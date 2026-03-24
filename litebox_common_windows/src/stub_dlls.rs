@@ -402,6 +402,23 @@ fn ntdll_exports() -> Vec<StubExport> {
         ),
         StubExport::syscall_stub("NtCreateThreadEx", NtSyscallId::NtCreateThreadEx as u32),
         StubExport::syscall_stub("NtTerminateThread", NtSyscallId::NtTerminateThread as u32),
+        StubExport::syscall_stub("NtResumeThread", NtSyscallId::NtResumeThread as u32),
+        StubExport::syscall_stub(
+            "NtAlertResumeThread",
+            NtSyscallId::NtAlertResumeThread as u32,
+        ),
+        StubExport::syscall_stub(
+            "NtWaitForAlertByThreadId",
+            NtSyscallId::NtWaitForAlertByThreadId as u32,
+        ),
+        StubExport::syscall_stub(
+            "NtAlertThreadByThreadId",
+            NtSyscallId::NtAlertThreadByThreadId as u32,
+        ),
+        StubExport::syscall_stub(
+            "NtAlertThreadByThreadIdEx",
+            NtSyscallId::NtAlertThreadByThreadIdEx as u32,
+        ),
         StubExport::syscall_stub("NtOpenKey", NtSyscallId::NtOpenKey as u32),
         StubExport::syscall_stub("NtQueryValueKey", NtSyscallId::NtQueryValueKey as u32),
         StubExport::syscall_stub("NtCreateEvent", NtSyscallId::NtCreateEvent as u32),
@@ -418,6 +435,23 @@ fn ntdll_exports() -> Vec<StubExport> {
         ),
         StubExport::syscall_stub("NtCreateSemaphore", NtSyscallId::NtCreateSemaphore as u32),
         StubExport::syscall_stub("NtReleaseSemaphore", NtSyscallId::NtReleaseSemaphore as u32),
+        StubExport::syscall_stub(
+            "NtCreateIoCompletion",
+            NtSyscallId::NtCreateIoCompletion as u32,
+        ),
+        StubExport::syscall_stub("NtSetIoCompletion", NtSyscallId::NtSetIoCompletion as u32),
+        StubExport::syscall_stub(
+            "NtRemoveIoCompletion",
+            NtSyscallId::NtRemoveIoCompletion as u32,
+        ),
+        StubExport::syscall_stub(
+            "NtSetIoCompletionEx",
+            NtSyscallId::NtSetIoCompletionEx as u32,
+        ),
+        StubExport::syscall_stub(
+            "NtRemoveIoCompletionEx",
+            NtSyscallId::NtRemoveIoCompletionEx as u32,
+        ),
         StubExport::syscall_stub("NtCreateKeyedEvent", NtSyscallId::NtCreateKeyedEvent as u32),
         StubExport::syscall_stub(
             "NtWaitForKeyedEvent",
@@ -891,32 +925,41 @@ pub const K32_REG_QUERY_VALUE_EX_W: u32 = 0x1141;
 pub const K32_REG_CLOSE_KEY: u32 = 0x1142;
 
 // Phase 4: WinSock (ws2_32.dll)
-pub const WS2_STARTUP: u32 = 0x1200;
-pub const WS2_CLEANUP: u32 = 0x1201;
-pub const WS2_SOCKET: u32 = 0x1202;
-pub const WS2_CLOSESOCKET: u32 = 0x1203;
-pub const WS2_CONNECT: u32 = 0x1204;
-pub const WS2_BIND: u32 = 0x1205;
-pub const WS2_LISTEN: u32 = 0x1206;
-pub const WS2_ACCEPT: u32 = 0x1207;
-pub const WS2_SEND: u32 = 0x1208;
-pub const WS2_RECV: u32 = 0x1209;
-pub const WS2_SENDTO: u32 = 0x120A;
-pub const WS2_RECVFROM: u32 = 0x120B;
-pub const WS2_SHUTDOWN: u32 = 0x120C;
-pub const WS2_SETSOCKOPT: u32 = 0x120D;
-pub const WS2_GETSOCKOPT: u32 = 0x120E;
-pub const WS2_IOCTLSOCKET: u32 = 0x120F;
-pub const WS2_SELECT: u32 = 0x1210;
-pub const WS2_GETSOCKNAME: u32 = 0x1211;
-pub const WS2_GETPEERNAME: u32 = 0x1212;
-pub const WS2_GETADDRINFO: u32 = 0x1213;
-pub const WS2_FREEADDRINFO: u32 = 0x1214;
-pub const WS2_HTONS: u32 = 0x1215;
-pub const WS2_HTONL: u32 = 0x1216;
-pub const WS2_NTOHS: u32 = 0x1217;
-pub const WS2_NTOHL: u32 = 0x1218;
-pub const WS2_INET_PTON: u32 = 0x1219;
+// WS2 pseudo-syscall numbers: 0x3000+ range.
+// Must NOT overlap with win32k (0x1000-0x1FFF) or CSR (0x2000).
+pub const WS2_STARTUP: u32 = 0x3000;
+pub const WS2_CLEANUP: u32 = 0x3001;
+pub const WS2_SOCKET: u32 = 0x3002;
+pub const WS2_CLOSESOCKET: u32 = 0x3003;
+pub const WS2_CONNECT: u32 = 0x3004;
+pub const WS2_BIND: u32 = 0x3005;
+pub const WS2_LISTEN: u32 = 0x3006;
+pub const WS2_ACCEPT: u32 = 0x3007;
+pub const WS2_SEND: u32 = 0x3008;
+pub const WS2_RECV: u32 = 0x3009;
+pub const WS2_SENDTO: u32 = 0x300A;
+pub const WS2_RECVFROM: u32 = 0x300B;
+pub const WS2_SHUTDOWN: u32 = 0x300C;
+pub const WS2_SETSOCKOPT: u32 = 0x300D;
+pub const WS2_GETSOCKOPT: u32 = 0x300E;
+pub const WS2_IOCTLSOCKET: u32 = 0x300F;
+pub const WS2_SELECT: u32 = 0x3010;
+pub const WS2_GETSOCKNAME: u32 = 0x3011;
+pub const WS2_GETPEERNAME: u32 = 0x3012;
+pub const WS2_GETADDRINFO: u32 = 0x3013;
+pub const WS2_FREEADDRINFO: u32 = 0x3014;
+pub const WS2_HTONS: u32 = 0x3015;
+pub const WS2_HTONL: u32 = 0x3016;
+pub const WS2_NTOHS: u32 = 0x3017;
+pub const WS2_NTOHL: u32 = 0x3018;
+pub const WS2_INET_PTON: u32 = 0x3019;
+/// One past the last WS2 pseudo-syscall number.
+pub const WS2_END: u32 = 0x301A;
+
+// Phase 5: CSRSS client pseudo-syscalls.
+// ntdll's CsrClient* functions are patched to trampoline JMPs so the shim
+// can handle them instead of letting ntdll attempt real LPC/ALPC to csrss.exe.
+pub const CSR_CLIENT_CONNECT_TO_SERVER: u32 = 0x2000;
 
 #[cfg(test)]
 mod tests {

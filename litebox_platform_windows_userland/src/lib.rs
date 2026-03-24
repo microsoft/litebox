@@ -26,6 +26,18 @@
     clippy::used_underscore_binding,
 )]
 
+#[cfg(all(debug_assertions, feature = "trace_debug"))]
+macro_rules! trace_debugln {
+    ($($arg:tt)*) => {
+        eprintln!($($arg)*);
+    };
+}
+
+#[cfg(not(all(debug_assertions, feature = "trace_debug")))]
+macro_rules! trace_debugln {
+    ($($arg:tt)*) => {};
+}
+
 use core::cell::Cell;
 use core::panic;
 use core::sync::atomic::{AtomicU32, Ordering};
@@ -678,10 +690,9 @@ impl GuestGsTable {
             if (entry.guest_gs == 0
                 || entry.guest_gs == litebox_common_windows::gs_table::TOMBSTONE_GUEST_GS)
                 && fwd_idx.is_none()
+                && i < litebox_common_windows::gs_table::MAX_GS_TABLE_ENTRIES
             {
-                if i < litebox_common_windows::gs_table::MAX_GS_TABLE_ENTRIES {
-                    fwd_idx = Some(i);
-                }
+                fwd_idx = Some(i);
             }
         }
         let fwd_idx = fwd_idx.ok_or(GuestGsTableError::Full)?;
@@ -694,10 +705,9 @@ impl GuestGsTable {
             if (entry.guest_gs == 0
                 || entry.guest_gs == litebox_common_windows::gs_table::TOMBSTONE_GUEST_GS)
                 && rev_idx.is_none()
+                && i < litebox_common_windows::gs_table::MAX_GS_TABLE_ENTRIES
             {
-                if i < litebox_common_windows::gs_table::MAX_GS_TABLE_ENTRIES {
-                    rev_idx = Some(i);
-                }
+                rev_idx = Some(i);
             }
         }
         let rev_idx = rev_idx.ok_or(GuestGsTableError::Full)?;
@@ -818,6 +828,14 @@ static REVERSE_GS_TABLE_BASE_PTR: std::sync::atomic::AtomicPtr<
     litebox_common_windows::gs_table::GsTableEntry,
 > = std::sync::atomic::AtomicPtr::new(core::ptr::null_mut());
 
+/// Address of host `ntdll!RtlDispatchException + 12`, i.e. the first
+/// instruction after the detour-overwritten prologue pushes.
+static RTL_DISPATCH_EXCEPTION_CONTINUE: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Install the host `RtlDispatchException` detour at most once.
+static INSTALL_RTL_DISPATCH_EXCEPTION_HOOK: std::sync::Once = const { std::sync::Once::new() };
+
 /// Helper to get the global GS table reference.
 fn global_gs_table() -> &'static GuestGsTable {
     let ptr = GS_TABLE_PTR.load(core::sync::atomic::Ordering::Acquire);
@@ -826,6 +844,181 @@ fn global_gs_table() -> &'static GuestGsTable {
     // GuestGsTable lives inside the Box-leaked WindowsUserland — stable
     // for the lifetime of the process.
     unsafe { &*ptr }
+}
+
+/// Naked trampoline for the host `ntdll!RtlDispatchException` detour.
+///
+/// Problem: when guest code faults after `NtContinue`, the Windows kernel
+/// dispatches the exception through the host process's `RtlDispatchException`
+/// with GS still pointing at the guest TEB. Host ntdll then reads
+/// `gs:[0x60]` / `gs:[0x30]` from the guest PEB/TEB and can fail before any
+/// VEH runs.
+///
+/// We detour the host `RtlDispatchException` entry and replicate the original
+/// 12-byte prologue (`0x40` REX prefix + 7 callee-saved pushes). Then we scan
+/// the forward GS table:
+/// if the current GS matches a guest_gs entry, we swap to the corresponding
+/// host_gs. If GS does not match any guest entry, we leave it unchanged so
+/// ordinary host exceptions continue to behave normally.
+#[unsafe(naked)]
+unsafe extern "system" fn rtl_dispatch_exception_trampoline() -> ! {
+    core::arch::naked_asm!(
+        // Replicate the original first 12 bytes of ntdll!RtlDispatchException:
+        //   0x40; push rbp; push rsi; push rdi; push r12; push r13; push r14; push r15
+        ".byte 0x40",
+        "push rbp",
+        "push rsi",
+        "push rdi",
+        "push r12",
+        "push r13",
+        "push r14",
+        "push r15",
+        // Swap GS from guest TEB to host TEB if the current GS matches one
+        // of our guest_gs entries. Use only volatile registers here so the
+        // original non-volatile state is preserved exactly.
+        "rdgsbase r11",
+        "mov r10, QWORD PTR [rip + {GS_TABLE_BASE_PTR}]",
+        "test r10, r10",
+        "jz 2f",
+        "test r11, r11",
+        "jz 2f",
+        "1:",
+        "mov rax, QWORD PTR [r10]",
+        "test rax, rax",
+        "jz 2f",
+        "cmp rax, r11",
+        "je 3f",
+        "add r10, 16",
+        "jmp 1b",
+        "3:",
+        "mov rax, QWORD PTR [r10 + 8]",
+        "test rax, rax",
+        "jz 2f",
+        "wrgsbase rax",
+        "2:",
+        "mov rax, QWORD PTR [rip + {RTL_DISPATCH_EXCEPTION_CONTINUE}]",
+        "jmp rax",
+        GS_TABLE_BASE_PTR = sym GS_TABLE_BASE_PTR,
+        RTL_DISPATCH_EXCEPTION_CONTINUE = sym RTL_DISPATCH_EXCEPTION_CONTINUE,
+    );
+}
+
+/// Patch host `ntdll!RtlDispatchException` so exception dispatch always runs
+/// with host GS, even if the fault happened while guest GS was active.
+fn install_rtl_dispatch_exception_hook() {
+    INSTALL_RTL_DISPATCH_EXCEPTION_HOOK.call_once(|| unsafe {
+        unsafe extern "system" {
+            fn GetModuleHandleA(name: *const u8) -> *mut c_void;
+            fn GetProcAddress(module: *mut c_void, name: *const u8) -> *mut c_void;
+            fn FlushInstructionCache(
+                process: windows_sys::Win32::Foundation::HANDLE,
+                base_address: *const c_void,
+                size: usize,
+            ) -> i32;
+        }
+
+        let ntdll = GetModuleHandleA(c"ntdll.dll".as_ptr().cast());
+        if ntdll.is_null() {
+            trace_debugln!("Skipping RtlDispatchException hook: GetModuleHandleA(ntdll.dll) failed");
+            return;
+        }
+
+        // RtlDispatchException is not exported. Derive its address from the
+        // exported KiUserExceptionDispatcher stub:
+        //   mov rcx, rsp
+        //   add rcx, 0x4F0
+        //   mov rdx, rsp
+        //   call rel32   ; -> RtlDispatchException
+        let dispatcher = GetProcAddress(ntdll, c"KiUserExceptionDispatcher".as_ptr().cast());
+        if dispatcher.is_null() {
+            trace_debugln!(
+                "Skipping RtlDispatchException hook: KiUserExceptionDispatcher export missing"
+            );
+            return;
+        }
+        let dispatcher = dispatcher.cast::<u8>();
+
+        const DISPATCH_CALL_BLOCK_OFFSET: usize = 0x1C;
+        const DISPATCH_CALL_OFFSET: usize = 0x29;
+        const DISPATCH_CALL_BLOCK_PREFIX: [u8; 13] = [
+            0x48, 0x8B, 0xCC, // mov rcx, rsp
+            0x48, 0x81, 0xC1, 0xF0, 0x04, 0x00, 0x00, // add rcx, 0x4F0
+            0x48, 0x8B, 0xD4, // mov rdx, rsp
+        ];
+        let actual_prefix = core::slice::from_raw_parts(
+            dispatcher.add(DISPATCH_CALL_BLOCK_OFFSET),
+            DISPATCH_CALL_BLOCK_PREFIX.len(),
+        );
+        if actual_prefix != DISPATCH_CALL_BLOCK_PREFIX {
+            trace_debugln!(
+                "Skipping RtlDispatchException hook: KiUserExceptionDispatcher call-site pattern changed"
+            );
+            return;
+        }
+        let call_site = dispatcher.add(DISPATCH_CALL_OFFSET);
+        if core::ptr::read(call_site) != 0xE8 {
+            trace_debugln!(
+                "Skipping RtlDispatchException hook: expected KiUserExceptionDispatcher call missing"
+            );
+            return;
+        }
+        let rel32 = core::ptr::read_unaligned(call_site.add(1).cast::<i32>()) as isize;
+        let target = call_site.add(5).offset(rel32).cast::<u8>();
+
+        const DETOUR_LEN: usize = 12; // mov rax, imm64; jmp rax
+        const RTL_DISPATCH_EXCEPTION_PROLOGUE: [u8; DETOUR_LEN] = [
+            0x40, 0x55, 0x56, 0x57, 0x41, 0x54, 0x41, 0x55, 0x41, 0x56, 0x41, 0x57,
+        ];
+        let actual_prologue = core::slice::from_raw_parts(target, DETOUR_LEN);
+        if actual_prologue != RTL_DISPATCH_EXCEPTION_PROLOGUE {
+            trace_debugln!("Skipping RtlDispatchException hook: prologue changed");
+            return;
+        }
+        RTL_DISPATCH_EXCEPTION_CONTINUE.store(target as usize + DETOUR_LEN, Ordering::Release);
+
+        let hook_addr = rtl_dispatch_exception_trampoline as *const () as usize as u64;
+        let mut detour = [0u8; DETOUR_LEN];
+        detour[0] = 0x48; // mov rax, imm64
+        detour[1] = 0xB8;
+        detour[2..10].copy_from_slice(&hook_addr.to_le_bytes());
+        detour[10] = 0xFF; // jmp rax
+        detour[11] = 0xE0;
+
+        let mut old_protect = 0u32;
+        let protect_ok = VirtualProtect(
+            target.cast::<c_void>(),
+            DETOUR_LEN,
+            Win32_Memory::PAGE_EXECUTE_READWRITE,
+            &mut old_protect,
+        );
+        if protect_ok == 0 {
+            trace_debugln!("Skipping RtlDispatchException hook: VirtualProtect failed");
+            return;
+        }
+
+        // Safety: the page is temporarily RWX and DETOUR_LEN exactly matches
+        // the validated RtlDispatchException prologue we intentionally replace.
+        core::ptr::copy_nonoverlapping(detour.as_ptr(), target, DETOUR_LEN);
+
+        let flush_ok = FlushInstructionCache(GetCurrentProcess(), target.cast(), DETOUR_LEN);
+        if flush_ok == 0 {
+            trace_debugln!("Skipping RtlDispatchException hook: FlushInstructionCache failed");
+            return;
+        }
+
+        let mut _ignored_old = 0u32;
+        let restore_ok = VirtualProtect(
+            target.cast::<c_void>(),
+            DETOUR_LEN,
+            old_protect,
+            &mut _ignored_old,
+        );
+        if restore_ok == 0 {
+            trace_debugln!(
+                "Skipping RtlDispatchException hook: failed to restore page protections"
+            );
+        }
+    });
 }
 
 /// Naked asm trampoline for the VEH handler.
@@ -913,19 +1106,17 @@ unsafe extern "system" fn vectored_exception_handler_inner(
         context = &mut *info.ContextRecord;
     }
 
-    #[cfg(debug_assertions)]
+    #[cfg(all(debug_assertions, feature = "trace_debug"))]
     {
         static VEH_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let n = VEH_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        if n < 20 {
+        if n < 200 {
             let current_gs: u64;
             unsafe {
                 core::arch::asm!("rdgsbase {}", out(reg) current_gs, options(nostack, preserves_flags));
             }
-            let guest_gs_val = get_tls_ptr()
-                .map(|p| unsafe { &*p }.guest_gs_base.get())
-                .unwrap_or(0);
-            eprintln!(
+            let guest_gs_val = get_tls_ptr().map_or(0, |p| unsafe { &*p }.guest_gs_base.get());
+            trace_debugln!(
                 "[VEH] #{} code=0x{:08X} rip=0x{:X} addr=0x{:X} gs=0x{:X} guest_gs=0x{:X}{}",
                 n,
                 exception_record.ExceptionCode as u32,
@@ -951,28 +1142,28 @@ unsafe extern "system" fn vectored_exception_handler_inner(
             unsafe {
                 core::arch::asm!("rdgsbase {}", out(reg) current_gs, options(nostack, preserves_flags));
             }
-            eprintln!("[VEH-GS] ILLEGAL_INSTRUCTION diagnostic:");
-            eprintln!("  current GS (after VEH trampoline): 0x{:X}", current_gs);
-            eprintln!("  R11 (rdgsbase result at UD2): 0x{:X}", context.R11);
+            trace_debugln!("[VEH-GS] ILLEGAL_INSTRUCTION diagnostic:");
+            trace_debugln!("  current GS (after VEH trampoline): 0x{current_gs:X}");
+            trace_debugln!("  R11 (rdgsbase result at UD2): 0x{:X}", context.R11);
             if let Some(tls) = get_tls_ptr() {
                 let tls = unsafe { &*tls };
-                eprintln!(
+                trace_debugln!(
                     "  expected guest_gs_base (TlsState): 0x{:X}",
                     tls.guest_gs_base.get()
                 );
-                eprintln!("  is_in_guest: {}", tls.is_in_guest.get());
+                trace_debugln!("  is_in_guest: {}", tls.is_in_guest.get());
             }
             // Dump the GS table entries.
             let table_base = GS_TABLE_BASE_PTR.load(core::sync::atomic::Ordering::Relaxed);
             if !table_base.is_null() {
-                eprintln!("  GS table entries (base={:p}):", table_base);
+                trace_debugln!("  GS table entries (base={table_base:p}):");
                 for i in 0..litebox_common_windows::gs_table::MAX_GS_TABLE_ENTRIES {
                     let entry = unsafe { &*table_base.add(i) };
                     if entry.guest_gs == 0 {
-                        eprintln!("    [{}] SENTINEL (end of table)", i);
+                        trace_debugln!("    [{i}] SENTINEL (end of table)");
                         break;
                     }
-                    eprintln!(
+                    trace_debugln!(
                         "    [{}] guest_gs=0x{:X} host_gs=0x{:X}{}",
                         i,
                         entry.guest_gs,
@@ -1006,6 +1197,17 @@ unsafe extern "system" fn vectored_exception_handler_inner(
             return EXCEPTION_CONTINUE_EXECUTION;
         } else {
             // Not one of our exceptions; let other handlers process it.
+            #[cfg(all(debug_assertions, feature = "trace_debug"))]
+            trace_debugln!(
+                "[VEH-host] NOT in guest, CONTINUE_SEARCH: code=0x{:08X} rip=0x{:X} addr=0x{:X}",
+                exception_record.ExceptionCode as u32,
+                context.Rip,
+                if exception_record.NumberParameters >= 2 {
+                    exception_record.ExceptionInformation[1] as u64
+                } else {
+                    0
+                },
+            );
             return EXCEPTION_CONTINUE_SEARCH;
         }
     }
@@ -1017,18 +1219,21 @@ unsafe extern "system" fn vectored_exception_handler_inner(
     // so tracing continues.
     const EXCEPTION_SINGLE_STEP: i32 = 0x80000004_u32 as i32;
     if exception_record.ExceptionCode == EXCEPTION_SINGLE_STEP {
-        #[cfg(debug_assertions)]
+        #[cfg(all(debug_assertions, feature = "trace_debug"))]
         {
             static STEP_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
             let n = STEP_COUNT.fetch_add(1, Ordering::Relaxed);
-            if n < 500 {
+            if n < 5000 {
                 // Read 4 bytes at RIP for compact trace.
                 let rip = context.Rip;
+                let rsp = context.Rsp;
                 let b0 = unsafe { *(rip as *const u8) };
                 let b1 = unsafe { *((rip + 1) as *const u8) };
                 let b2 = unsafe { *((rip + 2) as *const u8) };
                 let b3 = unsafe { *((rip + 3) as *const u8) };
-                eprintln!("[STEP #{n}] rip=0x{rip:X} [{b0:02X} {b1:02X} {b2:02X} {b3:02X}]");
+                trace_debugln!(
+                    "[STEP #{n}] rip=0x{rip:X} rsp=0x{rsp:X} [{b0:02X} {b1:02X} {b2:02X} {b3:02X}]"
+                );
             }
         }
         // Re-enable TF for the next instruction.
@@ -1076,10 +1281,22 @@ unsafe extern "system" fn vectored_exception_handler_inner(
     // Cast to ExecutionContext — PtRegs is at offset 0 of ExecutionContext, so
     // the pointer to PtRegs is also a valid pointer to ExecutionContext.
     let ctx_top = tls.guest_context_top.get();
-    #[cfg(debug_assertions)]
+    #[cfg(all(debug_assertions, feature = "trace_debug"))]
     {
-        eprintln!(
-            "[VEH-exc] guest exception: code=0x{:08X} rip=0x{:X} addr=0x{:X} guest_context_top={:p} host_sp={:p}",
+        let access_type = if exception_record.ExceptionCode as u32 == 0xC0000005
+            && exception_record.NumberParameters >= 1
+        {
+            match exception_record.ExceptionInformation[0] {
+                0 => "READ",
+                1 => "WRITE",
+                8 => "DEP",
+                _ => "???",
+            }
+        } else {
+            ""
+        };
+        trace_debugln!(
+            "[VEH-exc] guest exception: code=0x{:08X} rip=0x{:X} addr=0x{:X} access={} guest_context_top={:p} host_sp={:p}",
             exception_record.ExceptionCode as u32,
             context.Rip,
             if exception_record.NumberParameters >= 2 {
@@ -1087,6 +1304,7 @@ unsafe extern "system" fn vectored_exception_handler_inner(
             } else {
                 0
             },
+            access_type,
             ctx_top,
             tls.host_sp.get(),
         );
@@ -1392,11 +1610,11 @@ impl WindowsUserland {
 
         let va_min = sys_info.lpMinimumApplicationAddress as usize;
         let va_max = sys_info.lpMaximumApplicationAddress as usize;
-        #[cfg(debug_assertions)]
+        #[cfg(all(debug_assertions, feature = "trace_debug"))]
         {
-            println!("System information.");
-            println!("=> Max user address: {va_max:#x}");
-            println!("=> Min user address: {va_min:#x}");
+            trace_debugln!("System information.");
+            trace_debugln!("=> Max user address: {va_max:#x}");
+            trace_debugln!("=> Min user address: {va_min:#x}");
         }
 
         // Validate that the hardcoded PageManagementProvider constants are
@@ -1419,8 +1637,8 @@ impl WindowsUserland {
         // +1 to convert from inclusive last-byte to exclusive upper bound.
         // Safe: on 64-bit Windows, va_max is always well below usize::MAX.
         let partitions = PartitionState::new(va_max + 1);
-        #[cfg(debug_assertions)]
-        println!(
+        #[cfg(all(debug_assertions, feature = "trace_debug"))]
+        trace_debugln!(
             "=> VA partitions: {} slots of {} bytes each",
             partitions.num_slots(),
             va_partitions::PARTITION_SIZE,
@@ -1467,6 +1685,36 @@ impl WindowsUserland {
             let _ = AddVectoredExceptionHandler(1, Some(vectored_exception_handler_trampoline));
         }
 
+        // Register an unhandled exception filter as a last-resort diagnostic
+        // to catch crashes that bypass the VEH handler.
+        unsafe {
+            unsafe extern "system" fn unhandled_exception_filter(
+                info: *const EXCEPTION_POINTERS,
+            ) -> i32 {
+                unsafe {
+                    let info = &*info;
+                    let rec = &*info.ExceptionRecord;
+                    let ctx = &*info.ContextRecord;
+                    eprintln!(
+                        "[UNHANDLED] code=0x{:08X} rip=0x{:X} rsp=0x{:X} addr=0x{:X}",
+                        rec.ExceptionCode as u32,
+                        ctx.Rip,
+                        ctx.Rsp,
+                        if rec.NumberParameters >= 2 {
+                            rec.ExceptionInformation[1] as u64
+                        } else {
+                            0
+                        },
+                    );
+                    // EXCEPTION_CONTINUE_SEARCH = 0
+                    0
+                }
+            }
+            windows_sys::Win32::System::Diagnostics::Debug::SetUnhandledExceptionFilter(Some(
+                unhandled_exception_filter,
+            ));
+        }
+
         // Register a console control handler to receive Ctrl+C
         unsafe {
             windows_sys::Win32::System::Console::SetConsoleCtrlHandler(
@@ -1493,6 +1741,10 @@ impl WindowsUserland {
                 as *mut litebox_common_windows::gs_table::GsTableEntry,
             core::sync::atomic::Ordering::Release,
         );
+
+        // Host ntdll exception dispatch must never run with guest GS active.
+        // Install the detour only after the GS table pointers are published.
+        install_rtl_dispatch_exception_hook();
 
         leaked
     }
@@ -1849,10 +2101,7 @@ fn run_thread_inner(
         global_gs_table()
             .insert(guest_gs, host_gs)
             .unwrap_or_else(|e| panic!("failed to register GS mapping: {e}"));
-        eprintln!(
-            "[GS] Registered mapping: guest_gs=0x{:X} host_gs=0x{:X}",
-            guest_gs, host_gs
-        );
+        trace_debugln!("[GS] Registered mapping: guest_gs=0x{guest_gs:X} host_gs=0x{host_gs:X}");
         Some(GuestGsMappingGuard { guest_gs })
     } else {
         None
@@ -1869,6 +2118,7 @@ fn run_thread_inner(
     // Clear guest GS base so a subsequent Linux-mode guest on this thread
     // does not inherit a stale Windows TEB address.
     THREAD_GS_BASE.set(0);
+    shim.thread_terminated();
     // _gs_guard drops here → removes the GS table entry
 }
 
@@ -1898,6 +2148,7 @@ struct TlsState {
     /// Guest GS base address. When non-zero, switch_to_guest restores this
     /// via wrgsbase before entering the guest (NT-mode guests need GS → TEB).
     guest_gs_base: Cell<u64>,
+    #[allow(dead_code)]
     continue_context:
         Box<std::cell::UnsafeCell<windows_sys::Win32::System::Diagnostics::Debug::CONTEXT>>,
     /// Bitmask of pending host-originated signals for this thread.
@@ -2248,127 +2499,172 @@ DEFAULT_MXCSR:
 /// destructors.
 ///
 unsafe extern "C" fn switch_to_guest(ctx: &litebox_common_linux::ExecutionContext) -> ! {
-    /// Restores the full guest register state and jumps to the guest RIP
-    /// entirely in user-mode — no kernel round-trip.
-    ///
-    /// GS is swapped to the guest TEB as late as possible (just 3
-    /// instructions before `ret`) to minimize the window where host code
-    /// runs with guest GS active. The technique:
-    ///
-    /// 1. Pre-stage guest_gs and guest_rip at `(guest_rsp - 16)` and
-    ///    `(guest_rsp - 8)` on the guest stack (while GS is still host).
-    /// 2. Pop ALL GP registers (GS remains host throughout).
-    /// 3. `popfq` + `pop rsp` to restore EFLAGS and RSP.
-    /// 4. `xchg rax, [rsp]` to get a scratch register (does not clobber flags).
-    /// 5. `wrgsbase` the pre-staged guest_gs value.
-    /// 6. `mov rax, [rsp]` to restore guest rax, `lea` to skip the gs slot, `ret`.
-    #[unsafe(naked)]
-    extern "C" fn switch_to_guest_sysret(ctx: &litebox_common_linux::ExecutionContext) -> ! {
-        core::arch::naked_asm!(
-            // === switch_to_guest_start..switch_to_guest_end ===
-            // This range is checked by ThreadHandle::interrupt() to detect
-            // when a thread is in the process of entering guest code. If
-            // interrupted here, the thread is redirected to interrupt_callback
-            // and re-enters switch_to_guest later. The ExecutionContext is
-            // not modified below, so re-entry is safe (the pre-staging write
-            // to the guest stack is idempotent).
-            "switch_to_guest_start:",
-            // Restore guest FP/SIMD state before touching any guest registers.
-            // rcx = ptr to ExecutionContext; fp_regs is at offset FP_REGS_OFFSET.
-            // First check xsave_enabled in TlsState (GS still points to host TEB).
-            "mov     r11d, DWORD PTR [rip + {TLS_INDEX}]",
-            "mov     r11, QWORD PTR gs:[r11 * 8 + 5248]", // TEB_TLS_SLOTS → TlsState*
-            "cmp     BYTE PTR [r11 + {XSAVE_ENABLED}], 0",
-            "je      .Lguest_fp_restore_fxrstor",
-            // xrstor64 path: need eax:edx = mask.
-            "mov     eax, DWORD PTR [r11 + {XSAVE_MASK_LO}]",
-            "mov     edx, DWORD PTR [r11 + {XSAVE_MASK_HI}]",
-            "xrstor64 [rcx + {FP_REGS_OFFSET}]",
-            "jmp     .Lguest_fp_restore_done",
-            ".Lguest_fp_restore_fxrstor:",
-            "fxrstor64 [rcx + {FP_REGS_OFFSET}]",
-            ".Lguest_fp_restore_done:",
-            // Read guest_gs_base from TlsState. If zero (no GS swap needed),
-            // substitute the current host GS so wrgsbase at the end is a
-            // harmless identity operation. This avoids a flag-clobbering
-            // branch after popfq.
-            "mov     r11, QWORD PTR [r11 + {GUEST_GS_BASE}]",
-            "test    r11, r11",
-            "jnz     2f",
-            "rdgsbase r11",            // keep host GS if guest_gs is 0
-            "2:",
-            // Pre-stage: write guest_gs and guest_rip below guest_rsp.
-            // Layout: [guest_gs @ rsp-16] [guest_rip @ rsp-8]
-            // This does NOT modify the ExecutionContext, so it is idempotent
-            // and safe if an interrupt causes re-entry.
-            "mov     rax, QWORD PTR [rcx + {PT_RSP}]",
-            "mov     QWORD PTR [rax - 16], r11",          // guest_gs (or host_gs)
-            "mov     r11, QWORD PTR [rcx + {PT_RIP}]",
-            "mov     QWORD PTR [rax - 8], r11",           // guest_rip
-            // Load all GP registers from the guest context structure.
-            // GS is still host TEB throughout — immune to kernel preemption
-            // resetting GS to the thread's official TEB.
-            "mov rsp, rcx",
-            "pop r15",
-            "pop r14",
-            "pop r13",
-            "pop r12",
-            "pop rbp",
-            "pop rbx",
-            "pop r11",
-            "pop r10",
-            "pop r9",
-            "pop r8",
-            "pop rax",
-            "pop rcx",       // guest's actual RCX
-            "pop rdx",
-            "pop rsi",
-            "pop rdi",
-            "add rsp, 24",   // skip orig_rax + rip + cs
-            "popfq",
-            "pop rsp",                         // rsp = guest_rsp
-            // Swap GS to guest as late as possible. The pre-staged guest_gs
-            // is at (guest_rsp - 16). We use xchg to borrow rax as a scratch
-            // without clobbering EFLAGS or writing below guest_rsp - 16.
-            // xchg with memory has an implicit LOCK prefix (atomic + fence)
-            // but does NOT affect any flags.
-            "lea rsp, QWORD PTR [rsp - 16]",  // rsp → [guest_gs] [guest_rip]
-            "xchg rax, QWORD PTR [rsp]",      // rax = guest_gs, [rsp] = guest_rax
-            "wrgsbase rax",                    // GS = guest TEB (no flags clobber)
-            "mov  rax, QWORD PTR [rsp]",      // rax = guest_rax (no flags clobber)
-            "lea rsp, QWORD PTR [rsp + 8]",   // skip guest_gs → rsp points at guest_rip
-            "ret",                             // pop guest_rip, rsp = guest_rsp
-            "switch_to_guest_end:",
-            FP_REGS_OFFSET = const core::mem::offset_of!(litebox_common_linux::ExecutionContext, fp_regs),
-            TLS_INDEX = sym TLS_INDEX,
-            GUEST_GS_BASE = const core::mem::offset_of!(TlsState, guest_gs_base),
-            XSAVE_ENABLED = const core::mem::offset_of!(TlsState, xsave_enabled),
-            XSAVE_MASK_LO = const core::mem::offset_of!(TlsState, xsave_mask_lo),
-            XSAVE_MASK_HI = const core::mem::offset_of!(TlsState, xsave_mask_hi),
-            PT_RIP = const core::mem::offset_of!(litebox_common_linux::PtRegs, rip),
-            PT_RSP = const core::mem::offset_of!(litebox_common_linux::PtRegs, rsp),
-        );
-    }
-
-    let tls = unsafe { &*get_tls_ptr().expect("TLS not initialized") };
-    assert!(!tls.is_in_guest.get());
-
-    // Restore fsbase for the guest.
-    WindowsUserland::restore_thread_fs_base();
-
-    #[cfg(debug_assertions)]
-    {
-        static LAST_RIP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let prev = LAST_RIP.swap(ctx.rip as u64, Ordering::Relaxed);
-        if ctx.rip as u64 != prev {
-            eprintln!(
-                "[switch-guest] rip=0x{:X} rsp=0x{:X} rax=0x{:X} rcx=0x{:X}",
-                ctx.rip, ctx.rsp, ctx.rax, ctx.rcx,
+    unsafe {
+        /// Restores the full guest register state and jumps to the guest RIP
+        /// entirely in user-mode — no kernel round-trip.
+        ///
+        /// GS is swapped to the guest TEB as late as possible (just 3
+        /// instructions before `ret`) to minimize the window where host code
+        /// runs with guest GS active. The technique:
+        ///
+        /// 1. Pre-stage guest_gs and guest_rip at `(guest_rsp - 16)` and
+        ///    `(guest_rsp - 8)` on the guest stack (while GS is still host).
+        /// 2. Pop ALL GP registers (GS remains host throughout).
+        /// 3. `popfq` + `pop rsp` to restore EFLAGS and RSP.
+        /// 4. `xchg rax, [rsp]` to get a scratch register (does not clobber flags).
+        /// 5. `wrgsbase` the pre-staged guest_gs value.
+        /// 6. `mov rax, [rsp]` to restore guest rax, `lea` to skip the gs slot, `ret`.
+        #[unsafe(naked)]
+        extern "C" fn switch_to_guest_sysret(ctx: &litebox_common_linux::ExecutionContext) -> ! {
+            core::arch::naked_asm!(
+                // === switch_to_guest_start..switch_to_guest_end ===
+                // This range is checked by ThreadHandle::interrupt() to detect
+                // when a thread is in the process of entering guest code. If
+                // interrupted here, the thread is redirected to interrupt_callback
+                // and re-enters switch_to_guest later. The ExecutionContext is
+                // not modified below, so re-entry is safe (the pre-staging write
+                // to the guest stack is idempotent).
+                "switch_to_guest_start:",
+                // Restore guest FP/SIMD state before touching any guest registers.
+                // rcx = ptr to ExecutionContext; fp_regs is at offset FP_REGS_OFFSET.
+                // First check xsave_enabled in TlsState (GS still points to host TEB).
+                "mov     r11d, DWORD PTR [rip + {TLS_INDEX}]",
+                "mov     r11, QWORD PTR gs:[r11 * 8 + 5248]", // TEB_TLS_SLOTS → TlsState*
+                "cmp     BYTE PTR [r11 + {XSAVE_ENABLED}], 0",
+                "je      .Lguest_fp_restore_fxrstor",
+                // xrstor64 path: need eax:edx = mask.
+                "mov     eax, DWORD PTR [r11 + {XSAVE_MASK_LO}]",
+                "mov     edx, DWORD PTR [r11 + {XSAVE_MASK_HI}]",
+                "xrstor64 [rcx + {FP_REGS_OFFSET}]",
+                "jmp     .Lguest_fp_restore_done",
+                ".Lguest_fp_restore_fxrstor:",
+                "fxrstor64 [rcx + {FP_REGS_OFFSET}]",
+                ".Lguest_fp_restore_done:",
+                // Read guest_gs_base from TlsState. If zero (no GS swap needed),
+                // substitute the current host GS so wrgsbase at the end is a
+                // harmless identity operation. This avoids a flag-clobbering
+                // branch after popfq.
+                "mov     r11, QWORD PTR [r11 + {GUEST_GS_BASE}]",
+                "test    r11, r11",
+                "jnz     2f",
+                "rdgsbase r11",            // keep host GS if guest_gs is 0
+                "2:",
+                // Pre-stage: write guest_gs and guest_rip below guest_rsp.
+                // Layout: [guest_gs @ rsp-16] [guest_rip @ rsp-8]
+                // This does NOT modify the ExecutionContext, so it is idempotent
+                // and safe if an interrupt causes re-entry.
+                "mov     rax, QWORD PTR [rcx + {PT_RSP}]",
+                "mov     QWORD PTR [rax - 16], r11",          // guest_gs (or host_gs)
+                "mov     r11, QWORD PTR [rcx + {PT_RIP}]",
+                "mov     QWORD PTR [rax - 8], r11",           // guest_rip
+                // Load all GP registers from the guest context structure.
+                // GS is still host TEB throughout — immune to kernel preemption
+                // resetting GS to the thread's official TEB.
+                "mov rsp, rcx",
+                "pop r15",
+                "pop r14",
+                "pop r13",
+                "pop r12",
+                "pop rbp",
+                "pop rbx",
+                "pop r11",
+                "pop r10",
+                "pop r9",
+                "pop r8",
+                "pop rax",
+                "pop rcx",       // guest's actual RCX
+                "pop rdx",
+                "pop rsi",
+                "pop rdi",
+                "add rsp, 24",   // skip orig_rax + rip + cs
+                "popfq",
+                "pop rsp",                         // rsp = guest_rsp
+                // Swap GS to guest as late as possible. The pre-staged guest_gs
+                // is at (guest_rsp - 16). We use xchg to borrow rax as a scratch
+                // without clobbering EFLAGS or writing below guest_rsp - 16.
+                // xchg with memory has an implicit LOCK prefix (atomic + fence)
+                // but does NOT affect any flags.
+                "lea rsp, QWORD PTR [rsp - 16]",  // rsp → [guest_gs] [guest_rip]
+                "xchg rax, QWORD PTR [rsp]",      // rax = guest_gs, [rsp] = guest_rax
+                "wrgsbase rax",                    // GS = guest TEB (no flags clobber)
+                "mov  rax, QWORD PTR [rsp]",      // rax = guest_rax (no flags clobber)
+                "lea rsp, QWORD PTR [rsp + 8]",   // skip guest_gs → rsp points at guest_rip
+                "ret",                             // pop guest_rip, rsp = guest_rsp
+                "switch_to_guest_end:",
+                FP_REGS_OFFSET = const core::mem::offset_of!(litebox_common_linux::ExecutionContext, fp_regs),
+                TLS_INDEX = sym TLS_INDEX,
+                GUEST_GS_BASE = const core::mem::offset_of!(TlsState, guest_gs_base),
+                XSAVE_ENABLED = const core::mem::offset_of!(TlsState, xsave_enabled),
+                XSAVE_MASK_LO = const core::mem::offset_of!(TlsState, xsave_mask_lo),
+                XSAVE_MASK_HI = const core::mem::offset_of!(TlsState, xsave_mask_hi),
+                PT_RIP = const core::mem::offset_of!(litebox_common_linux::PtRegs, rip),
+                PT_RSP = const core::mem::offset_of!(litebox_common_linux::PtRegs, rsp),
             );
         }
+
+        let tls = &*get_tls_ptr().expect("TLS not initialized");
+        assert!(!tls.is_in_guest.get());
+
+        // Restore fsbase for the guest.
+        WindowsUserland::restore_thread_fs_base();
+
+        #[cfg(all(debug_assertions, feature = "trace_debug"))]
+        {
+            trace_debugln!(
+                "[switch-guest] rip=0x{:X} rsp=0x{:X} rax=0x{:X} rcx=0x{:X}",
+                ctx.rip,
+                ctx.rsp,
+                ctx.rax,
+                ctx.rcx,
+            );
+            // Validate guest RSP is writable before switching.
+            #[repr(C)]
+            struct MemoryBasicInformation {
+                base_address: u64,
+                allocation_base: u64,
+                allocation_protect: u32,
+                _pad1: u32,
+                region_size: u64,
+                state: u32,
+                protect: u32,
+                type_: u32,
+                _pad2: u32,
+            }
+            unsafe extern "system" {
+                fn VirtualQuery(
+                    addr: *const u8,
+                    info: *mut MemoryBasicInformation,
+                    len: usize,
+                ) -> usize;
+            }
+            let mut mbi = core::mem::zeroed::<MemoryBasicInformation>();
+            let ret = VirtualQuery(
+                ctx.rsp as *const u8,
+                &mut mbi,
+                core::mem::size_of::<MemoryBasicInformation>(),
+            );
+            if ret == 0 {
+                trace_debugln!(
+                    "[switch-guest] WARNING: VirtualQuery(RSP=0x{:X}) FAILED",
+                    ctx.rsp
+                );
+            } else {
+                let writable = (mbi.protect & 0x04) != 0  // PAGE_READWRITE
+                || (mbi.protect & 0x40) != 0  // PAGE_EXECUTE_READWRITE
+                || (mbi.protect & 0x08) != 0; // PAGE_WRITECOPY
+                if mbi.state != 0x1000 || !writable {
+                    trace_debugln!(
+                        "[switch-guest] WARNING: RSP=0x{:X} state=0x{:X} protect=0x{:X} NOT WRITABLE",
+                        ctx.rsp,
+                        mbi.state,
+                        mbi.protect,
+                    );
+                }
+            }
+        }
+        tls.is_in_guest.set(true);
+        switch_to_guest_sysret(ctx)
     }
-    tls.is_in_guest.set(true);
-    switch_to_guest_sysret(ctx)
 }
 
 fn thread_start(
@@ -3265,10 +3561,14 @@ impl litebox::platform::PunchthroughProvider for WindowsUserland {
 
 impl litebox::platform::DebugLogProvider for WindowsUserland {
     fn debug_log_print(&self, msg: &str) {
-        // TODO: Implement Windows debug logging
-        // For now, use standard error output
-        use std::io::Write;
-        let _ = std::io::stderr().write_all(msg.as_bytes());
+        #[cfg(not(all(debug_assertions, feature = "trace_debug")))]
+        let _ = msg;
+
+        #[cfg(all(debug_assertions, feature = "trace_debug"))]
+        {
+            use std::io::Write;
+            let _ = std::io::stderr().write_all(msg.as_bytes());
+        }
     }
 }
 

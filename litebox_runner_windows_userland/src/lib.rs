@@ -11,7 +11,7 @@
 //! ## Usage
 //!
 //! ```text
-//! litebox_runner_windows_userland --pe-file hello.exe
+//! litebox_runner_windows_userland --dll-tar node_windows.tar --pe-file node.exe -- --version
 //! ```
 //!
 //! For Phase 1, static PE executables that import from the built-in stub DLLs
@@ -23,9 +23,25 @@
     clippy::cast_possible_truncation,
     clippy::cast_possible_wrap,
     clippy::cast_sign_loss,
+    // Bootstrap/debug helpers define local ABI items that intentionally mirror
+    // Windows layouts and signatures.
+    clippy::items_after_statements,
+    clippy::struct_field_names,
 )]
 
 extern crate alloc;
+
+#[cfg(all(debug_assertions, feature = "trace_debug"))]
+macro_rules! trace_debugln {
+    ($($arg:tt)*) => {
+        eprintln!($($arg)*);
+    };
+}
+
+#[cfg(not(all(debug_assertions, feature = "trace_debug")))]
+macro_rules! trace_debugln {
+    ($($arg:tt)*) => {};
+}
 
 mod real_dlls;
 
@@ -50,6 +66,35 @@ const GUEST_STACK_SIZE: usize = 0x0010_0000;
 /// PEB/TEB region offset — placed well below the DLL region.
 const PEB_TEB_OFFSET: usize = 0x7E_FFF0_0000;
 
+#[cfg(all(debug_assertions, feature = "trace_debug"))]
+fn trace_log_path(file_name: &str) -> PathBuf {
+    std::env::temp_dir().join(format!("litebox_runner_windows_userland_{file_name}"))
+}
+
+#[cfg(all(debug_assertions, feature = "trace_debug"))]
+fn open_trace_log_handle(file_name: &str) -> *mut core::ffi::c_void {
+    use std::fs::OpenOptions;
+    use std::os::windows::io::IntoRawHandle;
+
+    match OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .open(trace_log_path(file_name))
+    {
+        Ok(file) => file.into_raw_handle(),
+        Err(_) => core::ptr::null_mut(),
+    }
+}
+
+#[cfg(all(debug_assertions, feature = "trace_debug"))]
+fn write_trace_log(file_name: &str, data: &[u8]) {
+    let _ = std::fs::write(trace_log_path(file_name), data);
+}
+
+#[cfg(all(debug_assertions, feature = "trace_debug"))]
+static mut CRASH_FILE_HANDLE: *mut core::ffi::c_void = core::ptr::null_mut();
+
 /// Run Windows PE programs with LiteBox.
 #[derive(Parser, Debug)]
 pub struct CliArgs {
@@ -66,6 +111,144 @@ pub struct CliArgs {
     /// etc.) and optionally the main EXE.
     #[arg(long = "dll-tar", value_name = "PATH", value_hint = clap::ValueHint::FilePath)]
     pub dll_tar: PathBuf,
+    /// Arguments passed to the guest PE image.
+    ///
+    /// Use `--` before guest arguments that begin with `-`, for example:
+    /// `--pe-file node.exe -- --version`.
+    #[arg(trailing_var_arg = true, value_name = "ARGS", value_hint = clap::ValueHint::CommandWithArguments)]
+    pub guest_arguments: Vec<String>,
+}
+
+fn quote_windows_command_line_arg(arg: &str) -> String {
+    if !arg.is_empty() && !arg.contains([' ', '\t', '"']) {
+        return arg.to_string();
+    }
+
+    let mut out = String::with_capacity(arg.len() + 2);
+    out.push('"');
+    let mut backslashes = 0usize;
+
+    for ch in arg.chars() {
+        match ch {
+            '\\' => backslashes += 1,
+            '"' => {
+                out.extend(std::iter::repeat_n('\\', backslashes * 2 + 1));
+                out.push('"');
+                backslashes = 0;
+            }
+            _ => {
+                out.extend(std::iter::repeat_n('\\', backslashes));
+                backslashes = 0;
+                out.push(ch);
+            }
+        }
+    }
+
+    out.extend(std::iter::repeat_n('\\', backslashes * 2));
+    out.push('"');
+    out
+}
+
+fn build_guest_command_line(program_name: &str, guest_arguments: &[String]) -> String {
+    core::iter::once(program_name)
+        .chain(guest_arguments.iter().map(String::as_str))
+        .map(quote_windows_command_line_arg)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+const LDRP_HASH_BUCKET_COUNT: usize = 32;
+const LIST_ENTRY_SIZE: usize = 16;
+const LDR_HASH_LINKS_OFFSET: usize = 0x70;
+const LDR_BASE_NAME_HASH_VALUE_OFFSET: usize = 0x108;
+
+unsafe fn write_guest_usize(addr: usize, value: usize) {
+    unsafe { (addr as *mut usize).write(value) };
+}
+
+unsafe fn write_guest_u32(addr: usize, value: u32) {
+    unsafe { (addr as *mut u32).write(value) };
+}
+
+unsafe fn read_guest_u32(addr: usize) -> u32 {
+    unsafe { (addr as *const u32).read() }
+}
+
+unsafe fn init_ntdll_pebldr(peb_va: usize, pebldr_va: usize, ldr_data_va: usize) {
+    let exe_entry_va = ldr_data_va + 0x60;
+    let ntdll_entry_va = ldr_data_va + 0x180;
+    let head_load = pebldr_va + 0x10;
+    let head_mem = pebldr_va + 0x20;
+    let head_init = pebldr_va + 0x30;
+
+    unsafe {
+        write_guest_usize(peb_va + 0x18, pebldr_va);
+        write_guest_u32(pebldr_va, 0x58);
+        write_guest_u32(pebldr_va + 0x04, 1);
+        write_guest_usize(pebldr_va + 0x08, 0);
+
+        write_guest_usize(exe_entry_va, ntdll_entry_va);
+        write_guest_usize(exe_entry_va + 0x08, head_load);
+        write_guest_usize(exe_entry_va + 0x10, ntdll_entry_va + 0x10);
+        write_guest_usize(exe_entry_va + 0x18, head_mem);
+
+        write_guest_usize(ntdll_entry_va, head_load);
+        write_guest_usize(ntdll_entry_va + 0x08, exe_entry_va);
+        write_guest_usize(ntdll_entry_va + 0x10, head_mem);
+        write_guest_usize(ntdll_entry_va + 0x18, exe_entry_va + 0x10);
+        write_guest_usize(ntdll_entry_va + 0x20, head_init);
+        write_guest_usize(ntdll_entry_va + 0x28, head_init);
+
+        write_guest_usize(head_load, exe_entry_va);
+        write_guest_usize(head_load + 8, ntdll_entry_va);
+        write_guest_usize(head_mem, exe_entry_va + 0x10);
+        write_guest_usize(head_mem + 8, ntdll_entry_va + 0x10);
+        write_guest_usize(head_init, ntdll_entry_va + 0x20);
+        write_guest_usize(head_init + 8, ntdll_entry_va + 0x20);
+    }
+}
+
+unsafe fn init_ntdll_loader_globals(pebldr_va: usize, ldr_data_va: usize) {
+    let exe_entry_va = ldr_data_va + 0x60;
+    let ntdll_entry_va = ldr_data_va + 0x180;
+
+    // On the current ntdll build, CDB shows:
+    //   PebLdr                   = ntdll+0x1D28E0
+    //   LdrpImageEntry          = ntdll+0x1D27C8 = PebLdr - 0x118
+    //   LdrpNtDllDataTableEntry = ntdll+0x1D2938 = PebLdr + 0x58
+    //
+    // These are kernel-seeded globals that ntdll expects to be initialized
+    // before LdrInitializeThunk runs.
+    let ldrp_image_entry_va = pebldr_va - 0x118;
+    let ldrp_ntdll_entry_va = pebldr_va + 0x58;
+
+    unsafe {
+        write_guest_usize(ldrp_image_entry_va, exe_entry_va);
+        write_guest_usize(ldrp_ntdll_entry_va, ntdll_entry_va);
+    }
+}
+
+unsafe fn init_ntdll_loader_hash_table(hash_table_va: usize, ldr_data_va: usize) {
+    for bucket in 0..LDRP_HASH_BUCKET_COUNT {
+        let head = hash_table_va + bucket * LIST_ENTRY_SIZE;
+        unsafe {
+            write_guest_usize(head, head);
+            write_guest_usize(head + 8, head);
+        }
+    }
+
+    for entry_va in [ldr_data_va + 0x60, ldr_data_va + 0x180] {
+        let hash = unsafe { read_guest_u32(entry_va + LDR_BASE_NAME_HASH_VALUE_OFFSET) } as usize;
+        let head = hash_table_va + (hash & (LDRP_HASH_BUCKET_COUNT - 1)) * LIST_ENTRY_SIZE;
+        let hash_links = entry_va + LDR_HASH_LINKS_OFFSET;
+        let tail = unsafe { (head as *const usize).add(1).read() };
+        unsafe {
+            write_guest_usize(hash_links, head);
+            write_guest_usize(hash_links + 8, tail);
+            write_guest_usize(tail, hash_links);
+            write_guest_usize(head + 8, hash_links);
+        }
+    }
 }
 
 /// Run a Windows PE program with LiteBox.
@@ -80,6 +263,7 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     // Install a last-resort crash handler so we always see what RIP/code
     // killed the process, even if VEH failed to catch the exception.
     unsafe {
+        #[allow(clippy::struct_field_names)]
         #[repr(C)]
         struct ExceptionRecord {
             exception_code: u32,
@@ -100,24 +284,109 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
             exception_record: *const ExceptionRecord,
             context_record: *const Context,
         }
+        #[cfg(all(debug_assertions, feature = "trace_debug"))]
+        {
+            // Keep a raw handle ready for zero-allocation crash logging.
+            CRASH_FILE_HANDLE = open_trace_log_handle("crash_filter.txt");
+        }
         unsafe extern "system" fn crash_filter(info: *mut ExceptionPointers) -> i32 {
-            let info = unsafe { &*info };
-            let rec = unsafe { &*info.exception_record };
-            let ctx_bytes = unsafe { &(*info.context_record).data };
-            // Rip at offset 0xF8, Rsp at offset 0x98
-            let rip = u64::from_le_bytes(ctx_bytes[0xF8..0x100].try_into().unwrap_or([0; 8]));
-            let rsp = u64::from_le_bytes(ctx_bytes[0x98..0xA0].try_into().unwrap_or([0; 8]));
-            eprintln!(
-                "[CRASH] Unhandled exception: code=0x{:08X} addr=0x{:X} rip=0x{:X} rsp=0x{:X}",
-                rec.exception_code, rec.exception_address, rip, rsp,
-            );
-            if rec.number_parameters >= 2 {
+            unsafe {
+                let info = &*info;
+                let rec = &*info.exception_record;
+                let ctx_bytes = &(*info.context_record).data;
+                // Rip at offset 0xF8, Rsp at offset 0x98
+                let rip = u64::from_le_bytes(ctx_bytes[0xF8..0x100].try_into().unwrap_or([0; 8]));
+                let rsp = u64::from_le_bytes(ctx_bytes[0x98..0xA0].try_into().unwrap_or([0; 8]));
+
+                #[cfg(all(debug_assertions, feature = "trace_debug"))]
+                {
+                    // Write to a file using raw Win32 — eprintln may not work.
+                    unsafe extern "system" {
+                        fn WriteFile(
+                            h: *mut core::ffi::c_void,
+                            buf: *const u8,
+                            len: u32,
+                            written: *mut u32,
+                            ovl: *mut core::ffi::c_void,
+                        ) -> i32;
+                    }
+                    // Format a minimal crash message without allocation (stack buffer).
+                    let mut buf = [0u8; 512];
+                    let msg = b"[CRASH] code=0x";
+                    buf[..msg.len()].copy_from_slice(msg);
+                    let mut pos = msg.len();
+                    for i in (0..8).rev() {
+                        let nibble = ((rec.exception_code >> (i * 4)) & 0xF) as u8;
+                        buf[pos] = if nibble < 10 {
+                            b'0' + nibble
+                        } else {
+                            b'A' + nibble - 10
+                        };
+                        pos += 1;
+                    }
+                    buf[pos..pos + 5].copy_from_slice(b" rip=");
+                    pos += 5;
+                    for i in (0..16).rev() {
+                        let nibble = ((rip >> (i * 4)) & 0xF) as u8;
+                        buf[pos] = if nibble < 10 {
+                            b'0' + nibble
+                        } else {
+                            b'A' + nibble - 10
+                        };
+                        pos += 1;
+                    }
+                    buf[pos..pos + 5].copy_from_slice(b" rsp=");
+                    pos += 5;
+                    for i in (0..16).rev() {
+                        let nibble = ((rsp >> (i * 4)) & 0xF) as u8;
+                        buf[pos] = if nibble < 10 {
+                            b'0' + nibble
+                        } else {
+                            b'A' + nibble - 10
+                        };
+                        pos += 1;
+                    }
+                    if rec.number_parameters >= 2 {
+                        buf[pos..pos + 6].copy_from_slice(b" addr=");
+                        pos += 6;
+                        let addr = rec.exception_information[1] as u64;
+                        for i in (0..16).rev() {
+                            let nibble = ((addr >> (i * 4)) & 0xF) as u8;
+                            buf[pos] = if nibble < 10 {
+                                b'0' + nibble
+                            } else {
+                                b'A' + nibble - 10
+                            };
+                            pos += 1;
+                        }
+                    }
+                    buf[pos] = b'\n';
+                    pos += 1;
+
+                    if !CRASH_FILE_HANDLE.is_null() && CRASH_FILE_HANDLE != (-1isize) as *mut _ {
+                        let mut w = 0u32;
+                        WriteFile(
+                            CRASH_FILE_HANDLE,
+                            buf.as_ptr(),
+                            pos as u32,
+                            &raw mut w,
+                            core::ptr::null_mut(),
+                        );
+                    }
+                }
+
                 eprintln!(
-                    "[CRASH]   info[0]=0x{:X} info[1]=0x{:X}",
-                    rec.exception_information[0], rec.exception_information[1],
+                    "[CRASH] Unhandled exception: code=0x{:08X} addr=0x{:X} rip=0x{:X} rsp=0x{:X}",
+                    rec.exception_code, rec.exception_address, rip, rsp,
                 );
+                if rec.number_parameters >= 2 {
+                    eprintln!(
+                        "[CRASH]   info[0]=0x{:X} info[1]=0x{:X}",
+                        rec.exception_information[0], rec.exception_information[1],
+                    );
+                }
+                -1 // EXCEPTION_EXECUTE_HANDLER
             }
-            -1 // EXCEPTION_EXECUTE_HANDLER
         }
         unsafe extern "system" {
             fn SetUnhandledExceptionFilter(
@@ -149,36 +418,61 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
             ) -> i32;
         }
         static mut STDERR_HANDLE: *mut core::ffi::c_void = core::ptr::null_mut();
+        static mut LOG_FILE_HANDLE: *mut core::ffi::c_void = core::ptr::null_mut();
         STDERR_HANDLE = GetStdHandle(0xFFFF_FFF4u32); // STD_ERROR_HANDLE
+        #[cfg(all(debug_assertions, feature = "trace_debug"))]
+        {
+            // Keep a raw handle ready for zero-allocation crash logging.
+            LOG_FILE_HANDLE = open_trace_log_handle("veh_log.txt");
+        }
         unsafe extern "system" fn early_veh(info: *mut ExPtrs2) -> i32 {
-            // Zero-allocation, GS-independent handler: uses pre-captured handle.
-            let info = unsafe { &*info };
-            let code = unsafe { *(info.exception_record as *const u32) };
-            let ctx = info.context_record;
-            let rip = unsafe { *(ctx.add(0xF8) as *const u64) };
-            // Format into a stack buffer (no heap allocation).
-            let mut buf = [0u8; 128];
-            let len = {
-                let prefix = b"[EARLY-VEH] code=0x";
-                buf[..prefix.len()].copy_from_slice(prefix);
-                let mut pos = prefix.len();
-                pos += hex_u32(&mut buf[pos..], code);
-                let mid = b" rip=0x";
-                buf[pos..pos + mid.len()].copy_from_slice(mid);
-                pos += mid.len();
-                pos += hex_u64(&mut buf[pos..], rip);
-                buf[pos] = b'\n';
-                pos + 1
-            };
-            let mut written = 0u32;
-            WriteFile(
-                STDERR_HANDLE,
-                buf.as_ptr(),
-                len as u32,
-                &mut written,
-                core::ptr::null_mut(),
-            );
-            0 // EXCEPTION_CONTINUE_SEARCH
+            unsafe {
+                // Zero-allocation, GS-independent handler: uses pre-captured handle.
+                let info = &*info;
+                let code = core::ptr::read_unaligned(info.exception_record.cast::<u32>());
+                let ctx = info.context_record;
+                let rip = core::ptr::read_unaligned(ctx.add(0xF8).cast::<u64>());
+                let rsp = core::ptr::read_unaligned(ctx.add(0x98).cast::<u64>());
+                // Format into a stack buffer (no heap allocation).
+                let mut buf = [0u8; 200];
+                let len = {
+                    let prefix = b"[EARLY-VEH] code=0x";
+                    buf[..prefix.len()].copy_from_slice(prefix);
+                    let mut pos = prefix.len();
+                    pos += hex_u32(&mut buf[pos..], code);
+                    let mid = b" rip=0x";
+                    buf[pos..pos + mid.len()].copy_from_slice(mid);
+                    pos += mid.len();
+                    pos += hex_u64(&mut buf[pos..], rip);
+                    let mid2 = b" rsp=0x";
+                    buf[pos..pos + mid2.len()].copy_from_slice(mid2);
+                    pos += mid2.len();
+                    pos += hex_u64(&mut buf[pos..], rsp);
+                    buf[pos] = b'\n';
+                    pos + 1
+                };
+                let mut written = 0u32;
+                WriteFile(
+                    STDERR_HANDLE,
+                    buf.as_ptr(),
+                    len as u32,
+                    &raw mut written,
+                    core::ptr::null_mut(),
+                );
+                // Also write to dedicated log file.
+                if !LOG_FILE_HANDLE.is_null()
+                    && LOG_FILE_HANDLE != (-1isize) as *mut core::ffi::c_void
+                {
+                    WriteFile(
+                        LOG_FILE_HANDLE,
+                        buf.as_ptr(),
+                        len as u32,
+                        &raw mut written,
+                        core::ptr::null_mut(),
+                    );
+                }
+                0 // EXCEPTION_CONTINUE_SEARCH
+            }
         }
         // Minimal hex formatters (no allocation).
         fn hex_u32(buf: &mut [u8], v: u32) -> usize {
@@ -214,6 +508,43 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
             ) -> usize;
         }
         AddVectoredExceptionHandler(1, Some(early_veh)); // 1 = head (highest priority)
+
+        // VEH self-test: trigger a deliberate access violation and verify VEH fires.
+        #[cfg(debug_assertions)]
+        {
+            static mut VEH_TEST_FIRED: bool = false;
+            unsafe extern "system" fn veh_test_handler(info: *mut ExPtrs2) -> i32 {
+                unsafe {
+                    let info = &*info;
+                    let code = core::ptr::read_unaligned(info.exception_record.cast::<u32>());
+                    if code == 0xC0000005 {
+                        // ACCESS_VIOLATION — skip the faulting instruction
+                        VEH_TEST_FIRED = true;
+                        let ctx = info.context_record.cast_mut();
+                        let rip = core::ptr::read_unaligned(ctx.add(0xF8).cast::<u64>());
+                        // Skip 2 bytes (the faulting mov [0], al instruction)
+                        core::ptr::write_unaligned(ctx.add(0xF8).cast::<u64>(), rip + 2);
+                        return -1; // EXCEPTION_CONTINUE_EXECUTION
+                    }
+                    0
+                }
+            }
+            let test_h = AddVectoredExceptionHandler(1, Some(veh_test_handler));
+            // Trigger access violation: write to address 0.
+            core::arch::asm!(
+                "xor eax, eax",
+                "mov byte ptr [rax], al", // ACCESS_VIOLATION at addr 0
+                out("rax") _,
+            );
+            // Verify VEH fired.
+            unsafe extern "system" {
+                fn RemoveVectoredExceptionHandler(handle: usize) -> u32;
+            }
+            RemoveVectoredExceptionHandler(test_h);
+            if !VEH_TEST_FIRED {
+                eprintln!("[VEH-TEST] FAIL: VEH handler did NOT fire for test exception!");
+            }
+        }
     }
 
     // The EXE can come from --pe-file, or we look for it inside the tar.
@@ -288,6 +619,10 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         unhandled_stubs: Vec<(u32, String)>,
         /// RVA of KiUserExceptionDispatcher in ntdll for SEH dispatch.
         ki_user_exception_dispatcher_rva: Option<usize>,
+        /// Guest VA of ntdll's internal loader hash table.
+        ldrp_hash_table_va: usize,
+        /// Guest VA of ntdll's internal PebLdr.
+        pebldr_va: usize,
     }
 
     let load_result = {
@@ -301,16 +636,46 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
                 cli_args.dll_tar.display()
             )
         })?;
-        #[allow(clippy::cast_precision_loss)]
-        let tar_size_mb = tar_data.len() as f64 / 1_048_576.0;
-        eprintln!(
-            "[real-dlls] Read tar: {} ({tar_size_mb:.1} MB)",
+        trace_debugln!(
+            "[real-dlls] Read tar: {} ({} bytes)",
             cli_args.dll_tar.display(),
+            tar_data.len(),
         );
         // Create layered VFS early so both boot loading and the shim share it.
         // Architecture: InMemFS (writable) → DeviceFS → TarFS (read-only).
         let vfs_arc = {
-            let in_mem = litebox::fs::in_mem::FileSystem::new(&litebox);
+            let mut in_mem = litebox::fs::in_mem::FileSystem::new(&litebox);
+            in_mem.with_root_privileges(|fs| {
+                use litebox::fs::FileSystem as _;
+
+                const DIR_MODE: litebox::fs::Mode = litebox::fs::Mode::RWXU
+                    .union(litebox::fs::Mode::RGRP)
+                    .union(litebox::fs::Mode::XGRP)
+                    .union(litebox::fs::Mode::ROTH)
+                    .union(litebox::fs::Mode::XOTH);
+                const FILE_MODE: litebox::fs::Mode = litebox::fs::Mode::RUSR
+                    .union(litebox::fs::Mode::WUSR)
+                    .union(litebox::fs::Mode::RGRP)
+                    .union(litebox::fs::Mode::ROTH);
+
+                for dir in [
+                    "/c",
+                    "/c/program files",
+                    "/c/program files/common files",
+                    "/c/program files/common files/ssl",
+                ] {
+                    let _ = fs.mkdir(dir, DIR_MODE);
+                }
+                if let Ok(fd) = fs.open(
+                    "/c/program files/common files/ssl/openssl.cnf",
+                    litebox::fs::OFlags::CREAT
+                        | litebox::fs::OFlags::WRONLY
+                        | litebox::fs::OFlags::TRUNC,
+                    FILE_MODE,
+                ) {
+                    let _ = fs.close(&fd);
+                }
+            });
 
             let dev_fs = litebox::fs::devices::FileSystem::new(&litebox);
             let tar_fs =
@@ -330,9 +695,10 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
             );
             alloc::sync::Arc::new(vfs)
         };
-        eprintln!("[vfs] Layered VFS created (InMemFS → DeviceFS → TarFS)");
+        trace_debugln!("[vfs] Layered VFS created (InMemFS → DeviceFS → TarFS)");
 
         // Log VFS root entries for debugging.
+        #[cfg(all(debug_assertions, feature = "trace_debug"))]
         {
             use litebox::fs::FileSystem as _;
             if let Ok(fd) = vfs_arc.open(
@@ -341,9 +707,9 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
                 litebox::fs::Mode::RUSR,
             ) {
                 if let Ok(entries) = vfs_arc.read_dir(&fd) {
-                    eprintln!("[vfs] Root entries: {}", entries.len());
+                    trace_debugln!("[vfs] Root entries: {}", entries.len());
                     for e in &entries {
-                        eprintln!("  /{}: {:?}", e.name, e.file_type);
+                        trace_debugln!("  /{}: {:?}", e.name, e.file_type);
                     }
                 }
                 let _ = vfs_arc.close(&fd);
@@ -376,22 +742,58 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
                     })
                 })
                 .ok_or_else(|| anyhow!("No --pe-file and no .exe found in VFS"))?;
-            eprintln!("[real-dlls] Using {exe_path} from VFS");
+            trace_debugln!("[real-dlls] Using {exe_path} from VFS");
             real_dlls::read_vfs_file(&vfs_arc, &exe_path)?
         } else {
             pe_data
         };
 
-        // Parse and load the EXE.
+        let mut pe_data = pe_data;
         let exe_parsed = PeParsedFile::parse(&pe_data)
             .map_err(|e| anyhow!("Failed to parse PE executable: {e}"))?;
+
+        // Patch int 0x29 (__fastfail) → int 3 (breakpoint) only inside
+        // executable sections before loading. Scanning the entire PE corrupts
+        // arbitrary data blobs such as V8's embedded snapshot in .rdata.
+        {
+            let mut patched = 0usize;
+            for section in &exe_parsed.sections {
+                if section.characteristics
+                    & litebox_common_windows::pe::section_chars::IMAGE_SCN_MEM_EXECUTE
+                    == 0
+                {
+                    continue;
+                }
+
+                let start = section.pointer_to_raw_data as usize;
+                let size = section.size_of_raw_data as usize;
+                if size < 2 || start >= pe_data.len() {
+                    continue;
+                }
+                let end = start.saturating_add(size).min(pe_data.len());
+                let section_bytes = &mut pe_data[start..end];
+
+                for i in 0..section_bytes.len().saturating_sub(1) {
+                    if section_bytes[i] == 0xCD && section_bytes[i + 1] == 0x29 {
+                        section_bytes[i] = 0xCC; // int 3
+                        section_bytes[i + 1] = 0x90; // nop
+                        patched += 1;
+                    }
+                }
+            }
+            if patched > 0 {
+                trace_debugln!(
+                    "[real-dlls] Patched {patched} __fastfail (int 0x29) in EXE → int 3"
+                );
+            }
+        }
 
         let preferred_base = exe_parsed.image_base as usize;
         let exe_base = if preferred_base >= guest_va_start && preferred_base < guest_va_end {
             preferred_base
         } else {
             let base = (guest_va_start + 0xFFFF) & !0xFFFF;
-            eprintln!("[real-dlls] Rebasing EXE from 0x{preferred_base:X} to 0x{base:X}");
+            trace_debugln!("[real-dlls] Rebasing EXE from 0x{preferred_base:X} to 0x{base:X}");
             base
         };
         let mut pm_mapper = PmMapper::new(&process_state.pm);
@@ -418,9 +820,10 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
             }
         }
 
-        eprintln!(
+        trace_debugln!(
             "[real-dlls] EXE loaded at 0x{:X}, entry=0x{:X}",
-            exe_info.image_base, exe_info.entry_point
+            exe_info.image_base,
+            exe_info.entry_point
         );
 
         // Load ntdll with rewritten syscalls + find LdrInitializeThunk.
@@ -452,12 +855,21 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
             )
             .map_err(|e| anyhow!("Failed to map trampoline: {e:?}"))?;
 
-        eprintln!(
+        trace_debugln!(
             "[real-dlls] Trampoline at 0x{tramp_va:X}, entry ptr at +0x{entry_off:X} = 0x{syscall_entry:X}"
         );
-        eprintln!(
+        // Store the trampoline code VA for win32k stub patching.
+        // The first 0x18 bytes are three 8-byte pointer slots; code starts at +0x18.
+        process_state.set_trampoline_code_va(tramp_va + 0x18);
+        // Store KiUserInvertedFunctionTable VA so the shim can register DLLs
+        // loaded via NtMapViewOfSection (needed for SEH unwinding).
+        if result.inverted_function_table_va != 0 {
+            process_state.set_inverted_function_table_va(result.inverted_function_table_va);
+        }
+        trace_debugln!(
             "[real-dlls] {} stubs rewritten ({} identified)",
-            result.stubs_rewritten, result.stubs_identified
+            result.stubs_rewritten,
+            result.stubs_identified
         );
 
         let module_bases = vec![
@@ -497,6 +909,8 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
             syscall_map: result.syscall_map,
             unhandled_stubs: result.unhandled_stubs,
             ki_user_exception_dispatcher_rva: result.ki_user_exception_dispatcher_rva,
+            ldrp_hash_table_va: result.ldrp_hash_table_va,
+            pebldr_va: result.pebldr_va,
         }
     };
 
@@ -521,11 +935,10 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     // provides this headroom; we simulate it by lowering RSP.
     // Layout: [return_addr=0][shadow0][shadow1][shadow2][shadow3]
     // 8 bytes return addr + 32 bytes shadow = 40 bytes.
-    let stack_top = stack_alloc_top - 0x28;
-
-    if cfg!(debug_assertions) {
-        eprintln!("Stack: base=0x{stack_base:X}, top=0x{stack_top:X}");
-    }
+    trace_debugln!(
+        "Stack: base=0x{stack_base:X}, top=0x{:X}",
+        stack_alloc_top - 0x28
+    );
 
     // Synthesize PEB/TEB.
     let mut shim =
@@ -577,7 +990,33 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         core::arch::asm!("mov {}, gs:[0x60]", out(reg) host_peb, options(nostack, readonly));
         *host_peb.add(0x68).cast::<usize>()
     };
-    eprintln!("Host ApiSetMap at: 0x{host_api_set_map:X}");
+    trace_debugln!("Host ApiSetMap at: 0x{host_api_set_map:X}");
+
+    // Allocate a zeroed region for the GDI shared handle table. gdi32full's
+    // GdiProcessSetup (when gbFirst==0) reads PEB+0xF8 and stores it as
+    // gpHandleTable, then gpHandleTable+0x180000 as pGdiSharedMemory.
+    // We allocate 0x200000 (2 MB) to cover both.
+    const GDI_SHARED_SIZE: usize = 0x20_0000;
+    let gdi_shared_va = {
+        let nz_size = NonZeroPageSize::<PAGE_SIZE>::new(GDI_SHARED_SIZE)
+            .expect("GDI shared size must be page-aligned");
+        let ptr = unsafe {
+            process_state.pm.create_writable_pages(
+                None,
+                nz_size,
+                CreatePagesFlags::POPULATE_PAGES_IMMEDIATELY,
+                |_| Ok(0),
+            )
+        }
+        .map_err(|e| anyhow!("Failed to allocate GDI shared handle table: {e:?}"))?;
+        use litebox::platform::RawConstPointer as _;
+        ptr.as_usize()
+    };
+    trace_debugln!("GDI shared handle table at: 0x{gdi_shared_va:X}");
+
+    let guest_command_line =
+        build_guest_command_line(&exe_base_name_str, &cli_args.guest_arguments);
+    trace_debugln!("[runner] Guest command line: {guest_command_line}");
 
     let peb_teb_params = PebTebParams {
         stack_base: stack_alloc_top,
@@ -585,7 +1024,7 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         image_base: load_result.exe_image_base,
         image_size: load_result.exe_image_size,
         process_heap,
-        command_line_wide: exe_base_name_str.encode_utf16().collect(),
+        command_line_wide: guest_command_line.encode_utf16().collect(),
         image_path_wide: format!("\\??\\{exe_full_path_str}")
             .encode_utf16()
             .collect(),
@@ -604,10 +1043,10 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
             .iter()
             .find(|m| m.name == "ntdll.dll")
             .map_or(0, |m| m.image_size),
-        // Synthetic IDs matching what NtQueryInformationProcess returns.
-        process_id: 1000,
-        thread_id: 1004,
+        process_id: u64::from(litebox_shim_windows::peb_teb::SYNTHETIC_PROCESS_ID),
+        thread_id: u64::from(litebox_shim_windows::peb_teb::SYNTHETIC_MAIN_THREAD_ID),
         api_set_map: host_api_set_map,
+        gdi_shared_handle_table: gdi_shared_va,
     };
     let peb_teb_bytes = build_peb_teb_bytes(&peb_teb_layout, &peb_teb_params);
 
@@ -630,18 +1069,41 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     }
     .map_err(|e| anyhow!("Failed to map PEB/TEB: {e:?}"))?;
 
-    if cfg!(debug_assertions) {
-        eprintln!(
+    unsafe {
+        init_ntdll_pebldr(
+            peb_teb_layout.peb_va,
+            load_result.pebldr_va,
+            peb_teb_layout.ldr_data_va,
+        );
+        init_ntdll_loader_globals(load_result.pebldr_va, peb_teb_layout.ldr_data_va);
+        init_ntdll_loader_hash_table(load_result.ldrp_hash_table_va, peb_teb_layout.ldr_data_va);
+    }
+    trace_debugln!(
+        "[real-dlls] Seeded internal PebLdr at 0x{:X}",
+        load_result.pebldr_va
+    );
+    trace_debugln!("[real-dlls] Seeded LdrpImageEntry/LdrpNtDllDataTableEntry");
+    trace_debugln!(
+        "[real-dlls] Seeded LdrpHashTable at 0x{:X} with EXE/ntdll entries",
+        load_result.ldrp_hash_table_va
+    );
+
+    #[cfg(all(debug_assertions, feature = "trace_debug"))]
+    {
+        trace_debugln!(
             "PEB/TEB mapped at 0x{:X} (TEB=0x{:X}, PEB=0x{:X})",
-            PEB_TEB_BASE, peb_teb_layout.teb_va, peb_teb_layout.peb_va
+            PEB_TEB_BASE,
+            peb_teb_layout.teb_va,
+            peb_teb_layout.peb_va
         );
         // Dump the LDR module entries to verify correctness.
         let ldr_va = peb_teb_layout.ldr_data_va;
         unsafe {
             let peb_image_base = core::ptr::read((peb_teb_layout.peb_va + 0x10) as *const u64);
             let peb_ldr_ptr = core::ptr::read((peb_teb_layout.peb_va + 0x18) as *const u64);
-            eprintln!(
-                "[LDR-verify] PEB.ImageBaseAddress=0x{peb_image_base:X}, PEB.Ldr=0x{peb_ldr_ptr:X} (expected 0x{ldr_va:X})"
+            trace_debugln!(
+                "[LDR-verify] PEB.ImageBaseAddress=0x{peb_image_base:X}, PEB.Ldr=0x{peb_ldr_ptr:X} (synthetic 0x{ldr_va:X}, internal 0x{:X})",
+                load_result.pebldr_va
             );
 
             // EXE entry at ldr_va + 0x60
@@ -649,7 +1111,7 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
             let exe_size = core::ptr::read((ldr_va + 0x60 + 0x40) as *const u32);
             let exe_load_order_next = core::ptr::read((ldr_va + 0x60) as *const u64);
             let exe_load_order_prev = core::ptr::read((ldr_va + 0x60 + 0x08) as *const u64);
-            eprintln!(
+            trace_debugln!(
                 "[LDR-verify] EXE entry(0x{:X}): DllBase=0x{exe_dll_base:X} SizeOfImage=0x{exe_size:X} Flink=0x{exe_load_order_next:X} Blink=0x{exe_load_order_prev:X}",
                 ldr_va + 0x60
             );
@@ -659,7 +1121,7 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
             let ntdll_size = core::ptr::read((ldr_va + 0x180 + 0x40) as *const u32);
             let ntdll_load_order_next = core::ptr::read((ldr_va + 0x180) as *const u64);
             let ntdll_load_order_prev = core::ptr::read((ldr_va + 0x180 + 0x08) as *const u64);
-            eprintln!(
+            trace_debugln!(
                 "[LDR-verify] ntdll entry(0x{:X}): DllBase=0x{ntdll_dll_base:X} SizeOfImage=0x{ntdll_size:X} Flink=0x{ntdll_load_order_next:X} Blink=0x{ntdll_load_order_prev:X}",
                 ldr_va + 0x180
             );
@@ -667,7 +1129,7 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
             // Head pointers
             let load_order_head_next = core::ptr::read((ldr_va + 0x10) as *const u64);
             let load_order_head_prev = core::ptr::read((ldr_va + 0x18) as *const u64);
-            eprintln!(
+            trace_debugln!(
                 "[LDR-verify] InLoadOrderModuleList head(0x{:X}): Flink=0x{load_order_head_next:X} Blink=0x{load_order_head_prev:X}",
                 ldr_va + 0x10
             );
@@ -699,6 +1161,7 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         // Build the CONTEXT that LdrInitializeThunk will pass to NtContinue
         // after initialization is complete. This describes the post-init state.
         let mut ctx_bytes = vec![0u8; CONTEXT_SIZE];
+        let default_fp = litebox_common_linux::FpRegs::default();
         // ContextFlags at offset 0x30
         ctx_bytes[0x30..0x34].copy_from_slice(&CONTEXT_FULL.to_le_bytes());
         // EFlags at 0x44: IF + reserved bit 1
@@ -711,12 +1174,21 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         ctx_bytes[0x80..0x88].copy_from_slice(&(load_result.exe_entry_point as u64).to_le_bytes());
         // Rdx at 0x88 = 0 (second param: thread parameter)
         ctx_bytes[0x88..0x90].copy_from_slice(&0u64.to_le_bytes());
-        // Rsp at 0x98 = clean stack below the context
-        ctx_bytes[0x98..0xA0].copy_from_slice(&((context_va - 0x200) as u64).to_le_bytes());
+        // Rsp at 0x98 = clean stack below the context.
+        //
+        // RtlUserThreadStart expects Windows x64 function-entry alignment:
+        // RSP % 16 == 8 on entry. A real CALL would have pushed an 8-byte
+        // return address; NtContinue does not, so we must bias the restored
+        // RSP by +8 ourselves to preserve the same invariant.
+        ctx_bytes[0x98..0xA0].copy_from_slice(&((context_va - 0x1F8) as u64).to_le_bytes());
         // Rip at 0xF8 = RtlUserThreadStart
         ctx_bytes[0xF8..0x100].copy_from_slice(&(rtl_uts_va as u64).to_le_bytes());
-        // MxCsr at 0x34 = default value (0x1F80)
-        ctx_bytes[0x34..0x38].copy_from_slice(&0x1F80u32.to_le_bytes());
+        // Seed both the top-level MxCsr field and CONTEXT.FltSave with sane
+        // default FP/SIMD state. NtContinue restores from FltSave, so leaving
+        // the FXSAVE area zeroed would start the guest with MXCSR=0 and
+        // unmask floating-point exceptions.
+        ctx_bytes[0x34..0x38].copy_from_slice(&default_fp.data[24..28]);
+        ctx_bytes[0x100..0x100 + 512].copy_from_slice(&default_fp.data[..512]);
 
         // Write CONTEXT bytes to guest stack memory.
         unsafe {
@@ -730,7 +1202,7 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
             .find(|m| m.name == "ntdll.dll")
             .map_or(0, |m| m.base_address);
 
-        eprintln!(
+        trace_debugln!(
             "[ntdll-init] CONTEXT at 0x{context_va:X} (Rip=0x{rtl_uts_va:X}, \
                  Rcx=0x{:X}), LdrInitializeThunk at 0x{ldr_init_va:X}, RSP=0x{ldr_rsp:X}, \
                  ntdll_base=0x{ntdll_base:X}",
@@ -747,6 +1219,7 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         teb_va: peb_teb_layout.teb_va,
         peb_va: peb_teb_layout.peb_va,
         image_base: load_result.exe_image_base,
+        image_size: load_result.exe_image_size,
         process_params_va: peb_teb_layout.process_params_va,
         cmdline_ansi_va: peb_teb_layout.cmdline_ansi_buffer_va,
         env_block_va: peb_teb_layout.env_block_va,
@@ -756,6 +1229,7 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         exe_path: exe_full_path,
         initial_rcx: context_ptr_arg,
         initial_rdx: ntdll_base_arg,
+        rtl_user_thread_start_va: load_result.rtl_user_thread_start_va,
         ki_user_exception_dispatcher_rva: load_result.ki_user_exception_dispatcher_rva,
     });
 
@@ -901,6 +1375,18 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     }
 
     let exit_code = shim.exit_code();
+    // Write to a file (avoids any stderr buffering/handle issues).
+    let msg = format!(
+        "[runner] Exiting with code 0x{:X} ({}). Regs: rip=0x{:X} rsp=0x{:X} rax=0x{:X}\n",
+        exit_code as u32, exit_code, ctx.regs.rip, ctx.regs.rsp, ctx.regs.rax,
+    );
+    #[cfg(all(debug_assertions, feature = "trace_debug"))]
+    write_trace_log("runner_exit.txt", msg.as_bytes());
+    if exit_code != 0 {
+        eprintln!("{msg}");
+    } else {
+        trace_debugln!("{msg}");
+    }
     std::process::exit(exit_code)
 }
 
@@ -926,7 +1412,7 @@ impl<'a> PmMapper<'a> {
     /// Reserve the full PE image range as writable pages via the PageManager.
     fn pre_reserve(&self, base: usize, size: usize) -> Result<(), PeLoadError> {
         let aligned = (size + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
-        eprintln!("[pm-mapper] pre_reserve(0x{base:X}, 0x{aligned:X})");
+        trace_debugln!("[pm-mapper] pre_reserve(0x{base:X}, 0x{aligned:X})");
         let addr = NonZeroAddress::<PAGE_SIZE>::new(base).ok_or(PeLoadError::MapFailed)?;
         let page_size = NonZeroPageSize::<PAGE_SIZE>::new(aligned).ok_or(PeLoadError::MapFailed)?;
         let flags = CreatePagesFlags::FIXED_ADDR | CreatePagesFlags::POPULATE_PAGES_IMMEDIATELY;
@@ -936,7 +1422,9 @@ impl<'a> PmMapper<'a> {
                 .create_writable_pages(Some(addr), page_size, flags, |_| Ok(0))
         }
         .map_err(|e| {
-            eprintln!("[pm-mapper] pre_reserve FAILED: {e:?}");
+            #[cfg(not(all(debug_assertions, feature = "trace_debug")))]
+            let _ = &e;
+            trace_debugln!("[pm-mapper] pre_reserve FAILED: {e:?}");
             PeLoadError::MapFailed
         })?;
         Ok(())
@@ -952,7 +1440,7 @@ impl PeMemoryMapper for PmMapper<'_> {
         perm: SectionPermissions,
     ) -> Result<(), PeLoadError> {
         let aligned = (size + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
-        eprintln!(
+        trace_debugln!(
             "[pm-mapper] map_section(0x{va:X}, data_len={}, size=0x{size:X}/{aligned:X}, perm={perm:?})",
             data.len()
         );
@@ -962,6 +1450,11 @@ impl PeMemoryMapper for PmMapper<'_> {
         if !data.is_empty() {
             unsafe {
                 core::ptr::copy_nonoverlapping(data.as_ptr(), va as *mut u8, data.len());
+            }
+        }
+        if data.len() < size {
+            unsafe {
+                core::ptr::write_bytes((va + data.len()) as *mut u8, 0, size - data.len());
             }
         }
 
@@ -979,7 +1472,9 @@ impl PeMemoryMapper for PmMapper<'_> {
             }
         }
         .map_err(|e| {
-            eprintln!("[pm-mapper] permission change FAILED: {e:?}");
+            #[cfg(not(all(debug_assertions, feature = "trace_debug")))]
+            let _ = &e;
+            trace_debugln!("[pm-mapper] permission change FAILED: {e:?}");
             PeLoadError::MapFailed
         })?;
 
@@ -1054,9 +1549,7 @@ fn connect_to_broker_ipc(addr: &str) -> Result<std::net::TcpStream> {
     if mtu != HANDSHAKE_MTU {
         anyhow::bail!("IPC handshake: MTU mismatch (broker sent {mtu}, we expect {HANDSHAKE_MTU})");
     }
-    if cfg!(debug_assertions) {
-        eprintln!("IPC handshake complete: broker MTU={mtu}");
-    }
+    trace_debugln!("IPC handshake complete: broker MTU={mtu}");
 
     // Switch to non-blocking for the platform's poll-based I/O loop.
     stream
@@ -1115,7 +1608,9 @@ fn start_network_worker(
 /// Capture NLS data from the host's real ntdll so the shim doesn't need to
 /// call host APIs (GetModuleHandleA, GetProcAddress, VirtualQuery) at runtime.
 fn capture_host_nls_data() -> Option<litebox_shim_windows::NlsData> {
-    type NtInitNlsFn = unsafe extern "system" fn(*mut *mut u8, *mut u32, *mut i64) -> i32;
+    type NtInitNlsFn = unsafe extern "system" fn(*mut *mut u8, *mut u32, *mut i64, *mut u32) -> i32;
+    type NtGetNlsSectionPtrFn =
+        unsafe extern "system" fn(u32, u32, *mut core::ffi::c_void, *mut *mut u8, *mut u32) -> i32;
 
     unsafe extern "system" {
         fn GetModuleHandleA(name: *const u8) -> *mut core::ffi::c_void;
@@ -1135,11 +1630,26 @@ fn capture_host_nls_data() -> Option<litebox_shim_windows::NlsData> {
         if proc.is_null() {
             return None;
         }
+        let get_section_proc = GetProcAddress(ntdll, c"NtGetNlsSectionPtr".as_ptr().cast());
         let func: NtInitNlsFn = core::mem::transmute(proc);
+        let get_section: Option<NtGetNlsSectionPtrFn> = if get_section_proc.is_null() {
+            None
+        } else {
+            Some(core::mem::transmute::<
+                *mut core::ffi::c_void,
+                NtGetNlsSectionPtrFn,
+            >(get_section_proc))
+        };
         let mut base: *mut u8 = core::ptr::null_mut();
         let mut locale: u32 = 0;
         let mut casing: i64 = 0;
-        let status = func(&mut base, &mut locale, &mut casing);
+        let mut version: u32 = 0;
+        let status = func(
+            &raw mut base,
+            &raw mut locale,
+            &raw mut casing,
+            &raw mut version,
+        );
         if status != 0 || base.is_null() {
             return None;
         }
@@ -1161,10 +1671,77 @@ fn capture_host_nls_data() -> Option<litebox_shim_windows::NlsData> {
         let ret = VirtualQuery(base, (&raw mut mbi).cast(), core::mem::size_of::<Mbi>());
         let section_size = if ret != 0 { mbi.region_size } else { 0xD3000 };
         let section = core::slice::from_raw_parts(base, section_size).to_vec();
+        let mut sections = alloc::vec::Vec::new();
+        if let Some(get_section) = get_section {
+            for section_data in [1252_u32, 437_u32, 10000_u32] {
+                let mut section_ptr: *mut u8 = core::ptr::null_mut();
+                let mut section_len: u32 = 0;
+                let section_status = get_section(
+                    11,
+                    section_data,
+                    core::ptr::null_mut(),
+                    &raw mut section_ptr,
+                    &raw mut section_len,
+                );
+                if section_status == 0 && !section_ptr.is_null() && section_len != 0 {
+                    let bytes =
+                        core::slice::from_raw_parts(section_ptr, section_len as usize).to_vec();
+                    sections.push(litebox_shim_windows::NlsSectionData {
+                        section_type: 11,
+                        section_data,
+                        bytes,
+                    });
+                }
+            }
+        }
         Some(litebox_shim_windows::NlsData {
             section,
             locale_id: locale,
             casing_size: casing,
+            version,
+            sections,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{build_guest_command_line, quote_windows_command_line_arg};
+
+    #[test]
+    fn windows_command_line_keeps_simple_arg_unquoted() {
+        assert_eq!(quote_windows_command_line_arg("--version"), "--version");
+    }
+
+    #[test]
+    fn windows_command_line_quotes_whitespace() {
+        assert_eq!(
+            quote_windows_command_line_arg(r"C:\Program Files\node.exe"),
+            r#""C:\Program Files\node.exe""#
+        );
+    }
+
+    #[test]
+    fn windows_command_line_escapes_embedded_quotes() {
+        assert_eq!(
+            quote_windows_command_line_arg(r#"say "hello""#),
+            r#""say \"hello\"""#
+        );
+    }
+
+    #[test]
+    fn windows_command_line_doubles_trailing_backslashes_inside_quotes() {
+        assert_eq!(
+            quote_windows_command_line_arg("dir with space\\"),
+            r#""dir with space\\""#,
+        );
+    }
+
+    #[test]
+    fn guest_command_line_includes_program_and_arguments() {
+        assert_eq!(
+            build_guest_command_line("node.exe", &["--version".to_string()]),
+            "node.exe --version"
+        );
     }
 }

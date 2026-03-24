@@ -207,16 +207,19 @@ fn load_pe_inner(
     for section in &parsed.sections {
         let section_va = base_address + section.virtual_address as usize;
         let virtual_size = section.virtual_size as usize;
-        if virtual_size == 0 {
+        let raw_size = section.size_of_raw_data as usize;
+        let section_size = virtual_size.max(raw_size);
+        if section_size == 0 {
             continue;
         }
-        let map_size = page_align_up(virtual_size);
+        let map_size = page_align_up(section_size);
         let perm = section_permissions(section.characteristics);
 
-        // File data to copy (may be less than virtual_size for BSS).
-        let raw_size = section.size_of_raw_data as usize;
+        // File data to copy. Some images legitimately have
+        // SizeOfRawData > VirtualSize, and the loader must preserve the full
+        // file-backed contents rather than truncating to VirtualSize.
         let raw_offset = section.pointer_to_raw_data as usize;
-        let copy_len = raw_size.min(virtual_size);
+        let copy_len = raw_size.min(section_size);
 
         let file_data = if copy_len > 0 && raw_offset + copy_len <= effective_data.len() {
             &effective_data[raw_offset..raw_offset + copy_len]
@@ -614,6 +617,80 @@ mod tests {
         assert_eq!(mapper.mappings[0].2, SectionPermissions::ReadOnly);
         // .text should be RX
         assert_eq!(mapper.mappings[1].2, SectionPermissions::ReadExecute);
+    }
+
+    #[test]
+    fn load_pe_preserves_raw_bytes_beyond_virtual_size() {
+        let exports = vec![
+            StubExport::syscall_stub("NtClose", 0x0006),
+            StubExport::syscall_stub("NtWriteFile", 0x0001),
+        ];
+        let base: u64 = 0x1800_0000_0000;
+        let mut dll_bytes = build_stub_dll("ntdll.dll", &exports, base);
+
+        let pe_offset = u32::from_le_bytes(dll_bytes[0x3c..0x40].try_into().unwrap()) as usize;
+        let num_sections =
+            u16::from_le_bytes(dll_bytes[pe_offset + 6..pe_offset + 8].try_into().unwrap())
+                as usize;
+        let optional_header_size = u16::from_le_bytes(
+            dll_bytes[pe_offset + 20..pe_offset + 22]
+                .try_into()
+                .unwrap(),
+        ) as usize;
+        let section_table_offset = pe_offset + 24 + optional_header_size;
+
+        let mut expected_va = None;
+        let mut expected_tail_offset = 0usize;
+        let mut expected_tail_bytes = Vec::new();
+
+        for index in 0..num_sections {
+            let section_offset = section_table_offset + index * 40;
+            let virtual_address = u32::from_le_bytes(
+                dll_bytes[section_offset + 12..section_offset + 16]
+                    .try_into()
+                    .unwrap(),
+            ) as usize;
+            let raw_size = u32::from_le_bytes(
+                dll_bytes[section_offset + 16..section_offset + 20]
+                    .try_into()
+                    .unwrap(),
+            ) as usize;
+            let raw_offset = u32::from_le_bytes(
+                dll_bytes[section_offset + 20..section_offset + 24]
+                    .try_into()
+                    .unwrap(),
+            ) as usize;
+            if raw_size < 16 || raw_offset + raw_size > dll_bytes.len() {
+                continue;
+            }
+
+            let new_virtual_size = raw_size - 16;
+            for (i, byte) in dll_bytes[raw_offset + new_virtual_size..raw_offset + raw_size]
+                .iter_mut()
+                .enumerate()
+            {
+                *byte = 0xA0u8.wrapping_add(i as u8);
+            }
+            let tail = dll_bytes[raw_offset + new_virtual_size..raw_offset + raw_size].to_vec();
+
+            dll_bytes[section_offset + 8..section_offset + 12]
+                .copy_from_slice(&(new_virtual_size as u32).to_le_bytes());
+            expected_va = Some(base as usize + virtual_address);
+            expected_tail_offset = new_virtual_size;
+            expected_tail_bytes = tail;
+            break;
+        }
+
+        let expected_va = expected_va.expect("failed to find section with non-zero raw overhang");
+        let parsed = PeParsedFile::parse(&dll_bytes).unwrap();
+        let mut mapper = TestMapper::new();
+        load_pe(&parsed, &dll_bytes, base as usize, &mut mapper).unwrap();
+
+        let mapped = mapper.memory.get(&expected_va).unwrap();
+        assert_eq!(
+            &mapped[expected_tail_offset..expected_tail_offset + expected_tail_bytes.len()],
+            expected_tail_bytes.as_slice()
+        );
     }
 
     #[test]

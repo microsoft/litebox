@@ -16,8 +16,8 @@ use crate::PmMapper;
 
 use anyhow::{Result, anyhow};
 use litebox_common_windows::ntdll_rewriter;
-use litebox_common_windows::pe_loader::{IatPatch, LoadedModule, load_pe};
 use litebox_common_windows::pe::IMAGE_DIRECTORY_ENTRY_EXCEPTION;
+use litebox_common_windows::pe_loader::{IatPatch, LoadedModule, load_pe};
 use litebox_common_windows::pe_parser::PeParsedFile;
 
 /// Read an entire file from VFS into a `Vec<u8>`.
@@ -168,8 +168,10 @@ pub struct NtdllInitLoadResult {
     /// Offset within trampoline where the reverse GS table pointer goes.
     pub reverse_gs_table_ptr_offset: usize,
     /// Number of ntdll syscall stubs that were rewritten.
+    #[allow(dead_code)]
     pub stubs_rewritten: usize,
     /// Number of stubs whose syscall number was identified (matched export name).
+    #[allow(dead_code)]
     pub stubs_identified: usize,
     /// VA of ntdll!LdrInitializeThunk (thread entry point).
     pub ldr_init_thunk_va: usize,
@@ -181,6 +183,157 @@ pub struct NtdllInitLoadResult {
     pub unhandled_stubs: Vec<(u32, String)>,
     /// RVA of KiUserExceptionDispatcher in ntdll (for SEH dispatch).
     pub ki_user_exception_dispatcher_rva: Option<usize>,
+    /// Guest VA of `ntdll!KiUserInvertedFunctionTable`.  The shim uses this
+    /// to register loaded DLLs so SEH unwinding finds their .pdata.
+    pub inverted_function_table_va: usize,
+    /// Guest VA of `ntdll!LdrpHashTable`.
+    pub ldrp_hash_table_va: usize,
+    /// Guest VA of `ntdll!PebLdr`.
+    pub pebldr_va: usize,
+}
+
+fn find_ntdll_hash_table_va(parsed: &PeParsedFile, image_base: usize) -> Result<usize> {
+    let text = parsed
+        .sections
+        .iter()
+        .find(|s| s.name.starts_with(b".text"))
+        .ok_or_else(|| anyhow!("ntdll missing .text section"))?;
+
+    // 41 83 E5 1F                and r13d, 1Fh
+    // 48 8D 05 xx xx xx xx       lea rax, [rip+disp32]  ; LdrpHashTable
+    // 49 C1 E5 04                shl r13, 4
+    // 4C 03 E8                   add r13, rax
+    // 4D 8B 7D 00                mov r15, [r13]
+    // 4D 3B FD                   cmp r15, r13
+    const PATTERN: [Option<u8>; 25] = [
+        Some(0x41),
+        Some(0x83),
+        Some(0xE5),
+        Some(0x1F),
+        Some(0x48),
+        Some(0x8D),
+        Some(0x05),
+        None,
+        None,
+        None,
+        None,
+        Some(0x49),
+        Some(0xC1),
+        Some(0xE5),
+        Some(0x04),
+        Some(0x4C),
+        Some(0x03),
+        Some(0xE8),
+        Some(0x4D),
+        Some(0x8B),
+        Some(0x7D),
+        Some(0x00),
+        Some(0x4D),
+        Some(0x3B),
+        Some(0xFD),
+    ];
+
+    let text_va = image_base + text.virtual_address as usize;
+    let text_len = text.virtual_size.max(text.size_of_raw_data) as usize;
+    let text_bytes = unsafe { core::slice::from_raw_parts(text_va as *const u8, text_len) };
+
+    let mut match_va = None;
+    for off in 0..=text_bytes.len().saturating_sub(PATTERN.len()) {
+        let matched = PATTERN
+            .iter()
+            .enumerate()
+            .all(|(i, byte)| byte.is_none_or(|b| text_bytes[off + i] == b));
+        if !matched {
+            continue;
+        }
+
+        if match_va.is_some() {
+            anyhow::bail!("ntdll LdrpHashTable signature matched multiple locations");
+        }
+
+        let disp = i32::from_le_bytes(text_bytes[off + 7..off + 11].try_into().unwrap()) as isize;
+        let lea_next_rip = (text_va + off + 11) as isize;
+        match_va = Some((lea_next_rip + disp) as usize);
+    }
+
+    match_va.ok_or_else(|| anyhow!("failed to locate ntdll!LdrpHashTable"))
+}
+
+fn find_ntdll_pebldr_va(parsed: &PeParsedFile, image_base: usize) -> Result<usize> {
+    let text = parsed
+        .sections
+        .iter()
+        .find(|s| s.name.starts_with(b".text"))
+        .ok_or_else(|| anyhow!("ntdll missing .text section"))?;
+
+    // 48 8B 3D xx xx xx xx       mov rdi, [rip+disp32]  ; PebLdr+0x10
+    // BB 01 00 00 00             mov ebx, 1
+    // 83 64 24 60 00             and dword ptr [rsp+60h], 0
+    // 48 8D 05 yy yy yy yy       lea rax, [rip+disp32]  ; PebLdr+0x10
+    // 48 3B F8                   cmp rdi, rax
+    const PATTERN: [Option<u8>; 27] = [
+        Some(0x48),
+        Some(0x8B),
+        Some(0x3D),
+        None,
+        None,
+        None,
+        None,
+        Some(0xBB),
+        Some(0x01),
+        Some(0x00),
+        Some(0x00),
+        Some(0x00),
+        Some(0x83),
+        Some(0x64),
+        Some(0x24),
+        Some(0x60),
+        Some(0x00),
+        Some(0x48),
+        Some(0x8D),
+        Some(0x05),
+        None,
+        None,
+        None,
+        None,
+        Some(0x48),
+        Some(0x3B),
+        Some(0xF8),
+    ];
+
+    let text_va = image_base + text.virtual_address as usize;
+    let text_len = text.virtual_size.max(text.size_of_raw_data) as usize;
+    let text_bytes = unsafe { core::slice::from_raw_parts(text_va as *const u8, text_len) };
+
+    let mut match_va = None;
+    for off in 0..=text_bytes.len().saturating_sub(PATTERN.len()) {
+        let matched = PATTERN
+            .iter()
+            .enumerate()
+            .all(|(i, byte)| byte.is_none_or(|b| text_bytes[off + i] == b));
+        if !matched {
+            continue;
+        }
+
+        let disp_load =
+            i32::from_le_bytes(text_bytes[off + 3..off + 7].try_into().unwrap()) as isize;
+        let disp_lea =
+            i32::from_le_bytes(text_bytes[off + 20..off + 24].try_into().unwrap()) as isize;
+        let head_va_from_load = ((text_va + off + 7) as isize + disp_load) as usize;
+        let head_va_from_lea = ((text_va + off + 24) as isize + disp_lea) as usize;
+
+        if head_va_from_load != head_va_from_lea {
+            continue;
+        }
+
+        if match_va.is_some() {
+            anyhow::bail!("ntdll PebLdr signature matched multiple locations");
+        }
+
+        match_va = Some(head_va_from_load - 0x10);
+    }
+
+    match_va.ok_or_else(|| anyhow!("failed to locate ntdll!PebLdr"))
 }
 
 /// Load only ntdll.dll from VFS for the ntdll-driven init approach.
@@ -195,7 +348,7 @@ pub fn load_ntdll_for_init(
     let ntdll_path = find_vfs_file_by_name(fs, "ntdll.dll")
         .ok_or_else(|| anyhow!("ntdll.dll not found in VFS"))?;
     let ntdll_data = read_vfs_file(fs, &ntdll_path)?;
-    eprintln!(
+    trace_debugln!(
         "[real-dlls] Read ntdll.dll from VFS ({} bytes, path={ntdll_path:?})",
         ntdll_data.len()
     );
@@ -217,13 +370,16 @@ pub fn load_ntdll_for_init(
     // Rewrite ntdll syscall stubs.
     let rewrite =
         ntdll_rewriter::rewrite_ntdll(&ntdll_data, ntdll_load_va as u64, trampoline_va as u64);
-    eprintln!(
+    trace_debugln!(
         "[real-dlls] Rewrote {} ntdll syscall stubs ({} identified), {} __fastfail patched",
-        rewrite.stubs_rewritten, rewrite.stubs_identified, rewrite.fastfail_patched
+        rewrite.stubs_rewritten,
+        rewrite.stubs_identified,
+        rewrite.fastfail_patched
     );
     // Log unhandled stubs for debugging.
+    #[cfg(all(debug_assertions, feature = "trace_debug"))]
     for (nr, name) in &rewrite.unhandled_stubs {
-        eprintln!("[real-dlls] unhandled stub: nr=0x{nr:04X} name={name}");
+        trace_debugln!("[real-dlls] unhandled stub: nr=0x{nr:04X} name={name}");
     }
 
     // -----------------------------------------------------------------------
@@ -262,47 +418,84 @@ pub fn load_ntdll_for_init(
         for &rva in error_path_rvas {
             if let Some(file_off) = parsed_tmp.rva_to_file_offset(rva as u32) {
                 image[file_off] = 0xCC; // INT3
-                eprintln!("[real-dlls] INT3 at ntdll+0x{rva:X} (file offset 0x{file_off:X})");
+                trace_debugln!("[real-dlls] INT3 at ntdll+0x{rva:X} (file offset 0x{file_off:X})");
             } else {
-                eprintln!("[real-dlls] WARN: could not patch INT3 at ntdll+0x{rva:X}");
+                trace_debugln!("[real-dlls] WARN: could not patch INT3 at ntdll+0x{rva:X}");
             }
         }
 
-        // --- Patch 1: CSRSS client stubs → return STATUS_SUCCESS -----------
+        // --- Patch 1: CSRSS client stubs ─────────────────────────────────
         //
         // CsrClientConnectToServer and CsrClientCallServer try to talk to the
         // Win32 subsystem server (csrss.exe) via LPC/ALPC.  There is no CSRSS
-        // in the sandbox, so these calls would deadlock.  Replacing the first
-        // three bytes with `xor eax, eax; ret` (31 C0 C3) makes them return 0
-        // (STATUS_SUCCESS / NTSTATUS 0) immediately.
-        let csr_functions: &[&str] = &["CsrClientConnectToServer", "CsrClientCallServer"];
-        // Collect (name, rva) first to avoid borrow conflicts with image.
-        let csr_rvas: Vec<(String, u32)> = {
-            let exports = parsed_tmp.exports(&image);
-            csr_functions
-                .iter()
-                .filter_map(|&func_name| {
-                    exports
-                        .iter()
-                        .find(|e| e.name == Some(func_name))
-                        .map(|e| (func_name.to_string(), e.rva))
-                })
-                .collect()
-        };
-        for (name, rva) in &csr_rvas {
-            if let Some(file_off) = parsed_tmp.rva_to_file_offset(*rva) {
-                let off = file_off;
-                if off + 3 <= image.len() {
+        // in the sandbox, so these calls would deadlock.
+        //
+        // CsrClientConnectToServer is converted into a pseudo-syscall
+        // (trampolined to the shim) so that the shim can fill in the
+        // ConnectionInformation output buffer.  Without this, USER32's
+        // _UserClientDllInitialize copies an empty buffer into gSharedInfo,
+        // leaving gSharedInfo.psi = NULL and causing DllMain to fail.
+        //
+        // CsrClientCallServer (fire-and-forget) keeps the simple
+        // `xor eax, eax; ret` (STATUS_SUCCESS) patch.
+        let trampoline_code_va = (trampoline_va as u64) + 0x18;
+
+        // Patch CsrClientConnectToServer → pseudo-syscall trampoline.
+        {
+            let rva_opt = {
+                let exports = parsed_tmp.exports(&image);
+                exports
+                    .iter()
+                    .find(|e| e.name == Some("CsrClientConnectToServer"))
+                    .map(|e| e.rva)
+            };
+            if let Some(rva) = rva_opt {
+                if let Some(off) = parsed_tmp.rva_to_file_offset(rva) {
+                    // 22-byte stub: mov r10,rcx; mov eax,NR; jmp [rip+0]; <8-byte addr>
+                    if off + 22 <= image.len() {
+                        let nr = litebox_common_windows::stub_dlls::CSR_CLIENT_CONNECT_TO_SERVER;
+                        image[off] = 0x4C; // mov r10, rcx
+                        image[off + 1] = 0x8B;
+                        image[off + 2] = 0xD1;
+                        image[off + 3] = 0xB8; // mov eax, <nr>
+                        image[off + 4..off + 8].copy_from_slice(&nr.to_le_bytes());
+                        image[off + 8] = 0xFF; // jmp [rip+0]
+                        image[off + 9] = 0x25;
+                        image[off + 10..off + 14].copy_from_slice(&0u32.to_le_bytes());
+                        image[off + 14..off + 22]
+                            .copy_from_slice(&trampoline_code_va.to_le_bytes());
+                        trace_debugln!(
+                            "[real-dlls] Patched CsrClientConnectToServer → pseudo-syscall 0x{nr:X} at ntdll+0x{rva:X}"
+                        );
+                    }
+                }
+            } else {
+                trace_debugln!(
+                    "[real-dlls] WARN: CsrClientConnectToServer not found in ntdll exports"
+                );
+            }
+        }
+
+        // Patch CsrClientCallServer → xor eax, eax; ret (STATUS_SUCCESS).
+        {
+            let rva_opt = {
+                let exports = parsed_tmp.exports(&image);
+                exports
+                    .iter()
+                    .find(|e| e.name == Some("CsrClientCallServer"))
+                    .map(|e| e.rva)
+            };
+            if let Some(rva) = rva_opt {
+                if let Some(off) = parsed_tmp.rva_to_file_offset(rva)
+                    && off + 3 <= image.len()
+                {
                     image[off] = 0x31; // xor eax, eax
                     image[off + 1] = 0xC0;
                     image[off + 2] = 0xC3; // ret
-                    eprintln!("[real-dlls] Patched {name} at ntdll+0x{rva:X}");
+                    trace_debugln!("[real-dlls] Patched CsrClientCallServer at ntdll+0x{rva:X}");
                 }
-            }
-        }
-        for func_name in csr_functions {
-            if !csr_rvas.iter().any(|(n, _)| n == func_name) {
-                eprintln!("[real-dlls] WARN: {func_name} not found in ntdll exports");
+            } else {
+                trace_debugln!("[real-dlls] WARN: CsrClientCallServer not found in ntdll exports");
             }
         }
 
@@ -327,20 +520,20 @@ pub fn load_ntdll_for_init(
                     .map(|e| e.rva)
             };
             if let Some(rva) = rva_opt {
-                if let Some(off) = parsed_tmp.rva_to_file_offset(rva) {
-                    if off + 5 <= image.len() {
-                        image[off] = 0x31; // xor eax, eax
-                        image[off + 1] = 0xC0;
-                        image[off + 2] = 0x89; // mov [rcx], eax
-                        image[off + 3] = 0x01;
-                        image[off + 4] = 0xC3; // ret
-                        eprintln!(
-                            "[real-dlls] Patched RtlGetCurrentProcessorNumberEx at ntdll+0x{rva:X}"
-                        );
-                    }
+                if let Some(off) = parsed_tmp.rva_to_file_offset(rva)
+                    && off + 5 <= image.len()
+                {
+                    image[off] = 0x31; // xor eax, eax
+                    image[off + 1] = 0xC0;
+                    image[off + 2] = 0x89; // mov [rcx], eax
+                    image[off + 3] = 0x01;
+                    image[off + 4] = 0xC3; // ret
+                    trace_debugln!(
+                        "[real-dlls] Patched RtlGetCurrentProcessorNumberEx at ntdll+0x{rva:X}"
+                    );
                 }
             } else {
-                eprintln!(
+                trace_debugln!(
                     "[real-dlls] WARN: RtlGetCurrentProcessorNumberEx not found in ntdll exports"
                 );
             }
@@ -378,7 +571,9 @@ pub fn load_ntdll_for_init(
                 }
             }
             if count > 0 {
-                eprintln!("[real-dlls] Replaced {count} rdtscp instructions with xor ecx, ecx");
+                trace_debugln!(
+                    "[real-dlls] Replaced {count} rdtscp instructions with xor ecx, ecx"
+                );
             }
         }
 
@@ -430,6 +625,7 @@ pub fn load_ntdll_for_init(
                     .sections
                     .iter()
                     .find(|s| s.name.starts_with(b".text"));
+                #[cfg(all(debug_assertions, feature = "trace_debug"))]
                 let mut kusd_patch_count = 0u32;
                 if let Some(ts) = text_section {
                     let file_start = ts.pointer_to_raw_data as usize;
@@ -457,7 +653,10 @@ pub fn load_ntdll_for_init(
                             {
                                 // Replace FE → FD at the 0xFE byte position.
                                 text_bytes[pos + 3] = 0xFD;
-                                kusd_patch_count += 1;
+                                #[cfg(all(debug_assertions, feature = "trace_debug"))]
+                                {
+                                    kusd_patch_count += 1;
+                                }
                                 pos += 5; // skip past this match
                             } else {
                                 pos += 1;
@@ -465,57 +664,31 @@ pub fn load_ntdll_for_init(
                         }
                     }
                 }
-                eprintln!(
+                #[cfg(all(debug_assertions, feature = "trace_debug"))]
+                trace_debugln!(
                     "[real-dlls] KUSD shadow at 0x{shadow:X}, patched {kusd_patch_count} \
                      ntdll references"
                 );
             } else {
-                eprintln!("[real-dlls] WARN: failed to allocate KUSD shadow page at 0x7FFD0000");
+                trace_debugln!(
+                    "[real-dlls] WARN: failed to allocate KUSD shadow page at 0x7FFD0000"
+                );
             }
         }
 
         // --- Patch 5: Inverted function table empty-table crash guard --------
         //
-        // ntdll's internal RtlpLookupFunctionTable reads the inverted function
-        // table at [rsp+0xF8].  When the table is empty (first entry is NULL),
-        // it falls through to `mov rax, [rdi]` at RVA 0x101FC where rdi is the
-        // lookup address (often 0 from an earlier failed query).  This crashes.
+        // DISABLED: Now that we populate the inverted function table for all
+        // loaded DLLs (both from the runner and the shim's NtMapViewOfSection),
+        // this patch is no longer needed.  The original code at RVA 0x101FC
+        // (`mov rax,[rdi]; cmp rbx,rax`) should work correctly with a
+        // populated table.  Leaving the patch in place causes the error path
+        // to return STATUS_BAD_STACK (0xC0000028), which breaks SEH unwinding
+        // in the rare case where the table iterator hits an edge condition.
         //
-        // On real Windows the table is always populated because the kernel's
-        // loader calls RtlInsertInvertedFunctionTable for every image.  In our
-        // sandbox the table may remain empty because ntdll's registration path
-        // hasn't fully initialised.
-        //
-        // Fix: replace the crashing `mov rax, [rdi]; cmp rbx, rax` (6 bytes)
-        // with `jmp` to the existing error-return path at RVA 0x10402 which
-        // sets eax = STATUS_BAD_STACK (0xC0000028) and jumps to the epilog.
-        // This path is only reached when the table is empty (je from 0x101DD).
-        //
-        //   Before: 48 8B 07 48 3B D8  (mov rax,[rdi]; cmp rbx,rax)
-        //   After:  E9 01 02 00 00 90  (jmp +0x201 → 0x10402; nop)
-        {
-            const PATCH_RVA: u32 = 0x101FC;
-            const EXPECTED: [u8; 6] = [0x48, 0x8B, 0x07, 0x48, 0x3B, 0xD8];
-            // jmp rel32 to RVA 0x10402:  rel32 = 0x10402 - (0x101FC + 5) = 0x201
-            const REPLACEMENT: [u8; 6] = [0xE9, 0x01, 0x02, 0x00, 0x00, 0x90];
-
-            if let Some(off) = parsed_tmp.rva_to_file_offset(PATCH_RVA) {
-                if off + 6 <= image.len() && image[off..off + 6] == EXPECTED {
-                    image[off..off + 6].copy_from_slice(&REPLACEMENT);
-                    eprintln!(
-                        "[real-dlls] Patched inverted function table crash guard at ntdll+0x{PATCH_RVA:X}"
-                    );
-                } else {
-                    eprintln!(
-                        "[real-dlls] WARN: inverted function table pattern mismatch at ntdll+0x{PATCH_RVA:X}"
-                    );
-                }
-            } else {
-                eprintln!(
-                    "[real-dlls] WARN: could not map RVA 0x{PATCH_RVA:X} to file offset for function table patch"
-                );
-            }
-        }
+        // Original patch: jmp +0x201 → 0x10402 (STATUS_BAD_STACK return)
+        // Now: no-op (table is populated, so the code should work as-is).
+        // (patching code removed)
     }
 
     // Parse and load ntdll into guest memory.
@@ -528,10 +701,59 @@ pub fn load_ntdll_for_init(
     let info = load_pe(&parsed, &image, ntdll_load_va, mapper)
         .map_err(|e| anyhow!("Failed to load ntdll: {e}"))?;
 
-    eprintln!(
+    trace_debugln!(
         "[real-dlls] ntdll loaded at 0x{:X} (size=0x{:X})",
-        info.image_base, info.image_size
+        info.image_base,
+        info.image_size
     );
+
+    let ldrp_hash_table_va = find_ntdll_hash_table_va(&parsed, info.image_base)?;
+    trace_debugln!("[real-dlls] LdrpHashTable at 0x{ldrp_hash_table_va:X}");
+
+    let pebldr_va = find_ntdll_pebldr_va(&parsed, info.image_base)?;
+    trace_debugln!("[real-dlls] PebLdr at 0x{pebldr_va:X}");
+
+    // Make ntdll's .mrdata section writable.  This section contains internal
+    // mutable data (KiUserInvertedFunctionTable, loader data, etc.) that
+    // ntdll's code needs to write during initialization.  On real Windows the
+    // kernel loads ntdll with writable .mrdata; our load_pe uses the PE section
+    // flags which may mark it read-only.
+    for section in &parsed.sections {
+        let name = core::str::from_utf8(&section.name)
+            .unwrap_or("")
+            .trim_end_matches('\0');
+        if name == ".mrdata" {
+            let start = info.image_base + section.virtual_address as usize;
+            let vsize = section.virtual_size.max(section.size_of_raw_data) as usize;
+            let pages = (vsize + 0xFFF) & !0xFFF;
+            unsafe {
+                for off in (0..pages).step_by(0x1000) {
+                    let addr = start + off;
+                    let ptr = addr as *mut u8;
+                    // Make writable via the host OS.
+                    let mut old_protect: u32 = 0;
+                    unsafe extern "system" {
+                        fn VirtualProtect(
+                            addr: *mut u8,
+                            size: usize,
+                            new_protect: u32,
+                            old_protect: *mut u32,
+                        ) -> i32;
+                    }
+                    VirtualProtect(
+                        ptr,
+                        0x1000,
+                        0x04, /* PAGE_READWRITE */
+                        &raw mut old_protect,
+                    );
+                }
+            }
+            trace_debugln!(
+                "[real-dlls] Made .mrdata writable: 0x{start:X}..0x{:X} ({pages} bytes)",
+                start + pages
+            );
+        }
+    }
 
     // Find LdrInitializeThunk and RtlUserThreadStart exports.
     let exports = parsed.exports(&image);
@@ -554,7 +776,7 @@ pub fn load_ntdll_for_init(
         )
     };
 
-    eprintln!(
+    trace_debugln!(
         "[real-dlls] LdrInitializeThunk at 0x{ldr_init_thunk_va:X}, \
          RtlUserThreadStart at 0x{rtl_user_thread_start_va:X}"
     );
@@ -584,11 +806,13 @@ pub fn load_ntdll_for_init(
     //     +0x08  u64  ImageBase
     //     +0x10  u32  ImageSize
     //     +0x14  u32  ExceptionDirectorySize
+    let mut ift_va_result = 0usize;
     if let Some(ift_export) = exports
         .iter()
         .find(|e| e.name == Some("KiUserInvertedFunctionTable"))
     {
         let ift_va = ntdll_load_va + ift_export.rva as usize;
+        ift_va_result = ift_va;
         // Exception directory (.pdata) from the PE data directories.
         if parsed.data_directories.len() > IMAGE_DIRECTORY_ENTRY_EXCEPTION {
             let exc_dir = &parsed.data_directories[IMAGE_DIRECTORY_ENTRY_EXCEPTION];
@@ -609,16 +833,17 @@ pub fn load_ntdll_for_init(
                     ((entry_va + 20) as *mut u32).write(exc_dir.size);
                 }
 
-                eprintln!(
+                trace_debugln!(
                     "[real-dlls] Populated KiUserInvertedFunctionTable entry 0: \
                      ExcDir=0x{exc_dir_va:X} Base=0x{ntdll_load_va:X} \
                      Size=0x{:X} ExcSize=0x{:X}",
-                    parsed.size_of_image, exc_dir.size
+                    parsed.size_of_image,
+                    exc_dir.size
                 );
             }
         }
     } else {
-        eprintln!("[real-dlls] WARN: KiUserInvertedFunctionTable export not found");
+        trace_debugln!("[real-dlls] WARN: KiUserInvertedFunctionTable export not found");
     }
 
     let ntdll = LoadedDll {
@@ -648,6 +873,9 @@ pub fn load_ntdll_for_init(
         syscall_map: rewrite.syscall_map,
         unhandled_stubs: rewrite.unhandled_stubs,
         ki_user_exception_dispatcher_rva,
+        inverted_function_table_va: ift_va_result,
+        ldrp_hash_table_va,
+        pebldr_va,
     })
 }
 
@@ -724,7 +952,7 @@ pub fn load_real_dlls(
         }
     }
 
-    eprintln!("[real-dlls] {} DLLs in tar", dll_files.len());
+    trace_debugln!("[real-dlls] {} DLLs in tar", dll_files.len());
 
     // Step 1: Rewrite ntdll.dll syscalls.
     // ntdll always gets load slot 0.
@@ -733,9 +961,11 @@ pub fn load_real_dlls(
     let rewrite = if let Some(ntdll_data) = dll_files.get("ntdll.dll") {
         let result =
             ntdll_rewriter::rewrite_ntdll(ntdll_data, ntdll_load_va as u64, trampoline_va as u64);
-        eprintln!(
+        trace_debugln!(
             "[real-dlls] Rewrote {} ntdll syscall stubs ({} identified), {} __fastfail patched",
-            result.stubs_rewritten, result.stubs_identified, result.fastfail_patched
+            result.stubs_rewritten,
+            result.stubs_identified,
+            result.fastfail_patched
         );
         result
     } else {
@@ -800,7 +1030,7 @@ pub fn load_real_dlls(
             0
         };
 
-        eprintln!(
+        trace_debugln!(
             "[real-dlls] Loaded {name} at 0x{:X} (size=0x{:X}{})",
             info.image_base,
             info.image_size,
@@ -864,16 +1094,17 @@ pub fn load_real_dlls(
     }
 
     if !all_unresolved.is_empty() {
-        eprintln!(
+        trace_debugln!(
             "[real-dlls] {} unresolved imports (fallback stub):",
             all_unresolved.len()
         );
+        #[cfg(all(debug_assertions, feature = "trace_debug"))]
         for (i, name) in all_unresolved.iter().enumerate() {
             if i >= 30 {
-                eprintln!("  ... and {} more", all_unresolved.len() - 30);
+                trace_debugln!("  ... and {} more", all_unresolved.len() - 30);
                 break;
             }
-            eprintln!("  {name}");
+            trace_debugln!("  {name}");
         }
     }
 
@@ -915,7 +1146,7 @@ pub fn load_real_dlls(
                     core::ptr::copy_nonoverlapping(patch.as_ptr(), va as *mut u8, 6);
                     let _ = mapper.pm.make_pages_executable(ptr, crate::PAGE_SIZE);
                 }
-                eprintln!("[real-dlls] Patched {name} at 0x{va:X} -> ret 0x{status:08X}");
+                trace_debugln!("[real-dlls] Patched {name} at 0x{va:X} -> ret 0x{status:08X}");
             }
         }
     }
@@ -1009,13 +1240,22 @@ fn create_kusd_shadow() -> usize {
 
     // Make the shadow read-only (mirrors the real KUSD's protection).
     unsafe extern "system" {
-        fn VirtualProtect(addr: usize, size: usize, new_protect: u32, old_protect: *mut u32)
-        -> i32;
+        fn VirtualProtect(
+            addr: *mut u8,
+            size: usize,
+            new_protect: u32,
+            old_protect: *mut u32,
+        ) -> i32;
     }
     let mut old_prot: u32 = 0;
     unsafe {
-        VirtualProtect(alloc, PAGE_SIZE, PAGE_READONLY, &mut old_prot);
-    }
+        VirtualProtect(
+            alloc as *mut u8,
+            PAGE_SIZE,
+            PAGE_READONLY,
+            &raw mut old_prot,
+        )
+    };
 
     alloc
 }

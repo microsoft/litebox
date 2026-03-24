@@ -196,7 +196,8 @@ pub(crate) fn k32_virtual_alloc(
         litebox::mm::linux::CreatePagesFlags::empty()
     };
 
-    let result = match memory::nt_protect_to_page_op_pub(fl_protect) {
+    let page_op = memory::nt_protect_to_page_op_pub(fl_protect);
+    let result = match page_op {
         memory::PageOp::ReadWrite
         | memory::PageOp::WriteCopy
         | memory::PageOp::ExecuteReadWrite => unsafe {
@@ -216,7 +217,14 @@ pub(crate) fn k32_virtual_alloc(
     match result {
         Ok(ptr) => {
             let addr = ptr.as_usize();
-            ps.track_alloc(addr, aligned_size);
+            if matches!(page_op, memory::PageOp::ExecuteReadWrite)
+                && unsafe { pm.make_pages_rwx(ptr, aligned_size) }.is_err()
+            {
+                let _ = unsafe { pm.remove_pages(ptr, aligned_size) };
+                ctx.regs.rax = 0;
+                return NtStatus::STATUS_INVALID_PAGE_PROTECTION;
+            }
+            ps.track_alloc(addr, aligned_size, fl_protect);
             ctx.regs.rax = addr;
             NtStatus::STATUS_SUCCESS
         }
@@ -245,15 +253,45 @@ pub(crate) fn k32_virtual_free(
         return NtStatus::STATUS_INVALID_PARAMETER;
     }
 
-    let free_size = if dw_free_type & mem_alloc_type::MEM_RELEASE != 0 {
+    let (free_size, tracked_release) = if dw_free_type & mem_alloc_type::MEM_RELEASE != 0 {
         if dw_size == 0 {
-            // Look up the original allocation size.
-            ps.untrack_alloc(lp_address).unwrap_or(PAGE_SIZE)
+            match ps.tracked_alloc_at(lp_address) {
+                Some((alloc_base, alloc_size, _)) if alloc_base == lp_address => {
+                    (alloc_size, Some((lp_address, alloc_size)))
+                }
+                Some(_) => {
+                    ctx.regs.rax = 0;
+                    return NtStatus::STATUS_INVALID_PARAMETER;
+                }
+                None => {
+                    ctx.regs.rax = 0;
+                    return NtStatus::STATUS_NO_MEMORY;
+                }
+            }
         } else {
-            (dw_size + PAGE_SIZE - 1) & !(PAGE_SIZE - 1)
+            let aligned_free_size = (dw_size + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+            let tracked_release = match ps.tracked_alloc_at(lp_address) {
+                Some((alloc_base, alloc_size, _)) => {
+                    let Some(release_end) = lp_address.checked_add(aligned_free_size) else {
+                        ctx.regs.rax = 0;
+                        return NtStatus::STATUS_INVALID_PARAMETER;
+                    };
+                    let Some(alloc_end) = alloc_base.checked_add(alloc_size) else {
+                        ctx.regs.rax = 0;
+                        return NtStatus::STATUS_INVALID_PARAMETER;
+                    };
+                    if release_end > alloc_end {
+                        ctx.regs.rax = 0;
+                        return NtStatus::STATUS_INVALID_PARAMETER;
+                    }
+                    Some((lp_address, aligned_free_size))
+                }
+                None => None,
+            };
+            (aligned_free_size, tracked_release)
         }
     } else {
-        (dw_size + PAGE_SIZE - 1) & !(PAGE_SIZE - 1)
+        ((dw_size + PAGE_SIZE - 1) & !(PAGE_SIZE - 1), None)
     };
 
     if free_size == 0 {
@@ -264,6 +302,9 @@ pub(crate) fn k32_virtual_free(
     let ptr = <Platform as RawPointerProvider>::RawMutPointer::<u8>::from_usize(lp_address);
     match unsafe { pm.remove_pages(ptr, free_size) } {
         Ok(()) => {
+            if let Some((release_base, release_size)) = tracked_release {
+                let _ = ps.release_tracked_alloc_range(release_base, release_size);
+            }
             ctx.regs.rax = 1; // TRUE
             NtStatus::STATUS_SUCCESS
         }
@@ -288,7 +329,11 @@ pub(crate) fn k32_virtual_protect(
     let lp_old_protect = args.arg3;
 
     let aligned_base = lp_address & !(PAGE_SIZE - 1);
-    let aligned_size = ((lp_address + dw_size) - aligned_base + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+    let Some(end_address) = lp_address.checked_add(dw_size) else {
+        ctx.regs.rax = 0;
+        return NtStatus::STATUS_INVALID_PARAMETER;
+    };
+    let aligned_size = (end_address - aligned_base + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
 
     if aligned_size == 0 {
         ctx.regs.rax = 0;
@@ -304,9 +349,10 @@ pub(crate) fn k32_virtual_protect(
 
     let ptr = <Platform as RawPointerProvider>::RawMutPointer::<u8>::from_usize(aligned_base);
     let result = match memory::nt_protect_to_page_op_pub(fl_new_protect) {
-        memory::PageOp::ReadWrite
-        | memory::PageOp::WriteCopy
-        | memory::PageOp::ExecuteReadWrite => unsafe { pm.make_pages_writable(ptr, aligned_size) },
+        memory::PageOp::ReadWrite | memory::PageOp::WriteCopy => unsafe {
+            pm.make_pages_writable(ptr, aligned_size)
+        },
+        memory::PageOp::ExecuteReadWrite => unsafe { pm.make_pages_rwx(ptr, aligned_size) },
         memory::PageOp::ReadOnly => unsafe { pm.make_pages_readable(ptr, aligned_size) },
         memory::PageOp::Execute | memory::PageOp::ExecuteRead => unsafe {
             pm.make_pages_executable(ptr, aligned_size)

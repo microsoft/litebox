@@ -268,6 +268,78 @@ fn insert_directory_handle(
     NtStatus::STATUS_SUCCESS
 }
 
+/// Helper: insert an arbitrary NT object handle and write a successful IOSB.
+fn insert_object_handle(
+    handles: &mut HandleTable,
+    obj: NtObject,
+    handle_out_ptr: usize,
+    io_status_ptr: usize,
+    iosb_information: u64,
+) -> NtStatus {
+    let handle = handles.insert(obj);
+    unsafe {
+        core::ptr::write(handle_out_ptr as *mut u32, handle);
+    }
+    if io_status_ptr != 0 {
+        let iosb = IoStatusBlock {
+            status: NtStatus::STATUS_SUCCESS.0,
+            _pad: 0,
+            information: iosb_information,
+        };
+        unsafe {
+            core::ptr::write(io_status_ptr as *mut IoStatusBlock, iosb);
+        }
+    }
+    NtStatus::STATUS_SUCCESS
+}
+
+/// Open synthetic device handles that are backed by shim logic rather than VFS.
+fn try_open_special_device(
+    nt_path: &str,
+    handles: &mut HandleTable,
+    handle_out_ptr: usize,
+    io_status_ptr: usize,
+) -> Option<NtStatus> {
+    let path_lower = nt_path.to_ascii_lowercase();
+    let (kind, obj) = match path_lower.as_str() {
+        "\\device\\cng" => (
+            "CNG",
+            NtObject::Stub {
+                kind: String::from("CNG"),
+            },
+        ),
+        "\\device\\ksecdd" => (
+            "KsecDD",
+            NtObject::Stub {
+                kind: String::from("KsecDD"),
+            },
+        ),
+        "\\device\\srpdevice" => (
+            "SrpDevice",
+            NtObject::Stub {
+                kind: String::from("SrpDevice"),
+            },
+        ),
+        _ => return None,
+    };
+
+    #[cfg(debug_assertions)]
+    {
+        use litebox::platform::DebugLogProvider as _;
+        litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+            "NT shim: opened synthetic device {kind} path={nt_path:?}\n",
+        ));
+    }
+
+    Some(insert_object_handle(
+        handles,
+        obj,
+        handle_out_ptr,
+        io_status_ptr,
+        1, // FILE_OPENED
+    ))
+}
+
 /// NtCreateFile — open or create a file.
 ///
 /// NT signature:
@@ -316,6 +388,11 @@ pub(crate) fn nt_create_file(
     };
 
     // Handle device paths that don't go through the filesystem.
+    if let Some(status) = try_open_special_device(&nt_path, handles, handle_out_ptr, io_status_ptr)
+    {
+        return status;
+    }
+
     let nt_path_lower = nt_path.to_lowercase();
     let is_condrv_path = nt_path_lower.contains("\\device\\condrv\\");
     // Check if root directory handle is a ConDrv stub (relative open).
@@ -1535,6 +1612,11 @@ pub(crate) fn nt_open_file(
         use litebox::platform::DebugLogProvider as _;
         let msg = alloc::format!("NT shim: NtOpenFile path={nt_path:?}\n");
         litebox_platform_multiplex::platform().debug_log_print(&msg);
+    }
+
+    if let Some(status) = try_open_special_device(&nt_path, handles, handle_out_ptr, io_status_ptr)
+    {
+        return status;
     }
 
     // ── VFS path ─────────────────────────────────────────────────────

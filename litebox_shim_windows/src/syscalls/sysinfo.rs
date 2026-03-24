@@ -10,6 +10,9 @@ use litebox_common_windows::ntstatus::NtStatus;
 
 use super::NtSyscallArgs;
 
+const GUEST_ACTIVE_PROCESSOR_COUNT: u8 = 4;
+const GUEST_ACTIVE_PROCESSOR_MASK: u64 = (1u64 << GUEST_ACTIVE_PROCESSOR_COUNT) - 1;
+
 /// NtQuerySystemInformation — query system-level information.
 ///
 /// NT signature:
@@ -74,10 +77,10 @@ pub(crate) fn nt_query_system_information(ctx: &mut super::super::ExecutionConte
                 core::ptr::write(base.add(0x20).cast::<u64>(), 0x10000);
                 // offset 0x28: MaximumUserModeAddress
                 core::ptr::write(base.add(0x28).cast::<u64>(), 0x7FFF_FFFE_FFFF);
-                // offset 0x30: ActiveProcessorsAffinityMask (4 CPUs)
-                core::ptr::write(base.add(0x30).cast::<u64>(), 0xF);
+                // offset 0x30: ActiveProcessorsAffinityMask
+                core::ptr::write(base.add(0x30).cast::<u64>(), GUEST_ACTIVE_PROCESSOR_MASK);
                 // offset 0x38: NumberOfProcessors
-                core::ptr::write(base.add(0x38), 4);
+                core::ptr::write(base.add(0x38), GUEST_ACTIVE_PROCESSOR_COUNT);
             }
             if return_length_ptr != 0 {
                 unsafe {
@@ -165,8 +168,8 @@ pub(crate) fn nt_query_system_information(ctx: &mut super::super::ExecutionConte
                 core::ptr::write(base.add(0x18).cast::<u32>(), 65536);
                 core::ptr::write(base.add(0x20).cast::<u64>(), 0x10000);
                 core::ptr::write(base.add(0x28).cast::<u64>(), 0x7FFF_FFFE_FFFF);
-                core::ptr::write(base.add(0x30).cast::<u64>(), 0xF);
-                core::ptr::write(base.add(0x38), 4);
+                core::ptr::write(base.add(0x30).cast::<u64>(), GUEST_ACTIVE_PROCESSOR_MASK);
+                core::ptr::write(base.add(0x38), GUEST_ACTIVE_PROCESSOR_COUNT);
             }
             if return_length_ptr != 0 {
                 unsafe {
@@ -177,7 +180,9 @@ pub(crate) fn nt_query_system_information(ctx: &mut super::super::ExecutionConte
         }
         // SystemProcessorGroupInformation (0x37 = 55). Returns per-group
         // processor info as PROCESSOR_GROUP_INFO entries (48 bytes each).
-        // We report one group with 1 active processor.
+        // We report one group with the same processor count that KUSD and
+        // SystemBasicInformation advertise, so heap/NUMA setup sees a
+        // self-consistent topology.
         0x37 => {
             // PROCESSOR_GROUP_INFO layout (48 bytes):
             //   offset 0: MaximumProcessorCount (BYTE)
@@ -196,12 +201,12 @@ pub(crate) fn nt_query_system_information(ctx: &mut super::super::ExecutionConte
             unsafe {
                 core::ptr::write_bytes(info_ptr as *mut u8, 0, PGI_SIZE);
                 let base = info_ptr as *mut u8;
-                // MaximumProcessorCount = 1
-                core::ptr::write(base, 1u8);
-                // ActiveProcessorCount = 1
-                core::ptr::write(base.add(1), 1u8);
-                // ActiveProcessorMask = 1 (bit 0 set)
-                core::ptr::write(base.add(40).cast::<u64>(), 0x1);
+                // MaximumProcessorCount
+                core::ptr::write(base, GUEST_ACTIVE_PROCESSOR_COUNT);
+                // ActiveProcessorCount
+                core::ptr::write(base.add(1), GUEST_ACTIVE_PROCESSOR_COUNT);
+                // ActiveProcessorMask
+                core::ptr::write(base.add(40).cast::<u64>(), GUEST_ACTIVE_PROCESSOR_MASK);
             }
             if return_length_ptr != 0 {
                 unsafe {
@@ -321,7 +326,8 @@ pub(crate) fn nt_query_system_information_ex(ctx: &mut super::super::ExecutionCo
         // STATUS_INTERNAL_ERROR and the process fails to start.
         //
         // We return a single SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX
-        // (RelationGroup) with 1 active group containing 1 processor.
+        // (RelationGroup) with 1 active group containing the same processor
+        // count/mask that KUSD and SystemBasicInformation advertise.
         //
         // Layout (80 bytes total):
         //   +0x00  DWORD Relationship = 4 (RelationGroup)
@@ -330,10 +336,10 @@ pub(crate) fn nt_query_system_information_ex(ctx: &mut super::super::ExecutionCo
         //   +0x0A  WORD  ActiveGroupCount = 1
         //   +0x0C  BYTE  Reserved[20] = {0}
         //   +0x20  PROCESSOR_GROUP_INFO[0]:
-        //     +0x20  BYTE  MaximumProcessorCount = 1
-        //     +0x21  BYTE  ActiveProcessorCount = 1
+        //     +0x20  BYTE  MaximumProcessorCount = 4
+        //     +0x21  BYTE  ActiveProcessorCount = 4
         //     +0x22  BYTE  Reserved[38] = {0}
-        //     +0x48  KAFFINITY ActiveProcessorMask = 0x1
+        //     +0x48  KAFFINITY ActiveProcessorMask = 0xF
         0x6B => {
             const ENTRY_SIZE: u32 = 80;
             if info_ptr == 0 || info_length < ENTRY_SIZE {
@@ -364,11 +370,11 @@ pub(crate) fn nt_query_system_information_ex(ctx: &mut super::super::ExecutionCo
                 core::ptr::write(base.add(10).cast::<u16>(), 1);
                 // PROCESSOR_GROUP_INFO at offset 0x20:
                 // MaximumProcessorCount
-                core::ptr::write(base.add(0x20), 1);
+                core::ptr::write(base.add(0x20), GUEST_ACTIVE_PROCESSOR_COUNT);
                 // ActiveProcessorCount
-                core::ptr::write(base.add(0x21), 1);
+                core::ptr::write(base.add(0x21), GUEST_ACTIVE_PROCESSOR_COUNT);
                 // ActiveProcessorMask (KAFFINITY = u64 at offset 0x48)
-                core::ptr::write(base.add(0x48).cast::<u64>(), 0x1);
+                core::ptr::write(base.add(0x48).cast::<u64>(), GUEST_ACTIVE_PROCESSOR_MASK);
             }
             if return_length_ptr != 0 {
                 unsafe {

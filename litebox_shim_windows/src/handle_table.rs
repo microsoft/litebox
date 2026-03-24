@@ -10,12 +10,13 @@
 //! The handle table is not internally synchronized. The shim wraps it in a
 //! `Mutex` for multi-threaded access (Phase 3+).
 
-use alloc::collections::BTreeMap;
+use alloc::collections::{BTreeMap, VecDeque};
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use spin::Mutex;
 
+use litebox_common_windows::ntstatus::NtStatus;
 use litebox_platform_multiplex::Platform;
 
 /// Type alias for thread wakers used by sync object waiters.
@@ -81,10 +82,14 @@ pub enum NtObject {
     Event(Arc<EventObject>),
     /// An NT semaphore object (NtCreateSemaphore).
     Semaphore(Arc<SemaphoreObject>),
+    /// An NT mutant object (NtCreateMutant).
+    Mutant(Arc<MutantObject>),
     /// An NT keyed event object (NtCreateKeyedEvent).
     KeyedEvent(Arc<KeyedEventObject>),
     /// An NT thread object (NtCreateThreadEx).
     Thread(Arc<ThreadObject>),
+    /// An NT I/O completion port object.
+    IoCompletion(Arc<IoCompletionObject>),
     /// A WinSock socket. The actual `SocketFd` is stored in
     /// `NtSharedState::sockets`; this variant just records the key.
     Socket {
@@ -111,8 +116,11 @@ pub enum NtObject {
     CurrentProcess,
     /// Current thread handle (from duplicating pseudo-handle -2).
     CurrentThread,
-    /// A registry key handle (dummy — returns NOT_FOUND on value queries).
-    RegistryKey,
+    /// A registry key handle.
+    RegistryKey {
+        /// Canonical NT path for this key, used to resolve RootDirectory-relative opens.
+        path: String,
+    },
 }
 
 /// Internal state for an NT event object.
@@ -157,19 +165,34 @@ pub struct ThreadObject {
     /// Thread exit code, set when the thread terminates.
     /// None = still running, Some(code) = exited.
     pub exit_status: Mutex<Option<i32>>,
-    /// Pseudo thread ID for GetCurrentThreadId / OwningThread in CRITICAL_SECTION.
+    /// Guest-visible thread ID (TEB.ClientId.UniqueThread / GetCurrentThreadId).
     pub thread_id: u32,
+    /// Guest VA of this thread's TEB.
+    pub teb_va: Mutex<usize>,
     /// Wakers for threads blocked in wait_thread.
     pub waiters: Mutex<Vec<SyncWaker>>,
+    /// Current suspend count. New threads created with CREATE_SUSPENDED start at 1.
+    pub suspend_count: Mutex<u32>,
+    /// Wakers for child threads blocked waiting to be resumed.
+    pub resume_waiters: Mutex<Vec<SyncWaker>>,
+    /// Pending alert-by-thread-id wake for NtWaitForAlertByThreadId.
+    pub alert_by_id_pending: Mutex<bool>,
+    /// Wakers for threads blocked in NtWaitForAlertByThreadId.
+    pub alert_by_id_waiters: Mutex<Vec<SyncWaker>>,
 }
 
 impl ThreadObject {
-    /// Create a new thread object (initially running).
-    pub fn new(thread_id: u32) -> Self {
+    /// Create a new thread object with the given initial suspend count.
+    pub fn new(thread_id: u32, initial_suspend_count: u32, teb_va: usize) -> Self {
         Self {
             exit_status: Mutex::new(None),
             thread_id,
+            teb_va: Mutex::new(teb_va),
             waiters: Mutex::new(Vec::new()),
+            suspend_count: Mutex::new(initial_suspend_count),
+            resume_waiters: Mutex::new(Vec::new()),
+            alert_by_id_pending: Mutex::new(false),
+            alert_by_id_waiters: Mutex::new(Vec::new()),
         }
     }
 
@@ -184,6 +207,98 @@ impl ThreadObject {
     /// Returns true if the thread has exited.
     pub fn has_exited(&self) -> bool {
         self.exit_status.lock().is_some()
+    }
+
+    /// Return the thread's current guest TEB VA.
+    pub fn teb_va(&self) -> usize {
+        *self.teb_va.lock()
+    }
+
+    /// Update the thread's guest TEB VA once it becomes known.
+    pub fn set_teb_va(&self, teb_va: usize) {
+        *self.teb_va.lock() = teb_va;
+    }
+
+    /// Block the host thread until the guest thread is resumed.
+    pub fn wait_until_resumed(&self, cx: &litebox::event::wait::WaitContext<'_, Platform>) {
+        self.resume_waiters.lock().push(cx.waker().clone());
+        let _ = cx.wait_until(|| *self.suspend_count.lock() == 0);
+        self.resume_waiters.lock().retain(|w| !w.ptr_eq(cx.waker()));
+    }
+
+    /// Resume the thread once and return the previous suspend count.
+    pub fn resume(&self) -> u32 {
+        let mut suspend_count = self.suspend_count.lock();
+        let previous = *suspend_count;
+        if *suspend_count != 0 {
+            *suspend_count -= 1;
+            if *suspend_count == 0 {
+                let mut waiters = self.resume_waiters.lock();
+                for w in waiters.drain(..) {
+                    w.wake();
+                }
+            }
+        }
+        previous
+    }
+
+    /// Consume a pending alert-by-thread-id wake, if one exists.
+    pub fn take_pending_alert_by_id(&self) -> bool {
+        let mut pending = self.alert_by_id_pending.lock();
+        if *pending {
+            *pending = false;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Post an alert-by-thread-id wake and notify any blocked waiters.
+    pub fn alert_by_id(&self) {
+        *self.alert_by_id_pending.lock() = true;
+        for w in self.alert_by_id_waiters.lock().iter() {
+            w.wake();
+        }
+    }
+}
+
+/// A queued completion packet delivered through an I/O completion port.
+#[derive(Clone, Copy, Debug)]
+pub struct IoCompletionEntry {
+    pub key_context: usize,
+    pub apc_context: usize,
+    pub status: NtStatus,
+    pub information: usize,
+}
+
+/// Internal state for an NT I/O completion port.
+pub struct IoCompletionObject {
+    /// FIFO queue of pending completion packets.
+    pub queue: Mutex<VecDeque<IoCompletionEntry>>,
+    /// Wakers for threads blocked in NtRemoveIoCompletion[Ex].
+    pub waiters: Mutex<Vec<SyncWaker>>,
+}
+
+impl IoCompletionObject {
+    /// Create an empty completion port.
+    pub fn new() -> Self {
+        Self {
+            queue: Mutex::new(VecDeque::new()),
+            waiters: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Queue a completion packet and wake any waiting threads.
+    pub fn push(&self, entry: IoCompletionEntry) {
+        self.queue.lock().push_back(entry);
+        self.wake_waiters();
+    }
+
+    /// Wake all threads waiting on this completion port.
+    pub fn wake_waiters(&self) {
+        for w in self.waiters.lock().iter() {
+            w.wake();
+        }
     }
 }
 
@@ -208,6 +323,46 @@ impl SemaphoreObject {
     }
 
     /// Wake all threads waiting on this semaphore.
+    pub fn wake_waiters(&self) {
+        for w in self.waiters.lock().iter() {
+            w.wake();
+        }
+    }
+}
+
+/// Internal state for an NT mutant object.
+pub struct MutantObject {
+    /// Mutex-protected owner / recursion / abandoned state.
+    pub state: Mutex<MutantState>,
+    /// Wakers for threads blocked waiting on this mutant.
+    pub waiters: Mutex<Vec<SyncWaker>>,
+}
+
+/// Mutable state inside a mutant object.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct MutantState {
+    /// Owning thread, if any.
+    pub owner_thread_id: Option<u32>,
+    /// Recursive acquisition count for the owner.
+    pub recursion_count: u32,
+    /// Whether the previous owner exited without releasing.
+    pub abandoned: bool,
+}
+
+impl MutantObject {
+    /// Create a new mutant.
+    pub fn new(initial_owner: bool, owner_thread_id: u32) -> Self {
+        Self {
+            state: Mutex::new(MutantState {
+                owner_thread_id: initial_owner.then_some(owner_thread_id),
+                recursion_count: u32::from(initial_owner),
+                abandoned: false,
+            }),
+            waiters: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Wake all threads waiting on this mutant.
     pub fn wake_waiters(&self) {
         for w in self.waiters.lock().iter() {
             w.wake();
@@ -346,6 +501,11 @@ impl HandleTable {
         self.objects.get(&handle)
     }
 
+    /// Iterate all objects currently stored in the table.
+    pub fn values(&self) -> impl Iterator<Item = &NtObject> + '_ {
+        self.objects.values()
+    }
+
     /// Look up an object by handle (mutable).
     pub fn get_mut(&mut self, handle: u32) -> Option<&mut NtObject> {
         self.objects.get_mut(&handle)
@@ -399,8 +559,10 @@ impl HandleTable {
             NtObject::Stub { kind } => NtObject::Stub { kind: kind.clone() },
             NtObject::Event(e) => NtObject::Event(Arc::clone(e)),
             NtObject::Semaphore(s) => NtObject::Semaphore(Arc::clone(s)),
+            NtObject::Mutant(m) => NtObject::Mutant(Arc::clone(m)),
             NtObject::KeyedEvent(k) => NtObject::KeyedEvent(Arc::clone(k)),
             NtObject::Thread(t) => NtObject::Thread(Arc::clone(t)),
+            NtObject::IoCompletion(port) => NtObject::IoCompletion(Arc::clone(port)),
             NtObject::Socket { sock_id } => NtObject::Socket { sock_id: *sock_id },
             NtObject::Section {
                 pe_data,
@@ -422,7 +584,7 @@ impl HandleTable {
             },
             NtObject::CurrentProcess => NtObject::CurrentProcess,
             NtObject::CurrentThread => NtObject::CurrentThread,
-            NtObject::RegistryKey => NtObject::RegistryKey,
+            NtObject::RegistryKey { path } => NtObject::RegistryKey { path: path.clone() },
         };
         Some(self.insert(new_obj))
     }

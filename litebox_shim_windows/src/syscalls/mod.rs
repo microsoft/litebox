@@ -19,6 +19,7 @@ pub(crate) mod section;
 pub(crate) mod sync;
 pub(crate) mod sysinfo;
 pub(crate) mod thread;
+pub(crate) mod win32k;
 
 /// Helper to read NT syscall arguments from the execution context.
 pub(crate) struct NtSyscallArgs {
@@ -40,8 +41,13 @@ impl NtSyscallArgs {
 
     /// Read the 5th argument from the caller's stack frame.
     ///
-    /// Windows x64 convention: `[rsp + 0x28]` (past return address + shadow
-    /// space). Only call this for syscalls that actually have 5+ arguments.
+    /// Both the ntdll trampoline and the PE-builder stubs preserve the
+    /// return address on the stack, so ctx.regs.rsp points at it and the
+    /// standard Windows x64 callee view applies:
+    ///   [rsp + 0x00] = return address
+    ///   [rsp + 0x08..0x20] = shadow space (4 × 8)
+    ///   [rsp + 0x28] = 5th arg
+    ///   [rsp + 0x30] = 6th arg
     ///
     /// # Safety
     /// Guest stack must be valid and mapped.

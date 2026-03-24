@@ -8,7 +8,7 @@ use alloc::sync::Arc;
 
 use crate::NtShimEntrypoints;
 use crate::handle_table::{NtObject, ThreadObject};
-use litebox::platform::{RawConstPointer as _, ThreadProvider as _};
+use litebox::platform::{RawConstPointer as _, RawPointerProvider, ThreadProvider as _};
 use litebox_common_windows::ntstatus::NtStatus;
 
 use super::NtSyscallArgs;
@@ -66,21 +66,20 @@ pub(crate) fn nt_create_thread_ex(
     let stack_size = unsafe { *((ctx.regs.rsp + 0x48) as *const usize) };
     let _max_stack_size = unsafe { *((ctx.regs.rsp + 0x50) as *const usize) };
 
-    if (create_flags & 0x1) != 0 {
-        log_unimplemented!("NtCreateThreadEx: CREATE_SUSPENDED not supported");
+    let unsupported_flags = create_flags & !0x1;
+    if unsupported_flags != 0 {
+        log_unimplemented!("NtCreateThreadEx: unsupported create_flags=0x{create_flags:X}");
         return NtStatus::STATUS_NOT_IMPLEMENTED;
     }
+    let initial_suspend_count = u32::from((create_flags & 0x1) != 0);
 
     // Allocate a thread ID.
     let tid = {
         let mut id = shim.shared.next_thread_id.lock();
         let val = *id;
-        *id = val + 1;
+        *id = val + crate::peb_teb::SYNTHETIC_THREAD_ID_INCREMENT;
         val
     };
-
-    // Create the thread object (not yet inserted into handle table).
-    let thread_obj = Arc::new(ThreadObject::new(tid));
 
     // Allocate guest stack for the new thread.
     let actual_stack_size = if stack_size == 0 {
@@ -106,6 +105,12 @@ pub(crate) fn nt_create_thread_ex(
         Err(_) => return NtStatus::STATUS_NO_MEMORY,
     };
     let stack_top = stack_base + actual_stack_size;
+    let cleanup_stack = |stack_base: usize| {
+        let stack_ptr = <litebox_platform_multiplex::Platform as RawPointerProvider>::RawMutPointer::<
+            u8,
+        >::from_usize(stack_base);
+        let _ = unsafe { pm.remove_pages(stack_ptr, actual_stack_size) };
+    };
 
     // Allocate a new TEB for the child thread (two pages — 8KB).
     let nz_teb_size = litebox::mm::linux::NonZeroPageSize::<{ crate::PAGE_SIZE }>::new(0x2000)
@@ -120,12 +125,31 @@ pub(crate) fn nt_create_thread_ex(
     };
     let child_teb_va = match teb_ptr {
         Ok(ptr) => ptr.as_usize(),
-        Err(_) => return NtStatus::STATUS_NO_MEMORY,
+        Err(_) => {
+            cleanup_stack(stack_base);
+            return NtStatus::STATUS_NO_MEMORY;
+        }
+    };
+    let cleanup_stack_and_teb = || {
+        super::section::free_thread_tls_allocations(&shim.shared, child_teb_va);
+        let teb_ptr = <litebox_platform_multiplex::Platform as RawPointerProvider>::RawMutPointer::<
+            u8,
+        >::from_usize(child_teb_va);
+        let _ = unsafe { pm.remove_pages(teb_ptr, 0x2000) };
+        cleanup_stack(stack_base);
+    };
+
+    // Create the thread object once the child TEB VA is known.
+    let thread_obj = Arc::new(ThreadObject::new(tid, initial_suspend_count, child_teb_va));
+    let Some(parent_init) = &shim.init_state else {
+        log_unimplemented!("NtCreateThreadEx: no parent init state");
+        cleanup_stack_and_teb();
+        return NtStatus::STATUS_UNSUCCESSFUL;
     };
 
     // Initialize the child TEB by copying the parent's TEB and updating
     // thread-specific fields.
-    let parent_teb_va = shim.init_state.as_ref().map_or(0, |s| s.teb_va);
+    let parent_teb_va = parent_init.teb_va;
     if parent_teb_va != 0 {
         // Safety: Both VAs are in guest address space, accessible in userland.
         unsafe {
@@ -140,6 +164,13 @@ pub(crate) fn nt_create_thread_ex(
     unsafe {
         core::ptr::write((child_teb_va + 0x30) as *mut usize, child_teb_va);
     }
+    // Update ClientId.UniqueThread to the guest-visible thread ID.
+    unsafe {
+        core::ptr::write(
+            (child_teb_va + crate::peb_teb::teb_offsets::CLIENT_ID_THREAD) as *mut u64,
+            u64::from(tid),
+        );
+    }
     // Update stack fields.
     unsafe {
         core::ptr::write(
@@ -150,11 +181,22 @@ pub(crate) fn nt_create_thread_ex(
             (child_teb_va + crate::peb_teb::teb_offsets::STACK_LIMIT) as *mut usize,
             stack_base,
         );
+        core::ptr::write(
+            (child_teb_va + crate::peb_teb::teb_offsets::DEALLOCATION_STACK) as *mut usize,
+            stack_base,
+        );
     }
-    // Zero TLS slots in child TEB (TlsSlots at offset 0x1480, 64 * 8 = 512 bytes).
+    // Child threads must not inherit the parent's TLS bookkeeping pointers or
+    // inline slots; module TLS blocks are per-thread.
     unsafe {
+        core::ptr::write(
+            (child_teb_va + crate::peb_teb::teb_offsets::TLS_POINTER) as *mut usize,
+            0,
+        );
+        core::ptr::write((child_teb_va + 0x1780) as *mut usize, 0);
         core::ptr::write_bytes((child_teb_va + 0x1480) as *mut u8, 0, 64 * 8);
     }
+    super::section::initialize_static_tls_for_teb(&shim.shared, child_teb_va);
 
     // Push the sentinel return address on the stack so that when the start
     // routine returns, the exception handler detects RIP == THREAD_EXIT_SENTINEL
@@ -167,12 +209,6 @@ pub(crate) fn nt_create_thread_ex(
     // Build a minimal execution context. The child's EnterShim::init() will
     // override RIP, RSP, and RCX before guest entry.
     let child_ctx = litebox_common_linux::ExecutionContext::default();
-
-    // Get parent init state reference for child shim construction.
-    let Some(parent_init) = &shim.init_state else {
-        log_unimplemented!("NtCreateThreadEx: no parent init state");
-        return NtStatus::STATUS_UNSUCCESSFUL;
-    };
 
     // Create the child's shim entrypoints — shares all process-wide state.
     let child_shim = NtShimEntrypoints::new_for_child_thread(
@@ -194,7 +230,13 @@ pub(crate) fn nt_create_thread_ex(
 
     // Spawn the thread.
     let platform = litebox_platform_multiplex::platform();
+    shim.shared
+        .threads_by_id
+        .lock()
+        .insert(tid, Arc::clone(&thread_obj));
     if unsafe { platform.spawn_thread(&child_ctx, init_args) }.is_err() {
+        shim.shared.threads_by_id.lock().remove(&tid);
+        cleanup_stack_and_teb();
         log_unimplemented!("NtCreateThreadEx: spawn_thread failed");
         return NtStatus::STATUS_NO_MEMORY;
     }
@@ -243,6 +285,10 @@ impl litebox::shim::InitThread for NtChildThreadInit {
         // Set GS base for this host thread to point to the child TEB.
         // This must happen on the new thread (TLS is per-thread).
         set_guest_gs_base(self.child_teb_va as u64);
+
+        if let Some(thread_obj) = self.child_shim.thread_obj.as_ref() {
+            thread_obj.wait_until_resumed(&self.child_shim.wait_cx());
+        }
 
         // Return the child's shim entrypoints. Its init() will set RIP, RSP,
         // and RCX correctly for child thread entry.

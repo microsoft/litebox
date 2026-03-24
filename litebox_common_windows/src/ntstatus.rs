@@ -39,6 +39,8 @@ impl NtStatus {
     // ---- Success codes ----
 
     pub const STATUS_SUCCESS: Self = Self(0x0000_0000);
+    pub const STATUS_ABANDONED_WAIT_0: Self = Self(0x0000_0080);
+    pub const STATUS_ALERTED: Self = Self(0x0000_0101);
     pub const STATUS_PENDING: Self = Self(0x0000_0103);
     pub const STATUS_BUFFER_OVERFLOW: Self = Self(0x8000_0005u32 as i32);
 
@@ -56,6 +58,7 @@ impl NtStatus {
     pub const STATUS_INFO_LENGTH_MISMATCH: Self = Self(0xC000_0004u32 as i32);
     pub const STATUS_ACCESS_VIOLATION: Self = Self(0xC000_0005u32 as i32);
     pub const STATUS_INVALID_HANDLE: Self = Self(0xC000_0008u32 as i32);
+    pub const STATUS_INVALID_CID: Self = Self(0xC000_000Bu32 as i32);
     pub const STATUS_INVALID_PARAMETER: Self = Self(0xC000_000Du32 as i32);
     pub const STATUS_NO_SUCH_FILE: Self = Self(0xC000_000Fu32 as i32);
     pub const STATUS_END_OF_FILE: Self = Self(0xC000_0011u32 as i32);

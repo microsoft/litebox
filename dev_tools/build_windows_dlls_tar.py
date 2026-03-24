@@ -16,6 +16,7 @@ Usage:
 """
 
 import argparse
+import io
 import os
 import sys
 import tarfile
@@ -50,9 +51,16 @@ DEFAULT_DLLS = [
     "dbgcore.dll",
     "wintypes.dll",
     "cryptbase.dll",
+    "cryptsp.dll",
+    "rsaenh.dll",
+    "bcrypt.dll",
+    "bcryptprimitives.dll",
 ]
 
 SYSTEM32 = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32")
+DEFAULT_VFS_FILES = {
+    "c/program files/common files/ssl/openssl.cnf": b"",
+}
 
 
 def main():
@@ -94,6 +102,13 @@ def main():
             tar.add(args.exe, arcname=tar_path)
             size_mb = os.path.getsize(args.exe) / 1_048_576
             print(f"  {tar_path} ({size_mb:.1f} MB)")
+
+        for tar_path, data in DEFAULT_VFS_FILES.items():
+            info = tarfile.TarInfo(tar_path)
+            info.size = len(data)
+            info.mode = 0o644
+            tar.addfile(info, io.BytesIO(data))
+            print(f"  {tar_path} ({len(data)} bytes)")
 
     if missing:
         print(f"\nWARNING: {len(missing)} DLLs not found: {', '.join(missing)}")

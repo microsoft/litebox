@@ -70,6 +70,13 @@ pub trait EnterShim {
     /// handler instead of this one.
     fn interrupt(&self, ctx: &mut Self::ExecutionContext) -> ContinueOperation;
 
+    /// Called after the platform has fully left guest execution for a thread.
+    ///
+    /// Platforms invoke this on the host stack after guest execution has
+    /// terminated, which lets shims release per-thread resources that could
+    /// not be safely unmapped while still running on the guest stack.
+    fn thread_terminated(&self) {}
+
     /// Re-enter a thread of a guest program or library that is already loaded
     /// in memory.
     ///

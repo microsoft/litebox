@@ -51,6 +51,16 @@
     clippy::new_without_default,
     clippy::too_many_arguments,
     clippy::case_sensitive_file_extension_comparisons,
+    clippy::redundant_field_names,
+    clippy::unnested_or_patterns,
+    clippy::manual_let_else,
+    clippy::collapsible_if,
+    clippy::if_not_else,
+    clippy::uninlined_format_args,
+    clippy::manual_range_contains,
+    clippy::map_unwrap_or,
+    clippy::bool_to_int_with_if,
+    clippy::useless_format,
 )]
 
 extern crate alloc;
@@ -109,6 +119,402 @@ fn is_addr_committed(addr: usize) -> bool {
     }
 }
 
+#[cfg(target_os = "windows")]
+fn query_host_registry_value(
+    nt_path: &str,
+    value_name: &str,
+) -> Option<(u32, alloc::vec::Vec<u8>)> {
+    unsafe extern "system" {
+        fn RegOpenKeyExW(
+            hkey: isize,
+            subkey: *const u16,
+            options: u32,
+            sam_desired: u32,
+            result: *mut isize,
+        ) -> u32;
+        fn RegQueryValueExW(
+            hkey: isize,
+            value_name: *const u16,
+            reserved: *mut u32,
+            reg_type: *mut u32,
+            data: *mut u8,
+            data_len: *mut u32,
+        ) -> u32;
+        fn RegCloseKey(hkey: isize) -> u32;
+    }
+
+    const ERROR_SUCCESS: u32 = 0;
+    const KEY_QUERY_VALUE: u32 = 0x0001;
+    const HKEY_LOCAL_MACHINE: isize = 0x8000_0002u32 as i32 as isize;
+    const HKEY_USERS: isize = 0x8000_0003u32 as i32 as isize;
+
+    let (root, subkey) = if let Some(suffix) = nt_path
+        .strip_prefix("\\REGISTRY\\MACHINE\\")
+        .or_else(|| nt_path.strip_prefix("\\Registry\\Machine\\"))
+    {
+        (HKEY_LOCAL_MACHINE, suffix)
+    } else if let Some(suffix) = nt_path
+        .strip_prefix("\\REGISTRY\\USER\\")
+        .or_else(|| nt_path.strip_prefix("\\Registry\\User\\"))
+    {
+        (HKEY_USERS, suffix)
+    } else {
+        return None;
+    };
+
+    let subkey_wide: alloc::vec::Vec<u16> =
+        subkey.encode_utf16().chain(core::iter::once(0)).collect();
+    let value_wide: alloc::vec::Vec<u16> = value_name
+        .encode_utf16()
+        .chain(core::iter::once(0))
+        .collect();
+
+    let mut key = 0isize;
+    if unsafe { RegOpenKeyExW(root, subkey_wide.as_ptr(), 0, KEY_QUERY_VALUE, &mut key) }
+        != ERROR_SUCCESS
+    {
+        return None;
+    }
+
+    let result = (|| {
+        let mut reg_type = 0u32;
+        let mut data_len = 0u32;
+        if unsafe {
+            RegQueryValueExW(
+                key,
+                value_wide.as_ptr(),
+                core::ptr::null_mut(),
+                &mut reg_type,
+                core::ptr::null_mut(),
+                &mut data_len,
+            )
+        } != ERROR_SUCCESS
+        {
+            return None;
+        }
+
+        let mut data = alloc::vec![0u8; data_len as usize];
+        if unsafe {
+            RegQueryValueExW(
+                key,
+                value_wide.as_ptr(),
+                core::ptr::null_mut(),
+                &mut reg_type,
+                data.as_mut_ptr(),
+                &mut data_len,
+            )
+        } != ERROR_SUCCESS
+        {
+            return None;
+        }
+        data.truncate(data_len as usize);
+        Some((reg_type, data))
+    })();
+
+    unsafe {
+        RegCloseKey(key);
+    }
+
+    result
+}
+
+#[cfg(not(target_os = "windows"))]
+fn query_host_registry_value(
+    _nt_path: &str,
+    _value_name: &str,
+) -> Option<(u32, alloc::vec::Vec<u8>)> {
+    None
+}
+
+#[cfg(target_os = "windows")]
+unsafe extern "system" {
+    fn NtGetMUIRegistryInfo(flags: u32, data_size: *mut u32, data: *mut core::ffi::c_void) -> i32;
+    fn QueryDosDeviceW(device_name: *const u16, target_path: *mut u16, max_chars: u32) -> u32;
+}
+
+fn read_guest_unicode_string_lossy(value_name_ptr: usize) -> alloc::string::String {
+    if value_name_ptr == 0 {
+        return alloc::string::String::new();
+    }
+    let len = unsafe { core::ptr::read_unaligned(value_name_ptr as *const u16) } as usize;
+    let buf = unsafe { core::ptr::read_unaligned((value_name_ptr + 8) as *const u64) };
+    if buf == 0 || len == 0 {
+        return alloc::string::String::new();
+    }
+    let wchars = unsafe { core::slice::from_raw_parts(buf as *const u16, len / 2) };
+    alloc::string::String::from_utf16_lossy(wchars)
+}
+
+fn encode_reg_sz(value: &str) -> alloc::vec::Vec<u8> {
+    let wide: alloc::vec::Vec<u16> = value.encode_utf16().chain(core::iter::once(0u16)).collect();
+    let mut bytes = alloc::vec![0u8; wide.len() * 2];
+    unsafe {
+        core::ptr::copy_nonoverlapping(wide.as_ptr() as *const u8, bytes.as_mut_ptr(), bytes.len());
+    }
+    bytes
+}
+
+fn encode_reg_dword(value: u32) -> alloc::vec::Vec<u8> {
+    alloc::vec::Vec::from(value.to_le_bytes())
+}
+
+fn read_object_attributes_name(obj_attrs_ptr: usize) -> alloc::string::String {
+    if obj_attrs_ptr == 0 {
+        return alloc::string::String::new();
+    }
+    let name_ptr = unsafe { core::ptr::read_unaligned((obj_attrs_ptr + 0x10) as *const usize) };
+    read_guest_unicode_string_lossy(name_ptr)
+}
+
+fn read_object_attributes_root_directory(obj_attrs_ptr: usize) -> u32 {
+    if obj_attrs_ptr == 0 {
+        return 0;
+    }
+    unsafe { core::ptr::read_unaligned((obj_attrs_ptr + 0x08) as *const u64) as u32 }
+}
+
+fn resolve_object_attributes_name(
+    obj_attrs_ptr: usize,
+    handles: &handle_table::HandleTable,
+) -> alloc::string::String {
+    let name = read_object_attributes_name(obj_attrs_ptr);
+    if name.is_empty() || name.starts_with('\\') {
+        return name;
+    }
+    let root = read_object_attributes_root_directory(obj_attrs_ptr);
+    if root == 0 {
+        return name;
+    }
+    match handles.get(root) {
+        Some(handle_table::NtObject::Stub { kind }) => {
+            if let Some(prefix) = kind.strip_prefix("DirectoryObject:") {
+                if prefix.ends_with('\\') {
+                    alloc::format!("{prefix}{name}")
+                } else {
+                    alloc::format!("{prefix}\\{name}")
+                }
+            } else {
+                name
+            }
+        }
+        _ => name,
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn query_host_dos_device(device: &str) -> Option<alloc::string::String> {
+    let wide: alloc::vec::Vec<u16> = device.encode_utf16().chain(core::iter::once(0)).collect();
+    let mut buf = [0u16; 512];
+    let written =
+        unsafe { QueryDosDeviceW(wide.as_ptr(), buf.as_mut_ptr(), buf.len() as u32) as usize };
+    if written == 0 {
+        return None;
+    }
+    let end = buf.iter().position(|&ch| ch == 0).unwrap_or(written);
+    Some(alloc::string::String::from_utf16_lossy(&buf[..end]))
+}
+
+#[cfg(not(target_os = "windows"))]
+fn query_host_dos_device(_device: &str) -> Option<alloc::string::String> {
+    None
+}
+
+fn symbolic_link_target_for_name(name: &str) -> Option<alloc::string::String> {
+    let lower = name.to_ascii_lowercase();
+    if lower == "\\knowndlls\\knowndllpath" {
+        return Some(alloc::string::String::from("C:\\Windows\\System32"));
+    }
+
+    for prefix in ["\\??\\", "\\global??\\"] {
+        if let Some(rest) = lower.strip_prefix(prefix) {
+            let original_rest = &name[prefix.len()..];
+            if original_rest.len() >= 2 {
+                let bytes = original_rest.as_bytes();
+                if bytes[1] == b':' && bytes[0].is_ascii_alphabetic() {
+                    return query_host_dos_device(&original_rest[..2]);
+                }
+            }
+            if rest == "systemroot" {
+                return Some(alloc::string::String::from("\\SystemRoot"));
+            }
+        }
+    }
+
+    None
+}
+
+#[cfg(target_os = "windows")]
+fn query_host_mui_registry_info(flags: u32) -> Result<alloc::vec::Vec<u8>, NtStatus> {
+    let mut size = 0u32;
+    let status =
+        NtStatus(unsafe { NtGetMUIRegistryInfo(flags, &mut size, core::ptr::null_mut()) as i32 });
+    if status != NtStatus::STATUS_SUCCESS {
+        return Err(status);
+    }
+    let mut data = alloc::vec![0u8; size as usize];
+    let status = NtStatus(unsafe {
+        NtGetMUIRegistryInfo(flags, &mut size, data.as_mut_ptr().cast()) as i32
+    });
+    if status != NtStatus::STATUS_SUCCESS {
+        return Err(status);
+    }
+    data.truncate(size as usize);
+    Ok(data)
+}
+
+#[cfg(not(target_os = "windows"))]
+fn query_host_mui_registry_info(_flags: u32) -> Result<alloc::vec::Vec<u8>, NtStatus> {
+    Err(NtStatus::STATUS_NOT_IMPLEMENTED)
+}
+
+fn lookup_registry_value_bytes(
+    key_path: &str,
+    value_name: &str,
+) -> Option<(u32, alloc::vec::Vec<u8>)> {
+    let key_lower = key_path.to_ascii_lowercase();
+    let name_lower = value_name.to_ascii_lowercase();
+
+    let host_reg_value = if key_lower.contains(
+        "\\system\\currentcontrolset\\services\\winsock2\\parameters\\protocol_catalog9\\catalog_entries",
+    ) || key_lower.contains(
+        "\\system\\currentcontrolset\\services\\winsock2\\parameters\\namespace_catalog5\\catalog_entries",
+    ) {
+        query_host_registry_value(key_path, value_name)
+    } else {
+        None
+    };
+    if let Some((reg_type, reg_data)) = host_reg_value {
+        return Some((reg_type, reg_data));
+    }
+
+    let reg_sz: Option<(&str, u32)> = if key_lower.ends_with("\\control panel\\international") {
+        match name_lower.as_str() {
+            "localename" => Some(("en-US", 1)),
+            "slist" => Some((",", 1)),
+            "sdecimal" => Some((".", 1)),
+            "sthousand" => Some((",", 1)),
+            "sgrouping" => Some(("3;0", 1)),
+            "snativedigits" => Some(("0123456789", 1)),
+            "smondecimalsep" => Some((".", 1)),
+            "smonthousandsep" => Some((",", 1)),
+            "smongrouping" => Some(("3;0", 1)),
+            "spositivesign" => Some(("", 1)),
+            "snegativesign" => Some(("-", 1)),
+            "stimeformat" => Some(("h:mm:ss tt", 1)),
+            "sshorttime" => Some(("h:mm tt", 1)),
+            "s1159" => Some(("AM", 1)),
+            "s2359" => Some(("PM", 1)),
+            "sshortdate" => Some(("M/d/yyyy", 1)),
+            "syearmonth" => Some(("MMMM yyyy", 1)),
+            "slongdate" => Some(("dddd, MMMM d, yyyy", 1)),
+            "icountry" => Some(("1", 1)),
+            "imeasure" => Some(("1", 1)),
+            "ipapersize" => Some(("1", 1)),
+            "idigits" => Some(("2", 1)),
+            "ilzero" => Some(("1", 1)),
+            "inegnumber" => Some(("1", 1)),
+            "numshape" => Some(("1", 1)),
+            "icurrdigits" => Some(("2", 1)),
+            "icurrency" => Some(("0", 1)),
+            "inegcurr" => Some(("0", 1)),
+            "ifirstdayofweek" => Some(("6", 1)),
+            "ifirstweekofyear" => Some(("0", 1)),
+            "scurrency" => Some(("$", 1)),
+            "icalendartype" => Some(("1", 1)),
+            _ => None,
+        }
+    } else if key_lower.ends_with("\\control panel\\desktop\\muicached")
+        && name_lower == "machinepreferreduilanguages"
+    {
+        Some(("en-US", 1))
+    } else if key_lower.ends_with("\\system\\currentcontrolset\\services\\winsock2\\parameters") {
+        match name_lower.as_str() {
+            "autodialdll" => Some((r"C:\Windows\System32\rasadhlp.dll", 1)),
+            "namespace_callout" => Some((r"C:\Windows\System32\fwpuclnt.dll", 2)),
+            "winsock_registry_version" => Some(("2.0", 1)),
+            "current_namespace_catalog" => Some(("NameSpace_Catalog5", 1)),
+            "current_protocol_catalog" => Some(("Protocol_Catalog9", 1)),
+            _ => None,
+        }
+    } else if key_lower
+        .ends_with("\\software\\microsoft\\cryptography\\defaults\\provider types\\type 001")
+    {
+        match name_lower.as_str() {
+            "name" => Some(("Microsoft Strong Cryptographic Provider", 1)),
+            "typename" => Some(("RSA Full (Signature and Key Exchange)", 1)),
+            _ => None,
+        }
+    } else if key_lower
+        .ends_with("\\software\\microsoft\\cryptography\\defaults\\provider types\\type 024")
+    {
+        match name_lower.as_str() {
+            "name" => Some(("Microsoft Enhanced RSA and AES Cryptographic Provider", 1)),
+            "typename" => Some(("RSA Full and AES", 1)),
+            _ => None,
+        }
+    } else if key_lower.ends_with(
+        "\\software\\microsoft\\cryptography\\defaults\\provider\\microsoft strong cryptographic provider",
+    ) || key_lower.ends_with(
+        "\\software\\microsoft\\cryptography\\defaults\\provider\\microsoft enhanced rsa and aes cryptographic provider",
+    ) {
+        match name_lower.as_str() {
+            "image path" => Some((r"%SystemRoot%\system32\rsaenh.dll", 1)),
+            _ => None,
+        }
+    } else {
+        match name_lower.as_str() {
+            "acp" => Some(("1252", 1)),
+            "oemcp" => Some(("437", 1)),
+            "maccp" => Some(("10000", 1)),
+            _ => None,
+        }
+    };
+    if let Some((value, reg_type)) = reg_sz {
+        return Some((reg_type, encode_reg_sz(value)));
+    }
+
+    let reg_dword = if key_lower.ends_with(
+        "\\system\\currentcontrolset\\services\\winsock2\\parameters\\namespace_catalog5",
+    ) {
+        match name_lower.as_str() {
+            "num_catalog_entries" => Some(5),
+            "num_catalog_entries64" => Some(5),
+            "serial_access_num" => Some(18),
+            _ => None,
+        }
+    } else if key_lower
+        .ends_with("\\system\\currentcontrolset\\services\\winsock2\\parameters\\protocol_catalog9")
+    {
+        match name_lower.as_str() {
+            "num_catalog_entries" => Some(14),
+            "num_catalog_entries64" => Some(14),
+            "next_catalog_entry_id" => Some(1015),
+            "serial_access_num" => Some(11),
+            _ => None,
+        }
+    } else if key_lower.ends_with(
+        "\\software\\microsoft\\cryptography\\defaults\\provider\\microsoft strong cryptographic provider",
+    ) {
+        match name_lower.as_str() {
+            "siginfile" => Some(0),
+            "type" => Some(1),
+            _ => None,
+        }
+    } else if key_lower.ends_with(
+        "\\software\\microsoft\\cryptography\\defaults\\provider\\microsoft enhanced rsa and aes cryptographic provider",
+    ) {
+        match name_lower.as_str() {
+            "siginfile" => Some(0),
+            "type" => Some(24),
+            _ => None,
+        }
+    } else {
+        None
+    };
+
+    reg_dword.map(|value| (4, encode_reg_dword(value)))
+}
+
 /// Concrete layered filesystem type used by the NT shim.
 /// Same architecture as the Linux shim: in-memory (writable) on top of
 /// devices on top of tar read-only.
@@ -128,7 +534,17 @@ const NT_CURRENT_PROCESS_HANDLE: usize = litebox_common_windows::NT_CURRENT_PROC
 /// Page size for the Windows userland platform (4 KiB).
 const PAGE_SIZE: usize = 4096;
 
-/// Pre-captured NLS combined section data from the host kernel.
+/// Pre-captured NtGetNlsSectionPtr data for a specific `(section_type, section_data)` pair.
+pub struct NlsSectionData {
+    /// Section type passed to NtGetNlsSectionPtr (for example, 11 for code pages).
+    pub section_type: u32,
+    /// Section-specific selector (for example, 1252 for ACP or 437 for OEMCP).
+    pub section_data: u32,
+    /// Raw section bytes returned by the host kernel.
+    pub bytes: alloc::vec::Vec<u8>,
+}
+
+/// Pre-captured NLS data from the host kernel.
 /// The runner captures this once and passes it to the shim so the shim
 /// doesn't need to call host Win32 APIs (GetModuleHandleA, etc.).
 pub struct NlsData {
@@ -138,6 +554,16 @@ pub struct NlsData {
     pub locale_id: u32,
     /// Default casing table size.
     pub casing_size: i64,
+    /// Host NLS version returned by NtInitializeNlsFiles.
+    pub version: u32,
+    /// Individual NtGetNlsSectionPtr payloads captured from the host.
+    pub sections: alloc::vec::Vec<NlsSectionData>,
+}
+
+#[derive(Clone, Copy)]
+struct TrackedAlloc {
+    size: usize,
+    allocation_protect: u32,
 }
 
 /// Per-process state shared across all threads in an NT guest process.
@@ -148,13 +574,18 @@ pub struct NlsData {
 pub struct NtProcessState {
     /// Page manager for the guest address space.
     pub pm: PageManager<Platform, PAGE_SIZE>,
-    /// Tracks allocation base → aligned size for MEM_RELEASE.
-    /// MEM_RELEASE with size==0 must free the entire original allocation.
-    alloc_tracker: Mutex<alloc::collections::BTreeMap<usize, usize>>,
+    /// Tracks private allocation base → metadata for MEM_RELEASE and
+    /// NtQueryVirtualMemory. Windows preserves allocation boundaries even
+    /// when adjacent reservations have identical protections.
+    alloc_tracker: Mutex<alloc::collections::BTreeMap<usize, TrackedAlloc>>,
     /// Tracks SEC_IMAGE mappings (base → size) for NtQueryVirtualMemory.
     /// Pages within these ranges should report `MEM_IMAGE` type instead of
     /// `MEM_PRIVATE`, matching real NT kernel behavior.
     image_mappings: Mutex<alloc::collections::BTreeMap<usize, usize>>,
+    /// Tracks non-image section views (base → size) so NtUnmapViewOfSection
+    /// can actually release their address ranges instead of returning
+    /// success-shaped no-ops.
+    section_views: Mutex<alloc::collections::BTreeMap<usize, usize>>,
     /// Tracks MEM_RESERVE-only VA ranges (no committed pages, no host alloc).
     /// Key = base VA, Value = reserved size. Pure bookkeeping.
     va_reservations: Mutex<alloc::collections::BTreeMap<usize, usize>>,
@@ -171,6 +602,14 @@ pub struct NtProcessState {
     /// Immutable guest VA ceiling (set once). Fixed-base reservations are
     /// validated against this, not the moving bump pointer.
     va_reserve_ceiling: core::sync::atomic::AtomicUsize,
+    /// Guest VA of the trampoline code entry point.  Set by the runner
+    /// after the trampoline page is mapped.  Win32k stub patching reads
+    /// this to emit `JMP [rip+0]` sequences that reach the trampoline.
+    trampoline_code_va: core::sync::atomic::AtomicUsize,
+    /// Guest VA of `ntdll!KiUserInvertedFunctionTable`.  Set by the runner.
+    /// The shim writes new entries here when mapping SEC_IMAGE sections so
+    /// that SEH unwinding can find .pdata for every loaded DLL.
+    inverted_function_table_va: core::sync::atomic::AtomicUsize,
 }
 
 impl NtProcessState {
@@ -180,34 +619,92 @@ impl NtProcessState {
             pm,
             alloc_tracker: Mutex::new(alloc::collections::BTreeMap::new()),
             image_mappings: Mutex::new(alloc::collections::BTreeMap::new()),
+            section_views: Mutex::new(alloc::collections::BTreeMap::new()),
             va_reservations: Mutex::new(alloc::collections::BTreeMap::new()),
             va_committed: Mutex::new(alloc::collections::BTreeMap::new()),
             va_reserve_bump: core::sync::atomic::AtomicUsize::new(0),
             va_reserve_floor: core::sync::atomic::AtomicUsize::new(0),
             va_reserve_ceiling: core::sync::atomic::AtomicUsize::new(0),
+            trampoline_code_va: core::sync::atomic::AtomicUsize::new(0),
+            inverted_function_table_va: core::sync::atomic::AtomicUsize::new(0),
         }
     }
 
     /// Record an allocation (base address ΓåÆ size in bytes).
-    pub fn track_alloc(&self, base: usize, size: usize) {
-        self.alloc_tracker.lock().insert(base, size);
+    pub fn track_alloc(&self, base: usize, size: usize, allocation_protect: u32) {
+        self.alloc_tracker.lock().insert(
+            base,
+            TrackedAlloc {
+                size,
+                allocation_protect,
+            },
+        );
     }
 
     /// Look up and remove the tracked allocation size for `base`.
     /// Returns `None` if the base was never tracked.
     pub fn untrack_alloc(&self, base: usize) -> Option<usize> {
-        self.alloc_tracker.lock().remove(&base)
+        self.alloc_tracker
+            .lock()
+            .remove(&base)
+            .map(|alloc| alloc.size)
+    }
+
+    /// Returns the tracked allocation containing `addr`.
+    pub fn tracked_alloc_at(&self, addr: usize) -> Option<(usize, usize, u32)> {
+        let tracker = self.alloc_tracker.lock();
+        let (&base, alloc) = tracker.range(..=addr).next_back()?;
+        if addr < base.saturating_add(alloc.size) {
+            Some((base, alloc.size, alloc.allocation_protect))
+        } else {
+            None
+        }
+    }
+
+    /// Updates tracked allocation boundaries after a successful partial or full
+    /// MEM_RELEASE of `[release_base, release_base + release_size)`.
+    ///
+    /// Windows splits a reservation into distinct allocation bases when a
+    /// middle sub-range is released; preserving that boundary is important for
+    /// later NtQueryVirtualMemory results.
+    pub fn release_tracked_alloc_range(
+        &self,
+        release_base: usize,
+        release_size: usize,
+    ) -> Option<(usize, usize, u32)> {
+        let release_end = release_base.checked_add(release_size)?;
+        let mut tracker = self.alloc_tracker.lock();
+        let (&alloc_base, &alloc) = tracker.range(..=release_base).next_back()?;
+        let alloc_end = alloc_base.checked_add(alloc.size)?;
+        if release_base < alloc_base || release_end > alloc_end {
+            return None;
+        }
+
+        tracker.remove(&alloc_base);
+        if alloc_base < release_base {
+            tracker.insert(
+                alloc_base,
+                TrackedAlloc {
+                    size: release_base - alloc_base,
+                    allocation_protect: alloc.allocation_protect,
+                },
+            );
+        }
+        if release_end < alloc_end {
+            tracker.insert(
+                release_end,
+                TrackedAlloc {
+                    size: alloc_end - release_end,
+                    allocation_protect: alloc.allocation_protect,
+                },
+            );
+        }
+        Some((alloc_base, alloc.size, alloc.allocation_protect))
     }
 
     /// Returns `true` if `addr` falls within any tracked allocation range.
     pub fn is_tracked_alloc(&self, addr: usize) -> bool {
-        let tracker = self.alloc_tracker.lock();
-        // Find the largest base Γëñ addr and check if addr < base + size.
-        if let Some((&base, &size)) = tracker.range(..=addr).next_back() {
-            addr < base + size
-        } else {
-            false
-        }
+        self.tracked_alloc_at(addr).is_some()
     }
 
     /// Allocate a small RW region in guest VA. Returns the guest VA of the
@@ -236,6 +733,19 @@ impl NtProcessState {
         self.image_mappings.lock().insert(base, size);
     }
 
+    /// Remove the SEC_IMAGE mapping containing `addr`.
+    /// Returns `(base, size)` if found.
+    pub fn untrack_image_mapping(&self, addr: usize) -> Option<(usize, usize)> {
+        let mut mappings = self.image_mappings.lock();
+        let (&base, &size) = mappings.range(..=addr).next_back()?;
+        if addr < base.saturating_add(size) {
+            mappings.remove(&base);
+            Some((base, size))
+        } else {
+            None
+        }
+    }
+
     /// Returns `true` if `addr` falls within a SEC_IMAGE mapping.
     pub fn is_image_mapping(&self, addr: usize) -> bool {
         let mappings = self.image_mappings.lock();
@@ -243,6 +753,33 @@ impl NtProcessState {
             addr < base + size
         } else {
             false
+        }
+    }
+
+    /// Snapshot the current SEC_IMAGE mappings.
+    pub fn image_mappings_snapshot(&self) -> alloc::vec::Vec<(usize, usize)> {
+        self.image_mappings
+            .lock()
+            .iter()
+            .map(|(&base, &size)| (base, size))
+            .collect()
+    }
+
+    /// Record a non-image section view.
+    pub fn track_section_view(&self, base: usize, size: usize) {
+        self.section_views.lock().insert(base, size);
+    }
+
+    /// Remove the non-image section view containing `addr`.
+    /// Returns `(base, size)` if found.
+    pub fn untrack_section_view(&self, addr: usize) -> Option<(usize, usize)> {
+        let mut views = self.section_views.lock();
+        let (&base, &size) = views.range(..=addr).next_back()?;
+        if addr < base.saturating_add(size) {
+            views.remove(&base);
+            Some((base, size))
+        } else {
+            None
         }
     }
 
@@ -262,6 +799,30 @@ impl NtProcessState {
         let aligned = (floor + 0xFFFF) & !0xFFFF; // align up
         self.va_reserve_floor
             .store(aligned, core::sync::atomic::Ordering::Release);
+    }
+
+    /// Store the trampoline code VA so win32k stub patching can use it.
+    pub fn set_trampoline_code_va(&self, va: usize) {
+        self.trampoline_code_va
+            .store(va, core::sync::atomic::Ordering::Release);
+    }
+
+    /// Load the trampoline code VA.
+    pub fn trampoline_code_va(&self) -> usize {
+        self.trampoline_code_va
+            .load(core::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Store the KiUserInvertedFunctionTable VA.
+    pub fn set_inverted_function_table_va(&self, va: usize) {
+        self.inverted_function_table_va
+            .store(va, core::sync::atomic::Ordering::Release);
+    }
+
+    /// Load the KiUserInvertedFunctionTable VA.
+    pub fn inverted_function_table_va(&self) -> usize {
+        self.inverted_function_table_va
+            .load(core::sync::atomic::Ordering::Acquire)
     }
 
     /// Reserve a VA range without allocating host memory.
@@ -418,6 +979,43 @@ impl NtProcessState {
             }
         }
         None
+    }
+
+    /// Release a sub-range inside a VA-only reservation.
+    ///
+    /// The caller must pass a non-zero range that is already aligned to the
+    /// desired release granularity and lies fully within a single reservation.
+    /// Returns the released size on success.
+    pub fn va_release_range(&self, base: usize, size: usize) -> Option<usize> {
+        if size == 0 {
+            return None;
+        }
+
+        let release_end = base.checked_add(size)?;
+        let mut reservations = self.va_reservations.lock();
+        let (res_base, res_size) = {
+            let (&res_base, &res_size) = reservations.range(..=base).next_back()?;
+            if base >= res_base.saturating_add(res_size) {
+                return None;
+            }
+            (res_base, res_size)
+        };
+        let res_end = res_base.checked_add(res_size)?;
+        if release_end > res_end {
+            return None;
+        }
+
+        reservations.remove(&res_base)?;
+        if res_base < base {
+            reservations.insert(res_base, base - res_base);
+        }
+        if release_end < res_end {
+            reservations.insert(release_end, res_end - release_end);
+        }
+        drop(reservations);
+
+        let _ = self.va_decommit(base, size);
+        Some(size)
     }
 
     /// Remove a VA reservation. Returns the size if found.
@@ -667,8 +1265,19 @@ pub(crate) struct NtSharedState {
     pub env_block_pool: Mutex<alloc::vec::Vec<(usize, usize, bool)>>,
     /// Guest current working directory (for relative path resolution).
     pub current_directory: Mutex<alloc::string::String>,
-    /// Next thread ID for NtCreateThreadEx.
+    /// Next guest-visible thread ID for NtCreateThreadEx.
     pub next_thread_id: Mutex<u32>,
+    /// Live threads indexed by guest-visible thread ID.
+    pub threads_by_id:
+        Mutex<alloc::collections::BTreeMap<u32, alloc::sync::Arc<handle_table::ThreadObject>>>,
+    /// Minimum known TLS vector slot count per TEB.
+    ///
+    /// This tracks shim-allocated vectors plus ntdll-driven replacements so
+    /// later static-TLS backfills can grow an existing vector without copying
+    /// past the currently provisioned slots.
+    pub tls_vector_slots: Mutex<alloc::collections::BTreeMap<usize, usize>>,
+    /// TLS vector and static-TLS block allocations owned by each thread TEB.
+    pub tls_allocations: Mutex<alloc::collections::BTreeMap<usize, ThreadTlsAllocations>>,
     /// Optional smoltcp network stack for WinSock syscalls.
     /// Set by the runner after creating the Network instance.
     pub net: spin::Once<alloc::sync::Arc<spin::Mutex<litebox::net::Network<Platform>>>>,
@@ -681,9 +1290,20 @@ pub(crate) struct NtSharedState {
     /// have not yet been returned to the guest.  Preserves excess and
     /// incomplete UTF-8 tails across calls.
     pub console_input_pending: Mutex<alloc::vec::Vec<u8>>,
-    /// Pre-captured NLS combined section data, locale ID, and casing size.
+    /// Pre-captured NLS combined section data, locale ID, casing size, and
+    /// individual NtGetNlsSectionPtr payloads.
     /// Set by the runner so the shim doesn't need to call host APIs.
     pub nls_data: spin::Once<NlsData>,
+    /// Guest-local WNF state table keyed by state name.
+    pub wnf_states: Mutex<alloc::collections::BTreeMap<u64, WnfStateValue>>,
+    /// Cached guest mappings for NtGetNlsSectionPtr results keyed by
+    /// `(section_type, section_data)`.
+    pub nls_section_mappings: Mutex<alloc::collections::BTreeMap<(u32, u32), (usize, u32)>>,
+    /// ETW notification event registered via NtTraceControl(0x1B).
+    pub trace_notification_event: Mutex<Option<u32>>,
+    /// ETW provider-registration handles that already had traits set via
+    /// NtTraceControl(0x1E).
+    pub etw_provider_traits_set: Mutex<alloc::collections::BTreeSet<u32>>,
     /// Litebox core VFS for file I/O.
     pub fs: spin::Once<alloc::sync::Arc<NtFS>>,
     /// Guest address space VA range (start..end) for pointer validation.
@@ -699,6 +1319,25 @@ pub(crate) struct NtSharedState {
     pub unhandled_stubs: spin::Once<alloc::vec::Vec<(u32, alloc::string::String)>>,
 }
 
+#[derive(Default)]
+pub(crate) struct ThreadTlsAllocations {
+    pub vector: Option<TrackedGuestAllocation>,
+    pub blocks: alloc::vec::Vec<TrackedGuestAllocation>,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct TrackedGuestAllocation {
+    pub base: usize,
+    pub len: usize,
+    pub owned_by_shim: bool,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct WnfStateValue {
+    pub change_stamp: u32,
+    pub data: alloc::vec::Vec<u8>,
+}
+
 /// State set by the runner to configure the initial thread.
 pub struct NtInitState {
     /// Absolute VA of the PE entry point.
@@ -711,6 +1350,8 @@ pub struct NtInitState {
     pub peb_va: usize,
     /// Image base address of the main executable.
     pub image_base: usize,
+    /// Size of the main executable image.
+    pub image_size: usize,
     /// Guest VA of the RTL_USER_PROCESS_PARAMETERS structure.
     pub process_params_va: usize,
     /// Guest VA of the ANSI command line buffer (for GetCommandLineA).
@@ -729,6 +1370,8 @@ pub struct NtInitState {
     pub initial_rcx: usize,
     /// For ntdll-driven init: RDX value (ntdll base address).
     pub initial_rdx: usize,
+    /// Absolute VA of ntdll!RtlUserThreadStart for child thread startup.
+    pub rtl_user_thread_start_va: usize,
     /// RVA of KiUserExceptionDispatcher in ntdll, resolved from PE exports.
     pub ki_user_exception_dispatcher_rva: Option<usize>,
 }
@@ -751,6 +1394,11 @@ impl NtShimEntrypoints {
     #[must_use]
     pub fn new(process_state: alloc::sync::Arc<NtProcessState>) -> Self {
         let (handles, stdin, stdout, stderr) = handle_table::HandleTable::with_stdio();
+        let main_thread_id = crate::peb_teb::SYNTHETIC_MAIN_THREAD_ID;
+        let main_thread_obj =
+            alloc::sync::Arc::new(handle_table::ThreadObject::new(main_thread_id, 0, 0));
+        let mut threads_by_id = alloc::collections::BTreeMap::new();
+        threads_by_id.insert(main_thread_id, alloc::sync::Arc::clone(&main_thread_obj));
         let shared = alloc::sync::Arc::new(NtSharedState {
             handles: Mutex::new(handles),
             stdin_handle: stdin,
@@ -765,12 +1413,21 @@ impl NtShimEntrypoints {
             env_vars: Mutex::new(alloc::collections::BTreeMap::new()),
             env_block_pool: Mutex::new(alloc::vec::Vec::new()),
             current_directory: Mutex::new(alloc::string::String::from("C:\\")),
-            next_thread_id: Mutex::new(2), // TID 1 is the main thread
+            next_thread_id: Mutex::new(
+                main_thread_id + crate::peb_teb::SYNTHETIC_THREAD_ID_INCREMENT,
+            ),
+            threads_by_id: Mutex::new(threads_by_id),
+            tls_vector_slots: Mutex::new(alloc::collections::BTreeMap::new()),
+            tls_allocations: Mutex::new(alloc::collections::BTreeMap::new()),
             net: spin::Once::new(),
             sockets: Mutex::new(alloc::collections::BTreeMap::new()),
             next_socket_id: Mutex::new(1),
             console_input_pending: Mutex::new(alloc::vec::Vec::new()),
             nls_data: spin::Once::new(),
+            wnf_states: Mutex::new(alloc::collections::BTreeMap::new()),
+            nls_section_mappings: Mutex::new(alloc::collections::BTreeMap::new()),
+            trace_notification_event: Mutex::new(None),
+            etw_provider_traits_set: Mutex::new(alloc::collections::BTreeSet::new()),
             fs: spin::Once::new(),
             guest_va_start: core::sync::atomic::AtomicUsize::new(0),
             guest_va_end: core::sync::atomic::AtomicUsize::new(usize::MAX),
@@ -783,8 +1440,8 @@ impl NtShimEntrypoints {
             init_state: None,
             child_thread_argument: None,
             fls_slots: Mutex::new([0usize; 128]),
-            thread_obj: None,
-            thread_id: 1, // Main thread is always TID 1
+            thread_obj: Some(main_thread_obj),
+            thread_id: main_thread_id,
             wait_state: WaitState::new(litebox_platform_multiplex::platform()),
             seh_forward_count: core::sync::atomic::AtomicU32::new(0),
             shared,
@@ -833,14 +1490,27 @@ impl NtShimEntrypoints {
         child_teb_va: usize,
         child_argument: usize,
     ) -> Self {
+        let (entry_point, initial_rcx, initial_rdx, child_thread_argument) =
+            if parent_init.rtl_user_thread_start_va != 0 {
+                (
+                    parent_init.rtl_user_thread_start_va,
+                    child_entry,
+                    child_argument,
+                    None,
+                )
+            } else {
+                (child_entry, 0, 0, Some(child_argument))
+            };
+
         Self {
             exit_code: AtomicI32::new(0),
             init_state: Some(NtInitState {
-                entry_point: child_entry,
+                entry_point,
                 stack_top: child_stack_top,
                 teb_va: child_teb_va,
                 peb_va: parent_init.peb_va,
                 image_base: parent_init.image_base,
+                image_size: parent_init.image_size,
                 process_params_va: parent_init.process_params_va,
                 cmdline_ansi_va: parent_init.cmdline_ansi_va,
                 env_block_va: 0, // Don't re-parse env block
@@ -848,11 +1518,12 @@ impl NtShimEntrypoints {
                 guest_va_start: parent_init.guest_va_start,
                 guest_va_end: parent_init.guest_va_end,
                 exe_path: parent_init.exe_path.clone(),
-                initial_rcx: 0,
-                initial_rdx: 0,
+                initial_rcx,
+                initial_rdx,
+                rtl_user_thread_start_va: parent_init.rtl_user_thread_start_va,
                 ki_user_exception_dispatcher_rva: parent_init.ki_user_exception_dispatcher_rva,
             }),
-            child_thread_argument: Some(child_argument),
+            child_thread_argument,
             fls_slots: Mutex::new([0usize; 128]),
             thread_obj: Some(thread_obj),
             thread_id,
@@ -913,6 +1584,13 @@ impl NtShimEntrypoints {
         self.shared
             .process_state
             .set_va_reserve_floor(state.guest_va_start);
+        self.shared
+            .process_state
+            .track_image_mapping(state.image_base, state.image_size);
+        crate::syscalls::section::initialize_static_tls_for_teb(&self.shared, state.teb_va);
+        if let Some(ref thread_obj) = self.thread_obj {
+            thread_obj.set_teb_va(state.teb_va);
+        }
         self.init_state = Some(state);
     }
 
@@ -920,6 +1598,88 @@ impl NtShimEntrypoints {
     /// Call this after `run_thread` returns to get the exit status.
     pub fn exit_code(&self) -> i32 {
         self.exit_code.load(Ordering::Acquire)
+    }
+
+    fn mark_current_thread_exited(&self, exit_code: i32) {
+        self.exit_code.store(exit_code, Ordering::Release);
+
+        let mut seen_mutants = alloc::vec::Vec::new();
+        let owned_mutants = {
+            let handles = self.shared.handles.lock();
+            let mut mutants = alloc::vec::Vec::new();
+            for obj in handles.values() {
+                let handle_table::NtObject::Mutant(mutant) = obj else {
+                    continue;
+                };
+                let mutant_ptr = alloc::sync::Arc::as_ptr(mutant) as usize;
+                if seen_mutants.contains(&mutant_ptr) {
+                    continue;
+                }
+                seen_mutants.push(mutant_ptr);
+                mutants.push(alloc::sync::Arc::clone(mutant));
+            }
+            mutants
+        };
+
+        for mutant in owned_mutants {
+            let mut state = mutant.state.lock();
+            if state.owner_thread_id == Some(self.thread_id) {
+                state.owner_thread_id = None;
+                state.recursion_count = 0;
+                state.abandoned = true;
+                drop(state);
+                mutant.wake_waiters();
+            }
+        }
+
+        if let Some(ref obj) = self.thread_obj {
+            obj.set_exited(exit_code);
+        }
+    }
+
+    fn cleanup_current_thread_resources(&self) {
+        let Some(thread_obj) = self.thread_obj.as_ref() else {
+            return;
+        };
+        if !thread_obj.has_exited() {
+            return;
+        }
+
+        self.shared.threads_by_id.lock().remove(&self.thread_id);
+
+        let teb_va = thread_obj.teb_va();
+        if teb_va == 0 {
+            return;
+        }
+
+        let stack_top =
+            unsafe { core::ptr::read((teb_va + peb_teb::teb_offsets::STACK_BASE) as *const usize) };
+        let stack_limit = unsafe {
+            core::ptr::read((teb_va + peb_teb::teb_offsets::STACK_LIMIT) as *const usize)
+        };
+        let deallocation_stack = unsafe {
+            core::ptr::read((teb_va + peb_teb::teb_offsets::DEALLOCATION_STACK) as *const usize)
+        };
+        let stack_base = if deallocation_stack != 0 {
+            deallocation_stack
+        } else {
+            stack_limit
+        };
+        let stack_len = stack_top.saturating_sub(stack_base);
+
+        crate::syscalls::section::free_thread_tls_allocations(&self.shared, teb_va);
+        thread_obj.set_teb_va(0);
+
+        use litebox::platform::{RawConstPointer as _, RawPointerProvider};
+        let pm = &self.shared.process_state.pm;
+        if stack_base != 0 && stack_len != 0 {
+            let stack_ptr =
+                <Platform as RawPointerProvider>::RawMutPointer::<u8>::from_usize(stack_base);
+            let _ = unsafe { pm.remove_pages(stack_ptr, stack_len) };
+        }
+
+        let teb_ptr = <Platform as RawPointerProvider>::RawMutPointer::<u8>::from_usize(teb_va);
+        let _ = unsafe { pm.remove_pages(teb_ptr, 0x2000) };
     }
 
     /// Returns the stdio handle values for PEB/TEB synthesis.
@@ -953,7 +1713,7 @@ impl NtShimEntrypoints {
             return self.dispatch_nt_syscall(id, nr, ctx);
         }
 
-        // Then try kernel32 syscalls (0x1000+ range).
+        // Then try kernel32 pseudo-syscalls and win32k syscalls (both in 0x1000+ range).
         match nr {
             stub_dlls::K32_GET_STD_HANDLE => {
                 syscalls::k32_get_std_handle(
@@ -991,6 +1751,20 @@ impl NtShimEntrypoints {
                     // Safety: guest memory is directly accessible on userland.
                     let ptr = unsafe { *(buf_va as *const u64) };
                     ctx.regs.rax = ptr as usize;
+                    #[cfg(debug_assertions)]
+                    {
+                        use litebox::platform::DebugLogProvider as _;
+                        let cmdline = read_wide_string_checked(
+                            &self.shared.process_state.pm,
+                            ptr as usize,
+                            state.guest_va_start,
+                            state.guest_va_end,
+                            MAX_WIDE_STRING_CHARS,
+                        );
+                        litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                            "NT shim: GetCommandLineW -> ptr=0x{ptr:X} value={cmdline:?}\n"
+                        ));
+                    }
                 } else {
                     ctx.regs.rax = 0;
                 }
@@ -1002,6 +1776,14 @@ impl NtShimEntrypoints {
                 // PEB/TEB region.
                 if let Some(state) = &self.init_state {
                     ctx.regs.rax = state.cmdline_ansi_va;
+                    #[cfg(debug_assertions)]
+                    {
+                        use litebox::platform::DebugLogProvider as _;
+                        litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                            "NT shim: GetCommandLineA -> ptr=0x{:X}\n",
+                            state.cmdline_ansi_va
+                        ));
+                    }
                 } else {
                     ctx.regs.rax = 0;
                 }
@@ -1709,6 +2491,14 @@ impl NtShimEntrypoints {
                         syscalls::sync::Waitable::Semaphore(s) => {
                             syscalls::sync::wait_semaphore_with_timeout(s, timeout, &self.wait_cx())
                         }
+                        syscalls::sync::Waitable::Mutant(m) => {
+                            syscalls::sync::wait_mutant_with_timeout(
+                                m,
+                                timeout,
+                                &self.wait_cx(),
+                                self.thread_id,
+                            )
+                        }
                         syscalls::sync::Waitable::Thread(t) => {
                             syscalls::sync::wait_thread_with_timeout(t, timeout, &self.wait_cx())
                         }
@@ -1746,12 +2536,31 @@ impl NtShimEntrypoints {
             }
 
             // --- WinSock (ws2_32) syscalls ---
-            nr if nr >= stub_dlls::WS2_STARTUP => {
+            nr if nr >= stub_dlls::WS2_STARTUP && nr < stub_dlls::WS2_END => {
                 let teb_va = self.init_state.as_ref().map_or(0, |s| s.teb_va);
                 return syscalls::net::dispatch_ws2_syscall(&self.shared, nr, ctx, teb_va);
             }
 
-            _ => {}
+            // --- CSRSS client pseudo-syscalls ---
+            stub_dlls::CSR_CLIENT_CONNECT_TO_SERVER => {
+                // CsrClientConnectToServer was patched into a trampoline
+                // pseudo-syscall.  The trampoline leaves the return address
+                // on the stack, so ctx.regs.rsp is the callee RSP — no
+                // adjustment needed.
+                let status =
+                    syscalls::win32k::csr_client_connect_to_server(ctx, &self.shared.process_state);
+                ctx.regs.rax = status.0 as u32 as usize;
+                return (status, false);
+            }
+
+            _ => {
+                // Win32k syscalls (0x1000-0x1FFF) from rewritten win32u.dll stubs.
+                // Checked here (after K32 match arms) to avoid intercepting K32
+                // pseudo-syscalls which share the same 0x1000+ number space.
+                if nr >= 0x1000 && nr < 0x2000 {
+                    return self.dispatch_win32k_syscall(nr, ctx);
+                }
+            }
         }
 
         // Look up the name from unhandled_stubs if available.
@@ -1769,24 +2578,82 @@ impl NtShimEntrypoints {
         (NtStatus::STATUS_NOT_IMPLEMENTED, false)
     }
 
+    /// Dispatch a Win32k syscall (from rewritten win32u.dll stubs).
+    ///
+    /// Like ntdll stubs, these go through the trampoline which leaves the
+    /// return address on the stack, so ctx.regs.rsp is the callee RSP.
+    /// Stack-arg offsets (+0x28 = arg5, +0x30 = arg6) work identically to
+    /// the PE-builder stub path.
+    /// The result NTSTATUS is written directly to rax because the outer
+    /// handler treats nr ≥ 0x1000 as "kernel32" and skips the status write.
+    fn dispatch_win32k_syscall(&self, nr: u32, ctx: &mut ExecutionContext) -> (NtStatus, bool) {
+        #[cfg(debug_assertions)]
+        {
+            use litebox::platform::DebugLogProvider as _;
+            litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                "NT shim: win32k nr=0x{:04X} r10=0x{:X} rdx=0x{:X} r8=0x{:X}\n",
+                nr,
+                ctx.regs.r10,
+                ctx.regs.rdx,
+                ctx.regs.r8,
+            ));
+        }
+
+        let status = match nr {
+            // NtUserGetThreadState — USER32 calls this early in DllMain.
+            // Returns a DWORD_PTR (not NTSTATUS).  0 = no thread state
+            // (thread not connected to win32k subsystem).
+            0x1000 => {
+                ctx.regs.rax = 0;
+                NtStatus::STATUS_SUCCESS
+            }
+            // NtUserProcessConnect — USER32's DllMain needs this to set up
+            // gSharedInfo.  Without it, gSharedInfo is NULL and USER32 crashes.
+            0x10E3 => syscalls::win32k::nt_user_process_connect(ctx, &self.shared.process_state),
+            // NtGdiInit — called by gdi32full!GdiProcessSetup.
+            0x12E7 => syscalls::win32k::nt_gdi_init(ctx, &self.shared.process_state),
+            // NtGdiInit2 — called by gdi32full!GdiDllInitialize_OLD.
+            // Must return non-NULL or GdiDllInitialize fails → USER32 init fails.
+            0x12E8 => syscalls::win32k::nt_gdi_init2(ctx, &self.shared.process_state),
+            _ => {
+                #[cfg(debug_assertions)]
+                {
+                    use litebox::platform::DebugLogProvider as _;
+                    litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                        "NT shim: unhandled win32k syscall 0x{:04X}\n",
+                        nr,
+                    ));
+                }
+                // Unknown win32k syscalls are errors, not value-returning
+                // success cases, so surface STATUS_NOT_IMPLEMENTED to the guest.
+                ctx.regs.rax = NtStatus::STATUS_NOT_IMPLEMENTED.raw() as usize;
+                NtStatus::STATUS_NOT_IMPLEMENTED
+            }
+        };
+
+        // For calls that set rax directly (NtUserGetThreadState etc.),
+        // don't overwrite it with the NTSTATUS.  Only overwrite for calls
+        // that genuinely return NTSTATUS (like NtUserProcessConnect).
+        let returns_ntstatus = matches!(nr, 0x10E3);
+        if returns_ntstatus {
+            ctx.regs.rax = status.0 as u32 as usize;
+        }
+
+        (status, false)
+    }
+
     /// Dispatch an NT-specific syscall (from ntdll stubs).
     ///
-    /// The rewriter trampoline pops the return address into RCX before
-    /// entering `syscall_callback`, so `ctx.regs.rsp` is 8 bytes higher
-    /// than in the stub-DLL path (where the return address stays on stack).
-    /// We temporarily subtract 8 from RSP so that all stack-arg offsets
-    /// (+0x28 = arg5, +0x30 = arg6, etc.) work identically to the stub path.
+    /// The trampoline leaves the return address on the stack, so
+    /// `ctx.regs.rsp` is the callee RSP — identical to the PE-builder
+    /// stub convention.  Stack-arg offsets (+0x28 = arg5, +0x30 = arg6)
+    /// work without any RSP adjustment.
     fn dispatch_nt_syscall(
         &self,
         nt_nr: NtSyscallId,
         raw_nr: u32,
         ctx: &mut ExecutionContext,
     ) -> (NtStatus, bool) {
-        // Normalize RSP: the rewriter trampoline pops the return address,
-        // so RSP is 8 higher than it would be with a real `syscall` instruction
-        // or with the stub-DLL path.  Subtract 8 so stack arg offsets match.
-        ctx.regs.rsp = ctx.regs.rsp.wrapping_sub(8);
-
         let result = self.dispatch_nt_syscall_inner(nt_nr, raw_nr, ctx);
 
         #[cfg(debug_assertions)]
@@ -1803,10 +2670,385 @@ impl NtShimEntrypoints {
             }
         }
 
-        // Restore RSP so sysret resumes the guest correctly.
-        ctx.regs.rsp = ctx.regs.rsp.wrapping_add(8);
+        // Module list integrity check: walk InLoadOrderModuleList and detect
+        // the first corrupted Flink.  Runs after every NT syscall in debug mode.
+        // Validates addresses, alignment, image-mapping containment, and the
+        // doubly-linked-list invariant (Flink.Blink == self).
+        #[cfg(debug_assertions)]
+        if let Some(init) = self.init_state.as_ref() {
+            let peb_va = init.peb_va;
+            if peb_va != 0 {
+                unsafe {
+                    let ldr_ptr = core::ptr::read((peb_va + 0x18) as *const usize);
+                    if ldr_ptr != 0 {
+                        let head = ldr_ptr + 0x10;
+                        let mut cur = core::ptr::read(head as *const usize);
+                        let mut count = 0u32;
+                        let mut prev_addr = head;
+                        while cur != head && count < 50 {
+                            // Bail if address is out of range or not 8-byte aligned
+                            if cur < 0x10000 || cur > 0x7FFF_FFFF_FFFF || (cur & 7) != 0 {
+                                use litebox::platform::DebugLogProvider as _;
+                                litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                                    "[LDR-CORRUPT] After {:?}(0x{:04X}): entry #{count} Flink \
+                                     0x{cur:X} from prev 0x{prev_addr:X} is out of range or misaligned\n",
+                                    nt_nr, raw_nr,
+                                ));
+                                break;
+                            }
+                            // Check if entry address is inside a DLL/EXE image
+                            if self.shared.process_state.is_image_mapping(cur) {
+                                use litebox::platform::DebugLogProvider as _;
+                                litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                                    "[LDR-CORRUPT] After {:?}(0x{:04X}): entry #{count} @ 0x{cur:X} \
+                                     is inside a SEC_IMAGE mapping! Prev 0x{prev_addr:X}\n",
+                                    nt_nr, raw_nr,
+                                ));
+                                break;
+                            }
+                            // Verify doubly-linked-list invariant: Blink should
+                            // point back to previous node.
+                            let blink = core::ptr::read((cur + 8) as *const usize);
+                            if blink != prev_addr {
+                                use litebox::platform::DebugLogProvider as _;
+                                let dll_base = core::ptr::read((cur + 0x30) as *const usize);
+                                let size_of_image = core::ptr::read((cur + 0x40) as *const u32);
+                                let flink = core::ptr::read(cur as *const usize);
+                                litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                                    "[LDR-CORRUPT] After {:?}(0x{:04X}): entry #{count} @ 0x{cur:X} \
+                                     Blink=0x{blink:X} != prev=0x{prev_addr:X}! \
+                                     Flink=0x{flink:X} DllBase=0x{dll_base:X} Size=0x{size_of_image:X}\n",
+                                    nt_nr, raw_nr,
+                                ));
+                                break;
+                            }
+                            // Read DllBase (+0x30) and SizeOfImage (+0x40).
+                            let dll_base = core::ptr::read((cur + 0x30) as *const usize);
+                            let size_of_image = core::ptr::read((cur + 0x40) as *const u32);
+                            if dll_base == 0 || size_of_image == 0 || size_of_image > 0x1000_0000 {
+                                use litebox::platform::DebugLogProvider as _;
+                                litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                                    "[LDR-CORRUPT] After {:?}(0x{:04X}): entry #{count} @ 0x{cur:X} has \
+                                     bad DllBase=0x{dll_base:X} SizeOfImage=0x{size_of_image:X}. \
+                                     Prev 0x{prev_addr:X}\n",
+                                    nt_nr, raw_nr,
+                                ));
+                                break;
+                            }
+                            prev_addr = cur;
+                            cur = core::ptr::read(cur as *const usize);
+                            count += 1;
+                        }
+                        // Log walk depth so we can see when the chain first breaks.
+                        use litebox::platform::DebugLogProvider as _;
+                        litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                            "[LDR-walk] {:?}(0x{:04X}) depth={count}\n",
+                            nt_nr,
+                            raw_nr,
+                        ));
+                    }
+                }
+            }
+        }
+
+        // Monitor TEB+0x58 (ThreadLocalStoragePointer) transitions.
+        // Track when the TLS vector pointer first becomes non-zero and when
+        // it changes (indicating LdrpInitializeTls or ProcessTlsReplaceVector).
+        #[cfg(debug_assertions)]
+        if let Some(init) = self.init_state.as_ref() {
+            let teb_va = init.teb_va;
+            if teb_va != 0 {
+                unsafe {
+                    let tls_ptr = core::ptr::read((teb_va + 0x58) as *const u64);
+                    static TLS_PTR_PREV: core::sync::atomic::AtomicU64 =
+                        core::sync::atomic::AtomicU64::new(0);
+                    let prev = TLS_PTR_PREV.load(core::sync::atomic::Ordering::Relaxed);
+                    if tls_ptr != prev {
+                        use litebox::platform::DebugLogProvider as _;
+                        litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                            "[TLS-VEC] After {:?}(0x{:04X}): TEB+0x58 changed 0x{prev:X} → 0x{tls_ptr:X}\n",
+                            nt_nr, raw_nr,
+                        ));
+                        TLS_PTR_PREV.store(tls_ptr, core::sync::atomic::Ordering::Relaxed);
+                    }
+                    // Also monitor TLS[9] for the combase slot.
+                    if tls_ptr != 0 && tls_ptr > 0x10000 && tls_ptr < 0x7FFF_FFFF_FFFF {
+                        let tls9 = core::ptr::read((tls_ptr + 9 * 8) as *const usize);
+                        static TLS9_PREV: core::sync::atomic::AtomicUsize =
+                            core::sync::atomic::AtomicUsize::new(0);
+                        let prev9 = TLS9_PREV.load(core::sync::atomic::Ordering::Relaxed);
+                        if tls9 != prev9 {
+                            use litebox::platform::DebugLogProvider as _;
+                            litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                                "[TLS9] After {:?}(0x{:04X}): TLS[9] changed 0x{prev9:X} → 0x{tls9:X}\n",
+                                nt_nr, raw_nr,
+                            ));
+                            TLS9_PREV.store(tls9, core::sync::atomic::Ordering::Relaxed);
+                        }
+                    }
+                }
+            }
+        }
 
         result
+    }
+
+    /// Handle NtSetInformationProcess(ProcessTlsInformation, 0x23).
+    ///
+    /// ntdll calls this to atomically replace each thread's TLS vector
+    /// (TEB+0x58 = ThreadLocalStoragePointer) when a new DLL with TLS is
+    /// loaded after `LdrpActiveThreadCount > 0`.
+    ///
+    /// PROCESS_TLS_INFORMATION layout (x64):
+    ///   +0x00  ULONG  Flags
+    ///   +0x04  ULONG  OperationType  (0 = ReplaceIndex, 1 = ReplaceVector)
+    ///   +0x08  ULONG  ThreadDataCount
+    ///   +0x0C  ULONG  TlsIndex
+    ///   +0x10  ULONG  PreviousCount
+    ///   +0x18  THREAD_TLS_INFORMATION[ThreadDataCount]
+    ///
+    /// THREAD_TLS_INFORMATION layout (x64, 0x20 bytes each):
+    ///   +0x00  ULONG  Flags
+    ///   +0x08  PVOID  NewTlsData   (input)
+    ///   +0x10  PVOID  OldTlsData   (output — kernel writes previous value)
+    ///   +0x18  HANDLE ThreadId
+    unsafe fn handle_process_tls_information(&self, info_ptr: u64) -> NtStatus {
+        unsafe {
+            let flags = core::ptr::read(info_ptr as *const u32);
+            let op_type = core::ptr::read((info_ptr + 4) as *const u32);
+            let thread_count = core::ptr::read((info_ptr + 8) as *const u32);
+            let tls_index = core::ptr::read((info_ptr + 0xC) as *const u32);
+            let prev_count = core::ptr::read((info_ptr + 0x10) as *const u32);
+
+            let current_teb_va = self.init_state.as_ref().map(|s| s.teb_va).unwrap_or(0);
+
+            #[cfg(debug_assertions)]
+            {
+                use litebox::platform::DebugLogProvider as _;
+                litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                "  ProcessTlsInformation: flags=0x{flags:X} op={op_type} threads={thread_count} \
+                 idx={tls_index} TEB=0x{current_teb_va:X}\n",
+            ));
+            }
+
+            if current_teb_va == 0 {
+                return NtStatus::STATUS_SUCCESS;
+            }
+
+            let threads = self.shared.threads_by_id.lock();
+            let handles = self.shared.handles.lock();
+            let resolve_teb_va = |thread_ref: u64| -> usize {
+                let thread_id = thread_ref as u32;
+                if let Some(thread) = threads.get(&thread_id) {
+                    return thread.teb_va();
+                }
+
+                let current_thread_pseudo = u64::MAX - 1;
+                if thread_ref == 0
+                    || thread_ref == current_thread_pseudo
+                    || thread_id == self.thread_id
+                {
+                    return current_teb_va;
+                }
+
+                match handles.get(thread_id) {
+                    Some(handle_table::NtObject::Thread(thread)) => thread.teb_va(),
+                    Some(handle_table::NtObject::CurrentThread) => current_teb_va,
+                    _ if thread_count == 1 => current_teb_va,
+                    _ => 0,
+                }
+            };
+
+            match op_type {
+                // ProcessTlsReplaceVector (1): replace TEB+0x58 with the new
+                // TLS array pointer. ntdll allocated a larger vector, copied
+                // old entries, and wants us to swap TEB.ThreadLocalStoragePointer.
+                1 => {
+                    for i in 0..thread_count {
+                        let entry = info_ptr + 0x18 + (i as u64) * 0x20;
+                        let raw_q0 = core::ptr::read(entry as *const u64);
+                        let thread_ref = core::ptr::read((entry + 0x18) as *const u64);
+                        let mut teb_va = resolve_teb_va(thread_ref);
+                        if teb_va == 0 {
+                            #[cfg(debug_assertions)]
+                            {
+                                use litebox::platform::DebugLogProvider as _;
+                                litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                                "    ReplaceVector[{i}]: unresolved thread_ref=0x{thread_ref:X}\n",
+                            ));
+                            }
+                            continue;
+                        }
+
+                        #[cfg(debug_assertions)]
+                        {
+                            use litebox::platform::DebugLogProvider as _;
+                            let mut dump =
+                                alloc::string::String::from("    ReplaceVector entry hex: ");
+                            for off in (0..0x20u64).step_by(8) {
+                                let val = core::ptr::read((entry + off) as *const u64);
+                                dump.push_str(&alloc::format!("+0x{off:02X}={val:016X} "));
+                            }
+                            dump.push('\n');
+                            litebox_platform_multiplex::platform().debug_log_print(&dump);
+                        }
+
+                        let mut new_tls_data = core::ptr::read((entry + 0x08) as *const u64);
+                        if thread_count == 1
+                            && thread_ref == 0
+                            && new_tls_data == 0
+                            && raw_q0 > 0x10000
+                        {
+                            teb_va = current_teb_va;
+                            new_tls_data = raw_q0;
+                            let old_vector = core::ptr::read(
+                                (teb_va + crate::peb_teb::teb_offsets::TLS_POINTER) as *const u64,
+                            );
+
+                            core::ptr::write(
+                                (teb_va + crate::peb_teb::teb_offsets::TLS_POINTER) as *mut u64,
+                                new_tls_data,
+                            );
+                            crate::syscalls::section::set_thread_tls_vector_allocation(
+                                &self.shared,
+                                teb_va,
+                                new_tls_data as usize,
+                                core::cmp::max(tls_index as usize + 1, prev_count as usize),
+                            );
+                            core::ptr::write((entry + 0x08) as *mut u64, old_vector);
+
+                            #[cfg(debug_assertions)]
+                            {
+                                use litebox::platform::DebugLogProvider as _;
+                                litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                                "    ReplaceVector[{i}]: legacy-current teb=0x{teb_va:X} old=0x{old_vector:X} → new=0x{new_tls_data:X}\n",
+                            ));
+                            }
+                            continue;
+                        }
+
+                        let old_vector = core::ptr::read(
+                            (teb_va + crate::peb_teb::teb_offsets::TLS_POINTER) as *const u64,
+                        );
+
+                        // Swap TEB+0x58 to the new (larger) vector.
+                        core::ptr::write(
+                            (teb_va + crate::peb_teb::teb_offsets::TLS_POINTER) as *mut u64,
+                            new_tls_data,
+                        );
+                        crate::syscalls::section::set_thread_tls_vector_allocation(
+                            &self.shared,
+                            teb_va,
+                            new_tls_data as usize,
+                            core::cmp::max(tls_index as usize + 1, prev_count as usize),
+                        );
+                        // Write back the old vector pointer so ntdll can free it.
+                        core::ptr::write((entry + 0x10) as *mut u64, old_vector);
+
+                        #[cfg(debug_assertions)]
+                        {
+                            use litebox::platform::DebugLogProvider as _;
+                            litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                            "    ReplaceVector[{i}]: thread_ref=0x{thread_ref:X} teb=0x{teb_va:X} old=0x{old_vector:X} → new=0x{new_tls_data:X}\n",
+                        ));
+                        }
+                    }
+                }
+                // ProcessTlsReplaceIndex (0): replace a specific TLS slot
+                // at TlsIndex within the current TLS array.
+                0 => {
+                    for i in 0..thread_count {
+                        let entry = info_ptr + 0x18 + (i as u64) * 0x20;
+                        let raw_q0 = core::ptr::read(entry as *const u64);
+                        let thread_ref = core::ptr::read((entry + 0x18) as *const u64);
+                        let mut teb_va = resolve_teb_va(thread_ref);
+                        if teb_va == 0 {
+                            #[cfg(debug_assertions)]
+                            {
+                                use litebox::platform::DebugLogProvider as _;
+                                litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                                "    ReplaceIndex[{i}]: unresolved thread_ref=0x{thread_ref:X}\n",
+                            ));
+                            }
+                            continue;
+                        }
+
+                        let tls_array = core::ptr::read(
+                            (teb_va + crate::peb_teb::teb_offsets::TLS_POINTER) as *const u64,
+                        );
+                        if tls_array == 0 {
+                            continue;
+                        }
+
+                        let mut new_tls_data = core::ptr::read((entry + 0x08) as *const u64);
+                        if thread_count == 1
+                            && thread_ref == 0
+                            && new_tls_data == 0
+                            && raw_q0 > 0x10000
+                        {
+                            teb_va = current_teb_va;
+                            let tls_array = core::ptr::read(
+                                (teb_va + crate::peb_teb::teb_offsets::TLS_POINTER) as *const u64,
+                            );
+                            if tls_array == 0 {
+                                continue;
+                            }
+
+                            new_tls_data = raw_q0;
+                            let slot_addr = tls_array + (tls_index as u64) * 8;
+                            let old_data = core::ptr::read(slot_addr as *const u64);
+                            core::ptr::write(slot_addr as *mut u64, new_tls_data);
+                            crate::syscalls::section::set_thread_tls_vector_allocation(
+                                &self.shared,
+                                teb_va,
+                                tls_array as usize,
+                                core::cmp::max(tls_index as usize + 1, prev_count as usize),
+                            );
+                            core::ptr::write((entry + 0x08) as *mut u64, old_data);
+
+                            #[cfg(debug_assertions)]
+                            {
+                                use litebox::platform::DebugLogProvider as _;
+                                litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                                "    ReplaceIndex[{i}]: legacy-current teb=0x{teb_va:X} slot[{tls_index}] old=0x{old_data:X} → new=0x{new_tls_data:X}\n",
+                            ));
+                            }
+                            continue;
+                        }
+
+                        let slot_addr = tls_array + (tls_index as u64) * 8;
+                        let old_data = core::ptr::read(slot_addr as *const u64);
+                        core::ptr::write(slot_addr as *mut u64, new_tls_data);
+                        crate::syscalls::section::set_thread_tls_vector_allocation(
+                            &self.shared,
+                            teb_va,
+                            tls_array as usize,
+                            core::cmp::max(tls_index as usize + 1, prev_count as usize),
+                        );
+                        core::ptr::write((entry + 0x10) as *mut u64, old_data);
+
+                        #[cfg(debug_assertions)]
+                        {
+                            use litebox::platform::DebugLogProvider as _;
+                            litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                            "    ReplaceIndex[{i}]: thread_ref=0x{thread_ref:X} teb=0x{teb_va:X} slot[{tls_index}] old=0x{old_data:X} → new=0x{new_tls_data:X}\n",
+                        ));
+                        }
+                    }
+                }
+                _ => {
+                    #[cfg(debug_assertions)]
+                    {
+                        use litebox::platform::DebugLogProvider as _;
+                        litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                            "    ProcessTlsInformation: unknown OperationType {op_type}\n",
+                        ));
+                    }
+                }
+            }
+
+            NtStatus::STATUS_SUCCESS
+        }
     }
 
     /// Inner dispatch after RSP normalization.
@@ -1833,13 +3075,17 @@ impl NtShimEntrypoints {
                 let args = syscalls::NtSyscallArgs::from_ctx(ctx);
                 let handle = args.arg0;
                 let exit_status = args.arg1 as i32;
+                let is_current_handle = handle == NT_CURRENT_PROCESS_HANDLE
+                    || handle == 0
+                    || self
+                        .shared
+                        .handles
+                        .lock()
+                        .get(handle as u32)
+                        .is_some_and(|obj| matches!(obj, handle_table::NtObject::CurrentProcess));
 
-                if handle == NT_CURRENT_PROCESS_HANDLE || handle == 0 {
-                    self.exit_code.store(exit_status, Ordering::Release);
-                    // Mark this thread as exited too.
-                    if let Some(ref obj) = self.thread_obj {
-                        obj.set_exited(exit_status);
-                    }
+                if is_current_handle {
+                    self.mark_current_thread_exited(exit_status);
                     (NtStatus::STATUS_SUCCESS, true)
                 } else {
                     log_unimplemented!("NtTerminateProcess on remote handle 0x{:X}", handle);
@@ -2024,6 +3270,51 @@ impl NtShimEntrypoints {
                     syscalls::sysinfo::nt_query_information_process(ctx, self.init_state.as_ref());
                 (status, false)
             }
+            NtSyscallId::NtOpenProcess => {
+                let args = syscalls::NtSyscallArgs::from_ctx(ctx);
+                let process_handle_ptr = args.arg0;
+                let client_id_ptr = args.arg3;
+                if process_handle_ptr == 0 {
+                    (NtStatus::STATUS_INVALID_PARAMETER, false)
+                } else {
+                    let target_process = if client_id_ptr != 0 {
+                        let client_id = unsafe {
+                            core::ptr::read(
+                                client_id_ptr as *const litebox_common_windows::nt_types::ClientId,
+                            )
+                        };
+                        client_id.unique_process
+                    } else {
+                        4
+                    };
+
+                    if target_process == 4
+                        || target_process == u32::MAX as u64
+                        || target_process == u64::MAX
+                    {
+                        let handle = self
+                            .shared
+                            .handles
+                            .lock()
+                            .insert(handle_table::NtObject::CurrentProcess);
+                        unsafe {
+                            core::ptr::write(process_handle_ptr as *mut u32, handle);
+                        }
+                        (NtStatus::STATUS_SUCCESS, false)
+                    } else {
+                        #[cfg(debug_assertions)]
+                        {
+                            use litebox::platform::DebugLogProvider as _;
+                            litebox_platform_multiplex::platform().debug_log_print(
+                                &alloc::format!(
+                                    "NT shim: NtOpenProcess unsupported target process=0x{target_process:X}\n",
+                                ),
+                            );
+                        }
+                        (NtStatus::STATUS_ACCESS_DENIED, false)
+                    }
+                }
+            }
             NtSyscallId::NtDelayExecution => {
                 let status = syscalls::sysinfo::nt_delay_execution(ctx, &self.wait_cx());
                 (status, false)
@@ -2105,14 +3396,64 @@ impl NtShimEntrypoints {
                 let status = syscalls::sync::nt_release_semaphore(ctx, &self.shared.handles.lock());
                 (status, false)
             }
+            NtSyscallId::NtOpenSemaphore => {
+                let args = syscalls::NtSyscallArgs::from_ctx(ctx);
+                let obj_attrs_ptr = args.arg2;
+                let name = read_object_attributes_name(obj_attrs_ptr);
+                #[cfg(debug_assertions)]
+                {
+                    use litebox::platform::DebugLogProvider as _;
+                    litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                        "NT shim: NtOpenSemaphore(name={name:?}) -> STATUS_OBJECT_NAME_NOT_FOUND\n"
+                    ));
+                }
+                (NtStatus::STATUS_OBJECT_NAME_NOT_FOUND, false)
+            }
             NtSyscallId::NtWaitForSingleObject => {
                 let args = syscalls::NtSyscallArgs::from_ctx(ctx);
+                let handle = args.arg0 as u32;
+                let timeout_ptr = args.arg2;
                 let waitable = {
                     let handles = self.shared.handles.lock();
-                    syscalls::sync::lookup_waitable(&handles, args.arg0 as u32)
+                    syscalls::sync::lookup_waitable(&handles, handle)
                 };
                 match waitable {
-                    Some(w) => (syscalls::sync::wait_single(ctx, &w, &self.wait_cx()), false),
+                    Some(w) => {
+                        let status =
+                            syscalls::sync::wait_single(ctx, &w, &self.wait_cx(), self.thread_id);
+                        #[cfg(debug_assertions)]
+                        {
+                            use litebox::platform::DebugLogProvider as _;
+                            let timeout_raw = if timeout_ptr == 0 {
+                                None
+                            } else {
+                                Some(unsafe { core::ptr::read(timeout_ptr as *const i64) })
+                            };
+                            let (kind, manual_reset, signaled_now) = match &w {
+                                syscalls::sync::Waitable::Event(event) => {
+                                    ("event", Some(event.manual_reset), Some(*event.state.lock()))
+                                }
+                                syscalls::sync::Waitable::Semaphore(_) => ("semaphore", None, None),
+                                syscalls::sync::Waitable::Mutant(mutant) => {
+                                    let state = mutant.state.lock();
+                                    (
+                                        "mutant",
+                                        None,
+                                        Some(
+                                            state.owner_thread_id.is_none()
+                                                || state.owner_thread_id == Some(self.thread_id),
+                                        ),
+                                    )
+                                }
+                                syscalls::sync::Waitable::Thread(_) => ("thread", None, None),
+                            };
+                            litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                                "NT shim: NtWaitForSingleObject(handle=0x{handle:X}, kind={kind}, timeout_ptr=0x{timeout_ptr:X}, timeout_raw={timeout_raw:?}, manual_reset={manual_reset:?}, signaled_now={signaled_now:?}) -> {:?}\n",
+                                status
+                            ));
+                        }
+                        (status, false)
+                    }
                     None => (NtStatus::STATUS_INVALID_HANDLE, false),
                 }
             }
@@ -2121,6 +3462,7 @@ impl NtShimEntrypoints {
                     ctx,
                     &self.shared.handles,
                     &self.wait_cx(),
+                    self.thread_id,
                 );
                 (status, false)
             }
@@ -2159,6 +3501,110 @@ impl NtShimEntrypoints {
                     (NtStatus::STATUS_INVALID_HANDLE, false)
                 }
             }
+            NtSyscallId::NtQueryObject => {
+                // NtQueryObject(Handle, ObjectInformationClass, ObjectInformation,
+                //               ObjectInformationLength, ReturnLength)
+                let args = syscalls::NtSyscallArgs::from_ctx(ctx);
+                let handle = args.arg0 as u32;
+                let info_class = args.arg1 as u32;
+                let info_ptr = args.arg2;
+                let info_len = args.arg3 as u32;
+                let return_len_ptr = unsafe { syscalls::NtSyscallArgs::arg4(ctx) };
+
+                let handle_valid = match handle as i32 {
+                    -1 | -2 | -4 | -5 | -6 => true,
+                    _ => self.shared.handles.lock().contains(handle),
+                };
+                if !handle_valid {
+                    (NtStatus::STATUS_INVALID_HANDLE, false)
+                } else {
+                    match info_class {
+                        4 => {
+                            // OBJECT_HANDLE_FLAG_INFORMATION
+                            // typedef struct _OBJECT_HANDLE_FLAG_INFORMATION {
+                            //   BOOLEAN Inherit;
+                            //   BOOLEAN ProtectFromClose;
+                            // } OBJECT_HANDLE_FLAG_INFORMATION;
+                            let needed: u32 = 2;
+                            if return_len_ptr != 0 {
+                                unsafe {
+                                    core::ptr::write(return_len_ptr as *mut u32, needed);
+                                }
+                            }
+                            if info_len < needed {
+                                (NtStatus::STATUS_INFO_LENGTH_MISMATCH, false)
+                            } else if info_ptr == 0 {
+                                (NtStatus::STATUS_INVALID_PARAMETER, false)
+                            } else {
+                                unsafe {
+                                    core::ptr::write(info_ptr as *mut u8, 0);
+                                    core::ptr::write((info_ptr + 1) as *mut u8, 0);
+                                }
+                                (NtStatus::STATUS_SUCCESS, false)
+                            }
+                        }
+                        _ => {
+                            #[cfg(debug_assertions)]
+                            {
+                                use litebox::platform::DebugLogProvider as _;
+                                litebox_platform_multiplex::platform().debug_log_print(
+                                    &alloc::format!(
+                                        "NT shim: NtQueryObject class={info_class} unhandled\n"
+                                    ),
+                                );
+                            }
+                            (NtStatus::STATUS_NOT_IMPLEMENTED, false)
+                        }
+                    }
+                }
+            }
+            NtSyscallId::NtSetInformationObject => {
+                // NtSetInformationObject(Handle, ObjectInformationClass,
+                //     ObjectInformation, ObjectInformationLength)
+                let args = syscalls::NtSyscallArgs::from_ctx(ctx);
+                let handle = args.arg0 as u32;
+                let info_class = args.arg1 as u32;
+                let info_ptr = args.arg2;
+                let info_len = args.arg3 as u32;
+
+                let handle_valid = match handle as i32 {
+                    -1 | -2 | -4 | -5 | -6 => true,
+                    _ => self.shared.handles.lock().contains(handle),
+                };
+                if !handle_valid {
+                    (NtStatus::STATUS_INVALID_HANDLE, false)
+                } else {
+                    match info_class {
+                        4 => {
+                            // OBJECT_HANDLE_FLAG_INFORMATION:
+                            // BOOLEAN Inherit; BOOLEAN ProtectFromClose;
+                            let needed: u32 = 2;
+                            if info_len < needed {
+                                (NtStatus::STATUS_INFO_LENGTH_MISMATCH, false)
+                            } else if info_ptr == 0 {
+                                (NtStatus::STATUS_INVALID_PARAMETER, false)
+                            } else {
+                                // We currently don't persist per-handle inherit /
+                                // protect-from-close flags, but succeeding here
+                                // matches the host's desktop-token/loader path.
+                                (NtStatus::STATUS_SUCCESS, false)
+                            }
+                        }
+                        _ => {
+                            #[cfg(debug_assertions)]
+                            {
+                                use litebox::platform::DebugLogProvider as _;
+                                litebox_platform_multiplex::platform().debug_log_print(
+                                    &alloc::format!(
+                                        "NT shim: NtSetInformationObject class={info_class} unhandled\n"
+                                    ),
+                                );
+                            }
+                            (NtStatus::STATUS_NOT_IMPLEMENTED, false)
+                        }
+                    }
+                }
+            }
             NtSyscallId::NtCreateThreadEx => {
                 let status = syscalls::thread::nt_create_thread_ex(ctx, self);
                 (status, false)
@@ -2171,10 +3617,7 @@ impl NtShimEntrypoints {
                 // -2 (0xFFFFFFFE) = NtCurrentThread pseudo-handle.
                 let is_current = handle == 0xFFFFFFFE || handle as i32 == -2;
                 if is_current {
-                    self.exit_code.store(exit_code, Ordering::Release);
-                    if let Some(ref obj) = self.thread_obj {
-                        obj.set_exited(exit_code);
-                    }
+                    self.mark_current_thread_exited(exit_code);
                     return (NtStatus::STATUS_SUCCESS, true);
                 }
 
@@ -2185,10 +3628,7 @@ impl NtShimEntrypoints {
                         if t.thread_id == self.thread_id {
                             // Handle resolves to our own thread.
                             drop(handles);
-                            self.exit_code.store(exit_code, Ordering::Release);
-                            if let Some(ref obj) = self.thread_obj {
-                                obj.set_exited(exit_code);
-                            }
+                            self.mark_current_thread_exited(exit_code);
                             (NtStatus::STATUS_SUCCESS, true)
                         } else {
                             log_unimplemented!(
@@ -2205,14 +3645,161 @@ impl NtShimEntrypoints {
                     None => (NtStatus::STATUS_INVALID_HANDLE, false),
                 }
             }
+            NtSyscallId::NtResumeThread | NtSyscallId::NtAlertResumeThread => {
+                let args = syscalls::NtSyscallArgs::from_ctx(ctx);
+                let handle = args.arg0 as u32;
+                let suspend_count_ptr = args.arg1;
+                let should_alert = matches!(nt_nr, NtSyscallId::NtAlertResumeThread);
+
+                let thread_obj = if handle == 0xFFFFFFFE || handle as i32 == -2 {
+                    self.thread_obj.clone()
+                } else {
+                    self.shared
+                        .handles
+                        .lock()
+                        .get(handle)
+                        .and_then(|obj| match obj {
+                            handle_table::NtObject::Thread(t) => Some(t.clone()),
+                            handle_table::NtObject::CurrentThread => self.thread_obj.clone(),
+                            _ => None,
+                        })
+                };
+
+                match thread_obj {
+                    Some(thread_obj) => {
+                        let previous = thread_obj.resume();
+                        if should_alert {
+                            thread_obj.alert_by_id();
+                        }
+                        if suspend_count_ptr != 0 {
+                            unsafe {
+                                core::ptr::write(suspend_count_ptr as *mut u32, previous);
+                            }
+                        }
+                        (NtStatus::STATUS_SUCCESS, false)
+                    }
+                    None => (NtStatus::STATUS_INVALID_HANDLE, false),
+                }
+            }
+            NtSyscallId::NtWaitForAlertByThreadId => match self.thread_obj.as_ref() {
+                Some(thread_obj) => (
+                    syscalls::sync::nt_wait_for_alert_by_thread_id(
+                        ctx,
+                        thread_obj,
+                        &self.wait_cx(),
+                    ),
+                    false,
+                ),
+                None => {
+                    log_unimplemented!("NtWaitForAlertByThreadId: missing current thread object");
+                    (NtStatus::STATUS_UNSUCCESSFUL, false)
+                }
+            },
+            NtSyscallId::NtAlertThreadByThreadId | NtSyscallId::NtAlertThreadByThreadIdEx => {
+                let args = syscalls::NtSyscallArgs::from_ctx(ctx);
+                let target_thread_id = args.arg0 as u32;
+                let thread_obj = self
+                    .shared
+                    .threads_by_id
+                    .lock()
+                    .get(&target_thread_id)
+                    .cloned();
+                match thread_obj {
+                    Some(thread_obj) => {
+                        thread_obj.alert_by_id();
+                        (NtStatus::STATUS_SUCCESS, false)
+                    }
+                    None => (NtStatus::STATUS_INVALID_CID, false),
+                }
+            }
             // --- Registry stubs (NT level) ---
+            NtSyscallId::NtCreateKey => {
+                let args = syscalls::NtSyscallArgs::from_ctx(ctx);
+                let key_handle_ptr = args.arg0; // PHANDLE
+                let obj_attrs_ptr = args.arg2; // POBJECT_ATTRIBUTES
+                let disposition_ptr =
+                    unsafe { core::ptr::read((ctx.regs.rsp + 0x38) as *const usize) };
+
+                let key_name = if obj_attrs_ptr != 0 {
+                    let root_directory =
+                        unsafe { core::ptr::read_unaligned((obj_attrs_ptr + 0x08) as *const u64) }
+                            as u32;
+                    let name_ptr =
+                        unsafe { core::ptr::read_unaligned((obj_attrs_ptr + 0x10) as *const u64) };
+                    let raw_name = if name_ptr != 0 {
+                        let len =
+                            unsafe { core::ptr::read_unaligned(name_ptr as *const u16) } as usize;
+                        let buf =
+                            unsafe { core::ptr::read_unaligned((name_ptr + 8) as *const u64) };
+                        if buf != 0 && len > 0 {
+                            let wchars =
+                                unsafe { core::slice::from_raw_parts(buf as *const u16, len / 2) };
+                            alloc::string::String::from_utf16_lossy(wchars)
+                        } else {
+                            alloc::string::String::from("<empty>")
+                        }
+                    } else {
+                        alloc::string::String::from("<null>")
+                    };
+                    if root_directory != 0
+                        && !raw_name.starts_with('\\')
+                        && let Some(base_path) = self
+                            .shared
+                            .handles
+                            .lock()
+                            .get(root_directory)
+                            .and_then(|obj| match obj {
+                                handle_table::NtObject::RegistryKey { path } => Some(path.clone()),
+                                _ => None,
+                            })
+                    {
+                        if raw_name.is_empty() || raw_name == "<null>" || raw_name == "<empty>" {
+                            base_path
+                        } else if base_path.ends_with('\\') {
+                            alloc::format!("{base_path}{raw_name}")
+                        } else {
+                            alloc::format!("{base_path}\\{raw_name}")
+                        }
+                    } else {
+                        raw_name
+                    }
+                } else {
+                    alloc::string::String::from("<no-attrs>")
+                };
+
+                #[cfg(debug_assertions)]
+                {
+                    use litebox::platform::DebugLogProvider as _;
+                    litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                        "NT shim: NtCreateKey(name={key_name:?})\n"
+                    ));
+                }
+
+                if key_handle_ptr == 0 || obj_attrs_ptr == 0 {
+                    (NtStatus::STATUS_INVALID_PARAMETER, false)
+                } else {
+                    let handle_val = self
+                        .shared
+                        .handles
+                        .lock()
+                        .insert(handle_table::NtObject::RegistryKey { path: key_name });
+                    unsafe {
+                        core::ptr::write(key_handle_ptr as *mut u32, handle_val);
+                        if disposition_ptr != 0 {
+                            core::ptr::write(disposition_ptr as *mut u32, 1); // REG_CREATED_NEW_KEY
+                        }
+                    }
+                    (NtStatus::STATUS_SUCCESS, false)
+                }
+            }
             NtSyscallId::NtOpenKey | NtSyscallId::NtOpenKeyEx => {
                 let args = syscalls::NtSyscallArgs::from_ctx(ctx);
                 let key_handle_ptr = args.arg0; // PHANDLE
                 let _desired_access = args.arg1 as u32;
                 let obj_attrs_ptr = args.arg2; // POBJECT_ATTRIBUTES
 
-                // Read the key name from OBJECT_ATTRIBUTES.ObjectName
+                // Read the key name from OBJECT_ATTRIBUTES.ObjectName and resolve it
+                // against RootDirectory when the caller opens a relative subkey.
                 let key_name = if obj_attrs_ptr != 0 {
                     // OBJECT_ATTRIBUTES layout (x64):
                     //   +0x00: ULONG Length
@@ -2221,9 +3808,12 @@ impl NtShimEntrypoints {
                     //   +0x18: ULONG Attributes
                     //   +0x20: PVOID SecurityDescriptor
                     //   +0x28: PVOID SecurityQualityOfService
+                    let root_directory =
+                        unsafe { core::ptr::read_unaligned((obj_attrs_ptr + 0x08) as *const u64) }
+                            as u32;
                     let name_ptr =
                         unsafe { core::ptr::read_unaligned((obj_attrs_ptr + 0x10) as *const u64) };
-                    if name_ptr != 0 {
+                    let raw_name = if name_ptr != 0 {
                         // UNICODE_STRING: Length (u16) + MaxLength (u16) + Buffer (ptr)
                         let len =
                             unsafe { core::ptr::read_unaligned(name_ptr as *const u16) } as usize;
@@ -2238,6 +3828,28 @@ impl NtShimEntrypoints {
                         }
                     } else {
                         alloc::string::String::from("<null>")
+                    };
+                    if root_directory != 0
+                        && !raw_name.starts_with('\\')
+                        && let Some(base_path) = self
+                            .shared
+                            .handles
+                            .lock()
+                            .get(root_directory)
+                            .and_then(|obj| match obj {
+                                handle_table::NtObject::RegistryKey { path } => Some(path.clone()),
+                                _ => None,
+                            })
+                    {
+                        if raw_name.is_empty() || raw_name == "<null>" || raw_name == "<empty>" {
+                            base_path
+                        } else if base_path.ends_with('\\') {
+                            alloc::format!("{base_path}{raw_name}")
+                        } else {
+                            alloc::format!("{base_path}\\{raw_name}")
+                        }
+                    } else {
+                        raw_name
                     }
                 } else {
                     alloc::string::String::from("<no-attrs>")
@@ -2250,24 +3862,78 @@ impl NtShimEntrypoints {
                     litebox_platform_multiplex::platform().debug_log_print(&msg);
                 }
 
-                // For critical Session Manager keys, return a dummy handle
-                // so ntdll's init can proceed. NtQueryValueKey will return
-                // NOT_FOUND for individual values.
-                //
-                // The "Segment Heap" key is now ACCEPTED (not blocked).  When
-                // NtQueryValueKey asks for "Enabled" on this key, we return 0
-                // to disable the segment heap.  On Windows 10+, an ABSENT
-                // Segment Heap key means "enabled by default" — so blocking it
-                // was counterproductive.
+                // For a small set of critical registry namespaces, return a
+                // dummy key handle so ntdll can probe values under them even
+                // when we don't model the full registry tree.
                 let key_lower = key_name.to_ascii_lowercase();
+                let is_absent_heap_policy_key = key_lower
+                    == "\\registry\\machine\\software\\microsoft\\windows nt\\currentversion\\image file execution options\\node.exe"
+                    || key_lower
+                        == "\\registry\\machine\\system\\currentcontrolset\\control\\session manager\\segment heap";
+                if is_absent_heap_policy_key {
+                    return (NtStatus::STATUS_OBJECT_NAME_NOT_FOUND, false);
+                }
+                let is_winsock_key = if let Some(suffix) = key_lower
+                    .strip_prefix("\\registry\\machine\\system\\currentcontrolset\\services\\winsock2\\parameters")
+                {
+                    let is_numbered_catalog_entry = |prefix: &str, max_entry: u32| -> bool {
+                        if let Some(entry) = suffix.strip_prefix(prefix)
+                            && entry.len() == 12
+                            && entry.bytes().all(|b| b.is_ascii_digit())
+                            && let Ok(parsed) = entry.parse::<u32>()
+                        {
+                            (1..=max_entry).contains(&parsed)
+                        } else {
+                            false
+                        }
+                    };
+
+                    matches!(
+                        suffix,
+                        ""
+                            | "\\appid_catalog"
+                            | "\\namespace_catalog5"
+                            | "\\namespace_catalog5\\catalog_entries"
+                            | "\\namespace_catalog5\\catalog_entries64"
+                            | "\\protocol_catalog9"
+                            | "\\protocol_catalog9\\catalog_entries"
+                            | "\\protocol_catalog9\\catalog_entries64"
+                    ) || matches!(
+                        suffix.strip_prefix("\\appid_catalog\\"),
+                        Some(
+                            "06ebdcb1"
+                                | "07761dd8"
+                                | "1178a89f"
+                                | "17c2aa53"
+                                | "251585a4"
+                                | "2c69d9f1"
+                                | "343305c9"
+                                | "34dd6a3a"
+                        )
+                    ) || is_numbered_catalog_entry("\\namespace_catalog5\\catalog_entries\\", 5)
+                        || is_numbered_catalog_entry("\\namespace_catalog5\\catalog_entries64\\", 5)
+                        || is_numbered_catalog_entry("\\protocol_catalog9\\catalog_entries\\", 14)
+                        || is_numbered_catalog_entry("\\protocol_catalog9\\catalog_entries64\\", 14)
+                } else {
+                    false
+                };
+                let is_crypto_provider_key = key_lower
+                    .starts_with("\\registry\\machine\\software\\microsoft\\cryptography\\defaults\\provider\\")
+                    || key_lower.starts_with(
+                        "\\registry\\machine\\software\\microsoft\\cryptography\\defaults\\provider types\\",
+                    );
+
                 let is_critical_key = key_lower.contains("session manager")
                     || key_lower.contains("knowndlls")
                     || key_lower.contains("nls")
                     || key_lower.contains("muilanguages")
                     || key_lower.contains("currentversion")
+                    || is_winsock_key
+                    || is_crypto_provider_key
+                    || key_lower == "\\registry\\machine"
+                    || key_lower == "\\registry\\user"
                     || key_lower.contains("\\registry\\user\\")
                     || key_lower.contains("control panel")
-                    || key_lower.contains("segment heap")
                     || key_lower.ends_with(".exe");
                 if is_critical_key {
                     // Dump PEB NLS fields for debugging
@@ -2306,11 +3972,13 @@ impl NtShimEntrypoints {
                         }
                     }
                     // Create a dummy registry key handle.
-                    let handle_val = self
-                        .shared
-                        .handles
-                        .lock()
-                        .insert(handle_table::NtObject::RegistryKey);
+                    let handle_val =
+                        self.shared
+                            .handles
+                            .lock()
+                            .insert(handle_table::NtObject::RegistryKey {
+                                path: key_name.clone(),
+                            });
                     if key_handle_ptr != 0 {
                         unsafe {
                             core::ptr::write(key_handle_ptr as *mut u32, handle_val);
@@ -2328,14 +3996,209 @@ impl NtShimEntrypoints {
             }
             NtSyscallId::NtQueryValueKey => {
                 let args = syscalls::NtSyscallArgs::from_ctx(ctx);
-                let _key_handle = args.arg0 as u32;
+                let key_handle = args.arg0 as u32;
                 let value_name_ptr = args.arg1; // PUNICODE_STRING
                 let info_class = args.arg2 as u32;
                 let info_ptr = args.arg3;
                 let info_length = unsafe { syscalls::NtSyscallArgs::arg4(ctx) } as u32;
                 let result_length_ptr = unsafe { syscalls::NtSyscallArgs::arg5(ctx) };
+                let key_path = self
+                    .shared
+                    .handles
+                    .lock()
+                    .get(key_handle)
+                    .and_then(|obj| match obj {
+                        handle_table::NtObject::RegistryKey { path } => Some(path.clone()),
+                        _ => None,
+                    })
+                    .unwrap_or_else(|| alloc::format!("<handle 0x{key_handle:X}>"));
 
-                // Read the value name.
+                let value_name = read_guest_unicode_string_lossy(value_name_ptr);
+
+                #[cfg(debug_assertions)]
+                {
+                    use litebox::platform::DebugLogProvider as _;
+                    // Dump raw stack slots around the args
+                    let rsp = ctx.regs.rsp;
+                    let mut stack_dump = alloc::string::String::from("  stack: ");
+                    for i in 0..8 {
+                        let off = i * 8;
+                        let val = unsafe { core::ptr::read_unaligned((rsp + off) as *const u64) };
+                        stack_dump.push_str(&alloc::format!("+0x{off:02X}={val:016X} "));
+                    }
+                    let msg = alloc::format!(
+                        "NT shim: NtQueryValueKey(key={key_path:?}, name={value_name:?}, class={info_class}) info_ptr=0x{info_ptr:X} len={info_length} res_ptr=0x{result_length_ptr:X}\n{stack_dump}\n"
+                    );
+                    litebox_platform_multiplex::platform().debug_log_print(&msg);
+                }
+
+                if let Some((reg_type, reg_data)) =
+                    lookup_registry_value_bytes(&key_path, &value_name)
+                {
+                    let data_bytes = reg_data.len();
+                    let total_size = 12 + data_bytes;
+                    if result_length_ptr != 0 {
+                        unsafe {
+                            core::ptr::write(result_length_ptr as *mut u32, total_size as u32);
+                        }
+                    }
+                    if info_ptr == 0 || info_length < 12 {
+                        (NtStatus::STATUS_BUFFER_TOO_SMALL, false)
+                    } else if info_class == 2 {
+                        unsafe {
+                            let base = info_ptr as *mut u8;
+                            core::ptr::write(base.cast::<u32>(), 0);
+                            core::ptr::write(base.add(4).cast::<u32>(), reg_type);
+                            core::ptr::write(base.add(8).cast::<u32>(), data_bytes as u32);
+                            let copy_len = core::cmp::min(
+                                data_bytes,
+                                (info_length as usize).saturating_sub(12),
+                            );
+                            if copy_len != 0 {
+                                core::ptr::copy_nonoverlapping(
+                                    reg_data.as_ptr(),
+                                    base.add(12),
+                                    copy_len,
+                                );
+                            }
+                        }
+                        if (info_length as usize) < total_size {
+                            (NtStatus::STATUS_BUFFER_OVERFLOW, false)
+                        } else {
+                            (NtStatus::STATUS_SUCCESS, false)
+                        }
+                    } else {
+                        (NtStatus::STATUS_NOT_IMPLEMENTED, false)
+                    }
+                } else {
+                    let status = NtStatus::STATUS_OBJECT_NAME_NOT_FOUND;
+                    #[cfg(debug_assertions)]
+                    {
+                        use litebox::platform::DebugLogProvider as _;
+                        litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                            "NT shim: NtQueryValueKey returned 0x{:08X}\n",
+                            status.0 as u32,
+                        ));
+                    }
+                    (status, false)
+                }
+            }
+            NtSyscallId::NtQueryMultipleValueKey => {
+                let args = syscalls::NtSyscallArgs::from_ctx(ctx);
+                let key_handle = args.arg0 as u32;
+                let value_entries_ptr = args.arg1;
+                let entry_count = args.arg2 as usize;
+                let value_buffer = args.arg3;
+                let buffer_length_ptr = unsafe { syscalls::NtSyscallArgs::arg4(ctx) };
+                let required_length_ptr = unsafe { syscalls::NtSyscallArgs::arg5(ctx) };
+                let key_path =
+                    self.shared
+                        .handles
+                        .lock()
+                        .get(key_handle)
+                        .and_then(|obj| match obj {
+                            handle_table::NtObject::RegistryKey { path } => Some(path.clone()),
+                            _ => None,
+                        });
+
+                #[cfg(debug_assertions)]
+                {
+                    use litebox::platform::DebugLogProvider as _;
+                    litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                        "NT shim: NtQueryMultipleValueKey(handle=0x{key_handle:X}, entries=0x{value_entries_ptr:X}, count={entry_count}, buffer=0x{value_buffer:X}, len_ptr=0x{buffer_length_ptr:X}, required_ptr=0x{required_length_ptr:X})\n"
+                    ));
+                }
+
+                if value_entries_ptr == 0 || buffer_length_ptr == 0 || value_buffer == 0 {
+                    (NtStatus::STATUS_INVALID_PARAMETER, false)
+                } else if let Some(key_path) = key_path {
+                    let available =
+                        unsafe { core::ptr::read_unaligned(buffer_length_ptr as *const u32) }
+                            as usize;
+                    let mut required = 0usize;
+                    let mut resolved = alloc::vec::Vec::with_capacity(entry_count);
+                    let mut missing_name = None;
+
+                    for index in 0..entry_count {
+                        let entry_ptr = value_entries_ptr + index * 24;
+                        let value_name_ptr =
+                            unsafe { core::ptr::read_unaligned(entry_ptr as *const u64) } as usize;
+                        let value_name = read_guest_unicode_string_lossy(value_name_ptr);
+                        if let Some((reg_type, reg_data)) =
+                            lookup_registry_value_bytes(&key_path, &value_name)
+                        {
+                            required = required.saturating_add(reg_data.len());
+                            resolved.push((entry_ptr, reg_type, reg_data));
+                        } else {
+                            missing_name = Some(value_name);
+                            break;
+                        }
+                    }
+
+                    if required_length_ptr != 0 {
+                        unsafe {
+                            core::ptr::write(required_length_ptr as *mut u32, required as u32);
+                        }
+                    }
+
+                    if let Some(value_name) = missing_name {
+                        #[cfg(debug_assertions)]
+                        {
+                            use litebox::platform::DebugLogProvider as _;
+                            litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                                "NT shim: NtQueryMultipleValueKey missing value {value_name:?} under {key_path:?}\n"
+                            ));
+                        }
+                        if buffer_length_ptr != 0 {
+                            unsafe {
+                                core::ptr::write(buffer_length_ptr as *mut u32, 0);
+                            }
+                        }
+                        (NtStatus::STATUS_OBJECT_NAME_NOT_FOUND, false)
+                    } else if available < required {
+                        unsafe {
+                            core::ptr::write(buffer_length_ptr as *mut u32, 0);
+                        }
+                        (NtStatus::STATUS_BUFFER_OVERFLOW, false)
+                    } else {
+                        let mut offset = 0usize;
+                        for (entry_ptr, reg_type, reg_data) in resolved {
+                            if !reg_data.is_empty() {
+                                unsafe {
+                                    core::ptr::copy_nonoverlapping(
+                                        reg_data.as_ptr(),
+                                        (value_buffer + offset) as *mut u8,
+                                        reg_data.len(),
+                                    );
+                                }
+                            }
+                            unsafe {
+                                core::ptr::write(
+                                    (entry_ptr + 8) as *mut u32,
+                                    reg_data.len() as u32,
+                                );
+                                core::ptr::write((entry_ptr + 12) as *mut u32, offset as u32);
+                                core::ptr::write((entry_ptr + 16) as *mut u32, reg_type);
+                            }
+                            offset += reg_data.len();
+                        }
+                        unsafe {
+                            core::ptr::write(buffer_length_ptr as *mut u32, required as u32);
+                        }
+                        (NtStatus::STATUS_SUCCESS, false)
+                    }
+                } else {
+                    (NtStatus::STATUS_INVALID_HANDLE, false)
+                }
+            }
+            NtSyscallId::NtQueryLicenseValue => {
+                let args = syscalls::NtSyscallArgs::from_ctx(ctx);
+                let value_name_ptr = args.arg0;
+                let type_ptr = args.arg1;
+                let data_ptr = args.arg2;
+                let data_len = args.arg3 as u32;
+                let result_length_ptr = unsafe { syscalls::NtSyscallArgs::arg4(ctx) };
+
                 let value_name = if value_name_ptr != 0 {
                     let len =
                         unsafe { core::ptr::read_unaligned(value_name_ptr as *const u16) } as usize;
@@ -2355,116 +4218,73 @@ impl NtShimEntrypoints {
                 #[cfg(debug_assertions)]
                 {
                     use litebox::platform::DebugLogProvider as _;
-                    let msg = alloc::format!(
-                        "NT shim: NtQueryValueKey(name={value_name:?}, class={info_class})\n"
-                    );
-                    litebox_platform_multiplex::platform().debug_log_print(&msg);
+                    litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                        "NT shim: NtQueryLicenseValue(name={value_name:?}) type_ptr=0x{type_ptr:X} data_ptr=0x{data_ptr:X} len={data_len} retlen_ptr=0x{result_length_ptr:X}\n"
+                    ));
                 }
 
-                // Return hardcoded values for critical NLS registry entries
-                // and for IFEO FrontEndHeapDebugOptions (disable segment heap).
-                let name_lower = value_name.to_ascii_lowercase();
-
-                // REG_SZ values (string data).
-                let reg_value: Option<&str> = match name_lower.as_str() {
-                    "acp" => Some("1252"),    // ANSI Code Page
-                    "oemcp" => Some("437"),   // OEM Code Page
-                    "maccp" => Some("10000"), // MAC Code Page
-                    _ => None,
-                };
-
-                // REG_DWORD values (4-byte integer).
-                let reg_dword: Option<u32> = match name_lower.as_str() {
-                    // Disable the NT segment heap.  The segment heap's 192 GB
-                    // VA cage has initialization issues with our demand-paging
-                    // model.  Returning Enabled=0 for the Segment Heap key
-                    // AND FrontEndHeapDebugOptions=0x08 covers both code paths
-                    // in ntdll's RtlCreateHeap.
-                    "frontendheapdebugoptions" => Some(0x08),
-                    "enabled" => Some(0),
-                    _ => None,
-                };
-
-                if let Some(val_str) = reg_value {
-                    // Return as REG_SZ (type 1) in KeyValuePartialInformation.
-                    let val_wide: alloc::vec::Vec<u16> = val_str
-                        .encode_utf16()
-                        .chain(core::iter::once(0u16))
-                        .collect();
-                    let data_bytes = val_wide.len() * 2;
-                    // KEY_VALUE_PARTIAL_INFORMATION: TitleIndex(4) + Type(4) + DataLength(4) + Data
-                    let total_size = 12 + data_bytes;
-
-                    if result_length_ptr != 0 {
-                        unsafe {
-                            core::ptr::write(result_length_ptr as *mut u32, total_size as u32);
+                match value_name.as_str() {
+                    // Observed on real Windows during `node.exe --version`:
+                    // NtQueryLicenseValue("TerminalServices-RemoteConnectionManager-AllowAppServerMode")
+                    //   -> STATUS_SUCCESS, type = REG_DWORD (4), data = 0, return_length = 4
+                    "TerminalServices-RemoteConnectionManager-AllowAppServerMode" => {
+                        if result_length_ptr != 0 {
+                            unsafe {
+                                core::ptr::write(result_length_ptr as *mut u32, 4);
+                            }
+                        }
+                        if data_ptr == 0 || data_len < 4 {
+                            (NtStatus::STATUS_BUFFER_TOO_SMALL, false)
+                        } else {
+                            unsafe {
+                                if type_ptr != 0 {
+                                    core::ptr::write(type_ptr as *mut u32, 4);
+                                }
+                                core::ptr::write(data_ptr as *mut u32, 0);
+                            }
+                            (NtStatus::STATUS_SUCCESS, false)
                         }
                     }
+                    _ => (NtStatus::STATUS_OBJECT_NAME_NOT_FOUND, false),
+                }
+            }
 
-                    if (info_length as usize) < total_size || info_ptr == 0 {
-                        (NtStatus::STATUS_BUFFER_TOO_SMALL, false)
-                    } else if info_class == 2 {
-                        // KeyValuePartialInformation
-                        unsafe {
-                            let base = info_ptr as *mut u8;
-                            core::ptr::write(base.cast::<u32>(), 0); // TitleIndex
-                            core::ptr::write(base.add(4).cast::<u32>(), 1); // Type = REG_SZ
-                            core::ptr::write(base.add(8).cast::<u32>(), data_bytes as u32); // DataLength
-                            core::ptr::copy_nonoverlapping(
-                                val_wide.as_ptr() as *const u8,
-                                base.add(12),
-                                data_bytes,
-                            );
-                        }
-                        (NtStatus::STATUS_SUCCESS, false)
-                    } else {
-                        // Other info classes — return NOT_IMPLEMENTED for now.
-                        (NtStatus::STATUS_NOT_IMPLEMENTED, false)
-                    }
-                } else if let Some(dword_val) = reg_dword {
-                    // REG_DWORD response.
-                    let data_bytes: usize = 4;
-                    let total_size: usize = 12 + data_bytes;
-                    if result_length_ptr != 0 {
-                        unsafe {
-                            core::ptr::write(result_length_ptr as *mut u32, total_size as u32);
-                        }
-                    }
-                    if (info_length as usize) < total_size || info_ptr == 0 {
-                        (NtStatus::STATUS_BUFFER_TOO_SMALL, false)
-                    } else if info_class == 2 {
-                        // KeyValuePartialInformation
-                        unsafe {
-                            let base = info_ptr as *mut u8;
-                            core::ptr::write(base.cast::<u32>(), 0); // TitleIndex
-                            core::ptr::write(base.add(4).cast::<u32>(), 4); // Type = REG_DWORD
-                            core::ptr::write(base.add(8).cast::<u32>(), data_bytes as u32);
-                            core::ptr::write(base.add(12).cast::<u32>(), dword_val);
-                        }
-                        #[cfg(debug_assertions)]
-                        {
-                            use litebox::platform::DebugLogProvider as _;
-                            litebox_platform_multiplex::platform().debug_log_print(
-                                &alloc::format!(
-                                    "NT shim: NtQueryValueKey returned {value_name}=0x{dword_val:X}\n",
-                                ),
-                            );
-                        }
-                        (NtStatus::STATUS_SUCCESS, false)
-                    } else {
-                        (NtStatus::STATUS_NOT_IMPLEMENTED, false)
-                    }
+            NtSyscallId::NtIsUILanguageComitted => {
+                let args = syscalls::NtSyscallArgs::from_ctx(ctx);
+                #[cfg(debug_assertions)]
+                {
+                    use litebox::platform::DebugLogProvider as _;
+                    litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                        "NT shim: NtIsUILanguageComitted(info_ptr=0x{:X})\n",
+                        args.arg0,
+                    ));
+                }
+                // ntdll's MUI code treats this as a probe before it falls back to
+                // NtQueryInstallUILanguage. Returning success without modifying the
+                // caller buffer preserves that flow.
+                (NtStatus::STATUS_SUCCESS, false)
+            }
+
+            NtSyscallId::NtQueryInstallUILanguage => {
+                let args = syscalls::NtSyscallArgs::from_ctx(ctx);
+                let lang_id_ptr = args.arg0;
+                if lang_id_ptr == 0 {
+                    (NtStatus::STATUS_INVALID_PARAMETER, false)
                 } else {
-                    let status = NtStatus::STATUS_OBJECT_NAME_NOT_FOUND;
+                    // Match the rest of the sandbox's synthesized locale state.
+                    // The NLS loader and MUI fallback paths are currently all
+                    // configured around en-US (0x0409).
+                    unsafe {
+                        core::ptr::write(lang_id_ptr as *mut u16, 0x0409);
+                    }
                     #[cfg(debug_assertions)]
                     {
                         use litebox::platform::DebugLogProvider as _;
                         litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
-                            "NT shim: NtQueryValueKey returned 0x{:08X}\n",
-                            status.0 as u32,
+                            "NT shim: NtQueryInstallUILanguage(lang_id_ptr=0x{lang_id_ptr:X}) -> 0x0409\n"
                         ));
                     }
-                    (status, false)
+                    (NtStatus::STATUS_SUCCESS, false)
                 }
             }
 
@@ -2549,6 +4369,8 @@ impl NtShimEntrypoints {
                         ctx.regs.rcx,
                         ctx.regs.rdx
                     ));
+                    // TF (Trap Flag) tracing disabled — fires in host ASM
+                    // (switch_to_guest_sysret popfq) before reaching guest code.
                 }
                 // NtContinue does not return an NTSTATUS — it switches context.
                 // We return STATUS_SUCCESS but the dispatch loop must NOT
@@ -2645,21 +4467,32 @@ impl NtShimEntrypoints {
                 let status = syscalls::section::nt_map_view_of_section(
                     ctx,
                     &self.shared.handles.lock(),
-                    &self.shared.process_state,
+                    &self.shared,
+                    self.init_state.as_ref(),
                 );
                 (status, false)
             }
             NtSyscallId::NtUnmapViewOfSection => {
                 let args = syscalls::NtSyscallArgs::from_ctx(ctx);
-                let _unmap_base = args.arg1 as usize;
-                #[cfg(debug_assertions)]
-                {
-                    use litebox::platform::DebugLogProvider as _;
-                    litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
-                        "NT shim: NtUnmapViewOfSection base=0x{_unmap_base:X}\n",
-                    ));
-                }
-                (NtStatus::STATUS_SUCCESS, false)
+                let unmap_base = args.arg1 as usize;
+                let status = syscalls::section::nt_unmap_view_of_section(
+                    &self.shared.process_state,
+                    unmap_base,
+                );
+                (status, false)
+            }
+            NtSyscallId::NtUnmapViewOfSectionEx => {
+                // NtUnmapViewOfSectionEx(ProcessHandle, BaseAddress, Flags)
+                // Flags can contain MEM_PRESERVE_PLACEHOLDER (0x2) to convert
+                // the unmapped region back into a placeholder.  We don't
+                // implement placeholders, but unmapping is identical.
+                let args = syscalls::NtSyscallArgs::from_ctx(ctx);
+                let unmap_base = args.arg1 as usize;
+                let status = syscalls::section::nt_unmap_view_of_section(
+                    &self.shared.process_state,
+                    unmap_base,
+                );
+                (status, false)
             }
 
             // --- ntdll-driven init: stubs for syscalls hit during LdrpInitialize ---
@@ -2805,6 +4638,16 @@ impl NtShimEntrypoints {
             NtSyscallId::NtSetInformationProcess => {
                 let info_class = ctx.regs.rdx as u32;
                 match info_class {
+                    // ProcessTlsInformation (0x23 = 35): ntdll uses this to
+                    // update the TLS vector (TEB+0x58) for all threads when a
+                    // new DLL with TLS is loaded after ActiveThreadCount > 0.
+                    // The kernel atomically swaps TLS pointers in each thread's
+                    // TEB so that the expanded vector becomes visible.
+                    0x23 => {
+                        let info_ptr = ctx.regs.r8 as u64;
+                        let status = unsafe { self.handle_process_tls_information(info_ptr) };
+                        (status, false)
+                    }
                     // ProcessMappingInformation (0x70 = 112): ntdll uses this
                     // to register the MI_MAP_INFO region with the kernel. The
                     // kernel then writes mapping entries during
@@ -2816,23 +4659,99 @@ impl NtShimEntrypoints {
                         {
                             use litebox::platform::DebugLogProvider as _;
                             litebox_platform_multiplex::platform().debug_log_print(
-                                "  NtSetInformationProcess(0x70): ΓåÆ STATUS_INVALID_INFO_CLASS (disable MI_MAP_INFO)\n",
+                                "  NtSetInformationProcess(0x70): → STATUS_INVALID_INFO_CLASS (disable MI_MAP_INFO)\n",
                             );
                         }
                         (NtStatus(0xC0000003_u32 as i32), false) // STATUS_INVALID_INFO_CLASS
                     }
-                    _ => (NtStatus::STATUS_SUCCESS, false),
+                    _ => {
+                        #[cfg(debug_assertions)]
+                        {
+                            use litebox::platform::DebugLogProvider as _;
+                            litebox_platform_multiplex::platform().debug_log_print(
+                                &alloc::format!(
+                                    "  NtSetInformationProcess(0x{info_class:X}): → STATUS_SUCCESS (stub)\n",
+                                ),
+                            );
+                        }
+                        (NtStatus::STATUS_SUCCESS, false)
+                    }
                 }
             }
             NtSyscallId::NtFlushBuffersFile => (NtStatus::STATUS_SUCCESS, false),
             NtSyscallId::NtCreateMutant => {
-                log_unimplemented!("NtCreateMutant");
-                (NtStatus::STATUS_NOT_IMPLEMENTED, false)
+                let args = syscalls::NtSyscallArgs::from_ctx(ctx);
+                let handle_out_ptr = args.arg0;
+                let _desired_access = args.arg1 as u32;
+                let obj_attrs_ptr = args.arg2;
+                let initial_owner = args.arg3 != 0;
+
+                let name = read_object_attributes_name(obj_attrs_ptr);
+
+                let handle = self
+                    .shared
+                    .handles
+                    .lock()
+                    .insert(handle_table::NtObject::Mutant(alloc::sync::Arc::new(
+                        handle_table::MutantObject::new(initial_owner, self.thread_id),
+                    )));
+
+                if handle_out_ptr != 0 {
+                    unsafe {
+                        core::ptr::write(handle_out_ptr as *mut u32, handle);
+                    }
+                }
+
+                #[cfg(debug_assertions)]
+                {
+                    use litebox::platform::DebugLogProvider as _;
+                    litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                        "NT shim: NtCreateMutant(handle=0x{handle:X}, initial_owner={initial_owner}, name={name:?}) -> STATUS_SUCCESS\n"
+                    ));
+                }
+
+                (NtStatus::STATUS_SUCCESS, false)
             }
             NtSyscallId::NtOpenMutant => (NtStatus::STATUS_OBJECT_NAME_NOT_FOUND, false),
+            NtSyscallId::NtReleaseMutant => {
+                let args = syscalls::NtSyscallArgs::from_ctx(ctx);
+                let handle = args.arg0 as u32;
+                let previous_count_ptr = args.arg1;
+
+                let mutant = {
+                    let handles = self.shared.handles.lock();
+                    match handles.get(handle) {
+                        Some(handle_table::NtObject::Mutant(mutant)) => {
+                            alloc::sync::Arc::clone(mutant)
+                        }
+                        _ => return (NtStatus::STATUS_INVALID_HANDLE, false),
+                    }
+                };
+
+                let mut state = mutant.state.lock();
+                if state.owner_thread_id != Some(self.thread_id) || state.recursion_count == 0 {
+                    (NtStatus::STATUS_ACCESS_DENIED, false)
+                } else {
+                    let previous_count = state.recursion_count as i32;
+                    state.recursion_count -= 1;
+                    if state.recursion_count == 0 {
+                        state.owner_thread_id = None;
+                        mutant.wake_waiters();
+                    }
+                    drop(state);
+
+                    if previous_count_ptr != 0 {
+                        unsafe {
+                            core::ptr::write(previous_count_ptr as *mut i32, previous_count);
+                        }
+                    }
+
+                    (NtStatus::STATUS_SUCCESS, false)
+                }
+            }
             NtSyscallId::NtQueryInformationThread => {
                 let args = syscalls::NtSyscallArgs::from_ctx(ctx);
-                let _thread_handle = args.arg0; // -2 = NtCurrentThread
+                let thread_handle = args.arg0 as u32; // -2 = NtCurrentThread
                 let info_class = args.arg1 as u32;
                 let info_ptr = args.arg2;
                 let info_len = args.arg3 as u32;
@@ -2850,18 +4769,42 @@ impl NtShimEntrypoints {
                         if info_len < 48 || info_ptr == 0 {
                             (NtStatus::STATUS_INFO_LENGTH_MISMATCH, false)
                         } else {
-                            let teb_va = self.init_state.as_ref().map_or(0, |s| s.teb_va);
+                            let target_thread =
+                                if thread_handle == 0xFFFF_FFFE || thread_handle as i32 == -2 {
+                                    self.thread_obj.clone()
+                                } else {
+                                    self.shared
+                                        .handles
+                                        .lock()
+                                        .get(thread_handle)
+                                        .and_then(|obj| match obj {
+                                            handle_table::NtObject::Thread(t) => Some(t.clone()),
+                                            handle_table::NtObject::CurrentThread => {
+                                                self.thread_obj.clone()
+                                            }
+                                            _ => None,
+                                        })
+                                };
+                            let Some(target_thread) = target_thread else {
+                                return (NtStatus::STATUS_INVALID_HANDLE, false);
+                            };
+                            let teb_va = target_thread.teb_va();
+                            let exit_status = (*target_thread.exit_status.lock())
+                                .map_or(0x103u32, |status| status as u32);
                             unsafe {
                                 let p = info_ptr as *mut u8;
                                 core::ptr::write_bytes(p, 0, 48);
-                                // ExitStatus = STATUS_PENDING (0x103)
-                                core::ptr::write(p.add(0) as *mut u32, 0x103);
+                                // ExitStatus = STATUS_PENDING while running.
+                                core::ptr::write(p.add(0) as *mut u32, exit_status);
                                 // TebBaseAddress
                                 core::ptr::write(p.add(8) as *mut u64, teb_va as u64);
                                 // ClientId.UniqueProcess
                                 core::ptr::write(p.add(0x10) as *mut u64, 4);
                                 // ClientId.UniqueThread
-                                core::ptr::write(p.add(0x18) as *mut u64, 4);
+                                core::ptr::write(
+                                    p.add(0x18) as *mut u64,
+                                    u64::from(target_thread.thread_id),
+                                );
                                 // AffinityMask
                                 core::ptr::write(p.add(0x20) as *mut u64, 1);
                                 // Priority = 8, BasePriority = 8
@@ -2882,9 +4825,33 @@ impl NtShimEntrypoints {
                     }
                 }
             }
-            NtSyscallId::NtOpenProcessToken | NtSyscallId::NtOpenThreadToken => {
-                // No token support in sandbox.
-                (NtStatus::STATUS_NO_TOKEN, false)
+            NtSyscallId::NtOpenProcessToken => {
+                let args = syscalls::NtSyscallArgs::from_ctx(ctx);
+                let token_handle_ptr = args.arg2;
+                if token_handle_ptr == 0 {
+                    (NtStatus::STATUS_INVALID_PARAMETER, false)
+                } else {
+                    let handle = self
+                        .shared
+                        .handles
+                        .lock()
+                        .insert(handle_table::NtObject::Stub {
+                            kind: alloc::string::String::from("Token"),
+                        });
+                    unsafe {
+                        core::ptr::write(token_handle_ptr as *mut u32, handle);
+                    }
+                    (NtStatus::STATUS_SUCCESS, false)
+                }
+            }
+            NtSyscallId::NtOpenThreadToken => {
+                let args = syscalls::NtSyscallArgs::from_ctx(ctx);
+                let token_handle_ptr = args.arg3;
+                if token_handle_ptr == 0 {
+                    (NtStatus::STATUS_INVALID_PARAMETER, false)
+                } else {
+                    (NtStatus::STATUS_NO_TOKEN, false)
+                }
             }
             NtSyscallId::NtQueryInformationToken => {
                 // Pseudo-handles: -4 = CurrentProcessToken, -5 = CurrentThreadToken,
@@ -2941,7 +4908,76 @@ impl NtShimEntrypoints {
                             (NtStatus::STATUS_SUCCESS, false)
                         }
                     }
-                    25 => {
+                    10 => {
+                        // TokenStatistics
+                        // typedef struct _TOKEN_STATISTICS {
+                        //   LUID TokenId;
+                        //   LUID AuthenticationId;
+                        //   LARGE_INTEGER ExpirationTime;
+                        //   TOKEN_TYPE TokenType;
+                        //   SECURITY_IMPERSONATION_LEVEL ImpersonationLevel;
+                        //   DWORD DynamicCharged;
+                        //   DWORD DynamicAvailable;
+                        //   DWORD GroupCount;
+                        //   DWORD PrivilegeCount;
+                        //   LUID ModifiedId;
+                        // } TOKEN_STATISTICS;
+                        let needed: u32 = 56;
+                        if return_len_ptr != 0 {
+                            unsafe {
+                                core::ptr::write(return_len_ptr as *mut u32, needed);
+                            }
+                        }
+                        if info_len < needed {
+                            (NtStatus(0xC0000023_u32 as i32), false) // STATUS_BUFFER_TOO_SMALL
+                        } else if info_ptr == 0 {
+                            (NtStatus::STATUS_INVALID_PARAMETER, false)
+                        } else {
+                            let token_type = if _token_handle == usize::MAX - 3 {
+                                1_u32 // TokenPrimary
+                            } else {
+                                2_u32 // TokenImpersonation
+                            };
+                            let impersonation_level = if token_type == 1 { 0_u32 } else { 2_u32 };
+                            let buf = info_ptr as *mut u8;
+                            unsafe {
+                                core::ptr::write_bytes(buf, 0, needed as usize);
+                                // TokenId.LowPart / HighPart
+                                core::ptr::write(buf.add(0) as *mut u32, 1);
+                                core::ptr::write(buf.add(4) as *mut i32, 0);
+                                // AuthenticationId.LowPart / HighPart
+                                core::ptr::write(buf.add(8) as *mut u32, 0x3E7);
+                                core::ptr::write(buf.add(12) as *mut i32, 0);
+                                // ExpirationTime stays 0 (never expires in practice here)
+                                core::ptr::write(buf.add(24) as *mut u32, token_type);
+                                core::ptr::write(buf.add(28) as *mut u32, impersonation_level);
+                                core::ptr::write(buf.add(40) as *mut u32, 1); // GroupCount
+                                core::ptr::write(buf.add(44) as *mut u32, 0); // PrivilegeCount
+                                // ModifiedId.LowPart / HighPart
+                                core::ptr::write(buf.add(48) as *mut u32, 1);
+                                core::ptr::write(buf.add(52) as *mut i32, 0);
+                            }
+                            (NtStatus::STATUS_SUCCESS, false)
+                        }
+                    }
+                    12 => {
+                        // TokenSessionId: ULONG
+                        let needed: u32 = 4;
+                        if return_len_ptr != 0 {
+                            unsafe {
+                                core::ptr::write(return_len_ptr as *mut u32, needed);
+                            }
+                        }
+                        if info_len >= needed && info_ptr != 0 {
+                            unsafe {
+                                core::ptr::write(info_ptr as *mut u32, 1);
+                            }
+                            (NtStatus::STATUS_SUCCESS, false)
+                        } else {
+                            (NtStatus(0xC0000023_u32 as i32), false)
+                        }
+                    }
+                    20 => {
                         // TokenElevation: DWORD = 0 (not elevated)
                         let needed: u32 = 4;
                         if return_len_ptr != 0 {
@@ -2958,6 +4994,77 @@ impl NtShimEntrypoints {
                             (NtStatus(0xC0000023_u32 as i32), false)
                         }
                     }
+                    26 => {
+                        // TokenUIAccess: DWORD = 0 (UIAccess disabled)
+                        let needed: u32 = 4;
+                        if return_len_ptr != 0 {
+                            unsafe {
+                                core::ptr::write(return_len_ptr as *mut u32, needed);
+                            }
+                        }
+                        if info_len >= needed && info_ptr != 0 {
+                            unsafe {
+                                core::ptr::write(info_ptr as *mut u32, 0);
+                            }
+                            (NtStatus::STATUS_SUCCESS, false)
+                        } else {
+                            (NtStatus(0xC0000023_u32 as i32), false)
+                        }
+                    }
+                    29 => {
+                        // TokenIsAppContainer: DWORD = 0 for a normal desktop process token.
+                        let needed: u32 = 4;
+                        if return_len_ptr != 0 {
+                            unsafe {
+                                core::ptr::write(return_len_ptr as *mut u32, needed);
+                            }
+                        }
+                        if info_len >= needed && info_ptr != 0 {
+                            unsafe {
+                                core::ptr::write(info_ptr as *mut u32, 0);
+                            }
+                            (NtStatus::STATUS_SUCCESS, false)
+                        } else {
+                            (NtStatus(0xC0000023_u32 as i32), false)
+                        }
+                    }
+                    42 => {
+                        // TokenPrivateNameSpace: DWORD = 0 for a normal desktop token.
+                        let needed: u32 = 4;
+                        if return_len_ptr != 0 {
+                            unsafe {
+                                core::ptr::write(return_len_ptr as *mut u32, needed);
+                            }
+                        }
+                        if info_len >= needed && info_ptr != 0 {
+                            unsafe {
+                                core::ptr::write(info_ptr as *mut u32, 0);
+                            }
+                            (NtStatus::STATUS_SUCCESS, false)
+                        } else {
+                            (NtStatus(0xC0000023_u32 as i32), false)
+                        }
+                    }
+                    44 => {
+                        // TokenBnoIsolation: host desktop tokens return a
+                        // 16-byte zeroed structure on this machine.
+                        let needed: u32 = 16;
+                        if return_len_ptr != 0 {
+                            unsafe {
+                                core::ptr::write(return_len_ptr as *mut u32, needed);
+                            }
+                        }
+                        if info_len < needed {
+                            (NtStatus(0xC0000023_u32 as i32), false)
+                        } else if info_ptr == 0 {
+                            (NtStatus::STATUS_INVALID_PARAMETER, false)
+                        } else {
+                            unsafe {
+                                core::ptr::write_bytes(info_ptr as *mut u8, 0, needed as usize);
+                            }
+                            (NtStatus::STATUS_SUCCESS, false)
+                        }
+                    }
                     _ => {
                         #[cfg(debug_assertions)]
                         {
@@ -2972,11 +5079,87 @@ impl NtShimEntrypoints {
                     }
                 }
             }
+            NtSyscallId::NtQuerySecurityAttributesToken => {
+                // NtQuerySecurityAttributesToken(TokenHandle, Attributes,
+                //     NumberOfAttributes, Buffer, Length, ReturnLength)
+                let args = syscalls::NtSyscallArgs::from_ctx(ctx);
+                let token_handle = args.arg0 as i64;
+                let buffer_ptr = args.arg3;
+                let length = unsafe { syscalls::NtSyscallArgs::arg4(ctx) } as u32;
+                let return_len_ptr = unsafe { syscalls::NtSyscallArgs::arg5(ctx) };
+
+                // TOKEN_SECURITY_ATTRIBUTES_INFORMATION header on x64:
+                // USHORT Version, USHORT Reserved, ULONG AttributeCount, PVOID AttributeV1
+                let needed: u32 = 16;
+
+                match token_handle {
+                    -5 => (NtStatus::STATUS_NO_TOKEN, false),
+                    -4 | -6 => {
+                        if return_len_ptr != 0 {
+                            unsafe {
+                                core::ptr::write(return_len_ptr as *mut u32, needed);
+                            }
+                        }
+                        if length < needed {
+                            (NtStatus::STATUS_BUFFER_TOO_SMALL, false)
+                        } else if buffer_ptr == 0 {
+                            (NtStatus::STATUS_INVALID_PARAMETER, false)
+                        } else {
+                            unsafe {
+                                core::ptr::write_bytes(buffer_ptr as *mut u8, 0, needed as usize);
+                                core::ptr::write(buffer_ptr as *mut u16, 1); // Version
+                                core::ptr::write((buffer_ptr + 4) as *mut u32, 0); // AttributeCount
+                                core::ptr::write((buffer_ptr + 8) as *mut u64, 0); // AttributeV1
+                            }
+                            (NtStatus::STATUS_SUCCESS, false)
+                        }
+                    }
+                    _ => {
+                        let handle_valid = self.shared.handles.lock().contains(token_handle as u32);
+                        if !handle_valid {
+                            (NtStatus::STATUS_INVALID_HANDLE, false)
+                        } else if return_len_ptr != 0 {
+                            unsafe {
+                                core::ptr::write(return_len_ptr as *mut u32, needed);
+                            }
+                            if length < needed {
+                                (NtStatus::STATUS_BUFFER_TOO_SMALL, false)
+                            } else if buffer_ptr == 0 {
+                                (NtStatus::STATUS_INVALID_PARAMETER, false)
+                            } else {
+                                unsafe {
+                                    core::ptr::write_bytes(
+                                        buffer_ptr as *mut u8,
+                                        0,
+                                        needed as usize,
+                                    );
+                                    core::ptr::write(buffer_ptr as *mut u16, 1);
+                                    core::ptr::write((buffer_ptr + 4) as *mut u32, 0);
+                                    core::ptr::write((buffer_ptr + 8) as *mut u64, 0);
+                                }
+                                (NtStatus::STATUS_SUCCESS, false)
+                            }
+                        } else if length < needed {
+                            (NtStatus::STATUS_BUFFER_TOO_SMALL, false)
+                        } else if buffer_ptr == 0 {
+                            (NtStatus::STATUS_INVALID_PARAMETER, false)
+                        } else {
+                            unsafe {
+                                core::ptr::write_bytes(buffer_ptr as *mut u8, 0, needed as usize);
+                                core::ptr::write(buffer_ptr as *mut u16, 1);
+                                core::ptr::write((buffer_ptr + 4) as *mut u32, 0);
+                                core::ptr::write((buffer_ptr + 8) as *mut u64, 0);
+                            }
+                            (NtStatus::STATUS_SUCCESS, false)
+                        }
+                    }
+                }
+            }
             NtSyscallId::NtRtlExitUserThread => {
                 // Thread exit. For the main thread, treat as process exit.
-                if let Some(ref obj) = self.thread_obj {
+                if self.thread_obj.is_some() {
                     let args = syscalls::NtSyscallArgs::from_ctx(ctx);
-                    obj.set_exited(args.arg0 as i32);
+                    self.mark_current_thread_exited(args.arg0 as i32);
                     (NtStatus::STATUS_SUCCESS, true)
                 } else {
                     // Main thread exiting.
@@ -2989,6 +5172,11 @@ impl NtShimEntrypoints {
             // --- Phase 6: Additional ntdll init syscalls ---
             NtSyscallId::NtTraceEvent => {
                 // ETW tracing ΓÇö no-op in sandbox.
+                (NtStatus::STATUS_SUCCESS, false)
+            }
+            NtSyscallId::NtTestAlert => {
+                // APC delivery probe. We do not queue APCs in the sandbox yet, so
+                // the empty-queue behavior is simply success.
                 (NtStatus::STATUS_SUCCESS, false)
             }
             NtSyscallId::NtManageHotPatch => {
@@ -3160,26 +5348,45 @@ impl NtShimEntrypoints {
                 let args = syscalls::NtSyscallArgs::from_ctx(ctx);
                 let key_handle = args.arg0 as u32;
                 let info_class = args.arg1 as u32;
-                let _info_ptr = args.arg2;
+                let info_ptr = args.arg2;
                 let info_length = args.arg3 as u32;
                 let result_length_ptr =
                     unsafe { core::ptr::read((ctx.regs.rsp + 0x28) as *const usize) };
 
-                let is_valid = self
-                    .shared
-                    .handles
-                    .lock()
-                    .get(key_handle)
-                    .is_some_and(|obj| matches!(obj, handle_table::NtObject::RegistryKey));
-                if is_valid {
+                let key_path =
+                    self.shared
+                        .handles
+                        .lock()
+                        .get(key_handle)
+                        .and_then(|obj| match obj {
+                            handle_table::NtObject::RegistryKey { path } => Some(path.clone()),
+                            _ => None,
+                        });
+                if let Some(key_path) = key_path {
                     // Minimum fixed-header sizes per NT ABI:
                     //   KeyBasicInformation:  LARGE_INTEGER + 2*ULONG = 16 bytes (+ Name)
                     //   KeyNodeInformation:   LARGE_INTEGER + 4*ULONG = 24 bytes (+ Name)
                     //   KeyFullInformation:   LARGE_INTEGER + 9*ULONG = 44 bytes (+ Class)
+                    //   KeyNameInformation:   ULONG NameLength (+ Name)
+                    let key_name = if let Some(suffix) =
+                        key_path.strip_prefix("\\Registry\\Machine\\System\\CurrentControlSet\\")
+                    {
+                        alloc::format!("\\REGISTRY\\MACHINE\\SYSTEM\\ControlSet001\\{suffix}")
+                    } else if let Some(suffix) = key_path.strip_prefix("\\Registry\\Machine\\") {
+                        alloc::format!("\\REGISTRY\\MACHINE\\{suffix}")
+                    } else if let Some(suffix) = key_path.strip_prefix("\\Registry\\User\\") {
+                        alloc::format!("\\REGISTRY\\USER\\{suffix}")
+                    } else {
+                        key_path.clone()
+                    };
+                    let key_name_utf16: alloc::vec::Vec<u16> = key_name.encode_utf16().collect();
+                    let key_name_bytes = (key_name_utf16.len() * 2) as u32;
                     let required: u32 = match info_class {
-                        0 => 16, // KeyBasicInformation
-                        1 => 24, // KeyNodeInformation
-                        2 => 44, // KeyFullInformation
+                        0 => 16,                 // KeyBasicInformation
+                        1 => 24,                 // KeyNodeInformation
+                        2 => 44,                 // KeyFullInformation
+                        3 => 4 + key_name_bytes, // KeyNameInformation
+                        7 => 4,                  // KeyHandleTagsInformation
                         _ => return (NtStatus::STATUS_INVALID_INFO_CLASS, false),
                     };
                     if result_length_ptr != 0 {
@@ -3187,14 +5394,42 @@ impl NtShimEntrypoints {
                             core::ptr::write(result_length_ptr as *mut u32, required);
                         }
                     }
-                    if info_length < required {
-                        (NtStatus(0xC0000023_u32 as i32), false) // STATUS_BUFFER_TOO_SMALL
+                    if info_class == 3 {
+                        if info_length < 4 {
+                            (NtStatus::STATUS_BUFFER_TOO_SMALL, false)
+                        } else {
+                            if info_ptr != 0 {
+                                unsafe {
+                                    core::ptr::write_bytes(
+                                        info_ptr as *mut u8,
+                                        0,
+                                        info_length as usize,
+                                    );
+                                    core::ptr::write(info_ptr as *mut u32, key_name_bytes);
+                                    let payload_capacity = info_length.saturating_sub(4) as usize;
+                                    let payload_len = payload_capacity.min(key_name_bytes as usize);
+                                    if payload_len > 0 {
+                                        core::ptr::copy_nonoverlapping(
+                                            key_name_utf16.as_ptr() as *const u8,
+                                            (info_ptr + 4) as *mut u8,
+                                            payload_len,
+                                        );
+                                    }
+                                }
+                            }
+                            if info_length < required {
+                                (NtStatus::STATUS_BUFFER_OVERFLOW, false)
+                            } else {
+                                (NtStatus::STATUS_SUCCESS, false)
+                            }
+                        }
+                    } else if info_length < required {
+                        (NtStatus::STATUS_BUFFER_TOO_SMALL, false)
                     } else {
-                        // Zero-fill the output buffer
-                        if _info_ptr != 0 && info_length > 0 {
+                        if info_ptr != 0 && info_length > 0 {
                             unsafe {
                                 core::ptr::write_bytes(
-                                    _info_ptr as *mut u8,
+                                    info_ptr as *mut u8,
                                     0,
                                     info_length as usize,
                                 );
@@ -3206,15 +5441,135 @@ impl NtShimEntrypoints {
                     (NtStatus::STATUS_INVALID_HANDLE, false)
                 }
             }
+            NtSyscallId::NtSetInformationKey => {
+                // NtSetInformationKey(KeyHandle, KeySetInformationClass,
+                //                     KeySetInformation, KeySetInformationLength)
+                let args = syscalls::NtSyscallArgs::from_ctx(ctx);
+                let key_handle = args.arg0 as u32;
+                let info_class = args.arg1 as u32;
+                let info_ptr = args.arg2;
+                let info_len = args.arg3 as u32;
+
+                let key_valid = self
+                    .shared
+                    .handles
+                    .lock()
+                    .get(key_handle)
+                    .is_some_and(|obj| matches!(obj, handle_table::NtObject::RegistryKey { .. }));
+
+                if !key_valid {
+                    (NtStatus::STATUS_INVALID_HANDLE, false)
+                } else {
+                    match info_class {
+                        5 => {
+                            // KeySetHandleTagsInformation is reserved for system use.
+                            // The caller only needs the kernel to accept the tag update.
+                            if info_len != 0 && info_ptr == 0 {
+                                (NtStatus::STATUS_INVALID_PARAMETER, false)
+                            } else {
+                                (NtStatus::STATUS_SUCCESS, false)
+                            }
+                        }
+                        _ => {
+                            #[cfg(debug_assertions)]
+                            {
+                                use litebox::platform::DebugLogProvider as _;
+                                litebox_platform_multiplex::platform().debug_log_print(
+                                    &alloc::format!(
+                                        "NT shim: NtSetInformationKey class={info_class} unhandled\n"
+                                    ),
+                                );
+                            }
+                            (NtStatus::STATUS_NOT_IMPLEMENTED, false)
+                        }
+                    }
+                }
+            }
+
+            NtSyscallId::NtNotifyChangeKey => {
+                // NtNotifyChangeKey(KeyHandle, Event, ApcRoutine, ApcContext,
+                //                   IoStatusBlock, CompletionFilter, WatchTree,
+                //                   Buffer, BufferSize, Asynchronous)
+                let args = syscalls::NtSyscallArgs::from_ctx(ctx);
+                let key_handle = args.arg0 as u32;
+                let event_handle = args.arg1 as u32;
+                let apc_routine = args.arg2;
+                let apc_context = args.arg3;
+                let io_status_ptr =
+                    unsafe { core::ptr::read((ctx.regs.rsp + 0x28) as *const usize) };
+                let completion_filter =
+                    unsafe { core::ptr::read((ctx.regs.rsp + 0x30) as *const u32) };
+                let watch_tree =
+                    unsafe { core::ptr::read((ctx.regs.rsp + 0x38) as *const u8) } != 0;
+                let buffer_ptr = unsafe { core::ptr::read((ctx.regs.rsp + 0x40) as *const usize) };
+                let buffer_size = unsafe { core::ptr::read((ctx.regs.rsp + 0x48) as *const u32) };
+                let asynchronous =
+                    unsafe { core::ptr::read((ctx.regs.rsp + 0x50) as *const u8) } != 0;
+
+                let handles = self.shared.handles.lock();
+                let key_path = match handles.get(key_handle) {
+                    Some(handle_table::NtObject::RegistryKey { path }) => Some(path.clone()),
+                    _ => None,
+                };
+                let event_obj = if event_handle == 0 {
+                    None
+                } else {
+                    match handles.get(event_handle) {
+                        Some(handle_table::NtObject::Event(event)) => {
+                            Some(alloc::sync::Arc::clone(event))
+                        }
+                        _ => return (NtStatus::STATUS_INVALID_HANDLE, false),
+                    }
+                };
+                drop(handles);
+
+                if key_path.is_none() {
+                    (NtStatus::STATUS_INVALID_HANDLE, false)
+                } else if buffer_ptr != 0 || buffer_size != 0 {
+                    (NtStatus::STATUS_INVALID_PARAMETER, false)
+                } else if !asynchronous {
+                    log_unimplemented!(
+                        "NtNotifyChangeKey synchronous key=0x{:X} filter=0x{:X}",
+                        key_handle,
+                        completion_filter
+                    );
+                    (NtStatus::STATUS_NOT_IMPLEMENTED, false)
+                } else {
+                    if let Some(event) = &event_obj {
+                        // Host Windows clears the event when an async registry notification
+                        // is armed, even if the caller passed a manual-reset event that was
+                        // initially signaled. Without this, zero-timeout polls keep
+                        // succeeding and callers spin forever.
+                        *event.state.lock() = false;
+                    }
+                    if io_status_ptr != 0 {
+                        unsafe {
+                            core::ptr::write(io_status_ptr as *mut i32, NtStatus::STATUS_PENDING.0);
+                            core::ptr::write((io_status_ptr + 8) as *mut usize, 0);
+                        }
+                    }
+                    #[cfg(debug_assertions)]
+                    {
+                        use litebox::platform::DebugLogProvider as _;
+                        let key_path = key_path.unwrap_or_default();
+                        litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                            "NT shim: NtNotifyChangeKey(key={key_path:?}, event=0x{event_handle:X}, apc=0x{apc_routine:X}, ctx=0x{apc_context:X}, filter=0x{completion_filter:X}, watch_tree={watch_tree}, async={asynchronous}) -> STATUS_PENDING\n"
+                        ));
+                    }
+                    (NtStatus::STATUS_PENDING, false)
+                }
+            }
 
             NtSyscallId::NtInitializeNlsFiles => {
                 // NtInitializeNlsFiles(OUT PVOID *BaseAddress, OUT PLCID DefaultLocaleId,
-                //                      OUT PLARGE_INTEGER DefaultCasingTableSize)
+                //                      OUT PLARGE_INTEGER DefaultCasingTableSize,
+                //                      OUT PULONG Version)
                 // Uses pre-captured NLS data from the runner (no host API calls).
                 let args = syscalls::NtSyscallArgs::from_ctx(ctx);
                 let base_addr_out = args.arg0;
                 let locale_id_out = args.arg1;
                 let casing_size_out = args.arg2;
+                let version_out = args.arg3;
 
                 let Some(nls) = self.shared.nls_data.get() else {
                     #[cfg(debug_assertions)]
@@ -3261,6 +5616,9 @@ impl NtShimEntrypoints {
                                 core::ptr::write(casing_size_out as *mut i64, nls.casing_size);
                             }
                         }
+                        if version_out != 0 {
+                            unsafe { core::ptr::write(version_out as *mut u32, nls.version) }
+                        }
                         #[cfg(debug_assertions)]
                         {
                             use litebox::platform::DebugLogProvider as _;
@@ -3276,10 +5634,22 @@ impl NtShimEntrypoints {
             }
 
             NtSyscallId::NtGetNlsSectionPtr => {
-                // NtGetNlsSectionPtr: load NLS data from host and map into guest.
+                // NtGetNlsSectionPtr:
+                //   NTSTATUS NtGetNlsSectionPtr(
+                //     ULONG SectionType,
+                //     ULONG SectionData,
+                //     PVOID ContextData,
+                //     PVOID *SectionPointer,
+                //     PULONG SectionSize
+                //   );
+                //
+                // The runner pre-captures the real host payloads so the shim can
+                // map them into guest memory without calling host APIs at runtime.
                 let args = syscalls::NtSyscallArgs::from_ctx(ctx);
                 let section_type = args.arg0 as u32;
                 let section_data = args.arg1 as u32;
+                let section_ptr_out = args.arg3;
+                let section_size_out = unsafe { syscalls::NtSyscallArgs::arg4(ctx) };
 
                 #[cfg(debug_assertions)]
                 {
@@ -3290,26 +5660,120 @@ impl NtShimEntrypoints {
                     litebox_platform_multiplex::platform().debug_log_print(&msg);
                 }
 
-                // Determine NLS filename based on type.
-                let nls_filename = match section_type {
-                    11 => alloc::format!("c_{section_data}.nls"),
-                    12 => alloc::string::String::from("normnfc.nls"),
-                    _ => alloc::string::String::from("l_intl.nls"),
-                };
-
-                let nls_path = alloc::format!("C:\\Windows\\System32\\{nls_filename}");
-
-                // In no_std mode we cannot read host files. NLS data must be
-                // provided by the runner via set_nls_data().  Return not-found
-                // so the caller falls back to its built-in path.
-                #[cfg(debug_assertions)]
+                if section_ptr_out == 0 || section_size_out == 0 {
+                    (NtStatus::STATUS_INVALID_PARAMETER, false)
+                } else if let Some((mapped_va, mapped_size)) = self
+                    .shared
+                    .nls_section_mappings
+                    .lock()
+                    .get(&(section_type, section_data))
+                    .copied()
                 {
-                    use litebox::platform::DebugLogProvider as _;
-                    let msg =
-                        alloc::format!("NT shim: NLS file not available (no_std): {nls_path}\n");
-                    litebox_platform_multiplex::platform().debug_log_print(&msg);
+                    unsafe {
+                        core::ptr::write(section_ptr_out as *mut u64, mapped_va as u64);
+                        core::ptr::write(section_size_out as *mut u32, mapped_size);
+                    }
+                    (NtStatus::STATUS_SUCCESS, false)
+                } else {
+                    let Some(nls) = self.shared.nls_data.get() else {
+                        return (NtStatus::STATUS_UNSUCCESSFUL, false);
+                    };
+                    let Some(section) = nls.sections.iter().find(|entry| {
+                        entry.section_type == section_type && entry.section_data == section_data
+                    }) else {
+                        #[cfg(debug_assertions)]
+                        {
+                            use litebox::platform::DebugLogProvider as _;
+                            litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                                "NT shim: NtGetNlsSectionPtr missing host payload type={section_type} data=0x{section_data:X}\n"
+                            ));
+                        }
+                        return (NtStatus::STATUS_OBJECT_NAME_NOT_FOUND, false);
+                    };
+
+                    use litebox::mm::linux::{CreatePagesFlags, NonZeroPageSize};
+                    use litebox::platform::RawConstPointer as _;
+
+                    let alloc_size = (section.bytes.len() + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+                    let nz_size =
+                        NonZeroPageSize::<PAGE_SIZE>::new(alloc_size).expect("NLS section size");
+                    let section_len = u32::try_from(section.bytes.len()).expect("NLS section fits");
+                    let data = &section.bytes;
+                    let result = unsafe {
+                        self.shared.process_state.pm.create_readable_pages(
+                            None,
+                            nz_size,
+                            CreatePagesFlags::POPULATE_PAGES_IMMEDIATELY,
+                            |ptr| {
+                                let dest = ptr.as_usize() as *mut u8;
+                                core::ptr::copy_nonoverlapping(data.as_ptr(), dest, data.len());
+                                Ok(data.len())
+                            },
+                        )
+                    };
+
+                    match result {
+                        Ok(addr) => {
+                            let mapped_va = addr.as_usize();
+                            self.shared
+                                .nls_section_mappings
+                                .lock()
+                                .insert((section_type, section_data), (mapped_va, section_len));
+                            unsafe {
+                                core::ptr::write(section_ptr_out as *mut u64, mapped_va as u64);
+                                core::ptr::write(section_size_out as *mut u32, section_len);
+                            }
+                            #[cfg(debug_assertions)]
+                            {
+                                use litebox::platform::DebugLogProvider as _;
+                                litebox_platform_multiplex::platform().debug_log_print(
+                                    &alloc::format!(
+                                        "NT shim: NtGetNlsSectionPtr mapped type={section_type} data=0x{section_data:X} at 0x{mapped_va:X} ({section_len} bytes)\n"
+                                    ),
+                                );
+                            }
+                            (NtStatus::STATUS_SUCCESS, false)
+                        }
+                        Err(_) => (NtStatus::STATUS_NO_MEMORY, false),
+                    }
                 }
-                (NtStatus::STATUS_OBJECT_NAME_NOT_FOUND, false)
+            }
+            NtSyscallId::NtGetMUIRegistryInfo => {
+                // NtGetMUIRegistryInfo(Flags, DataSize, Data)
+                let args = syscalls::NtSyscallArgs::from_ctx(ctx);
+                let flags = args.arg0 as u32;
+                let data_size_ptr = args.arg1;
+                let data_ptr = args.arg2;
+
+                if flags != 0 || data_size_ptr == 0 {
+                    (NtStatus::STATUS_INVALID_PARAMETER, false)
+                } else {
+                    match query_host_mui_registry_info(flags) {
+                        Ok(data) => {
+                            let needed = data.len() as u32;
+                            let provided =
+                                unsafe { core::ptr::read_unaligned(data_size_ptr as *const u32) };
+                            unsafe {
+                                core::ptr::write(data_size_ptr as *mut u32, needed);
+                            }
+                            if data_ptr == 0 {
+                                (NtStatus::STATUS_SUCCESS, false)
+                            } else if provided < needed {
+                                (NtStatus::STATUS_BUFFER_TOO_SMALL, false)
+                            } else {
+                                unsafe {
+                                    core::ptr::copy_nonoverlapping(
+                                        data.as_ptr(),
+                                        data_ptr as *mut u8,
+                                        data.len(),
+                                    );
+                                }
+                                (NtStatus::STATUS_SUCCESS, false)
+                            }
+                        }
+                        Err(status) => (status, false),
+                    }
+                }
             }
 
             NtSyscallId::NtCreateWaitCompletionPacket => {
@@ -3327,18 +5791,60 @@ impl NtShimEntrypoints {
             }
 
             NtSyscallId::NtCreateIoCompletion => {
-                // I/O completion port ΓÇö used by ntdll's thread pool (TpAllocPool).
-                // Allocate a dummy handle so the pool init doesn't fail.
+                let status =
+                    syscalls::sync::nt_create_io_completion(ctx, &mut self.shared.handles.lock());
+                (status, false)
+            }
+
+            NtSyscallId::NtSetIoCompletion => {
+                let status = syscalls::sync::nt_set_io_completion(ctx, &self.shared.handles.lock());
+                (status, false)
+            }
+
+            NtSyscallId::NtRemoveIoCompletion => {
                 let args = syscalls::NtSyscallArgs::from_ctx(ctx);
-                let handle_ptr = args.arg0; // PHANDLE
-                let mut handles = self.shared.handles.lock();
-                let h = handles.insert(handle_table::NtObject::Stub {
-                    kind: alloc::string::String::from("IoCompletion"),
-                });
-                unsafe {
-                    *(handle_ptr as *mut u64) = h as u64;
+                let port = {
+                    let handles = self.shared.handles.lock();
+                    syscalls::sync::lookup_io_completion(&handles, args.arg0 as u32)
+                };
+                match port {
+                    Some(port) => (
+                        syscalls::sync::nt_remove_io_completion(
+                            ctx,
+                            &port,
+                            &self.shared.process_state.pm,
+                            &self.wait_cx(),
+                        ),
+                        false,
+                    ),
+                    None => (NtStatus::STATUS_INVALID_HANDLE, false),
                 }
-                (NtStatus::STATUS_SUCCESS, false)
+            }
+
+            NtSyscallId::NtSetIoCompletionEx => {
+                let status =
+                    syscalls::sync::nt_set_io_completion_ex(ctx, &self.shared.handles.lock());
+                (status, false)
+            }
+
+            NtSyscallId::NtRemoveIoCompletionEx => {
+                let args = syscalls::NtSyscallArgs::from_ctx(ctx);
+                let port = {
+                    let handles = self.shared.handles.lock();
+                    syscalls::sync::lookup_io_completion(&handles, args.arg0 as u32)
+                };
+                match port {
+                    Some(port) => (
+                        syscalls::sync::nt_remove_io_completion_ex(
+                            ctx,
+                            &port,
+                            &self.shared.process_state.pm,
+                            &self.wait_cx(),
+                        ),
+                        false,
+                    ),
+                    None => (NtStatus::STATUS_INVALID_HANDLE, false),
+                }
             }
 
             NtSyscallId::NtCreateWorkerFactory => {
@@ -3357,6 +5863,21 @@ impl NtShimEntrypoints {
                 (NtStatus::STATUS_SUCCESS, false)
             }
 
+            NtSyscallId::NtReleaseWorkerFactoryWorker => {
+                // Stubbed worker factories do not maintain kernel scheduling
+                // state, but ntdll expects this bookkeeping syscall to succeed
+                // once the factory handle exists.
+                let args = syscalls::NtSyscallArgs::from_ctx(ctx);
+                let handle = args.arg0 as u32;
+                let handles = self.shared.handles.lock();
+                match handles.get(handle) {
+                    Some(handle_table::NtObject::Stub { kind }) if kind == "WorkerFactory" => {
+                        (NtStatus::STATUS_SUCCESS, false)
+                    }
+                    _ => (NtStatus::STATUS_INVALID_HANDLE, false),
+                }
+            }
+
             NtSyscallId::NtCreateTimer2 => {
                 // Timer2 ΓÇö used by the thread pool for delayed work items.
                 // Allocate a dummy handle so pool init doesn't abort.
@@ -3371,6 +5892,33 @@ impl NtShimEntrypoints {
                 }
                 (NtStatus::STATUS_SUCCESS, false)
             }
+            NtSyscallId::NtSetTimer2 => {
+                let args = syscalls::NtSyscallArgs::from_ctx(ctx);
+                let handle = args.arg0 as u32;
+                let handles = self.shared.handles.lock();
+                match handles.get(handle) {
+                    Some(handle_table::NtObject::Stub { kind }) if kind == "Timer2" => {
+                        (NtStatus::STATUS_SUCCESS, false)
+                    }
+                    _ => (NtStatus::STATUS_INVALID_HANDLE, false),
+                }
+            }
+            NtSyscallId::NtQueryTimerResolution => {
+                let args = syscalls::NtSyscallArgs::from_ctx(ctx);
+                let max_ptr = args.arg0;
+                let min_ptr = args.arg1;
+                let cur_ptr = args.arg2;
+                if max_ptr == 0 || min_ptr == 0 || cur_ptr == 0 {
+                    (NtStatus::STATUS_INVALID_PARAMETER, false)
+                } else {
+                    unsafe {
+                        core::ptr::write(max_ptr as *mut u32, 156_250);
+                        core::ptr::write(min_ptr as *mut u32, 5_000);
+                        core::ptr::write(cur_ptr as *mut u32, 156_250);
+                    }
+                    (NtStatus::STATUS_SUCCESS, false)
+                }
+            }
 
             NtSyscallId::NtOpenDirectoryObject => {
                 // ntdll opens \KnownDlls to check for pre-cached section
@@ -3378,12 +5926,23 @@ impl NtShimEntrypoints {
                 // NtOpenSection per-DLL, where we return NOT_FOUND to force
                 // file-based loading.
                 let args = syscalls::NtSyscallArgs::from_ctx(ctx);
+                let name = {
+                    let handles = self.shared.handles.lock();
+                    resolve_object_attributes_name(args.arg2, &handles)
+                };
                 let handle_ptr = args.arg0 as *mut u64;
                 let mut handles = self.shared.handles.lock();
                 let h = handles.insert(handle_table::NtObject::Stub {
-                    kind: alloc::string::String::from("DirectoryObject"),
+                    kind: alloc::format!("DirectoryObject:{name}"),
                 });
                 unsafe { core::ptr::write(handle_ptr, h as u64) };
+                #[cfg(debug_assertions)]
+                {
+                    use litebox::platform::DebugLogProvider as _;
+                    litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                        "NtOpenDirectoryObject(name=\"{name}\") -> handle=0x{h:X}\n",
+                    ));
+                }
                 (NtStatus::STATUS_SUCCESS, false)
             }
 
@@ -3561,8 +6120,16 @@ impl NtShimEntrypoints {
             }
 
             NtSyscallId::NtOpenEvent => {
-                // ntdll tries to open named events (e.g. CSR connection).
-                // Return NOT_FOUND ΓÇö we don't have CSRSS or named event objects.
+                let args = syscalls::NtSyscallArgs::from_ctx(ctx);
+                let obj_attrs_ptr = args.arg2;
+                let name = read_object_attributes_name(obj_attrs_ptr);
+                #[cfg(debug_assertions)]
+                {
+                    use litebox::platform::DebugLogProvider as _;
+                    litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                        "NT shim: NtOpenEvent(name={name:?}) -> STATUS_OBJECT_NAME_NOT_FOUND\n"
+                    ));
+                }
                 (NtStatus::STATUS_OBJECT_NAME_NOT_FOUND, false)
             }
 
@@ -3587,13 +6154,237 @@ impl NtShimEntrypoints {
             }
 
             NtSyscallId::NtTraceControl => {
-                // ETW trace control. Stub as success.
-                (NtStatus::STATUS_SUCCESS, false)
+                // NtTraceControl(FunctionCode, InBuffer, InBufferLen, OutBuffer,
+                //                OutBufferLen, ReturnSize)
+                let args = syscalls::NtSyscallArgs::from_ctx(ctx);
+                let function_code = args.arg0 as u32;
+                let input_buffer = args.arg1;
+                let input_length = args.arg2 as u32;
+                let output_buffer = args.arg3;
+                let output_length = unsafe { syscalls::NtSyscallArgs::arg4(ctx) } as u32;
+                let return_length_ptr = unsafe { syscalls::NtSyscallArgs::arg5(ctx) };
+
+                if return_length_ptr == 0 {
+                    (NtStatus::STATUS_INVALID_PARAMETER, false)
+                } else {
+                    match function_code {
+                        0x1B => {
+                            // Add notification event: input buffer is exactly one
+                            // 32-bit event handle. The kernel accepts only one
+                            // such event per process.
+                            if input_buffer == 0 || input_length != 4 {
+                                (NtStatus::STATUS_INVALID_PARAMETER, false)
+                            } else {
+                                let event_handle = unsafe {
+                                    core::ptr::read_unaligned(input_buffer as *const u32)
+                                };
+                                if event_handle == 0 {
+                                    (NtStatus::STATUS_INVALID_PARAMETER, false)
+                                } else {
+                                    let is_event = {
+                                        let handles = self.shared.handles.lock();
+                                        matches!(
+                                            handles.get(event_handle),
+                                            Some(handle_table::NtObject::Event(_))
+                                        )
+                                    };
+                                    if !is_event {
+                                        (NtStatus::STATUS_INVALID_HANDLE, false)
+                                    } else {
+                                        let mut registered =
+                                            self.shared.trace_notification_event.lock();
+                                        if registered.is_some() {
+                                            (NtStatus::STATUS_UNSUCCESSFUL, false)
+                                        } else {
+                                            *registered = Some(event_handle);
+                                            unsafe {
+                                                core::ptr::write(return_length_ptr as *mut u32, 0);
+                                                if output_buffer != 0 && output_length != 0 {
+                                                    core::ptr::write_bytes(
+                                                        output_buffer as *mut u8,
+                                                        0,
+                                                        output_length as usize,
+                                                    );
+                                                }
+                                            }
+                                            (NtStatus::STATUS_SUCCESS, false)
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        0x0F => {
+                            // Register user-mode GUID / ETW provider.
+                            if input_buffer == 0
+                                || output_buffer == 0
+                                || input_length != 0xA0
+                                || output_length < 0xA0
+                                || output_length > 0x1_0000
+                            {
+                                (NtStatus::STATUS_INVALID_PARAMETER, false)
+                            } else {
+                                let reg_handle = self.shared.handles.lock().insert(
+                                    handle_table::NtObject::Stub {
+                                        kind: alloc::string::String::from("EtwReg"),
+                                    },
+                                );
+                                unsafe {
+                                    if output_buffer != input_buffer {
+                                        core::ptr::copy_nonoverlapping(
+                                            input_buffer as *const u8,
+                                            output_buffer as *mut u8,
+                                            0x28,
+                                        );
+                                    }
+                                    core::ptr::write_bytes(
+                                        (output_buffer + 0x28) as *mut u8,
+                                        0,
+                                        0xA0 - 0x28,
+                                    );
+                                    core::ptr::write(
+                                        (output_buffer + 0x18) as *mut u64,
+                                        reg_handle as u64,
+                                    );
+                                    // ETW_NOTIFICATION_HEADER.NotificationSize
+                                    core::ptr::write((output_buffer + 0x28) as *mut u32, 0xA0);
+                                    core::ptr::write(return_length_ptr as *mut u32, 0xA0);
+                                }
+                                (NtStatus::STATUS_SUCCESS, false)
+                            }
+                        }
+                        0x1E => {
+                            // Set provider traits for an ETW registration object.
+                            if input_buffer == 0
+                                || output_buffer == 0
+                                || input_length != 0x18
+                                || !(0x78..=0x1_0000).contains(&output_length)
+                            {
+                                (NtStatus::STATUS_INVALID_PARAMETER, false)
+                            } else {
+                                let reg_handle = unsafe {
+                                    core::ptr::read_unaligned(input_buffer as *const u64)
+                                } as u32;
+                                let traits_ptr = unsafe {
+                                    core::ptr::read_unaligned((input_buffer + 0x08) as *const u64)
+                                } as usize;
+                                let traits_len = unsafe {
+                                    core::ptr::read_unaligned((input_buffer + 0x10) as *const u16)
+                                } as usize;
+                                if traits_ptr == 0 || traits_len == 0 {
+                                    (NtStatus::STATUS_INVALID_PARAMETER, false)
+                                } else {
+                                    let is_etw_reg = {
+                                        let handles = self.shared.handles.lock();
+                                        matches!(
+                                            handles.get(reg_handle),
+                                            Some(handle_table::NtObject::Stub { kind })
+                                                if kind == "EtwReg"
+                                        )
+                                    };
+                                    if !is_etw_reg {
+                                        (NtStatus::STATUS_INVALID_HANDLE, false)
+                                    } else {
+                                        let declared_len = unsafe {
+                                            core::ptr::read_unaligned(traits_ptr as *const u16)
+                                        }
+                                            as usize;
+                                        if traits_len < 3 || declared_len != traits_len {
+                                            (NtStatus::STATUS_INVALID_PARAMETER, false)
+                                        } else {
+                                            let mut traits_set =
+                                                self.shared.etw_provider_traits_set.lock();
+                                            if !traits_set.insert(reg_handle) {
+                                                (NtStatus::STATUS_UNSUCCESSFUL, false)
+                                            } else {
+                                                unsafe {
+                                                    core::ptr::write_bytes(
+                                                        output_buffer as *mut u8,
+                                                        0,
+                                                        output_length as usize,
+                                                    );
+                                                    core::ptr::write(
+                                                        return_length_ptr as *mut u32,
+                                                        0,
+                                                    );
+                                                }
+                                                (NtStatus::STATUS_SUCCESS, false)
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        _ => (NtStatus::STATUS_NOT_IMPLEMENTED, false),
+                    }
+                }
             }
 
             NtSyscallId::NtSetWnfProcessNotificationEvent => {
                 // WNF (Windows Notification Facility) event. Stub as success.
                 (NtStatus::STATUS_SUCCESS, false)
+            }
+
+            NtSyscallId::NtUpdateWnfStateData => {
+                // NtUpdateWnfStateData(StateName, Buffer, Length, TypeId,
+                //     ExplicitScope, MatchingChangeStamp, CheckStamp)
+                let args = syscalls::NtSyscallArgs::from_ctx(ctx);
+                let state_name_ptr = args.arg0;
+                let buffer_ptr = args.arg1;
+                let length = args.arg2 as u32;
+                let _type_id = args.arg3;
+                let explicit_scope =
+                    unsafe { core::ptr::read((ctx.regs.rsp + 0x28) as *const usize) };
+                let matching_change_stamp =
+                    unsafe { core::ptr::read((ctx.regs.rsp + 0x30) as *const u32) };
+                let check_stamp =
+                    unsafe { core::ptr::read((ctx.regs.rsp + 0x38) as *const u32) } != 0;
+
+                if state_name_ptr == 0 || (buffer_ptr == 0 && length != 0) {
+                    (NtStatus::STATUS_INVALID_PARAMETER, false)
+                } else {
+                    let state_name =
+                        unsafe { core::ptr::read_unaligned(state_name_ptr as *const u64) };
+                    let data = if buffer_ptr != 0 && length != 0 {
+                        unsafe {
+                            core::slice::from_raw_parts(buffer_ptr as *const u8, length as usize)
+                        }
+                        .to_vec()
+                    } else {
+                        alloc::vec::Vec::new()
+                    };
+
+                    let mut states = self.shared.wnf_states.lock();
+                    let stamp_result = match states.get(&state_name) {
+                        Some(existing)
+                            if check_stamp && existing.change_stamp != matching_change_stamp =>
+                        {
+                            Err(())
+                        }
+                        Some(existing) => Ok(existing.change_stamp.wrapping_add(1).max(1)),
+                        None if check_stamp && matching_change_stamp != 0 => Err(()),
+                        None => Ok(1),
+                    };
+                    if let Ok(next_change_stamp) = stamp_result {
+                        states.insert(
+                            state_name,
+                            WnfStateValue {
+                                change_stamp: next_change_stamp,
+                                data,
+                            },
+                        );
+
+                        #[cfg(debug_assertions)]
+                        {
+                            use litebox::platform::DebugLogProvider as _;
+                            litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                                "NT shim: NtUpdateWnfStateData(state=0x{state_name:016X}, len={length}, scope=0x{explicit_scope:X}, match={matching_change_stamp}, check={check_stamp}) -> STATUS_SUCCESS\n"
+                            ));
+                        }
+                        (NtStatus::STATUS_SUCCESS, false)
+                    } else {
+                        (NtStatus::STATUS_UNSUCCESSFUL, false)
+                    }
+                }
             }
 
             NtSyscallId::NtSubscribeWnfStateChange | NtSyscallId::NtUnsubscribeWnfStateChange => {
@@ -3626,7 +6417,8 @@ impl NtShimEntrypoints {
                 let status = syscalls::section::nt_map_view_of_section(
                     ctx,
                     &self.shared.handles.lock(),
-                    &self.shared.process_state,
+                    &self.shared,
+                    self.init_state.as_ref(),
                 );
                 (status, false)
             }
@@ -3637,50 +6429,59 @@ impl NtShimEntrypoints {
             }
 
             NtSyscallId::NtOpenSymbolicLinkObject => {
-                // ntdll opens \KnownDlls\KnownDllPath to discover the system
-                // directory (C:\Windows\System32). Return a fake handle so
-                // NtQuerySymbolicLinkObject can return the path.
+                // ntdll opens symbolic links such as \KnownDlls\KnownDllPath
+                // and \??\C:. Preserve the queried name so
+                // NtQuerySymbolicLinkObject can return the correct target.
                 let args = syscalls::NtSyscallArgs::from_ctx(ctx);
+                let name = {
+                    let handles = self.shared.handles.lock();
+                    resolve_object_attributes_name(args.arg2, &handles)
+                };
                 let handle_ptr = args.arg0 as *mut u64;
                 let mut handles = self.shared.handles.lock();
                 let h = handles.insert(handle_table::NtObject::Stub {
-                    kind: alloc::string::String::from("SymbolicLink"),
+                    kind: alloc::format!("SymbolicLink:{name}"),
                 });
                 unsafe { core::ptr::write(handle_ptr, h as u64) };
+                #[cfg(debug_assertions)]
+                {
+                    use litebox::platform::DebugLogProvider as _;
+                    litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                        "NtOpenSymbolicLinkObject(name=\"{name}\") -> handle=0x{h:X}\n",
+                    ));
+                }
                 (NtStatus::STATUS_SUCCESS, false)
             }
 
             NtSyscallId::NtQuerySymbolicLinkObject => {
-                // Return the system directory path that the loader uses for
-                // DLL search. The UNICODE_STRING at arg1 receives the target.
+                // Return the requested symbolic-link target. The UNICODE_STRING
+                // at arg1 receives the target.
                 //
                 // UNICODE_STRING layout: { u16 Length, u16 MaximumLength, *u16 Buffer }
                 let args = syscalls::NtSyscallArgs::from_ctx(ctx);
-                let _handle = args.arg0;
+                let handle = args.arg0 as u32;
                 let ustr_ptr = args.arg1;
-
-                // The path ntdll expects for KnownDllPath.
-                let path: &[u16] = &[
-                    b'C' as u16,
-                    b':' as u16,
-                    b'\\' as u16,
-                    b'W' as u16,
-                    b'i' as u16,
-                    b'n' as u16,
-                    b'd' as u16,
-                    b'o' as u16,
-                    b'w' as u16,
-                    b's' as u16,
-                    b'\\' as u16,
-                    b'S' as u16,
-                    b'y' as u16,
-                    b's' as u16,
-                    b't' as u16,
-                    b'e' as u16,
-                    b'm' as u16,
-                    b'3' as u16,
-                    b'2' as u16,
-                ];
+                let name = {
+                    let handles = self.shared.handles.lock();
+                    match handles.get(handle) {
+                        Some(handle_table::NtObject::Stub { kind }) => kind
+                            .strip_prefix("SymbolicLink:")
+                            .map(alloc::string::String::from)
+                            .unwrap_or_default(),
+                        _ => alloc::string::String::new(),
+                    }
+                };
+                let Some(target) = symbolic_link_target_for_name(&name) else {
+                    #[cfg(debug_assertions)]
+                    {
+                        use litebox::platform::DebugLogProvider as _;
+                        litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                            "NtQuerySymbolicLinkObject(name=\"{name}\") -> STATUS_OBJECT_NAME_NOT_FOUND\n",
+                        ));
+                    }
+                    return (NtStatus::STATUS_OBJECT_NAME_NOT_FOUND, false);
+                };
+                let path: alloc::vec::Vec<u16> = target.encode_utf16().collect();
                 let byte_len = (path.len() * 2) as u16;
 
                 unsafe {
@@ -3695,6 +6496,9 @@ impl NtShimEntrypoints {
                     let buf_ptr =
                         core::ptr::read_unaligned((ustr_ptr + 8) as *const usize) as *mut u16;
                     core::ptr::copy_nonoverlapping(path.as_ptr(), buf_ptr, path.len());
+                    if max_len >= byte_len + 2 {
+                        core::ptr::write(buf_ptr.add(path.len()), 0);
+                    }
                 }
                 // If caller provides a return-length pointer (arg2), write it.
                 let ret_len_ptr = args.arg2;
@@ -3702,6 +6506,13 @@ impl NtShimEntrypoints {
                     unsafe {
                         core::ptr::write(ret_len_ptr as *mut u32, byte_len as u32);
                     }
+                }
+                #[cfg(debug_assertions)]
+                {
+                    use litebox::platform::DebugLogProvider as _;
+                    litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                        "NtQuerySymbolicLinkObject(name=\"{name}\") -> \"{target}\"\n",
+                    ));
                 }
                 (NtStatus::STATUS_SUCCESS, false)
             }
@@ -3716,36 +6527,112 @@ impl NtShimEntrypoints {
                 let io_status_ptr =
                     unsafe { core::ptr::read((ctx.regs.rsp + 0x28) as *const usize) };
                 let ioctl_code = unsafe { core::ptr::read((ctx.regs.rsp + 0x30) as *const u32) };
+                let _input_buffer =
+                    unsafe { core::ptr::read((ctx.regs.rsp + 0x38) as *const usize) };
+                let _input_length = unsafe { core::ptr::read((ctx.regs.rsp + 0x40) as *const u32) };
+                let output_buffer =
+                    unsafe { core::ptr::read((ctx.regs.rsp + 0x48) as *const usize) };
+                let output_length = unsafe { core::ptr::read((ctx.regs.rsp + 0x50) as *const u32) };
 
-                let is_condrv = {
+                enum IoctlTarget {
+                    ConDrv,
+                    Cng,
+                }
+                let target = {
                     let handles = self.shared.handles.lock();
-                    handles.get(file_handle).is_some_and(|obj| {
-                        matches!(obj, handle_table::NtObject::Stub { kind } if kind == "ConDrv")
-                    })
+                    match handles.get(file_handle) {
+                        Some(handle_table::NtObject::Stub { kind }) if kind == "ConDrv" => {
+                            Some(IoctlTarget::ConDrv)
+                        }
+                        Some(handle_table::NtObject::Stub { kind }) if kind == "CNG" => {
+                            Some(IoctlTarget::Cng)
+                        }
+                        _ => None,
+                    }
                 };
 
-                if is_condrv {
-                    #[cfg(debug_assertions)]
-                    {
-                        use litebox::platform::DebugLogProvider as _;
-                        litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
-                            "NT shim: NtDeviceIoControlFile ConDrv ioctl=0x{ioctl_code:X} ΓåÆ stub success\n"
-                        ));
-                    }
-                    if io_status_ptr != 0 {
-                        unsafe {
-                            core::ptr::write(io_status_ptr as *mut u64, 0); // Status
-                            core::ptr::write((io_status_ptr + 8) as *mut u64, 0); // Information
+                match target {
+                    Some(IoctlTarget::ConDrv) => {
+                        #[cfg(debug_assertions)]
+                        {
+                            use litebox::platform::DebugLogProvider as _;
+                            litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                                "NT shim: NtDeviceIoControlFile ConDrv ioctl=0x{ioctl_code:X} ΓåÆ stub success\n"
+                            ));
                         }
+                        if io_status_ptr != 0 {
+                            unsafe {
+                                core::ptr::write(io_status_ptr as *mut u64, 0); // Status
+                                core::ptr::write((io_status_ptr + 8) as *mut u64, 0); // Information
+                            }
+                        }
+                        (NtStatus::STATUS_SUCCESS, false)
                     }
-                    (NtStatus::STATUS_SUCCESS, false)
-                } else {
-                    log_unimplemented!(
-                        "NtDeviceIoControlFile handle=0x{:X} ioctl=0x{:X}",
-                        file_handle,
-                        ioctl_code
-                    );
-                    (NtStatus::STATUS_NOT_IMPLEMENTED, false)
+                    Some(IoctlTarget::Cng) => match ioctl_code {
+                        0x0039_0008 => {
+                            if output_buffer == 0 || output_length == 0 {
+                                if io_status_ptr != 0 {
+                                    unsafe {
+                                        core::ptr::write(
+                                            io_status_ptr as *mut u64,
+                                            NtStatus::STATUS_INVALID_PARAMETER.0 as u64,
+                                        );
+                                        core::ptr::write((io_status_ptr + 8) as *mut u64, 0);
+                                    }
+                                }
+                                (NtStatus::STATUS_INVALID_PARAMETER, false)
+                            } else {
+                                let out = unsafe {
+                                    core::slice::from_raw_parts_mut(
+                                        output_buffer as *mut u8,
+                                        output_length as usize,
+                                    )
+                                };
+                                use litebox::platform::CrngProvider as _;
+                                litebox_platform_multiplex::platform().fill_bytes_crng(out);
+                                if io_status_ptr != 0 {
+                                    unsafe {
+                                        core::ptr::write(io_status_ptr as *mut u64, 0); // Status
+                                        core::ptr::write(
+                                            (io_status_ptr + 8) as *mut u64,
+                                            output_length as u64,
+                                        );
+                                    }
+                                }
+                                #[cfg(debug_assertions)]
+                                {
+                                    use litebox::platform::DebugLogProvider as _;
+                                    litebox_platform_multiplex::platform().debug_log_print(
+                                        &alloc::format!(
+                                            "NT shim: NtDeviceIoControlFile CNG ioctl=0x{ioctl_code:X} filled {} bytes\n",
+                                            output_length
+                                        ),
+                                    );
+                                }
+                                (NtStatus::STATUS_SUCCESS, false)
+                            }
+                        }
+                        _ => {
+                            #[cfg(debug_assertions)]
+                            {
+                                use litebox::platform::DebugLogProvider as _;
+                                litebox_platform_multiplex::platform().debug_log_print(
+                                    &alloc::format!(
+                                        "NT shim: unsupported CNG ioctl=0x{ioctl_code:X}\n"
+                                    ),
+                                );
+                            }
+                            (NtStatus::STATUS_NOT_SUPPORTED, false)
+                        }
+                    },
+                    None => {
+                        log_unimplemented!(
+                            "NtDeviceIoControlFile handle=0x{:X} ioctl=0x{:X}",
+                            file_handle,
+                            ioctl_code
+                        );
+                        (NtStatus::STATUS_NOT_IMPLEMENTED, false)
+                    }
                 }
             }
 
@@ -3760,11 +6647,108 @@ impl NtShimEntrypoints {
             }
 
             NtSyscallId::NtQueryWnfStateData => {
-                // WNF (Windows Notification Facility) state query. Modern
-                // Windows DLLs use WNF to check feature flags during init.
-                // Return STATUS_UNSUCCESSFUL to indicate no state is published,
-                // which makes callers use their default code paths.
-                (NtStatus::STATUS_UNSUCCESSFUL, false)
+                // NtQueryWnfStateData(StateName, TypeId, ExplicitScope,
+                //     ChangeStamp, Buffer, BufferLength)
+                let args = syscalls::NtSyscallArgs::from_ctx(ctx);
+                let state_name_ptr = args.arg0;
+                let _type_id = args.arg1;
+                let _explicit_scope = args.arg2;
+                let change_stamp_ptr = args.arg3;
+                let buffer_ptr = unsafe { core::ptr::read((ctx.regs.rsp + 0x28) as *const usize) };
+                let buffer_len_ptr =
+                    unsafe { core::ptr::read((ctx.regs.rsp + 0x30) as *const usize) };
+
+                if state_name_ptr == 0 || buffer_len_ptr == 0 {
+                    (NtStatus::STATUS_INVALID_PARAMETER, false)
+                } else {
+                    let state_name =
+                        unsafe { core::ptr::read_unaligned(state_name_ptr as *const u64) };
+                    let states = self.shared.wnf_states.lock();
+                    if let Some(state) = states.get(&state_name) {
+                        let required = state.data.len() as u32;
+                        let buffer_len = unsafe { core::ptr::read(buffer_len_ptr as *const u32) };
+                        unsafe {
+                            core::ptr::write(buffer_len_ptr as *mut u32, required);
+                        }
+                        if change_stamp_ptr != 0 {
+                            unsafe {
+                                core::ptr::write(change_stamp_ptr as *mut u32, state.change_stamp);
+                            }
+                        }
+                        if required != 0 && (buffer_ptr == 0 || buffer_len < required) {
+                            (NtStatus::STATUS_BUFFER_TOO_SMALL, false)
+                        } else {
+                            if required != 0 {
+                                unsafe {
+                                    core::ptr::copy_nonoverlapping(
+                                        state.data.as_ptr(),
+                                        buffer_ptr as *mut u8,
+                                        required as usize,
+                                    );
+                                }
+                            }
+                            (NtStatus::STATUS_SUCCESS, false)
+                        }
+                    } else {
+                        // No guest-local publication exists for this state.
+                        (NtStatus::STATUS_UNSUCCESSFUL, false)
+                    }
+                }
+            }
+
+            NtSyscallId::NtQueryWnfStateNameInformation => {
+                // NtQueryWnfStateNameInformation(StateName, NameInfoClass,
+                //     ExplicitScope, Buffer, BufferLength)
+                let args = syscalls::NtSyscallArgs::from_ctx(ctx);
+                let state_name_ptr = args.arg0;
+                let name_info_class = args.arg1 as u32;
+                let explicit_scope = args.arg2;
+                let buffer = args.arg3;
+                let buffer_len = unsafe { core::ptr::read((ctx.regs.rsp + 0x28) as *const u32) };
+
+                #[cfg(debug_assertions)]
+                {
+                    use litebox::platform::DebugLogProvider as _;
+                    let state_name = if state_name_ptr != 0 {
+                        unsafe { core::ptr::read_unaligned(state_name_ptr as *const u64) }
+                    } else {
+                        0
+                    };
+                    litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                        "NT shim: NtQueryWnfStateNameInformation(state=0x{state_name:016X}, class={}, scope=0x{explicit_scope:X}, buf=0x{buffer:X}, len={buffer_len})\n",
+                        name_info_class
+                    ));
+                }
+
+                #[cfg(target_os = "windows")]
+                {
+                    unsafe extern "system" {
+                        #[link_name = "NtQueryWnfStateNameInformation"]
+                        fn host_nt_query_wnf_state_name_information(
+                            state_name: *const u64,
+                            name_info_class: u32,
+                            explicit_scope: *const core::ffi::c_void,
+                            buffer: *mut core::ffi::c_void,
+                            buffer_len: u32,
+                        ) -> i32;
+                    }
+
+                    let status = unsafe {
+                        host_nt_query_wnf_state_name_information(
+                            state_name_ptr as *const u64,
+                            name_info_class,
+                            explicit_scope as *const core::ffi::c_void,
+                            buffer as *mut core::ffi::c_void,
+                            buffer_len,
+                        )
+                    };
+                    (NtStatus(status), false)
+                }
+
+                #[cfg(not(target_os = "windows"))]
+                {
+                    (NtStatus::STATUS_NOT_IMPLEMENTED, false)
+                }
             }
 
             NtSyscallId::NtReadVirtualMemory => {
@@ -3780,8 +6764,15 @@ impl NtShimEntrypoints {
                 let bytes_to_read = args.arg3;
                 let bytes_read_ptr =
                     unsafe { core::ptr::read((ctx.regs.rsp + 0x28) as *const usize) };
+                let is_current_process = handle == NT_CURRENT_PROCESS_HANDLE
+                    || self
+                        .shared
+                        .handles
+                        .lock()
+                        .get(handle as u32)
+                        .is_some_and(|obj| matches!(obj, handle_table::NtObject::CurrentProcess));
 
-                if handle == NT_CURRENT_PROCESS_HANDLE {
+                if is_current_process {
                     // Self-process: simple memcpy.
                     unsafe {
                         core::ptr::copy_nonoverlapping(
@@ -3819,12 +6810,14 @@ impl litebox::shim::EnterShim for NtShimEntrypoints {
             ctx.regs.rsp = state.stack_top;
 
             if let Some(argument) = self.child_thread_argument {
-                // Child thread: RCX = argument (first Win64 parameter).
+                // Fallback child-thread entry: call StartRoutine(Parameter)
+                // directly if the runner did not resolve RtlUserThreadStart.
                 ctx.regs.rcx = argument;
             } else if state.initial_rcx != 0 {
-                // ntdll-driven init: RCX = CONTEXT* on guest stack,
-                // RDX = ntdll base address. Since RCX != RIP, the platform
-                // uses the NtContinue slow path which restores all registers.
+                // ntdll-driven init: main thread enters with
+                // RCX=CONTEXT*/RDX=ntdll base for LdrInitializeThunk, while
+                // child threads enter with RCX=StartRoutine/RDX=Parameter for
+                // RtlUserThreadStart.
                 ctx.regs.rcx = state.initial_rcx;
                 ctx.regs.rdx = state.initial_rdx;
             } else {
@@ -3844,17 +6837,57 @@ impl litebox::shim::EnterShim for NtShimEntrypoints {
         #[cfg(debug_assertions)]
         {
             use litebox::platform::DebugLogProvider as _;
+            // Read caller return address from [guest_rsp] for module attribution.
+            let caller_ret = if ctx.regs.rsp != 0 {
+                unsafe { core::ptr::read_unaligned(ctx.regs.rsp as *const u64) }
+            } else {
+                0
+            };
+            // Also read [rsp-8] to see what's below
+            let below_rsp = if ctx.regs.rsp >= 8 {
+                unsafe { core::ptr::read_unaligned((ctx.regs.rsp - 8) as *const u64) }
+            } else {
+                0
+            };
             let msg = alloc::format!(
-                "NT shim: syscall nr=0x{:04X} rip=0x{:X} r10=0x{:X} rdx=0x{:X}\n",
+                "NT shim: syscall nr=0x{:04X} rip=0x{:X} caller=0x{:X} r10=0x{:X} rdx=0x{:X} rsp=0x{:X} [rsp-8]=0x{:X}\n",
                 nr,
                 ctx.regs.rip,
+                caller_ret,
                 ctx.regs.r10,
-                ctx.regs.rdx
+                ctx.regs.rdx,
+                ctx.regs.rsp,
+                below_rsp
             );
             litebox_platform_multiplex::platform().debug_log_print(&msg);
         }
 
+        // Double-check [rsp] right before dispatch
+        #[cfg(debug_assertions)]
+        let pre_dispatch_rsp_val = if ctx.regs.rsp != 0 {
+            unsafe { core::ptr::read_unaligned(ctx.regs.rsp as *const u64) }
+        } else {
+            0
+        };
+
         let (status, terminate) = self.dispatch_syscall(ctx);
+
+        // Verify [rsp] hasn't changed after dispatch
+        #[cfg(debug_assertions)]
+        {
+            if ctx.regs.rsp != 0 {
+                let post_dispatch_rsp_val =
+                    unsafe { core::ptr::read_unaligned(ctx.regs.rsp as *const u64) };
+                if post_dispatch_rsp_val != pre_dispatch_rsp_val {
+                    use litebox::platform::DebugLogProvider as _;
+                    litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                        "!!! [rsp] CHANGED during dispatch! before=0x{:X} after=0x{:X}\n",
+                        pre_dispatch_rsp_val,
+                        post_dispatch_rsp_val
+                    ));
+                }
+            }
+        }
 
         // Kernel32 functions in the 0x1000+ range return values in rax
         // directly (the dispatch handler sets rax). NT syscalls return
@@ -3873,6 +6906,18 @@ impl litebox::shim::EnterShim for NtShimEntrypoints {
             return ContinueOperation::Terminate;
         }
 
+        #[cfg(debug_assertions)]
+        {
+            use litebox::platform::DebugLogProvider as _;
+            litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                "[switch-guest] rip=0x{:X} rsp=0x{:X} rax=0x{:X} rcx=0x{:X}\n",
+                ctx.regs.rip,
+                ctx.regs.rsp,
+                ctx.regs.rax,
+                ctx.regs.rcx
+            ));
+        }
+
         ContinueOperation::Resume
     }
 
@@ -3881,6 +6926,65 @@ impl litebox::shim::EnterShim for NtShimEntrypoints {
         ctx: &mut Self::ExecutionContext,
         info: &ExceptionInfo,
     ) -> ContinueOperation {
+        // Entry-point trace for every exception the shim sees.
+        #[cfg(debug_assertions)]
+        {
+            use litebox::platform::DebugLogProvider as _;
+            litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                "NT shim: exception() ENTRY: exc={:?} rip=0x{:X} rsp=0x{:X} cr2=0x{:X} err=0x{:X}\n",
+                info.exception, ctx.regs.rip, ctx.regs.rsp, info.cr2, info.error_code,
+            ));
+
+            if let Some(init) = self.init_state.as_ref()
+                && let Some(ntdll_base) = init
+                    .module_bases
+                    .iter()
+                    .find(|m| m.name == "ntdll.dll")
+                    .map(|m| m.base_address)
+            {
+                let sxs_fault_rip = ntdll_base + 0x41A02;
+                if ctx.regs.rip == sxs_fault_rip {
+                    let teb = init.teb_va;
+                    let (stack_base, stack_limit, dealloc_stack) = if teb != 0 {
+                        unsafe {
+                            (
+                                core::ptr::read((teb + 0x08) as *const u64) as usize,
+                                core::ptr::read((teb + 0x10) as *const u64) as usize,
+                                core::ptr::read((teb + 0x1478) as *const u64) as usize,
+                            )
+                        }
+                    } else {
+                        (0, 0, 0)
+                    };
+                    let spill_addr = ctx.regs.rsp + 0x220;
+                    let entry_rsp = ctx.regs.rsp + 0x258;
+                    let ret_slot = entry_rsp;
+                    let spill_in_stack =
+                        stack_limit != 0 && spill_addr >= stack_limit && spill_addr < stack_base;
+                    let ret_addr = unsafe { core::ptr::read(ret_slot as *const u64) };
+                    litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                        "NT shim: SXS alignment diag exc={:?} rip=0x{:X}\n  \
+                         rsp=0x{:X} rsp&0xF=0x{:X} spill=0x{:X} spill_in_stack={spill_in_stack}\n  \
+                         entry_rsp=0x{:X} entry_rsp&0xF=0x{:X} ret=[entry_rsp]=0x{:X}\n  \
+                         teb=0x{teb:X} stack_base=0x{stack_base:X} stack_limit=0x{stack_limit:X} \
+                         dealloc_stack=0x{dealloc_stack:X}\n  \
+                         rdx=0x{:X} rdi=0x{:X} rsi=0x{:X} rbx=0x{:X}\n",
+                        info.exception,
+                        ctx.regs.rip,
+                        ctx.regs.rsp,
+                        ctx.regs.rsp & 0xF,
+                        spill_addr,
+                        entry_rsp,
+                        entry_rsp & 0xF,
+                        ret_addr,
+                        ctx.regs.rdx,
+                        ctx.regs.rdi,
+                        ctx.regs.rsi,
+                        ctx.regs.rbx,
+                    ));
+                }
+            }
+        }
         // A child thread returning from its start routine via `ret` pops the
         // sentinel into RIP and advances RSP to stack_top + 8 (one slot past
         // the sentinel). We verify both RIP and RSP to distinguish a legitimate
@@ -3893,10 +6997,7 @@ impl litebox::shim::EnterShim for NtShimEntrypoints {
                 .is_some_and(|s| ctx.regs.rsp == s.stack_top + 8)
         {
             let exit_code = ctx.regs.rax as i32;
-            self.exit_code.store(exit_code, Ordering::Release);
-            if let Some(ref obj) = self.thread_obj {
-                obj.set_exited(exit_code);
-            }
+            self.mark_current_thread_exited(exit_code);
             return ContinueOperation::Terminate;
         }
 
@@ -3909,10 +7010,23 @@ impl litebox::shim::EnterShim for NtShimEntrypoints {
             #[cfg(debug_assertions)]
             {
                 use litebox::platform::DebugLogProvider as _;
+                let ret0 = if ctx.regs.rsp >= 0x10000 {
+                    unsafe { core::ptr::read(ctx.regs.rsp as *const usize) }
+                } else {
+                    0
+                };
+                let ret1 = if ctx.regs.rsp >= 0x10000 {
+                    unsafe { core::ptr::read((ctx.regs.rsp + 8) as *const usize) }
+                } else {
+                    0
+                };
                 litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
-                    "NT shim: BREAKPOINT at rip=0x{:X} rcx=0x{:X}\n",
+                    "NT shim: BREAKPOINT at rip=0x{:X} rcx=0x{:X} rsp=0x{:X} ret0=0x{:X} ret1=0x{:X}\n",
                     ctx.regs.rip,
                     ctx.regs.rcx,
+                    ctx.regs.rsp,
+                    ret0,
+                    ret1,
                 ));
             }
             self.exit_code.store(
@@ -3930,6 +7044,69 @@ impl litebox::shim::EnterShim for NtShimEntrypoints {
         // demand-commit it here by upgrading the faulting page to read-write.
         if info.exception == litebox::shim::Exception::PAGE_FAULT {
             let fault_addr = info.cr2 & !(PAGE_SIZE - 1);
+
+            #[cfg(debug_assertions)]
+            {
+                if let Some(init) = self.init_state.as_ref()
+                    && let Some(ntdll_base) = init
+                        .module_bases
+                        .iter()
+                        .find(|m| m.name == "ntdll.dll")
+                        .map(|m| m.base_address)
+                {
+                    let sxs_fault_rip = ntdll_base + 0x41A02;
+                    if ctx.regs.rip == sxs_fault_rip {
+                        use litebox::platform::DebugLogProvider as _;
+
+                        let teb = init.teb_va;
+                        let (stack_base, stack_limit, dealloc_stack) = if teb != 0 {
+                            unsafe {
+                                (
+                                    core::ptr::read((teb + 0x08) as *const u64) as usize,
+                                    core::ptr::read((teb + 0x10) as *const u64) as usize,
+                                    core::ptr::read((teb + 0x1478) as *const u64) as usize,
+                                )
+                            }
+                        } else {
+                            (0, 0, 0)
+                        };
+                        let spill_addr = ctx.regs.rsp + 0x220;
+                        let spill_in_stack = stack_limit != 0
+                            && spill_addr >= stack_limit
+                            && spill_addr < stack_base;
+                        let spill_page = spill_addr & !(PAGE_SIZE - 1);
+                        let spill_perms = if let (Some(addr), Some(page_size)) = (
+                            litebox::mm::linux::NonZeroAddress::<PAGE_SIZE>::new(spill_page),
+                            litebox::mm::linux::NonZeroPageSize::<PAGE_SIZE>::new(PAGE_SIZE),
+                        ) {
+                            self.shared
+                                .process_state
+                                .pm
+                                .get_memory_permissions(addr, page_size)
+                        } else {
+                            None
+                        };
+
+                        litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                            "NT shim: SXS fault diag rip=0x{:X} cr2=0x{:X} rsp=0x{:X} rsp&0xF=0x{:X}\n  \
+                             spill=0x{:X} spill_page=0x{:X} spill_in_stack={spill_in_stack} spill_perms={spill_perms:?}\n  \
+                             teb=0x{teb:X} stack_base=0x{stack_base:X} stack_limit=0x{stack_limit:X} \
+                             dealloc_stack=0x{dealloc_stack:X}\n  \
+                             rdx=0x{:X} rdi=0x{:X} rsi=0x{:X} rbx=0x{:X}\n",
+                            ctx.regs.rip,
+                            info.cr2,
+                            ctx.regs.rsp,
+                            ctx.regs.rsp & 0xF,
+                            spill_addr,
+                            spill_page,
+                            ctx.regs.rdx,
+                            ctx.regs.rdi,
+                            ctx.regs.rsi,
+                            ctx.regs.rbx,
+                        ));
+                    }
+                }
+            }
 
             // First: check if this is a PM-backed inaccessible page.
             // This handles demand-commit for pages created via small
@@ -3968,6 +7145,229 @@ impl litebox::shim::EnterShim for NtShimEntrypoints {
                             fault_addr,
                             ctx.regs.rip,
                         ));
+
+                        // Dump TLS state when we see the __tlregdtor crash pattern
+                        // (rax = 0x905A4D = MZ header, suggesting corrupted TLS)
+                        if ctx.regs.rax == 0x905A4D {
+                            let teb_base = self.init_state.as_ref().map_or(0, |s| s.teb_va);
+                            let tls_ptr_addr = teb_base + 0x58;
+                            let tls_ptr = unsafe { core::ptr::read(tls_ptr_addr as *const u64) };
+                            litebox_platform_multiplex::platform().debug_log_print(
+                                &alloc::format!(
+                                    "  TLS DIAG: TEB=0x{:X} ThreadLocalStoragePointer=0x{:X}\n",
+                                    teb_base,
+                                    tls_ptr,
+                                ),
+                            );
+                            if tls_ptr != 0 {
+                                // Dump first 16 TLS slots
+                                for i in 0..16u64 {
+                                    let slot =
+                                        unsafe { core::ptr::read((tls_ptr + i * 8) as *const u64) };
+                                    if slot != 0 {
+                                        litebox_platform_multiplex::platform().debug_log_print(
+                                            &alloc::format!("  TLS[{}] = 0x{:X}\n", i, slot,),
+                                        );
+                                    }
+                                }
+                            }
+                            // Dump rbx (TLS_block) and rcx (_tls_index source)
+                            litebox_platform_multiplex::platform().debug_log_print(
+                                &alloc::format!(
+                                    "  rbx=0x{:X} rcx=0x{:X} rdx=0x{:X} rdi=0x{:X} r14=0x{:X}\n",
+                                    ctx.regs.rbx,
+                                    ctx.regs.rcx,
+                                    ctx.regs.rdx,
+                                    ctx.regs.rdi,
+                                    ctx.regs.r14,
+                                ),
+                            );
+                            let r14_plus_rdi = ctx.regs.r14.wrapping_add(ctx.regs.rdi);
+                            litebox_platform_multiplex::platform().debug_log_print(
+                                &alloc::format!(
+                                    "  dbghelp tls ptrs: rbx_is_image={} r14+rdi=0x{:X}\n",
+                                    self.shared.process_state.is_image_mapping(ctx.regs.rbx),
+                                    r14_plus_rdi,
+                                ),
+                            );
+                            if ctx.regs.rbx >= 0x10000
+                                && ctx.regs.rbx < 0x7FFF_FFFF_FFFF
+                                && is_page_readable(&self.shared.process_state.pm, ctx.regs.rbx)
+                            {
+                                let d0 = unsafe { core::ptr::read(ctx.regs.rbx as *const u32) };
+                                let q0 = unsafe { core::ptr::read(ctx.regs.rbx as *const u64) };
+                                let q1 =
+                                    unsafe { core::ptr::read((ctx.regs.rbx + 8) as *const u64) };
+                                litebox_platform_multiplex::platform().debug_log_print(
+                                    &alloc::format!(
+                                        "  dbghelp [rbx]: dword0=0x{:X} q0=0x{:X} q1=0x{:X}\n",
+                                        d0,
+                                        q0,
+                                        q1,
+                                    ),
+                                );
+                            }
+                            if r14_plus_rdi >= 0x10000
+                                && r14_plus_rdi < 0x7FFF_FFFF_FFFF
+                                && is_page_readable(&self.shared.process_state.pm, r14_plus_rdi)
+                            {
+                                let q0 = unsafe { core::ptr::read(r14_plus_rdi as *const u64) };
+                                let q1 =
+                                    unsafe { core::ptr::read((r14_plus_rdi + 8) as *const u64) };
+                                litebox_platform_multiplex::platform().debug_log_print(
+                                    &alloc::format!(
+                                        "  dbghelp [r14+rdi]: q0=0x{:X} q1=0x{:X}\n",
+                                        q0,
+                                        q1,
+                                    ),
+                                );
+                            }
+
+                            // Scan all image mappings for TLS directories and
+                            // read the assigned TLS index at AddressOfIndex.
+                            let imgs = self.shared.process_state.image_mappings.lock();
+                            for (&base, &_sz) in imgs.iter() {
+                                // Read PE sig offset from DOS header
+                                let e_lfanew =
+                                    unsafe { core::ptr::read((base as *const u32).byte_add(0x3C)) }
+                                        as usize;
+                                let opt_hdr = base + e_lfanew + 0x18;
+                                // NumberOfRvaAndSizes at opt_hdr + 0x6C (PE32+)
+                                let num_dd =
+                                    unsafe { core::ptr::read((opt_hdr + 0x6C) as *const u32) };
+                                if num_dd <= 9 {
+                                    continue; // no TLS directory entry
+                                }
+                                // Data Directory[9] (TLS) is at opt_hdr + 0x70 + 9*8
+                                let dd_tls = opt_hdr + 0x70 + 9 * 8;
+                                let tls_rva =
+                                    unsafe { core::ptr::read(dd_tls as *const u32) } as usize;
+                                let tls_size =
+                                    unsafe { core::ptr::read((dd_tls + 4) as *const u32) };
+                                if tls_rva == 0 || tls_size == 0 {
+                                    continue;
+                                }
+                                // Read TLS directory: AddressOfIndex at offset 0x10
+                                let tls_va = base + tls_rva;
+                                let addr_of_index =
+                                    unsafe { core::ptr::read((tls_va + 0x10) as *const u64) }
+                                        as usize;
+                                // Read the TLS index value stored there
+                                let idx_val = if addr_of_index >= 0x10000
+                                    && addr_of_index < 0x7FFF_FFFF_FFFF
+                                {
+                                    unsafe { core::ptr::read(addr_of_index as *const u32) }
+                                } else {
+                                    0xDEAD
+                                };
+                                litebox_platform_multiplex::platform().debug_log_print(
+                                    &alloc::format!(
+                                        "  IMG 0x{base:X} TLS_rva=0x{tls_rva:X} \
+                                         AddrOfIdx=0x{addr_of_index:X} idx={idx_val}\n",
+                                    ),
+                                );
+                            }
+                            drop(imgs);
+
+                            // Walk InLoadOrderModuleList to count modules
+                            let peb_va = self.init_state.as_ref().map_or(0, |s| s.peb_va);
+                            if peb_va != 0 {
+                                let ldr_ptr =
+                                    unsafe { core::ptr::read((peb_va + 0x18) as *const usize) };
+                                if ldr_ptr != 0 {
+                                    // InLoadOrderModuleList is at Ldr+0x10
+                                    let list_head = ldr_ptr + 0x10;
+                                    let head_flink =
+                                        unsafe { core::ptr::read(list_head as *const usize) };
+                                    let head_blink =
+                                        unsafe { core::ptr::read((list_head + 8) as *const usize) };
+                                    litebox_platform_multiplex::platform().debug_log_print(
+                                        &alloc::format!(
+                                            "  PEB.Ldr=0x{ldr_ptr:X} head=0x{list_head:X} \
+                                             head.Flink=0x{head_flink:X} head.Blink=0x{head_blink:X}\n",
+                                        ),
+                                    );
+                                    let mut count = 0u32;
+                                    let mut cur = head_flink;
+                                    while cur != list_head && cur != 0 && count < 30 {
+                                        // Bail if cur is outside any plausible guest range
+                                        if cur < 0x10000 || cur > 0x7FFF_FFFF_FFFF {
+                                            litebox_platform_multiplex::platform().debug_log_print(
+                                                &alloc::format!(
+                                                    "  LDR[{count}] @0x{cur:X} — out of range, stopping\n",
+                                                ),
+                                            );
+                                            break;
+                                        }
+                                        // DllBase is at offset 0x30, SizeOfImage at 0x40
+                                        let dll_base =
+                                            unsafe { core::ptr::read((cur + 0x30) as *const u64) };
+                                        let size =
+                                            unsafe { core::ptr::read((cur + 0x40) as *const u32) };
+                                        let flink = unsafe { core::ptr::read(cur as *const usize) };
+                                        litebox_platform_multiplex::platform().debug_log_print(
+                                            &alloc::format!(
+                                                "  LDR[{}] @0x{:X} base=0x{:X} size=0x{:X} flink=0x{:X}\n",
+                                                count, cur, dll_base, size, flink,
+                                            ),
+                                        );
+                                        // Stop if data looks corrupt
+                                        if size > 0x1000_0000 || dll_base == 0 {
+                                            break;
+                                        }
+                                        count += 1;
+                                        cur = flink;
+                                    }
+                                    litebox_platform_multiplex::platform().debug_log_print(
+                                        &alloc::format!(
+                                            "  LDR total={} head=0x{:X} final_cur=0x{:X}\n",
+                                            count,
+                                            list_head,
+                                            cur,
+                                        ),
+                                    );
+                                    // Walk the Blink chain (backwards) to see entries after corruption
+                                    litebox_platform_multiplex::platform()
+                                        .debug_log_print("  === BLINK walk (last→first) ===\n");
+                                    let mut bcur = head_blink;
+                                    let mut bcount = 0u32;
+                                    while bcur != list_head && bcur != 0 && bcount < 30 {
+                                        if bcur < 0x10000 || bcur > 0x7FFF_FFFF_FFFF {
+                                            litebox_platform_multiplex::platform().debug_log_print(
+                                                &alloc::format!(
+                                                    "  BLDR[{bcount}] @0x{bcur:X} — out of range, stopping\n",
+                                                ),
+                                            );
+                                            break;
+                                        }
+                                        let dll_base =
+                                            unsafe { core::ptr::read((bcur + 0x30) as *const u64) };
+                                        let size =
+                                            unsafe { core::ptr::read((bcur + 0x40) as *const u32) };
+                                        let blink =
+                                            unsafe { core::ptr::read((bcur + 8) as *const usize) };
+                                        litebox_platform_multiplex::platform().debug_log_print(
+                                            &alloc::format!(
+                                                "  BLDR[{}] @0x{:X} base=0x{:X} size=0x{:X} blink=0x{:X}\n",
+                                                bcount, bcur, dll_base, size, blink,
+                                            ),
+                                        );
+                                        if size > 0x1000_0000 || dll_base == 0 {
+                                            break;
+                                        }
+                                        bcount += 1;
+                                        bcur = blink;
+                                    }
+                                    litebox_platform_multiplex::platform().debug_log_print(
+                                        &alloc::format!(
+                                            "  BLDR total={} final=0x{:X}\n",
+                                            bcount,
+                                            bcur,
+                                        ),
+                                    );
+                                }
+                            }
+                        }
                     }
                     return ContinueOperation::Resume;
                 }
@@ -4196,7 +7596,9 @@ impl litebox::shim::EnterShim for NtShimEntrypoints {
 
         // ── Segment heap lazy context initialization fixup ──
         //
-        // NOTE: This fixup is disabled because we disable the segment heap
+        // Stock segment heap policy is enabled again. If segment-heap-specific
+        // demand faults need special handling, add it here based on traced
+        // host behavior rather than registry overrides.
         // ── Forward unhandled guest exceptions to ntdll's ──
         // ── KiUserExceptionDispatcher (guest SEH chain)    ──
         //
@@ -4332,6 +7734,420 @@ impl litebox::shim::EnterShim for NtShimEntrypoints {
                         "NT shim: forwarding exception to guest SEH: code=0x{:X} addr=0x{:X} rip=0x{:X} → KiUserExceptionDispatcher @ 0x{:X}\n",
                         exc_code, info.cr2, ctx.regs.rip, dispatcher_va,
                     ));
+
+                    // Dump TLS state and IFT count to diagnose TLS/SEH issues.
+                    let teb_va = self.init_state.as_ref().map_or(0, |s| s.teb_va);
+                    let peb_va = self.init_state.as_ref().map_or(0, |s| s.peb_va);
+                    if teb_va != 0 {
+                        unsafe {
+                            // TEB+0x58 = ThreadLocalStoragePointer
+                            let tls_ptr_array = core::ptr::read((teb_va + 0x58) as *const u64);
+                            litebox_platform_multiplex::platform().debug_log_print(
+                                &alloc::format!(
+                                    "  TLS diag: TEB=0x{:X} TEB+0x58 (TlsArrayPtr)=0x{:X}\n",
+                                    teb_va,
+                                    tls_ptr_array,
+                                ),
+                            );
+                            // Dump guest regs at crash for TLS analysis
+                            litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                                "  Crash regs: rdx=0x{:X} rdi=0x{:X} r8=0x{:X} r13=0x{:X} r14=0x{:X} rbx=0x{:X} rax=0x{:X} rsi=0x{:X}\n",
+                                ctx.regs.rdx, ctx.regs.rdi, ctx.regs.r8, ctx.regs.r13, ctx.regs.r14, ctx.regs.rbx, ctx.regs.rax, ctx.regs.rsi,
+                            ));
+                            let rbx = ctx.regs.rbx;
+                            let r14_plus_rdi = ctx.regs.r14.wrapping_add(ctx.regs.rdi);
+                            litebox_platform_multiplex::platform().debug_log_print(
+                                &alloc::format!(
+                                    "  Crash ptrs: rbx_is_image={} r14+rdi=0x{:X}\n",
+                                    self.shared.process_state.is_image_mapping(rbx),
+                                    r14_plus_rdi,
+                                ),
+                            );
+                            if rbx >= 0x10000
+                                && rbx <= 0x7FFF_FFFF_FFFF
+                                && is_page_readable(&self.shared.process_state.pm, rbx)
+                            {
+                                let rbx_dword0 = core::ptr::read(rbx as *const u32);
+                                let rbx_q0 = core::ptr::read(rbx as *const u64);
+                                let rbx_q1 = core::ptr::read((rbx + 8) as *const u64);
+                                litebox_platform_multiplex::platform().debug_log_print(
+                                    &alloc::format!(
+                                        "  [rbx] dword0=0x{:X} q0=0x{:X} q1=0x{:X}\n",
+                                        rbx_dword0,
+                                        rbx_q0,
+                                        rbx_q1,
+                                    ),
+                                );
+                            }
+                            let rdi = ctx.regs.rdi;
+                            if rdi >= 0x10000
+                                && rdi <= 0x7FFF_FFFF_FFFF
+                                && is_page_readable(&self.shared.process_state.pm, rdi)
+                                && is_page_readable(&self.shared.process_state.pm, rdi + 0x78)
+                            {
+                                let rdi_q0 = core::ptr::read((rdi + 0x00) as *const u64);
+                                let rdi_q1 = core::ptr::read((rdi + 0x08) as *const u64);
+                                let rdi_q2 = core::ptr::read((rdi + 0x10) as *const u64);
+                                let rdi_q3 = core::ptr::read((rdi + 0x18) as *const u64);
+                                let rdi_q4 = core::ptr::read((rdi + 0x20) as *const u64);
+                                let rdi_q5 = core::ptr::read((rdi + 0x28) as *const u64);
+                                let rdi_q6 = core::ptr::read((rdi + 0x30) as *const u64);
+                                let rdi_q7 = core::ptr::read((rdi + 0x38) as *const u64);
+                                let rdi_q8 = core::ptr::read((rdi + 0x40) as *const u64);
+                                let rdi_q9 = core::ptr::read((rdi + 0x48) as *const u64);
+                                let rdi_q10 = core::ptr::read((rdi + 0x50) as *const u64);
+                                let rdi_q11 = core::ptr::read((rdi + 0x58) as *const u64);
+                                let rdi_q12 = core::ptr::read((rdi + 0x60) as *const u64);
+                                let rdi_q13 = core::ptr::read((rdi + 0x68) as *const u64);
+                                let rdi_q14 = core::ptr::read((rdi + 0x70) as *const u64);
+                                let rdi_q15 = core::ptr::read((rdi + 0x78) as *const u64);
+                                litebox_platform_multiplex::platform().debug_log_print(
+                                    &alloc::format!(
+                                        "  [rdi+00] {:016X} {:016X} {:016X} {:016X} {:016X} {:016X} {:016X} {:016X}\n",
+                                        rdi_q0, rdi_q1, rdi_q2, rdi_q3, rdi_q4, rdi_q5, rdi_q6, rdi_q7,
+                                    ),
+                                );
+                                litebox_platform_multiplex::platform().debug_log_print(
+                                    &alloc::format!(
+                                        "  [rdi+40] {:016X} {:016X} {:016X} {:016X} {:016X} {:016X} {:016X} {:016X}\n",
+                                        rdi_q8, rdi_q9, rdi_q10, rdi_q11, rdi_q12, rdi_q13, rdi_q14, rdi_q15,
+                                    ),
+                                );
+                            }
+                            let r8 = ctx.regs.r8;
+                            if r8 >= 0x10000
+                                && r8 <= 0x7FFF_FFFF_FFFF
+                                && is_page_readable(&self.shared.process_state.pm, r8)
+                                && is_page_readable(&self.shared.process_state.pm, r8 + 0x78)
+                            {
+                                let r8_q0 = core::ptr::read((r8 + 0x00) as *const u64);
+                                let r8_q1 = core::ptr::read((r8 + 0x08) as *const u64);
+                                let r8_q2 = core::ptr::read((r8 + 0x10) as *const u64);
+                                let r8_q3 = core::ptr::read((r8 + 0x18) as *const u64);
+                                let r8_q4 = core::ptr::read((r8 + 0x20) as *const u64);
+                                let r8_q5 = core::ptr::read((r8 + 0x28) as *const u64);
+                                let r8_q6 = core::ptr::read((r8 + 0x30) as *const u64);
+                                let r8_q7 = core::ptr::read((r8 + 0x38) as *const u64);
+                                let r8_q8 = core::ptr::read((r8 + 0x40) as *const u64);
+                                let r8_q9 = core::ptr::read((r8 + 0x48) as *const u64);
+                                let r8_q10 = core::ptr::read((r8 + 0x50) as *const u64);
+                                let r8_q11 = core::ptr::read((r8 + 0x58) as *const u64);
+                                let r8_q12 = core::ptr::read((r8 + 0x60) as *const u64);
+                                let r8_q13 = core::ptr::read((r8 + 0x68) as *const u64);
+                                let r8_q14 = core::ptr::read((r8 + 0x70) as *const u64);
+                                let r8_q15 = core::ptr::read((r8 + 0x78) as *const u64);
+                                litebox_platform_multiplex::platform().debug_log_print(
+                                    &alloc::format!(
+                                        "  [r8 +00] {:016X} {:016X} {:016X} {:016X} {:016X} {:016X} {:016X} {:016X}\n",
+                                        r8_q0, r8_q1, r8_q2, r8_q3, r8_q4, r8_q5, r8_q6, r8_q7,
+                                    ),
+                                );
+                                litebox_platform_multiplex::platform().debug_log_print(
+                                    &alloc::format!(
+                                        "  [r8 +40] {:016X} {:016X} {:016X} {:016X} {:016X} {:016X} {:016X} {:016X}\n",
+                                        r8_q8, r8_q9, r8_q10, r8_q11, r8_q12, r8_q13, r8_q14, r8_q15,
+                                    ),
+                                );
+                            }
+                            if r14_plus_rdi >= 0x10000
+                                && r14_plus_rdi <= 0x7FFF_FFFF_FFFF
+                                && is_page_readable(&self.shared.process_state.pm, r14_plus_rdi)
+                            {
+                                let ptr_q0 = core::ptr::read(r14_plus_rdi as *const u64);
+                                let ptr_q1 = core::ptr::read((r14_plus_rdi + 8) as *const u64);
+                                litebox_platform_multiplex::platform().debug_log_print(
+                                    &alloc::format!(
+                                        "  [r14+rdi] q0=0x{:X} q1=0x{:X}\n",
+                                        ptr_q0,
+                                        ptr_q1,
+                                    ),
+                                );
+                            }
+                            if tls_ptr_array != 0 {
+                                // Dump first 20 TLS block pointers (bitmap shows bits up to 16)
+                                for i in 0u64..20 {
+                                    let slot =
+                                        core::ptr::read((tls_ptr_array + i * 8) as *const u64);
+                                    if slot != 0 {
+                                        litebox_platform_multiplex::platform().debug_log_print(
+                                            &alloc::format!("  TLS[{}]=0x{:X}\n", i, slot,),
+                                        );
+                                    }
+                                }
+                            }
+                            // PEB TlsBitmap (PEB+0x78 on x64)
+                            if peb_va != 0 {
+                                let process_params = core::ptr::read(
+                                    (peb_va + crate::peb_teb::peb_offsets::PROCESS_PARAMETERS)
+                                        as *const u64,
+                                ) as usize;
+                                if process_params != 0
+                                    && is_page_readable(
+                                        &self.shared.process_state.pm,
+                                        process_params,
+                                    )
+                                {
+                                    let pp_len = core::ptr::read(process_params as *const u32);
+                                    let pp_max =
+                                        core::ptr::read((process_params + 0x04) as *const u32);
+                                    let pp_flags =
+                                        core::ptr::read((process_params + 0x08) as *const u32);
+                                    let cur_len = core::ptr::read(
+                                        (process_params
+                                            + crate::peb_teb::process_params_offsets::CUR_DIR_DOS_PATH_LENGTH)
+                                            as *const u16,
+                                    );
+                                    let cur_max = core::ptr::read(
+                                        (process_params
+                                            + crate::peb_teb::process_params_offsets::CUR_DIR_DOS_PATH_MAX_LENGTH)
+                                            as *const u16,
+                                    );
+                                    let cur_buf = core::ptr::read(
+                                        (process_params
+                                            + crate::peb_teb::process_params_offsets::CUR_DIR_DOS_PATH_BUFFER)
+                                            as *const u64,
+                                    );
+                                    let cur_handle = core::ptr::read(
+                                        (process_params
+                                            + crate::peb_teb::process_params_offsets::CUR_DIR_HANDLE)
+                                            as *const u64,
+                                    );
+                                    let cmd_len = core::ptr::read(
+                                        (process_params
+                                            + crate::peb_teb::process_params_offsets::COMMAND_LINE_LENGTH)
+                                            as *const u16,
+                                    );
+                                    let cmd_max = core::ptr::read(
+                                        (process_params
+                                            + crate::peb_teb::process_params_offsets::COMMAND_LINE_MAX_LENGTH)
+                                            as *const u16,
+                                    );
+                                    let cmd_buf = core::ptr::read(
+                                        (process_params
+                                            + crate::peb_teb::process_params_offsets::COMMAND_LINE_BUFFER)
+                                            as *const u64,
+                                    );
+                                    litebox_platform_multiplex::platform().debug_log_print(
+                                        &alloc::format!(
+                                            "  ProcessParameters=0x{process_params:X} len=0x{pp_len:X} max=0x{pp_max:X} flags=0x{pp_flags:X}\n\
+                                             CurrentDirectory: len=0x{cur_len:X} max=0x{cur_max:X} buf=0x{cur_buf:X} handle=0x{cur_handle:X} readable={}\n\
+                                             CommandLine: len=0x{cmd_len:X} max=0x{cmd_max:X} buf=0x{cmd_buf:X} readable={}\n",
+                                            is_page_readable(
+                                                &self.shared.process_state.pm,
+                                                cur_buf as usize,
+                                            ),
+                                            is_page_readable(
+                                                &self.shared.process_state.pm,
+                                                cmd_buf as usize,
+                                            ),
+                                        ),
+                                    );
+                                }
+                                let tls_bitmap_ptr = core::ptr::read((peb_va + 0x78) as *const u64);
+                                let tls_bitmap_bits0 =
+                                    core::ptr::read((peb_va + 0x80) as *const u32);
+                                let tls_bitmap_bits1 =
+                                    core::ptr::read((peb_va + 0x84) as *const u32);
+                                litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                                    "  PEB+0x78 TlsBitmap ptr=0x{:X} bits[0]=0x{:X} bits[1]=0x{:X}\n",
+                                    tls_bitmap_ptr, tls_bitmap_bits0, tls_bitmap_bits1,
+                                ));
+                                // If TlsBitmap pointer is valid, read the RTL_BITMAP struct
+                                if tls_bitmap_ptr != 0 {
+                                    let bm_size = core::ptr::read(tls_bitmap_ptr as *const u32);
+                                    let bm_buf =
+                                        core::ptr::read((tls_bitmap_ptr + 8) as *const u64);
+                                    litebox_platform_multiplex::platform().debug_log_print(
+                                        &alloc::format!(
+                                            "  RTL_BITMAP: size={} buf_ptr=0x{:X}\n",
+                                            bm_size,
+                                            bm_buf,
+                                        ),
+                                    );
+                                }
+                                // TlsExpansionBitmap (PEB+0x1760)
+                                let exp_bitmap_ptr =
+                                    core::ptr::read((peb_va + 0x1760) as *const u64);
+                                litebox_platform_multiplex::platform().debug_log_print(
+                                    &alloc::format!(
+                                        "  PEB+0x1760 TlsExpBitmap ptr=0x{:X}\n",
+                                        exp_bitmap_ptr,
+                                    ),
+                                );
+                            }
+
+                            // Walk InLoadOrderModuleList and dump LoadReason + TLS info
+                            if peb_va != 0 {
+                                let ldr_ptr =
+                                    core::ptr::read((peb_va + 0x18) as *const u64) as usize;
+                                if ldr_ptr != 0 {
+                                    let head = ldr_ptr + 0x10; // InLoadOrderModuleList head
+                                    let mut cur = core::ptr::read(head as *const u64) as usize;
+                                    let mut mod_count = 0u32;
+                                    let guest_start =
+                                        self.init_state.as_ref().map_or(0, |s| s.guest_va_start);
+                                    let guest_end =
+                                        self.init_state.as_ref().map_or(0, |s| s.guest_va_end);
+                                    while cur != head && mod_count < 40 {
+                                        // Bounds check: make sure cur is in guest VA
+                                        if cur < guest_start || cur + 0x120 > guest_end {
+                                            litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                                                "  Mod[{}]: FLINK=0x{:X} OUT OF RANGE — stopping walk\n",
+                                                mod_count, cur,
+                                            ));
+                                            break;
+                                        }
+                                        let dll_base = core::ptr::read((cur + 0x30) as *const u64);
+                                        let img_size = core::ptr::read((cur + 0x40) as *const u32);
+                                        let load_reason =
+                                            core::ptr::read((cur + 0x10C) as *const u32);
+                                        let tls_idx = core::ptr::read((cur + 0x6E) as *const u16);
+                                        let flags = core::ptr::read((cur + 0x68) as *const u32);
+                                        // Read BaseDllName
+                                        let name_len =
+                                            core::ptr::read((cur + 0x58) as *const u16) as usize;
+                                        let name_ptr =
+                                            core::ptr::read((cur + 0x60) as *const u64) as usize;
+                                        let name = if name_ptr >= guest_start
+                                            && name_ptr < guest_end
+                                            && name_len > 0
+                                            && name_len < 512
+                                        {
+                                            let wchars = core::slice::from_raw_parts(
+                                                name_ptr as *const u16,
+                                                name_len / 2,
+                                            );
+                                            alloc::string::String::from_utf16_lossy(wchars)
+                                        } else {
+                                            alloc::format!(
+                                                "(name@0x{:X} len={})",
+                                                name_ptr,
+                                                name_len
+                                            )
+                                        };
+                                        let next_flink =
+                                            core::ptr::read(cur as *const u64) as usize;
+                                        litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                                            "  Mod[{}]: base=0x{:X} size=0x{:X} loadR={} tlsIdx=0x{:X} fl=0x{:X} next=0x{:X} {}\n",
+                                            mod_count, dll_base, img_size, load_reason, tls_idx, flags, next_flink, name,
+                                        ));
+                                        cur = next_flink;
+                                        mod_count += 1;
+                                    }
+                                    if cur == head {
+                                        litebox_platform_multiplex::platform().debug_log_print(
+                                            &alloc::format!(
+                                                "  Module list: {} entries (complete)\n",
+                                                mod_count,
+                                            ),
+                                        );
+                                    }
+                                }
+                            }
+                            // Dump PM mappings to check for DLL-heap overlaps at crash time.
+                            {
+                                let mappings = self.shared.process_state.pm.mappings();
+                                litebox_platform_multiplex::platform().debug_log_print(
+                                    &alloc::format!(
+                                        "  PM mappings total: {} entries\n",
+                                        mappings.len(),
+                                    ),
+                                );
+                                let mut shown = 0u32;
+                                for (range, flags) in &mappings {
+                                    if shown < 200 {
+                                        litebox_platform_multiplex::platform().debug_log_print(
+                                            &alloc::format!(
+                                                "    0x{:X}-0x{:X} (0x{:X}) flags=0x{:X}\n",
+                                                range.start,
+                                                range.end,
+                                                range.end - range.start,
+                                                flags,
+                                            ),
+                                        );
+                                        shown += 1;
+                                    }
+                                }
+                            }
+                            // Dump IFT count
+                            let ift = self.shared.process_state.inverted_function_table_va();
+                            if ift != 0 {
+                                let count = core::ptr::read(ift as *const u32);
+                                let max_count = core::ptr::read((ift + 4) as *const u32);
+                                litebox_platform_multiplex::platform().debug_log_print(
+                                    &alloc::format!(
+                                        "  IFT: va=0x{:X} count={} max={}\n",
+                                        ift,
+                                        count,
+                                        max_count,
+                                    ),
+                                );
+                            }
+
+                            // Read TLS directory from crashing module (dbghelp).
+                            // At exception time, ctx.regs.rip is still the original crash RIP.
+                            let crash_rip = ctx.regs.rip as usize;
+                            // Walk IFT to find which image contains the crash RIP
+                            if ift != 0 {
+                                let count = core::ptr::read(ift as *const u32) as usize;
+                                for i in 0..count {
+                                    let entry = ift + 0x10 + i * 0x18;
+                                    let img_base =
+                                        core::ptr::read((entry + 8) as *const u64) as usize;
+                                    let img_size =
+                                        core::ptr::read((entry + 0x10) as *const u32) as usize;
+                                    if crash_rip >= img_base && crash_rip < img_base + img_size {
+                                        // Found the image. Parse PE headers to find TLS dir.
+                                        let dos_e_lfanew =
+                                            core::ptr::read((img_base + 0x3C) as *const u32)
+                                                as usize;
+                                        let nt_hdr = img_base + dos_e_lfanew;
+                                        // Optional header is at nt_hdr + 24 (4 sig + 20 coff)
+                                        let opt_hdr = nt_hdr + 24;
+                                        // Data directories start at opt_hdr + 112
+                                        let dd_base = opt_hdr + 112;
+                                        // TLS = index 9, each entry 8 bytes (4 rva + 4 size)
+                                        let tls_dd_rva =
+                                            core::ptr::read((dd_base + 9 * 8) as *const u32)
+                                                as usize;
+                                        let tls_dd_size =
+                                            core::ptr::read((dd_base + 9 * 8 + 4) as *const u32);
+                                        if tls_dd_rva != 0 && tls_dd_size != 0 {
+                                            let tls_va = img_base + tls_dd_rva;
+                                            let start = core::ptr::read(tls_va as *const u64);
+                                            let end = core::ptr::read((tls_va + 8) as *const u64);
+                                            let addr_of_idx =
+                                                core::ptr::read((tls_va + 16) as *const u64);
+                                            let addr_of_cb =
+                                                core::ptr::read((tls_va + 24) as *const u64);
+                                            litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                                                "  Crash module TLS (base=0x{:X} size=0x{:X}):\n    \
+                                                 start=0x{:X} end=0x{:X} addr_of_idx=0x{:X} addr_of_cb=0x{:X}\n",
+                                                img_base, img_size, start, end, addr_of_idx, addr_of_cb,
+                                            ));
+                                            // Check if addr_of_idx is in range and read _tls_index
+                                            if (addr_of_idx as usize) >= img_base
+                                                && (addr_of_idx as usize) < img_base + img_size
+                                            {
+                                                let idx_val =
+                                                    core::ptr::read(addr_of_idx as *const u32);
+                                                litebox_platform_multiplex::platform()
+                                                    .debug_log_print(&alloc::format!(
+                                                        "    _tls_index={} (relocated correctly)\n",
+                                                        idx_val,
+                                                    ));
+                                            } else {
+                                                litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                                                    "    addr_of_idx NOT in image range! Relocation broken?\n"
+                                                ));
+                                            }
+                                        }
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
 
                 // Redirect guest execution to KiUserExceptionDispatcher.
@@ -4498,11 +8314,7 @@ impl litebox::shim::EnterShim for NtShimEntrypoints {
             }
         }
 
-        self.exit_code.store(status.0, Ordering::Release);
-        // Mark this thread's ThreadObject as exited so waiters wake up.
-        if let Some(ref obj) = self.thread_obj {
-            obj.set_exited(status.0);
-        }
+        self.mark_current_thread_exited(status.0);
         log_unimplemented!(
             "exception {:?} at rip=0x{:X} (exit code 0x{:08X})",
             info.exception,
@@ -4518,6 +8330,10 @@ impl litebox::shim::EnterShim for NtShimEntrypoints {
         // kernel for exception delivery). The trampoline return path handles
         // guest GS restoration for the syscall path.
         ContinueOperation::Resume
+    }
+
+    fn thread_terminated(&self) {
+        self.cleanup_current_thread_resources();
     }
 }
 

@@ -14,6 +14,7 @@ spin = { version = "0.9.8", default-features = false, features = ["spin_mutex", 
 [features]
 default = ["platform_windows_userland"]
 platform_windows_userland = ["litebox_platform_multiplex/platform_windows_userland", "dep:litebox_platform_windows_userland"]
+trace_debug = ["platform_windows_userland", "litebox_platform_windows_userland/trace_debug"]
 
 [lints]
 workspace = true

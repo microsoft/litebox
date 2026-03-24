@@ -85,6 +85,10 @@ pub mod peb_offsets {
     pub const IMAGE_SUBSYSTEM_MAJOR_VERSION: usize = 0x012C;
     /// ImageSubsystemMinorVersion
     pub const IMAGE_SUBSYSTEM_MINOR_VERSION: usize = 0x0130;
+    /// GdiSharedHandleTable (pointer to GDI shared handle table region).
+    /// Populated by the kernel; read by gdi32full!GdiProcessSetup when
+    /// `gbFirst` is 0 to store `gpHandleTable` and `pGdiSharedMemory`.
+    pub const GDI_SHARED_HANDLE_TABLE: usize = 0x00F8;
     /// SessionId
     pub const SESSION_ID: usize = 0x02C0;
 }
@@ -97,14 +101,18 @@ pub mod process_params_offsets {
     pub const LENGTH: usize = 0x0004;
     /// Flags (ULONG at offset 0x08), bit 0 = RTL_USER_PROC_PARAMS_NORMALIZED
     pub const FLAGS: usize = 0x0008;
+    /// DebugFlags (ULONG at offset 0x0C)
+    pub const DEBUG_FLAGS: usize = 0x000C;
     /// ConsoleHandle (HANDLE at offset 0x10)
     pub const CONSOLE_HANDLE: usize = 0x0010;
-    /// StandardInput handle (at offset 0x18)
-    pub const STD_INPUT_HANDLE: usize = 0x0018;
-    /// StandardOutput handle (at offset 0x20)
-    pub const STD_OUTPUT_HANDLE: usize = 0x0020;
-    /// StandardError handle (at offset 0x28)
-    pub const STD_ERROR_HANDLE: usize = 0x0028;
+    /// ConsoleFlags (ULONG at offset 0x18)
+    pub const CONSOLE_FLAGS: usize = 0x0018;
+    /// StandardInput handle (at offset 0x20)
+    pub const STD_INPUT_HANDLE: usize = 0x0020;
+    /// StandardOutput handle (at offset 0x28)
+    pub const STD_OUTPUT_HANDLE: usize = 0x0028;
+    /// StandardError handle (at offset 0x30)
+    pub const STD_ERROR_HANDLE: usize = 0x0030;
     /// CurrentDirectory.DosPath (UNICODE_STRING at offset 0x38)
     pub const CUR_DIR_DOS_PATH_LENGTH: usize = 0x0038;
     pub const CUR_DIR_DOS_PATH_MAX_LENGTH: usize = 0x003A;
@@ -133,8 +141,9 @@ pub mod process_params_offsets {
 
 /// Size of TEB allocation (2 pages — TEB is ~0x1000 bytes but we round up).
 pub const TEB_SIZE: usize = 0x2000;
-/// Size of PEB allocation (1 page).
-pub const PEB_SIZE: usize = 0x1000;
+/// Size of PEB allocation (2 pages — PEB extends to at least offset 0x1848
+/// on 64-bit Win10: TlsExpansionBitmap at 0x1760, TlsExpansionBitmapBits at 0x1768).
+pub const PEB_SIZE: usize = 0x2000;
 /// Size of RTL_USER_PROCESS_PARAMETERS allocation (1 page).
 pub const PROCESS_PARAMS_SIZE: usize = 0x1000;
 /// Size of command line string buffer (1 page).
@@ -167,6 +176,13 @@ pub const IMAGE_PATH_BUFFER_SIZE: usize = 0x1000;
 
 /// Size of the current directory path buffer (1 page).
 pub const CUR_DIR_BUFFER_SIZE: usize = 0x1000;
+
+/// Synthetic process ID exposed through the initial TEB.
+pub const SYNTHETIC_PROCESS_ID: u32 = 1000;
+/// Synthetic main-thread ID exposed through the initial TEB.
+pub const SYNTHETIC_MAIN_THREAD_ID: u32 = 1004;
+/// Increment used for subsequent synthetic thread IDs.
+pub const SYNTHETIC_THREAD_ID_INCREMENT: u32 = 4;
 
 /// Layout information for the synthesized PEB/TEB.
 #[derive(Debug, Clone)]
@@ -277,6 +293,11 @@ pub struct PebTebParams {
     /// api-ms-win-core-* imports to their actual DLLs (e.g., kernelbase.dll).
     /// If 0, a minimal empty namespace is synthesized in the PEB page.
     pub api_set_map: usize,
+    /// GDI shared handle table base address. gdi32full reads PEB+0xF8 and
+    /// stores it as `gpHandleTable`, then `gpHandleTable + 0x180000` as
+    /// `pGdiSharedMemory`. Must point to a region ≥ 0x200000 bytes.
+    /// If 0, PEB+0xF8 is left as NULL.
+    pub gdi_shared_handle_table: usize,
 }
 
 /// Build the raw bytes for the TEB/PEB/ProcessParams region.
@@ -404,13 +425,122 @@ pub fn build_peb_teb_bytes(layout: &PebTebLayout, params: &PebTebParams) -> allo
     // SessionId = 1 (normal interactive session)
     write_u32(peb, peb_offsets::SESSION_ID, 1);
 
-    // ---- ReadOnlyStaticServerData pointer array (written via `data` directly) ----
+    // GdiSharedHandleTable: gdi32full!GdiProcessSetup reads PEB+0xF8 on
+    // the fast path (gbFirst==0). It stores the pointer as gpHandleTable
+    // and gpHandleTable + 0x180000 as pGdiSharedMemory. The region must
+    // be valid (≥ 0x200000 bytes).
+    if params.gdi_shared_handle_table != 0 {
+        write_u64(
+            peb,
+            peb_offsets::GDI_SHARED_HANDLE_TABLE,
+            params.gdi_shared_handle_table as u64,
+        );
+    }
+
+    // ---- ReadOnlyStaticServerData pointer array + BASE_STATIC_SERVER_DATA ----
+    //
+    // kernelbase's _KernelBaseBaseDllInitialize reads from this structure to
+    // populate KernelBaseGlobalData with the Windows and System32 directory
+    // paths (used by GetSystemDirectoryW, GetWindowsDirectoryW, etc.).
+    //
+    // Layout:
+    //   +0x000 .. +0x017: pointer array [0]=data_va, [1]=data_va
+    //   +0x100 .. +0xFFF: BASE_STATIC_SERVER_DATA
+    //
+    // BASE_STATIC_SERVER_DATA layout (offsets from data_va):
+    //   +0x00: UNICODE_STRING WindowsDirectory
+    //   +0x10: UNICODE_STRING WindowsSysDirectory
+    //   +0x38: USHORT RCNumber (build-related, 0 is fine)
+    //   +0x9E8: u64 — original shared memory base (for pointer rebasing)
+    //
+    // Rebasing: kernelbase computes a delta =
+    //     data_va - [data_va + 0x9E8]
+    // and adds it to every Buffer pointer. Setting [+0x9E8] = data_va makes
+    // the delta 0, so Buffer pointers can be absolute guest VAs.
     {
         let data_va = layout.static_server_data_va + 0x100;
         let ssd_abs = layout.static_server_data_va - layout.teb_va;
         let dv = (data_va as u64).to_le_bytes();
         data[ssd_abs..ssd_abs + 8].copy_from_slice(&dv); // [0] = basesrv data
         data[ssd_abs + 8..ssd_abs + 16].copy_from_slice(&dv); // [1] = winsrv data
+
+        // Offset of BASE_STATIC_SERVER_DATA within the `data` buffer.
+        let bsd = ssd_abs + 0x100;
+
+        // ---- Write string data into the tail of the region ----
+        // WindowsDirectory: "C:\Windows"
+        let win_dir: &[u16] = &[
+            b'C' as u16,
+            b':' as u16,
+            b'\\' as u16,
+            b'W' as u16,
+            b'i' as u16,
+            b'n' as u16,
+            b'd' as u16,
+            b'o' as u16,
+            b'w' as u16,
+            b's' as u16,
+        ];
+        let win_dir_byte_len = (win_dir.len() * 2) as u16; // 20
+        let win_dir_str_offset = 0xA00usize; // offset from data_va
+        let win_dir_str_va = data_va + win_dir_str_offset;
+        for (i, &ch) in win_dir.iter().enumerate() {
+            let off = bsd + win_dir_str_offset + i * 2;
+            data[off..off + 2].copy_from_slice(&ch.to_le_bytes());
+        }
+        // null terminator
+        data[bsd + win_dir_str_offset + win_dir.len() * 2] = 0;
+        data[bsd + win_dir_str_offset + win_dir.len() * 2 + 1] = 0;
+
+        // WindowsSysDirectory: "C:\Windows\System32"
+        let sys_dir: &[u16] = &[
+            b'C' as u16,
+            b':' as u16,
+            b'\\' as u16,
+            b'W' as u16,
+            b'i' as u16,
+            b'n' as u16,
+            b'd' as u16,
+            b'o' as u16,
+            b'w' as u16,
+            b's' as u16,
+            b'\\' as u16,
+            b'S' as u16,
+            b'y' as u16,
+            b's' as u16,
+            b't' as u16,
+            b'e' as u16,
+            b'm' as u16,
+            b'3' as u16,
+            b'2' as u16,
+        ];
+        let sys_dir_byte_len = (sys_dir.len() * 2) as u16; // 38
+        let sys_dir_str_offset = 0xA40usize; // offset from data_va
+        let sys_dir_str_va = data_va + sys_dir_str_offset;
+        for (i, &ch) in sys_dir.iter().enumerate() {
+            let off = bsd + sys_dir_str_offset + i * 2;
+            data[off..off + 2].copy_from_slice(&ch.to_le_bytes());
+        }
+        // null terminator
+        data[bsd + sys_dir_str_offset + sys_dir.len() * 2] = 0;
+        data[bsd + sys_dir_str_offset + sys_dir.len() * 2 + 1] = 0;
+
+        // ---- Write UNICODE_STRING structures ----
+        // WindowsDirectory at BASE_STATIC_SERVER_DATA + 0x00
+        //   +0x00: USHORT Length (byte count excluding null)
+        //   +0x02: USHORT MaximumLength (byte count including null)
+        //   +0x08: PWSTR  Buffer (absolute VA)
+        data[bsd..bsd + 2].copy_from_slice(&win_dir_byte_len.to_le_bytes());
+        data[bsd + 2..bsd + 4].copy_from_slice(&(win_dir_byte_len + 2).to_le_bytes());
+        data[bsd + 8..bsd + 16].copy_from_slice(&(win_dir_str_va as u64).to_le_bytes());
+
+        // WindowsSysDirectory at BASE_STATIC_SERVER_DATA + 0x10
+        data[bsd + 0x10..bsd + 0x12].copy_from_slice(&sys_dir_byte_len.to_le_bytes());
+        data[bsd + 0x12..bsd + 0x14].copy_from_slice(&(sys_dir_byte_len + 2).to_le_bytes());
+        data[bsd + 0x18..bsd + 0x20].copy_from_slice(&(sys_dir_str_va as u64).to_le_bytes());
+
+        // Rebase anchor at offset 0x9E8: set to data_va so rebase delta = 0.
+        data[bsd + 0x9E8..bsd + 0x9F0].copy_from_slice(&(data_va as u64).to_le_bytes());
     }
 
     // ---- RTL_USER_PROCESS_PARAMETERS ----
@@ -419,17 +549,26 @@ pub fn build_peb_teb_bytes(layout: &PebTebLayout, params: &PebTebParams) -> allo
 
     // Flags: RTL_USER_PROC_PARAMS_NORMALIZED (bit 0) — buffers are absolute pointers
     write_u32(pp, process_params_offsets::FLAGS, 1);
+    write_u32(pp, process_params_offsets::DEBUG_FLAGS, 0);
+    write_u64(pp, process_params_offsets::CONSOLE_HANDLE, 0);
+    write_u32(pp, process_params_offsets::CONSOLE_FLAGS, 0);
 
-    // MaximumLength and Length of the structure itself
+    // MaximumLength and Length describe the full normalized process-parameter
+    // block, including the string/environment buffers reachable via rebased
+    // pointers. ntdll relocates those pointers by `new_base + (old_ptr-old_base)`,
+    // so the recorded size must cover the entire contiguous span, not just the
+    // fixed RTL_USER_PROCESS_PARAMETERS header page.
+    let process_params_total_len =
+        (layout.cur_dir_buffer_va + CUR_DIR_BUFFER_SIZE).saturating_sub(layout.process_params_va);
     write_u32(
         pp,
         process_params_offsets::MAXIMUM_LENGTH,
-        PROCESS_PARAMS_SIZE as u32,
+        process_params_total_len as u32,
     );
     write_u32(
         pp,
         process_params_offsets::LENGTH,
-        PROCESS_PARAMS_SIZE as u32,
+        process_params_total_len as u32,
     );
 
     // ImagePathName (UNICODE_STRING)
@@ -639,10 +778,15 @@ pub fn build_peb_teb_bytes(layout: &PebTebLayout, params: &PebTebParams) -> allo
     write_u64(ldr, 0x20, (exe_entry_va + 0x10) as u64);
     write_u64(ldr, 0x28, (ntdll_entry_va + 0x10) as u64);
 
-    // InInitializationOrderModuleList: empty (ntdll populates during init)
+    // InInitializationOrderModuleList: Head → ntdll+0x20 → Head.
+    //
+    // Real Windows seeds ntdll into the initialization-order list before
+    // user-mode loader work runs. Leaving this list empty diverges from the
+    // kernel-provided bootstrap state and can cause later loader passes to
+    // miss ntdll's already-initialized entry.
     let head_init = ldr_va + 0x30;
-    write_u64(ldr, 0x30, head_init as u64);
-    write_u64(ldr, 0x38, head_init as u64);
+    write_u64(ldr, 0x30, (ntdll_entry_va + 0x20) as u64);
+    write_u64(ldr, 0x38, (ntdll_entry_va + 0x20) as u64);
 
     // ---- LDR_DATA_TABLE_ENTRY for EXE (at +0x60) ----
     let exe_off = 0x60usize;
@@ -652,7 +796,7 @@ pub fn build_peb_teb_bytes(layout: &PebTebLayout, params: &PebTebParams) -> allo
     // InMemoryOrderLinks
     write_u64(ldr, exe_off + 0x10, (ntdll_entry_va + 0x10) as u64);
     write_u64(ldr, exe_off + 0x18, head_mem as u64);
-    // InInitializationOrderLinks (not linked yet)
+    // InInitializationOrderLinks (EXE is not on the initial init-order list)
     write_u64(ldr, exe_off + 0x20, 0);
     write_u64(ldr, exe_off + 0x28, 0);
     // DllBase
@@ -697,9 +841,9 @@ pub fn build_peb_teb_bytes(layout: &PebTebLayout, params: &PebTebParams) -> allo
     // InMemoryOrderLinks
     write_u64(ldr, ntdll_off + 0x10, head_mem as u64);
     write_u64(ldr, ntdll_off + 0x18, (exe_entry_va + 0x10) as u64);
-    // InInitializationOrderLinks (not linked yet)
-    write_u64(ldr, ntdll_off + 0x20, 0);
-    write_u64(ldr, ntdll_off + 0x28, 0);
+    // InInitializationOrderLinks: ntdll is the sole initial entry.
+    write_u64(ldr, ntdll_off + 0x20, head_init as u64);
+    write_u64(ldr, ntdll_off + 0x28, head_init as u64);
     // DllBase
     write_u64(ldr, ntdll_off + 0x30, params.ntdll_base as u64);
     // EntryPoint = 0 (ntdll has no DllMain)
@@ -841,6 +985,7 @@ mod tests {
                 + CUR_DIR_BUFFER_SIZE
                 + LDR_DATA_SIZE
                 + FAST_PEB_LOCK_SIZE
+                + STATIC_SERVER_DATA_SIZE
         );
     }
 
@@ -865,6 +1010,7 @@ mod tests {
             process_id: 1000,
             thread_id: 1004,
             api_set_map: 0,
+            gdi_shared_handle_table: 0,
         };
 
         let data = build_peb_teb_bytes(&layout, &params);
@@ -943,6 +1089,51 @@ mod tests {
                 .unwrap(),
         );
         assert_eq!(cl_max, cl_len + 2);
+
+        let pp_len = u32::from_le_bytes(
+            data[pp_off + process_params_offsets::LENGTH
+                ..pp_off + process_params_offsets::LENGTH + 4]
+                .try_into()
+                .unwrap(),
+        );
+        let pp_max = u32::from_le_bytes(
+            data[pp_off + process_params_offsets::MAXIMUM_LENGTH
+                ..pp_off + process_params_offsets::MAXIMUM_LENGTH + 4]
+                .try_into()
+                .unwrap(),
+        );
+        assert_eq!(
+            pp_len as usize,
+            PROCESS_PARAMS_SIZE
+                + CMDLINE_BUFFER_SIZE
+                + CMDLINE_ANSI_BUFFER_SIZE
+                + ENV_BLOCK_SIZE
+                + IMAGE_PATH_BUFFER_SIZE
+                + CUR_DIR_BUFFER_SIZE
+        );
+        assert_eq!(pp_max, pp_len);
+
+        let stdin = u64::from_le_bytes(
+            data[pp_off + process_params_offsets::STD_INPUT_HANDLE
+                ..pp_off + process_params_offsets::STD_INPUT_HANDLE + 8]
+                .try_into()
+                .unwrap(),
+        );
+        let stdout = u64::from_le_bytes(
+            data[pp_off + process_params_offsets::STD_OUTPUT_HANDLE
+                ..pp_off + process_params_offsets::STD_OUTPUT_HANDLE + 8]
+                .try_into()
+                .unwrap(),
+        );
+        let stderr = u64::from_le_bytes(
+            data[pp_off + process_params_offsets::STD_ERROR_HANDLE
+                ..pp_off + process_params_offsets::STD_ERROR_HANDLE + 8]
+                .try_into()
+                .unwrap(),
+        );
+        assert_eq!(stdin, 4);
+        assert_eq!(stdout, 8);
+        assert_eq!(stderr, 12);
     }
 
     #[test]

@@ -18,6 +18,12 @@ use litebox_platform_multiplex::Platform;
 use super::NtSyscallArgs;
 
 const PAGE_SIZE: usize = 4096;
+const ALLOCATION_GRANULARITY: usize = 0x10000;
+
+fn align_up(value: usize, align: usize) -> Option<usize> {
+    let addend = align.checked_sub(1)?;
+    value.checked_add(addend).map(|v| v & !addend)
+}
 
 /// Helper to create a platform raw mutable pointer from a usize address.
 fn raw_mut_ptr(addr: usize) -> <Platform as RawPointerProvider>::RawMutPointer<u8> {
@@ -68,17 +74,30 @@ pub(crate) fn nt_allocate_virtual_memory(
         return NtStatus::STATUS_INVALID_PARAMETER;
     }
 
-    // Round size up to page boundary.
-    let aligned_size = (requested_size + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
-
     let has_commit = (alloc_type & MEM_COMMIT) != 0;
     let has_reserve = (alloc_type & MEM_RESERVE) != 0;
+    let Some(aligned_size) = align_up(requested_size, PAGE_SIZE) else {
+        return NtStatus::STATUS_INVALID_PARAMETER;
+    };
+    let reservation_size = if has_reserve {
+        let Some(size) = align_up(requested_size, ALLOCATION_GRANULARITY) else {
+            return NtStatus::STATUS_INVALID_PARAMETER;
+        };
+        size
+    } else {
+        aligned_size
+    };
 
     #[cfg(debug_assertions)]
     {
         use litebox::platform::DebugLogProvider as _;
         let msg = alloc::format!(
-            "NT shim: NtAllocateVirtualMemory request: base=0x{requested_base:X} size=0x{aligned_size:X} type=0x{alloc_type:X} prot=0x{protect:X}\n"
+            "NT shim: NtAllocateVirtualMemory request: base=0x{requested_base:X} size=0x{:X} type=0x{alloc_type:X} prot=0x{protect:X}\n",
+            if has_reserve {
+                reservation_size
+            } else {
+                aligned_size
+            },
         );
         litebox_platform_multiplex::platform().debug_log_print(&msg);
     }
@@ -122,28 +141,40 @@ pub(crate) fn nt_allocate_virtual_memory(
             // PM has pages — fall through to PM upgrade path.
         }
 
+        let (Some(addr), Some(size)) = (
+            litebox::mm::linux::NonZeroAddress::<PAGE_SIZE>::new(aligned_base),
+            litebox::mm::linux::NonZeroPageSize::<PAGE_SIZE>::new(aligned_size),
+        ) else {
+            return NtStatus::STATUS_INVALID_PARAMETER;
+        };
+        if pm.get_memory_permissions(addr, size).is_none() {
+            return NtStatus::STATUS_MEMORY_NOT_ALLOCATED;
+        }
+
         // Not inside a VA reservation — upgrade existing PM pages.
         let ptr = raw_mut_ptr(aligned_base);
         let result = match nt_protect_to_page_op(protect) {
-            PageOp::ReadWrite | PageOp::WriteCopy | PageOp::ExecuteReadWrite => unsafe {
+            PageOp::ReadWrite | PageOp::WriteCopy => unsafe {
                 pm.make_pages_writable(ptr, aligned_size)
             },
+            PageOp::ExecuteReadWrite => unsafe { pm.make_pages_rwx(ptr, aligned_size) },
             PageOp::ReadOnly => unsafe { pm.make_pages_readable(ptr, aligned_size) },
             PageOp::Execute | PageOp::ExecuteRead => unsafe {
                 pm.make_pages_executable(ptr, aligned_size)
             },
-            PageOp::NoAccess => Ok(()), // already inaccessible from reserve
+            PageOp::NoAccess => unsafe { pm.make_pages_inaccessible(ptr, aligned_size) },
         };
-        // Ignore errors — pages may already have the right permissions.
-        #[cfg(debug_assertions)]
         if result.is_err() {
-            use litebox::platform::DebugLogProvider as _;
-            let msg = alloc::format!(
-                "NT shim: NtAllocateVirtualMemory MEM_COMMIT make_pages FAILED base=0x{aligned_base:X} size=0x{aligned_size:X}\n"
-            );
-            litebox_platform_multiplex::platform().debug_log_print(&msg);
+            #[cfg(debug_assertions)]
+            {
+                use litebox::platform::DebugLogProvider as _;
+                let msg = alloc::format!(
+                    "NT shim: NtAllocateVirtualMemory MEM_COMMIT make_pages FAILED base=0x{aligned_base:X} size=0x{aligned_size:X}\n"
+                );
+                litebox_platform_multiplex::platform().debug_log_print(&msg);
+            }
+            return NtStatus::STATUS_MEMORY_NOT_ALLOCATED;
         }
-        let _ = result;
         unsafe {
             core::ptr::write(base_addr_ptr as *mut usize, aligned_base);
             core::ptr::write(region_size_ptr as *mut usize, aligned_size);
@@ -159,38 +190,65 @@ pub(crate) fn nt_allocate_virtual_memory(
         return NtStatus::STATUS_SUCCESS;
     }
 
+    if has_reserve {
+        let reserved_base = ps.va_reserve(requested_base, reservation_size);
+        if reserved_base == 0 {
+            #[cfg(debug_assertions)]
+            {
+                use litebox::platform::DebugLogProvider as _;
+                let msg = alloc::format!(
+                    "NT shim: NtAllocateVirtualMemory → STATUS_NO_MEMORY (req_base=0x{requested_base:X}, size=0x{reservation_size:X})\n"
+                );
+                litebox_platform_multiplex::platform().debug_log_print(&msg);
+            }
+            return NtStatus::STATUS_NO_MEMORY;
+        }
+
+        if has_commit {
+            ps.va_commit(reserved_base, aligned_size, protect);
+        }
+
+        unsafe {
+            core::ptr::write(base_addr_ptr as *mut usize, reserved_base);
+            core::ptr::write(
+                region_size_ptr as *mut usize,
+                if has_commit {
+                    aligned_size
+                } else {
+                    reservation_size
+                },
+            );
+        }
+        #[cfg(debug_assertions)]
+        {
+            use litebox::platform::DebugLogProvider as _;
+            let msg = alloc::format!(
+                "NT shim: NtAllocateVirtualMemory → OK{} base=0x{reserved_base:X} size=0x{:X}\n",
+                if has_commit {
+                    " (MEM_RESERVE|MEM_COMMIT)"
+                } else {
+                    " (MEM_RESERVE)"
+                },
+                if has_commit {
+                    aligned_size
+                } else {
+                    reservation_size
+                },
+            );
+            litebox_platform_multiplex::platform().debug_log_print(&msg);
+        }
+        return NtStatus::STATUS_SUCCESS;
+    }
+
     let Some(nz_size) = NonZeroPageSize::new(aligned_size) else {
         return NtStatus::STATUS_INVALID_PARAMETER;
     };
 
-    // MEM_RESERVE only: for small-to-moderate sizes, use PM inaccessible
-    // pages so page faults can be caught by VEH. For huge reservations
-    // (>= 1 GB), use pure VA bookkeeping to avoid consuming host VA.
-    if has_reserve && !has_commit {
-        const VA_ONLY_THRESHOLD: usize = 1024 * 1024 * 1024; // 1 GB
-        if aligned_size >= VA_ONLY_THRESHOLD {
-            let base = ps.va_reserve(requested_base, aligned_size);
-            if base == 0 {
-                return NtStatus(0xC000009A_u32 as i32); // STATUS_INSUFFICIENT_RESOURCES
-            }
-            ps.track_alloc(base, aligned_size);
-            unsafe {
-                core::ptr::write(base_addr_ptr as *mut usize, base);
-                core::ptr::write(region_size_ptr as *mut usize, aligned_size);
-            }
-            #[cfg(debug_assertions)]
-            {
-                use litebox::platform::DebugLogProvider as _;
-                litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
-                    "NT shim: NtAllocateVirtualMemory → OK (VA-only reserve) base=0x{base:X} size=0x{aligned_size:X}\n",
-                ));
-            }
-            return NtStatus::STATUS_SUCCESS;
-        }
-    }
-
+    // When a specific base address is requested, use NOREPLACE to prevent
+    // silently overwriting existing allocations (DLLs, heap segments, etc.).
+    // MEM_COMMIT-only is handled above (upgrade path) and never reaches here.
     let flags = if requested_base != 0 {
-        CreatePagesFlags::FIXED_ADDR
+        CreatePagesFlags::FIXED_ADDR | CreatePagesFlags::NOREPLACE
     } else {
         CreatePagesFlags::empty()
     };
@@ -204,11 +262,12 @@ pub(crate) fn nt_allocate_virtual_memory(
 
     // MEM_RESERVE (small, via PM as inaccessible), MEM_RESERVE|MEM_COMMIT,
     // or MEM_COMMIT fallthrough: allocate via PM.
+    let page_op = nt_protect_to_page_op(protect);
     let result = if has_reserve && !has_commit {
         // Reserve only — inaccessible placeholder pages via PM.
         unsafe { pm.create_inaccessible_pages(suggested, nz_size, flags, |_| Ok(0)) }
     } else {
-        match nt_protect_to_page_op(protect) {
+        match page_op {
             PageOp::ReadWrite | PageOp::WriteCopy | PageOp::ExecuteReadWrite => unsafe {
                 pm.create_writable_pages(suggested, nz_size, flags, |_| Ok(0))
             },
@@ -227,7 +286,13 @@ pub(crate) fn nt_allocate_virtual_memory(
     match result {
         Ok(ptr) => {
             let allocated_addr = ptr.as_usize();
-            ps.track_alloc(allocated_addr, aligned_size);
+            if matches!(page_op, PageOp::ExecuteReadWrite)
+                && unsafe { pm.make_pages_rwx(ptr, aligned_size) }.is_err()
+            {
+                let _ = unsafe { pm.remove_pages(ptr, aligned_size) };
+                return NtStatus::STATUS_INVALID_PAGE_PROTECTION;
+            }
+            ps.track_alloc(allocated_addr, aligned_size, protect);
             unsafe {
                 core::ptr::write(base_addr_ptr as *mut usize, allocated_addr);
                 core::ptr::write(region_size_ptr as *mut usize, aligned_size);
@@ -321,13 +386,22 @@ pub(crate) fn nt_allocate_virtual_memory_ex(
         return NtStatus::STATUS_INVALID_PARAMETER;
     }
 
-    let aligned_size = (requested_size + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
-
     const MEM_COMMIT: u32 = 0x1000;
     const MEM_RESERVE: u32 = 0x2000;
 
     let has_commit = (alloc_type & MEM_COMMIT) != 0;
     let has_reserve = (alloc_type & MEM_RESERVE) != 0;
+    let Some(aligned_size) = align_up(requested_size, PAGE_SIZE) else {
+        return NtStatus::STATUS_INVALID_PARAMETER;
+    };
+    let reservation_size = if has_reserve {
+        let Some(size) = align_up(requested_size, ALLOCATION_GRANULARITY) else {
+            return NtStatus::STATUS_INVALID_PARAMETER;
+        };
+        size
+    } else {
+        aligned_size
+    };
 
     // MEM_COMMIT without MEM_RESERVE: upgrade existing inaccessible pages.
     if has_commit && !has_reserve && requested_base != 0 {
@@ -347,21 +421,84 @@ pub(crate) fn nt_allocate_virtual_memory_ex(
             return NtStatus::STATUS_SUCCESS;
         }
 
+        let (Some(addr), Some(size)) = (
+            litebox::mm::linux::NonZeroAddress::<PAGE_SIZE>::new(aligned_base),
+            litebox::mm::linux::NonZeroPageSize::<PAGE_SIZE>::new(aligned_size),
+        ) else {
+            return NtStatus::STATUS_INVALID_PARAMETER;
+        };
+        if pm.get_memory_permissions(addr, size).is_none() {
+            return NtStatus::STATUS_MEMORY_NOT_ALLOCATED;
+        }
+
         let ptr = raw_mut_ptr(aligned_base);
         let result = match nt_protect_to_page_op(protect) {
-            PageOp::ReadWrite | PageOp::WriteCopy | PageOp::ExecuteReadWrite => unsafe {
+            PageOp::ReadWrite | PageOp::WriteCopy => unsafe {
                 pm.make_pages_writable(ptr, aligned_size)
             },
+            PageOp::ExecuteReadWrite => unsafe { pm.make_pages_rwx(ptr, aligned_size) },
             PageOp::ReadOnly => unsafe { pm.make_pages_readable(ptr, aligned_size) },
             PageOp::Execute | PageOp::ExecuteRead => unsafe {
                 pm.make_pages_executable(ptr, aligned_size)
             },
-            PageOp::NoAccess => Ok(()),
+            PageOp::NoAccess => unsafe { pm.make_pages_inaccessible(ptr, aligned_size) },
         };
-        let _ = result;
+        if result.is_err() {
+            return NtStatus::STATUS_MEMORY_NOT_ALLOCATED;
+        }
         unsafe {
             core::ptr::write(base_addr_ptr as *mut usize, aligned_base);
             core::ptr::write(region_size_ptr as *mut usize, aligned_size);
+        }
+        return NtStatus::STATUS_SUCCESS;
+    }
+
+    if has_reserve {
+        let reserved_base = ps.va_reserve(requested_base, reservation_size);
+        if reserved_base == 0 {
+            #[cfg(debug_assertions)]
+            {
+                use litebox::platform::DebugLogProvider as _;
+                let msg = alloc::format!(
+                    "NT shim: NtAllocateVirtualMemoryEx → STATUS_NO_MEMORY (base=0x{requested_base:X}, size=0x{reservation_size:X})\n"
+                );
+                litebox_platform_multiplex::platform().debug_log_print(&msg);
+            }
+            return NtStatus::STATUS_NO_MEMORY;
+        }
+
+        if has_commit {
+            ps.va_commit(reserved_base, aligned_size, protect);
+        }
+
+        unsafe {
+            core::ptr::write(base_addr_ptr as *mut usize, reserved_base);
+            core::ptr::write(
+                region_size_ptr as *mut usize,
+                if has_commit {
+                    aligned_size
+                } else {
+                    reservation_size
+                },
+            );
+        }
+        #[cfg(debug_assertions)]
+        {
+            use litebox::platform::DebugLogProvider as _;
+            let msg = alloc::format!(
+                "NT shim: NtAllocateVirtualMemoryEx → OK{} base=0x{reserved_base:X} size=0x{:X}\n",
+                if has_commit {
+                    " (MEM_RESERVE|MEM_COMMIT)"
+                } else {
+                    " (MEM_RESERVE)"
+                },
+                if has_commit {
+                    aligned_size
+                } else {
+                    reservation_size
+                },
+            );
+            litebox_platform_multiplex::platform().debug_log_print(&msg);
         }
         return NtStatus::STATUS_SUCCESS;
     }
@@ -371,7 +508,7 @@ pub(crate) fn nt_allocate_virtual_memory_ex(
     };
 
     let flags = if requested_base != 0 {
-        CreatePagesFlags::FIXED_ADDR
+        CreatePagesFlags::FIXED_ADDR | CreatePagesFlags::NOREPLACE
     } else {
         CreatePagesFlags::empty()
     };
@@ -383,65 +520,32 @@ pub(crate) fn nt_allocate_virtual_memory_ex(
         None
     };
 
-    let result = if has_reserve && !has_commit {
-        // Reserve only.  For very large reservations (≥ 1 GB, e.g. the
-        // segment heap's 192 GB cage) use VA-only bookkeeping to avoid
-        // consuming host commit charge.  Mirrors the same logic in
-        // NtAllocateVirtualMemory.
-
-        const VA_ONLY_THRESHOLD: usize = 1024 * 1024 * 1024; // 1 GB
-        if aligned_size >= VA_ONLY_THRESHOLD {
-            let aligned_base = requested_base & !(PAGE_SIZE - 1);
-            let base = ps.va_reserve(aligned_base, aligned_size);
-            if base != 0 {
-                ps.track_alloc(base, aligned_size);
-                unsafe {
-                    core::ptr::write(base_addr_ptr as *mut usize, base);
-                    core::ptr::write(region_size_ptr as *mut usize, aligned_size);
-                }
-                #[cfg(debug_assertions)]
-                {
-                    use litebox::platform::DebugLogProvider as _;
-                    let msg = alloc::format!(
-                        "NT shim: NtAllocateVirtualMemoryEx → OK (VA-only reserve) base=0x{base:X} size=0x{aligned_size:X}\n"
-                    );
-                    litebox_platform_multiplex::platform().debug_log_print(&msg);
-                }
-                return NtStatus::STATUS_SUCCESS;
-            }
-            #[cfg(debug_assertions)]
-            {
-                use litebox::platform::DebugLogProvider as _;
-                let msg = alloc::format!(
-                    "NT shim: NtAllocateVirtualMemoryEx → STATUS_NO_MEMORY (VA-only, base=0x{aligned_base:X}, size=0x{aligned_size:X})\n"
-                );
-                litebox_platform_multiplex::platform().debug_log_print(&msg);
-            }
-            return NtStatus::STATUS_NO_MEMORY;
-        }
-        // Small reserve — inaccessible placeholder pages via PM.
-        unsafe { pm.create_inaccessible_pages(suggested, nz_size, flags, |_| Ok(0)) }
-    } else {
-        match nt_protect_to_page_op(protect) {
-            PageOp::ReadWrite | PageOp::WriteCopy | PageOp::ExecuteReadWrite => unsafe {
-                pm.create_writable_pages(suggested, nz_size, flags, |_| Ok(0))
-            },
-            PageOp::ReadOnly => unsafe {
-                pm.create_readable_pages(suggested, nz_size, flags, |_| Ok(0))
-            },
-            PageOp::Execute | PageOp::ExecuteRead => unsafe {
-                pm.create_executable_pages(suggested, nz_size, flags, |_| Ok(0))
-            },
-            PageOp::NoAccess => unsafe {
-                pm.create_inaccessible_pages(suggested, nz_size, flags, |_| Ok(0))
-            },
-        }
+    let page_op = nt_protect_to_page_op(protect);
+    let result = match page_op {
+        PageOp::ReadWrite | PageOp::WriteCopy | PageOp::ExecuteReadWrite => unsafe {
+            pm.create_writable_pages(suggested, nz_size, flags, |_| Ok(0))
+        },
+        PageOp::ReadOnly => unsafe {
+            pm.create_readable_pages(suggested, nz_size, flags, |_| Ok(0))
+        },
+        PageOp::Execute | PageOp::ExecuteRead => unsafe {
+            pm.create_executable_pages(suggested, nz_size, flags, |_| Ok(0))
+        },
+        PageOp::NoAccess => unsafe {
+            pm.create_inaccessible_pages(suggested, nz_size, flags, |_| Ok(0))
+        },
     };
 
     match result {
         Ok(ptr) => {
             let allocated_addr = ptr.as_usize();
-            ps.track_alloc(allocated_addr, aligned_size);
+            if matches!(page_op, PageOp::ExecuteReadWrite)
+                && unsafe { pm.make_pages_rwx(ptr, aligned_size) }.is_err()
+            {
+                let _ = unsafe { pm.remove_pages(ptr, aligned_size) };
+                return NtStatus::STATUS_INVALID_PAGE_PROTECTION;
+            }
+            ps.track_alloc(allocated_addr, aligned_size, protect);
             unsafe {
                 core::ptr::write(base_addr_ptr as *mut usize, allocated_addr);
                 core::ptr::write(region_size_ptr as *mut usize, aligned_size);
@@ -519,61 +623,98 @@ pub(crate) fn nt_free_virtual_memory(
 
         // Check if this is a VA-only reservation.
         if let Some((res_base, res_size)) = ps.va_reservation_at(base) {
-            // If PM has actual pages at this address (e.g. a PM allocation
-            // that the host placed inside a VA-only reservation range), fall
-            // through to the PM release path instead of treating it as a VA
-            // reservation operation.
-            let pm_has_pages = ps
-                .pm
-                .mappings()
-                .iter()
-                .any(|(range, _)| range.start < base + PAGE_SIZE && base < range.end);
-            if !pm_has_pages {
-                // Pure VA reservation release.
-                // MEM_RELEASE must pass the original allocation base and size==0.
-                if base != res_base || size != 0 {
+            let (release_base, release_size) = if size == 0 {
+                // Whole-release still requires the original reservation base.
+                if base != res_base {
                     return NtStatus::STATUS_INVALID_PARAMETER;
                 }
-                // Remove any demand-faulted PM pages within the reservation.
-                let res_end = res_base.saturating_add(res_size);
-                let all_mappings = ps.pm.mappings();
-                for (range, _) in &all_mappings {
-                    if range.start >= res_end || range.end <= res_base {
-                        continue;
-                    }
-                    let unmap_start = range.start.max(res_base);
-                    let unmap_end = range.end.min(res_end);
-                    let unmap_size = unmap_end - unmap_start;
-                    if unmap_size > 0 {
-                        let ptr = raw_mut_ptr(unmap_start);
-                        let _ = unsafe { pm.remove_pages(ptr, unmap_size) };
-                    }
-                }
-                let released_size = ps.va_unreserve(res_base).unwrap_or(0);
-                let _ = ps.untrack_alloc(res_base);
-                unsafe {
-                    core::ptr::write(base_addr_ptr as *mut usize, res_base);
-                    core::ptr::write(region_size_ptr as *mut usize, released_size);
-                }
-                #[cfg(debug_assertions)]
+                (res_base, res_size)
+            } else {
+                // Windows accepts partial MEM_RELEASE inside a reservation and
+                // rounds the request to page boundaries instead of insisting on
+                // whole-reservation release.
+                let release_base = base & !(PAGE_SIZE - 1);
+                let Some(release_end) = base
+                    .checked_add(size)
+                    .and_then(|end| align_up(end, PAGE_SIZE))
+                else {
+                    return NtStatus::STATUS_INVALID_PARAMETER;
+                };
+                let release_size = release_end.saturating_sub(release_base);
+                if release_size == 0
+                    || ps
+                        .va_reservation_contains_range(release_base, release_size)
+                        .is_none()
                 {
-                    use litebox::platform::DebugLogProvider as _;
-                    litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
-                        "NT shim: NtFreeVirtualMemory MEM_RELEASE (VA reservation) base=0x{res_base:X} size=0x{released_size:X}\n",
-                    ));
+                    return NtStatus::STATUS_INVALID_PARAMETER;
                 }
-                return NtStatus::STATUS_SUCCESS;
+                (release_base, release_size)
+            };
+
+            // Remove any demand-faulted PM pages within the released sub-range.
+            let release_end = release_base.saturating_add(release_size);
+            let all_mappings = ps.pm.mappings();
+            for (range, _) in &all_mappings {
+                if range.start >= release_end || range.end <= release_base {
+                    continue;
+                }
+                let unmap_start = range.start.max(release_base);
+                let unmap_end = range.end.min(release_end);
+                let unmap_size = unmap_end - unmap_start;
+                if unmap_size > 0 {
+                    let ptr = raw_mut_ptr(unmap_start);
+                    let _ = unsafe { pm.remove_pages(ptr, unmap_size) };
+                }
             }
-            // PM has pages here — fall through to PM release path.
+
+            let released_size = if size == 0 {
+                ps.va_unreserve(res_base).unwrap_or(0)
+            } else {
+                ps.va_release_range(release_base, release_size).unwrap_or(0)
+            };
+            if released_size == 0 {
+                return NtStatus::STATUS_INVALID_PARAMETER;
+            }
+            unsafe {
+                core::ptr::write(base_addr_ptr as *mut usize, release_base);
+                core::ptr::write(region_size_ptr as *mut usize, released_size);
+            }
+            #[cfg(debug_assertions)]
+            {
+                use litebox::platform::DebugLogProvider as _;
+                litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+                    "NT shim: NtFreeVirtualMemory MEM_RELEASE (VA reservation) base=0x{release_base:X} size=0x{released_size:X}\n",
+                ));
+            }
+            return NtStatus::STATUS_SUCCESS;
         }
 
-        let release_size = if size == 0 {
-            match ps.untrack_alloc(base) {
-                Some(tracked) => tracked,
-                None => PAGE_SIZE,
+        let (release_size, tracked_release) = if size == 0 {
+            match ps.tracked_alloc_at(base) {
+                Some((alloc_base, alloc_size, _)) if alloc_base == base => {
+                    (alloc_size, Some((base, alloc_size)))
+                }
+                Some(_) => return NtStatus::STATUS_INVALID_PARAMETER,
+                None => return NtStatus::STATUS_MEMORY_NOT_ALLOCATED,
             }
         } else {
-            (size + PAGE_SIZE - 1) & !(PAGE_SIZE - 1)
+            let aligned_release_size = (size + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+            let tracked_release = match ps.tracked_alloc_at(base) {
+                Some((alloc_base, alloc_size, _)) => {
+                    let Some(release_end) = base.checked_add(aligned_release_size) else {
+                        return NtStatus::STATUS_INVALID_PARAMETER;
+                    };
+                    let Some(alloc_end) = alloc_base.checked_add(alloc_size) else {
+                        return NtStatus::STATUS_INVALID_PARAMETER;
+                    };
+                    if release_end > alloc_end {
+                        return NtStatus::STATUS_INVALID_PARAMETER;
+                    }
+                    Some((base, aligned_release_size))
+                }
+                None => None,
+            };
+            (aligned_release_size, tracked_release)
         };
 
         let ptr = raw_mut_ptr(base);
@@ -607,7 +748,16 @@ pub(crate) fn nt_free_virtual_memory(
             }
         }
         match result {
-            Ok(()) => NtStatus::STATUS_SUCCESS,
+            Ok(()) => {
+                if let Some((release_base, release_size)) = tracked_release {
+                    let _ = ps.release_tracked_alloc_range(release_base, release_size);
+                }
+                unsafe {
+                    core::ptr::write(base_addr_ptr as *mut usize, base);
+                    core::ptr::write(region_size_ptr as *mut usize, release_size);
+                }
+                NtStatus::STATUS_SUCCESS
+            }
             Err(_) => NtStatus::STATUS_MEMORY_NOT_ALLOCATED,
         }
     } else if free_type & mem_alloc_type::MEM_DECOMMIT != 0 {
@@ -661,7 +811,19 @@ pub(crate) fn nt_free_virtual_memory(
             // PM has pages — fall through to PM decommit path.
         }
 
+        // Decommit discards anonymous page contents. Reset the range under the
+        // page manager's write lock before making it inaccessible so a later
+        // MEM_COMMIT cannot observe stale bytes from the prior incarnation.
         let ptr = raw_mut_ptr(base);
+        match unsafe { pm.reset_pages(ptr, decommit_size, true) } {
+            Ok(()) | Err(litebox::mm::linux::VmemResetError::AlreadyUnallocated) => {}
+            Err(litebox::mm::linux::VmemResetError::FileBacked) => {
+                return NtStatus::STATUS_UNABLE_TO_FREE_VM;
+            }
+            Err(litebox::mm::linux::VmemResetError::UnAligned) => {
+                return NtStatus::STATUS_INVALID_PARAMETER;
+            }
+        }
         let result = unsafe { pm.make_pages_inaccessible(ptr, decommit_size) };
         #[cfg(debug_assertions)]
         {
@@ -987,6 +1149,7 @@ pub(crate) fn nt_query_virtual_memory(
     let mappings = pm.mappings();
     let mut state = mem_state::MEM_FREE;
     let mut protect = 0u32;
+    let mut allocation_protect = 0u32;
     let mut alloc_base = aligned_addr;
     let mut region_size = PAGE_SIZE;
 
@@ -1005,6 +1168,16 @@ pub(crate) fn nt_query_virtual_memory(
             }
             alloc_base = range.start;
             region_size = range.end - aligned_addr;
+            if let Some((tracked_base, tracked_size, tracked_protect)) =
+                ps.tracked_alloc_at(aligned_addr)
+            {
+                let tracked_end = tracked_base.saturating_add(tracked_size);
+                alloc_base = tracked_base;
+                allocation_protect = tracked_protect;
+                region_size = region_size.min(tracked_end.saturating_sub(aligned_addr));
+            } else {
+                allocation_protect = protect;
+            }
             found = true;
             break;
         }
@@ -1016,6 +1189,7 @@ pub(crate) fn nt_query_virtual_memory(
             if aligned_addr >= m.base_address && aligned_addr < m.base_address + m.image_size {
                 state = mem_state::MEM_COMMIT;
                 protect = mem_protect::PAGE_READONLY;
+                allocation_protect = mem_protect::PAGE_READONLY;
                 alloc_base = m.base_address;
                 region_size = m.base_address + m.image_size - aligned_addr;
                 found = true;
@@ -1036,6 +1210,7 @@ pub(crate) fn nt_query_virtual_memory(
                 state = mem_state::MEM_RESERVE;
                 protect = 0; // reserved but not committed → no page protection
             }
+            allocation_protect = protect;
             alloc_base = res_base;
             // Region size extends to the next state/protection boundary,
             // not the entire reservation.
@@ -1049,6 +1224,7 @@ pub(crate) fn nt_query_virtual_memory(
     if !found {
         state = mem_state::MEM_FREE;
         protect = 0;
+        allocation_protect = 0;
         alloc_base = aligned_addr;
         region_size = 0x10000; // default gap size
         for (range, _) in &mappings {
@@ -1062,7 +1238,7 @@ pub(crate) fn nt_query_virtual_memory(
     // Determine the memory type. Image-mapped DLLs report MEM_IMAGE;
     // regular allocations report MEM_PRIVATE. For image regions, also
     // correct the allocation base to the image base.
-    let mem_type = if state == mem_state::MEM_COMMIT {
+    let mem_type = if state != mem_state::MEM_FREE {
         // Check SEC_IMAGE mappings (dynamically loaded via NtMapViewOfSection).
         let img_mappings = ps.image_mappings.lock();
         let dyn_img = img_mappings
@@ -1105,7 +1281,7 @@ pub(crate) fn nt_query_virtual_memory(
     let mbi = MemoryBasicInformation {
         base_address: aligned_addr as u64,
         allocation_base: alloc_base as u64,
-        allocation_protect: protect,
+        allocation_protect: allocation_protect,
         _pad0: 0,
         region_size: region_size as u64,
         state,

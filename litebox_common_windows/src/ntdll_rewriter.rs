@@ -111,32 +111,26 @@ pub fn rewrite_ntdll(
     let mut image = ntdll_data.to_vec();
 
     // Build the trampoline page.
-    // Layout:
-    //   +0x00: 8-byte pointer slot (shim entry address, filled by runner)
-    //   +0x08: trampoline code:
-    //          push rax                    ; 1 byte  (50)
-    //          mov rax, [rip - 0x0F]       ; 7 bytes (48 8B 05 F1 FF FF FF)
-    //                                      ; rip at end of this insn = +0x10
-    //                                      ; slot at +0x00, so disp = 0x00 - 0x10 = -16 = 0xFFFFFFF0
-    //          xchg rax, [rsp]             ; 4 bytes (48 87 04 24)
-    //          ret                         ; 1 byte  (C3)
-    //
-    // This sequence:
-    //   1. Saves caller's return address (pushed by JMP→CALL conversion? No—
-    //      we use JMP, so the original caller's ret addr is already on stack)
-    //   Wait, JMP doesn't push a return address. The original ntdll stub was
-    //   called by the application (e.g., kernel32 calls NtCreateFile), so the
-    //   return address to the caller is already on the stack. Our JMP just
-    //   redirects to the trampoline, and the trampoline needs to eventually
-    //   JMP to the shim entry with the original return address still on stack.
-    //
-    // The trampoline bridges JMP-based entry (from rewritten ntdll stubs) to
-    // the platform's syscall_callback, which expects the `syscall` instruction
-    // ABI: RCX = return address, R11 = scratch (RFLAGS).
     //
     // When guest code CALLs an ntdll function, the return address is pushed.
-    // The stub does `mov r10,rcx` (save arg1) then JMPs here with the return
-    // address still on the stack.
+    // The ntdll stub does `mov r10, rcx; mov eax, NR; ...` then JMPs here.
+    // The return address stays on the stack throughout the trampoline.
+    //
+    // The trampoline:
+    //   1. Scans the GS table to swap GS from guest TEB to host TEB
+    //      (needed because syscall_callback reads TLS via GS).
+    //   2. Loads RCX with the address of a `ret` instruction at the end.
+    //   3. JMPs to the platform's syscall_callback.
+    //
+    // When the shim finishes, the guest resumes at the `ret` instruction,
+    // which pops the caller's actual return address from the stack.
+    //
+    // This matches the PE-builder stub convention: the return address is
+    // on the stack, so the shim sees the standard x64 callee stack layout:
+    //   [rsp+0x00] = return address
+    //   [rsp+0x08] = shadow rcx
+    //   ...
+    //   [rsp+0x28] = 5th arg, etc.
     //
     // The trampoline must swap GS from guest TEB to host TEB before entering
     // the syscall callback, because `syscall_callback` reads TLS via
@@ -169,17 +163,22 @@ pub fn rewrite_ntdll(
 
     let mut off = code_offset;
 
-    // pop rcx  (59) — return addr → RCX
-    trampoline[off] = 0x59;
-    off += 1;
+    // The caller's `call NtFoo` pushed a return address.  The ntdll stub
+    // does `mov r10, rcx; mov eax, NR; ... jmp trampoline`.  The return
+    // address stays on the stack throughout — we leave it there so that
+    // ctx.regs.rsp seen by the shim includes the return address, matching
+    // the standard Windows x64 callee view:
+    //   [rsp+0x00] = return address
+    //   [rsp+0x08] = shadow rcx  ...  [rsp+0x28] = 5th stack arg, etc.
+    //
+    // At the end we load RCX with the address of a `ret` instruction
+    // that follows the JMP.  The platform pushes RCX as pt_regs->ip.
+    // When the guest resumes there, the `ret` pops the real return
+    // address and control returns to the original caller.
 
     // rdgsbase r11  (F3 49 0F AE CB) — current GS → R11
     trampoline[off..off + 5].copy_from_slice(&[0xF3, 0x49, 0x0F, 0xAE, 0xCB]);
     off += 5;
-
-    // push rcx  (51) — save return addr
-    trampoline[off] = 0x51;
-    off += 1;
 
     // === Phase 1: scan forward table (guest_gs → host_gs) ===
     //
@@ -270,9 +269,9 @@ pub fn rewrite_ntdll(
     let already_host_off = off;
     trampoline[je_already_host_off + 1] = (already_host_off - (je_already_host_off + 2)) as u8;
 
-    // pop rcx  (59) — restore return addr
-    trampoline[off] = 0x59;
-    off += 1;
+    // lea rcx, [rip+6]  (48 8D 0D 06 00 00 00) — rcx = addr of `ret` below
+    trampoline[off..off + 7].copy_from_slice(&[0x48, 0x8D, 0x0D, 0x06, 0x00, 0x00, 0x00]);
+    off += 7;
 
     // jmp [rip+disp32]  (FF 25 xx xx xx xx) — jump to shim entry
     let rip_after_jmp = (off + 6) as i32;
@@ -280,6 +279,10 @@ pub fn rewrite_ntdll(
     trampoline[off] = 0xFF;
     trampoline[off + 1] = 0x25;
     trampoline[off + 2..off + 6].copy_from_slice(&jmp_disp.to_le_bytes());
+    off += 6;
+
+    // ret  (C3) — resume point: pops the caller's actual return address
+    trampoline[off] = 0xC3;
 
     // Now scan the image for syscall stubs and rewrite them.
 

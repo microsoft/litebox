@@ -24,5 +24,8 @@ windows-sys = { version = "0.60.2", features = [
 ] }
 zerocopy = { version = "0.8", default-features = false }
 
+[features]
+trace_debug = []
+
 [lints]
 workspace = true

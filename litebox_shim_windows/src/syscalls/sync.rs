@@ -13,13 +13,19 @@
 //! held while a thread spins on a poll loop.
 
 use alloc::sync::Arc;
+use alloc::vec::Vec;
+use core::cell::{Cell, RefCell};
 use core::time::Duration;
 
 use litebox::event::wait::WaitContext;
+use litebox::mm::PageManager;
+use litebox::mm::linux::{NonZeroAddress, NonZeroPageSize};
+use litebox::platform::page_mgmt::MemoryRegionPermissions;
 use litebox_platform_multiplex::Platform;
 
 use crate::handle_table::{
-    EventObject, HandleTable, KeyedEventObject, NtObject, SemaphoreObject, ThreadObject,
+    EventObject, HandleTable, IoCompletionEntry, IoCompletionObject, KeyedEventObject,
+    MutantObject, NtObject, SemaphoreObject, ThreadObject,
 };
 use litebox_common_windows::ntstatus::NtStatus;
 
@@ -69,10 +75,286 @@ pub(crate) fn lookup_keyed_event(
     }
 }
 
+/// Create an I/O completion port and return its handle.
+pub(crate) fn nt_create_io_completion(
+    ctx: &mut super::super::ExecutionContext,
+    handles: &mut HandleTable,
+) -> NtStatus {
+    let args = NtSyscallArgs::from_ctx(ctx);
+    let handle_out_va = args.arg0;
+    let handle = handles.insert(NtObject::IoCompletion(Arc::new(IoCompletionObject::new())));
+    if handle_out_va != 0 {
+        unsafe {
+            core::ptr::write(handle_out_va as *mut usize, handle as usize);
+        }
+    }
+    NtStatus::STATUS_SUCCESS
+}
+
+/// Look up an I/O completion port by handle.
+pub(crate) fn lookup_io_completion(
+    handles: &HandleTable,
+    handle: u32,
+) -> Option<Arc<IoCompletionObject>> {
+    match handles.get(handle) {
+        Some(NtObject::IoCompletion(port)) => Some(Arc::clone(port)),
+        _ => None,
+    }
+}
+
+/// Queue a completion packet via NtSetIoCompletion.
+pub(crate) fn nt_set_io_completion(
+    ctx: &mut super::super::ExecutionContext,
+    handles: &HandleTable,
+) -> NtStatus {
+    let args = NtSyscallArgs::from_ctx(ctx);
+    let Some(port) = lookup_io_completion(handles, args.arg0 as u32) else {
+        return NtStatus::STATUS_INVALID_HANDLE;
+    };
+    let io_status = NtStatus::from_raw(args.arg3 as u32);
+    let information = unsafe { NtSyscallArgs::arg4(ctx) };
+    port.push(IoCompletionEntry {
+        key_context: args.arg1,
+        apc_context: args.arg2,
+        status: io_status,
+        information,
+    });
+    NtStatus::STATUS_SUCCESS
+}
+
+/// Queue a completion packet via NtSetIoCompletionEx.
+pub(crate) fn nt_set_io_completion_ex(
+    ctx: &mut super::super::ExecutionContext,
+    handles: &HandleTable,
+) -> NtStatus {
+    let args = NtSyscallArgs::from_ctx(ctx);
+    let Some(port) = lookup_io_completion(handles, args.arg0 as u32) else {
+        return NtStatus::STATUS_INVALID_HANDLE;
+    };
+    let io_status = unsafe { NtStatus::from_raw(NtSyscallArgs::arg4(ctx) as u32) };
+    let information = unsafe { NtSyscallArgs::arg5(ctx) };
+    port.push(IoCompletionEntry {
+        key_context: args.arg2,
+        apc_context: args.arg3,
+        status: io_status,
+        information,
+    });
+    NtStatus::STATUS_SUCCESS
+}
+
+fn wait_for_io_completion_packets(
+    port: &Arc<IoCompletionObject>,
+    count: usize,
+    timeout: Option<Duration>,
+    wait_cx: &WaitContext<'_, Platform>,
+) -> Result<Vec<IoCompletionEntry>, NtStatus> {
+    let drained = RefCell::new(None::<Vec<IoCompletionEntry>>);
+    port.waiters.lock().push(wait_cx.waker().clone());
+
+    let cx = wait_cx.with_timeout(timeout);
+    let result = cx.wait_until(|| {
+        let mut queue = port.queue.lock();
+        if queue.is_empty() {
+            return false;
+        }
+
+        let mut entries = Vec::with_capacity(core::cmp::min(count, queue.len()));
+        for _ in 0..count {
+            let Some(entry) = queue.pop_front() else {
+                break;
+            };
+            entries.push(entry);
+        }
+        *drained.borrow_mut() = Some(entries);
+        true
+    });
+
+    port.waiters.lock().retain(|w| !w.ptr_eq(wait_cx.waker()));
+
+    match result {
+        Ok(()) => Ok(drained.into_inner().unwrap_or_default()),
+        Err(_) => Err(NtStatus::STATUS_TIMEOUT),
+    }
+}
+
+#[repr(C)]
+struct RawIoStatusBlock {
+    status_or_pointer: usize,
+    information: usize,
+}
+
+#[repr(C)]
+struct RawFileIoCompletionInformation {
+    key_context: usize,
+    apc_context: usize,
+    io_status_block: RawIoStatusBlock,
+}
+
+fn write_io_status_block(ptr: usize, entry: IoCompletionEntry) {
+    unsafe {
+        core::ptr::write(
+            ptr as *mut RawIoStatusBlock,
+            RawIoStatusBlock {
+                status_or_pointer: entry.status.raw() as usize,
+                information: entry.information,
+            },
+        );
+    }
+}
+
+fn write_file_io_completion_information(ptr: usize, entry: IoCompletionEntry) {
+    unsafe {
+        core::ptr::write(
+            ptr as *mut RawFileIoCompletionInformation,
+            RawFileIoCompletionInformation {
+                key_context: entry.key_context,
+                apc_context: entry.apc_context,
+                io_status_block: RawIoStatusBlock {
+                    status_or_pointer: entry.status.raw() as usize,
+                    information: entry.information,
+                },
+            },
+        );
+    }
+}
+
+fn validate_writable_output_buffer(
+    pm: &PageManager<Platform, { crate::PAGE_SIZE }>,
+    ptr: usize,
+    len: usize,
+) -> bool {
+    if ptr == 0 || len == 0 {
+        return false;
+    }
+    let Some(end) = ptr.checked_add(len) else {
+        return false;
+    };
+    let aligned_base = ptr & !(crate::PAGE_SIZE - 1);
+    let aligned_size = (end - aligned_base + crate::PAGE_SIZE - 1) & !(crate::PAGE_SIZE - 1);
+    let (Some(addr), Some(size)) = (
+        NonZeroAddress::<{ crate::PAGE_SIZE }>::new(aligned_base),
+        NonZeroPageSize::<{ crate::PAGE_SIZE }>::new(aligned_size),
+    ) else {
+        return false;
+    };
+    pm.get_memory_permissions(addr, size)
+        .is_some_and(|perms| perms.contains(MemoryRegionPermissions::WRITE))
+}
+
+/// Remove one completion packet via NtRemoveIoCompletion.
+pub(crate) fn nt_remove_io_completion(
+    ctx: &mut super::super::ExecutionContext,
+    port: &Arc<IoCompletionObject>,
+    pm: &PageManager<Platform, { crate::PAGE_SIZE }>,
+    wait_cx: &WaitContext<'_, Platform>,
+) -> NtStatus {
+    let args = NtSyscallArgs::from_ctx(ctx);
+    if args.arg1 != 0
+        && !validate_writable_output_buffer(pm, args.arg1, core::mem::size_of::<usize>())
+    {
+        return NtStatus::STATUS_ACCESS_VIOLATION;
+    }
+    if args.arg2 != 0
+        && !validate_writable_output_buffer(pm, args.arg2, core::mem::size_of::<usize>())
+    {
+        return NtStatus::STATUS_ACCESS_VIOLATION;
+    }
+    if args.arg3 != 0
+        && !validate_writable_output_buffer(pm, args.arg3, core::mem::size_of::<RawIoStatusBlock>())
+    {
+        return NtStatus::STATUS_ACCESS_VIOLATION;
+    }
+
+    let timeout = unsafe { read_timeout(NtSyscallArgs::arg4(ctx)) };
+    let Ok(mut entries) = wait_for_io_completion_packets(port, 1, timeout, wait_cx) else {
+        return NtStatus::STATUS_TIMEOUT;
+    };
+    let Some(entry) = entries.pop() else {
+        return NtStatus::STATUS_TIMEOUT;
+    };
+
+    if args.arg1 != 0 {
+        unsafe {
+            core::ptr::write(args.arg1 as *mut usize, entry.key_context);
+        }
+    }
+    if args.arg2 != 0 {
+        unsafe {
+            core::ptr::write(args.arg2 as *mut usize, entry.apc_context);
+        }
+    }
+    if args.arg3 != 0 {
+        write_io_status_block(args.arg3, entry);
+    }
+    NtStatus::STATUS_SUCCESS
+}
+
+/// Remove up to `Count` completion packets via NtRemoveIoCompletionEx.
+pub(crate) fn nt_remove_io_completion_ex(
+    ctx: &mut super::super::ExecutionContext,
+    port: &Arc<IoCompletionObject>,
+    pm: &PageManager<Platform, { crate::PAGE_SIZE }>,
+    wait_cx: &WaitContext<'_, Platform>,
+) -> NtStatus {
+    let args = NtSyscallArgs::from_ctx(ctx);
+    let count = args.arg2;
+    let removed_count_writable = args.arg3 == 0
+        || validate_writable_output_buffer(pm, args.arg3, core::mem::size_of::<u32>());
+    if count == 0 {
+        if !removed_count_writable {
+            return NtStatus::STATUS_ACCESS_VIOLATION;
+        }
+        if args.arg3 != 0 {
+            unsafe {
+                core::ptr::write(args.arg3 as *mut u32, 0);
+            }
+        }
+        return NtStatus::STATUS_INVALID_PARAMETER;
+    }
+
+    let entry_size = core::mem::size_of::<RawFileIoCompletionInformation>();
+    let Some(output_len) = count.checked_mul(entry_size) else {
+        return NtStatus::STATUS_INVALID_PARAMETER;
+    };
+    if !validate_writable_output_buffer(pm, args.arg1, output_len) {
+        return NtStatus::STATUS_ACCESS_VIOLATION;
+    }
+    if !removed_count_writable {
+        return NtStatus::STATUS_ACCESS_VIOLATION;
+    }
+
+    let timeout = unsafe { read_timeout(NtSyscallArgs::arg4(ctx)) };
+    let Ok(entries) = wait_for_io_completion_packets(port, count, timeout, wait_cx) else {
+        if args.arg3 != 0 {
+            unsafe {
+                core::ptr::write(args.arg3 as *mut u32, 0);
+            }
+        }
+        return NtStatus::STATUS_TIMEOUT;
+    };
+
+    for (index, entry) in entries.iter().copied().enumerate() {
+        let Some(slot_offset) = index.checked_mul(entry_size) else {
+            return NtStatus::STATUS_INVALID_PARAMETER;
+        };
+        let Some(slot_ptr) = args.arg1.checked_add(slot_offset) else {
+            return NtStatus::STATUS_ACCESS_VIOLATION;
+        };
+        write_file_io_completion_information(slot_ptr, entry);
+    }
+    if args.arg3 != 0 {
+        unsafe {
+            core::ptr::write(args.arg3 as *mut u32, entries.len() as u32);
+        }
+    }
+    NtStatus::STATUS_SUCCESS
+}
+
 /// A waitable object (event, semaphore, or thread) extracted from the handle table.
 pub(crate) enum Waitable {
     Event(Arc<EventObject>),
     Semaphore(Arc<SemaphoreObject>),
+    Mutant(Arc<MutantObject>),
     Thread(Arc<ThreadObject>),
 }
 
@@ -81,6 +363,7 @@ pub(crate) fn lookup_waitable(handles: &HandleTable, handle: u32) -> Option<Wait
     match handles.get(handle) {
         Some(NtObject::Event(e)) => Some(Waitable::Event(Arc::clone(e))),
         Some(NtObject::Semaphore(s)) => Some(Waitable::Semaphore(Arc::clone(s))),
+        Some(NtObject::Mutant(m)) => Some(Waitable::Mutant(Arc::clone(m))),
         Some(NtObject::Thread(t)) => Some(Waitable::Thread(Arc::clone(t))),
         _ => None,
     }
@@ -91,6 +374,7 @@ fn waitable_addr(w: &Waitable) -> usize {
     match w {
         Waitable::Event(e) => Arc::as_ptr(e) as usize,
         Waitable::Semaphore(s) => Arc::as_ptr(s) as usize,
+        Waitable::Mutant(m) => Arc::as_ptr(m) as usize,
         Waitable::Thread(t) => Arc::as_ptr(t) as usize,
     }
 }
@@ -102,6 +386,7 @@ fn register_waker(w: &Waitable, waker: &litebox::event::wait::Waker<Platform>) {
     match w {
         Waitable::Event(e) => e.waiters.lock().push(waker.clone()),
         Waitable::Semaphore(s) => s.waiters.lock().push(waker.clone()),
+        Waitable::Mutant(m) => m.waiters.lock().push(waker.clone()),
         Waitable::Thread(t) => t.waiters.lock().push(waker.clone()),
     }
 }
@@ -111,6 +396,7 @@ fn unregister_waker(w: &Waitable, waker: &litebox::event::wait::Waker<Platform>)
     match w {
         Waitable::Event(e) => e.waiters.lock().retain(|w| !w.ptr_eq(waker)),
         Waitable::Semaphore(s) => s.waiters.lock().retain(|w| !w.ptr_eq(waker)),
+        Waitable::Mutant(m) => m.waiters.lock().retain(|w| !w.ptr_eq(waker)),
         Waitable::Thread(t) => t.waiters.lock().retain(|w| !w.ptr_eq(waker)),
     }
 }
@@ -299,6 +585,14 @@ pub(crate) fn nt_create_event(
     let obj = NtObject::Event(Arc::new(EventObject::new(manual_reset, initial_state)));
     let handle = handles.insert(obj);
 
+    #[cfg(debug_assertions)]
+    {
+        use litebox::platform::DebugLogProvider as _;
+        litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+            "NT shim: NtCreateEvent(handle=0x{handle:X}, event_type={event_type}, manual_reset={manual_reset}, initial_state={initial_state}) -> STATUS_SUCCESS\n"
+        ));
+    }
+
     if handle_out_va != 0 {
         unsafe {
             core::ptr::write(handle_out_va as *mut u32, handle);
@@ -471,6 +765,7 @@ pub(crate) fn wait_single(
     ctx: &mut super::super::ExecutionContext,
     waitable: &Waitable,
     wait_cx: &WaitContext<'_, Platform>,
+    current_thread_id: u32,
 ) -> NtStatus {
     let args = NtSyscallArgs::from_ctx(ctx);
     // arg1 = alertable (ignored)
@@ -480,6 +775,7 @@ pub(crate) fn wait_single(
     match waitable {
         Waitable::Event(e) => wait_event(e, timeout, wait_cx),
         Waitable::Semaphore(s) => wait_semaphore(s, timeout, wait_cx),
+        Waitable::Mutant(m) => wait_mutant(m, timeout, wait_cx, current_thread_id),
         Waitable::Thread(t) => wait_thread(t, timeout, wait_cx),
     }
 }
@@ -502,6 +798,16 @@ pub(crate) fn wait_semaphore_with_timeout(
     wait_semaphore(sem, timeout, wait_cx)
 }
 
+/// Wait for a mutant object with a timeout (for K32 WaitForSingleObject).
+pub(crate) fn wait_mutant_with_timeout(
+    mutant: &Arc<MutantObject>,
+    timeout: Option<Duration>,
+    wait_cx: &WaitContext<'_, Platform>,
+    current_thread_id: u32,
+) -> NtStatus {
+    wait_mutant(mutant, timeout, wait_cx, current_thread_id)
+}
+
 /// Wait for a thread object with a timeout (for K32 WaitForSingleObject).
 pub(crate) fn wait_thread_with_timeout(
     thread: &Arc<ThreadObject>,
@@ -509,6 +815,45 @@ pub(crate) fn wait_thread_with_timeout(
     wait_cx: &WaitContext<'_, Platform>,
 ) -> NtStatus {
     wait_thread(thread, timeout, wait_cx)
+}
+
+/// NtWaitForAlertByThreadId(IN PVOID Address, IN PLARGE_INTEGER Timeout)
+///
+/// Blocks the current thread until another thread calls
+/// NtAlertThreadByThreadId for this thread ID. The address is only a user-mode
+/// key; the kernel wake is delivered by thread ID, so the per-thread pending
+/// alert state is the source of truth here.
+pub(crate) fn nt_wait_for_alert_by_thread_id(
+    ctx: &mut super::super::ExecutionContext,
+    thread: &Arc<ThreadObject>,
+    wait_cx: &WaitContext<'_, Platform>,
+) -> NtStatus {
+    let args = NtSyscallArgs::from_ctx(ctx);
+    let _address = args.arg0;
+    let timeout = read_timeout(args.arg1);
+
+    if thread.take_pending_alert_by_id() {
+        return NtStatus::STATUS_ALERTED;
+    }
+
+    thread
+        .alert_by_id_waiters
+        .lock()
+        .push(wait_cx.waker().clone());
+
+    let cx = wait_cx.with_timeout(timeout);
+    let result = cx.wait_until(|| thread.take_pending_alert_by_id());
+
+    thread
+        .alert_by_id_waiters
+        .lock()
+        .retain(|w| !w.ptr_eq(wait_cx.waker()));
+
+    match result {
+        Ok(()) => NtStatus::STATUS_ALERTED,
+        Err(litebox::event::wait::WaitError::TimedOut)
+        | Err(litebox::event::wait::WaitError::Interrupted) => NtStatus::STATUS_TIMEOUT,
+    }
 }
 
 /// NtWaitForMultipleObjects(IN ULONG Count, IN PHANDLE Handles[],
@@ -521,6 +866,7 @@ pub(crate) fn nt_wait_for_multiple_objects(
     ctx: &mut super::super::ExecutionContext,
     handles_mutex: &spin::Mutex<HandleTable>,
     wait_cx: &WaitContext<'_, Platform>,
+    current_thread_id: u32,
 ) -> NtStatus {
     let args = NtSyscallArgs::from_ctx(ctx);
     let count = args.arg0;
@@ -548,6 +894,7 @@ pub(crate) fn nt_wait_for_multiple_objects(
                 match handles.get(h) {
                     Some(NtObject::Event(e)) => v.push(Waitable::Event(Arc::clone(e))),
                     Some(NtObject::Semaphore(s)) => v.push(Waitable::Semaphore(Arc::clone(s))),
+                    Some(NtObject::Mutant(m)) => v.push(Waitable::Mutant(Arc::clone(m))),
                     Some(NtObject::Thread(t)) => v.push(Waitable::Thread(Arc::clone(t))),
                     _ => return NtStatus::STATUS_INVALID_HANDLE,
                 }
@@ -579,6 +926,26 @@ pub(crate) fn nt_wait_for_multiple_objects(
                         let mut count = s.state.lock();
                         if *count > 0 {
                             *count -= 1;
+                            result_status = NtStatus(i as i32);
+                            return true;
+                        }
+                    }
+                    Waitable::Mutant(m) => {
+                        let mut state = m.state.lock();
+                        if state.owner_thread_id.is_none() {
+                            let was_abandoned = state.abandoned;
+                            state.owner_thread_id = Some(current_thread_id);
+                            state.recursion_count = 1;
+                            state.abandoned = false;
+                            result_status = if was_abandoned {
+                                NtStatus(NtStatus::STATUS_ABANDONED_WAIT_0.0 + i as i32)
+                            } else {
+                                NtStatus(i as i32)
+                            };
+                            return true;
+                        }
+                        if state.owner_thread_id == Some(current_thread_id) {
+                            state.recursion_count = state.recursion_count.saturating_add(1);
                             result_status = NtStatus(i as i32);
                             return true;
                         }
@@ -618,6 +985,7 @@ pub(crate) fn nt_wait_for_multiple_objects(
                 match handles.get(h) {
                     Some(NtObject::Event(e)) => v.push(Waitable::Event(Arc::clone(e))),
                     Some(NtObject::Semaphore(s)) => v.push(Waitable::Semaphore(Arc::clone(s))),
+                    Some(NtObject::Mutant(m)) => v.push(Waitable::Mutant(Arc::clone(m))),
                     Some(NtObject::Thread(t)) => v.push(Waitable::Thread(Arc::clone(t))),
                     _ => return NtStatus::STATUS_INVALID_HANDLE,
                 }
@@ -643,12 +1011,18 @@ pub(crate) fn nt_wait_for_multiple_objects(
         }
 
         let cx = wait_cx.with_timeout(timeout);
+        let abandoned_status = Cell::new(None::<NtStatus>);
         let wait_result = cx.wait_until(|| {
+            abandoned_status.set(None);
             // Lock unique objects in sorted address order, check all signaled.
             let mut event_guards: alloc::vec::Vec<(usize, spin::MutexGuard<'_, bool>)> =
                 alloc::vec::Vec::new();
             let mut sem_guards: alloc::vec::Vec<(usize, spin::MutexGuard<'_, i32>)> =
                 alloc::vec::Vec::new();
+            let mut mutant_guards: alloc::vec::Vec<(
+                usize,
+                spin::MutexGuard<'_, crate::handle_table::MutantState>,
+            )> = alloc::vec::Vec::new();
             let mut thread_guards: alloc::vec::Vec<(usize, spin::MutexGuard<'_, Option<i32>>)> =
                 alloc::vec::Vec::new();
 
@@ -673,6 +1047,14 @@ pub(crate) fn nt_wait_for_multiple_objects(
                         }
                         sem_guards.push((addr, g));
                     }
+                    Waitable::Mutant(m) => {
+                        let g = m.state.lock();
+                        if g.owner_thread_id.is_some() && g.owner_thread_id != Some(current_thread_id)
+                        {
+                            ok = false;
+                        }
+                        mutant_guards.push((addr, g));
+                    }
                     Waitable::Thread(t) => {
                         let g = t.exit_status.lock();
                         if g.is_none() {
@@ -685,7 +1067,7 @@ pub(crate) fn nt_wait_for_multiple_objects(
 
             if ok {
                 // All signaled — consume while still holding all locks.
-                for w in &waitables {
+                for (i, w) in waitables.iter().enumerate() {
                     match w {
                         Waitable::Event(e) => {
                             if !e.manual_reset {
@@ -705,6 +1087,26 @@ pub(crate) fn nt_wait_for_multiple_objects(
                                 **g -= 1;
                             }
                         }
+                        Waitable::Mutant(m) => {
+                            let addr = Arc::as_ptr(m) as usize;
+                            if let Some((_, g)) =
+                                mutant_guards.iter_mut().find(|(a, _)| *a == addr)
+                            {
+                                if g.owner_thread_id.is_none() {
+                                    let was_abandoned = g.abandoned;
+                                    g.owner_thread_id = Some(current_thread_id);
+                                    g.recursion_count = 1;
+                                    g.abandoned = false;
+                                    if was_abandoned && abandoned_status.get().is_none() {
+                                        abandoned_status.set(Some(NtStatus(
+                                            NtStatus::STATUS_ABANDONED_WAIT_0.0 + i as i32,
+                                        )));
+                                    }
+                                } else {
+                                    g.recursion_count = g.recursion_count.saturating_add(1);
+                                }
+                            }
+                        }
                         Waitable::Thread(_) => {}
                     }
                 }
@@ -719,7 +1121,7 @@ pub(crate) fn nt_wait_for_multiple_objects(
         }
 
         match wait_result {
-            Ok(()) => NtStatus::STATUS_SUCCESS,
+            Ok(()) => abandoned_status.get().unwrap_or(NtStatus::STATUS_SUCCESS),
             Err(_) => NtStatus::STATUS_TIMEOUT,
         }
     }
@@ -803,6 +1205,47 @@ fn wait_thread(
 
     match result {
         Ok(()) => NtStatus::STATUS_SUCCESS,
+        Err(_) => NtStatus::STATUS_TIMEOUT,
+    }
+}
+
+/// Wait on a mutant object using the platform's blocking wait.
+fn wait_mutant(
+    mutant: &Arc<MutantObject>,
+    timeout: Option<Duration>,
+    wait_cx: &WaitContext<'_, Platform>,
+    current_thread_id: u32,
+) -> NtStatus {
+    mutant.waiters.lock().push(wait_cx.waker().clone());
+
+    let cx = wait_cx.with_timeout(timeout);
+    let abandoned = Cell::new(false);
+    let result = cx.wait_until(|| {
+        let mut state = mutant.state.lock();
+        if state.owner_thread_id.is_none() {
+            abandoned.set(state.abandoned);
+            state.owner_thread_id = Some(current_thread_id);
+            state.recursion_count = 1;
+            state.abandoned = false;
+            return true;
+        }
+        if state.owner_thread_id == Some(current_thread_id) {
+            state.recursion_count = state.recursion_count.saturating_add(1);
+            return true;
+        }
+        false
+    });
+
+    mutant.waiters.lock().retain(|w| !w.ptr_eq(wait_cx.waker()));
+
+    match result {
+        Ok(()) => {
+            if abandoned.get() {
+                NtStatus::STATUS_ABANDONED_WAIT_0
+            } else {
+                NtStatus::STATUS_SUCCESS
+            }
+        }
         Err(_) => NtStatus::STATUS_TIMEOUT,
     }
 }
