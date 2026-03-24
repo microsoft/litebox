@@ -262,6 +262,7 @@ impl LinuxShimBuilder {
             cross_process_signals: litebox::sync::Mutex::new(Vec::new()),
             process_thread_handles: litebox::sync::RwLock::new(alloc::collections::BTreeMap::new()),
             transport_interrupt: alloc::sync::Arc::new(core::sync::atomic::AtomicBool::new(false)),
+            epoll_graph_lock: litebox::sync::Mutex::new(()),
         });
         LinuxShim {
             global,
@@ -2326,6 +2327,9 @@ struct GlobalState<FS: ShimFS> {
     >,
     /// Flag set during vfork to break transport spin-loops and propagate EINTR.
     transport_interrupt: alloc::sync::Arc<core::sync::atomic::AtomicBool>,
+    /// Serializes nested epoll graph updates so validation and insertion see
+    /// one consistent graph.
+    epoll_graph_lock: litebox::sync::Mutex<Platform, ()>,
 }
 
 /// A signal that needs to be delivered to a different process.

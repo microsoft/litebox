@@ -1400,10 +1400,20 @@ impl<FS: ShimFS> Task<FS> {
         }
         if let Ok(fd) = rds.fd_consume_raw_integer::<super::epoll::EpollSubsystem<FS>>(raw_fd) {
             drop(rds);
+            let _epoll_graph_guard = self.global.epoll_graph_lock.lock();
+            let parent_id = self
+                .global
+                .litebox
+                .descriptor_table()
+                .entry_handle(&fd)
+                .map(|handle| handle.identity_addr());
             let entry = {
                 let mut dt = self.global.litebox.descriptor_table_mut();
                 dt.remove(&fd)
             };
+            if let (Some(parent_id), Some(entry)) = (parent_id, entry.as_ref()) {
+                entry.detach_nested_children_by_parent_id(parent_id);
+            }
             drop(entry);
             return Ok(());
         }
@@ -3593,7 +3603,8 @@ impl<FS: ShimFS> Task<FS> {
             .read()
             .fd_from_raw_integer::<super::epoll::EpollSubsystem<FS>>(epfd as usize)
             .map_err(|_| Errno::EBADF)?;
-        let file_descriptor = super::epoll::EpollDescriptor::try_from(&files, fd as usize)?;
+        let file_descriptor =
+            super::epoll::EpollDescriptor::try_from(&self.global, &files, fd as usize)?;
 
         let event_ptr = event;
         let event = if op == litebox_common_linux::EpollOp::EpollCtlDel {

@@ -8,7 +8,7 @@
     reason = "still under development, remove before merging PR"
 )]
 
-use alloc::sync::Arc;
+use alloc::sync::{Arc, Weak};
 use alloc::vec;
 use alloc::vec::Vec;
 use core::marker::PhantomData;
@@ -311,6 +311,21 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
         Some(EntryHandle(Arc::clone(&entry.x), PhantomData))
     }
 
+    /// Handles to all currently alive entries in a subsystem.
+    pub fn entry_handles<Subsystem: FdEnabledSubsystem>(
+        &self,
+    ) -> impl Iterator<Item = EntryHandle<Platform, Subsystem>> + '_ {
+        self.entries.iter().filter_map(|entry| {
+            let entry = entry.as_ref()?;
+            let guard = entry.read();
+            if !guard.matches_subsystem::<Subsystem>() {
+                return None;
+            }
+            drop(guard);
+            Some(EntryHandle(entry.x.clone(), PhantomData))
+        })
+    }
+
     /// Use the entry at `internal_fd` as mutably.
     ///
     /// NOTE: Ideally, prefer using [`Self::with_entry_mut`] instead of this, since it provides a
@@ -494,15 +509,53 @@ pub struct EntryHandle<Platform: RawSyncPrimitivesProvider, Subsystem: FdEnabled
     Arc<RwLock<Platform, DescriptorEntry>>,
     PhantomData<Subsystem>,
 );
+impl<Platform: RawSyncPrimitivesProvider, Subsystem: FdEnabledSubsystem> Clone
+    for EntryHandle<Platform, Subsystem>
+{
+    fn clone(&self) -> Self {
+        Self(Arc::clone(&self.0), PhantomData)
+    }
+}
 impl<Platform: RawSyncPrimitivesProvider, Subsystem: FdEnabledSubsystem>
     EntryHandle<Platform, Subsystem>
 {
+    pub fn identity_addr(&self) -> usize {
+        Arc::as_ptr(&self.0).addr()
+    }
+
     pub fn with_entry<R>(&self, f: impl FnOnce(&Subsystem::Entry) -> R) -> R {
         f(self.0.read().as_subsystem::<Subsystem>())
     }
 
     pub fn with_entry_mut<R>(&self, f: impl FnOnce(&mut Subsystem::Entry) -> R) -> R {
         f(self.0.write().as_subsystem_mut::<Subsystem>())
+    }
+
+    pub fn downgrade(&self) -> WeakEntryHandle<Platform, Subsystem> {
+        WeakEntryHandle(Arc::downgrade(&self.0), PhantomData)
+    }
+}
+
+pub struct WeakEntryHandle<Platform: RawSyncPrimitivesProvider, Subsystem: FdEnabledSubsystem>(
+    Weak<RwLock<Platform, DescriptorEntry>>,
+    PhantomData<Subsystem>,
+);
+impl<Platform: RawSyncPrimitivesProvider, Subsystem: FdEnabledSubsystem> Clone
+    for WeakEntryHandle<Platform, Subsystem>
+{
+    fn clone(&self) -> Self {
+        Self(self.0.clone(), PhantomData)
+    }
+}
+impl<Platform: RawSyncPrimitivesProvider, Subsystem: FdEnabledSubsystem>
+    WeakEntryHandle<Platform, Subsystem>
+{
+    pub fn identity_addr(&self) -> usize {
+        self.0.as_ptr().addr()
+    }
+
+    pub fn upgrade(&self) -> Option<EntryHandle<Platform, Subsystem>> {
+        Some(EntryHandle(self.0.upgrade()?, PhantomData))
     }
 }
 
