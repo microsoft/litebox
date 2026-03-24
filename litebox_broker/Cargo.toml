@@ -12,3 +12,6 @@ litebox_syscall_rewriter = { path = "../litebox_syscall_rewriter" }
 smoltcp = { version = "0.12.0", default-features = false, features = ["log", "proto-ipv4", "medium-ip", "socket", "socket-tcp", "socket-udp", "socket-icmp", "alloc"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[target.'cfg(windows)'.dependencies]
+litebox_common_windows = { version = "0.1.0", path = "../litebox_common_windows", features = ["std"] }

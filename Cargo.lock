@@ -1530,6 +1530,7 @@ dependencies = [
  "clap",
  "libc",
  "litebox_common_linux",
+ "litebox_common_windows",
  "litebox_syscall_rewriter",
  "smoltcp",
  "tracing",
@@ -1571,6 +1572,7 @@ dependencies = [
  "bitflags 2.11.0",
  "litebox",
  "thiserror",
+ "windows-sys 0.60.2",
  "zerocopy",
 ]
 
@@ -1689,6 +1691,7 @@ dependencies = [
  "clap",
  "litebox",
  "litebox_common_linux",
+ "litebox_common_windows",
  "litebox_platform_multiplex",
  "litebox_platform_windows_userland",
  "litebox_shim_linux",

@@ -9,6 +9,7 @@
 
 use std::io::{self, Read, Write};
 use std::net::{TcpStream, UdpSocket};
+use std::time::Duration;
 
 // ---------------------------------------------------------------------------
 // Platform-specific raw socket type (needed only for poll)
@@ -91,6 +92,17 @@ impl IpcStream {
             Self::Unix(s) => s.set_nonblocking(nonblock),
             #[cfg(windows)]
             Self::Unix(s) => s.set_nonblocking(nonblock),
+        }
+    }
+
+    /// Set the read timeout on the underlying socket.
+    pub fn set_read_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
+        match self {
+            Self::Tcp(s) => s.set_read_timeout(timeout),
+            #[cfg(unix)]
+            Self::Unix(s) => s.set_read_timeout(timeout),
+            #[cfg(windows)]
+            Self::Unix(s) => s.set_read_timeout(timeout),
         }
     }
 

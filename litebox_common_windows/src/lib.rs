@@ -31,6 +31,8 @@
 )]
 
 extern crate alloc;
+#[cfg(feature = "std")]
+extern crate std;
 
 pub mod apiset;
 pub mod gs_table;
@@ -41,6 +43,8 @@ pub mod pe;
 pub mod pe_builder;
 pub mod pe_loader;
 pub mod pe_parser;
+#[cfg(all(feature = "std", target_os = "windows"))]
+pub mod shmem_ring;
 pub mod stub_dlls;
 
 /// Standard Windows HANDLEs for console I/O.

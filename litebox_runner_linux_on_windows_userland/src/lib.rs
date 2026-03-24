@@ -92,11 +92,11 @@ enum NinePBrokerEndpoint {
     IpcPath(String),
 }
 
-struct IpcTransportWriter(litebox_platform_windows_userland::IpcStream);
+struct ShmemTransportWriter(litebox_common_windows::shmem_ring::RingWriter);
 
-struct IpcTransportReader(litebox_platform_windows_userland::IpcStream);
+struct ShmemTransportReader(litebox_common_windows::shmem_ring::RingReader);
 
-impl litebox::fs::nine_p::transport::Write for IpcTransportWriter {
+impl litebox::fs::nine_p::transport::Write for ShmemTransportWriter {
     fn write(
         &mut self,
         buf: &[u8],
@@ -110,7 +110,7 @@ impl litebox::fs::nine_p::transport::Write for IpcTransportWriter {
     }
 }
 
-impl litebox::fs::nine_p::transport::Read for IpcTransportReader {
+impl litebox::fs::nine_p::transport::Read for ShmemTransportReader {
     fn read(
         &mut self,
         buf: &mut [u8],
@@ -128,39 +128,6 @@ fn parse_nine_p_broker_endpoint(endpoint: &str) -> NinePBrokerEndpoint {
     match endpoint.parse::<core::net::SocketAddr>() {
         Ok(addr) => NinePBrokerEndpoint::Tcp(addr),
         Err(_) => NinePBrokerEndpoint::IpcPath(endpoint.to_string()),
-    }
-}
-
-fn split_ipc_stream(
-    stream: litebox_platform_windows_userland::IpcStream,
-) -> Result<(IpcTransportWriter, IpcTransportReader)> {
-    match stream {
-        litebox_platform_windows_userland::IpcStream::Tcp(stream) => {
-            let reader = stream
-                .try_clone()
-                .map_err(|e| anyhow!("Failed to clone direct 9P TCP stream: {e}"))?;
-            Ok((
-                IpcTransportWriter(litebox_platform_windows_userland::IpcStream::from_tcp(
-                    stream,
-                )),
-                IpcTransportReader(litebox_platform_windows_userland::IpcStream::from_tcp(
-                    reader,
-                )),
-            ))
-        }
-        litebox_platform_windows_userland::IpcStream::Unix(stream) => {
-            let reader = stream
-                .try_clone()
-                .map_err(|e| anyhow!("Failed to clone direct 9P AF_UNIX stream: {e}"))?;
-            Ok((
-                IpcTransportWriter(litebox_platform_windows_userland::IpcStream::from_unix(
-                    stream,
-                )),
-                IpcTransportReader(litebox_platform_windows_userland::IpcStream::from_unix(
-                    reader,
-                )),
-            ))
-        }
     }
 }
 
@@ -292,11 +259,13 @@ fn finish_run_with_nine_p<FS: litebox_shim_linux::ShimFS>(
 
     match endpoint {
         NinePBrokerEndpoint::IpcPath(path) => {
-            let (writer, reader) = connect_to_nine_p_ipc(&path)?;
+            let (ring_writer, ring_reader) = connect_nine_p_channel(&path)?;
             let shim = shim_builder.build();
             let shutdown = std::sync::Arc::new(core::sync::atomic::AtomicBool::new(false));
             let net_worker = start_network_worker(&shim, &shutdown);
 
+            let writer = ShmemTransportWriter(ring_writer);
+            let reader = ShmemTransportReader(ring_reader);
             let litebox = shim.litebox();
             let msize = 4 * 1024 * 1024u32;
             let (nine_p_fs, mut reader) =
@@ -409,24 +378,28 @@ fn finish_run_with_nine_p<FS: litebox_shim_linux::ShimFS>(
     }
 }
 
-fn connect_to_nine_p_ipc(endpoint: &str) -> Result<(IpcTransportWriter, IpcTransportReader)> {
+fn connect_nine_p_channel(
+    endpoint: &str,
+) -> Result<(
+    litebox_common_windows::shmem_ring::RingWriter,
+    litebox_common_windows::shmem_ring::RingReader,
+)> {
     let mut attempts = 0;
     loop {
         match connect_to_ipc_endpoint(endpoint) {
-            Ok(mut stream) => {
-                if let Err(err) = perform_nine_p_ipc_handshake(&mut stream) {
+            Ok(mut stream) => match upgrade_ipc_stream_to_nine_p_ring(&mut stream) {
+                Ok(parts) => return Ok(parts),
+                Err(err) => {
                     attempts += 1;
                     if attempts >= 50 {
                         return Err(anyhow!(
                             "Failed to connect to direct 9P broker at {endpoint} \
-                             after {attempts} attempts: {err}"
+                                 after {attempts} attempts: {err}"
                         ));
                     }
                     std::thread::sleep(std::time::Duration::from_millis(100));
-                    continue;
                 }
-                return split_ipc_stream(stream);
-            }
+            },
             Err(err) => {
                 attempts += 1;
                 if attempts >= 50 {
@@ -439,6 +412,42 @@ fn connect_to_nine_p_ipc(endpoint: &str) -> Result<(IpcTransportWriter, IpcTrans
             }
         }
     }
+}
+
+fn upgrade_ipc_stream_to_nine_p_ring(
+    stream: &mut litebox_platform_windows_userland::IpcStream,
+) -> Result<(
+    litebox_common_windows::shmem_ring::RingWriter,
+    litebox_common_windows::shmem_ring::RingReader,
+)> {
+    use std::io::{Read as _, Write as _};
+
+    perform_nine_p_ipc_handshake(stream)?;
+
+    let (pair, info) = litebox_common_windows::shmem_ring::ShmemRingPair::create()
+        .map_err(|e| anyhow!("Failed to create Windows 9P ring pair: {e}"))?;
+    let metadata = info.encode();
+
+    stream
+        .write_all(&[litebox_common_windows::shmem_ring::TRANSPORT_MARKER])
+        .map_err(|e| anyhow!("Failed to send Windows 9P ring transport marker: {e}"))?;
+    stream
+        .write_all(&metadata)
+        .map_err(|e| anyhow!("Failed to send Windows 9P ring metadata: {e}"))?;
+
+    stream
+        .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+        .ok();
+    let mut ack = [0u8; 1];
+    stream
+        .read_exact(&mut ack)
+        .map_err(|e| anyhow!("Windows 9P ring handshake ACK failed: {e}"))?;
+    stream.set_read_timeout(None).ok();
+    if ack[0] != b'K' {
+        anyhow::bail!("Windows 9P ring handshake: broker did not ACK shared-memory metadata");
+    }
+
+    Ok(pair.into_parts())
 }
 
 /// Run the loaded program and exit with its return code.

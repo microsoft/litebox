@@ -8,6 +8,16 @@ bitflags = "2.9.0"
 litebox = { path = "../litebox/", version = "0.1.0" }
 thiserror = { version = "2.0.6", default-features = false }
 zerocopy = { version = "0.8", default-features = false, features = ["derive", "alloc"] }
+windows-sys = { version = "0.60.2", optional = true, features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_Memory",
+    "Win32_System_Threading",
+] }
+
+[features]
+default = []
+std = ["dep:windows-sys"]
 
 [lints]
 workspace = true

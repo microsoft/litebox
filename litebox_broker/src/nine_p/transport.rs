@@ -130,46 +130,57 @@ impl Write for std::os::unix::net::UnixStream {
 }
 
 // ---------------------------------------------------------------------------
-// Shared-memory ring transport (Unix only)
+// Shared-memory ring transport
 // ---------------------------------------------------------------------------
+
+#[cfg(unix)]
+pub type ShmemRingWriter = litebox_common_linux::shmem_ring::RingWriter;
+
+#[cfg(unix)]
+pub type ShmemRingReader = litebox_common_linux::shmem_ring::RingReader;
+
+#[cfg(windows)]
+pub type ShmemRingWriter = litebox_common_windows::shmem_ring::RingWriter;
+
+#[cfg(windows)]
+pub type ShmemRingReader = litebox_common_windows::shmem_ring::RingReader;
 
 /// Bidirectional shared-memory ring transport for 9P.
 ///
-/// Wraps a [`RingWriter`](litebox_common_linux::shmem_ring::RingWriter) and
-/// [`RingReader`](litebox_common_linux::shmem_ring::RingReader) pair into a
+/// Wraps the platform-specific shared-memory ring writer and reader into a
 /// single type that implements both [`Read`] and [`Write`], suitable for
 /// passing to [`Server::serve`](super::server::Server::serve).
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub struct RingTransport {
     /// Write half — sends data to the remote process.
-    pub writer: litebox_common_linux::shmem_ring::RingWriter,
+    pub writer: ShmemRingWriter,
     /// Read half — receives data from the remote process.
-    pub reader: litebox_common_linux::shmem_ring::RingReader,
+    pub reader: ShmemRingReader,
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 impl Read for RingTransport {
     fn read(&mut self, buf: &mut [u8]) -> Result<usize, ReadError> {
         std::io::Read::read(&mut self.reader, buf).map_err(|_| ReadError)
     }
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 impl Write for RingTransport {
     fn write(&mut self, buf: &[u8]) -> Result<usize, WriteError> {
         std::io::Write::write(&mut self.writer, buf).map_err(|_| WriteError)
     }
 }
 
-#[cfg(unix)]
-impl Read for litebox_common_linux::shmem_ring::RingReader {
+#[cfg(any(unix, windows))]
+impl Read for ShmemRingReader {
     fn read(&mut self, buf: &mut [u8]) -> Result<usize, ReadError> {
         std::io::Read::read(self, buf).map_err(|_| ReadError)
     }
 }
 
-#[cfg(unix)]
-impl Write for litebox_common_linux::shmem_ring::RingWriter {
+#[cfg(any(unix, windows))]
+impl Write for ShmemRingWriter {
     fn write(&mut self, buf: &[u8]) -> Result<usize, WriteError> {
         std::io::Write::write(self, buf).map_err(|_| WriteError)
     }

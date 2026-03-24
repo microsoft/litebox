@@ -270,6 +270,104 @@ fn recv_ring_fds(
     ))
 }
 
+#[cfg(any(unix, windows))]
+const LB9P_RING_ACK: u8 = b'K';
+
+#[cfg(unix)]
+const LB9P_RING_MARKER: u8 = 0;
+
+#[cfg(windows)]
+const LB9P_RING_MARKER: u8 = litebox_common_windows::shmem_ring::TRANSPORT_MARKER;
+
+#[cfg(windows)]
+fn recv_ring_connection_info(
+    stream: &mut IpcStream,
+) -> Result<litebox_common_windows::shmem_ring::RingConnectionInfo, std::io::Error> {
+    use std::io::Read as _;
+
+    stream.set_nonblocking(false)?;
+    stream.set_read_timeout(Some(Duration::from_secs(2)))?;
+
+    let mut payload = [0u8; 1 + litebox_common_windows::shmem_ring::CONNECTION_INFO_SIZE];
+    stream.read_exact(&mut payload)?;
+    if payload[0] != LB9P_RING_MARKER {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "unexpected LB9P transport marker",
+        ));
+    }
+
+    let info_bytes: &[u8; litebox_common_windows::shmem_ring::CONNECTION_INFO_SIZE] = payload[1..]
+        .try_into()
+        .expect("fixed-size ring metadata payload");
+    litebox_common_windows::shmem_ring::RingConnectionInfo::decode(info_bytes).map_err(|err| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("invalid Windows ring metadata: {err}"),
+        )
+    })
+}
+
+#[cfg(any(unix, windows))]
+fn ack_ring_connection(stream: &mut IpcStream) {
+    stream.set_nonblocking(false).ok();
+    use std::io::Write as _;
+    let _ = stream.write_all(&[LB9P_RING_ACK]);
+}
+
+#[cfg(unix)]
+fn handle_shared_memory_lb9p_connection(stream: &mut IpcStream, ring_spawner: RingServiceSpawner) {
+    match recv_ring_fds(stream) {
+        Ok((tx_fd, rx_fd)) => {
+            match litebox_common_linux::shmem_ring::ShmemRingPair::open(tx_fd, rx_fd) {
+                Ok((writer, reader)) => {
+                    ack_ring_connection(stream);
+                    ring_spawner(writer, reader);
+                    info!("direct 9P channel connected (shared memory)");
+                }
+                Err(e) => {
+                    warn!("failed to open ring pair: {e}");
+                }
+            }
+        }
+        Err(e) => {
+            warn!("failed to receive ring fds: {e}");
+        }
+    }
+}
+
+#[cfg(windows)]
+fn handle_shared_memory_lb9p_connection(stream: &mut IpcStream, ring_spawner: RingServiceSpawner) {
+    match recv_ring_connection_info(stream) {
+        Ok(info) => match litebox_common_windows::shmem_ring::ShmemRingPair::open(&info) {
+            Ok((writer, reader)) => {
+                ack_ring_connection(stream);
+                ring_spawner(writer, reader);
+                info!("direct 9P channel connected (shared memory)");
+            }
+            Err(e) => {
+                warn!("failed to open Windows ring pair: {e}");
+            }
+        },
+        Err(e) => {
+            warn!("failed to receive Windows ring metadata: {e}");
+        }
+    }
+}
+
+#[cfg(any(unix, windows))]
+fn spawn_shared_memory_lb9p_connection(stream: IpcStream, ring_spawner: RingServiceSpawner) {
+    if let Err(e) = std::thread::Builder::new()
+        .name("lb9p-ring-upgrade".into())
+        .spawn(move || {
+            let mut stream = stream;
+            handle_shared_memory_lb9p_connection(&mut stream, ring_spawner);
+        })
+    {
+        warn!("failed to spawn LB9P ring upgrade thread: {e}");
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Local service registry — broker-internal services on BROKER_IP
 // ---------------------------------------------------------------------------
@@ -283,14 +381,14 @@ pub type ServiceSpawner =
 
 /// Factory that spawns a service handler on a shared-memory ring buffer pair.
 ///
-/// Used for direct IPC connections (LB9P handshake) where the runner sends
-/// shared-memory file descriptors via `SCM_RIGHTS`. The handler runs in a
-/// separate thread.
-#[cfg(unix)]
-pub type RingServiceSpawner = Box<
+/// Used for direct IPC connections (LB9P handshake) where the runner upgrades
+/// the control stream to a platform-specific shared-memory transport. The
+/// handler runs in a separate thread.
+#[cfg(any(unix, windows))]
+pub type RingServiceSpawner = std::sync::Arc<
     dyn Fn(
-            litebox_common_linux::shmem_ring::RingWriter,
-            litebox_common_linux::shmem_ring::RingReader,
+            crate::nine_p::transport::ShmemRingWriter,
+            crate::nine_p::transport::ShmemRingReader,
         ) -> std::thread::JoinHandle<()>
         + Send
         + Sync,
@@ -302,11 +400,11 @@ pub type RingServiceSpawner = Box<
 /// registry. If a service is registered, the connection is handled
 /// in-process via a loopback TCP pair instead of opening a host TCP socket.
 ///
-/// On Unix, services may also be registered with a ring spawner for direct
-/// shared-memory IPC via the `LB9P` handshake path.
+/// On Unix and Windows, services may also be registered with a ring spawner
+/// for direct shared-memory IPC via the `LB9P` handshake path.
 pub struct LocalServiceRegistry {
     services: HashMap<u16, ServiceSpawner>,
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     ring_services: HashMap<u16, RingServiceSpawner>,
 }
 
@@ -320,7 +418,7 @@ impl LocalServiceRegistry {
     pub fn new() -> Self {
         Self {
             services: HashMap::new(),
-            #[cfg(unix)]
+            #[cfg(any(unix, windows))]
             ring_services: HashMap::new(),
         }
     }
@@ -335,9 +433,9 @@ impl LocalServiceRegistry {
     /// Register a shared-memory ring spawner for the given port.
     ///
     /// When a direct IPC connection (LB9P) arrives, the proxy receives
-    /// shared-memory fds via `SCM_RIGHTS` and calls this spawner with the
+    /// platform-specific ring metadata and calls this spawner with the
     /// resulting ring writer/reader pair.
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     pub fn register_ring(&mut self, port: u16, spawner: RingServiceSpawner) {
         self.ring_services.insert(port, spawner);
     }
@@ -346,9 +444,9 @@ impl LocalServiceRegistry {
         self.services.get(&port)
     }
 
-    #[cfg(unix)]
-    fn get_ring(&self, port: u16) -> Option<&RingServiceSpawner> {
-        self.ring_services.get(&port)
+    #[cfg(any(unix, windows))]
+    fn get_ring(&self, port: u16) -> Option<RingServiceSpawner> {
+        self.ring_services.get(&port).cloned()
     }
 }
 
@@ -740,7 +838,7 @@ pub fn run(
 
             // Got all 4 bytes — check magic.
             if &ph.magic == b"LB9P" {
-                #[cfg(unix)]
+                #[cfg(any(unix, windows))]
                 {
                     if local_services.get_ring(5640).is_some() {
                         let mut marker = [0u8; 1];
@@ -756,38 +854,15 @@ pub fn run(
                             }
                         }
 
-                        if marker[0] == 0 {
-                            let Some(mut stream) = ph.stream.take() else {
+                        if marker[0] == LB9P_RING_MARKER {
+                            let Some(stream) = ph.stream.take() else {
                                 return false;
                             };
                             let Some(ring_spawner) = local_services.get_ring(5640) else {
                                 warn!("LB9P ring marker received but no ring service registered");
                                 return false;
                             };
-                            match recv_ring_fds(&stream) {
-                                Ok((tx_fd, rx_fd)) => {
-                                    match litebox_common_linux::shmem_ring::ShmemRingPair::open(
-                                        tx_fd, rx_fd,
-                                    ) {
-                                        Ok((writer, reader)) => {
-                                            // Send 1-byte ACK to runner so it
-                                            // knows the ring pair is open and
-                                            // can safely drop the Unix socket.
-                                            stream.set_nonblocking(false).ok();
-                                            use std::io::Write as _;
-                                            let _ = stream.write_all(b"K");
-                                            ring_spawner(writer, reader);
-                                            info!("direct 9P channel connected (shared memory)");
-                                        }
-                                        Err(e) => {
-                                            warn!("failed to open ring pair: {e}");
-                                        }
-                                    }
-                                }
-                                Err(e) => {
-                                    warn!("failed to receive ring fds: {e}");
-                                }
-                            }
+                            spawn_shared_memory_lb9p_connection(stream, ring_spawner);
                             return false;
                         }
                     }
@@ -969,7 +1044,7 @@ pub fn accept_ipc_client(
                 continue;
             };
 
-            #[cfg(unix)]
+            #[cfg(any(unix, windows))]
             {
                 if local_services.get_ring(5640).is_some() {
                     let mut marker = [0u8; 1];
@@ -1012,32 +1087,13 @@ pub fn accept_ipc_client(
                         continue;
                     }
 
-                    if marker[0] == 0 {
+                    if marker[0] == LB9P_RING_MARKER {
                         let Some(ring_spawner) = local_services.get_ring(5640) else {
                             warn!("LB9P ring marker received but no ring service registered");
                             continue;
                         };
-                        match recv_ring_fds(&stream) {
-                            Ok((tx_fd, rx_fd)) => {
-                                match litebox_common_linux::shmem_ring::ShmemRingPair::open(
-                                    tx_fd, rx_fd,
-                                ) {
-                                    Ok((writer, reader)) => {
-                                        stream.set_nonblocking(false).ok();
-                                        use std::io::Write as _;
-                                        let _ = stream.write_all(b"K");
-                                        ring_spawner(writer, reader);
-                                        info!("direct 9P channel connected (shared memory)");
-                                    }
-                                    Err(e) => {
-                                        warn!("failed to open ring pair: {e}");
-                                    }
-                                }
-                            }
-                            Err(e) => {
-                                warn!("failed to receive ring fds: {e}");
-                            }
-                        }
+                        let mut stream = stream;
+                        handle_shared_memory_lb9p_connection(&mut stream, ring_spawner);
                         return Ok(None);
                     }
                 }
@@ -1950,6 +2006,74 @@ mod tests {
             assert!(
                 std::time::Instant::now() < deadline,
                 "local 9P service was not spawned"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        client.join().expect("join client thread");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_accept_ipc_client_handles_initial_lb9p_ring_connection() {
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("bind probe listener");
+        let port = probe.local_addr().expect("probe local_addr").port();
+        drop(probe);
+
+        let listener =
+            IpcListener::bind_endpoint(&format!("127.0.0.1:{port}")).expect("bind IPC listener");
+
+        let invoked = Arc::new(AtomicBool::new(false));
+        let invoked_flag = Arc::clone(&invoked);
+        let mut local_services = LocalServiceRegistry::new();
+        local_services.register_ring(
+            5640,
+            Arc::new(move |_writer, _reader| {
+                let invoked_flag = Arc::clone(&invoked_flag);
+                std::thread::spawn(move || {
+                    invoked_flag.store(true, Ordering::SeqCst);
+                })
+            }),
+        );
+
+        let endpoint = format!("127.0.0.1:{port}");
+        let client = std::thread::spawn(move || {
+            use std::io::{Read as _, Write as _};
+
+            let mut stream = std::net::TcpStream::connect(&endpoint).expect("connect test client");
+            stream.write_all(b"LB9P").expect("send LB9P magic");
+
+            let (_pair, info) = litebox_common_windows::shmem_ring::ShmemRingPair::create()
+                .expect("create Windows ring pair");
+            let metadata = info.encode();
+            stream
+                .write_all(&[litebox_common_windows::shmem_ring::TRANSPORT_MARKER])
+                .expect("send ring transport marker");
+            stream
+                .write_all(&metadata)
+                .expect("send ring metadata payload");
+
+            let mut ack = [0u8; 1];
+            stream.read_exact(&mut ack).expect("read ring ACK");
+            assert_eq!(ack, [LB9P_RING_ACK], "broker should ACK ring metadata");
+        });
+
+        let accepted = accept_ipc_client(
+            &listener,
+            Some(&local_services),
+            Some(Duration::from_secs(2)),
+        )
+        .expect("accept direct LB9P ring connection");
+        assert!(
+            accepted.is_none(),
+            "LB9P ring connection should be handled inline"
+        );
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while !invoked.load(Ordering::SeqCst) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "local shared-memory 9P service was not spawned"
             );
             std::thread::sleep(Duration::from_millis(10));
         }

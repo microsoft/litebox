@@ -115,15 +115,15 @@ fn build_local_services(
         );
     }
 
-    // Register shared-memory ring spawner for direct IPC connections (Unix only).
-    #[cfg(unix)]
+    // Register shared-memory ring spawner for direct IPC connections.
+    #[cfg(any(unix, windows))]
     {
         let root = root.clone();
         let policy = Arc::clone(&policy);
         let elf_cache = Arc::clone(&elf_cache);
         registry.register_ring(
             5640,
-            Box::new(move |writer, reader| {
+            Arc::new(move |writer, reader| {
                 let root = root.clone();
                 let policy = Arc::clone(&policy);
                 let elf_cache = Arc::clone(&elf_cache);
