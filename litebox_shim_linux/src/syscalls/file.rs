@@ -2979,7 +2979,7 @@ impl<FS: ShimFS> Task<FS> {
                 .entry_handle(&typed)
                 .ok_or(Errno::EBADF)?
         };
-        handle.with_entry(|file| file.get_timer())
+        handle.with_entry(super::eventfd::EventFile::get_timer)
     }
 
     /// Forward a terminal ioctl to the host via the platform's semantic
@@ -4028,6 +4028,7 @@ impl<FS: ShimFS> Task<FS> {
                 }
                 Ok(target)
             } else if let Some(min_fd) = min_fd {
+                #[allow(clippy::maybe_infinite_iter)]
                 let raw_fd = (min_fd..)
                     .find(|&raw_fd| !rds.is_alive(raw_fd))
                     .expect("raw fd search should always find a slot");

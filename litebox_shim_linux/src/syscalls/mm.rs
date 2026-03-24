@@ -403,7 +403,7 @@ impl<FS: ShimFS> Task<FS> {
         let ps = self.process_state.borrow();
         let file_path = self.fd_path_for_raw(fd);
         let mut cache = ps.elf_patch_cache.lock();
-        let _state = cache.entry(fd).or_insert(ElfPatchState {
+        let state = cache.entry(fd).or_insert(ElfPatchState {
             _base_addr: base_addr,
             pre_patched,
             trampoline_file_offset: tramp_file_offset,
@@ -415,17 +415,19 @@ impl<FS: ShimFS> Task<FS> {
             trampoline_mapped_len: 0,
             file_path,
         });
+        #[cfg(not(feature = "trace_syscalls"))]
+        let _ = &state;
         #[cfg(feature = "trace_syscalls")]
         litebox::log_println!(
             self.global.platform,
             "[TRACE-ELF-PATCH] init fd={} path={:?} base={:#x} tramp={:#x} pre_patched={} tramp_file_off={:#x} tramp_file_size={:#x}",
             fd,
-            _state.file_path,
+            state.file_path,
             base_addr,
-            _state.trampoline_addr,
-            _state.pre_patched,
-            _state.trampoline_file_offset,
-            _state.trampoline_file_size,
+            state.trampoline_addr,
+            state.pre_patched,
+            state.trampoline_file_offset,
+            state.trampoline_file_size,
         );
     }
 
@@ -1535,34 +1537,34 @@ impl<FS: ShimFS> Task<FS> {
         prot: ProtFlags,
     ) -> Result<(), Errno> {
         self.reject_shared_vfork_vm_mutation("mprotect")?;
-        if prot.contains(ProtFlags::PROT_WRITE) {
-            if let Some(cow) = self.top_cow_layer() {
-                let req_start = addr.as_usize();
-                let req_end = req_start + len;
+        if prot.contains(ProtFlags::PROT_WRITE)
+            && let Some(cow) = self.top_cow_layer()
+        {
+            let req_start = addr.as_usize();
+            let req_end = req_start + len;
 
-                let mut dirty = cow.dirty_pages.lock();
-                for &(base, plen, _) in &cow.protected_ranges {
-                    let prot_end = base + plen;
-                    if req_start < prot_end && req_end > base {
-                        let overlap_start = req_start.max(base);
-                        let overlap_end = req_end.min(prot_end);
-                        for page_addr in
-                            (overlap_start & !(PAGE_SIZE - 1)..overlap_end).step_by(PAGE_SIZE)
-                        {
-                            if dirty.contains_key(&page_addr) {
-                                continue;
-                            }
-                            let mut buf = alloc::vec![0u8; PAGE_SIZE];
-                            // SAFETY: page is mapped (CoW-protected).
-                            unsafe {
-                                core::ptr::copy_nonoverlapping(
-                                    page_addr as *const u8,
-                                    buf.as_mut_ptr(),
-                                    PAGE_SIZE,
-                                );
-                            }
-                            dirty.insert(page_addr, buf);
+            let mut dirty = cow.dirty_pages.lock();
+            for &(base, plen, _) in &cow.protected_ranges {
+                let prot_end = base + plen;
+                if req_start < prot_end && req_end > base {
+                    let overlap_start = req_start.max(base);
+                    let overlap_end = req_end.min(prot_end);
+                    for page_addr in
+                        (overlap_start & !(PAGE_SIZE - 1)..overlap_end).step_by(PAGE_SIZE)
+                    {
+                        if dirty.contains_key(&page_addr) {
+                            continue;
                         }
+                        let mut buf = alloc::vec![0u8; PAGE_SIZE];
+                        // SAFETY: page is mapped (CoW-protected).
+                        unsafe {
+                            core::ptr::copy_nonoverlapping(
+                                page_addr as *const u8,
+                                buf.as_mut_ptr(),
+                                PAGE_SIZE,
+                            );
+                        }
+                        dirty.insert(page_addr, buf);
                     }
                 }
             }

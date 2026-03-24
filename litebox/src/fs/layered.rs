@@ -776,25 +776,20 @@ impl<
                     // open path so that subsequent opens of the same
                     // shareable file reuse this entry instead of creating a
                     // conflicting standalone Arc.
-                    let shareable = match self.lower_fd_is_shareable(&lower_fd) {
-                        Ok(shareable) => shareable,
-                        Err(_) => {
-                            let _ = self.lower.close(&lower_fd);
-                            return Err(OpenError::Io);
-                        }
+                    let Ok(shareable) = self.lower_fd_is_shareable(&lower_fd) else {
+                        let _ = self.lower.close(&lower_fd);
+                        return Err(OpenError::Io);
                     };
                     let entry = if shareable {
                         let mut root = self.root.write();
                         if let Some(existing) = root.entries.get(&path) {
                             match existing.as_ref() {
                                 EntryX::Lower { fd } => {
-                                    let existing_shareable = match self.lower_fd_is_shareable(fd) {
-                                        Ok(shareable) => shareable,
-                                        Err(_) => {
-                                            drop(root);
-                                            let _ = self.lower.close(&lower_fd);
-                                            return Err(OpenError::Io);
-                                        }
+                                    let Ok(existing_shareable) = self.lower_fd_is_shareable(fd)
+                                    else {
+                                        drop(root);
+                                        let _ = self.lower.close(&lower_fd);
+                                        return Err(OpenError::Io);
                                     };
                                     if existing_shareable {
                                         let shared = Arc::clone(existing);
@@ -964,12 +959,9 @@ impl<
                 return Err(e);
             }
         };
-        let shareable = match self.lower_fd_is_shareable(&lower_fd) {
-            Ok(shareable) => shareable,
-            Err(_) => {
-                let _ = self.lower.close(&lower_fd);
-                return Err(OpenError::Io);
-            }
+        let Ok(shareable) = self.lower_fd_is_shareable(&lower_fd) else {
+            let _ = self.lower.close(&lower_fd);
+            return Err(OpenError::Io);
         };
         let entry = if shareable {
             // Insert into root entries, handling the race where another thread may have
@@ -979,13 +971,10 @@ impl<
             if let Some(existing) = root.entries.get(&path) {
                 match existing.as_ref() {
                     EntryX::Lower { fd } => {
-                        let existing_shareable = match self.lower_fd_is_shareable(fd) {
-                            Ok(shareable) => shareable,
-                            Err(_) => {
-                                drop(root);
-                                let _ = self.lower.close(&lower_fd);
-                                return Err(OpenError::Io);
-                            }
+                        let Ok(existing_shareable) = self.lower_fd_is_shareable(fd) else {
+                            drop(root);
+                            let _ = self.lower.close(&lower_fd);
+                            return Err(OpenError::Io);
                         };
                         if existing_shareable {
                             // Another thread won the race — reuse its entry and close ours.

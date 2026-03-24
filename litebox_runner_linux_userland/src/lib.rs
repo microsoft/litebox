@@ -533,6 +533,7 @@ impl litebox::fs::nine_p::transport::Read for ShmemTransportReader {
 ///
 /// Builds the shim, starts the network worker, connects to the 9P broker,
 /// layers the resulting FS on top of the base FS, and runs the program.
+#[allow(clippy::too_many_arguments)]
 fn finish_run_with_nine_p<FS: litebox_shim_linux::ShimFS>(
     shim_builder: litebox_shim_linux::LinuxShimBuilder,
     base_fs: FS,
@@ -775,149 +776,6 @@ fn connect_to_broker_ipc(path: &str) -> Result<std::os::fd::OwnedFd> {
     perform_ipc_handshake(&fd)?;
 
     Ok(fd)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn test_cli_args(program: &str) -> CliArgs {
-        CliArgs {
-            program_and_arguments: vec![program.to_string()],
-            environment_variables: vec![],
-            forward_environment_variables: false,
-            unstable: false,
-            insert_files: vec![],
-            initial_files: None,
-            rewrite_syscalls: false,
-            interception_backend: InterceptionBackend::Rewriter,
-            tun_device_name: None,
-            network_broker: None,
-            program_from_tar: false,
-            nine_p_broker: None,
-            working_directory: None,
-        }
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn initial_exec_path_canonicalizes_without_nine_p() {
-        use std::os::unix::fs::symlink;
-
-        let unique = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let base = std::env::temp_dir().join(format!(
-            "litebox-runner-initial-exec-path-{}-{unique}",
-            std::process::id()
-        ));
-        std::fs::create_dir_all(&base).unwrap();
-        let real = base.join("real-binary");
-        let launcher = base.join("launcher");
-        std::fs::write(&real, b"test").unwrap();
-        symlink(&real, &launcher).unwrap();
-
-        let cli = test_cli_args(launcher.to_str().unwrap());
-        assert_eq!(
-            initial_exec_path(&cli),
-            std::fs::canonicalize(&real).unwrap()
-        );
-
-        let _ = std::fs::remove_file(&launcher);
-        let _ = std::fs::remove_file(&real);
-        let _ = std::fs::remove_dir(&base);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn initial_exec_path_preserves_launcher_with_nine_p() {
-        use std::os::unix::fs::symlink;
-
-        let unique = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let base = std::env::temp_dir().join(format!(
-            "litebox-runner-initial-exec-path-9p-{}-{unique}",
-            std::process::id()
-        ));
-        std::fs::create_dir_all(&base).unwrap();
-        let real = base.join("real-binary");
-        let launcher = base.join("launcher");
-        std::fs::write(&real, b"test").unwrap();
-        symlink(&real, &launcher).unwrap();
-
-        let mut cli = test_cli_args(launcher.to_str().unwrap());
-        cli.nine_p_broker = Some("/tmp/litebox-broker.sock".to_string());
-        assert_eq!(initial_exec_path(&cli), launcher);
-
-        let _ = std::fs::remove_file(base.join("launcher"));
-        let _ = std::fs::remove_file(base.join("real-binary"));
-        let _ = std::fs::remove_dir(&base);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn load_program_path_canonicalizes_with_nine_p_for_relative_launcher() {
-        use std::os::unix::fs::symlink;
-
-        let unique = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let base = std::env::temp_dir().join(format!(
-            "litebox-runner-load-program-path-9p-{}-{unique}",
-            std::process::id()
-        ));
-        let guest_cwd = std::env::temp_dir().join(format!(
-            "litebox-runner-load-program-path-cwd-{}-{unique}",
-            std::process::id()
-        ));
-        std::fs::create_dir_all(&base).unwrap();
-        std::fs::create_dir_all(&guest_cwd).unwrap();
-        let real = base.join("real-binary");
-        let launcher = base.join("launcher");
-        std::fs::write(&real, b"test").unwrap();
-        symlink(&real, &launcher).unwrap();
-
-        let old_cwd = std::env::current_dir().unwrap();
-        std::env::set_current_dir(&base).unwrap();
-
-        let mut cli = test_cli_args("./launcher");
-        cli.nine_p_broker = Some("/tmp/litebox-broker.sock".to_string());
-        cli.working_directory = Some(guest_cwd.to_string_lossy().into_owned());
-
-        assert_eq!(initial_exec_path(&cli), PathBuf::from("./launcher"));
-        assert_eq!(
-            load_program_path(&cli),
-            std::fs::canonicalize(&real).unwrap()
-        );
-
-        std::env::set_current_dir(old_cwd).unwrap();
-        let _ = std::fs::remove_file(&launcher);
-        let _ = std::fs::remove_file(&real);
-        let _ = std::fs::remove_dir(&base);
-        let _ = std::fs::remove_dir(&guest_cwd);
-    }
-
-    #[test]
-    fn initial_program_data_falls_back_for_bun_executable() {
-        static BUN_BYTES: &[u8] = b"not-elf\n---- Bun! ----\n";
-
-        let mut cow_regions = Vec::new();
-        let file = MmappedFile {
-            data: BUN_BYTES,
-            abs_path: PathBuf::from("/tmp/fake-bun"),
-        };
-
-        let data =
-            initial_program_data(file, true, &mut cow_regions, Path::new("/tmp/fake-bun")).unwrap();
-
-        assert_eq!(&*data, BUN_BYTES);
-        assert_eq!(cow_regions.len(), 1);
-        assert_eq!(cow_regions[0].abs_path, PathBuf::from("/tmp/fake-bun"));
-    }
 }
 
 /// Open a dedicated 9P channel to the broker via Unix domain socket and
@@ -1325,4 +1183,147 @@ fn build_envp(cli_args: &CliArgs) -> Vec<std::ffi::CString> {
 fn fixup_env(_envp: &mut Vec<alloc::ffi::CString>) {
     // No environment fixups needed — the shim's mmap hook handles
     // syscall patching at runtime without LD_AUDIT.
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_cli_args(program: &str) -> CliArgs {
+        CliArgs {
+            program_and_arguments: vec![program.to_string()],
+            environment_variables: vec![],
+            forward_environment_variables: false,
+            unstable: false,
+            insert_files: vec![],
+            initial_files: None,
+            rewrite_syscalls: false,
+            interception_backend: InterceptionBackend::Rewriter,
+            tun_device_name: None,
+            network_broker: None,
+            program_from_tar: false,
+            nine_p_broker: None,
+            working_directory: None,
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn initial_exec_path_canonicalizes_without_nine_p() {
+        use std::os::unix::fs::symlink;
+
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let base = std::env::temp_dir().join(format!(
+            "litebox-runner-initial-exec-path-{}-{unique}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&base).unwrap();
+        let real = base.join("real-binary");
+        let launcher = base.join("launcher");
+        std::fs::write(&real, b"test").unwrap();
+        symlink(&real, &launcher).unwrap();
+
+        let cli = test_cli_args(launcher.to_str().unwrap());
+        assert_eq!(
+            initial_exec_path(&cli),
+            std::fs::canonicalize(&real).unwrap()
+        );
+
+        let _ = std::fs::remove_file(&launcher);
+        let _ = std::fs::remove_file(&real);
+        let _ = std::fs::remove_dir(&base);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn initial_exec_path_preserves_launcher_with_nine_p() {
+        use std::os::unix::fs::symlink;
+
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let base = std::env::temp_dir().join(format!(
+            "litebox-runner-initial-exec-path-9p-{}-{unique}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&base).unwrap();
+        let real = base.join("real-binary");
+        let launcher = base.join("launcher");
+        std::fs::write(&real, b"test").unwrap();
+        symlink(&real, &launcher).unwrap();
+
+        let mut cli = test_cli_args(launcher.to_str().unwrap());
+        cli.nine_p_broker = Some("/tmp/litebox-broker.sock".to_string());
+        assert_eq!(initial_exec_path(&cli), launcher);
+
+        let _ = std::fs::remove_file(base.join("launcher"));
+        let _ = std::fs::remove_file(base.join("real-binary"));
+        let _ = std::fs::remove_dir(&base);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn load_program_path_canonicalizes_with_nine_p_for_relative_launcher() {
+        use std::os::unix::fs::symlink;
+
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let base = std::env::temp_dir().join(format!(
+            "litebox-runner-load-program-path-9p-{}-{unique}",
+            std::process::id()
+        ));
+        let guest_cwd = std::env::temp_dir().join(format!(
+            "litebox-runner-load-program-path-cwd-{}-{unique}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&base).unwrap();
+        std::fs::create_dir_all(&guest_cwd).unwrap();
+        let real = base.join("real-binary");
+        let launcher = base.join("launcher");
+        std::fs::write(&real, b"test").unwrap();
+        symlink(&real, &launcher).unwrap();
+
+        let old_cwd = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&base).unwrap();
+
+        let mut cli = test_cli_args("./launcher");
+        cli.nine_p_broker = Some("/tmp/litebox-broker.sock".to_string());
+        cli.working_directory = Some(guest_cwd.to_string_lossy().into_owned());
+
+        assert_eq!(initial_exec_path(&cli), PathBuf::from("./launcher"));
+        assert_eq!(
+            load_program_path(&cli),
+            std::fs::canonicalize(&real).unwrap()
+        );
+
+        std::env::set_current_dir(old_cwd).unwrap();
+        let _ = std::fs::remove_file(&launcher);
+        let _ = std::fs::remove_file(&real);
+        let _ = std::fs::remove_dir(&base);
+        let _ = std::fs::remove_dir(&guest_cwd);
+    }
+
+    #[test]
+    fn initial_program_data_falls_back_for_bun_executable() {
+        static BUN_BYTES: &[u8] = b"not-elf\n---- Bun! ----\n";
+
+        let mut cow_regions = Vec::new();
+        let file = MmappedFile {
+            data: BUN_BYTES,
+            abs_path: PathBuf::from("/tmp/fake-bun"),
+        };
+
+        let data =
+            initial_program_data(file, true, &mut cow_regions, Path::new("/tmp/fake-bun")).unwrap();
+
+        assert_eq!(&*data, BUN_BYTES);
+        assert_eq!(cow_regions.len(), 1);
+        assert_eq!(cow_regions[0].abs_path, PathBuf::from("/tmp/fake-bun"));
+    }
 }

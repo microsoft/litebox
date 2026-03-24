@@ -1340,8 +1340,7 @@ impl<FS: ShimFS> Task<FS> {
             sockfd,
             |fd| {
                 let addr = sockaddr.clone().inet().ok_or(Errno::EAFNOSUPPORT)?;
-                let result = self.global.connect(&self.wait_cx(), fd, addr);
-                result
+                self.global.connect(&self.wait_cx(), fd, addr)
             },
             |file| {
                 let addr = sockaddr.clone().unix().ok_or(Errno::EAFNOSUPPORT)?;
@@ -1454,10 +1453,8 @@ impl<FS: ShimFS> Task<FS> {
                     .clone()
                     .map(|addr| addr.inet().ok_or(Errno::EAFNOSUPPORT))
                     .transpose()?;
-                let result = self
-                    .global
-                    .sendto(&self.wait_cx(), fd, buf, flags, sockaddr);
-                result
+                self.global
+                    .sendto(&self.wait_cx(), fd, buf, flags, sockaddr)
             },
             |file| {
                 let addr = sockaddr
@@ -1717,8 +1714,7 @@ impl<FS: ShimFS> Task<FS> {
             .iter()
             .try_fold(0usize, |acc, iov| acc.checked_add(iov.iov_len))
             .ok_or(Errno::EINVAL)?;
-        let mut recv_buf = Vec::new();
-        recv_buf.resize(total_len.min(0x80_000), 0);
+        let mut recv_buf = alloc::vec![0; total_len.min(0x80_000)];
 
         let msg_name = hdr.msg_name;
         let want_source = msg_name.as_usize() != 0;
@@ -2730,8 +2726,7 @@ mod tests {
         assert_ne!(
             event_bits & litebox::event::Events::OUT.bits(),
             0,
-            "expected EPOLLOUT after connect completion, got events={:#x}",
-            event_bits
+            "expected EPOLLOUT after connect completion, got events={event_bits:#x}",
         );
 
         let so_error = get_so_error(&task, client_fd);

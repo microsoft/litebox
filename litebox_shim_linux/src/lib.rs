@@ -300,6 +300,7 @@ impl<FS: ShimFS> LinuxShim<FS> {
         self.load_program_with_exec_filename(fs, task, path, path, argv, envp, initial_cwd)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn load_program_with_exec_filename(
         &self,
         fs: alloc::sync::Arc<FS>,
@@ -683,7 +684,7 @@ impl<FS: ShimFS> Task<FS> {
                 dirty_pages
             };
 
-            for (page_addr, original_data) in dirty_pages.iter() {
+            for (page_addr, original_data) in &dirty_pages {
                 if <crate::Platform as litebox::platform::AddressSpaceProvider>::EAGER_COW_FOR_VFORK
                 {
                     let current =
@@ -720,16 +721,18 @@ impl<FS: ShimFS> Task<FS> {
     fn try_handle_cow_fault(
         &self,
         fault_addr: usize,
-        _ctx: &litebox_common_linux::PtRegs,
+        ctx: &litebox_common_linux::PtRegs,
         page_present: bool,
     ) -> bool {
+        #[cfg(not(all(feature = "trace_syscalls", target_arch = "x86_64")))]
+        let _ = &ctx;
         #[cfg(all(feature = "trace_syscalls", target_arch = "x86_64"))]
         litebox::log_println!(
             self.global.platform,
             "[TRACE-COW] pid={} tid={} rip={:#x} fault_addr={:#x} page_present={} child={}",
             self.pid,
             self.tid,
-            _ctx.rip,
+            ctx.rip,
             fault_addr,
             page_present,
             self.fork_context.borrow().is_some(),

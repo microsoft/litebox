@@ -2572,7 +2572,7 @@ impl<FS: ShimFS> Task<FS> {
         usage: crate::MutPtr<litebox_common_linux::Rusage>,
     ) -> Result<(), Errno> {
         match who {
-            0 | -1 | 1 => {}
+            -1..=1 => {}
             _ => return Err(Errno::EINVAL),
         }
 

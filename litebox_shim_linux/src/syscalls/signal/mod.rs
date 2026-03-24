@@ -759,7 +759,7 @@ impl<FS: ShimFS> Task<FS> {
                     let summary = if word >= 0x10000 {
                         self.address_mapping_summary(word)
                     } else {
-                        alloc::format!("addr={:#x}", word)
+                        alloc::format!("addr={word:#x}")
                     };
                     litebox::log_println!(
                         self.global.platform,
@@ -800,7 +800,7 @@ impl<FS: ShimFS> Task<FS> {
             let summary = if ret_addr >= 0x10000 {
                 self.address_mapping_summary(ret_addr)
             } else {
-                alloc::format!("addr={:#x}", ret_addr)
+                alloc::format!("addr={ret_addr:#x}")
             };
             litebox::log_println!(
                 self.global.platform,

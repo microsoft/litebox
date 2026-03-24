@@ -314,7 +314,7 @@ fn test_fcntl_locking_on_non_file_descriptors() {
     let mut getlk = new_flock(FlockType::WriteLock);
     task.sys_fcntl(
         eventfd,
-        FcntlArg::GETLK(MutPtr::from_usize((&mut getlk as *mut Flock) as usize)),
+        FcntlArg::GETLK(MutPtr::from_usize((&raw mut getlk) as usize)),
     )
     .expect("GETLK should succeed on eventfd");
     assert_eq!(getlk.type_, FlockType::Unlock as i16);
@@ -323,7 +323,7 @@ fn test_fcntl_locking_on_non_file_descriptors() {
     assert_eq!(
         task.sys_fcntl(
             eventfd,
-            FcntlArg::GETLK(MutPtr::from_usize((&mut bad_getlk as *mut Flock) as usize)),
+            FcntlArg::GETLK(MutPtr::from_usize((&raw mut bad_getlk) as usize)),
         )
         .unwrap_err(),
         Errno::EINVAL
@@ -332,7 +332,7 @@ fn test_fcntl_locking_on_non_file_descriptors() {
     assert_eq!(
         task.sys_fcntl(
             read_fd,
-            FcntlArg::SETLK(ConstPtr::from_usize((&read_lock as *const Flock) as usize)),
+            FcntlArg::SETLK(ConstPtr::from_usize((&raw const read_lock) as usize)),
         )
         .unwrap(),
         0
@@ -340,7 +340,7 @@ fn test_fcntl_locking_on_non_file_descriptors() {
     assert_eq!(
         task.sys_fcntl(
             read_fd,
-            FcntlArg::SETLK(ConstPtr::from_usize((&write_lock as *const Flock) as usize)),
+            FcntlArg::SETLK(ConstPtr::from_usize((&raw const write_lock) as usize)),
         )
         .unwrap_err(),
         Errno::EBADF
@@ -348,7 +348,7 @@ fn test_fcntl_locking_on_non_file_descriptors() {
     assert_eq!(
         task.sys_fcntl(
             write_fd,
-            FcntlArg::SETLK(ConstPtr::from_usize((&read_lock as *const Flock) as usize)),
+            FcntlArg::SETLK(ConstPtr::from_usize((&raw const read_lock) as usize)),
         )
         .unwrap_err(),
         Errno::EBADF
@@ -356,7 +356,7 @@ fn test_fcntl_locking_on_non_file_descriptors() {
     assert_eq!(
         task.sys_fcntl(
             write_fd,
-            FcntlArg::SETLK(ConstPtr::from_usize((&write_lock as *const Flock) as usize)),
+            FcntlArg::SETLK(ConstPtr::from_usize((&raw const write_lock) as usize)),
         )
         .unwrap(),
         0
@@ -364,7 +364,7 @@ fn test_fcntl_locking_on_non_file_descriptors() {
     assert_eq!(
         task.sys_fcntl(
             read_fd,
-            FcntlArg::SETLK(ConstPtr::from_usize((&unlock as *const Flock) as usize)),
+            FcntlArg::SETLK(ConstPtr::from_usize((&raw const unlock) as usize)),
         )
         .unwrap(),
         0
@@ -374,7 +374,7 @@ fn test_fcntl_locking_on_non_file_descriptors() {
         assert_eq!(
             task.sys_fcntl(
                 fd,
-                FcntlArg::SETLK(ConstPtr::from_usize((&read_lock as *const Flock) as usize)),
+                FcntlArg::SETLK(ConstPtr::from_usize((&raw const read_lock) as usize)),
             )
             .unwrap(),
             0
@@ -382,7 +382,7 @@ fn test_fcntl_locking_on_non_file_descriptors() {
         assert_eq!(
             task.sys_fcntl(
                 fd,
-                FcntlArg::SETLK(ConstPtr::from_usize((&write_lock as *const Flock) as usize)),
+                FcntlArg::SETLK(ConstPtr::from_usize((&raw const write_lock) as usize)),
             )
             .unwrap(),
             0
@@ -390,7 +390,7 @@ fn test_fcntl_locking_on_non_file_descriptors() {
         assert_eq!(
             task.sys_fcntl(
                 fd,
-                FcntlArg::SETLK(ConstPtr::from_usize((&unlock as *const Flock) as usize)),
+                FcntlArg::SETLK(ConstPtr::from_usize((&raw const unlock) as usize)),
             )
             .unwrap(),
             0
@@ -866,7 +866,7 @@ fn test_nested_epoll_propagates_readiness_and_rejects_cycles() {
         .sys_epoll_pwait(
             outer,
             MutPtr::from_usize(events.as_mut_ptr() as usize),
-            events.len() as u32,
+            events.len().try_into().unwrap(),
             TimeParam::Milliseconds(1000),
             None,
             0,
@@ -957,7 +957,7 @@ fn test_nested_epoll_respects_host_poll_exclusive_and_depth_limit() {
         .sys_epoll_pwait(
             outer,
             MutPtr::from_usize(events.as_mut_ptr() as usize),
-            events.len() as u32,
+            events.len().try_into().unwrap(),
             TimeParam::Milliseconds(1000),
             None,
             0,
@@ -1081,7 +1081,7 @@ fn test_nested_epoll_survives_closing_added_fd_alias() {
         .sys_epoll_pwait(
             outer,
             MutPtr::from_usize(events.as_mut_ptr() as usize),
-            events.len() as u32,
+            events.len().try_into().unwrap(),
             TimeParam::Milliseconds(1000),
             None,
             0,
@@ -1143,7 +1143,7 @@ fn test_nested_epoll_stops_after_last_child_fd_closes() {
         .sys_epoll_pwait(
             outer,
             MutPtr::from_usize(events.as_mut_ptr() as usize),
-            events.len() as u32,
+            events.len().try_into().unwrap(),
             TimeParam::Milliseconds(100),
             None,
             0,

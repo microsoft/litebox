@@ -207,7 +207,9 @@ impl<FS: ShimFS> EpollDescriptor<FS> {
                 .litebox
                 .descriptor_table()
                 .entry_handle(fd)
-                .is_some_and(|handle| handle.with_entry(|entry| entry.needs_host_poll())),
+                .is_some_and(|handle| {
+                    handle.with_entry(super::eventfd::EventFile::needs_host_poll)
+                }),
             EpollDescriptor::Epoll(handle) => {
                 handle.with_entry(|entry| entry.compute_needs_host_poll(global, fs))
             }
@@ -329,7 +331,7 @@ impl<FS: ShimFS> EpollFile<FS> {
                     Err(TryOpError::<Infallible>::TryAgain)
                 }) {
                     Ok(WaitOutcome::Ready) => return Ok(events),
-                    Ok(WaitOutcome::RecheckMode) => continue,
+                    Ok(WaitOutcome::RecheckMode) => {}
                     Err(TryOpError::TryAgain) => unreachable!(),
                     Err(TryOpError::WaitError(e)) => return Err(e),
                     Err(TryOpError::Other(infallible)) => match infallible {},
@@ -394,6 +396,7 @@ impl<FS: ShimFS> EpollFile<FS> {
         })
     }
 
+    #[allow(clippy::only_used_in_recursion)]
     fn contains_epoll(&self, global: &GlobalState<FS>, target: *const Self) -> bool {
         if core::ptr::eq(self, target) {
             return true;
@@ -410,6 +413,7 @@ impl<FS: ShimFS> EpollFile<FS> {
         false
     }
 
+    #[allow(clippy::only_used_in_recursion)]
     fn max_descendant_epoll_depth(&self, global: &GlobalState<FS>) -> usize {
         let interests = self.interests.lock();
         let mut max_depth = 1;
@@ -425,7 +429,7 @@ impl<FS: ShimFS> EpollFile<FS> {
 
     fn max_ancestor_epoll_depth(&self, global: &GlobalState<FS>) -> usize {
         let parents = self.parents.lock().clone();
-        let self_ptr = self as *const _;
+        let self_ptr: *const _ = self;
         let mut max_depth = 1;
         for handle in parents {
             let Some(handle) = handle.upgrade() else {
@@ -509,7 +513,7 @@ impl<FS: ShimFS> EpollFile<FS> {
                     (parent_handle.as_ref(), removed.desc.upgrade())
                 {
                     child.with_entry(|entry| {
-                        entry.remove_parent_by_id(parent_handle.identity_addr())
+                        entry.remove_parent_by_id(parent_handle.identity_addr());
                     });
                 }
                 Ok(())
@@ -539,7 +543,7 @@ impl<FS: ShimFS> EpollFile<FS> {
                 if core::ptr::eq(entry, self) {
                     return Err(Errno::EINVAL);
                 }
-                if entry.contains_epoll(global, self as *const _) {
+                if entry.contains_epoll(global, core::ptr::from_ref(self)) {
                     return Err(Errno::ELOOP);
                 }
                 let new_depth = self.max_ancestor_epoll_depth(global)

@@ -187,8 +187,8 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> EventFile<Platform> {
                 match self.pollee.wait(&wait_cx, false, Events::IN, || {
                     Result::<(), TryOpError<Infallible>>::Err(TryOpError::TryAgain)
                 }) {
-                    Ok(()) | Err(TryOpError::TryAgain) => continue,
-                    Err(TryOpError::WaitError(WaitError::TimedOut)) => continue,
+                    Ok(())
+                    | Err(TryOpError::TryAgain | TryOpError::WaitError(WaitError::TimedOut)) => {}
                     Err(TryOpError::WaitError(WaitError::Interrupted)) => {
                         return Err(Errno::EINTR);
                     }
@@ -250,7 +250,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> EventFile<Platform> {
         let EventFileInner::Timerfd(timer) = &mut *inner else {
             return Err(Errno::EINVAL);
         };
-        let old_value = timer.current_spec()?;
+        let old_value = timer.current_spec();
         timer.set_time(flags, new_value)?;
         drop(inner);
         self.pollee.notify_observers(Events::IN);
@@ -262,7 +262,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> EventFile<Platform> {
         let EventFileInner::Timerfd(timer) = &mut *inner else {
             return Err(Errno::EINVAL);
         };
-        timer.current_spec()
+        Ok(timer.current_spec())
     }
 
     super::common_functions_for_file_status!();
@@ -368,9 +368,10 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> TimerFileState<Platform
         let elapsed_ns = now.duration_since(&deadline).as_nanos();
         let interval_ns = self.interval.as_nanos();
         let expirations = elapsed_ns / interval_ns + 1;
-        self.pending_expirations = self
-            .pending_expirations
-            .saturating_add(expirations.min(u64::MAX as u128) as u64);
+        // `.min(u128::from(u64::MAX))` guarantees the value fits in u64.
+        #[allow(clippy::cast_possible_truncation)]
+        let clamped = expirations.min(u128::from(u64::MAX)) as u64;
+        self.pending_expirations = self.pending_expirations.saturating_add(clamped);
 
         let remaining = if elapsed_ns % interval_ns == 0 {
             self.interval
@@ -381,16 +382,15 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> TimerFileState<Platform
         self.next_deadline = now.checked_add(remaining);
     }
 
-    fn current_spec(&mut self) -> Result<ItimerSpec, Errno> {
+    fn current_spec(&mut self) -> ItimerSpec {
         self.update();
-        let remaining = self
-            .next_deadline
-            .map(|deadline| deadline.duration_since(&self.platform.now()))
-            .unwrap_or(Duration::ZERO);
-        Ok(ItimerSpec {
+        let remaining = self.next_deadline.map_or(Duration::ZERO, |deadline| {
+            deadline.duration_since(&self.platform.now())
+        });
+        ItimerSpec {
             interval: self.interval.into(),
             value: remaining.into(),
-        })
+        }
     }
 
     fn set_time(&mut self, flags: TimerfdTimerFlags, new_value: ItimerSpec) -> Result<(), Errno> {

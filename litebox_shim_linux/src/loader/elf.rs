@@ -409,7 +409,7 @@ fn patch_elf64_relocation_entries(
     let table_end = table_offset
         .checked_add(table_size)
         .ok_or_else(invalid_program_header)?;
-    if entry_size == 0 || table_size % entry_size != 0 || table_end > data.len() {
+    if entry_size == 0 || !table_size.is_multiple_of(entry_size) || table_end > data.len() {
         return Err(invalid_program_header());
     }
 
@@ -579,8 +579,6 @@ fn patch_elf64_exec_image_with_bias(
     bias: u64,
     platform: &impl litebox::platform::DebugLogProvider,
 ) -> Result<(), ElfLoaderError> {
-    let _ = platform;
-
     const DT_PLTRELSZ: i64 = 2;
     const DT_PLTGOT: i64 = 3;
     const DT_HASH: i64 = 4;
@@ -613,6 +611,8 @@ fn patch_elf64_exec_image_with_bias(
     const SHT_REL: u32 = 9;
     const SHT_NOBITS: u32 = 8;
     const TRAMPOLINE_HEADER_SIZE: usize = 32;
+
+    let _ = platform;
     let bias = usize::try_from(bias).map_err(|_| invalid_program_header())?;
 
     let add_bias = |value: usize| -> Result<usize, ElfLoaderError> {
@@ -763,19 +763,19 @@ fn patch_elf64_exec_image_with_bias(
         dyn_value(DT_SYMTAB),
         dyn_value(DT_STRTAB),
         dyn_value(DT_SYMENT),
-    ) {
-        if strtab_addr > symtab_addr && sym_ent >= size_of::<u64>() * 2 {
-            let symtab_offset = vaddr_to_file_offset(layout, symtab_addr)?;
-            let sym_count = (strtab_addr - symtab_addr) / sym_ent;
-            for index in 0..sym_count {
-                let symbol_offset = symtab_offset
-                    .checked_add(index * sym_ent)
-                    .ok_or_else(invalid_program_header)?;
-                let shndx = read_u16(data, symbol_offset + 6)?;
-                let value = read_u64(data, symbol_offset + 8)?.truncate();
-                if shndx != 0 && layout.contains(value) {
-                    write_u64(data, symbol_offset + 8, add_bias(value)?)?;
-                }
+    ) && strtab_addr > symtab_addr
+        && sym_ent >= size_of::<u64>() * 2
+    {
+        let symtab_offset = vaddr_to_file_offset(layout, symtab_addr)?;
+        let sym_count = (strtab_addr - symtab_addr) / sym_ent;
+        for index in 0..sym_count {
+            let symbol_offset = symtab_offset
+                .checked_add(index * sym_ent)
+                .ok_or_else(invalid_program_header)?;
+            let shndx = read_u16(data, symbol_offset + 6)?;
+            let value = read_u64(data, symbol_offset + 8)?.truncate();
+            if shndx != 0 && layout.contains(value) {
+                write_u64(data, symbol_offset + 8, add_bias(value)?)?;
             }
         }
     }
@@ -903,8 +903,8 @@ fn patch_elf64_exec_image_with_bias(
             }
             if matches!(name, b".init_array" | b".fini_array" | b".preinit_array") {
                 if layout.dynamic.is_none() {
-                    for word_offset in (sh_file_offset..section_end - size_of::<u64>() + 1)
-                        .step_by(size_of::<u64>())
+                    for word_offset in
+                        (sh_file_offset..=section_end - size_of::<u64>()).step_by(size_of::<u64>())
                     {
                         let value = read_u64(data, word_offset)?.truncate();
                         if layout.contains(value) {
@@ -966,7 +966,7 @@ fn patch_elf64_exec_image_with_bias(
                 continue;
             }
             for word_offset in
-                (sh_file_offset..section_end - size_of::<u64>() + 1).step_by(size_of::<u64>())
+                (sh_file_offset..=section_end - size_of::<u64>()).step_by(size_of::<u64>())
             {
                 let value = read_u64(data, word_offset)?.truncate();
                 if layout.contains(value) {
@@ -1093,8 +1093,7 @@ impl<'a, FS: ShimFS> FileAndParsed<'a, FS> {
         let mut parsed = litebox_common_linux::loader::ElfParsedFile::parse(&mut data.as_slice())
             .map_err(ElfLoaderError::ParseError)?;
         match parsed.parse_trampoline(&mut data.as_slice(), platform.get_syscall_entry_point()) {
-            Ok(()) => {}
-            Err(litebox_common_linux::loader::ElfParseError::UnpatchedBinary) => {}
+            Ok(()) | Err(litebox_common_linux::loader::ElfParseError::UnpatchedBinary) => {}
             Err(err) => return Err(ElfLoaderError::ParseError(err)),
         }
         self.parsed = parsed;
