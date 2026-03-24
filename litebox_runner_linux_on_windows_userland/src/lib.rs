@@ -215,13 +215,21 @@ fn finish_run_with_nine_p<FS: litebox_shim_linux::ShimFS>(
     };
 
     let litebox = shim.litebox();
-    let nine_p_fs =
-        litebox::fs::nine_p::FileSystem::new(litebox, transport, 4 * 1024 * 1024, "root", "/")
+    let (writer, reader) = transport.split();
+    let msize = 4 * 1024 * 1024u32;
+    let (nine_p_fs, mut reader) =
+        litebox::fs::nine_p::FileSystem::new(litebox, writer, reader, msize, "root", "/")
             .map_err(|e| anyhow!("9P attach failed: {e:?}"))?;
 
     if cfg!(debug_assertions) {
         eprintln!("9P broker connected.");
     }
+
+    let worker_handle = nine_p_fs.worker_handle();
+    let _nine_p_worker = std::thread::spawn(move || {
+        let mut buf = alloc::vec::Vec::with_capacity(msize as usize);
+        while worker_handle.poll_responses(&mut reader, &mut buf) {}
+    });
 
     let combined = litebox::fs::layered::FileSystem::new(
         litebox,

@@ -7,7 +7,9 @@ pub mod oci;
 use anyhow::{Context, bail};
 use clap::Parser;
 use rayon::prelude::*;
-use std::collections::{BTreeMap, BTreeSet};
+#[cfg(target_os = "linux")]
+use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use tar::{Builder, Header};
 

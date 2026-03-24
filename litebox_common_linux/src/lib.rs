@@ -27,7 +27,7 @@ pub mod vmap;
 #[cfg(feature = "std")]
 extern crate std;
 
-#[cfg(feature = "std")]
+#[cfg(all(feature = "std", unix))]
 pub mod shmem_ring;
 
 extern crate alloc;

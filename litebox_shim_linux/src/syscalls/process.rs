@@ -2840,48 +2840,16 @@ impl<FS: ShimFS> Task<FS> {
     }
 
     /// Handle syscall `getgroups`.
-    pub(crate) fn sys_getgroups(&self, size: i32, list: MutPtr<u32>) -> Result<usize, Errno> {
-        fn host_errno() -> Errno {
-            let errno = unsafe { *libc::__errno_location() };
-            Errno::try_from(errno as u32).unwrap_or(Errno::EINVAL)
-        }
-
+    pub(crate) fn sys_getgroups(&self, size: i32, _list: MutPtr<u32>) -> Result<usize, Errno> {
         if size < 0 {
             return Err(Errno::EINVAL);
         }
 
-        let count = unsafe { libc::getgroups(0, core::ptr::null_mut()) };
-        if count < 0 {
-            return Err(host_errno());
-        }
-
-        let count = usize::try_from(count).map_err(|_| Errno::EINVAL)?;
-        let size = usize::try_from(size).map_err(|_| Errno::EINVAL)?;
-        if size == 0 {
-            return Ok(count);
-        }
-        if size < count {
-            return Err(Errno::EINVAL);
-        }
-        if count == 0 {
-            return Ok(0);
-        }
-
-        let mut groups = Vec::new();
-        groups.resize(count, 0 as libc::gid_t);
-        let ret = unsafe { libc::getgroups(count as i32, groups.as_mut_ptr()) };
-        if ret < 0 {
-            return Err(host_errno());
-        }
-
-        let ret = usize::try_from(ret).map_err(|_| Errno::EINVAL)?;
-        debug_assert_eq!(ret, count);
-        self.prepare_guest_write(list, ret)?;
-        for (i, gid) in groups.into_iter().enumerate().take(ret) {
-            list.write_at_offset(i.try_into().unwrap(), gid)
-                .ok_or(Errno::EFAULT)?;
-        }
-        Ok(ret)
+        // The shim currently tracks only primary/effective gids. Supplementary
+        // groups should come from LiteBox-managed process state rather than
+        // host libc, so until that state exists the sandbox exposes an empty
+        // supplemental group list on every host platform.
+        Ok(0)
     }
 }
 

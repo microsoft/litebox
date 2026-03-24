@@ -19,6 +19,7 @@ use zerocopy::{FromBytes, IntoBytes};
 /// Size of the guest FP/SIMD save area in bytes.
 const FPSTATE_SIZE: usize = litebox_common_linux::FP_STATE_SIZE;
 /// Size of the legacy FXSAVE area in bytes.
+#[cfg(any(feature = "platform_linux_userland", test))]
 const LEGACY_FPSTATE_SIZE: usize = 512;
 /// FP state area alignment.
 const FPSTATE_ALIGN: usize = 64;
@@ -38,6 +39,7 @@ const XSTATE_HEADER_SIZE: usize = 64;
 #[cfg(feature = "platform_linux_userland")]
 const XSTATE_EXTENDED_OFFSET: usize = XSTATE_HEADER_OFFSET + XSTATE_HEADER_SIZE;
 /// Offset of the software-reserved region within the legacy FXSAVE layout.
+#[cfg(any(feature = "platform_linux_userland", test))]
 const SW_RESERVED_OFFSET: usize = 464;
 /// Size of the guest signal-frame FP buffer, including Linux's trailing magic2.
 #[cfg(feature = "platform_linux_userland")]
