@@ -4754,6 +4754,12 @@ impl litebox::platform::SystemInfoProvider for WindowsUserland {
         // Windows doesn't have VDSO equivalent, return None
         None
     }
+
+    fn current_processor_number(&self) -> u32 {
+        // Keep guest rseq state aligned with the virtual CPU-0 view exposed by
+        // the Windows userland stack.
+        0
+    }
 }
 
 thread_local! {

@@ -878,6 +878,14 @@ pub trait SystemInfoProvider {
     /// Return `Some(address)` if the VDSO is available on the platform, or `None`
     /// if the platform does not support or provide a VDSO.
     fn get_vdso_address(&self) -> Option<usize>;
+
+    /// Returns the current processor number exposed to guest compatibility features.
+    ///
+    /// Platforms that do not expose a stable processor identifier, or that
+    /// virtualize CPU topology, may return `0`.
+    fn current_processor_number(&self) -> u32 {
+        0
+    }
 }
 
 /// A provider for thread-local storage.

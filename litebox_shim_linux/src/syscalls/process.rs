@@ -19,7 +19,7 @@ use litebox::mm::linux::PAGE_SIZE;
 use litebox::mm::linux::VmFlags;
 use litebox::platform::PageManagementProvider;
 use litebox::platform::ThreadProvider;
-use litebox::platform::{Instant as _, SystemTime as _, TimeProvider};
+use litebox::platform::{Instant as _, SystemInfoProvider as _, SystemTime as _, TimeProvider};
 #[allow(unused_imports)]
 // StdioProvider needed for SNP but resolved via inherent method on Linux userland
 use litebox::platform::{
@@ -2322,18 +2322,7 @@ impl<FS: ShimFS> Task<FS> {
             return Err(Errno::EINVAL);
         }
 
-        let cpu_id = {
-            #[cfg(target_os = "linux")]
-            {
-                // SAFETY: `sched_getcpu(3)` takes no pointers and has no side effects
-                // beyond reporting the current host CPU for this thread.
-                unsafe { libc::sched_getcpu() }.max(0) as u32
-            }
-            #[cfg(not(target_os = "linux"))]
-            {
-                0
-            }
-        };
+        let cpu_id = self.global.platform.current_processor_number();
 
         let cpu_ptr = crate::MutPtr::<u32>::from_usize(rseq.as_usize());
         let rseq_cs_ptr = crate::MutPtr::<u64>::from_usize(rseq.as_usize() + 8);

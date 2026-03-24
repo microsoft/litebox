@@ -5,9 +5,6 @@
 //!
 //! Examples of syscalls handled here include `getrandom`, `uname`, and similar operations.
 
-#[cfg(target_os = "linux")]
-use core::mem::MaybeUninit;
-
 use crate::{ShimFS, Task};
 use litebox::{
     platform::{Instant as _, RawConstPointer as _, RawMutPointer as _, TimeProvider as _},
@@ -70,71 +67,8 @@ const FALLBACK_SYS_INFO: litebox_common_linux::Utsname = litebox_common_linux::U
     domainname: to_fixed_size_array::<65>(""),
 };
 
-#[cfg(target_os = "linux")]
-fn c_char_array_to_fixed<const N: usize>(src: &[libc::c_char; N]) -> [u8; N] {
-    let mut dst = [0u8; N];
-    let mut i = 0;
-    while i < N {
-        dst[i] = src[i] as u8;
-        if dst[i] == 0 {
-            break;
-        }
-        i += 1;
-    }
-    if i == N {
-        dst[N - 1] = 0;
-    }
-    dst
-}
-
-#[cfg(target_os = "linux")]
-fn current_utsname() -> litebox_common_linux::Utsname {
-    let mut uts = MaybeUninit::<libc::utsname>::uninit();
-    // SAFETY: `uts` points to valid writable memory for a host `uname(2)` call.
-    if unsafe { libc::uname(uts.as_mut_ptr()) } != 0 {
-        return FALLBACK_SYS_INFO;
-    }
-    // SAFETY: The previous successful `uname(2)` call initialized the struct.
-    let uts = unsafe { uts.assume_init() };
-    litebox_common_linux::Utsname {
-        sysname: c_char_array_to_fixed(&uts.sysname),
-        nodename: c_char_array_to_fixed(&uts.nodename),
-        release: c_char_array_to_fixed(&uts.release),
-        version: c_char_array_to_fixed(&uts.version),
-        machine: c_char_array_to_fixed(&uts.machine),
-        domainname: c_char_array_to_fixed(&uts.domainname),
-    }
-}
-
-#[cfg(not(target_os = "linux"))]
 fn current_utsname() -> litebox_common_linux::Utsname {
     FALLBACK_SYS_INFO
-}
-
-#[cfg(target_os = "linux")]
-fn host_sysinfo() -> Option<litebox_common_linux::Sysinfo> {
-    let mut info = MaybeUninit::<libc::sysinfo>::uninit();
-    // SAFETY: `info` points to valid writable memory for a host `sysinfo(2)` call.
-    if unsafe { libc::sysinfo(info.as_mut_ptr()) } != 0 {
-        return None;
-    }
-    // SAFETY: The previous successful `sysinfo(2)` call initialized the struct.
-    let info = unsafe { info.assume_init() };
-    Some(litebox_common_linux::Sysinfo {
-        uptime: info.uptime.try_into().unwrap_or_default(),
-        loads: info.loads.map(|load| load as usize),
-        totalram: info.totalram as usize,
-        freeram: info.freeram as usize,
-        sharedram: info.sharedram as usize,
-        bufferram: info.bufferram as usize,
-        totalswap: info.totalswap as usize,
-        freeswap: info.freeswap as usize,
-        procs: info.procs,
-        totalhigh: info.totalhigh as usize,
-        freehigh: info.freehigh as usize,
-        mem_unit: info.mem_unit,
-        ..Default::default()
-    })
 }
 
 impl<FS: ShimFS> Task<FS> {
@@ -149,10 +83,6 @@ impl<FS: ShimFS> Task<FS> {
 
     /// Handle syscall `sysinfo`.
     pub(crate) fn sys_sysinfo(&self) -> litebox_common_linux::Sysinfo {
-        #[cfg(target_os = "linux")]
-        if let Some(info) = host_sysinfo() {
-            return info;
-        }
         let now = self.global.platform.now();
         litebox_common_linux::Sysinfo {
             uptime: now
@@ -243,6 +173,8 @@ impl<FS: ShimFS> Task<FS> {
 mod tests {
     use core::mem::MaybeUninit;
 
+    use litebox::utils::TruncateExt as _;
+
     use crate::syscalls::tests::init_platform;
 
     #[test]
@@ -280,5 +212,20 @@ mod tests {
         assert_eq!(utsname.version, expected.version);
         assert_eq!(utsname.machine, expected.machine);
         assert_eq!(utsname.domainname, expected.domainname);
+    }
+
+    #[test]
+    fn test_sysinfo_is_shim_owned() {
+        let task = init_platform(None);
+
+        let info = task.sys_sysinfo();
+        assert_eq!(info.loads, [0; 3]);
+        assert_eq!(info.procs, task.process().nr_threads().truncate());
+        assert_eq!(info.mem_unit, 1);
+        #[cfg(target_arch = "x86_64")]
+        assert_eq!(info.totalram, 4 * 1024 * 1024 * 1024);
+        #[cfg(target_arch = "x86")]
+        assert_eq!(info.totalram, 3 * 1024 * 1024 * 1024);
+        assert_eq!(info.freeram, 2 * 1024 * 1024 * 1024);
     }
 }

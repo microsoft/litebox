@@ -3374,6 +3374,12 @@ impl litebox::platform::SystemInfoProvider for LinuxUserland {
         }
         self.vdso_address
     }
+
+    fn current_processor_number(&self) -> u32 {
+        // SAFETY: `sched_getcpu(3)` takes no pointers and only reports the current
+        // processor for this thread.
+        u32::try_from(unsafe { libc::sched_getcpu() }.max(0)).unwrap_or_default()
+    }
 }
 
 thread_local! {
