@@ -876,18 +876,21 @@ pub fn run(
 
 /// Accept the IPC network-proxy client from `listener`.
 ///
-/// Loops until a connection completes the full LBNP handshake (8-byte
-/// request + 8-byte response) within `per_client_timeout` per attempt.
-/// Connections that are slow, send wrong magic/version/MTU, or close early
-/// are dropped so a stray local client cannot monopolize the listener.
+/// Loops until a connection either:
+/// - completes the full LBNP handshake and returns `Ok(Some(stream))`, or
+/// - is recognized as a direct local `LB9P` service connection and handled
+///   inline, returning `Ok(None)` so the caller can keep listening.
 ///
-/// Returns the accepted stream (already set non-blocking) once a valid LBNP
-/// handshake is complete, or an error if no valid client arrives within
-/// `overall_timeout`.  Pass `None` to wait indefinitely.
+/// Connections that are slow, send wrong magic/version/MTU, or close early are
+/// dropped so a stray local client cannot monopolize the listener.
+///
+/// Returns an error if no valid client arrives within `overall_timeout`. Pass
+/// `None` to wait indefinitely.
 pub fn accept_ipc_client(
     listener: &IpcListener,
+    local_services: Option<&LocalServiceRegistry>,
     overall_timeout: Option<Duration>,
-) -> Result<IpcStream, Box<dyn std::error::Error>> {
+) -> Result<Option<IpcStream>, Box<dyn std::error::Error>> {
     let deadline = overall_timeout.map(|d| Instant::now() + d);
     let per_client_timeout = Duration::from_secs(2);
 
@@ -911,10 +914,152 @@ pub fn accept_ipc_client(
         stream.set_nonblocking(true).ok();
         let raw_socket = stream.raw();
 
-        // Read full 8-byte handshake: magic(4) + version(2) + MTU(2).
+        // Read the 4-byte magic prefix first so we can distinguish LBNP from
+        // direct LB9P local-service connections.
         let client_deadline = Instant::now() + per_client_timeout;
         let mut buf = [0u8; 8];
         let mut got = 0usize;
+        let magic_ok = loop {
+            if Instant::now() >= client_deadline {
+                break false;
+            }
+            let remaining_ms = client_deadline
+                .saturating_duration_since(Instant::now())
+                .as_millis();
+            let mut rpfd = PollFd {
+                fd: raw_socket,
+                events: POLLIN,
+                revents: 0,
+            };
+            #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+            let ret = sock_compat::poll_fds(
+                std::slice::from_mut(&mut rpfd),
+                remaining_ms.min(100) as i32,
+            );
+            if ret <= 0 {
+                continue;
+            }
+            let n = sock_compat::recv_nb(raw_socket, &mut buf[got..4], 0);
+            if n > 0 {
+                #[allow(clippy::cast_sign_loss)]
+                {
+                    got += n as usize;
+                }
+                if got == 4 {
+                    break true;
+                }
+            } else if n == 0 {
+                break false; // peer closed
+            } else {
+                let err = sock_compat::last_socket_error();
+                if !sock_compat::is_would_block(err) {
+                    break false;
+                }
+            }
+        };
+
+        if !magic_ok || got < 4 {
+            debug!("rejected connection: only got {got}/4 magic bytes");
+            continue;
+        }
+
+        if &buf[0..4] == b"LB9P" {
+            let Some(local_services) = local_services else {
+                debug!("rejected connection: LB9P client arrived with no local services available");
+                continue;
+            };
+
+            #[cfg(unix)]
+            {
+                if local_services.get_ring(5640).is_some() {
+                    let mut marker = [0u8; 1];
+                    let marker_ready = loop {
+                        match stream.peek(&mut marker) {
+                            Ok(0) => {
+                                if Instant::now() >= client_deadline {
+                                    break false;
+                                }
+                                let remaining_ms = client_deadline
+                                    .saturating_duration_since(Instant::now())
+                                    .as_millis();
+                                let mut rpfd = PollFd {
+                                    fd: raw_socket,
+                                    events: POLLIN,
+                                    revents: 0,
+                                };
+                                #[allow(
+                                    clippy::cast_possible_truncation,
+                                    clippy::cast_possible_wrap
+                                )]
+                                let ret = sock_compat::poll_fds(
+                                    std::slice::from_mut(&mut rpfd),
+                                    remaining_ms.min(100) as i32,
+                                );
+                                if ret <= 0 {
+                                    continue;
+                                }
+                            }
+                            Ok(_) => break true,
+                            Err(e) => {
+                                warn!("failed to classify LB9P transport: {e}");
+                                break false;
+                            }
+                        }
+                    };
+
+                    if !marker_ready {
+                        debug!("rejected LB9P connection: timed out waiting for transport marker");
+                        continue;
+                    }
+
+                    if marker[0] == 0 {
+                        let Some(ring_spawner) = local_services.get_ring(5640) else {
+                            warn!("LB9P ring marker received but no ring service registered");
+                            continue;
+                        };
+                        match recv_ring_fds(&stream) {
+                            Ok((tx_fd, rx_fd)) => {
+                                match litebox_common_linux::shmem_ring::ShmemRingPair::open(
+                                    tx_fd, rx_fd,
+                                ) {
+                                    Ok((writer, reader)) => {
+                                        stream.set_nonblocking(false).ok();
+                                        use std::io::Write as _;
+                                        let _ = stream.write_all(b"K");
+                                        ring_spawner(writer, reader);
+                                        info!("direct 9P channel connected (shared memory)");
+                                    }
+                                    Err(e) => {
+                                        warn!("failed to open ring pair: {e}");
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                warn!("failed to receive ring fds: {e}");
+                            }
+                        }
+                        return Ok(None);
+                    }
+                }
+            }
+
+            if let Some(spawner) = local_services.get(5640) {
+                let stream = sock_compat::into_blocking_tcp_stream(stream);
+                spawner(stream);
+                info!("direct 9P channel connected");
+            } else {
+                warn!("LB9P connection but no 9P service registered");
+            }
+            return Ok(None);
+        }
+
+        if &buf[0..4] != HANDSHAKE_MAGIC {
+            debug!("rejected connection: wrong magic {:02x?}", &buf[0..4]);
+            continue;
+        }
+
+        // Read the remaining 4 bytes of the LBNP handshake:
+        // version(2) + MTU(2).
         let ok = loop {
             if Instant::now() >= client_deadline {
                 break false;
@@ -955,15 +1100,10 @@ pub fn accept_ipc_client(
         };
 
         if !ok || got < 8 {
-            debug!("rejected connection: only got {got}/8 handshake bytes");
+            debug!("rejected connection: only got {got}/8 LBNP handshake bytes");
             continue;
         }
 
-        // Validate magic, version, MTU.
-        if &buf[0..4] != HANDSHAKE_MAGIC {
-            debug!("rejected connection: wrong magic {:02x?}", &buf[0..4]);
-            continue;
-        }
         let version = u16::from_le_bytes([buf[4], buf[5]]);
         let mtu = u16::from_le_bytes([buf[6], buf[7]]);
         #[allow(clippy::cast_possible_truncation)]
@@ -1024,7 +1164,7 @@ pub fn accept_ipc_client(
             version,
             mtu, "accepted valid LBNP client, handshake complete"
         );
-        return Ok(stream);
+        return Ok(Some(stream));
     }
 }
 
@@ -1738,6 +1878,11 @@ fn build_udp_packet(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
+    use std::time::Duration;
 
     #[test]
     fn test_build_udp_packet_valid() {
@@ -1756,5 +1901,59 @@ mod tests {
 
         // Verify IP header checksum is valid.
         assert_eq!(device::internet_checksum(&pkt[..20]), 0);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_accept_ipc_client_handles_initial_lb9p_connection() {
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("bind probe listener");
+        let port = probe.local_addr().expect("probe local_addr").port();
+        drop(probe);
+
+        let listener =
+            IpcListener::bind_endpoint(&format!("127.0.0.1:{port}")).expect("bind IPC listener");
+
+        let invoked = Arc::new(AtomicBool::new(false));
+        let invoked_flag = Arc::clone(&invoked);
+        let mut local_services = LocalServiceRegistry::new();
+        local_services.register(
+            5640,
+            Box::new(move |_stream| {
+                let invoked_flag = Arc::clone(&invoked_flag);
+                std::thread::spawn(move || {
+                    invoked_flag.store(true, Ordering::SeqCst);
+                })
+            }),
+        );
+
+        let endpoint = format!("127.0.0.1:{port}");
+        let client = std::thread::spawn(move || {
+            let mut stream = std::net::TcpStream::connect(&endpoint).expect("connect test client");
+            use std::io::Write as _;
+            stream.write_all(b"LB9P").expect("send LB9P magic");
+            std::thread::sleep(Duration::from_millis(100));
+        });
+
+        let accepted = accept_ipc_client(
+            &listener,
+            Some(&local_services),
+            Some(Duration::from_secs(2)),
+        )
+        .expect("accept direct LB9P connection");
+        assert!(
+            accepted.is_none(),
+            "LB9P connection should be handled inline"
+        );
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while !invoked.load(Ordering::SeqCst) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "local 9P service was not spawned"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        client.join().expect("join client thread");
     }
 }

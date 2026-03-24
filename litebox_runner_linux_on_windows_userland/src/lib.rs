@@ -64,13 +64,20 @@ pub struct CliArgs {
         help_heading = "Unstable Options"
     )]
     pub network_broker: Option<String>,
-    /// Connect to a 9P file broker at the given address (e.g., 10.0.0.1:5640).
+    /// Connect to a 9P file broker for host filesystem access.
     ///
-    /// Requires --tun-device-name. The broker must be a 9P2000.L server
-    /// listening on the TUN gateway.
+    /// Accepts either a Windows AF_UNIX socket path for direct local IPC or a
+    /// TCP address for guest-network transport.
+    ///
+    /// - **IPC mode** (socket path): opens a direct local `LB9P` channel to
+    ///   the broker and does not require `--tun-device-name`.
+    /// - **TCP mode** (address): routes 9P over the guest network stack and
+    ///   requires a network backend (`--tun-device-name` or
+    ///   `--network-broker`).
     #[arg(
         long = "nine-p-broker",
-        requires_all = ["unstable", "tun_device_name"],
+        value_name = "ADDR_OR_PATH",
+        requires = "unstable",
         help_heading = "Unstable Options"
     )]
     pub nine_p_broker: Option<String>,
@@ -78,6 +85,83 @@ pub struct CliArgs {
     /// Defaults to "/".
     #[arg(long = "cwd", requires = "unstable", help_heading = "Unstable Options")]
     pub working_directory: Option<String>,
+}
+
+enum NinePBrokerEndpoint {
+    Tcp(core::net::SocketAddr),
+    IpcPath(String),
+}
+
+struct IpcTransportWriter(litebox_platform_windows_userland::IpcStream);
+
+struct IpcTransportReader(litebox_platform_windows_userland::IpcStream);
+
+impl litebox::fs::nine_p::transport::Write for IpcTransportWriter {
+    fn write(
+        &mut self,
+        buf: &[u8],
+    ) -> core::result::Result<usize, litebox::fs::nine_p::transport::WriteError> {
+        std::io::Write::write(&mut self.0, buf).map_err(|err| match err.kind() {
+            std::io::ErrorKind::Interrupted => {
+                litebox::fs::nine_p::transport::WriteError::Interrupted
+            }
+            _ => litebox::fs::nine_p::transport::WriteError::Io,
+        })
+    }
+}
+
+impl litebox::fs::nine_p::transport::Read for IpcTransportReader {
+    fn read(
+        &mut self,
+        buf: &mut [u8],
+    ) -> core::result::Result<usize, litebox::fs::nine_p::transport::ReadError> {
+        std::io::Read::read(&mut self.0, buf).map_err(|err| match err.kind() {
+            std::io::ErrorKind::Interrupted => {
+                litebox::fs::nine_p::transport::ReadError::Interrupted
+            }
+            _ => litebox::fs::nine_p::transport::ReadError::Io,
+        })
+    }
+}
+
+fn parse_nine_p_broker_endpoint(endpoint: &str) -> NinePBrokerEndpoint {
+    match endpoint.parse::<core::net::SocketAddr>() {
+        Ok(addr) => NinePBrokerEndpoint::Tcp(addr),
+        Err(_) => NinePBrokerEndpoint::IpcPath(endpoint.to_string()),
+    }
+}
+
+fn split_ipc_stream(
+    stream: litebox_platform_windows_userland::IpcStream,
+) -> Result<(IpcTransportWriter, IpcTransportReader)> {
+    match stream {
+        litebox_platform_windows_userland::IpcStream::Tcp(stream) => {
+            let reader = stream
+                .try_clone()
+                .map_err(|e| anyhow!("Failed to clone direct 9P TCP stream: {e}"))?;
+            Ok((
+                IpcTransportWriter(litebox_platform_windows_userland::IpcStream::from_tcp(
+                    stream,
+                )),
+                IpcTransportReader(litebox_platform_windows_userland::IpcStream::from_tcp(
+                    reader,
+                )),
+            ))
+        }
+        litebox_platform_windows_userland::IpcStream::Unix(stream) => {
+            let reader = stream
+                .try_clone()
+                .map_err(|e| anyhow!("Failed to clone direct 9P AF_UNIX stream: {e}"))?;
+            Ok((
+                IpcTransportWriter(litebox_platform_windows_userland::IpcStream::from_unix(
+                    stream,
+                )),
+                IpcTransportReader(litebox_platform_windows_userland::IpcStream::from_unix(
+                    reader,
+                )),
+            ))
+        }
+    }
 }
 
 /// Run Linux programs with LiteBox on unmodified Windows
@@ -200,77 +284,161 @@ fn finish_run_with_nine_p<FS: litebox_shim_linux::ShimFS>(
     envp: Vec<alloc::ffi::CString>,
 ) -> Result<()> {
     let broker_addr = cli_args.nine_p_broker.as_deref().unwrap();
-    let addr: core::net::SocketAddr = broker_addr
-        .parse()
-        .map_err(|e| anyhow!("Invalid 9P broker address '{broker_addr}': {e}"))?;
-
-    let shim = shim_builder.build();
-
-    let shutdown = std::sync::Arc::new(core::sync::atomic::AtomicBool::new(false));
-    let net_worker = start_network_worker(&shim, &shutdown);
+    let endpoint = parse_nine_p_broker_endpoint(broker_addr);
 
     if cfg!(debug_assertions) {
         eprintln!("Connecting to 9P broker at {broker_addr}...");
     }
 
-    // Retry connection with backoff (broker might not be listening yet).
-    let transport = {
-        let mut attempts = 0;
-        loop {
-            match shim.tcp_connection(addr) {
-                Ok(t) => break t,
-                Err(e) => {
+    match endpoint {
+        NinePBrokerEndpoint::IpcPath(path) => {
+            let (writer, reader) = connect_to_nine_p_ipc(&path)?;
+            let shim = shim_builder.build();
+            let shutdown = std::sync::Arc::new(core::sync::atomic::AtomicBool::new(false));
+            let net_worker = start_network_worker(&shim, &shutdown);
+
+            let litebox = shim.litebox();
+            let msize = 4 * 1024 * 1024u32;
+            let (nine_p_fs, mut reader) =
+                litebox::fs::nine_p::FileSystem::new(litebox, writer, reader, msize, "root", "/")
+                    .map_err(|e| anyhow!("9P attach failed: {e:?}"))?;
+
+            if cfg!(debug_assertions) {
+                eprintln!("9P broker connected.");
+            }
+
+            let worker_handle = nine_p_fs.worker_handle();
+            let _nine_p_worker = std::thread::spawn(move || {
+                let mut buf = alloc::vec::Vec::with_capacity(msize as usize);
+                while worker_handle.poll_responses(&mut reader, &mut buf) {}
+            });
+
+            let combined = litebox::fs::layered::FileSystem::new(
+                litebox,
+                base_fs,
+                nine_p_fs,
+                litebox::fs::layered::LayeringSemantics::LowerLayerWritableFiles,
+            );
+            let combined_fs = std::sync::Arc::new(combined);
+
+            let cwd = cli_args.working_directory.clone();
+            let program = shim
+                .load_program(
+                    combined_fs,
+                    platform.init_task(),
+                    prog_path,
+                    argv,
+                    envp,
+                    cwd,
+                )
+                .unwrap();
+
+            run_program(program, shutdown, net_worker)
+        }
+        NinePBrokerEndpoint::Tcp(addr) => {
+            if !litebox_platform_multiplex::platform().has_network() {
+                anyhow::bail!(
+                    "--nine-p-broker with a TCP address requires a network backend \
+                     (`--tun-device-name` or `--network-broker`)"
+                );
+            }
+
+            let shim = shim_builder.build();
+            let shutdown = std::sync::Arc::new(core::sync::atomic::AtomicBool::new(false));
+            let net_worker = start_network_worker(&shim, &shutdown);
+
+            // Retry connection with backoff (broker might not be listening yet).
+            let transport = {
+                let mut attempts = 0;
+                loop {
+                    match shim.tcp_connection(addr) {
+                        Ok(t) => break t,
+                        Err(e) => {
+                            attempts += 1;
+                            if attempts >= 50 {
+                                return Err(anyhow!(
+                                    "Failed to connect to 9P broker at {broker_addr} \
+                                     after {attempts} attempts: {e:?}"
+                                ));
+                            }
+                            std::thread::sleep(std::time::Duration::from_millis(100));
+                        }
+                    }
+                }
+            };
+
+            let litebox = shim.litebox();
+            let (writer, reader) = transport.split();
+            let msize = 4 * 1024 * 1024u32;
+            let (nine_p_fs, mut reader) =
+                litebox::fs::nine_p::FileSystem::new(litebox, writer, reader, msize, "root", "/")
+                    .map_err(|e| anyhow!("9P attach failed: {e:?}"))?;
+
+            if cfg!(debug_assertions) {
+                eprintln!("9P broker connected.");
+            }
+
+            let worker_handle = nine_p_fs.worker_handle();
+            let _nine_p_worker = std::thread::spawn(move || {
+                let mut buf = alloc::vec::Vec::with_capacity(msize as usize);
+                while worker_handle.poll_responses(&mut reader, &mut buf) {}
+            });
+
+            let combined = litebox::fs::layered::FileSystem::new(
+                litebox,
+                base_fs,
+                nine_p_fs,
+                litebox::fs::layered::LayeringSemantics::LowerLayerWritableFiles,
+            );
+            let combined_fs = std::sync::Arc::new(combined);
+
+            let cwd = cli_args.working_directory.clone();
+            let program = shim
+                .load_program(
+                    combined_fs,
+                    platform.init_task(),
+                    prog_path,
+                    argv,
+                    envp,
+                    cwd,
+                )
+                .unwrap();
+
+            run_program(program, shutdown, net_worker)
+        }
+    }
+}
+
+fn connect_to_nine_p_ipc(endpoint: &str) -> Result<(IpcTransportWriter, IpcTransportReader)> {
+    let mut attempts = 0;
+    loop {
+        match connect_to_ipc_endpoint(endpoint) {
+            Ok(mut stream) => {
+                if let Err(err) = perform_nine_p_ipc_handshake(&mut stream) {
                     attempts += 1;
                     if attempts >= 50 {
                         return Err(anyhow!(
-                            "Failed to connect to 9P broker at {broker_addr} \
-                             after {attempts} attempts: {e:?}"
+                            "Failed to connect to direct 9P broker at {endpoint} \
+                             after {attempts} attempts: {err}"
                         ));
                     }
                     std::thread::sleep(std::time::Duration::from_millis(100));
+                    continue;
                 }
+                return split_ipc_stream(stream);
+            }
+            Err(err) => {
+                attempts += 1;
+                if attempts >= 50 {
+                    return Err(anyhow!(
+                        "Failed to connect to direct 9P broker at {endpoint} \
+                         after {attempts} attempts: {err}"
+                    ));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
             }
         }
-    };
-
-    let litebox = shim.litebox();
-    let (writer, reader) = transport.split();
-    let msize = 4 * 1024 * 1024u32;
-    let (nine_p_fs, mut reader) =
-        litebox::fs::nine_p::FileSystem::new(litebox, writer, reader, msize, "root", "/")
-            .map_err(|e| anyhow!("9P attach failed: {e:?}"))?;
-
-    if cfg!(debug_assertions) {
-        eprintln!("9P broker connected.");
     }
-
-    let worker_handle = nine_p_fs.worker_handle();
-    let _nine_p_worker = std::thread::spawn(move || {
-        let mut buf = alloc::vec::Vec::with_capacity(msize as usize);
-        while worker_handle.poll_responses(&mut reader, &mut buf) {}
-    });
-
-    let combined = litebox::fs::layered::FileSystem::new(
-        litebox,
-        base_fs,
-        nine_p_fs,
-        litebox::fs::layered::LayeringSemantics::LowerLayerWritableFiles,
-    );
-    let combined_fs = std::sync::Arc::new(combined);
-
-    let cwd = cli_args.working_directory.clone();
-    let program = shim
-        .load_program(
-            combined_fs,
-            platform.init_task(),
-            prog_path,
-            argv,
-            envp,
-            cwd,
-        )
-        .unwrap();
-
-    run_program(program, shutdown, net_worker)
 }
 
 /// Run the loaded program and exit with its return code.
@@ -343,16 +511,20 @@ const HANDSHAKE_MTU: u16 = 1600;
 /// LBNP handshake. Returns a non-blocking IPC stream ready for the platform's
 /// `IPInterfaceProvider` to use.
 fn connect_to_broker_ipc(endpoint: &str) -> Result<litebox_platform_windows_userland::IpcStream> {
-    let mut stream = match endpoint.parse::<std::net::SocketAddr>() {
-        Ok(sock_addr) => connect_to_broker_tcp(endpoint, sock_addr)?,
-        Err(_) => connect_to_broker_unix(endpoint)?,
-    };
+    let mut stream = connect_to_ipc_endpoint(endpoint)?;
     perform_ipc_handshake(&mut stream)?;
     stream
         .set_nonblocking(true)
         .map_err(|e| anyhow!("Failed to set non-blocking on IPC stream: {e}"))?;
     stream.set_read_timeout(None).ok();
     Ok(stream)
+}
+
+fn connect_to_ipc_endpoint(endpoint: &str) -> Result<litebox_platform_windows_userland::IpcStream> {
+    match endpoint.parse::<std::net::SocketAddr>() {
+        Ok(sock_addr) => connect_to_broker_tcp(endpoint, sock_addr),
+        Err(_) => connect_to_broker_unix(endpoint),
+    }
 }
 
 fn connect_to_broker_tcp(
@@ -482,6 +654,16 @@ fn perform_ipc_handshake(stream: &mut litebox_platform_windows_userland::IpcStre
     Ok(())
 }
 
+fn perform_nine_p_ipc_handshake(
+    stream: &mut litebox_platform_windows_userland::IpcStream,
+) -> Result<()> {
+    use std::io::Write;
+
+    stream
+        .write_all(b"LB9P")
+        .map_err(|e| anyhow!("9P IPC handshake send failed: {e}"))
+}
+
 #[allow(
     non_camel_case_types,
     non_snake_case,
@@ -590,4 +772,70 @@ fn fixup_env(envp: &mut Vec<alloc::ffi::CString>) {
     let _ = envp;
     // No environment fixups needed — the shim's mmap hook handles
     // syscall patching at runtime without LD_AUDIT.
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_nine_p_broker_endpoint_recognizes_tcp_addresses() {
+        match parse_nine_p_broker_endpoint("127.0.0.1:5640") {
+            NinePBrokerEndpoint::Tcp(addr) => {
+                assert_eq!(addr, "127.0.0.1:5640".parse().unwrap());
+            }
+            NinePBrokerEndpoint::IpcPath(path) => {
+                panic!("expected TCP endpoint, got IPC path {path}");
+            }
+        }
+    }
+
+    #[test]
+    fn parse_nine_p_broker_endpoint_treats_windows_paths_as_ipc() {
+        match parse_nine_p_broker_endpoint(r"C:\temp\litebox-9p.sock") {
+            NinePBrokerEndpoint::Tcp(addr) => {
+                panic!("expected IPC path, got TCP endpoint {addr}");
+            }
+            NinePBrokerEndpoint::IpcPath(path) => {
+                assert_eq!(path, r"C:\temp\litebox-9p.sock");
+            }
+        }
+    }
+
+    #[test]
+    fn cli_allows_nine_p_ipc_path_without_tun() {
+        let cli = CliArgs::try_parse_from([
+            "litebox-runner-linux-on-windows-userland",
+            "--unstable",
+            "--initial-files",
+            "guest.tar",
+            "--nine-p-broker",
+            r"C:\temp\litebox-9p.sock",
+            "/bin/true",
+        ])
+        .expect("IPC 9P mode should not require a TUN device");
+
+        assert_eq!(
+            cli.nine_p_broker.as_deref(),
+            Some(r"C:\temp\litebox-9p.sock")
+        );
+        assert!(cli.tun_device_name.is_none());
+    }
+
+    #[test]
+    fn cli_allows_nine_p_tcp_without_tun() {
+        let cli = CliArgs::try_parse_from([
+            "litebox-runner-linux-on-windows-userland",
+            "--unstable",
+            "--initial-files",
+            "guest.tar",
+            "--nine-p-broker",
+            "127.0.0.1:5640",
+            "/bin/true",
+        ])
+        .expect("TCP 9P mode should parse without clap forcing a TUN device");
+
+        assert_eq!(cli.nine_p_broker.as_deref(), Some("127.0.0.1:5640"));
+        assert!(cli.tun_device_name.is_none());
+    }
 }

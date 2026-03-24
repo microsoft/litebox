@@ -192,15 +192,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // proxy event loop.  Stray/slow clients are rejected quickly so they
         // cannot block the real runner from connecting.
         loop {
-            let ipc = match litebox_broker::net_proxy::accept_ipc_client(&listener, None) {
-                Ok(s) => s,
+            let registry = build_local_services(&cli, Arc::clone(&elf_cache));
+            let ipc = match litebox_broker::net_proxy::accept_ipc_client(
+                &listener,
+                registry.as_ref(),
+                None,
+            ) {
+                Ok(Some(s)) => s,
+                Ok(None) => continue,
                 Err(e) => {
                     tracing::error!("accept_ipc_client error: {e}");
                     continue;
                 }
             };
             info!("network proxy client connected");
-            let registry = build_local_services(&cli, Arc::clone(&elf_cache));
             if let Err(e) = litebox_broker::net_proxy::run(ipc, true, registry, Some(&listener)) {
                 tracing::error!("network proxy error: {e}");
             }
