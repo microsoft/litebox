@@ -16,6 +16,7 @@ use litebox::{
         wait::{WaitContext, WaitError, Waker},
     },
     fd::{FdEnabledSubsystem, FdEnabledSubsystemEntry, TypedFd},
+    fs::OFlags,
     utils::ReinterpretUnsignedExt,
 };
 use litebox_common_linux::{EpollEvent, EpollOp, errno::Errno};
@@ -192,7 +193,7 @@ impl<FS: ShimFS> EpollFile<FS> {
         EpollFile {
             interests: litebox::sync::Mutex::new(BTreeMap::new()),
             ready: Arc::new(ReadySet::new()),
-            status: core::sync::atomic::AtomicU32::new(0),
+            status: core::sync::atomic::AtomicU32::new(OFlags::RDWR.bits()),
             needs_host_poll: core::sync::atomic::AtomicBool::new(false),
         }
     }

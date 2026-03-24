@@ -1583,6 +1583,87 @@ where
     Ok(total_written)
 }
 
+fn fcntl_status_flags<FS: ShimFS>(
+    task: &Task<FS>,
+    files: &FilesState<FS>,
+    desc: usize,
+) -> Result<OFlags, Errno> {
+    macro_rules! getfl_from_metadata {
+        ($fd:expr, $MetaType:path) => {
+            Ok(task
+                .global
+                .litebox
+                .descriptor_table()
+                .with_metadata($fd, |$MetaType(flags)| *flags)
+                .unwrap_or(OFlags::empty()))
+        };
+    }
+    macro_rules! getfl_from_handle {
+        ($fd:ident) => {{
+            let handle = task
+                .global
+                .litebox
+                .descriptor_table()
+                .entry_handle($fd)
+                .ok_or(Errno::EBADF)?;
+            handle.with_entry(|file| Ok(file.get_status()))
+        }};
+    }
+    files
+        .run_on_raw_fd(
+            desc,
+            |fd| getfl_from_metadata!(fd, crate::StdioStatusFlags),
+            |fd| getfl_from_metadata!(fd, crate::syscalls::net::SocketOFlags),
+            |fd| getfl_from_metadata!(fd, crate::PipeStatusFlags),
+            |fd| getfl_from_handle!(fd),
+            |fd| getfl_from_handle!(fd),
+            |fd| getfl_from_handle!(fd),
+        )
+        .flatten()
+        .map(|flags| flags & OFlags::STATUS_FLAGS_MASK)
+}
+
+fn validate_fcntl_lock_fd(open_flags: OFlags) -> Result<OFlags, Errno> {
+    if open_flags.contains(OFlags::PATH) {
+        return Err(Errno::EBADF);
+    }
+    Ok(open_flags & (OFlags::WRONLY | OFlags::RDWR))
+}
+
+fn emulate_fcntl_getlk(
+    lock: MutPtr<litebox_common_linux::Flock>,
+    park_before_guest_write: impl FnOnce(),
+) -> Result<u32, Errno> {
+    let mut flock = lock.read_at_offset(0).ok_or(Errno::EFAULT)?;
+    let lock_type =
+        litebox_common_linux::FlockType::try_from(flock.type_).map_err(|_| Errno::EINVAL)?;
+    if let litebox_common_linux::FlockType::Unlock = lock_type {
+        return Err(Errno::EINVAL);
+    }
+    flock.type_ = litebox_common_linux::FlockType::Unlock as i16;
+    park_before_guest_write();
+    lock.write_at_offset(0, flock).ok_or(Errno::EFAULT)?;
+    Ok(0)
+}
+
+fn emulate_fcntl_setlk(
+    lock: ConstPtr<litebox_common_linux::Flock>,
+    open_flags: OFlags,
+) -> Result<u32, Errno> {
+    let flock = lock.read_at_offset(0).ok_or(Errno::EFAULT)?;
+    let lock_type =
+        litebox_common_linux::FlockType::try_from(flock.type_).map_err(|_| Errno::EINVAL)?;
+    let access = validate_fcntl_lock_fd(open_flags)?;
+    if matches!(lock_type, litebox_common_linux::FlockType::ReadLock) && access == OFlags::WRONLY {
+        return Err(Errno::EBADF);
+    }
+    if matches!(lock_type, litebox_common_linux::FlockType::WriteLock) && access == OFlags::empty()
+    {
+        return Err(Errno::EBADF);
+    }
+    Ok(0)
+}
+
 fn total_readv_len(iovs: &[IoReadVec<MutPtr<u8>>]) -> Result<usize, Errno> {
     iovs.iter().try_fold(0usize, |total, iov| {
         let Ok(_iov_len) = isize::try_from(iov.iov_len) else {
@@ -2435,44 +2516,7 @@ impl<FS: ShimFS> Task<FS> {
             FcntlArg::SETFD(flags) => {
                 set_file_descriptor_flags(desc, &self.global, &files, flags).map(|()| 0)
             }
-            FcntlArg::GETFL => {
-                macro_rules! getfl_from_metadata {
-                    ($fd:expr, $MetaType:path) => {
-                        Ok(self
-                            .global
-                            .litebox
-                            .descriptor_table()
-                            .with_metadata($fd, |$MetaType(flags)| {
-                                *flags & OFlags::STATUS_FLAGS_MASK
-                            })
-                            .unwrap_or(OFlags::empty()))
-                    };
-                }
-                macro_rules! getfl_from_handle {
-                    ($fd:ident) => {{
-                        // TODO: Consider shared metadata table?
-                        let handle = self
-                            .global
-                            .litebox
-                            .descriptor_table()
-                            .entry_handle($fd)
-                            .ok_or(Errno::EBADF)?;
-                        handle.with_entry(|file| Ok(file.get_status()))
-                    }};
-                }
-                Ok(files
-                    .run_on_raw_fd(
-                        desc,
-                        |fd| getfl_from_metadata!(fd, crate::StdioStatusFlags),
-                        |fd| getfl_from_metadata!(fd, crate::syscalls::net::SocketOFlags),
-                        |fd| getfl_from_metadata!(fd, crate::PipeStatusFlags),
-                        |fd| getfl_from_handle!(fd),
-                        |fd| getfl_from_handle!(fd),
-                        |fd| getfl_from_handle!(fd),
-                    )
-                    .flatten()?
-                    .bits())
-            }
+            FcntlArg::GETFL => Ok(fcntl_status_flags(self, &files, desc)?.bits()),
             FcntlArg::SETFL(flags) => {
                 let setfl_mask = OFlags::APPEND
                     | OFlags::NONBLOCK
@@ -2560,7 +2604,10 @@ impl<FS: ShimFS> Task<FS> {
                         toggle_flags!(fd);
                         Ok(())
                     },
-                    |_fd| todo!("epoll"),
+                    |fd| {
+                        toggle_flags!(fd);
+                        Ok(())
+                    },
                     |fd| {
                         toggle_flags!(fd);
                         Ok(())
@@ -2569,53 +2616,13 @@ impl<FS: ShimFS> Task<FS> {
                 Ok(0)
             }
             FcntlArg::GETLK(lock) => {
-                self.files
-                    .borrow()
-                    .run_on_raw_fd(
-                        desc,
-                        |_fd| {
-                            let mut flock = lock.read_at_offset(0).ok_or(Errno::EFAULT)?;
-                            let lock_type = litebox_common_linux::FlockType::try_from(flock.type_)
-                                .map_err(|_| Errno::EINVAL)?;
-                            if let litebox_common_linux::FlockType::Unlock = lock_type {
-                                return Err(Errno::EINVAL);
-                            }
-
-                            // Note LiteBox does not support multiple processes yet, and one process
-                            // can always acquire the lock it owns, so return `Unlock` unconditionally.
-                            flock.type_ = litebox_common_linux::FlockType::Unlock as i16;
-                            lock.write_at_offset(0, flock).ok_or(Errno::EFAULT)?;
-                            Ok(0)
-                        },
-                        |_fd| todo!("net"),
-                        |_fd| todo!("pipes"),
-                        |_fd| Err(Errno::EBADF),
-                        |_fd| Err(Errno::EBADF),
-                        |_fd| Err(Errno::EBADF),
-                    )
-                    .flatten()
+                let open_flags = fcntl_status_flags(self, &files, desc)?;
+                let _ = validate_fcntl_lock_fd(open_flags)?;
+                emulate_fcntl_getlk(lock, || self.park_if_deferred())
             }
             FcntlArg::SETLK(lock) | FcntlArg::SETLKW(lock) => {
-                self.files
-                    .borrow()
-                    .run_on_raw_fd(
-                        desc,
-                        |_fd| {
-                            let flock = lock.read_at_offset(0).ok_or(Errno::EFAULT)?;
-                            let _ = litebox_common_linux::FlockType::try_from(flock.type_)
-                                .map_err(|_| Errno::EINVAL)?;
-
-                            // Note LiteBox does not support multiple processes yet, and one process
-                            // can always acquire the lock it owns, so we don't need to maintain anything.
-                            Ok(0)
-                        },
-                        |_fd| todo!("net"),
-                        |_fd| todo!("pipes"),
-                        |_fd| Err(Errno::EBADF),
-                        |_fd| Err(Errno::EBADF),
-                        |_fd| Err(Errno::EBADF),
-                    )
-                    .flatten()
+                let open_flags = fcntl_status_flags(self, &files, desc)?;
+                emulate_fcntl_setlk(lock, open_flags)
             }
             FcntlArg::DUPFD { cloexec, min_fd } => {
                 let max_fd = self

@@ -3,10 +3,13 @@
 
 use litebox::fs::{FileSystem as _, Mode, OFlags};
 use litebox::platform::RawConstPointer as _;
-use litebox_common_linux::{AtFlags, EfdFlags, FcntlArg, FileDescriptorFlags, errno::Errno};
+use litebox_common_linux::{
+    AddressFamily, AtFlags, ClockId, EfdFlags, EpollCreateFlags, FcntlArg, FileDescriptorFlags,
+    Flock, FlockType, SockType, TimerfdFlags, errno::Errno,
+};
 use litebox_platform_multiplex::{Platform, set_platform};
 
-use crate::MutPtr;
+use crate::{ConstPtr, MutPtr};
 
 extern crate std;
 
@@ -94,6 +97,33 @@ fn test_fcntl() {
         .expect("Failed to create eventfd");
     let eventfd = i32::try_from(eventfd).unwrap();
     check(eventfd, OFlags::RDWR | OFlags::NONBLOCK, OFlags::RDWR);
+
+    let epoll = task
+        .sys_epoll_create(EpollCreateFlags::EPOLL_CLOEXEC)
+        .expect("Failed to create epoll fd");
+    let epoll = i32::try_from(epoll).unwrap();
+    assert_eq!(
+        task.sys_fcntl(epoll, FcntlArg::GETFL).unwrap(),
+        OFlags::RDWR.bits()
+    );
+    task.sys_fcntl(epoll, FcntlArg::SETFL(OFlags::RDWR | OFlags::NONBLOCK))
+        .expect("Failed to set epoll O_NONBLOCK");
+    assert_eq!(
+        task.sys_fcntl(epoll, FcntlArg::GETFL).unwrap(),
+        (OFlags::RDWR | OFlags::NONBLOCK).bits()
+    );
+
+    let timerfd = task
+        .sys_timerfd_create(
+            ClockId::Monotonic,
+            TimerfdFlags::NONBLOCK | TimerfdFlags::CLOEXEC,
+        )
+        .expect("Failed to create timerfd");
+    let timerfd = i32::try_from(timerfd).unwrap();
+    assert_eq!(
+        task.sys_fcntl(timerfd, FcntlArg::GETFL).unwrap(),
+        (OFlags::RDWR | OFlags::NONBLOCK).bits()
+    );
 }
 
 #[test]
@@ -169,6 +199,151 @@ fn test_inotify_stub() {
     task.sys_inotify_rm_watch(dup_fd, wd)
         .expect("Failed to remove watch through dup fd");
     assert_eq!(task.sys_inotify_rm_watch(fd, wd), Err(Errno::EINVAL));
+}
+
+#[test]
+fn test_fcntl_locking_on_non_file_descriptors() {
+    let task = init_platform(None);
+
+    let new_flock = |lock_type: FlockType| Flock {
+        type_: lock_type as i16,
+        whence: 0,
+        #[cfg(target_pointer_width = "64")]
+        __pad0: 0,
+        start: 0,
+        len: 0,
+        pid: 0,
+        #[cfg(target_pointer_width = "64")]
+        __pad1: 0,
+    };
+
+    let (read_fd, write_fd) = task.sys_pipe2(OFlags::empty()).unwrap();
+    let read_fd = i32::try_from(read_fd).unwrap();
+    let write_fd = i32::try_from(write_fd).unwrap();
+
+    let udp_fd = task
+        .sys_socket(AddressFamily::INET as u32, SockType::Datagram as u32, 0)
+        .expect("Failed to create UDP socket");
+    let udp_fd = i32::try_from(udp_fd).unwrap();
+
+    let eventfd = task
+        .sys_eventfd2(0, EfdFlags::empty())
+        .expect("Failed to create eventfd");
+    let eventfd = i32::try_from(eventfd).unwrap();
+
+    let epoll = task
+        .sys_epoll_create(EpollCreateFlags::empty())
+        .expect("Failed to create epoll fd");
+    let epoll = i32::try_from(epoll).unwrap();
+
+    let mut sv = [0u32; 2];
+    task.sys_socketpair(
+        AddressFamily::UNIX as u32,
+        SockType::Stream as u32,
+        0,
+        MutPtr::from_usize(sv.as_mut_ptr() as usize),
+    )
+    .expect("Failed to create unix socketpair");
+    let unix_fd = i32::try_from(sv[0]).unwrap();
+    let unix_peer = i32::try_from(sv[1]).unwrap();
+
+    let read_lock = new_flock(FlockType::ReadLock);
+    let write_lock = new_flock(FlockType::WriteLock);
+    let unlock = new_flock(FlockType::Unlock);
+
+    let mut getlk = new_flock(FlockType::WriteLock);
+    task.sys_fcntl(
+        eventfd,
+        FcntlArg::GETLK(MutPtr::from_usize((&mut getlk as *mut Flock) as usize)),
+    )
+    .expect("GETLK should succeed on eventfd");
+    assert_eq!(getlk.type_, FlockType::Unlock as i16);
+
+    let mut bad_getlk = new_flock(FlockType::Unlock);
+    assert_eq!(
+        task.sys_fcntl(
+            eventfd,
+            FcntlArg::GETLK(MutPtr::from_usize((&mut bad_getlk as *mut Flock) as usize)),
+        )
+        .unwrap_err(),
+        Errno::EINVAL
+    );
+
+    assert_eq!(
+        task.sys_fcntl(
+            read_fd,
+            FcntlArg::SETLK(ConstPtr::from_usize((&read_lock as *const Flock) as usize)),
+        )
+        .unwrap(),
+        0
+    );
+    assert_eq!(
+        task.sys_fcntl(
+            read_fd,
+            FcntlArg::SETLK(ConstPtr::from_usize((&write_lock as *const Flock) as usize)),
+        )
+        .unwrap_err(),
+        Errno::EBADF
+    );
+    assert_eq!(
+        task.sys_fcntl(
+            write_fd,
+            FcntlArg::SETLK(ConstPtr::from_usize((&read_lock as *const Flock) as usize)),
+        )
+        .unwrap_err(),
+        Errno::EBADF
+    );
+    assert_eq!(
+        task.sys_fcntl(
+            write_fd,
+            FcntlArg::SETLK(ConstPtr::from_usize((&write_lock as *const Flock) as usize)),
+        )
+        .unwrap(),
+        0
+    );
+    assert_eq!(
+        task.sys_fcntl(
+            read_fd,
+            FcntlArg::SETLK(ConstPtr::from_usize((&unlock as *const Flock) as usize)),
+        )
+        .unwrap(),
+        0
+    );
+
+    for fd in [udp_fd, eventfd, epoll, unix_fd] {
+        assert_eq!(
+            task.sys_fcntl(
+                fd,
+                FcntlArg::SETLK(ConstPtr::from_usize((&read_lock as *const Flock) as usize)),
+            )
+            .unwrap(),
+            0
+        );
+        assert_eq!(
+            task.sys_fcntl(
+                fd,
+                FcntlArg::SETLK(ConstPtr::from_usize((&write_lock as *const Flock) as usize)),
+            )
+            .unwrap(),
+            0
+        );
+        assert_eq!(
+            task.sys_fcntl(
+                fd,
+                FcntlArg::SETLK(ConstPtr::from_usize((&unlock as *const Flock) as usize)),
+            )
+            .unwrap(),
+            0
+        );
+    }
+
+    task.sys_close(read_fd).unwrap();
+    task.sys_close(write_fd).unwrap();
+    task.sys_close(udp_fd).unwrap();
+    task.sys_close(eventfd).unwrap();
+    task.sys_close(epoll).unwrap();
+    task.sys_close(unix_fd).unwrap();
+    task.sys_close(unix_peer).unwrap();
 }
 
 #[test]

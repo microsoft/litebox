@@ -83,7 +83,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> EventFile<Platform> {
         clockid: ClockId,
         flags: TimerfdFlags,
     ) -> Self {
-        let mut status = OFlags::empty();
+        let mut status = OFlags::RDWR;
         status.set(OFlags::NONBLOCK, flags.contains(TimerfdFlags::NONBLOCK));
 
         Self {
