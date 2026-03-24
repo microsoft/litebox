@@ -3,7 +3,7 @@
 
 //! Process/thread related syscalls.
 
-use crate::{ConstPtr, MutPtr, ShimFS, Task};
+use crate::{ConstPtr, MutPtr, ShimFS, Task, multihost::ExecRoute};
 use alloc::boxed::Box;
 use alloc::collections::btree_map::BTreeMap;
 use alloc::sync::Arc;
@@ -787,6 +787,14 @@ impl<FS: ShimFS> Task<FS> {
                     ExitStatus::Signal(sig) => sig.as_i32() + 128,
                 }
             };
+            let removed_owner = self
+                .global
+                .control_plane
+                .unregister_running_process(self.process_id);
+            debug_assert!(
+                removed_owner.is_some(),
+                "last running thread must be registered in the control plane"
+            );
             self.global
                 .litebox
                 .process_registry()
@@ -1847,6 +1855,10 @@ impl<FS: ShimFS> Task<FS> {
             set_child_tid,
         });
         child_thread.clear_child_tid.set(clear_child_tid);
+        self.global
+            .control_plane
+            .register_running_process_local(child_process_id)
+            .expect("newly forked process must be registered to the local host");
 
         let r = unsafe {
             self.global.platform.spawn_thread(
@@ -1895,6 +1907,10 @@ impl<FS: ShimFS> Task<FS> {
                 .litebox
                 .process_registry()
                 .remove_process(child_process_id);
+            let _ = self
+                .global
+                .control_plane
+                .unregister_running_process(child_process_id);
             // On failure, restore write permissions if CoW was set up.
             if let Some(cow) = &cow_state {
                 self.restore_cow_layer_permissions(cow);
@@ -3213,6 +3229,14 @@ impl<FS: ShimFS> Task<FS> {
                 .collect::<alloc::vec::Vec<_>>(),
         );
 
+        match self
+            .global
+            .control_plane
+            .route_exec(self.process_id, path.as_ref())
+            .expect("running process must be routed by the local control plane")
+        {
+            ExecRoute::Local { .. } => {}
+        }
         let loader = crate::loader::elf::ElfLoader::new(self, &path).map_err(Errno::from)?;
 
         // After this point, the old program is torn down and failures must terminate the process.

@@ -1,0 +1,660 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
+//! Multi-host control-plane state for Linux shim process ownership and exec handoff.
+
+use alloc::collections::BTreeMap;
+use core::sync::atomic::{AtomicU32, Ordering};
+
+use litebox::{
+    process::ProcessId,
+    sync::{Mutex, RawSyncPrimitivesProvider},
+};
+
+/// Stable identifier for a host process participating in one sandbox.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub(crate) struct HostId(u32);
+
+impl HostId {
+    pub(crate) const ROOT: Self = Self(1);
+
+    pub(crate) fn as_u32(self) -> u32 {
+        self.0
+    }
+}
+
+/// Role of a registered host in the multi-host control plane.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HostRole {
+    /// The original/root host process that also runs the first coordinator.
+    RootCoordinator,
+    /// A non-root worker host that can own guest processes after handoff.
+    Worker,
+}
+
+/// Routing decision for a guest process exec.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ExecRoute {
+    /// Continue exec in the current host process.
+    Local { host: HostId },
+}
+
+/// Identifier for a prepared exec-handoff transaction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub(crate) struct ExecHandoffId(u32);
+
+/// Non-terminal stages of the exec-handoff transaction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ExecHandoffStage {
+    Prepared,
+    SourceTornDown,
+    StateTransferred,
+    TargetLoaded,
+    Failed,
+}
+
+impl ExecHandoffStage {
+    fn next(self) -> Option<Self> {
+        match self {
+            Self::Prepared => Some(Self::SourceTornDown),
+            Self::SourceTornDown => Some(Self::StateTransferred),
+            Self::StateTransferred => Some(Self::TargetLoaded),
+            Self::TargetLoaded | Self::Failed => None,
+        }
+    }
+}
+
+/// Snapshot of an in-flight exec handoff.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ExecHandoffSnapshot {
+    pub(crate) id: ExecHandoffId,
+    pub(crate) process_id: ProcessId,
+    pub(crate) source_host: HostId,
+    pub(crate) target_host: HostId,
+    pub(crate) stage: ExecHandoffStage,
+}
+
+/// Control-plane errors while the runtime is still single-host/local-only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ControlPlaneError {
+    UnknownHost(HostId),
+    UnknownProcess(ProcessId),
+    DuplicateProcess(ProcessId),
+    HandoffAlreadyActive(ProcessId),
+    ProcessOwnedByDifferentHost {
+        process_id: ProcessId,
+        owner_host: HostId,
+        local_host: HostId,
+    },
+    UnknownHandoff(ExecHandoffId),
+    InvalidHandoffTransition {
+        current: ExecHandoffStage,
+        next: ExecHandoffStage,
+    },
+    InvalidHandoffAbort(ExecHandoffStage),
+    InvalidHandoffCommit(ExecHandoffStage),
+    InvalidHandoffCommitOwner {
+        process_id: ProcessId,
+        expected_source_host: HostId,
+        actual_owner: Option<HostId>,
+    },
+    HandoffTargetMatchesSource {
+        process_id: ProcessId,
+        host: HostId,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct HostEntry {
+    role: HostRole,
+    parent_host: Option<HostId>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ExecHandoff {
+    process_id: ProcessId,
+    source_host: HostId,
+    target_host: HostId,
+    stage: ExecHandoffStage,
+}
+
+impl ExecHandoff {
+    fn snapshot(self, id: ExecHandoffId) -> ExecHandoffSnapshot {
+        ExecHandoffSnapshot {
+            id,
+            process_id: self.process_id,
+            source_host: self.source_host,
+            target_host: self.target_host,
+            stage: self.stage,
+        }
+    }
+}
+
+struct ControlPlaneState {
+    hosts: BTreeMap<HostId, HostEntry>,
+    running_process_owners: BTreeMap<ProcessId, HostId>,
+    active_handoffs_by_process: BTreeMap<ProcessId, ExecHandoffId>,
+    handoffs: BTreeMap<ExecHandoffId, ExecHandoff>,
+}
+
+/// Root-host-owned control-plane state for the multi-host process model.
+///
+/// The current implementation still runs everything in one host process, but it
+/// centralizes the ownership and transaction state that a later `ET_EXEC`
+/// handoff will consume.
+pub(crate) struct ControlPlane<Platform: RawSyncPrimitivesProvider> {
+    root_host: HostId,
+    local_host: HostId,
+    next_host_id: AtomicU32,
+    next_handoff_id: AtomicU32,
+    state: Mutex<Platform, ControlPlaneState>,
+}
+
+impl<Platform: RawSyncPrimitivesProvider> Default for ControlPlane<Platform> {
+    fn default() -> Self {
+        Self::new_root_local()
+    }
+}
+
+impl<Platform: RawSyncPrimitivesProvider> ControlPlane<Platform> {
+    /// Create the initial control plane for the root host.
+    pub(crate) fn new_root_local() -> Self {
+        let root_host = HostId::ROOT;
+        let mut hosts = BTreeMap::new();
+        hosts.insert(
+            root_host,
+            HostEntry {
+                role: HostRole::RootCoordinator,
+                parent_host: None,
+            },
+        );
+        Self {
+            root_host,
+            local_host: root_host,
+            next_host_id: AtomicU32::new(root_host.as_u32() + 1),
+            next_handoff_id: AtomicU32::new(1),
+            state: Mutex::new(ControlPlaneState {
+                hosts,
+                running_process_owners: BTreeMap::new(),
+                active_handoffs_by_process: BTreeMap::new(),
+                handoffs: BTreeMap::new(),
+            }),
+        }
+    }
+
+    pub(crate) fn root_host(&self) -> HostId {
+        self.root_host
+    }
+
+    pub(crate) fn local_host(&self) -> HostId {
+        self.local_host
+    }
+
+    /// Register a worker host under the root coordinator.
+    pub(crate) fn register_worker_host(
+        &self,
+        parent_host: HostId,
+    ) -> Result<HostId, ControlPlaneError> {
+        let mut state = self.state.lock();
+        if !state.hosts.contains_key(&parent_host) {
+            return Err(ControlPlaneError::UnknownHost(parent_host));
+        }
+        let host_id = HostId(self.next_host_id.fetch_add(1, Ordering::Relaxed));
+        let replaced = state.hosts.insert(
+            host_id,
+            HostEntry {
+                role: HostRole::Worker,
+                parent_host: Some(parent_host),
+            },
+        );
+        debug_assert!(replaced.is_none(), "host ids are monotonically allocated");
+        Ok(host_id)
+    }
+
+    /// Register a running guest process to the local host.
+    pub(crate) fn register_running_process_local(
+        &self,
+        process_id: ProcessId,
+    ) -> Result<(), ControlPlaneError> {
+        self.register_running_process(process_id, self.local_host)
+    }
+
+    /// Register a running guest process to an arbitrary host.
+    pub(crate) fn register_running_process(
+        &self,
+        process_id: ProcessId,
+        host_id: HostId,
+    ) -> Result<(), ControlPlaneError> {
+        let mut state = self.state.lock();
+        if !state.hosts.contains_key(&host_id) {
+            return Err(ControlPlaneError::UnknownHost(host_id));
+        }
+        if state.active_handoffs_by_process.contains_key(&process_id) {
+            return Err(ControlPlaneError::HandoffAlreadyActive(process_id));
+        }
+        if state.running_process_owners.contains_key(&process_id) {
+            return Err(ControlPlaneError::DuplicateProcess(process_id));
+        }
+        state.running_process_owners.insert(process_id, host_id);
+        Ok(())
+    }
+
+    /// Remove the running-owner entry for a process that has exited or failed to start.
+    ///
+    /// A handoff that never advanced past `Prepared` can be discarded here. Once
+    /// teardown has started, exit converts it into an explicit terminal failure
+    /// state so later code can still observe what happened without leaving the
+    /// handoff active forever.
+    pub(crate) fn unregister_running_process(&self, process_id: ProcessId) -> Option<HostId> {
+        let mut state = self.state.lock();
+        if let Some(&handoff_id) = state.active_handoffs_by_process.get(&process_id) {
+            let handoff_stage = state.handoffs.get(&handoff_id).map(|handoff| handoff.stage);
+            match handoff_stage {
+                Some(ExecHandoffStage::Prepared) => {
+                    state.active_handoffs_by_process.remove(&process_id);
+                    state.handoffs.remove(&handoff_id);
+                }
+                Some(_) => {
+                    state.active_handoffs_by_process.remove(&process_id);
+                    if let Some(handoff) = state.handoffs.get_mut(&handoff_id) {
+                        handoff.stage = ExecHandoffStage::Failed;
+                    }
+                }
+                None => {
+                    state.active_handoffs_by_process.remove(&process_id);
+                }
+            }
+        }
+        state.running_process_owners.remove(&process_id)
+    }
+
+    /// Return the current owner host for a running guest process.
+    pub(crate) fn owner_of_running_process(&self, process_id: ProcessId) -> Option<HostId> {
+        self.state
+            .lock()
+            .running_process_owners
+            .get(&process_id)
+            .copied()
+    }
+
+    /// Resolve whether exec continues locally or needs a future host handoff.
+    pub(crate) fn route_exec(
+        &self,
+        process_id: ProcessId,
+        _path: &str,
+    ) -> Result<ExecRoute, ControlPlaneError> {
+        let owner_host = self
+            .owner_of_running_process(process_id)
+            .ok_or(ControlPlaneError::UnknownProcess(process_id))?;
+        if owner_host != self.local_host {
+            return Err(ControlPlaneError::ProcessOwnedByDifferentHost {
+                process_id,
+                owner_host,
+                local_host: self.local_host,
+            });
+        }
+        Ok(ExecRoute::Local { host: owner_host })
+    }
+
+    /// Begin a future exec handoff for a process that currently lives in this host.
+    pub(crate) fn begin_exec_handoff(
+        &self,
+        process_id: ProcessId,
+        target_host: HostId,
+    ) -> Result<ExecHandoffSnapshot, ControlPlaneError> {
+        let mut state = self.state.lock();
+        if !state.hosts.contains_key(&target_host) {
+            return Err(ControlPlaneError::UnknownHost(target_host));
+        }
+        if let Some(&handoff_id) = state.active_handoffs_by_process.get(&process_id) {
+            let _ = handoff_id;
+            return Err(ControlPlaneError::HandoffAlreadyActive(process_id));
+        }
+        let source_host = *state
+            .running_process_owners
+            .get(&process_id)
+            .ok_or(ControlPlaneError::UnknownProcess(process_id))?;
+        if source_host == target_host {
+            return Err(ControlPlaneError::HandoffTargetMatchesSource {
+                process_id,
+                host: source_host,
+            });
+        }
+        let handoff_id = ExecHandoffId(self.next_handoff_id.fetch_add(1, Ordering::Relaxed));
+        let handoff = ExecHandoff {
+            process_id,
+            source_host,
+            target_host,
+            stage: ExecHandoffStage::Prepared,
+        };
+        state
+            .active_handoffs_by_process
+            .insert(process_id, handoff_id);
+        state.handoffs.insert(handoff_id, handoff);
+        Ok(handoff.snapshot(handoff_id))
+    }
+
+    /// Advance an exec handoff through the ordered prepare/teardown/transfer/load flow.
+    pub(crate) fn advance_exec_handoff(
+        &self,
+        handoff_id: ExecHandoffId,
+        next_stage: ExecHandoffStage,
+    ) -> Result<ExecHandoffSnapshot, ControlPlaneError> {
+        let mut state = self.state.lock();
+        let handoff = state
+            .handoffs
+            .get_mut(&handoff_id)
+            .ok_or(ControlPlaneError::UnknownHandoff(handoff_id))?;
+        if handoff.stage.next() != Some(next_stage) {
+            return Err(ControlPlaneError::InvalidHandoffTransition {
+                current: handoff.stage,
+                next: next_stage,
+            });
+        }
+        handoff.stage = next_stage;
+        Ok((*handoff).snapshot(handoff_id))
+    }
+
+    /// Commit a fully loaded exec handoff and transfer ownership to the target host.
+    pub(crate) fn commit_exec_handoff(
+        &self,
+        handoff_id: ExecHandoffId,
+    ) -> Result<ExecHandoffSnapshot, ControlPlaneError> {
+        let mut state = self.state.lock();
+        let handoff = *state
+            .handoffs
+            .get(&handoff_id)
+            .ok_or(ControlPlaneError::UnknownHandoff(handoff_id))?;
+        if handoff.stage != ExecHandoffStage::TargetLoaded {
+            return Err(ControlPlaneError::InvalidHandoffCommit(handoff.stage));
+        }
+        let actual_owner = state
+            .running_process_owners
+            .get(&handoff.process_id)
+            .copied();
+        if actual_owner != Some(handoff.source_host) {
+            return Err(ControlPlaneError::InvalidHandoffCommitOwner {
+                process_id: handoff.process_id,
+                expected_source_host: handoff.source_host,
+                actual_owner,
+            });
+        }
+        state.handoffs.remove(&handoff_id);
+        state.active_handoffs_by_process.remove(&handoff.process_id);
+        state
+            .running_process_owners
+            .insert(handoff.process_id, handoff.target_host);
+        Ok(handoff.snapshot(handoff_id))
+    }
+
+    /// Abort an in-flight exec handoff without changing the process owner.
+    pub(crate) fn abort_exec_handoff(
+        &self,
+        handoff_id: ExecHandoffId,
+    ) -> Result<ExecHandoffSnapshot, ControlPlaneError> {
+        let mut state = self.state.lock();
+        let handoff = *state
+            .handoffs
+            .get(&handoff_id)
+            .ok_or(ControlPlaneError::UnknownHandoff(handoff_id))?;
+        if handoff.stage != ExecHandoffStage::Prepared {
+            return Err(ControlPlaneError::InvalidHandoffAbort(handoff.stage));
+        }
+        state.handoffs.remove(&handoff_id);
+        state.active_handoffs_by_process.remove(&handoff.process_id);
+        Ok(handoff.snapshot(handoff_id))
+    }
+
+    #[cfg(test)]
+    fn host_entry(&self, host_id: HostId) -> Option<HostEntry> {
+        self.state.lock().hosts.get(&host_id).copied()
+    }
+
+    #[cfg(test)]
+    fn handoff_snapshot(&self, handoff_id: ExecHandoffId) -> Option<ExecHandoffSnapshot> {
+        self.state
+            .lock()
+            .handoffs
+            .get(&handoff_id)
+            .copied()
+            .map(|handoff| handoff.snapshot(handoff_id))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    extern crate std;
+
+    use super::*;
+
+    #[test]
+    fn root_control_plane_starts_with_registered_root_host() {
+        let plane = ControlPlane::<crate::Platform>::new_root_local();
+        assert_eq!(plane.root_host(), HostId::ROOT);
+        assert_eq!(plane.local_host(), HostId::ROOT);
+        assert_eq!(
+            plane.host_entry(HostId::ROOT),
+            Some(HostEntry {
+                role: HostRole::RootCoordinator,
+                parent_host: None,
+            })
+        );
+    }
+
+    #[test]
+    fn running_process_registration_tracks_local_owner() {
+        let plane = ControlPlane::<crate::Platform>::new_root_local();
+        let pid = ProcessId(42);
+        plane
+            .register_running_process_local(pid)
+            .expect("register running process");
+        assert_eq!(plane.owner_of_running_process(pid), Some(HostId::ROOT));
+        assert_eq!(
+            plane.route_exec(pid, "/bin/sh"),
+            Ok(ExecRoute::Local { host: HostId::ROOT })
+        );
+        assert_eq!(plane.unregister_running_process(pid), Some(HostId::ROOT));
+        assert_eq!(plane.owner_of_running_process(pid), None);
+    }
+
+    #[test]
+    fn worker_hosts_can_be_registered_under_root() {
+        let plane = ControlPlane::<crate::Platform>::new_root_local();
+        let worker = plane
+            .register_worker_host(HostId::ROOT)
+            .expect("register worker host");
+        assert_eq!(
+            plane.host_entry(worker),
+            Some(HostEntry {
+                role: HostRole::Worker,
+                parent_host: Some(HostId::ROOT),
+            })
+        );
+    }
+
+    #[test]
+    fn exec_handoff_commit_moves_running_process_owner() {
+        let plane = ControlPlane::<crate::Platform>::new_root_local();
+        let pid = ProcessId(7);
+        plane
+            .register_running_process_local(pid)
+            .expect("register running process");
+        let worker = plane
+            .register_worker_host(HostId::ROOT)
+            .expect("register worker host");
+        let handoff = plane
+            .begin_exec_handoff(pid, worker)
+            .expect("prepare handoff");
+        assert_eq!(handoff.stage, ExecHandoffStage::Prepared);
+        let handoff = plane
+            .advance_exec_handoff(handoff.id, ExecHandoffStage::SourceTornDown)
+            .expect("advance to teardown");
+        assert_eq!(handoff.stage, ExecHandoffStage::SourceTornDown);
+        let handoff = plane
+            .advance_exec_handoff(handoff.id, ExecHandoffStage::StateTransferred)
+            .expect("advance to transfer");
+        assert_eq!(handoff.stage, ExecHandoffStage::StateTransferred);
+        let handoff = plane
+            .advance_exec_handoff(handoff.id, ExecHandoffStage::TargetLoaded)
+            .expect("advance to load");
+        assert_eq!(handoff.stage, ExecHandoffStage::TargetLoaded);
+        let committed = plane
+            .commit_exec_handoff(handoff.id)
+            .expect("commit handoff");
+        assert_eq!(committed.process_id, pid);
+        assert_eq!(plane.owner_of_running_process(pid), Some(worker));
+        assert!(plane.handoff_snapshot(handoff.id).is_none());
+    }
+
+    #[test]
+    fn exec_handoff_rejects_out_of_order_transitions() {
+        let plane = ControlPlane::<crate::Platform>::new_root_local();
+        let pid = ProcessId(9);
+        plane
+            .register_running_process_local(pid)
+            .expect("register running process");
+        let worker = plane
+            .register_worker_host(HostId::ROOT)
+            .expect("register worker host");
+        let handoff = plane
+            .begin_exec_handoff(pid, worker)
+            .expect("prepare handoff");
+        assert_eq!(
+            plane.advance_exec_handoff(handoff.id, ExecHandoffStage::StateTransferred),
+            Err(ControlPlaneError::InvalidHandoffTransition {
+                current: ExecHandoffStage::Prepared,
+                next: ExecHandoffStage::StateTransferred,
+            })
+        );
+        assert_eq!(plane.owner_of_running_process(pid), Some(HostId::ROOT));
+    }
+
+    #[test]
+    fn exec_handoff_abort_keeps_original_owner() {
+        let plane = ControlPlane::<crate::Platform>::new_root_local();
+        let pid = ProcessId(11);
+        plane
+            .register_running_process_local(pid)
+            .expect("register running process");
+        let worker = plane
+            .register_worker_host(HostId::ROOT)
+            .expect("register worker host");
+        let handoff = plane
+            .begin_exec_handoff(pid, worker)
+            .expect("prepare handoff");
+        let aborted = plane.abort_exec_handoff(handoff.id).expect("abort handoff");
+        assert_eq!(aborted.process_id, pid);
+        assert_eq!(plane.owner_of_running_process(pid), Some(HostId::ROOT));
+        assert!(plane.handoff_snapshot(handoff.id).is_none());
+    }
+
+    #[test]
+    fn exec_handoff_cannot_abort_after_source_teardown() {
+        let plane = ControlPlane::<crate::Platform>::new_root_local();
+        let pid = ProcessId(13);
+        plane
+            .register_running_process_local(pid)
+            .expect("register running process");
+        let worker = plane
+            .register_worker_host(HostId::ROOT)
+            .expect("register worker host");
+        let handoff = plane
+            .begin_exec_handoff(pid, worker)
+            .expect("prepare handoff");
+        let handoff = plane
+            .advance_exec_handoff(handoff.id, ExecHandoffStage::SourceTornDown)
+            .expect("advance to teardown");
+        assert_eq!(
+            plane.abort_exec_handoff(handoff.id),
+            Err(ControlPlaneError::InvalidHandoffAbort(
+                ExecHandoffStage::SourceTornDown
+            ))
+        );
+        assert_eq!(plane.owner_of_running_process(pid), Some(HostId::ROOT));
+        assert!(plane.handoff_snapshot(handoff.id).is_some());
+    }
+
+    #[test]
+    fn unregister_marks_post_teardown_handoff_failed() {
+        let plane = ControlPlane::<crate::Platform>::new_root_local();
+        let pid = ProcessId(15);
+        plane
+            .register_running_process_local(pid)
+            .expect("register running process");
+        let worker = plane
+            .register_worker_host(HostId::ROOT)
+            .expect("register worker host");
+        let handoff = plane
+            .begin_exec_handoff(pid, worker)
+            .expect("prepare handoff");
+        let handoff = plane
+            .advance_exec_handoff(handoff.id, ExecHandoffStage::SourceTornDown)
+            .expect("advance to teardown");
+        assert_eq!(plane.unregister_running_process(pid), Some(HostId::ROOT));
+        assert_eq!(plane.owner_of_running_process(pid), None);
+        assert_eq!(
+            plane
+                .handoff_snapshot(handoff.id)
+                .map(|snapshot| snapshot.stage),
+            Some(ExecHandoffStage::Failed)
+        );
+    }
+
+    #[test]
+    fn active_handoff_blocks_process_reregistration() {
+        let plane = ControlPlane::<crate::Platform>::new_root_local();
+        let pid = ProcessId(17);
+        plane
+            .register_running_process_local(pid)
+            .expect("register running process");
+        let worker = plane
+            .register_worker_host(HostId::ROOT)
+            .expect("register worker host");
+        let handoff = plane
+            .begin_exec_handoff(pid, worker)
+            .expect("prepare handoff");
+        let handoff = plane
+            .advance_exec_handoff(handoff.id, ExecHandoffStage::SourceTornDown)
+            .expect("advance to teardown");
+        assert_eq!(
+            plane.register_running_process_local(pid),
+            Err(ControlPlaneError::HandoffAlreadyActive(pid))
+        );
+        assert!(plane.handoff_snapshot(handoff.id).is_some());
+    }
+
+    #[test]
+    fn commit_requires_live_source_owner() {
+        let plane = ControlPlane::<crate::Platform>::new_root_local();
+        let pid = ProcessId(19);
+        plane
+            .register_running_process_local(pid)
+            .expect("register running process");
+        let worker = plane
+            .register_worker_host(HostId::ROOT)
+            .expect("register worker host");
+        let handoff = plane
+            .begin_exec_handoff(pid, worker)
+            .expect("prepare handoff");
+        let handoff = plane
+            .advance_exec_handoff(handoff.id, ExecHandoffStage::SourceTornDown)
+            .expect("advance to teardown");
+        let handoff = plane
+            .advance_exec_handoff(handoff.id, ExecHandoffStage::StateTransferred)
+            .expect("advance to transfer");
+        let handoff = plane
+            .advance_exec_handoff(handoff.id, ExecHandoffStage::TargetLoaded)
+            .expect("advance to load");
+        plane.state.lock().running_process_owners.remove(&pid);
+        assert_eq!(
+            plane.commit_exec_handoff(handoff.id),
+            Err(ControlPlaneError::InvalidHandoffCommitOwner {
+                process_id: pid,
+                expected_source_host: HostId::ROOT,
+                actual_owner: None,
+            })
+        );
+        assert!(plane.handoff_snapshot(handoff.id).is_some());
+        assert_eq!(plane.owner_of_running_process(pid), None);
+    }
+}

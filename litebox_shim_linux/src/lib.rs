@@ -46,6 +46,8 @@ macro_rules! log_unsupported {
 
 pub(crate) mod channel;
 pub mod loader;
+#[cfg_attr(not(test), allow(dead_code))]
+mod multihost;
 pub(crate) mod stdio;
 pub mod syscalls;
 pub mod transport;
@@ -262,6 +264,10 @@ impl LinuxShimBuilder {
                 deferred_lie_count: core::sync::atomic::AtomicU32::new(0),
             }),
         });
+        let control_plane = multihost::ControlPlane::new_root_local();
+        control_plane
+            .register_running_process_local(litebox::process::ProcessId::INIT)
+            .expect("init process must be registered to the root host");
         let global = Arc::new(GlobalState {
             platform: self.platform,
             futex_manager: FutexManager::new(),
@@ -276,6 +282,7 @@ impl LinuxShimBuilder {
             process_thread_handles: litebox::sync::RwLock::new(alloc::collections::BTreeMap::new()),
             transport_interrupt: alloc::sync::Arc::new(core::sync::atomic::AtomicBool::new(false)),
             epoll_graph_lock: litebox::sync::Mutex::new(()),
+            control_plane,
         });
         LinuxShim {
             global,
@@ -2354,6 +2361,8 @@ struct GlobalState<FS: ShimFS> {
     /// Serializes nested epoll graph updates so validation and insertion see
     /// one consistent graph.
     epoll_graph_lock: litebox::sync::Mutex<Platform, ()>,
+    /// Root-host coordinator state for the future multi-host exec handoff path.
+    control_plane: multihost::ControlPlane<Platform>,
 }
 
 /// A signal that needs to be delivered to a different process.
