@@ -374,3 +374,25 @@ fn brk_rejects_requests_below_initial_brk() {
     assert_eq!(pm.current_brk_frontier(), 0x10_000);
     assert!(pm.mappings().is_empty());
 }
+
+#[test]
+fn ensure_brk_past_makes_floor_sticky() {
+    let pm = make_page_manager();
+    pm.set_initial_brk(0x10_000);
+    pm.ensure_brk_past(0x20_000);
+
+    assert_eq!(pm.current_brk(), 0x20_000);
+    assert_eq!(pm.current_brk_frontier(), 0x20_000);
+
+    unsafe {
+        assert_eq!(pm.brk(0x18_000).unwrap(), 0x20_000);
+        assert_eq!(pm.brk(0x24_000).unwrap(), 0x24_000);
+    }
+    assert_eq!(pm.current_brk(), 0x24_000);
+    assert_eq!(pm.current_brk_frontier(), 0x24_000);
+    assert!(
+        pm.mappings()
+            .iter()
+            .any(|(range, _)| *range == (0x20_000..0x24_000))
+    );
+}

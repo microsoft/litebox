@@ -48,9 +48,21 @@ pub struct CliArgs {
     #[arg(
         long = "tun-device-name",
         requires = "unstable",
+        conflicts_with = "network_broker",
         help_heading = "Unstable Options"
     )]
     pub tun_device_name: Option<String>,
+    /// Connect to a network broker via TCP loopback at the given address
+    /// (e.g., "127.0.0.1:9000"). The broker must be listening and speaking
+    /// the litebox IPC network protocol (LBNP handshake).
+    #[arg(
+        long = "network-broker",
+        value_name = "ADDR",
+        requires = "unstable",
+        conflicts_with = "tun_device_name",
+        help_heading = "Unstable Options"
+    )]
+    pub network_broker: Option<String>,
     /// Connect to a 9P file broker at the given address (e.g., 10.0.0.1:5640).
     ///
     /// Requires --tun-device-name. The broker must be a 9P2000.L server
@@ -85,6 +97,10 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     let platform = Platform::new(cli_args.tun_device_name.as_deref());
     platform.prefer_slot0_for_first_address_space();
     platform.prefer_redzone_syscall_entry();
+    if let Some(ref broker_addr) = cli_args.network_broker {
+        let stream = connect_to_broker_ipc(broker_addr)?;
+        platform.set_ipc_stream(stream);
+    }
     litebox_platform_multiplex::set_platform(platform);
     let mut shim_builder = litebox_shim_linux::LinuxShimBuilder::new();
     let litebox = shim_builder.litebox();
@@ -151,7 +167,7 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         let initial_file_system = std::sync::Arc::new(initial_file_system);
         let shim = shim_builder.build();
         let shutdown = std::sync::Arc::new(core::sync::atomic::AtomicBool::new(false));
-        let network_thread = start_network_worker(&shim, &shutdown, &cli_args);
+        let network_thread = start_network_worker(&shim, &shutdown);
 
         let cwd = cli_args.working_directory.clone();
         let program = shim
@@ -190,7 +206,7 @@ fn finish_run_with_nine_p<FS: litebox_shim_linux::ShimFS>(
     let shim = shim_builder.build();
 
     let shutdown = std::sync::Arc::new(core::sync::atomic::AtomicBool::new(false));
-    let net_worker = start_network_worker(&shim, &shutdown, cli_args);
+    let net_worker = start_network_worker(&shim, &shutdown);
 
     if cfg!(debug_assertions) {
         eprintln!("Connecting to 9P broker at {broker_addr}...");
@@ -283,9 +299,10 @@ fn run_program<FS: litebox_shim_linux::ShimFS>(
 fn start_network_worker<FS: litebox_shim_linux::ShimFS>(
     shim: &litebox_shim_linux::LinuxShim<FS>,
     shutdown: &std::sync::Arc<core::sync::atomic::AtomicBool>,
-    cli_args: &CliArgs,
 ) -> Option<std::thread::JoinHandle<()>> {
-    cli_args.tun_device_name.as_ref()?;
+    if !litebox_platform_multiplex::platform().has_network() {
+        return None;
+    }
     let shim = shim.clone();
     let shutdown_clone = shutdown.clone();
     let child = std::thread::Builder::new()
@@ -307,13 +324,80 @@ fn start_network_worker<FS: litebox_shim_linux::ShimFS>(
                     Some(t) if t < DEFAULT_TIMEOUT => t,
                     _ => DEFAULT_TIMEOUT,
                 };
-                litebox_platform_multiplex::platform().wait_on_tun(Some(wait));
+                litebox_platform_multiplex::platform().wait_on_network(Some(wait));
             }
             // Drain remaining network interactions before exiting.
             while shim.perform_network_interaction().call_again_immediately() {}
         })
         .expect("failed to spawn network worker thread");
     Some(child)
+}
+
+/// IPC handshake constants (must match `litebox_broker` protocol).
+const HANDSHAKE_MAGIC: &[u8; 4] = b"LBNP";
+const HANDSHAKE_VERSION: u16 = 1;
+const HANDSHAKE_MTU: u16 = 1600;
+
+/// Connect to the network broker via TCP loopback and perform the LBNP
+/// handshake. Returns a non-blocking `TcpStream` ready for the platform's
+/// `IPInterfaceProvider` to use.
+fn connect_to_broker_ipc(addr: &str) -> Result<std::net::TcpStream> {
+    use std::io::{Read, Write};
+
+    let sock_addr: std::net::SocketAddr = addr
+        .parse()
+        .map_err(|e| anyhow!("Invalid broker address '{addr}': {e}"))?;
+
+    let ip = sock_addr.ip();
+    if !ip.is_loopback() {
+        anyhow::bail!(
+            "Broker address '{addr}' is not a loopback address. \
+             Only 127.0.0.1 or [::1] are allowed for security."
+        );
+    }
+
+    let mut stream =
+        std::net::TcpStream::connect_timeout(&sock_addr, std::time::Duration::from_secs(5))
+            .map_err(|e| anyhow!("Failed to connect to broker at {addr}: {e}"))?;
+
+    stream.set_nodelay(true).ok();
+
+    let mut msg = [0u8; 8];
+    msg[0..4].copy_from_slice(HANDSHAKE_MAGIC);
+    msg[4..6].copy_from_slice(&HANDSHAKE_VERSION.to_le_bytes());
+    msg[6..8].copy_from_slice(&HANDSHAKE_MTU.to_le_bytes());
+    stream
+        .write_all(&msg)
+        .map_err(|e| anyhow!("IPC handshake send failed: {e}"))?;
+
+    stream
+        .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+        .ok();
+    let mut resp = [0u8; 8];
+    stream
+        .read_exact(&mut resp)
+        .map_err(|e| anyhow!("IPC handshake response failed: {e}"))?;
+
+    if &resp[0..4] != HANDSHAKE_MAGIC {
+        anyhow::bail!("IPC handshake: bad magic in response");
+    }
+    let version = u16::from_le_bytes([resp[4], resp[5]]);
+    if version != HANDSHAKE_VERSION {
+        anyhow::bail!(
+            "IPC handshake: version mismatch (got {version}, expected {HANDSHAKE_VERSION})"
+        );
+    }
+    let mtu = u16::from_le_bytes([resp[6], resp[7]]);
+    if mtu != HANDSHAKE_MTU {
+        anyhow::bail!("IPC handshake: MTU mismatch (broker sent {mtu}, we expect {HANDSHAKE_MTU})");
+    }
+
+    stream
+        .set_nonblocking(true)
+        .map_err(|e| anyhow!("Failed to set non-blocking on IPC stream: {e}"))?;
+    stream.set_read_timeout(None).ok();
+
+    Ok(stream)
 }
 
 fn fixup_env(envp: &mut Vec<alloc::ffi::CString>) {

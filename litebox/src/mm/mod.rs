@@ -362,14 +362,19 @@ where
         self.vmem.read().brk_frontier
     }
 
-    /// Advance the program break and heap frontier to at least `min_brk`
-    /// without allocating new heap pages.
+    /// Advance the minimum program break, current break, and heap frontier to
+    /// at least `min_brk` without allocating new heap pages.
     ///
     /// This is used only when already-mapped non-heap pages, such as a
     /// trampoline at the heap frontier, occupy space that future `brk` growth
-    /// must skip over.
+    /// must skip over. The skipped gap becomes a persistent floor: later
+    /// `brk` shrinks must not re-enter it, or subsequent growth would collide
+    /// with the same non-heap pages again.
     pub fn ensure_brk_past(&self, min_brk: usize) {
         let mut vmem = self.vmem.write();
+        if vmem.brk_base < min_brk {
+            vmem.brk_base = min_brk;
+        }
         if vmem.brk < min_brk {
             vmem.brk = min_brk;
         }

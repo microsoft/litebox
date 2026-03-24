@@ -487,6 +487,7 @@ mod wintun_ffi {
 /// traits.
 pub struct WindowsUserland {
     reserved_pages: alloc::vec::Vec<core::ops::Range<usize>>,
+    slot0_guest_reservations: Mutex<alloc::vec::Vec<core::ops::Range<usize>>>,
     sys_info: std::sync::RwLock<Win32_SysInfo::SYSTEM_INFO>,
     partitions: Mutex<PartitionState>,
     prefer_slot0_for_first_address_space: core::sync::atomic::AtomicBool,
@@ -1694,6 +1695,7 @@ impl WindowsUserland {
 
         let platform = Self {
             reserved_pages,
+            slot0_guest_reservations: Mutex::new(alloc::vec::Vec::new()),
             sys_info: std::sync::RwLock::new(sys_info),
             partitions: Mutex::new(partitions),
             prefer_slot0_for_first_address_space: core::sync::atomic::AtomicBool::new(false),
@@ -1851,6 +1853,80 @@ impl WindowsUserland {
     fn round_down_to_granu(&self, x: usize) -> usize {
         let gran = self.sys_info.read().unwrap().dwAllocationGranularity as usize;
         x & !(gran - 1)
+    }
+
+    /// Reserve an allocation-granularity-aligned free range with at least
+    /// `min_runway` bytes of contiguous space at or above `min_addr`.
+    ///
+    /// This is used by the Linux-on-Windows loader to choose an initial `brk`
+    /// that avoids low host mappings in slot 0 before guest libc starts growing
+    /// the heap with fixed-address `brk` calls.
+    pub fn reserve_clean_heap_runway(&self, min_addr: usize, min_runway: usize) -> Option<usize> {
+        let partition_end =
+            min_addr.div_ceil(va_partitions::PARTITION_SIZE) * va_partitions::PARTITION_SIZE;
+        let required = self.round_up_to_granu(min_runway.max(1));
+        let mut cursor = self.round_down_to_granu(min_addr.max(va_partitions::VA_MIN));
+        while cursor < partition_end {
+            let mut mbi = Win32_Memory::MEMORY_BASIC_INFORMATION::default();
+            let ok = unsafe {
+                Win32_Memory::VirtualQuery(
+                    cursor as *const c_void,
+                    &raw mut mbi,
+                    core::mem::size_of::<Win32_Memory::MEMORY_BASIC_INFORMATION>(),
+                ) != 0
+            };
+            if !ok {
+                break;
+            }
+            let region_start = mbi.BaseAddress as usize;
+            let Some(next_cursor) = region_start.checked_add(mbi.RegionSize) else {
+                break;
+            };
+            let region_end = next_cursor.min(partition_end);
+            if mbi.State == Win32_Memory::MEM_FREE {
+                let candidate =
+                    self.round_up_to_granu(region_start.max(min_addr).max(va_partitions::VA_MIN));
+                if candidate
+                    .checked_add(required)
+                    .is_some_and(|end| end <= region_end)
+                {
+                    let ptr = unsafe {
+                        VirtualAlloc2(
+                            GetCurrentProcess(),
+                            candidate as *mut c_void,
+                            required,
+                            Win32_Memory::MEM_RESERVE,
+                            Win32_Memory::PAGE_NOACCESS,
+                            core::ptr::null_mut(),
+                            0,
+                        )
+                    };
+                    if !ptr.is_null() && ptr as usize == candidate {
+                        self.slot0_guest_reservations
+                            .lock()
+                            .unwrap()
+                            .push(candidate..candidate + required);
+                        trace_debugln!(
+                            "[TRACE-HEAP-RUNWAY] reserved start=0x{:x} len=0x{:x}",
+                            candidate,
+                            required
+                        );
+                        return Some(candidate);
+                    }
+                    if !ptr.is_null() {
+                        trace_debugln!(
+                            "[TRACE-HEAP-RUNWAY] reserve returned unexpected base=0x{:x} wanted=0x{:x} len=0x{:x}",
+                            ptr as usize,
+                            candidate,
+                            required
+                        );
+                        let _ = unsafe { VirtualFree(ptr, 0, Win32_Memory::MEM_RELEASE) };
+                    }
+                }
+            }
+            cursor = next_cursor;
+        }
+        None
     }
 
     pub fn init_task(&self) -> litebox_common_linux::TaskParams {
@@ -3822,6 +3898,7 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
             assert!(suggested_range.end <= <WindowsUserland as litebox::platform::PageManagementProvider<ALIGN>>::
                                                             TASK_ADDR_MAX);
 
+            let hinted_range_is_clean = is_va_range_clean(suggested_range.clone());
             let has_committed_page =
                 process_memory_range_by_regions(suggested_range.clone(), |_r, state| {
                     if state == Win32_Memory::MEM_COMMIT {
@@ -3831,13 +3908,58 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
                     }
                 })
                 .is_err();
-            if has_committed_page && fixed_address_behavior == FixedAddressBehavior::Hint {
-                // If any page in the suggested range is already committed, and the caller
-                // did not request a fixed address, we ask the OS to allocate a new region.
+            let suggested_range_is_slot0 = suggested_range.start < va_partitions::PARTITION_SIZE;
+            if suggested_range_is_slot0
+                && !hinted_range_is_clean
+                && fixed_address_behavior == FixedAddressBehavior::Hint
+            {
+                // Slot 0 shares a VA partition with the host process, so a
+                // guest-managed "free" gap can still overlap post-boot host
+                // mappings that are invisible to the PageManager's VMA tree.
+                // For non-fixed guest mmaps, fall back to a fresh OS-chosen
+                // address inside the same partition instead of trying to map
+                // on top of those host pages.
+                base_addr = core::ptr::null_mut();
+            } else if has_committed_page && fixed_address_behavior == FixedAddressBehavior::Hint {
                 base_addr = core::ptr::null_mut();
             } else if has_committed_page
                 && fixed_address_behavior == FixedAddressBehavior::NoReplace
             {
+                trace_debugln!(
+                    "[TRACE-ALLOC] fixed noreplace rejected start=0x{:x} end=0x{:x}: committed mapping present",
+                    suggested_range.start,
+                    suggested_range.end
+                );
+                let mut cursor = suggested_range.start;
+                while cursor < suggested_range.end {
+                    let mut mbi = Win32_Memory::MEMORY_BASIC_INFORMATION::default();
+                    let ok = unsafe {
+                        Win32_Memory::VirtualQuery(
+                            cursor as *const c_void,
+                            &raw mut mbi,
+                            core::mem::size_of::<Win32_Memory::MEMORY_BASIC_INFORMATION>(),
+                        ) != 0
+                    };
+                    if !ok {
+                        break;
+                    }
+                    let region_start = mbi.BaseAddress as usize;
+                    let Some(region_end) = region_start.checked_add(mbi.RegionSize) else {
+                        break;
+                    };
+                    let overlap_start = region_start.max(suggested_range.start);
+                    let overlap_end = region_end.min(suggested_range.end);
+                    if overlap_start < overlap_end {
+                        trace_debugln!(
+                            "[TRACE-ALLOC]   region start=0x{:x} end=0x{:x} state=0x{:x} protect=0x{:x}",
+                            overlap_start,
+                            overlap_end,
+                            mbi.State,
+                            mbi.Protect
+                        );
+                    }
+                    cursor = region_end;
+                }
                 return Err(AllocationError::AddressInUse);
             } else {
                 process_memory_range_by_regions(
@@ -3878,12 +4000,29 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
                                         0,
                                     )
                                 };
+                                if ptr.is_null() {
+                                    trace_debugln!(
+                                        "[TRACE-ALLOC] commit failed start=0x{:x} len=0x{:x} state=0x{:x} err={}",
+                                        r.start,
+                                        r.len(),
+                                        state,
+                                        unsafe { GetLastError() }
+                                    );
+                                }
                                 !ptr.is_null()
                             }
                             // In case the region is free, we need to reserve and commit it.
                             Win32_Memory::MEM_FREE => {
                                 let ptr =
                                     reserve_and_commit(r.clone(), prot_flags(initial_permissions));
+                                if ptr.is_null() {
+                                    trace_debugln!(
+                                        "[TRACE-ALLOC] reserve+commit failed start=0x{:x} len=0x{:x} err={}",
+                                        r.start,
+                                        r.len(),
+                                        unsafe { GetLastError() }
+                                    );
+                                }
                                 !ptr.is_null()
                             }
                             _ => unimplemented!(
@@ -3908,11 +4047,11 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
         // VirtualAlloc2 with address requirements to keep allocations within
         // the same partition as the original suggested range.  Without this,
         // NULL-base allocations can land outside the page manager's addr_max.
-        let partition_end = {
-            // Round suggested_range.end up to the next partition boundary.
-            let end = suggested_range.end;
+        let (partition_start, partition_end) = {
             let ps = va_partitions::PARTITION_SIZE;
-            end.div_ceil(ps) * ps
+            let start = suggested_range.start / ps * ps;
+            let end = suggested_range.end.div_ceil(ps) * ps;
+            (start.max(va_partitions::VA_MIN), end)
         };
         #[repr(C)]
         struct MemAddressRequirements {
@@ -3921,7 +4060,7 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
             alignment: usize,
         }
         let mut addr_req = MemAddressRequirements {
-            lowest: va_partitions::VA_MIN as *mut c_void,
+            lowest: partition_start as *mut c_void,
             highest: (partition_end.saturating_sub(1)) as *mut c_void,
             alignment: 0,
         };
@@ -3936,7 +4075,7 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
             value: &mut addr_req as *mut MemAddressRequirements as *mut c_void,
         };
         let aligned_size = self.round_up_to_granu(size);
-        let ptr = unsafe {
+        let mut ptr = unsafe {
             VirtualAlloc2(
                 GetCurrentProcess(),
                 core::ptr::null_mut(),
@@ -3948,24 +4087,45 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
             )
         };
         if ptr.is_null() {
-            // Fallback: try without address constraints.
-            let ptr = reserve_and_commit(0..size, prot_flags(initial_permissions));
-            assert!(
-                !ptr.is_null(),
-                "VirtualAlloc2(RESERVE|COMMIT size=0x{:x}) failed: {}",
-                size,
-                std::io::Error::last_os_error()
-            );
-            if populate_pages_immediately {
-                do_prefetch_on_range(ptr as usize, size);
+            // VirtualAlloc2 address requirements can still fail inside slot 0
+            // when the host dirties parts of the partition after startup.
+            // Probe the partition at allocation time and pick a truly free
+            // sub-range rather than falling back outside the guest partition.
+            let mut cursor = partition_start;
+            while cursor < partition_end {
+                let mut mbi = Win32_Memory::MEMORY_BASIC_INFORMATION::default();
+                do_query_on_region(&mut mbi, cursor as *mut c_void);
+                let region_start = mbi.BaseAddress as usize;
+                let Some(next_cursor) = region_start.checked_add(mbi.RegionSize) else {
+                    break;
+                };
+                let region_end = next_cursor.min(partition_end);
+                if mbi.State == Win32_Memory::MEM_FREE {
+                    let candidate = self.round_up_to_granu(region_start.max(partition_start));
+                    if candidate
+                        .checked_add(aligned_size)
+                        .is_some_and(|end| end <= region_end)
+                    {
+                        let candidate_ptr = reserve_and_commit(
+                            candidate..candidate + size,
+                            prot_flags(initial_permissions),
+                        );
+                        if !candidate_ptr.is_null() {
+                            ptr = candidate_ptr;
+                            break;
+                        }
+                    }
+                }
+                cursor = next_cursor;
             }
-            Ok(UserMutPtr::from_ptr(ptr.cast::<u8>()))
-        } else {
-            if populate_pages_immediately {
-                do_prefetch_on_range(ptr as usize, size);
+            if ptr.is_null() {
+                return Err(AllocationError::OutOfMemory);
             }
-            Ok(UserMutPtr::from_ptr(ptr.cast::<u8>()))
         }
+        if populate_pages_immediately {
+            do_prefetch_on_range(ptr as usize, size);
+        }
+        Ok(UserMutPtr::from_ptr(ptr.cast::<u8>()))
     }
 
     unsafe fn deallocate_pages(
@@ -3985,7 +4145,15 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
         // Child partitions (slots 1+) are probed-clean and only contain
         // guest-allocated pages, so VirtualFree is safe for them.
         if range.start < va_partitions::PARTITION_SIZE {
-            return Ok(());
+            let slot0_owned = self
+                .slot0_guest_reservations
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|reserved| range.start >= reserved.start && range.end <= reserved.end);
+            if !slot0_owned {
+                return Ok(());
+            }
         }
 
         process_memory_range_by_regions(

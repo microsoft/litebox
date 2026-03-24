@@ -1222,6 +1222,23 @@ impl<'a, FS: ShimFS> ElfLoader<'a, FS> {
         }
 
         process_state.pm.set_initial_brk(info.brk);
+        #[cfg(target_os = "windows")]
+        {
+            const INITIAL_HEAP_RUNWAY: usize = 0x0100_0000;
+            if let Some(clean_brk) = litebox_platform_multiplex::platform()
+                .reserve_clean_heap_runway(info.brk, INITIAL_HEAP_RUNWAY)
+                && clean_brk > info.brk
+            {
+                #[cfg(feature = "trace_syscalls")]
+                litebox::log_println!(
+                    global.platform,
+                    "[ELF-LOAD] adjusted initial brk from {:#x} to {:#x} and reserved a clean heap runway",
+                    info.brk,
+                    clean_brk,
+                );
+                process_state.pm.ensure_brk_past(clean_brk);
+            }
+        }
         process_state
             .main_bss_start
             .store(info.bss_start, core::sync::atomic::Ordering::Relaxed);
