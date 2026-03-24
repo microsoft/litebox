@@ -4266,11 +4266,11 @@ impl<FS: ShimFS> Task<FS> {
                     .set_fd_metadata(file, Diroff(dir_off));
                 Ok(nbytes)
             },
-            |_fd| todo!("net"),
-            |_fd| todo!("pipes"),
-            |_fd| Err(Errno::EBADF),
-            |_fd| Err(Errno::EBADF),
-            |_fd| Err(Errno::EBADF),
+            |_fd| Err(Errno::ENOTDIR),
+            |_fd| Err(Errno::ENOTDIR),
+            |_fd| Err(Errno::ENOTDIR),
+            |_fd| Err(Errno::ENOTDIR),
+            |_fd| Err(Errno::ENOTDIR),
         )?
     }
 }
