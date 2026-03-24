@@ -913,7 +913,6 @@ struct DatagramMessage {
 #[derive(Clone)]
 struct UnixDatagramEndpoint {
     send_channel: WriteEnd<DatagramMessage>,
-    local_cred: Ucred,
 }
 
 #[derive(Clone)]
@@ -1064,7 +1063,6 @@ impl<FS: ShimFS> UnixDatagramInner<FS> {
             key,
             UnixEntry(UnixEntryInner::Datagram(UnixDatagramEndpoint {
                 send_channel,
-                local_cred: task.current_ucred(),
             })),
         );
         self.addr = Some((bound_addr, task.global.clone()));
