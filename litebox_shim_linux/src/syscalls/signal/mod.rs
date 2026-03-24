@@ -500,7 +500,14 @@ impl SignalState {
         }
 
         if self
-            .write_signal_frame(frame_addr, siginfo, action, ctx, task.in_syscall.get())
+            .write_signal_frame(
+                frame_addr,
+                siginfo,
+                action,
+                ctx,
+                task,
+                task.in_syscall.get(),
+            )
             .is_err()
         {
             litebox::log_println!(

@@ -4,6 +4,7 @@
 #[cfg(feature = "platform_linux_userland")]
 use crate::ConstPtr;
 use crate::MutPtr;
+use crate::Task;
 use crate::syscalls::signal::{DeliverFault, SignalState};
 use core::mem::offset_of;
 use litebox::platform::RawConstPointer as _;
@@ -256,6 +257,7 @@ impl SignalState {
         siginfo: &Siginfo,
         action: &SigAction,
         ctx: &mut litebox_common_linux::ExecutionContext,
+        task: &Task<impl crate::ShimFS>,
         in_syscall: bool,
     ) -> Result<(), DeliverFault> {
         if !action.flags.contains(SaFlags::RESTORER) {
@@ -273,6 +275,9 @@ impl SignalState {
                 sanitize_xsave_image(save, true)
             };
             write_signal_frame_xstate_metadata(&mut fp, xfeatures);
+            if !task.prepare_cow_for_host_write(addr, SIGNAL_FPSTATE_SIZE) {
+                return Err(DeliverFault);
+            }
             let fp_ptr = MutPtr::<SignalFpStateBuf>::from_usize(addr);
             fp_ptr.write_at_offset(0, fp).ok_or(DeliverFault)?;
             addr as u64
@@ -331,6 +336,9 @@ impl SignalState {
             siginfo: siginfo.clone(),
         };
 
+        if !task.prepare_cow_for_host_write(frame_addr, core::mem::size_of::<SignalFrame>()) {
+            return Err(DeliverFault);
+        }
         let frame_ptr = MutPtr::from_usize(frame_addr);
         frame_ptr.write_at_offset(0, frame).ok_or(DeliverFault)?;
 

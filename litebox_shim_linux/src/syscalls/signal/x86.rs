@@ -104,6 +104,7 @@ impl SignalState {
         siginfo: &Siginfo,
         action: &SigAction,
         ctx: &mut PtRegs,
+        task: &Task<impl crate::ShimFS>,
         _in_syscall: bool,
     ) -> Result<(), DeliverFault> {
         if !action.flags.contains(SaFlags::RESTORER) {
@@ -150,6 +151,9 @@ impl SignalState {
 
         let rt = action.flags.contains(SaFlags::SIGINFO);
         if rt {
+            if !task.prepare_cow_for_host_write(frame_addr, core::mem::size_of::<SignalFrameRt>()) {
+                return Err(DeliverFault);
+            }
             let frame_ptr = MutPtr::from_usize(frame_addr);
             let frame = SignalFrameRt {
                 return_address: action.restorer,
@@ -167,6 +171,9 @@ impl SignalState {
             };
             frame_ptr.write_at_offset(0, frame).ok_or(DeliverFault)?;
         } else {
+            if !task.prepare_cow_for_host_write(frame_addr, core::mem::size_of::<SignalFrame>()) {
+                return Err(DeliverFault);
+            }
             let frame_ptr = MutPtr::from_usize(frame_addr);
             let frame = SignalFrame {
                 return_address: action.restorer,

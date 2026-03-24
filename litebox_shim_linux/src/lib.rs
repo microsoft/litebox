@@ -622,18 +622,37 @@ impl<FS: ShimFS> Task<FS> {
 
     fn restore_cow_layer_permissions(&self, cow: &Arc<CowState>) {
         for &(base, len, orig_perms) in &cow.protected_ranges {
-            for page_addr in (base..base + len).step_by(PAGE_SIZE) {
+            let mut run_start = base;
+            let mut run_perms = self
+                .lower_cow_page_permissions(cow, base)
+                .unwrap_or(orig_perms);
+
+            for page_addr in ((base + PAGE_SIZE)..(base + len)).step_by(PAGE_SIZE) {
                 let perms = self
                     .lower_cow_page_permissions(cow, page_addr)
                     .unwrap_or(orig_perms);
+                if perms == run_perms {
+                    continue;
+                }
                 unsafe {
                     <crate::Platform as litebox::platform::PageManagementProvider<PAGE_SIZE>>::update_permissions(
                         self.global.platform,
-                        page_addr..page_addr + PAGE_SIZE,
-                        perms,
+                        run_start..page_addr,
+                        run_perms,
                     )
                     .expect("CoW restore: failed to restore page permissions");
                 }
+                run_start = page_addr;
+                run_perms = perms;
+            }
+
+            unsafe {
+                <crate::Platform as litebox::platform::PageManagementProvider<PAGE_SIZE>>::update_permissions(
+                    self.global.platform,
+                    run_start..base + len,
+                    run_perms,
+                )
+                .expect("CoW restore: failed to restore page permissions");
             }
         }
     }
@@ -650,8 +669,20 @@ impl<FS: ShimFS> Task<FS> {
 
     fn restore_cow_layer(&self, cow: &Arc<CowState>, restore_bytes: bool) {
         if restore_bytes {
-            let dirty = cow.dirty_pages.lock();
-            for (page_addr, original_data) in dirty.iter() {
+            let dirty_pages = {
+                let mut dirty = cow.dirty_pages.lock();
+                let dirty_pages = core::mem::take(&mut *dirty);
+                // If a shim-side restore write faults on a page that we just
+                // took ownership of, the fault handler still needs membership
+                // in `dirty_pages` to avoid re-snapshotting it.
+                *dirty = dirty_pages
+                    .keys()
+                    .map(|page_addr| (*page_addr, Vec::new()))
+                    .collect();
+                dirty_pages
+            };
+
+            for (page_addr, original_data) in dirty_pages.iter() {
                 if <crate::Platform as litebox::platform::AddressSpaceProvider>::EAGER_COW_FOR_VFORK
                 {
                     let current =
