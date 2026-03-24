@@ -70,6 +70,25 @@ pub trait EnterShim {
     /// handler instead of this one.
     fn interrupt(&self, ctx: &mut Self::ExecutionContext) -> ContinueOperation;
 
+    /// Return the LiteBox process ID associated with this shim entrypoint, if
+    /// the shim tracks one.
+    ///
+    /// Platforms can use this to scope platform-owned thread bookkeeping to a
+    /// guest process rather than a single global pool.
+    fn process_id(&self) -> Option<crate::process::ProcessId> {
+        None
+    }
+
+    /// Return a stable identifier for the shim instance that owns this
+    /// entrypoint, if the shim tracks one.
+    ///
+    /// Platforms can combine this with [`process_id`](Self::process_id) when a
+    /// host process may contain multiple independent LiteBox instances whose
+    /// guest PID spaces overlap.
+    fn signal_target_scope(&self) -> Option<usize> {
+        None
+    }
+
     /// Called after the platform has fully left guest execution for a thread.
     ///
     /// Platforms invoke this on the host stack after guest execution has

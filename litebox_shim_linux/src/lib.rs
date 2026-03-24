@@ -143,6 +143,14 @@ impl<FS: ShimFS> litebox::shim::EnterShim for LinuxShimEntrypoints<FS> {
     fn interrupt(&self, ctx: &mut Self::ExecutionContext) -> ContinueOperation {
         self.enter_shim(false, ctx, |_, _| {})
     }
+
+    fn process_id(&self) -> Option<litebox::process::ProcessId> {
+        Some(self.task.process_id)
+    }
+
+    fn signal_target_scope(&self) -> Option<usize> {
+        Some(Arc::as_ptr(&self.task.global).addr())
+    }
 }
 
 impl<FS: ShimFS> LinuxShimEntrypoints<FS> {

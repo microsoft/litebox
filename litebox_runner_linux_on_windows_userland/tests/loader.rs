@@ -12,6 +12,35 @@
 
 mod common;
 
+fn runner_binary_path() -> String {
+    std::env::var("NEXTEST_BIN_EXE_litebox_runner_linux_on_windows_userland").unwrap_or_else(|_| {
+        env!("CARGO_BIN_EXE_litebox_runner_linux_on_windows_userland").to_string()
+    })
+}
+
+fn run_runner(args: &[&str]) -> std::process::Output {
+    let binary_path = runner_binary_path();
+    let mut command = std::process::Command::new(&binary_path);
+    command.args(args);
+    println!("Running `{command:?}`");
+    command
+        .output()
+        .expect("Failed to run litebox_runner_linux_on_windows_userland")
+}
+
+fn runtime_artifact_dir(name: &str) -> std::path::PathBuf {
+    let root = std::env::var("CARGO_TARGET_TMPDIR").map_or_else(
+        |_| std::env::temp_dir().join("litebox_runner_linux_on_windows_userland_tests"),
+        std::path::PathBuf::from,
+    );
+    let dir = root.join(format!("{name}-{}", std::process::id()));
+    if dir.exists() {
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
 #[expect(
     unused,
     reason = "This code snippet is just used to illustrate the source code of the `hello_exec_nolibc` test."
@@ -155,12 +184,13 @@ fn test_static_linked_prog_with_rewriter() {
     // Use the already compiled executable from the tests folder (same dir as this file)
     let mut test_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     test_dir.push("tests/test-bins");
+    let runtime_dir = runtime_artifact_dir("hello_world_static_rewriter");
 
     let prog_name = "hello_world_static";
     let prog_name_hooked = format!("{prog_name}.hooked");
 
     let path = test_dir.join(prog_name);
-    let hooked_path = test_dir.join(&prog_name_hooked);
+    let hooked_path = runtime_dir.join(&prog_name_hooked);
 
     // rewrite the target ELF executable file
     let _ = std::fs::remove_file(hooked_path.clone());
@@ -211,9 +241,8 @@ fn run_dynamic_linked_prog_with_rewriter(
     let prog_name_hooked = format!("{prog_name}.hooked");
 
     let path = test_dir.join(prog_name);
-    let hooked_path = test_dir.join(&prog_name_hooked);
-
-    let out_path = std::env::var("OUT_DIR").unwrap();
+    let runtime_dir = runtime_artifact_dir(exec_name);
+    let hooked_path = runtime_dir.join(&prog_name_hooked);
 
     // Rewrite the target ELF executable file
     let _ = std::fs::remove_file(hooked_path.clone());
@@ -237,12 +266,14 @@ fn run_dynamic_linked_prog_with_rewriter(
     );
 
     // Create tar file containing all dependencies
-    let tar_src_path = std::path::Path::new(&out_path).join("test_program_tar");
+    let tar_src_path = runtime_dir.join("test_program_tar");
     println!(
         "Creating tar source directory path: {}",
         tar_src_path.to_str().unwrap()
     );
-
+    if tar_src_path.exists() {
+        std::fs::remove_dir_all(&tar_src_path).unwrap();
+    }
     std::fs::create_dir_all(tar_src_path.join("out")).unwrap();
 
     // Rewrite all libraries that are required for initialization
@@ -301,7 +332,7 @@ fn run_dynamic_linked_prog_with_rewriter(
     std::fs::copy(&hooked_path, hooked_tar_dir.join(&prog_name_hooked)).unwrap();
 
     // tar
-    let tar_target_file = std::path::Path::new(&out_path).join("rootfs_rewriter.tar");
+    let tar_target_file = runtime_dir.join("rootfs_rewriter.tar");
     let tar_data = std::process::Command::new("tar")
         .args([
             "-cvf",
@@ -321,11 +352,6 @@ fn run_dynamic_linked_prog_with_rewriter(
     );
     println!("Tar file created at: {}", tar_target_file.to_str().unwrap());
 
-    let binary_path = std::env::var("NEXTEST_BIN_EXE_litebox_runner_linux_on_windows_userland")
-        .unwrap_or_else(|_| {
-            env!("CARGO_BIN_EXE_litebox_runner_linux_on_windows_userland").to_string()
-        });
-
     // The program path refers to the tar-internal path.
     let prog_tar_path = format!("/bin/{prog_name_hooked}");
 
@@ -342,15 +368,15 @@ fn run_dynamic_linked_prog_with_rewriter(
     args.push(&prog_tar_path);
     args.extend_from_slice(cmd_args);
 
-    let mut command = std::process::Command::new(&binary_path);
-    command.args(&args);
-    println!("Running `{command:?}`");
-    let status = command
-        .status()
-        .expect("Failed to run litebox_runner_linux_on_windows_userland");
+    let output = run_runner(&args);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        status.success(),
-        "failed to run litebox_runner_linux_on_windows_userland: {status}",
+        output.status.success(),
+        "failed to run litebox_runner_linux_on_windows_userland: {}\nstdout:\n{}\nstderr:\n{}",
+        output.status,
+        stdout,
+        stderr,
     );
 }
 

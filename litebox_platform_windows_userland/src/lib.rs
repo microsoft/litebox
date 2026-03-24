@@ -43,6 +43,7 @@ use core::panic;
 use core::sync::atomic::{AtomicU32, Ordering};
 use core::time::Duration;
 use std::cell::RefCell;
+use std::collections::BTreeMap;
 use std::io::{Read, Write};
 use std::os::raw::c_void;
 use std::os::windows::io::AsRawHandle as _;
@@ -2301,7 +2302,11 @@ fn run_thread_inner(
         ctx,
         tls: &tls_state,
     };
-    ThreadHandle::run_with_handle(&tls_state, || unsafe {
+    let signal_process_key = shim
+        .process_id()
+        .zip(shim.signal_target_scope())
+        .map(|(process_id, scope)| SignalProcessKey { scope, process_id });
+    ThreadHandle::run_with_handle(&tls_state, signal_process_key, || unsafe {
         run_thread_arch(&mut thread_ctx, &tls_state);
     });
     // Clear guest GS base so a subsequent Linux-mode guest on this thread
@@ -2934,7 +2939,7 @@ impl litebox::platform::ThreadProvider for WindowsUserland {
         // Ensure the module-wide TLS slot is allocated.
         ensure_tls_index();
         let tls = TlsState::new();
-        ThreadHandle::run_with_handle(&tls, f)
+        ThreadHandle::run_with_handle(&tls, None, f)
     }
 }
 
@@ -2946,7 +2951,17 @@ impl litebox::platform::TimerProvider for WindowsUserland {
         &self,
         signal: Self::Signal,
     ) -> Result<Self::TimerHandle, litebox::platform::TimerCreationError> {
-        let ctx = Box::new(TimerCallbackContext { signal });
+        let target = CURRENT_THREAD_HANDLE.with_borrow(|current| {
+            let handle = current
+                .as_ref()
+                .expect("timers require a managed guest thread")
+                .clone();
+            match handle.process_key() {
+                Some(process_key) => SignalTarget::Process(process_key),
+                None => SignalTarget::Thread(handle),
+            }
+        });
+        let ctx = Box::new(TimerCallbackContext { signal, target });
 
         // Create a threadpool timer with the callback registered up-front.
         // The callback fires whenever the timer is armed via
@@ -3036,11 +3051,39 @@ impl litebox::platform::TimerHandle for TimerHandle {
 /// Context shared between the `TimerHandle` and the threadpool timer callback.
 struct TimerCallbackContext {
     signal: litebox_common_linux::signal::Signal,
+    target: SignalTarget,
+}
+
+#[derive(Clone)]
+enum SignalTarget {
+    Process(SignalProcessKey),
+    Thread(ThreadHandle),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct SignalProcessKey {
+    scope: usize,
+    process_id: litebox::process::ProcessId,
+}
+
+fn deliver_signal_to_target(target: &SignalTarget, signal: litebox_common_linux::signal::Signal) {
+    match target {
+        SignalTarget::Process(process_id) => {
+            let thread = ACTIVE_THREADS
+                .lock()
+                .unwrap()
+                .recipient_for_process(*process_id);
+            if let Some(thread) = thread {
+                thread.deliver_signal(signal);
+            }
+        }
+        SignalTarget::Thread(thread) => thread.deliver_signal(signal),
+    }
 }
 
 /// Threadpool timer callback registered via `CreateThreadpoolTimer`.
 ///
-/// Picks an arbitrary active thread and delivers the signal.
+/// Delivers the signal to the process that created the timer.
 unsafe extern "system" fn threadpool_timer_callback(
     _instance: Win32_Threading::PTP_CALLBACK_INSTANCE,
     context: *mut c_void,
@@ -3050,25 +3093,21 @@ unsafe extern "system" fn threadpool_timer_callback(
     // `TimerHandle`. The handle's `Drop` impl waits for all in-flight
     // callbacks before dropping the context, so this reference is valid.
     let ctx = unsafe { &*context.cast::<TimerCallbackContext>() };
-    let thread = ACTIVE_THREADS.lock().unwrap().first().cloned();
-    if let Some(thread) = thread {
-        thread.deliver_signal(ctx.signal);
-    }
+    deliver_signal_to_target(&ctx.target, ctx.signal);
 }
 
 /// Console control handler registered via `SetConsoleCtrlHandler`.
 ///
-/// When the user presses Ctrl+C, this sets the SIGINT bit on every active
-/// managed thread and interrupts them so the shim can deliver the signal.
+/// When the user presses Ctrl+C, this sets the SIGINT bit on one active thread
+/// per managed process and interrupts them so the shim can deliver the
+/// process-directed signal.
 unsafe extern "system" fn ctrl_c_handler(ctrl_type: u32) -> i32 {
     if ctrl_type != windows_sys::Win32::System::Console::CTRL_C_EVENT {
         return 0; // FALSE — let the next handler deal with it
     }
 
-    // Pick one arbitrary thread to deliver the signal to.
-    let thread = ACTIVE_THREADS.lock().unwrap().first().cloned();
-
-    if let Some(thread) = thread {
+    let threads = ACTIVE_THREADS.lock().unwrap().broadcast_recipients();
+    for thread in threads {
         thread.deliver_signal(litebox_common_linux::signal::Signal::SIGINT);
     }
 
@@ -3081,6 +3120,7 @@ pub struct ThreadHandle(Arc<Mutex<Option<ThreadHandleInner>>>);
 struct ThreadHandleInner {
     handle: std::os::windows::io::OwnedHandle,
     tls: SendConstPtr<TlsState>,
+    process_key: Option<SignalProcessKey>,
 }
 
 struct SendConstPtr<T>(*const T);
@@ -3090,19 +3130,77 @@ thread_local! {
     static CURRENT_THREAD_HANDLE: RefCell<Option<ThreadHandle>> = const { RefCell::new(None) };
 }
 
-/// Global registry of all active managed thread handles.
+#[derive(Default)]
+struct ActiveThreadRegistry {
+    by_process: BTreeMap<SignalProcessKey, alloc::vec::Vec<ThreadHandle>>,
+    unscoped: alloc::vec::Vec<ThreadHandle>,
+}
+
+impl ActiveThreadRegistry {
+    fn register(&mut self, process_key: Option<SignalProcessKey>, handle: ThreadHandle) {
+        if let Some(process_key) = process_key {
+            self.by_process.entry(process_key).or_default().push(handle);
+        } else {
+            self.unscoped.push(handle);
+        }
+    }
+
+    fn unregister(&mut self, current: &ThreadHandle) {
+        self.by_process.retain(|_, handles| {
+            handles.retain(|handle| !Arc::ptr_eq(&handle.0, &current.0));
+            !handles.is_empty()
+        });
+        self.unscoped
+            .retain(|handle| !Arc::ptr_eq(&handle.0, &current.0));
+    }
+
+    fn recipient_for_process(&mut self, process_key: SignalProcessKey) -> Option<ThreadHandle> {
+        let mut remove_process = false;
+        let recipient = self.by_process.get_mut(&process_key).and_then(|handles| {
+            handles.retain(ThreadHandle::is_registered);
+            if handles.is_empty() {
+                remove_process = true;
+                None
+            } else {
+                handles.first().cloned()
+            }
+        });
+        if remove_process {
+            self.by_process.remove(&process_key);
+        }
+        recipient
+    }
+
+    fn broadcast_recipients(&mut self) -> alloc::vec::Vec<ThreadHandle> {
+        let mut recipients = alloc::vec::Vec::new();
+        self.by_process.retain(|_, handles| {
+            handles.retain(ThreadHandle::is_registered);
+            if let Some(handle) = handles.first().cloned() {
+                recipients.push(handle);
+                true
+            } else {
+                false
+            }
+        });
+        self.unscoped.retain(ThreadHandle::is_registered);
+        recipients.extend(self.unscoped.iter().cloned());
+        recipients
+    }
+}
+
+/// Global registry of all active managed thread handles, keyed by LiteBox
+/// process where available.
 ///
 /// Threads are registered in [`ThreadHandle::run_with_handle`] and
 /// removed when the guard drops.
-///
-/// TODO: This global list only works when we support a single process. For
-/// multi-process support, each process (or `WindowsUserland` instance) should
-/// track its own thread list.
-static ACTIVE_THREADS: Mutex<alloc::vec::Vec<ThreadHandle>> = Mutex::new(alloc::vec::Vec::new());
+static ACTIVE_THREADS: Mutex<ActiveThreadRegistry> = Mutex::new(ActiveThreadRegistry {
+    by_process: BTreeMap::new(),
+    unscoped: alloc::vec::Vec::new(),
+});
 
 impl ThreadHandle {
     /// Creates a [`ThreadHandle`] referencing the calling OS thread.
-    fn for_current_thread(tls: &TlsState) -> ThreadHandle {
+    fn for_current_thread(tls: &TlsState, process_key: Option<SignalProcessKey>) -> ThreadHandle {
         let win_handle = unsafe {
             std::os::windows::io::BorrowedHandle::borrow_raw(
                 windows_sys::Win32::System::Threading::GetCurrentThread(),
@@ -3113,16 +3211,24 @@ impl ThreadHandle {
                 .try_clone_to_owned()
                 .expect("failed to clone current thread handle"),
             tls: SendConstPtr(tls),
+            process_key,
         }))))
     }
 
     /// Runs `f`, ensuring that [`CURRENT_THREAD_HANDLE`] is set while in the call to `f`.
-    fn run_with_handle<R>(tls: &TlsState, f: impl FnOnce() -> R) -> R {
+    fn run_with_handle<R>(
+        tls: &TlsState,
+        process_key: Option<SignalProcessKey>,
+        f: impl FnOnce() -> R,
+    ) -> R {
         // Safety: `tls_state` lives for the duration of this call.
         unsafe { install_tls(tls) };
 
-        let handle = Self::for_current_thread(tls);
-        ACTIVE_THREADS.lock().unwrap().push(handle.clone());
+        let handle = Self::for_current_thread(tls, process_key);
+        ACTIVE_THREADS
+            .lock()
+            .unwrap()
+            .register(process_key, handle.clone());
         CURRENT_THREAD_HANDLE.with_borrow_mut(|current| {
             assert!(
                 current.is_none(),
@@ -3132,15 +3238,23 @@ impl ThreadHandle {
         });
         let _guard = litebox::utils::defer(move || {
             let current = CURRENT_THREAD_HANDLE.take().unwrap();
-            // Remove from the global registry.
-            ACTIVE_THREADS
-                .lock()
-                .unwrap()
-                .retain(|h| !Arc::ptr_eq(&h.0, &current.0));
+            ACTIVE_THREADS.lock().unwrap().unregister(&current);
             *current.0.lock().unwrap() = None;
             uninstall_tls();
         });
         f()
+    }
+
+    fn is_registered(&self) -> bool {
+        self.0.lock().unwrap().is_some()
+    }
+
+    fn process_key(&self) -> Option<SignalProcessKey> {
+        self.0
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(|inner| inner.process_key)
     }
 
     /// Sets a pending signal on this thread, wakes it from any condvar wait,
@@ -5050,8 +5164,10 @@ impl litebox::mm::linux::VmemPageFaultHandler for WindowsUserland {
 #[cfg(test)]
 mod tests {
     use core::sync::atomic::AtomicU32;
+    use core::sync::atomic::Ordering;
     use std::thread::sleep;
 
+    use super::CURRENT_THREAD_HANDLE;
     use crate::WindowsUserland;
     use crate::process_memory_range_by_regions;
     use litebox::platform::PageManagementProvider;
@@ -5059,6 +5175,107 @@ mod tests {
     use litebox::platform::RawMutex;
     use litebox::platform::page_mgmt::FixedAddressBehavior;
     use litebox::platform::page_mgmt::MemoryRegionPermissions;
+    use litebox::process::ProcessId;
+
+    static SIGNAL_ROUTING_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    struct ManagedTestThread {
+        handle: super::ThreadHandle,
+        release_tx: std::sync::mpsc::Sender<()>,
+        join: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl Drop for ManagedTestThread {
+        fn drop(&mut self) {
+            let _ = self.release_tx.send(());
+            if let Some(join) = self.join.take() {
+                join.join().unwrap();
+            }
+        }
+    }
+
+    fn spawn_managed_test_thread(scope: usize, process_id: ProcessId) -> ManagedTestThread {
+        let (handle_tx, handle_rx) = std::sync::mpsc::sync_channel(1);
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let join = std::thread::spawn(move || {
+            super::ensure_tls_index();
+            let tls = super::TlsState::new();
+            super::ThreadHandle::run_with_handle(
+                &tls,
+                Some(super::SignalProcessKey { scope, process_id }),
+                || {
+                    let handle = CURRENT_THREAD_HANDLE.with_borrow(|current| {
+                        current
+                            .clone()
+                            .expect("test thread should be registered with LiteBox")
+                    });
+                    handle_tx.send(handle).unwrap();
+                    release_rx.recv().unwrap();
+                },
+            );
+        });
+        ManagedTestThread {
+            handle: handle_rx.recv().unwrap(),
+            release_tx,
+            join: Some(join),
+        }
+    }
+
+    fn pending_signal_bits(handle: &super::ThreadHandle) -> u32 {
+        let inner = handle.0.lock().unwrap();
+        let inner = inner.as_ref().unwrap();
+        let tls = unsafe { &*inner.tls.0 };
+        tls.pending_host_signals.load(Ordering::SeqCst)
+    }
+
+    struct TimerCaptureShim {
+        scope: usize,
+        process_id: ProcessId,
+        observed_target: std::sync::Arc<std::sync::Mutex<Option<super::SignalProcessKey>>>,
+    }
+
+    impl litebox::shim::EnterShim for TimerCaptureShim {
+        type ExecutionContext = litebox_common_linux::ExecutionContext;
+
+        fn init(&self, _ctx: &mut Self::ExecutionContext) -> litebox::shim::ContinueOperation {
+            let platform = WindowsUserland::new(None);
+            let timer = <WindowsUserland as litebox::platform::TimerProvider>::create_timer(
+                platform,
+                litebox_common_linux::signal::Signal::SIGUSR1,
+            )
+            .unwrap();
+            let target = match &timer._ctx.target {
+                super::SignalTarget::Process(key) => Some(*key),
+                super::SignalTarget::Thread(_) => None,
+            };
+            *self.observed_target.lock().unwrap() = target;
+            litebox::shim::ContinueOperation::Terminate
+        }
+
+        fn syscall(&self, _ctx: &mut Self::ExecutionContext) -> litebox::shim::ContinueOperation {
+            litebox::shim::ContinueOperation::Terminate
+        }
+
+        fn exception(
+            &self,
+            _ctx: &mut Self::ExecutionContext,
+            _info: &litebox::shim::ExceptionInfo,
+        ) -> litebox::shim::ContinueOperation {
+            litebox::shim::ContinueOperation::Terminate
+        }
+
+        fn interrupt(&self, _ctx: &mut Self::ExecutionContext) -> litebox::shim::ContinueOperation {
+            litebox::shim::ContinueOperation::Terminate
+        }
+
+        fn process_id(&self) -> Option<ProcessId> {
+            Some(self.process_id)
+        }
+
+        fn signal_target_scope(&self) -> Option<usize> {
+            Some(self.scope)
+        }
+    }
 
     #[test]
     fn test_raw_mutex() {
@@ -5356,5 +5573,68 @@ mod tests {
             unsafe { super::VirtualFree(addr, 0, super::Win32_Memory::MEM_RELEASE) },
             0
         );
+    }
+
+    #[test]
+    fn test_create_timer_captures_signal_process_key_from_shim_scope() {
+        let observed_target = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let shim = TimerCaptureShim {
+            scope: 7,
+            process_id: ProcessId(9),
+            observed_target: observed_target.clone(),
+        };
+        let mut ctx = litebox_common_linux::ExecutionContext::default();
+
+        unsafe {
+            super::run_thread_ref(&shim, &mut ctx);
+        }
+
+        assert_eq!(
+            *observed_target.lock().unwrap(),
+            Some(super::SignalProcessKey {
+                scope: 7,
+                process_id: ProcessId(9),
+            })
+        );
+    }
+
+    #[test]
+    fn test_threadpool_timer_callback_targets_own_process() {
+        let _guard = SIGNAL_ROUTING_TEST_LOCK.lock().unwrap();
+        let process_a = spawn_managed_test_thread(1, ProcessId(1));
+        let process_b = spawn_managed_test_thread(2, ProcessId(1));
+        let signal = litebox_common_linux::signal::Signal::SIGUSR1;
+        let bit = 1u32 << (signal.as_i32() - 1);
+        let ctx = super::TimerCallbackContext {
+            signal,
+            target: super::SignalTarget::Process(super::SignalProcessKey {
+                scope: 2,
+                process_id: ProcessId(1),
+            }),
+        };
+
+        unsafe {
+            super::threadpool_timer_callback(0, (&raw const ctx).cast_mut().cast(), 0);
+        }
+
+        assert_eq!(pending_signal_bits(&process_a.handle), 0);
+        assert_eq!(pending_signal_bits(&process_b.handle), bit);
+    }
+
+    #[test]
+    fn test_ctrl_c_handler_signals_each_active_process() {
+        let _guard = SIGNAL_ROUTING_TEST_LOCK.lock().unwrap();
+        let process_a = spawn_managed_test_thread(1, ProcessId(1));
+        let process_b = spawn_managed_test_thread(2, ProcessId(1));
+        let sigint = litebox_common_linux::signal::Signal::SIGINT;
+        let bit = 1u32 << (sigint.as_i32() - 1);
+
+        assert_eq!(
+            unsafe { super::ctrl_c_handler(windows_sys::Win32::System::Console::CTRL_C_EVENT) },
+            1
+        );
+
+        assert_eq!(pending_signal_bits(&process_a.handle), bit);
+        assert_eq!(pending_signal_bits(&process_b.handle), bit);
     }
 }
