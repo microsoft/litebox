@@ -43,6 +43,7 @@ use core::panic;
 use core::sync::atomic::{AtomicU32, Ordering};
 use core::time::Duration;
 use std::cell::RefCell;
+use std::io::{Read, Write};
 use std::os::raw::c_void;
 use std::os::windows::io::AsRawHandle as _;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -74,6 +75,81 @@ use windows_sys::Win32::{
 use zerocopy::{FromBytes, IntoBytes};
 
 extern crate alloc;
+
+/// IPC stream to a host-side broker.
+///
+/// On Windows, both loopback TCP sockets and AF_UNIX sockets are Winsock
+/// stream sockets. Rust's standard library only exposes `TcpStream`, so both
+/// variants are owned through that type while remaining explicitly tagged here.
+#[derive(Debug)]
+pub enum IpcStream {
+    Tcp(std::net::TcpStream),
+    Unix(std::net::TcpStream),
+}
+
+impl IpcStream {
+    pub fn from_tcp(stream: std::net::TcpStream) -> Self {
+        Self::Tcp(stream)
+    }
+
+    pub fn from_unix(stream: std::net::TcpStream) -> Self {
+        Self::Unix(stream)
+    }
+
+    pub fn set_nonblocking(&self, nonblock: bool) -> std::io::Result<()> {
+        match self {
+            Self::Tcp(stream) | Self::Unix(stream) => stream.set_nonblocking(nonblock),
+        }
+    }
+
+    pub fn set_nodelay(&self, nodelay: bool) -> std::io::Result<()> {
+        match self {
+            Self::Tcp(stream) | Self::Unix(stream) => stream.set_nodelay(nodelay),
+        }
+    }
+
+    pub fn set_read_timeout(&self, timeout: Option<Duration>) -> std::io::Result<()> {
+        match self {
+            Self::Tcp(stream) | Self::Unix(stream) => stream.set_read_timeout(timeout),
+        }
+    }
+
+    pub fn peek(&self, buf: &mut [u8]) -> std::io::Result<usize> {
+        match self {
+            Self::Tcp(stream) | Self::Unix(stream) => stream.peek(buf),
+        }
+    }
+
+    pub fn raw_socket(&self) -> usize {
+        use std::os::windows::io::AsRawSocket;
+
+        match self {
+            Self::Tcp(stream) | Self::Unix(stream) => stream.as_raw_socket() as usize,
+        }
+    }
+}
+
+impl Read for IpcStream {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        match self {
+            Self::Tcp(stream) | Self::Unix(stream) => stream.read(buf),
+        }
+    }
+}
+
+impl Write for IpcStream {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        match self {
+            Self::Tcp(stream) | Self::Unix(stream) => stream.write(buf),
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self {
+            Self::Tcp(stream) | Self::Unix(stream) => stream.flush(),
+        }
+    }
+}
 
 // Thread-local storage for FS base state
 thread_local! {
@@ -500,9 +576,9 @@ pub struct WindowsUserland {
     stdin_cancelled: core::sync::atomic::AtomicBool,
     /// WinTUN session for IP packet I/O (None when networking is disabled).
     tun_session: Option<wintun_ffi::WinTunSession>,
-    /// IPC TCP stream to a network broker (None when IPC networking is disabled).
+    /// IPC stream to a network broker (None when IPC networking is disabled).
     /// Uses the same framing protocol as the Linux platform: `[u32 LE len][IP packet]`.
-    ipc_stream: std::sync::OnceLock<Mutex<std::net::TcpStream>>,
+    ipc_stream: std::sync::OnceLock<Mutex<IpcStream>>,
     /// Set when the IPC transport encounters a fatal protocol error or EOF.
     ipc_dead: core::sync::atomic::AtomicBool,
     /// Host-owned guest GS → host GS lookup table for NT-mode guests.
@@ -1781,12 +1857,12 @@ impl WindowsUserland {
         leaked
     }
 
-    /// Attach an IPC TCP stream to the broker for networking.
+    /// Attach an IPC stream to the broker for networking.
     ///
     /// The stream must already be connected and in non-blocking mode.
     /// Called after `new()` but before the network worker thread starts.
     /// Panics if called more than once.
-    pub fn set_ipc_stream(&self, stream: std::net::TcpStream) {
+    pub fn set_ipc_stream(&self, stream: IpcStream) {
         self.ipc_stream
             .set(Mutex::new(stream))
             .expect("set_ipc_stream called more than once");
@@ -1972,7 +2048,7 @@ impl WindowsUserland {
             return self.wait_on_tun(timeout);
         }
 
-        // IPC path — poll the TCP socket for POLLIN.
+        // IPC path — poll the broker stream for POLLIN.
         if let Some(stream_lock) = self.ipc_stream.get() {
             if self.ipc_dead.load(core::sync::atomic::Ordering::Relaxed) {
                 if let Some(t) = timeout {
@@ -1980,11 +2056,7 @@ impl WindowsUserland {
                 }
                 return;
             }
-
-            let raw_socket = {
-                use std::os::windows::io::AsRawSocket;
-                stream_lock.lock().unwrap().as_raw_socket() as usize
-            };
+            let raw_socket = stream_lock.lock().unwrap().raw_socket();
 
             #[repr(C)]
             struct WsaPollFd {
@@ -3441,8 +3513,7 @@ impl litebox::platform::IPInterfaceProvider for WindowsUserland {
                         // Wait for the socket to become writable (up to 10ms)
                         // instead of busy-spinning. Drop the lock while waiting
                         // so receive_ip_packet can make progress.
-                        use std::os::windows::io::AsRawSocket;
-                        let raw = stream.as_raw_socket() as usize;
+                        let raw = stream.raw_socket();
                         drop(stream);
                         #[repr(C)]
                         struct WsaPollFd {

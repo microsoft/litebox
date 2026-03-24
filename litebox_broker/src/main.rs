@@ -50,8 +50,9 @@ struct Cli {
     #[arg(long)]
     network_proxy_fd: Option<i32>,
 
-    /// Listen address for network proxy IPC connections.
-    /// On Unix: path to a Unix domain socket. On Windows: TCP address (e.g., 127.0.0.1:9999).
+    /// Listen endpoint for network proxy IPC connections.
+    /// On Unix: path to a Unix domain socket. On Windows: loopback TCP address
+    /// (e.g., 127.0.0.1:9999) or AF_UNIX socket path.
     #[arg(long, conflicts_with = "network_proxy_fd")]
     network_proxy_listen: Option<String>,
 }
@@ -179,7 +180,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         #[cfg(unix)]
         let listener = IpcListener::bind_unix(std::path::Path::new(listen_addr))?;
         #[cfg(windows)]
-        let listener = IpcListener::bind_tcp(listen_addr)?;
+        let listener = IpcListener::bind_endpoint(listen_addr)?;
 
         info!(addr = %listen_addr, "network proxy listening");
 

@@ -102,10 +102,11 @@ pub struct CliArgs {
     /// an .exe, that EXE is used automatically.
     #[arg(long = "pe-file", value_name = "PATH", value_hint = clap::ValueHint::FilePath)]
     pub pe_file: Option<PathBuf>,
-    /// Connect to a network broker via TCP loopback at the given address
-    /// (e.g., "127.0.0.1:9000"). The broker must be listening and speaking
-    /// the litebox IPC network protocol (LBNP handshake).
-    #[arg(long = "network-broker", value_name = "ADDR")]
+    /// Connect to a network broker via loopback TCP (e.g.,
+    /// "127.0.0.1:9000") or a Windows AF_UNIX socket path. The broker must
+    /// be listening and speaking the litebox IPC network protocol (LBNP
+    /// handshake).
+    #[arg(long = "network-broker", value_name = "ADDR_OR_PATH")]
     pub network_broker: Option<String>,
     /// Path to a tar file containing real DLLs (ntdll.dll, kernel32.dll,
     /// etc.) and optionally the main EXE.
@@ -1491,33 +1492,117 @@ const HANDSHAKE_MAGIC: &[u8; 4] = b"LBNP";
 const HANDSHAKE_VERSION: u16 = 1;
 const HANDSHAKE_MTU: u16 = 1600;
 
-/// Connect to the network broker via TCP loopback and perform the LBNP
-/// handshake. Returns a **non-blocking** `TcpStream` ready for the
+/// Connect to the network broker via loopback TCP or AF_UNIX and perform the
+/// LBNP handshake. Returns a **non-blocking** IPC stream ready for the
 /// platform's `IPInterfaceProvider` to use.
-fn connect_to_broker_ipc(addr: &str) -> Result<std::net::TcpStream> {
-    use std::io::{Read, Write};
+fn connect_to_broker_ipc(endpoint: &str) -> Result<litebox_platform_windows_userland::IpcStream> {
+    let mut stream = match endpoint.parse::<std::net::SocketAddr>() {
+        Ok(sock_addr) => connect_to_broker_tcp(endpoint, sock_addr)?,
+        Err(_) => connect_to_broker_unix(endpoint)?,
+    };
+    perform_ipc_handshake(&mut stream)?;
+    stream
+        .set_nonblocking(true)
+        .map_err(|e| anyhow!("Failed to set non-blocking on IPC stream: {e}"))?;
+    stream.set_read_timeout(None).ok();
+    Ok(stream)
+}
 
-    let sock_addr: std::net::SocketAddr = addr
-        .parse()
-        .map_err(|e| anyhow!("Invalid broker address '{addr}': {e}"))?;
-
-    // Security: only allow loopback addresses for the IPC control plane.
+fn connect_to_broker_tcp(
+    endpoint: &str,
+    sock_addr: std::net::SocketAddr,
+) -> Result<litebox_platform_windows_userland::IpcStream> {
     let ip = sock_addr.ip();
     if !ip.is_loopback() {
         anyhow::bail!(
-            "Broker address '{addr}' is not a loopback address. \
+            "Broker address '{endpoint}' is not a loopback address. \
              Only 127.0.0.1 or [::1] are allowed for security."
         );
     }
 
-    // Blocking connect — we don't have anything else to do yet.
-    let mut stream =
+    let stream =
         std::net::TcpStream::connect_timeout(&sock_addr, std::time::Duration::from_secs(5))
-            .map_err(|e| anyhow!("Failed to connect to broker at {addr}: {e}"))?;
+            .map_err(|e| anyhow!("Failed to connect to broker at {endpoint}: {e}"))?;
 
-    stream.set_nodelay(true).ok(); // reduce latency for small IPC frames
+    stream.set_nodelay(true).ok();
+    Ok(litebox_platform_windows_userland::IpcStream::from_tcp(
+        stream,
+    ))
+}
 
-    // --- Send handshake: magic (4) + version (2) + MTU (2) = 8 bytes ---
+fn connect_to_broker_unix(path: &str) -> Result<litebox_platform_windows_userland::IpcStream> {
+    use std::os::windows::io::FromRawSocket;
+
+    let (addr, addr_len) = win_sock::sockaddr_un_from_path(path)
+        .map_err(|e| anyhow!("Invalid broker AF_UNIX path '{path}': {e}"))?;
+    let stream = unsafe {
+        win_sock::wsa_ensure_init();
+        let socket = win_sock::socket(i32::from(win_sock::AF_UNIX), win_sock::SOCK_STREAM, 0);
+        if socket == win_sock::INVALID_SOCKET {
+            let err = win_sock::WSAGetLastError();
+            if err == win_sock::WSAEAFNOSUPPORT {
+                anyhow::bail!("Windows AF_UNIX is not available on this system");
+            }
+            anyhow::bail!("Failed to create AF_UNIX broker IPC socket: WSA error {err}");
+        }
+        std::net::TcpStream::from_raw_socket(socket as _)
+    };
+    let stream = litebox_platform_windows_userland::IpcStream::from_unix(stream);
+    stream
+        .set_nonblocking(true)
+        .map_err(|e| anyhow!("Failed to set non-blocking on AF_UNIX IPC stream: {e}"))?;
+    let raw = stream.raw_socket();
+    let ret = unsafe { win_sock::connect(raw, (&raw const addr).cast(), addr_len) };
+    if ret != 0 {
+        let err = unsafe { win_sock::WSAGetLastError() };
+        if err != win_sock::WSAEWOULDBLOCK {
+            anyhow::bail!("Failed to connect to broker AF_UNIX socket at {path}: WSA error {err}");
+        }
+        wait_for_ipc_connect(raw, path)?;
+    }
+    stream
+        .set_nonblocking(false)
+        .map_err(|e| anyhow!("Failed to restore blocking mode on AF_UNIX IPC stream: {e}"))?;
+    stream.set_nodelay(true).ok();
+    Ok(stream)
+}
+
+fn wait_for_ipc_connect(raw_socket: usize, endpoint: &str) -> Result<()> {
+    let mut pfd = win_sock::WSAPOLLFD {
+        fd: raw_socket,
+        events: win_sock::POLLOUT,
+        revents: 0,
+    };
+    let ret = unsafe { win_sock::WSAPoll(&raw mut pfd, 1, 5000) };
+    if ret == 0 {
+        anyhow::bail!("Timed out connecting to broker IPC at {endpoint}");
+    }
+    if ret < 0 {
+        anyhow::bail!(
+            "Failed polling broker IPC connect at {endpoint}: WSA error {}",
+            unsafe { win_sock::WSAGetLastError() }
+        );
+    }
+    let mut err: i32 = 0;
+    let mut len = i32::try_from(std::mem::size_of::<i32>()).expect("i32 size fits in i32");
+    unsafe {
+        win_sock::getsockopt(
+            raw_socket,
+            win_sock::SOL_SOCKET.cast_signed(),
+            win_sock::SO_ERROR.cast_signed(),
+            (&raw mut err).cast(),
+            &raw mut len,
+        );
+    }
+    if err != 0 {
+        anyhow::bail!("Failed to connect to broker IPC at {endpoint}: WSA error {err}");
+    }
+    Ok(())
+}
+
+fn perform_ipc_handshake(stream: &mut litebox_platform_windows_userland::IpcStream) -> Result<()> {
+    use std::io::{Read, Write};
+
     let mut msg = [0u8; 8];
     msg[0..4].copy_from_slice(HANDSHAKE_MAGIC);
     msg[4..6].copy_from_slice(&HANDSHAKE_VERSION.to_le_bytes());
@@ -1526,7 +1611,6 @@ fn connect_to_broker_ipc(addr: &str) -> Result<std::net::TcpStream> {
         .write_all(&msg)
         .map_err(|e| anyhow!("IPC handshake send failed: {e}"))?;
 
-    // --- Read response (8 bytes, with timeout) ---
     stream
         .set_read_timeout(Some(std::time::Duration::from_secs(10)))
         .ok();
@@ -1550,14 +1634,111 @@ fn connect_to_broker_ipc(addr: &str) -> Result<std::net::TcpStream> {
         anyhow::bail!("IPC handshake: MTU mismatch (broker sent {mtu}, we expect {HANDSHAKE_MTU})");
     }
     trace_debugln!("IPC handshake complete: broker MTU={mtu}");
+    Ok(())
+}
 
-    // Switch to non-blocking for the platform's poll-based I/O loop.
-    stream
-        .set_nonblocking(true)
-        .map_err(|e| anyhow!("Failed to set non-blocking on IPC stream: {e}"))?;
-    stream.set_read_timeout(None).ok();
+#[allow(
+    non_camel_case_types,
+    non_snake_case,
+    dead_code,
+    clippy::upper_case_acronyms
+)]
+mod win_sock {
+    use std::{io, sync::Once};
 
-    Ok(stream)
+    pub const AF_UNIX: u16 = 1;
+    pub const SOCK_STREAM: i32 = 1;
+    pub const INVALID_SOCKET: usize = !0;
+    pub const SOL_SOCKET: u32 = 0xFFFF;
+    pub const SO_ERROR: u32 = 0x1007;
+    pub const WSAEAFNOSUPPORT: i32 = 10047;
+    pub const WSAEWOULDBLOCK: i32 = 10035;
+    pub const POLLOUT: i16 = 0x0010;
+
+    #[repr(C)]
+    pub struct WSADATA {
+        pub wVersion: u16,
+        pub wHighVersion: u16,
+        pub iMaxSockets: u16,
+        pub iMaxUdpDg: u16,
+        pub lpVendorInfo: *mut u8,
+        pub szDescription: [u8; 257],
+        pub szSystemStatus: [u8; 129],
+    }
+
+    #[repr(C)]
+    pub struct SOCKADDR_UN {
+        pub sun_family: u16,
+        pub sun_path: [u8; 108],
+    }
+
+    #[repr(C)]
+    pub struct WSAPOLLFD {
+        pub fd: usize,
+        pub events: i16,
+        pub revents: i16,
+    }
+
+    #[link(name = "ws2_32")]
+    unsafe extern "system" {
+        pub fn WSAStartup(wVersionRequested: u16, lpWSAData: *mut WSADATA) -> i32;
+        pub fn WSAGetLastError() -> i32;
+        pub fn WSAPoll(fdArray: *mut WSAPOLLFD, fds: u32, timeout: i32) -> i32;
+        pub fn socket(af: i32, r#type: i32, protocol: i32) -> usize;
+        pub fn connect(s: usize, name: *const u8, namelen: i32) -> i32;
+        pub fn getsockopt(
+            s: usize,
+            level: i32,
+            optname: i32,
+            optval: *mut u8,
+            optlen: *mut i32,
+        ) -> i32;
+    }
+
+    static WSA_INIT: Once = Once::new();
+
+    pub fn wsa_ensure_init() {
+        WSA_INIT.call_once(|| unsafe {
+            let mut data = std::mem::zeroed::<WSADATA>();
+            WSAStartup(0x0202, &raw mut data);
+        });
+    }
+
+    pub fn sockaddr_un_from_path(path: &str) -> io::Result<(SOCKADDR_UN, i32)> {
+        let path_bytes = path.as_bytes();
+        if path_bytes.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "AF_UNIX path cannot be empty",
+            ));
+        }
+        if path_bytes.contains(&0) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "AF_UNIX path cannot contain NUL bytes",
+            ));
+        }
+        if path_bytes.len() >= 108 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "AF_UNIX path too long ({} bytes, max 107)",
+                    path_bytes.len()
+                ),
+            ));
+        }
+
+        let mut addr = SOCKADDR_UN {
+            sun_family: AF_UNIX,
+            sun_path: [0; 108],
+        };
+        addr.sun_path[..path_bytes.len()].copy_from_slice(path_bytes);
+        let addr_len =
+            i32::try_from(std::mem::size_of::<u16>() + path_bytes.len() + 1).map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidInput, "AF_UNIX path length overflow")
+            })?;
+        Ok((addr, addr_len))
+    }
 }
 
 /// Start the network worker thread if a network stack is configured.

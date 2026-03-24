@@ -58,14 +58,17 @@ impl_as_raw_sock!(UdpSocket);
 
 /// Owned stream socket.
 ///
-/// Wraps a `TcpStream` on all platforms and, on Unix, also supports Unix
-/// domain sockets.  Implements `Read + Write` via `std`.
+/// Wraps a stream socket on all platforms and implements `Read + Write` via
+/// `std`.
 pub enum IpcStream {
     /// TCP stream (cross-platform).
     Tcp(TcpStream),
-    /// Unix domain stream (Unix only).
+    /// Unix domain stream.
     #[cfg(unix)]
     Unix(std::os::unix::net::UnixStream),
+    /// Windows AF_UNIX stream socket, owned through `TcpStream`.
+    #[cfg(windows)]
+    Unix(TcpStream),
 }
 
 impl IpcStream {
@@ -86,6 +89,8 @@ impl IpcStream {
             Self::Tcp(s) => s.set_nonblocking(nonblock),
             #[cfg(unix)]
             Self::Unix(s) => s.set_nonblocking(nonblock),
+            #[cfg(windows)]
+            Self::Unix(s) => s.set_nonblocking(nonblock),
         }
     }
 
@@ -98,6 +103,8 @@ impl IpcStream {
                 use std::os::unix::io::AsRawFd;
                 s.as_raw_fd()
             }
+            #[cfg(windows)]
+            Self::Unix(s) => s.as_raw_sock(),
         }
     }
 
@@ -132,6 +139,8 @@ impl IpcStream {
                     Ok(ret as usize)
                 })
             }
+            #[cfg(windows)]
+            Self::Unix(s) => normalize(s.peek(buf)),
         }
     }
 }
@@ -141,6 +150,8 @@ impl Read for IpcStream {
         match self {
             Self::Tcp(s) => s.read(buf),
             #[cfg(unix)]
+            Self::Unix(s) => s.read(buf),
+            #[cfg(windows)]
             Self::Unix(s) => s.read(buf),
         }
     }
@@ -152,6 +163,8 @@ impl Write for IpcStream {
             Self::Tcp(s) => s.write(buf),
             #[cfg(unix)]
             Self::Unix(s) => s.write(buf),
+            #[cfg(windows)]
+            Self::Unix(s) => s.write(buf),
         }
     }
 
@@ -159,6 +172,8 @@ impl Write for IpcStream {
         match self {
             Self::Tcp(s) => s.flush(),
             #[cfg(unix)]
+            Self::Unix(s) => s.flush(),
+            #[cfg(windows)]
             Self::Unix(s) => s.flush(),
         }
     }
@@ -187,12 +202,56 @@ impl std::os::unix::io::AsRawFd for IpcStream {
 /// Cross-platform IPC listener.
 ///
 /// On Unix: wraps a `UnixListener` (Unix domain socket).
-/// On Windows: wraps a `TcpListener` on localhost.
+/// On Windows: wraps either a loopback TCP listener or a raw AF_UNIX socket
+/// listener.
 pub struct IpcListener {
     #[cfg(unix)]
     inner: std::os::unix::net::UnixListener,
     #[cfg(windows)]
-    inner: std::net::TcpListener,
+    inner: WindowsIpcListener,
+}
+
+#[cfg(windows)]
+enum WindowsIpcListener {
+    Tcp(std::net::TcpListener),
+    Unix(UnixSocketListener),
+}
+
+#[cfg(windows)]
+struct UnixSocketListener {
+    socket: RawSock,
+    path: std::path::PathBuf,
+}
+
+#[cfg(windows)]
+impl Drop for UnixSocketListener {
+    fn drop(&mut self) {
+        unsafe {
+            win::closesocket(self.socket);
+        }
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+#[cfg(windows)]
+impl UnixSocketListener {
+    fn accept(&self) -> io::Result<Option<IpcStream>> {
+        use std::os::windows::io::FromRawSocket;
+
+        let socket =
+            unsafe { win::accept(self.socket, std::ptr::null_mut(), std::ptr::null_mut()) };
+        if socket == win::INVALID_SOCKET {
+            let err = unsafe { win::WSAGetLastError() };
+            if err == win::WSAEWOULDBLOCK {
+                return Ok(None);
+            }
+            return Err(io::Error::from_raw_os_error(err));
+        }
+
+        let stream = unsafe { TcpStream::from_raw_socket(socket as _) };
+        stream.set_nonblocking(true)?;
+        Ok(Some(IpcStream::Unix(stream)))
+    }
 }
 
 impl IpcListener {
@@ -209,17 +268,30 @@ impl IpcListener {
         }
         #[cfg(windows)]
         {
-            match self.inner.accept() {
-                Ok((stream, _)) => Ok(Some(IpcStream::Tcp(stream))),
-                Err(e) if e.kind() == io::ErrorKind::WouldBlock => Ok(None),
-                Err(e) => Err(e),
+            match &self.inner {
+                WindowsIpcListener::Tcp(listener) => match listener.accept() {
+                    Ok((stream, _)) => Ok(Some(IpcStream::Tcp(stream))),
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => Ok(None),
+                    Err(e) => Err(e),
+                },
+                WindowsIpcListener::Unix(listener) => listener.accept(),
             }
         }
     }
 
     /// Raw socket for polling.
     pub fn raw(&self) -> RawSock {
-        self.inner.as_raw_sock()
+        #[cfg(unix)]
+        {
+            self.inner.as_raw_sock()
+        }
+        #[cfg(windows)]
+        {
+            match &self.inner {
+                WindowsIpcListener::Tcp(listener) => listener.as_raw_sock(),
+                WindowsIpcListener::Unix(listener) => listener.socket,
+            }
+        }
     }
 }
 
@@ -247,23 +319,93 @@ impl IpcListener {
 
 #[cfg(windows)]
 impl IpcListener {
-    /// Bind to a TCP loopback address.
+    /// Bind to either a TCP loopback address or an AF_UNIX socket path.
     ///
-    /// Only `127.0.0.1` and `[::1]` are accepted — the IPC listener must not
-    /// be reachable off-host.
-    pub fn bind_tcp(addr: &str) -> io::Result<Self> {
-        let sock_addr: std::net::SocketAddr = addr.parse().map_err(|e| {
-            io::Error::new(io::ErrorKind::InvalidInput, format!("bad address: {e}"))
-        })?;
-        if !sock_addr.ip().is_loopback() {
+    /// Only `127.0.0.1` and `[::1]` are accepted for TCP — the IPC listener
+    /// must not be reachable off-host.
+    pub fn bind_endpoint(endpoint: &str) -> io::Result<Self> {
+        if let Ok(sock_addr) = endpoint.parse::<std::net::SocketAddr>() {
+            if !sock_addr.ip().is_loopback() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "IPC listener must bind to loopback (127.0.0.1 / [::1]), got {endpoint}"
+                    ),
+                ));
+            }
+            let listener = std::net::TcpListener::bind(sock_addr)?;
+            listener.set_nonblocking(true)?;
+            return Ok(Self {
+                inner: WindowsIpcListener::Tcp(listener),
+            });
+        }
+
+        Self::bind_unix(endpoint)
+    }
+
+    fn bind_unix(path: &str) -> io::Result<Self> {
+        let socket_path = std::path::Path::new(path);
+        if socket_path.exists() {
             return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("IPC listener must bind to loopback (127.0.0.1 / [::1]), got {addr}"),
+                io::ErrorKind::AlreadyExists,
+                format!("AF_UNIX socket path already exists: {path}"),
             ));
         }
-        let listener = std::net::TcpListener::bind(sock_addr)?;
-        listener.set_nonblocking(true)?;
-        Ok(Self { inner: listener })
+
+        let (addr, addr_len) = win::sockaddr_un_from_path(path)?;
+        let socket = unsafe {
+            win::wsa_ensure_init();
+            let socket = win::socket(i32::from(win::AF_UNIX), win::SOCK_STREAM, 0);
+            if socket == win::INVALID_SOCKET {
+                let err = win::WSAGetLastError();
+                return Err(if err == win::WSAEAFNOSUPPORT {
+                    io::Error::new(
+                        io::ErrorKind::Unsupported,
+                        "Windows AF_UNIX is not available on this system",
+                    )
+                } else {
+                    io::Error::from_raw_os_error(err)
+                });
+            }
+            socket
+        };
+
+        let bind_ret = unsafe { win::bind(socket, (&raw const addr).cast(), addr_len) };
+        if bind_ret != 0 {
+            unsafe {
+                win::closesocket(socket);
+            }
+            return Err(io::Error::from_raw_os_error(unsafe {
+                win::WSAGetLastError()
+            }));
+        }
+        let mut nonblock = 1;
+        let nonblock_ret = unsafe { win::ioctlsocket(socket, win::FIONBIO as i32, &mut nonblock) };
+        if nonblock_ret != 0 {
+            unsafe {
+                win::closesocket(socket);
+            }
+            let _ = std::fs::remove_file(socket_path);
+            return Err(io::Error::from_raw_os_error(unsafe {
+                win::WSAGetLastError()
+            }));
+        }
+        let listen_ret = unsafe { win::listen(socket, 128) };
+        if listen_ret != 0 {
+            unsafe {
+                win::closesocket(socket);
+            }
+            let _ = std::fs::remove_file(socket_path);
+            return Err(io::Error::from_raw_os_error(unsafe {
+                win::WSAGetLastError()
+            }));
+        }
+        Ok(Self {
+            inner: WindowsIpcListener::Unix(UnixSocketListener {
+                socket,
+                path: socket_path.to_path_buf(),
+            }),
+        })
     }
 }
 
@@ -485,7 +627,7 @@ pub fn start_nonblocking_connect(dest: &std::net::SocketAddr) -> Result<IpcStrea
         use std::os::windows::io::FromRawSocket;
         unsafe {
             win::wsa_ensure_init();
-            let s = win::socket(win::AF_INET as i32, win::SOCK_STREAM, 0);
+            let s = win::socket(i32::from(win::AF_INET), win::SOCK_STREAM, 0);
             if s == win::INVALID_SOCKET {
                 return Err(io::Error::from_raw_os_error(win::WSAGetLastError()));
             }
@@ -556,13 +698,13 @@ pub fn check_connect(ipc: &IpcStream) -> Option<Result<(), io::Error>> {
     #[cfg(windows)]
     unsafe {
         let mut err: i32 = 0;
-        let mut len: i32 = std::mem::size_of::<i32>() as i32;
+        let mut len: i32 = i32::try_from(std::mem::size_of::<i32>()).expect("i32 size fits in i32");
         win::getsockopt(
             fd,
-            win::SOL_SOCKET as i32,
-            win::SO_ERROR as i32,
-            (&mut err as *mut i32).cast(),
-            &mut len,
+            win::SOL_SOCKET.cast_signed(),
+            win::SO_ERROR.cast_signed(),
+            (&raw mut err).cast(),
+            &raw mut len,
         );
         if err != 0 {
             Some(Err(io::Error::from_raw_os_error(err)))
@@ -594,6 +736,11 @@ pub fn into_blocking_tcp_stream(ipc: IpcStream) -> TcpStream {
             }
             unsafe { TcpStream::from_raw_fd(fd) }
         }
+        #[cfg(windows)]
+        IpcStream::Unix(s) => {
+            let _ = s.set_nonblocking(false);
+            s
+        }
     }
 }
 
@@ -609,14 +756,16 @@ pub fn into_blocking_tcp_stream(ipc: IpcStream) -> TcpStream {
     clippy::upper_case_acronyms
 )]
 mod win {
-    use std::sync::Once;
+    use std::{io, sync::Once};
 
     pub const AF_INET: u16 = 2;
+    pub const AF_UNIX: u16 = 1;
     pub const SOCK_STREAM: i32 = 1;
     pub const INVALID_SOCKET: usize = !0;
     pub const FIONBIO: u32 = 0x8004_667E;
     pub const SOL_SOCKET: u32 = 0xFFFF;
     pub const SO_ERROR: u32 = 0x1007;
+    pub const WSAEAFNOSUPPORT: i32 = 10047;
     pub const WSAEWOULDBLOCK: i32 = 10035;
 
     #[repr(C)]
@@ -639,6 +788,12 @@ mod win {
     }
 
     #[repr(C)]
+    pub struct SOCKADDR_UN {
+        pub sun_family: u16,
+        pub sun_path: [u8; 108],
+    }
+
+    #[repr(C)]
     pub struct WSAPOLLFD {
         pub fd: usize, // SOCKET
         pub events: i16,
@@ -653,6 +808,9 @@ mod win {
         pub fn socket(af: i32, r#type: i32, protocol: i32) -> usize;
         pub fn closesocket(s: usize) -> i32;
         pub fn connect(s: usize, name: *const u8, namelen: i32) -> i32;
+        pub fn bind(s: usize, name: *const u8, namelen: i32) -> i32;
+        pub fn listen(s: usize, backlog: i32) -> i32;
+        pub fn accept(s: usize, addr: *mut u8, addrlen: *mut i32) -> usize;
         pub fn recv(s: usize, buf: *mut u8, len: i32, flags: i32) -> i32;
         pub fn send(s: usize, buf: *const u8, len: i32, flags: i32) -> i32;
         pub fn ioctlsocket(s: usize, cmd: i32, argp: *mut u32) -> i32;
@@ -671,7 +829,43 @@ mod win {
     pub fn wsa_ensure_init() {
         WSA_INIT.call_once(|| unsafe {
             let mut data = std::mem::zeroed::<WSADATA>();
-            WSAStartup(0x0202, &mut data);
+            WSAStartup(0x0202, &raw mut data);
         });
+    }
+
+    pub fn sockaddr_un_from_path(path: &str) -> io::Result<(SOCKADDR_UN, i32)> {
+        let path_bytes = path.as_bytes();
+        if path_bytes.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "AF_UNIX path cannot be empty",
+            ));
+        }
+        if path_bytes.contains(&0) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "AF_UNIX path cannot contain NUL bytes",
+            ));
+        }
+        if path_bytes.len() >= 108 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "AF_UNIX path too long ({} bytes, max 107)",
+                    path_bytes.len()
+                ),
+            ));
+        }
+
+        let mut addr = SOCKADDR_UN {
+            sun_family: AF_UNIX,
+            sun_path: [0; 108],
+        };
+        addr.sun_path[..path_bytes.len()].copy_from_slice(path_bytes);
+        let addr_len =
+            i32::try_from(std::mem::size_of::<u16>() + path_bytes.len() + 1).map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidInput, "AF_UNIX path length overflow")
+            })?;
+        Ok((addr, addr_len))
     }
 }
