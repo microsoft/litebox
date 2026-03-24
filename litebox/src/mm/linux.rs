@@ -1150,11 +1150,21 @@ pub enum MappingError {
 
 /// Enable [`super::PageManager`] to handle page faults if its platform implements this trait
 pub trait VmemPageFaultHandler {
+    /// Whether the platform wants guest user-mode page faults to go through
+    /// [`super::PageManager::handle_page_fault`] in addition to kernel faults.
+    ///
+    /// Userland Windows uses this to service grow-down guest stacks through the
+    /// shared PageManager bookkeeping even though the fault originated from
+    /// guest user mode rather than shim code.
+    const HANDLE_USER_PAGE_FAULTS: bool = false;
+
     /// Handle a page fault for the given address.
     ///
     /// # Safety
     ///
-    /// This should only be called from the kernel page fault handler.
+    /// This should only be called from platform page-fault recovery paths that
+    /// have already classified the fault and determined that the PageManager
+    /// should attempt to service it.
     unsafe fn handle_page_fault(
         &self,
         fault_addr: usize,

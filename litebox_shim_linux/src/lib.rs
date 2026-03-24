@@ -120,19 +120,24 @@ impl<FS: ShimFS> litebox::shim::EnterShim for LinuxShimEntrypoints<FS> {
         {
             return ContinueOperation::Resume;
         }
-        if info.kernel_mode && info.exception == litebox::shim::Exception::PAGE_FAULT {
-            if unsafe {
-                self.task
-                    .process_state
-                    .borrow()
-                    .pm
-                    .handle_page_fault(info.cr2, info.error_code.into())
-            }
-            .is_ok()
-            {
-                return ContinueOperation::Resume;
-            } else {
-                return ContinueOperation::Terminate;
+        if info.exception == litebox::shim::Exception::PAGE_FAULT {
+            let should_try_page_manager = info.kernel_mode
+                || <crate::Platform as litebox::mm::linux::VmemPageFaultHandler>::HANDLE_USER_PAGE_FAULTS;
+            if should_try_page_manager {
+                // SAFETY: We are servicing a live page-fault trap for the
+                // current task. `cr2` and `error_code` come directly from the
+                // trap context, and `pm` is this task's PageManager.
+                match unsafe {
+                    self.task
+                        .process_state
+                        .borrow()
+                        .pm
+                        .handle_page_fault(info.cr2, info.error_code.into())
+                } {
+                    Ok(()) => return ContinueOperation::Resume,
+                    Err(_) if info.kernel_mode => return ContinueOperation::Terminate,
+                    Err(_) => {}
+                }
             }
         }
         self.enter_shim(false, ctx, |task, ctx| {

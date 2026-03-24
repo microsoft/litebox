@@ -58,9 +58,13 @@ use litebox::shim::{ContinueOperation, Exception};
 use litebox::utils::TruncateExt as _;
 use litebox_common_linux::PunchthroughSyscall;
 
-use windows_sys::Win32::Foundation::{self as Win32_Foundation, FILETIME};
+use windows_sys::Win32::Foundation::{self as Win32_Foundation, CloseHandle, FILETIME};
 use windows_sys::Win32::{
     Foundation::GetLastError,
+    Security::{
+        GetSidSubAuthority, GetSidSubAuthorityCount, GetTokenInformation, TOKEN_PRIMARY_GROUP,
+        TOKEN_QUERY, TOKEN_USER, TokenPrimaryGroup, TokenUser,
+    },
     System::Diagnostics::Debug::{
         AddVectoredExceptionHandler, CONTEXT_XSTATE_AMD64, EXCEPTION_CONTINUE_EXECUTION,
         EXCEPTION_CONTINUE_SEARCH, EXCEPTION_POINTERS, EXCEPTION_RECORD, GetXStateFeaturesMask,
@@ -76,6 +80,12 @@ use windows_sys::Win32::{
 use zerocopy::{FromBytes, IntoBytes};
 
 extern crate alloc;
+
+#[derive(Clone, Copy)]
+struct UnixLikeIdentity {
+    uid: u32,
+    gid: u32,
+}
 
 /// IPC stream to a host-side broker.
 ///
@@ -1932,6 +1942,125 @@ impl WindowsUserland {
         x & !(gran - 1)
     }
 
+    fn query_process_token_information(
+        class: windows_sys::Win32::Security::TOKEN_INFORMATION_CLASS,
+    ) -> alloc::vec::Vec<u8> {
+        let mut token = core::ptr::null_mut();
+        // SAFETY: We are opening the access token for the current process and
+        // provide a valid out-pointer for the returned handle.
+        let ok = unsafe {
+            Win32_Threading::OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token)
+        };
+        if ok == 0 {
+            // SAFETY: This reads the thread-local Win32 error code immediately
+            // after the failing API call above.
+            let err = unsafe { GetLastError() };
+            panic!("OpenProcessToken failed: {err}");
+        }
+
+        let result = {
+            let mut required_len = 0;
+            // SAFETY: A null buffer with length 0 is the documented
+            // `GetTokenInformation` size-probe pattern, and `required_len` is a
+            // valid out-pointer for the required byte count.
+            let ok = unsafe {
+                GetTokenInformation(token, class, core::ptr::null_mut(), 0, &mut required_len)
+            };
+            assert_eq!(ok, 0, "GetTokenInformation unexpectedly succeeded");
+            // SAFETY: This reads the thread-local Win32 error code immediately
+            // after the expected probe failure above.
+            let err = unsafe { GetLastError() };
+            assert_eq!(
+                err,
+                Win32_Foundation::ERROR_INSUFFICIENT_BUFFER,
+                "GetTokenInformation size probe failed"
+            );
+
+            let mut buffer = alloc::vec![0u8; required_len as usize];
+            // SAFETY: `buffer` is writable for `required_len` bytes, `token` is
+            // still a live TOKEN_QUERY handle, and Windows writes exactly the
+            // requested token-information class into the caller-provided buffer.
+            let ok = unsafe {
+                GetTokenInformation(
+                    token,
+                    class,
+                    buffer.as_mut_ptr().cast::<c_void>(),
+                    required_len,
+                    &mut required_len,
+                )
+            };
+            if ok == 0 {
+                // SAFETY: This reads the thread-local Win32 error code
+                // immediately after the failing API call above.
+                let err = unsafe { GetLastError() };
+                panic!("GetTokenInformation failed: {err}");
+            }
+            buffer
+        };
+
+        // SAFETY: `token` was returned by `OpenProcessToken` above and has not
+        // yet been closed.
+        let ok = unsafe { CloseHandle(token) };
+        if ok == 0 {
+            // SAFETY: This reads the thread-local Win32 error code immediately
+            // after the failing API call above.
+            let err = unsafe { GetLastError() };
+            panic!("CloseHandle(token) failed: {err}");
+        }
+
+        result
+    }
+
+    fn sid_last_subauthority(sid: windows_sys::Win32::Security::PSID) -> u32 {
+        assert!(!sid.is_null(), "token SID pointer must not be null");
+        // SAFETY: `sid` was checked non-null and comes from Windows
+        // token-information structures, so this returns a valid pointer to the
+        // SID's subauthority count byte.
+        let count_ptr = unsafe { GetSidSubAuthorityCount(sid) };
+        assert!(
+            !count_ptr.is_null(),
+            "GetSidSubAuthorityCount returned null"
+        );
+        // SAFETY: `count_ptr` came from `GetSidSubAuthorityCount` for this SID
+        // and points to a single initialized `u8`.
+        let count = unsafe { *count_ptr };
+        assert!(count > 0, "token SID must have at least one subauthority");
+        // SAFETY: `count > 0` guarantees the last-subauthority index is in
+        // bounds for this SID, and Windows returns a pointer into the SID
+        // storage.
+        let subauthority_ptr = unsafe { GetSidSubAuthority(sid, u32::from(count) - 1) };
+        assert!(
+            !subauthority_ptr.is_null(),
+            "GetSidSubAuthority returned null"
+        );
+        // SAFETY: Token-information buffers are only byte-aligned, so read the
+        // final subauthority with an unaligned load rather than assuming `u32`
+        // alignment.
+        unsafe { core::ptr::read_unaligned(subauthority_ptr) }
+    }
+
+    fn current_process_unix_identity() -> UnixLikeIdentity {
+        let token_user_buffer = Self::query_process_token_information(TokenUser);
+        // SAFETY: `token_user_buffer` owns the raw `TOKEN_USER` bytes returned
+        // by Windows and remains alive for the full scope while we follow the
+        // embedded SID pointer.
+        let token_user =
+            unsafe { core::ptr::read_unaligned(token_user_buffer.as_ptr().cast::<TOKEN_USER>()) };
+
+        let token_group_buffer = Self::query_process_token_information(TokenPrimaryGroup);
+        // SAFETY: `token_group_buffer` owns the raw `TOKEN_PRIMARY_GROUP`
+        // bytes returned by Windows and remains alive for the full scope while
+        // we follow the embedded SID pointer.
+        let token_group = unsafe {
+            core::ptr::read_unaligned(token_group_buffer.as_ptr().cast::<TOKEN_PRIMARY_GROUP>())
+        };
+
+        UnixLikeIdentity {
+            uid: Self::sid_last_subauthority(token_user.User.Sid),
+            gid: Self::sid_last_subauthority(token_group.PrimaryGroup),
+        }
+    }
+
     /// Reserve an allocation-granularity-aligned free range with at least
     /// `min_runway` bytes of contiguous space at or above `min_addr`.
     ///
@@ -2007,16 +2136,22 @@ impl WindowsUserland {
     }
 
     pub fn init_task(&self) -> litebox_common_linux::TaskParams {
-        // TODO: Currently we are using a static thread ID and credentials (faked).
-        // This is a placeholder for future implementation to use passthrough.
+        // Keep PID/PPID in LiteBox's internal process namespace until the core
+        // process registry and explicit-PID syscalls are plumbed through a
+        // unified host-backed namespace. Windows does not expose POSIX uid/gid
+        // values directly, so derive stable guest-visible credentials from the
+        // current process token's user and primary-group SIDs.
+        let pid = i32::try_from(litebox::process::ProcessId::INIT.0)
+            .expect("init pid does not fit in i32");
+        let parent_pid = 0;
+        let identity = Self::current_process_unix_identity();
         litebox_common_linux::TaskParams {
-            pid: 1000,
-            // TODO: placeholder for actual PPID
-            ppid: 0,
-            uid: 1000,
-            gid: 1000,
-            euid: 1000,
-            egid: 1000,
+            pid,
+            ppid: parent_pid,
+            uid: identity.uid,
+            gid: identity.gid,
+            euid: identity.uid,
+            egid: identity.gid,
         }
     }
 
@@ -4074,7 +4209,9 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
 
         let mut base_addr = suggested_range.start as *mut c_void;
         let size = suggested_range.len();
-        // TODO: For Windows, there is no MAP_GROWDOWN features so far.
+        // Windows has no direct MAP_GROWSDOWN equivalent. Guest stack growth is
+        // serviced via explicit PageManager fault recovery instead, so the
+        // initial mapping here is just a normal reservation/commit.
         let _ = can_grow_down;
 
         if suggested_range.start != 0 {
@@ -5142,27 +5279,100 @@ impl litebox::platform::CrngProvider for WindowsUserland {
     }
 }
 
-/// Dummy `VmemPageFaultHandler`.
+/// Page-fault recovery for guest-managed mappings on Windows userland.
 ///
-/// Page faults are handled transparently by the host Windows kernel.
-/// Provided to satisfy trait bounds for `PageManager::handle_page_fault`.
+/// Guest user-mode faults are surfaced through the VEH path. The Linux shim can
+/// route those faults into the PageManager so grow-down stack VMAs expand the
+/// same way kernel-backed platforms do.
 impl litebox::mm::linux::VmemPageFaultHandler for WindowsUserland {
+    const HANDLE_USER_PAGE_FAULTS: bool = true;
+
     unsafe fn handle_page_fault(
         &self,
-        _fault_addr: usize,
-        _flags: litebox::mm::linux::VmFlags,
+        fault_addr: usize,
+        flags: litebox::mm::linux::VmFlags,
         _error_code: u64,
     ) -> Result<(), litebox::mm::linux::PageFaultError> {
-        unreachable!("host kernel handles page faults for Windows userland")
+        let fault_addr = fault_addr & !(litebox::mm::linux::PAGE_SIZE - 1);
+        let permissions_bits: u8 = flags
+            .intersection(litebox::mm::linux::VmFlags::VM_ACCESS_FLAGS)
+            .bits()
+            .try_into()
+            .unwrap();
+        let permissions = MemoryRegionPermissions::from_bits(permissions_bits).unwrap();
+        if permissions.is_empty() {
+            return Err(litebox::mm::linux::PageFaultError::AccessError(
+                "no accessible mapping",
+            ));
+        }
+
+        let mut mbi = Win32_Memory::MEMORY_BASIC_INFORMATION::default();
+        // SAFETY: We query our own process address space at the page-aligned
+        // fault address and provide a valid output buffer of the correct size.
+        let ok = unsafe {
+            Win32_Memory::VirtualQuery(
+                fault_addr as *const c_void,
+                &raw mut mbi,
+                core::mem::size_of::<Win32_Memory::MEMORY_BASIC_INFORMATION>(),
+            ) != 0
+        };
+        if !ok {
+            return Err(litebox::mm::linux::PageFaultError::AllocationFailed);
+        }
+
+        match mbi.State {
+            Win32_Memory::MEM_COMMIT => Ok(()),
+            Win32_Memory::MEM_RESERVE => {
+                // SAFETY: This commits exactly one page inside an existing
+                // reserved region in the current process. The PageManager only
+                // reaches this path for guest-managed mappings that it owns.
+                let ptr = unsafe {
+                    VirtualAlloc2(
+                        GetCurrentProcess(),
+                        fault_addr as *mut c_void,
+                        litebox::mm::linux::PAGE_SIZE,
+                        Win32_Memory::MEM_COMMIT,
+                        prot_flags(permissions),
+                        core::ptr::null_mut(),
+                        0,
+                    )
+                };
+                if ptr.is_null() {
+                    return Err(litebox::mm::linux::PageFaultError::AllocationFailed);
+                }
+                Ok(())
+            }
+            _ => Err(litebox::mm::linux::PageFaultError::AccessError(
+                "no mapping",
+            )),
+        }
     }
 
-    fn access_error(_error_code: u64, _flags: litebox::mm::linux::VmFlags) -> bool {
-        unreachable!("host kernel handles page faults for Windows userland")
+    fn access_error(error_code: u64, flags: litebox::mm::linux::VmFlags) -> bool {
+        let present = (error_code & 0x1) != 0;
+        let write = (error_code & 0x2) != 0;
+        let instruction_fetch = (error_code & 0x10) != 0;
+        if write {
+            return !flags.contains(litebox::mm::linux::VmFlags::VM_WRITE);
+        }
+        if instruction_fetch {
+            // Like read-side protection faults on the kernel platforms, a
+            // present instruction-fetch fault is an unrecoverable permission
+            // violation (DEP / NX), not a missing-page condition that the
+            // PageManager can repair. Only non-present executable faults should
+            // flow into handle_page_fault().
+            return present || !flags.contains(litebox::mm::linux::VmFlags::VM_EXEC);
+        }
+        if present {
+            return true;
+        }
+        (flags & litebox::mm::linux::VmFlags::VM_ACCESS_FLAGS).is_empty()
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use core::ops::Range;
     use core::sync::atomic::AtomicU32;
     use core::sync::atomic::Ordering;
     use std::thread::sleep;
@@ -5170,6 +5380,8 @@ mod tests {
     use super::CURRENT_THREAD_HANDLE;
     use crate::WindowsUserland;
     use crate::process_memory_range_by_regions;
+    use litebox::mm::PageManager;
+    use litebox::mm::linux::{CreatePagesFlags, NonZeroAddress, NonZeroPageSize};
     use litebox::platform::PageManagementProvider;
     use litebox::platform::RawConstPointer;
     use litebox::platform::RawMutex;
@@ -5178,6 +5390,19 @@ mod tests {
     use litebox::process::ProcessId;
 
     static SIGNAL_ROUTING_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn collect_regions(r: Range<usize>) -> Vec<(Range<usize>, u32)> {
+        let mut regions = Vec::new();
+        process_memory_range_by_regions(
+            r,
+            |region, state| -> Result<bool, core::convert::Infallible> {
+                regions.push((region, state));
+                Ok(true)
+            },
+        )
+        .unwrap();
+        regions
+    }
 
     struct ManagedTestThread {
         handle: super::ThreadHandle,
@@ -5315,19 +5540,6 @@ mod tests {
 
     #[test]
     fn test_page_provider() {
-        let collect_regions = |r| {
-            let mut regions = Vec::new();
-            process_memory_range_by_regions(
-                r,
-                |region, state| -> Result<bool, core::convert::Infallible> {
-                    regions.push((region, state));
-                    Ok(true)
-                },
-            )
-            .unwrap();
-            regions
-        };
-
         let platform = WindowsUserland::new(None);
         let system_allocation_granularity =
             platform.sys_info.read().unwrap().dwAllocationGranularity as usize;
@@ -5406,6 +5618,104 @@ mod tests {
         assert_ne!(addr3, addr + 0x4000);
     }
 
+    #[test]
+    fn test_init_task_uses_internal_pid_namespace_and_host_credentials() {
+        let platform = WindowsUserland::new(None);
+        let task = platform.init_task();
+        let identity = WindowsUserland::current_process_unix_identity();
+        assert_eq!(
+            task.pid,
+            i32::try_from(litebox::process::ProcessId::INIT.0).unwrap()
+        );
+        assert_eq!(task.ppid, 0);
+        assert_eq!(task.uid, identity.uid);
+        assert_eq!(task.euid, identity.uid);
+        assert_eq!(task.gid, identity.gid);
+        assert_eq!(task.egid, identity.gid);
+    }
+
+    #[test]
+    fn test_user_page_fault_grows_stack_mapping() {
+        let platform = WindowsUserland::new(None);
+        let system_allocation_granularity =
+            platform.sys_info.read().unwrap().dwAllocationGranularity as usize;
+        assert!(system_allocation_granularity >= 0xA000);
+
+        let base = <WindowsUserland as PageManagementProvider<4096>>::allocate_pages(
+            platform,
+            0..0x1000,
+            MemoryRegionPermissions::WRITE,
+            false,
+            true,
+            false,
+            FixedAddressBehavior::Hint,
+        )
+        .unwrap()
+        .as_usize();
+
+        let litebox = litebox::LiteBox::new(platform);
+        let page_manager = PageManager::<WindowsUserland, 4096>::new(
+            &litebox,
+            <WindowsUserland as PageManagementProvider<4096>>::TASK_ADDR_MIN
+                ..<WindowsUserland as PageManagementProvider<4096>>::TASK_ADDR_MAX,
+        );
+
+        let stack_start = base + 0x8000;
+        // SAFETY: The test allocates this range immediately above a freshly
+        // reserved region and requests a fixed, non-replacing stack mapping.
+        let stack_ptr = unsafe {
+            page_manager.create_stack_pages(
+                Some(NonZeroAddress::new(stack_start).unwrap()),
+                NonZeroPageSize::new(0x2000).unwrap(),
+                CreatePagesFlags::FIXED_ADDR | CreatePagesFlags::NOREPLACE,
+            )
+        }
+        .unwrap();
+        assert_eq!(stack_ptr.as_usize(), stack_start);
+
+        let grow_page = stack_start - 0x1000;
+        assert_eq!(
+            collect_regions(grow_page..stack_start),
+            vec![(grow_page..stack_start, super::Win32_Memory::MEM_RESERVE)]
+        );
+
+        // SAFETY: `grow_page` lies inside the reserved grow-down runway for the
+        // stack mapping created above, and the synthesized write fault code
+        // matches the access we are testing.
+        unsafe {
+            page_manager.handle_page_fault(grow_page, 0x6).unwrap();
+        }
+
+        assert_eq!(
+            page_manager.get_memory_permissions(
+                NonZeroAddress::new(grow_page).unwrap(),
+                NonZeroPageSize::new(0x1000).unwrap(),
+            ),
+            Some(MemoryRegionPermissions::READ | MemoryRegionPermissions::WRITE)
+        );
+        assert_eq!(
+            collect_regions(grow_page..stack_start),
+            vec![(grow_page..stack_start, super::Win32_Memory::MEM_COMMIT)]
+        );
+
+        // SAFETY: `base` is the allocation base returned by `allocate_pages`,
+        // so releasing it with `MEM_RELEASE` and size 0 tears down the full
+        // reserved region that this test created.
+        let ok = unsafe {
+            super::VirtualFree(
+                base as *mut core::ffi::c_void,
+                0,
+                super::Win32_Memory::MEM_RELEASE,
+            ) != 0
+        };
+        if !ok {
+            // SAFETY: This reads the thread-local Win32 error code immediately
+            // after the failing API call above.
+            let err = unsafe { super::GetLastError() };
+            panic!("VirtualFree(MEM_RELEASE) failed: {err}");
+        }
+    }
+
     // -- Step 3.2: error-code synthesis tests --
 
     #[test]
@@ -5432,6 +5742,22 @@ mod tests {
 
         // DEP, uncommitted page: bits 4+2 = 0x14
         assert_eq!(synthesize_pf_error_code(false, 8), 0x14);
+    }
+
+    #[test]
+    fn test_access_error_treats_present_dep_fault_as_unrecoverable() {
+        let exec_flags =
+            litebox::mm::linux::VmFlags::VM_READ | litebox::mm::linux::VmFlags::VM_EXEC;
+        assert!(
+            !<WindowsUserland as litebox::mm::linux::VmemPageFaultHandler>::access_error(
+                0x14, exec_flags
+            )
+        );
+        assert!(
+            <WindowsUserland as litebox::mm::linux::VmemPageFaultHandler>::access_error(
+                0x15, exec_flags
+            )
+        );
     }
 
     #[test]

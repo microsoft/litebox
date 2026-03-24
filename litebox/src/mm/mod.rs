@@ -793,7 +793,10 @@ where
     ///
     /// # Safety
     ///
-    /// This should only be called from the kernel page fault handler.
+    /// This must only be called while servicing a real page fault for the
+    /// current address space, and `fault_addr` / `error_code` must come from
+    /// that trap context. Depending on the platform, that may be a kernel fault
+    /// handler or an opted-in user-mode fault path.
     pub unsafe fn handle_page_fault(
         &self,
         fault_addr: usize,
@@ -845,7 +848,8 @@ where
                     crate::platform::page_mgmt::FixedAddressBehavior::NoReplace,
                 )
             } {
-                unimplemented!("failed to grow stack: {:?}", err)
+                let _ = err;
+                return Err(PageFaultError::AllocationFailed);
             }
         }
 
