@@ -26,7 +26,7 @@ use litebox::{
     utils::TruncateExt as _,
 };
 use litebox_common_linux::{
-    IpOption, ReceiveFlags, SendFlags, SockFlags, SockType, SocketOption, SocketOptionName,
+    IpOption, ReceiveFlags, SendFlags, SockFlags, SockType, SocketOption, SocketOptionName, Ucred,
     errno::Errno,
 };
 
@@ -185,6 +185,12 @@ impl<FS: ShimFS> From<&UnixBoundSocketAddr<FS>> for UnixSocketAddr {
     }
 }
 
+const UNCONNECTED_PEER_CRED: Ucred = Ucred {
+    pid: 0,
+    uid: u32::MAX,
+    gid: u32::MAX,
+};
+
 /// Represents a Unix stream socket in its initial state.
 ///
 /// This is the state immediately after socket creation, before the socket
@@ -224,12 +230,13 @@ impl<FS: ShimFS> UnixInitStream<FS> {
         self,
         backlog: u16,
         global: &Arc<GlobalState<FS>>,
+        listener_cred: Ucred,
     ) -> Result<UnixListenStream<FS>, (Self, Errno)> {
         let Some(addr) = self.addr else {
             return Err((self, Errno::EINVAL));
         };
         let key = addr.to_key();
-        let backlog = Arc::new(Backlog::new(addr, backlog, self.pollee));
+        let backlog = Arc::new(Backlog::new(addr, backlog, self.pollee, listener_cred));
         global
             .unix_addr_table
             .write()
@@ -244,9 +251,17 @@ impl<FS: ShimFS> UnixInitStream<FS> {
     fn into_connected(
         self,
         peer_addr: Arc<UnixBoundSocketAddr<FS>>,
+        self_cred: Ucred,
+        peer_cred: Ucred,
     ) -> (UnixConnectedStream<FS>, UnixConnectedStream<FS>) {
         let UnixInitStream { addr, pollee } = self;
-        UnixConnectedStream::new_pair(addr.map(Arc::new), Some(Arc::new(pollee)), Some(peer_addr))
+        UnixConnectedStream::new_pair(
+            addr.map(Arc::new),
+            Some(Arc::new(pollee)),
+            Some(peer_addr),
+            self_cred,
+            peer_cred,
+        )
     }
 }
 
@@ -258,16 +273,24 @@ struct Backlog<FS: ShimFS> {
     addr: Arc<UnixBoundSocketAddr<FS>>,
     /// Maximum number of pending connections
     limit: AtomicU16,
+    /// Credentials exposed to peers that connect to this listener.
+    listener_cred: Ucred,
     /// Queue of pending connections (None when shut down)
     sockets: Mutex<crate::Platform, Option<VecDeque<UnixConnectedStream<FS>>>>,
     pollee: Pollee<crate::Platform>,
 }
 
 impl<FS: ShimFS> Backlog<FS> {
-    fn new(addr: UnixBoundSocketAddr<FS>, backlog: u16, pollee: Pollee<crate::Platform>) -> Self {
+    fn new(
+        addr: UnixBoundSocketAddr<FS>,
+        backlog: u16,
+        pollee: Pollee<crate::Platform>,
+        listener_cred: Ucred,
+    ) -> Self {
         Self {
             addr: Arc::new(addr),
             limit: AtomicU16::new(backlog),
+            listener_cred,
             sockets: litebox::sync::Mutex::new(Some(VecDeque::new())),
             pollee,
         }
@@ -282,6 +305,7 @@ impl<FS: ShimFS> Backlog<FS> {
     fn try_connect(
         &self,
         init: UnixInitStream<FS>,
+        client_cred: Ucred,
     ) -> Result<UnixConnectedStream<FS>, (UnixInitStream<FS>, Errno)> {
         let mut sockets = self.sockets.lock();
         let Some(sockets) = &mut *sockets else {
@@ -294,7 +318,8 @@ impl<FS: ShimFS> Backlog<FS> {
             return Err((init, Errno::EAGAIN));
         }
 
-        let (client, server) = init.into_connected(self.addr.clone());
+        let (client, server) =
+            init.into_connected(self.addr.clone(), client_cred, self.listener_cred);
         sockets.push_back(server);
 
         self.pollee.notify_observers(Events::IN);
@@ -431,6 +456,7 @@ struct UnixConnectedStream<FS: ShimFS> {
     recv_channel: crate::channel::ReadEnd<Message>,
     /// The write end of the connected peer socket for sending messages.
     connected_send_channel: crate::channel::WriteEnd<Message>,
+    peer_cred: Ucred,
     pollee: Arc<Pollee<crate::Platform>>,
 }
 
@@ -441,6 +467,8 @@ impl<FS: ShimFS> UnixConnectedStream<FS> {
         addr: Option<Arc<UnixBoundSocketAddr<FS>>>,
         pollee: Option<Arc<Pollee<crate::Platform>>>,
         peer: Option<Arc<UnixBoundSocketAddr<FS>>>,
+        first_cred: Ucred,
+        second_cred: Ucred,
     ) -> (Self, Self) {
         let (addr1, addr2) = AddrView::new_pair(addr, peer);
         let pollee1 = pollee.unwrap_or(Arc::new(Pollee::new()));
@@ -455,12 +483,14 @@ impl<FS: ShimFS> UnixConnectedStream<FS> {
                 addr: addr1,
                 recv_channel,
                 connected_send_channel: send_channel_peer,
+                peer_cred: second_cred,
                 pollee: pollee1,
             },
             UnixConnectedStream {
                 addr: addr2,
                 recv_channel: recv_channel_peer,
                 connected_send_channel: send_channel,
+                peer_cred: first_cred,
                 pollee: pollee2,
             },
         )
@@ -478,6 +508,10 @@ impl<FS: ShimFS> UnixConnectedStream<FS> {
             Some(addr) => UnixSocketAddr::from(addr),
             None => UnixSocketAddr::Unnamed,
         }
+    }
+
+    fn peer_cred(&self) -> Ucred {
+        self.peer_cred
     }
 
     fn try_sendto(&self, msg: Message) -> Result<(), (Message, Errno)> {
@@ -638,11 +672,16 @@ impl<FS: ShimFS> UnixStream<FS> {
         })
     }
 
-    fn listen(&self, backlog: u16, global: &Arc<GlobalState<FS>>) -> Result<(), Errno> {
+    fn listen(
+        &self,
+        task: &Task<FS>,
+        backlog: u16,
+        global: &Arc<GlobalState<FS>>,
+    ) -> Result<(), Errno> {
         self.with_state(|state| {
             let ret = match state {
                 UnixStreamState::Init(init) => {
-                    return match init.listen(backlog, global) {
+                    return match init.listen(backlog, global, task.current_ucred()) {
                         Ok(listen) => (UnixStreamState::Listen(listen), Ok(())),
                         Err((init, err)) => (UnixStreamState::Init(init), Err(err)),
                     };
@@ -670,9 +709,13 @@ impl<FS: ShimFS> UnixStream<FS> {
             UnixEntryInner::Datagram(_) => Err(Errno::EPROTOTYPE),
         }
     }
-    fn try_connect(&self, backlog: &Backlog<FS>) -> Result<(), TryOpError<Errno>> {
+    fn try_connect(
+        &self,
+        backlog: &Backlog<FS>,
+        client_cred: Ucred,
+    ) -> Result<(), TryOpError<Errno>> {
         self.with_state(|state| match state {
-            UnixStreamState::Init(init) => match backlog.try_connect(init) {
+            UnixStreamState::Init(init) => match backlog.try_connect(init, client_cred) {
                 Ok(connected) => (UnixStreamState::Connected(connected), Ok(())),
                 Err((init, err)) => (UnixStreamState::Init(init), Err(err)),
             },
@@ -701,7 +744,7 @@ impl<FS: ShimFS> UnixStream<FS> {
                     backlog.pollee.register_observer(observer, mask);
                     Ok(())
                 },
-                || self.try_connect(&backlog),
+                || self.try_connect(&backlog, task.current_ucred()),
             )
             .map_err(Errno::from)
     }
@@ -867,6 +910,19 @@ struct DatagramMessage {
     source: UnixSocketAddr,
 }
 
+#[derive(Clone)]
+struct UnixDatagramEndpoint {
+    send_channel: WriteEnd<DatagramMessage>,
+    local_cred: Ucred,
+}
+
+#[derive(Clone)]
+struct UnixDatagramPeer {
+    send_channel: WriteEnd<DatagramMessage>,
+    addr: UnixSocketAddr,
+    peer_cred: Option<Ucred>,
+}
+
 impl WriteEnd<DatagramMessage> {
     fn try_write(&self, msg: DatagramMessage) -> Result<(), (DatagramMessage, Errno)> {
         self.try_write_one(msg)
@@ -963,7 +1019,7 @@ struct UnixDatagramInner<FS: ShimFS> {
     recv_channel: Option<ReadEnd<DatagramMessage>>,
     /// The write end of the connected peer socket for sending messages.
     /// Set when the socket is connected via `connect` or `new_pair`.
-    connected_send_channel: Option<(WriteEnd<DatagramMessage>, UnixSocketAddr)>,
+    connected_send_channel: Option<UnixDatagramPeer>,
     pollee: Arc<Pollee<crate::Platform>>,
 }
 /// Represents a Unix datagram socket.
@@ -977,9 +1033,9 @@ impl<FS: ShimFS> Drop for UnixDatagramInner<FS> {
             let key = addr.to_key();
             let mut table = global.unix_addr_table.write();
             // Only remove the entry if it matches the current socket
-            if let Some(UnixEntry(UnixEntryInner::Datagram(send_channel))) = table.get(&key)
+            if let Some(UnixEntry(UnixEntryInner::Datagram(endpoint))) = table.get(&key)
                 && let Some(recv_channel) = &self.recv_channel
-                && send_channel.is_pair(recv_channel)
+                && endpoint.send_channel.is_pair(recv_channel)
             {
                 table.remove(&key);
             }
@@ -1004,11 +1060,13 @@ impl<FS: ShimFS> UnixDatagramInner<FS> {
         // can receive messages sent to this address.
         let (send_channel, recv_channel) =
             Channel::new(UNIX_BUF_SIZE, Arc::new(Pollee::new()), self.pollee.clone()).split();
-        let _ = task
-            .global
-            .unix_addr_table
-            .write()
-            .insert(key, UnixEntry(UnixEntryInner::Datagram(send_channel)));
+        let _ = task.global.unix_addr_table.write().insert(
+            key,
+            UnixEntry(UnixEntryInner::Datagram(UnixDatagramEndpoint {
+                send_channel,
+                local_cred: task.current_ucred(),
+            })),
+        );
         self.addr = Some((bound_addr, task.global.clone()));
         self.recv_channel = Some(recv_channel);
         Ok(())
@@ -1027,7 +1085,7 @@ impl<FS: ShimFS> UnixDatagram<FS> {
         }
     }
 
-    fn new_pair() -> (UnixDatagram<FS>, UnixDatagram<FS>) {
+    fn new_pair(peer_cred: Ucred) -> (UnixDatagram<FS>, UnixDatagram<FS>) {
         let pollee1 = Arc::new(Pollee::new());
         let pollee2 = Arc::new(Pollee::new());
         let (send_channel, recv_channel) =
@@ -1040,7 +1098,11 @@ impl<FS: ShimFS> UnixDatagram<FS> {
                 inner: RwLock::new(UnixDatagramInner {
                     addr: None,
                     recv_channel: Some(recv_channel),
-                    connected_send_channel: Some((send_channel_peer, UnixSocketAddr::Unnamed)),
+                    connected_send_channel: Some(UnixDatagramPeer {
+                        send_channel: send_channel_peer,
+                        addr: UnixSocketAddr::Unnamed,
+                        peer_cred: Some(peer_cred),
+                    }),
                     pollee: pollee1,
                 }),
             },
@@ -1048,7 +1110,11 @@ impl<FS: ShimFS> UnixDatagram<FS> {
                 inner: RwLock::new(UnixDatagramInner {
                     addr: None,
                     recv_channel: Some(recv_channel_peer),
-                    connected_send_channel: Some((send_channel, UnixSocketAddr::Unnamed)),
+                    connected_send_channel: Some(UnixDatagramPeer {
+                        send_channel,
+                        addr: UnixSocketAddr::Unnamed,
+                        peer_cred: Some(peer_cred),
+                    }),
                     pollee: pollee2,
                 }),
             },
@@ -1061,11 +1127,7 @@ impl<FS: ShimFS> UnixDatagram<FS> {
     }
 
     /// Looks up a socket address and returns its write endpoint.
-    fn lookup(
-        &self,
-        task: &Task<FS>,
-        addr: UnixSocketAddr,
-    ) -> Result<WriteEnd<DatagramMessage>, Errno> {
+    fn lookup(&self, task: &Task<FS>, addr: UnixSocketAddr) -> Result<UnixDatagramEndpoint, Errno> {
         let guard = task.global.unix_addr_table.read();
         let Some(key) = addr.to_key() else {
             return Err(Errno::EINVAL);
@@ -1077,7 +1139,7 @@ impl<FS: ShimFS> UnixDatagram<FS> {
         let _ = addr.bind(task, false)?;
         match &entry.0 {
             UnixEntryInner::Stream(_) => Err(Errno::EPROTOTYPE),
-            UnixEntryInner::Datagram(send_channel) => Ok(send_channel.clone()),
+            UnixEntryInner::Datagram(endpoint) => Ok(endpoint.clone()),
         }
     }
 
@@ -1085,7 +1147,12 @@ impl<FS: ShimFS> UnixDatagram<FS> {
     ///
     /// Subsequent sends without an address will use this peer.
     fn connect(&self, task: &Task<FS>, addr: UnixSocketAddr) -> Result<(), Errno> {
-        self.inner.write().connected_send_channel = Some((self.lookup(task, addr.clone())?, addr));
+        let endpoint = self.lookup(task, addr.clone())?;
+        self.inner.write().connected_send_channel = Some(UnixDatagramPeer {
+            send_channel: endpoint.send_channel,
+            addr,
+            peer_cred: None,
+        });
         Ok(())
     }
 
@@ -1130,10 +1197,9 @@ impl<FS: ShimFS> UnixDatagram<FS> {
     ) -> Result<usize, Errno> {
         let source = self.get_local_addr();
         let send_channel = if let Some(addr) = addr {
-            self.lookup(task, addr)?
-        } else if let Some((connected_send_channel, _)) = &self.inner.read().connected_send_channel
-        {
-            connected_send_channel.clone()
+            self.lookup(task, addr)?.send_channel
+        } else if let Some(connected_send_channel) = &self.inner.read().connected_send_channel {
+            connected_send_channel.send_channel.clone()
         } else {
             return Err(Errno::ENOTCONN);
         };
@@ -1163,7 +1229,15 @@ impl<FS: ShimFS> UnixDatagram<FS> {
             .read()
             .connected_send_channel
             .as_ref()
-            .map(|(_, addr)| addr.clone())
+            .map(|peer| peer.addr.clone())
+    }
+
+    fn peer_cred(&self) -> Option<Ucred> {
+        self.inner
+            .read()
+            .connected_send_channel
+            .as_ref()
+            .and_then(|peer| peer.peer_cred)
     }
 
     fn check_io_events(&self) -> Events {
@@ -1175,10 +1249,10 @@ impl<FS: ShimFS> UnixDatagram<FS> {
                 events |= Events::IN;
             }
         }
-        if let Some((connected_send_channel, _)) = &self.inner.read().connected_send_channel {
-            if connected_send_channel.is_peer_shutdown() {
+        if let Some(connected_send_channel) = &self.inner.read().connected_send_channel {
+            if connected_send_channel.send_channel.is_peer_shutdown() {
                 events |= Events::HUP;
-            } else if !connected_send_channel.is_full() {
+            } else if !connected_send_channel.send_channel.is_full() {
                 events |= Events::OUT;
             }
         } else {
@@ -1242,9 +1316,14 @@ impl<FS: ShimFS> UnixSocket<FS> {
         self.sock_type
     }
 
-    pub(super) fn listen(&self, backlog: u16, global: &Arc<GlobalState<FS>>) -> Result<(), Errno> {
+    pub(super) fn listen(
+        &self,
+        task: &Task<FS>,
+        backlog: u16,
+        global: &Arc<GlobalState<FS>>,
+    ) -> Result<(), Errno> {
         match &self.inner {
-            UnixSocketInner::Stream(stream) => stream.listen(backlog, global),
+            UnixSocketInner::Stream(stream) => stream.listen(task, backlog, global),
             UnixSocketInner::Datagram(_) => Err(Errno::EOPNOTSUPP),
         }
     }
@@ -1376,10 +1455,12 @@ impl<FS: ShimFS> UnixSocket<FS> {
     pub(super) fn new_connected_pair(
         ty: SockType,
         flags: SockFlags,
+        peer_cred: Ucred,
     ) -> Option<(UnixSocket<FS>, UnixSocket<FS>)> {
         match ty {
             SockType::Stream | SockType::SeqPacket => {
-                let (conn1, conn2) = UnixConnectedStream::new_pair(None, None, None);
+                let (conn1, conn2) =
+                    UnixConnectedStream::new_pair(None, None, None, peer_cred, peer_cred);
                 Some((
                     UnixSocket::new_with_inner(
                         UnixSocketInner::Stream(UnixStream::new(UnixStreamState::Connected(conn1))),
@@ -1394,7 +1475,7 @@ impl<FS: ShimFS> UnixSocket<FS> {
                 ))
             }
             SockType::Datagram => {
-                let (datagram1, datagram2) = UnixDatagram::new_pair();
+                let (datagram1, datagram2) = UnixDatagram::new_pair(peer_cred);
                 Some((
                     UnixSocket::new_with_inner(UnixSocketInner::Datagram(datagram1), ty, flags),
                     UnixSocket::new_with_inner(UnixSocketInner::Datagram(datagram2), ty, flags),
@@ -1511,26 +1592,19 @@ impl<FS: ShimFS> UnixSocket<FS> {
                 SocketOption::ERROR => 0,
                 SocketOption::TYPE => self.sock_type as u32,
                 SocketOption::RCVBUF | SocketOption::SNDBUF => UNIX_BUF_SIZE.truncate(),
-                SocketOption::PEERCRED => match &self.inner {
-                    UnixSocketInner::Stream(stream) => {
-                        let ucred = stream.with_state_ref(|state| match state {
-                            UnixStreamState::Connected(_) => {
-                                log_unsupported!("get PEERCRED for unix socket");
-                                Err(Errno::EOPNOTSUPP)
-                            }
-                            _ => Ok(litebox_common_linux::Ucred {
-                                pid: 0,
-                                uid: u32::MAX,
-                                gid: u32::MAX,
-                            }),
-                        })?;
-                        return super::write_to_user(ucred, optval, len);
-                    }
-                    UnixSocketInner::Datagram(_) => {
-                        log_unsupported!("get PEERCRED for unix datagram socket");
-                        return Err(Errno::EOPNOTSUPP);
-                    }
-                },
+                SocketOption::PEERCRED => {
+                    let ucred = match &self.inner {
+                        UnixSocketInner::Stream(stream) => stream.with_state_ref(|state| {
+                            state
+                                .connected()
+                                .map_or(UNCONNECTED_PEER_CRED, UnixConnectedStream::peer_cred)
+                        }),
+                        UnixSocketInner::Datagram(datagram) => {
+                            datagram.peer_cred().unwrap_or(UNCONNECTED_PEER_CRED)
+                        }
+                    };
+                    return super::write_to_user(ucred, optval, len);
+                }
             },
             SocketOptionName::TCP(_) => return Err(Errno::EOPNOTSUPP),
         };
@@ -1571,7 +1645,7 @@ impl<FS: ShimFS> IOPollable for UnixSocket<FS> {
 pub(crate) struct UnixEntry<FS: ShimFS>(UnixEntryInner<FS>);
 enum UnixEntryInner<FS: ShimFS> {
     Stream(Arc<Backlog<FS>>),
-    Datagram(WriteEnd<DatagramMessage>),
+    Datagram(UnixDatagramEndpoint),
 }
 
 /// Type alias for the global Unix socket address table.

@@ -1091,7 +1091,8 @@ impl<FS: ShimFS> Task<FS> {
             AddressFamily::UNIX => {
                 let _ = UnixProtocol::try_from(protocol).map_err(|_| Errno::EPROTONOSUPPORT)?;
                 let (sock1, sock2) =
-                    UnixSocket::new_connected_pair(ty, flags).ok_or(Errno::ESOCKTNOSUPPORT)?;
+                    UnixSocket::new_connected_pair(ty, flags, self.current_ucred())
+                        .ok_or(Errno::ESOCKTNOSUPPORT)?;
                 let files = self.files.borrow();
                 let mut dt = self.global.litebox.descriptor_table_mut();
                 let typed1 = dt.insert::<crate::syscalls::unix::UnixSocketSubsystem<FS>>(sock1);
@@ -1389,7 +1390,7 @@ impl<FS: ShimFS> Task<FS> {
             &self.global,
             sockfd,
             |fd| self.global.listen(fd, backlog),
-            |file| file.listen(backlog, &self.global),
+            |file| file.listen(self, backlog, &self.global),
         )
     }
 
@@ -2197,6 +2198,44 @@ mod tests {
             .expect("getsockopt SO_ERROR failed");
         assert_eq!(len, core::mem::size_of::<u32>());
         optval
+    }
+
+    pub(super) fn get_so_peercred(
+        task: &crate::Task<crate::DefaultFS>,
+        sockfd: u32,
+    ) -> litebox_common_linux::Ucred {
+        let mut peercred = litebox_common_linux::Ucred {
+            pid: u32::MAX,
+            uid: 0,
+            gid: 0,
+        };
+        let len = task
+            .do_getsockopt(
+                sockfd,
+                SocketOptionName::Socket(SocketOption::PEERCRED),
+                MutPtr::from_usize((&raw mut peercred).cast::<u8>() as usize),
+                core::mem::size_of::<litebox_common_linux::Ucred>().truncate(),
+            )
+            .expect("getsockopt SO_PEERCRED failed");
+        assert_eq!(len, core::mem::size_of::<litebox_common_linux::Ucred>());
+        peercred
+    }
+
+    pub(super) fn assert_ucred_eq(
+        actual: litebox_common_linux::Ucred,
+        expected: litebox_common_linux::Ucred,
+    ) {
+        assert_eq!(actual.pid, expected.pid);
+        assert_eq!(actual.uid, expected.uid);
+        assert_eq!(actual.gid, expected.gid);
+    }
+
+    pub(super) fn unconnected_peercred() -> litebox_common_linux::Ucred {
+        litebox_common_linux::Ucred {
+            pid: 0,
+            uid: u32::MAX,
+            gid: u32::MAX,
+        }
     }
 
     fn epoll_add(
@@ -3023,6 +3062,7 @@ mod unix_tests {
         SocketOptionName, TimeParam, errno::Errno,
     };
 
+    use super::tests::{assert_ucred_eq, get_so_peercred, unconnected_peercred};
     use crate::{
         ConstPtr, MutPtr, Task,
         syscalls::{net::SocketAddress, tests::init_platform, unix::UnixSocketAddr},
@@ -3494,6 +3534,106 @@ mod unix_tests {
 
         unix_socketpair_bidirectional(SockType::Stream, true);
         unix_socketpair_bidirectional(SockType::Datagram, true);
+    }
+
+    fn unix_socketpair_peercred(ty: SockType) {
+        let task = init_platform(None);
+        let (sock1, sock2) = task
+            .do_socketpair(AddressFamily::UNIX, ty, SockFlags::empty(), 0)
+            .expect("socketpair failed");
+        let expected = task.current_ucred();
+
+        assert_ucred_eq(get_so_peercred(&task, sock1), expected);
+        assert_ucred_eq(get_so_peercred(&task, sock2), expected);
+
+        close_socket(&task, sock1);
+        close_socket(&task, sock2);
+    }
+
+    #[test]
+    fn test_unix_socketpair_peercred() {
+        unix_socketpair_peercred(SockType::Stream);
+        unix_socketpair_peercred(SockType::SeqPacket);
+        unix_socketpair_peercred(SockType::Datagram);
+    }
+
+    #[test]
+    fn test_unix_stream_connect_accept_peercred() {
+        let task = init_platform(None);
+        let addr = "/unix_stream_peercred.sock";
+        let server_fd = create_unix_server_socket(&task, addr, SockFlags::empty()).unwrap();
+        let client_fd = create_unix_socket(&task, SockType::Stream, SockFlags::empty());
+        let expected = task.current_ucred();
+
+        assert_ucred_eq(get_so_peercred(&task, server_fd), unconnected_peercred());
+
+        task.do_connect(
+            client_fd,
+            SocketAddress::Unix(UnixSocketAddr::Path(addr.to_string())),
+        )
+        .expect("connect failed");
+        let server_conn = task
+            .do_accept(server_fd, None, SockFlags::empty())
+            .expect("accept failed");
+
+        assert_ucred_eq(get_so_peercred(&task, client_fd), expected);
+        assert_ucred_eq(get_so_peercred(&task, server_conn), expected);
+
+        close_socket(&task, client_fd);
+        close_socket(&task, server_conn);
+        close_socket(&task, server_fd);
+        task.sys_unlinkat(-1, addr, AtFlags::empty()).unwrap();
+    }
+
+    #[test]
+    fn test_unix_connected_datagram_peercred() {
+        let task = init_platform(None);
+        let server_path = "/unix_dgram_peercred_server.sock";
+        let server_fd = create_unix_socket(&task, SockType::Datagram, SockFlags::empty());
+        let client_fd = create_unix_socket(&task, SockType::Datagram, SockFlags::empty());
+
+        task.do_bind(
+            server_fd,
+            SocketAddress::Unix(UnixSocketAddr::Path(server_path.to_string())),
+        )
+        .expect("bind failed");
+        assert_ucred_eq(get_so_peercred(&task, server_fd), unconnected_peercred());
+
+        task.do_connect(
+            client_fd,
+            SocketAddress::Unix(UnixSocketAddr::Path(server_path.to_string())),
+        )
+        .expect("connect failed");
+
+        assert_ucred_eq(get_so_peercred(&task, client_fd), unconnected_peercred());
+        assert_ucred_eq(get_so_peercred(&task, server_fd), unconnected_peercred());
+
+        close_socket(&task, client_fd);
+        close_socket(&task, server_fd);
+        task.sys_unlinkat(-1, server_path, AtFlags::empty())
+            .unwrap();
+    }
+
+    #[test]
+    fn test_unix_socketpair_peercred_uses_effective_ids() {
+        let mut task = init_platform(None);
+        task.credentials = alloc::sync::Arc::new(crate::syscalls::process::Credentials {
+            uid: 1000,
+            euid: 2000,
+            gid: 3000,
+            egid: 4000,
+        });
+
+        let (sock1, sock2) = task
+            .do_socketpair(AddressFamily::UNIX, SockType::Stream, SockFlags::empty(), 0)
+            .expect("socketpair failed");
+        let expected = task.current_ucred();
+
+        assert_ucred_eq(get_so_peercred(&task, sock1), expected);
+        assert_ucred_eq(get_so_peercred(&task, sock2), expected);
+
+        close_socket(&task, sock1);
+        close_socket(&task, sock2);
     }
 
     fn unix_socketpair_recvmsg(ty: SockType) {

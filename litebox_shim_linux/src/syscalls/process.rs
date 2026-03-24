@@ -448,10 +448,12 @@ impl<FS: ShimFS> Task<FS> {
         &self.thread.process
     }
 
-    /// Returns the core [`ProcessId`](litebox::process::ProcessId) for this task's process.
-    #[expect(dead_code, reason = "scaffolding for multi-process steps 1.2+")]
-    pub(crate) fn current_process_id(&self) -> litebox::process::ProcessId {
-        self.process_id
+    pub(crate) fn current_ucred(&self) -> litebox_common_linux::Ucred {
+        litebox_common_linux::Ucred {
+            pid: self.pid.cast_unsigned(),
+            uid: self.credentials.euid,
+            gid: self.credentials.egid,
+        }
     }
 
     /// Set the current task's command name.
