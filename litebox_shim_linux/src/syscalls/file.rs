@@ -727,8 +727,8 @@ impl<FS: ShimFS> Task<FS> {
             .run_on_raw_fd(
                 raw_fd,
                 |fd| files.fs.truncate(fd, length, false).map_err(Errno::from),
-                |_fd| todo!("net"),
-                |_fd| todo!("pipes"),
+                |_fd| Err(Errno::EINVAL),
+                |_fd| Err(Errno::EINVAL),
                 |_fd| Err(Errno::EINVAL),
                 |_fd| Err(Errno::EINVAL),
                 |_fd| Err(Errno::EINVAL),

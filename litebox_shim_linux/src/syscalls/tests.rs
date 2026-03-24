@@ -165,6 +165,59 @@ fn test_fcntl_dupfd_respects_min_fd() {
 }
 
 #[test]
+fn test_ftruncate_rejects_non_file_descriptors() {
+    let task = init_platform(None);
+
+    let (read_fd, write_fd) = task.sys_pipe2(OFlags::empty()).unwrap();
+    let read_fd = i32::try_from(read_fd).unwrap();
+    let write_fd = i32::try_from(write_fd).unwrap();
+
+    let udp_fd = task
+        .sys_socket(AddressFamily::INET as u32, SockType::Datagram as u32, 0)
+        .expect("Failed to create UDP socket");
+    let udp_fd = i32::try_from(udp_fd).unwrap();
+
+    let eventfd = task
+        .sys_eventfd2(0, EfdFlags::empty())
+        .expect("Failed to create eventfd");
+    let eventfd = i32::try_from(eventfd).unwrap();
+
+    let epoll = task
+        .sys_epoll_create(EpollCreateFlags::empty())
+        .expect("Failed to create epoll fd");
+    let epoll = i32::try_from(epoll).unwrap();
+
+    let timerfd = task
+        .sys_timerfd_create(ClockId::Monotonic, TimerfdFlags::empty())
+        .expect("Failed to create timerfd");
+    let timerfd = i32::try_from(timerfd).unwrap();
+
+    let mut sv = [0u32; 2];
+    task.sys_socketpair(
+        AddressFamily::UNIX as u32,
+        SockType::Stream as u32,
+        0,
+        MutPtr::from_usize(sv.as_mut_ptr() as usize),
+    )
+    .expect("Failed to create unix socketpair");
+    let unix_fd = i32::try_from(sv[0]).unwrap();
+    let unix_peer = i32::try_from(sv[1]).unwrap();
+
+    for fd in [read_fd, write_fd, udp_fd, eventfd, epoll, timerfd, unix_fd] {
+        assert_eq!(task.sys_ftruncate(fd, 0).unwrap_err(), Errno::EINVAL);
+    }
+
+    task.sys_close(read_fd).unwrap();
+    task.sys_close(write_fd).unwrap();
+    task.sys_close(udp_fd).unwrap();
+    task.sys_close(eventfd).unwrap();
+    task.sys_close(epoll).unwrap();
+    task.sys_close(timerfd).unwrap();
+    task.sys_close(unix_fd).unwrap();
+    task.sys_close(unix_peer).unwrap();
+}
+
+#[test]
 fn test_inotify_stub() {
     let task = init_platform(None);
 
