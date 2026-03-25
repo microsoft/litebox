@@ -1974,25 +1974,9 @@ impl<FS: ShimFS> Task<FS> {
                 off_in,
                 fd_out,
                 off_out,
+                len,
                 flags,
-                ..
-            } => {
-                // Linux rejects nonzero flags before any fd checks.
-                if flags != 0 {
-                    return Err(Errno::EINVAL);
-                }
-                // Source must be a readable regular file; dest must be writable.
-                self.validate_regular_file_fd(fd_in, true, false)?;
-                self.validate_regular_file_fd(fd_out, false, true)?;
-                // Validate non-null offset pointers are readable.
-                if off_in.as_usize() != 0 {
-                    off_in.read_at_offset(0).ok_or(Errno::EFAULT)?;
-                }
-                if off_out.as_usize() != 0 {
-                    off_out.read_at_offset(0).ok_or(Errno::EFAULT)?;
-                }
-                Err(Errno::EOPNOTSUPP)
-            }
+            } => self.sys_copy_file_range(fd_in, off_in, fd_out, off_out, len, flags),
             SyscallRequest::Flock { fd, .. } => {
                 // No-op: single-process sandbox has no contention.
                 self.validate_fd(fd)?;

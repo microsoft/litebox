@@ -13,7 +13,7 @@ use alloc::{
 };
 use litebox::{
     event::{Events, wait::WaitError},
-    fd::{FdEnabledSubsystem, MetadataError, TypedFd},
+    fd::{ErrRawIntFd, FdEnabledSubsystem, MetadataError, TypedFd},
     fs::{Mode, OFlags, SeekWhence},
     path,
     platform::{RawConstPointer, RawMutPointer, StdioProvider as _},
@@ -148,6 +148,7 @@ pub(crate) struct FilesState<FS: ShimFS> {
     pub(crate) fs: alloc::sync::Arc<FS>,
     pub(crate) raw_descriptor_store:
         litebox::sync::RwLock<Platform, litebox::fd::RawDescriptorStorage>,
+    file_position_lock: alloc::sync::Arc<litebox::sync::Mutex<Platform, ()>>,
     inotify_instances: litebox::sync::Mutex<
         Platform,
         BTreeMap<usize, Arc<litebox::sync::Mutex<Platform, InotifyInstanceState>>>,
@@ -162,6 +163,7 @@ impl<FS: ShimFS> FilesState<FS> {
             raw_descriptor_store: litebox::sync::RwLock::new(
                 litebox::fd::RawDescriptorStorage::new(),
             ),
+            file_position_lock: Arc::new(litebox::sync::Mutex::new(())),
             inotify_instances: litebox::sync::Mutex::new(BTreeMap::new()),
             max_fd: AtomicUsize::new(usize::MAX),
         }
@@ -206,6 +208,7 @@ impl<FS: ShimFS> FilesState<FS> {
             raw_descriptor_store: litebox::sync::RwLock::new(
                 self.raw_descriptor_store.read().clone_for_fork(global_dt),
             ),
+            file_position_lock: self.file_position_lock.clone(),
             inotify_instances: litebox::sync::Mutex::new(self.inotify_instances.lock().clone()),
             max_fd: AtomicUsize::new(self.max_fd.load(Ordering::Relaxed)),
         }
@@ -931,6 +934,15 @@ impl<FS: ShimFS> Task<FS> {
             .run_on_raw_fd(
                 raw_fd,
                 |fd| {
+                    let _position_guard = if offset.is_none()
+                        && matches!(
+                            files.fs.fd_file_status(fd),
+                            Ok(status) if status.file_type == litebox::fs::FileType::RegularFile
+                        ) {
+                        Some(files.file_position_lock.lock())
+                    } else {
+                        None
+                    };
                     // First attempt.
                     let result = files
                         .fs
@@ -1042,7 +1054,18 @@ impl<FS: ShimFS> Task<FS> {
         let res = files
             .run_on_raw_fd(
                 raw_fd,
-                |fd| files.fs.write(fd, buf, offset).map_err(Errno::from),
+                |fd| {
+                    let _position_guard = if offset.is_none()
+                        && matches!(
+                            files.fs.fd_file_status(fd),
+                            Ok(status) if status.file_type == litebox::fs::FileType::RegularFile
+                        ) {
+                        Some(files.file_position_lock.lock())
+                    } else {
+                        None
+                    };
+                    files.fs.write(fd, buf, offset).map_err(Errno::from)
+                },
                 |fd| {
                     self.global.sendto(
                         &self.wait_cx(),
@@ -1103,6 +1126,238 @@ impl<FS: ShimFS> Task<FS> {
         res
     }
 
+    fn copy_file_range_explicit_offset(&self, offset: MutPtr<i64>) -> Result<Option<usize>, Errno> {
+        if offset.as_usize() == 0 {
+            return Ok(None);
+        }
+        let pos = offset.read_at_offset(0).ok_or(Errno::EFAULT)?;
+        Ok(Some(usize::try_from(pos).map_err(|_| Errno::EINVAL)?))
+    }
+
+    fn finish_copy_file_range_explicit_offset(
+        &self,
+        offset: MutPtr<i64>,
+        pos: Option<usize>,
+    ) -> Result<(), Errno> {
+        let Some(pos) = pos else {
+            return Ok(());
+        };
+        let pos = i64::try_from(pos).map_err(|_| Errno::EOVERFLOW)?;
+        offset.write_at_offset(0, pos).ok_or(Errno::EFAULT)?;
+        Ok(())
+    }
+
+    fn regular_file_open_flags(&self, typed_fd: &TypedFd<FS>) -> OFlags {
+        self.global
+            .litebox
+            .descriptor_table()
+            .with_metadata(typed_fd, |crate::StdioStatusFlags(flags)| *flags)
+            .unwrap_or(OFlags::empty())
+    }
+
+    fn validate_regular_file_typed_fd(
+        &self,
+        files: &FilesState<FS>,
+        typed_fd: &TypedFd<FS>,
+        need_read: bool,
+        need_write: bool,
+    ) -> Result<litebox::fs::FileStatus, Errno> {
+        let status = files.fs.fd_file_status(typed_fd).map_err(Errno::from)?;
+        match status.file_type {
+            litebox::fs::FileType::RegularFile => {}
+            litebox::fs::FileType::Directory => return Err(Errno::EISDIR),
+            _ => return Err(Errno::EINVAL),
+        }
+        let open_flags = self.regular_file_open_flags(typed_fd);
+        if open_flags.contains(OFlags::PATH) {
+            return Err(Errno::EBADF);
+        }
+        let access = open_flags & (OFlags::WRONLY | OFlags::RDWR);
+        if need_read && access == OFlags::WRONLY {
+            return Err(Errno::EBADF);
+        }
+        if need_write && access == OFlags::empty() {
+            return Err(Errno::EBADF);
+        }
+        Ok(status)
+    }
+
+    pub fn sys_copy_file_range(
+        &self,
+        fd_in: i32,
+        off_in: MutPtr<i64>,
+        fd_out: i32,
+        off_out: MutPtr<i64>,
+        len: usize,
+        flags: u32,
+    ) -> Result<usize, Errno> {
+        if flags != 0 {
+            return Err(Errno::EINVAL);
+        }
+        let mut explicit_in_pos = self.copy_file_range_explicit_offset(off_in)?;
+        let explicit_out_pos = self.copy_file_range_explicit_offset(off_out)?;
+        let raw_fd_in = usize::try_from(fd_in).map_err(|_| Errno::EBADF)?;
+        let raw_fd_out = usize::try_from(fd_out).map_err(|_| Errno::EBADF)?;
+        let files = self.files.borrow();
+        let (src_fd, dst_fd) = {
+            let rds = files.raw_descriptor_store.read();
+            let capture_fs_fd = |raw_fd| match rds.fd_from_raw_integer::<FS>(raw_fd) {
+                Ok(fd) => Ok(fd),
+                Err(ErrRawIntFd::NotFound) => Err(Errno::EBADF),
+                Err(ErrRawIntFd::InvalidSubsystem) => Err(Errno::EINVAL),
+            };
+            (capture_fs_fd(raw_fd_in)?, capture_fs_fd(raw_fd_out)?)
+        };
+        let src_status = self.validate_regular_file_typed_fd(&files, &src_fd, true, false)?;
+        let dst_status = self.validate_regular_file_typed_fd(&files, &dst_fd, false, true)?;
+        if self
+            .regular_file_open_flags(&dst_fd)
+            .contains(OFlags::APPEND)
+        {
+            return Err(Errno::EBADF);
+        }
+
+        let use_position_lock = explicit_in_pos.is_none() || explicit_out_pos.is_none();
+        let park_during_copy = !use_position_lock;
+        let (copied, explicit_in_pos, out_pos) = {
+            // Keep implicit-offset copies serialized against other regular-file
+            // I/O on the same shared file description, but never park while
+            // holding that mutex or vfork parking can deadlock on it.
+            let _position_guard = use_position_lock.then(|| files.file_position_lock.lock());
+            let start_in = explicit_in_pos.unwrap_or(
+                files
+                    .fs
+                    .seek(&*src_fd, 0, SeekWhence::RelativeToCurrentOffset)
+                    .map_err(Errno::from)?,
+            );
+            let start_out = explicit_out_pos.unwrap_or(
+                files
+                    .fs
+                    .seek(&*dst_fd, 0, SeekWhence::RelativeToCurrentOffset)
+                    .map_err(Errno::from)?,
+            );
+            let same_file = src_status.node_info.dev == dst_status.node_info.dev
+                && src_status.node_info.ino == dst_status.node_info.ino;
+            let copy_len = core::cmp::min(len, src_status.size.saturating_sub(start_in));
+            start_in.checked_add(len).ok_or(Errno::EOVERFLOW)?;
+            start_out.checked_add(len).ok_or(Errno::EOVERFLOW)?;
+            if same_file {
+                let in_end = start_in.checked_add(copy_len).ok_or(Errno::EOVERFLOW)?;
+                let out_end = start_out.checked_add(copy_len).ok_or(Errno::EOVERFLOW)?;
+                if start_in < out_end && start_out < in_end {
+                    return Err(Errno::EINVAL);
+                }
+            }
+
+            let mut copied = 0usize;
+            let mut buf = [0u8; 16 * 1024];
+            let mut out_pos = start_out;
+            while copied < copy_len {
+                let chunk_len = core::cmp::min(copy_len - copied, buf.len());
+                let read = match files
+                    .fs
+                    .read(&*src_fd, &mut buf[..chunk_len], explicit_in_pos)
+                    .map_err(Errno::from)
+                {
+                    Ok(n) => n,
+                    Err(err) if copied == 0 => return Err(err),
+                    Err(_) => break,
+                };
+                if read == 0 {
+                    break;
+                }
+                if park_during_copy {
+                    self.park_if_deferred();
+                }
+
+                let mut written = 0usize;
+                let mut stop_after_chunk = false;
+                while written < read {
+                    let wrote = match files
+                        .fs
+                        .write(&*dst_fd, &buf[written..read], Some(out_pos))
+                        .map_err(Errno::from)
+                    {
+                        Ok(0) if copied == 0 && written == 0 => {
+                            if explicit_in_pos.is_none() {
+                                files
+                                    .fs
+                                    .seek(
+                                        &*src_fd,
+                                        -isize::try_from(read).map_err(|_| Errno::EOVERFLOW)?,
+                                        SeekWhence::RelativeToCurrentOffset,
+                                    )
+                                    .map_err(Errno::from)?;
+                            }
+                            return Err(Errno::EIO);
+                        }
+                        Ok(0) => {
+                            stop_after_chunk = true;
+                            break;
+                        }
+                        Ok(n) => n,
+                        Err(err) if copied == 0 && written == 0 => {
+                            if explicit_in_pos.is_none() {
+                                files
+                                    .fs
+                                    .seek(
+                                        &*src_fd,
+                                        -isize::try_from(read).map_err(|_| Errno::EOVERFLOW)?,
+                                        SeekWhence::RelativeToCurrentOffset,
+                                    )
+                                    .map_err(Errno::from)?;
+                            }
+                            return Err(err);
+                        }
+                        Err(_) => {
+                            stop_after_chunk = true;
+                            break;
+                        }
+                    };
+                    written = written.checked_add(wrote).ok_or(Errno::EOVERFLOW)?;
+                    out_pos = out_pos.checked_add(wrote).ok_or(Errno::EOVERFLOW)?;
+                    if explicit_out_pos.is_none() {
+                        files
+                            .fs
+                            .seek(
+                                &*dst_fd,
+                                isize::try_from(out_pos).map_err(|_| Errno::EOVERFLOW)?,
+                                SeekWhence::RelativeToBeginning,
+                            )
+                            .map_err(Errno::from)?;
+                    }
+                    if park_during_copy {
+                        self.park_if_deferred();
+                    }
+                }
+
+                if explicit_in_pos.is_none() && written < read {
+                    files
+                        .fs
+                        .seek(
+                            &*src_fd,
+                            -isize::try_from(read - written).map_err(|_| Errno::EOVERFLOW)?,
+                            SeekWhence::RelativeToCurrentOffset,
+                        )
+                        .map_err(Errno::from)?;
+                }
+                copied = copied.checked_add(written).ok_or(Errno::EOVERFLOW)?;
+                if let Some(pos) = explicit_in_pos.as_mut() {
+                    *pos = pos.checked_add(written).ok_or(Errno::EOVERFLOW)?;
+                }
+                if written < read || stop_after_chunk {
+                    break;
+                }
+            }
+            (copied, explicit_in_pos, out_pos)
+        };
+
+        self.park_if_deferred();
+        self.finish_copy_file_range_explicit_offset(off_in, explicit_in_pos)?;
+        self.finish_copy_file_range_explicit_offset(off_out, explicit_out_pos.map(|_| out_pos))?;
+        Ok(copied)
+    }
+
     /// Handle syscall `pread64`
     pub fn sys_pread64(&self, fd: i32, buf: &mut [u8], offset: i64) -> Result<usize, Errno> {
         let pos = usize::try_from(offset).map_err(|_| Errno::EINVAL)?;
@@ -1139,7 +1394,17 @@ impl<FS: ShimFS> Task<FS> {
         files
             .run_on_raw_fd(
                 raw_fd,
-                |fd| files.fs.seek(fd, offset, whence).map_err(Errno::from),
+                |fd| {
+                    let _position_guard = if matches!(
+                        files.fs.fd_file_status(fd),
+                        Ok(status) if status.file_type == litebox::fs::FileType::RegularFile
+                    ) {
+                        Some(files.file_position_lock.lock())
+                    } else {
+                        None
+                    };
+                    files.fs.seek(fd, offset, whence).map_err(Errno::from)
+                },
                 |_| Err(Errno::ESPIPE),
                 |_| Err(Errno::ESPIPE),
                 |_| Err(Errno::ESPIPE),
@@ -1209,59 +1474,6 @@ impl<FS: ShimFS> Task<FS> {
         let files = self.files.borrow();
         files.run_on_raw_fd(raw_fd, |_| (), |_| (), |_| (), |_| (), |_| (), |_| ())?;
         Ok(())
-    }
-
-    /// Validate that an fd is a regular file opened with the required access
-    /// mode. Returns `EISDIR` for directories, `EBADF` for missing/O_PATH fds
-    /// or wrong access mode, and `EINVAL` for non-regular-file fds.
-    ///
-    /// `need_read` / `need_write` indicate the required permissions.
-    pub fn validate_regular_file_fd(
-        &self,
-        fd: i32,
-        need_read: bool,
-        need_write: bool,
-    ) -> Result<(), Errno> {
-        let Ok(raw_fd) = usize::try_from(fd) else {
-            return Err(Errno::EBADF);
-        };
-        let files = self.files.borrow();
-        files.run_on_raw_fd(
-            raw_fd,
-            |typed_fd| {
-                // Check file type — only regular files are valid.
-                let status = files.fs.fd_file_status(typed_fd).map_err(Errno::from)?;
-                match status.file_type {
-                    litebox::fs::FileType::RegularFile => {}
-                    litebox::fs::FileType::Directory => return Err(Errno::EISDIR),
-                    _ => return Err(Errno::EINVAL),
-                }
-                // Check access mode via stored open flags.
-                let open_flags = self
-                    .global
-                    .litebox
-                    .descriptor_table()
-                    .with_metadata(typed_fd, |crate::StdioStatusFlags(flags)| *flags)
-                    .unwrap_or(OFlags::empty());
-                // O_PATH fds are not usable for I/O.
-                if open_flags.contains(OFlags::PATH) {
-                    return Err(Errno::EBADF);
-                }
-                let access = open_flags & (OFlags::WRONLY | OFlags::RDWR);
-                if need_read && access == OFlags::WRONLY {
-                    return Err(Errno::EBADF);
-                }
-                if need_write && access == OFlags::empty() {
-                    return Err(Errno::EBADF);
-                }
-                Ok(())
-            },
-            |_| Err(Errno::EINVAL),
-            |_| Err(Errno::EINVAL),
-            |_| Err(Errno::EINVAL),
-            |_| Err(Errno::EINVAL),
-            |_| Err(Errno::EINVAL),
-        )?
     }
 
     /// Validate that a path resolves to an existing file (follows symlinks).
@@ -1505,6 +1717,10 @@ impl<FS: ShimFS> Task<FS> {
             .run_on_raw_fd(
                 raw_fd,
                 |fd| {
+                    let needs_position_lock = matches!(
+                        files.fs.fd_file_status(fd),
+                        Ok(status) if status.file_type == litebox::fs::FileType::RegularFile
+                    );
                     let mut total_read = 0;
                     let kernel_buffer =
                         core::cell::RefCell::new(vec![
@@ -1522,10 +1738,18 @@ impl<FS: ShimFS> Task<FS> {
                         let Ok(_iov_len) = isize::try_from(iov.iov_len) else {
                             return Err(Errno::EINVAL);
                         };
-                        let size = files
-                            .fs
-                            .read(fd, &mut kernel_buffer.borrow_mut(), None)
-                            .map_err(Errno::from)?;
+                        let size = if needs_position_lock {
+                            let _position_guard = files.file_position_lock.lock();
+                            files
+                                .fs
+                                .read(fd, &mut kernel_buffer.borrow_mut(), None)
+                                .map_err(Errno::from)?
+                        } else {
+                            files
+                                .fs
+                                .read(fd, &mut kernel_buffer.borrow_mut(), None)
+                                .map_err(Errno::from)?
+                        };
                         self.park_if_deferred();
                         iov.iov_base
                             .copy_from_slice(0, &kernel_buffer.borrow()[..size])
@@ -1837,6 +2061,14 @@ impl<FS: ShimFS> Task<FS> {
             .run_on_raw_fd(
                 raw_fd,
                 |fd| {
+                    let _position_guard = if matches!(
+                        files.fs.fd_file_status(fd),
+                        Ok(status) if status.file_type == litebox::fs::FileType::RegularFile
+                    ) {
+                        Some(files.file_position_lock.lock())
+                    } else {
+                        None
+                    };
                     write_to_iovec(iovs, |buf: &[u8]| {
                         files.fs.write(fd, buf, None).map_err(Errno::from)
                     })
@@ -4675,6 +4907,397 @@ mod tests {
         assert_eq!(
             task.sys_readlinkat(123_456, "", &mut buf).unwrap_err(),
             Errno::EBADF
+        );
+    }
+
+    #[test]
+    fn copy_file_range_updates_implicit_file_positions() {
+        let task = crate::syscalls::tests::init_platform(None);
+        let src = task
+            .sys_open(
+                "/copy-src",
+                OFlags::CREAT | OFlags::RDWR,
+                Mode::RUSR | Mode::WUSR,
+            )
+            .unwrap();
+        let dst = task
+            .sys_open(
+                "/copy-dst",
+                OFlags::CREAT | OFlags::RDWR,
+                Mode::RUSR | Mode::WUSR,
+            )
+            .unwrap();
+        let src = i32::try_from(src).unwrap();
+        let dst = i32::try_from(dst).unwrap();
+
+        assert_eq!(task.sys_write(src, b"hello world", None).unwrap(), 11);
+        task.sys_lseek(src, 0, SeekWhence::RelativeToBeginning)
+            .unwrap();
+
+        assert_eq!(
+            task.sys_copy_file_range(
+                src,
+                MutPtr::from_ptr(core::ptr::null_mut()),
+                dst,
+                MutPtr::from_ptr(core::ptr::null_mut()),
+                5,
+                0,
+            )
+            .unwrap(),
+            5
+        );
+        assert_eq!(
+            task.sys_lseek(src, 0, SeekWhence::RelativeToCurrentOffset)
+                .unwrap(),
+            5
+        );
+        assert_eq!(
+            task.sys_lseek(dst, 0, SeekWhence::RelativeToCurrentOffset)
+                .unwrap(),
+            5
+        );
+
+        task.sys_lseek(dst, 0, SeekWhence::RelativeToBeginning)
+            .unwrap();
+        let mut buf = [0u8; 5];
+        assert_eq!(task.sys_read(dst, &mut buf, None).unwrap(), 5);
+        assert_eq!(&buf, b"hello");
+    }
+
+    #[test]
+    fn copy_file_range_explicit_offsets_leave_fd_positions_unchanged() {
+        let task = crate::syscalls::tests::init_platform(None);
+        let src = task
+            .sys_open(
+                "/copy-explicit-src",
+                OFlags::CREAT | OFlags::RDWR,
+                Mode::RUSR | Mode::WUSR,
+            )
+            .unwrap();
+        let dst = task
+            .sys_open(
+                "/copy-explicit-dst",
+                OFlags::CREAT | OFlags::RDWR,
+                Mode::RUSR | Mode::WUSR,
+            )
+            .unwrap();
+        let src = i32::try_from(src).unwrap();
+        let dst = i32::try_from(dst).unwrap();
+
+        assert_eq!(task.sys_write(src, b"abcdef", None).unwrap(), 6);
+        assert_eq!(task.sys_write(dst, b"\0\0", None).unwrap(), 2);
+        task.sys_lseek(dst, 0, SeekWhence::RelativeToBeginning)
+            .unwrap();
+        task.sys_lseek(src, 2, SeekWhence::RelativeToBeginning)
+            .unwrap();
+        task.sys_lseek(dst, 1, SeekWhence::RelativeToBeginning)
+            .unwrap();
+
+        let mut off_in = 1i64;
+        let mut off_out = 0i64;
+        assert_eq!(
+            task.sys_copy_file_range(
+                src,
+                MutPtr::from_ptr(core::ptr::addr_of_mut!(off_in)),
+                dst,
+                MutPtr::from_ptr(core::ptr::addr_of_mut!(off_out)),
+                3,
+                0,
+            )
+            .unwrap(),
+            3
+        );
+        assert_eq!(off_in, 4);
+        assert_eq!(off_out, 3);
+        assert_eq!(
+            task.sys_lseek(src, 0, SeekWhence::RelativeToCurrentOffset)
+                .unwrap(),
+            2
+        );
+        assert_eq!(
+            task.sys_lseek(dst, 0, SeekWhence::RelativeToCurrentOffset)
+                .unwrap(),
+            1
+        );
+
+        task.sys_lseek(dst, 0, SeekWhence::RelativeToBeginning)
+            .unwrap();
+        let mut buf = [0u8; 3];
+        assert_eq!(task.sys_read(dst, &mut buf, None).unwrap(), 3);
+        assert_eq!(&buf, b"bcd");
+    }
+
+    #[test]
+    fn copy_file_range_rejects_append_destination() {
+        let task = crate::syscalls::tests::init_platform(None);
+        let src = task
+            .sys_open(
+                "/copy-append-src",
+                OFlags::CREAT | OFlags::RDWR,
+                Mode::RUSR | Mode::WUSR,
+            )
+            .unwrap();
+        let dst = task
+            .sys_open(
+                "/copy-append-dst",
+                OFlags::CREAT | OFlags::WRONLY | OFlags::APPEND,
+                Mode::RUSR | Mode::WUSR,
+            )
+            .unwrap();
+        let src = i32::try_from(src).unwrap();
+        let dst = i32::try_from(dst).unwrap();
+
+        assert_eq!(task.sys_write(src, b"abc", None).unwrap(), 3);
+        task.sys_lseek(src, 0, SeekWhence::RelativeToBeginning)
+            .unwrap();
+        assert_eq!(
+            task.sys_copy_file_range(
+                src,
+                MutPtr::from_ptr(core::ptr::null_mut()),
+                dst,
+                MutPtr::from_ptr(core::ptr::null_mut()),
+                1,
+                0,
+            )
+            .unwrap_err(),
+            Errno::EBADF
+        );
+    }
+
+    #[test]
+    fn copy_file_range_rejects_non_file_descriptors_with_einval() {
+        let task = crate::syscalls::tests::init_platform(None);
+        let src = task
+            .sys_open(
+                "/copy-nonfile-src",
+                OFlags::CREAT | OFlags::RDWR,
+                Mode::RUSR | Mode::WUSR,
+            )
+            .unwrap();
+        let dst = task
+            .sys_open(
+                "/copy-nonfile-dst",
+                OFlags::CREAT | OFlags::RDWR,
+                Mode::RUSR | Mode::WUSR,
+            )
+            .unwrap();
+        let src = i32::try_from(src).unwrap();
+        let dst = i32::try_from(dst).unwrap();
+        let (pipe_read, pipe_write) = task.sys_pipe2(OFlags::empty()).unwrap();
+        let pipe_read = i32::try_from(pipe_read).unwrap();
+        let pipe_write = i32::try_from(pipe_write).unwrap();
+
+        assert_eq!(
+            task.sys_copy_file_range(
+                pipe_read,
+                MutPtr::from_ptr(core::ptr::null_mut()),
+                dst,
+                MutPtr::from_ptr(core::ptr::null_mut()),
+                1,
+                0,
+            )
+            .unwrap_err(),
+            Errno::EINVAL
+        );
+        assert_eq!(
+            task.sys_copy_file_range(
+                src,
+                MutPtr::from_ptr(core::ptr::null_mut()),
+                pipe_write,
+                MutPtr::from_ptr(core::ptr::null_mut()),
+                1,
+                0,
+            )
+            .unwrap_err(),
+            Errno::EINVAL
+        );
+
+        task.sys_close(pipe_read).unwrap();
+        task.sys_close(pipe_write).unwrap();
+    }
+
+    #[test]
+    fn copy_file_range_rejects_overlapping_ranges_on_same_file() {
+        let task = crate::syscalls::tests::init_platform(None);
+        let fd = task
+            .sys_open(
+                "/copy-overlap",
+                OFlags::CREAT | OFlags::RDWR,
+                Mode::RUSR | Mode::WUSR,
+            )
+            .unwrap();
+        let fd = i32::try_from(fd).unwrap();
+        let dup = i32::try_from(task.sys_dup(fd, None, None).unwrap()).unwrap();
+
+        assert_eq!(task.sys_write(fd, b"abcdef", None).unwrap(), 6);
+        let mut off_in = 0i64;
+        let mut off_out = 1i64;
+        assert_eq!(
+            task.sys_copy_file_range(
+                fd,
+                MutPtr::from_ptr(core::ptr::addr_of_mut!(off_in)),
+                dup,
+                MutPtr::from_ptr(core::ptr::addr_of_mut!(off_out)),
+                3,
+                0,
+            )
+            .unwrap_err(),
+            Errno::EINVAL
+        );
+    }
+
+    #[test]
+    fn copy_file_range_rejects_same_file_range_overflow() {
+        let task = crate::syscalls::tests::init_platform(None);
+        let fd = task
+            .sys_open(
+                "/copy-overflow",
+                OFlags::CREAT | OFlags::RDWR,
+                Mode::RUSR | Mode::WUSR,
+            )
+            .unwrap();
+        let fd = i32::try_from(fd).unwrap();
+        let dup = i32::try_from(task.sys_dup(fd, None, None).unwrap()).unwrap();
+
+        let mut off_in = 0i64;
+        let mut off_out = 1i64;
+        assert_eq!(
+            task.sys_copy_file_range(
+                fd,
+                MutPtr::from_ptr(core::ptr::addr_of_mut!(off_in)),
+                dup,
+                MutPtr::from_ptr(core::ptr::addr_of_mut!(off_out)),
+                usize::MAX,
+                0,
+            )
+            .unwrap_err(),
+            Errno::EOVERFLOW
+        );
+    }
+
+    #[test]
+    fn copy_file_range_rejects_cross_file_range_overflow() {
+        let task = crate::syscalls::tests::init_platform(None);
+        let src = task
+            .sys_open(
+                "/copy-cross-overflow-src",
+                OFlags::CREAT | OFlags::RDWR,
+                Mode::RUSR | Mode::WUSR,
+            )
+            .unwrap();
+        let dst = task
+            .sys_open(
+                "/copy-cross-overflow-dst",
+                OFlags::CREAT | OFlags::RDWR,
+                Mode::RUSR | Mode::WUSR,
+            )
+            .unwrap();
+        let src = i32::try_from(src).unwrap();
+        let dst = i32::try_from(dst).unwrap();
+
+        assert_eq!(task.sys_write(src, b"x", None).unwrap(), 1);
+        let mut off_in = 0i64;
+        let mut off_out = 1i64;
+        assert_eq!(
+            task.sys_copy_file_range(
+                src,
+                MutPtr::from_ptr(core::ptr::addr_of_mut!(off_in)),
+                dst,
+                MutPtr::from_ptr(core::ptr::addr_of_mut!(off_out)),
+                usize::MAX,
+                0,
+            )
+            .unwrap_err(),
+            Errno::EOVERFLOW
+        );
+    }
+
+    #[test]
+    fn copy_file_range_uses_current_position_after_clearing_append() {
+        let task = crate::syscalls::tests::init_platform(None);
+        let src = task
+            .sys_open(
+                "/copy-append-cleared-src",
+                OFlags::CREAT | OFlags::RDWR,
+                Mode::RUSR | Mode::WUSR,
+            )
+            .unwrap();
+        let dst = task
+            .sys_open(
+                "/copy-append-cleared-dst",
+                OFlags::CREAT | OFlags::WRONLY | OFlags::APPEND,
+                Mode::RUSR | Mode::WUSR,
+            )
+            .unwrap();
+        let src = i32::try_from(src).unwrap();
+        let dst = i32::try_from(dst).unwrap();
+
+        assert_eq!(task.sys_write(src, b"ab", None).unwrap(), 2);
+        task.sys_lseek(src, 0, SeekWhence::RelativeToBeginning)
+            .unwrap();
+        task.sys_close(dst).unwrap();
+
+        let dst = task
+            .sys_open(
+                "/copy-append-cleared-dst",
+                OFlags::RDWR | OFlags::APPEND,
+                Mode::empty(),
+            )
+            .unwrap();
+        let dst = i32::try_from(dst).unwrap();
+        assert_eq!(task.sys_write(dst, b"zzzz", None).unwrap(), 4);
+        task.sys_fcntl(dst, FcntlArg::SETFL(OFlags::empty()))
+            .unwrap();
+        task.sys_lseek(dst, 1, SeekWhence::RelativeToBeginning)
+            .unwrap();
+
+        assert_eq!(
+            task.sys_copy_file_range(
+                src,
+                MutPtr::from_ptr(core::ptr::null_mut()),
+                dst,
+                MutPtr::from_ptr(core::ptr::null_mut()),
+                2,
+                0,
+            )
+            .unwrap(),
+            2
+        );
+
+        task.sys_lseek(dst, 0, SeekWhence::RelativeToBeginning)
+            .unwrap();
+        let mut buf = [0u8; 4];
+        assert_eq!(task.sys_read(dst, &mut buf, None).unwrap(), 4);
+        assert_eq!(&buf, b"zabz");
+    }
+
+    #[test]
+    fn copy_file_range_clamps_overlap_check_to_source_size() {
+        let task = crate::syscalls::tests::init_platform(None);
+        let fd = task
+            .sys_open(
+                "/copy-clamp-overlap",
+                OFlags::CREAT | OFlags::RDWR,
+                Mode::RUSR | Mode::WUSR,
+            )
+            .unwrap();
+        let fd = i32::try_from(fd).unwrap();
+        let dup = i32::try_from(task.sys_dup(fd, None, None).unwrap()).unwrap();
+
+        assert_eq!(task.sys_write(fd, b"0123456789", None).unwrap(), 10);
+        let mut off_in = 0i64;
+        let mut off_out = 50i64;
+        assert_eq!(
+            task.sys_copy_file_range(
+                fd,
+                MutPtr::from_ptr(core::ptr::addr_of_mut!(off_in)),
+                dup,
+                MutPtr::from_ptr(core::ptr::addr_of_mut!(off_out)),
+                100,
+                0,
+            )
+            .unwrap(),
+            10
         );
     }
 
