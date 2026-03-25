@@ -305,6 +305,8 @@ pub enum LinkError {
     NoWritePerms,
     #[error("cross-device link not permitted")]
     CrossDevice,
+    #[error("oldpath is a directory")]
+    IsDirectory,
     #[error("I/O error")]
     Io,
     #[error("operation not supported")]

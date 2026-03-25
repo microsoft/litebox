@@ -2259,8 +2259,9 @@ impl<FS: ShimFS> Task<FS> {
         new_rlim: Option<crate::ConstPtr<litebox_common_linux::Rlimit64>>,
         old_rlim: Option<crate::MutPtr<litebox_common_linux::Rlimit64>>,
     ) -> Result<(), Errno> {
-        if pid != 0 {
-            unimplemented!("prlimit for a specific PID is not supported yet");
+        if pid != 0 && pid != self.pid {
+            // prlimit for a different process. We can only handle our own.
+            return Err(Errno::ESRCH);
         }
         let new_limit = match new_rlim {
             Some(rlim) => {
@@ -2314,8 +2315,10 @@ impl<FS: ShimFS> Task<FS> {
         pid: Option<i32>,
         head_ptr: crate::MutPtr<usize>,
     ) -> Result<(), Errno> {
-        if pid.is_some() {
-            unimplemented!("Getting robust list for a specific PID is not supported yet");
+        if let Some(pid) = pid
+            && pid != self.tid
+        {
+            return Err(Errno::ESRCH);
         }
         let head = self
             .thread
@@ -2851,16 +2854,29 @@ impl<FS: ShimFS> Task<FS> {
     }
 
     /// Handle syscall `getgroups`.
-    pub(crate) fn sys_getgroups(&self, size: i32, _list: MutPtr<u32>) -> Result<usize, Errno> {
+    pub(crate) fn sys_getgroups(&self, size: i32, list: MutPtr<u32>) -> Result<usize, Errno> {
         if size < 0 {
             return Err(Errno::EINVAL);
         }
 
-        // The shim currently tracks only primary/effective gids. Supplementary
-        // groups should come from LiteBox-managed process state rather than
-        // host libc, so until that state exists the sandbox exposes an empty
-        // supplemental group list on every host platform.
-        Ok(0)
+        // Return the effective gid as the sole supplementary group — this
+        // matches the common case where a user has their primary group as
+        // their only supplementary group.
+        let groups: &[u32] = &[self.credentials.egid];
+        if size == 0 {
+            return Ok(groups.len());
+        }
+        #[allow(clippy::cast_sign_loss)]
+        let size = size as usize;
+        if size < groups.len() {
+            return Err(Errno::EINVAL);
+        }
+        self.prepare_guest_write(list, groups.len())?;
+        for (i, &gid) in groups.iter().enumerate() {
+            list.write_at_offset(isize::try_from(i).unwrap(), gid)
+                .ok_or(Errno::EFAULT)?;
+        }
+        Ok(groups.len())
     }
 }
 

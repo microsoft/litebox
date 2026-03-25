@@ -292,6 +292,7 @@ impl From<litebox::fs::errors::LinkError> for Errno {
             litebox::fs::errors::LinkError::ReadOnlyFileSystem => Errno::EROFS,
             litebox::fs::errors::LinkError::NoWritePerms => Errno::EACCES,
             litebox::fs::errors::LinkError::CrossDevice => Errno::EXDEV,
+            litebox::fs::errors::LinkError::IsDirectory => Errno::EPERM,
             litebox::fs::errors::LinkError::Io => Errno::EIO,
             litebox::fs::errors::LinkError::NotSupported => Errno::EOPNOTSUPP,
             _ => unimplemented!(),

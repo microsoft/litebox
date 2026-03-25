@@ -139,7 +139,15 @@ impl UnixSocketAddr {
                 // TODO: check if the abstract address is already in use
                 Ok(UnixBoundSocketAddr::Abstract(data))
             }
-            UnixSocketAddr::Unnamed => todo!("autobind for unnamed unix socket"),
+            UnixSocketAddr::Unnamed => {
+                // Autobind: assign a unique abstract address. Linux uses a
+                // 5-hex-digit counter (e.g., "\0/00001").
+                static AUTOBIND_COUNTER: core::sync::atomic::AtomicU32 =
+                    core::sync::atomic::AtomicU32::new(1);
+                let id = AUTOBIND_COUNTER.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                let name = alloc::format!("{id:05x}");
+                Ok(UnixBoundSocketAddr::Abstract(name.into_bytes()))
+            }
         }
     }
 

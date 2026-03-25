@@ -861,6 +861,51 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
         }
     }
 
+    fn link(
+        &self,
+        oldpath: impl crate::path::Arg,
+        newpath: impl crate::path::Arg,
+    ) -> Result<(), super::errors::LinkError> {
+        let old = self
+            .absolute_path(oldpath)
+            .map_err(super::errors::LinkError::PathError)?;
+        let new = self
+            .absolute_path(newpath)
+            .map_err(super::errors::LinkError::PathError)?;
+        let mut root = self.root.write();
+        let (_, old_entry) = root.parent_and_entry(&old, self.current_user)?;
+        let Some(old_entry) = old_entry else {
+            return Err(super::errors::PathError::NoSuchFileOrDirectory)?;
+        };
+        let old_entry = old_entry.clone();
+        if matches!(old_entry, Entry::Dir(_)) {
+            return Err(super::errors::LinkError::IsDirectory);
+        }
+        let (new_parent, existing) = root.parent_and_entry(&new, self.current_user)?;
+        if existing.is_some() {
+            return Err(super::errors::LinkError::AlreadyExists);
+        }
+        let Some((_, new_parent)) = new_parent else {
+            return Err(super::errors::LinkError::Io);
+        };
+        let mut parent = new_parent.write();
+        if !self.current_user.can_write(&parent.perms) {
+            return Err(super::errors::LinkError::NoWritePerms);
+        }
+        let file_type = match &old_entry {
+            Entry::File(_) => FileType::RegularFile,
+            Entry::Symlink(_) => FileType::Symlink,
+            Entry::Dir(_) => unreachable!(),
+        };
+        let old = parent
+            .children
+            .insert(new.components().unwrap().last().unwrap().into(), file_type);
+        assert!(old.is_none());
+        let old = root.entries.insert(new, old_entry);
+        assert!(old.is_none());
+        Ok(())
+    }
+
     fn read_dir(&self, fd: &FileFd<Platform>) -> Result<Vec<DirEntry>, ReadDirError> {
         let descriptor_table = self.litebox.descriptor_table();
         let Descriptor::Dir { dir, .. } = &descriptor_table
