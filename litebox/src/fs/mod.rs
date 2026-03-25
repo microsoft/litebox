@@ -362,6 +362,7 @@ pub enum FileType {
     RegularFile,
     Directory,
     CharacterDevice,
+    Symlink,
 }
 
 bitflags! {

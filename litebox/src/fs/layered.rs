@@ -200,7 +200,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
                         },
                     }
                 }
-                Ok(FileType::RegularFile | FileType::CharacterDevice)
+                Ok(FileType::RegularFile | FileType::CharacterDevice | FileType::Symlink)
                 | Err(
                     FileStatusError::PathError(PathError::MissingComponent)
                     | FileStatusError::ClosedFd
@@ -1546,7 +1546,7 @@ impl<
                             unreachable!()
                         }
                     })? {
-                        FileType::RegularFile => {
+                        FileType::RegularFile | FileType::Symlink => {
                             // fallthrough
                         }
                         FileType::Directory => {
@@ -2188,6 +2188,15 @@ impl<
         let path = self
             .absolute_path(path)
             .map_err(|_| super::errors::ReadLinkError::Io)?;
+        // Check for tombstones — a symlink unlinked from the layered FS
+        // should not be readable via the lower layer.
+        if let Some(entry) = self.root.read().entries.get(&path)
+            && matches!(&**entry, EntryX::Tombstone)
+        {
+            return Err(super::errors::ReadLinkError::PathError(
+                super::errors::PathError::NoSuchFileOrDirectory,
+            ));
+        }
         // Try upper first, fall back to lower
         match self.upper.read_link(&*path) {
             Ok(target) => Ok(target),
