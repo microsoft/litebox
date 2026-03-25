@@ -1590,14 +1590,19 @@ impl<FS: ShimFS> Task<FS> {
             let fds_ptr = ConstPtr::<i32>::from_usize(control_ptr + offset + data_offset);
             let fd_array = fds_ptr.to_owned_slice(fd_count).ok_or(Errno::EFAULT)?;
 
-            let files = self.files.borrow();
-            let rds = files.raw_descriptor_store.read();
+            // Duplicate each fd for passing. We take the descriptor_table_mut
+            // lock first (matching the established dt -> rds lock order), then
+            // briefly read from raw_descriptor_store for each fd.
             let mut dt = self.global.litebox.descriptor_table_mut();
             for &guest_fd in &fd_array {
                 let raw_fd = usize::try_from(guest_fd).map_err(|_| Errno::EBADF)?;
+                let files = self.files.borrow();
+                let rds = files.raw_descriptor_store.read();
                 let passed = rds
                     .duplicate_for_passing(raw_fd, &mut dt)
                     .ok_or(Errno::EBADF)?;
+                drop(rds);
+                drop(files);
                 passed_fds.push(passed);
             }
 
@@ -1640,37 +1645,37 @@ impl<FS: ShimFS> Task<FS> {
             return 0;
         }
 
-        let cmsg_hdr = CmsgHdr {
-            cmsg_len: cmsg_len(fd_data_len),
-            cmsg_level: 1, // SOL_SOCKET
-            cmsg_type: SCM_RIGHTS,
-        };
-
         let hdr_size = core::mem::size_of::<CmsgHdr>();
         let data_offset = cmsg_align(hdr_size);
 
-        // Check if we have room for at least the header.
-        if control_buf_len < data_offset {
+        // Check if we have room for at least the header + one fd.
+        if control_buf_len < data_offset + core::mem::size_of::<i32>() {
             *msg_flags |= ReceiveFlags::CTRUNC;
             hdr.msg_controllen = 0;
             return 0;
         }
 
-        // Write the cmsghdr.
-        let cmsg_ptr = MutPtr::<CmsgHdr>::from_usize(control_ptr);
-        if cmsg_ptr.write_at_offset(0, cmsg_hdr).is_none() {
-            *msg_flags |= ReceiveFlags::CTRUNC;
-            hdr.msg_controllen = 0;
-            return 0;
-        }
-
-        // Determine how many fds fit in the remaining buffer.
+        // Determine how many fds fit in the available buffer.
         let available_data = control_buf_len.saturating_sub(data_offset);
         let fds_that_fit = available_data / core::mem::size_of::<i32>();
         let fds_to_write = fds.len().min(fds_that_fit);
 
         if fds_to_write < fds.len() {
             *msg_flags |= ReceiveFlags::CTRUNC;
+        }
+
+        // Write the cmsghdr with the *actual* payload length.
+        let written_data_len = fds_to_write * core::mem::size_of::<i32>();
+        let cmsg_hdr = CmsgHdr {
+            cmsg_len: cmsg_len(written_data_len),
+            cmsg_level: 1, // SOL_SOCKET
+            cmsg_type: SCM_RIGHTS,
+        };
+        let cmsg_ptr = MutPtr::<CmsgHdr>::from_usize(control_ptr);
+        if cmsg_ptr.write_at_offset(0, cmsg_hdr).is_none() {
+            *msg_flags |= ReceiveFlags::CTRUNC;
+            hdr.msg_controllen = 0;
+            return 0;
         }
 
         // Write the fd array.
@@ -1680,14 +1685,13 @@ impl<FS: ShimFS> Task<FS> {
             let _ = fd_ptr.copy_from_slice(0, fd_bytes);
         }
 
-        // Set the actual control length (including the full cmsg for all
-        // written fds, not truncated ones).
-        let written_data_len = fds_to_write * core::mem::size_of::<i32>();
-        hdr.msg_controllen = if fds_to_write == fds.len() {
+        // Cap msg_controllen to the buffer actually available.
+        let reported = if fds_to_write == fds.len() {
             needed
         } else {
             cmsg_space(written_data_len)
         };
+        hdr.msg_controllen = reported.min(control_buf_len);
         fds_to_write
     }
 
