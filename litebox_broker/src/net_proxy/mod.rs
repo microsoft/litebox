@@ -93,7 +93,7 @@ struct PendingHandshake {
 const HANDSHAKE_ACCEPT_TIMEOUT: Duration = Duration::from_millis(100);
 
 /// Maximum total time to receive direct shared-memory 9P upgrade metadata.
-#[cfg(any(unix, windows))]
+#[cfg(windows)]
 const LB9P_RING_UPGRADE_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Hard cap on concurrent background direct 9P ring-upgrade workers.
