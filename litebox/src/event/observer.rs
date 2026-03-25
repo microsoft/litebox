@@ -93,9 +93,21 @@ impl<E, F: EventsFilter<E>, Platform: RawSyncPrimitivesProvider> Subject<E, F, P
         }
     }
 
+    fn prune_dead_observers(&self, observers: &mut BTreeMap<ObserverKey<E>, F>) {
+        observers.retain(|observer, _| {
+            if observer.upgrade().is_some() {
+                true
+            } else {
+                self.nums.fetch_sub(1, Ordering::Relaxed);
+                false
+            }
+        });
+    }
+
     /// Register an observer with the given filter.
     pub fn register_observer(&self, observer: Weak<dyn Observer<E>>, filter: F) {
         let mut observers = self.observers.lock();
+        self.prune_dead_observers(&mut observers);
         if observers
             .insert(ObserverKey::new(observer), filter)
             .is_none()
@@ -130,5 +142,57 @@ impl<E, F: EventsFilter<E>, Platform: RawSyncPrimitivesProvider> Subject<E, F, P
                 false
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use alloc::sync::Arc;
+    use core::sync::atomic::{AtomicUsize, Ordering};
+
+    use super::{Observer, Subject};
+    use crate::{event::Events, platform::mock::MockPlatform};
+
+    struct TestObserver {
+        notifications: AtomicUsize,
+    }
+
+    impl Observer<Events> for TestObserver {
+        fn on_events(&self, _events: &Events) {
+            self.notifications.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    #[test]
+    fn register_observer_prunes_dead_entries() {
+        let subject = Subject::<Events, Events, MockPlatform>::new();
+
+        let stale = Arc::new(TestObserver {
+            notifications: AtomicUsize::new(0),
+        });
+        subject.register_observer(Arc::downgrade(&stale) as _, Events::IN);
+        assert_eq!(subject.nums.load(Ordering::Relaxed), 1);
+        assert_eq!(subject.observers.lock().len(), 1);
+        drop(stale);
+
+        let fresh = Arc::new(TestObserver {
+            notifications: AtomicUsize::new(0),
+        });
+        subject.register_observer(Arc::downgrade(&fresh) as _, Events::OUT);
+        {
+            let observers = subject.observers.lock();
+            let registered = observers
+                .keys()
+                .next()
+                .and_then(super::ObserverKey::upgrade)
+                .expect("dead observer should be pruned during registration");
+            let fresh_observer: Arc<dyn Observer<Events>> = fresh.clone();
+            assert!(Arc::ptr_eq(&registered, &fresh_observer));
+            assert_eq!(subject.nums.load(Ordering::Relaxed), 1);
+            assert_eq!(observers.len(), 1);
+        }
+        subject.notify_observers(Events::OUT);
+
+        assert_eq!(fresh.notifications.load(Ordering::Relaxed), 1);
     }
 }
