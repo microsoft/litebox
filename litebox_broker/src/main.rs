@@ -143,7 +143,7 @@ fn build_local_services(
         );
     }
 
-    info!("registered 9P file service on local port 5640");
+    info!("registered 9P file service on virtual port 5640");
     Some(registry)
 }
 
