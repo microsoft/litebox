@@ -707,7 +707,7 @@ impl<FS: ShimFS> Task<FS> {
 
     pub(crate) fn sys_kill(&self, pid: i32, signal: i32) -> Result<usize, Errno> {
         if pid > 0 && pid != self.pid {
-            return self.do_remote_process_kill(pid, signal);
+            return self.do_remote_process_kill(pid, None, signal);
         }
         self.do_kill(Some(pid), None, signal)
     }
@@ -720,7 +720,12 @@ impl<FS: ShimFS> Task<FS> {
         self.do_kill(Some(pid), Some(tid), signal)
     }
 
-    fn do_remote_process_kill(&self, pid: i32, signal: i32) -> Result<usize, Errno> {
+    fn do_remote_process_kill(
+        &self,
+        pid: i32,
+        tid: Option<i32>,
+        signal: i32,
+    ) -> Result<usize, Errno> {
         let target = ProcessId(pid.try_into().map_err(|_| Errno::ESRCH)?);
         let is_running = self
             .global
@@ -741,6 +746,7 @@ impl<FS: ShimFS> Task<FS> {
             .lock()
             .push(crate::CrossProcessSignal {
                 target_process_id: target.0,
+                target_tid: tid,
                 signal,
                 siginfo: siginfo_kill(signal),
             });
@@ -867,14 +873,10 @@ impl<FS: ShimFS> Task<FS> {
                 }
             }
             Err(Errno::ESRCH)
+        } else if let Some(target_pid) = pid {
+            // Sending signal to a thread in a different process.
+            self.do_remote_process_kill(target_pid, tid, signal.map_or(0, |s| s.as_i32()))
         } else {
-            log_unsupported!(
-                "sys_{{t|tg}}kill with remote pid (caller pid={}, tid={}, target pid={:?}, tid={:?})",
-                self.pid,
-                self.tid,
-                pid,
-                tid
-            );
             Err(Errno::ESRCH)
         }
     }
@@ -937,11 +939,29 @@ impl<FS: ShimFS> Task<FS> {
         while i < queue.len() {
             if queue[i].target_process_id == my_id {
                 let sig = queue.swap_remove(i);
-                self.signals.shared_pending.lock().push(
-                    &self.process().limits,
-                    sig.signal,
-                    sig.siginfo,
-                );
+                if let Some(tid) = sig.target_tid {
+                    // Thread-directed signal (e.g. from tgkill) — route to the
+                    // specific thread's pending queue if it exists.
+                    let inner = self.process().inner.lock();
+                    if let Some(remote) = inner.threads.get(&tid) {
+                        remote.pending_signals.lock().push(
+                            &self.process().limits,
+                            sig.signal,
+                            sig.siginfo,
+                        );
+                        remote.interrupt();
+                    }
+                    // If the thread no longer exists, the signal is silently
+                    // dropped — consistent with Linux behaviour after the
+                    // target thread has exited.
+                } else {
+                    // Process-directed signal — goes to shared_pending.
+                    self.signals.shared_pending.lock().push(
+                        &self.process().limits,
+                        sig.signal,
+                        sig.siginfo,
+                    );
+                }
             } else {
                 i += 1;
             }
@@ -1199,7 +1219,7 @@ impl<FS: ShimFS> Task<FS> {
         }
     }
 
-    /// Only supports sending signals to self for now.
+    /// Queue a thread-directed signal on the current task's pending set.
     pub(crate) fn send_signal(&self, signal: Signal, siginfo: Siginfo) {
         if self.is_signal_ignored(signal) {
             return;

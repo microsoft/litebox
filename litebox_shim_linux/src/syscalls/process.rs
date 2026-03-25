@@ -817,6 +817,7 @@ impl<FS: ShimFS> Task<FS> {
                             self.global.cross_process_signals.lock().push(
                                 crate::CrossProcessSignal {
                                     target_process_id: notif.parent_pid.0,
+                                    target_tid: None,
                                     signal,
                                     siginfo,
                                 },

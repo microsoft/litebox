@@ -2376,6 +2376,9 @@ struct GlobalState<FS: ShimFS> {
 struct CrossProcessSignal {
     /// The target process's internal ID (ProcessId).
     target_process_id: u32,
+    /// Optional target thread ID for thread-directed signals (e.g. `tgkill`).
+    /// When `None`, the signal is process-directed and goes to `shared_pending`.
+    target_tid: Option<i32>,
     /// The signal to deliver.
     signal: litebox_common_linux::signal::Signal,
     /// The siginfo data.
