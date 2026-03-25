@@ -2347,11 +2347,12 @@ struct GlobalState<FS: ShimFS> {
     next_thread_id: core::sync::atomic::AtomicI32,
     /// UNIX domain socket address table
     unix_addr_table: litebox::sync::RwLock<Platform, syscalls::unix::UnixAddrTable<FS>>,
-    /// Cross-process signal queue for delivering signals (e.g. SIGCHLD) between
-    /// processes. Entries are consumed by the target task during signal processing.
+    /// Local-host cross-process signal queue for delivering signals (e.g.
+    /// SIGCHLD) between processes owned by this host. Entries are consumed by
+    /// the target task during signal processing.
     cross_process_signals: litebox::sync::Mutex<Platform, Vec<CrossProcessSignal>>,
-    /// Thread handles for each process's main thread, used to interrupt a
-    /// process when delivering a cross-process signal.
+    /// Best-effort local thread handles used to interrupt a process when
+    /// delivering a queued local cross-process signal.
     process_thread_handles: litebox::sync::RwLock<
         Platform,
         alloc::collections::BTreeMap<i32, alloc::sync::Arc<syscalls::process::ThreadRemote>>,

@@ -802,42 +802,7 @@ impl<FS: ShimFS> Task<FS> {
                     // Queue SIGCHLD before waking parent waiters so the parent
                     // cannot return from wait4 and miss the pending signal.
                     if let Some(notif) = notif {
-                        use litebox_common_linux::signal::{Siginfo, SiginfoData, Signal};
-
-                        if let Ok(signal) = Signal::try_from(notif.exit_signal) {
-                            const CLD_EXITED: i32 = 1;
-                            let mut data = SiginfoData { pad: [0u32; 28] };
-                            // si_pid (offset 0 in data, i32)
-                            data.pad[0] = notif.child_pid.0;
-                            // si_uid (offset 4, u32) — leave as 0
-                            // si_status (offset 8, i32)
-                            data.pad[2] = notif.exit_status.cast_unsigned();
-
-                            let siginfo = Siginfo {
-                                signo: signal.as_i32(),
-                                errno: 0,
-                                code: CLD_EXITED,
-                                #[cfg(target_pointer_width = "64")]
-                                __pad: 0,
-                                data,
-                            };
-
-                            self.global.cross_process_signals.lock().push(
-                                crate::CrossProcessSignal {
-                                    target_process_id: notif.parent_pid.0,
-                                    target_tid: None,
-                                    signal,
-                                    siginfo,
-                                },
-                            );
-
-                            // Interrupt the parent so it processes the signal.
-                            let handles = self.global.process_thread_handles.read();
-                            let parent_key = notif.parent_pid.0.cast_signed();
-                            if let Some(remote) = handles.get(&parent_key) {
-                                remote.interrupt();
-                            }
-                        }
+                        self.notify_parent_of_child_exit(notif);
                     }
                 });
 
@@ -914,6 +879,65 @@ impl<FS: ShimFS> Task<FS> {
             return Ok(());
         }
         self.reject_remote_running_process_control(process_id, operation)
+    }
+
+    fn notify_parent_of_child_exit(&self, notif: litebox::process::ExitNotification) {
+        use litebox_common_linux::signal::{Siginfo, SiginfoData, Signal};
+
+        const CLD_EXITED: i32 = 1;
+
+        let Some(owner_host) = self
+            .global
+            .control_plane
+            .owner_of_running_process(notif.parent_pid)
+        else {
+            return;
+        };
+        if owner_host != self.global.control_plane.local_host() {
+            log_unsupported!(
+                "SIGCHLD delivery to running pid {} owned by remote host {:?}",
+                notif.parent_pid.0,
+                owner_host
+            );
+            return;
+        }
+
+        let Ok(signal) = Signal::try_from(notif.exit_signal) else {
+            return;
+        };
+        let mut data = SiginfoData { pad: [0u32; 28] };
+        // si_pid (offset 0 in data, i32)
+        data.pad[0] = notif.child_pid.0;
+        // si_uid (offset 4, u32) — leave as 0
+        // si_status (offset 8, i32)
+        data.pad[2] = notif.exit_status.cast_unsigned();
+
+        let siginfo = Siginfo {
+            signo: signal.as_i32(),
+            errno: 0,
+            code: CLD_EXITED,
+            #[cfg(target_pointer_width = "64")]
+            __pad: 0,
+            data,
+        };
+
+        self.global
+            .cross_process_signals
+            .lock()
+            .push(crate::CrossProcessSignal {
+                target_process_id: notif.parent_pid.0,
+                target_tid: None,
+                signal,
+                siginfo,
+            });
+
+        // Local interrupt handles are a best-effort wakeup path, not the
+        // ownership source of truth.
+        let handles = self.global.process_thread_handles.read();
+        let parent_key = notif.parent_pid.0.cast_signed();
+        if let Some(remote) = handles.get(&parent_key) {
+            remote.interrupt();
+        }
     }
 
     pub(crate) fn sys_exit_group(&self, status: i32) {
@@ -3653,6 +3677,18 @@ mod tests {
         grandchild
     }
 
+    fn child_exit_notification(
+        parent_pid: litebox::process::ProcessId,
+        child_pid: litebox::process::ProcessId,
+    ) -> litebox::process::ExitNotification {
+        litebox::process::ExitNotification {
+            parent_pid,
+            exit_signal: litebox_common_linux::signal::Signal::SIGCHLD.as_i32(),
+            child_pid,
+            exit_status: 23,
+        }
+    }
+
     #[test]
     fn test_wait4_rejects_remote_owned_running_child() {
         use litebox::process::WaitOptions;
@@ -3751,6 +3787,48 @@ mod tests {
             .sys_kill(i32::try_from(child.0).unwrap(), 999)
             .unwrap_err();
         assert_eq!(err, Errno::EINVAL);
+    }
+
+    #[test]
+    fn test_notify_parent_of_child_exit_queues_local_signal() {
+        use litebox_common_linux::signal::Signal;
+
+        let task = crate::syscalls::tests::init_platform(None);
+        let notif = child_exit_notification(task.process_id, litebox::process::ProcessId(99));
+
+        task.notify_parent_of_child_exit(notif);
+
+        let queue = task.global.cross_process_signals.lock();
+        assert_eq!(queue.len(), 1);
+        assert_eq!(queue[0].target_process_id, task.process_id.0);
+        assert_eq!(queue[0].signal, Signal::SIGCHLD);
+    }
+
+    #[test]
+    fn test_notify_parent_of_child_exit_skips_remote_owned_parent_queue() {
+        let task = crate::syscalls::tests::init_platform(None);
+        let remote_parent = register_remote_owned_child(&task);
+        let notif = child_exit_notification(remote_parent, litebox::process::ProcessId(99));
+
+        task.notify_parent_of_child_exit(notif);
+
+        assert!(task.global.cross_process_signals.lock().is_empty());
+    }
+
+    #[test]
+    fn test_notify_parent_of_child_exit_queues_without_registered_handle() {
+        let task = crate::syscalls::tests::init_platform(None);
+        task.global
+            .process_thread_handles
+            .write()
+            .remove(&task.process_id.0.cast_signed());
+        let notif = child_exit_notification(task.process_id, litebox::process::ProcessId(99));
+
+        task.notify_parent_of_child_exit(notif);
+
+        let queue = task.global.cross_process_signals.lock();
+        assert_eq!(queue.len(), 1);
+        assert_eq!(queue[0].target_process_id, task.process_id.0);
     }
 
     #[cfg(target_arch = "x86_64")]
