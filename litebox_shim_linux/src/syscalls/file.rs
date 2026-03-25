@@ -2651,13 +2651,7 @@ impl<FS: ShimFS> Task<FS> {
                 }
                 files.run_on_raw_fd(
                     desc,
-                    |fd| {
-                        setfl_in_metadata!(
-                            fd,
-                            crate::StdioStatusFlags,
-                            unimplemented!("SETFL on non-stdio")
-                        )
-                    },
+                    |fd| setfl_in_metadata!(fd, crate::StdioStatusFlags, Errno::EBADF),
                     |fd| {
                         setfl_in_metadata!(
                             fd,
