@@ -692,6 +692,16 @@ impl<Platform: RawSyncPrimitivesProvider> ControlPlane<Platform> {
         Ok(Some(next))
     }
 
+    /// Pop one queued outbound control-plane envelope as a transport-ready wire
+    /// record for a specific host.
+    pub(crate) fn take_next_outbound_message_wire_for_host(
+        &self,
+        target_host: HostId,
+    ) -> Result<Option<OutboundControlPlaneEnvelopeWire>, ControlPlaneError> {
+        self.take_next_outbound_message_for_host(target_host)
+            .map(|message| message.map(Into::into))
+    }
+
     /// Returns whether a host currently has any queued outbound envelopes.
     pub(crate) fn has_outbound_messages_for_host(
         &self,
@@ -1421,6 +1431,65 @@ mod tests {
                 assert_eq!(notification, second);
             }
         }
+    }
+
+    #[test]
+    fn take_next_outbound_message_wire_preserves_tail_fifo() {
+        let plane = ControlPlane::<crate::Platform>::new_root_local();
+        let worker = plane
+            .register_worker_host(HostId::ROOT)
+            .expect("register worker host");
+        let first = ExitNotification {
+            parent_pid: ProcessId(31),
+            exit_signal: 17,
+            child_pid: ProcessId(32),
+            exit_status: 23,
+        };
+        let second = ExitNotification {
+            parent_pid: ProcessId(31),
+            exit_signal: 17,
+            child_pid: ProcessId(33),
+            exit_status: 24,
+        };
+
+        plane
+            .queue_remote_child_exit_notification(HostId::ROOT, worker, first)
+            .expect("queue first notification");
+        plane
+            .queue_remote_child_exit_notification(HostId::ROOT, worker, second)
+            .expect("queue second notification");
+
+        let next = plane
+            .take_next_outbound_message_wire_for_host(worker)
+            .expect("take next queued wire")
+            .expect("first queued wire should exist");
+        assert_eq!(
+            decode_outbound_envelope_wire(next),
+            OutboundControlPlaneEnvelope {
+                source_host: HostId::ROOT,
+                message: OutboundControlPlaneMessageWire::try_from(
+                    OutboundControlPlaneMessage::ChildExit(first),
+                )
+                .expect("encode first child-exit message"),
+                local_delivery_completed: false,
+            }
+        );
+
+        let remaining = plane
+            .poll_outbound_message_wires_for_host(worker)
+            .expect("drain remaining queued wire");
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(
+            decode_outbound_envelope_wire(remaining[0]),
+            OutboundControlPlaneEnvelope {
+                source_host: HostId::ROOT,
+                message: OutboundControlPlaneMessageWire::try_from(
+                    OutboundControlPlaneMessage::ChildExit(second),
+                )
+                .expect("encode second child-exit message"),
+                local_delivery_completed: false,
+            }
+        );
     }
 
     #[test]

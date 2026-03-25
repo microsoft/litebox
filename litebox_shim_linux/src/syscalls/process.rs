@@ -1181,13 +1181,21 @@ impl<FS: ShimFS> Task<FS> {
         }
     }
 
+    fn consume_inbound_control_plane_envelope_wire(
+        &self,
+        envelope_wire: crate::multihost::OutboundControlPlaneEnvelopeWire,
+        restore_local_retry_front: bool,
+    ) -> Result<InboundControlPlaneEnvelopeOutcome, InboundControlPlaneMessageError> {
+        let envelope = crate::multihost::OutboundControlPlaneEnvelope::try_from(envelope_wire)
+            .map_err(InboundControlPlaneMessageError::EnvelopeWire)?;
+        self.consume_inbound_control_plane_envelope(envelope, restore_local_retry_front)
+    }
+
     pub(crate) fn deliver_inbound_control_plane_envelope_wire(
         &self,
         envelope_wire: crate::multihost::OutboundControlPlaneEnvelopeWire,
     ) -> Result<(), InboundControlPlaneMessageError> {
-        let envelope = crate::multihost::OutboundControlPlaneEnvelope::try_from(envelope_wire)
-            .map_err(InboundControlPlaneMessageError::EnvelopeWire)?;
-        self.consume_inbound_control_plane_envelope(envelope, false)
+        self.consume_inbound_control_plane_envelope_wire(envelope_wire, false)
             .map(|_| ())
     }
 
@@ -1272,10 +1280,10 @@ impl<FS: ShimFS> Task<FS> {
         }
         let _pump_active_guard = PumpActiveGuard(&self.global.local_control_plane_pump_active);
         let local_host = self.global.control_plane.local_host();
-        let Ok(envelope) = self
+        let Ok(envelope_wire) = self
             .global
             .control_plane
-            .take_next_outbound_message_for_host(local_host)
+            .take_next_outbound_message_wire_for_host(local_host)
         else {
             log_unsupported!(
                 "local host {:?} could not poll its control-plane queue",
@@ -1283,30 +1291,33 @@ impl<FS: ShimFS> Task<FS> {
             );
             return false;
         };
-        let Some(envelope) = envelope else {
+        let Some(envelope_wire) = envelope_wire else {
             return false;
         };
-        let made_forward_progress =
-            match self.consume_inbound_control_plane_envelope(envelope, true) {
-                Ok(InboundControlPlaneEnvelopeOutcome::Consumed) => true,
-                Ok(InboundControlPlaneEnvelopeOutcome::RetriedLocally) => false,
-                Err(err) => {
-                    if let Ok(crate::multihost::OutboundControlPlaneMessage::ChildExit(notif)) =
+        let made_forward_progress = match self
+            .consume_inbound_control_plane_envelope_wire(envelope_wire, true)
+        {
+            Ok(InboundControlPlaneEnvelopeOutcome::Consumed) => true,
+            Ok(InboundControlPlaneEnvelopeOutcome::RetriedLocally) => false,
+            Err(err) => {
+                if let Ok(envelope) =
+                    crate::multihost::OutboundControlPlaneEnvelope::try_from(envelope_wire)
+                    && let Ok(crate::multihost::OutboundControlPlaneMessage::ChildExit(notif)) =
                         crate::multihost::OutboundControlPlaneMessage::try_from(envelope.message)
-                    {
-                        let _ = self
-                            .global
-                            .control_plane
-                            .clear_child_exit_provenance(notif.child_pid);
-                    }
-                    log_unsupported!(
-                        "local host {:?} could not consume control-plane message: {:?}",
-                        local_host,
-                        err
-                    );
-                    true
+                {
+                    let _ = self
+                        .global
+                        .control_plane
+                        .clear_child_exit_provenance(notif.child_pid);
                 }
-            };
+                log_unsupported!(
+                    "local host {:?} could not consume control-plane message: {:?}",
+                    local_host,
+                    err
+                );
+                true
+            }
+        };
         if !made_forward_progress {
             return false;
         }
