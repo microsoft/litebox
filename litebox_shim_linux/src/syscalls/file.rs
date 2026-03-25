@@ -30,6 +30,26 @@ use crate::{ConstPtr, GlobalState, MutPtr, ShimFS, Task};
 use core::fmt::Write as _;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
+/// Synthetic device IDs for anonymous descriptor pseudo-filesystems,
+/// mirroring the Linux kernel's `sockfs`, `pipefs`, and `anon_inodefs`.
+const SOCKFS_DEV: u64 = 0x000c;
+const PIPEFS_DEV: u64 = 0x000d;
+const ANON_INODE_DEV: u64 = 0x000e;
+
+/// Monotonically increasing counter for unique inode numbers assigned to
+/// anonymous file descriptors (sockets, pipes, eventfds, epoll instances).
+static ANON_INO_COUNTER: AtomicUsize = AtomicUsize::new(1);
+
+/// Fixed inode for the `/proc/self/exe` symlink so that repeated `lstat`
+/// calls return a stable identity.
+static PROC_SELF_EXE_INO: AtomicUsize = AtomicUsize::new(0);
+
+/// Stable inode number stored as entry metadata on anonymous descriptors.
+/// Assigned once on first stat and reused for the lifetime of the open file
+/// description (including across `dup`).
+#[derive(Clone)]
+struct AnonIno(u64);
+
 /// Classification of a file descriptor for terminal ioctl routing.
 enum TerminalKind {
     /// Host stdio device (major=5) — forward ioctls to host kernel.
@@ -2108,6 +2128,8 @@ impl<FS: ShimFS> Task<FS> {
 }
 
 fn descriptor_stat<FS: ShimFS>(raw_fd: usize, task: &Task<FS>) -> Result<FileStat, Errno> {
+    let uid = task.credentials.euid.truncate();
+    let gid = task.credentials.egid.truncate();
     let fstat = task
         .files
         .borrow()
@@ -2121,17 +2143,17 @@ fn descriptor_stat<FS: ShimFS>(raw_fd: usize, task: &Task<FS>) -> Result<FileSta
                     .map(FileStat::from)
                     .map_err(Errno::from)
             },
-            |_fd| {
+            |fd| {
+                let ino = get_or_assign_anon_ino(task, fd);
                 Ok(FileStat {
-                    // TODO: give correct values
-                    st_dev: 0,
-                    st_ino: 0,
+                    st_dev: SOCKFS_DEV.truncate(),
+                    st_ino: ino.truncate(),
                     st_nlink: 1,
                     st_mode: (litebox_common_linux::InodeType::Socket as u32
                         | (Mode::RWXU | Mode::RWXG | Mode::RWXO).bits())
                     .truncate(),
-                    st_uid: 0,
-                    st_gid: 0,
+                    st_uid: uid,
+                    st_gid: gid,
                     st_rdev: 0,
                     st_size: 0,
                     st_blksize: 4096,
@@ -2145,16 +2167,16 @@ fn descriptor_stat<FS: ShimFS>(raw_fd: usize, task: &Task<FS>) -> Result<FileSta
                     litebox::pipes::HalfPipeType::SenderHalf => Mode::WUSR,
                     litebox::pipes::HalfPipeType::ReceiverHalf => Mode::RUSR,
                 };
+                let ino = get_or_assign_anon_ino(task, fd);
                 Ok(FileStat {
-                    // TODO: give correct values
-                    st_dev: 0,
-                    st_ino: 0,
+                    st_dev: PIPEFS_DEV.truncate(),
+                    st_ino: ino.truncate(),
                     st_nlink: 1,
                     st_mode: (read_write_mode.bits()
                         | litebox_common_linux::InodeType::NamedPipe as u32)
                         .truncate(),
-                    st_uid: 0,
-                    st_gid: 0,
+                    st_uid: uid,
+                    st_gid: gid,
                     st_rdev: 0,
                     st_size: 0,
                     st_blksize: 4096,
@@ -2162,15 +2184,15 @@ fn descriptor_stat<FS: ShimFS>(raw_fd: usize, task: &Task<FS>) -> Result<FileSta
                     ..Default::default()
                 })
             },
-            |_fd| {
+            |fd| {
+                let ino = get_or_assign_anon_ino(task, fd);
                 Ok(FileStat {
-                    // TODO: give correct values
-                    st_dev: 0,
-                    st_ino: 0,
+                    st_dev: ANON_INODE_DEV.truncate(),
+                    st_ino: ino.truncate(),
                     st_nlink: 1,
                     st_mode: (Mode::RUSR | Mode::WUSR).bits().truncate(),
-                    st_uid: 0,
-                    st_gid: 0,
+                    st_uid: uid,
+                    st_gid: gid,
                     st_rdev: 0,
                     st_size: 0,
                     st_blksize: 4096,
@@ -2178,15 +2200,15 @@ fn descriptor_stat<FS: ShimFS>(raw_fd: usize, task: &Task<FS>) -> Result<FileSta
                     ..Default::default()
                 })
             },
-            |_fd| {
+            |fd| {
+                let ino = get_or_assign_anon_ino(task, fd);
                 Ok(FileStat {
-                    // TODO: give correct values
-                    st_dev: 0,
-                    st_ino: 0,
+                    st_dev: ANON_INODE_DEV.truncate(),
+                    st_ino: ino.truncate(),
                     st_nlink: 1,
                     st_mode: (Mode::RUSR | Mode::WUSR).bits().truncate(),
-                    st_uid: 0,
-                    st_gid: 0,
+                    st_uid: uid,
+                    st_gid: gid,
                     st_rdev: 0,
                     st_size: 0,
                     st_blksize: 0,
@@ -2194,17 +2216,17 @@ fn descriptor_stat<FS: ShimFS>(raw_fd: usize, task: &Task<FS>) -> Result<FileSta
                     ..Default::default()
                 })
             },
-            |_fd| {
+            |fd| {
+                let ino = get_or_assign_anon_ino(task, fd);
                 Ok(FileStat {
-                    // TODO: give correct values
-                    st_dev: 0,
-                    st_ino: 0,
+                    st_dev: SOCKFS_DEV.truncate(),
+                    st_ino: ino.truncate(),
                     st_nlink: 1,
                     st_mode: (litebox_common_linux::InodeType::Socket as u32
                         | (Mode::RWXU | Mode::RWXG | Mode::RWXO).bits())
                     .truncate(),
-                    st_uid: 0,
-                    st_gid: 0,
+                    st_uid: uid,
+                    st_gid: gid,
                     st_rdev: 0,
                     st_size: 0,
                     st_blksize: 4096,
@@ -2215,6 +2237,33 @@ fn descriptor_stat<FS: ShimFS>(raw_fd: usize, task: &Task<FS>) -> Result<FileSta
         )
         .flatten()?;
     Ok(fstat)
+}
+
+/// Return a fresh inode number for an anonymous descriptor.
+fn next_anon_ino() -> u64 {
+    let ino = ANON_INO_COUNTER.fetch_add(1, Ordering::Relaxed);
+    assert_ne!(ino, usize::MAX, "anonymous inode counter overflow");
+    ino as u64
+}
+
+/// Retrieve the cached inode for an anonymous fd, or assign a new one.
+///
+/// The inode is stored as [`AnonIno`] entry metadata so that repeated `fstat`
+/// calls on the same fd (or a `dup`'d alias) return a stable `st_ino`.
+fn get_or_assign_anon_ino<FS: ShimFS, S: litebox::fd::FdEnabledSubsystem>(
+    task: &Task<FS>,
+    fd: &litebox::fd::TypedFd<S>,
+) -> u64 {
+    // Take the write lock upfront to avoid a TOCTOU race: two threads could
+    // both observe "no metadata" under a read lock and each store a different
+    // inode.
+    let mut dt = task.global.litebox.descriptor_table_mut();
+    if let Ok(ino) = dt.with_metadata::<S, AnonIno, _>(fd, |a| a.0) {
+        return ino;
+    }
+    let ino = next_anon_ino();
+    dt.set_entry_metadata(fd, AnonIno(ino));
+    ino
 }
 
 pub(crate) fn get_file_descriptor_flags<FS: ShimFS>(
@@ -2286,7 +2335,23 @@ impl<FS: ShimFS> Task<FS> {
                 return Err(Errno::ENOENT);
             }
             if !follow_symlink {
+                let mut cached = PROC_SELF_EXE_INO.load(Ordering::Relaxed);
+                if cached == 0 {
+                    #[allow(clippy::cast_possible_truncation)]
+                    let fresh = next_anon_ino() as usize;
+                    match PROC_SELF_EXE_INO.compare_exchange(
+                        0,
+                        fresh,
+                        Ordering::Relaxed,
+                        Ordering::Relaxed,
+                    ) {
+                        Ok(_) => cached = fresh,
+                        Err(winner) => cached = winner,
+                    }
+                }
                 return Ok(FileStat {
+                    st_dev: ANON_INODE_DEV.truncate(),
+                    st_ino: (cached as u64).truncate(),
                     st_mode: ((litebox_common_linux::InodeType::SymLink as u32)
                         | (Mode::RWXU | Mode::RWXG | Mode::RWXO).bits())
                     .truncate(),
@@ -2294,6 +2359,8 @@ impl<FS: ShimFS> Task<FS> {
                     st_blksize: 4096,
                     st_blocks: 0,
                     st_nlink: 1,
+                    st_uid: self.credentials.euid.truncate(),
+                    st_gid: self.credentials.egid.truncate(),
                     ..Default::default()
                 });
             }
