@@ -90,6 +90,27 @@ const PTMX_NODE_INFO: NodeInfo = NodeInfo {
 /// single type avoids duplication and simplifies conversions.
 pub type PtyTermios = crate::platform::TerminalAttributes;
 
+/// Per-entry status flags for device-backed file descriptors.
+#[derive(Clone, Copy)]
+pub struct DeviceStatusFlags(pub OFlags);
+
+impl DeviceStatusFlags {
+    /// Returns the stored status flags.
+    #[must_use]
+    pub fn get_status(&self) -> OFlags {
+        self.0 & OFlags::STATUS_FLAGS_MASK
+    }
+
+    /// Sets or clears a status flag.
+    pub fn set_status(&mut self, flag: OFlags, on: bool) {
+        if on {
+            self.0 |= flag;
+        } else {
+            self.0 &= !flag;
+        }
+    }
+}
+
 /// Shared state for a single PTY pair (master ↔ slave).
 pub struct PtyPair<Platform: crate::sync::RawSyncPrimitivesProvider + TimeProvider> {
     /// Data written to master, read by slave (input to the child process).
@@ -437,7 +458,7 @@ impl<
     ) -> Result<FileFd<Platform>, OpenError> {
         let open_directory = flags.contains(OFlags::DIRECTORY);
         let flags = flags - OFlags::DIRECTORY;
-        let nonblocking = flags.contains(OFlags::NONBLOCK);
+        let _nonblocking = flags.contains(OFlags::NONBLOCK);
         let flags = flags - OFlags::NONBLOCK;
         // ignore NOCTTY, NOFOLLOW, and APPEND
         let flags = flags - OFlags::NOCTTY - OFlags::NOFOLLOW - OFlags::APPEND;
@@ -529,14 +550,6 @@ impl<
         if open_directory {
             return Err(OpenError::PathError(PathError::ComponentNotADirectory));
         }
-        if nonblocking
-            && matches!(
-                device,
-                Device::Stdin | Device::Stderr | Device::Stdout | Device::URandom
-            )
-        {
-            unimplemented!("Non-blocking I/O is not supported for {:?}", device);
-        }
         let fd = self.litebox.descriptor_table_mut().insert(DescriptorEntry {
             entry: device,
             pty_pair,
@@ -564,73 +577,84 @@ impl<
         buf: &mut [u8],
         _offset: Option<usize>,
     ) -> Result<usize, ReadError> {
-        match &self
-            .litebox
-            .descriptor_table()
-            .get_entry(fd)
-            .ok_or(ReadError::ClosedFd)?
-            .entry
-        {
-            Device::Stdin | Device::Tty => {}
-            Device::Stdout | Device::Stderr => {
-                return Err(ReadError::NotForReading);
-            }
-            Device::Null => {
-                // /dev/null read returns EOF
-                return Ok(0);
-            }
-            Device::URandom => {
-                self.litebox.x.platform.fill_bytes_crng(buf);
-                return Ok(buf.len());
-            }
-            &Device::PtyMaster(idx) => {
-                // Master reads what the slave has written
-                let pair = self.pty_manager.get(idx).ok_or(ReadError::ClosedFd)?;
-                let mut ring = pair.slave_to_master.lock();
-                if ring.is_empty() {
-                    if pair
-                        .slave_open_count
-                        .load(core::sync::atomic::Ordering::Acquire)
-                        == 0
-                    {
-                        return Ok(0); // EOF — slave closed
+        let nonblocking = {
+            let table = self.litebox.descriptor_table();
+            let nonblocking = table
+                .with_metadata(fd, |DeviceStatusFlags(flags)| {
+                    flags.contains(OFlags::NONBLOCK)
+                })
+                .unwrap_or(false);
+            match &table.get_entry(fd).ok_or(ReadError::ClosedFd)?.entry {
+                Device::Stdin | Device::Tty => nonblocking,
+                Device::Stdout | Device::Stderr => {
+                    return Err(ReadError::NotForReading);
+                }
+                Device::Null => {
+                    // /dev/null read returns EOF
+                    return Ok(0);
+                }
+                Device::URandom => {
+                    self.litebox.x.platform.fill_bytes_crng(buf);
+                    return Ok(buf.len());
+                }
+                &Device::PtyMaster(idx) => {
+                    // Master reads what the slave has written
+                    let pair = self.pty_manager.get(idx).ok_or(ReadError::ClosedFd)?;
+                    let mut ring = pair.slave_to_master.lock();
+                    if ring.is_empty() {
+                        if pair
+                            .slave_open_count
+                            .load(core::sync::atomic::Ordering::Acquire)
+                            == 0
+                        {
+                            return Ok(0); // EOF — slave closed
+                        }
+                        return Err(ReadError::WouldBlock);
                     }
-                    return Err(ReadError::WouldBlock);
-                }
-                let n = core::cmp::min(buf.len(), ring.len());
-                for (i, byte) in ring.drain(..n).enumerate() {
-                    buf[i] = byte;
-                }
-                return Ok(n);
-            }
-            &Device::PtySlave(idx) => {
-                // Slave reads what the master has written.
-                // Returns WouldBlock (EAGAIN) when no data is available;
-                // the shim layer handles blocking retry with interruptibility.
-                let pair = self.pty_manager.get(idx).ok_or(ReadError::ClosedFd)?;
-                let mut ring = pair.master_to_slave.lock();
-                if ring.is_empty() {
-                    if pair
-                        .master_open_count
-                        .load(core::sync::atomic::Ordering::Acquire)
-                        == 0
-                    {
-                        return Ok(0); // EOF — master closed
+                    let n = core::cmp::min(buf.len(), ring.len());
+                    for (i, byte) in ring.drain(..n).enumerate() {
+                        buf[i] = byte;
                     }
-                    return Err(ReadError::WouldBlock);
+                    return Ok(n);
                 }
-                let n = core::cmp::min(buf.len(), ring.len());
-                for (i, byte) in ring.drain(..n).enumerate() {
-                    buf[i] = byte;
+                &Device::PtySlave(idx) => {
+                    // Slave reads what the master has written.
+                    // Returns WouldBlock (EAGAIN) when no data is available;
+                    // the shim layer handles blocking retry with interruptibility.
+                    let pair = self.pty_manager.get(idx).ok_or(ReadError::ClosedFd)?;
+                    let mut ring = pair.master_to_slave.lock();
+                    if ring.is_empty() {
+                        if pair
+                            .master_open_count
+                            .load(core::sync::atomic::Ordering::Acquire)
+                            == 0
+                        {
+                            return Ok(0); // EOF — master closed
+                        }
+                        return Err(ReadError::WouldBlock);
+                    }
+                    let n = core::cmp::min(buf.len(), ring.len());
+                    for (i, byte) in ring.drain(..n).enumerate() {
+                        buf[i] = byte;
+                    }
+                    return Ok(n);
                 }
-                return Ok(n);
             }
-        }
+        };
         // Stdin is a stream device — offsets are meaningless. Ignore any
         // explicit offset (the layered FS may supply one for concurrency safety).
-        match self.litebox.x.platform.read_from_stdin(buf) {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        let read_result = if nonblocking {
+            self.litebox.x.platform.read_from_stdin_nonblocking(buf)
+        } else {
+            self.litebox.x.platform.read_from_stdin(buf)
+        };
+        match read_result {
             Ok(n) => Ok(n),
             Err(StdioReadError::Closed) => Ok(0), // EOF — terminal disconnected
+            Err(StdioReadError::WouldBlock) => Err(ReadError::WouldBlock),
         }
     }
 

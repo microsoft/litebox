@@ -651,6 +651,8 @@ where
 pub enum StdioReadError {
     #[error("input stream has been closed")]
     Closed,
+    #[error("input would block")]
+    WouldBlock,
 }
 
 /// A non-exhaustive list of errors that can be thrown by [`StdioProvider::write_to`].
@@ -789,6 +791,20 @@ pub enum SetTermiosWhen {
 pub trait StdioProvider {
     /// Read from standard input. Returns number of bytes read.
     fn read_from_stdin(&self, buf: &mut [u8]) -> Result<usize, StdioReadError>;
+
+    /// Read from standard input without blocking.
+    ///
+    /// Platforms with exact nonblocking stdin support should override this
+    /// instead of emulating it with a separate readiness probe.
+    fn read_from_stdin_nonblocking(&self, buf: &mut [u8]) -> Result<usize, StdioReadError> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        if !self.poll_stdin_readable() {
+            return Err(StdioReadError::WouldBlock);
+        }
+        self.read_from_stdin(buf)
+    }
 
     /// Write to stdout/stderr. Returns number of bytes written.
     fn write_to(&self, stream: StdioOutStream, buf: &[u8]) -> Result<usize, StdioWriteError>;

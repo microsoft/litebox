@@ -493,9 +493,8 @@ pub fn default_fs(
     )
 }
 
-// Special override so that `GETFL` can return stdio-specific flags
-#[derive(Clone, Copy)]
-pub(crate) struct StdioStatusFlags(litebox::fs::OFlags);
+// Special override so that `GETFL` can return stdio-specific flags.
+pub(crate) use litebox::fs::devices::DeviceStatusFlags as StdioStatusFlags;
 
 /// Status flags for pipes
 #[derive(Clone)]

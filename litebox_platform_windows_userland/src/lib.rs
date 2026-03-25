@@ -585,6 +585,9 @@ pub struct WindowsUserland {
     console_terminal: Mutex<ConsoleTerminalState>,
     /// Atomic flag for cancelling pending `read_from_stdin()` calls.
     stdin_cancelled: core::sync::atomic::AtomicBool,
+    /// Serialize host-stdin consumption so nonblocking reads do not race other
+    /// sandbox threads on the shared Windows stdin handle.
+    stdin_read_serial: Mutex<()>,
     /// WinTUN session for IP packet I/O (None when networking is disabled).
     tun_session: Option<wintun_ffi::WinTunSession>,
     /// IPC stream to a network broker (None when IPC networking is disabled).
@@ -1789,6 +1792,7 @@ impl WindowsUserland {
             prefer_redzone_syscall_entry: core::sync::atomic::AtomicBool::new(false),
             console_terminal: Mutex::new(ConsoleTerminalState::default()),
             stdin_cancelled: core::sync::atomic::AtomicBool::new(false),
+            stdin_read_serial: Mutex::new(()),
             tun_session,
             ipc_stream: std::sync::OnceLock::new(),
             ipc_dead: core::sync::atomic::AtomicBool::new(false),
@@ -4567,15 +4571,16 @@ fn console_has_key_data(handle: windows_sys::Win32::Foundation::HANDLE) -> bool 
     }
 
     // Peek up to 32 events without removing them.
-    let mut buf: [windows_sys::Win32::System::Console::INPUT_RECORD; 32] =
-        unsafe { core::mem::zeroed() };
+    let mut buf: alloc::vec::Vec<windows_sys::Win32::System::Console::INPUT_RECORD> =
+        core::iter::repeat_with(|| unsafe { core::mem::zeroed() })
+            .take(events_available as usize)
+            .collect();
     let mut events_read: u32 = 0;
-    let peek_count = core::cmp::min(events_available, 32);
     let ok = unsafe {
         windows_sys::Win32::System::Console::PeekConsoleInputW(
             handle,
             buf.as_mut_ptr(),
-            peek_count,
+            events_available,
             &mut events_read,
         )
     };
@@ -4596,6 +4601,112 @@ fn console_has_key_data(handle: windows_sys::Win32::Foundation::HANDLE) -> bool 
         }
     }
     false
+}
+
+/// Check whether a nonblocking console read can complete immediately.
+///
+/// In raw mode, any key-down character event is sufficient. In line-input
+/// mode, `ReadFile` does not complete until a full line is available, so we
+/// require an end-of-line/EOF character in the queued key events.
+fn console_nonblocking_read_ready(handle: windows_sys::Win32::Foundation::HANDLE) -> bool {
+    let mut mode: u32 = 0;
+    let ok = unsafe { windows_sys::Win32::System::Console::GetConsoleMode(handle, &mut mode) };
+    if ok == 0 {
+        return false;
+    }
+    let line_input_enabled = mode & windows_sys::Win32::System::Console::ENABLE_LINE_INPUT != 0;
+
+    let mut events_available: u32 = 0;
+    let ok = unsafe {
+        windows_sys::Win32::System::Console::GetNumberOfConsoleInputEvents(
+            handle,
+            &mut events_available,
+        )
+    };
+    if ok == 0 || events_available == 0 {
+        return false;
+    }
+
+    let mut buf: alloc::vec::Vec<windows_sys::Win32::System::Console::INPUT_RECORD> =
+        core::iter::repeat_with(|| unsafe { core::mem::zeroed() })
+            .take(events_available as usize)
+            .collect();
+    let mut events_read: u32 = 0;
+    let ok = unsafe {
+        windows_sys::Win32::System::Console::PeekConsoleInputW(
+            handle,
+            buf.as_mut_ptr(),
+            events_available,
+            &mut events_read,
+        )
+    };
+    if ok == 0 {
+        return false;
+    }
+
+    for record in &buf[..events_read as usize] {
+        if u32::from(record.EventType) != windows_sys::Win32::System::Console::KEY_EVENT {
+            continue;
+        }
+        let key = unsafe { record.Event.KeyEvent };
+        if key.bKeyDown == 0 {
+            continue;
+        }
+        let ch = unsafe { key.uChar.UnicodeChar };
+        if ch == 0 {
+            continue;
+        }
+        if !line_input_enabled {
+            return true;
+        }
+        if matches!(ch, 0x000d | 0x000a | 0x001a) {
+            return true;
+        }
+    }
+
+    false
+}
+
+#[derive(Clone, Copy)]
+enum NonConsoleStdinReadiness {
+    Ready,
+    WouldBlock,
+}
+
+fn nonconsole_stdin_read_ready(
+    handle: windows_sys::Win32::Foundation::HANDLE,
+) -> NonConsoleStdinReadiness {
+    use windows_sys::Win32::Storage::FileSystem;
+
+    match unsafe { FileSystem::GetFileType(handle) } {
+        FileSystem::FILE_TYPE_DISK => NonConsoleStdinReadiness::Ready,
+        FileSystem::FILE_TYPE_PIPE => {
+            let mut available: u32 = 0;
+            let ok = unsafe {
+                windows_sys::Win32::System::Pipes::PeekNamedPipe(
+                    handle,
+                    core::ptr::null_mut(),
+                    0,
+                    core::ptr::null_mut(),
+                    &mut available,
+                    core::ptr::null_mut(),
+                )
+            };
+            if ok != 0 {
+                return if available == 0 {
+                    NonConsoleStdinReadiness::WouldBlock
+                } else {
+                    NonConsoleStdinReadiness::Ready
+                };
+            }
+            match unsafe { GetLastError() } {
+                Win32_Foundation::ERROR_BROKEN_PIPE
+                | Win32_Foundation::ERROR_PIPE_NOT_CONNECTED => NonConsoleStdinReadiness::Ready,
+                _ => NonConsoleStdinReadiness::WouldBlock,
+            }
+        }
+        _ => NonConsoleStdinReadiness::WouldBlock,
+    }
 }
 
 /// Drain non-key (mouse, focus, resize) events from the console input buffer
@@ -4773,6 +4884,10 @@ fn open_conout() -> Option<windows_sys::Win32::Foundation::HANDLE> {
 
 impl litebox::platform::StdioProvider for WindowsUserland {
     fn read_from_stdin(&self, buf: &mut [u8]) -> Result<usize, litebox::platform::StdioReadError> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        let _stdin_read = self.stdin_read_serial.lock().unwrap();
         let stdin_handle = unsafe {
             windows_sys::Win32::System::Console::GetStdHandle(
                 windows_sys::Win32::System::Console::STD_INPUT_HANDLE,
@@ -4821,6 +4936,71 @@ impl litebox::platform::StdioProvider for WindowsUserland {
                 }
             });
         }
+    }
+
+    fn read_from_stdin_nonblocking(
+        &self,
+        buf: &mut [u8],
+    ) -> Result<usize, litebox::platform::StdioReadError> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        if self
+            .stdin_cancelled
+            .load(core::sync::atomic::Ordering::Acquire)
+        {
+            return Err(litebox::platform::StdioReadError::Closed);
+        }
+        let _stdin_read = match self.stdin_read_serial.try_lock() {
+            Ok(guard) => guard,
+            Err(std::sync::TryLockError::WouldBlock) => {
+                return Err(litebox::platform::StdioReadError::WouldBlock);
+            }
+            Err(std::sync::TryLockError::Poisoned(err)) => err.into_inner(),
+        };
+
+        if self
+            .stdin_cancelled
+            .load(core::sync::atomic::Ordering::Acquire)
+        {
+            return Err(litebox::platform::StdioReadError::Closed);
+        }
+
+        let stdin_handle = unsafe {
+            windows_sys::Win32::System::Console::GetStdHandle(
+                windows_sys::Win32::System::Console::STD_INPUT_HANDLE,
+            )
+        };
+        if stdin_handle == windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE {
+            return Err(litebox::platform::StdioReadError::Closed);
+        }
+
+        if is_console_handle(stdin_handle) {
+            if !console_nonblocking_read_ready(stdin_handle) {
+                drain_non_key_console_events(stdin_handle);
+                if !console_nonblocking_read_ready(stdin_handle) {
+                    return Err(litebox::platform::StdioReadError::WouldBlock);
+                }
+            }
+        } else {
+            if matches!(
+                nonconsole_stdin_read_ready(stdin_handle),
+                NonConsoleStdinReadiness::WouldBlock
+            ) {
+                return Err(litebox::platform::StdioReadError::WouldBlock);
+            }
+        }
+
+        use std::io::Read as _;
+        std::io::stdin().read(buf).map_err(|err| {
+            if err.kind() == std::io::ErrorKind::BrokenPipe {
+                litebox::platform::StdioReadError::Closed
+            } else if err.kind() == std::io::ErrorKind::WouldBlock {
+                litebox::platform::StdioReadError::WouldBlock
+            } else {
+                panic!("unhandled error {err}")
+            }
+        })
     }
 
     fn write_to(
@@ -5027,14 +5207,14 @@ impl litebox::platform::StdioProvider for WindowsUserland {
         }
 
         if is_console_handle(stdin_handle) {
-            // For console handles, check for actual keyboard character data.
-            // WaitForSingleObject alone would report readable for mouse/focus
-            // events that stdin().read() cannot consume.
-            console_has_key_data(stdin_handle)
+            // For console handles, only report readability when a console read
+            // can complete immediately in the current line/raw mode.
+            console_nonblocking_read_ready(stdin_handle)
         } else {
-            // For pipe/file handles, WaitForSingleObject is reliable.
-            let result = unsafe { Win32_Threading::WaitForSingleObject(stdin_handle, 0) };
-            result == Win32_Foundation::WAIT_OBJECT_0
+            matches!(
+                nonconsole_stdin_read_ready(stdin_handle),
+                NonConsoleStdinReadiness::Ready
+            )
         }
     }
 

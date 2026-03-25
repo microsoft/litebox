@@ -153,6 +153,9 @@ pub struct LinuxUserland {
     partitions: std::sync::Mutex<PartitionState>,
     /// When set, pending `read_from_stdin()` calls return EOF instead of blocking.
     stdin_cancelled: std::sync::atomic::AtomicBool,
+    /// Serialize host-stdin consumption so nonblocking reads cannot lose a
+    /// readiness race to another sandbox thread.
+    stdin_read_serial: Mutex<()>,
     /// Synthetic terminal replies injected by the platform emulation layer.
     stdin_injected: Mutex<VecDeque<u8>>,
     /// Pending terminal escape-sequence fragments split across stdout/stderr writes.
@@ -692,6 +695,7 @@ impl LinuxUserland {
             #[cfg(target_arch = "x86_64")]
             partitions: std::sync::Mutex::new(PartitionState::new()),
             stdin_cancelled: std::sync::atomic::AtomicBool::new(false),
+            stdin_read_serial: Mutex::new(()),
             stdin_injected: Mutex::new(VecDeque::new()),
             terminal_osc_pending: Mutex::new(TerminalOscPending::default()),
             worker_spawn_flags: std::sync::RwLock::new(Vec::new()),
@@ -3277,6 +3281,20 @@ fn check_ioctl_result(ret: libc::c_long) -> Result<(), litebox::platform::StdioI
 
 impl litebox::platform::StdioProvider for LinuxUserland {
     fn read_from_stdin(&self, buf: &mut [u8]) -> Result<usize, litebox::platform::StdioReadError> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        if let Some(len) = self.drain_injected_stdin(buf) {
+            return Ok(len);
+        }
+
+        let _stdin_read = self.stdin_read_serial.lock().unwrap();
+        if self
+            .stdin_cancelled
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            return Err(litebox::platform::StdioReadError::Closed);
+        }
         if let Some(len) = self.drain_injected_stdin(buf) {
             return Ok(len);
         }
@@ -3329,7 +3347,8 @@ impl litebox::platform::StdioProvider for LinuxUserland {
                 continue;
             }
 
-            if pfd.revents & (libc::POLLHUP | libc::POLLERR) != 0 && pfd.revents & libc::POLLIN == 0
+            if pfd.revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0
+                && pfd.revents & libc::POLLIN == 0
             {
                 return Err(litebox::platform::StdioReadError::Closed);
             }
@@ -3344,13 +3363,108 @@ impl litebox::platform::StdioProvider for LinuxUserland {
                         syscall_intercept::SYSCALL_ARG_MAGIC,
                     )
                 };
-                return result.map_err(|err| match err {
-                    syscalls::Errno::EPIPE | syscalls::Errno::EIO | syscalls::Errno::EBADF => {
-                        litebox::platform::StdioReadError::Closed
+                match result {
+                    Ok(n) => return Ok(n),
+                    Err(syscalls::Errno::EINTR) => continue,
+                    Err(syscalls::Errno::EPIPE | syscalls::Errno::EIO | syscalls::Errno::EBADF) => {
+                        return Err(litebox::platform::StdioReadError::Closed);
                     }
-                    _ => panic!("unhandled error {err}"),
-                });
+                    Err(err) => panic!("unhandled error {err}"),
+                }
             }
+
+            return Err(litebox::platform::StdioReadError::Closed);
+        }
+    }
+
+    fn read_from_stdin_nonblocking(
+        &self,
+        buf: &mut [u8],
+    ) -> Result<usize, litebox::platform::StdioReadError> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        if self
+            .stdin_cancelled
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            return Err(litebox::platform::StdioReadError::Closed);
+        }
+
+        if let Some(len) = self.drain_injected_stdin(buf) {
+            return Ok(len);
+        }
+
+        let _stdin_read = match self.stdin_read_serial.try_lock() {
+            Ok(guard) => guard,
+            Err(std::sync::TryLockError::WouldBlock) => {
+                if let Some(len) = self.drain_injected_stdin(buf) {
+                    return Ok(len);
+                }
+                return Err(litebox::platform::StdioReadError::WouldBlock);
+            }
+            Err(std::sync::TryLockError::Poisoned(err)) => err.into_inner(),
+        };
+        if self
+            .stdin_cancelled
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            return Err(litebox::platform::StdioReadError::Closed);
+        }
+        if let Some(len) = self.drain_injected_stdin(buf) {
+            return Ok(len);
+        }
+
+        loop {
+            let mut pfd = libc::pollfd {
+                fd: litebox_common_linux::STDIN_FILENO,
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            // SAFETY: poll with timeout=0 is a non-blocking readiness probe.
+            let ret = unsafe { libc::poll(core::ptr::from_mut(&mut pfd), 1, 0) };
+            if ret < 0 {
+                let errno = unsafe { *libc::__errno_location() };
+                if errno == libc::EINTR {
+                    continue;
+                }
+                return Err(litebox::platform::StdioReadError::Closed);
+            }
+
+            if ret == 0 {
+                return Err(litebox::platform::StdioReadError::WouldBlock);
+            }
+
+            if pfd.revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0
+                && pfd.revents & libc::POLLIN == 0
+            {
+                return Err(litebox::platform::StdioReadError::Closed);
+            }
+
+            if pfd.revents & libc::POLLIN != 0 {
+                let result = unsafe {
+                    syscalls::syscall4(
+                        syscalls::Sysno::read,
+                        usize::try_from(litebox_common_linux::STDIN_FILENO).unwrap(),
+                        buf.as_ptr() as usize,
+                        buf.len(),
+                        syscall_intercept::SYSCALL_ARG_MAGIC,
+                    )
+                };
+                match result {
+                    Ok(n) => return Ok(n),
+                    Err(syscalls::Errno::EAGAIN) => {
+                        return Err(litebox::platform::StdioReadError::WouldBlock);
+                    }
+                    Err(syscalls::Errno::EINTR) => continue,
+                    Err(syscalls::Errno::EPIPE | syscalls::Errno::EIO | syscalls::Errno::EBADF) => {
+                        return Err(litebox::platform::StdioReadError::Closed);
+                    }
+                    Err(err) => panic!("unhandled error {err}"),
+                }
+            }
+
+            return Err(litebox::platform::StdioReadError::Closed);
         }
     }
 
@@ -4376,7 +4490,7 @@ mod tests {
     use core::sync::atomic::AtomicU32;
     use std::thread::sleep;
 
-    use litebox::platform::RawMutex;
+    use litebox::platform::{RawMutex, StdioProvider as _};
 
     use crate::{LinuxUserland, filter_terminal_osc_queries};
     use litebox::platform::PageManagementProvider;
@@ -4468,6 +4582,19 @@ mod tests {
         assert!(pending.is_empty());
         assert!(second.injected_stdin.starts_with(b"\x1b]4;15;rgb:"));
         assert!(second.injected_stdin.ends_with(b"\x1b\\"));
+    }
+
+    #[test]
+    fn injected_stdin_is_readable_without_blocking() {
+        let platform = LinuxUserland::new(None);
+        platform.inject_stdin_reply(b"ready");
+
+        let mut buf = [0u8; 16];
+        let read = platform
+            .read_from_stdin_nonblocking(&mut buf)
+            .expect("injected stdin should be readable immediately");
+        assert_eq!(read, 5);
+        assert_eq!(&buf[..read], b"ready");
     }
 
     #[test]

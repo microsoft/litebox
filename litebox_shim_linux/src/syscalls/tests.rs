@@ -131,6 +131,16 @@ fn test_fcntl() {
         task.sys_fcntl(timerfd, FcntlArg::GETFL).unwrap(),
         (OFlags::RDWR | OFlags::NONBLOCK).bits()
     );
+
+    let stdin = task
+        .sys_open(
+            "/dev/stdin",
+            OFlags::RDONLY | OFlags::NONBLOCK | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .expect("Failed to open non-blocking stdin");
+    let stdin = i32::try_from(stdin).unwrap();
+    check(stdin, OFlags::RDONLY | OFlags::NONBLOCK, OFlags::RDONLY);
 }
 
 #[test]

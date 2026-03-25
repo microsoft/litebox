@@ -953,11 +953,20 @@ impl<FS: ShimFS> Task<FS> {
                         .fs
                         .read(fd, &mut buf.borrow_mut(), offset)
                         .map_err(Errno::from);
+                    let nonblocking = self
+                        .global
+                        .litebox
+                        .descriptor_table()
+                        .with_metadata(fd, |crate::StdioStatusFlags(flags)| {
+                            flags.contains(OFlags::NONBLOCK)
+                        })
+                        .unwrap_or(false);
                     // If the read returned EAGAIN (no data), check whether
                     // this fd is a pollable device that wants blocking reads
                     // (e.g. PTY slave). Non-blocking pollables (PTY master)
                     // return EAGAIN immediately for epoll-driven callers.
                     if let Err(Errno::EAGAIN) = result
+                        && !nonblocking
                         && let Some(pollable) = files.fs.get_io_pollable(fd)
                         && pollable.should_block_read()
                     {

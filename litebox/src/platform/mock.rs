@@ -298,6 +298,9 @@ impl RawPointerProvider for MockPlatform {
 
 impl StdioProvider for MockPlatform {
     fn read_from_stdin(&self, buf: &mut [u8]) -> Result<usize, StdioReadError> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
         let Some(front) = self.stdin_queue.write().unwrap().pop_front() else {
             return Err(StdioReadError::Closed);
         };
@@ -326,6 +329,10 @@ impl StdioProvider for MockPlatform {
     fn is_a_tty(&self, _stream: StdioStream) -> bool {
         false
     }
+
+    fn poll_stdin_readable(&self) -> bool {
+        self.stdin_queue.read().unwrap().front().is_some()
+    }
 }
 
 impl CrngProvider for MockPlatform {
@@ -338,6 +345,29 @@ impl CrngProvider for MockPlatform {
             buf[off..off + max].copy_from_slice(&bytes.to_ne_bytes()[..max]);
             off += max;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{MockPlatform, StdioProvider};
+
+    #[test]
+    fn nonblocking_stdin_reads_queued_input() {
+        let platform = MockPlatform::new();
+        platform
+            .stdin_queue
+            .write()
+            .unwrap()
+            .push_back(b"ready".to_vec());
+
+        let mut buf = [0u8; 8];
+        let read = platform
+            .read_from_stdin_nonblocking(&mut buf)
+            .expect("queued stdin should not block");
+
+        assert_eq!(read, 5);
+        assert_eq!(&buf[..read], b"ready");
     }
 }
 
