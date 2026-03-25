@@ -1267,8 +1267,10 @@ impl<'a, FS: ShimFS> ElfLoader<'a, FS> {
         };
         let mut stack = UserStack::new(sp, super::DEFAULT_STACK_SIZE)
             .ok_or(ElfLoaderError::InvalidStackAddr)?;
+        let mut at_random = [0u8; 16];
+        <_ as litebox::platform::CrngProvider>::fill_bytes_crng(global.platform, &mut at_random);
         stack
-            .init(argv, envp, aux, exec_filename)
+            .init(argv, envp, aux, exec_filename, at_random)
             .ok_or(ElfLoaderError::InvalidStackAddr)?;
 
         Ok(ElfLoadInfo {

@@ -167,6 +167,7 @@ impl UserStack {
         env: Vec<CString>,
         mut aux: BTreeMap<AuxKey, usize>,
         exec_filename: Option<&CString>,
+        at_random: [u8; 16],
     ) -> Option<()> {
         // end markers
         self.pos = self.pos.checked_sub(size_of::<usize>())?;
@@ -199,11 +200,7 @@ impl UserStack {
             aux.insert(AuxKey::AT_PLATFORM, self.stack_top.as_usize() + self.pos);
         }
 
-        // TODO: generate a random value
-        self.push_bytes(&[
-            0xDE, 0xAD, 0xBE, 0xEF, 0xDE, 0xAD, 0xBE, 0xEF, 0xDE, 0xAD, 0xBE, 0xEF, 0xDE, 0xAD,
-            0xBE, 0xEF,
-        ])?;
+        self.push_bytes(&at_random)?;
         aux.insert(AuxKey::AT_RANDOM, self.stack_top.as_usize() + self.pos);
 
         let align_down = |pos: usize, alignment: usize| -> usize {
