@@ -20,6 +20,8 @@ use crate::event::{
 };
 use crate::platform::RawMutex as RawMutexTrait;
 use crate::sync::{Mutex, RawSyncPrimitivesProvider, RwLock};
+use zerocopy::byteorder::{I32, LE, U32};
+use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 // ---------------------------------------------------------------------------
 // Identity types
@@ -34,6 +36,11 @@ pub struct ProcessId(pub u32);
 impl ProcessId {
     /// The initial guest process.
     pub const INIT: Self = Self(1);
+
+    /// Creates a process ID if it satisfies LiteBox's allocated-ID invariant.
+    pub const fn new(raw: u32) -> Option<Self> {
+        if raw == 0 { None } else { Some(Self(raw)) }
+    }
 
     /// Returns the raw numeric value.
     pub fn as_u32(self) -> u32 {
@@ -112,7 +119,7 @@ pub struct ProcessContext {
 /// Information about a child process exit, returned by
 /// [`ProcessRegistry::exit_process`] so the caller can deliver the exit
 /// signal (typically `SIGCHLD`) to the parent.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ExitNotification {
     /// The parent process that should receive the signal.
     pub parent_pid: ProcessId,
@@ -122,6 +129,63 @@ pub struct ExitNotification {
     pub child_pid: ProcessId,
     /// The child's exit status.
     pub exit_status: i32,
+}
+
+/// Fixed-endian wire encoding for [`ExitNotification`] transport between hosts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, FromBytes, Immutable, IntoBytes, KnownLayout)]
+#[repr(C)]
+pub struct ExitNotificationWire {
+    parent_pid: U32<LE>,
+    exit_signal: I32<LE>,
+    child_pid: U32<LE>,
+    exit_status: I32<LE>,
+}
+
+/// Error returned when converting a child-exit notification to or from wire format.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExitNotificationWireError {
+    InvalidParentPid(u32),
+    InvalidChildPid(u32),
+}
+
+impl TryFrom<ExitNotification> for ExitNotificationWire {
+    type Error = ExitNotificationWireError;
+
+    fn try_from(notification: ExitNotification) -> Result<Self, Self::Error> {
+        ProcessId::new(notification.parent_pid.as_u32()).ok_or(
+            ExitNotificationWireError::InvalidParentPid(notification.parent_pid.as_u32()),
+        )?;
+        ProcessId::new(notification.child_pid.as_u32()).ok_or(
+            ExitNotificationWireError::InvalidChildPid(notification.child_pid.as_u32()),
+        )?;
+
+        Ok(Self {
+            parent_pid: U32::new(notification.parent_pid.as_u32()),
+            exit_signal: I32::new(notification.exit_signal),
+            child_pid: U32::new(notification.child_pid.as_u32()),
+            exit_status: I32::new(notification.exit_status),
+        })
+    }
+}
+
+impl TryFrom<ExitNotificationWire> for ExitNotification {
+    type Error = ExitNotificationWireError;
+
+    fn try_from(wire: ExitNotificationWire) -> Result<Self, Self::Error> {
+        let parent_pid = ProcessId::new(wire.parent_pid.get()).ok_or(
+            ExitNotificationWireError::InvalidParentPid(wire.parent_pid.get()),
+        )?;
+        let child_pid = ProcessId::new(wire.child_pid.get()).ok_or(
+            ExitNotificationWireError::InvalidChildPid(wire.child_pid.get()),
+        )?;
+
+        Ok(Self {
+            parent_pid,
+            exit_signal: wire.exit_signal.get(),
+            child_pid,
+            exit_status: wire.exit_status.get(),
+        })
+    }
 }
 
 /// The target of a `waitpid`-style call.
@@ -942,6 +1006,81 @@ mod tests {
         // Parent should list child
         let children = registry.get_children(parent).unwrap();
         assert_eq!(children, alloc::vec![child]);
+    }
+
+    #[test]
+    fn test_exit_notification_wire_layout() {
+        let notification = ExitNotification {
+            parent_pid: ProcessId(7),
+            exit_signal: 17,
+            child_pid: ProcessId(9),
+            exit_status: 23,
+        };
+
+        let wire = ExitNotificationWire::try_from(notification).unwrap();
+        let bytes = wire.as_bytes();
+        assert_eq!(bytes.len(), core::mem::size_of::<ExitNotificationWire>());
+        assert_eq!(bytes, &[7, 0, 0, 0, 17, 0, 0, 0, 9, 0, 0, 0, 23, 0, 0, 0]);
+    }
+
+    #[test]
+    fn test_exit_notification_wire_round_trips() {
+        let notification = ExitNotification {
+            parent_pid: ProcessId(7),
+            exit_signal: 17,
+            child_pid: ProcessId(9),
+            exit_status: 23,
+        };
+
+        let wire = ExitNotificationWire::try_from(notification).unwrap();
+        assert_eq!(ExitNotification::try_from(wire), Ok(notification));
+    }
+
+    #[test]
+    fn test_exit_notification_wire_rejects_zero_process_ids() {
+        let invalid_parent = ExitNotificationWire {
+            parent_pid: U32::new(0),
+            exit_signal: I32::new(17),
+            child_pid: U32::new(9),
+            exit_status: I32::new(23),
+        };
+        assert_eq!(
+            ExitNotification::try_from(invalid_parent),
+            Err(ExitNotificationWireError::InvalidParentPid(0))
+        );
+
+        let invalid_child = ExitNotificationWire {
+            parent_pid: U32::new(7),
+            exit_signal: I32::new(17),
+            child_pid: U32::new(0),
+            exit_status: I32::new(23),
+        };
+        assert_eq!(
+            ExitNotification::try_from(invalid_child),
+            Err(ExitNotificationWireError::InvalidChildPid(0))
+        );
+
+        let invalid_parent_notification = ExitNotification {
+            parent_pid: ProcessId(0),
+            exit_signal: 17,
+            child_pid: ProcessId(9),
+            exit_status: 23,
+        };
+        assert_eq!(
+            ExitNotificationWire::try_from(invalid_parent_notification),
+            Err(ExitNotificationWireError::InvalidParentPid(0))
+        );
+
+        let invalid_child_notification = ExitNotification {
+            parent_pid: ProcessId(7),
+            exit_signal: 17,
+            child_pid: ProcessId(0),
+            exit_status: 23,
+        };
+        assert_eq!(
+            ExitNotificationWire::try_from(invalid_child_notification),
+            Err(ExitNotificationWireError::InvalidChildPid(0))
+        );
     }
 
     #[test]
