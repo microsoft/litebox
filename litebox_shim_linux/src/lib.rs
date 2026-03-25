@@ -341,6 +341,11 @@ impl<FS: ShimFS> LinuxShim<FS> {
             egid,
         } = task;
 
+        // A newly loaded process may already have a caller-assigned PID/TID
+        // (for example, when a child resumes in its own host process), so keep
+        // future clone() allocations above that main thread ID.
+        self.global.reserve_thread_id(pid);
+
         let files = syscalls::file::FilesState::new(fs);
         files.set_max_fd(syscalls::process::RLIMIT_NOFILE_CUR - 1);
         let files = Arc::new(files);
@@ -2368,6 +2373,17 @@ struct GlobalState<FS: ShimFS> {
     control_plane: multihost::ControlPlane<Platform>,
 }
 
+impl<FS: ShimFS> GlobalState<FS> {
+    /// Keeps the global thread allocator above a thread ID that was assigned
+    /// outside `next_thread_id` (for example, when bootstrapping a process in a
+    /// new host process).
+    fn reserve_thread_id(&self, tid: i32) {
+        let _ = self
+            .next_thread_id
+            .fetch_max(tid.saturating_add(1), Ordering::Relaxed);
+    }
+}
+
 /// A signal that needs to be delivered to a different process.
 struct CrossProcessSignal {
     /// The target process's internal ID (ProcessId).
@@ -2707,5 +2723,26 @@ mod test_utils {
             let task = self.clone_for_test().unwrap();
             std::thread::spawn(move || f(task))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    extern crate std;
+
+    use super::*;
+
+    #[test]
+    fn reserve_thread_id_advances_allocator_past_bootstrap_tid() {
+        let _ = crate::syscalls::tests::init_platform(None);
+
+        let shim = LinuxShimBuilder::new().build::<DefaultFS>();
+
+        shim.global.reserve_thread_id(8);
+
+        assert_eq!(
+            shim.global.next_thread_id.fetch_add(1, Ordering::Relaxed),
+            9
+        );
     }
 }

@@ -2038,10 +2038,7 @@ impl<FS: ShimFS> Task<FS> {
         // Ensure the global clone-TID counter stays ahead of fork-allocated
         // PIDs so that a subsequent clone() in ANY process never hands out a
         // TID that collides with an existing process's initial thread.
-        let _ = self
-            .global
-            .next_thread_id
-            .fetch_max(child_initial_tid + 1, Ordering::Relaxed);
+        self.global.reserve_thread_id(child_initial_tid);
 
         // 4. Build per-fork-mode state: vfork (shared with parent) vs
         //    independent (kernel CoW).
@@ -3914,7 +3911,7 @@ impl<FS: ShimFS> Task<FS> {
                 remote_exec_image,
                 remote_interp_image,
             );
-            if detached_from_shared_fork && result.is_err() {
+            if detached_from_shared_fork && result.is_err() && !self.is_exiting() {
                 litebox::log_println!(
                     self.global.platform,
                     "execve({:?}): remote worker handoff failed after detach — terminating child",
