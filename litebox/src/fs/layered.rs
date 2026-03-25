@@ -105,6 +105,28 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
         self.lower.file_status(path).map(|stat| stat.file_type)
     }
 
+    /// Whether this path is hidden because it or one of its ancestors is tombstoned.
+    fn is_hidden_by_tombstone(&self, path: &str) -> Result<bool, PathError> {
+        let root = self.root.read();
+        Ok(path.increasing_ancestors()?.any(|ancestor| {
+            root.entries
+                .get(ancestor)
+                .is_some_and(|e| matches!(e.as_ref(), EntryX::Tombstone))
+        }))
+    }
+
+    /// Whether one of this path's strict ancestors is tombstoned.
+    fn has_tombstoned_ancestor(&self, path: &str) -> Result<bool, PathError> {
+        let root = self.root.read();
+        Ok(path.increasing_ancestors()?.any(|ancestor| {
+            ancestor != path
+                && root
+                    .entries
+                    .get(ancestor)
+                    .is_some_and(|e| matches!(e.as_ref(), EntryX::Tombstone))
+        }))
+    }
+
     /// Invalidate `root.entries` cache for a path and all its descendants.
     /// Required after rename to prevent stale cached fds and tombstones
     /// from shadowing the post-rename namespace.
@@ -145,6 +167,9 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
         for dir in path.increasing_ancestors().map_err(PathError::from)? {
             if dir == path {
                 return Ok(());
+            }
+            if self.is_hidden_by_tombstone(dir)? {
+                return Err(PathError::NoSuchFileOrDirectory)?;
             }
             // Check if the ancestor already exists on the upper layer.
             // This handles dirs created on upper in a prior layered mkdir
@@ -667,6 +692,9 @@ impl<
             unimplemented!("{flags:?}")
         }
         let path = self.absolute_path(path)?;
+        if self.has_tombstoned_ancestor(&path)? {
+            return Err(PathError::NoSuchFileOrDirectory)?;
+        }
         if flags.contains(OFlags::CREAT) {
             if flags.contains(OFlags::EXCL) {
                 // O_EXCL with O_CREAT: fail if file already exists anywhere (upper or lower layer)
@@ -1748,6 +1776,9 @@ impl<
 
     fn mkdir(&self, path: impl crate::path::Arg, mode: Mode) -> Result<(), MkdirError> {
         let path = self.absolute_path(path)?;
+        if self.has_tombstoned_ancestor(&path)? {
+            return Err(PathError::NoSuchFileOrDirectory)?;
+        }
         // When LowerLayerWritableFiles, try lower layer first so directories
         // persist on the host. Fall back to upper if lower can't create.
         // But first, check upper for conflicts: if the path already exists,
@@ -1996,6 +2027,9 @@ impl<
         // essentially to ask the compiler to remind us we need to update this when we support
         // inodes and such.
         let path = self.absolute_path(path)?;
+        if self.is_hidden_by_tombstone(&path)? {
+            return Err(PathError::NoSuchFileOrDirectory)?;
+        }
         if let Some(entry) = self.root.read().entries.get(&path) {
             let FileStatus {
                 file_type,
@@ -2188,27 +2222,48 @@ impl<
         let path = self
             .absolute_path(path)
             .map_err(|_| super::errors::ReadLinkError::Io)?;
-        // Check for tombstones — a symlink unlinked from the layered FS
-        // should not be readable via the lower layer.
-        if let Some(entry) = self.root.read().entries.get(&path)
-            && matches!(&**entry, EntryX::Tombstone)
+        if self
+            .is_hidden_by_tombstone(&path)
+            .map_err(super::errors::ReadLinkError::PathError)?
         {
             return Err(super::errors::ReadLinkError::PathError(
                 super::errors::PathError::NoSuchFileOrDirectory,
             ));
         }
-        // Try upper first, fall back to lower
-        match self.upper.read_link(&path) {
-            Ok(target) => Ok(target),
+
+        match self.upper.file_status(&*path) {
+            Ok(_) => {
+                return match self.upper.read_link(&*path) {
+                    Ok(target) => Ok(target),
+                    Err(super::errors::ReadLinkError::NotSupported) => {
+                        Err(super::errors::ReadLinkError::NotASymlink)
+                    }
+                    Err(e) => Err(e),
+                };
+            }
+            Err(super::errors::FileStatusError::PathError(
+                super::errors::PathError::NoSuchFileOrDirectory
+                | super::errors::PathError::MissingComponent,
+            )) => {
+                // fall through to lower
+            }
+            Err(super::errors::FileStatusError::PathError(e)) => {
+                return Err(super::errors::ReadLinkError::PathError(e));
+            }
             Err(
-                super::errors::ReadLinkError::NotSupported
-                | super::errors::ReadLinkError::PathError(
-                    super::errors::PathError::NoSuchFileOrDirectory
-                    | super::errors::PathError::MissingComponent,
-                ),
-            ) => self.lower.read_link(&path),
-            Err(e) => Err(e),
+                super::errors::FileStatusError::Io | super::errors::FileStatusError::SymlinkLoop,
+            ) => {
+                return Err(super::errors::ReadLinkError::Io);
+            }
+            Err(
+                super::errors::FileStatusError::ClosedFd
+                | super::errors::FileStatusError::NotADirectory,
+            ) => {
+                unreachable!()
+            }
         }
+
+        self.lower.read_link(path)
     }
 
     fn open_at(

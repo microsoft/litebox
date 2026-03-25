@@ -1001,6 +1001,141 @@ fn test_nine_p_fd_file_status() {
     fs.close(&fd).unwrap();
 }
 
+#[cfg(unix)]
+#[test]
+fn layered_readlink_respects_upper_shadow_over_lower_symlink() {
+    if std::process::Command::new("diod")
+        .arg("--help")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_err()
+    {
+        std::eprintln!("skipping layered 9P symlink test because diod is unavailable");
+        return;
+    }
+
+    let litebox = crate::LiteBox::new(MockPlatform::new());
+    let server = DiodServer::start();
+    std::os::unix::fs::symlink(
+        "/target-from-lower",
+        server.export_path().join("shadowed-link"),
+    )
+    .expect("create lower symlink");
+
+    let upper = crate::fs::in_mem::FileSystem::new(&litebox);
+    let upper_fd = upper
+        .open(
+            "/shadowed-link",
+            OFlags::CREAT | OFlags::WRONLY,
+            Mode::RUSR | Mode::WUSR,
+        )
+        .expect("create upper shadow file");
+    upper.close(&upper_fd).expect("close upper shadow file");
+
+    let (lower, mut reader) = connect_9p(&litebox, &server);
+    let worker_handle = lower.worker_handle();
+    let msize = lower.msize();
+    let worker = std::thread::spawn(move || {
+        let mut buf = alloc::vec::Vec::with_capacity(msize as usize);
+        while worker_handle.poll_responses(&mut reader, &mut buf) {}
+    });
+
+    let layered = crate::fs::layered::FileSystem::new(
+        &litebox,
+        upper,
+        lower,
+        crate::fs::layered::LayeringSemantics::LowerLayerReadOnly,
+    );
+
+    let status = layered
+        .file_status("/shadowed-link")
+        .expect("layered file_status should see upper file");
+    assert_eq!(status.file_type, crate::fs::FileType::RegularFile);
+    assert!(matches!(
+        layered.read_link("/shadowed-link"),
+        Err(crate::fs::errors::ReadLinkError::NotASymlink)
+    ));
+
+    drop(layered);
+    let _ = worker.join();
+}
+
+#[cfg(unix)]
+#[test]
+fn layered_tombstoned_lower_dir_hides_late_lower_children() {
+    if std::process::Command::new("diod")
+        .arg("--help")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_err()
+    {
+        std::eprintln!("skipping layered 9P tombstone test because diod is unavailable");
+        return;
+    }
+
+    let litebox = crate::LiteBox::new(MockPlatform::new());
+    let server = DiodServer::start();
+    std::fs::create_dir(server.export_path().join("masked-dir")).expect("create lower directory");
+
+    let upper = crate::fs::in_mem::FileSystem::new(&litebox);
+    let (lower, mut reader) = connect_9p(&litebox, &server);
+    let worker_handle = lower.worker_handle();
+    let msize = lower.msize();
+    let worker = std::thread::spawn(move || {
+        let mut buf = alloc::vec::Vec::with_capacity(msize as usize);
+        while worker_handle.poll_responses(&mut reader, &mut buf) {}
+    });
+
+    let layered = crate::fs::layered::FileSystem::new(
+        &litebox,
+        upper,
+        lower,
+        crate::fs::layered::LayeringSemantics::LowerLayerReadOnly,
+    );
+
+    layered
+        .rmdir("/masked-dir")
+        .expect("layered rmdir should tombstone lower dir");
+    std::os::unix::fs::symlink(
+        "/late-target",
+        server.export_path().join("masked-dir").join("late-link"),
+    )
+    .expect("create late lower symlink");
+
+    assert!(matches!(
+        layered.file_status("/masked-dir/late-link"),
+        Err(crate::fs::errors::FileStatusError::PathError(
+            crate::fs::errors::PathError::NoSuchFileOrDirectory,
+        ))
+    ));
+    assert!(matches!(
+        layered.read_link("/masked-dir/late-link"),
+        Err(crate::fs::errors::ReadLinkError::PathError(
+            crate::fs::errors::PathError::NoSuchFileOrDirectory,
+        ))
+    ));
+    assert!(matches!(
+        layered.open("/masked-dir/late-link", OFlags::RDONLY, Mode::empty()),
+        Err(crate::fs::errors::OpenError::PathError(
+            crate::fs::errors::PathError::NoSuchFileOrDirectory,
+        ))
+    ));
+    assert!(matches!(
+        layered.mkdir(
+            "/masked-dir/new-child",
+            Mode::RUSR | Mode::WUSR | Mode::XUSR
+        ),
+        Err(crate::fs::errors::MkdirError::PathError(
+            crate::fs::errors::PathError::NoSuchFileOrDirectory,
+        ))
+    ));
+
+    drop(layered);
+    let _ = worker.join();
+}
+
 #[test]
 fn test_nine_p_large_read_write() {
     let litebox = crate::LiteBox::new(MockPlatform::new());

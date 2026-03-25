@@ -2335,10 +2335,12 @@ impl<FS: ShimFS> Task<FS> {
             Err(e) => {
                 use litebox::fs::errors::ReadLinkError;
                 match e {
-                    ReadLinkError::PathError(_) => Err(Errno::ENOENT),
+                    ReadLinkError::PathError(pe) => Err(Errno::from(pe)),
+                    ReadLinkError::ClosedFd => Err(Errno::EBADF),
+                    ReadLinkError::NotADirectory => Err(Errno::ENOTDIR),
                     // Not a symlink, or FS doesn't support symlinks.
-                    // 9P also returns Io when readlink is called on a non-symlink.
-                    _ => Err(Errno::EINVAL),
+                    ReadLinkError::NotASymlink | ReadLinkError::NotSupported => Err(Errno::EINVAL),
+                    _ => Err(Errno::EIO),
                 }
             }
         }
@@ -2403,6 +2405,24 @@ impl<FS: ShimFS> Task<FS> {
         let min_len = core::cmp::min(buf.len(), bytes.len());
         buf[..min_len].copy_from_slice(&bytes[..min_len]);
         Ok(min_len)
+    }
+}
+
+fn synthetic_symlink_stat(target_len: usize) -> FileStat {
+    FileStat {
+        st_dev: 0,
+        st_ino: 0,
+        st_nlink: 1,
+        st_mode: ((litebox_common_linux::InodeType::SymLink as u32)
+            | (Mode::RWXU | Mode::RWXG | Mode::RWXO).bits())
+        .truncate(),
+        st_uid: 0,
+        st_gid: 0,
+        st_rdev: 0,
+        st_size: target_len,
+        st_blksize: 4096,
+        st_blocks: 0,
+        ..Default::default()
     }
 }
 
@@ -2646,9 +2666,17 @@ impl<FS: ShimFS> Task<FS> {
             let status = self.files.borrow().fs.file_status(exe.as_str())?;
             return Ok(FileStat::from(status));
         }
+        let fs_walks_follow_symlinks = self.files.borrow().fs.walks_follow_symlinks();
+        if !follow_symlink && fs_walks_follow_symlinks {
+            match self.do_readlink(normalized_path.as_str()) {
+                Ok(target) => return Ok(synthetic_symlink_stat(target.len())),
+                Err(Errno::EINVAL) => {}
+                Err(err) => return Err(err),
+            }
+        }
         // Skip client-side symlink resolution when the FS backend follows
         // symlinks during walk (e.g., 9P with a canonicalizing broker).
-        let path = if follow_symlink && !self.files.borrow().fs.walks_follow_symlinks() {
+        let path = if follow_symlink && !fs_walks_follow_symlinks {
             self.canonicalize_path(normalized_path.as_str())?
         } else {
             normalized_path
@@ -2714,6 +2742,17 @@ impl<FS: ShimFS> Task<FS> {
                 let Ok(raw_fd) = usize::try_from(fd) else {
                     return Err(Errno::EBADF);
                 };
+                if !follow_symlinks && files.fs.walks_follow_symlinks() {
+                    let mut target = [0u8; PATH_MAX];
+                    let Ok(fd_i32) = i32::try_from(fd) else {
+                        return Err(Errno::EBADF);
+                    };
+                    match self.sys_readlinkat(fd_i32, path.clone(), &mut target) {
+                        Ok(len) => return Ok(synthetic_symlink_stat(len)),
+                        Err(Errno::EINVAL) => {}
+                        Err(err) => return Err(err),
+                    }
+                }
 
                 files.run_on_raw_fd(
                     raw_fd,
