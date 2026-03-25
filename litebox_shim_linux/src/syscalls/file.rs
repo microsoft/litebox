@@ -1712,6 +1712,91 @@ impl<FS: ShimFS> Task<FS> {
         self.do_close(raw_fd)
     }
 
+    fn set_close_on_exec(&self, raw_fd: usize) -> Result<(), Errno> {
+        let files = self.files.borrow();
+        files.run_on_raw_fd(
+            raw_fd,
+            |fd| {
+                let _old = self
+                    .global
+                    .litebox
+                    .descriptor_table_mut()
+                    .set_fd_metadata(fd, FileDescriptorFlags::FD_CLOEXEC);
+            },
+            |fd| {
+                let _old = self
+                    .global
+                    .litebox
+                    .descriptor_table_mut()
+                    .set_fd_metadata(fd, FileDescriptorFlags::FD_CLOEXEC);
+            },
+            |fd| {
+                let _old = self
+                    .global
+                    .litebox
+                    .descriptor_table_mut()
+                    .set_fd_metadata(fd, FileDescriptorFlags::FD_CLOEXEC);
+            },
+            |fd| {
+                let _old = self
+                    .global
+                    .litebox
+                    .descriptor_table_mut()
+                    .set_fd_metadata(fd, FileDescriptorFlags::FD_CLOEXEC);
+            },
+            |fd| {
+                let _old = self
+                    .global
+                    .litebox
+                    .descriptor_table_mut()
+                    .set_fd_metadata(fd, FileDescriptorFlags::FD_CLOEXEC);
+            },
+            |fd| {
+                let _old = self
+                    .global
+                    .litebox
+                    .descriptor_table_mut()
+                    .set_fd_metadata(fd, FileDescriptorFlags::FD_CLOEXEC);
+            },
+        )
+    }
+
+    pub(crate) fn sys_close_range(
+        &self,
+        first: u32,
+        last: u32,
+        flags: u32,
+    ) -> Result<usize, Errno> {
+        const CLOSE_RANGE_CLOEXEC: u32 = 1 << 2;
+
+        if first > last || flags & !CLOSE_RANGE_CLOEXEC != 0 {
+            return Err(Errno::EINVAL);
+        }
+
+        let first = first as usize;
+        let last = last as usize;
+        let alive_fds: Vec<usize> = {
+            let files = self.files.borrow();
+            files.raw_descriptor_store.read().iter_alive().collect()
+        };
+
+        for raw_fd in alive_fds {
+            if raw_fd < first || raw_fd > last {
+                continue;
+            }
+            if flags == CLOSE_RANGE_CLOEXEC {
+                let _ = self.set_close_on_exec(raw_fd);
+            } else {
+                if let Ok(fd) = i32::try_from(raw_fd) {
+                    self.finalize_elf_patch(fd);
+                }
+                let _ = self.do_close(raw_fd);
+            }
+        }
+
+        Ok(0)
+    }
+
     /// Handle syscall `readv`
     pub fn sys_readv(
         &self,

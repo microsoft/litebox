@@ -31,7 +31,7 @@ use litebox::{
     platform::{RawConstPointer as _, RawMutPointer as _, TimeProvider},
     shim::ContinueOperation,
     sync::futex::FutexManager,
-    utils::{ReinterpretSignedExt as _, ReinterpretUnsignedExt as _},
+    utils::{ReinterpretSignedExt as _, ReinterpretUnsignedExt as _, TruncateExt as _},
 };
 use litebox_common_linux::{SyscallRequest, errno::Errno};
 use litebox_platform_multiplex::Platform;
@@ -550,13 +550,14 @@ impl<FS: ShimFS> Task<FS> {
         Arc<CowState>,
         litebox::platform::page_mgmt::MemoryRegionPermissions,
     )> {
-        let cow = self.top_cow_layer()?;
-        let perms = cow
-            .protected_ranges
-            .iter()
-            .find(|&&(base, len, _)| page_addr >= base && page_addr < base + len)
-            .map(|&(_, _, perms)| perms)?;
-        Some((cow, perms))
+        let ps = self.process_state.borrow();
+        let layers = ps.active_vfork_layers.lock();
+        layers.iter().rev().find_map(|cow| {
+            cow.protected_ranges
+                .iter()
+                .find(|&&(base, len, _)| page_addr >= base && page_addr < base + len)
+                .map(|&(_, _, perms)| (cow.clone(), perms))
+        })
     }
 
     fn snapshot_cow_page_if_needed(&self, cow: &CowState, page_addr: usize, page_present: bool) {
@@ -1466,6 +1467,14 @@ impl<FS: ShimFS> Task<FS> {
         let syscall_number = ctx.orig_eax;
         #[cfg(target_arch = "x86_64")]
         let syscall_number = ctx.orig_rax;
+
+        if syscall_number == ::syscalls::Sysno::close_range as usize {
+            self.record_syscall_entry(ctx, syscall_number);
+            #[cfg(target_arch = "x86")]
+            return self.sys_close_range(ctx.ebx as u32, ctx.ecx as u32, ctx.edx as u32);
+            #[cfg(target_arch = "x86_64")]
+            return self.sys_close_range(ctx.rdi.truncate(), ctx.rsi.truncate(), ctx.rdx.truncate());
+        }
 
         let request = match SyscallRequest::<Platform>::try_from_raw(
             syscall_number,
@@ -2731,6 +2740,9 @@ mod tests {
     extern crate std;
 
     use super::*;
+    use litebox::fs::OFlags;
+    use litebox::platform::page_mgmt::MemoryRegionPermissions;
+    use litebox_common_linux::{FcntlArg, FileDescriptorFlags};
 
     #[test]
     fn reserve_thread_id_advances_allocator_past_bootstrap_tid() {
@@ -2743,6 +2755,71 @@ mod tests {
         assert_eq!(
             shim.global.next_thread_id.fetch_add(1, Ordering::Relaxed),
             9
+        );
+    }
+
+    #[test]
+    fn top_cow_layer_for_page_finds_older_active_layer() {
+        let task = crate::syscalls::tests::init_platform(None);
+        let perms = MemoryRegionPermissions::READ | MemoryRegionPermissions::WRITE;
+        let lower = Arc::new(CowState {
+            protected_ranges: vec![(0x4000, PAGE_SIZE, perms)],
+            dirty_pages: litebox::sync::Mutex::new(BTreeMap::new()),
+        });
+        let upper = Arc::new(CowState {
+            protected_ranges: vec![(0x8000, PAGE_SIZE, perms)],
+            dirty_pages: litebox::sync::Mutex::new(BTreeMap::new()),
+        });
+
+        task.process_state
+            .borrow()
+            .active_vfork_layers
+            .lock()
+            .extend([lower.clone(), upper]);
+
+        let (cow, found_perms) = task
+            .top_cow_layer_for_page(0x4000)
+            .expect("lower active CoW layer should be found");
+
+        assert!(Arc::ptr_eq(&cow, &lower));
+        assert_eq!(found_perms, perms);
+    }
+
+    #[test]
+    fn close_range_syscall_marks_pipe_fds_close_on_exec() {
+        let task = crate::syscalls::tests::init_platform(None);
+        let (read_fd, write_fd) = task
+            .sys_pipe2(OFlags::empty())
+            .expect("pipe2 should succeed");
+        let read_fd = i32::try_from(read_fd).expect("pipe fd should fit in i32");
+        let write_fd = i32::try_from(write_fd).expect("pipe fd should fit in i32");
+
+        let mut ctx = litebox_common_linux::ExecutionContext::default();
+        #[cfg(target_arch = "x86")]
+        {
+            ctx.orig_eax = ::syscalls::Sysno::close_range as usize;
+            ctx.ebx = 3;
+            ctx.ecx = u32::MAX as usize;
+            ctx.edx = 1 << 2;
+        }
+        #[cfg(target_arch = "x86_64")]
+        {
+            ctx.orig_rax = ::syscalls::Sysno::close_range as usize;
+            ctx.rdi = 3;
+            ctx.rsi = u32::MAX as usize;
+            ctx.rdx = 1 << 2;
+        }
+
+        assert_eq!(task.do_syscall(&mut ctx), Ok(0));
+        assert_eq!(
+            task.sys_fcntl(read_fd, FcntlArg::GETFD)
+                .expect("fcntl F_GETFD should succeed"),
+            FileDescriptorFlags::FD_CLOEXEC.bits()
+        );
+        assert_eq!(
+            task.sys_fcntl(write_fd, FcntlArg::GETFD)
+                .expect("fcntl F_GETFD should succeed"),
+            FileDescriptorFlags::FD_CLOEXEC.bits()
         );
     }
 }
