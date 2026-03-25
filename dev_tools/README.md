@@ -152,12 +152,42 @@ run directory, and it refuses a pre-existing broker socket path.
 | `BROKER_SOCK` | tool-specific | Unix socket path for IPC broker helpers; `run_claude_ipc.sh` requires a fresh path under its private run dir |
 | `CLAUDE_FORWARD_ENV` | empty | Extra host env var names to pass through in `run_claude_ipc.sh` |
 
+## Refresh Linux-on-Windows test bins
+
+Rebuild the checked-in Linux ELF fixtures used by
+`litebox_runner_linux_on_windows_userland` from the canonical multiprocess C
+sources on a Linux-capable host with an x86_64-capable GCC toolchain:
+
+```bash
+python dev_tools/build_linux_on_windows_test_bins.py
+```
+
+This compiles the sources from
+`litebox_runner_linux_userland/tests/multiprocess/` into
+`litebox_runner_linux_on_windows_userland/tests/test-bins/`.
+If your Linux/WSL environment is not natively x86_64, pass `--gcc` pointing at
+an x86_64 Linux cross-compiler.
+
+## Rebuild `bash-cat.tar`
+
+Use `litebox_packager` OCI mode to rebuild `bash-cat.tar` from a public Linux
+image that already contains both `/bin/bash` and `/bin/cat`:
+
+```bash
+cargo run -p litebox_packager -- --oci-image docker.io/library/ubuntu:22.04 -o bash-cat.tar
+```
+
+OCI mode packages the extracted image rootfs, so the tar is not limited to just
+those two binaries. It requires x86_64 and network access to pull from a public
+registry.
+
 ## Script Reference
 
 | Script | Description |
 |---|---|
 | `setup_tun_nat.sh` | Creates/destroys TUN device with NAT and DNS forwarding |
 | `create_tar_for_copilot.sh` | Packages Copilot and dependencies into a sandbox tar |
+| `build_linux_on_windows_test_bins.py` | Builds Linux ELF multiprocess fixtures for the Windows-hosted runner tests |
 | `run_copilot.sh` | Launches Copilot inside the litebox sandbox |
 | `run_copilot_ipc.sh` | Launches Copilot inside the litebox sandbox over IPC |
 | `run_claude_ipc.sh` | Launches Claude Code inside the litebox sandbox over IPC |

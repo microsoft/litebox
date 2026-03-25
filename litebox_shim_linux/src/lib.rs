@@ -582,6 +582,30 @@ impl<FS: ShimFS> Task<FS> {
         }
     }
 
+    fn guest_range_is_mapped(&self, addr: usize, len: usize) -> bool {
+        if len == 0 {
+            return true;
+        }
+        let Some(last_addr) = addr.checked_add(len - 1) else {
+            return false;
+        };
+        let start = addr & !(PAGE_SIZE - 1);
+        let end = (last_addr & !(PAGE_SIZE - 1)).saturating_add(PAGE_SIZE);
+        let Some(start) = litebox::mm::linux::NonZeroAddress::<PAGE_SIZE>::new(start) else {
+            return false;
+        };
+        let Some(len) =
+            litebox::mm::linux::NonZeroPageSize::<PAGE_SIZE>::new(end - start.as_usize())
+        else {
+            return false;
+        };
+        self.process_state
+            .borrow()
+            .pm
+            .get_memory_permissions(start, len)
+            .is_some()
+    }
+
     fn active_vfork_layer_count(&self) -> usize {
         let ps = self.process_state.borrow();
         ps.active_vfork_layers.lock().len()

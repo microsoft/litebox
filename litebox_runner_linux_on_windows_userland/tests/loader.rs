@@ -4,9 +4,12 @@
 //! Tests for the Windows userland runner.
 //!
 //! **NOTE:** These tests depend on pre-built Linux ELF binaries in `tests/test-bins/`,
-//! including `litebox_rtld_audit.so`, shared libraries (`libc.so.6`, `ld-linux-x86-64.so.2`),
-//! and test executables. These binaries must be rebuilt on Linux and re-committed whenever
-//! the corresponding source code changes (e.g., `litebox_rtld_audit/rtld_audit.c`).
+//! including shared libraries (`libc.so.6`, `ld-linux-x86-64.so.2`) and test
+//! executables. The canonical multiprocess guest sources live in
+//! `litebox_runner_linux_userland/tests/multiprocess/`; rebuild the corresponding
+//! Windows-runner test bins with `python dev_tools/build_linux_on_windows_test_bins.py`
+//! on Linux (or inside WSL) and re-commit the resulting ELFs whenever the
+//! source fixtures change.
 
 #![cfg(all(target_os = "windows", target_arch = "x86_64"))]
 
@@ -26,6 +29,33 @@ fn run_runner(args: &[&str]) -> std::process::Output {
     command
         .output()
         .expect("Failed to run litebox_runner_linux_on_windows_userland")
+}
+
+fn cargo_binary() -> String {
+    std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string())
+}
+
+fn test_bins_dir() -> std::path::PathBuf {
+    std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/test-bins")
+}
+
+fn run_syscall_rewriter(
+    cargo: &str,
+    src: &std::path::Path,
+    dst: &std::path::Path,
+) -> std::process::Output {
+    std::process::Command::new(cargo)
+        .args([
+            "run",
+            "-p",
+            "litebox_syscall_rewriter",
+            "--",
+            src.to_str().unwrap(),
+            "-o",
+            dst.to_str().unwrap(),
+        ])
+        .output()
+        .expect("Failed to run syscall rewriter")
 }
 
 fn runtime_artifact_dir(name: &str) -> std::path::PathBuf {
@@ -234,8 +264,7 @@ fn run_dynamic_linked_prog_with_rewriter(
     install_files: fn(std::path::PathBuf),
 ) {
     // Use the already compiled executable from the tests folder (same dir as this file)
-    let mut test_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    test_dir.push("tests/test-bins");
+    let test_dir = test_bins_dir();
 
     let prog_name = exec_name;
     let prog_name_hooked = format!("{prog_name}.hooked");
@@ -246,19 +275,8 @@ fn run_dynamic_linked_prog_with_rewriter(
 
     // Rewrite the target ELF executable file
     let _ = std::fs::remove_file(hooked_path.clone());
-    let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
-    let output = std::process::Command::new(&cargo)
-        .args([
-            "run",
-            "-p",
-            "litebox_syscall_rewriter",
-            "--",
-            path.to_str().unwrap(),
-            "-o",
-            hooked_path.to_str().unwrap(),
-        ])
-        .output()
-        .expect("Failed to run syscall rewriter");
+    let cargo = cargo_binary();
+    let output = run_syscall_rewriter(&cargo, &path, &hooked_path);
     assert!(
         output.status.success(),
         "failed to run syscall rewriter {:?}",
@@ -288,18 +306,7 @@ fn run_dynamic_linked_prog_with_rewriter(
             src.to_str().unwrap(),
             dst.to_str().unwrap(),
         );
-        let output = std::process::Command::new(&cargo)
-            .args([
-                "run",
-                "-p",
-                "litebox_syscall_rewriter",
-                "--",
-                src.to_str().unwrap(),
-                "-o",
-                dst.to_str().unwrap(),
-            ])
-            .output()
-            .expect("Failed to run syscall rewriter");
+        let output = run_syscall_rewriter(&cargo, &src, &dst);
         assert!(
             output.status.success(),
             "failed to run syscall rewriter {:?}",
@@ -307,8 +314,7 @@ fn run_dynamic_linked_prog_with_rewriter(
         );
     }
 
-    // Copy libraries that are not needed to be rewritten (`litebox_rtld_audit.so`)
-    // to the tar directory
+    // Copy libraries that are not needed to be rewritten to the tar directory.
     for (file, prefix) in libs_without_rewrite {
         let src = test_dir.join(file);
         let dst_dir = tar_src_path.join(prefix.trim_start_matches('/'));
@@ -387,9 +393,27 @@ fn test_testcase_dynamic_with_rewriter() {
         ("libc.so.6", "/lib/x86_64-linux-gnu"),
         ("ld-linux-x86-64.so.2", "/lib64"),
     ];
-    let libs_without_rewrite = [("litebox_rtld_audit.so", "/lib")];
+    let libs_without_rewrite: [(&str, &str); 0] = [];
 
     // Run
+    run_dynamic_linked_prog_with_rewriter(
+        &libs_to_rewrite,
+        &libs_without_rewrite,
+        exec_name,
+        &[],
+        |_| {},
+    );
+}
+
+#[test]
+fn test_thread_dynamic_with_rewriter() {
+    let exec_name = "hello_thread";
+    let libs_to_rewrite = [
+        ("libc.so.6", "/lib/x86_64-linux-gnu"),
+        ("ld-linux-x86-64.so.2", "/lib64"),
+    ];
+    let libs_without_rewrite: [(&str, &str); 0] = [];
+
     run_dynamic_linked_prog_with_rewriter(
         &libs_to_rewrite,
         &libs_without_rewrite,
