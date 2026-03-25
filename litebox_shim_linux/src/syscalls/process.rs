@@ -3623,6 +3623,8 @@ impl<FS: ShimFS> Task<FS> {
         path: &str,
         argv: alloc::vec::Vec<alloc::ffi::CString>,
         envp: alloc::vec::Vec<alloc::ffi::CString>,
+        guest_exec_image: &[u8],
+        guest_interp_image: Option<(&str, &[u8])>,
     ) -> Result<usize, Errno> {
         #[cfg(feature = "trace_syscalls")]
         litebox::log_println!(
@@ -3633,27 +3635,26 @@ impl<FS: ShimFS> Task<FS> {
         );
 
         let guest_cwd = self.fs.borrow().current_working_directory();
-        // Ensure the load path is absolute so the worker resolves it
-        // correctly regardless of its own host-side CWD.
-        let abs_path = if path.starts_with('/') {
-            alloc::string::String::from(path)
-        } else {
-            let mut abs = guest_cwd.clone();
-            abs.push_str(path);
-            abs
-        };
+        // Resolve the worker load path through the current guest filesystem so
+        // transferred images materialize at their real lower-tree locations
+        // rather than shadowing symlinked parents like /bin or /lib64.
+        let load_path = self.resolve_exe_path(path);
         let host_pid = self
             .global
             .platform
             .spawn_worker_host_for_exec(
-                &abs_path,
+                &load_path,
                 &argv,
                 &envp,
                 &guest_cwd,
                 self.pid,
                 self.ppid,
                 self.credentials.uid,
+                self.credentials.euid,
                 self.credentials.gid,
+                self.credentials.egid,
+                guest_exec_image,
+                guest_interp_image,
             )
             .map_err(|err| {
                 litebox::log_println!(
@@ -3683,10 +3684,16 @@ impl<FS: ShimFS> Task<FS> {
             exit_code,
         );
 
-        // The worker ran the guest binary to completion. Terminate this guest
-        // process with the same exit code so the parent sees the correct
-        // status via wait4/SIGCHLD.
-        self.exit_group(ExitStatus::Exit(exit_code.truncate()));
+        if exit_code > 255 {
+            let signal = litebox_common_linux::signal::Signal::try_from(exit_code - 256)
+                .expect("worker host reported an invalid signal");
+            self.exit_group(ExitStatus::Signal(signal));
+        } else {
+            // The worker ran the guest binary to completion. Terminate this
+            // guest process with the same exit code so the parent sees the
+            // correct status via wait4/SIGCHLD.
+            self.exit_group(ExitStatus::Exit(exit_code.truncate()));
+        }
 
         // exit_group triggers process teardown and SIGCHLD to the parent.
         // The syscall handler loop will notice is_exiting and stop running
@@ -3820,6 +3827,18 @@ impl<FS: ShimFS> Task<FS> {
         } else {
             false
         };
+        let remote_exec_image = if needs_remote {
+            Some(loader.main_file_bytes()?)
+        } else {
+            None
+        };
+        let remote_interp_image = if needs_remote {
+            loader
+                .interp_file_bytes()?
+                .map(|(interp_path, data)| (self.resolve_exe_path(&interp_path), data))
+        } else {
+            None
+        };
 
         // After this point, the old program is torn down and failures must terminate the process.
 
@@ -3841,6 +3860,7 @@ impl<FS: ShimFS> Task<FS> {
         if needs_remote {
             // For shared-fork children (userland), detach from the parent's
             // state before spawning the worker, just like normal exec does.
+            let mut detached_from_shared_fork = false;
             if let Some(fc) = self.fork_context.borrow_mut().take() {
                 // Flush MAP_SHARED writeback data while still using the
                 // parent's ProcessState.
@@ -3879,8 +3899,30 @@ impl<FS: ShimFS> Task<FS> {
 
                 // Signal the parent to resume now that we've detached.
                 fc.vfork_done.signal();
+                detached_from_shared_fork = true;
             }
-            return self.exec_on_remote_host(&path, argv_vec, envp_vec);
+            let Some(remote_exec_image) = remote_exec_image.as_deref() else {
+                unreachable!("needs_remote must capture the main executable bytes");
+            };
+            let remote_interp_image = remote_interp_image
+                .as_ref()
+                .map(|(path, data)| (path.as_str(), data.as_slice()));
+            let result = self.exec_on_remote_host(
+                &path,
+                argv_vec,
+                envp_vec,
+                remote_exec_image,
+                remote_interp_image,
+            );
+            if detached_from_shared_fork && result.is_err() {
+                litebox::log_println!(
+                    self.global.platform,
+                    "execve({:?}): remote worker handoff failed after detach — terminating child",
+                    path,
+                );
+                self.exit_group(ExitStatus::Exit(127_i32.truncate()));
+            }
+            return result;
         }
 
         // If this is a vfork child, detach from the parent's shared state.

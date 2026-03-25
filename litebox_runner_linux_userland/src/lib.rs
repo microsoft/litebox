@@ -127,6 +127,22 @@ pub struct CliArgs {
     )]
     pub worker_exec: bool,
 
+    /// Internal: inherited memfd containing the exact guest executable bytes.
+    #[arg(long = "worker-exec-fd", hide = true, requires = "worker_exec")]
+    pub worker_exec_fd: Option<i32>,
+
+    /// Internal: inherited pipe fd used to report the guest wait status back to the parent host.
+    #[arg(long = "worker-result-fd", hide = true, requires = "worker_exec")]
+    pub worker_result_fd: Option<i32>,
+
+    /// Internal: inherited memfd containing the resolved PT_INTERP image, if any.
+    #[arg(long = "worker-interp-fd", hide = true, requires = "worker_exec")]
+    pub worker_interp_fd: Option<i32>,
+
+    /// Internal: guest path to inject the resolved PT_INTERP image at, if any.
+    #[arg(long = "worker-interp-path", hide = true, requires = "worker_exec")]
+    pub worker_interp_path: Option<String>,
+
     /// Internal: guest PID for worker-exec mode.
     #[arg(long = "guest-pid", hide = true, requires = "worker_exec")]
     pub guest_pid: Option<i32>,
@@ -139,9 +155,17 @@ pub struct CliArgs {
     #[arg(long = "guest-uid", hide = true, requires = "worker_exec")]
     pub guest_uid: Option<u32>,
 
+    /// Internal: guest effective UID for worker-exec mode.
+    #[arg(long = "guest-euid", hide = true, requires = "worker_exec")]
+    pub guest_euid: Option<u32>,
+
     /// Internal: guest GID for worker-exec mode.
     #[arg(long = "guest-gid", hide = true, requires = "worker_exec")]
     pub guest_gid: Option<u32>,
+
+    /// Internal: guest effective GID for worker-exec mode.
+    #[arg(long = "guest-egid", hide = true, requires = "worker_exec")]
+    pub guest_egid: Option<u32>,
 }
 
 /// Backends supported for intercepting syscalls
@@ -202,6 +226,25 @@ fn load_program_path(cli_args: &CliArgs) -> PathBuf {
         PathBuf::from(&cli_args.program_and_arguments[0])
     } else {
         resolve_host_program_path(&cli_args.program_and_arguments[0])
+    }
+}
+
+fn worker_load_program_path(cli_args: &CliArgs) -> PathBuf {
+    let guest_path = if Path::new(&cli_args.program_and_arguments[0]).is_absolute() {
+        PathBuf::from(&cli_args.program_and_arguments[0])
+    } else if let Some(cwd) = cli_args.working_directory.as_deref() {
+        Path::new(cwd).join(&cli_args.program_and_arguments[0])
+    } else {
+        PathBuf::from(&cli_args.program_and_arguments[0])
+    };
+    if cli_args.worker_exec_fd.is_some() || cli_args.program_from_tar {
+        guest_path
+    } else {
+        resolve_host_program_path(
+            guest_path
+                .to_str()
+                .unwrap_or(&cli_args.program_and_arguments[0]),
+        )
     }
 }
 
@@ -522,6 +565,7 @@ fn finish_run<FS: litebox_shim_linux::ShimFS>(
             argv,
             envp,
             None,
+            None,
         )
     } else {
         let initial_file_system = std::sync::Arc::new(fs);
@@ -540,7 +584,7 @@ fn finish_run<FS: litebox_shim_linux::ShimFS>(
             cli_args.working_directory.clone(),
         )?;
 
-        run_program(program, shutdown, net_worker);
+        run_program(program, shutdown, net_worker, None);
     }
 }
 
@@ -585,6 +629,7 @@ fn finish_run_with_nine_p<FS: litebox_shim_linux::ShimFS>(
     argv: Vec<alloc::ffi::CString>,
     envp: Vec<alloc::ffi::CString>,
     task_override: Option<litebox_common_linux::TaskParams>,
+    worker_result_fd: Option<i32>,
 ) -> Result<()> {
     let broker_addr = cli_args.nine_p_broker.as_deref().unwrap();
     let is_tcp = broker_addr.parse::<core::net::SocketAddr>().is_ok();
@@ -631,7 +676,7 @@ fn finish_run_with_nine_p<FS: litebox_shim_linux::ShimFS>(
             cli_args.working_directory.clone(),
         )?;
 
-        run_program(program, shutdown, net_worker);
+        run_program(program, shutdown, net_worker, worker_result_fd);
     }
 
     // TUN mode: connect via TCP through the guest's smoltcp network stack.
@@ -701,7 +746,174 @@ fn finish_run_with_nine_p<FS: litebox_shim_linux::ShimFS>(
         cli_args.working_directory.clone(),
     )?;
 
-    run_program(program, shutdown, net_worker);
+    run_program(program, shutdown, net_worker, worker_result_fd);
+}
+
+#[allow(clippy::similar_names)]
+fn worker_task_params(cli_args: &CliArgs) -> litebox_common_linux::TaskParams {
+    let pid: i32 = cli_args.guest_pid.unwrap_or(1);
+    let ppid: i32 = cli_args.guest_ppid.unwrap_or(0);
+    let uid: u32 = cli_args.guest_uid.unwrap_or(0);
+    let euid: u32 = cli_args.guest_euid.unwrap_or(uid);
+    let gid: u32 = cli_args.guest_gid.unwrap_or(0);
+    let egid: u32 = cli_args.guest_egid.unwrap_or(gid);
+    litebox_common_linux::TaskParams {
+        pid,
+        ppid,
+        uid,
+        euid,
+        gid,
+        egid,
+    }
+}
+
+fn read_worker_exec_image(fd: i32) -> Result<alloc::borrow::Cow<'static, [u8]>> {
+    use std::io::Read as _;
+    use std::os::fd::FromRawFd as _;
+
+    if fd < 0 {
+        anyhow::bail!("worker exec fd must be non-negative, got {fd}");
+    }
+    let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
+    let mut data = Vec::new();
+    file.read_to_end(&mut data)?;
+    Ok(data.into())
+}
+
+fn write_worker_result(wait_status: i32, fd: i32) {
+    use std::io::Write as _;
+    use std::os::fd::FromRawFd as _;
+
+    if fd < 0 {
+        return;
+    }
+    let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
+    let _ = file.write_all(&wait_status.to_le_bytes());
+}
+
+fn set_fd_cloexec(fd: i32) -> Result<()> {
+    if fd < 0 {
+        anyhow::bail!("fd must be non-negative, got {fd}");
+    }
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+    if flags < 0 {
+        anyhow::bail!(
+            "fcntl(F_GETFD) failed for fd {fd}: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+    if unsafe { libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) } < 0 {
+        anyhow::bail!(
+            "fcntl(F_SETFD, FD_CLOEXEC) failed for fd {fd}: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+    Ok(())
+}
+
+fn inject_program_image_into_in_mem(
+    in_mem: &mut litebox::fs::in_mem::FileSystem<Platform>,
+    program_path: &Path,
+    program_data: alloc::borrow::Cow<'static, [u8]>,
+) -> Result<()> {
+    if !program_path.is_absolute() {
+        anyhow::bail!(
+            "worker exec load path must be absolute inside the guest fs: {}",
+            program_path.display()
+        );
+    }
+    let path_str = program_path.to_str().ok_or_else(|| {
+        anyhow!(
+            "worker exec path is not valid UTF-8: {}",
+            program_path.display()
+        )
+    })?;
+    let ancestors: Vec<_> = program_path.ancestors().collect();
+    if ancestors.len() < 2 {
+        anyhow::bail!(
+            "worker exec path has no parent directory: {}",
+            program_path.display()
+        );
+    }
+
+    let dir_mode = Mode::RWXU | Mode::RGRP | Mode::XGRP | Mode::ROTH | Mode::XOTH;
+    let mut inject_error = None;
+    in_mem.with_root_privileges(|fs| {
+        for path in ancestors
+            .iter()
+            .rev()
+            .skip(1)
+            .take(ancestors.len().saturating_sub(2))
+        {
+            let path_str = path.to_str().unwrap_or("/");
+            if let Err(err) = fs.mkdir(path_str, dir_mode)
+                && !matches!(err, litebox::fs::errors::MkdirError::AlreadyExists)
+            {
+                inject_error = Some(anyhow!(
+                    "failed to create worker exec parent directory {}: {err:?}",
+                    path.display()
+                ));
+                return;
+            }
+        }
+
+        let fd = match fs.open(
+            path_str,
+            litebox::fs::OFlags::WRONLY | litebox::fs::OFlags::CREAT,
+            dir_mode,
+        ) {
+            Ok(fd) => fd,
+            Err(err) => {
+                inject_error = Some(anyhow!(
+                    "failed to create worker exec image {}: {err:?}",
+                    program_path.display()
+                ));
+                return;
+            }
+        };
+        fs.initialize_primarily_read_heavy_file(&fd, program_data);
+        if let Err(err) = fs.close(&fd) {
+            inject_error = Some(anyhow!(
+                "failed to close worker exec image {}: {err:?}",
+                program_path.display()
+            ));
+        }
+    });
+    if let Some(err) = inject_error {
+        Err(err)
+    } else {
+        Ok(())
+    }
+}
+
+fn host_signal_should_raise(signal: i32) -> bool {
+    litebox_common_linux::signal::Signal::try_from(signal)
+        .map(|signal| {
+            matches!(
+                signal.default_disposition(),
+                litebox_common_linux::signal::SignalDisposition::Terminate
+                    | litebox_common_linux::signal::SignalDisposition::Core
+            )
+        })
+        .unwrap_or(false)
+}
+
+fn terminate_host_with_guest_wait_status(wait_status: i32) -> ! {
+    if wait_status > 255 {
+        let signal = wait_status - 256;
+        unsafe {
+            if host_signal_should_raise(signal) {
+                let mut mask = std::mem::zeroed::<libc::sigset_t>();
+                libc::sigemptyset(&raw mut mask);
+                libc::sigaddset(&raw mut mask, signal);
+                libc::pthread_sigmask(libc::SIG_UNBLOCK, &raw const mask, std::ptr::null_mut());
+                libc::signal(signal, libc::SIG_DFL);
+                libc::raise(signal);
+            }
+            libc::_exit(128 + signal);
+        }
+    }
+    std::process::exit(wait_status)
 }
 
 /// Run as a worker host process for a non-PIE child exec.
@@ -719,16 +931,24 @@ fn run_worker_exec(cli_args: CliArgs) -> Result<()> {
         anyhow::bail!("--worker-exec requires at least a load path");
     }
     let load_path = &cli_args.program_and_arguments[0];
+    let guest_load_path = worker_load_program_path(&cli_args);
+    let guest_load_path_str = guest_load_path
+        .to_str()
+        .ok_or_else(|| anyhow!("Could not convert worker guest load path to a string"))?;
     let guest_argv: Vec<std::ffi::CString> = cli_args.program_and_arguments[1..]
         .iter()
         .map(|x| std::ffi::CString::new(x.bytes().collect::<Vec<u8>>()).unwrap())
         .collect();
-
-    // Read guest identity from CLI args passed by the parent.
-    let guest_pid: i32 = cli_args.guest_pid.unwrap_or(1);
-    let guest_ppid: i32 = cli_args.guest_ppid.unwrap_or(0);
-    let guest_uid: u32 = cli_args.guest_uid.unwrap_or(0);
-    let guest_gid: u32 = cli_args.guest_gid.unwrap_or(0);
+    for fd in [
+        cli_args.worker_exec_fd,
+        cli_args.worker_result_fd,
+        cli_args.worker_interp_fd,
+    ]
+    .into_iter()
+    .flatten()
+    {
+        set_fd_cloexec(fd)?;
+    }
 
     // Set up the platform with the same network transport as the parent.
     let platform = if cli_args.tun_device_name.is_some() {
@@ -744,6 +964,21 @@ fn run_worker_exec(cli_args: CliArgs) -> Result<()> {
 
     let shim_builder = litebox_shim_linux::LinuxShimBuilder::new();
     let litebox = shim_builder.litebox();
+    let transferred_exec_image = if let Some(fd) = cli_args.worker_exec_fd {
+        Some(read_worker_exec_image(fd)?)
+    } else {
+        None
+    };
+    let transferred_interp_image = match (
+        cli_args.worker_interp_path.as_deref(),
+        cli_args.worker_interp_fd,
+    ) {
+        (Some(path), Some(fd)) => Some((path, read_worker_exec_image(fd)?)),
+        (None, None) => None,
+        _ => anyhow::bail!(
+            "worker interpreter handoff requires both --worker-interp-path and --worker-interp-fd"
+        ),
+    };
 
     // Load tar data if --initial-files was forwarded.
     let tar_data: &'static [u8] = if let Some(tar_file) = cli_args.initial_files.as_ref() {
@@ -758,9 +993,11 @@ fn run_worker_exec(cli_args: CliArgs) -> Result<()> {
         let _ = fs.mkdir("/tmp", mode);
     });
 
-    // If the binary is on the host filesystem and no 9P broker is active,
-    // inject it into the in-memory FS.
-    if cli_args.nine_p_broker.is_none() && !cli_args.program_from_tar {
+    if let Some(program_data) = transferred_exec_image {
+        inject_program_image_into_in_mem(&mut in_mem, &guest_load_path, program_data)?;
+    } else if cli_args.nine_p_broker.is_none() && !cli_args.program_from_tar {
+        // If no transferred guest image was provided and the binary is on the
+        // host filesystem, inject it into the in-memory FS.
         let prog = resolve_host_program_path(load_path);
         if prog.exists() {
             let file = mmapped_file(&prog)?;
@@ -795,19 +1032,15 @@ fn run_worker_exec(cli_args: CliArgs) -> Result<()> {
             });
         }
     }
+    if let Some((interp_path, interp_data)) = transferred_interp_image {
+        inject_program_image_into_in_mem(&mut in_mem, Path::new(interp_path), interp_data)?;
+    }
 
     let tar_ro = litebox::fs::tar_ro::FileSystem::new(litebox, tar_data.into());
     let default_fs = litebox_shim_linux::default_fs(litebox, in_mem, tar_ro);
 
     let guest_envp = build_envp(&cli_args);
-    let guest_task = litebox_common_linux::TaskParams {
-        pid: guest_pid,
-        ppid: guest_ppid,
-        uid: guest_uid,
-        euid: guest_uid,
-        gid: guest_gid,
-        egid: guest_gid,
-    };
+    let guest_task = worker_task_params(&cli_args);
 
     // When a 9P broker is active, layer the 9P FS on top.
     if cli_args.nine_p_broker.is_some() {
@@ -816,11 +1049,12 @@ fn run_worker_exec(cli_args: CliArgs) -> Result<()> {
             default_fs,
             &cli_args,
             platform,
-            load_path,
-            load_path,
+            guest_load_path_str,
+            guest_load_path_str,
             guest_argv,
             guest_envp,
             Some(guest_task),
+            cli_args.worker_result_fd,
         )
     } else {
         let initial_file_system = std::sync::Arc::new(default_fs);
@@ -828,10 +1062,7 @@ fn run_worker_exec(cli_args: CliArgs) -> Result<()> {
         let shutdown = std::sync::Arc::new(core::sync::atomic::AtomicBool::new(false));
         let net_worker = start_network_worker(&shim, &shutdown);
 
-        let load_prog = resolve_host_program_path(load_path);
-        let load_prog_path = load_prog
-            .to_str()
-            .ok_or_else(|| anyhow!("Could not convert program path to a string"))?;
+        let load_prog_path = guest_load_path_str;
         let program = shim.load_program_with_exec_filename(
             initial_file_system,
             guest_task,
@@ -842,7 +1073,7 @@ fn run_worker_exec(cli_args: CliArgs) -> Result<()> {
             cli_args.working_directory.clone(),
         )?;
 
-        run_program(program, shutdown, net_worker);
+        run_program(program, shutdown, net_worker, cli_args.worker_result_fd);
     }
 }
 
@@ -853,6 +1084,7 @@ fn run_program<FS: litebox_shim_linux::ShimFS>(
     program: litebox_shim_linux::LoadedProgram<FS>,
     shutdown: std::sync::Arc<core::sync::atomic::AtomicBool>,
     net_worker: Option<std::thread::JoinHandle<()>>,
+    worker_result_fd: Option<i32>,
 ) -> ! {
     #[cfg(feature = "lock_tracing")]
     litebox::sync::start_recording();
@@ -882,8 +1114,11 @@ fn run_program<FS: litebox_shim_linux::ShimFS>(
         shutdown.store(true, core::sync::atomic::Ordering::Relaxed);
         net_worker.join().unwrap();
     }
-    let exit_code = program.process.wait();
-    std::process::exit(exit_code)
+    let wait_status = program.process.wait();
+    if let Some(worker_result_fd) = worker_result_fd {
+        write_worker_result(wait_status, worker_result_fd);
+    }
+    terminate_host_with_guest_wait_status(wait_status)
 }
 
 /// Connect to a network broker via Unix domain socket.
@@ -1423,6 +1658,17 @@ mod tests {
             program_from_tar: false,
             nine_p_broker: None,
             working_directory: None,
+            worker_exec: false,
+            worker_exec_fd: None,
+            worker_result_fd: None,
+            worker_interp_fd: None,
+            worker_interp_path: None,
+            guest_pid: None,
+            guest_ppid: None,
+            guest_uid: None,
+            guest_euid: None,
+            guest_gid: None,
+            guest_egid: None,
         }
     }
 
@@ -1544,5 +1790,59 @@ mod tests {
         assert_eq!(&*data, BUN_BYTES);
         assert_eq!(cow_regions.len(), 1);
         assert_eq!(cow_regions[0].abs_path, PathBuf::from("/tmp/fake-bun"));
+    }
+
+    #[test]
+    fn worker_load_program_path_preserves_guest_path_for_transferred_exec_image() {
+        let mut cli = test_cli_args("/guest/bin/nonpie");
+        cli.worker_exec = true;
+        cli.worker_exec_fd = Some(42);
+
+        assert_eq!(
+            worker_load_program_path(&cli),
+            PathBuf::from("/guest/bin/nonpie")
+        );
+    }
+
+    #[test]
+    fn worker_load_program_path_resolves_relative_guest_path_with_cwd() {
+        let mut cli = test_cli_args("./nonpie");
+        cli.worker_exec = true;
+        cli.worker_exec_fd = Some(42);
+        cli.working_directory = Some("/guest/cwd".to_string());
+
+        assert_eq!(
+            worker_load_program_path(&cli),
+            PathBuf::from("/guest/cwd/./nonpie")
+        );
+    }
+
+    #[test]
+    fn worker_task_params_preserve_effective_ids() {
+        let mut cli = test_cli_args("/guest/bin/nonpie");
+        cli.worker_exec = true;
+        cli.guest_pid = Some(7);
+        cli.guest_ppid = Some(3);
+        cli.guest_uid = Some(1000);
+        cli.guest_euid = Some(1001);
+        cli.guest_gid = Some(2000);
+        cli.guest_egid = Some(2001);
+
+        let task = worker_task_params(&cli);
+        assert_eq!(task.pid, 7);
+        assert_eq!(task.ppid, 3);
+        assert_eq!(task.uid, 1000);
+        assert_eq!(task.euid, 1001);
+        assert_eq!(task.gid, 2000);
+        assert_eq!(task.egid, 2001);
+    }
+
+    #[test]
+    fn terminate_host_with_guest_wait_status_only_raises_terminating_signals() {
+        let segv = litebox_common_linux::signal::Signal::SIGSEGV.as_i32();
+        let stop = litebox_common_linux::signal::Signal::SIGSTOP.as_i32();
+
+        assert!(host_signal_should_raise(segv));
+        assert!(!host_signal_should_raise(stop));
     }
 }

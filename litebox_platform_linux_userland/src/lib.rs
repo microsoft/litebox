@@ -8,7 +8,9 @@
 #![cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "x86")))]
 
 use std::cell::Cell;
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
+use std::ffi::CString;
+use std::io::{Seek as _, Write as _};
 use std::os::fd::{AsRawFd as _, FromRawFd as _};
 use std::path::PathBuf;
 use std::sync::Mutex;
@@ -158,6 +160,11 @@ pub struct LinuxUserland {
     /// Extra CLI flags to forward when spawning worker host processes.
     /// Set by the runner at startup via [`set_worker_spawn_flags`].
     worker_spawn_flags: std::sync::RwLock<Vec<std::ffi::CString>>,
+    /// Serialize worker-host spawns so internal inheritable fds do not leak
+    /// across concurrent worker launches.
+    worker_spawn_serial: Mutex<()>,
+    /// Result pipes for in-flight worker host processes, keyed by host PID.
+    worker_result_fds: std::sync::Mutex<BTreeMap<i32, std::os::fd::OwnedFd>>,
 }
 
 impl core::fmt::Debug for LinuxUserland {
@@ -688,6 +695,8 @@ impl LinuxUserland {
             stdin_injected: Mutex::new(VecDeque::new()),
             terminal_osc_pending: Mutex::new(TerminalOscPending::default()),
             worker_spawn_flags: std::sync::RwLock::new(Vec::new()),
+            worker_spawn_serial: Mutex::new(()),
+            worker_result_fds: std::sync::Mutex::new(BTreeMap::new()),
         };
         Box::leak(Box::new(platform))
     }
@@ -968,9 +977,12 @@ impl LinuxUserland {
         guest_pid: i32,
         guest_ppid: i32,
         guest_uid: u32,
+        guest_euid: u32,
         guest_gid: u32,
+        guest_egid: u32,
+        guest_exec_image: &[u8],
+        guest_interp_image: Option<(&str, &[u8])>,
     ) -> Result<i32, i32> {
-        use std::ffi::CString;
         use std::os::unix::ffi::OsStrExt;
 
         // SAFETY: `environ` is the standard C runtime global environment pointer.
@@ -978,14 +990,36 @@ impl LinuxUserland {
             static environ: *const *const libc::c_char;
         }
 
+        let _spawn_guard = self.worker_spawn_serial.lock().unwrap();
+        let exec_image_fd = create_worker_exec_image_fd(guest_exec_image).map_err(|_| -1_i32)?;
+        let (result_read_fd, result_write_fd) = create_worker_result_pipe().map_err(|_| -1_i32)?;
+        let interp_image_fd = guest_interp_image
+            .map(|(_, image)| create_worker_exec_image_fd(image))
+            .transpose()
+            .map_err(|_| -1_i32)?;
+
         // Build the command line for the worker:
         //   /proc/self/exe -Z --worker-exec [extra_flags...] --cwd <cwd>
         //       --env K=V ... -- <guest_binary> [original argv...]
         let self_exe = std::fs::read_link("/proc/self/exe").map_err(|_| -1_i32)?;
-        let mut spawn_argv: Vec<CString> = Vec::new();
-        spawn_argv.push(CString::new(self_exe.as_os_str().as_bytes()).map_err(|_| -1_i32)?);
-        spawn_argv.push(CString::new("-Z").unwrap());
-        spawn_argv.push(CString::new("--worker-exec").unwrap());
+        let mut spawn_argv: Vec<CString> = vec![
+            CString::new(self_exe.as_os_str().as_bytes()).map_err(|_| -1_i32)?,
+            CString::new("-Z").unwrap(),
+            CString::new("--worker-exec").unwrap(),
+            CString::new("--worker-exec-fd").unwrap(),
+            CString::new(exec_image_fd.as_raw_fd().to_string()).map_err(|_| -1_i32)?,
+            CString::new("--worker-result-fd").unwrap(),
+            CString::new(result_write_fd.as_raw_fd().to_string()).map_err(|_| -1_i32)?,
+        ];
+        if let (Some((interp_path, _)), Some(interp_image_fd)) =
+            (guest_interp_image, interp_image_fd.as_ref())
+        {
+            spawn_argv.push(CString::new("--worker-interp-path").unwrap());
+            spawn_argv.push(CString::new(interp_path).map_err(|_| -1_i32)?);
+            spawn_argv.push(CString::new("--worker-interp-fd").unwrap());
+            spawn_argv
+                .push(CString::new(interp_image_fd.as_raw_fd().to_string()).map_err(|_| -1_i32)?);
+        }
 
         // Include runner flags (--nine-p-broker, --initial-files, etc.)
         {
@@ -1007,8 +1041,12 @@ impl LinuxUserland {
         spawn_argv.push(CString::new(guest_ppid.to_string()).map_err(|_| -1_i32)?);
         spawn_argv.push(CString::new("--guest-uid").unwrap());
         spawn_argv.push(CString::new(guest_uid.to_string()).map_err(|_| -1_i32)?);
+        spawn_argv.push(CString::new("--guest-euid").unwrap());
+        spawn_argv.push(CString::new(guest_euid.to_string()).map_err(|_| -1_i32)?);
         spawn_argv.push(CString::new("--guest-gid").unwrap());
         spawn_argv.push(CString::new(guest_gid.to_string()).map_err(|_| -1_i32)?);
+        spawn_argv.push(CString::new("--guest-egid").unwrap());
+        spawn_argv.push(CString::new(guest_egid.to_string()).map_err(|_| -1_i32)?);
 
         // Forward guest environment as --env K=V pairs.
         for env_entry in envp {
@@ -1044,12 +1082,20 @@ impl LinuxUserland {
         if ret != 0 {
             return Err(ret);
         }
+        self.worker_result_fds
+            .lock()
+            .unwrap()
+            .insert(pid, result_read_fd);
         Ok(pid)
     }
 
     /// Wait for a worker host process to exit and return the exit status.
     ///
-    /// Returns the exit code (0–255) on normal exit, or 128+signal on signal death.
+    /// Returns the exit code (0–255) on normal exit, or 256+signal on signal death.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal worker-result-fd lock is poisoned.
     pub fn wait_worker_host(&self, host_pid: i32) -> i32 {
         let mut status: libc::c_int = 0;
         loop {
@@ -1060,17 +1106,25 @@ impl LinuxUserland {
                     continue;
                 }
                 // Child doesn't exist or other error — treat as exit 127.
+                let _ = self.worker_result_fds.lock().unwrap().remove(&host_pid);
                 return 127;
             }
             break;
         }
-        if libc::WIFEXITED(status) {
+        let fallback_status = if libc::WIFEXITED(status) {
             libc::WEXITSTATUS(status)
         } else if libc::WIFSIGNALED(status) {
-            128 + libc::WTERMSIG(status)
+            256 + libc::WTERMSIG(status)
         } else {
             127
+        };
+        let result_fd = self.worker_result_fds.lock().unwrap().remove(&host_pid);
+        if let Some(result_fd) = result_fd
+            && let Some(wait_status) = read_worker_result_fd(result_fd)
+        {
+            return wait_status;
         }
+        fallback_status
     }
 
     /// Wait until there is data available on the network transport (TUN or IPC).
@@ -1141,6 +1195,55 @@ impl LinuxUserland {
     /// Panics if the internal lock is poisoned.
     pub fn has_network(&self) -> bool {
         self.network_transport.read().unwrap().is_some()
+    }
+}
+
+fn create_worker_exec_image_fd(guest_exec_image: &[u8]) -> std::io::Result<std::os::fd::OwnedFd> {
+    let name = CString::new("litebox-worker-exec").unwrap();
+    let raw_fd = unsafe { libc::memfd_create(name.as_ptr(), 0) };
+    if raw_fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let mut file = unsafe { std::fs::File::from_raw_fd(raw_fd) };
+    file.write_all(guest_exec_image)?;
+    file.seek(std::io::SeekFrom::Start(0))?;
+    Ok(file.into())
+}
+
+fn create_worker_result_pipe() -> std::io::Result<(std::os::fd::OwnedFd, std::os::fd::OwnedFd)> {
+    let mut fds = [0; 2];
+    if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+
+    let read_fd = unsafe { std::os::fd::OwnedFd::from_raw_fd(fds[0]) };
+    let write_fd = unsafe { std::os::fd::OwnedFd::from_raw_fd(fds[1]) };
+    let flags = unsafe { libc::fcntl(write_fd.as_raw_fd(), libc::F_GETFD) };
+    if flags < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    if unsafe {
+        libc::fcntl(
+            write_fd.as_raw_fd(),
+            libc::F_SETFD,
+            flags & !libc::FD_CLOEXEC,
+        )
+    } < 0
+    {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok((read_fd, write_fd))
+}
+
+fn read_worker_result_fd(result_fd: std::os::fd::OwnedFd) -> Option<i32> {
+    use std::io::Read as _;
+
+    let mut file = std::fs::File::from(result_fd);
+    let mut status = [0_u8; core::mem::size_of::<i32>()];
+    match file.read_exact(&mut status) {
+        Ok(()) => Some(i32::from_le_bytes(status)),
+        Err(err) if err.kind() == std::io::ErrorKind::UnexpectedEof => None,
+        Err(_) => None,
     }
 }
 

@@ -1132,6 +1132,14 @@ impl<'a, FS: ShimFS> FileAndParsed<'a, FS> {
 }
 
 impl<'a, FS: ShimFS> ElfLoader<'a, FS> {
+    fn file_bytes(file: &FileAndParsed<'_, FS>) -> Result<Vec<u8>, Errno> {
+        let mut elf_file = &file.file;
+        let size = usize::try_from(elf_file.size()?).map_err(|_| Errno::EFBIG)?;
+        let mut data = alloc::vec![0; size];
+        elf_file.read_at(0, &mut data)?;
+        Ok(data)
+    }
+
     /// Parses an ELF file from the given path.
     pub fn new(task: &'a Task<FS>, path: &'a str) -> Result<Self, ElfLoaderError> {
         // Parse the main ELF file.
@@ -1151,6 +1159,19 @@ impl<'a, FS: ShimFS> ElfLoader<'a, FS> {
     /// ET_EXEC (non-PIE) binary. Returns `None` for ET_DYN (PIE) binaries.
     pub fn fixed_load_range(&self) -> Option<core::ops::Range<usize>> {
         self.main.parsed.fixed_load_range()
+    }
+
+    /// Read the current executable bytes from the already-open main ELF file.
+    pub fn main_file_bytes(&self) -> Result<Vec<u8>, Errno> {
+        Self::file_bytes(&self.main)
+    }
+
+    /// Read the resolved PT_INTERP image, if any, from the already-open file.
+    pub fn interp_file_bytes(&self) -> Result<Option<(String, Vec<u8>)>, Errno> {
+        self.interp
+            .as_ref()
+            .map(|interp| Ok((interp.path.clone(), Self::file_bytes(interp)?)))
+            .transpose()
     }
 
     /// Load an ELF file and prepare the stack for the new process.
