@@ -5,12 +5,15 @@
 
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
+use core::convert::TryFrom;
 use core::sync::atomic::{AtomicU32, Ordering};
 
 use litebox::{
-    process::{ExitNotification, ProcessId},
+    process::{ExitNotification, ExitNotificationWire, ExitNotificationWireError, ProcessId},
     sync::{Mutex, RawSyncPrimitivesProvider},
 };
+use zerocopy::byteorder::{LE, U16};
+use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 /// Stable identifier for a host process participating in one sandbox.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -75,10 +78,81 @@ pub(crate) struct ExecHandoffSnapshot {
     pub(crate) stage: ExecHandoffStage,
 }
 
-/// Outbound control-plane message waiting for future host-to-host delivery.
-#[derive(Debug, Clone, Copy)]
+/// Semantic outbound control-plane message before transport encoding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum OutboundControlPlaneMessage {
     ChildExit(ExitNotification),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u16)]
+enum OutboundControlPlaneMessageKind {
+    ChildExit = 1,
+}
+
+impl TryFrom<u16> for OutboundControlPlaneMessageKind {
+    type Error = OutboundControlPlaneMessageWireError;
+
+    fn try_from(raw: u16) -> Result<Self, Self::Error> {
+        match raw {
+            1 => Ok(Self::ChildExit),
+            _ => Err(OutboundControlPlaneMessageWireError::UnknownKind(raw)),
+        }
+    }
+}
+
+const OUTBOUND_CONTROL_PLANE_WIRE_VERSION: u16 = 1;
+
+/// Versioned wire record for one outbound control-plane message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, FromBytes, Immutable, IntoBytes, KnownLayout)]
+#[repr(C)]
+pub(crate) struct OutboundControlPlaneMessageWire {
+    version: U16<LE>,
+    kind: U16<LE>,
+    child_exit: ExitNotificationWire,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OutboundControlPlaneMessageWireError {
+    UnsupportedVersion(u16),
+    UnknownKind(u16),
+    InvalidChildExit(ExitNotificationWireError),
+}
+
+impl TryFrom<OutboundControlPlaneMessage> for OutboundControlPlaneMessageWire {
+    type Error = OutboundControlPlaneMessageWireError;
+
+    fn try_from(message: OutboundControlPlaneMessage) -> Result<Self, Self::Error> {
+        match message {
+            OutboundControlPlaneMessage::ChildExit(notification) => Ok(Self {
+                version: U16::new(OUTBOUND_CONTROL_PLANE_WIRE_VERSION),
+                kind: U16::new(OutboundControlPlaneMessageKind::ChildExit as u16),
+                child_exit: ExitNotificationWire::try_from(notification)
+                    .map_err(OutboundControlPlaneMessageWireError::InvalidChildExit)?,
+            }),
+        }
+    }
+}
+
+impl TryFrom<OutboundControlPlaneMessageWire> for OutboundControlPlaneMessage {
+    type Error = OutboundControlPlaneMessageWireError;
+
+    fn try_from(message: OutboundControlPlaneMessageWire) -> Result<Self, Self::Error> {
+        let version = message.version.get();
+        if version != OUTBOUND_CONTROL_PLANE_WIRE_VERSION {
+            return Err(OutboundControlPlaneMessageWireError::UnsupportedVersion(
+                version,
+            ));
+        }
+
+        let kind = OutboundControlPlaneMessageKind::try_from(message.kind.get())?;
+        match kind {
+            OutboundControlPlaneMessageKind::ChildExit => Ok(Self::ChildExit(
+                ExitNotification::try_from(message.child_exit)
+                    .map_err(OutboundControlPlaneMessageWireError::InvalidChildExit)?,
+            )),
+        }
+    }
 }
 
 /// Control-plane errors while the runtime is still single-host/local-only.
@@ -109,7 +183,8 @@ pub(crate) enum ControlPlaneError {
         process_id: ProcessId,
         host: HostId,
     },
-    RemoteChildExitQueueFull {
+    InvalidOutboundMessage(OutboundControlPlaneMessageWireError),
+    OutboundMessageQueueFull {
         target_host: HostId,
         limit: usize,
     },
@@ -141,14 +216,14 @@ impl ExecHandoff {
     }
 }
 
-const MAX_PENDING_REMOTE_CHILD_EXIT_NOTIFICATIONS_PER_HOST: usize = 64;
+const MAX_PENDING_OUTBOUND_CONTROL_PLANE_MESSAGES_PER_HOST: usize = 64;
 
 struct ControlPlaneState {
     hosts: BTreeMap<HostId, HostEntry>,
     running_process_owners: BTreeMap<ProcessId, HostId>,
     active_handoffs_by_process: BTreeMap<ProcessId, ExecHandoffId>,
     handoffs: BTreeMap<ExecHandoffId, ExecHandoff>,
-    pending_outbound_messages: BTreeMap<HostId, Vec<OutboundControlPlaneMessage>>,
+    pending_outbound_messages: BTreeMap<HostId, Vec<OutboundControlPlaneMessageWire>>,
 }
 
 /// Root-host-owned control-plane state for the multi-host process model.
@@ -292,12 +367,16 @@ impl<Platform: RawSyncPrimitivesProvider> ControlPlane<Platform> {
             .copied()
     }
 
-    /// Queue a child-exit notification for later delivery to a remote host.
+    /// Queue a child-exit notification as a wire record for later remote delivery.
     pub(crate) fn queue_remote_child_exit_notification(
         &self,
         target_host: HostId,
         notification: ExitNotification,
     ) -> Result<(), ControlPlaneError> {
+        let wire_message = OutboundControlPlaneMessageWire::try_from(
+            OutboundControlPlaneMessage::ChildExit(notification),
+        )
+        .map_err(ControlPlaneError::InvalidOutboundMessage)?;
         let mut state = self.state.lock();
         if !state.hosts.contains_key(&target_host) {
             return Err(ControlPlaneError::UnknownHost(target_host));
@@ -306,21 +385,21 @@ impl<Platform: RawSyncPrimitivesProvider> ControlPlane<Platform> {
             .pending_outbound_messages
             .entry(target_host)
             .or_default();
-        if queue.len() >= MAX_PENDING_REMOTE_CHILD_EXIT_NOTIFICATIONS_PER_HOST {
-            return Err(ControlPlaneError::RemoteChildExitQueueFull {
+        if queue.len() >= MAX_PENDING_OUTBOUND_CONTROL_PLANE_MESSAGES_PER_HOST {
+            return Err(ControlPlaneError::OutboundMessageQueueFull {
                 target_host,
-                limit: MAX_PENDING_REMOTE_CHILD_EXIT_NOTIFICATIONS_PER_HOST,
+                limit: MAX_PENDING_OUTBOUND_CONTROL_PLANE_MESSAGES_PER_HOST,
             });
         }
-        queue.push(OutboundControlPlaneMessage::ChildExit(notification));
+        queue.push(wire_message);
         Ok(())
     }
 
-    /// Drain any queued outbound control-plane messages for a specific host.
+    /// Drain any queued outbound control-plane wire records for a specific host.
     pub(crate) fn poll_outbound_messages_for_host(
         &self,
         target_host: HostId,
-    ) -> Result<Vec<OutboundControlPlaneMessage>, ControlPlaneError> {
+    ) -> Result<Vec<OutboundControlPlaneMessageWire>, ControlPlaneError> {
         let mut state = self.state.lock();
         if !state.hosts.contains_key(&target_host) {
             return Err(ControlPlaneError::UnknownHost(target_host));
@@ -478,7 +557,7 @@ impl<Platform: RawSyncPrimitivesProvider> ControlPlane<Platform> {
     fn pending_outbound_messages_for_host(
         &self,
         target_host: HostId,
-    ) -> Vec<OutboundControlPlaneMessage> {
+    ) -> Vec<OutboundControlPlaneMessageWire> {
         self.state
             .lock()
             .pending_outbound_messages
@@ -493,6 +572,12 @@ mod tests {
     extern crate std;
 
     use super::*;
+
+    fn decode_outbound_message(
+        wire: OutboundControlPlaneMessageWire,
+    ) -> OutboundControlPlaneMessage {
+        OutboundControlPlaneMessage::try_from(wire).expect("decode outbound wire message")
+    }
 
     #[test]
     fn root_control_plane_starts_with_registered_root_host() {
@@ -726,6 +811,63 @@ mod tests {
     }
 
     #[test]
+    fn outbound_message_wire_round_trips_child_exit() {
+        let message = OutboundControlPlaneMessage::ChildExit(ExitNotification {
+            parent_pid: ProcessId(21),
+            exit_signal: 17,
+            child_pid: ProcessId(22),
+            exit_status: 23,
+        });
+
+        let wire = OutboundControlPlaneMessageWire::try_from(message).expect("encode message");
+        assert_eq!(OutboundControlPlaneMessage::try_from(wire), Ok(message));
+    }
+
+    #[test]
+    fn outbound_message_wire_rejects_unknown_version() {
+        let child_exit = ExitNotificationWire::try_from(ExitNotification {
+            parent_pid: ProcessId(21),
+            exit_signal: 17,
+            child_pid: ProcessId(22),
+            exit_status: 23,
+        })
+        .expect("encode child exit");
+        let wire = OutboundControlPlaneMessageWire {
+            version: U16::new(OUTBOUND_CONTROL_PLANE_WIRE_VERSION + 1),
+            kind: U16::new(OutboundControlPlaneMessageKind::ChildExit as u16),
+            child_exit,
+        };
+
+        assert_eq!(
+            OutboundControlPlaneMessage::try_from(wire),
+            Err(OutboundControlPlaneMessageWireError::UnsupportedVersion(
+                OUTBOUND_CONTROL_PLANE_WIRE_VERSION + 1
+            ))
+        );
+    }
+
+    #[test]
+    fn outbound_message_wire_rejects_unknown_kind() {
+        let child_exit = ExitNotificationWire::try_from(ExitNotification {
+            parent_pid: ProcessId(21),
+            exit_signal: 17,
+            child_pid: ProcessId(22),
+            exit_status: 23,
+        })
+        .expect("encode child exit");
+        let wire = OutboundControlPlaneMessageWire {
+            version: U16::new(OUTBOUND_CONTROL_PLANE_WIRE_VERSION),
+            kind: U16::new(999),
+            child_exit,
+        };
+
+        assert_eq!(
+            OutboundControlPlaneMessage::try_from(wire),
+            Err(OutboundControlPlaneMessageWireError::UnknownKind(999))
+        );
+    }
+
+    #[test]
     fn outbound_messages_drain_in_fifo_order_per_host() {
         let plane = ControlPlane::<crate::Platform>::new_root_local();
         let worker = plane
@@ -758,7 +900,7 @@ mod tests {
             .poll_outbound_messages_for_host(worker)
             .expect("drain notifications");
         assert_eq!(drained.len(), 2);
-        match drained[0] {
+        match decode_outbound_message(drained[0]) {
             OutboundControlPlaneMessage::ChildExit(notification) => {
                 assert_eq!(notification.parent_pid, first.parent_pid);
                 assert_eq!(notification.child_pid, first.child_pid);
@@ -766,7 +908,7 @@ mod tests {
                 assert_eq!(notification.exit_status, first.exit_status);
             }
         }
-        match drained[1] {
+        match decode_outbound_message(drained[1]) {
             OutboundControlPlaneMessage::ChildExit(notification) => {
                 assert_eq!(notification.parent_pid, second.parent_pid);
                 assert_eq!(notification.child_pid, second.child_pid);
@@ -784,7 +926,7 @@ mod tests {
             .register_worker_host(HostId::ROOT)
             .expect("register worker host");
 
-        for idx in 0..MAX_PENDING_REMOTE_CHILD_EXIT_NOTIFICATIONS_PER_HOST {
+        for idx in 0..MAX_PENDING_OUTBOUND_CONTROL_PLANE_MESSAGES_PER_HOST {
             plane
                 .queue_remote_child_exit_notification(
                     worker,
@@ -808,14 +950,14 @@ mod tests {
                     exit_status: 999,
                 }
             ),
-            Err(ControlPlaneError::RemoteChildExitQueueFull {
+            Err(ControlPlaneError::OutboundMessageQueueFull {
                 target_host: worker,
-                limit: MAX_PENDING_REMOTE_CHILD_EXIT_NOTIFICATIONS_PER_HOST,
+                limit: MAX_PENDING_OUTBOUND_CONTROL_PLANE_MESSAGES_PER_HOST,
             })
         );
         assert_eq!(
             plane.pending_outbound_messages_for_host(worker).len(),
-            MAX_PENDING_REMOTE_CHILD_EXIT_NOTIFICATIONS_PER_HOST
+            MAX_PENDING_OUTBOUND_CONTROL_PLANE_MESSAGES_PER_HOST
         );
     }
 
@@ -856,7 +998,7 @@ mod tests {
             .poll_outbound_messages_for_host(worker_a)
             .expect("poll worker a");
         assert_eq!(drained_a.len(), 1);
-        match drained_a[0] {
+        match decode_outbound_message(drained_a[0]) {
             OutboundControlPlaneMessage::ChildExit(notification) => {
                 assert_eq!(notification.parent_pid, ProcessId(51));
                 assert_eq!(notification.child_pid, ProcessId(61));
@@ -865,7 +1007,7 @@ mod tests {
 
         let pending_b = plane.pending_outbound_messages_for_host(worker_b);
         assert_eq!(pending_b.len(), 1);
-        match pending_b[0] {
+        match decode_outbound_message(pending_b[0]) {
             OutboundControlPlaneMessage::ChildExit(notification) => {
                 assert_eq!(notification.parent_pid, ProcessId(52));
                 assert_eq!(notification.child_pid, ProcessId(62));

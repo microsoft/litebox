@@ -3830,7 +3830,9 @@ mod tests {
             .poll_outbound_messages_for_host(remote_host)
             .expect("remote host queue should exist");
         assert_eq!(drained.len(), 1);
-        match drained[0] {
+        match crate::multihost::OutboundControlPlaneMessage::try_from(drained[0])
+            .expect("decode queued outbound message")
+        {
             crate::multihost::OutboundControlPlaneMessage::ChildExit(notification) => {
                 assert_eq!(notification.parent_pid, notif.parent_pid);
                 assert_eq!(notification.child_pid, notif.child_pid);
