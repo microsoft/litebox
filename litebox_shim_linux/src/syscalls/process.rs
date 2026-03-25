@@ -2554,10 +2554,13 @@ impl<FS: ShimFS> Task<FS> {
         tv: Option<crate::MutPtr<litebox_common_linux::TimeVal>>,
         tz: Option<crate::MutPtr<litebox_common_linux::TimeZone>>,
     ) -> Result<(), Errno> {
-        if tz.is_some() {
-            // `man 2 gettimeofday`: The use of the timezone structure is obsolete; the tz argument
-            // should normally be specified as NULL.
-            unimplemented!()
+        if let Some(tz) = tz {
+            // `man 2 gettimeofday`: The use of the timezone structure is
+            // obsolete; the tz argument should normally be specified as NULL.
+            // Return UTC (minuteswest=0, dsttime=0) which is the Linux default.
+            self.prepare_guest_write(tz, 1)?;
+            tz.write_at_offset(0, litebox_common_linux::TimeZone::new(0, 0))
+                .ok_or(Errno::EFAULT)?;
         }
         if let Some(tv) = tv {
             self.prepare_guest_write(tv, 1)?;

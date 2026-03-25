@@ -31,7 +31,9 @@ impl<FS: ShimFS> Task<FS> {
             <_ as litebox::platform::CrngProvider>::fill_bytes_crng(self.global.platform, kbuf);
             buf.copy_from_slice(offset, kbuf).ok_or(Errno::EFAULT)?;
             offset += len;
-            // TODO: check for interrupt here and break out.
+            if self.has_pending_signals() {
+                break;
+            }
         }
         Ok(offset)
     }
@@ -84,19 +86,23 @@ impl<FS: ShimFS> Task<FS> {
     /// Handle syscall `sysinfo`.
     pub(crate) fn sys_sysinfo(&self) -> litebox_common_linux::Sysinfo {
         let now = self.global.platform.now();
+        let uptime_secs = now.duration_since(&self.global.boot_time).as_secs();
+        // Approximate load averages. Use a small non-zero value to indicate
+        // the system is alive. SI_LOAD_SHIFT=16, so 655 ≈ 0.01 load.
+        let load_1min: usize = if uptime_secs > 0 { 655 } else { 0 };
         litebox_common_linux::Sysinfo {
-            uptime: now
-                .duration_since(&self.global.boot_time)
-                .as_secs()
-                .truncate(),
-            // TODO: Populate these fields with actual values
-            loads: [0; 3],
+            uptime: uptime_secs.truncate(),
+            loads: [
+                load_1min.truncate(),
+                load_1min.truncate(),
+                load_1min.truncate(),
+            ],
             #[cfg(target_arch = "x86_64")]
             totalram: 4 * 1024 * 1024 * 1024,
             #[cfg(target_arch = "x86")]
             totalram: 3 * 1024 * 1024 * 1024,
             freeram: 2 * 1024 * 1024 * 1024,
-            sharedram: 0, // We don't support shared memory
+            sharedram: 0,
             bufferram: 0,
             totalswap: 0,
             freeswap: 0,

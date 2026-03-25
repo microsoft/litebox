@@ -842,8 +842,14 @@ impl<FS: ShimFS> Task<FS> {
         newpath: impl path::Arg,
         flags: u32,
     ) -> Result<(), Errno> {
-        if flags != 0 {
-            // RENAME_NOREPLACE, RENAME_EXCHANGE, RENAME_WHITEOUT not yet supported
+        const RENAME_NOREPLACE: u32 = 1;
+        const RENAME_EXCHANGE: u32 = 2;
+        const RENAME_WHITEOUT: u32 = 4;
+        let supported = RENAME_NOREPLACE;
+        if flags & !supported != 0 {
+            if flags & (RENAME_EXCHANGE | RENAME_WHITEOUT) != 0 {
+                return Err(Errno::EINVAL);
+            }
             return Err(Errno::EINVAL);
         }
         let get_cwd = || self.fs.borrow().cwd.read().clone();
@@ -896,6 +902,12 @@ impl<FS: ShimFS> Task<FS> {
         };
         let old_path = resolve(old)?;
         let new_path = resolve(new)?;
+        if flags & RENAME_NOREPLACE != 0 {
+            // Check if target exists — RENAME_NOREPLACE fails with EEXIST.
+            if self.files.borrow().fs.file_status(&*new_path).is_ok() {
+                return Err(Errno::EEXIST);
+            }
+        }
         self.files
             .borrow()
             .fs
