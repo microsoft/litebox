@@ -49,6 +49,7 @@ impl<FS: ShimFS> Task<FS> {
             self.global.platform.take_pending_signals(|signal| {
                 self.queue_signals(signal);
             });
+            let _ = self.drain_one_local_control_plane_message();
             self.check_alarm_deadline();
             self.process_signals(ctx);
             #[cfg(all(feature = "trace_syscalls", target_arch = "x86_64"))]
@@ -200,6 +201,11 @@ impl<FS: ShimFS> litebox::event::wait::CheckForInterrupt for Task<FS> {
             self.queue_signals(sig);
         });
         self.check_alarm_deadline();
+
+        let local_mailbox_needs_another_pass = self.drain_one_local_control_plane_message();
+        if local_mailbox_needs_another_pass {
+            self.wait_state.thread_handle().interrupt();
+        }
 
         // Drain cross-process signals (e.g. SIGCHLD) into the process's
         // shared pending queue so that `has_pending_signals()` sees them.

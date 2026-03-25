@@ -289,6 +289,7 @@ impl Process {
 enum InboundControlPlaneMessageError {
     Wire(crate::multihost::OutboundControlPlaneMessageWireError),
     ControlPlane(crate::multihost::ControlPlaneError),
+    RetryEnvelope(crate::multihost::OutboundControlPlaneEnvelope),
     UnknownSourceHost(crate::multihost::HostId),
     UnexpectedSourceHostForChild {
         child_pid: litebox::process::ProcessId,
@@ -318,6 +319,12 @@ enum InboundControlPlaneMessageError {
         actual_status: i32,
     },
     InvalidChildExitSignal(i32),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InboundControlPlaneEnvelopeOutcome {
+    Consumed,
+    RetriedLocally,
 }
 
 impl<FS: ShimFS> Task<FS> {
@@ -976,6 +983,7 @@ impl<FS: ShimFS> Task<FS> {
         &self,
         source_host: crate::multihost::HostId,
         wire: crate::multihost::OutboundControlPlaneMessageWire,
+        local_delivery_completed: bool,
     ) -> Result<(), InboundControlPlaneMessageError> {
         if !self.global.control_plane.is_registered_host(source_host) {
             return Err(InboundControlPlaneMessageError::UnknownSourceHost(
@@ -1046,11 +1054,18 @@ impl<FS: ShimFS> Task<FS> {
                         local_host,
                     });
                 }
+                if local_delivery_completed {
+                    self.global
+                        .control_plane
+                        .clear_child_exit_provenance(notif.child_pid);
+                    return Ok(());
+                }
                 match self.deliver_local_child_exit_notification(notif) {
                     Ok(()) => match self.global.control_plane.route_child_exit_notification(
                         source_host,
                         local_host,
                         notif,
+                        true,
                     ) {
                         Ok(
                             crate::multihost::ChildExitRoute::DeliverLocal
@@ -1066,19 +1081,13 @@ impl<FS: ShimFS> Task<FS> {
                         }
                         Err(crate::multihost::ControlPlaneError::OutboundMessageQueueFull {
                             ..
-                        }) => {
-                            self.global
-                                .control_plane
-                                .queue_outbound_envelope_for_host(
-                                    local_host,
-                                    crate::multihost::OutboundControlPlaneEnvelope {
-                                        source_host,
-                                        message: wire,
-                                    },
-                                )
-                                .map_err(InboundControlPlaneMessageError::ControlPlane)?;
-                            Ok(())
-                        }
+                        }) => Err(InboundControlPlaneMessageError::RetryEnvelope(
+                            crate::multihost::OutboundControlPlaneEnvelope {
+                                source_host,
+                                message: wire,
+                                local_delivery_completed: true,
+                            },
+                        )),
                         Err(err) => Err(InboundControlPlaneMessageError::ControlPlane(err)),
                     },
                     Err(err @ InboundControlPlaneMessageError::InvalidChildExitSignal(_)) => {
@@ -1096,14 +1105,32 @@ impl<FS: ShimFS> Task<FS> {
     fn consume_inbound_control_plane_envelope(
         &self,
         envelope: crate::multihost::OutboundControlPlaneEnvelope,
-    ) -> Result<(), InboundControlPlaneMessageError> {
+        restore_local_retry_front: bool,
+    ) -> Result<InboundControlPlaneEnvelopeOutcome, InboundControlPlaneMessageError> {
         let message = crate::multihost::OutboundControlPlaneMessage::try_from(envelope.message)
             .map_err(InboundControlPlaneMessageError::Wire)?;
         let local_host = self.global.control_plane.local_host();
         loop {
-            match self.deliver_inbound_control_plane_message(envelope.source_host, envelope.message)
-            {
-                Ok(()) => return Ok(()),
+            match self.deliver_inbound_control_plane_message(
+                envelope.source_host,
+                envelope.message,
+                envelope.local_delivery_completed,
+            ) {
+                Ok(()) => return Ok(InboundControlPlaneEnvelopeOutcome::Consumed),
+                Err(InboundControlPlaneMessageError::RetryEnvelope(retry_envelope)) => {
+                    if restore_local_retry_front {
+                        self.global
+                            .control_plane
+                            .restore_local_outbound_envelope(retry_envelope)
+                            .map_err(InboundControlPlaneMessageError::ControlPlane)?;
+                    } else {
+                        self.global
+                            .control_plane
+                            .queue_outbound_envelope_for_host(local_host, retry_envelope)
+                            .map_err(InboundControlPlaneMessageError::ControlPlane)?;
+                    }
+                    return Ok(InboundControlPlaneEnvelopeOutcome::RetriedLocally);
+                }
                 Err(InboundControlPlaneMessageError::TargetProcessNotLocal { .. }) => match message
                 {
                     crate::multihost::OutboundControlPlaneMessage::ChildExit(notif) => {
@@ -1111,6 +1138,7 @@ impl<FS: ShimFS> Task<FS> {
                             envelope.source_host,
                             local_host,
                             notif,
+                            envelope.local_delivery_completed,
                         ) {
                             Ok(crate::multihost::ChildExitRoute::DeliverLocal) => {}
                             Ok(crate::multihost::ChildExitRoute::NoRunningOwner) => {
@@ -1118,21 +1146,28 @@ impl<FS: ShimFS> Task<FS> {
                                     .global
                                     .control_plane
                                     .clear_child_exit_provenance(notif.child_pid);
-                                return Ok(());
+                                return Ok(InboundControlPlaneEnvelopeOutcome::Consumed);
                             }
                             Ok(crate::multihost::ChildExitRoute::QueuedRemote {
                                 target_host: _,
-                            }) => return Ok(()),
+                            }) => return Ok(InboundControlPlaneEnvelopeOutcome::Consumed),
                             Err(
                                 crate::multihost::ControlPlaneError::OutboundMessageQueueFull {
                                     ..
                                 },
                             ) => {
-                                self.global
-                                    .control_plane
-                                    .queue_outbound_envelope_for_host(local_host, envelope)
-                                    .map_err(InboundControlPlaneMessageError::ControlPlane)?;
-                                return Ok(());
+                                if restore_local_retry_front {
+                                    self.global
+                                        .control_plane
+                                        .restore_local_outbound_envelope(envelope)
+                                        .map_err(InboundControlPlaneMessageError::ControlPlane)?;
+                                } else {
+                                    self.global
+                                        .control_plane
+                                        .queue_outbound_envelope_for_host(local_host, envelope)
+                                        .map_err(InboundControlPlaneMessageError::ControlPlane)?;
+                                }
+                                return Ok(InboundControlPlaneEnvelopeOutcome::RetriedLocally);
                             }
                             Err(err) => {
                                 return Err(InboundControlPlaneMessageError::ControlPlane(err));
@@ -1175,10 +1210,12 @@ impl<FS: ShimFS> Task<FS> {
             crate::multihost::OutboundControlPlaneEnvelope {
                 source_host,
                 message,
+                local_delivery_completed: false,
             },
+            false,
         );
         match delivery {
-            Ok(()) => {}
+            Ok(_) => {}
             Err(InboundControlPlaneMessageError::ControlPlane(
                 crate::multihost::ControlPlaneError::OutboundMessageQueueFull { .. },
             )) => {
@@ -1197,6 +1234,83 @@ impl<FS: ShimFS> Task<FS> {
                     notif.parent_pid.0,
                     err
                 );
+            }
+        }
+    }
+
+    /// Drain one local control-plane envelope if possible.
+    ///
+    /// Returns `true` when the caller should immediately re-check instead of
+    /// sleeping, either because more local work remains after forward progress
+    /// or because another thread currently holds the serialized pump.
+    pub(crate) fn drain_one_local_control_plane_message(&self) -> bool {
+        struct PumpActiveGuard<'a>(&'a AtomicBool);
+        impl Drop for PumpActiveGuard<'_> {
+            fn drop(&mut self) {
+                self.0.store(false, Ordering::Release);
+            }
+        }
+        if self
+            .global
+            .local_control_plane_pump_active
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return true;
+        }
+        let _pump_active_guard = PumpActiveGuard(&self.global.local_control_plane_pump_active);
+        let local_host = self.global.control_plane.local_host();
+        let Ok(envelope) = self
+            .global
+            .control_plane
+            .take_next_outbound_message_for_host(local_host)
+        else {
+            log_unsupported!(
+                "local host {:?} could not poll its control-plane queue",
+                local_host
+            );
+            return false;
+        };
+        let Some(envelope) = envelope else {
+            return false;
+        };
+        let made_forward_progress =
+            match self.consume_inbound_control_plane_envelope(envelope, true) {
+                Ok(InboundControlPlaneEnvelopeOutcome::Consumed) => true,
+                Ok(InboundControlPlaneEnvelopeOutcome::RetriedLocally) => false,
+                Err(err) => {
+                    if let Ok(crate::multihost::OutboundControlPlaneMessage::ChildExit(notif)) =
+                        crate::multihost::OutboundControlPlaneMessage::try_from(envelope.message)
+                    {
+                        let _ = self
+                            .global
+                            .control_plane
+                            .clear_child_exit_provenance(notif.child_pid);
+                    }
+                    log_unsupported!(
+                        "local host {:?} could not consume control-plane message: {:?}",
+                        local_host,
+                        err
+                    );
+                    true
+                }
+            };
+        if !made_forward_progress {
+            return false;
+        }
+        match self
+            .global
+            .control_plane
+            .has_outbound_messages_for_host(local_host)
+        {
+            Ok(has_more) => has_more,
+            Err(err) => {
+                log_unsupported!(
+                    "local host {:?} could not inspect its control-plane queue: {:?}",
+                    local_host,
+                    err
+                );
+                false
             }
         }
     }
@@ -4243,13 +4357,93 @@ mod tests {
         )
         .expect("encode child-exit message");
 
-        task.deliver_inbound_control_plane_message(task.global.control_plane.local_host(), wire)
-            .expect("deliver inbound message");
+        task.deliver_inbound_control_plane_message(
+            task.global.control_plane.local_host(),
+            wire,
+            false,
+        )
+        .expect("deliver inbound message");
 
         let queue = task.global.cross_process_signals.lock();
         assert_eq!(queue.len(), 1);
         assert_eq!(queue[0].target_process_id, task.process_id.0);
         assert_eq!(queue[0].signal, Signal::SIGCHLD);
+    }
+
+    #[test]
+    fn test_replayed_local_delivery_completed_envelope_skips_duplicate_local_signal() {
+        let task = crate::syscalls::tests::init_platform(None);
+        let child = register_exited_child(
+            &task,
+            litebox_common_linux::signal::Signal::SIGCHLD.as_i32(),
+            23,
+        );
+        let notif = child_exit_notification(task.process_id, child);
+        let envelope = crate::multihost::OutboundControlPlaneEnvelope {
+            source_host: task.global.control_plane.local_host(),
+            message: crate::multihost::OutboundControlPlaneMessageWire::try_from(
+                crate::multihost::OutboundControlPlaneMessage::ChildExit(notif),
+            )
+            .expect("encode child-exit message"),
+            local_delivery_completed: true,
+        };
+
+        task.consume_inbound_control_plane_envelope(envelope, false)
+            .expect("replayed local envelope should be consumed");
+
+        assert!(task.global.cross_process_signals.lock().is_empty());
+        assert!(
+            task.global
+                .control_plane
+                .child_exit_provenance(child)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn test_rerouted_replayed_envelope_preserves_local_delivery_completed() {
+        let task = crate::syscalls::tests::init_platform(None);
+        let remote_parent = register_remote_owned_child(&task);
+        let remote_host = task
+            .global
+            .control_plane
+            .owner_of_running_process(remote_parent)
+            .expect("remote parent should have an owner");
+        let child = register_exited_child_for_parent(
+            &task,
+            remote_parent,
+            task.global.control_plane.local_host(),
+            litebox_common_linux::signal::Signal::SIGCHLD.as_i32(),
+            23,
+        );
+        let envelope = crate::multihost::OutboundControlPlaneEnvelope {
+            source_host: task.global.control_plane.local_host(),
+            message: crate::multihost::OutboundControlPlaneMessageWire::try_from(
+                crate::multihost::OutboundControlPlaneMessage::ChildExit(child_exit_notification(
+                    remote_parent,
+                    child,
+                )),
+            )
+            .expect("encode child-exit message"),
+            local_delivery_completed: true,
+        };
+
+        task.consume_inbound_control_plane_envelope(envelope, false)
+            .expect("replayed remote envelope should reroute");
+
+        let rerouted = task
+            .global
+            .control_plane
+            .poll_outbound_messages_for_host(remote_host)
+            .expect("remote host queue should exist");
+        assert_eq!(rerouted.len(), 1);
+        assert!(rerouted[0].local_delivery_completed);
+        assert!(
+            task.global
+                .control_plane
+                .child_exit_provenance(child)
+                .is_some()
+        );
     }
 
     #[test]
@@ -4277,7 +4471,8 @@ mod tests {
         assert_eq!(
             task.deliver_inbound_control_plane_message(
                 task.global.control_plane.local_host(),
-                wire
+                wire,
+                false
             ),
             Err(
                 crate::syscalls::process::InboundControlPlaneMessageError::TargetProcessNotLocal {
@@ -4318,7 +4513,7 @@ mod tests {
         .expect("encode child-exit message");
 
         assert_eq!(
-            task.deliver_inbound_control_plane_message(task.global.control_plane.local_host(), wire),
+            task.deliver_inbound_control_plane_message(task.global.control_plane.local_host(), wire, false),
             Err(
                 crate::syscalls::process::InboundControlPlaneMessageError::ChildOwnedByDifferentParent {
                     child_pid: child,
@@ -4354,7 +4549,8 @@ mod tests {
         assert_eq!(
             task.deliver_inbound_control_plane_message(
                 task.global.control_plane.local_host(),
-                wire
+                wire,
+                false
             ),
             Err(
                 crate::syscalls::process::InboundControlPlaneMessageError::InvalidChildExitSignal(
@@ -4425,7 +4621,7 @@ mod tests {
         .expect("encode child-exit message");
 
         assert_eq!(
-            task.deliver_inbound_control_plane_message(worker, wire),
+            task.deliver_inbound_control_plane_message(worker, wire, false),
             Err(
                 crate::syscalls::process::InboundControlPlaneMessageError::UnexpectedSourceHostForChild {
                     child_pid: child,
@@ -4458,7 +4654,7 @@ mod tests {
         .expect("encode child-exit message");
 
         assert_eq!(
-            task.deliver_inbound_control_plane_message(task.global.control_plane.local_host(), wire),
+            task.deliver_inbound_control_plane_message(task.global.control_plane.local_host(), wire, false),
             Err(
                 crate::syscalls::process::InboundControlPlaneMessageError::ChildExitStatusMismatch {
                     child_pid: child,
@@ -4525,7 +4721,7 @@ mod tests {
 
         handoff_running_process(&task, remote_parent, worker_b);
 
-        task.consume_inbound_control_plane_envelope(drained[0])
+        task.consume_inbound_control_plane_envelope(drained[0], false)
             .expect("drained envelope should reroute");
 
         assert!(task.global.cross_process_signals.lock().is_empty());
@@ -4641,7 +4837,7 @@ mod tests {
         handoff_running_process(&task, remote_parent, worker_b);
         fill_outbound_child_exit_queue(&task, worker_b, remote_parent);
 
-        task.consume_inbound_control_plane_envelope(drained[0])
+        task.consume_inbound_control_plane_envelope(drained[0], false)
             .expect("queue-full reroute should be persisted for retry");
         assert!(
             task.global
@@ -4661,6 +4857,219 @@ mod tests {
             .poll_outbound_messages_for_host(worker_b)
             .expect("worker b queue should exist");
         assert_eq!(filled.len(), 64);
+    }
+
+    #[test]
+    fn test_drain_one_local_control_plane_message_retries_persisted_remote_queue_full_envelope() {
+        let task = crate::syscalls::tests::init_platform(None);
+        let remote_parent = register_remote_owned_child(&task);
+        let remote_host = task
+            .global
+            .control_plane
+            .owner_of_running_process(remote_parent)
+            .expect("remote parent should have an owner");
+        fill_outbound_child_exit_queue(&task, remote_host, remote_parent);
+        let child = register_exited_child_for_parent(
+            &task,
+            remote_parent,
+            task.global.control_plane.local_host(),
+            litebox_common_linux::signal::Signal::SIGCHLD.as_i32(),
+            23,
+        );
+
+        task.notify_parent_of_child_exit(child_exit_notification(remote_parent, child));
+
+        let drained_full = task
+            .global
+            .control_plane
+            .poll_outbound_messages_for_host(remote_host)
+            .expect("remote host queue should exist");
+        assert_eq!(drained_full.len(), 64);
+
+        assert!(!task.drain_one_local_control_plane_message());
+
+        let local_after = task
+            .global
+            .control_plane
+            .poll_outbound_messages_for_host(task.global.control_plane.local_host())
+            .expect("local retry queue should still be readable");
+        assert!(local_after.is_empty());
+
+        let rerouted = task
+            .global
+            .control_plane
+            .poll_outbound_messages_for_host(remote_host)
+            .expect("remote host queue should exist");
+        assert_eq!(rerouted.len(), 1);
+        match crate::multihost::OutboundControlPlaneMessage::try_from(rerouted[0].message)
+            .expect("decode rerouted retry message")
+        {
+            crate::multihost::OutboundControlPlaneMessage::ChildExit(notification) => {
+                assert_eq!(notification.parent_pid, remote_parent);
+                assert_eq!(notification.child_pid, child);
+                assert_eq!(
+                    rerouted[0].source_host,
+                    task.global.control_plane.local_host()
+                );
+            }
+        }
+        assert!(
+            task.global
+                .control_plane
+                .child_exit_provenance(child)
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn test_drain_one_local_control_plane_message_preserves_retry_head_order() {
+        let task = crate::syscalls::tests::init_platform(None);
+        let remote_parent = register_remote_owned_child(&task);
+        let remote_host = task
+            .global
+            .control_plane
+            .owner_of_running_process(remote_parent)
+            .expect("remote parent should have an owner");
+        fill_outbound_child_exit_queue(&task, remote_host, remote_parent);
+        let first_child = register_exited_child_for_parent(
+            &task,
+            remote_parent,
+            task.global.control_plane.local_host(),
+            litebox_common_linux::signal::Signal::SIGCHLD.as_i32(),
+            23,
+        );
+        let second_child = register_exited_child_for_parent(
+            &task,
+            remote_parent,
+            task.global.control_plane.local_host(),
+            litebox_common_linux::signal::Signal::SIGCHLD.as_i32(),
+            24,
+        );
+
+        task.notify_parent_of_child_exit(child_exit_notification(remote_parent, first_child));
+        task.notify_parent_of_child_exit(litebox::process::ExitNotification {
+            parent_pid: remote_parent,
+            exit_signal: litebox_common_linux::signal::Signal::SIGCHLD.as_i32(),
+            child_pid: second_child,
+            exit_status: 24,
+        });
+
+        assert!(!task.drain_one_local_control_plane_message());
+
+        let retry = task
+            .global
+            .control_plane
+            .poll_outbound_messages_for_host(task.global.control_plane.local_host())
+            .expect("local retry queue should exist");
+        assert_eq!(retry.len(), 2);
+        match crate::multihost::OutboundControlPlaneMessage::try_from(retry[0].message)
+            .expect("decode first retry message")
+        {
+            crate::multihost::OutboundControlPlaneMessage::ChildExit(notification) => {
+                assert_eq!(notification.child_pid, first_child);
+            }
+        }
+        match crate::multihost::OutboundControlPlaneMessage::try_from(retry[1].message)
+            .expect("decode second retry message")
+        {
+            crate::multihost::OutboundControlPlaneMessage::ChildExit(notification) => {
+                assert_eq!(notification.child_pid, second_child);
+            }
+        }
+    }
+
+    #[test]
+    fn test_drain_one_local_control_plane_message_reports_more_local_work_after_progress() {
+        let task = crate::syscalls::tests::init_platform(None);
+        let remote_parent = register_remote_owned_child(&task);
+        let remote_host = task
+            .global
+            .control_plane
+            .owner_of_running_process(remote_parent)
+            .expect("remote parent should have an owner");
+        let local_host = task.global.control_plane.local_host();
+        let first_child = register_exited_child_for_parent(
+            &task,
+            remote_parent,
+            local_host,
+            litebox_common_linux::signal::Signal::SIGCHLD.as_i32(),
+            23,
+        );
+        let second_child = register_exited_child_for_parent(
+            &task,
+            remote_parent,
+            local_host,
+            litebox_common_linux::signal::Signal::SIGCHLD.as_i32(),
+            24,
+        );
+        task.global
+            .control_plane
+            .queue_outbound_envelope_for_host(
+                local_host,
+                crate::multihost::OutboundControlPlaneEnvelope {
+                    source_host: local_host,
+                    message: crate::multihost::OutboundControlPlaneMessageWire::try_from(
+                        crate::multihost::OutboundControlPlaneMessage::ChildExit(
+                            child_exit_notification(remote_parent, first_child),
+                        ),
+                    )
+                    .expect("encode first child-exit message"),
+                    local_delivery_completed: false,
+                },
+            )
+            .expect("first local retry envelope should queue");
+        task.global
+            .control_plane
+            .queue_outbound_envelope_for_host(
+                local_host,
+                crate::multihost::OutboundControlPlaneEnvelope {
+                    source_host: local_host,
+                    message: crate::multihost::OutboundControlPlaneMessageWire::try_from(
+                        crate::multihost::OutboundControlPlaneMessage::ChildExit(
+                            litebox::process::ExitNotification {
+                                parent_pid: remote_parent,
+                                exit_signal: litebox_common_linux::signal::Signal::SIGCHLD.as_i32(),
+                                child_pid: second_child,
+                                exit_status: 24,
+                            },
+                        ),
+                    )
+                    .expect("encode second child-exit message"),
+                    local_delivery_completed: false,
+                },
+            )
+            .expect("second local retry envelope should queue");
+
+        assert!(task.drain_one_local_control_plane_message());
+        assert!(!task.drain_one_local_control_plane_message());
+
+        let local_after = task
+            .global
+            .control_plane
+            .poll_outbound_messages_for_host(local_host)
+            .expect("local queue should remain readable");
+        assert!(local_after.is_empty());
+
+        let rerouted = task
+            .global
+            .control_plane
+            .poll_outbound_messages_for_host(remote_host)
+            .expect("remote host queue should exist");
+        assert_eq!(rerouted.len(), 2);
+        match crate::multihost::OutboundControlPlaneMessage::try_from(rerouted[0].message)
+            .expect("decode first rerouted message")
+        {
+            crate::multihost::OutboundControlPlaneMessage::ChildExit(notification) => {
+                assert_eq!(notification.child_pid, first_child);
+            }
+        }
+        match crate::multihost::OutboundControlPlaneMessage::try_from(rerouted[1].message)
+            .expect("decode second rerouted message")
+        {
+            crate::multihost::OutboundControlPlaneMessage::ChildExit(notification) => {
+                assert_eq!(notification.child_pid, second_child);
+            }
+        }
     }
 
     #[cfg(target_arch = "x86_64")]

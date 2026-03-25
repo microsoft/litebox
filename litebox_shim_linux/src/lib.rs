@@ -280,6 +280,7 @@ impl LinuxShimBuilder {
             unix_addr_table: litebox::sync::RwLock::new(syscalls::unix::UnixAddrTable::new()),
             cross_process_signals: litebox::sync::Mutex::new(Vec::new()),
             process_thread_handles: litebox::sync::RwLock::new(alloc::collections::BTreeMap::new()),
+            local_control_plane_pump_active: core::sync::atomic::AtomicBool::new(false),
             transport_interrupt: alloc::sync::Arc::new(core::sync::atomic::AtomicBool::new(false)),
             epoll_graph_lock: litebox::sync::Mutex::new(()),
             control_plane,
@@ -2357,6 +2358,8 @@ struct GlobalState<FS: ShimFS> {
         Platform,
         alloc::collections::BTreeMap<i32, alloc::sync::Arc<syscalls::process::ThreadRemote>>,
     >,
+    /// Ensures only one task thread drains the local control-plane queue at a time.
+    local_control_plane_pump_active: core::sync::atomic::AtomicBool,
     /// Flag set during vfork to break transport spin-loops and propagate EINTR.
     transport_interrupt: alloc::sync::Arc<core::sync::atomic::AtomicBool>,
     /// Serializes nested epoll graph updates so validation and insertion see

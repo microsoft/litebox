@@ -124,6 +124,7 @@ pub(crate) enum OutboundControlPlaneMessageWireError {
 pub(crate) struct OutboundControlPlaneEnvelope {
     pub(crate) source_host: HostId,
     pub(crate) message: OutboundControlPlaneMessageWire,
+    pub(crate) local_delivery_completed: bool,
 }
 
 impl TryFrom<OutboundControlPlaneMessage> for OutboundControlPlaneMessageWire {
@@ -456,6 +457,7 @@ impl<Platform: RawSyncPrimitivesProvider> ControlPlane<Platform> {
         source_host: HostId,
         local_host: HostId,
         notification: ExitNotification,
+        local_delivery_completed: bool,
     ) -> Result<ChildExitRoute, ControlPlaneError> {
         let wire_message = OutboundControlPlaneMessageWire::try_from(
             OutboundControlPlaneMessage::ChildExit(notification),
@@ -491,6 +493,7 @@ impl<Platform: RawSyncPrimitivesProvider> ControlPlane<Platform> {
         queue.push(OutboundControlPlaneEnvelope {
             source_host,
             message: wire_message,
+            local_delivery_completed,
         });
         Ok(ChildExitRoute::QueuedRemote {
             target_host: owner_host,
@@ -528,6 +531,7 @@ impl<Platform: RawSyncPrimitivesProvider> ControlPlane<Platform> {
         queue.push(OutboundControlPlaneEnvelope {
             source_host,
             message: wire_message,
+            local_delivery_completed: false,
         });
         Ok(())
     }
@@ -559,6 +563,23 @@ impl<Platform: RawSyncPrimitivesProvider> ControlPlane<Platform> {
         Ok(())
     }
 
+    /// Restore one in-flight local envelope to the front of the local queue.
+    pub(crate) fn restore_local_outbound_envelope(
+        &self,
+        envelope: OutboundControlPlaneEnvelope,
+    ) -> Result<(), ControlPlaneError> {
+        let mut state = self.state.lock();
+        if !state.hosts.contains_key(&envelope.source_host) {
+            return Err(ControlPlaneError::UnknownHost(envelope.source_host));
+        }
+        let queue = state
+            .pending_outbound_messages
+            .entry(self.local_host)
+            .or_default();
+        queue.insert(0, envelope);
+        Ok(())
+    }
+
     /// Drain any queued outbound control-plane wire records for a specific host.
     pub(crate) fn poll_outbound_messages_for_host(
         &self,
@@ -572,6 +593,43 @@ impl<Platform: RawSyncPrimitivesProvider> ControlPlane<Platform> {
             .pending_outbound_messages
             .remove(&target_host)
             .unwrap_or_default())
+    }
+
+    /// Pop one queued outbound control-plane envelope for a specific host.
+    pub(crate) fn take_next_outbound_message_for_host(
+        &self,
+        target_host: HostId,
+    ) -> Result<Option<OutboundControlPlaneEnvelope>, ControlPlaneError> {
+        let mut state = self.state.lock();
+        if !state.hosts.contains_key(&target_host) {
+            return Err(ControlPlaneError::UnknownHost(target_host));
+        }
+        let Some(queue) = state.pending_outbound_messages.get_mut(&target_host) else {
+            return Ok(None);
+        };
+        if queue.is_empty() {
+            return Ok(None);
+        }
+        let next = queue.remove(0);
+        if queue.is_empty() {
+            state.pending_outbound_messages.remove(&target_host);
+        }
+        Ok(Some(next))
+    }
+
+    /// Returns whether a host currently has any queued outbound envelopes.
+    pub(crate) fn has_outbound_messages_for_host(
+        &self,
+        target_host: HostId,
+    ) -> Result<bool, ControlPlaneError> {
+        let state = self.state.lock();
+        if !state.hosts.contains_key(&target_host) {
+            return Err(ControlPlaneError::UnknownHost(target_host));
+        }
+        Ok(state
+            .pending_outbound_messages
+            .get(&target_host)
+            .is_some_and(|queue| !queue.is_empty()))
     }
 
     /// Resolve whether exec continues locally or needs a future host handoff.
@@ -1086,6 +1144,55 @@ mod tests {
             }
         }
         assert!(plane.pending_outbound_messages_for_host(worker).is_empty());
+    }
+
+    #[test]
+    fn take_next_outbound_message_preserves_tail_fifo() {
+        let plane = ControlPlane::<crate::Platform>::new_root_local();
+        let worker = plane
+            .register_worker_host(HostId::ROOT)
+            .expect("register worker host");
+        let first = ExitNotification {
+            parent_pid: ProcessId(31),
+            exit_signal: 17,
+            child_pid: ProcessId(32),
+            exit_status: 23,
+        };
+        let second = ExitNotification {
+            parent_pid: ProcessId(31),
+            exit_signal: 17,
+            child_pid: ProcessId(33),
+            exit_status: 24,
+        };
+
+        plane
+            .queue_remote_child_exit_notification(HostId::ROOT, worker, first)
+            .expect("queue first notification");
+        plane
+            .queue_remote_child_exit_notification(HostId::ROOT, worker, second)
+            .expect("queue second notification");
+
+        let next = plane
+            .take_next_outbound_message_for_host(worker)
+            .expect("take next queued message")
+            .expect("first queued message should exist");
+        assert_eq!(next.source_host, HostId::ROOT);
+        match decode_outbound_message(next) {
+            OutboundControlPlaneMessage::ChildExit(notification) => {
+                assert_eq!(notification, first);
+            }
+        }
+
+        let remaining = plane
+            .poll_outbound_messages_for_host(worker)
+            .expect("drain remaining queued message");
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].source_host, HostId::ROOT);
+        match decode_outbound_message(remaining[0]) {
+            OutboundControlPlaneMessage::ChildExit(notification) => {
+                assert_eq!(notification, second);
+            }
+        }
     }
 
     #[test]
