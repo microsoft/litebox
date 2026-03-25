@@ -119,6 +119,13 @@ pub(crate) enum OutboundControlPlaneMessageWireError {
     InvalidChildExit(ExitNotificationWireError),
 }
 
+/// Envelope queued for transport, including the authenticated sender metadata.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct OutboundControlPlaneEnvelope {
+    pub(crate) source_host: HostId,
+    pub(crate) message: OutboundControlPlaneMessageWire,
+}
+
 impl TryFrom<OutboundControlPlaneMessage> for OutboundControlPlaneMessageWire {
     type Error = OutboundControlPlaneMessageWireError;
 
@@ -197,6 +204,19 @@ struct HostEntry {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ChildExitProvenance {
+    pub(crate) source_host: HostId,
+    pub(crate) notification: ExitNotification,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ChildExitRoute {
+    DeliverLocal,
+    NoRunningOwner,
+    QueuedRemote { target_host: HostId },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ExecHandoff {
     process_id: ProcessId,
     source_host: HostId,
@@ -221,9 +241,10 @@ const MAX_PENDING_OUTBOUND_CONTROL_PLANE_MESSAGES_PER_HOST: usize = 64;
 struct ControlPlaneState {
     hosts: BTreeMap<HostId, HostEntry>,
     running_process_owners: BTreeMap<ProcessId, HostId>,
+    child_exit_provenance: BTreeMap<ProcessId, ChildExitProvenance>,
     active_handoffs_by_process: BTreeMap<ProcessId, ExecHandoffId>,
     handoffs: BTreeMap<ExecHandoffId, ExecHandoff>,
-    pending_outbound_messages: BTreeMap<HostId, Vec<OutboundControlPlaneMessageWire>>,
+    pending_outbound_messages: BTreeMap<HostId, Vec<OutboundControlPlaneEnvelope>>,
 }
 
 /// Root-host-owned control-plane state for the multi-host process model.
@@ -265,6 +286,7 @@ impl<Platform: RawSyncPrimitivesProvider> ControlPlane<Platform> {
             state: Mutex::new(ControlPlaneState {
                 hosts,
                 running_process_owners: BTreeMap::new(),
+                child_exit_provenance: BTreeMap::new(),
                 active_handoffs_by_process: BTreeMap::new(),
                 handoffs: BTreeMap::new(),
                 pending_outbound_messages: BTreeMap::new(),
@@ -358,6 +380,31 @@ impl<Platform: RawSyncPrimitivesProvider> ControlPlane<Platform> {
         state.running_process_owners.remove(&process_id)
     }
 
+    /// Record the authoritative child-exit facts until the notification is consumed.
+    pub(crate) fn record_child_exit_provenance(
+        &self,
+        source_host: HostId,
+        notification: ExitNotification,
+    ) {
+        let mut state = self.state.lock();
+        let previous = state.child_exit_provenance.insert(
+            notification.child_pid,
+            ChildExitProvenance {
+                source_host,
+                notification,
+            },
+        );
+        debug_assert!(
+            previous.is_none()
+                || previous
+                    == Some(ChildExitProvenance {
+                        source_host,
+                        notification,
+                    }),
+            "child exit provenance should be unique per exited child"
+        );
+    }
+
     /// Return the current owner host for a running guest process.
     pub(crate) fn owner_of_running_process(&self, process_id: ProcessId) -> Option<HostId> {
         self.state
@@ -367,9 +414,93 @@ impl<Platform: RawSyncPrimitivesProvider> ControlPlane<Platform> {
             .copied()
     }
 
+    /// Return the authoritative child-exit facts for a not-yet-consumed notification.
+    pub(crate) fn child_exit_provenance(
+        &self,
+        process_id: ProcessId,
+    ) -> Option<ChildExitProvenance> {
+        self.state
+            .lock()
+            .child_exit_provenance
+            .get(&process_id)
+            .copied()
+    }
+
+    /// Clear the child-exit proof once the notification has been consumed locally.
+    pub(crate) fn clear_child_exit_provenance(
+        &self,
+        process_id: ProcessId,
+    ) -> Option<ChildExitProvenance> {
+        self.state.lock().child_exit_provenance.remove(&process_id)
+    }
+
+    /// Drop any pending child-exit proofs targeted at a parent that is exiting.
+    pub(crate) fn clear_child_exit_provenance_for_parent(&self, parent_pid: ProcessId) {
+        self.state
+            .lock()
+            .child_exit_provenance
+            .retain(|_, proof| proof.notification.parent_pid != parent_pid);
+    }
+
+    /// Return whether a host id is currently registered in this control plane.
+    pub(crate) fn is_registered_host(&self, host_id: HostId) -> bool {
+        self.state.lock().hosts.contains_key(&host_id)
+    }
+
+    /// Route a child-exit notification based on the parent's current owner.
+    ///
+    /// This re-reads the owner and queues any remote delivery while holding the
+    /// control-plane lock so ownership changes cannot race between lookup and enqueue.
+    pub(crate) fn route_child_exit_notification(
+        &self,
+        source_host: HostId,
+        local_host: HostId,
+        notification: ExitNotification,
+    ) -> Result<ChildExitRoute, ControlPlaneError> {
+        let wire_message = OutboundControlPlaneMessageWire::try_from(
+            OutboundControlPlaneMessage::ChildExit(notification),
+        )
+        .map_err(ControlPlaneError::InvalidOutboundMessage)?;
+        let mut state = self.state.lock();
+        if !state.hosts.contains_key(&source_host) {
+            return Err(ControlPlaneError::UnknownHost(source_host));
+        }
+        if !state.hosts.contains_key(&local_host) {
+            return Err(ControlPlaneError::UnknownHost(local_host));
+        }
+        let Some(owner_host) = state
+            .running_process_owners
+            .get(&notification.parent_pid)
+            .copied()
+        else {
+            return Ok(ChildExitRoute::NoRunningOwner);
+        };
+        if owner_host == local_host {
+            return Ok(ChildExitRoute::DeliverLocal);
+        }
+        let queue = state
+            .pending_outbound_messages
+            .entry(owner_host)
+            .or_default();
+        if queue.len() >= MAX_PENDING_OUTBOUND_CONTROL_PLANE_MESSAGES_PER_HOST {
+            return Err(ControlPlaneError::OutboundMessageQueueFull {
+                target_host: owner_host,
+                limit: MAX_PENDING_OUTBOUND_CONTROL_PLANE_MESSAGES_PER_HOST,
+            });
+        }
+        queue.push(OutboundControlPlaneEnvelope {
+            source_host,
+            message: wire_message,
+        });
+        Ok(ChildExitRoute::QueuedRemote {
+            target_host: owner_host,
+        })
+    }
+
     /// Queue a child-exit notification as a wire record for later remote delivery.
     pub(crate) fn queue_remote_child_exit_notification(
         &self,
+        source_host: HostId,
         target_host: HostId,
         notification: ExitNotification,
     ) -> Result<(), ControlPlaneError> {
@@ -378,6 +509,9 @@ impl<Platform: RawSyncPrimitivesProvider> ControlPlane<Platform> {
         )
         .map_err(ControlPlaneError::InvalidOutboundMessage)?;
         let mut state = self.state.lock();
+        if !state.hosts.contains_key(&source_host) {
+            return Err(ControlPlaneError::UnknownHost(source_host));
+        }
         if !state.hosts.contains_key(&target_host) {
             return Err(ControlPlaneError::UnknownHost(target_host));
         }
@@ -391,7 +525,37 @@ impl<Platform: RawSyncPrimitivesProvider> ControlPlane<Platform> {
                 limit: MAX_PENDING_OUTBOUND_CONTROL_PLANE_MESSAGES_PER_HOST,
             });
         }
-        queue.push(wire_message);
+        queue.push(OutboundControlPlaneEnvelope {
+            source_host,
+            message: wire_message,
+        });
+        Ok(())
+    }
+
+    /// Queue a pre-encoded outbound envelope for a host to retry or consume later.
+    pub(crate) fn queue_outbound_envelope_for_host(
+        &self,
+        target_host: HostId,
+        envelope: OutboundControlPlaneEnvelope,
+    ) -> Result<(), ControlPlaneError> {
+        let mut state = self.state.lock();
+        if !state.hosts.contains_key(&envelope.source_host) {
+            return Err(ControlPlaneError::UnknownHost(envelope.source_host));
+        }
+        if !state.hosts.contains_key(&target_host) {
+            return Err(ControlPlaneError::UnknownHost(target_host));
+        }
+        let queue = state
+            .pending_outbound_messages
+            .entry(target_host)
+            .or_default();
+        if queue.len() >= MAX_PENDING_OUTBOUND_CONTROL_PLANE_MESSAGES_PER_HOST {
+            return Err(ControlPlaneError::OutboundMessageQueueFull {
+                target_host,
+                limit: MAX_PENDING_OUTBOUND_CONTROL_PLANE_MESSAGES_PER_HOST,
+            });
+        }
+        queue.push(envelope);
         Ok(())
     }
 
@@ -399,7 +563,7 @@ impl<Platform: RawSyncPrimitivesProvider> ControlPlane<Platform> {
     pub(crate) fn poll_outbound_messages_for_host(
         &self,
         target_host: HostId,
-    ) -> Result<Vec<OutboundControlPlaneMessageWire>, ControlPlaneError> {
+    ) -> Result<Vec<OutboundControlPlaneEnvelope>, ControlPlaneError> {
         let mut state = self.state.lock();
         if !state.hosts.contains_key(&target_host) {
             return Err(ControlPlaneError::UnknownHost(target_host));
@@ -557,7 +721,7 @@ impl<Platform: RawSyncPrimitivesProvider> ControlPlane<Platform> {
     fn pending_outbound_messages_for_host(
         &self,
         target_host: HostId,
-    ) -> Vec<OutboundControlPlaneMessageWire> {
+    ) -> Vec<OutboundControlPlaneEnvelope> {
         self.state
             .lock()
             .pending_outbound_messages
@@ -574,9 +738,10 @@ mod tests {
     use super::*;
 
     fn decode_outbound_message(
-        wire: OutboundControlPlaneMessageWire,
+        envelope: OutboundControlPlaneEnvelope,
     ) -> OutboundControlPlaneMessage {
-        OutboundControlPlaneMessage::try_from(wire).expect("decode outbound wire message")
+        OutboundControlPlaneMessage::try_from(envelope.message)
+            .expect("decode outbound wire message")
     }
 
     #[test]
@@ -887,19 +1052,23 @@ mod tests {
         };
 
         plane
-            .queue_remote_child_exit_notification(worker, first)
+            .queue_remote_child_exit_notification(HostId::ROOT, worker, first)
             .expect("queue notification");
         plane
-            .queue_remote_child_exit_notification(worker, second)
+            .queue_remote_child_exit_notification(HostId::ROOT, worker, second)
             .expect("queue second notification");
 
         let pending = plane.pending_outbound_messages_for_host(worker);
         assert_eq!(pending.len(), 2);
+        assert_eq!(pending[0].source_host, HostId::ROOT);
+        assert_eq!(pending[1].source_host, HostId::ROOT);
 
         let drained = plane
             .poll_outbound_messages_for_host(worker)
             .expect("drain notifications");
         assert_eq!(drained.len(), 2);
+        assert_eq!(drained[0].source_host, HostId::ROOT);
+        assert_eq!(drained[1].source_host, HostId::ROOT);
         match decode_outbound_message(drained[0]) {
             OutboundControlPlaneMessage::ChildExit(notification) => {
                 assert_eq!(notification.parent_pid, first.parent_pid);
@@ -929,6 +1098,7 @@ mod tests {
         for idx in 0..MAX_PENDING_OUTBOUND_CONTROL_PLANE_MESSAGES_PER_HOST {
             plane
                 .queue_remote_child_exit_notification(
+                    HostId::ROOT,
                     worker,
                     ExitNotification {
                         parent_pid: ProcessId(40),
@@ -942,6 +1112,7 @@ mod tests {
 
         assert_eq!(
             plane.queue_remote_child_exit_notification(
+                HostId::ROOT,
                 worker,
                 ExitNotification {
                     parent_pid: ProcessId(40),
@@ -973,6 +1144,7 @@ mod tests {
 
         plane
             .queue_remote_child_exit_notification(
+                HostId::ROOT,
                 worker_a,
                 ExitNotification {
                     parent_pid: ProcessId(51),
@@ -984,6 +1156,7 @@ mod tests {
             .expect("queue worker a notification");
         plane
             .queue_remote_child_exit_notification(
+                HostId::ROOT,
                 worker_b,
                 ExitNotification {
                     parent_pid: ProcessId(52),
@@ -998,6 +1171,7 @@ mod tests {
             .poll_outbound_messages_for_host(worker_a)
             .expect("poll worker a");
         assert_eq!(drained_a.len(), 1);
+        assert_eq!(drained_a[0].source_host, HostId::ROOT);
         match decode_outbound_message(drained_a[0]) {
             OutboundControlPlaneMessage::ChildExit(notification) => {
                 assert_eq!(notification.parent_pid, ProcessId(51));
@@ -1007,6 +1181,7 @@ mod tests {
 
         let pending_b = plane.pending_outbound_messages_for_host(worker_b);
         assert_eq!(pending_b.len(), 1);
+        assert_eq!(pending_b[0].source_host, HostId::ROOT);
         match decode_outbound_message(pending_b[0]) {
             OutboundControlPlaneMessage::ChildExit(notification) => {
                 assert_eq!(notification.parent_pid, ProcessId(52));
