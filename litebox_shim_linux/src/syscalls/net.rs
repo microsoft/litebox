@@ -1451,7 +1451,7 @@ impl<FS: ShimFS> Task<FS> {
                     .clone()
                     .map(|addr| addr.unix().ok_or(Errno::EAFNOSUPPORT))
                     .transpose()?;
-                file.sendto(self, buf, flags, addr)
+                file.sendto(self, buf, flags, addr, Vec::new())
             },
         );
         if let Err(Errno::EPIPE) = ret
@@ -1529,6 +1529,168 @@ impl<FS: ShimFS> Task<FS> {
         Ok(total_sent)
     }
 
+    /// Parse `SCM_RIGHTS` control messages from a `sendmsg` header.
+    ///
+    /// Iterates over the control-message buffer, validates each `cmsghdr`,
+    /// and duplicates the referenced file descriptors for inter-process
+    /// passing. Only `SOL_SOCKET` / `SCM_RIGHTS` is supported; any other
+    /// cmsg level/type is rejected with `EOPNOTSUPP`.
+    fn parse_sendmsg_cmsg(
+        &self,
+        msg: &litebox_common_linux::UserMsgHdr<Platform>,
+    ) -> Result<Vec<super::unix::PassedFd>, Errno> {
+        use litebox::platform::RawConstPointer as _;
+        use litebox_common_linux::{CmsgHdr, SCM_RIGHTS, cmsg_align, cmsg_len};
+
+        let controllen = msg.msg_controllen;
+        if controllen == 0 {
+            return Ok(Vec::new());
+        }
+
+        let msg_control = { msg.msg_control };
+        let control_ptr = msg_control.as_usize();
+        if control_ptr == 0 {
+            return Err(Errno::EFAULT);
+        }
+
+        let hdr_size = core::mem::size_of::<CmsgHdr>();
+        let mut passed_fds = Vec::new();
+        let mut offset = 0usize;
+
+        while offset + hdr_size <= controllen {
+            let cmsg_ptr = ConstPtr::<CmsgHdr>::from_usize(control_ptr + offset);
+            let cmsg: CmsgHdr = cmsg_ptr.read_at_offset(0).ok_or(Errno::EFAULT)?;
+
+            if cmsg.cmsg_len < cmsg_len(0) {
+                return Err(Errno::EINVAL);
+            }
+
+            // Validate that the full cmsg fits within the control buffer.
+            if cmsg.cmsg_len > controllen - offset {
+                return Err(Errno::EINVAL);
+            }
+
+            // SOL_SOCKET = 1 (SocketOptionLevel::SOCKET)
+            if cmsg.cmsg_level != 1 || cmsg.cmsg_type != SCM_RIGHTS {
+                return Err(Errno::EOPNOTSUPP);
+            }
+
+            let data_offset = cmsg_align(hdr_size);
+            let data_len = cmsg.cmsg_len - data_offset;
+            if !data_len.is_multiple_of(core::mem::size_of::<i32>()) {
+                return Err(Errno::EINVAL);
+            }
+            let fd_count = data_len / core::mem::size_of::<i32>();
+            if fd_count == 0 {
+                // Advance past this cmsg.
+                offset += cmsg_align(cmsg.cmsg_len);
+                continue;
+            }
+
+            let fds_ptr = ConstPtr::<i32>::from_usize(control_ptr + offset + data_offset);
+            let fd_array = fds_ptr.to_owned_slice(fd_count).ok_or(Errno::EFAULT)?;
+
+            let files = self.files.borrow();
+            let rds = files.raw_descriptor_store.read();
+            let mut dt = self.global.litebox.descriptor_table_mut();
+            for &guest_fd in &fd_array {
+                let raw_fd = usize::try_from(guest_fd).map_err(|_| Errno::EBADF)?;
+                let passed = rds
+                    .duplicate_for_passing(raw_fd, &mut dt)
+                    .ok_or(Errno::EBADF)?;
+                passed_fds.push(passed);
+            }
+
+            offset += cmsg_align(cmsg.cmsg_len);
+        }
+
+        Ok(passed_fds)
+    }
+
+    /// Write an `SCM_RIGHTS` control message into the user's `msg_control`
+    /// buffer. Updates `msg_controllen` with the actual bytes written, and
+    /// sets `MSG_CTRUNC` in `msg_flags` if the buffer was too small.
+    ///
+    /// Returns the number of fds that were actually written to the control
+    /// buffer. The caller must close any excess fds (matching Linux semantics
+    /// where truncated SCM_RIGHTS fds are closed by the kernel).
+    fn write_recvmsg_cmsg(
+        &self,
+        hdr: &mut litebox_common_linux::UserMsgHdr<Platform>,
+        fds: &[i32],
+        msg_flags: &mut ReceiveFlags,
+    ) -> usize {
+        use litebox::platform::{RawConstPointer as _, RawMutPointer as _};
+        use litebox_common_linux::{CmsgHdr, SCM_RIGHTS, cmsg_align, cmsg_len, cmsg_space};
+
+        if fds.is_empty() {
+            hdr.msg_controllen = 0;
+            return 0;
+        }
+
+        let fd_data_len = core::mem::size_of_val(fds);
+        let needed = cmsg_space(fd_data_len);
+        let control_buf_len = hdr.msg_controllen;
+        let msg_control = { hdr.msg_control };
+        let control_ptr = msg_control.as_usize();
+
+        if control_ptr == 0 || control_buf_len == 0 {
+            *msg_flags |= ReceiveFlags::CTRUNC;
+            hdr.msg_controllen = 0;
+            return 0;
+        }
+
+        let cmsg_hdr = CmsgHdr {
+            cmsg_len: cmsg_len(fd_data_len),
+            cmsg_level: 1, // SOL_SOCKET
+            cmsg_type: SCM_RIGHTS,
+        };
+
+        let hdr_size = core::mem::size_of::<CmsgHdr>();
+        let data_offset = cmsg_align(hdr_size);
+
+        // Check if we have room for at least the header.
+        if control_buf_len < data_offset {
+            *msg_flags |= ReceiveFlags::CTRUNC;
+            hdr.msg_controllen = 0;
+            return 0;
+        }
+
+        // Write the cmsghdr.
+        let cmsg_ptr = MutPtr::<CmsgHdr>::from_usize(control_ptr);
+        if cmsg_ptr.write_at_offset(0, cmsg_hdr).is_none() {
+            *msg_flags |= ReceiveFlags::CTRUNC;
+            hdr.msg_controllen = 0;
+            return 0;
+        }
+
+        // Determine how many fds fit in the remaining buffer.
+        let available_data = control_buf_len.saturating_sub(data_offset);
+        let fds_that_fit = available_data / core::mem::size_of::<i32>();
+        let fds_to_write = fds.len().min(fds_that_fit);
+
+        if fds_to_write < fds.len() {
+            *msg_flags |= ReceiveFlags::CTRUNC;
+        }
+
+        // Write the fd array.
+        if fds_to_write > 0 {
+            let fd_ptr = MutPtr::<u8>::from_usize(control_ptr + data_offset);
+            let fd_bytes: &[u8] = zerocopy::IntoBytes::as_bytes(&fds[..fds_to_write]);
+            let _ = fd_ptr.copy_from_slice(0, fd_bytes);
+        }
+
+        // Set the actual control length (including the full cmsg for all
+        // written fds, not truncated ones).
+        let written_data_len = fds_to_write * core::mem::size_of::<i32>();
+        hdr.msg_controllen = if fds_to_write == fds.len() {
+            needed
+        } else {
+            cmsg_space(written_data_len)
+        };
+        fds_to_write
+    }
+
     fn do_sendmsg(
         &self,
         sockfd: u32,
@@ -1544,9 +1706,6 @@ impl<FS: ShimFS> Task<FS> {
         } else {
             None
         };
-        if msg.msg_controllen != 0 {
-            return Err(Errno::EOPNOTSUPP);
-        }
         if msg.msg_iovlen > 1024 {
             return Err(Errno::EINVAL);
         }
@@ -1562,6 +1721,10 @@ impl<FS: ShimFS> Task<FS> {
             &self.global,
             sockfd,
             |fd| {
+                // Inet sockets do not support ancillary data.
+                if msg.msg_controllen != 0 {
+                    return Err(Errno::EOPNOTSUPP);
+                }
                 let sock_addr = sock_addr
                     .clone()
                     .map(|addr| addr.inet().ok_or(Errno::EAFNOSUPPORT))
@@ -1583,20 +1746,31 @@ impl<FS: ShimFS> Task<FS> {
                 }
             },
             |file| {
+                // Parse SCM_RIGHTS ancillary data for unix sockets.
+                let passed_fds = self.parse_sendmsg_cmsg(msg)?;
                 let sock_addr = sock_addr
                     .clone()
                     .map(|addr| addr.unix().ok_or(Errno::EAFNOSUPPORT))
                     .transpose()?;
                 if file.sock_type() == SockType::Stream {
                     if total_len == 0 {
-                        return file.sendto(self, &[], flags, sock_addr.clone());
+                        return file.sendto(self, &[], flags, sock_addr.clone(), passed_fds);
                     }
+                    // For stream sockets with ancillary data, attach fds to
+                    // the first chunk only (matching Linux semantics).
+                    let mut fds = Some(passed_fds);
                     Self::sendmsg_stream_iovs(&iovs, |chunk| {
-                        file.sendto(self, chunk, flags, sock_addr.clone())
+                        file.sendto(
+                            self,
+                            chunk,
+                            flags,
+                            sock_addr.clone(),
+                            fds.take().unwrap_or_default(),
+                        )
                     })
                 } else {
                     let buf = Self::copy_sendmsg_iovs(&iovs)?;
-                    file.sendto(self, &buf, flags, sock_addr)
+                    file.sendto(self, &buf, flags, sock_addr, passed_fds)
                 }
             },
         );
@@ -1727,7 +1901,8 @@ impl<FS: ShimFS> Task<FS> {
         let msg_name = hdr.msg_name;
         let want_source = msg_name.as_usize() != 0;
         let mut source_addr = None;
-        let size = self.do_recvfrom(
+        let mut received_fds = Vec::new();
+        let size = self.do_recvfrom_with_fds(
             sockfd,
             &mut recv_buf,
             flags,
@@ -1736,6 +1911,7 @@ impl<FS: ShimFS> Task<FS> {
             } else {
                 None
             },
+            &mut received_fds,
         )?;
 
         let copied_len = size.min(recv_buf.len());
@@ -1763,11 +1939,37 @@ impl<FS: ShimFS> Task<FS> {
         } else {
             hdr.msg_namelen = 0;
         }
-        hdr.msg_controllen = 0;
+
         let mut msg_flags = ReceiveFlags::empty();
         if size > copied_len {
             msg_flags |= ReceiveFlags::TRUNC;
         }
+
+        // Install received fds and format SCM_RIGHTS control message.
+        if received_fds.is_empty() {
+            hdr.msg_controllen = 0;
+        } else {
+            let mut installed_fds = Vec::with_capacity(received_fds.len());
+            {
+                let files = self.files.borrow();
+                let mut rds = files.raw_descriptor_store.write();
+                for passed_fd in received_fds {
+                    let raw_fd = rds.insert_passed_fd(passed_fd);
+                    installed_fds.push(i32::try_from(raw_fd).unwrap_or(i32::MAX));
+                }
+            }
+
+            // Format the SCM_RIGHTS control message into the user buffer.
+            let fds_written = self.write_recvmsg_cmsg(&mut hdr, &installed_fds, &mut msg_flags);
+
+            // Close any excess fds that didn't fit in the control buffer
+            // (matching Linux semantics where truncated SCM_RIGHTS fds are
+            // closed by the kernel).
+            for &excess_fd in &installed_fds[fds_written..] {
+                let _ = self.sys_close(excess_fd);
+            }
+        }
+
         hdr.msg_flags = msg_flags;
         msg.write_at_offset(0, hdr).ok_or(Errno::EFAULT)?;
         Ok(size)
@@ -1779,6 +1981,17 @@ impl<FS: ShimFS> Task<FS> {
         buf: &mut [u8],
         flags: ReceiveFlags,
         source_addr: Option<&mut Option<SocketAddress>>,
+    ) -> Result<usize, Errno> {
+        self.do_recvfrom_with_fds(sockfd, buf, flags, source_addr, &mut Vec::new())
+    }
+
+    fn do_recvfrom_with_fds(
+        &self,
+        sockfd: u32,
+        buf: &mut [u8],
+        flags: ReceiveFlags,
+        source_addr: Option<&mut Option<SocketAddress>>,
+        received_fds: &mut Vec<super::unix::PassedFd>,
     ) -> Result<usize, Errno> {
         let want_source = source_addr.is_some();
         let files = self.files.borrow();
@@ -1809,6 +2022,7 @@ impl<FS: ShimFS> Task<FS> {
                         &mut buf.borrow_mut(),
                         flags,
                         if want_source { Some(&mut addr) } else { None },
+                        received_fds,
                     )?;
                     let src_addr = addr.map(SocketAddress::Unix);
                     Ok((size, src_addr))
@@ -3058,7 +3272,7 @@ mod tests {
 mod unix_tests {
     use core::time::Duration;
 
-    use alloc::{string::ToString, vec::Vec};
+    use alloc::{string::ToString, vec, vec::Vec};
     use litebox::{event::Events, platform::RawConstPointer};
     use litebox_common_linux::{
         AddressFamily, AtFlags, ReceiveFlags, SendFlags, SockFlags, SockType, SocketOption,
@@ -3859,32 +4073,112 @@ mod unix_tests {
     }
 
     #[test]
-    fn test_sendmsg_rejects_ancillary_data_without_panicking() {
+    fn test_sendmsg_rejects_ancillary_data_on_inet_socket() {
+        // Ancillary data on inet sockets should still be rejected.
         let task = init_platform(None);
         let (sock1, sock2) = task
             .do_socketpair(AddressFamily::UNIX, SockType::Stream, SockFlags::empty(), 0)
             .expect("socketpair failed");
 
+        // Build a valid SCM_RIGHTS cmsg with the fd of sock2.
+        let fd_to_pass = i32::try_from(sock2).unwrap();
+        let hdr_size = core::mem::size_of::<litebox_common_linux::CmsgHdr>();
+        let aligned_hdr = litebox_common_linux::cmsg_align(hdr_size);
+        let cmsg_hdr = litebox_common_linux::CmsgHdr {
+            cmsg_len: litebox_common_linux::cmsg_len(core::mem::size_of::<i32>()),
+            cmsg_level: 1, // SOL_SOCKET
+            cmsg_type: litebox_common_linux::SCM_RIGHTS,
+        };
+        let mut control_buf =
+            vec![0u8; litebox_common_linux::cmsg_space(core::mem::size_of::<i32>())];
+        // Write the cmsghdr.
+        control_buf[..hdr_size].copy_from_slice(zerocopy::IntoBytes::as_bytes(&cmsg_hdr));
+        // Write the fd.
+        control_buf[aligned_hdr..aligned_hdr + core::mem::size_of::<i32>()]
+            .copy_from_slice(&fd_to_pass.to_ne_bytes());
+
         let byte = b"x";
-        let control = [0u8; 1];
         let iovec = [litebox_common_linux::IoVec {
             iov_base: MutPtr::from_usize(byte.as_ptr() as usize),
             iov_len: 1,
         }];
-        let hdr = {
+        let send_hdr = {
             use zerocopy::FromZeros as _;
             let mut h = litebox_common_linux::UserMsgHdr::<crate::Platform>::new_zeroed();
             h.msg_iov = ConstPtr::from_usize(iovec.as_ptr() as usize);
             h.msg_iovlen = iovec.len();
-            h.msg_control = ConstPtr::from_usize(control.as_ptr() as usize);
-            h.msg_controllen = control.len();
+            h.msg_control = ConstPtr::from_usize(control_buf.as_ptr() as usize);
+            h.msg_controllen = control_buf.len();
             h
         };
-        let err = task
-            .do_sendmsg(sock1, &hdr, SendFlags::empty())
-            .expect_err("ancillary data should be rejected");
-        assert_eq!(err, Errno::EOPNOTSUPP);
 
+        // Send with SCM_RIGHTS on a unix socket should succeed.
+        let sent = task
+            .do_sendmsg(sock1, &send_hdr, SendFlags::empty())
+            .expect("sendmsg with SCM_RIGHTS should succeed");
+        assert_eq!(sent, 1);
+
+        // Receive via recvmsg — should get the fd back.
+        let mut recv_data = [0u8; 1];
+        let recv_iovec = [litebox_common_linux::IoVec {
+            iov_base: MutPtr::from_usize(recv_data.as_mut_ptr() as usize),
+            iov_len: recv_data.len(),
+        }];
+        let mut recv_control =
+            vec![0u8; litebox_common_linux::cmsg_space(core::mem::size_of::<i32>())];
+        let mut recv_hdr = {
+            use zerocopy::FromZeros as _;
+            let mut h = litebox_common_linux::UserMsgHdr::<crate::Platform>::new_zeroed();
+            h.msg_iov = ConstPtr::from_usize(recv_iovec.as_ptr() as usize);
+            h.msg_iovlen = recv_iovec.len();
+            h.msg_control = ConstPtr::from_usize(recv_control.as_mut_ptr() as usize);
+            h.msg_controllen = recv_control.len();
+            h
+        };
+        let recv_hdr_ptr = MutPtr::from_usize((&raw mut recv_hdr) as usize);
+        let received = task
+            .sys_recvmsg(
+                i32::try_from(sock2).unwrap(),
+                recv_hdr_ptr,
+                ReceiveFlags::empty(),
+            )
+            .expect("recvmsg should succeed");
+        assert_eq!(received, 1);
+        assert_eq!(recv_data[0], b'x');
+
+        // Verify we got a control message back.
+        let recv_controllen = { recv_hdr.msg_controllen };
+        assert!(
+            recv_controllen >= litebox_common_linux::cmsg_len(core::mem::size_of::<i32>()),
+            "expected control data, got controllen={}",
+            recv_controllen
+        );
+
+        // Parse the received cmsghdr.
+        let recv_cmsg: litebox_common_linux::CmsgHdr =
+            zerocopy::FromBytes::read_from_bytes(&recv_control[..hdr_size]).unwrap();
+        assert_eq!(recv_cmsg.cmsg_level, 1); // SOL_SOCKET
+        assert_eq!(recv_cmsg.cmsg_type, litebox_common_linux::SCM_RIGHTS);
+
+        // Extract the received fd number.
+        let mut fd_bytes = [0u8; 4];
+        fd_bytes.copy_from_slice(&recv_control[aligned_hdr..aligned_hdr + 4]);
+        let received_fd = i32::from_ne_bytes(fd_bytes);
+
+        // The received fd should be a new fd (different from the one we sent).
+        assert_ne!(received_fd, fd_to_pass);
+
+        // Verify the received fd is alive.
+        assert!(
+            task.files
+                .borrow()
+                .raw_descriptor_store
+                .read()
+                .is_alive(usize::try_from(received_fd).unwrap()),
+            "received fd should be alive"
+        );
+
+        close_socket(&task, received_fd as u32);
         close_socket(&task, sock1);
         close_socket(&task, sock2);
     }

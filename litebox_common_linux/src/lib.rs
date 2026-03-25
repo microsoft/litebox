@@ -896,6 +896,37 @@ impl SocketOptionName {
     }
 }
 
+/// Linux control message header (`struct cmsghdr`).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, zerocopy::FromBytes, zerocopy::Immutable, zerocopy::IntoBytes)]
+pub struct CmsgHdr {
+    /// Length of the control message including the header.
+    pub cmsg_len: usize,
+    /// Originating protocol (e.g. `SOL_SOCKET`).
+    pub cmsg_level: i32,
+    /// Protocol-specific type (e.g. `SCM_RIGHTS`).
+    pub cmsg_type: i32,
+}
+
+/// `SCM_RIGHTS` — pass file descriptors via ancillary data.
+pub const SCM_RIGHTS: i32 = 1;
+
+/// CMSG alignment (matches `__kernel_size_t` alignment, i.e. `size_of::<usize>()`).
+pub const fn cmsg_align(len: usize) -> usize {
+    let align = core::mem::size_of::<usize>();
+    (len + align - 1) & !(align - 1)
+}
+
+/// Total space needed for a control message with `data_len` bytes of payload.
+pub const fn cmsg_space(data_len: usize) -> usize {
+    cmsg_align(core::mem::size_of::<CmsgHdr>()) + cmsg_align(data_len)
+}
+
+/// Value for `cmsg_len` for a control message with `data_len` bytes of payload.
+pub const fn cmsg_len(data_len: usize) -> usize {
+    cmsg_align(core::mem::size_of::<CmsgHdr>()) + data_len
+}
+
 #[derive(Debug, Clone, Copy, FromBytes, IntoBytes)]
 #[repr(C)]
 pub struct Ucred {
@@ -1920,6 +1951,8 @@ bitflags::bitflags! {
         const PEEK = 0x2;
         /// `MSG_NOSIGNAL`: ignored for receive calls on Linux.
         const NOSIGNAL = 0x4000;
+        /// `MSG_CTRUNC`: control data was truncated
+        const CTRUNC = 0x8;
         /// `MSG_TRUNC`: truncate the message
         const TRUNC = 0x20;
         /// `MSG_WAITALL`: wait for the full amount of data

@@ -580,6 +580,15 @@ pub struct RawDescriptorStorage {
     stored_fds: Vec<Option<StoredFd>>,
 }
 
+/// An opaque token representing an fd duplicated for inter-process delivery
+/// (e.g. via `SCM_RIGHTS`). Create one with
+/// [`RawDescriptorStorage::duplicate_for_passing`] and install it on the
+/// receiving side with [`RawDescriptorStorage::insert_passed_fd`].
+pub struct PassedFd {
+    owned: OwnedFd,
+    type_id: core::any::TypeId,
+}
+
 struct StoredFd {
     x: Arc<OwnedFd>,
     subsystem_entry_type_id: core::any::TypeId,
@@ -645,6 +654,55 @@ impl RawDescriptorStorage {
                 })
                 .collect(),
         }
+    }
+
+    /// Duplicate a stored fd for inter-process passing (e.g. `SCM_RIGHTS`).
+    ///
+    /// Creates a new entry in the global descriptor table that shares the same
+    /// underlying file description as the fd at `raw_fd`. Returns a
+    /// [`PassedFd`] token that can be installed in another process's raw
+    /// descriptor store via [`Self::insert_passed_fd`].
+    ///
+    /// Returns `None` if `raw_fd` is not occupied or the underlying owned fd
+    /// has already been closed.
+    pub fn duplicate_for_passing<Platform: RawSyncPrimitivesProvider>(
+        &self,
+        raw_fd: usize,
+        global_dt: &mut Descriptors<Platform>,
+    ) -> Option<PassedFd> {
+        let stored = self.stored_fds.get(raw_fd)?.as_ref()?;
+        let new_owned = global_dt.duplicate_raw_fd(&stored.x)?;
+        Some(PassedFd {
+            owned: new_owned,
+            type_id: stored.subsystem_entry_type_id,
+        })
+    }
+
+    /// Install an fd received via inter-process passing (e.g. `SCM_RIGHTS`).
+    ///
+    /// The caller supplies a [`PassedFd`] token (obtained from
+    /// [`Self::duplicate_for_passing`]). The fd is placed in the first
+    /// available slot and its raw integer is returned.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the selected slot is unexpectedly occupied.
+    pub fn insert_passed_fd(&mut self, passed: PassedFd) -> usize {
+        let raw_fd = self
+            .stored_fds
+            .iter()
+            .position(Option::is_none)
+            .unwrap_or_else(|| {
+                self.stored_fds.push(None);
+                self.stored_fds.len() - 1
+            });
+        let stored = StoredFd {
+            x: Arc::new(passed.owned),
+            subsystem_entry_type_id: passed.type_id,
+        };
+        let old = self.stored_fds[raw_fd].replace(stored);
+        assert!(old.is_none());
+        raw_fd
     }
 
     /// Get the corresponding integer value of the provided `fd`.

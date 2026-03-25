@@ -112,10 +112,18 @@ impl<T> ReadEnd<T> {
     common_functions_for_channel!();
 }
 
-#[derive(Clone)]
 pub(crate) struct WriteEnd<T> {
     endpoint: alloc::sync::Arc<EndPointer<crate::Platform, ringbuf::HeapProd<T>>>,
     peer: alloc::sync::Weak<EndPointer<crate::Platform, ringbuf::HeapCons<T>>>,
+}
+
+impl<T> Clone for WriteEnd<T> {
+    fn clone(&self) -> Self {
+        Self {
+            endpoint: self.endpoint.clone(),
+            peer: self.peer.clone(),
+        }
+    }
 }
 
 impl<T> WriteEnd<T> {

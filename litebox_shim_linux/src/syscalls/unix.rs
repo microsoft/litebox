@@ -442,11 +442,14 @@ impl<FS: ShimFS> AddrView<FS> {
     }
 }
 
+/// Re-export for use by sibling modules (e.g. `net.rs`).
+pub(super) use litebox::fd::PassedFd;
+
 /// A message sent over a Unix socket.
 struct Message {
     data: Vec<u8>,
-    // TODO: add control messages
-    // cmsgs: Option<Vec<Cmsg>>,
+    /// File descriptors passed via `SCM_RIGHTS` ancillary data.
+    passed_fds: Vec<PassedFd>,
 }
 
 /// Represents a connected Unix stream socket.
@@ -523,6 +526,7 @@ impl<FS: ShimFS> UnixConnectedStream<FS> {
         &self,
         mut buf: &mut [u8],
         seqpacket: bool,
+        received_fds: &mut Vec<PassedFd>,
     ) -> Result<usize, TryOpError<Errno>> {
         if seqpacket {
             // SOCK_SEQPACKET: return exactly one message per recv call.
@@ -534,6 +538,7 @@ impl<FS: ShimFS> UnixConnectedStream<FS> {
                 .peek_and_consume_one(|msg| {
                     let copy_len = buf.len().min(msg.data.len());
                     buf[..copy_len].copy_from_slice(&msg.data[..copy_len]);
+                    received_fds.append(&mut msg.passed_fds);
                     Ok((true, copy_len))
                 })
                 .map_err(|e| match e {
@@ -547,6 +552,10 @@ impl<FS: ShimFS> UnixConnectedStream<FS> {
         let mut total_read = 0;
         while !buf.is_empty() {
             let n = match self.recv_channel.peek_and_consume_one(|msg| {
+                // Extract any passed fds from the first message that carries them.
+                if !msg.passed_fds.is_empty() {
+                    received_fds.append(&mut msg.passed_fds);
+                }
                 if buf.len() >= msg.data.len() {
                     buf[..msg.data.len()].copy_from_slice(&msg.data);
                     Ok((true, msg.data.len()))
@@ -779,6 +788,7 @@ impl<FS: ShimFS> UnixStream<FS> {
         .map_err(Errno::from)
     }
 
+    #[expect(clippy::too_many_arguments)]
     fn sendto(
         &self,
         cx: &WaitContext<'_, crate::Platform>,
@@ -787,8 +797,12 @@ impl<FS: ShimFS> UnixStream<FS> {
         is_nonblocking: bool,
         addr: Option<UnixSocketAddr>,
         preserve_empty_record: bool,
+        passed_fds: Vec<PassedFd>,
     ) -> Result<usize, Errno> {
-        let mut msg = Some(Message { data: buf.to_vec() });
+        let mut msg = Some(Message {
+            data: buf.to_vec(),
+            passed_fds,
+        });
         cx.with_timeout(timeout)
             .wait_on_events(
                 is_nonblocking,
@@ -825,6 +839,7 @@ impl<FS: ShimFS> UnixStream<FS> {
             .map_err(Errno::from)
     }
 
+    #[expect(clippy::too_many_arguments)]
     fn recvfrom(
         &self,
         cx: &WaitContext<'_, crate::Platform>,
@@ -833,6 +848,7 @@ impl<FS: ShimFS> UnixStream<FS> {
         is_nonblocking: bool,
         mut source_addr: Option<&mut Option<UnixSocketAddr>>,
         seqpacket: bool,
+        received_fds: &mut Vec<PassedFd>,
     ) -> Result<usize, Errno> {
         cx.with_timeout(timeout)
             .wait_on_events(
@@ -850,7 +866,7 @@ impl<FS: ShimFS> UnixStream<FS> {
                         let conn = state
                             .connected()
                             .ok_or(TryOpError::Other(Errno::ENOTCONN))?;
-                        let n = conn.try_recvfrom(buf, seqpacket)?;
+                        let n = conn.try_recvfrom(buf, seqpacket, received_fds)?;
                         // For connected stream sockets, no need to return the source address
                         if let Some(source_addr) = source_addr.as_deref_mut() {
                             *source_addr = None;
@@ -902,11 +918,10 @@ impl<FS: ShimFS> UnixStream<FS> {
 }
 
 /// A datagram message with source address information
-#[derive(Clone)]
 struct DatagramMessage {
     data: Vec<u8>,
-    // TODO: add control messages
-    // cmsgs: Option<Vec<Cmsg>>,
+    /// File descriptors passed via `SCM_RIGHTS` ancillary data.
+    passed_fds: Vec<PassedFd>,
     source: UnixSocketAddr,
 }
 
@@ -963,6 +978,7 @@ impl ReadEnd<DatagramMessage> {
         &self,
         mut buf: &mut [u8],
         source_addr: Option<&mut Option<UnixSocketAddr>>,
+        received_fds: &mut Vec<PassedFd>,
     ) -> Result<usize, TryOpError<Errno>> {
         let mut src = None;
         let mut total_read = 0;
@@ -975,6 +991,10 @@ impl ReadEnd<DatagramMessage> {
                 }
                 if src.is_none() {
                     src.replace(msg.source.clone());
+                }
+                // Extract any passed fds from the first message.
+                if !msg.passed_fds.is_empty() {
+                    received_fds.append(&mut msg.passed_fds);
                 }
                 if buf.len() >= msg.data.len() {
                     buf[..msg.data.len()].copy_from_slice(&msg.data);
@@ -1161,6 +1181,7 @@ impl<FS: ShimFS> UnixDatagram<FS> {
         buf: &mut [u8],
         is_nonblocking: bool,
         mut source_addr: Option<&mut Option<UnixSocketAddr>>,
+        received_fds: &mut Vec<PassedFd>,
     ) -> Result<usize, Errno> {
         cx.with_timeout(timeout)
             .wait_on_events(
@@ -1175,7 +1196,7 @@ impl<FS: ShimFS> UnixDatagram<FS> {
                     let Some(recv_channel) = &guard.recv_channel else {
                         return Err(TryOpError::Other(Errno::ENOTCONN));
                     };
-                    recv_channel.try_read(buf, source_addr.as_deref_mut())
+                    recv_channel.try_read(buf, source_addr.as_deref_mut(), received_fds)
                 },
             )
             .map_err(Errno::from)
@@ -1192,6 +1213,7 @@ impl<FS: ShimFS> UnixDatagram<FS> {
         buf: &[u8],
         is_nonblocking: bool,
         addr: Option<UnixSocketAddr>,
+        passed_fds: Vec<PassedFd>,
     ) -> Result<usize, Errno> {
         let source = self.get_local_addr();
         let send_channel = if let Some(addr) = addr {
@@ -1206,6 +1228,7 @@ impl<FS: ShimFS> UnixDatagram<FS> {
             timeout,
             DatagramMessage {
                 data: buf.to_vec(),
+                passed_fds,
                 source,
             },
             is_nonblocking,
@@ -1361,6 +1384,7 @@ impl<FS: ShimFS> UnixSocket<FS> {
         buf: &[u8],
         flags: SendFlags,
         addr: Option<UnixSocketAddr>,
+        passed_fds: Vec<PassedFd>,
     ) -> Result<usize, Errno> {
         let supported_flags = SendFlags::DONTWAIT | SendFlags::NOSIGNAL;
         if flags.intersects(supported_flags.complement()) {
@@ -1378,9 +1402,10 @@ impl<FS: ShimFS> UnixSocket<FS> {
                 is_nonblocking,
                 addr,
                 self.sock_type == SockType::SeqPacket,
+                passed_fds,
             ),
             UnixSocketInner::Datagram(datagram) => {
-                datagram.sendto(task, timeout, buf, is_nonblocking, addr)
+                datagram.sendto(task, timeout, buf, is_nonblocking, addr, passed_fds)
             }
         }
     }
@@ -1391,8 +1416,10 @@ impl<FS: ShimFS> UnixSocket<FS> {
         buf: &mut [u8],
         flags: ReceiveFlags,
         source_addr: Option<&mut Option<UnixSocketAddr>>,
+        received_fds: &mut Vec<PassedFd>,
     ) -> Result<usize, Errno> {
-        let supported_flags = ReceiveFlags::DONTWAIT | ReceiveFlags::NOSIGNAL;
+        let supported_flags =
+            ReceiveFlags::DONTWAIT | ReceiveFlags::NOSIGNAL | ReceiveFlags::CMSG_CLOEXEC;
         if flags.intersects(supported_flags.complement()) {
             log_unsupported!("Unsupported recvfrom flags: {:?}", flags);
             return Err(Errno::EINVAL);
@@ -1402,11 +1429,17 @@ impl<FS: ShimFS> UnixSocket<FS> {
         let timeout = self.options.lock().recv_timeout;
         let seqpacket = self.sock_type == SockType::SeqPacket;
         let ret = match &self.inner {
-            UnixSocketInner::Stream(stream) => {
-                stream.recvfrom(cx, timeout, buf, is_nonblocking, source_addr, seqpacket)
-            }
+            UnixSocketInner::Stream(stream) => stream.recvfrom(
+                cx,
+                timeout,
+                buf,
+                is_nonblocking,
+                source_addr,
+                seqpacket,
+                received_fds,
+            ),
             UnixSocketInner::Datagram(datagram) => {
-                datagram.recvfrom(cx, timeout, buf, is_nonblocking, source_addr)
+                datagram.recvfrom(cx, timeout, buf, is_nonblocking, source_addr, received_fds)
             }
         };
         match ret {
