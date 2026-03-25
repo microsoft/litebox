@@ -25,6 +25,7 @@ use litebox_common_linux::{
 };
 use litebox_platform_multiplex::Platform;
 
+use crate::syscalls::signal::siginfo_kernel;
 use crate::{ConstPtr, GlobalState, MutPtr, ShimFS, Task};
 use core::fmt::Write as _;
 use core::sync::atomic::{AtomicUsize, Ordering};
@@ -1054,8 +1055,10 @@ impl<FS: ShimFS> Task<FS> {
             )
             .flatten();
         if let Err(Errno::EPIPE) = res {
-            // TODO: send SIGPIPE to the current task.
-            // For now, just return EPIPE — most programs check the return value.
+            self.send_signal(
+                litebox_common_linux::signal::Signal::SIGPIPE,
+                siginfo_kernel(litebox_common_linux::signal::Signal::SIGPIPE),
+            );
         }
         res
     }
@@ -1858,7 +1861,10 @@ impl<FS: ShimFS> Task<FS> {
             )
             .flatten();
         if let Err(Errno::EPIPE) = res {
-            // TODO: send SIGPIPE to the current task.
+            self.send_signal(
+                litebox_common_linux::signal::Signal::SIGPIPE,
+                siginfo_kernel(litebox_common_linux::signal::Signal::SIGPIPE),
+            );
         }
         res
     }

@@ -411,6 +411,19 @@ pub(crate) fn siginfo_kill(signal: Signal) -> Siginfo {
     }
 }
 
+/// Build a `Siginfo` for a kernel-generated signal (e.g. SIGPIPE from a
+/// broken-pipe write).  Uses `SI_KERNEL` to match real Linux behaviour.
+pub(crate) fn siginfo_kernel(signal: Signal) -> Siginfo {
+    Siginfo {
+        signo: signal.as_i32(),
+        errno: 0,
+        code: SI_KERNEL,
+        #[cfg(target_arch = "x86_64")]
+        __pad: 0,
+        data: SiginfoData::new_zeroed(),
+    }
+}
+
 impl SignalState {
     /// Updates the blocked signal mask.
     fn set_signal_mask(&self, mask: SigSet) {

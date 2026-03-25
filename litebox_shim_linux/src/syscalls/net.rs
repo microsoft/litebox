@@ -820,8 +820,7 @@ impl<FS: ShimFS> GlobalState<FS> {
         let is_nonblock =
             self.get_status(fd).contains(OFlags::NONBLOCK) || flags.contains(SendFlags::DONTWAIT);
 
-        let ret = cx
-            .with_timeout(timeout)
+        cx.with_timeout(timeout)
             .wait_on_events(
                 is_nonblock,
                 Events::OUT,
@@ -836,16 +835,7 @@ impl<FS: ShimFS> GlobalState<FS> {
                     Err(e) => Err(TryOpError::Other(Errno::from(e))),
                 },
             )
-            .map_err(Errno::from);
-        if let Err(Errno::EPIPE) = ret
-            && !flags.contains(SendFlags::NOSIGNAL)
-        {
-            // SIGPIPE delivery: On real Linux, EPIPE without MSG_NOSIGNAL
-            // raises SIGPIPE. Most applications (including Node.js) ignore
-            // SIGPIPE via SIG_IGN, so just return EPIPE for now.
-            // TODO: actually deliver SIGPIPE to the calling process.
-        }
-        ret
+            .map_err(Errno::from)
     }
 
     /// Receive data via socket channel (lock-free path).
@@ -1445,7 +1435,7 @@ impl<FS: ShimFS> Task<FS> {
         flags: SendFlags,
         sockaddr: Option<SocketAddress>,
     ) -> Result<usize, Errno> {
-        self.files.borrow().with_socket(
+        let ret = self.files.borrow().with_socket(
             &self.global,
             sockfd,
             |fd| {
@@ -1463,7 +1453,16 @@ impl<FS: ShimFS> Task<FS> {
                     .transpose()?;
                 file.sendto(self, buf, flags, addr)
             },
-        )
+        );
+        if let Err(Errno::EPIPE) = ret
+            && !flags.contains(SendFlags::NOSIGNAL)
+        {
+            self.send_signal(
+                litebox_common_linux::signal::Signal::SIGPIPE,
+                super::signal::siginfo_kernel(litebox_common_linux::signal::Signal::SIGPIPE),
+            );
+        }
+        ret
     }
 
     /// Handle syscall `sendmsg`
@@ -1559,7 +1558,7 @@ impl<FS: ShimFS> Task<FS> {
             .iter()
             .try_fold(0usize, |acc, iov| acc.checked_add(iov.iov_len))
             .ok_or(Errno::EINVAL)?;
-        self.files.borrow().with_socket(
+        let ret = self.files.borrow().with_socket(
             &self.global,
             sockfd,
             |fd| {
@@ -1600,7 +1599,16 @@ impl<FS: ShimFS> Task<FS> {
                     file.sendto(self, &buf, flags, sock_addr)
                 }
             },
-        )
+        );
+        if let Err(Errno::EPIPE) = ret
+            && !flags.contains(SendFlags::NOSIGNAL)
+        {
+            self.send_signal(
+                litebox_common_linux::signal::Signal::SIGPIPE,
+                super::signal::siginfo_kernel(litebox_common_linux::signal::Signal::SIGPIPE),
+            );
+        }
+        ret
     }
 
     /// Handle syscall `sendmmsg` — send multiple messages on a socket.
