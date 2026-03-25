@@ -3827,13 +3827,17 @@ mod tests {
         let drained = task
             .global
             .control_plane
-            .take_remote_child_exit_notifications_for_host(remote_host)
+            .poll_outbound_messages_for_host(remote_host)
             .expect("remote host queue should exist");
         assert_eq!(drained.len(), 1);
-        assert_eq!(drained[0].parent_pid, notif.parent_pid);
-        assert_eq!(drained[0].child_pid, notif.child_pid);
-        assert_eq!(drained[0].exit_signal, notif.exit_signal);
-        assert_eq!(drained[0].exit_status, notif.exit_status);
+        match drained[0] {
+            crate::multihost::OutboundControlPlaneMessage::ChildExit(notification) => {
+                assert_eq!(notification.parent_pid, notif.parent_pid);
+                assert_eq!(notification.child_pid, notif.child_pid);
+                assert_eq!(notification.exit_signal, notif.exit_signal);
+                assert_eq!(notification.exit_status, notif.exit_status);
+            }
+        }
     }
 
     #[test]
