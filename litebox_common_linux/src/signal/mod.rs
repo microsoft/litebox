@@ -104,6 +104,7 @@ impl TryFrom<i32> for Signal {
 }
 
 /// The default disposition of a signal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SignalDisposition {
     /// Terminate the process.
     Terminate,

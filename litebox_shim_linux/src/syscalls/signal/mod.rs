@@ -1060,16 +1060,24 @@ impl<FS: ShimFS> Task<FS> {
                             // STOP is not currently supported, so treat as
                             // terminate. Core dumps are also not currently
                             // supported.
-                            self.log_fatal_signal_context(signal, ctx);
-                            litebox::log_println!(
-                                self.global.platform,
-                                "-- Fatal signal {:?}: terminating task {}:{} fault_addr={:#x} error_code={:#x}",
-                                signal,
-                                self.pid,
-                                self.tid,
-                                self.signals.last_exception.get().cr2,
-                                self.signals.last_exception.get().error_code,
-                            );
+                            //
+                            // Only log full crash context for Core-disposition
+                            // signals (SIGSEGV, SIGBUS, SIGABRT, etc).
+                            // Normal termination signals like SIGHUP/SIGTERM
+                            // are expected process lifecycle events and should
+                            // not pollute the TTY with register dumps.
+                            if signal.default_disposition() == SignalDisposition::Core {
+                                self.log_fatal_signal_context(signal, ctx);
+                                litebox::log_println!(
+                                    self.global.platform,
+                                    "-- Fatal signal {:?}: terminating task {}:{} fault_addr={:#x} error_code={:#x}",
+                                    signal,
+                                    self.pid,
+                                    self.tid,
+                                    self.signals.last_exception.get().cr2,
+                                    self.signals.last_exception.get().error_code,
+                                );
+                            }
                             self.exit_group(ExitStatus::Signal(signal));
                         }
                         SignalDisposition::Ignore => {}
