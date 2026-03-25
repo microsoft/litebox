@@ -846,6 +846,7 @@ where
                     false,
                     vma.noreserve(),
                     crate::platform::page_mgmt::FixedAddressBehavior::NoReplace,
+                    false,
                 )
             } {
                 let _ = err;

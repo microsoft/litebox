@@ -1050,16 +1050,25 @@ impl<FS: ShimFS> Task<FS> {
         }
 
         if flags.intersects(
-            MapFlags::MAP_32BIT
-                | MapFlags::MAP_GROWSDOWN
-                | MapFlags::MAP_LOCKED
-                | MapFlags::MAP_NONBLOCK
+            MapFlags::MAP_GROWSDOWN
                 | MapFlags::MAP_HUGETLB
                 | MapFlags::MAP_HUGE_2MB
                 | MapFlags::MAP_HUGE_1GB,
         ) {
             log_unsupported!("mmap flags {:?}", flags);
             return Err(Errno::EINVAL);
+        }
+        if flags.contains(MapFlags::MAP_NONBLOCK) && !flags.contains(MapFlags::MAP_ANONYMOUS) {
+            log_unsupported!("mmap MAP_NONBLOCK for file-backed mapping");
+            return Err(Errno::EINVAL);
+        }
+        if flags.contains(MapFlags::MAP_32BIT)
+            && !flags.intersects(MapFlags::MAP_FIXED | MapFlags::MAP_FIXED_NOREPLACE)
+            && self.process_state.borrow().pm.addr_min() >= 0x8000_0000
+        {
+            // This process's managed VA partition does not intersect Linux's
+            // low-2G MAP_32BIT range, so there is no representable result.
+            return Err(Errno::ENOMEM);
         }
 
         let aligned_len = align_up(len, PAGE_SIZE);
@@ -2574,6 +2583,72 @@ mod tests {
             .unwrap_err(),
             Errno::EBADF
         );
+    }
+
+    #[test]
+    fn test_mmap_growsdown_returns_einval() {
+        let task = init_platform(None);
+
+        assert_eq!(
+            task.sys_mmap(
+                0,
+                0x2000,
+                ProtFlags::PROT_READ | ProtFlags::PROT_WRITE,
+                MapFlags::MAP_PRIVATE | MapFlags::MAP_ANON | MapFlags::MAP_GROWSDOWN,
+                -1,
+                0,
+            )
+            .unwrap_err(),
+            Errno::EINVAL
+        );
+    }
+
+    #[test]
+    fn test_mmap_accepts_locked_and_nonblock_flags() {
+        let task = init_platform(None);
+
+        let addr = task
+            .sys_mmap(
+                0,
+                0x1000,
+                ProtFlags::PROT_READ | ProtFlags::PROT_WRITE,
+                MapFlags::MAP_PRIVATE
+                    | MapFlags::MAP_ANON
+                    | MapFlags::MAP_LOCKED
+                    | MapFlags::MAP_POPULATE
+                    | MapFlags::MAP_NONBLOCK,
+                -1,
+                0,
+            )
+            .unwrap();
+
+        task.sys_munmap(addr, 0x1000).unwrap();
+    }
+
+    #[test]
+    fn test_mmap_file_nonblock_returns_einval() {
+        let task = init_platform(None);
+
+        let fd = task
+            .sys_open("nonblock-map.txt", OFlags::RDWR | OFlags::CREAT, Mode::RWXU)
+            .unwrap();
+        let fd = i32::try_from(fd).unwrap();
+        let initial = [0u8; 0x1000];
+        assert_eq!(task.sys_write(fd, &initial, None).unwrap(), initial.len());
+
+        assert_eq!(
+            task.sys_mmap(
+                0,
+                0x1000,
+                ProtFlags::PROT_READ,
+                MapFlags::MAP_PRIVATE | MapFlags::MAP_NONBLOCK,
+                fd,
+                0,
+            )
+            .unwrap_err(),
+            Errno::EINVAL
+        );
+        task.sys_close(fd).unwrap();
     }
 
     #[test]

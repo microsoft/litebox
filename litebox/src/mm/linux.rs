@@ -128,6 +128,7 @@ impl From<VmFlags> for MemoryRegionPermissions {
 }
 
 const DEFAULT_RESERVED_SPACE_SIZE: usize = 0x100_0000; // 16 MiB
+const MAP_32BIT_ADDR_LIMIT: usize = 0x8000_0000;
 
 bitflags::bitflags! {
     /// Options for page creation.
@@ -156,6 +157,8 @@ bitflags::bitflags! {
         /// Request a sparse reservation without reserving swap/commit upfront
         /// when the platform supports it.
         const NORESERVE = 1 << 8;
+        /// Keep the mapping below Linux's MAP_32BIT 2 GiB ceiling.
+        const LOW_2G = 1 << 9;
     }
 }
 
@@ -515,6 +518,7 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
                     false,
                     vma.noreserve(),
                     FixedAddressBehavior::Replace,
+                    false,
                 )
             }
             .expect("failed to reset pages");
@@ -547,6 +551,7 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
         populate_pages_immediately: bool,
         noreserve: bool,
         fixed_address_behavior: FixedAddressBehavior,
+        require_low_2g: bool,
     ) -> Result<Platform::RawMutPointer<u8>, AllocationError> {
         let (start, end) = (suggested_range.start, suggested_range.end);
         if start < self.addr_min {
@@ -618,7 +623,10 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
         // (e.g., VirtualAlloc chose a different location because the hinted
         // address was occupied by the host), free the allocation and report
         // out-of-memory instead of recording a VMA at an invalid address.
-        if new_start < self.addr_min || new_end > self.addr_max {
+        if new_start < self.addr_min
+            || new_end > self.addr_max
+            || (require_low_2g && new_end > MAP_32BIT_ADDR_LIMIT)
+        {
             unsafe {
                 let _ = self.platform.deallocate_pages(new_start..new_end);
             }
@@ -671,31 +679,67 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
                 0
             })
         .unwrap();
-        let new_addr = self
-            .get_unmmaped_area(
-                suggested_address,
-                total_length,
-                flags.contains(CreatePagesFlags::FIXED_ADDR),
-            )
-            .ok_or(AllocationError::OutOfMemory)?;
-        // new_addr must be ALIGN aligned
-        let new_range = PageRange::new(new_addr, new_addr + length.as_usize()).unwrap();
-        unsafe {
-            self.insert_mapping(
-                new_range,
-                vma,
-                flags.contains(CreatePagesFlags::POPULATE_PAGES_IMMEDIATELY),
-                flags.contains(CreatePagesFlags::NORESERVE),
-                if flags.contains(CreatePagesFlags::FIXED_ADDR) {
-                    if flags.contains(CreatePagesFlags::NOREPLACE) {
-                        FixedAddressBehavior::NoReplace
+        let fixed_addr = flags.contains(CreatePagesFlags::FIXED_ADDR);
+        let require_low_2g = flags.contains(CreatePagesFlags::LOW_2G);
+        let fixed_address_behavior = if fixed_addr {
+            if flags.contains(CreatePagesFlags::NOREPLACE) {
+                FixedAddressBehavior::NoReplace
+            } else {
+                FixedAddressBehavior::Replace
+            }
+        } else if require_low_2g {
+            FixedAddressBehavior::NoReplace
+        } else {
+            FixedAddressBehavior::Hint
+        };
+        let mut next_top_down_max_start = None;
+        let mut pending_hint = suggested_address.filter(|_| require_low_2g);
+        loop {
+            let candidate_hint = if next_top_down_max_start.is_none() {
+                pending_hint.take()
+            } else {
+                None
+            };
+            let used_hint = candidate_hint.is_some();
+            let new_addr = self
+                .get_unmmaped_area(
+                    if require_low_2g {
+                        candidate_hint
                     } else {
-                        FixedAddressBehavior::Replace
+                        suggested_address
+                    },
+                    total_length,
+                    fixed_addr,
+                    require_low_2g,
+                    next_top_down_max_start,
+                )
+                .ok_or(AllocationError::OutOfMemory)?;
+            // new_addr must be ALIGN aligned
+            let new_range = PageRange::new(new_addr, new_addr + length.as_usize()).unwrap();
+            match unsafe {
+                self.insert_mapping(
+                    new_range,
+                    vma,
+                    flags.contains(CreatePagesFlags::POPULATE_PAGES_IMMEDIATELY),
+                    flags.contains(CreatePagesFlags::NORESERVE),
+                    fixed_address_behavior,
+                    require_low_2g,
+                )
+            } {
+                Ok(ret) => return Ok(ret),
+                Err(AllocationError::AddressInUseByPlatform | AllocationError::OutOfMemory)
+                    if require_low_2g && !fixed_addr =>
+                {
+                    if used_hint {
+                        continue;
                     }
-                } else {
-                    FixedAddressBehavior::Hint
-                },
-            )
+                    let Some(max_start) = new_addr.checked_sub(ALIGN) else {
+                        return Err(AllocationError::OutOfMemory);
+                    };
+                    next_top_down_max_start = Some(max_start);
+                }
+                Err(err) => return Err(err),
+            }
         }
     }
 
@@ -768,6 +812,7 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
                     false,
                     cur_vma.noreserve(),
                     FixedAddressBehavior::NoReplace,
+                    false,
                 )
             } {
                 Ok(_) => {}
@@ -826,7 +871,7 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
             unimplemented!("file-backed mapping move is not supported yet");
         }
         let new_addr = self
-            .get_unmmaped_area(suggested_new_address, new_size, false)
+            .get_unmmaped_area(suggested_new_address, new_size, false, false, None)
             .ok_or(VmemMoveError::OutOfMemory)?;
         let new_range = PageRange::<ALIGN>::new(new_addr, new_addr + new_size.as_usize()).unwrap();
         let new_addr = unsafe {
@@ -1003,6 +1048,8 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
         suggested_address: Option<NonZeroAddress<ALIGN>>,
         length: NonZeroPageSize<ALIGN>,
         fixed_addr: bool,
+        require_low_2g: bool,
+        max_start: Option<usize>,
     ) -> Option<usize> {
         let size = length.as_usize();
         let range_span = self.addr_max - self.addr_min;
@@ -1012,7 +1059,14 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
         if let Some(suggested_address) = suggested_address {
             let hint = suggested_address.0;
             let hint_end = hint.saturating_add(size);
-            let in_range = hint >= self.addr_min && hint_end <= self.addr_max;
+            let addr_max = if require_low_2g {
+                self.addr_max.min(MAP_32BIT_ADDR_LIMIT)
+            } else {
+                self.addr_max
+            };
+            let in_range = hint >= self.addr_min
+                && hint_end <= addr_max
+                && max_start.is_none_or(|max_start| hint <= max_start);
 
             if fixed_addr {
                 // Fixed: always honour the hint; insert_mapping will reject
@@ -1033,10 +1087,26 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
 
         // top down
         // 1. check [last_end, TASK_SIZE_MAX)
-        let (low_limit, high_limit) = (self.addr_min, self.addr_max - length.as_usize());
+        let low_limit = self.addr_min;
+        let mut high_limit = self.addr_max - length.as_usize();
+        if require_low_2g {
+            if low_limit >= MAP_32BIT_ADDR_LIMIT || size > MAP_32BIT_ADDR_LIMIT - low_limit {
+                return None;
+            }
+            high_limit = high_limit.min(MAP_32BIT_ADDR_LIMIT - size);
+        }
+        if let Some(max_start) = max_start {
+            high_limit = high_limit.min(max_start);
+        }
         debug_assert!(self.addr_min.is_multiple_of(ALIGN));
         debug_assert!(self.addr_max.is_multiple_of(ALIGN));
-        let last_end = self.vmas.last_range_value().map_or(low_limit, |r| r.0.end);
+        let search_end = high_limit + size;
+        let last_end = self
+            .vmas
+            .iter()
+            .rev()
+            .find(|(r, _)| r.start < search_end)
+            .map_or(low_limit, |(r, _)| r.end);
         if last_end <= high_limit {
             return Some(high_limit);
         }

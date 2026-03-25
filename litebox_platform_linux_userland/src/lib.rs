@@ -2799,11 +2799,6 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Li
                 FixedAddressBehavior::Replace => MapFlags::MAP_FIXED,
                 FixedAddressBehavior::NoReplace => MapFlags::MAP_FIXED_NOREPLACE,
             }
-            | if can_grow_down {
-                MapFlags::MAP_GROWSDOWN
-            } else {
-                MapFlags::empty()
-            }
             | if populate_pages_immediately {
                 MapFlags::MAP_POPULATE
             } else {
@@ -2814,6 +2809,11 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Li
             } else {
                 MapFlags::empty()
             };
+        // Host Linux userland faults never re-enter LiteBox's PageManager, so
+        // passing MAP_GROWSDOWN through would let the host expand the mapping
+        // behind our VMA bookkeeping. Keep grow-down semantics internal to the
+        // guest VM metadata instead of enabling host-side auto-growth.
+        let _ = can_grow_down;
         let r = unsafe {
             syscalls::syscall6(
                 {

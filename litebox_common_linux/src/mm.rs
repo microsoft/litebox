@@ -54,7 +54,8 @@ pub fn do_mmap<
         );
         create_flags.set(
             CreatePagesFlags::POPULATE_PAGES_IMMEDIATELY,
-            flags.contains(MapFlags::MAP_POPULATE),
+            flags.intersects(MapFlags::MAP_POPULATE | MapFlags::MAP_LOCKED)
+                && !flags.contains(MapFlags::MAP_NONBLOCK),
         );
         create_flags.set(CreatePagesFlags::ENSURE_SPACE_AFTER, ensure_space_after);
         create_flags.set(
@@ -69,6 +70,12 @@ pub fn do_mmap<
         create_flags.set(
             CreatePagesFlags::NORESERVE,
             flags.contains(MapFlags::MAP_NORESERVE),
+        );
+        #[cfg(target_arch = "x86_64")]
+        create_flags.set(
+            CreatePagesFlags::LOW_2G,
+            flags.contains(MapFlags::MAP_32BIT)
+                && !flags.intersects(MapFlags::MAP_FIXED | MapFlags::MAP_FIXED_NOREPLACE),
         );
         create_flags
     };
