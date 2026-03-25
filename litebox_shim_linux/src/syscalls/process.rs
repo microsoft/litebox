@@ -894,11 +894,17 @@ impl<FS: ShimFS> Task<FS> {
             return;
         };
         if owner_host != self.global.control_plane.local_host() {
-            log_unsupported!(
-                "SIGCHLD delivery to running pid {} owned by remote host {:?}",
-                notif.parent_pid.0,
-                owner_host
-            );
+            if let Err(err) = self
+                .global
+                .control_plane
+                .queue_remote_child_exit_notification(owner_host, notif)
+            {
+                log_unsupported!(
+                    "remote child-exit notification for pid {} could not be queued: {:?}",
+                    notif.parent_pid.0,
+                    err
+                );
+            }
             return;
         }
 
@@ -3808,11 +3814,26 @@ mod tests {
     fn test_notify_parent_of_child_exit_skips_remote_owned_parent_queue() {
         let task = crate::syscalls::tests::init_platform(None);
         let remote_parent = register_remote_owned_child(&task);
+        let remote_host = task
+            .global
+            .control_plane
+            .owner_of_running_process(remote_parent)
+            .expect("remote parent should have an owner");
         let notif = child_exit_notification(remote_parent, litebox::process::ProcessId(99));
 
         task.notify_parent_of_child_exit(notif);
 
         assert!(task.global.cross_process_signals.lock().is_empty());
+        let drained = task
+            .global
+            .control_plane
+            .take_remote_child_exit_notifications_for_host(remote_host)
+            .expect("remote host queue should exist");
+        assert_eq!(drained.len(), 1);
+        assert_eq!(drained[0].parent_pid, notif.parent_pid);
+        assert_eq!(drained[0].child_pid, notif.child_pid);
+        assert_eq!(drained[0].exit_signal, notif.exit_signal);
+        assert_eq!(drained[0].exit_status, notif.exit_status);
     }
 
     #[test]

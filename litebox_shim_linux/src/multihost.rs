@@ -4,10 +4,11 @@
 //! Multi-host control-plane state for Linux shim process ownership and exec handoff.
 
 use alloc::collections::BTreeMap;
+use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU32, Ordering};
 
 use litebox::{
-    process::ProcessId,
+    process::{ExitNotification, ProcessId},
     sync::{Mutex, RawSyncPrimitivesProvider},
 };
 
@@ -102,6 +103,10 @@ pub(crate) enum ControlPlaneError {
         process_id: ProcessId,
         host: HostId,
     },
+    RemoteChildExitQueueFull {
+        target_host: HostId,
+        limit: usize,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -130,11 +135,14 @@ impl ExecHandoff {
     }
 }
 
+const MAX_PENDING_REMOTE_CHILD_EXIT_NOTIFICATIONS_PER_HOST: usize = 64;
+
 struct ControlPlaneState {
     hosts: BTreeMap<HostId, HostEntry>,
     running_process_owners: BTreeMap<ProcessId, HostId>,
     active_handoffs_by_process: BTreeMap<ProcessId, ExecHandoffId>,
     handoffs: BTreeMap<ExecHandoffId, ExecHandoff>,
+    pending_remote_child_exit_notifications: BTreeMap<HostId, Vec<ExitNotification>>,
 }
 
 /// Root-host-owned control-plane state for the multi-host process model.
@@ -178,6 +186,7 @@ impl<Platform: RawSyncPrimitivesProvider> ControlPlane<Platform> {
                 running_process_owners: BTreeMap::new(),
                 active_handoffs_by_process: BTreeMap::new(),
                 handoffs: BTreeMap::new(),
+                pending_remote_child_exit_notifications: BTreeMap::new(),
             }),
         }
     }
@@ -275,6 +284,45 @@ impl<Platform: RawSyncPrimitivesProvider> ControlPlane<Platform> {
             .running_process_owners
             .get(&process_id)
             .copied()
+    }
+
+    /// Queue a child-exit notification for later delivery to a remote host.
+    pub(crate) fn queue_remote_child_exit_notification(
+        &self,
+        target_host: HostId,
+        notification: ExitNotification,
+    ) -> Result<(), ControlPlaneError> {
+        let mut state = self.state.lock();
+        if !state.hosts.contains_key(&target_host) {
+            return Err(ControlPlaneError::UnknownHost(target_host));
+        }
+        let queue = state
+            .pending_remote_child_exit_notifications
+            .entry(target_host)
+            .or_default();
+        if queue.len() >= MAX_PENDING_REMOTE_CHILD_EXIT_NOTIFICATIONS_PER_HOST {
+            return Err(ControlPlaneError::RemoteChildExitQueueFull {
+                target_host,
+                limit: MAX_PENDING_REMOTE_CHILD_EXIT_NOTIFICATIONS_PER_HOST,
+            });
+        }
+        queue.push(notification);
+        Ok(())
+    }
+
+    /// Drain any queued remote child-exit notifications for a specific host.
+    pub(crate) fn take_remote_child_exit_notifications_for_host(
+        &self,
+        target_host: HostId,
+    ) -> Result<Vec<ExitNotification>, ControlPlaneError> {
+        let mut state = self.state.lock();
+        if !state.hosts.contains_key(&target_host) {
+            return Err(ControlPlaneError::UnknownHost(target_host));
+        }
+        Ok(state
+            .pending_remote_child_exit_notifications
+            .remove(&target_host)
+            .unwrap_or_default())
     }
 
     /// Resolve whether exec continues locally or needs a future host handoff.
@@ -418,6 +466,19 @@ impl<Platform: RawSyncPrimitivesProvider> ControlPlane<Platform> {
             .get(&handoff_id)
             .copied()
             .map(|handoff| handoff.snapshot(handoff_id))
+    }
+
+    #[cfg(test)]
+    fn pending_remote_child_exit_notifications_for_host(
+        &self,
+        target_host: HostId,
+    ) -> Vec<ExitNotification> {
+        self.state
+            .lock()
+            .pending_remote_child_exit_notifications
+            .get(&target_host)
+            .cloned()
+            .unwrap_or_default()
     }
 }
 
@@ -656,5 +717,87 @@ mod tests {
         );
         assert!(plane.handoff_snapshot(handoff.id).is_some());
         assert_eq!(plane.owner_of_running_process(pid), None);
+    }
+
+    #[test]
+    fn remote_child_exit_notifications_queue_per_target_host() {
+        let plane = ControlPlane::<crate::Platform>::new_root_local();
+        let worker = plane
+            .register_worker_host(HostId::ROOT)
+            .expect("register worker host");
+        let notification = ExitNotification {
+            parent_pid: ProcessId(31),
+            exit_signal: 17,
+            child_pid: ProcessId(32),
+            exit_status: 23,
+        };
+
+        plane
+            .queue_remote_child_exit_notification(worker, notification)
+            .expect("queue notification");
+        let pending = plane.pending_remote_child_exit_notifications_for_host(worker);
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].parent_pid, notification.parent_pid);
+        assert_eq!(pending[0].child_pid, notification.child_pid);
+        assert_eq!(pending[0].exit_signal, notification.exit_signal);
+        assert_eq!(pending[0].exit_status, notification.exit_status);
+
+        let drained = plane
+            .take_remote_child_exit_notifications_for_host(worker)
+            .expect("drain notifications");
+        assert_eq!(drained.len(), 1);
+        assert_eq!(drained[0].parent_pid, notification.parent_pid);
+        assert_eq!(drained[0].child_pid, notification.child_pid);
+        assert_eq!(drained[0].exit_signal, notification.exit_signal);
+        assert_eq!(drained[0].exit_status, notification.exit_status);
+        assert!(
+            plane
+                .pending_remote_child_exit_notifications_for_host(worker)
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn remote_child_exit_notification_queue_is_bounded() {
+        let plane = ControlPlane::<crate::Platform>::new_root_local();
+        let worker = plane
+            .register_worker_host(HostId::ROOT)
+            .expect("register worker host");
+
+        for idx in 0..MAX_PENDING_REMOTE_CHILD_EXIT_NOTIFICATIONS_PER_HOST {
+            plane
+                .queue_remote_child_exit_notification(
+                    worker,
+                    ExitNotification {
+                        parent_pid: ProcessId(40),
+                        exit_signal: 17,
+                        child_pid: ProcessId(100 + u32::try_from(idx).unwrap()),
+                        exit_status: i32::try_from(idx).unwrap(),
+                    },
+                )
+                .expect("queue notification within bound");
+        }
+
+        assert_eq!(
+            plane.queue_remote_child_exit_notification(
+                worker,
+                ExitNotification {
+                    parent_pid: ProcessId(40),
+                    exit_signal: 17,
+                    child_pid: ProcessId(999),
+                    exit_status: 999,
+                }
+            ),
+            Err(ControlPlaneError::RemoteChildExitQueueFull {
+                target_host: worker,
+                limit: MAX_PENDING_REMOTE_CHILD_EXIT_NOTIFICATIONS_PER_HOST,
+            })
+        );
+        assert_eq!(
+            plane
+                .pending_remote_child_exit_notifications_for_host(worker)
+                .len(),
+            MAX_PENDING_REMOTE_CHILD_EXIT_NOTIFICATIONS_PER_HOST
+        );
     }
 }
