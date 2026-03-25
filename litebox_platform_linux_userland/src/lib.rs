@@ -777,7 +777,7 @@ impl LinuxUserland {
 
         let mut written = 0;
         while written < buf.len() {
-            let n = unsafe {
+            let n = match unsafe {
                 syscalls::syscall4(
                     syscalls::Sysno::write,
                     fd,
@@ -785,13 +785,14 @@ impl LinuxUserland {
                     buf.len() - written,
                     syscall_intercept::SYSCALL_ARG_MAGIC,
                 )
-            }
-            .map_err(|err| match err {
-                syscalls::Errno::EPIPE | syscalls::Errno::EBADF => {
-                    litebox::platform::StdioWriteError::Closed
+            } {
+                Ok(n) => n,
+                Err(syscalls::Errno::EINTR) => continue,
+                Err(syscalls::Errno::EPIPE | syscalls::Errno::EBADF) => {
+                    return Err(litebox::platform::StdioWriteError::Closed);
                 }
-                _ => panic!("unhandled error {err}"),
-            })?;
+                Err(err) => panic!("unhandled error {err}"),
+            };
 
             if n == 0 {
                 return Err(litebox::platform::StdioWriteError::Closed);
