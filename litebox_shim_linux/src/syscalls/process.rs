@@ -3509,10 +3509,11 @@ impl<FS: ShimFS> Task<FS> {
 #[cfg(test)]
 mod tests {
     extern crate std;
+    use litebox::platform::RawConstPointer as _;
 
     #[test]
     fn test_drop_skips_unmapped_clear_child_tid() {
-        let mut task = crate::syscalls::tests::init_platform(None);
+        let task = crate::syscalls::tests::init_platform(None);
         task.thread
             .clear_child_tid
             .set(Some(crate::MutPtr::from_usize(0x1000_0060_c2b)));

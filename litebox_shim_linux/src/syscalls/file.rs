@@ -692,7 +692,7 @@ impl<FS: ShimFS> Task<FS> {
             FsPath::Absolute { path } => self.sys_open(path, flags, mode),
             FsPath::Cwd => self.sys_open(get_cwd(), flags, mode),
             FsPath::Fd(_fd) => {
-                log_unsupported!("openat with FsPath::Fd");
+                log_unsupported!("openat with empty path");
                 Err(Errno::EINVAL)
             }
             FsPath::FdRelative { fd, path } => {
@@ -2111,16 +2111,22 @@ impl<FS: ShimFS> Task<FS> {
         buf: &mut [u8],
     ) -> Result<usize, Errno> {
         let get_cwd = || self.fs.borrow().cwd.read().clone();
-        let fspath = FsPath::new(dirfd, pathname, get_cwd)?;
+        let fspath = FsPath::new_inner(dirfd, pathname, get_cwd, true)?;
         let path = match fspath {
             FsPath::Absolute { path } => {
                 self.do_readlink(path.to_str().map_err(|_| Errno::EINVAL)?)
             }
-            FsPath::Cwd => {
-                let cwd = self.fs.borrow().cwd.read().clone();
-                self.do_readlink(&cwd)
+            // Linux only resolves empty-path readlinkat() on an O_PATH|O_NOFOLLOW
+            // symlink fd. The shim does not preserve symlink fd identity yet, so
+            // valid fds fall back to ENOENT instead of resolving through the
+            // original path; invalid fds still return EBADF.
+            FsPath::Cwd => Err(Errno::ENOENT),
+            FsPath::Fd(fd) => {
+                let raw_fd = usize::try_from(fd).map_err(|_| Errno::EBADF)?;
+                let files = self.files.borrow();
+                files.run_on_raw_fd(raw_fd, |_| (), |_| (), |_| (), |_| (), |_| (), |_| ())?;
+                Err(Errno::ENOENT)
             }
-            FsPath::Fd(_) => unimplemented!(),
             FsPath::FdRelative { fd, path } => {
                 let Ok(raw_fd) = usize::try_from(fd) else {
                     return Err(Errno::EBADF);
@@ -4640,6 +4646,36 @@ mod tests {
             )
             .expect("O_PATH open should succeed");
         task.sys_close(i32::try_from(fd).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn readlinkat_empty_path_on_non_symlink_fd_returns_enoent() {
+        let task = crate::syscalls::tests::init_platform(None);
+        task.sys_mkdir("/readlinkat_empty", 0o755).unwrap();
+        let fd = task
+            .sys_open(
+                "/readlinkat_empty",
+                OFlags::PATH | OFlags::DIRECTORY,
+                Mode::empty(),
+            )
+            .expect("O_PATH open should succeed");
+        let mut buf = [0u8; 32];
+        assert_eq!(
+            task.sys_readlinkat(i32::try_from(fd).unwrap(), "", &mut buf)
+                .unwrap_err(),
+            Errno::ENOENT
+        );
+        task.sys_close(i32::try_from(fd).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn readlinkat_empty_path_on_invalid_fd_returns_ebadf() {
+        let task = crate::syscalls::tests::init_platform(None);
+        let mut buf = [0u8; 32];
+        assert_eq!(
+            task.sys_readlinkat(123_456, "", &mut buf).unwrap_err(),
+            Errno::EBADF
+        );
     }
 
     #[test]

@@ -216,6 +216,35 @@ impl<FS: ShimFS> Task<FS> {
         }
     }
 
+    /// Validate that `fd` refers to a readable regular file for file-backed
+    /// mmap operations. This preserves Linux-style errno precedence for invalid
+    /// fds, non-file descriptors, directories, and write-only descriptors.
+    fn validate_file_backed_mmap_fd(&self, fd: i32) -> Result<(), Errno> {
+        let raw_fd = usize::try_from(u32::try_from(fd).map_err(|_| Errno::EBADF)?)
+            .map_err(|_| Errno::EBADF)?;
+        let files = self.files.borrow();
+        files.run_on_raw_fd(
+            raw_fd,
+            |typed_fd| {
+                let status = files.fs.fd_file_status(typed_fd).map_err(Errno::from)?;
+                if status.file_type != litebox::fs::FileType::RegularFile {
+                    return Err(Errno::ENODEV);
+                }
+                let mut probe = [];
+                files
+                    .fs
+                    .read(typed_fd, &mut probe, Some(0))
+                    .map_err(Errno::from)?;
+                Ok(())
+            },
+            |_| Err(Errno::ENODEV),
+            |_| Err(Errno::ENODEV),
+            |_| Err(Errno::ENODEV),
+            |_| Err(Errno::ENODEV),
+            |_| Err(Errno::ENODEV),
+        )?
+    }
+
     // ── End of internal fd helpers ─────────────────────────────────────
 
     /// Get the FS-level path for a raw fd, if it's a filesystem fd.
@@ -988,7 +1017,7 @@ impl<FS: ShimFS> Task<FS> {
         addr: usize,
         len: usize,
         prot: ProtFlags,
-        flags: MapFlags,
+        mut flags: MapFlags,
         fd: i32,
         offset: usize,
     ) -> Result<MutPtr<u8>, Errno> {
@@ -1006,17 +1035,31 @@ impl<FS: ShimFS> Task<FS> {
         let is_shared_file =
             flags.contains(MapFlags::MAP_SHARED) && !flags.contains(MapFlags::MAP_ANONYMOUS);
 
+        if flags.contains(MapFlags::MAP_SYNC) {
+            if flags.contains(MapFlags::MAP_ANONYMOUS) {
+                if flags.contains(MapFlags::MAP_SHARED_VALIDATE) {
+                    log_unsupported!("mmap MAP_SYNC with MAP_SHARED_VALIDATE|MAP_ANONYMOUS");
+                    return Err(Errno::EINVAL);
+                }
+                flags.remove(MapFlags::MAP_SYNC);
+            } else {
+                self.validate_file_backed_mmap_fd(fd)?;
+                log_unsupported!("mmap MAP_SYNC");
+                return Err(Errno::EOPNOTSUPP);
+            }
+        }
+
         if flags.intersects(
             MapFlags::MAP_32BIT
                 | MapFlags::MAP_GROWSDOWN
                 | MapFlags::MAP_LOCKED
                 | MapFlags::MAP_NONBLOCK
-                | MapFlags::MAP_SYNC
                 | MapFlags::MAP_HUGETLB
                 | MapFlags::MAP_HUGE_2MB
                 | MapFlags::MAP_HUGE_1GB,
         ) {
-            todo!("Unsupported flags {:?}", flags);
+            log_unsupported!("mmap flags {:?}", flags);
+            return Err(Errno::EINVAL);
         }
 
         let aligned_len = align_up(len, PAGE_SIZE);
@@ -2446,6 +2489,91 @@ mod tests {
 
         task.sys_munmap(addr, 0x1000).unwrap();
         task.sys_close(fd).unwrap();
+    }
+
+    #[test]
+    fn test_mmap_anonymous_ignores_map_sync() {
+        let task = init_platform(None);
+
+        let addr = task
+            .sys_mmap(
+                0,
+                0x1000,
+                ProtFlags::PROT_READ,
+                MapFlags::MAP_PRIVATE | MapFlags::MAP_ANON | MapFlags::MAP_SYNC,
+                -1,
+                0,
+            )
+            .unwrap();
+        task.sys_munmap(addr, 0x1000).unwrap();
+    }
+
+    #[test]
+    fn test_mmap_file_map_sync_returns_eopnotsupp() {
+        let task = init_platform(None);
+
+        let fd = task
+            .sys_open(
+                "shared-map-sync.txt",
+                OFlags::RDWR | OFlags::CREAT,
+                Mode::RWXU,
+            )
+            .unwrap();
+        let fd = i32::try_from(fd).unwrap();
+        let initial = [0u8; 0x1000];
+        assert_eq!(task.sys_write(fd, &initial, None).unwrap(), initial.len());
+        task.sys_lseek(fd, 0, litebox::fs::SeekWhence::RelativeToBeginning)
+            .unwrap();
+
+        assert_eq!(
+            task.sys_mmap(
+                0,
+                0x1000,
+                ProtFlags::PROT_READ,
+                MapFlags::MAP_SHARED | MapFlags::MAP_SYNC,
+                fd,
+                0,
+            )
+            .unwrap_err(),
+            Errno::EOPNOTSUPP
+        );
+        task.sys_close(fd).unwrap();
+    }
+
+    #[test]
+    fn test_mmap_shared_validate_anon_map_sync_returns_einval() {
+        let task = init_platform(None);
+
+        assert_eq!(
+            task.sys_mmap(
+                0,
+                0x1000,
+                ProtFlags::PROT_READ,
+                MapFlags::MAP_SHARED_VALIDATE | MapFlags::MAP_ANON | MapFlags::MAP_SYNC,
+                -1,
+                0,
+            )
+            .unwrap_err(),
+            Errno::EINVAL
+        );
+    }
+
+    #[test]
+    fn test_mmap_file_map_sync_invalid_fd_returns_ebadf() {
+        let task = init_platform(None);
+
+        assert_eq!(
+            task.sys_mmap(
+                0,
+                0x1000,
+                ProtFlags::PROT_READ,
+                MapFlags::MAP_PRIVATE | MapFlags::MAP_SYNC,
+                -1,
+                0,
+            )
+            .unwrap_err(),
+            Errno::EBADF
+        );
     }
 
     #[test]

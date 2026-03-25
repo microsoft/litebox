@@ -1224,7 +1224,9 @@ pub(crate) fn write_sockaddr_to_user(
                 }
             }
         }
-        SocketAddress::Inet(SocketAddr::V6(_)) => todo!("copy_sockaddr_to_user for IPv6"),
+        SocketAddress::Inet(SocketAddr::V6(_)) => {
+            return Err(Errno::EAFNOSUPPORT);
+        }
     }
     .truncate();
     addrlen.write_at_offset(0, len).ok_or(Errno::EFAULT)
