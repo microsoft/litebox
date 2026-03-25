@@ -140,6 +140,11 @@ impl FsState {
     fn umask(&self) -> Mode {
         Mode::from_bits_retain(self.umask.load(Ordering::Relaxed))
     }
+
+    /// Returns the current working directory path.
+    pub(crate) fn current_working_directory(&self) -> String {
+        self.cwd.read().clone()
+    }
 }
 
 /// Task state shared by `CLONE_FILES`.

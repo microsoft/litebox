@@ -1147,6 +1147,12 @@ impl<'a, FS: ShimFS> ElfLoader<'a, FS> {
         Ok(Self { path, main, interp })
     }
 
+    /// Returns the fixed load address range for the main ELF, if it is an
+    /// ET_EXEC (non-PIE) binary. Returns `None` for ET_DYN (PIE) binaries.
+    pub fn fixed_load_range(&self) -> Option<core::ops::Range<usize>> {
+        self.main.parsed.fixed_load_range()
+    }
+
     /// Load an ELF file and prepare the stack for the new process.
     pub fn load(
         &mut self,

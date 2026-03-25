@@ -1376,6 +1376,7 @@ pub struct CloneArgs {
 /// Task command name length
 pub const TASK_COMM_LEN: usize = 16;
 
+#[derive(Debug, Clone, Copy)]
 pub struct TaskParams {
     /// Process ID
     pub pid: i32,

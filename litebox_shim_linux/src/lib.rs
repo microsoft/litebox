@@ -474,7 +474,7 @@ impl LinuxShimProcess {
 }
 
 /// Create a default layered file system with the given in-memory and tar read-only layers.
-fn default_fs(
+pub fn default_fs(
     litebox: &LiteBox<Platform>,
     in_mem_fs: litebox::fs::in_mem::FileSystem<Platform>,
     tar_ro_fs: litebox::fs::tar_ro::FileSystem<Platform>,

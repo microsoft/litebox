@@ -45,6 +45,8 @@ pub(crate) enum HostRole {
 pub(crate) enum ExecRoute {
     /// Continue exec in the current host process.
     Local { host: HostId },
+    /// The binary cannot be loaded locally and needs a dedicated worker host.
+    RemoteHost { source_host: HostId },
 }
 
 /// Identifier for a prepared exec-handoff transaction.

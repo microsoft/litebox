@@ -3612,6 +3612,89 @@ impl<FS: ShimFS> Task<FS> {
         Ok((path, argv_vec))
     }
 
+    /// Execute a non-PIE binary in a dedicated worker host process.
+    ///
+    /// This is called from `sys_execve` when the parsed ELF has fixed load
+    /// addresses outside the current VA partition. Instead of biasing/rewriting,
+    /// we spawn a fresh host process with the full address space, let it load
+    /// and run the binary, then map its exit status back to the guest process.
+    fn exec_on_remote_host(
+        &self,
+        path: &str,
+        argv: alloc::vec::Vec<alloc::ffi::CString>,
+        envp: alloc::vec::Vec<alloc::ffi::CString>,
+    ) -> Result<usize, Errno> {
+        #[cfg(feature = "trace_syscalls")]
+        litebox::log_println!(
+            self.global.platform,
+            "[EXEC-REMOTE] pid={} path={:?} — spawning worker host for non-PIE binary",
+            self.pid,
+            path,
+        );
+
+        let guest_cwd = self.fs.borrow().current_working_directory();
+        // Ensure the load path is absolute so the worker resolves it
+        // correctly regardless of its own host-side CWD.
+        let abs_path = if path.starts_with('/') {
+            alloc::string::String::from(path)
+        } else {
+            let mut abs = guest_cwd.clone();
+            abs.push_str(path);
+            abs
+        };
+        let host_pid = self
+            .global
+            .platform
+            .spawn_worker_host_for_exec(
+                &abs_path,
+                &argv,
+                &envp,
+                &guest_cwd,
+                self.pid,
+                self.ppid,
+                self.credentials.uid,
+                self.credentials.gid,
+            )
+            .map_err(|err| {
+                litebox::log_println!(
+                    self.global.platform,
+                    "[EXEC-REMOTE] pid={} spawn_worker_host_for_exec failed: {}",
+                    self.pid,
+                    err,
+                );
+                Errno::ENOMEM
+            })?;
+
+        #[cfg(feature = "trace_syscalls")]
+        litebox::log_println!(
+            self.global.platform,
+            "[EXEC-REMOTE] pid={} worker host_pid={} — waiting for exit",
+            self.pid,
+            host_pid,
+        );
+
+        let exit_code = self.global.platform.wait_worker_host(host_pid);
+
+        #[cfg(feature = "trace_syscalls")]
+        litebox::log_println!(
+            self.global.platform,
+            "[EXEC-REMOTE] pid={} worker exited with code {}",
+            self.pid,
+            exit_code,
+        );
+
+        // The worker ran the guest binary to completion. Terminate this guest
+        // process with the same exit code so the parent sees the correct
+        // status via wait4/SIGCHLD.
+        self.exit_group(ExitStatus::Exit(exit_code.truncate()));
+
+        // exit_group triggers process teardown and SIGCHLD to the parent.
+        // The syscall handler loop will notice is_exiting and stop running
+        // guest code. Return ENOSYS as a placeholder — this path should
+        // not be reached in practice.
+        Err(Errno::ENOSYS)
+    }
+
     /// Handle syscall `execve`.
     pub(crate) fn sys_execve(
         &self,
@@ -3705,12 +3788,44 @@ impl<FS: ShimFS> Task<FS> {
             .expect("running process must be routed by the local control plane")
         {
             ExecRoute::Local { .. } => {}
+            ExecRoute::RemoteHost { .. } => {
+                // A previous route_exec call determined this process needs a
+                // remote host. This shouldn't happen on the first exec call
+                // since we check needs_remote_host below; this arm exists for
+                // completeness and future re-routing scenarios.
+                return Err(Errno::ENOSYS);
+            }
         }
         let loader = crate::loader::elf::ElfLoader::new(self, &path).map_err(Errno::from)?;
+
+        // Check whether the parsed ELF is a non-PIE binary whose fixed load
+        // addresses fall outside this process's VA partition. For a shared-
+        // fork child (userland), the child still uses the parent's ProcessState
+        // at this point, so we must check against the child's actual partition
+        // (from the ForkContext) rather than the parent's.
+        let needs_remote = if let Some(fixed_range) = loader.fixed_load_range() {
+            let (pm_min, pm_max) = if let Some(fc) = self.fork_context.borrow().as_ref() {
+                use litebox::platform::AddressSpaceProvider;
+                let child_range = self
+                    .global
+                    .platform
+                    .address_space_range(fc.address_space_id)
+                    .expect("child address space must be valid");
+                (child_range.start, child_range.end)
+            } else {
+                let ps = self.process_state.borrow();
+                (ps.pm.addr_min(), ps.pm.addr_max())
+            };
+            fixed_range.start < pm_min || fixed_range.end > pm_max
+        } else {
+            false
+        };
 
         // After this point, the old program is torn down and failures must terminate the process.
 
         // Kill all the other threads in this process and wait for them to exit.
+        // This must happen before any remote handoff so sibling threads are not
+        // left running concurrently with the worker.
         if !self.kill_other_threads() {
             // If we were suspended for vfork parking, report EINTR so callers
             // can retry. Otherwise preserve existing EBUSY behavior for
@@ -3721,6 +3836,51 @@ impl<FS: ShimFS> Task<FS> {
             // Another thread is already in the process of execve. This thread
             // will exit; return any error code.
             return Err(Errno::EBUSY);
+        }
+
+        if needs_remote {
+            // For shared-fork children (userland), detach from the parent's
+            // state before spawning the worker, just like normal exec does.
+            if let Some(fc) = self.fork_context.borrow_mut().take() {
+                // Flush MAP_SHARED writeback data while still using the
+                // parent's ProcessState.
+                self.sync_all_shared_mappings();
+
+                // Switch to the child's own VA partition.
+                let child_range = {
+                    use litebox::platform::AddressSpaceProvider;
+                    self.global
+                        .platform
+                        .address_space_range(fc.address_space_id)
+                        .expect("child address space must be valid")
+                };
+                let child_ps = Arc::new(crate::ProcessState {
+                    pm: litebox::mm::PageManager::new(&self.global.litebox, child_range),
+                    address_space_id: fc.address_space_id,
+                    thread_count: core::sync::atomic::AtomicI32::new(1),
+                    active_vfork_layers: litebox::sync::Mutex::new(alloc::vec::Vec::new()),
+                    elf_patch_cache: litebox::sync::Mutex::new(alloc::collections::BTreeMap::new()),
+                    shared_file_mappings: litebox::sync::Mutex::new(alloc::vec::Vec::new()),
+                    main_bss_start: core::sync::atomic::AtomicUsize::new(0),
+                    main_bss_end: core::sync::atomic::AtomicUsize::new(0),
+                    proc_map_paths: litebox::sync::Mutex::new(alloc::vec::Vec::new()),
+                    vfork_parking: Arc::new(crate::VforkParking {
+                        park: <Platform as litebox::platform::RawMutexProvider>::RawMutex::INIT,
+                        parked_count:
+                            <Platform as litebox::platform::RawMutexProvider>::RawMutex::INIT,
+                        deferred_lie_count: core::sync::atomic::AtomicU32::new(0),
+                    }),
+                });
+                self.process_state.replace(child_ps);
+
+                // Unshare fs state.
+                let new_fs: Arc<_> = Arc::new(self.fs.borrow().as_ref().clone());
+                self.fs.replace(new_fs);
+
+                // Signal the parent to resume now that we've detached.
+                fc.vfork_done.signal();
+            }
+            return self.exec_on_remote_host(&path, argv_vec, envp_vec);
         }
 
         // If this is a vfork child, detach from the parent's shared state.

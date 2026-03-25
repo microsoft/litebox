@@ -112,6 +112,36 @@ pub struct CliArgs {
     /// Defaults to "/".
     #[arg(long = "cwd", requires = "unstable", help_heading = "Unstable Options")]
     pub working_directory: Option<String>,
+
+    /// Internal: run as a worker host process for a non-PIE child exec.
+    ///
+    /// When set, the runner loads the specified binary with the full VA space
+    /// (no partitioning), runs it to completion, and exits with its exit code.
+    /// This flag is set automatically by the parent host process and should
+    /// not be used directly.
+    #[arg(
+        long = "worker-exec",
+        requires = "unstable",
+        hide = true,
+        help_heading = "Unstable Options"
+    )]
+    pub worker_exec: bool,
+
+    /// Internal: guest PID for worker-exec mode.
+    #[arg(long = "guest-pid", hide = true, requires = "worker_exec")]
+    pub guest_pid: Option<i32>,
+
+    /// Internal: guest PPID for worker-exec mode.
+    #[arg(long = "guest-ppid", hide = true, requires = "worker_exec")]
+    pub guest_ppid: Option<i32>,
+
+    /// Internal: guest UID for worker-exec mode.
+    #[arg(long = "guest-uid", hide = true, requires = "worker_exec")]
+    pub guest_uid: Option<u32>,
+
+    /// Internal: guest GID for worker-exec mode.
+    #[arg(long = "guest-gid", hide = true, requires = "worker_exec")]
+    pub guest_gid: Option<u32>,
 }
 
 /// Backends supported for intercepting syscalls
@@ -214,6 +244,12 @@ fn initial_program_data(
 /// panic. If it does actually panic, then ping the authors of LiteBox, and likely a better error
 /// message could be thrown instead.
 pub fn run(cli_args: CliArgs) -> Result<()> {
+    // When running as a worker host for a non-PIE child exec, take the
+    // simplified worker path that skips VA partitioning.
+    if cli_args.worker_exec {
+        return run_worker_exec(cli_args);
+    }
+
     if !cli_args.insert_files.is_empty() {
         unimplemented!(
             "this should (hopefully soon) have a nicer interface to support loading in files"
@@ -312,6 +348,10 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     }
 
     litebox_platform_multiplex::set_platform(platform);
+
+    // Register runner CLI flags that should be forwarded to worker host
+    // processes spawned for non-PIE child execs.
+    register_worker_spawn_flags(platform, &cli_args);
 
     let shim_builder = litebox_shim_linux::LinuxShimBuilder::new();
     let litebox = shim_builder.litebox();
@@ -481,6 +521,7 @@ fn finish_run<FS: litebox_shim_linux::ShimFS>(
             exec_prog_path,
             argv,
             envp,
+            None,
         )
     } else {
         let initial_file_system = std::sync::Arc::new(fs);
@@ -543,6 +584,7 @@ fn finish_run_with_nine_p<FS: litebox_shim_linux::ShimFS>(
     exec_prog_path: &str,
     argv: Vec<alloc::ffi::CString>,
     envp: Vec<alloc::ffi::CString>,
+    task_override: Option<litebox_common_linux::TaskParams>,
 ) -> Result<()> {
     let broker_addr = cli_args.nine_p_broker.as_deref().unwrap();
     let is_tcp = broker_addr.parse::<core::net::SocketAddr>().is_ok();
@@ -581,7 +623,7 @@ fn finish_run_with_nine_p<FS: litebox_shim_linux::ShimFS>(
 
         let program = shim.load_program_with_exec_filename(
             combined_fs,
-            platform.init_task(),
+            task_override.unwrap_or_else(|| platform.init_task()),
             load_prog_path,
             exec_prog_path,
             argv,
@@ -651,7 +693,7 @@ fn finish_run_with_nine_p<FS: litebox_shim_linux::ShimFS>(
 
     let program = shim.load_program_with_exec_filename(
         combined_fs,
-        platform.init_task(),
+        task_override.unwrap_or_else(|| platform.init_task()),
         load_prog_path,
         exec_prog_path,
         argv,
@@ -660,6 +702,148 @@ fn finish_run_with_nine_p<FS: litebox_shim_linux::ShimFS>(
     )?;
 
     run_program(program, shutdown, net_worker);
+}
+
+/// Run as a worker host process for a non-PIE child exec.
+///
+/// This is the simplified path used when the parent host process detected that
+/// a child's binary is ET_EXEC with fixed addresses outside its VA partition.
+/// The worker gets the full address space (no partitioning), loads the binary
+/// at its canonical addresses, runs it to completion, and exits with its code.
+#[allow(clippy::similar_names)]
+fn run_worker_exec(cli_args: CliArgs) -> Result<()> {
+    // program_and_arguments layout from the parent:
+    //   [0] = resolved load path (the binary to load from the FS)
+    //   [1..] = original guest argv (may be empty for argc==0 execs)
+    if cli_args.program_and_arguments.is_empty() {
+        anyhow::bail!("--worker-exec requires at least a load path");
+    }
+    let load_path = &cli_args.program_and_arguments[0];
+    let guest_argv: Vec<std::ffi::CString> = cli_args.program_and_arguments[1..]
+        .iter()
+        .map(|x| std::ffi::CString::new(x.bytes().collect::<Vec<u8>>()).unwrap())
+        .collect();
+
+    // Read guest identity from CLI args passed by the parent.
+    let guest_pid: i32 = cli_args.guest_pid.unwrap_or(1);
+    let guest_ppid: i32 = cli_args.guest_ppid.unwrap_or(0);
+    let guest_uid: u32 = cli_args.guest_uid.unwrap_or(0);
+    let guest_gid: u32 = cli_args.guest_gid.unwrap_or(0);
+
+    // Set up the platform with the same network transport as the parent.
+    let platform = if cli_args.tun_device_name.is_some() {
+        Platform::new(cli_args.tun_device_name.as_deref())
+    } else if let Some(broker_path) = &cli_args.network_broker {
+        use litebox_platform_linux_userland::NetworkTransport;
+        let fd = connect_to_broker_ipc(broker_path)?;
+        Platform::with_network(Some(NetworkTransport::Ipc(fd)))
+    } else {
+        Platform::new(None)
+    };
+    litebox_platform_multiplex::set_platform(platform);
+
+    let shim_builder = litebox_shim_linux::LinuxShimBuilder::new();
+    let litebox = shim_builder.litebox();
+
+    // Load tar data if --initial-files was forwarded.
+    let tar_data: &'static [u8] = if let Some(tar_file) = cli_args.initial_files.as_ref() {
+        mmapped_file(tar_file)?.data
+    } else {
+        litebox::fs::tar_ro::EMPTY_TAR_FILE
+    };
+
+    let mut in_mem = litebox::fs::in_mem::FileSystem::new(litebox);
+    in_mem.with_root_privileges(|fs| {
+        let mode = Mode::RWXU | Mode::RWXG | Mode::RWXO;
+        let _ = fs.mkdir("/tmp", mode);
+    });
+
+    // If the binary is on the host filesystem and no 9P broker is active,
+    // inject it into the in-memory FS.
+    if cli_args.nine_p_broker.is_none() && !cli_args.program_from_tar {
+        let prog = resolve_host_program_path(load_path);
+        if prog.exists() {
+            let file = mmapped_file(&prog)?;
+            let data: alloc::borrow::Cow<'static, [u8]> = file.data.into();
+            platform.register_cow_region(file.data, file.abs_path);
+
+            let ancestors: Vec<_> = prog.ancestors().collect();
+            for path in ancestors
+                .iter()
+                .rev()
+                .skip(1)
+                .take(ancestors.len().saturating_sub(2))
+            {
+                let path_str = path.to_str().unwrap_or("/");
+                in_mem.with_root_privileges(|fs| {
+                    let _ = fs.mkdir(
+                        path_str,
+                        Mode::RWXU | Mode::RGRP | Mode::XGRP | Mode::ROTH | Mode::XOTH,
+                    );
+                });
+            }
+            in_mem.with_root_privileges(|fs| {
+                let fd = fs
+                    .open(
+                        prog.to_str().unwrap(),
+                        litebox::fs::OFlags::WRONLY | litebox::fs::OFlags::CREAT,
+                        Mode::RWXU | Mode::RGRP | Mode::XGRP | Mode::ROTH | Mode::XOTH,
+                    )
+                    .unwrap();
+                fs.initialize_primarily_read_heavy_file(&fd, data);
+                fs.close(&fd).unwrap();
+            });
+        }
+    }
+
+    let tar_ro = litebox::fs::tar_ro::FileSystem::new(litebox, tar_data.into());
+    let default_fs = litebox_shim_linux::default_fs(litebox, in_mem, tar_ro);
+
+    let guest_envp = build_envp(&cli_args);
+    let guest_task = litebox_common_linux::TaskParams {
+        pid: guest_pid,
+        ppid: guest_ppid,
+        uid: guest_uid,
+        euid: guest_uid,
+        gid: guest_gid,
+        egid: guest_gid,
+    };
+
+    // When a 9P broker is active, layer the 9P FS on top.
+    if cli_args.nine_p_broker.is_some() {
+        finish_run_with_nine_p(
+            shim_builder,
+            default_fs,
+            &cli_args,
+            platform,
+            load_path,
+            load_path,
+            guest_argv,
+            guest_envp,
+            Some(guest_task),
+        )
+    } else {
+        let initial_file_system = std::sync::Arc::new(default_fs);
+        let shim = shim_builder.build();
+        let shutdown = std::sync::Arc::new(core::sync::atomic::AtomicBool::new(false));
+        let net_worker = start_network_worker(&shim, &shutdown);
+
+        let load_prog = resolve_host_program_path(load_path);
+        let load_prog_path = load_prog
+            .to_str()
+            .ok_or_else(|| anyhow!("Could not convert program path to a string"))?;
+        let program = shim.load_program_with_exec_filename(
+            initial_file_system,
+            guest_task,
+            load_prog_path,
+            load_prog_path,
+            guest_argv,
+            guest_envp,
+            cli_args.working_directory.clone(),
+        )?;
+
+        run_program(program, shutdown, net_worker);
+    }
 }
 
 /// Run the loaded program and exit with its return code.
@@ -706,7 +890,13 @@ fn run_program<FS: litebox_shim_linux::ShimFS>(
 fn connect_to_broker_ipc(path: &str) -> Result<std::os::fd::OwnedFd> {
     use std::os::fd::FromRawFd;
 
-    let fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM | libc::SOCK_NONBLOCK, 0) };
+    let fd = unsafe {
+        libc::socket(
+            libc::AF_UNIX,
+            libc::SOCK_STREAM | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC,
+            0,
+        )
+    };
     if fd < 0 {
         anyhow::bail!("Failed to create Unix socket for broker IPC");
     }
@@ -1183,6 +1373,35 @@ fn build_envp(cli_args: &CliArgs) -> Vec<std::ffi::CString> {
 fn fixup_env(_envp: &mut Vec<alloc::ffi::CString>) {
     // No environment fixups needed — the shim's mmap hook handles
     // syscall patching at runtime without LD_AUDIT.
+}
+
+/// Collect runner CLI flags that should be forwarded to worker host processes
+/// spawned for non-PIE child execs.
+fn register_worker_spawn_flags(platform: &Platform, cli_args: &CliArgs) {
+    let mut flags: Vec<std::ffi::CString> = Vec::new();
+    if let Some(ref broker) = cli_args.nine_p_broker {
+        flags.push(std::ffi::CString::new("--nine-p-broker").unwrap());
+        flags.push(std::ffi::CString::new(broker.as_bytes()).unwrap());
+    }
+    if let Some(ref initial_files) = cli_args.initial_files {
+        flags.push(std::ffi::CString::new("--initial-files").unwrap());
+        flags
+            .push(std::ffi::CString::new(initial_files.to_str().unwrap_or("").as_bytes()).unwrap());
+    }
+    if let Some(ref broker) = cli_args.network_broker {
+        flags.push(std::ffi::CString::new("--network-broker").unwrap());
+        flags.push(std::ffi::CString::new(broker.as_bytes()).unwrap());
+    }
+    if let Some(ref tun) = cli_args.tun_device_name {
+        flags.push(std::ffi::CString::new("--tun-device-name").unwrap());
+        flags.push(std::ffi::CString::new(tun.as_bytes()).unwrap());
+    }
+    if cli_args.program_from_tar {
+        flags.push(std::ffi::CString::new("--program-from-tar").unwrap());
+    }
+    if !flags.is_empty() {
+        platform.set_worker_spawn_flags(flags);
+    }
 }
 
 #[cfg(test)]

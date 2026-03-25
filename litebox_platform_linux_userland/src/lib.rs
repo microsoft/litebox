@@ -155,6 +155,9 @@ pub struct LinuxUserland {
     stdin_injected: Mutex<VecDeque<u8>>,
     /// Pending terminal escape-sequence fragments split across stdout/stderr writes.
     terminal_osc_pending: Mutex<TerminalOscPending>,
+    /// Extra CLI flags to forward when spawning worker host processes.
+    /// Set by the runner at startup via [`set_worker_spawn_flags`].
+    worker_spawn_flags: std::sync::RwLock<Vec<std::ffi::CString>>,
 }
 
 impl core::fmt::Debug for LinuxUserland {
@@ -684,6 +687,7 @@ impl LinuxUserland {
             stdin_cancelled: std::sync::atomic::AtomicBool::new(false),
             stdin_injected: Mutex::new(VecDeque::new()),
             terminal_osc_pending: Mutex::new(TerminalOscPending::default()),
+            worker_spawn_flags: std::sync::RwLock::new(Vec::new()),
         };
         Box::leak(Box::new(platform))
     }
@@ -696,6 +700,19 @@ impl LinuxUserland {
     /// Panics if the internal lock is poisoned.
     pub fn set_raw_message_fd(&self, fd: std::os::fd::OwnedFd) {
         *self.raw_message_fd.write().unwrap() = Some(fd);
+    }
+
+    /// Register extra CLI flags that should be forwarded to worker host
+    /// processes spawned for non-PIE child execs.
+    ///
+    /// The runner should call this at startup with flags like
+    /// `--nine-p-broker`, `--initial-files`, `--network-broker`, etc.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal lock is poisoned.
+    pub fn set_worker_spawn_flags(&self, flags: Vec<std::ffi::CString>) {
+        *self.worker_spawn_flags.write().unwrap() = flags;
     }
 
     /// Cancel any pending `read_from_stdin()` call, causing it to return EOF.
@@ -924,6 +941,135 @@ impl LinuxUserland {
             egid: unsafe { syscalls::raw::syscall0(syscalls::Sysno::getegid) }
                 .try_into()
                 .unwrap(),
+        }
+    }
+
+    /// Spawn a worker host process to run a non-PIE binary that cannot be
+    /// loaded in the current process's VA partition.
+    ///
+    /// The worker is a fresh instance of the runner binary (`/proc/self/exe`)
+    /// invoked with the `--worker-exec` internal flag. It boots a new shim,
+    /// loads the binary at its canonical address with the full VA space, runs
+    /// it to completion, and exits with the guest's exit code.
+    ///
+    /// Returns the host-side PID of the worker process on success.
+    ///
+    /// # Panics
+    ///
+    /// Panics only if `CString::new` fails on a NUL-free string literal,
+    /// which cannot happen in practice.
+    #[allow(clippy::too_many_arguments, clippy::similar_names)]
+    pub fn spawn_worker_host_for_exec(
+        &self,
+        guest_binary_path: &str,
+        argv: &[alloc::ffi::CString],
+        envp: &[alloc::ffi::CString],
+        guest_cwd: &str,
+        guest_pid: i32,
+        guest_ppid: i32,
+        guest_uid: u32,
+        guest_gid: u32,
+    ) -> Result<i32, i32> {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+
+        // SAFETY: `environ` is the standard C runtime global environment pointer.
+        unsafe extern "C" {
+            static environ: *const *const libc::c_char;
+        }
+
+        // Build the command line for the worker:
+        //   /proc/self/exe -Z --worker-exec [extra_flags...] --cwd <cwd>
+        //       --env K=V ... -- <guest_binary> [original argv...]
+        let self_exe = std::fs::read_link("/proc/self/exe").map_err(|_| -1_i32)?;
+        let mut spawn_argv: Vec<CString> = Vec::new();
+        spawn_argv.push(CString::new(self_exe.as_os_str().as_bytes()).map_err(|_| -1_i32)?);
+        spawn_argv.push(CString::new("-Z").unwrap());
+        spawn_argv.push(CString::new("--worker-exec").unwrap());
+
+        // Include runner flags (--nine-p-broker, --initial-files, etc.)
+        {
+            let flags = self.worker_spawn_flags.read().unwrap();
+            for flag in flags.iter() {
+                spawn_argv.push(flag.clone());
+            }
+        }
+
+        // Forward the guest's current working directory.
+        spawn_argv.push(CString::new("--cwd").unwrap());
+        spawn_argv.push(CString::new(guest_cwd).map_err(|_| -1_i32)?);
+
+        // Forward guest identity via CLI args (safe with concurrent host threads,
+        // unlike std::env::set_var which mutates the global environment).
+        spawn_argv.push(CString::new("--guest-pid").unwrap());
+        spawn_argv.push(CString::new(guest_pid.to_string()).map_err(|_| -1_i32)?);
+        spawn_argv.push(CString::new("--guest-ppid").unwrap());
+        spawn_argv.push(CString::new(guest_ppid.to_string()).map_err(|_| -1_i32)?);
+        spawn_argv.push(CString::new("--guest-uid").unwrap());
+        spawn_argv.push(CString::new(guest_uid.to_string()).map_err(|_| -1_i32)?);
+        spawn_argv.push(CString::new("--guest-gid").unwrap());
+        spawn_argv.push(CString::new(guest_gid.to_string()).map_err(|_| -1_i32)?);
+
+        // Forward guest environment as --env K=V pairs.
+        for env_entry in envp {
+            spawn_argv.push(CString::new("--env").unwrap());
+            spawn_argv.push(env_entry.clone());
+        }
+        spawn_argv.push(CString::new("--").unwrap());
+        // Forward the full original guest argv (argv[0] may differ from
+        // guest_binary_path for symlinks/busybox-style applets).
+        spawn_argv.push(CString::new(guest_binary_path).map_err(|_| -1_i32)?);
+        for arg in argv {
+            spawn_argv.push(arg.clone());
+        }
+
+        let argv_ptrs: Vec<*const libc::c_char> = spawn_argv
+            .iter()
+            .map(|s| s.as_ptr())
+            .chain(core::iter::once(core::ptr::null()))
+            .collect();
+
+        // The worker inherits the current host environment.
+        let mut pid: libc::pid_t = 0;
+        let ret = unsafe {
+            libc::posix_spawn(
+                core::ptr::addr_of_mut!(pid),
+                spawn_argv[0].as_ptr(),
+                core::ptr::null(),
+                core::ptr::null(),
+                argv_ptrs.as_ptr().cast::<*mut libc::c_char>(),
+                environ.cast::<*mut libc::c_char>(),
+            )
+        };
+        if ret != 0 {
+            return Err(ret);
+        }
+        Ok(pid)
+    }
+
+    /// Wait for a worker host process to exit and return the exit status.
+    ///
+    /// Returns the exit code (0–255) on normal exit, or 128+signal on signal death.
+    pub fn wait_worker_host(&self, host_pid: i32) -> i32 {
+        let mut status: libc::c_int = 0;
+        loop {
+            let ret = unsafe { libc::waitpid(host_pid, core::ptr::addr_of_mut!(status), 0) };
+            if ret == -1 {
+                let err = std::io::Error::last_os_error();
+                if err.kind() == std::io::ErrorKind::Interrupted {
+                    continue;
+                }
+                // Child doesn't exist or other error — treat as exit 127.
+                return 127;
+            }
+            break;
+        }
+        if libc::WIFEXITED(status) {
+            libc::WEXITSTATUS(status)
+        } else if libc::WIFSIGNALED(status) {
+            128 + libc::WTERMSIG(status)
+        } else {
+            127
         }
     }
 
