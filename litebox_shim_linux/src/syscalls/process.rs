@@ -876,6 +876,46 @@ impl<FS: ShimFS> Task<FS> {
         self.exit_thread(status.truncate());
     }
 
+    fn reject_remote_running_process_control(
+        &self,
+        process_id: litebox::process::ProcessId,
+        operation: &str,
+    ) -> Result<(), Errno> {
+        let Some(owner_host) = self
+            .global
+            .control_plane
+            .owner_of_running_process(process_id)
+        else {
+            return Ok(());
+        };
+        if owner_host == self.global.control_plane.local_host() {
+            return Ok(());
+        }
+        log_unsupported!(
+            "{operation} for running pid {} owned by remote host {:?}",
+            process_id.0,
+            owner_host
+        );
+        Err(Errno::EOPNOTSUPP)
+    }
+
+    fn reject_remote_running_child_wait(
+        &self,
+        process_id: litebox::process::ProcessId,
+        operation: &str,
+    ) -> Result<(), Errno> {
+        let is_direct_child = self
+            .global
+            .litebox
+            .process_registry()
+            .with_context(process_id, |ctx| ctx.parent == Some(self.process_id))
+            .unwrap_or(false);
+        if !is_direct_child {
+            return Ok(());
+        }
+        self.reject_remote_running_process_control(process_id, operation)
+    }
+
     pub(crate) fn sys_exit_group(&self, status: i32) {
         self.exit_group(ExitStatus::Exit(status.truncate()));
     }
@@ -913,6 +953,9 @@ impl<FS: ShimFS> Task<FS> {
             log_unsupported!("wait4 with unsupported options: {:#x}", options);
             Errno::EINVAL
         })?;
+        if let WaitTarget::Pid(target_pid) = target {
+            self.reject_remote_running_child_wait(target_pid, "wait4")?;
+        }
 
         // Treat vfork suspension as an interruption so wait_for_child returns,
         // allowing prepare_to_run_guest() to park this thread.
@@ -1001,6 +1044,9 @@ impl<FS: ShimFS> Task<FS> {
             // Not waiting for exited children — we only support WEXITED.
             log_unsupported!("waitid without WEXITED");
             return Err(Errno::EINVAL);
+        }
+        if let WaitTarget::Pid(target_pid) = target {
+            self.reject_remote_running_child_wait(target_pid, "waitid")?;
         }
         let mut wait_options = WaitOptions::empty();
         if raw_opts & WaitOptions::WNOHANG.bits() != 0 {
@@ -1123,6 +1169,7 @@ impl<FS: ShimFS> Task<FS> {
         if flags & !PIDFD_NONBLOCK != 0 {
             return Err(Errno::EINVAL);
         }
+        self.reject_remote_running_process_control(ProcessId(pid), "pidfd_open")?;
 
         let state = self
             .global
@@ -3542,6 +3589,168 @@ mod tests {
             .clear_child_tid
             .set(Some(crate::MutPtr::from_usize(0x1000_0060_c2b)));
         drop(task);
+    }
+
+    fn register_remote_owned_child(
+        task: &crate::Task<crate::DefaultFS>,
+    ) -> litebox::process::ProcessId {
+        let create_child = || {
+            task.global
+                .litebox
+                .process_registry()
+                .create_process(
+                    Some(task.process_id),
+                    litebox_common_linux::signal::Signal::SIGCHLD.as_i32(),
+                )
+                .expect("child process should be created")
+        };
+        let mut child = create_child();
+        if i32::try_from(child.0).unwrap() == task.pid {
+            child = create_child();
+        }
+        let worker = task
+            .global
+            .control_plane
+            .register_worker_host(crate::multihost::HostId::ROOT)
+            .expect("worker host should be created");
+        task.global
+            .control_plane
+            .register_running_process(child, worker)
+            .expect("child should be registered to worker host");
+        child
+    }
+
+    fn register_remote_owned_grandchild(
+        task: &crate::Task<crate::DefaultFS>,
+    ) -> litebox::process::ProcessId {
+        let intermediate = task
+            .global
+            .litebox
+            .process_registry()
+            .create_process(
+                Some(task.process_id),
+                litebox_common_linux::signal::Signal::SIGCHLD.as_i32(),
+            )
+            .expect("intermediate child should be created");
+        let grandchild = task
+            .global
+            .litebox
+            .process_registry()
+            .create_process(
+                Some(intermediate),
+                litebox_common_linux::signal::Signal::SIGCHLD.as_i32(),
+            )
+            .expect("grandchild should be created");
+        let worker = task
+            .global
+            .control_plane
+            .register_worker_host(crate::multihost::HostId::ROOT)
+            .expect("worker host should be created");
+        task.global
+            .control_plane
+            .register_running_process(grandchild, worker)
+            .expect("grandchild should be registered to worker host");
+        grandchild
+    }
+
+    #[test]
+    fn test_wait4_rejects_remote_owned_running_child() {
+        use litebox::process::WaitOptions;
+        use litebox_common_linux::errno::Errno;
+
+        let task = crate::syscalls::tests::init_platform(None);
+        let child = register_remote_owned_child(&task);
+
+        let err = task
+            .sys_wait4(
+                i32::try_from(child.0).unwrap(),
+                None,
+                i32::try_from(WaitOptions::WNOHANG.bits()).unwrap(),
+                None,
+            )
+            .unwrap_err();
+        assert_eq!(err, Errno::EOPNOTSUPP);
+    }
+
+    #[test]
+    fn test_waitid_rejects_remote_owned_running_child() {
+        use litebox::process::WaitOptions;
+        use litebox_common_linux::errno::Errno;
+
+        const P_PID: u32 = 1;
+        const WEXITED: i32 = 4;
+
+        let task = crate::syscalls::tests::init_platform(None);
+        let child = register_remote_owned_child(&task);
+
+        let err = task
+            .sys_waitid(
+                P_PID,
+                child.0,
+                None,
+                WEXITED | i32::try_from(WaitOptions::WNOHANG.bits()).unwrap(),
+            )
+            .unwrap_err();
+        assert_eq!(err, Errno::EOPNOTSUPP);
+    }
+
+    #[test]
+    fn test_wait4_keeps_echild_for_remote_owned_non_child() {
+        use litebox::process::WaitOptions;
+        use litebox_common_linux::errno::Errno;
+
+        let task = crate::syscalls::tests::init_platform(None);
+        let grandchild = register_remote_owned_grandchild(&task);
+
+        let err = task
+            .sys_wait4(
+                i32::try_from(grandchild.0).unwrap(),
+                None,
+                i32::try_from(WaitOptions::WNOHANG.bits()).unwrap(),
+                None,
+            )
+            .unwrap_err();
+        assert_eq!(err, Errno::ECHILD);
+    }
+
+    #[test]
+    fn test_pidfd_open_rejects_remote_owned_running_child() {
+        use litebox_common_linux::errno::Errno;
+
+        let task = crate::syscalls::tests::init_platform(None);
+        let child = register_remote_owned_child(&task);
+
+        let err = task
+            .sys_pidfd_open(i32::try_from(child.0).unwrap(), 0)
+            .unwrap_err();
+        assert_eq!(err, Errno::EOPNOTSUPP);
+    }
+
+    #[test]
+    fn test_kill_rejects_remote_owned_running_child() {
+        use litebox_common_linux::errno::Errno;
+        use litebox_common_linux::signal::Signal;
+
+        let task = crate::syscalls::tests::init_platform(None);
+        let child = register_remote_owned_child(&task);
+
+        let err = task
+            .sys_kill(i32::try_from(child.0).unwrap(), Signal::SIGTERM.as_i32())
+            .unwrap_err();
+        assert_eq!(err, Errno::EOPNOTSUPP);
+    }
+
+    #[test]
+    fn test_kill_remote_owned_running_child_preserves_invalid_signal_errno() {
+        use litebox_common_linux::errno::Errno;
+
+        let task = crate::syscalls::tests::init_platform(None);
+        let child = register_remote_owned_child(&task);
+
+        let err = task
+            .sys_kill(i32::try_from(child.0).unwrap(), 999)
+            .unwrap_err();
+        assert_eq!(err, Errno::EINVAL);
     }
 
     #[cfg(target_arch = "x86_64")]

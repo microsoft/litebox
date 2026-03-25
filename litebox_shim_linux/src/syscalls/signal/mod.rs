@@ -739,8 +739,17 @@ impl<FS: ShimFS> Task<FS> {
         if signal == 0 {
             return Ok(0);
         }
-
         let signal = Signal::try_from(signal)?;
+        if let Some(owner_host) = self.global.control_plane.owner_of_running_process(target)
+            && owner_host != self.global.control_plane.local_host()
+        {
+            log_unsupported!(
+                "kill for running pid {} owned by remote host {:?}",
+                target.0,
+                owner_host
+            );
+            return Err(Errno::EOPNOTSUPP);
+        }
         self.global
             .cross_process_signals
             .lock()
