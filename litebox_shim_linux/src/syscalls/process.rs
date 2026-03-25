@@ -1244,8 +1244,7 @@ impl<FS: ShimFS> Task<FS> {
 
         // --- Thread clone path (existing behavior) ---
 
-        let thread_required_flags =
-            CloneFlags::VM | CloneFlags::THREAD | CloneFlags::SIGHAND | CloneFlags::FILES;
+        let thread_required_flags = CloneFlags::VM | CloneFlags::THREAD | CloneFlags::SIGHAND;
 
         let supported_clone_flags = CloneFlags::VM
             | CloneFlags::FS
@@ -1346,6 +1345,16 @@ impl<FS: ShimFS> Task<FS> {
             None
         };
 
+        let child_files = if flags.contains(CloneFlags::FILES) {
+            self.files.borrow().clone()
+        } else {
+            alloc::sync::Arc::new(
+                self.files
+                    .borrow()
+                    .clone_for_fork(&mut self.global.litebox.descriptor_table_mut()),
+            )
+        };
+
         let thread = self.thread.new_thread(child_tid).ok_or(Errno::EBUSY)?;
         thread.init_state.set(ThreadInitState::NewThread {
             stack: sp,
@@ -1370,7 +1379,7 @@ impl<FS: ShimFS> Task<FS> {
                         credentials: self.credentials.clone(),
                         comm: self.comm.clone(),
                         fs: fs.into(),
-                        files: self.files.clone(), // TODO: !CLONE_FILES support
+                        files: child_files.into(),
                         signals: self.signals.clone_for_new_task(),
                         fork_context: core::cell::RefCell::new(None),
                         last_shell_write: core::cell::RefCell::new(None),
