@@ -19,6 +19,7 @@ mod device;
 
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpListener, UdpSocket};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
@@ -79,12 +80,12 @@ struct PendingConnect {
     started: Instant,
 }
 
-/// A newly accepted connection waiting for its 4-byte handshake magic.
+/// A newly accepted connection waiting for transport classification.
 /// Drained opportunistically each event-loop iteration with zero blocking.
 struct PendingHandshake {
     stream: Option<IpcStream>,
     raw_socket: RawSock,
-    magic: [u8; 4],
+    handshake: [u8; 8],
     got: usize,
     deadline: Instant,
 }
@@ -104,8 +105,43 @@ const MAX_CONCURRENT_LB9P_RING_UPGRADES: usize = 32;
 #[cfg(any(unix, windows))]
 static ACTIVE_LB9P_RING_UPGRADES: AtomicUsize = AtomicUsize::new(0);
 
+/// Maximum concurrently active extra LBNP proxy sessions accepted from the
+/// listener while an initial session is already running.
+const MAX_ADDITIONAL_LBNP_SESSIONS: usize = 32;
+
+/// Maximum accepted-but-not-yet-classified listener sockets kept in the
+/// pending handshake queue at once.
+const MAX_PENDING_ACCEPTED_HANDSHAKES: usize = 32;
+
 /// Timeout for non-blocking host TCP connect.
 const HOST_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+struct LbnpSessionPermit {
+    session_slots: Arc<AtomicUsize>,
+}
+
+impl Drop for LbnpSessionPermit {
+    fn drop(&mut self) {
+        self.session_slots.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+fn try_acquire_lbnp_session_permit(session_slots: &Arc<AtomicUsize>) -> Option<LbnpSessionPermit> {
+    loop {
+        let active = session_slots.load(Ordering::Acquire);
+        if active >= MAX_ADDITIONAL_LBNP_SESSIONS {
+            return None;
+        }
+        if session_slots
+            .compare_exchange_weak(active, active + 1, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            return Some(LbnpSessionPermit {
+                session_slots: Arc::clone(session_slots),
+            });
+        }
+    }
+}
 
 /// Extract the raw socket descriptor from any std socket type.
 fn raw_socket<T: AsRawSock>(socket: &T) -> RawSock {
@@ -550,7 +586,8 @@ struct LocalBridge {
 /// handled in-process by the registered service instead of proxied to the host.
 ///
 /// If `accept_listener` is provided, the event loop also accepts new IPC
-/// connections on it.  A connection sending `LB9P` magic is dispatched to the
+/// connections on it. Additional `LBNP` clients are handed off to their own
+/// proxy sessions, while a connection sending `LB9P` magic is dispatched to the
 /// first registered local service (port 5640 / 9P) as a direct byte-stream
 /// channel, bypassing smoltcp entirely.
 ///
@@ -562,7 +599,38 @@ pub fn run(
     local_services: Option<LocalServiceRegistry>,
     accept_listener: Option<&IpcListener>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let local_services = local_services.unwrap_or_default();
+    run_with_session_slots(
+        ipc_fd,
+        handshake_done,
+        local_services,
+        accept_listener,
+        Arc::new(AtomicUsize::new(0)),
+    )
+}
+
+pub fn run_with_session_slots(
+    ipc_fd: IpcStream,
+    handshake_done: bool,
+    local_services: Option<LocalServiceRegistry>,
+    accept_listener: Option<&IpcListener>,
+    session_slots: Arc<AtomicUsize>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    run_inner(
+        ipc_fd,
+        handshake_done,
+        Arc::new(local_services.unwrap_or_default()),
+        accept_listener,
+        session_slots,
+    )
+}
+
+fn run_inner(
+    ipc_fd: IpcStream,
+    handshake_done: bool,
+    local_services: Arc<LocalServiceRegistry>,
+    accept_listener: Option<&IpcListener>,
+    session_slots: Arc<AtomicUsize>,
+) -> Result<(), Box<dyn std::error::Error>> {
     info!("network proxy starting");
 
     if !handshake_done {
@@ -858,15 +926,23 @@ pub fn run(
         if let Some(listener) = accept_listener {
             match listener.accept() {
                 Ok(Some(stream)) => {
-                    stream.set_nonblocking(true).ok();
-                    let raw_socket = stream.raw();
-                    pending_handshakes.push(PendingHandshake {
-                        stream: Some(stream),
-                        raw_socket,
-                        magic: [0u8; 4],
-                        got: 0,
-                        deadline: Instant::now() + HANDSHAKE_ACCEPT_TIMEOUT,
-                    });
+                    if pending_handshakes.len() >= MAX_PENDING_ACCEPTED_HANDSHAKES {
+                        warn!(
+                            limit = MAX_PENDING_ACCEPTED_HANDSHAKES,
+                            "too many pending accepted listener clients; dropping accepted connection"
+                        );
+                        drop(stream);
+                    } else {
+                        stream.set_nonblocking(true).ok();
+                        let raw_socket = stream.raw();
+                        pending_handshakes.push(PendingHandshake {
+                            stream: Some(stream),
+                            raw_socket,
+                            handshake: [0u8; 8],
+                            got: 0,
+                            deadline: Instant::now() + HANDSHAKE_ACCEPT_TIMEOUT,
+                        });
+                    }
                 }
                 Ok(None) => {} // Would-block, nothing to accept.
                 Err(e) => {
@@ -879,14 +955,14 @@ pub fn run(
         pending_handshakes.retain_mut(|ph| {
             if Instant::now() >= ph.deadline {
                 debug!(
-                    "accepted connection handshake timed out ({}/4 bytes), dropping",
+                    "accepted connection handshake timed out ({}/8 bytes), dropping",
                     ph.got
                 );
                 return false;
             }
-            // Only read more bytes if we haven't received all 4 magic bytes yet.
+
             if ph.got < 4 {
-                let n = sock_compat::recv_nb(ph.raw_socket, &mut ph.magic[ph.got..], 0);
+                let n = sock_compat::recv_nb(ph.raw_socket, &mut ph.handshake[ph.got..4], 0);
                 if n > 0 {
                     #[allow(clippy::cast_sign_loss)]
                     {
@@ -911,8 +987,66 @@ pub fn run(
                 return true; // keep in queue
             }
 
-            // Got all 4 bytes — check magic.
-            if &ph.magic == b"LB9P" {
+            let magic = &ph.handshake[0..4];
+            if magic == HANDSHAKE_MAGIC {
+                if ph.got < 8 {
+                    let n = sock_compat::recv_nb(ph.raw_socket, &mut ph.handshake[ph.got..], 0);
+                    if n > 0 {
+                        #[allow(clippy::cast_sign_loss)]
+                        {
+                            ph.got += n as usize;
+                        }
+                    } else if n == 0 {
+                        debug!(
+                            "accepted LBNP connection closed during handshake (got {}/8 bytes), dropping",
+                            ph.got
+                        );
+                        return false;
+                    } else {
+                        let err = sock_compat::last_socket_error();
+                        if !sock_compat::is_would_block(err) {
+                            debug!("accepted LBNP handshake read failed: {err}");
+                            return false;
+                        }
+                    }
+                }
+
+                if ph.got < 8 {
+                    return true;
+                }
+
+                let request = ph.handshake;
+                if let Err(e) = validate_handshake_request(&request) {
+                    debug!("accepted LBNP connection with invalid handshake, dropping: {e}");
+                    return false;
+                }
+
+                let Some(stream) = ph.stream.take() else {
+                    return false;
+                };
+                let local_services = Arc::clone(&local_services);
+                let Some(session_permit) = try_acquire_lbnp_session_permit(&session_slots) else {
+                    warn!(
+                        limit = MAX_ADDITIONAL_LBNP_SESSIONS,
+                        "too many concurrent additional LBNP sessions; dropping connection"
+                    );
+                    return false;
+                };
+                let session_slots = Arc::clone(&session_slots);
+                std::thread::spawn(move || {
+                    let _session_permit = session_permit;
+                    if let Err(e) = send_handshake_response(&stream) {
+                        warn!("failed to send accepted LBNP handshake response: {e}");
+                        return;
+                    }
+                    info!("accepted additional LBNP client, handshake complete");
+                    if let Err(e) = run_inner(stream, true, local_services, None, session_slots) {
+                        tracing::error!("network proxy error: {e}");
+                    }
+                });
+                return false;
+            }
+            if magic == b"LB9P" {
                 #[cfg(any(unix, windows))]
                 {
                     if local_services.get_ring(5640).is_some() {
@@ -1347,6 +1481,11 @@ fn perform_handshake(fd: &IpcStream) -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    validate_handshake_request(&buf)?;
+    send_handshake_response(fd)
+}
+
+fn validate_handshake_request(buf: &[u8; 8]) -> Result<(), Box<dyn std::error::Error>> {
     if &buf[0..4] != HANDSHAKE_MAGIC {
         return Err(format!(
             "IPC handshake: bad magic {:02x?}, expected {:02x?}",
@@ -1374,7 +1513,10 @@ fn perform_handshake(fd: &IpcStream) -> Result<(), Box<dyn std::error::Error>> {
             format!("IPC handshake: MTU mismatch — peer sent {mtu}, we expect {our_mtu}").into(),
         );
     }
+    Ok(())
+}
 
+fn send_handshake_response(fd: &IpcStream) -> Result<(), Box<dyn std::error::Error>> {
     // Send handshake response (retry on would-block).
     #[allow(clippy::cast_possible_truncation)]
     let response_mtu = DEVICE_MTU as u16;
@@ -2013,6 +2155,7 @@ mod tests {
         atomic::{AtomicBool, AtomicUsize, Ordering},
     };
     use std::time::Duration;
+    use std::io::{Read as _, Write as _};
 
     #[test]
     fn test_build_udp_packet_valid() {
@@ -2267,5 +2410,62 @@ mod tests {
         release_bad_tx.send(()).expect("release truncated client");
         bad_client.join().expect("join truncated client");
         good_client.join().expect("join valid client");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_accepts_additional_lbnp_client() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("litebox-netproxy-{unique}.sock"));
+        let listener = IpcListener::bind_unix(&path).expect("bind unix listener");
+
+        let mut client1 = std::os::unix::net::UnixStream::connect(&path).expect("connect client1");
+        client1
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("set client1 timeout");
+        client1
+            .write_all(&build_lbnp_handshake())
+            .expect("write client1 handshake");
+        let server_ipc =
+            accept_ipc_client(&listener, None, Some(Duration::from_secs(2))).expect("accept client1");
+        let mut resp = [0u8; 8];
+        client1
+            .read_exact(&mut resp)
+            .expect("read client1 handshake response");
+        assert_eq!(&resp[0..4], HANDSHAKE_MAGIC);
+
+        let run_thread = std::thread::spawn(move || {
+            run(server_ipc, true, None, Some(&listener)).expect("proxy thread should run")
+        });
+
+        let mut client2 = std::os::unix::net::UnixStream::connect(&path).expect("connect client2");
+        client2
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("set client2 timeout");
+        client2
+            .write_all(&build_lbnp_handshake())
+            .expect("write client2 handshake");
+        client2
+            .read_exact(&mut resp)
+            .expect("read client2 handshake response");
+        assert_eq!(&resp[0..4], HANDSHAKE_MAGIC);
+
+        drop(client2);
+        drop(client1);
+        run_thread.join().expect("join proxy thread");
+        let _ = std::fs::remove_file(path);
+    }
+
+    fn build_lbnp_handshake() -> [u8; 8] {
+        #[allow(clippy::cast_possible_truncation)]
+        let mtu = DEVICE_MTU as u16;
+        let mut msg = [0u8; 8];
+        msg[0..4].copy_from_slice(HANDSHAKE_MAGIC);
+        msg[4..6].copy_from_slice(&HANDSHAKE_VERSION.to_le_bytes());
+        msg[6..8].copy_from_slice(&mtu.to_le_bytes());
+        msg
     }
 }

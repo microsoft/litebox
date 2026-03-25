@@ -187,6 +187,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Shared ELF patch cache — persists across connections so that
         // expensive ELF patching is amortized over the broker's lifetime.
         let elf_cache = litebox_broker::nine_p::server::Server::new_elf_cache();
+        let extra_session_slots = Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
         // Accept connections, validating the LBNP handshake before entering the
         // proxy event loop.  Stray/slow clients are rejected quickly so they
@@ -206,7 +207,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             };
             info!("network proxy client connected");
-            if let Err(e) = litebox_broker::net_proxy::run(ipc, true, registry, Some(&listener)) {
+            if let Err(e) = litebox_broker::net_proxy::run_with_session_slots(
+                ipc,
+                true,
+                registry,
+                Some(&listener),
+                Arc::clone(&extra_session_slots),
+            ) {
                 tracing::error!("network proxy error: {e}");
             }
             info!("network proxy client disconnected");
