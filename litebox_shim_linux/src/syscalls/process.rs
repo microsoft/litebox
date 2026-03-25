@@ -286,7 +286,8 @@ impl Process {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum InboundControlPlaneMessageError {
+pub(crate) enum InboundControlPlaneMessageError {
+    EnvelopeWire(crate::multihost::OutboundControlPlaneEnvelopeWireError),
     Wire(crate::multihost::OutboundControlPlaneMessageWireError),
     ControlPlane(crate::multihost::ControlPlaneError),
     RetryEnvelope(crate::multihost::OutboundControlPlaneEnvelope),
@@ -1180,6 +1181,16 @@ impl<FS: ShimFS> Task<FS> {
         }
     }
 
+    pub(crate) fn deliver_inbound_control_plane_envelope_wire(
+        &self,
+        envelope_wire: crate::multihost::OutboundControlPlaneEnvelopeWire,
+    ) -> Result<(), InboundControlPlaneMessageError> {
+        let envelope = crate::multihost::OutboundControlPlaneEnvelope::try_from(envelope_wire)
+            .map_err(InboundControlPlaneMessageError::EnvelopeWire)?;
+        self.consume_inbound_control_plane_envelope(envelope, false)
+            .map(|_| ())
+    }
+
     fn notify_parent_of_child_exit(&self, notif: litebox::process::ExitNotification) {
         let Some(source_host) = self
             .global
@@ -1206,16 +1217,17 @@ impl<FS: ShimFS> Task<FS> {
             );
             return;
         };
-        let delivery = self.consume_inbound_control_plane_envelope(
-            crate::multihost::OutboundControlPlaneEnvelope {
-                source_host,
-                message,
-                local_delivery_completed: false,
-            },
-            false,
+        let delivery = self.deliver_inbound_control_plane_envelope_wire(
+            crate::multihost::OutboundControlPlaneEnvelopeWire::from(
+                crate::multihost::OutboundControlPlaneEnvelope {
+                    source_host,
+                    message,
+                    local_delivery_completed: false,
+                },
+            ),
         );
         match delivery {
-            Ok(_) => {}
+            Ok(()) => {}
             Err(InboundControlPlaneMessageError::ControlPlane(
                 crate::multihost::ControlPlaneError::OutboundMessageQueueFull { .. },
             )) => {
@@ -4363,6 +4375,38 @@ mod tests {
             false,
         )
         .expect("deliver inbound message");
+
+        let queue = task.global.cross_process_signals.lock();
+        assert_eq!(queue.len(), 1);
+        assert_eq!(queue[0].target_process_id, task.process_id.0);
+        assert_eq!(queue[0].signal, Signal::SIGCHLD);
+    }
+
+    #[test]
+    fn test_deliver_inbound_child_exit_envelope_wire_queues_local_signal() {
+        use litebox_common_linux::signal::Signal;
+
+        let task = crate::syscalls::tests::init_platform(None);
+        let child = register_exited_child(
+            &task,
+            litebox_common_linux::signal::Signal::SIGCHLD.as_i32(),
+            23,
+        );
+        let envelope_wire = crate::multihost::OutboundControlPlaneEnvelopeWire::from(
+            crate::multihost::OutboundControlPlaneEnvelope {
+                source_host: task.global.control_plane.local_host(),
+                message: crate::multihost::OutboundControlPlaneMessageWire::try_from(
+                    crate::multihost::OutboundControlPlaneMessage::ChildExit(
+                        child_exit_notification(task.process_id, child),
+                    ),
+                )
+                .expect("encode child-exit message"),
+                local_delivery_completed: false,
+            },
+        );
+
+        task.deliver_inbound_control_plane_envelope_wire(envelope_wire)
+            .expect("valid envelope wire should deliver");
 
         let queue = task.global.cross_process_signals.lock();
         assert_eq!(queue.len(), 1);

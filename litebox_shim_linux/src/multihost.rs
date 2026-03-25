@@ -12,7 +12,7 @@ use litebox::{
     process::{ExitNotification, ExitNotificationWire, ExitNotificationWireError, ProcessId},
     sync::{Mutex, RawSyncPrimitivesProvider},
 };
-use zerocopy::byteorder::{LE, U16};
+use zerocopy::byteorder::{LE, U16, U32};
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 /// Stable identifier for a host process participating in one sandbox.
@@ -24,6 +24,10 @@ impl HostId {
 
     pub(crate) fn as_u32(self) -> u32 {
         self.0
+    }
+
+    fn from_raw(raw: u32) -> Option<Self> {
+        if raw == 0 { None } else { Some(Self(raw)) }
     }
 }
 
@@ -101,7 +105,9 @@ impl TryFrom<u16> for OutboundControlPlaneMessageKind {
     }
 }
 
-const OUTBOUND_CONTROL_PLANE_WIRE_VERSION: u16 = 1;
+const OUTBOUND_CONTROL_PLANE_MESSAGE_WIRE_VERSION: u16 = 1;
+const OUTBOUND_CONTROL_PLANE_ENVELOPE_WIRE_VERSION: u16 = 1;
+const OUTBOUND_CONTROL_PLANE_ENVELOPE_FLAG_LOCAL_DELIVERY_COMPLETED: u16 = 1;
 
 /// Versioned wire record for one outbound control-plane message.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, FromBytes, Immutable, IntoBytes, KnownLayout)]
@@ -119,6 +125,23 @@ pub(crate) enum OutboundControlPlaneMessageWireError {
     InvalidChildExit(ExitNotificationWireError),
 }
 
+/// Versioned wire record for one outbound control-plane envelope.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, FromBytes, Immutable, IntoBytes, KnownLayout)]
+#[repr(C)]
+pub(crate) struct OutboundControlPlaneEnvelopeWire {
+    version: U16<LE>,
+    flags: U16<LE>,
+    source_host: U32<LE>,
+    message: OutboundControlPlaneMessageWire,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OutboundControlPlaneEnvelopeWireError {
+    UnsupportedVersion(u16),
+    InvalidFlags(u16),
+    InvalidSourceHost(u32),
+}
+
 /// Envelope queued for transport, including the authenticated sender metadata.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct OutboundControlPlaneEnvelope {
@@ -133,7 +156,7 @@ impl TryFrom<OutboundControlPlaneMessage> for OutboundControlPlaneMessageWire {
     fn try_from(message: OutboundControlPlaneMessage) -> Result<Self, Self::Error> {
         match message {
             OutboundControlPlaneMessage::ChildExit(notification) => Ok(Self {
-                version: U16::new(OUTBOUND_CONTROL_PLANE_WIRE_VERSION),
+                version: U16::new(OUTBOUND_CONTROL_PLANE_MESSAGE_WIRE_VERSION),
                 kind: U16::new(OutboundControlPlaneMessageKind::ChildExit as u16),
                 child_exit: ExitNotificationWire::try_from(notification)
                     .map_err(OutboundControlPlaneMessageWireError::InvalidChildExit)?,
@@ -147,7 +170,7 @@ impl TryFrom<OutboundControlPlaneMessageWire> for OutboundControlPlaneMessage {
 
     fn try_from(message: OutboundControlPlaneMessageWire) -> Result<Self, Self::Error> {
         let version = message.version.get();
-        if version != OUTBOUND_CONTROL_PLANE_WIRE_VERSION {
+        if version != OUTBOUND_CONTROL_PLANE_MESSAGE_WIRE_VERSION {
             return Err(OutboundControlPlaneMessageWireError::UnsupportedVersion(
                 version,
             ));
@@ -160,6 +183,48 @@ impl TryFrom<OutboundControlPlaneMessageWire> for OutboundControlPlaneMessage {
                     .map_err(OutboundControlPlaneMessageWireError::InvalidChildExit)?,
             )),
         }
+    }
+}
+
+impl From<OutboundControlPlaneEnvelope> for OutboundControlPlaneEnvelopeWire {
+    fn from(envelope: OutboundControlPlaneEnvelope) -> Self {
+        Self {
+            version: U16::new(OUTBOUND_CONTROL_PLANE_ENVELOPE_WIRE_VERSION),
+            flags: U16::new(if envelope.local_delivery_completed {
+                OUTBOUND_CONTROL_PLANE_ENVELOPE_FLAG_LOCAL_DELIVERY_COMPLETED
+            } else {
+                0
+            }),
+            source_host: U32::new(envelope.source_host.as_u32()),
+            message: envelope.message,
+        }
+    }
+}
+
+impl TryFrom<OutboundControlPlaneEnvelopeWire> for OutboundControlPlaneEnvelope {
+    type Error = OutboundControlPlaneEnvelopeWireError;
+
+    fn try_from(envelope: OutboundControlPlaneEnvelopeWire) -> Result<Self, Self::Error> {
+        let version = envelope.version.get();
+        if version != OUTBOUND_CONTROL_PLANE_ENVELOPE_WIRE_VERSION {
+            return Err(OutboundControlPlaneEnvelopeWireError::UnsupportedVersion(
+                version,
+            ));
+        }
+        let flags = envelope.flags.get();
+        if flags & !OUTBOUND_CONTROL_PLANE_ENVELOPE_FLAG_LOCAL_DELIVERY_COMPLETED != 0 {
+            return Err(OutboundControlPlaneEnvelopeWireError::InvalidFlags(flags));
+        }
+        let source_host = HostId::from_raw(envelope.source_host.get()).ok_or(
+            OutboundControlPlaneEnvelopeWireError::InvalidSourceHost(envelope.source_host.get()),
+        )?;
+        Ok(Self {
+            source_host,
+            message: envelope.message,
+            local_delivery_completed: (flags
+                & OUTBOUND_CONTROL_PLANE_ENVELOPE_FLAG_LOCAL_DELIVERY_COMPLETED)
+                != 0,
+        })
     }
 }
 
@@ -595,6 +660,16 @@ impl<Platform: RawSyncPrimitivesProvider> ControlPlane<Platform> {
             .unwrap_or_default())
     }
 
+    /// Drain any queued outbound control-plane envelopes as transport-ready wire
+    /// records for a specific host.
+    pub(crate) fn poll_outbound_message_wires_for_host(
+        &self,
+        target_host: HostId,
+    ) -> Result<Vec<OutboundControlPlaneEnvelopeWire>, ControlPlaneError> {
+        self.poll_outbound_messages_for_host(target_host)
+            .map(|messages| messages.into_iter().map(Into::into).collect())
+    }
+
     /// Pop one queued outbound control-plane envelope for a specific host.
     pub(crate) fn take_next_outbound_message_for_host(
         &self,
@@ -800,6 +875,13 @@ mod tests {
     ) -> OutboundControlPlaneMessage {
         OutboundControlPlaneMessage::try_from(envelope.message)
             .expect("decode outbound wire message")
+    }
+
+    fn decode_outbound_envelope_wire(
+        envelope_wire: OutboundControlPlaneEnvelopeWire,
+    ) -> OutboundControlPlaneEnvelope {
+        OutboundControlPlaneEnvelope::try_from(envelope_wire)
+            .expect("decode outbound envelope wire")
     }
 
     #[test]
@@ -1056,7 +1138,7 @@ mod tests {
         })
         .expect("encode child exit");
         let wire = OutboundControlPlaneMessageWire {
-            version: U16::new(OUTBOUND_CONTROL_PLANE_WIRE_VERSION + 1),
+            version: U16::new(OUTBOUND_CONTROL_PLANE_MESSAGE_WIRE_VERSION + 1),
             kind: U16::new(OutboundControlPlaneMessageKind::ChildExit as u16),
             child_exit,
         };
@@ -1064,7 +1146,7 @@ mod tests {
         assert_eq!(
             OutboundControlPlaneMessage::try_from(wire),
             Err(OutboundControlPlaneMessageWireError::UnsupportedVersion(
-                OUTBOUND_CONTROL_PLANE_WIRE_VERSION + 1
+                OUTBOUND_CONTROL_PLANE_MESSAGE_WIRE_VERSION + 1
             ))
         );
     }
@@ -1079,7 +1161,7 @@ mod tests {
         })
         .expect("encode child exit");
         let wire = OutboundControlPlaneMessageWire {
-            version: U16::new(OUTBOUND_CONTROL_PLANE_WIRE_VERSION),
+            version: U16::new(OUTBOUND_CONTROL_PLANE_MESSAGE_WIRE_VERSION),
             kind: U16::new(999),
             child_exit,
         };
@@ -1087,6 +1169,97 @@ mod tests {
         assert_eq!(
             OutboundControlPlaneMessage::try_from(wire),
             Err(OutboundControlPlaneMessageWireError::UnknownKind(999))
+        );
+    }
+
+    #[test]
+    fn outbound_envelope_wire_round_trips_source_host_and_flags() {
+        let envelope = OutboundControlPlaneEnvelope {
+            source_host: HostId::ROOT,
+            message: OutboundControlPlaneMessageWire::try_from(
+                OutboundControlPlaneMessage::ChildExit(ExitNotification {
+                    parent_pid: ProcessId(21),
+                    exit_signal: 17,
+                    child_pid: ProcessId(22),
+                    exit_status: 23,
+                }),
+            )
+            .expect("encode child-exit message"),
+            local_delivery_completed: true,
+        };
+
+        let wire = OutboundControlPlaneEnvelopeWire::from(envelope);
+        assert_eq!(OutboundControlPlaneEnvelope::try_from(wire), Ok(envelope));
+    }
+
+    #[test]
+    fn outbound_envelope_wire_rejects_unknown_version() {
+        let wire = OutboundControlPlaneEnvelopeWire {
+            version: U16::new(OUTBOUND_CONTROL_PLANE_ENVELOPE_WIRE_VERSION + 1),
+            flags: U16::new(0),
+            source_host: U32::new(HostId::ROOT.as_u32()),
+            message: OutboundControlPlaneMessageWire::try_from(
+                OutboundControlPlaneMessage::ChildExit(ExitNotification {
+                    parent_pid: ProcessId(21),
+                    exit_signal: 17,
+                    child_pid: ProcessId(22),
+                    exit_status: 23,
+                }),
+            )
+            .expect("encode child-exit message"),
+        };
+
+        assert_eq!(
+            OutboundControlPlaneEnvelope::try_from(wire),
+            Err(OutboundControlPlaneEnvelopeWireError::UnsupportedVersion(
+                OUTBOUND_CONTROL_PLANE_ENVELOPE_WIRE_VERSION + 1
+            ))
+        );
+    }
+
+    #[test]
+    fn outbound_envelope_wire_rejects_zero_source_host() {
+        let wire = OutboundControlPlaneEnvelopeWire {
+            version: U16::new(OUTBOUND_CONTROL_PLANE_ENVELOPE_WIRE_VERSION),
+            flags: U16::new(0),
+            source_host: U32::new(0),
+            message: OutboundControlPlaneMessageWire::try_from(
+                OutboundControlPlaneMessage::ChildExit(ExitNotification {
+                    parent_pid: ProcessId(21),
+                    exit_signal: 17,
+                    child_pid: ProcessId(22),
+                    exit_status: 23,
+                }),
+            )
+            .expect("encode child-exit message"),
+        };
+
+        assert_eq!(
+            OutboundControlPlaneEnvelope::try_from(wire),
+            Err(OutboundControlPlaneEnvelopeWireError::InvalidSourceHost(0))
+        );
+    }
+
+    #[test]
+    fn outbound_envelope_wire_rejects_unknown_flags() {
+        let wire = OutboundControlPlaneEnvelopeWire {
+            version: U16::new(OUTBOUND_CONTROL_PLANE_ENVELOPE_WIRE_VERSION),
+            flags: U16::new(2),
+            source_host: U32::new(HostId::ROOT.as_u32()),
+            message: OutboundControlPlaneMessageWire::try_from(
+                OutboundControlPlaneMessage::ChildExit(ExitNotification {
+                    parent_pid: ProcessId(21),
+                    exit_signal: 17,
+                    child_pid: ProcessId(22),
+                    exit_status: 23,
+                }),
+            )
+            .expect("encode child-exit message"),
+        };
+
+        assert_eq!(
+            OutboundControlPlaneEnvelope::try_from(wire),
+            Err(OutboundControlPlaneEnvelopeWireError::InvalidFlags(2))
         );
     }
 
@@ -1143,6 +1316,61 @@ mod tests {
                 assert_eq!(notification.exit_status, second.exit_status);
             }
         }
+        assert!(plane.pending_outbound_messages_for_host(worker).is_empty());
+    }
+
+    #[test]
+    fn outbound_message_wires_drain_in_fifo_order_per_host() {
+        let plane = ControlPlane::<crate::Platform>::new_root_local();
+        let worker = plane
+            .register_worker_host(HostId::ROOT)
+            .expect("register worker host");
+        let first = ExitNotification {
+            parent_pid: ProcessId(31),
+            exit_signal: 17,
+            child_pid: ProcessId(32),
+            exit_status: 23,
+        };
+        let second = ExitNotification {
+            parent_pid: ProcessId(31),
+            exit_signal: 17,
+            child_pid: ProcessId(33),
+            exit_status: 24,
+        };
+
+        plane
+            .queue_remote_child_exit_notification(HostId::ROOT, worker, first)
+            .expect("queue first notification");
+        plane
+            .queue_remote_child_exit_notification(HostId::ROOT, worker, second)
+            .expect("queue second notification");
+
+        let drained = plane
+            .poll_outbound_message_wires_for_host(worker)
+            .expect("drain notifications as wires");
+        assert_eq!(drained.len(), 2);
+        assert_eq!(
+            decode_outbound_envelope_wire(drained[0]),
+            OutboundControlPlaneEnvelope {
+                source_host: HostId::ROOT,
+                message: OutboundControlPlaneMessageWire::try_from(
+                    OutboundControlPlaneMessage::ChildExit(first),
+                )
+                .expect("encode first child-exit message"),
+                local_delivery_completed: false,
+            }
+        );
+        assert_eq!(
+            decode_outbound_envelope_wire(drained[1]),
+            OutboundControlPlaneEnvelope {
+                source_host: HostId::ROOT,
+                message: OutboundControlPlaneMessageWire::try_from(
+                    OutboundControlPlaneMessage::ChildExit(second),
+                )
+                .expect("encode second child-exit message"),
+                local_delivery_completed: false,
+            }
+        );
         assert!(plane.pending_outbound_messages_for_host(worker).is_empty());
     }
 
