@@ -693,9 +693,11 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
             FixedAddressBehavior::Hint
         };
         let mut next_top_down_max_start = None;
-        let mut pending_hint = suggested_address.filter(|_| require_low_2g);
+        let mut pending_hint = if fixed_addr { None } else { suggested_address };
         loop {
-            let candidate_hint = if next_top_down_max_start.is_none() {
+            let candidate_hint = if fixed_addr {
+                suggested_address
+            } else if next_top_down_max_start.is_none() {
                 pending_hint.take()
             } else {
                 None
@@ -703,11 +705,7 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
             let used_hint = candidate_hint.is_some();
             let new_addr = self
                 .get_unmmaped_area(
-                    if require_low_2g {
-                        candidate_hint
-                    } else {
-                        suggested_address
-                    },
+                    candidate_hint,
                     total_length,
                     fixed_addr,
                     require_low_2g,
@@ -727,8 +725,12 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
                 )
             } {
                 Ok(ret) => return Ok(ret),
+                // Non-fixed mappings treat the requested address as a hint.
+                // If the host allocator can't realize that hint inside the
+                // guest partition, fall back to another guest VA instead of
+                // surfacing ENOMEM immediately.
                 Err(AllocationError::AddressInUseByPlatform | AllocationError::OutOfMemory)
-                    if require_low_2g && !fixed_addr =>
+                    if !fixed_addr =>
                 {
                     if used_hint {
                         continue;
