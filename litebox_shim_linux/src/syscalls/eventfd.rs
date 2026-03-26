@@ -118,6 +118,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> EventFile<Platform> {
         matches!(*self.inner.lock(), EventFileInner::Timerfd(_))
     }
 
+    #[cfg(feature = "trace_syscalls")]
     pub(crate) fn kind_name(&self) -> &'static str {
         match &*self.inner.lock() {
             EventFileInner::Eventfd { .. } => "eventfd",
