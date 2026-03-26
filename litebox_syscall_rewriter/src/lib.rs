@@ -301,7 +301,7 @@ fn has_bun_footer_marker(input_binary: &[u8]) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{BUN_FOOTER_MARKER, has_bun_footer_marker};
+    use super::{BUN_FOOTER_MARKER, Error, has_bun_footer_marker, patch_code_segment};
 
     #[test]
     fn detects_bun_footer_marker_near_end() {
@@ -315,6 +315,45 @@ mod tests {
     fn ignores_missing_bun_footer_marker() {
         let bytes = vec![0u8; 512];
         assert!(!has_bun_footer_marker(&bytes));
+    }
+
+    #[test]
+    fn patch_code_segment_leaves_rip_relative_presyscall_setup_in_place() {
+        let mut code = vec![
+            0x48, 0x8D, 0x35, 0x10, 0x00, 0x00, 0x00, // lea rsi, [rip + 0x10]
+            0x0F, 0x05, // syscall
+            0x31, 0xC0, // xor eax, eax
+            0xBA, 0x01, 0x00, 0x00, 0x00, // mov edx, 1
+        ];
+        let original_prefix = code[..7].to_vec();
+        let syscall_offset = 7usize;
+
+        let trampoline = patch_code_segment(&mut code, 0x1000, 0x8000, 0x9000)
+            .expect("patch_code_segment should succeed");
+
+        assert!(!trampoline.is_empty());
+        assert_eq!(
+            &code[..syscall_offset],
+            original_prefix.as_slice(),
+            "RIP-relative setup before syscall must stay in place"
+        );
+        assert_eq!(
+            code[syscall_offset], 0xE9,
+            "syscall site should jump to trampoline"
+        );
+    }
+
+    #[test]
+    fn patch_code_segment_rejects_rip_relative_setup_on_both_sides_of_syscall() {
+        let mut code = vec![
+            0x48, 0x8D, 0x35, 0x10, 0x00, 0x00, 0x00, // lea rsi, [rip + 0x10]
+            0x0F, 0x05, // syscall
+            0x48, 0x8D, 0x3D, 0x10, 0x00, 0x00, 0x00, // lea rdi, [rip + 0x10]
+        ];
+
+        let err = patch_code_segment(&mut code, 0x1000, 0x8000, 0x9000)
+            .expect_err("patch_code_segment should reject RIP-relative copies on both sides");
+        assert!(matches!(err, Error::InsufficientBytesBeforeOrAfter(0x1007)));
     }
 }
 
@@ -541,6 +580,28 @@ fn hook_syscalls_in_section(
 
         let replace_start = replace_start.unwrap();
         let replace_len = usize::try_from(replace_end - replace_start).unwrap();
+
+        let copied_presyscall_insts_have_ip_rel_mem = arch == Arch::X86_64
+            && instruction_slice_has_ip_rel_memory_operand(
+                instructions
+                    .iter()
+                    .take(i)
+                    .skip_while(|prev_inst| prev_inst.ip() < replace_start),
+            );
+        if copied_presyscall_insts_have_ip_rel_mem {
+            hook_syscall_and_after(
+                arch,
+                control_transfer_targets,
+                section_base_addr,
+                section_data,
+                trampoline_base_addr,
+                syscall_entry_addr,
+                trampoline_data,
+                &instructions,
+                i,
+            )?;
+            continue;
+        }
 
         let target_addr = trampoline_base_addr + trampoline_data.len() as u64;
 
@@ -973,6 +1034,26 @@ fn hook_syscall_and_after(
     }
 
     let replace_end = replace_end.unwrap();
+    let copied_postsyscall_insts_have_ip_rel_mem = arch == Arch::X86_64
+        && instruction_slice_has_ip_rel_memory_operand(
+            instructions
+                .iter()
+                .skip(inst_index + 1)
+                .take_while(|next_inst| next_inst.ip() < replace_end),
+        );
+    if copied_postsyscall_insts_have_ip_rel_mem {
+        return hook_syscall_before_and_after(
+            arch,
+            control_transfer_targets,
+            section_base_addr,
+            section_data,
+            trampoline_base_addr,
+            syscall_entry_addr,
+            trampoline_data,
+            instructions,
+            inst_index,
+        );
+    }
 
     let target_addr = trampoline_base_addr + trampoline_data.len() as u64;
 
@@ -1052,6 +1133,14 @@ fn hook_syscall_and_after(
     }
 
     Ok(())
+}
+
+fn instruction_slice_has_ip_rel_memory_operand<'a>(
+    instructions: impl IntoIterator<Item = &'a iced_x86::Instruction>,
+) -> bool {
+    instructions
+        .into_iter()
+        .any(iced_x86::Instruction::is_ip_rel_memory_operand)
 }
 
 #[allow(clippy::too_many_arguments)]

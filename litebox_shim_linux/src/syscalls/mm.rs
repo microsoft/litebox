@@ -40,6 +40,9 @@ pub(crate) struct ElfPatchState {
     pub trampoline_mapped: bool,
     /// Total number of trampoline bytes currently mapped.
     pub trampoline_mapped_len: usize,
+    /// Whether any runtime-generated stubs were successfully linked from code
+    /// in this fd to the trampoline.
+    pub runtime_patches_committed: bool,
     /// File path of the ELF (from the fd→path table, if available).
     #[allow(dead_code)]
     pub file_path: Option<alloc::string::String>,
@@ -442,6 +445,7 @@ impl<FS: ShimFS> Task<FS> {
             trampoline_cursor: 0,
             trampoline_mapped: false,
             trampoline_mapped_len: 0,
+            runtime_patches_committed: false,
             file_path,
         });
         #[cfg(not(feature = "trace_syscalls"))]
@@ -772,6 +776,7 @@ impl<FS: ShimFS> Task<FS> {
                     return;
                 }
                 state.trampoline_cursor = new_cursor;
+                state.runtime_patches_committed = true;
                 #[cfg(feature = "trace_syscalls")]
                 litebox::log_println!(
                     self.global.platform,
@@ -783,8 +788,27 @@ impl<FS: ShimFS> Task<FS> {
                     state.trampoline_cursor,
                 );
             }
-            _ => {
-                // No syscalls found or error — no patching needed.
+            Ok(_) => {
+                // No syscalls found — no patching needed.
+            }
+            Err(_e) => {
+                #[cfg(feature = "trace_syscalls")]
+                litebox::log_println!(
+                    self.global.platform,
+                    "[TRACE-ELF-PATCH] failed fd={} path={:?} map={:#x}-{:#x} error={}",
+                    fd,
+                    state.file_path,
+                    mapped_addr.as_usize(),
+                    mapped_addr.as_usize() + len,
+                    _e,
+                );
+                let _ = self.sys_mprotect(
+                    mapped_addr,
+                    len,
+                    ProtFlags::PROT_READ | ProtFlags::PROT_EXEC,
+                );
+                restore_trampoline_rx(self, state);
+                return;
             }
         }
 
@@ -812,6 +836,11 @@ impl<FS: ShimFS> Task<FS> {
         {
             let tramp_len = state.trampoline_mapped_len;
             if tramp_len > 0 {
+                if !state.runtime_patches_committed {
+                    let _ =
+                        self.sys_munmap(MutPtr::<u8>::from_usize(state.trampoline_addr), tramp_len);
+                    return;
+                }
                 let _ = self.sys_mprotect(
                     MutPtr::<u8>::from_usize(state.trampoline_addr),
                     tramp_len,

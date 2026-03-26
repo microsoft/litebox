@@ -1473,7 +1473,11 @@ impl<FS: ShimFS> Task<FS> {
             #[cfg(target_arch = "x86")]
             return self.sys_close_range(ctx.ebx as u32, ctx.ecx as u32, ctx.edx as u32);
             #[cfg(target_arch = "x86_64")]
-            return self.sys_close_range(ctx.rdi.truncate(), ctx.rsi.truncate(), ctx.rdx.truncate());
+            return self.sys_close_range(
+                ctx.rdi.truncate(),
+                ctx.rsi.truncate(),
+                ctx.rdx.truncate(),
+            );
         }
 
         let request = match SyscallRequest::<Platform>::try_from_raw(
