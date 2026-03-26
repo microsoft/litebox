@@ -170,8 +170,9 @@ enum WorkerExecOutputSink<FS: litebox::fs::FileSystem + Send + Sync + 'static> {
 enum WorkerExecOutputGroupKey {
     Fs(litebox::fd::DescriptorObjectId),
     Pipe(litebox::fd::DescriptorObjectId),
-    /// Streams are never grouped — each gets its own bridge.
-    Stream(usize),
+    /// Streams are grouped by underlying object identity so aliased
+    /// stdout/stderr (e.g. same socket via `dup2`) share one bridge thread.
+    Stream(u64),
 }
 
 struct WorkerExecOutputGroup<FS: litebox::fs::FileSystem + Send + Sync + 'static> {
@@ -1733,7 +1734,7 @@ where
                 },
             ),
             WorkerExecOutputBinding::Stream(writer) => (
-                WorkerExecOutputGroupKey::Stream(target_fd as usize),
+                WorkerExecOutputGroupKey::Stream(writer.object_id()),
                 WorkerExecOutputSink::Stream(writer.clone()),
             ),
             WorkerExecOutputBinding::Inherit
@@ -1767,6 +1768,7 @@ where
             let thread_cancel = cancel.clone();
             Ok(DetachedWorkerBridge {
                 handle: std::thread::Builder::new().spawn(move || {
+                    block_guest_signals();
                     bridge_worker_input_from_fs(fs, fd, host_write_fd, thread_cancel)
                 })?,
                 input_control: Some(WorkerInputBridgeControl {
@@ -1779,6 +1781,7 @@ where
             let thread_cancel = cancel.clone();
             let (sender, receiver) = std::sync::mpsc::sync_channel(1);
             let handle = std::thread::Builder::new().spawn(move || {
+                block_guest_signals();
                 bridge_worker_input_from_pipe(
                     platform,
                     pipes,
@@ -1799,13 +1802,23 @@ where
         }
         WorkerExecInputSource::Stream(reader) => {
             let thread_cancel = cancel.clone();
+            let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+            let handle = std::thread::Builder::new().spawn(move || {
+                block_guest_signals();
+                bridge_worker_input_from_stream(
+                    platform,
+                    reader,
+                    host_write_fd,
+                    thread_cancel,
+                    sender,
+                )
+            })?;
+            let thread_handle = receiver.recv().ok();
             Ok(DetachedWorkerBridge {
-                handle: std::thread::Builder::new().spawn(move || {
-                    bridge_worker_input_from_stream(reader, host_write_fd, thread_cancel)
-                })?,
+                handle,
                 input_control: Some(WorkerInputBridgeControl {
                     cancel,
-                    thread_handle: None,
+                    thread_handle,
                 }),
             })
         }
@@ -1820,13 +1833,16 @@ fn spawn_worker_output_bridge<FS>(
 where
     FS: litebox::fs::FileSystem + Send + Sync + 'static,
 {
-    std::thread::Builder::new().spawn(move || match sink {
-        WorkerExecOutputSink::Fs { fs, fd } => bridge_worker_output_to_fs(fs, fd, host_read_fd),
-        WorkerExecOutputSink::Pipe { pipes, fd } => {
-            bridge_worker_output_to_pipe(platform, pipes, fd, host_read_fd)
-        }
-        WorkerExecOutputSink::Stream(writer) => {
-            bridge_worker_output_to_stream(writer, host_read_fd)
+    std::thread::Builder::new().spawn(move || {
+        block_guest_signals();
+        match sink {
+            WorkerExecOutputSink::Fs { fs, fd } => bridge_worker_output_to_fs(fs, fd, host_read_fd),
+            WorkerExecOutputSink::Pipe { pipes, fd } => {
+                bridge_worker_output_to_pipe(platform, pipes, fd, host_read_fd)
+            }
+            WorkerExecOutputSink::Stream(writer) => {
+                bridge_worker_output_to_stream(writer, host_read_fd)
+            }
         }
     })
 }
@@ -2042,29 +2058,37 @@ fn bridge_worker_output_to_pipe(
 }
 
 fn bridge_worker_input_from_stream(
+    platform: &'static LinuxUserland,
     reader: std::sync::Arc<dyn litebox::process::WorkerExecStreamReader>,
     host_write_fd: std::os::fd::OwnedFd,
     cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    thread_handle_sender: std::sync::mpsc::SyncSender<
+        litebox::event::wait::ThreadHandle<LinuxUserland>,
+    >,
 ) {
-    let mut host_write = std::fs::File::from(host_write_fd);
-    let mut buf = [0_u8; 8192];
-    loop {
-        if cancel.load(std::sync::atomic::Ordering::Acquire) {
-            break;
-        }
-        if !worker_stdio_pipe_has_readers(&host_write) {
-            break;
-        }
-        match reader.read_blocking(&mut buf) {
-            Ok(0) => break,
-            Ok(read) => {
-                if !write_worker_stdio_all(&mut host_write, &buf[..read]) {
-                    break;
-                }
+    ThreadHandle::run_with_handle(|| {
+        let mut host_write = std::fs::File::from(host_write_fd);
+        let wait_state = litebox::event::wait::WaitState::new(platform);
+        let _ = thread_handle_sender.send(wait_state.thread_handle());
+        let mut buf = [0_u8; 8192];
+        loop {
+            if cancel.load(std::sync::atomic::Ordering::Acquire) {
+                break;
             }
-            Err(()) => break,
+            if !worker_stdio_pipe_has_readers(&host_write) {
+                break;
+            }
+            match reader.read_blocking(&mut buf) {
+                Ok(0) => break,
+                Ok(read) => {
+                    if !write_worker_stdio_all(&mut host_write, &buf[..read]) {
+                        break;
+                    }
+                }
+                Err(()) => break,
+            }
         }
-    }
+    });
 }
 
 fn bridge_worker_output_to_stream(

@@ -347,6 +347,33 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
         Ok(fd)
     }
 
+    fn create_anonymous_file(
+        &self,
+        name: &str,
+        mode: super::Mode,
+    ) -> Result<FileFd<Platform>, super::errors::CreateAnonymousFileError> {
+        let path = super::memfd_display_path(name);
+        let file = Arc::new(sync::RwLock::new(FileX {
+            perms: Permissions {
+                mode,
+                userinfo: self.current_user,
+            },
+            data: Vec::new().into(),
+            unique_id: self.fresh_id(),
+        }));
+        Ok(self
+            .litebox
+            .descriptor_table_mut()
+            .insert(Descriptor::File {
+                file,
+                read_allowed: true,
+                write_allowed: true,
+                position: 0,
+                append_mode: false,
+                path,
+            }))
+    }
+
     fn close(&self, fd: &FileFd<Platform>) -> Result<(), CloseError> {
         self.litebox.descriptor_table_mut().remove(fd);
         Ok(())

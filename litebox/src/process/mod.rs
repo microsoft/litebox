@@ -130,6 +130,12 @@ pub trait WorkerExecStreamWriter: Send + Sync + 'static {
     /// Write `buf`, blocking until space is available.
     /// Returns the number of bytes written, or `Err(())` on error.
     fn write_blocking(&self, buf: &[u8]) -> Result<usize, ()>;
+
+    /// Return an identifier for the underlying descriptor object.
+    ///
+    /// Used to group aliased stdout/stderr writers that refer to the same
+    /// socket so they share a single bridge thread and preserve ordering.
+    fn object_id(&self) -> u64;
 }
 
 /// Worker-exec stdin binding for a host-process handoff.

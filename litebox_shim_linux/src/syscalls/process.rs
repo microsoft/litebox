@@ -1690,7 +1690,8 @@ impl<FS: ShimFS> Task<FS> {
             clone3,
         );
 
-        // Temporary unconditional clone/fork tracing for debugging Claude helper spawn.
+        // Clone/fork tracing for debugging child spawn issues.
+        #[cfg(feature = "trace_syscalls")]
         litebox::log_println!(
             self.global.platform,
             "[CLONE-DBG] pid={} tid={} flags={:?} exit_signal={} clone3={} stack={:#x}",
@@ -1931,7 +1932,8 @@ impl<FS: ShimFS> Task<FS> {
     ) -> Result<usize, Errno> {
         use litebox::platform::AddressSpaceProvider;
 
-        // Temporary: log fork entry for debugging child stdio issues.
+        // Log fork entry for debugging child stdio issues.
+        #[cfg(feature = "trace_syscalls")]
         litebox::log_println!(
             self.global.platform,
             "[FORK-DBG] pid={} tid={} flags={:?} clone3={} is_vfork={}",
@@ -2997,7 +2999,8 @@ impl<FS: ShimFS> Task<FS> {
                 // return the current time.
                 let current_time = self.gettime_as_duration(clock_id)?;
                 let remaining = duration.checked_sub(current_time).unwrap_or(Duration::ZERO);
-                // Temporary: log deadline computation for debugging Bun futex timeouts.
+                // Log deadline computation for debugging futex timeouts.
+                #[cfg(feature = "trace_syscalls")]
                 if remaining == Duration::ZERO && duration.as_secs() > 0 {
                     litebox::log_println!(
                         self.global.platform,
@@ -3516,26 +3519,29 @@ impl<FS: ShimFS> Task<FS> {
                             litebox_common_linux::ClockId::Monotonic
                         };
                     let d = self.duration_since_epoch_to_deadline(clock_id, timeout_dur)?;
-                    // Temporary: log wait_bitset deadlines for debugging Bun futex timeouts.
-                    let clock_str =
-                        if flags.contains(litebox_common_linux::FutexFlags::CLOCK_REALTIME) {
-                            "realtime"
-                        } else {
-                            "monotonic"
-                        };
-                    litebox::log_println!(
-                        self.global.platform,
-                        "[FUTEX-DBG] tid={} wait_bitset addr={:#x} val={} clock={} timeout_secs={} deadline_some={} mask={:#x}",
-                        self.tid,
-                        addr.as_usize(),
-                        val,
-                        clock_str,
-                        timeout_dur.as_secs(),
-                        d.is_some(),
-                        bitmask,
-                    );
+                    #[cfg(feature = "trace_syscalls")]
+                    {
+                        let clock_str =
+                            if flags.contains(litebox_common_linux::FutexFlags::CLOCK_REALTIME) {
+                                "realtime"
+                            } else {
+                                "monotonic"
+                            };
+                        litebox::log_println!(
+                            self.global.platform,
+                            "[FUTEX-DBG] tid={} wait_bitset addr={:#x} val={} clock={} timeout_secs={} deadline_some={} mask={:#x}",
+                            self.tid,
+                            addr.as_usize(),
+                            val,
+                            clock_str,
+                            timeout_dur.as_secs(),
+                            d.is_some(),
+                            bitmask,
+                        );
+                    }
                     d
                 } else {
+                    #[cfg(feature = "trace_syscalls")]
                     litebox::log_println!(
                         self.global.platform,
                         "[FUTEX-DBG] tid={} wait_bitset addr={:#x} val={} no_timeout mask={:#x}",
@@ -3694,18 +3700,26 @@ impl<FS: ShimFS> Task<FS> {
         guest_exec_image: &[u8],
         guest_interp_image: Option<(&str, &[u8])>,
     ) -> Result<usize, Errno> {
-        let argv_preview = argv
-            .iter()
-            .take(8)
-            .map(|arg| arg.to_string_lossy().into_owned())
-            .collect::<alloc::vec::Vec<_>>();
         litebox::log_println!(
             self.global.platform,
-            "[EXEC-REMOTE] pid={} path={:?} argv={:?} — spawning worker host for non-PIE binary",
+            "[EXEC-REMOTE] pid={} path={:?} — spawning worker host for non-PIE binary",
             self.pid,
             path,
-            argv_preview,
         );
+        #[cfg(feature = "trace_syscalls")]
+        {
+            let argv_preview = argv
+                .iter()
+                .take(8)
+                .map(|arg| arg.to_string_lossy().into_owned())
+                .collect::<alloc::vec::Vec<_>>();
+            litebox::log_println!(
+                self.global.platform,
+                "[EXEC-REMOTE] pid={} argv={:?}",
+                self.pid,
+                argv_preview,
+            );
+        }
 
         let guest_cwd = self.fs.borrow().current_working_directory();
         let worker_stdio = self.worker_exec_stdio_bindings().map_err(|err| {
@@ -4464,12 +4478,21 @@ fn worker_exec_stdio_is_unsupported<FS: ShimFS>(
     if let Ok(fd) =
         rds.fd_from_raw_integer::<crate::syscalls::unix::UnixSocketSubsystem<FS>>(raw_fd)
     {
-        let nonblocking = global
+        let (nonblocking, is_stream, is_connected, has_timeouts) = global
             .litebox
             .descriptor_table()
             .entry_handle(&fd)
-            .map(|handle| handle.with_entry(|file| file.get_status().contains(OFlags::NONBLOCK)))
-            .unwrap_or(false);
+            .map(|handle| {
+                handle.with_entry(|file| {
+                    (
+                        file.get_status().contains(OFlags::NONBLOCK),
+                        file.sock_type() == litebox_common_linux::SockType::Stream,
+                        file.is_connected(),
+                        file.has_timeouts(),
+                    )
+                })
+            })
+            .unwrap_or((false, false, false, false));
         drop(rds);
         if nonblocking {
             log_worker_exec_stdio_unsupported(
@@ -4479,7 +4502,31 @@ fn worker_exec_stdio_is_unsupported<FS: ShimFS>(
             );
             return true;
         }
-        // Blocking unix sockets are supported via stream bridging.
+        if !is_stream {
+            log_worker_exec_stdio_unsupported(
+                global,
+                raw_fd,
+                "unix-socket-backed stdio (non-stream type)",
+            );
+            return true;
+        }
+        if !is_connected {
+            log_worker_exec_stdio_unsupported(
+                global,
+                raw_fd,
+                "unix-socket-backed stdio (not connected)",
+            );
+            return true;
+        }
+        if has_timeouts {
+            log_worker_exec_stdio_unsupported(
+                global,
+                raw_fd,
+                "unix-socket-backed stdio (has send/recv timeouts)",
+            );
+            return true;
+        }
+        // Blocking SOCK_STREAM unix sockets are supported via stream bridging.
         return false;
     }
     drop(rds);
@@ -4651,6 +4698,10 @@ impl<FS: ShimFS> litebox::process::WorkerExecStreamWriter for UnixSocketStreamWr
         self.handle
             .with_entry(|socket| socket.send_bytes(&cx, buf))
             .map_err(|_| ())
+    }
+
+    fn object_id(&self) -> u64 {
+        self.handle.object_id().as_u64()
     }
 }
 

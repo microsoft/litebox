@@ -140,6 +140,16 @@ impl From<litebox::fs::errors::OpenError> for Errno {
     }
 }
 
+impl From<litebox::fs::errors::CreateAnonymousFileError> for Errno {
+    fn from(value: litebox::fs::errors::CreateAnonymousFileError) -> Self {
+        match value {
+            litebox::fs::errors::CreateAnonymousFileError::Io => Errno::EIO,
+            litebox::fs::errors::CreateAnonymousFileError::NotSupported => Errno::ENOSYS,
+            _ => unimplemented!(),
+        }
+    }
+}
+
 impl From<litebox::fs::errors::UnlinkError> for Errno {
     fn from(value: litebox::fs::errors::UnlinkError) -> Self {
         match value {

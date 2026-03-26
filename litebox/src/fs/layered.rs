@@ -668,6 +668,20 @@ impl<
         self.upper.walks_follow_symlinks() || self.lower.walks_follow_symlinks()
     }
 
+    fn create_anonymous_file(
+        &self,
+        name: &str,
+        mode: super::Mode,
+    ) -> Result<FileFd<Platform, Upper, Lower>, super::errors::CreateAnonymousFileError> {
+        let upper_fd = self.upper.create_anonymous_file(name, mode)?;
+        Ok(self.litebox.descriptor_table_mut().insert(Descriptor {
+            path: super::memfd_display_path(name),
+            flags: OFlags::RDWR | OFlags::LARGEFILE,
+            entry: Arc::new(EntryX::Upper { fd: upper_fd }),
+            position: 0.into(),
+        }))
+    }
+
     fn open(
         &self,
         path: impl crate::path::Arg,

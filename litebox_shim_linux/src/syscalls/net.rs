@@ -1020,9 +1020,24 @@ impl<FS: ShimFS> Task<FS> {
                 };
                 let socket = self.global.net.lock().socket(protocol)?;
                 let _ = self.global.initialize_socket(&socket, ty, flags);
+                #[cfg(feature = "trace_syscalls")]
+                let object_id = socket.object_id().as_u64();
                 let Ok(raw_fd) = files.insert_raw_fd(socket) else {
                     unimplemented!()
                 };
+                #[cfg(feature = "trace_syscalls")]
+                if raw_fd <= 20 {
+                    litebox::log_println!(
+                        self.global.platform,
+                        "[FD-TRACE] pid={} socket raw_fd={} object_id={} domain={:?} type={:?} flags={:?}",
+                        self.pid,
+                        raw_fd,
+                        object_id,
+                        domain,
+                        ty,
+                        flags,
+                    );
+                }
                 raw_fd
             }
             AddressFamily::UNIX => {
@@ -1042,10 +1057,26 @@ impl<FS: ShimFS> Task<FS> {
                     assert!(old.is_none());
                 }
 
-                files.insert_raw_fd(typed).map_err(|typed| {
+                #[cfg(feature = "trace_syscalls")]
+                let object_id = typed.object_id().as_u64();
+                let raw_fd = files.insert_raw_fd(typed).map_err(|typed| {
                     let _ = self.global.litebox.descriptor_table_mut().remove(&typed);
                     Errno::EMFILE
-                })?
+                })?;
+                #[cfg(feature = "trace_syscalls")]
+                if raw_fd <= 20 {
+                    litebox::log_println!(
+                        self.global.platform,
+                        "[FD-TRACE] pid={} socket raw_fd={} object_id={} domain={:?} type={:?} flags={:?}",
+                        self.pid,
+                        raw_fd,
+                        object_id,
+                        domain,
+                        ty,
+                        flags,
+                    );
+                }
+                raw_fd
             }
             AddressFamily::INET6 | AddressFamily::NETLINK => return Err(Errno::EAFNOSUPPORT),
             _ => unimplemented!(),
@@ -1094,15 +1125,34 @@ impl<FS: ShimFS> Task<FS> {
                     assert!(old.is_none());
                 }
                 drop(dt);
+                #[cfg(feature = "trace_syscalls")]
+                let object_id1 = typed1.object_id().as_u64();
                 let raw_fd1 = files.insert_raw_fd(typed1).map_err(|typed| {
                     let _ = self.global.litebox.descriptor_table_mut().remove(&typed);
                     Errno::EMFILE
                 })?;
+                #[cfg(feature = "trace_syscalls")]
+                let object_id2 = typed2.object_id().as_u64();
                 let raw_fd2 = files.insert_raw_fd(typed2).map_err(|typed| {
                     self.do_close(raw_fd1).unwrap();
                     let _ = self.global.litebox.descriptor_table_mut().remove(&typed);
                     Errno::EMFILE
                 })?;
+                #[cfg(feature = "trace_syscalls")]
+                if raw_fd1 <= 20 || raw_fd2 <= 20 {
+                    litebox::log_println!(
+                        self.global.platform,
+                        "[FD-TRACE] pid={} socketpair fd1={} object_id1={} fd2={} object_id2={} domain={:?} type={:?} flags={:?}",
+                        self.pid,
+                        raw_fd1,
+                        object_id1,
+                        raw_fd2,
+                        object_id2,
+                        domain,
+                        ty,
+                        flags,
+                    );
+                }
                 (raw_fd1, raw_fd2)
             }
             AddressFamily::INET | AddressFamily::INET6 | AddressFamily::NETLINK => {

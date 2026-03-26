@@ -1345,6 +1345,19 @@ impl<FS: ShimFS> UnixSocket<FS> {
         self.sock_type
     }
 
+    /// Returns `true` if this is a connected stream socket.
+    pub(super) fn is_connected(&self) -> bool {
+        match &self.inner {
+            UnixSocketInner::Stream(stream) => stream.with_state_ref(|s| s.connected().is_some()),
+            UnixSocketInner::Datagram(_) => false,
+        }
+    }
+
+    pub(super) fn has_timeouts(&self) -> bool {
+        let opts = self.options.lock();
+        opts.recv_timeout.is_some() || opts.send_timeout.is_some()
+    }
+
     pub(super) fn listen(
         &self,
         task: &Task<FS>,

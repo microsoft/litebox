@@ -36,6 +36,14 @@ pub struct Pipes<Platform: RawSyncPrimitivesProvider + TimeProvider> {
     litebox: LiteBox<Platform>,
 }
 
+impl<Platform: RawSyncPrimitivesProvider + TimeProvider> Clone for Pipes<Platform> {
+    fn clone(&self) -> Self {
+        Self {
+            litebox: self.litebox.clone(),
+        }
+    }
+}
+
 impl<Platform: RawSyncPrimitivesProvider + TimeProvider> Pipes<Platform> {
     /// Construct a new `Pipes` instance.
     ///
@@ -212,6 +220,18 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> Pipes<Platform> {
         match &dt.get_entry(fd).ok_or(errors::ClosedError::ClosedFd)?.entry {
             PipeEnd::Receiver(p) => Ok(p.endpoint.rb.lock().occupied_len()),
             PipeEnd::Sender(_) => Ok(0),
+        }
+    }
+
+    /// Return the number of bytes that can still be written without blocking.
+    pub fn writable_bytes(&self, fd: &PipeFd<Platform>) -> Result<usize, errors::ClosedError> {
+        let dt = self.litebox.descriptor_table();
+        match &dt.get_entry(fd).ok_or(errors::ClosedError::ClosedFd)?.entry {
+            PipeEnd::Receiver(_) => Ok(0),
+            PipeEnd::Sender(p) => {
+                let rb = p.endpoint.rb.lock();
+                Ok(rb.vacant_len())
+            }
         }
     }
 }

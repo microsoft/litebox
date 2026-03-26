@@ -31,6 +31,19 @@ use crate::{ConstPtr, GlobalState, MutPtr, ShimFS, Task};
 use core::fmt::Write as _;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
+fn host_stdio_source_for_path(path: &str) -> Option<i32> {
+    match path {
+        "/dev/stdin" => Some(0),
+        "/dev/stdout" => Some(1),
+        "/dev/stderr" => Some(2),
+        _ => None,
+    }
+}
+
+fn is_host_tty_path(path: &str) -> bool {
+    path == "/dev/tty"
+}
+
 /// Synthetic device IDs for anonymous descriptor pseudo-filesystems,
 /// mirroring the Linux kernel's `sockfs`, `pipefs`, and `anon_inodefs`.
 const SOCKFS_DEV: u64 = 0x000c;
@@ -153,6 +166,8 @@ pub(crate) struct FilesState<FS: ShimFS> {
     pub(crate) fs: alloc::sync::Arc<FS>,
     pub(crate) raw_descriptor_store:
         litebox::sync::RwLock<Platform, litebox::fd::RawDescriptorStorage>,
+    pub(crate) host_stdio_object_ids:
+        litebox::sync::RwLock<Platform, [Option<litebox::fd::DescriptorObjectId>; 3]>,
     file_position_lock: alloc::sync::Arc<litebox::sync::Mutex<Platform, ()>>,
     inotify_instances: litebox::sync::Mutex<
         Platform,
@@ -168,6 +183,7 @@ impl<FS: ShimFS> FilesState<FS> {
             raw_descriptor_store: litebox::sync::RwLock::new(
                 litebox::fd::RawDescriptorStorage::new(),
             ),
+            host_stdio_object_ids: litebox::sync::RwLock::new([None, None, None]),
             file_position_lock: Arc::new(litebox::sync::Mutex::new(())),
             inotify_instances: litebox::sync::Mutex::new(BTreeMap::new()),
             max_fd: AtomicUsize::new(usize::MAX),
@@ -213,6 +229,7 @@ impl<FS: ShimFS> FilesState<FS> {
             raw_descriptor_store: litebox::sync::RwLock::new(
                 self.raw_descriptor_store.read().clone_for_fork(global_dt),
             ),
+            host_stdio_object_ids: litebox::sync::RwLock::new(*self.host_stdio_object_ids.read()),
             file_position_lock: self.file_position_lock.clone(),
             inotify_instances: litebox::sync::Mutex::new(self.inotify_instances.lock().clone()),
             max_fd: AtomicUsize::new(self.max_fd.load(Ordering::Relaxed)),
@@ -668,12 +685,38 @@ impl<FS: ShimFS> Task<FS> {
             let None = dt.set_entry_metadata(&file, crate::StdioStatusFlags(status)) else {
                 unreachable!()
             };
+            if let Ok(path_str) = path.to_str()
+                && let Some(source_fd) = host_stdio_source_for_path(path_str)
+            {
+                let old = dt.set_entry_metadata(&file, crate::HostStdioSourceFd(source_fd));
+                assert!(old.is_none());
+            }
+            if let Ok(path_str) = path.to_str()
+                && is_host_tty_path(path_str)
+            {
+                let old = dt.set_entry_metadata(&file, crate::HostTtyAlias);
+                assert!(old.is_none());
+            }
         }
+        #[cfg(feature = "trace_syscalls")]
+        let object_id = file.object_id().as_u64();
         let files = self.files.borrow();
         let raw_fd = files.insert_raw_fd(file).map_err(|file| {
             files.fs.close(&file).unwrap();
             Errno::EMFILE
         })?;
+        #[cfg(feature = "trace_syscalls")]
+        if raw_fd <= 20 {
+            litebox::log_println!(
+                self.global.platform,
+                "[FD-TRACE] pid={} open raw_fd={} object_id={} path={:?} flags={:?}",
+                self.pid,
+                raw_fd,
+                object_id,
+                path,
+                flags,
+            );
+        }
         let guest_fd = u32::try_from(raw_fd).unwrap();
 
         if let Ok(s) = path.to_str()
@@ -709,6 +752,7 @@ impl<FS: ShimFS> Task<FS> {
                 };
                 let mode = mode & !self.get_umask();
 
+                let abs_path = self.resolve_dirfd_path(fd, &path).ok();
                 let files = self.files.borrow();
                 let file = files.run_on_raw_fd(
                     raw_fd,
@@ -737,11 +781,35 @@ impl<FS: ShimFS> Task<FS> {
                     let None = dt.set_entry_metadata(&file, crate::StdioStatusFlags(status)) else {
                         unreachable!()
                     };
+                    if let Some(source_fd) =
+                        abs_path.as_deref().and_then(host_stdio_source_for_path)
+                    {
+                        let old = dt.set_entry_metadata(&file, crate::HostStdioSourceFd(source_fd));
+                        assert!(old.is_none());
+                    }
+                    if abs_path.as_deref().is_some_and(is_host_tty_path) {
+                        let old = dt.set_entry_metadata(&file, crate::HostTtyAlias);
+                        assert!(old.is_none());
+                    }
                 }
+                #[cfg(feature = "trace_syscalls")]
+                let object_id = file.object_id().as_u64();
                 let guest_raw = files.insert_raw_fd(file).map_err(|file| {
                     files.fs.close(&file).unwrap();
                     Errno::EMFILE
                 })?;
+                #[cfg(feature = "trace_syscalls")]
+                if guest_raw <= 20 {
+                    litebox::log_println!(
+                        self.global.platform,
+                        "[FD-TRACE] pid={} openat raw_fd={} object_id={} path={:?} flags={:?}",
+                        self.pid,
+                        guest_raw,
+                        object_id,
+                        abs_path.as_deref().unwrap_or("<unknown>"),
+                        flags,
+                    );
+                }
                 Ok(u32::try_from(guest_raw).unwrap())
             }
         }
@@ -1640,6 +1708,16 @@ impl<FS: ShimFS> Task<FS> {
         let mut rds = files.raw_descriptor_store.write();
         match rds.fd_consume_raw_integer(raw_fd) {
             Ok(fd) => {
+                #[cfg(feature = "trace_syscalls")]
+                if raw_fd <= 20 {
+                    litebox::log_println!(
+                        self.global.platform,
+                        "[STDIO-MAP] pid={} close fd={} kind=fs object_id={}",
+                        self.pid,
+                        raw_fd,
+                        fd.object_id().as_u64(),
+                    );
+                }
                 drop(rds);
                 return files.fs.close(&fd).map_err(Errno::from);
             }
@@ -1651,14 +1729,52 @@ impl<FS: ShimFS> Task<FS> {
             }
         }
         if let Ok(fd) = rds.fd_consume_raw_integer(raw_fd) {
+            #[cfg(feature = "trace_syscalls")]
+            if raw_fd <= 20 {
+                litebox::log_println!(
+                    self.global.platform,
+                    "[STDIO-MAP] pid={} close fd={} kind=net-socket object_id={}",
+                    self.pid,
+                    raw_fd,
+                    fd.object_id().as_u64(),
+                );
+            }
             drop(rds);
             return self.global.close_socket(&self.wait_cx(), fd);
         }
         if let Ok(fd) = rds.fd_consume_raw_integer(raw_fd) {
+            #[cfg(feature = "trace_syscalls")]
+            if raw_fd <= 20 {
+                litebox::log_println!(
+                    self.global.platform,
+                    "[STDIO-MAP] pid={} close fd={} kind=pipe object_id={}",
+                    self.pid,
+                    raw_fd,
+                    fd.object_id().as_u64(),
+                );
+            }
             drop(rds);
             return self.global.pipes.close(&fd).map_err(Errno::from);
         }
         if let Ok(fd) = rds.fd_consume_raw_integer::<super::eventfd::EventfdSubsystem>(raw_fd) {
+            #[cfg(feature = "trace_syscalls")]
+            if raw_fd <= 20 {
+                let kind = self
+                    .global
+                    .litebox
+                    .descriptor_table()
+                    .entry_handle(&fd)
+                    .map(|handle| handle.with_entry(|file| file.kind_name()))
+                    .unwrap_or("eventfd-subsystem");
+                litebox::log_println!(
+                    self.global.platform,
+                    "[STDIO-MAP] pid={} close fd={} kind={} object_id={}",
+                    self.pid,
+                    raw_fd,
+                    kind,
+                    fd.object_id().as_u64(),
+                );
+            }
             drop(rds);
             let entry = {
                 let mut dt = self.global.litebox.descriptor_table_mut();
@@ -1668,6 +1784,16 @@ impl<FS: ShimFS> Task<FS> {
             return Ok(());
         }
         if let Ok(fd) = rds.fd_consume_raw_integer::<super::epoll::EpollSubsystem<FS>>(raw_fd) {
+            #[cfg(feature = "trace_syscalls")]
+            if raw_fd <= 20 {
+                litebox::log_println!(
+                    self.global.platform,
+                    "[STDIO-MAP] pid={} close fd={} kind=epoll object_id={}",
+                    self.pid,
+                    raw_fd,
+                    fd.object_id().as_u64(),
+                );
+            }
             drop(rds);
             let _epoll_graph_guard = self.global.epoll_graph_lock.lock();
             let parent_id = self
@@ -1687,6 +1813,15 @@ impl<FS: ShimFS> Task<FS> {
             return Ok(());
         }
         if let Ok(fd) = rds.fd_consume_raw_integer::<super::unix::UnixSocketSubsystem<FS>>(raw_fd) {
+            #[cfg(feature = "trace_syscalls")]
+            if raw_fd <= 20 {
+                litebox::log_println!(
+                    self.global.platform,
+                    "[STDIO-MAP] pid={} close fd={} kind=unix-socket",
+                    self.pid,
+                    raw_fd,
+                );
+            }
             drop(rds);
             let entry = {
                 let mut dt = self.global.litebox.descriptor_table_mut();
@@ -3268,10 +3403,14 @@ impl<FS: ShimFS> Task<FS> {
         }
 
         let files = self.files.borrow();
+        #[cfg(feature = "trace_syscalls")]
+        let writer_object_id = writer.object_id().as_u64();
         let wr_raw_fd = files.insert_raw_fd(writer).map_err(|writer| {
             self.global.pipes.close(&writer).unwrap();
             Errno::EMFILE
         })?;
+        #[cfg(feature = "trace_syscalls")]
+        let reader_object_id = reader.object_id().as_u64();
         let rd_raw_fd = files.insert_raw_fd(reader).map_err(|reader| {
             let writer = files
                 .raw_descriptor_store
@@ -3282,6 +3421,19 @@ impl<FS: ShimFS> Task<FS> {
             self.global.pipes.close(&reader).unwrap();
             Errno::EMFILE
         })?;
+        #[cfg(feature = "trace_syscalls")]
+        if rd_raw_fd <= 20 || wr_raw_fd <= 20 {
+            litebox::log_println!(
+                self.global.platform,
+                "[FD-TRACE] pid={} pipe2 read_fd={} read_object_id={} write_fd={} write_object_id={} flags={:?}",
+                self.pid,
+                rd_raw_fd,
+                reader_object_id,
+                wr_raw_fd,
+                writer_object_id,
+                flags,
+            );
+        }
         Ok((rd_raw_fd.try_into().unwrap(), wr_raw_fd.try_into().unwrap()))
     }
 
@@ -3301,12 +3453,83 @@ impl<FS: ShimFS> Task<FS> {
         }
         drop(dt);
         let files = self.files.borrow();
+        #[cfg(feature = "trace_syscalls")]
+        let object_id = typed.object_id().as_u64();
         let raw_fd = files.insert_raw_fd(typed).map_err(|typed| {
             self.global
                 .litebox
                 .descriptor_table_mut()
                 .remove(&typed)
                 .unwrap();
+            Errno::EMFILE
+        })?;
+        #[cfg(feature = "trace_syscalls")]
+        litebox::log_println!(
+            self.global.platform,
+            "[STDIO-MAP] pid={} create fd={} kind=eventfd object_id={} flags={:?}",
+            self.pid,
+            raw_fd,
+            object_id,
+            flags,
+        );
+        Ok(raw_fd.try_into().unwrap())
+    }
+    ///
+    /// Creates an anonymous regular file backed by the in-memory filesystem.
+    /// The returned fd behaves like a normal seekable file but has no
+    /// directory entry — only the descriptor keeps it alive.
+    pub fn sys_memfd_create(
+        &self,
+        name: alloc::ffi::CString,
+        flags: litebox_common_linux::MemfdFlags,
+    ) -> Result<u32, Errno> {
+        use litebox::fs::errors::CreateAnonymousFileError;
+        use litebox_common_linux::MemfdFlags;
+
+        let known = MemfdFlags::CLOEXEC
+            | MemfdFlags::ALLOW_SEALING
+            | MemfdFlags::HUGETLB
+            | MemfdFlags::NOEXEC_SEAL
+            | MemfdFlags::EXEC;
+        if flags.intersects(known.complement()) {
+            return Err(Errno::EINVAL);
+        }
+        if flags.contains(MemfdFlags::HUGETLB) {
+            return Err(Errno::ENOSYS);
+        }
+        // MFD_EXEC and MFD_NOEXEC_SEAL are mutually exclusive.
+        if flags.contains(MemfdFlags::EXEC) && flags.contains(MemfdFlags::NOEXEC_SEAL) {
+            return Err(Errno::EINVAL);
+        }
+
+        let name_str = name.to_string_lossy();
+        // Strip execute bits when MFD_NOEXEC_SEAL is set, matching Linux.
+        let mode = if flags.contains(MemfdFlags::NOEXEC_SEAL) {
+            litebox::fs::Mode::from_bits_truncate(0o666)
+        } else {
+            litebox::fs::Mode::from_bits_truncate(0o777)
+        };
+        let files = self.files.borrow();
+        let file = files
+            .fs
+            .create_anonymous_file(&name_str, mode)
+            .map_err(|e| match e {
+                CreateAnonymousFileError::NotSupported => Errno::ENOSYS,
+                CreateAnonymousFileError::Io => Errno::EIO,
+                _ => Errno::EIO,
+            })?;
+        {
+            let mut dt = self.global.litebox.descriptor_table_mut();
+            if flags.contains(MemfdFlags::CLOEXEC) {
+                let old = dt.set_fd_metadata(&file, FileDescriptorFlags::FD_CLOEXEC);
+                assert!(old.is_none());
+            }
+            let status = OFlags::RDWR | OFlags::LARGEFILE;
+            let old = dt.set_entry_metadata(&file, crate::StdioStatusFlags(status));
+            assert!(old.is_none());
+        }
+        let raw_fd = files.insert_raw_fd(file).map_err(|file| {
+            files.fs.close(&file).unwrap();
             Errno::EMFILE
         })?;
         Ok(raw_fd.try_into().unwrap())
@@ -3388,6 +3611,8 @@ impl<FS: ShimFS> Task<FS> {
         }
         drop(dt);
         let files = self.files.borrow();
+        #[cfg(feature = "trace_syscalls")]
+        let object_id = typed.object_id().as_u64();
         let raw_fd = files.insert_raw_fd(typed).map_err(|typed| {
             self.global
                 .litebox
@@ -3396,6 +3621,15 @@ impl<FS: ShimFS> Task<FS> {
                 .unwrap();
             Errno::EMFILE
         })?;
+        #[cfg(feature = "trace_syscalls")]
+        litebox::log_println!(
+            self.global.platform,
+            "[STDIO-MAP] pid={} create fd={} kind=timerfd object_id={} flags={:?}",
+            self.pid,
+            raw_fd,
+            object_id,
+            flags,
+        );
         Ok(raw_fd.try_into().unwrap())
     }
 
@@ -4481,22 +4715,28 @@ impl<FS: ShimFS> Task<FS> {
             global: &GlobalState<FS>,
             files: &FilesState<FS>,
             fd: &TypedFd<S>,
+            pid: i32,
+            source_raw_fd: usize,
             close_on_exec: bool,
             target: Option<usize>,
             min_fd: Option<usize>,
         ) -> Result<usize, Errno> {
+            #[cfg(not(feature = "trace_syscalls"))]
+            let _ = (pid, source_raw_fd);
             let mut dt = global.litebox.descriptor_table_mut();
             let fd: TypedFd<_> = dt.duplicate(fd).ok_or(Errno::EBADF)?;
+            #[cfg(feature = "trace_syscalls")]
+            let object_id = fd.object_id().as_u64();
             if close_on_exec {
                 let old = dt.set_fd_metadata(&fd, FileDescriptorFlags::FD_CLOEXEC);
                 assert!(old.is_none());
             }
             let mut rds = files.raw_descriptor_store.write();
-            if let Some(target) = target {
+            let new_raw_fd = if let Some(target) = target {
                 if !rds.fd_into_specific_raw_integer(fd, target) {
                     return Err(Errno::EBADF);
                 }
-                Ok(target)
+                target
             } else if let Some(min_fd) = min_fd {
                 #[allow(clippy::maybe_infinite_iter)]
                 let raw_fd = (min_fd..)
@@ -4504,21 +4744,101 @@ impl<FS: ShimFS> Task<FS> {
                     .expect("raw fd search should always find a slot");
                 let success = rds.fd_into_specific_raw_integer(fd, raw_fd);
                 assert!(success);
-                Ok(raw_fd)
+                raw_fd
             } else {
-                Ok(rds.fd_into_raw_integer(fd))
+                rds.fd_into_raw_integer(fd)
+            };
+            #[cfg(feature = "trace_syscalls")]
+            if source_raw_fd <= 20 || new_raw_fd <= 20 {
+                litebox::log_println!(
+                    global.platform,
+                    "[STDIO-MAP] pid={} dup source_fd={} target_fd={} object_id={} entry_type={} cloexec={}",
+                    pid,
+                    source_raw_fd,
+                    new_raw_fd,
+                    object_id,
+                    core::any::type_name::<S::Entry>(),
+                    close_on_exec,
+                );
             }
+            Ok(new_raw_fd)
         }
         let close_on_exec = flags.contains(OFlags::CLOEXEC);
         let files = self.files.borrow();
         let new_fd = files.run_on_raw_fd(
             file,
-            |fd| dup(&self.global, &files, fd, close_on_exec, target, min_fd),
-            |fd| dup(&self.global, &files, fd, close_on_exec, target, min_fd),
-            |fd| dup(&self.global, &files, fd, close_on_exec, target, min_fd),
-            |fd| dup(&self.global, &files, fd, close_on_exec, target, min_fd),
-            |fd| dup(&self.global, &files, fd, close_on_exec, target, min_fd),
-            |fd| dup(&self.global, &files, fd, close_on_exec, target, min_fd),
+            |fd| {
+                dup(
+                    &self.global,
+                    &files,
+                    fd,
+                    self.pid,
+                    file,
+                    close_on_exec,
+                    target,
+                    min_fd,
+                )
+            },
+            |fd| {
+                dup(
+                    &self.global,
+                    &files,
+                    fd,
+                    self.pid,
+                    file,
+                    close_on_exec,
+                    target,
+                    min_fd,
+                )
+            },
+            |fd| {
+                dup(
+                    &self.global,
+                    &files,
+                    fd,
+                    self.pid,
+                    file,
+                    close_on_exec,
+                    target,
+                    min_fd,
+                )
+            },
+            |fd| {
+                dup(
+                    &self.global,
+                    &files,
+                    fd,
+                    self.pid,
+                    file,
+                    close_on_exec,
+                    target,
+                    min_fd,
+                )
+            },
+            |fd| {
+                dup(
+                    &self.global,
+                    &files,
+                    fd,
+                    self.pid,
+                    file,
+                    close_on_exec,
+                    target,
+                    min_fd,
+                )
+            },
+            |fd| {
+                dup(
+                    &self.global,
+                    &files,
+                    fd,
+                    self.pid,
+                    file,
+                    close_on_exec,
+                    target,
+                    min_fd,
+                )
+            },
         )??;
         if target.is_none() {
             let max_fd = self

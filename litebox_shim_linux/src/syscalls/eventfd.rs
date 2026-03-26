@@ -118,6 +118,14 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> EventFile<Platform> {
         matches!(*self.inner.lock(), EventFileInner::Timerfd(_))
     }
 
+    pub(crate) fn kind_name(&self) -> &'static str {
+        match &*self.inner.lock() {
+            EventFileInner::Eventfd { .. } => "eventfd",
+            EventFileInner::Pidfd { .. } => "pidfd",
+            EventFileInner::Timerfd(_) => "timerfd",
+        }
+    }
+
     pub(crate) fn needs_host_poll(&self) -> bool {
         self.is_timerfd()
     }

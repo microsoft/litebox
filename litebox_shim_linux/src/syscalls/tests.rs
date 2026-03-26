@@ -10,8 +10,8 @@ use litebox::{
 };
 use litebox_common_linux::{
     AddressFamily, AtFlags, ClockId, EfdFlags, EpollCreateFlags, EpollEvent, EpollOp, FcntlArg,
-    FileDescriptorFlags, Flock, FlockType, ItimerSpec, SockType, TimeParam, TimerfdFlags,
-    TimerfdTimerFlags, errno::Errno,
+    FileDescriptorFlags, Flock, FlockType, ItimerSpec, MemfdFlags, SockType, TimeParam,
+    TimerfdFlags, TimerfdTimerFlags, errno::Errno,
 };
 use litebox_platform_multiplex::{Platform, set_platform};
 use std::vec::Vec;
@@ -104,6 +104,19 @@ fn test_fcntl() {
         .expect("Failed to create eventfd");
     let eventfd = i32::try_from(eventfd).unwrap();
     check(eventfd, OFlags::RDWR | OFlags::NONBLOCK, OFlags::RDWR);
+
+    let memfd = task
+        .sys_memfd_create(
+            alloc::ffi::CString::new("fcntl-memfd").unwrap(),
+            MemfdFlags::CLOEXEC,
+        )
+        .expect("Failed to create memfd");
+    let memfd = i32::try_from(memfd).unwrap();
+    check(
+        memfd,
+        OFlags::RDWR | OFlags::LARGEFILE,
+        OFlags::RDWR | OFlags::LARGEFILE,
+    );
 
     let epoll = task
         .sys_epoll_create(EpollCreateFlags::EPOLL_CLOEXEC)

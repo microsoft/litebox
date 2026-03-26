@@ -11,6 +11,16 @@ use super::FileSystem;
 
 use thiserror::Error;
 
+/// Possible errors from [`FileSystem::create_anonymous_file`]
+#[non_exhaustive]
+#[derive(Error, Debug)]
+pub enum CreateAnonymousFileError {
+    #[error("I/O error")]
+    Io,
+    #[error("operation not supported")]
+    NotSupported,
+}
+
 /// Possible errors from [`FileSystem::open`]
 #[non_exhaustive]
 #[derive(Error, Debug)]

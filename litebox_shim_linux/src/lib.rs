@@ -501,6 +501,12 @@ pub fn default_fs(
 // Special override so that `GETFL` can return stdio-specific flags.
 pub(crate) use litebox::fs::devices::DeviceStatusFlags as StdioStatusFlags;
 
+#[derive(Clone, Copy)]
+pub(crate) struct HostStdioSourceFd(pub i32);
+
+#[derive(Clone, Copy)]
+pub(crate) struct HostTtyAlias;
+
 /// Status flags for pipes
 #[derive(Clone)]
 pub(crate) struct PipeStatusFlags(pub litebox::fs::OFlags);
@@ -520,6 +526,11 @@ impl<FS: ShimFS> syscalls::file::FilesState<FS> {
             .fs
             .open("/dev/stderr", OFlags::WRONLY, Mode::empty())
             .unwrap();
+        let stdio_object_ids = [
+            Some(stdin.object_id()),
+            Some(stdout.object_id()),
+            Some(stderr.object_id()),
+        ];
         let mut dt = global.litebox.descriptor_table_mut();
         let mut rds = self.raw_descriptor_store.write();
         for (raw_fd, fd) in [(0, stdin), (1, stdout), (2, stderr)] {
@@ -527,9 +538,12 @@ impl<FS: ShimFS> syscalls::file::FilesState<FS> {
             debug_assert_eq!(OFlags::STATUS_FLAGS_MASK & status_flags, status_flags);
             let old = dt.set_entry_metadata(&fd, StdioStatusFlags(status_flags));
             assert!(old.is_none());
+            let old = dt.set_entry_metadata(&fd, HostStdioSourceFd(raw_fd as i32));
+            assert!(old.is_none());
             let success = rds.fd_into_specific_raw_integer(fd, raw_fd);
             assert!(success);
         }
+        *self.host_stdio_object_ids.write() = stdio_object_ids;
     }
 }
 
@@ -2162,6 +2176,11 @@ impl<FS: ShimFS> Task<FS> {
                 .and_then(|s| buf.write_at_offset(0, s).ok_or(Errno::EFAULT).map(|()| 0)),
             SyscallRequest::Eventfd2 { initval, flags } => {
                 syscall!(sys_eventfd2(initval, flags))
+            }
+            SyscallRequest::MemfdCreate { name, flags } => {
+                name.to_cstring().map_or(Err(Errno::EFAULT), |name| {
+                    syscall!(sys_memfd_create(name, flags))
+                })
             }
             SyscallRequest::InotifyInit1 { flags } => syscall!(sys_inotify_init1(flags)),
             SyscallRequest::InotifyAddWatch { fd, pathname, mask } => {

@@ -79,6 +79,20 @@ pub trait FileSystem: private::Sealed + FdEnabledSubsystem {
         mode: Mode,
     ) -> Result<TypedFd<Self>, OpenError>;
 
+    /// Create an anonymous regular file that has no namespace entry.
+    ///
+    /// This is used for Linux `memfd_create`-style descriptors: the file
+    /// behaves like an ordinary seekable regular file, but only the returned
+    /// file descriptor keeps it alive.
+    #[expect(unused_variables, reason = "default body, non-underscored param names")]
+    fn create_anonymous_file(
+        &self,
+        name: &str,
+        mode: Mode,
+    ) -> Result<TypedFd<Self>, errors::CreateAnonymousFileError> {
+        Err(errors::CreateAnonymousFileError::NotSupported)
+    }
+
     /// Close the file at `fd`.
     ///
     /// Future operations on the `fd` will start to return `ClosedFd` errors.
@@ -311,6 +325,10 @@ pub trait FileSystem: private::Sealed + FdEnabledSubsystem {
     /// Returns the path that was used to open the file. Used by the ELF
     /// patch cache and diagnostics.
     fn fd_path(&self, fd: &TypedFd<Self>) -> Option<alloc::string::String>;
+}
+
+pub(crate) fn memfd_display_path(name: &str) -> alloc::string::String {
+    alloc::format!("/memfd:{name} (deleted)")
 }
 
 bitflags! {

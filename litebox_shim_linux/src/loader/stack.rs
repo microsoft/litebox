@@ -258,7 +258,7 @@ mod tests {
         ];
 
         stack
-            .init(argv.clone(), env.clone(), BTreeMap::new(), None)
+            .init(argv.clone(), env.clone(), BTreeMap::new(), None, [0; 16])
             .expect("initialize user stack");
 
         let sp = stack.get_cur_stack_top();

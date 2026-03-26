@@ -2150,12 +2150,12 @@ fn build_udp_packet(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{Read as _, Write as _};
     use std::sync::{
         Arc,
         atomic::{AtomicBool, AtomicUsize, Ordering},
     };
     use std::time::Duration;
-    use std::io::{Read as _, Write as _};
 
     #[test]
     fn test_build_udp_packet_valid() {
@@ -2429,8 +2429,8 @@ mod tests {
         client1
             .write_all(&build_lbnp_handshake())
             .expect("write client1 handshake");
-        let server_ipc =
-            accept_ipc_client(&listener, None, Some(Duration::from_secs(2))).expect("accept client1");
+        let server_ipc = accept_ipc_client(&listener, None, Some(Duration::from_secs(2)))
+            .expect("accept client1");
         let mut resp = [0u8; 8];
         client1
             .read_exact(&mut resp)
