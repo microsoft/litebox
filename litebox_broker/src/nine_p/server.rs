@@ -1704,7 +1704,12 @@ impl Server {
             return None;
         }
 
-        let patched = match litebox_syscall_rewriter::hook_syscalls_in_elf(&content, None) {
+        let mut skipped_addrs = Vec::new();
+        let patched = match litebox_syscall_rewriter::hook_syscalls_in_elf(
+            &content,
+            None,
+            &mut skipped_addrs,
+        ) {
             Ok(p) => p,
             Err(_) => {
                 let _ = file.seek(SeekFrom::Start(0));
@@ -1716,6 +1721,7 @@ impl Server {
             path = %path.display(),
             original_size = content.len(),
             patched_size = patched.len(),
+            skipped_syscalls = skipped_addrs.len(),
             "patched ELF with syscall trampolines"
         );
 

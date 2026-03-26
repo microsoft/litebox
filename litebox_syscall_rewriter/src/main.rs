@@ -47,10 +47,19 @@ fn main() -> anyhow::Result<()> {
     let mut input_binary = std::fs::File::open(&cli_args.input_binary)?;
     let mut input_binary_bytes = vec![];
     input_binary.read_to_end(&mut input_binary_bytes)?;
+    let mut skipped_addrs = Vec::new();
     let output_binary = litebox_syscall_rewriter::hook_syscalls_in_elf(
         &input_binary_bytes,
         cli_args.trampoline_addr,
+        &mut skipped_addrs,
     )?;
+    if !skipped_addrs.is_empty() {
+        eprintln!(
+            "warning: {} unpatchable syscall instruction(s) at {:?}",
+            skipped_addrs.len(),
+            skipped_addrs,
+        );
+    }
     let output_path = cli_args.output_binary.unwrap_or_else(|| {
         cli_args.input_binary.with_file_name(
             cli_args

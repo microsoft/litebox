@@ -56,8 +56,19 @@ pub enum InterceptionBackend {
 }
 
 fn rewrite_program_bytes(data: &[u8], path: &Path) -> Result<Vec<u8>> {
-    match litebox_syscall_rewriter::hook_syscalls_in_elf(data, None) {
-        Ok(rewritten) => Ok(rewritten),
+    let mut skipped_addrs = Vec::new();
+    match litebox_syscall_rewriter::hook_syscalls_in_elf(data, None, &mut skipped_addrs) {
+        Ok(rewritten) => {
+            if !skipped_addrs.is_empty() {
+                eprintln!(
+                    "warning: {} has {} unpatchable syscall instruction(s) at {:?}",
+                    path.display(),
+                    skipped_addrs.len(),
+                    skipped_addrs,
+                );
+            }
+            Ok(rewritten)
+        }
         Err(litebox_syscall_rewriter::Error::UnsupportedBunExecutable) => anyhow::bail!(
             "{} is a Bun-packaged executable, and this runner requires a LiteBox trampoline to load it; Bun-packaged executables are unsupported here",
             path.display()

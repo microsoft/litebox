@@ -14,11 +14,13 @@ fn patch_single_syscall() {
     let syscall_entry_addr: u64 = 0x40_2000;
     let trampoline_write_vaddr: u64 = syscall_entry_addr + 8;
 
+    let mut skipped = Vec::new();
     let stubs = patch_code_segment(
         &mut code,
         code_vaddr,
         trampoline_write_vaddr,
         syscall_entry_addr,
+        &mut skipped,
     )
     .unwrap();
 
@@ -60,7 +62,8 @@ fn no_syscalls_returns_empty() {
     let original = vec![0x90, 0x90, 0xC3];
     let mut code = original.clone();
 
-    let stubs = patch_code_segment(&mut code, 0x40_1000, 0x40_2008, 0x40_2000).unwrap();
+    let stubs =
+        patch_code_segment(&mut code, 0x40_1000, 0x40_2008, 0x40_2000, &mut Vec::new()).unwrap();
 
     assert!(stubs.is_empty(), "no syscalls → no stubs");
     assert_eq!(code, original, "code should be unmodified");
@@ -76,8 +79,8 @@ fn matches_hook_syscalls_in_elf() {
     let input = include_bytes!("hello");
 
     // --- Run the whole-file API ---
-    let output =
-        litebox_syscall_rewriter::hook_syscalls_in_elf(input, None).expect("hook_syscalls_in_elf");
+    let output = litebox_syscall_rewriter::hook_syscalls_in_elf(input, None, &mut Vec::new())
+        .expect("hook_syscalls_in_elf");
 
     // Parse the trampoline header (last 32 bytes for 64-bit)
     let hdr_start = output.len() - 32;
@@ -133,8 +136,14 @@ fn matches_hook_syscalls_in_elf() {
         let sz = size as usize;
         let mut section_data = buf[off..off + sz].to_vec();
         let write_vaddr = stubs_base + all_stubs.len() as u64;
-        let stubs = patch_code_segment(&mut section_data, vaddr, write_vaddr, entry_point_addr)
-            .expect("patch_code_segment");
+        let stubs = patch_code_segment(
+            &mut section_data,
+            vaddr,
+            write_vaddr,
+            entry_point_addr,
+            &mut Vec::new(),
+        )
+        .expect("patch_code_segment");
 
         // The patched section bytes should match those in the whole-file output.
         assert_eq!(

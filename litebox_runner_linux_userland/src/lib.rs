@@ -255,8 +255,19 @@ fn initial_program_data(
     program_path: &Path,
 ) -> Result<alloc::borrow::Cow<'static, [u8]>> {
     if rewrite_syscalls {
-        match litebox_syscall_rewriter::hook_syscalls_in_elf(file.data, None) {
-            Ok(data) => Ok(data.into()),
+        let mut skipped_addrs = Vec::new();
+        match litebox_syscall_rewriter::hook_syscalls_in_elf(file.data, None, &mut skipped_addrs) {
+            Ok(data) => {
+                if !skipped_addrs.is_empty() {
+                    eprintln!(
+                        "warning: {} has {} unpatchable syscall instruction(s) at {:?}",
+                        program_path.display(),
+                        skipped_addrs.len(),
+                        skipped_addrs,
+                    );
+                }
+                Ok(data.into())
+            }
             Err(litebox_syscall_rewriter::Error::UnsupportedBunExecutable) => {
                 eprintln!(
                     "warning: skipping --rewrite-syscalls for Bun-packaged executable {}; \

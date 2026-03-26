@@ -105,7 +105,15 @@ struct TextSectionInfo {
 /// - trampoline size (8 bytes for 64-bit, 4 bytes for 32-bit)
 ///
 /// This layout allows loaders to read just the last 32/20 bytes to get the metadata.
-pub fn hook_syscalls_in_elf(input_binary: &[u8], trampoline: Option<u64>) -> Result<Vec<u8>> {
+///
+/// `skipped_addrs` receives the virtual addresses of any `syscall`
+/// instructions that could not be patched. The output ELF is still
+/// valid, but those instructions remain as raw host syscalls.
+pub fn hook_syscalls_in_elf(
+    input_binary: &[u8],
+    trampoline: Option<u64>,
+    skipped_addrs: &mut Vec<u64>,
+) -> Result<Vec<u8>> {
     if has_bun_footer_marker(input_binary) {
         return Err(Error::UnsupportedBunExecutable);
     }
@@ -204,6 +212,7 @@ pub fn hook_syscalls_in_elf(input_binary: &[u8], trampoline: Option<u64>) -> Res
             trampoline_base_addr, // entry point is at offset 0 of trampoline
             dl_sysinfo_int80,
             &mut trampoline_data,
+            skipped_addrs,
         ) {
             Ok(()) => {
                 syscall_insns_found = true;
@@ -301,7 +310,7 @@ fn has_bun_footer_marker(input_binary: &[u8]) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{BUN_FOOTER_MARKER, Error, has_bun_footer_marker, patch_code_segment};
+    use super::{BUN_FOOTER_MARKER, has_bun_footer_marker, patch_code_segment};
 
     #[test]
     fn detects_bun_footer_marker_near_end() {
@@ -318,42 +327,75 @@ mod tests {
     }
 
     #[test]
-    fn patch_code_segment_leaves_rip_relative_presyscall_setup_in_place() {
+    fn patch_code_segment_relocates_rip_relative_presyscall_to_trampoline() {
         let mut code = vec![
-            0x48, 0x8D, 0x35, 0x10, 0x00, 0x00, 0x00, // lea rsi, [rip + 0x10]
-            0x0F, 0x05, // syscall
+            0x48, 0x8D, 0x35, 0x10, 0x00, 0x00, 0x00, // lea rsi, [rip + 0x10] @ 0x1000
+            0x0F, 0x05, // syscall @ 0x1007
             0x31, 0xC0, // xor eax, eax
             0xBA, 0x01, 0x00, 0x00, 0x00, // mov edx, 1
         ];
-        let original_prefix = code[..7].to_vec();
-        let syscall_offset = 7usize;
 
-        let trampoline = patch_code_segment(&mut code, 0x1000, 0x8000, 0x9000)
+        let trampoline = patch_code_segment(&mut code, 0x1000, 0x8000, 0x9000, &mut Vec::new())
             .expect("patch_code_segment should succeed");
 
         assert!(!trampoline.is_empty());
+        // The lea + syscall region (9 bytes starting at 0x1000) should now be a
+        // JMP to the trampoline followed by NOPs.
+        assert_eq!(code[0], 0xE9, "replace region should start with JMP rel32");
+        // The trampoline should contain the re-encoded lea with an adjusted
+        // RIP-relative displacement targeting the same absolute address.
+        // Original: lea targets 0x1007 + 0x10 = 0x1017.
+        // Re-encoded at 0x8000: displacement = 0x1017 - (0x8000 + 7) = -0x6FF0 = 0xFFFF9010
+        #[allow(clippy::cast_possible_truncation)]
+        let expected_disp: i32 = 0x1017_i64.wrapping_sub(0x8000 + 7) as i32;
         assert_eq!(
-            &code[..syscall_offset],
-            original_prefix.as_slice(),
-            "RIP-relative setup before syscall must stay in place"
-        );
-        assert_eq!(
-            code[syscall_offset], 0xE9,
-            "syscall site should jump to trampoline"
+            &trampoline[3..7],
+            &expected_disp.to_le_bytes(),
+            "re-encoded lea displacement should target the original address"
         );
     }
 
     #[test]
-    fn patch_code_segment_rejects_rip_relative_setup_on_both_sides_of_syscall() {
+    fn patch_code_segment_handles_rip_relative_on_both_sides_of_syscall() {
         let mut code = vec![
-            0x48, 0x8D, 0x35, 0x10, 0x00, 0x00, 0x00, // lea rsi, [rip + 0x10]
-            0x0F, 0x05, // syscall
+            0x48, 0x8D, 0x35, 0x10, 0x00, 0x00, 0x00, // lea rsi, [rip + 0x10] @ 0x1000
+            0x0F, 0x05, // syscall @ 0x1007
             0x48, 0x8D, 0x3D, 0x10, 0x00, 0x00, 0x00, // lea rdi, [rip + 0x10]
         ];
 
-        let err = patch_code_segment(&mut code, 0x1000, 0x8000, 0x9000)
-            .expect_err("patch_code_segment should reject RIP-relative copies on both sides");
-        assert!(matches!(err, Error::InsufficientBytesBeforeOrAfter(0x1007)));
+        let mut skipped = Vec::new();
+        let stubs = patch_code_segment(&mut code, 0x1000, 0x8000, 0x9000, &mut skipped)
+            .expect("patch_code_segment should succeed");
+        // The pre-syscall lea is re-encoded in the trampoline; the
+        // post-syscall lea stays in place (not overwritten).
+        assert!(!stubs.is_empty(), "should be patched via re-encoding");
+        assert_eq!(code[0], 0xE9, "replace region should start with JMP");
+        assert!(skipped.is_empty(), "nothing should be skipped");
+    }
+
+    #[test]
+    fn patch_code_segment_patches_all_syscalls_including_rip_relative() {
+        let mut code = vec![
+            // First syscall: patchable (3 nops before = 5 bytes total with syscall)
+            0x90, 0x90, 0x90, // nop; nop; nop
+            0x0F, 0x05, // syscall @ offset 3
+            0xC3, // ret
+            // Second syscall: RIP-relative before, now patchable via re-encoding
+            0x48, 0x8D, 0x35, 0x10, 0x00, 0x00, 0x00, // lea rsi, [rip+0x10]
+            0x0F, 0x05, // syscall @ offset 13
+            0x48, 0x8D, 0x3D, 0x10, 0x00, 0x00, 0x00, // lea rdi, [rip+0x10]
+        ];
+
+        let mut skipped = Vec::new();
+        let stubs = patch_code_segment(&mut code, 0x1000, 0x8000, 0x9000, &mut skipped).unwrap();
+
+        assert!(!stubs.is_empty(), "both syscalls should be patched");
+        assert_eq!(code[0], 0xE9, "first syscall site should be a JMP");
+        assert_eq!(
+            code[6], 0xE9,
+            "second syscall site (lea start) should be a JMP"
+        );
+        assert!(skipped.is_empty(), "nothing should be skipped");
     }
 }
 
@@ -378,11 +420,16 @@ mod tests {
 /// The trampoline stub bytes. The caller must copy them to
 /// `trampoline_write_vaddr`. Returns an empty `Vec` if no syscall
 /// instructions are found in `code`.
+///
+/// `skipped_addrs` receives the virtual addresses of any `syscall`
+/// instructions that could not be patched due to insufficient surrounding
+/// space. Those instructions remain as raw host syscalls in the output.
 pub fn patch_code_segment(
     code: &mut [u8],
     code_vaddr: u64,
     trampoline_write_vaddr: u64,
     syscall_entry_addr: u64,
+    skipped_addrs: &mut Vec<u64>,
 ) -> Result<Vec<u8>> {
     let arch = Arch::X86_64; // runtime patching is x86-64 only
 
@@ -406,6 +453,7 @@ pub fn patch_code_segment(
         syscall_entry_addr,
         None, // dl_sysinfo_int80 — not applicable on x86-64
         &mut trampoline_data,
+        skipped_addrs,
     ) {
         Ok(()) => Ok(trampoline_data),
         Err(Error::NoSyscallInstructionsFound) => Ok(Vec::new()),
@@ -514,6 +562,7 @@ fn hook_syscalls_in_section(
     syscall_entry_addr: u64,
     dl_sysinfo_int80: Option<u64>,
     trampoline_data: &mut Vec<u8>,
+    skipped_addrs: &mut Vec<u64>,
 ) -> Result<()> {
     let instructions = decode_section_instructions(arch, section_data, section_base_addr)?;
     let mut found_any = false;
@@ -564,7 +613,7 @@ fn hook_syscalls_in_section(
         }
 
         if replace_start.is_none() {
-            hook_syscall_and_after(
+            match hook_syscall_and_after(
                 arch,
                 control_transfer_targets,
                 section_base_addr,
@@ -574,7 +623,17 @@ fn hook_syscalls_in_section(
                 trampoline_data,
                 &instructions,
                 i,
-            )?;
+            ) {
+                Ok(()) => {}
+                Err(Error::InsufficientBytesBeforeOrAfter(_)) => {
+                    // Skip this syscall instruction and continue patching the
+                    // rest of the section.  The unpatched instruction will
+                    // execute as a raw host syscall, which the caller should
+                    // log so it can be investigated.
+                    skipped_addrs.push(inst.ip());
+                }
+                Err(e) => return Err(e),
+            }
             continue;
         }
 
@@ -588,29 +647,62 @@ fn hook_syscalls_in_section(
                     .take(i)
                     .skip_while(|prev_inst| prev_inst.ip() < replace_start),
             );
-        if copied_presyscall_insts_have_ip_rel_mem {
-            hook_syscall_and_after(
-                arch,
-                control_transfer_targets,
-                section_base_addr,
-                section_data,
-                trampoline_base_addr,
-                syscall_entry_addr,
-                trampoline_data,
-                &instructions,
-                i,
-            )?;
-            continue;
-        }
 
         let target_addr = trampoline_base_addr + trampoline_data.len() as u64;
 
-        // Copy the original instructions to the trampoline
+        // Copy the pre-syscall instructions to the trampoline.
+        // When any instruction has a RIP-relative memory operand, we
+        // re-encode them so the displacement targets the same absolute
+        // address from the new trampoline location.
         if replace_start < inst.ip() {
-            trampoline_data.extend_from_slice(
-                &section_data[usize::try_from(replace_start - section_base_addr).unwrap()
-                    ..usize::try_from(inst.ip() - section_base_addr).unwrap()],
-            );
+            if copied_presyscall_insts_have_ip_rel_mem {
+                let mut reencoded = Vec::new();
+                let mut ok = true;
+                let mut encoder = iced_x86::Encoder::new(64);
+                for pre_inst in instructions
+                    .iter()
+                    .take(i)
+                    .skip_while(|p| p.ip() < replace_start)
+                {
+                    let tramp_ip = target_addr + reencoded.len() as u64;
+                    if encoder.encode(pre_inst, tramp_ip).is_err() {
+                        ok = false;
+                        break;
+                    }
+                    let bytes = encoder.take_buffer();
+                    if bytes.len() != pre_inst.len() {
+                        ok = false;
+                        break;
+                    }
+                    reencoded.extend_from_slice(&bytes);
+                }
+                if !ok {
+                    match hook_syscall_and_after(
+                        arch,
+                        control_transfer_targets,
+                        section_base_addr,
+                        section_data,
+                        trampoline_base_addr,
+                        syscall_entry_addr,
+                        trampoline_data,
+                        &instructions,
+                        i,
+                    ) {
+                        Ok(()) => {}
+                        Err(Error::InsufficientBytesBeforeOrAfter(_)) => {
+                            skipped_addrs.push(inst.ip());
+                        }
+                        Err(e) => return Err(e),
+                    }
+                    continue;
+                }
+                trampoline_data.extend_from_slice(&reencoded);
+            } else {
+                trampoline_data.extend_from_slice(
+                    &section_data[usize::try_from(replace_start - section_base_addr).unwrap()
+                        ..usize::try_from(inst.ip() - section_base_addr).unwrap()],
+                );
+            }
         }
 
         let return_addr = inst.next_ip();
