@@ -1083,6 +1083,35 @@ mod layered {
         fs.close(&fd).expect("Failed to close dir");
     }
 
+    #[test]
+    fn read_link_falls_back_when_upper_reports_missing_component() {
+        use crate::fs::errors::ReadLinkError;
+
+        let litebox = LiteBox::new(MockPlatform::new());
+        let mut lower = in_mem::FileSystem::new(&litebox);
+        lower.with_root_privileges(|fs| {
+            fs.mkdir("/workspace", Mode::from_bits(0o755).unwrap())
+                .unwrap();
+            fs.mkdir("/workspace/repo", Mode::from_bits(0o755).unwrap())
+                .unwrap();
+        });
+        let fs = layered::FileSystem::new(
+            &litebox,
+            in_mem::FileSystem::new(&litebox),
+            lower,
+            layered::LayeringSemantics::LowerLayerWritableFiles,
+        );
+
+        assert_eq!(
+            fs.file_status("/workspace/repo").unwrap().file_type,
+            FileType::Directory
+        );
+        assert!(matches!(
+            fs.read_link("/workspace/repo"),
+            Err(ReadLinkError::NotASymlink)
+        ));
+    }
+
     /// Check that for the same file, even though it started as a lower-level file, writing to it
     /// successfully migrated it to an upper-level file, and converted the internal descriptors
     /// over, such that the expected semantics of being able to see the updated file are held.
