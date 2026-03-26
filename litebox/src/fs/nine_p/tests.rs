@@ -310,6 +310,11 @@ fn test_nine_p_mkdir_and_readdir() {
         names.contains(&"subdir"),
         "root should contain 'subdir', got: {names:?}"
     );
+    let subdir = entries
+        .iter()
+        .find(|e| e.name == "subdir")
+        .expect("root should classify subdir entry");
+    assert_eq!(subdir.file_type, crate::fs::FileType::Directory);
 
     // Read the subdirectory
     let fd = fs
@@ -327,6 +332,16 @@ fn test_nine_p_mkdir_and_readdir() {
         names.contains(&"file.txt"),
         "subdir should contain 'file.txt', got: {names:?}"
     );
+    let nested = entries
+        .iter()
+        .find(|e| e.name == "nested")
+        .expect("subdir should classify nested entry");
+    assert_eq!(nested.file_type, crate::fs::FileType::Directory);
+    let file = entries
+        .iter()
+        .find(|e| e.name == "file.txt")
+        .expect("subdir should classify file entry");
+    assert_eq!(file.file_type, crate::fs::FileType::RegularFile);
 }
 
 #[test]

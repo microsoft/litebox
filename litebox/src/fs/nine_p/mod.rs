@@ -1989,15 +1989,9 @@ impl<Platform: sync::RawSyncPrimitivesProvider, W: transport::Write> super::File
         let dir_entries: Vec<super::DirEntry> = entries
             .into_iter()
             .map(|e| {
-                let file_type = if e.typ == fcall::QidType::DIR.bits() {
-                    super::FileType::Directory
-                } else {
-                    super::FileType::RegularFile
-                };
-
                 Ok(super::DirEntry {
                     name: String::from_utf8_lossy(&e.name).into_owned(),
-                    file_type,
+                    file_type: Self::qid_type_to_file_type(e.qid.typ),
                     ino_info: Some(super::NodeInfo {
                         dev: DEVICE_ID,
                         ino: usize::try_from(e.qid.path).map_err(|_| Error::InvalidResponse)?,
