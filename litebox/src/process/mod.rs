@@ -18,7 +18,7 @@ use crate::event::{
     observer::Subject,
     wait::{WaitContext, Waker},
 };
-use crate::platform::RawMutex as RawMutexTrait;
+use crate::platform::{RawMutex as RawMutexTrait, TimeProvider};
 use crate::sync::{Mutex, RawSyncPrimitivesProvider, RwLock};
 use zerocopy::byteorder::{I32, LE, U32};
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
@@ -110,6 +110,89 @@ pub struct ProcessContext {
     pub exit_signal: i32,
     /// Current lifecycle state.
     pub state: ProcessState,
+}
+
+/// Blocking byte-stream reader for worker-exec stdio bridging.
+///
+/// Implementations are called in a loop from a bridge thread to transfer data
+/// from a guest byte stream (e.g., a unix socket) to a host pipe.
+pub trait WorkerExecStreamReader: Send + Sync + 'static {
+    /// Read up to `buf.len()` bytes, blocking until data is available.
+    /// Returns `Ok(0)` at EOF or `Err(())` on error.
+    fn read_blocking(&self, buf: &mut [u8]) -> Result<usize, ()>;
+}
+
+/// Blocking byte-stream writer for worker-exec stdio bridging.
+///
+/// Implementations are called in a loop from a bridge thread to transfer data
+/// from a host pipe into a guest byte stream (e.g., a unix socket).
+pub trait WorkerExecStreamWriter: Send + Sync + 'static {
+    /// Write `buf`, blocking until space is available.
+    /// Returns the number of bytes written, or `Err(())` on error.
+    fn write_blocking(&self, buf: &[u8]) -> Result<usize, ()>;
+}
+
+/// Worker-exec stdin binding for a host-process handoff.
+pub enum WorkerExecInputBinding<
+    FS: crate::fs::FileSystem + Send + Sync + 'static,
+    Platform: RawSyncPrimitivesProvider + TimeProvider,
+> {
+    /// Keep the existing worker stdin inherited from the parent host process.
+    Inherit,
+    /// Duplicate one of the parent host stdio fds onto worker stdin.
+    HostStdio { fd: i32 },
+    /// Explicitly close the worker stdin stream before exec.
+    Close,
+    /// Proxy worker stdin reads from an existing guest filesystem descriptor.
+    Fs {
+        fs: Arc<FS>,
+        fd: Arc<crate::fd::TypedFd<FS>>,
+    },
+    /// Proxy worker stdin reads from an existing guest pipe receiver.
+    Pipe {
+        pipes: crate::pipes::Pipes<Platform>,
+        fd: Arc<crate::fd::TypedFd<crate::pipes::Pipes<Platform>>>,
+    },
+    /// Proxy worker stdin from a guest byte stream (e.g., a unix socket).
+    Stream(Arc<dyn WorkerExecStreamReader>),
+}
+
+/// Worker-exec output binding for a host-process handoff.
+pub enum WorkerExecOutputBinding<
+    FS: crate::fs::FileSystem + Send + Sync + 'static,
+    Platform: RawSyncPrimitivesProvider + TimeProvider,
+> {
+    /// Keep the existing worker stream inherited from the parent host process.
+    Inherit,
+    /// Duplicate one of the parent host stdio fds onto this worker stream.
+    HostStdio { fd: i32 },
+    /// Explicitly close the worker stream before exec.
+    Close,
+    /// Proxy the worker stream into an existing guest filesystem descriptor.
+    Fs {
+        fs: Arc<FS>,
+        fd: Arc<crate::fd::TypedFd<FS>>,
+    },
+    /// Proxy the worker stream into an existing guest pipe sender.
+    Pipe {
+        pipes: crate::pipes::Pipes<Platform>,
+        fd: Arc<crate::fd::TypedFd<crate::pipes::Pipes<Platform>>>,
+    },
+    /// Proxy the worker stream into a guest byte stream (e.g., a unix socket).
+    Stream(Arc<dyn WorkerExecStreamWriter>),
+}
+
+/// Worker-exec stdio bindings for a host-process handoff.
+pub struct WorkerExecStdioBindings<
+    FS: crate::fs::FileSystem + Send + Sync + 'static,
+    Platform: RawSyncPrimitivesProvider + TimeProvider,
+> {
+    /// Binding for file descriptor 0.
+    pub stdin: WorkerExecInputBinding<FS, Platform>,
+    /// Binding for file descriptor 1.
+    pub stdout: WorkerExecOutputBinding<FS, Platform>,
+    /// Binding for file descriptor 2.
+    pub stderr: WorkerExecOutputBinding<FS, Platform>,
 }
 
 // ---------------------------------------------------------------------------

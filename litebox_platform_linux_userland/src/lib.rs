@@ -10,7 +10,7 @@
 use std::cell::Cell;
 use std::collections::{BTreeMap, VecDeque};
 use std::ffi::CString;
-use std::io::{Seek as _, Write as _};
+use std::io::{Read as _, Seek as _, Write as _};
 use std::os::fd::{AsRawFd as _, FromRawFd as _};
 use std::path::PathBuf;
 use std::sync::Mutex;
@@ -24,6 +24,7 @@ use litebox::platform::page_mgmt::{
     CowAllocationError, FixedAddressBehavior, MemoryRegionPermissions,
 };
 use litebox::platform::{ImmediatelyWokenUp, RawConstPointer as _};
+use litebox::process::{WorkerExecInputBinding, WorkerExecOutputBinding, WorkerExecStdioBindings};
 use litebox::shim::ContinueOperation;
 use litebox::utils::{ReinterpretSignedExt, ReinterpretUnsignedExt as _, TruncateExt};
 use litebox_common_linux::{
@@ -126,6 +127,59 @@ pub enum NetworkTransport {
     Ipc(std::os::fd::OwnedFd),
 }
 
+struct WorkerHostProcess {
+    result_fd: std::os::fd::OwnedFd,
+    bridge_threads: Vec<DetachedWorkerBridge>,
+}
+
+struct DetachedWorkerBridge {
+    handle: std::thread::JoinHandle<()>,
+    input_control: Option<WorkerInputBridgeControl>,
+}
+
+enum WorkerExecInputSource<FS: litebox::fs::FileSystem + Send + Sync + 'static> {
+    Fs {
+        fs: std::sync::Arc<FS>,
+        fd: std::sync::Arc<litebox::fd::TypedFd<FS>>,
+    },
+    Pipe {
+        pipes: litebox::pipes::Pipes<LinuxUserland>,
+        fd: std::sync::Arc<litebox::fd::TypedFd<litebox::pipes::Pipes<LinuxUserland>>>,
+    },
+    Stream(std::sync::Arc<dyn litebox::process::WorkerExecStreamReader>),
+}
+
+struct WorkerInputBridgeControl {
+    cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    thread_handle: Option<litebox::event::wait::ThreadHandle<LinuxUserland>>,
+}
+
+enum WorkerExecOutputSink<FS: litebox::fs::FileSystem + Send + Sync + 'static> {
+    Fs {
+        fs: std::sync::Arc<FS>,
+        fd: std::sync::Arc<litebox::fd::TypedFd<FS>>,
+    },
+    Pipe {
+        pipes: litebox::pipes::Pipes<LinuxUserland>,
+        fd: std::sync::Arc<litebox::fd::TypedFd<litebox::pipes::Pipes<LinuxUserland>>>,
+    },
+    Stream(std::sync::Arc<dyn litebox::process::WorkerExecStreamWriter>),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WorkerExecOutputGroupKey {
+    Fs(litebox::fd::DescriptorObjectId),
+    Pipe(litebox::fd::DescriptorObjectId),
+    /// Streams are never grouped — each gets its own bridge.
+    Stream(usize),
+}
+
+struct WorkerExecOutputGroup<FS: litebox::fs::FileSystem + Send + Sync + 'static> {
+    key: WorkerExecOutputGroupKey,
+    sink: WorkerExecOutputSink<FS>,
+    target_fds: Vec<libc::c_int>,
+}
+
 /// The userland Linux platform.
 ///
 /// This implements the main [`litebox::platform::Provider`] trait, i.e., implements all platform
@@ -166,8 +220,10 @@ pub struct LinuxUserland {
     /// Serialize worker-host spawns so internal inheritable fds do not leak
     /// across concurrent worker launches.
     worker_spawn_serial: Mutex<()>,
-    /// Result pipes for in-flight worker host processes, keyed by host PID.
-    worker_result_fds: std::sync::Mutex<BTreeMap<i32, std::os::fd::OwnedFd>>,
+    /// Result pipes and proxy threads for in-flight worker host processes, keyed by host PID.
+    worker_processes: std::sync::Mutex<BTreeMap<i32, WorkerHostProcess>>,
+    /// Detached bridge threads that may outlive the waited worker while descendants still hold stdio.
+    detached_worker_bridge_threads: std::sync::Mutex<Vec<DetachedWorkerBridge>>,
 }
 
 impl core::fmt::Debug for LinuxUserland {
@@ -615,6 +671,30 @@ mod partition_tests {
 }
 
 impl LinuxUserland {
+    fn reap_finished_worker_bridge_threads(&self) {
+        let finished = {
+            let mut detached = self.detached_worker_bridge_threads.lock().unwrap();
+            let mut finished = Vec::new();
+            let mut idx = 0;
+            while idx < detached.len() {
+                if let Some(input_control) = detached[idx].input_control.as_ref()
+                    && let Some(thread_handle) = &input_control.thread_handle
+                {
+                    thread_handle.interrupt();
+                }
+                if detached[idx].handle.is_finished() {
+                    finished.push(detached.swap_remove(idx));
+                } else {
+                    idx += 1;
+                }
+            }
+            finished
+        };
+        for bridge in finished {
+            let _ = bridge.handle.join();
+        }
+    }
+
     /// Create a new userland-Linux platform for use in `LiteBox`.
     ///
     /// Takes an optional tun device name (such as `"tun0"` or `"tun99"`) to connect networking (if
@@ -700,7 +780,8 @@ impl LinuxUserland {
             terminal_osc_pending: Mutex::new(TerminalOscPending::default()),
             worker_spawn_flags: std::sync::RwLock::new(Vec::new()),
             worker_spawn_serial: Mutex::new(()),
-            worker_result_fds: std::sync::Mutex::new(BTreeMap::new()),
+            worker_processes: std::sync::Mutex::new(BTreeMap::new()),
+            detached_worker_bridge_threads: std::sync::Mutex::new(Vec::new()),
         };
         Box::leak(Box::new(platform))
     }
@@ -973,8 +1054,8 @@ impl LinuxUserland {
     /// Panics only if `CString::new` fails on a NUL-free string literal,
     /// which cannot happen in practice.
     #[allow(clippy::too_many_arguments, clippy::similar_names)]
-    pub fn spawn_worker_host_for_exec(
-        &self,
+    pub fn spawn_worker_host_for_exec<FS>(
+        &'static self,
         guest_binary_path: &str,
         argv: &[alloc::ffi::CString],
         envp: &[alloc::ffi::CString],
@@ -987,7 +1068,11 @@ impl LinuxUserland {
         guest_egid: u32,
         guest_exec_image: &[u8],
         guest_interp_image: Option<(&str, &[u8])>,
-    ) -> Result<i32, i32> {
+        stdio: WorkerExecStdioBindings<FS, LinuxUserland>,
+    ) -> Result<i32, i32>
+    where
+        FS: litebox::fs::FileSystem + Send + Sync + 'static,
+    {
         use std::os::unix::ffi::OsStrExt;
 
         // SAFETY: `environ` is the standard C runtime global environment pointer.
@@ -996,12 +1081,15 @@ impl LinuxUserland {
         }
 
         let _spawn_guard = self.worker_spawn_serial.lock().unwrap();
+        self.reap_finished_worker_bridge_threads();
         let exec_image_fd = create_worker_exec_image_fd(guest_exec_image).map_err(|_| -1_i32)?;
         let (result_read_fd, result_write_fd) = create_worker_result_pipe().map_err(|_| -1_i32)?;
         let interp_image_fd = guest_interp_image
             .map(|(_, image)| create_worker_exec_image_fd(image))
             .transpose()
             .map_err(|_| -1_i32)?;
+        let host_stdio_temp_sources =
+            duplicate_host_stdio_sources_for_spawn(&stdio).map_err(|_| -1_i32)?;
 
         // Build the command line for the worker:
         //   /proc/self/exe -Z --worker-exec [extra_flags...] --cwd <cwd>
@@ -1072,13 +1160,156 @@ impl LinuxUserland {
             .chain(core::iter::once(core::ptr::null()))
             .collect();
 
+        let mut spawn_file_actions =
+            std::mem::MaybeUninit::<libc::posix_spawn_file_actions_t>::uninit();
+        if unsafe { libc::posix_spawn_file_actions_init(spawn_file_actions.as_mut_ptr()) } != 0 {
+            return Err(-1_i32);
+        }
+        struct FileActionsGuard(*mut libc::posix_spawn_file_actions_t);
+        impl Drop for FileActionsGuard {
+            fn drop(&mut self) {
+                // SAFETY: initialized via posix_spawn_file_actions_init in this scope.
+                unsafe {
+                    libc::posix_spawn_file_actions_destroy(self.0);
+                }
+            }
+        }
+        let file_actions_ptr = spawn_file_actions.as_mut_ptr();
+        let _file_actions_guard = FileActionsGuard(file_actions_ptr);
+
+        let input_source = collect_worker_exec_input_source(&stdio);
+        let mut output_groups = collect_worker_exec_output_groups(&stdio);
+        match &stdio.stdin {
+            WorkerExecInputBinding::HostStdio { fd } if *fd != 0 => {
+                let Some(source_idx) = worker_host_stdio_index(*fd) else {
+                    return Err(-1_i32);
+                };
+                let Some(source) = host_stdio_temp_sources[source_idx].as_ref() else {
+                    return Err(-1_i32);
+                };
+                let source_fd = source.as_raw_fd();
+                if unsafe { libc::posix_spawn_file_actions_adddup2(file_actions_ptr, source_fd, 0) }
+                    != 0
+                {
+                    return Err(-1_i32);
+                }
+            }
+            WorkerExecInputBinding::Close => {
+                if unsafe { libc::posix_spawn_file_actions_addclose(file_actions_ptr, 0) } != 0 {
+                    return Err(-1_i32);
+                }
+            }
+            _ => {}
+        }
+        let mut input_bridges = Vec::new();
+        let mut worker_input_read_fds = Vec::new();
+        if let Some(input_source) = input_source {
+            let (read_fd, write_fd) =
+                create_worker_stdio_pipe(false, false, None).map_err(|_| -1_i32)?;
+            if unsafe {
+                libc::posix_spawn_file_actions_adddup2(file_actions_ptr, read_fd.as_raw_fd(), 0)
+            } != 0
+                || unsafe {
+                    libc::posix_spawn_file_actions_addclose(file_actions_ptr, read_fd.as_raw_fd())
+                } != 0
+                || unsafe {
+                    libc::posix_spawn_file_actions_addclose(file_actions_ptr, write_fd.as_raw_fd())
+                } != 0
+            {
+                return Err(-1_i32);
+            }
+            worker_input_read_fds.push(read_fd);
+            input_bridges.push((input_source, write_fd));
+        }
+        for (fd_num, binding) in [(1, &stdio.stdout), (2, &stdio.stderr)] {
+            match binding {
+                WorkerExecOutputBinding::HostStdio { fd } if *fd != fd_num => {
+                    let Some(source_idx) = worker_host_stdio_index(*fd) else {
+                        return Err(-1_i32);
+                    };
+                    let Some(source) = host_stdio_temp_sources[source_idx].as_ref() else {
+                        return Err(-1_i32);
+                    };
+                    let source_fd = source.as_raw_fd();
+                    if unsafe {
+                        libc::posix_spawn_file_actions_adddup2(file_actions_ptr, source_fd, fd_num)
+                    } != 0
+                    {
+                        return Err(-1_i32);
+                    }
+                }
+                WorkerExecOutputBinding::Close => {
+                    if unsafe { libc::posix_spawn_file_actions_addclose(file_actions_ptr, fd_num) }
+                        != 0
+                    {
+                        return Err(-1_i32);
+                    }
+                }
+                _ => {}
+            }
+        }
+        for temp_fd in host_stdio_temp_sources.iter().flatten() {
+            if unsafe {
+                libc::posix_spawn_file_actions_addclose(file_actions_ptr, temp_fd.as_raw_fd())
+            } != 0
+            {
+                return Err(-1_i32);
+            }
+        }
+        let mut output_bridges = Vec::new();
+        let mut worker_output_write_fds = Vec::new();
+        for group in output_groups.drain(..) {
+            let (write_nonblocking, write_capacity) = match &group.sink {
+                WorkerExecOutputSink::Pipe { pipes, fd } => (
+                    pipes
+                        .get_flags(fd.as_ref())
+                        .map(|flags| flags.contains(litebox::pipes::Flags::NON_BLOCKING))
+                        .unwrap_or(false),
+                    pipes
+                        .writable_bytes(fd.as_ref())
+                        .ok()
+                        .filter(|capacity| supports_bridge_pipe_capacity(*capacity)),
+                ),
+                WorkerExecOutputSink::Fs { .. } | WorkerExecOutputSink::Stream(_) => (false, None),
+            };
+            if write_nonblocking && write_capacity.is_none() {
+                return Err(-1_i32);
+            }
+            let (read_fd, write_fd) =
+                create_worker_stdio_pipe(false, write_nonblocking, write_capacity)
+                    .map_err(|_| -1_i32)?;
+            for &target_fd in &group.target_fds {
+                if unsafe {
+                    libc::posix_spawn_file_actions_adddup2(
+                        file_actions_ptr,
+                        write_fd.as_raw_fd(),
+                        target_fd,
+                    )
+                } != 0
+                {
+                    return Err(-1_i32);
+                }
+            }
+            if unsafe {
+                libc::posix_spawn_file_actions_addclose(file_actions_ptr, write_fd.as_raw_fd())
+            } != 0
+                || unsafe {
+                    libc::posix_spawn_file_actions_addclose(file_actions_ptr, read_fd.as_raw_fd())
+                } != 0
+            {
+                return Err(-1_i32);
+            }
+            worker_output_write_fds.push(write_fd);
+            output_bridges.push((group.sink, read_fd));
+        }
+
         // The worker inherits the current host environment.
         let mut pid: libc::pid_t = 0;
         let ret = unsafe {
             libc::posix_spawn(
                 core::ptr::addr_of_mut!(pid),
                 spawn_argv[0].as_ptr(),
-                core::ptr::null(),
+                file_actions_ptr,
                 core::ptr::null(),
                 argv_ptrs.as_ptr().cast::<*mut libc::c_char>(),
                 environ.cast::<*mut libc::c_char>(),
@@ -1087,10 +1318,40 @@ impl LinuxUserland {
         if ret != 0 {
             return Err(ret);
         }
-        self.worker_result_fds
-            .lock()
-            .unwrap()
-            .insert(pid, result_read_fd);
+        drop(worker_input_read_fds);
+        drop(worker_output_write_fds);
+        drop(host_stdio_temp_sources);
+        let mut bridge_threads = Vec::new();
+        for (source, write_fd) in input_bridges {
+            let bridge = match spawn_worker_input_bridge(self, source, write_fd) {
+                Ok(bridge) => bridge,
+                Err(_) => {
+                    terminate_worker_after_bridge_spawn_failure(self, pid, bridge_threads);
+                    return Err(-1_i32);
+                }
+            };
+            bridge_threads.push(bridge);
+        }
+        for (sink, read_fd) in output_bridges {
+            let bridge = match spawn_worker_output_bridge(self, sink, read_fd) {
+                Ok(handle) => DetachedWorkerBridge {
+                    handle,
+                    input_control: None,
+                },
+                Err(_) => {
+                    terminate_worker_after_bridge_spawn_failure(self, pid, bridge_threads);
+                    return Err(-1_i32);
+                }
+            };
+            bridge_threads.push(bridge);
+        }
+        self.worker_processes.lock().unwrap().insert(
+            pid,
+            WorkerHostProcess {
+                result_fd: result_read_fd,
+                bridge_threads,
+            },
+        );
         Ok(pid)
     }
 
@@ -1111,7 +1372,13 @@ impl LinuxUserland {
                     continue;
                 }
                 // Child doesn't exist or other error — treat as exit 127.
-                let _ = self.worker_result_fds.lock().unwrap().remove(&host_pid);
+                if let Some(worker) = self.worker_processes.lock().unwrap().remove(&host_pid) {
+                    self.detached_worker_bridge_threads
+                        .lock()
+                        .unwrap()
+                        .extend(worker.bridge_threads);
+                    self.reap_finished_worker_bridge_threads();
+                }
                 return 127;
             }
             break;
@@ -1123,11 +1390,21 @@ impl LinuxUserland {
         } else {
             127
         };
-        let result_fd = self.worker_result_fds.lock().unwrap().remove(&host_pid);
-        if let Some(result_fd) = result_fd
-            && let Some(wait_status) = read_worker_result_fd(result_fd)
-        {
-            return wait_status;
+        let worker = self.worker_processes.lock().unwrap().remove(&host_pid);
+        if let Some(worker) = worker {
+            let WorkerHostProcess {
+                result_fd,
+                bridge_threads,
+            } = worker;
+            let wait_status = read_worker_result_fd(result_fd);
+            self.detached_worker_bridge_threads
+                .lock()
+                .unwrap()
+                .extend(bridge_threads);
+            self.reap_finished_worker_bridge_threads();
+            if let Some(wait_status) = wait_status {
+                return wait_status;
+            }
         }
         fallback_status
     }
@@ -1203,6 +1480,90 @@ impl LinuxUserland {
     }
 }
 
+fn move_fd_away_from_stdio(fd: std::os::fd::OwnedFd) -> std::io::Result<std::os::fd::OwnedFd> {
+    if fd.as_raw_fd() > 2 {
+        return Ok(fd);
+    }
+    let fd_flags = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFD) };
+    if fd_flags < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let new_raw_fd = unsafe {
+        libc::fcntl(
+            fd.as_raw_fd(),
+            if fd_flags & libc::FD_CLOEXEC != 0 {
+                libc::F_DUPFD_CLOEXEC
+            } else {
+                libc::F_DUPFD
+            },
+            3,
+        )
+    };
+    if new_raw_fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    drop(fd);
+    Ok(unsafe { std::os::fd::OwnedFd::from_raw_fd(new_raw_fd) })
+}
+
+fn duplicate_host_stdio_fd_for_spawn(source_fd: i32) -> std::io::Result<std::os::fd::OwnedFd> {
+    let new_raw_fd = unsafe { libc::fcntl(source_fd, libc::F_DUPFD_CLOEXEC, 3) };
+    if new_raw_fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(unsafe { std::os::fd::OwnedFd::from_raw_fd(new_raw_fd) })
+}
+
+fn worker_host_stdio_index(fd: i32) -> Option<usize> {
+    match fd {
+        0..=2 => usize::try_from(fd).ok(),
+        _ => None,
+    }
+}
+
+fn duplicate_host_stdio_sources_for_spawn<FS>(
+    stdio: &WorkerExecStdioBindings<FS, LinuxUserland>,
+) -> std::io::Result<[Option<std::os::fd::OwnedFd>; 3]>
+where
+    FS: litebox::fs::FileSystem + Send + Sync + 'static,
+{
+    let mut needed_sources = [false; 3];
+    for source_fd in [
+        match &stdio.stdin {
+            WorkerExecInputBinding::HostStdio { fd } => Some(*fd),
+            _ => None,
+        },
+        match &stdio.stdout {
+            WorkerExecOutputBinding::HostStdio { fd } => Some(*fd),
+            _ => None,
+        },
+        match &stdio.stderr {
+            WorkerExecOutputBinding::HostStdio { fd } => Some(*fd),
+            _ => None,
+        },
+    ]
+    .into_iter()
+    .flatten()
+    {
+        let Some(source_idx) = worker_host_stdio_index(source_fd) else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "worker HostStdio fd must be 0, 1, or 2",
+            ));
+        };
+        needed_sources[source_idx] = true;
+    }
+    let mut temp_sources: [Option<std::os::fd::OwnedFd>; 3] = [None, None, None];
+    for (source_fd, needed) in needed_sources.into_iter().enumerate() {
+        if needed {
+            temp_sources[source_fd] = Some(duplicate_host_stdio_fd_for_spawn(
+                i32::try_from(source_fd).unwrap(),
+            )?);
+        }
+    }
+    Ok(temp_sources)
+}
+
 fn create_worker_exec_image_fd(guest_exec_image: &[u8]) -> std::io::Result<std::os::fd::OwnedFd> {
     let name = CString::new("litebox-worker-exec").unwrap();
     let raw_fd = unsafe { libc::memfd_create(name.as_ptr(), 0) };
@@ -1212,7 +1573,7 @@ fn create_worker_exec_image_fd(guest_exec_image: &[u8]) -> std::io::Result<std::
     let mut file = unsafe { std::fs::File::from_raw_fd(raw_fd) };
     file.write_all(guest_exec_image)?;
     file.seek(std::io::SeekFrom::Start(0))?;
-    Ok(file.into())
+    move_fd_away_from_stdio(file.into())
 }
 
 fn create_worker_result_pipe() -> std::io::Result<(std::os::fd::OwnedFd, std::os::fd::OwnedFd)> {
@@ -1237,7 +1598,501 @@ fn create_worker_result_pipe() -> std::io::Result<(std::os::fd::OwnedFd, std::os
     {
         return Err(std::io::Error::last_os_error());
     }
+    Ok((
+        move_fd_away_from_stdio(read_fd)?,
+        move_fd_away_from_stdio(write_fd)?,
+    ))
+}
+
+fn update_fd_nonblocking(fd: &std::os::fd::OwnedFd, nonblocking: bool) -> std::io::Result<()> {
+    let flags = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFL) };
+    if flags < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let new_flags = if nonblocking {
+        flags | libc::O_NONBLOCK
+    } else {
+        flags & !libc::O_NONBLOCK
+    };
+    if unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFL, new_flags) } < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+fn host_pipe_capacity_granularity() -> usize {
+    let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    usize::try_from(page_size)
+        .ok()
+        .filter(|size| *size > 0)
+        .unwrap_or(4096)
+}
+
+fn supports_bridge_pipe_capacity(capacity: usize) -> bool {
+    capacity >= host_pipe_capacity_granularity()
+}
+
+fn set_pipe_capacity(fd: &std::os::fd::OwnedFd, capacity: usize) -> std::io::Result<usize> {
+    let requested = i32::try_from(capacity).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "requested pipe capacity does not fit in i32",
+        )
+    })?;
+    let actual = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETPIPE_SZ, requested) };
+    if actual < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    usize::try_from(actual)
+        .map_err(|_| std::io::Error::other("host pipe capacity did not fit in usize"))
+}
+
+fn set_pipe_capacity_at_most(fd: &std::os::fd::OwnedFd, limit: usize) -> std::io::Result<()> {
+    let granularity = host_pipe_capacity_granularity();
+    let mut requested = limit / granularity * granularity;
+
+    while requested >= granularity {
+        let actual = set_pipe_capacity(fd, requested)?;
+        if actual <= limit {
+            return Ok(());
+        }
+        requested = requested.saturating_sub(granularity);
+    }
+
+    Err(std::io::Error::other(
+        "host pipe capacity cannot be constrained to the guest writable space",
+    ))
+}
+
+fn create_worker_stdio_pipe(
+    read_nonblocking: bool,
+    write_nonblocking: bool,
+    write_capacity: Option<usize>,
+) -> std::io::Result<(std::os::fd::OwnedFd, std::os::fd::OwnedFd)> {
+    let mut fds = [0; 2];
+    if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let read_fd = unsafe { std::os::fd::OwnedFd::from_raw_fd(fds[0]) };
+    let write_fd = unsafe { std::os::fd::OwnedFd::from_raw_fd(fds[1]) };
+    let read_fd = move_fd_away_from_stdio(read_fd)?;
+    let write_fd = move_fd_away_from_stdio(write_fd)?;
+    if let Some(write_capacity) = write_capacity {
+        set_pipe_capacity_at_most(&write_fd, write_capacity)?;
+    }
+    update_fd_nonblocking(&read_fd, read_nonblocking)?;
+    update_fd_nonblocking(&write_fd, write_nonblocking)?;
     Ok((read_fd, write_fd))
+}
+
+fn collect_worker_exec_input_source<FS>(
+    stdio: &WorkerExecStdioBindings<FS, LinuxUserland>,
+) -> Option<WorkerExecInputSource<FS>>
+where
+    FS: litebox::fs::FileSystem + Send + Sync + 'static,
+{
+    match &stdio.stdin {
+        WorkerExecInputBinding::Fs { fs, fd } => Some(WorkerExecInputSource::Fs {
+            fs: fs.clone(),
+            fd: fd.clone(),
+        }),
+        WorkerExecInputBinding::Pipe { pipes, fd } => Some(WorkerExecInputSource::Pipe {
+            pipes: pipes.clone(),
+            fd: fd.clone(),
+        }),
+        WorkerExecInputBinding::Stream(reader) => {
+            Some(WorkerExecInputSource::Stream(reader.clone()))
+        }
+        WorkerExecInputBinding::Inherit
+        | WorkerExecInputBinding::HostStdio { .. }
+        | WorkerExecInputBinding::Close => None,
+    }
+}
+
+fn collect_worker_exec_output_groups<FS>(
+    stdio: &WorkerExecStdioBindings<FS, LinuxUserland>,
+) -> Vec<WorkerExecOutputGroup<FS>>
+where
+    FS: litebox::fs::FileSystem + Send + Sync + 'static,
+{
+    let mut groups: Vec<WorkerExecOutputGroup<FS>> = Vec::new();
+    for (target_fd, binding) in [(1, &stdio.stdout), (2, &stdio.stderr)] {
+        let (key, sink) = match binding {
+            WorkerExecOutputBinding::Fs { fs, fd } => (
+                WorkerExecOutputGroupKey::Fs(fd.object_id()),
+                WorkerExecOutputSink::Fs {
+                    fs: fs.clone(),
+                    fd: fd.clone(),
+                },
+            ),
+            WorkerExecOutputBinding::Pipe { pipes, fd } => (
+                WorkerExecOutputGroupKey::Pipe(fd.object_id()),
+                WorkerExecOutputSink::Pipe {
+                    pipes: pipes.clone(),
+                    fd: fd.clone(),
+                },
+            ),
+            WorkerExecOutputBinding::Stream(writer) => (
+                WorkerExecOutputGroupKey::Stream(target_fd as usize),
+                WorkerExecOutputSink::Stream(writer.clone()),
+            ),
+            WorkerExecOutputBinding::Inherit
+            | WorkerExecOutputBinding::HostStdio { .. }
+            | WorkerExecOutputBinding::Close => continue,
+        };
+        if let Some(existing) = groups.iter_mut().find(|group| group.key == key) {
+            existing.target_fds.push(target_fd);
+        } else {
+            groups.push(WorkerExecOutputGroup {
+                key,
+                sink,
+                target_fds: vec![target_fd],
+            });
+        }
+    }
+    groups
+}
+
+fn spawn_worker_input_bridge<FS>(
+    platform: &'static LinuxUserland,
+    source: WorkerExecInputSource<FS>,
+    host_write_fd: std::os::fd::OwnedFd,
+) -> std::io::Result<DetachedWorkerBridge>
+where
+    FS: litebox::fs::FileSystem + Send + Sync + 'static,
+{
+    let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    match source {
+        WorkerExecInputSource::Fs { fs, fd } => {
+            let thread_cancel = cancel.clone();
+            Ok(DetachedWorkerBridge {
+                handle: std::thread::Builder::new().spawn(move || {
+                    bridge_worker_input_from_fs(fs, fd, host_write_fd, thread_cancel)
+                })?,
+                input_control: Some(WorkerInputBridgeControl {
+                    cancel,
+                    thread_handle: None,
+                }),
+            })
+        }
+        WorkerExecInputSource::Pipe { pipes, fd } => {
+            let thread_cancel = cancel.clone();
+            let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+            let handle = std::thread::Builder::new().spawn(move || {
+                bridge_worker_input_from_pipe(
+                    platform,
+                    pipes,
+                    fd,
+                    host_write_fd,
+                    thread_cancel,
+                    sender,
+                )
+            })?;
+            let thread_handle = receiver.recv().ok();
+            Ok(DetachedWorkerBridge {
+                handle,
+                input_control: Some(WorkerInputBridgeControl {
+                    cancel,
+                    thread_handle,
+                }),
+            })
+        }
+        WorkerExecInputSource::Stream(reader) => {
+            let thread_cancel = cancel.clone();
+            Ok(DetachedWorkerBridge {
+                handle: std::thread::Builder::new().spawn(move || {
+                    bridge_worker_input_from_stream(reader, host_write_fd, thread_cancel)
+                })?,
+                input_control: Some(WorkerInputBridgeControl {
+                    cancel,
+                    thread_handle: None,
+                }),
+            })
+        }
+    }
+}
+
+fn spawn_worker_output_bridge<FS>(
+    platform: &'static LinuxUserland,
+    sink: WorkerExecOutputSink<FS>,
+    host_read_fd: std::os::fd::OwnedFd,
+) -> std::io::Result<std::thread::JoinHandle<()>>
+where
+    FS: litebox::fs::FileSystem + Send + Sync + 'static,
+{
+    std::thread::Builder::new().spawn(move || match sink {
+        WorkerExecOutputSink::Fs { fs, fd } => bridge_worker_output_to_fs(fs, fd, host_read_fd),
+        WorkerExecOutputSink::Pipe { pipes, fd } => {
+            bridge_worker_output_to_pipe(platform, pipes, fd, host_read_fd)
+        }
+        WorkerExecOutputSink::Stream(writer) => {
+            bridge_worker_output_to_stream(writer, host_read_fd)
+        }
+    })
+}
+
+fn write_worker_stdio_all(host_write: &mut std::fs::File, mut buf: &[u8]) -> bool {
+    while !buf.is_empty() {
+        match host_write.write(buf) {
+            Ok(0) => return false,
+            Ok(written) => buf = &buf[written..],
+            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(err) if err.kind() == std::io::ErrorKind::BrokenPipe => return false,
+            Err(_) => return false,
+        }
+    }
+    true
+}
+
+fn worker_stdio_pipe_has_readers(host_write: &std::fs::File) -> bool {
+    let mut pollfd = libc::pollfd {
+        fd: host_write.as_raw_fd(),
+        events: libc::POLLOUT,
+        revents: 0,
+    };
+    let ret = unsafe { libc::poll(core::ptr::addr_of_mut!(pollfd), 1, 0) };
+    ret >= 0 && (pollfd.revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL)) == 0
+}
+
+fn cancel_worker_input_bridges(bridges: &[DetachedWorkerBridge]) {
+    for bridge in bridges {
+        let Some(control) = bridge.input_control.as_ref() else {
+            continue;
+        };
+        control
+            .cancel
+            .store(true, std::sync::atomic::Ordering::Release);
+        if let Some(thread_handle) = &control.thread_handle {
+            thread_handle.interrupt();
+        }
+    }
+}
+
+fn terminate_worker_after_bridge_spawn_failure(
+    platform: &'static LinuxUserland,
+    pid: libc::pid_t,
+    bridge_threads: Vec<DetachedWorkerBridge>,
+) {
+    cancel_worker_input_bridges(&bridge_threads);
+    // SAFETY: best-effort cleanup of a worker process we just spawned and still own.
+    unsafe {
+        libc::kill(pid, libc::SIGKILL);
+    }
+    let mut status = 0;
+    // SAFETY: best-effort reap of the worker process on the error path.
+    unsafe {
+        libc::waitpid(pid, &mut status, 0);
+    }
+    platform
+        .detached_worker_bridge_threads
+        .lock()
+        .unwrap()
+        .extend(bridge_threads);
+    platform.reap_finished_worker_bridge_threads();
+}
+
+fn bridge_worker_input_from_fs<FS>(
+    fs: std::sync::Arc<FS>,
+    fd: std::sync::Arc<litebox::fd::TypedFd<FS>>,
+    host_write_fd: std::os::fd::OwnedFd,
+    cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) where
+    FS: litebox::fs::FileSystem + Send + Sync + 'static,
+{
+    let mut host_write = std::fs::File::from(host_write_fd);
+    let mut buf = [0_u8; 8192];
+    loop {
+        if cancel.load(std::sync::atomic::Ordering::Acquire) {
+            break;
+        }
+        if !worker_stdio_pipe_has_readers(&host_write) {
+            break;
+        }
+        match fs.read(fd.as_ref(), &mut buf, None) {
+            Ok(0) => break,
+            Ok(read) => {
+                if !write_worker_stdio_all(&mut host_write, &buf[..read]) {
+                    break;
+                }
+            }
+            Err(litebox::fs::errors::ReadError::Interrupted) => continue,
+            Err(litebox::fs::errors::ReadError::WouldBlock) => {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            Err(_) => break,
+        }
+    }
+}
+
+fn bridge_worker_input_from_pipe(
+    platform: &'static LinuxUserland,
+    pipes: litebox::pipes::Pipes<LinuxUserland>,
+    fd: std::sync::Arc<litebox::fd::TypedFd<litebox::pipes::Pipes<LinuxUserland>>>,
+    host_write_fd: std::os::fd::OwnedFd,
+    cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    thread_handle_sender: std::sync::mpsc::SyncSender<
+        litebox::event::wait::ThreadHandle<LinuxUserland>,
+    >,
+) {
+    ThreadHandle::run_with_handle(|| {
+        let mut host_write = std::fs::File::from(host_write_fd);
+        let wait_state = litebox::event::wait::WaitState::new(platform);
+        let _ = thread_handle_sender.send(wait_state.thread_handle());
+        let cx = wait_state.context();
+        let mut buf = [0_u8; 8192];
+        loop {
+            if cancel.load(std::sync::atomic::Ordering::Acquire) {
+                break;
+            }
+            if !worker_stdio_pipe_has_readers(&host_write) {
+                break;
+            }
+            match pipes.read(&cx, fd.as_ref(), &mut buf) {
+                Ok(0) => break,
+                Ok(read) => {
+                    if !write_worker_stdio_all(&mut host_write, &buf[..read]) {
+                        break;
+                    }
+                }
+                Err(litebox::pipes::errors::ReadError::WaitError(
+                    litebox::event::wait::WaitError::Interrupted,
+                )) => {
+                    if cancel.load(std::sync::atomic::Ordering::Acquire) {
+                        break;
+                    }
+                    continue;
+                }
+                Err(litebox::pipes::errors::ReadError::WouldBlock) => std::thread::yield_now(),
+                Err(_) => break,
+            }
+        }
+    });
+}
+
+fn bridge_worker_output_to_fs<FS>(
+    fs: std::sync::Arc<FS>,
+    fd: std::sync::Arc<litebox::fd::TypedFd<FS>>,
+    host_read_fd: std::os::fd::OwnedFd,
+) where
+    FS: litebox::fs::FileSystem + Send + Sync + 'static,
+{
+    let mut host_read = std::fs::File::from(host_read_fd);
+    let mut buf = [0_u8; 8192];
+    loop {
+        match host_read.read(&mut buf) {
+            Ok(0) => break,
+            Ok(mut remaining) => {
+                let mut offset = 0;
+                while remaining > 0 {
+                    match fs.write(fd.as_ref(), &buf[offset..offset + remaining], None) {
+                        Ok(0) => return,
+                        Ok(written) => {
+                            offset += written;
+                            remaining -= written;
+                        }
+                        Err(litebox::fs::errors::WriteError::Interrupted) => continue,
+                        Err(_) => return,
+                    }
+                }
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => break,
+        }
+    }
+}
+
+fn bridge_worker_output_to_pipe(
+    platform: &'static LinuxUserland,
+    pipes: litebox::pipes::Pipes<LinuxUserland>,
+    fd: std::sync::Arc<litebox::fd::TypedFd<litebox::pipes::Pipes<LinuxUserland>>>,
+    host_read_fd: std::os::fd::OwnedFd,
+) {
+    let mut host_read = std::fs::File::from(host_read_fd);
+    let wait_state = litebox::event::wait::WaitState::new(platform);
+    let cx = wait_state.context();
+    let mut buf = [0_u8; 8192];
+    loop {
+        match host_read.read(&mut buf) {
+            Ok(0) => break,
+            Ok(mut remaining) => {
+                let mut offset = 0;
+                while remaining > 0 {
+                    match pipes.write(&cx, fd.as_ref(), &buf[offset..offset + remaining]) {
+                        Ok(0) => return,
+                        Ok(written) => {
+                            offset += written;
+                            remaining -= written;
+                        }
+                        Err(litebox::pipes::errors::WriteError::WouldBlock) => {
+                            std::thread::sleep(Duration::from_millis(1));
+                        }
+                        Err(litebox::pipes::errors::WriteError::WaitError(
+                            litebox::event::wait::WaitError::Interrupted,
+                        )) => {
+                            std::thread::sleep(Duration::from_millis(1));
+                        }
+                        Err(_) => return,
+                    }
+                }
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => break,
+        }
+    }
+}
+
+fn bridge_worker_input_from_stream(
+    reader: std::sync::Arc<dyn litebox::process::WorkerExecStreamReader>,
+    host_write_fd: std::os::fd::OwnedFd,
+    cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) {
+    let mut host_write = std::fs::File::from(host_write_fd);
+    let mut buf = [0_u8; 8192];
+    loop {
+        if cancel.load(std::sync::atomic::Ordering::Acquire) {
+            break;
+        }
+        if !worker_stdio_pipe_has_readers(&host_write) {
+            break;
+        }
+        match reader.read_blocking(&mut buf) {
+            Ok(0) => break,
+            Ok(read) => {
+                if !write_worker_stdio_all(&mut host_write, &buf[..read]) {
+                    break;
+                }
+            }
+            Err(()) => break,
+        }
+    }
+}
+
+fn bridge_worker_output_to_stream(
+    writer: std::sync::Arc<dyn litebox::process::WorkerExecStreamWriter>,
+    host_read_fd: std::os::fd::OwnedFd,
+) {
+    let mut host_read = std::fs::File::from(host_read_fd);
+    let mut buf = [0_u8; 8192];
+    loop {
+        match host_read.read(&mut buf) {
+            Ok(0) => break,
+            Ok(mut remaining) => {
+                let mut offset = 0;
+                while remaining > 0 {
+                    match writer.write_blocking(&buf[offset..offset + remaining]) {
+                        Ok(0) => return,
+                        Ok(written) => {
+                            offset += written;
+                            remaining -= written;
+                        }
+                        Err(()) => return,
+                    }
+                }
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => break,
+        }
+    }
 }
 
 fn read_worker_result_fd(result_fd: std::os::fd::OwnedFd) -> Option<i32> {
@@ -4489,6 +5344,7 @@ impl litebox::mm::linux::VmemPageFaultHandler for LinuxUserland {
 #[cfg(test)]
 mod tests {
     use core::sync::atomic::AtomicU32;
+    use std::os::fd::AsRawFd;
     use std::thread::sleep;
 
     use litebox::platform::{RawMutex, StdioProvider as _};
@@ -4606,5 +5462,27 @@ mod tests {
         assert_eq!(result.passthrough, b"\x1b]0;title\x07");
         assert!(result.injected_stdin.is_empty());
         assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn worker_host_stdio_index_accepts_only_stdio_range() {
+        assert_eq!(super::worker_host_stdio_index(0), Some(0));
+        assert_eq!(super::worker_host_stdio_index(1), Some(1));
+        assert_eq!(super::worker_host_stdio_index(2), Some(2));
+        assert_eq!(super::worker_host_stdio_index(-1), None);
+        assert_eq!(super::worker_host_stdio_index(3), None);
+    }
+
+    #[test]
+    fn worker_stdio_pipe_can_mark_child_write_end_nonblocking() {
+        let (_read_fd, write_fd) = super::create_worker_stdio_pipe(false, true, None)
+            .expect("worker stdio pipe should be created");
+        let flags = unsafe { libc::fcntl(write_fd.as_raw_fd(), libc::F_GETFL) };
+        assert!(flags >= 0, "F_GETFL should succeed");
+        assert_ne!(
+            flags & libc::O_NONBLOCK,
+            0,
+            "write end should be nonblocking"
+        );
     }
 }

@@ -1418,6 +1418,22 @@ impl<FS: ShimFS> UnixSocket<FS> {
         }
     }
 
+    /// Blocking write for worker-exec stdio bridging (no Task needed).
+    pub(crate) fn send_bytes(
+        &self,
+        cx: &WaitContext<'_, crate::Platform>,
+        buf: &[u8],
+    ) -> Result<usize, Errno> {
+        let is_nonblocking = self.get_status().contains(OFlags::NONBLOCK);
+        let timeout = self.options.lock().send_timeout;
+        match &self.inner {
+            UnixSocketInner::Stream(stream) => {
+                stream.sendto(cx, timeout, buf, is_nonblocking, None, false, Vec::new())
+            }
+            UnixSocketInner::Datagram(_) => Err(Errno::ENOTSUP),
+        }
+    }
+
     pub(super) fn recvfrom(
         &self,
         cx: &WaitContext<'_, crate::Platform>,

@@ -3,6 +3,7 @@
 
 //! Process/thread related syscalls.
 
+use crate::syscalls::file::get_file_descriptor_flags;
 use crate::{ConstPtr, MutPtr, ShimFS, Task, multihost::ExecRoute};
 use alloc::boxed::Box;
 use alloc::collections::btree_map::BTreeMap;
@@ -17,6 +18,7 @@ use litebox::event::wait::WaitError;
 use litebox::fs::OFlags;
 use litebox::mm::linux::PAGE_SIZE;
 use litebox::mm::linux::VmFlags;
+use litebox::pipes::HalfPipeType;
 use litebox::platform::PageManagementProvider;
 use litebox::platform::ThreadProvider;
 use litebox::platform::{Instant as _, SystemInfoProvider as _, SystemTime as _, TimeProvider};
@@ -28,6 +30,7 @@ use litebox::platform::{
 };
 use litebox::platform::{RawMutPointer as _, TimerHandle, TimerProvider};
 use litebox::process::ProcessId;
+use litebox::process::{WorkerExecInputBinding, WorkerExecOutputBinding, WorkerExecStdioBindings};
 use litebox::sync::Mutex;
 use litebox::utils::TruncateExt as _;
 use litebox_common_linux::{
@@ -1610,10 +1613,19 @@ impl<FS: ShimFS> Task<FS> {
         assert!(old.is_none());
         drop(dt);
 
-        self.files
+        let raw_fd = self
+            .files
             .borrow()
             .insert_raw_fd(typed)
-            .map_err(|_| Errno::EMFILE)
+            .map_err(|_| Errno::EMFILE)?;
+        litebox::log_println!(
+            self.global.platform,
+            "[STDIO-MAP] pid={} create fd={} kind=pidfd nonblock={}",
+            self.pid,
+            raw_fd,
+            flags & PIDFD_NONBLOCK != 0,
+        );
+        Ok(raw_fd)
     }
 
     pub(crate) fn sys_clone(
@@ -1676,6 +1688,18 @@ impl<FS: ShimFS> Task<FS> {
             stack,
             stack_size,
             clone3,
+        );
+
+        // Temporary unconditional clone/fork tracing for debugging Claude helper spawn.
+        litebox::log_println!(
+            self.global.platform,
+            "[CLONE-DBG] pid={} tid={} flags={:?} exit_signal={} clone3={} stack={:#x}",
+            self.pid,
+            self.tid,
+            flags,
+            exit_signal,
+            clone3,
+            stack,
         );
 
         if cgroup != 0 {
@@ -1906,6 +1930,17 @@ impl<FS: ShimFS> Task<FS> {
         clone3: bool,
     ) -> Result<usize, Errno> {
         use litebox::platform::AddressSpaceProvider;
+
+        // Temporary: log fork entry for debugging child stdio issues.
+        litebox::log_println!(
+            self.global.platform,
+            "[FORK-DBG] pid={} tid={} flags={:?} clone3={} is_vfork={}",
+            self.pid,
+            self.tid,
+            flags,
+            clone3,
+            flags.contains(CloneFlags::VM) && flags.contains(CloneFlags::VFORK),
+        );
 
         // Linux clone flag compatibility: CLONE_SIGHAND requires CLONE_VM,
         // and CLONE_THREAD requires CLONE_SIGHAND. Since the fork path has
@@ -2961,11 +2996,20 @@ impl<FS: ShimFS> Task<FS> {
                 // Convert between time domains. If the requested time is in the past,
                 // return the current time.
                 let current_time = self.gettime_as_duration(clock_id)?;
-                Ok(self
-                    .global
-                    .platform
-                    .now()
-                    .checked_add(duration.checked_sub(current_time).unwrap_or(Duration::ZERO)))
+                let remaining = duration.checked_sub(current_time).unwrap_or(Duration::ZERO);
+                // Temporary: log deadline computation for debugging Bun futex timeouts.
+                if remaining == Duration::ZERO && duration.as_secs() > 0 {
+                    litebox::log_println!(
+                        self.global.platform,
+                        "[DEADLINE-DBG] tid={} PAST deadline={}.{:09} current={}.{:09}",
+                        self.tid,
+                        duration.as_secs(),
+                        duration.subsec_nanos(),
+                        current_time.as_secs(),
+                        current_time.subsec_nanos(),
+                    );
+                }
+                Ok(self.global.platform.now().checked_add(remaining))
             }
         }
     }
@@ -3464,15 +3508,42 @@ impl<FS: ShimFS> Task<FS> {
                 timeout,
                 bitmask,
             } => {
-                let deadline = if let Some(timeout) = timeout.read()? {
+                let deadline = if let Some(timeout_dur) = timeout.read()? {
                     let clock_id =
                         if flags.contains(litebox_common_linux::FutexFlags::CLOCK_REALTIME) {
                             litebox_common_linux::ClockId::RealTime
                         } else {
                             litebox_common_linux::ClockId::Monotonic
                         };
-                    self.duration_since_epoch_to_deadline(clock_id, timeout)?
+                    let d = self.duration_since_epoch_to_deadline(clock_id, timeout_dur)?;
+                    // Temporary: log wait_bitset deadlines for debugging Bun futex timeouts.
+                    let clock_str =
+                        if flags.contains(litebox_common_linux::FutexFlags::CLOCK_REALTIME) {
+                            "realtime"
+                        } else {
+                            "monotonic"
+                        };
+                    litebox::log_println!(
+                        self.global.platform,
+                        "[FUTEX-DBG] tid={} wait_bitset addr={:#x} val={} clock={} timeout_secs={} deadline_some={} mask={:#x}",
+                        self.tid,
+                        addr.as_usize(),
+                        val,
+                        clock_str,
+                        timeout_dur.as_secs(),
+                        d.is_some(),
+                        bitmask,
+                    );
+                    d
                 } else {
+                    litebox::log_println!(
+                        self.global.platform,
+                        "[FUTEX-DBG] tid={} wait_bitset addr={:#x} val={} no_timeout mask={:#x}",
+                        self.tid,
+                        addr.as_usize(),
+                        val,
+                        bitmask,
+                    );
                     None
                 };
                 // FUTEX_WAIT_BITSET uses an absolute deadline, so
@@ -3623,15 +3694,28 @@ impl<FS: ShimFS> Task<FS> {
         guest_exec_image: &[u8],
         guest_interp_image: Option<(&str, &[u8])>,
     ) -> Result<usize, Errno> {
-        #[cfg(feature = "trace_syscalls")]
+        let argv_preview = argv
+            .iter()
+            .take(8)
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<alloc::vec::Vec<_>>();
         litebox::log_println!(
             self.global.platform,
-            "[EXEC-REMOTE] pid={} path={:?} — spawning worker host for non-PIE binary",
+            "[EXEC-REMOTE] pid={} path={:?} argv={:?} — spawning worker host for non-PIE binary",
             self.pid,
             path,
+            argv_preview,
         );
 
         let guest_cwd = self.fs.borrow().current_working_directory();
+        let worker_stdio = self.worker_exec_stdio_bindings().map_err(|err| {
+            litebox::log_println!(
+                self.global.platform,
+                "[EXEC-REMOTE] pid={} remote worker exec does not support the current stdio bindings",
+                self.pid,
+            );
+            err
+        })?;
         // Resolve the worker load path through the current guest filesystem so
         // transferred images materialize at their real lower-tree locations
         // rather than shadowing symlinked parents like /bin or /lib64.
@@ -3652,6 +3736,7 @@ impl<FS: ShimFS> Task<FS> {
                 self.credentials.egid,
                 guest_exec_image,
                 guest_interp_image,
+                worker_stdio,
             )
             .map_err(|err| {
                 litebox::log_println!(
@@ -3697,6 +3782,18 @@ impl<FS: ShimFS> Task<FS> {
         // guest code. Return ENOSYS as a placeholder — this path should
         // not be reached in practice.
         Err(Errno::ENOSYS)
+    }
+
+    fn worker_exec_stdio_bindings(&self) -> Result<WorkerExecStdioBindings<FS, Platform>, Errno> {
+        let files = self.files.borrow();
+        if worker_exec_has_unsupported_stdio(&self.global, &files) {
+            return Err(Errno::ENOTSUP);
+        }
+        Ok(WorkerExecStdioBindings {
+            stdin: worker_exec_input_binding(0, &self.global, &files),
+            stdout: worker_exec_output_binding(1, &self.global, &files),
+            stderr: worker_exec_output_binding(2, &self.global, &files),
+        })
     }
 
     /// Handle syscall `execve`.
@@ -4198,10 +4295,439 @@ impl<FS: ShimFS> Task<FS> {
     }
 }
 
+fn worker_exec_fd_survives_exec<FS: ShimFS>(
+    raw_fd: usize,
+    global: &crate::GlobalState<FS>,
+    files: &crate::syscalls::file::FilesState<FS>,
+) -> bool {
+    let alive = files.raw_descriptor_store.read().is_alive(raw_fd);
+    alive
+        && get_file_descriptor_flags(raw_fd, global, files)
+            .map(|flags| !flags.contains(FileDescriptorFlags::FD_CLOEXEC))
+            .unwrap_or(false)
+}
+
+fn worker_exec_has_unsupported_stdio<FS: ShimFS>(
+    global: &crate::GlobalState<FS>,
+    files: &crate::syscalls::file::FilesState<FS>,
+) -> bool {
+    [0, 1, 2]
+        .into_iter()
+        .any(|raw_fd| worker_exec_stdio_is_unsupported(raw_fd, global, files))
+}
+
+fn log_worker_exec_stdio_unsupported<FS: ShimFS>(
+    global: &crate::GlobalState<FS>,
+    raw_fd: usize,
+    reason: &str,
+) {
+    litebox::log_println!(
+        global.platform,
+        "[EXEC-REMOTE-STDIO] fd={} unsupported: {}",
+        raw_fd,
+        reason,
+    );
+}
+
+fn worker_exec_stdio_is_unsupported<FS: ShimFS>(
+    raw_fd: usize,
+    global: &crate::GlobalState<FS>,
+    files: &crate::syscalls::file::FilesState<FS>,
+) -> bool {
+    if !worker_exec_fd_survives_exec(raw_fd, global, files) {
+        return false;
+    }
+    let rds = files.raw_descriptor_store.read();
+    if let Ok(fd) = rds.fd_from_raw_integer::<litebox::pipes::Pipes<Platform>>(raw_fd) {
+        drop(rds);
+        let nonblocking = global
+            .pipes
+            .get_flags(fd.as_ref())
+            .map(|flags| flags.contains(litebox::pipes::Flags::NON_BLOCKING))
+            .unwrap_or(true);
+        return global
+            .pipes
+            .half_pipe_type(fd.as_ref())
+            .map(|half| match (raw_fd, half) {
+                (0, HalfPipeType::ReceiverHalf) => {
+                    if nonblocking {
+                        log_worker_exec_stdio_unsupported(
+                            global,
+                            raw_fd,
+                            "nonblocking pipe-backed stdin",
+                        );
+                    }
+                    nonblocking
+                }
+                (1 | 2, HalfPipeType::SenderHalf) => false,
+                _ => {
+                    log_worker_exec_stdio_unsupported(global, raw_fd, "wrong pipe direction");
+                    true
+                }
+            })
+            .unwrap_or_else(|_| {
+                log_worker_exec_stdio_unsupported(global, raw_fd, "closed pipe descriptor");
+                true
+            });
+    }
+    if let Ok(fd) = rds.fd_from_raw_integer::<FS>(raw_fd) {
+        drop(rds);
+        let status = files.fs.fd_file_status(fd.as_ref()).ok();
+        let open_flags = global
+            .litebox
+            .descriptor_table()
+            .with_metadata(fd.as_ref(), |crate::StdioStatusFlags(flags)| *flags)
+            .unwrap_or(OFlags::empty());
+        let access = open_flags & (OFlags::WRONLY | OFlags::RDWR);
+        if open_flags.contains(OFlags::PATH)
+            || (raw_fd == 0 && access == OFlags::WRONLY)
+            || (matches!(raw_fd, 1 | 2) && access == OFlags::empty())
+        {
+            let source_fd = worker_exec_host_stdio_source_fd(raw_fd, global, files, fd.as_ref());
+            litebox::log_println!(
+                global.platform,
+                "[EXEC-REMOTE-STDIO] fd={} unsupported fs access: object_id={} flags={:?} source_fd={:?}",
+                raw_fd,
+                fd.as_ref().object_id().as_u64(),
+                open_flags,
+                source_fd,
+            );
+            return true;
+        }
+        if let Some(source_fd) =
+            worker_exec_host_stdio_source_fd(raw_fd, global, files, fd.as_ref())
+        {
+            let unsupported = !worker_exec_host_stdio_direction_compatible(raw_fd, source_fd)
+                || (raw_fd == 0 && open_flags.contains(OFlags::NONBLOCK));
+            if unsupported {
+                let reason = if !worker_exec_host_stdio_direction_compatible(raw_fd, source_fd) {
+                    "host stdio alias points at the wrong direction"
+                } else {
+                    "nonblocking host-backed stdin"
+                };
+                log_worker_exec_stdio_unsupported(global, raw_fd, reason);
+            }
+            return unsupported;
+        }
+        let Some(status) = status else {
+            log_worker_exec_stdio_unsupported(global, raw_fd, "missing file status");
+            return true;
+        };
+        let unsupported = if status.file_type == litebox::fs::FileType::Directory {
+            Some("directory-backed stdio")
+        } else if worker_exec_stdio_needs_terminal_semantics(&status) {
+            Some("terminal-like device without explicit host alias")
+        } else {
+            None
+        };
+        if let Some(reason) = unsupported {
+            log_worker_exec_stdio_unsupported(global, raw_fd, reason);
+            return true;
+        }
+        return false;
+    }
+    if rds
+        .fd_from_raw_integer::<crate::Network<Platform>>(raw_fd)
+        .is_ok()
+    {
+        drop(rds);
+        log_worker_exec_stdio_unsupported(global, raw_fd, "network socket-backed stdio");
+        return true;
+    }
+    if let Ok(fd) = rds.fd_from_raw_integer::<crate::syscalls::eventfd::EventfdSubsystem>(raw_fd) {
+        let nonblocking = global
+            .litebox
+            .descriptor_table()
+            .entry_handle(&fd)
+            .map(|handle| handle.with_entry(|file| file.get_status().contains(OFlags::NONBLOCK)))
+            .unwrap_or(false);
+        drop(rds);
+        log_worker_exec_stdio_unsupported(
+            global,
+            raw_fd,
+            if nonblocking {
+                "eventfd-backed stdio (nonblocking)"
+            } else {
+                "eventfd-backed stdio (blocking)"
+            },
+        );
+        return true;
+    }
+    if rds
+        .fd_from_raw_integer::<crate::syscalls::epoll::EpollSubsystem<FS>>(raw_fd)
+        .is_ok()
+    {
+        drop(rds);
+        log_worker_exec_stdio_unsupported(global, raw_fd, "epoll-backed stdio");
+        return true;
+    }
+    if let Ok(fd) =
+        rds.fd_from_raw_integer::<crate::syscalls::unix::UnixSocketSubsystem<FS>>(raw_fd)
+    {
+        let nonblocking = global
+            .litebox
+            .descriptor_table()
+            .entry_handle(&fd)
+            .map(|handle| handle.with_entry(|file| file.get_status().contains(OFlags::NONBLOCK)))
+            .unwrap_or(false);
+        drop(rds);
+        if nonblocking {
+            log_worker_exec_stdio_unsupported(
+                global,
+                raw_fd,
+                "unix-socket-backed stdio (nonblocking)",
+            );
+            return true;
+        }
+        // Blocking unix sockets are supported via stream bridging.
+        return false;
+    }
+    drop(rds);
+    log_worker_exec_stdio_unsupported(global, raw_fd, "unknown descriptor subsystem");
+    true
+}
+
+fn worker_exec_stdio_needs_terminal_semantics(status: &litebox::fs::FileStatus) -> bool {
+    if status.file_type != litebox::fs::FileType::CharacterDevice {
+        return false;
+    }
+    match status.node_info.rdev.map(core::num::NonZero::get) {
+        Some(0x500) | Some(0x502) => true,
+        Some(rdev) if rdev >= 0x8800 => true,
+        _ => false,
+    }
+}
+
+fn worker_exec_tty_stdio_source_fd<FS: ShimFS>(
+    raw_fd: usize,
+    global: &crate::GlobalState<FS>,
+    fd: &litebox::fd::TypedFd<FS>,
+) -> Option<i32> {
+    // `/dev/tty` in LiteBox reads from host stdin and writes to host stdout.
+    // Preserve that same behavior across remote worker exec instead of treating
+    // the reopened terminal alias as an unsupported generic tty device.
+    global
+        .litebox
+        .descriptor_table()
+        .with_metadata(fd, |_alias: &crate::HostTtyAlias| ())
+        .ok()
+        .and_then(|()| match raw_fd {
+            0 => Some(0),
+            1 | 2 => Some(1),
+            _ => None,
+        })
+}
+
+fn worker_exec_host_stdio_source_fd<FS: ShimFS>(
+    raw_fd: usize,
+    global: &crate::GlobalState<FS>,
+    files: &crate::syscalls::file::FilesState<FS>,
+    fd: &litebox::fd::TypedFd<FS>,
+) -> Option<i32> {
+    global
+        .litebox
+        .descriptor_table()
+        .with_metadata(fd, |crate::HostStdioSourceFd(source_fd)| *source_fd)
+        .ok()
+        .or_else(|| worker_exec_tty_stdio_source_fd(raw_fd, global, fd))
+        .or_else(|| worker_exec_host_stdio_fd(files, fd.object_id()))
+}
+
+fn worker_exec_host_stdio_direction_compatible(raw_fd: usize, source_fd: i32) -> bool {
+    matches!((raw_fd, source_fd), (0, 0) | (1 | 2, 1 | 2))
+}
+
+fn worker_exec_host_stdio_fd<FS: ShimFS>(
+    files: &crate::syscalls::file::FilesState<FS>,
+    object_id: litebox::fd::DescriptorObjectId,
+) -> Option<i32> {
+    files
+        .host_stdio_object_ids
+        .read()
+        .iter()
+        .position(|candidate| *candidate == Some(object_id))
+        .and_then(|idx| i32::try_from(idx).ok())
+}
+
+fn worker_exec_input_binding<FS: ShimFS>(
+    raw_fd: usize,
+    global: &crate::GlobalState<FS>,
+    files: &crate::syscalls::file::FilesState<FS>,
+) -> WorkerExecInputBinding<FS, Platform> {
+    if !worker_exec_fd_survives_exec(raw_fd, global, files) {
+        return WorkerExecInputBinding::Close;
+    }
+
+    let rds = files.raw_descriptor_store.read();
+    if let Ok(fd) = rds.fd_from_raw_integer::<litebox::pipes::Pipes<Platform>>(raw_fd) {
+        drop(rds);
+        return match global.pipes.half_pipe_type(fd.as_ref()) {
+            Ok(HalfPipeType::ReceiverHalf) => WorkerExecInputBinding::Pipe {
+                pipes: global.pipes.clone(),
+                fd,
+            },
+            Ok(HalfPipeType::SenderHalf) | Err(_) => WorkerExecInputBinding::Close,
+        };
+    }
+    if let Ok(fd) =
+        rds.fd_from_raw_integer::<crate::syscalls::unix::UnixSocketSubsystem<FS>>(raw_fd)
+    {
+        drop(rds);
+        if let Some(handle) = global.litebox.descriptor_table().entry_handle(&fd) {
+            return WorkerExecInputBinding::Stream(Arc::new(UnixSocketStreamReader {
+                platform: global.platform,
+                handle,
+            }));
+        }
+        return WorkerExecInputBinding::Close;
+    }
+    if let Ok(fd) = rds.fd_from_raw_integer::<FS>(raw_fd) {
+        drop(rds);
+        let open_flags = global
+            .litebox
+            .descriptor_table()
+            .with_metadata(fd.as_ref(), |crate::StdioStatusFlags(flags)| *flags)
+            .unwrap_or(OFlags::empty());
+        let access = open_flags & (OFlags::WRONLY | OFlags::RDWR);
+        if open_flags.contains(OFlags::PATH) || access == OFlags::WRONLY {
+            return WorkerExecInputBinding::Close;
+        }
+        let source_fd = worker_exec_host_stdio_source_fd(raw_fd, global, files, fd.as_ref());
+        if let Some(source_fd) = source_fd {
+            if !worker_exec_host_stdio_direction_compatible(raw_fd, source_fd) {
+                return WorkerExecInputBinding::Close;
+            }
+            return if usize::try_from(source_fd).ok() == Some(raw_fd) {
+                WorkerExecInputBinding::Inherit
+            } else {
+                WorkerExecInputBinding::HostStdio { fd: source_fd }
+            };
+        }
+        WorkerExecInputBinding::Fs {
+            fs: files.fs.clone(),
+            fd,
+        }
+    } else {
+        WorkerExecInputBinding::Close
+    }
+}
+
+/// Blocking reader for a connected unix-socket FD, used by worker-exec
+/// stdio bridges.
+struct UnixSocketStreamReader<FS: ShimFS> {
+    platform: &'static Platform,
+    handle: litebox::fd::EntryHandle<Platform, crate::syscalls::unix::UnixSocketSubsystem<FS>>,
+}
+
+impl<FS: ShimFS> litebox::process::WorkerExecStreamReader for UnixSocketStreamReader<FS> {
+    fn read_blocking(&self, buf: &mut [u8]) -> Result<usize, ()> {
+        let wait_state = litebox::event::wait::WaitState::new(self.platform);
+        let cx = wait_state.context();
+        self.handle
+            .with_entry(|socket| {
+                socket.recvfrom(
+                    &cx,
+                    buf,
+                    litebox_common_linux::ReceiveFlags::empty(),
+                    None,
+                    &mut Vec::new(),
+                )
+            })
+            .map_err(|_| ())
+    }
+}
+
+/// Blocking writer for a connected unix-socket FD, used by worker-exec
+/// stdio bridges.
+struct UnixSocketStreamWriter<FS: ShimFS> {
+    platform: &'static Platform,
+    handle: litebox::fd::EntryHandle<Platform, crate::syscalls::unix::UnixSocketSubsystem<FS>>,
+}
+
+impl<FS: ShimFS> litebox::process::WorkerExecStreamWriter for UnixSocketStreamWriter<FS> {
+    fn write_blocking(&self, buf: &[u8]) -> Result<usize, ()> {
+        let wait_state = litebox::event::wait::WaitState::new(self.platform);
+        let cx = wait_state.context();
+        self.handle
+            .with_entry(|socket| socket.send_bytes(&cx, buf))
+            .map_err(|_| ())
+    }
+}
+
+fn worker_exec_output_binding<FS: ShimFS>(
+    raw_fd: usize,
+    global: &crate::GlobalState<FS>,
+    files: &crate::syscalls::file::FilesState<FS>,
+) -> WorkerExecOutputBinding<FS, Platform> {
+    if !worker_exec_fd_survives_exec(raw_fd, global, files) {
+        return WorkerExecOutputBinding::Close;
+    }
+
+    let rds = files.raw_descriptor_store.read();
+    if let Ok(fd) = rds.fd_from_raw_integer::<litebox::pipes::Pipes<Platform>>(raw_fd) {
+        drop(rds);
+        return match global.pipes.half_pipe_type(fd.as_ref()) {
+            Ok(HalfPipeType::SenderHalf) => WorkerExecOutputBinding::Pipe {
+                pipes: global.pipes.clone(),
+                fd,
+            },
+            Ok(HalfPipeType::ReceiverHalf) | Err(_) => WorkerExecOutputBinding::Close,
+        };
+    }
+    if let Ok(fd) =
+        rds.fd_from_raw_integer::<crate::syscalls::unix::UnixSocketSubsystem<FS>>(raw_fd)
+    {
+        drop(rds);
+        if let Some(handle) = global.litebox.descriptor_table().entry_handle(&fd) {
+            return WorkerExecOutputBinding::Stream(Arc::new(UnixSocketStreamWriter {
+                platform: global.platform,
+                handle,
+            }));
+        }
+        return WorkerExecOutputBinding::Close;
+    }
+    if let Ok(fd) = rds.fd_from_raw_integer::<FS>(raw_fd) {
+        drop(rds);
+        let open_flags = global
+            .litebox
+            .descriptor_table()
+            .with_metadata(fd.as_ref(), |crate::StdioStatusFlags(flags)| *flags)
+            .unwrap_or(OFlags::empty());
+        let access = open_flags & (OFlags::WRONLY | OFlags::RDWR);
+        if open_flags.contains(OFlags::PATH) || access == OFlags::empty() {
+            return WorkerExecOutputBinding::Close;
+        }
+        let source_fd = worker_exec_host_stdio_source_fd(raw_fd, global, files, fd.as_ref());
+        if let Some(source_fd) = source_fd {
+            if !worker_exec_host_stdio_direction_compatible(raw_fd, source_fd) {
+                return WorkerExecOutputBinding::Close;
+            }
+            return if usize::try_from(source_fd).ok() == Some(raw_fd) {
+                WorkerExecOutputBinding::Inherit
+            } else {
+                WorkerExecOutputBinding::HostStdio { fd: source_fd }
+            };
+        }
+        WorkerExecOutputBinding::Fs {
+            fs: files.fs.clone(),
+            fd,
+        }
+    } else {
+        WorkerExecOutputBinding::Close
+    }
+}
+
 #[cfg(test)]
 mod tests {
     extern crate std;
     use litebox::platform::RawConstPointer as _;
+
+    use litebox::fs::OFlags;
+    use litebox::process::WorkerExecInputBinding;
+    use litebox::process::WorkerExecOutputBinding;
+    use litebox_common_linux::EfdFlags;
+    use litebox_common_linux::FileDescriptorFlags;
+    use litebox_common_linux::errno::Errno;
 
     #[test]
     fn test_drop_skips_unmapped_clear_child_tid() {
@@ -5770,5 +6296,446 @@ mod tests {
             parse_shebang(b"#!/usr/bin/env\tpython3\n"),
             Some(("/usr/bin/env", Some("python3")))
         );
+    }
+
+    #[test]
+    fn worker_exec_stdio_bindings_forward_pipe_backed_stdout() {
+        let task = crate::syscalls::tests::init_platform(None);
+        let (_read_fd, write_fd) = task
+            .sys_pipe2(OFlags::empty())
+            .expect("pipe2 should succeed");
+        let write_fd = i32::try_from(write_fd).expect("pipe fd should fit in i32");
+        task.sys_dup(write_fd, Some(1), None)
+            .expect("dup2 onto stdout should succeed");
+
+        let bindings = task
+            .worker_exec_stdio_bindings()
+            .expect("stdio bindings should succeed");
+        match bindings.stdout {
+            WorkerExecOutputBinding::Pipe { .. } => {}
+            _ => panic!("stdout should be proxied through a worker pipe binding"),
+        }
+    }
+
+    #[test]
+    fn worker_exec_stdio_bindings_reject_read_end_on_stdout() {
+        let task = crate::syscalls::tests::init_platform(None);
+        let (read_fd, _write_fd) = task
+            .sys_pipe2(OFlags::empty())
+            .expect("pipe2 should succeed");
+        let read_fd = i32::try_from(read_fd).expect("pipe fd should fit in i32");
+        task.sys_dup(read_fd, Some(1), None)
+            .expect("dup2 onto stdout should succeed");
+
+        let err = match task.worker_exec_stdio_bindings() {
+            Ok(_) => panic!("stdout wired to a pipe read end should be rejected"),
+            Err(err) => err,
+        };
+        assert_eq!(err, Errno::ENOTSUP);
+    }
+
+    #[test]
+    fn worker_exec_stdio_bindings_preserve_nonblocking_pipe_backed_stdout() {
+        let task = crate::syscalls::tests::init_platform(None);
+        let (_read_fd, write_fd) = task
+            .sys_pipe2(OFlags::NONBLOCK)
+            .expect("pipe2 should succeed");
+        let write_fd = i32::try_from(write_fd).expect("pipe fd should fit in i32");
+        task.sys_dup(write_fd, Some(1), None)
+            .expect("dup2 onto stdout should succeed");
+
+        let bindings = task
+            .worker_exec_stdio_bindings()
+            .expect("nonblocking stdout pipe should be preserved for remote exec");
+        match bindings.stdout {
+            WorkerExecOutputBinding::Pipe { .. } => {}
+            _ => panic!("nonblocking stdout should still be proxied through a worker pipe binding"),
+        }
+    }
+
+    #[test]
+    fn worker_exec_stdio_bindings_forward_pipe_backed_stdin() {
+        let task = crate::syscalls::tests::init_platform(None);
+        let (read_fd, _write_fd) = task
+            .sys_pipe2(OFlags::empty())
+            .expect("pipe2 should succeed");
+        let read_fd = i32::try_from(read_fd).expect("pipe fd should fit in i32");
+        task.sys_dup(read_fd, Some(0), None)
+            .expect("dup2 onto stdin should succeed");
+
+        let bindings = task
+            .worker_exec_stdio_bindings()
+            .expect("stdio bindings should succeed");
+        match bindings.stdin {
+            WorkerExecInputBinding::Pipe { .. } => {}
+            _ => panic!("stdin should be proxied through a worker pipe binding"),
+        }
+    }
+
+    #[test]
+    fn worker_exec_stdio_bindings_reject_nonblocking_pipe_backed_stdin() {
+        let task = crate::syscalls::tests::init_platform(None);
+        let (read_fd, _write_fd) = task
+            .sys_pipe2(OFlags::NONBLOCK)
+            .expect("pipe2 should succeed");
+        let read_fd = i32::try_from(read_fd).expect("pipe fd should fit in i32");
+        task.sys_dup(read_fd, Some(0), None)
+            .expect("dup2 onto stdin should succeed");
+
+        let err = match task.worker_exec_stdio_bindings() {
+            Ok(_) => panic!("nonblocking pipe stdin should still be rejected"),
+            Err(err) => err,
+        };
+        assert_eq!(err, Errno::ENOTSUP);
+    }
+
+    #[test]
+    fn worker_exec_stdio_bindings_reject_write_end_on_stdin() {
+        let task = crate::syscalls::tests::init_platform(None);
+        let (_read_fd, write_fd) = task
+            .sys_pipe2(OFlags::empty())
+            .expect("pipe2 should succeed");
+        let write_fd = i32::try_from(write_fd).expect("pipe fd should fit in i32");
+        task.sys_dup(write_fd, Some(0), None)
+            .expect("dup2 onto stdin should succeed");
+
+        let err = match task.worker_exec_stdio_bindings() {
+            Ok(_) => panic!("stdin wired to a pipe write end should be rejected"),
+            Err(err) => err,
+        };
+        assert_eq!(err, Errno::ENOTSUP);
+    }
+
+    #[test]
+    fn worker_exec_stdio_bindings_preserve_host_stdio_aliases() {
+        let task = crate::syscalls::tests::init_platform(None);
+        task.sys_dup(1, Some(2), None)
+            .expect("dup2 onto stderr should succeed");
+
+        let files = task.files.borrow();
+        let rds = files.raw_descriptor_store.read();
+        let stdout_fd = rds
+            .fd_from_raw_integer::<crate::DefaultFS>(1)
+            .expect("stdout fd should exist");
+        let stderr_fd = rds
+            .fd_from_raw_integer::<crate::DefaultFS>(2)
+            .expect("stderr fd should exist");
+        assert_eq!(
+            stdout_fd.object_id(),
+            stderr_fd.object_id(),
+            "dup2 should preserve descriptor-object identity for stderr aliases"
+        );
+        drop(rds);
+        drop(files);
+
+        let bindings = task
+            .worker_exec_stdio_bindings()
+            .expect("stdio bindings should succeed");
+        assert!(matches!(bindings.stdout, WorkerExecOutputBinding::Inherit));
+        match bindings.stderr {
+            WorkerExecOutputBinding::HostStdio { fd } => {
+                assert_eq!(fd, 1, "stderr alias should target host stdout");
+            }
+            WorkerExecOutputBinding::Inherit => {
+                panic!("stderr alias should not stay inherited on host stderr")
+            }
+            WorkerExecOutputBinding::Close => panic!("stderr alias should not be closed"),
+            WorkerExecOutputBinding::Fs { .. } => {
+                panic!("stderr alias should not be proxied through the guest FS")
+            }
+            WorkerExecOutputBinding::Pipe { .. } => {
+                panic!("stderr alias should not be proxied through a guest pipe")
+            }
+            WorkerExecOutputBinding::Stream(_) => {
+                panic!("stderr alias should not be proxied through a guest byte stream")
+            }
+        }
+    }
+
+    #[test]
+    fn worker_exec_stdio_bindings_preserve_reopened_dev_stdout_aliases() {
+        let task = crate::syscalls::tests::init_platform(None);
+        let stdout_fd = task
+            .sys_open("/dev/stdout", OFlags::WRONLY, litebox::fs::Mode::empty())
+            .expect("open /dev/stdout should succeed");
+        let stdout_fd = i32::try_from(stdout_fd).expect("fd should fit in i32");
+        task.sys_dup(stdout_fd, Some(2), None)
+            .expect("dup2 onto stderr should succeed");
+
+        let files = task.files.borrow();
+        let rds = files.raw_descriptor_store.read();
+        let stderr_fd = rds
+            .fd_from_raw_integer::<crate::DefaultFS>(2)
+            .expect("stderr fd should exist");
+        assert_eq!(
+            super::worker_exec_host_stdio_source_fd(2, &task.global, &files, stderr_fd.as_ref()),
+            Some(1)
+        );
+        drop(rds);
+        drop(files);
+
+        let bindings = task
+            .worker_exec_stdio_bindings()
+            .expect("stdio bindings should succeed");
+        match bindings.stderr {
+            WorkerExecOutputBinding::HostStdio { fd } => {
+                assert_eq!(
+                    fd, 1,
+                    "reopened /dev/stdout should still map to host stdout"
+                );
+            }
+            _ => panic!("reopened /dev/stdout should not degrade into an FS proxy"),
+        }
+    }
+
+    #[test]
+    fn worker_exec_stdio_bindings_preserve_reopened_dev_tty_stdin() {
+        let task = crate::syscalls::tests::init_platform(None);
+        let tty_fd = task
+            .sys_open("/dev/tty", OFlags::RDONLY, litebox::fs::Mode::empty())
+            .expect("open /dev/tty should succeed");
+        let tty_fd = i32::try_from(tty_fd).expect("fd should fit in i32");
+        task.sys_dup(tty_fd, Some(0), None)
+            .expect("dup2 onto stdin should succeed");
+
+        let bindings = task
+            .worker_exec_stdio_bindings()
+            .expect("stdio bindings should succeed");
+        match bindings.stdin {
+            WorkerExecInputBinding::Inherit => {}
+            _ => panic!("reopened /dev/tty stdin should preserve host stdin"),
+        }
+    }
+
+    #[test]
+    fn worker_exec_stdio_bindings_preserve_reopened_dev_tty_stderr_aliases() {
+        let task = crate::syscalls::tests::init_platform(None);
+        let tty_fd = task
+            .sys_open("/dev/tty", OFlags::WRONLY, litebox::fs::Mode::empty())
+            .expect("open /dev/tty should succeed");
+        let tty_fd = i32::try_from(tty_fd).expect("fd should fit in i32");
+        task.sys_dup(tty_fd, Some(2), None)
+            .expect("dup2 onto stderr should succeed");
+
+        let bindings = task
+            .worker_exec_stdio_bindings()
+            .expect("stdio bindings should succeed");
+        match bindings.stderr {
+            WorkerExecOutputBinding::HostStdio { fd } => {
+                assert_eq!(fd, 1, "reopened /dev/tty should still write to host stdout");
+            }
+            _ => panic!("reopened /dev/tty stderr should preserve host tty output"),
+        }
+    }
+
+    #[test]
+    fn worker_exec_stdio_bindings_reject_host_stdout_as_stdin() {
+        let task = crate::syscalls::tests::init_platform(None);
+        task.sys_dup(1, Some(0), None)
+            .expect("dup2 onto stdin should succeed");
+
+        let err = match task.worker_exec_stdio_bindings() {
+            Ok(_) => panic!("stdin aliased to host stdout should be rejected"),
+            Err(err) => err,
+        };
+        assert_eq!(err, Errno::ENOTSUP);
+    }
+
+    #[test]
+    fn worker_exec_stdio_bindings_reject_nonblocking_host_stdin() {
+        let task = crate::syscalls::tests::init_platform(None);
+        task.sys_fcntl(0, litebox_common_linux::FcntlArg::SETFL(OFlags::NONBLOCK))
+            .expect("setfl should succeed");
+
+        let err = match task.worker_exec_stdio_bindings() {
+            Ok(_) => panic!("nonblocking host stdin should be rejected"),
+            Err(err) => err,
+        };
+        assert_eq!(err, Errno::ENOTSUP);
+    }
+
+    #[test]
+    fn worker_exec_stdio_bindings_close_missing_or_cloexec_streams() {
+        let task = crate::syscalls::tests::init_platform(None);
+        task.sys_close(2).expect("close stderr should succeed");
+        task.sys_fcntl(
+            1,
+            litebox_common_linux::FcntlArg::SETFD(FileDescriptorFlags::FD_CLOEXEC),
+        )
+        .expect("setfd should succeed");
+
+        let bindings = task
+            .worker_exec_stdio_bindings()
+            .expect("stdio bindings should succeed");
+        assert!(matches!(bindings.stdout, WorkerExecOutputBinding::Close));
+        assert!(matches!(bindings.stderr, WorkerExecOutputBinding::Close));
+    }
+
+    #[test]
+    fn worker_exec_stdio_bindings_reject_unsupported_stdio_subsystems() {
+        let task = crate::syscalls::tests::init_platform(None);
+        let eventfd = task
+            .sys_eventfd2(0, EfdFlags::empty())
+            .expect("eventfd should succeed");
+        let eventfd = i32::try_from(eventfd).expect("fd should fit in i32");
+        task.sys_dup(eventfd, Some(1), None)
+            .expect("dup2 onto stdout should succeed");
+
+        let err = match task.worker_exec_stdio_bindings() {
+            Ok(_) => panic!("unsupported stdio subsystem should be rejected"),
+            Err(err) => err,
+        };
+        assert_eq!(err, Errno::ENOTSUP);
+    }
+
+    #[test]
+    fn worker_exec_stdio_bindings_reject_non_host_terminal_backed_stdout() {
+        let task = crate::syscalls::tests::init_platform(None);
+        let ptmx_fd = task
+            .sys_open("/dev/ptmx", OFlags::RDWR, litebox::fs::Mode::empty())
+            .expect("open /dev/ptmx should succeed");
+        let ptmx_fd = i32::try_from(ptmx_fd).expect("fd should fit in i32");
+        task.sys_dup(ptmx_fd, Some(1), None)
+            .expect("dup2 onto stdout should succeed");
+
+        let err = match task.worker_exec_stdio_bindings() {
+            Ok(_) => panic!("non-host terminal stdout should be rejected"),
+            Err(err) => err,
+        };
+        assert_eq!(err, Errno::ENOTSUP);
+    }
+
+    #[test]
+    fn worker_exec_stdio_bindings_proxy_non_terminal_fs_redirections() {
+        let task = crate::syscalls::tests::init_platform(None);
+        let null_fd = task
+            .sys_open("/dev/null", OFlags::WRONLY, litebox::fs::Mode::empty())
+            .expect("open /dev/null should succeed");
+        let null_fd = i32::try_from(null_fd).expect("fd should fit in i32");
+        task.sys_dup(null_fd, Some(1), None)
+            .expect("dup2 onto stdout should succeed");
+
+        let bindings = task
+            .worker_exec_stdio_bindings()
+            .expect("stdio bindings should succeed");
+        match bindings.stdout {
+            WorkerExecOutputBinding::Fs { .. } => {}
+            _ => panic!("stdout redirected to /dev/null should be proxied via the guest FS"),
+        }
+    }
+
+    #[test]
+    fn worker_exec_stdio_bindings_proxy_non_terminal_fs_stdin() {
+        let task = crate::syscalls::tests::init_platform(None);
+        let null_fd = task
+            .sys_open("/dev/null", OFlags::RDONLY, litebox::fs::Mode::empty())
+            .expect("open /dev/null should succeed");
+        let null_fd = i32::try_from(null_fd).expect("fd should fit in i32");
+        task.sys_dup(null_fd, Some(0), None)
+            .expect("dup2 onto stdin should succeed");
+
+        let bindings = task
+            .worker_exec_stdio_bindings()
+            .expect("stdio bindings should succeed");
+        match bindings.stdin {
+            WorkerExecInputBinding::Fs { .. } => {}
+            _ => panic!("stdin redirected from /dev/null should be proxied via the guest FS"),
+        }
+    }
+
+    #[test]
+    fn worker_exec_stdio_bindings_proxy_urandom_fs_stdin() {
+        let task = crate::syscalls::tests::init_platform(None);
+        let urandom_fd = task
+            .sys_open("/dev/urandom", OFlags::RDONLY, litebox::fs::Mode::empty())
+            .expect("open /dev/urandom should succeed");
+        let urandom_fd = i32::try_from(urandom_fd).expect("fd should fit in i32");
+        task.sys_dup(urandom_fd, Some(0), None)
+            .expect("dup2 onto stdin should succeed");
+
+        let bindings = task
+            .worker_exec_stdio_bindings()
+            .expect("stdio bindings should succeed");
+        match bindings.stdin {
+            WorkerExecInputBinding::Fs { .. } => {}
+            _ => panic!("stdin redirected from /dev/urandom should be proxied via the guest FS"),
+        }
+    }
+
+    #[test]
+    fn worker_exec_stdio_bindings_reject_directory_stdin() {
+        let task = crate::syscalls::tests::init_platform(None);
+        let dir_fd = task
+            .sys_open(
+                "/",
+                OFlags::RDONLY | OFlags::DIRECTORY,
+                litebox::fs::Mode::empty(),
+            )
+            .expect("open / should succeed");
+        let dir_fd = i32::try_from(dir_fd).expect("fd should fit in i32");
+        task.sys_dup(dir_fd, Some(0), None)
+            .expect("dup2 onto stdin should succeed");
+
+        let err = match task.worker_exec_stdio_bindings() {
+            Ok(_) => panic!("directory stdin should be rejected"),
+            Err(err) => err,
+        };
+        assert_eq!(err, Errno::ENOTSUP);
+    }
+
+    #[test]
+    fn worker_exec_stdio_bindings_reject_high_index_pty_stdin() {
+        let task = crate::syscalls::tests::init_platform(None);
+        let mut pty_fd = None;
+        for _ in 0..=256 {
+            pty_fd = Some(
+                task.sys_open("/dev/ptmx", OFlags::RDWR, litebox::fs::Mode::empty())
+                    .expect("open /dev/ptmx should succeed"),
+            );
+        }
+        let pty_fd = i32::try_from(pty_fd.expect("at least one PTY fd should be opened"))
+            .expect("fd should fit in i32");
+        task.sys_dup(pty_fd, Some(0), None)
+            .expect("dup2 onto stdin should succeed");
+
+        let err = match task.worker_exec_stdio_bindings() {
+            Ok(_) => panic!("high-index PTY stdin should be rejected"),
+            Err(err) => err,
+        };
+        assert_eq!(err, Errno::ENOTSUP);
+    }
+
+    #[test]
+    fn worker_exec_stdio_bindings_reject_read_only_fs_stdout() {
+        let task = crate::syscalls::tests::init_platform(None);
+        let null_fd = task
+            .sys_open("/dev/null", OFlags::RDONLY, litebox::fs::Mode::empty())
+            .expect("open /dev/null should succeed");
+        let null_fd = i32::try_from(null_fd).expect("fd should fit in i32");
+        task.sys_dup(null_fd, Some(1), None)
+            .expect("dup2 onto stdout should succeed");
+
+        let err = match task.worker_exec_stdio_bindings() {
+            Ok(_) => panic!("read-only stdout should be rejected"),
+            Err(err) => err,
+        };
+        assert_eq!(err, Errno::ENOTSUP);
+    }
+
+    #[test]
+    fn worker_exec_stdio_bindings_reject_write_only_fs_stdin() {
+        let task = crate::syscalls::tests::init_platform(None);
+        let null_fd = task
+            .sys_open("/dev/null", OFlags::WRONLY, litebox::fs::Mode::empty())
+            .expect("open /dev/null should succeed");
+        let null_fd = i32::try_from(null_fd).expect("fd should fit in i32");
+        task.sys_dup(null_fd, Some(0), None)
+            .expect("dup2 onto stdin should succeed");
+
+        let err = match task.worker_exec_stdio_bindings() {
+            Ok(_) => panic!("write-only stdin should be rejected"),
+            Err(err) => err,
+        };
+        assert_eq!(err, Errno::ENOTSUP);
     }
 }
