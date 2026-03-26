@@ -2198,7 +2198,7 @@ impl<
             ));
         }
         // Try upper first, fall back to lower
-        match self.upper.read_link(path) {
+        match self.upper.read_link(&path) {
             Ok(target) => Ok(target),
             Err(
                 super::errors::ReadLinkError::NotSupported
@@ -2206,7 +2206,7 @@ impl<
                     super::errors::PathError::NoSuchFileOrDirectory
                     | super::errors::PathError::MissingComponent,
                 ),
-            ) => self.lower.read_link(path),
+            ) => self.lower.read_link(&path),
             Err(e) => Err(e),
         }
     }
