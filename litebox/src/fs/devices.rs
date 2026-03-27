@@ -849,6 +849,7 @@ impl<
         Err(ReadDirError::NotADirectory)
     }
 
+    #[allow(clippy::cast_possible_truncation)] // 64-bit only target
     fn file_status(&self, path: impl Arg) -> Result<FileStatus, FileStatusError> {
         let path = self.absolute_path(path)?;
         let device = match path.as_str() {
@@ -875,21 +876,21 @@ impl<
             }
             p if p.starts_with("/dev/pts/") => {
                 // Check for host PTY path before internal PTY manager lookup.
-                if let Some(info) = self.litebox.x.platform.host_stdin_tty_device_info() {
-                    if p == info.path {
-                        return Ok(FileStatus {
-                            file_type: FileType::CharacterDevice,
-                            mode: Mode::RUSR | Mode::WUSR | Mode::WGRP,
-                            size: 0,
-                            owner: UserInfo::ROOT,
-                            node_info: NodeInfo {
-                                dev: info.dev as usize,
-                                ino: info.ino as usize,
-                                rdev: core::num::NonZeroUsize::new(info.rdev as usize),
-                            },
-                            blksize: STDIO_BLOCK_SIZE,
-                        });
-                    }
+                if let Some(info) = self.litebox.x.platform.host_stdin_tty_device_info()
+                    && p == info.path
+                {
+                    return Ok(FileStatus {
+                        file_type: FileType::CharacterDevice,
+                        mode: Mode::RUSR | Mode::WUSR | Mode::WGRP,
+                        size: 0,
+                        owner: UserInfo::ROOT,
+                        node_info: NodeInfo {
+                            dev: info.dev as usize,
+                            ino: info.ino as usize,
+                            rdev: core::num::NonZeroUsize::new(info.rdev as usize),
+                        },
+                        blksize: STDIO_BLOCK_SIZE,
+                    });
                 }
                 let num_str = &p["/dev/pts/".len()..];
                 let idx: u32 = num_str

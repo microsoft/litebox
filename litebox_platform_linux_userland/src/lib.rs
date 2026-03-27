@@ -1125,6 +1125,16 @@ impl LinuxUserland {
             static environ: *const *const libc::c_char;
         }
 
+        struct FileActionsGuard(*mut libc::posix_spawn_file_actions_t);
+        impl Drop for FileActionsGuard {
+            fn drop(&mut self) {
+                // SAFETY: initialized via posix_spawn_file_actions_init in this scope.
+                unsafe {
+                    libc::posix_spawn_file_actions_destroy(self.0);
+                }
+            }
+        }
+
         let _spawn_guard = self.worker_spawn_serial.lock().unwrap();
         self.reap_finished_worker_bridge_threads();
         let exec_image_fd = create_worker_exec_image_fd(guest_exec_image).map_err(|_| -1_i32)?;
@@ -1209,15 +1219,6 @@ impl LinuxUserland {
             std::mem::MaybeUninit::<libc::posix_spawn_file_actions_t>::uninit();
         if unsafe { libc::posix_spawn_file_actions_init(spawn_file_actions.as_mut_ptr()) } != 0 {
             return Err(-1_i32);
-        }
-        struct FileActionsGuard(*mut libc::posix_spawn_file_actions_t);
-        impl Drop for FileActionsGuard {
-            fn drop(&mut self) {
-                // SAFETY: initialized via posix_spawn_file_actions_init in this scope.
-                unsafe {
-                    libc::posix_spawn_file_actions_destroy(self.0);
-                }
-            }
         }
         let file_actions_ptr = spawn_file_actions.as_mut_ptr();
         let _file_actions_guard = FileActionsGuard(file_actions_ptr);
@@ -1368,25 +1369,21 @@ impl LinuxUserland {
         drop(host_stdio_temp_sources);
         let mut bridge_threads = Vec::new();
         for (source, write_fd) in input_bridges {
-            let bridge = match spawn_worker_input_bridge(self, source, write_fd) {
-                Ok(bridge) => bridge,
-                Err(_) => {
-                    terminate_worker_after_bridge_spawn_failure(self, pid, bridge_threads);
-                    return Err(-1_i32);
-                }
+            let Ok(bridge) = spawn_worker_input_bridge(self, source, write_fd) else {
+                terminate_worker_after_bridge_spawn_failure(self, pid, bridge_threads);
+                return Err(-1_i32);
             };
             bridge_threads.push(bridge);
         }
         for (sink, read_fd) in output_bridges {
-            let bridge = match spawn_worker_output_bridge(self, sink, read_fd) {
-                Ok(handle) => DetachedWorkerBridge {
+            let bridge = if let Ok(handle) = spawn_worker_output_bridge(self, sink, read_fd) {
+                DetachedWorkerBridge {
                     handle,
                     input_control: None,
-                },
-                Err(_) => {
-                    terminate_worker_after_bridge_spawn_failure(self, pid, bridge_threads);
-                    return Err(-1_i32);
                 }
+            } else {
+                terminate_worker_after_bridge_spawn_failure(self, pid, bridge_threads);
+                return Err(-1_i32);
             };
             bridge_threads.push(bridge);
         }
@@ -1813,7 +1810,7 @@ where
             Ok(DetachedWorkerBridge {
                 handle: std::thread::Builder::new().spawn(move || {
                     block_guest_signals();
-                    bridge_worker_input_from_fs(fs, fd, host_write_fd, thread_cancel)
+                    bridge_worker_input_from_fs(fs, fd, host_write_fd, thread_cancel);
                 })?,
                 input_control: Some(WorkerInputBridgeControl {
                     cancel,
@@ -1833,7 +1830,7 @@ where
                     host_write_fd,
                     thread_cancel,
                     sender,
-                )
+                );
             })?;
             let thread_handle = receiver.recv().ok();
             Ok(DetachedWorkerBridge {
@@ -1855,7 +1852,7 @@ where
                     host_write_fd,
                     thread_cancel,
                     sender,
-                )
+                );
             })?;
             let thread_handle = receiver.recv().ok();
             Ok(DetachedWorkerBridge {
@@ -1882,10 +1879,10 @@ where
         match sink {
             WorkerExecOutputSink::Fs { fs, fd } => bridge_worker_output_to_fs(fs, fd, host_read_fd),
             WorkerExecOutputSink::Pipe { pipes, fd } => {
-                bridge_worker_output_to_pipe(platform, pipes, fd, host_read_fd)
+                bridge_worker_output_to_pipe(platform, pipes, fd, host_read_fd);
             }
             WorkerExecOutputSink::Stream(writer) => {
-                bridge_worker_output_to_stream(writer, host_read_fd)
+                bridge_worker_output_to_stream(writer, host_read_fd);
             }
         }
     })
@@ -1896,7 +1893,7 @@ fn write_worker_stdio_all(host_write: &mut std::fs::File, mut buf: &[u8]) -> boo
         match host_write.write(buf) {
             Ok(0) => return false,
             Ok(written) => buf = &buf[written..],
-            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {}
             Err(err) if err.kind() == std::io::ErrorKind::BrokenPipe => return false,
             Err(_) => return false,
         }
@@ -1941,7 +1938,7 @@ fn terminate_worker_after_bridge_spawn_failure(
     let mut status = 0;
     // SAFETY: best-effort reap of the worker process on the error path.
     unsafe {
-        libc::waitpid(pid, &mut status, 0);
+        libc::waitpid(pid, &raw mut status, 0);
     }
     platform
         .detached_worker_bridge_threads
@@ -1975,7 +1972,7 @@ fn bridge_worker_input_from_fs<FS>(
                     break;
                 }
             }
-            Err(litebox::fs::errors::ReadError::Interrupted) => continue,
+            Err(litebox::fs::errors::ReadError::Interrupted) => {}
             Err(litebox::fs::errors::ReadError::WouldBlock) => {
                 std::thread::sleep(Duration::from_millis(1));
             }
@@ -2020,7 +2017,6 @@ fn bridge_worker_input_from_pipe(
                     if cancel.load(std::sync::atomic::Ordering::Acquire) {
                         break;
                     }
-                    continue;
                 }
                 Err(litebox::pipes::errors::ReadError::WouldBlock) => std::thread::yield_now(),
                 Err(_) => break,
@@ -2050,12 +2046,12 @@ fn bridge_worker_output_to_fs<FS>(
                             offset += written;
                             remaining -= written;
                         }
-                        Err(litebox::fs::errors::WriteError::Interrupted) => continue,
+                        Err(litebox::fs::errors::WriteError::Interrupted) => {}
                         Err(_) => return,
                     }
                 }
             }
-            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {}
             Err(_) => break,
         }
     }
@@ -2083,19 +2079,19 @@ fn bridge_worker_output_to_pipe(
                             offset += written;
                             remaining -= written;
                         }
-                        Err(litebox::pipes::errors::WriteError::WouldBlock) => {
-                            std::thread::sleep(Duration::from_millis(1));
-                        }
-                        Err(litebox::pipes::errors::WriteError::WaitError(
-                            litebox::event::wait::WaitError::Interrupted,
-                        )) => {
+                        Err(
+                            litebox::pipes::errors::WriteError::WouldBlock
+                            | litebox::pipes::errors::WriteError::WaitError(
+                                litebox::event::wait::WaitError::Interrupted,
+                            ),
+                        ) => {
                             std::thread::sleep(Duration::from_millis(1));
                         }
                         Err(_) => return,
                     }
                 }
             }
-            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {}
             Err(_) => break,
         }
     }
@@ -2123,13 +2119,12 @@ fn bridge_worker_input_from_stream(
                 break;
             }
             match reader.read_blocking(&mut buf) {
-                Ok(0) => break,
+                Ok(0) | Err(()) => break,
                 Ok(read) => {
                     if !write_worker_stdio_all(&mut host_write, &buf[..read]) {
                         break;
                     }
                 }
-                Err(()) => break,
             }
         }
     });
@@ -2148,16 +2143,15 @@ fn bridge_worker_output_to_stream(
                 let mut offset = 0;
                 while remaining > 0 {
                     match writer.write_blocking(&buf[offset..offset + remaining]) {
-                        Ok(0) => return,
+                        Ok(0) | Err(()) => return,
                         Ok(written) => {
                             offset += written;
                             remaining -= written;
                         }
-                        Err(()) => return,
                     }
                 }
             }
-            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {}
             Err(_) => break,
         }
     }
@@ -4581,7 +4575,7 @@ impl litebox::platform::StdioProvider for LinuxUserland {
 
     fn host_stdin_tty_device_info(&self) -> Option<litebox::platform::HostTtyDeviceInfo> {
         self.host_stdin_tty_info
-            .get_or_init(|| Self::query_host_stdin_tty_info())
+            .get_or_init(Self::query_host_stdin_tty_info)
             .clone()
     }
 }

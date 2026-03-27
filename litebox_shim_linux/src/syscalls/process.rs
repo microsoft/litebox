@@ -3724,13 +3724,12 @@ impl<FS: ShimFS> Task<FS> {
         }
 
         let guest_cwd = self.fs.borrow().current_working_directory();
-        let worker_stdio = self.worker_exec_stdio_bindings().map_err(|err| {
+        let worker_stdio = self.worker_exec_stdio_bindings().inspect_err(|_err| {
             litebox::log_println!(
                 self.global.platform,
                 "[EXEC-REMOTE] pid={} remote worker exec does not support the current stdio bindings",
                 self.pid,
             );
-            err
         })?;
         // Resolve the worker load path through the current guest filesystem so
         // transferred images materialize at their real lower-tree locations
@@ -4361,10 +4360,12 @@ fn worker_exec_stdio_is_unsupported<FS: ShimFS>(
             .get_flags(fd.as_ref())
             .map(|flags| flags.contains(litebox::pipes::Flags::NON_BLOCKING))
             .unwrap_or(true);
-        return global
-            .pipes
-            .half_pipe_type(fd.as_ref())
-            .map(|half| match (raw_fd, half) {
+        return global.pipes.half_pipe_type(fd.as_ref()).map_or_else(
+            |_| {
+                log_worker_exec_stdio_unsupported(global, raw_fd, "closed pipe descriptor");
+                true
+            },
+            |half| match (raw_fd, half) {
                 (0, HalfPipeType::ReceiverHalf) => {
                     if nonblocking {
                         log_worker_exec_stdio_unsupported(
@@ -4380,11 +4381,8 @@ fn worker_exec_stdio_is_unsupported<FS: ShimFS>(
                     log_worker_exec_stdio_unsupported(global, raw_fd, "wrong pipe direction");
                     true
                 }
-            })
-            .unwrap_or_else(|_| {
-                log_worker_exec_stdio_unsupported(global, raw_fd, "closed pipe descriptor");
-                true
-            });
+            },
+        );
     }
     if let Ok(fd) = rds.fd_from_raw_integer::<FS>(raw_fd) {
         drop(rds);
@@ -4416,10 +4414,10 @@ fn worker_exec_stdio_is_unsupported<FS: ShimFS>(
             let unsupported = !worker_exec_host_stdio_direction_compatible(raw_fd, source_fd)
                 || (raw_fd == 0 && open_flags.contains(OFlags::NONBLOCK));
             if unsupported {
-                let reason = if !worker_exec_host_stdio_direction_compatible(raw_fd, source_fd) {
-                    "host stdio alias points at the wrong direction"
-                } else {
+                let reason = if worker_exec_host_stdio_direction_compatible(raw_fd, source_fd) {
                     "nonblocking host-backed stdin"
+                } else {
+                    "host stdio alias points at the wrong direction"
                 };
                 log_worker_exec_stdio_unsupported(global, raw_fd, reason);
             }
@@ -4455,8 +4453,9 @@ fn worker_exec_stdio_is_unsupported<FS: ShimFS>(
             .litebox
             .descriptor_table()
             .entry_handle(&fd)
-            .map(|handle| handle.with_entry(|file| file.get_status().contains(OFlags::NONBLOCK)))
-            .unwrap_or(false);
+            .is_some_and(|handle| {
+                handle.with_entry(|file| file.get_status().contains(OFlags::NONBLOCK))
+            });
         drop(rds);
         log_worker_exec_stdio_unsupported(
             global,
@@ -4484,7 +4483,7 @@ fn worker_exec_stdio_is_unsupported<FS: ShimFS>(
             .litebox
             .descriptor_table()
             .entry_handle(&fd)
-            .map(|handle| {
+            .map_or((false, false, false, false), |handle| {
                 handle.with_entry(|file| {
                     (
                         file.get_status().contains(OFlags::NONBLOCK),
@@ -4493,8 +4492,7 @@ fn worker_exec_stdio_is_unsupported<FS: ShimFS>(
                         file.has_timeouts(),
                     )
                 })
-            })
-            .unwrap_or((false, false, false, false));
+            });
         drop(rds);
         if nonblocking {
             log_worker_exec_stdio_unsupported(
@@ -4541,7 +4539,7 @@ fn worker_exec_stdio_needs_terminal_semantics(status: &litebox::fs::FileStatus) 
         return false;
     }
     match status.node_info.rdev.map(core::num::NonZero::get) {
-        Some(0x500) | Some(0x502) => true,
+        Some(0x500 | 0x502) => true,
         Some(rdev) if rdev >= 0x8800 => true,
         _ => false,
     }
@@ -4560,7 +4558,7 @@ fn worker_exec_tty_stdio_source_fd<FS: ShimFS>(
         .descriptor_table()
         .with_metadata(fd, |_alias: &crate::HostTtyAlias| ())
         .ok()
-        .and_then(|()| match raw_fd {
+        .and(match raw_fd {
             0 => Some(0),
             1 | 2 => Some(1),
             _ => None,
@@ -4787,7 +4785,7 @@ mod tests {
         let task = crate::syscalls::tests::init_platform(None);
         task.thread
             .clear_child_tid
-            .set(Some(crate::MutPtr::from_usize(0x1000_0060_c2b)));
+            .set(Some(crate::MutPtr::from_usize(0x0100_0006_0c2b)));
         drop(task);
     }
 
@@ -6380,9 +6378,8 @@ mod tests {
         task.sys_dup(read_fd, Some(1), None)
             .expect("dup2 onto stdout should succeed");
 
-        let err = match task.worker_exec_stdio_bindings() {
-            Ok(_) => panic!("stdout wired to a pipe read end should be rejected"),
-            Err(err) => err,
+        let Err(err) = task.worker_exec_stdio_bindings() else {
+            panic!("stdout wired to a pipe read end should be rejected")
         };
         assert_eq!(err, Errno::ENOTSUP);
     }
@@ -6435,9 +6432,8 @@ mod tests {
         task.sys_dup(read_fd, Some(0), None)
             .expect("dup2 onto stdin should succeed");
 
-        let err = match task.worker_exec_stdio_bindings() {
-            Ok(_) => panic!("nonblocking pipe stdin should still be rejected"),
-            Err(err) => err,
+        let Err(err) = task.worker_exec_stdio_bindings() else {
+            panic!("nonblocking pipe stdin should still be rejected")
         };
         assert_eq!(err, Errno::ENOTSUP);
     }
@@ -6452,9 +6448,8 @@ mod tests {
         task.sys_dup(write_fd, Some(0), None)
             .expect("dup2 onto stdin should succeed");
 
-        let err = match task.worker_exec_stdio_bindings() {
-            Ok(_) => panic!("stdin wired to a pipe write end should be rejected"),
-            Err(err) => err,
+        let Err(err) = task.worker_exec_stdio_bindings() else {
+            panic!("stdin wired to a pipe write end should be rejected")
         };
         assert_eq!(err, Errno::ENOTSUP);
     }
@@ -6587,9 +6582,8 @@ mod tests {
         task.sys_dup(1, Some(0), None)
             .expect("dup2 onto stdin should succeed");
 
-        let err = match task.worker_exec_stdio_bindings() {
-            Ok(_) => panic!("stdin aliased to host stdout should be rejected"),
-            Err(err) => err,
+        let Err(err) = task.worker_exec_stdio_bindings() else {
+            panic!("stdin aliased to host stdout should be rejected")
         };
         assert_eq!(err, Errno::ENOTSUP);
     }
@@ -6600,9 +6594,8 @@ mod tests {
         task.sys_fcntl(0, litebox_common_linux::FcntlArg::SETFL(OFlags::NONBLOCK))
             .expect("setfl should succeed");
 
-        let err = match task.worker_exec_stdio_bindings() {
-            Ok(_) => panic!("nonblocking host stdin should be rejected"),
-            Err(err) => err,
+        let Err(err) = task.worker_exec_stdio_bindings() else {
+            panic!("nonblocking host stdin should be rejected")
         };
         assert_eq!(err, Errno::ENOTSUP);
     }
@@ -6634,9 +6627,8 @@ mod tests {
         task.sys_dup(eventfd, Some(1), None)
             .expect("dup2 onto stdout should succeed");
 
-        let err = match task.worker_exec_stdio_bindings() {
-            Ok(_) => panic!("unsupported stdio subsystem should be rejected"),
-            Err(err) => err,
+        let Err(err) = task.worker_exec_stdio_bindings() else {
+            panic!("unsupported stdio subsystem should be rejected")
         };
         assert_eq!(err, Errno::ENOTSUP);
     }
@@ -6651,9 +6643,8 @@ mod tests {
         task.sys_dup(ptmx_fd, Some(1), None)
             .expect("dup2 onto stdout should succeed");
 
-        let err = match task.worker_exec_stdio_bindings() {
-            Ok(_) => panic!("non-host terminal stdout should be rejected"),
-            Err(err) => err,
+        let Err(err) = task.worker_exec_stdio_bindings() else {
+            panic!("non-host terminal stdout should be rejected")
         };
         assert_eq!(err, Errno::ENOTSUP);
     }
@@ -6729,9 +6720,8 @@ mod tests {
         task.sys_dup(dir_fd, Some(0), None)
             .expect("dup2 onto stdin should succeed");
 
-        let err = match task.worker_exec_stdio_bindings() {
-            Ok(_) => panic!("directory stdin should be rejected"),
-            Err(err) => err,
+        let Err(err) = task.worker_exec_stdio_bindings() else {
+            panic!("directory stdin should be rejected")
         };
         assert_eq!(err, Errno::ENOTSUP);
     }
@@ -6751,9 +6741,8 @@ mod tests {
         task.sys_dup(pty_fd, Some(0), None)
             .expect("dup2 onto stdin should succeed");
 
-        let err = match task.worker_exec_stdio_bindings() {
-            Ok(_) => panic!("high-index PTY stdin should be rejected"),
-            Err(err) => err,
+        let Err(err) = task.worker_exec_stdio_bindings() else {
+            panic!("high-index PTY stdin should be rejected")
         };
         assert_eq!(err, Errno::ENOTSUP);
     }
@@ -6768,9 +6757,8 @@ mod tests {
         task.sys_dup(null_fd, Some(1), None)
             .expect("dup2 onto stdout should succeed");
 
-        let err = match task.worker_exec_stdio_bindings() {
-            Ok(_) => panic!("read-only stdout should be rejected"),
-            Err(err) => err,
+        let Err(err) = task.worker_exec_stdio_bindings() else {
+            panic!("read-only stdout should be rejected")
         };
         assert_eq!(err, Errno::ENOTSUP);
     }
@@ -6785,9 +6773,8 @@ mod tests {
         task.sys_dup(null_fd, Some(0), None)
             .expect("dup2 onto stdin should succeed");
 
-        let err = match task.worker_exec_stdio_bindings() {
-            Ok(_) => panic!("write-only stdin should be rejected"),
-            Err(err) => err,
+        let Err(err) = task.worker_exec_stdio_bindings() else {
+            panic!("write-only stdin should be rejected")
         };
         assert_eq!(err, Errno::ENOTSUP);
     }

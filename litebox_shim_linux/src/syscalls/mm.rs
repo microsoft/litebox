@@ -803,7 +803,9 @@ impl<FS: ShimFS> Task<FS> {
             Ok(_) => {
                 // No syscalls found — no patching needed.
             }
-            Err(_e) => {
+            Err(e) => {
+                #[cfg(not(feature = "trace_syscalls"))]
+                let _ = &e;
                 #[cfg(feature = "trace_syscalls")]
                 litebox::log_println!(
                     self.global.platform,
@@ -812,7 +814,7 @@ impl<FS: ShimFS> Task<FS> {
                     state.file_path,
                     mapped_addr.as_usize(),
                     mapped_addr.as_usize() + len,
-                    _e,
+                    e,
                 );
                 let _ = self.sys_mprotect(
                     mapped_addr,

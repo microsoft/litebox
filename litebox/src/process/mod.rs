@@ -116,6 +116,7 @@ pub struct ProcessContext {
 ///
 /// Implementations are called in a loop from a bridge thread to transfer data
 /// from a guest byte stream (e.g., a unix socket) to a host pipe.
+#[allow(clippy::result_unit_err)]
 pub trait WorkerExecStreamReader: Send + Sync + 'static {
     /// Read up to `buf.len()` bytes, blocking until data is available.
     /// Returns `Ok(0)` at EOF or `Err(())` on error.
@@ -126,6 +127,7 @@ pub trait WorkerExecStreamReader: Send + Sync + 'static {
 ///
 /// Implementations are called in a loop from a bridge thread to transfer data
 /// from a host pipe into a guest byte stream (e.g., a unix socket).
+#[allow(clippy::result_unit_err)]
 pub trait WorkerExecStreamWriter: Send + Sync + 'static {
     /// Write `buf`, blocking until space is available.
     /// Returns the number of bytes written, or `Err(())` on error.

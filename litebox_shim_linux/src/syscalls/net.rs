@@ -4206,8 +4206,7 @@ mod unix_tests {
         let recv_controllen = { recv_hdr.msg_controllen };
         assert!(
             recv_controllen >= litebox_common_linux::cmsg_len(core::mem::size_of::<i32>()),
-            "expected control data, got controllen={}",
-            recv_controllen
+            "expected control data, got controllen={recv_controllen}"
         );
 
         // Parse the received cmsghdr.
@@ -4234,6 +4233,7 @@ mod unix_tests {
             "received fd should be alive"
         );
 
+        #[allow(clippy::cast_sign_loss)]
         close_socket(&task, received_fd as u32);
         close_socket(&task, sock1);
         close_socket(&task, sock2);

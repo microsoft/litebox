@@ -541,6 +541,7 @@ impl<FS: ShimFS> syscalls::file::FilesState<FS> {
             debug_assert_eq!(OFlags::STATUS_FLAGS_MASK & status_flags, status_flags);
             let old = dt.set_entry_metadata(&fd, StdioStatusFlags(status_flags));
             assert!(old.is_none());
+            #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
             let old = dt.set_entry_metadata(&fd, HostStdioSourceFd(raw_fd as i32));
             assert!(old.is_none());
             let success = rds.fd_into_specific_raw_integer(fd, raw_fd);

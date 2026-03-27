@@ -1806,8 +1806,9 @@ impl<FS: ShimFS> Task<FS> {
                     .litebox
                     .descriptor_table()
                     .entry_handle(&fd)
-                    .map(|handle| handle.with_entry(|file| file.kind_name()))
-                    .unwrap_or("eventfd-subsystem");
+                    .map_or("eventfd-subsystem", |handle| {
+                        handle.with_entry(super::eventfd::EventFile::kind_name)
+                    });
                 litebox::log_println!(
                     self.global.platform,
                     "[STDIO-MAP] pid={} close fd={} kind={} object_id={}",
@@ -2568,102 +2569,98 @@ impl<FS: ShimFS> Task<FS> {
         }
         if let Some(stripped) = fullpath.strip_prefix("/proc/self/fd/") {
             let fd = stripped.parse::<u32>().map_err(|_| Errno::EINVAL)?;
-            match fd {
-                0..=2 => {
-                    let raw_fd = usize::try_from(fd).map_err(|_| Errno::EBADF)?;
-                    let files = self.files.borrow();
-                    let rds = files.raw_descriptor_store.read();
-                    if let Ok(typed_fd) = rds.fd_from_raw_integer::<FS>(raw_fd) {
-                        if let Ok(source_fd) = self.global.litebox.descriptor_table().with_metadata(
+            if let 0..=2 = fd {
+                let raw_fd = usize::try_from(fd).map_err(|_| Errno::EBADF)?;
+                let files = self.files.borrow();
+                let rds = files.raw_descriptor_store.read();
+                if let Ok(typed_fd) = rds.fd_from_raw_integer::<FS>(raw_fd) {
+                    if let Ok(source_fd) =
+                        self.global.litebox.descriptor_table().with_metadata(
                             typed_fd.as_ref(),
                             |crate::HostStdioSourceFd(source_fd)| *source_fd,
-                        ) {
-                            let stream = match source_fd {
-                                0 => Some(litebox::platform::StdioStream::Stdin),
-                                1 => Some(litebox::platform::StdioStream::Stdout),
-                                2 => Some(litebox::platform::StdioStream::Stderr),
-                                _ => None,
-                            };
-                            if let Some(stream) = stream
-                                && self.global.platform.is_a_tty(stream)
-                            {
-                                // Return the actual host PTY path if available,
-                                // so that ttyname_r() can discover and reopen
-                                // the controlling terminal by its real device path.
-                                if let Some(info) =
-                                    self.global.platform.host_stdin_tty_device_info()
-                                {
-                                    return Ok(info.path);
-                                }
-                                return Ok("/dev/tty".to_string());
-                            }
-                            return Ok(match source_fd {
-                                0 => "/dev/stdin".to_string(),
-                                1 => "/dev/stdout".to_string(),
-                                2 => "/dev/stderr".to_string(),
-                                _ => files.fs.fd_path(typed_fd.as_ref()).ok_or(Errno::ENOENT)?,
-                            });
-                        }
-                        if self
-                            .global
-                            .litebox
-                            .descriptor_table()
-                            .with_metadata(typed_fd.as_ref(), |_alias: &crate::HostTtyAlias| ())
-                            .is_ok()
+                        )
+                    {
+                        let stream = match source_fd {
+                            0 => Some(litebox::platform::StdioStream::Stdin),
+                            1 => Some(litebox::platform::StdioStream::Stdout),
+                            2 => Some(litebox::platform::StdioStream::Stderr),
+                            _ => None,
+                        };
+                        if let Some(stream) = stream
+                            && self.global.platform.is_a_tty(stream)
                         {
+                            // Return the actual host PTY path if available,
+                            // so that ttyname_r() can discover and reopen
+                            // the controlling terminal by its real device path.
                             if let Some(info) = self.global.platform.host_stdin_tty_device_info() {
                                 return Ok(info.path);
                             }
                             return Ok("/dev/tty".to_string());
                         }
-                        // Also check for HostPtyDeviceFd (reopened via /dev/pts/N)
-                        if self
-                            .global
-                            .litebox
-                            .descriptor_table()
-                            .with_metadata(typed_fd.as_ref(), |_: &HostPtyDeviceFd| ())
-                            .is_ok()
-                        {
-                            if let Some(info) = self.global.platform.host_stdin_tty_device_info() {
-                                return Ok(info.path);
-                            }
-                            return Ok("/dev/tty".to_string());
-                        }
+                        return Ok(match source_fd {
+                            0 => "/dev/stdin".to_string(),
+                            1 => "/dev/stdout".to_string(),
+                            2 => "/dev/stderr".to_string(),
+                            _ => files.fs.fd_path(typed_fd.as_ref()).ok_or(Errno::ENOENT)?,
+                        });
                     }
-                    return Ok(match fd {
-                        0 => "/dev/stdin".to_string(),
-                        1 => "/dev/stdout".to_string(),
-                        2 => "/dev/stderr".to_string(),
-                        _ => unreachable!(),
-                    });
-                }
-                _ => {
-                    // Check for HostPtyDeviceFd or HostTtyAlias metadata on
-                    // non-stdio fds (e.g., fds reopened via /dev/pts/N or
-                    // /dev/tty) so readlink returns a consistent PTY path.
-                    let raw_fd = usize::try_from(fd).map_err(|_| Errno::EBADF)?;
-                    let files = self.files.borrow();
-                    let rds = files.raw_descriptor_store.read();
-                    if let Ok(typed_fd) = rds.fd_from_raw_integer::<FS>(raw_fd) {
-                        let dt = self.global.litebox.descriptor_table();
-                        if dt
-                            .with_metadata(typed_fd.as_ref(), |_: &HostPtyDeviceFd| ())
-                            .is_ok()
-                        {
-                            if let Some(info) = self.global.platform.host_stdin_tty_device_info() {
-                                return Ok(info.path);
-                            }
+                    if self
+                        .global
+                        .litebox
+                        .descriptor_table()
+                        .with_metadata(typed_fd.as_ref(), |_alias: &crate::HostTtyAlias| ())
+                        .is_ok()
+                    {
+                        if let Some(info) = self.global.platform.host_stdin_tty_device_info() {
+                            return Ok(info.path);
                         }
-                        if dt
-                            .with_metadata(typed_fd.as_ref(), |_: &crate::HostTtyAlias| ())
-                            .is_ok()
-                        {
-                            return Ok("/dev/tty".to_string());
-                        }
-                        return files.fs.fd_path(typed_fd.as_ref()).ok_or(Errno::ENOENT);
+                        return Ok("/dev/tty".to_string());
                     }
-                    return Err(Errno::EBADF);
+                    // Also check for HostPtyDeviceFd (reopened via /dev/pts/N)
+                    if self
+                        .global
+                        .litebox
+                        .descriptor_table()
+                        .with_metadata(typed_fd.as_ref(), |_: &HostPtyDeviceFd| ())
+                        .is_ok()
+                    {
+                        if let Some(info) = self.global.platform.host_stdin_tty_device_info() {
+                            return Ok(info.path);
+                        }
+                        return Ok("/dev/tty".to_string());
+                    }
                 }
+                return Ok(match fd {
+                    0 => "/dev/stdin".to_string(),
+                    1 => "/dev/stdout".to_string(),
+                    2 => "/dev/stderr".to_string(),
+                    _ => unreachable!(),
+                });
+            } else {
+                // Check for HostPtyDeviceFd or HostTtyAlias metadata on
+                // non-stdio fds (e.g., fds reopened via /dev/pts/N or
+                // /dev/tty) so readlink returns a consistent PTY path.
+                let raw_fd = usize::try_from(fd).map_err(|_| Errno::EBADF)?;
+                let files = self.files.borrow();
+                let rds = files.raw_descriptor_store.read();
+                if let Ok(typed_fd) = rds.fd_from_raw_integer::<FS>(raw_fd) {
+                    let dt = self.global.litebox.descriptor_table();
+                    if dt
+                        .with_metadata(typed_fd.as_ref(), |_: &HostPtyDeviceFd| ())
+                        .is_ok()
+                        && let Some(info) = self.global.platform.host_stdin_tty_device_info()
+                    {
+                        return Ok(info.path);
+                    }
+                    if dt
+                        .with_metadata(typed_fd.as_ref(), |_: &crate::HostTtyAlias| ())
+                        .is_ok()
+                    {
+                        return Ok("/dev/tty".to_string());
+                    }
+                    return files.fs.fd_path(typed_fd.as_ref()).ok_or(Errno::ENOENT);
+                }
+                return Err(Errno::EBADF);
             }
         }
 
@@ -2895,16 +2892,14 @@ fn descriptor_stat<FS: ShimFS>(raw_fd: usize, task: &Task<FS>) -> Result<FileSta
                 // Check for HostStdioSourceFd (inherited stdin/stdout/stderr)
                 if let Ok(crate::HostStdioSourceFd(source_fd)) =
                     table.with_metadata(fd, |m: &crate::HostStdioSourceFd| *m)
+                    && (0..=2).contains(&source_fd)
+                    && task.global.platform.is_a_tty(match source_fd {
+                        0 => litebox::platform::StdioStream::Stdin,
+                        1 => litebox::platform::StdioStream::Stdout,
+                        _ => litebox::platform::StdioStream::Stderr,
+                    })
                 {
-                    if (0..=2).contains(&source_fd)
-                        && task.global.platform.is_a_tty(match source_fd {
-                            0 => litebox::platform::StdioStream::Stdin,
-                            1 => litebox::platform::StdioStream::Stdout,
-                            _ => litebox::platform::StdioStream::Stderr,
-                        })
-                    {
-                        return true;
-                    }
+                    return true;
                 }
                 // Check for HostTtyAlias (/dev/tty opens)
                 table
@@ -3077,12 +3072,10 @@ impl<FS: ShimFS> Task<FS> {
         // Override st_dev/st_ino/st_rdev for the host PTY path so that
         // stat("/dev/pts/N") matches fstat(0) — required by glibc ttyname_r's
         // is_mytty() verification.
-        if is_host_pty {
-            if let Some(info) = self.global.platform.host_stdin_tty_device_info() {
-                result.st_dev = info.dev.truncate();
-                result.st_ino = info.ino.truncate();
-                result.st_rdev = info.rdev.truncate();
-            }
+        if is_host_pty && let Some(info) = self.global.platform.host_stdin_tty_device_info() {
+            result.st_dev = info.dev.truncate();
+            result.st_ino = info.ino.truncate();
+            result.st_rdev = info.rdev.truncate();
         }
 
         Ok(result)
@@ -3388,8 +3381,9 @@ impl<FS: ShimFS> Task<FS> {
                                 *f
                             })
                             .map_err(|err| match err {
-                                MetadataError::ClosedFd => Errno::EBADF,
-                                MetadataError::NoSuchMetadata => Errno::EBADF,
+                                MetadataError::ClosedFd | MetadataError::NoSuchMetadata => {
+                                    Errno::EBADF
+                                }
                             })?;
                         files
                             .fs
@@ -3721,8 +3715,7 @@ impl<FS: ShimFS> Task<FS> {
             .create_anonymous_file(&name_str, mode)
             .map_err(|e| match e {
                 CreateAnonymousFileError::NotSupported => Errno::ENOSYS,
-                CreateAnonymousFileError::Io => Errno::EIO,
-                _ => Errno::EIO,
+                CreateAnonymousFileError::Io | _ => Errno::EIO,
             })?;
         {
             let mut dt = self.global.litebox.descriptor_table_mut();
@@ -4987,6 +4980,7 @@ impl<FS: ShimFS> Task<FS> {
         target: Option<usize>,
         min_fd: Option<usize>,
     ) -> Result<usize, Errno> {
+        #[allow(clippy::too_many_arguments)]
         fn dup<FS: ShimFS, S: FdEnabledSubsystem>(
             global: &GlobalState<FS>,
             files: &FilesState<FS>,
