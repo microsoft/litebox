@@ -1,20 +1,20 @@
 #!/bin/bash
-# Launch GitHub Copilot CLI inside the litebox sandbox using IPC networking.
+# Launch OpenAI Codex CLI inside the litebox sandbox using IPC networking.
 #
-# Runs Copilot transparently — the sandbox sees the same HOME, working
-# directory, and files as the host via 9P.  If a pre-built tar file exists
-# (from create_tar_for_copilot.sh), it is loaded as the initial filesystem;
-# otherwise Copilot runs directly from the host binary.
+# Runs Codex transparently — the sandbox sees the same HOME, working
+# directory, and files as the host via 9P.  If a pre-built tar file exists,
+# it is loaded as the initial filesystem; otherwise Codex runs directly from
+# the host binary.
 #
 # If the broker is already running (socket exists and connectable), the script
 # connects to it directly.  Otherwise it starts a broker in the background and
 # cleans it up on exit.
 #
-# Usage: ./dev_tools/run_copilot_ipc.sh [copilot args...]
+# Usage: ./dev_tools/run_codex_ipc.sh [codex args...]
 #
 # Examples:
-#   ./dev_tools/run_copilot_ipc.sh                    # interactive TUI
-#   ./dev_tools/run_copilot_ipc.sh -p "say hello"     # one-shot prompt
+#   ./dev_tools/run_codex_ipc.sh                    # interactive TUI
+#   ./dev_tools/run_codex_ipc.sh -q "say hello"    # one-shot prompt
 #
 # Prerequisite:
 #   cargo build --release -p litebox_runner_linux_userland -p litebox_broker
@@ -24,7 +24,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 RUNNER="$REPO_ROOT/target/release/litebox_runner_linux_userland"
 BROKER="$REPO_ROOT/target/release/litebox_broker"
-TAR="${COPILOT_TAR:-/tmp/copilot_ustar.tar}"
+TAR="${CODEX_TAR:-/tmp/codex_ustar.tar}"
 BROKER_SOCK="${BROKER_SOCK:-/tmp/litebox-broker.sock}"
 CWD="${SANDBOX_CWD:-$(pwd)}"
 
@@ -41,9 +41,9 @@ except: sys.exit(1)
 }
 
 # --- Locate binaries. --------------------------------------------------------
-COPILOT_BIN="$(which copilot 2>/dev/null || true)"
-if [ -z "$COPILOT_BIN" ]; then
-    echo "Error: copilot not found on PATH" >&2
+CODEX_BIN="$(which codex 2>/dev/null || true)"
+if [ -z "$CODEX_BIN" ]; then
+    echo "Error: codex not found on PATH" >&2
     exit 1
 fi
 
@@ -106,7 +106,6 @@ RUNNER_ARGS=(
     --network-broker "$BROKER_SOCK"
     --nine-p-broker "$BROKER_SOCK"
     --cwd "$CWD"
-    --env COPILOT_RUN_APP=1
     --env GIT_CONFIG_COUNT=1
     --env GIT_CONFIG_KEY_0=safe.directory
     --env "GIT_CONFIG_VALUE_0=*"
@@ -117,4 +116,4 @@ if [ -f "$TAR" ]; then
 fi
 
 # --- Run the guest. ----------------------------------------------------------
-"$RUNNER" "${RUNNER_ARGS[@]}" -- "$COPILOT_BIN" --allow-all --no-auto-update "$@"
+"$RUNNER" "${RUNNER_ARGS[@]}" -- "$CODEX_BIN" "$@"
