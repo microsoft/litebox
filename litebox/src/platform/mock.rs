@@ -330,6 +330,22 @@ impl StdioProvider for MockPlatform {
         false
     }
 
+    fn get_terminal_input_bytes(&self, stream: StdioStream) -> Result<u32, StdioIoctlError> {
+        match stream {
+            StdioStream::Stdin => {
+                let len = self
+                    .stdin_queue
+                    .read()
+                    .unwrap()
+                    .iter()
+                    .map(std::vec::Vec::len)
+                    .sum::<usize>();
+                Ok(u32::try_from(len).unwrap_or(u32::MAX))
+            }
+            StdioStream::Stdout | StdioStream::Stderr => Err(StdioIoctlError::NotATerminal),
+        }
+    }
+
     fn poll_stdin_readable(&self) -> bool {
         self.stdin_queue.read().unwrap().front().is_some()
     }

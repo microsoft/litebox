@@ -13,7 +13,7 @@ use hashbrown::{HashMap, HashSet};
 use crate::log_println;
 
 use crate::LiteBox;
-use crate::fd::{InternalFd, TypedFd};
+use crate::fd::{InternalFd, MetadataError, TypedFd};
 use crate::path::Arg;
 use crate::sync;
 
@@ -2181,6 +2181,23 @@ impl<
                     .intersects(OFlags::WRONLY | OFlags::RDWR)
             })
             .unwrap_or(false)
+    }
+
+    fn set_open_status_flags(
+        &self,
+        fd: &FileFd<Platform, Upper, Lower>,
+        flags: OFlags,
+    ) -> Result<(), MetadataError> {
+        let entry = self
+            .litebox
+            .descriptor_table()
+            .with_entry(fd, |descriptor| Arc::clone(&descriptor.entry.entry))
+            .ok_or(MetadataError::ClosedFd)?;
+        match entry.as_ref() {
+            EntryX::Upper { fd } => self.upper.set_open_status_flags(fd, flags),
+            EntryX::Lower { fd } => self.lower.set_open_status_flags(fd, flags),
+            EntryX::Tombstone => unreachable!(),
+        }
     }
 
     fn get_io_pollable(

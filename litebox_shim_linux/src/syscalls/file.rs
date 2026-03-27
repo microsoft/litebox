@@ -44,11 +44,28 @@ fn is_host_tty_path(path: &str) -> bool {
     path == "/dev/tty"
 }
 
+/// Check if a path matches the host's actual PTY device path (e.g., `/dev/pts/156`).
+fn is_host_pty_device_path<Platform: litebox::platform::StdioProvider>(
+    path: &str,
+    platform: &Platform,
+) -> bool {
+    platform
+        .host_stdin_tty_device_info()
+        .is_some_and(|info| path == info.path)
+}
+
 /// Synthetic device IDs for anonymous descriptor pseudo-filesystems,
 /// mirroring the Linux kernel's `sockfs`, `pipefs`, and `anon_inodefs`.
 const SOCKFS_DEV: u64 = 0x000c;
 const PIPEFS_DEV: u64 = 0x000d;
 const ANON_INODE_DEV: u64 = 0x000e;
+
+/// Marker metadata attached to fds opened via the host PTY device path
+/// (e.g., `/dev/pts/156`). Causes the shim's `descriptor_stat()` to override
+/// `st_dev`, `st_ino`, and `st_rdev` with the real host PTY identity so that
+/// `fstat(reopened_fd)` is consistent with `fstat(0)`.
+#[derive(Clone)]
+struct HostPtyDeviceFd;
 
 /// Monotonically increasing counter for unique inode numbers assigned to
 /// anonymous file descriptors (sockets, pipes, eventfds, epoll instances).
@@ -673,6 +690,7 @@ impl<FS: ShimFS> Task<FS> {
             .fs
             .open(&*path, flags - OFlags::CLOEXEC, mode)
             .map_err(Errno::from)?;
+        let status = flags & OFlags::STATUS_FLAGS_MASK;
         {
             let mut dt = self.global.litebox.descriptor_table_mut();
             if flags.contains(OFlags::CLOEXEC) {
@@ -681,7 +699,6 @@ impl<FS: ShimFS> Task<FS> {
                 };
             }
             // Store access mode + status flags so F_GETFL can return them.
-            let status = flags & OFlags::STATUS_FLAGS_MASK;
             let None = dt.set_entry_metadata(&file, crate::StdioStatusFlags(status)) else {
                 unreachable!()
             };
@@ -697,7 +714,21 @@ impl<FS: ShimFS> Task<FS> {
                 let old = dt.set_entry_metadata(&file, crate::HostTtyAlias);
                 assert!(old.is_none());
             }
+            // Tag fds opened via the host PTY device path (e.g., /dev/pts/156)
+            // so that fstat returns the host PTY identity, not the default
+            // Device::Tty identity (rdev=0x500).
+            if let Ok(path_str) = path.to_str()
+                && is_host_pty_device_path(path_str, self.global.platform)
+            {
+                let old = dt.set_entry_metadata(&file, HostPtyDeviceFd);
+                assert!(old.is_none());
+            }
         }
+        self.files
+            .borrow()
+            .fs
+            .set_open_status_flags(&file, status)
+            .map_err(|_| Errno::EBADF)?;
         #[cfg(feature = "trace_syscalls")]
         let object_id = file.object_id().as_u64();
         let files = self.files.borrow();
@@ -751,6 +782,7 @@ impl<FS: ShimFS> Task<FS> {
                     return Err(Errno::EBADF);
                 };
                 let mode = mode & !self.get_umask();
+                let status = flags & OFlags::STATUS_FLAGS_MASK;
 
                 let abs_path = self.resolve_dirfd_path(fd, &path).ok();
                 let files = self.files.borrow();
@@ -777,7 +809,6 @@ impl<FS: ShimFS> Task<FS> {
                             unreachable!()
                         };
                     }
-                    let status = flags & OFlags::STATUS_FLAGS_MASK;
                     let None = dt.set_entry_metadata(&file, crate::StdioStatusFlags(status)) else {
                         unreachable!()
                     };
@@ -791,7 +822,18 @@ impl<FS: ShimFS> Task<FS> {
                         let old = dt.set_entry_metadata(&file, crate::HostTtyAlias);
                         assert!(old.is_none());
                     }
+                    if abs_path
+                        .as_deref()
+                        .is_some_and(|p| is_host_pty_device_path(p, self.global.platform))
+                    {
+                        let old = dt.set_entry_metadata(&file, HostPtyDeviceFd);
+                        assert!(old.is_none());
+                    }
                 }
+                files
+                    .fs
+                    .set_open_status_flags(&file, status)
+                    .map_err(|_| Errno::EBADF)?;
                 #[cfg(feature = "trace_syscalls")]
                 let object_id = file.object_id().as_u64();
                 let guest_raw = files.insert_raw_fd(file).map_err(|file| {
@@ -2527,23 +2569,100 @@ impl<FS: ShimFS> Task<FS> {
         if let Some(stripped) = fullpath.strip_prefix("/proc/self/fd/") {
             let fd = stripped.parse::<u32>().map_err(|_| Errno::EINVAL)?;
             match fd {
-                0 => return Ok("/dev/stdin".to_string()),
-                1 => return Ok("/dev/stdout".to_string()),
-                2 => return Ok("/dev/stderr".to_string()),
-                _ => {
+                0..=2 => {
                     let raw_fd = usize::try_from(fd).map_err(|_| Errno::EBADF)?;
                     let files = self.files.borrow();
-                    return files
-                        .run_on_raw_fd(
-                            raw_fd,
-                            |typed_fd| files.fs.fd_path(typed_fd).ok_or(Errno::ENOENT),
-                            |_| Err(Errno::ENOENT),
-                            |_| Err(Errno::ENOENT),
-                            |_| Err(Errno::ENOENT),
-                            |_| Err(Errno::ENOENT),
-                            |_| Err(Errno::ENOENT),
-                        )
-                        .and_then(|r| r);
+                    let rds = files.raw_descriptor_store.read();
+                    if let Ok(typed_fd) = rds.fd_from_raw_integer::<FS>(raw_fd) {
+                        if let Ok(source_fd) = self.global.litebox.descriptor_table().with_metadata(
+                            typed_fd.as_ref(),
+                            |crate::HostStdioSourceFd(source_fd)| *source_fd,
+                        ) {
+                            let stream = match source_fd {
+                                0 => Some(litebox::platform::StdioStream::Stdin),
+                                1 => Some(litebox::platform::StdioStream::Stdout),
+                                2 => Some(litebox::platform::StdioStream::Stderr),
+                                _ => None,
+                            };
+                            if let Some(stream) = stream
+                                && self.global.platform.is_a_tty(stream)
+                            {
+                                // Return the actual host PTY path if available,
+                                // so that ttyname_r() can discover and reopen
+                                // the controlling terminal by its real device path.
+                                if let Some(info) =
+                                    self.global.platform.host_stdin_tty_device_info()
+                                {
+                                    return Ok(info.path);
+                                }
+                                return Ok("/dev/tty".to_string());
+                            }
+                            return Ok(match source_fd {
+                                0 => "/dev/stdin".to_string(),
+                                1 => "/dev/stdout".to_string(),
+                                2 => "/dev/stderr".to_string(),
+                                _ => files.fs.fd_path(typed_fd.as_ref()).ok_or(Errno::ENOENT)?,
+                            });
+                        }
+                        if self
+                            .global
+                            .litebox
+                            .descriptor_table()
+                            .with_metadata(typed_fd.as_ref(), |_alias: &crate::HostTtyAlias| ())
+                            .is_ok()
+                        {
+                            if let Some(info) = self.global.platform.host_stdin_tty_device_info() {
+                                return Ok(info.path);
+                            }
+                            return Ok("/dev/tty".to_string());
+                        }
+                        // Also check for HostPtyDeviceFd (reopened via /dev/pts/N)
+                        if self
+                            .global
+                            .litebox
+                            .descriptor_table()
+                            .with_metadata(typed_fd.as_ref(), |_: &HostPtyDeviceFd| ())
+                            .is_ok()
+                        {
+                            if let Some(info) = self.global.platform.host_stdin_tty_device_info() {
+                                return Ok(info.path);
+                            }
+                            return Ok("/dev/tty".to_string());
+                        }
+                    }
+                    return Ok(match fd {
+                        0 => "/dev/stdin".to_string(),
+                        1 => "/dev/stdout".to_string(),
+                        2 => "/dev/stderr".to_string(),
+                        _ => unreachable!(),
+                    });
+                }
+                _ => {
+                    // Check for HostPtyDeviceFd or HostTtyAlias metadata on
+                    // non-stdio fds (e.g., fds reopened via /dev/pts/N or
+                    // /dev/tty) so readlink returns a consistent PTY path.
+                    let raw_fd = usize::try_from(fd).map_err(|_| Errno::EBADF)?;
+                    let files = self.files.borrow();
+                    let rds = files.raw_descriptor_store.read();
+                    if let Ok(typed_fd) = rds.fd_from_raw_integer::<FS>(raw_fd) {
+                        let dt = self.global.litebox.descriptor_table();
+                        if dt
+                            .with_metadata(typed_fd.as_ref(), |_: &HostPtyDeviceFd| ())
+                            .is_ok()
+                        {
+                            if let Some(info) = self.global.platform.host_stdin_tty_device_info() {
+                                return Ok(info.path);
+                            }
+                        }
+                        if dt
+                            .with_metadata(typed_fd.as_ref(), |_: &crate::HostTtyAlias| ())
+                            .is_ok()
+                        {
+                            return Ok("/dev/tty".to_string());
+                        }
+                        return files.fs.fd_path(typed_fd.as_ref()).ok_or(Errno::ENOENT);
+                    }
+                    return Err(Errno::EBADF);
                 }
             }
         }
@@ -2649,7 +2768,7 @@ fn synthetic_symlink_stat(target_len: usize) -> FileStat {
 fn descriptor_stat<FS: ShimFS>(raw_fd: usize, task: &Task<FS>) -> Result<FileStat, Errno> {
     let uid = task.credentials.euid.truncate();
     let gid = task.credentials.egid.truncate();
-    let fstat = task
+    let mut fstat = task
         .files
         .borrow()
         .run_on_raw_fd(
@@ -2755,6 +2874,56 @@ fn descriptor_stat<FS: ShimFS>(raw_fd: usize, task: &Task<FS>) -> Result<FileSta
             },
         )
         .flatten()?;
+
+    // Override st_dev/st_ino/st_rdev for fds that should report the host PTY
+    // identity. This applies to:
+    // - Inherited stdin/stdout/stderr (have HostStdioSourceFd metadata)
+    // - Fds opened via the host PTY device path (have HostPtyDeviceFd metadata)
+    // The device FS internally reports rdev=0x500 (major 5) which keeps
+    // classify_terminal() routing to HostStdio. This override only affects
+    // what the guest sees via fstat/statx.
+    if let Some(info) = task.global.platform.host_stdin_tty_device_info() {
+        let files = task.files.borrow();
+        let should_override = files.run_on_raw_fd(
+            raw_fd,
+            |fd| {
+                let table = task.global.litebox.descriptor_table();
+                // Check for HostPtyDeviceFd marker (reopened via /dev/pts/N)
+                if table.with_metadata(fd, |_: &HostPtyDeviceFd| ()).is_ok() {
+                    return true;
+                }
+                // Check for HostStdioSourceFd (inherited stdin/stdout/stderr)
+                if let Ok(crate::HostStdioSourceFd(source_fd)) =
+                    table.with_metadata(fd, |m: &crate::HostStdioSourceFd| *m)
+                {
+                    if (0..=2).contains(&source_fd)
+                        && task.global.platform.is_a_tty(match source_fd {
+                            0 => litebox::platform::StdioStream::Stdin,
+                            1 => litebox::platform::StdioStream::Stdout,
+                            _ => litebox::platform::StdioStream::Stderr,
+                        })
+                    {
+                        return true;
+                    }
+                }
+                // Check for HostTtyAlias (/dev/tty opens)
+                table
+                    .with_metadata(fd, |_: &crate::HostTtyAlias| ())
+                    .is_ok()
+            },
+            |_| false,
+            |_| false,
+            |_| false,
+            |_| false,
+            |_| false,
+        )?;
+        if should_override {
+            fstat.st_dev = info.dev.truncate();
+            fstat.st_ino = info.ino.truncate();
+            fstat.st_rdev = info.rdev.truncate();
+        }
+    }
+
     Ok(fstat)
 }
 
@@ -2896,13 +3065,27 @@ impl<FS: ShimFS> Task<FS> {
         }
         // Skip client-side symlink resolution when the FS backend follows
         // symlinks during walk (e.g., 9P with a canonicalizing broker).
+        let is_host_pty = is_host_pty_device_path(normalized_path.as_str(), self.global.platform);
         let path = if follow_symlink && !fs_walks_follow_symlinks {
             self.canonicalize_path(normalized_path.as_str())?
         } else {
             normalized_path
         };
         let status = self.files.borrow().fs.file_status(path)?;
-        Ok(FileStat::from(status))
+        let mut result = FileStat::from(status);
+
+        // Override st_dev/st_ino/st_rdev for the host PTY path so that
+        // stat("/dev/pts/N") matches fstat(0) — required by glibc ttyname_r's
+        // is_mytty() verification.
+        if is_host_pty {
+            if let Some(info) = self.global.platform.host_stdin_tty_device_info() {
+                result.st_dev = info.dev.truncate();
+                result.st_ino = info.ino.truncate();
+                result.st_rdev = info.rdev.truncate();
+            }
+        }
+
+        Ok(result)
     }
 
     /// Handle syscall `stat`
@@ -3189,7 +3372,30 @@ impl<FS: ShimFS> Task<FS> {
                 }
                 files.run_on_raw_fd(
                     desc,
-                    |fd| setfl_in_metadata!(fd, crate::StdioStatusFlags, Errno::EBADF),
+                    |fd| {
+                        let new_flags = self
+                            .global
+                            .litebox
+                            .descriptor_table_mut()
+                            .with_metadata_mut(fd, |crate::StdioStatusFlags(f)| {
+                                let diff = (*f & setfl_mask) ^ flags;
+                                if diff
+                                    .intersects(OFlags::APPEND | OFlags::DIRECT | OFlags::NOATIME)
+                                {
+                                    log_unsupported!("unsupported flags");
+                                }
+                                f.toggle(diff);
+                                *f
+                            })
+                            .map_err(|err| match err {
+                                MetadataError::ClosedFd => Errno::EBADF,
+                                MetadataError::NoSuchMetadata => Errno::EBADF,
+                            })?;
+                        files
+                            .fs
+                            .set_open_status_flags(fd, new_flags)
+                            .map_err(|_| Errno::EBADF)
+                    },
                     |fd| {
                         setfl_in_metadata!(
                             fd,
@@ -3692,13 +3898,69 @@ impl<FS: ShimFS> Task<FS> {
     /// Maps the fd's device type to the corresponding host stdio stream and
     /// calls `get_terminal_attributes`, `set_terminal_attributes`,
     /// `get_window_size`, or `set_window_size` as appropriate.
+    fn host_stdio_stream_for_fd(
+        &self,
+        fs: &FS,
+        fd: &TypedFd<FS>,
+    ) -> Result<litebox::platform::StdioStream, Errno> {
+        use litebox::platform::StdioStream;
+
+        let status = fs.fd_file_status(fd).map_err(|_| Errno::EBADF)?;
+        let preferred = match status.node_info.ino {
+            9 | 12 => StdioStream::Stdin,
+            10 => StdioStream::Stdout,
+            _ => StdioStream::Stderr,
+        };
+
+        if self.global.platform.is_a_tty(preferred) {
+            return Ok(preferred);
+        }
+
+        [StdioStream::Stdin, StdioStream::Stdout, StdioStream::Stderr]
+            .into_iter()
+            .find(|s| self.global.platform.is_a_tty(*s))
+            .ok_or(Errno::ENOTTY)
+    }
+
+    fn host_tty_foreground_pgrp(&self) -> litebox::process::ProcessGroupId {
+        *self.global.host_tty_foreground_pgrp.lock()
+    }
+
+    fn host_tty_session_id(&self) -> Result<litebox::process::SessionId, Errno> {
+        self.global
+            .litebox
+            .process_registry()
+            .get_sid(self.process_id)
+            .ok_or(Errno::ESRCH)
+    }
+
+    fn set_host_tty_foreground_pgrp(&self, pgrp: i32) -> Result<(), Errno> {
+        use litebox::process::ProcessGroupId;
+
+        if pgrp <= 0 {
+            return Err(Errno::EINVAL);
+        }
+        let pgid = ProcessGroupId(u32::try_from(pgrp).map_err(|_| Errno::EINVAL)?);
+        let group_exists = self
+            .global
+            .litebox
+            .process_registry()
+            .process_group_exists_in_session(self.process_id, pgid)
+            .ok_or(Errno::ESRCH)?;
+        if !group_exists {
+            return Err(Errno::EPERM);
+        }
+        *self.global.host_tty_foreground_pgrp.lock() = pgid;
+        Ok(())
+    }
+
     fn host_stdio_ioctl(
         &self,
         fs: &FS,
         fd: &TypedFd<FS>,
         arg: &IoctlArg<litebox_platform_multiplex::Platform>,
     ) -> Result<u32, Errno> {
-        use litebox::platform::{SetTermiosWhen, StdioIoctlError, StdioStream};
+        use litebox::platform::{SetTermiosWhen, StdioIoctlError};
 
         /// Map a `StdioIoctlError` to an `Errno`.
         fn ioctl_err_to_errno(e: StdioIoctlError) -> Errno {
@@ -3708,27 +3970,7 @@ impl<FS: ShimFS> Task<FS> {
             }
         }
 
-        // Determine which host stream this fd corresponds to.
-        let status = fs.fd_file_status(fd).map_err(|_| Errno::EBADF)?;
-        // Each stdio device has a distinct ino (stdin=9, stdout=10, stderr=11, tty=12).
-        let preferred = match status.node_info.ino {
-            9 | 12 => StdioStream::Stdin,
-            10 => StdioStream::Stdout,
-            _ => StdioStream::Stderr,
-        };
-
-        // Try the preferred stream first, then fall back to any stream that is
-        // actually a terminal on the host. This handles the common case where
-        // the runner's stderr (or stdout) is redirected to a log file but the
-        // guest still expects all stdio fds to behave as terminal devices.
-        let stream = if self.global.platform.is_a_tty(preferred) {
-            preferred
-        } else {
-            [StdioStream::Stdin, StdioStream::Stdout, StdioStream::Stderr]
-                .into_iter()
-                .find(|s| self.global.platform.is_a_tty(*s))
-                .ok_or(Errno::ENOTTY)?
-        };
+        let stream = self.host_stdio_stream_for_fd(fs, fd)?;
 
         match arg {
             IoctlArg::TCGETS(termios_ptr) => {
@@ -3838,17 +4080,26 @@ impl<FS: ShimFS> Task<FS> {
                 Ok(0)
             }
             IoctlArg::TIOCGPGRP(pgrp) => {
-                // Return the calling process's PID as the foreground process group.
-                pgrp.write_at_offset(0, self.sys_getpid())
+                let foreground_pgrp = i32::try_from(self.host_tty_foreground_pgrp().as_u32())
+                    .map_err(|_| Errno::EINVAL)?;
+                pgrp.write_at_offset(0, foreground_pgrp)
                     .ok_or(Errno::EFAULT)?;
                 Ok(0)
             }
+            IoctlArg::TIOCGSID(sid) => {
+                let session_id = i32::try_from(self.host_tty_session_id()?.as_u32())
+                    .map_err(|_| Errno::EINVAL)?;
+                sid.write_at_offset(0, session_id).ok_or(Errno::EFAULT)?;
+                Ok(0)
+            }
+            IoctlArg::TIOCSPGRP(pgrp) => {
+                let foreground_pgrp = pgrp.read_at_offset(0).ok_or(Errno::EFAULT)?;
+                self.set_host_tty_foreground_pgrp(foreground_pgrp)?;
+                Ok(0)
+            }
             // These are no-ops for stdio: TIOCSCTTY (already controlling terminal),
-            // TIOCNOTTY (detach), TIOCSPGRP (set foreground pgrp), TIOCSPTLK (unlock PTY).
-            IoctlArg::TIOCSCTTY
-            | IoctlArg::TIOCNOTTY
-            | IoctlArg::TIOCSPGRP(_)
-            | IoctlArg::TIOCSPTLK(_) => Ok(0),
+            // TIOCNOTTY (detach), TIOCSPTLK (unlock PTY).
+            IoctlArg::TIOCSCTTY | IoctlArg::TIOCNOTTY | IoctlArg::TIOCSPTLK(_) => Ok(0),
             _ => Err(Errno::ENOTTY),
         }
     }
@@ -3975,9 +4226,30 @@ impl<FS: ShimFS> Task<FS> {
                 files
                     .run_on_raw_fd(
                         desc,
-                        |_file_fd| {
-                            // File/device fds: ENOTTY (not a supported operation).
-                            Err(Errno::ENOTTY)
+                        |file_fd| {
+                            let available = match self.classify_terminal(&files.fs, file_fd)? {
+                                TerminalKind::HostStdio => self
+                                    .global
+                                    .platform
+                                    .get_terminal_input_bytes(
+                                        self.host_stdio_stream_for_fd(&files.fs, file_fd)?,
+                                    )
+                                    .map_err(|e| match e {
+                                        litebox::platform::StdioIoctlError::NotATerminal => {
+                                            Errno::ENOTTY
+                                        }
+                                        litebox::platform::StdioIoctlError::OsError(_) => {
+                                            Errno::EIO
+                                        }
+                                        _ => Errno::EIO,
+                                    })?,
+                                TerminalKind::Pty | TerminalKind::NotTerminal => {
+                                    return Err(Errno::ENOTTY);
+                                }
+                            };
+                            let available = i32::try_from(available).unwrap_or(i32::MAX);
+                            out.write_at_offset(0, available).ok_or(Errno::EFAULT)?;
+                            Ok(0u32)
                         },
                         |socket_fd| {
                             let proxy = self.global.get_proxy(socket_fd)?;
@@ -4005,25 +4277,28 @@ impl<FS: ShimFS> Task<FS> {
             }
             IoctlArg::FIONBIO(arg) => {
                 let val = arg.read_at_offset(0).ok_or(Errno::EFAULT)?;
-                self.files
-                    .borrow()
+                let files = self.files.borrow();
+                files
                     .run_on_raw_fd(
                         desc,
                         |file_fd| {
-                            if let Err(e) = self
+                            let result = self
                                 .global
                                 .litebox
                                 .descriptor_table_mut()
                                 .with_metadata_mut(file_fd, |crate::StdioStatusFlags(flags)| {
                                     flags.set(OFlags::NONBLOCK, val != 0);
-                                })
-                            {
-                                match e {
-                                    MetadataError::ClosedFd => return Err(Errno::EBADF),
-                                    MetadataError::NoSuchMetadata => {
-                                        // Non-stdio file FD; non-blocking is irrelevant for
-                                        // in-memory files, so silently succeed.
-                                    }
+                                    *flags
+                                });
+                            match result {
+                                Ok(new_flags) => files
+                                    .fs
+                                    .set_open_status_flags(file_fd, new_flags)
+                                    .map_err(|_| Errno::EBADF)?,
+                                Err(MetadataError::ClosedFd) => return Err(Errno::EBADF),
+                                Err(MetadataError::NoSuchMetadata) => {
+                                    // Non-stdio file FD; non-blocking is irrelevant for
+                                    // in-memory files, so silently succeed.
                                 }
                             }
                             Ok(())
@@ -4231,6 +4506,7 @@ impl<FS: ShimFS> Task<FS> {
             | IoctlArg::TIOCSPTLK(..)
             | IoctlArg::TIOCSCTTY
             | IoctlArg::TIOCNOTTY
+            | IoctlArg::TIOCGSID(..)
             | IoctlArg::TIOCGPGRP(..)
             | IoctlArg::TIOCSPGRP(..)
             | IoctlArg::TIOCGWINSZ(..)
@@ -5082,6 +5358,8 @@ mod tests {
     use super::*;
     use alloc::string::String;
     use litebox::fs::Mode;
+    use litebox::process::ProcessGroupId;
+    use litebox_common_linux::IoctlArg;
 
     extern crate std;
 
@@ -5255,6 +5533,71 @@ mod tests {
         );
 
         task.sys_close(i32::try_from(filefd).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn host_stdio_tiocgpgrp_matches_process_group() {
+        let task = crate::syscalls::tests::init_platform(None);
+
+        let mut foreground_pgrp = -1_i32;
+        task.sys_ioctl(
+            0,
+            IoctlArg::TIOCGPGRP(MutPtr::from_usize((&raw mut foreground_pgrp) as usize)),
+        )
+        .expect("TIOCGPGRP should succeed");
+
+        let pgid = i32::try_from(task.sys_getpgid(0).expect("getpgid should succeed"))
+            .expect("pgid should fit in i32");
+        assert_eq!(foreground_pgrp, pgid);
+    }
+
+    #[test]
+    fn host_stdio_tiocgsid_matches_session_id() {
+        let task = crate::syscalls::tests::init_platform(None);
+
+        let mut session_id = -1_i32;
+        task.sys_ioctl(
+            0,
+            IoctlArg::TIOCGSID(MutPtr::from_usize((&raw mut session_id) as usize)),
+        )
+        .expect("TIOCGSID should succeed");
+
+        let sid = i32::try_from(task.sys_getsid(0).expect("getsid should succeed"))
+            .expect("sid should fit");
+        assert_eq!(session_id, sid);
+    }
+
+    #[test]
+    fn host_stdio_tiocspgrp_updates_shared_foreground_group() {
+        let task = crate::syscalls::tests::init_platform(None);
+
+        let child = task
+            .global
+            .litebox
+            .process_registry()
+            .create_process(Some(task.process_id), 0)
+            .expect("child process should be created");
+        task.global
+            .litebox
+            .process_registry()
+            .set_pgid(task.process_id, child, ProcessGroupId::from(child))
+            .expect("child should exist")
+            .expect("setpgid should succeed");
+
+        let child_pgrp = i32::try_from(child.0).expect("child pgid should fit in i32");
+        task.sys_ioctl(
+            0,
+            IoctlArg::TIOCSPGRP(ConstPtr::from_usize((&raw const child_pgrp) as usize)),
+        )
+        .expect("TIOCSPGRP should succeed");
+
+        let mut foreground_pgrp = -1_i32;
+        task.sys_ioctl(
+            1,
+            IoctlArg::TIOCGPGRP(MutPtr::from_usize((&raw mut foreground_pgrp) as usize)),
+        )
+        .expect("stdout TIOCGPGRP should succeed");
+        assert_eq!(foreground_pgrp, child_pgrp);
     }
 
     /// readlink("/proc/self/cwd") must return the CWD without a trailing slash.

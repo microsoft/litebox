@@ -708,6 +708,7 @@ pub const TIOCSCTTY: u32 = 0x540e;
 pub const TIOCGPGRP: u32 = 0x540f;
 pub const TIOCSPGRP: u32 = 0x5410;
 pub const TIOCNOTTY: u32 = 0x5422;
+pub const TIOCGSID: u32 = 0x5429;
 pub const TIOCGPTPEER: u32 = 0x5441;
 pub const FIONBIO: u32 = 0x5421;
 pub const FIONREAD: u32 = 0x541b;
@@ -741,6 +742,8 @@ pub enum IoctlArg<Platform: litebox::platform::RawPointerProvider> {
     TIOCSCTTY,
     /// Give up the controlling terminal.
     TIOCNOTTY,
+    /// Get the session ID of the controlling terminal.
+    TIOCGSID(Platform::RawMutPointer<i32>),
     /// Open the slave side of a PTY master, returning an fd (Linux 4.13+).
     TIOCGPTPEER(i32),
     /// Get the process group ID of the foreground process group on this terminal.
@@ -2995,6 +2998,7 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
                         TIOCSPTLK => IoctlArg::TIOCSPTLK(ctx.sys_req_ptr(2)),
                         TIOCSCTTY => IoctlArg::TIOCSCTTY,
                         TIOCNOTTY => IoctlArg::TIOCNOTTY,
+                        TIOCGSID => IoctlArg::TIOCGSID(ctx.sys_req_ptr(2)),
                         TIOCGPTPEER => IoctlArg::TIOCGPTPEER(ctx.sys_req_arg(2)),
                         TIOCGPGRP => IoctlArg::TIOCGPGRP(ctx.sys_req_ptr(2)),
                         TIOCSPGRP => IoctlArg::TIOCSPGRP(ctx.sys_req_ptr(2)),

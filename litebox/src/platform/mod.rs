@@ -851,6 +851,15 @@ pub trait StdioProvider {
         Err(StdioIoctlError::NotATerminal)
     }
 
+    /// Get the number of input bytes currently readable from a terminal stream.
+    ///
+    /// On Linux, this forwards `FIONREAD` to the host kernel. Platforms that
+    /// do not support terminal input-queue queries may return
+    /// [`StdioIoctlError::NotATerminal`].
+    fn get_terminal_input_bytes(&self, _stream: StdioStream) -> Result<u32, StdioIoctlError> {
+        Err(StdioIoctlError::NotATerminal)
+    }
+
     /// Set the terminal window size for a stdio stream.
     ///
     /// On Linux, this forwards `TIOCSWINSZ` to the host kernel. On other
@@ -879,6 +888,39 @@ pub trait StdioProvider {
     /// [`StdioReadError::Closed`]. Used during process exit to unblock
     /// threads waiting on stdin. The default is a no-op.
     fn cancel_stdin(&self) {}
+
+    /// Returns the host terminal device identity for stdin, if it is
+    /// connected to a real terminal (e.g., a PTY slave like `/dev/pts/156`).
+    ///
+    /// Used to report correct device info in guest-visible `fstat()` and
+    /// `readlink("/proc/self/fd/0")`, so that runtimes like Bun/libuv can
+    /// discover and reopen the controlling terminal by its actual device path.
+    ///
+    /// The returned `st_dev`, `st_ino`, and `st_rdev` must match what the
+    /// host kernel returns for `stat(path)` on the device path, because
+    /// glibc `ttyname_r` verifies all three fields via `is_mytty()`.
+    ///
+    /// Returns `None` when stdin is not a terminal (pipes, files) or on
+    /// platforms that do not expose PTY device paths (Windows).
+    fn host_stdin_tty_device_info(&self) -> Option<HostTtyDeviceInfo> {
+        None
+    }
+}
+
+/// Host terminal device identity, returned by
+/// [`StdioProvider::host_stdin_tty_device_info`].
+#[derive(Debug, Clone)]
+pub struct HostTtyDeviceInfo {
+    /// Device path on the host, e.g., `/dev/pts/156`.
+    pub path: alloc::string::String,
+    /// `st_rdev` from `fstat()` on the host stdin fd, encoding the
+    /// major/minor device numbers (e.g., `0x889c` for major 136, minor 156).
+    pub rdev: u64,
+    /// `st_dev` from `fstat()` on the host stdin fd (devpts superblock
+    /// device number).
+    pub dev: u64,
+    /// `st_ino` from `fstat()` on the host stdin fd (inode within devpts).
+    pub ino: u64,
 }
 
 /// A provider for system information.

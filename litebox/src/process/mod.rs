@@ -980,6 +980,23 @@ impl<Platform: RawSyncPrimitivesProvider> ProcessRegistry<Platform> {
         self.with_context(id, |ctx| ctx.sid)
     }
 
+    /// Returns whether `pgid` names a process group in the caller's session.
+    ///
+    /// Returns `None` if `caller` is not a live process.
+    pub fn process_group_exists_in_session(
+        &self,
+        caller: ProcessId,
+        pgid: ProcessGroupId,
+    ) -> Option<bool> {
+        let table = self.table.read();
+        let caller_sid = table.get(&caller)?.context.sid;
+        Some(
+            table
+                .values()
+                .any(|entry| entry.context.pgid == pgid && entry.context.sid == caller_sid),
+        )
+    }
+
     /// Create a new session with `caller` as the session leader and sole
     /// member of a new process group.
     ///

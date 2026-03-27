@@ -225,6 +225,9 @@ pub struct LinuxUserland {
     worker_processes: std::sync::Mutex<BTreeMap<i32, WorkerHostProcess>>,
     /// Detached bridge threads that may outlive the waited worker while descendants still hold stdio.
     detached_worker_bridge_threads: std::sync::Mutex<Vec<DetachedWorkerBridge>>,
+    /// Cached host stdin TTY device info (path, rdev, dev, ino).
+    /// Computed once on first access and cached for the process lifetime.
+    host_stdin_tty_info: std::sync::OnceLock<Option<litebox::platform::HostTtyDeviceInfo>>,
 }
 
 impl core::fmt::Debug for LinuxUserland {
@@ -783,6 +786,7 @@ impl LinuxUserland {
             worker_spawn_serial: Mutex::new(()),
             worker_processes: std::sync::Mutex::new(BTreeMap::new()),
             detached_worker_bridge_threads: std::sync::Mutex::new(Vec::new()),
+            host_stdin_tty_info: std::sync::OnceLock::new(),
         };
         Box::leak(Box::new(platform))
     }
@@ -815,6 +819,46 @@ impl LinuxUserland {
     pub fn cancel_stdin(&self) {
         self.stdin_cancelled
             .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Query the host kernel for the actual terminal device identity of stdin.
+    ///
+    /// Returns `None` if stdin is not a terminal or the query fails.
+    fn query_host_stdin_tty_info() -> Option<litebox::platform::HostTtyDeviceInfo> {
+        use std::io::IsTerminal;
+        if !std::io::stdin().is_terminal() {
+            return None;
+        }
+
+        // Get st_dev, st_ino, st_rdev from fstat(0).
+        let mut stat_buf: libc::stat = unsafe { core::mem::zeroed() };
+        // SAFETY: stat_buf is a valid zeroed libc::stat. fstat reads from host fd 0.
+        let ret = unsafe { libc::fstat(0, &raw mut stat_buf) };
+        if ret != 0 {
+            return None;
+        }
+
+        // Get the device path via ttyname_r(0).
+        let mut name_buf = [0u8; 256];
+        // SAFETY: name_buf is a valid buffer. ttyname_r writes a null-terminated
+        // path into it.
+        let ret = unsafe { libc::ttyname_r(0, name_buf.as_mut_ptr().cast(), name_buf.len()) };
+        if ret != 0 {
+            return None;
+        }
+
+        let path = std::ffi::CStr::from_bytes_until_nul(&name_buf)
+            .ok()?
+            .to_str()
+            .ok()?
+            .to_owned();
+
+        Some(litebox::platform::HostTtyDeviceInfo {
+            path,
+            rdev: stat_buf.st_rdev,
+            dev: stat_buf.st_dev,
+            ino: stat_buf.st_ino,
+        })
     }
 
     fn drain_injected_stdin(&self, buf: &mut [u8]) -> Option<usize> {
@@ -4472,6 +4516,25 @@ impl litebox::platform::StdioProvider for LinuxUserland {
         })
     }
 
+    fn get_terminal_input_bytes(
+        &self,
+        stream: litebox::platform::StdioStream,
+    ) -> Result<u32, litebox::platform::StdioIoctlError> {
+        let host_fd = stdio_stream_to_fd(stream);
+        let mut available: libc::c_int = 0;
+        // SAFETY: FIONREAD writes an integer byte count to the provided pointer.
+        let ret = unsafe {
+            libc::syscall(
+                libc::SYS_ioctl,
+                host_fd,
+                libc::c_ulong::from(litebox_common_linux::FIONREAD),
+                core::ptr::from_mut(&mut available) as libc::c_ulong,
+            )
+        };
+        check_ioctl_result(ret)?;
+        Ok(u32::try_from(available).unwrap_or(0))
+    }
+
     fn set_window_size(
         &self,
         stream: litebox::platform::StdioStream,
@@ -4514,6 +4577,12 @@ impl litebox::platform::StdioProvider for LinuxUserland {
 
     fn cancel_stdin(&self) {
         self.cancel_stdin();
+    }
+
+    fn host_stdin_tty_device_info(&self) -> Option<litebox::platform::HostTtyDeviceInfo> {
+        self.host_stdin_tty_info
+            .get_or_init(|| Self::query_host_stdin_tty_info())
+            .clone()
     }
 }
 

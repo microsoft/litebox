@@ -2265,6 +2265,7 @@ mod stdio {
 
 mod layered_stdio {
     use crate::LiteBox;
+    use crate::fs::errors::ReadError;
     use crate::fs::layered::LayeringSemantics;
     use crate::fs::{FileSystem as _, Mode, OFlags};
     use crate::fs::{devices, in_mem, layered};
@@ -2398,6 +2399,33 @@ mod layered_stdio {
         layered_fs
             .close(&second)
             .expect("Failed to close second /dev/ptmx");
+    }
+
+    #[test]
+    fn layered_tty_status_flags_sync_to_device_reads() {
+        let litebox = LiteBox::new(MockPlatform::new());
+        let layered_fs = layered::FileSystem::new(
+            &litebox,
+            in_mem::FileSystem::new(&litebox),
+            devices::FileSystem::new(&litebox),
+            LayeringSemantics::LowerLayerWritableFiles,
+        );
+
+        let fd = layered_fs
+            .open("/dev/tty", OFlags::RDWR, Mode::empty())
+            .expect("Failed to open /dev/tty");
+
+        layered_fs
+            .set_open_status_flags(&fd, OFlags::RDWR | OFlags::NONBLOCK)
+            .expect("Failed to set nonblocking status on /dev/tty");
+
+        let mut buffer = vec![0; 16];
+        let err = layered_fs
+            .read(&fd, &mut buffer, None)
+            .expect_err("empty nonblocking /dev/tty read should not block");
+        assert!(matches!(err, ReadError::WouldBlock));
+
+        layered_fs.close(&fd).expect("Failed to close /dev/tty");
     }
 
     #[test]

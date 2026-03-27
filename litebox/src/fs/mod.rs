@@ -4,7 +4,7 @@
 //! File-system related functionality
 
 use crate::event::IOPollable;
-use crate::fd::{FdEnabledSubsystem, TypedFd};
+use crate::fd::{FdEnabledSubsystem, MetadataError, TypedFd};
 use crate::path;
 
 use alloc::vec::Vec;
@@ -199,6 +199,21 @@ pub trait FileSystem: private::Sealed + FdEnabledSubsystem {
     #[expect(unused_variables, reason = "default body, non-underscored param names")]
     fn is_writable(&self, fd: &TypedFd<Self>) -> bool {
         true
+    }
+
+    /// Synchronize per-open status flags to the backing file description.
+    ///
+    /// Most filesystem backends can ignore this because status flags are only
+    /// tracked by higher layers for `F_GETFL`. Device-style backends that
+    /// implement per-open blocking behavior should override it so `O_NONBLOCK`
+    /// and similar flags remain visible on the real backing fd.
+    #[expect(unused_variables, reason = "default body, non-underscored param names")]
+    fn set_open_status_flags(
+        &self,
+        fd: &TypedFd<Self>,
+        flags: OFlags,
+    ) -> Result<(), MetadataError> {
+        Ok(())
     }
 
     /// Get an `IOPollable` for a file descriptor, if the underlying device supports polling.

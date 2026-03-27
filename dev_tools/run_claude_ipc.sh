@@ -79,8 +79,10 @@ seed_sandbox_home() {
         "$SANDBOX_HOME/.config" \
         "$SANDBOX_HOME/.cache" \
         "$SANDBOX_HOME/.local" \
+        "$SANDBOX_HOME/.local/bin" \
         "$SANDBOX_HOME/.local/state"
     rm -rf "$SANDBOX_HOME/.claude" "$SANDBOX_HOME/.claude.json" "$SANDBOX_HOME/.claude.lock"
+    rm -f "$SANDBOX_HOME/.local/bin/claude"
 
     if [ -d "$HOST_HOME/.claude" ]; then
         install -d -m 700 "$SANDBOX_HOME/.claude"
@@ -90,6 +92,8 @@ seed_sandbox_home() {
     if [ -f "$HOST_HOME/.claude.json" ]; then
         cp -a "$HOST_HOME/.claude.json" "$SANDBOX_HOME/.claude.json"
     fi
+
+    ln -s "$CLAUDE_BIN" "$SANDBOX_HOME/.local/bin/claude"
 }
 
 seed_sandbox_home
@@ -104,7 +108,7 @@ RUNNER_ARGS=(
     --env XDG_STATE_HOME="$SANDBOX_HOME/.local/state"
     --env XDG_CACHE_HOME="$SANDBOX_HOME/.cache"
     --env SHELL=/bin/bash
-    --env "PATH=${PATH:-/usr/local/bin:/usr/bin:/bin}"
+    --env "PATH=$SANDBOX_HOME/.local/bin:${PATH:-/usr/local/bin:/usr/bin:/bin}"
     --env "TERM=${TERM:-xterm-256color}"
     --env GIT_CONFIG_COUNT=1
     --env GIT_CONFIG_KEY_0=safe.directory

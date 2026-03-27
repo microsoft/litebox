@@ -16,6 +16,7 @@ use alloc::sync::Weak;
 use crate::{
     LiteBox,
     event::{Events, IOPollable, observer::Observer, polling::Pollee},
+    fd::MetadataError,
     fs::{
         FileStatus, FileType, Mode, NodeInfo, OFlags, SeekWhence, UserInfo,
         errors::{
@@ -456,6 +457,7 @@ impl<
         flags: OFlags,
         mode: Mode,
     ) -> Result<FileFd<Platform>, OpenError> {
+        let requested_status = flags & OFlags::STATUS_FLAGS_MASK;
         let open_directory = flags.contains(OFlags::DIRECTORY);
         let flags = flags - OFlags::DIRECTORY;
         let _nonblocking = flags.contains(OFlags::NONBLOCK);
@@ -530,20 +532,34 @@ impl<
                 if excl {
                     return Err(OpenError::AlreadyExists);
                 }
-                let num_str = &p["/dev/pts/".len()..];
-                let idx: u32 = num_str
-                    .parse()
-                    .map_err(|_| OpenError::PathError(PathError::NoSuchFileOrDirectory))?;
-                let pair = self
-                    .pty_manager
-                    .get(idx)
-                    .ok_or(OpenError::PathError(PathError::NoSuchFileOrDirectory))?;
-                if !pair.unlocked.load(core::sync::atomic::Ordering::Acquire) {
-                    return Err(OpenError::AccessNotAllowed);
+                // Check if this is the host's actual PTY device path. If so,
+                // create a Device::Tty fd (same as /dev/tty) instead of looking
+                // up the sandbox's internal PTY manager. This check runs first
+                // to avoid collisions with internal PTY indices.
+                if self
+                    .litebox
+                    .x
+                    .platform
+                    .host_stdin_tty_device_info()
+                    .is_some_and(|info| p == info.path)
+                {
+                    (Device::Tty, None)
+                } else {
+                    let num_str = &p["/dev/pts/".len()..];
+                    let idx: u32 = num_str
+                        .parse()
+                        .map_err(|_| OpenError::PathError(PathError::NoSuchFileOrDirectory))?;
+                    let pair = self
+                        .pty_manager
+                        .get(idx)
+                        .ok_or(OpenError::PathError(PathError::NoSuchFileOrDirectory))?;
+                    if !pair.unlocked.load(core::sync::atomic::Ordering::Acquire) {
+                        return Err(OpenError::AccessNotAllowed);
+                    }
+                    pair.slave_open_count
+                        .fetch_add(1, core::sync::atomic::Ordering::Release);
+                    (Device::PtySlave(idx), Some(pair))
                 }
-                pair.slave_open_count
-                    .fetch_add(1, core::sync::atomic::Ordering::Release);
-                (Device::PtySlave(idx), Some(pair))
             }
             _ => return Err(OpenError::PathError(PathError::NoSuchFileOrDirectory)),
         };
@@ -562,6 +578,8 @@ impl<
                 Err(TruncateError::IsTerminalDevice)
             ));
         }
+        self.set_open_status_flags(&fd, requested_status)
+            .map_err(|_| OpenError::Io)?;
         Ok(fd)
     }
 
@@ -856,6 +874,23 @@ impl<
                 });
             }
             p if p.starts_with("/dev/pts/") => {
+                // Check for host PTY path before internal PTY manager lookup.
+                if let Some(info) = self.litebox.x.platform.host_stdin_tty_device_info() {
+                    if p == info.path {
+                        return Ok(FileStatus {
+                            file_type: FileType::CharacterDevice,
+                            mode: Mode::RUSR | Mode::WUSR | Mode::WGRP,
+                            size: 0,
+                            owner: UserInfo::ROOT,
+                            node_info: NodeInfo {
+                                dev: info.dev as usize,
+                                ino: info.ino as usize,
+                                rdev: core::num::NonZeroUsize::new(info.rdev as usize),
+                            },
+                            blksize: STDIO_BLOCK_SIZE,
+                        });
+                    }
+                }
                 let num_str = &p["/dev/pts/".len()..];
                 let idx: u32 = num_str
                     .parse()
@@ -921,6 +956,26 @@ impl<
                 Some(alloc::boxed::Box::new(PtySlavePollable(pair)))
             }
             _ => None,
+        }
+    }
+
+    fn set_open_status_flags(
+        &self,
+        fd: &FileFd<Platform>,
+        flags: OFlags,
+    ) -> Result<(), MetadataError> {
+        let status = flags & OFlags::STATUS_FLAGS_MASK;
+        let mut table = self.litebox.descriptor_table_mut();
+        match table.with_metadata_mut(fd, |DeviceStatusFlags(existing)| {
+            *existing = status;
+        }) {
+            Ok(()) => Ok(()),
+            Err(MetadataError::NoSuchMetadata) => {
+                let old = table.set_entry_metadata(fd, DeviceStatusFlags(status));
+                debug_assert!(old.is_none());
+                Ok(())
+            }
+            Err(MetadataError::ClosedFd) => Err(MetadataError::ClosedFd),
         }
     }
 
