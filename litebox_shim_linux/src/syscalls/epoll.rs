@@ -731,11 +731,10 @@ impl<FS: ShimFS> EpollEntry<FS> {
                     .flags
                     .intersects(EpollFlags::EDGE_TRIGGER | EpollFlags::ONE_SHOT);
 
-            // disable the entry if it is one-shot
-            if inner.flags.contains(EpollFlags::ONE_SHOT) {
-                self.is_enabled
-                    .store(false, core::sync::atomic::Ordering::Relaxed);
-            }
+            // Note: ONESHOT disabling is intentionally deferred to pop_multiple(),
+            // where the event is actually delivered. Disabling here would cause
+            // rescan_interests() -> push() to reject the entry (is_enabled check),
+            // silently dropping the event.
 
             Some((event, is_still_ready))
         }
@@ -827,6 +826,16 @@ impl<FS: ShimFS> ReadySet<FS> {
 
             if let Some(event) = event {
                 events.push(event);
+
+                // Disable ONESHOT entries after delivering the event.
+                // This is deferred from poll() so that rescan_interests() -> push()
+                // can still add the entry to the ready set before it is disabled.
+                let inner = entry.inner.lock();
+                if inner.flags.contains(EpollFlags::ONE_SHOT) {
+                    entry
+                        .is_enabled
+                        .store(false, core::sync::atomic::Ordering::Relaxed);
+                }
             }
 
             if is_still_ready {
