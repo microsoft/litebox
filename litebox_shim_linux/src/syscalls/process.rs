@@ -1618,6 +1618,7 @@ impl<FS: ShimFS> Task<FS> {
             .borrow()
             .insert_raw_fd(typed)
             .map_err(|_| Errno::EMFILE)?;
+        #[cfg(feature = "trace_syscalls")]
         litebox::log_println!(
             self.global.platform,
             "[STDIO-MAP] pid={} create fd={} kind=pidfd nonblock={}",
@@ -3700,6 +3701,7 @@ impl<FS: ShimFS> Task<FS> {
         guest_exec_image: &[u8],
         guest_interp_image: Option<(&str, &[u8])>,
     ) -> Result<usize, Errno> {
+        #[cfg(feature = "trace_syscalls")]
         litebox::log_println!(
             self.global.platform,
             "[EXEC-REMOTE] pid={} path={:?} — spawning worker host for non-PIE binary",
