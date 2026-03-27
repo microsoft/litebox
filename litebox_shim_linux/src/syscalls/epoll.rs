@@ -353,7 +353,7 @@ impl<FS: ShimFS> EpollFile<FS> {
             if entry.is_ready.load(core::sync::atomic::Ordering::Relaxed) {
                 continue; // already in the ready set
             }
-            if let Some((Some(_event), _)) = entry.poll(global, fs) {
+            if let Some((Some(_event), _)) = entry.poll(global, fs, false) {
                 self.ready.push(&entry);
             }
         }
@@ -707,7 +707,25 @@ impl<FS: ShimFS> EpollEntry<FS> {
         })
     }
 
-    fn poll(&self, global: &GlobalState<FS>, fs: &FS) -> Option<(Option<EpollEvent>, bool)> {
+    /// Poll the entry for events.
+    ///
+    /// When `disable_oneshot` is true (used by `pop_multiple()` during event
+    /// delivery), ONESHOT entries are disabled atomically under the `inner` lock
+    /// before returning. This prevents both:
+    /// - Double-delivery: another `pop_multiple()` thread cannot see the entry
+    ///   as enabled between poll and disable.
+    /// - MOD clobber: `mod_interest()` also operates under `inner`, so a
+    ///   concurrent re-arm either completes before poll (and the disable
+    ///   correctly fires for this delivery) or after (re-enabling the entry).
+    ///
+    /// When `disable_oneshot` is false (used by `rescan_interests()`), ONESHOT
+    /// entries remain enabled so `push()` can add them to the ready set.
+    fn poll(
+        &self,
+        global: &GlobalState<FS>,
+        fs: &FS,
+        disable_oneshot: bool,
+    ) -> Option<(Option<EpollEvent>, bool)> {
         let file = self.desc.upgrade()?;
         let inner = self.inner.lock();
 
@@ -731,10 +749,14 @@ impl<FS: ShimFS> EpollEntry<FS> {
                     .flags
                     .intersects(EpollFlags::EDGE_TRIGGER | EpollFlags::ONE_SHOT);
 
-            // Note: ONESHOT disabling is intentionally deferred to pop_multiple(),
-            // where the event is actually delivered. Disabling here would cause
-            // rescan_interests() -> push() to reject the entry (is_enabled check),
-            // silently dropping the event.
+            // Disable ONESHOT entries atomically under the inner lock when
+            // delivering events (pop_multiple path). This is NOT done in the
+            // rescan_interests path — disabling here would cause push() to
+            // reject the entry, silently dropping the event.
+            if disable_oneshot && inner.flags.contains(EpollFlags::ONE_SHOT) {
+                self.is_enabled
+                    .store(false, core::sync::atomic::Ordering::Relaxed);
+            }
 
             Some((event, is_still_ready))
         }
@@ -819,23 +841,16 @@ impl<FS: ShimFS> ReadySet<FS> {
                 .is_ready
                 .store(false, core::sync::atomic::Ordering::Relaxed);
 
-            let Some((event, is_still_ready)) = entry.poll(global, fs) else {
+            let Some((event, is_still_ready)) = entry.poll(global, fs, true) else {
                 // the entry is disabled or the associated file is closed
                 continue;
             };
 
             if let Some(event) = event {
                 events.push(event);
-
-                // Disable ONESHOT entries after delivering the event.
-                // This is deferred from poll() so that rescan_interests() -> push()
-                // can still add the entry to the ready set before it is disabled.
-                let inner = entry.inner.lock();
-                if inner.flags.contains(EpollFlags::ONE_SHOT) {
-                    entry
-                        .is_enabled
-                        .store(false, core::sync::atomic::Ordering::Relaxed);
-                }
+                // ONESHOT disable already happened atomically inside poll()
+                // under the inner lock, preventing both MOD-clobber races and
+                // double-delivery by concurrent pop_multiple() threads.
             }
 
             if is_still_ready {
