@@ -932,8 +932,6 @@ fn backfill_static_tls_for_mapped_image(
     image_base: usize,
     image_size: usize,
 ) -> Option<u32> {
-    use litebox::platform::DebugLogProvider as _;
-
     if teb_va == 0 {
         return None;
     }
@@ -989,13 +987,16 @@ fn backfill_static_tls_for_mapped_image(
     push_thread_tls_block_allocation(shared, teb_va, block_base, total.max(16));
 
     #[cfg(debug_assertions)]
-    litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
-        "  [TLS-backfill] base=0x{image_base:X} idx={} vec=0x{tls_vector:X} slot=0x{:X} data=0x{aligned:X} raw=0x{:X} zero=0x{:X}\n",
-        tls_index,
-        slot_addr,
-        raw_size,
-        zero_fill,
-    ));
+    {
+        use litebox::platform::DebugLogProvider as _;
+        litebox_platform_multiplex::platform().debug_log_print(&alloc::format!(
+            "  [TLS-backfill] base=0x{image_base:X} idx={} vec=0x{tls_vector:X} slot=0x{:X} data=0x{aligned:X} raw=0x{:X} zero=0x{:X}\n",
+            tls_index,
+            slot_addr,
+            raw_size,
+            zero_fill,
+        ));
+    }
 
     Some(tls_index)
 }

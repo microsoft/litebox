@@ -78,9 +78,8 @@ use litebox_platform_multiplex::Platform;
 
 /// Check if a memory address is committed (readable) using host VirtualQuery.
 ///
-/// Used by the debug exception dump to avoid recursive faults when reading
+/// Used by the exception handler to avoid recursive faults when reading
 /// guest stack or code memory that might not be mapped.
-#[cfg(debug_assertions)]
 fn is_addr_committed(addr: usize) -> bool {
     #[repr(C)]
     struct MemoryBasicInformation {
