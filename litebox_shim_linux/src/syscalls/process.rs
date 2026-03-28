@@ -2063,16 +2063,25 @@ impl<FS: ShimFS> Task<FS> {
             forked,
             litebox::platform::address_space::ForkedAddressSpace::SharedWithParent(_)
         );
+        let is_vfork = flags.contains(CloneFlags::VM) && flags.contains(CloneFlags::VFORK);
 
         #[cfg(feature = "trace_syscalls")]
         litebox::log_println!(
             self.global.platform,
-            "[FORK] pid={} -> child_pid={} as_id={} shared={}",
+            "[FORK] pid={} -> child_pid={} as_id={} shared={} is_vfork={}",
             self.pid,
             child_process_id.0,
             child_as_id,
             is_shared,
+            is_vfork,
         );
+
+        // True fork on a shared-address-space platform: the child must run in
+        // a separate host process with its own address space.  Route to the
+        // dedicated true-fork path instead of the vfork-style shared path.
+        if is_shared && !is_vfork {
+            return self.do_true_fork(ctx, args, flags, clone3, child_process_id, child_as_id);
+        }
 
         // 3. Allocate a TID for the child. For the initial thread of a
         //    forked process, pid == tid == the ProcessId assigned by the
@@ -2463,6 +2472,49 @@ impl<FS: ShimFS> Task<FS> {
 
         // Parent returns child's PID.
         Ok(usize::try_from(child_pid).unwrap())
+    }
+
+    /// True fork on a shared-address-space (userland) platform.
+    ///
+    /// Unlike the vfork-style shared path in [`do_fork`], true fork creates
+    /// the child in a separate host process so that parent and child run
+    /// concurrently with independent address spaces.
+    ///
+    /// This is the entry point for the two-phase snapshot/restore design:
+    ///   1. Snapshot the parent's state at the fork trap.
+    ///   2. Restore that snapshot in a new worker host process.
+    ///
+    /// Currently unimplemented — returns `ENOSYS`.
+    #[allow(unused_variables)]
+    fn do_true_fork(
+        &self,
+        ctx: &litebox_common_linux::ExecutionContext,
+        args: &litebox_common_linux::CloneArgs,
+        flags: CloneFlags,
+        clone3: bool,
+        child_process_id: litebox::process::ProcessId,
+        child_as_id: <crate::Platform as litebox::platform::AddressSpaceProvider>::AddressSpaceId,
+    ) -> Result<usize, Errno> {
+        use litebox::platform::AddressSpaceProvider;
+
+        #[cfg(feature = "trace_syscalls")]
+        litebox::log_println!(
+            self.global.platform,
+            "[TRUE-FORK] pid={} child_process_id={} child_as_id={:?}: not yet implemented",
+            self.pid,
+            child_process_id.0,
+            child_as_id,
+        );
+
+        // Clean up pre-allocated resources before returning the error.
+        let _ = self.global.platform.destroy_address_space(child_as_id);
+        self.global
+            .litebox
+            .process_registry()
+            .remove_process(child_process_id);
+
+        // True fork is not yet implemented on this platform.
+        Err(Errno::ENOSYS)
     }
 
     /// Handle syscall `set_tid_address`.
