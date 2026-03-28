@@ -164,6 +164,15 @@ impl FsState {
         }
     }
 
+    /// Reconstruct filesystem state from a fork snapshot.
+    pub(crate) fn from_restore(cwd: String, exe_path: String, umask: u32) -> Self {
+        Self {
+            umask: core::sync::atomic::AtomicU32::new(umask),
+            cwd: litebox::sync::RwLock::new(cwd),
+            exe_path: litebox::sync::RwLock::new(exe_path),
+        }
+    }
+
     pub(crate) fn umask(&self) -> Mode {
         Mode::from_bits_retain(self.umask.load(Ordering::Relaxed))
     }

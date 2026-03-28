@@ -393,6 +393,19 @@ where
         self.vmem.write().brk = brk;
     }
 
+    /// Restore brk metadata from a fork snapshot without allocating pages.
+    ///
+    /// The caller must have already mapped the heap pages (e.g., via
+    /// `create_writable_pages`).  This method only sets the logical brk
+    /// bookkeeping so that subsequent `brk()` calls resume from the
+    /// correct position.
+    pub fn restore_brk_metadata(&self, brk_base: usize, brk: usize, brk_frontier: usize) {
+        let mut vmem = self.vmem.write();
+        vmem.brk_base = brk_base;
+        vmem.brk = brk;
+        vmem.brk_frontier = brk_frontier;
+    }
+
     /// Set the program break to the given address.
     ///
     /// Increasing the program break has the effect of allocating memory to the process;

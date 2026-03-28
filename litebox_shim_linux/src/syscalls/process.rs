@@ -40,7 +40,7 @@ use litebox_platform_multiplex::Platform;
 
 /// Process-management-related state on [`Task`].
 pub(crate) struct ThreadState {
-    init_state: Cell<ThreadInitState>,
+    pub(crate) init_state: Cell<ThreadInitState>,
     process: Arc<Process>,
     /// Thread state that can be accessed from a remote thread.
     remote: Arc<ThreadRemote>,
@@ -92,6 +92,30 @@ impl ThreadState {
         })
     }
 
+    /// Reconstruct a thread state from a fork snapshot.
+    pub(crate) fn new_from_restore(
+        pid: i32,
+        process: Arc<Process>,
+        remote: Arc<ThreadRemote>,
+        clear_child_tid: Option<usize>,
+        robust_list: Option<usize>,
+    ) -> Self {
+        use litebox::platform::RawConstPointer as _;
+
+        Self {
+            init_state: Cell::new(ThreadInitState::None),
+            process,
+            remote,
+            attached_tid: Cell::new(Some(pid)),
+            clear_child_tid: Cell::new(clear_child_tid.map(crate::MutPtr::<i32>::from_usize)),
+            rseq: Cell::new(None),
+            robust_list: Cell::new(
+                robust_list
+                    .map(crate::ConstPtr::<litebox_common_linux::RobustListHead>::from_usize),
+            ),
+        }
+    }
+
     fn detach_from_process(&self) -> bool {
         if let Some(tid) = self.attached_tid.take() {
             return self.process.detach_thread(tid);
@@ -125,7 +149,7 @@ pub(crate) struct ThreadRemote {
 }
 
 impl ThreadRemote {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             is_exiting: AtomicBool::new(false),
             is_suspended: AtomicBool::new(false),
@@ -204,6 +228,36 @@ impl Process {
                 deadline: None,
             }),
             thp_disabled: AtomicBool::new(false),
+        }
+    }
+
+    /// Creates a new process with restored resource limits and thp state.
+    ///
+    /// Used by fork-restore to reconstruct a child process from a snapshot.
+    pub(crate) fn new_with_rlimits(
+        pid: i32,
+        remote: Arc<ThreadRemote>,
+        rlimits: &[(usize, usize); litebox_common_linux::RlimitResource::RLIM_NLIMITS],
+        thp_disabled: bool,
+    ) -> Self {
+        let nr_threads = <Platform as litebox::platform::RawMutexProvider>::RawMutex::INIT;
+        nr_threads.underlying_atomic().store(1, Ordering::Relaxed);
+        let limits = ResourceLimits::from_snapshot(rlimits);
+        Self {
+            nr_threads,
+            inner: Mutex::new(ProcessInner {
+                exit_status: ExitStatus::Exit(0),
+                group_exit: false,
+                is_killing_other_threads: false,
+                is_forking: false,
+                threads: BTreeMap::from_iter([(pid, remote)]),
+            }),
+            limits,
+            alarm_timer: Mutex::new(Alarm {
+                handle: None,
+                deadline: None,
+            }),
+            thp_disabled: AtomicBool::new(thp_disabled),
         }
     }
 
@@ -469,7 +523,7 @@ impl<FS: ShimFS> Task<FS> {
 }
 
 #[derive(Default)]
-enum ThreadInitState {
+pub(crate) enum ThreadInitState {
     #[default]
     None,
     NewProcess(crate::loader::elf::ElfLoadInfo),
@@ -477,6 +531,12 @@ enum ThreadInitState {
         stack: Option<usize>,
         tls: Option<ThreadLocalDescriptor>,
         set_child_tid: Option<MutPtr<i32>>,
+    },
+    /// Restored from a fork snapshot — the full execution context is provided.
+    ForkRestore {
+        exec_ctx: alloc::boxed::Box<litebox_common_linux::ExecutionContext>,
+        tls_base: Option<usize>,
+        set_child_tid: Option<usize>,
     },
 }
 
@@ -3279,6 +3339,20 @@ impl ResourceLimits {
         Self { limits }
     }
 
+    /// Reconstruct resource limits from a fork snapshot.
+    fn from_snapshot(
+        rlimits: &[(usize, usize); litebox_common_linux::RlimitResource::RLIM_NLIMITS],
+    ) -> Self {
+        seq_macro::seq!(N in 0..16 {
+            let limits = [
+                #(
+                    AtomicRlimit::new(rlimits[N].0, rlimits[N].1),
+                )*
+            ];
+        });
+        Self { limits }
+    }
+
     pub(crate) fn get_rlimit(
         &self,
         resource: litebox_common_linux::RlimitResource,
@@ -4786,13 +4860,13 @@ impl<FS: ShimFS> Task<FS> {
     ///
     /// Returns `true` for the process's main thread (`None` or `NewProcess`),
     /// `false` for worker threads (`NewThread`).
-    fn init_thread_context(&self, ctx: &mut litebox_common_linux::PtRegs) -> bool {
+    fn init_thread_context(&self, ctx: &mut litebox_common_linux::ExecutionContext) -> bool {
         match self.thread.init_state.take() {
             ThreadInitState::None => true,
             ThreadInitState::NewProcess(load_info) => {
                 #[cfg(target_arch = "x86_64")]
                 {
-                    *ctx = litebox_common_linux::PtRegs {
+                    ctx.regs = litebox_common_linux::PtRegs {
                         r15: 0,
                         r14: 0,
                         r13: 0,
@@ -4818,7 +4892,7 @@ impl<FS: ShimFS> Task<FS> {
                 }
                 #[cfg(target_arch = "x86")]
                 {
-                    *ctx = litebox_common_linux::PtRegs {
+                    ctx.regs = litebox_common_linux::PtRegs {
                         ebx: 0,
                         ecx: 0,
                         edx: 0,
@@ -4883,6 +4957,40 @@ impl<FS: ShimFS> Task<FS> {
                     let _ = child_tid_ptr.write_at_offset(0, self.tid);
                 }
                 false
+            }
+            ThreadInitState::ForkRestore {
+                exec_ctx,
+                tls_base,
+                set_child_tid,
+            } => {
+                // Restore the register state from the fork snapshot.
+                // fork() returns 0 in the child (already set in exec_ctx.rax).
+                ctx.regs = exec_ctx.regs;
+                ctx.fp_regs = exec_ctx.fp_regs;
+
+                // Restore the TLS base address.
+                if let Some(tls) = tls_base {
+                    #[cfg(target_arch = "x86_64")]
+                    {
+                        self.sys_arch_prctl(ArchPrctlArg::SetFs(tls)).unwrap();
+                    }
+                    #[cfg(target_arch = "x86")]
+                    {
+                        // On x86, TLS is set via set_thread_area. For now,
+                        // just store it; full x86 TLS restore is future work.
+                        let _ = tls;
+                    }
+                }
+
+                // Write child TID to set_child_tid address (CLONE_CHILD_SETTID).
+                if let Some(addr) = set_child_tid {
+                    use litebox::platform::RawMutPointer as _;
+                    let ptr = crate::MutPtr::<i32>::from_usize(addr);
+                    let _ = self.prepare_guest_write(ptr, 1);
+                    let _ = ptr.write_at_offset(0, self.tid);
+                }
+
+                true
             }
         }
     }

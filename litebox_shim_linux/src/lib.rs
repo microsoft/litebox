@@ -473,12 +473,285 @@ impl<FS: ShimFS> LinuxShim<FS> {
     /// unsupported state).
     pub fn restore_process(
         &self,
-        _snapshot: syscalls::fork_snapshot::ForkSnapshot,
-        _fs: alloc::sync::Arc<FS>,
+        snapshot: syscalls::fork_snapshot::ForkSnapshot,
+        fs: alloc::sync::Arc<FS>,
     ) -> Result<LoadedProgram<FS>, Errno> {
-        // TODO (Phase 8): Reconstruct ProcessState, Task, ThreadState,
-        // FilesState, SignalState, and mappings from the snapshot.
-        Err(Errno::ENOSYS)
+        use litebox::mm::linux::{CreatePagesFlags, NonZeroAddress, NonZeroPageSize, VmFlags};
+        use litebox::platform::AddressSpaceProvider;
+        use litebox::platform::RawMutex as _;
+
+        let syscalls::fork_snapshot::ForkSnapshot {
+            identity: id,
+            process_wide: pw,
+            thread: th,
+            signal: sig,
+            fs: fs_snap,
+            fd_table: _fd_table,
+            memory: mem,
+        } = snapshot;
+
+        // Reserve the child's thread ID so future clone() calls don't collide.
+        self.global.reserve_thread_id(id.pid);
+
+        // --- 1. Allocate a new address space for the child. -----------------
+        let child_as_id = self
+            .global
+            .platform
+            .create_address_space()
+            .map_err(|_| Errno::ENOMEM)?;
+        let as_range = self
+            .global
+            .platform
+            .address_space_range(child_as_id)
+            .map_err(|_| Errno::ENOMEM)?;
+
+        let child_pm: PageManager<Platform, { PAGE_SIZE }> =
+            PageManager::new(&self.global.litebox, as_range);
+
+        // --- 2. Restore memory regions. ------------------------------------
+        for region in &mem.regions {
+            let vm_flags = VmFlags::from_bits_truncate(region.vm_flags);
+            let has_read = vm_flags.contains(VmFlags::VM_READ);
+            let has_write = vm_flags.contains(VmFlags::VM_WRITE);
+            let has_exec = vm_flags.contains(VmFlags::VM_EXEC);
+
+            let addr = NonZeroAddress::<PAGE_SIZE>::new(region.addr).ok_or(Errno::EINVAL)?;
+            let len = NonZeroPageSize::<PAGE_SIZE>::new(region.len).ok_or(Errno::EINVAL)?;
+
+            let mut flags = CreatePagesFlags::FIXED_ADDR;
+            if region.is_shared {
+                flags |= CreatePagesFlags::SHARED;
+            }
+
+            let data = &region.data;
+
+            // Choose the create method that matches the final permissions.
+            unsafe {
+                match (has_read, has_write, has_exec) {
+                    (true, true, true) => {
+                        child_pm.create_rwx_pages(Some(addr), len, flags, |ptr| {
+                            if !data.is_empty() {
+                                ptr.write_slice_at_offset(0, data)
+                                    .ok_or(litebox::mm::linux::MappingError::OutOfMemory)?;
+                            }
+                            Ok(data.len())
+                        })
+                    }
+                    (true | false, false, true) => {
+                        child_pm.create_executable_pages(Some(addr), len, flags, |ptr| {
+                            if !data.is_empty() {
+                                ptr.write_slice_at_offset(0, data)
+                                    .ok_or(litebox::mm::linux::MappingError::OutOfMemory)?;
+                            }
+                            Ok(data.len())
+                        })
+                    }
+                    (true | false, true, false) => {
+                        child_pm.create_writable_pages(Some(addr), len, flags, |ptr| {
+                            if !data.is_empty() {
+                                ptr.write_slice_at_offset(0, data)
+                                    .ok_or(litebox::mm::linux::MappingError::OutOfMemory)?;
+                            }
+                            Ok(data.len())
+                        })
+                    }
+                    (true, false, false) => {
+                        child_pm.create_readable_pages(Some(addr), len, flags, |ptr| {
+                            if !data.is_empty() {
+                                ptr.write_slice_at_offset(0, data)
+                                    .ok_or(litebox::mm::linux::MappingError::OutOfMemory)?;
+                            }
+                            Ok(data.len())
+                        })
+                    }
+                    // PROT_NONE or other combinations: create writable first
+                    // to copy data, then downgrade to inaccessible.
+                    _ => {
+                        let ptr =
+                            child_pm.create_writable_pages(Some(addr), len, flags, |ptr| {
+                                if !data.is_empty() {
+                                    ptr.write_slice_at_offset(0, data)
+                                        .ok_or(litebox::mm::linux::MappingError::OutOfMemory)?;
+                                }
+                                Ok(data.len())
+                            })?;
+                        child_pm
+                            .make_pages_inaccessible(ptr, len.as_usize())
+                            .map_err(|_| litebox::mm::linux::MappingError::OutOfMemory)?;
+                        Ok(ptr)
+                    }
+                }
+                .map_err(|_| Errno::ENOMEM)?;
+            }
+        }
+
+        // --- 3. Restore brk metadata (pages already mapped above). ----------
+        let pm_meta = &mem.metadata;
+        if pm_meta.brk_base != 0 {
+            child_pm.restore_brk_metadata(pm_meta.brk_base, pm_meta.brk, pm_meta.brk_frontier);
+        }
+
+        // --- 4. Build the child ProcessState. -------------------------------
+        let elf_patch_cache: alloc::collections::BTreeMap<i32, syscalls::mm::ElfPatchState> =
+            pm_meta
+                .elf_patch_entries
+                .iter()
+                .map(|e| {
+                    (
+                        e.fd,
+                        syscalls::mm::ElfPatchState {
+                            _base_addr: e.base_addr,
+                            pre_patched: e.pre_patched,
+                            trampoline_file_offset: e.trampoline_file_offset,
+                            trampoline_file_size: e.trampoline_file_size,
+                            _trampoline_vaddr: e.trampoline_vaddr,
+                            trampoline_addr: e.trampoline_addr,
+                            trampoline_cursor: e.trampoline_cursor,
+                            trampoline_mapped: e.trampoline_mapped,
+                            trampoline_mapped_len: e.trampoline_mapped_len,
+                            runtime_patches_committed: e.runtime_patches_committed,
+                            file_path: e.file_path.clone(),
+                        },
+                    )
+                })
+                .collect();
+
+        let proc_map_paths: Vec<(core::ops::Range<usize>, alloc::string::String)> = pm_meta
+            .proc_map_paths
+            .iter()
+            .map(|(range, path)| (range.clone(), path.clone()))
+            .collect();
+
+        let child_process_state = Arc::new(ProcessState {
+            pm: child_pm,
+            address_space_id: child_as_id,
+            thread_count: core::sync::atomic::AtomicI32::new(1),
+            active_vfork_layers: litebox::sync::Mutex::new(Vec::new()),
+            elf_patch_cache: litebox::sync::Mutex::new(elf_patch_cache),
+            shared_file_mappings: litebox::sync::Mutex::new(alloc::vec::Vec::new()),
+            main_bss_start: core::sync::atomic::AtomicUsize::new(pm_meta.main_bss_start),
+            main_bss_end: core::sync::atomic::AtomicUsize::new(pm_meta.main_bss_end),
+            proc_map_paths: litebox::sync::Mutex::new(proc_map_paths),
+            vfork_parking: Arc::new(VforkParking {
+                park: <Platform as litebox::platform::RawMutexProvider>::RawMutex::INIT,
+                parked_count: <Platform as litebox::platform::RawMutexProvider>::RawMutex::INIT,
+                deferred_lie_count: core::sync::atomic::AtomicU32::new(0),
+            }),
+        });
+
+        // --- 6. Build Process with restored rlimits. ------------------------
+        let child_thread_remote = Arc::new(syscalls::process::ThreadRemote::new());
+        let child_process = Arc::new(syscalls::process::Process::new_with_rlimits(
+            id.pid,
+            child_thread_remote.clone(),
+            &pw.rlimits,
+            pw.thp_disabled,
+        ));
+
+        // --- 7. Build ThreadState. ------------------------------------------
+        let child_thread = syscalls::process::ThreadState::new_from_restore(
+            id.pid,
+            child_process.clone(),
+            child_thread_remote,
+            th.clear_child_tid,
+            th.robust_list,
+        );
+
+        // --- 8. Restore signal state. ---------------------------------------
+        let child_signals = syscalls::signal::SignalState::new_from_restore(
+            sig.blocked,
+            &sig.handlers,
+            sig.altstack,
+        );
+
+        // --- 9. Restore filesystem state. -----------------------------------
+        let child_fs = {
+            let mut cwd = fs_snap.cwd.clone();
+            if !cwd.ends_with('/') {
+                cwd.push('/');
+            }
+            Arc::new(syscalls::file::FsState::from_restore(
+                cwd,
+                fs_snap.exe_path.clone(),
+                fs_snap.umask,
+            ))
+        };
+
+        // --- 10. Restore FD table (v1: stdio only). -------------------------
+        let child_files = Arc::new(syscalls::file::FilesState::new(fs.clone()));
+        child_files.set_max_fd(
+            child_process
+                .limits
+                .get_rlimit_cur(litebox_common_linux::RlimitResource::NOFILE)
+                .saturating_sub(1),
+        );
+        child_files.initialize_stdio_in_shared_descriptors_table(&self.global);
+
+        // --- 11. Build credentials. -----------------------------------------
+        let child_credentials = Arc::new(syscalls::process::Credentials {
+            uid: id.credentials.uid,
+            euid: id.credentials.euid,
+            gid: id.credentials.gid,
+            egid: id.credentials.egid,
+        });
+
+        // --- 11. Build Task with fork return value 0. -----------------------
+        let mut exec_ctx = th.execution_context;
+        // fork() returns 0 in the child.
+        #[cfg(target_arch = "x86_64")]
+        {
+            exec_ctx.rax = 0;
+        }
+        #[cfg(target_arch = "x86")]
+        {
+            exec_ctx.eax = 0;
+        }
+
+        let mut comm = [0u8; litebox_common_linux::TASK_COMM_LEN];
+        comm.copy_from_slice(&id.comm);
+
+        let entrypoints = LinuxShimEntrypoints {
+            _not_send: core::marker::PhantomData,
+            task: Task {
+                global: self.global.clone(),
+                process_state: child_process_state.into(),
+                thread: child_thread,
+                wait_state: wait::WaitState::new(self.global.platform),
+                process_id: litebox::process::ProcessId::INIT,
+                pid: id.pid,
+                ppid: id.ppid,
+                tid: id.tid,
+                credentials: child_credentials,
+                comm: Cell::new(comm),
+                fs: child_fs.into(),
+                files: child_files.into(),
+                signals: child_signals,
+                fork_context: RefCell::new(None),
+                last_shell_write: RefCell::new(None),
+                last_syscall: Cell::new(None),
+                syscall_restartable: Cell::new(false),
+                in_syscall: Cell::new(false),
+                deferred_vfork_park: Cell::new(false),
+            },
+        };
+
+        // Set the init state so the first handle_init_request restores the
+        // full execution context (registers + TLS) from the snapshot.
+        entrypoints
+            .task
+            .thread
+            .init_state
+            .set(syscalls::process::ThreadInitState::ForkRestore {
+                exec_ctx: alloc::boxed::Box::new(exec_ctx),
+                tls_base: th.tls_base,
+                set_child_tid: th.set_child_tid,
+            });
+
+        let process = LinuxShimProcess(child_process);
+        Ok(LoadedProgram {
+            entrypoints,
+            process,
+        })
     }
 }
 

@@ -110,6 +110,32 @@ impl SignalState {
         }
     }
 
+    /// Reconstruct signal state from a fork snapshot.
+    ///
+    /// Per POSIX/Linux fork semantics: handlers and blocked mask are inherited,
+    /// pending signals are not.
+    pub fn new_from_restore(
+        blocked: SigSet,
+        handler_snapshots: &[crate::syscalls::fork_snapshot::SignalHandlerSnapshot],
+        altstack: SigAltStack,
+    ) -> Self {
+        let handlers = SignalHandlers::from_restore(handler_snapshots);
+        Self {
+            pending: RefCell::new(PendingSignals::new()),
+            shared_pending: Arc::new(Mutex::new(PendingSignals::new())),
+            blocked: Cell::new(blocked),
+            handlers: RefCell::new(Arc::new(handlers)),
+            altstack: Cell::new(altstack),
+            last_exception: Cell::new(litebox::shim::ExceptionInfo {
+                exception: litebox::shim::Exception(0),
+                error_code: 0,
+                cr2: 0,
+                kernel_mode: false,
+            }),
+            restore_mask: Cell::new(None),
+        }
+    }
+
     /// Get the current blocked signal mask.
     pub fn get_blocked(&self) -> SigSet {
         self.blocked.get()
@@ -296,6 +322,41 @@ impl SignalHandlers {
                         || i == SignalHandlersInner::sig_index(Signal::SIGSTOP),
                 }),
             }),
+        }
+    }
+
+    fn from_restore(
+        handler_snapshots: &[crate::syscalls::fork_snapshot::SignalHandlerSnapshot],
+    ) -> Self {
+        let mut handlers: [Handler; NSIG] = core::array::from_fn(|i| Handler {
+            action: SigAction {
+                sigaction: SIG_DFL,
+                restorer: 0,
+                flags: SaFlags::empty(),
+                mask: SigSet::empty(),
+                #[cfg(target_arch = "x86_64")]
+                __pad: 0,
+            },
+            immutable: i == SignalHandlersInner::sig_index(Signal::SIGKILL)
+                || i == SignalHandlersInner::sig_index(Signal::SIGSTOP),
+        });
+        for (i, snap) in handler_snapshots.iter().enumerate() {
+            if i < NSIG {
+                // Don't override SIGKILL/SIGSTOP immutable handlers.
+                if !handlers[i].immutable {
+                    handlers[i].action = SigAction {
+                        sigaction: snap.sigaction,
+                        restorer: snap.restorer,
+                        flags: snap.flags,
+                        mask: snap.mask,
+                        #[cfg(target_arch = "x86_64")]
+                        __pad: 0,
+                    };
+                }
+            }
+        }
+        Self {
+            inner: Mutex::new(SignalHandlersInner { handlers }),
         }
     }
 }
