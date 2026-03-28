@@ -681,10 +681,17 @@ impl LinuxUserland {
             let mut finished = Vec::new();
             let mut idx = 0;
             while idx < detached.len() {
-                if let Some(input_control) = detached[idx].input_control.as_ref()
-                    && let Some(thread_handle) = &input_control.thread_handle
-                {
-                    thread_handle.interrupt();
+                if let Some(input_control) = detached[idx].input_control.as_ref() {
+                    // All bridges in detached_worker_bridge_threads belong to
+                    // completed workers.  Set cancel so that waker-based bridges
+                    // (e.g. PTY-backed Fs) observe the flag in their
+                    // CheckForInterrupt and break out of wait_on_events.
+                    input_control
+                        .cancel
+                        .store(true, std::sync::atomic::Ordering::Release);
+                    if let Some(thread_handle) = &input_control.thread_handle {
+                        thread_handle.interrupt();
+                    }
                 }
                 if detached[idx].handle.is_finished() {
                     finished.push(detached.swap_remove(idx));
@@ -1807,14 +1814,17 @@ where
     match source {
         WorkerExecInputSource::Fs { fs, fd } => {
             let thread_cancel = cancel.clone();
+            let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+            let handle = std::thread::Builder::new().spawn(move || {
+                block_guest_signals();
+                bridge_worker_input_from_fs(platform, fs, fd, host_write_fd, thread_cancel, sender);
+            })?;
+            let thread_handle = receiver.recv().ok();
             Ok(DetachedWorkerBridge {
-                handle: std::thread::Builder::new().spawn(move || {
-                    block_guest_signals();
-                    bridge_worker_input_from_fs(fs, fd, host_write_fd, thread_cancel);
-                })?,
+                handle,
                 input_control: Some(WorkerInputBridgeControl {
                     cancel,
-                    thread_handle: None,
+                    thread_handle,
                 }),
             })
         }
@@ -1949,36 +1959,95 @@ fn terminate_worker_after_bridge_spawn_failure(
 }
 
 fn bridge_worker_input_from_fs<FS>(
+    platform: &'static LinuxUserland,
     fs: std::sync::Arc<FS>,
     fd: std::sync::Arc<litebox::fd::TypedFd<FS>>,
     host_write_fd: std::os::fd::OwnedFd,
     cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    thread_handle_sender: std::sync::mpsc::SyncSender<
+        litebox::event::wait::ThreadHandle<LinuxUserland>,
+    >,
 ) where
     FS: litebox::fs::FileSystem + Send + Sync + 'static,
 {
-    let mut host_write = std::fs::File::from(host_write_fd);
-    let mut buf = [0_u8; 8192];
-    loop {
-        if cancel.load(std::sync::atomic::Ordering::Acquire) {
-            break;
-        }
-        if !worker_stdio_pipe_has_readers(&host_write) {
-            break;
-        }
-        match fs.read(fd.as_ref(), &mut buf, None) {
-            Ok(0) => break,
-            Ok(read) => {
-                if !write_worker_stdio_all(&mut host_write, &buf[..read]) {
-                    break;
-                }
-            }
-            Err(litebox::fs::errors::ReadError::Interrupted) => {}
-            Err(litebox::fs::errors::ReadError::WouldBlock) => {
-                std::thread::sleep(Duration::from_millis(1));
-            }
-            Err(_) => break,
+    use litebox::event::polling::TryOpError;
+
+    struct CancelInterrupt(std::sync::Arc<std::sync::atomic::AtomicBool>);
+    impl litebox::event::wait::CheckForInterrupt for CancelInterrupt {
+        fn check_for_interrupt(&self) -> bool {
+            self.0.load(std::sync::atomic::Ordering::Acquire)
         }
     }
+
+    ThreadHandle::run_with_handle(|| {
+        let mut host_write = std::fs::File::from(host_write_fd);
+        let mut buf = [0_u8; 8192];
+        let io_pollable = fs.get_io_pollable(fd.as_ref());
+        let use_waker = io_pollable.as_ref().is_some_and(|p| !p.needs_host_poll());
+        let wait_state = litebox::event::wait::WaitState::new(platform);
+        let _ = thread_handle_sender.send(wait_state.thread_handle());
+        let cancel_checker = CancelInterrupt(cancel.clone());
+        let base_cx = wait_state.context();
+        let cx = if use_waker {
+            Some(base_cx.with_check_for_interrupt(&cancel_checker))
+        } else {
+            None
+        };
+        loop {
+            if cancel.load(std::sync::atomic::Ordering::Acquire) {
+                break;
+            }
+            if !worker_stdio_pipe_has_readers(&host_write) {
+                break;
+            }
+            if let (Some(cx), Some(pollable)) = (&cx, &io_pollable) {
+                // Use waker-based blocking wait for pollable fds (e.g. PTYs).
+                let result = cx.wait_on_events(
+                    false,
+                    litebox::event::Events::IN,
+                    |observer, filter| {
+                        pollable.register_observer(observer, filter);
+                        Ok::<_, litebox::fs::errors::ReadError>(())
+                    },
+                    || match fs.read(fd.as_ref(), &mut buf, None) {
+                        Ok(n) => Ok(n),
+                        Err(
+                            litebox::fs::errors::ReadError::WouldBlock
+                            | litebox::fs::errors::ReadError::Interrupted,
+                        ) => Err(TryOpError::TryAgain),
+                        Err(e) => Err(TryOpError::Other(e)),
+                    },
+                );
+                match result {
+                    Ok(0) => break,
+                    Ok(read) => {
+                        if !write_worker_stdio_all(&mut host_write, &buf[..read]) {
+                            break;
+                        }
+                    }
+                    Err(TryOpError::WaitError(_)) => {
+                        // Interrupted (e.g. cancel/exit) — recheck loop condition.
+                    }
+                    Err(_) => break,
+                }
+            } else {
+                // Fallback: sleep-poll for non-pollable fds.
+                match fs.read(fd.as_ref(), &mut buf, None) {
+                    Ok(0) => break,
+                    Ok(read) => {
+                        if !write_worker_stdio_all(&mut host_write, &buf[..read]) {
+                            break;
+                        }
+                    }
+                    Err(litebox::fs::errors::ReadError::Interrupted) => {}
+                    Err(litebox::fs::errors::ReadError::WouldBlock) => {
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                    Err(_) => break,
+                }
+            }
+        }
+    });
 }
 
 fn bridge_worker_input_from_pipe(

@@ -4427,17 +4427,16 @@ fn worker_exec_stdio_is_unsupported<FS: ShimFS>(
             log_worker_exec_stdio_unsupported(global, raw_fd, "missing file status");
             return true;
         };
-        let unsupported = if status.file_type == litebox::fs::FileType::Directory {
-            Some("directory-backed stdio")
-        } else if worker_exec_stdio_needs_terminal_semantics(&status) {
-            Some("terminal-like device without explicit host alias")
-        } else {
-            None
-        };
-        if let Some(reason) = unsupported {
-            log_worker_exec_stdio_unsupported(global, raw_fd, reason);
+        if status.file_type == litebox::fs::FileType::Directory {
+            log_worker_exec_stdio_unsupported(global, raw_fd, "directory-backed stdio");
             return true;
         }
+        // All other FS-backed fds — including terminal-like devices such as
+        // /dev/tty, /dev/stdin, /dev/stdout, /dev/stderr (rdev 0x500), and
+        // sandbox-created PTY masters/slaves (rdev 0x8800+N) — are bridgeable
+        // via the Fs path.  If the fd had a direct host alias
+        // (HostStdioSourceFd or HostTtyAlias), it was already handled above
+        // with a HostStdio binding.
         return false;
     }
     if rds
@@ -4532,17 +4531,6 @@ fn worker_exec_stdio_is_unsupported<FS: ShimFS>(
     drop(rds);
     log_worker_exec_stdio_unsupported(global, raw_fd, "unknown descriptor subsystem");
     true
-}
-
-fn worker_exec_stdio_needs_terminal_semantics(status: &litebox::fs::FileStatus) -> bool {
-    if status.file_type != litebox::fs::FileType::CharacterDevice {
-        return false;
-    }
-    match status.node_info.rdev.map(core::num::NonZero::get) {
-        Some(0x500 | 0x502) => true,
-        Some(rdev) if rdev >= 0x8800 => true,
-        _ => false,
-    }
 }
 
 fn worker_exec_tty_stdio_source_fd<FS: ShimFS>(
@@ -6634,7 +6622,7 @@ mod tests {
     }
 
     #[test]
-    fn worker_exec_stdio_bindings_reject_non_host_terminal_backed_stdout() {
+    fn worker_exec_stdio_bindings_proxy_sandbox_pty_stdout() {
         let task = crate::syscalls::tests::init_platform(None);
         let ptmx_fd = task
             .sys_open("/dev/ptmx", OFlags::RDWR, litebox::fs::Mode::empty())
@@ -6643,10 +6631,13 @@ mod tests {
         task.sys_dup(ptmx_fd, Some(1), None)
             .expect("dup2 onto stdout should succeed");
 
-        let Err(err) = task.worker_exec_stdio_bindings() else {
-            panic!("non-host terminal stdout should be rejected")
-        };
-        assert_eq!(err, Errno::ENOTSUP);
+        let bindings = task
+            .worker_exec_stdio_bindings()
+            .expect("sandbox PTY stdout should be accepted");
+        match bindings.stdout {
+            WorkerExecOutputBinding::Fs { .. } => {}
+            _ => panic!("sandbox PTY stdout should be proxied via the guest FS"),
+        }
     }
 
     #[test]
@@ -6727,24 +6718,22 @@ mod tests {
     }
 
     #[test]
-    fn worker_exec_stdio_bindings_reject_high_index_pty_stdin() {
+    fn worker_exec_stdio_bindings_proxy_sandbox_pty_stdin() {
         let task = crate::syscalls::tests::init_platform(None);
-        let mut pty_fd = None;
-        for _ in 0..=256 {
-            pty_fd = Some(
-                task.sys_open("/dev/ptmx", OFlags::RDWR, litebox::fs::Mode::empty())
-                    .expect("open /dev/ptmx should succeed"),
-            );
-        }
-        let pty_fd = i32::try_from(pty_fd.expect("at least one PTY fd should be opened"))
-            .expect("fd should fit in i32");
-        task.sys_dup(pty_fd, Some(0), None)
+        let ptmx_fd = task
+            .sys_open("/dev/ptmx", OFlags::RDWR, litebox::fs::Mode::empty())
+            .expect("open /dev/ptmx should succeed");
+        let ptmx_fd = i32::try_from(ptmx_fd).expect("fd should fit in i32");
+        task.sys_dup(ptmx_fd, Some(0), None)
             .expect("dup2 onto stdin should succeed");
 
-        let Err(err) = task.worker_exec_stdio_bindings() else {
-            panic!("high-index PTY stdin should be rejected")
-        };
-        assert_eq!(err, Errno::ENOTSUP);
+        let bindings = task
+            .worker_exec_stdio_bindings()
+            .expect("sandbox PTY stdin should be accepted");
+        match bindings.stdin {
+            WorkerExecInputBinding::Fs { .. } => {}
+            _ => panic!("sandbox PTY stdin should be proxied via the guest FS"),
+        }
     }
 
     #[test]
