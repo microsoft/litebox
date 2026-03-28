@@ -1784,4 +1784,25 @@ mod tests {
         assert!(msg.contains("shared mapping"));
         assert!(msg.contains("inotify"));
     }
+
+    #[test]
+    fn snapshot_round_trip_preserves_is_delayed_fork_false() {
+        let original = make_test_snapshot();
+        assert!(!original.is_delayed_fork);
+        let bytes = original.serialize();
+        let restored = ForkSnapshot::deserialize(&bytes).expect("deserialize failed");
+        assert!(!restored.is_delayed_fork);
+    }
+
+    #[test]
+    fn snapshot_round_trip_preserves_is_delayed_fork_true() {
+        let mut snapshot = make_test_snapshot();
+        snapshot.is_delayed_fork = true;
+        let bytes = snapshot.serialize();
+        let restored = ForkSnapshot::deserialize(&bytes).expect("deserialize failed");
+        assert!(restored.is_delayed_fork);
+        // Other fields still intact.
+        assert_eq!(restored.identity.pid, 42);
+        assert_eq!(restored.thread.tls_base, Some(0x7f00_dead_beef));
+    }
 }

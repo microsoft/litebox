@@ -3265,4 +3265,201 @@ mod tests {
             FileDescriptorFlags::FD_CLOEXEC.bits()
         );
     }
+
+    // ---- Delayed-fork allowlist tests (x86_64 only) ----
+
+    #[cfg(target_arch = "x86_64")]
+    /// Helper: build an ExecutionContext with the given syscall number and args.
+    fn make_syscall_ctx(
+        nr: usize,
+        arg0: usize,
+        arg1: usize,
+    ) -> litebox_common_linux::ExecutionContext {
+        let mut ctx = litebox_common_linux::ExecutionContext::default();
+        ctx.orig_rax = nr;
+        ctx.rdi = arg0;
+        ctx.rsi = arg1;
+        ctx
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn assert_allowed(nr: ::syscalls::Sysno) {
+        let ctx = make_syscall_ctx(nr as usize, 0, 0);
+        assert!(
+            Task::<DefaultFS>::is_pre_exec_syscall(&ctx),
+            "{nr:?} should be allowed"
+        );
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn assert_rejected(nr: ::syscalls::Sysno) {
+        let ctx = make_syscall_ctx(nr as usize, 0, 0);
+        assert!(
+            !Task::<DefaultFS>::is_pre_exec_syscall(&ctx),
+            "{nr:?} should be rejected"
+        );
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn pre_exec_syscall_allows_terminal_syscalls() {
+        use ::syscalls::Sysno;
+        assert_allowed(Sysno::execve);
+        assert_allowed(Sysno::execveat);
+        assert_allowed(Sysno::exit);
+        assert_allowed(Sysno::exit_group);
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn pre_exec_syscall_allows_fd_plumbing() {
+        use ::syscalls::Sysno;
+        assert_allowed(Sysno::close);
+        assert_allowed(Sysno::close_range);
+        assert_allowed(Sysno::dup);
+        assert_allowed(Sysno::dup2);
+        assert_allowed(Sysno::dup3);
+        assert_allowed(Sysno::open);
+        assert_allowed(Sysno::openat);
+        assert_allowed(Sysno::openat2);
+        assert_allowed(Sysno::pipe2);
+        assert_allowed(Sysno::write);
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn pre_exec_syscall_allows_directory() {
+        use ::syscalls::Sysno;
+        assert_allowed(Sysno::chdir);
+        assert_allowed(Sysno::fchdir);
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn pre_exec_syscall_allows_process_group() {
+        use ::syscalls::Sysno;
+        assert_allowed(Sysno::setpgid);
+        assert_allowed(Sysno::setsid);
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn pre_exec_syscall_allows_signal_setup() {
+        use ::syscalls::Sysno;
+        assert_allowed(Sysno::rt_sigaction);
+        assert_allowed(Sysno::rt_sigprocmask);
+        assert_allowed(Sysno::sigaltstack);
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn pre_exec_syscall_allows_identity() {
+        use ::syscalls::Sysno;
+        assert_allowed(Sysno::setuid);
+        assert_allowed(Sysno::setgid);
+        assert_allowed(Sysno::setgroups);
+        assert_allowed(Sysno::setreuid);
+        assert_allowed(Sysno::setregid);
+        assert_allowed(Sysno::setresuid);
+        assert_allowed(Sysno::setresgid);
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn pre_exec_syscall_allows_scheduling() {
+        use ::syscalls::Sysno;
+        assert_allowed(Sysno::sched_setscheduler);
+        assert_allowed(Sysno::sched_setaffinity);
+        assert_allowed(Sysno::sched_setparam);
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn pre_exec_syscall_allows_resource_limits() {
+        use ::syscalls::Sysno;
+        assert_allowed(Sysno::setrlimit);
+        assert_allowed(Sysno::prlimit64);
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn pre_exec_syscall_allows_readonly_queries() {
+        use ::syscalls::Sysno;
+        assert_allowed(Sysno::getpid);
+        assert_allowed(Sysno::getppid);
+        assert_allowed(Sysno::gettid);
+        assert_allowed(Sysno::getuid);
+        assert_allowed(Sysno::getgid);
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn pre_exec_syscall_rejects_non_allowlisted() {
+        use ::syscalls::Sysno;
+        assert_rejected(Sysno::read);
+        assert_rejected(Sysno::mmap);
+        assert_rejected(Sysno::brk);
+        assert_rejected(Sysno::clone);
+        assert_rejected(Sysno::ioctl);
+        assert_rejected(Sysno::poll);
+        assert_rejected(Sysno::socket);
+        assert_rejected(Sysno::connect);
+        assert_rejected(Sysno::accept);
+        assert_rejected(Sysno::wait4);
+        assert_rejected(Sysno::kill);
+        assert_rejected(Sysno::futex);
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn pre_exec_syscall_fcntl_allows_fd_ops() {
+        use ::syscalls::Sysno;
+        // F_DUPFD=0, F_GETFD=1, F_SETFD=2, F_DUPFD_CLOEXEC=1030
+        for cmd in [0, 1, 2, 1030] {
+            let ctx = make_syscall_ctx(Sysno::fcntl as usize, 3, cmd);
+            assert!(
+                Task::<DefaultFS>::is_pre_exec_syscall(&ctx),
+                "fcntl cmd={cmd} should be allowed"
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn pre_exec_syscall_fcntl_rejects_non_fd_ops() {
+        use ::syscalls::Sysno;
+        // F_GETFL=3, F_SETFL=4, F_GETLK=5, F_SETLK=6, F_SETOWN=8
+        for cmd in [3, 4, 5, 6, 8] {
+            let ctx = make_syscall_ctx(Sysno::fcntl as usize, 3, cmd);
+            assert!(
+                !Task::<DefaultFS>::is_pre_exec_syscall(&ctx),
+                "fcntl cmd={cmd} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn pre_exec_syscall_prctl_allows_pdeathsig_and_name() {
+        use ::syscalls::Sysno;
+        // PR_SET_PDEATHSIG=1, PR_SET_NAME=15
+        let ctx = make_syscall_ctx(Sysno::prctl as usize, 1, 9);
+        assert!(Task::<DefaultFS>::is_pre_exec_syscall(&ctx));
+        let ctx = make_syscall_ctx(Sysno::prctl as usize, 15, 0x1000);
+        assert!(Task::<DefaultFS>::is_pre_exec_syscall(&ctx));
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn pre_exec_syscall_prctl_rejects_other_ops() {
+        use ::syscalls::Sysno;
+        // PR_GET_NAME=16, PR_SET_SECCOMP=22, PR_SET_NO_NEW_PRIVS=38
+        for op in [16, 22, 38] {
+            let ctx = make_syscall_ctx(Sysno::prctl as usize, op, 0);
+            assert!(
+                !Task::<DefaultFS>::is_pre_exec_syscall(&ctx),
+                "prctl op={op} should be rejected"
+            );
+        }
+    }
 }
