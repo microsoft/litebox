@@ -95,6 +95,50 @@ pub struct LinuxShimEntrypoints<FS: ShimFS> {
     _not_send: core::marker::PhantomData<*const ()>,
 }
 
+impl<FS: ShimFS> LinuxShimEntrypoints<FS> {
+    /// Install a host-backed pipe FD into the restored child's descriptor table.
+    ///
+    /// Called by the runner after `restore_process` to replace virtual pipe
+    /// endpoints with real OS pipe FDs for cross-host-process communication.
+    /// This replaces any existing pipe endpoint at the given guest FD number.
+    pub fn install_host_pipe_fd(
+        &self,
+        guest_fd: usize,
+        host_fd: i32,
+        direction: syscalls::host_pipe::HostPipeDirection,
+    ) {
+        let entry = syscalls::host_pipe::HostPipeFd::new(host_fd, direction);
+        let mut dt = self.task.global.litebox.descriptor_table_mut();
+        let typed_fd: litebox::fd::TypedFd<syscalls::host_pipe::HostPipeSubsystem> =
+            dt.insert(entry);
+        drop(dt);
+
+        let files = self.task.files.borrow();
+        let mut rds = files.raw_descriptor_store.write();
+
+        // Remove the existing entry at this slot, regardless of subsystem type.
+        // The slot might hold a virtual Pipe (from snapshot), a StdioFd (from
+        // the init process if fd_table restore is not yet implemented), or
+        // nothing at all.  Close the consumed descriptor properly to avoid
+        // leaking descriptor-table entries.
+        if let Ok(old_pipe) =
+            rds.fd_consume_raw_integer::<litebox::pipes::Pipes<Platform>>(guest_fd)
+        {
+            drop(rds);
+            let _ = self.task.global.pipes.close(&old_pipe);
+            rds = files.raw_descriptor_store.write();
+        } else if let Ok(old_fs) = rds.fd_consume_raw_integer::<FS>(guest_fd) {
+            drop(rds);
+            let _ = files.fs.close(&old_fs);
+            rds = files.raw_descriptor_store.write();
+        }
+
+        // Install the HostPipe FD at the same guest fd number.
+        let ok = rds.fd_into_specific_raw_integer(typed_fd, guest_fd);
+        debug_assert!(ok, "install_host_pipe_fd: slot {guest_fd} still occupied");
+    }
+}
+
 impl<FS: ShimFS> litebox::shim::EnterShim for LinuxShimEntrypoints<FS> {
     type ExecutionContext = litebox_common_linux::ExecutionContext;
 
@@ -474,6 +518,7 @@ impl<FS: ShimFS> LinuxShim<FS> {
     ///
     /// Returns an error if restore fails (e.g., the snapshot references
     /// unsupported state).
+    #[allow(clippy::cast_possible_wrap, clippy::cast_sign_loss)]
     pub fn restore_process(
         &self,
         snapshot: syscalls::fork_snapshot::ForkSnapshot,
@@ -498,7 +543,18 @@ impl<FS: ShimFS> LinuxShim<FS> {
         // Reserve the child's thread ID so future clone() calls don't collide.
         self.global.reserve_thread_id(id.pid);
 
-        // --- 1. Allocate a new address space for the child. -----------------
+        // --- 1. Reuse the init process's address space slot. -----------------
+        // The parent used slot 0 in its host. The child host's init process
+        // also occupies slot 0 but is unused in fork-restore mode. Destroy it
+        // and re-create to get a clean slot 0, so all snapshot addresses
+        // remain valid without rebasing (va_rebase = 0).
+        let init_as_id = self.process_state.address_space_id;
+        // Deallocate the init process's pages (clears page tables).
+        self.global
+            .platform
+            .destroy_address_space(init_as_id)
+            .map_err(|_| Errno::ENOMEM)?;
+        // Re-allocate slot 0 (the allocator gives back the lowest free slot).
         let child_as_id = self
             .global
             .platform
@@ -511,7 +567,16 @@ impl<FS: ShimFS> LinuxShim<FS> {
             .map_err(|_| Errno::ENOMEM)?;
 
         let child_pm: PageManager<Platform, { PAGE_SIZE }> =
-            PageManager::new(&self.global.litebox, as_range);
+            PageManager::new(&self.global.litebox, as_range.clone());
+
+        // Compute VA rebase offset (should be 0 since we reuse the same slot).
+        let snapshot_va_start = mem.metadata.va_range.start;
+        let child_va_start = as_range.start;
+        let va_rebase: isize = child_va_start as isize - snapshot_va_start as isize;
+        debug_assert_eq!(
+            va_rebase, 0,
+            "non-zero va_rebase not fully supported: signal handlers would be stale"
+        );
 
         // --- 2. Restore memory regions. ------------------------------------
         for region in &mem.regions {
@@ -520,7 +585,8 @@ impl<FS: ShimFS> LinuxShim<FS> {
             let has_write = vm_flags.contains(VmFlags::VM_WRITE);
             let has_exec = vm_flags.contains(VmFlags::VM_EXEC);
 
-            let addr = NonZeroAddress::<PAGE_SIZE>::new(region.addr).ok_or(Errno::EINVAL)?;
+            let rebased_addr = (region.addr as isize + va_rebase) as usize;
+            let addr = NonZeroAddress::<PAGE_SIZE>::new(rebased_addr).ok_or(Errno::EINVAL)?;
             let len = NonZeroPageSize::<PAGE_SIZE>::new(region.len).ok_or(Errno::EINVAL)?;
 
             let mut flags = CreatePagesFlags::FIXED_ADDR;
@@ -593,10 +659,16 @@ impl<FS: ShimFS> LinuxShim<FS> {
         // --- 3. Restore brk metadata (pages already mapped above). ----------
         let pm_meta = &mem.metadata;
         if pm_meta.brk_base != 0 {
-            child_pm.restore_brk_metadata(pm_meta.brk_base, pm_meta.brk, pm_meta.brk_frontier);
+            let rb = |addr: usize| (addr as isize + va_rebase) as usize;
+            child_pm.restore_brk_metadata(
+                rb(pm_meta.brk_base),
+                rb(pm_meta.brk),
+                rb(pm_meta.brk_frontier),
+            );
         }
 
         // --- 4. Build the child ProcessState. -------------------------------
+        let rb = |addr: usize| (addr as isize + va_rebase) as usize;
         let elf_patch_cache: alloc::collections::BTreeMap<i32, syscalls::mm::ElfPatchState> =
             pm_meta
                 .elf_patch_entries
@@ -605,13 +677,13 @@ impl<FS: ShimFS> LinuxShim<FS> {
                     (
                         e.fd,
                         syscalls::mm::ElfPatchState {
-                            _base_addr: e.base_addr,
+                            _base_addr: rb(e.base_addr),
                             pre_patched: e.pre_patched,
                             trampoline_file_offset: e.trampoline_file_offset,
                             trampoline_file_size: e.trampoline_file_size,
                             _trampoline_vaddr: e.trampoline_vaddr,
-                            trampoline_addr: e.trampoline_addr,
-                            trampoline_cursor: e.trampoline_cursor,
+                            trampoline_addr: rb(e.trampoline_addr),
+                            trampoline_cursor: rb(e.trampoline_cursor),
                             trampoline_mapped: e.trampoline_mapped,
                             trampoline_mapped_len: e.trampoline_mapped_len,
                             runtime_patches_committed: e.runtime_patches_committed,
@@ -624,8 +696,73 @@ impl<FS: ShimFS> LinuxShim<FS> {
         let proc_map_paths: Vec<(core::ops::Range<usize>, alloc::string::String)> = pm_meta
             .proc_map_paths
             .iter()
-            .map(|(range, path)| (range.clone(), path.clone()))
+            .map(|(range, path)| (rb(range.start)..rb(range.end), path.clone()))
             .collect();
+
+        // --- 5. Re-patch trampoline entry points. ---------------------------
+        // Each rewriter trampoline region starts with an 8-byte pointer to the
+        // host's syscall_callback. The snapshot captured the parent host's
+        // address; update it to the child host's address.
+        let new_syscall_entry = {
+            use litebox::platform::SystemInfoProvider as _;
+            self.global.platform.get_syscall_entry_point()
+        };
+        let old_syscall_entry = pm_meta.old_syscall_entry_point;
+        if new_syscall_entry != 0
+            && old_syscall_entry != 0
+            && new_syscall_entry != old_syscall_entry
+        {
+            use litebox::platform::RawMutPointer as _;
+
+            // First patch any entries tracked in the elf_patch_cache (runtime-
+            // patched libraries).
+            for state in elf_patch_cache.values() {
+                if !state.trampoline_mapped {
+                    continue;
+                }
+                let tramp_addr = state.trampoline_addr;
+                let tramp_page_len = state.trampoline_mapped_len;
+                let tramp_ptr = <Platform as litebox::platform::RawPointerProvider>::RawMutPointer::<
+                    u8,
+                >::from_usize(tramp_addr);
+                // SAFETY: no concurrent access — child hasn't started yet.
+                unsafe {
+                    let _ = child_pm.make_pages_writable(tramp_ptr, tramp_page_len);
+                }
+                let _ = tramp_ptr.copy_from_slice(0, &new_syscall_entry.to_le_bytes());
+                unsafe {
+                    let _ = child_pm.make_pages_executable(tramp_ptr, tramp_page_len);
+                }
+            }
+
+            // Also scan all restored RX memory regions for trampolines that
+            // were created by the ELF loader (not in elf_patch_cache).
+            // A trampoline region's first 8 bytes contain the host's syscall
+            // entry point address.
+            let old_bytes = old_syscall_entry.to_le_bytes();
+            for region in &mem.regions {
+                let vm_flags = VmFlags::from_bits_truncate(region.vm_flags);
+                if !vm_flags.contains(VmFlags::VM_EXEC) {
+                    continue;
+                }
+                // Check if the first 8 bytes of the region data match the old entry.
+                if region.data.len() >= 8 && region.data[..8] == old_bytes {
+                    let rebased_addr = (region.addr as isize + va_rebase) as usize;
+                    let page_len = (region.len + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+                    let tramp_ptr =
+                        <Platform as litebox::platform::RawPointerProvider>::RawMutPointer::<u8>
+                            ::from_usize(rebased_addr);
+                    // SAFETY: no concurrent access — child hasn't started yet.
+                    unsafe {
+                        let _ = child_pm.make_pages_writable(tramp_ptr, page_len);
+                    }
+                    let _ = tramp_ptr.copy_from_slice(0, &new_syscall_entry.to_le_bytes());
+                    unsafe {
+                        let _ = child_pm.make_pages_executable(tramp_ptr, page_len);
+                    }
+                }
+            }
+        }
 
         let child_process_state = Arc::new(ProcessState {
             pm: child_pm,
@@ -634,8 +771,8 @@ impl<FS: ShimFS> LinuxShim<FS> {
             active_vfork_layers: litebox::sync::Mutex::new(Vec::new()),
             elf_patch_cache: litebox::sync::Mutex::new(elf_patch_cache),
             shared_file_mappings: litebox::sync::Mutex::new(alloc::vec::Vec::new()),
-            main_bss_start: core::sync::atomic::AtomicUsize::new(pm_meta.main_bss_start),
-            main_bss_end: core::sync::atomic::AtomicUsize::new(pm_meta.main_bss_end),
+            main_bss_start: core::sync::atomic::AtomicUsize::new(rb(pm_meta.main_bss_start)),
+            main_bss_end: core::sync::atomic::AtomicUsize::new(rb(pm_meta.main_bss_end)),
             proc_map_paths: litebox::sync::Mutex::new(proc_map_paths),
             vfork_parking: Arc::new(VforkParking {
                 park: <Platform as litebox::platform::RawMutexProvider>::RawMutex::INIT,
@@ -658,15 +795,26 @@ impl<FS: ShimFS> LinuxShim<FS> {
             id.pid,
             child_process.clone(),
             child_thread_remote,
-            th.clear_child_tid,
-            th.robust_list,
+            th.clear_child_tid.map(rb),
+            th.robust_list.map(rb),
         );
 
         // --- 8. Restore signal state. ---------------------------------------
+        let rebased_altstack = litebox_common_linux::signal::SigAltStack {
+            sp: if sig.altstack.sp != 0 {
+                rb(sig.altstack.sp)
+            } else {
+                0
+            },
+            flags: sig.altstack.flags,
+            #[cfg(target_pointer_width = "64")]
+            __pad: sig.altstack.__pad,
+            size: sig.altstack.size,
+        };
         let child_signals = syscalls::signal::SignalState::new_from_restore(
             sig.blocked,
             &sig.handlers,
-            sig.altstack,
+            rebased_altstack,
         );
 
         // --- 9. Restore filesystem state. -----------------------------------
@@ -702,6 +850,21 @@ impl<FS: ShimFS> LinuxShim<FS> {
 
         // --- 11. Build Task with execution context. ---------------------------
         let mut exec_ctx = th.execution_context;
+
+        // Rebase all address-valued registers from the snapshot's VA partition
+        // to the child's VA partition.
+        if va_rebase != 0 {
+            #[cfg(target_arch = "x86_64")]
+            {
+                let rb_reg = |v: usize| (v as isize + va_rebase) as usize;
+                exec_ctx.regs.rip = rb_reg(exec_ctx.regs.rip);
+                exec_ctx.regs.rsp = rb_reg(exec_ctx.regs.rsp);
+                exec_ctx.regs.rbp = rb_reg(exec_ctx.regs.rbp);
+                exec_ctx.regs.rcx = rb_reg(exec_ctx.regs.rcx);
+                exec_ctx.regs.r11 = rb_reg(exec_ctx.regs.r11);
+            }
+        }
+
         if !is_delayed_fork {
             // True fork: fork() returns 0 in the child.
             #[cfg(target_arch = "x86_64")]
@@ -755,8 +918,8 @@ impl<FS: ShimFS> LinuxShim<FS> {
             .init_state
             .set(syscalls::process::ThreadInitState::ForkRestore {
                 exec_ctx: alloc::boxed::Box::new(exec_ctx),
-                tls_base: th.tls_base,
-                set_child_tid: th.set_child_tid,
+                tls_base: th.tls_base.map(rb),
+                set_child_tid: th.set_child_tid.map(rb),
             });
 
         let process = LinuxShimProcess(child_process);
@@ -1239,6 +1402,19 @@ impl<FS: ShimFS> syscalls::file::FilesState<FS> {
             return Ok(unix(&fd));
         }
         Err(Errno::EBADF)
+    }
+
+    /// Check if the given raw FD is a host-pipe FD.
+    ///
+    /// Returns a typed handle if it is, `None` otherwise.  Used by `sys_read`,
+    /// `sys_write`, and `sys_close` to fast-path host-pipe I/O without
+    /// modifying every `run_on_raw_fd` call site.
+    pub(crate) fn try_host_pipe_fd(
+        &self,
+        fd: usize,
+    ) -> Option<alloc::sync::Arc<TypedFd<syscalls::host_pipe::HostPipeSubsystem>>> {
+        let rds = self.raw_descriptor_store.read();
+        rds.fd_from_raw_integer(fd).ok()
     }
 }
 
@@ -2894,11 +3070,26 @@ pub(crate) struct VforkParking {
 /// The parent creates this before spawning the child and calls [`wait`](Self::wait)
 /// after the spawn succeeds. The child holds a clone and calls [`signal`](Self::signal)
 /// when it execs or exits, unblocking the parent.
+/// Describes a single pipe endpoint that should be replaced with a host OS
+/// pipe after the delayed-fork child has been migrated.
+#[derive(Debug)]
+struct PipeReplacement {
+    /// The guest FD number to replace.
+    guest_fd: usize,
+    /// The raw host OS file descriptor for the parent's end of the pipe.
+    host_fd: i32,
+    /// Whether this endpoint is a read or write end.
+    direction: syscalls::host_pipe::HostPipeDirection,
+}
+
 struct VforkDone {
     done: core::sync::atomic::AtomicBool,
     /// Waker for the parent thread — calling `wake()` causes the parent's
     /// `wait_until` loop to re-evaluate the done flag.
     parent_waker: litebox::event::wait::Waker<Platform>,
+    /// Pipe replacements the parent should apply after VforkDone is signaled.
+    /// Filled by `commit_delayed_fork`, consumed by `do_fork` after resume.
+    pipe_replacements: litebox::sync::Mutex<Platform, Vec<PipeReplacement>>,
 }
 
 impl VforkDone {
@@ -2906,6 +3097,7 @@ impl VforkDone {
         Self {
             done: core::sync::atomic::AtomicBool::new(false),
             parent_waker,
+            pipe_replacements: litebox::sync::Mutex::new(Vec::new()),
         }
     }
 
@@ -2982,6 +3174,10 @@ struct ForkContext {
     /// The parent's ProcessId in the process registry.
     /// Needed by `commit_delayed_fork` for the snapshot's parent identity.
     parent_process_id: litebox::process::ProcessId,
+    /// Snapshot of the parent's pipe FDs at fork time: (guest_fd, direction, pipe_pair_id).
+    /// Used by `commit_delayed_fork` to find the parent's counterpart pipe endpoints
+    /// so both sides can be replaced with real OS pipes.
+    parent_pipe_fds: Vec<(usize, syscalls::host_pipe::HostPipeDirection, usize)>,
 }
 
 const SHELL_WRITE_SCAN_LEN: usize = 1024;

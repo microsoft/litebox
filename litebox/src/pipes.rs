@@ -234,6 +234,27 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> Pipes<Platform> {
             }
         }
     }
+
+    /// Return an opaque identifier for the pipe pair that this FD belongs to.
+    ///
+    /// Both the read and write endpoints of the same pipe return the same ID.
+    /// This can be used to match counterpart endpoints across cloned FD tables
+    /// (e.g. after fork).
+    pub fn pipe_pair_id(&self, fd: &PipeFd<Platform>) -> Result<usize, errors::ClosedError> {
+        let dt = self.litebox.descriptor_table();
+        match &dt.get_entry(fd).ok_or(errors::ClosedError::ClosedFd)?.entry {
+            PipeEnd::Sender(w) => Ok(Arc::as_ptr(w) as usize),
+            PipeEnd::Receiver(r) => {
+                // Use the write end pointer as the canonical identity.
+                // If the write end has been dropped, fall back to the read
+                // end pointer (the pipe is broken anyway).
+                match r.peer.upgrade() {
+                    Some(w) => Ok(Arc::as_ptr(&w) as usize),
+                    None => Ok(Arc::as_ptr(r) as usize),
+                }
+            }
+        }
+    }
 }
 
 /// Whether a particular pipe end is the sender half or the receiver half

@@ -398,6 +398,28 @@ fn test_pipe_cloexec() {
     );
 }
 
+/// End-to-end test for fork-based context switching via synchronized pipe I/O.
+/// Parent and child exchange iteration counters through two pipes.  This
+/// exercises the delayed-fork path because the child calls read() (a
+/// non-pre-exec syscall) before ever calling exec.
+#[cfg(target_arch = "x86_64")]
+#[test]
+fn test_context_switch() {
+    let unique_name = "context_switch_rewriter";
+    let target = common::compile(
+        "./tests/multiprocess/context_switch.c",
+        unique_name,
+        false, // dynamic (PIE)
+        false,
+    );
+    let output = Runner::new(Backend::Rewriter, &target, unique_name).output();
+    let output_str = String::from_utf8_lossy(&output);
+    assert!(
+        output_str.contains("[OK]"),
+        "context_switch test failed:\n{output_str}",
+    );
+}
+
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 fn run_python(args: &[&str]) -> String {
     let output = std::process::Command::new("python3")

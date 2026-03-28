@@ -1404,6 +1404,109 @@ impl LinuxUserland {
         Ok(pid)
     }
 
+    /// Read from an arbitrary host file descriptor.
+    ///
+    /// Used by `HostPipeFd` entries to do I/O on real OS pipe FDs that bridge
+    /// fork children across host processes.
+    pub fn read_host_fd(
+        &self,
+        fd: i32,
+        buf: &mut [u8],
+    ) -> Result<usize, litebox_common_linux::errno::Errno> {
+        use litebox_common_linux::errno::Errno;
+        loop {
+            // Safety: fd is a valid host FD obtained from create_host_pipe.
+            let result = unsafe {
+                syscalls::syscall4(
+                    syscalls::Sysno::read,
+                    usize::try_from(fd).unwrap_or(0),
+                    buf.as_mut_ptr() as usize,
+                    buf.len(),
+                    syscall_intercept::SYSCALL_ARG_MAGIC,
+                )
+            };
+            match result {
+                Ok(n) => return Ok(n),
+                Err(syscalls::Errno::EINTR) => {}
+                Err(syscalls::Errno::EAGAIN) => return Err(Errno::EAGAIN),
+                Err(syscalls::Errno::EPIPE) => return Err(Errno::EPIPE),
+                Err(syscalls::Errno::EBADF) => return Err(Errno::EBADF),
+                Err(_) => return Err(Errno::EIO),
+            }
+        }
+    }
+
+    /// Write to an arbitrary host file descriptor.
+    ///
+    /// Used by `HostPipeFd` entries to do I/O on real OS pipe FDs that bridge
+    /// fork children across host processes.
+    pub fn write_host_fd(
+        &self,
+        fd: i32,
+        buf: &[u8],
+    ) -> Result<usize, litebox_common_linux::errno::Errno> {
+        use litebox_common_linux::errno::Errno;
+        loop {
+            // Safety: fd is a valid host FD obtained from create_host_pipe.
+            let result = unsafe {
+                syscalls::syscall4(
+                    syscalls::Sysno::write,
+                    usize::try_from(fd).unwrap_or(0),
+                    buf.as_ptr() as usize,
+                    buf.len(),
+                    syscall_intercept::SYSCALL_ARG_MAGIC,
+                )
+            };
+            match result {
+                Ok(n) => return Ok(n),
+                Err(syscalls::Errno::EINTR) => {}
+                Err(syscalls::Errno::EAGAIN) => return Err(Errno::EAGAIN),
+                Err(syscalls::Errno::EPIPE) => return Err(Errno::EPIPE),
+                Err(syscalls::Errno::EBADF) => return Err(Errno::EBADF),
+                Err(syscalls::Errno::ENOSPC) => return Err(Errno::ENOSPC),
+                Err(_) => return Err(Errno::EIO),
+            }
+        }
+    }
+
+    /// Close a host file descriptor.
+    pub fn close_host_fd(&self, fd: i32) {
+        // Safety: fd is a valid host FD obtained from create_host_pipe.
+        unsafe {
+            let _ = syscalls::syscall2(
+                syscalls::Sysno::close,
+                usize::try_from(fd).unwrap_or(0),
+                syscall_intercept::SYSCALL_ARG_MAGIC,
+            );
+        }
+    }
+
+    /// Create a host OS pipe pair.
+    ///
+    /// Returns `(read_fd, write_fd)` as raw file descriptor numbers.
+    /// Both FDs have `O_CLOEXEC` set.
+    pub fn create_host_pipe(&self) -> Result<(i32, i32), litebox_common_linux::errno::Errno> {
+        let mut fds = [0i32; 2];
+        let ret = unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) };
+        if ret != 0 {
+            return Err(litebox_common_linux::errno::Errno::EMFILE);
+        }
+        Ok((fds[0], fds[1]))
+    }
+
+    /// Clear the `O_CLOEXEC` flag on a host file descriptor so it survives
+    /// `posix_spawn` / `exec`.
+    pub fn clear_cloexec(&self, fd: i32) -> Result<(), litebox_common_linux::errno::Errno> {
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+        if flags < 0 {
+            return Err(litebox_common_linux::errno::Errno::EBADF);
+        }
+        if unsafe { libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) } < 0 {
+            return Err(litebox_common_linux::errno::Errno::EBADF);
+        }
+        Ok(())
+    }
+
     /// Spawn a worker host process to restore a fork child from a snapshot.
     ///
     /// Writes the serialized snapshot to a memfd, creates an ack pipe for the
@@ -1424,6 +1527,7 @@ impl LinuxUserland {
         &'static self,
         snapshot_bytes: &[u8],
         stdio: WorkerExecStdioBindings<FS, LinuxUserland>,
+        pipe_bridges: &[(usize, i32, bool)],
     ) -> Result<i32, i32>
     where
         FS: litebox::fs::FileSystem + Send + Sync + 'static,
@@ -1480,6 +1584,18 @@ impl LinuxUserland {
             for flag in flags.iter() {
                 spawn_argv.push(flag.clone());
             }
+        }
+
+        // Add pipe bridge CLI args: --pipe-bridge guest_fd:direction:host_fd
+        // direction is 'r' for read, 'w' for write.
+        for &(guest_fd, host_fd, is_read) in pipe_bridges {
+            // Clear O_CLOEXEC so the fd survives posix_spawn.
+            let _ = self.clear_cloexec(host_fd);
+            let dir_char = if is_read { 'r' } else { 'w' };
+            spawn_argv.push(CString::new("--pipe-bridge").unwrap());
+            spawn_argv.push(
+                CString::new(format!("{guest_fd}:{dir_char}:{host_fd}")).map_err(|_| -1_i32)?,
+            );
         }
 
         let argv_ptrs: Vec<*const libc::c_char> = spawn_argv
@@ -1572,6 +1688,8 @@ impl LinuxUserland {
             )
         };
         if ret != 0 {
+            // posix_spawn failed — bridge FD cleanup is the caller's
+            // responsibility (they own the child_pipe_bridges list).
             return Err(ret);
         }
         drop(host_stdio_temp_sources);
@@ -1580,6 +1698,12 @@ impl LinuxUserland {
         drop(ack_write_fd);
         drop(result_write_fd);
         drop(snapshot_fd);
+
+        // Close child-side pipe bridge FDs (child inherited them via
+        // posix_spawn since we cleared CLOEXEC).
+        for &(_, host_fd, _) in pipe_bridges {
+            self.close_host_fd(host_fd);
+        }
 
         // Read ack from child: 0 = success, non-zero = error.
         let ack_status = read_fork_restore_ack(ack_read_fd);

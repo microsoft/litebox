@@ -316,6 +316,10 @@ pub struct PageManagerMetadata {
     pub main_bss_start: usize,
     /// Page-aligned end of the main binary's `.bss` section.
     pub main_bss_end: usize,
+    /// The parent host's syscall entry point address. Used during restore to
+    /// replace stale host addresses in trampoline regions with the child
+    /// host's entry point.
+    pub old_syscall_entry_point: usize,
 }
 
 /// Plain-data snapshot of an `ElfPatchState` entry.
@@ -1084,6 +1088,7 @@ impl PageManagerMetadata {
         }
         w.write_usize(self.main_bss_start);
         w.write_usize(self.main_bss_end);
+        w.write_usize(self.old_syscall_entry_point);
     }
 
     fn read(r: &mut SnapshotReader<'_>) -> Result<Self, SnapshotDeserializeError> {
@@ -1120,6 +1125,7 @@ impl PageManagerMetadata {
             proc_map_paths,
             main_bss_start: r.read_usize()?,
             main_bss_end: r.read_usize()?,
+            old_syscall_entry_point: r.read_usize()?,
         })
     }
 }
@@ -1445,6 +1451,7 @@ mod tests {
                     ],
                     main_bss_start: 0x2000_1000,
                     main_bss_end: 0x2000_2000,
+                    old_syscall_entry_point: 0x7f_dead_beef,
                 },
             },
             is_delayed_fork: false,
@@ -1664,6 +1671,7 @@ mod tests {
 
         assert_eq!(m.main_bss_start, 0x2000_1000);
         assert_eq!(m.main_bss_end, 0x2000_2000);
+        assert_eq!(m.old_syscall_entry_point, 0x7f_dead_beef);
     }
 
     #[test]

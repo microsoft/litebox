@@ -1072,6 +1072,20 @@ impl<FS: ShimFS> Task<FS> {
             return Err(Errno::EBADF);
         };
         let files = self.files.borrow();
+
+        // Fast path: host-pipe FDs bypass the multi-subsystem dispatch.
+        if let Some(hp_fd) = files.try_host_pipe_fd(raw_fd) {
+            let handle = self
+                .global
+                .litebox
+                .descriptor_table()
+                .entry_handle(&hp_fd)
+                .ok_or(Errno::EBADF)?;
+            return handle.with_entry(|entry: &super::host_pipe::HostPipeFd| {
+                super::host_pipe::read_host_pipe(self.global.platform, entry, buf)
+            });
+        }
+
         // We need to do this cell dance because otherwise Rust can't recognize that the two
         // closures are mutually exclusive.
         let buf: core::cell::RefCell<&mut [u8]> = core::cell::RefCell::new(buf);
@@ -1205,6 +1219,27 @@ impl<FS: ShimFS> Task<FS> {
             return Err(Errno::EBADF);
         };
         let files = self.files.borrow();
+
+        // Fast path: host-pipe FDs bypass the multi-subsystem dispatch.
+        if let Some(hp_fd) = files.try_host_pipe_fd(raw_fd) {
+            let handle = self
+                .global
+                .litebox
+                .descriptor_table()
+                .entry_handle(&hp_fd)
+                .ok_or(Errno::EBADF)?;
+            let res = handle.with_entry(|entry: &super::host_pipe::HostPipeFd| {
+                super::host_pipe::write_host_pipe(self.global.platform, entry, buf)
+            });
+            if let Err(Errno::EPIPE) = res {
+                self.send_signal(
+                    litebox_common_linux::signal::Signal::SIGPIPE,
+                    siginfo_kernel(litebox_common_linux::signal::Signal::SIGPIPE),
+                );
+            }
+            return res;
+        }
+
         let res = files
             .run_on_raw_fd(
                 raw_fd,
@@ -1901,6 +1936,22 @@ impl<FS: ShimFS> Task<FS> {
                 dt.remove(&fd)
             };
             drop(entry);
+            return Ok(());
+        }
+        if let Ok(fd) = rds.fd_consume_raw_integer::<super::host_pipe::HostPipeSubsystem>(raw_fd) {
+            drop(rds);
+            // Atomically take the host fd so concurrent readers see -1 (EBADF)
+            // before we actually close the OS descriptor.
+            let host_fd = {
+                let dt = self.global.litebox.descriptor_table();
+                dt.entry_handle(&fd)
+                    .map(|handle| handle.with_entry(|e: &super::host_pipe::HostPipeFd| e.take_fd()))
+            };
+            if let Some(host_fd) = host_fd.filter(|&fd| fd >= 0) {
+                self.global.platform.close_host_fd(host_fd);
+            }
+            let mut dt = self.global.litebox.descriptor_table_mut();
+            dt.remove(&fd);
             return Ok(());
         }
         // All the above cases should cover all the known subsystems, and we've already

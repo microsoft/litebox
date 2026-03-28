@@ -188,6 +188,12 @@ pub struct CliArgs {
     /// Internal: inherited pipe fd used to ack successful restore to the parent.
     #[arg(long = "fork-restore-ack-fd", hide = true, requires = "fork_restore")]
     pub fork_restore_ack_fd: Option<i32>,
+
+    /// Internal: pipe bridge specs for fork-restore.
+    /// Each value has the format `guest_fd:direction:host_fd` where direction
+    /// is 'r' (read) or 'w' (write).
+    #[arg(long = "pipe-bridge", hide = true, requires = "fork_restore")]
+    pub pipe_bridge: Vec<String>,
 }
 
 /// Backends supported for intercepting syscalls
@@ -970,7 +976,11 @@ fn run_fork_restore(cli_args: CliArgs) -> Result<()> {
         .fork_restore_ack_fd
         .ok_or_else(|| anyhow!("--fork-restore requires --fork-restore-ack-fd"))?;
 
-    // Mark inherited fds as close-on-exec.
+    // Parse pipe bridge specs.
+    let pipe_bridges = parse_pipe_bridge_specs(&cli_args.pipe_bridge)?;
+
+    // Mark inherited fds as close-on-exec (except pipe bridge FDs which
+    // the shim will use directly).
     for fd in [Some(snapshot_fd), Some(ack_fd), cli_args.worker_result_fd]
         .into_iter()
         .flatten()
@@ -1053,7 +1063,7 @@ fn run_fork_restore(cli_args: CliArgs) -> Result<()> {
         );
         let combined_fs = std::sync::Arc::new(combined);
 
-        let program = fork_restore_and_ack(&shim, snapshot, combined_fs, ack_fd)?;
+        let program = fork_restore_and_ack(&shim, snapshot, combined_fs, ack_fd, &pipe_bridges)?;
         run_program(program, shutdown, net_worker, cli_args.worker_result_fd);
     } else {
         let initial_file_system = std::sync::Arc::new(default_fs);
@@ -1062,9 +1072,44 @@ fn run_fork_restore(cli_args: CliArgs) -> Result<()> {
         let shutdown = std::sync::Arc::new(core::sync::atomic::AtomicBool::new(false));
         let net_worker = start_network_worker(&shim, &shutdown);
 
-        let program = fork_restore_and_ack(&shim, snapshot, initial_file_system, ack_fd)?;
+        let program =
+            fork_restore_and_ack(&shim, snapshot, initial_file_system, ack_fd, &pipe_bridges)?;
         run_program(program, shutdown, net_worker, cli_args.worker_result_fd);
     }
+}
+
+/// A parsed pipe bridge specification from the `--pipe-bridge` CLI arg.
+struct PipeBridgeSpec {
+    guest_fd: usize,
+    host_fd: i32,
+    is_read: bool,
+}
+
+fn parse_pipe_bridge_specs(specs: &[String]) -> Result<Vec<PipeBridgeSpec>> {
+    let mut bridges = Vec::new();
+    for spec in specs {
+        let parts: Vec<&str> = spec.split(':').collect();
+        if parts.len() != 3 {
+            anyhow::bail!("invalid --pipe-bridge format: {spec}");
+        }
+        let guest_fd: usize = parts[0]
+            .parse()
+            .map_err(|_| anyhow!("bad guest_fd in --pipe-bridge: {spec}"))?;
+        let is_read = match parts[1] {
+            "r" => true,
+            "w" => false,
+            _ => anyhow::bail!("bad direction in --pipe-bridge: {spec}"),
+        };
+        let host_fd: i32 = parts[2]
+            .parse()
+            .map_err(|_| anyhow!("bad host_fd in --pipe-bridge: {spec}"))?;
+        bridges.push(PipeBridgeSpec {
+            guest_fd,
+            host_fd,
+            is_read,
+        });
+    }
+    Ok(bridges)
 }
 
 /// Restore a child process from a fork snapshot and write the ack status to the parent.
@@ -1073,12 +1118,27 @@ fn fork_restore_and_ack<FS: litebox_shim_linux::ShimFS>(
     snapshot: litebox_shim_linux::syscalls::fork_snapshot::ForkSnapshot,
     fs: std::sync::Arc<FS>,
     ack_fd: i32,
+    pipe_bridges: &[PipeBridgeSpec],
 ) -> Result<litebox_shim_linux::LoadedProgram<FS>> {
     use std::io::Write;
     use std::os::fd::FromRawFd;
 
     match shim.restore_process(snapshot, fs) {
         Ok(program) => {
+            // Install HostPipe FDs for pipe bridges before acking.
+            for bridge in pipe_bridges {
+                let direction = if bridge.is_read {
+                    litebox_shim_linux::syscalls::host_pipe::HostPipeDirection::Read
+                } else {
+                    litebox_shim_linux::syscalls::host_pipe::HostPipeDirection::Write
+                };
+                program.entrypoints.install_host_pipe_fd(
+                    bridge.guest_fd,
+                    bridge.host_fd,
+                    direction,
+                );
+            }
+
             // Report successful restore to parent via ack pipe.
             let mut ack_file = unsafe { std::fs::File::from_raw_fd(ack_fd) };
             ack_file.write_all(&0i32.to_le_bytes())?;
@@ -1857,6 +1917,10 @@ mod tests {
             guest_euid: None,
             guest_gid: None,
             guest_egid: None,
+            fork_restore: false,
+            fork_restore_fd: None,
+            fork_restore_ack_fd: None,
+            pipe_bridge: Vec::new(),
         }
     }
 

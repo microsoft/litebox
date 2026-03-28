@@ -2135,7 +2135,7 @@ impl<FS: ShimFS> Task<FS> {
             forked,
             litebox::platform::address_space::ForkedAddressSpace::SharedWithParent(_)
         );
-        let is_vfork = flags.contains(CloneFlags::VM) && flags.contains(CloneFlags::VFORK);
+        let _is_vfork = flags.contains(CloneFlags::VM) && flags.contains(CloneFlags::VFORK);
 
         #[cfg(feature = "trace_syscalls")]
         litebox::log_println!(
@@ -2145,17 +2145,19 @@ impl<FS: ShimFS> Task<FS> {
             child_process_id.0,
             child_as_id,
             is_shared,
-            is_vfork,
+            _is_vfork,
         );
 
-        // On a shared-address-space platform where the caller requested a real
-        // fork (not vfork), use the delayed-fork strategy: start vfork-style
-        // (parent suspended, CoW layer) and defer the expensive snapshot+restore
-        // to the point where the child makes a non-pre-exec syscall.
-        // Delayed fork is only supported on x86_64 for now; on other
-        // architectures, fall through to do_true_fork (which returns ENOSYS).
+        // On a shared-address-space platform, every fork appears as vfork
+        // because the syscall rewriter adds CLONE_VM | CLONE_VFORK.  Enable
+        // delayed fork for ALL shared forks: programs that call execve will
+        // stay on the fast vfork path (execve is in the pre-exec allowlist),
+        // while programs that make a non-pre-exec syscall will trigger
+        // commit_delayed_fork and be migrated to a worker host.
+        //
+        // Delayed fork is only supported on x86_64 for now.
         #[cfg(target_arch = "x86_64")]
-        let delayed_fork = is_shared && !is_vfork;
+        let delayed_fork = is_shared;
         #[cfg(not(target_arch = "x86_64"))]
         let delayed_fork = false;
 
@@ -2319,6 +2321,31 @@ impl<FS: ShimFS> Task<FS> {
                 vfork_done: vfork_done.clone(),
                 exit_signal: i32::try_from(args.exit_signal).unwrap_or(0),
                 parent_process_id: self.process_id,
+                parent_pipe_fds: {
+                    let files = self.files.borrow();
+                    let rds = files.raw_descriptor_store.read();
+                    let mut pipe_fds = Vec::new();
+                    for raw_fd in rds.iter_alive() {
+                        if let Ok(typed) = rds
+                            .fd_from_raw_integer::<litebox::pipes::Pipes<crate::Platform>>(raw_fd)
+                        {
+                            let direction = match self.global.pipes.half_pipe_type(&typed) {
+                                Ok(litebox::pipes::HalfPipeType::ReceiverHalf) => {
+                                    crate::syscalls::host_pipe::HostPipeDirection::Read
+                                }
+                                Ok(litebox::pipes::HalfPipeType::SenderHalf) => {
+                                    crate::syscalls::host_pipe::HostPipeDirection::Write
+                                }
+                                Err(_) => continue,
+                            };
+                            let Ok(pair_id) = self.global.pipes.pipe_pair_id(&typed) else {
+                                continue;
+                            };
+                            pipe_fds.push((raw_fd, direction, pair_id));
+                        }
+                    }
+                    pipe_fds
+                },
             };
             (
                 self.process_state.clone(),                  // share parent's PM
@@ -2551,6 +2578,46 @@ impl<FS: ShimFS> Task<FS> {
                 self.restore_cow_layer(cow, true);
             }
 
+            // Apply pipe replacements deposited by commit_delayed_fork.
+            // The parent's virtual pipe endpoints are replaced with HostPipe
+            // FDs that do direct I/O on the real OS pipes connecting to the
+            // migrated child.
+            let replacements: Vec<crate::PipeReplacement> =
+                vd.pipe_replacements.lock().drain(..).collect();
+            if !replacements.is_empty() {
+                let files = self.files.borrow();
+                for repl in replacements {
+                    let entry = super::host_pipe::HostPipeFd::new(repl.host_fd, repl.direction);
+                    let mut dt = self.global.litebox.descriptor_table_mut();
+                    let typed_fd: litebox::fd::TypedFd<super::host_pipe::HostPipeSubsystem> =
+                        dt.insert(entry);
+                    drop(dt);
+
+                    // Consume the old virtual pipe and install the HostPipe FD
+                    // under the rds lock, then drop the lock before closing the
+                    // old pipe to maintain the lock ordering invariant
+                    // (descriptor_table → rds, never rds → descriptor_table).
+                    let old_pipe;
+                    {
+                        let mut rds = files.raw_descriptor_store.write();
+                        old_pipe = rds
+                            .fd_consume_raw_integer::<litebox::pipes::Pipes<crate::Platform>>(
+                                repl.guest_fd,
+                            )
+                            .ok();
+                        let ok = rds.fd_into_specific_raw_integer(typed_fd, repl.guest_fd);
+                        debug_assert!(
+                            ok,
+                            "pipe replacement: slot {} still occupied",
+                            repl.guest_fd
+                        );
+                    }
+                    if let Some(old_typed) = old_pipe {
+                        let _ = self.global.pipes.close(&old_typed);
+                    }
+                }
+            }
+
             // Unpark other threads now that CoW is fully restored.
             if did_park_threads {
                 self.unpark_other_threads();
@@ -2700,6 +2767,114 @@ impl<FS: ShimFS> Task<FS> {
             return Err(Errno::ENOSYS);
         }
 
+        // --- Pipe bridging ---
+        // For each pipe FD in the child's table, create a real OS pipe pair
+        // so that parent and child can communicate across host processes.
+        //
+        // child_pipe_bridges: (guest_fd, child_os_fd, direction)
+        // parent_pipe_replacements: stored in VforkDone for the parent to apply.
+        let mut child_pipe_bridges: Vec<(usize, i32, super::host_pipe::HostPipeDirection)> =
+            Vec::new();
+        {
+            use super::host_pipe::HostPipeDirection;
+
+            let files = self.files.borrow();
+            let rds = files.raw_descriptor_store.read();
+
+            // Gather child's pipe FDs with their directions and pair IDs.
+            let mut child_pipes: Vec<(usize, HostPipeDirection, usize)> = Vec::new();
+            for raw_fd in rds.iter_alive() {
+                if let Ok(typed) =
+                    rds.fd_from_raw_integer::<litebox::pipes::Pipes<crate::Platform>>(raw_fd)
+                {
+                    let direction = match self.global.pipes.half_pipe_type(&typed) {
+                        Ok(litebox::pipes::HalfPipeType::ReceiverHalf) => HostPipeDirection::Read,
+                        Ok(litebox::pipes::HalfPipeType::SenderHalf) => HostPipeDirection::Write,
+                        Err(_) => continue,
+                    };
+                    let Ok(pair_id) = self.global.pipes.pipe_pair_id(&typed) else {
+                        continue;
+                    };
+                    child_pipes.push((raw_fd, direction, pair_id));
+                }
+            }
+            drop(rds);
+            drop(files);
+
+            let mut parent_replacements: Vec<crate::PipeReplacement> = Vec::new();
+
+            for &(child_fd, child_dir, child_pair_id) in &child_pipes {
+                // Create a real OS pipe pair.
+                let (os_read, os_write) = match self.global.platform.create_host_pipe() {
+                    Ok(pair) => pair,
+                    Err(_e) => {
+                        #[cfg(feature = "trace_syscalls")]
+                        litebox::log_println!(
+                            self.global.platform,
+                            "[DELAYED-FORK] pid={}: create_host_pipe failed: {}",
+                            self.pid,
+                            _e,
+                        );
+                        // Close any already-created OS pipes.
+                        for &(_, os_fd, _) in &child_pipe_bridges {
+                            self.global.platform.close_host_fd(os_fd);
+                        }
+                        for pr in &parent_replacements {
+                            self.global.platform.close_host_fd(pr.host_fd);
+                        }
+                        put_fc_back(self, fc);
+                        return Err(Errno::ENOMEM);
+                    }
+                };
+
+                // Child direction determines which OS pipe end goes where.
+                let (child_os_fd, parent_os_fd) = match child_dir {
+                    HostPipeDirection::Read => (os_read, os_write),
+                    HostPipeDirection::Write => (os_write, os_read),
+                };
+
+                child_pipe_bridges.push((child_fd, child_os_fd, child_dir));
+
+                // Find the parent's counterpart FD (opposite direction, same pipe pair).
+                let parent_dir = match child_dir {
+                    HostPipeDirection::Read => HostPipeDirection::Write,
+                    HostPipeDirection::Write => HostPipeDirection::Read,
+                };
+
+                if let Some(&(parent_fd, _, _)) = fc
+                    .parent_pipe_fds
+                    .iter()
+                    .find(|&&(_, dir, pair_id)| dir == parent_dir && pair_id == child_pair_id)
+                {
+                    parent_replacements.push(crate::PipeReplacement {
+                        guest_fd: parent_fd,
+                        host_fd: parent_os_fd,
+                        direction: parent_dir,
+                    });
+                } else {
+                    // No counterpart in parent — the parent may have already
+                    // closed this end (broken pipe). Close the unused OS end.
+                    self.global.platform.close_host_fd(parent_os_fd);
+                }
+            }
+
+            // Store parent replacements in VforkDone for the parent to apply
+            // after resume.
+            if !parent_replacements.is_empty() {
+                *fc.vfork_done.pipe_replacements.lock() = parent_replacements;
+            }
+
+            #[cfg(feature = "trace_syscalls")]
+            if !child_pipe_bridges.is_empty() {
+                litebox::log_println!(
+                    self.global.platform,
+                    "[DELAYED-FORK] pid={}: created {} pipe bridges",
+                    self.pid,
+                    child_pipe_bridges.len(),
+                );
+            }
+        }
+
         let snapshot = super::fork_snapshot::ForkSnapshot {
             identity,
             process_wide,
@@ -2732,17 +2907,36 @@ impl<FS: ShimFS> Task<FS> {
                     self.pid,
                     _e,
                 );
+                // Clean up OS pipe FDs created during pipe bridging.
+                for &(_, os_fd, _) in &child_pipe_bridges {
+                    self.global.platform.close_host_fd(os_fd);
+                }
+                for pr in fc.vfork_done.pipe_replacements.lock().drain(..) {
+                    self.global.platform.close_host_fd(pr.host_fd);
+                }
                 put_fc_back(self, fc);
                 return Err(Errno::ENOSYS);
             }
         };
 
+        // Build pipe bridge specs for the worker (guest_fd, child_os_fd, is_read).
+        let bridge_specs: Vec<(usize, i32, bool)> = child_pipe_bridges
+            .iter()
+            .map(|&(guest_fd, os_fd, dir)| {
+                (
+                    guest_fd,
+                    os_fd,
+                    dir == super::host_pipe::HostPipeDirection::Read,
+                )
+            })
+            .collect();
+
         // Spawn the child worker host.
-        let host_pid = match self
-            .global
-            .platform
-            .spawn_worker_host_for_fork_restore(&snapshot_bytes, stdio)
-        {
+        let host_pid = match self.global.platform.spawn_worker_host_for_fork_restore(
+            &snapshot_bytes,
+            stdio,
+            &bridge_specs,
+        ) {
             Ok(pid) => pid,
             Err(_err) => {
                 #[cfg(feature = "trace_syscalls")]
@@ -2752,6 +2946,14 @@ impl<FS: ShimFS> Task<FS> {
                     self.pid,
                     _err,
                 );
+                // Clean up child-side OS pipe FDs on failure.
+                for &(_, os_fd, _) in &child_pipe_bridges {
+                    self.global.platform.close_host_fd(os_fd);
+                }
+                // Clean up parent-side OS pipe FDs on failure.
+                for pr in fc.vfork_done.pipe_replacements.lock().drain(..) {
+                    self.global.platform.close_host_fd(pr.host_fd);
+                }
                 put_fc_back(self, fc);
                 return Err(Errno::ENOMEM);
             }
@@ -2994,11 +3196,11 @@ impl<FS: ShimFS> Task<FS> {
         };
 
         // Spawn the child worker host.
-        let host_pid = match self
-            .global
-            .platform
-            .spawn_worker_host_for_fork_restore(&snapshot_bytes, stdio)
-        {
+        let host_pid = match self.global.platform.spawn_worker_host_for_fork_restore(
+            &snapshot_bytes,
+            stdio,
+            &[],
+        ) {
             Ok(pid) => pid,
             Err(err) => {
                 #[cfg(feature = "trace_syscalls")]
@@ -3340,9 +3542,9 @@ impl<FS: ShimFS> Task<FS> {
                 subsystem_class
             };
 
-            // v1: reject all non-stdio fds.
+            // v1: accept stdio and pipes; reject all other FD classes.
             match class {
-                FdClass::StdioFd => {}
+                FdClass::StdioFd | FdClass::Pipe => {}
                 _ => {
                     reject.push(ForkRejectReason::UnsupportedFdClass { fd: raw_fd, class });
                 }
@@ -3520,6 +3722,7 @@ impl<FS: ShimFS> Task<FS> {
                 .main_bss_start
                 .load(core::sync::atomic::Ordering::Relaxed),
             main_bss_end: ps.main_bss_end.load(core::sync::atomic::Ordering::Relaxed),
+            old_syscall_entry_point: self.global.platform.get_syscall_entry_point(),
         }
     }
 
@@ -5058,6 +5261,7 @@ impl<FS: ShimFS> Task<FS> {
             // state before spawning the worker, just like normal exec does.
             let mut detached_from_shared_fork = false;
             if let Some(fc) = self.fork_context.borrow_mut().take() {
+                self.delayed_fork_pending.set(false);
                 // Flush MAP_SHARED writeback data while still using the
                 // parent's ProcessState.
                 self.sync_all_shared_mappings();
@@ -5126,6 +5330,10 @@ impl<FS: ShimFS> Task<FS> {
         // only affect the child's own copies.
         let mut vfork_done = None;
         if let Some(fc) = self.fork_context.borrow_mut().take() {
+            // Exec completes the vfork/delayed-fork window — the child is now
+            // fully independent.  Clear the delayed-fork flag so post-exec
+            // syscalls (brk, mmap, etc.) don't trigger commit_delayed_fork.
+            self.delayed_fork_pending.set(false);
             // Flush MAP_SHARED writeback data while still using the parent's
             // ProcessState — the tracking entries and handles live there.
             // After the ProcessState swap the parent's entries are gone from

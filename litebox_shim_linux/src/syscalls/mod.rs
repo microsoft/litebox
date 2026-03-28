@@ -7,6 +7,7 @@ pub(crate) mod epoll;
 pub(crate) mod eventfd;
 pub mod file;
 pub mod fork_snapshot;
+pub mod host_pipe;
 pub(crate) mod misc;
 pub(crate) mod mm;
 pub(crate) mod net;
