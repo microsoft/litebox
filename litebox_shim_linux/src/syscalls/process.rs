@@ -2651,6 +2651,121 @@ impl<FS: ShimFS> Task<FS> {
         }
     }
 
+    /// Snapshot the FD table and populate the reject gate for unsupported types.
+    ///
+    /// In v1, only stdio fds (identified by matching their object ID against the
+    /// original host stdio descriptors) are supported for cross-host fork.
+    /// All other open fds cause fork rejection.
+    #[allow(dead_code)] // Will be called from `do_true_fork` in a later phase.
+    fn snapshot_fd_table(
+        &self,
+        reject: &mut super::fork_snapshot::ForkRejectReasons,
+    ) -> super::fork_snapshot::FdTableSnapshot {
+        use super::fork_snapshot::{
+            FdClass, FdEntrySnapshot, FdMetadataSnapshot, ForkRejectReason,
+        };
+
+        let files = self.files.borrow();
+
+        // Check for inotify instances.
+        if files.has_inotify_instances() {
+            reject.push(ForkRejectReason::InotifyPresent);
+        }
+
+        // Read stdio object IDs first so we can identify true stdio descriptors
+        // by identity rather than by fd number alone.  An fd at slot 0/1/2 that
+        // has been closed and reused (via close+open or dup2) will no longer
+        // match, and will be classified/rejected by its actual subsystem type.
+        let stdio_ids = files.host_stdio_object_ids.read();
+        let host_stdio_oids: [Option<litebox::fd::DescriptorObjectId>; 3] = *stdio_ids;
+        drop(stdio_ids);
+
+        // Enumerate all open fds and classify each inline (to avoid
+        // double-borrowing self.files via a separate classify_fd call).
+        let rds = files.raw_descriptor_store.read();
+        let alive_fds: Vec<usize> = rds.iter_alive().collect();
+
+        let mut entries = Vec::new();
+        for raw_fd in &alive_fds {
+            let raw_fd = *raw_fd;
+
+            // Classify by subsystem type first, then promote to StdioFd if
+            // the descriptor's object_id matches the original host stdio.
+            let (subsystem_class, object_id) = if let Ok(fd) = rds.fd_from_raw_integer::<FS>(raw_fd)
+            {
+                (FdClass::FilesystemFd, Some(fd.object_id()))
+            } else if let Ok(fd) =
+                rds.fd_from_raw_integer::<litebox::net::Network<crate::Platform>>(raw_fd)
+            {
+                (FdClass::NetworkSocket, Some(fd.object_id()))
+            } else if let Ok(fd) =
+                rds.fd_from_raw_integer::<litebox::pipes::Pipes<crate::Platform>>(raw_fd)
+            {
+                (FdClass::Pipe, Some(fd.object_id()))
+            } else if let Ok(fd) =
+                rds.fd_from_raw_integer::<super::eventfd::EventfdSubsystem>(raw_fd)
+            {
+                (FdClass::EventFd, Some(fd.object_id()))
+            } else if let Ok(fd) =
+                rds.fd_from_raw_integer::<super::epoll::EpollSubsystem<FS>>(raw_fd)
+            {
+                (FdClass::Epoll, Some(fd.object_id()))
+            } else if let Ok(fd) =
+                rds.fd_from_raw_integer::<super::unix::UnixSocketSubsystem<FS>>(raw_fd)
+            {
+                (FdClass::UnixSocket, Some(fd.object_id()))
+            } else {
+                (FdClass::Other, None)
+            };
+
+            // Promote to StdioFd only if this fd sits at a stdio slot AND
+            // its object_id matches ANY of the original host stdio descriptors.
+            // This handles aliases like dup2(1, 2) where fd 2 shares stdout's
+            // object_id rather than stderr's original one.
+            let class = if raw_fd <= 2 {
+                let is_host_stdio =
+                    object_id.is_some() && host_stdio_oids.contains(&object_id);
+                if is_host_stdio {
+                    FdClass::StdioFd
+                } else {
+                    subsystem_class
+                }
+            } else {
+                subsystem_class
+            };
+
+            // v1: reject all non-stdio fds.
+            match class {
+                FdClass::StdioFd => {}
+                _ => {
+                    reject.push(ForkRejectReason::UnsupportedFdClass { fd: raw_fd, class });
+                }
+            }
+
+            entries.push(FdEntrySnapshot {
+                fd: raw_fd,
+                class,
+                fd_flags: 0,     // TODO: read FD_CLOEXEC in a later phase
+                status_flags: 0, // TODO: read O_NONBLOCK etc. in a later phase
+                object_id: object_id.map_or(0, litebox::fd::DescriptorObjectId::as_u64),
+                metadata: FdMetadataSnapshot::default(),
+            });
+        }
+        drop(rds);
+
+        let stdio_object_ids = [
+            host_stdio_oids[0].map(litebox::fd::DescriptorObjectId::as_u64),
+            host_stdio_oids[1].map(litebox::fd::DescriptorObjectId::as_u64),
+            host_stdio_oids[2].map(litebox::fd::DescriptorObjectId::as_u64),
+        ];
+
+        super::fork_snapshot::FdTableSnapshot {
+            entries,
+            open_file_descriptions: Vec::new(), // TODO: populate in a later phase
+            stdio_object_ids,
+        }
+    }
+
     /// Capture the full memory image and page-manager metadata for a true-fork
     /// snapshot.
     ///

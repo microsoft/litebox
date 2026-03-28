@@ -268,6 +268,11 @@ impl<FS: ShimFS> FilesState<FS> {
         self.inotify_instances.lock().remove(&raw_fd);
     }
 
+    /// Returns true if any inotify instances are open.
+    pub(crate) fn has_inotify_instances(&self) -> bool {
+        !self.inotify_instances.lock().is_empty()
+    }
+
     fn with_inotify_fd<R>(
         &self,
         raw_fd: usize,
