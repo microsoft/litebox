@@ -106,7 +106,6 @@ RUNNER_ARGS=(
     --network-broker "$BROKER_SOCK"
     --nine-p-broker "$BROKER_SOCK"
     --cwd "$CWD"
-    --env COPILOT_RUN_APP=1
     --env GIT_CONFIG_COUNT=1
     --env GIT_CONFIG_KEY_0=safe.directory
     --env "GIT_CONFIG_VALUE_0=*"

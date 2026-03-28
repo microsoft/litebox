@@ -2001,9 +2001,9 @@ impl<FS: ShimFS> Task<FS> {
                 | Sysno::getpid | Sysno::getppid | Sysno::gettid
                 | Sysno::getuid | Sysno::getgid,
             ) => true,
-            // Argument-aware: fcntl — only allow fd flag / dup operations.
-            // F_DUPFD=0, F_GETFD=1, F_SETFD=2, F_DUPFD_CLOEXEC=1030
-            Some(Sysno::fcntl) => matches!(ctx.rsi, 0 | 1 | 2 | 1030),
+            // Argument-aware: fcntl — only allow fd flag / dup / status-flag operations.
+            // F_DUPFD=0, F_GETFD=1, F_SETFD=2, F_GETFL=3, F_SETFL=4, F_DUPFD_CLOEXEC=1030
+            Some(Sysno::fcntl) => matches!(ctx.rsi, 0 | 1 | 2 | 3 | 4 | 1030),
             // Argument-aware: prctl — only allow SET_PDEATHSIG and SET_NAME.
             // PR_SET_PDEATHSIG=1, PR_SET_NAME=15
             Some(Sysno::prctl) => matches!(ctx.rdi, 1 | 15),
@@ -3610,8 +3610,8 @@ mod tests {
     #[cfg(target_arch = "x86_64")]
     fn pre_exec_syscall_fcntl_allows_fd_ops() {
         use ::syscalls::Sysno;
-        // F_DUPFD=0, F_GETFD=1, F_SETFD=2, F_DUPFD_CLOEXEC=1030
-        for cmd in [0, 1, 2, 1030] {
+        // F_DUPFD=0, F_GETFD=1, F_SETFD=2, F_GETFL=3, F_SETFL=4, F_DUPFD_CLOEXEC=1030
+        for cmd in [0, 1, 2, 3, 4, 1030] {
             let ctx = make_syscall_ctx(Sysno::fcntl as usize, 3, cmd);
             assert!(
                 Task::<DefaultFS>::is_pre_exec_syscall(&ctx),
@@ -3624,8 +3624,8 @@ mod tests {
     #[cfg(target_arch = "x86_64")]
     fn pre_exec_syscall_fcntl_rejects_non_fd_ops() {
         use ::syscalls::Sysno;
-        // F_GETFL=3, F_SETFL=4, F_GETLK=5, F_SETLK=6, F_SETOWN=8
-        for cmd in [3, 4, 5, 6, 8] {
+        // F_GETLK=5, F_SETLK=6, F_SETOWN=8
+        for cmd in [5, 6, 8] {
             let ctx = make_syscall_ctx(Sysno::fcntl as usize, 3, cmd);
             assert!(
                 !Task::<DefaultFS>::is_pre_exec_syscall(&ctx),
