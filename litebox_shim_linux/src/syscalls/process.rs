@@ -2517,6 +2517,140 @@ impl<FS: ShimFS> Task<FS> {
         Err(Errno::ENOSYS)
     }
 
+    /// Capture the calling task's identity for a true-fork snapshot.
+    #[allow(dead_code)] // Will be called from `do_true_fork` in a later phase.
+    fn snapshot_identity(
+        &self,
+        child_process_id: litebox::process::ProcessId,
+        child_pid: i32,
+        exit_signal: i32,
+    ) -> super::fork_snapshot::ProcessIdentitySnapshot {
+        use litebox::process::ProcessGroupId;
+        use litebox::process::SessionId;
+
+        let pgid = self
+            .global
+            .litebox
+            .process_registry()
+            .get_pgid(self.process_id)
+            .map_or(self.pid.cast_unsigned(), ProcessGroupId::as_u32);
+        let sid = self
+            .global
+            .litebox
+            .process_registry()
+            .get_sid(self.process_id)
+            .map_or(self.pid.cast_unsigned(), SessionId::as_u32);
+
+        super::fork_snapshot::ProcessIdentitySnapshot {
+            process_id: child_process_id,
+            parent_process_id: self.process_id,
+            pid: child_pid,
+            ppid: self.pid,
+            tid: child_pid, // initial thread tid == pid
+            pgid: i32::try_from(pgid).unwrap_or(self.pid),
+            sid: i32::try_from(sid).unwrap_or(self.pid),
+            exit_signal,
+            comm: self.comm.get(),
+            credentials: super::fork_snapshot::CredentialsSnapshot {
+                uid: self.credentials.uid,
+                euid: self.credentials.euid,
+                gid: self.credentials.gid,
+                egid: self.credentials.egid,
+            },
+        }
+    }
+
+    /// Capture process-wide state for a true-fork snapshot.
+    #[allow(dead_code)] // Will be called from `do_true_fork` in a later phase.
+    fn snapshot_process_wide(&self) -> super::fork_snapshot::ProcessWideSnapshot {
+        let process = self.process();
+
+        // Snapshot resource limits.
+        let mut rlimits = [(0usize, 0usize); litebox_common_linux::RlimitResource::RLIM_NLIMITS];
+        for (i, rl) in process.limits.limits.iter().enumerate() {
+            rlimits[i] = (
+                rl.cur.load(Ordering::Relaxed),
+                rl.max.load(Ordering::Relaxed),
+            );
+        }
+
+        super::fork_snapshot::ProcessWideSnapshot {
+            rlimits,
+            thp_disabled: process.thp_disabled.load(Ordering::Relaxed),
+            // Linux fork() does not inherit pending alarms.
+            alarm_remaining_ns: None,
+        }
+    }
+
+    /// Capture the calling thread's execution state for a true-fork snapshot.
+    #[allow(dead_code)] // Will be called from `do_true_fork` in a later phase.
+    fn snapshot_thread(
+        &self,
+        ctx: &litebox_common_linux::ExecutionContext,
+        flags: CloneFlags,
+        args: &litebox_common_linux::CloneArgs,
+    ) -> super::fork_snapshot::ThreadSnapshot {
+        // Read guest TLS base (FS base on x86-64).
+        #[cfg(target_arch = "x86_64")]
+        let tls_base = {
+            let punchthrough = litebox_common_linux::PunchthroughSyscall::GetFsBase;
+            self.global
+                .platform
+                .get_punchthrough_token_for(punchthrough)
+                .and_then(|token| token.execute().ok())
+        };
+        #[cfg(not(target_arch = "x86_64"))]
+        let tls_base: Option<usize> = None;
+
+        let set_child_tid = if flags.contains(CloneFlags::CHILD_SETTID) && args.child_tid != 0 {
+            Some(args.child_tid.truncate())
+        } else {
+            None
+        };
+        let clear_child_tid = if flags.contains(CloneFlags::CHILD_CLEARTID) && args.child_tid != 0 {
+            Some(args.child_tid.truncate())
+        } else {
+            None
+        };
+        let robust_list = self.thread.robust_list.get().map(|ptr| ptr.as_usize());
+
+        super::fork_snapshot::ThreadSnapshot {
+            execution_context: ctx.clone(),
+            tls_base,
+            set_child_tid,
+            clear_child_tid,
+            robust_list,
+        }
+    }
+
+    /// Capture signal state for a true-fork snapshot.
+    #[allow(dead_code)] // Will be called from `do_true_fork` in a later phase.
+    fn snapshot_signal(&self) -> super::fork_snapshot::SignalSnapshot {
+        let blocked = self.signals.get_blocked();
+        let handlers = self.signals.snapshot_handlers();
+
+        // Linux fork() inherits the parent's alternate signal stack.
+        // Only clone(CLONE_VM) without CLONE_VFORK resets it.
+        let altstack = self.signals.altstack();
+
+        super::fork_snapshot::SignalSnapshot {
+            blocked,
+            handlers,
+            altstack,
+        }
+    }
+
+    /// Capture filesystem state for a true-fork snapshot (deep copy).
+    #[allow(dead_code)] // Will be called from `do_true_fork` in a later phase.
+    fn snapshot_fs(&self) -> super::fork_snapshot::FsSnapshot {
+        let fs = self.fs.borrow();
+        super::fork_snapshot::FsSnapshot {
+            cwd: fs.current_working_directory(),
+            exe_path: fs.exe_path.read().clone(),
+            umask: fs.umask().bits(),
+        }
+    }
+
     /// Handle syscall `set_tid_address`.
     pub(crate) fn sys_set_tid_address(&self, tidptr: crate::MutPtr<i32>) -> i32 {
         self.thread.clear_child_tid.set(Some(tidptr));
@@ -2721,7 +2855,7 @@ pub(crate) const RLIMIT_NOFILE_CUR: usize = 1024 * 1024;
 const RLIMIT_NOFILE_MAX: usize = 1024 * 1024;
 const RLIMIT_SIGPENDING: usize = 128;
 
-struct AtomicRlimit {
+pub(crate) struct AtomicRlimit {
     cur: core::sync::atomic::AtomicUsize,
     max: core::sync::atomic::AtomicUsize,
 }
@@ -2736,7 +2870,7 @@ impl AtomicRlimit {
 }
 
 pub(crate) struct ResourceLimits {
-    limits: [AtomicRlimit; litebox_common_linux::RlimitResource::RLIM_NLIMITS],
+    pub(crate) limits: [AtomicRlimit; litebox_common_linux::RlimitResource::RLIM_NLIMITS],
 }
 
 impl ResourceLimits {

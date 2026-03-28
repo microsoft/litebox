@@ -49,6 +49,7 @@ use crate::syscalls::process::ExitStatus;
 use crate::{ConstPtr, MutPtr, ShimFS, Task};
 use alloc::collections::vec_deque::VecDeque;
 use alloc::sync::Arc;
+use alloc::vec::Vec;
 use core::cell::{Cell, RefCell};
 use litebox::{
     platform::{RawConstPointer as _, RawMutPointer as _},
@@ -112,6 +113,29 @@ impl SignalState {
     /// Get the current blocked signal mask.
     pub fn get_blocked(&self) -> SigSet {
         self.blocked.get()
+    }
+
+    /// Get the current alternate signal stack.
+    #[allow(dead_code)] // Used by fork snapshot capture.
+    pub fn altstack(&self) -> SigAltStack {
+        self.altstack.get()
+    }
+
+    /// Snapshot all signal handlers as plain data for true-fork export.
+    #[allow(dead_code)] // Used by fork snapshot capture.
+    pub fn snapshot_handlers(&self) -> Vec<crate::syscalls::fork_snapshot::SignalHandlerSnapshot> {
+        let handlers = self.handlers.borrow();
+        let inner = handlers.inner.lock();
+        inner
+            .handlers
+            .iter()
+            .map(|h| crate::syscalls::fork_snapshot::SignalHandlerSnapshot {
+                sigaction: h.action.sigaction,
+                restorer: h.action.restorer,
+                flags: h.action.flags,
+                mask: h.action.mask,
+            })
+            .collect()
     }
 
     /// Set the blocked signal mask.
