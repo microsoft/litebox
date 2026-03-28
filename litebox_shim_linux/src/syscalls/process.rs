@@ -2463,7 +2463,14 @@ impl<FS: ShimFS> Task<FS> {
                         tid: child_initial_tid,
                         credentials: self.credentials.clone(),
                         comm: self.comm.clone(),
-                        fs: self.fs.clone(),
+                        // Clone FsState into a new Arc so the child has its
+                        // own cwd/umask/exe_path.  Without this, chdir or
+                        // umask in the child would mutate the parent's state
+                        // (the parent is suspended during the vfork window,
+                        // but the mutation persists after it resumes).
+                        fs: core::cell::RefCell::new(alloc::sync::Arc::new(
+                            (**self.fs.borrow()).clone(),
+                        )),
                         files: child_files,
                         signals: {
                             // Linux sigaltstack(2): fork() inherits the
