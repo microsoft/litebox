@@ -389,6 +389,7 @@ impl<FS: ShimFS> LinuxShim<FS> {
                 in_syscall: Cell::new(false),
                 deferred_vfork_park: Cell::new(false),
                 delayed_fork_pending: Cell::new(false),
+                migrated_to_remote: Cell::new(false),
             },
         };
         let exec_filename = alloc::ffi::CString::new(exec_filename).ok();
@@ -482,6 +483,7 @@ impl<FS: ShimFS> LinuxShim<FS> {
         use litebox::platform::AddressSpaceProvider;
         use litebox::platform::RawMutex as _;
 
+        let is_delayed_fork = snapshot.is_delayed_fork;
         let syscalls::fork_snapshot::ForkSnapshot {
             identity: id,
             process_wide: pw,
@@ -490,6 +492,7 @@ impl<FS: ShimFS> LinuxShim<FS> {
             fs: fs_snap,
             fd_table: _fd_table,
             memory: mem,
+            is_delayed_fork: _,
         } = snapshot;
 
         // Reserve the child's thread ID so future clone() calls don't collide.
@@ -697,17 +700,22 @@ impl<FS: ShimFS> LinuxShim<FS> {
             egid: id.credentials.egid,
         });
 
-        // --- 11. Build Task with fork return value 0. -----------------------
+        // --- 11. Build Task with execution context. ---------------------------
         let mut exec_ctx = th.execution_context;
-        // fork() returns 0 in the child.
-        #[cfg(target_arch = "x86_64")]
-        {
-            exec_ctx.rax = 0;
+        if !is_delayed_fork {
+            // True fork: fork() returns 0 in the child.
+            #[cfg(target_arch = "x86_64")]
+            {
+                exec_ctx.rax = 0;
+            }
+            #[cfg(target_arch = "x86")]
+            {
+                exec_ctx.eax = 0;
+            }
         }
-        #[cfg(target_arch = "x86")]
-        {
-            exec_ctx.eax = 0;
-        }
+        // For delayed fork the context already has rax = syscall number and
+        // rip backed up to the syscall instruction, so the guest replays the
+        // triggering syscall after restore.
 
         let mut comm = [0u8; litebox_common_linux::TASK_COMM_LEN];
         comm.copy_from_slice(&id.comm);
@@ -735,6 +743,7 @@ impl<FS: ShimFS> LinuxShim<FS> {
                 in_syscall: Cell::new(false),
                 deferred_vfork_park: Cell::new(false),
                 delayed_fork_pending: Cell::new(false),
+                migrated_to_remote: Cell::new(false),
             },
         };
 
@@ -1783,7 +1792,6 @@ impl<FS: ShimFS> Task<FS> {
     /// Two syscalls (`fcntl` and `prctl`) require argument-level inspection
     /// because they multiplex many operations through a single syscall number.
     #[cfg(target_arch = "x86_64")]
-    #[allow(dead_code)] // Wired up in Phase C (commit_delayed_fork).
     fn is_pre_exec_syscall(ctx: &litebox_common_linux::ExecutionContext) -> bool {
         use ::syscalls::Sysno;
 
@@ -1840,6 +1848,24 @@ impl<FS: ShimFS> Task<FS> {
         let syscall_number = ctx.orig_eax;
         #[cfg(target_arch = "x86_64")]
         let syscall_number = ctx.orig_rax;
+
+        // Delayed fork trigger: if this task is a fork child waiting to be
+        // promoted to a true fork, check whether the current syscall is in
+        // the pre-exec allowlist.  If not, commit the delayed fork now.
+        #[cfg(target_arch = "x86_64")]
+        if self.delayed_fork_pending.get() && !Self::is_pre_exec_syscall(ctx) {
+            if self.commit_delayed_fork(ctx).is_ok() {
+                // Child migrated to worker host.  Terminate this local task.
+                self.exit_thread(0);
+                return Ok(0);
+            }
+            // Delayed fork failed.  Force-exit the child; prepare_for_exit
+            // will signal VforkDone so the parent resumes and can reap.
+            self.exit_group(syscalls::process::ExitStatus::Signal(
+                litebox_common_linux::signal::Signal::SIGKILL,
+            ));
+            return Err(Errno::ENOMEM);
+        }
 
         if syscall_number == ::syscalls::Sysno::close_range as usize {
             self.record_syscall_entry(ctx, syscall_number);
@@ -2950,6 +2976,12 @@ struct ForkContext {
     address_space_id: <Platform as litebox::platform::AddressSpaceProvider>::AddressSpaceId,
     /// Signals the parent to resume after the vfork child execs or exits.
     vfork_done: Arc<VforkDone>,
+    /// The exit signal from the fork/clone args (usually SIGCHLD).
+    /// Stored here so that `commit_delayed_fork` can include it in the snapshot.
+    exit_signal: i32,
+    /// The parent's ProcessId in the process registry.
+    /// Needed by `commit_delayed_fork` for the snapshot's parent identity.
+    parent_process_id: litebox::process::ProcessId,
 }
 
 const SHELL_WRITE_SCAN_LEN: usize = 1024;
@@ -3035,8 +3067,12 @@ struct Task<FS: ShimFS> {
     ///
     /// Distinct from `deferred_vfork_park`, which handles sibling-thread
     /// parking coordination.
-    #[allow(dead_code)] // Wired up in Phase C (commit_delayed_fork).
     delayed_fork_pending: Cell<bool>,
+    /// Set by `commit_delayed_fork` on success.  When true, `prepare_for_exit`
+    /// skips exit notification and address-space cleanup because the process
+    /// was migrated to a remote worker host (the background waiter handles
+    /// the real exit).
+    migrated_to_remote: Cell<bool>,
 }
 
 impl<FS: ShimFS> Drop for Task<FS> {
@@ -3085,6 +3121,7 @@ mod test_utils {
                 in_syscall: Cell::new(false),
                 deferred_vfork_park: Cell::new(false),
                 delayed_fork_pending: Cell::new(false),
+                migrated_to_remote: Cell::new(false),
                 process_state: self.process_state.into(),
                 global: self.global,
             }
@@ -3119,6 +3156,7 @@ mod test_utils {
                 in_syscall: Cell::new(false),
                 deferred_vfork_park: Cell::new(false),
                 delayed_fork_pending: Cell::new(false),
+                migrated_to_remote: Cell::new(false),
             };
             Some(task)
         }

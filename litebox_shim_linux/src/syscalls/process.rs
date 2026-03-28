@@ -21,7 +21,9 @@ use litebox::mm::linux::VmFlags;
 use litebox::pipes::HalfPipeType;
 use litebox::platform::PageManagementProvider;
 use litebox::platform::ThreadProvider;
-use litebox::platform::{Instant as _, SystemInfoProvider as _, SystemTime as _, TimeProvider};
+use litebox::platform::{
+    AddressSpaceProvider, Instant as _, SystemInfoProvider as _, SystemTime as _, TimeProvider,
+};
 #[allow(unused_imports)]
 // StdioProvider needed for SNP but resolved via inherent method on Linux userland
 use litebox::platform::{
@@ -387,7 +389,7 @@ enum InboundControlPlaneEnvelopeOutcome {
 
 impl<FS: ShimFS> Task<FS> {
     /// Updates the process exit status for a thread exit.
-    fn exit_thread(&self, code: i8) {
+    pub(crate) fn exit_thread(&self, code: i8) {
         let mut inner = self.thread.process.inner.lock();
         if self.is_exiting() {
             return;
@@ -818,6 +820,14 @@ impl<FS: ShimFS> Task<FS> {
                 .vfork_parking
                 .parked_count
                 .wake_all();
+        }
+
+        // If this task was migrated to a remote worker host via delayed fork,
+        // all exit notification and cleanup was handled by commit_delayed_fork
+        // and its background waiter.  Skip the rest of prepare_for_exit to
+        // avoid double-notifying the parent or double-destroying resources.
+        if self.migrated_to_remote.get() {
+            return;
         }
 
         let is_last_thread = self.thread.detach_from_process();
@@ -1966,6 +1976,7 @@ impl<FS: ShimFS> Task<FS> {
                         in_syscall: core::cell::Cell::new(false),
                         deferred_vfork_park: core::cell::Cell::new(false),
                         delayed_fork_pending: core::cell::Cell::new(false),
+                        migrated_to_remote: core::cell::Cell::new(false),
                     },
                 }),
             )
@@ -2137,12 +2148,16 @@ impl<FS: ShimFS> Task<FS> {
             is_vfork,
         );
 
-        // True fork on a shared-address-space platform: the child must run in
-        // a separate host process with its own address space.  Route to the
-        // dedicated true-fork path instead of the vfork-style shared path.
-        if is_shared && !is_vfork {
-            return self.do_true_fork(ctx, args, flags, clone3, child_process_id, child_as_id);
-        }
+        // On a shared-address-space platform where the caller requested a real
+        // fork (not vfork), use the delayed-fork strategy: start vfork-style
+        // (parent suspended, CoW layer) and defer the expensive snapshot+restore
+        // to the point where the child makes a non-pre-exec syscall.
+        // Delayed fork is only supported on x86_64 for now; on other
+        // architectures, fall through to do_true_fork (which returns ENOSYS).
+        #[cfg(target_arch = "x86_64")]
+        let delayed_fork = is_shared && !is_vfork;
+        #[cfg(not(target_arch = "x86_64"))]
+        let delayed_fork = false;
 
         // 3. Allocate a TID for the child. For the initial thread of a
         //    forked process, pid == tid == the ProcessId assigned by the
@@ -2302,6 +2317,8 @@ impl<FS: ShimFS> Task<FS> {
             let fc = crate::ForkContext {
                 address_space_id: child_as_id,
                 vfork_done: vfork_done.clone(),
+                exit_signal: i32::try_from(args.exit_signal).unwrap_or(0),
+                parent_process_id: self.process_id,
             };
             (
                 self.process_state.clone(),                  // share parent's PM
@@ -2491,7 +2508,8 @@ impl<FS: ShimFS> Task<FS> {
                         syscall_restartable: core::cell::Cell::new(false),
                         in_syscall: core::cell::Cell::new(false),
                         deferred_vfork_park: core::cell::Cell::new(false),
-                        delayed_fork_pending: core::cell::Cell::new(false),
+                        delayed_fork_pending: core::cell::Cell::new(delayed_fork),
+                        migrated_to_remote: core::cell::Cell::new(false),
                     },
                 }),
             )
@@ -2543,6 +2561,319 @@ impl<FS: ShimFS> Task<FS> {
         Ok(usize::try_from(child_pid).unwrap())
     }
 
+    /// Commit a delayed fork: snapshot the child's current state, spawn a
+    /// worker host, restore the child there, and signal VforkDone so the
+    /// parent resumes.
+    ///
+    /// Called from `do_syscall` when a delayed-fork child makes a non-pre-exec
+    /// syscall.  On success, the local child task should exit (the process
+    /// continues in the worker host).  On failure, the caller should force-exit
+    /// the child so that VforkDone is signaled via `prepare_for_exit`.
+    pub(crate) fn commit_delayed_fork(
+        &self,
+        ctx: &litebox_common_linux::ExecutionContext,
+    ) -> Result<(), Errno> {
+        use super::fork_snapshot::ForkRejectReasons;
+
+        // Take the fork context.  This gives us the VforkDone handle and
+        // the child's address-space ID.
+        let fc = self.fork_context.borrow_mut().take().ok_or(Errno::EINVAL)?;
+
+        // Helper to restore fork_context on failure so prepare_for_exit
+        // can signal VforkDone.
+        let put_fc_back = |this: &Self, fc: crate::ForkContext| {
+            *this.fork_context.borrow_mut() = Some(fc);
+        };
+
+        #[cfg(feature = "trace_syscalls")]
+        litebox::log_println!(
+            self.global.platform,
+            "[DELAYED-FORK] pid={}: triggered by syscall nr={}",
+            self.pid,
+            ctx.orig_rax,
+        );
+
+        // Sibling threads are already parked (by the vfork CoW setup).
+        // Snapshot the child's current state.
+        let mut reject = ForkRejectReasons::new();
+
+        let identity = super::fork_snapshot::ProcessIdentitySnapshot {
+            process_id: self.process_id,
+            parent_process_id: fc.parent_process_id,
+            pid: self.pid,
+            ppid: self.ppid,
+            tid: self.tid,
+            pgid: {
+                use litebox::process::ProcessGroupId;
+                self.global
+                    .litebox
+                    .process_registry()
+                    .get_pgid(self.process_id)
+                    .map_or(self.pid.cast_unsigned(), ProcessGroupId::as_u32)
+                    .try_into()
+                    .unwrap_or(self.pid)
+            },
+            sid: {
+                use litebox::process::SessionId;
+                self.global
+                    .litebox
+                    .process_registry()
+                    .get_sid(self.process_id)
+                    .map_or(self.pid.cast_unsigned(), SessionId::as_u32)
+                    .try_into()
+                    .unwrap_or(self.pid)
+            },
+            exit_signal: fc.exit_signal,
+            comm: self.comm.get(),
+            credentials: super::fork_snapshot::CredentialsSnapshot {
+                uid: self.credentials.uid,
+                euid: self.credentials.euid,
+                gid: self.credentials.gid,
+                egid: self.credentials.egid,
+            },
+        };
+
+        let process_wide = self.snapshot_process_wide();
+
+        // Snapshot thread state from the child's current context (the
+        // triggering syscall's entry state).  The child was already started
+        // via the vfork path so set_child_tid was already written; we only
+        // need clear_child_tid for the restored child's futex wake on exit.
+        //
+        // Adjust the execution context so the restored child replays the
+        // triggering syscall: back up rip by 2 (the x86_64 `syscall`
+        // instruction is 2 bytes) and restore rax to the syscall number.
+        let thread = {
+            #[cfg(target_arch = "x86_64")]
+            let tls_base = {
+                let punchthrough = litebox_common_linux::PunchthroughSyscall::GetFsBase;
+                self.global
+                    .platform
+                    .get_punchthrough_token_for(punchthrough)
+                    .and_then(|token| token.execute().ok())
+            };
+            #[cfg(not(target_arch = "x86_64"))]
+            let tls_base: Option<usize> = None;
+
+            let mut exec_ctx = ctx.clone();
+            #[cfg(target_arch = "x86_64")]
+            {
+                // Mirror the syscall-restart mechanism used by
+                // signal/mod.rs: both the rewriter trampoline and
+                // seccomp handler store the call-site address in R11.
+                // Setting rip to that address re-enters the
+                // trampoline/syscall, which re-executes the syscall.
+                exec_ctx.regs.rip = exec_ctx.regs.r11;
+                exec_ctx.regs.rax = exec_ctx.orig_rax;
+            }
+
+            super::fork_snapshot::ThreadSnapshot {
+                execution_context: exec_ctx,
+                tls_base,
+                // set_child_tid was already written when the child started;
+                // the restored child does not need to re-write it.
+                set_child_tid: None,
+                clear_child_tid: self
+                    .thread
+                    .clear_child_tid
+                    .get()
+                    .map(|p: MutPtr<i32>| p.as_usize()),
+                robust_list: self.thread.robust_list.get().map(|ptr| ptr.as_usize()),
+            }
+        };
+
+        let signal = self.snapshot_signal();
+        let fs = self.snapshot_fs();
+        let fd_table = self.snapshot_fd_table(&mut reject);
+        let memory = self.snapshot_memory(&mut reject);
+
+        // Check rejection gate.
+        if !reject.is_empty() {
+            #[cfg(feature = "trace_syscalls")]
+            litebox::log_println!(
+                self.global.platform,
+                "[DELAYED-FORK] pid={}: rejected — {}",
+                self.pid,
+                reject,
+            );
+            put_fc_back(self, fc);
+            return Err(Errno::ENOSYS);
+        }
+
+        let snapshot = super::fork_snapshot::ForkSnapshot {
+            identity,
+            process_wide,
+            thread,
+            signal,
+            fs,
+            fd_table,
+            memory,
+            is_delayed_fork: true,
+        };
+
+        let snapshot_bytes = snapshot.serialize();
+
+        #[cfg(feature = "trace_syscalls")]
+        litebox::log_println!(
+            self.global.platform,
+            "[DELAYED-FORK] pid={}: snapshot serialized ({} bytes), spawning worker",
+            self.pid,
+            snapshot_bytes.len(),
+        );
+
+        // Get stdio bindings for the child worker.
+        let stdio = match self.worker_exec_stdio_bindings() {
+            Ok(s) => s,
+            Err(_e) => {
+                #[cfg(feature = "trace_syscalls")]
+                litebox::log_println!(
+                    self.global.platform,
+                    "[DELAYED-FORK] pid={}: stdio bindings failed: {:?}",
+                    self.pid,
+                    _e,
+                );
+                put_fc_back(self, fc);
+                return Err(Errno::ENOSYS);
+            }
+        };
+
+        // Spawn the child worker host.
+        let host_pid = match self
+            .global
+            .platform
+            .spawn_worker_host_for_fork_restore(&snapshot_bytes, stdio)
+        {
+            Ok(pid) => pid,
+            Err(_err) => {
+                #[cfg(feature = "trace_syscalls")]
+                litebox::log_println!(
+                    self.global.platform,
+                    "[DELAYED-FORK] pid={}: spawn_worker_host failed: {}",
+                    self.pid,
+                    _err,
+                );
+                put_fc_back(self, fc);
+                return Err(Errno::ENOMEM);
+            }
+        };
+
+        #[cfg(feature = "trace_syscalls")]
+        litebox::log_println!(
+            self.global.platform,
+            "[DELAYED-FORK] pid={}: worker spawned, host_pid={}",
+            self.pid,
+            host_pid,
+        );
+
+        // Migrate: unregister from local control plane, re-register as remote.
+        let local_host = self.global.control_plane.local_host();
+        let _ = self
+            .global
+            .control_plane
+            .unregister_running_process(self.process_id);
+        let _ = self
+            .global
+            .control_plane
+            .register_running_process(self.process_id, local_host);
+
+        // Record fork child → worker host PID mapping for signal forwarding.
+        self.global
+            .fork_child_host_pids
+            .write()
+            .insert(self.process_id.0, host_pid);
+
+        // Clean up the pre-allocated child address space — the worker host
+        // has its own.
+        let _ = self
+            .global
+            .platform
+            .destroy_address_space(fc.address_space_id);
+
+        // Spawn a background thread that waits for the child worker to exit
+        // and reports the exit to the process registry (same as do_true_fork).
+        {
+            use litebox_common_linux::signal::{Siginfo, SiginfoData, Signal};
+            const CLD_EXITED: i32 = 1;
+
+            let global = self.global.clone();
+            let child_proc_id = self.process_id;
+            self.global.platform.spawn_background_task(move || {
+                let exit_code = global.platform.wait_worker_host(host_pid);
+
+                let exit_status = if exit_code > 255 {
+                    (exit_code - 256) + 128
+                } else {
+                    exit_code
+                };
+
+                global.fork_child_host_pids.write().remove(&child_proc_id.0);
+
+                global
+                    .control_plane
+                    .unregister_running_process(child_proc_id);
+
+                global
+                    .litebox
+                    .process_registry()
+                    .exit_process_with_callback(child_proc_id, exit_status, |notif| {
+                        if let Some(notif) = notif {
+                            global
+                                .control_plane
+                                .record_child_exit_provenance(local_host, notif);
+
+                            let Ok(signal) = Signal::try_from(notif.exit_signal) else {
+                                return;
+                            };
+                            let mut data = SiginfoData { pad: [0u32; 28] };
+                            data.pad[0] = notif.child_pid.0;
+                            data.pad[2] = notif.exit_status.cast_unsigned();
+                            let siginfo = Siginfo {
+                                signo: signal.as_i32(),
+                                errno: 0,
+                                code: CLD_EXITED,
+                                #[cfg(target_pointer_width = "64")]
+                                __pad: 0,
+                                data,
+                            };
+
+                            global
+                                .cross_process_signals
+                                .lock()
+                                .push(crate::CrossProcessSignal {
+                                    target_process_id: notif.parent_pid.0,
+                                    target_tid: None,
+                                    signal,
+                                    siginfo,
+                                });
+                            let parent_key = notif.parent_pid.0.cast_signed();
+                            if let Some(remote) =
+                                global.process_thread_handles.read().get(&parent_key)
+                            {
+                                remote.interrupt();
+                            }
+                        }
+                    });
+            });
+        }
+
+        // Signal VforkDone AFTER the worker is spawned and registered.
+        // The parent will then restore the CoW layer and resume.
+        fc.vfork_done.signal();
+
+        // Mark this task as migrated so prepare_for_exit skips cleanup.
+        self.delayed_fork_pending.set(false);
+        self.migrated_to_remote.set(true);
+
+        // Remove the local process_thread_handles entry for this child —
+        // the remote worker host owns the process now.
+        {
+            let proc_key = self.process_id.0.cast_signed();
+            self.global.process_thread_handles.write().remove(&proc_key);
+        }
+
+        Ok(())
+    }
+
     /// True fork on a shared-address-space (userland) platform.
     ///
     /// Unlike the vfork-style shared path in [`do_fork`], true fork creates
@@ -2555,6 +2886,7 @@ impl<FS: ShimFS> Task<FS> {
     ///
     /// Currently unimplemented — returns `ENOSYS`.
     #[allow(unused_variables)]
+    #[allow(dead_code)]
     fn do_true_fork(
         &self,
         ctx: &litebox_common_linux::ExecutionContext,
@@ -2629,6 +2961,7 @@ impl<FS: ShimFS> Task<FS> {
             fs,
             fd_table,
             memory,
+            is_delayed_fork: false,
         };
 
         // Phase 3: serialize and transport.
@@ -2796,6 +3129,7 @@ impl<FS: ShimFS> Task<FS> {
     }
 
     /// Capture the calling task's identity for a true-fork snapshot.
+    #[allow(dead_code)]
     fn snapshot_identity(
         &self,
         child_process_id: litebox::process::ProcessId,
@@ -2859,6 +3193,7 @@ impl<FS: ShimFS> Task<FS> {
     }
 
     /// Capture the calling thread's execution state for a true-fork snapshot.
+    #[allow(dead_code)]
     fn snapshot_thread(
         &self,
         ctx: &litebox_common_linux::ExecutionContext,

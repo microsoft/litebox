@@ -31,6 +31,11 @@ pub struct ForkSnapshot {
     pub fs: FsSnapshot,
     pub fd_table: FdTableSnapshot,
     pub memory: MemorySnapshot,
+    /// When true, the snapshot was taken from a delayed-fork child at the
+    /// point of its first non-pre-exec syscall.  The execution context
+    /// contains a rewound instruction pointer so the guest replays the
+    /// triggering syscall after restore (rax is NOT overwritten to 0).
+    pub is_delayed_fork: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -617,6 +622,7 @@ impl ForkSnapshot {
         let mut w = SnapshotWriter::new();
         w.write_u32(SNAPSHOT_MAGIC);
         w.write_u32(SNAPSHOT_VERSION);
+        w.write_u8(u8::from(self.is_delayed_fork));
         self.identity.write(&mut w);
         self.process_wide.write(&mut w);
         self.thread.write(&mut w);
@@ -637,6 +643,7 @@ impl ForkSnapshot {
         if version != SNAPSHOT_VERSION {
             return Err(SnapshotDeserializeError::UnsupportedVersion(version));
         }
+        let is_delayed_fork = r.read_u8()? != 0;
         Ok(Self {
             identity: ProcessIdentitySnapshot::read(&mut r)?,
             process_wide: ProcessWideSnapshot::read(&mut r)?,
@@ -645,6 +652,7 @@ impl ForkSnapshot {
             fs: FsSnapshot::read(&mut r)?,
             fd_table: FdTableSnapshot::read(&mut r)?,
             memory: MemorySnapshot::read(&mut r)?,
+            is_delayed_fork,
         })
     }
 }
@@ -1439,6 +1447,7 @@ mod tests {
                     main_bss_end: 0x2000_2000,
                 },
             },
+            is_delayed_fork: false,
         }
     }
 
