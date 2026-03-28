@@ -1507,11 +1507,7 @@ impl LinuxUserland {
                     return Err(-1_i32);
                 };
                 if unsafe {
-                    libc::posix_spawn_file_actions_adddup2(
-                        file_actions_ptr,
-                        source.as_raw_fd(),
-                        0,
-                    )
+                    libc::posix_spawn_file_actions_adddup2(file_actions_ptr, source.as_raw_fd(), 0)
                 } != 0
                 {
                     return Err(-1_i32);
@@ -1545,9 +1541,8 @@ impl LinuxUserland {
                     }
                 }
                 WorkerExecOutputBinding::Close => {
-                    if unsafe {
-                        libc::posix_spawn_file_actions_addclose(file_actions_ptr, fd_num)
-                    } != 0
+                    if unsafe { libc::posix_spawn_file_actions_addclose(file_actions_ptr, fd_num) }
+                        != 0
                     {
                         return Err(-1_i32);
                     }
@@ -1594,7 +1589,9 @@ impl LinuxUserland {
             let mut status: libc::c_int = 0;
             loop {
                 let ret = unsafe { libc::waitpid(pid, core::ptr::addr_of_mut!(status), 0) };
-                if ret != -1 || std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
+                if ret != -1
+                    || std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted
+                {
                     break;
                 }
             }
@@ -1664,6 +1661,29 @@ impl LinuxUserland {
             }
         }
         fallback_status
+    }
+
+    /// Spawn a background host thread that runs the given closure.
+    ///
+    /// This is used for tasks that need to run concurrently with guest
+    /// execution, such as waiting for a fork child worker to exit.
+    pub fn spawn_background_task<F>(&self, f: F)
+    where
+        F: FnOnce() + Send + 'static,
+    {
+        spawn_host_thread(f);
+    }
+
+    /// Send a signal to a worker host process.
+    ///
+    /// Returns 0 on success, or a negative errno on failure.
+    pub fn kill_worker_host(&self, host_pid: i32, signal: i32) -> i32 {
+        let ret = unsafe { libc::kill(host_pid, signal) };
+        if ret == -1 {
+            -(std::io::Error::last_os_error().raw_os_error().unwrap_or(1))
+        } else {
+            0
+        }
     }
 
     /// Wait until there is data available on the network transport (TUN or IPC).
@@ -1764,9 +1784,7 @@ fn move_fd_away_from_stdio(fd: std::os::fd::OwnedFd) -> std::io::Result<std::os:
 }
 
 /// Create a memfd containing the serialized fork snapshot bytes.
-fn create_worker_fork_snapshot_fd(
-    snapshot_bytes: &[u8],
-) -> std::io::Result<std::os::fd::OwnedFd> {
+fn create_worker_fork_snapshot_fd(snapshot_bytes: &[u8]) -> std::io::Result<std::os::fd::OwnedFd> {
     let name = CString::new("litebox-fork-snapshot").unwrap();
     let raw_fd = unsafe { libc::memfd_create(name.as_ptr(), 0) };
     if raw_fd < 0 {

@@ -924,10 +924,44 @@ impl<FS: ShimFS> Task<FS> {
         if !is_running {
             return Err(Errno::ESRCH);
         }
+
+        // If the target is a fork child running in a remote worker host,
+        // forward the signal to the worker host OS process directly.
+        // This includes signal 0 (existence check) so we test host-level
+        // liveness rather than relying on guest registry state alone.
+        if let Some(&host_pid) = self.global.fork_child_host_pids.read().get(&target.0) {
+            if signal == 0 {
+                let ret = self.global.platform.kill_worker_host(host_pid, 0);
+                return if ret < 0 {
+                    Err(Errno::try_from(-ret).unwrap_or(Errno::ESRCH))
+                } else {
+                    Ok(0)
+                };
+            }
+            let signal = Signal::try_from(signal)?;
+            if tid.is_some() {
+                log_unsupported!(
+                    "tgkill for fork child pid {} (host_pid {}) not supported",
+                    target.0,
+                    host_pid,
+                );
+                return Err(Errno::EOPNOTSUPP);
+            }
+            let ret = self
+                .global
+                .platform
+                .kill_worker_host(host_pid, signal.as_i32());
+            if ret < 0 {
+                return Err(Errno::try_from(-ret).unwrap_or(Errno::EIO));
+            }
+            return Ok(0);
+        }
+
         if signal == 0 {
             return Ok(0);
         }
         let signal = Signal::try_from(signal)?;
+
         if let Some(owner_host) = self.global.control_plane.owner_of_running_process(target)
             && owner_host != self.global.control_plane.local_host()
         {

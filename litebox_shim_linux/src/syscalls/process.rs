@@ -2691,6 +2691,97 @@ impl<FS: ShimFS> Task<FS> {
         // Clean up the pre-allocated address space — the child has its own.
         let _ = self.global.platform.destroy_address_space(child_as_id);
 
+        // Record the fork child → worker host PID mapping so that kill()
+        // can forward signals to the correct worker host process.
+        self.global
+            .fork_child_host_pids
+            .write()
+            .insert(child_process_id.0, host_pid);
+
+        // Spawn a background thread that waits for the child worker to exit,
+        // then reports the exit to the process registry so that the parent's
+        // wait4/waitid can reap the child.
+        {
+            use litebox_common_linux::signal::{Siginfo, SiginfoData, Signal};
+            const CLD_EXITED: i32 = 1;
+
+            let global = self.global.clone();
+            let child_proc_id = child_process_id;
+            self.global.platform.spawn_background_task(move || {
+                let exit_code = global.platform.wait_worker_host(host_pid);
+
+                // Convert exit_code to the process registry's status format.
+                // wait_worker_host returns 0–255 for normal exit, 256+N for signal N.
+                // The registry stores: exit_code for normal exit, signal+128 for signals
+                // (matching the shell convention where signal death = 128 + signum).
+                let exit_status = if exit_code > 255 {
+                    (exit_code - 256) + 128
+                } else {
+                    exit_code
+                };
+
+                // Remove the fork child host PID mapping first to prevent
+                // kill() from forwarding signals to a potentially-reused PID.
+                global.fork_child_host_pids.write().remove(&child_proc_id.0);
+
+                // Unregister from control plane before exit notification.
+                global
+                    .control_plane
+                    .unregister_running_process(child_proc_id);
+
+                // Report exit to the process registry, which wakes the parent's
+                // wait channel and delivers the configured exit signal.
+                global
+                    .litebox
+                    .process_registry()
+                    .exit_process_with_callback(child_proc_id, exit_status, |notif| {
+                        if let Some(notif) = notif {
+                            // Record provenance so the control plane can track
+                            // the source host for this child exit.
+                            global
+                                .control_plane
+                                .record_child_exit_provenance(local_host, notif);
+
+                            // Build exit notification siginfo matching
+                            // deliver_local_child_exit_notification().
+                            // Use notif.exit_signal (not hardcoded SIGCHLD) so
+                            // clone() with a custom exit_signal works correctly.
+                            let Ok(signal) = Signal::try_from(notif.exit_signal) else {
+                                return;
+                            };
+                            let mut data = SiginfoData { pad: [0u32; 28] };
+                            data.pad[0] = notif.child_pid.0; // si_pid
+                            data.pad[2] = notif.exit_status.cast_unsigned(); // si_status
+                            let siginfo = Siginfo {
+                                signo: signal.as_i32(),
+                                errno: 0,
+                                code: CLD_EXITED,
+                                #[cfg(target_pointer_width = "64")]
+                                __pad: 0,
+                                data,
+                            };
+
+                            // Queue exit signal for the parent and interrupt it.
+                            global
+                                .cross_process_signals
+                                .lock()
+                                .push(crate::CrossProcessSignal {
+                                    target_process_id: notif.parent_pid.0,
+                                    target_tid: None,
+                                    signal,
+                                    siginfo,
+                                });
+                            let parent_key = notif.parent_pid.0.cast_signed();
+                            if let Some(remote) =
+                                global.process_thread_handles.read().get(&parent_key)
+                            {
+                                remote.interrupt();
+                            }
+                        }
+                    });
+            });
+        }
+
         // Return child pid to the parent.
         Ok(usize::try_from(child_pid).unwrap())
     }

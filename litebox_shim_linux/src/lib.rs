@@ -288,6 +288,7 @@ impl LinuxShimBuilder {
             transport_interrupt: alloc::sync::Arc::new(core::sync::atomic::AtomicBool::new(false)),
             epoll_graph_lock: litebox::sync::Mutex::new(()),
             control_plane,
+            fork_child_host_pids: litebox::sync::RwLock::new(alloc::collections::BTreeMap::new()),
         });
         LinuxShim {
             global,
@@ -2711,6 +2712,9 @@ struct GlobalState<FS: ShimFS> {
     epoll_graph_lock: litebox::sync::Mutex<Platform, ()>,
     /// Root-host coordinator state for the future multi-host exec handoff path.
     control_plane: multihost::ControlPlane<Platform>,
+    /// Mapping from fork child guest ProcessId.0 → worker host OS PID.
+    /// Used to forward signals (e.g. SIGKILL) to the correct worker host.
+    fork_child_host_pids: litebox::sync::RwLock<Platform, alloc::collections::BTreeMap<u32, i32>>,
 }
 
 impl<FS: ShimFS> GlobalState<FS> {
