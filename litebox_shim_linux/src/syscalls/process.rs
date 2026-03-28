@@ -2491,34 +2491,151 @@ impl<FS: ShimFS> Task<FS> {
         ctx: &litebox_common_linux::ExecutionContext,
         args: &litebox_common_linux::CloneArgs,
         flags: CloneFlags,
-        clone3: bool,
+        _clone3: bool,
         child_process_id: litebox::process::ProcessId,
         child_as_id: <crate::Platform as litebox::platform::AddressSpaceProvider>::AddressSpaceId,
     ) -> Result<usize, Errno> {
+        use super::fork_snapshot::ForkRejectReasons;
         use litebox::platform::AddressSpaceProvider;
+
+        // Helper to clean up pre-allocated resources on failure.
+        let cleanup = |this: &Self, as_id, proc_id: litebox::process::ProcessId| {
+            let _ = this.global.platform.destroy_address_space(as_id);
+            this.global
+                .litebox
+                .process_registry()
+                .remove_process(proc_id);
+        };
+
+        // Allocate the child's guest PID/TID.
+        let child_pid = self
+            .global
+            .next_thread_id
+            .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+
+        // Park sibling threads to get a consistent snapshot.
+        // snapshot_memory() changes page permissions and reads raw pages,
+        // so we need exclusive access.
+        let Ok(did_park) = self.park_other_threads() else {
+            cleanup(self, child_as_id, child_process_id);
+            return Err(Errno::EAGAIN);
+        };
+
+        // Phase 1: collect snapshot.
+        let mut reject = ForkRejectReasons::new();
+
+        let exit_signal = i32::try_from(args.exit_signal).unwrap_or(0);
+        let identity = self.snapshot_identity(child_process_id, child_pid, exit_signal);
+        let process_wide = self.snapshot_process_wide();
+        let thread = self.snapshot_thread(ctx, flags, args);
+        let signal = self.snapshot_signal();
+        let fs = self.snapshot_fs();
+        let fd_table = self.snapshot_fd_table(&mut reject);
+        let memory = self.snapshot_memory(&mut reject);
+
+        // Unpark sibling threads — snapshot is complete.
+        if did_park {
+            self.unpark_other_threads();
+        }
+
+        // Phase 2: check reject gate.
+        if !reject.is_empty() {
+            #[cfg(feature = "trace_syscalls")]
+            litebox::log_println!(
+                self.global.platform,
+                "[TRUE-FORK] pid={} child_pid={}: rejected — {}",
+                self.pid,
+                child_pid,
+                reject,
+            );
+            cleanup(self, child_as_id, child_process_id);
+            return Err(Errno::ENOSYS);
+        }
+
+        let snapshot = super::fork_snapshot::ForkSnapshot {
+            identity,
+            process_wide,
+            thread,
+            signal,
+            fs,
+            fd_table,
+            memory,
+        };
+
+        // Phase 3: serialize and transport.
+        let snapshot_bytes = snapshot.serialize();
 
         #[cfg(feature = "trace_syscalls")]
         litebox::log_println!(
             self.global.platform,
-            "[TRUE-FORK] pid={} child_process_id={} child_as_id={:?}: not yet implemented",
+            "[TRUE-FORK] pid={} child_pid={}: snapshot serialized ({} bytes), spawning worker",
             self.pid,
-            child_process_id.0,
-            child_as_id,
+            child_pid,
+            snapshot_bytes.len(),
         );
 
-        // Clean up pre-allocated resources before returning the error.
-        let _ = self.global.platform.destroy_address_space(child_as_id);
-        self.global
-            .litebox
-            .process_registry()
-            .remove_process(child_process_id);
+        // Get stdio bindings for the child worker.
+        let stdio = match self.worker_exec_stdio_bindings() {
+            Ok(s) => s,
+            Err(e) => {
+                #[cfg(feature = "trace_syscalls")]
+                litebox::log_println!(
+                    self.global.platform,
+                    "[TRUE-FORK] pid={} child_pid={}: stdio bindings failed: {:?}",
+                    self.pid,
+                    child_pid,
+                    e,
+                );
+                cleanup(self, child_as_id, child_process_id);
+                return Err(Errno::ENOSYS);
+            }
+        };
 
-        // True fork is not yet implemented on this platform.
-        Err(Errno::ENOSYS)
+        // Spawn the child worker host.
+        let host_pid = match self
+            .global
+            .platform
+            .spawn_worker_host_for_fork_restore(&snapshot_bytes, stdio)
+        {
+            Ok(pid) => pid,
+            Err(err) => {
+                #[cfg(feature = "trace_syscalls")]
+                litebox::log_println!(
+                    self.global.platform,
+                    "[TRUE-FORK] pid={} child_pid={}: spawn_worker_host_for_fork_restore failed: {}",
+                    self.pid,
+                    child_pid,
+                    err,
+                );
+                cleanup(self, child_as_id, child_process_id);
+                return Err(Errno::ENOMEM);
+            }
+        };
+
+        #[cfg(feature = "trace_syscalls")]
+        litebox::log_println!(
+            self.global.platform,
+            "[TRUE-FORK] pid={} child_pid={}: worker spawned, host_pid={}",
+            self.pid,
+            child_pid,
+            host_pid,
+        );
+
+        // Register the child in the multihost control plane.
+        let local_host = self.global.control_plane.local_host();
+        let _ = self
+            .global
+            .control_plane
+            .register_running_process(child_process_id, local_host);
+
+        // Clean up the pre-allocated address space — the child has its own.
+        let _ = self.global.platform.destroy_address_space(child_as_id);
+
+        // Return child pid to the parent.
+        Ok(usize::try_from(child_pid).unwrap())
     }
 
     /// Capture the calling task's identity for a true-fork snapshot.
-    #[allow(dead_code)] // Will be called from `do_true_fork` in a later phase.
     fn snapshot_identity(
         &self,
         child_process_id: litebox::process::ProcessId,
@@ -2561,7 +2678,6 @@ impl<FS: ShimFS> Task<FS> {
     }
 
     /// Capture process-wide state for a true-fork snapshot.
-    #[allow(dead_code)] // Will be called from `do_true_fork` in a later phase.
     fn snapshot_process_wide(&self) -> super::fork_snapshot::ProcessWideSnapshot {
         let process = self.process();
 
@@ -2583,7 +2699,6 @@ impl<FS: ShimFS> Task<FS> {
     }
 
     /// Capture the calling thread's execution state for a true-fork snapshot.
-    #[allow(dead_code)] // Will be called from `do_true_fork` in a later phase.
     fn snapshot_thread(
         &self,
         ctx: &litebox_common_linux::ExecutionContext,
@@ -2624,7 +2739,6 @@ impl<FS: ShimFS> Task<FS> {
     }
 
     /// Capture signal state for a true-fork snapshot.
-    #[allow(dead_code)] // Will be called from `do_true_fork` in a later phase.
     fn snapshot_signal(&self) -> super::fork_snapshot::SignalSnapshot {
         let blocked = self.signals.get_blocked();
         let handlers = self.signals.snapshot_handlers();
@@ -2641,7 +2755,6 @@ impl<FS: ShimFS> Task<FS> {
     }
 
     /// Capture filesystem state for a true-fork snapshot (deep copy).
-    #[allow(dead_code)] // Will be called from `do_true_fork` in a later phase.
     fn snapshot_fs(&self) -> super::fork_snapshot::FsSnapshot {
         let fs = self.fs.borrow();
         super::fork_snapshot::FsSnapshot {
@@ -2656,7 +2769,6 @@ impl<FS: ShimFS> Task<FS> {
     /// In v1, only stdio fds (identified by matching their object ID against the
     /// original host stdio descriptors) are supported for cross-host fork.
     /// All other open fds cause fork rejection.
-    #[allow(dead_code)] // Will be called from `do_true_fork` in a later phase.
     fn snapshot_fd_table(
         &self,
         reject: &mut super::fork_snapshot::ForkRejectReasons,
@@ -2723,8 +2835,7 @@ impl<FS: ShimFS> Task<FS> {
             // This handles aliases like dup2(1, 2) where fd 2 shares stdout's
             // object_id rather than stderr's original one.
             let class = if raw_fd <= 2 {
-                let is_host_stdio =
-                    object_id.is_some() && host_stdio_oids.contains(&object_id);
+                let is_host_stdio = object_id.is_some() && host_stdio_oids.contains(&object_id);
                 if is_host_stdio {
                     FdClass::StdioFd
                 } else {
@@ -2773,7 +2884,6 @@ impl<FS: ShimFS> Task<FS> {
     /// metadata that must be restored alongside the raw pages. Shared mappings
     /// are flagged for the v1 reject gate (the caller decides whether to
     /// proceed or abort).
-    #[allow(dead_code)] // Will be called from `do_true_fork` in a later phase.
     fn snapshot_memory(
         &self,
         reject: &mut super::fork_snapshot::ForkRejectReasons,
@@ -2811,10 +2921,19 @@ impl<FS: ShimFS> Task<FS> {
             let data =
                 unsafe { core::slice::from_raw_parts(range.start as *const u8, len).to_vec() };
 
-            // Restore original permissions if we upgraded them.
+            // Restore original permissions if we temporarily upgraded them.
+            // Use the exact original flags rather than always setting PROT_NONE,
+            // in case the region was write-only or exec-only (rare but possible).
             if !readable {
                 let ptr = crate::MutPtr::<u8>::from_usize(range.start);
-                let _ = unsafe { ps.pm.make_pages_inaccessible(ptr, len) };
+                let has_write = flags.contains(VmFlags::VM_WRITE);
+                let has_exec = flags.contains(VmFlags::VM_EXEC);
+                let _ = match (has_write, has_exec) {
+                    (false, false) => unsafe { ps.pm.make_pages_inaccessible(ptr, len) },
+                    (true, false) => unsafe { ps.pm.make_pages_writable(ptr, len) },
+                    (false, true) => unsafe { ps.pm.make_pages_executable(ptr, len) },
+                    (true, true) => unsafe { ps.pm.make_pages_rwx(ptr, len) },
+                };
             }
 
             regions.push(super::fork_snapshot::MemoryRegionSnapshot {

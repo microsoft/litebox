@@ -11,7 +11,7 @@ use std::cell::Cell;
 use std::collections::{BTreeMap, VecDeque};
 use std::ffi::CString;
 use std::io::{Read as _, Seek as _, Write as _};
-use std::os::fd::{AsRawFd as _, FromRawFd as _};
+use std::os::fd::{AsRawFd as _, FromRawFd as _, IntoRawFd as _};
 use std::path::PathBuf;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicI32, AtomicU32, Ordering};
@@ -1404,6 +1404,214 @@ impl LinuxUserland {
         Ok(pid)
     }
 
+    /// Spawn a worker host process to restore a fork child from a snapshot.
+    ///
+    /// Writes the serialized snapshot to a memfd, creates an ack pipe for the
+    /// child to report restore success/failure, and launches a new host process
+    /// via `posix_spawn`.
+    ///
+    /// Returns `Ok(host_pid)` if the child was spawned and reported successful
+    /// restore via the ack pipe.  Returns `Err(errno)` on failure.
+    ///
+    /// The caller is responsible for registering the child in the multihost
+    /// control plane and for reaping it later via `wait_worker_host`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if any internal lock (worker spawn serialization, worker spawn
+    /// flags, or worker processes) is poisoned.
+    pub fn spawn_worker_host_for_fork_restore<FS>(
+        &'static self,
+        snapshot_bytes: &[u8],
+        stdio: WorkerExecStdioBindings<FS, LinuxUserland>,
+    ) -> Result<i32, i32>
+    where
+        FS: litebox::fs::FileSystem + Send + Sync + 'static,
+    {
+        use std::os::unix::ffi::OsStrExt;
+
+        // SAFETY: `environ` is the standard C runtime global environment pointer.
+        unsafe extern "C" {
+            static environ: *const *const libc::c_char;
+        }
+
+        struct FileActionsGuard(*mut libc::posix_spawn_file_actions_t);
+        impl Drop for FileActionsGuard {
+            fn drop(&mut self) {
+                unsafe {
+                    libc::posix_spawn_file_actions_destroy(self.0);
+                }
+            }
+        }
+
+        let _spawn_guard = self.worker_spawn_serial.lock().unwrap();
+        self.reap_finished_worker_bridge_threads();
+
+        // Create memfd with serialized snapshot.
+        let snapshot_fd = create_worker_fork_snapshot_fd(snapshot_bytes).map_err(|_| -1_i32)?;
+
+        // Create ack pipe: child writes restore status, parent reads it.
+        let (ack_read_fd, ack_write_fd) = create_worker_result_pipe().map_err(|_| -1_i32)?;
+
+        // Create result pipe for exit status (reuses exec infrastructure).
+        let (result_read_fd, result_write_fd) = create_worker_result_pipe().map_err(|_| -1_i32)?;
+
+        let host_stdio_temp_sources =
+            duplicate_host_stdio_sources_for_spawn(&stdio).map_err(|_| -1_i32)?;
+
+        // Build command: /proc/self/exe -Z --fork-restore --fork-restore-fd N
+        //     --fork-restore-ack-fd N --worker-result-fd N
+        let self_exe = std::fs::read_link("/proc/self/exe").map_err(|_| -1_i32)?;
+        let mut spawn_argv: Vec<CString> = vec![
+            CString::new(self_exe.as_os_str().as_bytes()).map_err(|_| -1_i32)?,
+            CString::new("-Z").unwrap(),
+            CString::new("--fork-restore").unwrap(),
+            CString::new("--fork-restore-fd").unwrap(),
+            CString::new(snapshot_fd.as_raw_fd().to_string()).map_err(|_| -1_i32)?,
+            CString::new("--fork-restore-ack-fd").unwrap(),
+            CString::new(ack_write_fd.as_raw_fd().to_string()).map_err(|_| -1_i32)?,
+            CString::new("--worker-result-fd").unwrap(),
+            CString::new(result_write_fd.as_raw_fd().to_string()).map_err(|_| -1_i32)?,
+        ];
+
+        // Forward runner infrastructure flags.
+        {
+            let flags = self.worker_spawn_flags.read().unwrap();
+            for flag in flags.iter() {
+                spawn_argv.push(flag.clone());
+            }
+        }
+
+        let argv_ptrs: Vec<*const libc::c_char> = spawn_argv
+            .iter()
+            .map(|s| s.as_ptr())
+            .chain(core::iter::once(core::ptr::null()))
+            .collect();
+
+        // Set up file actions for stdio.
+        let mut spawn_file_actions =
+            std::mem::MaybeUninit::<libc::posix_spawn_file_actions_t>::uninit();
+        if unsafe { libc::posix_spawn_file_actions_init(spawn_file_actions.as_mut_ptr()) } != 0 {
+            return Err(-1_i32);
+        }
+        let file_actions_ptr = spawn_file_actions.as_mut_ptr();
+        let _file_actions_guard = FileActionsGuard(file_actions_ptr);
+
+        // Wire up stdio from bindings (same pattern as exec).
+        match &stdio.stdin {
+            WorkerExecInputBinding::HostStdio { fd } if *fd != 0 => {
+                let Some(source_idx) = worker_host_stdio_index(*fd) else {
+                    return Err(-1_i32);
+                };
+                let Some(source) = host_stdio_temp_sources[source_idx].as_ref() else {
+                    return Err(-1_i32);
+                };
+                if unsafe {
+                    libc::posix_spawn_file_actions_adddup2(
+                        file_actions_ptr,
+                        source.as_raw_fd(),
+                        0,
+                    )
+                } != 0
+                {
+                    return Err(-1_i32);
+                }
+            }
+            WorkerExecInputBinding::Close => {
+                if unsafe { libc::posix_spawn_file_actions_addclose(file_actions_ptr, 0) } != 0 {
+                    return Err(-1_i32);
+                }
+            }
+            _ => {}
+        }
+        for (fd_num, binding) in [(1, &stdio.stdout), (2, &stdio.stderr)] {
+            match binding {
+                WorkerExecOutputBinding::HostStdio { fd } if *fd != fd_num => {
+                    let Some(source_idx) = worker_host_stdio_index(*fd) else {
+                        return Err(-1_i32);
+                    };
+                    let Some(source) = host_stdio_temp_sources[source_idx].as_ref() else {
+                        return Err(-1_i32);
+                    };
+                    if unsafe {
+                        libc::posix_spawn_file_actions_adddup2(
+                            file_actions_ptr,
+                            source.as_raw_fd(),
+                            fd_num,
+                        )
+                    } != 0
+                    {
+                        return Err(-1_i32);
+                    }
+                }
+                WorkerExecOutputBinding::Close => {
+                    if unsafe {
+                        libc::posix_spawn_file_actions_addclose(file_actions_ptr, fd_num)
+                    } != 0
+                    {
+                        return Err(-1_i32);
+                    }
+                }
+                _ => {}
+            }
+        }
+        for temp_fd in host_stdio_temp_sources.iter().flatten() {
+            if unsafe {
+                libc::posix_spawn_file_actions_addclose(file_actions_ptr, temp_fd.as_raw_fd())
+            } != 0
+            {
+                return Err(-1_i32);
+            }
+        }
+
+        // Spawn the child process.
+        let mut pid: libc::pid_t = 0;
+        let ret = unsafe {
+            libc::posix_spawn(
+                core::ptr::addr_of_mut!(pid),
+                spawn_argv[0].as_ptr(),
+                file_actions_ptr,
+                core::ptr::null(),
+                argv_ptrs.as_ptr().cast::<*mut libc::c_char>(),
+                environ.cast::<*mut libc::c_char>(),
+            )
+        };
+        if ret != 0 {
+            return Err(ret);
+        }
+        drop(host_stdio_temp_sources);
+
+        // Close write ends so the parent only reads.
+        drop(ack_write_fd);
+        drop(result_write_fd);
+        drop(snapshot_fd);
+
+        // Read ack from child: 0 = success, non-zero = error.
+        let ack_status = read_fork_restore_ack(ack_read_fd);
+
+        if ack_status != 0 {
+            // Restore failed. Reap the child synchronously.
+            let mut status: libc::c_int = 0;
+            loop {
+                let ret = unsafe { libc::waitpid(pid, core::ptr::addr_of_mut!(status), 0) };
+                if ret != -1 || std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
+                    break;
+                }
+            }
+            return Err(ack_status);
+        }
+
+        // Register the child worker so it can be reaped later.
+        self.worker_processes.lock().unwrap().insert(
+            pid,
+            WorkerHostProcess {
+                result_fd: result_read_fd,
+                bridge_threads: Vec::new(),
+            },
+        );
+        Ok(pid)
+    }
+
     /// Wait for a worker host process to exit and return the exit status.
     ///
     /// Returns the exit code (0–255) on normal exit, or 256+signal on signal death.
@@ -1553,6 +1761,36 @@ fn move_fd_away_from_stdio(fd: std::os::fd::OwnedFd) -> std::io::Result<std::os:
     }
     drop(fd);
     Ok(unsafe { std::os::fd::OwnedFd::from_raw_fd(new_raw_fd) })
+}
+
+/// Create a memfd containing the serialized fork snapshot bytes.
+fn create_worker_fork_snapshot_fd(
+    snapshot_bytes: &[u8],
+) -> std::io::Result<std::os::fd::OwnedFd> {
+    let name = CString::new("litebox-fork-snapshot").unwrap();
+    let raw_fd = unsafe { libc::memfd_create(name.as_ptr(), 0) };
+    if raw_fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let mut file = unsafe { std::fs::File::from_raw_fd(raw_fd) };
+    file.write_all(snapshot_bytes)?;
+    file.seek(std::io::SeekFrom::Start(0))?;
+    move_fd_away_from_stdio(file.into())
+}
+
+/// Read a single i32 ack status from the fork-restore ack pipe.
+///
+/// Returns 0 on success, or a non-zero error code if restore failed or the
+/// pipe was closed without an ack (child crashed/exited before writing).
+fn read_fork_restore_ack(ack_fd: std::os::fd::OwnedFd) -> i32 {
+    let mut buf = [0u8; 4];
+    let file = unsafe { std::fs::File::from_raw_fd(ack_fd.into_raw_fd()) };
+    let mut reader = std::io::BufReader::new(file);
+    match std::io::Read::read_exact(&mut reader, &mut buf) {
+        Ok(()) => i32::from_le_bytes(buf),
+        // Pipe closed without data — child exited before acking.
+        Err(_) => -1,
+    }
 }
 
 fn duplicate_host_stdio_fd_for_spawn(source_fd: i32) -> std::io::Result<std::os::fd::OwnedFd> {

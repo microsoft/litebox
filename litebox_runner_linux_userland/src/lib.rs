@@ -19,7 +19,7 @@ pub struct CliArgs {
     ///
     /// By default this is a path on the host filesystem. When --program-from-tar
     /// is set, it refers to a path inside the tar archive instead.
-    #[arg(required = true, trailing_var_arg = true, value_hint = clap::ValueHint::CommandWithArguments)]
+    #[arg(required_unless_present = "fork_restore", trailing_var_arg = true, value_hint = clap::ValueHint::CommandWithArguments)]
     pub program_and_arguments: Vec<String>,
     /// Environment variables passed to the program (`K=V` pairs; can be invoked multiple times)
     #[arg(long = "env")]
@@ -132,7 +132,7 @@ pub struct CliArgs {
     pub worker_exec_fd: Option<i32>,
 
     /// Internal: inherited pipe fd used to report the guest wait status back to the parent host.
-    #[arg(long = "worker-result-fd", hide = true, requires = "worker_exec")]
+    #[arg(long = "worker-result-fd", hide = true, required_if_eq_any([("worker_exec", "true"), ("fork_restore", "true")]))]
     pub worker_result_fd: Option<i32>,
 
     /// Internal: inherited memfd containing the resolved PT_INTERP image, if any.
@@ -166,6 +166,28 @@ pub struct CliArgs {
     /// Internal: guest effective GID for worker-exec mode.
     #[arg(long = "guest-egid", hide = true, requires = "worker_exec")]
     pub guest_egid: Option<u32>,
+
+    /// Internal: run as a worker host process to restore a fork child.
+    ///
+    /// When set, the runner reads a serialized fork snapshot from the fd
+    /// provided by `--fork-restore-fd`, restores the child process state,
+    /// and resumes guest execution with `fork()` return value 0.
+    #[arg(
+        long = "fork-restore",
+        requires = "unstable",
+        hide = true,
+        conflicts_with = "worker_exec",
+        help_heading = "Unstable Options"
+    )]
+    pub fork_restore: bool,
+
+    /// Internal: inherited memfd containing the serialized fork snapshot.
+    #[arg(long = "fork-restore-fd", hide = true, requires = "fork_restore")]
+    pub fork_restore_fd: Option<i32>,
+
+    /// Internal: inherited pipe fd used to ack successful restore to the parent.
+    #[arg(long = "fork-restore-ack-fd", hide = true, requires = "fork_restore")]
+    pub fork_restore_ack_fd: Option<i32>,
 }
 
 /// Backends supported for intercepting syscalls
@@ -302,6 +324,11 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     // simplified worker path that skips VA partitioning.
     if cli_args.worker_exec {
         return run_worker_exec(cli_args);
+    }
+
+    // When running as a worker host for fork-restore, take the restore path.
+    if cli_args.fork_restore {
+        return run_fork_restore(cli_args);
     }
 
     if !cli_args.insert_files.is_empty() {
@@ -930,6 +957,64 @@ fn terminate_host_with_guest_wait_status(wait_status: i32) -> ! {
 /// Run as a worker host process for a non-PIE child exec.
 ///
 /// This is the simplified path used when the parent host process detected that
+/// Run as a fork-restore worker host.
+///
+/// Reads the serialized fork snapshot from the inherited memfd, restores the
+/// child process state, and resumes guest execution. Writes a restore ack to
+/// the parent via the ack pipe before resuming.
+///
+/// This is a stub implementation — full restore is implemented in Phase 8.
+fn run_fork_restore(cli_args: CliArgs) -> Result<()> {
+    use std::io::Write;
+    use std::os::fd::FromRawFd;
+
+    let snapshot_fd = cli_args
+        .fork_restore_fd
+        .ok_or_else(|| anyhow!("--fork-restore requires --fork-restore-fd"))?;
+    let ack_fd = cli_args
+        .fork_restore_ack_fd
+        .ok_or_else(|| anyhow!("--fork-restore requires --fork-restore-ack-fd"))?;
+
+    // Mark inherited fds as close-on-exec.
+    for fd in [Some(snapshot_fd), Some(ack_fd), cli_args.worker_result_fd]
+        .into_iter()
+        .flatten()
+    {
+        set_fd_cloexec(fd)?;
+    }
+
+    // Read the snapshot from the memfd.
+    let snapshot_data = read_fork_snapshot_from_fd(snapshot_fd)?;
+
+    // Deserialize the snapshot to verify the wire format is valid.
+    let _snapshot =
+        litebox_shim_linux::syscalls::fork_snapshot::ForkSnapshot::deserialize(&snapshot_data)
+            .map_err(|e| anyhow!("failed to deserialize fork snapshot: {e}"))?;
+
+    // TODO (Phase 8): Actually restore the child process and resume execution.
+    // For now, report failure so the parent knows restore is not yet implemented.
+    let ack_status: i32 = -libc::ENOSYS;
+    let mut ack_file = unsafe { std::fs::File::from_raw_fd(ack_fd) };
+    let _ = ack_file.write_all(&ack_status.to_le_bytes());
+    drop(ack_file);
+
+    // Exit with an error code to signal unimplemented restore.
+    std::process::exit(1);
+}
+
+/// Read the fork snapshot bytes from an inherited memfd.
+fn read_fork_snapshot_from_fd(fd: i32) -> Result<Vec<u8>> {
+    use std::io::Read;
+    use std::os::fd::FromRawFd;
+
+    let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
+    let mut data = Vec::new();
+    file.read_to_end(&mut data)?;
+    Ok(data)
+}
+
+/// Worker host entry point for a non-PIE child exec.
+///
 /// a child's binary is ET_EXEC with fixed addresses outside its VA partition.
 /// The worker gets the full address space (no partitioning), loads the binary
 /// at its canonical addresses, runs it to completion, and exits with its code.
