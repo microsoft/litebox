@@ -374,6 +374,32 @@ pub enum ForkRejectReason {
     InotifyPresent,
 }
 
+#[cfg(test)]
+impl PartialEq for ForkRejectReason {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (
+                Self::SharedMapping { addr: a1, len: l1 },
+                Self::SharedMapping { addr: a2, len: l2 },
+            ) => a1 == a2 && l1 == l2,
+            (
+                Self::UnsupportedFdClass { fd: f1, class: c1 },
+                Self::UnsupportedFdClass { fd: f2, class: c2 },
+            ) => f1 == f2 && c1 == c2,
+            (
+                Self::NonPortableFdMetadata { fd: f1, detail: d1 },
+                Self::NonPortableFdMetadata { fd: f2, detail: d2 },
+            ) => f1 == f2 && d1 == d2,
+            (
+                Self::SharedMappingNoBackingPath { addr: a1, len: l1 },
+                Self::SharedMappingNoBackingPath { addr: a2, len: l2 },
+            ) => a1 == a2 && l1 == l2,
+            (Self::InotifyPresent, Self::InotifyPresent) => true,
+            _ => false,
+        }
+    }
+}
+
 impl Default for ForkRejectReasons {
     fn default() -> Self {
         Self::new()
@@ -1172,5 +1198,581 @@ impl core::fmt::Display for ForkRejectReasons {
             }
         }
         Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloc::string::String;
+    use alloc::vec;
+    use litebox_common_linux::signal::{SaFlags, SigAltStack, SigSet, SsFlags};
+
+    /// Build a minimal but fully-populated ForkSnapshot for round-trip testing.
+    fn make_test_snapshot() -> ForkSnapshot {
+        let mut comm = [0u8; litebox_common_linux::TASK_COMM_LEN];
+        comm[..5].copy_from_slice(b"hello");
+
+        ForkSnapshot {
+            identity: ProcessIdentitySnapshot {
+                process_id: litebox::process::ProcessId(42),
+                parent_process_id: litebox::process::ProcessId(1),
+                pid: 42,
+                ppid: 1,
+                tid: 42,
+                pgid: 1,
+                sid: 1,
+                exit_signal: 17, // SIGCHLD
+                comm,
+                credentials: CredentialsSnapshot {
+                    uid: 1000,
+                    euid: 1000,
+                    gid: 100,
+                    egid: 100,
+                },
+            },
+            process_wide: ProcessWideSnapshot {
+                rlimits: {
+                    let mut r =
+                        [(0usize, 0usize); litebox_common_linux::RlimitResource::RLIM_NLIMITS];
+                    r[0] = (1024, 4096); // RLIMIT_NOFILE
+                    r[1] = (8192, 65536); // RLIMIT_STACK
+                    r
+                },
+                thp_disabled: true,
+                alarm_remaining_ns: Some(5_000_000_000),
+            },
+            thread: ThreadSnapshot {
+                execution_context: {
+                    let mut ctx = litebox_common_linux::ExecutionContext::default();
+                    ctx.regs.rax = 0xAAAA_BBBB_CCCC_DDDD;
+                    ctx.regs.rbx = 0x1111_2222_3333_4444;
+                    ctx.regs.rcx = 0x5555_6666_7777_8888;
+                    ctx.regs.rip = 0x0040_1000;
+                    ctx.regs.rsp = 0x7FFF_0000_F000;
+                    ctx.regs.rbp = 0x7FFF_0000_E000;
+                    ctx.regs.rdi = 42;
+                    ctx.regs.rsi = 99;
+                    ctx.regs.r8 = 0xDEAD;
+                    ctx.regs.r15 = 0xBEEF;
+                    // Write a distinctive pattern into FP state.
+                    ctx.fp_regs.data[100] = 0xAB;
+                    ctx.fp_regs.data[200] = 0xCD;
+                    ctx
+                },
+                tls_base: Some(0x7f00_dead_beef),
+                set_child_tid: Some(0x7fff_0000_1000),
+                clear_child_tid: Some(0x7fff_0000_1008),
+                robust_list: Some(0x7fff_0000_2000),
+            },
+            signal: SignalSnapshot {
+                blocked: SigSet::empty(),
+                handlers: vec![
+                    SignalHandlerSnapshot {
+                        sigaction: 0,
+                        restorer: 0,
+                        flags: SaFlags::empty(),
+                        mask: SigSet::empty(),
+                    },
+                    SignalHandlerSnapshot {
+                        sigaction: 0x4000_1000,
+                        restorer: 0x4000_2000,
+                        flags: SaFlags::SIGINFO | SaFlags::RESTART,
+                        mask: SigSet::from_u64(u64::MAX),
+                    },
+                ],
+                altstack: SigAltStack {
+                    sp: 0x7f00_0000_0000,
+                    flags: SsFlags::empty(),
+                    #[cfg(target_pointer_width = "64")]
+                    __pad: 0,
+                    size: 8192,
+                },
+            },
+            fs: FsSnapshot {
+                cwd: String::from("/home/test/"),
+                exe_path: String::from("/bin/myapp"),
+                umask: 0o022,
+            },
+            fd_table: FdTableSnapshot {
+                entries: vec![
+                    FdEntrySnapshot {
+                        fd: 0,
+                        class: FdClass::StdioFd,
+                        fd_flags: 0,
+                        status_flags: 0,
+                        object_id: 100,
+                        metadata: FdMetadataSnapshot {
+                            host_stdio_source_fd: Some(0),
+                            is_host_tty_alias: false,
+                            is_host_pty_device: false,
+                            anon_ino: None,
+                            diroff: None,
+                        },
+                    },
+                    FdEntrySnapshot {
+                        fd: 1,
+                        class: FdClass::StdioFd,
+                        fd_flags: 0,
+                        status_flags: 0,
+                        object_id: 101,
+                        metadata: FdMetadataSnapshot {
+                            host_stdio_source_fd: Some(1),
+                            is_host_tty_alias: false,
+                            is_host_pty_device: false,
+                            anon_ino: None,
+                            diroff: None,
+                        },
+                    },
+                    FdEntrySnapshot {
+                        fd: 3,
+                        class: FdClass::FilesystemFd,
+                        fd_flags: 1,         // FD_CLOEXEC
+                        status_flags: 0x800, // O_NONBLOCK
+                        object_id: 200,
+                        metadata: FdMetadataSnapshot {
+                            host_stdio_source_fd: None,
+                            is_host_tty_alias: false,
+                            is_host_pty_device: false,
+                            anon_ino: Some(12345),
+                            diroff: Some(42),
+                        },
+                    },
+                    // fd 4 is a dup of fd 3 — shares the same object_id (OFD aliasing).
+                    FdEntrySnapshot {
+                        fd: 4,
+                        class: FdClass::FilesystemFd,
+                        fd_flags: 0,
+                        status_flags: 0x800,
+                        object_id: 200, // same OFD as fd 3
+                        metadata: FdMetadataSnapshot {
+                            host_stdio_source_fd: None,
+                            is_host_tty_alias: true,
+                            is_host_pty_device: true,
+                            anon_ino: None,
+                            diroff: None,
+                        },
+                    },
+                ],
+                open_file_descriptions: vec![
+                    OpenFileDescriptionSnapshot {
+                        object_id: 100,
+                        file_offset: 0,
+                        reopen_path: None,
+                    },
+                    OpenFileDescriptionSnapshot {
+                        object_id: 101,
+                        file_offset: 0,
+                        reopen_path: None,
+                    },
+                    OpenFileDescriptionSnapshot {
+                        object_id: 200,
+                        file_offset: 4096,
+                        reopen_path: Some(String::from("/tmp/data.txt")),
+                    },
+                ],
+                stdio_object_ids: [Some(100), Some(101), None],
+            },
+            memory: MemorySnapshot {
+                regions: vec![
+                    MemoryRegionSnapshot {
+                        addr: 0x1000_0000,
+                        len: 4096,
+                        permissions: 5, // RX
+                        vm_flags: 0x42,
+                        is_shared: false,
+                        data: vec![0xCC; 4096],
+                    },
+                    MemoryRegionSnapshot {
+                        addr: 0x2000_0000,
+                        len: 8192,
+                        permissions: 3, // RW
+                        vm_flags: 0,
+                        is_shared: false,
+                        data: vec![0xAB; 8192],
+                    },
+                    // Shared mapping region.
+                    MemoryRegionSnapshot {
+                        addr: 0x4000_0000,
+                        len: 4096,
+                        permissions: 7, // RWX
+                        vm_flags: 0x81,
+                        is_shared: true,
+                        data: vec![0xEF; 4096],
+                    },
+                ],
+                metadata: PageManagerMetadata {
+                    va_range: 0x0000_1000..0xFFFF_F000,
+                    brk_base: 0x3000_0000,
+                    brk: 0x3000_1000,
+                    brk_frontier: 0x3000_2000,
+                    elf_patch_entries: vec![ElfPatchEntrySnapshot {
+                        fd: 3,
+                        base_addr: 0x1000_0000,
+                        pre_patched: true,
+                        trampoline_file_offset: 0x100,
+                        trampoline_file_size: 256,
+                        trampoline_vaddr: 0x1000_0800,
+                        trampoline_addr: 0x1000_0800,
+                        trampoline_cursor: 64,
+                        trampoline_mapped: true,
+                        trampoline_mapped_len: 4096,
+                        runtime_patches_committed: false,
+                        file_path: Some(String::from("/lib/libc.so")),
+                    }],
+                    shared_file_mapping_metadata: vec![SharedFileMappingSnapshot {
+                        addr: 0x4000_0000,
+                        len: 4096,
+                        file_offset: 0,
+                        needs_writeback: true,
+                        backing_file_path: Some(String::from("/tmp/shared.dat")),
+                    }],
+                    proc_map_paths: vec![
+                        (0x1000_0000..0x1000_1000, String::from("/bin/myapp")),
+                        (0x2000_0000..0x2000_2000, String::from("[heap]")),
+                    ],
+                    main_bss_start: 0x2000_1000,
+                    main_bss_end: 0x2000_2000,
+                },
+            },
+        }
+    }
+
+    #[test]
+    fn snapshot_round_trip_preserves_identity() {
+        let original = make_test_snapshot();
+        let bytes = original.serialize();
+        let restored = ForkSnapshot::deserialize(&bytes).expect("deserialize failed");
+
+        assert_eq!(restored.identity.process_id.0, 42);
+        assert_eq!(restored.identity.parent_process_id.0, 1);
+        assert_eq!(restored.identity.pid, 42);
+        assert_eq!(restored.identity.ppid, 1);
+        assert_eq!(restored.identity.tid, 42);
+        assert_eq!(restored.identity.pgid, 1);
+        assert_eq!(restored.identity.sid, 1);
+        assert_eq!(restored.identity.exit_signal, 17);
+        assert_eq!(&restored.identity.comm[..5], b"hello");
+        assert_eq!(restored.identity.credentials.uid, 1000);
+        assert_eq!(restored.identity.credentials.euid, 1000);
+        assert_eq!(restored.identity.credentials.gid, 100);
+        assert_eq!(restored.identity.credentials.egid, 100);
+    }
+
+    #[test]
+    fn snapshot_round_trip_preserves_process_wide() {
+        let original = make_test_snapshot();
+        let bytes = original.serialize();
+        let restored = ForkSnapshot::deserialize(&bytes).expect("deserialize failed");
+
+        assert_eq!(restored.process_wide.rlimits[0], (1024, 4096));
+        assert_eq!(restored.process_wide.rlimits[1], (8192, 65536));
+        assert!(restored.process_wide.thp_disabled);
+        assert_eq!(
+            restored.process_wide.alarm_remaining_ns,
+            Some(5_000_000_000)
+        );
+    }
+
+    #[test]
+    fn snapshot_round_trip_preserves_thread_state() {
+        let original = make_test_snapshot();
+        let bytes = original.serialize();
+        let restored = ForkSnapshot::deserialize(&bytes).expect("deserialize failed");
+
+        // Verify execution context registers survive round-trip.
+        assert_eq!(
+            restored.thread.execution_context.regs.rax,
+            0xAAAA_BBBB_CCCC_DDDD
+        );
+        assert_eq!(
+            restored.thread.execution_context.regs.rbx,
+            0x1111_2222_3333_4444
+        );
+        assert_eq!(
+            restored.thread.execution_context.regs.rcx,
+            0x5555_6666_7777_8888
+        );
+        assert_eq!(restored.thread.execution_context.regs.rip, 0x0040_1000);
+        assert_eq!(restored.thread.execution_context.regs.rsp, 0x7FFF_0000_F000);
+        assert_eq!(restored.thread.execution_context.regs.rbp, 0x7FFF_0000_E000);
+        assert_eq!(restored.thread.execution_context.regs.rdi, 42);
+        assert_eq!(restored.thread.execution_context.regs.rsi, 99);
+        assert_eq!(restored.thread.execution_context.regs.r8, 0xDEAD);
+        assert_eq!(restored.thread.execution_context.regs.r15, 0xBEEF);
+        // Verify FP state bytes survive round-trip.
+        assert_eq!(restored.thread.execution_context.fp_regs.data[100], 0xAB);
+        assert_eq!(restored.thread.execution_context.fp_regs.data[200], 0xCD);
+
+        assert_eq!(restored.thread.tls_base, Some(0x7f00_dead_beef));
+        assert_eq!(restored.thread.set_child_tid, Some(0x7fff_0000_1000));
+        assert_eq!(restored.thread.clear_child_tid, Some(0x7fff_0000_1008));
+        assert_eq!(restored.thread.robust_list, Some(0x7fff_0000_2000));
+    }
+
+    #[test]
+    fn snapshot_round_trip_preserves_signal_state() {
+        let original = make_test_snapshot();
+        let bytes = original.serialize();
+        let restored = ForkSnapshot::deserialize(&bytes).expect("deserialize failed");
+
+        assert_eq!(restored.signal.blocked.as_u64(), SigSet::empty().as_u64());
+        assert_eq!(restored.signal.handlers.len(), 2);
+        assert_eq!(restored.signal.handlers[1].sigaction, 0x4000_1000);
+        assert_eq!(restored.signal.handlers[1].restorer, 0x4000_2000);
+        assert!(restored.signal.handlers[1].flags.contains(SaFlags::SIGINFO));
+        assert_eq!(restored.signal.altstack.sp, 0x7f00_0000_0000);
+        assert_eq!(restored.signal.altstack.size, 8192);
+    }
+
+    #[test]
+    fn snapshot_round_trip_preserves_fs_state() {
+        let original = make_test_snapshot();
+        let bytes = original.serialize();
+        let restored = ForkSnapshot::deserialize(&bytes).expect("deserialize failed");
+
+        assert_eq!(restored.fs.cwd, "/home/test/");
+        assert_eq!(restored.fs.exe_path, "/bin/myapp");
+        assert_eq!(restored.fs.umask, 0o022);
+    }
+
+    #[test]
+    fn snapshot_round_trip_preserves_fd_table() {
+        let original = make_test_snapshot();
+        let bytes = original.serialize();
+        let restored = ForkSnapshot::deserialize(&bytes).expect("deserialize failed");
+
+        assert_eq!(restored.fd_table.entries.len(), 4);
+        // fd 0: stdio
+        assert_eq!(restored.fd_table.entries[0].fd, 0);
+        assert_eq!(restored.fd_table.entries[0].class, FdClass::StdioFd);
+        assert_eq!(restored.fd_table.entries[0].object_id, 100);
+        assert_eq!(
+            restored.fd_table.entries[0].metadata.host_stdio_source_fd,
+            Some(0)
+        );
+        // fd 3: filesystem with metadata
+        assert_eq!(restored.fd_table.entries[2].fd, 3);
+        assert_eq!(restored.fd_table.entries[2].class, FdClass::FilesystemFd);
+        assert_eq!(restored.fd_table.entries[2].fd_flags, 1);
+        assert_eq!(restored.fd_table.entries[2].status_flags, 0x800);
+        assert_eq!(restored.fd_table.entries[2].object_id, 200);
+        assert_eq!(restored.fd_table.entries[2].metadata.anon_ino, Some(12345));
+        assert_eq!(restored.fd_table.entries[2].metadata.diroff, Some(42));
+        assert!(!restored.fd_table.entries[2].metadata.is_host_tty_alias);
+        // fd 4: dup of fd 3 — shares OFD (object_id 200)
+        assert_eq!(restored.fd_table.entries[3].fd, 4);
+        assert_eq!(restored.fd_table.entries[3].object_id, 200);
+        assert!(restored.fd_table.entries[3].metadata.is_host_tty_alias);
+        assert!(restored.fd_table.entries[3].metadata.is_host_pty_device);
+
+        assert_eq!(restored.fd_table.open_file_descriptions.len(), 3);
+        assert_eq!(
+            restored.fd_table.open_file_descriptions[2].reopen_path,
+            Some(String::from("/tmp/data.txt"))
+        );
+        assert_eq!(
+            restored.fd_table.open_file_descriptions[2].file_offset,
+            4096
+        );
+
+        assert_eq!(
+            restored.fd_table.stdio_object_ids,
+            [Some(100), Some(101), None]
+        );
+    }
+
+    #[test]
+    fn snapshot_round_trip_preserves_memory() {
+        let original = make_test_snapshot();
+        let bytes = original.serialize();
+        let restored = ForkSnapshot::deserialize(&bytes).expect("deserialize failed");
+
+        assert_eq!(restored.memory.regions.len(), 3);
+        // Region 0: private RX with non-zero vm_flags
+        assert_eq!(restored.memory.regions[0].addr, 0x1000_0000);
+        assert_eq!(restored.memory.regions[0].len, 4096);
+        assert_eq!(restored.memory.regions[0].permissions, 5);
+        assert_eq!(restored.memory.regions[0].vm_flags, 0x42);
+        assert!(!restored.memory.regions[0].is_shared);
+        assert_eq!(restored.memory.regions[0].data.len(), 4096);
+        assert!(restored.memory.regions[0].data.iter().all(|&b| b == 0xCC));
+
+        // Region 1: private RW
+        assert_eq!(restored.memory.regions[1].addr, 0x2000_0000);
+        assert!(!restored.memory.regions[1].is_shared);
+        assert_eq!(restored.memory.regions[1].data.len(), 8192);
+
+        // Region 2: shared RWX with distinct vm_flags
+        assert_eq!(restored.memory.regions[2].addr, 0x4000_0000);
+        assert_eq!(restored.memory.regions[2].permissions, 7);
+        assert_eq!(restored.memory.regions[2].vm_flags, 0x81);
+        assert!(restored.memory.regions[2].is_shared);
+        assert_eq!(restored.memory.regions[2].data.len(), 4096);
+        assert!(restored.memory.regions[2].data.iter().all(|&b| b == 0xEF));
+
+        let m = &restored.memory.metadata;
+        assert_eq!(m.va_range, 0x0000_1000..0xFFFF_F000);
+        assert_eq!(m.brk_base, 0x3000_0000);
+        assert_eq!(m.brk, 0x3000_1000);
+        assert_eq!(m.brk_frontier, 0x3000_2000);
+
+        // ELF patch entries — verify all fields
+        assert_eq!(m.elf_patch_entries.len(), 1);
+        let ep = &m.elf_patch_entries[0];
+        assert_eq!(ep.fd, 3);
+        assert_eq!(ep.base_addr, 0x1000_0000);
+        assert!(ep.pre_patched);
+        assert_eq!(ep.trampoline_file_offset, 0x100);
+        assert_eq!(ep.trampoline_file_size, 256);
+        assert_eq!(ep.trampoline_vaddr, 0x1000_0800);
+        assert_eq!(ep.trampoline_addr, 0x1000_0800);
+        assert_eq!(ep.trampoline_cursor, 64);
+        assert!(ep.trampoline_mapped);
+        assert_eq!(ep.trampoline_mapped_len, 4096);
+        assert!(!ep.runtime_patches_committed);
+        assert_eq!(ep.file_path, Some(String::from("/lib/libc.so")));
+
+        // Shared file mapping metadata — verify all fields
+        assert_eq!(m.shared_file_mapping_metadata.len(), 1);
+        let sfm = &m.shared_file_mapping_metadata[0];
+        assert_eq!(sfm.addr, 0x4000_0000);
+        assert_eq!(sfm.len, 4096);
+        assert_eq!(sfm.file_offset, 0);
+        assert!(sfm.needs_writeback);
+        assert_eq!(sfm.backing_file_path, Some(String::from("/tmp/shared.dat")));
+
+        // Proc map paths
+        assert_eq!(m.proc_map_paths.len(), 2);
+        assert_eq!(m.proc_map_paths[0].0, 0x1000_0000..0x1000_1000);
+        assert_eq!(m.proc_map_paths[0].1, "/bin/myapp");
+        assert_eq!(m.proc_map_paths[1].0, 0x2000_0000..0x2000_2000);
+        assert_eq!(m.proc_map_paths[1].1, "[heap]");
+
+        assert_eq!(m.main_bss_start, 0x2000_1000);
+        assert_eq!(m.main_bss_end, 0x2000_2000);
+    }
+
+    #[test]
+    fn snapshot_deserialize_bad_magic() {
+        let mut bytes = make_test_snapshot().serialize();
+        bytes[0] = 0xFF;
+        match ForkSnapshot::deserialize(&bytes) {
+            Err(SnapshotDeserializeError::BadMagic(_)) => {}
+            Err(e) => panic!("expected BadMagic, got {e:?}"),
+            Ok(_) => panic!("expected error, got Ok"),
+        }
+    }
+
+    #[test]
+    fn snapshot_deserialize_bad_version() {
+        let mut bytes = make_test_snapshot().serialize();
+        bytes[4..8].copy_from_slice(&99u32.to_le_bytes());
+        match ForkSnapshot::deserialize(&bytes) {
+            Err(SnapshotDeserializeError::UnsupportedVersion(99)) => {}
+            Err(e) => panic!("expected UnsupportedVersion(99), got {e:?}"),
+            Ok(_) => panic!("expected error, got Ok"),
+        }
+    }
+
+    #[test]
+    fn snapshot_deserialize_truncated() {
+        let bytes = make_test_snapshot().serialize();
+        match ForkSnapshot::deserialize(&bytes[..10]) {
+            Err(SnapshotDeserializeError::UnexpectedEof) => {}
+            Err(e) => panic!("expected UnexpectedEof, got {e:?}"),
+            Ok(_) => panic!("expected error, got Ok"),
+        }
+    }
+
+    #[test]
+    fn snapshot_round_trip_empty_memory() {
+        let mut snap = make_test_snapshot();
+        snap.memory.regions.clear();
+        snap.memory.metadata.elf_patch_entries.clear();
+        snap.memory.metadata.shared_file_mapping_metadata.clear();
+        snap.memory.metadata.proc_map_paths.clear();
+
+        let bytes = snap.serialize();
+        let restored = ForkSnapshot::deserialize(&bytes).expect("deserialize failed");
+        assert!(restored.memory.regions.is_empty());
+        assert!(restored.memory.metadata.elf_patch_entries.is_empty());
+    }
+
+    #[test]
+    fn snapshot_round_trip_no_alarm() {
+        let mut snap = make_test_snapshot();
+        snap.process_wide.alarm_remaining_ns = None;
+
+        let bytes = snap.serialize();
+        let restored = ForkSnapshot::deserialize(&bytes).expect("deserialize failed");
+        assert_eq!(restored.process_wide.alarm_remaining_ns, None);
+    }
+
+    #[test]
+    fn snapshot_round_trip_no_tls() {
+        let mut snap = make_test_snapshot();
+        snap.thread.tls_base = None;
+        snap.thread.set_child_tid = None;
+        snap.thread.clear_child_tid = None;
+        snap.thread.robust_list = None;
+
+        let bytes = snap.serialize();
+        let restored = ForkSnapshot::deserialize(&bytes).expect("deserialize failed");
+        assert_eq!(restored.thread.tls_base, None);
+        assert_eq!(restored.thread.set_child_tid, None);
+        assert_eq!(restored.thread.clear_child_tid, None);
+        assert_eq!(restored.thread.robust_list, None);
+    }
+
+    #[test]
+    fn fork_reject_reasons_collects_multiple() {
+        let mut reasons = ForkRejectReasons::new();
+        assert!(reasons.is_empty());
+
+        reasons.push(ForkRejectReason::SharedMapping {
+            addr: 0x1000,
+            len: 4096,
+        });
+        reasons.push(ForkRejectReason::UnsupportedFdClass {
+            fd: 5,
+            class: FdClass::Epoll,
+        });
+        reasons.push(ForkRejectReason::InotifyPresent);
+
+        assert!(!reasons.is_empty());
+        assert_eq!(reasons.reasons.len(), 3);
+        assert_eq!(
+            reasons.reasons[0],
+            ForkRejectReason::SharedMapping {
+                addr: 0x1000,
+                len: 4096
+            }
+        );
+        assert_eq!(
+            reasons.reasons[1],
+            ForkRejectReason::UnsupportedFdClass {
+                fd: 5,
+                class: FdClass::Epoll
+            }
+        );
+        assert_eq!(reasons.reasons[2], ForkRejectReason::InotifyPresent);
+    }
+
+    #[test]
+    fn fork_reject_reasons_display() {
+        let mut reasons = ForkRejectReasons::new();
+        reasons.push(ForkRejectReason::SharedMapping {
+            addr: 0x1000,
+            len: 4096,
+        });
+        reasons.push(ForkRejectReason::InotifyPresent);
+        let msg = alloc::format!("{}", reasons);
+        assert!(msg.contains("shared mapping"));
+        assert!(msg.contains("inotify"));
     }
 }
