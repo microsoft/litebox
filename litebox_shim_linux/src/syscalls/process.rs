@@ -2651,6 +2651,149 @@ impl<FS: ShimFS> Task<FS> {
         }
     }
 
+    /// Capture the full memory image and page-manager metadata for a true-fork
+    /// snapshot.
+    ///
+    /// Walks all mapped regions, copies their contents, and snapshots the shim
+    /// metadata that must be restored alongside the raw pages. Shared mappings
+    /// are flagged for the v1 reject gate (the caller decides whether to
+    /// proceed or abort).
+    #[allow(dead_code)] // Will be called from `do_true_fork` in a later phase.
+    fn snapshot_memory(
+        &self,
+        reject: &mut super::fork_snapshot::ForkRejectReasons,
+    ) -> super::fork_snapshot::MemorySnapshot {
+        let ps = self.process_state.borrow();
+        let mappings = ps.pm.mappings();
+
+        let mut regions = Vec::new();
+        for (range, flags) in &mappings {
+            let is_shared = flags.contains(VmFlags::VM_SHARED);
+
+            // v1: reject shared mappings since we cannot preserve cross-host
+            // shared-memory semantics.
+            if is_shared {
+                reject.push(super::fork_snapshot::ForkRejectReason::SharedMapping {
+                    addr: range.start,
+                    len: range.end - range.start,
+                });
+            }
+
+            let len = range.end - range.start;
+            let readable = flags.contains(VmFlags::VM_READ);
+
+            // If the region is not readable (e.g. PROT_NONE or write/exec
+            // only), temporarily make it readable so we can copy the data.
+            // SAFETY: sibling threads are parked, so no concurrent access.
+            if !readable {
+                let ptr = crate::MutPtr::<u8>::from_usize(range.start);
+                let _ = unsafe { ps.pm.make_pages_readable(ptr, len) };
+            }
+
+            // Read the raw page bytes.
+            // SAFETY: the forking thread has exclusive access (sibling threads
+            // are parked) and the region is now readable.
+            let data =
+                unsafe { core::slice::from_raw_parts(range.start as *const u8, len).to_vec() };
+
+            // Restore original permissions if we upgraded them.
+            if !readable {
+                let ptr = crate::MutPtr::<u8>::from_usize(range.start);
+                let _ = unsafe { ps.pm.make_pages_inaccessible(ptr, len) };
+            }
+
+            regions.push(super::fork_snapshot::MemoryRegionSnapshot {
+                addr: range.start,
+                len,
+                permissions: flags.bits() & VmFlags::VM_ACCESS_FLAGS.bits(),
+                vm_flags: flags.bits(),
+                is_shared,
+                data,
+            });
+        }
+
+        let metadata = self.snapshot_page_manager_metadata(&ps);
+
+        super::fork_snapshot::MemorySnapshot { regions, metadata }
+    }
+
+    /// Snapshot shim-level page-manager metadata from `ProcessState`.
+    #[allow(dead_code)]
+    fn snapshot_page_manager_metadata(
+        &self,
+        ps: &crate::ProcessState,
+    ) -> super::fork_snapshot::PageManagerMetadata {
+        let va_range = ps.pm.addr_min()..ps.pm.addr_max();
+        let brk_base = ps.pm.brk_base();
+        let brk = ps.pm.current_brk();
+        let brk_frontier = ps.pm.current_brk_frontier();
+
+        // Snapshot ELF patch cache entries.
+        let elf_patch_cache = ps.elf_patch_cache.lock();
+        #[allow(clippy::used_underscore_binding)]
+        let elf_patch_entries = elf_patch_cache
+            .iter()
+            .map(|(&fd, state)| super::fork_snapshot::ElfPatchEntrySnapshot {
+                fd,
+                base_addr: state._base_addr,
+                pre_patched: state.pre_patched,
+                trampoline_file_offset: state.trampoline_file_offset,
+                trampoline_file_size: state.trampoline_file_size,
+                trampoline_vaddr: state._trampoline_vaddr,
+                trampoline_addr: state.trampoline_addr,
+                trampoline_cursor: state.trampoline_cursor,
+                trampoline_mapped: state.trampoline_mapped,
+                trampoline_mapped_len: state.trampoline_mapped_len,
+                runtime_patches_committed: state.runtime_patches_committed,
+                file_path: state.file_path.clone(),
+            })
+            .collect();
+        drop(elf_patch_cache);
+
+        // Snapshot shared file mapping metadata (file handles are not
+        // portable, so only capture the address/length/offset and whether
+        // writeback is needed).
+        let shared_mappings = ps.shared_file_mappings.lock();
+        let proc_map_paths_guard = ps.proc_map_paths.lock();
+
+        let shared_file_mapping_metadata = shared_mappings
+            .iter()
+            .map(|m| {
+                // Try to find a backing path from proc_map_paths.
+                let backing_file_path = proc_map_paths_guard
+                    .iter()
+                    .find(|(range, _)| range.start == m.addr)
+                    .map(|(_, path)| path.clone());
+
+                super::fork_snapshot::SharedFileMappingSnapshot {
+                    addr: m.addr,
+                    len: m.len,
+                    file_offset: m.file_offset,
+                    needs_writeback: m.needs_writeback,
+                    backing_file_path,
+                }
+            })
+            .collect();
+
+        let proc_map_paths = proc_map_paths_guard.clone();
+        drop(proc_map_paths_guard);
+        drop(shared_mappings);
+
+        super::fork_snapshot::PageManagerMetadata {
+            va_range,
+            brk_base,
+            brk,
+            brk_frontier,
+            elf_patch_entries,
+            shared_file_mapping_metadata,
+            proc_map_paths,
+            main_bss_start: ps
+                .main_bss_start
+                .load(core::sync::atomic::Ordering::Relaxed),
+            main_bss_end: ps.main_bss_end.load(core::sync::atomic::Ordering::Relaxed),
+        }
+    }
+
     /// Handle syscall `set_tid_address`.
     pub(crate) fn sys_set_tid_address(&self, tidptr: crate::MutPtr<i32>) -> i32 {
         self.thread.clear_child_tid.set(Some(tidptr));

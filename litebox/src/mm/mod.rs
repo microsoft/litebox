@@ -357,6 +357,11 @@ where
         self.vmem.read().brk
     }
 
+    /// Returns the base program break address (start of the heap region).
+    pub fn brk_base(&self) -> usize {
+        self.vmem.read().brk_base
+    }
+
     /// Returns the current page-aligned heap frontier that `brk` growth uses.
     pub fn current_brk_frontier(&self) -> usize {
         self.vmem.read().brk_frontier

@@ -97,7 +97,7 @@ pub(crate) struct SharedFileMapping {
     /// `sys_mprotect` when write permission is added. Writeback is skipped
     /// for entries where this is `false` to avoid overwriting newer file
     /// data with stale CoW pages.
-    needs_writeback: bool,
+    pub(crate) needs_writeback: bool,
 }
 
 /// Per-process collection of shared file mappings pending writeback.
