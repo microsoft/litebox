@@ -388,6 +388,7 @@ impl<FS: ShimFS> LinuxShim<FS> {
                 syscall_restartable: Cell::new(false),
                 in_syscall: Cell::new(false),
                 deferred_vfork_park: Cell::new(false),
+                delayed_fork_pending: Cell::new(false),
             },
         };
         let exec_filename = alloc::ffi::CString::new(exec_filename).ok();
@@ -733,6 +734,7 @@ impl<FS: ShimFS> LinuxShim<FS> {
                 syscall_restartable: Cell::new(false),
                 in_syscall: Cell::new(false),
                 deferred_vfork_park: Cell::new(false),
+                delayed_fork_pending: Cell::new(false),
             },
         };
 
@@ -1766,6 +1768,63 @@ impl<FS: ShimFS> Task<FS> {
                 stack1,
                 ctx.rax,
             );
+        }
+    }
+
+    /// Returns `true` if the given syscall is in the pre-exec allowlist and
+    /// should be permitted to execute in vfork-style mode without triggering a
+    /// delayed true fork.
+    ///
+    /// The allowlist covers the syscalls that `posix_spawn` and runtime libraries
+    /// typically issue between `fork` and `execve`.  Any syscall *not* in this
+    /// list indicates the child intends to run independently and must be migrated
+    /// to its own worker host.
+    ///
+    /// Two syscalls (`fcntl` and `prctl`) require argument-level inspection
+    /// because they multiplex many operations through a single syscall number.
+    #[cfg(target_arch = "x86_64")]
+    #[allow(dead_code)] // Wired up in Phase C (commit_delayed_fork).
+    fn is_pre_exec_syscall(ctx: &litebox_common_linux::ExecutionContext) -> bool {
+        use ::syscalls::Sysno;
+
+        let nr = ctx.orig_rax;
+
+        // Match on syscall number, with argument inspection for fcntl/prctl.
+        match Sysno::new(nr) {
+            // Number-only allowlisted syscalls.
+            Some(
+                // Terminal — child leaves vfork mode.
+                Sysno::execve | Sysno::execveat | Sysno::exit | Sysno::exit_group
+                // FD plumbing.
+                | Sysno::close | Sysno::close_range | Sysno::dup | Sysno::dup2 | Sysno::dup3
+                | Sysno::open | Sysno::openat | Sysno::openat2 | Sysno::pipe2 | Sysno::write
+                // Directory.
+                | Sysno::chdir | Sysno::fchdir
+                // Process group.
+                | Sysno::setpgid | Sysno::setsid
+                // Signal setup.
+                | Sysno::rt_sigaction | Sysno::rt_sigprocmask | Sysno::sigaltstack
+                // Identity.
+                | Sysno::setuid | Sysno::setgid | Sysno::setgroups
+                | Sysno::setreuid | Sysno::setregid
+                | Sysno::setresuid | Sysno::setresgid
+                // Scheduling.
+                | Sysno::sched_setscheduler | Sysno::sched_setaffinity
+                | Sysno::sched_setparam
+                // Resource limits.
+                | Sysno::setrlimit | Sysno::prlimit64
+                // No-ops (read-only queries).
+                | Sysno::getpid | Sysno::getppid | Sysno::gettid
+                | Sysno::getuid | Sysno::getgid,
+            ) => true,
+            // Argument-aware: fcntl — only allow fd flag / dup operations.
+            // F_DUPFD=0, F_GETFD=1, F_SETFD=2, F_DUPFD_CLOEXEC=1030
+            Some(Sysno::fcntl) => matches!(ctx.rsi, 0 | 1 | 2 | 1030),
+            // Argument-aware: prctl — only allow SET_PDEATHSIG and SET_NAME.
+            // PR_SET_PDEATHSIG=1, PR_SET_NAME=15
+            Some(Sysno::prctl) => matches!(ctx.rdi, 1 | 15),
+            // Any unrecognized or non-allowlisted syscall triggers a delayed fork.
+            _ => false,
         }
     }
 
@@ -2969,6 +3028,15 @@ struct Task<FS: ShimFS> {
     /// when the task resumes after vfork completes. `Cell` because the task
     /// owns this flag exclusively (no cross-thread sharing).
     deferred_vfork_park: Cell<bool>,
+    /// When true, this task is a fork child running in vfork-style mode that
+    /// should be upgraded to a true fork when it makes a non-pre-exec syscall.
+    /// Set by `do_fork` for `is_shared && !is_vfork` children.  Cleared by
+    /// `commit_delayed_fork` (on success) or the exit path (on failure).
+    ///
+    /// Distinct from `deferred_vfork_park`, which handles sibling-thread
+    /// parking coordination.
+    #[allow(dead_code)] // Wired up in Phase C (commit_delayed_fork).
+    delayed_fork_pending: Cell<bool>,
 }
 
 impl<FS: ShimFS> Drop for Task<FS> {
@@ -3016,6 +3084,7 @@ mod test_utils {
                 syscall_restartable: Cell::new(false),
                 in_syscall: Cell::new(false),
                 deferred_vfork_park: Cell::new(false),
+                delayed_fork_pending: Cell::new(false),
                 process_state: self.process_state.into(),
                 global: self.global,
             }
@@ -3049,6 +3118,7 @@ mod test_utils {
                 syscall_restartable: Cell::new(false),
                 in_syscall: Cell::new(false),
                 deferred_vfork_park: Cell::new(false),
+                delayed_fork_pending: Cell::new(false),
             };
             Some(task)
         }
