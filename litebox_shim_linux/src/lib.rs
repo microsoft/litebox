@@ -459,6 +459,27 @@ impl<FS: ShimFS> LinuxShim<FS> {
     pub fn litebox(&self) -> &LiteBox<Platform> {
         &self.global.litebox
     }
+
+    /// Restore a child process from a fork snapshot.
+    ///
+    /// Instead of loading an ELF binary, this reconstructs the child process
+    /// state from the serialized snapshot captured at the fork trap. The
+    /// returned [`LoadedProgram`] can be passed to `run_thread()` just like
+    /// a freshly loaded program.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if restore fails (e.g., the snapshot references
+    /// unsupported state).
+    pub fn restore_process(
+        &self,
+        _snapshot: syscalls::fork_snapshot::ForkSnapshot,
+        _fs: alloc::sync::Arc<FS>,
+    ) -> Result<LoadedProgram<FS>, Errno> {
+        // TODO (Phase 8): Reconstruct ProcessState, Task, ThreadState,
+        // FilesState, SignalState, and mappings from the snapshot.
+        Err(Errno::ENOSYS)
+    }
 }
 
 pub struct LoadedProgram<FS: ShimFS> {

@@ -962,12 +962,7 @@ fn terminate_host_with_guest_wait_status(wait_status: i32) -> ! {
 /// Reads the serialized fork snapshot from the inherited memfd, restores the
 /// child process state, and resumes guest execution. Writes a restore ack to
 /// the parent via the ack pipe before resuming.
-///
-/// This is a stub implementation — full restore is implemented in Phase 8.
 fn run_fork_restore(cli_args: CliArgs) -> Result<()> {
-    use std::io::Write;
-    use std::os::fd::FromRawFd;
-
     let snapshot_fd = cli_args
         .fork_restore_fd
         .ok_or_else(|| anyhow!("--fork-restore requires --fork-restore-fd"))?;
@@ -983,23 +978,120 @@ fn run_fork_restore(cli_args: CliArgs) -> Result<()> {
         set_fd_cloexec(fd)?;
     }
 
-    // Read the snapshot from the memfd.
+    // Read and deserialize the snapshot.
     let snapshot_data = read_fork_snapshot_from_fd(snapshot_fd)?;
-
-    // Deserialize the snapshot to verify the wire format is valid.
-    let _snapshot =
+    let snapshot =
         litebox_shim_linux::syscalls::fork_snapshot::ForkSnapshot::deserialize(&snapshot_data)
             .map_err(|e| anyhow!("failed to deserialize fork snapshot: {e}"))?;
 
-    // TODO (Phase 8): Actually restore the child process and resume execution.
-    // For now, report failure so the parent knows restore is not yet implemented.
-    let ack_status: i32 = -libc::ENOSYS;
-    let mut ack_file = unsafe { std::fs::File::from_raw_fd(ack_fd) };
-    let _ = ack_file.write_all(&ack_status.to_le_bytes());
-    drop(ack_file);
+    // Set up the platform (same as worker-exec).
+    let platform = if cli_args.tun_device_name.is_some() {
+        Platform::new(cli_args.tun_device_name.as_deref())
+    } else if let Some(broker_path) = &cli_args.network_broker {
+        use litebox_platform_linux_userland::NetworkTransport;
+        let fd = connect_to_broker_ipc(broker_path)?;
+        Platform::with_network(Some(NetworkTransport::Ipc(fd)))
+    } else {
+        Platform::new(None)
+    };
+    litebox_platform_multiplex::set_platform(platform);
 
-    // Exit with an error code to signal unimplemented restore.
-    std::process::exit(1);
+    let shim_builder = litebox_shim_linux::LinuxShimBuilder::new();
+    let litebox = shim_builder.litebox();
+
+    // Load tar data if --initial-files was forwarded.
+    let tar_data: &'static [u8] = if let Some(tar_file) = cli_args.initial_files.as_ref() {
+        mmapped_file(tar_file)?.data
+    } else {
+        litebox::fs::tar_ro::EMPTY_TAR_FILE
+    };
+
+    let mut in_mem = litebox::fs::in_mem::FileSystem::new(litebox);
+    in_mem.with_root_privileges(|fs| {
+        let mode = Mode::RWXU | Mode::RWXG | Mode::RWXO;
+        let _ = fs.mkdir("/tmp", mode);
+    });
+
+    let tar_ro = litebox::fs::tar_ro::FileSystem::new(litebox, tar_data.into());
+    let default_fs = litebox_shim_linux::default_fs(litebox, in_mem, tar_ro);
+
+    // When a 9P broker is active, layer the 9P FS on top (mirrors run_worker_exec).
+    if cli_args.nine_p_broker.is_some() {
+        let broker_addr = cli_args.nine_p_broker.as_deref().unwrap();
+        let is_tcp = broker_addr.parse::<core::net::SocketAddr>().is_ok();
+
+        if is_tcp {
+            anyhow::bail!("fork-restore does not support TCP 9P brokers");
+        }
+
+        let (ring_writer, ring_reader) = connect_nine_p_channel(broker_addr)?;
+
+        let shim = shim_builder.build();
+        let shutdown = std::sync::Arc::new(core::sync::atomic::AtomicBool::new(false));
+        let net_worker = start_network_worker(&shim, &shutdown);
+
+        let writer = ShmemTransportWriter(ring_writer);
+        let reader = ShmemTransportReader(ring_reader);
+        let litebox = shim.litebox();
+        let msize = 4 * 1024 * 1024u32;
+        let (nine_p_fs, mut reader) =
+            litebox::fs::nine_p::FileSystem::new(litebox, writer, reader, msize, "root", "/")
+                .map_err(|e| anyhow!("9P attach failed: {e:?}"))?;
+
+        // Spawn the 9P response worker thread.
+        let worker_handle = nine_p_fs.worker_handle();
+        let _nine_p_worker = litebox_platform_linux_userland::spawn_host_thread(move || {
+            let mut buf = alloc::vec::Vec::with_capacity(msize as usize);
+            while worker_handle.poll_responses(&mut reader, &mut buf) {}
+        });
+
+        let combined = litebox::fs::layered::FileSystem::new(
+            litebox,
+            default_fs,
+            nine_p_fs,
+            litebox::fs::layered::LayeringSemantics::LowerLayerWritableFiles,
+        );
+        let combined_fs = std::sync::Arc::new(combined);
+
+        let program = fork_restore_and_ack(&shim, snapshot, combined_fs, ack_fd)?;
+        run_program(program, shutdown, net_worker, cli_args.worker_result_fd);
+    } else {
+        let initial_file_system = std::sync::Arc::new(default_fs);
+
+        let shim = shim_builder.build();
+        let shutdown = std::sync::Arc::new(core::sync::atomic::AtomicBool::new(false));
+        let net_worker = start_network_worker(&shim, &shutdown);
+
+        let program = fork_restore_and_ack(&shim, snapshot, initial_file_system, ack_fd)?;
+        run_program(program, shutdown, net_worker, cli_args.worker_result_fd);
+    }
+}
+
+/// Restore a child process from a fork snapshot and write the ack status to the parent.
+fn fork_restore_and_ack<FS: litebox_shim_linux::ShimFS>(
+    shim: &litebox_shim_linux::LinuxShim<FS>,
+    snapshot: litebox_shim_linux::syscalls::fork_snapshot::ForkSnapshot,
+    fs: std::sync::Arc<FS>,
+    ack_fd: i32,
+) -> Result<litebox_shim_linux::LoadedProgram<FS>> {
+    use std::io::Write;
+    use std::os::fd::FromRawFd;
+
+    match shim.restore_process(snapshot, fs) {
+        Ok(program) => {
+            // Report successful restore to parent via ack pipe.
+            let mut ack_file = unsafe { std::fs::File::from_raw_fd(ack_fd) };
+            ack_file.write_all(&0i32.to_le_bytes())?;
+            Ok(program)
+        }
+        Err(e) => {
+            // Report failure to parent via ack pipe.
+            let mut ack_file = unsafe { std::fs::File::from_raw_fd(ack_fd) };
+            let _ = ack_file.write_all(&e.as_neg().to_le_bytes());
+            drop(ack_file);
+            anyhow::bail!("fork-restore failed: {e:?}");
+        }
+    }
 }
 
 /// Read the fork snapshot bytes from an inherited memfd.
