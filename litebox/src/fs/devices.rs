@@ -132,6 +132,9 @@ pub struct PtyPair<Platform: crate::sync::RawSyncPrimitivesProvider + TimeProvid
     pub slave_pollee: Pollee<Platform>,
     /// Stored terminal attributes — modified by TCSETS, read by TCGETS.
     pub termios: crate::sync::Mutex<Platform, PtyTermios>,
+    /// Foreground process group for this PTY — modified by TIOCSPGRP, read by
+    /// TIOCGPGRP.  Stored as a raw pid_t; 0 means "not yet set".
+    pub foreground_pgrp: core::sync::atomic::AtomicI32,
 }
 
 /// Wrapper for polling the master side of a PTY pair.
@@ -253,6 +256,7 @@ impl<Platform: crate::sync::RawSyncPrimitivesProvider + TimeProvider> PtyManager
             master_pollee: Pollee::new(),
             slave_pollee: Pollee::new(),
             termios: crate::sync::Mutex::new(PtyTermios::new_default()),
+            foreground_pgrp: core::sync::atomic::AtomicI32::new(0),
         }));
         idx
     }
@@ -988,6 +992,24 @@ impl<
     fn set_pty_termios(&self, fd: &FileFd<Platform>, termios: PtyTermios) -> bool {
         if let Some((pair, _, _)) = self.get_pty_info(fd) {
             *pair.termios.lock() = termios;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn get_pty_foreground_pgrp(&self, fd: &FileFd<Platform>) -> Option<i32> {
+        let (pair, _, _) = self.get_pty_info(fd)?;
+        Some(
+            pair.foreground_pgrp
+                .load(core::sync::atomic::Ordering::Relaxed),
+        )
+    }
+
+    fn set_pty_foreground_pgrp(&self, fd: &FileFd<Platform>, pgrp: i32) -> bool {
+        if let Some((pair, _, _)) = self.get_pty_info(fd) {
+            pair.foreground_pgrp
+                .store(pgrp, core::sync::atomic::Ordering::Relaxed);
             true
         } else {
             false

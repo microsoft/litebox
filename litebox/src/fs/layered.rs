@@ -2246,6 +2246,30 @@ impl<
         }
     }
 
+    fn get_pty_foreground_pgrp(&self, fd: &FileFd<Platform, Upper, Lower>) -> Option<i32> {
+        let entry = self
+            .litebox
+            .descriptor_table()
+            .with_entry(fd, |descriptor| Arc::clone(&descriptor.entry.entry))?;
+        match entry.as_ref() {
+            EntryX::Upper { fd } => self.upper.get_pty_foreground_pgrp(fd),
+            EntryX::Lower { fd } => self.lower.get_pty_foreground_pgrp(fd),
+            EntryX::Tombstone => None,
+        }
+    }
+
+    fn set_pty_foreground_pgrp(&self, fd: &FileFd<Platform, Upper, Lower>, pgrp: i32) -> bool {
+        let entry = self
+            .litebox
+            .descriptor_table()
+            .with_entry(fd, |descriptor| Arc::clone(&descriptor.entry.entry));
+        match entry.as_deref() {
+            Some(EntryX::Upper { fd }) => self.upper.set_pty_foreground_pgrp(fd, pgrp),
+            Some(EntryX::Lower { fd }) => self.lower.set_pty_foreground_pgrp(fd, pgrp),
+            _ => false,
+        }
+    }
+
     fn read_link(
         &self,
         path: impl crate::path::Arg,

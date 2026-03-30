@@ -4146,8 +4146,17 @@ impl<FS: ShimFS> Task<FS> {
             IoctlArg::TIOCSWINSZ(_)
             | IoctlArg::TIOCSPTLK(_)
             | IoctlArg::TIOCSCTTY
-            | IoctlArg::TIOCNOTTY
-            | IoctlArg::TIOCSPGRP(_) => Ok(0),
+            | IoctlArg::TIOCNOTTY => Ok(0),
+            IoctlArg::TIOCSPGRP(pgrp_ptr) => {
+                let pgrp: i32 = pgrp_ptr.read_at_offset(0).ok_or(Errno::EFAULT)?;
+                if pgrp <= 0 {
+                    return Err(Errno::EINVAL);
+                }
+                if !fs.set_pty_foreground_pgrp(fd, pgrp) {
+                    return Err(Errno::ENOTTY);
+                }
+                Ok(0)
+            }
             IoctlArg::TIOCGWINSZ(ws) => {
                 ws.write_at_offset(
                     0,
@@ -4173,8 +4182,15 @@ impl<FS: ShimFS> Task<FS> {
                 Ok(0)
             }
             IoctlArg::TIOCGPGRP(pgrp) => {
-                pgrp.write_at_offset(0, self.sys_getpid())
-                    .ok_or(Errno::EFAULT)?;
+                let stored = fs.get_pty_foreground_pgrp(fd).ok_or(Errno::ENOTTY)?;
+                // If no foreground pgrp has been set yet, default to the
+                // calling process's pid (matching initial-open semantics).
+                let value = if stored == 0 {
+                    self.sys_getpid()
+                } else {
+                    stored
+                };
+                pgrp.write_at_offset(0, value).ok_or(Errno::EFAULT)?;
                 Ok(0)
             }
             _ => Err(Errno::ENOTTY),
@@ -5592,6 +5608,49 @@ mod tests {
         )
         .expect("stdout TIOCGPGRP should succeed");
         assert_eq!(foreground_pgrp, child_pgrp);
+    }
+
+    /// TIOCSPGRP on a PTY slave stores the foreground pgrp; TIOCGPGRP reads it
+    /// back. When no pgrp has been set, TIOCGPGRP defaults to the caller's pid.
+    #[test]
+    fn pty_tiocspgrp_tiocgpgrp_round_trip() {
+        let task = crate::syscalls::tests::init_platform(None);
+
+        // Open a PTY master (/dev/ptmx), then the matching slave.
+        let ptmx_fd = task
+            .sys_open("/dev/ptmx", OFlags::RDWR, Mode::empty())
+            .expect("open /dev/ptmx should succeed");
+        let _ptmx_fd = i32::try_from(ptmx_fd).expect("fd should fit in i32");
+        let slave_fd = task
+            .sys_open("/dev/pts/0", OFlags::RDWR, Mode::empty())
+            .expect("open /dev/pts/0 should succeed");
+        let slave_fd_i32 = i32::try_from(slave_fd).expect("fd should fit in i32");
+
+        // Before any TIOCSPGRP, TIOCGPGRP should default to the caller's pid.
+        let mut pgrp_out = -1_i32;
+        task.sys_ioctl(
+            slave_fd_i32,
+            IoctlArg::TIOCGPGRP(MutPtr::from_usize((&raw mut pgrp_out) as usize)),
+        )
+        .expect("TIOCGPGRP on PTY slave should succeed");
+        assert_eq!(pgrp_out, task.sys_getpid(), "default should be caller pid");
+
+        // Set a different foreground pgrp via TIOCSPGRP.
+        let new_pgrp: i32 = 42;
+        task.sys_ioctl(
+            slave_fd_i32,
+            IoctlArg::TIOCSPGRP(ConstPtr::from_usize((&raw const new_pgrp) as usize)),
+        )
+        .expect("TIOCSPGRP on PTY slave should succeed");
+
+        // TIOCGPGRP should now return the value we set.
+        let mut pgrp_out2 = -1_i32;
+        task.sys_ioctl(
+            slave_fd_i32,
+            IoctlArg::TIOCGPGRP(MutPtr::from_usize((&raw mut pgrp_out2) as usize)),
+        )
+        .expect("TIOCGPGRP after TIOCSPGRP should succeed");
+        assert_eq!(pgrp_out2, new_pgrp);
     }
 
     /// readlink("/proc/self/cwd") must return the CWD without a trailing slash.
