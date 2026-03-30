@@ -62,7 +62,7 @@ const ANON_INODE_DEV: u64 = 0x000e;
 /// `st_dev`, `st_ino`, and `st_rdev` with the real host PTY identity so that
 /// `fstat(reopened_fd)` is consistent with `fstat(0)`.
 #[derive(Clone)]
-struct HostPtyDeviceFd;
+pub(crate) struct HostPtyDeviceFd;
 
 /// Monotonically increasing counter for unique inode numbers assigned to
 /// anonymous file descriptors (sockets, pipes, eventfds, epoll instances).

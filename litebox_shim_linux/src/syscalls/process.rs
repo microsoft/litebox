@@ -3498,6 +3498,9 @@ impl<FS: ShimFS> Task<FS> {
 
         // Enumerate all open fds and classify each inline (to avoid
         // double-borrowing self.files via a separate classify_fd call).
+        // Acquire descriptor table BEFORE raw_descriptor_store to preserve
+        // the established dt → rds lock order.
+        let dt = self.global.litebox.descriptor_table();
         let rds = files.raw_descriptor_store.read();
         let alive_fds: Vec<usize> = rds.iter_alive().collect();
 
@@ -3507,32 +3510,63 @@ impl<FS: ShimFS> Task<FS> {
 
             // Classify by subsystem type first, then promote to StdioFd if
             // the descriptor's object_id matches the original host stdio.
-            let (subsystem_class, object_id) = if let Ok(fd) = rds.fd_from_raw_integer::<FS>(raw_fd)
-            {
-                (FdClass::FilesystemFd, Some(fd.object_id()))
-            } else if let Ok(fd) =
-                rds.fd_from_raw_integer::<litebox::net::Network<crate::Platform>>(raw_fd)
-            {
-                (FdClass::NetworkSocket, Some(fd.object_id()))
-            } else if let Ok(fd) =
-                rds.fd_from_raw_integer::<litebox::pipes::Pipes<crate::Platform>>(raw_fd)
-            {
-                (FdClass::Pipe, Some(fd.object_id()))
-            } else if let Ok(fd) =
-                rds.fd_from_raw_integer::<super::eventfd::EventfdSubsystem>(raw_fd)
-            {
-                (FdClass::EventFd, Some(fd.object_id()))
-            } else if let Ok(fd) =
-                rds.fd_from_raw_integer::<super::epoll::EpollSubsystem<FS>>(raw_fd)
-            {
-                (FdClass::Epoll, Some(fd.object_id()))
-            } else if let Ok(fd) =
-                rds.fd_from_raw_integer::<super::unix::UnixSocketSubsystem<FS>>(raw_fd)
-            {
-                (FdClass::UnixSocket, Some(fd.object_id()))
-            } else {
-                (FdClass::Other, None)
-            };
+            // For filesystem fds, also probe terminal metadata markers so we
+            // can accept terminal fds through the snapshot gate.
+            let (subsystem_class, object_id, terminal_meta) =
+                if let Ok(fd) = rds.fd_from_raw_integer::<FS>(raw_fd) {
+                    let oid = Some(fd.object_id());
+                    // Probe terminal metadata markers on this filesystem fd.
+                    // HostStdioSourceFd only counts as terminal when the
+                    // underlying host stream is actually a tty.
+                    let host_stdio_source = dt
+                        .with_metadata(&fd, |m: &crate::HostStdioSourceFd| m.0)
+                        .ok()
+                        .filter(|&source_fd| {
+                            let stream = match source_fd {
+                                0 => litebox::platform::StdioStream::Stdin,
+                                1 => litebox::platform::StdioStream::Stdout,
+                                _ => litebox::platform::StdioStream::Stderr,
+                            };
+                            self.global.platform.is_a_tty(stream)
+                        });
+                    let is_tty_alias = dt.with_metadata(&fd, |_: &crate::HostTtyAlias| ()).is_ok();
+                    let is_pty_device = dt
+                        .with_metadata(&fd, |_: &super::file::HostPtyDeviceFd| ())
+                        .is_ok();
+                    let meta = if host_stdio_source.is_some() || is_tty_alias || is_pty_device {
+                        Some(FdMetadataSnapshot {
+                            host_stdio_source_fd: host_stdio_source,
+                            is_host_tty_alias: is_tty_alias,
+                            is_host_pty_device: is_pty_device,
+                            ..Default::default()
+                        })
+                    } else {
+                        None
+                    };
+                    (FdClass::FilesystemFd, oid, meta)
+                } else if let Ok(fd) =
+                    rds.fd_from_raw_integer::<litebox::net::Network<crate::Platform>>(raw_fd)
+                {
+                    (FdClass::NetworkSocket, Some(fd.object_id()), None)
+                } else if let Ok(fd) =
+                    rds.fd_from_raw_integer::<litebox::pipes::Pipes<crate::Platform>>(raw_fd)
+                {
+                    (FdClass::Pipe, Some(fd.object_id()), None)
+                } else if let Ok(fd) =
+                    rds.fd_from_raw_integer::<super::eventfd::EventfdSubsystem>(raw_fd)
+                {
+                    (FdClass::EventFd, Some(fd.object_id()), None)
+                } else if let Ok(fd) =
+                    rds.fd_from_raw_integer::<super::epoll::EpollSubsystem<FS>>(raw_fd)
+                {
+                    (FdClass::Epoll, Some(fd.object_id()), None)
+                } else if let Ok(fd) =
+                    rds.fd_from_raw_integer::<super::unix::UnixSocketSubsystem<FS>>(raw_fd)
+                {
+                    (FdClass::UnixSocket, Some(fd.object_id()), None)
+                } else {
+                    (FdClass::Other, None, None)
+                };
 
             // Promote to StdioFd only if this fd sits at a stdio slot AND
             // its object_id matches ANY of the original host stdio descriptors.
@@ -3549,9 +3583,11 @@ impl<FS: ShimFS> Task<FS> {
                 subsystem_class
             };
 
-            // v1: accept stdio and pipes; reject all other FD classes.
+            // Accept stdio, pipes, and terminal filesystem fds (fds with
+            // host tty/pty metadata that can be reconnected on the worker).
             match class {
                 FdClass::StdioFd | FdClass::Pipe => {}
+                FdClass::FilesystemFd if terminal_meta.is_some() => {}
                 _ => {
                     reject.push(ForkRejectReason::UnsupportedFdClass { fd: raw_fd, class });
                 }
@@ -3563,10 +3599,11 @@ impl<FS: ShimFS> Task<FS> {
                 fd_flags: 0,     // TODO: read FD_CLOEXEC in a later phase
                 status_flags: 0, // TODO: read O_NONBLOCK etc. in a later phase
                 object_id: object_id.map_or(0, litebox::fd::DescriptorObjectId::as_u64),
-                metadata: FdMetadataSnapshot::default(),
+                metadata: terminal_meta.unwrap_or_default(),
             });
         }
         drop(rds);
+        drop(dt);
 
         let stdio_object_ids = [
             host_stdio_oids[0].map(litebox::fd::DescriptorObjectId::as_u64),
