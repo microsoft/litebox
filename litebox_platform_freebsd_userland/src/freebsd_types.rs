@@ -11,7 +11,9 @@ pub(crate) const STDERR_FILENO: i32 = 2;
 /// When enabled, prepends a 4-byte address-family header to each packet.
 /// We disable this (set to 0) so that raw IP packets are read/written
 /// without any header, matching Linux `IFF_NO_PI` behaviour.
-pub(crate) const TUNSIFHEAD: u64 = 0x80044460;
+///
+/// Defined as `_IOW('t', 96, int)` in `<net/if_tun.h>`.
+pub(crate) const TUNSIFHEAD: u64 = 0x8004_7460;
 
 bitflags::bitflags! {
     /// Desired memory protection of a memory mapping.
