@@ -15,6 +15,62 @@ pub(crate) const STDERR_FILENO: i32 = 2;
 /// Defined as `_IOW('t', 96, int)` in `<net/if_tun.h>`.
 pub(crate) const TUNSIFHEAD: u64 = 0x8004_7460;
 
+// ---------------------------------------------------------------------------
+// Interface configuration ioctls — `_IOW('i', N, struct ifreq)`.
+//
+// `struct ifreq` is 32 (0x20) bytes on FreeBSD x86_64.
+// ---------------------------------------------------------------------------
+
+/// Set interface address — `_IOW('i', 12, struct ifreq)`.
+pub(crate) const SIOCSIFADDR: u64 = 0x8020_690c;
+/// Set point-to-point destination address — `_IOW('i', 14, struct ifreq)`.
+pub(crate) const SIOCSIFDSTADDR: u64 = 0x8020_690e;
+/// Set interface flags — `_IOW('i', 16, struct ifreq)`.
+pub(crate) const SIOCSIFFLAGS: u64 = 0x8020_6910;
+/// Get interface flags — `_IOWR('i', 17, struct ifreq)`.
+pub(crate) const SIOCGIFFLAGS: u64 = 0xc020_6911;
+/// Set network address mask — `_IOW('i', 22, struct ifreq)`.
+pub(crate) const SIOCSIFNETMASK: u64 = 0x8020_6916;
+
+/// Maximum interface name length (IFNAMSIZ).
+pub(crate) const IF_NAMESIZE: usize = 16;
+
+/// FreeBSD `sockaddr_in` for IPv4 interface configuration.
+///
+/// Matches `<netinet/in.h>` layout on FreeBSD (includes `sin_len`).
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub(crate) struct SockaddrIn {
+    pub sin_len: u8,
+    pub sin_family: u8,
+    pub sin_port: u16,
+    pub sin_addr: [u8; 4],
+    pub sin_zero: [u8; 8],
+}
+
+/// Minimal `ifreq` for interface configuration ioctls on FreeBSD.
+///
+/// Total size is 32 bytes (`IF_NAMESIZE` + 16-byte `sockaddr`-sized union).
+#[repr(C)]
+pub(crate) struct IfReq {
+    /// Interface name, e.g. `"tun99"`.
+    pub ifr_name: [u8; IF_NAMESIZE],
+    /// Union — we cast through `ifru_addr` (a `sockaddr`-sized field).
+    pub ifr_ifru: IfReqData,
+}
+
+/// Union payload of [`IfReq`].
+///
+/// Only the two variants we actually use are declared.
+#[repr(C)]
+pub(crate) union IfReqData {
+    /// Used by `SIOCSIFADDR`, `SIOCSIFDSTADDR`, `SIOCSIFNETMASK`.
+    pub ifru_addr: SockaddrIn,
+    /// Used by `SIOCGIFFLAGS` / `SIOCSIFFLAGS` — a pair of `i16` values
+    /// (`if_flags`, `if_drv_flags`).
+    pub ifru_flags: [i16; 2],
+}
+
 bitflags::bitflags! {
     /// Desired memory protection of a memory mapping.
     #[derive(PartialEq, Debug)]

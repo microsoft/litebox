@@ -26,6 +26,7 @@ pub(crate) enum SyscallTable {
     Getgid = 47,
     Ioctl = 54,
     Munmap = 73,
+    Socket = 97,
     Mprotect = 74,
     Sysctl = 202,
     ThrExit = 431,
