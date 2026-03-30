@@ -420,6 +420,53 @@ fn test_context_switch() {
     );
 }
 
+/// End-to-end test for bidirectional pipe I/O with a non-PIE child binary.
+/// Parent (PIE) creates pipes, forks, child execs a static (non-PIE / ET_EXEC)
+/// helper via the remote-exec path.  Data flows through pipes in both
+/// directions — parent writes to child stdin and reads child stdout.
+/// This exercises the worker-host exec pipe bridging path.
+#[cfg(target_arch = "x86_64")]
+#[test]
+fn test_pipe_nonpie_exec() {
+    // Compile the non-PIE helper (static = ET_EXEC).
+    let helper_name = "echo_nonpie_helper_rewriter";
+    let helper_target = common::compile(
+        "./tests/multiprocess/echo_nonpie_helper.c",
+        helper_name,
+        true, // static (non-PIE)
+        false,
+    );
+
+    // Compile the PIE parent driver.
+    let unique_name = "pipe_nonpie_exec_rewriter";
+    let target = common::compile(
+        "./tests/multiprocess/pipe_nonpie_exec.c",
+        unique_name,
+        false, // dynamic (PIE)
+        false,
+    );
+
+    // Build the runner, inject the non-PIE helper into the guest filesystem,
+    // and tell the parent where to find it.
+    let helper_guest_path = "/out/echo_nonpie_helper";
+    let mut runner = Runner::new(Backend::Rewriter, &target, unique_name);
+
+    // Copy the rewritten helper into the tar filesystem.
+    runner.with_fs_path(|tar_dir| {
+        let out_path = tar_dir.join("out").join("echo_nonpie_helper");
+        let success = common::rewrite_with_cache(&helper_target, &out_path, &[]);
+        assert!(success, "failed to rewrite echo_nonpie_helper");
+    });
+
+    runner.env(format!("ECHO_HELPER_PATH={helper_guest_path}"));
+    let output = runner.output();
+    let output_str = String::from_utf8_lossy(&output);
+    assert!(
+        output_str.contains("[OK]"),
+        "pipe_nonpie_exec test failed:\n{output_str}",
+    );
+}
+
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 fn run_python(args: &[&str]) -> String {
     let output = std::process::Command::new("python3")

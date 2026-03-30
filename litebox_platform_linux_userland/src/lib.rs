@@ -132,6 +132,29 @@ struct WorkerHostProcess {
     bridge_threads: Vec<DetachedWorkerBridge>,
 }
 
+/// Describes a pipe-backed stdio fd that was set up with direct OS pipe I/O
+/// (no bridge thread). The parent should install a `HostPipeFd` wrapping
+/// `parent_os_fd` at the appropriate guest fd number.
+pub struct ExecPipeDirectIo {
+    /// The child worker's stdio fd number (0, 1, or 2).
+    pub child_stdio_fd: i32,
+    /// The raw host OS fd for the parent's end of the pipe.
+    /// For child stdin (fd 0): write-end (parent writes → child reads).
+    /// For child stdout/stderr: read-end (child writes → parent reads).
+    pub parent_os_fd: i32,
+}
+
+/// Result of [`LinuxUserland::spawn_worker_host_for_exec`].
+pub struct WorkerExecSpawnResult {
+    /// The host PID of the spawned worker process.
+    pub host_pid: i32,
+    /// Pipe-backed stdio fds that use direct OS pipe I/O instead of bridge
+    /// threads. Non-empty only when `direct_pipe_io` was requested. The caller
+    /// is responsible for installing `HostPipeFd` entries for these and closing
+    /// them on error.
+    pub direct_pipes: Vec<ExecPipeDirectIo>,
+}
+
 struct DetachedWorkerBridge {
     handle: std::thread::JoinHandle<()>,
     input_control: Option<WorkerInputBridgeControl>,
@@ -1121,7 +1144,8 @@ impl LinuxUserland {
         guest_exec_image: &[u8],
         guest_interp_image: Option<(&str, &[u8])>,
         stdio: WorkerExecStdioBindings<FS, LinuxUserland>,
-    ) -> Result<i32, i32>
+        direct_pipe_io: bool,
+    ) -> Result<WorkerExecSpawnResult, i32>
     where
         FS: litebox::fs::FileSystem + Send + Sync + 'static,
     {
@@ -1353,7 +1377,8 @@ impl LinuxUserland {
                 return Err(-1_i32);
             }
             worker_output_write_fds.push(write_fd);
-            output_bridges.push((group.sink, read_fd));
+            let first_target_fd = group.target_fds[0];
+            output_bridges.push((group.sink, read_fd, first_target_fd));
         }
 
         // The worker inherits the current host environment.
@@ -1375,24 +1400,49 @@ impl LinuxUserland {
         drop(worker_output_write_fds);
         drop(host_stdio_temp_sources);
         let mut bridge_threads = Vec::new();
+        let mut direct_pipes = Vec::new();
         for (source, write_fd) in input_bridges {
-            let Ok(bridge) = spawn_worker_input_bridge(self, source, write_fd) else {
-                terminate_worker_after_bridge_spawn_failure(self, pid, bridge_threads);
-                return Err(-1_i32);
-            };
-            bridge_threads.push(bridge);
-        }
-        for (sink, read_fd) in output_bridges {
-            let bridge = if let Ok(handle) = spawn_worker_output_bridge(self, sink, read_fd) {
-                DetachedWorkerBridge {
-                    handle,
-                    input_control: None,
-                }
+            if direct_pipe_io && matches!(&source, WorkerExecInputSource::Pipe { .. }) {
+                // Skip bridge thread: the caller will install a HostPipeFd for
+                // the parent's corresponding pipe endpoint.
+                let raw_fd = write_fd.into_raw_fd();
+                direct_pipes.push(ExecPipeDirectIo {
+                    child_stdio_fd: 0,
+                    parent_os_fd: raw_fd,
+                });
             } else {
-                terminate_worker_after_bridge_spawn_failure(self, pid, bridge_threads);
-                return Err(-1_i32);
-            };
-            bridge_threads.push(bridge);
+                let Ok(bridge) = spawn_worker_input_bridge(self, source, write_fd) else {
+                    for dp in &direct_pipes {
+                        close_raw_fd(dp.parent_os_fd);
+                    }
+                    terminate_worker_after_bridge_spawn_failure(self, pid, bridge_threads);
+                    return Err(-1_i32);
+                };
+                bridge_threads.push(bridge);
+            }
+        }
+        for (sink, read_fd, target_fd) in output_bridges {
+            if direct_pipe_io && matches!(&sink, WorkerExecOutputSink::Pipe { .. }) {
+                let raw_fd = read_fd.into_raw_fd();
+                direct_pipes.push(ExecPipeDirectIo {
+                    child_stdio_fd: target_fd,
+                    parent_os_fd: raw_fd,
+                });
+            } else {
+                let bridge = if let Ok(handle) = spawn_worker_output_bridge(self, sink, read_fd) {
+                    DetachedWorkerBridge {
+                        handle,
+                        input_control: None,
+                    }
+                } else {
+                    for dp in &direct_pipes {
+                        close_raw_fd(dp.parent_os_fd);
+                    }
+                    terminate_worker_after_bridge_spawn_failure(self, pid, bridge_threads);
+                    return Err(-1_i32);
+                };
+                bridge_threads.push(bridge);
+            }
         }
         self.worker_processes.lock().unwrap().insert(
             pid,
@@ -1401,7 +1451,10 @@ impl LinuxUserland {
                 bridge_threads,
             },
         );
-        Ok(pid)
+        Ok(WorkerExecSpawnResult {
+            host_pid: pid,
+            direct_pipes,
+        })
     }
 
     /// Read from an arbitrary host file descriptor.
@@ -1878,6 +1931,14 @@ impl LinuxUserland {
     /// Panics if the internal lock is poisoned.
     pub fn has_network(&self) -> bool {
         self.network_transport.read().unwrap().is_some()
+    }
+}
+
+/// Close a raw file descriptor without wrapping it in `OwnedFd`.
+fn close_raw_fd(fd: i32) {
+    // SAFETY: we own this fd and are giving up ownership.
+    unsafe {
+        libc::close(fd);
     }
 }
 

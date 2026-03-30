@@ -40,6 +40,13 @@ use litebox_common_linux::{
 };
 use litebox_platform_multiplex::Platform;
 
+/// Type alias for the VforkDone + parent pipe FD info passed through to
+/// `exec_on_remote_host` so it can set up HostPipeFd replacements.
+type ExecVforkInfo = (
+    Arc<crate::VforkDone>,
+    Vec<(usize, super::host_pipe::HostPipeDirection, usize)>,
+);
+
 /// Process-management-related state on [`Task`].
 pub(crate) struct ThreadState {
     pub(crate) init_state: Cell<ThreadInitState>,
@@ -4990,6 +4997,7 @@ impl<FS: ShimFS> Task<FS> {
         envp: alloc::vec::Vec<alloc::ffi::CString>,
         guest_exec_image: &[u8],
         guest_interp_image: Option<(&str, &[u8])>,
+        vfork_info: Option<ExecVforkInfo>,
     ) -> Result<usize, Errno> {
         #[cfg(feature = "trace_syscalls")]
         litebox::log_println!(
@@ -5013,6 +5021,15 @@ impl<FS: ShimFS> Task<FS> {
             );
         }
 
+        let has_vfork_done = vfork_info.is_some();
+        // Helper: signal VforkDone (if present) so the parent is never left
+        // blocked on error.
+        let signal_on_error = |vfork_info: &Option<ExecVforkInfo>| {
+            if let Some((vd, _)) = vfork_info {
+                vd.signal();
+            }
+        };
+
         let guest_cwd = self.fs.borrow().current_working_directory();
         let worker_stdio = self.worker_exec_stdio_bindings().inspect_err(|_err| {
             litebox::log_println!(
@@ -5020,12 +5037,35 @@ impl<FS: ShimFS> Task<FS> {
                 "[EXEC-REMOTE] pid={} remote worker exec does not support the current stdio bindings",
                 self.pid,
             );
+            signal_on_error(&vfork_info);
         })?;
+
+        // Collect pipe_pair_ids for pipe-backed stdio so we can map the
+        // direct-pipe fds back to parent fd numbers after spawn.
+        let mut stdio_pipe_pair_ids: alloc::vec::Vec<(i32, usize)> = alloc::vec::Vec::new();
+        if has_vfork_done {
+            if let WorkerExecInputBinding::Pipe { ref pipes, ref fd } = worker_stdio.stdin
+                && let Ok(pair_id) = pipes.pipe_pair_id(fd.as_ref())
+            {
+                stdio_pipe_pair_ids.push((0, pair_id));
+            }
+            if let WorkerExecOutputBinding::Pipe { ref pipes, ref fd } = worker_stdio.stdout
+                && let Ok(pair_id) = pipes.pipe_pair_id(fd.as_ref())
+            {
+                stdio_pipe_pair_ids.push((1, pair_id));
+            }
+            if let WorkerExecOutputBinding::Pipe { ref pipes, ref fd } = worker_stdio.stderr
+                && let Ok(pair_id) = pipes.pipe_pair_id(fd.as_ref())
+            {
+                stdio_pipe_pair_ids.push((2, pair_id));
+            }
+        }
+
         // Resolve the worker load path through the current guest filesystem so
         // transferred images materialize at their real lower-tree locations
         // rather than shadowing symlinked parents like /bin or /lib64.
         let load_path = self.resolve_exe_path(path);
-        let host_pid = self
+        let spawn_result = self
             .global
             .platform
             .spawn_worker_host_for_exec(
@@ -5042,6 +5082,7 @@ impl<FS: ShimFS> Task<FS> {
                 guest_exec_image,
                 guest_interp_image,
                 worker_stdio,
+                has_vfork_done,
             )
             .map_err(|err| {
                 litebox::log_println!(
@@ -5050,8 +5091,55 @@ impl<FS: ShimFS> Task<FS> {
                     self.pid,
                     err,
                 );
+                signal_on_error(&vfork_info);
                 Errno::ENOMEM
             })?;
+
+        // Build pipe replacements for the parent and signal VforkDone so the
+        // parent can start using HostPipeFd for direct I/O to the child worker.
+        if let Some((vd, ref parent_pipe_fds)) = vfork_info {
+            use super::host_pipe::HostPipeDirection;
+
+            let mut replacements: alloc::vec::Vec<crate::PipeReplacement> = alloc::vec::Vec::new();
+            for dp in &spawn_result.direct_pipes {
+                // Find the pipe_pair_id for this child stdio fd.
+                let Some(&(_, pair_id)) = stdio_pipe_pair_ids
+                    .iter()
+                    .find(|&&(fd, _)| fd == dp.child_stdio_fd)
+                else {
+                    self.global.platform.close_host_fd(dp.parent_os_fd);
+                    continue;
+                };
+
+                // Parent direction is opposite of child's.
+                let parent_dir = if dp.child_stdio_fd == 0 {
+                    HostPipeDirection::Write
+                } else {
+                    HostPipeDirection::Read
+                };
+
+                if let Some(&(parent_fd, _, _)) = parent_pipe_fds
+                    .iter()
+                    .find(|&&(_, dir, pid)| dir == parent_dir && pid == pair_id)
+                {
+                    replacements.push(crate::PipeReplacement {
+                        guest_fd: parent_fd,
+                        host_fd: dp.parent_os_fd,
+                        direction: parent_dir,
+                    });
+                } else {
+                    // No counterpart in parent — close unused OS end.
+                    self.global.platform.close_host_fd(dp.parent_os_fd);
+                }
+            }
+
+            if !replacements.is_empty() {
+                *vd.pipe_replacements.lock() = replacements;
+            }
+            vd.signal();
+        }
+
+        let host_pid = spawn_result.host_pid;
 
         #[cfg(feature = "trace_syscalls")]
         litebox::log_println!(
@@ -5260,6 +5348,7 @@ impl<FS: ShimFS> Task<FS> {
             // For shared-fork children (userland), detach from the parent's
             // state before spawning the worker, just like normal exec does.
             let mut detached_from_shared_fork = false;
+            let mut vfork_info_for_exec: Option<ExecVforkInfo> = None;
             if let Some(fc) = self.fork_context.borrow_mut().take() {
                 self.delayed_fork_pending.set(false);
                 // Flush MAP_SHARED writeback data while still using the
@@ -5297,8 +5386,10 @@ impl<FS: ShimFS> Task<FS> {
                 let new_fs: Arc<_> = Arc::new(self.fs.borrow().as_ref().clone());
                 self.fs.replace(new_fs);
 
-                // Signal the parent to resume now that we've detached.
-                fc.vfork_done.signal();
+                // Don't signal VforkDone here — exec_on_remote_host will signal
+                // it after spawning the worker and setting up pipe replacements
+                // so the parent can use direct HostPipeFd I/O.
+                vfork_info_for_exec = Some((fc.vfork_done, fc.parent_pipe_fds));
                 detached_from_shared_fork = true;
             }
             let Some(remote_exec_image) = remote_exec_image.as_deref() else {
@@ -5313,6 +5404,7 @@ impl<FS: ShimFS> Task<FS> {
                 envp_vec,
                 remote_exec_image,
                 remote_interp_image,
+                vfork_info_for_exec,
             );
             if detached_from_shared_fork && result.is_err() && !self.is_exiting() {
                 litebox::log_println!(
