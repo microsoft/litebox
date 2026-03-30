@@ -82,7 +82,7 @@ info "Creating TUN device"
 ifconfig "$TUN_DEV" create
 
 info "Assigning IP address"
-ifconfig "$TUN_DEV" inet "$TUN_IP"/24
+ifconfig "$TUN_DEV" inet "$TUN_IP" netmask 255.255.255.0
 
 info "Bringing up TUN device"
 ifconfig "$TUN_DEV" up

@@ -9,11 +9,11 @@ set -e
 
 SCRIPT_DIR=$( cd "$( dirname "$0" )" && pwd -P )
 
-RED="\033[0;31m"
-YELLOW="\033[0;33m"
-GREEN="\033[0;32m"
-BOLD="\033[1m"
-RESET="\033[0m"
+RED=$(printf '\033[0;31m')
+YELLOW=$(printf '\033[0;33m')
+GREEN=$(printf '\033[0;32m')
+BOLD=$(printf '\033[1m')
+RESET=$(printf '\033[0m')
 
 fatal() {
     printf "${RED}${BOLD}[!]${RESET} %s\n" "$1" 1>&2
