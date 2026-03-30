@@ -434,17 +434,22 @@ impl litebox::platform::common_providers::userspace_pointers::ValidateAccess
     #[inline]
     fn with_user_memory_access<R>(f: impl FnOnce() -> R) -> R {
         // STAC: Set AC flag to temporarily allow supervisor access to user pages.
-        // Safety: STAC is a privileged instruction that only modifies the AC flag
+        // Safety: STAC is a privileged instruction that modifies the AC flag
         // in RFLAGS. It has no side effects beyond enabling SMAP bypass.
+        //
+        // Note:
+        // - `preserves_flags` is omitted because STAC modifies RFLAGS.AC.
+        // - `nomem` is omitted. to prevent reordering across the SMAP boundary.
         unsafe {
-            core::arch::asm!("stac", options(nomem, nostack, preserves_flags));
+            core::arch::asm!("stac", options(nostack));
         }
         let result = f();
         // CLAC: Clear AC flag to re-enable SMAP protection.
-        // Safety: CLAC is a privileged instruction that only modifies the AC flag
+        // Safety: CLAC is a privileged instruction that modifies the AC flag
         // in RFLAGS. It has no side effects beyond re-enabling SMAP enforcement.
+        // Note: `preserves_flags` and `nomem` are intentionally omitted.
         unsafe {
-            core::arch::asm!("clac", options(nomem, nostack, preserves_flags));
+            core::arch::asm!("clac", options(nostack));
         }
         result
     }
@@ -1900,6 +1905,9 @@ unsafe extern "C" fn run_thread_arch(
         "mov gs:[{cur_kernel_bp_off}], rbp",
         "lea r8, [rsi + {USER_CONTEXT_SIZE}]",
         "mov gs:[{user_context_top_off}], r8",
+        // Mark that we are inside a user/TA context so that
+        // kernel_exception_callback knows a valid ThreadContext exists.
+        "mov byte ptr gs:[{is_in_user_off}], 1",
         // Call init_handler or reenter_handler based on reenter flag (in dl)
         "test r9b, r9b",
         "jnz 1f",
@@ -1963,14 +1971,30 @@ unsafe extern "C" fn run_thread_arch(
         SAVE_CPU_CONTEXT_ASM!(),
         "mov rbp, rsp",
         "and rsp, -16",
-        // Pass exception info via registers (SysV ABI args 1-5)
+        // Check if we are inside a user/TA context (is_in_user flag).
+        // When is_in_user is set, a valid ThreadContext exists on the
+        // kernel stack at [gs:cur_kernel_sp] and we can attempt demand
+        // paging through the shim.  When clear, the page fault occurred
+        // outside run_thread_arch and only exception-table fixup is available.
+        "cmp byte ptr gs:[{is_in_user_off}], 0",
+        "je 6f",
+        // In-user path: load ThreadContext and call full exception_handler.
         "mov rdi, gs:[{cur_kernel_sp_off}]",
+        // Pass exception info via registers (SysV ABI args 1-5)
         "mov rdi, [rdi]",                   // arg1: thread_ctx
         "mov esi, 1",                       // arg2: kernel_mode = true
         "mov rdx, cr2",                     // arg3: cr2 (fault address)
         "mov ecx, [rbp + 120]",             // arg4: error_code (orig_rax slot)
         "mov r8, [rbp + 128]",              // arg5: faulting RIP (iret frame)
         "call {exception_handler}",
+        "jmp 7f",
+        // No thread context: only exception table fixup is possible.
+        "6:",
+        "mov rdi, cr2",                     // arg1: cr2
+        "mov esi, [rbp + 120]",             // arg2: error_code
+        "mov rdx, [rbp + 128]",             // arg3: faulting RIP
+        "call {kernel_exception_handler_no_ctx}",
+        "7:",
         // If demand paging failed, rax contains the exception table fixup
         // address. Patch the saved RIP on the ISR stack so iretq resumes
         // at the fixup instead of re-faulting.
@@ -1985,8 +2009,14 @@ unsafe extern "C" fn run_thread_arch(
         "interrupt_callback:",
         "jmp done",
         "done:",
+        // We are leaving the user/TA context. Clear is_in_user first
+        // so that any kernel-mode page fault from this point on takes the
+        // exception-table-only path in kernel_exception_callback.
+        "mov byte ptr gs:[{is_in_user_off}], 0",
         "mov rbp, gs:[{cur_kernel_bp_off}]",
         "mov rsp, gs:[{cur_kernel_sp_off}]",
+        // Zero cur_kernel_sp as defence in depth
+        "mov qword ptr gs:[{cur_kernel_sp_off}], 0",
         XRSTOR_VTL1_ASM!({vtl1_kernel_xsave_area_off}, {vtl1_xsave_mask_lo_off}, {vtl1_xsave_mask_hi_off}, {vtl1_kernel_xsaved_off}),
         RESTORE_CALLEE_SAVED_REGISTERS_ASM!(),
         "ret",
@@ -2002,10 +2032,12 @@ unsafe extern "C" fn run_thread_arch(
         USER_CONTEXT_SIZE = const core::mem::size_of::<litebox_common_linux::PtRegs>(),
         scratch_off = const { PerCpuVariablesAsm::scratch_offset() },
         exception_trapno_off = const { PerCpuVariablesAsm::exception_trapno_offset() },
+        is_in_user_off = const { PerCpuVariablesAsm::is_in_user_offset() },
         init_handler = sym init_handler,
         reenter_handler = sym reenter_handler,
         syscall_handler = sym syscall_handler,
         exception_handler = sym exception_handler,
+        kernel_exception_handler_no_ctx = sym kernel_exception_handler_no_ctx,
     );
 }
 
@@ -2033,6 +2065,29 @@ unsafe extern "C" fn syscall_handler(thread_ctx: &mut ThreadContext) {
         ContinueOperation::Resume => unsafe { switch_to_user(thread_ctx.ctx) },
         ContinueOperation::Terminate => {}
     }
+}
+
+/// Handles a kernel-mode page fault that occurs outside `run_thread_arch`
+/// (i.e., when `cur_kernel_sp` is zero). Without a valid `ThreadContext`
+/// we cannot call into the shim for demand paging, so the only option is
+/// exception-table fixup (or panic).
+///
+/// Returns the fixup address on success (to be patched into the saved RIP)
+/// or panics if no fixup entry is found.
+unsafe extern "C" fn kernel_exception_handler_no_ctx(
+    cr2: usize,
+    error_code: usize,
+    faulting_rip: usize,
+) -> usize {
+    litebox::mm::exception_table::search_exception_tables(faulting_rip).unwrap_or_else(|| {
+        panic!(
+            "EXCEPTION: PAGE FAULT outside run_thread_arch (no ThreadContext)\n\
+             Accessed Address: {:#x}\n\
+             Error Code: {:#x}\n\
+             Faulting RIP: {:#x}",
+            cr2, error_code, faulting_rip,
+        )
+    })
 }
 
 /// Handles exceptions and routes to the shim's exception handler via `call_shim`.

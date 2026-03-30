@@ -2,7 +2,6 @@
 // Licensed under the MIT license.
 
 use crate::{
-    debug_serial_println,
     host::per_cpu_variables::with_per_cpu_variables,
     mshv::{
         DEFAULT_REG_PIN_MASK, HV_REGISTER_PENDING_EVENT0, HV_X64_REGISTER_APIC_BASE,
@@ -10,10 +9,10 @@ use crate::{
         HV_X64_REGISTER_GDTR, HV_X64_REGISTER_IDTR, HV_X64_REGISTER_LDTR, HV_X64_REGISTER_LSTAR,
         HV_X64_REGISTER_RIP, HV_X64_REGISTER_SFMASK, HV_X64_REGISTER_STAR,
         HV_X64_REGISTER_SYSENTER_CS, HV_X64_REGISTER_SYSENTER_EIP, HV_X64_REGISTER_SYSENTER_ESP,
-        HV_X64_REGISTER_TR, HvInterceptMessage, HvInterceptMessageHeader, HvMemInterceptMessage,
-        HvMessageType, HvMsrInterceptMessage, HvPendingExceptionEvent, MSR_CSTAR, MSR_EFER,
-        MSR_IA32_APICBASE, MSR_IA32_SYSENTER_CS, MSR_IA32_SYSENTER_EIP, MSR_IA32_SYSENTER_ESP,
-        MSR_LSTAR, MSR_STAR, MSR_SYSCALL_MASK, X86Cr0Flags, X86Cr4Flags, hvcall::HypervCallError,
+        HV_X64_REGISTER_TR, HvInterceptMessage, HvInterceptMessageHeader, HvMessageType,
+        HvMsrInterceptMessage, HvPendingExceptionEvent, MSR_CSTAR, MSR_EFER, MSR_IA32_APICBASE,
+        MSR_IA32_SYSENTER_CS, MSR_IA32_SYSENTER_EIP, MSR_IA32_SYSENTER_ESP, MSR_LSTAR, MSR_STAR,
+        MSR_SYSCALL_MASK, X86Cr0Flags, X86Cr4Flags, hvcall::HypervCallError,
         hvcall_vp::hvcall_set_vp_vtl0_registers,
     },
 };
@@ -61,13 +60,16 @@ pub fn vsm_handle_intercept() {
 
     match HvMessageType::try_from(msg.header.message_type).unwrap() {
         HvMessageType::GpaIntercept => {
-            let int_msg = unsafe {
-                let ptr = core::ptr::addr_of!(msg.payload).cast::<HvMemInterceptMessage>();
-                &*ptr
-            };
-
-            let gpa = int_msg.gpa;
-            debug_serial_println!("VSM: GPA intercept on {gpa:#x}");
+            #[cfg(debug_assertions)]
+            {
+                let int_msg = unsafe {
+                    let ptr = core::ptr::addr_of!(msg.payload)
+                        .cast::<crate::mshv::HvMemInterceptMessage>();
+                    &*ptr
+                };
+                let gpa = int_msg.gpa;
+                crate::debug_serial_println!("VSM: GPA intercept on {gpa:#x}");
+            }
             raise_vtl0_gp_fault().expect("Failed to raise VTL0 GP fault on GPA intercept");
         }
         HvMessageType::MsrIntercept => {
@@ -137,8 +139,10 @@ pub fn vsm_handle_intercept() {
             }
         }
         _ => {
+            #[cfg(debug_assertions)]
             let msg_type = msg.header.message_type;
-            debug_serial_println!(
+            #[cfg(debug_assertions)]
+            crate::debug_serial_println!(
                 "VSM: Ignore unknown synthetic interrupt message type {msg_type:#x}"
             );
         }
@@ -180,7 +184,10 @@ fn validate_and_continue_vtl0_register_write(
             hvcall_set_vp_vtl0_registers(reg_name, value).expect("Failed to write VTL0 register");
             advance_vtl0_rip(int_msg_hdr).expect("Failed to advance VTL0 RIP");
         } else {
-            debug_serial_println!("VSM: Writing {value:#x} to reg {reg_name:#x} is disallowed");
+            #[cfg(debug_assertions)]
+            crate::debug_serial_println!(
+                "VSM: Writing {value:#x} to reg {reg_name:#x} is disallowed"
+            );
             raise_vtl0_gp_fault().expect("Failed to raise VTL0 GP fault");
         }
     } else {

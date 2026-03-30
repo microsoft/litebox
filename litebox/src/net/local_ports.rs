@@ -130,7 +130,7 @@ impl LocalPort {
 }
 
 /// Errors that could be returned when allocating a port
-#[derive(Debug, Error)]
+#[derive(Debug, Clone, Copy, Error)]
 pub enum LocalPortAllocationError {
     #[error("Port {0} is already in use")]
     AlreadyInUse(u16),

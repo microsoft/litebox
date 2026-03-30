@@ -59,39 +59,86 @@ struct DiodServer {
 }
 
 impl DiodServer {
+    /// Maximum number of attempts to start `diod` on a free port.
+    const MAX_START_ATTEMPTS: usize = 5;
+
     /// Start a new `diod` server exporting a fresh temporary directory.
+    ///
+    /// Retries with a new port if `diod` fails to bind (e.g., due to a
+    /// TOCTOU race between [`find_free_port`] releasing the port and `diod`
+    /// binding to it).
     fn start() -> Self {
         let export_dir = tempfile::tempdir().expect("failed to create temp dir");
         let export_path = export_dir.path().to_path_buf();
-        let port = find_free_port();
 
-        let child = std::process::Command::new("diod")
-            .args([
-                "--foreground",
-                "--no-auth",
-                "--export",
-                export_dir.path().to_str().unwrap(),
-                "--listen",
-                &std::format!("127.0.0.1:{port}"),
-                "--nwthreads",
-                "1",
-                "-d",
-                "100000",
-            ])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
-            .expect("failed to start diod – is it installed? (`apt install diod`)");
+        for attempt in 0..Self::MAX_START_ATTEMPTS {
+            let port = find_free_port();
 
-        // Give the server a moment to start listening
-        std::thread::sleep(std::time::Duration::from_millis(500));
+            let mut child = std::process::Command::new("diod")
+                .args([
+                    "--foreground",
+                    "--no-auth",
+                    "--export",
+                    export_dir.path().to_str().unwrap(),
+                    "--listen",
+                    &std::format!("127.0.0.1:{port}"),
+                    "--nwthreads",
+                    "1",
+                    "-d",
+                    "100000",
+                ])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .expect("failed to start diod – is it installed? (`apt install diod`)");
 
-        Self {
-            child,
-            port,
-            _export_dir: export_dir,
-            export_path,
+            // Poll until the server is accepting connections or has exited.
+            let ready = Self::wait_until_ready(&mut child, port);
+            if ready {
+                return Self {
+                    child,
+                    port,
+                    _export_dir: export_dir,
+                    export_path,
+                };
+            }
+
+            // The server failed to start (e.g., port already in use). Clean
+            // up and retry with a different port.
+            let _ = child.kill();
+            let _ = child.wait();
+            if attempt + 1 < Self::MAX_START_ATTEMPTS {
+                std::eprintln!(
+                    "diod failed to bind to port {port}, retrying ({}/{})…",
+                    attempt + 1,
+                    Self::MAX_START_ATTEMPTS,
+                );
+            }
         }
+
+        panic!(
+            "failed to start diod after {} attempts",
+            Self::MAX_START_ATTEMPTS,
+        );
+    }
+
+    /// Wait for `diod` to begin accepting TCP connections on `port`.
+    ///
+    /// Returns `true` if the server is ready, `false` if it exited before
+    /// becoming ready (e.g., because the port was already in use).
+    fn wait_until_ready(child: &mut std::process::Child, port: u16) -> bool {
+        let addr = std::format!("127.0.0.1:{port}");
+        for _ in 0..50 {
+            // If the child already exited, no point waiting further.
+            if let Some(_status) = child.try_wait().ok().flatten() {
+                return false;
+            }
+            if TcpStream::connect(&addr).is_ok() {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        false
     }
 
     /// TCP address of the server (e.g., "127.0.0.1:12345").

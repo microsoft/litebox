@@ -204,7 +204,13 @@ pub fn hv_do_hypercall(
         asm!(
             "call rax",
             in("rax") hv_hypercall_page_address(), in("rcx") control, in("rdx") input_gpa,
-            in("r8") output_gpa, lateout("rax") status, options(nostack)
+            in("r8") output_gpa, lateout("rax") status,
+            // call rax uses the stack (pushes return address), so nostack must NOT be used.
+            // The hypercall page follows Windows x64 ABI: r9, r10, r11, and xmm0-xmm5
+            // are volatile (caller-saved), and flags are clobbered by the call.
+            out("r9") _, out("r10") _, out("r11") _,
+            out("xmm0") _, out("xmm1") _, out("xmm2") _,
+            out("xmm3") _, out("xmm4") _, out("xmm5") _,
         );
     }
 

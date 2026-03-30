@@ -541,6 +541,15 @@ impl<FS: ShimFS> Task<FS> {
         !shared_pending.is_empty()
     }
 
+    /// Returns the set of all pending (deliverable) signals.
+    #[cfg(test)]
+    pub(crate) fn pending_signal_set(&self) -> SigSet {
+        let blocked = self.signals.blocked.get();
+        let thread = self.signals.pending.borrow().pending & !blocked;
+        let shared = self.signals.shared_pending.lock().pending & !blocked;
+        thread | shared
+    }
+
     /// Deliver any pending signals.
     pub(crate) fn process_signals(&self, ctx: &mut PtRegs) {
         loop {
@@ -605,7 +614,39 @@ impl<FS: ShimFS> Task<FS> {
         }
     }
 
+    /// Check whether the process-wide alarm deadline has passed and, if so,
+    /// enqueue `SIGALRM`.
+    ///
+    /// Note this is a fallback in case the platform does not support timers.
+    pub(crate) fn check_alarm_deadline(&self) {
+        use litebox::platform::TimeProvider as _;
+        let mut alarm = self.process().alarm_timer.lock();
+        if alarm.handle.is_some() {
+            // If the platform supports timers, we rely on those to trigger SIGALRM, so we don't need
+            // to check the deadline here.
+            return;
+        }
+
+        if alarm
+            .deadline
+            .is_some_and(|deadline| self.global.platform.now() >= deadline)
+        {
+            alarm.deadline = None;
+            self.send_shared_signal(
+                litebox_common_linux::signal::Signal::SIGALRM,
+                siginfo_kill(litebox_common_linux::signal::Signal::SIGALRM),
+            );
+        }
+    }
+
     pub(crate) fn queue_signals(&self, signal: litebox_common_linux::signal::Signal) {
+        if signal == litebox_common_linux::signal::Signal::SIGALRM {
+            // The platform timer fired; clear the stored deadline so that a
+            // subsequent `alarm()` call does not see a stale positive remaining
+            // time due to timer imprecision (the timer can fire slightly before
+            // the exact deadline).
+            self.process().alarm_timer.lock().deadline = None;
+        }
         self.send_shared_signal(signal, siginfo_kill(signal));
     }
 

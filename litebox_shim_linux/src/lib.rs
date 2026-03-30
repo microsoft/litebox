@@ -48,6 +48,8 @@ pub mod syscalls;
 pub mod transport;
 mod wait;
 
+use crate::syscalls::file::get_file_descriptor_flags;
+
 pub type DefaultFS = LinuxFS;
 
 pub(crate) type LinuxFS = litebox::fs::layered::FileSystem<
@@ -141,27 +143,25 @@ impl<FS: ShimFS> LinuxShimEntrypoints<FS> {
 }
 
 /// The shim entry point structure.
-pub struct LinuxShimBuilder<FS: ShimFS> {
+pub struct LinuxShimBuilder {
     platform: &'static Platform,
     litebox: LiteBox<Platform>,
-    fs: Option<FS>,
     load_filter: Option<LoadFilter>,
 }
 
-impl<FS: ShimFS> Default for LinuxShimBuilder<FS> {
+impl Default for LinuxShimBuilder {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl<FS: ShimFS> LinuxShimBuilder<FS> {
+impl LinuxShimBuilder {
     /// Returns a new shim builder.
     pub fn new() -> Self {
         let platform = litebox_platform_multiplex::platform();
         Self {
             platform,
             litebox: LiteBox::new(platform),
-            fs: None,
             load_filter: None,
         }
     }
@@ -169,14 +169,6 @@ impl<FS: ShimFS> LinuxShimBuilder<FS> {
     /// Returns the litebox object for the shim.
     pub fn litebox(&self) -> &LiteBox<Platform> {
         &self.litebox
-    }
-
-    /// Set the global file system
-    ///
-    /// NOTE: This function signature might change as better parametricity is added to file systems.
-    /// Related: <https://github.com/MSRSSP/litebox/issues/24>
-    pub fn set_fs(&mut self, fs: FS) {
-        self.fs = Some(fs);
     }
 
     /// Create a default layered file system with the given in-memory and tar read-only layers.
@@ -194,19 +186,12 @@ impl<FS: ShimFS> LinuxShimBuilder<FS> {
     }
 
     /// Build the shim.
-    ///
-    /// # Panics
-    /// Panics if the file system has not been set with [`set_fs`](Self::set_fs)
-    /// before calling this method.
-    pub fn build(self) -> LinuxShim<FS> {
+    pub fn build<FS: ShimFS>(self) -> LinuxShim<FS> {
         let mut net = Network::new(&self.litebox);
         net.set_platform_interaction(litebox::net::PlatformInteraction::Manual);
         let global = Arc::new(GlobalState {
             platform: self.platform,
             pm: PageManager::new(&self.litebox),
-            fs: self
-                .fs
-                .expect("File system must be set before calling build"),
             futex_manager: FutexManager::new(),
             pipes: Pipes::new(&self.litebox),
             net: litebox::sync::Mutex::new(net),
@@ -232,6 +217,7 @@ impl<FS: ShimFS> LinuxShim<FS> {
     /// initial register state.
     pub fn load_program(
         &self,
+        fs: alloc::sync::Arc<FS>,
         task: litebox_common_linux::TaskParams,
         path: &str,
         argv: Vec<alloc::ffi::CString>,
@@ -246,7 +232,9 @@ impl<FS: ShimFS> LinuxShim<FS> {
             egid,
         } = task;
 
-        let files = Arc::new(syscalls::file::FilesState::new());
+        let files = syscalls::file::FilesState::new(fs);
+        files.set_max_fd(syscalls::process::RLIMIT_NOFILE_CUR - 1);
+        let files = Arc::new(files);
         files.initialize_stdio_in_shared_descriptors_table(&self.0);
 
         let entrypoints = crate::LinuxShimEntrypoints {
@@ -307,6 +295,10 @@ impl<FS: ShimFS> LinuxShim<FS> {
     ) -> Result<transport::ShimTransport, Errno> {
         transport::ShimTransport::connect(self.0.clone(), addr)
     }
+
+    pub fn litebox(&self) -> &LiteBox<Platform> {
+        &self.0.litebox
+    }
 }
 
 pub struct LoadedProgram<FS: ShimFS> {
@@ -353,18 +345,21 @@ fn default_fs(
 // Special override so that `GETFL` can return stdio-specific flags
 pub(crate) struct StdioStatusFlags(litebox::fs::OFlags);
 
+/// Status flags for pipes
+pub(crate) struct PipeStatusFlags(pub litebox::fs::OFlags);
+
 impl<FS: ShimFS> syscalls::file::FilesState<FS> {
     fn initialize_stdio_in_shared_descriptors_table(&self, global: &GlobalState<FS>) {
         use litebox::fs::{Mode, OFlags};
-        let stdin = global
+        let stdin = self
             .fs
             .open("/dev/stdin", OFlags::RDONLY, Mode::empty())
             .unwrap();
-        let stdout = global
+        let stdout = self
             .fs
             .open("/dev/stdout", OFlags::WRONLY, Mode::empty())
             .unwrap();
-        let stderr = global
+        let stderr = self
             .fs
             .open("/dev/stderr", OFlags::WRONLY, Mode::empty())
             .unwrap();
@@ -385,180 +380,58 @@ impl<FS: ShimFS> syscalls::file::FilesState<FS> {
 type ConstPtr<T> = <Platform as litebox::platform::RawPointerProvider>::RawConstPointer<T>;
 type MutPtr<T> = <Platform as litebox::platform::RawPointerProvider>::RawMutPointer<T>;
 
-struct Descriptors<FS: ShimFS> {
-    descriptors: Vec<Option<Descriptor<FS>>>,
-}
-
-impl<FS: ShimFS> Descriptors<FS> {
-    fn new() -> Self {
-        Self {
-            descriptors: vec![
-                Some(Descriptor::LiteBoxRawFd(0)),
-                Some(Descriptor::LiteBoxRawFd(1)),
-                Some(Descriptor::LiteBoxRawFd(2)),
-            ],
-        }
-    }
-    /// Inserts a descriptor at the first available file descriptor number,
-    /// respecting the RLIMIT_NOFILE limit for the task.
-    ///
-    /// Returns the assigned file descriptor number, or the descriptor back on failure
-    /// if the limit is exceeded.
-    fn insert(
-        &mut self,
-        task: &Task<FS>,
-        descriptor: Descriptor<FS>,
-    ) -> Result<u32, Descriptor<FS>> {
-        self.insert_in_range(
-            descriptor,
-            0,
-            task.process()
-                .limits
-                .get_rlimit_cur(litebox_common_linux::RlimitResource::NOFILE),
-        )
-    }
-    /// Inserts a descriptor at the first available slot within the specified range [min_idx, max_idx).
-    ///
-    /// Automatically grows the descriptor table if needed. Returns the assigned file descriptor number,
-    /// or the descriptor back if no slot is found within the limit.
-    fn insert_in_range(
-        &mut self,
-        descriptor: Descriptor<FS>,
-        min_idx: usize,
-        max_idx: usize,
-    ) -> Result<u32, Descriptor<FS>> {
-        let idx = self
-            .descriptors
-            .iter()
-            .skip(min_idx)
-            .position(Option::is_none)
-            .unwrap_or_else(|| {
-                self.descriptors.push(None);
-                self.descriptors.len() - 1
-            });
-        if idx >= max_idx {
-            return Err(descriptor);
-        }
-        let old = self.descriptors[idx].replace(descriptor);
-        assert!(old.is_none());
-        Ok(u32::try_from(idx).unwrap())
-    }
-    /// Attempts to insert a descriptor at a specific file descriptor number,
-    /// respecting the RLIMIT_NOFILE limit for the task.
-    ///
-    /// Returns the previous descriptor at that slot (if any), or the new descriptor back on failure
-    /// if the index exceeds the limit.
-    fn insert_at(
-        &mut self,
-        task: &Task<FS>,
-        descriptor: Descriptor<FS>,
-        idx: usize,
-    ) -> Result<Option<Descriptor<FS>>, Descriptor<FS>> {
-        if idx
-            >= task
-                .process()
-                .limits
-                .get_rlimit_cur(litebox_common_linux::RlimitResource::NOFILE)
-        {
-            return Err(descriptor);
-        }
-        if idx >= self.descriptors.len() {
-            self.descriptors.resize_with(idx + 1, Default::default);
-        }
-        Ok(self
-            .descriptors
-            .get_mut(idx)
-            .and_then(|v| v.replace(descriptor)))
-    }
-    fn remove(&mut self, fd: u32) -> Option<Descriptor<FS>> {
-        let fd = fd as usize;
-        self.descriptors.get_mut(fd)?.take()
-    }
-    fn get_fd(&self, fd: u32) -> Option<&Descriptor<FS>> {
-        self.descriptors.get(fd as usize)?.as_ref()
-    }
-
-    fn len(&self) -> usize {
-        self.descriptors.len()
-    }
-}
-
 impl<FS: ShimFS> Task<FS> {
     fn close_on_exec(&self) {
         let files = self.files.borrow();
-        files
-            .file_descriptors
-            .write()
-            .descriptors
-            .iter_mut()
-            .for_each(|slot| {
-                if let Some(desc) = slot.take()
-                    && let Ok(flags) = desc.get_file_descriptor_flags(&self.global, &files)
-                {
-                    if flags.contains(litebox_common_linux::FileDescriptorFlags::FD_CLOEXEC) {
-                        let _ = self.do_close(desc);
-                    } else {
-                        *slot = Some(desc);
-                    }
-                }
-            });
-    }
-}
-
-enum Descriptor<FS: ShimFS> {
-    LiteBoxRawFd(usize),
-    Eventfd {
-        file: alloc::sync::Arc<syscalls::eventfd::EventFile<Platform>>,
-        close_on_exec: core::sync::atomic::AtomicBool,
-    },
-    Epoll {
-        file: alloc::sync::Arc<syscalls::epoll::EpollFile<FS>>,
-        close_on_exec: core::sync::atomic::AtomicBool,
-    },
-    Unix {
-        file: alloc::sync::Arc<syscalls::unix::UnixSocket<FS>>,
-        close_on_exec: core::sync::atomic::AtomicBool,
-    },
-}
-
-/// A strongly-typed FD.
-///
-/// This enum only ever stores `Arc<TypedFd<..>>`s, and should not store any additional data
-/// alongside them (i.e., it is a trivial tagged union across the subsystems being used).
-enum StrongFd<FS: ShimFS> {
-    FileSystem(Arc<TypedFd<FS>>),
-    Network(Arc<TypedFd<Network<Platform>>>),
-    Pipes(Arc<TypedFd<Pipes<Platform>>>),
-}
-impl<FS: ShimFS> StrongFd<FS> {
-    fn from_raw(files: &syscalls::file::FilesState<FS>, fd: usize) -> Result<Self, Errno> {
-        let rds = files.raw_descriptor_store.read();
-        if let Ok(fd) = rds.fd_from_raw_integer::<FS>(fd) {
-            return Ok(StrongFd::FileSystem(fd));
+        let alive_fds: Vec<usize> = files.raw_descriptor_store.read().iter_alive().collect();
+        for raw_fd in alive_fds {
+            if let Ok(flags) = get_file_descriptor_flags(raw_fd, &self.global, &files)
+                && flags.contains(litebox_common_linux::FileDescriptorFlags::FD_CLOEXEC)
+            {
+                let _ = self.do_close(raw_fd);
+            }
         }
-        if let Ok(fd) = rds.fd_from_raw_integer::<Network<Platform>>(fd) {
-            return Ok(StrongFd::Network(fd));
-        }
-        if let Ok(fd) = rds.fd_from_raw_integer::<Pipes<Platform>>(fd) {
-            return Ok(StrongFd::Pipes(fd));
-        }
-        Err(Errno::EBADF)
     }
 }
 
 impl<FS: ShimFS> syscalls::file::FilesState<FS> {
+    #[expect(clippy::too_many_arguments)]
     pub(crate) fn run_on_raw_fd<R>(
         &self,
         fd: usize,
         fs: impl FnOnce(&TypedFd<FS>) -> R,
         net: impl FnOnce(&TypedFd<Network<Platform>>) -> R,
         pipes: impl FnOnce(&TypedFd<Pipes<Platform>>) -> R,
+        eventfd: impl FnOnce(&TypedFd<syscalls::eventfd::EventfdSubsystem>) -> R,
+        epoll: impl FnOnce(&TypedFd<syscalls::epoll::EpollSubsystem<FS>>) -> R,
+        unix: impl FnOnce(&TypedFd<syscalls::unix::UnixSocketSubsystem<FS>>) -> R,
     ) -> Result<R, Errno> {
-        match StrongFd::<FS>::from_raw(self, fd)? {
-            StrongFd::FileSystem(fd) => Ok(fs(&fd)),
-            StrongFd::Network(fd) => Ok(net(&fd)),
-            StrongFd::Pipes(fd) => Ok(pipes(&fd)),
+        let rds = self.raw_descriptor_store.read();
+        if let Ok(fd) = rds.fd_from_raw_integer(fd) {
+            drop(rds);
+            return Ok(fs(&fd));
         }
+        if let Ok(fd) = rds.fd_from_raw_integer(fd) {
+            drop(rds);
+            return Ok(net(&fd));
+        }
+        if let Ok(fd) = rds.fd_from_raw_integer(fd) {
+            drop(rds);
+            return Ok(pipes(&fd));
+        }
+        if let Ok(fd) = rds.fd_from_raw_integer(fd) {
+            drop(rds);
+            return Ok(eventfd(&fd));
+        }
+        if let Ok(fd) = rds.fd_from_raw_integer(fd) {
+            drop(rds);
+            return Ok(epoll(&fd));
+        }
+        if let Ok(fd) = rds.fd_from_raw_integer(fd) {
+            drop(rds);
+            return Ok(unix(&fd));
+        }
+        Err(Errno::EBADF)
     }
 }
 
@@ -1154,6 +1027,7 @@ impl<FS: ShimFS> Task<FS> {
             SyscallRequest::Tkill { tid, sig } => self.sys_tkill(tid, sig),
             SyscallRequest::Tgkill { tgid, tid, sig } => self.sys_tgkill(tgid, tid, sig),
             SyscallRequest::Sigaltstack { ss, old_ss } => self.sys_sigaltstack(ss, old_ss, ctx),
+            SyscallRequest::Alarm { seconds } => syscall!(sys_alarm(seconds)),
             _ => {
                 log_unsupported!("{request:?}");
                 Err(Errno::ENOSYS)
@@ -1170,8 +1044,6 @@ struct GlobalState<FS: ShimFS> {
     litebox: litebox::LiteBox<Platform>,
     /// The page manager for managing virtual memory.
     pm: litebox::mm::PageManager<Platform, { PAGE_SIZE }>,
-    /// The filesystem implementation.
-    fs: FS,
     /// The futex manager for handling futex operations.
     futex_manager: FutexManager<Platform>,
     /// The anonymous pipe implementation.
@@ -1227,11 +1099,11 @@ mod test_utils {
 
     impl<FS: ShimFS> GlobalState<FS> {
         /// Make a new task with default values for testing.
-        pub(crate) fn new_test_task(self: Arc<Self>) -> Task<FS> {
+        pub(crate) fn new_test_task(self: Arc<Self>, fs: alloc::sync::Arc<FS>) -> Task<FS> {
             let pid = self
                 .next_thread_id
                 .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-            let files = Arc::new(syscalls::file::FilesState::new());
+            let files = Arc::new(syscalls::file::FilesState::new(fs));
             files.initialize_stdio_in_shared_descriptors_table(&self);
             Task {
                 wait_state: wait::WaitState::new(self.platform),

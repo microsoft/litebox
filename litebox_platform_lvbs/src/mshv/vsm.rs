@@ -7,7 +7,7 @@
 use crate::mshv::mem_integrity::parse_modinfo;
 use crate::mshv::ringbuffer::set_ringbuffer;
 use crate::{
-    debug_serial_print, debug_serial_println,
+    debug_serial_println,
     host::{
         bootparam::get_vtl1_memory_info,
         linux::{CpuMask, KEXEC_SEGMENT_MAX, Kimage},
@@ -126,11 +126,14 @@ pub fn mshv_vsm_boot_aps(cpu_online_mask_pfn: u64, boot_signal_pfn: u64) -> Resu
         return Err(VsmError::CpuOnlineMaskCopyFailed);
     };
 
-    debug_serial_print!("cpu_online_mask: ");
-    cpu_mask.for_each_cpu(|cpu_id| {
-        debug_serial_print!("{}, ", cpu_id);
-    });
-    debug_serial_println!("");
+    #[cfg(debug_assertions)]
+    {
+        crate::debug_serial_print!("cpu_online_mask: ");
+        cpu_mask.for_each_cpu(|cpu_id| {
+            crate::debug_serial_print!("{}, ", cpu_id);
+        });
+        debug_serial_println!("");
+    }
 
     // boot_signal is an array of bytes whose length is the number of possible cores. Copy the entire page for now.
     let Some(mut boot_signal_page_buf) = (unsafe {
@@ -886,13 +889,12 @@ fn apply_vtl0_text_patch(heki_patch: HekiPatch) -> Result<(), VsmError> {
             return Err(VsmError::Vtl0CopyFailed);
         }
     } else {
-        let (patch_first, patch_second) = heki_patch.code.split_at(bytes_in_first_page);
+        let (patch_first, patch_second) =
+            heki_patch.code[..usize::from(heki_patch.size)].split_at(bytes_in_first_page);
 
         unsafe {
-            if !crate::platform_low().copy_slice_to_vtl0_phys(
-                heki_patch_pa_0 + patch_target_page_offset as u64,
-                patch_first,
-            ) || !crate::platform_low().copy_slice_to_vtl0_phys(heki_patch_pa_1, patch_second)
+            if !crate::platform_low().copy_slice_to_vtl0_phys(heki_patch_pa_0, patch_first)
+                || !crate::platform_low().copy_slice_to_vtl0_phys(heki_patch_pa_1, patch_second)
             {
                 return Err(VsmError::Vtl0CopyFailed);
             }
@@ -1680,24 +1682,30 @@ impl PatchDataMap {
 
         // the buffer looks like below:
         // [`HekiPatchInfo`, [`HekiPatch`, ...], `HekiPatchInfo`, [`HekiPatch`, ...], ...]
-        // each `HekiPatchInfo` contains the number of `HekiPatch` structures (`patch_index`) that follow it.
+        // Each `HekiPatchInfo`'s `patch_index` field specifies the number of `HekiPatch` entries that follow it.
+        // The buffer may have trailing bytes (from page-aligned VTL0 ranges) that don't form a valid record.
         let mut index: usize = 0;
-        while index <= patch_info_buf.len() - core::mem::size_of::<HekiPatchInfo>() {
-            let patch_info = HekiPatchInfo::try_from_bytes(
+        while index + core::mem::size_of::<HekiPatchInfo>() <= patch_info_buf.len() {
+            let Some(patch_info) = HekiPatchInfo::try_from_bytes(
                 &patch_info_buf[index..index + core::mem::size_of::<HekiPatchInfo>()],
-            )
-            .ok_or(PatchDataMapError::InvalidHekiPatchInfo)?;
+            ) else {
+                // Remaining bytes don't form a valid header. End of meaningful patch data.
+                break;
+            };
 
             let patch_index: usize = patch_info.patch_index.truncate();
             let total_patch_size = core::mem::size_of::<HekiPatch>()
                 .checked_mul(patch_index)
                 .ok_or(PatchDataMapError::InvalidHekiPatchInfo)?;
-            index = index
-                .checked_add(core::mem::size_of::<HekiPatchInfo>() + total_patch_size)
-                .filter(|&x| x <= patch_info_buf.len())
+            let patches_start = index
+                .checked_add(core::mem::size_of::<HekiPatchInfo>())
+                .ok_or(PatchDataMapError::InvalidHekiPatchInfo)?;
+            let patches_end = patches_start
+                .checked_add(total_patch_size)
+                .filter(|&end| end <= patch_info_buf.len())
                 .ok_or(PatchDataMapError::InvalidHekiPatchInfo)?;
 
-            for patch in patch_info_buf[index - total_patch_size..index]
+            for patch in patch_info_buf[patches_start..patches_end]
                 .chunks(core::mem::size_of::<HekiPatch>())
                 .map(HekiPatch::try_from_bytes)
             {
@@ -1742,7 +1750,7 @@ impl PatchDataMap {
                     }
                 }
             }
-            index += total_patch_size;
+            index = patches_end;
         }
 
         Ok(())

@@ -34,6 +34,7 @@ fn align_down(addr: usize, align: usize) -> usize {
 impl Task {
     /// A system call to return to the kernel. A TA calls this function when
     /// it finishes its job delivered through a TA command invocation.
+    #[allow(clippy::unused_self)]
     pub fn sys_return(&self, ret: usize) -> usize {
         #[cfg(debug_assertions)]
         litebox::log_println!(self.global.platform, "sys_return: ret {}", ret);

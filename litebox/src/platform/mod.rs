@@ -112,6 +112,42 @@ pub trait ThreadProvider: RawPointerProvider {
     }
 }
 
+#[non_exhaustive]
+#[derive(Error, Debug)]
+pub enum TimerCreationError {
+    #[error("The platform does not support timers at all.")]
+    Unsupported,
+}
+
+/// Timer support for proactive signal delivery.
+pub trait TimerProvider {
+    /// The timer handle type.
+    type TimerHandle: TimerHandle;
+    /// The signal type delivered by timers.
+    type Signal;
+
+    /// Create a new one-shot timer that delivers `signal` when it fires.
+    ///
+    /// By default, this returns an error indicating that timers are not supported.
+    /// Platforms that support it should overwrite this.
+    #[expect(unused_variables, reason = "returns an error by default")]
+    fn create_timer(&self, signal: Self::Signal) -> Result<Self::TimerHandle, TimerCreationError> {
+        Err(TimerCreationError::Unsupported)
+    }
+}
+
+/// A handle to a platform timer created by [`TimerProvider::create_timer`].
+pub trait TimerHandle: Sized {
+    /// Arm (or re-arm) the timer to fire after `duration` elapses.
+    ///
+    /// If the timer is already armed, the previous deadline is replaced.
+    /// A zero duration cancels the timer without firing.
+    fn set_timer(&self, duration: core::time::Duration);
+
+    /// Delete the timer.
+    fn delete_timer(self) {}
+}
+
 /// Provider for consuming platform-originating signals.
 ///
 /// Platforms can record signals (e.g., `SIGINT`) and the shim should call

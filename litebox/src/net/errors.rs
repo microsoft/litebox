@@ -35,7 +35,7 @@ pub enum CloseError {
 
 /// Possible errors from [`Network::connect`]
 #[non_exhaustive]
-#[derive(Error, Debug)]
+#[derive(Error, Clone, Copy, Debug)]
 pub enum ConnectError {
     #[error("Not a valid open file descriptor")]
     InvalidFd,
@@ -49,6 +49,8 @@ pub enum ConnectError {
     InProgress,
     #[error("Socket is in an invalid state")]
     InvalidState,
+    #[error("Connection timed out")]
+    TimedOut,
 }
 
 /// Possible errors from [`Network::get_local_addr`]
@@ -139,6 +141,20 @@ pub enum ReceiveError {
     SocketInInvalidState,
     #[error("Operation finished")]
     OperationFinished,
+}
+
+crate::utilities::macros::repr_enum! {
+    /// Asynchronous socket errors
+    #[non_exhaustive]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum SocketAsyncError: u32, from_u32 {
+        /// Connection was refused by the remote host (e.g., RST received during SYN).
+        ConnectionRefused = 1,
+        /// An established connection was reset by the remote host.
+        ConnectionReset = 2,
+        /// Connection timed out (e.g., SYN retransmission timeout expired without response).
+        TimedOut = 3,
+    }
 }
 
 /// Possible errors from [`Network::set_tcp_option`]

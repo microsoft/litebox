@@ -3,15 +3,15 @@
 
 //! VTL1 kernel boot parameters (compatible with Linux kernel's boot_params structure and command line)
 
-use crate::{
-    debug_serial_println,
-    mshv::vtl1_mem_layout::{
-        VTL1_BOOT_PARAMS_PAGE, VTL1_CMDLINE_PAGE, VtlMemoryError, get_address_of_special_page,
-    },
+use crate::mshv::vtl1_mem_layout::{
+    VTL1_BOOT_PARAMS_PAGE, VTL1_CMDLINE_PAGE, VtlMemoryError, get_address_of_special_page,
 };
 use core::ffi::{CStr, c_char};
 use num_enum::TryFromPrimitive;
 use spin::Once;
+
+#[cfg(debug_assertions)]
+use crate::debug_serial_println;
 
 // This module defines a simplified Linux boot params structure
 // (based on arch/x86/include/uapi/asm/bootparam.h and
@@ -120,7 +120,7 @@ fn dump_cmdline() {
     }
 
     if let Some(cmdline_str) = unsafe { CStr::from_ptr(cmdline).to_str().ok() } {
-        debug_serial_println!("{}", cmdline_str);
+        crate::debug_serial_println!("{}", cmdline_str);
     }
 }
 

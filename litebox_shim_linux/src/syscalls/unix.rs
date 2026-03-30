@@ -20,6 +20,7 @@ use litebox::{
         polling::{Pollee, TryOpError},
         wait::WaitContext,
     },
+    fd::{FdEnabledSubsystem, FdEnabledSubsystemEntry},
     fs::{Mode, OFlags, errors::OpenError},
     sync::{Mutex, RwLock},
     utils::TruncateExt as _,
@@ -34,6 +35,12 @@ use crate::{
     channel::{Channel, ReadEnd, WriteEnd},
     syscalls::net::{SocketOptionValue, SocketOptions},
 };
+
+pub(crate) struct UnixSocketSubsystem<FS: ShimFS>(core::marker::PhantomData<FS>);
+impl<FS: ShimFS> FdEnabledSubsystem for UnixSocketSubsystem<FS> {
+    type Entry = UnixSocket<FS>;
+}
+impl<FS: ShimFS> FdEnabledSubsystemEntry for UnixSocket<FS> {}
 
 /// C-compatible structure for Unix socket addresses.
 const UNIX_PATH_MAX: usize = 108;
@@ -62,7 +69,7 @@ pub(crate) enum UnixSocketAddr {
 /// the socket file remains accessible. The file is automatically closed
 /// when this structure is dropped.
 enum UnixBoundSocketAddr<FS: ShimFS> {
-    Path((String, FileFd<FS>, Arc<GlobalState<FS>>)),
+    Path((String, FileFd<FS>, Arc<FS>)),
     Abstract(Vec<u8>),
 }
 
@@ -110,7 +117,8 @@ impl UnixSocketAddr {
                 };
                 // TODO: extend fs to support creating sock file (i.e., with type `InodeType::Socket`)
                 let file = task
-                    .global
+                    .files
+                    .borrow()
                     .fs
                     .open(
                         path.as_str(),
@@ -121,7 +129,11 @@ impl UnixSocketAddr {
                         OpenError::AlreadyExists => Errno::EADDRINUSE,
                         other => Errno::from(other),
                     })?;
-                Ok(UnixBoundSocketAddr::Path((path, file, task.global.clone())))
+                Ok(UnixBoundSocketAddr::Path((
+                    path,
+                    file,
+                    task.files.borrow().fs.clone(),
+                )))
             }
             UnixSocketAddr::Abstract(data) => {
                 // TODO: check if the abstract address is already in use
@@ -156,8 +168,8 @@ impl<FS: ShimFS> UnixBoundSocketAddr<FS> {
 impl<FS: ShimFS> Drop for UnixBoundSocketAddr<FS> {
     fn drop(&mut self) {
         match self {
-            Self::Path((_, file, global)) => {
-                let _ = global.fs.close(file);
+            Self::Path((_, file, fs)) => {
+                let _ = fs.close(file);
             }
             Self::Abstract(_) => {}
         }
@@ -1367,7 +1379,9 @@ impl<FS: ShimFS> UnixSocket<FS> {
                     unreachable!()
                 }
                 // Don't allow changing socket type and credentials
-                SocketOption::TYPE | SocketOption::PEERCRED => Err(Errno::ENOPROTOOPT),
+                SocketOption::TYPE | SocketOption::PEERCRED | SocketOption::ERROR => {
+                    Err(Errno::ENOPROTOOPT)
+                }
                 // We use fixed buffer size for now
                 SocketOption::RCVBUF | SocketOption::SNDBUF => Err(Errno::EOPNOTSUPP),
             },
@@ -1414,6 +1428,8 @@ impl<FS: ShimFS> UnixSocket<FS> {
                 | SocketOption::BROADCAST => {
                     unreachable!()
                 }
+                // Unix sockets don't track async errors
+                SocketOption::ERROR => 0,
                 SocketOption::TYPE => match self.inner {
                     UnixSocketInner::Stream(_) => SockType::Stream as u32,
                     UnixSocketInner::Datagram(_) => SockType::Datagram as u32,

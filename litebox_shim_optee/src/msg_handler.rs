@@ -64,6 +64,47 @@ fn page_align_up(len: u64) -> u64 {
     len.next_multiple_of(PAGE_SIZE as u64)
 }
 
+fn parse_optee_msg_args(
+    blob: &[u8],
+    has_rpc_arg: bool,
+) -> Result<(Box<OpteeMsgArgs>, Option<Box<OpteeRpcArgs>>), OpteeSmcReturnCode> {
+    // Parse main header from the private buffer.
+    let main_header = OpteeMsgArgsHeader::read_from_prefix(blob)
+        .map_err(|_| OpteeSmcReturnCode::EBadAddr)?
+        .0;
+
+    // Validate num_params from the snapshot.
+    if main_header.num_params as usize > OpteeMsgArgs::MAX_ARG_PARAM_COUNT {
+        return Err(OpteeSmcReturnCode::EBadCmd);
+    }
+
+    let main_size = optee_msg_args_total_size(main_header.num_params);
+    let main_params = &blob[size_of::<OpteeMsgArgsHeader>()..main_size];
+    let main_args = OpteeMsgArgs::from_header_and_raw_params(&main_header, main_params)?;
+
+    // Parse RPC args if present.
+    // The Linux kernel driver places the RPC arg at offset main_size (based on the actual
+    // num_params, not MAX_ARG_PARAM_COUNT). Since we copied main_max bytes which is >= main_size,
+    // and main_size is computed from our own validated snapshot, this is safe.
+    let rpc_args = if has_rpc_arg {
+        let rpc_blob = &blob[main_size..];
+        let rpc_header = OpteeMsgArgsHeader::read_from_prefix(rpc_blob)
+            .map_err(|_| OpteeSmcReturnCode::EBadAddr)?
+            .0;
+        // Re-validate RPC num_params from the snapshot against our negotiated limit.
+        if rpc_header.num_params as usize > OpteeRpcArgs::MAX_RPC_ARG_PARAM_COUNT {
+            return Err(OpteeSmcReturnCode::EBadCmd);
+        }
+        let rpc_params = &rpc_blob[size_of::<OpteeMsgArgsHeader>()..];
+        let rpc = OpteeRpcArgs::from_header_and_raw_params(&rpc_header, rpc_params)?;
+        Some(Box::new(rpc))
+    } else {
+        None
+    };
+
+    Ok((Box::new(main_args), rpc_args))
+}
+
 /// Read `OpteeMsgArgs` (and optional `OpteeRpcArgs`) from a VTL0 physical address.
 ///
 /// Copies the maximum possible size in one shot into a private VTL1 buffer, then
@@ -126,41 +167,7 @@ pub fn read_optee_msg_args_from_phys(
     unsafe { blob_ptr.read_slice_at_offset(0, &mut blob) }
         .map_err(|_| OpteeSmcReturnCode::EBadAddr)?;
 
-    // Parse main header from the private buffer.
-    let main_header = OpteeMsgArgsHeader::read_from_prefix(&blob)
-        .map_err(|_| OpteeSmcReturnCode::EBadAddr)?
-        .0;
-
-    // Validate num_params from the snapshot.
-    if main_header.num_params as usize > OpteeMsgArgs::MAX_ARG_PARAM_COUNT {
-        return Err(OpteeSmcReturnCode::EBadCmd);
-    }
-
-    let main_size = optee_msg_args_total_size(main_header.num_params);
-    let main_params = &blob[size_of::<OpteeMsgArgsHeader>()..main_size];
-    let main_args = OpteeMsgArgs::from_header_and_raw_params(&main_header, main_params)?;
-
-    // Parse RPC args if present.
-    // The Linux kernel driver places the RPC arg at offset main_size (based on the actual
-    // num_params, not MAX_ARG_PARAM_COUNT). Since we copied main_max bytes which is >= main_size,
-    // and main_size is computed from our own validated snapshot, this is safe.
-    let rpc_args = if has_rpc_arg {
-        let rpc_blob = &blob[main_size..];
-        let rpc_header = OpteeMsgArgsHeader::read_from_prefix(rpc_blob)
-            .map_err(|_| OpteeSmcReturnCode::EBadAddr)?
-            .0;
-        // Re-validate RPC num_params from the snapshot against our negotiated limit.
-        if rpc_header.num_params as usize > OpteeRpcArgs::MAX_RPC_ARG_PARAM_COUNT {
-            return Err(OpteeSmcReturnCode::EBadCmd);
-        }
-        let rpc_params = &rpc_blob[size_of::<OpteeMsgArgsHeader>()..];
-        let rpc = OpteeRpcArgs::from_header_and_raw_params(&rpc_header, rpc_params)?;
-        Some(Box::new(rpc))
-    } else {
-        None
-    };
-
-    Ok((Box::new(main_args), rpc_args))
+    parse_optee_msg_args(&blob, has_rpc_arg)
 }
 
 /// This function handles `OpteeSmcArgs` passed from the normal world (VTL0) via an OP-TEE SMC call.
@@ -185,13 +192,52 @@ pub fn handle_optee_smc_args(
             Ok(OpteeSmcResult::CallWithArg {
                 msg_args,
                 rpc_args: None,
+                msg_args_phys_addr: msg_args_addr as u64,
             })
         }
-        OpteeSmcFunction::CallWithRpcArg | OpteeSmcFunction::CallWithRegdArg => {
+        OpteeSmcFunction::CallWithRpcArg => {
             let msg_args_addr = smc.optee_msg_args_phys_addr()?;
             let msg_args_addr: usize = msg_args_addr.truncate();
             let (msg_args, rpc_args) = read_optee_msg_args_from_phys(msg_args_addr, true)?;
-            Ok(OpteeSmcResult::CallWithArg { msg_args, rpc_args })
+            Ok(OpteeSmcResult::CallWithArg {
+                msg_args,
+                rpc_args,
+                msg_args_phys_addr: msg_args_addr as u64,
+            })
+        }
+        OpteeSmcFunction::CallWithRegdArg => {
+            // `OpteeMsgArgs` is located at the offset specified in args[3] within the shared memory region pointed by args[1]:args[2].
+            let (shm_ref, offset) = smc.optee_regd_shm_ref_and_offset()?;
+            let shm_info = shm_ref_map()
+                .get(shm_ref)
+                .ok_or(OpteeSmcReturnCode::EBadAddr)?;
+
+            // Compute copy size from known-good upper bounds — no untrusted data involved.
+            let main_max = optee_msg_args_total_size(OpteeMsgArgs::MAX_ARG_PARAM_COUNT.truncate());
+            let copy_size = main_max
+                + optee_msg_args_total_size(OpteeRpcArgs::MAX_RPC_ARG_PARAM_COUNT.truncate());
+
+            let mut blob = alloc::vec![0u8; copy_size];
+            read_data_from_shm_with_offset(&shm_info, offset, &mut blob)?;
+            let (msg_args, rpc_args) = parse_optee_msg_args(&blob, true)?;
+
+            // Compute the physical address of `OpteeMsgArgs`
+            let total_offset = shm_info
+                .page_offset
+                .checked_add(offset)
+                .ok_or(OpteeSmcReturnCode::EBadAddr)?;
+            let page_index = total_offset / PAGE_SIZE;
+            let offset_in_page = total_offset % PAGE_SIZE;
+            if page_index >= shm_info.page_addrs.len() {
+                return Err(OpteeSmcReturnCode::EBadAddr);
+            }
+            let msg_args_addr = shm_info.page_addrs[page_index].as_usize() + offset_in_page;
+
+            Ok(OpteeSmcResult::CallWithArg {
+                msg_args,
+                rpc_args,
+                msg_args_phys_addr: msg_args_addr as u64,
+            })
         }
         OpteeSmcFunction::ExchangeCapabilities => {
             // TODO: update the below when we support more features
@@ -749,10 +795,18 @@ fn read_data_from_shm<const ALIGN: usize>(
     shm_info: &ShmInfo<ALIGN>,
     buffer: &mut [u8],
 ) -> Result<(), OpteeSmcReturnCode> {
+    read_data_from_shm_with_offset(shm_info, 0, buffer)
+}
+
+fn read_data_from_shm_with_offset<const ALIGN: usize>(
+    shm_info: &ShmInfo<ALIGN>,
+    offset: usize,
+    buffer: &mut [u8],
+) -> Result<(), OpteeSmcReturnCode> {
     let mut ptr: NormalWorldConstPtr<u8, ALIGN> = shm_info.clone().try_into()?;
     // SAFETY: The data is copied into a buffer owned by LiteBox to avoid TOCTOU issues.
     unsafe {
-        ptr.read_slice_at_offset(0, buffer)?;
+        ptr.read_slice_at_offset(offset, buffer)?;
     }
     Ok(())
 }
