@@ -1831,7 +1831,7 @@ impl<FS: ShimFS> Task<FS> {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
 #[cfg(test)]
 mod tests {
     use core::net::SocketAddr;
@@ -2242,16 +2242,28 @@ mod tests {
 
         let msg = "Hello from client";
         let mut child = std::process::Command::new("nc")
-            .args([
-                "-u", // udp mode
-                "-N", // Shutdown the network socket after EOF on stdin
-                "-q", // quit after EOF on stdin and delay of secs
-                "1",
-                "-p", // Specify local port for remote connects
-                CLIENT_PORT.to_string().as_str(),
-                TUN_IP_ADDR_STR,
-                SERVER_PORT.to_string().as_str(),
-            ])
+            .args({
+                let mut args = alloc::vec![
+                    "-u".to_string(), // udp mode
+                    "-N".to_string(), // Shutdown the network socket after EOF on stdin
+                ];
+                // FreeBSD nc doesn't support -q; use -w for timeout instead.
+                #[cfg(target_os = "linux")]
+                {
+                    args.push("-q".to_string()); // quit after EOF on stdin and delay of secs
+                    args.push("1".to_string());
+                }
+                #[cfg(target_os = "freebsd")]
+                {
+                    args.push("-w".to_string());
+                    args.push("1".to_string());
+                }
+                args.push("-p".to_string()); // Specify local port for remote connects
+                args.push(CLIENT_PORT.to_string());
+                args.push(TUN_IP_ADDR_STR.to_string());
+                args.push(SERVER_PORT.to_string());
+                args
+            })
             .stdin(std::process::Stdio::piped())
             .spawn()
             .expect("Failed to spawn client");
