@@ -2001,6 +2001,11 @@ impl<FS: ShimFS> Task<FS> {
                 | Sysno::getpid | Sysno::getppid | Sysno::gettid
                 | Sysno::getuid | Sysno::getgid,
             ) => true,
+            // Argument-aware: ioctl — only allow terminal ioctls (type byte 'T' = 0x54).
+            // Bash children do TIOCSCTTY (0x540e), TIOCGPGRP (0x540f), etc. before exec.
+            // The ioctl type byte is bits [8:16); encoded ioctls (e.g. TIOCGPTN=0x80045430)
+            // have direction/size in the upper bits, so we must mask.
+            Some(Sysno::ioctl) => ((ctx.rsi >> 8) & 0xff) == 0x54,
             // Argument-aware: fcntl — only allow fd flag / dup / status-flag operations.
             // F_DUPFD=0, F_GETFD=1, F_SETFD=2, F_GETFL=3, F_SETFL=4, F_DUPFD_CLOEXEC=1030
             Some(Sysno::fcntl) => matches!(ctx.rsi, 0 | 1 | 2 | 3 | 4 | 1030),
@@ -3596,7 +3601,6 @@ mod tests {
         assert_rejected(Sysno::mmap);
         assert_rejected(Sysno::brk);
         assert_rejected(Sysno::clone);
-        assert_rejected(Sysno::ioctl);
         assert_rejected(Sysno::poll);
         assert_rejected(Sysno::socket);
         assert_rejected(Sysno::connect);
@@ -3604,6 +3608,38 @@ mod tests {
         assert_rejected(Sysno::wait4);
         assert_rejected(Sysno::kill);
         assert_rejected(Sysno::futex);
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn pre_exec_syscall_ioctl_allows_terminal_ioctls() {
+        use ::syscalls::Sysno;
+        // Terminal ioctls have type byte 'T' (0x54).
+        // Legacy (low 16-bit): TIOCSCTTY=0x540e, TIOCGPGRP=0x540f, TIOCSPGRP=0x5410,
+        //                      TIOCNOTTY=0x5422
+        // Encoded (_IOR/_IOW): TIOCGPTN=0x80045430, TIOCSPTLCK=0x40045431
+        for req in [0x540e_usize, 0x540f, 0x5410, 0x5422, 0x80045430, 0x40045431] {
+            let ctx = make_syscall_ctx(Sysno::ioctl as usize, 3, req);
+            assert!(
+                Task::<DefaultFS>::is_pre_exec_syscall(&ctx),
+                "ioctl req=0x{req:04x} should be allowed"
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn pre_exec_syscall_ioctl_rejects_non_terminal_ioctls() {
+        use ::syscalls::Sysno;
+        // Non-terminal ioctls: SIOCGIFCONF=0x8912 (type 0x89),
+        // generic ioctl=0x0001 (type 0x00), type byte 0x55=0x5500
+        for req in [0x8912_usize, 0x0001, 0x5500] {
+            let ctx = make_syscall_ctx(Sysno::ioctl as usize, 3, req);
+            assert!(
+                !Task::<DefaultFS>::is_pre_exec_syscall(&ctx),
+                "ioctl req=0x{req:04x} should be rejected"
+            );
+        }
     }
 
     #[test]
