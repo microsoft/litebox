@@ -321,6 +321,11 @@ macro_rules! saved_tls {
     };
 }
 
+impl litebox::platform::TimerProvider for FreeBSDUserland {
+    type TimerHandle = litebox::platform::trivial_providers::UnsupportedTimerHandle;
+    type Signal = litebox_common_linux::signal::Signal;
+}
+
 impl litebox::platform::SignalProvider for FreeBSDUserland {
     type Signal = litebox_common_linux::signal::Signal;
 
