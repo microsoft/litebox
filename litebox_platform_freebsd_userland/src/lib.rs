@@ -15,7 +15,7 @@ use litebox::fs::OFlags;
 use litebox::platform::page_mgmt::{FixedAddressBehavior, MemoryRegionPermissions};
 use litebox::platform::{ImmediatelyWokenUp, RawConstPointer as _, UnblockedOrTimedOut};
 use litebox::shim::ContinueOperation;
-use litebox::utils::{ReinterpretUnsignedExt as _, TruncateExt as _};
+use litebox::utils::{ReinterpretSignedExt as _, ReinterpretUnsignedExt as _, TruncateExt as _};
 use litebox_common_linux::{ProtFlags, PunchthroughSyscall};
 
 use zerocopy::{FromBytes, IntoBytes};
