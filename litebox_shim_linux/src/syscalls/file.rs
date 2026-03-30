@@ -3990,6 +3990,14 @@ impl<FS: ShimFS> Task<FS> {
             IoctlArg::TCSETS(termios_ptr) => {
                 let t: litebox_common_linux::Termios =
                     termios_ptr.read_at_offset(0).ok_or(Errno::EFAULT)?;
+                // Only the init process may change the real host terminal
+                // attributes. Child processes accept the call silently so they
+                // think the change succeeded, but we skip the real ioctl to
+                // prevent them from leaving the terminal in a bad state (e.g.
+                // canonical mode) after they exit.
+                if self.process_id != litebox::process::ProcessId::INIT {
+                    return Ok(0);
+                }
                 let attrs = litebox::platform::TerminalAttributes {
                     c_iflag: t.c_iflag,
                     c_oflag: t.c_oflag,
@@ -4007,6 +4015,9 @@ impl<FS: ShimFS> Task<FS> {
             IoctlArg::TCSETSW(termios_ptr) => {
                 let t: litebox_common_linux::Termios =
                     termios_ptr.read_at_offset(0).ok_or(Errno::EFAULT)?;
+                if self.process_id != litebox::process::ProcessId::INIT {
+                    return Ok(0);
+                }
                 let attrs = litebox::platform::TerminalAttributes {
                     c_iflag: t.c_iflag,
                     c_oflag: t.c_oflag,
@@ -4024,6 +4035,9 @@ impl<FS: ShimFS> Task<FS> {
             IoctlArg::TCSETSF(termios_ptr) => {
                 let t: litebox_common_linux::Termios =
                     termios_ptr.read_at_offset(0).ok_or(Errno::EFAULT)?;
+                if self.process_id != litebox::process::ProcessId::INIT {
+                    return Ok(0);
+                }
                 let attrs = litebox::platform::TerminalAttributes {
                     c_iflag: t.c_iflag,
                     c_oflag: t.c_oflag,
