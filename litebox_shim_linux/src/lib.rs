@@ -535,7 +535,7 @@ impl<FS: ShimFS> LinuxShim<FS> {
             thread: th,
             signal: sig,
             fs: fs_snap,
-            fd_table: _fd_table,
+            fd_table,
             memory: mem,
             is_delayed_fork: _,
         } = snapshot;
@@ -830,7 +830,7 @@ impl<FS: ShimFS> LinuxShim<FS> {
             ))
         };
 
-        // --- 10. Restore FD table (v1: stdio only). -------------------------
+        // --- 10. Restore FD table. -------------------------------------------
         let child_files = Arc::new(syscalls::file::FilesState::new(fs.clone()));
         child_files.set_max_fd(
             child_process
@@ -839,6 +839,65 @@ impl<FS: ShimFS> LinuxShim<FS> {
                 .saturating_sub(1),
         );
         child_files.initialize_stdio_in_shared_descriptors_table(&self.global);
+
+        // Restore terminal fds beyond stdio.  Fds 0/1/2 are already
+        // populated by initialize_stdio; skip them to avoid slot collisions.
+        // Terminal filesystem fds (tty/pty metadata) are reconnected via
+        // /dev/tty; tty-backed stdio aliases use their original /dev/std* path.
+        {
+            use litebox::fs::{Mode, OFlags};
+            use syscalls::fork_snapshot::FdClass;
+
+            for entry in &fd_table.entries {
+                // Skip stdio slots (already initialized above) and non-FS fds.
+                if entry.fd <= 2 || entry.class != FdClass::FilesystemFd {
+                    continue;
+                }
+                let meta = &entry.metadata;
+                if !meta.is_host_tty_alias
+                    && !meta.is_host_pty_device
+                    && meta.host_stdio_source_fd.is_none()
+                {
+                    continue;
+                }
+
+                // Choose the right device path based on the fd's origin.
+                let (path, flags) = if meta.is_host_tty_alias || meta.is_host_pty_device {
+                    ("/dev/tty", OFlags::RDWR)
+                } else if let Some(source_fd) = meta.host_stdio_source_fd {
+                    match source_fd {
+                        0 => ("/dev/stdin", OFlags::RDONLY),
+                        1 => ("/dev/stdout", OFlags::WRONLY),
+                        _ => ("/dev/stderr", OFlags::WRONLY),
+                    }
+                } else {
+                    continue;
+                };
+
+                let Ok(fd_handle) = child_files.fs.open(path, flags, Mode::empty()) else {
+                    continue;
+                };
+
+                // Attach metadata markers matching the snapshot.
+                let mut dt = self.global.litebox.descriptor_table_mut();
+                let mut rds = child_files.raw_descriptor_store.write();
+                let status_flags = OFlags::APPEND | flags;
+                dt.set_entry_metadata(&fd_handle, StdioStatusFlags(status_flags));
+                if meta.is_host_tty_alias {
+                    dt.set_entry_metadata(&fd_handle, HostTtyAlias);
+                }
+                if meta.is_host_pty_device {
+                    dt.set_entry_metadata(&fd_handle, syscalls::file::HostPtyDeviceFd);
+                }
+                if let Some(source_fd) = meta.host_stdio_source_fd {
+                    dt.set_entry_metadata(&fd_handle, HostStdioSourceFd(source_fd));
+                }
+                let success = rds.fd_into_specific_raw_integer(fd_handle, entry.fd);
+                debug_assert!(success, "fd slot {} already occupied", entry.fd);
+                drop(rds);
+                drop(dt);
+            }
+        }
 
         // --- 11. Build credentials. -----------------------------------------
         let child_credentials = Arc::new(syscalls::process::Credentials {
