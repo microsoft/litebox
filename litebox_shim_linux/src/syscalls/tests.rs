@@ -20,13 +20,7 @@ pub(crate) fn init_platform(tun_device_name: Option<&str>) -> crate::Task<crate:
         let platform = Platform::new(tun_device_name);
 
         #[cfg(target_os = "freebsd")]
-        let platform = Platform::new(tun_device_name.map(|name| {
-            litebox_platform_multiplex::TunConfig {
-                device_name: name,
-                local_ip: [10, 0, 0, 1],
-                remote_ip: [10, 0, 0, 2],
-            }
-        }));
+        let platform = Platform::new(tun_device_name);
 
         #[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
         let platform = Platform::new();

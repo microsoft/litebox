@@ -48,153 +48,22 @@ impl core::fmt::Debug for FreeBSDUserland {
 
 const SELFPROC_MAPS_PATH: &str = "/proc/curproc/map";
 
-/// AF_INET constant for FreeBSD socket ioctls.
-const AF_INET: u8 = 2;
-/// SOCK_DGRAM constant for FreeBSD socket creation.
-const SOCK_DGRAM: usize = 2;
-/// IFF_UP interface flag.
-const IFF_UP: i16 = 0x1;
-
-/// Build a [`freebsd_types::SockaddrIn`] for the given IPv4 address.
-fn make_sockaddr_in(ip: [u8; 4]) -> freebsd_types::SockaddrIn {
-    freebsd_types::SockaddrIn {
-        sin_len: core::mem::size_of::<freebsd_types::SockaddrIn>() as u8,
-        sin_family: AF_INET,
-        sin_port: 0,
-        sin_addr: ip,
-        sin_zero: [0; 8],
-    }
-}
-
-/// Build an [`freebsd_types::IfReq`] with the given interface name and
-/// `sockaddr_in` address payload.
-fn make_ifreq_addr(name: &str, addr: freebsd_types::SockaddrIn) -> freebsd_types::IfReq {
-    let mut ifr_name = [0u8; freebsd_types::IF_NAMESIZE];
-    let name_bytes = name.as_bytes();
-    let copy_len = name_bytes.len().min(freebsd_types::IF_NAMESIZE - 1);
-    ifr_name[..copy_len].copy_from_slice(&name_bytes[..copy_len]);
-    freebsd_types::IfReq {
-        ifr_name,
-        ifr_ifru: freebsd_types::IfReqData {
-            ifru_addr: addr,
-        },
-    }
-}
-
-/// Configure an already-opened TUN interface with the given IP addresses.
-///
-/// Creates a temporary UDP socket, applies `SIOCSIFADDR`, `SIOCSIFDSTADDR`,
-/// `SIOCSIFNETMASK`, and `SIOCSIFFLAGS` ioctls, then closes the socket.
-///
-/// # Panics
-///
-/// Panics if any ioctl fails (typically means insufficient privileges).
-fn configure_tun_interface(device_name: &str, local_ip: [u8; 4], remote_ip: [u8; 4]) {
-    // Create a temporary UDP socket for the ioctls.
-    let sock = unsafe {
-        syscalls::syscall3(
-            syscalls::Sysno::Socket,
-            AF_INET as usize,
-            SOCK_DGRAM,
-            0,
-        )
-    }
-    .expect("failed to create socket for TUN interface configuration");
-
-    // Helper: execute an ioctl on the socket with the given ifreq.
-    let do_ioctl = |cmd: u64, ifr: &freebsd_types::IfReq, label: &str| {
-        unsafe {
-            syscalls::syscall3(
-                syscalls::Sysno::Ioctl,
-                sock,
-                usize::try_from(cmd).unwrap(),
-                core::ptr::from_ref(ifr) as usize,
-            )
-        }
-        .unwrap_or_else(|e| panic!("TUN {label} failed: {e:?}"));
-    };
-
-    // Set local (host-side) address.
-    let ifr = make_ifreq_addr(device_name, make_sockaddr_in(local_ip));
-    do_ioctl(freebsd_types::SIOCSIFADDR, &ifr, "SIOCSIFADDR");
-
-    // Set point-to-point destination (guest-side) address.
-    let ifr = make_ifreq_addr(device_name, make_sockaddr_in(remote_ip));
-    do_ioctl(freebsd_types::SIOCSIFDSTADDR, &ifr, "SIOCSIFDSTADDR");
-
-    // Set netmask to 255.255.255.0.
-    let ifr = make_ifreq_addr(device_name, make_sockaddr_in([255, 255, 255, 0]));
-    do_ioctl(freebsd_types::SIOCSIFNETMASK, &ifr, "SIOCSIFNETMASK");
-
-    // Bring the interface UP: read current flags, set IFF_UP, write back.
-    {
-        let mut ifr_flags = make_ifreq_addr(device_name, make_sockaddr_in([0; 4]));
-        // SIOCGIFFLAGS
-        unsafe {
-            syscalls::syscall3(
-                syscalls::Sysno::Ioctl,
-                sock,
-                usize::try_from(freebsd_types::SIOCGIFFLAGS).unwrap(),
-                core::ptr::from_mut(&mut ifr_flags) as usize,
-            )
-        }
-        .expect("TUN SIOCGIFFLAGS failed");
-
-        // Set IFF_UP in the flags.
-        // Safety: we just performed SIOCGIFFLAGS which populates ifru_flags.
-        unsafe {
-            ifr_flags.ifr_ifru.ifru_flags[0] |= IFF_UP;
-        }
-
-        // SIOCSIFFLAGS
-        unsafe {
-            syscalls::syscall3(
-                syscalls::Sysno::Ioctl,
-                sock,
-                usize::try_from(freebsd_types::SIOCSIFFLAGS).unwrap(),
-                core::ptr::from_ref(&ifr_flags) as usize,
-            )
-        }
-        .expect("TUN SIOCSIFFLAGS failed");
-    }
-
-    // Close the temporary socket.
-    let _ = unsafe { syscalls::syscall1(syscalls::Sysno::Close, sock) };
-}
-
-/// Configuration for a TUN device on FreeBSD.
-///
-/// On FreeBSD, opening `/dev/tunN` resets the interface configuration, so the
-/// IP addresses must be (re-)applied each time the device is opened.
-pub struct TunConfig<'a> {
-    /// Device name, e.g. `"tun99"`.
-    pub device_name: &'a str,
-    /// Local (host) IPv4 address for the point-to-point link.
-    pub local_ip: [u8; 4],
-    /// Remote (guest) IPv4 address for the point-to-point link.
-    pub remote_ip: [u8; 4],
-}
-
 impl FreeBSDUserland {
     /// Create a new userland-FreeBSD platform for use in `LiteBox`.
     ///
-    /// Takes an optional [`TunConfig`] to connect networking (if not specified,
-    /// networking is disabled).
-    ///
-    /// On FreeBSD, opening the TUN device resets the interface configuration,
-    /// so the IP addresses are applied via socket ioctls after opening. This
-    /// requires the process to have sufficient privileges (typically root).
+    /// Takes an optional tun device name (such as `"tun0"` or `"tun1"`) to connect networking
+    /// (if not specified, networking is disabled).
     ///
     /// # Panics
     ///
-    /// Panics if the tun device could not be successfully opened or configured.
-    pub fn new(tun_config: Option<TunConfig<'_>>) -> &'static Self {
+    /// Panics if the tun device could not be successfully opened.
+    pub fn new(tun_device_name: Option<&str>) -> &'static Self {
         register_exception_handlers();
 
-        let tun_socket_fd = tun_config
-            .map(|config| {
+        let tun_socket_fd = tun_device_name
+            .map(|tun_device_name| {
                 // On FreeBSD, TUN devices are opened directly as /dev/tunN.
-                let dev_path = alloc::format!("/dev/{}\0", config.device_name);
+                let dev_path = alloc::format!("/dev/{tun_device_name}\0");
 
                 let tun_fd = unsafe {
                     syscalls::syscall3(
@@ -221,15 +90,6 @@ impl FreeBSDUserland {
                     )
                 }
                 .expect("failed to set TUNSIFHEAD on tun device");
-
-                // Configure the interface IP addresses.  On FreeBSD, the
-                // interface loses its addresses when the device node is
-                // re-opened, so we must apply them here.
-                configure_tun_interface(
-                    config.device_name,
-                    config.local_ip,
-                    config.remote_ip,
-                );
 
                 // Take ownership so that `drop` will close the fd.
                 unsafe {
