@@ -19,7 +19,10 @@ pub(crate) fn init_platform(tun_device_name: Option<&str>) -> crate::Task<crate:
         #[cfg(target_os = "linux")]
         let platform = Platform::new(tun_device_name);
 
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(target_os = "freebsd")]
+        let platform = Platform::new(tun_device_name);
+
+        #[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
         let platform = Platform::new();
 
         set_platform(platform);
