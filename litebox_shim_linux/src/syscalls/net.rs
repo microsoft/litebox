@@ -1831,7 +1831,7 @@ impl<FS: ShimFS> Task<FS> {
     }
 }
 
-#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+#[cfg(target_os = "linux")]
 #[cfg(test)]
 mod tests {
     use core::net::SocketAddr;
@@ -2247,17 +2247,8 @@ mod tests {
                     "-u".to_string(), // udp mode
                     "-N".to_string(), // Shutdown the network socket after EOF on stdin
                 ];
-                // FreeBSD nc doesn't support -q; use -w for timeout instead.
-                #[cfg(target_os = "linux")]
-                {
-                    args.push("-q".to_string()); // quit after EOF on stdin and delay of secs
-                    args.push("1".to_string());
-                }
-                #[cfg(target_os = "freebsd")]
-                {
-                    args.push("-w".to_string());
-                    args.push("1".to_string());
-                }
+                args.push("-q".to_string()); // quit after EOF on stdin and delay of secs
+                args.push("1".to_string());
                 args.push("-p".to_string()); // Specify local port for remote connects
                 args.push(CLIENT_PORT.to_string());
                 args.push(TUN_IP_ADDR_STR.to_string());
