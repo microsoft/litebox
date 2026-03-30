@@ -4143,10 +4143,15 @@ impl<FS: ShimFS> Task<FS> {
                 }
                 Ok(0)
             }
-            IoctlArg::TIOCSWINSZ(_)
-            | IoctlArg::TIOCSPTLK(_)
-            | IoctlArg::TIOCSCTTY
-            | IoctlArg::TIOCNOTTY => Ok(0),
+            IoctlArg::TIOCSWINSZ(_) | IoctlArg::TIOCSPTLK(_) | IoctlArg::TIOCNOTTY => Ok(0),
+            IoctlArg::TIOCSCTTY => {
+                // On real Linux, TIOCSCTTY sets the controlling terminal and
+                // initialises the foreground pgrp to the caller's pgid. Mirror
+                // that here so tcgetpgrp() returns the right value.
+                let pgid = i32::try_from(self.sys_getpgid(0).unwrap_or(1)).unwrap_or(1);
+                let _ = fs.set_pty_foreground_pgrp(fd, pgid);
+                Ok(0)
+            }
             IoctlArg::TIOCSPGRP(pgrp_ptr) => {
                 let pgrp: i32 = pgrp_ptr.read_at_offset(0).ok_or(Errno::EFAULT)?;
                 if pgrp <= 0 {
@@ -4183,10 +4188,12 @@ impl<FS: ShimFS> Task<FS> {
             }
             IoctlArg::TIOCGPGRP(pgrp) => {
                 let stored = fs.get_pty_foreground_pgrp(fd).ok_or(Errno::ENOTTY)?;
-                // If no foreground pgrp has been set yet, default to the
-                // calling process's pid (matching initial-open semantics).
+                // If no foreground pgrp has been set yet (e.g. TIOCSCTTY was
+                // a no-op), default to the calling process's pgid so that
+                // tcgetpgrp() == getpgrp() and shells see themselves in the
+                // foreground.
                 let value = if stored == 0 {
-                    self.sys_getpid()
+                    i32::try_from(self.sys_getpgid(0).unwrap_or(1)).unwrap_or(1)
                 } else {
                     stored
                 };
@@ -5626,14 +5633,16 @@ mod tests {
             .expect("open /dev/pts/0 should succeed");
         let slave_fd_i32 = i32::try_from(slave_fd).expect("fd should fit in i32");
 
-        // Before any TIOCSPGRP, TIOCGPGRP should default to the caller's pid.
+        // Before any TIOCSPGRP, TIOCGPGRP should default to the caller's pgid.
         let mut pgrp_out = -1_i32;
         task.sys_ioctl(
             slave_fd_i32,
             IoctlArg::TIOCGPGRP(MutPtr::from_usize((&raw mut pgrp_out) as usize)),
         )
         .expect("TIOCGPGRP on PTY slave should succeed");
-        assert_eq!(pgrp_out, task.sys_getpid(), "default should be caller pid");
+        let expected_pgid =
+            i32::try_from(task.sys_getpgid(0).expect("getpgid should succeed")).unwrap();
+        assert_eq!(pgrp_out, expected_pgid, "default should be caller pgid");
 
         // Set a different foreground pgrp via TIOCSPGRP.
         let new_pgrp: i32 = 42;

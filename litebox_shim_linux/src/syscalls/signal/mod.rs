@@ -706,6 +706,34 @@ impl<FS: ShimFS> Task<FS> {
     }
 
     pub(crate) fn sys_kill(&self, pid: i32, signal: i32) -> Result<usize, Errno> {
+        if pid == 0 {
+            // pid=0 means "send to every process in the caller's process
+            // group". Deliver to self as a simplified implementation; child
+            // processes in the same group are uncommon in the sandbox.
+            return self.do_kill(Some(self.pid), None, signal);
+        }
+        if pid < -1 {
+            // pid < -1 means "send to every process in process group -pid".
+            // We only deliver to self when the caller is in that group;
+            // otherwise the target group may not exist on this host.
+            let target_pgid = u32::try_from(pid.wrapping_neg()).map_err(|_| Errno::ESRCH)?;
+            let my_pgid = self.sys_getpgid(0).unwrap_or(0);
+            if my_pgid == target_pgid {
+                return self.do_kill(Some(self.pid), None, signal);
+            }
+            // Try remote delivery for the group leader.
+            return self.do_remote_process_kill(
+                i32::try_from(target_pgid).map_err(|_| Errno::ESRCH)?,
+                None,
+                signal,
+            );
+        }
+        if pid == -1 {
+            // pid=-1 means "send to every process the caller can signal
+            // (except PID 1)". Full broadcast is not implemented; return
+            // success so callers that rely on non-ESRCH behaviour work.
+            return Ok(0);
+        }
         if pid > 0 && pid != self.pid {
             return self.do_remote_process_kill(pid, None, signal);
         }
