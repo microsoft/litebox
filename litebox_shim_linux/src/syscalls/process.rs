@@ -1756,6 +1756,7 @@ mod tests {
     /// After the alarm deadline passes, a blocking operation should be
     /// interrupted and SIGALRM should be pending.
     #[test]
+    #[cfg(target_os = "linux")]
     fn test_alarm_fires_after_deadline() {
         use litebox::platform::{Instant as _, TimeProvider};
         use litebox_common_linux::{ClockId, TimerFlags, Timespec};
@@ -1905,6 +1906,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
     fn test_timer_delivers_correct_signal() {
         use litebox::platform::{TimerHandle as _, TimerProvider as _};
         use litebox_common_linux::signal::Signal;
