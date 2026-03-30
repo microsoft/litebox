@@ -34,6 +34,8 @@ extern crate alloc;
 /// This implements the main [`litebox::platform::Provider`] trait, i.e., implements all platform
 /// traits.
 pub struct FreeBSDUserland {
+    /// TUN device file descriptor for IP packet I/O (networking).
+    tun_socket_fd: std::sync::RwLock<Option<std::os::fd::OwnedFd>>,
     /// Reserved pages that are not available for guest programs to use.
     reserved_pages: Vec<core::ops::Range<usize>>,
 }
@@ -48,14 +50,88 @@ const SELFPROC_MAPS_PATH: &str = "/proc/curproc/map";
 
 impl FreeBSDUserland {
     /// Create a new userland-FreeBSD platform for use in `LiteBox`.
-    pub fn new() -> &'static Self {
+    ///
+    /// Takes an optional tun device name (such as `"tun0"` or `"tun1"`) to connect networking
+    /// (if not specified, networking is disabled).
+    ///
+    /// # Panics
+    ///
+    /// Panics if the tun device could not be successfully opened.
+    pub fn new(tun_device_name: Option<&str>) -> &'static Self {
         register_exception_handlers();
 
+        let tun_socket_fd = tun_device_name
+            .map(|tun_device_name| {
+                // On FreeBSD, TUN devices are opened directly as /dev/tunN.
+                let dev_path = alloc::format!("/dev/{tun_device_name}\0");
+
+                let tun_fd = unsafe {
+                    syscalls::syscall3(
+                        syscalls::Sysno::Open,
+                        dev_path.as_ptr() as usize,
+                        (litebox::fs::OFlags::RDWR
+                            | litebox::fs::OFlags::CLOEXEC
+                            | litebox::fs::OFlags::NONBLOCK)
+                            .bits() as usize,
+                        0,
+                    )
+                }
+                .expect("failed to open tun device");
+
+                // Disable the address-family header so that raw IP packets are
+                // read/written without any framing, matching Linux IFF_NO_PI.
+                let zero: i32 = 0;
+                unsafe {
+                    syscalls::syscall3(
+                        syscalls::Sysno::Ioctl,
+                        tun_fd,
+                        freebsd_types::TUNSIFHEAD as usize,
+                        core::ptr::from_ref(&zero) as usize,
+                    )
+                }
+                .expect("failed to set TUNSIFHEAD on tun device");
+
+                // Take ownership so that `drop` will close the fd.
+                unsafe {
+                    use std::os::fd::FromRawFd as _;
+                    std::os::fd::OwnedFd::from_raw_fd(
+                        tun_fd.reinterpret_as_signed().truncate(),
+                    )
+                }
+            })
+            .into();
+
         let platform = Self {
+            tun_socket_fd,
             reserved_pages: Self::read_proc_self_maps(),
         };
 
         Box::leak(Box::new(platform))
+    }
+
+    /// Wait until there is data available on the TUN device.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the TUN device is not initialized.
+    pub fn wait_on_tun(&self, timeout: Option<Duration>) {
+        use std::os::fd::AsRawFd as _;
+        let tun_fd = self.tun_socket_fd.read().unwrap();
+        let mut pfd = libc::pollfd {
+            fd: tun_fd.as_ref().unwrap().as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let _ = unsafe {
+            libc::poll(
+                &raw mut pfd,
+                1,
+                timeout.map_or(-1, |t| {
+                    let ms = t.as_millis();
+                    i32::try_from(ms).unwrap_or(i32::MAX)
+                }),
+            )
+        };
     }
 
     fn read_proc_self_maps() -> alloc::vec::Vec<core::ops::Range<usize>> {
@@ -853,25 +929,60 @@ impl litebox::platform::RawMutex for RawMutex {
 }
 
 // ---------------------------------------------------------------------------
-// IP Interface (stub)
+// IP Interface
 // ---------------------------------------------------------------------------
 
 impl litebox::platform::IPInterfaceProvider for FreeBSDUserland {
     fn send_ip_packet(&self, packet: &[u8]) -> Result<(), litebox::platform::SendError> {
-        unimplemented!(
-            "send_ip_packet is not implemented for FreeBSD yet. packet length: {}",
-            packet.len()
-        );
+        use std::os::fd::AsRawFd as _;
+        let tun_fd = self.tun_socket_fd.read().unwrap();
+        let Some(tun_socket_fd) = tun_fd.as_ref() else {
+            unimplemented!("networking without tun is unimplemented")
+        };
+        match unsafe {
+            syscalls::syscall3(
+                syscalls::Sysno::Write,
+                usize::try_from(tun_socket_fd.as_raw_fd()).unwrap(),
+                packet.as_ptr() as usize,
+                packet.len(),
+            )
+        } {
+            Ok(n) => {
+                if n != packet.len() {
+                    unimplemented!("unexpected size {n}")
+                }
+                Ok(())
+            }
+            Err(errno) => {
+                unimplemented!("unexpected error {errno}")
+            }
+        }
     }
 
     fn receive_ip_packet(
         &self,
         packet: &mut [u8],
     ) -> Result<usize, litebox::platform::ReceiveError> {
-        unimplemented!(
-            "receive_ip_packet is not implemented for FreeBSD yet. packet length: {}",
-            packet.len()
-        );
+        use std::os::fd::AsRawFd as _;
+        let tun_fd = self.tun_socket_fd.read().unwrap();
+        let Some(tun_socket_fd) = tun_fd.as_ref() else {
+            unimplemented!("networking without tun is unimplemented")
+        };
+        unsafe {
+            syscalls::syscall3(
+                syscalls::Sysno::Read,
+                usize::try_from(tun_socket_fd.as_raw_fd()).unwrap(),
+                packet.as_mut_ptr() as usize,
+                packet.len(),
+            )
+        }
+        .map_err(|errno| match errno {
+            #[allow(unreachable_patterns, reason = "EAGAIN == EWOULDBLOCK")]
+            crate::errno::Errno::EWOULDBLOCK | crate::errno::Errno::EAGAIN => {
+                litebox::platform::ReceiveError::WouldBlock
+            }
+            _ => unimplemented!("unexpected error {errno}"),
+        })
     }
 }
 
@@ -1711,7 +1822,7 @@ mod tests {
 
     #[test]
     fn test_reserved_pages() {
-        let platform = FreeBSDUserland::new();
+        let platform = FreeBSDUserland::new(None);
 
         platform.debug_log_print("msg from FreeBSDUserland test_reserved_pages\n");
 
