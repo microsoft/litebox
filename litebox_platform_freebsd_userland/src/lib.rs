@@ -94,9 +94,7 @@ impl FreeBSDUserland {
                 // Take ownership so that `drop` will close the fd.
                 unsafe {
                     use std::os::fd::FromRawFd as _;
-                    std::os::fd::OwnedFd::from_raw_fd(
-                        tun_fd.reinterpret_as_signed().truncate(),
-                    )
+                    std::os::fd::OwnedFd::from_raw_fd(tun_fd.reinterpret_as_signed().truncate())
                 }
             })
             .into();
