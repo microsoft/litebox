@@ -708,8 +708,20 @@ impl<FS: ShimFS> Task<FS> {
     pub(crate) fn sys_kill(&self, pid: i32, signal: i32) -> Result<usize, Errno> {
         if pid == 0 {
             // pid=0 means "send to every process in the caller's process
-            // group". Deliver to self as a simplified implementation; child
-            // processes in the same group are uncommon in the sandbox.
+            // group". On real Linux this delivers to every group member.
+            //
+            // The sandbox does not support process stopping (SIGSTOP,
+            // SIGTSTP, SIGTTIN, SIGTTOU with SIG_DFL are treated as
+            // terminate), so stop signals sent to the own group are
+            // accepted without delivery to avoid accidentally killing
+            // the caller (e.g. bash's job-control SIGTTIN loop).
+            if signal > 0
+                && let Ok(sig) = Signal::try_from(signal)
+                && sig.default_disposition()
+                    == litebox_common_linux::signal::SignalDisposition::Stop
+            {
+                return Ok(0);
+            }
             return self.do_kill(Some(self.pid), None, signal);
         }
         if pid < -1 {

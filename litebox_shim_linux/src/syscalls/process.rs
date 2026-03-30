@@ -1722,17 +1722,29 @@ impl<FS: ShimFS> Task<FS> {
         // Reject any clone/fork while vfork parking is active (or already
         // requested for this thread). This prevents concurrent fork/clone
         // operations from bypassing parking invariants.
+        //
+        // If another fork/vfork is in progress, briefly wait for it to
+        // complete instead of returning EAGAIN immediately. This avoids
+        // spurious failures when the guest issues two forks in quick
+        // succession (e.g. a shell spawning a pipeline).
         {
             let ps = self.process_state.borrow();
-            if self.is_suspended()
-                || ps
-                    .vfork_parking
-                    .park
-                    .underlying_atomic()
-                    .load(Ordering::Acquire)
-                    != 0
-            {
+            if self.is_suspended() {
                 return Err(Errno::EAGAIN);
+            }
+            let parking_atomic = ps.vfork_parking.park.underlying_atomic();
+            if parking_atomic.load(Ordering::Acquire) != 0 {
+                // Wait up to ~500 ms for the ongoing fork to finish.
+                for _ in 0..100 {
+                    let v = parking_atomic.load(Ordering::Acquire);
+                    if v == 0 {
+                        break;
+                    }
+                    let _ = ps.vfork_parking.park.block(v);
+                }
+                if parking_atomic.load(Ordering::Acquire) != 0 {
+                    return Err(Errno::EAGAIN);
+                }
             }
         }
 

@@ -3915,10 +3915,6 @@ impl<FS: ShimFS> Task<FS> {
             .ok_or(Errno::ENOTTY)
     }
 
-    fn host_tty_foreground_pgrp(&self) -> litebox::process::ProcessGroupId {
-        *self.global.host_tty_foreground_pgrp.lock()
-    }
-
     fn host_tty_session_id(&self) -> Result<litebox::process::SessionId, Errno> {
         self.global
             .litebox
@@ -4087,10 +4083,15 @@ impl<FS: ShimFS> Task<FS> {
                 Ok(0)
             }
             IoctlArg::TIOCGPGRP(pgrp) => {
-                let foreground_pgrp = i32::try_from(self.host_tty_foreground_pgrp().as_u32())
-                    .map_err(|_| Errno::EINVAL)?;
-                pgrp.write_at_offset(0, foreground_pgrp)
-                    .ok_or(Errno::EFAULT)?;
+                // Return the caller's own pgid rather than the shared
+                // host_tty_foreground_pgrp.  After setsid() the child's
+                // pgid diverges from the init-owned foreground value, and
+                // /dev/tty always routes here (major 5), so returning the
+                // stored global would make the child think it's in the
+                // background.  Returning the caller's pgid guarantees
+                // tcgetpgrp() == getpgrp() for every process.
+                let caller_pgid = i32::try_from(self.sys_getpgid(0).unwrap_or(1)).unwrap_or(1);
+                pgrp.write_at_offset(0, caller_pgid).ok_or(Errno::EFAULT)?;
                 Ok(0)
             }
             IoctlArg::TIOCGSID(sid) => {
@@ -4201,16 +4202,16 @@ impl<FS: ShimFS> Task<FS> {
                 Ok(0)
             }
             IoctlArg::TIOCGPGRP(pgrp) => {
-                let stored = fs.get_pty_foreground_pgrp(fd).ok_or(Errno::ENOTTY)?;
-                // If no foreground pgrp has been set yet (e.g. TIOCSCTTY was
-                // a no-op), default to the calling process's pgid so that
-                // tcgetpgrp() == getpgrp() and shells see themselves in the
-                // foreground.
-                let value = if stored == 0 {
-                    i32::try_from(self.sys_getpgid(0).unwrap_or(1)).unwrap_or(1)
-                } else {
-                    stored
-                };
+                // Always return the caller's own pgid.  This avoids a race
+                // between the parent setting the PTY foreground pgrp (via
+                // TIOCSPGRP on the master) and the child checking it (via
+                // TIOCGPGRP on the slave): with vfork the parent can only
+                // call tcsetpgrp *after* the child execs, but bash checks
+                // tcgetpgrp during early init, before the parent had a chance
+                // to call setpgid+tcsetpgrp.  Returning the caller's pgid
+                // guarantees tcgetpgrp() == getpgrp() so shells always see
+                // themselves in the foreground.
+                let value = i32::try_from(self.sys_getpgid(0).unwrap_or(1)).unwrap_or(1);
                 pgrp.write_at_offset(0, value).ok_or(Errno::EFAULT)?;
                 Ok(0)
             }
@@ -5622,13 +5623,16 @@ mod tests {
         )
         .expect("TIOCSPGRP should succeed");
 
+        // TIOCGPGRP always returns the caller's own pgid (not the stored
+        // foreground pgrp) to avoid vfork/setsid race conditions.
         let mut foreground_pgrp = -1_i32;
         task.sys_ioctl(
             1,
             IoctlArg::TIOCGPGRP(MutPtr::from_usize((&raw mut foreground_pgrp) as usize)),
         )
         .expect("stdout TIOCGPGRP should succeed");
-        assert_eq!(foreground_pgrp, child_pgrp);
+        let caller_pgid = i32::try_from(task.sys_getpgid(0).expect("getpgid")).unwrap();
+        assert_eq!(foreground_pgrp, caller_pgid);
     }
 
     /// TIOCSPGRP on a PTY slave stores the foreground pgrp; TIOCGPGRP reads it
@@ -5666,14 +5670,15 @@ mod tests {
         )
         .expect("TIOCSPGRP on PTY slave should succeed");
 
-        // TIOCGPGRP should now return the value we set.
+        // TIOCGPGRP always returns the caller's pgid (not the stored value)
+        // to avoid vfork race conditions.
         let mut pgrp_out2 = -1_i32;
         task.sys_ioctl(
             slave_fd_i32,
             IoctlArg::TIOCGPGRP(MutPtr::from_usize((&raw mut pgrp_out2) as usize)),
         )
         .expect("TIOCGPGRP after TIOCSPGRP should succeed");
-        assert_eq!(pgrp_out2, new_pgrp);
+        assert_eq!(pgrp_out2, expected_pgid, "should still be caller pgid");
     }
 
     /// readlink("/proc/self/cwd") must return the CWD without a trailing slash.
