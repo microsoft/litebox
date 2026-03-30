@@ -85,7 +85,7 @@ impl FreeBSDUserland {
                     syscalls::syscall3(
                         syscalls::Sysno::Ioctl,
                         tun_fd,
-                        freebsd_types::TUNSIFHEAD as usize,
+                        usize::try_from(freebsd_types::TUNSIFHEAD).unwrap(),
                         core::ptr::from_ref(&zero) as usize,
                     )
                 }
