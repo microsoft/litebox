@@ -15,15 +15,17 @@ REMOVE_TUN=0
 FORCE_RECREATE=0
 TUN_DEV="tun99"
 TUN_IP="10.0.0.1"
-while getopts "hdft:i:" opt; do
+TUN_REMOTE_IP="10.0.0.2"
+while getopts "hdft:i:r:" opt; do
     case $opt in
         h)
-            echo "Usage: $0 [-h] [-d | -f] [-t TUN] [-i IP]" 1>&2
+            echo "Usage: $0 [-h] [-d | -f] [-t TUN] [-i IP] [-r REMOTE_IP]" 1>&2
             echo "  -h  Show this help message" 1>&2
             echo "  -d  Remove the TUN device" 1>&2
             echo "  -f  Force re-create the TUN device" 1>&2
             echo "  -t  TUN device name (default: $TUN_DEV)" 1>&2
-            echo "  -i  TUN IP address (default: $TUN_IP)" 1>&2
+            echo "  -i  TUN local IP address (default: $TUN_IP)" 1>&2
+            echo "  -r  TUN remote (guest) IP address (default: $TUN_REMOTE_IP)" 1>&2
             exit 0
             ;;
         d)
@@ -37,6 +39,9 @@ while getopts "hdft:i:" opt; do
             ;;
         i)
             TUN_IP="$OPTARG"
+            ;;
+        r)
+            TUN_REMOTE_IP="$OPTARG"
             ;;
         \?)
             fatal "Invalid option: -$OPTARG"
@@ -54,7 +59,8 @@ info2 "TUN device: ${BOLD}${TUN_DEV}${RESET}"
 if [ $REMOVE_TUN -eq 1 ]; then
     info2 "Remove TUN device: ${BOLD}yes${RESET}"
 else
-    info2 "TUN IPs: ${BOLD}${TUN_IP}/24${RESET}"
+    info2 "TUN local IP: ${BOLD}${TUN_IP}${RESET}"
+    info2 "TUN remote IP: ${BOLD}${TUN_REMOTE_IP}${RESET}"
 fi
 if [ $FORCE_RECREATE -eq 1 ]; then
     info2 "Force recreate TUN device: ${BOLD}yes${RESET}"
@@ -81,11 +87,8 @@ fi
 info "Creating TUN device"
 ifconfig "$TUN_DEV" create
 
-info "Assigning IP address"
-ifconfig "$TUN_DEV" inet "$TUN_IP" netmask 255.255.255.0
-
-info "Bringing up TUN device"
-ifconfig "$TUN_DEV" up
+info "Assigning IP address (point-to-point: $TUN_IP -> $TUN_REMOTE_IP)"
+ifconfig "$TUN_DEV" inet "$TUN_IP" "$TUN_REMOTE_IP" netmask 255.255.255.0
 
 # Allow the current user to open the device node
 CURRENT_USER=$(logname 2>/dev/null || echo "$SUDO_USER")
