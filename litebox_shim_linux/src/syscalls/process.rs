@@ -3599,14 +3599,21 @@ impl<FS: ShimFS> Task<FS> {
         for (range, flags) in &mappings {
             let is_shared = flags.contains(VmFlags::VM_SHARED);
 
-            // v1: reject shared mappings since we cannot preserve cross-host
-            // shared-memory semantics.
-            if is_shared {
+            // Reject writable shared mappings since we cannot preserve
+            // cross-host shared-memory semantics.  Read-only shared mappings
+            // (e.g. glibc's MAP_SHARED locale-archive) are snapshotted and
+            // restored as private copies — we clear is_shared so the restore
+            // path uses MAP_PRIVATE, avoiding elevated VM_MAYWRITE.
+            let snapshot_as_shared = if is_shared && flags.contains(VmFlags::VM_WRITE) {
                 reject.push(super::fork_snapshot::ForkRejectReason::SharedMapping {
                     addr: range.start,
                     len: range.end - range.start,
                 });
-            }
+                true
+            } else {
+                // Non-rejected shared mappings become private on restore.
+                false
+            };
 
             let len = range.end - range.start;
             let readable = flags.contains(VmFlags::VM_READ);
@@ -3645,7 +3652,7 @@ impl<FS: ShimFS> Task<FS> {
                 len,
                 permissions: flags.bits() & VmFlags::VM_ACCESS_FLAGS.bits(),
                 vm_flags: flags.bits(),
-                is_shared,
+                is_shared: snapshot_as_shared,
                 data,
             });
         }
