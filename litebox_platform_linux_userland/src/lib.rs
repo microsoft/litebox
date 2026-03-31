@@ -1534,6 +1534,16 @@ impl LinuxUserland {
         }
     }
 
+    /// Duplicate a host OS file descriptor with `O_CLOEXEC` set.
+    pub fn dup_host_fd(&self, fd: i32) -> Result<i32, litebox_common_linux::errno::Errno> {
+        // Safety: fd is a valid host FD.
+        let new_fd = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 3) };
+        if new_fd < 0 {
+            return Err(litebox_common_linux::errno::Errno::EMFILE);
+        }
+        Ok(new_fd)
+    }
+
     /// Create a host OS pipe pair.
     ///
     /// Returns `(read_fd, write_fd)` as raw file descriptor numbers.

@@ -2790,6 +2790,11 @@ impl<FS: ShimFS> Task<FS> {
 
             // Gather child's pipe FDs with their directions and pair IDs.
             let mut child_pipes: Vec<(usize, HostPipeDirection, usize)> = Vec::new();
+            // Gather child's host-backed pipe TypedFds (from prior delayed-fork bridges).
+            let mut child_host_pipe_fds: Vec<(
+                usize,
+                alloc::sync::Arc<litebox::fd::TypedFd<super::host_pipe::HostPipeSubsystem>>,
+            )> = Vec::new();
             for raw_fd in rds.iter_alive() {
                 if let Ok(typed) =
                     rds.fd_from_raw_integer::<litebox::pipes::Pipes<crate::Platform>>(raw_fd)
@@ -2803,10 +2808,32 @@ impl<FS: ShimFS> Task<FS> {
                         continue;
                     };
                     child_pipes.push((raw_fd, direction, pair_id));
+                } else if let Ok(typed) =
+                    rds.fd_from_raw_integer::<super::host_pipe::HostPipeSubsystem>(raw_fd)
+                {
+                    // Already host-backed — collect for later extraction
+                    // (need descriptor_table lock which we acquire after rds).
+                    child_host_pipe_fds.push((raw_fd, typed));
                 }
             }
             drop(rds);
             drop(files);
+
+            // Extract OS fd + direction from collected host-pipe TypedFds.
+            // Done after dropping rds to maintain dt→rds lock ordering.
+            let mut child_host_pipes: Vec<(usize, i32, HostPipeDirection)> = Vec::new();
+            {
+                let dt = self.global.litebox.descriptor_table();
+                for (raw_fd, typed) in &child_host_pipe_fds {
+                    if let Some((host_fd, direction)) = dt
+                        .with_entry(typed, |e: &super::host_pipe::HostPipeFd| {
+                            (e.raw_fd(), e.direction)
+                        })
+                    {
+                        child_host_pipes.push((*raw_fd, host_fd, direction));
+                    }
+                }
+            }
 
             let mut parent_replacements: Vec<crate::PipeReplacement> = Vec::new();
 
@@ -2862,6 +2889,34 @@ impl<FS: ShimFS> Task<FS> {
                     // No counterpart in parent — the parent may have already
                     // closed this end (broken pipe). Close the unused OS end.
                     self.global.platform.close_host_fd(parent_os_fd);
+                }
+            }
+
+            // Host-backed pipes (from prior delayed-fork bridges) are already
+            // backed by real OS fds.  We dup the fd so that the parent keeps
+            // its original fd intact after spawn closes bridge fds.
+            for &(guest_fd, host_fd, direction) in &child_host_pipes {
+                match self.global.platform.dup_host_fd(host_fd) {
+                    Ok(dup_fd) => child_pipe_bridges.push((guest_fd, dup_fd, direction)),
+                    Err(_e) => {
+                        #[cfg(feature = "trace_syscalls")]
+                        litebox::log_println!(
+                            self.global.platform,
+                            "[DELAYED-FORK] pid={}: dup_host_fd({}) failed: {}",
+                            self.pid,
+                            host_fd,
+                            _e,
+                        );
+                        // Close any already-created bridge fds.
+                        for &(_, os_fd, _) in &child_pipe_bridges {
+                            self.global.platform.close_host_fd(os_fd);
+                        }
+                        for pr in &parent_replacements {
+                            self.global.platform.close_host_fd(pr.host_fd);
+                        }
+                        put_fc_back(self, fc);
+                        return Err(Errno::ENOMEM);
+                    }
                 }
             }
 
@@ -3551,6 +3606,11 @@ impl<FS: ShimFS> Task<FS> {
                 } else if let Ok(fd) =
                     rds.fd_from_raw_integer::<litebox::pipes::Pipes<crate::Platform>>(raw_fd)
                 {
+                    (FdClass::Pipe, Some(fd.object_id()), None)
+                } else if let Ok(fd) =
+                    rds.fd_from_raw_integer::<super::host_pipe::HostPipeSubsystem>(raw_fd)
+                {
+                    // Host-backed pipe (from a prior delayed-fork bridge).
                     (FdClass::Pipe, Some(fd.object_id()), None)
                 } else if let Ok(fd) =
                     rds.fd_from_raw_integer::<super::eventfd::EventfdSubsystem>(raw_fd)
