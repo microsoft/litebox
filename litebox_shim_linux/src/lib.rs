@@ -131,6 +131,18 @@ impl<FS: ShimFS> LinuxShimEntrypoints<FS> {
             drop(rds);
             let _ = files.fs.close(&old_fs);
             rds = files.raw_descriptor_store.write();
+        } else if let Ok(old_sock) =
+            rds.fd_consume_raw_integer::<syscalls::unix::UnixSocketSubsystem<FS>>(guest_fd)
+        {
+            // Remove descriptor table entry to avoid leaking the socket.
+            drop(rds);
+            let _ = self
+                .task
+                .global
+                .litebox
+                .descriptor_table_mut()
+                .remove(&old_sock);
+            rds = files.raw_descriptor_store.write();
         }
 
         // Install the HostPipe FD at the same guest fd number.
@@ -3178,21 +3190,26 @@ pub(crate) struct VforkParking {
     pub deferred_lie_count: core::sync::atomic::AtomicU32,
 }
 
-/// One-shot synchronization primitive for vfork parent blocking.
-///
-/// The parent creates this before spawning the child and calls [`wait`](Self::wait)
-/// after the spawn succeeds. The child holds a clone and calls [`signal`](Self::signal)
-/// when it execs or exits, unblocking the parent.
-/// Describes a single pipe endpoint that should be replaced with a host OS
+/// Which virtual subsystem the replaced fd belonged to.
+#[derive(Debug)]
+enum ReplacedSubsystem {
+    Pipe,
+    UnixSocket,
+}
+
+/// Describes a single fd endpoint that should be replaced with a host OS
 /// pipe after the delayed-fork child has been migrated.
 #[derive(Debug)]
-struct PipeReplacement {
+struct FdReplacement {
     /// The guest FD number to replace.
     guest_fd: usize,
     /// The raw host OS file descriptor for the parent's end of the pipe.
     host_fd: i32,
     /// Whether this endpoint is a read or write end.
     direction: syscalls::host_pipe::HostPipeDirection,
+    /// The virtual subsystem that owned the original fd.
+    #[allow(dead_code)] // Useful for debug logging; may drive close logic in future.
+    subsystem: ReplacedSubsystem,
 }
 
 struct VforkDone {
@@ -3200,9 +3217,9 @@ struct VforkDone {
     /// Waker for the parent thread — calling `wake()` causes the parent's
     /// `wait_until` loop to re-evaluate the done flag.
     parent_waker: litebox::event::wait::Waker<Platform>,
-    /// Pipe replacements the parent should apply after VforkDone is signaled.
+    /// FD replacements the parent should apply after VforkDone is signaled.
     /// Filled by `commit_delayed_fork`, consumed by `do_fork` after resume.
-    pipe_replacements: litebox::sync::Mutex<Platform, Vec<PipeReplacement>>,
+    fd_replacements: litebox::sync::Mutex<Platform, Vec<FdReplacement>>,
 }
 
 impl VforkDone {
@@ -3210,7 +3227,7 @@ impl VforkDone {
         Self {
             done: core::sync::atomic::AtomicBool::new(false),
             parent_waker,
-            pipe_replacements: litebox::sync::Mutex::new(Vec::new()),
+            fd_replacements: litebox::sync::Mutex::new(Vec::new()),
         }
     }
 
@@ -3291,6 +3308,11 @@ struct ForkContext {
     /// Used by `commit_delayed_fork` to find the parent's counterpart pipe endpoints
     /// so both sides can be replaced with real OS pipes.
     parent_pipe_fds: Vec<(usize, syscalls::host_pipe::HostPipeDirection, usize)>,
+    /// Snapshot of the parent's Unix socket FDs at fork time:
+    /// (guest_fd, socket_pair_id, object_id).
+    /// Used by `commit_delayed_fork` to find the parent's peer socket endpoints
+    /// so both sides can be bridged with real OS pipes.
+    parent_unix_socket_fds: Vec<(usize, usize, u64)>,
 }
 
 const SHELL_WRITE_SCAN_LEN: usize = 1024;

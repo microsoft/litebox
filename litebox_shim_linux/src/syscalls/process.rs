@@ -2353,6 +2353,41 @@ impl<FS: ShimFS> Task<FS> {
                     }
                     pipe_fds
                 },
+                parent_unix_socket_fds: {
+                    let files = self.files.borrow();
+                    let rds = files.raw_descriptor_store.read();
+                    // Collect TypedFds under rds, then drop rds before
+                    // acquiring dt to maintain dt → rds lock ordering.
+                    let mut typed_sockets: Vec<(
+                        usize,
+                        alloc::sync::Arc<
+                            litebox::fd::TypedFd<super::unix::UnixSocketSubsystem<FS>>,
+                        >,
+                    )> = Vec::new();
+                    for raw_fd in rds.iter_alive() {
+                        if let Ok(typed) =
+                            rds.fd_from_raw_integer::<super::unix::UnixSocketSubsystem<FS>>(raw_fd)
+                        {
+                            typed_sockets.push((raw_fd, typed));
+                        }
+                    }
+                    drop(rds);
+
+                    let mut socket_fds = Vec::new();
+                    let dt = self.global.litebox.descriptor_table();
+                    for (raw_fd, typed) in &typed_sockets {
+                        let pair_id = dt
+                            .with_entry(typed, |sock: &super::unix::UnixSocket<FS>| {
+                                sock.socket_pair_id()
+                            })
+                            .flatten();
+                        if let Some(pair_id) = pair_id {
+                            socket_fds.push((*raw_fd, pair_id, typed.object_id().as_u64()));
+                        }
+                    }
+                    drop(dt);
+                    socket_fds
+                },
             };
             (
                 self.process_state.clone(),                  // share parent's PM
@@ -2585,23 +2620,24 @@ impl<FS: ShimFS> Task<FS> {
                 self.restore_cow_layer(cow, true);
             }
 
-            // Apply pipe replacements deposited by commit_delayed_fork.
-            // The parent's virtual pipe endpoints are replaced with HostPipe
-            // FDs that do direct I/O on the real OS pipes connecting to the
-            // migrated child.
-            let replacements: Vec<crate::PipeReplacement> =
-                vd.pipe_replacements.lock().drain(..).collect();
+            // Apply fd replacements deposited by commit_delayed_fork.
+            // The parent's virtual pipe/socket endpoints are replaced with
+            // HostPipe FDs that do direct I/O on the real OS pipes connecting
+            // to the migrated child.
+            let replacements: Vec<crate::FdReplacement> =
+                vd.fd_replacements.lock().drain(..).collect();
             if !replacements.is_empty() {
                 let files = self.files.borrow();
                 for repl in replacements {
                     #[cfg(feature = "trace_syscalls")]
                     litebox::log_println!(
                         self.global.platform,
-                        "[PIPE-REPLACE] pid={}: replacing guest_fd={} with HostPipeFd(host_fd={}, dir={:?})",
+                        "[FD-REPLACE] pid={}: replacing guest_fd={} with HostPipeFd(host_fd={}, dir={:?}, subsystem={:?})",
                         self.pid,
                         repl.guest_fd,
                         repl.host_fd,
                         repl.direction,
+                        repl.subsystem,
                     );
                     let entry = super::host_pipe::HostPipeFd::new(repl.host_fd, repl.direction);
                     let mut dt = self.global.litebox.descriptor_table_mut();
@@ -2609,27 +2645,41 @@ impl<FS: ShimFS> Task<FS> {
                         dt.insert(entry);
                     drop(dt);
 
-                    // Consume the old virtual pipe and install the HostPipe FD
+                    // Consume the old virtual fd and install the HostPipe FD
                     // under the rds lock, then drop the lock before closing the
                     // old pipe to maintain the lock ordering invariant
                     // (descriptor_table → rds, never rds → descriptor_table).
                     let old_pipe;
+                    let old_socket;
                     {
                         let mut rds = files.raw_descriptor_store.write();
-                        old_pipe = rds
+                        let consumed_pipe = rds
                             .fd_consume_raw_integer::<litebox::pipes::Pipes<crate::Platform>>(
                                 repl.guest_fd,
                             )
                             .ok();
+                        let consumed_socket = if consumed_pipe.is_none() {
+                            rds.fd_consume_raw_integer::<super::unix::UnixSocketSubsystem<FS>>(
+                                repl.guest_fd,
+                            )
+                            .ok()
+                        } else {
+                            None
+                        };
+                        old_pipe = consumed_pipe;
+                        old_socket = consumed_socket;
                         let ok = rds.fd_into_specific_raw_integer(typed_fd, repl.guest_fd);
-                        debug_assert!(
-                            ok,
-                            "pipe replacement: slot {} still occupied",
-                            repl.guest_fd
-                        );
+                        debug_assert!(ok, "fd replacement: slot {} still occupied", repl.guest_fd);
                     }
                     if let Some(old_typed) = old_pipe {
                         let _ = self.global.pipes.close(&old_typed);
+                    }
+                    if let Some(old_typed) = old_socket {
+                        let _ = self
+                            .global
+                            .litebox
+                            .descriptor_table_mut()
+                            .remove(&old_typed);
                     }
                 }
             }
@@ -2788,7 +2838,7 @@ impl<FS: ShimFS> Task<FS> {
         // so that parent and child can communicate across host processes.
         //
         // child_pipe_bridges: (guest_fd, child_os_fd, direction)
-        // parent_pipe_replacements: stored in VforkDone for the parent to apply.
+        // parent_fd_replacements: stored in VforkDone for the parent to apply.
         let mut child_pipe_bridges: Vec<(usize, i32, super::host_pipe::HostPipeDirection)> =
             Vec::new();
         {
@@ -2844,7 +2894,7 @@ impl<FS: ShimFS> Task<FS> {
                 }
             }
 
-            let mut parent_replacements: Vec<crate::PipeReplacement> = Vec::new();
+            let mut parent_replacements: Vec<crate::FdReplacement> = Vec::new();
 
             for &(child_fd, child_dir, child_pair_id) in &child_pipes {
                 // Create a real OS pipe pair.
@@ -2940,10 +2990,11 @@ impl<FS: ShimFS> Task<FS> {
                     .iter()
                     .find(|&&(_, dir, pair_id)| dir == parent_dir && pair_id == child_pair_id)
                 {
-                    parent_replacements.push(crate::PipeReplacement {
+                    parent_replacements.push(crate::FdReplacement {
                         guest_fd: parent_fd,
                         host_fd: parent_os_fd,
                         direction: parent_dir,
+                        subsystem: crate::ReplacedSubsystem::Pipe,
                     });
                 } else {
                     // No counterpart in parent — the parent may have already
@@ -2980,10 +3031,315 @@ impl<FS: ShimFS> Task<FS> {
                 }
             }
 
+            // --- Unix socket bridging (stdio slots only) ---
+            // For each connected Unix socket on fd 0/1/2 in the child's
+            // table, create an OS pipe bridge so parent and child communicate
+            // across host processes after migration.
+            {
+                // Collect child unix socket fds on stdio slots.
+                struct ChildSocketInfo<S: litebox::fd::FdEnabledSubsystem> {
+                    child_fd: usize,
+                    direction: super::host_pipe::HostPipeDirection,
+                    pair_id: usize,
+                    object_id: u64,
+                    typed: alloc::sync::Arc<litebox::fd::TypedFd<S>>,
+                }
+
+                // Collect TypedFds under rds, then drop rds before
+                // acquiring dt to maintain dt → rds lock ordering.
+                let typed_stdio_sockets: Vec<(
+                    usize,
+                    alloc::sync::Arc<litebox::fd::TypedFd<super::unix::UnixSocketSubsystem<FS>>>,
+                )> = {
+                    let files = self.files.borrow();
+                    let rds = files.raw_descriptor_store.read();
+                    let mut out = Vec::new();
+                    for raw_fd in 0..=2usize {
+                        if let Ok(typed) =
+                            rds.fd_from_raw_integer::<super::unix::UnixSocketSubsystem<FS>>(raw_fd)
+                        {
+                            out.push((raw_fd, typed));
+                        }
+                    }
+                    out
+                    // rds and files dropped here
+                };
+
+                let mut child_sockets: Vec<ChildSocketInfo<super::unix::UnixSocketSubsystem<FS>>> =
+                    Vec::new();
+                {
+                    let dt = self.global.litebox.descriptor_table();
+                    for (raw_fd, typed) in &typed_stdio_sockets {
+                        let pair_id = dt
+                            .with_entry(typed, |sock: &super::unix::UnixSocket<FS>| {
+                                sock.socket_pair_id()
+                            })
+                            .flatten();
+                        if let Some(pair_id) = pair_id {
+                            let direction = if *raw_fd == 0 {
+                                HostPipeDirection::Read
+                            } else {
+                                HostPipeDirection::Write
+                            };
+                            child_sockets.push(ChildSocketInfo {
+                                child_fd: *raw_fd,
+                                direction,
+                                pair_id,
+                                object_id: typed.object_id().as_u64(),
+                                typed: typed.clone(),
+                            });
+                        }
+                    }
+                }
+
+                // Bidirectional conflict: reject if the same socket pair
+                // appears on both a Read and a Write slot. Different ends
+                // of the same socketpair have different object_ids but
+                // share the same pair_id.
+                for a in &child_sockets {
+                    for b in &child_sockets {
+                        if a.pair_id == b.pair_id && a.direction != b.direction {
+                            #[cfg(feature = "trace_syscalls")]
+                            litebox::log_println!(
+                                self.global.platform,
+                                "[DELAYED-FORK] pid={}: bidirectional socket on stdio slots {} and {}",
+                                self.pid,
+                                a.child_fd,
+                                b.child_fd,
+                            );
+                            // Clean up any already-created OS pipe fds.
+                            for &(_, os_fd, _) in &child_pipe_bridges {
+                                self.global.platform.close_host_fd(os_fd);
+                            }
+                            for pr in &parent_replacements {
+                                self.global.platform.close_host_fd(pr.host_fd);
+                            }
+                            put_fc_back(self, fc);
+                            return Err(Errno::ENOSYS);
+                        }
+                    }
+                }
+
+                // Track already-bridged object IDs to dedup dup'd sockets.
+                // (object_id, os_fd_for_child, direction)
+                let mut bridged_objects: Vec<(u64, i32, HostPipeDirection)> = Vec::new();
+
+                for info in &child_sockets {
+                    // Dedup: if same object_id already bridged with same
+                    // direction, dup the existing child OS fd.
+                    if let Some(&(_, existing_os_fd, _)) = bridged_objects
+                        .iter()
+                        .find(|(oid, _, dir)| *oid == info.object_id && *dir == info.direction)
+                    {
+                        match self.global.platform.dup_host_fd(existing_os_fd) {
+                            Ok(dup_fd) => {
+                                child_pipe_bridges.push((info.child_fd, dup_fd, info.direction));
+                            }
+                            Err(_e) => {
+                                #[cfg(feature = "trace_syscalls")]
+                                litebox::log_println!(
+                                    self.global.platform,
+                                    "[DELAYED-FORK] pid={}: dup_host_fd({}) failed for socket dedup: {}",
+                                    self.pid,
+                                    existing_os_fd,
+                                    _e,
+                                );
+                                for &(_, os_fd, _) in &child_pipe_bridges {
+                                    self.global.platform.close_host_fd(os_fd);
+                                }
+                                for pr in &parent_replacements {
+                                    self.global.platform.close_host_fd(pr.host_fd);
+                                }
+                                put_fc_back(self, fc);
+                                return Err(Errno::ENOMEM);
+                            }
+                        }
+                        continue;
+                    }
+
+                    // Create OS pipe pair.
+                    let (os_read, os_write) = match self.global.platform.create_host_pipe() {
+                        Ok(pair) => pair,
+                        Err(_e) => {
+                            #[cfg(feature = "trace_syscalls")]
+                            litebox::log_println!(
+                                self.global.platform,
+                                "[DELAYED-FORK] pid={}: create_host_pipe failed for socket bridge: {}",
+                                self.pid,
+                                _e,
+                            );
+                            for &(_, os_fd, _) in &child_pipe_bridges {
+                                self.global.platform.close_host_fd(os_fd);
+                            }
+                            for pr in &parent_replacements {
+                                self.global.platform.close_host_fd(pr.host_fd);
+                            }
+                            put_fc_back(self, fc);
+                            return Err(Errno::ENOMEM);
+                        }
+                    };
+
+                    let (child_os_fd, parent_os_fd) = match info.direction {
+                        HostPipeDirection::Read => (os_read, os_write),
+                        HostPipeDirection::Write => (os_write, os_read),
+                    };
+
+                    // G4: Drain recv_channel into OS pipe for Read direction.
+                    if info.direction == HostPipeDirection::Read {
+                        let dt = self.global.litebox.descriptor_table();
+                        let msgs: Vec<super::unix::Message> = dt
+                            .with_entry(&info.typed, |sock: &super::unix::UnixSocket<FS>| {
+                                let mut msgs = Vec::new();
+                                while let Some(msg) = sock.drain_recv_one() {
+                                    msgs.push(msg);
+                                }
+                                msgs
+                            })
+                            .unwrap_or_default();
+                        drop(dt);
+
+                        // Reject if any message carries SCM_RIGHTS fds —
+                        // we cannot transfer fds across host processes.
+                        for msg in &msgs {
+                            if !msg.passed_fds.is_empty() {
+                                #[cfg(feature = "trace_syscalls")]
+                                litebox::log_println!(
+                                    self.global.platform,
+                                    "[DELAYED-FORK] pid={}: SCM_RIGHTS on socket fd={}, cannot bridge",
+                                    self.pid,
+                                    info.child_fd,
+                                );
+                                self.global.platform.close_host_fd(child_os_fd);
+                                self.global.platform.close_host_fd(parent_os_fd);
+                                for &(_, os_fd, _) in &child_pipe_bridges {
+                                    self.global.platform.close_host_fd(os_fd);
+                                }
+                                for pr in &parent_replacements {
+                                    self.global.platform.close_host_fd(pr.host_fd);
+                                }
+                                put_fc_back(self, fc);
+                                return Err(Errno::ENOSYS);
+                            }
+                        }
+
+                        // Accumulate all drained data, then write in one
+                        // shot after setting the pipe capacity once.
+                        let mut drain_data: Vec<u8> = Vec::new();
+                        for msg in msgs {
+                            drain_data.extend_from_slice(&msg.data);
+                        }
+
+                        if !drain_data.is_empty() {
+                            let capacity = i32::try_from(drain_data.len())
+                                .unwrap_or(i32::MAX)
+                                .saturating_add(4096);
+                            self.global
+                                .platform
+                                .try_set_pipe_capacity(parent_os_fd, capacity);
+
+                            #[cfg(feature = "trace_syscalls")]
+                            litebox::log_println!(
+                                self.global.platform,
+                                "[DELAYED-FORK] pid={}: drained {} bytes from socket fd={} into OS pipe",
+                                self.pid,
+                                drain_data.len(),
+                                info.child_fd,
+                            );
+                            let mut offset = 0;
+                            while offset < drain_data.len() {
+                                match self
+                                    .global
+                                    .platform
+                                    .write_host_fd(parent_os_fd, &drain_data[offset..])
+                                {
+                                    Ok(n) => offset += n,
+                                    Err(_e) => {
+                                        #[cfg(feature = "trace_syscalls")]
+                                        litebox::log_println!(
+                                            self.global.platform,
+                                            "[DELAYED-FORK] pid={}: drain write failed for socket fd={}: {}",
+                                            self.pid,
+                                            info.child_fd,
+                                            _e,
+                                        );
+                                        // Drain failure is fatal — data
+                                        // was already consumed from the
+                                        // virtual channel.
+                                        self.global.platform.close_host_fd(child_os_fd);
+                                        self.global.platform.close_host_fd(parent_os_fd);
+                                        for &(_, os_fd, _) in &child_pipe_bridges {
+                                            self.global.platform.close_host_fd(os_fd);
+                                        }
+                                        for pr in &parent_replacements {
+                                            self.global.platform.close_host_fd(pr.host_fd);
+                                        }
+                                        put_fc_back(self, fc);
+                                        return Err(Errno::EIO);
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    bridged_objects.push((info.object_id, child_os_fd, info.direction));
+                    child_pipe_bridges.push((info.child_fd, child_os_fd, info.direction));
+
+                    // Find ALL parent peers (same pair_id, different object_id).
+                    let parent_dir = match info.direction {
+                        HostPipeDirection::Read => HostPipeDirection::Write,
+                        HostPipeDirection::Write => HostPipeDirection::Read,
+                    };
+
+                    let mut found_parent = false;
+                    for &(parent_fd, parent_pair_id, parent_oid) in &fc.parent_unix_socket_fds {
+                        if parent_pair_id == info.pair_id && parent_oid != info.object_id {
+                            let parent_host_fd = if found_parent {
+                                // Multiple parent fds alias the same peer — dup
+                                // the OS pipe end for each.
+                                match self.global.platform.dup_host_fd(parent_os_fd) {
+                                    Ok(fd) => fd,
+                                    Err(_e) => {
+                                        #[cfg(feature = "trace_syscalls")]
+                                        litebox::log_println!(
+                                            self.global.platform,
+                                            "[DELAYED-FORK] pid={}: dup_host_fd({}) failed for parent alias: {}",
+                                            self.pid,
+                                            parent_os_fd,
+                                            _e,
+                                        );
+                                        for &(_, os_fd, _) in &child_pipe_bridges {
+                                            self.global.platform.close_host_fd(os_fd);
+                                        }
+                                        for pr in &parent_replacements {
+                                            self.global.platform.close_host_fd(pr.host_fd);
+                                        }
+                                        put_fc_back(self, fc);
+                                        return Err(Errno::ENOMEM);
+                                    }
+                                }
+                            } else {
+                                parent_os_fd
+                            };
+                            found_parent = true;
+                            parent_replacements.push(crate::FdReplacement {
+                                guest_fd: parent_fd,
+                                host_fd: parent_host_fd,
+                                direction: parent_dir,
+                                subsystem: crate::ReplacedSubsystem::UnixSocket,
+                            });
+                        }
+                    }
+
+                    if !found_parent {
+                        self.global.platform.close_host_fd(parent_os_fd);
+                    }
+                }
+            }
+
             // Store parent replacements in VforkDone for the parent to apply
             // after resume.
             if !parent_replacements.is_empty() {
-                *fc.vfork_done.pipe_replacements.lock() = parent_replacements;
+                *fc.vfork_done.fd_replacements.lock() = parent_replacements;
             }
 
             #[cfg(feature = "trace_syscalls")]
@@ -3033,7 +3389,7 @@ impl<FS: ShimFS> Task<FS> {
                 for &(_, os_fd, _) in &child_pipe_bridges {
                     self.global.platform.close_host_fd(os_fd);
                 }
-                for pr in fc.vfork_done.pipe_replacements.lock().drain(..) {
+                for pr in fc.vfork_done.fd_replacements.lock().drain(..) {
                     self.global.platform.close_host_fd(pr.host_fd);
                 }
                 put_fc_back(self, fc);
@@ -3073,7 +3429,7 @@ impl<FS: ShimFS> Task<FS> {
                     self.global.platform.close_host_fd(os_fd);
                 }
                 // Clean up parent-side OS pipe FDs on failure.
-                for pr in fc.vfork_done.pipe_replacements.lock().drain(..) {
+                for pr in fc.vfork_done.fd_replacements.lock().drain(..) {
                     self.global.platform.close_host_fd(pr.host_fd);
                 }
                 put_fc_back(self, fc);
@@ -3714,6 +4070,13 @@ impl<FS: ShimFS> Task<FS> {
             // Accept stdio, pipes, terminal filesystem fds, connected
             // Unix sockets on stdio slots, and non-terminal filesystem fds
             // on stdio slots (e.g. /dev/null redirections).
+            //
+            // NOTE: The gate intentionally does not validate socket type
+            // (stream vs datagram), connection state, or O_NONBLOCK here.
+            // Its purpose is to avoid false rejections — rejecting forks
+            // that could succeed. Detailed validation happens at commit
+            // time in commit_delayed_fork, where failure kills the child
+            // with proper cleanup (same pattern as pipe bridging).
             match class {
                 FdClass::StdioFd | FdClass::Pipe => {}
                 FdClass::FilesystemFd if terminal_meta.is_some() => {}
@@ -5283,7 +5646,7 @@ impl<FS: ShimFS> Task<FS> {
         if let Some((vd, ref parent_pipe_fds)) = vfork_info {
             use super::host_pipe::HostPipeDirection;
 
-            let mut replacements: alloc::vec::Vec<crate::PipeReplacement> = alloc::vec::Vec::new();
+            let mut replacements: alloc::vec::Vec<crate::FdReplacement> = alloc::vec::Vec::new();
             for dp in &spawn_result.direct_pipes {
                 // Find the pipe_pair_id for this child stdio fd.
                 let Some(&(_, pair_id)) = stdio_pipe_pair_ids
@@ -5305,10 +5668,11 @@ impl<FS: ShimFS> Task<FS> {
                     .iter()
                     .find(|&&(_, dir, pid)| dir == parent_dir && pid == pair_id)
                 {
-                    replacements.push(crate::PipeReplacement {
+                    replacements.push(crate::FdReplacement {
                         guest_fd: parent_fd,
                         host_fd: dp.parent_os_fd,
                         direction: parent_dir,
+                        subsystem: crate::ReplacedSubsystem::Pipe,
                     });
                 } else {
                     // No counterpart in parent — close unused OS end.
@@ -5317,7 +5681,7 @@ impl<FS: ShimFS> Task<FS> {
             }
 
             if !replacements.is_empty() {
-                *vd.pipe_replacements.lock() = replacements;
+                *vd.fd_replacements.lock() = replacements;
             }
             vd.signal();
         }

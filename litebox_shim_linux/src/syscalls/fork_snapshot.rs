@@ -381,6 +381,11 @@ pub enum ForkRejectReason {
     SharedMappingNoBackingPath { addr: usize, len: usize },
     /// inotify state is present.
     InotifyPresent,
+    /// A bidirectional Unix socket occupies both a read and a write stdio slot.
+    /// Detected and rejected at commit time in `commit_delayed_fork`; kept here
+    /// for diagnostic completeness in rejection reporting.
+    #[allow(dead_code)]
+    BidirectionalSocketOnMultipleStdioSlots,
 }
 
 #[cfg(test)]
@@ -404,6 +409,10 @@ impl PartialEq for ForkRejectReason {
                 Self::SharedMappingNoBackingPath { addr: a2, len: l2 },
             ) => a1 == a2 && l1 == l2,
             (Self::InotifyPresent, Self::InotifyPresent) => true,
+            (
+                Self::BidirectionalSocketOnMultipleStdioSlots,
+                Self::BidirectionalSocketOnMultipleStdioSlots,
+            ) => true,
             _ => false,
         }
     }
@@ -1208,6 +1217,9 @@ impl core::fmt::Display for ForkRejectReasons {
                 }
                 ForkRejectReason::InotifyPresent => {
                     write!(f, "inotify instances present")?;
+                }
+                ForkRejectReason::BidirectionalSocketOnMultipleStdioSlots => {
+                    write!(f, "bidirectional Unix socket on multiple stdio slots")?;
                 }
             }
         }

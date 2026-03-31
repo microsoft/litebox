@@ -454,10 +454,10 @@ impl<FS: ShimFS> AddrView<FS> {
 pub(super) use litebox::fd::PassedFd;
 
 /// A message sent over a Unix socket.
-struct Message {
-    data: Vec<u8>,
+pub(crate) struct Message {
+    pub(crate) data: Vec<u8>,
     /// File descriptors passed via `SCM_RIGHTS` ancillary data.
-    passed_fds: Vec<PassedFd>,
+    pub(crate) passed_fds: Vec<PassedFd>,
 }
 
 /// Represents a connected Unix stream socket.
@@ -486,7 +486,6 @@ impl<FS: ShimFS> UnixConnectedStream<FS> {
     ///
     /// Stable across `clone_for_fork` because both clones share the same
     /// underlying `Arc` allocations.
-    #[allow(dead_code)] // Used in G2+ (Unix socket fork bridging)
     pub(crate) fn socket_pair_id(&self) -> usize {
         let recv_ptr = self.recv_channel.endpoint_ptr() as usize;
         let send_peer_ptr = self.connected_send_channel.peer_ptr() as usize;
@@ -1375,12 +1374,34 @@ impl<FS: ShimFS> UnixSocket<FS> {
 
     /// Returns a pair identifier for connected stream sockets, or `None`
     /// for init/listen/datagram sockets.
-    #[allow(dead_code)] // Used in G2+ (Unix socket fork bridging)
     pub(crate) fn socket_pair_id(&self) -> Option<usize> {
         match &self.inner {
             UnixSocketInner::Stream(stream) => {
                 stream.with_state_ref(|s| s.connected().map(UnixConnectedStream::socket_pair_id))
             }
+            UnixSocketInner::Datagram(_) => None,
+        }
+    }
+
+    /// Pop one message from the recv channel (connected stream only).
+    /// Returns `None` if empty, not connected, or datagram.
+    pub(crate) fn drain_recv_one(&self) -> Option<Message> {
+        match &self.inner {
+            UnixSocketInner::Stream(stream) => stream.with_state_ref(|s| {
+                s.connected().and_then(|c| {
+                    c.recv_channel
+                        .peek_and_consume_one(|msg| {
+                            Ok((
+                                true,
+                                Message {
+                                    data: core::mem::take(&mut msg.data),
+                                    passed_fds: core::mem::take(&mut msg.passed_fds),
+                                },
+                            ))
+                        })
+                        .ok()
+                })
+            }),
             UnixSocketInner::Datagram(_) => None,
         }
     }
