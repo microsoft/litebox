@@ -4078,30 +4078,41 @@ impl<FS: ShimFS> Task<FS> {
             // time in commit_delayed_fork, where failure kills the child
             // with proper cleanup (same pattern as pipe bridging).
             match class {
-                FdClass::StdioFd | FdClass::Pipe => {}
-                FdClass::FilesystemFd if terminal_meta.is_some() => {}
+                FdClass::StdioFd | FdClass::Pipe | FdClass::FilesystemFd => {}
                 FdClass::UnixSocket if raw_fd <= 2 && socket_pair_id.is_some() => {}
-                FdClass::FilesystemFd if raw_fd <= 2 => {}
                 _ => {
                     reject.push(ForkRejectReason::UnsupportedFdClass { fd: raw_fd, class });
                 }
             }
 
-            let is_non_terminal_stdio_fs =
-                class == FdClass::FilesystemFd && raw_fd <= 2 && terminal_meta.is_none();
+            let is_non_terminal_fs = class == FdClass::FilesystemFd && terminal_meta.is_none();
+
+            // Capture access mode flags for FilesystemFd so restore can
+            // reopen with the correct mode (read-only, write-only, rdwr).
+            let fs_status_flags = if class == FdClass::FilesystemFd {
+                if let Ok(fd) = rds.fd_from_raw_integer::<FS>(raw_fd) {
+                    dt.with_metadata(&fd, |crate::StdioStatusFlags(flags)| flags.bits())
+                        .unwrap_or(0)
+                } else {
+                    0
+                }
+            } else {
+                0
+            };
 
             entries.push(FdEntrySnapshot {
                 fd: raw_fd,
                 class,
-                fd_flags: 0,     // TODO: read FD_CLOEXEC in a later phase
-                status_flags: 0, // TODO: read O_NONBLOCK etc. in a later phase
+                fd_flags: 0, // TODO: read FD_CLOEXEC in a later phase
+                status_flags: fs_status_flags,
                 object_id: object_id.map_or(0, litebox::fd::DescriptorObjectId::as_u64),
                 metadata: terminal_meta.unwrap_or_default(),
             });
 
-            // For non-terminal FilesystemFd on stdio slots, capture the
-            // reopen path so restore can reopen the file (e.g. /dev/null).
-            if is_non_terminal_stdio_fs && let Ok(fd) = rds.fd_from_raw_integer::<FS>(raw_fd) {
+            // For non-terminal FilesystemFd, capture the reopen path so
+            // restore can reopen the file (e.g. /dev/null, /dev/tty, or
+            // bash's saved fd 255).
+            if is_non_terminal_fs && let Ok(fd) = rds.fd_from_raw_integer::<FS>(raw_fd) {
                 let path = files.fs.fd_path(&fd);
                 open_file_descriptions.push(super::fork_snapshot::OpenFileDescriptionSnapshot {
                     object_id: fd.object_id().as_u64(),

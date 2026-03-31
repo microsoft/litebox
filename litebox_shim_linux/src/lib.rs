@@ -584,11 +584,14 @@ impl<FS: ShimFS> LinuxShim<FS> {
                 }
                 Errno::ENOMEM
             })?;
-            let range = self
-                .global
-                .platform
-                .address_space_range(id)
-                .map_err(|_| Errno::ENOMEM)?;
+            let range = self.global.platform.address_space_range(id).map_err(|_| {
+                // Clean up the just-created slot and all temp slots.
+                let _ = self.global.platform.destroy_address_space(id);
+                for &s in &temp_slots {
+                    let _ = self.global.platform.destroy_address_space(s);
+                }
+                Errno::ENOMEM
+            })?;
             if range.start <= snapshot_va_start && snapshot_va_start < range.end {
                 break id;
             }
@@ -966,12 +969,11 @@ impl<FS: ShimFS> LinuxShim<FS> {
                 drop(dt);
             }
 
-            // Restore non-terminal FilesystemFd on stdio slots (e.g.,
-            // /dev/null redirections).  Reopen by path if available, else
-            // fall back to /dev/null.  These replace the pre-populated
-            // stdio entries at the slot.
+            // Restore non-terminal FilesystemFd entries.  Reopen by path
+            // if available, fall back to /dev/null.  For stdio slots (0-2),
+            // consume the pre-populated entry first.
             for entry in &fd_table.entries {
-                if entry.fd > 2 || entry.class != FdClass::FilesystemFd {
+                if entry.class != FdClass::FilesystemFd {
                     continue;
                 }
                 let meta = &entry.metadata;
@@ -989,14 +991,20 @@ impl<FS: ShimFS> LinuxShim<FS> {
                     .find(|ofd| ofd.object_id == entry.object_id)
                     .and_then(|ofd| ofd.reopen_path.as_deref())
                     .unwrap_or("/dev/null");
-                let flags = if entry.fd == 0 {
-                    OFlags::RDONLY
-                } else {
-                    OFlags::WRONLY
+                // Use captured access mode, falling back to RDONLY.
+                let access_bits = entry.status_flags & 0x3; // O_ACCMODE
+                let flags = match access_bits {
+                    1 => OFlags::WRONLY,
+                    2 => OFlags::RDWR,
+                    _ => OFlags::RDONLY,
                 };
                 let Ok(fd_handle) = child_files
                     .fs
                     .open(path, flags, Mode::empty())
+                    .or_else(|_| {
+                        // Try RDONLY if the original mode failed.
+                        child_files.fs.open(path, OFlags::RDONLY, Mode::empty())
+                    })
                     .or_else(|_| {
                         child_files
                             .fs
@@ -1006,11 +1014,14 @@ impl<FS: ShimFS> LinuxShim<FS> {
                     continue;
                 };
 
-                // Consume the pre-populated entry so the slot is free.
+                // For stdio slots, consume the pre-populated entry.
+                // For higher fds, the slot is empty.
                 let mut rds = child_files.raw_descriptor_store.write();
-                let _ = rds.fd_consume_raw_integer::<FS>(entry.fd);
+                if entry.fd <= 2 {
+                    let _ = rds.fd_consume_raw_integer::<FS>(entry.fd);
+                }
                 let success = rds.fd_into_specific_raw_integer(fd_handle, entry.fd);
-                debug_assert!(success, "fd slot {} still occupied after consume", entry.fd);
+                debug_assert!(success, "fd slot {} occupied during restore", entry.fd);
                 drop(rds);
             }
         }

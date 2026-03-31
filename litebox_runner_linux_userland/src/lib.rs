@@ -1005,6 +1005,7 @@ fn run_fork_restore(cli_args: CliArgs) -> Result<()> {
         Platform::new(None)
     };
     litebox_platform_multiplex::set_platform(platform);
+    register_worker_spawn_flags(platform, &cli_args);
 
     let shim_builder = litebox_shim_linux::LinuxShimBuilder::new();
     let litebox = shim_builder.litebox();
@@ -1209,6 +1210,7 @@ fn run_worker_exec(cli_args: CliArgs) -> Result<()> {
         Platform::new(None)
     };
     litebox_platform_multiplex::set_platform(platform);
+    register_worker_spawn_flags(platform, &cli_args);
 
     let shim_builder = litebox_shim_linux::LinuxShimBuilder::new();
     let litebox = shim_builder.litebox();
