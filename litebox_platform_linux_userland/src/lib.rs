@@ -1271,6 +1271,15 @@ impl LinuxUserland {
                     return Err(-1_i32);
                 }
             }
+            WorkerExecInputBinding::HostPipe { fd } => {
+                // dup2 the host pipe fd onto stdin in the child.
+                // The fd has O_CLOEXEC but posix_spawn file actions run
+                // before exec, so dup2 succeeds and fd 0 survives exec.
+                if unsafe { libc::posix_spawn_file_actions_adddup2(file_actions_ptr, *fd, 0) } != 0
+                {
+                    return Err(-1_i32);
+                }
+            }
             WorkerExecInputBinding::Close => {
                 if unsafe { libc::posix_spawn_file_actions_addclose(file_actions_ptr, 0) } != 0 {
                     return Err(-1_i32);
@@ -1310,6 +1319,14 @@ impl LinuxUserland {
                     let source_fd = source.as_raw_fd();
                     if unsafe {
                         libc::posix_spawn_file_actions_adddup2(file_actions_ptr, source_fd, fd_num)
+                    } != 0
+                    {
+                        return Err(-1_i32);
+                    }
+                }
+                WorkerExecOutputBinding::HostPipe { fd } => {
+                    if unsafe {
+                        libc::posix_spawn_file_actions_adddup2(file_actions_ptr, *fd, fd_num)
                     } != 0
                     {
                         return Err(-1_i32);
@@ -1557,6 +1574,17 @@ impl LinuxUserland {
         Ok((fds[0], fds[1]))
     }
 
+    /// Try to enlarge a host pipe's capacity to at least `size` bytes.
+    ///
+    /// Best-effort: silently ignores errors (e.g. unprivileged processes
+    /// cannot exceed `/proc/sys/fs/pipe-max-size`).
+    pub fn try_set_pipe_capacity(&self, fd: i32, size: i32) {
+        // Safety: fd is a valid pipe fd.
+        unsafe {
+            libc::fcntl(fd, libc::F_SETPIPE_SZ, size);
+        }
+    }
+
     /// Clear the `O_CLOEXEC` flag on a host file descriptor so it survives
     /// `posix_spawn` / `exec`.
     pub fn clear_cloexec(&self, fd: i32) -> Result<(), litebox_common_linux::errno::Errno> {
@@ -1692,6 +1720,12 @@ impl LinuxUserland {
                     return Err(-1_i32);
                 }
             }
+            WorkerExecInputBinding::HostPipe { fd } => {
+                if unsafe { libc::posix_spawn_file_actions_adddup2(file_actions_ptr, *fd, 0) } != 0
+                {
+                    return Err(-1_i32);
+                }
+            }
             WorkerExecInputBinding::Close => {
                 if unsafe { libc::posix_spawn_file_actions_addclose(file_actions_ptr, 0) } != 0 {
                     return Err(-1_i32);
@@ -1714,6 +1748,14 @@ impl LinuxUserland {
                             source.as_raw_fd(),
                             fd_num,
                         )
+                    } != 0
+                    {
+                        return Err(-1_i32);
+                    }
+                }
+                WorkerExecOutputBinding::HostPipe { fd } => {
+                    if unsafe {
+                        libc::posix_spawn_file_actions_adddup2(file_actions_ptr, *fd, fd_num)
                     } != 0
                     {
                         return Err(-1_i32);
@@ -2205,6 +2247,7 @@ where
         }
         WorkerExecInputBinding::Inherit
         | WorkerExecInputBinding::HostStdio { .. }
+        | WorkerExecInputBinding::HostPipe { .. }
         | WorkerExecInputBinding::Close => None,
     }
 }
@@ -2238,6 +2281,7 @@ where
             ),
             WorkerExecOutputBinding::Inherit
             | WorkerExecOutputBinding::HostStdio { .. }
+            | WorkerExecOutputBinding::HostPipe { .. }
             | WorkerExecOutputBinding::Close => continue,
         };
         if let Some(existing) = groups.iter_mut().find(|group| group.key == key) {

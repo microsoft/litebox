@@ -149,6 +149,8 @@ pub enum WorkerExecInputBinding<
     Inherit,
     /// Duplicate one of the parent host stdio fds onto worker stdin.
     HostStdio { fd: i32 },
+    /// Duplicate a host pipe bridge fd onto worker stdin.
+    HostPipe { fd: i32 },
     /// Explicitly close the worker stdin stream before exec.
     Close,
     /// Proxy worker stdin reads from an existing guest filesystem descriptor.
@@ -174,6 +176,8 @@ pub enum WorkerExecOutputBinding<
     Inherit,
     /// Duplicate one of the parent host stdio fds onto this worker stream.
     HostStdio { fd: i32 },
+    /// Duplicate a host pipe bridge fd onto this worker stream.
+    HostPipe { fd: i32 },
     /// Explicitly close the worker stream before exec.
     Close,
     /// Proxy the worker stream into an existing guest filesystem descriptor.

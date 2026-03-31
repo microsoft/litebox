@@ -2891,6 +2891,16 @@ impl<FS: ShimFS> Task<FS> {
                         if let Ok(data) = self.global.pipes.drain_available(&typed)
                             && !data.is_empty()
                         {
+                            // Enlarge the OS pipe to hold all drained data so the
+                            // blocking write below cannot deadlock (no reader exists
+                            // yet — the child worker is spawned later).
+                            let capacity = i32::try_from(data.len())
+                                .unwrap_or(i32::MAX)
+                                .saturating_add(4096);
+                            self.global
+                                .platform
+                                .try_set_pipe_capacity(parent_os_fd, capacity);
+
                             #[cfg(feature = "trace_syscalls")]
                             litebox::log_println!(
                                 self.global.platform,
@@ -6170,11 +6180,18 @@ fn worker_exec_input_binding<FS: ShimFS>(
         return WorkerExecInputBinding::Close;
     }
 
-    // HostPipeFd: the worker will receive this fd via the pipe bridge
-    // mechanism (--pipe-bridge CLI arg) and install_host_pipe_fd will set
-    // it up.  The stdio binding should not try to wire it up separately.
-    if files.try_host_pipe_fd(raw_fd).is_some() {
-        return WorkerExecInputBinding::Inherit;
+    // HostPipeFd: the worker needs this fd dup2'd onto its stdio slot.
+    // The pipe bridge mechanism (--pipe-bridge) only applies to fork-restore,
+    // not exec.  For exec, we use posix_spawn file actions to dup2 the host
+    // fd onto the target stdio slot.
+    if let Some(hp_fd) = files.try_host_pipe_fd(raw_fd) {
+        let dt = global.litebox.descriptor_table();
+        if let Some(host_fd) = dt.with_entry(&hp_fd, |e: &super::host_pipe::HostPipeFd| e.raw_fd())
+            && host_fd >= 0
+        {
+            return WorkerExecInputBinding::HostPipe { fd: host_fd };
+        }
+        return WorkerExecInputBinding::Close;
     }
 
     let rds = files.raw_descriptor_store.read();
@@ -6286,9 +6303,15 @@ fn worker_exec_output_binding<FS: ShimFS>(
         return WorkerExecOutputBinding::Close;
     }
 
-    // HostPipeFd: handled by the pipe bridge mechanism.
-    if files.try_host_pipe_fd(raw_fd).is_some() {
-        return WorkerExecOutputBinding::Inherit;
+    // HostPipeFd: dup2 onto the target stdio slot via posix_spawn.
+    if let Some(hp_fd) = files.try_host_pipe_fd(raw_fd) {
+        let dt = global.litebox.descriptor_table();
+        if let Some(host_fd) = dt.with_entry(&hp_fd, |e: &super::host_pipe::HostPipeFd| e.raw_fd())
+            && host_fd >= 0
+        {
+            return WorkerExecOutputBinding::HostPipe { fd: host_fd };
+        }
+        return WorkerExecOutputBinding::Close;
     }
 
     let rds = files.raw_descriptor_store.read();
@@ -8073,6 +8096,9 @@ mod tests {
             }
             WorkerExecOutputBinding::Stream(_) => {
                 panic!("stderr alias should not be proxied through a guest byte stream")
+            }
+            WorkerExecOutputBinding::HostPipe { .. } => {
+                panic!("stderr alias should not be proxied through a host pipe")
             }
         }
     }
