@@ -3620,6 +3620,7 @@ impl<FS: ShimFS> Task<FS> {
         let alive_fds: Vec<usize> = rds.iter_alive().collect();
 
         let mut entries = Vec::new();
+        let mut open_file_descriptions = Vec::new();
         for raw_fd in &alive_fds {
             let raw_fd = *raw_fd;
 
@@ -3627,7 +3628,7 @@ impl<FS: ShimFS> Task<FS> {
             // the descriptor's object_id matches the original host stdio.
             // For filesystem fds, also probe terminal metadata markers so we
             // can accept terminal fds through the snapshot gate.
-            let (subsystem_class, object_id, terminal_meta) =
+            let (subsystem_class, object_id, terminal_meta, socket_pair_id) =
                 if let Ok(fd) = rds.fd_from_raw_integer::<FS>(raw_fd) {
                     let oid = Some(fd.object_id());
                     // Probe terminal metadata markers on this filesystem fd.
@@ -3658,34 +3659,41 @@ impl<FS: ShimFS> Task<FS> {
                     } else {
                         None
                     };
-                    (FdClass::FilesystemFd, oid, meta)
+                    (FdClass::FilesystemFd, oid, meta, None)
                 } else if let Ok(fd) =
                     rds.fd_from_raw_integer::<litebox::net::Network<crate::Platform>>(raw_fd)
                 {
-                    (FdClass::NetworkSocket, Some(fd.object_id()), None)
+                    (FdClass::NetworkSocket, Some(fd.object_id()), None, None)
                 } else if let Ok(fd) =
                     rds.fd_from_raw_integer::<litebox::pipes::Pipes<crate::Platform>>(raw_fd)
                 {
-                    (FdClass::Pipe, Some(fd.object_id()), None)
+                    (FdClass::Pipe, Some(fd.object_id()), None, None)
                 } else if let Ok(fd) =
                     rds.fd_from_raw_integer::<super::host_pipe::HostPipeSubsystem>(raw_fd)
                 {
                     // Host-backed pipe (from a prior delayed-fork bridge).
-                    (FdClass::Pipe, Some(fd.object_id()), None)
+                    (FdClass::Pipe, Some(fd.object_id()), None, None)
                 } else if let Ok(fd) =
                     rds.fd_from_raw_integer::<super::eventfd::EventfdSubsystem>(raw_fd)
                 {
-                    (FdClass::EventFd, Some(fd.object_id()), None)
+                    (FdClass::EventFd, Some(fd.object_id()), None, None)
                 } else if let Ok(fd) =
                     rds.fd_from_raw_integer::<super::epoll::EpollSubsystem<FS>>(raw_fd)
                 {
-                    (FdClass::Epoll, Some(fd.object_id()), None)
+                    (FdClass::Epoll, Some(fd.object_id()), None, None)
                 } else if let Ok(fd) =
                     rds.fd_from_raw_integer::<super::unix::UnixSocketSubsystem<FS>>(raw_fd)
                 {
-                    (FdClass::UnixSocket, Some(fd.object_id()), None)
+                    let dt_inner = self.global.litebox.descriptor_table();
+                    let pair_id = dt_inner
+                        .with_entry(&fd, |sock: &super::unix::UnixSocket<FS>| {
+                            sock.socket_pair_id()
+                        })
+                        .flatten();
+                    drop(dt_inner);
+                    (FdClass::UnixSocket, Some(fd.object_id()), None, pair_id)
                 } else {
-                    (FdClass::Other, None, None)
+                    (FdClass::Other, None, None, None)
                 };
 
             // Promote to StdioFd only if this fd sits at a stdio slot AND
@@ -3703,15 +3711,21 @@ impl<FS: ShimFS> Task<FS> {
                 subsystem_class
             };
 
-            // Accept stdio, pipes, and terminal filesystem fds (fds with
-            // host tty/pty metadata that can be reconnected on the worker).
+            // Accept stdio, pipes, terminal filesystem fds, connected
+            // Unix sockets on stdio slots, and non-terminal filesystem fds
+            // on stdio slots (e.g. /dev/null redirections).
             match class {
                 FdClass::StdioFd | FdClass::Pipe => {}
                 FdClass::FilesystemFd if terminal_meta.is_some() => {}
+                FdClass::UnixSocket if raw_fd <= 2 && socket_pair_id.is_some() => {}
+                FdClass::FilesystemFd if raw_fd <= 2 => {}
                 _ => {
                     reject.push(ForkRejectReason::UnsupportedFdClass { fd: raw_fd, class });
                 }
             }
+
+            let is_non_terminal_stdio_fs =
+                class == FdClass::FilesystemFd && raw_fd <= 2 && terminal_meta.is_none();
 
             entries.push(FdEntrySnapshot {
                 fd: raw_fd,
@@ -3721,6 +3735,17 @@ impl<FS: ShimFS> Task<FS> {
                 object_id: object_id.map_or(0, litebox::fd::DescriptorObjectId::as_u64),
                 metadata: terminal_meta.unwrap_or_default(),
             });
+
+            // For non-terminal FilesystemFd on stdio slots, capture the
+            // reopen path so restore can reopen the file (e.g. /dev/null).
+            if is_non_terminal_stdio_fs && let Ok(fd) = rds.fd_from_raw_integer::<FS>(raw_fd) {
+                let path = files.fs.fd_path(&fd);
+                open_file_descriptions.push(super::fork_snapshot::OpenFileDescriptionSnapshot {
+                    object_id: fd.object_id().as_u64(),
+                    file_offset: 0,
+                    reopen_path: path,
+                });
+            }
         }
         drop(rds);
         drop(dt);
@@ -3733,7 +3758,7 @@ impl<FS: ShimFS> Task<FS> {
 
         super::fork_snapshot::FdTableSnapshot {
             entries,
-            open_file_descriptions: Vec::new(), // TODO: populate in a later phase
+            open_file_descriptions,
             stdio_object_ids,
         }
     }

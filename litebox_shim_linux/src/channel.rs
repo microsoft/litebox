@@ -110,6 +110,13 @@ impl<T> ReadEnd<T> {
     }
 
     common_functions_for_channel!();
+
+    /// Returns a raw pointer to this end's endpoint allocation.
+    /// Stable as long as this `ReadEnd` (or any clone) is alive.
+    #[allow(dead_code)] // Used in G2+ (Unix socket fork bridging)
+    pub(crate) fn endpoint_ptr(&self) -> *const () {
+        Arc::as_ptr(&self.endpoint).cast()
+    }
 }
 
 pub(crate) struct WriteEnd<T> {
@@ -161,6 +168,14 @@ impl<T> WriteEnd<T> {
     }
 
     common_functions_for_channel!();
+
+    /// Returns a raw pointer to this end's peer endpoint allocation.
+    /// Stable even after the peer's strong `Arc` is dropped (the weak
+    /// keeps the allocation address constant).
+    #[allow(dead_code)] // Used in G2+ (Unix socket fork bridging)
+    pub(crate) fn peer_ptr(&self) -> *const () {
+        self.peer.as_ptr().cast()
+    }
 }
 
 impl<T> Drop for WriteEnd<T> {

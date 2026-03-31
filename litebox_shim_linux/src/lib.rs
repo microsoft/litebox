@@ -897,6 +897,54 @@ impl<FS: ShimFS> LinuxShim<FS> {
                 drop(rds);
                 drop(dt);
             }
+
+            // Restore non-terminal FilesystemFd on stdio slots (e.g.,
+            // /dev/null redirections).  Reopen by path if available, else
+            // fall back to /dev/null.  These replace the pre-populated
+            // stdio entries at the slot.
+            for entry in &fd_table.entries {
+                if entry.fd > 2 || entry.class != FdClass::FilesystemFd {
+                    continue;
+                }
+                let meta = &entry.metadata;
+                // Skip terminal fds and host stdio (already handled above).
+                if meta.is_host_tty_alias
+                    || meta.is_host_pty_device
+                    || meta.host_stdio_source_fd.is_some()
+                {
+                    continue;
+                }
+
+                let path = fd_table
+                    .open_file_descriptions
+                    .iter()
+                    .find(|ofd| ofd.object_id == entry.object_id)
+                    .and_then(|ofd| ofd.reopen_path.as_deref())
+                    .unwrap_or("/dev/null");
+                let flags = if entry.fd == 0 {
+                    OFlags::RDONLY
+                } else {
+                    OFlags::WRONLY
+                };
+                let Ok(fd_handle) = child_files
+                    .fs
+                    .open(path, flags, Mode::empty())
+                    .or_else(|_| {
+                        child_files
+                            .fs
+                            .open("/dev/null", OFlags::RDWR, Mode::empty())
+                    })
+                else {
+                    continue;
+                };
+
+                // Consume the pre-populated entry so the slot is free.
+                let mut rds = child_files.raw_descriptor_store.write();
+                let _ = rds.fd_consume_raw_integer::<FS>(entry.fd);
+                let success = rds.fd_into_specific_raw_integer(fd_handle, entry.fd);
+                debug_assert!(success, "fd slot {} still occupied after consume", entry.fd);
+                drop(rds);
+            }
         }
 
         // --- 11. Build credentials. -----------------------------------------

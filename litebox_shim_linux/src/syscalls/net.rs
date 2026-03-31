@@ -4424,4 +4424,48 @@ mod unix_tests {
         task.sys_unlinkat(-1, client_path, AtFlags::empty())
             .unwrap();
     }
+
+    #[test]
+    fn test_unix_socketpair_pair_id() {
+        use crate::syscalls::unix::UnixSocket;
+
+        let task = init_platform(None);
+        let (fd1, fd2) = task
+            .do_socketpair(AddressFamily::UNIX, SockType::Stream, SockFlags::CLOEXEC, 0)
+            .unwrap();
+
+        let files = task.files.borrow();
+        let rds = files.raw_descriptor_store.read();
+        let typed1 = rds
+            .fd_from_raw_integer::<crate::syscalls::unix::UnixSocketSubsystem<crate::DefaultFS>>(
+                fd1 as usize,
+            )
+            .unwrap();
+        let typed2 = rds
+            .fd_from_raw_integer::<crate::syscalls::unix::UnixSocketSubsystem<crate::DefaultFS>>(
+                fd2 as usize,
+            )
+            .unwrap();
+
+        let dt = task.global.litebox.descriptor_table();
+        let id1 = dt
+            .with_entry(&typed1, |sock: &UnixSocket<crate::DefaultFS>| {
+                sock.socket_pair_id()
+            })
+            .unwrap();
+        let id2 = dt
+            .with_entry(&typed2, |sock: &UnixSocket<crate::DefaultFS>| {
+                sock.socket_pair_id()
+            })
+            .unwrap();
+
+        assert_eq!(
+            id1, id2,
+            "both ends of a socketpair should have the same pair id"
+        );
+        assert!(
+            id1.is_some(),
+            "connected stream sockets should have a pair id"
+        );
+    }
 }

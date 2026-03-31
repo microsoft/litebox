@@ -473,6 +473,26 @@ struct UnixConnectedStream<FS: ShimFS> {
 
 const UNIX_BUF_SIZE: usize = 65536;
 impl<FS: ShimFS> UnixConnectedStream<FS> {
+    /// Returns a pair identifier shared by both ends of a connected pair.
+    ///
+    /// Both peers produce the same value because the channels are
+    /// cross-wired:
+    ///
+    ///   Socket A: recv = ReadEnd(EP_R1),  send = WriteEnd(_, peer→EP_R2)
+    ///   Socket B: recv = ReadEnd(EP_R2),  send = WriteEnd(_, peer→EP_R1)
+    ///
+    ///   A: min(ptr(EP_R1), ptr(EP_R2)) = min(R1, R2)
+    ///   B: min(ptr(EP_R2), ptr(EP_R1)) = min(R1, R2)  ✓
+    ///
+    /// Stable across `clone_for_fork` because both clones share the same
+    /// underlying `Arc` allocations.
+    #[allow(dead_code)] // Used in G2+ (Unix socket fork bridging)
+    pub(crate) fn socket_pair_id(&self) -> usize {
+        let recv_ptr = self.recv_channel.endpoint_ptr() as usize;
+        let send_peer_ptr = self.connected_send_channel.peer_ptr() as usize;
+        core::cmp::min(recv_ptr, send_peer_ptr)
+    }
+
     /// Creates a pair of connected Unix stream sockets.
     fn new_pair(
         addr: Option<Arc<UnixBoundSocketAddr<FS>>>,
@@ -1350,6 +1370,18 @@ impl<FS: ShimFS> UnixSocket<FS> {
         match &self.inner {
             UnixSocketInner::Stream(stream) => stream.with_state_ref(|s| s.connected().is_some()),
             UnixSocketInner::Datagram(_) => false,
+        }
+    }
+
+    /// Returns a pair identifier for connected stream sockets, or `None`
+    /// for init/listen/datagram sockets.
+    #[allow(dead_code)] // Used in G2+ (Unix socket fork bridging)
+    pub(crate) fn socket_pair_id(&self) -> Option<usize> {
+        match &self.inner {
+            UnixSocketInner::Stream(stream) => {
+                stream.with_state_ref(|s| s.connected().map(UnixConnectedStream::socket_pair_id))
+            }
+            UnixSocketInner::Datagram(_) => None,
         }
     }
 
