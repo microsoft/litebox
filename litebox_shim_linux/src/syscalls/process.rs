@@ -4139,6 +4139,11 @@ impl<FS: ShimFS> Task<FS> {
     ) -> super::fork_snapshot::MemorySnapshot {
         let ps = self.process_state.borrow();
         let mappings = ps.pm.mappings();
+        let as_range = self
+            .global
+            .platform
+            .address_space_range(ps.address_space_id)
+            .ok();
 
         let mut regions = Vec::new();
         for (range, flags) in &mappings {
@@ -4154,14 +4159,34 @@ impl<FS: ShimFS> Task<FS> {
             // avoid the restore path elevating VM_MAYWRITE via SHARED flags.
             let _ = is_shared;
 
-            let len = range.end - range.start;
+            let mut region_start = range.start;
+            let mut len = range.end - range.start;
+
+            // Clip regions that extend past the VA partition ceiling.
+            // The host kernel can place ld.so near the top of the partition,
+            // with the last page spilling past the boundary.  Truncate so the
+            // child restore doesn't try to map outside its partition.
+            if let Some(ref as_r) = as_range {
+                if range.end > as_r.end {
+                    len = as_r.end.saturating_sub(region_start);
+                }
+                if region_start < as_r.start {
+                    let skip = as_r.start - region_start;
+                    region_start = as_r.start;
+                    len = len.saturating_sub(skip);
+                }
+                if len == 0 {
+                    continue;
+                }
+            }
+
             let readable = flags.contains(VmFlags::VM_READ);
 
             // If the region is not readable (e.g. PROT_NONE or write/exec
             // only), temporarily make it readable so we can copy the data.
             // SAFETY: sibling threads are parked, so no concurrent access.
             if !readable {
-                let ptr = crate::MutPtr::<u8>::from_usize(range.start);
+                let ptr = crate::MutPtr::<u8>::from_usize(region_start);
                 let _ = unsafe { ps.pm.make_pages_readable(ptr, len) };
             }
 
@@ -4169,13 +4194,13 @@ impl<FS: ShimFS> Task<FS> {
             // SAFETY: the forking thread has exclusive access (sibling threads
             // are parked) and the region is now readable.
             let data =
-                unsafe { core::slice::from_raw_parts(range.start as *const u8, len).to_vec() };
+                unsafe { core::slice::from_raw_parts(region_start as *const u8, len).to_vec() };
 
             // Restore original permissions if we temporarily upgraded them.
             // Use the exact original flags rather than always setting PROT_NONE,
             // in case the region was write-only or exec-only (rare but possible).
             if !readable {
-                let ptr = crate::MutPtr::<u8>::from_usize(range.start);
+                let ptr = crate::MutPtr::<u8>::from_usize(region_start);
                 let has_write = flags.contains(VmFlags::VM_WRITE);
                 let has_exec = flags.contains(VmFlags::VM_EXEC);
                 let _ = match (has_write, has_exec) {
@@ -4187,7 +4212,7 @@ impl<FS: ShimFS> Task<FS> {
             }
 
             regions.push(super::fork_snapshot::MemoryRegionSnapshot {
-                addr: range.start,
+                addr: region_start,
                 len,
                 permissions: flags.bits() & VmFlags::VM_ACCESS_FLAGS.bits(),
                 vm_flags: flags.bits(),

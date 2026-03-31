@@ -555,23 +555,50 @@ impl<FS: ShimFS> LinuxShim<FS> {
         // Reserve the child's thread ID so future clone() calls don't collide.
         self.global.reserve_thread_id(id.pid);
 
-        // --- 1. Reuse the init process's address space slot. -----------------
-        // The parent used slot 0 in its host. The child host's init process
-        // also occupies slot 0 but is unused in fork-restore mode. Destroy it
-        // and re-create to get a clean slot 0, so all snapshot addresses
-        // remain valid without rebasing (va_rebase = 0).
+        // --- 1. Allocate the same VA partition slot used by the parent. ------
+        // The snapshot addresses are absolute within the parent's partition.
+        // Rather than rebasing all addresses, we allocate the same slot in the
+        // child worker so va_rebase == 0.
+        //
+        // The worker's init process occupies slot 0.  If the snapshot came from
+        // a different slot (e.g. slot 1), we allocate slots sequentially until
+        // we get the matching one, then free the extras and init's slot.
         let init_as_id = self.process_state.address_space_id;
-        // Deallocate the init process's pages (clears page tables).
+        let snapshot_va_start = mem.metadata.va_range.start;
+
+        // Determine which slot the snapshot was taken from by finding the slot
+        // whose range contains the snapshot's VA start.
+        // Destroy init's slot first so it's available for reuse.
         self.global
             .platform
             .destroy_address_space(init_as_id)
             .map_err(|_| Errno::ENOMEM)?;
-        // Re-allocate slot 0 (the allocator gives back the lowest free slot).
-        let child_as_id = self
-            .global
-            .platform
-            .create_address_space()
-            .map_err(|_| Errno::ENOMEM)?;
+
+        // Allocate slots until we get one whose range matches the snapshot.
+        let mut temp_slots = alloc::vec::Vec::new();
+        let child_as_id = loop {
+            let id = self.global.platform.create_address_space().map_err(|_| {
+                // Clean up any temp slots on failure.
+                for &s in &temp_slots {
+                    let _ = self.global.platform.destroy_address_space(s);
+                }
+                Errno::ENOMEM
+            })?;
+            let range = self
+                .global
+                .platform
+                .address_space_range(id)
+                .map_err(|_| Errno::ENOMEM)?;
+            if range.start <= snapshot_va_start && snapshot_va_start < range.end {
+                break id;
+            }
+            temp_slots.push(id);
+        };
+        // Free the temporary slots we allocated to skip past.
+        for s in temp_slots {
+            let _ = self.global.platform.destroy_address_space(s);
+        }
+
         let as_range = self
             .global
             .platform
@@ -581,7 +608,7 @@ impl<FS: ShimFS> LinuxShim<FS> {
         let child_pm: PageManager<Platform, { PAGE_SIZE }> =
             PageManager::new(&self.global.litebox, as_range.clone());
 
-        // Compute VA rebase offset (should be 0 since we reuse the same slot).
+        // Compute VA rebase offset (should be 0 since we matched the slot).
         let snapshot_va_start = mem.metadata.va_range.start;
         let child_va_start = as_range.start;
         let va_rebase: isize = child_va_start as isize - snapshot_va_start as isize;
@@ -598,15 +625,32 @@ impl<FS: ShimFS> LinuxShim<FS> {
             let has_exec = vm_flags.contains(VmFlags::VM_EXEC);
 
             let rebased_addr = (region.addr as isize + va_rebase) as usize;
+
+            // Clip regions that extend past the partition ceiling (e.g. ld.so
+            // mapped at the very top with last page spilling over).
+            let region_end = rebased_addr.saturating_add(region.len);
+            let clipped_len = if region_end > as_range.end {
+                as_range.end.saturating_sub(rebased_addr)
+            } else {
+                region.len
+            };
+            if clipped_len == 0 {
+                continue;
+            }
+
             let addr = NonZeroAddress::<PAGE_SIZE>::new(rebased_addr).ok_or(Errno::EINVAL)?;
-            let len = NonZeroPageSize::<PAGE_SIZE>::new(region.len).ok_or(Errno::EINVAL)?;
+            let len = NonZeroPageSize::<PAGE_SIZE>::new(clipped_len).ok_or(Errno::EINVAL)?;
 
             let mut flags = CreatePagesFlags::FIXED_ADDR;
             if region.is_shared {
                 flags |= CreatePagesFlags::SHARED;
             }
 
-            let data = &region.data;
+            let data = if region.data.len() > clipped_len {
+                &region.data[..clipped_len]
+            } else {
+                &region.data
+            };
 
             // Choose the create method that matches the final permissions.
             unsafe {
@@ -664,7 +708,19 @@ impl<FS: ShimFS> LinuxShim<FS> {
                         Ok(ptr)
                     }
                 }
-                .map_err(|_| Errno::ENOMEM)?;
+                .map_err(|e| {
+                    litebox::log_println!(
+                        self.global.platform,
+                        "[FORK-RESTORE-DIAG] region addr={:#x} len={:#x} rwx={}/{}/{} err={:?}",
+                        rebased_addr,
+                        region.len,
+                        has_read,
+                        has_write,
+                        has_exec,
+                        e
+                    );
+                    Errno::ENOMEM
+                })?;
             }
         }
 
