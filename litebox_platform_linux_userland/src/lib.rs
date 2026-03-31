@@ -1574,6 +1574,28 @@ impl LinuxUserland {
         Ok((fds[0], fds[1]))
     }
 
+    /// Create an `AF_UNIX SOCK_SEQPACKET` socketpair for the stream multiplexer.
+    ///
+    /// Returns `(fd_a, fd_b)` — both ends are equivalent.  Both FDs have
+    /// `O_CLOEXEC` set; the caller must clear it on the end that should
+    /// survive `posix_spawn`.
+    pub fn create_host_socketpair(&self) -> Result<(i32, i32), litebox_common_linux::errno::Errno> {
+        let mut fds = [0i32; 2];
+        // SAFETY: fds points to a valid 2-element array.
+        let ret = unsafe {
+            libc::socketpair(
+                libc::AF_UNIX,
+                libc::SOCK_SEQPACKET | libc::SOCK_CLOEXEC,
+                0,
+                fds.as_mut_ptr(),
+            )
+        };
+        if ret != 0 {
+            return Err(litebox_common_linux::errno::Errno::EMFILE);
+        }
+        Ok((fds[0], fds[1]))
+    }
+
     /// Try to enlarge a host pipe's capacity to at least `size` bytes.
     ///
     /// Best-effort: silently ignores errors (e.g. unprivileged processes
@@ -1598,11 +1620,34 @@ impl LinuxUserland {
         Ok(())
     }
 
+    /// Set `O_NONBLOCK` on a host file descriptor.
+    pub fn set_host_fd_nonblock(&self, fd: i32) -> Result<(), litebox_common_linux::errno::Errno> {
+        // SAFETY: fd is a valid host FD.
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        if flags < 0 {
+            return Err(litebox_common_linux::errno::Errno::EBADF);
+        }
+        if unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+            return Err(litebox_common_linux::errno::Errno::EBADF);
+        }
+        Ok(())
+    }
+
+    /// Sleep for `us` microseconds on the calling host thread.
+    pub fn host_sleep_us(&self, us: u64) {
+        std::thread::sleep(std::time::Duration::from_micros(us));
+    }
+
     /// Spawn a worker host process to restore a fork child from a snapshot.
     ///
     /// Writes the serialized snapshot to a memfd, creates an ack pipe for the
     /// child to report restore success/failure, and launches a new host process
     /// via `posix_spawn`.
+    ///
+    /// The multiplexer socketpair fd (`mux_fd`) and per-stream mappings
+    /// (`mux_streams`) replace the old per-fd `--pipe-bridge` arguments.
+    /// Host-pipe fds from prior bridges are passed via `passthrough_fds`
+    /// and inherit directly (not through the mux).
     ///
     /// Returns `Ok(host_pid)` if the child was spawned and reported successful
     /// restore via the ack pipe.  Returns `Err(errno)` on failure.
@@ -1618,7 +1663,9 @@ impl LinuxUserland {
         &'static self,
         snapshot_bytes: &[u8],
         stdio: WorkerExecStdioBindings<FS, LinuxUserland>,
-        pipe_bridges: &[(usize, i32, bool)],
+        mux_fd: Option<i32>,
+        mux_streams: &[(u32, usize, u8, u8)],
+        passthrough_fds: &[(usize, i32, bool)],
     ) -> Result<i32, i32>
     where
         FS: litebox::fs::FileSystem + Send + Sync + 'static,
@@ -1677,10 +1724,28 @@ impl LinuxUserland {
             }
         }
 
-        // Add pipe bridge CLI args: --pipe-bridge guest_fd:direction:host_fd
-        // direction is 'r' for read, 'w' for write.
-        for &(guest_fd, host_fd, is_read) in pipe_bridges {
-            // Clear O_CLOEXEC so the fd survives posix_spawn.
+        // Add --mux-fd if a socketpair was created.
+        if let Some(mux_fd) = mux_fd {
+            let _ = self.clear_cloexec(mux_fd);
+            spawn_argv.push(CString::new("--mux-fd").unwrap());
+            spawn_argv.push(CString::new(mux_fd.to_string()).map_err(|_| -1_i32)?);
+        }
+
+        // Add --mux-stream for each muxed stream.
+        // Format: stream_id:guest_fd:direction:type
+        for &(stream_id, guest_fd, dir, stype) in mux_streams {
+            spawn_argv.push(CString::new("--mux-stream").unwrap());
+            spawn_argv.push(
+                CString::new(format!(
+                    "{}:{}:{}:{}",
+                    stream_id, guest_fd, dir as char, stype as char,
+                ))
+                .map_err(|_| -1_i32)?,
+            );
+        }
+
+        // Add --pipe-bridge for host-pipe passthrough fds (from prior bridges).
+        for &(guest_fd, host_fd, is_read) in passthrough_fds {
             let _ = self.clear_cloexec(host_fd);
             let dir_char = if is_read { 'r' } else { 'w' };
             spawn_argv.push(CString::new("--pipe-bridge").unwrap());
@@ -1793,8 +1858,11 @@ impl LinuxUserland {
             )
         };
         if ret != 0 {
-            // posix_spawn failed — bridge FD cleanup is the caller's
-            // responsibility (they own the child_pipe_bridges list).
+            // Close mux fd — child was never spawned, so caller must not
+            // close it (the function takes ownership).
+            if let Some(mux_fd) = mux_fd {
+                self.close_host_fd(mux_fd);
+            }
             return Err(ret);
         }
         drop(host_stdio_temp_sources);
@@ -1804,10 +1872,15 @@ impl LinuxUserland {
         drop(result_write_fd);
         drop(snapshot_fd);
 
-        // Close child-side pipe bridge FDs (child inherited them via
-        // posix_spawn since we cleared CLOEXEC).
-        for &(_, host_fd, _) in pipe_bridges {
+        // Close child-side passthrough pipe bridge FDs (child inherited them
+        // via posix_spawn since we cleared CLOEXEC).
+        for &(_, host_fd, _) in passthrough_fds {
             self.close_host_fd(host_fd);
+        }
+
+        // Close the worker's mux socketpair end (the child inherited it).
+        if let Some(mux_fd) = mux_fd {
+            self.close_host_fd(mux_fd);
         }
 
         // Read ack from child: 0 = success, non-zero = error.

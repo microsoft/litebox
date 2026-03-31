@@ -48,6 +48,7 @@ pub(crate) mod channel;
 pub mod loader;
 #[cfg_attr(not(test), allow(dead_code))]
 mod multihost;
+pub mod multiplexer;
 pub(crate) mod stdio;
 pub mod syscalls;
 pub mod transport;
@@ -148,6 +149,47 @@ impl<FS: ShimFS> LinuxShimEntrypoints<FS> {
         // Install the HostPipe FD at the same guest fd number.
         let ok = rds.fd_into_specific_raw_integer(typed_fd, guest_fd);
         debug_assert!(ok, "install_host_pipe_fd: slot {guest_fd} still occupied");
+    }
+
+    /// Install a virtual pipe FD for a multiplexer stream endpoint.
+    ///
+    /// Called by the runner after `restore_process` to replace the restored
+    /// virtual fd at `guest_fd` with the given pipe endpoint (half of a new
+    /// virtual pipe pair whose other half is connected to the mux dispatcher).
+    pub fn install_mux_pipe_fd(
+        &self,
+        guest_fd: usize,
+        pipe_fd: litebox::fd::TypedFd<litebox::pipes::Pipes<Platform>>,
+    ) {
+        let files = self.task.files.borrow();
+        let mut rds = files.raw_descriptor_store.write();
+
+        // Consume the existing entry at this slot.
+        if let Ok(old_pipe) =
+            rds.fd_consume_raw_integer::<litebox::pipes::Pipes<Platform>>(guest_fd)
+        {
+            drop(rds);
+            let _ = self.task.global.pipes.close(&old_pipe);
+            rds = files.raw_descriptor_store.write();
+        } else if let Ok(old_fs) = rds.fd_consume_raw_integer::<FS>(guest_fd) {
+            drop(rds);
+            let _ = files.fs.close(&old_fs);
+            rds = files.raw_descriptor_store.write();
+        } else if let Ok(old_sock) =
+            rds.fd_consume_raw_integer::<syscalls::unix::UnixSocketSubsystem<FS>>(guest_fd)
+        {
+            drop(rds);
+            let _ = self
+                .task
+                .global
+                .litebox
+                .descriptor_table_mut()
+                .remove(&old_sock);
+            rds = files.raw_descriptor_store.write();
+        }
+
+        let ok = rds.fd_into_specific_raw_integer(pipe_fd, guest_fd);
+        debug_assert!(ok, "install_mux_pipe_fd: slot {guest_fd} still occupied");
     }
 }
 
@@ -3258,7 +3300,7 @@ pub(crate) struct VforkParking {
 }
 
 /// Which virtual subsystem the replaced fd belonged to.
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 enum ReplacedSubsystem {
     Pipe,
     UnixSocket,
@@ -3266,6 +3308,9 @@ enum ReplacedSubsystem {
 
 /// Describes a single fd endpoint that should be replaced with a host OS
 /// pipe after the delayed-fork child has been migrated.
+///
+/// Used by the exec-on-remote-host path.  The fork-restore path uses the
+/// stream multiplexer instead (see [`MuxParentStream`]).
 #[derive(Debug)]
 struct FdReplacement {
     /// The guest FD number to replace.
@@ -3279,14 +3324,51 @@ struct FdReplacement {
     subsystem: ReplacedSubsystem,
 }
 
+/// Describes a single stream in the multiplexer that the parent dispatcher
+/// must service after the fork-restore child has been migrated.
+struct MuxParentStream {
+    /// Stream ID matching the child's `--mux-stream` argument.
+    stream_id: u32,
+    /// The guest FD number whose virtual endpoint is replaced with a new pipe.
+    /// For virtual pipe/socket streams, this is the parent's fd that gets a new
+    /// virtual pipe endpoint.  For host-backed streams, this is the child's
+    /// guest fd (informational only — no parent fd replacement occurs).
+    guest_fd: usize,
+    /// Read = parent reads (child writes, WorkerToParent).
+    /// Write = parent writes (child reads, ParentToWorker).
+    direction: syscalls::host_pipe::HostPipeDirection,
+    /// Which virtual subsystem owned the original fd.
+    #[allow(dead_code)] // Useful for debug logging; may drive close logic in future.
+    subsystem: ReplacedSubsystem,
+    /// Data drained from the virtual channel before migration.
+    /// Sent as the first mux message(s) when the parent dispatcher starts.
+    drained_data: Vec<u8>,
+    /// For host-backed pipes from prior bridges: the raw OS fd to relay.
+    /// The parent dispatcher bridges between this fd and the mux.
+    /// -1 for virtual pipe/socket streams (parent creates a new virtual pipe).
+    host_pipe_fd: i32,
+    /// When true, the parent's existing pipe at `guest_fd` is used directly
+    /// by the dispatcher (nested fork case — one-sided pipe, other end is in
+    /// the parent's own mux dispatcher).  The fd table entry is NOT replaced.
+    use_existing_pipe: bool,
+}
+
 struct VforkDone {
     done: core::sync::atomic::AtomicBool,
     /// Waker for the parent thread — calling `wake()` causes the parent's
     /// `wait_until` loop to re-evaluate the done flag.
     parent_waker: litebox::event::wait::Waker<Platform>,
     /// FD replacements the parent should apply after VforkDone is signaled.
-    /// Filled by `commit_delayed_fork`, consumed by `do_fork` after resume.
+    /// Filled by `commit_delayed_fork` (exec path), consumed by `do_fork` after resume.
     fd_replacements: litebox::sync::Mutex<Platform, Vec<FdReplacement>>,
+    /// Parent's end of the multiplexer socketpair.  -1 if no mux is active.
+    /// Filled by `commit_delayed_fork` (fork-restore path).
+    mux_parent_fd: core::sync::atomic::AtomicI32,
+    /// Stream mappings for the parent mux dispatcher.
+    mux_parent_streams: litebox::sync::Mutex<Platform, Vec<MuxParentStream>>,
+    /// Stream IDs with no parent counterpart (broken pipe).
+    /// The parent dispatcher sends RESET for these at startup.
+    mux_orphan_streams: litebox::sync::Mutex<Platform, Vec<u32>>,
 }
 
 impl VforkDone {
@@ -3295,6 +3377,9 @@ impl VforkDone {
             done: core::sync::atomic::AtomicBool::new(false),
             parent_waker,
             fd_replacements: litebox::sync::Mutex::new(Vec::new()),
+            mux_parent_fd: core::sync::atomic::AtomicI32::new(-1),
+            mux_parent_streams: litebox::sync::Mutex::new(Vec::new()),
+            mux_orphan_streams: litebox::sync::Mutex::new(Vec::new()),
         }
     }
 

@@ -223,6 +223,27 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> Pipes<Platform> {
         }
     }
 
+    /// Check if a pipe receiver has reached EOF: the sender is closed and
+    /// the buffer is empty.  Returns `false` for sender ends or if data
+    /// remains buffered.
+    pub fn is_read_eof(&self, fd: &PipeFd<Platform>) -> bool {
+        let dt = self.litebox.descriptor_table();
+        match dt.get_entry(fd) {
+            Some(entry) => match &entry.entry {
+                PipeEnd::Receiver(p) => {
+                    // Check empty → peer shutdown → re-check empty to avoid
+                    // a TOCTOU race where the writer pushes data then closes
+                    // between the two checks.
+                    p.endpoint.rb.lock().occupied_len() == 0
+                        && p.is_peer_shutdown()
+                        && p.endpoint.rb.lock().occupied_len() == 0
+                }
+                PipeEnd::Sender(_) => false,
+            },
+            None => true,
+        }
+    }
+
     /// Drain all currently buffered data from a pipe receiver without blocking.
     ///
     /// Returns the buffered data (may be empty if nothing is buffered).

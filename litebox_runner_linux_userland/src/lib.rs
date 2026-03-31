@@ -189,11 +189,22 @@ pub struct CliArgs {
     #[arg(long = "fork-restore-ack-fd", hide = true, requires = "fork_restore")]
     pub fork_restore_ack_fd: Option<i32>,
 
-    /// Internal: pipe bridge specs for fork-restore.
+    /// Internal: pipe bridge specs for fork-restore (host-pipe passthrough).
     /// Each value has the format `guest_fd:direction:host_fd` where direction
     /// is 'r' (read) or 'w' (write).
     #[arg(long = "pipe-bridge", hide = true, requires = "fork_restore")]
     pub pipe_bridge: Vec<String>,
+
+    /// Internal: inherited socketpair fd for the stream multiplexer.
+    #[arg(long = "mux-fd", hide = true, requires = "fork_restore")]
+    pub mux_fd: Option<i32>,
+
+    /// Internal: stream mapping for the multiplexer.
+    /// Format: `stream_id:guest_fd:direction:type` where direction is
+    /// 'r' (read/ParentToWorker) or 'w' (write/WorkerToParent), and type
+    /// is 'p' (pipe) or 's' (socket).
+    #[arg(long = "mux-stream", hide = true, requires = "fork_restore")]
+    pub mux_stream: Vec<String>,
 }
 
 /// Backends supported for intercepting syscalls
@@ -976,11 +987,15 @@ fn run_fork_restore(cli_args: CliArgs) -> Result<()> {
         .fork_restore_ack_fd
         .ok_or_else(|| anyhow!("--fork-restore requires --fork-restore-ack-fd"))?;
 
-    // Parse pipe bridge specs.
+    // Parse pipe bridge specs (host-pipe passthrough from prior bridges).
     let pipe_bridges = parse_pipe_bridge_specs(&cli_args.pipe_bridge)?;
 
-    // Mark inherited fds as close-on-exec (except pipe bridge FDs which
-    // the shim will use directly).
+    // Parse mux stream specs.
+    let mux_streams = parse_mux_stream_specs(&cli_args.mux_stream)?;
+    let mux_fd = cli_args.mux_fd;
+
+    // Mark inherited fds as close-on-exec (except pipe bridge FDs and mux fd
+    // which the shim/dispatcher will use directly).
     for fd in [Some(snapshot_fd), Some(ack_fd), cli_args.worker_result_fd]
         .into_iter()
         .flatten()
@@ -1064,7 +1079,15 @@ fn run_fork_restore(cli_args: CliArgs) -> Result<()> {
         );
         let combined_fs = std::sync::Arc::new(combined);
 
-        let program = fork_restore_and_ack(&shim, snapshot, combined_fs, ack_fd, &pipe_bridges)?;
+        let program = fork_restore_and_ack(
+            &shim,
+            snapshot,
+            combined_fs,
+            ack_fd,
+            &pipe_bridges,
+            mux_fd,
+            &mux_streams,
+        )?;
         run_program(program, shutdown, net_worker, cli_args.worker_result_fd);
     } else {
         let initial_file_system = std::sync::Arc::new(default_fs);
@@ -1073,13 +1096,21 @@ fn run_fork_restore(cli_args: CliArgs) -> Result<()> {
         let shutdown = std::sync::Arc::new(core::sync::atomic::AtomicBool::new(false));
         let net_worker = start_network_worker(&shim, &shutdown);
 
-        let program =
-            fork_restore_and_ack(&shim, snapshot, initial_file_system, ack_fd, &pipe_bridges)?;
+        let program = fork_restore_and_ack(
+            &shim,
+            snapshot,
+            initial_file_system,
+            ack_fd,
+            &pipe_bridges,
+            mux_fd,
+            &mux_streams,
+        )?;
         run_program(program, shutdown, net_worker, cli_args.worker_result_fd);
     }
 }
 
 /// A parsed pipe bridge specification from the `--pipe-bridge` CLI arg.
+/// Used for host-pipe passthrough fds from prior delayed-fork bridges.
 struct PipeBridgeSpec {
     guest_fd: usize,
     host_fd: i32,
@@ -1113,20 +1144,70 @@ fn parse_pipe_bridge_specs(specs: &[String]) -> Result<Vec<PipeBridgeSpec>> {
     Ok(bridges)
 }
 
+/// A parsed mux stream specification from the `--mux-stream` CLI arg.
+#[allow(dead_code)]
+struct MuxStreamSpec {
+    stream_id: u32,
+    guest_fd: usize,
+    /// 'r' = ParentToWorker (worker reads), 'w' = WorkerToParent (worker writes).
+    direction: u8,
+    /// 'p' = pipe, 's' = socket.
+    stream_type: u8,
+}
+
+fn parse_mux_stream_specs(specs: &[String]) -> Result<Vec<MuxStreamSpec>> {
+    let mut streams = Vec::new();
+    for spec in specs {
+        let parts: Vec<&str> = spec.split(':').collect();
+        if parts.len() != 4 {
+            anyhow::bail!("invalid --mux-stream format: {spec}");
+        }
+        let stream_id: u32 = parts[0]
+            .parse()
+            .map_err(|_| anyhow!("bad stream_id in --mux-stream: {spec}"))?;
+        let guest_fd: usize = parts[1]
+            .parse()
+            .map_err(|_| anyhow!("bad guest_fd in --mux-stream: {spec}"))?;
+        let direction = match parts[2] {
+            "r" => b'r',
+            "w" => b'w',
+            _ => anyhow::bail!("bad direction in --mux-stream: {spec}"),
+        };
+        let stream_type = match parts[3] {
+            "p" => b'p',
+            "s" => b's',
+            "t" => b't',
+            _ => anyhow::bail!("bad type in --mux-stream: {spec}"),
+        };
+        streams.push(MuxStreamSpec {
+            stream_id,
+            guest_fd,
+            direction,
+            stream_type,
+        });
+    }
+    Ok(streams)
+}
+
 /// Restore a child process from a fork snapshot and write the ack status to the parent.
+///
+/// Sets up both host-pipe passthrough fds and multiplexer stream endpoints,
+/// then starts the worker mux dispatcher thread before acking.
 fn fork_restore_and_ack<FS: litebox_shim_linux::ShimFS>(
     shim: &litebox_shim_linux::LinuxShim<FS>,
     snapshot: litebox_shim_linux::syscalls::fork_snapshot::ForkSnapshot,
     fs: std::sync::Arc<FS>,
     ack_fd: i32,
     pipe_bridges: &[PipeBridgeSpec],
+    mux_fd: Option<i32>,
+    mux_streams: &[MuxStreamSpec],
 ) -> Result<litebox_shim_linux::LoadedProgram<FS>> {
     use std::io::Write;
     use std::os::fd::FromRawFd;
 
     match shim.restore_process(snapshot, fs) {
         Ok(program) => {
-            // Install HostPipe FDs for pipe bridges before acking.
+            // Install HostPipe FDs for passthrough pipe bridges.
             for bridge in pipe_bridges {
                 let direction = if bridge.is_read {
                     litebox_shim_linux::syscalls::host_pipe::HostPipeDirection::Read
@@ -1138,6 +1219,52 @@ fn fork_restore_and_ack<FS: litebox_shim_linux::ShimFS>(
                     bridge.host_fd,
                     direction,
                 );
+            }
+
+            // Set up mux stream endpoints: for each stream, create a virtual
+            // pipe pair, install the guest-facing end at the guest_fd slot,
+            // and collect the relay end for the dispatcher.
+            if let Some(mux_fd) = mux_fd
+                && !mux_streams.is_empty()
+            {
+                let platform = litebox_platform_multiplex::platform();
+                let litebox_ref = shim.litebox();
+                let pipes = litebox::pipes::Pipes::new(litebox_ref);
+
+                // (stream_id, direction, relay_fd)
+                #[allow(clippy::type_complexity)]
+                let mut relay_endpoints: Vec<(
+                    u32,
+                    u8,
+                    std::sync::Arc<litebox::fd::TypedFd<litebox::pipes::Pipes<Platform>>>,
+                )> = Vec::new();
+
+                for ms in mux_streams {
+                    let (sender, receiver) = pipes.create_pipe(
+                        1024 * 1024,
+                        litebox::pipes::Flags::empty(),
+                        core::num::NonZero::new(4096),
+                    );
+
+                    // 'r' = ParentToWorker: worker reads → install receiver
+                    //   as guest fd, relay writes via sender.
+                    // 'w' = WorkerToParent: worker writes → install sender
+                    //   as guest fd, relay reads via receiver.
+                    let (guest_pipe_fd, relay_pipe_fd) = if ms.direction == b'r' {
+                        (receiver, sender)
+                    } else {
+                        (sender, receiver)
+                    };
+
+                    program
+                        .entrypoints
+                        .install_mux_pipe_fd(ms.guest_fd, guest_pipe_fd);
+
+                    relay_endpoints.push((ms.stream_id, ms.direction, relay_pipe_fd.into()));
+                }
+
+                // Spawn the worker mux dispatcher thread.
+                spawn_worker_mux_dispatcher(platform, pipes, mux_fd, relay_endpoints);
             }
 
             // Report successful restore to parent via ack pipe.
@@ -1164,6 +1291,190 @@ fn read_fork_snapshot_from_fd(fd: i32) -> Result<Vec<u8>> {
     let mut data = Vec::new();
     file.read_to_end(&mut data)?;
     Ok(data)
+}
+
+/// Spawn the worker-side multiplexer dispatcher thread.
+///
+/// This single thread handles all mux streams for this worker:
+/// - For WorkerToParent (`w`) streams: reads from virtual pipe receiver,
+///   sends mux messages to the parent via the socketpair.
+/// - For ParentToWorker (`r`) streams: reads mux messages from the socketpair,
+///   writes data to virtual pipe sender.
+#[allow(clippy::type_complexity)]
+fn spawn_worker_mux_dispatcher(
+    platform: &'static Platform,
+    pipes: litebox::pipes::Pipes<Platform>,
+    mux_fd: i32,
+    relay_endpoints: Vec<(
+        u32,
+        u8,
+        std::sync::Arc<litebox::fd::TypedFd<litebox::pipes::Pipes<Platform>>>,
+    )>,
+) {
+    use litebox_shim_linux::multiplexer::{
+        HEADER_SIZE, MSG_FLAG_EOF, MSG_FLAG_RESET, MSG_TYPE_DATA, MuxMessage,
+    };
+
+    /// Maximum payload per mux message (60 KB, well under the ~212 KB kernel
+    /// SEQPACKET limit and within the 64 KB recv buffer).
+    const MUX_MAX_PAYLOAD: usize = 61440;
+
+    litebox_platform_linux_userland::spawn_host_thread(move || {
+        let wait_state = litebox::event::wait::WaitState::new(platform);
+        let cx = wait_state.context();
+
+        eprintln!(
+            "[WORKER-MUX] dispatcher started, {} endpoints, mux_fd={}",
+            relay_endpoints.len(),
+            mux_fd,
+        );
+
+        // Set socketpair to non-blocking for the poll loop.
+        let _ = platform.set_host_fd_nonblock(mux_fd);
+
+        let mut recv_buf = vec![0u8; MUX_MAX_PAYLOAD + HEADER_SIZE];
+        let mut closed_endpoints: Vec<bool> = vec![false; relay_endpoints.len()];
+
+        // Helper: send a control frame (EOF/RESET) reliably.
+        // Retries on EAGAIN since the socketpair is non-blocking.
+        let send_control = |mux_fd: i32, msg: &MuxMessage| {
+            let buf = msg.serialize();
+            loop {
+                match platform.write_host_fd(mux_fd, &buf) {
+                    Ok(_) => return true,
+                    Err(litebox_common_linux::errno::Errno::EAGAIN) => {
+                        std::thread::sleep(std::time::Duration::from_micros(100));
+                    }
+                    Err(_) => return false,
+                }
+            }
+        };
+
+        loop {
+            let mut did_work = false;
+
+            // 1. Check socketpair for incoming messages (ParentToWorker data).
+            match platform.read_host_fd(mux_fd, &mut recv_buf) {
+                Ok(0) => {
+                    // Socketpair closed — parent exited. Close all relay fds.
+                    for (_, _, relay_fd) in &relay_endpoints {
+                        let _ = pipes.close(relay_fd);
+                    }
+                    platform.close_host_fd(mux_fd);
+                    return;
+                }
+                Ok(n) => {
+                    did_work = true;
+                    if let Some(msg) = MuxMessage::deserialize(&recv_buf[..n])
+                        && msg.msg_type == MSG_TYPE_DATA
+                    {
+                        eprintln!(
+                            "[WORKER-MUX] recv stream={} flags={:#x} len={}",
+                            msg.stream_id,
+                            msg.flags,
+                            msg.data.len(),
+                        );
+                        if msg.flags & MSG_FLAG_EOF != 0 || msg.flags & MSG_FLAG_RESET != 0 {
+                            for (idx, (sid, _, relay_fd)) in relay_endpoints.iter().enumerate() {
+                                if *sid == msg.stream_id && !closed_endpoints[idx] {
+                                    let _ = pipes.close(relay_fd);
+                                    closed_endpoints[idx] = true;
+                                }
+                            }
+                        } else if !msg.data.is_empty() {
+                            for (idx, (sid, _, relay_fd)) in relay_endpoints.iter().enumerate() {
+                                if *sid == msg.stream_id && !closed_endpoints[idx] {
+                                    let mut offset = 0;
+                                    while offset < msg.data.len() {
+                                        if let Ok(w) =
+                                            pipes.write(&cx, relay_fd, &msg.data[offset..])
+                                        {
+                                            offset += w;
+                                        } else {
+                                            // Local reader gone — close endpoint
+                                            // and notify peer.
+                                            let _ = pipes.close(relay_fd);
+                                            closed_endpoints[idx] = true;
+                                            let rst = MuxMessage::reset(*sid);
+                                            send_control(mux_fd, &rst);
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                Err(litebox_common_linux::errno::Errno::EAGAIN) => {}
+                Err(_) => {
+                    for (_, _, relay_fd) in &relay_endpoints {
+                        let _ = pipes.close(relay_fd);
+                    }
+                    platform.close_host_fd(mux_fd);
+                    return;
+                }
+            }
+
+            // 2. Check WorkerToParent streams for data to send.
+            for (idx, (stream_id, direction, relay_fd)) in relay_endpoints.iter().enumerate() {
+                if *direction != b'w' || closed_endpoints[idx] {
+                    continue;
+                }
+                match pipes.drain_available(relay_fd) {
+                    Ok(data) if data.is_empty() => {
+                        // Nothing buffered — check if sender closed.
+                        if pipes.is_read_eof(relay_fd) {
+                            let _ = pipes.close(relay_fd);
+                            let msg = MuxMessage::eof(*stream_id);
+                            send_control(mux_fd, &msg);
+                            closed_endpoints[idx] = true;
+                        }
+                    }
+                    Ok(data) => {
+                        did_work = true;
+                        eprintln!("[WORKER-MUX] send stream={} len={}", stream_id, data.len(),);
+                        for chunk in data.chunks(MUX_MAX_PAYLOAD) {
+                            let msg = MuxMessage::data(*stream_id, chunk.to_vec());
+                            let buf = msg.serialize();
+                            loop {
+                                match platform.write_host_fd(mux_fd, &buf) {
+                                    Ok(w) if w == buf.len() => break,
+                                    Err(litebox_common_linux::errno::Errno::EAGAIN) => {
+                                        std::thread::sleep(std::time::Duration::from_micros(100));
+                                    }
+                                    _ => {
+                                        for (_, _, rfd) in &relay_endpoints {
+                                            let _ = pipes.close(rfd);
+                                        }
+                                        platform.close_host_fd(mux_fd);
+                                        return;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Err(_) => {
+                        // Pipe closed — send EOF.
+                        let _ = pipes.close(relay_fd);
+                        let msg = MuxMessage::eof(*stream_id);
+                        send_control(mux_fd, &msg);
+                        closed_endpoints[idx] = true;
+                    }
+                }
+            }
+
+            // Check if all endpoints are closed.
+            if closed_endpoints.iter().all(|&c| c) {
+                eprintln!("[WORKER-MUX] all endpoints closed, exiting");
+                platform.close_host_fd(mux_fd);
+                return;
+            }
+
+            if !did_work {
+                std::thread::sleep(std::time::Duration::from_micros(100));
+            }
+        }
+    });
 }
 
 /// Worker host entry point for a non-PIE child exec.
@@ -1923,6 +2234,8 @@ mod tests {
             fork_restore_fd: None,
             fork_restore_ack_fd: None,
             pipe_bridge: Vec::new(),
+            mux_fd: None,
+            mux_stream: Vec::new(),
         }
     }
 
