@@ -223,6 +223,37 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> Pipes<Platform> {
         }
     }
 
+    /// Drain all currently buffered data from a pipe receiver without blocking.
+    ///
+    /// Returns the buffered data (may be empty if nothing is buffered).
+    /// This is used during delayed-fork pipe bridging to transfer data that
+    /// was written to a virtual pipe (e.g. by a builtin command) into a real
+    /// OS pipe before the virtual pipe is torn down.
+    pub fn drain_available(
+        &self,
+        fd: &PipeFd<Platform>,
+    ) -> Result<alloc::vec::Vec<u8>, errors::ClosedError> {
+        let dt = self.litebox.descriptor_table();
+        match &dt.get_entry(fd).ok_or(errors::ClosedError::ClosedFd)?.entry {
+            PipeEnd::Receiver(p) => {
+                let mut rb = p.endpoint.rb.lock();
+                let len = rb.occupied_len();
+                if len == 0 {
+                    return Ok(alloc::vec::Vec::new());
+                }
+                let mut buf = alloc::vec![0u8; len];
+                let n = rb.pop_slice(&mut buf);
+                buf.truncate(n);
+                drop(rb);
+                if let Some(peer) = p.peer.upgrade() {
+                    peer.endpoint.pollee.notify_observers(Events::OUT);
+                }
+                Ok(buf)
+            }
+            PipeEnd::Sender(_) => Ok(alloc::vec::Vec::new()),
+        }
+    }
+
     /// Return the number of bytes that can still be written without blocking.
     pub fn writable_bytes(&self, fd: &PipeFd<Platform>) -> Result<usize, errors::ClosedError> {
         let dt = self.litebox.descriptor_table();

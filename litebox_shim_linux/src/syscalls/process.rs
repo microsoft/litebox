@@ -2876,6 +2876,47 @@ impl<FS: ShimFS> Task<FS> {
                     HostPipeDirection::Write => (os_write, os_read),
                 };
 
+                // For Read-direction children: drain any data already buffered
+                // in the virtual pipe into the OS pipe.  This handles the case
+                // where a builtin (e.g. `echo`) wrote to the virtual pipe
+                // without triggering delayed fork, then the reader (e.g. `cat`)
+                // commits and needs that data in the OS pipe.
+                if child_dir == HostPipeDirection::Read {
+                    let files = self.files.borrow();
+                    let rds = files.raw_descriptor_store.read();
+                    if let Ok(typed) =
+                        rds.fd_from_raw_integer::<litebox::pipes::Pipes<crate::Platform>>(child_fd)
+                    {
+                        drop(rds);
+                        if let Ok(data) = self.global.pipes.drain_available(&typed)
+                            && !data.is_empty()
+                        {
+                            #[cfg(feature = "trace_syscalls")]
+                            litebox::log_println!(
+                                self.global.platform,
+                                "[DELAYED-FORK] pid={}: drained {} bytes from virtual pipe fd={} into OS pipe",
+                                self.pid,
+                                data.len(),
+                                child_fd,
+                            );
+                            let mut offset = 0;
+                            while offset < data.len() {
+                                match self
+                                    .global
+                                    .platform
+                                    .write_host_fd(parent_os_fd, &data[offset..])
+                                {
+                                    Ok(n) => offset += n,
+                                    Err(_) => break,
+                                }
+                            }
+                        }
+                    } else {
+                        drop(rds);
+                    }
+                    drop(files);
+                }
+
                 child_pipe_bridges.push((child_fd, child_os_fd, child_dir));
 
                 // Find the parent's counterpart FD (opposite direction, same pipe pair).
