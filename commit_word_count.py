@@ -1,52 +1,55 @@
 #!/usr/bin/env python3
-"""Word count on the last 8 git commit messages."""
+"""Count the number of words in the last Git commit (message + diff)."""
 
 import subprocess
-import re
-from collections import Counter
-
-NUM_COMMITS = 8
-SEPARATOR = "---COMMIT---"
+import sys
 
 
-def get_commit_messages(n):
+def git(*args):
     result = subprocess.run(
-        ["git", "log", f"-{n}", f"--format=%B{SEPARATOR}"],
-        capture_output=True, text=True, check=True,
+        ["git", "--no-pager", *args],
+        capture_output=True,
+        text=True,
+        check=True,
     )
-    raw = result.stdout.strip()
-    messages = [m.strip() for m in raw.split(SEPARATOR) if m.strip()]
-    return messages
+    return result.stdout.strip()
 
 
-def word_count(text):
-    words = re.findall(r"[a-zA-Z0-9_]+", text.lower())
-    return Counter(words)
+def count_words(text):
+    return len(text.split())
 
 
 def main():
-    messages = get_commit_messages(NUM_COMMITS)
-    all_counts = Counter()
-    total_words = 0
+    try:
+        sha = git("log", "-1", "--format=%H")
+        subject = git("log", "-1", "--format=%s")
+        body = git("log", "-1", "--format=%b")
+        diff = git("diff", f"{sha}~1", sha)
+    except subprocess.CalledProcessError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
 
-    print(f"=== Word Count for Last {len(messages)} Commits ===\n")
+    message = f"{subject}\n\n{body}".strip()
+    msg_words = count_words(message)
 
-    for i, msg in enumerate(messages, 1):
-        counts = word_count(msg)
-        n_words = sum(counts.values())
-        total_words += n_words
-        all_counts += counts
-        first_line = msg.splitlines()[0] if msg else ""
-        print(f"  Commit {i} ({n_words:>3} words): {first_line}")
+    added, removed = [], []
+    for line in diff.splitlines():
+        if line.startswith("+") and not line.startswith("+++"):
+            added.append(line[1:])
+        elif line.startswith("-") and not line.startswith("---"):
+            removed.append(line[1:])
 
-    print(f"\n  Total:   {total_words} words across {len(messages)} commits")
-    print(f"  Average: {total_words / len(messages):.1f} words per commit")
-    print(f"  Unique:  {len(all_counts)} unique words\n")
+    added_words = count_words("\n".join(added))
+    removed_words = count_words("\n".join(removed))
+    diff_words = count_words(diff)
 
-    print("Top words by frequency:")
-    for word, count in all_counts.most_common(15):
-        bar = "█" * count
-        print(f"  {word:<20} {count:>3}  {bar}")
+    print(f"Commit: {sha[:12]}")
+    print(f"Subject: {subject}\n")
+    print(f"  Commit message:  {msg_words:>6} words")
+    print(f"  Full diff:       {diff_words:>6} words")
+    print(f"    Added lines:   {added_words:>6} words")
+    print(f"    Removed lines: {removed_words:>6} words")
+    print(f"  Total:           {msg_words + diff_words:>6} words")
 
 
 if __name__ == "__main__":

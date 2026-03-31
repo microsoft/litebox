@@ -536,11 +536,22 @@ impl<
                 if excl {
                     return Err(OpenError::AlreadyExists);
                 }
-                // Check if this is the host's actual PTY device path. If so,
-                // create a Device::Tty fd (same as /dev/tty) instead of looking
-                // up the sandbox's internal PTY manager. This check runs first
-                // to avoid collisions with internal PTY indices.
-                if self
+                let num_str = &p["/dev/pts/".len()..];
+                let idx: u32 = num_str
+                    .parse()
+                    .map_err(|_| OpenError::PathError(PathError::NoSuchFileOrDirectory))?;
+                // A sandbox-created PTY always takes priority over the host
+                // terminal alias. Only fall through to Device::Tty when no
+                // sandbox PTY with this index exists AND the path matches the
+                // host's actual tty.
+                if let Some(pair) = self.pty_manager.get(idx) {
+                    if !pair.unlocked.load(core::sync::atomic::Ordering::Acquire) {
+                        return Err(OpenError::AccessNotAllowed);
+                    }
+                    pair.slave_open_count
+                        .fetch_add(1, core::sync::atomic::Ordering::Release);
+                    (Device::PtySlave(idx), Some(pair))
+                } else if self
                     .litebox
                     .x
                     .platform
@@ -549,20 +560,7 @@ impl<
                 {
                     (Device::Tty, None)
                 } else {
-                    let num_str = &p["/dev/pts/".len()..];
-                    let idx: u32 = num_str
-                        .parse()
-                        .map_err(|_| OpenError::PathError(PathError::NoSuchFileOrDirectory))?;
-                    let pair = self
-                        .pty_manager
-                        .get(idx)
-                        .ok_or(OpenError::PathError(PathError::NoSuchFileOrDirectory))?;
-                    if !pair.unlocked.load(core::sync::atomic::Ordering::Acquire) {
-                        return Err(OpenError::AccessNotAllowed);
-                    }
-                    pair.slave_open_count
-                        .fetch_add(1, core::sync::atomic::Ordering::Release);
-                    (Device::PtySlave(idx), Some(pair))
+                    return Err(OpenError::PathError(PathError::NoSuchFileOrDirectory));
                 }
             }
             _ => return Err(OpenError::PathError(PathError::NoSuchFileOrDirectory)),
