@@ -45,10 +45,7 @@ fn is_host_tty_path(path: &str) -> bool {
 }
 
 /// Check if a path matches the host's actual PTY device path (e.g., `/dev/pts/156`).
-fn is_host_pty_device_path<Platform: litebox::platform::StdioProvider>(
-    path: &str,
-    platform: &Platform,
-) -> bool {
+fn is_host_pty_device_path(path: &str, platform: &litebox_platform_multiplex::Platform) -> bool {
     platform
         .host_stdin_tty_device_info()
         .is_some_and(|info| path == info.path)
@@ -716,12 +713,23 @@ impl<FS: ShimFS> Task<FS> {
             }
             // Tag fds opened via the host PTY device path (e.g., /dev/pts/156)
             // so that fstat returns the host PTY identity, not the default
-            // Device::Tty identity (rdev=0x500).
+            // Device::Tty identity (rdev=0x500). Skip if the fd resolved to a
+            // sandbox PTY (major 136) rather than the host tty alias.
             if let Ok(path_str) = path.to_str()
                 && is_host_pty_device_path(path_str, self.global.platform)
             {
-                let old = dt.set_entry_metadata(&file, HostPtyDeviceFd);
-                assert!(old.is_none());
+                let is_sandbox_pty = self
+                    .files
+                    .borrow()
+                    .fs
+                    .fd_file_status(&file)
+                    .ok()
+                    .and_then(|s| s.node_info.rdev)
+                    .is_some_and(|rdev| (rdev.get() >> 8) >= 136);
+                if !is_sandbox_pty {
+                    let old = dt.set_entry_metadata(&file, HostPtyDeviceFd);
+                    assert!(old.is_none());
+                }
             }
         }
         self.files
@@ -826,8 +834,16 @@ impl<FS: ShimFS> Task<FS> {
                         .as_deref()
                         .is_some_and(|p| is_host_pty_device_path(p, self.global.platform))
                     {
-                        let old = dt.set_entry_metadata(&file, HostPtyDeviceFd);
-                        assert!(old.is_none());
+                        let is_sandbox_pty = files
+                            .fs
+                            .fd_file_status(&file)
+                            .ok()
+                            .and_then(|s| s.node_info.rdev)
+                            .is_some_and(|rdev| (rdev.get() >> 8) >= 136);
+                        if !is_sandbox_pty {
+                            let old = dt.set_entry_metadata(&file, HostPtyDeviceFd);
+                            assert!(old.is_none());
+                        }
                     }
                 }
                 files
@@ -3071,8 +3087,12 @@ impl<FS: ShimFS> Task<FS> {
 
         // Override st_dev/st_ino/st_rdev for the host PTY path so that
         // stat("/dev/pts/N") matches fstat(0) — required by glibc ttyname_r's
-        // is_mytty() verification.
-        if is_host_pty && let Some(info) = self.global.platform.host_stdin_tty_device_info() {
+        // is_mytty() verification. Skip when a sandbox PTY shadows the path
+        // (the stat already returned sandbox PTY identity with major 136-143).
+        if is_host_pty
+            && (result.st_rdev >> 8) < 136
+            && let Some(info) = self.global.platform.host_stdin_tty_device_info()
+        {
             result.st_dev = info.dev.truncate();
             result.st_ino = info.ino.truncate();
             result.st_rdev = info.rdev.truncate();
@@ -3963,11 +3983,20 @@ impl<FS: ShimFS> Task<FS> {
 
         match arg {
             IoctlArg::TCGETS(termios_ptr) => {
-                let attrs = self
-                    .global
-                    .platform
-                    .get_terminal_attributes(stream)
-                    .map_err(ioctl_err_to_errno)?;
+                // Non-init processes may have a shadow termios from a
+                // silently-accepted TCSETS. Return the shadow if present
+                // so TCGETS reflects what the caller set.
+                let shadow = self.global.host_tty_shadow_termios.lock().clone();
+                let attrs = if self.process_id != litebox::process::ProcessId::INIT
+                    && let Some(ref shadow_attrs) = shadow
+                {
+                    shadow_attrs.clone()
+                } else {
+                    self.global
+                        .platform
+                        .get_terminal_attributes(stream)
+                        .map_err(ioctl_err_to_errno)?
+                };
                 termios_ptr
                     .write_at_offset(
                         0,
@@ -3986,14 +4015,6 @@ impl<FS: ShimFS> Task<FS> {
             IoctlArg::TCSETS(termios_ptr) => {
                 let t: litebox_common_linux::Termios =
                     termios_ptr.read_at_offset(0).ok_or(Errno::EFAULT)?;
-                // Only the init process may change the real host terminal
-                // attributes. Child processes accept the call silently so they
-                // think the change succeeded, but we skip the real ioctl to
-                // prevent them from leaving the terminal in a bad state (e.g.
-                // canonical mode) after they exit.
-                if self.process_id != litebox::process::ProcessId::INIT {
-                    return Ok(0);
-                }
                 let attrs = litebox::platform::TerminalAttributes {
                     c_iflag: t.c_iflag,
                     c_oflag: t.c_oflag,
@@ -4002,18 +4023,24 @@ impl<FS: ShimFS> Task<FS> {
                     c_line: t.c_line,
                     c_cc: t.c_cc,
                 };
+                // Only the init process may change the real host terminal
+                // attributes. Child processes update a shadow so TCGETS
+                // reflects the change, but the real terminal is untouched.
+                if self.process_id != litebox::process::ProcessId::INIT {
+                    *self.global.host_tty_shadow_termios.lock() = Some(attrs);
+                    return Ok(0);
+                }
                 self.global
                     .platform
                     .set_terminal_attributes(stream, &attrs, SetTermiosWhen::Now)
                     .map_err(ioctl_err_to_errno)?;
+                // Clear stale shadow so non-init TCGETS sees the new real state.
+                *self.global.host_tty_shadow_termios.lock() = None;
                 Ok(0)
             }
             IoctlArg::TCSETSW(termios_ptr) => {
                 let t: litebox_common_linux::Termios =
                     termios_ptr.read_at_offset(0).ok_or(Errno::EFAULT)?;
-                if self.process_id != litebox::process::ProcessId::INIT {
-                    return Ok(0);
-                }
                 let attrs = litebox::platform::TerminalAttributes {
                     c_iflag: t.c_iflag,
                     c_oflag: t.c_oflag,
@@ -4022,18 +4049,20 @@ impl<FS: ShimFS> Task<FS> {
                     c_line: t.c_line,
                     c_cc: t.c_cc,
                 };
+                if self.process_id != litebox::process::ProcessId::INIT {
+                    *self.global.host_tty_shadow_termios.lock() = Some(attrs);
+                    return Ok(0);
+                }
                 self.global
                     .platform
                     .set_terminal_attributes(stream, &attrs, SetTermiosWhen::AfterDrain)
                     .map_err(ioctl_err_to_errno)?;
+                *self.global.host_tty_shadow_termios.lock() = None;
                 Ok(0)
             }
             IoctlArg::TCSETSF(termios_ptr) => {
                 let t: litebox_common_linux::Termios =
                     termios_ptr.read_at_offset(0).ok_or(Errno::EFAULT)?;
-                if self.process_id != litebox::process::ProcessId::INIT {
-                    return Ok(0);
-                }
                 let attrs = litebox::platform::TerminalAttributes {
                     c_iflag: t.c_iflag,
                     c_oflag: t.c_oflag,
@@ -4042,10 +4071,15 @@ impl<FS: ShimFS> Task<FS> {
                     c_line: t.c_line,
                     c_cc: t.c_cc,
                 };
+                if self.process_id != litebox::process::ProcessId::INIT {
+                    *self.global.host_tty_shadow_termios.lock() = Some(attrs);
+                    return Ok(0);
+                }
                 self.global
                     .platform
                     .set_terminal_attributes(stream, &attrs, SetTermiosWhen::AfterDrainFlushInput)
                     .map_err(ioctl_err_to_errno)?;
+                *self.global.host_tty_shadow_termios.lock() = None;
                 Ok(0)
             }
             IoctlArg::TIOCGWINSZ(ws_ptr) => {

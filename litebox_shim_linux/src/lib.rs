@@ -283,6 +283,7 @@ impl LinuxShimBuilder {
             host_tty_foreground_pgrp: litebox::sync::Mutex::new(
                 litebox::process::ProcessGroupId::from(litebox::process::ProcessId::INIT),
             ),
+            host_tty_shadow_termios: litebox::sync::Mutex::new(None),
             local_control_plane_pump_active: core::sync::atomic::AtomicBool::new(false),
             transport_interrupt: alloc::sync::Arc::new(core::sync::atomic::AtomicBool::new(false)),
             epoll_graph_lock: litebox::sync::Mutex::new(()),
@@ -2401,6 +2402,12 @@ struct GlobalState<FS: ShimFS> {
     /// Foreground process group for the shared host tty backing stdio and
     /// `/dev/tty`.
     host_tty_foreground_pgrp: litebox::sync::Mutex<Platform, litebox::process::ProcessGroupId>,
+    /// Shadow terminal attributes for non-init processes. When a child calls
+    /// TCSETS on host stdio, the real terminal is not changed but the shadow
+    /// is updated so subsequent TCGETS returns the values the child expects.
+    /// The init process bypasses this and modifies the real terminal directly.
+    host_tty_shadow_termios:
+        litebox::sync::Mutex<Platform, Option<litebox::platform::TerminalAttributes>>,
     /// Ensures only one task thread drains the local control-plane queue at a time.
     local_control_plane_pump_active: core::sync::atomic::AtomicBool,
     /// Flag set during vfork to break transport spin-loops and propagate EINTR.

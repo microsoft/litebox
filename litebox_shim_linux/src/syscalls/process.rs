@@ -1740,7 +1740,10 @@ impl<FS: ShimFS> Task<FS> {
                     if v == 0 {
                         break;
                     }
-                    let _ = ps.vfork_parking.park.block(v);
+                    let _ = ps
+                        .vfork_parking
+                        .park
+                        .block_or_timeout(v, core::time::Duration::from_millis(5));
                 }
                 if parking_atomic.load(Ordering::Acquire) != 0 {
                     return Err(Errno::EAGAIN);

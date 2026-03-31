@@ -877,7 +877,15 @@ impl<
                 });
             }
             p if p.starts_with("/dev/pts/") => {
-                // Check for host PTY path before internal PTY manager lookup.
+                let num_str = &p["/dev/pts/".len()..];
+                let idx: u32 = num_str
+                    .parse()
+                    .map_err(|_| FileStatusError::PathError(PathError::NoSuchFileOrDirectory))?;
+                // Sandbox PTY takes priority over host tty alias, matching
+                // the open() resolution order.
+                if self.pty_manager.get(idx).is_some() {
+                    return Ok(Self::device_file_status(Device::PtySlave(idx)));
+                }
                 if let Some(info) = self.litebox.x.platform.host_stdin_tty_device_info()
                     && p == info.path
                 {
@@ -893,13 +901,6 @@ impl<
                         },
                         blksize: STDIO_BLOCK_SIZE,
                     });
-                }
-                let num_str = &p["/dev/pts/".len()..];
-                let idx: u32 = num_str
-                    .parse()
-                    .map_err(|_| FileStatusError::PathError(PathError::NoSuchFileOrDirectory))?;
-                if self.pty_manager.get(idx).is_some() {
-                    return Ok(Self::device_file_status(Device::PtySlave(idx)));
                 }
                 return Err(FileStatusError::PathError(PathError::NoSuchFileOrDirectory));
             }

@@ -706,44 +706,107 @@ impl<FS: ShimFS> Task<FS> {
     }
 
     pub(crate) fn sys_kill(&self, pid: i32, signal: i32) -> Result<usize, Errno> {
-        if pid == 0 {
-            // pid=0 means "send to every process in the caller's process
-            // group". On real Linux this delivers to every group member.
-            //
-            // The sandbox does not support process stopping (SIGSTOP,
-            // SIGTSTP, SIGTTIN, SIGTTOU with SIG_DFL are treated as
-            // terminate), so stop signals sent to the own group are
-            // accepted without delivery to avoid accidentally killing
-            // the caller (e.g. bash's job-control SIGTTIN loop).
-            if signal > 0
-                && let Ok(sig) = Signal::try_from(signal)
-                && sig.default_disposition()
-                    == litebox_common_linux::signal::SignalDisposition::Stop
-            {
-                return Ok(0);
+        // The sandbox treats default-disposition stop signals as terminate.
+        // Suppress them for group/broadcast kills to avoid accidentally
+        // killing targets that should only be stopped.
+        let suppress_stop = signal > 0
+            && Signal::try_from(signal).is_ok_and(|sig| {
+                sig.default_disposition() == litebox_common_linux::signal::SignalDisposition::Stop
+            });
+
+        if pid == 0 || pid < -1 {
+            // pid=0: send to caller's process group.
+            // pid<-1: send to process group -pid.
+
+            // Validate signal upfront (Linux rejects invalid signals before
+            // iterating the process table).
+            if signal != 0 {
+                Signal::try_from(signal)?;
             }
-            return self.do_kill(Some(self.pid), None, signal);
-        }
-        if pid < -1 {
-            // pid < -1 means "send to every process in process group -pid".
-            // We only deliver to self when the caller is in that group;
-            // otherwise the target group may not exist on this host.
-            let target_pgid = u32::try_from(pid.wrapping_neg()).map_err(|_| Errno::ESRCH)?;
+
+            let target_pgid = if pid == 0 {
+                litebox::process::ProcessGroupId(self.sys_getpgid(0).map_err(|_| Errno::ESRCH)?)
+            } else {
+                let raw = u32::try_from(pid.wrapping_neg()).map_err(|_| Errno::ESRCH)?;
+                litebox::process::ProcessGroupId(raw)
+            };
+
             let my_pgid = self.sys_getpgid(0).unwrap_or(0);
-            if my_pgid == target_pgid {
-                return self.do_kill(Some(self.pid), None, signal);
+            let is_own_group = target_pgid.as_u32() == my_pgid;
+            let mut delivered = false;
+
+            // Deliver to self first (if in the target group).
+            if is_own_group {
+                if !suppress_stop {
+                    let _ = self.do_kill(Some(self.pid), None, signal);
+                }
+                delivered = true;
             }
-            // Try remote delivery for the group leader.
-            return self.do_remote_process_kill(
-                i32::try_from(target_pgid).map_err(|_| Errno::ESRCH)?,
-                None,
-                signal,
-            );
+
+            // Deliver to all other processes in the group.
+            let members = self
+                .global
+                .litebox
+                .process_registry()
+                .process_ids_in_group(target_pgid);
+            for member in &members {
+                // Skip self — already handled via do_kill above. Compare
+                // using process_id (guest ProcessId), not pid (host TID).
+                if *member == self.process_id {
+                    continue;
+                }
+                let member_pid = i32::try_from(member.0).unwrap_or(-1);
+                if member_pid > 0 {
+                    if suppress_stop {
+                        delivered = true;
+                        continue;
+                    }
+                    if self
+                        .do_remote_process_kill(member_pid, None, signal)
+                        .is_ok()
+                    {
+                        delivered = true;
+                    }
+                }
+            }
+
+            if !delivered && members.is_empty() {
+                return Err(Errno::ESRCH);
+            }
+            return Ok(0);
         }
         if pid == -1 {
             // pid=-1 means "send to every process the caller can signal
-            // (except PID 1)". Full broadcast is not implemented; return
-            // success so callers that rely on non-ESRCH behaviour work.
+            // (except PID 1 and self)".
+            if signal != 0 {
+                Signal::try_from(signal)?;
+            }
+            // Suppress stop signals — the sandbox treats Stop as Terminate.
+            if suppress_stop {
+                return Ok(0);
+            }
+            let all_pids = self
+                .global
+                .litebox
+                .process_registry()
+                .all_running_except(self.process_id);
+            let mut delivered = false;
+            for target in all_pids {
+                if target == litebox::process::ProcessId::INIT {
+                    continue; // skip PID 1, matching Linux semantics
+                }
+                let target_pid = i32::try_from(target.0).unwrap_or(-1);
+                if target_pid > 0
+                    && self
+                        .do_remote_process_kill(target_pid, None, signal)
+                        .is_ok()
+                {
+                    delivered = true;
+                }
+            }
+            if !delivered {
+                return Err(Errno::ESRCH);
+            }
             return Ok(0);
         }
         if pid > 0 && pid != self.pid {

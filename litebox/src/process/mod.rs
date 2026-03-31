@@ -999,6 +999,30 @@ impl<Platform: RawSyncPrimitivesProvider> ProcessRegistry<Platform> {
         )
     }
 
+    /// Returns the process IDs of all running processes in the given group.
+    pub fn process_ids_in_group(&self, pgid: ProcessGroupId) -> alloc::vec::Vec<ProcessId> {
+        let table = self.table.read();
+        table
+            .values()
+            .filter(|entry| {
+                entry.context.pgid == pgid && matches!(entry.context.state, ProcessState::Running)
+            })
+            .map(|entry| entry.context.id)
+            .collect()
+    }
+
+    /// Returns the process IDs of all running processes except `exclude`.
+    pub fn all_running_except(&self, exclude: ProcessId) -> alloc::vec::Vec<ProcessId> {
+        let table = self.table.read();
+        table
+            .values()
+            .filter(|entry| {
+                matches!(entry.context.state, ProcessState::Running) && entry.context.id != exclude
+            })
+            .map(|entry| entry.context.id)
+            .collect()
+    }
+
     /// Create a new session with `caller` as the session leader and sole
     /// member of a new process group.
     ///
