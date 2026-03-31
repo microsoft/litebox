@@ -1222,6 +1222,16 @@ impl<FS: ShimFS> Task<FS> {
 
         // Fast path: host-pipe FDs bypass the multi-subsystem dispatch.
         if let Some(hp_fd) = files.try_host_pipe_fd(raw_fd) {
+            #[cfg(feature = "trace_syscalls")]
+            if raw_fd <= 2 {
+                litebox::log_println!(
+                    self.global.platform,
+                    "[WRITE-HOSTPIPE] pid={} fd={} len={}",
+                    self.pid,
+                    raw_fd,
+                    buf.len(),
+                );
+            }
             let handle = self
                 .global
                 .litebox
@@ -1244,6 +1254,16 @@ impl<FS: ShimFS> Task<FS> {
             .run_on_raw_fd(
                 raw_fd,
                 |fd| {
+                    #[cfg(feature = "trace_syscalls")]
+                    if raw_fd <= 2 {
+                        litebox::log_println!(
+                            self.global.platform,
+                            "[WRITE-FS-TRACE] pid={} fd={} len={}",
+                            self.pid,
+                            raw_fd,
+                            buf.len(),
+                        );
+                    }
                     let _position_guard = if offset.is_none()
                         && matches!(
                             files.fs.fd_file_status(fd),

@@ -2621,31 +2621,46 @@ impl<FS: ShimFS> Task<FS> {
             }
 
             // Apply fd replacements deposited by commit_delayed_fork.
-            // The parent's virtual pipe/socket endpoints are replaced with
-            // HostPipe FDs that do direct I/O on the real OS pipes connecting
-            // to the migrated child.
+            // Instead of replacing with HostPipeFd (which has a no-op
+            // register_observer and therefore breaks epoll), create a
+            // virtual pipe pair and spawn a relay thread that bridges
+            // the real OS pipe to the virtual pipe.  Virtual pipes
+            // support epoll via the Pollee mechanism, so programs that
+            // rely on epoll (e.g. Node.js) get correct wakeups.
             let replacements: Vec<crate::FdReplacement> =
                 vd.fd_replacements.lock().drain(..).collect();
             if !replacements.is_empty() {
+                use super::host_pipe::HostPipeDirection;
+
                 let files = self.files.borrow();
                 for repl in replacements {
                     #[cfg(feature = "trace_syscalls")]
                     litebox::log_println!(
                         self.global.platform,
-                        "[FD-REPLACE] pid={}: replacing guest_fd={} with HostPipeFd(host_fd={}, dir={:?}, subsystem={:?})",
+                        "[FD-REPLACE] pid={}: replacing guest_fd={} with virtual pipe relay (host_fd={}, dir={:?}, subsystem={:?})",
                         self.pid,
                         repl.guest_fd,
                         repl.host_fd,
                         repl.direction,
                         repl.subsystem,
                     );
-                    let entry = super::host_pipe::HostPipeFd::new(repl.host_fd, repl.direction);
-                    let mut dt = self.global.litebox.descriptor_table_mut();
-                    let typed_fd: litebox::fd::TypedFd<super::host_pipe::HostPipeSubsystem> =
-                        dt.insert(entry);
-                    drop(dt);
 
-                    // Consume the old virtual fd and install the HostPipe FD
+                    // Create a virtual pipe pair.  The parent keeps one
+                    // end in its fd table; the relay thread owns the other.
+                    let (sender, receiver) = self.global.pipes.create_pipe(
+                        1024 * 1024,
+                        litebox::pipes::Flags::empty(),
+                        core::num::NonZero::new(4096),
+                    );
+
+                    // Read direction: parent reads ← relay writes ← OS pipe
+                    // Write direction: parent writes → relay reads → OS pipe
+                    let (parent_pipe_fd, relay_pipe_fd) = match repl.direction {
+                        HostPipeDirection::Read => (receiver, sender),
+                        HostPipeDirection::Write => (sender, receiver),
+                    };
+
+                    // Consume the old virtual fd and install the virtual pipe
                     // under the rds lock, then drop the lock before closing the
                     // old pipe to maintain the lock ordering invariant
                     // (descriptor_table → rds, never rds → descriptor_table).
@@ -2668,7 +2683,7 @@ impl<FS: ShimFS> Task<FS> {
                         };
                         old_pipe = consumed_pipe;
                         old_socket = consumed_socket;
-                        let ok = rds.fd_into_specific_raw_integer(typed_fd, repl.guest_fd);
+                        let ok = rds.fd_into_specific_raw_integer(parent_pipe_fd, repl.guest_fd);
                         debug_assert!(ok, "fd replacement: slot {} still occupied", repl.guest_fd);
                     }
                     if let Some(old_typed) = old_pipe {
@@ -2681,6 +2696,83 @@ impl<FS: ShimFS> Task<FS> {
                             .descriptor_table_mut()
                             .remove(&old_typed);
                     }
+
+                    // Spawn a background relay thread bridging the OS pipe
+                    // to/from the virtual pipe.
+                    let platform = self.global.platform;
+                    let pipes = self.global.pipes.clone();
+                    let host_fd = repl.host_fd;
+                    let direction = repl.direction;
+
+                    self.global.platform.spawn_background_task(move || {
+                        let wait_state = litebox::event::wait::WaitState::new(platform);
+                        let cx = wait_state.context();
+                        let mut buf = alloc::vec![0u8; 65536];
+
+                        match direction {
+                            HostPipeDirection::Read => {
+                                // Relay: OS pipe → virtual pipe sender.
+                                // The parent's receiver end gets Pollee
+                                // notifications, enabling epoll wakeups.
+                                loop {
+                                    match platform.read_host_fd(host_fd, &mut buf) {
+                                        Ok(0) | Err(_) => break,
+                                        Ok(n) => {
+                                            let mut offset = 0;
+                                            while offset < n {
+                                                if let Ok(w) = pipes.write(
+                                                    &cx,
+                                                    &relay_pipe_fd,
+                                                    &buf[offset..n],
+                                                ) {
+                                                    offset += w;
+                                                } else {
+                                                    // Parent closed receiver.
+                                                    let _ = pipes.close(&relay_pipe_fd);
+                                                    platform.close_host_fd(host_fd);
+                                                    return;
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                // OS pipe EOF — close sender so parent
+                                // sees HUP/EOF on the receiver.
+                                let _ = pipes.close(&relay_pipe_fd);
+                                platform.close_host_fd(host_fd);
+                            }
+                            HostPipeDirection::Write => {
+                                // Relay: virtual pipe receiver → OS pipe.
+                                // The parent writes to the sender end;
+                                // the relay drains the receiver into the
+                                // real OS pipe for the child process.
+                                loop {
+                                    match pipes.read(&cx, &relay_pipe_fd, &mut buf) {
+                                        Ok(0) | Err(_) => break,
+                                        Ok(n) => {
+                                            let mut offset = 0;
+                                            while offset < n {
+                                                if let Ok(w) =
+                                                    platform.write_host_fd(host_fd, &buf[offset..n])
+                                                {
+                                                    offset += w;
+                                                } else {
+                                                    // OS pipe broken (child exited).
+                                                    let _ = pipes.close(&relay_pipe_fd);
+                                                    platform.close_host_fd(host_fd);
+                                                    return;
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                // Virtual pipe sender closed — propagate
+                                // EOF by closing the OS pipe.
+                                platform.close_host_fd(host_fd);
+                                let _ = pipes.close(&relay_pipe_fd);
+                            }
+                        }
+                    });
                 }
             }
 
@@ -3004,31 +3096,19 @@ impl<FS: ShimFS> Task<FS> {
             }
 
             // Host-backed pipes (from prior delayed-fork bridges) are already
-            // backed by real OS fds.  We dup the fd so that the parent keeps
-            // its original fd intact after spawn closes bridge fds.
+            // backed by real OS fds.  The child worker inherits these fds
+            // directly from the parent via the host process fd table — no new
+            // OS pipe bridge is needed.  We just clear O_CLOEXEC so they
+            // survive posix_spawn, and install_host_pipe_fd in the worker will
+            // wrap them in HostPipeFd at the correct guest fd slots.
+            //
+            // DO NOT add these to child_pipe_bridges — that would cause
+            // spawn_worker_host_for_fork_restore to dup2 them onto stdio
+            // slots, disconnecting the chain that reaches the original parent.
             for &(guest_fd, host_fd, direction) in &child_host_pipes {
-                match self.global.platform.dup_host_fd(host_fd) {
-                    Ok(dup_fd) => child_pipe_bridges.push((guest_fd, dup_fd, direction)),
-                    Err(_e) => {
-                        #[cfg(feature = "trace_syscalls")]
-                        litebox::log_println!(
-                            self.global.platform,
-                            "[DELAYED-FORK] pid={}: dup_host_fd({}) failed: {}",
-                            self.pid,
-                            host_fd,
-                            _e,
-                        );
-                        // Close any already-created bridge fds.
-                        for &(_, os_fd, _) in &child_pipe_bridges {
-                            self.global.platform.close_host_fd(os_fd);
-                        }
-                        for pr in &parent_replacements {
-                            self.global.platform.close_host_fd(pr.host_fd);
-                        }
-                        put_fc_back(self, fc);
-                        return Err(Errno::ENOMEM);
-                    }
-                }
+                let _ = self.global.platform.clear_cloexec(host_fd);
+                // Add as bridge spec so install_host_pipe_fd sets up the guest.
+                child_pipe_bridges.push((guest_fd, host_fd, direction));
             }
 
             // --- Unix socket bridging (stdio slots only) ---
@@ -4068,17 +4148,19 @@ impl<FS: ShimFS> Task<FS> {
             };
 
             // Accept stdio, pipes, terminal filesystem fds, connected
-            // Unix sockets on stdio slots, and non-terminal filesystem fds
-            // on stdio slots (e.g. /dev/null redirections).
+            // Unix sockets on stdio slots, and non-terminal filesystem fds.
             //
-            // NOTE: The gate intentionally does not validate socket type
-            // (stream vs datagram), connection state, or O_NONBLOCK here.
-            // Its purpose is to avoid false rejections — rejecting forks
-            // that could succeed. Detailed validation happens at commit
-            // time in commit_delayed_fork, where failure kills the child
-            // with proper cleanup (same pattern as pipe bridging).
+            // Non-terminal FilesystemFd on stdio slots (fd <= 2) without
+            // host-stdio-source metadata are rejected — these are typically
+            // PTY slaves opened by the guest (e.g. bash opens /dev/pts/N).
+            // PTY communication requires the master/slave relationship which
+            // doesn't survive across host processes.  Non-terminal fds on
+            // fd > 2 (e.g. bash's saved fd 255) are safe to accept and
+            // reopen by path.
             match class {
-                FdClass::StdioFd | FdClass::Pipe | FdClass::FilesystemFd => {}
+                FdClass::StdioFd | FdClass::Pipe => {}
+                FdClass::FilesystemFd if terminal_meta.is_some() => {}
+                FdClass::FilesystemFd if raw_fd > 2 => {}
                 FdClass::UnixSocket if raw_fd <= 2 && socket_pair_id.is_some() => {}
                 _ => {
                     reject.push(ForkRejectReason::UnsupportedFdClass { fd: raw_fd, class });
