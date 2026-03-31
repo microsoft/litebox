@@ -1940,18 +1940,20 @@ impl<FS: ShimFS> Task<FS> {
         }
         if let Ok(fd) = rds.fd_consume_raw_integer::<super::host_pipe::HostPipeSubsystem>(raw_fd) {
             drop(rds);
-            // Atomically take the host fd so concurrent readers see -1 (EBADF)
-            // before we actually close the OS descriptor.
-            let host_fd = {
-                let dt = self.global.litebox.descriptor_table();
-                dt.entry_handle(&fd)
-                    .map(|handle| handle.with_entry(|e: &super::host_pipe::HostPipeFd| e.take_fd()))
-            };
-            if let Some(host_fd) = host_fd.filter(|&fd| fd >= 0) {
-                self.global.platform.close_host_fd(host_fd);
-            }
+            // Remove the descriptor table entry.  The OS fd is only closed
+            // when this was the last reference (i.e. remove() returns the
+            // entry), because dup'd HostPipeFd entries share the same
+            // underlying SharedEntry and we must not invalidate the fd for
+            // other aliases.
             let mut dt = self.global.litebox.descriptor_table_mut();
-            dt.remove(&fd);
+            let entry = dt.remove(&fd);
+            drop(dt);
+            if let Some(entry) = entry {
+                let host_fd = entry.take_fd();
+                if host_fd >= 0 {
+                    self.global.platform.close_host_fd(host_fd);
+                }
+            }
             return Ok(());
         }
         // All the above cases should cover all the known subsystems, and we've already
@@ -2846,6 +2848,33 @@ fn synthetic_symlink_stat(target_len: usize) -> FileStat {
 fn descriptor_stat<FS: ShimFS>(raw_fd: usize, task: &Task<FS>) -> Result<FileStat, Errno> {
     let uid = task.credentials.euid.truncate();
     let gid = task.credentials.egid.truncate();
+
+    // Fast path: host-pipe FDs return a synthetic pipe-like stat.
+    if let Some(hp_fd) = task.files.borrow().try_host_pipe_fd(raw_fd) {
+        let dt = task.global.litebox.descriptor_table();
+        let dir = dt
+            .with_entry(&hp_fd, |e: &super::host_pipe::HostPipeFd| e.direction)
+            .ok_or(Errno::EBADF)?;
+        let read_write_mode = match dir {
+            super::host_pipe::HostPipeDirection::Read => Mode::RUSR,
+            super::host_pipe::HostPipeDirection::Write => Mode::WUSR,
+        };
+        return Ok(FileStat {
+            st_dev: PIPEFS_DEV.truncate(),
+            st_ino: raw_fd as u64,
+            st_nlink: 1,
+            st_mode: (read_write_mode.bits() | litebox_common_linux::InodeType::NamedPipe as u32)
+                .truncate(),
+            st_uid: uid,
+            st_gid: gid,
+            st_rdev: 0,
+            st_size: 0,
+            st_blksize: 4096,
+            st_blocks: 0,
+            ..Default::default()
+        });
+    }
+
     let mut fstat = task
         .files
         .borrow()
@@ -3047,6 +3076,12 @@ pub(crate) fn get_file_descriptor_flags<FS: ShimFS>(
             .with_metadata(fd, |flags: &FileDescriptorFlags| *flags)
             .unwrap_or(FileDescriptorFlags::empty())
     }
+
+    // Fast path: host-pipe FDs bypass run_on_raw_fd.
+    if let Some(hp_fd) = files.try_host_pipe_fd(raw_fd) {
+        return Ok(get_flags(global, &hp_fd));
+    }
+
     files.run_on_raw_fd(
         raw_fd,
         |fd| get_flags(global, fd),
@@ -3073,6 +3108,12 @@ fn set_file_descriptor_flags<FS: ShimFS>(
             .litebox
             .descriptor_table_mut()
             .set_fd_metadata(fd, flags);
+    }
+
+    // Fast path: host-pipe FDs bypass run_on_raw_fd.
+    if let Some(hp_fd) = files.try_host_pipe_fd(raw_fd) {
+        set_flags(global, &hp_fd, flags);
+        return Ok(());
     }
 
     files.run_on_raw_fd(
@@ -5246,7 +5287,28 @@ impl<FS: ShimFS> Task<FS> {
                     min_fd,
                 )
             },
-        )??;
+        );
+        // Fallback: try HostPipeSubsystem (pipe bridges from delayed fork).
+        let new_fd = match new_fd {
+            Ok(Ok(fd)) => fd,
+            Err(Errno::EBADF) => {
+                if let Some(hp_fd) = files.try_host_pipe_fd(file) {
+                    dup(
+                        &self.global,
+                        &files,
+                        &hp_fd,
+                        self.pid,
+                        file,
+                        close_on_exec,
+                        target,
+                        min_fd,
+                    )?
+                } else {
+                    return Err(Errno::EBADF);
+                }
+            }
+            Ok(Err(e)) | Err(e) => return Err(e),
+        };
         if target.is_none() {
             let max_fd = self
                 .process()

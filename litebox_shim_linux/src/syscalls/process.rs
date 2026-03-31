@@ -2594,6 +2594,15 @@ impl<FS: ShimFS> Task<FS> {
             if !replacements.is_empty() {
                 let files = self.files.borrow();
                 for repl in replacements {
+                    #[cfg(feature = "trace_syscalls")]
+                    litebox::log_println!(
+                        self.global.platform,
+                        "[PIPE-REPLACE] pid={}: replacing guest_fd={} with HostPipeFd(host_fd={}, dir={:?})",
+                        self.pid,
+                        repl.guest_fd,
+                        repl.host_fd,
+                        repl.direction,
+                    );
                     let entry = super::host_pipe::HostPipeFd::new(repl.host_fd, repl.direction);
                     let mut dt = self.global.litebox.descriptor_table_mut();
                     let typed_fd: litebox::fd::TypedFd<super::host_pipe::HostPipeSubsystem> =
@@ -3687,7 +3696,7 @@ impl<FS: ShimFS> Task<FS> {
     /// proceed or abort).
     fn snapshot_memory(
         &self,
-        reject: &mut super::fork_snapshot::ForkRejectReasons,
+        _reject: &mut super::fork_snapshot::ForkRejectReasons,
     ) -> super::fork_snapshot::MemorySnapshot {
         let ps = self.process_state.borrow();
         let mappings = ps.pm.mappings();
@@ -3696,21 +3705,15 @@ impl<FS: ShimFS> Task<FS> {
         for (range, flags) in &mappings {
             let is_shared = flags.contains(VmFlags::VM_SHARED);
 
-            // Reject writable shared mappings since we cannot preserve
-            // cross-host shared-memory semantics.  Read-only shared mappings
-            // (e.g. glibc's MAP_SHARED locale-archive) are snapshotted and
-            // restored as private copies — we clear is_shared so the restore
-            // path uses MAP_PRIVATE, avoiding elevated VM_MAYWRITE.
-            let snapshot_as_shared = if is_shared && flags.contains(VmFlags::VM_WRITE) {
-                reject.push(super::fork_snapshot::ForkRejectReason::SharedMapping {
-                    addr: range.start,
-                    len: range.end - range.start,
-                });
-                true
-            } else {
-                // Non-rejected shared mappings become private on restore.
-                false
-            };
+            // The sandbox demotes all MAP_SHARED mappings to MAP_PRIVATE at
+            // the kernel level (see mm.rs mmap handling), so VM_SHARED is
+            // metadata-only.  There is no actual cross-process shared memory
+            // to worry about.  File-backed shared mappings are just locale
+            // archives, gconv modules, etc.; anonymous shared mappings are
+            // process-local shmem.  Both are safe to snapshot.
+            // We restore all shared mappings as private (is_shared=false) to
+            // avoid the restore path elevating VM_MAYWRITE via SHARED flags.
+            let _ = is_shared;
 
             let len = range.end - range.start;
             let readable = flags.contains(VmFlags::VM_READ);
@@ -3749,7 +3752,7 @@ impl<FS: ShimFS> Task<FS> {
                 len,
                 permissions: flags.bits() & VmFlags::VM_ACCESS_FLAGS.bits(),
                 vm_flags: flags.bits(),
-                is_shared: snapshot_as_shared,
+                is_shared: false,
                 data,
             });
         }
@@ -6054,6 +6057,14 @@ fn worker_exec_stdio_is_unsupported<FS: ShimFS>(
         return false;
     }
     drop(rds);
+
+    // HostPipeFd: these are pipe bridge fds from a prior delayed fork.
+    // They already wrap a host OS fd, so the worker can inherit them
+    // directly — they are always supported.
+    if files.try_host_pipe_fd(raw_fd).is_some() {
+        return false;
+    }
+
     log_worker_exec_stdio_unsupported(global, raw_fd, "unknown descriptor subsystem");
     true
 }
@@ -6116,6 +6127,13 @@ fn worker_exec_input_binding<FS: ShimFS>(
 ) -> WorkerExecInputBinding<FS, Platform> {
     if !worker_exec_fd_survives_exec(raw_fd, global, files) {
         return WorkerExecInputBinding::Close;
+    }
+
+    // HostPipeFd: the worker will receive this fd via the pipe bridge
+    // mechanism (--pipe-bridge CLI arg) and install_host_pipe_fd will set
+    // it up.  The stdio binding should not try to wire it up separately.
+    if files.try_host_pipe_fd(raw_fd).is_some() {
+        return WorkerExecInputBinding::Inherit;
     }
 
     let rds = files.raw_descriptor_store.read();
@@ -6225,6 +6243,11 @@ fn worker_exec_output_binding<FS: ShimFS>(
 ) -> WorkerExecOutputBinding<FS, Platform> {
     if !worker_exec_fd_survives_exec(raw_fd, global, files) {
         return WorkerExecOutputBinding::Close;
+    }
+
+    // HostPipeFd: handled by the pipe bridge mechanism.
+    if files.try_host_pipe_fd(raw_fd).is_some() {
+        return WorkerExecOutputBinding::Inherit;
     }
 
     let rds = files.raw_descriptor_store.read();

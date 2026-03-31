@@ -936,8 +936,19 @@ impl<
                         let dirname = path.rsplit_once('/').unwrap().0;
                         if let Ok(FileType::Directory) = self.ensure_lower_contains(dirname) {
                             // We must migrate the directories above, and then re-trigger the open
-                            self.mkdir_migrating_ancestor_dirs(&path).unwrap();
-                            return self.open(path, flags, mode);
+                            match self.mkdir_migrating_ancestor_dirs(&path) {
+                                Ok(()) => return self.open(path, flags, mode),
+                                Err(MkdirError::NoWritePerms) => {
+                                    return Err(OpenError::NoWritePerms);
+                                }
+                                Err(MkdirError::ReadOnlyFileSystem) => {
+                                    return Err(OpenError::ReadOnlyFileSystem);
+                                }
+                                Err(MkdirError::PathError(e)) => {
+                                    return Err(OpenError::PathError(e));
+                                }
+                                Err(_) => return Err(OpenError::Io),
+                            }
                         }
                         // Otherwise, handle-able by a lower level, fallthrough
                     }

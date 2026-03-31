@@ -398,6 +398,26 @@ fn test_pipe_cloexec() {
     );
 }
 
+/// Test vfork child that writes to pipe WITHOUT exec (like bash builtin).
+/// The echo child does dup2+write+_exit without execve.
+#[cfg(target_arch = "x86_64")]
+#[test]
+fn test_pipe_vfork_builtin() {
+    let unique_name = "pipe_vfork_builtin_rewriter";
+    let target = common::compile(
+        "./tests/multiprocess/pipe_vfork_builtin.c",
+        unique_name,
+        true, // static
+        false,
+    );
+    let output = Runner::new(Backend::Rewriter, &target, unique_name).output();
+    let output_str = String::from_utf8_lossy(&output);
+    assert!(
+        output_str.contains("hello-from-vfork"),
+        "pipe_vfork_builtin test failed:\n{output_str}",
+    );
+}
+
 /// End-to-end test for fork-based context switching via synchronized pipe I/O.
 /// Parent and child exchange iteration counters through two pipes.  This
 /// exercises the delayed-fork path because the child calls read() (a
