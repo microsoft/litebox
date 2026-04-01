@@ -251,6 +251,10 @@ pub struct LinuxUserland {
     /// Cached host stdin TTY device info (path, rdev, dev, ino).
     /// Computed once on first access and cached for the process lifetime.
     host_stdin_tty_info: std::sync::OnceLock<Option<litebox::platform::HostTtyDeviceInfo>>,
+    /// Join handles for background tasks (mux dispatchers, background
+    /// waiters).  Joined before `std::process::exit()` to let tasks
+    /// flush buffered data.
+    background_handles: Mutex<Vec<std::thread::JoinHandle<()>>>,
 }
 
 impl core::fmt::Debug for LinuxUserland {
@@ -817,6 +821,7 @@ impl LinuxUserland {
             worker_processes: std::sync::Mutex::new(BTreeMap::new()),
             detached_worker_bridge_threads: std::sync::Mutex::new(Vec::new()),
             host_stdin_tty_info: std::sync::OnceLock::new(),
+            background_handles: Mutex::new(Vec::new()),
         };
         Box::leak(Box::new(platform))
     }
@@ -1664,8 +1669,9 @@ impl LinuxUserland {
         snapshot_bytes: &[u8],
         stdio: WorkerExecStdioBindings<FS, LinuxUserland>,
         mux_fd: Option<i32>,
-        mux_streams: &[(u32, usize, u8, u8)],
+        mux_streams: &[(u32, usize, u8, u8, bool)],
         passthrough_fds: &[(usize, i32, bool)],
+        local_pipe_pairs: &[(usize, usize, Vec<u8>, u32, u32)],
     ) -> Result<i32, i32>
     where
         FS: litebox::fs::FileSystem + Send + Sync + 'static,
@@ -1732,16 +1738,22 @@ impl LinuxUserland {
         }
 
         // Add --mux-stream for each muxed stream.
-        // Format: stream_id:guest_fd:direction:type
-        for &(stream_id, guest_fd, dir, stype) in mux_streams {
+        // Format: stream_id:guest_fd:direction:type[:e]
+        // The optional :e suffix marks streams with initial EOF.
+        for &(stream_id, guest_fd, dir, stype, initial_eof) in mux_streams {
             spawn_argv.push(CString::new("--mux-stream").unwrap());
-            spawn_argv.push(
-                CString::new(format!(
+            let spec = if initial_eof {
+                format!(
+                    "{}:{}:{}:{}:e",
+                    stream_id, guest_fd, dir as char, stype as char,
+                )
+            } else {
+                format!(
                     "{}:{}:{}:{}",
                     stream_id, guest_fd, dir as char, stype as char,
-                ))
-                .map_err(|_| -1_i32)?,
-            );
+                )
+            };
+            spawn_argv.push(CString::new(spec).map_err(|_| -1_i32)?);
         }
 
         // Add --pipe-bridge for host-pipe passthrough fds (from prior bridges).
@@ -1752,6 +1764,39 @@ impl LinuxUserland {
             spawn_argv.push(
                 CString::new(format!("{guest_fd}:{dir_char}:{host_fd}")).map_err(|_| -1_i32)?,
             );
+        }
+
+        // Add --local-pipe for child-only pipe pairs (both ends in the
+        // child, not in the parent).  The worker creates a connected
+        // pipe pair and installs both ends at the specified fds.
+        // Format: write_fd:read_fd::w_flags:r_flags or
+        //         write_fd:read_fd:drain_fd:w_flags:r_flags
+        // where drain_fd is a memfd containing buffered data and
+        // w_flags/r_flags are per-end OFlags as decimal integers.
+        // Keep OwnedFds alive until posix_spawn (Drop closes them).
+        // Collected here so early returns automatically close them.
+        let mut drain_owned_fds: Vec<std::os::fd::OwnedFd> = Vec::new();
+        for &(write_fd, read_fd, ref drained, w_flags, r_flags) in local_pipe_pairs {
+            spawn_argv.push(CString::new("--local-pipe").unwrap());
+            if drained.is_empty() {
+                spawn_argv.push(
+                    CString::new(format!("{write_fd}:{read_fd}::{w_flags}:{r_flags}"))
+                        .map_err(|_| -1_i32)?,
+                );
+            } else {
+                // Write drained data to a memfd (avoids E2BIG on large buffers).
+                let drain_fd = create_worker_fork_snapshot_fd(drained).map_err(|_| -1_i32)?;
+                let raw_drain_fd = drain_fd.as_raw_fd();
+                let _ = self.clear_cloexec(raw_drain_fd);
+                // Keep OwnedFd alive until after posix_spawn.
+                drain_owned_fds.push(drain_fd);
+                spawn_argv.push(
+                    CString::new(format!(
+                        "{write_fd}:{read_fd}:{raw_drain_fd}:{w_flags}:{r_flags}"
+                    ))
+                    .map_err(|_| -1_i32)?,
+                );
+            }
         }
 
         let argv_ptrs: Vec<*const libc::c_char> = spawn_argv
@@ -1863,6 +1908,7 @@ impl LinuxUserland {
             if let Some(mux_fd) = mux_fd {
                 self.close_host_fd(mux_fd);
             }
+            // drain_owned_fds dropped automatically (OwnedFd::drop closes).
             return Err(ret);
         }
         drop(host_stdio_temp_sources);
@@ -1877,6 +1923,9 @@ impl LinuxUserland {
         for &(_, host_fd, _) in passthrough_fds {
             self.close_host_fd(host_fd);
         }
+
+        // Close drain memfds (child inherited them via posix_spawn).
+        drop(drain_owned_fds);
 
         // Close the worker's mux socketpair end (the child inherited it).
         if let Some(mux_fd) = mux_fd {
@@ -1973,7 +2022,18 @@ impl LinuxUserland {
     where
         F: FnOnce() + Send + 'static,
     {
-        spawn_host_thread(f);
+        let handle = spawn_host_thread(f);
+        self.background_handles.lock().unwrap().push(handle);
+    }
+
+    /// Join all background tasks (mux dispatchers, background waiters).
+    /// Must be called before `std::process::exit()` to give tasks a
+    /// chance to flush buffered data.
+    pub fn join_background_tasks(&self) {
+        let handles: Vec<_> = self.background_handles.lock().unwrap().drain(..).collect();
+        for handle in handles {
+            let _ = handle.join();
+        }
     }
 
     /// Send a signal to a worker host process.

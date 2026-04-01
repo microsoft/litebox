@@ -205,6 +205,12 @@ pub struct CliArgs {
     /// is 'p' (pipe) or 's' (socket).
     #[arg(long = "mux-stream", hide = true, requires = "fork_restore")]
     pub mux_stream: Vec<String>,
+
+    /// Internal: child-only pipe pairs (both ends in the child, not in the
+    /// parent).  The worker creates a connected pipe pair and installs both
+    /// ends.  Format: `write_fd:read_fd`.
+    #[arg(long = "local-pipe", hide = true, requires = "fork_restore")]
+    pub local_pipe: Vec<String>,
 }
 
 /// Backends supported for intercepting syscalls
@@ -639,7 +645,7 @@ fn finish_run<FS: litebox_shim_linux::ShimFS>(
             cli_args.working_directory.clone(),
         )?;
 
-        run_program(program, shutdown, net_worker, None);
+        run_program(program, shutdown, net_worker, None, None);
     }
 }
 
@@ -731,7 +737,7 @@ fn finish_run_with_nine_p<FS: litebox_shim_linux::ShimFS>(
             cli_args.working_directory.clone(),
         )?;
 
-        run_program(program, shutdown, net_worker, worker_result_fd);
+        run_program(program, shutdown, net_worker, worker_result_fd, None);
     }
 
     // TUN mode: connect via TCP through the guest's smoltcp network stack.
@@ -801,7 +807,7 @@ fn finish_run_with_nine_p<FS: litebox_shim_linux::ShimFS>(
         cli_args.working_directory.clone(),
     )?;
 
-    run_program(program, shutdown, net_worker, worker_result_fd);
+    run_program(program, shutdown, net_worker, worker_result_fd, None);
 }
 
 #[allow(clippy::similar_names)]
@@ -994,6 +1000,9 @@ fn run_fork_restore(cli_args: CliArgs) -> Result<()> {
     let mux_streams = parse_mux_stream_specs(&cli_args.mux_stream)?;
     let mux_fd = cli_args.mux_fd;
 
+    // Parse local pipe pair specs (child-only pipes).
+    let local_pipes = parse_local_pipe_specs(&cli_args.local_pipe)?;
+
     // Mark inherited fds as close-on-exec (except pipe bridge FDs and mux fd
     // which the shim/dispatcher will use directly).
     for fd in [Some(snapshot_fd), Some(ack_fd), cli_args.worker_result_fd]
@@ -1079,7 +1088,7 @@ fn run_fork_restore(cli_args: CliArgs) -> Result<()> {
         );
         let combined_fs = std::sync::Arc::new(combined);
 
-        let program = fork_restore_and_ack(
+        let (program, mux_handle) = fork_restore_and_ack(
             &shim,
             snapshot,
             combined_fs,
@@ -1087,8 +1096,15 @@ fn run_fork_restore(cli_args: CliArgs) -> Result<()> {
             &pipe_bridges,
             mux_fd,
             &mux_streams,
+            &local_pipes,
         )?;
-        run_program(program, shutdown, net_worker, cli_args.worker_result_fd);
+        run_program(
+            program,
+            shutdown,
+            net_worker,
+            cli_args.worker_result_fd,
+            mux_handle,
+        );
     } else {
         let initial_file_system = std::sync::Arc::new(default_fs);
 
@@ -1096,7 +1112,7 @@ fn run_fork_restore(cli_args: CliArgs) -> Result<()> {
         let shutdown = std::sync::Arc::new(core::sync::atomic::AtomicBool::new(false));
         let net_worker = start_network_worker(&shim, &shutdown);
 
-        let program = fork_restore_and_ack(
+        let (program, mux_handle) = fork_restore_and_ack(
             &shim,
             snapshot,
             initial_file_system,
@@ -1104,8 +1120,15 @@ fn run_fork_restore(cli_args: CliArgs) -> Result<()> {
             &pipe_bridges,
             mux_fd,
             &mux_streams,
+            &local_pipes,
         )?;
-        run_program(program, shutdown, net_worker, cli_args.worker_result_fd);
+        run_program(
+            program,
+            shutdown,
+            net_worker,
+            cli_args.worker_result_fd,
+            mux_handle,
+        );
     }
 }
 
@@ -1153,13 +1176,17 @@ struct MuxStreamSpec {
     direction: u8,
     /// 'p' = pipe, 's' = socket.
     stream_type: u8,
+    /// If true, the parent's pipe is already EOF at setup time.
+    /// The worker pre-closes the relay sender so the child sees
+    /// immediate EOF (preserving POSIX synchronous EOF semantics).
+    initial_eof: bool,
 }
 
 fn parse_mux_stream_specs(specs: &[String]) -> Result<Vec<MuxStreamSpec>> {
     let mut streams = Vec::new();
     for spec in specs {
         let parts: Vec<&str> = spec.split(':').collect();
-        if parts.len() != 4 {
+        if parts.len() < 4 || parts.len() > 5 {
             anyhow::bail!("invalid --mux-stream format: {spec}");
         }
         let stream_id: u32 = parts[0]
@@ -1179,14 +1206,56 @@ fn parse_mux_stream_specs(specs: &[String]) -> Result<Vec<MuxStreamSpec>> {
             "t" => b't',
             _ => anyhow::bail!("bad type in --mux-stream: {spec}"),
         };
+        let initial_eof = parts.get(4) == Some(&"e");
         streams.push(MuxStreamSpec {
             stream_id,
             guest_fd,
             direction,
             stream_type,
+            initial_eof,
         });
     }
     Ok(streams)
+}
+
+/// Parse `--local-pipe` CLI args.
+/// Format: `write_fd:read_fd::w_flags:r_flags` or
+///         `write_fd:read_fd:drain_fd:w_flags:r_flags`.
+fn parse_local_pipe_specs(specs: &[String]) -> Result<Vec<(usize, usize, Vec<u8>, u32, u32)>> {
+    let mut pairs = Vec::new();
+    for spec in specs {
+        let parts: Vec<&str> = spec.split(':').collect();
+        if parts.len() != 5 {
+            anyhow::bail!("invalid --local-pipe format: {spec}");
+        }
+        let write_fd: usize = parts[0]
+            .parse()
+            .map_err(|_| anyhow!("bad write_fd in --local-pipe: {spec}"))?;
+        let read_fd: usize = parts[1]
+            .parse()
+            .map_err(|_| anyhow!("bad read_fd in --local-pipe: {spec}"))?;
+        let drained = if parts[2].is_empty() {
+            Vec::new()
+        } else {
+            let drain_fd: i32 = parts[2]
+                .parse()
+                .map_err(|_| anyhow!("bad drain_fd in --local-pipe: {spec}"))?;
+            use std::io::Read;
+            use std::os::fd::FromRawFd;
+            let mut f = unsafe { std::fs::File::from_raw_fd(drain_fd) };
+            let mut data = Vec::new();
+            f.read_to_end(&mut data)?;
+            data
+        };
+        let w_flags: u32 = parts[3]
+            .parse()
+            .map_err(|_| anyhow!("bad w_flags in --local-pipe: {spec}"))?;
+        let r_flags: u32 = parts[4]
+            .parse()
+            .map_err(|_| anyhow!("bad r_flags in --local-pipe: {spec}"))?;
+        pairs.push((write_fd, read_fd, drained, w_flags, r_flags));
+    }
+    Ok(pairs)
 }
 
 /// Restore a child process from a fork snapshot and write the ack status to the parent.
@@ -1201,12 +1270,18 @@ fn fork_restore_and_ack<FS: litebox_shim_linux::ShimFS>(
     pipe_bridges: &[PipeBridgeSpec],
     mux_fd: Option<i32>,
     mux_streams: &[MuxStreamSpec],
-) -> Result<litebox_shim_linux::LoadedProgram<FS>> {
+    local_pipes: &[(usize, usize, Vec<u8>, u32, u32)],
+) -> Result<(
+    litebox_shim_linux::LoadedProgram<FS>,
+    Option<std::thread::JoinHandle<()>>,
+)> {
     use std::io::Write;
     use std::os::fd::FromRawFd;
 
     match shim.restore_process(snapshot, fs) {
         Ok(program) => {
+            let mut mux_thread_handle: Option<std::thread::JoinHandle<()>> = None;
+
             // Install HostPipe FDs for passthrough pipe bridges.
             for bridge in pipe_bridges {
                 let direction = if bridge.is_read {
@@ -1219,6 +1294,120 @@ fn fork_restore_and_ack<FS: litebox_shim_linux::ShimFS>(
                     bridge.host_fd,
                     direction,
                 );
+            }
+
+            // Install connected pipe pairs for child-only pipes (both
+            // ends in the child, not in the parent).  These bypass the
+            // mux entirely — write(write_fd) → read(read_fd) locally.
+            //
+            // Entries arrive in order: primary pair first, then alias
+            // entries where one fd matches the primary.  For aliases,
+            // dup the already-installed pipe end to the new fd.
+            if !local_pipes.is_empty() {
+                let litebox_ref = shim.litebox();
+                let pipes_sub = litebox::pipes::Pipes::new(litebox_ref);
+                // Keep dup'd TypedFds so we can dup again for aliases.
+                let mut sender_dups: std::collections::HashMap<
+                    usize,
+                    litebox::fd::TypedFd<litebox::pipes::Pipes<Platform>>,
+                > = std::collections::HashMap::new();
+                let mut receiver_dups: std::collections::HashMap<
+                    usize,
+                    litebox::fd::TypedFd<litebox::pipes::Pipes<Platform>>,
+                > = std::collections::HashMap::new();
+                // Map: write_fd → read_fd for primary pairs.
+                let mut read_for_write: std::collections::HashMap<usize, usize> =
+                    std::collections::HashMap::new();
+
+                for &(write_fd, read_fd, ref drained, w_flags_bits, r_flags_bits) in local_pipes {
+                    let w_installed = sender_dups.contains_key(&write_fd);
+                    let r_installed = receiver_dups.contains_key(&read_fd);
+
+                    if !w_installed && !r_installed {
+                        // Primary pair: create new connected pipe.
+                        // Apply the read-end flags at creation (they
+                        // affect the shared pipe state like O_NONBLOCK).
+                        let r_flags = litebox::pipes::Flags::from_bits_truncate(r_flags_bits);
+                        let (sender, receiver) = pipes_sub.create_pipe(
+                            1024 * 1024,
+                            r_flags,
+                            core::num::NonZero::new(4096),
+                        );
+                        // Apply write-end flags separately if different.
+                        // clear creation-time flags first, then set desired.
+                        let w_flags = litebox::pipes::Flags::from_bits_truncate(w_flags_bits);
+                        if w_flags != r_flags {
+                            let _ = pipes_sub.update_flags(&sender, r_flags, false);
+                            if !w_flags.is_empty() {
+                                let _ = pipes_sub.update_flags(&sender, w_flags, true);
+                            }
+                        }
+                        // Pre-fill drained data into the pipe so the
+                        // child sees any bytes that were buffered before
+                        // migration.
+                        if !drained.is_empty() {
+                            let wait_state = litebox::event::wait::WaitState::new(
+                                litebox_platform_multiplex::platform(),
+                            );
+                            let cx = wait_state.context();
+                            let mut offset = 0;
+                            while offset < drained.len() {
+                                match pipes_sub.write(&cx, &sender, &drained[offset..]) {
+                                    Ok(n) => offset += n,
+                                    Err(_) => break,
+                                }
+                            }
+                        }
+                        // Dup before install (install consumes TypedFd).
+                        let s_dup = litebox_ref.descriptor_table_mut().duplicate(&sender);
+                        let r_dup = litebox_ref.descriptor_table_mut().duplicate(&receiver);
+                        program.entrypoints.install_mux_pipe_fd(write_fd, sender);
+                        program.entrypoints.install_mux_pipe_fd(read_fd, receiver);
+                        if let Some(s) = s_dup {
+                            sender_dups.insert(write_fd, s);
+                        }
+                        if let Some(r) = r_dup {
+                            receiver_dups.insert(read_fd, r);
+                        }
+                        read_for_write.insert(write_fd, read_fd);
+                    } else if w_installed && !r_installed {
+                        // write_fd already installed. read_fd is a new
+                        // alias — dup the receiver from primary pair.
+                        if let Some(&primary_r) = read_for_write.get(&write_fd) {
+                            if let Some(src) = receiver_dups.get(&primary_r) {
+                                if let Some(duped) =
+                                    litebox_ref.descriptor_table_mut().duplicate(src)
+                                {
+                                    program.entrypoints.install_mux_pipe_fd(read_fd, duped);
+                                }
+                            }
+                        }
+                    } else if r_installed && !w_installed {
+                        // read_fd already installed. write_fd is a new
+                        // alias — dup the sender from primary pair.
+                        // Find which primary write_fd maps to this read_fd.
+                        let primary_w = read_for_write
+                            .iter()
+                            .find(|(_, v)| **v == read_fd)
+                            .map(|(k, _)| *k);
+                        if let Some(pw) = primary_w {
+                            if let Some(src) = sender_dups.get(&pw) {
+                                if let Some(duped) =
+                                    litebox_ref.descriptor_table_mut().duplicate(src)
+                                {
+                                    program.entrypoints.install_mux_pipe_fd(write_fd, duped);
+                                }
+                            }
+                        }
+                    }
+                }
+                // Clean up dup'd references kept for aliasing.
+                for (_, fd) in sender_dups {
+                    let _ = pipes_sub.close(&fd);
+                }
+                for (_, fd) in receiver_dups {
+                    let _ = pipes_sub.close(&fd);
+                }
             }
 
             // Set up mux stream endpoints: for each stream, create a virtual
@@ -1239,7 +1428,25 @@ fn fork_restore_and_ack<FS: litebox_shim_linux::ShimFS>(
                     std::sync::Arc<litebox::fd::TypedFd<litebox::pipes::Pipes<Platform>>>,
                 )> = Vec::new();
 
+                // Track seen stream_ids for dup'd alias handling:
+                // if a stream_id repeats, dup the already-created
+                // guest pipe end instead of creating a new pair.
+                let mut guest_pipe_dups: std::collections::HashMap<
+                    u32,
+                    litebox::fd::TypedFd<litebox::pipes::Pipes<Platform>>,
+                > = std::collections::HashMap::new();
+
                 for ms in mux_streams {
+                    if let Some(primary_dup) = guest_pipe_dups.get(&ms.stream_id) {
+                        // Alias: dup the pipe end from the primary.
+                        if let Some(duped) =
+                            litebox_ref.descriptor_table_mut().duplicate(primary_dup)
+                        {
+                            program.entrypoints.install_mux_pipe_fd(ms.guest_fd, duped);
+                        }
+                        continue;
+                    }
+
                     let (sender, receiver) = pipes.create_pipe(
                         1024 * 1024,
                         litebox::pipes::Flags::empty(),
@@ -1256,21 +1463,52 @@ fn fork_restore_and_ack<FS: litebox_shim_linux::ShimFS>(
                         (sender, receiver)
                     };
 
+                    // Dup guest pipe before install (install consumes it).
+                    let guest_dup = litebox_ref.descriptor_table_mut().duplicate(&guest_pipe_fd);
                     program
                         .entrypoints
                         .install_mux_pipe_fd(ms.guest_fd, guest_pipe_fd);
+                    if let Some(d) = guest_dup {
+                        guest_pipe_dups.insert(ms.stream_id, d);
+                    }
+
+                    // For ParentToWorker streams with initial_eof:
+                    // pre-close the relay sender so the child's receiver
+                    // sees immediate EOF (POSIX synchronous semantics).
+                    if ms.initial_eof && ms.direction == b'r' {
+                        let _ = pipes.close(&relay_pipe_fd);
+                        // Don't add to relay_endpoints — stream is
+                        // already closed, no relay needed.
+                        continue;
+                    }
 
                     relay_endpoints.push((ms.stream_id, ms.direction, relay_pipe_fd.into()));
                 }
 
+                // Clean up guest pipe dups.
+                for (_, fd) in guest_pipe_dups {
+                    let _ = pipes.close(&fd);
+                }
+
+                // Pre-flight check: verify relay endpoints are alive.
+                for (sid, dir, relay_fd) in &relay_endpoints {
+                    let eof = pipes.is_read_eof(relay_fd);
+                    eprintln!(
+                        "[WORKER-MUX] preflight stream={} dir={} is_read_eof={}",
+                        sid, *dir as char, eof,
+                    );
+                }
+
                 // Spawn the worker mux dispatcher thread.
-                spawn_worker_mux_dispatcher(platform, pipes, mux_fd, relay_endpoints);
+                let mux_handle =
+                    spawn_worker_mux_dispatcher(platform, pipes, mux_fd, relay_endpoints);
+                mux_thread_handle = Some(mux_handle);
             }
 
             // Report successful restore to parent via ack pipe.
             let mut ack_file = unsafe { std::fs::File::from_raw_fd(ack_fd) };
             ack_file.write_all(&0i32.to_le_bytes())?;
-            Ok(program)
+            Ok((program, mux_thread_handle))
         }
         Err(e) => {
             // Report failure to parent via ack pipe.
@@ -1310,7 +1548,7 @@ fn spawn_worker_mux_dispatcher(
         u8,
         std::sync::Arc<litebox::fd::TypedFd<litebox::pipes::Pipes<Platform>>>,
     )>,
-) {
+) -> std::thread::JoinHandle<()> {
     use litebox_shim_linux::multiplexer::{
         HEADER_SIZE, MSG_FLAG_EOF, MSG_FLAG_RESET, MSG_TYPE_DATA, MuxMessage,
     };
@@ -1357,6 +1595,10 @@ fn spawn_worker_mux_dispatcher(
             match platform.read_host_fd(mux_fd, &mut recv_buf) {
                 Ok(0) => {
                     // Socketpair closed — parent exited. Close all relay fds.
+                    eprintln!(
+                        "[WORKER-MUX] socketpair closed (parent gone), {} open endpoints",
+                        closed_endpoints.iter().filter(|&&c| !c).count(),
+                    );
                     for (_, _, relay_fd) in &relay_endpoints {
                         let _ = pipes.close(relay_fd);
                     }
@@ -1424,6 +1666,15 @@ fn spawn_worker_mux_dispatcher(
                     Ok(data) if data.is_empty() => {
                         // Nothing buffered — check if sender closed.
                         if pipes.is_read_eof(relay_fd) {
+                            // Distinguish: DT entry gone vs peer shutdown
+                            let reason = match pipes.half_pipe_type(relay_fd) {
+                                Ok(_) => "peer_shutdown",
+                                Err(_) => "dt_entry_gone",
+                            };
+                            eprintln!(
+                                "[WORKER-MUX] stream={} is_read_eof=true ({}), sending EOF",
+                                stream_id, reason,
+                            );
                             let _ = pipes.close(relay_fd);
                             let msg = MuxMessage::eof(*stream_id);
                             send_control(mux_fd, &msg);
@@ -1455,6 +1706,10 @@ fn spawn_worker_mux_dispatcher(
                     }
                     Err(_) => {
                         // Pipe closed — send EOF.
+                        eprintln!(
+                            "[WORKER-MUX] stream={} drain_available=Err, sending EOF",
+                            stream_id,
+                        );
                         let _ = pipes.close(relay_fd);
                         let msg = MuxMessage::eof(*stream_id);
                         send_control(mux_fd, &msg);
@@ -1463,9 +1718,16 @@ fn spawn_worker_mux_dispatcher(
                 }
             }
 
-            // Check if all endpoints are closed.
-            if closed_endpoints.iter().all(|&c| c) {
-                eprintln!("[WORKER-MUX] all endpoints closed, exiting");
+            // Exit when all WorkerToParent (b'w') endpoints are
+            // drained and EOF sent.  The child's output is fully
+            // relayed.  ParentToWorker (b'r') endpoints don't need
+            // to keep the thread alive — the parent will close the
+            // socketpair when it's done receiving.
+            let all_write_done = relay_endpoints
+                .iter()
+                .enumerate()
+                .all(|(idx, (_, dir, _))| *dir != b'w' || closed_endpoints[idx]);
+            if all_write_done {
                 platform.close_host_fd(mux_fd);
                 return;
             }
@@ -1474,7 +1736,7 @@ fn spawn_worker_mux_dispatcher(
                 std::thread::sleep(std::time::Duration::from_micros(100));
             }
         }
-    });
+    })
 }
 
 /// Worker host entry point for a non-PIE child exec.
@@ -1634,7 +1896,13 @@ fn run_worker_exec(cli_args: CliArgs) -> Result<()> {
             cli_args.working_directory.clone(),
         )?;
 
-        run_program(program, shutdown, net_worker, cli_args.worker_result_fd);
+        run_program(
+            program,
+            shutdown,
+            net_worker,
+            cli_args.worker_result_fd,
+            None,
+        );
     }
 }
 
@@ -1646,6 +1914,7 @@ fn run_program<FS: litebox_shim_linux::ShimFS>(
     shutdown: std::sync::Arc<core::sync::atomic::AtomicBool>,
     net_worker: Option<std::thread::JoinHandle<()>>,
     worker_result_fd: Option<i32>,
+    mux_handle: Option<std::thread::JoinHandle<()>>,
 ) -> ! {
     #[cfg(feature = "lock_tracing")]
     litebox::sync::start_recording();
@@ -1676,6 +1945,25 @@ fn run_program<FS: litebox_shim_linux::ShimFS>(
         net_worker.join().unwrap();
     }
     let wait_status = program.process.wait();
+    eprintln!(
+        "[WORKER] child exited with wait_status={}{}",
+        wait_status,
+        if wait_status > 255 {
+            format!(" (signal {})", wait_status - 256)
+        } else {
+            String::new()
+        },
+    );
+    // Wait for the mux dispatcher to drain remaining data
+    // before exiting.
+    if let Some(handle) = mux_handle {
+        let _ = handle.join();
+    }
+    // Join ALL background tasks (parent mux dispatchers for child
+    // forks, background waiters, etc.) before exiting.  Without
+    // this, std::process::exit() kills threads and buffered mux
+    // data is lost.
+    litebox_platform_multiplex::platform().join_background_tasks();
     if let Some(worker_result_fd) = worker_result_fd {
         write_worker_result(wait_status, worker_result_fd);
     }

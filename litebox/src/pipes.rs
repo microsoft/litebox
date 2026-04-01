@@ -93,6 +93,16 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> Pipes<Platform> {
         Ok(())
     }
 
+    /// Remove an arbitrary descriptor from the global descriptor table.
+    ///
+    /// This is a generic version of [`close`](Self::close) that works on
+    /// any subsystem's `TypedFd`, not just pipes.  Used by the mux
+    /// dispatcher to clean up keepalive references for replaced Unix
+    /// sockets.
+    pub fn remove_fd<S: crate::fd::FdEnabledSubsystem>(&self, fd: &crate::fd::TypedFd<S>) {
+        let _ = self.litebox.descriptor_table_mut().remove(fd);
+    }
+
     /// Read values in the pipe into `buf`, returning the number of elements read.
     ///
     /// See [`Self::create_pipe`] for details on blocking behavior.

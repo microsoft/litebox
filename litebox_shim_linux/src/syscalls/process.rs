@@ -2831,6 +2831,21 @@ impl<FS: ShimFS> Task<FS> {
                     // aliases share one receive queue (matching real dup
                     // semantics).
                     let mut dispatch_endpoints: Vec<(u32, u8, PipeFd, Vec<u8>)> = Vec::new();
+                    // Keepalive references: old pipe/socket ends consumed
+                    // during replacement, plus duplicates of the new parent
+                    // pipe ends.  These prevent SharedEntry drops that would
+                    // kill Weak peer links in other processes.  Moved into
+                    // the dispatcher thread so they live as long as the mux.
+                    let mut keepalive_pipes: Vec<
+                        alloc::sync::Arc<
+                            litebox::fd::TypedFd<litebox::pipes::Pipes<crate::Platform>>,
+                        >,
+                    > = Vec::new();
+                    let mut keepalive_sockets: Vec<
+                        alloc::sync::Arc<
+                            litebox::fd::TypedFd<super::unix::UnixSocketSubsystem<FS>>,
+                        >,
+                    > = Vec::new();
                     // Track which stream_ids have been processed: (stream_id, first_guest_fd).
                     let mut seen_streams: Vec<(u32, usize)> = Vec::new();
 
@@ -2893,14 +2908,12 @@ impl<FS: ShimFS> Task<FS> {
                                     }
                                 }
                                 if let Some(old_typed) = old_pipe {
-                                    let _ = self.global.pipes.close(&old_typed);
+                                    // Keep alive — don't close. Same
+                                    // rationale as the primary path.
+                                    keepalive_pipes.push(old_typed);
                                 }
                                 if let Some(old_typed) = old_socket {
-                                    let _ = self
-                                        .global
-                                        .litebox
-                                        .descriptor_table_mut()
-                                        .remove(&old_typed);
+                                    keepalive_sockets.push(old_typed);
                                 }
                             }
                             // No new dispatch_endpoint — the first alias's
@@ -2909,6 +2922,16 @@ impl<FS: ShimFS> Task<FS> {
                         }
 
                         seen_streams.push((ms.stream_id, ms.guest_fd));
+
+                        litebox::log_println!(
+                            self.global.platform,
+                            "[PARENT-MUX] setup stream={} guest_fd={} dir={:?} use_existing={} host_pipe={}",
+                            ms.stream_id,
+                            ms.guest_fd,
+                            ms.direction,
+                            ms.use_existing_pipe,
+                            ms.host_pipe_fd,
+                        );
 
                         // Create a virtual pipe pair for this stream.
                         let (sender, receiver) = self.global.pipes.create_pipe(
@@ -2932,6 +2955,10 @@ impl<FS: ShimFS> Task<FS> {
                             // guest_fd directly.  Don't create a new pipe or
                             // replace the fd table entry.  The dispatcher
                             // reads from / writes to the existing pipe end.
+                            //
+                            // Duplicate the pipe so the DT entry survives
+                            // if the parent later closes this guest_fd.
+                            // Same keepalive pattern as the replacement path.
                             let rds = files.raw_descriptor_store.read();
                             if let Ok(existing_fd) = rds
                                 .fd_from_raw_integer::<litebox::pipes::Pipes<crate::Platform>>(
@@ -2939,12 +2966,24 @@ impl<FS: ShimFS> Task<FS> {
                                 )
                             {
                                 drop(rds);
-                                dispatch_endpoints.push((
-                                    ms.stream_id,
-                                    dir_byte,
-                                    existing_fd,
-                                    ms.drained_data,
-                                ));
+                                // The dispatch endpoint uses a DUPLICATE.
+                                // The duplicate keeps the DT entry alive
+                                // regardless of when the parent closes the fd.
+                                if let Some(dup_fd) = self
+                                    .global
+                                    .litebox
+                                    .descriptor_table_mut()
+                                    .duplicate(&existing_fd)
+                                {
+                                    dispatch_endpoints.push((
+                                        ms.stream_id,
+                                        dir_byte,
+                                        dup_fd.into(),
+                                        ms.drained_data,
+                                    ));
+                                } else {
+                                    orphan_streams.push(ms.stream_id);
+                                }
                             } else {
                                 drop(rds);
                                 orphan_streams.push(ms.stream_id);
@@ -3024,6 +3063,19 @@ impl<FS: ShimFS> Task<FS> {
                         } else {
                             // Virtual pipe/socket stream: install the parent
                             // end in the fd table, consuming the old entry.
+                            //
+                            // Duplicate the parent pipe fd BEFORE installing
+                            // so the dispatcher holds an independent reference.
+                            // When the parent later closes this guest_fd, the
+                            // duplicate keeps the pipe's SharedEntry alive,
+                            // preventing is_peer_shutdown() from triggering
+                            // on the dispatch (sender) end.
+                            let parent_pipe_keepalive = self
+                                .global
+                                .litebox
+                                .descriptor_table_mut()
+                                .duplicate(&parent_pipe_fd);
+
                             let old_pipe;
                             let old_socket;
                             {
@@ -3052,14 +3104,30 @@ impl<FS: ShimFS> Task<FS> {
                                 );
                             }
                             if let Some(old_typed) = old_pipe {
-                                let _ = self.global.pipes.close(&old_typed);
+                                // Keep the old pipe end alive — don't call
+                                // pipes.close().  The fd slot is already freed
+                                // by fd_consume_raw_integer above.  Calling
+                                // close would remove the global DT entry,
+                                // dropping the SharedEntry if this was the
+                                // last Arc.  That would kill the Weak peer
+                                // link in the OTHER end (held by copilot's
+                                // worker or a relay thread), cascading into
+                                // a shutdown of the whole sandbox.
+                                //
+                                // The old pipe end lives in keepalive_pipes
+                                // until the dispatcher thread exits.
+                                keepalive_pipes.push(old_typed);
                             }
                             if let Some(old_typed) = old_socket {
-                                let _ = self
-                                    .global
-                                    .litebox
-                                    .descriptor_table_mut()
-                                    .remove(&old_typed);
+                                // Same treatment for sockets — keep alive.
+                                keepalive_sockets.push(old_typed);
+                            }
+
+                            // Move the keepalive into the dispatch endpoint so
+                            // it is dropped only when the dispatcher thread
+                            // exits, not when the parent closes the guest fd.
+                            if let Some(k) = parent_pipe_keepalive {
+                                keepalive_pipes.push(alloc::sync::Arc::new(k));
                             }
                         }
 
@@ -3077,6 +3145,37 @@ impl<FS: ShimFS> Task<FS> {
                     let mux_fd = parent_mux_raw;
 
                     self.global.platform.spawn_background_task(move || {
+                        // Keepalive references prevent SharedEntry drops
+                        // while the dispatcher runs.  They must be
+                        // explicitly closed on exit to free DT entries
+                        // and unblock peer-shutdown detection.
+                        //
+                        // Use a Drop guard so cleanup runs even on panic.
+                        // Type-erased to avoid generic struct inside fn.
+                        struct KeepaliveGuard(Option<Box<dyn FnOnce()>>);
+                        impl Drop for KeepaliveGuard {
+                            fn drop(&mut self) {
+                                if let Some(f) = self.0.take() {
+                                    f();
+                                }
+                            }
+                        }
+                        let kp = keepalive_pipes;
+                        let ks = keepalive_sockets;
+                        let pipes_for_guard = pipes.clone();
+                        let _keepalive_guard = KeepaliveGuard(Some(Box::new(move || {
+                            for fd in &kp {
+                                let _ = pipes_for_guard.close(fd);
+                            }
+                            for fd in &ks {
+                                pipes_for_guard.remove_fd(fd);
+                            }
+                        })));
+
+                        // The dispatcher body runs inline. The
+                        // _keepalive_guard Drop ensures cleanup on
+                        // all exit paths including panics.
+
                         use crate::multiplexer::{
                             HEADER_SIZE, MSG_FLAG_EOF, MSG_FLAG_RESET, MSG_TYPE_DATA, MuxMessage,
                         };
@@ -3112,7 +3211,8 @@ impl<FS: ShimFS> Task<FS> {
 
                         // Send RESET for orphan streams (no parent counterpart)
                         // so the worker closes them immediately instead of
-                        // polling forever.
+                        // polling forever.  Self-pipe streams are excluded
+                        // from orphans (handled separately below).
                         for &sid in &orphan_streams {
                             litebox::log_println!(
                                 platform,
@@ -3154,6 +3254,11 @@ impl<FS: ShimFS> Task<FS> {
                             match platform.read_host_fd(mux_fd, &mut recv_buf) {
                                 Ok(0) => {
                                     // Socketpair closed — worker exited.
+                                    litebox::log_println!(
+                                        platform,
+                                        "[PARENT-MUX] socketpair closed (worker gone), {} open endpoints",
+                                        closed_endpoints.iter().filter(|&&c| !c).count(),
+                                    );
                                     for (_, _, relay_fd, _) in &dispatch_endpoints {
                                         let _ = pipes.close(relay_fd);
                                     }
@@ -3280,8 +3385,17 @@ impl<FS: ShimFS> Task<FS> {
                                 }
                             }
 
-                            // Check if all endpoints are closed.
-                            if closed_endpoints.iter().all(|&c| c) {
+                            // Exit when all WorkerToParent (b'w') endpoints
+                            // on the worker side have been drained and EOF
+                            // received.  These are the Read (b'r') endpoints
+                            // on the parent side — the child's stdout/stderr.
+                            // Once all child output is received, the parent
+                            // no longer needs the relay.
+                            let all_read_done = dispatch_endpoints
+                                .iter()
+                                .enumerate()
+                                .all(|(idx, (_, dir, _, _))| *dir != b'r' || closed_endpoints[idx]);
+                            if all_read_done {
                                 platform.close_host_fd(mux_fd);
                                 return;
                             }
@@ -3291,6 +3405,7 @@ impl<FS: ShimFS> Task<FS> {
                                 platform.host_sleep_us(100);
                             }
                         }
+                        // _keepalive_guard dropped here → cleanup runs.
                     });
                 }
             }
@@ -3504,7 +3619,13 @@ impl<FS: ShimFS> Task<FS> {
         // - host OS fd for host-backed pipes (-1 for new OS pipe bridges)
         let mut bridge_host_fd: Vec<i32> = Vec::new();
         let mut mux_worker_fd_raw: i32 = -1;
-        let mut mux_stream_specs: Vec<(u32, usize, u8, u8)> = Vec::new();
+        // (stream_id, guest_fd, dir_byte, type_byte, initial_eof)
+        let mut mux_stream_specs: Vec<(u32, usize, u8, u8, bool)> = Vec::new();
+        // (write_fd, read_fd, drained_data, write_flags, read_flags)
+        let mut local_pipe_pairs: Vec<(usize, usize, Vec<u8>, u32, u32)> = Vec::new();
+        // Dup'd pipe aliases: (alias_fd, primary_bridge_index).
+        // The worker dups the primary stream's pipe end to alias_fd.
+        let mut mux_aliases: Vec<(usize, usize)> = Vec::new();
         {
             use super::host_pipe::HostPipeDirection;
 
@@ -3550,6 +3671,115 @@ impl<FS: ShimFS> Task<FS> {
                 child_host_pipe_fds.len(),
             );
 
+            // Detect child-only pipe pairs: both ends (same pair_id,
+            // opposite directions) are in the child but NOT in
+            // parent_pipe_fds.  These were created by the child
+            // between fork and exec.  They don't need mux bridging —
+            // the worker creates a connected pipe pair instead.
+            //
+            // Collect ALL fds per pair (including dup'd aliases) so
+            // the worker can install pipe ends at every alias fd.
+            {
+                let mut seen_pair_ids: Vec<usize> = Vec::new();
+                for &(_, dir_a, pair_id) in &child_pipes {
+                    if seen_pair_ids.contains(&pair_id) {
+                        continue;
+                    }
+                    // Require both directions present in the child.
+                    let has_opposite = child_pipes
+                        .iter()
+                        .any(|&(_, dir_b, pid)| pid == pair_id && dir_b != dir_a);
+                    if !has_opposite {
+                        continue;
+                    }
+                    // Check the parent doesn't have this pair.
+                    let in_parent = fc.parent_pipe_fds.iter().any(|&(_, _, pid)| pid == pair_id);
+                    if in_parent {
+                        continue;
+                    }
+                    seen_pair_ids.push(pair_id);
+                    // Collect ALL write and read fds for this pair.
+                    let write_fds: Vec<usize> = child_pipes
+                        .iter()
+                        .filter(|&&(_, dir, pid)| pid == pair_id && dir == HostPipeDirection::Write)
+                        .map(|&(fd, _, _)| fd)
+                        .collect();
+                    let read_fds: Vec<usize> = child_pipes
+                        .iter()
+                        .filter(|&&(_, dir, pid)| pid == pair_id && dir == HostPipeDirection::Read)
+                        .map(|&(fd, _, _)| fd)
+                        .collect();
+                    // Store primary pair + any aliases.
+                    if let (Some(&primary_w), Some(&primary_r)) =
+                        (write_fds.first(), read_fds.first())
+                    {
+                        // Drain any buffered data from the read end so
+                        // it can be pre-filled in the worker's pipe.
+                        // Capture per-end flags (e.g. O_NONBLOCK).
+                        let (drained, w_flags, r_flags) = {
+                            let files = self.files.borrow();
+                            let rds = files.raw_descriptor_store.read();
+                            let r_typed = rds
+                                .fd_from_raw_integer::<litebox::pipes::Pipes<crate::Platform>>(
+                                    primary_r,
+                                )
+                                .ok();
+                            let w_typed = rds
+                                .fd_from_raw_integer::<litebox::pipes::Pipes<crate::Platform>>(
+                                    primary_w,
+                                )
+                                .ok();
+                            drop(rds);
+                            let data = r_typed
+                                .as_ref()
+                                .and_then(|t| self.global.pipes.drain_available(t).ok())
+                                .unwrap_or_default();
+                            let rf = r_typed
+                                .as_ref()
+                                .and_then(|t| self.global.pipes.get_flags(t).ok())
+                                .unwrap_or(litebox::pipes::Flags::empty())
+                                .bits();
+                            let wf = w_typed
+                                .as_ref()
+                                .and_then(|t| self.global.pipes.get_flags(t).ok())
+                                .unwrap_or(litebox::pipes::Flags::empty())
+                                .bits();
+                            (data, wf, rf)
+                        };
+                        local_pipe_pairs.push((primary_w, primary_r, drained, w_flags, r_flags));
+                        // Extra write aliases.
+                        for &fd in &write_fds[1..] {
+                            local_pipe_pairs.push((fd, primary_r, Vec::new(), w_flags, r_flags));
+                        }
+                        // Extra read aliases.
+                        for &fd in &read_fds[1..] {
+                            local_pipe_pairs.push((primary_w, fd, Vec::new(), w_flags, r_flags));
+                        }
+                    }
+                }
+            }
+            if !local_pipe_pairs.is_empty() {
+                litebox::log_println!(
+                    self.global.platform,
+                    "[DELAYED-FORK] pid={}: {} child-only pipe pair(s) → local in worker",
+                    self.pid,
+                    local_pipe_pairs.len(),
+                );
+                // Remove ALL fds sharing a child-only pair_id from
+                // child_pipes — not just the two representative fds.
+                // This handles dup'd aliases that share the same pair.
+                let local_pair_ids: Vec<usize> = child_pipes
+                    .iter()
+                    .filter(|&&(fd, _, _)| {
+                        local_pipe_pairs
+                            .iter()
+                            .any(|&(w, r, _, _, _)| fd == w || fd == r)
+                    })
+                    .map(|&(_, _, pair_id)| pair_id)
+                    .collect();
+                child_pipes.retain(|&(_, _, pair_id)| !local_pair_ids.contains(&pair_id));
+            }
+
             // Extract OS fd + direction from collected host-pipe TypedFds.
             // Done after dropping rds to maintain dt→rds lock ordering.
             let mut child_host_pipes: Vec<(usize, i32, HostPipeDirection)> = Vec::new();
@@ -3575,7 +3805,33 @@ impl<FS: ShimFS> Task<FS> {
                 child_pipes.len(),
             );
 
+            // Track parent fds already claimed by a bridge so that a
+            // pair_id match on one stream doesn't collide with an
+            // fd-number fallback on another stream.
+            let mut claimed_parent_fds: Vec<usize> = Vec::new();
+
+            // Track (pair_id, direction) → bridge index for dedup.
+            // If two child fds share the same pipe end (e.g. after
+            // dup2), only the first gets a real OS pipe bridge; the
+            // second reuses the same OS pipe fd via dup.
+            let mut pipe_dedup: Vec<(usize, super::host_pipe::HostPipeDirection, usize)> =
+                Vec::new(); // (pair_id, dir, bridge_index)
+
             for &(child_fd, child_dir, child_pair_id) in &child_pipes {
+                // Dedup: if another child fd with the same (pair_id,
+                // direction) was already bridged, DON'T create a
+                // separate bridge/stream.  Instead, record as an
+                // alias — the worker will dup the primary stream's
+                // pipe end to this fd.  This ensures aliases share
+                // one mux stream and one parent counterpart.
+                if let Some(&(_, _, existing_idx)) = pipe_dedup
+                    .iter()
+                    .find(|&&(pid, dir, _)| pid == child_pair_id && dir == child_dir)
+                {
+                    mux_aliases.push((child_fd, existing_idx));
+                    continue;
+                }
+
                 litebox::log_println!(
                     self.global.platform,
                     "[DELAYED-FORK] pid={}: creating OS pipe for child_fd={} dir={:?}",
@@ -3694,44 +3950,136 @@ impl<FS: ShimFS> Task<FS> {
                 bridge_drained.push(this_drained);
                 bridge_host_fd.push(-1);
 
-                // Find the parent's pipe at the same guest fd.  The parent
-                // and child share the same fd layout at fork time, so
-                // parent fd N is always the counterpart of child fd N.
-                if let Some(&(parent_fd, parent_dir_actual, _)) = fc
+                // Record for dedup so aliases reuse this bridge.
+                pipe_dedup.push((child_pair_id, child_dir, child_pipe_bridges.len() - 1));
+
+                // Find the parent's counterpart(s) for this pipe.
+                //
+                // Strategy (in priority order):
+                // 1. pair_id + opposite direction — the parent has the other
+                //    end of the SAME pipe pair.  Handles dup2'd pipes where
+                //    the child moved the pipe to a different fd number.
+                // 2. Same fd number — the parent has a pipe at the same fd
+                //    slot.  Handles inherited pipes (same or different pair)
+                //    and post-fork pipe() at previously-occupied slots.
+                // 3. Neither — orphan (broken pipe / child-only pipe).
+                //
+                // Both strategies skip parent fds already claimed by a
+                // previous bridge to prevent two streams from replacing
+                // the same parent fd.
+                let parent_counterparts: Vec<(usize, HostPipeDirection)> = fc
                     .parent_pipe_fds
                     .iter()
-                    .find(|&&(fd, _, _)| fd == child_fd)
-                {
-                    // Check if the parent has the OPPOSITE end of the same
-                    // pipe pair (both ends in the fd table — first fork case).
-                    let has_opposite_end = fc.parent_pipe_fds.iter().any(|&(_, dir, pair_id)| {
-                        dir != parent_dir_actual && pair_id == child_pair_id
-                    });
+                    .filter(|&&(fd, dir, pair_id)| {
+                        pair_id == child_pair_id
+                            && dir != child_dir
+                            && !claimed_parent_fds.contains(&fd)
+                    })
+                    .map(|&(fd, dir, _)| (fd, dir))
+                    .collect();
 
-                    if has_opposite_end {
-                        // First fork: parent has both ends.  The relay
-                        // replaces the parent's fd with a new virtual pipe.
-                        parent_replacements.push(crate::FdReplacement {
-                            guest_fd: parent_fd,
-                            host_fd: parent_os_fd,
-                            direction: parent_dir_actual,
-                            subsystem: crate::ReplacedSubsystem::Pipe,
-                        });
-                    } else {
-                        // Close the unused OS pipe end — the mux relays
-                        // directly to the parent's existing pipe.
-                        self.global.platform.close_host_fd(parent_os_fd);
-                    }
-                    bridge_parent_info.push(alloc::vec![(
-                        parent_fd,
-                        parent_dir_actual,
-                        crate::ReplacedSubsystem::Pipe,
-                    )]);
+                // Fallback: match by fd number if pair_id matching found
+                // nothing.  The parent and child may have different pipes at
+                // the same fd slot (e.g. child did close+pipe after fork),
+                // but bridging to the parent's pipe preserves the slot
+                // semantics that the parent expects.
+                //
+                // The direction is always set to the OPPOSITE of the child's
+                // direction (representing the data flow from the parent's
+                // perspective: child-Write → parent-Read, child-Read →
+                // parent-Write).  For pair_id matches this is naturally
+                // correct; for fd-number fallback the parent's pipe half
+                // type may differ from the data flow direction.
+                let flow_dir = match child_dir {
+                    HostPipeDirection::Read => HostPipeDirection::Write,
+                    HostPipeDirection::Write => HostPipeDirection::Read,
+                };
+                let (counterparts, matched_by_pair_id) = if !parent_counterparts.is_empty() {
+                    (parent_counterparts, true)
+                } else if let Some(&(parent_fd, _, _)) = fc
+                    .parent_pipe_fds
+                    .iter()
+                    .find(|&&(fd, _, _)| fd == child_fd && !claimed_parent_fds.contains(&fd))
+                {
+                    (alloc::vec![(parent_fd, flow_dir)], false)
                 } else {
+                    (Vec::new(), false)
+                };
+
+                // Mark all matched parent fds as claimed.
+                for &(fd, _) in &counterparts {
+                    claimed_parent_fds.push(fd);
+                }
+
+                if counterparts.is_empty() {
                     // No counterpart in parent — the parent may have already
                     // closed this end (broken pipe). Close the unused OS end.
                     self.global.platform.close_host_fd(parent_os_fd);
                     bridge_parent_info.push(Vec::new());
+                } else {
+                    // First-fork check: the parent holds an fd on the same
+                    // pipe pair with the OPPOSITE direction from the
+                    // counterpart (i.e. both ends live in the parent's fd
+                    // table).  For pair_id matches this means the parent
+                    // also has child_dir; for fd-number fallback, use the
+                    // parent's ACTUAL direction at the matched fd (not the
+                    // synthetic flow_dir) to avoid self-matching.
+                    let is_first_fork = if matched_by_pair_id {
+                        fc.parent_pipe_fds
+                            .iter()
+                            .any(|&(_, dir, pair_id)| pair_id == child_pair_id && dir == child_dir)
+                    } else {
+                        let matched_fd = counterparts[0].0;
+                        // Look up the parent's actual direction and pair_id
+                        // at the matched fd.
+                        let matched_entry = fc
+                            .parent_pipe_fds
+                            .iter()
+                            .find(|&&(fd, _, _)| fd == matched_fd);
+                        matched_entry.is_some_and(|&(_, actual_dir, pid)| {
+                            // First fork requires a SECOND fd on the same
+                            // pair with the opposite direction.  Using
+                            // actual_dir (not flow_dir) prevents the matched
+                            // fd from satisfying its own predicate.
+                            fc.parent_pipe_fds.iter().any(|&(fd, dir, pair_id)| {
+                                pair_id == pid && dir != actual_dir && fd != matched_fd
+                            })
+                        })
+                    };
+
+                    if is_first_fork {
+                        // First fork: parent has both ends.  The relay
+                        // replaces the parent's counterpart fd(s) with
+                        // new virtual pipe(s).
+                        let mut first = true;
+                        for &(parent_fd, parent_dir) in &counterparts {
+                            let host_fd = if first {
+                                first = false;
+                                parent_os_fd
+                            } else {
+                                match self.global.platform.dup_host_fd(parent_os_fd) {
+                                    Ok(fd) => fd,
+                                    Err(_) => continue,
+                                }
+                            };
+                            parent_replacements.push(crate::FdReplacement {
+                                guest_fd: parent_fd,
+                                host_fd,
+                                direction: parent_dir,
+                                subsystem: crate::ReplacedSubsystem::Pipe,
+                            });
+                        }
+                    } else {
+                        // Nested fork: close the unused OS pipe end — the
+                        // mux relays directly to the parent's existing pipe.
+                        self.global.platform.close_host_fd(parent_os_fd);
+                    }
+                    bridge_parent_info.push(
+                        counterparts
+                            .iter()
+                            .map(|&(fd, dir)| (fd, dir, crate::ReplacedSubsystem::Pipe))
+                            .collect(),
+                    );
                 }
             }
 
@@ -3837,49 +4185,18 @@ impl<FS: ShimFS> Task<FS> {
                 }
 
                 // Track already-bridged object IDs to dedup dup'd sockets.
-                // (object_id, os_fd_for_child, direction)
-                let mut bridged_objects: Vec<(u64, i32, HostPipeDirection)> = Vec::new();
+                // (object_id, direction, bridge_index)
+                let mut bridged_objects: Vec<(u64, HostPipeDirection, usize)> = Vec::new();
 
                 for info in &child_sockets {
                     // Dedup: if same object_id already bridged with same
-                    // direction, dup the existing child OS fd.
-                    if let Some(&(_, existing_os_fd, _)) = bridged_objects
+                    // direction, record as alias (same stream_id) instead
+                    // of creating a separate bridge.
+                    if let Some(&(_, _, existing_idx)) = bridged_objects
                         .iter()
-                        .find(|(oid, _, dir)| *oid == info.object_id && *dir == info.direction)
+                        .find(|(oid, dir, _)| *oid == info.object_id && *dir == info.direction)
                     {
-                        match self.global.platform.dup_host_fd(existing_os_fd) {
-                            Ok(dup_fd) => {
-                                child_pipe_bridges.push((info.child_fd, dup_fd, info.direction));
-                                bridge_drained.push(Vec::new());
-                                bridge_host_fd.push(-1);
-                                // Copy parent info from the original bridge
-                                let original_parents = child_pipe_bridges
-                                    .iter()
-                                    .position(|&(_, os_fd, _)| os_fd == existing_os_fd)
-                                    .and_then(|idx| bridge_parent_info.get(idx))
-                                    .cloned()
-                                    .unwrap_or_default();
-                                bridge_parent_info.push(original_parents);
-                            }
-                            Err(_e) => {
-                                #[cfg(feature = "trace_syscalls")]
-                                litebox::log_println!(
-                                    self.global.platform,
-                                    "[DELAYED-FORK] pid={}: dup_host_fd({}) failed for socket dedup: {}",
-                                    self.pid,
-                                    existing_os_fd,
-                                    _e,
-                                );
-                                for &(_, os_fd, _) in &child_pipe_bridges {
-                                    self.global.platform.close_host_fd(os_fd);
-                                }
-                                for pr in &parent_replacements {
-                                    self.global.platform.close_host_fd(pr.host_fd);
-                                }
-                                put_fc_back(self, fc);
-                                return Err(Errno::ENOMEM);
-                            }
-                        }
+                        mux_aliases.push((info.child_fd, existing_idx));
                         continue;
                     }
 
@@ -4009,7 +4326,11 @@ impl<FS: ShimFS> Task<FS> {
                         }
                     }
 
-                    bridged_objects.push((info.object_id, child_os_fd, info.direction));
+                    bridged_objects.push((
+                        info.object_id,
+                        info.direction,
+                        child_pipe_bridges.len(),
+                    ));
                     child_pipe_bridges.push((info.child_fd, child_os_fd, info.direction));
                     bridge_drained.push(this_socket_drained);
                     bridge_host_fd.push(-1);
@@ -4133,7 +4454,45 @@ impl<FS: ShimFS> Task<FS> {
                         },
                     );
 
-                    mux_stream_specs.push((stream_id, guest_fd, dir_byte, type_byte));
+                    // For Read-direction child pipes (child reads,
+                    // parent writes): check if the parent's pipe is
+                    // already EOF at setup time.  This lets the worker
+                    // pre-close the relay sender so the child gets
+                    // immediate EOF — preserving POSIX synchronous EOF.
+                    let initial_eof = if direction == HostPipeDirection::Read {
+                        // The parent's counterpart (Write direction) might
+                        // already have its sender shut down.  Check via
+                        // the OS pipe: the parent_os_fd is the write end.
+                        // If the parent's virtual pipe receiver already
+                        // sees EOF, the child should too.
+                        bridge_parent_info.get(i).is_some_and(|parents| {
+                            parents.iter().all(|&(parent_fd, parent_dir, _)| {
+                                if parent_dir == HostPipeDirection::Write {
+                                    // Parent is a writer — check if the
+                                    // source pipe already has EOF.
+                                    let files = self.files.borrow();
+                                    let rds = files.raw_descriptor_store.read();
+                                    if let Ok(typed) = rds.fd_from_raw_integer::<
+                                        litebox::pipes::Pipes<crate::Platform>,
+                                    >(
+                                        parent_fd
+                                    ) {
+                                        drop(rds);
+                                        self.global.pipes.is_read_eof(&typed)
+                                    } else {
+                                        drop(rds);
+                                        false
+                                    }
+                                } else {
+                                    false
+                                }
+                            })
+                        })
+                    } else {
+                        false
+                    };
+
+                    mux_stream_specs.push((stream_id, guest_fd, dir_byte, type_byte, initial_eof));
 
                     let is_host_backed = bridge_host_fd.get(i).is_some_and(|&hf| hf >= 0);
 
@@ -4195,6 +4554,21 @@ impl<FS: ShimFS> Task<FS> {
                 // Close parent-side OS pipe fds — the mux replaces them.
                 for pr in &parent_replacements {
                     self.global.platform.close_host_fd(pr.host_fd);
+                }
+
+                // Append alias entries to mux_stream_specs: same
+                // stream_id as the primary, different guest_fd.  The
+                // worker dedup installs a dup'd pipe end at the alias
+                // fd.  The parent `seen_streams` dedup installs a
+                // dup'd dispatch pipe for the alias.
+                for &(alias_fd, primary_idx) in &mux_aliases {
+                    let stream_id = u32::try_from(primary_idx).unwrap_or(0);
+                    let &(_, _, direction) = &child_pipe_bridges[primary_idx];
+                    let dir_byte = match direction {
+                        HostPipeDirection::Read => b'r',
+                        HostPipeDirection::Write => b'w',
+                    };
+                    mux_stream_specs.push((stream_id, alias_fd, dir_byte, b'p', false));
                 }
 
                 // Store mux info in VforkDone for the parent to consume.
@@ -4294,6 +4668,7 @@ impl<FS: ShimFS> Task<FS> {
             mux_fd_opt,
             &mux_stream_specs,
             &[],
+            &local_pipe_pairs,
         ) {
             Ok(pid) => pid,
             Err(_err) => {
@@ -4565,6 +4940,7 @@ impl<FS: ShimFS> Task<FS> {
             &snapshot_bytes,
             stdio,
             None,
+            &[],
             &[],
             &[],
         ) {
@@ -6472,6 +6848,7 @@ impl<FS: ShimFS> Task<FS> {
         guest_interp_image: Option<(&str, &[u8])>,
         vfork_info: Option<ExecVforkInfo>,
     ) -> Result<usize, Errno> {
+        use super::host_pipe::HostPipeDirection;
         litebox::log_println!(
             self.global.platform,
             "[EXEC-REMOTE] pid={} path={:?} — entering exec_on_remote_host",
@@ -6519,24 +6896,27 @@ impl<FS: ShimFS> Task<FS> {
             signal_on_error(&vfork_info);
         })?;
 
-        // Collect pipe_pair_ids for pipe-backed stdio so we can map the
-        // direct-pipe fds back to parent fd numbers after spawn.
-        let mut stdio_pipe_pair_ids: alloc::vec::Vec<(i32, usize)> = alloc::vec::Vec::new();
+        // Collect pipe_pair_ids + direction for pipe-backed stdio so we can
+        // map the direct-pipe fds back to the parent's counterpart by pair_id
+        // after spawn.  The child may dup2 a pipe to a different fd number
+        // between fork and exec, so pair_id matching is necessary.
+        let mut stdio_pipe_pair_ids: alloc::vec::Vec<(i32, usize, HostPipeDirection)> =
+            alloc::vec::Vec::new();
         if has_vfork_done {
             if let WorkerExecInputBinding::Pipe { ref pipes, ref fd } = worker_stdio.stdin
                 && let Ok(pair_id) = pipes.pipe_pair_id(fd.as_ref())
             {
-                stdio_pipe_pair_ids.push((0, pair_id));
+                stdio_pipe_pair_ids.push((0, pair_id, HostPipeDirection::Read));
             }
             if let WorkerExecOutputBinding::Pipe { ref pipes, ref fd } = worker_stdio.stdout
                 && let Ok(pair_id) = pipes.pipe_pair_id(fd.as_ref())
             {
-                stdio_pipe_pair_ids.push((1, pair_id));
+                stdio_pipe_pair_ids.push((1, pair_id, HostPipeDirection::Write));
             }
             if let WorkerExecOutputBinding::Pipe { ref pipes, ref fd } = worker_stdio.stderr
                 && let Ok(pair_id) = pipes.pipe_pair_id(fd.as_ref())
             {
-                stdio_pipe_pair_ids.push((2, pair_id));
+                stdio_pipe_pair_ids.push((2, pair_id, HostPipeDirection::Write));
             }
         }
 
@@ -6578,26 +6958,63 @@ impl<FS: ShimFS> Task<FS> {
         // parent can start using HostPipeFd for direct I/O to the child worker.
         if let Some((vd, ref parent_pipe_fds)) = vfork_info {
             let mut replacements: alloc::vec::Vec<crate::FdReplacement> = alloc::vec::Vec::new();
+            // Prevent double-claiming the same parent fd (e.g. 2>&1
+            // makes stdout and stderr share the same pair_id).
+            let mut claimed_parent_fds: alloc::vec::Vec<usize> = alloc::vec::Vec::new();
             for dp in &spawn_result.direct_pipes {
-                // Verify the child has a pipe at this stdio fd.
-                let has_pipe = stdio_pipe_pair_ids
+                // Look up the child's pair_id and direction for this stdio fd.
+                let child_info = stdio_pipe_pair_ids
                     .iter()
-                    .any(|&(fd, _)| fd == dp.child_stdio_fd);
-                if !has_pipe {
+                    .find(|&&(fd, _, _)| fd == dp.child_stdio_fd);
+                let Some(&(_, child_pair_id, child_dir)) = child_info else {
                     self.global.platform.close_host_fd(dp.parent_os_fd);
                     continue;
-                }
+                };
 
-                // Find the parent's pipe at the same guest fd.
-                let child_fd_usize = usize::try_from(dp.child_stdio_fd).unwrap_or(usize::MAX);
-                if let Some(&(parent_fd, parent_dir_actual, _)) = parent_pipe_fds
-                    .iter()
-                    .find(|&&(fd, _, _)| fd == child_fd_usize)
-                {
+                // Find ONE parent counterpart by pair_id + opposite
+                // direction.  Use find() (not filter()) so each
+                // direct pipe claims at most one parent fd — when
+                // multiple direct pipes share a pair_id (e.g. 2>&1),
+                // each gets its own counterpart via claimed_parent_fds.
+                let pair_id_match: Option<(usize, super::host_pipe::HostPipeDirection)> =
+                    parent_pipe_fds
+                        .iter()
+                        .find(|&&(fd, dir, pid)| {
+                            pid == child_pair_id
+                                && dir != child_dir
+                                && !claimed_parent_fds.contains(&fd)
+                        })
+                        .map(|&(fd, dir, _)| (fd, dir));
+
+                // Fallback: match by fd number if pair_id matching
+                // found nothing (child may have close+pipe+dup2 after
+                // fork, creating a new pair the parent doesn't have).
+                let counterpart = if let Some(m) = pair_id_match {
+                    Some(m)
+                } else {
+                    let child_fd_usize = usize::try_from(dp.child_stdio_fd).unwrap_or(usize::MAX);
+                    let flow_dir = match child_dir {
+                        super::host_pipe::HostPipeDirection::Read => {
+                            super::host_pipe::HostPipeDirection::Write
+                        }
+                        super::host_pipe::HostPipeDirection::Write => {
+                            super::host_pipe::HostPipeDirection::Read
+                        }
+                    };
+                    parent_pipe_fds
+                        .iter()
+                        .find(|&&(fd, _, _)| {
+                            fd == child_fd_usize && !claimed_parent_fds.contains(&fd)
+                        })
+                        .map(|&(fd, _, _)| (fd, flow_dir))
+                };
+
+                if let Some((parent_fd, parent_dir)) = counterpart {
+                    claimed_parent_fds.push(parent_fd);
                     replacements.push(crate::FdReplacement {
                         guest_fd: parent_fd,
                         host_fd: dp.parent_os_fd,
-                        direction: parent_dir_actual,
+                        direction: parent_dir,
                         subsystem: crate::ReplacedSubsystem::Pipe,
                     });
                 } else {
