@@ -22,14 +22,23 @@ use std::path::Path;
 ///
 /// `tar_data` is the raw bytes of a `.tar` archive containing syscall-rewritten
 /// Linux ELF binaries. `request` specifies the command, environment, and any
-/// files to inject.
+/// files to inject. `policy` optionally restricts what the guest may do.
 ///
 /// Returns a [`ToolResult`] with captured output and audit trail.
 ///
 /// # Panics
 ///
 /// May panic if the platform or filesystem setup encounters an unexpected state.
-pub fn execute(tar_data: Vec<u8>, request: &ToolRequest) -> Result<ToolResult> {
+pub fn execute(
+    tar_data: Vec<u8>,
+    request: &ToolRequest,
+    policy: Option<litebox_shim_linux::policy::SandboxPolicy>,
+) -> Result<ToolResult> {
+    // Install the sandbox policy before any guest code runs.
+    if let Some(pol) = policy {
+        litebox_shim_linux::policy::set_policy(pol);
+    }
+
     // Leak the tar data so it has a 'static lifetime, as required by the
     // read-only filesystem layer. This is acceptable because each execute()
     // call runs a short-lived guest program and then the process exits.

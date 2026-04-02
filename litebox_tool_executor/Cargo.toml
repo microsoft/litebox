@@ -10,7 +10,7 @@ litebox = { version = "0.1.0", path = "../litebox" }
 litebox_common_linux = { version = "0.1.0", path = "../litebox_common_linux" }
 litebox_platform_windows_userland = { version = "0.1.0", path = "../litebox_platform_windows_userland" }
 litebox_platform_multiplex = { version = "0.1.0", path = "../litebox_platform_multiplex", default-features = false, features = ["platform_windows_userland"] }
-litebox_shim_linux = { version = "0.1.0", path = "../litebox_shim_linux", default-features = false, features = ["platform_windows_userland", "audit_log"] }
+litebox_shim_linux = { version = "0.1.0", path = "../litebox_shim_linux", default-features = false, features = ["platform_windows_userland", "audit_log", "policy"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 

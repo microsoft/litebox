@@ -52,6 +52,8 @@ pub mod loader;
 #[cfg_attr(not(test), allow(dead_code))]
 mod multihost;
 pub mod multiplexer;
+#[cfg(feature = "policy")]
+pub mod policy;
 pub(crate) mod stdio;
 pub mod syscalls;
 pub mod transport;
@@ -2382,7 +2384,19 @@ impl<FS: ShimFS> Task<FS> {
                 pathname,
                 argv,
                 envp,
-            } => self.sys_execve(pathname, argv, envp, ctx),
+            } => {
+                #[cfg(feature = "policy")]
+                #[allow(clippy::collapsible_if)]
+                if let Some(pol) = policy::get_policy() {
+                    if let Some(s) = pathname.to_cstring() {
+                        if pol.check_exec(s.to_str().unwrap_or("")) == policy::PolicyDecision::Deny
+                        {
+                            return Err(Errno::EACCES);
+                        }
+                    }
+                }
+                self.sys_execve(pathname, argv, envp, ctx)
+            }
             SyscallRequest::Read { fd, buf, count } => {
                 // Note some applications (e.g., `node`) seem to assume that getting fewer bytes than
                 // requested indicates EOF.
@@ -2611,7 +2625,16 @@ impl<FS: ShimFS> Task<FS> {
                 sockfd,
                 sockaddr,
                 addrlen,
-            } => syscall!(sys_connect(sockfd, sockaddr, addrlen)),
+            } => {
+                #[cfg(feature = "policy")]
+                #[allow(clippy::collapsible_if)]
+                if let Some(pol) = policy::get_policy() {
+                    if pol.network.deny_all {
+                        return Err(Errno::EACCES);
+                    }
+                }
+                syscall!(sys_connect(sockfd, sockaddr, addrlen))
+            }
             SyscallRequest::Accept {
                 sockfd,
                 addr,
@@ -2799,6 +2822,19 @@ impl<FS: ShimFS> Task<FS> {
                 flags,
                 mode,
             } => pathname.to_cstring().map_or(Err(Errno::EFAULT), |path| {
+                #[cfg(feature = "policy")]
+                #[allow(clippy::collapsible_if)]
+                if let Some(pol) = policy::get_policy() {
+                    let write = flags.contains(litebox::fs::OFlags::WRONLY)
+                        || flags.contains(litebox::fs::OFlags::RDWR)
+                        || flags.contains(litebox::fs::OFlags::CREAT)
+                        || flags.contains(litebox::fs::OFlags::TRUNC);
+                    if pol.check_file_access(path.to_str().unwrap_or(""), write)
+                        == policy::PolicyDecision::Deny
+                    {
+                        return Err(Errno::EACCES);
+                    }
+                }
                 syscall!(sys_openat(dirfd, path, flags, mode))
             }),
             SyscallRequest::Ftruncate { fd, length } => syscall!(sys_ftruncate(fd, length)),
@@ -2807,6 +2843,15 @@ impl<FS: ShimFS> Task<FS> {
                 pathname,
                 flags,
             } => pathname.to_cstring().map_or(Err(Errno::EFAULT), |path| {
+                #[cfg(feature = "policy")]
+                #[allow(clippy::collapsible_if)]
+                if let Some(pol) = policy::get_policy() {
+                    if pol.check_file_access(path.to_str().unwrap_or(""), true)
+                        == policy::PolicyDecision::Deny
+                    {
+                        return Err(Errno::EACCES);
+                    }
+                }
                 syscall!(sys_unlinkat(dirfd, path, flags))
             }),
             SyscallRequest::Renameat2 {

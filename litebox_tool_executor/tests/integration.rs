@@ -76,7 +76,8 @@ fn test_execute_static_hello_world() {
         timeout_secs: None,
     };
 
-    let result = litebox_tool_executor::execute(tar_data, &request).expect("execute() failed");
+    let result =
+        litebox_tool_executor::execute(tar_data, &request, None).expect("execute() failed");
 
     // The program prints "hello world.\n" and exits with code 0.
     assert_eq!(result.exit_code, 0, "Expected exit code 0");

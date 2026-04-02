@@ -16,11 +16,14 @@ fn main() -> anyhow::Result<()> {
         anyhow::anyhow!("Could not read rootfs tar at {}: {e}", cli.rootfs.display())
     })?;
 
+    // Load policy from file if specified.
+    let policy = cli.policy.map(|path| load_policy(&path)).transpose()?;
+
     if cli.command.is_empty() {
         // JSON pipe mode: read ToolRequest from stdin.
         let request: litebox_tool_executor::protocol::ToolRequest =
             serde_json::from_reader(std::io::stdin().lock())?;
-        let result = litebox_tool_executor::execute(tar_data, &request)?;
+        let result = litebox_tool_executor::execute(tar_data, &request, policy)?;
         serde_json::to_writer(std::io::stdout().lock(), &result)?;
         println!();
     } else {
@@ -31,10 +34,67 @@ fn main() -> anyhow::Result<()> {
             files: std::collections::HashMap::new(),
             timeout_secs: None,
         };
-        let result = litebox_tool_executor::execute(tar_data, &request)?;
+        let result = litebox_tool_executor::execute(tar_data, &request, policy)?;
         std::process::exit(result.exit_code);
     }
     Ok(())
+}
+
+#[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+/// Load a sandbox policy from a JSON file.
+fn load_policy(
+    path: &std::path::Path,
+) -> anyhow::Result<litebox_shim_linux::policy::SandboxPolicy> {
+    #[derive(serde::Deserialize)]
+    struct PolicyFile {
+        #[serde(default)]
+        filesystem: FsPolicyFile,
+        #[serde(default)]
+        network: NetworkPolicyFile,
+        #[serde(default)]
+        process: ProcessPolicyFile,
+    }
+    #[derive(serde::Deserialize, Default)]
+    struct FsPolicyFile {
+        #[serde(default)]
+        allow_read: Vec<String>,
+        #[serde(default)]
+        allow_write: Vec<String>,
+        #[serde(default)]
+        deny: Vec<String>,
+    }
+    #[derive(serde::Deserialize, Default)]
+    struct NetworkPolicyFile {
+        #[serde(default)]
+        deny_all: bool,
+        #[serde(default)]
+        allow_connect: Vec<String>,
+    }
+    #[derive(serde::Deserialize, Default)]
+    struct ProcessPolicyFile {
+        #[serde(default)]
+        allow_exec: Vec<String>,
+    }
+
+    let data = std::fs::read_to_string(path)
+        .map_err(|e| anyhow::anyhow!("Could not read policy file {}: {e}", path.display()))?;
+    let pf: PolicyFile = serde_json::from_str(&data)
+        .map_err(|e| anyhow::anyhow!("Invalid policy JSON in {}: {e}", path.display()))?;
+
+    Ok(litebox_shim_linux::policy::SandboxPolicy {
+        filesystem: litebox_shim_linux::policy::FsPolicy {
+            allow_read: pf.filesystem.allow_read,
+            allow_write: pf.filesystem.allow_write,
+            deny: pf.filesystem.deny,
+        },
+        network: litebox_shim_linux::policy::NetworkPolicy {
+            deny_all: pf.network.deny_all,
+            allow_connect: pf.network.allow_connect,
+        },
+        process: litebox_shim_linux::policy::ProcessPolicy {
+            allow_exec: pf.process.allow_exec,
+        },
+    })
 }
 
 #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
@@ -45,6 +105,9 @@ struct Cli {
     /// Path to a .tar rootfs containing syscall-rewritten Linux binaries.
     #[arg(long, value_name = "PATH", value_hint = clap::ValueHint::FilePath)]
     rootfs: std::path::PathBuf,
+    /// Path to a JSON policy file restricting guest operations.
+    #[arg(long, value_name = "PATH", value_hint = clap::ValueHint::FilePath)]
+    policy: Option<std::path::PathBuf>,
     /// Environment variables passed to the program (`KEY=VALUE`; repeatable).
     #[arg(long = "env")]
     env: Vec<String>,
