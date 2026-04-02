@@ -45,6 +45,8 @@ macro_rules! log_unsupported {
     };
 }
 
+#[cfg(feature = "audit_log")]
+pub mod audit;
 pub(crate) mod channel;
 pub mod loader;
 #[cfg_attr(not(test), allow(dead_code))]
@@ -2351,7 +2353,10 @@ impl<FS: ShimFS> Task<FS> {
 
         self.record_syscall_entry(ctx, syscall_number);
 
-        match request {
+        #[cfg(feature = "audit_log")]
+        let mut audit_event = audit::build_audit_event(&request);
+
+        let result = match request {
             SyscallRequest::Exit { status } => {
                 self.sys_exit(status);
                 Ok(0)
@@ -3203,7 +3208,18 @@ impl<FS: ShimFS> Task<FS> {
                 log_unsupported!("{request:?}");
                 Err(Errno::ENOSYS)
             }
+        };
+
+        #[cfg(feature = "audit_log")]
+        {
+            audit_event.set_result(match &result {
+                Ok(v) => Ok(*v),
+                Err(e) => Err(e.as_neg()),
+            });
+            audit::emit_audit_event(&audit_event);
         }
+
+        result
     }
 }
 
