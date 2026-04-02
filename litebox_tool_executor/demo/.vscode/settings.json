@@ -4,6 +4,10 @@
             "path": "C:\\src\\litebox\\target\\debug\\litebox_tool_executor.exe",
             "args": ["--rootfs", "C:\\src\\litebox\\target\\busybox-minimal.tar", "--policy", "C:\\src\\litebox\\litebox_tool_executor\\policies\\demo-policy.json", "--audit-log", "C:\\src\\litebox\\target\\litebox-audit.jsonl", "--interactive"],
             "icon": "shield"
+        },
+        "PowerShell": {
+            "path": "powershell.exe",
+            "icon": "terminal-powershell"
         }
     },
     // Make the sandbox the default terminal so Copilot agent mode uses it

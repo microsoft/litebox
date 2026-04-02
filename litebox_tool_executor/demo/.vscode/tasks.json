@@ -3,8 +3,8 @@
     "tasks": [
         {
             "label": "LiteBox: Tail Audit Log",
-            "type": "shell",
-            "command": "powershell",
+            "type": "process",
+            "command": "powershell.exe",
             "args": [
                 "-NoProfile",
                 "-Command",
@@ -19,8 +19,8 @@
         },
         {
             "label": "LiteBox: Tail Audit Log (Pretty)",
-            "type": "shell",
-            "command": "powershell",
+            "type": "process",
+            "command": "powershell.exe",
             "args": [
                 "-NoProfile",
                 "-ExecutionPolicy", "Bypass",
