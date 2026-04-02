@@ -50,12 +50,25 @@ if "%LITEBOX_AUDIT%"=="" (
     set "LITEBOX_AUDIT=%LITEBOX_ROOTFS%.audit.jsonl"
 )
 
-REM If arguments were passed, run in direct mode.
-REM If no arguments, launch an interactive busybox shell.
+REM Interactive REPL mode: each line the user (or agent) types is run as a
+REM separate LiteBox invocation. This avoids the need for fork(), which is not
+REM yet implemented. Each command gets a fresh sandbox.
 if "%~1"=="" (
-    "%EXECUTOR%" %ARGS% /bin/busybox sh 2>>"%LITEBOX_AUDIT%"
+    goto :repl
 ) else (
     "%EXECUTOR%" %ARGS% /bin/busybox sh -c "%~1" 2>>"%LITEBOX_AUDIT%"
+    echo.
+    echo [LiteBox] Audit log: %LITEBOX_AUDIT%
+    goto :eof
 )
+
+:repl
+echo LiteBox Sandbox Shell (each command runs in a fresh sandbox)
+echo Type 'exit' to quit. Commands are executed via busybox.
 echo.
-echo [LiteBox] Audit log written to: %LITEBOX_AUDIT%
+:prompt
+set /p "CMD=/ $ "
+if /i "%CMD%"=="exit" goto :eof
+if "%CMD%"=="" goto :prompt
+"%EXECUTOR%" %ARGS% /bin/busybox sh -c "%CMD%" 2>>"%LITEBOX_AUDIT%"
+goto :prompt

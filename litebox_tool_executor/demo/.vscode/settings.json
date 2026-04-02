@@ -7,5 +7,8 @@
             },
             "icon": "shield"
         }
-    }
+    },
+    // Make the sandbox the default terminal so Copilot agent mode uses it
+    // when running commands.
+    "terminal.integrated.defaultProfile.windows": "LiteBox Sandbox"
 }
