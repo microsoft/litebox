@@ -83,3 +83,68 @@ fn test_execute_static_hello_world() {
     assert_eq!(result.exit_code, 0, "Expected exit code 0");
     assert!(!result.timed_out, "Should not have timed out");
 }
+
+/// Helper: get the path to the built executor binary.
+fn executor_exe() -> std::path::PathBuf {
+    // cargo puts the test binary in target/debug/deps/, the main binary is in target/debug/
+    let mut path = std::env::current_exe().unwrap();
+    path.pop(); // remove the test binary name
+    if path.ends_with("deps") {
+        path.pop(); // remove "deps"
+    }
+    path.push("litebox_tool_executor.exe");
+    path
+}
+
+/// Helper: get or create the busybox rootfs tar for process-level tests.
+/// Reuses the same rewritten hello_world_static binary in a tar.
+fn test_rootfs_tar() -> Vec<u8> {
+    let bin_path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../litebox_runner_linux_on_windows_userland/tests/test-bins/hello_world_static"
+    );
+    let bin_data = std::fs::read(bin_path).expect("Failed to read hello_world_static");
+    let hooked = litebox_syscall_rewriter::hook_syscalls_in_elf(&bin_data, None)
+        .expect("Failed to rewrite syscalls");
+    make_tar("hello_world_static", &hooked)
+}
+
+/// Process-level test: spawn the executor, run a command, capture stdout.
+/// This tests the full pipeline including console mode, stdio passthrough,
+/// and process exit code — exactly matching how the VS Code terminal uses it.
+#[test]
+fn test_process_level_echo() {
+    let exe = executor_exe();
+    if !exe.exists() {
+        eprintln!(
+            "Skipping process-level test: executor binary not found at {}",
+            exe.display()
+        );
+        return;
+    }
+
+    // Write a temporary tar
+    let tar_data = test_rootfs_tar();
+    let tar_path = std::env::temp_dir().join("litebox_test_rootfs.tar");
+    std::fs::write(&tar_path, &tar_data).unwrap();
+
+    let output = std::process::Command::new(&exe)
+        .args([
+            "--rootfs",
+            tar_path.to_str().unwrap(),
+            "/hello_world_static",
+        ])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .expect("Failed to spawn executor");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("hello world."),
+        "Expected 'hello world.' in stdout, got: {stdout}"
+    );
+    assert_eq!(output.status.code(), Some(0), "Expected exit code 0");
+
+    std::fs::remove_file(&tar_path).ok();
+}

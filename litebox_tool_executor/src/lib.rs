@@ -34,6 +34,14 @@ pub fn execute(
     request: &ToolRequest,
     policy: Option<litebox_shim_linux::policy::SandboxPolicy>,
 ) -> Result<ToolResult> {
+    // Disable the Windows console's built-in echo and line-input mode.
+    // When running interactively (e.g., via a VS Code terminal), the ConPTY
+    // echoes keystrokes by default. But busybox's shell also echoes input,
+    // causing double-echo. We switch to raw mode so only the guest's echo
+    // is visible, matching how a Linux terminal works (the application
+    // controls echo via the tty, not the terminal emulator).
+    disable_console_echo();
+
     // Install the sandbox policy before any guest code runs.
     if let Some(pol) = policy {
         litebox_shim_linux::policy::set_policy(pol);
@@ -148,4 +156,33 @@ pub fn execute(
         audit_log: Vec::new(),
         timed_out: false,
     })
+}
+
+/// Disable the Windows console's ECHO and LINE_INPUT modes on stdin.
+///
+/// This prevents the ConPTY from echoing keystrokes (the guest shell handles
+/// its own echo) and switches to character-at-a-time input (the guest shell
+/// handles its own line editing).
+fn disable_console_echo() {
+    use std::os::windows::io::AsRawHandle as _;
+    use windows_sys::Win32::System::Console::{
+        ENABLE_ECHO_INPUT, ENABLE_LINE_INPUT, ENABLE_PROCESSED_INPUT, GetConsoleMode,
+        SetConsoleMode,
+    };
+
+    let stdin_handle = std::io::stdin().as_raw_handle();
+    let mut mode: u32 = 0;
+    // Safety: stdin_handle is a valid console handle when running in a terminal.
+    // GetConsoleMode will fail (return 0) if stdin is a pipe — harmless.
+    let ok = unsafe { GetConsoleMode(stdin_handle, &mut mode) };
+    if ok == 0 {
+        return; // stdin is not a console (piped input) — nothing to do.
+    }
+    // Disable echo and line-buffering. Keep ENABLE_PROCESSED_INPUT so Ctrl+C
+    // still works.
+    let new_mode = (mode & !(ENABLE_ECHO_INPUT | ENABLE_LINE_INPUT)) | ENABLE_PROCESSED_INPUT;
+    // Safety: same handle, valid mode bits.
+    unsafe {
+        SetConsoleMode(stdin_handle, new_mode);
+    }
 }
