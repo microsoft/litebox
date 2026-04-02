@@ -36,6 +36,9 @@ fn main() -> anyhow::Result<()> {
 
         eprintln!("LiteBox Sandbox Shell (each command runs in a fresh sandbox)");
         eprintln!("Type 'exit' to quit. Commands are executed via busybox.");
+        if let Some(ref log_path) = cli.audit_log {
+            eprintln!("Audit log: {}", log_path.display());
+        }
         eprintln!();
 
         let exe = std::env::current_exe()?;
@@ -88,8 +91,16 @@ fn main() -> anyhow::Result<()> {
                     use std::io::Write as _;
                     let _ = std::io::stdout().write_all(&out.stdout);
                     let _ = std::io::stdout().flush();
-                    // Child stderr contains audit log + debug output — discard
-                    // it in interactive mode to keep the terminal clean.
+                    // Append child stderr (audit log) to file if configured.
+                    if let Some(ref log_path) = cli.audit_log {
+                        if let Ok(mut f) = std::fs::OpenOptions::new()
+                            .create(true)
+                            .append(true)
+                            .open(log_path)
+                        {
+                            let _ = std::io::Write::write_all(&mut f, &out.stderr);
+                        }
+                    }
                     if !out.status.success() {
                         eprintln!("[exit code: {}]", out.status.code().unwrap_or(-1));
                     }
@@ -211,6 +222,10 @@ struct Cli {
     /// Run an interactive REPL shell (each line is a sandboxed command).
     #[arg(long)]
     interactive: bool,
+    /// Path to write the audit log (JSON lines). In interactive mode, child
+    /// stderr (audit events) is appended here instead of being discarded.
+    #[arg(long = "audit-log", value_name = "PATH", value_hint = clap::ValueHint::FilePath)]
+    audit_log: Option<std::path::PathBuf>,
     /// Environment variables passed to the program (`KEY=VALUE`; repeatable).
     #[arg(long = "env")]
     env: Vec<String>,

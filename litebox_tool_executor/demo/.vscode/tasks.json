@@ -1,0 +1,38 @@
+{
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "LiteBox: Tail Audit Log",
+            "type": "shell",
+            "command": "powershell",
+            "args": [
+                "-NoProfile",
+                "-Command",
+                "Get-Content -Path 'C:\\src\\litebox\\target\\litebox-audit.jsonl' -Wait -Tail 0 | ForEach-Object { if ($_ -match '^\\{') { $_ | ConvertFrom-Json | Format-Table -AutoSize syscall, args, result } else { Write-Host $_ -ForegroundColor DarkGray } }"
+            ],
+            "problemMatcher": [],
+            "presentation": {
+                "reveal": "always",
+                "panel": "dedicated",
+                "focus": false
+            }
+        },
+        {
+            "label": "LiteBox: Tail Audit Log (Pretty)",
+            "type": "shell",
+            "command": "powershell",
+            "args": [
+                "-NoProfile",
+                "-ExecutionPolicy", "Bypass",
+                "-Command",
+                "Get-Content -Path 'C:\\src\\litebox\\target\\litebox-audit.jsonl' -Wait -Tail 0 | & 'C:\\src\\litebox\\litebox_tool_executor\\scripts\\View-AuditLog.ps1'"
+            ],
+            "problemMatcher": [],
+            "presentation": {
+                "reveal": "always",
+                "panel": "dedicated",
+                "focus": false
+            }
+        }
+    ]
+}
