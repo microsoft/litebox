@@ -3,24 +3,80 @@
 
 //! CLI entrypoint for the LiteBox tool executor.
 //!
-//! Supports two modes:
-//! - **Direct mode**: `litebox-tool-executor --rootfs rootfs.tar -- /bin/ls -la`
-//! - **JSON pipe mode**: reads a [`ToolRequest`] from stdin, writes a [`ToolResult`] to stdout.
+//! Supports three modes:
+//! - **Direct mode**: `litebox-tool-executor --rootfs rootfs.tar -- /bin/busybox echo hello`
+//! - **Interactive REPL**: `litebox-tool-executor --rootfs rootfs.tar --interactive`
+//! - **JSON pipe mode**: reads a [`ToolRequest`] from stdin (when no command given and not interactive)
 
 #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
 fn main() -> anyhow::Result<()> {
     use clap::Parser as _;
+    use std::io::Write as _;
 
     let cli = Cli::parse();
     let tar_data = std::fs::read(&cli.rootfs).map_err(|e| {
         anyhow::anyhow!("Could not read rootfs tar at {}: {e}", cli.rootfs.display())
     })?;
 
-    // Load policy from file if specified.
-    let policy = cli.policy.map(|path| load_policy(&path)).transpose()?;
+    if cli.interactive {
+        // Interactive REPL mode: read lines from stdin, execute each as a
+        // separate child process of this executor. This avoids the singleton
+        // platform limitation (each child gets its own process) and also means
+        // the command string is passed via argv with no shell quoting issues.
+        eprintln!("LiteBox Sandbox Shell (each command runs in a fresh sandbox)");
+        eprintln!("Type 'exit' to quit. Commands are executed via busybox.");
+        eprintln!();
 
-    if cli.command.is_empty() {
+        let exe = std::env::current_exe()?;
+        let stdin = std::io::stdin();
+        loop {
+            print!("/ $ ");
+            std::io::stdout().flush()?;
+
+            let mut line = String::new();
+            let n = stdin.read_line(&mut line)?;
+            if n == 0 {
+                break; // EOF
+            }
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            if line == "exit" {
+                break;
+            }
+
+            // Spawn a child process: litebox_tool_executor --rootfs <tar> /bin/busybox sh -c <line>
+            // The command goes as a single argv element — no shell escaping needed.
+            let mut child_args = vec![
+                "--rootfs".to_string(),
+                cli.rootfs.to_str().unwrap_or_default().to_string(),
+            ];
+            if let Some(ref policy_path) = cli.policy {
+                child_args.push("--policy".to_string());
+                child_args.push(policy_path.to_str().unwrap_or_default().to_string());
+            }
+            child_args.extend([
+                "/bin/busybox".to_string(),
+                "sh".to_string(),
+                "-c".to_string(),
+                line.to_string(),
+            ]);
+
+            let status = std::process::Command::new(&exe).args(&child_args).status();
+            match status {
+                Ok(s) if !s.success() => {
+                    eprintln!("[exit code: {}]", s.code().unwrap_or(-1));
+                }
+                Err(e) => {
+                    eprintln!("[error: {e}]");
+                }
+                _ => {}
+            }
+        }
+    } else if cli.command.is_empty() {
         // JSON pipe mode: read ToolRequest from stdin.
+        let policy = cli.policy.map(|path| load_policy(&path)).transpose()?;
         let request: litebox_tool_executor::protocol::ToolRequest =
             serde_json::from_reader(std::io::stdin().lock())?;
         let result = litebox_tool_executor::execute(tar_data, &request, policy)?;
@@ -28,6 +84,7 @@ fn main() -> anyhow::Result<()> {
         println!();
     } else {
         // Direct CLI mode.
+        let policy = cli.policy.map(|path| load_policy(&path)).transpose()?;
         let request = litebox_tool_executor::protocol::ToolRequest {
             command: cli.command,
             env: cli.env,
@@ -108,6 +165,9 @@ struct Cli {
     /// Path to a JSON policy file restricting guest operations.
     #[arg(long, value_name = "PATH", value_hint = clap::ValueHint::FilePath)]
     policy: Option<std::path::PathBuf>,
+    /// Run an interactive REPL shell (each line is a sandboxed command).
+    #[arg(long)]
+    interactive: bool,
     /// Environment variables passed to the program (`KEY=VALUE`; repeatable).
     #[arg(long = "env")]
     env: Vec<String>,
