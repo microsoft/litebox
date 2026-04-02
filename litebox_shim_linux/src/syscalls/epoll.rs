@@ -181,8 +181,9 @@ impl<FS: ShimFS> EpollDescriptor<FS> {
                     let events = poll(&*io_poll);
                     return Some(events);
                 }
-                // Regular files: return dummy OUT events.
-                Some(Events::OUT & mask)
+                // Regular files and stdio: always considered both readable
+                // and writable, matching Linux kernel behaviour.
+                Some((Events::IN | Events::OUT) & mask)
             }
             EpollDescriptor::Socket(fd) => {
                 let proxy = match global.get_proxy(fd) {
