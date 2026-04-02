@@ -14,7 +14,14 @@
 //!
 //! This crate currently only supports x86-64 (i.e., amd64) ELFs.
 
-use std::collections::HashSet;
+#![cfg_attr(not(feature = "std"), no_std)]
+extern crate alloc;
+
+use alloc::collections::BTreeSet;
+use alloc::format;
+use alloc::string::{String, ToString};
+use alloc::vec;
+use alloc::vec::Vec;
 
 use object::read::elf::{ElfFile, ProgramHeader as _};
 use object::read::{Object as _, ObjectSection as _, ObjectSymbol as _};
@@ -29,6 +36,8 @@ pub enum Error {
     ParseError(String),
     #[error("unsupported executable")]
     UnsupportedObjectFile,
+    #[error("unsupported Bun-packaged executable")]
+    UnsupportedBunExecutable,
     #[error("executable is already hooked with trampoline")]
     AlreadyHooked,
     #[error("no .text section found")]
@@ -43,7 +52,9 @@ pub enum Error {
     TrampolineAddressTooLarge,
 }
 
-type Result<T> = std::result::Result<T, Error>;
+type Result<T> = core::result::Result<T, Error>;
+
+const BUN_FOOTER_MARKER: &[u8] = b"\n---- Bun! ----\n";
 
 /// The magic bytes used to identify the trampoline data.
 /// This is checked by the loader to verify that the trampoline is valid.
@@ -95,7 +106,31 @@ struct TextSectionInfo {
 /// - trampoline size (8 bytes for 64-bit, 4 bytes for 32-bit)
 ///
 /// This layout allows loaders to read just the last 32/20 bytes to get the metadata.
-pub fn hook_syscalls_in_elf(input_binary: &[u8], trampoline: Option<u64>) -> Result<Vec<u8>> {
+///
+/// `skipped_addrs` receives the virtual addresses of any `syscall`
+/// instructions that could not be patched (replaced with `UD2` so they
+/// trap instead of escaping to the host kernel).
+pub fn hook_syscalls_in_elf(
+    input_binary: &[u8],
+    trampoline: Option<u64>,
+    skipped_addrs: &mut Vec<u64>,
+) -> Result<Vec<u8>> {
+    if has_bun_footer_marker(input_binary) {
+        return Err(Error::UnsupportedBunExecutable);
+    }
+
+    // Relocatable object files (.o) must not be patched: they are linker
+    // input, not executable code. Rewriting instructions or appending
+    // trampoline data would corrupt the object file for the linker.
+    // Check the ELF e_type field (bytes 16..18) before doing any work.
+    if input_binary.len() >= 18 {
+        let e_type = u16::from_le_bytes([input_binary[16], input_binary[17]]);
+        if e_type == 1 {
+            // ET_REL — relocatable object file
+            return Err(Error::UnsupportedObjectFile);
+        }
+    }
+
     // Make a single mutable, 8-byte-aligned copy of the input binary. This serves as both the
     // parse buffer (object::File::parse requires 8-byte alignment) and the output buffer for
     // in-place patching. We use a Vec<u64> to guarantee alignment, then view it as bytes.
@@ -104,8 +139,20 @@ pub fn hook_syscalls_in_elf(input_binary: &[u8], trampoline: Option<u64>) -> Res
     buf[..input_binary.len()].copy_from_slice(input_binary);
     let buf = &mut buf[..input_binary.len()];
 
+    // Some ELF files (e.g. Node.js SEA binaries) have a program header table at an offset that
+    // is not 8-byte aligned, which the `object` crate rejects. Fix this by relocating the phdr
+    // table within our mutable copy so it sits at an 8-byte aligned offset.
+    fixup_phdr_alignment(buf);
+
     // Parse the ELF and extract all metadata we need, then drop the borrow so we can mutate buf.
-    let (arch, dl_sysinfo_int80, text_sections, control_transfer_targets, trampoline_base_addr) = {
+    let (
+        arch,
+        dl_sysinfo_int80,
+        text_sections,
+        control_transfer_targets,
+        trampoline_base_addr,
+        fork_to_vfork_patch,
+    ) = {
         let file = object::File::parse(&*buf).map_err(|e| Error::ParseError(e.to_string()))?;
 
         let arch = match file {
@@ -130,12 +177,15 @@ pub fn hook_syscalls_in_elf(input_binary: &[u8], trampoline: Option<u64>) -> Res
 
         let trampoline_base_addr = find_addr_for_trampoline_code(&file);
 
+        let fork_to_vfork_patch = find_fork_vfork_patch(&file, &text_sections);
+
         (
             arch,
             dl_sysinfo_int80,
             text_sections,
             control_transfer_targets,
             trampoline_base_addr,
+            fork_to_vfork_patch,
         )
     };
 
@@ -151,7 +201,6 @@ pub fn hook_syscalls_in_elf(input_binary: &[u8], trampoline: Option<u64>) -> Res
     }
 
     // Patch syscalls in-place in buf
-    let mut syscall_insns_found = false;
     for s in &text_sections {
         let section_data = section_slice_mut(buf, s)?;
         match hook_syscalls_in_section(
@@ -160,19 +209,31 @@ pub fn hook_syscalls_in_elf(input_binary: &[u8], trampoline: Option<u64>) -> Res
             s.vaddr,
             section_data,
             trampoline_base_addr,
+            trampoline_base_addr, // entry point is at offset 0 of trampoline
             dl_sysinfo_int80,
             &mut trampoline_data,
+            skipped_addrs,
         ) {
-            Ok(()) => {
-                syscall_insns_found = true;
-            }
-            Err(Error::NoSyscallInstructionsFound) => {}
+            Ok(()) | Err(Error::NoSyscallInstructionsFound) => {}
             Err(e) => return Err(e),
         }
     }
 
-    if !syscall_insns_found {
-        return Err(Error::NoSyscallInstructionsFound);
+    // Patch fork → vfork: overwrite the first bytes of __libc_fork with a
+    // JMP to __libc_vfork. This prevents glibc's fork wrapper from running
+    // post-fork handlers that corrupt shared state under vfork semantics.
+    if let Some((fork_file_offset, rel32)) = fork_to_vfork_patch {
+        #[allow(clippy::cast_possible_truncation)]
+        let off = fork_file_offset as usize;
+        if off + 5 <= buf.len() {
+            buf[off] = 0xE9; // JMP rel32
+            buf[off + 1..off + 5].copy_from_slice(&rel32.to_le_bytes());
+        } else {
+            return Err(Error::ParseError(format!(
+                "fork→vfork patch offset {off:#x} + 5 exceeds buffer length {}",
+                buf.len()
+            )));
+        }
     }
 
     // Build output: [patched ELF][padding to page boundary][trampoline code][header]
@@ -301,17 +362,24 @@ enum Arch {
 }
 
 /// (private) Hook all syscalls in `section`, possibly extending `trampoline_data` to do so.
+///
+/// `trampoline_base_addr` is the virtual address corresponding to `trampoline_data[0]`.
+/// `syscall_entry_addr` is the address of the 8-byte entry-point value that each trampoline
+/// stub jumps to (via `JMP [RIP+disp32]` on x86-64 or `CALL [EAX+disp32]` on x86-32).
 #[allow(clippy::too_many_arguments)]
 fn hook_syscalls_in_section(
     arch: Arch,
-    control_transfer_targets: &HashSet<u64>,
+    control_transfer_targets: &BTreeSet<u64>,
     section_base_addr: u64,
     section_data: &mut [u8],
     trampoline_base_addr: u64,
+    syscall_entry_addr: u64,
     dl_sysinfo_int80: Option<u64>,
     trampoline_data: &mut Vec<u8>,
+    skipped_addrs: &mut Vec<u64>,
 ) -> Result<()> {
     let instructions = decode_section_instructions(arch, section_data, section_base_addr)?;
+    let mut found_any = false;
     for (i, inst) in instructions.iter().enumerate() {
         // Forward search for `syscall` / `int 0x80` / `call DWORD PTR gs:0x10`
         match arch {
@@ -335,6 +403,7 @@ fn hook_syscalls_in_section(
             }
         }
 
+        found_any = true;
         let replace_end = inst.next_ip();
 
         let mut replace_start = None;
@@ -358,16 +427,26 @@ fn hook_syscalls_in_section(
         }
 
         if replace_start.is_none() {
-            hook_syscall_and_after(
+            match hook_syscall_and_after(
                 arch,
                 control_transfer_targets,
                 section_base_addr,
                 section_data,
                 trampoline_base_addr,
+                syscall_entry_addr,
                 trampoline_data,
                 &instructions,
                 i,
-            )?;
+            ) {
+                Ok(()) => {}
+                Err(Error::InsufficientBytesBeforeOrAfter(_)) => {
+                    // Replace the unpatchable syscall with UD2 so it traps
+                    // instead of escaping to the host kernel.
+                    replace_with_ud2(section_data, section_base_addr, inst);
+                    skipped_addrs.push(inst.ip());
+                }
+                Err(e) => return Err(e),
+            }
             continue;
         }
 
@@ -394,28 +473,29 @@ fn hook_syscalls_in_section(
                 .extend_from_slice(&(i32::try_from(jmp_back_offset).unwrap().to_le_bytes()));
 
             // Add jmp [rip + offset_to_entry_point]
-            // Entry point is at offset 0 of trampoline_data
             trampoline_data.extend_from_slice(&[0xFF, 0x25]);
-            // disp32 points to offset 0 (entry point) from current RIP
             // RIP after this instruction = trampoline_base_addr + trampoline_data.len() + 4
-            // We want: RIP + disp32 = trampoline_base_addr + 0
-            // So: disp32 = -(trampoline_data.len() + 4)
-            let disp32 = -(i32::try_from(trampoline_data.len()).unwrap() + 4);
-            trampoline_data.extend_from_slice(&disp32.to_le_bytes());
+            // We want: RIP + disp32 = syscall_entry_addr
+            #[allow(clippy::cast_possible_wrap)]
+            let disp32 = i64::try_from(syscall_entry_addr).unwrap()
+                - i64::try_from(trampoline_base_addr).unwrap()
+                - trampoline_data.len() as i64
+                - 4;
+            trampoline_data.extend_from_slice(&(i32::try_from(disp32).unwrap().to_le_bytes()));
         } else {
             // For 32-bit, use a different approach to simulate indirect call
-            // Entry point is at offset 0 of trampoline_data
             trampoline_data.push(0x50); // PUSH EAX
             trampoline_data.extend_from_slice(&[0xE8, 0x0, 0x0, 0x0, 0x0]); // CALL next instruction
             trampoline_data.push(0x58); // POP EAX (effectively store IP in EAX)
             trampoline_data.extend_from_slice(&[0xFF, 0x90]); // CALL [EAX + offset]
-            // The offset should point to the entry at offset 0
-            // After PUSH(1) + CALL(5) + POP(1) + opcode(2) = 9 bytes
-            // EAX = base + (len_before_PUSH + 6) = base + (current_len - 9 + 6) = base + (current_len - 3)
-            // We want: EAX + offset = base + 0
-            // So: offset = -(current_len - 3)
-            let disp32 = -(i32::try_from(trampoline_data.len()).unwrap() - 3);
-            trampoline_data.extend_from_slice(&disp32.to_le_bytes());
+            // EAX = trampoline_base_addr + (trampoline_data.len() - 3)
+            // We want: EAX + offset = syscall_entry_addr
+            #[allow(clippy::cast_possible_wrap)]
+            let disp32 = i64::try_from(syscall_entry_addr).unwrap()
+                - i64::try_from(trampoline_base_addr).unwrap()
+                - trampoline_data.len() as i64
+                + 3;
+            trampoline_data.extend_from_slice(&(i32::try_from(disp32).unwrap().to_le_bytes()));
             // Note we skip `POP EAX` here as it is done by the callback `syscall_callback`
             // from litebox_shim_linux/src/lib.rs, which helps reduce the size of the trampoline.
 
@@ -441,7 +521,226 @@ fn hook_syscalls_in_section(
         }
     }
 
-    Ok(())
+    if found_any {
+        Ok(())
+    } else {
+        Err(Error::NoSyscallInstructionsFound)
+    }
+}
+
+/// If the ELF64 program header table offset (`e_phoff`) is not 8-byte aligned, shift the table
+/// forward by the necessary padding so the `object` crate can parse it. This is needed for
+/// binaries like Node.js SEA executables where post-link tools append data and relocate the
+/// program headers to a non-aligned offset.
+///
+/// The function modifies the buffer in-place: it moves the phdr table contents and updates
+/// `e_phoff` in the ELF header. Only ELF64 files are handled (ELF32 requires 4-byte alignment
+/// which is always satisfied when `e_phoff` is within a valid file).
+fn fixup_phdr_alignment(buf: &mut [u8]) {
+    // Minimum ELF header size for ELF64
+    if buf.len() < 64 {
+        return;
+    }
+
+    // Check ELF magic and class (must be ELF64)
+    if &buf[0..4] != b"\x7fELF" || buf[4] != 2 {
+        return;
+    }
+
+    let e_phoff = u64::from_le_bytes(buf[32..40].try_into().unwrap());
+    let e_phentsize = u64::from(u16::from_le_bytes(buf[54..56].try_into().unwrap()));
+    let e_phnum = u64::from(u16::from_le_bytes(buf[56..58].try_into().unwrap()));
+
+    if e_phoff == 0 || e_phnum == 0 || e_phentsize == 0 {
+        return;
+    }
+
+    let misalignment = e_phoff % 8;
+    if misalignment == 0 {
+        return; // already aligned
+    }
+
+    let phdr_size = e_phentsize * e_phnum;
+    let old_start = usize::try_from(e_phoff).expect("e_phoff must fit in usize");
+    let old_end = old_start + usize::try_from(phdr_size).expect("phdr_size must fit in usize");
+
+    // Shift forward to align: new offset is the next 8-byte boundary.
+    let padding = usize::try_from(8 - misalignment).expect("padding must fit in usize");
+    let new_start = old_start + padding;
+    let new_end = new_start + usize::try_from(phdr_size).expect("phdr_size must fit in usize");
+
+    if old_end > buf.len() || new_end > buf.len() {
+        return; // corrupt phdr table or not enough room
+    }
+
+    // Move the phdr table forward (use copy_within since src and dst overlap).
+    buf.copy_within(old_start..old_end, new_start);
+
+    // Update e_phoff in the ELF header.
+    let new_phoff = (e_phoff + padding as u64).to_le_bytes();
+    buf[32..40].copy_from_slice(&new_phoff);
+
+    // Also update the PHDR segment's p_offset if present, so it matches.
+    // PT_PHDR = 6, each Elf64_Phdr is e_phentsize bytes, p_type at offset 0, p_offset at offset 8.
+    for i in 0..e_phnum {
+        let entry_off = new_start
+            + usize::try_from(i).expect("i must fit in usize")
+                * usize::try_from(e_phentsize).expect("e_phentsize must fit in usize");
+        if entry_off + 16 > buf.len() {
+            break;
+        }
+        let p_type = u32::from_le_bytes(buf[entry_off..entry_off + 4].try_into().unwrap());
+        if p_type == 6 {
+            // PT_PHDR — update p_offset to match new location
+            let p_offset_off = entry_off + 8;
+            let old_p_offset =
+                u64::from_le_bytes(buf[p_offset_off..p_offset_off + 8].try_into().unwrap());
+            if old_p_offset == e_phoff {
+                let new_p_offset = (old_p_offset + padding as u64).to_le_bytes();
+                buf[p_offset_off..p_offset_off + 8].copy_from_slice(&new_p_offset);
+            }
+            // The PHDR segment size should match the phdr table; no change needed.
+        }
+    }
+}
+
+/// Find fork and vfork symbols in the ELF and compute the patch needed to
+/// redirect fork -> vfork. Returns `Some((fork_file_offset, jmp_rel32))` if
+/// both symbols are found, or `None` if this binary doesn't export fork.
+fn find_fork_vfork_patch(
+    file: &object::File<'_>,
+    text_sections: &[TextSectionInfo],
+) -> Option<(u64, i32)> {
+    use object::ObjectSymbol as _;
+
+    // Search both .dynsym and .symtab for fork/vfork.
+    let mut fork_vaddr = None;
+    let mut vfork_vaddr = None;
+
+    for sym in file.dynamic_symbols().chain(file.symbols()) {
+        if sym.kind() != object::SymbolKind::Text {
+            continue;
+        }
+        let Ok(name) = sym.name() else { continue };
+        match name {
+            "fork" | "__libc_fork" if fork_vaddr.is_none() => {
+                fork_vaddr = Some(sym.address());
+            }
+            "vfork" | "__libc_vfork" | "__vfork" if vfork_vaddr.is_none() => {
+                vfork_vaddr = Some(sym.address());
+            }
+            _ => {}
+        }
+    }
+
+    let fork_vaddr = fork_vaddr?;
+    let vfork_vaddr = vfork_vaddr?;
+
+    // Convert fork's vaddr to a file offset using the text sections.
+    let fork_file_offset = text_sections.iter().find_map(|s| {
+        let section_end = s.vaddr + s.size;
+        if fork_vaddr >= s.vaddr && fork_vaddr < section_end {
+            Some(s.file_offset + (fork_vaddr - s.vaddr))
+        } else {
+            None
+        }
+    })?;
+
+    // Compute the relative offset for a JMP rel32 instruction.
+    // JMP rel32 encodes: target = rip_after_jmp + rel32
+    // rip_after_jmp = fork_vaddr + 5 (size of JMP rel32 instruction)
+    let rel32 = i64::try_from(vfork_vaddr)
+        .ok()?
+        .checked_sub(i64::try_from(fork_vaddr).ok()? + 5)?;
+    let rel32 = i32::try_from(rel32).ok()?;
+
+    Some((fork_file_offset, rel32))
+}
+
+/// Check if the input binary has the Bun footer marker at the end.
+fn has_bun_footer_marker(input_binary: &[u8]) -> bool {
+    input_binary.len() >= BUN_FOOTER_MARKER.len()
+        && input_binary[input_binary.len() - BUN_FOOTER_MARKER.len()..] == *BUN_FOOTER_MARKER
+}
+
+/// Replace an unpatchable syscall instruction with `UD2` (`0F 0B`) so that
+/// reaching it triggers SIGILL instead of silently escaping to the host kernel.
+///
+/// `syscall` (0F 05) and `int 0x80` (CD 80) are both 2 bytes — same size as
+/// `ud2`. For `call DWORD PTR gs:0x10` (7 bytes), the remaining 5 bytes are
+/// filled with NOPs.
+fn replace_with_ud2(section_data: &mut [u8], section_base_addr: u64, inst: &iced_x86::Instruction) {
+    let offset = usize::try_from(inst.ip() - section_base_addr).unwrap();
+    let len = inst.len();
+    // UD2 = 0F 0B
+    section_data[offset] = 0x0F;
+    section_data[offset + 1] = 0x0B;
+    // Fill any remaining bytes (e.g. 7-byte `call gs:0x10`) with NOPs.
+    for b in &mut section_data[offset + 2..offset + len] {
+        *b = 0x90;
+    }
+}
+
+/// Patch a single mapped code segment in-place, returning trampoline stubs.
+///
+/// This is the runtime counterpart to [`hook_syscalls_in_elf`]. Instead of
+/// processing a whole ELF file, it operates on a single already-mapped code
+/// region — the caller is responsible for making the region writable before
+/// calling and restoring permissions afterwards.
+///
+/// # Arguments
+///
+/// * `code` — mutable slice of the mapped code segment.
+/// * `code_vaddr` — virtual address of `code[0]` in guest memory.
+/// * `trampoline_write_vaddr` — virtual address where the returned stub bytes
+///   will be placed by the caller.
+/// * `syscall_entry_addr` — address of the 8-byte entry-point value that
+///   each stub's indirect jump targets.
+///
+/// # Returns
+///
+/// The trampoline stub bytes. The caller must copy them to
+/// `trampoline_write_vaddr`. Returns an empty `Vec` if no syscall
+/// instructions are found in `code`.
+///
+/// `skipped_addrs` receives the virtual addresses of any `syscall`
+/// instructions that could not be patched (replaced with `UD2` so they
+/// trap instead of escaping to the host kernel).
+pub fn patch_code_segment(
+    code: &mut [u8],
+    code_vaddr: u64,
+    trampoline_write_vaddr: u64,
+    syscall_entry_addr: u64,
+    skipped_addrs: &mut Vec<u64>,
+) -> Result<Vec<u8>> {
+    let arch = Arch::X86_64; // runtime patching is x86-64 only
+
+    // Build control-transfer targets for this segment.
+    let instructions = decode_section_instructions(arch, code, code_vaddr)?;
+    let mut control_transfer_targets = BTreeSet::new();
+    for inst in &instructions {
+        let target = inst.near_branch_target();
+        if target != 0 {
+            control_transfer_targets.insert(target);
+        }
+    }
+
+    let mut trampoline_data = Vec::new();
+    match hook_syscalls_in_section(
+        arch,
+        &control_transfer_targets,
+        code_vaddr,
+        code,
+        trampoline_write_vaddr,
+        syscall_entry_addr,
+        None, // dl_sysinfo_int80 — not applicable on x86-64
+        &mut trampoline_data,
+        skipped_addrs,
+    ) {
+        Ok(()) => Ok(trampoline_data),
+        Err(Error::NoSyscallInstructionsFound) => Ok(Vec::new()),
+        Err(e) => Err(e),
+    }
 }
 
 fn find_addr_for_trampoline_code(file: &object::File<'_>) -> u64 {
@@ -485,8 +784,8 @@ fn get_control_transfer_targets(
     arch: Arch,
     input_binary: &[u8],
     text_sections: &[TextSectionInfo],
-) -> Result<HashSet<u64>> {
-    let mut control_transfer_targets = HashSet::new();
+) -> Result<BTreeSet<u64>> {
+    let mut control_transfer_targets = BTreeSet::new();
     for s in text_sections {
         let section_data = section_slice(input_binary, s)?;
         let instructions = decode_section_instructions(arch, section_data, s.vaddr)?;
@@ -595,10 +894,11 @@ fn section_slice_mut<'a>(buf: &'a mut [u8], section: &TextSectionInfo) -> Result
 #[allow(clippy::too_many_arguments)]
 fn hook_syscall_and_after(
     arch: Arch,
-    control_transfer_targets: &HashSet<u64>,
+    control_transfer_targets: &BTreeSet<u64>,
     section_base_addr: u64,
     section_data: &mut [u8],
     trampoline_base_addr: u64,
+    syscall_entry_addr: u64,
     trampoline_data: &mut Vec<u8>,
     instructions: &[iced_x86::Instruction],
     inst_index: usize,
@@ -613,7 +913,6 @@ fn hook_syscall_and_after(
             && control_transfer_targets.contains(&next_inst.ip())
         {
             // If the next instruction is a control transfer target, we don't want to cross it
-            println!("Skipping control transfer target at {:#x}", next_inst.ip());
             break;
         }
         // Check if the instruction does control transfer
@@ -639,6 +938,7 @@ fn hook_syscall_and_after(
             section_base_addr,
             section_data,
             trampoline_base_addr,
+            syscall_entry_addr,
             trampoline_data,
             instructions,
             inst_index,
@@ -654,28 +954,29 @@ fn hook_syscall_and_after(
         trampoline_data.extend_from_slice(&[0x48, 0x8D, 0x0D]); // LEA RCX, [RIP + disp32]
         trampoline_data.extend_from_slice(&6u32.to_le_bytes());
         // Add jmp [rip + offset_to_entry_point]
-        // Entry point is at offset 0 of trampoline_data
         trampoline_data.extend_from_slice(&[0xFF, 0x25]);
-        // disp32 points to offset 0 (entry point) from current RIP
         // RIP after this instruction = trampoline_base_addr + trampoline_data.len() + 4
-        // We want: RIP + disp32 = trampoline_base_addr + 0
-        // So: disp32 = -(trampoline_data.len() + 4)
-        let disp32 = -(i32::try_from(trampoline_data.len()).unwrap() + 4);
-        trampoline_data.extend_from_slice(&disp32.to_le_bytes());
+        // We want: RIP + disp32 = syscall_entry_addr
+        #[allow(clippy::cast_possible_wrap)]
+        let disp32 = i64::try_from(syscall_entry_addr).unwrap()
+            - i64::try_from(trampoline_base_addr).unwrap()
+            - trampoline_data.len() as i64
+            - 4;
+        trampoline_data.extend_from_slice(&(i32::try_from(disp32).unwrap().to_le_bytes()));
     } else {
         // For 32-bit, use a different approach to simulate indirect call
-        // Entry point is at offset 0 of trampoline_data
         trampoline_data.push(0x50); // PUSH EAX
         trampoline_data.extend_from_slice(&[0xE8, 0x0, 0x0, 0x0, 0x0]); // CALL next instruction
         trampoline_data.push(0x58); // POP EAX (effectively store IP in EAX)
         trampoline_data.extend_from_slice(&[0xFF, 0x90]); // CALL [EAX + offset]
-        // The offset should point to the entry at offset 0
-        // After PUSH(1) + CALL(5) + POP(1) + opcode(2) = 9 bytes
-        // EAX = base + (len_before_PUSH + 6) = base + (current_len - 9 + 6) = base + (current_len - 3)
-        // We want: EAX + offset = base + 0
-        // So: offset = -(current_len - 3)
-        let disp32 = -(i32::try_from(trampoline_data.len()).unwrap() - 3);
-        trampoline_data.extend_from_slice(&disp32.to_le_bytes());
+        // EAX = trampoline_base_addr + (trampoline_data.len() - 3)
+        // We want: EAX + offset = syscall_entry_addr
+        #[allow(clippy::cast_possible_wrap)]
+        let disp32 = i64::try_from(syscall_entry_addr).unwrap()
+            - i64::try_from(trampoline_base_addr).unwrap()
+            - trampoline_data.len() as i64
+            + 3;
+        trampoline_data.extend_from_slice(&(i32::try_from(disp32).unwrap().to_le_bytes()));
         // Note we skip `POP EAX` here as it is done by the callback `syscall_callback`
         // from litebox_shim_linux/src/lib.rs, which helps reduce the size of the trampoline.
     }
@@ -715,10 +1016,11 @@ fn hook_syscall_and_after(
 #[allow(clippy::too_many_arguments)]
 fn hook_syscall_before_and_after(
     arch: Arch,
-    control_transfer_targets: &HashSet<u64>,
+    control_transfer_targets: &BTreeSet<u64>,
     section_base_addr: u64,
     section_data: &mut [u8],
     trampoline_base_addr: u64,
+    syscall_entry_addr: u64,
     trampoline_data: &mut Vec<u8>,
     instructions: &[iced_x86::Instruction],
     inst_index: usize,
@@ -793,13 +1095,14 @@ fn hook_syscall_before_and_after(
     trampoline_data.extend_from_slice(&[0xE8, 0x0, 0x0, 0x0, 0x0]); // CALL next instruction
     trampoline_data.push(0x58); // POP EAX (effectively store IP in EAX)
     trampoline_data.extend_from_slice(&[0xFF, 0x90]); // CALL [EAX + offset]
-    // The offset should point to the entry at offset 0
-    // After PUSH(1) + CALL(5) + POP(1) + opcode(2) = 9 bytes
-    // EAX = base + (len_before_PUSH + 6) = base + (current_len - 9 + 6) = base + (current_len - 3)
-    // We want: EAX + offset = base + 0
-    // So: offset = -(current_len - 3)
-    let disp32 = -(i32::try_from(trampoline_data.len()).unwrap() - 3);
-    trampoline_data.extend_from_slice(&disp32.to_le_bytes());
+    // EAX = trampoline_base_addr + (trampoline_data.len() - 3)
+    // We want: EAX + offset = syscall_entry_addr
+    #[allow(clippy::cast_possible_wrap)]
+    let disp32 = i64::try_from(syscall_entry_addr).unwrap()
+        - i64::try_from(trampoline_base_addr).unwrap()
+        - trampoline_data.len() as i64
+        + 3;
+    trampoline_data.extend_from_slice(&(i32::try_from(disp32).unwrap().to_le_bytes()));
     // Note we skip `POP EAX` here as it is done by the callback `syscall_callback`
     // from litebox_shim_linux/src/lib.rs, which helps reduce the size of the trampoline.
 

@@ -169,9 +169,18 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
             .collect();
         let file = mmapped_file(&prog)?;
         let data = if cli_args.rewrite_syscalls {
-            litebox_syscall_rewriter::hook_syscalls_in_elf(file.data, None)
-                .unwrap()
-                .into()
+            let mut skipped_addrs = Vec::new();
+            let rewritten =
+                litebox_syscall_rewriter::hook_syscalls_in_elf(file.data, None, &mut skipped_addrs)
+                    .unwrap();
+            if !skipped_addrs.is_empty() {
+                eprintln!(
+                    "warning: program has {} unpatchable syscall instruction(s) at {:?}",
+                    skipped_addrs.len(),
+                    skipped_addrs,
+                );
+            }
+            rewritten.into()
         } else {
             let data = file.data.into();
             cow_eligible_regions.push(file);

@@ -1,5 +1,6 @@
 ---
 source: litebox_syscall_rewriter/tests/snapshot_tests.rs
+assertion_line: 99
 expression: diff
 ---
 --- original
@@ -10,7 +11,7 @@ expression: diff
    401222:	bf 01 00 00 00       	mov    $0x1,%edi
 -  401227:	b8 0e 00 00 00       	mov    $0xe,%eax
 -  40122c:	0f 05                	syscall
-+  401227:	e9 dc 0d 0b 00       	jmp    4b2008 <_end+0xde0>
++  401227:	<trampoline-jmp+0x8>
 +  40122c:	90                   	nop
 +  40122d:	90                   	nop
    40122e:	8b 05 0c fc 0a 00    	mov    0xafc0c(%rip),%eax        # 4b0e40 <stage>
@@ -23,7 +24,7 @@ expression: diff
 -  401e78:	31 ff                	xor    %edi,%edi
 -  401e7a:	89 d0                	mov    %edx,%eax
 -  401e7c:	0f 05                	syscall
-+  401e78:	e9 9d 01 0b 00       	jmp    4b201a <_end+0xdf2>
++  401e78:	<trampoline-jmp+0x1a>
 +  401e7d:	90                   	nop
    401e7e:	eb f8                	jmp    401e78 <__libc_start_call_main+0x88>
    401e80:	31 c0                	xor    %eax,%eax
@@ -34,7 +35,7 @@ expression: diff
    403ee0:	bf 01 50 00 00       	mov    $0x5001,%edi
 -  403ee5:	b8 9e 00 00 00       	mov    $0x9e,%eax
 -  403eea:	0f 05                	syscall
-+  403ee5:	e9 41 e1 0a 00       	jmp    4b202b <_end+0xe03>
++  403ee5:	<trampoline-jmp+0x2b>
 +  403eea:	90                   	nop
 +  403eeb:	90                   	nop
    403eec:	44 89 ef             	mov    %r13d,%edi
@@ -46,7 +47,7 @@ expression: diff
    4043ce:	48 89 36             	mov    %rsi,(%rsi)
 -  4043d1:	48 89 76 10          	mov    %rsi,0x10(%rsi)
 -  4043d5:	0f 05                	syscall
-+  4043d1:	e9 67 dc 0a 00       	jmp    4b203d <_end+0xe15>
++  4043d1:	<trampoline-jmp+0x3d>
 +  4043d6:	90                   	nop
    4043d7:	85 c0                	test   %eax,%eax
    4043d9:	74 24                	je     4043ff <__libc_setup_tls+0x1df>
@@ -55,7 +56,7 @@ expression: diff
    4043e5:	b8 01 00 00 00       	mov    $0x1,%eax
 -  4043ea:	48 8d 35 c7 d1 07 00 	lea    0x7d1c7(%rip),%rsi        # 4815b8 <slashdot.0+0x76b>
 -  4043f1:	0f 05                	syscall
-+  4043ea:	e9 5f dc 0a 00       	jmp    4b204e <_end+0xe26>
++  4043ea:	<trampoline-jmp+0x4e>
 +  4043ef:	90                   	nop
 +  4043f0:	90                   	nop
 +  4043f1:	90                   	nop
@@ -63,7 +64,7 @@ expression: diff
    4043f3:	bf 7f 00 00 00       	mov    $0x7f,%edi
 -  4043f8:	b8 e7 00 00 00       	mov    $0xe7,%eax
 -  4043fd:	0f 05                	syscall
-+  4043f8:	e9 65 dc 0a 00       	jmp    4b2062 <_end+0xe3a>
++  4043f8:	<trampoline-jmp+0x62>
 +  4043fd:	90                   	nop
 +  4043fe:	90                   	nop
    4043ff:	e8 dc ba 01 00       	call   41fee0 <__tls_init_tp>
@@ -75,7 +76,7 @@ expression: diff
    4044ba:	b8 01 00 00 00       	mov    $0x1,%eax
 -  4044bf:	48 8d 35 f2 d0 07 00 	lea    0x7d0f2(%rip),%rsi        # 4815b8 <slashdot.0+0x76b>
 -  4044c6:	0f 05                	syscall
-+  4044bf:	e9 b0 db 0a 00       	jmp    4b2074 <_end+0xe4c>
++  4044bf:	<trampoline-jmp+0x74>
 +  4044c4:	90                   	nop
 +  4044c5:	90                   	nop
 +  4044c6:	90                   	nop
@@ -83,7 +84,7 @@ expression: diff
    4044c8:	bf 7f 00 00 00       	mov    $0x7f,%edi
 -  4044cd:	b8 e7 00 00 00       	mov    $0xe7,%eax
 -  4044d2:	0f 05                	syscall
-+  4044cd:	e9 b6 db 0a 00       	jmp    4b2088 <_end+0xe60>
++  4044cd:	<trampoline-jmp+0x88>
 +  4044d2:	90                   	nop
 +  4044d3:	90                   	nop
    4044d4:	e9 70 fe ff ff       	jmp    404349 <__libc_setup_tls+0x129>
@@ -95,7 +96,7 @@ expression: diff
    40a3e7:	bf 02 00 00 00       	mov    $0x2,%edi
 -  40a3ec:	44 89 c8             	mov    %r9d,%eax
 -  40a3ef:	0f 05                	syscall
-+  40a3ec:	e9 a9 7c 0a 00       	jmp    4b209a <_end+0xe72>
++  40a3ec:	<trampoline-jmp+0x9a>
    40a3f1:	48 83 f8 fc          	cmp    $0xfffffffffffffffc,%rax
    40a3f5:	74 e9                	je     40a3e0 <__libc_message_impl+0x150>
    40a3f7:	45 31 c9             	xor    %r9d,%r9d
@@ -105,7 +106,7 @@ expression: diff
    40a5cf:	be 80 00 00 00       	mov    $0x80,%esi
 -  40a5d4:	b8 ca 00 00 00       	mov    $0xca,%eax
 -  40a5d9:	0f 05                	syscall
-+  40a5d4:	e9 d1 7a 0a 00       	jmp    4b20aa <_end+0xe82>
++  40a5d4:	<trampoline-jmp+0xaa>
 +  40a5d9:	90                   	nop
 +  40a5da:	90                   	nop
    40a5db:	48 3d 00 f0 ff ff    	cmp    $0xfffffffffffff000,%rax
@@ -117,7 +118,7 @@ expression: diff
    40a635:	b8 ca 00 00 00       	mov    $0xca,%eax
 -  40a63a:	40 80 f6 80          	xor    $0x80,%sil
 -  40a63e:	0f 05                	syscall
-+  40a63a:	e9 7d 7a 0a 00       	jmp    4b20bc <_end+0xe94>
++  40a63a:	<trampoline-jmp+0xbc>
 +  40a63f:	90                   	nop
    40a640:	48 3d 00 f0 ff ff    	cmp    $0xfffffffffffff000,%rax
    40a646:	76 d6                	jbe    40a61e <__lll_lock_wait+0xe>
@@ -128,7 +129,7 @@ expression: diff
    40a67c:	be 81 00 00 00       	mov    $0x81,%esi
 -  40a681:	b8 ca 00 00 00       	mov    $0xca,%eax
 -  40a686:	0f 05                	syscall
-+  40a681:	e9 47 7a 0a 00       	jmp    4b20cd <_end+0xea5>
++  40a681:	<trampoline-jmp+0xcd>
 +  40a686:	90                   	nop
 +  40a687:	90                   	nop
    40a688:	c3                   	ret
@@ -140,7 +141,7 @@ expression: diff
    40a69b:	ba 01 00 00 00       	mov    $0x1,%edx
 -  40a6a0:	b8 ca 00 00 00       	mov    $0xca,%eax
 -  40a6a5:	0f 05                	syscall
-+  40a6a0:	e9 3a 7a 0a 00       	jmp    4b20df <_end+0xeb7>
++  40a6a0:	<trampoline-jmp+0xdf>
 +  40a6a5:	90                   	nop
 +  40a6a6:	90                   	nop
    40a6a7:	c3                   	ret
@@ -152,7 +153,7 @@ expression: diff
    40bbdb:	c6 05 3e 4c 0a 00 01 	movb   $0x1,0xa4c3e(%rip)        # 4b0820 <__malloc_initialized>
 -  40bbe2:	b8 3e 01 00 00       	mov    $0x13e,%eax
 -  40bbe7:	0f 05                	syscall
-+  40bbe2:	e9 0a 65 0a 00       	jmp    4b20f1 <_end+0xec9>
++  40bbe2:	<trampoline-jmp+0xf1>
 +  40bbe7:	90                   	nop
 +  40bbe8:	90                   	nop
    40bbe9:	48 8d 5d d0          	lea    -0x30(%rbp),%rbx
@@ -164,7 +165,7 @@ expression: diff
    4181de:	66 90                	xchg   %ax,%ax
 -  4181e0:	b8 e4 00 00 00       	mov    $0xe4,%eax
 -  4181e5:	0f 05                	syscall
-+  4181e0:	e9 1e 9f 09 00       	jmp    4b2103 <_end+0xedb>
++  4181e0:	<trampoline-jmp+0x103>
 +  4181e5:	90                   	nop
 +  4181e6:	90                   	nop
    4181e7:	85 c0                	test   %eax,%eax
@@ -176,7 +177,7 @@ expression: diff
    418249:	89 d0                	mov    %edx,%eax
 -  41824b:	0f 05                	syscall
 -  41824d:	48 3d 00 f0 ff ff    	cmp    $0xfffffffffffff000,%rax
-+  41824b:	e9 c5 9e 09 00       	jmp    4b2115 <_end+0xeed>
++  41824b:	<trampoline-jmp+0x115>
 +  418250:	90                   	nop
 +  418251:	90                   	nop
 +  418252:	90                   	nop
@@ -189,7 +190,7 @@ expression: diff
    418260:	f3 0f 1e fa          	endbr64
 -  418264:	b8 05 00 00 00       	mov    $0x5,%eax
 -  418269:	0f 05                	syscall
-+  418264:	e9 c4 9e 09 00       	jmp    4b212d <_end+0xf05>
++  418264:	<trampoline-jmp+0x12d>
 +  418269:	90                   	nop
 +  41826a:	90                   	nop
    41826b:	48 3d 00 f0 ff ff    	cmp    $0xfffffffffffff000,%rax
@@ -201,7 +202,7 @@ expression: diff
    418290:	f3 0f 1e fa          	endbr64
 -  418294:	b8 03 00 00 00       	mov    $0x3,%eax
 -  418299:	0f 05                	syscall
-+  418294:	e9 a6 9e 09 00       	jmp    4b213f <_end+0xf17>
++  418294:	<trampoline-jmp+0x13f>
 +  418299:	90                   	nop
 +  41829a:	90                   	nop
    41829b:	48 3d 00 f0 ff ff    	cmp    $0xfffffffffffff000,%rax
@@ -213,7 +214,7 @@ expression: diff
    4182f9:	74 25                	je     418320 <__fcntl64_nocancel+0x60>
 -  4182fb:	b8 48 00 00 00       	mov    $0x48,%eax
 -  418300:	0f 05                	syscall
-+  4182fb:	e9 51 9e 09 00       	jmp    4b2151 <_end+0xf29>
++  4182fb:	<trampoline-jmp+0x151>
 +  418300:	90                   	nop
 +  418301:	90                   	nop
    418302:	48 3d 00 f0 ff ff    	cmp    $0xfffffffffffff000,%rax
@@ -225,7 +226,7 @@ expression: diff
    418324:	be 10 00 00 00       	mov    $0x10,%esi
 -  418329:	b8 48 00 00 00       	mov    $0x48,%eax
 -  41832e:	0f 05                	syscall
-+  418329:	e9 35 9e 09 00       	jmp    4b2163 <_end+0xf3b>
++  418329:	<trampoline-jmp+0x163>
 +  41832e:	90                   	nop
 +  41832f:	90                   	nop
    418330:	3d 00 f0 ff ff       	cmp    $0xfffff000,%eax
@@ -237,7 +238,7 @@ expression: diff
    41837e:	74 20                	je     4183a0 <__fcntl64_nocancel_adjusted+0x40>
 -  418380:	b8 48 00 00 00       	mov    $0x48,%eax
 -  418385:	0f 05                	syscall
-+  418380:	e9 f0 9d 09 00       	jmp    4b2175 <_end+0xf4d>
++  418380:	<trampoline-jmp+0x175>
 +  418385:	90                   	nop
 +  418386:	90                   	nop
    418387:	48 3d 00 f0 ff ff    	cmp    $0xfffffffffffff000,%rax
@@ -249,7 +250,7 @@ expression: diff
    4183a4:	be 10 00 00 00       	mov    $0x10,%esi
 -  4183a9:	b8 48 00 00 00       	mov    $0x48,%eax
 -  4183ae:	0f 05                	syscall
-+  4183a9:	e9 d9 9d 09 00       	jmp    4b2187 <_end+0xf5f>
++  4183a9:	<trampoline-jmp+0x187>
 +  4183ae:	90                   	nop
 +  4183af:	90                   	nop
    4183b0:	3d 00 f0 ff ff       	cmp    $0xfffff000,%eax
@@ -261,7 +262,7 @@ expression: diff
    41841a:	48 89 fe             	mov    %rdi,%rsi
 -  41841d:	bf 9c ff ff ff       	mov    $0xffffff9c,%edi
 -  418422:	0f 05                	syscall
-+  41841d:	e9 77 9d 09 00       	jmp    4b2199 <_end+0xf71>
++  41841d:	<trampoline-jmp+0x199>
 +  418422:	90                   	nop
 +  418423:	90                   	nop
    418424:	48 3d 00 f0 ff ff    	cmp    $0xfffffffffffff000,%rax
@@ -274,7 +275,7 @@ expression: diff
 -  418480:	f3 0f 1e fa          	endbr64
 -  418484:	31 c0                	xor    %eax,%eax
 -  418486:	0f 05                	syscall
-+  418480:	e9 26 9d 09 00       	jmp    4b21ab <_end+0xf83>
++  418480:	<trampoline-jmp+0x1ab>
 +  418485:	90                   	nop
 +  418486:	90                   	nop
 +  418487:	90                   	nop
@@ -287,7 +288,7 @@ expression: diff
    4184b0:	f3 0f 1e fa          	endbr64
 -  4184b4:	b8 0c 00 00 00       	mov    $0xc,%eax
 -  4184b9:	0f 05                	syscall
-+  4184b4:	e9 05 9d 09 00       	jmp    4b21be <_end+0xf96>
++  4184b4:	<trampoline-jmp+0x1be>
 +  4184b9:	90                   	nop
 +  4184ba:	90                   	nop
    4184bb:	48 89 05 96 83 09 00 	mov    %rax,0x98396(%rip)        # 4b0858 <__curbrk>
@@ -299,7 +300,7 @@ expression: diff
    41871a:	48 8d 95 f0 ef ff ff 	lea    -0x1010(%rbp),%rdx
 -  418721:	b8 cc 00 00 00       	mov    $0xcc,%eax
 -  418726:	0f 05                	syscall
-+  418721:	e9 aa 9a 09 00       	jmp    4b21d0 <_end+0xfa8>
++  418721:	<trampoline-jmp+0x1d0>
 +  418726:	90                   	nop
 +  418727:	90                   	nop
    418728:	85 c0                	test   %eax,%eax
@@ -311,7 +312,7 @@ expression: diff
    418b40:	f3 0f 1e fa          	endbr64
 -  418b44:	b8 1c 00 00 00       	mov    $0x1c,%eax
 -  418b49:	0f 05                	syscall
-+  418b44:	e9 99 96 09 00       	jmp    4b21e2 <_end+0xfba>
++  418b44:	<trampoline-jmp+0x1e2>
 +  418b49:	90                   	nop
 +  418b4a:	90                   	nop
    418b4b:	48 3d 01 f0 ff ff    	cmp    $0xfffffffffffff001,%rax
@@ -323,7 +324,7 @@ expression: diff
    418b92:	48 89 df             	mov    %rbx,%rdi
 -  418b95:	b8 09 00 00 00       	mov    $0x9,%eax
 -  418b9a:	0f 05                	syscall
-+  418b95:	e9 5a 96 09 00       	jmp    4b21f4 <_end+0xfcc>
++  418b95:	<trampoline-jmp+0x1f4>
 +  418b9a:	90                   	nop
 +  418b9b:	90                   	nop
    418b9c:	48 3d 00 f0 ff ff    	cmp    $0xfffffffffffff000,%rax
@@ -335,7 +336,7 @@ expression: diff
    418bed:	b8 09 00 00 00       	mov    $0x9,%eax
 -  418bf2:	41 83 ca 40          	or     $0x40,%r10d
 -  418bf6:	0f 05                	syscall
-+  418bf2:	e9 0f 96 09 00       	jmp    4b2206 <_end+0xfde>
++  418bf2:	<trampoline-jmp+0x206>
 +  418bf7:	90                   	nop
    418bf8:	48 3d 00 f0 ff ff    	cmp    $0xfffffffffffff000,%rax
    418bfe:	76 a4                	jbe    418ba4 <__mmap64+0x34>
@@ -346,7 +347,7 @@ expression: diff
    418c30:	f3 0f 1e fa          	endbr64
 -  418c34:	b8 0a 00 00 00       	mov    $0xa,%eax
 -  418c39:	0f 05                	syscall
-+  418c34:	e9 de 95 09 00       	jmp    4b2217 <_end+0xfef>
++  418c34:	<trampoline-jmp+0x217>
 +  418c39:	90                   	nop
 +  418c3a:	90                   	nop
    418c3b:	48 3d 01 f0 ff ff    	cmp    $0xfffffffffffff001,%rax
@@ -358,7 +359,7 @@ expression: diff
    418c60:	f3 0f 1e fa          	endbr64
 -  418c64:	b8 0b 00 00 00       	mov    $0xb,%eax
 -  418c69:	0f 05                	syscall
-+  418c64:	e9 c0 95 09 00       	jmp    4b2229 <_end+0x1001>
++  418c64:	<trampoline-jmp+0x229>
 +  418c69:	90                   	nop
 +  418c6a:	90                   	nop
    418c6b:	48 3d 01 f0 ff ff    	cmp    $0xfffffffffffff001,%rax
@@ -370,7 +371,7 @@ expression: diff
    418d47:	45 31 c0             	xor    %r8d,%r8d
 -  418d4a:	b8 19 00 00 00       	mov    $0x19,%eax
 -  418d4f:	0f 05                	syscall
-+  418d4a:	e9 ec 94 09 00       	jmp    4b223b <_end+0x1013>
++  418d4a:	<trampoline-jmp+0x23b>
 +  418d4f:	90                   	nop
 +  418d50:	90                   	nop
    418d51:	48 3d 00 f0 ff ff    	cmp    $0xfffffffffffff000,%rax
@@ -382,7 +383,7 @@ expression: diff
    418e23:	bf 41 4d 56 53       	mov    $0x53564d41,%edi
 -  418e28:	b8 9d 00 00 00       	mov    $0x9d,%eax
 -  418e2d:	0f 05                	syscall
-+  418e28:	e9 20 94 09 00       	jmp    4b224d <_end+0x1025>
++  418e28:	<trampoline-jmp+0x24d>
 +  418e2d:	90                   	nop
 +  418e2e:	90                   	nop
    418e2f:	83 f8 ea             	cmp    $0xffffffea,%eax
@@ -394,7 +395,7 @@ expression: diff
    418e50:	f3 0f 1e fa          	endbr64
 -  418e54:	b8 63 00 00 00       	mov    $0x63,%eax
 -  418e59:	0f 05                	syscall
-+  418e54:	e9 06 94 09 00       	jmp    4b225f <_end+0x1037>
++  418e54:	<trampoline-jmp+0x25f>
 +  418e59:	90                   	nop
 +  418e5a:	90                   	nop
    418e5b:	48 3d 01 f0 ff ff    	cmp    $0xfffffffffffff001,%rax
@@ -406,7 +407,7 @@ expression: diff
    41e494:	48 8d 9d e0 ef ff ff 	lea    -0x1020(%rbp),%rbx
 -  41e49b:	48 89 da             	mov    %rbx,%rdx
 -  41e49e:	0f 05                	syscall
-+  41e49b:	e9 d1 3d 09 00       	jmp    4b2271 <_end+0x1049>
++  41e49b:	<trampoline-jmp+0x271>
    41e4a0:	85 c0                	test   %eax,%eax
    41e4a2:	7e 5c                	jle    41e500 <_dl_get_origin+0xa0>
    41e4a4:	0f b6 95 e0 ef ff ff 	movzbl -0x1020(%rbp),%edx
@@ -416,7 +417,7 @@ expression: diff
    41e6db:	48 8d b5 d0 f6 ff ff 	lea    -0x930(%rbp),%rsi
 -  41e6e2:	b8 14 00 00 00       	mov    $0x14,%eax
 -  41e6e7:	0f 05                	syscall
-+  41e6e2:	e9 9a 3b 09 00       	jmp    4b2281 <_end+0x1059>
++  41e6e2:	<trampoline-jmp+0x281>
 +  41e6e7:	90                   	nop
 +  41e6e8:	90                   	nop
    41e6e9:	48 81 c4 38 09 00 00 	add    $0x938,%rsp
@@ -428,7 +429,7 @@ expression: diff
    41ff24:	48 8d bb d0 02 00 00 	lea    0x2d0(%rbx),%rdi
 -  41ff2b:	b8 da 00 00 00       	mov    $0xda,%eax
 -  41ff30:	0f 05                	syscall
-+  41ff2b:	e9 63 23 09 00       	jmp    4b2293 <_end+0x106b>
++  41ff2b:	<trampoline-jmp+0x293>
 +  41ff30:	90                   	nop
 +  41ff31:	90                   	nop
    41ff32:	89 83 d0 02 00 00    	mov    %eax,0x2d0(%rbx)
@@ -440,7 +441,7 @@ expression: diff
    41ff81:	66 0f 6c c0          	punpcklqdq %xmm0,%xmm0
 -  41ff85:	0f 11 83 d8 02 00 00 	movups %xmm0,0x2d8(%rbx)
 -  41ff8c:	0f 05                	syscall
-+  41ff85:	e9 1b 23 09 00       	jmp    4b22a5 <_end+0x107d>
++  41ff85:	<trampoline-jmp+0x2a5>
 +  41ff8a:	90                   	nop
 +  41ff8b:	90                   	nop
 +  41ff8c:	90                   	nop
@@ -454,7 +455,7 @@ expression: diff
    41fff4:	48 89 df             	mov    %rbx,%rdi
 -  41fff7:	b8 4e 01 00 00       	mov    $0x14e,%eax
 -  41fffc:	0f 05                	syscall
-+  41fff7:	e9 bd 22 09 00       	jmp    4b22b9 <_end+0x1091>
++  41fff7:	<trampoline-jmp+0x2b9>
 +  41fffc:	90                   	nop
 +  41fffd:	90                   	nop
    41fffe:	3d 00 f0 ff ff       	cmp    $0xfffff000,%eax
@@ -466,7 +467,7 @@ expression: diff
    421344:	bf 02 50 00 00       	mov    $0x5002,%edi
 -  421349:	b8 9e 00 00 00       	mov    $0x9e,%eax
 -  42134e:	0f 05                	syscall
-+  421349:	e9 7d 0f 09 00       	jmp    4b22cb <_end+0x10a3>
++  421349:	<trampoline-jmp+0x2cb>
 +  42134e:	90                   	nop
 +  42134f:	90                   	nop
    421350:	89 c7                	mov    %eax,%edi
@@ -478,7 +479,7 @@ expression: diff
    4213a5:	48 89 e5             	mov    %rsp,%rbp
 -  4213a8:	48 8d 75 f8          	lea    -0x8(%rbp),%rsi
 -  4213ac:	0f 05                	syscall
-+  4213a8:	e9 30 0f 09 00       	jmp    4b22dd <_end+0x10b5>
++  4213a8:	<trampoline-jmp+0x2dd>
 +  4213ad:	90                   	nop
    4213ae:	48 85 c0             	test   %rax,%rax
    4213b1:	74 15                	je     4213c8 <_dl_cet_setup_features+0x38>
@@ -490,7 +491,7 @@ expression: diff
 -  4213f7:	bf 03 50 00 00       	mov    $0x5003,%edi
 -  4213fc:	89 d0                	mov    %edx,%eax
 -  4213fe:	0f 05                	syscall
-+  4213f7:	e9 f2 0e 09 00       	jmp    4b22ee <_end+0x10c6>
++  4213f7:	<trampoline-jmp+0x2ee>
 +  4213fc:	90                   	nop
 +  4213fd:	90                   	nop
 +  4213fe:	90                   	nop
@@ -505,13 +506,13 @@ expression: diff
 -  421455:	31 ff                	xor    %edi,%edi
 -  421457:	89 f0                	mov    %esi,%eax
 -  421459:	0f 05                	syscall
-+  421455:	e9 a8 0e 09 00       	jmp    4b2302 <_end+0x10da>
++  421455:	<trampoline-jmp+0x302>
 +  42145a:	90                   	nop
    42145b:	48 89 c2             	mov    %rax,%rdx
 -  42145e:	48 8d 3c 18          	lea    (%rax,%rbx,1),%rdi
 -  421462:	89 f0                	mov    %esi,%eax
 -  421464:	0f 05                	syscall
-+  42145e:	e9 b0 0e 09 00       	jmp    4b2313 <_end+0x10eb>
++  42145e:	<trampoline-jmp+0x313>
 +  421463:	90                   	nop
 +  421464:	90                   	nop
 +  421465:	90                   	nop
@@ -524,7 +525,7 @@ expression: diff
    421481:	48 89 de             	mov    %rbx,%rsi
 -  421484:	b8 09 00 00 00       	mov    $0x9,%eax
 -  421489:	0f 05                	syscall
-+  421484:	e9 9d 0e 09 00       	jmp    4b2326 <_end+0x10fe>
++  421484:	<trampoline-jmp+0x326>
 +  421489:	90                   	nop
 +  42148a:	90                   	nop
    42148b:	31 d2                	xor    %edx,%edx
@@ -536,7 +537,7 @@ expression: diff
    444c16:	48 8d 35 b3 0a 04 00 	lea    0x40ab3(%rip),%rsi        # 4856d0 <sigall_set>
 -  444c1d:	b8 0e 00 00 00       	mov    $0xe,%eax
 -  444c22:	0f 05                	syscall
-+  444c1d:	e9 16 d7 06 00       	jmp    4b2338 <_end+0x1110>
++  444c1d:	<trampoline-jmp+0x338>
 +  444c22:	90                   	nop
 +  444c23:	90                   	nop
    444c24:	31 c0                	xor    %eax,%eax
@@ -548,7 +549,7 @@ expression: diff
    444c63:	bf 02 00 00 00       	mov    $0x2,%edi
 -  444c68:	b8 0e 00 00 00       	mov    $0xe,%eax
 -  444c6d:	0f 05                	syscall
-+  444c68:	e9 dd d6 06 00       	jmp    4b234a <_end+0x1122>
++  444c68:	<trampoline-jmp+0x34a>
 +  444c6d:	90                   	nop
 +  444c6e:	90                   	nop
    444c6f:	48 8b 45 d8          	mov    -0x28(%rbp),%rax
@@ -560,7 +561,7 @@ expression: diff
    444ca8:	89 de                	mov    %ebx,%esi
 -  444caa:	b8 ea 00 00 00       	mov    $0xea,%eax
 -  444caf:	0f 05                	syscall
-+  444caa:	e9 ad d6 06 00       	jmp    4b235c <_end+0x1134>
++  444caa:	<trampoline-jmp+0x35c>
 +  444caf:	90                   	nop
 +  444cb0:	90                   	nop
    444cb1:	3d 00 f0 ff ff       	cmp    $0xfffff000,%eax
@@ -571,7 +572,7 @@ expression: diff
    444cbe:	66 90                	xchg   %ax,%ax
 -  444cc0:	b8 ba 00 00 00       	mov    $0xba,%eax
 -  444cc5:	0f 05                	syscall
-+  444cc0:	e9 a9 d6 06 00       	jmp    4b236e <_end+0x1146>
++  444cc0:	<trampoline-jmp+0x36e>
 +  444cc5:	90                   	nop
 +  444cc6:	90                   	nop
    444cc7:	89 c3                	mov    %eax,%ebx
@@ -581,7 +582,7 @@ expression: diff
    444cd3:	89 c7                	mov    %eax,%edi
 -  444cd5:	b8 ea 00 00 00       	mov    $0xea,%eax
 -  444cda:	0f 05                	syscall
-+  444cd5:	e9 a6 d6 06 00       	jmp    4b2380 <_end+0x1158>
++  444cd5:	<trampoline-jmp+0x380>
 +  444cda:	90                   	nop
 +  444cdb:	90                   	nop
    444cdc:	89 c3                	mov    %eax,%ebx
@@ -593,7 +594,7 @@ expression: diff
    444d78:	4c 89 fa             	mov    %r15,%rdx
 -  444d7b:	48 8d 35 4e 09 04 00 	lea    0x4094e(%rip),%rsi        # 4856d0 <sigall_set>
 -  444d82:	0f 05                	syscall
-+  444d7b:	e9 12 d6 06 00       	jmp    4b2392 <_end+0x116a>
++  444d7b:	<trampoline-jmp+0x392>
 +  444d80:	90                   	nop
 +  444d81:	90                   	nop
 +  444d82:	90                   	nop
@@ -607,7 +608,7 @@ expression: diff
    444dc4:	bf 02 00 00 00       	mov    $0x2,%edi
 -  444dc9:	b8 0e 00 00 00       	mov    $0xe,%eax
 -  444dce:	0f 05                	syscall
-+  444dc9:	e9 d8 d5 06 00       	jmp    4b23a6 <_end+0x117e>
++  444dc9:	<trampoline-jmp+0x3a6>
 +  444dce:	90                   	nop
 +  444dcf:	90                   	nop
    444dd0:	48 8b 45 c8          	mov    -0x38(%rbp),%rax
@@ -619,7 +620,7 @@ expression: diff
    444e08:	89 de                	mov    %ebx,%esi
 -  444e0a:	b8 ea 00 00 00       	mov    $0xea,%eax
 -  444e0f:	0f 05                	syscall
-+  444e0a:	e9 a9 d5 06 00       	jmp    4b23b8 <_end+0x1190>
++  444e0a:	<trampoline-jmp+0x3b8>
 +  444e0f:	90                   	nop
 +  444e10:	90                   	nop
    444e11:	3d 00 f0 ff ff       	cmp    $0xfffff000,%eax
@@ -629,7 +630,7 @@ expression: diff
    444e1e:	eb 8a                	jmp    444daa <__pthread_kill+0x8a>
 -  444e20:	b8 ba 00 00 00       	mov    $0xba,%eax
 -  444e25:	0f 05                	syscall
-+  444e20:	e9 a5 d5 06 00       	jmp    4b23ca <_end+0x11a2>
++  444e20:	<trampoline-jmp+0x3ca>
 +  444e25:	90                   	nop
 +  444e26:	90                   	nop
    444e27:	89 c3                	mov    %eax,%ebx
@@ -639,7 +640,7 @@ expression: diff
    444e33:	89 c7                	mov    %eax,%edi
 -  444e35:	b8 ea 00 00 00       	mov    $0xea,%eax
 -  444e3a:	0f 05                	syscall
-+  444e35:	e9 a2 d5 06 00       	jmp    4b23dc <_end+0x11b4>
++  444e35:	<trampoline-jmp+0x3dc>
 +  444e3a:	90                   	nop
 +  444e3b:	90                   	nop
    444e3c:	41 89 c6             	mov    %eax,%r14d
@@ -651,7 +652,7 @@ expression: diff
    445107:	f7 d6                	not    %esi
 -  445109:	81 e6 80 00 00 00    	and    $0x80,%esi
 -  44510f:	0f 05                	syscall
-+  445109:	e9 e0 d2 06 00       	jmp    4b23ee <_end+0x11c6>
++  445109:	<trampoline-jmp+0x3ee>
 +  44510e:	90                   	nop
 +  44510f:	90                   	nop
 +  445110:	90                   	nop
@@ -664,7 +665,7 @@ expression: diff
    4452e4:	48 89 df             	mov    %rbx,%rdi
 -  4452e7:	b8 ca 00 00 00       	mov    $0xca,%eax
 -  4452ec:	0f 05                	syscall
-+  4452e7:	e9 15 d1 06 00       	jmp    4b2401 <_end+0x11d9>
++  4452e7:	<trampoline-jmp+0x401>
 +  4452ec:	90                   	nop
 +  4452ed:	90                   	nop
    4452ee:	48 3d 00 f0 ff ff    	cmp    $0xfffffffffffff000,%rax
@@ -676,7 +677,7 @@ expression: diff
    4454ff:	be 07 00 00 00       	mov    $0x7,%esi
 -  445504:	b8 ca 00 00 00       	mov    $0xca,%eax
 -  445509:	0f 05                	syscall
-+  445504:	e9 0a cf 06 00       	jmp    4b2413 <_end+0x11eb>
++  445504:	<trampoline-jmp+0x413>
 +  445509:	90                   	nop
 +  44550a:	90                   	nop
    44550b:	48 3d 00 f0 ff ff    	cmp    $0xfffffffffffff000,%rax
@@ -688,7 +689,7 @@ expression: diff
    445aa9:	81 e6 80 00 00 00    	and    $0x80,%esi
 -  445aaf:	40 80 f6 81          	xor    $0x81,%sil
 -  445ab3:	0f 05                	syscall
-+  445aaf:	e9 71 c9 06 00       	jmp    4b2425 <_end+0x11fd>
++  445aaf:	<trampoline-jmp+0x425>
 +  445ab4:	90                   	nop
    445ab5:	48 3d 00 f0 ff ff    	cmp    $0xfffffffffffff000,%rax
    445abb:	0f 87 0e 02 00 00    	ja     445ccf <__pthread_mutex_unlock_full+0x3bf>
@@ -699,7 +700,7 @@ expression: diff
    445cfd:	4c 89 c7             	mov    %r8,%rdi
 -  445d00:	b8 ca 00 00 00       	mov    $0xca,%eax
 -  445d05:	0f 05                	syscall
-+  445d00:	e9 31 c7 06 00       	jmp    4b2436 <_end+0x120e>
++  445d00:	<trampoline-jmp+0x436>
 +  445d05:	90                   	nop
 +  445d06:	90                   	nop
    445d07:	48 3d 00 f0 ff ff    	cmp    $0xfffffffffffff000,%rax
@@ -711,7 +712,7 @@ expression: diff
    445d29:	4c 89 c7             	mov    %r8,%rdi
 -  445d2c:	b8 ca 00 00 00       	mov    $0xca,%eax
 -  445d31:	0f 05                	syscall
-+  445d2c:	e9 17 c7 06 00       	jmp    4b2448 <_end+0x1220>
++  445d2c:	<trampoline-jmp+0x448>
 +  445d31:	90                   	nop
 +  445d32:	90                   	nop
    445d33:	48 3d 00 f0 ff ff    	cmp    $0xfffffffffffff000,%rax
@@ -723,7 +724,7 @@ expression: diff
    44600f:	48 89 df             	mov    %rbx,%rdi
 -  446012:	b8 ca 00 00 00       	mov    $0xca,%eax
 -  446017:	0f 05                	syscall
-+  446012:	e9 43 c4 06 00       	jmp    4b245a <_end+0x1232>
++  446012:	<trampoline-jmp+0x45a>
 +  446017:	90                   	nop
 +  446018:	90                   	nop
    446019:	48 3d 00 f0 ff ff    	cmp    $0xfffffffffffff000,%rax
@@ -735,7 +736,7 @@ expression: diff
    4460b0:	48 89 df             	mov    %rbx,%rdi
 -  4460b3:	b8 ca 00 00 00       	mov    $0xca,%eax
 -  4460b8:	0f 05                	syscall
-+  4460b3:	e9 b4 c3 06 00       	jmp    4b246c <_end+0x1244>
++  4460b3:	<trampoline-jmp+0x46c>
 +  4460b8:	90                   	nop
 +  4460b9:	90                   	nop
    4460ba:	48 3d 00 f0 ff ff    	cmp    $0xfffffffffffff000,%rax
@@ -747,7 +748,7 @@ expression: diff
    446142:	be 81 00 00 00       	mov    $0x81,%esi
 -  446147:	b8 ca 00 00 00       	mov    $0xca,%eax
 -  44614c:	0f 05                	syscall
-+  446147:	e9 32 c3 06 00       	jmp    4b247e <_end+0x1256>
++  446147:	<trampoline-jmp+0x47e>
 +  44614c:	90                   	nop
 +  44614d:	90                   	nop
    44614e:	48 3d 00 f0 ff ff    	cmp    $0xfffffffffffff000,%rax
@@ -759,7 +760,7 @@ expression: diff
    4462e3:	c1 e6 07             	shl    $0x7,%esi
 -  4462e6:	40 80 f6 81          	xor    $0x81,%sil
 -  4462ea:	0f 05                	syscall
-+  4462e6:	e9 a5 c1 06 00       	jmp    4b2490 <_end+0x1268>
++  4462e6:	<trampoline-jmp+0x490>
 +  4462eb:	90                   	nop
    4462ec:	48 3d 00 f0 ff ff    	cmp    $0xfffffffffffff000,%rax
    4462f2:	0f 86 2e ff ff ff    	jbe    446226 <___pthread_rwlock_rdlock+0x46>
@@ -770,7 +771,7 @@ expression: diff
    446437:	40 80 f6 81          	xor    $0x81,%sil
 -  44643b:	b8 ca 00 00 00       	mov    $0xca,%eax
 -  446440:	0f 05                	syscall
-+  44643b:	e9 61 c0 06 00       	jmp    4b24a1 <_end+0x1279>
++  44643b:	<trampoline-jmp+0x4a1>
 +  446440:	90                   	nop
 +  446441:	90                   	nop
    446442:	48 3d 00 f0 ff ff    	cmp    $0xfffffffffffff000,%rax
@@ -782,7 +783,7 @@ expression: diff
    44648a:	b8 ca 00 00 00       	mov    $0xca,%eax
 -  44648f:	40 80 f6 81          	xor    $0x81,%sil
 -  446493:	0f 05                	syscall
-+  44648f:	e9 1f c0 06 00       	jmp    4b24b3 <_end+0x128b>
++  44648f:	<trampoline-jmp+0x4b3>
 +  446494:	90                   	nop
    446495:	48 3d 00 f0 ff ff    	cmp    $0xfffffffffffff000,%rax
    44649b:	76 83                	jbe    446420 <___pthread_rwlock_unlock+0x50>
@@ -793,7 +794,7 @@ expression: diff
    446511:	40 80 f6 81          	xor    $0x81,%sil
 -  446515:	b8 ca 00 00 00       	mov    $0xca,%eax
 -  44651a:	0f 05                	syscall
-+  446515:	e9 aa bf 06 00       	jmp    4b24c4 <_end+0x129c>
++  446515:	<trampoline-jmp+0x4c4>
 +  44651a:	90                   	nop
 +  44651b:	90                   	nop
    44651c:	48 3d 00 f0 ff ff    	cmp    $0xfffffffffffff000,%rax
@@ -805,7 +806,7 @@ expression: diff
    446577:	b8 ca 00 00 00       	mov    $0xca,%eax
 -  44657c:	40 80 f6 81          	xor    $0x81,%sil
 -  446580:	0f 05                	syscall
-+  44657c:	e9 55 bf 06 00       	jmp    4b24d6 <_end+0x12ae>
++  44657c:	<trampoline-jmp+0x4d6>
 +  446581:	90                   	nop
    446582:	48 3d 00 f0 ff ff    	cmp    $0xfffffffffffff000,%rax
    446588:	0f 86 6c ff ff ff    	jbe    4464fa <___pthread_rwlock_unlock+0x12a>
@@ -816,7 +817,7 @@ expression: diff
    446855:	40 80 f6 81          	xor    $0x81,%sil
 -  446859:	b8 ca 00 00 00       	mov    $0xca,%eax
 -  44685e:	0f 05                	syscall
-+  446859:	e9 89 bc 06 00       	jmp    4b24e7 <_end+0x12bf>
++  446859:	<trampoline-jmp+0x4e7>
 +  44685e:	90                   	nop
 +  44685f:	90                   	nop
    446860:	48 3d 00 f0 ff ff    	cmp    $0xfffffffffffff000,%rax
@@ -828,7 +829,7 @@ expression: diff
    446880:	40 80 f6 81          	xor    $0x81,%sil
 -  446884:	b8 ca 00 00 00       	mov    $0xca,%eax
 -  446889:	0f 05                	syscall
-+  446884:	e9 70 bc 06 00       	jmp    4b24f9 <_end+0x12d1>
++  446884:	<trampoline-jmp+0x4f9>
 +  446889:	90                   	nop
 +  44688a:	90                   	nop
    44688b:	48 3d 00 f0 ff ff    	cmp    $0xfffffffffffff000,%rax
@@ -840,7 +841,7 @@ expression: diff
    446924:	40 80 f6 81          	xor    $0x81,%sil
 -  446928:	b8 ca 00 00 00       	mov    $0xca,%eax
 -  44692d:	0f 05                	syscall
-+  446928:	e9 de bb 06 00       	jmp    4b250b <_end+0x12e3>
++  446928:	<trampoline-jmp+0x50b>
 +  44692d:	90                   	nop
 +  44692e:	90                   	nop
    44692f:	48 3d 00 f0 ff ff    	cmp    $0xfffffffffffff000,%rax
@@ -852,7 +853,7 @@ expression: diff
    446a0b:	41 ba 08 00 00 00    	mov    $0x8,%r10d
 -  446a11:	b8 0e 00 00 00       	mov    $0xe,%eax
 -  446a16:	0f 05                	syscall
-+  446a11:	e9 07 bb 06 00       	jmp    4b251d <_end+0x12f5>
++  446a11:	<trampoline-jmp+0x51d>
 +  446a16:	90                   	nop
 +  446a17:	90                   	nop
    446a18:	89 c2                	mov    %eax,%edx
@@ -864,7 +865,7 @@ expression: diff
    45ba2c:	48 0f 47 d0          	cmova  %rax,%rdx
 -  45ba30:	b8 d9 00 00 00       	mov    $0xd9,%eax
 -  45ba35:	0f 05                	syscall
-+  45ba30:	e9 fa 6a 05 00       	jmp    4b252f <_end+0x1307>
++  45ba30:	<trampoline-jmp+0x52f>
 +  45ba35:	90                   	nop
 +  45ba36:	90                   	nop
    45ba37:	48 3d 00 f0 ff ff    	cmp    $0xfffffffffffff000,%rax
@@ -876,7 +877,7 @@ expression: diff
    45bb50:	f3 0f 1e fa          	endbr64
 -  45bb54:	b8 27 00 00 00       	mov    $0x27,%eax
 -  45bb59:	0f 05                	syscall
-+  45bb54:	e9 e8 69 05 00       	jmp    4b2541 <_end+0x1319>
++  45bb54:	<trampoline-jmp+0x541>
 +  45bb59:	90                   	nop
 +  45bb5a:	90                   	nop
    45bb5b:	c3                   	ret
@@ -888,7 +889,7 @@ expression: diff
    45bba0:	f3 0f 1e fa          	endbr64
 -  45bba4:	b8 8f 00 00 00       	mov    $0x8f,%eax
 -  45bba9:	0f 05                	syscall
-+  45bba4:	e9 aa 69 05 00       	jmp    4b2553 <_end+0x132b>
++  45bba4:	<trampoline-jmp+0x553>
 +  45bba9:	90                   	nop
 +  45bbaa:	90                   	nop
    45bbab:	48 3d 01 f0 ff ff    	cmp    $0xfffffffffffff001,%rax
@@ -900,7 +901,7 @@ expression: diff
    45bbd0:	f3 0f 1e fa          	endbr64
 -  45bbd4:	b8 91 00 00 00       	mov    $0x91,%eax
 -  45bbd9:	0f 05                	syscall
-+  45bbd4:	e9 8c 69 05 00       	jmp    4b2565 <_end+0x133d>
++  45bbd4:	<trampoline-jmp+0x565>
 +  45bbd9:	90                   	nop
 +  45bbda:	90                   	nop
    45bbdb:	48 3d 01 f0 ff ff    	cmp    $0xfffffffffffff001,%rax
@@ -912,7 +913,7 @@ expression: diff
    45bc00:	f3 0f 1e fa          	endbr64
 -  45bc04:	b8 92 00 00 00       	mov    $0x92,%eax
 -  45bc09:	0f 05                	syscall
-+  45bc04:	e9 6e 69 05 00       	jmp    4b2577 <_end+0x134f>
++  45bc04:	<trampoline-jmp+0x577>
 +  45bc09:	90                   	nop
 +  45bc0a:	90                   	nop
    45bc0b:	48 3d 01 f0 ff ff    	cmp    $0xfffffffffffff001,%rax
@@ -924,7 +925,7 @@ expression: diff
    45bc30:	f3 0f 1e fa          	endbr64
 -  45bc34:	b8 93 00 00 00       	mov    $0x93,%eax
 -  45bc39:	0f 05                	syscall
-+  45bc34:	e9 50 69 05 00       	jmp    4b2589 <_end+0x1361>
++  45bc34:	<trampoline-jmp+0x589>
 +  45bc39:	90                   	nop
 +  45bc3a:	90                   	nop
    45bc3b:	48 3d 01 f0 ff ff    	cmp    $0xfffffffffffff001,%rax
@@ -936,7 +937,7 @@ expression: diff
    45bc60:	f3 0f 1e fa          	endbr64
 -  45bc64:	b8 90 00 00 00       	mov    $0x90,%eax
 -  45bc69:	0f 05                	syscall
-+  45bc64:	e9 32 69 05 00       	jmp    4b259b <_end+0x1373>
++  45bc64:	<trampoline-jmp+0x59b>
 +  45bc69:	90                   	nop
 +  45bc6a:	90                   	nop
    45bc6b:	48 3d 01 f0 ff ff    	cmp    $0xfffffffffffff001,%rax
@@ -948,7 +949,7 @@ expression: diff
    45bd0d:	48 8b bd 08 ff ff ff 	mov    -0xf8(%rbp),%rdi
 -  45bd14:	b8 4f 00 00 00       	mov    $0x4f,%eax
 -  45bd19:	0f 05                	syscall
-+  45bd14:	e9 94 68 05 00       	jmp    4b25ad <_end+0x1385>
++  45bd14:	<trampoline-jmp+0x5ad>
 +  45bd19:	90                   	nop
 +  45bd1a:	90                   	nop
    45bd1b:	48 3d 00 f0 ff ff    	cmp    $0xfffffffffffff000,%rax
@@ -960,7 +961,7 @@ expression: diff
    45c510:	f3 0f 1e fa          	endbr64
 -  45c514:	b8 08 00 00 00       	mov    $0x8,%eax
 -  45c519:	0f 05                	syscall
-+  45c514:	e9 a6 60 05 00       	jmp    4b25bf <_end+0x1397>
++  45c514:	<trampoline-jmp+0x5bf>
 +  45c519:	90                   	nop
 +  45c51a:	90                   	nop
    45c51b:	48 3d 00 f0 ff ff    	cmp    $0xfffffffffffff000,%rax
@@ -972,7 +973,7 @@ expression: diff
    45c5a9:	bf 9c ff ff ff       	mov    $0xffffff9c,%edi
 -  45c5ae:	b8 01 01 00 00       	mov    $0x101,%eax
 -  45c5b3:	0f 05                	syscall
-+  45c5ae:	e9 1e 60 05 00       	jmp    4b25d1 <_end+0x13a9>
++  45c5ae:	<trampoline-jmp+0x5d1>
 +  45c5b3:	90                   	nop
 +  45c5b4:	90                   	nop
    45c5b5:	48 3d 00 f0 ff ff    	cmp    $0xfffffffffffff000,%rax
@@ -984,7 +985,7 @@ expression: diff
    45c619:	bf 9c ff ff ff       	mov    $0xffffff9c,%edi
 -  45c61e:	b8 01 01 00 00       	mov    $0x101,%eax
 -  45c623:	0f 05                	syscall
-+  45c61e:	e9 c0 5f 05 00       	jmp    4b25e3 <_end+0x13bb>
++  45c61e:	<trampoline-jmp+0x5e3>
 +  45c623:	90                   	nop
 +  45c624:	90                   	nop
    45c625:	48 3d 00 f0 ff ff    	cmp    $0xfffffffffffff000,%rax
@@ -996,7 +997,7 @@ expression: diff
    45c6b9:	74 51                	je     45c70c <__libc_openat64+0x8c>
 -  45c6bb:	b8 01 01 00 00       	mov    $0x101,%eax
 -  45c6c0:	0f 05                	syscall
-+  45c6bb:	e9 35 5f 05 00       	jmp    4b25f5 <_end+0x13cd>
++  45c6bb:	<trampoline-jmp+0x5f5>
 +  45c6c0:	90                   	nop
 +  45c6c1:	90                   	nop
    45c6c2:	48 3d 00 f0 ff ff    	cmp    $0xfffffffffffff000,%rax
@@ -1008,7 +1009,7 @@ expression: diff
    45c72d:	8b 7d a8             	mov    -0x58(%rbp),%edi
 -  45c730:	b8 01 01 00 00       	mov    $0x101,%eax
 -  45c735:	0f 05                	syscall
-+  45c730:	e9 d2 5e 05 00       	jmp    4b2607 <_end+0x13df>
++  45c730:	<trampoline-jmp+0x607>
 +  45c735:	90                   	nop
 +  45c736:	90                   	nop
    45c737:	48 3d 00 f0 ff ff    	cmp    $0xfffffffffffff000,%rax
@@ -1020,7 +1021,7 @@ expression: diff
    45c79d:	31 c0                	xor    %eax,%eax
 -  45c79f:	0f 05                	syscall
 -  45c7a1:	48 3d 00 f0 ff ff    	cmp    $0xfffffffffffff000,%rax
-+  45c79f:	e9 75 5e 05 00       	jmp    4b2619 <_end+0x13f1>
++  45c79f:	<trampoline-jmp+0x619>
 +  45c7a4:	90                   	nop
 +  45c7a5:	90                   	nop
 +  45c7a6:	90                   	nop
@@ -1034,7 +1035,7 @@ expression: diff
 -  45c7d3:	8b 7d f8             	mov    -0x8(%rbp),%edi
 -  45c7d6:	31 c0                	xor    %eax,%eax
 -  45c7d8:	0f 05                	syscall
-+  45c7d3:	e9 59 5e 05 00       	jmp    4b2631 <_end+0x1409>
++  45c7d3:	<trampoline-jmp+0x631>
 +  45c7d8:	90                   	nop
 +  45c7d9:	90                   	nop
    45c7da:	48 3d 00 f0 ff ff    	cmp    $0xfffffffffffff000,%rax
@@ -1046,7 +1047,7 @@ expression: diff
    45c85b:	74 13                	je     45c870 <__libc_write+0x20>
 -  45c85d:	b8 01 00 00 00       	mov    $0x1,%eax
 -  45c862:	0f 05                	syscall
-+  45c85d:	e9 e1 5d 05 00       	jmp    4b2643 <_end+0x141b>
++  45c85d:	<trampoline-jmp+0x643>
 +  45c862:	90                   	nop
 +  45c863:	90                   	nop
    45c864:	48 3d 00 f0 ff ff    	cmp    $0xfffffffffffff000,%rax
@@ -1058,7 +1059,7 @@ expression: diff
    45c893:	8b 7d f8             	mov    -0x8(%rbp),%edi
 -  45c896:	b8 01 00 00 00       	mov    $0x1,%eax
 -  45c89b:	0f 05                	syscall
-+  45c896:	e9 ba 5d 05 00       	jmp    4b2655 <_end+0x142d>
++  45c896:	<trampoline-jmp+0x655>
 +  45c89b:	90                   	nop
 +  45c89c:	90                   	nop
    45c89d:	48 3d 00 f0 ff ff    	cmp    $0xfffffffffffff000,%rax
@@ -1070,7 +1071,7 @@ expression: diff
    45c920:	74 26                	je     45c948 <__openat64_nocancel+0x58>
 -  45c922:	b8 01 01 00 00       	mov    $0x101,%eax
 -  45c927:	0f 05                	syscall
-+  45c922:	e9 40 5d 05 00       	jmp    4b2667 <_end+0x143f>
++  45c922:	<trampoline-jmp+0x667>
 +  45c927:	90                   	nop
 +  45c928:	90                   	nop
    45c929:	48 3d 00 f0 ff ff    	cmp    $0xfffffffffffff000,%rax
@@ -1082,7 +1083,7 @@ expression: diff
    45c984:	49 89 ca             	mov    %rcx,%r10
 -  45c987:	b8 11 00 00 00       	mov    $0x11,%eax
 -  45c98c:	0f 05                	syscall
-+  45c987:	e9 ed 5c 05 00       	jmp    4b2679 <_end+0x1451>
++  45c987:	<trampoline-jmp+0x679>
 +  45c98c:	90                   	nop
 +  45c98d:	90                   	nop
    45c98e:	48 3d 00 f0 ff ff    	cmp    $0xfffffffffffff000,%rax
@@ -1094,7 +1095,7 @@ expression: diff
    45c9c0:	f3 0f 1e fa          	endbr64
 -  45c9c4:	b8 01 00 00 00       	mov    $0x1,%eax
 -  45c9c9:	0f 05                	syscall
-+  45c9c4:	e9 c2 5c 05 00       	jmp    4b268b <_end+0x1463>
++  45c9c4:	<trampoline-jmp+0x68b>
 +  45c9c9:	90                   	nop
 +  45c9ca:	90                   	nop
    45c9cb:	48 3d 00 f0 ff ff    	cmp    $0xfffffffffffff000,%rax
@@ -1106,7 +1107,7 @@ expression: diff
    45ca13:	48 8d 55 d0          	lea    -0x30(%rbp),%rdx
 -  45ca17:	b8 10 00 00 00       	mov    $0x10,%eax
 -  45ca1c:	0f 05                	syscall
-+  45ca17:	e9 81 5c 05 00       	jmp    4b269d <_end+0x1475>
++  45ca17:	<trampoline-jmp+0x69d>
 +  45ca1c:	90                   	nop
 +  45ca1d:	90                   	nop
    45ca1e:	48 3d 00 f0 ff ff    	cmp    $0xfffffffffffff000,%rax
@@ -1119,7 +1120,7 @@ expression: diff
 -  45cabb:	b8 2e 01 00 00       	mov    $0x12e,%eax
 -  45cac0:	31 ff                	xor    %edi,%edi
 -  45cac2:	0f 05                	syscall
-+  45cabb:	e9 ef 5b 05 00       	jmp    4b26af <_end+0x1487>
++  45cabb:	<trampoline-jmp+0x6af>
 +  45cac0:	90                   	nop
 +  45cac1:	90                   	nop
 +  45cac2:	90                   	nop
@@ -1133,7 +1134,7 @@ expression: diff
    45ffa0:	48 8d 78 1c          	lea    0x1c(%rax),%rdi
 -  45ffa4:	b8 ca 00 00 00       	mov    $0xca,%eax
 -  45ffa9:	0f 05                	syscall
-+  45ffa4:	e9 1a 27 05 00       	jmp    4b26c3 <_end+0x149b>
++  45ffa4:	<trampoline-jmp+0x6c3>
 +  45ffa9:	90                   	nop
 +  45ffaa:	90                   	nop
    45ffab:	48 8d 3d 6e ab 04 00 	lea    0x4ab6e(%rip),%rdi        # 4aab20 <_dl_load_lock>
@@ -1145,7 +1146,7 @@ expression: diff
    46306a:	be 80 00 00 00       	mov    $0x80,%esi
 -  46306f:	44 89 c8             	mov    %r9d,%eax
 -  463072:	0f 05                	syscall
-+  46306f:	e9 61 f6 04 00       	jmp    4b26d5 <_end+0x14ad>
++  46306f:	<trampoline-jmp+0x6d5>
    463074:	48 3d 00 f0 ff ff    	cmp    $0xfffffffffffff000,%rax
    46307a:	76 dc                	jbe    463058 <__thread_gscope_wait+0x88>
    46307c:	83 f8 f5             	cmp    $0xfffffff5,%eax
@@ -1155,7 +1156,7 @@ expression: diff
    46310a:	be 80 00 00 00       	mov    $0x80,%esi
 -  46310f:	44 89 c8             	mov    %r9d,%eax
 -  463112:	0f 05                	syscall
-+  46310f:	e9 d1 f5 04 00       	jmp    4b26e5 <_end+0x14bd>
++  46310f:	<trampoline-jmp+0x6e5>
    463114:	48 3d 00 f0 ff ff    	cmp    $0xfffffffffffff000,%rax
    46311a:	76 dc                	jbe    4630f8 <__thread_gscope_wait+0x128>
    46311c:	83 f8 f5             	cmp    $0xfffffff5,%eax
@@ -1165,7 +1166,7 @@ expression: diff
  00000000004669d0 <__restore_rt>:
 -  4669d0:	48 c7 c0 0f 00 00 00 	mov    $0xf,%rax
 -  4669d7:	0f 05                	syscall
-+  4669d0:	e9 20 bd 04 00       	jmp    4b26f5 <_end+0x14cd>
++  4669d0:	<trampoline-jmp+0x6f5>
 +  4669d5:	90                   	nop
 +  4669d6:	90                   	nop
 +  4669d7:	90                   	nop
@@ -1179,7 +1180,7 @@ expression: diff
    466aad:	41 ba 08 00 00 00    	mov    $0x8,%r10d
 -  466ab3:	b8 0d 00 00 00       	mov    $0xd,%eax
 -  466ab8:	0f 05                	syscall
-+  466ab3:	e9 51 bc 04 00       	jmp    4b2709 <_end+0x14e1>
++  466ab3:	<trampoline-jmp+0x709>
 +  466ab8:	90                   	nop
 +  466ab9:	90                   	nop
    466aba:	48 3d 00 f0 ff ff    	cmp    $0xfffffffffffff000,%rax
@@ -1191,7 +1192,7 @@ expression: diff
    46cb16:	be 80 00 00 00       	mov    $0x80,%esi
 -  46cb1b:	44 89 c0             	mov    %r8d,%eax
 -  46cb1e:	0f 05                	syscall
-+  46cb1b:	e9 fb 5b 04 00       	jmp    4b271b <_end+0x14f3>
++  46cb1b:	<trampoline-jmp+0x71b>
    46cb20:	48 3d 00 f0 ff ff    	cmp    $0xfffffffffffff000,%rax
    46cb26:	77 0d                	ja     46cb35 <__pthread_disable_asynccancel+0x65>
    46cb28:	8b 0f                	mov    (%rdi),%ecx
@@ -1201,7 +1202,7 @@ expression: diff
    46ccdf:	44 31 c6             	xor    %r8d,%esi
 -  46cce2:	45 31 c0             	xor    %r8d,%r8d
 -  46cce5:	0f 05                	syscall
-+  46cce2:	e9 44 5a 04 00       	jmp    4b272b <_end+0x1503>
++  46cce2:	<trampoline-jmp+0x72b>
    46cce7:	85 c0                	test   %eax,%eax
    46cce9:	7f 27                	jg     46cd12 <__futex_abstimed_wait64+0x62>
    46cceb:	83 f8 ea             	cmp    $0xffffffea,%eax
@@ -1211,7 +1212,7 @@ expression: diff
    46cd89:	44 89 e2             	mov    %r12d,%edx
 -  46cd8c:	b8 ca 00 00 00       	mov    $0xca,%eax
 -  46cd91:	0f 05                	syscall
-+  46cd8c:	e9 aa 59 04 00       	jmp    4b273b <_end+0x1513>
++  46cd8c:	<trampoline-jmp+0x73b>
 +  46cd91:	90                   	nop
 +  46cd92:	90                   	nop
    46cd93:	48 89 c3             	mov    %rax,%rbx
@@ -1223,7 +1224,7 @@ expression: diff
    46ce17:	44 89 e2             	mov    %r12d,%edx
 -  46ce1a:	b8 ca 00 00 00       	mov    $0xca,%eax
 -  46ce1f:	0f 05                	syscall
-+  46ce1a:	e9 2e 59 04 00       	jmp    4b274d <_end+0x1525>
++  46ce1a:	<trampoline-jmp+0x74d>
 +  46ce1f:	90                   	nop
 +  46ce20:	90                   	nop
    46ce21:	44 89 ef             	mov    %r13d,%edi
@@ -1235,7 +1236,7 @@ expression: diff
    46ce6c:	31 d2                	xor    %edx,%edx
 -  46ce6e:	b8 ca 00 00 00       	mov    $0xca,%eax
 -  46ce73:	0f 05                	syscall
-+  46ce6e:	e9 ec 58 04 00       	jmp    4b275f <_end+0x1537>
++  46ce6e:	<trampoline-jmp+0x75f>
 +  46ce73:	90                   	nop
 +  46ce74:	90                   	nop
    46ce75:	83 f8 da             	cmp    $0xffffffda,%eax
@@ -1247,7 +1248,7 @@ expression: diff
    46f344:	41 89 ca             	mov    %ecx,%r10d
 -  46f347:	b8 06 01 00 00       	mov    $0x106,%eax
 -  46f34c:	0f 05                	syscall
-+  46f347:	e9 25 34 04 00       	jmp    4b2771 <_end+0x1549>
++  46f347:	<trampoline-jmp+0x771>
 +  46f34c:	90                   	nop
 +  46f34d:	90                   	nop
    46f34e:	3d 00 f0 ff ff       	cmp    $0xfffff000,%eax
@@ -1259,7 +1260,7 @@ expression: diff
    472975:	48 8d 78 1c          	lea    0x1c(%rax),%rdi
 -  472979:	b8 ca 00 00 00       	mov    $0xca,%eax
 -  47297e:	0f 05                	syscall
-+  472979:	e9 05 fe 03 00       	jmp    4b2783 <_end+0x155b>
++  472979:	<trampoline-jmp+0x783>
 +  47297e:	90                   	nop
 +  47297f:	90                   	nop
    472980:	eb 8c                	jmp    47290e <_dl_fixup+0x10e>
@@ -1271,7 +1272,7 @@ expression: diff
    476c10:	48 8d 78 1c          	lea    0x1c(%rax),%rdi
 -  476c14:	b8 ca 00 00 00       	mov    $0xca,%eax
 -  476c19:	0f 05                	syscall
-+  476c14:	e9 7c bb 03 00       	jmp    4b2795 <_end+0x156d>
++  476c14:	<trampoline-jmp+0x795>
 +  476c19:	90                   	nop
 +  476c1a:	90                   	nop
    476c1b:	48 83 7d 98 00       	cmpq   $0x0,-0x68(%rbp)
@@ -1283,7 +1284,7 @@ expression: diff
    476e4a:	48 8d 78 1c          	lea    0x1c(%rax),%rdi
 -  476e4e:	b8 ca 00 00 00       	mov    $0xca,%eax
 -  476e53:	0f 05                	syscall
-+  476e4e:	e9 54 b9 03 00       	jmp    4b27a7 <_end+0x157f>
++  476e4e:	<trampoline-jmp+0x7a7>
 +  476e53:	90                   	nop
 +  476e54:	90                   	nop
    476e55:	48 83 7d 98 00       	cmpq   $0x0,-0x68(%rbp)

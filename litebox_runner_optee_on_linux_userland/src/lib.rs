@@ -58,7 +58,19 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         let ldelf = PathBuf::from(&cli_args.ldelf);
         let data = std::fs::read(ldelf).unwrap();
         if cli_args.rewrite_syscalls {
-            litebox_syscall_rewriter::hook_syscalls_in_elf(&data, None).unwrap()
+            let mut skipped_addrs = Vec::new();
+            let rewritten =
+                litebox_syscall_rewriter::hook_syscalls_in_elf(&data, None, &mut skipped_addrs)
+                    .unwrap();
+            if !skipped_addrs.is_empty() {
+                eprintln!(
+                    "warning: {} has {} unpatchable syscall instruction(s) at {:?}",
+                    cli_args.ldelf,
+                    skipped_addrs.len(),
+                    skipped_addrs,
+                );
+            }
+            rewritten
         } else {
             data
         }
@@ -68,7 +80,19 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         let prog = PathBuf::from(&cli_args.program);
         let data = std::fs::read(prog).unwrap();
         if cli_args.rewrite_syscalls {
-            litebox_syscall_rewriter::hook_syscalls_in_elf(&data, None).unwrap()
+            let mut skipped_addrs = Vec::new();
+            let rewritten =
+                litebox_syscall_rewriter::hook_syscalls_in_elf(&data, None, &mut skipped_addrs)
+                    .unwrap();
+            if !skipped_addrs.is_empty() {
+                eprintln!(
+                    "warning: {} has {} unpatchable syscall instruction(s) at {:?}",
+                    cli_args.program,
+                    skipped_addrs.len(),
+                    skipped_addrs,
+                );
+            }
+            rewritten
         } else {
             data
         }

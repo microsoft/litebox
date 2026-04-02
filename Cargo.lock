@@ -1734,7 +1734,6 @@ dependencies = [
  "clap",
  "iced-x86",
  "insta",
- "memmap2",
  "object",
  "similar",
  "tempfile",

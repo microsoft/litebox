@@ -3,14 +3,23 @@ name = "litebox_syscall_rewriter"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+default = ["std", "anyhow", "clap"]
+std = []
+
 [dependencies]
-anyhow = "1.0"
-clap = { version = "4.5.32", features = ["derive"] }
-iced-x86 = "1.21"
-memmap2 = "0.9"
-object = { version = "0.36.7", default-features = false, features = ["elf", "read", "std"] }
+iced-x86 = { version = "1.21", default-features = false, features = ["no_std", "decoder", "encoder", "instr_info"] }
+object = { version = "0.36.7", default-features = false, features = ["elf", "read_core"] }
 thiserror = { version = "2.0.6", default-features = false }
-zerocopy = { version = "0.8", features = ["derive"] }
+zerocopy = { version = "0.8", default-features = false, features = ["derive"] }
+
+# Binary-only dependencies
+anyhow = { version = "1.0", optional = true }
+clap = { version = "4.5.32", features = ["derive"], optional = true }
+
+[[bin]]
+name = "litebox_syscall_rewriter"
+required-features = ["std", "anyhow", "clap"]
 
 [lints]
 workspace = true
