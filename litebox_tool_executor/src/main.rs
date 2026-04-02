@@ -23,6 +23,17 @@ fn main() -> anyhow::Result<()> {
         // separate child process of this executor. This avoids the singleton
         // platform limitation (each child gets its own process) and also means
         // the command string is passed via argv with no shell quoting issues.
+        //
+        // Install a Ctrl+C handler so the REPL survives when VS Code sends
+        // Ctrl+C to the terminal after a command completes. Without this,
+        // the REPL exits with STATUS_CONTROL_C_EXIT (0xC000013A).
+        unsafe {
+            windows_sys::Win32::System::Console::SetConsoleCtrlHandler(
+                Some(ctrl_handler),
+                1, // TRUE = add handler
+            );
+        }
+
         eprintln!("LiteBox Sandbox Shell (each command runs in a fresh sandbox)");
         eprintln!("Type 'exit' to quit. Commands are executed via busybox.");
         eprintln!();
@@ -114,6 +125,19 @@ fn main() -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+/// Console control handler that ignores Ctrl+C in the REPL parent process.
+/// Child processes handle their own termination; we don't want Ctrl+C from
+/// VS Code's terminal management to kill the REPL.
+unsafe extern "system" fn ctrl_handler(ctrl_type: u32) -> i32 {
+    // CTRL_C_EVENT = 0, CTRL_BREAK_EVENT = 1
+    if ctrl_type <= 1 {
+        1 // TRUE = handled, don't terminate
+    } else {
+        0 // FALSE = not handled, use default behavior (terminate for CLOSE etc.)
+    }
 }
 
 #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
