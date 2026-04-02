@@ -1,7 +1,8 @@
 {
     "terminal.integrated.profiles.windows": {
         "LiteBox Sandbox": {
-            "path": "C:\\src\\litebox\\litebox_tool_executor\\scripts\\litebox-shell.cmd",
+            "path": "powershell.exe",
+            "args": ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "C:\\src\\litebox\\litebox_tool_executor\\scripts\\litebox-shell.ps1"],
             "env": {
                 "LITEBOX_ROOTFS": "C:\\src\\litebox\\target\\busybox-minimal.tar"
             },

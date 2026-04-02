@@ -1,4 +1,5 @@
 @echo off
+setlocal EnableDelayedExpansion
 REM Copyright (c) Microsoft Corporation.
 REM Licensed under the MIT license.
 REM
@@ -56,7 +57,8 @@ REM yet implemented. Each command gets a fresh sandbox.
 if "%~1"=="" (
     goto :repl
 ) else (
-    "%EXECUTOR%" %ARGS% /bin/busybox sh -c "%~1" 2>>"%LITEBOX_AUDIT%"
+    set "CMD=%~1"
+    "%EXECUTOR%" %ARGS% /bin/busybox sh -c "!CMD!" 2>>"%LITEBOX_AUDIT%"
     echo.
     echo [LiteBox] Audit log: %LITEBOX_AUDIT%
     goto :eof
@@ -67,8 +69,13 @@ echo LiteBox Sandbox Shell (each command runs in a fresh sandbox)
 echo Type 'exit' to quit. Commands are executed via busybox.
 echo.
 :prompt
+set "CMD="
 set /p "CMD=/ $ "
-if /i "%CMD%"=="exit" goto :eof
-if "%CMD%"=="" goto :prompt
-"%EXECUTOR%" %ARGS% /bin/busybox sh -c "%CMD%" 2>>"%LITEBOX_AUDIT%"
+if /i "!CMD!"=="exit" goto :eof
+if "!CMD!"=="" goto :prompt
+REM Use a temporary file to avoid CMD quote-mangling issues with
+REM double quotes inside the user's command.
+echo !CMD!> "%TEMP%\litebox_cmd.txt"
+set /p CMDLINE=<"%TEMP%\litebox_cmd.txt"
+"%EXECUTOR%" %ARGS% /bin/busybox sh -c "!CMDLINE!" 2>>"%LITEBOX_AUDIT%"
 goto :prompt
