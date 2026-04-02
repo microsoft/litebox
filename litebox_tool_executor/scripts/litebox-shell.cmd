@@ -42,14 +42,20 @@ if not "%LITEBOX_POLICY%"=="" (
     set "ARGS=%ARGS% --policy "%LITEBOX_POLICY%""
 )
 
+REM Audit events and debug messages go to stderr. In interactive mode this
+REM floods the terminal, so we redirect stderr to a log file.
+REM Set LITEBOX_AUDIT to control where the log goes, or leave it unset for
+REM a default location next to the rootfs tar.
+if "%LITEBOX_AUDIT%"=="" (
+    set "LITEBOX_AUDIT=%LITEBOX_ROOTFS%.audit.jsonl"
+)
+
 REM If arguments were passed, run in direct mode.
 REM If no arguments, launch an interactive busybox shell.
 if "%~1"=="" (
-    "%EXECUTOR%" %ARGS% /bin/busybox sh
+    "%EXECUTOR%" %ARGS% /bin/busybox sh 2>>"%LITEBOX_AUDIT%"
 ) else (
-    "%EXECUTOR%" %ARGS% /bin/busybox sh -c %*
+    "%EXECUTOR%" %ARGS% /bin/busybox sh -c "%~1" 2>>"%LITEBOX_AUDIT%"
 )
-
-REM Redirect audit log if requested.
-REM Note: audit events go to stderr. To capture them:
-REM   litebox-shell.cmd "echo hello" 2>>%LITEBOX_AUDIT%
+echo.
+echo [LiteBox] Audit log written to: %LITEBOX_AUDIT%
