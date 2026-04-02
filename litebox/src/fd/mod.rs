@@ -582,19 +582,32 @@ impl RawDescriptorStorage {
     /// Get the corresponding integer value of the provided `fd`.
     ///
     /// This explicitly consumes the `fd`.
-    #[expect(
-        clippy::missing_panics_doc,
-        reason = "panics are only within assertions"
-    )]
     pub fn fd_into_raw_integer<Subsystem: FdEnabledSubsystem>(
         &mut self,
         fd: TypedFd<Subsystem>,
     ) -> usize {
+        self.fd_into_raw_integer_at_or_above(fd, 0)
+    }
+
+    /// Get the corresponding integer value of the provided `fd`, starting the search at `min_fd`.
+    ///
+    /// This explicitly consumes the `fd`.
+    #[expect(
+        clippy::missing_panics_doc,
+        reason = "panics are only within assertions"
+    )]
+    pub fn fd_into_raw_integer_at_or_above<Subsystem: FdEnabledSubsystem>(
+        &mut self,
+        fd: TypedFd<Subsystem>,
+        min_fd: usize,
+    ) -> usize {
         let ret = self
             .stored_fds
             .iter()
-            .position(Option::is_none)
-            .unwrap_or(self.stored_fds.len());
+            .enumerate()
+            .skip(min_fd)
+            .find_map(|(i, slot)| if slot.is_none() { Some(i) } else { None })
+            .unwrap_or(self.stored_fds.len().max(min_fd));
         let success = self.fd_into_specific_raw_integer(fd, ret);
         assert!(success);
         ret
