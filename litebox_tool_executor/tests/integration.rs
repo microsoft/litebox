@@ -153,3 +153,99 @@ fn test_process_level_echo() {
 
     std::fs::remove_file(&tar_path).ok();
 }
+
+/// Helper: write tar to a temp file, returning the path.
+fn write_temp_tar() -> std::path::PathBuf {
+    let tar_data = test_rootfs_tar();
+    let tar_path = std::env::temp_dir().join("litebox_test_rootfs.tar");
+    std::fs::write(&tar_path, &tar_data).unwrap();
+    tar_path
+}
+
+/// Helper: get the busybox rootfs tar if it exists on disk.
+/// Returns None if the rootfs hasn't been built yet (WSL2 prerequisite).
+fn busybox_tar_path() -> Option<std::path::PathBuf> {
+    let path = std::path::PathBuf::from(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../target/busybox-minimal.tar"
+    ));
+    if path.exists() { Some(path) } else { None }
+}
+
+/// Helper: run a command through the executor in direct mode, return stdout.
+fn run_direct(tar_path: &std::path::Path, args: &[&str]) -> (String, i32) {
+    let exe = executor_exe();
+    let mut cmd_args = vec!["--rootfs", tar_path.to_str().unwrap()];
+    cmd_args.extend(args);
+    let output = std::process::Command::new(&exe)
+        .args(&cmd_args)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .expect("Failed to spawn executor");
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let code = output.status.code().unwrap_or(-1);
+    (stdout, code)
+}
+
+/// Direct mode with busybox: simple echo produces output.
+#[test]
+fn test_direct_echo() {
+    let exe = executor_exe();
+    if !exe.exists() {
+        return;
+    }
+    let Some(tar_path) = busybox_tar_path() else {
+        eprintln!("Skipping: busybox-minimal.tar not found (run prepare-rootfs.sh in WSL2)");
+        return;
+    };
+    let (stdout, _code) = run_direct(&tar_path, &["/bin/busybox", "sh", "-c", "echo hello"]);
+    assert!(
+        stdout.contains("hello"),
+        "Expected 'hello' in stdout, got: {stdout}"
+    );
+    assert!(
+        !stdout.contains("System information"),
+        "stdout should not contain debug output, got: {stdout}"
+    );
+}
+
+/// Direct mode with busybox: double-quoted strings pass through correctly.
+#[test]
+fn test_direct_quoted_echo() {
+    let exe = executor_exe();
+    if !exe.exists() {
+        return;
+    }
+    let Some(tar_path) = busybox_tar_path() else {
+        return;
+    };
+    let (stdout, _code) = run_direct(
+        &tar_path,
+        &["/bin/busybox", "sh", "-c", r#"echo "hello world""#],
+    );
+    assert!(
+        stdout.contains("hello world"),
+        "Expected 'hello world' in stdout, got: {stdout}"
+    );
+}
+
+/// Direct mode with busybox: multiple words without quotes.
+#[test]
+fn test_direct_echo_multiple_words() {
+    let exe = executor_exe();
+    if !exe.exists() {
+        return;
+    }
+    let Some(tar_path) = busybox_tar_path() else {
+        return;
+    };
+    let (stdout, _code) = run_direct(
+        &tar_path,
+        &["/bin/busybox", "sh", "-c", "echo one two three"],
+    );
+    assert!(
+        stdout.contains("one two three"),
+        "Expected 'one two three' in stdout, got: {stdout}"
+    );
+}

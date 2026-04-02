@@ -63,10 +63,25 @@ fn main() -> anyhow::Result<()> {
                 line.to_string(),
             ]);
 
-            let status = std::process::Command::new(&exe).args(&child_args).status();
-            match status {
-                Ok(s) if !s.success() => {
-                    eprintln!("[exit code: {}]", s.code().unwrap_or(-1));
+            // Capture the child's output and print it ourselves, rather than
+            // relying on inherited stdio (which doesn't work reliably when our
+            // own stdout is a pipe on Windows).
+            let output = std::process::Command::new(&exe)
+                .args(&child_args)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .output();
+            match output {
+                Ok(out) => {
+                    use std::io::Write as _;
+                    let _ = std::io::stdout().write_all(&out.stdout);
+                    let _ = std::io::stdout().flush();
+                    // Write child stderr to our stderr for debugging.
+                    let _ = std::io::stderr().write_all(&out.stderr);
+                    if !out.status.success() {
+                        eprintln!("[exit code: {}]", out.status.code().unwrap_or(-1));
+                    }
                 }
                 Err(e) => {
                     eprintln!("[error: {e}]");
@@ -92,7 +107,11 @@ fn main() -> anyhow::Result<()> {
             timeout_secs: None,
         };
         let result = litebox_tool_executor::execute(tar_data, &request, policy)?;
-        std::process::exit(result.exit_code);
+        // Return normally so all destructors run and stdio buffers flush.
+        // process::exit() skips this and can lose piped output on Windows.
+        if result.exit_code != 0 {
+            anyhow::bail!("guest exited with code {}", result.exit_code);
+        }
     }
     Ok(())
 }
