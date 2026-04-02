@@ -5011,22 +5011,28 @@ impl litebox::platform::StdioProvider for WindowsUserland {
         use std::io::Write as _;
         match stream {
             litebox::platform::StdioOutStream::Stdout => {
-                std::io::stdout().write(buf).map_err(|err| {
+                let result = std::io::stdout().write(buf).map_err(|err| {
                     if err.kind() == std::io::ErrorKind::BrokenPipe {
                         litebox::platform::StdioWriteError::Closed
                     } else {
                         panic!("unhandled error {err}")
                     }
-                })
+                });
+                // Flush immediately so prompts (which lack a trailing newline)
+                // appear without waiting for the next write.
+                let _ = std::io::stdout().flush();
+                result
             }
             litebox::platform::StdioOutStream::Stderr => {
-                std::io::stderr().write(buf).map_err(|err| {
+                let result = std::io::stderr().write(buf).map_err(|err| {
                     if err.kind() == std::io::ErrorKind::BrokenPipe {
                         litebox::platform::StdioWriteError::Closed
                     } else {
                         panic!("unhandled error {err}")
                     }
-                })
+                });
+                let _ = std::io::stderr().flush();
+                result
             }
         }
     }
