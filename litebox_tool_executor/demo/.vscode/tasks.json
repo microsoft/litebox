@@ -28,6 +28,9 @@
                 "Get-Content -Path 'C:\\src\\litebox\\target\\litebox-audit.jsonl' -Wait -Tail 0 | & 'C:\\src\\litebox\\litebox_tool_executor\\scripts\\View-AuditLog.ps1'"
             ],
             "problemMatcher": [],
+            "runOptions": {
+                "runOn": "folderOpen"
+            },
             "presentation": {
                 "reveal": "always",
                 "panel": "dedicated",
