@@ -1,0 +1,11 @@
+{
+    "terminal.integrated.profiles.windows": {
+        "LiteBox Sandbox": {
+            "path": "C:\\src\\litebox\\litebox_tool_executor\\scripts\\litebox-shell.cmd",
+            "env": {
+                "LITEBOX_ROOTFS": "C:\\src\\litebox\\target\\busybox-minimal.tar"
+            },
+            "icon": "shield"
+        }
+    }
+}
