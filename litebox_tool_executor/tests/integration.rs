@@ -144,6 +144,11 @@ fn test_process_level_echo() {
         stdout.contains("hello world."),
         "Expected 'hello world.' in stdout, got: {stdout}"
     );
+    // Verify stdout is clean — no debug "System information" banners.
+    assert!(
+        !stdout.contains("System information"),
+        "stdout should not contain platform debug output, got: {stdout}"
+    );
     assert_eq!(output.status.code(), Some(0), "Expected exit code 0");
 
     std::fs::remove_file(&tar_path).ok();
