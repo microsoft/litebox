@@ -23,6 +23,7 @@ members = [
     "litebox_util_log",
     "litebox_util_log_macros",
     "litebox_broker",
+    "litebox_tool_executor",
     # The CI tests are not meant to be released (thus are not prefixed with
     # `litebox_`), but exist purely to better manage development on LiteBox.
     "dev_tests",
