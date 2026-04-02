@@ -9,10 +9,8 @@
 #   LITEBOX_POLICY   - Path to a JSON policy file (optional)
 #   LITEBOX_AUDIT    - Path to write audit log    (optional)
 
-$ErrorActionPreference = 'Stop'
-
 if (-not $env:LITEBOX_ROOTFS) {
-    Write-Error "LITEBOX_ROOTFS environment variable must point to a rootfs .tar file."
+    Write-Host "ERROR: LITEBOX_ROOTFS environment variable must point to a rootfs .tar file."
     exit 1
 }
 
@@ -40,8 +38,19 @@ if ($env:LITEBOX_POLICY) {
 
 function Invoke-Sandbox {
     param([string]$Command)
-    # Run the command via busybox sh -c, redirecting stderr to audit log.
-    & $Executor @BaseArgs /bin/busybox sh -c $Command 2>> $env:LITEBOX_AUDIT
+    # Run the command via busybox sh -c, appending stderr to audit log.
+    # The 2>> redirect in PowerShell captures the error stream; we convert
+    # native stderr to the error stream and append to the log file.
+    $output = & $Executor @BaseArgs /bin/busybox sh -c $Command 2>&1
+    foreach ($line in $output) {
+        if ($line -is [System.Management.Automation.ErrorRecord]) {
+            # Stderr line — append to audit log
+            Add-Content -Path $env:LITEBOX_AUDIT -Value $line.ToString()
+        } else {
+            # Stdout line — display to user
+            Write-Host $line
+        }
+    }
 }
 
 # One-shot mode: if arguments were passed, run them and exit.
