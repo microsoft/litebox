@@ -306,27 +306,38 @@ The sandbox (layer 3) is necessary but not sufficient.
 
 ### Architecture
 
+The sandbox operates at the **terminal command** level within VS Code:
+
 ```
 VS Code (Copilot Agent Mode)
   │
-  │  Types command into terminal
-  ▼
-litebox-shell.cmd (REPL wrapper)
+  ├── File read/write ──► VS Code extension host ──► Host filesystem
+  │                        (NOT sandboxed)
   │
-  │  Invokes litebox_tool_executor per command
-  ▼
-litebox_tool_executor (Rust, Windows native)
-  │
-  ├── Loads rootfs .tar (syscall-rewritten busybox)
-  ├── Sets up LiteBox platform + shim + layered filesystem
-  ├── Installs sandbox policy (if specified)
-  ├── Disables Windows console echo
-  ├── Runs guest program via run_thread()
-  ├── Audit events → stderr → .audit.jsonl file
-  └── Guest stdout/stderr → host stdio
+  └── Terminal command ──► LiteBox Sandbox (sandboxed)
+                            │
+                            ▼
+                          litebox_tool_executor --interactive (REPL)
+                            │
+                            │  For each command typed:
+                            │  spawns child process
+                            ▼
+                          litebox_tool_executor --rootfs <tar> /bin/busybox sh -c "<command>"
+                            │
+                            ├── Loads rootfs .tar (syscall-rewritten busybox)
+                            ├── Sets up LiteBox platform + shim + layered filesystem
+                            ├── Installs sandbox policy (if specified)
+                            ├── Runs guest program via run_thread()
+                            ├── Audit events → stderr (discarded in REPL mode)
+                            └── Guest stdout → parent REPL → terminal display
 ```
 
-Each command gets a fresh LiteBox invocation (avoids the need for `fork()`, which isn't implemented on the Windows platform). The rootfs is a ~4MB tar containing a syscall-rewritten busybox binary + `litebox_rtld_audit.so`.
+**Key design decision**: Each command spawns a fresh child process (and thus a fresh LiteBox instance). This is because:
+1. LiteBox's platform is a singleton — can only be initialized once per process
+2. `fork()` is not implemented on the Windows platform
+3. A fresh sandbox per command provides stronger isolation (no state leaks between commands)
+
+The tradeoff is that commands don't share state — `cd /tmp` followed by `ls` won't list `/tmp`.
 
 ### Phase 1: Audit Logging
 
@@ -409,33 +420,72 @@ Example policy (`deny-network.json`):
 
 ## Current Status & Limitations
 
-**What works:**
-- Busybox commands run through LiteBox on Windows with full syscall audit trail
-- Policy enforcement blocks filesystem/network/exec access per declarative rules
-- VS Code terminal integration with REPL-mode wrapper
-- Interactive shell with proper prompt display
-- Process-level integration tests
+### What the Sandbox Covers
 
-**Limitations:**
+The current implementation sandboxes **terminal command execution only**. When a coding agent (e.g., VS Code Copilot in agent mode) opens a terminal and runs a command, that command runs inside LiteBox with:
+
+- Every Linux syscall mediated by Rust code (no Linux kernel)
+- Policy enforcement on filesystem access, network, and exec
+- A structured audit trail of all syscall activity
+
+### What the Sandbox Does NOT Cover
+
+**VS Code Copilot agent mode has two ways to interact with a workspace:**
+
+1. **VS Code APIs** (file read/write, search, symbol lookup, etc.) — these execute on the host via the VS Code extension host. **They bypass the sandbox entirely.** When the agent "reads a file" or "lists a directory," it uses VS Code's native filesystem API, not a terminal command.
+
+2. **Terminal commands** — these go through the default terminal profile, which we set to the LiteBox Sandbox. Only this path is sandboxed.
+
+In practice, the agent uses VS Code APIs for most file operations and only uses the terminal for running builds, tests, scripts, and tools. This means:
+
+| Agent Action | Path | Sandboxed? |
+|---|---|---|
+| Read file contents | VS Code API | **No** |
+| Write/edit files | VS Code API | **No** |
+| Search workspace | VS Code API | **No** |
+| List directory | VS Code API | **No** |
+| Run `make build` | Terminal | **Yes** |
+| Run `python test.py` | Terminal | **Yes** |
+| Run `curl https://...` | Terminal | **Yes** |
+| Execute shell commands | Terminal | **Yes** |
+
+### What Would Be Needed for Complete Sandboxing
+
+To sandbox **all** agent activity (not just terminal commands), you would need one of:
+
+1. **VS Code Remote connection** — run the VS Code Server inside the sandbox (e.g., a dev container backed by LiteBox or gVisor). All extension host operations would execute inside the sandbox, including file reads and writes. This is the most complete approach but requires implementing the VS Code Server lifecycle.
+
+2. **MCP tool server** — expose every operation as an MCP tool call routed through LiteBox. The agent would call `read_file`, `write_file`, `run_command` etc. as tool invocations, each going through the sandbox's policy layer. This works for agents that support MCP but requires the agent to use tools instead of native APIs.
+
+3. **Custom VS Code extension** — intercept filesystem operations in the extension host and route them through a sandbox proxy. This is fragile and not how VS Code is designed to work.
+
+4. **Restrict agent to terminal-only mode** — configure the agent to never use VS Code APIs directly and always go through the terminal. Not all agents support this, and it's significantly slower.
+
+The current terminal-based approach is a pragmatic middle ground: it sandboxes the most dangerous attack vector (arbitrary code execution via terminal commands) while leaving file reads unsandboxed (lower risk — the agent can only see what's in the workspace).
+
+### Technical Limitations
+
 - **No `fork()`**: `clone()` only supports threads (`CLONE_VM | CLONE_THREAD`), not new processes. The REPL wrapper works around this by spawning a fresh LiteBox per command, but this means no state persistence between commands, no piping (`|`), no subshells.
 - **Limited rootfs**: Only busybox (no Python, no git, no compilers). The packager can create richer rootfs images but the ~512MB allocator limit constrains size.
 - **No dynamic terminal size**: TIOCGWINSZ returns hardcoded 80x24 instead of querying the real terminal dimensions.
 - **Single-threaded guest**: While `clone` with `CLONE_THREAD` works, many real-world programs need multi-process support.
 - **No `/dev/tty`**: busybox shell warns "can't access tty; job control turned off".
+- **Each REPL command is a fresh process**: The `--interactive` mode spawns a child `litebox_tool_executor` process per command. This means environment variables, working directory changes (`cd`), and file modifications don't persist between commands.
 
 ## Future Work
 
 | Item | Description | Priority |
 |---|---|---|
-| **`fork()` / `clone` without `CLONE_VM`** | Enable multi-process guest programs — the single biggest compatibility gap | High |
+| **VS Code Remote integration** | Run VS Code Server inside LiteBox so all agent operations (file reads, writes, searches) are sandboxed, not just terminal commands. This is the path to complete agent sandboxing. | High |
+| **MCP tool server** | Expose the executor as an MCP-compatible tool server where every operation (`read_file`, `write_file`, `run_command`) is a sandboxed tool call. Works for MCP-enabled agents without requiring VS Code Remote. | High |
+| **`fork()` / `clone` without `CLONE_VM`** | Enable multi-process guest programs — the single biggest compatibility gap for running real-world tools (Python, git, etc.) | High |
 | **Richer rootfs** | Python, git, common dev tools — requires solving the allocator size limit | High |
 | **Output sanitization** | Filter sensitive data (secrets, credentials) from sandbox output before returning to LLM | Medium |
 | **Timeout enforcement** | Kill guest after configurable wall-clock time | Medium |
 | **File injection/extraction** | Return modified files from sandbox, diff against originals | Medium |
-| **Dynamic terminal size** | Query actual Windows console dimensions for TIOCGWINSZ | Low |
-| **MCP tool server** | Expose the executor as an MCP-compatible tool server for direct LLM integration | Medium |
-| **Ephemeral instance pool** | Pre-warm LiteBox instances for low-latency per-command execution | Low |
 | **Network egress filtering** | Allowlist-based outbound connectivity via `smoltcp` network stack | Medium |
+| **Dynamic terminal size** | Query actual Windows console dimensions for TIOCGWINSZ | Low |
+| **Ephemeral instance pool** | Pre-warm LiteBox instances for low-latency per-command execution | Low |
 | **`/dev/tty` emulation** | Proper terminal device for job control support | Low |
 
 ---
