@@ -386,6 +386,24 @@ Feature-gated (`policy`) sandbox policy module in `litebox_shim_linux`:
 - 8 unit tests covering all policy paths
 - JSON policy files loaded via `--policy` CLI flag
 
+**Known policy enforcement gaps:**
+
+The current implementation only checks policies at specific syscall entry points. Several syscalls that access the filesystem or reveal information about it are **not** checked against the policy:
+
+| Syscall | Checked? | Impact |
+|---|---|---|
+| `openat` | **Yes** | Blocks file reads/writes |
+| `unlinkat` | **Yes** | Blocks file deletion |
+| `execve` | **Yes** | Blocks program execution |
+| `connect` | **Yes** | Blocks network connections |
+| `stat` / `lstat` / `newfstatat` | **No** | Can probe whether denied files exist, see sizes/permissions |
+| `readlink` / `readlinkat` | **No** | Can read symlink targets of denied paths |
+| `mkdir` | **No** | Can create directories in denied paths |
+| `access` | **No** | Can check permissions of denied paths |
+| `getdents` | **No** | Can list directory contents of denied paths (if parent is openable) |
+
+This means a command like `ls /lib/litebox_rtld_audit.so` succeeds (uses `stat`) even when `/lib/**` is in the deny list, while `cat /lib/litebox_rtld_audit.so` correctly fails (uses `openat`). A complete implementation would enforce the deny list at `stat`, `readlink`, `access`, and `mkdir` syscalls as well.
+
 Example policy (`deny-network.json`):
 ```json
 {
