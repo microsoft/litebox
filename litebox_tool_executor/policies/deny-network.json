@@ -1,0 +1,14 @@
+{
+    "filesystem": {
+        "allow_read": [],
+        "allow_write": ["/tmp/**", "/workspace/**"],
+        "deny": ["**/.ssh/**", "**/.git/config", "**/id_rsa*"]
+    },
+    "network": {
+        "deny_all": true,
+        "allow_connect": []
+    },
+    "process": {
+        "allow_exec": ["/bin/*", "/usr/bin/*"]
+    }
+}
