@@ -77,8 +77,8 @@ fn main() -> anyhow::Result<()> {
                     use std::io::Write as _;
                     let _ = std::io::stdout().write_all(&out.stdout);
                     let _ = std::io::stdout().flush();
-                    // Write child stderr to our stderr for debugging.
-                    let _ = std::io::stderr().write_all(&out.stderr);
+                    // Child stderr contains audit log + debug output — discard
+                    // it in interactive mode to keep the terminal clean.
                     if !out.status.success() {
                         eprintln!("[exit code: {}]", out.status.code().unwrap_or(-1));
                     }
