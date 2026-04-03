@@ -686,9 +686,9 @@ impl<const ALIGN: usize> ShmRefMap<ALIGN> {
         if page_offset >= ALIGN as u64 || aligned_size == 0 {
             return Err(OpteeSmcReturnCode::EBadAddr);
         }
-        let num_pages = usize::try_from(aligned_size).unwrap() / ALIGN;
+        let num_pages = TruncateExt::<usize>::truncate(aligned_size) / ALIGN;
         let mut pages = Vec::with_capacity(num_pages);
-        let mut cur_addr = usize::try_from(shm_ref_pages_data_phys_addr).unwrap();
+        let mut cur_addr: usize = shm_ref_pages_data_phys_addr.truncate();
         loop {
             let mut cur_ptr = NormalWorldConstPtr::<ShmRefPagesData, ALIGN>::with_usize(cur_addr)
                 .map_err(|_| OpteeSmcReturnCode::EBadAddr)?;
@@ -699,7 +699,7 @@ impl<const ALIGN: usize> ShmRefMap<ALIGN> {
                     break;
                 } else {
                     pages.push(
-                        PhysPageAddr::new(usize::try_from(*page).unwrap())
+                        PhysPageAddr::new((*page).truncate())
                             .ok_or(OpteeSmcReturnCode::EBadAddr)?,
                     );
                 }
@@ -707,16 +707,13 @@ impl<const ALIGN: usize> ShmRefMap<ALIGN> {
             if pages_data.next_page_data == 0 || pages.len() == num_pages {
                 break;
             } else {
-                cur_addr = usize::try_from(pages_data.next_page_data).unwrap();
+                cur_addr = pages_data.next_page_data.truncate();
             }
         }
 
         self.insert(
             shm_ref,
-            ShmInfo::new(
-                pages.into_boxed_slice(),
-                usize::try_from(page_offset).unwrap(),
-            )?,
+            ShmInfo::new(pages.into_boxed_slice(), page_offset.truncate())?,
         )?;
         Ok(())
     }

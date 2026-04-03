@@ -181,11 +181,7 @@ impl TaStack {
                     }
                     self.push_bytes(bytes)?;
                     self.params
-                        .set_values(
-                            self.num_params,
-                            u64::try_from(self.get_cur_stack_top()).unwrap(),
-                            u64::try_from(len).unwrap(),
-                        )
+                        .set_values(self.num_params, self.get_cur_stack_top() as u64, len as u64)
                         .ok()?;
                 } else {
                     return None;
@@ -194,11 +190,7 @@ impl TaStack {
             TeeParamType::MemrefOutput => {
                 self.pos = self.pos.checked_sub(len)?;
                 self.params
-                    .set_values(
-                        self.num_params,
-                        u64::try_from(self.get_cur_stack_top()).unwrap(),
-                        u64::try_from(len).unwrap(),
-                    )
+                    .set_values(self.num_params, self.get_cur_stack_top() as u64, len as u64)
                     .ok()?;
             }
             _ => {

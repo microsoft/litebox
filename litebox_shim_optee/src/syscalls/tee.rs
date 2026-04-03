@@ -7,6 +7,7 @@ use litebox::mm::linux::{NonZeroAddress, NonZeroPageSize, PAGE_SIZE};
 use litebox::path::Arg;
 use litebox::platform::RawMutPointer;
 use litebox::platform::{RawConstPointer, page_mgmt::MemoryRegionPermissions};
+use litebox::utils::TruncateExt;
 use litebox_common_optee::{
     TeeIdentity, TeeMemoryAccessRights, TeeOrigin, TeePropSet, TeeResult, TeeUuid, UserTaPropType,
     UteeParams,
@@ -89,10 +90,7 @@ impl Task {
                 let identity = self.client_identity;
                 prop_buf.copy_from_slice(identity.as_bytes());
                 prop_len
-                    .write_at_offset(
-                        0,
-                        u32::try_from(core::mem::size_of::<TeeIdentity>()).unwrap(),
-                    )
+                    .write_at_offset(0, core::mem::size_of::<TeeIdentity>().truncate())
                     .ok_or(TeeResult::AccessDenied)?;
                 prop_type
                     .write_at_offset(0, UserTaPropType::Identity as u32)
@@ -109,7 +107,7 @@ impl Task {
                 let ta_uuid = self.ta_app_id;
                 prop_buf.copy_from_slice(ta_uuid.as_bytes());
                 prop_len
-                    .write_at_offset(0, u32::try_from(core::mem::size_of::<TeeUuid>()).unwrap())
+                    .write_at_offset(0, core::mem::size_of::<TeeUuid>().truncate())
                     .ok_or(TeeResult::AccessDenied)?;
                 prop_type
                     .write_at_offset(0, UserTaPropType::Uuid as u32)

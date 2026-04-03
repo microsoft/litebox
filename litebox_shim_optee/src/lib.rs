@@ -389,9 +389,9 @@ impl Task {
                 prop_type,
             } => {
                 if let Some(buf_length) = blen.read_at_offset(0)
-                    && usize::try_from(buf_length).unwrap() <= MAX_KERNEL_BUF_SIZE
+                    && (buf_length as usize) <= MAX_KERNEL_BUF_SIZE
                 {
-                    let mut prop_buf = vec![0u8; usize::try_from(buf_length).unwrap()];
+                    let mut prop_buf = vec![0u8; buf_length as usize];
                     if name.as_usize() != 0 || name_len.as_usize() != 0 {
                         if cfg!(debug_assertions) {
                             todo!("return the name of a given property index");
@@ -751,10 +751,10 @@ impl Task {
             .ok_or(ElfLoaderError::InvalidStackAddr)?;
 
         Ok(ThreadInitState::Ta {
-            cmd_id: usize::try_from(cmd_id.unwrap_or(0)).unwrap(),
+            cmd_id: cmd_id.unwrap_or(0) as usize,
             params_address: ta_stack.get_params_address(),
-            session_id: usize::try_from(session_id.unwrap_or(self.session_id)).unwrap(),
-            func_id: usize::try_from(func_id).unwrap(),
+            session_id: session_id.unwrap_or(self.session_id) as usize,
+            func_id: func_id as usize,
             entry_point: self.get_ta_entry_point(),
             stack_top: ta_stack.get_cur_stack_top(),
         })
@@ -823,7 +823,7 @@ impl Task {
         if let Some(ldelf_arg_address) = ldelf_arg_address {
             let ldelf_arg_ptr = UserConstPtr::<LdelfArg>::from_usize(ldelf_arg_address);
             if let Some(ldef_arg) = ldelf_arg_ptr.read_at_offset(0) {
-                let entry_func = usize::try_from(ldef_arg.entry_func).unwrap();
+                let entry_func = ldef_arg.entry_func.truncate();
                 // If `ldelf` has been successfully executed, it loads the given TA and stores the TA's entry
                 // point into `ldelf_arg.entry_func`.
                 self.set_ta_entry_point(entry_func);
@@ -879,12 +879,12 @@ where
 {
     if let Some(src_slice) = src.to_owned_slice(src_len)
         && let Some(length) = dst_len.read_at_offset(0)
-        && usize::try_from(length).unwrap() <= MAX_KERNEL_BUF_SIZE
+        && TruncateExt::<usize>::truncate(length) <= MAX_KERNEL_BUF_SIZE
     {
-        let mut length = usize::try_from(length).unwrap();
+        let mut length: usize = length.truncate();
         let mut kernel_buf = vec![0u8; length];
         syscall_fn(task, state, &src_slice, &mut kernel_buf, &mut length).and_then(|()| {
-            let _ = dst_len.write_at_offset(0, u64::try_from(length).unwrap());
+            let _ = dst_len.write_at_offset(0, length as u64);
             dst.copy_from_slice(0, &kernel_buf[..length])
                 .ok_or(TeeResult::OutOfMemory)
         })
