@@ -468,6 +468,41 @@ Example policy (`deny-network.json`):
 | `94fef7d3` | **Terminal size 80x24 instead of 20x20** — TIOCGWINSZ ioctl was hardcoded to 20 columns, causing line wrapping mid-word |
 | `3adc98d2` | **Move debug banner to stderr** — "System information" printed to stdout on every `Platform::new()`, polluting guest output |
 
+### Phase 5: WSL2 Investigation
+
+**Goal**: Run the Linux runner inside WSL2 to unlock `fork()` via the seccomp backend's kernel passthrough, gaining piping (`|`), subshells, and multi-process tools.
+
+**What was accomplished**:
+- Added `--policy` and `--audit-log` CLI flags to `litebox_runner_linux_userland` (feature-gated behind `audit_log` and `policy`)
+- Demo workspace gained three terminal profiles: "LiteBox Sandbox (Windows)", "LiteBox Sandbox (WSL2)", and "PowerShell"
+- Built and verified the Linux runner in WSL2 with the rewriter backend — single busybox commands work with audit logging and policy enforcement
+
+**Seccomp segfault discovery and fix** (`f419f420`):
+
+The seccomp backend crashed with a segfault on WSL2. Investigation with GDB revealed:
+- `gs_base = 0` at the crash point (`syscall_callback`)
+- The SIGSYS handler redirected RIP to `syscall_callback`, which accesses thread-local storage via `gs:@tpoff`
+- `gs_base` is only set to the host TLS base by `wrgsbase` inside `run_thread_arch`
+- The seccomp BPF filter was installed during `init_sys_intercept()`, before `run_thread_arch` ran
+- A `gettid` syscall during host initialization was trapped by seccomp, triggering the SIGSYS handler before `gs_base` was valid
+
+This was initially suspected to be a WSL2 kernel bug (gs_base not preserved during signal delivery), but further analysis proved it was a **LiteBox bug**: the seccomp filter was installed too early. The fix:
+- **Two-phase initialization**: register the SIGSYS handler early (Phase 1), defer the BPF filter installation to `init_handler` inside `run_thread_arch` after `wrgsbase` (Phase 2), using a `PENDING_SECCOMP_ACTIVATION` atomic flag
+- **Defense-in-depth**: the SIGSYS handler checks `rdgsbase`; if `gs_base == 0`, it aborts with a diagnostic message instead of crashing silently
+
+**Why fork() still doesn't work**:
+
+After fixing the segfault, the seccomp backend no longer crashes but **hangs** with busybox. The reason: seccomp traps ALL syscalls (including musl/busybox runtime initialization), and the shim returns `ENOSYS` for syscalls it doesn't implement. Some of these are essential for the runtime to function. The shim's syscall coverage was designed for the rewriter backend's narrower scope and doesn't cover the full syscall surface that seccomp exposes.
+
+The rewriter backend works on WSL2 but has the same `fork()` limitation as Windows — the shim rejects `clone()` without `CLONE_VM` because it hasn't implemented process-level forking (address space duplication with COW). This is an implementation limitation, not a security decision.
+
+**The three paths to fork() remain**:
+1. Expand the seccomp allow-list to pass `clone`/`fork` through to the kernel, plus fix the shim hang for other runtime syscalls
+2. Implement `clone` without `CLONE_VM` in the shim itself (works with both backends, on all platforms)
+3. A hybrid: let `clone`/`fork` pass to the kernel while trapping everything else — requires careful thought about what the child process inherits (seccomp filters, signal handlers, TLS state)
+
+**Net result**: WSL2 provides Hyper-V hardware isolation and the plumbing is ready for when fork support lands, but the near-term demo is equivalent to the Windows executor.
+
 ## Current Status & Limitations
 
 ### What the Sandbox Covers
@@ -528,8 +563,9 @@ The current terminal-based approach is a pragmatic middle ground: it sandboxes t
 |---|---|---|
 | **VS Code Remote integration** | Run VS Code Server inside LiteBox so all agent operations (file reads, writes, searches) are sandboxed, not just terminal commands. This is the path to complete agent sandboxing. | High |
 | **MCP tool server** | Expose the executor as an MCP-compatible tool server where every operation (`read_file`, `write_file`, `run_command`) is a sandboxed tool call. Works for MCP-enabled agents without requiring VS Code Remote. | High |
-| **`fork()` / `clone` without `CLONE_VM`** | Enable multi-process guest programs — the single biggest compatibility gap for running real-world tools (Python, git, etc.) | High |
+| **`fork()` / `clone` without `CLONE_VM`** | Enable multi-process guest programs — the single biggest compatibility gap. Three paths: (1) seccomp allow-list passthrough to kernel (requires fixing shim hang for other syscalls), (2) implement process forking in the shim itself (works on all platforms), (3) hybrid kernel passthrough for clone only. See Phase 5. | High |
 | **Richer rootfs** | Python, git, common dev tools — requires solving the allocator size limit | High |
+| **Seccomp shim hang** | The seccomp backend hangs with busybox because the shim returns ENOSYS for runtime init syscalls. Expanding syscall coverage or adding a kernel-passthrough mode for init-only syscalls would unblock seccomp+busybox and the fork path. | High |
 | **Output sanitization** | Filter sensitive data (secrets, credentials) from sandbox output before returning to LLM | Medium |
 | **Timeout enforcement** | Kill guest after configurable wall-clock time | Medium |
 | **File injection/extraction** | Return modified files from sandbox, diff against originals | Medium |
@@ -540,4 +576,4 @@ The current terminal-based approach is a pragmatic middle ground: it sandboxes t
 
 ---
 
-*Branch: `feature/llm-tool-sandbox` — 13 commits on top of `main`*
+*Branch: `feature/llm-tool-sandbox`*
