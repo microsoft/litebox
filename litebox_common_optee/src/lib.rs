@@ -243,7 +243,7 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
             TeeSyscallNr::Unknown => {
                 return Err(Errno::ENOSYS);
             }
-            _ => todo!(),
+            _ => return Err(Errno::ENOSYS),
         };
 
         Ok(dispatcher)
@@ -1180,7 +1180,7 @@ impl<Platform: litebox::platform::RawPointerProvider> LdelfSyscallRequest<Platfo
                 buf: Platform::RawMutPointer::from_usize(ctx.syscall_arg(0)),
                 num_bytes: ctx.syscall_arg(1),
             },
-            _ => todo!("implement ldelf syscall number: {}", sysnr),
+            _ => return Err(Errno::ENOSYS),
         };
 
         Ok(dispatcher)

@@ -136,7 +136,12 @@ impl Task {
                     Err(TeeResult::BadParameters)
                 }
             }
-            _ => todo!("support other system PTA commands {cmd_id}"),
+            _ => {
+                if cfg!(debug_assertions) {
+                    todo!("support other system PTA commands {cmd_id}");
+                }
+                Err(TeeResult::NotSupported)
+            }
         }
     }
 }

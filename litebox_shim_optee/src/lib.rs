@@ -393,22 +393,26 @@ impl Task {
                 {
                     let mut prop_buf = vec![0u8; usize::try_from(buf_length).unwrap()];
                     if name.as_usize() != 0 || name_len.as_usize() != 0 {
-                        todo!("return the name of a given property index")
+                        if cfg!(debug_assertions) {
+                            todo!("return the name of a given property index");
+                        }
+                        Err(TeeResult::NotSupported)
+                    } else {
+                        self.sys_get_property(
+                            prop_set,
+                            index,
+                            None,
+                            None,
+                            &mut prop_buf,
+                            blen,
+                            prop_type,
+                        )
+                        .and_then(|()| {
+                            buf.copy_from_slice(0, &prop_buf)
+                                .ok_or(TeeResult::ShortBuffer)?;
+                            Ok(())
+                        })
                     }
-                    self.sys_get_property(
-                        prop_set,
-                        index,
-                        None,
-                        None,
-                        &mut prop_buf,
-                        blen,
-                        prop_type,
-                    )
-                    .and_then(|()| {
-                        buf.copy_from_slice(0, &prop_buf)
-                            .ok_or(TeeResult::ShortBuffer)?;
-                        Ok(())
-                    })
                 } else {
                     Err(TeeResult::BadParameters)
                 }
@@ -534,7 +538,12 @@ impl Task {
                         })
                 }
             }
-            _ => todo!(),
+            _ => {
+                if cfg!(debug_assertions) {
+                    todo!();
+                }
+                Err(TeeResult::NotSupported)
+            }
         };
 
         ctx.rax = match res {
@@ -686,7 +695,7 @@ impl Task {
                         })
                 }
             }
-            _ => todo!(),
+            _ => Err(TeeResult::NotSupported),
         };
 
         ctx.rax = match res {
@@ -974,33 +983,35 @@ impl TeeObjMap {
     ) -> Result<(), TeeResult> {
         let mut inner = self.inner.lock();
         if let Some(tee_obj) = inner.get_mut(&handle) {
-            tee_obj.initialize();
-
             if user_attrs.is_empty() {
+                tee_obj.initialize();
                 return Ok(());
             }
 
             // TODO: support multiple attributes (e.g., two-key crypto algorithms like AES-XTS)
-            match user_attrs[0].attribute_id {
-                TeeAttributeType::SecretValue => {
-                    let key_addr: usize = user_attrs[0].a.truncate();
-                    let key_len: usize = user_attrs[0].b.truncate();
-                    // TODO: revisit buffer size limits based on OP-TEE spec and deployment constraints
-                    if key_len > MAX_KERNEL_BUF_SIZE {
-                        return Err(TeeResult::BadParameters);
-                    }
-                    let key_ptr = UserConstPtr::<u8>::from_usize(key_addr);
-                    let Some(key_box) = key_ptr.to_owned_slice(key_len) else {
-                        return Err(TeeResult::BadParameters);
-                    };
-                    tee_obj.set_key(&key_box);
+            if user_attrs[0].attribute_id == TeeAttributeType::SecretValue {
+                let key_addr: usize = user_attrs[0].a.truncate();
+                let key_len: usize = user_attrs[0].b.truncate();
+                // TODO: revisit buffer size limits based on OP-TEE spec and deployment constraints
+                if key_len > MAX_KERNEL_BUF_SIZE {
+                    return Err(TeeResult::BadParameters);
                 }
-                _ => todo!(
-                    "handle attribute ID: {}",
-                    user_attrs[0].attribute_id.value()
-                ),
+                let key_ptr = UserConstPtr::<u8>::from_usize(key_addr);
+                let Some(key_box) = key_ptr.to_owned_slice(key_len) else {
+                    return Err(TeeResult::BadParameters);
+                };
+                tee_obj.set_key(&key_box);
+            } else {
+                if cfg!(debug_assertions) {
+                    todo!(
+                        "handle attribute ID: {}",
+                        user_attrs[0].attribute_id.value()
+                    );
+                }
+                return Err(TeeResult::NotSupported);
             }
 
+            tee_obj.initialize();
             Ok(())
         } else {
             Err(TeeResult::ItemNotFound)

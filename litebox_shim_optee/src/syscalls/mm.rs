@@ -60,7 +60,10 @@ impl Task {
                 | MapFlags::MAP_HUGE_2MB
                 | MapFlags::MAP_HUGE_1GB,
         ) {
-            todo!("Unsupported flags {:?}", flags);
+            if cfg!(debug_assertions) {
+                todo!("Unsupported flags {:?}", flags);
+            }
+            return Err(Errno::EINVAL);
         }
 
         let aligned_len = align_up(len, PAGE_SIZE);
@@ -72,12 +75,18 @@ impl Task {
         }
 
         let suggested_addr = if addr == 0 { None } else { Some(addr) };
-        if flags.contains(MapFlags::MAP_ANONYMOUS) {
+        let result = if flags.contains(MapFlags::MAP_ANONYMOUS) {
             self.do_mmap_anonymous(suggested_addr, aligned_len, prot, flags)
         } else {
-            panic!("we don't support file-backed mmap");
-        }
-        .map_err(Errno::from)
+            #[cfg(debug_assertions)]
+            {
+                panic!("we don't support file-backed mmap");
+            }
+
+            #[cfg(not(debug_assertions))]
+            return Err(Errno::EINVAL);
+        };
+        result.map_err(Errno::from)
     }
 
     /// Handle syscall `munmap`
