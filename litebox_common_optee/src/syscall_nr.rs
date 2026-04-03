@@ -125,7 +125,6 @@ pub enum TeeSyscallNr {
     StorageObjSeek = SYSCALL_STORAGE_OBJ_SEEK,
     ObjGenerateKey = SYSCALL_OBJ_GENERATE_KEY,
     CacheOperation = SYSCALL_CACHE_OPERATION,
-    Unknown = 0xffff_ffff,
 }
 
 const LDELF_RETURN: u32 = 0;
@@ -157,5 +156,4 @@ pub enum LdelfSyscallNr {
     SetProt = LDELF_SET_PROT,
     Remap = LDELF_REMAP,
     GenRndNum = LDELF_GEN_RND_NUM,
-    Unknown = 0xffff_ffff,
 }
