@@ -34,6 +34,7 @@
   - [Bug Fixes Along the Way](#bug-fixes-along-the-way)
 - [Current Status & Limitations](#current-status--limitations)
 - [Future Work](#future-work)
+- [Related Work](#related-work)
 
 ---
 
@@ -631,6 +632,88 @@ The current terminal-based approach is a pragmatic middle ground: it sandboxes t
 | **Dynamic terminal size** | Query actual Windows console dimensions for TIOCGWINSZ | Low |
 | **Ephemeral instance pool** | Pre-warm LiteBox instances for low-latency per-command execution | Low |
 | **`/dev/tty` emulation** | Proper terminal device for job control support | Low |
+
+## Related Work
+
+The agent sandboxing space is rapidly evolving. This section surveys existing projects and how they compare to LiteBox's syscall-level approach.
+
+### NVIDIA OpenShell
+
+[OpenShell](https://github.com/NVIDIA/OpenShell) (Apache 2.0, Rust, ~4.4k stars) is the closest existing project to this work. It provides sandboxed execution environments for CLI coding agents (Claude Code, Codex, OpenCode, Copilot CLI).
+
+**Architecture**: Each sandbox is a Docker container managed by a K3s Kubernetes cluster running inside a single Docker container. A gateway coordinates sandbox lifecycle, and all outbound traffic is routed through an HTTP L7 proxy that enforces YAML-based policies.
+
+**Policy model**: Declarative YAML covering four domains — filesystem (locked at creation), network (hot-reloadable at runtime, enforced at HTTP method + path level), process (blocks privilege escalation), and inference (reroutes LLM API calls). Network policy is particularly mature, supporting fine-grained controls like "allow GET to `api.github.com` but block POST."
+
+**Credential management**: "Providers" inject API keys as environment variables at runtime. Credentials never touch the sandbox filesystem, preventing accidental exfiltration.
+
+| | NVIDIA OpenShell | LiteBox Sandbox |
+|---|---|---|
+| **Isolation layer** | Docker container + K3s | Library OS (no kernel) or Hyper-V VM |
+| **Syscall surface** | Full Linux kernel (~300 syscalls) | Only what the shim implements |
+| **Network policy** | HTTP L7 proxy (method + path level) | Syscall-level (`connect` allow/deny) |
+| **Filesystem policy** | Container-level path restrictions | Syscall-level (`openat` allow/deny per path) |
+| **Audit trail** | Proxy logs (network traffic) | Every syscall (structured JSON) |
+| **fork() support** | Yes (real Linux kernel) | No (shim limitation) |
+| **Agent compatibility** | Claude Code, Codex, OpenCode, Copilot | Busybox only (limited rootfs) |
+| **Deployment** | Docker + K3s (heavyweight) | Single binary (lightweight) |
+| **Maturity** | Alpha, 21 contributors, active development | Experimental prototype |
+
+OpenShell's L7 network proxy and credential management are significantly more mature than our syscall-level `connect` deny. LiteBox's syscall-level audit trail and memory-safe Rust shim provide a different (deeper) observation point that OpenShell doesn't have.
+
+### E2B (e2b.dev)
+
+[E2B](https://e2b.dev) provides **cloud-hosted Firecracker microVMs** as a service for running LLM agent code. Agent frameworks call E2B's API to create a sandbox, execute code, and retrieve results.
+
+- **Isolation**: Firecracker microVM (hardware-enforced, ~25 syscalls from VMM)
+- **Model**: Cloud service — code runs on E2B's infrastructure, not locally
+- **Integration**: SDK for Python/JS; widely adopted by agent frameworks
+- **Tradeoff**: Strong isolation, but code leaves your machine and you pay per execution
+
+### agent-safehouse
+
+[agent-safehouse](https://github.com/eugene1g/agent-safehouse) (~1.5k stars) uses **macOS `sandbox-exec` profiles** to restrict what CLI agents can access. Simple Shell scripts that wrap agent invocations with Apple's built-in sandbox.
+
+- **Isolation**: macOS sandbox profiles (kernel-enforced, declarative)
+- **Scope**: File access and network restrictions
+- **Limitation**: macOS only; `sandbox-exec` is deprecated by Apple
+
+### Rivet agent-os
+
+[agent-os](https://github.com/rivet-dev/agent-os) (~1.8k stars) uses **V8 isolates and WebAssembly** for lightweight agent sandboxing with ~6ms cold starts.
+
+- **Isolation**: V8 isolate + Wasm linear memory
+- **Model**: Agent code must be JavaScript/Wasm (can't run native binaries)
+- **Tradeoff**: Extremely lightweight and fast, but limited to Wasm-compatible workloads
+
+### Composio
+
+[Composio](https://github.com/ComposioHQ/composio) (~27.6k stars) is an agent tool framework with built-in sandboxed execution. Provides 1000+ tool integrations with authentication and a sandboxed "workbench" for code execution.
+
+- **Model**: MCP-compatible tool framework that wraps tool invocations in sandboxed containers
+- **Focus**: Tool integration and authentication rather than low-level isolation
+
+### vibe
+
+[vibe](https://github.com/lynaghk/vibe) (~843 stars, Rust) creates lightweight **Linux VMs on macOS** using Apple's Virtualization framework specifically for sandboxing LLM agents.
+
+- **Isolation**: Full VM (Apple Virtualization.framework)
+- **Focus**: Developer ergonomics — easy VM lifecycle for agent sandboxing on Mac
+- **Limitation**: macOS only
+
+### Landscape Summary
+
+| Project | Isolation Mechanism | Platform | Agent Compat | Unique Strength |
+|---|---|---|---|---|
+| **NVIDIA OpenShell** | Docker containers + L7 proxy | Linux/Mac | Full (CLI agents) | HTTP-level network policy, credential management |
+| **E2B** | Firecracker microVMs (cloud) | Any (cloud API) | Full (via SDK) | Strongest isolation, no local code execution |
+| **agent-safehouse** | macOS sandbox-exec | macOS only | Full (CLI agents) | Zero dependencies, simple |
+| **Rivet agent-os** | V8 isolates + Wasm | Any | Wasm only | 6ms cold starts, 32x cheaper |
+| **Composio** | Containers + MCP tools | Any | MCP agents | 1000+ tool integrations |
+| **vibe** | Apple Virtualization VMs | macOS only | Full (VM) | Lightweight Mac VMs |
+| **LiteBox** | Library OS (Rust) | Windows, Linux, bare-metal | Limited (no fork) | Syscall-level audit, memory-safe shim, smallest TCB |
+
+The industry is converging on **containers as the practical sandboxing layer** for agents. LiteBox's syscall-level approach is architecturally unique — no other agent sandbox provides per-syscall audit trails or memory-safe Rust reimplementation of the OS interface. The tradeoff is compatibility (no `fork()`) vs. depth of mediation.
 
 ---
 
