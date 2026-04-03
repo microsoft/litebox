@@ -1712,6 +1712,8 @@ dependencies = [
  "litebox_shim_linux",
  "litebox_syscall_rewriter",
  "memmap2",
+ "serde",
+ "serde_json",
  "sha2",
  "walkdir",
 ]
@@ -1860,6 +1862,7 @@ dependencies = [
  "litebox_syscall_rewriter",
  "serde",
  "serde_json",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
