@@ -142,7 +142,7 @@ impl litebox_common_linux::loader::MapMemory for ElfFileInMemory<'_> {
 
         self.task
             .sys_mprotect(UserMutPtr::from_usize(mapped_addr), len, prot.flags())
-            .expect("sys_mprotect failed");
+            .map_err(ElfLoaderError::from)?;
         Ok(())
     }
 
