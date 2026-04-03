@@ -211,6 +211,15 @@ pub struct CliArgs {
     /// ends.  Format: `write_fd:read_fd`.
     #[arg(long = "local-pipe", hide = true, requires = "fork_restore")]
     pub local_pipe: Vec<String>,
+    /// Path to a JSON policy file restricting guest filesystem, network, and exec operations.
+    #[cfg(feature = "policy")]
+    #[arg(long = "policy", value_name = "PATH", value_hint = clap::ValueHint::FilePath)]
+    pub policy: Option<PathBuf>,
+    /// Path to write the audit log (JSON lines). When set, audit events go to this file
+    /// instead of stderr.
+    #[cfg(feature = "audit_log")]
+    #[arg(long = "audit-log", value_name = "PATH", value_hint = clap::ValueHint::FilePath)]
+    pub audit_log: Option<PathBuf>,
 }
 
 /// Backends supported for intercepting syscalls
@@ -358,6 +367,24 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         unimplemented!(
             "this should (hopefully soon) have a nicer interface to support loading in files"
         )
+    }
+
+    // Install sandbox policy if specified.
+    #[cfg(feature = "policy")]
+    if let Some(ref policy_path) = cli_args.policy {
+        let policy = load_policy(policy_path)?;
+        litebox_shim_linux::policy::set_policy(policy);
+    }
+
+    // --program-from-tar loads pre-rewritten binaries that depend on litebox_rtld_audit.so,
+    // which is only injected by the rewriter backend.
+    if cli_args.program_from_tar
+        && !matches!(cli_args.interception_backend, InterceptionBackend::Rewriter)
+    {
+        anyhow::bail!(
+            "--program-from-tar requires --interception-backend=rewriter \
+             (the packaged binary is pre-rewritten and needs the audit library)"
+        );
     }
 
     // When loading from tar, the program path is a guest-internal path and must
@@ -2713,4 +2740,59 @@ mod tests {
         assert!(host_signal_should_raise(segv));
         assert!(!host_signal_should_raise(stop));
     }
+}
+
+/// Load a sandbox policy from a JSON file.
+#[cfg(feature = "policy")]
+fn load_policy(path: &std::path::Path) -> Result<litebox_shim_linux::policy::SandboxPolicy> {
+    #[derive(serde::Deserialize)]
+    struct PolicyFile {
+        #[serde(default)]
+        filesystem: FsPolicyFile,
+        #[serde(default)]
+        network: NetworkPolicyFile,
+        #[serde(default)]
+        process: ProcessPolicyFile,
+    }
+    #[derive(serde::Deserialize, Default)]
+    struct FsPolicyFile {
+        #[serde(default)]
+        allow_read: Vec<String>,
+        #[serde(default)]
+        allow_write: Vec<String>,
+        #[serde(default)]
+        deny: Vec<String>,
+    }
+    #[derive(serde::Deserialize, Default)]
+    struct NetworkPolicyFile {
+        #[serde(default)]
+        deny_all: bool,
+        #[serde(default)]
+        allow_connect: Vec<String>,
+    }
+    #[derive(serde::Deserialize, Default)]
+    struct ProcessPolicyFile {
+        #[serde(default)]
+        allow_exec: Vec<String>,
+    }
+
+    let data = std::fs::read_to_string(path)
+        .map_err(|e| anyhow!("Could not read policy file {}: {e}", path.display()))?;
+    let pf: PolicyFile = serde_json::from_str(&data)
+        .map_err(|e| anyhow!("Invalid policy JSON in {}: {e}", path.display()))?;
+
+    Ok(litebox_shim_linux::policy::SandboxPolicy {
+        filesystem: litebox_shim_linux::policy::FsPolicy {
+            allow_read: pf.filesystem.allow_read,
+            allow_write: pf.filesystem.allow_write,
+            deny: pf.filesystem.deny,
+        },
+        network: litebox_shim_linux::policy::NetworkPolicy {
+            deny_all: pf.network.deny_all,
+            allow_connect: pf.network.allow_connect,
+        },
+        process: litebox_shim_linux::policy::ProcessPolicy {
+            allow_exec: pf.process.allow_exec,
+        },
+    })
 }
