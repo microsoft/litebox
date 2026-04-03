@@ -35,6 +35,11 @@
 - [Current Status & Limitations](#current-status--limitations)
 - [Future Work](#future-work)
 - [Related Work](#related-work)
+  - [Commercial & Cloud Services](#commercial--cloud-services)
+  - [Academic](#academic)
+  - [Open Source Tools](#open-source-tools)
+  - [Landscape Summary](#landscape-summary)
+  - [Themes from the Landscape](#themes-from-the-landscape)
 
 ---
 
@@ -651,11 +656,66 @@ The current terminal-based approach is a pragmatic middle ground: it sandboxes t
 
 ## Related Work
 
-The agent sandboxing space is rapidly evolving. This section surveys existing projects and how they compare to LiteBox's syscall-level approach.
+The agent sandboxing space is rapidly evolving. This section surveys existing projects organized by category and compares them to LiteBox's syscall-level approach.
 
-### NVIDIA OpenShell
+### Commercial & Cloud Services
 
-[OpenShell](https://github.com/NVIDIA/OpenShell) (Apache 2.0, Rust, ~4.4k stars) is the closest existing project to this work. It provides sandboxed execution environments for CLI coding agents (Claude Code, Codex, OpenCode, Copilot CLI).
+#### E2B (e2b.dev)
+
+[E2B](https://e2b.dev) provides **cloud-hosted Firecracker microVMs** as a service for running LLM agent code. Agent frameworks call E2B's API to create a sandbox, execute code, and retrieve results.
+
+- **Isolation**: Firecracker microVM (hardware-enforced, ~25 syscalls from VMM)
+- **Model**: Cloud service — code runs on E2B's infrastructure, not locally
+- **Integration**: SDK for Python/JS; widely adopted by agent frameworks
+- **Tradeoff**: Strong isolation, but code leaves your machine and you pay per execution
+
+#### Composio
+
+[Composio](https://github.com/ComposioHQ/composio) (~27.6k stars) is an agent tool framework with built-in sandboxed execution. Provides 1000+ tool integrations with authentication and a sandboxed "workbench" for code execution.
+
+- **Model**: MCP-compatible tool framework that wraps tool invocations in sandboxed containers
+- **Focus**: Tool integration and authentication rather than low-level isolation
+
+#### Built-in Agent Sandboxes
+
+Major AI agent vendors have begun shipping their own sandboxing:
+
+- **Claude Code** — uses [bubblewrap](https://github.com/containers/bubblewrap) on Linux and Apple's Seatbelt on macOS. Configured via `.claude/settings.json` with `allowRead`/`denyRead`/`allowWrite` rules. However, by default it retries failed sandboxed commands *outside* the sandbox (configurable via `allowUnsandboxedCommands: false`). Community reports indicate bugs — seccomp filter not working ([#24238](https://github.com/anthropics/claude-code/issues/24238)), sandbox not enforced in some configurations ([#32226](https://github.com/anthropics/claude-code/issues/32226)).
+- **Codex** — also ships bubblewrap on Linux, with configurable sandbox via [agent approvals](https://developers.openai.com/codex/agent-approvals-security).
+- **Docker AI Sandboxes** — [in development](https://docs.docker.com/ai/sandboxes/), uses microVMs for hardware-level isolation rather than container namespaces.
+
+These built-in sandboxes are convenient but tied to a single vendor. The HN discussion around jai highlights a common concern: sandboxing should be independent of the agent, not controlled by the same software being sandboxed.
+
+### Academic
+
+#### jai (Stanford SCS)
+
+[jai](https://github.com/stanford-scs/jai) (C++, ~400 stars) is an ultra-lightweight Linux jail for AI coding agents from Stanford's Secure Computer Systems group, authored by David Mazieres. It was designed around one insight: "if containment isn't easier than YOLO mode, nobody will bother."
+
+- **Architecture**: Uses Linux namespaces, mount namespaces, PID namespaces, and overlayfs. No images, no Dockerfiles — `jai claude` or `jai codex` is the entire invocation.
+- **Three modes**: casual (COW overlay on home, same UID), strict (separate `jai` user, empty home), detached (your UID, empty home)
+- **Policy**: CWD gets full read/write; home directory is COW-overlaid; `/tmp` is private; everything else is read-only. Common credential paths (`.ssh`, `.gnupg`, `.aws`, etc.) are hidden by default.
+- **Limitations**: Linux-only, requires kernel ≥6.13, no network filtering, explicitly "not a substitute for Docker or a VM when you need better isolation"
+- **Philosophy**: A "casual sandbox" that reduces blast radius with zero configuration friction, not a security container
+
+| | jai | LiteBox Sandbox |
+|---|---|---|
+| **Isolation** | Linux namespaces + overlayfs | Library OS (no kernel) or Hyper-V VM |
+| **Syscall surface** | Full Linux kernel | Only what the shim implements |
+| **Configuration** | Zero-config (`jai <command>`) | Requires rootfs tar + policy JSON |
+| **Filesystem model** | COW overlay on real home dir | Isolated virtual filesystem |
+| **Network policy** | None | Syscall-level (`connect` allow/deny) |
+| **Audit trail** | None | Every syscall (structured JSON) |
+| **Platform** | Linux only (kernel ≥6.13) | Windows, Linux, bare-metal |
+| **Maturity** | Early (v0.2, 3 contributors) | Experimental prototype |
+
+jai and LiteBox occupy different niches: jai minimizes friction for the common case (developer running an agent on their laptop), while LiteBox provides deeper mediation (per-syscall audit, memory-safe reimplementation) at the cost of more setup and less compatibility.
+
+### Open Source Tools
+
+#### NVIDIA OpenShell
+
+[OpenShell](https://github.com/NVIDIA/OpenShell) (Apache 2.0, Rust, ~4.4k stars) is the closest existing project to this work in terms of ambition. It provides sandboxed execution environments for CLI coding agents (Claude Code, Codex, OpenCode, Copilot CLI).
 
 **Architecture**: Each sandbox is a Docker container managed by a K3s Kubernetes cluster running inside a single Docker container. A gateway coordinates sandbox lifecycle, and all outbound traffic is routed through an HTTP L7 proxy that enforces YAML-based policies.
 
@@ -677,39 +737,52 @@ The agent sandboxing space is rapidly evolving. This section surveys existing pr
 
 OpenShell's L7 network proxy and credential management are significantly more mature than our syscall-level `connect` deny. LiteBox's syscall-level audit trail and memory-safe Rust shim provide a different (deeper) observation point that OpenShell doesn't have.
 
-### E2B (e2b.dev)
+#### nono
 
-[E2B](https://e2b.dev) provides **cloud-hosted Firecracker microVMs** as a service for running LLM agent code. Agent frameworks call E2B's API to create a sandbox, execute code, and retrieve results.
+[nono](https://github.com/always-further/nono) (Apache 2.0, Rust, ~1.6k stars, 39 contributors) is a kernel-enforced agent sandbox from the creator of [Sigstore](https://sigstore.dev/). The most feature-rich open source entry in this space.
 
-- **Isolation**: Firecracker microVM (hardware-enforced, ~25 syscalls from VMM)
-- **Model**: Cloud service — code runs on E2B's infrastructure, not locally
-- **Integration**: SDK for Python/JS; widely adopted by agent frameworks
-- **Tradeoff**: Strong isolation, but code leaves your machine and you pay per execution
+- **Isolation**: Landlock (Linux ≥5.13) and Seatbelt (macOS). Capabilities are irreversible once applied — all child processes inherit.
+- **Credential injection**: Proxy mode (agent connects to localhost, proxy injects real API keys upstream — agent never sees keys even in its own memory) and env mode (secrets from OS keystore, 1Password, or Apple Passwords injected as env vars before sandbox locks).
+- **Network filtering**: Allowlist-based host filtering via local proxy; cloud metadata endpoints hardcoded as denied.
+- **Supply chain security**: Cryptographic signing and verification of instruction files (SKILLS.md, CLAUDE.md, etc.) using Sigstore attestation with DSSE envelopes — detects tampering of agent configuration files.
+- **Snapshot/rollback**: Content-addressable snapshots of working directory with SHA-256 deduplication. Interactive restore of individual files or entire directory.
+- **Supervisor mode** (Linux): Seccomp user notification intercepts syscalls when the agent needs access outside its sandbox; the supervisor prompts the user and injects file descriptors directly — the agent never executes its own `open()`.
+- **Platform**: macOS, Linux, WSL2. Native Windows coming soon.
+- **Built-in profiles**: Claude Code, Codex, OpenCode, OpenClaw, Swival.
 
-### agent-safehouse
+nono's supervisor mode (seccomp user notification + FD injection) is architecturally interesting — it's a different approach to syscall-level mediation than LiteBox's library OS model. nono intercepts at the kernel level and delegates decisions to an external supervisor; LiteBox reimplements the syscall entirely in userspace.
 
-[agent-safehouse](https://github.com/eugene1g/agent-safehouse) (~1.5k stars) uses **macOS `sandbox-exec` profiles** to restrict what CLI agents can access. Simple Shell scripts that wrap agent invocations with Apple's built-in sandbox.
+#### greywall
+
+[greywall](https://github.com/GreyhavenHQ/greywall) (Apache 2.0, Go, ~127 stars) is a container-free, deny-by-default sandbox for AI agents. Fork of [Fence](https://github.com/Use-Tusk/fence) by Tusk AI.
+
+- **Five security layers on Linux**: Bubblewrap namespaces, Landlock, seccomp BPF, eBPF monitoring, TUN-based network capture
+- **Network**: All traffic routed through [greyproxy](https://github.com/GreyhavenHQ/greyproxy), a transparent proxy with a live allow/deny dashboard
+- **Learning mode**: Traces filesystem access via strace and auto-generates least-privilege profiles
+- **Built-in profiles**: Claude Code, Cursor, Codex, Aider, Goose, Gemini, OpenCode, Amp, Cline, Copilot, and toolchain profiles (Node, Python, Go, Rust, Java, Ruby, Docker)
+- **Platform**: Linux (bubblewrap + Landlock + seccomp) and macOS (Seatbelt)
+
+#### yoloAI
+
+[yoloAI](https://github.com/kstenerud/yoloai) (MIT, Go, ~58 stars) takes a different philosophy: let the agent do whatever it wants in a disposable sandbox, then review the diff and choose what to keep.
+
+- **Model**: Agent works on an isolated copy of the project inside a container. `yoloai diff` shows changes; `yoloai apply` patches the real project via git; `yoloai reset` starts fresh.
+- **Backends**: Docker, Podman, Tart (macOS Apple Silicon VMs), Seatbelt (macOS sandbox-exec)
+- **Security modes**: Standard (runc), gVisor (userspace kernel), Kata Containers (hardware VM), Kata + Firecracker (microVM)
+- **Agent support**: Claude Code, Codex, Gemini, Aider, OpenCode, or plain shell
+- **Philosophy**: "Permission fatigue is real. After a hundred approve/deny prompts you stop reading and just hit yes." Eliminates the permission question entirely by making the sandbox disposable.
+
+The diff/apply workflow is relevant to LiteBox's file injection/extraction future work item — yoloAI has already solved the UX for reviewing and selectively applying agent modifications.
+
+#### agent-safehouse
+
+[agent-safehouse](https://github.com/eugene1g/agent-safehouse) (~1.5k stars) uses **macOS `sandbox-exec` profiles** to restrict what CLI agents can access. Shell scripts that wrap agent invocations with Apple's built-in sandbox.
 
 - **Isolation**: macOS sandbox profiles (kernel-enforced, declarative)
 - **Scope**: File access and network restrictions
 - **Limitation**: macOS only; `sandbox-exec` is deprecated by Apple
 
-### Rivet agent-os
-
-[agent-os](https://github.com/rivet-dev/agent-os) (~1.8k stars) uses **V8 isolates and WebAssembly** for lightweight agent sandboxing with ~6ms cold starts.
-
-- **Isolation**: V8 isolate + Wasm linear memory
-- **Model**: Agent code must be JavaScript/Wasm (can't run native binaries)
-- **Tradeoff**: Extremely lightweight and fast, but limited to Wasm-compatible workloads
-
-### Composio
-
-[Composio](https://github.com/ComposioHQ/composio) (~27.6k stars) is an agent tool framework with built-in sandboxed execution. Provides 1000+ tool integrations with authentication and a sandboxed "workbench" for code execution.
-
-- **Model**: MCP-compatible tool framework that wraps tool invocations in sandboxed containers
-- **Focus**: Tool integration and authentication rather than low-level isolation
-
-### vibe
+#### vibe
 
 [vibe](https://github.com/lynaghk/vibe) (~843 stars, Rust) creates lightweight **Linux VMs on macOS** using Apple's Virtualization framework specifically for sandboxing LLM agents.
 
@@ -717,19 +790,44 @@ OpenShell's L7 network proxy and credential management are significantly more ma
 - **Focus**: Developer ergonomics — easy VM lifecycle for agent sandboxing on Mac
 - **Limitation**: macOS only
 
+#### Rivet agent-os
+
+[agent-os](https://github.com/rivet-dev/agent-os) (~1.8k stars) uses **V8 isolates and WebAssembly** for lightweight agent sandboxing with ~6ms cold starts.
+
+- **Isolation**: V8 isolate + Wasm linear memory
+- **Model**: Agent code must be JavaScript/Wasm (can't run native binaries)
+- **Tradeoff**: Extremely lightweight and fast, but limited to Wasm-compatible workloads
+
 ### Landscape Summary
 
-| Project | Isolation Mechanism | Platform | Agent Compat | Unique Strength |
-|---|---|---|---|---|
-| **NVIDIA OpenShell** | Docker containers + L7 proxy | Linux/Mac | Full (CLI agents) | HTTP-level network policy, credential management |
-| **E2B** | Firecracker microVMs (cloud) | Any (cloud API) | Full (via SDK) | Strongest isolation, no local code execution |
-| **agent-safehouse** | macOS sandbox-exec | macOS only | Full (CLI agents) | Zero dependencies, simple |
-| **Rivet agent-os** | V8 isolates + Wasm | Any | Wasm only | 6ms cold starts, 32x cheaper |
-| **Composio** | Containers + MCP tools | Any | MCP agents | 1000+ tool integrations |
-| **vibe** | Apple Virtualization VMs | macOS only | Full (VM) | Lightweight Mac VMs |
-| **LiteBox** | Library OS (Rust) | Windows, Linux, bare-metal | Limited (no fork) | Syscall-level audit, memory-safe shim, smallest TCB |
+| Project | Category | Isolation Mechanism | Platform | Agent Compat | Unique Strength |
+|---|---|---|---|---|---|
+| **E2B** | Commercial | Firecracker microVMs (cloud) | Any (cloud API) | Full (via SDK) | Strongest isolation, no local code |
+| **Composio** | Commercial | Containers + MCP tools | Any | MCP agents | 1000+ tool integrations |
+| **Claude Code** | Built-in | bubblewrap / Seatbelt | Linux/Mac | Claude only | Zero setup for Claude users |
+| **jai** | Academic | Namespaces + overlayfs | Linux (≥6.13) | Full (CLI agents) | Zero-config, COW home overlay |
+| **NVIDIA OpenShell** | Open source | Docker + K3s + L7 proxy | Linux/Mac | Full (CLI agents) | HTTP-level network policy, credentials |
+| **nono** | Open source | Landlock / Seatbelt | Linux/Mac/WSL2 | Full (CLI agents) | Credential proxy, Sigstore supply chain |
+| **greywall** | Open source | bwrap + Landlock + seccomp + eBPF | Linux/Mac | Full (CLI agents) | Learning mode, 5 security layers |
+| **yoloAI** | Open source | Docker/Podman/Tart/Seatbelt | Linux/Mac | Full (CLI agents) | Diff/apply workflow, gVisor/Kata modes |
+| **agent-safehouse** | Open source | macOS sandbox-exec | macOS only | Full (CLI agents) | Zero dependencies, simple |
+| **Rivet agent-os** | Open source | V8 isolates + Wasm | Any | Wasm only | 6ms cold starts |
+| **vibe** | Open source | Apple Virtualization VMs | macOS only | Full (VM) | Lightweight Mac VMs |
+| **LiteBox** | Open source | Library OS (Rust) | Windows, Linux, bare-metal | Limited (no fork) | Syscall-level audit, memory-safe shim, smallest TCB |
 
-The industry is converging on **containers as the practical sandboxing layer** for agents. LiteBox's syscall-level approach is architecturally unique — no other agent sandbox provides per-syscall audit trails or memory-safe Rust reimplementation of the OS interface. The tradeoff is compatibility (no `fork()`) vs. depth of mediation.
+### Themes from the Landscape
+
+Several patterns emerge across these projects:
+
+1. **Containers are the practical default.** Most tools (OpenShell, yoloAI, Composio, Claude Code) use Linux namespaces, bubblewrap, or Docker as their primary isolation mechanism. LiteBox's library OS approach is architecturally unique but trades compatibility for depth of mediation.
+
+2. **Network policy is a distinct problem.** Filesystem sandboxing is mostly solved; network filtering is harder. OpenShell's L7 proxy, nono's allowlist proxy, and greywall's transparent proxy each take different approaches. LiteBox's syscall-level `connect` deny is the crudest — it can block connections but can't inspect HTTP methods or inject credentials.
+
+3. **Credential management is unsolved.** Agents need API keys to function, but exposing them inside the sandbox is a leakage risk. nono's proxy injection (agent never sees the key, even in memory) is the most sophisticated approach. Most tools simply environment-variable inject and hope for the best.
+
+4. **The diff/apply pattern matters.** yoloAI's insight that the agent should work on an isolated copy and the user should review changes via git diff is relevant to any sandbox that needs to return modified files — including LiteBox's file injection/extraction future work.
+
+5. **Agent-independent sandboxing is preferred.** The HN discussion around jai strongly favors external sandboxes over vendor built-ins. As one commenter noted: "I'm often switching between claude, codex, and opencode. It's kind of nice to have the sandbox policy independent of the actual AI assistant you are running."
 
 ---
 
