@@ -534,23 +534,26 @@ The rewriter backend works on WSL2 but has the same `fork()` limitation as Windo
 
 ## Current Status & Limitations
 
-### What the Sandbox Covers
+### Agent Integration Patterns
 
-The current implementation sandboxes **terminal command execution only**. When a coding agent (e.g., VS Code Copilot in agent mode) opens a terminal and runs a command, that command runs inside LiteBox with:
+LLM coding agents fall into two categories with fundamentally different sandboxing surfaces:
 
-- Every Linux syscall mediated by Rust code (no Linux kernel)
-- Policy enforcement on filesystem access, network, and exec
-- A structured audit trail of all syscall activity
+**VS Code agents** (Copilot agent mode, Cline, Continue, etc.) run inside the VS Code extension host. They interact with the system through two paths:
+- **VS Code APIs** — file read/write, search, symbol lookup, diagnostics. These execute on the host via the extension host process. When using VS Code Remote (WSL, SSH, Containers), they execute on the remote server.
+- **Terminal API** — opening terminals, sending commands. The terminal process is a separate shell.
 
-### What the Sandbox Does NOT Cover
+**CLI agents** (Claude Code, Codex CLI, aider, SWE-agent, OpenHands, etc.) run as standalone processes outside VS Code. They interact with the system entirely through **direct syscalls**:
+- `open()`/`read()`/`write()` for file access
+- `fork()`+`exec()` for running commands
+- `connect()`/`send()` for network access (LLM API calls, URL fetching)
 
-**VS Code Copilot agent mode has two ways to interact with a workspace:**
+There is no protocol to intercept for CLI agents — syscalls are the only interception point.
 
-1. **VS Code APIs** (file read/write, search, symbol lookup, etc.) — these execute on the host via the VS Code extension host. **They bypass the sandbox entirely.** When the agent "reads a file" or "lists a directory," it uses VS Code's native filesystem API, not a terminal command.
+### What the Current Sandbox Covers
 
-2. **Terminal commands** — these go through the default terminal profile, which we set to the LiteBox Sandbox. Only this path is sandboxed.
+The current implementation sandboxes **terminal command execution only**. This applies differently depending on the agent type:
 
-In practice, the agent uses VS Code APIs for most file operations and only uses the terminal for running builds, tests, scripts, and tools. This means:
+**For VS Code agents:**
 
 | Agent Action | Path | Sandboxed? |
 |---|---|---|
@@ -563,17 +566,43 @@ In practice, the agent uses VS Code APIs for most file operations and only uses 
 | Run `curl https://...` | Terminal | **Yes** |
 | Execute shell commands | Terminal | **Yes** |
 
+In practice, VS Code agents use APIs for most file operations and only use the terminal for builds, tests, and tool execution. The sandbox covers the most dangerous attack vector (arbitrary code execution) but not file access.
+
+**For CLI agents:**
+
+The current sandbox cannot run CLI agents directly because:
+1. CLI agents are native binaries (typically Node.js or Python) that need `fork()` + full POSIX compatibility
+2. They make direct syscalls for all operations — no separate "terminal" vs "API" distinction
+3. Without `fork()`, the agent process can't spawn subprocesses (build tools, tests, etc.)
+
+If LiteBox gained `fork()` support, running the **entire CLI agent** inside LiteBox would sandbox everything — every file read, network call, and subprocess — because all operations are syscalls. This is actually a stronger sandboxing model than the VS Code approach, where file operations bypass the terminal sandbox.
+
+| | VS Code Agent + Terminal Sandbox | CLI Agent inside LiteBox (future) |
+|---|---|---|
+| File reads | **Not sandboxed** (VS Code API) | **Sandboxed** (all `open`/`read` go through shim) |
+| File writes | **Not sandboxed** (VS Code API) | **Sandboxed** (all `open`/`write` go through shim) |
+| Command execution | **Sandboxed** (terminal) | **Sandboxed** (`fork`+`exec` go through shim) |
+| Network | **Sandboxed** (terminal `curl` etc.) | **Sandboxed** (all `connect`/`send` go through shim) |
+| Audit trail | Terminal commands only | Complete — every syscall |
+| fork() required? | No (REPL workaround) | **Yes** |
+
 ### What Would Be Needed for Complete Sandboxing
 
-To sandbox **all** agent activity (not just terminal commands), you would need one of:
+**For VS Code agents** — sandbox all activity, not just terminal commands:
 
-1. **VS Code Remote connection** — run the VS Code Server inside the sandbox (e.g., a dev container backed by LiteBox or gVisor). All extension host operations would execute inside the sandbox, including file reads and writes. This is the most complete approach but requires implementing the VS Code Server lifecycle.
+1. **VS Code Remote connection** — run the VS Code Server inside the sandbox (e.g., a hardened WSL2 instance or a dev container backed by LiteBox/gVisor). All extension host operations would execute inside the sandbox, including file reads and writes. This is the most complete approach but requires configuring the VS Code Server lifecycle and restricting the remote environment.
 
 2. **MCP tool server** — expose every operation as an MCP tool call routed through LiteBox. The agent would call `read_file`, `write_file`, `run_command` etc. as tool invocations, each going through the sandbox's policy layer. This works for agents that support MCP but requires the agent to use tools instead of native APIs.
 
 3. **Custom VS Code extension** — intercept filesystem operations in the extension host and route them through a sandbox proxy. This is fragile and not how VS Code is designed to work.
 
-4. **Restrict agent to terminal-only mode** — configure the agent to never use VS Code APIs directly and always go through the terminal. Not all agents support this, and it's significantly slower.
+**For CLI agents** — sandbox the entire agent process:
+
+1. **Run the agent inside LiteBox** — requires `fork()` support (not yet implemented). Once available, the agent's every syscall goes through the shim. The strongest model.
+
+2. **Run the agent inside a hardened WSL2/container** — use Linux namespaces, restricted user accounts, and network policy to limit what the agent can access. LiteBox can add per-command audit + policy on top. Doesn't require `fork()` in LiteBox since the real kernel handles it.
+
+3. **MCP tool server** — same as for VS Code agents. The CLI agent calls sandboxed tools instead of making direct syscalls. Requires the agent to support MCP.
 
 The current terminal-based approach is a pragmatic middle ground: it sandboxes the most dangerous attack vector (arbitrary code execution via terminal commands) while leaving file reads unsandboxed (lower risk — the agent can only see what's in the workspace).
 
