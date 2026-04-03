@@ -33,6 +33,27 @@ extern "C" fn sigsys_handler(sig: c_int, info: *mut libc::siginfo_t, context: *m
             std::process::abort();
         }
 
+        // Defense-in-depth: if gs_base is 0, we haven't entered the guest context
+        // yet (wrgsbase hasn't been called). This can happen if a syscall is trapped
+        // during host initialization before run_thread sets up the gs/fs swap.
+        // In this case, we cannot redirect to syscall_callback (it would crash
+        // accessing gs:@tpoff at address 0).
+        //
+        // We cannot re-issue the syscall from here because seccomp filters apply
+        // to all syscalls including those from signal handlers, so we'd get
+        // infinite recursion. Instead, we abort with a clear error message.
+        // The correct fix is to ensure seccomp is activated late enough that
+        // this path is never reached (see activate_seccomp_filter).
+        let gsbase: u64;
+        core::arch::asm!("rdgsbase {}", out(reg) gsbase);
+        if gsbase == 0 {
+            // Write a diagnostic message (write is in the seccomp allow-list with
+            // the backdoor magic, but we use fd 2 directly here since we're aborting).
+            let msg = b"FATAL: SIGSYS trapped before guest context (gs_base=0). Seccomp filter installed too early.\n";
+            libc::write(2, msg.as_ptr().cast(), msg.len());
+            std::process::abort();
+        }
+
         // Store the return address in RCX, as expected by `syscall_callback`.
         let ucontext = &mut *(context.cast::<libc::ucontext_t>());
         ucontext.uc_mcontext.gregs[libc::REG_RCX as usize] = addr as i64;
@@ -210,7 +231,26 @@ fn register_seccomp_filter() {
     seccompiler::apply_filter(&bpf_prog).unwrap();
 }
 
-/// Initialize the syscall interception mechanism.
+/// Phase 1: Register the SIGSYS signal handler.
+///
+/// This is safe to call early — without the seccomp filter installed, SIGSYS
+/// will never be delivered, so the handler is harmless until
+/// [`activate_seccomp_filter`] is called.
+pub(crate) fn register_syscall_handler() {
+    register_sigsys_handler();
+}
+
+/// Phase 2: Install the seccomp BPF filter that traps unrecognized syscalls.
+///
+/// This must be called **after** the guest entry context (gs_base swap) is
+/// ready — i.e., just before `run_thread`. Any syscall trapped before
+/// `wrgsbase` sets up gs_base would crash in `syscall_callback`.
+#[cfg(not(test))]
+pub(crate) fn activate_seccomp_filter() {
+    register_seccomp_filter();
+}
+
+/// Initialize the syscall interception mechanism (legacy single-call API).
 ///
 /// This function sets up the syscall handler and registers seccomp
 /// filters and the SIGSYS signal handler.

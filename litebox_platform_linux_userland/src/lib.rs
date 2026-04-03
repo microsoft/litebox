@@ -37,6 +37,14 @@ mod syscall_intercept;
 
 extern crate alloc;
 
+/// Flag used to defer seccomp filter activation until inside `init_handler`,
+/// after `wrgsbase` has set up gs_base in the run_thread_arch assembly.
+/// This prevents the filter from trapping host initialization syscalls before
+/// `syscall_callback` can safely access thread-local storage via gs.
+#[cfg(feature = "systrap_backend")]
+static PENDING_SECCOMP_ACTIVATION: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 // ---------------------------------------------------------------------------
 // TLS (`.tbss`) access helpers
 //
@@ -1023,6 +1031,45 @@ impl LinuxUserland {
                 .is_ok()
         );
         syscall_intercept::init_sys_intercept();
+    }
+
+    /// Phase 1 of seccomp interception: register the SIGSYS signal handler.
+    ///
+    /// Call this early in initialization. The handler is harmless without the
+    /// seccomp filter — SIGSYS won't be delivered until
+    /// [`activate_seccomp_filter`](Self::activate_seccomp_filter) is called.
+    #[cfg(feature = "systrap_backend")]
+    pub fn register_seccomp_handler(&self) {
+        syscall_intercept::register_syscall_handler();
+    }
+
+    /// Phase 2 of seccomp interception: install the BPF filter.
+    ///
+    /// Call this just before `run_thread`, after all host initialization is
+    /// complete. The filter is not activated immediately — it's deferred to
+    /// the `init_handler` callback inside `run_thread_arch`, which runs after
+    /// `wrgsbase` has set up gs_base. This ensures `syscall_callback` can
+    /// safely access thread-local storage via gs.
+    ///
+    /// # Panics
+    ///
+    /// Panics if called more than once.
+    #[cfg(feature = "systrap_backend")]
+    pub fn activate_seccomp_filter(&self) {
+        assert!(
+            self.seccomp_interception_enabled
+                .compare_exchange(
+                    false,
+                    true,
+                    std::sync::atomic::Ordering::SeqCst,
+                    std::sync::atomic::Ordering::SeqCst
+                )
+                .is_ok(),
+            "seccomp filter already activated"
+        );
+        // Don't install the filter here — set a flag that init_handler will check
+        // after wrgsbase has been called in the assembly.
+        PENDING_SECCOMP_ACTIVATION.store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
     fn read_maps_and_vdso() -> (alloc::vec::Vec<core::ops::Range<usize>>, Option<usize>) {
@@ -5325,6 +5372,17 @@ unsafe extern "C" {
 }
 
 unsafe extern "C-unwind" fn init_handler(thread_ctx: &mut ThreadContext) {
+    // Activate the pending seccomp filter if one was requested.
+    // This runs after wrgsbase has set up gs_base in the assembly, so
+    // syscall_callback can safely access gs:@tpoff. Activating here
+    // (rather than before run_thread) ensures no host initialization
+    // syscalls are trapped before gs_base is ready.
+    #[cfg(feature = "systrap_backend")]
+    if PENDING_SECCOMP_ACTIVATION.swap(false, std::sync::atomic::Ordering::SeqCst) {
+        #[cfg(not(test))]
+        syscall_intercept::activate_seccomp_filter();
+    }
+
     thread_ctx.call_shim(|shim, ctx| shim.init(ctx));
 }
 

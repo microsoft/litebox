@@ -9,6 +9,14 @@ pub(crate) mod systrap;
 #[cfg(all(target_arch = "x86_64", feature = "systrap_backend"))]
 pub(crate) use systrap::init_sys_intercept;
 
+// Two-phase seccomp initialization: register the signal handler early,
+// activate the filter late (just before guest entry). See systrap.rs for details.
+#[cfg(all(target_arch = "x86_64", feature = "systrap_backend"))]
+pub(crate) use systrap::register_syscall_handler;
+
+#[cfg(all(target_arch = "x86_64", feature = "systrap_backend"))]
+pub(crate) use systrap::activate_seccomp_filter;
+
 #[cfg(target_arch = "x86")]
 pub(crate) fn init_sys_intercept() {
     // TODO: Actually start intercepting syscalls on 32-bit Linux.

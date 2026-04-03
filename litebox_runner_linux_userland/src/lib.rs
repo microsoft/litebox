@@ -619,9 +619,19 @@ fn finish_run<FS: litebox_shim_linux::ShimFS>(
 
     shim_builder.set_load_filter(fixup_env);
 
+    // Set up syscall interception.
+    //
+    // For seccomp: register the SIGSYS handler now (Phase 1), but defer
+    // installing the BPF filter until just before run_thread (Phase 2).
+    // This prevents host initialization syscalls from being trapped before
+    // the guest context (gs_base swap) is ready.
+    let use_seccomp = matches!(cli_args.interception_backend, InterceptionBackend::Seccomp);
+    match cli_args.interception_backend {
     match cli_args.interception_backend {
         InterceptionBackend::Seccomp => platform.enable_seccomp_based_syscall_interception(),
-        InterceptionBackend::Rewriter => {}
+        InterceptionBackend::Rewriter => {
+            REQUIRE_RTLD_AUDIT.store(true, core::sync::atomic::Ordering::SeqCst);
+        }
     }
 
     let argv = build_argv(cli_args);
@@ -1956,6 +1966,22 @@ fn run_program<FS: litebox_shim_linux::ShimFS>(
 ) -> ! {
     #[cfg(feature = "lock_tracing")]
     litebox::sync::start_recording();
+
+    // Phase 2 of seccomp interception: install the BPF filter now, just before
+    // entering the guest. All host initialization (load_program, shim setup,
+    // network worker spawn) is complete, so no host syscalls will be trapped.
+    //
+    // This must happen after load_program() because load_program makes many
+    // syscalls (file I/O, mmap, etc.) that would be trapped by seccomp before
+    // run_thread_arch has set up gs_base via wrgsbase. Without gs_base, the
+    // syscall_callback entry point crashes accessing gs:@tpoff at address 0.
+    //
+    // The SIGSYS handler (registered in Phase 1) also has a defense-in-depth
+    // rdgsbase check: if gs_base is still 0 when a SIGSYS arrives, it returns
+    // -ENOSYS instead of redirecting to syscall_callback.
+    if use_seccomp {
+        platform.activate_seccomp_filter();
+    }
 
     unsafe {
         litebox_platform_linux_userland::run_thread(
