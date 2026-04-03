@@ -283,6 +283,35 @@ A "dev container for LLM agents" would:
 - Never run privileged
 - Use a stronger runtime (gVisor's `runsc`, or LiteBox inside the container)
 
+### WSL2 as an Isolation Boundary
+
+WSL2 runs a real Linux kernel inside a Hyper-V virtual machine — hardware-isolated from the Windows host. This makes it tempting to use as an LLM sandbox. However, a default WSL2 instance provides **environmental isolation, not security isolation**, similar to Docker:
+
+**What WSL2 isolates (from Windows):**
+- Guest processes can't directly access Windows APIs, the Windows registry, or Windows processes
+- Memory is in a separate Hyper-V VM partition — hardware-enforced
+- Guest processes run under the Linux kernel, not the Windows kernel
+
+**What WSL2 does NOT isolate (by default):**
+
+| Exposure | Detail |
+|---|---|
+| **Windows filesystem** | `/mnt/c/`, `/mnt/d/` etc. mount entire Windows drives read-write. The agent can read `~/.ssh/id_rsa`, browser profiles, cloud CLI tokens, etc. |
+| **Network** | Full unrestricted network access. The agent can exfiltrate data via HTTP, DNS, or scan internal networks. |
+| **Linux filesystem** | Full access to `/etc/`, `$HOME`, installed packages, dotfiles |
+| **Forwarded credentials** | If git credential-manager or SSH agent forwarding is configured (common), the agent can push to repos or SSH to servers using the user's identity |
+| **Environment variables** | `PATH`, `HOME`, cloud tokens, API keys — anything exported is visible |
+| **Other WSL2 distros** | Not isolated from each other (shared kernel) |
+
+**Hardening a WSL2 instance for sandboxing requires:**
+- Disabling Windows drive automount (`automount = false` in `/etc/wsl.conf`)
+- Creating a restricted user account without access to sensitive directories
+- Configuring network restrictions (iptables, or not forwarding DNS)
+- Not forwarding SSH agents or credential managers into the WSL2 environment
+- Using LiteBox or another sandbox inside WSL2 for per-command audit and policy enforcement
+
+The combination of **WSL2 (hardware VM boundary) + restricted configuration + LiteBox (syscall audit + policy)** provides defense-in-depth: the VM prevents escape to Windows, the configuration limits lateral access within Linux, and LiteBox mediates individual command execution.
+
 ## Attack Surface Analysis
 
 ### What Sandboxing Addresses
