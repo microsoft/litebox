@@ -171,6 +171,14 @@ impl Task {
             return Err(TeeResult::ShortBuffer);
         }
         if let Some(mut map) = tee_cryp_state_map.get_mut(state) {
+            // Check last_block before applying the cipher so we don't mutate
+            // dst_slice and then return an error.
+            if last_block {
+                if cfg!(debug_assertions) {
+                    todo!("support algorithms which have a certain finalization logic");
+                }
+                return Err(TeeResult::NotSupported);
+            }
             if let Some(state_entry) = map.get_mut(&state)
                 && let Some(cipher) = state_entry.get_mut_cipher()
             {
@@ -187,12 +195,6 @@ impl Task {
                     }
                 }
                 *dst_len = src_slice.len();
-            }
-            if last_block {
-                if cfg!(debug_assertions) {
-                    todo!("support algorithms which have a certain finalization logic");
-                }
-                return Err(TeeResult::NotSupported);
             }
             Ok(())
         } else {

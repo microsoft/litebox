@@ -142,7 +142,7 @@ impl litebox_common_linux::loader::MapMemory for ElfFileInMemory<'_> {
 
         self.task
             .sys_mprotect(UserMutPtr::from_usize(mapped_addr), len, prot.flags())
-            .map_err(ElfLoaderError::from)?;
+            .map_err(ElfLoaderError::ProtectError)?;
         Ok(())
     }
 
@@ -265,6 +265,8 @@ pub enum ElfLoaderError {
     LoadError(#[from] litebox_common_linux::loader::ElfLoadError<Errno>),
     #[error("invalid stack")]
     InvalidStackAddr,
+    #[error("failed to set memory protection")]
+    ProtectError(Errno),
     #[error("failed to mmap")]
     MappingError(#[from] MappingError),
     #[error("TA binary UUID does not match expected UUID")]
@@ -274,7 +276,7 @@ pub enum ElfLoaderError {
 impl From<ElfLoaderError> for litebox_common_linux::errno::Errno {
     fn from(value: ElfLoaderError) -> Self {
         match value {
-            ElfLoaderError::OpenError(e) => e,
+            ElfLoaderError::OpenError(e) | ElfLoaderError::ProtectError(e) => e,
             ElfLoaderError::ParseError(e) => e.into(),
             ElfLoaderError::InvalidStackAddr | ElfLoaderError::MappingError(_) => {
                 litebox_common_linux::errno::Errno::ENOMEM
