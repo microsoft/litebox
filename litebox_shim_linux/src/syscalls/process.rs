@@ -3187,14 +3187,21 @@ impl<FS: ShimFS> Task<FS> {
                                                             off += w;
                                                         } else {
                                                             let _ = pipes_clone.close(&relay_fd);
-                                                            platform.close_host_fd(host_fd);
+                                                            // Don't close host stdio fds (0/1/2) —
+                                                            // they're shared with the terminal.
+                                                            if host_fd > 2 {
+                                                                platform.close_host_fd(host_fd);
+                                                            }
                                                             return;
                                                         }
                                                     }
                                                 }
                                             }
                                         }
-                                        platform.close_host_fd(host_fd);
+                                        // Don't close host stdio fds (0/1/2).
+                                        if host_fd > 2 {
+                                            platform.close_host_fd(host_fd);
+                                        }
                                         let _ = pipes_clone.close(&relay_fd);
                                     }
                                     HostPipeDirection::Write => {
@@ -3212,14 +3219,20 @@ impl<FS: ShimFS> Task<FS> {
                                                             off += w;
                                                         } else {
                                                             let _ = pipes_clone.close(&relay_fd);
-                                                            platform.close_host_fd(host_fd);
+                                                            // Don't close host stdio fds (0/1/2).
+                                                            if host_fd > 2 {
+                                                                platform.close_host_fd(host_fd);
+                                                            }
                                                             return;
                                                         }
                                                     }
                                                 }
                                             }
                                         }
-                                        platform.close_host_fd(host_fd);
+                                        // Don't close host stdio fds (0/1/2).
+                                        if host_fd > 2 {
+                                            platform.close_host_fd(host_fd);
+                                        }
                                         let _ = pipes_clone.close(&relay_fd);
                                     }
                                 }
@@ -5041,6 +5054,107 @@ impl<FS: ShimFS> Task<FS> {
                     bridge_pty_pair.push(Some(pty_pair));
                     // No parent fd counterpart — the PTY relay bridges
                     // between ring buffers and virtual pipes.
+                    bridge_parent_info.push(Vec::new());
+                }
+            }
+
+            // --- Host stdio bridging (Pass 4) ---
+            // For each fd in the child's snapshot that is backed by a host
+            // stdio descriptor (stdin/stdout/stderr), create an OS pipe pair
+            // and register a host-backed mux stream.  The parent's relay
+            // thread will bridge between the mux virtual pipe and the real
+            // host terminal fd.  This ensures all terminal I/O from nested
+            // workers is serialized through the parent's mux dispatcher
+            // instead of multiple workers writing directly to the host
+            // terminal (which causes garbled output in TUI mode).
+            {
+                use super::host_pipe::HostPipeDirection;
+
+                for entry in &fd_table.entries {
+                    // Only bridge fds that have host stdio backing.
+                    let source_fd = match entry.metadata.host_stdio_source_fd {
+                        Some(sf) => sf,
+                        None => {
+                            // Also check is_host_tty_alias for fds that
+                            // were dup'd from host stdio (e.g., fd opened
+                            // on /dev/tty that aliases the host terminal).
+                            if entry.metadata.is_host_tty_alias {
+                                match entry.fd {
+                                    0 => 0,
+                                    1 | 2 => 1,
+                                    _ => continue,
+                                }
+                            } else {
+                                continue;
+                            }
+                        }
+                    };
+
+                    // Skip if this fd was already bridged by Pass 1/2/3.
+                    if child_pipe_bridges.iter().any(|&(gfd, _, _)| gfd == entry.fd) {
+                        #[cfg(feature = "trace_syscalls")]
+                        litebox::log_println!(
+                            self.global.platform,
+                            "[DELAYED-FORK] pid={}: host stdio fd={} source_fd={} already bridged, skipping",
+                            self.pid,
+                            entry.fd,
+                            source_fd,
+                        );
+                        continue;
+                    }
+
+                    // Direction: fd 0 = child reads (ParentToWorker),
+                    //            fd 1/2 = child writes (WorkerToParent).
+                    let direction = if entry.fd == 0 {
+                        HostPipeDirection::Read
+                    } else {
+                        HostPipeDirection::Write
+                    };
+
+                    // Create an OS pipe pair for the child side.
+                    let (read_fd, write_fd) = match self.global.platform.create_host_pipe() {
+                        Ok(pair) => pair,
+                        Err(_e) => {
+                            #[cfg(feature = "trace_syscalls")]
+                            litebox::log_println!(
+                                self.global.platform,
+                                "[DELAYED-FORK] pid={}: host stdio bridge create_host_pipe failed for fd={}: {}",
+                                self.pid,
+                                entry.fd,
+                                _e,
+                            );
+                            continue;
+                        }
+                    };
+
+                    let (child_os_fd, parent_os_fd) = match direction {
+                        HostPipeDirection::Read => (read_fd, write_fd),
+                        HostPipeDirection::Write => (write_fd, read_fd),
+                    };
+
+                    // Close the parent OS fd — the mux host_pipe_fd relay
+                    // uses the real host stdio fd directly, not this pipe end.
+                    self.global.platform.close_host_fd(parent_os_fd);
+
+                    #[cfg(feature = "trace_syscalls")]
+                    litebox::log_println!(
+                        self.global.platform,
+                        "[DELAYED-FORK] pid={}: host stdio bridge fd={} source_fd={} dir={:?} child_os_fd={}",
+                        self.pid,
+                        entry.fd,
+                        source_fd,
+                        direction,
+                        child_os_fd,
+                    );
+
+                    child_pipe_bridges.push((entry.fd, child_os_fd, direction));
+                    bridge_drained.push(Vec::new());
+                    // Set bridge_host_fd to the real host stdio fd number.
+                    // This tells the mux parent dispatcher to spawn a relay
+                    // thread that bridges between the virtual pipe and the
+                    // real host terminal fd.
+                    bridge_host_fd.push(source_fd);
+                    bridge_pty_pair.push(None);
                     bridge_parent_info.push(Vec::new());
                 }
             }

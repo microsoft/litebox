@@ -1841,7 +1841,23 @@ impl LinuxUserland {
                     return Err(-1_i32);
                 }
             }
-            _ => {}
+            // For Pipe/Stream/Fs/Inherit bindings, the mux handles all
+            // actual data flow via virtual pipes.  Redirect the worker's
+            // host stdin to /dev/null so it cannot read from the terminal.
+            _ => {
+                if unsafe {
+                    libc::posix_spawn_file_actions_addopen(
+                        file_actions_ptr,
+                        0,
+                        b"/dev/null\0".as_ptr().cast::<libc::c_char>(),
+                        libc::O_RDONLY,
+                        0,
+                    )
+                } != 0
+                {
+                    return Err(-1_i32);
+                }
+            }
         }
         for (fd_num, binding) in [(1, &stdio.stdout), (2, &stdio.stderr)] {
             match binding {
@@ -1878,7 +1894,24 @@ impl LinuxUserland {
                         return Err(-1_i32);
                     }
                 }
-                _ => {}
+                // For Pipe/Stream/Fs/Inherit bindings, the mux handles all
+                // actual data flow via virtual pipes.  Redirect the worker's
+                // host stdout/stderr to /dev/null so it cannot write to the
+                // terminal.
+                _ => {
+                    if unsafe {
+                        libc::posix_spawn_file_actions_addopen(
+                            file_actions_ptr,
+                            fd_num,
+                            b"/dev/null\0".as_ptr().cast::<libc::c_char>(),
+                            libc::O_WRONLY,
+                            0,
+                        )
+                    } != 0
+                    {
+                        return Err(-1_i32);
+                    }
+                }
             }
         }
         for temp_fd in host_stdio_temp_sources.iter().flatten() {
