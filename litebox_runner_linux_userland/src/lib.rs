@@ -1697,7 +1697,14 @@ fn spawn_worker_mux_dispatcher(
                                     Err(litebox_common_linux::errno::Errno::EAGAIN) => {
                                         std::thread::sleep(std::time::Duration::from_micros(100));
                                     }
-                                    _ => {
+                                    other => {
+                                        #[cfg(feature = "trace_syscalls")]
+                                        eprintln!(
+                                            "[WORKER-MUX] mux write failed: {:?} (expected {} bytes)",
+                                            other,
+                                            buf.len(),
+                                        );
+                                        let _ = &other;
                                         for (_, _, rfd) in &relay_endpoints {
                                             let _ = pipes.close(rfd);
                                         }

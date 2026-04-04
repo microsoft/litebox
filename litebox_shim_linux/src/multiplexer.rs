@@ -72,6 +72,11 @@ impl MuxMessage {
     /// Serialize into a byte buffer suitable for sending over the transport.
     #[allow(clippy::cast_possible_truncation)]
     pub fn serialize(&self) -> Vec<u8> {
+        debug_assert!(
+            self.data.len() <= u32::MAX as usize - HEADER_SIZE,
+            "mux payload too large: {}",
+            self.data.len()
+        );
         let len = (HEADER_SIZE + self.data.len()) as u32;
         let mut buf = Vec::with_capacity(len as usize);
         buf.extend_from_slice(&len.to_le_bytes());

@@ -1596,7 +1596,11 @@ impl LinuxUserland {
             )
         };
         if ret != 0 {
-            return Err(litebox_common_linux::errno::Errno::EMFILE);
+            let raw = std::io::Error::last_os_error()
+                .raw_os_error()
+                .unwrap_or(libc::EMFILE);
+            return Err(litebox_common_linux::errno::Errno::try_from(raw)
+                .unwrap_or(litebox_common_linux::errno::Errno::EMFILE));
         }
         Ok((fds[0], fds[1]))
     }

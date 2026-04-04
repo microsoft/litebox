@@ -3577,13 +3577,16 @@ impl<FS: ShimFS> Task<FS> {
                                     let buf = msg.serialize();
                                     match platform.write_host_fd(mux_fd, &buf) {
                                         Ok(w) if w == buf.len() => {}
-                                        _ => {
+                                        other => {
                                             #[cfg(feature = "trace_syscalls")]
                                             litebox::log_println!(
                                                 platform,
-                                                "[PARENT-MUX] initial send failed for stream={}",
+                                                "[PARENT-MUX] initial drain send failed for stream={}: {:?} (expected {} bytes)",
                                                 stream_id,
+                                                other,
+                                                buf.len(),
                                             );
+                                            let _ = &other;
                                             break 'drain;
                                         }
                                     }
@@ -3788,7 +3791,15 @@ impl<FS: ShimFS> Task<FS> {
                                                     ) => {
                                                         platform.host_sleep_us(100);
                                                     }
-                                                    _ => {
+                                                    other => {
+                                                        #[cfg(feature = "trace_syscalls")]
+                                                        litebox::log_println!(
+                                                            platform,
+                                                            "[PARENT-MUX] mux write failed: {:?} (expected {} bytes)",
+                                                            other,
+                                                            buf.len(),
+                                                        );
+                                                        let _ = &other;
                                                         for (_, _, rfd, _) in &dispatch_endpoints {
                                                             let _ = pipes.close(rfd);
                                                         }
