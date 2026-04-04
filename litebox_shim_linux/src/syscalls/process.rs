@@ -833,7 +833,16 @@ impl<FS: ShimFS> Task<FS> {
         // all exit notification and cleanup was handled by commit_delayed_fork
         // and its background waiter.  Skip the rest of prepare_for_exit to
         // avoid double-notifying the parent or double-destroying resources.
+        //
+        // However, we MUST close the local FD table references first.  The
+        // child's FD table was cloned from the parent at fork time and still
+        // holds Arc references to shared descriptor entries (e.g. pipe sender
+        // halves).  Without releasing these references, pipe readers in the
+        // parent process will never see EOF — the worker-mux dispatcher polls
+        // is_read_eof() on the receiver, which requires ALL sender Arc refs
+        // to be dropped so the WriteEnd is shut down.
         if self.migrated_to_remote.get() {
+            self.close_all_fds();
             return;
         }
 
@@ -1984,6 +1993,7 @@ impl<FS: ShimFS> Task<FS> {
                         deferred_vfork_park: core::cell::Cell::new(false),
                         delayed_fork_pending: core::cell::Cell::new(false),
                         migrated_to_remote: core::cell::Cell::new(false),
+                        mux_pipe_pair_ids: core::cell::RefCell::new(alloc::vec::Vec::new()),
                     },
                 }),
             )
@@ -2331,6 +2341,7 @@ impl<FS: ShimFS> Task<FS> {
                 parent_pipe_fds: {
                     let files = self.files.borrow();
                     let rds = files.raw_descriptor_store.read();
+                    let mux_ids = self.mux_pipe_pair_ids.borrow();
                     let mut pipe_fds = Vec::new();
                     for raw_fd in rds.iter_alive() {
                         if let Ok(typed) = rds
@@ -2348,8 +2359,36 @@ impl<FS: ShimFS> Task<FS> {
                             let Ok(pair_id) = self.global.pipes.pipe_pair_id(&typed) else {
                                 continue;
                             };
+                            // Skip mux-managed pipes — these are infrastructure
+                            // virtual pipes installed by a prior sibling's mux
+                            // dispatcher or fd-replacement relay.  Bridging them
+                            // again would create nested mux-over-mux and destroy
+                            // the first mux's data flow.
+                            if mux_ids.contains(&pair_id) {
+                                #[cfg(feature = "trace_syscalls")]
+                                litebox::log_println!(
+                                    self.global.platform,
+                                    "[FORK-DIAG] pid={}: skipping mux-managed pipe fd={} pair_id={:#x}",
+                                    self.pid,
+                                    raw_fd,
+                                    pair_id,
+                                );
+                                continue;
+                            }
                             pipe_fds.push((raw_fd, direction, pair_id));
                         }
+                    }
+                    // Diagnostic: log ALL alive fds in the parent's fd table
+                    #[cfg(feature = "trace_syscalls")]
+                    {
+                        let all_alive: alloc::vec::Vec<usize> = rds.iter_alive().collect();
+                        litebox::log_println!(
+                            self.global.platform,
+                            "[FORK-DIAG] pid={}: parent all_alive_fds={:?} pipe_fds={:?}",
+                            self.pid,
+                            all_alive,
+                            pipe_fds,
+                        );
                     }
                     pipe_fds
                 },
@@ -2388,6 +2427,76 @@ impl<FS: ShimFS> Task<FS> {
                     drop(dt);
                     socket_fds
                 },
+                parent_pty_master_fds: {
+                    // Capture parent's PTY master fds by checking rdev of
+                    // all filesystem fds.  PTY masters have rdev major = 136.
+                    let files = self.files.borrow();
+                    let rds = files.raw_descriptor_store.read();
+                    let mut pty_fds = Vec::new();
+                    for raw_fd in rds.iter_alive() {
+                        if let Ok(typed) = rds.fd_from_raw_integer::<FS>(raw_fd)
+                            && let Some(pty_index) = files
+                                .fs
+                                .fd_file_status(&typed)
+                                .ok()
+                                .and_then(|s| s.node_info.rdev)
+                                .and_then(|rdev| {
+                                    let major = rdev.get() >> 8;
+                                    if major >= 136 {
+                                        u32::try_from(rdev.get() - 0x8800).ok()
+                                    } else {
+                                        None
+                                    }
+                                })
+                        {
+                            // Check if this is a PTY by verifying it has
+                            // termios (both master and slave do).  We record
+                            // all PTY fds — the bridging code will match by
+                            // pty_index.
+                            if files.fs.get_pty_termios(&typed).is_some() {
+                                pty_fds.push((raw_fd, pty_index));
+                            }
+                        }
+                    }
+                    #[cfg(feature = "trace_syscalls")]
+                    litebox::log_println!(
+                        self.global.platform,
+                        "[FORK-DIAG] pid={}: parent_pty_master_fds={:?}",
+                        self.pid,
+                        pty_fds,
+                    );
+                    pty_fds
+                },
+                parent_pty_pairs: {
+                    // Capture PtyPair Arcs for relay threads. Use the erased
+                    // trait method to avoid needing the concrete FS type.
+                    let files = self.files.borrow();
+                    let rds = files.raw_descriptor_store.read();
+                    let mut pairs = Vec::new();
+                    let mut seen_indices = Vec::new();
+                    for raw_fd in rds.iter_alive() {
+                        if let Ok(typed) = rds.fd_from_raw_integer::<FS>(raw_fd)
+                            && let Some((arc, idx, _is_master)) =
+                                files.fs.get_pty_pair_erased(&typed)
+                            && !seen_indices.contains(&idx)
+                            // Downcast to the concrete PtyPair type.
+                            && let Ok(pty_pair) = arc
+                                .downcast::<litebox::fs::devices::PtyPair<crate::Platform>>()
+                        {
+                            pairs.push((idx, pty_pair));
+                            seen_indices.push(idx);
+                        }
+                    }
+                    #[cfg(feature = "trace_syscalls")]
+                    litebox::log_println!(
+                        self.global.platform,
+                        "[FORK-DIAG] pid={}: captured {} pty_pairs",
+                        self.pid,
+                        pairs.len(),
+                    );
+                    pairs
+                },
+                parent_mux_pipe_pair_ids: self.mux_pipe_pair_ids.borrow().clone(),
             };
             (
                 self.process_state.clone(),                  // share parent's PM
@@ -2579,6 +2688,7 @@ impl<FS: ShimFS> Task<FS> {
                         deferred_vfork_park: core::cell::Cell::new(false),
                         delayed_fork_pending: core::cell::Cell::new(delayed_fork),
                         migrated_to_remote: core::cell::Cell::new(false),
+                        mux_pipe_pair_ids: core::cell::RefCell::new(alloc::vec::Vec::new()),
                     },
                 }),
             )
@@ -2608,6 +2718,26 @@ impl<FS: ShimFS> Task<FS> {
 
         // 6. For vfork (shared), block the parent until child execs or exits.
         //    For independent fork, the parent continues immediately.
+        #[cfg(feature = "trace_syscalls")]
+        {
+            let comm_bytes = self.comm.get();
+            let comm_str = core::str::from_utf8(
+                &comm_bytes[..comm_bytes
+                    .iter()
+                    .position(|&b| b == 0)
+                    .unwrap_or(comm_bytes.len())],
+            )
+            .unwrap_or("<invalid>");
+            litebox::log_println!(
+                self.global.platform,
+                "[FORK-CHILD] parent_pid={} parent_comm={:?}: spawned child_pid={} delayed_fork={} is_shared={}",
+                self.pid,
+                comm_str,
+                child_pid,
+                delayed_fork,
+                is_shared,
+            );
+        }
         if let Some(vd) = vfork_done {
             // Like Linux's TASK_UNINTERRUPTIBLE wait: keep blocking even if
             // interrupted, because parent and child share the same guest stack.
@@ -2632,6 +2762,7 @@ impl<FS: ShimFS> Task<FS> {
             if !replacements.is_empty() {
                 use super::host_pipe::HostPipeDirection;
 
+                #[cfg(feature = "trace_syscalls")]
                 litebox::log_println!(
                     self.global.platform,
                     "[FD-REPLACE] pid={}: processing {} fd replacements",
@@ -2641,6 +2772,7 @@ impl<FS: ShimFS> Task<FS> {
 
                 let files = self.files.borrow();
                 for repl in replacements {
+                    #[cfg(feature = "trace_syscalls")]
                     litebox::log_println!(
                         self.global.platform,
                         "[FD-REPLACE] pid={}: replacing guest_fd={} (host_fd={}, dir={:?})",
@@ -2657,6 +2789,12 @@ impl<FS: ShimFS> Task<FS> {
                         litebox::pipes::Flags::empty(),
                         core::num::NonZero::new(4096),
                     );
+
+                    // Record this pipe's pair_id as mux-managed so future
+                    // children don't try to bridge it again.
+                    if let Ok(pair_id) = self.global.pipes.pipe_pair_id(&sender) {
+                        self.mux_pipe_pair_ids.borrow_mut().push(pair_id);
+                    }
 
                     // Read direction: parent reads ← relay writes ← OS pipe
                     // Write direction: parent writes → relay reads → OS pipe
@@ -2802,6 +2940,7 @@ impl<FS: ShimFS> Task<FS> {
                     self.global.platform.spawn_background_task(move || {
                         use crate::multiplexer::MuxMessage;
                         for &sid in &orphan_streams {
+                            #[cfg(feature = "trace_syscalls")]
                             litebox::log_println!(
                                 platform,
                                 "[PARENT-MUX] sending RESET for orphan stream={} (no dispatcher)",
@@ -2923,6 +3062,7 @@ impl<FS: ShimFS> Task<FS> {
 
                         seen_streams.push((ms.stream_id, ms.guest_fd));
 
+                        #[cfg(feature = "trace_syscalls")]
                         litebox::log_println!(
                             self.global.platform,
                             "[PARENT-MUX] setup stream={} guest_fd={} dir={:?} use_existing={} host_pipe={}",
@@ -2933,38 +3073,41 @@ impl<FS: ShimFS> Task<FS> {
                             ms.host_pipe_fd,
                         );
 
-                        // Create a virtual pipe pair for this stream.
-                        let (sender, receiver) = self.global.pipes.create_pipe(
-                            1024 * 1024,
-                            litebox::pipes::Flags::empty(),
-                            core::num::NonZero::new(4096),
-                        );
-
-                        let (parent_pipe_fd, dispatch_pipe_fd) = match ms.direction {
-                            HostPipeDirection::Read => (receiver, sender),
-                            HostPipeDirection::Write => (sender, receiver),
-                        };
-
                         let dir_byte = match ms.direction {
                             HostPipeDirection::Read => b'r',
                             HostPipeDirection::Write => b'w',
                         };
 
                         if ms.use_existing_pipe {
-                            // Nested fork: use the parent's existing pipe at
-                            // guest_fd directly.  Don't create a new pipe or
-                            // replace the fd table entry.  The dispatcher
-                            // reads from / writes to the existing pipe end.
+                            // use_existing_pipe: the parent already has a pipe
+                            // at guest_fd.  For Read (b'r', WorkerToParent),
+                            // this is a SenderHalf — the dispatcher writes mux
+                            // data INTO it, and whoever holds the matching
+                            // ReceiverHalf (e.g. copilot's Go runtime) reads
+                            // from it.  For Write (b'w', ParentToWorker), this
+                            // is a ReceiverHalf — the dispatcher reads from it.
                             //
-                            // Duplicate the pipe so the DT entry survives
-                            // if the parent later closes this guest_fd.
-                            // Same keepalive pattern as the replacement path.
+                            // Don't create a new pipe or replace the fd table
+                            // entry.  Duplicate the pipe so the DT entry
+                            // survives if the parent later closes this guest_fd.
                             let rds = files.raw_descriptor_store.read();
                             if let Ok(existing_fd) = rds
                                 .fd_from_raw_integer::<litebox::pipes::Pipes<crate::Platform>>(
                                     ms.guest_fd,
                                 )
                             {
+                                #[cfg(feature = "trace_syscalls")]
+                                {
+                                    let pipe_type = self.global.pipes.half_pipe_type(&existing_fd);
+                                    litebox::log_println!(
+                                        self.global.platform,
+                                        "[PARENT-MUX] use_existing_pipe: stream={} guest_fd={} dir={} pipe_type={:?}",
+                                        ms.stream_id,
+                                        ms.guest_fd,
+                                        dir_byte as char,
+                                        pipe_type,
+                                    );
+                                }
                                 drop(rds);
                                 // The dispatch endpoint uses a DUPLICATE.
                                 // The duplicate keeps the DT entry alive
@@ -2990,6 +3133,27 @@ impl<FS: ShimFS> Task<FS> {
                             }
                             continue;
                         }
+
+                        // Create a virtual pipe pair for this stream.
+                        // This is only needed for first-fork (fd replacement)
+                        // and host-pipe relay paths — NOT for use_existing_pipe
+                        // which reuses the parent's existing pipe directly.
+                        let (sender, receiver) = self.global.pipes.create_pipe(
+                            1024 * 1024,
+                            litebox::pipes::Flags::empty(),
+                            core::num::NonZero::new(4096),
+                        );
+
+                        // Record this pipe's pair_id as mux-managed so future
+                        // children don't try to bridge it again.
+                        if let Ok(pair_id) = self.global.pipes.pipe_pair_id(&sender) {
+                            self.mux_pipe_pair_ids.borrow_mut().push(pair_id);
+                        }
+
+                        let (parent_pipe_fd, dispatch_pipe_fd) = match ms.direction {
+                            HostPipeDirection::Read => (receiver, sender),
+                            HostPipeDirection::Write => (sender, receiver),
+                        };
 
                         if ms.host_pipe_fd >= 0 {
                             // Host-backed pipe: spawn a relay thread that
@@ -3060,21 +3224,211 @@ impl<FS: ShimFS> Task<FS> {
                                     }
                                 }
                             });
+                        } else if let Some(pty_pair) = ms.pty_pair {
+                            // PTY-backed stream: spawn a relay thread that
+                            // bridges between the PtyPair ring buffers and
+                            // a virtual pipe.  The dispatcher relays between
+                            // the mux socketpair and the virtual pipe as usual.
+                            let platform = self.global.platform;
+                            let pipes_clone = self.global.pipes.clone();
+                            let direction = ms.direction;
+                            let relay_fd: alloc::sync::Arc<
+                                litebox::fd::TypedFd<litebox::pipes::Pipes<crate::Platform>>,
+                            > = parent_pipe_fd.into();
+
+                            #[cfg(feature = "trace_syscalls")]
+                            litebox::log_println!(
+                                platform,
+                                "[PARENT-MUX] spawning PTY relay thread stream={} dir={:?}",
+                                ms.stream_id,
+                                direction,
+                            );
+
+                            self.global.platform.spawn_background_task(move || {
+                                let wait_state = litebox::event::wait::WaitState::new(platform);
+                                let cx = wait_state.context();
+                                let mut buf = alloc::vec![0u8; 65536];
+
+                                match direction {
+                                    HostPipeDirection::Read => {
+                                        // Parent reads: child wrote to slave,
+                                        // data is in slave_to_master ring.
+                                        // Relay: read virtual pipe → write
+                                        // to slave_to_master → wake master.
+                                        //
+                                        // Wait — this direction means the
+                                        // DISPATCHER reads from the mux and
+                                        // writes to the dispatch pipe (sender).
+                                        // The relay thread reads from the
+                                        // parent_pipe (receiver) and pushes
+                                        // into slave_to_master.
+                                        //
+                                        // Data flow:
+                                        //   child writes → mux → dispatcher
+                                        //   → dispatch_pipe(sender) → ...
+                                        //   → relay_fd(receiver) → ring buffer
+                                        //   slave_to_master → copilot reads
+                                        //   from master
+                                        loop {
+                                            match pipes_clone.read(&cx, &relay_fd, &mut buf) {
+                                                Ok(0) | Err(_) => break,
+                                                Ok(n) => {
+                                                    let mut ring = pty_pair.slave_to_master.lock();
+                                                    ring.extend(&buf[..n]);
+                                                    drop(ring);
+                                                    // Wake master pollee so
+                                                    // copilot's epoll/read sees
+                                                    // new data.
+                                                    pty_pair.master_pollee.notify_observers(
+                                                        litebox::event::Events::IN,
+                                                    );
+                                                }
+                                            }
+                                        }
+                                        let _ = pipes_clone.close(&relay_fd);
+                                    }
+                                    HostPipeDirection::Write => {
+                                        // Parent writes: copilot writes to
+                                        // master, data goes to master_to_slave
+                                        // ring.  Relay: read master_to_slave
+                                        // → write to virtual pipe → dispatcher
+                                        // → mux → child reads from slave.
+                                        //
+                                        // Data flow:
+                                        //   copilot writes to master →
+                                        //   master_to_slave ring →
+                                        //   relay reads ring → relay_fd
+                                        //   (sender) → dispatch_pipe(receiver)
+                                        //   → dispatcher → mux → child reads
+                                        //
+                                        // Poll the master_to_slave ring.
+                                        // Use slave_pollee for event-driven
+                                        // wakeup (the slave pollee signals
+                                        // when data is available for slave
+                                        // reads = master_to_slave has data).
+                                        use litebox::event::polling::TryOpError;
+                                        loop {
+                                            // Check if the master is still open.
+                                            if pty_pair
+                                                .master_open_count
+                                                .load(core::sync::atomic::Ordering::Acquire)
+                                                == 0
+                                            {
+                                                // Drain any remaining data.
+                                                let mut ring = pty_pair.master_to_slave.lock();
+                                                if ring.is_empty() {
+                                                    break;
+                                                }
+                                                let len = ring.len().min(buf.len());
+                                                for (i, b) in ring.drain(..len).enumerate() {
+                                                    buf[i] = b;
+                                                }
+                                                drop(ring);
+                                                let mut off = 0;
+                                                while off < len {
+                                                    if let Ok(w) = pipes_clone.write(
+                                                        &cx,
+                                                        &relay_fd,
+                                                        &buf[off..len],
+                                                    ) {
+                                                        off += w;
+                                                    } else {
+                                                        let _ = pipes_clone.close(&relay_fd);
+                                                        return;
+                                                    }
+                                                }
+                                                continue;
+                                            }
+
+                                            // Block until slave_pollee fires
+                                            // (master wrote to master_to_slave).
+                                            let drain_result: Result<
+                                                usize,
+                                                TryOpError<core::convert::Infallible>,
+                                            > = pty_pair.slave_pollee.wait(
+                                                &cx,
+                                                false, // blocking
+                                                litebox::event::Events::IN,
+                                                || {
+                                                    let mut ring = pty_pair.master_to_slave.lock();
+                                                    if ring.is_empty() {
+                                                        // Also check master close
+                                                        // to avoid blocking forever.
+                                                        if pty_pair.master_open_count.load(
+                                                            core::sync::atomic::Ordering::Acquire,
+                                                        ) == 0
+                                                        {
+                                                            return Ok(0usize);
+                                                        }
+                                                        return Err(TryOpError::TryAgain);
+                                                    }
+                                                    let len = ring.len().min(buf.len());
+                                                    for (i, b) in ring.drain(..len).enumerate() {
+                                                        buf[i] = b;
+                                                    }
+                                                    Ok(len)
+                                                },
+                                            );
+
+                                            match drain_result {
+                                                Ok(0) | Err(_) => break, // master closed or wait error
+                                                Ok(n) => {
+                                                    let mut off = 0;
+                                                    while off < n {
+                                                        if let Ok(w) = pipes_clone.write(
+                                                            &cx,
+                                                            &relay_fd,
+                                                            &buf[off..n],
+                                                        ) {
+                                                            off += w;
+                                                        } else {
+                                                            let _ = pipes_clone.close(&relay_fd);
+                                                            return;
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        let _ = pipes_clone.close(&relay_fd);
+                                    }
+                                }
+                            });
                         } else {
                             // Virtual pipe/socket stream: install the parent
                             // end in the fd table, consuming the old entry.
                             //
-                            // Duplicate the parent pipe fd BEFORE installing
-                            // so the dispatcher holds an independent reference.
-                            // When the parent later closes this guest_fd, the
-                            // duplicate keeps the pipe's SharedEntry alive,
-                            // preventing is_peer_shutdown() from triggering
-                            // on the dispatch (sender) end.
-                            let parent_pipe_keepalive = self
-                                .global
-                                .litebox
-                                .descriptor_table_mut()
-                                .duplicate(&parent_pipe_fd);
+                            // For Read (WorkerToParent) direction:
+                            //   parent_pipe_fd is a ReceiverHalf. Duplicate it
+                            //   so the dispatcher holds an independent reference.
+                            //   When the parent later closes this guest_fd, the
+                            //   duplicate keeps the pipe's SharedEntry alive,
+                            //   preventing premature EOF on the dispatch
+                            //   (sender) end.
+                            //
+                            // For Write (ParentToWorker) direction:
+                            //   parent_pipe_fd is a SenderHalf. Do NOT keep it
+                            //   alive — when the parent closes the guest_fd,
+                            //   we WANT the SenderHalf's SharedEntry to drop
+                            //   so is_peer_shutdown() returns true on the
+                            //   dispatch ReceiverHalf, triggering is_read_eof()
+                            //   and sending EOF to the worker.
+                            let parent_pipe_keepalive = if ms.direction == HostPipeDirection::Read {
+                                self.global
+                                    .litebox
+                                    .descriptor_table_mut()
+                                    .duplicate(&parent_pipe_fd)
+                            } else {
+                                None
+                            };
+
+                            #[cfg(feature = "trace_syscalls")]
+                            litebox::log_println!(
+                                self.global.platform,
+                                "[PARENT-MUX] stream={} dir={:?} keepalive={}",
+                                ms.stream_id,
+                                ms.direction,
+                                parent_pipe_keepalive.is_some(),
+                            );
 
                             let old_pipe;
                             let old_socket;
@@ -3145,6 +3499,11 @@ impl<FS: ShimFS> Task<FS> {
                     let mux_fd = parent_mux_raw;
 
                     self.global.platform.spawn_background_task(move || {
+                        use crate::multiplexer::{
+                            HEADER_SIZE, MSG_FLAG_EOF, MSG_FLAG_RESET, MSG_TYPE_DATA, MuxMessage,
+                        };
+                        const MUX_MAX_PAYLOAD: usize = 61440;
+
                         // Keepalive references prevent SharedEntry drops
                         // while the dispatcher runs.  They must be
                         // explicitly closed on exit to free DT entries
@@ -3176,12 +3535,7 @@ impl<FS: ShimFS> Task<FS> {
                         // _keepalive_guard Drop ensures cleanup on
                         // all exit paths including panics.
 
-                        use crate::multiplexer::{
-                            HEADER_SIZE, MSG_FLAG_EOF, MSG_FLAG_RESET, MSG_TYPE_DATA, MuxMessage,
-                        };
-
-                        const MUX_MAX_PAYLOAD: usize = 61440;
-
+                        #[cfg(feature = "trace_syscalls")]
                         litebox::log_println!(
                             platform,
                             "[PARENT-MUX] dispatcher started, {} endpoints, mux_fd={}",
@@ -3198,12 +3552,27 @@ impl<FS: ShimFS> Task<FS> {
                         // and must not be lost.
                         'drain: for (stream_id, _, _, drained) in &dispatch_endpoints {
                             if !drained.is_empty() {
+                                #[cfg(feature = "trace_syscalls")]
+                                litebox::log_println!(
+                                    platform,
+                                    "[PARENT-MUX] sending initial drained data stream={} len={}",
+                                    stream_id,
+                                    drained.len(),
+                                );
                                 for chunk in drained.chunks(MUX_MAX_PAYLOAD) {
                                     let msg = MuxMessage::data(*stream_id, chunk.to_vec());
                                     let buf = msg.serialize();
                                     match platform.write_host_fd(mux_fd, &buf) {
                                         Ok(w) if w == buf.len() => {}
-                                        _ => break 'drain,
+                                        _ => {
+                                            #[cfg(feature = "trace_syscalls")]
+                                            litebox::log_println!(
+                                                platform,
+                                                "[PARENT-MUX] initial send failed for stream={}",
+                                                stream_id,
+                                            );
+                                            break 'drain;
+                                        }
                                     }
                                 }
                             }
@@ -3214,6 +3583,7 @@ impl<FS: ShimFS> Task<FS> {
                         // polling forever.  Self-pipe streams are excluded
                         // from orphans (handled separately below).
                         for &sid in &orphan_streams {
+                            #[cfg(feature = "trace_syscalls")]
                             litebox::log_println!(
                                 platform,
                                 "[PARENT-MUX] sending RESET for orphan stream={}",
@@ -3254,6 +3624,7 @@ impl<FS: ShimFS> Task<FS> {
                             match platform.read_host_fd(mux_fd, &mut recv_buf) {
                                 Ok(0) => {
                                     // Socketpair closed — worker exited.
+                                    #[cfg(feature = "trace_syscalls")]
                                     litebox::log_println!(
                                         platform,
                                         "[PARENT-MUX] socketpair closed (worker gone), {} open endpoints",
@@ -3270,6 +3641,7 @@ impl<FS: ShimFS> Task<FS> {
                                     if let Some(msg) = MuxMessage::deserialize(&recv_buf[..n])
                                         && msg.msg_type == MSG_TYPE_DATA
                                     {
+                                        #[cfg(feature = "trace_syscalls")]
                                         litebox::log_println!(
                                             platform,
                                             "[PARENT-MUX] recv stream={} flags={:#x} len={}",
@@ -3293,26 +3665,57 @@ impl<FS: ShimFS> Task<FS> {
                                         } else if !msg.data.is_empty() {
                                             // Fan out data to ALL endpoints
                                             // matching this stream_id.
-                                            for (idx, (sid, _, relay_fd, _)) in
+                                            for (idx, (sid, _dir_byte, relay_fd, _)) in
                                                 dispatch_endpoints.iter().enumerate()
                                             {
                                                 if *sid == msg.stream_id && !closed_endpoints[idx] {
+                                                    #[cfg(feature = "trace_syscalls")]
+                                                    {
+                                                        let pipe_type = pipes.half_pipe_type(relay_fd);
+                                                        litebox::log_println!(
+                                                            platform,
+                                                            "[PARENT-MUX] writing {} bytes to stream={} dir={} relay pipe_type={:?}",
+                                                            msg.data.len(),
+                                                            sid,
+                                                            *_dir_byte as char,
+                                                            pipe_type,
+                                                        );
+                                                    }
                                                     let mut offset = 0;
                                                     while offset < msg.data.len() {
-                                                        if let Ok(w) = pipes.write(
+                                                        match pipes.write(
                                                             &cx,
                                                             relay_fd,
                                                             &msg.data[offset..],
                                                         ) {
-                                                            offset += w;
-                                                        } else {
-                                                            // Local reader gone — close
-                                                            // endpoint and notify peer.
-                                                            let _ = pipes.close(relay_fd);
-                                                            closed_endpoints[idx] = true;
-                                                            let rst = MuxMessage::reset(*sid);
-                                                            send_control(platform, mux_fd, &rst);
-                                                            break;
+                                                            Ok(w) => {
+                                                                #[cfg(feature = "trace_syscalls")]
+                                                                litebox::log_println!(
+                                                                    platform,
+                                                                    "[PARENT-MUX] pipes.write stream={} wrote {} bytes (offset {}/{})",
+                                                                    sid,
+                                                                    w,
+                                                                    offset + w,
+                                                                    msg.data.len(),
+                                                                );
+                                                                offset += w;
+                                                            }
+                                                            Err(_e) => {
+                                                                #[cfg(feature = "trace_syscalls")]
+                                                                litebox::log_println!(
+                                                                    platform,
+                                                                    "[PARENT-MUX] pipes.write stream={} FAILED: {:?}",
+                                                                    sid,
+                                                                    _e,
+                                                                );
+                                                                // Local reader gone — close
+                                                                // endpoint and notify peer.
+                                                                let _ = pipes.close(relay_fd);
+                                                                closed_endpoints[idx] = true;
+                                                                let rst = MuxMessage::reset(*sid);
+                                                                send_control(platform, mux_fd, &rst);
+                                                                break;
+                                                            }
                                                         }
                                                     }
                                                 }
@@ -3340,6 +3743,12 @@ impl<FS: ShimFS> Task<FS> {
                                 match pipes.drain_available(relay_fd) {
                                     Ok(data) if data.is_empty() => {
                                         if pipes.is_read_eof(relay_fd) {
+                                            #[cfg(feature = "trace_syscalls")]
+                                            litebox::log_println!(
+                                                platform,
+                                                "[PARENT-MUX] stream={} is_read_eof=true, sending EOF",
+                                                stream_id,
+                                            );
                                             let _ = pipes.close(relay_fd);
                                             let msg = MuxMessage::eof(*stream_id);
                                             send_control(platform, mux_fd, &msg);
@@ -3348,6 +3757,7 @@ impl<FS: ShimFS> Task<FS> {
                                     }
                                     Ok(data) => {
                                         did_work = true;
+                                        #[cfg(feature = "trace_syscalls")]
                                         litebox::log_println!(
                                             platform,
                                             "[PARENT-MUX] send stream={} len={}",
@@ -3444,11 +3854,24 @@ impl<FS: ShimFS> Task<FS> {
             *this.fork_context.borrow_mut() = Some(fc);
         };
 
-        litebox::log_println!(
-            self.global.platform,
-            "[DELAYED-FORK] pid={}: commit_delayed_fork ENTERED",
-            self.pid,
-        );
+        #[cfg(feature = "trace_syscalls")]
+        {
+            let comm_bytes = self.comm.get();
+            let comm_str = core::str::from_utf8(
+                &comm_bytes[..comm_bytes
+                    .iter()
+                    .position(|&b| b == 0)
+                    .unwrap_or(comm_bytes.len())],
+            )
+            .unwrap_or("<invalid>");
+            litebox::log_println!(
+                self.global.platform,
+                "[DELAYED-FORK] pid={} comm={:?} ppid={}: commit_delayed_fork ENTERED",
+                self.pid,
+                comm_str,
+                self.ppid,
+            );
+        }
 
         #[cfg(feature = "trace_syscalls")]
         litebox::log_println!(
@@ -3547,6 +3970,7 @@ impl<FS: ShimFS> Task<FS> {
             }
         };
 
+        #[cfg(feature = "trace_syscalls")]
         litebox::log_println!(
             self.global.platform,
             "[DELAYED-FORK] pid={}: snapshot_signal",
@@ -3554,6 +3978,7 @@ impl<FS: ShimFS> Task<FS> {
         );
         let signal = self.snapshot_signal();
         let fs = self.snapshot_fs();
+        #[cfg(feature = "trace_syscalls")]
         litebox::log_println!(
             self.global.platform,
             "[DELAYED-FORK] pid={}: snapshot_fs",
@@ -3561,6 +3986,7 @@ impl<FS: ShimFS> Task<FS> {
         );
         let fd_table = self.snapshot_fd_table(&mut reject);
         let memory = self.snapshot_memory(&mut reject);
+        #[cfg(feature = "trace_syscalls")]
         litebox::log_println!(
             self.global.platform,
             "[DELAYED-FORK] pid={}: snapshot_fd_table",
@@ -3568,12 +3994,14 @@ impl<FS: ShimFS> Task<FS> {
         );
 
         // Check rejection gate.
+        #[cfg(feature = "trace_syscalls")]
         litebox::log_println!(
             self.global.platform,
             "[DELAYED-FORK] pid={}: snapshot_memory",
             self.pid
         );
         if !reject.is_empty() {
+            #[cfg(feature = "trace_syscalls")]
             litebox::log_println!(
                 self.global.platform,
                 "[DELAYED-FORK] pid={}: REJECTED — {}",
@@ -3591,6 +4019,7 @@ impl<FS: ShimFS> Task<FS> {
             return Err(Errno::ENOSYS);
         }
 
+        #[cfg(feature = "trace_syscalls")]
         litebox::log_println!(
             self.global.platform,
             "[DELAYED-FORK] pid={}: entering pipe bridging",
@@ -3618,6 +4047,10 @@ impl<FS: ShimFS> Task<FS> {
         > = Vec::new();
         // - host OS fd for host-backed pipes (-1 for new OS pipe bridges)
         let mut bridge_host_fd: Vec<i32> = Vec::new();
+        // - PTY pair for PTY-bridged streams (None for pipe/socket streams)
+        let mut bridge_pty_pair: Vec<
+            Option<alloc::sync::Arc<litebox::fs::devices::PtyPair<crate::Platform>>>,
+        > = Vec::new();
         let mut mux_worker_fd_raw: i32 = -1;
         // (stream_id, guest_fd, dir_byte, type_byte, initial_eof)
         let mut mux_stream_specs: Vec<(u32, usize, u8, u8, bool)> = Vec::new();
@@ -3663,6 +4096,41 @@ impl<FS: ShimFS> Task<FS> {
             drop(rds);
             drop(files);
 
+            // Filter out mux-managed pipes inherited from the parent.
+            // These are infrastructure virtual pipes created by a prior
+            // sibling's mux dispatcher or fd-replacement relay.  Bridging
+            // them would create nested mux-over-mux, destroying the first
+            // mux's data flow.
+            if !fc.parent_mux_pipe_pair_ids.is_empty() {
+                let _before = child_pipes.len();
+                child_pipes.retain(|&(_raw_fd, _, pair_id)| {
+                    let is_mux = fc.parent_mux_pipe_pair_ids.contains(&pair_id);
+                    #[cfg(feature = "trace_syscalls")]
+                    if is_mux {
+                        litebox::log_println!(
+                            self.global.platform,
+                            "[DELAYED-FORK] pid={}: filtering inherited mux pipe fd={} pair_id={:#x}",
+                            self.pid,
+                            _raw_fd,
+                            pair_id,
+                        );
+                    }
+                    !is_mux
+                });
+                #[cfg(feature = "trace_syscalls")]
+                if child_pipes.len() < _before {
+                    litebox::log_println!(
+                        self.global.platform,
+                        "[DELAYED-FORK] pid={}: filtered {} mux-managed pipes from child_pipes ({} → {})",
+                        self.pid,
+                        _before - child_pipes.len(),
+                        _before,
+                        child_pipes.len(),
+                    );
+                }
+            }
+
+            #[cfg(feature = "trace_syscalls")]
             litebox::log_println!(
                 self.global.platform,
                 "[DELAYED-FORK] pid={}: found {} child_pipes, {} host_pipe_fds",
@@ -3759,6 +4227,7 @@ impl<FS: ShimFS> Task<FS> {
                 }
             }
             if !local_pipe_pairs.is_empty() {
+                #[cfg(feature = "trace_syscalls")]
                 litebox::log_println!(
                     self.global.platform,
                     "[DELAYED-FORK] pid={}: {} child-only pipe pair(s) → local in worker",
@@ -3798,6 +4267,20 @@ impl<FS: ShimFS> Task<FS> {
 
             let mut parent_replacements: Vec<crate::FdReplacement> = Vec::new();
 
+            // Log parent_pipe_fds for debugging counterpart matching.
+            #[cfg(feature = "trace_syscalls")]
+            for &(fd, dir, pair_id) in &fc.parent_pipe_fds {
+                litebox::log_println!(
+                    self.global.platform,
+                    "[DELAYED-FORK] pid={}: parent_pipe_fd: fd={} dir={:?} pair_id={:#x}",
+                    self.pid,
+                    fd,
+                    dir,
+                    pair_id,
+                );
+            }
+
+            #[cfg(feature = "trace_syscalls")]
             litebox::log_println!(
                 self.global.platform,
                 "[DELAYED-FORK] pid={}: starting OS pipe creation for {} pipes",
@@ -3818,6 +4301,15 @@ impl<FS: ShimFS> Task<FS> {
                 Vec::new(); // (pair_id, dir, bridge_index)
 
             for &(child_fd, child_dir, child_pair_id) in &child_pipes {
+                #[cfg(feature = "trace_syscalls")]
+                litebox::log_println!(
+                    self.global.platform,
+                    "[DELAYED-FORK] pid={}: child_pipe: fd={} dir={:?} pair_id={:#x}",
+                    self.pid,
+                    child_fd,
+                    child_dir,
+                    child_pair_id,
+                );
                 // Dedup: if another child fd with the same (pair_id,
                 // direction) was already bridged, DON'T create a
                 // separate bridge/stream.  Instead, record as an
@@ -3832,6 +4324,7 @@ impl<FS: ShimFS> Task<FS> {
                     continue;
                 }
 
+                #[cfg(feature = "trace_syscalls")]
                 litebox::log_println!(
                     self.global.platform,
                     "[DELAYED-FORK] pid={}: creating OS pipe for child_fd={} dir={:?}",
@@ -3870,6 +4363,7 @@ impl<FS: ShimFS> Task<FS> {
 
                 // For Read-direction children: drain any data already buffered
                 // in the virtual pipe into the OS pipe.
+                #[cfg(feature = "trace_syscalls")]
                 litebox::log_println!(
                     self.global.platform,
                     "[DELAYED-FORK] pid={}: OS pipe created for fd={}, starting drain check",
@@ -3881,6 +4375,7 @@ impl<FS: ShimFS> Task<FS> {
                 // commits and needs that data in the OS pipe.
                 let mut this_drained: Vec<u8> = Vec::new();
                 if child_dir == HostPipeDirection::Read {
+                    #[cfg(feature = "trace_syscalls")]
                     litebox::log_println!(
                         self.global.platform,
                         "[DELAYED-FORK] pid={}: drain: borrowing files for fd={}",
@@ -3889,6 +4384,7 @@ impl<FS: ShimFS> Task<FS> {
                     );
                     let files = self.files.borrow();
                     let rds = files.raw_descriptor_store.read();
+                    #[cfg(feature = "trace_syscalls")]
                     litebox::log_println!(
                         self.global.platform,
                         "[DELAYED-FORK] pid={}: drain: got rds lock for fd={}",
@@ -3899,6 +4395,7 @@ impl<FS: ShimFS> Task<FS> {
                         rds.fd_from_raw_integer::<litebox::pipes::Pipes<crate::Platform>>(child_fd)
                     {
                         drop(rds);
+                        #[cfg(feature = "trace_syscalls")]
                         litebox::log_println!(
                             self.global.platform,
                             "[DELAYED-FORK] pid={}: drain: calling drain_available for fd={}",
@@ -3949,6 +4446,7 @@ impl<FS: ShimFS> Task<FS> {
                 child_pipe_bridges.push((child_fd, child_os_fd, child_dir));
                 bridge_drained.push(this_drained);
                 bridge_host_fd.push(-1);
+                bridge_pty_pair.push(None);
 
                 // Record for dedup so aliases reuse this bridge.
                 pipe_dedup.push((child_pair_id, child_dir, child_pipe_bridges.len() - 1));
@@ -3994,8 +4492,31 @@ impl<FS: ShimFS> Task<FS> {
                     HostPipeDirection::Read => HostPipeDirection::Write,
                     HostPipeDirection::Write => HostPipeDirection::Read,
                 };
+                // Strategy 1.5: pair_id + SAME direction.  Handles
+                // inherited/dup2'd pipe ends where the child got a copy of the
+                // parent's own end (same pair_id, same direction) and the
+                // sender/receiver lives in a different process.  The parent
+                // only holds one end of the pipe so this is never a first-fork
+                // scenario — we set matched_by_pair_id=false so is_first_fork
+                // uses the fd-number fallback which correctly returns false.
+                let parent_same_dir: Vec<(usize, HostPipeDirection)> = fc
+                    .parent_pipe_fds
+                    .iter()
+                    .filter(|&&(fd, dir, pair_id)| {
+                        pair_id == child_pair_id
+                            && dir == child_dir
+                            && !claimed_parent_fds.contains(&fd)
+                    })
+                    .map(|&(fd, _, _)| (fd, flow_dir))
+                    .collect();
+
                 let (counterparts, matched_by_pair_id) = if !parent_counterparts.is_empty() {
                     (parent_counterparts, true)
+                } else if !parent_same_dir.is_empty() {
+                    // Same-direction pair_id match — treat like fd-number
+                    // fallback for is_first_fork purposes (parent only has
+                    // one end, never first fork).
+                    (parent_same_dir, false)
                 } else if let Some(&(parent_fd, _, _)) = fc
                     .parent_pipe_fds
                     .iter()
@@ -4005,6 +4526,19 @@ impl<FS: ShimFS> Task<FS> {
                 } else {
                     (Vec::new(), false)
                 };
+
+                #[cfg(feature = "trace_syscalls")]
+                litebox::log_println!(
+                    self.global.platform,
+                    "[DELAYED-FORK] pid={}: counterpart child_fd={} child_pair_id={:#x} child_dir={:?} → {} match(es), by_pair_id={}, counterparts={:?}",
+                    self.pid,
+                    child_fd,
+                    child_pair_id,
+                    child_dir,
+                    counterparts.len(),
+                    matched_by_pair_id,
+                    counterparts,
+                );
 
                 // Mark all matched parent fds as claimed.
                 for &(fd, _) in &counterparts {
@@ -4046,6 +4580,16 @@ impl<FS: ShimFS> Task<FS> {
                             })
                         })
                     };
+
+                    #[cfg(feature = "trace_syscalls")]
+                    litebox::log_println!(
+                        self.global.platform,
+                        "[DELAYED-FORK] pid={}: child_fd={} is_first_fork={} matched_by_pair_id={}",
+                        self.pid,
+                        child_fd,
+                        is_first_fork,
+                        matched_by_pair_id,
+                    );
 
                     if is_first_fork {
                         // First fork: parent has both ends.  The relay
@@ -4092,6 +4636,7 @@ impl<FS: ShimFS> Task<FS> {
                 child_pipe_bridges.push((guest_fd, host_fd, direction));
                 bridge_drained.push(Vec::new());
                 bridge_host_fd.push(host_fd);
+                bridge_pty_pair.push(None);
                 bridge_parent_info.push(Vec::new());
             }
 
@@ -4334,6 +4879,7 @@ impl<FS: ShimFS> Task<FS> {
                     child_pipe_bridges.push((info.child_fd, child_os_fd, info.direction));
                     bridge_drained.push(this_socket_drained);
                     bridge_host_fd.push(-1);
+                    bridge_pty_pair.push(None);
 
                     // Find ALL parent peers (same pair_id, different object_id).
                     let parent_dir = match info.direction {
@@ -4399,6 +4945,106 @@ impl<FS: ShimFS> Task<FS> {
                 }
             }
 
+            // --- PTY slave bridging ---
+            // For each sandbox PTY slave fd in the child's snapshot, create an
+            // OS pipe pair so the mux can relay data between the parent's PTY
+            // ring buffers and the child worker.  The parent dispatcher spawns
+            // relay threads that bridge between the PtyPair ring buffers and
+            // virtual pipes.
+            {
+                use super::host_pipe::HostPipeDirection;
+
+                for entry in &fd_table.entries {
+                    if !entry.metadata.is_sandbox_pty_slave {
+                        continue;
+                    }
+                    let Some(pty_index) = entry.metadata.sandbox_pty_index else {
+                        continue;
+                    };
+
+                    // Find the PtyPair Arc captured at fork time.
+                    let pty_pair = fc
+                        .parent_pty_pairs
+                        .iter()
+                        .find(|(idx, _)| *idx == pty_index)
+                        .map(|(_, pair)| pair.clone());
+
+                    if pty_pair.is_none() {
+                        #[cfg(feature = "trace_syscalls")]
+                        litebox::log_println!(
+                            self.global.platform,
+                            "[DELAYED-FORK] pid={}: PTY slave fd={} pty_index={} — no PtyPair captured, skipping",
+                            self.pid,
+                            entry.fd,
+                            pty_index,
+                        );
+                        continue;
+                    }
+                    let pty_pair = pty_pair.unwrap();
+
+                    // Direction: fd 0 = child reads (ParentToWorker),
+                    //            fd 1/2 = child writes (WorkerToParent).
+                    let direction = if entry.fd == 0 {
+                        HostPipeDirection::Read
+                    } else {
+                        HostPipeDirection::Write
+                    };
+
+                    // Create an OS pipe pair for the child side.
+                    let (read_fd, write_fd) = match self.global.platform.create_host_pipe() {
+                        Ok(pair) => pair,
+                        Err(_e) => {
+                            #[cfg(feature = "trace_syscalls")]
+                            litebox::log_println!(
+                                self.global.platform,
+                                "[DELAYED-FORK] pid={}: create_host_pipe failed for PTY fd={}: {}",
+                                self.pid,
+                                entry.fd,
+                                _e,
+                            );
+                            for &(_, os_fd, _) in &child_pipe_bridges {
+                                self.global.platform.close_host_fd(os_fd);
+                            }
+                            for pr in &parent_replacements {
+                                self.global.platform.close_host_fd(pr.host_fd);
+                            }
+                            put_fc_back(self, fc);
+                            return Err(Errno::ENOMEM);
+                        }
+                    };
+
+                    // For Read (child reads): child gets read_fd, parent writes write_fd.
+                    // For Write (child writes): child gets write_fd, parent reads read_fd.
+                    let (child_os_fd, parent_os_fd) = match direction {
+                        HostPipeDirection::Read => (read_fd, write_fd),
+                        HostPipeDirection::Write => (write_fd, read_fd),
+                    };
+
+                    // Close the parent OS fd — the mux replaces per-fd relay.
+                    // The PTY relay thread uses PtyPair ring buffers, not OS fds.
+                    self.global.platform.close_host_fd(parent_os_fd);
+
+                    #[cfg(feature = "trace_syscalls")]
+                    litebox::log_println!(
+                        self.global.platform,
+                        "[DELAYED-FORK] pid={}: PTY bridge fd={} pty_index={} dir={:?} child_os_fd={}",
+                        self.pid,
+                        entry.fd,
+                        pty_index,
+                        direction,
+                        child_os_fd,
+                    );
+
+                    child_pipe_bridges.push((entry.fd, child_os_fd, direction));
+                    bridge_drained.push(Vec::new());
+                    bridge_host_fd.push(-1);
+                    bridge_pty_pair.push(Some(pty_pair));
+                    // No parent fd counterpart — the PTY relay bridges
+                    // between ring buffers and virtual pipes.
+                    bridge_parent_info.push(Vec::new());
+                }
+            }
+
             // --- Multiplexer setup ---
             // Replace per-fd OS pipe bridges with a single multiplexed channel.
             // The child worker gets virtual pipe endpoints via --mux-stream,
@@ -4446,53 +5092,95 @@ impl<FS: ShimFS> Task<FS> {
                         HostPipeDirection::Read => b'r',
                         HostPipeDirection::Write => b'w',
                     };
-                    let type_byte = bridge_parent_info.get(i).and_then(|v| v.first()).map_or(
-                        b'p',
-                        |&(_, _, sub)| match sub {
-                            crate::ReplacedSubsystem::Pipe => b'p',
-                            crate::ReplacedSubsystem::UnixSocket => b's',
-                        },
-                    );
+                    let type_byte = if bridge_pty_pair.get(i).is_some_and(Option::is_some) {
+                        b't' // PTY-backed stream
+                    } else {
+                        bridge_parent_info.get(i).and_then(|v| v.first()).map_or(
+                            b'p',
+                            |&(_, _, sub)| match sub {
+                                crate::ReplacedSubsystem::Pipe => b'p',
+                                crate::ReplacedSubsystem::UnixSocket => b's',
+                                crate::ReplacedSubsystem::Pty => b't',
+                            },
+                        )
+                    };
 
                     // For Read-direction child pipes (child reads,
                     // parent writes): check if the parent's pipe is
                     // already EOF at setup time.  This lets the worker
                     // pre-close the relay sender so the child gets
                     // immediate EOF — preserving POSIX synchronous EOF.
-                    let initial_eof = if direction == HostPipeDirection::Read {
+                    //
+                    // IMPORTANT: Do NOT set initial_eof when there is
+                    // drained data for this stream.  The drain at
+                    // commit_delayed_fork empties the ring buffer, which
+                    // makes is_read_eof return true (sender shut down +
+                    // buffer empty).  But the drained data still needs to
+                    // be relayed through the mux to the child.  Setting
+                    // initial_eof would cause the worker to pre-close the
+                    // relay sender before the drained data arrives,
+                    // silently dropping it.
+                    let has_drained_data = bridge_drained.get(i).is_some_and(|d| !d.is_empty());
+                    let is_pty_stream = bridge_pty_pair.get(i).is_some_and(Option::is_some);
+                    let initial_eof = if has_drained_data {
+                        false
+                    } else if is_pty_stream {
+                        // PTY-backed streams are relayed through the PTY
+                        // relay thread — never signal initial EOF.  The
+                        // relay thread manages the lifecycle.
+                        false
+                    } else if direction == HostPipeDirection::Read {
                         // The parent's counterpart (Write direction) might
                         // already have its sender shut down.  Check via
                         // the OS pipe: the parent_os_fd is the write end.
                         // If the parent's virtual pipe receiver already
                         // sees EOF, the child should too.
+                        //
+                        // Guard against empty parent_info (vacuous .all()
+                        // would return true and falsely signal EOF).
                         bridge_parent_info.get(i).is_some_and(|parents| {
-                            parents.iter().all(|&(parent_fd, parent_dir, _)| {
-                                if parent_dir == HostPipeDirection::Write {
-                                    // Parent is a writer — check if the
-                                    // source pipe already has EOF.
-                                    let files = self.files.borrow();
-                                    let rds = files.raw_descriptor_store.read();
-                                    if let Ok(typed) = rds.fd_from_raw_integer::<
-                                        litebox::pipes::Pipes<crate::Platform>,
-                                    >(
-                                        parent_fd
-                                    ) {
-                                        drop(rds);
-                                        self.global.pipes.is_read_eof(&typed)
+                            !parents.is_empty()
+                                && parents.iter().all(|&(parent_fd, parent_dir, _)| {
+                                    if parent_dir == HostPipeDirection::Write {
+                                        // Parent is a writer — check if the
+                                        // source pipe already has EOF.
+                                        let files = self.files.borrow();
+                                        let rds = files.raw_descriptor_store.read();
+                                        if let Ok(typed) = rds.fd_from_raw_integer::<
+                                            litebox::pipes::Pipes<crate::Platform>,
+                                        >(
+                                            parent_fd
+                                        ) {
+                                            drop(rds);
+                                            self.global.pipes.is_read_eof(&typed)
+                                        } else {
+                                            drop(rds);
+                                            false
+                                        }
                                     } else {
-                                        drop(rds);
                                         false
                                     }
-                                } else {
-                                    false
-                                }
-                            })
+                                })
                         })
                     } else {
                         false
                     };
 
                     mux_stream_specs.push((stream_id, guest_fd, dir_byte, type_byte, initial_eof));
+
+                    if initial_eof || has_drained_data {
+                        #[cfg(feature = "trace_syscalls")]
+                        litebox::log_println!(
+                            self.global.platform,
+                            "[DELAYED-FORK] pid={}: stream={} fd={} dir={} initial_eof={} has_drained_data={}",
+                            self.pid,
+                            stream_id,
+                            guest_fd,
+                            dir_byte as char,
+                            initial_eof,
+                            has_drained_data,
+                        );
+                    }
 
                     let is_host_backed = bridge_host_fd.get(i).is_some_and(|&hf| hf >= 0);
 
@@ -4512,6 +5200,8 @@ impl<FS: ShimFS> Task<FS> {
                             drained_data: Vec::new(),
                             host_pipe_fd: bridge_host_fd[i],
                             use_existing_pipe: false,
+                            pty_pair: None,
+                            pty_is_master: false,
                         });
                     } else {
                         // Virtual pipe/socket bridge: close the child-side OS
@@ -4525,12 +5215,57 @@ impl<FS: ShimFS> Task<FS> {
                         let parents = bridge_parent_info.get(i).cloned().unwrap_or_default();
 
                         if parents.is_empty() {
-                            // No parent counterpart — stream has no parent
-                            // relay (broken pipe / already closed).  Still
-                            // include in mux_stream_specs so the worker sets
-                            // up the guest fd.  Send RESET at dispatcher
-                            // startup so the worker closes it immediately.
-                            orphan_stream_ids.push(stream_id);
+                            // Check if this is a PTY bridge.
+                            let pty = bridge_pty_pair.get(i).and_then(Clone::clone);
+                            if let Some(pty_pair) = pty {
+                                // PTY-backed stream: the parent dispatcher
+                                // spawns a relay thread that bridges between
+                                // the PtyPair ring buffers and a virtual pipe.
+                                // Direction for the relay: from the parent's
+                                // perspective, a WorkerToParent stream (child
+                                // writes) means the relay READS from the virtual
+                                // pipe and writes to slave_to_master.  A
+                                // ParentToWorker stream (child reads) means
+                                // the relay reads from master_to_slave and
+                                // WRITES to the virtual pipe.
+                                //
+                                // The MuxParentStream direction is from the
+                                // parent's perspective:
+                                //   child writes (WorkerToParent) => parent reads
+                                //   child reads  (ParentToWorker) => parent writes
+                                let parent_dir = match direction {
+                                    HostPipeDirection::Read => HostPipeDirection::Write,
+                                    HostPipeDirection::Write => HostPipeDirection::Read,
+                                };
+                                #[cfg(feature = "trace_syscalls")]
+                                litebox::log_println!(
+                                    self.global.platform,
+                                    "[DELAYED-FORK] pid={}: PTY mux stream={} fd={} child_dir={:?} parent_dir={:?}",
+                                    self.pid,
+                                    stream_id,
+                                    guest_fd,
+                                    direction,
+                                    parent_dir,
+                                );
+                                mux_parent_streams.push(crate::MuxParentStream {
+                                    stream_id,
+                                    guest_fd,
+                                    direction: parent_dir,
+                                    subsystem: crate::ReplacedSubsystem::Pty,
+                                    drained_data: drained,
+                                    host_pipe_fd: -1,
+                                    use_existing_pipe: false,
+                                    pty_pair: Some(pty_pair),
+                                    pty_is_master: false,
+                                });
+                            } else {
+                                // No parent counterpart — stream has no parent
+                                // relay (broken pipe / already closed).  Still
+                                // include in mux_stream_specs so the worker sets
+                                // up the guest fd.  Send RESET at dispatcher
+                                // startup so the worker closes it immediately.
+                                orphan_stream_ids.push(stream_id);
+                            }
                         } else {
                             for (j, &(parent_fd, parent_dir, subsystem)) in
                                 parents.iter().enumerate()
@@ -4545,6 +5280,8 @@ impl<FS: ShimFS> Task<FS> {
                                     use_existing_pipe: !parent_replacements
                                         .iter()
                                         .any(|pr| pr.guest_fd == parent_fd),
+                                    pty_pair: None,
+                                    pty_is_master: false,
                                 });
                             }
                         }
@@ -5270,11 +6007,45 @@ impl<FS: ShimFS> Task<FS> {
                     let is_pty_device = dt
                         .with_metadata(&fd, |_: &super::file::HostPtyDeviceFd| ())
                         .is_ok();
-                    let meta = if host_stdio_source.is_some() || is_tty_alias || is_pty_device {
+
+                    // Check if this is a sandbox PTY (userspace-emulated, major >= 136).
+                    // Extract PTY pair index from rdev: rdev = 0x8800 + index.
+                    // Only slaves (not masters) count — masters are the host
+                    // side and should not be bridged.
+                    let sandbox_pty_info: Option<u32> = files
+                        .fs
+                        .fd_file_status(&fd)
+                        .ok()
+                        .and_then(|s| s.node_info.rdev)
+                        .and_then(|rdev| {
+                            let major = rdev.get() >> 8;
+                            if major >= 136 {
+                                u32::try_from(rdev.get() - 0x8800).ok()
+                            } else {
+                                None
+                            }
+                        })
+                        .filter(|_| {
+                            // Verify this is actually a slave, not a master.
+                            // get_pty_pair_erased returns (arc, index, is_master).
+                            // If is_master is true, filter it out.
+                            files
+                                .fs
+                                .get_pty_pair_erased(&fd)
+                                .is_none_or(|(_, _, is_master)| !is_master)
+                        });
+
+                    let meta = if host_stdio_source.is_some()
+                        || is_tty_alias
+                        || is_pty_device
+                        || sandbox_pty_info.is_some()
+                    {
                         Some(FdMetadataSnapshot {
                             host_stdio_source_fd: host_stdio_source,
                             is_host_tty_alias: is_tty_alias,
                             is_host_pty_device: is_pty_device,
+                            is_sandbox_pty_slave: sandbox_pty_info.is_some(),
+                            sandbox_pty_index: sandbox_pty_info,
                             ..Default::default()
                         })
                     } else {
@@ -5332,24 +6103,48 @@ impl<FS: ShimFS> Task<FS> {
                 subsystem_class
             };
 
-            // Accept stdio, pipes, terminal filesystem fds, connected
-            // Unix sockets on stdio slots, and non-terminal filesystem fds.
-            //
-            // Non-terminal FilesystemFd on stdio slots (fd <= 2) without
-            // host-stdio-source metadata are rejected — these are typically
-            // PTY slaves opened by the guest (e.g. bash opens /dev/pts/N).
-            // PTY communication requires the master/slave relationship which
-            // doesn't survive across host processes.  Non-terminal fds on
-            // fd > 2 (e.g. bash's saved fd 255) are safe to accept and
-            // reopen by path.
+            // Accept stdio, pipes, terminal filesystem fds, sandbox PTY fds on
+            // stdio slots, connected Unix sockets on stdio slots.
             match class {
                 FdClass::StdioFd | FdClass::Pipe => {}
+                FdClass::FilesystemFd
+                    if terminal_meta.is_some()
+                        && terminal_meta
+                            .as_ref()
+                            .is_some_and(|m| m.is_sandbox_pty_slave) =>
+                {
+                    // Sandbox PTY slave — accepted on any fd slot for bridging.
+                }
                 FdClass::FilesystemFd if terminal_meta.is_some() => {}
                 FdClass::FilesystemFd if raw_fd > 2 => {}
                 FdClass::UnixSocket if raw_fd <= 2 && socket_pair_id.is_some() => {}
                 _ => {
                     reject.push(ForkRejectReason::UnsupportedFdClass { fd: raw_fd, class });
                 }
+            }
+
+            // Per-fd diagnostic trace for delayed-fork analysis.
+            #[cfg(feature = "trace_syscalls")]
+            {
+                let fd_path_str = if let Ok(fd_handle) = rds.fd_from_raw_integer::<FS>(raw_fd) {
+                    files
+                        .fs
+                        .fd_path(&fd_handle)
+                        .unwrap_or_else(|| "<no-path>".into())
+                } else {
+                    "<not-fs>".into()
+                };
+                litebox::log_println!(
+                    self.global.platform,
+                    "[DELAYED-FORK-FD] pid={}: fd={} class={:?} subsystem_class={:?} terminal_meta={} host_stdio_oid_match={} path={:?}",
+                    self.pid,
+                    raw_fd,
+                    class,
+                    subsystem_class,
+                    terminal_meta.is_some(),
+                    object_id.is_some() && host_stdio_oids.contains(&object_id),
+                    fd_path_str,
+                );
             }
 
             let is_non_terminal_fs = class == FdClass::FilesystemFd && terminal_meta.is_none();
@@ -6849,6 +7644,7 @@ impl<FS: ShimFS> Task<FS> {
         vfork_info: Option<ExecVforkInfo>,
     ) -> Result<usize, Errno> {
         use super::host_pipe::HostPipeDirection;
+        #[cfg(feature = "trace_syscalls")]
         litebox::log_println!(
             self.global.platform,
             "[EXEC-REMOTE] pid={} path={:?} — entering exec_on_remote_host",
@@ -6888,6 +7684,7 @@ impl<FS: ShimFS> Task<FS> {
 
         let guest_cwd = self.fs.borrow().current_working_directory();
         let worker_stdio = self.worker_exec_stdio_bindings().inspect_err(|_err| {
+            #[cfg(feature = "trace_syscalls")]
             litebox::log_println!(
                 self.global.platform,
                 "[EXEC-REMOTE] pid={} remote worker exec does not support the current stdio bindings",
@@ -6943,12 +7740,13 @@ impl<FS: ShimFS> Task<FS> {
                 worker_stdio,
                 has_vfork_done,
             )
-            .map_err(|err| {
+            .map_err(|_err| {
+                #[cfg(feature = "trace_syscalls")]
                 litebox::log_println!(
                     self.global.platform,
                     "[EXEC-REMOTE] pid={} spawn_worker_host_for_exec failed: {}",
                     self.pid,
-                    err,
+                    _err,
                 );
                 signal_on_error(&vfork_info);
                 Errno::ENOMEM
@@ -7023,6 +7821,7 @@ impl<FS: ShimFS> Task<FS> {
                 }
             }
 
+            #[cfg(feature = "trace_syscalls")]
             litebox::log_println!(
                 self.global.platform,
                 "[EXEC-REMOTE] pid={}: {} direct_pipes, {} replacements built, signaling VforkDone",

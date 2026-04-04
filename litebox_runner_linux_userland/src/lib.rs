@@ -1218,10 +1218,13 @@ fn parse_mux_stream_specs(specs: &[String]) -> Result<Vec<MuxStreamSpec>> {
     Ok(streams)
 }
 
+/// Parsed local-pipe specification: `(write_fd, read_fd, drained_data, w_flags, r_flags)`.
+type LocalPipeSpec = (usize, usize, Vec<u8>, u32, u32);
+
 /// Parse `--local-pipe` CLI args.
 /// Format: `write_fd:read_fd::w_flags:r_flags` or
 ///         `write_fd:read_fd:drain_fd:w_flags:r_flags`.
-fn parse_local_pipe_specs(specs: &[String]) -> Result<Vec<(usize, usize, Vec<u8>, u32, u32)>> {
+fn parse_local_pipe_specs(specs: &[String]) -> Result<Vec<LocalPipeSpec>> {
     let mut pairs = Vec::new();
     for spec in specs {
         let parts: Vec<&str> = spec.split(':').collect();
@@ -1237,11 +1240,11 @@ fn parse_local_pipe_specs(specs: &[String]) -> Result<Vec<(usize, usize, Vec<u8>
         let drained = if parts[2].is_empty() {
             Vec::new()
         } else {
+            use std::io::Read;
+            use std::os::fd::FromRawFd;
             let drain_fd: i32 = parts[2]
                 .parse()
                 .map_err(|_| anyhow!("bad drain_fd in --local-pipe: {spec}"))?;
-            use std::io::Read;
-            use std::os::fd::FromRawFd;
             let mut f = unsafe { std::fs::File::from_raw_fd(drain_fd) };
             let mut data = Vec::new();
             f.read_to_end(&mut data)?;
@@ -1262,6 +1265,7 @@ fn parse_local_pipe_specs(specs: &[String]) -> Result<Vec<(usize, usize, Vec<u8>
 ///
 /// Sets up both host-pipe passthrough fds and multiplexer stream endpoints,
 /// then starts the worker mux dispatcher thread before acking.
+#[allow(clippy::too_many_arguments)]
 fn fork_restore_and_ack<FS: litebox_shim_linux::ShimFS>(
     shim: &litebox_shim_linux::LinuxShim<FS>,
     snapshot: litebox_shim_linux::syscalls::fork_snapshot::ForkSnapshot,
@@ -1270,7 +1274,7 @@ fn fork_restore_and_ack<FS: litebox_shim_linux::ShimFS>(
     pipe_bridges: &[PipeBridgeSpec],
     mux_fd: Option<i32>,
     mux_streams: &[MuxStreamSpec],
-    local_pipes: &[(usize, usize, Vec<u8>, u32, u32)],
+    local_pipes: &[LocalPipeSpec],
 ) -> Result<(
     litebox_shim_linux::LoadedProgram<FS>,
     Option<std::thread::JoinHandle<()>>,
@@ -1373,14 +1377,11 @@ fn fork_restore_and_ack<FS: litebox_shim_linux::ShimFS>(
                     } else if w_installed && !r_installed {
                         // write_fd already installed. read_fd is a new
                         // alias — dup the receiver from primary pair.
-                        if let Some(&primary_r) = read_for_write.get(&write_fd) {
-                            if let Some(src) = receiver_dups.get(&primary_r) {
-                                if let Some(duped) =
-                                    litebox_ref.descriptor_table_mut().duplicate(src)
-                                {
-                                    program.entrypoints.install_mux_pipe_fd(read_fd, duped);
-                                }
-                            }
+                        if let Some(&primary_r) = read_for_write.get(&write_fd)
+                            && let Some(src) = receiver_dups.get(&primary_r)
+                            && let Some(duped) = litebox_ref.descriptor_table_mut().duplicate(src)
+                        {
+                            program.entrypoints.install_mux_pipe_fd(read_fd, duped);
                         }
                     } else if r_installed && !w_installed {
                         // read_fd already installed. write_fd is a new
@@ -1390,14 +1391,11 @@ fn fork_restore_and_ack<FS: litebox_shim_linux::ShimFS>(
                             .iter()
                             .find(|(_, v)| **v == read_fd)
                             .map(|(k, _)| *k);
-                        if let Some(pw) = primary_w {
-                            if let Some(src) = sender_dups.get(&pw) {
-                                if let Some(duped) =
-                                    litebox_ref.descriptor_table_mut().duplicate(src)
-                                {
-                                    program.entrypoints.install_mux_pipe_fd(write_fd, duped);
-                                }
-                            }
+                        if let Some(pw) = primary_w
+                            && let Some(src) = sender_dups.get(&pw)
+                            && let Some(duped) = litebox_ref.descriptor_table_mut().duplicate(src)
+                        {
+                            program.entrypoints.install_mux_pipe_fd(write_fd, duped);
                         }
                     }
                 }
@@ -1491,6 +1489,7 @@ fn fork_restore_and_ack<FS: litebox_shim_linux::ShimFS>(
                 }
 
                 // Pre-flight check: verify relay endpoints are alive.
+                #[cfg(feature = "trace_syscalls")]
                 for (sid, dir, relay_fd) in &relay_endpoints {
                     let eof = pipes.is_read_eof(relay_fd);
                     eprintln!(
@@ -1561,6 +1560,7 @@ fn spawn_worker_mux_dispatcher(
         let wait_state = litebox::event::wait::WaitState::new(platform);
         let cx = wait_state.context();
 
+        #[cfg(feature = "trace_syscalls")]
         eprintln!(
             "[WORKER-MUX] dispatcher started, {} endpoints, mux_fd={}",
             relay_endpoints.len(),
@@ -1595,6 +1595,7 @@ fn spawn_worker_mux_dispatcher(
             match platform.read_host_fd(mux_fd, &mut recv_buf) {
                 Ok(0) => {
                     // Socketpair closed — parent exited. Close all relay fds.
+                    #[cfg(feature = "trace_syscalls")]
                     eprintln!(
                         "[WORKER-MUX] socketpair closed (parent gone), {} open endpoints",
                         closed_endpoints.iter().filter(|&&c| !c).count(),
@@ -1610,6 +1611,7 @@ fn spawn_worker_mux_dispatcher(
                     if let Some(msg) = MuxMessage::deserialize(&recv_buf[..n])
                         && msg.msg_type == MSG_TYPE_DATA
                     {
+                        #[cfg(feature = "trace_syscalls")]
                         eprintln!(
                             "[WORKER-MUX] recv stream={} flags={:#x} len={}",
                             msg.stream_id,
@@ -1666,15 +1668,16 @@ fn spawn_worker_mux_dispatcher(
                     Ok(data) if data.is_empty() => {
                         // Nothing buffered — check if sender closed.
                         if pipes.is_read_eof(relay_fd) {
-                            // Distinguish: DT entry gone vs peer shutdown
-                            let reason = match pipes.half_pipe_type(relay_fd) {
-                                Ok(_) => "peer_shutdown",
-                                Err(_) => "dt_entry_gone",
-                            };
-                            eprintln!(
-                                "[WORKER-MUX] stream={} is_read_eof=true ({}), sending EOF",
-                                stream_id, reason,
-                            );
+                            #[cfg(feature = "trace_syscalls")]
+                            {
+                                let reason = match pipes.half_pipe_type(relay_fd) {
+                                    Ok(_) => "peer_shutdown",
+                                    Err(_) => "dt_entry_gone",
+                                };
+                                eprintln!(
+                                    "[WORKER-MUX] stream={stream_id} is_read_eof=true ({reason}), sending EOF",
+                                );
+                            }
                             let _ = pipes.close(relay_fd);
                             let msg = MuxMessage::eof(*stream_id);
                             send_control(mux_fd, &msg);
@@ -1683,6 +1686,7 @@ fn spawn_worker_mux_dispatcher(
                     }
                     Ok(data) => {
                         did_work = true;
+                        #[cfg(feature = "trace_syscalls")]
                         eprintln!("[WORKER-MUX] send stream={} len={}", stream_id, data.len(),);
                         for chunk in data.chunks(MUX_MAX_PAYLOAD) {
                             let msg = MuxMessage::data(*stream_id, chunk.to_vec());
@@ -1706,9 +1710,9 @@ fn spawn_worker_mux_dispatcher(
                     }
                     Err(_) => {
                         // Pipe closed — send EOF.
+                        #[cfg(feature = "trace_syscalls")]
                         eprintln!(
-                            "[WORKER-MUX] stream={} drain_available=Err, sending EOF",
-                            stream_id,
+                            "[WORKER-MUX] stream={stream_id} drain_available=Err, sending EOF",
                         );
                         let _ = pipes.close(relay_fd);
                         let msg = MuxMessage::eof(*stream_id);
@@ -1945,6 +1949,7 @@ fn run_program<FS: litebox_shim_linux::ShimFS>(
         net_worker.join().unwrap();
     }
     let wait_status = program.process.wait();
+    #[cfg(feature = "trace_syscalls")]
     eprintln!(
         "[WORKER] child exited with wait_status={}{}",
         wait_status,
@@ -2524,6 +2529,7 @@ mod tests {
             pipe_bridge: Vec::new(),
             mux_fd: None,
             mux_stream: Vec::new(),
+            local_pipe: Vec::new(),
         }
     }
 

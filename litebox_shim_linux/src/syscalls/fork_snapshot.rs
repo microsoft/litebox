@@ -224,6 +224,13 @@ pub struct FdMetadataSnapshot {
     pub is_host_tty_alias: bool,
     /// Whether this fd is a host PTY device.
     pub is_host_pty_device: bool,
+    /// Whether this fd is a sandbox PTY slave (userspace-emulated, major >= 136).
+    /// These fds need special bridging during delayed fork — the mux relays
+    /// data between the parent's PtyPair ring buffers and the child's OS pipes.
+    pub is_sandbox_pty_slave: bool,
+    /// The PTY pair index for sandbox PTY slave fds (index into PtyManager).
+    /// Only meaningful when `is_sandbox_pty_slave` is true.
+    pub sandbox_pty_index: Option<u32>,
     /// Anonymous inode number for special fds.
     pub anon_ino: Option<u64>,
     /// Directory stream continuation offset for `getdents64`.
@@ -999,6 +1006,8 @@ impl FdMetadataSnapshot {
         w.write_option_i32(self.host_stdio_source_fd);
         w.write_bool(self.is_host_tty_alias);
         w.write_bool(self.is_host_pty_device);
+        w.write_bool(self.is_sandbox_pty_slave);
+        w.write_option_u64(self.sandbox_pty_index.map(u64::from));
         w.write_option_u64(self.anon_ino);
         w.write_option_u64(self.diroff);
     }
@@ -1008,6 +1017,8 @@ impl FdMetadataSnapshot {
             host_stdio_source_fd: r.read_option_i32()?,
             is_host_tty_alias: r.read_bool()?,
             is_host_pty_device: r.read_bool()?,
+            is_sandbox_pty_slave: r.read_bool()?,
+            sandbox_pty_index: r.read_option_u64()?.map(|v| v as u32),
             anon_ino: r.read_option_u64()?,
             diroff: r.read_option_u64()?,
         })
@@ -1336,6 +1347,8 @@ mod tests {
                             host_stdio_source_fd: Some(0),
                             is_host_tty_alias: false,
                             is_host_pty_device: false,
+                            is_sandbox_pty_slave: false,
+                            sandbox_pty_index: None,
                             anon_ino: None,
                             diroff: None,
                         },
@@ -1350,6 +1363,8 @@ mod tests {
                             host_stdio_source_fd: Some(1),
                             is_host_tty_alias: false,
                             is_host_pty_device: false,
+                            is_sandbox_pty_slave: false,
+                            sandbox_pty_index: None,
                             anon_ino: None,
                             diroff: None,
                         },
@@ -1364,6 +1379,8 @@ mod tests {
                             host_stdio_source_fd: None,
                             is_host_tty_alias: false,
                             is_host_pty_device: false,
+                            is_sandbox_pty_slave: false,
+                            sandbox_pty_index: None,
                             anon_ino: Some(12345),
                             diroff: Some(42),
                         },
@@ -1379,6 +1396,8 @@ mod tests {
                             host_stdio_source_fd: None,
                             is_host_tty_alias: true,
                             is_host_pty_device: true,
+                            is_sandbox_pty_slave: false,
+                            sandbox_pty_index: None,
                             anon_ino: None,
                             diroff: None,
                         },

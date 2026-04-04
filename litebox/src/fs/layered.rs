@@ -2281,6 +2281,25 @@ impl<
         }
     }
 
+    fn get_pty_pair_erased(
+        &self,
+        fd: &FileFd<Platform, Upper, Lower>,
+    ) -> Option<(
+        alloc::sync::Arc<dyn core::any::Any + Send + Sync>,
+        u32,
+        bool,
+    )> {
+        let entry = self
+            .litebox
+            .descriptor_table()
+            .with_entry(fd, |descriptor| Arc::clone(&descriptor.entry.entry))?;
+        match entry.as_ref() {
+            EntryX::Upper { fd } => self.upper.get_pty_pair_erased(fd),
+            EntryX::Lower { fd } => self.lower.get_pty_pair_erased(fd),
+            EntryX::Tombstone => None,
+        }
+    }
+
     fn read_link(
         &self,
         path: impl crate::path::Arg,

@@ -11,6 +11,7 @@
     clippy::unused_self,
     reason = "by convention, syscalls and related methods take &self even if unused"
 )]
+#![cfg_attr(feature = "trace_syscalls", allow(clippy::used_underscore_binding))]
 
 extern crate alloc;
 
@@ -488,6 +489,7 @@ impl<FS: ShimFS> LinuxShim<FS> {
                 deferred_vfork_park: Cell::new(false),
                 delayed_fork_pending: Cell::new(false),
                 migrated_to_remote: Cell::new(false),
+                mux_pipe_pair_ids: RefCell::new(Vec::new()),
             },
         };
         let exec_filename = alloc::ffi::CString::new(exec_filename).ok();
@@ -1135,6 +1137,7 @@ impl<FS: ShimFS> LinuxShim<FS> {
                 deferred_vfork_park: Cell::new(false),
                 delayed_fork_pending: Cell::new(false),
                 migrated_to_remote: Cell::new(false),
+                mux_pipe_pair_ids: RefCell::new(Vec::new()),
             },
         };
 
@@ -2263,18 +2266,64 @@ impl<FS: ShimFS> Task<FS> {
         // promoted to a true fork, check whether the current syscall is in
         // the pre-exec allowlist.  If not, commit the delayed fork now.
         #[cfg(target_arch = "x86_64")]
-        if self.delayed_fork_pending.get() && !Self::is_pre_exec_syscall(ctx) {
-            if self.commit_delayed_fork(ctx).is_ok() {
-                // Child migrated to worker host.  Terminate this local task.
-                self.exit_thread(0);
-                return Ok(0);
+        if self.delayed_fork_pending.get() {
+            let is_pre_exec = Self::is_pre_exec_syscall(ctx);
+            #[cfg(feature = "trace_syscalls")]
+            {
+                let sysname = ::syscalls::Sysno::new(ctx.orig_rax).map_or_else(
+                    || alloc::format!("unknown({})", ctx.orig_rax),
+                    |s| alloc::format!("{s:?}"),
+                );
+                let comm_bytes = self.comm.get();
+                let comm_str = core::str::from_utf8(
+                    &comm_bytes[..comm_bytes
+                        .iter()
+                        .position(|&b| b == 0)
+                        .unwrap_or(comm_bytes.len())],
+                )
+                .unwrap_or("<invalid>");
+                litebox::log_println!(
+                    self.global.platform,
+                    "[DELAYED-FORK-SYSCALL] pid={} comm={:?} ppid={}: syscall {} pre_exec={} args=({}, {}, {})",
+                    self.pid,
+                    comm_str,
+                    self.ppid,
+                    sysname,
+                    is_pre_exec,
+                    ctx.rdi,
+                    ctx.rsi,
+                    ctx.rdx,
+                );
             }
-            // Delayed fork failed.  Force-exit the child; prepare_for_exit
-            // will signal VforkDone so the parent resumes and can reap.
-            self.exit_group(syscalls::process::ExitStatus::Signal(
-                litebox_common_linux::signal::Signal::SIGKILL,
-            ));
-            return Err(Errno::ENOMEM);
+            if !is_pre_exec {
+                if self.commit_delayed_fork(ctx).is_ok() {
+                    // Child migrated to worker host.  Terminate this local task.
+                    #[cfg(feature = "trace_syscalls")]
+                    litebox::log_println!(
+                        self.global.platform,
+                        "[DELAYED-FORK-TRIGGER] pid={}: commit SUCCESS — child migrated, exiting local task",
+                        self.pid,
+                    );
+                    self.exit_thread(0);
+                    return Ok(0);
+                }
+                // Delayed fork could not migrate this child (e.g. unsupported
+                // fd types like sandbox PTY slaves on stdio).  Instead of
+                // killing the child, let it continue as a vfork child sharing
+                // the parent's address space.  The child will eventually
+                // execve (which detaches from the parent and signals
+                // VforkDone) or exit (which signals VforkDone via
+                // prepare_for_exit).  The parent remains blocked on
+                // VforkDone, which is correct vfork semantics.
+                #[cfg(feature = "trace_syscalls")]
+                litebox::log_println!(
+                    self.global.platform,
+                    "[DELAYED-FORK-TRIGGER] pid={}: commit FAILED — continuing as vfork child",
+                    self.pid,
+                );
+                self.delayed_fork_pending.set(false);
+                // Fall through to normal syscall handling.
+            }
         }
 
         if syscall_number == ::syscalls::Sysno::close_range as usize {
@@ -3304,6 +3353,7 @@ pub(crate) struct VforkParking {
 enum ReplacedSubsystem {
     Pipe,
     UnixSocket,
+    Pty,
 }
 
 /// Describes a single fd endpoint that should be replaced with a host OS
@@ -3351,6 +3401,14 @@ struct MuxParentStream {
     /// by the dispatcher (nested fork case — one-sided pipe, other end is in
     /// the parent's own mux dispatcher).  The fd table entry is NOT replaced.
     use_existing_pipe: bool,
+    /// For PTY-bridged streams: the PTY pair whose ring buffers the relay
+    /// thread reads/writes.  `None` for pipe/socket streams.
+    pty_pair: Option<Arc<litebox::fs::devices::PtyPair<Platform>>>,
+    /// For PTY-bridged streams: whether this is the master side of the pair.
+    /// When bridging a child's slave fd, the relay acts as a proxy for the
+    /// slave, so `pty_is_master` is `false`.
+    #[allow(dead_code)] // Reserved for future bidirectional PTY bridge logic.
+    pty_is_master: bool,
 }
 
 struct VforkDone {
@@ -3465,6 +3523,22 @@ struct ForkContext {
     /// Used by `commit_delayed_fork` to find the parent's peer socket endpoints
     /// so both sides can be bridged with real OS pipes.
     parent_unix_socket_fds: Vec<(usize, usize, u64)>,
+    /// Snapshot of the parent's PTY master FDs at fork time:
+    /// (guest_fd, pty_pair_index).
+    /// Used by `commit_delayed_fork` to find the parent's PTY master endpoint
+    /// for bridging sandbox PTY slave fds in the child.
+    #[allow(dead_code)] // Diagnostic; actual lookup uses parent_pty_pairs.
+    parent_pty_master_fds: Vec<(usize, u32)>,
+    /// PTY pair Arcs captured at fork time, keyed by pty_pair_index.
+    /// Used by `commit_delayed_fork` to set up PTY relay threads that bridge
+    /// between the parent's PTY ring buffers and the mux.
+    parent_pty_pairs: Vec<(u32, Arc<litebox::fs::devices::PtyPair<Platform>>)>,
+    /// Pipe pair_ids of virtual pipes created by prior siblings' mux
+    /// dispatchers or fd-replacement relays.  Inherited from the parent's
+    /// `mux_pipe_pair_ids`.  Used by `commit_delayed_fork` to exclude
+    /// these infrastructure pipes from child_pipes, preventing nested
+    /// mux-over-mux bridging.
+    parent_mux_pipe_pair_ids: Vec<usize>,
 }
 
 const SHELL_WRITE_SCAN_LEN: usize = 1024;
@@ -3556,6 +3630,12 @@ struct Task<FS: ShimFS> {
     /// was migrated to a remote worker host (the background waiter handles
     /// the real exit).
     migrated_to_remote: Cell<bool>,
+    /// Pipe pair_ids of virtual pipes created by the mux dispatcher or fd
+    /// replacement relay setup.  These are infrastructure pipes that should
+    /// NOT be bridged again when a subsequent child forks.  Tracked so that
+    /// `ForkContext.parent_pipe_fds` can exclude them, preventing nested
+    /// mux-over-mux bridging that destroys the first mux's endpoints.
+    mux_pipe_pair_ids: RefCell<Vec<usize>>,
 }
 
 impl<FS: ShimFS> Drop for Task<FS> {
@@ -3605,6 +3685,7 @@ mod test_utils {
                 deferred_vfork_park: Cell::new(false),
                 delayed_fork_pending: Cell::new(false),
                 migrated_to_remote: Cell::new(false),
+                mux_pipe_pair_ids: RefCell::new(Vec::new()),
                 process_state: self.process_state.into(),
                 global: self.global,
             }
@@ -3640,6 +3721,7 @@ mod test_utils {
                 deferred_vfork_park: Cell::new(false),
                 delayed_fork_pending: Cell::new(false),
                 migrated_to_remote: Cell::new(false),
+                mux_pipe_pair_ids: RefCell::new(Vec::new()),
             };
             Some(task)
         }

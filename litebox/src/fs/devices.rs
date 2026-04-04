@@ -1015,6 +1015,22 @@ impl<
         }
     }
 
+    fn get_pty_pair_erased(
+        &self,
+        fd: &FileFd<Platform>,
+    ) -> Option<(
+        alloc::sync::Arc<dyn core::any::Any + Send + Sync>,
+        u32,
+        bool,
+    )> {
+        let (pair, idx, is_master) = self.get_pty_info(fd)?;
+        Some((
+            pair as alloc::sync::Arc<dyn core::any::Any + Send + Sync>,
+            idx,
+            is_master,
+        ))
+    }
+
     fn open_at(
         &self,
         _dirfd: &FileFd<Platform>,

@@ -2683,22 +2683,31 @@ impl<FS: ShimFS> Task<FS> {
                             |crate::HostStdioSourceFd(source_fd)| *source_fd,
                         )
                     {
-                        let stream = match source_fd {
-                            0 => Some(litebox::platform::StdioStream::Stdin),
-                            1 => Some(litebox::platform::StdioStream::Stdout),
-                            2 => Some(litebox::platform::StdioStream::Stderr),
-                            _ => None,
-                        };
-                        if let Some(stream) = stream
-                            && self.global.platform.is_a_tty(stream)
-                        {
+                        if (0..=2).contains(&source_fd) {
                             // Return the actual host PTY path if available,
                             // so that ttyname_r() can discover and reopen
                             // the controlling terminal by its real device path.
+                            // We check host_stdin_tty_device_info() which gates
+                            // on whether the host has a terminal at all, rather
+                            // than checking the specific stream for this source_fd.
+                            // This matches the ioctl layer's fallback behavior
+                            // (host_stdio_stream_for_fd) which routes any stdio
+                            // fd to whichever host stream IS a terminal.
                             if let Some(info) = self.global.platform.host_stdin_tty_device_info() {
                                 return Ok(info.path);
                             }
-                            return Ok("/dev/tty".to_string());
+                            // If no host PTY info is available but any host
+                            // stream is a terminal, report /dev/tty.
+                            let any_tty = [
+                                litebox::platform::StdioStream::Stdin,
+                                litebox::platform::StdioStream::Stdout,
+                                litebox::platform::StdioStream::Stderr,
+                            ]
+                            .into_iter()
+                            .any(|s| self.global.platform.is_a_tty(s));
+                            if any_tty {
+                                return Ok("/dev/tty".to_string());
+                            }
                         }
                         return Ok(match source_fd {
                             0 => "/dev/stdin".to_string(),
@@ -3019,15 +3028,23 @@ fn descriptor_stat<FS: ShimFS>(raw_fd: usize, task: &Task<FS>) -> Result<FileSta
                 if table.with_metadata(fd, |_: &HostPtyDeviceFd| ()).is_ok() {
                     return true;
                 }
-                // Check for HostStdioSourceFd (inherited stdin/stdout/stderr)
+                // Check for HostStdioSourceFd (inherited stdin/stdout/stderr).
+                // Use the same any-stream-is-a-tty logic as the readlink
+                // override: if the host has any terminal stream, all sandbox
+                // stdio fds should report the host PTY identity.  This
+                // matches the ioctl layer's fallback in
+                // host_stdio_stream_for_fd which routes any stdio fd to
+                // whichever host stream IS a terminal.
                 if let Ok(crate::HostStdioSourceFd(source_fd)) =
                     table.with_metadata(fd, |m: &crate::HostStdioSourceFd| *m)
                     && (0..=2).contains(&source_fd)
-                    && task.global.platform.is_a_tty(match source_fd {
-                        0 => litebox::platform::StdioStream::Stdin,
-                        1 => litebox::platform::StdioStream::Stdout,
-                        _ => litebox::platform::StdioStream::Stderr,
-                    })
+                    && [
+                        litebox::platform::StdioStream::Stdin,
+                        litebox::platform::StdioStream::Stdout,
+                        litebox::platform::StdioStream::Stderr,
+                    ]
+                    .into_iter()
+                    .any(|s| task.global.platform.is_a_tty(s))
                 {
                     return true;
                 }
@@ -3271,6 +3288,29 @@ impl<FS: ShimFS> Task<FS> {
         let fs_path = FsPath::new_inner(dirfd, pathname, get_cwd, allow_empty)?;
         let files = self.files.borrow();
         let get_cwd = || self.fs.borrow().cwd.read().clone();
+
+        #[cfg(feature = "trace_syscalls")]
+        match &fs_path {
+            FsPath::Absolute { path } => {
+                litebox::log_println!(
+                    self.global.platform,
+                    "[STAT-TRACE] pid={} newfstatat path=\"{:?}\"",
+                    self.pid,
+                    path,
+                );
+            }
+            FsPath::FdRelative { fd, path } => {
+                litebox::log_println!(
+                    self.global.platform,
+                    "[STAT-TRACE] pid={} newfstatat fd={} rel_path=\"{:?}\"",
+                    self.pid,
+                    fd,
+                    path,
+                );
+            }
+            _ => {}
+        }
+
         let fstat: FileStat = match fs_path {
             FsPath::Absolute { path } => self.do_stat(path, follow_symlinks)?,
             FsPath::Cwd => files.fs.file_status(get_cwd())?.into(),

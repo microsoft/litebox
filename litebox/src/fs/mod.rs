@@ -260,6 +260,26 @@ pub trait FileSystem: private::Sealed + FdEnabledSubsystem {
         false
     }
 
+    /// Get the PTY pair for a file descriptor as a type-erased Arc.
+    ///
+    /// Returns `Some((arc, index, is_master))` if the fd refers to a PTY device.
+    /// The `Arc` can be downcast to `Arc<PtyPair<Platform>>` by the caller.
+    /// `index` is the PTY pair index, `is_master` indicates master vs slave side.
+    ///
+    /// This method exists to allow the shim to capture PTY pair references for
+    /// relay threads without knowing the concrete filesystem type.
+    #[expect(unused_variables, reason = "default body, non-underscored param names")]
+    fn get_pty_pair_erased(
+        &self,
+        fd: &TypedFd<Self>,
+    ) -> Option<(
+        alloc::sync::Arc<dyn core::any::Any + Send + Sync>,
+        u32,
+        bool,
+    )> {
+        None
+    }
+
     /// Read the target of a symbolic link.
     ///
     /// Returns the link target as a string. The default implementation returns
