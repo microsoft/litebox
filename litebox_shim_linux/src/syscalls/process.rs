@@ -4368,8 +4368,12 @@ impl<FS: ShimFS> Task<FS> {
                             _e,
                         );
                         // Close any already-created OS pipes.
-                        for &(_, os_fd, _) in &child_pipe_bridges {
-                            self.global.platform.close_host_fd(os_fd);
+                        for (i, &(_, os_fd, _)) in child_pipe_bridges.iter().enumerate() {
+                            let is_host_owned =
+                                bridge_host_fd.get(i).is_some_and(|&hf| hf == os_fd);
+                            if !is_host_owned {
+                                self.global.platform.close_host_fd(os_fd);
+                            }
                         }
                         for pr in &parent_replacements {
                             self.global.platform.close_host_fd(pr.host_fd);
@@ -4741,8 +4745,12 @@ impl<FS: ShimFS> Task<FS> {
                                 b.child_fd,
                             );
                             // Clean up any already-created OS pipe fds.
-                            for &(_, os_fd, _) in &child_pipe_bridges {
-                                self.global.platform.close_host_fd(os_fd);
+                            for (i, &(_, os_fd, _)) in child_pipe_bridges.iter().enumerate() {
+                                let is_host_owned =
+                                    bridge_host_fd.get(i).is_some_and(|&hf| hf == os_fd);
+                                if !is_host_owned {
+                                    self.global.platform.close_host_fd(os_fd);
+                                }
                             }
                             for pr in &parent_replacements {
                                 self.global.platform.close_host_fd(pr.host_fd);
@@ -4780,8 +4788,12 @@ impl<FS: ShimFS> Task<FS> {
                                 self.pid,
                                 _e,
                             );
-                            for &(_, os_fd, _) in &child_pipe_bridges {
-                                self.global.platform.close_host_fd(os_fd);
+                            for (i, &(_, os_fd, _)) in child_pipe_bridges.iter().enumerate() {
+                                let is_host_owned =
+                                    bridge_host_fd.get(i).is_some_and(|&hf| hf == os_fd);
+                                if !is_host_owned {
+                                    self.global.platform.close_host_fd(os_fd);
+                                }
                             }
                             for pr in &parent_replacements {
                                 self.global.platform.close_host_fd(pr.host_fd);
@@ -4824,8 +4836,12 @@ impl<FS: ShimFS> Task<FS> {
                                 );
                                 self.global.platform.close_host_fd(child_os_fd);
                                 self.global.platform.close_host_fd(parent_os_fd);
-                                for &(_, os_fd, _) in &child_pipe_bridges {
-                                    self.global.platform.close_host_fd(os_fd);
+                                for (i, &(_, os_fd, _)) in child_pipe_bridges.iter().enumerate() {
+                                    let is_host_owned =
+                                        bridge_host_fd.get(i).is_some_and(|&hf| hf == os_fd);
+                                    if !is_host_owned {
+                                        self.global.platform.close_host_fd(os_fd);
+                                    }
                                 }
                                 for pr in &parent_replacements {
                                     self.global.platform.close_host_fd(pr.host_fd);
@@ -4881,8 +4897,15 @@ impl<FS: ShimFS> Task<FS> {
                                         // virtual channel.
                                         self.global.platform.close_host_fd(child_os_fd);
                                         self.global.platform.close_host_fd(parent_os_fd);
-                                        for &(_, os_fd, _) in &child_pipe_bridges {
-                                            self.global.platform.close_host_fd(os_fd);
+                                        for (i, &(_, os_fd, _)) in
+                                            child_pipe_bridges.iter().enumerate()
+                                        {
+                                            let is_host_owned = bridge_host_fd
+                                                .get(i)
+                                                .is_some_and(|&hf| hf == os_fd);
+                                            if !is_host_owned {
+                                                self.global.platform.close_host_fd(os_fd);
+                                            }
                                         }
                                         for pr in &parent_replacements {
                                             self.global.platform.close_host_fd(pr.host_fd);
@@ -4933,8 +4956,15 @@ impl<FS: ShimFS> Task<FS> {
                                             parent_os_fd,
                                             _e,
                                         );
-                                        for &(_, os_fd, _) in &child_pipe_bridges {
-                                            self.global.platform.close_host_fd(os_fd);
+                                        for (i, &(_, os_fd, _)) in
+                                            child_pipe_bridges.iter().enumerate()
+                                        {
+                                            let is_host_owned = bridge_host_fd
+                                                .get(i)
+                                                .is_some_and(|&hf| hf == os_fd);
+                                            if !is_host_owned {
+                                                self.global.platform.close_host_fd(os_fd);
+                                            }
                                         }
                                         for pr in &parent_replacements {
                                             self.global.platform.close_host_fd(pr.host_fd);
@@ -5026,8 +5056,12 @@ impl<FS: ShimFS> Task<FS> {
                                 entry.fd,
                                 _e,
                             );
-                            for &(_, os_fd, _) in &child_pipe_bridges {
-                                self.global.platform.close_host_fd(os_fd);
+                            for (i, &(_, os_fd, _)) in child_pipe_bridges.iter().enumerate() {
+                                let is_host_owned =
+                                    bridge_host_fd.get(i).is_some_and(|&hf| hf == os_fd);
+                                if !is_host_owned {
+                                    self.global.platform.close_host_fd(os_fd);
+                                }
                             }
                             for pr in &parent_replacements {
                                 self.global.platform.close_host_fd(pr.host_fd);
@@ -6168,11 +6202,11 @@ impl<FS: ShimFS> Task<FS> {
                         .filter(|_| {
                             // Verify this is actually a slave, not a master.
                             // get_pty_pair_erased returns (arc, index, is_master).
-                            // If is_master is true, filter it out.
+                            // If is_master is true or the pair is gone, filter out.
                             files
                                 .fs
                                 .get_pty_pair_erased(&fd)
-                                .is_none_or(|(_, _, is_master)| !is_master)
+                                .is_some_and(|(_, _, is_master)| !is_master)
                         });
 
                     let meta = if host_stdio_source.is_some()
