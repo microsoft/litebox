@@ -5091,7 +5091,10 @@ impl<FS: ShimFS> Task<FS> {
                     };
 
                     // Skip if this fd was already bridged by Pass 1/2/3.
-                    if child_pipe_bridges.iter().any(|&(gfd, _, _)| gfd == entry.fd) {
+                    if child_pipe_bridges
+                        .iter()
+                        .any(|&(gfd, _, _)| gfd == entry.fd)
+                    {
                         #[cfg(feature = "trace_syscalls")]
                         litebox::log_println!(
                             self.global.platform,
