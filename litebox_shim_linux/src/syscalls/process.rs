@@ -5199,7 +5199,12 @@ impl<FS: ShimFS> Task<FS> {
                                 _e,
                             );
                             for (i, &(_, os_fd, _)) in child_pipe_bridges.iter().enumerate() {
-                                if bridge_host_fd.get(i).is_none_or(|&hf| hf < 0) {
+                                // Close newly-created pipe fds, but NOT fds
+                                // that are owned by the host pipe system (where
+                                // os_fd == bridge_host_fd[i]).
+                                let is_host_owned =
+                                    bridge_host_fd.get(i).is_some_and(|&hf| hf == os_fd);
+                                if !is_host_owned {
                                     self.global.platform.close_host_fd(os_fd);
                                 }
                             }
@@ -5498,7 +5503,11 @@ impl<FS: ShimFS> Task<FS> {
                 );
                 // Clean up OS pipe FDs created during pipe bridging.
                 for (i, &(_, os_fd, _)) in child_pipe_bridges.iter().enumerate() {
-                    if bridge_host_fd.get(i).is_none_or(|&hf| hf < 0) {
+                    // Close newly-created pipe fds, but NOT fds
+                    // that are owned by the host pipe system (where
+                    // os_fd == bridge_host_fd[i]).
+                    let is_host_owned = bridge_host_fd.get(i).is_some_and(|&hf| hf == os_fd);
+                    if !is_host_owned {
                         self.global.platform.close_host_fd(os_fd);
                     }
                 }
