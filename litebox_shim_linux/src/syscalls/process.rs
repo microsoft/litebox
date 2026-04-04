@@ -5117,9 +5117,12 @@ impl<FS: ShimFS> Task<FS> {
                         continue;
                     }
 
-                    // Direction: fd 0 = child reads (ParentToWorker),
-                    //            fd 1/2 = child writes (WorkerToParent).
-                    let direction = if entry.fd == 0 {
+                    // Direction based on the host stdio source fd:
+                    //   source_fd 0 (stdin)  = child reads (ParentToWorker),
+                    //   source_fd 1/2 (stdout/stderr) = child writes (WorkerToParent).
+                    // We use source_fd (not entry.fd) because the guest fd number
+                    // may differ from the host stdio fd if it was dup'd.
+                    let direction = if source_fd == 0 {
                         HostPipeDirection::Read
                     } else {
                         HostPipeDirection::Write
