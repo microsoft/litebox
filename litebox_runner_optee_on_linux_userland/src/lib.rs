@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-use anyhow::Result;
+use anyhow::{Context as _, Result};
 use clap::Parser;
 use litebox_common_optee::{TeeUuid, UteeEntryFunc, UteeParamOwned};
 use litebox_platform_multiplex::Platform;
@@ -56,12 +56,13 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
 
     let ldelf_data: Vec<u8> = {
         let ldelf = PathBuf::from(&cli_args.ldelf);
-        let data = std::fs::read(ldelf).unwrap();
+        let data =
+            std::fs::read(&ldelf).with_context(|| format!("failed to read {}", cli_args.ldelf))?;
         if cli_args.rewrite_syscalls {
             let mut skipped_addrs = Vec::new();
             let rewritten =
                 litebox_syscall_rewriter::hook_syscalls_in_elf(&data, None, &mut skipped_addrs)
-                    .unwrap();
+                    .with_context(|| format!("failed to rewrite {}", cli_args.ldelf))?;
             if !skipped_addrs.is_empty() {
                 eprintln!(
                     "warning: {} has {} unpatchable syscall instruction(s) at {:?}",
@@ -78,12 +79,13 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
 
     let prog_data: Vec<u8> = {
         let prog = PathBuf::from(&cli_args.program);
-        let data = std::fs::read(prog).unwrap();
+        let data =
+            std::fs::read(&prog).with_context(|| format!("failed to read {}", cli_args.program))?;
         if cli_args.rewrite_syscalls {
             let mut skipped_addrs = Vec::new();
             let rewritten =
                 litebox_syscall_rewriter::hook_syscalls_in_elf(&data, None, &mut skipped_addrs)
-                    .unwrap();
+                    .with_context(|| format!("failed to rewrite {}", cli_args.program))?;
             if !skipped_addrs.is_empty() {
                 eprintln!(
                     "warning: {} has {} unpatchable syscall instruction(s) at {:?}",

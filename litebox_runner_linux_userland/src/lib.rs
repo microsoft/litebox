@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-use anyhow::{Result, anyhow};
+use anyhow::{Context as _, Result, anyhow};
 use clap::Parser;
 use litebox::fs::{FileSystem as _, Mode};
 use litebox_platform_multiplex::Platform;
@@ -172,7 +172,7 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
             let mut skipped_addrs = Vec::new();
             let rewritten =
                 litebox_syscall_rewriter::hook_syscalls_in_elf(file.data, None, &mut skipped_addrs)
-                    .unwrap();
+                    .with_context(|| format!("failed to rewrite {}", prog.display()))?;
             if !skipped_addrs.is_empty() {
                 eprintln!(
                     "warning: program has {} unpatchable syscall instruction(s) at {:?}",

@@ -616,13 +616,10 @@ fn rewrite_elf(data: &[u8], path: &Path, verbose: bool) -> anyhow::Result<Vec<u8
             Ok(data.to_vec())
         }
         Err(litebox_syscall_rewriter::Error::UnsupportedBunExecutable) => {
-            if verbose {
-                eprintln!(
-                    "  warning: {} is a Bun-packaged executable, using as-is",
-                    path.display()
-                );
-            }
-            Ok(data.to_vec())
+            anyhow::bail!(
+                "{} is a Bun-packaged executable and cannot be safely packaged without syscall rewriting",
+                path.display()
+            )
         }
         Err(e) => Err(e).with_context(|| format!("failed to rewrite {}", path.display())),
     }

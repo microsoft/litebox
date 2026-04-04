@@ -95,8 +95,8 @@ struct TextSectionInfo {
 /// The `trampoline` must be an absolute address if specified; if unspecified, it will be set to
 /// zeros, and it is the caller's decision to overwrite it at loading time.
 ///
-/// If it succeeds, it produces an executable with trampoline code appended at a page-aligned
-/// offset after the ELF file. The file layout is:
+/// If rewriting emits trampoline stubs, the returned executable has trampoline code appended at a
+/// page-aligned offset after the ELF file. The file layout is:
 /// `[original ELF][padding to page boundary][trampoline code][header]`
 ///
 /// The header at the end contains:
@@ -105,7 +105,9 @@ struct TextSectionInfo {
 /// - trampoline virtual address (8 bytes for 64-bit, 4 bytes for 32-bit)
 /// - trampoline size (8 bytes for 64-bit, 4 bytes for 32-bit)
 ///
-/// This layout allows loaders to read just the last 32/20 bytes to get the metadata.
+/// This layout allows loaders to read just the last 32/20 bytes to get the metadata. Even when
+/// no syscall instructions are patched, the rewriter still appends the header and the initial
+/// syscall-entry placeholder so the loader/audit path can tell the binary was processed.
 ///
 /// `skipped_addrs` receives the virtual addresses of any `syscall`
 /// instructions that could not be patched (replaced with `UD2` so they
@@ -175,7 +177,7 @@ pub fn hook_syscalls_in_elf(
 
         let control_transfer_targets = get_control_transfer_targets(arch, &*buf, &text_sections)?;
 
-        let trampoline_base_addr = find_addr_for_trampoline_code(&file);
+        let trampoline_base_addr = find_addr_for_trampoline_code(&file)?;
 
         let fork_to_vfork_patch = find_fork_vfork_patch(&file, &text_sections);
 
@@ -199,7 +201,6 @@ pub fn hook_syscalls_in_elf(
         let trampoline = u32::try_from(trampoline).map_err(|_| Error::TrampolineAddressTooLarge)?;
         trampoline_data.extend_from_slice(&trampoline.to_le_bytes());
     }
-
     // Patch syscalls in-place in buf
     for s in &text_sections {
         let section_data = section_slice_mut(buf, s)?;
@@ -222,16 +223,18 @@ pub fn hook_syscalls_in_elf(
     // Patch fork → vfork: overwrite the first bytes of __libc_fork with a
     // JMP to __libc_vfork. This prevents glibc's fork wrapper from running
     // post-fork handlers that corrupt shared state under vfork semantics.
-    if let Some((fork_file_offset, rel32)) = fork_to_vfork_patch {
+    if let Some((fork_file_offset, fork_patch_end, rel32)) = fork_to_vfork_patch {
         #[allow(clippy::cast_possible_truncation)]
         let off = fork_file_offset as usize;
-        if off + 5 <= buf.len() {
+        #[allow(clippy::cast_possible_truncation)]
+        let patch_end = fork_patch_end as usize;
+        if off + 5 <= buf.len() && patch_end <= buf.len() && off + 5 <= patch_end {
             buf[off] = 0xE9; // JMP rel32
             buf[off + 1..off + 5].copy_from_slice(&rel32.to_le_bytes());
         } else {
             return Err(Error::ParseError(format!(
-                "fork→vfork patch offset {off:#x} + 5 exceeds buffer length {}",
-                buf.len()
+                "fork→vfork patch range {off:#x}..{patch_end:#x} is invalid for buffer length {}",
+                buf.len(),
             )));
         }
     }
@@ -453,7 +456,11 @@ fn hook_syscalls_in_section(
         let replace_start = replace_start.unwrap();
         let replace_len = usize::try_from(replace_end - replace_start).unwrap();
 
-        let target_addr = trampoline_base_addr + trampoline_data.len() as u64;
+        let target_addr = checked_add_u64(
+            trampoline_base_addr,
+            trampoline_data.len() as u64,
+            "syscall trampoline target",
+        )?;
 
         // Copy the original instructions to the trampoline
         if replace_start < inst.ip() {
@@ -466,54 +473,81 @@ fn hook_syscalls_in_section(
         let return_addr = inst.next_ip();
         if arch == Arch::X86_64 {
             // Put jump back location into rcx.
-            let jmp_back_offset = i64::try_from(return_addr).unwrap()
-                - i64::try_from(trampoline_base_addr + trampoline_data.len() as u64 + 7).unwrap();
+            let jmp_back_base = checked_add_u64(
+                trampoline_base_addr,
+                trampoline_data.len() as u64,
+                "x86_64 trampoline jump-back base",
+            )?;
+            let jmp_back_base =
+                checked_add_u64(jmp_back_base, 7, "x86_64 trampoline jump-back base")?;
             trampoline_data.extend_from_slice(&[0x48, 0x8D, 0x0D]); // LEA RCX, [RIP + disp32]
-            trampoline_data
-                .extend_from_slice(&(i32::try_from(jmp_back_offset).unwrap().to_le_bytes()));
+            trampoline_data.extend_from_slice(&rel32_bytes(
+                return_addr,
+                jmp_back_base,
+                "x86_64 trampoline jump-back",
+            )?);
 
             // Add jmp [rip + offset_to_entry_point]
             trampoline_data.extend_from_slice(&[0xFF, 0x25]);
             // RIP after this instruction = trampoline_base_addr + trampoline_data.len() + 4
             // We want: RIP + disp32 = syscall_entry_addr
-            #[allow(clippy::cast_possible_wrap)]
-            let disp32 = i64::try_from(syscall_entry_addr).unwrap()
-                - i64::try_from(trampoline_base_addr).unwrap()
-                - trampoline_data.len() as i64
-                - 4;
-            trampoline_data.extend_from_slice(&(i32::try_from(disp32).unwrap().to_le_bytes()));
+            let entry_base = checked_add_u64(
+                trampoline_base_addr,
+                trampoline_data.len() as u64,
+                "x86_64 trampoline entry base",
+            )?;
+            let entry_base = checked_add_u64(entry_base, 4, "x86_64 trampoline entry base")?;
+            trampoline_data.extend_from_slice(&rel32_bytes(
+                syscall_entry_addr,
+                entry_base,
+                "x86_64 trampoline entry",
+            )?);
         } else {
             // For 32-bit, use a different approach to simulate indirect call
             trampoline_data.push(0x50); // PUSH EAX
             trampoline_data.extend_from_slice(&[0xE8, 0x0, 0x0, 0x0, 0x0]); // CALL next instruction
             trampoline_data.push(0x58); // POP EAX (effectively store IP in EAX)
             trampoline_data.extend_from_slice(&[0xFF, 0x90]); // CALL [EAX + offset]
-            // EAX = trampoline_base_addr + (trampoline_data.len() - 3)
-            // We want: EAX + offset = syscall_entry_addr
-            #[allow(clippy::cast_possible_wrap)]
-            let disp32 = i64::try_from(syscall_entry_addr).unwrap()
-                - i64::try_from(trampoline_base_addr).unwrap()
-                - trampoline_data.len() as i64
-                + 3;
-            trampoline_data.extend_from_slice(&(i32::try_from(disp32).unwrap().to_le_bytes()));
+                                                              // EAX = trampoline_base_addr + (trampoline_data.len() - 3)
+                                                              // We want: EAX + offset = syscall_entry_addr
+            let call_base = checked_add_u64(
+                trampoline_base_addr,
+                trampoline_data.len() as u64,
+                "x86 trampoline entry base",
+            )?;
+            let call_base = checked_sub_u64(call_base, 3, "x86 trampoline entry base")?;
+            trampoline_data.extend_from_slice(&rel32_bytes(
+                syscall_entry_addr,
+                call_base,
+                "x86 trampoline entry",
+            )?);
             // Note we skip `POP EAX` here as it is done by the callback `syscall_callback`
             // from litebox_shim_linux/src/lib.rs, which helps reduce the size of the trampoline.
 
             // Add jmp back to original after syscall
-            let jmp_back_offset = i64::try_from(return_addr).unwrap()
-                - i64::try_from(trampoline_base_addr + trampoline_data.len() as u64 + 5).unwrap();
+            let jmp_back_base = checked_add_u64(
+                trampoline_base_addr,
+                trampoline_data.len() as u64,
+                "x86 trampoline jump-back base",
+            )?;
+            let jmp_back_base = checked_add_u64(jmp_back_base, 5, "x86 trampoline jump-back base")?;
             trampoline_data.push(0xE9);
-            trampoline_data
-                .extend_from_slice(&(i32::try_from(jmp_back_offset).unwrap().to_le_bytes()));
+            trampoline_data.extend_from_slice(&rel32_bytes(
+                return_addr,
+                jmp_back_base,
+                "x86 trampoline jump-back",
+            )?);
         }
 
         // Replace original instructions with jump to trampoline
         let replace_offset = usize::try_from(replace_start - section_base_addr).unwrap();
         section_data[replace_offset] = 0xE9; // JMP rel32
-        let jump_offset =
-            i64::try_from(target_addr).unwrap() - i64::try_from(replace_start + 5).unwrap();
-        section_data[replace_offset + 1..replace_offset + 5]
-            .copy_from_slice(&(i32::try_from(jump_offset).unwrap().to_le_bytes()));
+        let patch_base = checked_add_u64(replace_start, 5, "syscall patch jump base")?;
+        section_data[replace_offset + 1..replace_offset + 5].copy_from_slice(&rel32_bytes(
+            target_addr,
+            patch_base,
+            "syscall patch jump",
+        )?);
 
         // Fill remaining bytes with NOP
         for idx in 5..replace_len {
@@ -560,17 +594,38 @@ fn fixup_phdr_alignment(buf: &mut [u8]) {
         return; // already aligned
     }
 
-    let phdr_size = e_phentsize * e_phnum;
-    let old_start = usize::try_from(e_phoff).expect("e_phoff must fit in usize");
-    let old_end = old_start + usize::try_from(phdr_size).expect("phdr_size must fit in usize");
+    let Some(phdr_size) = e_phentsize.checked_mul(e_phnum) else {
+        return;
+    };
+    let Ok(old_start) = usize::try_from(e_phoff) else {
+        return;
+    };
+    let Ok(phdr_size) = usize::try_from(phdr_size) else {
+        return;
+    };
+    let Some(old_end) = old_start.checked_add(phdr_size) else {
+        return;
+    };
 
     // Shift forward to align: new offset is the next 8-byte boundary.
-    let padding = usize::try_from(8 - misalignment).expect("padding must fit in usize");
-    let new_start = old_start + padding;
-    let new_end = new_start + usize::try_from(phdr_size).expect("phdr_size must fit in usize");
+    let Ok(padding) = usize::try_from(8 - misalignment) else {
+        return;
+    };
+    let Some(new_start) = old_start.checked_add(padding) else {
+        return;
+    };
+    let Some(new_end) = new_start.checked_add(phdr_size) else {
+        return;
+    };
 
     if old_end > buf.len() || new_end > buf.len() {
         return; // corrupt phdr table or not enough room
+    }
+
+    // Only relocate when the overwritten bytes are padding. Otherwise this would corrupt the file
+    // by destroying whatever payload follows the existing program header table.
+    if !buf[old_end..new_end].iter().all(|&byte| byte == 0) {
+        return;
     }
 
     // Move the phdr table forward (use copy_within since src and dst overlap).
@@ -582,10 +637,16 @@ fn fixup_phdr_alignment(buf: &mut [u8]) {
 
     // Also update the PHDR segment's p_offset if present, so it matches.
     // PT_PHDR = 6, each Elf64_Phdr is e_phentsize bytes, p_type at offset 0, p_offset at offset 8.
-    for i in 0..e_phnum {
-        let entry_off = new_start
-            + usize::try_from(i).expect("i must fit in usize")
-                * usize::try_from(e_phentsize).expect("e_phentsize must fit in usize");
+    let Ok(e_phentsize_usize) = usize::try_from(e_phentsize) else {
+        return;
+    };
+    let Ok(e_phnum_usize) = usize::try_from(e_phnum) else {
+        return;
+    };
+    for i in 0..e_phnum_usize {
+        let Some(entry_off) = new_start.checked_add(i.saturating_mul(e_phentsize_usize)) else {
+            break;
+        };
         if entry_off + 16 > buf.len() {
             break;
         }
@@ -610,23 +671,40 @@ fn fixup_phdr_alignment(buf: &mut [u8]) {
 fn find_fork_vfork_patch(
     file: &object::File<'_>,
     text_sections: &[TextSectionInfo],
-) -> Option<(u64, i32)> {
+) -> Option<(u64, u64, i32)> {
     use object::ObjectSymbol as _;
 
-    // Search both .dynsym and .symtab for fork/vfork.
     let mut fork_vaddr = None;
     let mut vfork_vaddr = None;
 
-    for sym in file.dynamic_symbols().chain(file.symbols()) {
+    // Restrict this rewrite to libc-specific symbols. Plain `fork`/`vfork` names may belong to
+    // arbitrary DSOs or user code, and retargeting them would silently change unrelated behavior.
+    for sym in file.dynamic_symbols() {
         if sym.kind() != object::SymbolKind::Text {
             continue;
         }
         let Ok(name) = sym.name() else { continue };
         match name {
-            "fork" | "__libc_fork" if fork_vaddr.is_none() => {
+            "__libc_fork" if fork_vaddr.is_none() => {
                 fork_vaddr = Some(sym.address());
             }
-            "vfork" | "__libc_vfork" | "__vfork" if vfork_vaddr.is_none() => {
+            "__libc_vfork" | "__vfork" if vfork_vaddr.is_none() => {
+                vfork_vaddr = Some(sym.address());
+            }
+            _ => {}
+        }
+    }
+
+    for sym in file.symbols() {
+        if sym.kind() != object::SymbolKind::Text {
+            continue;
+        }
+        let Ok(name) = sym.name() else { continue };
+        match name {
+            "__libc_fork" if fork_vaddr.is_none() => {
+                fork_vaddr = Some(sym.address());
+            }
+            "__libc_vfork" | "__vfork" if vfork_vaddr.is_none() => {
                 vfork_vaddr = Some(sym.address());
             }
             _ => {}
@@ -635,12 +713,22 @@ fn find_fork_vfork_patch(
 
     let fork_vaddr = fork_vaddr?;
     let vfork_vaddr = vfork_vaddr?;
+    if fork_vaddr == 0 || vfork_vaddr == 0 {
+        return None;
+    }
 
     // Convert fork's vaddr to a file offset using the text sections.
-    let fork_file_offset = text_sections.iter().find_map(|s| {
+    let (fork_file_offset, fork_patch_end) = text_sections.iter().find_map(|s| {
         let section_end = s.vaddr + s.size;
-        if fork_vaddr >= s.vaddr && fork_vaddr < section_end {
-            Some(s.file_offset + (fork_vaddr - s.vaddr))
+        if fork_vaddr >= s.vaddr
+            && fork_vaddr < section_end
+            && fork_vaddr
+                .checked_add(5)
+                .is_some_and(|end| end <= section_end)
+        {
+            let file_offset = s.file_offset + (fork_vaddr - s.vaddr);
+            let file_end = s.file_offset + s.size;
+            Some((file_offset, file_end))
         } else {
             None
         }
@@ -654,7 +742,7 @@ fn find_fork_vfork_patch(
         .checked_sub(i64::try_from(fork_vaddr).ok()? + 5)?;
     let rel32 = i32::try_from(rel32).ok()?;
 
-    Some((fork_file_offset, rel32))
+    Some((fork_file_offset, fork_patch_end, rel32))
 }
 
 /// Check if the input binary has the Bun footer marker at the end.
@@ -679,6 +767,26 @@ fn replace_with_ud2(section_data: &mut [u8], section_base_addr: u64, inst: &iced
     for b in &mut section_data[offset + 2..offset + len] {
         *b = 0x90;
     }
+}
+
+fn checked_add_u64(base: u64, addend: u64, context: &'static str) -> Result<u64> {
+    base.checked_add(addend)
+        .ok_or_else(|| Error::ParseError(format!("{context} address overflow")))
+}
+
+fn checked_sub_u64(base: u64, subtrahend: u64, context: &'static str) -> Result<u64> {
+    base.checked_sub(subtrahend)
+        .ok_or_else(|| Error::ParseError(format!("{context} address underflow")))
+}
+
+fn rel32_bytes(target: u64, base: u64, context: &'static str) -> Result<[u8; 4]> {
+    let disp = i128::from(target) - i128::from(base);
+    let disp = i32::try_from(disp).map_err(|_| {
+        Error::ParseError(format!(
+            "{context} displacement out of range: target {target:#x}, base {base:#x}"
+        ))
+    })?;
+    Ok(disp.to_le_bytes())
 }
 
 /// Patch a single mapped code segment in-place, returning trampoline stubs.
@@ -743,20 +851,21 @@ pub fn patch_code_segment(
     }
 }
 
-fn find_addr_for_trampoline_code(file: &object::File<'_>) -> u64 {
+fn find_addr_for_trampoline_code(file: &object::File<'_>) -> Result<u64> {
     // Find the highest virtual address among all PT_LOAD segments
     let max_virtual_addr = match file {
         object::File::Elf64(elf) => max_load_segment_end(elf),
         object::File::Elf32(elf) => max_load_segment_end(elf),
         _ => unreachable!(),
-    };
+    }
+    .ok_or_else(|| Error::ParseError("no PT_LOAD segments found".into()))?;
 
     // Round up to the nearest page (assume 0x1000 page size)
-    max_virtual_addr.next_multiple_of(0x1000)
+    checked_add_u64(max_virtual_addr, 0xFFF, "trampoline base").map(|addr| addr & !0xFFF)
 }
 
 /// Returns the highest `p_vaddr + p_memsz` among all `PT_LOAD` segments.
-fn max_load_segment_end<Elf: object::read::elf::FileHeader>(elf: &ElfFile<'_, Elf>) -> u64
+fn max_load_segment_end<Elf: object::read::elf::FileHeader>(elf: &ElfFile<'_, Elf>) -> Option<u64>
 where
     Elf::Word: Into<u64>,
 {
@@ -764,9 +873,12 @@ where
     elf.elf_program_headers()
         .iter()
         .filter(|ph| ph.p_type(endian) == object::elf::PT_LOAD)
-        .map(|ph| ph.p_vaddr(endian).into() + ph.p_memsz(endian).into())
+        .filter_map(|ph| {
+            ph.p_vaddr(endian)
+                .into()
+                .checked_add(ph.p_memsz(endian).into())
+        })
         .max()
-        .unwrap()
 }
 
 fn get_symbols(file: &object::File<'_>) -> Option<u64> {
@@ -947,7 +1059,11 @@ fn hook_syscall_and_after(
 
     let replace_end = replace_end.unwrap();
 
-    let target_addr = trampoline_base_addr + trampoline_data.len() as u64;
+    let target_addr = checked_add_u64(
+        trampoline_base_addr,
+        trampoline_data.len() as u64,
+        "syscall trampoline target",
+    )?;
 
     if arch == Arch::X86_64 {
         // Put jump back location into rcx, via lea rcx, [next instruction]
@@ -957,26 +1073,36 @@ fn hook_syscall_and_after(
         trampoline_data.extend_from_slice(&[0xFF, 0x25]);
         // RIP after this instruction = trampoline_base_addr + trampoline_data.len() + 4
         // We want: RIP + disp32 = syscall_entry_addr
-        #[allow(clippy::cast_possible_wrap)]
-        let disp32 = i64::try_from(syscall_entry_addr).unwrap()
-            - i64::try_from(trampoline_base_addr).unwrap()
-            - trampoline_data.len() as i64
-            - 4;
-        trampoline_data.extend_from_slice(&(i32::try_from(disp32).unwrap().to_le_bytes()));
+        let entry_base = checked_add_u64(
+            trampoline_base_addr,
+            trampoline_data.len() as u64,
+            "x86_64 trampoline entry base",
+        )?;
+        let entry_base = checked_add_u64(entry_base, 4, "x86_64 trampoline entry base")?;
+        trampoline_data.extend_from_slice(&rel32_bytes(
+            syscall_entry_addr,
+            entry_base,
+            "x86_64 trampoline entry",
+        )?);
     } else {
         // For 32-bit, use a different approach to simulate indirect call
         trampoline_data.push(0x50); // PUSH EAX
         trampoline_data.extend_from_slice(&[0xE8, 0x0, 0x0, 0x0, 0x0]); // CALL next instruction
         trampoline_data.push(0x58); // POP EAX (effectively store IP in EAX)
         trampoline_data.extend_from_slice(&[0xFF, 0x90]); // CALL [EAX + offset]
-        // EAX = trampoline_base_addr + (trampoline_data.len() - 3)
-        // We want: EAX + offset = syscall_entry_addr
-        #[allow(clippy::cast_possible_wrap)]
-        let disp32 = i64::try_from(syscall_entry_addr).unwrap()
-            - i64::try_from(trampoline_base_addr).unwrap()
-            - trampoline_data.len() as i64
-            + 3;
-        trampoline_data.extend_from_slice(&(i32::try_from(disp32).unwrap().to_le_bytes()));
+                                                          // EAX = trampoline_base_addr + (trampoline_data.len() - 3)
+                                                          // We want: EAX + offset = syscall_entry_addr
+        let call_base = checked_add_u64(
+            trampoline_base_addr,
+            trampoline_data.len() as u64,
+            "x86 trampoline entry base",
+        )?;
+        let call_base = checked_sub_u64(call_base, 3, "x86 trampoline entry base")?;
+        trampoline_data.extend_from_slice(&rel32_bytes(
+            syscall_entry_addr,
+            call_base,
+            "x86 trampoline entry",
+        )?);
         // Note we skip `POP EAX` here as it is done by the callback `syscall_callback`
         // from litebox_shim_linux/src/lib.rs, which helps reduce the size of the trampoline.
     }
@@ -991,18 +1117,28 @@ fn hook_syscall_and_after(
     }
 
     // Add jmp back to original after syscall
-    let jmp_back_offset = i64::try_from(replace_end).unwrap()
-        - i64::try_from(trampoline_base_addr + trampoline_data.len() as u64 + 5).unwrap();
+    let jmp_back_base = checked_add_u64(
+        trampoline_base_addr,
+        trampoline_data.len() as u64,
+        "trampoline jump-back base",
+    )?;
+    let jmp_back_base = checked_add_u64(jmp_back_base, 5, "trampoline jump-back base")?;
     trampoline_data.push(0xE9);
-    trampoline_data.extend_from_slice(&(i32::try_from(jmp_back_offset).unwrap().to_le_bytes()));
+    trampoline_data.extend_from_slice(&rel32_bytes(
+        replace_end,
+        jmp_back_base,
+        "trampoline jump-back",
+    )?);
 
     // Replace original instructions with jump to trampoline
     let replace_offset = usize::try_from(replace_start - section_base_addr).unwrap();
     section_data[replace_offset] = 0xE9; // JMP rel32
-    let jump_offset =
-        i64::try_from(target_addr).unwrap() - i64::try_from(replace_start + 5).unwrap();
-    section_data[replace_offset + 1..replace_offset + 5]
-        .copy_from_slice(&(i32::try_from(jump_offset).unwrap().to_le_bytes()));
+    let patch_base = checked_add_u64(replace_start, 5, "syscall patch jump base")?;
+    section_data[replace_offset + 1..replace_offset + 5].copy_from_slice(&rel32_bytes(
+        target_addr,
+        patch_base,
+        "syscall patch jump",
+    )?);
 
     // Fill remaining bytes with NOP
     let replace_len = usize::try_from(replace_end - replace_start).unwrap();
@@ -1080,7 +1216,11 @@ fn hook_syscall_before_and_after(
         }
     };
 
-    let target_addr = trampoline_base_addr + trampoline_data.len() as u64;
+    let target_addr = checked_add_u64(
+        trampoline_base_addr,
+        trampoline_data.len() as u64,
+        "syscall trampoline target",
+    )?;
     let replace_start = prev_inst.ip();
     let replace_len = usize::try_from(next_inst.next_ip() - replace_start).unwrap();
 
@@ -1095,14 +1235,19 @@ fn hook_syscall_before_and_after(
     trampoline_data.extend_from_slice(&[0xE8, 0x0, 0x0, 0x0, 0x0]); // CALL next instruction
     trampoline_data.push(0x58); // POP EAX (effectively store IP in EAX)
     trampoline_data.extend_from_slice(&[0xFF, 0x90]); // CALL [EAX + offset]
-    // EAX = trampoline_base_addr + (trampoline_data.len() - 3)
-    // We want: EAX + offset = syscall_entry_addr
-    #[allow(clippy::cast_possible_wrap)]
-    let disp32 = i64::try_from(syscall_entry_addr).unwrap()
-        - i64::try_from(trampoline_base_addr).unwrap()
-        - trampoline_data.len() as i64
-        + 3;
-    trampoline_data.extend_from_slice(&(i32::try_from(disp32).unwrap().to_le_bytes()));
+                                                      // EAX = trampoline_base_addr + (trampoline_data.len() - 3)
+                                                      // We want: EAX + offset = syscall_entry_addr
+    let call_base = checked_add_u64(
+        trampoline_base_addr,
+        trampoline_data.len() as u64,
+        "x86 trampoline entry base",
+    )?;
+    let call_base = checked_sub_u64(call_base, 3, "x86 trampoline entry base")?;
+    trampoline_data.extend_from_slice(&rel32_bytes(
+        syscall_entry_addr,
+        call_base,
+        "x86 trampoline entry",
+    )?);
     // Note we skip `POP EAX` here as it is done by the callback `syscall_callback`
     // from litebox_shim_linux/src/lib.rs, which helps reduce the size of the trampoline.
 
@@ -1115,19 +1260,29 @@ fn hook_syscall_before_and_after(
     // Add jmp back to original after syscall if needed
     if need_jump_back {
         let return_addr = next_inst.next_ip();
-        let jmp_back_offset = i64::try_from(return_addr).unwrap()
-            - i64::try_from(trampoline_base_addr + trampoline_data.len() as u64 + 5).unwrap();
+        let jmp_back_base = checked_add_u64(
+            trampoline_base_addr,
+            trampoline_data.len() as u64,
+            "x86 trampoline jump-back base",
+        )?;
+        let jmp_back_base = checked_add_u64(jmp_back_base, 5, "x86 trampoline jump-back base")?;
         trampoline_data.push(0xE9);
-        trampoline_data.extend_from_slice(&(i32::try_from(jmp_back_offset).unwrap().to_le_bytes()));
+        trampoline_data.extend_from_slice(&rel32_bytes(
+            return_addr,
+            jmp_back_base,
+            "x86 trampoline jump-back",
+        )?);
     }
 
     // Replace original instructions with jump to trampoline
     let replace_offset = usize::try_from(replace_start - section_base_addr).unwrap();
     section_data[replace_offset] = 0xE9; // JMP rel32
-    let jump_offset =
-        i64::try_from(target_addr).unwrap() - i64::try_from(replace_start + 5).unwrap();
-    section_data[replace_offset + 1..replace_offset + 5]
-        .copy_from_slice(&(i32::try_from(jump_offset).unwrap().to_le_bytes()));
+    let patch_base = checked_add_u64(replace_start, 5, "syscall patch jump base")?;
+    section_data[replace_offset + 1..replace_offset + 5].copy_from_slice(&rel32_bytes(
+        target_addr,
+        patch_base,
+        "syscall patch jump",
+    )?);
 
     // Fill remaining bytes with NOP
     for idx in 5..replace_len {

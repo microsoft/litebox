@@ -48,11 +48,21 @@ fn main() -> anyhow::Result<()> {
     let mut input_binary_bytes = vec![];
     input_binary.read_to_end(&mut input_binary_bytes)?;
     let mut skipped_addrs = Vec::new();
-    let output_binary = litebox_syscall_rewriter::hook_syscalls_in_elf(
+    let output_binary = match litebox_syscall_rewriter::hook_syscalls_in_elf(
         &input_binary_bytes,
         cli_args.trampoline_addr,
         &mut skipped_addrs,
-    )?;
+    ) {
+        Ok(output_binary) => output_binary,
+        Err(litebox_syscall_rewriter::Error::NoSyscallInstructionsFound) => {
+            eprintln!(
+                "warning: {} has no syscall instructions, copying as-is",
+                cli_args.input_binary.display()
+            );
+            input_binary_bytes.clone()
+        }
+        Err(err) => return Err(err.into()),
+    };
     if !skipped_addrs.is_empty() {
         eprintln!(
             "warning: {} unpatchable syscall instruction(s) at {:?}",
