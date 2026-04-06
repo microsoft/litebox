@@ -10,6 +10,7 @@
 - [Threat Model & Attack Surface](#threat-model--attack-surface)
   - [What Sandboxing Addresses](#what-sandboxing-addresses)
   - [What Sandboxing Does NOT Address](#what-sandboxing-does-not-address)
+  - [Why Delegating fork() to the Kernel Breaks the Sandbox](#why-delegating-fork-to-the-kernel-breaks-the-sandbox)
   - [Network Isolation Patterns](#network-isolation-patterns)
   - [Complete LLM Tool Sandboxing Stack](#complete-llm-tool-sandboxing-stack)
 - [Sandboxing Technology Landscape](#sandboxing-technology-landscape)
@@ -23,7 +24,12 @@
   - [Phase 3: Policy Enforcement](#phase-3-policy-enforcement)
   - [Phase 4: VS Code Agent Integration](#phase-4-vs-code-agent-integration)
   - [Bug Fixes Along the Way](#bug-fixes-along-the-way)
+  - [Phase 5: WSL2 Investigation](#phase-5-wsl2-investigation)
 - [Current Status & Limitations](#current-status--limitations)
+  - [Agent Integration Patterns](#agent-integration-patterns)
+  - [What the Current Sandbox Covers](#what-the-current-sandbox-covers)
+  - [What Would Be Needed for Complete Sandboxing](#what-would-be-needed-for-complete-sandboxing)
+  - [Technical Limitations](#technical-limitations)
 - [Future Work](#future-work)
 - [Related Work](#related-work)
   - [Commercial & Cloud Services](#commercial--cloud-services)
@@ -33,7 +39,6 @@
   - [Themes from the Landscape](#themes-from-the-landscape)
 - [Appendix A: Hardware Virtualization Primer](#appendix-a-hardware-virtualization-primer)
 - [Appendix B: VS Code Remote Architecture](#appendix-b-vs-code-remote-architecture)
-  - [Dev Containers vs LLM Sandboxing](#dev-containers-vs-llm-sandboxing)
 - [Appendix C: WSL2 as an Isolation Boundary](#appendix-c-wsl2-as-an-isolation-boundary)
 - [Appendix D: Sandbox Technology Details](#appendix-d-sandbox-technology-details)
 
@@ -88,6 +93,22 @@ The strength of a sandbox is determined by how narrow the interface is between u
 **6. Network Policy** — most tools need some network access. The moment any outbound connectivity is allowed, DNS exfiltration and HTTP exfiltration to attacker-controlled servers become possible. This requires network-level policy orthogonal to syscall isolation. See [Network Isolation Patterns](#network-isolation-patterns) below.
 
 **7. Sandbox Implementation Bugs** — smaller TCB in a memory-safe language means fewer bugs, but never zero.
+
+### Why Delegating fork() to the Kernel Breaks the Sandbox
+
+The simplest path to `fork()` in a library OS sandbox would be to let the `clone` syscall (without `CLONE_VM`) fall through to the real Linux kernel instead of handling it in the shim. This is tempting because the kernel already implements COW address space duplication correctly. However, it undermines the sandbox in several ways:
+
+1. **Shim state is duplicated, not shared.** LiteBox maintains its own virtual state: file descriptor table, memory map metadata, layered filesystem, policy rules, audit hooks. A kernel `fork()` duplicates the entire address space via COW, so the child gets a *frozen copy* of all shim-internal data structures. Now two independent processes each have their own copy, but neither knows the other exists. The shim was designed for a single process with threads sharing one set of state (`CLONE_VM` means shared address space), not for independent processes with diverging copies.
+
+2. **Kernel state and shim state diverge.** The kernel fork also duplicates real kernel objects — file descriptors, signal dispositions, memory mappings. The child now has *two* FD tables: the shim's virtual one (copied) and the kernel's real one (also copied). If the child closes FD 3 through the shim, the shim removes it from its virtual table but may not close the real kernel FD — or vice versa for operations that bypass the shim. This desynchronization can cause resource leaks, use-after-close bugs, or security-relevant state confusion.
+
+3. **On the rewriter backend, unrewritten code in the child bypasses the sandbox entirely.** The rewriter patches `syscall` instructions in `.text` sections of the ELF, but the dynamic linker, libc internals, and dynamically loaded libraries that weren't rewritten still make direct kernel syscalls. In the parent, this is a known coverage gap. In a forked child, it becomes a full escape: the child is a real OS process with its own PID, real kernel FDs, and unrewritten code paths. It can `open()` files the policy would deny, `connect()` to hosts the policy would block, and `exec()` programs without audit logging — all through the unrewritten libc paths that go straight to the kernel.
+
+4. **On the seccomp backend, the BPF filter IS inherited — preserving the security boundary.** Seccomp filters survive `fork()` (the kernel copies them to the child). So the child's syscalls are still trapped, which is why "seccomp + kernel fork passthrough" is the most viable path forward. However, the shim state divergence problems (points 1-2) still apply, and the existing shim hang (ENOSYS for runtime syscalls) would need to be fixed first.
+
+5. **The platform singleton can't be reinitialized.** LiteBox's platform layer (`Platform::new()`) is a per-process singleton that sets up signal handlers, memory mappings, and TLS state. After fork, the child inherits this state but can't reinitialize it. Platform invariants (e.g., the SIGSYS handler's assumption about `gs_base`, the syscall trampoline's address) may break if the child's execution diverges from what the platform expects.
+
+In summary: for the **rewriter** backend, fork-to-kernel is a sandbox escape — the child is a real OS process where unrewritten code has unmediated kernel access, silently bypassing audit logging and policy enforcement. For the **seccomp** backend, the security boundary is maintained (BPF filter inherits), but the shim's internal state model breaks because it assumes a single shared-memory process. This is why the shim returns `EINVAL` today rather than allowing a partially-broken fork.
 
 ### Network Isolation Patterns
 
@@ -367,23 +388,7 @@ This was initially suspected to be a WSL2 kernel bug (gs_base not preserved duri
 
 After fixing the segfault, the seccomp backend no longer crashes but **hangs** with busybox. The reason: seccomp traps ALL syscalls (including musl/busybox runtime initialization), and the shim returns `ENOSYS` for syscalls it doesn't implement. Some of these are essential for the runtime to function. The shim's syscall coverage was designed for the rewriter backend's narrower scope and doesn't cover the full syscall surface that seccomp exposes.
 
-The rewriter backend works on WSL2 but has the same `fork()` limitation as Windows — the shim rejects `clone()` without `CLONE_VM` because it hasn't implemented process-level forking (address space duplication with COW). As explained below, this is partly an implementation limitation and partly a security concern — depending on the interception backend.
-
-**Why delegating fork to the kernel breaks the sandbox**:
-
-The simplest path to `fork()` would be to let the `clone` syscall (without `CLONE_VM`) fall through to the real Linux kernel instead of handling it in the shim. This is tempting because the kernel already implements COW address space duplication correctly. However, it undermines the sandbox in several ways:
-
-1. **Shim state is duplicated, not shared.** LiteBox maintains its own virtual state: file descriptor table, memory map metadata, layered filesystem, policy rules, audit hooks. A kernel `fork()` duplicates the entire address space via COW, so the child gets a *frozen copy* of all shim-internal data structures. Now two independent processes each have their own copy, but neither knows the other exists. The shim was designed for a single process with threads sharing one set of state (`CLONE_VM` means shared address space), not for independent processes with diverging copies.
-
-2. **Kernel state and shim state diverge.** The kernel fork also duplicates real kernel objects — file descriptors, signal dispositions, memory mappings. The child now has *two* FD tables: the shim's virtual one (copied) and the kernel's real one (also copied). If the child closes FD 3 through the shim, the shim removes it from its virtual table but may not close the real kernel FD — or vice versa for operations that bypass the shim. This desynchronization can cause resource leaks, use-after-close bugs, or security-relevant state confusion.
-
-3. **On the rewriter backend, unrewritten code in the child bypasses the sandbox entirely.** The rewriter patches `syscall` instructions in `.text` sections of the ELF, but the dynamic linker, libc internals, and dynamically loaded libraries that weren't rewritten still make direct kernel syscalls. In the parent, this is a known coverage gap. In a forked child, it becomes a full escape: the child is a real OS process with its own PID, real kernel FDs, and unrewritten code paths. It can `open()` files the policy would deny, `connect()` to hosts the policy would block, and `exec()` programs without audit logging — all through the unrewritten libc paths that go straight to the kernel.
-
-4. **On the seccomp backend, the BPF filter IS inherited — preserving the security boundary.** Seccomp filters survive `fork()` (the kernel copies them to the child). So the child's syscalls are still trapped, which is why "seccomp + kernel fork passthrough" is the most viable path forward. However, the shim state divergence problems (points 1-2) still apply, and the existing shim hang (ENOSYS for runtime syscalls) would need to be fixed first.
-
-5. **The platform singleton can't be reinitialized.** LiteBox's platform layer (`Platform::new()`) is a per-process singleton that sets up signal handlers, memory mappings, and TLS state. After fork, the child inherits this state but can't reinitialize it. Platform invariants (e.g., the SIGSYS handler's assumption about `gs_base`, the syscall trampoline's address) may break if the child's execution diverges from what the platform expects.
-
-In summary: for the **rewriter** backend, fork-to-kernel is a sandbox escape — the child is a real OS process where unrewritten code has unmediated kernel access, silently bypassing audit logging and policy enforcement. For the **seccomp** backend, the security boundary is maintained (BPF filter inherits), but the shim's internal state model breaks because it assumes a single shared-memory process. This is why the shim returns `EINVAL` today rather than allowing a partially-broken fork.
+The rewriter backend works on WSL2 but has the same `fork()` limitation as Windows — the shim rejects `clone()` without `CLONE_VM` because it hasn't implemented process-level forking (address space duplication with COW). This is partly an implementation limitation and partly a security concern — depending on the interception backend. See [Why Delegating fork() to the Kernel Breaks the Sandbox](#why-delegating-fork-to-the-kernel-breaks-the-sandbox) in the Threat Model section for the full analysis.
 
 **The three paths to fork() remain**:
 1. Expand the seccomp allow-list to pass `clone`/`fork` through to the kernel, plus fix the shim hang for other runtime syscalls
