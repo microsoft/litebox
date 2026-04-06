@@ -10,6 +10,7 @@
 - [Threat Model & Attack Surface](#threat-model--attack-surface)
   - [What Sandboxing Addresses](#what-sandboxing-addresses)
   - [What Sandboxing Does NOT Address](#what-sandboxing-does-not-address)
+  - [Sandboxing Surface: VS Code Agents vs CLI Agents](#sandboxing-surface-vs-code-agents-vs-cli-agents)
   - [Why Delegating fork() to the Kernel Breaks the Sandbox](#why-delegating-fork-to-the-kernel-breaks-the-sandbox)
   - [Network Isolation Patterns](#network-isolation-patterns)
   - [Complete LLM Tool Sandboxing Stack](#complete-llm-tool-sandboxing-stack)
@@ -26,9 +27,7 @@
   - [Bug Fixes Along the Way](#bug-fixes-along-the-way)
   - [Phase 5: WSL2 Investigation](#phase-5-wsl2-investigation)
 - [Current Status & Limitations](#current-status--limitations)
-  - [Agent Integration Patterns](#agent-integration-patterns)
-  - [What the Current Sandbox Covers](#what-the-current-sandbox-covers)
-  - [What Would Be Needed for Complete Sandboxing](#what-would-be-needed-for-complete-sandboxing)
+  - [Sandbox Coverage by Agent Type](#sandbox-coverage-by-agent-type)
   - [Technical Limitations](#technical-limitations)
 - [Future Work](#future-work)
 - [Related Work](#related-work)
@@ -93,6 +92,33 @@ The strength of a sandbox is determined by how narrow the interface is between u
 **6. Network Policy** — most tools need some network access. The moment any outbound connectivity is allowed, DNS exfiltration and HTTP exfiltration to attacker-controlled servers become possible. This requires network-level policy orthogonal to syscall isolation. See [Network Isolation Patterns](#network-isolation-patterns) below.
 
 **7. Sandbox Implementation Bugs** — smaller TCB in a memory-safe language means fewer bugs, but never zero.
+
+### Sandboxing Surface: VS Code Agents vs CLI Agents
+
+The attack surface that a sandbox can cover depends on how the agent interacts with the system.
+
+**VS Code agents** (Copilot agent mode, Cline, Continue, etc.) have two interaction paths:
+- **VS Code APIs** — file read/write, search, symbol lookup, diagnostics. These execute in the extension host process, which is *outside* any command-level sandbox. When using VS Code Remote (WSL, SSH, Containers), they execute on the remote server — meaning a sandbox around the remote environment covers them.
+- **Terminal API** — shell commands. The terminal process is separate and can be sandboxed independently.
+
+This split means a command-level sandbox (like LiteBox's current REPL approach) only covers terminal commands. File operations through VS Code APIs bypass it entirely. To sandbox everything, you need either:
+1. **VS Code Remote** into a sandboxed environment (all extension host operations execute inside the sandbox)
+2. **MCP tool server** that routes every operation through a sandbox policy layer
+3. A combination: sandboxed terminal + restricted VS Code Remote for file access
+
+**CLI agents** (Claude Code, Codex CLI, aider, SWE-agent, OpenHands, etc.) have no such split. They interact with the system entirely through **direct syscalls**: `open()`/`read()`/`write()` for files, `fork()`+`exec()` for commands, `connect()`/`send()` for network. There is no protocol to intercept — syscalls are the only interception point.
+
+This makes CLI agents both harder and easier to sandbox:
+- **Harder**: they need `fork()` and full POSIX compatibility, which LiteBox doesn't yet support
+- **Easier**: if you *can* run the entire agent inside a sandbox, *every* operation is mediated — files, network, subprocesses, everything. No API bypass path exists. This is architecturally stronger than the VS Code model.
+
+The practical implications:
+
+| | Command-level sandbox (current) | Full agent sandbox (future) |
+|---|---|---|
+| **VS Code agents** | Terminal commands sandboxed; file APIs bypass | Requires VS Code Remote into sandbox or MCP |
+| **CLI agents** | Cannot run (need `fork()`) | Every syscall sandboxed — strongest model |
+| **Audit completeness** | Terminal commands only | Every operation |
 
 ### Why Delegating fork() to the Kernel Breaks the Sandbox
 
@@ -399,48 +425,24 @@ The rewriter backend works on WSL2 but has the same `fork()` limitation as Windo
 
 ## Current Status & Limitations
 
-### Agent Integration Patterns
+The current implementation sandboxes **terminal command execution only** on a per-command basis. For a full discussion of what sandboxing can and cannot protect against, see [Threat Model & Attack Surface](#threat-model--attack-surface).
 
-LLM coding agents fall into two categories with fundamentally different sandboxing surfaces:
+### Sandbox Coverage by Agent Type
 
-**VS Code agents** (Copilot agent mode, Cline, Continue, etc.) run inside the VS Code extension host. They interact with the system through two paths:
-- **VS Code APIs** — file read/write, search, symbol lookup, diagnostics. These execute on the host via the extension host process. When using VS Code Remote (WSL, SSH, Containers), they execute on the remote server.
-- **Terminal API** — opening terminals, sending commands. The terminal process is a separate shell.
+LLM coding agents fall into two categories with different sandboxing surfaces:
 
-**CLI agents** (Claude Code, Codex CLI, aider, SWE-agent, OpenHands, etc.) run as standalone processes outside VS Code. They interact with the system entirely through **direct syscalls**:
-- `open()`/`read()`/`write()` for file access
-- `fork()`+`exec()` for running commands
-- `connect()`/`send()` for network access (LLM API calls, URL fetching)
-
-There is no protocol to intercept for CLI agents — syscalls are the only interception point.
-
-### What the Current Sandbox Covers
-
-The current implementation sandboxes **terminal command execution only**. This applies differently depending on the agent type:
-
-**For VS Code agents:**
+**VS Code agents** (Copilot agent mode, Cline, Continue, etc.) interact with the system through VS Code APIs (file read/write, search) and the Terminal API (shell commands). Only the terminal path is sandboxed:
 
 | Agent Action | Path | Sandboxed? |
 |---|---|---|
 | Read file contents | VS Code API | **No** |
 | Write/edit files | VS Code API | **No** |
 | Search workspace | VS Code API | **No** |
-| List directory | VS Code API | **No** |
 | Run `make build` | Terminal | **Yes** |
 | Run `python test.py` | Terminal | **Yes** |
 | Run `curl https://...` | Terminal | **Yes** |
-| Execute shell commands | Terminal | **Yes** |
 
-In practice, VS Code agents use APIs for most file operations and only use the terminal for builds, tests, and tool execution. The sandbox covers the most dangerous attack vector (arbitrary code execution) but not file access.
-
-**For CLI agents:**
-
-The current sandbox cannot run CLI agents directly because:
-1. CLI agents are native binaries (typically Node.js or Python) that need `fork()` + full POSIX compatibility
-2. They make direct syscalls for all operations — no separate "terminal" vs "API" distinction
-3. Without `fork()`, the agent process can't spawn subprocesses (build tools, tests, etc.)
-
-If LiteBox gained `fork()` support, running the **entire CLI agent** inside LiteBox would sandbox everything — every file read, network call, and subprocess — because all operations are syscalls. This is actually a stronger sandboxing model than the VS Code approach, where file operations bypass the terminal sandbox.
+**CLI agents** (Claude Code, Codex CLI, aider, etc.) make direct syscalls for all operations. The current sandbox cannot run them — they need `fork()` and full POSIX compatibility. If LiteBox gained `fork()` support, running the entire CLI agent inside LiteBox would be a stronger model (every syscall sandboxed):
 
 | | VS Code Agent + Terminal Sandbox | CLI Agent inside LiteBox (future) |
 |---|---|---|
@@ -451,29 +453,9 @@ If LiteBox gained `fork()` support, running the **entire CLI agent** inside Lite
 | Audit trail | Terminal commands only | Complete — every syscall |
 | fork() required? | No (REPL workaround) | **Yes** |
 
-### What Would Be Needed for Complete Sandboxing
-
-**For VS Code agents** — sandbox all activity, not just terminal commands:
-
-1. **VS Code Remote connection** — run the VS Code Server inside the sandbox (e.g., a hardened WSL2 instance or a dev container backed by LiteBox/gVisor). All extension host operations would execute inside the sandbox, including file reads and writes. This is the most complete approach but requires configuring the VS Code Server lifecycle and restricting the remote environment.
-
-2. **MCP tool server** — expose every operation as an MCP tool call routed through LiteBox. The agent would call `read_file`, `write_file`, `run_command` etc. as tool invocations, each going through the sandbox's policy layer. This works for agents that support MCP but requires the agent to use tools instead of native APIs.
-
-3. **Custom VS Code extension** — intercept filesystem operations in the extension host and route them through a sandbox proxy. This is fragile and not how VS Code is designed to work.
-
-**For CLI agents** — sandbox the entire agent process:
-
-1. **Run the agent inside LiteBox** — requires `fork()` support (not yet implemented). Once available, the agent's every syscall goes through the shim. The strongest model.
-
-2. **Run the agent inside a hardened WSL2/container** — use Linux namespaces, restricted user accounts, and network policy to limit what the agent can access. LiteBox can add per-command audit + policy on top. Doesn't require `fork()` in LiteBox since the real kernel handles it.
-
-3. **MCP tool server** — same as for VS Code agents. The CLI agent calls sandboxed tools instead of making direct syscalls. Requires the agent to support MCP.
-
-The current terminal-based approach is a pragmatic middle ground: it sandboxes the most dangerous attack vector (arbitrary code execution via terminal commands) while leaving file reads unsandboxed (lower risk — the agent can only see what's in the workspace).
-
 ### Technical Limitations
 
-- **No `fork()`**: `clone()` only supports threads (`CLONE_VM | CLONE_THREAD`), not new processes. The REPL wrapper works around this by spawning a fresh LiteBox per command, but this means no state persistence between commands, no piping (`|`), no subshells.
+- **No `fork()`**: `clone()` only supports threads (`CLONE_VM | CLONE_THREAD`), not new processes. The REPL wrapper works around this by spawning a fresh LiteBox per command, but this means no state persistence between commands, no piping (`|`), no subshells. See [Why Delegating fork() to the Kernel Breaks the Sandbox](#why-delegating-fork-to-the-kernel-breaks-the-sandbox) for why this isn't a simple fix.
 - **Limited rootfs**: Only busybox (no Python, no git, no compilers). The packager can create richer rootfs images but the ~512MB allocator limit constrains size.
 - **No dynamic terminal size**: TIOCGWINSZ returns hardcoded 80x24 instead of querying the real terminal dimensions.
 - **Single-threaded guest**: While `clone` with `CLONE_THREAD` works, many real-world programs need multi-process support.
