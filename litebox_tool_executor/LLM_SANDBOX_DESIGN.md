@@ -293,16 +293,7 @@ The tradeoff is that commands don't share state — `cd /tmp` followed by `ls` w
 
 ### Phase 1: Audit Logging
 
-**Commit**: `3c5101ea`
-
-Added a feature-gated (`audit_log`) structured logging module to `litebox_shim_linux`:
-
-- `AuditEvent` struct with `syscall_name`, `args: ArrayVec<AuditArg, 6>`, `result`
-- `AuditArg` enum: `Fd`, `Path`, `Addr`, `Int`, `Flags` — all `no_std`-compatible via `arrayvec`
-- `build_audit_event()` extracts human-readable args from ~20 `SyscallRequest` variants
-- JSON line output via `DebugLogProvider::debug_log_print()` (→ stderr on Windows)
-- Hooked in `do_syscall()` — before match: build event, after match: set result + emit
-- Zero overhead when feature disabled (`#[cfg(feature = "audit_log")]`)
+Feature-gated (`audit_log`) structured logging in `litebox_shim_linux`. Every syscall passing through `do_syscall()` emits a JSON line event with syscall name, typed arguments (`Fd`, `Path`, `Addr`, `Int`, `Flags`), and result. Zero overhead when the feature is disabled.
 
 Example output:
 ```json
@@ -313,80 +304,44 @@ Example output:
 
 ### Phase 2: Tool Executor
 
-**Commits**: `2eb3d343`, `5fe28147`
+New `litebox_tool_executor` crate providing two interfaces:
 
-New `litebox_tool_executor` crate:
+- **Direct mode**: `litebox_tool_executor --rootfs <tar> -- /bin/busybox echo hello`
+- **Interactive REPL**: `litebox_tool_executor --rootfs <tar> --interactive` — each line typed spawns a fresh sandbox
+- **JSON pipe mode**: reads `ToolRequest` from stdin, writes `ToolResult` to stdout — for programmatic integration
 
-- **`protocol.rs`**: `ToolRequest` (command, env, files, timeout) / `ToolResult` (stdout, stderr, exit_code, audit_log, timed_out)
-- **`lib.rs`**: `execute()` function — loads tar, inits platform + shim + layered FS, injects files, runs guest, returns result
-- **`main.rs`**: CLI with direct mode (`--rootfs tar -- command args`) and JSON pipe mode (stdin/stdout)
-- **`scripts/prepare-rootfs.sh`**: WSL2 script to build busybox rootfs via `litebox_packager`
-
-Rootfs preparation: `litebox_packager --oci-image docker.io/library/busybox:latest` or packaging individual host binaries. The packager discovers dependencies via `ldd`, rewrites all ELF syscall instructions, and outputs a tar.
+The rootfs is prepared via `litebox_packager`, which discovers ELF dependencies via `ldd`, rewrites all syscall instructions, and outputs a tar.
 
 ### Phase 3: Policy Enforcement
 
-**Commit**: `c32a911d`
+Feature-gated (`policy`) sandbox policy in `litebox_shim_linux` with three domains:
 
-Feature-gated (`policy`) sandbox policy module in `litebox_shim_linux`:
+- **Filesystem**: `allow_read`/`allow_write`/`deny` glob lists, enforced at `openat`, `unlinkat`
+- **Network**: `deny_all` + `allow_connect` address list, enforced at `connect`
+- **Process**: `allow_exec` glob list, enforced at `execve`
 
-- **`SandboxPolicy`** with `FsPolicy` (allow_read/write/deny globs), `NetworkPolicy` (deny_all + allow_connect), `ProcessPolicy` (allow_exec globs)
-- Hand-rolled glob matching (`*`, `**`, `?`) — no regex dependency, `no_std` compatible
-- Enforcement hooks in `do_syscall()` at `Openat` (read/write detection via flags), `Unlinkat`, `Execve`, `Connect`
-- Violations return `EACCES` 
-- Global policy storage via `once_cell::OnceBox`
-- 8 unit tests covering all policy paths
-- JSON policy files loaded via `--policy` CLI flag
+Globs are hand-rolled (`*`, `**`, `?`) with no regex dependency, `no_std` compatible. Violations return `EACCES`. Policies are loaded from JSON files via `--policy`.
 
-**Known policy enforcement gaps:**
-
-The current implementation only checks policies at specific syscall entry points. Several syscalls that access the filesystem or reveal information about it are **not** checked against the policy:
-
-| Syscall | Checked? | Impact |
-|---|---|---|
-| `openat` | **Yes** | Blocks file reads/writes |
-| `unlinkat` | **Yes** | Blocks file deletion |
-| `execve` | **Yes** | Blocks program execution |
-| `connect` | **Yes** | Blocks network connections |
-| `stat` / `lstat` / `newfstatat` | **No** | Can probe whether denied files exist, see sizes/permissions |
-| `readlink` / `readlinkat` | **No** | Can read symlink targets of denied paths |
-| `mkdir` | **No** | Can create directories in denied paths |
-| `access` | **No** | Can check permissions of denied paths |
-| `getdents` | **No** | Can list directory contents of denied paths (if parent is openable) |
-
-This means a command like `ls /lib/litebox_rtld_audit.so` succeeds (uses `stat`) even when `/lib/**` is in the deny list, while `cat /lib/litebox_rtld_audit.so` correctly fails (uses `openat`). A complete implementation would enforce the deny list at `stat`, `readlink`, `access`, and `mkdir` syscalls as well.
-
-Example policy (`deny-network.json`):
-```json
-{
-    "filesystem": {
-        "allow_read": [],
-        "allow_write": ["/tmp/**", "/workspace/**"],
-        "deny": ["**/.ssh/**", "**/.git/config"]
-    },
-    "network": { "deny_all": true, "allow_connect": [] },
-    "process": { "allow_exec": ["/bin/*", "/usr/bin/*"] }
-}
-```
+**Known enforcement gaps**: `stat`, `readlink`, `access`, `mkdir`, and `getdents` are not checked against the policy. This means `ls /lib/...` succeeds (uses `stat`) even when `/lib/**` is denied, while `cat /lib/...` correctly fails (uses `openat`).
 
 ### Phase 4: VS Code Agent Integration
 
-**Commits**: `7a56af5c`, `474380f4`, `a9ae1ac5`, `67f68c72`
-
-- **`litebox-shell.cmd`**: Windows batch wrapper — REPL mode where each command typed by the user (or Copilot agent) spawns a fresh LiteBox invocation. Avoids `fork()` limitation. Stderr (audit log) redirected to `.audit.jsonl` file.
-- **`vscode-settings-example.jsonc`**: Terminal profile config + audit log tail task
-- **`View-AuditLog.ps1`**: PowerShell pretty-printer with color-coded syscall names and regex filtering
-- **`demo/`**: Self-contained folder with `.vscode/settings.json` — open in a separate VS Code instance for sandboxed terminal testing. LiteBox Sandbox set as default terminal profile.
+The sandbox is exposed as a VS Code terminal profile. A demo workspace (`litebox_tool_executor/demo/`) provides:
+- Three terminal profiles: "LiteBox Sandbox (Windows)", "LiteBox Sandbox (WSL2)", "PowerShell"
+- Audit log viewer (`View-AuditLog.ps1`) with color-coded syscall names and regex filtering
+- Auto-tail task that streams the audit log on workspace open
 
 ### Bug Fixes Along the Way
 
-| Commit | Fix |
+Several LiteBox bugs were discovered and fixed during integration:
+
+| Fix | Root Cause |
 |---|---|
-| `e59682ef` | **ppoll/epoll: return IN events for file descriptors** — poll only returned OUT (writable), never IN (readable), causing interactive shells to hang waiting for stdin |
-| `4d697d8f` | **Flush stdout after each write** — Rust's line-buffered stdout held shell prompts (no trailing newline) in the buffer |
-| `8dbdfa54` | **Disable Windows console echo** — ConPTY echoes keystrokes, but busybox shell also echoes, causing double-echo |
-| `94fef7d3` | **Terminal size 80x24 instead of 20x20** — TIOCGWINSZ ioctl was hardcoded to 20 columns, causing line wrapping mid-word |
-| `3adc98d2` | **Move debug banner to stderr** — "System information" printed to stdout on every `Platform::new()`, polluting guest output |
+| **ppoll/epoll returning only OUT events** | File descriptors never reported IN (readable), causing shells to hang waiting for stdin |
+| **Stdout not flushing prompts** | Rust's line-buffered stdout held shell prompts (no trailing newline) in the buffer |
+| **Double-echo in Windows terminal** | ConPTY and busybox both echoed keystrokes; fixed by disabling `ENABLE_ECHO_INPUT` |
+| **Line wrapping at 20 columns** | TIOCGWINSZ ioctl hardcoded to 20×20 instead of 80×24 |
+| **Debug banner on stdout** | `Platform::new()` printed "System information" to stdout, polluting guest output |
 
 ### Phase 5: WSL2 Investigation
 
@@ -397,7 +352,7 @@ Example policy (`deny-network.json`):
 - Demo workspace gained three terminal profiles: "LiteBox Sandbox (Windows)", "LiteBox Sandbox (WSL2)", and "PowerShell"
 - Built and verified the Linux runner in WSL2 with the rewriter backend — single busybox commands work with audit logging and policy enforcement
 
-**Seccomp segfault discovery and fix** (`f419f420`):
+**Seccomp segfault discovery and fix**:
 
 The seccomp backend crashed with a segfault on WSL2. Investigation with GDB revealed:
 - `gs_base = 0` at the crash point (`syscall_callback`)
