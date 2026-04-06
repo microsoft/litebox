@@ -33,7 +33,8 @@
   - [Themes from the Landscape](#themes-from-the-landscape)
 - [Appendix A: Hardware Virtualization Primer](#appendix-a-hardware-virtualization-primer)
 - [Appendix B: VS Code Remote Architecture](#appendix-b-vs-code-remote-architecture)
-- [Appendix C: Dev Containers vs LLM Sandboxing](#appendix-c-dev-containers-vs-llm-sandboxing)
+  - [Dev Containers vs LLM Sandboxing](#dev-containers-vs-llm-sandboxing)
+- [Appendix C: WSL2 as an Isolation Boundary](#appendix-c-wsl2-as-an-isolation-boundary)
 
 ---
 
@@ -805,7 +806,7 @@ The server is installed at `~/.vscode-server/` on the remote, authenticated via 
 
 Codespaces are cloud-hosted dev containers running on Azure VMs. The VM provides the outer isolation boundary; the dev container provides the environment. The VS Code client connects via WebSocket tunnel through a Microsoft relay service.
 
-## Appendix C: Dev Containers vs LLM Sandboxing
+### Dev Containers vs LLM Sandboxing
 
 Dev containers and LLM sandboxes solve related but different problems:
 
@@ -831,7 +832,7 @@ A "dev container for LLM agents" would:
 - Never run privileged
 - Use a stronger runtime (gVisor's `runsc`, or LiteBox inside the container)
 
-### WSL2 as an Isolation Boundary
+## Appendix C: WSL2 as an Isolation Boundary
 
 WSL2 runs a real Linux kernel inside a Hyper-V virtual machine — hardware-isolated from the Windows host. This makes it tempting to use as an LLM sandbox. However, a default WSL2 instance provides **environmental isolation, not security isolation**, similar to Docker:
 
