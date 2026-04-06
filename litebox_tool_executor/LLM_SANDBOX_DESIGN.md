@@ -25,6 +25,7 @@
   - [GitHub Codespaces](#github-codespaces)
 - [Dev Containers vs LLM Sandboxing](#dev-containers-vs-llm-sandboxing)
 - [Attack Surface Analysis](#attack-surface-analysis)
+  - [Network Isolation Patterns](#network-isolation-patterns)
 - [Implementation](#implementation)
   - [Architecture](#architecture)
   - [Phase 1: Audit Logging](#phase-1-audit-logging)
@@ -342,9 +343,44 @@ The combination of **WSL2 (hardware VM boundary) + restricted configuration + Li
 
 **5. The Pre-Sandbox Surface** — provisioning the sandbox image, configuring it, preparing tool binaries. If the rootfs contains a backdoored binary, the sandbox faithfully runs it.
 
-**6. Network Policy** — most tools need some network access. The moment any outbound connectivity is allowed, DNS exfiltration and HTTP exfiltration to attacker-controlled servers become possible. This requires network-level policy orthogonal to syscall isolation.
+**6. Network Policy** — most tools need some network access. The moment any outbound connectivity is allowed, DNS exfiltration and HTTP exfiltration to attacker-controlled servers become possible. This requires network-level policy orthogonal to syscall isolation. See [Network Isolation Patterns](#network-isolation-patterns) below.
 
 **7. Sandbox Implementation Bugs** — smaller TCB in a memory-safe language means fewer bugs, but never zero.
+
+### Network Isolation Patterns
+
+Filesystem sandboxing is largely a solved problem; network isolation for agents is harder. The moment an agent needs *any* outbound connectivity (typically for LLM API calls), a data exfiltration channel opens. Several complementary patterns exist, ordered from coarsest to most sophisticated:
+
+**Network namespace isolation.** Place the agent process in its own Linux network namespace with no interfaces except a veth pair to a controlled bridge. The bridge side runs firewall rules (iptables/nftables). The agent literally cannot see the host's network. This is what bubblewrap and Docker do. Strong but coarse — it's all-or-nothing per host:port.
+
+**DNS sinkholing / split DNS.** Intercept DNS queries and return NXDOMAIN for unauthorized domains. Simple to implement (run a local DNS resolver that only resolves allowlisted names), but easily bypassed by hardcoding IP addresses. Useful as defense-in-depth alongside other methods.
+
+**Transparent TUN-based capture.** A TUN virtual network interface captures *all* traffic at the IP level — not just HTTP. The agent's network namespace routes everything through the TUN device to a userspace proxy. This catches non-HTTP protocols (raw TCP, DNS, UDP) that an application-layer proxy would miss. greywall uses this approach via `tun2socks`.
+
+**L7 allowlist proxy.** All outbound HTTP(S) traffic routes through an application-layer proxy that inspects method, path, and host. Policies like "allow GET to `api.github.com/repos/*` but block POST" are expressible. Requires TLS termination (MITM) to inspect HTTPS content, meaning the proxy holds its own CA cert trusted inside the sandbox. OpenShell uses this approach.
+
+**Credential injection proxy.** The agent connects to `localhost`; the proxy injects real API keys into upstream requests before forwarding. The agent never sees credentials, even in its own process memory. This solves *credential leakage* specifically — the agent can still reach the allowed upstream, but cannot exfiltrate the key. nono implements this as both proxy mode (keys never enter the sandbox) and env mode (keys injected as environment variables, simpler but weaker).
+
+**Scoped token exchange.** Instead of injecting a powerful API key, mint a short-lived token with minimal scopes (e.g., "read-only access to this one repo for 15 minutes"). The agent holds a real credential, but it's worthless for anything outside the task. OAuth 2.0 token exchange (RFC 8693) and GitHub's fine-grained PATs support this. Orthogonal to network isolation — limits what the agent can *do* even if it reaches the API.
+
+**eBPF-based network monitoring.** Attach eBPF programs to socket operations to observe (and optionally block) connections in real time. Unlike iptables, eBPF can correlate network activity with the specific process making the call and log structured events. More observation than enforcement — primarily useful for audit trails. greywall uses this for violation monitoring.
+
+**Syscall-level connect filtering.** Intercept `connect()` syscalls and check the destination address/port against a policy. The crudest option — no protocol awareness, no credential injection, no DNS filtering. LiteBox's current `connect` deny policy operates at this level.
+
+These patterns compose as defense-in-depth layers:
+
+| Layer | What it stops | Example implementations |
+|---|---|---|
+| **Network namespace** | All unauthorized network access | bubblewrap, Docker, jai |
+| **DNS sinkhole** | Resolution of unauthorized domains | Local resolver in namespace |
+| **TUN capture** | Non-HTTP protocol exfiltration | greywall (tun2socks) |
+| **L7 proxy** | Unauthorized HTTP methods/paths | OpenShell gateway |
+| **Credential proxy** | Agent seeing/leaking API keys | nono proxy injection |
+| **Scoped tokens** | Damage from leaked credentials | GitHub fine-grained PATs, OAuth token exchange |
+| **eBPF monitoring** | Undetected exfiltration attempts | greywall violation monitor |
+| **Syscall filtering** | Any `connect()` not in allowlist | LiteBox, seccomp BPF |
+
+The recommended stack for agent network isolation: network namespace (deny-all default) + L7 proxy (allowlisted endpoints) + credential proxy (agent never holds keys) + scoped tokens (limit blast radius). LiteBox currently operates only at the syscall filtering layer; the design doc's future work item for "network egress filtering via smoltcp" would add TUN-level capture, but L7 inspection and credential proxying would remain out of scope.
 
 ### Complete LLM Tool Sandboxing Stack
 
