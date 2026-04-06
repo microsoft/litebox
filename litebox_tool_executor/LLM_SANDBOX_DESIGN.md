@@ -9,11 +9,9 @@
 - [Motivation](#motivation)
 - [Threat Model](#threat-model)
 - [Sandboxing Technology Landscape](#sandboxing-technology-landscape)
-  - [Docker & Container Isolation](#docker--container-isolation)
-  - [gVisor (runsc)](#gvisor-runsc)
-  - [Firecracker MicroVMs](#firecracker-microvms)
-  - [WebAssembly (Wasm)](#webassembly-wasm)
   - [LiteBox Scenarios](#litebox-scenarios)
+  - [Syscall Interception Backends: Rewriter vs Seccomp](#syscall-interception-backends-rewriter-vs-seccomp)
+  - [Comparison Matrix](#comparison-matrix)
 - [Attack Surface Analysis](#attack-surface-analysis)
   - [Network Isolation Patterns](#network-isolation-patterns)
 - [Implementation](#implementation)
@@ -35,6 +33,7 @@
 - [Appendix B: VS Code Remote Architecture](#appendix-b-vs-code-remote-architecture)
   - [Dev Containers vs LLM Sandboxing](#dev-containers-vs-llm-sandboxing)
 - [Appendix C: WSL2 as an Isolation Boundary](#appendix-c-wsl2-as-an-isolation-boundary)
+- [Appendix D: Sandbox Technology Details](#appendix-d-sandbox-technology-details)
 
 ---
 
@@ -64,62 +63,7 @@ The strength of a sandbox is determined by how narrow the interface is between u
 
 ## Sandboxing Technology Landscape
 
-### Docker & Container Isolation
-
-Docker containers share the host kernel. The container boundary is enforced by Linux namespaces, cgroups, seccomp, and AppArmor/SELinux — all kernel features. A kernel exploit from inside the container escapes the sandbox entirely.
-
-| Property | Value |
-|---|---|
-| **Isolation mechanism** | Namespaces + cgroups + seccomp |
-| **Syscall surface** | ~300+ Linux syscalls (seccomp can filter) |
-| **TCB** | Full Linux kernel (~28M LoC in C) |
-| **Escape difficulty** | Moderate — steady stream of kernel CVEs |
-| **Best for** | Environmental isolation, not security isolation |
-
-### gVisor (runsc)
-
-[gVisor](https://gvisor.dev/) is Google's userspace kernel. The **Sentry** process intercepts guest syscalls (via ptrace or KVM) and reimplements them in Go, forwarding only ~70 syscalls to the real host kernel.
-
-| Property | Value |
-|---|---|
-| **Isolation mechanism** | Userspace syscall reimplementation |
-| **Syscall surface** | ~70 syscalls to host (from Sentry) |
-| **TCB** | gVisor Sentry (~200K LoC Go) |
-| **Interception** | ptrace (~10-20μs/syscall) or KVM (~1-5μs/syscall) |
-| **OCI integration** | Drop-in `--runtime=runsc` for Docker/containerd |
-| **Used in production** | GKE Sandbox, Cloud Run |
-
-gVisor's Sentry is architecturally the closest analog to LiteBox in the existing ecosystem. Key differences: Go vs Rust (GC pauses vs zero-cost), ~200K LoC vs much smaller, Linux-only vs cross-platform.
-
-### Firecracker MicroVMs
-
-[Firecracker](https://firecracker-microvm.github.io/) is AWS's open-source VMM, written in Rust. It creates lightweight VMs using Linux KVM.
-
-| Property | Value |
-|---|---|
-| **Isolation mechanism** | Hardware VM (Intel VT-x / AMD-V via KVM) |
-| **Host syscall surface** | ~25 (from the VMM process, seccomp-enforced) |
-| **TCB** | Firecracker VMM (~50K LoC Rust) + KVM |
-| **Boot time** | ~125ms |
-| **Memory overhead** | ~5MB minimum |
-| **Device model** | 4 devices (virtio-net, virtio-block, serial, keyboard) |
-| **Used in production** | AWS Lambda, AWS Fargate |
-
-Firecracker runs a full Linux kernel inside the VM — near-perfect compatibility but heavier than a library OS.
-
-### WebAssembly (Wasm)
-
-Wasm runtimes (Wasmtime, V8, Wasmer) provide language-level sandboxing with capability-based security (WASI).
-
-| Property | Value |
-|---|---|
-| **Isolation mechanism** | Language-level sandbox, linear memory |
-| **Syscall surface** | Capability-based (WASI) — explicit imports only |
-| **TCB** | Wasm runtime |
-| **Compatibility** | Cannot run arbitrary Linux binaries |
-| **Best for** | Purpose-built sandboxed modules |
-
-Very strong isolation but can't run unmodified Linux programs — tools would need to be compiled to Wasm.
+Several sandboxing technologies are relevant to LLM agent tool execution. For detailed descriptions of Docker, gVisor, Firecracker, and WebAssembly sandboxes, see [Appendix D](#appendix-d-sandbox-technology-details). This section focuses on LiteBox's positioning and unique properties.
 
 ### LiteBox Scenarios
 
@@ -860,6 +804,67 @@ WSL2 runs a real Linux kernel inside a Hyper-V virtual machine — hardware-isol
 - Using LiteBox or another sandbox inside WSL2 for per-command audit and policy enforcement
 
 The combination of **WSL2 (hardware VM boundary) + restricted configuration + LiteBox (syscall audit + policy)** provides defense-in-depth: the VM prevents escape to Windows, the configuration limits lateral access within Linux, and LiteBox mediates individual command execution.
+
+## Appendix D: Sandbox Technology Details
+
+Detailed descriptions of the sandbox technologies referenced in the [Comparison Matrix](#comparison-matrix).
+
+### Docker & Container Isolation
+
+Docker containers share the host kernel. The container boundary is enforced by Linux namespaces, cgroups, seccomp, and AppArmor/SELinux — all kernel features. A kernel exploit from inside the container escapes the sandbox entirely.
+
+| Property | Value |
+|---|---|
+| **Isolation mechanism** | Namespaces + cgroups + seccomp |
+| **Syscall surface** | ~300+ Linux syscalls (seccomp can filter) |
+| **TCB** | Full Linux kernel (~28M LoC in C) |
+| **Escape difficulty** | Moderate — steady stream of kernel CVEs |
+| **Best for** | Environmental isolation, not security isolation |
+
+### gVisor (runsc)
+
+[gVisor](https://gvisor.dev/) is Google's userspace kernel. The **Sentry** process intercepts guest syscalls (via ptrace or KVM) and reimplements them in Go, forwarding only ~70 syscalls to the real host kernel.
+
+| Property | Value |
+|---|---|
+| **Isolation mechanism** | Userspace syscall reimplementation |
+| **Syscall surface** | ~70 syscalls to host (from Sentry) |
+| **TCB** | gVisor Sentry (~200K LoC Go) |
+| **Interception** | ptrace (~10-20μs/syscall) or KVM (~1-5μs/syscall) |
+| **OCI integration** | Drop-in `--runtime=runsc` for Docker/containerd |
+| **Used in production** | GKE Sandbox, Cloud Run |
+
+gVisor's Sentry is architecturally the closest analog to LiteBox in the existing ecosystem. Key differences: Go vs Rust (GC pauses vs zero-cost), ~200K LoC vs much smaller, Linux-only vs cross-platform.
+
+### Firecracker MicroVMs
+
+[Firecracker](https://firecracker-microvm.github.io/) is AWS's open-source VMM, written in Rust. It creates lightweight VMs using Linux KVM.
+
+| Property | Value |
+|---|---|
+| **Isolation mechanism** | Hardware VM (Intel VT-x / AMD-V via KVM) |
+| **Host syscall surface** | ~25 (from the VMM process, seccomp-enforced) |
+| **TCB** | Firecracker VMM (~50K LoC Rust) + KVM |
+| **Boot time** | ~125ms |
+| **Memory overhead** | ~5MB minimum |
+| **Device model** | 4 devices (virtio-net, virtio-block, serial, keyboard) |
+| **Used in production** | AWS Lambda, AWS Fargate |
+
+Firecracker runs a full Linux kernel inside the VM — near-perfect compatibility but heavier than a library OS.
+
+### WebAssembly (Wasm)
+
+Wasm runtimes (Wasmtime, V8, Wasmer) provide language-level sandboxing with capability-based security (WASI).
+
+| Property | Value |
+|---|---|
+| **Isolation mechanism** | Language-level sandbox, linear memory |
+| **Syscall surface** | Capability-based (WASI) — explicit imports only |
+| **TCB** | Wasm runtime |
+| **Compatibility** | Cannot run arbitrary Linux binaries |
+| **Best for** | Purpose-built sandboxed modules |
+
+Very strong isolation but can't run unmodified Linux programs — tools would need to be compiled to Wasm.
 
 ---
 
