@@ -14,16 +14,6 @@
   - [Firecracker MicroVMs](#firecracker-microvms)
   - [WebAssembly (Wasm)](#webassembly-wasm)
   - [LiteBox Scenarios](#litebox-scenarios)
-- [Hardware Virtualization Primer](#hardware-virtualization-primer)
-  - [Intel VT-x / AMD-V](#intel-vt-x--amd-v)
-  - [KVM (Linux)](#kvm-linux)
-  - [Hyper-V / VBS (Windows)](#hyper-v--vbs-windows)
-  - [AMD SEV-SNP](#amd-sev-snp)
-- [VS Code Remote Architecture](#vs-code-remote-architecture)
-  - [Dev Containers](#dev-containers)
-  - [VS Code Remote Protocol](#vs-code-remote-protocol)
-  - [GitHub Codespaces](#github-codespaces)
-- [Dev Containers vs LLM Sandboxing](#dev-containers-vs-llm-sandboxing)
 - [Attack Surface Analysis](#attack-surface-analysis)
   - [Network Isolation Patterns](#network-isolation-patterns)
 - [Implementation](#implementation)
@@ -41,6 +31,9 @@
   - [Open Source Tools](#open-source-tools)
   - [Landscape Summary](#landscape-summary)
   - [Themes from the Landscape](#themes-from-the-landscape)
+- [Appendix A: Hardware Virtualization Primer](#appendix-a-hardware-virtualization-primer)
+- [Appendix B: VS Code Remote Architecture](#appendix-b-vs-code-remote-architecture)
+- [Appendix C: Dev Containers vs LLM Sandboxing](#appendix-c-dev-containers-vs-llm-sandboxing)
 
 ---
 
@@ -182,142 +175,6 @@ For LLM tool sandboxing, the **rewriter** backend is the practical choice today 
 | **LiteBox on Windows** | LiteBox + Windows kernel | Cross-OS library OS | No Linux kernel | Strong; novel attack surface reduction |
 | **LiteBox + SNP** | LiteBox + AMD hardware | Hardware encryption | Minimal | Strongest confidential computing |
 | **Wasm** | Wasm runtime | Language-level | Capability-based (WASI) | Very strong; can't run Linux binaries |
-
-## Hardware Virtualization Primer
-
-### Intel VT-x / AMD-V
-
-Modern x86 CPUs have a dedicated virtualization mode with two execution contexts:
-
-- **Guest mode (non-root)**: runs guest code at full hardware speed
-- **Host mode (root)**: runs VMM code that handles VM exits
-
-Key components:
-- **VMCS/VMCB**: per-vCPU control structure storing guest/host register state and exit configuration
-- **VM Entry** (`VMLAUNCH`/`VMRESUME` / `VMRUN`): CPU switches to guest mode
-- **VM Exit**: certain events cause CPU to stop guest, save state, jump to VMM handler
-- **EPT/NPT** (Extended/Nested Page Tables): second-level address translation — guest physical addresses go through VMM-controlled page tables before reaching real RAM
-
-The two-level address translation is the critical memory isolation mechanism: the guest literally cannot address host memory that the VMM hasn't mapped.
-
-### KVM (Linux)
-
-KVM (Kernel-based Virtual Machine) is a Linux kernel module that exposes hardware virtualization to userspace via `ioctl()` on `/dev/kvm`. It's the plumbing — userspace VMMs like QEMU, Firecracker, and crosvm build on top of it.
-
-Lifecycle: `open(/dev/kvm)` → `KVM_CREATE_VM` → `KVM_CREATE_VCPU` → `KVM_SET_USER_MEMORY_REGION` (map guest physical memory) → `KVM_RUN` (enter guest, blocks until VM exit) → inspect exit reason → handle → repeat.
-
-### Hyper-V / VBS (Windows)
-
-**VBS** (Virtualization-Based Security) uses the Hyper-V hypervisor to create isolated memory regions called Virtual Trust Levels (VTLs) within the same partition:
-
-- **VTL 0**: Normal OS (Windows kernel)
-- **VTL 1**: Secure world (powers Credential Guard, HVCI, and LiteBox's LVBS platform)
-- **VTL 2**: Management (future use)
-
-VTLs are asymmetric: higher VTLs can access lower VTL memory, but not vice versa. The hypervisor enforces this at the hardware page-table level.
-
-Key differences from KVM:
-- Hyper-V runs **beneath** the host OS (Type-1 hypervisor), not inside it
-- Communication is via **hypercalls** (through a memory-mapped hypercall page + MSRs), not ioctls
-- **SynIC** (Synthetic Interrupt Controller) handles event delivery between VTLs
-
-LiteBox's LVBS platform runs in VTL1 kernel mode, talking to Hyper-V via raw hypercalls, managing its own page tables, and running OP-TEE Trusted Applications.
-
-**WHP** (Windows Hypervisor Platform) is the userspace API equivalent of KVM — lets applications create VMs from Windows. Used by QEMU-on-Windows, Android Emulator, etc.
-
-### AMD SEV-SNP
-
-AMD **SEV** (Secure Encrypted Virtualization) family:
-- **SEV**: encrypts VM memory with a per-VM key (hypervisor can't read it)
-- **SEV-ES**: adds Encrypted State (registers protected on VM exits)
-- **SEV-SNP**: adds Secure Nested Paging (prevents hypervisor from remapping, replaying, or tampering with guest memory pages)
-
-SNP is the strongest variant — defends against a **malicious hypervisor** that actively tries to manipulate the guest's memory, not just passively snooping. LiteBox's SNP runner boots as a bare-metal `#![no_std]` kernel inside an SNP-protected VM.
-
-## VS Code Remote Architecture
-
-### Dev Containers
-
-The [Dev Containers specification](https://containers.dev/) (open standard, originally from Microsoft) defines how a development tool creates containerized development environments via `devcontainer.json`:
-
-- **Image source**: `image`, `dockerFile`, or `dockerComposeFile`
-- **Lifecycle hooks**: `initializeCommand` → build/pull → `onCreateCommand` → `updateContentCommand` → `postCreateCommand` → `postStartCommand` → `postAttachCommand`
-- **Features**: composable OCI artifacts with `install.sh` scripts
-- **Customizations**: `customizations.vscode.extensions`, `customizations.vscode.settings`
-
-Dev containers were designed for **environmental isolation** (protect your machine from a project's dependencies), not **security isolation** (protect your machine from adversarial code).
-
-### VS Code Remote Protocol
-
-When VS Code works remotely (Dev Containers, SSH, WSL, Tunnels), it splits into two halves:
-
-- **Local (UI Client)**: renderer, webview panels, UI-only extensions (themes, keymaps)
-- **Remote (VS Code Server)**: extension hosts, language servers, debug adapters, terminals, file system access
-
-The connection is a **multiplexed JSON-RPC channel** over a bidirectional byte stream (Docker exec stdin/stdout, SSH channel, WebSocket, etc.). Multiple channels are multiplexed: extension host communication, file system operations, terminal I/O, debug adapter traffic, port forwarding.
-
-Extensions declare where they run via `extensionKind` in `package.json`: `"ui"` (local only), `"workspace"` (remote server), or both.
-
-The server is installed at `~/.vscode-server/` on the remote, authenticated via a random connection token.
-
-### GitHub Codespaces
-
-Codespaces are cloud-hosted dev containers running on Azure VMs. The VM provides the outer isolation boundary; the dev container provides the environment. The VS Code client connects via WebSocket tunnel through a Microsoft relay service.
-
-## Dev Containers vs LLM Sandboxing
-
-Dev containers and LLM sandboxes solve related but different problems:
-
-| Concern | Dev Container | LLM Sandbox Needed |
-|---|---|---|
-| Toolchain isolation | ✅ Separate containers | ✅ Same need |
-| Reproducible environment | ✅ `devcontainer.json` | ✅ Same need |
-| Project file access | Bind-mount (read-write) | Copy-in, explicit sync-back |
-| Credentials | Forwarded (SSH, Git, cloud) | Never forwarded; scoped tokens |
-| Network access | Unrestricted | Egress allowlist, DNS filtering |
-| Docker socket | Sometimes mounted | Never |
-| Privileged mode | Sometimes needed | Never |
-| Persistence | Container survives across sessions | Ephemeral per-invocation |
-| Trust model | Developer is trusted | Agent is partially trusted at best |
-
-The dev container **abstraction** — a declarative, reproducible, disposable environment — is the right shape for LLM sandboxing. The **implementation** just needs a stronger foundation.
-
-A "dev container for LLM agents" would:
-- Copy project files into the container instead of bind-mounting
-- Use scoped, short-lived tokens instead of forwarding credentials
-- Apply network egress allowlists
-- Be ephemeral per task (or per tool invocation for high security)
-- Never run privileged
-- Use a stronger runtime (gVisor's `runsc`, or LiteBox inside the container)
-
-### WSL2 as an Isolation Boundary
-
-WSL2 runs a real Linux kernel inside a Hyper-V virtual machine — hardware-isolated from the Windows host. This makes it tempting to use as an LLM sandbox. However, a default WSL2 instance provides **environmental isolation, not security isolation**, similar to Docker:
-
-**What WSL2 isolates (from Windows):**
-- Guest processes can't directly access Windows APIs, the Windows registry, or Windows processes
-- Memory is in a separate Hyper-V VM partition — hardware-enforced
-- Guest processes run under the Linux kernel, not the Windows kernel
-
-**What WSL2 does NOT isolate (by default):**
-
-| Exposure | Detail |
-|---|---|
-| **Windows filesystem** | `/mnt/c/`, `/mnt/d/` etc. mount entire Windows drives read-write. The agent can read `~/.ssh/id_rsa`, browser profiles, cloud CLI tokens, etc. |
-| **Network** | Full unrestricted network access. The agent can exfiltrate data via HTTP, DNS, or scan internal networks. |
-| **Linux filesystem** | Full access to `/etc/`, `$HOME`, installed packages, dotfiles |
-| **Forwarded credentials** | If git credential-manager or SSH agent forwarding is configured (common), the agent can push to repos or SSH to servers using the user's identity |
-| **Environment variables** | `PATH`, `HOME`, cloud tokens, API keys — anything exported is visible |
-| **Other WSL2 distros** | Not isolated from each other (shared kernel) |
-
-**Hardening a WSL2 instance for sandboxing requires:**
-- Disabling Windows drive automount (`automount = false` in `/etc/wsl.conf`)
-- Creating a restricted user account without access to sensitive directories
-- Configuring network restrictions (iptables, or not forwarding DNS)
-- Not forwarding SSH agents or credential managers into the WSL2 environment
-- Using LiteBox or another sandbox inside WSL2 for per-command audit and policy enforcement
-
-The combination of **WSL2 (hardware VM boundary) + restricted configuration + LiteBox (syscall audit + policy)** provides defense-in-depth: the VM prevents escape to Windows, the configuration limits lateral access within Linux, and LiteBox mediates individual command execution.
 
 ## Attack Surface Analysis
 
@@ -864,6 +721,144 @@ Several patterns emerge across these projects:
 4. **The diff/apply pattern matters.** yoloAI's insight that the agent should work on an isolated copy and the user should review changes via git diff is relevant to any sandbox that needs to return modified files — including LiteBox's file injection/extraction future work.
 
 5. **Agent-independent sandboxing is preferred.** The HN discussion around jai strongly favors external sandboxes over vendor built-ins. As one commenter noted: "I'm often switching between claude, codex, and opencode. It's kind of nice to have the sandbox policy independent of the actual AI assistant you are running."
+
+---
+
+## Appendix A: Hardware Virtualization Primer
+
+### Intel VT-x / AMD-V
+
+Modern x86 CPUs have a dedicated virtualization mode with two execution contexts:
+
+- **Guest mode (non-root)**: runs guest code at full hardware speed
+- **Host mode (root)**: runs VMM code that handles VM exits
+
+Key components:
+- **VMCS/VMCB**: per-vCPU control structure storing guest/host register state and exit configuration
+- **VM Entry** (`VMLAUNCH`/`VMRESUME` / `VMRUN`): CPU switches to guest mode
+- **VM Exit**: certain events cause CPU to stop guest, save state, jump to VMM handler
+- **EPT/NPT** (Extended/Nested Page Tables): second-level address translation — guest physical addresses go through VMM-controlled page tables before reaching real RAM
+
+The two-level address translation is the critical memory isolation mechanism: the guest literally cannot address host memory that the VMM hasn't mapped.
+
+### KVM (Linux)
+
+KVM (Kernel-based Virtual Machine) is a Linux kernel module that exposes hardware virtualization to userspace via `ioctl()` on `/dev/kvm`. It's the plumbing — userspace VMMs like QEMU, Firecracker, and crosvm build on top of it.
+
+Lifecycle: `open(/dev/kvm)` → `KVM_CREATE_VM` → `KVM_CREATE_VCPU` → `KVM_SET_USER_MEMORY_REGION` (map guest physical memory) → `KVM_RUN` (enter guest, blocks until VM exit) → inspect exit reason → handle → repeat.
+
+### Hyper-V / VBS (Windows)
+
+**VBS** (Virtualization-Based Security) uses the Hyper-V hypervisor to create isolated memory regions called Virtual Trust Levels (VTLs) within the same partition:
+
+- **VTL 0**: Normal OS (Windows kernel)
+- **VTL 1**: Secure world (powers Credential Guard, HVCI, and LiteBox's LVBS platform)
+- **VTL 2**: Management (future use)
+
+VTLs are asymmetric: higher VTLs can access lower VTL memory, but not vice versa. The hypervisor enforces this at the hardware page-table level.
+
+Key differences from KVM:
+- Hyper-V runs **beneath** the host OS (Type-1 hypervisor), not inside it
+- Communication is via **hypercalls** (through a memory-mapped hypercall page + MSRs), not ioctls
+- **SynIC** (Synthetic Interrupt Controller) handles event delivery between VTLs
+
+LiteBox's LVBS platform runs in VTL1 kernel mode, talking to Hyper-V via raw hypercalls, managing its own page tables, and running OP-TEE Trusted Applications.
+
+**WHP** (Windows Hypervisor Platform) is the userspace API equivalent of KVM — lets applications create VMs from Windows. Used by QEMU-on-Windows, Android Emulator, etc.
+
+### AMD SEV-SNP
+
+AMD **SEV** (Secure Encrypted Virtualization) family:
+- **SEV**: encrypts VM memory with a per-VM key (hypervisor can't read it)
+- **SEV-ES**: adds Encrypted State (registers protected on VM exits)
+- **SEV-SNP**: adds Secure Nested Paging (prevents hypervisor from remapping, replaying, or tampering with guest memory pages)
+
+SNP is the strongest variant — defends against a **malicious hypervisor** that actively tries to manipulate the guest's memory, not just passively snooping. LiteBox's SNP runner boots as a bare-metal `#![no_std]` kernel inside an SNP-protected VM.
+
+## Appendix B: VS Code Remote Architecture
+
+### Dev Containers
+
+The [Dev Containers specification](https://containers.dev/) (open standard, originally from Microsoft) defines how a development tool creates containerized development environments via `devcontainer.json`:
+
+- **Image source**: `image`, `dockerFile`, or `dockerComposeFile`
+- **Lifecycle hooks**: `initializeCommand` → build/pull → `onCreateCommand` → `updateContentCommand` → `postCreateCommand` → `postStartCommand` → `postAttachCommand`
+- **Features**: composable OCI artifacts with `install.sh` scripts
+- **Customizations**: `customizations.vscode.extensions`, `customizations.vscode.settings`
+
+Dev containers were designed for **environmental isolation** (protect your machine from a project's dependencies), not **security isolation** (protect your machine from adversarial code).
+
+### VS Code Remote Protocol
+
+When VS Code works remotely (Dev Containers, SSH, WSL, Tunnels), it splits into two halves:
+
+- **Local (UI Client)**: renderer, webview panels, UI-only extensions (themes, keymaps)
+- **Remote (VS Code Server)**: extension hosts, language servers, debug adapters, terminals, file system access
+
+The connection is a **multiplexed JSON-RPC channel** over a bidirectional byte stream (Docker exec stdin/stdout, SSH channel, WebSocket, etc.). Multiple channels are multiplexed: extension host communication, file system operations, terminal I/O, debug adapter traffic, port forwarding.
+
+Extensions declare where they run via `extensionKind` in `package.json`: `"ui"` (local only), `"workspace"` (remote server), or both.
+
+The server is installed at `~/.vscode-server/` on the remote, authenticated via a random connection token.
+
+### GitHub Codespaces
+
+Codespaces are cloud-hosted dev containers running on Azure VMs. The VM provides the outer isolation boundary; the dev container provides the environment. The VS Code client connects via WebSocket tunnel through a Microsoft relay service.
+
+## Appendix C: Dev Containers vs LLM Sandboxing
+
+Dev containers and LLM sandboxes solve related but different problems:
+
+| Concern | Dev Container | LLM Sandbox Needed |
+|---|---|---|
+| Toolchain isolation | ✅ Separate containers | ✅ Same need |
+| Reproducible environment | ✅ `devcontainer.json` | ✅ Same need |
+| Project file access | Bind-mount (read-write) | Copy-in, explicit sync-back |
+| Credentials | Forwarded (SSH, Git, cloud) | Never forwarded; scoped tokens |
+| Network access | Unrestricted | Egress allowlist, DNS filtering |
+| Docker socket | Sometimes mounted | Never |
+| Privileged mode | Sometimes needed | Never |
+| Persistence | Container survives across sessions | Ephemeral per-invocation |
+| Trust model | Developer is trusted | Agent is partially trusted at best |
+
+The dev container **abstraction** — a declarative, reproducible, disposable environment — is the right shape for LLM sandboxing. The **implementation** just needs a stronger foundation.
+
+A "dev container for LLM agents" would:
+- Copy project files into the container instead of bind-mounting
+- Use scoped, short-lived tokens instead of forwarding credentials
+- Apply network egress allowlists
+- Be ephemeral per task (or per tool invocation for high security)
+- Never run privileged
+- Use a stronger runtime (gVisor's `runsc`, or LiteBox inside the container)
+
+### WSL2 as an Isolation Boundary
+
+WSL2 runs a real Linux kernel inside a Hyper-V virtual machine — hardware-isolated from the Windows host. This makes it tempting to use as an LLM sandbox. However, a default WSL2 instance provides **environmental isolation, not security isolation**, similar to Docker:
+
+**What WSL2 isolates (from Windows):**
+- Guest processes can't directly access Windows APIs, the Windows registry, or Windows processes
+- Memory is in a separate Hyper-V VM partition — hardware-enforced
+- Guest processes run under the Linux kernel, not the Windows kernel
+
+**What WSL2 does NOT isolate (by default):**
+
+| Exposure | Detail |
+|---|---|
+| **Windows filesystem** | `/mnt/c/`, `/mnt/d/` etc. mount entire Windows drives read-write. The agent can read `~/.ssh/id_rsa`, browser profiles, cloud CLI tokens, etc. |
+| **Network** | Full unrestricted network access. The agent can exfiltrate data via HTTP, DNS, or scan internal networks. |
+| **Linux filesystem** | Full access to `/etc/`, `$HOME`, installed packages, dotfiles |
+| **Forwarded credentials** | If git credential-manager or SSH agent forwarding is configured (common), the agent can push to repos or SSH to servers using the user's identity |
+| **Environment variables** | `PATH`, `HOME`, cloud tokens, API keys — anything exported is visible |
+| **Other WSL2 distros** | Not isolated from each other (shared kernel) |
+
+**Hardening a WSL2 instance for sandboxing requires:**
+- Disabling Windows drive automount (`automount = false` in `/etc/wsl.conf`)
+- Creating a restricted user account without access to sensitive directories
+- Configuring network restrictions (iptables, or not forwarding DNS)
+- Not forwarding SSH agents or credential managers into the WSL2 environment
+- Using LiteBox or another sandbox inside WSL2 for per-command audit and policy enforcement
+
+The combination of **WSL2 (hardware VM boundary) + restricted configuration + LiteBox (syscall audit + policy)** provides defense-in-depth: the VM prevents escape to Windows, the configuration limits lateral access within Linux, and LiteBox mediates individual command execution.
 
 ---
 
