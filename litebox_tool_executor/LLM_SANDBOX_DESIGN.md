@@ -7,13 +7,15 @@
 ## Table of Contents
 
 - [Motivation](#motivation)
-- [Threat Model](#threat-model)
+- [Threat Model & Attack Surface](#threat-model--attack-surface)
+  - [What Sandboxing Addresses](#what-sandboxing-addresses)
+  - [What Sandboxing Does NOT Address](#what-sandboxing-does-not-address)
+  - [Network Isolation Patterns](#network-isolation-patterns)
+  - [Complete LLM Tool Sandboxing Stack](#complete-llm-tool-sandboxing-stack)
 - [Sandboxing Technology Landscape](#sandboxing-technology-landscape)
   - [LiteBox Scenarios](#litebox-scenarios)
   - [Syscall Interception Backends: Rewriter vs Seccomp](#syscall-interception-backends-rewriter-vs-seccomp)
   - [Comparison Matrix](#comparison-matrix)
-- [Attack Surface Analysis](#attack-surface-analysis)
-  - [Network Isolation Patterns](#network-isolation-patterns)
 - [Implementation](#implementation)
   - [Architecture](#architecture)
   - [Phase 1: Audit Logging](#phase-1-audit-logging)
@@ -47,7 +49,7 @@ LiteBox is uniquely positioned for this because:
 - The **syscall rewriter** patches ELF binaries ahead of time so syscall instructions jump through LiteBox instead of the kernel
 - The **North/South architecture** allows the same shim to run on different platforms (Linux userland, Windows userland, Hyper-V VTL1, AMD SEV-SNP)
 
-## Threat Model
+## Threat Model & Attack Surface
 
 When an LLM agent executes a tool, the threats are:
 
@@ -60,68 +62,6 @@ When an LLM agent executes a tool, the threats are:
 | **Resource abuse** | Code consumes unbounded CPU/memory/disk |
 
 The strength of a sandbox is determined by how narrow the interface is between untrusted code and the trusted host, and how much code sits in the trusted computing base (TCB).
-
-## Sandboxing Technology Landscape
-
-Several sandboxing technologies are relevant to LLM agent tool execution. For detailed descriptions of Docker, gVisor, Firecracker, and WebAssembly sandboxes, see [Appendix D](#appendix-d-sandbox-technology-details). This section focuses on LiteBox's positioning and unique properties.
-
-### LiteBox Scenarios
-
-LiteBox supports multiple deployment scenarios with varying isolation properties:
-
-| Scenario | Platform | Isolation | TCB | Attack Surface |
-|---|---|---|---|---|
-| **Linux-on-Linux** | `litebox_platform_linux_userland` | Syscall rewriting + seccomp | LiteBox + Linux kernel | Reduced syscall set, memory-safe |
-| **Linux-on-Windows** | `litebox_platform_windows_userland` | No Linux kernel at all | LiteBox + Windows kernel | No Linux kernel bugs exploitable |
-| **SEV-SNP** | `litebox_runner_snp` | Hardware memory encryption | LiteBox + AMD CPU | Hypervisor cannot read guest memory |
-| **Hyper-V VTL1 (LVBS)** | `litebox_platform_lvbs` | Hypervisor-enforced VTL isolation | LiteBox + Hyper-V | Even compromised VTL0 OS can't access VTL1 |
-| **OP-TEE on Linux** | `litebox_runner_optee_on_linux_userland` | Library OS mediation | LiteBox + Linux kernel | Dev/test tool for TEE TAs |
-
-### Syscall Interception Backends: Rewriter vs Seccomp
-
-LiteBox on Linux supports two interception backends with fundamentally different tradeoffs:
-
-**Rewriter backend** (`--interception-backend rewriter`, default):
-- Scans all `.text` sections of the ELF binary for `syscall` instructions (opcode `0F 05`)
-- Replaces each with a `JMP` to a trampoline that routes through LiteBox's `syscall_callback`
-- **Non-selective**: rewrites ALL `syscall` instructions in the binary, regardless of syscall number
-- **Coverage gap**: shared libraries that aren't rewritten (dynamic linker, libc) make real kernel syscalls directly. `litebox_rtld_audit.so` hooks the dynamic linker to cover dynamically loaded libraries, but the linker itself still makes some direct kernel calls during startup.
-- **Better compatibility**: unrewritten code (library init) runs natively on the kernel, so programs "just work" even if the shim doesn't implement every syscall
-- **Weaker isolation**: the coverage gap means some guest code reaches the kernel unmediated
-
-**Seccomp backend** (`--interception-backend seccomp`):
-- Installs a BPF filter via `seccomp(SECCOMP_SET_MODE_FILTER)` that traps all syscalls not in an explicit allow-list
-- Trapped syscalls deliver `SIGSYS`, and the signal handler redirects execution to `syscall_callback`
-- **Complete coverage**: every syscall from the process is either allowed (for LiteBox's own internal use via "backdoor" magic arguments) or trapped and routed through LiteBox
-- **Stronger isolation**: no guest code can reach the kernel without LiteBox mediating it
-- **Worse compatibility**: the shim must handle every syscall the guest makes, including runtime initialization (musl/glibc TLS setup, memory allocation, etc.). If the shim returns `ENOSYS` for an essential syscall, the guest hangs or crashes.
-- **Known limitation**: busybox with seccomp currently hangs because musl's init sequence makes syscalls that the shim doesn't fully handle. The CI tests use seccomp with specific test binaries that make a limited syscall set.
-
-| Property | Rewriter | Seccomp |
-|---|---|---|
-| **What's intercepted** | `syscall` instructions in rewritten ELF code | All syscalls from the process |
-| **Unhandled syscalls** | Unrewritten library code falls through to kernel | Returns `ENOSYS` (may break the guest) |
-| **Coverage** | Partial (rewritten binaries only) | Complete (all process syscalls) |
-| **Compatibility** | Better (runtime init runs natively) | Worse (shim must handle everything) |
-| **Isolation strength** | Weaker (coverage gap for libraries) | Stronger (no gap) |
-| **Performance** | ~ns per syscall (direct JMP) | ~μs per syscall (signal handler round-trip) |
-| **fork() support** | No (shim doesn't implement it) | Potential via kernel fallback, but currently shim returns ENOSYS |
-
-For LLM tool sandboxing, the **rewriter** backend is the practical choice today — it works with busybox and provides audit + policy enforcement for all rewritten syscalls. The **seccomp** backend is the path to stronger isolation once the shim's syscall coverage is expanded.
-
-### Comparison Matrix
-
-| Technology | TCB Size | Isolation Type | Syscall Surface | LLM Tool Suitability |
-|---|---|---|---|---|
-| **Docker** | Full kernel | Namespaces + seccomp | ~300 syscalls | Weak; easy to set up |
-| **gVisor** | ~200K LoC Go | Userspace kernel | ~70 to host | Good; production-proven |
-| **Firecracker** | ~50K LoC Rust | Full VM (KVM) | ~25 from VMM | Strong; broad compatibility |
-| **LiteBox on Linux** | Small Rust codebase | Rewriting + seccomp | Implemented subset only | Strong; smallest TCB |
-| **LiteBox on Windows** | LiteBox + Windows kernel | Cross-OS library OS | No Linux kernel | Strong; novel attack surface reduction |
-| **LiteBox + SNP** | LiteBox + AMD hardware | Hardware encryption | Minimal | Strongest confidential computing |
-| **Wasm** | Wasm runtime | Language-level | Capability-based (WASI) | Very strong; can't run Linux binaries |
-
-## Attack Surface Analysis
 
 ### What Sandboxing Addresses
 
@@ -206,6 +146,66 @@ The recommended stack for agent network isolation: network namespace (deny-all d
 ```
 
 The sandbox (layer 3) is necessary but not sufficient.
+
+## Sandboxing Technology Landscape
+
+Several sandboxing technologies are relevant to LLM agent tool execution. For detailed descriptions of Docker, gVisor, Firecracker, and WebAssembly sandboxes, see [Appendix D](#appendix-d-sandbox-technology-details). This section focuses on LiteBox's positioning and unique properties.
+
+### LiteBox Scenarios
+
+LiteBox supports multiple deployment scenarios with varying isolation properties:
+
+| Scenario | Platform | Isolation | TCB | Attack Surface |
+|---|---|---|---|---|
+| **Linux-on-Linux** | `litebox_platform_linux_userland` | Syscall rewriting + seccomp | LiteBox + Linux kernel | Reduced syscall set, memory-safe |
+| **Linux-on-Windows** | `litebox_platform_windows_userland` | No Linux kernel at all | LiteBox + Windows kernel | No Linux kernel bugs exploitable |
+| **SEV-SNP** | `litebox_runner_snp` | Hardware memory encryption | LiteBox + AMD CPU | Hypervisor cannot read guest memory |
+| **Hyper-V VTL1 (LVBS)** | `litebox_platform_lvbs` | Hypervisor-enforced VTL isolation | LiteBox + Hyper-V | Even compromised VTL0 OS can't access VTL1 |
+| **OP-TEE on Linux** | `litebox_runner_optee_on_linux_userland` | Library OS mediation | LiteBox + Linux kernel | Dev/test tool for TEE TAs |
+
+### Syscall Interception Backends: Rewriter vs Seccomp
+
+LiteBox on Linux supports two interception backends with fundamentally different tradeoffs:
+
+**Rewriter backend** (`--interception-backend rewriter`, default):
+- Scans all `.text` sections of the ELF binary for `syscall` instructions (opcode `0F 05`)
+- Replaces each with a `JMP` to a trampoline that routes through LiteBox's `syscall_callback`
+- **Non-selective**: rewrites ALL `syscall` instructions in the binary, regardless of syscall number
+- **Coverage gap**: shared libraries that aren't rewritten (dynamic linker, libc) make real kernel syscalls directly. `litebox_rtld_audit.so` hooks the dynamic linker to cover dynamically loaded libraries, but the linker itself still makes some direct kernel calls during startup.
+- **Better compatibility**: unrewritten code (library init) runs natively on the kernel, so programs "just work" even if the shim doesn't implement every syscall
+- **Weaker isolation**: the coverage gap means some guest code reaches the kernel unmediated
+
+**Seccomp backend** (`--interception-backend seccomp`):
+- Installs a BPF filter via `seccomp(SECCOMP_SET_MODE_FILTER)` that traps all syscalls not in an explicit allow-list
+- Trapped syscalls deliver `SIGSYS`, and the signal handler redirects execution to `syscall_callback`
+- **Complete coverage**: every syscall from the process is either allowed (for LiteBox's own internal use via "backdoor" magic arguments) or trapped and routed through LiteBox
+- **Stronger isolation**: no guest code can reach the kernel without LiteBox mediating it
+- **Worse compatibility**: the shim must handle every syscall the guest makes, including runtime initialization (musl/glibc TLS setup, memory allocation, etc.). If the shim returns `ENOSYS` for an essential syscall, the guest hangs or crashes.
+- **Known limitation**: busybox with seccomp currently hangs because musl's init sequence makes syscalls that the shim doesn't fully handle. The CI tests use seccomp with specific test binaries that make a limited syscall set.
+
+| Property | Rewriter | Seccomp |
+|---|---|---|
+| **What's intercepted** | `syscall` instructions in rewritten ELF code | All syscalls from the process |
+| **Unhandled syscalls** | Unrewritten library code falls through to kernel | Returns `ENOSYS` (may break the guest) |
+| **Coverage** | Partial (rewritten binaries only) | Complete (all process syscalls) |
+| **Compatibility** | Better (runtime init runs natively) | Worse (shim must handle everything) |
+| **Isolation strength** | Weaker (coverage gap for libraries) | Stronger (no gap) |
+| **Performance** | ~ns per syscall (direct JMP) | ~μs per syscall (signal handler round-trip) |
+| **fork() support** | No (shim doesn't implement it) | Potential via kernel fallback, but currently shim returns ENOSYS |
+
+For LLM tool sandboxing, the **rewriter** backend is the practical choice today — it works with busybox and provides audit + policy enforcement for all rewritten syscalls. The **seccomp** backend is the path to stronger isolation once the shim's syscall coverage is expanded.
+
+### Comparison Matrix
+
+| Technology | TCB Size | Isolation Type | Syscall Surface | LLM Tool Suitability |
+|---|---|---|---|---|
+| **Docker** | Full kernel | Namespaces + seccomp | ~300 syscalls | Weak; easy to set up |
+| **gVisor** | ~200K LoC Go | Userspace kernel | ~70 to host | Good; production-proven |
+| **Firecracker** | ~50K LoC Rust | Full VM (KVM) | ~25 from VMM | Strong; broad compatibility |
+| **LiteBox on Linux** | Small Rust codebase | Rewriting + seccomp | Implemented subset only | Strong; smallest TCB |
+| **LiteBox on Windows** | LiteBox + Windows kernel | Cross-OS library OS | No Linux kernel | Strong; novel attack surface reduction |
+| **LiteBox + SNP** | LiteBox + AMD hardware | Hardware encryption | Minimal | Strongest confidential computing |
+| **Wasm** | Wasm runtime | Language-level | Capability-based (WASI) | Very strong; can't run Linux binaries |
 
 ## Implementation
 
