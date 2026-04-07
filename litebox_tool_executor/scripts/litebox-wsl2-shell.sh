@@ -9,7 +9,7 @@ POLICY="/mnt/c/src/litebox/litebox_tool_executor/policies/demo-policy.json"
 AUDIT_LOG="/mnt/c/src/litebox/target/litebox-audit.jsonl"
 
 echo "LiteBox Sandbox Shell (WSL2 — each command runs in a fresh sandbox)"
-echo "Type 'exit' to quit."
+echo "Type 'exit' to quit. Pipes (|) and subshells (\$()) will hang (no fork support)."
 echo "Audit log: C:\\src\\litebox\\target\\litebox-audit.jsonl"
 echo ""
 
