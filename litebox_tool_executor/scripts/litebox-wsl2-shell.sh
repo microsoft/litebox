@@ -16,7 +16,8 @@ if [ ! -f "$ROOTFS" ]; then
 fi
 
 echo "LiteBox Sandbox Shell (WSL2 — bash with fork+pipe support)"
-echo "Type 'exit' to quit. Pipes (|) and subshells work."
+echo "Type 'exit' to quit. Simple pipes work (e.g. echo x | cat)."
+echo "Multi-program pipes (ls | sort) may hang (cascaded fork limitation)."
 echo "Audit log: C:\\src\\litebox\\target\\litebox-audit.jsonl"
 echo ""
 
@@ -25,7 +26,7 @@ while true; do
     read -r line || break
     [ "$line" = "exit" ] && break
     [ -z "$line" ] && continue
-    "$RUNNER" --unstable \
+    timeout 10 "$RUNNER" --unstable \
         --initial-files "$ROOTFS" \
         --program-from-tar \
         --policy "$POLICY" \
@@ -34,5 +35,9 @@ while true; do
         --env "PATH=/usr/bin:/bin" \
         -- /usr/bin/bash --norc --noprofile -c "$line" 2>>"$AUDIT_LOG"
     rc=$?
-    [ $rc -ne 0 ] && echo "[exit code: $rc]"
+    if [ $rc -eq 124 ]; then
+        echo "[timed out — multi-fork pipe commands may hang]"
+    elif [ $rc -ne 0 ]; then
+        echo "[exit code: $rc]"
+    fi
 done
