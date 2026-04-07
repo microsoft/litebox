@@ -6,9 +6,11 @@
 RUNNER="/mnt/c/src/litebox/target/debug/litebox_runner_linux_userland"
 ROOTFS="/mnt/c/src/litebox/target/busybox-minimal.tar"
 POLICY="/mnt/c/src/litebox/litebox_tool_executor/policies/demo-policy.json"
+AUDIT_LOG="/mnt/c/src/litebox/target/litebox-audit.jsonl"
 
 echo "LiteBox Sandbox Shell (WSL2 — each command runs in a fresh sandbox)"
 echo "Type 'exit' to quit."
+echo "Audit log: C:\\src\\litebox\\target\\litebox-audit.jsonl"
 echo ""
 
 while true; do
@@ -20,7 +22,7 @@ while true; do
         --initial-files "$ROOTFS" \
         --program-from-tar \
         --policy "$POLICY" \
-        -- /bin/busybox sh -c "$line" 2>/dev/null
+        -- /bin/busybox sh -c "$line" 2>>"$AUDIT_LOG"
     rc=$?
     [ $rc -ne 0 ] && echo "[exit code: $rc]"
 done
