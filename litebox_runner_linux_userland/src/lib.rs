@@ -2571,6 +2571,10 @@ mod tests {
             mux_fd: None,
             mux_stream: Vec::new(),
             local_pipe: Vec::new(),
+            #[cfg(feature = "policy")]
+            policy: None,
+            #[cfg(feature = "audit_log")]
+            audit_log: None,
         }
     }
 
