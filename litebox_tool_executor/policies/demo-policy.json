@@ -1,8 +1,8 @@
 {
     "filesystem": {
-        "allow_read": ["/", "/bin", "/bin/**", "/usr", "/usr/**", "/tmp", "/tmp/**", "/workspace", "/workspace/**", "/dev/**"],
+        "allow_read": ["/", "/bin", "/bin/**", "/usr", "/usr/**", "/lib", "/lib/**", "/lib64", "/lib64/**", "/tmp", "/tmp/**", "/workspace", "/workspace/**", "/etc", "/etc/**", "/dev/**"],
         "allow_write": ["/tmp/**", "/workspace/**"],
-        "deny": ["/lib/**", "**/passwd", "**/shadow", "**/.ssh/**"]
+        "deny": ["**/passwd", "**/shadow", "**/.ssh/**"]
     },
     "network": {
         "deny_all": true,
