@@ -1,8 +1,7 @@
 #!/bin/bash
 # WSL2 shell wrapper for litebox_runner_linux_userland.
-# Runs a persistent bash shell inside the LiteBox sandbox with
-# fork+pipe support. Uses bash (PIE binary) instead of busybox
-# (static ET_EXEC) because the delayed fork mechanism requires PIE.
+# Each command runs in a fresh LiteBox sandbox with bash.
+# Fork+pipe work because bash is a PIE binary (unlike busybox).
 
 RUNNER="/mnt/c/src/litebox/target/debug/litebox_runner_linux_userland"
 ROOTFS="/mnt/c/src/litebox/target/bash-sandbox.tar"
@@ -17,16 +16,23 @@ if [ ! -f "$ROOTFS" ]; then
 fi
 
 echo "LiteBox Sandbox Shell (WSL2 — bash with fork+pipe support)"
-echo "Pipes (|), subshells (\$()), cd, and env vars all work."
+echo "Type 'exit' to quit. Pipes (|) and subshells work."
 echo "Audit log: C:\\src\\litebox\\target\\litebox-audit.jsonl"
 echo ""
 
-exec "$RUNNER" --unstable \
-    --initial-files "$ROOTFS" \
-    --program-from-tar \
-    --policy "$POLICY" \
-    --env "LD_LIBRARY_PATH=/lib64:/lib/x86_64-linux-gnu:/lib" \
-    --env "HOME=/" \
-    --env "PATH=/usr/bin:/bin" \
-    --env "TERM=xterm" \
-    -- /usr/bin/bash --norc --noprofile 2>>"$AUDIT_LOG"
+while true; do
+    printf "sandbox\$ "
+    read -r line || break
+    [ "$line" = "exit" ] && break
+    [ -z "$line" ] && continue
+    "$RUNNER" --unstable \
+        --initial-files "$ROOTFS" \
+        --program-from-tar \
+        --policy "$POLICY" \
+        --env "LD_LIBRARY_PATH=/lib64:/lib/x86_64-linux-gnu:/lib" \
+        --env "HOME=/" \
+        --env "PATH=/usr/bin:/bin" \
+        -- /usr/bin/bash --norc --noprofile -c "$line" 2>>"$AUDIT_LOG"
+    rc=$?
+    [ $rc -ne 0 ] && echo "[exit code: $rc]"
+done
