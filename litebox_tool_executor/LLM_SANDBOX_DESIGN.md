@@ -109,18 +109,22 @@ This split means a command-level sandbox (like LiteBox's current REPL approach) 
 **CLI agents** (Claude Code, Codex CLI, aider, SWE-agent, OpenHands, etc.) have no such split. They interact with the system entirely through **direct syscalls**: `open()`/`read()`/`write()` for files, `fork()`+`exec()` for commands, `connect()`/`send()` for network. There is no protocol to intercept — syscalls are the only interception point.
 
 This makes CLI agents both harder and easier to sandbox:
-- **Harder**: they need `fork()` and full POSIX compatibility, which LiteBox doesn't yet support
+- **Harder**: they need `fork()` and full POSIX compatibility
 - **Easier**: if you *can* run the entire agent inside a sandbox, *every* operation is mediated — files, network, subprocesses, everything. No API bypass path exists. This is architecturally stronger than the VS Code model.
+
+With the `wdcui/agent-sandbox-fork` branch, LiteBox now supports `fork()` on the Linux userland platform via delayed fork + worker host processes (see [Implementation](#implementation)), making CLI agent sandboxing feasible.
 
 The practical implications:
 
 | | Command-level sandbox (current) | Full agent sandbox (future) |
 |---|---|---|
 | **VS Code agents** | Terminal commands sandboxed; file APIs bypass | Requires VS Code Remote into sandbox or MCP |
-| **CLI agents** | Cannot run (need `fork()`) | Every syscall sandboxed — strongest model |
+| **CLI agents** | Cannot run (need `fork()` + richer rootfs) | Every syscall sandboxed — strongest model |
 | **Audit completeness** | Terminal commands only | Every operation |
 
 ### Why Delegating fork() to the Kernel Breaks the Sandbox
+
+> **Note**: LiteBox now implements fork in the shim itself via delayed fork + worker host snapshot/restore (see [Phase 5](#phase-5-wsl2-investigation)), avoiding the kernel delegation problems described below. This section explains *why* the simpler kernel-passthrough approach was rejected.
 
 The simplest path to `fork()` in a library OS sandbox would be to let the `clone` syscall (without `CLONE_VM`) fall through to the real Linux kernel instead of handling it in the shim. This is tempting because the kernel already implements COW address space duplication correctly. However, it undermines the sandbox in several ways:
 
@@ -238,7 +242,7 @@ LiteBox on Linux supports two interception backends with fundamentally different
 | **Compatibility** | Better (runtime init runs natively) | Worse (shim must handle everything) |
 | **Isolation strength** | Weaker (coverage gap for libraries) | Stronger (no gap) |
 | **Performance** | ~ns per syscall (direct JMP) | ~μs per syscall (signal handler round-trip) |
-| **fork() support** | No (shim doesn't implement it) | Potential via kernel fallback, but currently shim returns ENOSYS |
+| **fork() support** | No (shim doesn't implement it) | Delayed fork + worker host (Linux), potential via kernel fallback |
 
 For LLM tool sandboxing, the **rewriter** backend is the practical choice today — it works with busybox and provides audit + policy enforcement for all rewritten syscalls. The **seccomp** backend is the path to stronger isolation once the shim's syscall coverage is expanded.
 
@@ -286,7 +290,7 @@ VS Code (Copilot Agent Mode)
 
 **Key design decision**: Each command spawns a fresh child process (and thus a fresh LiteBox instance). This is because:
 1. LiteBox's platform is a singleton — can only be initialized once per process
-2. `fork()` is not implemented on the Windows platform
+2. `fork()` is now supported on Linux but not on Windows
 3. A fresh sandbox per command provides stronger isolation (no state leaks between commands)
 
 The tradeoff is that commands don't share state — `cd /tmp` followed by `ls` won't list `/tmp`.
@@ -365,18 +369,28 @@ This was initially suspected to be a WSL2 kernel bug (gs_base not preserved duri
 - **Two-phase initialization**: register the SIGSYS handler early (Phase 1), defer the BPF filter installation to `init_handler` inside `run_thread_arch` after `wrgsbase` (Phase 2), using a `PENDING_SECCOMP_ACTIVATION` atomic flag
 - **Defense-in-depth**: the SIGSYS handler checks `rdgsbase`; if `gs_base == 0`, it aborts with a diagnostic message instead of crashing silently
 
-**Why fork() still doesn't work**:
+**Why fork() didn't work (before the agent-sandbox-fork branch)**:
 
-After fixing the segfault, the seccomp backend no longer crashes but **hangs** with busybox. The reason: seccomp traps ALL syscalls (including musl/busybox runtime initialization), and the shim returns `ENOSYS` for syscalls it doesn't implement. Some of these are essential for the runtime to function. The shim's syscall coverage was designed for the rewriter backend's narrower scope and doesn't cover the full syscall surface that seccomp exposes.
+After fixing the segfault, the seccomp backend no longer crashed but **hung** with busybox. The reason: seccomp traps ALL syscalls (including musl/busybox runtime initialization), and the shim returned `ENOSYS` for syscalls it didn't implement. The rewriter backend worked on WSL2 but rejected `clone()` without `CLONE_VM`.
 
-The rewriter backend works on WSL2 but has the same `fork()` limitation as Windows — the shim rejects `clone()` without `CLONE_VM` because it hasn't implemented process-level forking (address space duplication with COW). This is partly an implementation limitation and partly a security concern — depending on the interception backend. See [Why Delegating fork() to the Kernel Breaks the Sandbox](#why-delegating-fork-to-the-kernel-breaks-the-sandbox) in the Threat Model section for the full analysis.
+**Fork now works (agent-sandbox-fork branch)**:
 
-**The three paths to fork() remain**:
-1. Expand the seccomp allow-list to pass `clone`/`fork` through to the kernel, plus fix the shim hang for other runtime syscalls
-2. Implement `clone` without `CLONE_VM` in the shim itself (works with both backends, on all platforms)
-3. A hybrid: let `clone`/`fork` pass to the kernel while trapping everything else — requires careful thought about what the child process inherits (seccomp filters, signal handlers, TLS state)
+The `wdcui/agent-sandbox-fork` branch implements fork in the shim via **delayed fork + worker host + snapshot/restore** — path 2 from the original analysis:
 
-**Net result**: WSL2 provides Hyper-V hardware isolation and the plumbing is ready for when fork support lands, but the near-term demo is equivalent to the Windows executor.
+1. **Fork detection**: `do_clone` detects fork-like calls (no `CLONE_VM` or `CLONE_VFORK`). `CLONE_VM` is no longer required.
+2. **Delayed fork**: On shared-address-space platforms (userland, x86_64), the child initially runs in the parent's address space with vfork semantics. Pre-exec syscalls are allowed immediately.
+3. **Snapshot + migration**: The first non-pre-exec syscall triggers full state serialization — process identity, FD table, signal handlers, memory mappings, and execution context are captured into a `ForkSnapshot` and serialized to a memfd.
+4. **Worker host**: The runner spawns a new OS process (`litebox_runner_linux_userland --fork-restore`) that inherits the memfd, deserializes the snapshot, restores the child's full state, and resumes execution in its own address space with its own shim instance.
+5. **I/O bridging**: Host pipes and a stream multiplexer connect the child's stdio and inter-process pipes back to the parent. The `multihost.rs` control plane coordinates process ownership and signal forwarding between hosts.
+
+**Security properties**: Every syscall in both parent and child processes continues to go through the shim — no kernel passthrough, no coverage gap. The child gets an independent copy of all shim state (FD table, policy, audit hooks), not a broken shared reference. This is the architecturally clean solution described in the [fork analysis](#why-delegating-fork-to-the-kernel-breaks-the-sandbox).
+
+**Current fork limitations**:
+- Linux userland platform only (x86_64); Windows does not implement the required `spawn_worker_host_*` APIs
+- `true_fork` (concurrent fork without shared address space) returns ENOSYS — only delayed fork is supported
+- The fork work was done on the rewriter backend; seccomp backend interaction is untested
+
+**Net result**: Shell piping (`echo hello | cat`), subshells (`$(command)`), and multi-process tools now work on WSL2 with the rewriter backend.
 
 ## Current Status & Limitations
 
@@ -397,7 +411,7 @@ LLM coding agents fall into two categories with different sandboxing surfaces:
 | Run `python test.py` | Terminal | **Yes** |
 | Run `curl https://...` | Terminal | **Yes** |
 
-**CLI agents** (Claude Code, Codex CLI, aider, etc.) make direct syscalls for all operations. The current sandbox cannot run them — they need `fork()` and full POSIX compatibility. If LiteBox gained `fork()` support, running the entire CLI agent inside LiteBox would be a stronger model (every syscall sandboxed):
+**CLI agents** (Claude Code, Codex CLI, aider, etc.) make direct syscalls for all operations. With fork support now available on the Linux platform, running the entire CLI agent inside LiteBox is feasible (given a sufficiently rich rootfs). Every syscall would be sandboxed:
 
 | | VS Code Agent + Terminal Sandbox | CLI Agent inside LiteBox (future) |
 |---|---|---|
@@ -406,16 +420,15 @@ LLM coding agents fall into two categories with different sandboxing surfaces:
 | Command execution | **Sandboxed** (terminal) | **Sandboxed** (`fork`+`exec` go through shim) |
 | Network | **Sandboxed** (terminal `curl` etc.) | **Sandboxed** (all `connect`/`send` go through shim) |
 | Audit trail | Terminal commands only | Complete — every syscall |
-| fork() required? | No (REPL workaround) | **Yes** |
+| fork() required? | No (REPL workaround) | **Yes** (now supported on Linux) |
 
 ### Technical Limitations
 
-- **No `fork()`**: `clone()` only supports threads (`CLONE_VM | CLONE_THREAD`), not new processes. The REPL wrapper works around this by spawning a fresh LiteBox per command, but this means no state persistence between commands, no piping (`|`), no subshells. See [Why Delegating fork() to the Kernel Breaks the Sandbox](#why-delegating-fork-to-the-kernel-breaks-the-sandbox) for why this isn't a simple fix.
+- **Fork on Linux only**: `fork()` / `clone()` without `CLONE_VM` is supported on the Linux userland platform (x86_64) via delayed fork + worker host. Windows does not support fork. The REPL wrapper spawns a fresh sandbox per command as a workaround.
 - **Limited rootfs**: Only busybox (no Python, no git, no compilers). The packager can create richer rootfs images but the ~512MB allocator limit constrains size.
-- **No dynamic terminal size**: TIOCGWINSZ returns hardcoded 80x24 instead of querying the real terminal dimensions.
-- **Single-threaded guest**: While `clone` with `CLONE_THREAD` works, many real-world programs need multi-process support.
+- **No dynamic terminal size**: TIOCGWINSZ returns hardcoded values instead of querying the real terminal dimensions.
 - **No `/dev/tty`**: busybox shell warns "can't access tty; job control turned off".
-- **Each REPL command is a fresh process**: The `--interactive` mode spawns a child `litebox_tool_executor` process per command. This means environment variables, working directory changes (`cd`), and file modifications don't persist between commands.
+- **Each REPL command is a fresh process**: The `--interactive` mode and WSL2 wrapper spawn a fresh sandbox per command. Environment variables, working directory changes (`cd`), and file modifications don't persist between commands. With fork support, a persistent shell session is now possible but not yet integrated.
 
 ## Future Work
 
@@ -423,9 +436,9 @@ LLM coding agents fall into two categories with different sandboxing surfaces:
 |---|---|---|
 | **VS Code Remote integration** | Run VS Code Server inside LiteBox so all agent operations (file reads, writes, searches) are sandboxed, not just terminal commands. This is the path to complete agent sandboxing. | High |
 | **MCP tool server** | Expose the executor as an MCP-compatible tool server where every operation (`read_file`, `write_file`, `run_command`) is a sandboxed tool call. Works for MCP-enabled agents without requiring VS Code Remote. | High |
-| **`fork()` / `clone` without `CLONE_VM`** | Enable multi-process guest programs — the single biggest compatibility gap. Three paths: (1) seccomp allow-list passthrough to kernel (requires fixing shim hang for other syscalls), (2) implement process forking in the shim itself (works on all platforms), (3) hybrid kernel passthrough for clone only. See Phase 5. | High |
+| **Persistent shell session** | With fork now supported, replace the per-command REPL with a persistent busybox shell that supports piping, subshells, `cd`, and environment variables across commands. | High |
 | **Richer rootfs** | Python, git, common dev tools — requires solving the allocator size limit | High |
-| **Seccomp shim hang** | The seccomp backend hangs with busybox because the shim returns ENOSYS for runtime init syscalls. Expanding syscall coverage or adding a kernel-passthrough mode for init-only syscalls would unblock seccomp+busybox and the fork path. | High |
+| **Windows fork support** | Implement `spawn_worker_host_*` APIs on `WindowsUserland` to enable fork on the Windows platform. Currently fork only works on Linux. | High |
 | **Output sanitization** | Filter sensitive data (secrets, credentials) from sandbox output before returning to LLM | Medium |
 | **Timeout enforcement** | Kill guest after configurable wall-clock time | Medium |
 | **File injection/extraction** | Return modified files from sandbox, diff against originals | Medium |
