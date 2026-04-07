@@ -20,7 +20,7 @@ while true; do
         --initial-files "$ROOTFS" \
         --program-from-tar \
         --policy "$POLICY" \
-        -- /usr/bin/busybox sh -c "$line" 2>/dev/null
+        -- /bin/busybox sh -c "$line" 2>/dev/null
     rc=$?
     [ $rc -ne 0 ] && echo "[exit code: $rc]"
 done
