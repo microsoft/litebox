@@ -7,7 +7,7 @@
         },
         "LiteBox Sandbox (WSL2)": {
             "path": "wsl.exe",
-            "args": ["-d", "Ubuntu", "--", "/mnt/c/src/litebox/target/debug/litebox_runner_linux_userland", "--unstable", "--initial-files", "/mnt/c/src/litebox/target/busybox-minimal.tar", "--program-from-tar", "--policy", "/mnt/c/src/litebox/litebox_tool_executor/policies/demo-policy.json", "--", "/bin/busybox", "sh"],
+            "args": ["-d", "Ubuntu", "--", "/mnt/c/src/litebox/target/debug/litebox_runner_linux_userland", "--unstable", "--initial-files", "/mnt/c/src/litebox/target/busybox-minimal.tar", "--program-from-tar", "--policy", "/mnt/c/src/litebox/litebox_tool_executor/policies/demo-policy.json", "--", "/usr/bin/busybox", "sh"],
             "icon": "shield"
         },
         "PowerShell": {
@@ -17,5 +17,5 @@
     },
     // Make the Windows sandbox the default for Copilot agent mode.
     // Switch to "LiteBox Sandbox (WSL2)" for fork/piping support (when seccomp is fixed).
-    "terminal.integrated.defaultProfile.windows": "LiteBox Sandbox (Windows)"
+    "terminal.integrated.defaultProfile.windows": "LiteBox Sandbox (WSL2)"
 }
