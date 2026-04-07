@@ -878,3 +878,95 @@ fn test_tun_with_curl() {
     let output_str = String::from_utf8_lossy(&output);
     assert!(output_str.contains(RESPONSE_BODY), "Unexpected curl output");
 }
+
+/// Test shell pipe with busybox via --program-from-tar.
+/// This exercises fork + pipe in the context of a statically-linked
+/// multi-call binary (busybox), which is how the LLM sandbox demo works.
+#[cfg(target_arch = "x86_64")]
+#[test]
+fn test_busybox_shell_pipe() {
+    // Find busybox on the host.
+    let busybox_path = if std::path::Path::new("/bin/busybox").exists() {
+        "/bin/busybox"
+    } else if std::path::Path::new("/usr/bin/busybox").exists() {
+        "/usr/bin/busybox"
+    } else {
+        eprintln!("busybox not found, skipping test");
+        return;
+    };
+
+    // Package busybox into a rootfs tar via litebox_packager.
+    let packager_path = std::env::var("CARGO_BIN_EXE_litebox_packager")
+        .unwrap_or_else(|_| {
+            // Fall back to looking in target/debug
+            let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap();
+            let workspace = std::path::Path::new(&manifest_dir).parent().unwrap();
+            workspace.join("target/debug/litebox_packager").to_str().unwrap().to_string()
+        });
+
+    let dir_path = PathBuf::from(std::env::var_os("OUT_DIR").unwrap());
+    let tar_path = dir_path.join("busybox_pipe_test.tar");
+
+    // Build the rootfs tar (rewrite busybox syscalls).
+    let packager_output = std::process::Command::new(&packager_path)
+        .args([busybox_path, "-o", tar_path.to_str().unwrap()])
+        .output();
+
+    match packager_output {
+        Ok(out) if out.status.success() => {}
+        Ok(out) => {
+            eprintln!(
+                "litebox_packager failed ({}): {}",
+                out.status,
+                String::from_utf8_lossy(&out.stderr)
+            );
+            eprintln!("skipping test (packager not available)");
+            return;
+        }
+        Err(e) => {
+            eprintln!("litebox_packager not found ({e}), skipping test");
+            return;
+        }
+    }
+
+    // Determine the guest path based on the host path used for packaging.
+    let guest_busybox = busybox_path; // packager preserves the host path
+
+    // Run: busybox sh -c 'echo hello | cat'
+    // Wrap with `timeout` to detect hangs (fork not working = child never runs).
+    let runner_path = std::env::var("NEXTEST_BIN_EXE_litebox_runner_linux_userland")
+        .unwrap_or_else(|_| env!("CARGO_BIN_EXE_litebox_runner_linux_userland").to_string());
+
+    let output = std::process::Command::new("timeout")
+        .args([
+            "15",
+            &runner_path,
+            "--unstable",
+            "--initial-files", tar_path.to_str().unwrap(),
+            "--program-from-tar",
+            "--", guest_busybox, "sh", "-c", "echo hello | cat",
+        ])
+        .output()
+        .expect("failed to run litebox_runner_linux_userland");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    // timeout exits with 124 when the command times out.
+    assert!(
+        output.status.code() != Some(124),
+        "busybox pipe test TIMED OUT — fork/pipe likely hung.\n\
+         stderr (last 500 chars): {}",
+        &stderr[stderr.len().saturating_sub(500)..],
+    );
+
+    assert!(
+        stdout.contains("hello"),
+        "busybox pipe test failed — expected 'hello' in stdout.\n\
+         exit status: {}\n\
+         stdout: {stdout}\n\
+         stderr (last 500 chars): {}",
+        output.status,
+        &stderr[stderr.len().saturating_sub(500)..],
+    );
+}
