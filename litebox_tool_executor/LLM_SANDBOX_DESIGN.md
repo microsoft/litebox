@@ -425,10 +425,18 @@ LLM coding agents fall into two categories with different sandboxing surfaces:
 ### Technical Limitations
 
 - **Fork on Linux only**: `fork()` / `clone()` without `CLONE_VM` is supported on the Linux userland platform (x86_64) via delayed fork + worker host. Windows does not support fork. The REPL wrapper spawns a fresh sandbox per command as a workaround.
-- **Limited rootfs**: Only busybox (no Python, no git, no compilers). The packager can create richer rootfs images but the ~512MB allocator limit constrains size.
+
+- **Static (ET_EXEC) binaries cannot fork**: The delayed fork mechanism only works with PIE (position-independent) binaries. Static binaries like busybox are ET_EXEC with hardcoded addresses in VA slot 0, which conflicts with the VA partitioning that the delayed fork path uses to create worker host processes. When busybox's `sh` calls `clone()` for a pipe, the shim returns a fake child PID but never spawns a worker, causing the parent to wait forever. The demo was switched from busybox to bash (which is PIE) to work around this.
+
+- **Multi-program pipes deadlock**: The delayed fork uses vfork semantics — the child shares the parent's address space until it execs or exits. Only one outstanding vfork child is allowed at a time. When bash runs `ls | sort`, it needs to fork twice (one child per pipeline stage) before exec'ing either. The second fork deadlocks because the first child is still parked in the parent's address space waiting for exec. Single-fork pipes work (`echo hello | cat`) because `echo` is a bash builtin (no fork needed), so only one fork occurs (for `cat`). This is a fundamental limitation of the delayed fork design on shared-address-space platforms. Fixes would require concurrent fork support (the `true_fork` path, currently ENOSYS), eager child migration (migrate on fork instead of on first non-pre-exec syscall), or sequential fork detection.
+
+- **Persistent interactive shell not working**: Running bash with `-i` (interactive mode) inside the sandbox doesn't work because the shim's stdin bridging doesn't properly deliver line-by-line input from the VS Code terminal PTY to the guest process. Bash reads the first line but subsequent reads fail or return nothing. The workaround is the per-command REPL: each line typed by the user spawns a fresh `bash -c "<command>"` invocation. This means `cd`, environment variables, and file modifications don't persist between commands.
+
+- **Limited rootfs**: The bash-based rootfs includes ~28 common utilities (cat, ls, grep, sort, etc.) + shared libraries, totaling ~26MB. No Python, git, or compilers yet. The `prepare-bash-rootfs.sh` script stages these from the host system.
+
 - **No dynamic terminal size**: TIOCGWINSZ returns hardcoded values instead of querying the real terminal dimensions.
-- **No `/dev/tty`**: busybox shell warns "can't access tty; job control turned off".
-- **Each REPL command is a fresh process**: The `--interactive` mode and WSL2 wrapper spawn a fresh sandbox per command. Environment variables, working directory changes (`cd`), and file modifications don't persist between commands. With fork support, a persistent shell session is now possible but not yet integrated.
+
+- **No `/dev/tty`**: bash warns "cannot set terminal process group" and "no job control" when run interactively.
 
 ## Future Work
 
@@ -436,8 +444,10 @@ LLM coding agents fall into two categories with different sandboxing surfaces:
 |---|---|---|
 | **VS Code Remote integration** | Run VS Code Server inside LiteBox so all agent operations (file reads, writes, searches) are sandboxed, not just terminal commands. This is the path to complete agent sandboxing. | High |
 | **MCP tool server** | Expose the executor as an MCP-compatible tool server where every operation (`read_file`, `write_file`, `run_command`) is a sandboxed tool call. Works for MCP-enabled agents without requiring VS Code Remote. | High |
-| **Persistent shell session** | With fork now supported, replace the per-command REPL with a persistent busybox shell that supports piping, subshells, `cd`, and environment variables across commands. | High |
-| **Richer rootfs** | Python, git, common dev tools — requires solving the allocator size limit | High |
+| **Concurrent fork (multi-program pipes)** | The delayed fork's vfork semantics only allow one outstanding child. Multi-program pipes (`ls \| sort`) deadlock because bash forks twice before exec'ing either. Fix via concurrent fork (`true_fork` path, currently ENOSYS), eager child migration, or sequential fork detection. | High |
+| **Persistent shell session** | Interactive bash (`-i`) doesn't work because the shim's stdin bridging doesn't deliver line-by-line input. Fix the stdin bridge so a persistent shell can replace the per-command REPL, enabling `cd`, env vars, and state across commands. | High |
+| **ET_EXEC fork support** | Static (non-PIE) binaries like busybox hang on fork because the delayed fork+worker mechanism requires PIE VA partitioning. Fix would enable busybox, statically-compiled tools, and other ET_EXEC binaries to fork. | Medium |
+| **Richer rootfs** | Python, git, common dev tools. The `prepare-bash-rootfs.sh` script provides the pattern; Python would follow the same stage+rewrite approach. | High |
 | **Windows fork support** | Implement `spawn_worker_host_*` APIs on `WindowsUserland` to enable fork on the Windows platform. Currently fork only works on Linux. | High |
 | **Output sanitization** | Filter sensitive data (secrets, credentials) from sandbox output before returning to LLM | Medium |
 | **Timeout enforcement** | Kill guest after configurable wall-clock time | Medium |
