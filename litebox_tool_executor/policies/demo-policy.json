@@ -1,6 +1,6 @@
 {
     "filesystem": {
-        "allow_read": ["/", ".", "/bin", "/bin/**", "/usr", "/usr/**", "/tmp", "/tmp/**", "/workspace", "/workspace/**", "/dev/**"],
+        "allow_read": ["/", "/bin", "/bin/**", "/usr", "/usr/**", "/tmp", "/tmp/**", "/workspace", "/workspace/**", "/dev/**"],
         "allow_write": ["/tmp/**", "/workspace/**"],
         "deny": ["/lib/**", "**/passwd", "**/shadow", "**/.ssh/**"]
     },

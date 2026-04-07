@@ -67,6 +67,8 @@ pub enum PolicyDecision {
 impl SandboxPolicy {
     /// Check whether opening a file at `path` with the given `write` flag is allowed.
     pub fn check_file_access(&self, path: &str, write: bool) -> PolicyDecision {
+        let normalized = normalize_path(path);
+        let path = normalized.as_str();
         // Deny list always wins.
         if self.filesystem.deny.iter().any(|p| glob_match(p, path)) {
             return PolicyDecision::Deny;
@@ -112,6 +114,8 @@ impl SandboxPolicy {
 
     /// Check whether executing a program at `path` is allowed.
     pub fn check_exec(&self, path: &str) -> PolicyDecision {
+        let normalized = normalize_path(path);
+        let path = normalized.as_str();
         if self.process.allow_exec.is_empty() {
             return PolicyDecision::Allow;
         }
@@ -120,6 +124,50 @@ impl SandboxPolicy {
         } else {
             PolicyDecision::Deny
         }
+    }
+}
+
+/// Normalize a filesystem path for policy matching.
+///
+/// Resolves `.` and `..` components and ensures the path is absolute.
+/// Relative paths (including bare `.`) are treated as relative to `/`
+/// (the guest CWD is always `/`).
+fn normalize_path(path: &str) -> String {
+    let path = path.trim();
+    if path.is_empty() || path == "." {
+        return String::from("/");
+    }
+
+    // Treat relative paths as relative to root.
+    let absolute = if path.starts_with('/') {
+        String::from(path)
+    } else {
+        let mut s = String::from("/");
+        s.push_str(path);
+        s
+    };
+
+    // Resolve . and .. components.
+    let mut parts: Vec<&str> = Vec::new();
+    for component in absolute.split('/') {
+        match component {
+            "" | "." => {}
+            ".." => {
+                parts.pop();
+            }
+            other => parts.push(other),
+        }
+    }
+
+    if parts.is_empty() {
+        String::from("/")
+    } else {
+        let mut result = String::new();
+        for part in &parts {
+            result.push('/');
+            result.push_str(part);
+        }
+        result
     }
 }
 
@@ -297,5 +345,43 @@ mod tests {
         );
         assert_eq!(policy.check_connect("anywhere:80"), PolicyDecision::Allow);
         assert_eq!(policy.check_exec("/anything"), PolicyDecision::Allow);
+    }
+
+    #[test]
+    fn normalize_dot_to_root() {
+        assert_eq!(normalize_path("."), "/");
+        assert_eq!(normalize_path(""), "/");
+    }
+
+    #[test]
+    fn normalize_relative_path() {
+        assert_eq!(normalize_path("bin/busybox"), "/bin/busybox");
+        assert_eq!(normalize_path("./bin/busybox"), "/bin/busybox");
+    }
+
+    #[test]
+    fn normalize_dotdot() {
+        assert_eq!(normalize_path("/usr/bin/../lib"), "/usr/lib");
+        assert_eq!(normalize_path("/a/b/c/../../d"), "/a/d");
+        assert_eq!(normalize_path("/.."), "/");
+    }
+
+    #[test]
+    fn normalize_already_absolute() {
+        assert_eq!(normalize_path("/bin/busybox"), "/bin/busybox");
+        assert_eq!(normalize_path("/"), "/");
+    }
+
+    #[test]
+    fn policy_dot_resolves_to_root() {
+        let policy = SandboxPolicy {
+            filesystem: FsPolicy {
+                allow_read: alloc::vec!["/".into()],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        // "." should resolve to "/" and match the allow_read entry.
+        assert_eq!(policy.check_file_access(".", false), PolicyDecision::Allow);
     }
 }
