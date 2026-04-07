@@ -223,12 +223,12 @@ pub fn hook_syscalls_in_elf(
     // Patch fork → vfork: overwrite the first bytes of __libc_fork with a
     // JMP to __libc_vfork. This prevents glibc's fork wrapper from running
     // post-fork handlers that corrupt shared state under vfork semantics.
-    if let Some((fork_file_offset, fork_patch_end, mut rel32)) = fork_to_vfork_patch {
+    if let Some((fork_file_offset, fork_func_end, mut rel32)) = fork_to_vfork_patch {
         const ENDBR64: [u8; 4] = [0xF3, 0x0F, 0x1E, 0xFA];
         #[allow(clippy::cast_possible_truncation)]
         let mut off = fork_file_offset as usize;
         #[allow(clippy::cast_possible_truncation)]
-        let patch_end = fork_patch_end as usize;
+        let func_end = fork_func_end as usize;
 
         // If fork starts with endbr64 (F3 0F 1E FA), preserve it by placing
         // the JMP after it. This keeps CET/IBT indirect-branch targets valid.
@@ -237,17 +237,17 @@ pub fn hook_syscalls_in_elf(
             rel32 = rel32.wrapping_sub(4); // JMP is now 4 bytes later, adjust displacement
         }
 
-        if off + 5 <= buf.len() && patch_end <= buf.len() && off + 5 <= patch_end {
+        if off + 5 <= func_end && func_end <= buf.len() {
             buf[off] = 0xE9; // JMP rel32
             buf[off + 1..off + 5].copy_from_slice(&rel32.to_le_bytes());
-            // NOP-fill remaining bytes between end of JMP and the patch boundary
+            // NOP-fill remaining bytes of the fork function body after the JMP
             // to avoid leaving stale instructions that could be jumped into.
-            for b in &mut buf[off + 5..patch_end] {
+            for b in &mut buf[off + 5..func_end] {
                 *b = 0x90; // NOP
             }
         } else {
             return Err(Error::ParseError(format!(
-                "fork→vfork patch range {off:#x}..{patch_end:#x} is invalid for buffer length {}",
+                "fork→vfork patch range {off:#x}..{func_end:#x} is invalid for buffer length {}",
                 buf.len(),
             )));
         }
@@ -675,8 +675,12 @@ fn fixup_phdr_alignment(buf: &mut [u8]) {
 }
 
 /// Find fork and vfork symbols in the ELF and compute the patch needed to
-/// redirect fork -> vfork. Returns `Some((fork_file_offset, jmp_rel32))` if
+/// redirect fork -> vfork. Returns `Some((fork_file_offset, fork_func_end, jmp_rel32))` if
 /// both symbols are found, or `None` if this binary doesn't export fork.
+///
+/// `fork_func_end` is the file offset of the end of the fork function (based on
+/// the symbol's size), clamped to the section boundary. This is used to NOP-fill
+/// only the fork function body after the JMP, not the rest of the section.
 fn find_fork_vfork_patch(
     file: &object::File<'_>,
     text_sections: &[TextSectionInfo],
@@ -684,6 +688,7 @@ fn find_fork_vfork_patch(
     use object::ObjectSymbol as _;
 
     let mut fork_vaddr = None;
+    let mut fork_size = None;
     let mut vfork_vaddr = None;
 
     // Restrict this rewrite to libc-specific symbols. Plain `fork`/`vfork` names may belong to
@@ -696,6 +701,7 @@ fn find_fork_vfork_patch(
         match name {
             "__libc_fork" if fork_vaddr.is_none() => {
                 fork_vaddr = Some(sym.address());
+                fork_size = Some(sym.size());
             }
             "__libc_vfork" | "__vfork" if vfork_vaddr.is_none() => {
                 vfork_vaddr = Some(sym.address());
@@ -712,6 +718,7 @@ fn find_fork_vfork_patch(
         match name {
             "__libc_fork" if fork_vaddr.is_none() => {
                 fork_vaddr = Some(sym.address());
+                fork_size = Some(sym.size());
             }
             "__libc_vfork" | "__vfork" if vfork_vaddr.is_none() => {
                 vfork_vaddr = Some(sym.address());
@@ -721,13 +728,14 @@ fn find_fork_vfork_patch(
     }
 
     let fork_vaddr = fork_vaddr?;
+    let fork_size = fork_size?;
     let vfork_vaddr = vfork_vaddr?;
     if fork_vaddr == 0 || vfork_vaddr == 0 {
         return None;
     }
 
     // Convert fork's vaddr to a file offset using the text sections.
-    let (fork_file_offset, fork_patch_end) = text_sections.iter().find_map(|s| {
+    let (fork_file_offset, fork_func_end) = text_sections.iter().find_map(|s| {
         let section_end = s.vaddr + s.size;
         if fork_vaddr >= s.vaddr
             && fork_vaddr < section_end
@@ -736,8 +744,15 @@ fn find_fork_vfork_patch(
                 .is_some_and(|end| end <= section_end)
         {
             let file_offset = s.file_offset + (fork_vaddr - s.vaddr);
-            let file_end = s.file_offset + s.size;
-            Some((file_offset, file_end))
+            let section_file_end = s.file_offset + s.size;
+            // Compute the end of the fork function, clamped to the section boundary.
+            let func_file_end = if fork_size > 0 {
+                (file_offset + fork_size).min(section_file_end)
+            } else {
+                // No size info — only NOP-fill the JMP itself (no extra NOPs).
+                file_offset + 5
+            };
+            Some((file_offset, func_file_end))
         } else {
             None
         }
@@ -751,7 +766,7 @@ fn find_fork_vfork_patch(
         .checked_sub(i64::try_from(fork_vaddr).ok()? + 5)?;
     let rel32 = i32::try_from(rel32).ok()?;
 
-    Some((fork_file_offset, fork_patch_end, rel32))
+    Some((fork_file_offset, fork_func_end, rel32))
 }
 
 /// Check if the input binary has the Bun footer marker at the end.
