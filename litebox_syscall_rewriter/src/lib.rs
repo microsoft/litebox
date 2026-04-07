@@ -127,7 +127,7 @@ pub fn hook_syscalls_in_elf(
     // Check the ELF e_type field (bytes 16..18) before doing any work.
     if input_binary.len() >= 18 {
         let e_type = u16::from_le_bytes([input_binary[16], input_binary[17]]);
-        if e_type == 1 {
+        if e_type == object::elf::ET_REL {
             // ET_REL — relocatable object file
             return Err(Error::UnsupportedObjectFile);
         }
@@ -223,14 +223,28 @@ pub fn hook_syscalls_in_elf(
     // Patch fork → vfork: overwrite the first bytes of __libc_fork with a
     // JMP to __libc_vfork. This prevents glibc's fork wrapper from running
     // post-fork handlers that corrupt shared state under vfork semantics.
-    if let Some((fork_file_offset, fork_patch_end, rel32)) = fork_to_vfork_patch {
+    if let Some((fork_file_offset, fork_patch_end, mut rel32)) = fork_to_vfork_patch {
+        const ENDBR64: [u8; 4] = [0xF3, 0x0F, 0x1E, 0xFA];
         #[allow(clippy::cast_possible_truncation)]
-        let off = fork_file_offset as usize;
+        let mut off = fork_file_offset as usize;
         #[allow(clippy::cast_possible_truncation)]
         let patch_end = fork_patch_end as usize;
+
+        // If fork starts with endbr64 (F3 0F 1E FA), preserve it by placing
+        // the JMP after it. This keeps CET/IBT indirect-branch targets valid.
+        if off + 4 <= buf.len() && buf[off..off + 4] == ENDBR64 {
+            off += 4;
+            rel32 = rel32.wrapping_sub(4); // JMP is now 4 bytes later, adjust displacement
+        }
+
         if off + 5 <= buf.len() && patch_end <= buf.len() && off + 5 <= patch_end {
             buf[off] = 0xE9; // JMP rel32
             buf[off + 1..off + 5].copy_from_slice(&rel32.to_le_bytes());
+            // NOP-fill remaining bytes between end of JMP and the patch boundary
+            // to avoid leaving stale instructions that could be jumped into.
+            for b in &mut buf[off + 5..patch_end] {
+                *b = 0x90; // NOP
+            }
         } else {
             return Err(Error::ParseError(format!(
                 "fork→vfork patch range {off:#x}..{patch_end:#x} is invalid for buffer length {}",
@@ -475,11 +489,9 @@ fn hook_syscalls_in_section(
             // Put jump back location into rcx.
             let jmp_back_base = checked_add_u64(
                 trampoline_base_addr,
-                trampoline_data.len() as u64,
+                trampoline_data.len() as u64 + 7,
                 "x86_64 trampoline jump-back base",
             )?;
-            let jmp_back_base =
-                checked_add_u64(jmp_back_base, 7, "x86_64 trampoline jump-back base")?;
             trampoline_data.extend_from_slice(&[0x48, 0x8D, 0x0D]); // LEA RCX, [RIP + disp32]
             trampoline_data.extend_from_slice(&rel32_bytes(
                 return_addr,
@@ -493,10 +505,9 @@ fn hook_syscalls_in_section(
             // We want: RIP + disp32 = syscall_entry_addr
             let entry_base = checked_add_u64(
                 trampoline_base_addr,
-                trampoline_data.len() as u64,
+                trampoline_data.len() as u64 + 4,
                 "x86_64 trampoline entry base",
             )?;
-            let entry_base = checked_add_u64(entry_base, 4, "x86_64 trampoline entry base")?;
             trampoline_data.extend_from_slice(&rel32_bytes(
                 syscall_entry_addr,
                 entry_base,
@@ -512,10 +523,9 @@ fn hook_syscalls_in_section(
             // We want: EAX + offset = syscall_entry_addr
             let call_base = checked_add_u64(
                 trampoline_base_addr,
-                trampoline_data.len() as u64,
+                trampoline_data.len() as u64 - 3,
                 "x86 trampoline entry base",
             )?;
-            let call_base = checked_sub_u64(call_base, 3, "x86 trampoline entry base")?;
             trampoline_data.extend_from_slice(&rel32_bytes(
                 syscall_entry_addr,
                 call_base,
@@ -527,10 +537,9 @@ fn hook_syscalls_in_section(
             // Add jmp back to original after syscall
             let jmp_back_base = checked_add_u64(
                 trampoline_base_addr,
-                trampoline_data.len() as u64,
+                trampoline_data.len() as u64 + 5,
                 "x86 trampoline jump-back base",
             )?;
-            let jmp_back_base = checked_add_u64(jmp_back_base, 5, "x86 trampoline jump-back base")?;
             trampoline_data.push(0xE9);
             trampoline_data.extend_from_slice(&rel32_bytes(
                 return_addr,
@@ -651,7 +660,7 @@ fn fixup_phdr_alignment(buf: &mut [u8]) {
             break;
         }
         let p_type = u32::from_le_bytes(buf[entry_off..entry_off + 4].try_into().unwrap());
-        if p_type == 6 {
+        if p_type == object::elf::PT_PHDR {
             // PT_PHDR — update p_offset to match new location
             let p_offset_off = entry_off + 8;
             let old_p_offset =
@@ -747,8 +756,7 @@ fn find_fork_vfork_patch(
 
 /// Check if the input binary has the Bun footer marker at the end.
 fn has_bun_footer_marker(input_binary: &[u8]) -> bool {
-    input_binary.len() >= BUN_FOOTER_MARKER.len()
-        && input_binary[input_binary.len() - BUN_FOOTER_MARKER.len()..] == *BUN_FOOTER_MARKER
+    input_binary.ends_with(BUN_FOOTER_MARKER)
 }
 
 /// Replace an unpatchable syscall instruction with `UD2` (`0F 0B`) so that
@@ -1075,10 +1083,9 @@ fn hook_syscall_and_after(
         // We want: RIP + disp32 = syscall_entry_addr
         let entry_base = checked_add_u64(
             trampoline_base_addr,
-            trampoline_data.len() as u64,
+            trampoline_data.len() as u64 + 4,
             "x86_64 trampoline entry base",
         )?;
-        let entry_base = checked_add_u64(entry_base, 4, "x86_64 trampoline entry base")?;
         trampoline_data.extend_from_slice(&rel32_bytes(
             syscall_entry_addr,
             entry_base,
@@ -1119,10 +1126,9 @@ fn hook_syscall_and_after(
     // Add jmp back to original after syscall
     let jmp_back_base = checked_add_u64(
         trampoline_base_addr,
-        trampoline_data.len() as u64,
+        trampoline_data.len() as u64 + 5,
         "trampoline jump-back base",
     )?;
-    let jmp_back_base = checked_add_u64(jmp_back_base, 5, "trampoline jump-back base")?;
     trampoline_data.push(0xE9);
     trampoline_data.extend_from_slice(&rel32_bytes(
         replace_end,
@@ -1262,10 +1268,9 @@ fn hook_syscall_before_and_after(
         let return_addr = next_inst.next_ip();
         let jmp_back_base = checked_add_u64(
             trampoline_base_addr,
-            trampoline_data.len() as u64,
+            trampoline_data.len() as u64 + 5,
             "x86 trampoline jump-back base",
         )?;
-        let jmp_back_base = checked_add_u64(jmp_back_base, 5, "x86 trampoline jump-back base")?;
         trampoline_data.push(0xE9);
         trampoline_data.extend_from_slice(&rel32_bytes(
             return_addr,
