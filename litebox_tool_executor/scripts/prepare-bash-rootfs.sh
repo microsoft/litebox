@@ -20,7 +20,7 @@ WORKSPACE="$(cd "$SCRIPT_DIR/../.." && pwd)"
 REWRITER="$WORKSPACE/target/debug/litebox_syscall_rewriter"
 OUTPUT="${1:-$WORKSPACE/target/bash-sandbox.tar}"
 
-UTILS=(cat ls grep sort wc find head tail mkdir rm cp mv echo tr sed awk pwd dirname basename env printenv date id uname xargs tee touch chmod)
+UTILS=(cat ls grep sort uniq wc find head tail mkdir rm cp mv echo tr sed awk pwd dirname basename env printenv date id uname xargs tee touch chmod)
 
 if [ ! -f "$REWRITER" ]; then
     echo "ERROR: litebox_syscall_rewriter not found at $REWRITER"
