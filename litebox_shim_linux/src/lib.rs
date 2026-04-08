@@ -2234,10 +2234,16 @@ impl<FS: ShimFS> Task<FS> {
                 | Sysno::setrlimit | Sysno::prlimit64
                 // No-ops (read-only queries).
                 | Sysno::getpid | Sysno::getppid | Sysno::gettid
-                | Sysno::getuid | Sysno::getgid | Sysno::getsid | Sysno::getpgid
+                | Sysno::getuid | Sysno::geteuid | Sysno::getgid | Sysno::getegid
+                | Sysno::getsid | Sysno::getpgid
                 // Stat queries — bash calls fstat between fork and exec
                 // to check terminal type and fd validity.
-                | Sysno::fstat | Sysno::stat | Sysno::newfstatat
+                | Sysno::fstat | Sysno::stat | Sysno::lstat | Sysno::newfstatat
+                // Access queries — bash calls faccessat(X_OK) during PATH
+                // lookup between fork and exec to check executability.
+                | Sysno::access | Sysno::faccessat | Sysno::faccessat2
+                // Symlink queries — bash may readlink during PATH search.
+                | Sysno::readlink | Sysno::readlinkat
                 // ioctl — bash calls ioctl(TIOCGPGRP) for job control
                 // between fork and exec.
                 | Sysno::ioctl,
@@ -4015,12 +4021,20 @@ mod tests {
         assert_allowed(Sysno::getppid);
         assert_allowed(Sysno::gettid);
         assert_allowed(Sysno::getuid);
+        assert_allowed(Sysno::geteuid);
         assert_allowed(Sysno::getgid);
+        assert_allowed(Sysno::getegid);
         assert_allowed(Sysno::getsid);
         assert_allowed(Sysno::getpgid);
         assert_allowed(Sysno::fstat);
         assert_allowed(Sysno::stat);
+        assert_allowed(Sysno::lstat);
         assert_allowed(Sysno::newfstatat);
+        assert_allowed(Sysno::access);
+        assert_allowed(Sysno::faccessat);
+        assert_allowed(Sysno::faccessat2);
+        assert_allowed(Sysno::readlink);
+        assert_allowed(Sysno::readlinkat);
         assert_allowed(Sysno::ioctl);
     }
 
