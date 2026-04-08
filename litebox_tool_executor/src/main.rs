@@ -5,12 +5,13 @@
 //!
 //! Supports two modes:
 //! - **Direct mode**: `litebox-tool-executor --rootfs rootfs.tar -- /usr/bin/bash -c "echo hello"`
-//! - **Interactive REPL**: `litebox-tool-executor --rootfs rootfs.tar --interactive`
+//! - **Interactive shell**: `litebox-tool-executor --rootfs rootfs.tar --interactive`
+//!   Launches a persistent bash session inside a single sandbox. Shell state
+//!   (cd, env vars, etc.) persists across commands.
 //!
-//! Spawns `litebox_runner_linux_userland` as a subprocess for each command.
+//! Spawns `litebox_runner_linux_userland` as a subprocess.
 
 use clap::Parser as _;
-use std::io::Write as _;
 
 #[derive(clap::Parser, Debug)]
 #[command(name = "litebox-tool-executor")]
@@ -24,7 +25,8 @@ struct Cli {
     #[arg(long, value_name = "PATH", value_hint = clap::ValueHint::FilePath)]
     policy: Option<std::path::PathBuf>,
 
-    /// Run an interactive REPL shell (each line is a sandboxed command).
+    /// Run a persistent interactive shell inside the sandbox.
+    /// Shell state (cd, environment variables) persists across commands.
     #[arg(long)]
     interactive: bool,
 
@@ -40,7 +42,7 @@ struct Cli {
     #[arg(long = "env")]
     env: Vec<String>,
 
-    /// The command and arguments to run. Omit for JSON pipe mode (stdin/stdout).
+    /// The command and arguments to run. Omit for interactive mode.
     #[arg(trailing_var_arg = true)]
     command: Vec<String>,
 }
@@ -133,80 +135,63 @@ fn runner_command(cli: &Cli) -> anyhow::Result<std::process::Command> {
     if !has("PATH=") {
         cmd.arg("--env").arg("PATH=/usr/bin:/bin");
     }
+    if !has("TERM=") {
+        cmd.arg("--env").arg("TERM=dumb");
+    }
 
     cmd.arg("--");
     Ok(cmd)
 }
 
-/// Interactive REPL mode. Each line runs in a fresh sandbox.
+/// Interactive shell mode. Launches a persistent bash session inside a single
+/// sandbox. Shell state (cd, environment variables, etc.) persists across
+/// commands. Uses `--noediting -s` and `TERM=dumb` to disable readline
+/// (the sandbox reports stdin as a TTY, which would cause bash to enter
+/// interactive/readline mode and hang).
 fn interactive(cli: &Cli) -> anyhow::Result<()> {
-    eprintln!("LiteBox Sandbox Shell (each command runs in a fresh sandbox)");
-    eprintln!("Type 'exit' to quit.");
-    if let Some(ref log_path) = cli.audit_log {
-        eprintln!("Audit log: {}", log_path.display());
-    }
-    eprintln!();
+    let mut cmd = runner_command(cli)?;
 
-    let stdin = std::io::stdin();
-    loop {
-        eprint!("sandbox$ ");
-        std::io::stderr().flush()?;
+    // Launch bash in non-editing script mode:
+    // --norc --noprofile: skip startup files
+    // --noediting: disable readline (avoids hang on TTY stdin)
+    // -s: read commands from stdin (explicit, even though it's the default
+    //     for non-interactive bash — makes intent clear)
+    cmd.args([&cli.shell, "--norc", "--noprofile", "--noediting", "-s"]);
 
-        let mut line = String::new();
-        let n = stdin.read_line(&mut line)?;
-        if n == 0 {
-            break; // EOF
-        }
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        if line == "exit" {
-            break;
-        }
+    // Pass stdin/stdout/stderr straight through to the guest shell.
+    cmd.stdin(std::process::Stdio::inherit())
+        .stdout(std::process::Stdio::inherit());
 
-        let mut cmd = runner_command(cli)?;
-        cmd.args([&cli.shell, "--norc", "--noprofile", "-c", line]);
-
-        // Inherit stdin (null) and stdout. For stderr:
-        // - If --audit-log is set, capture stderr and write it to the file
-        //   (the runner emits audit events as JSON on stderr by default).
-        // - Otherwise, inherit stderr so the user sees everything.
-        cmd.stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::inherit());
-
-        if cli.audit_log.is_some() {
-            cmd.stderr(std::process::Stdio::piped());
-        } else {
-            cmd.stderr(std::process::Stdio::inherit());
-        }
-
-        match cmd.output() {
-            Ok(out) => {
-                if let Some(ref log_path) = cli.audit_log {
-                    if let Ok(mut f) = std::fs::OpenOptions::new()
-                        .create(true)
-                        .append(true)
-                        .open(log_path)
-                    {
-                        let _ = std::io::Write::write_all(&mut f, &out.stderr);
-                    }
-                }
-                if !out.status.success() {
-                    let code = out.status.code().unwrap_or(-1);
-                    if code == 124 {
-                        eprintln!("[timed out]");
-                    } else {
-                        eprintln!("[exit code: {code}]");
-                    }
-                }
-            }
-            Err(e) => {
-                eprintln!("[error: {e}]");
-            }
-        }
+    if cli.audit_log.is_some() {
+        cmd.stderr(std::process::Stdio::piped());
+    } else {
+        cmd.stderr(std::process::Stdio::inherit());
     }
 
+    let result = if cli.audit_log.is_some() {
+        // Capture stderr for audit log while forwarding stdout.
+        let output = cmd.output().map_err(|e| {
+            anyhow::anyhow!("Failed to spawn litebox_runner_linux_userland: {e}")
+        })?;
+        if let Some(ref log_path) = cli.audit_log {
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(log_path)
+            {
+                let _ = std::io::Write::write_all(&mut f, &output.stderr);
+            }
+        }
+        output.status
+    } else {
+        cmd.status().map_err(|e| {
+            anyhow::anyhow!("Failed to spawn litebox_runner_linux_userland: {e}")
+        })?
+    };
+
+    if !result.success() {
+        std::process::exit(result.code().unwrap_or(1));
+    }
     Ok(())
 }
 
