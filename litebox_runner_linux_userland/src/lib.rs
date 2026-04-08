@@ -169,9 +169,8 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
             .collect();
         let file = mmapped_file(&prog)?;
         let data = if cli_args.rewrite_syscalls {
-            let mut skipped_addrs = Vec::new();
-            let rewritten =
-                litebox_syscall_rewriter::hook_syscalls_in_elf(file.data, None, &mut skipped_addrs)
+            let (rewritten, skipped_addrs) =
+                litebox_syscall_rewriter::hook_syscalls_in_elf(file.data, None)
                     .with_context(|| format!("failed to rewrite {}", prog.display()))?;
             if !skipped_addrs.is_empty() {
                 eprintln!(

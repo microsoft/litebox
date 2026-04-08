@@ -34,10 +34,10 @@ use zerocopy::{FromBytes, Immutable, IntoBytes};
 pub enum Error {
     #[error("failed to parse: {0}")]
     ParseError(String),
-    #[error("unsupported executable")]
-    UnsupportedObjectFile,
-    #[error("unsupported Bun-packaged executable")]
-    UnsupportedBunExecutable,
+    #[error("unsupported object file: {0}")]
+    UnsupportedObjectFile(String),
+    #[error("unsupported executable: {0}")]
+    UnsupportedExecutable(String),
     #[error("executable is already hooked with trampoline")]
     AlreadyHooked,
     #[error("no .text section found")]
@@ -50,6 +50,8 @@ pub enum Error {
     InsufficientBytesBeforeOrAfter(u64),
     #[error("provided trampoline address is too large for 32-bit executable")]
     TrampolineAddressTooLarge,
+    #[error("patch failed: {0}")]
+    PatchError(String),
 }
 
 type Result<T> = core::result::Result<T, Error>;
@@ -109,16 +111,18 @@ struct TextSectionInfo {
 /// no syscall instructions are patched, the rewriter still appends the header and the initial
 /// syscall-entry placeholder so the loader/audit path can tell the binary was processed.
 ///
-/// `skipped_addrs` receives the virtual addresses of any `syscall`
-/// instructions that could not be patched (replaced with `UD2` so they
-/// trap instead of escaping to the host kernel).
+/// Returns a tuple of (rewritten binary, skipped syscall addresses). Skipped
+/// addresses are syscall instructions that could not be patched because there
+/// is not enough space around the instruction (replaced with `icebp; hlt` so
+/// they trap instead of escaping to the host kernel).
 pub fn hook_syscalls_in_elf(
     input_binary: &[u8],
     trampoline: Option<u64>,
-    skipped_addrs: &mut Vec<u64>,
-) -> Result<Vec<u8>> {
-    if has_bun_footer_marker(input_binary) {
-        return Err(Error::UnsupportedBunExecutable);
+) -> Result<(Vec<u8>, Vec<u64>)> {
+    if input_binary.ends_with(BUN_FOOTER_MARKER) {
+        return Err(Error::UnsupportedExecutable(
+            "Bun-packaged executable".into(),
+        ));
     }
 
     // Relocatable object files (.o) must not be patched: they are linker
@@ -129,7 +133,9 @@ pub fn hook_syscalls_in_elf(
         let e_type = u16::from_le_bytes([input_binary[16], input_binary[17]]);
         if e_type == object::elf::ET_REL {
             // ET_REL — relocatable object file
-            return Err(Error::UnsupportedObjectFile);
+            return Err(Error::UnsupportedObjectFile(
+                "relocatable object file".into(),
+            ));
         }
     }
 
@@ -153,7 +159,7 @@ pub fn hook_syscalls_in_elf(
         let arch = match file {
             object::File::Elf64(_) => Arch::X86_64,
             object::File::Elf32(_) => Arch::X86_32,
-            _ => return Err(Error::UnsupportedObjectFile),
+            _ => return Err(Error::UnsupportedObjectFile("not an ELF file".into())),
         };
 
         let dl_sysinfo_int80 = if arch == Arch::X86_32 {
@@ -192,6 +198,7 @@ pub fn hook_syscalls_in_elf(
         trampoline_data.extend_from_slice(&trampoline.to_le_bytes());
     }
     // Patch syscalls in-place in buf
+    let mut skipped_addrs = Vec::new();
     for s in &text_sections {
         let section_data = section_slice_mut(buf, s)?;
         match hook_syscalls_in_section(
@@ -203,9 +210,9 @@ pub fn hook_syscalls_in_elf(
             trampoline_base_addr, // entry point is at offset 0 of trampoline
             dl_sysinfo_int80,
             &mut trampoline_data,
-            skipped_addrs,
         ) {
-            Ok(()) | Err(Error::NoSyscallInstructionsFound) => {}
+            Ok(addrs) => skipped_addrs.extend(addrs),
+            Err(Error::NoSyscallInstructionsFound) => {}
             Err(e) => return Err(e),
         }
     }
@@ -246,7 +253,7 @@ pub fn hook_syscalls_in_elf(
         };
         out.extend_from_slice(header.as_bytes());
     }
-    Ok(out)
+    Ok((out, skipped_addrs))
 }
 
 /// (private) Get metadata for executable sections
@@ -350,10 +357,10 @@ fn hook_syscalls_in_section(
     syscall_entry_addr: u64,
     dl_sysinfo_int80: Option<u64>,
     trampoline_data: &mut Vec<u8>,
-    skipped_addrs: &mut Vec<u64>,
-) -> Result<()> {
+) -> Result<Vec<u64>> {
     let instructions = decode_section_instructions(arch, section_data, section_base_addr)?;
     let mut found_any = false;
+    let mut skipped_addrs = Vec::new();
     for (i, inst) in instructions.iter().enumerate() {
         // Forward search for `syscall` / `int 0x80` / `call DWORD PTR gs:0x10`
         match arch {
@@ -414,9 +421,9 @@ fn hook_syscalls_in_section(
             ) {
                 Ok(()) => {}
                 Err(Error::InsufficientBytesBeforeOrAfter(_)) => {
-                    // Replace the unpatchable syscall with UD2 so it traps
-                    // instead of escaping to the host kernel.
-                    replace_with_ud2(section_data, section_base_addr, inst);
+                    // Replace the unpatchable syscall with ICEBP;HLT so it
+                    // traps instead of escaping to the host kernel.
+                    replace_with_trap(section_data, section_base_addr, inst);
                     skipped_addrs.push(inst.ip());
                 }
                 Err(e) => return Err(e),
@@ -522,7 +529,7 @@ fn hook_syscalls_in_section(
     }
 
     if found_any {
-        Ok(())
+        Ok(skipped_addrs)
     } else {
         Err(Error::NoSyscallInstructionsFound)
     }
@@ -631,23 +638,29 @@ fn fixup_phdr_alignment(buf: &mut [u8]) {
     }
 }
 
-/// Check if the input binary has the Bun footer marker at the end.
-fn has_bun_footer_marker(input_binary: &[u8]) -> bool {
-    input_binary.ends_with(BUN_FOOTER_MARKER)
-}
-
-/// Replace an unpatchable syscall instruction with `UD2` (`0F 0B`) so that
-/// reaching it triggers SIGILL instead of silently escaping to the host kernel.
+/// Replace an unpatchable syscall instruction with `ICEBP; HLT` (`F1 F4`) so
+/// that reaching it traps instead of silently escaping to the host kernel.
+///
+/// We avoid `UD2` (`0F 0B`) because it commonly appears in binaries to mark
+/// `unreachable!()` paths.  The `ICEBP; HLT` sequence is a strong, distinctive
+/// indicator of "this syscall was intentionally poisoned" — `ICEBP` alone does
+/// not trap on Linux in userspace, but `HLT` does (SIGILL in ring 3), and the
+/// `F1` prefix makes it easy for a signal handler to distinguish an
+/// intentional break from a spurious one.
 ///
 /// `syscall` (0F 05) and `int 0x80` (CD 80) are both 2 bytes — same size as
-/// `ud2`. For `call DWORD PTR gs:0x10` (7 bytes), the remaining 5 bytes are
-/// filled with NOPs.
-fn replace_with_ud2(section_data: &mut [u8], section_base_addr: u64, inst: &iced_x86::Instruction) {
+/// `ICEBP; HLT`.  For `call DWORD PTR gs:0x10` (7 bytes), the remaining 5
+/// bytes are filled with NOPs.
+fn replace_with_trap(
+    section_data: &mut [u8],
+    section_base_addr: u64,
+    inst: &iced_x86::Instruction,
+) {
     let offset = usize::try_from(inst.ip() - section_base_addr).unwrap();
     let len = inst.len();
-    // UD2 = 0F 0B
-    section_data[offset] = 0x0F;
-    section_data[offset + 1] = 0x0B;
+    // ICEBP (F1) + HLT (F4): traps in userspace, easy to identify in a handler.
+    section_data[offset] = 0xF1;
+    section_data[offset + 1] = 0xF4;
     // Fill any remaining bytes (e.g. 7-byte `call gs:0x10`) with NOPs.
     for b in &mut section_data[offset + 2..offset + len] {
         *b = 0x90;
@@ -656,56 +669,40 @@ fn replace_with_ud2(section_data: &mut [u8], section_base_addr: u64, inst: &iced
 
 fn checked_add_u64(base: u64, addend: u64, context: &'static str) -> Result<u64> {
     base.checked_add(addend)
-        .ok_or_else(|| Error::ParseError(format!("{context} address overflow")))
+        .ok_or_else(|| Error::PatchError(format!("{context} address overflow")))
 }
 
 fn checked_sub_u64(base: u64, subtrahend: u64, context: &'static str) -> Result<u64> {
     base.checked_sub(subtrahend)
-        .ok_or_else(|| Error::ParseError(format!("{context} address underflow")))
+        .ok_or_else(|| Error::PatchError(format!("{context} address underflow")))
 }
 
 fn rel32_bytes(target: u64, base: u64, context: &'static str) -> Result<[u8; 4]> {
     let disp = i128::from(target) - i128::from(base);
     let disp = i32::try_from(disp).map_err(|_| {
-        Error::ParseError(format!(
+        Error::PatchError(format!(
             "{context} displacement out of range: target {target:#x}, base {base:#x}"
         ))
     })?;
     Ok(disp.to_le_bytes())
 }
 
-/// Patch a single mapped code segment in-place, returning trampoline stubs.
+/// Patch a single mapped code segment in-place, returning trampoline stubs and
+/// the addresses of any syscall instructions that could not be patched
+/// (replaced with `ICEBP; HLT` so they trap instead of escaping to the host
+/// kernel).
 ///
 /// This is the runtime counterpart to [`hook_syscalls_in_elf`]. Instead of
 /// processing a whole ELF file, it operates on a single already-mapped code
 /// region — the caller is responsible for making the region writable before
-/// calling and restoring permissions afterwards.
-///
-/// # Arguments
-///
-/// * `code` — mutable slice of the mapped code segment.
-/// * `code_vaddr` — virtual address of `code[0]` in guest memory.
-/// * `trampoline_write_vaddr` — virtual address where the returned stub bytes
-///   will be placed by the caller.
-/// * `syscall_entry_addr` — address of the 8-byte entry-point value that
-///   each stub's indirect jump targets.
-///
-/// # Returns
-///
-/// The trampoline stub bytes. The caller must copy them to
-/// `trampoline_write_vaddr`. Returns an empty `Vec` if no syscall
-/// instructions are found in `code`.
-///
-/// `skipped_addrs` receives the virtual addresses of any `syscall`
-/// instructions that could not be patched (replaced with `UD2` so they
-/// trap instead of escaping to the host kernel).
+/// calling and restoring permissions afterwards. The caller must copy the
+/// returned stubs to `trampoline_write_vaddr`.
 pub fn patch_code_segment(
     code: &mut [u8],
     code_vaddr: u64,
     trampoline_write_vaddr: u64,
     syscall_entry_addr: u64,
-    skipped_addrs: &mut Vec<u64>,
-) -> Result<Vec<u8>> {
+) -> Result<(Vec<u8>, Vec<u64>)> {
     let arch = Arch::X86_64; // runtime patching is x86-64 only
 
     // Build control-transfer targets for this segment.
@@ -728,10 +725,9 @@ pub fn patch_code_segment(
         syscall_entry_addr,
         None, // dl_sysinfo_int80 — not applicable on x86-64
         &mut trampoline_data,
-        skipped_addrs,
     ) {
-        Ok(()) => Ok(trampoline_data),
-        Err(Error::NoSyscallInstructionsFound) => Ok(Vec::new()),
+        Ok(skipped_addrs) => Ok((trampoline_data, skipped_addrs)),
+        Err(Error::NoSyscallInstructionsFound) => Ok((Vec::new(), Vec::new())),
         Err(e) => Err(e),
     }
 }

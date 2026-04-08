@@ -565,9 +565,8 @@ fn rewrite_elf(data: &[u8], path: &Path, verbose: bool) -> anyhow::Result<Vec<u8
         return Ok(data.to_vec());
     }
 
-    let mut skipped_addrs = Vec::new();
-    match litebox_syscall_rewriter::hook_syscalls_in_elf(data, None, &mut skipped_addrs) {
-        Ok(rewritten) => {
+    match litebox_syscall_rewriter::hook_syscalls_in_elf(data, None) {
+        Ok((rewritten, skipped_addrs)) => {
             if !skipped_addrs.is_empty() {
                 eprintln!(
                     "  warning: {} has {} unpatchable syscall instruction(s) at {:?}",
@@ -597,7 +596,7 @@ fn rewrite_elf(data: &[u8], path: &Path, verbose: bool) -> anyhow::Result<Vec<u8
             }
             Ok(data.to_vec())
         }
-        Err(litebox_syscall_rewriter::Error::UnsupportedObjectFile) => {
+        Err(litebox_syscall_rewriter::Error::UnsupportedObjectFile(_)) => {
             if verbose {
                 eprintln!(
                     "  warning: {} is not a supported ELF, including as-is",
@@ -615,7 +614,7 @@ fn rewrite_elf(data: &[u8], path: &Path, verbose: bool) -> anyhow::Result<Vec<u8
             }
             Ok(data.to_vec())
         }
-        Err(litebox_syscall_rewriter::Error::UnsupportedBunExecutable) => {
+        Err(litebox_syscall_rewriter::Error::UnsupportedExecutable(_)) => {
             anyhow::bail!(
                 "{} is a Bun-packaged executable and cannot be safely packaged without syscall rewriting",
                 path.display()

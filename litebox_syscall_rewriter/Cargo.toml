@@ -6,6 +6,8 @@ edition = "2024"
 [features]
 default = ["std", "anyhow", "clap"]
 std = []
+anyhow = ["dep:anyhow"]
+clap = ["dep:clap"]
 
 [dependencies]
 iced-x86 = { version = "1.21", default-features = false, features = ["no_std", "decoder", "encoder", "instr_info"] }
