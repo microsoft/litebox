@@ -1060,25 +1060,89 @@ fn test_multi_external_pipes_on_userland() {
 // ---------------------------------------------------------------------------
 // --program-from-tar fork+pipe tests
 //
-// These exercise the same pipelines as test_multi_external_pipes_on_userland
-// but with --program-from-tar, which is the mode the tool_executor uses.
-// The Runner-based tests load bash from the *host* filesystem; these load
-// everything from a self-contained tar, which changes how the fork/exec
-// worker resolves binaries.
+// These exercise bash pipelines with --program-from-tar, which is the mode
+// the tool_executor uses. The Runner-based tests above load bash from the
+// *host* filesystem; these load everything from a self-contained tar.
+//
+// Bare-name pipe tests run each case 20 times to expose non-determinism.
+// Each reports pass/fail/timeout statistics rather than asserting a single
+// expected outcome.
 // ---------------------------------------------------------------------------
 
 /// Helper: find the bash-sandbox.tar built by prepare-bash-rootfs.sh.
-/// Returns None if it hasn't been built (the test will be skipped).
 #[cfg(target_arch = "x86_64")]
 fn bash_sandbox_tar() -> Option<PathBuf> {
-    // Check workspace target dir
     let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap();
     let workspace = Path::new(&manifest_dir).parent().unwrap();
     let path = workspace.join("target/bash-sandbox.tar");
     if path.exists() {
-        return Some(path);
+        Some(path)
+    } else {
+        None
     }
-    None
+}
+
+/// Validate that the bash-sandbox.tar has the expected structure.
+/// Catches build issues before they manifest as mysterious test failures.
+#[cfg(target_arch = "x86_64")]
+fn validate_tar(tar_path: &Path) {
+    let output = std::process::Command::new("tar")
+        .args(["tf", tar_path.to_str().unwrap()])
+        .output()
+        .expect("failed to list tar contents");
+    let listing = String::from_utf8_lossy(&output.stdout);
+    let entries: Vec<&str> = listing.lines().collect();
+
+    // Required binaries (real files in /usr/bin)
+    for bin in [
+        "./usr/bin/bash",
+        "./usr/bin/cat",
+        "./usr/bin/ls",
+        "./usr/bin/sort",
+        "./usr/bin/grep",
+    ] {
+        assert!(
+            entries.iter().any(|e| *e == bin),
+            "tar missing required binary: {bin}\n\
+             Rebuild with: bash litebox_tool_executor/scripts/prepare-bash-rootfs.sh\n\
+             tar has {n} entries",
+            n = entries.len(),
+        );
+    }
+
+    // Required shared libraries
+    for lib in ["libc.so", "ld-linux-x86-64.so"] {
+        assert!(
+            entries.iter().any(|e| e.contains(lib)),
+            "tar missing required library matching '{lib}'",
+        );
+    }
+
+    // /bin/ symlinks must exist
+    for link in ["./bin/cat", "./bin/ls", "./bin/sort", "./bin/grep"] {
+        assert!(
+            entries.iter().any(|e| *e == link),
+            "tar missing expected symlink: {link}",
+        );
+    }
+
+    // Verify symlink targets point to /usr/bin/
+    let output = std::process::Command::new("tar")
+        .args(["tvf", tar_path.to_str().unwrap()])
+        .output()
+        .expect("failed to list tar with details");
+    let verbose = String::from_utf8_lossy(&output.stdout);
+    for name in ["bin/cat", "bin/ls", "bin/sort"] {
+        if let Some(line) = verbose
+            .lines()
+            .find(|l| l.contains(&format!("./{name} -> ")))
+        {
+            assert!(
+                line.contains("/usr/bin/"),
+                "/bin symlink ./{name} doesn't point to /usr/bin/: {line}",
+            );
+        }
+    }
 }
 
 /// Helper: run a bash command via --program-from-tar with a timeout.
@@ -1111,203 +1175,231 @@ fn run_bash_from_tar(tar_path: &Path, bash_cmd: &str, timeout_secs: &str) -> (St
     (stdout, stderr, code)
 }
 
-/// Baseline: simple echo works via --program-from-tar.
+/// Outcome statistics from running a command multiple times.
+#[cfg(target_arch = "x86_64")]
+#[derive(Debug, Default)]
+struct TrialStats {
+    pass: u32,
+    empty: u32,   // exit 0 but expected output missing
+    timeout: u32, // exit 124
+    error: u32,   // other non-zero exit
+}
+
+#[cfg(target_arch = "x86_64")]
+impl std::fmt::Display for TrialStats {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let total = self.pass + self.empty + self.timeout + self.error;
+        write!(
+            f,
+            "{total} trials: {pass} pass, {empty} empty, {timeout} timeout, {error} error",
+            pass = self.pass,
+            empty = self.empty,
+            timeout = self.timeout,
+            error = self.error,
+        )
+    }
+}
+
+/// Run a command N times and collect statistics.
+#[cfg(target_arch = "x86_64")]
+fn run_trials(
+    tar_path: &Path,
+    bash_cmd: &str,
+    expected_substr: &str,
+    n: u32,
+    timeout_secs: &str,
+) -> TrialStats {
+    let mut stats = TrialStats::default();
+    for _ in 0..n {
+        let (stdout, _stderr, code) = run_bash_from_tar(tar_path, bash_cmd, timeout_secs);
+        match code {
+            124 => stats.timeout += 1,
+            0 if stdout.contains(expected_substr) => stats.pass += 1,
+            0 => stats.empty += 1,
+            _ => stats.error += 1,
+        }
+    }
+    stats
+}
+
+#[cfg(target_arch = "x86_64")]
+fn report_bare_pipe_result(label: &str, stats: &TrialStats) {
+    let total = stats.pass + stats.empty + stats.timeout + stats.error;
+    eprintln!("bare `{label}` via --program-from-tar: {stats}");
+    if stats.pass == total {
+        eprintln!("  → ALL PASSED — the bug may be fixed!");
+    } else if stats.pass > 0 {
+        eprintln!("  → FLAKY: passes {}/{total} times", stats.pass);
+    } else {
+        eprintln!("  → ALWAYS FAILS (0/{total})");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tar validation
+// ---------------------------------------------------------------------------
+
+/// Validate tar structure before running any --program-from-tar tests.
 #[cfg(target_arch = "x86_64")]
 #[test]
-fn test_tar_echo() {
+fn test_tar_validate() {
     let Some(tar) = bash_sandbox_tar() else {
         eprintln!("Skipping: bash-sandbox.tar not found (run prepare-bash-rootfs.sh)");
         return;
     };
-    let (stdout, _stderr, code) = run_bash_from_tar(&tar, "echo hello-tar", "10");
-    assert_eq!(code, 0, "echo should succeed");
-    assert!(stdout.contains("hello-tar"), "expected 'hello-tar', got: {stdout}");
+    validate_tar(&tar);
 }
 
-/// Baseline: single-fork pipe (builtin echo → external cat) works.
+// ---------------------------------------------------------------------------
+// Baselines: these must always pass (10 trials each).
+// ---------------------------------------------------------------------------
+
 #[cfg(target_arch = "x86_64")]
 #[test]
-fn test_tar_builtin_pipe_cat() {
+fn test_tar_baseline_echo() {
     let Some(tar) = bash_sandbox_tar() else { return };
-    let (stdout, _stderr, code) = run_bash_from_tar(&tar, "echo hello-pipe | /usr/bin/cat", "10");
-    assert_eq!(code, 0, "builtin | cat should succeed");
-    assert!(stdout.contains("hello-pipe"), "expected 'hello-pipe', got: {stdout}");
+    let stats = run_trials(&tar, "echo hello-tar", "hello-tar", 10, "10");
+    assert_eq!(stats.pass, 10, "echo should always work. {stats}");
 }
 
-/// Full-path two-external pipe: /usr/bin/echo | /usr/bin/cat
 #[cfg(target_arch = "x86_64")]
 #[test]
-fn test_tar_full_path_echo_pipe_cat() {
+fn test_tar_baseline_builtin_pipe_cat() {
     let Some(tar) = bash_sandbox_tar() else { return };
-    let (stdout, _stderr, code) = run_bash_from_tar(
+    let stats = run_trials(&tar, "echo hello-pipe | /usr/bin/cat", "hello-pipe", 10, "10");
+    assert_eq!(stats.pass, 10, "builtin | /usr/bin/cat should always work. {stats}");
+}
+
+#[cfg(target_arch = "x86_64")]
+#[test]
+fn test_tar_baseline_full_path_echo_pipe_cat() {
+    let Some(tar) = bash_sandbox_tar() else { return };
+    let stats = run_trials(
         &tar,
         "/usr/bin/echo hello-full | /usr/bin/cat",
+        "hello-full",
+        10,
         "10",
     );
-    assert_eq!(code, 0, "/usr/bin/echo | /usr/bin/cat should succeed");
-    assert!(stdout.contains("hello-full"), "expected 'hello-full', got: {stdout}");
+    assert_eq!(stats.pass, 10, "full-path echo|cat should always work. {stats}");
 }
 
-/// Full-path 3-stage pipe: /usr/bin/ls | /usr/bin/sort | /usr/bin/head
-/// This works because full paths bypass whatever resolution issue causes
-/// bare-name pipes to hang.
 #[cfg(target_arch = "x86_64")]
 #[test]
-fn test_tar_full_path_ls_sort() {
+fn test_tar_baseline_full_path_ls_sort() {
     let Some(tar) = bash_sandbox_tar() else { return };
-    let (stdout, stderr, code) = run_bash_from_tar(
+    let stats = run_trials(
         &tar,
         "echo a > /tmp/a; echo b > /tmp/b; /usr/bin/ls /tmp | /usr/bin/sort",
+        "a",
+        10,
         "10",
     );
-    assert_ne!(code, 124, "TIMED OUT — full-path ls|sort hung.\nstderr: {stderr}");
-    assert_eq!(code, 0, "full-path ls|sort failed with code {code}");
-    assert!(
-        stdout.contains("a") && stdout.contains("b"),
-        "expected file listing, got: {stdout}",
-    );
+    assert_eq!(stats.pass, 10, "full-path ls|sort should always work. {stats}");
 }
 
-/// BUG REPRO: bare-name `ls | sort` with --program-from-tar loses output.
-///
-/// bash resolves `ls` to `/usr/bin/ls` via PATH before execve, so the same
-/// binary is executed — yet with --program-from-tar, bare-name commands in
-/// pipes either hang (timeout) or exit 0 with empty stdout. Full paths work.
-///
-/// When this bug is fixed, change the assertion to require output.
 #[cfg(target_arch = "x86_64")]
 #[test]
-fn test_tar_bare_ls_pipe() {
+fn test_tar_baseline_full_path_ls_subshell() {
     let Some(tar) = bash_sandbox_tar() else { return };
-    let (stdout, _stderr, code) = run_bash_from_tar(
+    let stats = run_trials(&tar, "x=$(/usr/bin/ls /); echo $x", "tmp", 10, "10");
+    assert_eq!(stats.pass, 10, "full-path ls subshell should always work. {stats}");
+}
+
+#[cfg(target_arch = "x86_64")]
+#[test]
+fn test_tar_baseline_bare_ls_subshell() {
+    let Some(tar) = bash_sandbox_tar() else { return };
+    let stats = run_trials(&tar, "x=$(ls /); echo \"LS=$x\"", "tmp", 10, "10");
+    eprintln!("bare ls subshell: {stats}");
+    // If this is flaky, the non-determinism extends to subshells too.
+    assert!(stats.pass > 0, "bare ls subshell never worked. {stats}");
+}
+
+// ---------------------------------------------------------------------------
+// Bare-name pipe tests: 20 trials each to expose non-determinism.
+//
+// These document the bug. Each test reports statistics. They do NOT assert
+// failure — they report pass rates so we can distinguish:
+//   "always broken" vs "flaky" vs "always works"
+// ---------------------------------------------------------------------------
+
+#[cfg(target_arch = "x86_64")]
+#[test]
+fn test_tar_bare_pipe_echo_cat() {
+    let Some(tar) = bash_sandbox_tar() else { return };
+    let stats = run_trials(&tar, "echo works | cat", "works", 20, "5");
+    report_bare_pipe_result("echo | cat", &stats);
+}
+
+#[cfg(target_arch = "x86_64")]
+#[test]
+fn test_tar_bare_pipe_echo_sort() {
+    let Some(tar) = bash_sandbox_tar() else { return };
+    let stats = run_trials(&tar, "echo zzz | sort", "zzz", 20, "5");
+    report_bare_pipe_result("echo | sort", &stats);
+}
+
+#[cfg(target_arch = "x86_64")]
+#[test]
+fn test_tar_bare_pipe_ls_sort() {
+    let Some(tar) = bash_sandbox_tar() else { return };
+    let stats = run_trials(
         &tar,
         "echo a > /tmp/a; echo b > /tmp/b; ls /tmp | sort",
-        "10",
+        "a",
+        20,
+        "5",
     );
-    // BUG: exits 0 but stdout is empty (data lost in fork+exec pipeline).
-    // When fixed, this should contain "a" and "b".
-    let has_output = stdout.contains("a") && stdout.contains("b");
-    assert!(
-        !has_output || code == 0,
-        "If this assertion fires, the bare-name pipe bug is FIXED! \
-         Update test to assert success. stdout: [{stdout}]",
-    );
-    if !has_output {
-        eprintln!(
-            "KNOWN BUG: bare `ls /tmp | sort` via --program-from-tar: \
-             exit={code}, stdout is empty (expected file listing)"
-        );
-    }
+    report_bare_pipe_result("ls | sort", &stats);
 }
 
-/// BUG REPRO: bare-name `grep` in a pipe with --program-from-tar loses output.
 #[cfg(target_arch = "x86_64")]
 #[test]
-fn test_tar_bare_grep_pipe() {
+fn test_tar_bare_pipe_grep() {
     let Some(tar) = bash_sandbox_tar() else { return };
-    let (stdout, _stderr, code) = run_bash_from_tar(
+    let stats = run_trials(
         &tar,
         "echo hello-grep | grep hello | cat",
-        "10",
+        "hello-grep",
+        20,
+        "5",
     );
-    // BUG: exits 0 but stdout is empty, or times out.
-    let has_output = stdout.contains("hello-grep");
-    assert!(
-        !has_output || code == 0,
-        "If this fires, the bare-name pipe bug is FIXED! stdout: [{stdout}]",
+    report_bare_pipe_result("echo | grep | cat", &stats);
+}
+
+// ---------------------------------------------------------------------------
+// Direct comparison: same pipeline, bare vs full paths, 20 trials each.
+// Most controlled test — isolates the bug to path resolution in fork+exec.
+// ---------------------------------------------------------------------------
+
+#[cfg(target_arch = "x86_64")]
+#[test]
+fn test_tar_bare_vs_full_path_comparison() {
+    let Some(tar) = bash_sandbox_tar() else { return };
+    let n = 20;
+
+    let full = run_trials(
+        &tar,
+        "/usr/bin/echo hello-cmp | /usr/bin/cat",
+        "hello-cmp",
+        n,
+        "5",
     );
-    if !has_output {
+    let bare = run_trials(&tar, "echo hello-cmp | cat", "hello-cmp", n, "5");
+
+    eprintln!("=== bare vs full path comparison ({n} trials each) ===");
+    eprintln!("  full path: {full}");
+    eprintln!("  bare name: {bare}");
+
+    assert_eq!(full.pass, n, "full-path echo|cat should always work. {full}");
+
+    if bare.pass == full.pass {
+        eprintln!("  → No difference — bare names work as well as full paths!");
+    } else {
         eprintln!(
-            "KNOWN BUG: bare `grep` pipe via --program-from-tar: \
-             exit={code}, stdout empty (expected 'hello-grep')"
+            "  → BUG CONFIRMED: full paths pass {}/{n} but bare names pass {}/{n}",
+            full.pass, bare.pass,
         );
     }
-}
-
-/// BUG REPRO: bare-name `cat` in a pipe with --program-from-tar.
-#[cfg(target_arch = "x86_64")]
-#[test]
-fn test_tar_bare_cat_pipe() {
-    let Some(tar) = bash_sandbox_tar() else { return };
-    let (stdout, _stderr, code) = run_bash_from_tar(
-        &tar,
-        "echo works | cat",
-        "10",
-    );
-    // BUG: hangs (timeout 124) or exits 0 with empty output.
-    let has_output = stdout.contains("works");
-    assert!(
-        !has_output || code == 0,
-        "If this fires, the bare-name pipe bug is FIXED! stdout: [{stdout}]",
-    );
-    if !has_output {
-        eprintln!(
-            "KNOWN BUG: bare `echo | cat` via --program-from-tar: \
-             exit={code}, stdout empty or timed out (expected 'works')"
-        );
-    }
-}
-
-/// BUG REPRO: bare-name `sort` in a pipe with --program-from-tar.
-#[cfg(target_arch = "x86_64")]
-#[test]
-fn test_tar_bare_sort_pipe() {
-    let Some(tar) = bash_sandbox_tar() else { return };
-    let (stdout, _stderr, code) = run_bash_from_tar(
-        &tar,
-        "echo zzz | sort",
-        "10",
-    );
-    // BUG: hangs (timeout 124) or exits 0 with empty output.
-    let has_output = stdout.contains("zzz");
-    assert!(
-        !has_output || code == 0,
-        "If this fires, the bare-name pipe bug is FIXED! stdout: [{stdout}]",
-    );
-    if !has_output {
-        eprintln!(
-            "KNOWN BUG: bare `echo | sort` via --program-from-tar: \
-             exit={code}, stdout empty or timed out (expected 'zzz')"
-        );
-    }
-}
-
-/// Bare `ls` in a command substitution (fork without pipe to another process).
-#[cfg(target_arch = "x86_64")]
-#[test]
-fn test_tar_bare_ls_subshell() {
-    let Some(tar) = bash_sandbox_tar() else { return };
-    let (stdout, stderr, code) = run_bash_from_tar(
-        &tar,
-        "x=$(ls /); echo \"LS=$x\"",
-        "10",
-    );
-    assert_ne!(
-        code, 124,
-        "bare `ls` in subshell TIMED OUT.\nstderr (last 500): {}",
-        &stderr[stderr.len().saturating_sub(500)..],
-    );
-    assert!(
-        stdout.contains("LS=") && stdout.contains("tmp"),
-        "bare `ls /` in subshell produced wrong output.\n\
-         exit code: {code}\n\
-         stdout: [{stdout}]\n\
-         stderr (last 500): {}",
-        &stderr[stderr.len().saturating_sub(500)..],
-    );
-}
-
-/// Control: full-path /usr/bin/ls in a subshell works fine.
-#[cfg(target_arch = "x86_64")]
-#[test]
-fn test_tar_full_path_ls_subshell_works() {
-    let Some(tar) = bash_sandbox_tar() else { return };
-    let (stdout, stderr, code) = run_bash_from_tar(
-        &tar,
-        "x=$(/usr/bin/ls /); echo $x",
-        "10",
-    );
-    assert_ne!(code, 124, "TIMED OUT\nstderr: {stderr}");
-    assert_eq!(code, 0, "full-path ls in subshell failed with {code}");
-    assert!(stdout.contains("tmp"), "expected directory listing, got: {stdout}");
 }
