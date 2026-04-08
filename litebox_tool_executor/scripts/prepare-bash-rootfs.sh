@@ -2,19 +2,16 @@
 # Prepare a rootfs tar containing common utilities + shared libraries
 # for use with the LiteBox sandbox demo.
 #
-# NOTE: This tar does NOT contain bash itself. Bash is loaded from the
-# host filesystem via --rewrite-syscalls. This tar provides:
-#   1. Utilities that bash forks+execs (cat, ls, grep, etc.)
-#   2. Shared library dependencies (libc, ld-linux, etc.)
+# Stages bash, common utilities, and shared libraries into a tar.
 #
 # Usage:
 #   ./prepare-bash-rootfs.sh [output.tar]
 #
 # The resulting tar is used with:
-#   litebox_runner_linux_userland --unstable --rewrite-syscalls \
-#     --initial-files <output.tar> \
-#     --env LD_LIBRARY_PATH=/lib64:/lib/x86_64-linux-gnu:/lib \
-#     /usr/bin/bash --norc --noprofile
+#   litebox_tool_executor --rootfs <output.tar> --interactive
+#   litebox_tool_executor --rootfs <output.tar> -- /usr/bin/bash -c 'echo hello'
+#   litebox_runner_linux_userland --unstable --initial-files <output.tar> \
+#     --program-from-tar -- /usr/bin/bash --norc --noprofile -c 'echo hello'
 
 set -euo pipefail
 

@@ -8,7 +8,7 @@
 #   .\View-AuditLog.ps1 -Path target\litebox-audit.jsonl
 #
 #   # Pipe from executor stderr:
-#   cargo run -p litebox_tool_executor -- --rootfs target\busybox-minimal.tar /bin/busybox echo hi 2>&1 |
+#   cargo run -p litebox_tool_executor -- --rootfs target\bash-sandbox.tar /usr/bin/bash -c "echo hi" 2>&1 |
 #     Where-Object { $_ -match '^\{' } |
 #     .\View-AuditLog.ps1
 #

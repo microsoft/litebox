@@ -970,3 +970,89 @@ fn test_busybox_shell_pipe() {
         &stderr[stderr.len().saturating_sub(500)..],
     );
 }
+
+/// Verify that the Linux userland platform's delayed-fork model handles
+/// multi-process external-command pipelines correctly.
+///
+/// Under delayed fork (vfork-like semantics), each fork() call blocks the
+/// parent until the child exec's. After exec, the child runs as an
+/// independent worker process. This means pipeline stages are spawned
+/// sequentially but run concurrently once exec'd — so data flows through
+/// the pipe even when it exceeds the kernel pipe buffer (64 KiB).
+///
+/// This test exercises:
+/// 1. Large data (>64 KiB) through a 2-stage external pipe
+/// 2. A 3-stage external pipeline (seq | head | cat)
+/// 3. A classic utility pipeline (ls | sort | uniq)
+#[cfg(target_arch = "x86_64")]
+#[test]
+fn test_multi_external_pipes_on_userland() {
+    let bash_path = run_which("bash");
+
+    // --- Test 1: large data through a 2-stage pipe ---
+    {
+        let output = Runner::new(Backend::Rewriter, &bash_path, "large_pipe_2stage")
+            .args([
+                "--norc",
+                "--noprofile",
+                "-c",
+                // seq produces ~588 KiB (well over the 64K pipe buffer).
+                // If delayed fork can't handle concurrent children, this deadlocks.
+                "/usr/bin/seq 1 100000 | /bin/cat > /dev/null && echo large-pipe-ok",
+            ])
+            .with_fs_path(|tar_dir| {
+                stage_host_binary(tar_dir, "cat", "/bin/cat");
+                stage_host_binary(tar_dir, "seq", "/usr/bin/seq");
+            })
+            .output();
+        let s = String::from_utf8_lossy(&output);
+        assert!(
+            s.contains("large-pipe-ok"),
+            "large 2-stage pipe failed:\n{s}",
+        );
+    }
+
+    // --- Test 2: 3-stage external-command pipeline ---
+    {
+        let output = Runner::new(Backend::Rewriter, &bash_path, "pipe_3stage")
+            .args([
+                "--norc",
+                "--noprofile",
+                "-c",
+                "/usr/bin/seq 1 100000 | /usr/bin/head -n 10 | /bin/cat",
+            ])
+            .with_fs_path(|tar_dir| {
+                stage_host_binary(tar_dir, "cat", "/bin/cat");
+                stage_host_binary(tar_dir, "seq", "/usr/bin/seq");
+                stage_host_binary(tar_dir, "head", "/usr/bin/head");
+            })
+            .output();
+        let s = String::from_utf8_lossy(&output);
+        // seq 1..10 should appear
+        assert!(s.contains("10"), "3-stage pipe missing expected output:\n{s}");
+    }
+
+    // --- Test 3: ls | sort | uniq (classic 3-stage utility pipeline) ---
+    {
+        let output = Runner::new(Backend::Rewriter, &bash_path, "ls_sort_uniq")
+            .args([
+                "--norc",
+                "--noprofile",
+                "-c",
+                // Create a few files then list + sort + dedup.
+                "echo a > /tmp/a; echo b > /tmp/b; \
+                 /bin/ls /tmp | /usr/bin/sort | /usr/bin/uniq",
+            ])
+            .with_fs_path(|tar_dir| {
+                stage_host_binary(tar_dir, "ls", "/bin/ls");
+                stage_host_binary(tar_dir, "sort", "/usr/bin/sort");
+                stage_host_binary(tar_dir, "uniq", "/usr/bin/uniq");
+            })
+            .output();
+        let s = String::from_utf8_lossy(&output);
+        assert!(
+            s.contains("a") && s.contains("b"),
+            "ls|sort|uniq failed:\n{s}",
+        );
+    }
+}

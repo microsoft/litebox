@@ -6,13 +6,20 @@ edition = "2024"
 [dependencies]
 anyhow = "1.0.97"
 clap = { version = "4.5.33", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Linux-only: spawn litebox_runner_linux_userland as subprocess
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+
+# Windows-only: in-process sandbox via litebox core APIs
+[target.'cfg(target_os = "windows")'.dependencies]
 litebox = { version = "0.1.0", path = "../litebox" }
 litebox_common_linux = { version = "0.1.0", path = "../litebox_common_linux" }
 litebox_platform_windows_userland = { version = "0.1.0", path = "../litebox_platform_windows_userland" }
 litebox_platform_multiplex = { version = "0.1.0", path = "../litebox_platform_multiplex", default-features = false, features = ["platform_windows_userland"] }
 litebox_shim_linux = { version = "0.1.0", path = "../litebox_shim_linux", default-features = false, features = ["platform_windows_userland", "audit_log", "policy"] }
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
 windows-sys = { version = "0.60.2", features = ["Win32_System_Console"] }
 
 [dev-dependencies]

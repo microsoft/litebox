@@ -96,7 +96,7 @@ fn executor_exe() -> std::path::PathBuf {
     path
 }
 
-/// Helper: get or create the busybox rootfs tar for process-level tests.
+/// Helper: get or create a rootfs tar for process-level tests.
 /// Reuses the same rewritten hello_world_static binary in a tar.
 fn test_rootfs_tar() -> Vec<u8> {
     let bin_path = concat!(
@@ -162,12 +162,12 @@ fn write_temp_tar() -> std::path::PathBuf {
     tar_path
 }
 
-/// Helper: get the busybox rootfs tar if it exists on disk.
-/// Returns None if the rootfs hasn't been built yet (WSL2 prerequisite).
-fn busybox_tar_path() -> Option<std::path::PathBuf> {
+/// Helper: get the bash rootfs tar if it exists on disk.
+/// Returns None if the rootfs hasn't been built yet (run prepare-bash-rootfs.sh).
+fn bash_tar_path() -> Option<std::path::PathBuf> {
     let path = std::path::PathBuf::from(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/../target/busybox-minimal.tar"
+        "/../target/bash-sandbox.tar"
     ));
     if path.exists() { Some(path) } else { None }
 }
@@ -188,18 +188,18 @@ fn run_direct(tar_path: &std::path::Path, args: &[&str]) -> (String, i32) {
     (stdout, code)
 }
 
-/// Direct mode with busybox: simple echo produces output.
+/// Direct mode with bash: simple echo produces output.
 #[test]
 fn test_direct_echo() {
     let exe = executor_exe();
     if !exe.exists() {
         return;
     }
-    let Some(tar_path) = busybox_tar_path() else {
-        eprintln!("Skipping: busybox-minimal.tar not found (run prepare-rootfs.sh in WSL2)");
+    let Some(tar_path) = bash_tar_path() else {
+        eprintln!("Skipping: bash-sandbox.tar not found (run prepare-bash-rootfs.sh in WSL2)");
         return;
     };
-    let (stdout, _code) = run_direct(&tar_path, &["/bin/busybox", "sh", "-c", "echo hello"]);
+    let (stdout, _code) = run_direct(&tar_path, &["/usr/bin/bash", "-c", "echo hello"]);
     assert!(
         stdout.contains("hello"),
         "Expected 'hello' in stdout, got: {stdout}"
@@ -210,19 +210,19 @@ fn test_direct_echo() {
     );
 }
 
-/// Direct mode with busybox: double-quoted strings pass through correctly.
+/// Direct mode with bash: double-quoted strings pass through correctly.
 #[test]
 fn test_direct_quoted_echo() {
     let exe = executor_exe();
     if !exe.exists() {
         return;
     }
-    let Some(tar_path) = busybox_tar_path() else {
+    let Some(tar_path) = bash_tar_path() else {
         return;
     };
     let (stdout, _code) = run_direct(
         &tar_path,
-        &["/bin/busybox", "sh", "-c", r#"echo "hello world""#],
+        &["/usr/bin/bash", "-c", r#"echo "hello world""#],
     );
     assert!(
         stdout.contains("hello world"),
@@ -230,19 +230,19 @@ fn test_direct_quoted_echo() {
     );
 }
 
-/// Direct mode with busybox: multiple words without quotes.
+/// Direct mode with bash: multiple words without quotes.
 #[test]
 fn test_direct_echo_multiple_words() {
     let exe = executor_exe();
     if !exe.exists() {
         return;
     }
-    let Some(tar_path) = busybox_tar_path() else {
+    let Some(tar_path) = bash_tar_path() else {
         return;
     };
     let (stdout, _code) = run_direct(
         &tar_path,
-        &["/bin/busybox", "sh", "-c", "echo one two three"],
+        &["/usr/bin/bash", "-c", "echo one two three"],
     );
     assert!(
         stdout.contains("one two three"),
