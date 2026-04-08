@@ -147,14 +147,7 @@ pub fn hook_syscalls_in_elf(
     fixup_phdr_alignment(buf);
 
     // Parse the ELF and extract all metadata we need, then drop the borrow so we can mutate buf.
-    let (
-        arch,
-        dl_sysinfo_int80,
-        text_sections,
-        control_transfer_targets,
-        trampoline_base_addr,
-        fork_to_vfork_patch,
-    ) = {
+    let (arch, dl_sysinfo_int80, text_sections, control_transfer_targets, trampoline_base_addr) = {
         let file = object::File::parse(&*buf).map_err(|e| Error::ParseError(e.to_string()))?;
 
         let arch = match file {
@@ -179,15 +172,12 @@ pub fn hook_syscalls_in_elf(
 
         let trampoline_base_addr = find_addr_for_trampoline_code(&file)?;
 
-        let fork_to_vfork_patch = find_fork_vfork_patch(&file, &text_sections);
-
         (
             arch,
             dl_sysinfo_int80,
             text_sections,
             control_transfer_targets,
             trampoline_base_addr,
-            fork_to_vfork_patch,
         )
     };
 
@@ -217,39 +207,6 @@ pub fn hook_syscalls_in_elf(
         ) {
             Ok(()) | Err(Error::NoSyscallInstructionsFound) => {}
             Err(e) => return Err(e),
-        }
-    }
-
-    // Patch fork → vfork: overwrite the first bytes of __libc_fork with a
-    // JMP to __libc_vfork. This prevents glibc's fork wrapper from running
-    // post-fork handlers that corrupt shared state under vfork semantics.
-    if let Some((fork_file_offset, fork_func_end, mut rel32)) = fork_to_vfork_patch {
-        const ENDBR64: [u8; 4] = [0xF3, 0x0F, 0x1E, 0xFA];
-        #[allow(clippy::cast_possible_truncation)]
-        let mut off = fork_file_offset as usize;
-        #[allow(clippy::cast_possible_truncation)]
-        let func_end = fork_func_end as usize;
-
-        // If fork starts with endbr64 (F3 0F 1E FA), preserve it by placing
-        // the JMP after it. This keeps CET/IBT indirect-branch targets valid.
-        if off + 4 <= buf.len() && buf[off..off + 4] == ENDBR64 {
-            off += 4;
-            rel32 = rel32.wrapping_sub(4); // JMP is now 4 bytes later, adjust displacement
-        }
-
-        if off + 5 <= func_end && func_end <= buf.len() {
-            buf[off] = 0xE9; // JMP rel32
-            buf[off + 1..off + 5].copy_from_slice(&rel32.to_le_bytes());
-            // NOP-fill remaining bytes of the fork function body after the JMP
-            // to avoid leaving stale instructions that could be jumped into.
-            for b in &mut buf[off + 5..func_end] {
-                *b = 0x90; // NOP
-            }
-        } else {
-            return Err(Error::ParseError(format!(
-                "fork→vfork patch range {off:#x}..{func_end:#x} is invalid for buffer length {}",
-                buf.len(),
-            )));
         }
     }
 
@@ -672,101 +629,6 @@ fn fixup_phdr_alignment(buf: &mut [u8]) {
             // The PHDR segment size should match the phdr table; no change needed.
         }
     }
-}
-
-/// Find fork and vfork symbols in the ELF and compute the patch needed to
-/// redirect fork -> vfork. Returns `Some((fork_file_offset, fork_func_end, jmp_rel32))` if
-/// both symbols are found, or `None` if this binary doesn't export fork.
-///
-/// `fork_func_end` is the file offset of the end of the fork function (based on
-/// the symbol's size), clamped to the section boundary. This is used to NOP-fill
-/// only the fork function body after the JMP, not the rest of the section.
-fn find_fork_vfork_patch(
-    file: &object::File<'_>,
-    text_sections: &[TextSectionInfo],
-) -> Option<(u64, u64, i32)> {
-    use object::ObjectSymbol as _;
-
-    let mut fork_vaddr = None;
-    let mut fork_size = None;
-    let mut vfork_vaddr = None;
-
-    // Restrict this rewrite to libc-specific symbols. Plain `fork`/`vfork` names may belong to
-    // arbitrary DSOs or user code, and retargeting them would silently change unrelated behavior.
-    for sym in file.dynamic_symbols() {
-        if sym.kind() != object::SymbolKind::Text {
-            continue;
-        }
-        let Ok(name) = sym.name() else { continue };
-        match name {
-            "__libc_fork" if fork_vaddr.is_none() => {
-                fork_vaddr = Some(sym.address());
-                fork_size = Some(sym.size());
-            }
-            "__libc_vfork" | "__vfork" if vfork_vaddr.is_none() => {
-                vfork_vaddr = Some(sym.address());
-            }
-            _ => {}
-        }
-    }
-
-    for sym in file.symbols() {
-        if sym.kind() != object::SymbolKind::Text {
-            continue;
-        }
-        let Ok(name) = sym.name() else { continue };
-        match name {
-            "__libc_fork" if fork_vaddr.is_none() => {
-                fork_vaddr = Some(sym.address());
-                fork_size = Some(sym.size());
-            }
-            "__libc_vfork" | "__vfork" if vfork_vaddr.is_none() => {
-                vfork_vaddr = Some(sym.address());
-            }
-            _ => {}
-        }
-    }
-
-    let fork_vaddr = fork_vaddr?;
-    let fork_size = fork_size?;
-    let vfork_vaddr = vfork_vaddr?;
-    if fork_vaddr == 0 || vfork_vaddr == 0 {
-        return None;
-    }
-
-    // Convert fork's vaddr to a file offset using the text sections.
-    let (fork_file_offset, fork_func_end) = text_sections.iter().find_map(|s| {
-        let section_end = s.vaddr + s.size;
-        if fork_vaddr >= s.vaddr
-            && fork_vaddr < section_end
-            && fork_vaddr
-                .checked_add(5)
-                .is_some_and(|end| end <= section_end)
-        {
-            let file_offset = s.file_offset + (fork_vaddr - s.vaddr);
-            let section_file_end = s.file_offset + s.size;
-            // Compute the end of the fork function, clamped to the section boundary.
-            let func_file_end = if fork_size > 0 {
-                (file_offset + fork_size).min(section_file_end)
-            } else {
-                // No size info — only NOP-fill the JMP itself (no extra NOPs).
-                file_offset + 5
-            };
-            Some((file_offset, func_file_end))
-        } else {
-            None
-        }
-    })?;
-
-    // Compute the relative offset for a JMP rel32 instruction.
-    // JMP rel32 encodes: target = rip_after_jmp + rel32
-    // rip_after_jmp = fork_vaddr + 5 (size of JMP rel32 instruction)
-    let rel32 = i64::try_from(vfork_vaddr)
-        .ok()?
-        .checked_sub(i64::try_from(fork_vaddr).ok()? + 5)?;
-    let rel32 = i32::try_from(rel32).ok()?;
-
-    Some((fork_file_offset, fork_func_end, rel32))
 }
 
 /// Check if the input binary has the Bun footer marker at the end.
