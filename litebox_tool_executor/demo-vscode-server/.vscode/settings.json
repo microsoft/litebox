@@ -1,0 +1,50 @@
+{
+    // ================================================================
+    // LiteBox VS Code Server: Full agent sandboxing
+    // ================================================================
+    //
+    // This configures VS Code to connect to a LiteBox sandbox as if it
+    // were a remote SSH host. All agent operations (file read/write,
+    // search, terminal, extensions) execute inside the sandbox.
+    //
+    // Prerequisites:
+    //   1. Build the rootfs:
+    //      wsl -d Ubuntu -- bash scripts/prepare-vscode-rootfs-staged.sh
+    //   2. Build the binaries in WSL2:
+    //      wsl -d Ubuntu -- bash -c 'cd /mnt/c/src/litebox-vscode-server && cargo build -p litebox_tool_executor -p litebox_broker -p litebox_runner_linux_userland'
+    //
+    // Usage:
+    //   1. Open this folder in VS Code
+    //   2. Add to ~/.ssh/config:  Host litebox\n    HostName litebox
+    //   3. Ctrl+Shift+P -> "Remote-SSH: Connect to Host..." -> litebox
+    //   4. VS Code connects to the LiteBox sandbox via stdio transport
+    //
+    // How it works:
+    //   VS Code Remote-SSH calls the shim instead of real ssh.
+    //   The shim launches litebox_tool_executor --vscode-server via WSL2.
+    //   The VS Code Remote protocol runs over inherited stdin/stdout,
+    //   same transport mechanism as docker exec -i.
+
+    // Override the SSH binary with our LiteBox shim
+    "remote.SSH.path": "C:\\src\\litebox-vscode-server\\litebox_tool_executor\\scripts\\litebox-ssh-shim.ps1",
+
+    // Show the login terminal so we can see the LiteBox startup output
+    "remote.SSH.showLoginTerminal": true,
+
+    // Terminal profiles (for shell-only sandboxing as fallback)
+    "terminal.integrated.profiles.windows": {
+        "LiteBox Sandbox (WSL2)": {
+            "path": "wsl.exe",
+            "args": ["-d", "Ubuntu", "--",
+                "/mnt/c/src/litebox-vscode-server/target/debug/litebox_tool_executor",
+                "--rootfs", "/home/wportnoy/vscode-rootfs",
+                "--interactive"
+            ],
+            "icon": "shield"
+        },
+        "PowerShell": {
+            "path": "powershell.exe",
+            "icon": "terminal-powershell"
+        }
+    }
+}
