@@ -20,7 +20,10 @@ param(
 
     [string]$Path,
 
-    [string]$Filter
+    [string]$Filter,
+
+    ## Optional prefix string to prepend to each output line (e.g., "[A] ").
+    [string]$Prefix = ""
 )
 
 begin {
@@ -78,6 +81,9 @@ begin {
             $resultStr = "ERR $($evt.result.err)"
         }
 
+        if ($Prefix) {
+            Write-Host -NoNewline -ForegroundColor DarkGray $Prefix
+        }
         Write-Host -NoNewline -ForegroundColor $color "$name"
         Write-Host -NoNewline "($argStr) "
         if ($null -ne $evt.result.err) {
