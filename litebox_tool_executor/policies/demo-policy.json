@@ -6,6 +6,14 @@
     },
     "network": {
         "deny_all": true,
-        "allow_connect": []
+        "allow_connect": [
+            "api.github.com:443",
+            "github.com:443",
+            "*.githubusercontent.com:443",
+            "pypi.org:443",
+            "*.pypi.org:443",
+            "registry.npmjs.org:443",
+            "*.npmjs.org:443"
+        ]
     }
 }
