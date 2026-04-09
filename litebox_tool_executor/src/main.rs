@@ -71,7 +71,7 @@ fn main() -> anyhow::Result<()> {
     };
 
     // Print binary build times for diagnostics.
-    print_build_info();
+    print_build_info(audit_log_file.as_deref());
 
     if cli.interactive {
         interactive(&cli, audit_log_file.as_deref())
@@ -114,19 +114,22 @@ fn create_audit_log_file(dir: &std::path::Path) -> anyhow::Result<std::path::Pat
     Ok(path)
 }
 
-/// Print build timestamps of this binary and the runner for diagnostics.
-fn print_build_info() {
+/// Print build timestamps of this binary, the runner, and the broker for diagnostics.
+/// Writes to both stderr (visible in terminal) and the audit log file (if provided).
+fn print_build_info(audit_log_file: Option<&std::path::Path>) {
+    let mut lines = Vec::new();
+
     if let Ok(exe) = std::env::current_exe() {
         if let Ok(meta) = std::fs::metadata(&exe) {
             if let Ok(modified) = meta.modified() {
                 let age = std::time::SystemTime::now()
                     .duration_since(modified)
                     .unwrap_or_default();
-                eprintln!(
+                lines.push(format!(
                     "Tool executor: {} (built {}s ago)",
                     exe.display(),
                     age.as_secs()
-                );
+                ));
             }
         }
     }
@@ -136,11 +139,43 @@ fn print_build_info() {
                 let age = std::time::SystemTime::now()
                     .duration_since(modified)
                     .unwrap_or_default();
-                eprintln!(
+                lines.push(format!(
                     "Runner: {} (built {}s ago)",
                     runner.display(),
                     age.as_secs()
-                );
+                ));
+            }
+        }
+    }
+    if let Ok(broker) = find_broker() {
+        if let Ok(meta) = std::fs::metadata(&broker) {
+            if let Ok(modified) = meta.modified() {
+                let age = std::time::SystemTime::now()
+                    .duration_since(modified)
+                    .unwrap_or_default();
+                lines.push(format!(
+                    "Broker: {} (built {}s ago)",
+                    broker.display(),
+                    age.as_secs()
+                ));
+            }
+        }
+    }
+
+    for line in &lines {
+        eprintln!("{line}");
+    }
+
+    // Also write to the audit log file so the tail script can show them.
+    if let Some(path) = audit_log_file {
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+        {
+            use std::io::Write;
+            for line in &lines {
+                let _ = writeln!(f, "# {line}");
             }
         }
     }

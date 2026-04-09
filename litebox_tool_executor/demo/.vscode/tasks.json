@@ -7,8 +7,10 @@
             "command": "powershell.exe",
             "args": [
                 "-NoProfile",
-                "-Command",
-                "$dir = 'C:\\src\\litebox\\target\\litebox-audit'; Write-Host 'Watching audit logs in:' $dir -ForegroundColor DarkGray; $seen = @{}; $labels = @{}; $nextLabel = 0; while ($true) { if (Test-Path $dir) { Get-ChildItem $dir -Filter '*.jsonl' | Sort-Object Name | ForEach-Object { $p = $_.FullName; if (-not $seen.ContainsKey($p)) { $seen[$p] = (Get-Content $p).Count; $lbl = [char]([int][char]'A' + ($nextLabel++ % 26)); $labels[$p] = $lbl; Write-Host \"[$lbl] New session: $($_.Name)\" -ForegroundColor Cyan }; $lbl = $labels[$p]; $lines = Get-Content $p; if ($lines.Count -gt $seen[$p]) { $lines[$seen[$p]..($lines.Count-1)] | ForEach-Object { if ($_ -match '^\\{') { try { $o = $_ | ConvertFrom-Json; Write-Host \"[$lbl] $($o.syscall)($($o.args | ForEach-Object { $_.PSObject.Properties.Value }) -join ', ') = $($o.result.PSObject.Properties.Value)\" } catch {} } }; $seen[$p] = $lines.Count } } }; Start-Sleep -Milliseconds 250 }"
+                "-ExecutionPolicy", "Bypass",
+                "-File",
+                "C:\\src\\litebox\\litebox_tool_executor\\scripts\\Tail-AuditLog.ps1",
+                "-Raw"
             ],
             "problemMatcher": [],
             "presentation": {
@@ -24,8 +26,8 @@
             "args": [
                 "-NoProfile",
                 "-ExecutionPolicy", "Bypass",
-                "-Command",
-                "$dir = 'C:\\src\\litebox\\target\\litebox-audit'; Write-Host 'Watching audit logs in:' $dir -ForegroundColor DarkGray; $seen = @{}; $labels = @{}; $nextLabel = 0; while ($true) { if (Test-Path $dir) { Get-ChildItem $dir -Filter '*.jsonl' | Sort-Object Name | ForEach-Object { $p = $_.FullName; if (-not $seen.ContainsKey($p)) { $seen[$p] = (Get-Content $p).Count; $lbl = [char]([int][char]'A' + ($nextLabel++ % 26)); $labels[$p] = $lbl; Write-Host \"[$lbl] New session: $($_.Name)\" -ForegroundColor Cyan; $bp = $p -replace '\\.jsonl$','.broker.log'; if (-not $seen.ContainsKey($bp)) { $seen[$bp] = 0 } }; $lbl = $labels[$p]; $lines = Get-Content $p; if ($lines.Count -gt $seen[$p]) { $lines[$seen[$p]..($lines.Count-1)] | & 'C:\\src\\litebox\\litebox_tool_executor\\scripts\\View-AuditLog.ps1' -Prefix \"[$lbl] \"; $seen[$p] = $lines.Count }; $bp = $p -replace '\\.jsonl$','.broker.log'; if (Test-Path $bp) { $bl = Get-Content $bp; if ($bl.Count -gt $seen[$bp]) { $bl[$seen[$bp]..($bl.Count-1)] | ForEach-Object { Write-Host \"[$lbl] $_\" -ForegroundColor DarkGray }; $seen[$bp] = $bl.Count } } } }; Start-Sleep -Milliseconds 250 }"
+                "-File",
+                "C:\\src\\litebox\\litebox_tool_executor\\scripts\\Tail-AuditLog.ps1"
             ],
             "problemMatcher": [],
             "runOptions": {

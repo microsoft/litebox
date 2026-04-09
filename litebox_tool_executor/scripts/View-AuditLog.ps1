@@ -98,6 +98,9 @@ process {
     if ($InputLine) {
         if ($InputLine -match '^\{') {
             Format-Event $InputLine
+        } elseif ($InputLine -match '^#') {
+            if ($Prefix) { Write-Host -NoNewline -ForegroundColor DarkGray $Prefix }
+            Write-Host -ForegroundColor DarkYellow $InputLine.Substring(2)
         }
     }
 }
@@ -122,6 +125,8 @@ end {
         Get-Content $resolvedPath | ForEach-Object {
             if ($_ -match '^\{') {
                 Format-Event $_
+            } elseif ($_ -match '^#') {
+                Write-Host -ForegroundColor DarkYellow $_.Substring(2)
             }
         }
     }
