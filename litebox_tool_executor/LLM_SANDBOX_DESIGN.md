@@ -20,6 +20,8 @@
   - [Comparison Matrix](#comparison-matrix)
 - [Implementation](#implementation)
   - [Architecture](#architecture)
+    - [Process Architecture](#process-architecture)
+    - [Network Request Flow](#network-request-flow-eg-wget-httpsapigithubcomzen)
   - [Phase 1: Audit Logging](#phase-1-audit-logging)
   - [Phase 2: Tool Executor](#phase-2-tool-executor)
   - [Phase 3: Policy Enforcement](#phase-3-policy-enforcement)
@@ -290,6 +292,113 @@ VS Code (Copilot Agent Mode)
 ```
 
 **Key design decision**: The interactive shell runs a persistent bash session inside a single sandbox. Stdin is piped through a bridge thread (not inherited as a TTY) to prevent bash from enabling job control, which fails in the sandbox because `setpgid` returns `EPERM` for the session-leader init process. Shell state (`cd`, environment variables, file modifications) persists across commands.
+
+#### Process Architecture
+
+The tool executor spawns two child processes: a **broker** (policy enforcement, network proxy) and a **runner** (sandbox execution). The guest's rewritten binaries run inside the runner, with every syscall intercepted by the shim.
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│  Windows Host                                               │
+│                                                             │
+│  ┌─────────────────────────────────────────────────────┐    │
+│  │  VS Code                                            │    │
+│  │  Terminal Profile: "LiteBox Sandbox (WSL2)"         │    │
+│  │  └─→ wsl.exe -d Ubuntu -- litebox_tool_executor ... │    │
+│  └──────────────────────┬──────────────────────────────┘    │
+│                         │ stdin/stdout/stderr               │
+│  ┌──────────────────────▼──────────────────────────────┐    │
+│  │  WSL2 (Ubuntu)                Linux userland         │    │
+│  │                                                      │    │
+│  │  ┌──────────────────────────────────────────────┐    │    │
+│  │  │  litebox_tool_executor                       │    │    │
+│  │  │  • Parses --rootfs, --policy, --audit-log    │    │    │
+│  │  │  • Spawns broker + runner as children        │    │    │
+│  │  │  • Bridges stdin → runner (pipe)             │    │    │
+│  │  └────┬───────────────────┬─────────────────────┘    │    │
+│  │       │ spawn             │ spawn                    │    │
+│  │       ▼                   ▼                          │    │
+│  │  ┌──────────────┐   ┌─────────────────────────────┐  │    │
+│  │  │ litebox_     │   │ litebox_runner_              │  │    │
+│  │  │ broker       │   │ linux_userland               │  │    │
+│  │  │              │   │                              │  │    │
+│  │  │ ┌──────────┐ │   │ ┌──────────────────────────┐ │  │    │
+│  │  │ │ smoltcp  │ │◄──┼─┤ Platform                 │ │  │    │
+│  │  │ │ TCP/IP   │ │IPC│ │ (linux_userland)          │ │  │    │
+│  │  │ │ stack    │ │   │ │ • IPC ↔ broker smoltcp   │ │  │    │
+│  │  │ └──────────┘ │   │ │ • Syscall interception   │ │  │    │
+│  │  │              │   │ │   (binary rewriter)      │ │  │    │
+│  │  │ ┌──────────┐ │   │ └──────────┬───────────────┘ │  │    │
+│  │  │ │ DNS      │ │   │            │                 │  │    │
+│  │  │ │ Tracker  │ │   │ ┌──────────▼───────────────┐ │  │    │
+│  │  │ │ IP→host  │ │   │ │ Shim (litebox_shim_linux)│ │  │    │
+│  │  │ └──────────┘ │   │ │ • Virtual FS (tar + /tmp)│ │  │    │
+│  │  │              │   │ │ • Virtual network stack  │ │  │    │
+│  │  │ ┌──────────┐ │   │ │ • Syscall emulation     │ │  │    │
+│  │  │ │ Sandbox  │ │   │ │ • Process management    │ │  │    │
+│  │  │ │ Policy   │ │   │ └──────────┬───────────────┘ │  │    │
+│  │  │ │ • FS     │ │   │            │                 │  │    │
+│  │  │ │   globs  │ │   │ ┌──────────▼───────────────┐ │  │    │
+│  │  │ │ • Net    │ │   │ │ Guest: bash + wget       │ │  │    │
+│  │  │ │   hosts  │ │   │ │ (rewritten ELF binaries) │ │  │    │
+│  │  │ └──────────┘ │   │ │                          │ │  │    │
+│  │  └──────┬───────┘   │ │ All syscalls intercepted │ │  │    │
+│  │         │            │ │ by rewritten instructions│ │  │    │
+│  │         │            │ └──────────────────────────┘ │  │    │
+│  │         │            └──────────────────────────────┘  │    │
+│  └─────────┼──────────────────────────────────────────────┘    │
+│            │ real TCP/UDP sockets                               │
+└────────────┼───────────────────────────────────────────────────┘
+             ▼  Internet
+```
+
+**Key trust boundary**: The broker runs in a separate process from the runner. Even if the guest compromises the shim, it cannot tamper with policy enforcement — the broker enforces policy on the host side of the IPC channel.
+
+#### Network Request Flow (e.g., `wget https://api.github.com/zen`)
+
+```
+Guest wget              Shim              Platform/IPC        Broker                  Internet
+   │                      │                    │                  │                       │
+   │  DNS Resolution:     │                    │                  │                       │
+   ├─socket(AF_INET,─────►│                    │                  │                       │
+   │  DGRAM)              │                    │                  │                       │
+   ├─connect(10.0.0.1:53)►│                    │                  │                       │
+   ├─sendmmsg(DNS query)─►│───────────────────►│ IP pkt via IPC   │                       │
+   │                      │                    │─────────────────►│                       │
+   │                      │                    │                  ├─track query            │
+   │                      │                    │                  │  (id→hostname)         │
+   │                      │                    │                  ├─rewrite dst to         │
+   │                      │                    │                  │  host DNS resolver     │
+   │                      │                    │                  ├─UDP send───────────────►
+   │                      │                    │                  │◄──DNS response─────────┤
+   │                      │                    │                  ├─track: IP →            │
+   │                      │                    │                  │  "api.github.com"      │
+   │                      │                    │◄─────────────────┤                       │
+   │◄─────────────────────┤◄───────────────────┤                  │                       │
+   │  getaddrinfo → IP    │                    │                  │                       │
+   │                      │                    │                  │                       │
+   │  TCP Connection:     │                    │                  │                       │
+   ├─socket(AF_INET,─────►│                    │                  │                       │
+   │  STREAM)             │                    │                  │                       │
+   ├─connect(IP:443)─────►│───────────────────►│ TCP SYN packet   │                       │
+   │                      │                    │─────────────────►│                       │
+   │                      │                    │                  ├─lookup(IP) →           │
+   │                      │                    │                  │  "api.github.com"      │
+   │                      │                    │                  ├─check_connect()        │
+   │                      │                    │                  │  → ALLOW ✓             │
+   │                      │                    │                  ├─host TCP connect───────►
+   │                      │                    │◄─SYN-ACK─────────┤◄──────────────────────┤
+   │◄─connect() returns───┤◄───────────────────┤                  │                       │
+   │                      │                    │                  │                       │
+   │  Data Relay:         │                    │                  │                       │
+   ├─write(TLS hello)────►│═══════════════════►│═════════════════►│═══════════════════════►
+   │◄─read(TLS resp)──────┤◄══════════════════─┤◄════════════════─┤◄═════════════════════─┤
+   │  ... HTTP GET ...    │                    │                  │                       │
+   │◄─"Keep it logically  │                    │                  │                       │
+   │   awesome."          │                    │                  │                       │
+```
+
+If the destination hostname is **not** in the policy's `allow_connect` list, the broker silently drops the TCP SYN. The guest's `connect()` hangs until it times out — no connection is ever established on the host side.
 
 ### Phase 1: Audit Logging
 
