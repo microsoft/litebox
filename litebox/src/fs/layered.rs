@@ -688,7 +688,7 @@ impl<
         flags: OFlags,
         mode: Mode,
     ) -> Result<FileFd<Platform, Upper, Lower>, OpenError> {
-        let flags = flags - OFlags::PATH;
+        let mut flags = flags - OFlags::PATH;
         let currently_supported_oflags: OFlags = OFlags::CREAT
             | OFlags::RDONLY
             | OFlags::WRONLY
@@ -702,8 +702,11 @@ impl<
             | OFlags::NOFOLLOW
             | OFlags::APPEND
             | OFlags::PATH;
-        if flags.intersects(currently_supported_oflags.complement()) {
-            unimplemented!("{flags:?}")
+        let unsupported = flags & currently_supported_oflags.complement();
+        if !unsupported.is_empty() {
+            // Strip unsupported flags rather than panicking — Node.js/V8 may
+            // pass platform-specific flags that are harmless to ignore.
+            flags = flags & currently_supported_oflags;
         }
         let path = self.absolute_path(path)?;
         if self.has_tombstoned_ancestor(&path)? {

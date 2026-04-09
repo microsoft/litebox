@@ -426,6 +426,10 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         Option<alloc::borrow::Cow<'static, [u8]>>,
     ) = if cli_args.program_from_tar {
         (Vec::new(), None)
+    } else if cli_args.nine_p_broker.is_some() {
+        // When a 9P broker is active, the program will be loaded from the 9P
+        // filesystem — skip the host existence check and host-side read.
+        (Vec::new(), None)
     } else {
         let prog = resolve_host_program_path(&cli_args.program_and_arguments[0]);
         if !prog.exists() {
@@ -438,31 +442,27 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
             }
             anyhow::bail!(msg);
         }
-        if cli_args.nine_p_broker.is_some() {
-            (Vec::new(), None)
-        } else {
-            let ancestors: Vec<_> = prog.ancestors().collect();
-            let modes: Vec<_> = ancestors
-                .into_iter()
-                .rev()
-                .skip(1)
-                .map(|path| {
-                    let metadata = path.metadata().unwrap();
-                    (
-                        litebox::fs::Mode::from_bits(metadata.st_mode()).unwrap(),
-                        metadata.st_uid(),
-                    )
-                })
-                .collect();
-            let file = mmapped_file(&prog)?;
-            let data = initial_program_data(
-                file,
-                cli_args.rewrite_syscalls,
-                &mut cow_eligible_regions,
-                &prog,
-            )?;
-            (modes, Some(data))
-        }
+        let ancestors: Vec<_> = prog.ancestors().collect();
+        let modes: Vec<_> = ancestors
+            .into_iter()
+            .rev()
+            .skip(1)
+            .map(|path| {
+                let metadata = path.metadata().unwrap();
+                (
+                    litebox::fs::Mode::from_bits(metadata.st_mode()).unwrap(),
+                    metadata.st_uid(),
+                )
+            })
+            .collect();
+        let file = mmapped_file(&prog)?;
+        let data = initial_program_data(
+            file,
+            cli_args.rewrite_syscalls,
+            &mut cow_eligible_regions,
+            &prog,
+        )?;
+        (modes, Some(data))
     };
     let tar_data: &'static [u8] = if let Some(tar_file) = cli_args.initial_files.as_ref() {
         if tar_file.extension().and_then(|x| x.to_str()) != Some("tar") {
