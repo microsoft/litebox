@@ -9,23 +9,24 @@
     //   2. Build the binaries in WSL2:
     //      wsl -d Ubuntu -- bash -c 'cd /mnt/c/src/litebox-vscode-server && cargo build -p litebox_tool_executor -p litebox_broker -p litebox_runner_linux_userland'
     //
-    // Setup (one-time, in your Default profile user settings — Ctrl+Shift+P
-    // → "Preferences: Open User Settings (JSON)"):
+    // Setup:
+    //   remote.SSH.path and remote.SSH.showLoginTerminal have application
+    //   scope. To avoid affecting your normal SSH workflows, create a
+    //   dedicated VS Code profile:
     //
-    //   "remote.SSH.path": "C:\\src\\litebox-vscode-server\\litebox_tool_executor\\scripts\\litebox-ssh-shim.ps1",
-    //   "remote.SSH.showLoginTerminal": true,
-    //
-    // These settings have application scope and CANNOT be set per-workspace.
-    //
-    // Also add to ~/.ssh/config:
-    //   Host litebox
-    //     HostName litebox
+    //   1. File → Preferences → Profiles → Create Profile → name it "LiteBox"
+    //   2. In the LiteBox profile's user settings (JSON), add:
+    //        "remote.SSH.path": "C:\\src\\litebox-vscode-server\\litebox_tool_executor\\scripts\\litebox-ssh-shim.ps1",
+    //        "remote.SSH.showLoginTerminal": true
+    //   3. The shim only intercepts host "litebox" — all other SSH
+    //      connections fall through to real ssh unchanged.
     //
     // Usage:
-    //   1. Ctrl+Shift+P -> "Remote-SSH: Connect to Host..." -> litebox
-    //   2. VS Code connects to the LiteBox sandbox via stdio transport
-    //   3. All agent operations execute inside the sandbox
-    //   4. Logs: /tmp/litebox-vscode-server-logs/*.{jsonl,broker.log,server.log}
+    //   1. Switch to the "LiteBox" profile
+    //   2. Ctrl+Shift+P → "Remote-SSH: Connect to Host..." → litebox
+    //   3. VS Code connects to the LiteBox sandbox via stdio transport
+    //   4. All operations execute inside the sandbox
+    //   5. Logs: /tmp/litebox-vscode-server-logs/*.{jsonl,broker.log,server.log}
 
     // Terminal profiles (for shell-only sandboxing as fallback)
     "terminal.integrated.profiles.windows": {

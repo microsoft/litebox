@@ -1,22 +1,19 @@
 #!/usr/bin/env pwsh
-# litebox-ssh-shim.ps1 — VS Code Remote-SSH shim for LiteBox
+# litebox-ssh-shim.ps1 — Drop-in SSH replacement for VS Code Remote-SSH
 #
-# This acts as a drop-in replacement for the SSH binary. VS Code's
-# Remote-SSH extension calls it with SSH-style arguments; the shim
-# ignores them and instead launches VS Code Server inside a LiteBox
-# sandbox via WSL2 with inherited stdio.
+# This shim intercepts connections to host "litebox" and routes them through
+# a LiteBox sandbox. All other hosts pass through to real SSH unchanged.
 #
-# Configure VS Code:
+# Setup (one-time, in VS Code Default profile user settings):
 #   "remote.SSH.path": "C:\\src\\litebox-vscode-server\\litebox_tool_executor\\scripts\\litebox-ssh-shim.ps1"
+#   "remote.SSH.showLoginTerminal": true
 #
-# Then add to your SSH config (~/.ssh/config):
-#   Host litebox
-#     HostName litebox
+# NOTE: remote.SSH.path has application scope — it affects all Remote-SSH
+# connections. This shim preserves normal SSH behavior for non-litebox hosts
+# by falling through to the real ssh binary. For full isolation, use a
+# dedicated VS Code profile (File → Preferences → Profiles → Create Profile).
 #
-# Connect via: Ctrl+Shift+P → "Remote-SSH: Connect to Host..." → litebox
-#
-# The VS Code Remote protocol runs over stdin/stdout — same transport
-# as docker exec -i or real SSH.
+# Then connect: Ctrl+Shift+P → "Remote-SSH: Connect to Host..." → litebox
 
 param(
     [Parameter(ValueFromRemainingArguments = $true)]
@@ -28,31 +25,34 @@ $WSL_DISTRO = "Ubuntu"
 $ROOTFS = "/home/wportnoy/vscode-rootfs"
 $EXECUTOR = "/mnt/c/src/litebox-vscode-server/target/debug/litebox_tool_executor"
 
-# Parse the last positional argument as the "host" — if it's not "litebox",
-# fall back to real SSH so other Remote-SSH connections still work.
+# Parse SSH arguments to find the target host.
+# SSH CLI: ssh [options] destination [command]
+# Options that take a value: -b -c -D -E -e -F -I -i -J -L -l -m -O -o -p -Q -R -S -W -w
 $host = ""
-$command = ""
 $skipNext = $false
 for ($i = 0; $i -lt $SshArgs.Count; $i++) {
     if ($skipNext) { $skipNext = $false; continue }
     $arg = $SshArgs[$i]
     # Skip SSH flags that take a value argument
-    if ($arg -match "^-[bcDEeFIiJLlmOopQRSWw]$") { $skipNext = $true; continue }
-    # Skip SSH flags without value
+    if ($arg -match "^-[bcDEeFIiJLlmOopQRSWw]$") { $skipNext = $false; continue }
+    if ($arg -match "^-[bcDEeFIiJLlmOopQRSWw].") { continue }  # -oValue form
+    # Skip flags without value
     if ($arg -match "^-") { continue }
-    # First non-flag arg is the host, rest is the command
-    if (-not $host) { $host = $arg }
-    else { $command += " $arg" }
+    # First non-flag arg is the destination
+    if (-not $host) { $host = $arg; break }
 }
 
 if ($host -ne "litebox") {
     # Not targeting litebox — fall back to real SSH
-    $realSsh = (Get-Command ssh -ErrorAction SilentlyContinue).Source
-    if ($realSsh) {
+    $realSsh = (Get-Command ssh.exe -ErrorAction SilentlyContinue).Source
+    if (-not $realSsh) {
+        $realSsh = "$env:SystemRoot\System32\OpenSSH\ssh.exe"
+    }
+    if (Test-Path $realSsh) {
         & $realSsh @SshArgs
         exit $LASTEXITCODE
     }
-    Write-Error "SSH not found and host is not 'litebox': $host"
+    Write-Error "Real SSH not found and host is not 'litebox': $host"
     exit 1
 }
 
