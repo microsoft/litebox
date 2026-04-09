@@ -101,7 +101,7 @@ The attack surface that a sandbox can cover depends on how the agent interacts w
 - **VS Code APIs** — file read/write, search, symbol lookup, diagnostics. These execute in the extension host process, which is *outside* any command-level sandbox. When using VS Code Remote (WSL, SSH, Containers), they execute on the remote server — meaning a sandbox around the remote environment covers them.
 - **Terminal API** — shell commands. The terminal process is separate and can be sandboxed independently.
 
-This split means a command-level sandbox (like LiteBox's current REPL approach) only covers terminal commands. File operations through VS Code APIs bypass it entirely. To sandbox everything, you need either:
+This split means a command-level sandbox (like LiteBox's current persistent shell approach) only covers terminal commands. File operations through VS Code APIs bypass it entirely. To sandbox everything, you need either:
 1. **VS Code Remote** into a sandboxed environment (all extension host operations execute inside the sandbox)
 2. **MCP tool server** that routes every operation through a sandbox policy layer
 3. A combination: sandboxed terminal + restricted VS Code Remote for file access
@@ -360,7 +360,7 @@ Several LiteBox bugs were discovered and fixed during integration:
 **What was accomplished**:
 - Added `--policy` and `--audit-log` CLI flags to `litebox_runner_linux_userland` (feature-gated behind `audit_log` and `policy`)
 - Demo workspace gained three terminal profiles: "LiteBox Sandbox (Windows)", "LiteBox Sandbox (WSL2)", and "PowerShell"
-- Built and verified the Linux runner in WSL2 with the rewriter backend — single busybox commands work with audit logging and policy enforcement
+- Built and verified the Linux runner in WSL2 with the rewriter backend — single commands work with audit logging and policy enforcement
 
 **Seccomp segfault discovery and fix**:
 
@@ -400,7 +400,7 @@ The `wdcui/agent-sandbox-fork` branch implements fork in the shim via **delayed 
 
 ## Current Status & Limitations
 
-The current implementation sandboxes **terminal command execution only** on a per-command basis. For a full discussion of what sandboxing can and cannot protect against, see [Threat Model & Attack Surface](#threat-model--attack-surface).
+The current implementation sandboxes **terminal command execution only** within a persistent shell session. For a full discussion of what sandboxing can and cannot protect against, see [Threat Model & Attack Surface](#threat-model--attack-surface).
 
 ### Sandbox Coverage by Agent Type
 
@@ -833,4 +833,4 @@ Very strong isolation but can't run unmodified Linux programs — tools would ne
 
 ---
 
-*Branch: `feature/llm-tool-sandbox`*
+*Branch: `wportnoy/agent-sandbox-fork`*
