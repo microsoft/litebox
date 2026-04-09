@@ -290,7 +290,53 @@ impl Drop for BrokerProcess {
     }
 }
 
-/// Build the base runner command with common flags.
+/// Default sandbox policy applied when no `--policy` file is specified.
+///
+/// - Filesystem: deny access to secrets (`.ssh`, `passwd`, `shadow`, private keys)
+/// - Network: deny all outbound connections
+const DEFAULT_POLICY: &str = r#"{
+    "filesystem": {
+        "allow_read": [],
+        "allow_write": ["/tmp/**", "/workspace/**"],
+        "deny": ["**/.ssh/**", "**/passwd", "**/shadow", "**/id_rsa*", "**/id_ed25519*"]
+    },
+    "network": {
+        "deny_all": true,
+        "allow_connect": []
+    }
+}"#;
+
+/// Write the default policy to a temporary file and return its path.
+fn write_default_policy() -> anyhow::Result<TempFile> {
+    let path = std::env::temp_dir().join(format!(
+        "litebox-default-policy-{}.json",
+        std::process::id()
+    ));
+    std::fs::write(&path, DEFAULT_POLICY)?;
+    Ok(TempFile(path))
+}
+
+/// A file that is deleted when dropped.
+struct TempFile(std::path::PathBuf);
+
+impl Drop for TempFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+/// Spawn the broker, using the user-provided policy or the built-in default.
+fn spawn_broker(cli: &Cli) -> anyhow::Result<(BrokerProcess, Option<TempFile>)> {
+    let (policy_path, temp_policy) = if let Some(ref p) = cli.policy {
+        (p.clone(), None)
+    } else {
+        let tmp = write_default_policy()?;
+        let path = tmp.0.clone();
+        (path, Some(tmp))
+    };
+    let broker = BrokerProcess::spawn(&cli.rootfs, Some(&policy_path))?;
+    Ok((broker, temp_policy))
+}
 fn runner_command(
     cli: &Cli,
     audit_log_file: Option<&std::path::Path>,
@@ -344,13 +390,9 @@ fn runner_command(
 /// This prevents bash from enabling job control (which breaks pipelines in
 /// the sandbox because setpgid fails for the session-leader init process).
 fn interactive(cli: &Cli, audit_log_file: Option<&std::path::Path>) -> anyhow::Result<()> {
-    let broker = if cli.policy.is_some() {
-        Some(BrokerProcess::spawn(&cli.rootfs, cli.policy.as_deref())?)
-    } else {
-        None
-    };
+    let (broker, _temp_policy) = spawn_broker(cli)?;
 
-    let mut cmd = runner_command(cli, audit_log_file, broker.as_ref())?;
+    let mut cmd = runner_command(cli, audit_log_file, Some(&broker))?;
 
     // Launch bash in non-editing script mode:
     // --norc --noprofile: skip startup files
@@ -395,6 +437,7 @@ fn interactive(cli: &Cli, audit_log_file: Option<&std::path::Path>) -> anyhow::R
 
     // Clean up the broker process.
     drop(broker);
+    // Temp policy file cleaned up when _temp_policy drops.
 
     if !status.success() {
         std::process::exit(status.code().unwrap_or(1));
@@ -404,13 +447,9 @@ fn interactive(cli: &Cli, audit_log_file: Option<&std::path::Path>) -> anyhow::R
 
 /// Direct mode: run a single command.
 fn direct(cli: &Cli, audit_log_file: Option<&std::path::Path>) -> anyhow::Result<()> {
-    let broker = if cli.policy.is_some() {
-        Some(BrokerProcess::spawn(&cli.rootfs, cli.policy.as_deref())?)
-    } else {
-        None
-    };
+    let (broker, _temp_policy) = spawn_broker(cli)?;
 
-    let mut cmd = runner_command(cli, audit_log_file, broker.as_ref())?;
+    let mut cmd = runner_command(cli, audit_log_file, Some(&broker))?;
     cmd.args(&cli.command);
 
     cmd.stdin(std::process::Stdio::inherit())
