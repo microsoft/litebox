@@ -14,7 +14,9 @@ use std::sync::{Arc, Mutex};
 use clap::Parser;
 use tracing::info;
 
-use litebox_broker::policy::{AllowAllPolicy, ReadOnlyPolicy, ReadOnlyWithWritablePaths};
+use litebox_broker::policy::{
+    AllowAllPolicy, GlobPolicy, ReadOnlyPolicy, ReadOnlyWithWritablePaths,
+};
 use litebox_broker::sock_compat::IpcListener;
 #[cfg(unix)]
 use litebox_broker::sock_compat::IpcStream;
@@ -55,9 +57,23 @@ struct Cli {
     /// (e.g., 127.0.0.1:9999) or AF_UNIX socket path.
     #[arg(long, conflicts_with = "network_proxy_fd")]
     network_proxy_listen: Option<String>,
+
+    /// Path to a JSON sandbox policy file controlling filesystem and network
+    /// access. When provided, the broker enforces the policy on all 9P
+    /// operations and network connections.
+    #[arg(long, value_name = "PATH", value_hint = clap::ValueHint::FilePath)]
+    policy: Option<PathBuf>,
 }
 
-fn build_policy(cli: &Cli) -> Arc<dyn litebox_broker::policy::Policy> {
+fn build_policy(
+    cli: &Cli,
+    sandbox_policy: &Option<Arc<litebox_broker::sandbox_policy::SandboxPolicy>>,
+) -> Arc<dyn litebox_broker::policy::Policy> {
+    // If a sandbox policy is loaded, use its FS rules via GlobPolicy.
+    if let Some(sp) = sandbox_policy {
+        return Arc::new(GlobPolicy::new(Arc::clone(sp)));
+    }
+    // Otherwise fall back to the CLI flag-based policies.
     if cli.read_only {
         if cli.writable_paths.is_empty() {
             Arc::new(ReadOnlyPolicy)
@@ -75,16 +91,32 @@ fn build_policy(cli: &Cli) -> Arc<dyn litebox_broker::policy::Policy> {
     }
 }
 
+/// Load sandbox policy from the `--policy` flag, if provided.
+fn load_sandbox_policy(cli: &Cli) -> Option<Arc<litebox_broker::sandbox_policy::SandboxPolicy>> {
+    let path = cli.policy.as_ref()?;
+    match litebox_broker::sandbox_policy::SandboxPolicy::from_file(path) {
+        Ok(policy) => {
+            info!(?path, "loaded sandbox policy");
+            Some(Arc::new(policy))
+        }
+        Err(e) => {
+            tracing::error!("failed to load sandbox policy from {}: {e}", path.display());
+            std::process::exit(1);
+        }
+    }
+}
+
 /// Build a `LocalServiceRegistry` when `--root-dir` is provided alongside
 /// network proxy flags. The 9P file server is registered on port 5640 so the
 /// guest can reach it at `BROKER_IP:5640` without a real TCP listener.
 fn build_local_services(
     cli: &Cli,
     elf_cache: Arc<Mutex<litebox_broker::nine_p::server::ElfCache>>,
+    sandbox_policy: &Option<Arc<litebox_broker::sandbox_policy::SandboxPolicy>>,
 ) -> Option<litebox_broker::net_proxy::LocalServiceRegistry> {
     let root_dir = cli.root_dir.as_ref()?;
     let root = root_dir.canonicalize().unwrap_or_else(|_| root_dir.clone());
-    let policy = build_policy(cli);
+    let policy = build_policy(cli, sandbox_policy);
     let rewrite_syscalls = cli.rewrite_syscalls;
 
     let mut registry = litebox_broker::net_proxy::LocalServiceRegistry::new();
@@ -155,6 +187,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .init();
 
     let cli = Cli::parse();
+    let sandbox_policy = load_sandbox_policy(&cli);
 
     // Network proxy mode (fd passed from runner — Unix only).
     #[cfg(unix)]
@@ -165,8 +198,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let fd = unsafe { std::os::unix::io::OwnedFd::from_raw_fd(fd_num) };
         let ipc = IpcStream::from_owned_fd(fd);
         let elf_cache = litebox_broker::nine_p::server::Server::new_elf_cache();
-        let registry = build_local_services(&cli, elf_cache);
-        return litebox_broker::net_proxy::run(ipc, false, registry, None);
+        let registry = build_local_services(&cli, elf_cache, &sandbox_policy);
+        return litebox_broker::net_proxy::run(ipc, false, registry, None, sandbox_policy);
     }
     #[cfg(not(unix))]
     if cli.network_proxy_fd.is_some() {
@@ -193,7 +226,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // proxy event loop.  Stray/slow clients are rejected quickly so they
         // cannot block the real runner from connecting.
         loop {
-            let registry = build_local_services(&cli, Arc::clone(&elf_cache));
+            let registry = build_local_services(&cli, Arc::clone(&elf_cache), &sandbox_policy);
             let ipc = match litebox_broker::net_proxy::accept_ipc_client(
                 &listener,
                 registry.as_ref(),
@@ -213,6 +246,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 registry,
                 Some(&listener),
                 Arc::clone(&extra_session_slots),
+                sandbox_policy.clone(),
             ) {
                 tracing::error!("network proxy error: {e}");
             }
@@ -228,7 +262,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .expect("--root-dir is required for 9P mode");
     let root = root_dir.canonicalize().expect("root directory must exist");
 
-    let policy = build_policy(&cli);
+    let policy = build_policy(&cli, &sandbox_policy);
 
     info!(
         ?root,

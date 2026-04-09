@@ -7,8 +7,5 @@
     "network": {
         "deny_all": true,
         "allow_connect": []
-    },
-    "process": {
-        "allow_exec": ["/bin/*", "/usr/bin/*"]
     }
 }

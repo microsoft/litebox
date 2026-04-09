@@ -11,4 +11,5 @@
 pub mod net_proxy;
 pub mod nine_p;
 pub mod policy;
+pub mod sandbox_policy;
 pub mod sock_compat;

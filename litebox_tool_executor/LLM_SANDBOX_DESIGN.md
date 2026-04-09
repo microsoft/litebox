@@ -318,15 +318,26 @@ The rootfs is prepared via `litebox_packager`, which discovers ELF dependencies 
 
 ### Phase 3: Policy Enforcement
 
-Feature-gated (`policy`) sandbox policy in `litebox_shim_linux` with three domains:
+Policy enforcement has been moved from the guest-side shim to the **host-side broker**,
+which runs outside the sandbox trust boundary and cannot be tampered with by guest code.
 
-- **Filesystem**: `allow_read`/`allow_write`/`deny` glob lists, enforced at `openat`, `unlinkat`
-- **Network**: `deny_all` + `allow_connect` address list, enforced at `connect`
-- **Process**: `allow_exec` glob list, enforced at `execve`
+The broker enforces two policy domains:
 
-Globs are hand-rolled (`*`, `**`, `?`) with no regex dependency, `no_std` compatible. Violations return `EACCES`. Policies are loaded from JSON files via `--policy`.
+- **Filesystem**: `allow_read`/`allow_write`/`deny` glob lists, enforced at the 9P protocol
+  layer via `GlobPolicy`. All file operations pass through the broker's policy engine before
+  touching the host filesystem.
+- **Network**: `deny_all` + `allow_connect` hostname:port patterns, enforced in the smoltcp
+  network proxy. The broker intercepts DNS queries (UDP port 53) to build an IP→hostname
+  reverse map, enabling hostname-based blocking (e.g., `allow_connect: ["api.github.com:443"]`).
 
-**Known enforcement gaps**: `stat`, `readlink`, `access`, `mkdir`, and `getdents` are not checked against the policy. This means `ls /lib/...` succeeds (uses `stat`) even when `/lib/**` is denied, while `cat /lib/...` correctly fails (uses `openat`).
+Policies are loaded from a unified JSON file via the broker's `--policy` flag. The tool
+executor (`litebox_tool_executor`) spawns the broker with the policy file and connects
+the runner to it via `--network-broker`.
+
+The previous shim-side policy (`litebox_shim_linux/src/policy.rs`) has been removed.
+It ran inside the guest's trust domain, making it bypassable by malicious guest code.
+The `process` (exec) policy domain was dropped — filesystem policy provides indirect
+exec control by restricting which files can be accessed.
 
 ### Phase 4: VS Code Agent Integration
 
@@ -452,7 +463,7 @@ LLM coding agents fall into two categories with different sandboxing surfaces:
 | **Output sanitization** | Filter sensitive data (secrets, credentials) from sandbox output before returning to LLM | Medium |
 | **Timeout enforcement** | Kill guest after configurable wall-clock time | Medium |
 | **File injection/extraction** | Return modified files from sandbox, diff against originals | Medium |
-| **Network egress filtering** | Allowlist-based outbound connectivity via `smoltcp` network stack | Medium |
+| **Network egress filtering** | ~~Allowlist-based outbound connectivity via `smoltcp` network stack~~ **Done** — broker-side network policy with DNS hostname tracking | ~~Medium~~ |
 | **Dynamic terminal size** | Query actual Windows console dimensions for TIOCGWINSZ | Low |
 | **Ephemeral instance pool** | Pre-warm LiteBox instances for low-latency per-command execution | Low |
 | **`/dev/tty` emulation** | Proper terminal device for job control support | Low |

@@ -16,6 +16,7 @@
 //! opened and data is relayed bidirectionally.
 
 mod device;
+pub mod dns_tracker;
 
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpListener, UdpSocket};
@@ -23,6 +24,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
+use crate::sandbox_policy::SandboxPolicy;
 use crate::sock_compat::{
     self, AsRawSock, IpcListener, IpcStream, POLLERR, POLLHUP, POLLIN, POLLOUT, PollFd, RawSock,
 };
@@ -598,6 +600,7 @@ pub fn run(
     handshake_done: bool,
     local_services: Option<LocalServiceRegistry>,
     accept_listener: Option<&IpcListener>,
+    sandbox_policy: Option<Arc<SandboxPolicy>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     run_with_session_slots(
         ipc_fd,
@@ -605,6 +608,7 @@ pub fn run(
         local_services,
         accept_listener,
         Arc::new(AtomicUsize::new(0)),
+        sandbox_policy,
     )
 }
 
@@ -614,6 +618,7 @@ pub fn run_with_session_slots(
     local_services: Option<LocalServiceRegistry>,
     accept_listener: Option<&IpcListener>,
     session_slots: Arc<AtomicUsize>,
+    sandbox_policy: Option<Arc<SandboxPolicy>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     run_inner(
         ipc_fd,
@@ -621,6 +626,7 @@ pub fn run_with_session_slots(
         Arc::new(local_services.unwrap_or_default()),
         accept_listener,
         session_slots,
+        sandbox_policy,
     )
 }
 
@@ -630,6 +636,7 @@ fn run_inner(
     local_services: Arc<LocalServiceRegistry>,
     accept_listener: Option<&IpcListener>,
     session_slots: Arc<AtomicUsize>,
+    sandbox_policy: Option<Arc<SandboxPolicy>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     info!("network proxy starting");
 
@@ -678,6 +685,8 @@ fn run_inner(
     let mut accepting_sockets: Vec<(SocketHandle, Ipv4Addr, u16)> = Vec::new();
     // UDP flows keyed by (src_ip, src_port, dst_ip, dst_port).
     let mut udp_flows: HashMap<UdpFlowKey, UdpFlow> = HashMap::new();
+    // DNS tracker for hostname-based network policy enforcement.
+    let mut dns_tracker = dns_tracker::DnsTracker::new();
     // Pending LB9P handshakes — drained non-blocking each loop iteration.
     let mut pending_handshakes: Vec<PendingHandshake> = Vec::new();
 
@@ -740,50 +749,70 @@ fn run_inner(
                     debug!("no local service on port {dst_port}, dropping SYN");
                     suppress_from_smoltcp = true;
                 } else {
-                    // New flow to external host — start non-blocking host connect.
-                    let total_flows = pending_connects.len()
-                        + ready_host_streams.len()
-                        + accepting_sockets.len()
-                        + tcp_bridges.len()
-                        + local_bridges.len();
-                    let dest = SocketAddr::V4(SocketAddrV4::new(dest_ipv4, dst_port));
-                    if total_flows >= MAX_CONNECTIONS {
-                        warn!("connection limit reached, dropping SYN to {dest}");
-                        suppress_from_smoltcp = true;
-                    } else {
-                        match start_nonblocking_connect(&dest) {
-                            Ok(stream) => {
-                                debug!("SYN {src_ip:?}:{src_port} → {dest}, async host connect");
-                                pending_connects.push(PendingConnect {
-                                    flow_key,
-                                    dest,
-                                    stream,
-                                    started: Instant::now(),
-                                });
-                                // Immediately try to resolve (handles localhost /
-                                // already-completed connects without waiting for
-                                // a SYN retransmit).
-                                resolve_pending_connects(
-                                    &mut pending_connects,
-                                    &mut ready_host_streams,
-                                );
-                                if ready_host_streams.contains_key(&flow_key) {
-                                    // Completed instantly — create listen socket
-                                    // and let this SYN through.
-                                    ensure_listen_socket(
-                                        &mut sockets,
-                                        &mut listen_sockets,
-                                        &mut accepting_sockets,
-                                        dest_ipv4,
-                                        dst_port,
+                    // New flow to external host.
+                    // Check network policy before connecting.
+                    if let Some(ref policy) = sandbox_policy {
+                        let hostname = dns_tracker.lookup(dest_ipv4);
+                        if policy.check_connect(dest_ipv4, dst_port, hostname)
+                            == crate::sandbox_policy::Decision::Deny
+                        {
+                            let hostname_info =
+                                hostname.map(|h| format!(" ({h})")).unwrap_or_default();
+                            warn!(
+                                "policy denied TCP connect to {dest_ipv4}:{dst_port}{hostname_info}"
+                            );
+                            suppress_from_smoltcp = true;
+                            // Skip the rest of this branch — connection is blocked.
+                        }
+                    }
+                    if !suppress_from_smoltcp {
+                        // Start non-blocking host connect.
+                        let total_flows = pending_connects.len()
+                            + ready_host_streams.len()
+                            + accepting_sockets.len()
+                            + tcp_bridges.len()
+                            + local_bridges.len();
+                        let dest = SocketAddr::V4(SocketAddrV4::new(dest_ipv4, dst_port));
+                        if total_flows >= MAX_CONNECTIONS {
+                            warn!("connection limit reached, dropping SYN to {dest}");
+                            suppress_from_smoltcp = true;
+                        } else {
+                            match start_nonblocking_connect(&dest) {
+                                Ok(stream) => {
+                                    debug!(
+                                        "SYN {src_ip:?}:{src_port} → {dest}, async host connect"
                                     );
-                                } else {
+                                    pending_connects.push(PendingConnect {
+                                        flow_key,
+                                        dest,
+                                        stream,
+                                        started: Instant::now(),
+                                    });
+                                    // Immediately try to resolve (handles localhost /
+                                    // already-completed connects without waiting for
+                                    // a SYN retransmit).
+                                    resolve_pending_connects(
+                                        &mut pending_connects,
+                                        &mut ready_host_streams,
+                                    );
+                                    if ready_host_streams.contains_key(&flow_key) {
+                                        // Completed instantly — create listen socket
+                                        // and let this SYN through.
+                                        ensure_listen_socket(
+                                            &mut sockets,
+                                            &mut listen_sockets,
+                                            &mut accepting_sockets,
+                                            dest_ipv4,
+                                            dst_port,
+                                        );
+                                    } else {
+                                        suppress_from_smoltcp = true;
+                                    }
+                                }
+                                Err(e) => {
+                                    warn!("failed to create socket for {dest}: {e}");
                                     suppress_from_smoltcp = true;
                                 }
-                            }
-                            Err(e) => {
-                                warn!("failed to create socket for {dest}: {e}");
-                                suppress_from_smoltcp = true;
                             }
                         }
                     }
@@ -797,7 +826,40 @@ fn run_inner(
                 suppress_from_smoltcp = true;
                 let payload =
                     &packet[payload_off..payload_off + payload_len.min(packet.len() - payload_off)];
-                handle_udp_outbound(&mut udp_flows, src_ip, src_port, dst_ip, dst_port, payload);
+
+                // DNS query tracking — intercept outbound UDP port 53.
+                if dst_port == 53 {
+                    dns_tracker.process_query(payload);
+                }
+
+                // Network policy check for non-DNS UDP.
+                let mut udp_blocked = false;
+                if dst_port != 53
+                    && let Some(ref policy) = sandbox_policy
+                {
+                    let dest_ipv4 = Ipv4Addr::from(dst_ip);
+                    let hostname = dns_tracker.lookup(dest_ipv4);
+                    if policy.check_connect(dest_ipv4, dst_port, hostname)
+                        == crate::sandbox_policy::Decision::Deny
+                    {
+                        let hostname_info = hostname.map(|h| format!(" ({h})")).unwrap_or_default();
+                        debug!(
+                            "policy denied UDP to {}:{dst_port}{hostname_info}",
+                            Ipv4Addr::from(dst_ip)
+                        );
+                        udp_blocked = true;
+                    }
+                }
+                if !udp_blocked {
+                    handle_udp_outbound(
+                        &mut udp_flows,
+                        src_ip,
+                        src_port,
+                        dst_ip,
+                        dst_port,
+                        payload,
+                    );
+                }
             }
 
             // ICMP Echo Request — synthesize reply directly.
@@ -839,7 +901,7 @@ fn run_inner(
         relay_local(&mut sockets, &mut local_bridges);
 
         // Step 6: Check for UDP replies from host and send back to guest.
-        relay_udp_replies(&mut udp_flows, &mut device);
+        relay_udp_replies(&mut udp_flows, &mut device, &mut dns_tracker);
 
         // Step 7: GC idle UDP flows.
         udp_flows.retain(|key, flow| {
@@ -1040,7 +1102,7 @@ fn run_inner(
                         return;
                     }
                     info!("accepted additional LBNP client, handshake complete");
-                    if let Err(e) = run_inner(stream, true, local_services, None, session_slots) {
+                    if let Err(e) = run_inner(stream, true, local_services, None, session_slots, None) {
                         tracing::error!("network proxy error: {e}");
                     }
                 });
@@ -2066,14 +2128,25 @@ fn handle_udp_outbound(
 }
 
 /// Check all UDP flows for replies from host and send raw IP+UDP packets back
-/// to guest via IPC.
-fn relay_udp_replies(flows: &mut HashMap<UdpFlowKey, UdpFlow>, device: &mut IpcDevice) {
+/// to guest via IPC. DNS responses (from port 53 flows) are also fed to the
+/// DNS tracker for hostname→IP mapping.
+fn relay_udp_replies(
+    flows: &mut HashMap<UdpFlowKey, UdpFlow>,
+    device: &mut IpcDevice,
+    dns_tracker: &mut dns_tracker::DnsTracker,
+) {
     for flow in flows.values_mut() {
         let mut buf = [0u8; 65535];
         loop {
             match flow.host_socket.recv_from(&mut buf) {
                 Ok((n, _from)) => {
                     flow.last_activity = Instant::now();
+
+                    // Track DNS responses for hostname-based policy.
+                    if flow.dest_port == 53 {
+                        dns_tracker.process_response(&buf[..n]);
+                    }
+
                     // Construct raw IP+UDP packet.
                     let packet = build_udp_packet(
                         &flow.dest_ip,
