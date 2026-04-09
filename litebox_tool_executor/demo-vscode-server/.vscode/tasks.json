@@ -1,0 +1,45 @@
+{
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "LiteBox: Start VS Code Server",
+            "type": "process",
+            "command": "wsl.exe",
+            "args": [
+                "-d", "Ubuntu", "--",
+                "/mnt/c/src/litebox-vscode-server/target/debug/litebox_tool_executor",
+                "--rootfs", "/home/wportnoy/vscode-rootfs",
+                "--vscode-server"
+            ],
+            "problemMatcher": [],
+            "isBackground": true,
+            "runOptions": {
+                "runOn": "folderOpen"
+            },
+            "presentation": {
+                "reveal": "always",
+                "panel": "dedicated",
+                "focus": false,
+                "echo": true
+            }
+        },
+        {
+            "label": "LiteBox: Tail Audit Log",
+            "type": "process",
+            "command": "powershell.exe",
+            "args": [
+                "-NoProfile",
+                "-ExecutionPolicy", "Bypass",
+                "-Command",
+                "Get-ChildItem /tmp/litebox-vscode-server-logs/*.jsonl -ErrorAction SilentlyContinue | Sort-Object LastWriteTime | Select-Object -Last 1 | ForEach-Object { Get-Content $_.FullName -Wait -Tail 20 }"
+            ],
+            "problemMatcher": [],
+            "isBackground": true,
+            "presentation": {
+                "reveal": "silent",
+                "panel": "dedicated",
+                "focus": false
+            }
+        }
+    ]
+}
