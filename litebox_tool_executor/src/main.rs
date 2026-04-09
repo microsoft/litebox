@@ -12,6 +12,7 @@
 //! Spawns `litebox_runner_linux_userland` as a subprocess.
 
 use clap::Parser as _;
+use std::io::Read as _;
 
 #[derive(clap::Parser, Debug)]
 #[command(name = "litebox-tool-executor")]
@@ -184,28 +185,54 @@ fn runner_command(cli: &Cli, audit_log_file: Option<&std::path::Path>) -> anyhow
 
 /// Interactive shell mode. Launches a persistent bash session inside a single
 /// sandbox. Shell state (cd, environment variables, etc.) persists across
-/// commands. Uses `--noediting -s` and `TERM=dumb` to disable readline
-/// (the sandbox reports stdin as a TTY, which would cause bash to enter
-/// interactive/readline mode and hang).
+/// commands.
+///
+/// Stdin is piped through a bridge thread so the runner's stdin is NOT a TTY.
+/// This prevents bash from enabling job control (which breaks pipelines in
+/// the sandbox because setpgid fails for the session-leader init process).
 fn interactive(cli: &Cli, audit_log_file: Option<&std::path::Path>) -> anyhow::Result<()> {
     let mut cmd = runner_command(cli, audit_log_file)?;
 
     // Launch bash in non-editing script mode:
     // --norc --noprofile: skip startup files
-    // --noediting: disable readline (avoids hang on TTY stdin)
-    // +m: disable job control (setpgid fails in the sandbox, breaking pipes)
+    // --noediting: disable readline
     // -s: read commands from stdin
-    cmd.args([&cli.shell, "--norc", "--noprofile", "--noediting", "+m", "-s"]);
+    cmd.args([&cli.shell, "--norc", "--noprofile", "--noediting", "-s"]);
 
-    // Pass stdin/stdout/stderr straight through. Audit events go directly
-    // to the log file via the runner's --audit-log flag (no stderr capture).
-    cmd.stdin(std::process::Stdio::inherit())
+    // Pipe stdin so the runner sees a pipe, not a TTY. This makes bash
+    // enter non-interactive mode and skip job control entirely.
+    cmd.stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::inherit())
         .stderr(std::process::Stdio::inherit());
 
-    let status = cmd.status().map_err(|e| {
+    let mut child = cmd.spawn().map_err(|e| {
         anyhow::anyhow!("Failed to spawn litebox_runner_linux_userland: {e}")
     })?;
+
+    // Bridge host stdin to the child's piped stdin in a background thread.
+    let mut child_stdin = child.stdin.take().unwrap();
+    let stdin_thread = std::thread::spawn(move || {
+        let mut host_stdin = std::io::stdin().lock();
+        let mut buf = [0u8; 4096];
+        loop {
+            match host_stdin.read(&mut buf) {
+                Ok(0) => break,                              // EOF
+                Ok(n) => {
+                    if std::io::Write::write_all(&mut child_stdin, &buf[..n]).is_err() {
+                        break; // child closed stdin
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    let status = child.wait().map_err(|e| {
+        anyhow::anyhow!("Failed to wait for litebox_runner_linux_userland: {e}")
+    })?;
+
+    // stdin thread will exit when the child closes its end or host stdin hits EOF.
+    let _ = stdin_thread.join();
 
     if !status.success() {
         std::process::exit(status.code().unwrap_or(1));
