@@ -53,6 +53,11 @@ struct Cli {
     #[arg(long)]
     vscode_server: bool,
 
+    /// SSH port for --vscode-server mode (default: 2222).
+    /// Use a fixed port so the SSH config entry is stable across restarts.
+    #[arg(long, default_value = "2222")]
+    ssh_port: u16,
+
     /// The command and arguments to run. Omit for interactive mode.
     #[arg(trailing_var_arg = true)]
     command: Vec<String>,
@@ -627,10 +632,11 @@ fn vscode_server(cli: &Cli, audit_log_file: Option<&std::path::Path>) -> anyhow:
         extra_args: cli.command.clone(),
     };
 
+    let ssh_port = cli.ssh_port;
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async {
         let (port, server_handle) =
-            litebox_tool_executor::ssh_server::start_ssh_server(ssh_config).await?;
+            litebox_tool_executor::ssh_server::start_ssh_server(ssh_config, ssh_port).await?;
 
         // Detect WSL2 IP for connection instructions
         let wsl_ip = std::process::Command::new("hostname")
@@ -641,20 +647,26 @@ fn vscode_server(cli: &Cli, audit_log_file: Option<&std::path::Path>) -> anyhow:
             .map(|s| s.trim().split_whitespace().next().unwrap_or("").to_string())
             .unwrap_or_default();
 
+        let host_ip = if !wsl_ip.is_empty() && wsl_ip != "127.0.0.1" {
+            &wsl_ip
+        } else {
+            "127.0.0.1"
+        };
+
         eprintln!();
         eprintln!("==============================================");
         eprintln!("  LiteBox VS Code Server (embedded SSH)");
-        if !wsl_ip.is_empty() && wsl_ip != "127.0.0.1" {
-            eprintln!("  SSH listening on 0.0.0.0:{port}");
-            eprintln!();
-            eprintln!("  Connect from VS Code (use WSL2 IP):");
-            eprintln!("    Remote-SSH → {wsl_ip}:{port}");
-        } else {
-            eprintln!("  SSH listening on 0.0.0.0:{port}");
-            eprintln!();
-            eprintln!("  Connect from VS Code:");
-            eprintln!("    Remote-SSH → localhost:{port}");
-        }
+        eprintln!("  SSH listening on 0.0.0.0:{port}");
+        eprintln!();
+        eprintln!("  Add to ~/.ssh/config:");
+        eprintln!("    Host litebox");
+        eprintln!("        HostName {host_ip}");
+        eprintln!("        Port {port}");
+        eprintln!("        StrictHostKeyChecking no");
+        eprintln!("        UserKnownHostsFile /dev/null");
+        eprintln!();
+        eprintln!("  Then in VS Code:");
+        eprintln!("    Remote-SSH → Connect to Host → litebox");
         eprintln!();
         eprintln!("  Logs:");
         eprintln!("    Syscalls: {}", audit.display());

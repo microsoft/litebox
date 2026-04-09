@@ -295,11 +295,12 @@ impl russh::server::Handler for SshSession {
     }
 }
 
-/// Start the embedded SSH server on `127.0.0.1:0` (random port) and return
+/// Start the embedded SSH server on the given port and return
 /// the assigned port. The server runs until the returned handle is dropped
 /// or the process exits.
 pub async fn start_ssh_server(
     config: LiteboxConfig,
+    port: u16,
 ) -> Result<(u16, tokio::task::JoinHandle<()>), anyhow::Error> {
     let ssh_config = russh::server::Config {
         inactivity_timeout: Some(std::time::Duration::from_secs(3600)),
@@ -316,7 +317,7 @@ pub async fn start_ssh_server(
     };
     let ssh_config = Arc::new(ssh_config);
 
-    let listener = tokio::net::TcpListener::bind("0.0.0.0:0").await?;
+    let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{port}")).await?;
     let port = listener.local_addr()?.port();
 
     let mut server = SshServer {
