@@ -40,6 +40,8 @@ use device::{DEVICE_MTU, IpcDevice};
 const BROKER_IP: Ipv4Address = Ipv4Address::new(10, 0, 0, 1);
 /// Broker IP as std Ipv4Addr.
 const BROKER_IPV4: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 1);
+/// Broker IP as byte array.
+const BROKER_IP_BYTES: [u8; 4] = [10, 0, 0, 1];
 
 /// Maximum concurrent TCP flows.
 const MAX_CONNECTIONS: usize = 1024;
@@ -687,6 +689,8 @@ fn run_inner(
     let mut udp_flows: HashMap<UdpFlowKey, UdpFlow> = HashMap::new();
     // DNS tracker for hostname-based network policy enforcement.
     let mut dns_tracker = dns_tracker::DnsTracker::new();
+    // Host DNS resolver for forwarding guest DNS queries.
+    let host_dns = discover_host_dns();
     // Pending LB9P handshakes — drained non-blocking each loop iteration.
     let mut pending_handshakes: Vec<PendingHandshake> = Vec::new();
 
@@ -851,11 +855,18 @@ fn run_inner(
                     }
                 }
                 if !udp_blocked {
+                    // Rewrite DNS queries addressed to the broker IP to the
+                    // host's actual DNS resolver.
+                    let effective_dst_ip = if dst_port == 53 && dst_ip == BROKER_IP_BYTES {
+                        host_dns.octets()
+                    } else {
+                        dst_ip
+                    };
                     handle_udp_outbound(
                         &mut udp_flows,
                         src_ip,
                         src_port,
-                        dst_ip,
+                        effective_dst_ip,
                         dst_port,
                         payload,
                     );
@@ -2218,6 +2229,27 @@ fn build_udp_packet(
     packet[28..].copy_from_slice(payload);
 
     packet
+}
+
+/// Discover the host's DNS resolver by parsing `/etc/resolv.conf`.
+///
+/// Returns the first `nameserver` entry found, or `8.8.8.8` as a fallback.
+fn discover_host_dns() -> Ipv4Addr {
+    if let Ok(content) = std::fs::read_to_string("/etc/resolv.conf") {
+        for line in content.lines() {
+            let line = line.trim();
+            if let Some(addr_str) = line.strip_prefix("nameserver") {
+                let addr_str = addr_str.trim();
+                if let Ok(addr) = addr_str.parse::<Ipv4Addr>() {
+                    info!("host DNS resolver: {addr}");
+                    return addr;
+                }
+            }
+        }
+    }
+    let fallback = Ipv4Addr::new(8, 8, 8, 8);
+    info!("no host DNS resolver found, using fallback: {fallback}");
+    fallback
 }
 
 #[cfg(test)]

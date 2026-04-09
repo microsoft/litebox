@@ -362,8 +362,7 @@ fn spawn_broker(
     };
     // Write broker logs to a .log file alongside the audit .jsonl files.
     let broker_log = audit_log_file.map(|p| p.with_extension("broker.log"));
-    let broker =
-        BrokerProcess::spawn(&cli.rootfs, Some(&policy_path), broker_log.as_deref())?;
+    let broker = BrokerProcess::spawn(&cli.rootfs, Some(&policy_path), broker_log.as_deref())?;
     Ok((broker, temp_policy))
 }
 fn runner_command(
