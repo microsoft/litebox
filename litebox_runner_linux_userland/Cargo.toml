@@ -23,11 +23,10 @@ walkdir = "2.0"
 glob = "0.3"
 
 [features]
-default = ["audit_log", "policy"]
+default = ["audit_log"]
 lock_tracing = ["litebox/lock_tracing"]
 trace_syscalls = ["litebox_shim_linux/trace_syscalls"]
 audit_log = ["litebox_shim_linux/audit_log"]
-policy = ["litebox_shim_linux/policy"]
 
 [lints]
 workspace = true

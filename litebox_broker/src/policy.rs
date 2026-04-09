@@ -152,3 +152,59 @@ impl Policy for ReadOnlyWithWritablePaths {
         Err("ReadOnlyWithWritablePaths does not support dynamic rules".into())
     }
 }
+
+/// A policy backed by a [`SandboxPolicy`]'s filesystem rules.
+///
+/// Uses glob-based allow/deny patterns to control read and write access.
+/// This replaces the simpler `ReadOnlyPolicy` / `AllowAllPolicy` when a
+/// full sandbox policy file is loaded.
+pub struct GlobPolicy {
+    sandbox_policy: std::sync::Arc<crate::sandbox_policy::SandboxPolicy>,
+}
+
+impl GlobPolicy {
+    /// Create a glob-based policy from a shared sandbox policy.
+    pub fn new(sandbox_policy: std::sync::Arc<crate::sandbox_policy::SandboxPolicy>) -> Self {
+        Self { sandbox_policy }
+    }
+}
+
+impl std::fmt::Debug for GlobPolicy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GlobPolicy")
+            .field("filesystem", &self.sandbox_policy.filesystem)
+            .finish()
+    }
+}
+
+impl Policy for GlobPolicy {
+    fn check(&self, action: Action, path: Option<&Path>) -> Decision {
+        let write = matches!(
+            action,
+            Action::Write
+                | Action::Chmod
+                | Action::Mkdir
+                | Action::Rmdir
+                | Action::Unlink
+                | Action::Truncate
+        );
+
+        // For FD-only operations (no path), allow by default.
+        let Some(p) = path else {
+            return match action {
+                Action::Seek | Action::Close => Decision::Allow,
+                _ => Decision::Allow,
+            };
+        };
+
+        let path_str = p.to_str().unwrap_or("");
+        match self.sandbox_policy.check_file_access(path_str, write) {
+            crate::sandbox_policy::Decision::Allow => Decision::Allow,
+            crate::sandbox_policy::Decision::Deny => Decision::Deny,
+        }
+    }
+
+    fn load_rules(&self, _text: &str) -> Result<(), String> {
+        Err("GlobPolicy does not support dynamic rules".into())
+    }
+}

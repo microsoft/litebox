@@ -896,13 +896,16 @@ fn test_busybox_shell_pipe() {
     };
 
     // Package busybox into a rootfs tar via litebox_packager.
-    let packager_path = std::env::var("CARGO_BIN_EXE_litebox_packager")
-        .unwrap_or_else(|_| {
-            // Fall back to looking in target/debug
-            let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap();
-            let workspace = std::path::Path::new(&manifest_dir).parent().unwrap();
-            workspace.join("target/debug/litebox_packager").to_str().unwrap().to_string()
-        });
+    let packager_path = std::env::var("CARGO_BIN_EXE_litebox_packager").unwrap_or_else(|_| {
+        // Fall back to looking in target/debug
+        let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap();
+        let workspace = std::path::Path::new(&manifest_dir).parent().unwrap();
+        workspace
+            .join("target/debug/litebox_packager")
+            .to_str()
+            .unwrap()
+            .to_string()
+    });
 
     let dir_path = PathBuf::from(std::env::var_os("OUT_DIR").unwrap());
     let tar_path = dir_path.join("busybox_pipe_test.tar");
@@ -942,9 +945,14 @@ fn test_busybox_shell_pipe() {
             "15",
             &runner_path,
             "--unstable",
-            "--initial-files", tar_path.to_str().unwrap(),
+            "--initial-files",
+            tar_path.to_str().unwrap(),
             "--program-from-tar",
-            "--", guest_busybox, "sh", "-c", "echo hello | cat",
+            "--",
+            guest_busybox,
+            "sh",
+            "-c",
+            "echo hello | cat",
         ])
         .output()
         .expect("failed to run litebox_runner_linux_userland");
@@ -1029,7 +1037,10 @@ fn test_multi_external_pipes_on_userland() {
             .output();
         let s = String::from_utf8_lossy(&output);
         // seq 1..10 should appear
-        assert!(s.contains("10"), "3-stage pipe missing expected output:\n{s}");
+        assert!(
+            s.contains("10"),
+            "3-stage pipe missing expected output:\n{s}"
+        );
     }
 
     // --- Test 3: ls | sort | uniq (classic 3-stage utility pipeline) ---
@@ -1075,11 +1086,7 @@ fn bash_sandbox_tar() -> Option<PathBuf> {
     let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap();
     let workspace = Path::new(&manifest_dir).parent().unwrap();
     let path = workspace.join("target/bash-sandbox.tar");
-    if path.exists() {
-        Some(path)
-    } else {
-        None
-    }
+    if path.exists() { Some(path) } else { None }
 }
 
 /// Validate that the bash-sandbox.tar has the expected structure.
@@ -1157,14 +1164,23 @@ fn run_bash_from_tar(tar_path: &Path, bash_cmd: &str, timeout_secs: &str) -> (St
             timeout_secs,
             &runner_path,
             "--unstable",
-            "--initial-files", tar_path.to_str().unwrap(),
+            "--initial-files",
+            tar_path.to_str().unwrap(),
             "--program-from-tar",
-            "--env", "LD_LIBRARY_PATH=/lib64:/lib/x86_64-linux-gnu:/lib",
-            "--env", "HOME=/",
-            "--env", "PATH=/usr/bin:/bin",
-            "--env", "TERM=dumb",
+            "--env",
+            "LD_LIBRARY_PATH=/lib64:/lib/x86_64-linux-gnu:/lib",
+            "--env",
+            "HOME=/",
+            "--env",
+            "PATH=/usr/bin:/bin",
+            "--env",
+            "TERM=dumb",
             "--",
-            "/usr/bin/bash", "--norc", "--noprofile", "-c", bash_cmd,
+            "/usr/bin/bash",
+            "--norc",
+            "--noprofile",
+            "-c",
+            bash_cmd,
         ])
         .output()
         .expect("failed to spawn runner");
@@ -1257,7 +1273,9 @@ fn test_tar_validate() {
 #[cfg(target_arch = "x86_64")]
 #[test]
 fn test_tar_baseline_echo() {
-    let Some(tar) = bash_sandbox_tar() else { return };
+    let Some(tar) = bash_sandbox_tar() else {
+        return;
+    };
     let stats = run_trials(&tar, "echo hello-tar", "hello-tar", 10, "10");
     assert_eq!(stats.pass, 10, "echo should always work. {stats}");
 }
@@ -1265,15 +1283,28 @@ fn test_tar_baseline_echo() {
 #[cfg(target_arch = "x86_64")]
 #[test]
 fn test_tar_baseline_builtin_pipe_cat() {
-    let Some(tar) = bash_sandbox_tar() else { return };
-    let stats = run_trials(&tar, "echo hello-pipe | /usr/bin/cat", "hello-pipe", 10, "10");
-    assert_eq!(stats.pass, 10, "builtin | /usr/bin/cat should always work. {stats}");
+    let Some(tar) = bash_sandbox_tar() else {
+        return;
+    };
+    let stats = run_trials(
+        &tar,
+        "echo hello-pipe | /usr/bin/cat",
+        "hello-pipe",
+        10,
+        "10",
+    );
+    assert_eq!(
+        stats.pass, 10,
+        "builtin | /usr/bin/cat should always work. {stats}"
+    );
 }
 
 #[cfg(target_arch = "x86_64")]
 #[test]
 fn test_tar_baseline_full_path_echo_pipe_cat() {
-    let Some(tar) = bash_sandbox_tar() else { return };
+    let Some(tar) = bash_sandbox_tar() else {
+        return;
+    };
     let stats = run_trials(
         &tar,
         "/usr/bin/echo hello-full | /usr/bin/cat",
@@ -1281,13 +1312,18 @@ fn test_tar_baseline_full_path_echo_pipe_cat() {
         10,
         "10",
     );
-    assert_eq!(stats.pass, 10, "full-path echo|cat should always work. {stats}");
+    assert_eq!(
+        stats.pass, 10,
+        "full-path echo|cat should always work. {stats}"
+    );
 }
 
 #[cfg(target_arch = "x86_64")]
 #[test]
 fn test_tar_baseline_full_path_ls_sort() {
-    let Some(tar) = bash_sandbox_tar() else { return };
+    let Some(tar) = bash_sandbox_tar() else {
+        return;
+    };
     let stats = run_trials(
         &tar,
         "echo a > /tmp/a; echo b > /tmp/b; /usr/bin/ls /tmp | /usr/bin/sort",
@@ -1295,21 +1331,31 @@ fn test_tar_baseline_full_path_ls_sort() {
         10,
         "10",
     );
-    assert_eq!(stats.pass, 10, "full-path ls|sort should always work. {stats}");
+    assert_eq!(
+        stats.pass, 10,
+        "full-path ls|sort should always work. {stats}"
+    );
 }
 
 #[cfg(target_arch = "x86_64")]
 #[test]
 fn test_tar_baseline_full_path_ls_subshell() {
-    let Some(tar) = bash_sandbox_tar() else { return };
+    let Some(tar) = bash_sandbox_tar() else {
+        return;
+    };
     let stats = run_trials(&tar, "x=$(/usr/bin/ls /); echo $x", "tmp", 10, "10");
-    assert_eq!(stats.pass, 10, "full-path ls subshell should always work. {stats}");
+    assert_eq!(
+        stats.pass, 10,
+        "full-path ls subshell should always work. {stats}"
+    );
 }
 
 #[cfg(target_arch = "x86_64")]
 #[test]
 fn test_tar_baseline_bare_ls_subshell() {
-    let Some(tar) = bash_sandbox_tar() else { return };
+    let Some(tar) = bash_sandbox_tar() else {
+        return;
+    };
     let stats = run_trials(&tar, "x=$(ls /); echo \"LS=$x\"", "tmp", 10, "10");
     eprintln!("bare ls subshell: {stats}");
     // If this is flaky, the non-determinism extends to subshells too.
@@ -1327,7 +1373,9 @@ fn test_tar_baseline_bare_ls_subshell() {
 #[cfg(target_arch = "x86_64")]
 #[test]
 fn test_tar_bare_pipe_echo_cat() {
-    let Some(tar) = bash_sandbox_tar() else { return };
+    let Some(tar) = bash_sandbox_tar() else {
+        return;
+    };
     let stats = run_trials(&tar, "echo works | cat", "works", 20, "5");
     report_bare_pipe_result("echo | cat", &stats);
 }
@@ -1335,7 +1383,9 @@ fn test_tar_bare_pipe_echo_cat() {
 #[cfg(target_arch = "x86_64")]
 #[test]
 fn test_tar_bare_pipe_echo_sort() {
-    let Some(tar) = bash_sandbox_tar() else { return };
+    let Some(tar) = bash_sandbox_tar() else {
+        return;
+    };
     let stats = run_trials(&tar, "echo zzz | sort", "zzz", 20, "5");
     report_bare_pipe_result("echo | sort", &stats);
 }
@@ -1343,7 +1393,9 @@ fn test_tar_bare_pipe_echo_sort() {
 #[cfg(target_arch = "x86_64")]
 #[test]
 fn test_tar_bare_pipe_ls_sort() {
-    let Some(tar) = bash_sandbox_tar() else { return };
+    let Some(tar) = bash_sandbox_tar() else {
+        return;
+    };
     let stats = run_trials(
         &tar,
         "echo a > /tmp/a; echo b > /tmp/b; ls /tmp | sort",
@@ -1357,7 +1409,9 @@ fn test_tar_bare_pipe_ls_sort() {
 #[cfg(target_arch = "x86_64")]
 #[test]
 fn test_tar_bare_pipe_grep() {
-    let Some(tar) = bash_sandbox_tar() else { return };
+    let Some(tar) = bash_sandbox_tar() else {
+        return;
+    };
     let stats = run_trials(
         &tar,
         "echo hello-grep | grep hello | cat",
@@ -1376,7 +1430,9 @@ fn test_tar_bare_pipe_grep() {
 #[cfg(target_arch = "x86_64")]
 #[test]
 fn test_tar_bare_vs_full_path_comparison() {
-    let Some(tar) = bash_sandbox_tar() else { return };
+    let Some(tar) = bash_sandbox_tar() else {
+        return;
+    };
     let n = 20;
 
     let full = run_trials(
@@ -1392,7 +1448,10 @@ fn test_tar_bare_vs_full_path_comparison() {
     eprintln!("  full path: {full}");
     eprintln!("  bare name: {bare}");
 
-    assert_eq!(full.pass, n, "full-path echo|cat should always work. {full}");
+    assert_eq!(
+        full.pass, n,
+        "full-path echo|cat should always work. {full}"
+    );
 
     if bare.pass == full.pass {
         eprintln!("  → No difference — bare names work as well as full paths!");

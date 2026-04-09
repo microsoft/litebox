@@ -1532,6 +1532,9 @@ dependencies = [
  "litebox_common_linux",
  "litebox_common_windows",
  "litebox_syscall_rewriter",
+ "serde",
+ "serde_json",
+ "simple-dns",
  "smoltcp",
  "tracing",
  "tracing-subscriber",
@@ -2804,6 +2807,15 @@ name = "similar"
 version = "2.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bbbb5d9659141646ae647b42fe094daf6c6192d1620870b449d9557f748b2daa"
+
+[[package]]
+name = "simple-dns"
+version = "0.9.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dee851d0e5e7af3721faea1843e8015e820a234f81fda3dea9247e15bac9a86a"
+dependencies = [
+ "bitflags 2.11.0",
+]
 
 [[package]]
 name = "slab"

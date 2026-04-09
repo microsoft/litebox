@@ -9,7 +9,9 @@
 //!   Launches a persistent bash session inside a single sandbox. Shell state
 //!   (cd, env vars, etc.) persists across commands.
 //!
-//! Spawns `litebox_runner_linux_userland` as a subprocess.
+//! Spawns `litebox_broker` and `litebox_runner_linux_userland` as subprocesses.
+//! The broker enforces sandbox policy (filesystem + network), while the runner
+//! provides the actual sandbox execution environment.
 
 use clap::Parser as _;
 
@@ -22,6 +24,7 @@ struct Cli {
     rootfs: std::path::PathBuf,
 
     /// Path to a JSON policy file restricting guest operations.
+    /// When provided, the broker enforces filesystem and network policy.
     #[arg(long, value_name = "PATH", value_hint = clap::ValueHint::FilePath)]
     policy: Option<std::path::PathBuf>,
 
@@ -100,21 +103,133 @@ fn find_runner() -> anyhow::Result<std::path::PathBuf> {
     anyhow::bail!(
         "Could not find litebox_runner_linux_userland. \
          Set LITEBOX_RUNNER env var or build it with: \
-         cargo build -p litebox_runner_linux_userland --features audit_log,policy"
+         cargo build -p litebox_runner_linux_userland --features audit_log"
     );
 }
 
+/// Find the litebox_broker binary.
+fn find_broker() -> anyhow::Result<std::path::PathBuf> {
+    if let Ok(path) = std::env::var("LITEBOX_BROKER") {
+        let p = std::path::PathBuf::from(path);
+        if p.exists() {
+            return Ok(p);
+        }
+    }
+
+    if let Ok(exe) = std::env::current_exe() {
+        let sibling = exe
+            .parent()
+            .unwrap_or(std::path::Path::new("."))
+            .join("litebox_broker");
+        if sibling.exists() {
+            return Ok(sibling);
+        }
+    }
+
+    for candidate in [
+        "/mnt/c/src/litebox/target/debug/litebox_broker",
+        "./target/debug/litebox_broker",
+    ] {
+        let p = std::path::PathBuf::from(candidate);
+        if p.exists() {
+            return Ok(p);
+        }
+    }
+
+    anyhow::bail!(
+        "Could not find litebox_broker. \
+         Set LITEBOX_BROKER env var or build it with: \
+         cargo build -p litebox_broker"
+    );
+}
+
+/// Managed broker process. Spawns the broker as a child and provides the IPC
+/// socket path for the runner to connect to.
+struct BrokerProcess {
+    child: std::process::Child,
+    socket_path: std::path::PathBuf,
+}
+
+impl BrokerProcess {
+    /// Spawn the broker with the given rootfs and optional policy file.
+    ///
+    /// The broker listens on a Unix domain socket at a temporary path.
+    /// The runner connects to it via `--network-broker`.
+    fn spawn(rootfs: &std::path::Path, policy: Option<&std::path::Path>) -> anyhow::Result<Self> {
+        let broker = find_broker()?;
+
+        // Create a temporary socket path.
+        let socket_path =
+            std::env::temp_dir().join(format!("litebox-broker-{}.sock", std::process::id()));
+        // Clean up any stale socket from a previous run.
+        let _ = std::fs::remove_file(&socket_path);
+
+        let mut cmd = std::process::Command::new(&broker);
+        cmd.arg("--network-proxy-listen").arg(&socket_path);
+
+        // Expose the rootfs directory for 9P access. The tar rootfs itself is
+        // extracted by the runner, so we expose the rootfs's parent directory
+        // (or the rootfs itself if it's a directory).
+        if rootfs.is_dir() {
+            cmd.arg("--root-dir").arg(rootfs);
+        }
+
+        cmd.arg("--rewrite-syscalls");
+
+        if let Some(p) = policy {
+            cmd.arg("--policy").arg(p);
+        }
+
+        let child = cmd
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::inherit())
+            .stderr(std::process::Stdio::inherit())
+            .spawn()
+            .map_err(|e| anyhow::anyhow!("Failed to spawn litebox_broker: {e}"))?;
+
+        // Give the broker a moment to create the socket.
+        for _ in 0..50 {
+            if socket_path.exists() {
+                return Ok(Self { child, socket_path });
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+
+        Ok(Self { child, socket_path })
+    }
+
+    /// Get the IPC socket path for the runner's `--network-broker` flag.
+    fn socket_path(&self) -> &std::path::Path {
+        &self.socket_path
+    }
+}
+
+impl Drop for BrokerProcess {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        let _ = std::fs::remove_file(&self.socket_path);
+    }
+}
+
 /// Build the base runner command with common flags.
-fn runner_command(cli: &Cli) -> anyhow::Result<std::process::Command> {
+fn runner_command(
+    cli: &Cli,
+    broker: Option<&BrokerProcess>,
+) -> anyhow::Result<std::process::Command> {
     let runner = find_runner()?;
     let mut cmd = std::process::Command::new(&runner);
     cmd.arg("--unstable");
     cmd.arg("--initial-files").arg(&cli.rootfs);
     cmd.arg("--program-from-tar");
 
-    if let Some(ref policy) = cli.policy {
-        cmd.arg("--policy").arg(policy);
+    // When a broker is running, connect the runner to it for network access.
+    // Policy is enforced by the broker, not the runner.
+    if let Some(b) = broker {
+        cmd.arg("--network-broker")
+            .arg(b.socket_path().to_str().unwrap_or(""));
     }
+
     if let Some(ref audit_log) = cli.audit_log {
         cmd.arg("--audit-log").arg(audit_log);
     }
@@ -149,14 +264,27 @@ fn runner_command(cli: &Cli) -> anyhow::Result<std::process::Command> {
 /// (the sandbox reports stdin as a TTY, which would cause bash to enter
 /// interactive/readline mode and hang).
 fn interactive(cli: &Cli) -> anyhow::Result<()> {
-    let mut cmd = runner_command(cli)?;
+    let broker = if cli.policy.is_some() {
+        Some(BrokerProcess::spawn(&cli.rootfs, cli.policy.as_deref())?)
+    } else {
+        None
+    };
+
+    let mut cmd = runner_command(cli, broker.as_ref())?;
 
     // Launch bash in non-editing script mode:
     // --norc --noprofile: skip startup files
     // --noediting: disable readline (avoids hang on TTY stdin)
     // +m: disable job control (setpgid fails in the sandbox, breaking pipes)
     // -s: read commands from stdin
-    cmd.args([&cli.shell, "--norc", "--noprofile", "--noediting", "+m", "-s"]);
+    cmd.args([
+        &cli.shell,
+        "--norc",
+        "--noprofile",
+        "--noediting",
+        "+m",
+        "-s",
+    ]);
 
     // Pass stdin/stdout/stderr straight through. Audit events go directly
     // to the log file via the runner's --audit-log flag (no stderr capture).
@@ -164,9 +292,12 @@ fn interactive(cli: &Cli) -> anyhow::Result<()> {
         .stdout(std::process::Stdio::inherit())
         .stderr(std::process::Stdio::inherit());
 
-    let status = cmd.status().map_err(|e| {
-        anyhow::anyhow!("Failed to spawn litebox_runner_linux_userland: {e}")
-    })?;
+    let status = cmd
+        .status()
+        .map_err(|e| anyhow::anyhow!("Failed to spawn litebox_runner_linux_userland: {e}"))?;
+
+    // Broker is dropped here, which kills the broker process and cleans up.
+    drop(broker);
 
     if !status.success() {
         std::process::exit(status.code().unwrap_or(1));
@@ -176,7 +307,13 @@ fn interactive(cli: &Cli) -> anyhow::Result<()> {
 
 /// Direct mode: run a single command.
 fn direct(cli: &Cli) -> anyhow::Result<()> {
-    let mut cmd = runner_command(cli)?;
+    let broker = if cli.policy.is_some() {
+        Some(BrokerProcess::spawn(&cli.rootfs, cli.policy.as_deref())?)
+    } else {
+        None
+    };
+
+    let mut cmd = runner_command(cli, broker.as_ref())?;
     cmd.args(&cli.command);
 
     cmd.stdin(std::process::Stdio::inherit())
@@ -186,9 +323,11 @@ fn direct(cli: &Cli) -> anyhow::Result<()> {
     let status = cmd.status().map_err(|e| {
         anyhow::anyhow!(
             "Failed to spawn litebox_runner_linux_userland: {e}\n\
-             Build it with: cargo build -p litebox_runner_linux_userland --features audit_log,policy"
+             Build it with: cargo build -p litebox_runner_linux_userland --features audit_log"
         )
     })?;
+
+    drop(broker);
 
     if !status.success() {
         std::process::exit(status.code().unwrap_or(1));
