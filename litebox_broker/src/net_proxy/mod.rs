@@ -24,6 +24,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
+use crate::audit::AuditLog;
 use crate::sandbox_policy::SandboxPolicy;
 use crate::sock_compat::{
     self, AsRawSock, IpcListener, IpcStream, POLLERR, POLLHUP, POLLIN, POLLOUT, PollFd, RawSock,
@@ -603,6 +604,7 @@ pub fn run(
     local_services: Option<LocalServiceRegistry>,
     accept_listener: Option<&IpcListener>,
     sandbox_policy: Option<Arc<SandboxPolicy>>,
+    audit_log: Option<AuditLog>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     run_with_session_slots(
         ipc_fd,
@@ -611,6 +613,7 @@ pub fn run(
         accept_listener,
         Arc::new(AtomicUsize::new(0)),
         sandbox_policy,
+        audit_log,
     )
 }
 
@@ -621,6 +624,7 @@ pub fn run_with_session_slots(
     accept_listener: Option<&IpcListener>,
     session_slots: Arc<AtomicUsize>,
     sandbox_policy: Option<Arc<SandboxPolicy>>,
+    audit_log: Option<AuditLog>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     run_inner(
         ipc_fd,
@@ -629,6 +633,7 @@ pub fn run_with_session_slots(
         accept_listener,
         session_slots,
         sandbox_policy,
+        audit_log,
     )
 }
 
@@ -639,6 +644,7 @@ fn run_inner(
     accept_listener: Option<&IpcListener>,
     session_slots: Arc<AtomicUsize>,
     sandbox_policy: Option<Arc<SandboxPolicy>>,
+    audit_log: Option<AuditLog>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     info!("network proxy starting");
 
@@ -762,10 +768,18 @@ fn run_inner(
                             let hostname_info =
                                 hostname.map(|h| format!(" ({h})")).unwrap_or_default();
                             info!("policy denied TCP to {dest_ipv4}:{dst_port}{hostname_info}");
+                            if let Some(ref al) = audit_log {
+                                al.tcp_denied(hostname, dest_ipv4, dst_port);
+                            }
                             suppress_from_smoltcp = true;
                         }
                     }
                     if !suppress_from_smoltcp {
+                        // Policy allowed (or no policy). Log the allowed connection.
+                        if let Some(ref al) = audit_log {
+                            let hostname = dns_tracker.lookup(dest_ipv4);
+                            al.tcp_allowed(hostname, dest_ipv4, dst_port);
+                        }
                         // Start non-blocking host connect.
                         let total_flows = pending_connects.len()
                             + ready_host_streams.len()
@@ -847,6 +861,9 @@ fn run_inner(
                             "policy denied UDP to {}:{dst_port}{hostname_info}",
                             Ipv4Addr::from(dst_ip)
                         );
+                        if let Some(ref al) = audit_log {
+                            al.udp_denied(hostname, Ipv4Addr::from(dst_ip), dst_port);
+                        }
                         udp_blocked = true;
                     }
                 }
@@ -908,7 +925,7 @@ fn run_inner(
         relay_local(&mut sockets, &mut local_bridges);
 
         // Step 6: Check for UDP replies from host and send back to guest.
-        relay_udp_replies(&mut udp_flows, &mut device, &mut dns_tracker);
+        relay_udp_replies(&mut udp_flows, &mut device, &mut dns_tracker, &audit_log);
 
         // Step 7: GC idle UDP flows.
         udp_flows.retain(|key, flow| {
@@ -1103,6 +1120,7 @@ fn run_inner(
                 };
                 let session_slots = Arc::clone(&session_slots);
                 let sandbox_policy = sandbox_policy.clone();
+                let audit_log = audit_log.clone();
                 std::thread::spawn(move || {
                     let _session_permit = session_permit;
                     if let Err(e) = send_handshake_response(&stream) {
@@ -1110,7 +1128,7 @@ fn run_inner(
                         return;
                     }
                     info!("accepted additional LBNP client, handshake complete");
-                    if let Err(e) = run_inner(stream, true, local_services, None, session_slots, sandbox_policy) {
+                    if let Err(e) = run_inner(stream, true, local_services, None, session_slots, sandbox_policy, audit_log) {
                         tracing::error!("network proxy error: {e}");
                     }
                 });
@@ -2142,6 +2160,7 @@ fn relay_udp_replies(
     flows: &mut HashMap<UdpFlowKey, UdpFlow>,
     device: &mut IpcDevice,
     dns_tracker: &mut dns_tracker::DnsTracker,
+    audit_log: &Option<AuditLog>,
 ) {
     for flow in flows.values_mut() {
         let mut buf = [0u8; 65535];
@@ -2152,7 +2171,11 @@ fn relay_udp_replies(
 
                     // Track DNS responses for hostname-based policy.
                     if flow.dest_port == 53 {
-                        dns_tracker.process_response(&buf[..n]);
+                        if let Some((hostname, ips)) = dns_tracker.process_response(&buf[..n]) {
+                            if let Some(al) = audit_log {
+                                al.dns_resolved(&hostname, &ips);
+                            }
+                        }
                     }
 
                     // Construct raw IP+UDP packet.

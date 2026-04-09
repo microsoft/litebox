@@ -58,6 +58,51 @@ begin {
             return
         }
 
+        # Broker policy events (have "event" field instead of "syscall").
+        if ($evt.event) {
+            if ($Prefix) { Write-Host -NoNewline -ForegroundColor DarkGray $Prefix }
+            switch ($evt.event) {
+                'policy_loaded' {
+                    Write-Host -ForegroundColor Cyan "=== Sandbox Policy Loaded ==="
+                    if ($evt.network_deny_all) {
+                        if ($Prefix) { Write-Host -NoNewline -ForegroundColor DarkGray $Prefix }
+                        Write-Host -ForegroundColor Cyan "  Network: deny all except:"
+                        foreach ($rule in $evt.network_allow) {
+                            if ($Prefix) { Write-Host -NoNewline -ForegroundColor DarkGray $Prefix }
+                            Write-Host -ForegroundColor Green "    + $rule"
+                        }
+                        if (-not $evt.network_allow -or $evt.network_allow.Count -eq 0) {
+                            if ($Prefix) { Write-Host -NoNewline -ForegroundColor DarkGray $Prefix }
+                            Write-Host -ForegroundColor Red "    (none - all network blocked)"
+                        }
+                    } else {
+                        if ($Prefix) { Write-Host -NoNewline -ForegroundColor DarkGray $Prefix }
+                        Write-Host -ForegroundColor Yellow "  Network: allow all"
+                    }
+                }
+                'dns_resolved' {
+                    $ipList = $evt.ips -join ', '
+                    Write-Host -ForegroundColor Cyan "DNS $($evt.hostname) -> $ipList"
+                }
+                'tcp_allowed' {
+                    $target = if ($evt.hostname) { "$($evt.hostname) ($($evt.ip))" } else { "$($evt.ip)" }
+                    Write-Host -ForegroundColor Green "+ TCP $target`:$($evt.port)"
+                }
+                'tcp_denied' {
+                    $target = if ($evt.hostname) { "$($evt.hostname) ($($evt.ip))" } else { "$($evt.ip)" }
+                    Write-Host -ForegroundColor Red "X BLOCKED TCP $target`:$($evt.port)"
+                }
+                'udp_denied' {
+                    $target = if ($evt.hostname) { "$($evt.hostname) ($($evt.ip))" } else { "$($evt.ip)" }
+                    Write-Host -ForegroundColor Red "X BLOCKED UDP $target`:$($evt.port)"
+                }
+                default {
+                    Write-Host -ForegroundColor DarkGray "[broker] $($evt.event): $json"
+                }
+            }
+            return
+        }
+
         $name = $evt.syscall
         if ($Filter -and $name -notmatch $Filter) { return }
 

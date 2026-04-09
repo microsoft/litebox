@@ -63,6 +63,12 @@ struct Cli {
     /// operations and network connections.
     #[arg(long, value_name = "PATH", value_hint = clap::ValueHint::FilePath)]
     policy: Option<PathBuf>,
+
+    /// Path to write structured audit events (JSONL). The broker appends
+    /// policy decisions (dns_resolved, tcp_allowed, tcp_denied, etc.) to
+    /// this file, which may be shared with the runner's syscall audit log.
+    #[arg(long = "audit-log", value_name = "PATH", value_hint = clap::ValueHint::FilePath)]
+    audit_log: Option<PathBuf>,
 }
 
 fn build_policy(
@@ -189,6 +195,32 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
     let sandbox_policy = load_sandbox_policy(&cli);
 
+    // Open the audit log file for structured broker events.
+    let audit_log =
+        cli.audit_log
+            .as_ref()
+            .and_then(|path| match litebox_broker::audit::AuditLog::open(path) {
+                Ok(al) => {
+                    info!(?path, "audit log opened");
+                    Some(al)
+                }
+                Err(e) => {
+                    tracing::error!("failed to open audit log {}: {e}", path.display());
+                    None
+                }
+            });
+
+    // Log policy summary to audit.
+    if let (Some(al), Some(sp)) = (&audit_log, &sandbox_policy) {
+        al.policy_loaded(
+            cli.policy
+                .as_ref()
+                .map(|p| p.to_str().unwrap_or("<non-utf8>"))
+                .unwrap_or("<default>"),
+            sp,
+        );
+    }
+
     // Network proxy mode (fd passed from runner — Unix only).
     #[cfg(unix)]
     if let Some(fd_num) = cli.network_proxy_fd {
@@ -199,7 +231,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let ipc = IpcStream::from_owned_fd(fd);
         let elf_cache = litebox_broker::nine_p::server::Server::new_elf_cache();
         let registry = build_local_services(&cli, elf_cache, &sandbox_policy);
-        return litebox_broker::net_proxy::run(ipc, false, registry, None, sandbox_policy);
+        return litebox_broker::net_proxy::run(
+            ipc,
+            false,
+            registry,
+            None,
+            sandbox_policy,
+            audit_log,
+        );
     }
     #[cfg(not(unix))]
     if cli.network_proxy_fd.is_some() {
@@ -247,6 +286,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Some(&listener),
                 Arc::clone(&extra_session_slots),
                 sandbox_policy.clone(),
+                audit_log.clone(),
             ) {
                 tracing::error!("network proxy error: {e}");
             }

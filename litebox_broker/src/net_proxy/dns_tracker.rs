@@ -105,20 +105,20 @@ impl DnsTracker {
     /// Extracts A record answers and maps the resolved IPs to the hostname
     /// from the original query.
     ///
-    /// Returns `true` if the packet was recognized as a DNS response with
-    /// relevant records.
-    pub fn process_response(&mut self, payload: &[u8]) -> bool {
+    /// Returns `Some((hostname, ips))` if the packet was recognized as a DNS
+    /// response with A records, `None` otherwise.
+    pub fn process_response(&mut self, payload: &[u8]) -> Option<(String, Vec<Ipv4Addr>)> {
         let packet = match Packet::parse(payload) {
             Ok(p) => p,
             Err(e) => {
                 trace!("DNS parse error (response): {e}");
-                return false;
+                return None;
             }
         };
 
         // Must be a response (QR=1).
         if !packet.has_flags(PacketFlag::RESPONSE) {
-            return false;
+            return None;
         }
 
         let id = packet.id();
@@ -140,11 +140,11 @@ impl DnsTracker {
         };
 
         if hostname.is_empty() {
-            return false;
+            return None;
         }
 
         let now = Instant::now();
-        let mut found = false;
+        let mut resolved_ips = Vec::new();
 
         for answer in packet.answers.iter() {
             let ResourceRecord { rdata, ttl, .. } = answer;
@@ -158,11 +158,15 @@ impl DnsTracker {
 
                 debug!("DNS response: {hostname} → {ip} (TTL {ttl}s)");
                 self.insert(ip, hostname.clone(), now + ttl_duration);
-                found = true;
+                resolved_ips.push(ip);
             }
         }
 
-        found
+        if resolved_ips.is_empty() {
+            None
+        } else {
+            Some((hostname, resolved_ips))
+        }
     }
 
     /// Insert a hostname mapping, evicting oldest entries if at capacity.
@@ -250,7 +254,11 @@ mod tests {
 
         let ip = Ipv4Addr::new(140, 82, 121, 6);
         let response = build_dns_response(42, "api.github.com", &[ip], 300);
-        assert!(tracker.process_response(&response));
+        let result = tracker.process_response(&response);
+        assert!(result.is_some());
+        let (hostname, ips) = result.unwrap();
+        assert_eq!(hostname, "api.github.com");
+        assert_eq!(ips, vec![ip]);
 
         assert_eq!(tracker.lookup(ip), Some("api.github.com"));
         assert_eq!(tracker.lookup(Ipv4Addr::new(1, 2, 3, 4)), None);
@@ -284,6 +292,6 @@ mod tests {
     fn non_dns_packet_rejected() {
         let mut tracker = DnsTracker::new();
         assert!(!tracker.process_query(&[0, 1, 2, 3]));
-        assert!(!tracker.process_response(&[0, 1, 2, 3]));
+        assert!(tracker.process_response(&[0, 1, 2, 3]).is_none());
     }
 }

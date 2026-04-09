@@ -273,6 +273,7 @@ impl BrokerProcess {
         rootfs: &std::path::Path,
         policy: Option<&std::path::Path>,
         log_file: Option<&std::path::Path>,
+        audit_log: Option<&std::path::Path>,
     ) -> anyhow::Result<Self> {
         let broker = find_broker()?;
 
@@ -296,6 +297,11 @@ impl BrokerProcess {
 
         if let Some(p) = policy {
             cmd.arg("--policy").arg(p);
+        }
+
+        // Share the audit log file with the broker for unified event tracing.
+        if let Some(p) = audit_log {
+            cmd.arg("--audit-log").arg(p);
         }
 
         let child = cmd
@@ -397,7 +403,12 @@ fn spawn_broker(
     };
     // Write broker logs to a .log file alongside the audit .jsonl files.
     let broker_log = audit_log_file.map(|p| p.with_extension("broker.log"));
-    let broker = BrokerProcess::spawn(&cli.rootfs, Some(&policy_path), broker_log.as_deref())?;
+    let broker = BrokerProcess::spawn(
+        &cli.rootfs,
+        Some(&policy_path),
+        broker_log.as_deref(),
+        audit_log_file,
+    )?;
     Ok((broker, temp_policy))
 }
 fn runner_command(

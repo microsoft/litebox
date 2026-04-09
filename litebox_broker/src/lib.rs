@@ -8,6 +8,7 @@
 //! with policy enforcement and optional ELF syscall rewriting.
 //! Also provides a network proxy that bridges guest networking over IPC.
 
+pub mod audit;
 pub mod net_proxy;
 pub mod nine_p;
 pub mod policy;
