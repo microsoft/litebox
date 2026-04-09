@@ -8,7 +8,7 @@
             "args": [
                 "-NoProfile",
                 "-Command",
-                "$dir = 'C:\\src\\litebox\\target\\litebox-audit'; while (-not (Test-Path $dir)) { Start-Sleep -Milliseconds 500 }; $latest = Get-ChildItem $dir -Filter '*.jsonl' | Sort-Object LastWriteTime -Descending | Select-Object -First 1; if ($latest) { Write-Host \"Tailing: $($latest.FullName)\" -ForegroundColor DarkGray; Get-Content $latest.FullName -Wait -Tail 0 | ForEach-Object { if ($_ -match '^\\{') { $_ | ConvertFrom-Json | Format-Table -AutoSize syscall, args, result } else { Write-Host $_ -ForegroundColor DarkGray } } } else { Write-Host 'No audit logs found yet.' }"
+                "$dir = 'C:\\src\\litebox\\target\\litebox-audit'; $start = Get-Date; Write-Host 'Waiting for new audit session...' -ForegroundColor DarkGray; while ($true) { if (Test-Path $dir) { $f = Get-ChildItem $dir -Filter '*.jsonl' | Where-Object { $_.LastWriteTime -ge $start } | Sort-Object LastWriteTime -Descending | Select-Object -First 1; if ($f) { Write-Host \"Tailing: $($f.FullName)\" -ForegroundColor DarkGray; Get-Content $f.FullName -Wait -Tail 0 | ForEach-Object { if ($_ -match '^\\{') { $_ | ConvertFrom-Json | Format-Table -AutoSize syscall, args, result } else { Write-Host $_ -ForegroundColor DarkGray } }; break } }; Start-Sleep -Milliseconds 500 }"
             ],
             "problemMatcher": [],
             "presentation": {
@@ -25,7 +25,7 @@
                 "-NoProfile",
                 "-ExecutionPolicy", "Bypass",
                 "-Command",
-                "$dir = 'C:\\src\\litebox\\target\\litebox-audit'; while (-not (Test-Path $dir)) { Start-Sleep -Milliseconds 500 }; $latest = Get-ChildItem $dir -Filter '*.jsonl' | Sort-Object LastWriteTime -Descending | Select-Object -First 1; if ($latest) { Write-Host \"Tailing: $($latest.FullName)\" -ForegroundColor DarkGray; Get-Content $latest.FullName -Wait -Tail 0 | & 'C:\\src\\litebox\\litebox_tool_executor\\scripts\\View-AuditLog.ps1' } else { Write-Host 'No audit logs found yet.' }"
+                "$dir = 'C:\\src\\litebox\\target\\litebox-audit'; $start = Get-Date; Write-Host 'Waiting for new audit session...' -ForegroundColor DarkGray; while ($true) { if (Test-Path $dir) { $f = Get-ChildItem $dir -Filter '*.jsonl' | Where-Object { $_.LastWriteTime -ge $start } | Sort-Object LastWriteTime -Descending | Select-Object -First 1; if ($f) { Write-Host \"Tailing: $($f.FullName)\" -ForegroundColor DarkGray; Get-Content $f.FullName -Wait -Tail 0 | & 'C:\\src\\litebox\\litebox_tool_executor\\scripts\\View-AuditLog.ps1'; break } }; Start-Sleep -Milliseconds 500 }"
             ],
             "problemMatcher": [],
             "runOptions": {
