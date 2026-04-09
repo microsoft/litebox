@@ -233,7 +233,12 @@ impl BrokerProcess {
     ///
     /// The broker listens on a Unix domain socket at a temporary path.
     /// The runner connects to it via `--network-broker`.
-    fn spawn(rootfs: &std::path::Path, policy: Option<&std::path::Path>) -> anyhow::Result<Self> {
+    /// If `log_file` is provided, broker stdout/stderr go there instead of /dev/null.
+    fn spawn(
+        rootfs: &std::path::Path,
+        policy: Option<&std::path::Path>,
+        log_file: Option<&std::path::Path>,
+    ) -> anyhow::Result<Self> {
         let broker = find_broker()?;
 
         // Create a temporary socket path.
@@ -260,8 +265,26 @@ impl BrokerProcess {
 
         let child = cmd
             .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
+            .stdout(if let Some(p) = log_file {
+                std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(p)
+                    .map(std::process::Stdio::from)
+                    .unwrap_or(std::process::Stdio::null())
+            } else {
+                std::process::Stdio::null()
+            })
+            .stderr(if let Some(p) = log_file {
+                std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(p)
+                    .map(std::process::Stdio::from)
+                    .unwrap_or(std::process::Stdio::null())
+            } else {
+                std::process::Stdio::null()
+            })
             .spawn()
             .map_err(|e| anyhow::anyhow!("Failed to spawn litebox_broker: {e}"))?;
 
@@ -326,7 +349,10 @@ impl Drop for TempFile {
 }
 
 /// Spawn the broker, using the user-provided policy or the built-in default.
-fn spawn_broker(cli: &Cli) -> anyhow::Result<(BrokerProcess, Option<TempFile>)> {
+fn spawn_broker(
+    cli: &Cli,
+    audit_log_file: Option<&std::path::Path>,
+) -> anyhow::Result<(BrokerProcess, Option<TempFile>)> {
     let (policy_path, temp_policy) = if let Some(ref p) = cli.policy {
         (p.clone(), None)
     } else {
@@ -334,7 +360,10 @@ fn spawn_broker(cli: &Cli) -> anyhow::Result<(BrokerProcess, Option<TempFile>)> 
         let path = tmp.0.clone();
         (path, Some(tmp))
     };
-    let broker = BrokerProcess::spawn(&cli.rootfs, Some(&policy_path))?;
+    // Write broker logs to a .log file alongside the audit .jsonl files.
+    let broker_log = audit_log_file.map(|p| p.with_extension("broker.log"));
+    let broker =
+        BrokerProcess::spawn(&cli.rootfs, Some(&policy_path), broker_log.as_deref())?;
     Ok((broker, temp_policy))
 }
 fn runner_command(
@@ -390,7 +419,7 @@ fn runner_command(
 /// This prevents bash from enabling job control (which breaks pipelines in
 /// the sandbox because setpgid fails for the session-leader init process).
 fn interactive(cli: &Cli, audit_log_file: Option<&std::path::Path>) -> anyhow::Result<()> {
-    let (broker, _temp_policy) = spawn_broker(cli)?;
+    let (broker, _temp_policy) = spawn_broker(cli, audit_log_file)?;
 
     let mut cmd = runner_command(cli, audit_log_file, Some(&broker))?;
 
@@ -447,7 +476,7 @@ fn interactive(cli: &Cli, audit_log_file: Option<&std::path::Path>) -> anyhow::R
 
 /// Direct mode: run a single command.
 fn direct(cli: &Cli, audit_log_file: Option<&std::path::Path>) -> anyhow::Result<()> {
-    let (broker, _temp_policy) = spawn_broker(cli)?;
+    let (broker, _temp_policy) = spawn_broker(cli, audit_log_file)?;
 
     let mut cmd = runner_command(cli, audit_log_file, Some(&broker))?;
     cmd.args(&cli.command);
