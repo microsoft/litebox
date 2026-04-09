@@ -20,7 +20,7 @@ WORKSPACE="$(cd "$SCRIPT_DIR/../.." && pwd)"
 REWRITER="$WORKSPACE/target/debug/litebox_syscall_rewriter"
 OUTPUT="${1:-$WORKSPACE/target/bash-sandbox.tar}"
 
-UTILS=(cat ls grep sort uniq wc find head tail mkdir rm cp mv echo tr sed awk pwd dirname basename env printenv date id uname xargs tee touch chmod)
+UTILS=(cat ls grep sort uniq wc find head tail mkdir rm cp mv echo tr sed awk pwd dirname basename env printenv date id uname xargs tee touch chmod wget)
 
 if [ ! -f "$REWRITER" ]; then
     echo "ERROR: litebox_syscall_rewriter not found at $REWRITER"
@@ -132,6 +132,15 @@ mkdir -p "$STAGING/tmp" "$STAGING/etc"
 # The broker's smoltcp proxy intercepts DNS queries for hostname-based
 # network policy enforcement.
 echo "nameserver 10.0.0.1" > "$STAGING/etc/resolv.conf"
+
+# CA certificates for HTTPS (wget, curl, etc.)
+if [ -f /etc/ssl/certs/ca-certificates.crt ]; then
+    mkdir -p "$STAGING/etc/ssl/certs" "$STAGING/usr/lib/ssl"
+    cp /etc/ssl/certs/ca-certificates.crt "$STAGING/etc/ssl/certs/"
+    # OpenSSL looks for /usr/lib/ssl/cert.pem by default.
+    cp /etc/ssl/certs/ca-certificates.crt "$STAGING/usr/lib/ssl/cert.pem"
+    echo "  Copied CA certificates"
+fi
 
 # Ensure the dynamic linker is available at its PT_INTERP path
 # (bash expects /lib64/ld-linux-x86-64.so.2 but readlink resolves
