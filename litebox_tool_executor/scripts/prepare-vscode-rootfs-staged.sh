@@ -242,6 +242,12 @@ mkdir -p "$OUTPUT/tmp" "$OUTPUT/etc" "$OUTPUT/dev" "$OUTPUT/proc"
 mkdir -p "$OUTPUT/workspaces" "$OUTPUT/root" "$OUTPUT/home"
 mkdir -p "$OUTPUT/bin" "$OUTPUT/usr/bin" "$OUTPUT/usr/local/bin"
 
+# VS Code Server data directories (writable at runtime)
+mkdir -p "$OUTPUT/root/.vscode-server/data/logs"
+mkdir -p "$OUTPUT/root/.vscode-server/data/Machine"
+mkdir -p "$OUTPUT/root/.vscode-server/extensions"
+chmod -R 777 "$OUTPUT/root/.vscode-server"
+
 # DNS resolver pointing at broker virtual IP
 echo "nameserver 10.0.0.1" > "$OUTPUT/etc/resolv.conf"
 
