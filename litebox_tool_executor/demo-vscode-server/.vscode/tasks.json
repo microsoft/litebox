@@ -26,12 +26,11 @@
         {
             "label": "LiteBox: Tail Audit Log",
             "type": "process",
-            "command": "powershell.exe",
+            "command": "wsl.exe",
             "args": [
-                "-NoProfile",
-                "-ExecutionPolicy", "Bypass",
-                "-Command",
-                "Get-ChildItem /tmp/litebox-vscode-server-logs/*.jsonl -ErrorAction SilentlyContinue | Sort-Object LastWriteTime | Select-Object -Last 1 | ForEach-Object { Get-Content $_.FullName -Wait -Tail 20 }"
+                "-d", "Ubuntu", "--",
+                "bash", "-c",
+                "sleep 3 && tail -f $(ls -t /tmp/litebox-vscode-server-logs/*.jsonl 2>/dev/null | head -1) 2>/dev/null || echo 'No audit log found yet — waiting...' && sleep 30"
             ],
             "problemMatcher": [],
             "isBackground": true,

@@ -213,11 +213,37 @@ impl russh::server::Handler for SshSession {
     async fn channel_open_session(
         &mut self,
         channel: Channel<Msg>,
-        session: &mut Session,
+        _session: &mut Session,
     ) -> Result<bool, Self::Error> {
-        eprintln!("[ssh] session channel opened");
-        self.spawn_litebox(channel.id(), session.handle()).await?;
+        eprintln!("[ssh] session channel opened (id={})", channel.id());
+        // Don't spawn yet — wait for exec_request or shell_request from the
+        // client. VS Code Remote-SSH opens the channel first, sends env vars,
+        // then sends an exec request with the server startup command.
         Ok(true)
+    }
+
+    async fn exec_request(
+        &mut self,
+        channel_id: ChannelId,
+        data: &[u8],
+        session: &mut Session,
+    ) -> Result<(), Self::Error> {
+        let cmd = String::from_utf8_lossy(data);
+        eprintln!("[ssh] exec request: {cmd}");
+        // VS Code sends a command to start the server. We ignore the command
+        // and always launch our litebox VS Code Server instead.
+        self.spawn_litebox(channel_id, session.handle()).await?;
+        Ok(())
+    }
+
+    async fn shell_request(
+        &mut self,
+        channel_id: ChannelId,
+        session: &mut Session,
+    ) -> Result<(), Self::Error> {
+        eprintln!("[ssh] shell request");
+        self.spawn_litebox(channel_id, session.handle()).await?;
+        Ok(())
     }
 
     async fn auth_publickey(
