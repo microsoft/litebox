@@ -572,6 +572,10 @@ fn direct(cli: &Cli, audit_log_file: Option<&std::path::Path>) -> anyhow::Result
 /// transport. The server protocol runs over stdin/stdout so VS Code's Remote
 /// extension can connect via the same pipe mechanism as `docker exec -i`.
 ///
+/// Broker logs go to a `.broker.log` file and syscall audit to a `.jsonl`
+/// file (auto-created in /tmp if `--audit-log` is not specified). Share
+/// these files for debugging.
+///
 /// Usage:
 ///   litebox-tool-executor --rootfs /path/to/vscode-rootfs --vscode-server
 ///
@@ -585,8 +589,23 @@ fn vscode_server(cli: &Cli, audit_log_file: Option<&std::path::Path>) -> anyhow:
         );
     }
 
-    let (broker, _temp_policy) = spawn_broker(cli, audit_log_file)?;
-    let mut cmd = runner_command(cli, audit_log_file, Some(&broker))?;
+    // Auto-create an audit log directory if none was specified, so we always
+    // have broker + syscall logs available for debugging.
+    let auto_audit;
+    let audit = if let Some(p) = audit_log_file {
+        p
+    } else {
+        let dir = std::env::temp_dir().join("litebox-vscode-server-logs");
+        auto_audit = create_audit_log_file(&dir)?;
+        eprintln!(
+            "LiteBox VS Code Server logs: {}",
+            auto_audit.parent().unwrap_or(&dir).display()
+        );
+        &auto_audit
+    };
+
+    let (broker, _temp_policy) = spawn_broker(cli, Some(audit))?;
+    let mut cmd = runner_command(cli, Some(audit), Some(&broker))?;
 
     // VS Code Server entry point
     cmd.args([
@@ -606,11 +625,26 @@ fn vscode_server(cli: &Cli, audit_log_file: Option<&std::path::Path>) -> anyhow:
         cmd.args(&cli.command);
     }
 
-    // Inherit stdio: VS Code's Remote protocol runs over stdin/stdout.
-    // Broker logs go to the audit log file (if set) or /dev/null.
+    // Redirect server stderr to the audit log file so only the VS Code
+    // Remote JSON-RPC protocol flows over stdout. The broker already
+    // logs to a .broker.log file alongside this.
+    let log_file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(audit.with_extension("server.log"))
+        .ok()
+        .map(std::process::Stdio::from)
+        .unwrap_or(std::process::Stdio::inherit());
+
     cmd.stdin(std::process::Stdio::inherit())
         .stdout(std::process::Stdio::inherit())
-        .stderr(std::process::Stdio::inherit());
+        .stderr(log_file);
+
+    eprintln!(
+        "LiteBox VS Code Server starting (broker log: {}, server log: {})",
+        audit.with_extension("broker.log").display(),
+        audit.with_extension("server.log").display(),
+    );
 
     let status = cmd
         .status()
@@ -619,6 +653,14 @@ fn vscode_server(cli: &Cli, audit_log_file: Option<&std::path::Path>) -> anyhow:
     drop(broker);
 
     if !status.success() {
+        eprintln!(
+            "VS Code Server exited with code {}. Check logs in: {}",
+            status.code().unwrap_or(-1),
+            audit
+                .parent()
+                .unwrap_or(std::path::Path::new("/tmp"))
+                .display()
+        );
         std::process::exit(status.code().unwrap_or(1));
     }
     Ok(())
