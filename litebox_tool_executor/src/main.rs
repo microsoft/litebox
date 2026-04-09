@@ -568,19 +568,17 @@ fn direct(cli: &Cli, audit_log_file: Option<&std::path::Path>) -> anyhow::Result
     Ok(())
 }
 
-/// VS Code Server mode: run VS Code Server inside the sandbox with stdio
-/// transport. The server protocol runs over stdin/stdout so VS Code's Remote
-/// extension can connect via the same pipe mechanism as `docker exec -i`.
+/// VS Code Server mode: start an embedded SSH server that bridges VS Code
+/// Remote-SSH connections to a litebox-sandboxed VS Code Server.
 ///
-/// Broker logs go to a `.broker.log` file and syscall audit to a `.jsonl`
-/// file (auto-created in /tmp if `--audit-log` is not specified). Share
-/// these files for debugging.
+/// Starts a broker, then an SSH server on `localhost:<random-port>`. When
+/// VS Code connects via Remote-SSH, the SSH session spawns a litebox runner
+/// running VS Code Server. No shims, no global settings, no profiles needed.
 ///
 /// Usage:
 ///   litebox-tool-executor --rootfs /path/to/vscode-rootfs --vscode-server
-///
-/// The rootfs must be a directory (not a tar) containing pre-rewritten
-/// binaries, Node.js, and VS Code Server at /opt/vscode-server/.
+///   # prints: SSH listening on 127.0.0.1:<port>
+///   # then in VS Code: Remote-SSH → localhost:<port>
 fn vscode_server(cli: &Cli, audit_log_file: Option<&std::path::Path>) -> anyhow::Result<()> {
     if !cli.rootfs.is_dir() {
         anyhow::bail!(
@@ -589,79 +587,72 @@ fn vscode_server(cli: &Cli, audit_log_file: Option<&std::path::Path>) -> anyhow:
         );
     }
 
-    // Auto-create an audit log directory if none was specified, so we always
-    // have broker + syscall logs available for debugging.
+    // Auto-create an audit log directory if none was specified.
     let auto_audit;
     let audit = if let Some(p) = audit_log_file {
         p
     } else {
         let dir = std::env::temp_dir().join("litebox-vscode-server-logs");
         auto_audit = create_audit_log_file(&dir)?;
-        eprintln!(
-            "LiteBox VS Code Server logs: {}",
-            auto_audit.parent().unwrap_or(&dir).display()
-        );
         &auto_audit
     };
 
     let (broker, _temp_policy) = spawn_broker(cli, Some(audit))?;
-    let mut cmd = runner_command(cli, Some(audit), Some(&broker))?;
+    let socket_path = broker.socket_path().to_str().unwrap_or("").to_string();
+    let runner = find_runner()?;
+    let runner_path = runner.to_str().unwrap_or("").to_string();
 
-    // VS Code Server entry point
-    cmd.args([
-        "/usr/local/bin/node",
-        "/opt/vscode-server/out/server-main.js",
-        "--accept-server-license-terms",
-        "--without-connection-token",
-        "--disable-telemetry",
-        "--host",
-        "127.0.0.1",
-        "--port",
-        "0",
-    ]);
-
-    // Append any extra CLI args (e.g. --folder /workspaces/repo)
-    if !cli.command.is_empty() {
-        cmd.args(&cli.command);
+    // Build environment
+    let has = |prefix: &str| cli.env.iter().any(|e| e.starts_with(prefix));
+    let mut env_vars: Vec<String> = cli.env.clone();
+    if !has("LD_LIBRARY_PATH=") {
+        env_vars.push("LD_LIBRARY_PATH=/lib64:/lib/x86_64-linux-gnu:/lib".into());
+    }
+    if !has("HOME=") {
+        env_vars.push("HOME=/root".into());
+    }
+    if !has("PATH=") {
+        env_vars.push("PATH=/usr/local/bin:/usr/bin:/bin".into());
+    }
+    if !has("TERM=") {
+        env_vars.push("TERM=dumb".into());
     }
 
-    // Redirect server stderr to the audit log file so only the VS Code
-    // Remote JSON-RPC protocol flows over stdout. The broker already
-    // logs to a .broker.log file alongside this.
-    let log_file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(audit.with_extension("server.log"))
-        .ok()
-        .map(std::process::Stdio::from)
-        .unwrap_or(std::process::Stdio::inherit());
+    let ssh_config = litebox_tool_executor::ssh_server::LiteboxConfig {
+        runner_path,
+        broker_socket: socket_path,
+        rootfs: cli.rootfs.to_str().unwrap_or("").to_string(),
+        audit_log: Some(audit.to_str().unwrap_or("").to_string()),
+        extra_env: env_vars,
+        extra_args: cli.command.clone(),
+    };
 
-    cmd.stdin(std::process::Stdio::inherit())
-        .stdout(std::process::Stdio::inherit())
-        .stderr(log_file);
+    let rt = tokio::runtime::Runtime::new()?;
+    rt.block_on(async {
+        let (port, server_handle) =
+            litebox_tool_executor::ssh_server::start_ssh_server(ssh_config).await?;
 
-    eprintln!(
-        "LiteBox VS Code Server starting (broker log: {}, server log: {})",
-        audit.with_extension("broker.log").display(),
-        audit.with_extension("server.log").display(),
-    );
+        eprintln!();
+        eprintln!("==============================================");
+        eprintln!("  LiteBox VS Code Server (embedded SSH)");
+        eprintln!("  SSH listening on 127.0.0.1:{port}");
+        eprintln!();
+        eprintln!("  Connect from VS Code:");
+        eprintln!("    Remote-SSH → localhost:{port}");
+        eprintln!();
+        eprintln!("  Logs:");
+        eprintln!("    Syscalls: {}", audit.display());
+        eprintln!(
+            "    Broker:   {}",
+            audit.with_extension("broker.log").display()
+        );
+        eprintln!("==============================================");
+        eprintln!();
 
-    let status = cmd
-        .status()
-        .map_err(|e| anyhow::anyhow!("Failed to spawn litebox_runner_linux_userland: {e}"))?;
+        server_handle.await.ok();
+        Ok::<_, anyhow::Error>(())
+    })?;
 
     drop(broker);
-
-    if !status.success() {
-        eprintln!(
-            "VS Code Server exited with code {}. Check logs in: {}",
-            status.code().unwrap_or(-1),
-            audit
-                .parent()
-                .unwrap_or(std::path::Path::new("/tmp"))
-                .display()
-        );
-        std::process::exit(status.code().unwrap_or(1));
-    }
     Ok(())
 }
