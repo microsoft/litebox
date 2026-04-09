@@ -49,6 +49,24 @@ pub fn find_dependencies(prog: &str) -> Vec<String> {
         }
     }
 
+    // libgcc_s.so.1 is not always a direct link-time dependency (ldd won't list it), but
+    // glibc's pthread_cancel needs it at runtime for forced stack unwinding. Without it the
+    // we get SIGABRTs.
+    let libgcc_s: Option<String> = [
+        "/usr/lib/x86_64-linux-gnu/libgcc_s.so.1",
+        "/lib/x86_64-linux-gnu/libgcc_s.so.1",
+        "/usr/lib64/libgcc_s.so.1",
+        "/lib64/libgcc_s.so.1",
+    ]
+    .into_iter()
+    .map(String::from)
+    .find(|p| Path::new(p).exists());
+    if let Some(libgcc_s) = libgcc_s
+        && !paths.contains(&libgcc_s)
+    {
+        paths.push(libgcc_s);
+    }
+
     println!("Resolved dependency paths: {paths:?}");
 
     paths

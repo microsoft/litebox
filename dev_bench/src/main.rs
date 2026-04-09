@@ -508,7 +508,30 @@ fn find_dependencies(sh: &xshell::Shell, command: &str) -> Result<Vec<PathBuf>> 
             }
         }
     }
-    let paths: Vec<PathBuf> = paths.into_iter().map(PathBuf::from).collect();
+    let paths: Vec<PathBuf> = {
+        let mut paths: Vec<_> = paths.into_iter().map(PathBuf::from).collect();
+
+        // libgcc_s.so.1 is not always a direct link-time dependency (ldd won't list it), but
+        // glibc's pthread_cancel needs it at runtime for forced stack unwinding. Without it the
+        // we get SIGABRTs.
+        let libgcc_s: Option<PathBuf> = [
+            "/usr/lib/x86_64-linux-gnu/libgcc_s.so.1",
+            "/lib/x86_64-linux-gnu/libgcc_s.so.1",
+            "/usr/lib64/libgcc_s.so.1",
+            "/lib64/libgcc_s.so.1",
+        ]
+        .iter()
+        .map(PathBuf::from)
+        .find(|p| p.exists());
+        if let Some(libgcc_s) = libgcc_s
+            && !paths.contains(&libgcc_s)
+        {
+            paths.push(libgcc_s);
+        }
+
+        paths
+    };
+
     for p in &paths {
         if !p.exists() {
             warn!(path = %p.display(), "Resolved dependency path does not exist");
