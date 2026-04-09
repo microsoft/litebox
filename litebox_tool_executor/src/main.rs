@@ -154,43 +154,21 @@ fn interactive(cli: &Cli) -> anyhow::Result<()> {
     // Launch bash in non-editing script mode:
     // --norc --noprofile: skip startup files
     // --noediting: disable readline (avoids hang on TTY stdin)
-    // -s: read commands from stdin (explicit, even though it's the default
-    //     for non-interactive bash — makes intent clear)
+    // -s: read commands from stdin
     cmd.args([&cli.shell, "--norc", "--noprofile", "--noediting", "-s"]);
 
-    // Pass stdin/stdout/stderr straight through to the guest shell.
+    // Pass stdin/stdout/stderr straight through. Audit events go directly
+    // to the log file via the runner's --audit-log flag (no stderr capture).
     cmd.stdin(std::process::Stdio::inherit())
-        .stdout(std::process::Stdio::inherit());
+        .stdout(std::process::Stdio::inherit())
+        .stderr(std::process::Stdio::inherit());
 
-    if cli.audit_log.is_some() {
-        cmd.stderr(std::process::Stdio::piped());
-    } else {
-        cmd.stderr(std::process::Stdio::inherit());
-    }
+    let status = cmd.status().map_err(|e| {
+        anyhow::anyhow!("Failed to spawn litebox_runner_linux_userland: {e}")
+    })?;
 
-    let result = if cli.audit_log.is_some() {
-        // Capture stderr for audit log while forwarding stdout.
-        let output = cmd.output().map_err(|e| {
-            anyhow::anyhow!("Failed to spawn litebox_runner_linux_userland: {e}")
-        })?;
-        if let Some(ref log_path) = cli.audit_log {
-            if let Ok(mut f) = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(log_path)
-            {
-                let _ = std::io::Write::write_all(&mut f, &output.stderr);
-            }
-        }
-        output.status
-    } else {
-        cmd.status().map_err(|e| {
-            anyhow::anyhow!("Failed to spawn litebox_runner_linux_userland: {e}")
-        })?
-    };
-
-    if !result.success() {
-        std::process::exit(result.code().unwrap_or(1));
+    if !status.success() {
+        std::process::exit(status.code().unwrap_or(1));
     }
     Ok(())
 }

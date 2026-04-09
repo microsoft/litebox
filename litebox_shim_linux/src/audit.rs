@@ -4,18 +4,29 @@
 //! Structured audit logging for syscall tracing.
 //!
 //! When the `audit_log` feature is enabled, every syscall dispatched through the shim is logged
-//! as a JSON line via [`DebugLogProvider::debug_log_print`]. This provides a complete, structured
-//! audit trail of all guest activity — useful for observability, anomaly detection, and
-//! security analysis of LLM agent tool execution.
-//!
-//! The types here are `no_std`-compatible and avoid heap allocation per event by using
-//! fixed-capacity [`arrayvec`] types.
+//! as a JSON line. By default, events go to the platform's debug log (typically stderr).
+//! Call [`set_audit_log_fd`] before the guest starts to redirect events to a dedicated file
+//! descriptor instead, keeping stderr clean for real error messages.
 
 // We intentionally store raw bits of signed values (e.g., status codes, ProtFlags) as u64.
 #![allow(clippy::cast_sign_loss)]
 
 use arrayvec::{ArrayString, ArrayVec};
 use core::fmt;
+use core::sync::atomic::{AtomicI32, Ordering};
+
+/// File descriptor for the audit log file. When >= 0, audit events are
+/// written to this fd instead of stderr. Set via [`set_audit_log_fd`].
+static AUDIT_LOG_FD: AtomicI32 = AtomicI32::new(-1);
+
+/// Redirect audit events to the given host file descriptor.
+///
+/// Call this before the guest starts. The fd must be a valid host-side file
+/// descriptor opened for writing (e.g., via `open` with `O_WRONLY | O_CREAT | O_APPEND`).
+/// The caller is responsible for keeping the fd open for the lifetime of the sandbox.
+pub fn set_audit_log_fd(fd: i32) {
+    AUDIT_LOG_FD.store(fd, Ordering::Release);
+}
 
 /// Maximum number of arguments recorded per syscall event.
 const MAX_ARGS: usize = 6;
@@ -142,11 +153,23 @@ fn write_json_escaped(f: &mut fmt::Formatter<'_>, s: &str) -> fmt::Result {
     Ok(())
 }
 
-/// Emit an audit event via the platform's debug log.
+/// Emit an audit event.
+///
+/// If [`set_audit_log_fd`] was called, writes the JSON line to that file
+/// descriptor. Otherwise falls back to the platform's debug log (stderr).
 pub fn emit_audit_event(event: &AuditEvent) {
-    use litebox::platform::DebugLogProvider as _;
     let msg = alloc::format!("{event}\n");
-    litebox_platform_multiplex::platform().debug_log_print(&msg);
+    let fd = AUDIT_LOG_FD.load(Ordering::Relaxed);
+    if fd >= 0 {
+        use litebox::platform::DebugLogProvider as _;
+        if !litebox_platform_multiplex::platform().debug_log_write_to_fd(fd, &msg) {
+            // Platform doesn't support fd-targeted writes; fall back to stderr.
+            litebox_platform_multiplex::platform().debug_log_print(&msg);
+        }
+    } else {
+        use litebox::platform::DebugLogProvider as _;
+        litebox_platform_multiplex::platform().debug_log_print(&msg);
+    }
 }
 
 /// Build an [`AuditEvent`] from a typed [`SyscallRequest`], extracting human-readable arguments

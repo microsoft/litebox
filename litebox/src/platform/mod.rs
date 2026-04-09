@@ -481,7 +481,7 @@ pub trait SystemTime: Send + Sync {
 
 /// An interface to dumping debug output for tracing purposes.
 pub trait DebugLogProvider {
-    /// Print `msg` to the debug log
+    /// Print `msg` to the debug log (typically stderr).
     ///
     /// Newlines are *not* automatically appended to `msg`, thus the caller must make sure to
     /// include newlines if necessary.
@@ -491,6 +491,15 @@ pub trait DebugLogProvider {
     /// but instead should combine all strings part of a single logical message into a single
     /// `debug_log_print` call.
     fn debug_log_print(&self, msg: &str);
+
+    /// Write `msg` to an arbitrary host file descriptor.
+    ///
+    /// Used by the audit log to write events directly to a log file without
+    /// going through stderr. Returns `false` if the platform doesn't support
+    /// fd-targeted writes (default).
+    fn debug_log_write_to_fd(&self, _fd: i32, _msg: &str) -> bool {
+        false
+    }
 }
 
 /// A common interface for raw pointers, aimed at usage in shims _above_ LiteBox.

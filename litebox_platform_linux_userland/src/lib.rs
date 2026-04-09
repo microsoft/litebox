@@ -4593,6 +4593,19 @@ impl litebox::platform::DebugLogProvider for LinuxUserland {
             )
         };
     }
+
+    fn debug_log_write_to_fd(&self, fd: i32, msg: &str) -> bool {
+        let _ = unsafe {
+            syscalls::syscall4(
+                syscalls::Sysno::write,
+                fd as usize,
+                msg.as_ptr() as usize,
+                msg.len(),
+                syscall_intercept::SYSCALL_ARG_MAGIC,
+            )
+        };
+        true
+    }
 }
 
 type UserMutPtr<T> = litebox::platform::common_providers::userspace_pointers::UserMutPtr<

@@ -376,6 +376,19 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         litebox_shim_linux::policy::set_policy(policy);
     }
 
+    // Open audit log file if specified. Events will be written directly to
+    // this fd by the shim, bypassing stderr.
+    #[cfg(feature = "audit_log")]
+    if let Some(ref audit_path) = cli_args.audit_log {
+        use std::os::unix::io::IntoRawFd as _;
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(audit_path)
+            .map_err(|e| anyhow::anyhow!("Could not open audit log {}: {e}", audit_path.display()))?;
+        litebox_shim_linux::audit::set_audit_log_fd(file.into_raw_fd());
+    }
+
     // --program-from-tar loads pre-rewritten binaries that depend on litebox_rtld_audit.so,
     // which is only injected by the rewriter backend.
     if cli_args.program_from_tar
