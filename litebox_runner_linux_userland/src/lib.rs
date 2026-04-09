@@ -386,7 +386,17 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
             .append(true)
             .open(audit_path)
             .map_err(|e| anyhow::anyhow!("Could not open audit log {}: {e}", audit_path.display()))?;
-        litebox_shim_linux::audit::set_audit_log_fd(file.into_raw_fd());
+        let raw_fd = file.into_raw_fd();
+        // Move to a high fd number so it doesn't collide with guest pipe fds
+        // (bash creates pipes starting from fd 3). F_DUPFD_CLOEXEC = 1030.
+        let high_fd = unsafe { libc::fcntl(raw_fd, libc::F_DUPFD_CLOEXEC, 100) };
+        if high_fd >= 0 {
+            unsafe { libc::close(raw_fd) };
+            litebox_shim_linux::audit::set_audit_log_fd(high_fd);
+        } else {
+            // Fallback: use original fd if fcntl fails
+            litebox_shim_linux::audit::set_audit_log_fd(raw_fd);
+        }
     }
 
     // --program-from-tar loads pre-rewritten binaries that depend on litebox_rtld_audit.so,

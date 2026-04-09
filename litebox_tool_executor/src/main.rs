@@ -154,8 +154,9 @@ fn interactive(cli: &Cli) -> anyhow::Result<()> {
     // Launch bash in non-editing script mode:
     // --norc --noprofile: skip startup files
     // --noediting: disable readline (avoids hang on TTY stdin)
+    // +m: disable job control (setpgid fails in the sandbox, breaking pipes)
     // -s: read commands from stdin
-    cmd.args([&cli.shell, "--norc", "--noprofile", "--noediting", "-s"]);
+    cmd.args([&cli.shell, "--norc", "--noprofile", "--noediting", "+m", "-s"]);
 
     // Pass stdin/stdout/stderr straight through. Audit events go directly
     // to the log file via the runner's --audit-log flag (no stderr capture).
