@@ -757,16 +757,12 @@ fn run_inner(
                     // Check network policy before connecting.
                     if let Some(ref policy) = sandbox_policy {
                         let hostname = dns_tracker.lookup(dest_ipv4);
-                        if policy.check_connect(dest_ipv4, dst_port, hostname)
-                            == crate::sandbox_policy::Decision::Deny
-                        {
+                        let decision = policy.check_connect(dest_ipv4, dst_port, hostname);
+                        if decision == crate::sandbox_policy::Decision::Deny {
                             let hostname_info =
                                 hostname.map(|h| format!(" ({h})")).unwrap_or_default();
-                            warn!(
-                                "policy denied TCP connect to {dest_ipv4}:{dst_port}{hostname_info}"
-                            );
+                            info!("policy denied TCP to {dest_ipv4}:{dst_port}{hostname_info}");
                             suppress_from_smoltcp = true;
-                            // Skip the rest of this branch — connection is blocked.
                         }
                     }
                     if !suppress_from_smoltcp {
