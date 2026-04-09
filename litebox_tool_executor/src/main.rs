@@ -47,6 +47,12 @@ struct Cli {
     #[arg(long = "env")]
     env: Vec<String>,
 
+    /// Run VS Code Server inside the sandbox with stdio transport.
+    /// The server protocol runs over stdin/stdout so VS Code's Remote
+    /// extension can connect via the same pipe mechanism as docker exec.
+    #[arg(long)]
+    vscode_server: bool,
+
     /// The command and arguments to run. Omit for interactive mode.
     #[arg(trailing_var_arg = true)]
     command: Vec<String>,
@@ -57,8 +63,9 @@ fn main() -> anyhow::Result<()> {
 
     if !cli.rootfs.exists() {
         anyhow::bail!(
-            "Rootfs tar not found: {}\n\
-             Build it with: bash litebox_tool_executor/scripts/prepare-bash-rootfs.sh",
+            "Rootfs not found: {}\n\
+             For tar rootfs: bash litebox_tool_executor/scripts/prepare-bash-rootfs.sh\n\
+             For directory rootfs: bash litebox_tool_executor/scripts/prepare-vscode-rootfs-staged.sh",
             cli.rootfs.display()
         );
     }
@@ -73,7 +80,9 @@ fn main() -> anyhow::Result<()> {
     // Print binary build times for diagnostics.
     print_build_info(audit_log_file.as_deref());
 
-    if cli.interactive {
+    if cli.vscode_server {
+        vscode_server(&cli, audit_log_file.as_deref())
+    } else if cli.interactive {
         interactive(&cli, audit_log_file.as_deref())
     } else {
         direct(&cli, audit_log_file.as_deref())
@@ -291,9 +300,11 @@ impl BrokerProcess {
         // (or the rootfs itself if it's a directory).
         if rootfs.is_dir() {
             cmd.arg("--root-dir").arg(rootfs);
+            // Directory rootfs contains pre-rewritten binaries, so skip
+            // broker-side rewriting (which would double-rewrite and crash).
+        } else {
+            cmd.arg("--rewrite-syscalls");
         }
-
-        cmd.arg("--rewrite-syscalls");
 
         if let Some(p) = policy {
             cmd.arg("--policy").arg(p);
@@ -419,14 +430,26 @@ fn runner_command(
     let runner = find_runner()?;
     let mut cmd = std::process::Command::new(&runner);
     cmd.arg("--unstable");
-    cmd.arg("--initial-files").arg(&cli.rootfs);
-    cmd.arg("--program-from-tar");
 
-    // When a broker is running, connect the runner to it for network access.
-    // Policy is enforced by the broker, not the runner.
+    let rootfs_is_dir = cli.rootfs.is_dir();
+
+    if rootfs_is_dir {
+        // Directory rootfs: program loads from 9P, not from a tar file.
+        // The broker serves the directory; the runner connects via --nine-p-broker.
+    } else {
+        // Tar rootfs: runner extracts the tar and loads the program from it.
+        cmd.arg("--initial-files").arg(&cli.rootfs);
+        cmd.arg("--program-from-tar");
+    }
+
+    // When a broker is running, connect the runner to it for network access
+    // and (for directory rootfs) 9P filesystem access.
     if let Some(b) = broker {
-        cmd.arg("--network-broker")
-            .arg(b.socket_path().to_str().unwrap_or(""));
+        let socket = b.socket_path().to_str().unwrap_or("");
+        cmd.arg("--network-broker").arg(socket);
+        if rootfs_is_dir {
+            cmd.arg("--nine-p-broker").arg(socket);
+        }
     }
     if let Some(audit_path) = audit_log_file {
         cmd.arg("--audit-log").arg(audit_path);
@@ -443,10 +466,10 @@ fn runner_command(
             .arg("LD_LIBRARY_PATH=/lib64:/lib/x86_64-linux-gnu:/lib");
     }
     if !has("HOME=") {
-        cmd.arg("--env").arg("HOME=/");
+        cmd.arg("--env").arg("HOME=/root");
     }
     if !has("PATH=") {
-        cmd.arg("--env").arg("PATH=/usr/bin:/bin");
+        cmd.arg("--env").arg("PATH=/usr/local/bin:/usr/bin:/bin");
     }
     if !has("TERM=") {
         cmd.arg("--env").arg("TERM=dumb");
@@ -536,6 +559,62 @@ fn direct(cli: &Cli, audit_log_file: Option<&std::path::Path>) -> anyhow::Result
              Build it with: cargo build -p litebox_runner_linux_userland --features audit_log"
         )
     })?;
+
+    drop(broker);
+
+    if !status.success() {
+        std::process::exit(status.code().unwrap_or(1));
+    }
+    Ok(())
+}
+
+/// VS Code Server mode: run VS Code Server inside the sandbox with stdio
+/// transport. The server protocol runs over stdin/stdout so VS Code's Remote
+/// extension can connect via the same pipe mechanism as `docker exec -i`.
+///
+/// Usage:
+///   litebox-tool-executor --rootfs /path/to/vscode-rootfs --vscode-server
+///
+/// The rootfs must be a directory (not a tar) containing pre-rewritten
+/// binaries, Node.js, and VS Code Server at /opt/vscode-server/.
+fn vscode_server(cli: &Cli, audit_log_file: Option<&std::path::Path>) -> anyhow::Result<()> {
+    if !cli.rootfs.is_dir() {
+        anyhow::bail!(
+            "--vscode-server requires a directory rootfs (not a tar).\n\
+             Build one with: bash litebox_tool_executor/scripts/prepare-vscode-rootfs-staged.sh"
+        );
+    }
+
+    let (broker, _temp_policy) = spawn_broker(cli, audit_log_file)?;
+    let mut cmd = runner_command(cli, audit_log_file, Some(&broker))?;
+
+    // VS Code Server entry point
+    cmd.args([
+        "/usr/local/bin/node",
+        "/opt/vscode-server/out/server-main.js",
+        "--accept-server-license-terms",
+        "--without-connection-token",
+        "--disable-telemetry",
+        "--host",
+        "127.0.0.1",
+        "--port",
+        "0",
+    ]);
+
+    // Append any extra CLI args (e.g. --folder /workspaces/repo)
+    if !cli.command.is_empty() {
+        cmd.args(&cli.command);
+    }
+
+    // Inherit stdio: VS Code's Remote protocol runs over stdin/stdout.
+    // Broker logs go to the audit log file (if set) or /dev/null.
+    cmd.stdin(std::process::Stdio::inherit())
+        .stdout(std::process::Stdio::inherit())
+        .stderr(std::process::Stdio::inherit());
+
+    let status = cmd
+        .status()
+        .map_err(|e| anyhow::anyhow!("Failed to spawn litebox_runner_linux_userland: {e}"))?;
 
     drop(broker);
 
