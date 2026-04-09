@@ -128,6 +128,11 @@ done
 
 mkdir -p "$STAGING/tmp" "$STAGING/etc"
 
+# DNS resolver config pointing at the broker's virtual IP.
+# The broker's smoltcp proxy intercepts DNS queries for hostname-based
+# network policy enforcement.
+echo "nameserver 10.0.0.1" > "$STAGING/etc/resolv.conf"
+
 # Ensure the dynamic linker is available at its PT_INTERP path
 # (bash expects /lib64/ld-linux-x86-64.so.2 but readlink resolves
 # to /usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2 on Ubuntu)
