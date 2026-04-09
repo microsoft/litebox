@@ -67,6 +67,9 @@ fn main() -> anyhow::Result<()> {
         None
     };
 
+    // Print binary build times for diagnostics.
+    print_build_info();
+
     if cli.interactive {
         interactive(&cli, audit_log_file.as_deref())
     } else {
@@ -103,6 +106,38 @@ fn create_audit_log_file(dir: &std::path::Path) -> anyhow::Result<std::path::Pat
     let path = dir.join(filename);
     eprintln!("Audit log: {}", path.display());
     Ok(path)
+}
+
+/// Print build timestamps of this binary and the runner for diagnostics.
+fn print_build_info() {
+    if let Ok(exe) = std::env::current_exe() {
+        if let Ok(meta) = std::fs::metadata(&exe) {
+            if let Ok(modified) = meta.modified() {
+                let age = std::time::SystemTime::now()
+                    .duration_since(modified)
+                    .unwrap_or_default();
+                eprintln!(
+                    "Tool executor: {} (built {}s ago)",
+                    exe.display(),
+                    age.as_secs()
+                );
+            }
+        }
+    }
+    if let Ok(runner) = find_runner() {
+        if let Ok(meta) = std::fs::metadata(&runner) {
+            if let Ok(modified) = meta.modified() {
+                let age = std::time::SystemTime::now()
+                    .duration_since(modified)
+                    .unwrap_or_default();
+                eprintln!(
+                    "Runner: {} (built {}s ago)",
+                    runner.display(),
+                    age.as_secs()
+                );
+            }
+        }
+    }
 }
 
 /// Find the litebox_runner_linux_userland binary.
