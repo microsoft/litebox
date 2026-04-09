@@ -632,13 +632,29 @@ fn vscode_server(cli: &Cli, audit_log_file: Option<&std::path::Path>) -> anyhow:
         let (port, server_handle) =
             litebox_tool_executor::ssh_server::start_ssh_server(ssh_config).await?;
 
+        // Detect WSL2 IP for connection instructions
+        let wsl_ip = std::process::Command::new("hostname")
+            .arg("-I")
+            .output()
+            .ok()
+            .and_then(|o| String::from_utf8(o.stdout).ok())
+            .map(|s| s.trim().split_whitespace().next().unwrap_or("").to_string())
+            .unwrap_or_default();
+
         eprintln!();
         eprintln!("==============================================");
         eprintln!("  LiteBox VS Code Server (embedded SSH)");
-        eprintln!("  SSH listening on 127.0.0.1:{port}");
-        eprintln!();
-        eprintln!("  Connect from VS Code:");
-        eprintln!("    Remote-SSH → localhost:{port}");
+        if !wsl_ip.is_empty() && wsl_ip != "127.0.0.1" {
+            eprintln!("  SSH listening on 0.0.0.0:{port}");
+            eprintln!();
+            eprintln!("  Connect from VS Code (use WSL2 IP):");
+            eprintln!("    Remote-SSH → {wsl_ip}:{port}");
+        } else {
+            eprintln!("  SSH listening on 0.0.0.0:{port}");
+            eprintln!();
+            eprintln!("  Connect from VS Code:");
+            eprintln!("    Remote-SSH → localhost:{port}");
+        }
         eprintln!();
         eprintln!("  Logs:");
         eprintln!("    Syscalls: {}", audit.display());
