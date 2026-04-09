@@ -242,9 +242,9 @@ LiteBox on Linux supports two interception backends with fundamentally different
 | **Compatibility** | Better (runtime init runs natively) | Worse (shim must handle everything) |
 | **Isolation strength** | Weaker (coverage gap for libraries) | Stronger (no gap) |
 | **Performance** | ~ns per syscall (direct JMP) | ~μs per syscall (signal handler round-trip) |
-| **fork() support** | No (shim doesn't implement it) | Delayed fork + worker host (Linux), potential via kernel fallback |
+| **fork() support** | Delayed fork + worker host (Linux) | Delayed fork + worker host (Linux); seccomp untested |
 
-For LLM tool sandboxing, the **rewriter** backend is the practical choice today — it works with busybox and provides audit + policy enforcement for all rewritten syscalls. The **seccomp** backend is the path to stronger isolation once the shim's syscall coverage is expanded.
+For LLM tool sandboxing, the **rewriter** backend is the practical choice today — it works with bash and multi-program pipes, and provides audit + policy enforcement for all rewritten syscalls. The **seccomp** backend is the path to stronger isolation once the shim's syscall coverage is expanded.
 
 ### Comparison Matrix
 
@@ -273,27 +273,23 @@ VS Code (Copilot Agent Mode)
   └── Terminal command ──► LiteBox Sandbox (sandboxed)
                             │
                             ▼
-                          litebox_tool_executor --interactive (REPL)
+                          litebox_tool_executor --interactive
                             │
-                            │  For each command typed:
-                            │  spawns child process
+                            ├── Spawns litebox_broker (policy + network enforcement)
+                            ├── Spawns litebox_runner_linux_userland
+                            │     with stdin piped (not TTY, to avoid job control issues)
                             ▼
-                          litebox_tool_executor --rootfs <tar> /bin/busybox sh -c "<command>"
+                          litebox_runner_linux_userland --program-from-tar
                             │
-                            ├── Loads rootfs .tar (syscall-rewritten busybox)
+                            ├── Loads rootfs .tar (syscall-rewritten bash + utilities)
                             ├── Sets up LiteBox platform + shim + layered filesystem
                             ├── Installs sandbox policy (if specified)
-                            ├── Runs guest program via run_thread()
-                            ├── Audit events → stderr (discarded in REPL mode)
-                            └── Guest stdout → parent REPL → terminal display
+                            ├── Runs /usr/bin/bash --norc --noprofile --noediting -s
+                            ├── Audit events → file (via set_audit_log_fd)
+                            └── Persistent shell: cd, env vars, state persist across commands
 ```
 
-**Key design decision**: Each command spawns a fresh child process (and thus a fresh LiteBox instance). This is because:
-1. LiteBox's platform is a singleton — can only be initialized once per process
-2. `fork()` is now supported on Linux but not on Windows
-3. A fresh sandbox per command provides stronger isolation (no state leaks between commands)
-
-The tradeoff is that commands don't share state — `cd /tmp` followed by `ls` won't list `/tmp`.
+**Key design decision**: The interactive shell runs a persistent bash session inside a single sandbox. Stdin is piped through a bridge thread (not inherited as a TTY) to prevent bash from enabling job control, which fails in the sandbox because `setpgid` returns `EPERM` for the session-leader init process. Shell state (`cd`, environment variables, file modifications) persists across commands.
 
 ### Phase 1: Audit Logging
 
@@ -310,9 +306,8 @@ Example output:
 
 New `litebox_tool_executor` crate providing two interfaces:
 
-- **Direct mode**: `litebox_tool_executor --rootfs <tar> -- /bin/busybox echo hello`
-- **Interactive REPL**: `litebox_tool_executor --rootfs <tar> --interactive` — each line typed spawns a fresh sandbox
-- **JSON pipe mode**: reads `ToolRequest` from stdin, writes `ToolResult` to stdout — for programmatic integration
+- **Direct mode**: `litebox_tool_executor --rootfs <tar> -- /usr/bin/bash -c "echo hello"`
+- **Interactive shell**: `litebox_tool_executor --rootfs <tar> --interactive` — launches a persistent bash session with state across commands
 
 The rootfs is prepared via `litebox_packager`, which discovers ELF dependencies via `ldd`, rewrites all syscall instructions, and outputs a tar.
 
@@ -401,7 +396,7 @@ The `wdcui/agent-sandbox-fork` branch implements fork in the shim via **delayed 
 - The Linux userland platform always returns `SharedWithParent` for forked address spaces, so only the delayed fork path is used. `do_true_fork` (used by kernel platforms that return `Independent`) has a working implementation but is not exercised on the userland platform.
 - The fork work was done on the rewriter backend; seccomp backend interaction is untested
 
-**Net result**: Shell piping (`echo hello | cat`), subshells (`$(command)`), and multi-process tools now work on WSL2 with the rewriter backend.
+**Net result**: Shell piping (`echo hello | cat`), multi-program pipes (`ls | sort | uniq`), subshells (`$(command)`), and multi-process tools work on Linux with the rewriter backend.
 
 ## Current Status & Limitations
 
@@ -431,23 +426,19 @@ LLM coding agents fall into two categories with different sandboxing surfaces:
 | Command execution | **Sandboxed** (terminal) | **Sandboxed** (`fork`+`exec` go through shim) |
 | Network | **Sandboxed** (terminal `curl` etc.) | **Sandboxed** (all `connect`/`send` go through shim) |
 | Audit trail | Terminal commands only | Complete — every syscall |
-| fork() required? | No (REPL workaround) | **Yes** (now supported on Linux) |
+| fork() required? | Yes (persistent shell uses fork) | **Yes** (now supported on Linux) |
 
 ### Technical Limitations
 
-- **Fork on Linux only**: `fork()` / `clone()` without `CLONE_VM` is supported on the Linux userland platform (x86_64) via delayed fork + worker host. Windows does not support fork. The REPL wrapper spawns a fresh sandbox per command as a workaround.
+- **Fork on Linux only**: `fork()` / `clone()` without `CLONE_VM` is supported on the Linux userland platform (x86_64) via delayed fork + worker host. Windows does not support fork.
 
 - **Static (ET_EXEC) binaries cannot fork**: The delayed fork mechanism only works with PIE (position-independent) binaries. Static binaries like busybox are ET_EXEC with hardcoded addresses in VA slot 0, which conflicts with the VA partitioning that the delayed fork path uses to create worker host processes. When busybox's `sh` calls `clone()` for a pipe, the shim returns a fake child PID but never spawns a worker, causing the parent to wait forever. The demo was switched from busybox to bash (which is PIE) to work around this.
 
-- **Multi-program pipes deadlock (userland platform only)**: The Linux userland platform always returns `SharedWithParent` for forked address spaces, triggering delayed fork with vfork semantics — the child shares the parent's address space until it execs or exits. Only one outstanding vfork child is allowed at a time. When bash runs `ls | sort`, it needs to fork twice (one child per pipeline stage) before exec'ing either. The second fork deadlocks because the first child is still parked in the parent's address space waiting for exec. Single-fork pipes work (`echo hello | cat`) because `echo` is a bash builtin (no fork needed), so only one fork occurs (for `cat`). This limitation is specific to the userland platform's shared-address-space model. Kernel platforms (LVBS, SNP) return `Independent`, which uses `do_true_fork` — each child gets its own address space immediately with no vfork parking, so multi-program pipes would work. Fixing this on the userland platform would require concurrent fork support (allowing multiple outstanding vfork children) or eager child migration (snapshot+migrate on fork instead of deferring to the first non-pre-exec syscall).
-
-- **Persistent interactive shell not working**: Running bash with `-i` (interactive mode) inside the sandbox doesn't work because the shim's stdin bridging doesn't properly deliver line-by-line input from the VS Code terminal PTY to the guest process. Bash reads the first line but subsequent reads fail or return nothing. The workaround is the per-command REPL: each line typed by the user spawns a fresh `bash -c "<command>"` invocation. This means `cd`, environment variables, and file modifications don't persist between commands.
+- **Job control disabled**: The sandbox's init process is always a session leader, so `setpgid` returns `EPERM`. Bash's job control depends on `setpgid` to create per-pipeline process groups. The tool executor works around this by piping stdin through a bridge (so bash sees a pipe, not a TTY, and skips job control). Background jobs (`&`) and `Ctrl+Z` are not supported.
 
 - **Limited rootfs**: The bash-based rootfs includes ~28 common utilities (cat, ls, grep, sort, etc.) + shared libraries, totaling ~26MB. No Python, git, or compilers yet. The `prepare-bash-rootfs.sh` script stages these from the host system.
 
 - **No dynamic terminal size**: TIOCGWINSZ returns hardcoded values instead of querying the real terminal dimensions.
-
-- **No `/dev/tty`**: bash warns "cannot set terminal process group" and "no job control" when run interactively.
 
 ## Future Work
 
@@ -455,8 +446,6 @@ LLM coding agents fall into two categories with different sandboxing surfaces:
 |---|---|---|
 | **VS Code Remote integration** | Run VS Code Server inside LiteBox so all agent operations (file reads, writes, searches) are sandboxed, not just terminal commands. This is the path to complete agent sandboxing. | High |
 | **MCP tool server** | Expose the executor as an MCP-compatible tool server where every operation (`read_file`, `write_file`, `run_command`) is a sandboxed tool call. Works for MCP-enabled agents without requiring VS Code Remote. | High |
-| **Concurrent fork (multi-program pipes)** | The userland platform's delayed fork uses vfork semantics allowing only one outstanding child. Multi-program pipes (`ls \| sort`) deadlock because bash forks twice before exec'ing either. Fix options: allow multiple outstanding vfork children, or eager child migration (snapshot+migrate immediately on fork). Kernel platforms already handle this via `do_true_fork` with independent address spaces. | High |
-| **Persistent shell session** | Interactive bash (`-i`) doesn't work because the shim's stdin bridging doesn't deliver line-by-line input. Fix the stdin bridge so a persistent shell can replace the per-command REPL, enabling `cd`, env vars, and state across commands. | High |
 | **ET_EXEC fork support** | Static (non-PIE) binaries like busybox hang on fork because the delayed fork+worker mechanism requires PIE VA partitioning. Fix would enable busybox, statically-compiled tools, and other ET_EXEC binaries to fork. | Medium |
 | **Richer rootfs** | Python, git, common dev tools. The `prepare-bash-rootfs.sh` script provides the pattern; Python would follow the same stage+rewrite approach. | High |
 | **Windows fork support** | Implement `spawn_worker_host_*` APIs on `WindowsUserland` to enable fork on the Windows platform. Currently fork only works on Linux. | High |
@@ -466,7 +455,7 @@ LLM coding agents fall into two categories with different sandboxing surfaces:
 | **Network egress filtering** | ~~Allowlist-based outbound connectivity via `smoltcp` network stack~~ **Done** — broker-side network policy with DNS hostname tracking | ~~Medium~~ |
 | **Dynamic terminal size** | Query actual Windows console dimensions for TIOCGWINSZ | Low |
 | **Ephemeral instance pool** | Pre-warm LiteBox instances for low-latency per-command execution | Low |
-| **`/dev/tty` emulation** | Proper terminal device for job control support | Low |
+| **Job control in sandbox** | Make `setpgid` work for the init process so bash can use job control with background jobs and `Ctrl+Z`. Currently worked around by piping stdin (making bash non-interactive). | Low |
 
 ## Related Work
 
@@ -544,8 +533,8 @@ jai and LiteBox occupy different niches: jai minimizes friction for the common c
 | **Network policy** | HTTP L7 proxy (method + path level) | Syscall-level (`connect` allow/deny) |
 | **Filesystem policy** | Container-level path restrictions | Syscall-level (`openat` allow/deny per path) |
 | **Audit trail** | Proxy logs (network traffic) | Every syscall (structured JSON) |
-| **fork() support** | Yes (real Linux kernel) | No (shim limitation) |
-| **Agent compatibility** | Claude Code, Codex, OpenCode, Copilot | Busybox only (limited rootfs) |
+| **fork() support** | Yes (real Linux kernel) | Yes (delayed fork + worker host, Linux only) |
+| **Agent compatibility** | Claude Code, Codex, OpenCode, Copilot | Bash + ~28 utilities (limited rootfs) |
 | **Deployment** | Docker + K3s (heavyweight) | Single binary (lightweight) |
 | **Maturity** | Alpha, 21 contributors, active development | Experimental prototype |
 
@@ -627,7 +616,7 @@ The diff/apply workflow is relevant to LiteBox's file injection/extraction futur
 | **agent-safehouse** | Open source | macOS sandbox-exec | macOS only | Full (CLI agents) | Zero dependencies, simple |
 | **Rivet agent-os** | Open source | V8 isolates + Wasm | Any | Wasm only | 6ms cold starts |
 | **vibe** | Open source | Apple Virtualization VMs | macOS only | Full (VM) | Lightweight Mac VMs |
-| **LiteBox** | Open source | Library OS (Rust) | Windows, Linux, bare-metal | Limited (no fork) | Syscall-level audit, memory-safe shim, smallest TCB |
+| **LiteBox** | Open source | Library OS (Rust) | Windows, Linux, bare-metal | Bash + utilities (fork on Linux) | Syscall-level audit, memory-safe shim, smallest TCB |
 
 ### Themes from the Landscape
 
