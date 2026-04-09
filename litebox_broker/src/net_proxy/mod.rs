@@ -1102,6 +1102,7 @@ fn run_inner(
                     return false;
                 };
                 let session_slots = Arc::clone(&session_slots);
+                let sandbox_policy = sandbox_policy.clone();
                 std::thread::spawn(move || {
                     let _session_permit = session_permit;
                     if let Err(e) = send_handshake_response(&stream) {
@@ -1109,7 +1110,7 @@ fn run_inner(
                         return;
                     }
                     info!("accepted additional LBNP client, handshake complete");
-                    if let Err(e) = run_inner(stream, true, local_services, None, session_slots, None) {
+                    if let Err(e) = run_inner(stream, true, local_services, None, session_slots, sandbox_policy) {
                         tracing::error!("network proxy error: {e}");
                     }
                 });
