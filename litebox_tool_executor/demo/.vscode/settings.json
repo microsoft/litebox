@@ -2,12 +2,12 @@
     "terminal.integrated.profiles.windows": {
         "LiteBox Sandbox (Windows)": {
             "path": "C:\\src\\litebox\\target\\debug\\litebox_tool_executor.exe",
-            "args": ["--rootfs", "C:\\src\\litebox\\target\\bash-sandbox.tar", "--policy", "C:\\src\\litebox\\litebox_tool_executor\\policies\\demo-policy.json", "--audit-log", "C:\\src\\litebox\\target\\litebox-audit.jsonl", "--interactive"],
+            "args": ["--rootfs", "C:\\src\\litebox\\target\\bash-sandbox.tar", "--policy", "C:\\src\\litebox\\litebox_tool_executor\\policies\\demo-policy.json", "--audit-log", "C:\\src\\litebox\\target\\litebox-audit", "--interactive"],
             "icon": "shield"
         },
         "LiteBox Sandbox (WSL2)": {
             "path": "wsl.exe",
-            "args": ["-d", "Ubuntu", "--", "/mnt/c/src/litebox/target/debug/litebox_tool_executor", "--rootfs", "/mnt/c/src/litebox/target/bash-sandbox.tar", "--policy", "/mnt/c/src/litebox/litebox_tool_executor/policies/demo-policy.json", "--audit-log", "/mnt/c/src/litebox/target/litebox-audit.jsonl", "--interactive"],
+            "args": ["-d", "Ubuntu", "--", "/mnt/c/src/litebox/target/debug/litebox_tool_executor", "--rootfs", "/mnt/c/src/litebox/target/bash-sandbox.tar", "--policy", "/mnt/c/src/litebox/litebox_tool_executor/policies/demo-policy.json", "--audit-log", "/mnt/c/src/litebox/target/litebox-audit", "--interactive"],
             "icon": "shield"
         },
         "PowerShell": {

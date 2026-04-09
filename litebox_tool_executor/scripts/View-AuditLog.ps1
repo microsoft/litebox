@@ -1,19 +1,17 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT license.
 #
-# Pretty-print LiteBox audit log JSON lines from stderr or a file.
+# Pretty-print LiteBox audit log JSON lines from a file or directory.
 #
 # Usage:
-#   # Tail a log file:
-#   .\View-AuditLog.ps1 -Path target\litebox-audit.jsonl
+#   # View the latest audit log from a directory:
+#   .\View-AuditLog.ps1 -Path target\litebox-audit
 #
-#   # Pipe from executor stderr:
-#   cargo run -p litebox_tool_executor -- --rootfs target\bash-sandbox.tar /usr/bin/bash -c "echo hi" 2>&1 |
-#     Where-Object { $_ -match '^\{' } |
-#     .\View-AuditLog.ps1
+#   # View a specific log file:
+#   .\View-AuditLog.ps1 -Path target\litebox-audit\2026-04-08T12-34-56.jsonl
 #
 #   # Filter to security-relevant syscalls only:
-#   .\View-AuditLog.ps1 -Path target\litebox-audit.jsonl -Filter "openat|connect|execve|unlinkat|socket"
+#   .\View-AuditLog.ps1 -Path target\litebox-audit -Filter "openat|connect|execve|unlinkat|socket"
 
 [CmdletBinding()]
 param(
@@ -101,10 +99,21 @@ process {
 end {
     if ($Path) {
         if (-not (Test-Path $Path)) {
-            Write-Error "File not found: $Path"
+            Write-Error "Not found: $Path"
             return
         }
-        Get-Content $Path | ForEach-Object {
+        # If Path is a directory, use the most recent .jsonl file.
+        $resolvedPath = $Path
+        if (Test-Path $Path -PathType Container) {
+            $latest = Get-ChildItem $Path -Filter '*.jsonl' | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+            if (-not $latest) {
+                Write-Error "No .jsonl files found in $Path"
+                return
+            }
+            $resolvedPath = $latest.FullName
+            Write-Host -ForegroundColor DarkGray "Reading: $resolvedPath"
+        }
+        Get-Content $resolvedPath | ForEach-Object {
             if ($_ -match '^\{') {
                 Format-Event $_
             }

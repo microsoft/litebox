@@ -30,8 +30,9 @@ struct Cli {
     #[arg(long)]
     interactive: bool,
 
-    /// Path to write the audit log (JSON lines).
-    #[arg(long = "audit-log", value_name = "PATH", value_hint = clap::ValueHint::FilePath)]
+    /// Directory to write audit log files (JSON lines). Each session creates
+    /// a new timestamped file, e.g. `audit-dir/2026-04-08T12-34-56.jsonl`.
+    #[arg(long = "audit-log", value_name = "DIR", value_hint = clap::ValueHint::DirPath)]
     audit_log: Option<std::path::PathBuf>,
 
     /// Shell binary inside the rootfs to use for interactive mode (default: /usr/bin/bash).
@@ -58,11 +59,49 @@ fn main() -> anyhow::Result<()> {
         );
     }
 
-    if cli.interactive {
-        interactive(&cli)
+    // Resolve audit log: create directory and generate a timestamped file path.
+    let audit_log_file = if let Some(ref dir) = cli.audit_log {
+        Some(create_audit_log_file(dir)?)
     } else {
-        direct(&cli)
+        None
+    };
+
+    if cli.interactive {
+        interactive(&cli, audit_log_file.as_deref())
+    } else {
+        direct(&cli, audit_log_file.as_deref())
     }
+}
+
+/// Create a timestamped audit log file inside the given directory.
+/// Returns the full path to the new file.
+fn create_audit_log_file(dir: &std::path::Path) -> anyhow::Result<std::path::PathBuf> {
+    std::fs::create_dir_all(dir)
+        .map_err(|e| anyhow::anyhow!("Could not create audit log directory {}: {e}", dir.display()))?;
+
+    // Generate a timestamp-based filename: YYYY-MM-DDTHH-MM-SS.jsonl
+    // Use seconds since epoch as a fallback-safe approach.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    let secs = now.as_secs();
+    // Convert to approximate human-readable (good enough for filenames).
+    let days = secs / 86400;
+    let years = 1970 + days / 365; // approximate
+    let day_of_year = days % 365;
+    let month = day_of_year / 30 + 1;
+    let day = day_of_year % 30 + 1;
+    let time_of_day = secs % 86400;
+    let hour = time_of_day / 3600;
+    let minute = (time_of_day % 3600) / 60;
+    let second = time_of_day % 60;
+    let filename = format!(
+        "{years:04}-{month:02}-{day:02}T{hour:02}-{minute:02}-{second:02}.jsonl"
+    );
+
+    let path = dir.join(filename);
+    eprintln!("Audit log: {}", path.display());
+    Ok(path)
 }
 
 /// Find the litebox_runner_linux_userland binary.
@@ -105,7 +144,7 @@ fn find_runner() -> anyhow::Result<std::path::PathBuf> {
 }
 
 /// Build the base runner command with common flags.
-fn runner_command(cli: &Cli) -> anyhow::Result<std::process::Command> {
+fn runner_command(cli: &Cli, audit_log_file: Option<&std::path::Path>) -> anyhow::Result<std::process::Command> {
     let runner = find_runner()?;
     let mut cmd = std::process::Command::new(&runner);
     cmd.arg("--unstable");
@@ -115,8 +154,8 @@ fn runner_command(cli: &Cli) -> anyhow::Result<std::process::Command> {
     if let Some(ref policy) = cli.policy {
         cmd.arg("--policy").arg(policy);
     }
-    if let Some(ref audit_log) = cli.audit_log {
-        cmd.arg("--audit-log").arg(audit_log);
+    if let Some(audit_path) = audit_log_file {
+        cmd.arg("--audit-log").arg(audit_path);
     }
 
     // Pass environment variables
@@ -148,8 +187,8 @@ fn runner_command(cli: &Cli) -> anyhow::Result<std::process::Command> {
 /// commands. Uses `--noediting -s` and `TERM=dumb` to disable readline
 /// (the sandbox reports stdin as a TTY, which would cause bash to enter
 /// interactive/readline mode and hang).
-fn interactive(cli: &Cli) -> anyhow::Result<()> {
-    let mut cmd = runner_command(cli)?;
+fn interactive(cli: &Cli, audit_log_file: Option<&std::path::Path>) -> anyhow::Result<()> {
+    let mut cmd = runner_command(cli, audit_log_file)?;
 
     // Launch bash in non-editing script mode:
     // --norc --noprofile: skip startup files
@@ -175,8 +214,8 @@ fn interactive(cli: &Cli) -> anyhow::Result<()> {
 }
 
 /// Direct mode: run a single command.
-fn direct(cli: &Cli) -> anyhow::Result<()> {
-    let mut cmd = runner_command(cli)?;
+fn direct(cli: &Cli, audit_log_file: Option<&std::path::Path>) -> anyhow::Result<()> {
+    let mut cmd = runner_command(cli, audit_log_file)?;
     cmd.args(&cli.command);
 
     cmd.stdin(std::process::Stdio::inherit())
