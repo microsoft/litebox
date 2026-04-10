@@ -223,11 +223,13 @@ echo "nameserver 10.0.0.1" > "$OUTPUT/etc/resolv.conf"
 # Minimal /etc/passwd and /etc/group
 cat > "$OUTPUT/etc/passwd" << 'EOF'
 root:x:0:0:root:/root:/bin/bash
+user:x:1000:1000:user:/root:/bin/bash
 nobody:x:65534:65534:nobody:/nonexistent:/usr/sbin/nologin
 EOF
 
 cat > "$OUTPUT/etc/group" << 'EOF'
 root:x:0:
+user:x:1000:
 nogroup:x:65534:
 EOF
 
