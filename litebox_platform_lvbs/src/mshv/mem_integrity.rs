@@ -626,7 +626,10 @@ const JMP32_INSN_SIZE: u8 = 5;
 /// Refer [Linux](https://elixir.bootlin.com/linux/v6.6.85/source/arch/x86/kernel/alternative.c#L2164)
 pub fn validate_text_poke_bp_batch(patch_data: &HekiPatch, precomputed_patch: &HekiPatch) -> bool {
     // step 1
-    if patch_data.size == 1 && patch_data.code[0] == INT3_INSN_OPCODE {
+    if patch_data.size == 1
+        && patch_data.code[0] == INT3_INSN_OPCODE
+        && patch_data.pa[0] == precomputed_patch.pa[0]
+    {
         return true;
     }
 
@@ -637,7 +640,15 @@ pub fn validate_text_poke_bp_batch(patch_data: &HekiPatch, precomputed_patch: &H
             || (patch_data.pa[0] == precomputed_patch.pa[1]
                 && (precomputed_patch.pa[0] + 1).is_multiple_of(Size4KiB::SIZE)))
     {
-        1 // step 2
+        // step 2. pa[1] is dereferenced by `apply_vtl0_text_patch` only when
+        // `precomputed_patch.pa[0] + 1` is not page-aligned. In that case, it must
+        // equal `precomputed_patch.pa[1]`.
+        if !(precomputed_patch.pa[0] + 1).is_multiple_of(Size4KiB::SIZE)
+            && patch_data.pa[1] != precomputed_patch.pa[1]
+        {
+            return false;
+        }
+        1
     } else {
         return false;
     };
