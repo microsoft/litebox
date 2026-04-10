@@ -94,17 +94,17 @@ impl SshSession {
         let cfg = &self.litebox_config;
 
         eprintln!(
-            "[ssh] spawning litebox runner: {} (broker: {})",
+            "[ssh] spawning litebox runner: {} (broker: {}, runner_bin: {})",
             guest_command.join(" "),
-            &cfg.broker_socket
+            &cfg.broker_socket,
+            &cfg.runner_path,
         );
 
         // Verify broker socket exists before spawning
         if !std::path::Path::new(&cfg.broker_socket).exists() {
-            return Err(anyhow::anyhow!(
-                "Broker socket not found: {}",
-                cfg.broker_socket
-            ));
+            let msg = format!("Broker socket not found: {}", cfg.broker_socket);
+            eprintln!("[ssh] ERROR: {msg}");
+            return Err(anyhow::anyhow!(msg));
         }
 
         let mut cmd = TokioCommand::new(&cfg.runner_path);
@@ -144,13 +144,37 @@ impl SshSession {
             });
         }
 
-        let mut child = cmd
-            .spawn()
-            .map_err(|e| anyhow::anyhow!("Failed to spawn litebox runner: {e}"))?;
+        let mut child = match cmd.spawn() {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("[ssh] ERROR: Failed to spawn runner at '{}': {e}", cfg.runner_path);
+                return Err(anyhow::anyhow!("Failed to spawn litebox runner: {e}"));
+            }
+        };
+
+        eprintln!(
+            "[ssh] runner spawned (pid={})",
+            child.id().unwrap_or(0)
+        );
 
         let stdin = child.stdin.take().unwrap();
         let mut stdout = child.stdout.take().unwrap();
         let mut stderr = child.stderr.take().unwrap();
+
+        // Read the first chunk of stderr synchronously to catch early crashes
+        let mut early_stderr = [0u8; 2048];
+        match tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            stderr.read(&mut early_stderr),
+        )
+        .await
+        {
+            Ok(Ok(n)) if n > 0 => {
+                let msg = String::from_utf8_lossy(&early_stderr[..n]);
+                eprintln!("[runner-early-stderr] {msg}");
+            }
+            _ => {}
+        }
 
         // Forward subprocess stdout → SSH channel data
         let handle_out = session_handle.clone();
@@ -175,7 +199,7 @@ impl SshSession {
             let _ = handle_out.close(channel_id).await;
         });
 
-        // Forward subprocess stderr → SSH channel extended data (stderr)
+        // Forward subprocess stderr → tool executor stderr + SSH channel
         let handle_err = session_handle;
         let stderr_task = tokio::spawn(async move {
             let mut buf = [0u8; 4096];
@@ -183,22 +207,26 @@ impl SshSession {
                 match stderr.read(&mut buf).await {
                     Ok(0) => break,
                     Ok(n) => {
-                        if handle_err
+                        // Log to tool executor stderr for debugging
+                        let msg = String::from_utf8_lossy(&buf[..n]);
+                        eprint!("[runner-stderr] {msg}");
+                        // Also relay to SSH client
+                        let _ = handle_err
                             .extended_data(channel_id, 1, bytes::Bytes::copy_from_slice(&buf[..n]))
-                            .await
-                            .is_err()
-                        {
-                            break;
-                        }
+                            .await;
                     }
                     Err(_) => break,
                 }
             }
         });
 
-        // Wait for child in the background
+        // Wait for child in the background and log exit status
+        let cmd_desc = guest_command.iter().copied().collect::<Vec<_>>().join(" ");
         tokio::spawn(async move {
-            let _ = child.wait().await;
+            match child.wait().await {
+                Ok(status) => eprintln!("[ssh] runner exited: {status} (cmd: {cmd_desc})"),
+                Err(e) => eprintln!("[ssh] runner wait error: {e} (cmd: {cmd_desc})"),
+            }
         });
 
         *self.child.lock().await = Some(ChildBridge {
@@ -242,6 +270,7 @@ impl russh::server::Handler for SshSession {
             &["/usr/bin/bash", "-c", &cmd_str],
         )
         .await?;
+        session.channel_success(channel_id)?;
         Ok(())
     }
 
@@ -253,6 +282,7 @@ impl russh::server::Handler for SshSession {
         eprintln!("[ssh] shell request");
         self.spawn_litebox(channel_id, session.handle(), &["/usr/bin/bash"])
             .await?;
+        session.channel_success(channel_id)?;
         Ok(())
     }
 
