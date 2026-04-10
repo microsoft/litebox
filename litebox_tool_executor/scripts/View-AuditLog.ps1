@@ -51,6 +51,19 @@ begin {
         'other'      = 'DarkGray'
     }
 
+    # Dedup state for repeated tcp_denied/udp_denied events.
+    $script:lastDeniedKey = $null
+    $script:lastDeniedCount = 0
+
+    function Flush-Denied {
+        if ($script:lastDeniedCount -gt 1) {
+            if ($Prefix) { Write-Host -NoNewline -ForegroundColor DarkGray $Prefix }
+            Write-Host -ForegroundColor DarkRed "  (repeated $($script:lastDeniedCount - 1) more times)"
+        }
+        $script:lastDeniedKey = $null
+        $script:lastDeniedCount = 0
+    }
+
     function Format-Event($json) {
         try {
             $evt = $json | ConvertFrom-Json
@@ -85,16 +98,36 @@ begin {
                     Write-Host -ForegroundColor Cyan "DNS $($evt.hostname) -> $ipList"
                 }
                 'tcp_allowed' {
+                    Flush-Denied
                     $target = if ($evt.hostname) { "$($evt.hostname) ($($evt.ip))" } else { "$($evt.ip)" }
                     Write-Host -ForegroundColor Green "+ TCP $target`:$($evt.port)"
                 }
                 'tcp_denied' {
+                    $key = "$($evt.ip):$($evt.port)"
+                    if ($key -eq $script:lastDeniedKey) {
+                        $script:lastDeniedCount++
+                        return
+                    }
+                    Flush-Denied
+                    $script:lastDeniedKey = $key
+                    $script:lastDeniedCount = 1
                     $target = if ($evt.hostname) { "$($evt.hostname) ($($evt.ip))" } else { "$($evt.ip)" }
                     Write-Host -ForegroundColor Red "X BLOCKED TCP $target`:$($evt.port)"
                 }
                 'udp_denied' {
+                    $key = "udp:$($evt.ip):$($evt.port)"
+                    if ($key -eq $script:lastDeniedKey) {
+                        $script:lastDeniedCount++
+                        return
+                    }
+                    Flush-Denied
+                    $script:lastDeniedKey = $key
+                    $script:lastDeniedCount = 1
                     $target = if ($evt.hostname) { "$($evt.hostname) ($($evt.ip))" } else { "$($evt.ip)" }
                     Write-Host -ForegroundColor Red "X BLOCKED UDP $target`:$($evt.port)"
+                }
+                'fs_denied' {
+                    Write-Host -ForegroundColor Red "X FS DENIED $($evt.action): $($evt.path)"
                 }
                 default {
                     Write-Host -ForegroundColor DarkGray "[broker] $($evt.event): $json"
@@ -104,6 +137,7 @@ begin {
         }
 
         $name = $evt.syscall
+        Flush-Denied
         if ($Filter -and $name -notmatch $Filter) { return }
 
         $color = if ($colors.ContainsKey($name)) { $colors[$name] } else { 'White' }

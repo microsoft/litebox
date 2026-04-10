@@ -308,11 +308,44 @@ pub fn build_audit_event(
             ev
         }
         SyscallRequest::Connect {
-            sockfd, addrlen, ..
+            sockfd,
+            sockaddr,
+            addrlen,
         } => {
             let mut ev = AuditEvent::new("connect");
             ev.fd(*sockfd);
-            ev.int(*addrlen as u64);
+            // Try to parse sockaddr_in for AF_INET to emit dst_ip and dst_port.
+            if *addrlen >= 8 {
+                // Read the address family (first 2 bytes).
+                let family_bytes: Option<[u8; 2]> = sockaddr
+                    .read_at_offset(0)
+                    .and_then(|b0: u8| sockaddr.read_at_offset(1).map(|b1: u8| [b0, b1]));
+                if let Some(fam) = family_bytes {
+                    let family = u16::from_ne_bytes(fam);
+                    if family == 2 {
+                        // AF_INET: port at offset 2 (big-endian), IP at offset 4.
+                        let port_hi: u8 = sockaddr.read_at_offset(2).unwrap_or(0);
+                        let port_lo: u8 = sockaddr.read_at_offset(3).unwrap_or(0);
+                        let port = u16::from_be_bytes([port_hi, port_lo]);
+                        let ip0: u8 = sockaddr.read_at_offset(4).unwrap_or(0);
+                        let ip1: u8 = sockaddr.read_at_offset(5).unwrap_or(0);
+                        let ip2: u8 = sockaddr.read_at_offset(6).unwrap_or(0);
+                        let ip3: u8 = sockaddr.read_at_offset(7).unwrap_or(0);
+                        let mut addr_str = ArrayString::<64>::new();
+                        let _ = core::fmt::write(
+                            &mut addr_str,
+                            format_args!("{ip0}.{ip1}.{ip2}.{ip3}:{port}"),
+                        );
+                        ev.args.push(AuditArg::Addr(addr_str));
+                    } else {
+                        ev.int(*addrlen as u64);
+                    }
+                } else {
+                    ev.int(*addrlen as u64);
+                }
+            } else {
+                ev.int(*addrlen as u64);
+            }
             ev
         }
         SyscallRequest::Bind {

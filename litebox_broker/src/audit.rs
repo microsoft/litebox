@@ -92,6 +92,12 @@ impl AuditLog {
             net_rules.join(",")
         ));
     }
+    /// Log that a filesystem operation was denied by policy.
+    pub fn fs_denied(&self, path: &str, action: &str) {
+        self.write_line(&format!(
+            r#"{{"event":"fs_denied","path":"{path}","action":"{action}"}}"#
+        ));
+    }
 }
 
 // Use `Option<AuditLog>` and call methods only when `Some`.

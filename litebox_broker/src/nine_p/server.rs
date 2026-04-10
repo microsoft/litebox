@@ -78,10 +78,9 @@ pub struct Server {
     /// Whether to rewrite syscall instructions in ELF files.
     rewrite_syscalls: bool,
     /// Cache of patched ELF data, keyed by canonical path.
-    /// Stores `(mtime_secs, patched_data)` to invalidate when the file changes.
-    /// Shared across all server instances via `Arc` so ELF patching is amortized
-    /// across connections.
     elf_cache: Arc<Mutex<ElfCache>>,
+    /// Optional audit log for structured policy events.
+    audit_log: Option<crate::audit::AuditLog>,
 }
 
 impl Server {
@@ -122,7 +121,13 @@ impl Server {
             msize: AtomicU32::new(4 * 1024 * 1024),
             rewrite_syscalls,
             elf_cache,
+            audit_log: None,
         }
+    }
+
+    /// Set the audit log for structured policy events.
+    pub fn set_audit_log(&mut self, audit_log: crate::audit::AuditLog) {
+        self.audit_log = Some(audit_log);
     }
 
     /// Create a shared ELF cache that can be passed to multiple server instances.
@@ -841,6 +846,9 @@ impl Server {
 
         // Policy check using the full canonical path
         if self.policy.check(Action::Open, Some(&resolved)) == Decision::Deny {
+            if let Some(ref al) = self.audit_log {
+                al.fs_denied(resolved.to_str().unwrap_or("?"), "open");
+            }
             return error_response(libc::EPERM as u32);
         }
 
@@ -849,6 +857,9 @@ impl Server {
             fcall::LOpenFlags::O_WRONLY | fcall::LOpenFlags::O_RDWR | fcall::LOpenFlags::O_TRUNC,
         );
         if is_write && self.policy.check(Action::Write, Some(&resolved)) == Decision::Deny {
+            if let Some(ref al) = self.audit_log {
+                al.fs_denied(resolved.to_str().unwrap_or("?"), "write");
+            }
             return error_response(libc::EPERM as u32);
         }
 
@@ -1069,6 +1080,9 @@ impl Server {
 
         // Policy check for write using the full path
         if self.policy.check(Action::Write, Some(&path)) == Decision::Deny {
+            if let Some(ref al) = self.audit_log {
+                al.fs_denied(path.to_str().unwrap_or("?"), "write");
+            }
             return error_response(libc::EPERM as u32);
         }
 
