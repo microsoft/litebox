@@ -84,13 +84,28 @@ impl Clone for SshSession {
 
 impl SshSession {
     /// Spawn the litebox runner as a child process and bridge its I/O to the
-    /// SSH channel.
+    /// SSH channel. Runs the given command inside the sandbox.
     async fn spawn_litebox(
         &self,
         channel_id: ChannelId,
         session_handle: russh::server::Handle,
+        guest_command: &[&str],
     ) -> Result<(), anyhow::Error> {
         let cfg = &self.litebox_config;
+
+        eprintln!(
+            "[ssh] spawning litebox runner: {} (broker: {})",
+            guest_command.join(" "),
+            &cfg.broker_socket
+        );
+
+        // Verify broker socket exists before spawning
+        if !std::path::Path::new(&cfg.broker_socket).exists() {
+            return Err(anyhow::anyhow!(
+                "Broker socket not found: {}",
+                cfg.broker_socket
+            ));
+        }
 
         let mut cmd = TokioCommand::new(&cfg.runner_path);
         cmd.arg("--unstable");
@@ -106,20 +121,9 @@ impl SshSession {
             cmd.arg("--env").arg(kv);
         }
 
+        // Run the requested command inside the sandbox
         cmd.arg("--");
-        cmd.arg("/usr/local/bin/node");
-        cmd.arg("/opt/vscode-server/out/server-main.js");
-        cmd.args([
-            "--accept-server-license-terms",
-            "--without-connection-token",
-            "--disable-telemetry",
-            "--host",
-            "127.0.0.1",
-            "--port",
-            "0",
-        ]);
-
-        for arg in &cfg.extra_args {
+        for arg in guest_command {
             cmd.arg(arg);
         }
 
@@ -228,11 +232,16 @@ impl russh::server::Handler for SshSession {
         data: &[u8],
         session: &mut Session,
     ) -> Result<(), Self::Error> {
-        let cmd = String::from_utf8_lossy(data);
-        eprintln!("[ssh] exec request: {cmd}");
-        // VS Code sends a command to start the server. We ignore the command
-        // and always launch our litebox VS Code Server instead.
-        self.spawn_litebox(channel_id, session.handle()).await?;
+        let cmd_str = String::from_utf8_lossy(data);
+        eprintln!("[ssh] exec request: {cmd_str}");
+        // Run the requested command inside the litebox sandbox.
+        // VS Code sends "sh" and pipes its bootstrap script via stdin.
+        self.spawn_litebox(
+            channel_id,
+            session.handle(),
+            &["/usr/bin/bash", "-c", &cmd_str],
+        )
+        .await?;
         Ok(())
     }
 
@@ -242,7 +251,8 @@ impl russh::server::Handler for SshSession {
         session: &mut Session,
     ) -> Result<(), Self::Error> {
         eprintln!("[ssh] shell request");
-        self.spawn_litebox(channel_id, session.handle()).await?;
+        self.spawn_litebox(channel_id, session.handle(), &["/usr/bin/bash"])
+            .await?;
         Ok(())
     }
 

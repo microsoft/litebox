@@ -248,6 +248,15 @@ mkdir -p "$OUTPUT/root/.vscode-server/data/Machine"
 mkdir -p "$OUTPUT/root/.vscode-server/extensions"
 chmod -R 777 "$OUTPUT/root/.vscode-server"
 
+# Symlink VS Code Server at the path VS Code Remote-SSH expects:
+# ~/.vscode-server/bin/<commit>/
+VSCODE_COMMIT=$(python3 -c "import json; print(json.load(open('$VSCODE_DIR/product.json'))['commit'])" 2>/dev/null || echo "")
+if [ -n "$VSCODE_COMMIT" ]; then
+    mkdir -p "$OUTPUT/root/.vscode-server/bin"
+    ln -sfn /opt/vscode-server "$OUTPUT/root/.vscode-server/bin/$VSCODE_COMMIT"
+    echo "  Linked VS Code Server at ~/.vscode-server/bin/$VSCODE_COMMIT"
+fi
+
 # DNS resolver pointing at broker virtual IP
 echo "nameserver 10.0.0.1" > "$OUTPUT/etc/resolv.conf"
 
