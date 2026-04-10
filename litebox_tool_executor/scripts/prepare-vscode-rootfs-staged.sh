@@ -203,7 +203,82 @@ if [ -f /etc/ssl/openssl.cnf ]; then
 fi
 
 # ============================================================
-echo "=== Phase 7: Create directory structure and config ==="
+echo "=== Phase 7: Install OpenSSH sshd ==="
+# sshd runs inside the sandbox as the init process. VS Code connects
+# via SSH, and sshd fork+execs bash/sftp-server/VS Code Server — all
+# sharing one filesystem.
+SSHD_DEB_DIR=$(mktemp -d)
+(
+    cd "$SSHD_DEB_DIR"
+    # Download sshd and libwrap (TCP wrappers, required by sshd)
+    apt-get download openssh-server libwrap0 2>/dev/null
+    for deb in *.deb; do
+        [ -f "$deb" ] || continue
+        dpkg-deb -x "$deb" "$SSHD_DEB_DIR/ext"
+    done
+)
+
+# Install sshd binary
+if [ -f "$SSHD_DEB_DIR/ext/usr/sbin/sshd" ]; then
+    mkdir -p "$OUTPUT/usr/sbin"
+    cp "$SSHD_DEB_DIR/ext/usr/sbin/sshd" "$OUTPUT/usr/sbin/sshd"
+    chmod +x "$OUTPUT/usr/sbin/sshd"
+    echo "  Installed sshd"
+    stage_deps "$SSHD_DEB_DIR/ext/usr/sbin/sshd"
+fi
+
+# Install libwrap (TCP wrappers)
+LIBWRAP=$(find "$SSHD_DEB_DIR/ext" -name "libwrap.so.0*" -type f | head -1)
+if [ -n "$LIBWRAP" ]; then
+    mkdir -p "$OUTPUT/lib/x86_64-linux-gnu"
+    cp "$LIBWRAP" "$OUTPUT/lib/x86_64-linux-gnu/libwrap.so.0"
+    echo "  Installed libwrap"
+fi
+
+# Install sftp-server
+SFTP=$(find "$SSHD_DEB_DIR/ext" -name "sftp-server" -type f 2>/dev/null | head -1)
+if [ -z "$SFTP" ]; then
+    # sftp-server is in a separate package
+    (cd "$SSHD_DEB_DIR" && apt-get download openssh-sftp-server 2>/dev/null && \
+     dpkg-deb -x openssh-sftp-server*.deb "$SSHD_DEB_DIR/ext")
+    SFTP=$(find "$SSHD_DEB_DIR/ext" -name "sftp-server" -type f | head -1)
+fi
+if [ -n "$SFTP" ]; then
+    mkdir -p "$OUTPUT/usr/lib/openssh"
+    cp "$SFTP" "$OUTPUT/usr/lib/openssh/sftp-server"
+    chmod +x "$OUTPUT/usr/lib/openssh/sftp-server"
+    echo "  Installed sftp-server"
+fi
+
+# Generate host key
+mkdir -p "$OUTPUT/etc/ssh"
+if [ ! -f "$OUTPUT/etc/ssh/ssh_host_ed25519_key" ]; then
+    ssh-keygen -t ed25519 -f "$OUTPUT/etc/ssh/ssh_host_ed25519_key" -N "" -q
+    echo "  Generated host key"
+fi
+
+# Write sshd config
+cat > "$OUTPUT/etc/ssh/sshd_config" << 'SSHD_CONFIG'
+Port 22
+HostKey /etc/ssh/ssh_host_ed25519_key
+PermitRootLogin yes
+PasswordAuthentication yes
+PermitEmptyPasswords yes
+UsePAM no
+Subsystem sftp /usr/lib/openssh/sftp-server
+UseDNS no
+AcceptEnv *
+LogLevel INFO
+SSHD_CONFIG
+echo "  Written sshd_config"
+
+# sshd privilege separation directory
+mkdir -p "$OUTPUT/var/run/sshd" "$OUTPUT/run/sshd"
+
+rm -rf "$SSHD_DEB_DIR"
+
+# ============================================================
+echo "=== Phase 8: Create directory structure and config ==="
 # Essential directories
 mkdir -p "$OUTPUT/tmp" "$OUTPUT/etc" "$OUTPUT/dev" "$OUTPUT/proc"
 mkdir -p "$OUTPUT/workspaces" "$OUTPUT/root" "$OUTPUT/home"
@@ -243,6 +318,15 @@ for util in "${UTILS[@]}"; do
     fi
 done
 
+# sh symlink (VS Code bootstrap sends 'sh' as the exec command)
+ln -sf /usr/bin/bash "$OUTPUT/bin/sh" 2>/dev/null || true
+ln -sf /usr/bin/bash "$OUTPUT/usr/bin/sh" 2>/dev/null || true
+
+# python3 symlink
+if [ -f "$OUTPUT/usr/bin/python3.12" ] && [ ! -f "$OUTPUT/usr/bin/python3" ]; then
+    ln -sf python3.12 "$OUTPUT/usr/bin/python3"
+fi
+
 # Ensure dynamic linker is at PT_INTERP path
 if [ ! -f "$OUTPUT/lib64/ld-linux-x86-64.so.2" ]; then
     mkdir -p "$OUTPUT/lib64"
@@ -264,7 +348,7 @@ echo "  Total size: $TOTAL_SIZE"
 echo "  File count: $FILE_COUNT"
 echo ""
 echo "Key binaries:"
-for bin in node git python3 bash; do
+for bin in node git python3 bash sshd sftp-server; do
     found=$(find "$OUTPUT" -name "$bin" -type f 2>/dev/null | head -1)
     if [ -n "$found" ]; then
         echo "  $bin: ${found#$OUTPUT}"
