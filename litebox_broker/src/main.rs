@@ -69,6 +69,19 @@ struct Cli {
     /// this file, which may be shared with the runner's syscall audit log.
     #[arg(long = "audit-log", value_name = "PATH", value_hint = clap::ValueHint::FilePath)]
     audit_log: Option<PathBuf>,
+
+    /// Forward a host TCP port to the guest virtual network.
+    /// Format: HOST_PORT:GUEST_IP:GUEST_PORT (e.g., 2222:10.0.0.2:22).
+    /// The broker listens on HOST_PORT and relays connections to the guest.
+    #[arg(long = "forward-port", value_name = "HOST:GUEST_IP:GUEST_PORT")]
+    forward_port: Vec<String>,
+}
+
+fn parse_forward_specs(specs: &[String]) -> Vec<(u16, std::net::Ipv4Addr, u16)> {
+    specs
+        .iter()
+        .filter_map(|s| litebox_broker::net_proxy::parse_forward_spec(s))
+        .collect()
 }
 
 fn build_policy(
@@ -231,6 +244,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let ipc = IpcStream::from_owned_fd(fd);
         let elf_cache = litebox_broker::nine_p::server::Server::new_elf_cache();
         let registry = build_local_services(&cli, elf_cache, &sandbox_policy);
+        let forwards = parse_forward_specs(&cli.forward_port);
         return litebox_broker::net_proxy::run(
             ipc,
             false,
@@ -238,6 +252,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             None,
             sandbox_policy,
             audit_log,
+            forwards,
         );
     }
     #[cfg(not(unix))]
@@ -279,6 +294,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             };
             info!("network proxy client connected");
+            let forwards = parse_forward_specs(&cli.forward_port);
             if let Err(e) = litebox_broker::net_proxy::run_with_session_slots(
                 ipc,
                 true,
@@ -287,6 +303,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Arc::clone(&extra_session_slots),
                 sandbox_policy.clone(),
                 audit_log.clone(),
+                forwards,
             ) {
                 tracing::error!("network proxy error: {e}");
             }

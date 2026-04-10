@@ -19,6 +19,7 @@ mod device;
 pub mod dns_tracker;
 
 use std::collections::HashMap;
+use std::io::{Read, Write};
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpListener, UdpSocket};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -117,6 +118,34 @@ const MAX_ADDITIONAL_LBNP_SESSIONS: usize = 32;
 /// Maximum accepted-but-not-yet-classified listener sockets kept in the
 /// pending handshake queue at once.
 const MAX_PENDING_ACCEPTED_HANDSHAKES: usize = 32;
+
+/// An inbound TCP port forward: host listens on a port and relays connections
+/// to a guest IP:port inside the smoltcp virtual network.
+struct InboundForward {
+    listener: std::net::TcpListener,
+    guest_ip: Ipv4Addr,
+    guest_port: u16,
+}
+
+/// An active inbound TCP bridge: relays data between a host TCP socket and a
+/// smoltcp TCP socket connected to the guest.
+struct InboundBridge {
+    smoltcp_handle: SocketHandle,
+    host_stream: std::net::TcpStream,
+    host_eof: bool,
+}
+
+/// Parse a port-forward spec: "HOST_PORT:GUEST_IP:GUEST_PORT"
+pub fn parse_forward_spec(spec: &str) -> Option<(u16, Ipv4Addr, u16)> {
+    let parts: Vec<&str> = spec.splitn(3, ':').collect();
+    if parts.len() != 3 {
+        return None;
+    }
+    let host_port: u16 = parts[0].parse().ok()?;
+    let guest_ip: Ipv4Addr = parts[1].parse().ok()?;
+    let guest_port: u16 = parts[2].parse().ok()?;
+    Some((host_port, guest_ip, guest_port))
+}
 
 /// Timeout for non-blocking host TCP connect.
 const HOST_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -605,6 +634,7 @@ pub fn run(
     accept_listener: Option<&IpcListener>,
     sandbox_policy: Option<Arc<SandboxPolicy>>,
     audit_log: Option<AuditLog>,
+    inbound_forwards: Vec<(u16, Ipv4Addr, u16)>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     run_with_session_slots(
         ipc_fd,
@@ -614,6 +644,7 @@ pub fn run(
         Arc::new(AtomicUsize::new(0)),
         sandbox_policy,
         audit_log,
+        inbound_forwards,
     )
 }
 
@@ -625,6 +656,7 @@ pub fn run_with_session_slots(
     session_slots: Arc<AtomicUsize>,
     sandbox_policy: Option<Arc<SandboxPolicy>>,
     audit_log: Option<AuditLog>,
+    inbound_forwards: Vec<(u16, Ipv4Addr, u16)>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     run_inner(
         ipc_fd,
@@ -634,6 +666,7 @@ pub fn run_with_session_slots(
         session_slots,
         sandbox_policy,
         audit_log,
+        inbound_forwards,
     )
 }
 
@@ -645,6 +678,7 @@ fn run_inner(
     session_slots: Arc<AtomicUsize>,
     sandbox_policy: Option<Arc<SandboxPolicy>>,
     audit_log: Option<AuditLog>,
+    inbound_forwards: Vec<(u16, Ipv4Addr, u16)>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     info!("network proxy starting");
 
@@ -695,6 +729,28 @@ fn run_inner(
     let mut udp_flows: HashMap<UdpFlowKey, UdpFlow> = HashMap::new();
     // DNS tracker for hostname-based network policy enforcement.
     let mut dns_tracker = dns_tracker::DnsTracker::new();
+
+    // Inbound TCP port forwards: host listeners that relay to guest ports.
+    let mut inbound_listeners: Vec<InboundForward> = Vec::new();
+    let mut inbound_bridges: Vec<InboundBridge> = Vec::new();
+    let mut next_inbound_src_port: u16 = 49152; // ephemeral port range
+
+    for (host_port, guest_ip, guest_port) in &inbound_forwards {
+        match std::net::TcpListener::bind(format!("0.0.0.0:{host_port}")) {
+            Ok(listener) => {
+                listener.set_nonblocking(true).ok();
+                info!("inbound TCP forward: host:{host_port} → {guest_ip}:{guest_port}");
+                inbound_listeners.push(InboundForward {
+                    listener,
+                    guest_ip: *guest_ip,
+                    guest_port: *guest_port,
+                });
+            }
+            Err(e) => {
+                error!("failed to bind inbound forward on port {host_port}: {e}");
+            }
+        }
+    }
     // Host DNS resolver for forwarding guest DNS queries.
     let host_dns = discover_host_dns();
     // Pending LB9P handshakes — drained non-blocking each loop iteration.
@@ -1128,7 +1184,7 @@ fn run_inner(
                         return;
                     }
                     info!("accepted additional LBNP client, handshake complete");
-                    if let Err(e) = run_inner(stream, true, local_services, None, session_slots, sandbox_policy, audit_log) {
+                    if let Err(e) = run_inner(stream, true, local_services, None, session_slots, sandbox_policy, audit_log, vec![]) {
                         tracing::error!("network proxy error: {e}");
                     }
                 });
@@ -1180,7 +1236,109 @@ fn run_inner(
             false // remove from queue
         });
 
-        // Step 9: Compute delay and wait for readability on IPC + host UDP sockets.
+        // Step 8c: Accept inbound TCP forwards and create smoltcp connections.
+        for fwd in &inbound_listeners {
+            loop {
+                match fwd.listener.accept() {
+                    Ok((stream, peer)) => {
+                        stream.set_nonblocking(true).ok();
+                        info!(
+                            "inbound TCP: accepted from {peer} → {}:{}",
+                            fwd.guest_ip, fwd.guest_port
+                        );
+
+                        // Create a smoltcp TCP socket that connects to the guest.
+                        let tcp_rx = smoltcp::socket::tcp::SocketBuffer::new(vec![0; 65536]);
+                        let tcp_tx = smoltcp::socket::tcp::SocketBuffer::new(vec![0; 65536]);
+                        let tcp_socket = smoltcp::socket::tcp::Socket::new(tcp_rx, tcp_tx);
+                        let handle = sockets.add(tcp_socket);
+
+                        let src_port = next_inbound_src_port;
+                        next_inbound_src_port = next_inbound_src_port.wrapping_add(1);
+                        if next_inbound_src_port < 49152 {
+                            next_inbound_src_port = 49152;
+                        }
+
+                        let sock = sockets.get_mut::<smoltcp::socket::tcp::Socket>(handle);
+                        let local = smoltcp::wire::IpEndpoint::new(
+                            IpAddress::Ipv4(BROKER_IP),
+                            src_port,
+                        );
+                        let octets = fwd.guest_ip.octets();
+                        let remote = smoltcp::wire::IpEndpoint::new(
+                            IpAddress::Ipv4(Ipv4Address::new(
+                                octets[0], octets[1], octets[2], octets[3],
+                            )),
+                            fwd.guest_port,
+                        );
+                        if let Err(e) = sock.connect(iface.context(), remote, local) {
+                            error!("inbound TCP: smoltcp connect failed: {e}");
+                            sockets.remove(handle);
+                            continue;
+                        }
+
+                        inbound_bridges.push(InboundBridge {
+                            smoltcp_handle: handle,
+                            host_stream: stream,
+                            host_eof: false,
+                        });
+                    }
+                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                    Err(e) => {
+                        warn!("inbound TCP accept error: {e}");
+                        break;
+                    }
+                }
+            }
+        }
+
+        // Step 8d: Relay data for inbound TCP bridges.
+        inbound_bridges.retain_mut(|bridge| {
+            let sock = sockets.get_mut::<smoltcp::socket::tcp::Socket>(bridge.smoltcp_handle);
+
+            // Host → guest: read from host socket, send to smoltcp.
+            if !bridge.host_eof && sock.can_send() {
+                let mut buf = [0u8; 4096];
+                match bridge.host_stream.read(&mut buf) {
+                    Ok(0) => {
+                        bridge.host_eof = true;
+                        sock.close();
+                    }
+                    Ok(n) => {
+                        let _ = sock.send_slice(&buf[..n]);
+                    }
+                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                    Err(_) => {
+                        bridge.host_eof = true;
+                        sock.close();
+                    }
+                }
+            }
+
+            // Guest → host: read from smoltcp, write to host socket.
+            if sock.can_recv() {
+                let mut buf = [0u8; 4096];
+                match sock.recv_slice(&mut buf) {
+                    Ok(n) if n > 0 => {
+                        if bridge.host_stream.write_all(&buf[..n]).is_err() {
+                            sock.close();
+                            return false;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+
+            // Clean up closed connections.
+            if sock.state() == smoltcp::socket::tcp::State::Closed {
+                sockets.remove(bridge.smoltcp_handle);
+                return false;
+            }
+
+            true
+        });
+
+        // Step 9: Compute delay and wait for readability on IPC + host sockets.
         //
         // Cap at 100µs to match the guest-side polling cadence.  ppoll wakes
         // immediately on any fd becoming readable, so the timeout only governs
@@ -1201,6 +1359,22 @@ fn run_inner(
         if let Some(listener) = accept_listener {
             pfds.push(PollFd {
                 fd: listener.raw(),
+                events: POLLIN,
+                revents: 0,
+            });
+        }
+        // Include inbound forward listeners in the poll set.
+        for fwd in &inbound_listeners {
+            pfds.push(PollFd {
+                fd: raw_socket(&fwd.listener),
+                events: POLLIN,
+                revents: 0,
+            });
+        }
+        // Include inbound bridge host streams in the poll set.
+        for bridge in &inbound_bridges {
+            pfds.push(PollFd {
+                fd: raw_socket(&bridge.host_stream),
                 events: POLLIN,
                 revents: 0,
             });

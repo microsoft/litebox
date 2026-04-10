@@ -765,8 +765,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, W: transport::Write> FileSystem<
             FileStatusError::PathError(PathError::NoSuchFileOrDirectory)
         ) && self.cache_generation.load(Ordering::SeqCst) == gen_before
         {
-            // Negative stat cache disabled (see file_status comment above).
-            // self.negative_stat_cache.lock().insert(path.into());
+            self.negative_stat_cache.lock().insert(path.into());
         }
     }
 
@@ -2023,17 +2022,15 @@ impl<Platform: sync::RawSyncPrimitivesProvider, W: transport::Write> super::File
         // RPC so we can detect namespace mutations racing with this lookup.
         let gen_before = self.cache_generation.load(Ordering::SeqCst);
 
-        // NOTE: negative stat cache disabled — it causes stale ENOENT when
-        // files are created externally (e.g., sftp-server writing through a
-        // different 9P session to the same broker). The cache is per-client
-        // and not invalidated by external writes.
-        // TODO: re-enable with a TTL or cross-session invalidation mechanism.
-        // {
-        //     let neg_cache = self.negative_stat_cache.lock();
-        //     if neg_cache.contains(&path) {
-        //         return Err(FileStatusError::PathError(PathError::NoSuchFileOrDirectory));
-        //     }
-        // }
+        // Check the negative stat cache — if we previously got ENOENT
+        // for this path and no namespace mutations have invalidated it,
+        // we can return the error without any RPCs.
+        {
+            let neg_cache = self.negative_stat_cache.lock();
+            if neg_cache.contains(&path) {
+                return Err(FileStatusError::PathError(PathError::NoSuchFileOrDirectory));
+            }
+        }
 
         // Validate the path before issuing RPCs.
         let _ = path
