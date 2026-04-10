@@ -1,19 +1,20 @@
 #!/bin/bash
 # Download Node.js and prepare rootfs directory for VS Code Server
-# No sudo required — stages binaries from host + downloads.
+# Prepare a rootfs directory for VS Code Server with runtime syscall rewriting.
+#
+# Binaries are staged as-is (no pre-rewriting). The broker's --rewrite-syscalls
+# flag rewrites ELF binaries on-the-fly when they're read over 9P. This
+# simplifies rootfs preparation and supports VS Code's localServerDownload
+# (where the client transfers the server tarball at connection time).
+#
+# Usage:
+#   ./prepare-vscode-rootfs-staged.sh [output-dir]
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 WORKSPACE="$(cd "$SCRIPT_DIR/../.." && pwd)"
-REWRITER="${LITEBOX_REWRITER:-$WORKSPACE/target/debug/litebox_syscall_rewriter}"
 OUTPUT="${1:-$WORKSPACE/target/vscode-rootfs}"
 NODE_VERSION="v24.14.1"
-
-if [ ! -f "$REWRITER" ]; then
-    echo "ERROR: litebox_syscall_rewriter not found at $REWRITER"
-    echo "Build it first: cargo build -p litebox_syscall_rewriter"
-    exit 1
-fi
 
 mkdir -p "$OUTPUT"
 
@@ -36,7 +37,7 @@ stage_lib() {
     STAGED_LIBS["$lib_path"]=1
     local dest="$OUTPUT$lib_path"
     mkdir -p "$(dirname "$dest")"
-    "$REWRITER" "$lib_path" -o "$dest" 2>/dev/null || cp "$lib_path" "$dest"
+    cp "$lib_path" "$dest"
     if [ "$orig_path" != "$lib_path" ]; then
         local sym_dest="$OUTPUT$orig_path"
         if [ ! -e "$sym_dest" ]; then
@@ -81,10 +82,7 @@ stage_binary() {
 
     echo "  staging: $host_path -> $dest_path"
     mkdir -p "$(dirname "$dest")"
-    "$REWRITER" "$host_path" -o "$dest" 2>/dev/null || {
-        echo "    WARNING: rewriter failed, copying raw"
-        cp "$host_path" "$dest"
-    }
+    cp "$host_path" "$dest"
     chmod +x "$dest"
     stage_deps "$host_path"
 }
@@ -117,7 +115,8 @@ echo "  Node.js ready: $("$NODE_DIR/bin/node" --version)"
 echo "=== Phase 2: Stage shell + core utilities ==="
 UTILS=(bash cat ls grep sort uniq wc find head tail mkdir rm cp mv echo tr sed awk
        pwd dirname basename env printenv date id uname xargs tee touch chmod
-       ps pgrep kill hostname readlink ln less which whoami)
+       ps pgrep kill hostname readlink ln less which whoami
+       tar gzip gunzip curl wget)
 
 for util in "${UTILS[@]}"; do
     stage_binary_by_name "$util"
@@ -135,8 +134,7 @@ if [ -d "$GIT_EXEC_PATH" ]; then
         [ -f "$helper" ] || continue
         local_name=$(basename "$helper")
         if [ ! -f "$OUTPUT$GIT_EXEC_PATH/$local_name" ]; then
-            "$REWRITER" "$helper" -o "$OUTPUT$GIT_EXEC_PATH/$local_name" 2>/dev/null || \
-                cp "$helper" "$OUTPUT$GIT_EXEC_PATH/$local_name"
+            cp "$helper" "$OUTPUT$GIT_EXEC_PATH/$local_name"
             chmod +x "$OUTPUT$GIT_EXEC_PATH/$local_name"
         fi
     done
@@ -179,8 +177,7 @@ if [ -d "$PYTHON_LIB" ]; then
         mkdir -p "$OUTPUT$PYTHON_DYNLOAD"
         for so in "$PYTHON_DYNLOAD"/*.so; do
             [ -f "$so" ] || continue
-            "$REWRITER" "$so" -o "$OUTPUT$PYTHON_DYNLOAD/$(basename "$so")" 2>/dev/null || \
-                cp "$so" "$OUTPUT$PYTHON_DYNLOAD/$(basename "$so")"
+            cp "$so" "$OUTPUT$PYTHON_DYNLOAD/$(basename "$so")"
         done
     fi
 fi
@@ -205,57 +202,19 @@ if [ -f /etc/ssl/openssl.cnf ]; then
 fi
 
 # ============================================================
-echo "=== Phase 7: Download VS Code Server ==="
-VSCODE_DIR="$OUTPUT/opt/vscode-server"
-if [ -d "$VSCODE_DIR" ] && [ -f "$VSCODE_DIR/node" ]; then
-    echo "  VS Code Server already exists, skipping download"
-else
-    mkdir -p "$VSCODE_DIR"
-    echo "  Downloading VS Code Server (stable, linux-x64)..."
-    # Download the official server tarball
-    curl -fsSL "https://update.code.visualstudio.com/latest/server-linux-x64/stable" \
-        -o /tmp/vscode-server.tar.gz
-    tar xzf /tmp/vscode-server.tar.gz -C "$VSCODE_DIR" --strip-components=1
-    rm -f /tmp/vscode-server.tar.gz
-    echo "  VS Code Server downloaded to $VSCODE_DIR"
-
-    # Rewrite all ELF binaries in the VS Code Server directory
-    echo "  Rewriting VS Code Server ELF binaries..."
-    REWRITTEN=0
-    while IFS= read -r -d '' binary; do
-        if file "$binary" 2>/dev/null | grep -q "ELF"; then
-            if "$REWRITER" "$binary" -o "${binary}.rw" 2>/dev/null; then
-                mv "${binary}.rw" "$binary"
-                REWRITTEN=$((REWRITTEN + 1))
-            else
-                rm -f "${binary}.rw"
-            fi
-        fi
-    done < <(find "$VSCODE_DIR" -type f \( -perm -100 -o -name "*.so" -o -name "*.so.*" -o -name "*.node" \) -print0 2>/dev/null)
-    echo "  Rewrote $REWRITTEN VS Code Server binaries"
-fi
-
-# ============================================================
-echo "=== Phase 8: Create directory structure and config ==="
+echo "=== Phase 7: Create directory structure and config ==="
 # Essential directories
 mkdir -p "$OUTPUT/tmp" "$OUTPUT/etc" "$OUTPUT/dev" "$OUTPUT/proc"
 mkdir -p "$OUTPUT/workspaces" "$OUTPUT/root" "$OUTPUT/home"
 mkdir -p "$OUTPUT/bin" "$OUTPUT/usr/bin" "$OUTPUT/usr/local/bin"
 
-# VS Code Server data directories (writable at runtime)
+# VS Code Server data directories (writable at runtime).
+# VS Code's localServerDownload will transfer the server tarball here.
+mkdir -p "$OUTPUT/root/.vscode-server/bin"
 mkdir -p "$OUTPUT/root/.vscode-server/data/logs"
 mkdir -p "$OUTPUT/root/.vscode-server/data/Machine"
 mkdir -p "$OUTPUT/root/.vscode-server/extensions"
 chmod -R 777 "$OUTPUT/root/.vscode-server"
-
-# Symlink VS Code Server at the path VS Code Remote-SSH expects:
-# ~/.vscode-server/bin/<commit>/
-VSCODE_COMMIT=$(python3 -c "import json; print(json.load(open('$VSCODE_DIR/product.json'))['commit'])" 2>/dev/null || echo "")
-if [ -n "$VSCODE_COMMIT" ]; then
-    mkdir -p "$OUTPUT/root/.vscode-server/bin"
-    ln -sfn /opt/vscode-server "$OUTPUT/root/.vscode-server/bin/$VSCODE_COMMIT"
-    echo "  Linked VS Code Server at ~/.vscode-server/bin/$VSCODE_COMMIT"
-fi
 
 # DNS resolver pointing at broker virtual IP
 echo "nameserver 10.0.0.1" > "$OUTPUT/etc/resolv.conf"

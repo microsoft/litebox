@@ -18,8 +18,10 @@
     //   2. In the LiteBox profile's user settings (JSON), add:
     //        "remote.SSH.path": "C:\\src\\litebox-vscode-server\\litebox_tool_executor\\scripts\\litebox-ssh-shim.ps1",
     //        "remote.SSH.showLoginTerminal": true
-    //   3. The shim only intercepts host "litebox" — all other SSH
-    //      connections fall through to real ssh unchanged.
+    //   Also add to the LiteBox profile's user settings:
+    //        "remote.SSH.localServerDownload": "always"
+    //   This makes VS Code download the server locally and transfer it
+    //   via SSH (tar over stdin), so the sandbox doesn't need internet.
     //
     // Usage:
     //   1. Switch to the "LiteBox" profile

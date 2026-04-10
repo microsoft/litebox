@@ -312,11 +312,12 @@ impl BrokerProcess {
         // (or the rootfs itself if it's a directory).
         if rootfs.is_dir() {
             cmd.arg("--root-dir").arg(rootfs);
-            // Directory rootfs contains pre-rewritten binaries, so skip
-            // broker-side rewriting (which would double-rewrite and crash).
-        } else {
-            cmd.arg("--rewrite-syscalls");
         }
+
+        // Always rewrite syscalls — the broker patches ELF binaries on-the-fly
+        // when they're read over 9P. This handles both the base rootfs and any
+        // binaries transferred at runtime (e.g., VS Code's localServerDownload).
+        cmd.arg("--rewrite-syscalls");
 
         if let Some(p) = policy {
             cmd.arg("--policy").arg(p);
