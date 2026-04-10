@@ -58,6 +58,13 @@ struct Cli {
     #[arg(long, default_value = "2222")]
     ssh_port: u16,
 
+    /// Record a baseline: use AllowAll policy (no restrictions) so every
+    /// operation succeeds while being fully audit-logged. Use this to
+    /// capture the complete set of operations VS Code Server needs,
+    /// then generate a policy from the recording.
+    #[arg(long)]
+    record_baseline: bool,
+
     /// The command and arguments to run. Omit for interactive mode.
     #[arg(trailing_var_arg = true)]
     command: Vec<String>,
@@ -410,18 +417,21 @@ fn spawn_broker(
     cli: &Cli,
     audit_log_file: Option<&std::path::Path>,
 ) -> anyhow::Result<(BrokerProcess, Option<TempFile>)> {
-    let (policy_path, temp_policy) = if let Some(ref p) = cli.policy {
-        (p.clone(), None)
+    let (policy_path, temp_policy) = if cli.record_baseline {
+        // AllowAll: no policy file → broker allows everything
+        (None, None)
+    } else if let Some(ref p) = cli.policy {
+        (Some(p.clone()), None)
     } else {
         let tmp = write_default_policy()?;
         let path = tmp.0.clone();
-        (path, Some(tmp))
+        (Some(path), Some(tmp))
     };
     // Write broker logs to a .log file alongside the audit .jsonl files.
     let broker_log = audit_log_file.map(|p| p.with_extension("broker.log"));
     let broker = BrokerProcess::spawn(
         &cli.rootfs,
-        Some(&policy_path),
+        policy_path.as_deref(),
         broker_log.as_deref(),
         audit_log_file,
     )?;
@@ -656,6 +666,9 @@ fn vscode_server(cli: &Cli, audit_log_file: Option<&std::path::Path>) -> anyhow:
         eprintln!();
         eprintln!("==============================================");
         eprintln!("  LiteBox VS Code Server (embedded SSH)");
+        if cli.record_baseline {
+            eprintln!("  *** RECORDING BASELINE (AllowAll policy) ***");
+        }
         eprintln!("  SSH listening on 0.0.0.0:{port}");
         eprintln!();
         eprintln!("  Add to ~/.ssh/config:");

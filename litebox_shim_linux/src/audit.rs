@@ -73,6 +73,10 @@ pub struct AuditEvent {
     pub args: ArrayVec<AuditArg, MAX_ARGS>,
     /// The syscall return value: `Ok(value)` or `Err(negated_errno)`.
     pub result: Result<usize, i32>,
+    /// Virtual PID of the process that made the syscall.
+    pub pid: i32,
+    /// Command name of the process (from execve, e.g., "node", "bash").
+    pub comm: ArrayString<16>,
 }
 
 impl AuditEvent {
@@ -82,6 +86,8 @@ impl AuditEvent {
             syscall_name,
             args: ArrayVec::new(),
             result: Ok(0),
+            pid: 0,
+            comm: ArrayString::new(),
         }
     }
 
@@ -124,7 +130,13 @@ impl AuditEvent {
 impl fmt::Display for AuditEvent {
     /// Emit the event as a single JSON line.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{{\"syscall\":\"{}\",\"args\":[", self.syscall_name)?;
+        write!(
+            f,
+            "{{\"syscall\":\"{}\",\"pid\":{},\"comm\":\"",
+            self.syscall_name, self.pid
+        )?;
+        write_json_escaped(f, self.comm.as_str())?;
+        write!(f, "\",\"args\":[")?;
         for (i, arg) in self.args.iter().enumerate() {
             if i > 0 {
                 write!(f, ",")?;

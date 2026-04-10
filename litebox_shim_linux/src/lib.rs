@@ -2360,7 +2360,16 @@ impl<FS: ShimFS> Task<FS> {
         self.record_syscall_entry(ctx, syscall_number);
 
         #[cfg(feature = "audit_log")]
-        let audit_event = audit::build_audit_event(&request);
+        let mut audit_event = audit::build_audit_event(&request);
+        #[cfg(feature = "audit_log")]
+        {
+            audit_event.pid = self.pid;
+            let comm_bytes = self.comm.get();
+            let comm_len = comm_bytes.iter().position(|&b| b == 0).unwrap_or(comm_bytes.len());
+            let _ = audit_event
+                .comm
+                .try_push_str(core::str::from_utf8(&comm_bytes[..comm_len]).unwrap_or("?"));
+        }
         #[cfg(feature = "audit_log")]
         let audit_seq = audit::emit_entry_event(&audit_event);
 
