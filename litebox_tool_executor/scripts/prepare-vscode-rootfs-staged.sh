@@ -116,7 +116,7 @@ echo "=== Phase 2: Stage shell + core utilities ==="
 UTILS=(bash cat ls grep sort uniq wc find head tail mkdir rm cp mv echo tr sed awk
        pwd dirname basename env printenv date id uname xargs tee touch chmod
        ps pgrep kill hostname readlink ln less which whoami
-       tar gzip gunzip curl wget sleep
+       tar gzip gunzip curl wget sleep scp
        getconf nproc dd mktemp chown stat cut)
 
 for util in "${UTILS[@]}"; do
