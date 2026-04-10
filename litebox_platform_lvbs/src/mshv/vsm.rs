@@ -1366,19 +1366,49 @@ fn copy_heki_pages_from_vtl0(pa: u64, nranges: u64) -> Option<Vec<HekiPage>> {
     Some(heki_pages)
 }
 
-/// This function protects a physical memory range. It is a safe wrapper for `hv_modify_vtl_protection_mask`.
-/// `phys_frame_range` specifies the physical frame range to protect
-/// `mem_attr` specifies the memory attributes to be applied to the range
+/// This function protects a VTL0 physical memory range from potentially compromised VTL0 by
+/// restricting its access permissions using VTL protection mask (e.g., kernel code integrity).
+/// It is a safe wrapper for `hv_modify_vtl_protection_mask`. `phys_frame_range` specifies the
+/// physical frame range to protect (must belong to VTL0) `mem_attr` specifies the memory
+/// attributes (VTL0's allowed access) to be applied to the range
 #[inline]
 pub(crate) fn protect_physical_memory_range(
     phys_frame_range: PhysFrameRange<Size4KiB>,
     mem_attr: MemAttr,
 ) -> Result<(), VsmError> {
+    let vtl1_range = crate::platform_low().vtl1_phys_frame_range();
+    if phys_frame_range.start < vtl1_range.end && vtl1_range.start < phys_frame_range.end {
+        return Err(VsmError::Vtl1MemoryOverlap);
+    }
     let pa = phys_frame_range.start.start_address().as_u64();
     let num_pages = phys_frame_range.count() as u64;
     if num_pages > 0 {
         hv_modify_vtl_protection_mask(pa, num_pages, mem_attr_to_hv_page_prot_flags(mem_attr))
             .map_err(VsmError::HypercallFailed)?;
+    }
+    Ok(())
+}
+
+/// This function is a variant of [`protect_physical_memory_range`] to protect a VTL1 physical memory range.
+/// Unlike [`protect_physical_memory_range`], this is intended exclusively for securing VTL1's own pages.
+/// VTL0 should never access VTL1 memory, so the memory attribute is always empty (no read, write, or execute).
+///
+/// Note. This function doesn't check whether `phys_frame_range` belongs to VTL1 because it is called by BSP
+/// before the kernel platform data structure is initialized. To this end, one might call this function with
+/// a VTL0 physical memory range which only restricts access to the range.
+#[inline]
+pub(crate) fn protect_vtl1_physical_memory_range(
+    phys_frame_range: PhysFrameRange<Size4KiB>,
+) -> Result<(), VsmError> {
+    let pa = phys_frame_range.start.start_address().as_u64();
+    let num_pages = phys_frame_range.count() as u64;
+    if num_pages > 0 {
+        hv_modify_vtl_protection_mask(
+            pa,
+            num_pages,
+            mem_attr_to_hv_page_prot_flags(MemAttr::empty()),
+        )
+        .map_err(VsmError::HypercallFailed)?;
     }
     Ok(())
 }

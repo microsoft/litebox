@@ -627,6 +627,11 @@ impl<Host: HostInterface> LinuxKernel<Host> {
         CPU_MHZ.store(cpu_mhz, core::sync::atomic::Ordering::Relaxed);
     }
 
+    /// Returns the physical frame range belonging to VTL1.
+    pub fn vtl1_phys_frame_range(&self) -> PhysFrameRange<Size4KiB> {
+        self.vtl1_phys_frame_range
+    }
+
     /// This function maps VTL0 physical page frames containing the physical addresses
     /// from `phys_start` to `phys_end` to the VTL1 kernel page table. It internally page aligns
     /// the input addresses to ensure the mapped memory area covers the entire input addresses
