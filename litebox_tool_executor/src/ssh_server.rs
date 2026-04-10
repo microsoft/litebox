@@ -262,14 +262,18 @@ impl russh::server::Handler for SshSession {
     ) -> Result<(), Self::Error> {
         let cmd_str = String::from_utf8_lossy(data);
         eprintln!("[ssh] exec request: {cmd_str}");
-        // Run the requested command inside the litebox sandbox.
+
         // VS Code sends "sh" and pipes its bootstrap script via stdin.
-        self.spawn_litebox(
-            channel_id,
-            session.handle(),
-            &["/usr/bin/bash", "-c", &cmd_str],
-        )
-        .await?;
+        // Map "sh" to our actual shell path since sh may not be in PATH.
+        let cmd_trimmed = cmd_str.trim();
+        let guest_command: Vec<&str> = if cmd_trimmed == "sh" || cmd_trimmed == "/bin/sh" {
+            vec!["/usr/bin/bash"]
+        } else {
+            vec!["/usr/bin/bash", "-c", cmd_trimmed]
+        };
+
+        self.spawn_litebox(channel_id, session.handle(), &guest_command)
+            .await?;
         session.channel_success(channel_id)?;
         Ok(())
     }
