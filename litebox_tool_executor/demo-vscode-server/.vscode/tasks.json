@@ -9,7 +9,8 @@
                 "-d", "Ubuntu", "--",
                 "/mnt/c/src/litebox-vscode-server/target/debug/litebox_tool_executor",
                 "--rootfs", "/home/wportnoy/vscode-rootfs",
-                "--vscode-server"
+                "--vscode-server",
+                "--record-baseline"
             ],
             "problemMatcher": [],
             "isBackground": true,
