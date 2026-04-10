@@ -30,6 +30,11 @@
     //   4. All operations execute inside the sandbox
     //   5. Logs: /tmp/litebox-vscode-server-logs/*.{jsonl,broker.log,server.log}
 
+    // Tell VS Code the remote platform so it doesn't ask every time
+    "remote.SSH.remotePlatform": {
+        "litebox": "linux"
+    },
+
     // Terminal profiles (for shell-only sandboxing as fallback)
     "terminal.integrated.profiles.windows": {
         "LiteBox Sandbox (WSL2)": {
