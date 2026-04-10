@@ -290,6 +290,28 @@ impl russh::server::Handler for SshSession {
         Ok(())
     }
 
+    async fn subsystem_request(
+        &mut self,
+        channel_id: ChannelId,
+        name: &str,
+        session: &mut Session,
+    ) -> Result<(), Self::Error> {
+        eprintln!("[ssh] subsystem request: {name}");
+        if name == "sftp" {
+            self.spawn_litebox(
+                channel_id,
+                session.handle(),
+                &["/usr/lib/openssh/sftp-server"],
+            )
+            .await?;
+            session.channel_success(channel_id)?;
+        } else {
+            eprintln!("[ssh] unknown subsystem: {name}");
+            session.channel_failure(channel_id)?;
+        }
+        Ok(())
+    }
+
     async fn auth_publickey(
         &mut self,
         _user: &str,
