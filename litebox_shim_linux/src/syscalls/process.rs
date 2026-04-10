@@ -637,6 +637,10 @@ impl<FS: ShimFS> Task<FS> {
                     .load(Ordering::Relaxed)
                     .into())
             }
+            PrctlArg::SetDumpable(_) => {
+                // No-op in the sandbox — dumpability is irrelevant.
+                Ok(0)
+            }
             _ => unimplemented!(),
         }
     }

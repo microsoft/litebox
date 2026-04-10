@@ -1934,6 +1934,7 @@ pub enum PrctlArg<Platform: litebox::platform::RawPointerProvider> {
     CapBSetRead(usize),
     SetTHPDisable(usize),
     GetTHPDisable(usize),
+    SetDumpable(usize),
 }
 
 #[repr(i32)]
@@ -3305,6 +3306,9 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
                         },
                         PrctlOption::GetTHPDisable => SyscallRequest::Prctl {
                             args: PrctlArg::GetTHPDisable(ctx.sys_req_arg(1)),
+                        },
+                        PrctlOption::SetDumpable => SyscallRequest::Prctl {
+                            args: PrctlArg::SetDumpable(ctx.sys_req_arg(1)),
                         },
                         _ => {
                             return Err(unsupported_einval(format_args!("prctl({op:?})")));
