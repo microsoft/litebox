@@ -6,6 +6,7 @@ edition = "2024"
 [dependencies]
 anyhow = "1.0.97"
 clap = { version = "4.5.33", features = ["derive"] }
+libc = "0.2"
 
 [lints]
 workspace = true

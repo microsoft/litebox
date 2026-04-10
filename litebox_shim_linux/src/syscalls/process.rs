@@ -641,6 +641,27 @@ impl<FS: ShimFS> Task<FS> {
                 // No-op in the sandbox — dumpability is irrelevant.
                 Ok(0)
             }
+            PrctlArg::SetNoNewPrivs(_) => {
+                // No-op — the sandbox already controls privilege.
+                Ok(0)
+            }
+            PrctlArg::GetNoNewPrivs => {
+                // Report that no_new_privs is set (it effectively is in the sandbox).
+                Ok(1)
+            }
+            PrctlArg::SetSeccomp(_) => {
+                // No-op — sshd installs a seccomp filter for privilege separation.
+                // The sandbox has its own syscall interception; ignore sshd's.
+                Ok(0)
+            }
+            PrctlArg::GetSecureBits => {
+                // Return 0 (no secure bits set).
+                Ok(0)
+            }
+            PrctlArg::CapAmbient(_) => {
+                // No-op — capabilities are not supported in the sandbox.
+                Ok(0)
+            }
             _ => unimplemented!(),
         }
     }

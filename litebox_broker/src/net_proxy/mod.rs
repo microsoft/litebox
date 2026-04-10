@@ -19,7 +19,6 @@ mod device;
 pub mod dns_tracker;
 
 use std::collections::HashMap;
-use std::io::{Read, Write};
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpListener, UdpSocket};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -125,14 +124,6 @@ struct InboundForward {
     listener: std::net::TcpListener,
     guest_ip: Ipv4Addr,
     guest_port: u16,
-}
-
-/// An active inbound TCP bridge: relays data between a host TCP socket and a
-/// smoltcp TCP socket connected to the guest.
-struct InboundBridge {
-    smoltcp_handle: SocketHandle,
-    host_stream: std::net::TcpStream,
-    host_eof: bool,
 }
 
 /// Parse a port-forward spec: "HOST_PORT:GUEST_IP:GUEST_PORT"
@@ -732,7 +723,6 @@ fn run_inner(
 
     // Inbound TCP port forwards: host listeners that relay to guest ports.
     let mut inbound_listeners: Vec<InboundForward> = Vec::new();
-    let mut inbound_bridges: Vec<InboundBridge> = Vec::new();
     let mut next_inbound_src_port: u16 = 49152; // ephemeral port range
 
     for (host_port, guest_ip, guest_port) in &inbound_forwards {
@@ -1248,9 +1238,12 @@ fn run_inner(
                         );
 
                         // Create a smoltcp TCP socket that connects to the guest.
-                        let tcp_rx = smoltcp::socket::tcp::SocketBuffer::new(vec![0; 65536]);
-                        let tcp_tx = smoltcp::socket::tcp::SocketBuffer::new(vec![0; 65536]);
-                        let tcp_socket = smoltcp::socket::tcp::Socket::new(tcp_rx, tcp_tx);
+                        let tcp_rx = smoltcp::socket::tcp::SocketBuffer::new(vec![0; SOCKET_BUFFER_SIZE]);
+                        let tcp_tx = smoltcp::socket::tcp::SocketBuffer::new(vec![0; SOCKET_BUFFER_SIZE]);
+                        let mut tcp_socket = smoltcp::socket::tcp::Socket::new(tcp_rx, tcp_tx);
+                        // Disable Nagle — the broker is a relay. Nagle + delayed ACK
+                        // causes multi-second stalls on the SSH key exchange.
+                        tcp_socket.set_nagle_enabled(false);
                         let handle = sockets.add(tcp_socket);
 
                         let src_port = next_inbound_src_port;
@@ -1277,9 +1270,13 @@ fn run_inner(
                             continue;
                         }
 
-                        inbound_bridges.push(InboundBridge {
+                        let dest = SocketAddr::V4(SocketAddrV4::new(
+                            fwd.guest_ip, fwd.guest_port,
+                        ));
+                        tcp_bridges.push(TcpBridge {
                             smoltcp_handle: handle,
                             host_stream: stream,
+                            dest,
                             host_eof: false,
                         });
                     }
@@ -1291,52 +1288,6 @@ fn run_inner(
                 }
             }
         }
-
-        // Step 8d: Relay data for inbound TCP bridges.
-        inbound_bridges.retain_mut(|bridge| {
-            let sock = sockets.get_mut::<smoltcp::socket::tcp::Socket>(bridge.smoltcp_handle);
-
-            // Host → guest: read from host socket, send to smoltcp.
-            if !bridge.host_eof && sock.can_send() {
-                let mut buf = [0u8; 4096];
-                match bridge.host_stream.read(&mut buf) {
-                    Ok(0) => {
-                        bridge.host_eof = true;
-                        sock.close();
-                    }
-                    Ok(n) => {
-                        let _ = sock.send_slice(&buf[..n]);
-                    }
-                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
-                    Err(_) => {
-                        bridge.host_eof = true;
-                        sock.close();
-                    }
-                }
-            }
-
-            // Guest → host: read from smoltcp, write to host socket.
-            if sock.can_recv() {
-                let mut buf = [0u8; 4096];
-                match sock.recv_slice(&mut buf) {
-                    Ok(n) if n > 0 => {
-                        if bridge.host_stream.write_all(&buf[..n]).is_err() {
-                            sock.close();
-                            return false;
-                        }
-                    }
-                    _ => {}
-                }
-            }
-
-            // Clean up closed connections.
-            if sock.state() == smoltcp::socket::tcp::State::Closed {
-                sockets.remove(bridge.smoltcp_handle);
-                return false;
-            }
-
-            true
-        });
 
         // Step 9: Compute delay and wait for readability on IPC + host sockets.
         //
@@ -1367,14 +1318,6 @@ fn run_inner(
         for fwd in &inbound_listeners {
             pfds.push(PollFd {
                 fd: raw_socket(&fwd.listener),
-                events: POLLIN,
-                revents: 0,
-            });
-        }
-        // Include inbound bridge host streams in the poll set.
-        for bridge in &inbound_bridges {
-            pfds.push(PollFd {
-                fd: raw_socket(&bridge.host_stream),
                 events: POLLIN,
                 revents: 0,
             });

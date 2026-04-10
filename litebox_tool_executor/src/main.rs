@@ -65,6 +65,11 @@ struct Cli {
     #[arg(long)]
     record_baseline: bool,
 
+    /// Forward a host TCP port to a guest port (HOST:GUEST_IP:GUEST_PORT).
+    /// Can be specified multiple times. E.g. --forward-port 2223:10.0.0.2:22
+    #[arg(long = "forward-port")]
+    forward_port: Vec<String>,
+
     /// The command and arguments to run. Omit for interactive mode.
     #[arg(trailing_var_arg = true)]
     command: Vec<String>,
@@ -501,6 +506,21 @@ fn runner_command(
     }
 
     cmd.arg("--");
+
+    // Reset signal handlers to SIG_DFL in the child process. The tool
+    // executor (or its parent) may have installed handlers (e.g., Ctrl-C)
+    // that the runner asserts must be at their defaults on startup.
+    #[cfg(unix)]
+    unsafe {
+        use std::os::unix::process::CommandExt as _;
+        cmd.pre_exec(|| {
+            for sig in [libc::SIGINT, libc::SIGTERM, libc::SIGQUIT, libc::SIGHUP, libc::SIGPIPE] {
+                libc::signal(sig, libc::SIG_DFL);
+            }
+            Ok(())
+        });
+    }
+
     Ok(cmd)
 }
 
@@ -569,7 +589,25 @@ fn interactive(cli: &Cli, audit_log_file: Option<&std::path::Path>) -> anyhow::R
 
 /// Direct mode: run a single command.
 fn direct(cli: &Cli, audit_log_file: Option<&std::path::Path>) -> anyhow::Result<()> {
-    let (broker, _temp_policy) = spawn_broker(cli, audit_log_file, &[])?;
+    // Parse --forward-port specs for direct mode.
+    let forward_ports: Vec<(u16, &str, u16)> = cli
+        .forward_port
+        .iter()
+        .filter_map(|spec| {
+            let parts: Vec<&str> = spec.split(':').collect();
+            if parts.len() == 3 {
+                Some((
+                    parts[0].parse::<u16>().ok()?,
+                    parts[1],
+                    parts[2].parse::<u16>().ok()?,
+                ))
+            } else {
+                eprintln!("invalid --forward-port spec: {spec} (expected HOST:GUEST_IP:GUEST_PORT)");
+                None
+            }
+        })
+        .collect();
+    let (broker, _temp_policy) = spawn_broker(cli, audit_log_file, &forward_ports)?;
 
     let mut cmd = runner_command(cli, audit_log_file, Some(&broker))?;
     cmd.args(&cli.command);

@@ -1935,6 +1935,11 @@ pub enum PrctlArg<Platform: litebox::platform::RawPointerProvider> {
     SetTHPDisable(usize),
     GetTHPDisable(usize),
     SetDumpable(usize),
+    SetNoNewPrivs(usize),
+    GetNoNewPrivs,
+    SetSeccomp(usize),
+    GetSecureBits,
+    CapAmbient(usize),
 }
 
 #[repr(i32)]
@@ -2503,6 +2508,8 @@ pub enum SyscallRequest<Platform: litebox::platform::RawPointerProvider> {
     },
     /// No-op: set file timestamps (in-memory FS ignores timestamps).
     Utimensat,
+    /// No-op: seccomp filter installation (sandbox handles this externally).
+    Seccomp,
     Fchmodat {
         dirfd: i32,
         pathname: Platform::RawConstPointer<i8>,
@@ -3310,6 +3317,21 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
                         PrctlOption::SetDumpable => SyscallRequest::Prctl {
                             args: PrctlArg::SetDumpable(ctx.sys_req_arg(1)),
                         },
+                        PrctlOption::SetNoNewPrivs => SyscallRequest::Prctl {
+                            args: PrctlArg::SetNoNewPrivs(ctx.sys_req_arg(1)),
+                        },
+                        PrctlOption::GetNoNewPrivs => SyscallRequest::Prctl {
+                            args: PrctlArg::GetNoNewPrivs,
+                        },
+                        PrctlOption::SetSeccomp => SyscallRequest::Prctl {
+                            args: PrctlArg::SetSeccomp(ctx.sys_req_arg(1)),
+                        },
+                        PrctlOption::GetSecureBits => SyscallRequest::Prctl {
+                            args: PrctlArg::GetSecureBits,
+                        },
+                        PrctlOption::CapAmbient => SyscallRequest::Prctl {
+                            args: PrctlArg::CapAmbient(ctx.sys_req_arg(1)),
+                        },
                         _ => {
                             return Err(unsupported_einval(format_args!("prctl({op:?})")));
                         }
@@ -3593,6 +3615,13 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
             }),
             Sysno::io_uring_setup => {
                 return Err(errno::Errno::ENOSYS);
+            }
+            // seccomp filter installation: no-op in the sandbox.
+            // sshd calls seccomp(SECCOMP_SET_MODE_FILTER) during privilege
+            // separation. Returning 0 lets sshd continue believing the
+            // filter is installed.
+            Sysno::seccomp => {
+                return Ok(SyscallRequest::Seccomp);
             }
             // Single-process sandbox: file locking is a no-op.
             Sysno::flock => {

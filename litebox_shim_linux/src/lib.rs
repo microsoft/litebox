@@ -2867,8 +2867,10 @@ impl<FS: ShimFS> Task<FS> {
             }
             SyscallRequest::Fsync { fd: _ }
             | SyscallRequest::Fdatasync { fd: _ }
-            | SyscallRequest::Utimensat => {
-                // No-op for in-memory FS; data is always "persisted" and timestamps are ignored.
+            | SyscallRequest::Utimensat
+            | SyscallRequest::Seccomp => {
+                // No-op: in-memory FS doesn't need fsync/timestamps, and
+                // seccomp filter installation is handled by the sandbox.
                 Ok(0)
             }
             SyscallRequest::Fadvise64 { fd, .. } => {
