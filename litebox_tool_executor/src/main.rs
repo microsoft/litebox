@@ -295,6 +295,7 @@ impl BrokerProcess {
         policy: Option<&std::path::Path>,
         log_file: Option<&std::path::Path>,
         audit_log: Option<&std::path::Path>,
+        forward_ports: &[(u16, &str, u16)],
     ) -> anyhow::Result<Self> {
         let broker = find_broker()?;
 
@@ -326,6 +327,12 @@ impl BrokerProcess {
         // Share the audit log file with the broker for unified event tracing.
         if let Some(p) = audit_log {
             cmd.arg("--audit-log").arg(p);
+        }
+
+        // Inbound TCP port forwards (e.g., host:2222 → guest sshd:22).
+        for (host_port, guest_ip, guest_port) in forward_ports {
+            cmd.arg("--forward-port")
+                .arg(format!("{host_port}:{guest_ip}:{guest_port}"));
         }
 
         let child = cmd
@@ -417,6 +424,7 @@ impl Drop for TempFile {
 fn spawn_broker(
     cli: &Cli,
     audit_log_file: Option<&std::path::Path>,
+    forward_ports: &[(u16, &str, u16)],
 ) -> anyhow::Result<(BrokerProcess, Option<TempFile>)> {
     let (policy_path, temp_policy) = if cli.record_baseline {
         // AllowAll: no policy file → broker allows everything
@@ -435,6 +443,7 @@ fn spawn_broker(
         policy_path.as_deref(),
         broker_log.as_deref(),
         audit_log_file,
+        forward_ports,
     )?;
     Ok((broker, temp_policy))
 }
@@ -503,7 +512,7 @@ fn runner_command(
 /// This prevents bash from enabling job control (which breaks pipelines in
 /// the sandbox because setpgid fails for the session-leader init process).
 fn interactive(cli: &Cli, audit_log_file: Option<&std::path::Path>) -> anyhow::Result<()> {
-    let (broker, _temp_policy) = spawn_broker(cli, audit_log_file)?;
+    let (broker, _temp_policy) = spawn_broker(cli, audit_log_file, &[])?;
 
     let mut cmd = runner_command(cli, audit_log_file, Some(&broker))?;
 
@@ -560,7 +569,7 @@ fn interactive(cli: &Cli, audit_log_file: Option<&std::path::Path>) -> anyhow::R
 
 /// Direct mode: run a single command.
 fn direct(cli: &Cli, audit_log_file: Option<&std::path::Path>) -> anyhow::Result<()> {
-    let (broker, _temp_policy) = spawn_broker(cli, audit_log_file)?;
+    let (broker, _temp_policy) = spawn_broker(cli, audit_log_file, &[])?;
 
     let mut cmd = runner_command(cli, audit_log_file, Some(&broker))?;
     cmd.args(&cli.command);
@@ -584,17 +593,16 @@ fn direct(cli: &Cli, audit_log_file: Option<&std::path::Path>) -> anyhow::Result
     Ok(())
 }
 
-/// VS Code Server mode: start an embedded SSH server that bridges VS Code
-/// Remote-SSH connections to a litebox-sandboxed VS Code Server.
+/// VS Code Server mode: start OpenSSH sshd inside the sandbox.
 ///
-/// Starts a broker, then an SSH server on `localhost:<random-port>`. When
-/// VS Code connects via Remote-SSH, the SSH session spawns a litebox runner
-/// running VS Code Server. No shims, no global settings, no profiles needed.
+/// Starts a broker with inbound TCP port forwarding (host:2222 → guest:22),
+/// then runs ONE litebox runner with sshd as the init process. When VS Code
+/// connects via Remote-SSH, sshd fork+execs bash, sftp-server, and VS Code
+/// Server — all sharing one filesystem inside the sandbox.
 ///
 /// Usage:
 ///   litebox-tool-executor --rootfs /path/to/vscode-rootfs --vscode-server
-///   # prints: SSH listening on 127.0.0.1:<port>
-///   # then in VS Code: Remote-SSH → localhost:<port>
+///   # then in VS Code: Remote-SSH → litebox (port 2222)
 fn vscode_server(cli: &Cli, audit_log_file: Option<&std::path::Path>) -> anyhow::Result<()> {
     if !cli.rootfs.is_dir() {
         anyhow::bail!(
@@ -613,88 +621,77 @@ fn vscode_server(cli: &Cli, audit_log_file: Option<&std::path::Path>) -> anyhow:
         &auto_audit
     };
 
-    let (broker, _temp_policy) = spawn_broker(cli, Some(audit))?;
-    let socket_path = broker.socket_path().to_str().unwrap_or("").to_string();
-    let runner = find_runner()?;
-    let runner_path = runner.to_str().unwrap_or("").to_string();
+    // The guest IP in the broker's virtual network.
+    let guest_ip = "10.0.0.2";
+    let ssh_port = cli.ssh_port;
 
-    // Build environment
-    let has = |prefix: &str| cli.env.iter().any(|e| e.starts_with(prefix));
-    let mut env_vars: Vec<String> = cli.env.clone();
-    if !has("LD_LIBRARY_PATH=") {
-        env_vars.push("LD_LIBRARY_PATH=/lib64:/lib/x86_64-linux-gnu:/lib".into());
-    }
-    if !has("HOME=") {
-        env_vars.push("HOME=/root".into());
-    }
-    if !has("PATH=") {
-        env_vars.push("PATH=/usr/local/bin:/usr/bin:/bin".into());
-    }
-    if !has("TERM=") {
-        env_vars.push("TERM=dumb".into());
-    }
+    // Start the broker with inbound TCP forwarding: host:ssh_port → guest:22
+    let forward_ports = [(ssh_port, guest_ip, 22u16)];
+    let (broker, _temp_policy) = spawn_broker(cli, Some(audit), &forward_ports)?;
 
-    let ssh_config = litebox_tool_executor::ssh_server::LiteboxConfig {
-        runner_path,
-        broker_socket: socket_path,
-        rootfs: cli.rootfs.to_str().unwrap_or("").to_string(),
-        audit_log: Some(audit.to_str().unwrap_or("").to_string()),
-        extra_env: env_vars,
-        extra_args: cli.command.clone(),
+    // Build the runner command: sshd -D -e (foreground, stderr logging)
+    let mut cmd = runner_command(cli, Some(audit), Some(&broker))?;
+    cmd.args(["/usr/sbin/sshd", "-D", "-e"]);
+
+    cmd.stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::inherit())
+        .stderr(std::process::Stdio::inherit());
+
+    // Detect WSL2 IP for connection instructions.
+    let wsl_ip = std::process::Command::new("hostname")
+        .arg("-I")
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().split_whitespace().next().unwrap_or("").to_string())
+        .unwrap_or_default();
+
+    let host_ip = if !wsl_ip.is_empty() && wsl_ip != "127.0.0.1" {
+        &wsl_ip
+    } else {
+        "0.0.0.0"
     };
 
-    let ssh_port = cli.ssh_port;
-    let rt = tokio::runtime::Runtime::new()?;
-    rt.block_on(async {
-        let (port, server_handle) =
-            litebox_tool_executor::ssh_server::start_ssh_server(ssh_config, ssh_port).await?;
+    eprintln!();
+    eprintln!("==============================================");
+    eprintln!("  LiteBox VS Code Server (sshd in sandbox)");
+    if cli.record_baseline {
+        eprintln!("  *** RECORDING BASELINE (AllowAll policy) ***");
+    }
+    eprintln!("  sshd inside sandbox on port 22");
+    eprintln!("  Forwarding host:{ssh_port} → sandbox:22");
+    eprintln!();
+    eprintln!("  Add to ~/.ssh/config:");
+    eprintln!("    Host litebox");
+    eprintln!("        HostName {host_ip}");
+    eprintln!("        Port {ssh_port}");
+    eprintln!("        StrictHostKeyChecking no");
+    eprintln!("        UserKnownHostsFile /dev/null");
+    eprintln!();
+    eprintln!("  Then in VS Code:");
+    eprintln!("    Remote-SSH → Connect to Host → litebox");
+    eprintln!();
+    eprintln!("  Logs:");
+    eprintln!("    Syscalls: {}", audit.display());
+    eprintln!(
+        "    Broker:   {}",
+        audit.with_extension("broker.log").display()
+    );
+    eprintln!("==============================================");
+    eprintln!();
 
-        // Detect WSL2 IP for connection instructions
-        let wsl_ip = std::process::Command::new("hostname")
-            .arg("-I")
-            .output()
-            .ok()
-            .and_then(|o| String::from_utf8(o.stdout).ok())
-            .map(|s| s.trim().split_whitespace().next().unwrap_or("").to_string())
-            .unwrap_or_default();
-
-        let host_ip = if !wsl_ip.is_empty() && wsl_ip != "127.0.0.1" {
-            &wsl_ip
-        } else {
-            "127.0.0.1"
-        };
-
-        eprintln!();
-        eprintln!("==============================================");
-        eprintln!("  LiteBox VS Code Server (embedded SSH)");
-        if cli.record_baseline {
-            eprintln!("  *** RECORDING BASELINE (AllowAll policy) ***");
-        }
-        eprintln!("  SSH listening on 0.0.0.0:{port}");
-        eprintln!();
-        eprintln!("  Add to ~/.ssh/config:");
-        eprintln!("    Host litebox");
-        eprintln!("        HostName {host_ip}");
-        eprintln!("        Port {port}");
-        eprintln!("        StrictHostKeyChecking no");
-        eprintln!("        UserKnownHostsFile /dev/null");
-        eprintln!();
-        eprintln!("  Then in VS Code:");
-        eprintln!("    Remote-SSH → Connect to Host → litebox");
-        eprintln!();
-        eprintln!("  Logs:");
-        eprintln!("    Syscalls: {}", audit.display());
-        eprintln!(
-            "    Broker:   {}",
-            audit.with_extension("broker.log").display()
-        );
-        eprintln!("==============================================");
-        eprintln!();
-
-        server_handle.await.ok();
-        Ok::<_, anyhow::Error>(())
+    let status = cmd.status().map_err(|e| {
+        anyhow::anyhow!("Failed to spawn litebox_runner_linux_userland: {e}")
     })?;
 
     drop(broker);
+
+    if !status.success() {
+        eprintln!(
+            "sshd exited with code {}",
+            status.code().unwrap_or(-1)
+        );
+        std::process::exit(status.code().unwrap_or(1));
+    }
     Ok(())
 }

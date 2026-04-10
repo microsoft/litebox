@@ -5,11 +5,7 @@ edition = "2024"
 
 [dependencies]
 anyhow = "1.0.97"
-bytes = "1"
 clap = { version = "4.5.33", features = ["derive"] }
-libc = "0.2"
-russh = { version = "0.60", default-features = false, features = ["ring"] }
-tokio = { version = "1", features = ["full"] }
 
 [lints]
 workspace = true
