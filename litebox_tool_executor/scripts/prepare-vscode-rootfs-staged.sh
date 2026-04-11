@@ -329,6 +329,16 @@ cat > "$OUTPUT/etc/shells" << 'EOF'
 /usr/bin/bash
 EOF
 
+# OS release info (VS Code bootstrap reads this to detect platform)
+cat > "$OUTPUT/etc/os-release" << 'EOF'
+PRETTY_NAME="Ubuntu 24.04 LTS (LiteBox)"
+NAME="Ubuntu"
+VERSION_ID="24.04"
+VERSION="24.04 LTS"
+ID=ubuntu
+ID_LIKE=debian
+EOF
+
 # Compatibility symlinks
 for util in "${UTILS[@]}"; do
     real_path=$(readlink -f "$(which "$util" 2>/dev/null)" 2>/dev/null || true)
