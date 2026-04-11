@@ -370,7 +370,242 @@ if [ ! -f "$OUTPUT/lib64/ld-linux-x86-64.so.2" ]; then
 fi
 
 # ============================================================
-echo "=== Summary ==="
+echo "=== Phase 8: Pre-install VS Code CLI ==="
+# Download the VS Code CLI so the bootstrap script finds it already
+# installed and skips the download/install steps (which use $(cmd | pipe)
+# that deadlocks in litebox's delayed-fork).
+#
+# Detect the local VS Code commit ID. If VS Code isn't installed or
+# the commit can't be determined, skip this phase — the user can
+# re-run after installing VS Code.
+VSCODE_COMMIT=""
+if command -v code >/dev/null 2>&1; then
+    VSCODE_COMMIT=$(code --version 2>/dev/null | sed -n '2p')
+fi
+# Also check Windows VS Code via PowerShell (for WSL builds)
+if [ -z "$VSCODE_COMMIT" ]; then
+    VSCODE_COMMIT=$(powershell.exe -NoProfile -Command "(code --version 2>\$null | Select-Object -Index 1)" 2>/dev/null | tr -d '\r\n')
+fi
+
+if [ -n "$VSCODE_COMMIT" ] && echo "$VSCODE_COMMIT" | grep -qE '^[a-f0-9]{40}$'; then
+    echo "  VS Code commit: $VSCODE_COMMIT"
+    CLI_NAME="code-${VSCODE_COMMIT}"
+    CLI_DIR="$OUTPUT/root/.vscode-server"
+    CLI_PATH="$CLI_DIR/$CLI_NAME"
+
+    if [ -f "$CLI_PATH" ]; then
+        echo "  CLI already installed at $CLI_PATH"
+    else
+        CLI_URL="https://update.code.visualstudio.com/commit:${VSCODE_COMMIT}/cli-alpine-x64/stable"
+        echo "  Downloading VS Code CLI from $CLI_URL ..."
+        mkdir -p "$CLI_DIR"
+        TARBALL="$CLI_DIR/vscode-cli.tar.gz"
+        if wget -q -O "$TARBALL" "$CLI_URL" 2>/dev/null || curl -sL -o "$TARBALL" "$CLI_URL" 2>/dev/null; then
+            (cd "$CLI_DIR" && tar -xf "$TARBALL" && mv code "$CLI_NAME" && rm -f "$TARBALL")
+            if [ -f "$CLI_PATH" ]; then
+                chmod +x "$CLI_PATH"
+                echo "  Installed VS Code CLI ($( du -h "$CLI_PATH" | cut -f1 ))"
+            else
+                echo "  WARNING: CLI extraction failed"
+            fi
+        else
+            echo "  WARNING: CLI download failed (will use client download fallback)"
+        fi
+    fi
+else
+    echo "  VS Code not detected, skipping CLI pre-install"
+    echo "  (re-run after installing VS Code to pre-install the CLI)"
+fi
+
+# ============================================================
+echo "=== Phase 9: Install VS Code bootstrap sh wrapper ==="
+# VS Code sends 'ssh litebox sh' and pipes a bootstrap script.
+# The bootstrap script uses $(cmd | pipe) which deadlocks in litebox.
+# This wrapper intercepts the VS Code bootstrap protocol and handles
+# it without pipes-in-subshells, falling back to bash for normal use.
+#
+# Keep the real bash as /usr/bin/bash (already installed).
+cat > "$OUTPUT/usr/bin/sh" << 'SHWRAPPER'
+#!/usr/bin/bash
+# VS Code bootstrap interceptor.
+# Detects VS Code's bootstrap script on stdin and handles the protocol
+# without $(cmd | pipe). Falls back to bash for normal shell usage.
+
+# If we have arguments (not the VS Code 'sh' pattern), run bash directly.
+if [ $# -gt 0 ] && [ "$1" != "" ]; then
+    exec /usr/bin/bash "$@"
+fi
+
+# Read the bootstrap script from stdin into a temp file.
+SCRIPT=$(cat)
+
+# Check if this is a VS Code bootstrap (contains UUID marker pattern).
+UUID=$(echo "$SCRIPT" | grep -m1 '^UUID=' | head -1)
+UUID=${UUID#UUID=\"}
+UUID=${UUID%\"}
+
+if [ -z "$UUID" ]; then
+    # Not a VS Code bootstrap — run as normal shell.
+    echo "$SCRIPT" | exec /usr/bin/bash
+fi
+
+# Extract variables from the bootstrap script.
+extract_var() {
+    echo "$SCRIPT" | grep -m1 "^$1=" | sed "s/^$1=\"\\{0,1\\}//;s/\"$//"
+}
+COMMIT_ID=$(extract_var COMMIT_ID)
+TOKEN=$(extract_var TOKEN)
+QUALITY=$(extract_var QUALITY)
+VSCODE_AGENT_FOLDER=$(extract_var VSCODE_AGENT_FOLDER)
+LISTEN_ARGS=$(extract_var LISTEN_ARGS)
+
+# Expand $HOME in VSCODE_AGENT_FOLDER (the bootstrap script uses it literally).
+VSCODE_AGENT_FOLDER=$(echo "$VSCODE_AGENT_FOLDER" | sed "s|\\\$HOME|$HOME|g;s|\${HOME}|$HOME|g")
+: "${VSCODE_AGENT_FOLDER:=$HOME/.vscode-server}"
+
+CLI_NAME="code-${COMMIT_ID}"
+CLI_PATH="${VSCODE_AGENT_FOLDER}/${CLI_NAME}"
+
+# Emit the running marker.
+echo "${UUID}: running"
+echo "Script executing under PID: $$"
+
+# Detect platform/arch (inline, no pipes in subshells).
+PLATFORM=linux
+ARCH=$(uname -m)
+VSCODE_ARCH=x64
+BITNESS=$(getconf LONG_BIT 2>/dev/null)
+OSRELEASEID=""
+if [ -f /etc/os-release ]; then
+    while IFS='=' read -r key val; do
+        if [ "$key" = "ID" ]; then
+            OSRELEASEID=$(echo "$val" | tr -d '"')
+            break
+        fi
+    done < /etc/os-release
+fi
+
+# Check if CLI exists.
+if [ ! -f "$CLI_PATH" ]; then
+    echo "Installing to ${VSCODE_AGENT_FOLDER}..."
+    mkdir -p "$VSCODE_AGENT_FOLDER"
+
+    # Try wget/curl download first.
+    DOWNLOAD_URL="https://update.code.visualstudio.com/commit:${COMMIT_ID}/cli-alpine-x64/${QUALITY}"
+    cd "$VSCODE_AGENT_FOLDER"
+
+    DOWNLOADED=0
+    if command -v wget >/dev/null 2>&1; then
+        if wget --tries=1 --connect-timeout=7 -nv -O "vscode-cli-${COMMIT_ID}.tar.gz" "$DOWNLOAD_URL" 2>/dev/null; then
+            DOWNLOADED=1
+        fi
+    fi
+    if [ "$DOWNLOADED" = "0" ] && command -v curl >/dev/null 2>&1; then
+        if curl --connect-timeout 7 -sL -o "vscode-cli-${COMMIT_ID}.tar.gz" "$DOWNLOAD_URL" 2>/dev/null; then
+            DOWNLOADED=1
+        fi
+    fi
+
+    if [ "$DOWNLOADED" = "1" ]; then
+        tar -xf "vscode-cli-${COMMIT_ID}.tar.gz" 2>/dev/null
+        mv code "$CLI_NAME" 2>/dev/null
+        rm -f "vscode-cli-${COMMIT_ID}.tar.gz"
+    fi
+
+    if [ ! -f "$CLI_PATH" ]; then
+        # Trigger client-side download (VS Code SCPs the CLI).
+        echo "${UUID}%%1%%"
+        echo "Trigger local server download"
+        echo "${UUID}:trigger_server_download"
+        echo "artifact==cli-alpine-x64=="
+        echo "destFolder==${VSCODE_AGENT_FOLDER}=="
+        echo "destFolder2==/vscode-cli-${COMMIT_ID}.tar.gz=="
+        echo "${UUID}:trigger_server_download_end"
+        echo "Waiting for client to transfer server archive..."
+
+        while [ ! -f "${VSCODE_AGENT_FOLDER}/vscode-cli-${COMMIT_ID}.tar.gz.done" ]; do
+            printf ' '
+            sleep 3
+        done
+        rm -f "${VSCODE_AGENT_FOLDER}/vscode-cli-${COMMIT_ID}.tar.gz.done"
+        tar -xf "vscode-cli-${COMMIT_ID}.tar.gz" 2>/dev/null
+        mv code "$CLI_NAME" 2>/dev/null
+        rm -f "vscode-cli-${COMMIT_ID}.tar.gz"
+    fi
+
+    cd /
+fi
+
+if [ ! -f "$CLI_PATH" ]; then
+    echo "${UUID}: start"
+    echo "exitCode==205=="
+    echo "${UUID}: end"
+    exit 0
+fi
+
+echo "Found existing installation at ${VSCODE_AGENT_FOLDER}..."
+
+# Start the VS Code CLI server.
+echo "Starting VS Code CLI..."
+export VSCODE_AGENT_FOLDER
+CLI_LOG_FILE="${VSCODE_AGENT_FOLDER}/.cli.${COMMIT_ID}.log"
+rm -f "$CLI_LOG_FILE"
+touch "$CLI_LOG_FILE"
+chmod 600 "$CLI_LOG_FILE"
+
+VSCODE_CLI_REQUIRE_TOKEN=${TOKEN} "$CLI_PATH" command-shell \
+    --cli-data-dir "$VSCODE_AGENT_FOLDER/cli" \
+    --parent-process-id $$ \
+    ${LISTEN_ARGS} > "$CLI_LOG_FILE" 2>&1 < /dev/null &
+CLI_PID=$!
+echo "Spawned remote CLI: $CLI_PID"
+
+# Wait for the server to start listening (read log file, no pipes).
+LISTENING_ON=""
+count=0
+while [ $count -lt 15 ]; do
+    count=$((count + 1))
+    if [ -f "$CLI_LOG_FILE" ]; then
+        LISTENING_ON=$(grep -m1 'Listening on ' "$CLI_LOG_FILE" 2>/dev/null)
+        LISTENING_ON=${LISTENING_ON#*Listening on }
+    fi
+    if [ -n "$LISTENING_ON" ]; then
+        break
+    fi
+    if ! kill -0 $CLI_PID 2>/dev/null; then
+        echo "Exec server process not found"
+        cat "$CLI_LOG_FILE" 2>/dev/null
+        break
+    fi
+    echo "Waiting for server log..."
+    sleep 1
+done
+
+# Emit result markers.
+echo "${UUID}: start"
+echo "listeningOn==${LISTENING_ON}=="
+echo "osReleaseId==${OSRELEASEID}=="
+echo "arch==${ARCH}=="
+echo "vscodeArch==${VSCODE_ARCH}=="
+echo "bitness==${BITNESS}=="
+echo "tmpDir==/tmp=="
+echo "platform==${PLATFORM}=="
+echo "unpackResult==success=="
+echo "didLocalDownload==0=="
+echo "downloadTime===="
+echo "installTime===="
+echo "serverStartTime===="
+echo "execServerToken==${TOKEN}=="
+echo "platformDownloadPath==cli-alpine-x64=="
+echo "SSH_AUTH_SOCK===="
+echo "DISPLAY===="
+echo "${UUID}: end"
+
+# Keep alive.
+while true; do sleep 180; printf ' '; done
+SHWRAPPER
+chmod +x "$OUTPUT/usr/bin/sh"
+echo "  Installed VS Code bootstrap sh wrapper"
 TOTAL_SIZE=$(du -sh "$OUTPUT" | cut -f1)
 FILE_COUNT=$(find "$OUTPUT" -type f | wc -l)
 
@@ -380,7 +615,7 @@ echo "  Total size: $TOTAL_SIZE"
 echo "  File count: $FILE_COUNT"
 echo ""
 echo "Key binaries:"
-for bin in node git python3 bash sshd sftp-server; do
+for bin in node git python3 bash dropbear dropbearkey sftp-server; do
     found=$(find "$OUTPUT" -name "$bin" -type f 2>/dev/null | head -1)
     if [ -n "$found" ]; then
         echo "  $bin: ${found#$OUTPUT}"
