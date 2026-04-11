@@ -2400,6 +2400,30 @@ impl<FS: ShimFS> Task<FS> {
                 argv,
                 envp,
             } => self.sys_execve(pathname, argv, envp, ctx),
+            SyscallRequest::Execveat {
+                dirfd,
+                pathname,
+                argv,
+                envp,
+                flags,
+            } => {
+                const AT_EMPTY_PATH: i32 = 0x1000;
+                if flags & AT_EMPTY_PATH != 0 {
+                    // fexecve path: resolve the fd to a filesystem path.
+                    let path = self.fd_path_for_raw(dirfd).ok_or(Errno::EBADF)?;
+                    let path_cstr = alloc::ffi::CString::new(path.as_bytes())
+                        .map_err(|_| Errno::EINVAL)?;
+                    let path_ptr = crate::ConstPtr::<i8>::from_usize(path_cstr.as_ptr() as usize);
+                    // Keep path_cstr alive across the call.
+                    let result = self.sys_execve(path_ptr, argv, envp, ctx);
+                    drop(path_cstr);
+                    result
+                } else {
+                    // Non-AT_EMPTY_PATH: treat like regular execve with
+                    // the pathname (dirfd-relative paths not yet supported).
+                    self.sys_execve(pathname, argv, envp, ctx)
+                }
+            }
             SyscallRequest::Read { fd, buf, count } => {
                 // Note some applications (e.g., `node`) seem to assume that getting fewer bytes than
                 // requested indicates EOF.

@@ -505,6 +505,11 @@ fn runner_command(
         cmd.arg("--env").arg("TERM=dumb");
     }
 
+    // Run as root inside the sandbox. The host process runs as a normal
+    // user, but the guest should appear as root so sshd/dropbear can
+    // authenticate users and manage sessions.
+    cmd.args(["--guest-uid", "0", "--guest-euid", "0", "--guest-gid", "0", "--guest-egid", "0"]);
+
     cmd.arg("--");
 
     // Reset signal handlers to SIG_DFL in the child process. The tool
@@ -667,9 +672,23 @@ fn vscode_server(cli: &Cli, audit_log_file: Option<&std::path::Path>) -> anyhow:
     let forward_ports = [(ssh_port, guest_ip, 22u16)];
     let (broker, _temp_policy) = spawn_broker(cli, Some(audit), &forward_ports)?;
 
-    // Build the runner command: sshd -D -e (foreground, stderr logging)
+    // Build the runner command: dropbear SSH server
+    // dropbear flags:
+    //   -F  don't fork into background (foreground mode)
+    //   -E  log to stderr
+    //   -s  disable password login (empty passwords via -B instead)
+    //   -B  allow blank passwords
+    //   -R  create host keys if missing
+    //   -p 22  listen on port 22 inside the sandbox
     let mut cmd = runner_command(cli, Some(audit), Some(&broker))?;
-    cmd.args(["/usr/sbin/sshd", "-D", "-e"]);
+    cmd.args([
+        "/usr/sbin/dropbear",
+        "-F", // foreground
+        "-E", // stderr logging
+        "-B", // allow blank passwords
+        "-R", // generate host keys if missing
+        "-p", "22",
+    ]);
 
     cmd.stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::inherit())
@@ -692,11 +711,11 @@ fn vscode_server(cli: &Cli, audit_log_file: Option<&std::path::Path>) -> anyhow:
 
     eprintln!();
     eprintln!("==============================================");
-    eprintln!("  LiteBox VS Code Server (sshd in sandbox)");
+    eprintln!("  LiteBox VS Code Server (dropbear SSH)");
     if cli.record_baseline {
         eprintln!("  *** RECORDING BASELINE (AllowAll policy) ***");
     }
-    eprintln!("  sshd inside sandbox on port 22");
+    eprintln!("  dropbear inside sandbox on port 22");
     eprintln!("  Forwarding host:{ssh_port} → sandbox:22");
     eprintln!();
     eprintln!("  Add to ~/.ssh/config:");

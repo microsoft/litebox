@@ -2784,6 +2784,15 @@ pub enum SyscallRequest<Platform: litebox::platform::RawPointerProvider> {
         argv: Platform::RawConstPointer<Platform::RawConstPointer<i8>>,
         envp: Platform::RawConstPointer<Platform::RawConstPointer<i8>>,
     },
+    /// execveat — execute program relative to a directory fd.
+    /// Used by fexecve() (dropbear's re-exec path).
+    Execveat {
+        dirfd: i32,
+        pathname: Platform::RawConstPointer<i8>,
+        argv: Platform::RawConstPointer<Platform::RawConstPointer<i8>>,
+        envp: Platform::RawConstPointer<Platform::RawConstPointer<i8>>,
+        flags: i32,
+    },
     Umask {
         mask: u32,
     },
@@ -3588,6 +3597,18 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
                 Self::parse_futex(ctx, TimeParam::timespec64, unsupported_einval)?
             }
             Sysno::execve => sys_req!(Execve { pathname:*, argv:*, envp:* }),
+            // execveat: like execve but with dirfd+flags. Used by fexecve()
+            // (dropbear's re-exec path). We parse the same as execve but
+            // include the dirfd and flags for AT_EMPTY_PATH handling.
+            Sysno::execveat => {
+                return Ok(SyscallRequest::Execveat {
+                    dirfd: ctx.sys_req_arg(0),
+                    pathname: ctx.sys_req_ptr(1),
+                    argv: ctx.sys_req_ptr(2),
+                    envp: ctx.sys_req_ptr(3),
+                    flags: ctx.sys_req_arg(4),
+                });
+            }
             Sysno::umask => sys_req!(Umask { mask }),
             Sysno::alarm => sys_req!(Alarm { seconds }),
             Sysno::setitimer => sys_req!(SetITimer { which:?, new_value:*, old_value:* }),

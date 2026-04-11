@@ -203,79 +203,75 @@ if [ -f /etc/ssl/openssl.cnf ]; then
 fi
 
 # ============================================================
-echo "=== Phase 7: Install OpenSSH sshd ==="
-# sshd runs inside the sandbox as the init process. VS Code connects
-# via SSH, and sshd fork+execs bash/sftp-server/VS Code Server — all
-# sharing one filesystem.
-SSHD_DEB_DIR=$(mktemp -d)
+echo "=== Phase 7: Install dropbear SSH server ==="
+# dropbear runs inside the sandbox as the init process. VS Code connects
+# via SSH, and dropbear fork+execs bash/VS Code Server — all sharing
+# one filesystem. dropbear uses fork+exec (DROPBEAR_DO_REEXEC) which is
+# compatible with litebox's delayed-fork semantics (unlike OpenSSH sshd
+# whose privilege separation requires concurrent parent+child execution).
+DROPBEAR_DEB_DIR=$(mktemp -d)
 (
-    cd "$SSHD_DEB_DIR"
-    # Download sshd and libwrap (TCP wrappers, required by sshd)
-    apt-get download openssh-server libwrap0 2>/dev/null
+    cd "$DROPBEAR_DEB_DIR"
+    # Download dropbear-bin and its crypto dependencies.
+    # Also download openssh-sftp-server — dropbear has no native SFTP
+    # but can launch an external sftp-server binary.
+    apt-get download dropbear-bin libtomcrypt1 libtommath1 openssh-sftp-server 2>/dev/null
     for deb in *.deb; do
         [ -f "$deb" ] || continue
-        dpkg-deb -x "$deb" "$SSHD_DEB_DIR/ext"
+        dpkg-deb -x "$deb" "$DROPBEAR_DEB_DIR/ext"
     done
 )
 
-# Install sshd binary
-if [ -f "$SSHD_DEB_DIR/ext/usr/sbin/sshd" ]; then
+# Install dropbear binary
+if [ -f "$DROPBEAR_DEB_DIR/ext/usr/sbin/dropbear" ]; then
     mkdir -p "$OUTPUT/usr/sbin"
-    cp "$SSHD_DEB_DIR/ext/usr/sbin/sshd" "$OUTPUT/usr/sbin/sshd"
-    chmod +x "$OUTPUT/usr/sbin/sshd"
-    echo "  Installed sshd"
-    stage_deps "$SSHD_DEB_DIR/ext/usr/sbin/sshd"
+    cp "$DROPBEAR_DEB_DIR/ext/usr/sbin/dropbear" "$OUTPUT/usr/sbin/dropbear"
+    chmod +x "$OUTPUT/usr/sbin/dropbear"
+    echo "  Installed dropbear"
+    stage_deps "$DROPBEAR_DEB_DIR/ext/usr/sbin/dropbear"
 fi
 
-# Install libwrap (TCP wrappers)
-LIBWRAP=$(find "$SSHD_DEB_DIR/ext" -name "libwrap.so.0*" -type f | head -1)
-if [ -n "$LIBWRAP" ]; then
-    mkdir -p "$OUTPUT/lib/x86_64-linux-gnu"
-    cp "$LIBWRAP" "$OUTPUT/lib/x86_64-linux-gnu/libwrap.so.0"
-    echo "  Installed libwrap"
+# Install dropbearkey (host key generator)
+if [ -f "$DROPBEAR_DEB_DIR/ext/usr/bin/dropbearkey" ]; then
+    mkdir -p "$OUTPUT/usr/bin"
+    cp "$DROPBEAR_DEB_DIR/ext/usr/bin/dropbearkey" "$OUTPUT/usr/bin/dropbearkey"
+    chmod +x "$OUTPUT/usr/bin/dropbearkey"
+    echo "  Installed dropbearkey"
 fi
 
-# Install sftp-server
-SFTP=$(find "$SSHD_DEB_DIR/ext" -name "sftp-server" -type f 2>/dev/null | head -1)
-if [ -z "$SFTP" ]; then
-    # sftp-server is in a separate package
-    (cd "$SSHD_DEB_DIR" && apt-get download openssh-sftp-server 2>/dev/null && \
-     dpkg-deb -x openssh-sftp-server*.deb "$SSHD_DEB_DIR/ext")
-    SFTP=$(find "$SSHD_DEB_DIR/ext" -name "sftp-server" -type f | head -1)
-fi
+# Install dropbear's crypto libs (libtomcrypt, libtommath)
+for lib in libtomcrypt.so.1 libtommath.so.1; do
+    LIBPATH=$(find "$DROPBEAR_DEB_DIR/ext" -name "$lib*" -type f 2>/dev/null | head -1)
+    if [ -n "$LIBPATH" ]; then
+        stage_lib "$LIBPATH"
+    fi
+done
+
+# Install sftp-server (from openssh-sftp-server package)
+SFTP=$(find "$DROPBEAR_DEB_DIR/ext" -name "sftp-server" -type f 2>/dev/null | head -1)
 if [ -n "$SFTP" ]; then
     mkdir -p "$OUTPUT/usr/lib/openssh"
     cp "$SFTP" "$OUTPUT/usr/lib/openssh/sftp-server"
     chmod +x "$OUTPUT/usr/lib/openssh/sftp-server"
     echo "  Installed sftp-server"
+    stage_deps "$SFTP"
 fi
 
-# Generate host key
-mkdir -p "$OUTPUT/etc/ssh"
-if [ ! -f "$OUTPUT/etc/ssh/ssh_host_ed25519_key" ]; then
-    ssh-keygen -t ed25519 -f "$OUTPUT/etc/ssh/ssh_host_ed25519_key" -N "" -q
-    echo "  Generated host key"
+# Symlink sftp-server where dropbear expects it (/usr/libexec/sftp-server)
+mkdir -p "$OUTPUT/usr/libexec"
+ln -sf /usr/lib/openssh/sftp-server "$OUTPUT/usr/libexec/sftp-server"
+echo "  Symlinked /usr/libexec/sftp-server → /usr/lib/openssh/sftp-server"
+
+# Generate host key (dropbear format)
+mkdir -p "$OUTPUT/etc/dropbear"
+if [ ! -f "$OUTPUT/etc/dropbear/dropbear_ed25519_host_key" ]; then
+    LD_LIBRARY_PATH="$DROPBEAR_DEB_DIR/ext/usr/lib/x86_64-linux-gnu:$DROPBEAR_DEB_DIR/ext/lib/x86_64-linux-gnu" \
+        "$DROPBEAR_DEB_DIR/ext/usr/bin/dropbearkey" -t ed25519 \
+        -f "$OUTPUT/etc/dropbear/dropbear_ed25519_host_key" 2>/dev/null
+    echo "  Generated ed25519 host key"
 fi
 
-# Write sshd config
-cat > "$OUTPUT/etc/ssh/sshd_config" << 'SSHD_CONFIG'
-Port 22
-HostKey /etc/ssh/ssh_host_ed25519_key
-PermitRootLogin yes
-PasswordAuthentication yes
-PermitEmptyPasswords yes
-UsePAM no
-Subsystem sftp /usr/lib/openssh/sftp-server
-UseDNS no
-AcceptEnv *
-LogLevel INFO
-SSHD_CONFIG
-echo "  Written sshd_config"
-
-# sshd privilege separation directory
-mkdir -p "$OUTPUT/var/run/sshd" "$OUTPUT/run/sshd"
-
-rm -rf "$SSHD_DEB_DIR"
+rm -rf "$DROPBEAR_DEB_DIR"
 
 # ============================================================
 echo "=== Phase 8: Create directory structure and config ==="
@@ -296,9 +292,11 @@ chmod -R 777 "$OUTPUT/root/.vscode-server"
 echo "nameserver 10.0.0.1" > "$OUTPUT/etc/resolv.conf"
 
 # Minimal /etc/passwd and /etc/group
+# root has an empty password (no 'x' which would require /etc/shadow).
+# dropbear with -B (blank passwords) accepts this for SSH login.
 cat > "$OUTPUT/etc/passwd" << 'EOF'
-root:x:0:0:root:/root:/bin/bash
-user:x:1000:1000:user:/root:/bin/bash
+root::0:0:root:/root:/usr/bin/bash
+user:x:1000:1000:user:/root:/usr/bin/bash
 nobody:x:65534:65534:nobody:/nonexistent:/usr/sbin/nologin
 EOF
 
@@ -306,6 +304,29 @@ cat > "$OUTPUT/etc/group" << 'EOF'
 root:x:0:
 user:x:1000:
 nogroup:x:65534:
+EOF
+
+# NSS configuration: glibc's getpwnam/getgrnam need nsswitch.conf
+# and libnss_files to read /etc/passwd and /etc/group.
+cat > "$OUTPUT/etc/nsswitch.conf" << 'EOF'
+passwd:   files
+group:    files
+shadow:   files
+hosts:    files dns
+EOF
+
+# Stage libnss_files (required) and libnss_dns (for hostname resolution)
+for nss_lib in libnss_files.so.2 libnss_dns.so.2; do
+    if [ -f "/lib/x86_64-linux-gnu/$nss_lib" ]; then
+        stage_lib "/lib/x86_64-linux-gnu/$nss_lib"
+    fi
+done
+
+# Valid login shells (dropbear checks getusershell())
+cat > "$OUTPUT/etc/shells" << 'EOF'
+/bin/sh
+/bin/bash
+/usr/bin/bash
 EOF
 
 # Compatibility symlinks

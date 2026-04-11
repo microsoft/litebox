@@ -251,7 +251,7 @@ impl<FS: ShimFS> Task<FS> {
     // ── End of internal fd helpers ─────────────────────────────────────
 
     /// Get the FS-level path for a raw fd, if it's a filesystem fd.
-    fn fd_path_for_raw(&self, fd: i32) -> Option<alloc::string::String> {
+    pub(crate) fn fd_path_for_raw(&self, fd: i32) -> Option<alloc::string::String> {
         let Ok(raw_fd) = u32::try_from(fd).and_then(usize::try_from) else {
             return None;
         };

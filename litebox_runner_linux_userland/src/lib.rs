@@ -151,20 +151,20 @@ pub struct CliArgs {
     #[arg(long = "guest-ppid", hide = true, requires = "worker_exec")]
     pub guest_ppid: Option<i32>,
 
-    /// Internal: guest UID for worker-exec mode.
-    #[arg(long = "guest-uid", hide = true, requires = "worker_exec")]
+    /// Guest UID (default: host UID). Set to 0 for root inside the sandbox.
+    #[arg(long = "guest-uid", hide = true)]
     pub guest_uid: Option<u32>,
 
-    /// Internal: guest effective UID for worker-exec mode.
-    #[arg(long = "guest-euid", hide = true, requires = "worker_exec")]
+    /// Guest effective UID (default: same as guest-uid).
+    #[arg(long = "guest-euid", hide = true)]
     pub guest_euid: Option<u32>,
 
-    /// Internal: guest GID for worker-exec mode.
-    #[arg(long = "guest-gid", hide = true, requires = "worker_exec")]
+    /// Guest GID (default: host GID). Set to 0 for root inside the sandbox.
+    #[arg(long = "guest-gid", hide = true)]
     pub guest_gid: Option<u32>,
 
-    /// Internal: guest effective GID for worker-exec mode.
-    #[arg(long = "guest-egid", hide = true, requires = "worker_exec")]
+    /// Guest effective GID (default: same as guest-gid).
+    #[arg(long = "guest-egid", hide = true)]
     pub guest_egid: Option<u32>,
 
     /// Internal: run as a worker host process to restore a fork child.
@@ -685,7 +685,7 @@ fn finish_run<FS: litebox_shim_linux::ShimFS>(
 
         let program = shim.load_program_with_exec_filename(
             initial_file_system,
-            platform.init_task(),
+            task_params_with_overrides(cli_args, &platform),
             load_prog_path,
             exec_prog_path,
             argv,
@@ -777,7 +777,7 @@ fn finish_run_with_nine_p<FS: litebox_shim_linux::ShimFS>(
 
         let program = shim.load_program_with_exec_filename(
             combined_fs,
-            task_override.unwrap_or_else(|| platform.init_task()),
+            task_override.unwrap_or_else(|| task_params_with_overrides(cli_args, platform)),
             load_prog_path,
             exec_prog_path,
             argv,
@@ -856,6 +856,27 @@ fn finish_run_with_nine_p<FS: litebox_shim_linux::ShimFS>(
     )?;
 
     run_program(program, shutdown, net_worker, worker_result_fd, None);
+}
+
+/// Build task params for the init process, applying --guest-uid/gid overrides.
+fn task_params_with_overrides(
+    cli_args: &CliArgs,
+    platform: &litebox_platform_multiplex::Platform,
+) -> litebox_common_linux::TaskParams {
+    let mut params = platform.init_task();
+    if let Some(uid) = cli_args.guest_uid {
+        params.uid = uid;
+    }
+    if let Some(euid) = cli_args.guest_euid {
+        params.euid = euid;
+    }
+    if let Some(gid) = cli_args.guest_gid {
+        params.gid = gid;
+    }
+    if let Some(egid) = cli_args.guest_egid {
+        params.egid = egid;
+    }
+    params
 }
 
 #[allow(clippy::similar_names)]
