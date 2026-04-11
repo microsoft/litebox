@@ -668,8 +668,18 @@ fn vscode_server(cli: &Cli, audit_log_file: Option<&std::path::Path>) -> anyhow:
     let guest_ip = "10.0.0.2";
     let ssh_port = cli.ssh_port;
 
-    // Start the broker with inbound TCP forwarding: host:ssh_port → guest:22
-    let forward_ports = [(ssh_port, guest_ip, 22u16)];
+    // Port for the VS Code CLI exec server inside the sandbox.
+    // Fixed port because the broker needs to know it for hairpin forwarding
+    // (loopback connections are redirected through the broker).
+    let cli_port = 9100u16;
+
+    // Start the broker with inbound TCP forwarding:
+    //   host:ssh_port → guest:22 (SSH)
+    //   broker:cli_port → guest:cli_port (VS Code CLI hairpin for loopback)
+    let forward_ports = [
+        (ssh_port, guest_ip, 22u16),
+        (cli_port, guest_ip, cli_port),
+    ];
     let (broker, _temp_policy) = spawn_broker(cli, Some(audit), &forward_ports)?;
 
     // Build the runner command: dropbear SSH server

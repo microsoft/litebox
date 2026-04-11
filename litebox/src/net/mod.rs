@@ -104,9 +104,20 @@ where
         let mut interface =
             smoltcp::iface::Interface::new(config, &mut device, smoltcp::time::Instant::ZERO);
         interface.update_ip_addrs(|ip_addrs| {
+            // Guest's main IP address.
             match ip_addrs.push(smoltcp::wire::IpCidr::new(
                 smoltcp::wire::IpAddress::Ipv4(INTERFACE_IP_ADDR),
                 24,
+            )) {
+                Ok(()) => {}
+                Err(_) => unreachable!(),
+            }
+            // Loopback address — enables connections from within the sandbox
+            // to services listening on the same sandbox (e.g., VS Code CLI's
+            // exec server, accessed via SSH dynamic port forwarding).
+            match ip_addrs.push(smoltcp::wire::IpCidr::new(
+                smoltcp::wire::IpAddress::Ipv4(smoltcp::wire::Ipv4Address::new(127, 0, 0, 1)),
+                8,
             )) {
                 Ok(()) => {}
                 Err(_) => unreachable!(),
@@ -989,6 +1000,15 @@ where
     ) -> Result<(), ConnectError> {
         let SocketAddr::V4(addr) = addr else {
             return Err(ConnectError::UnsupportedAddress(*addr));
+        };
+
+        // Redirect loopback connections to the gateway (broker). The sandbox's
+        // smoltcp can't do loopback (connect to its own listening sockets).
+        // The broker can hairpin the connection back via inbound port forwarding.
+        let addr = if addr.ip().is_loopback() || *addr.ip() == INTERFACE_IP_ADDR {
+            &SocketAddrV4::new(GATEWAY_IP_ADDR, addr.port())
+        } else {
+            addr
         };
 
         let descriptor_table = self.litebox.descriptor_table();
