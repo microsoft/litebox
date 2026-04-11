@@ -13,11 +13,14 @@
 
 use arrayvec::{ArrayString, ArrayVec};
 use core::fmt;
-use core::sync::atomic::{AtomicI32, Ordering};
+use core::sync::atomic::{AtomicI32, AtomicU64, Ordering};
 
 /// File descriptor for the audit log file. When >= 0, audit events are
 /// written to this fd instead of stderr. Set via [`set_audit_log_fd`].
 static AUDIT_LOG_FD: AtomicI32 = AtomicI32::new(-1);
+
+/// Monotonically increasing sequence number for correlating entry/exit events.
+static AUDIT_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// Redirect audit events to the given host file descriptor.
 ///
@@ -159,16 +162,61 @@ fn write_json_escaped(f: &mut fmt::Formatter<'_>, s: &str) -> fmt::Result {
 /// descriptor. Otherwise falls back to the platform's debug log (stderr).
 pub fn emit_audit_event(event: &AuditEvent) {
     let msg = alloc::format!("{event}\n");
+    write_audit_line(&msg);
+}
+
+/// Allocate a new sequence number and emit the entry (pre-syscall) event.
+///
+/// Returns the sequence number for pairing with the exit event.
+pub fn emit_entry_event(event: &AuditEvent) -> u64 {
+    let seq = AUDIT_SEQ.fetch_add(1, Ordering::Relaxed);
+    let msg = alloc::format!(
+        "{{\"phase\":\"enter\",\"seq\":{seq},\"syscall\":\"{}\",\"args\":[{}]}}\n",
+        event.syscall_name,
+        FormatArgs(&event.args),
+    );
+    write_audit_line(&msg);
+    seq
+}
+
+/// Emit the exit (post-syscall) event with the result.
+pub fn emit_exit_event(syscall_name: &str, seq: u64, result: Result<usize, i32>) {
+    let result_str = match result {
+        Ok(v) => alloc::format!("{{\"ok\":{v}}}"),
+        Err(e) => alloc::format!("{{\"err\":{e}}}"),
+    };
+    let msg = alloc::format!(
+        "{{\"phase\":\"exit\",\"seq\":{seq},\"syscall\":\"{syscall_name}\",\"result\":{result_str}}}\n",
+    );
+    write_audit_line(&msg);
+}
+
+/// Write a line to the audit log fd or stderr.
+fn write_audit_line(msg: &str) {
     let fd = AUDIT_LOG_FD.load(Ordering::Relaxed);
     if fd >= 0 {
         use litebox::platform::DebugLogProvider as _;
-        if !litebox_platform_multiplex::platform().debug_log_write_to_fd(fd, &msg) {
-            // Platform doesn't support fd-targeted writes; fall back to stderr.
-            litebox_platform_multiplex::platform().debug_log_print(&msg);
+        if !litebox_platform_multiplex::platform().debug_log_write_to_fd(fd, msg) {
+            litebox_platform_multiplex::platform().debug_log_print(msg);
         }
     } else {
         use litebox::platform::DebugLogProvider as _;
-        litebox_platform_multiplex::platform().debug_log_print(&msg);
+        litebox_platform_multiplex::platform().debug_log_print(msg);
+    }
+}
+
+/// Helper for formatting args in the entry event.
+struct FormatArgs<'a>(&'a ArrayVec<AuditArg, MAX_ARGS>);
+
+impl fmt::Display for FormatArgs<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for (i, arg) in self.0.iter().enumerate() {
+            if i > 0 {
+                write!(f, ",")?;
+            }
+            write!(f, "{arg}")?;
+        }
+        Ok(())
     }
 }
 

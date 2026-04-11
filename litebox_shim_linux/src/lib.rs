@@ -2360,7 +2360,9 @@ impl<FS: ShimFS> Task<FS> {
         self.record_syscall_entry(ctx, syscall_number);
 
         #[cfg(feature = "audit_log")]
-        let mut audit_event = audit::build_audit_event(&request);
+        let audit_event = audit::build_audit_event(&request);
+        #[cfg(feature = "audit_log")]
+        let audit_seq = audit::emit_entry_event(&audit_event);
 
         let result = match request {
             SyscallRequest::Exit { status } => {
@@ -3220,11 +3222,11 @@ impl<FS: ShimFS> Task<FS> {
 
         #[cfg(feature = "audit_log")]
         {
-            audit_event.set_result(match &result {
+            let result_val = match &result {
                 Ok(v) => Ok(*v),
                 Err(e) => Err(e.as_neg()),
-            });
-            audit::emit_audit_event(&audit_event);
+            };
+            audit::emit_exit_event(audit_event.syscall_name, audit_seq, result_val);
         }
 
         result

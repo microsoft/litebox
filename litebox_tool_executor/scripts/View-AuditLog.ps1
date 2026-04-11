@@ -55,6 +55,9 @@ begin {
     $script:lastDeniedKey = $null
     $script:lastDeniedCount = 0
 
+    # Pending enter event for merging with its exit.
+    $script:pendingEnter = $null
+
     function Flush-Denied {
         if ($script:lastDeniedCount -gt 1) {
             if ($Prefix) { Write-Host -NoNewline -ForegroundColor DarkGray $Prefix }
@@ -64,6 +67,32 @@ begin {
         $script:lastDeniedCount = 0
     }
 
+    function Flush-PendingEnter {
+        if ($null -ne $script:pendingEnter) {
+            $pe = $script:pendingEnter
+            $script:pendingEnter = $null
+            # Show as in-progress (no result yet).
+            $color = if ($colors.ContainsKey($pe.syscall)) { $colors[$pe.syscall] } else { 'White' }
+            $argStr = Format-SyscallArgs $pe.args
+            if ($Prefix) { Write-Host -NoNewline -ForegroundColor DarkGray $Prefix }
+            Write-Host -NoNewline -ForegroundColor DarkYellow "-> "
+            Write-Host -NoNewline -ForegroundColor $color "$($pe.syscall)"
+            Write-Host "($argStr) ..."
+        }
+    }
+
+    function Format-SyscallArgs($argList) {
+        $parts = @()
+        foreach ($arg in $argList) {
+            if ($null -ne $arg.fd)    { $parts += "fd=$($arg.fd)" }
+            if ($null -ne $arg.path)  { $parts += "`"$($arg.path)`"" }
+            if ($null -ne $arg.addr)  { $parts += $arg.addr }
+            if ($null -ne $arg.int)   { $parts += "$($arg.int)" }
+            if ($null -ne $arg.flags) { $parts += $arg.flags }
+        }
+        return ($parts -join ', ')
+    }
+
     function Format-Event($json) {
         try {
             $evt = $json | ConvertFrom-Json
@@ -71,8 +100,63 @@ begin {
             return
         }
 
+        # Handle split enter/exit events (phase field present).
+        if ($evt.phase -eq 'enter') {
+            Flush-PendingEnter
+            Flush-Denied
+            $script:pendingEnter = $evt
+            return
+        }
+        if ($evt.phase -eq 'exit') {
+            Flush-Denied
+            if ($null -ne $script:pendingEnter -and $script:pendingEnter.seq -eq $evt.seq) {
+                # Merge: show as single line with args from enter + result from exit.
+                $pe = $script:pendingEnter
+                $script:pendingEnter = $null
+                $name = $pe.syscall
+                if ($Filter -and $name -notmatch $Filter) { return }
+                $color = if ($colors.ContainsKey($name)) { $colors[$name] } else { 'White' }
+                $argStr = Format-SyscallArgs $pe.args
+                if ($null -ne $evt.result.ok) {
+                    $resultStr = "= $($evt.result.ok)"
+                } else {
+                    $resultStr = "ERR $($evt.result.err)"
+                }
+                if ($Prefix) { Write-Host -NoNewline -ForegroundColor DarkGray $Prefix }
+                Write-Host -NoNewline -ForegroundColor $color "$name"
+                Write-Host -NoNewline "($argStr) "
+                if ($null -ne $evt.result.err) {
+                    Write-Host -ForegroundColor Red $resultStr
+                } else {
+                    Write-Host $resultStr
+                }
+            } else {
+                # Exit without matching enter — show result only.
+                Flush-PendingEnter
+                $name = $evt.syscall
+                if ($Filter -and $name -notmatch $Filter) { return }
+                $color = if ($colors.ContainsKey($name)) { $colors[$name] } else { 'White' }
+                if ($null -ne $evt.result.ok) {
+                    $resultStr = "= $($evt.result.ok)"
+                } else {
+                    $resultStr = "ERR $($evt.result.err)"
+                }
+                if ($Prefix) { Write-Host -NoNewline -ForegroundColor DarkGray $Prefix }
+                Write-Host -NoNewline -ForegroundColor DarkYellow "<- "
+                Write-Host -NoNewline -ForegroundColor $color "$name"
+                Write-Host -NoNewline " "
+                if ($null -ne $evt.result.err) {
+                    Write-Host -ForegroundColor Red $resultStr
+                } else {
+                    Write-Host $resultStr
+                }
+            }
+            return
+        }
+
         # Broker policy events (have "event" field instead of "syscall").
         if ($evt.event) {
+            Flush-PendingEnter
             if ($Prefix) { Write-Host -NoNewline -ForegroundColor DarkGray $Prefix }
             switch ($evt.event) {
                 'policy_loaded' {
