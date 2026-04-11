@@ -18,7 +18,6 @@ struct TestLauncher {
 impl TestLauncher {
     fn init_platform(
         tar_data: &'static [u8],
-        initial_dirs: &[&str],
         initial_files: &[&str],
         tun_device_name: Option<&str>,
         enable_syscall_interception: bool,
@@ -48,10 +47,8 @@ impl TestLauncher {
             fs,
         };
 
-        for each in initial_dirs {
-            this.install_dir(each);
-        }
         for each in initial_files {
+            this.install_dir_all(std::path::Path::new(each).parent().unwrap());
             let data = std::fs::read(each).unwrap();
             this.install_file(data, each);
         }
@@ -62,10 +59,25 @@ impl TestLauncher {
         this
     }
 
-    fn install_dir(&mut self, path: &str) {
-        self.fs
-            .mkdir(path, Mode::RWXU | Mode::RWXG | Mode::RWXO)
-            .expect("Failed to create directory");
+    fn install_dir_all(&mut self, path: &std::path::Path) {
+        let mut ancestors: Vec<_> = path
+            .ancestors()
+            .filter(|a| *a != std::path::Path::new("/") && !a.as_os_str().is_empty())
+            .collect();
+        ancestors.reverse();
+        for ancestor in ancestors {
+            if let Err(e) = self.install_dir(ancestor.to_str().unwrap()) {
+                assert!(
+                    matches!(e, litebox::fs::errors::MkdirError::AlreadyExists),
+                    "Failed to create directory {}: {e}",
+                    ancestor.display()
+                );
+            }
+        }
+    }
+
+    fn install_dir(&mut self, path: &str) -> Result<(), litebox::fs::errors::MkdirError> {
+        self.fs.mkdir(path, Mode::RWXU | Mode::RWXG | Mode::RWXO)
     }
 
     fn install_file(&mut self, contents: Vec<u8>, out: &str) {
@@ -121,7 +133,6 @@ fn test_load_exec_dynamic() {
 
     let mut launcher = TestLauncher::init_platform(
         &[],
-        &["lib64", "lib32", "lib", "lib/x86_64-linux-gnu"],
         &files_to_install
             .iter()
             .map(std::string::String::as_str)
@@ -141,7 +152,7 @@ fn test_load_exec_static() {
     let executable_path = "/hello_exec";
     let executable_data = std::fs::read(path).unwrap();
 
-    let mut launcher = TestLauncher::init_platform(&[], &[], &[], None, false);
+    let mut launcher = TestLauncher::init_platform(&[], &[], None, false);
 
     launcher.install_file(executable_data, executable_path);
 
@@ -254,7 +265,7 @@ fn test_syscall_rewriter() {
     let executable_path = "/hello_exec_nolibc.hooked";
     let executable_data = std::fs::read(hooked_path).unwrap();
 
-    let mut launcher = TestLauncher::init_platform(&[], &[], &[], None, false);
+    let mut launcher = TestLauncher::init_platform(&[], &[], None, false);
     launcher.install_file(executable_data, executable_path);
     launcher.test_load_exec_common(executable_path);
 }
