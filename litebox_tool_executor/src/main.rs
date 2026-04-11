@@ -722,6 +722,7 @@ fn vscode_server(cli: &Cli, audit_log_file: Option<&std::path::Path>) -> anyhow:
     eprintln!("    Host litebox");
     eprintln!("        HostName {host_ip}");
     eprintln!("        Port {ssh_port}");
+    eprintln!("        User root");
     eprintln!("        StrictHostKeyChecking no");
     eprintln!("        UserKnownHostsFile /dev/null");
     eprintln!();
