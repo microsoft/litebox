@@ -1120,7 +1120,19 @@ where
                             Ok(SocketAddr::V4(SocketAddrV4::new(ipv4, endpoint.port)))
                         }
                     },
-                    None => Ok(SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0))),
+                    None => {
+                        // Socket is bound but not connected — smoltcp doesn't
+                        // track the local endpoint until a connection is active.
+                        // Fall back to the port stored during bind().
+                        let tcp = socket_handle.specific.tcp();
+                        let port = tcp
+                            .server_socket
+                            .as_ref()
+                            .map(|s| s.ip_listen_endpoint.port)
+                            .or_else(|| tcp.local_port.as_ref().map(|lp| lp.port()))
+                            .unwrap_or(0);
+                        Ok(SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, port)))
+                    }
                 }
             }
             Protocol::Udp => {
