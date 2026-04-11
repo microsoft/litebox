@@ -339,9 +339,10 @@ for util in "${UTILS[@]}"; do
     fi
 done
 
-# sh symlink (VS Code bootstrap sends 'sh' as the exec command)
-ln -sf /usr/bin/bash "$OUTPUT/bin/sh" 2>/dev/null || true
-ln -sf /usr/bin/bash "$OUTPUT/usr/bin/sh" 2>/dev/null || true
+# sh: VS Code bootstrap sends 'ssh litebox sh' — sh must be a real file
+# (not a symlink) because the sandbox's 9P filesystem doesn't always
+# resolve symlinks with absolute targets correctly.
+cp "$OUTPUT/usr/bin/bash" "$OUTPUT/usr/bin/sh" 2>/dev/null || true
 
 # python3 symlink
 if [ -f "$OUTPUT/usr/bin/python3.12" ] && [ ! -f "$OUTPUT/usr/bin/python3" ]; then
