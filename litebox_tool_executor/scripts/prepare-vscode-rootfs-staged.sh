@@ -214,6 +214,12 @@ if [ -n "$LIBSTDCPP" ]; then
     echo "  Staged libstdc++ ($(basename "$LIBSTDCPP"))"
 fi
 
+# Additional libs needed by the glibc VS Code CLI
+for lib in librt.so.1 libgcc_s.so.1; do
+    SRC="/lib/x86_64-linux-gnu/$lib"
+    [ -f "$SRC" ] && stage_lib "$SRC"
+done
+
 # ldconfig (VS Code CLI checks for it to detect GNU environment)
 # On Ubuntu, /sbin/ldconfig is a shell wrapper; use ldconfig.real instead.
 LDCONFIG_REAL="/sbin/ldconfig.real"
@@ -426,7 +432,7 @@ if [ -n "$VSCODE_COMMIT" ] && echo "$VSCODE_COMMIT" | grep -qE '^[a-f0-9]{40}$';
     if [ -f "$CLI_PATH" ]; then
         echo "  CLI already installed at $CLI_PATH"
     else
-        CLI_URL="https://update.code.visualstudio.com/commit:${VSCODE_COMMIT}/cli-alpine-x64/stable"
+        CLI_URL="https://update.code.visualstudio.com/commit:${VSCODE_COMMIT}/cli-linux-x64/stable"
         echo "  Downloading VS Code CLI from $CLI_URL ..."
         mkdir -p "$CLI_DIR"
         TARBALL="$CLI_DIR/vscode-cli.tar.gz"
@@ -521,7 +527,7 @@ if [ ! -f "$CLI_PATH" ]; then
     mkdir -p "$VSCODE_AGENT_FOLDER"
 
     # Try wget/curl download first.
-    DOWNLOAD_URL="https://update.code.visualstudio.com/commit:${COMMIT_ID}/cli-alpine-x64/${QUALITY}"
+    DOWNLOAD_URL="https://update.code.visualstudio.com/commit:${COMMIT_ID}/cli-linux-x64/${QUALITY}"
     cd "$VSCODE_AGENT_FOLDER"
 
     DOWNLOADED=0
@@ -547,7 +553,7 @@ if [ ! -f "$CLI_PATH" ]; then
         echo "${UUID}%%1%%"
         echo "Trigger local server download"
         echo "${UUID}:trigger_server_download"
-        echo "artifact==cli-alpine-x64=="
+        echo "artifact==cli-linux-x64=="
         echo "destFolder==${VSCODE_AGENT_FOLDER}=="
         echo "destFolder2==/vscode-cli-${COMMIT_ID}.tar.gz=="
         echo "${UUID}:trigger_server_download_end"
@@ -626,7 +632,7 @@ echo "downloadTime===="
 echo "installTime===="
 echo "serverStartTime===="
 echo "execServerToken==${TOKEN}=="
-echo "platformDownloadPath==cli-alpine-x64=="
+echo "platformDownloadPath==cli-linux-x64=="
 echo "SSH_AUTH_SOCK===="
 echo "DISPLAY===="
 echo "${UUID}: end"
