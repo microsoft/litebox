@@ -202,6 +202,31 @@ if [ -f /etc/ssl/openssl.cnf ]; then
     cp /etc/ssl/openssl.cnf "$OUTPUT/etc/ssl/"
 fi
 
+# libstdc++ (required by VS Code CLI / Node.js)
+# The VS Code CLI specifically checks /lib64/libstdc++.so.6
+LIBSTDCPP=$(find /usr/lib/x86_64-linux-gnu -name "libstdc++.so.6.*" -type f 2>/dev/null | head -1)
+if [ -n "$LIBSTDCPP" ]; then
+    stage_lib "$LIBSTDCPP"
+    ln -sf "$(basename "$LIBSTDCPP")" "$OUTPUT/usr/lib/x86_64-linux-gnu/libstdc++.so.6"
+    # VS Code CLI checks this exact path
+    mkdir -p "$OUTPUT/lib64"
+    cp "$LIBSTDCPP" "$OUTPUT/lib64/libstdc++.so.6"
+    echo "  Staged libstdc++ ($(basename "$LIBSTDCPP"))"
+fi
+
+# ldconfig (VS Code CLI checks for it to detect GNU environment)
+# On Ubuntu, /sbin/ldconfig is a shell wrapper; use ldconfig.real instead.
+LDCONFIG_REAL="/sbin/ldconfig.real"
+if [ ! -f "$LDCONFIG_REAL" ]; then
+    LDCONFIG_REAL=$(readlink -f /sbin/ldconfig 2>/dev/null || echo /sbin/ldconfig)
+fi
+if [ -f "$LDCONFIG_REAL" ]; then
+    mkdir -p "$OUTPUT/sbin"
+    cp "$LDCONFIG_REAL" "$OUTPUT/sbin/ldconfig"
+    chmod +x "$OUTPUT/sbin/ldconfig"
+    echo "  Staged ldconfig"
+fi
+
 # ============================================================
 echo "=== Phase 7: Install dropbear SSH server ==="
 # dropbear runs inside the sandbox as the init process. VS Code connects
@@ -279,6 +304,11 @@ echo "=== Phase 8: Create directory structure and config ==="
 mkdir -p "$OUTPUT/tmp" "$OUTPUT/etc" "$OUTPUT/dev" "$OUTPUT/proc"
 mkdir -p "$OUTPUT/workspaces" "$OUTPUT/root" "$OUTPUT/home"
 mkdir -p "$OUTPUT/bin" "$OUTPUT/usr/bin" "$OUTPUT/usr/local/bin"
+
+# Skip VS Code Server prerequisites check — the CLI checks for libstdc++
+# and ldconfig, but the sandbox's 9P filesystem doesn't expose /lib64/
+# paths reliably. The skip file tells the CLI to trust the environment.
+touch "$OUTPUT/tmp/vscode-skip-server-requirements-check"
 
 # VS Code Server data directories (writable at runtime).
 # VS Code's localServerDownload will transfer the server tarball here.
