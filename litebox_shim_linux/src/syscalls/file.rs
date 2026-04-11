@@ -3593,13 +3593,19 @@ impl<FS: ShimFS> Task<FS> {
                                 flags.intersects(OFlags::NONBLOCK),
                             )
                             .map_err(Errno::from)?;
-                        // Record all status flags in metadata for F_GETFL
-                        setfl_in_metadata!(
-                            fd,
-                            crate::PipeStatusFlags,
-                            unreachable!("all pipes have PipeStatusFlags when created"),
-                            |_| {}
-                        )
+                        // Record all status flags in metadata for F_GETFL.
+                        // Pipes inherited across exec may lack this metadata;
+                        // the update_flags call above already applied the
+                        // actual flag change, so just log and succeed.
+                        if self.global.litebox.descriptor_table_mut()
+                            .with_metadata_mut(fd, |crate::PipeStatusFlags(f)| {
+                                let diff = (*f & setfl_mask) ^ flags;
+                                f.toggle(diff);
+                            }).is_err()
+                        {
+                            log_unsupported!("pipe F_SETFL: missing PipeStatusFlags metadata");
+                        }
+                        Ok(())
                     },
                     |fd| {
                         toggle_flags!(fd);
