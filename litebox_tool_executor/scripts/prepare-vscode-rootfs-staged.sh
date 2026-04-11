@@ -466,6 +466,10 @@ cat > "$OUTPUT/usr/bin/sh" << 'SHWRAPPER'
 # VS Code bootstrap interceptor.
 # Detects VS Code's bootstrap script on stdin and handles the protocol
 # without $(cmd | pipe). Falls back to bash for normal shell usage.
+#
+# IMPORTANT: This script must NEVER use $(cmd | pipe) — that pattern
+# deadlocks in litebox's delayed-fork. Use temp files, single-command
+# $(), and while-read loops instead.
 
 # If we have arguments (not the VS Code 'sh' pattern), run bash directly.
 if [ $# -gt 0 ] && [ "$1" != "" ]; then
@@ -473,30 +477,47 @@ if [ $# -gt 0 ] && [ "$1" != "" ]; then
 fi
 
 # Read the bootstrap script from stdin into a temp file.
-SCRIPT=$(cat)
+TMPSCRIPT="/tmp/.vscode-bootstrap-$$.sh"
+cat > "$TMPSCRIPT"
 
 # Check if this is a VS Code bootstrap (contains UUID marker pattern).
-UUID=$(echo "$SCRIPT" | grep -m1 '^UUID=' | head -1)
+# Use grep on the FILE (not piped) — single command $() is safe.
+UUID=$(grep -m1 '^UUID=' "$TMPSCRIPT")
 UUID=${UUID#UUID=\"}
 UUID=${UUID%\"}
 
 if [ -z "$UUID" ]; then
     # Not a VS Code bootstrap — run as normal shell.
-    echo "$SCRIPT" | exec /usr/bin/bash
+    exec /usr/bin/bash "$TMPSCRIPT"
 fi
 
-# Extract variables from the bootstrap script.
-extract_var() {
-    echo "$SCRIPT" | grep -m1 "^$1=" | sed "s/^$1=\"\\{0,1\\}//;s/\"$//"
-}
-COMMIT_ID=$(extract_var COMMIT_ID)
-TOKEN=$(extract_var TOKEN)
-QUALITY=$(extract_var QUALITY)
-VSCODE_AGENT_FOLDER=$(extract_var VSCODE_AGENT_FOLDER)
-LISTEN_ARGS=$(extract_var LISTEN_ARGS)
+# Extract variables from the temp file.
+# Each grep reads the FILE directly — no pipes in subshells.
+COMMIT_ID=$(grep -m1 '^COMMIT_ID=' "$TMPSCRIPT")
+COMMIT_ID=${COMMIT_ID#COMMIT_ID=\"}
+COMMIT_ID=${COMMIT_ID%\"}
 
-# Expand $HOME in VSCODE_AGENT_FOLDER (the bootstrap script uses it literally).
-VSCODE_AGENT_FOLDER=$(echo "$VSCODE_AGENT_FOLDER" | sed "s|\\\$HOME|$HOME|g;s|\${HOME}|$HOME|g")
+TOKEN=$(grep -m1 '^TOKEN=' "$TMPSCRIPT")
+TOKEN=${TOKEN#TOKEN=\"}
+TOKEN=${TOKEN%\"}
+
+QUALITY=$(grep -m1 '^QUALITY=' "$TMPSCRIPT")
+QUALITY=${QUALITY#QUALITY=\"}
+QUALITY=${QUALITY%\"}
+
+VSCODE_AGENT_FOLDER=$(grep -m1 '^VSCODE_AGENT_FOLDER=' "$TMPSCRIPT")
+VSCODE_AGENT_FOLDER=${VSCODE_AGENT_FOLDER#VSCODE_AGENT_FOLDER=\"}
+VSCODE_AGENT_FOLDER=${VSCODE_AGENT_FOLDER%\"}
+
+LISTEN_ARGS=$(grep -m1 '^LISTEN_ARGS=' "$TMPSCRIPT")
+LISTEN_ARGS=${LISTEN_ARGS#LISTEN_ARGS=\"}
+LISTEN_ARGS=${LISTEN_ARGS%\"}
+
+rm -f "$TMPSCRIPT"
+
+# Expand $HOME in VSCODE_AGENT_FOLDER.
+VSCODE_AGENT_FOLDER=${VSCODE_AGENT_FOLDER/\$HOME/$HOME}
+VSCODE_AGENT_FOLDER=${VSCODE_AGENT_FOLDER/\$\{HOME\}/$HOME}
 : "${VSCODE_AGENT_FOLDER:=$HOME/.vscode-server}"
 
 CLI_NAME="code-${COMMIT_ID}"
@@ -506,7 +527,7 @@ CLI_PATH="${VSCODE_AGENT_FOLDER}/${CLI_NAME}"
 echo "${UUID}: running"
 echo "Script executing under PID: $$"
 
-# Detect platform/arch (inline, no pipes in subshells).
+# Detect platform/arch (inline, no pipes).
 PLATFORM=linux
 ARCH=$(uname -m)
 VSCODE_ARCH=x64
@@ -515,7 +536,7 @@ OSRELEASEID=""
 if [ -f /etc/os-release ]; then
     while IFS='=' read -r key val; do
         if [ "$key" = "ID" ]; then
-            OSRELEASEID=$(echo "$val" | tr -d '"')
+            OSRELEASEID=${val//\"/}
             break
         fi
     done < /etc/os-release
@@ -602,6 +623,7 @@ count=0
 while [ $count -lt 15 ]; do
     count=$((count + 1))
     if [ -f "$CLI_LOG_FILE" ]; then
+        # Single grep on a file — no pipe.
         LISTENING_ON=$(grep -m1 'Listening on ' "$CLI_LOG_FILE" 2>/dev/null)
         LISTENING_ON=${LISTENING_ON#*Listening on }
     fi
