@@ -173,7 +173,11 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
                 } => match inner.unmap(start) {
                     Ok((frame, fl)) => {
                         match unsafe { inner.map_to(new_start, frame, flags, &mut allocator) } {
-                            Ok(_) => {}
+                            Ok(flush) => {
+                                if FLUSH_TLB {
+                                    flush.flush();
+                                }
+                            }
                             Err(e) => match e {
                                 MapToError::PageAlreadyMapped(_) => {
                                     return Err(page_mgmt::RemapError::AlreadyAllocated);

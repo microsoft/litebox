@@ -241,13 +241,14 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
         let end: Page<Size4KiB> = Page::from_start_address(VirtAddr::new(old_range.end as u64))
             .or(Err(page_mgmt::RemapError::Unaligned))?;
 
-        // Note: TLB entries for the old addresses are batch-flushed after all pages
-        // are remapped, consistent with the Linux kernel's approach.
+        // Note: TLB entries for both old and new addresses are batch-flushed
+        // after all pages are remapped, consistent with the Linux kernel's approach.
         // Note this implementation is slow as each page requires three full page table walks.
         // If we have N pages, it will be 3N times slower.
         let mut allocator = PageTableAllocator::<M>::new();
         let mut inner = self.inner.lock();
         let flush_start = start;
+        let new_flush_start = new_start;
         while start < end {
             match inner.translate(start.start_address()) {
                 TranslateResult::Mapped {
@@ -295,6 +296,7 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
         // Flush old (unmapped) addresses — other cores may hold stale entries.
         let page_count = (end.start_address() - flush_start.start_address()) / Size4KiB::SIZE;
         flush_tlb_range(flush_start, page_count.truncate());
+        flush_tlb_range(new_flush_start, page_count.truncate());
 
         Ok(UserMutPtr::from_ptr(new_range.start as *mut u8))
     }
@@ -460,6 +462,12 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
             }
         }
 
+        let start_page =
+            Page::<Size4KiB>::containing_address(pa_to_va(frame_range.start.start_address()));
+        let count =
+            (frame_range.end.start_address() - frame_range.start.start_address()) / Size4KiB::SIZE;
+        flush_tlb_range(start_page, count.truncate());
+
         Ok(pa_to_va(frame_range.start.start_address()).as_mut_ptr())
     }
 
@@ -539,6 +547,8 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
             }
         }
 
+        flush_tlb_range(start_page, mapped_count);
+
         Ok(base_va.as_mut_ptr())
     }
 
@@ -558,6 +568,11 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
         for page in pages {
             let _ = inner.unmap(page);
         }
+
+        let start = pages.start;
+        let end = pages.end; // inclusive
+        let count = (end.start_address() - start.start_address()) / Size4KiB::SIZE + 1;
+        flush_tlb_range(start, count.truncate());
 
         // Safety: all leaf entries in `pages` have been unmapped above while
         // holding `self.inner`, so any P1/P2/P3 frames that became empty can
@@ -732,7 +747,9 @@ impl<M: MemoryProvider, const ALIGN: usize> PageTableImpl<ALIGN> for X64PageTabl
                         &mut allocator,
                     )
                 } {
-                    Ok(_fl) => {}
+                    Ok(_) => {
+                        flush_tlb_range(page, 1);
+                    }
                     Err(e) => {
                         unsafe { allocator.deallocate_frame(frame) };
                         match e {
