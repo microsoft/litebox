@@ -51,6 +51,8 @@ pub enum ConnectError {
     InvalidState,
     #[error("Connection timed out")]
     TimedOut,
+    #[error("Connection refused")]
+    ConnectionRefused,
 }
 
 /// Possible errors from [`Network::get_local_addr`]

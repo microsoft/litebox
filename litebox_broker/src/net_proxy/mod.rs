@@ -800,10 +800,64 @@ fn run_inner(
                     );
                     // Let SYN through to smoltcp.
                 } else if dest_ipv4 == BROKER_IPV4 {
-                    // Connection to BROKER_IP but no service registered on this
-                    // port — suppress SYN (guest gets timeout / RST).
-                    debug!("no local service on port {dst_port}, dropping SYN");
-                    suppress_from_smoltcp = true;
+                    // Connection to BROKER_IP — check if there's an inbound
+                    // forward for this port. If so, hairpin through localhost
+                    // (the broker's own inbound listener will accept and
+                    // relay back to the guest).
+                    let has_inbound = inbound_listeners.iter().any(|f| f.guest_port == dst_port);
+                    info!("SYN to BROKER_IP:{dst_port}, has_inbound={has_inbound}");
+                    if has_inbound {
+                        let dest = SocketAddr::V4(SocketAddrV4::new(
+                            Ipv4Addr::LOCALHOST,
+                            dst_port,
+                        ));
+                        let total_flows = pending_connects.len()
+                            + ready_host_streams.len()
+                            + accepting_sockets.len()
+                            + tcp_bridges.len()
+                            + local_bridges.len();
+                        if total_flows >= MAX_CONNECTIONS {
+                            warn!("connection limit reached, dropping hairpin SYN to {dest}");
+                            suppress_from_smoltcp = true;
+                        } else {
+                            match start_nonblocking_connect(&dest) {
+                                Ok(stream) => {
+                                    debug!(
+                                        "hairpin SYN {src_ip:?}:{src_port} → BROKER:{dst_port}, async localhost connect"
+                                    );
+                                    pending_connects.push(PendingConnect {
+                                        flow_key,
+                                        dest,
+                                        stream,
+                                        started: Instant::now(),
+                                    });
+                                    resolve_pending_connects(
+                                        &mut pending_connects,
+                                        &mut ready_host_streams,
+                                    );
+                                    if ready_host_streams.contains_key(&flow_key) {
+                                        ensure_listen_socket(
+                                            &mut sockets,
+                                            &mut listen_sockets,
+                                            &mut accepting_sockets,
+                                            dest_ipv4,
+                                            dst_port,
+                                        );
+                                    } else {
+                                        suppress_from_smoltcp = true;
+                                    }
+                                }
+                                Err(e) => {
+                                    warn!("failed to create hairpin socket for {dest}: {e}");
+                                    suppress_from_smoltcp = true;
+                                }
+                            }
+                        }
+                    } else {
+                        // No service and no inbound forward — drop SYN.
+                        debug!("no local service on port {dst_port}, dropping SYN");
+                        suppress_from_smoltcp = true;
+                    }
                 } else {
                     // New flow to external host.
                     // Check network policy before connecting.

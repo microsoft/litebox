@@ -1002,9 +1002,9 @@ where
             return Err(ConnectError::UnsupportedAddress(*addr));
         };
 
-        // Redirect loopback connections to the gateway (broker). The sandbox's
-        // smoltcp can't do loopback (connect to its own listening sockets).
-        // The broker can hairpin the connection back via inbound port forwarding.
+        // Handle loopback connections (127.0.0.0/8 or self IP).
+        // smoltcp can't route packets to its own sockets. Redirect to the
+        // gateway (broker) which can hairpin via inbound port forwarding.
         let addr = if addr.ip().is_loopback() || *addr.ip() == INTERFACE_IP_ADDR {
             &SocketAddrV4::new(GATEWAY_IP_ADDR, addr.port())
         } else {
