@@ -155,7 +155,7 @@ impl SocketAddress {
     }
 }
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub(super) struct SocketOptions {
     pub(super) reuse_address: bool,
     pub(super) keep_alive: bool,
@@ -171,7 +171,9 @@ pub(super) struct SocketOptions {
     pub(super) linger_timeout: Option<core::time::Duration>,
 }
 
+#[derive(Clone)]
 pub(crate) struct SocketOFlags(pub OFlags);
+#[derive(Clone)]
 pub(crate) struct SocketProxy(pub Arc<NetworkProxy<Platform>>);
 
 pub(super) enum SocketOptionValue {

@@ -343,9 +343,11 @@ fn default_fs(
 }
 
 // Special override so that `GETFL` can return stdio-specific flags
+#[derive(Clone)]
 pub(crate) struct StdioStatusFlags(litebox::fs::OFlags);
 
 /// Status flags for pipes
+#[derive(Clone)]
 pub(crate) struct PipeStatusFlags(pub litebox::fs::OFlags);
 
 impl<FS: ShimFS> syscalls::file::FilesState<FS> {
