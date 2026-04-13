@@ -1969,8 +1969,39 @@ fn promote_established(
     }
 
     for (handle, dest_ip, dest_port) in newly_established {
-        // Local service: spawn handler via a loopback TCP pair.
+        // For connections to BROKER_IP, first check if there's a matching
+        // host stream (e.g., hairpin from loopback redirect). If so, treat
+        // as a normal external bridge. Otherwise, try local services.
         if dest_ip == BROKER_IPV4 {
+            // Check for hairpin host stream first.
+            let socket: &tcp::Socket = sockets.get(handle);
+            let remote = socket.remote_endpoint();
+            let mut found_host_stream = false;
+            if let Some(remote) = remote {
+                #[allow(unreachable_patterns)]
+                let src_ip = match remote.addr {
+                    IpAddress::Ipv4(ip) => ip.octets(),
+                    _ => [0; 4],
+                };
+                let flow_key = (src_ip, remote.port, BROKER_IP_BYTES, dest_port);
+                if let Some((stream, _)) = ready_host_streams.remove(&flow_key) {
+                    stream.set_nonblocking(true).ok();
+                    let dest = SocketAddr::V4(SocketAddrV4::new(dest_ip, dest_port));
+                    bridges.push(TcpBridge {
+                        smoltcp_handle: handle,
+                        host_stream: stream,
+                        dest,
+                        host_eof: false,
+                    });
+                    info!("hairpin bridge created for BROKER_IP:{dest_port}");
+                    found_host_stream = true;
+                }
+            }
+            if found_host_stream {
+                continue;
+            }
+
+            // No host stream — try local service.
             if let Some(spawner) = local_services.get(dest_port) {
                 match TcpListener::bind("127.0.0.1:0") {
                     Ok(listener) => match listener.local_addr() {
