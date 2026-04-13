@@ -928,7 +928,9 @@ fn run_inner(
                         // to the target worker.
                         match create_tcp_pair() {
                             Ok((local_end, remote_end)) => {
-                                let guest_ip = Ipv4Addr::from(dst_ip);
+                                // The target worker's smoltcp connects to its
+                                // guest (10.0.0.2), not to the broker IP.
+                                let guest_ip = Ipv4Addr::new(10, 0, 0, 2);
                                 if port_router.try_route(dst_port, guest_ip, remote_end).is_some() {
                                     warn!("port_router rejected routed stream for port {dst_port}");
                                     suppress_from_smoltcp = true;
@@ -2310,7 +2312,7 @@ fn relay_tcp(sockets: &mut SocketSet<'_>, bridges: &mut Vec<TcpBridge>) {
     for (i, bridge) in bridges.iter_mut().enumerate() {
         let socket: &mut tcp::Socket = sockets.get_mut(bridge.smoltcp_handle);
 
-        // Guest → Host: peek from smoltcp, write to host, then consume only
+        // Guest → Host:peek from smoltcp, write to host, then consume only
         // the bytes the host actually accepted.
         if socket.can_recv() {
             let mut buf = [0u8; 8192];
@@ -2321,7 +2323,7 @@ fn relay_tcp(sockets: &mut SocketSet<'_>, bridges: &mut Vec<TcpBridge>) {
                             // Consume only the bytes the host accepted.
                             let mut discard = vec![0u8; sent];
                             let _ = socket.recv_slice(&mut discard);
-                            trace!("relayed {sent} bytes guest→host for {}", bridge.dest);
+                            debug!("relayed {sent} bytes guest→host for {}", bridge.dest);
                         }
                         Ok(_) => {
                             // Zero-byte write — host buffer full. Leave data in
@@ -2360,8 +2362,7 @@ fn relay_tcp(sockets: &mut SocketSet<'_>, bridges: &mut Vec<TcpBridge>) {
                         socket.close();
                     }
                     Ok(n) => {
-                        // read_limit ≤ free, n ≤ read_limit, so send_slice
-                        // should accept all bytes.
+                        debug!("relayed {n} bytes host→guest for {}", bridge.dest);
                         match socket.send_slice(&buf[..n]) {
                             Ok(sent) => {
                                 trace!("relayed {sent} bytes host→guest for {}", bridge.dest);
