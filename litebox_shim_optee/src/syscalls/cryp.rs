@@ -119,16 +119,16 @@ impl Task {
             if let Some(handle) = cryp_state.get_object_handle(false)
                 && tee_obj_map.exists(handle)
             {
-                if cfg!(debug_assertions) {
-                    todo!("support two-key algorithms");
-                }
+                #[cfg(debug_assertions)]
+                todo!("support two-key algorithms");
+                #[cfg(not(debug_assertions))]
                 return Err(TeeResult::NotSupported);
             }
 
             let Some(cipher) = create_cipher(cryp_state.algorithm(), key, iv) else {
-                if cfg!(debug_assertions) {
-                    todo!("implement algorithm {}", cryp_state.algorithm() as u32);
-                }
+                #[cfg(debug_assertions)]
+                todo!("implement algorithm {}", cryp_state.algorithm() as u32);
+                #[cfg(not(debug_assertions))]
                 return Err(TeeResult::NotSupported);
             };
             tee_cryp_state_map.set_cipher(state, &cipher)?;
@@ -174,9 +174,9 @@ impl Task {
             // Check last_block before applying the cipher so we don't mutate
             // dst_slice and then return an error.
             if last_block {
-                if cfg!(debug_assertions) {
-                    todo!("support algorithms which have a certain finalization logic");
-                }
+                #[cfg(debug_assertions)]
+                todo!("support algorithms which have a certain finalization logic");
+                #[cfg(not(debug_assertions))]
                 return Err(TeeResult::NotSupported);
             }
             if let Some(state_entry) = map.get_mut(&state)
@@ -195,8 +195,13 @@ impl Task {
                     }
                 }
                 *dst_len = src_slice.len();
+                Ok(())
+            } else {
+                #[cfg(debug_assertions)]
+                todo!("handle unimplemented cipher");
+                #[cfg(not(debug_assertions))]
+                Err(TeeResult::NotImplemented)
             }
-            Ok(())
         } else {
             Err(TeeResult::BadParameters)
         }
@@ -260,9 +265,9 @@ impl Task {
     ) -> Result<(), TeeResult> {
         let tee_obj_map = &self.tee_obj_map;
         if attrs.len() > 1 {
-            if cfg!(debug_assertions) {
-                todo!("handle multiple attributes");
-            }
+            #[cfg(debug_assertions)]
+            todo!("handle multiple attributes");
+            #[cfg(not(debug_assertions))]
             return Err(TeeResult::NotSupported);
         }
         if !tee_obj_map.exists(obj) {

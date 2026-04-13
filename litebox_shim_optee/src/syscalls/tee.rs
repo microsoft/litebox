@@ -74,9 +74,9 @@ impl Task {
         prop_type: UserMutPtr<u32>,
     ) -> Result<(), TeeResult> {
         if name_buf.is_some() && name_len.is_some() {
-            if cfg!(debug_assertions) {
-                todo!("return the name of a given property index");
-            }
+            #[cfg(debug_assertions)]
+            todo!("return the name of a given property index");
+            #[cfg(not(debug_assertions))]
             return Err(TeeResult::NotSupported);
         }
         match GpdPropertyIndex::try_from(index).unwrap_or(GpdPropertyIndex::None) {
@@ -178,9 +178,9 @@ impl Task {
             // (using its UUID) to leverage its functions.
             // TODO: if this TA hasn't been loaded, we need to load its ELF and prepare its stack (hopefully
             // in a separate page table). We can do this here or at `sys_invoke_ta_command` (in a lazy manner).
-            if cfg!(debug_assertions) {
-                todo!("support inter TA interaction");
-            }
+            #[cfg(debug_assertions)]
+            todo!("support inter TA interaction");
+            #[cfg(not(debug_assertions))]
             Err(TeeResult::NotSupported)
         }
     }
@@ -192,9 +192,9 @@ impl Task {
             close_pta_session(ta_sess_id);
             Ok(())
         } else {
-            if cfg!(debug_assertions) {
-                todo!("support inter TA interaction");
-            }
+            #[cfg(debug_assertions)]
+            todo!("support inter TA interaction");
+            #[cfg(not(debug_assertions))]
             Err(TeeResult::NotSupported)
         }
     }
@@ -216,9 +216,9 @@ impl Task {
             // TODO: check whether `ta_sess_id` is associated with the system PTA.
             self.handle_system_pta_command(cmd_id, &params)
         } else {
-            if cfg!(debug_assertions) {
-                todo!("support inter TA interaction");
-            }
+            #[cfg(debug_assertions)]
+            todo!("support inter TA interaction");
+            #[cfg(not(debug_assertions))]
             Err(TeeResult::NotSupported)
         }
     }

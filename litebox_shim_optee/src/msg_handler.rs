@@ -686,7 +686,8 @@ impl<const ALIGN: usize> ShmRefMap<ALIGN> {
         if page_offset >= ALIGN as u64 || aligned_size == 0 {
             return Err(OpteeSmcReturnCode::EBadAddr);
         }
-        let num_pages = TruncateExt::<usize>::truncate(aligned_size) / ALIGN;
+        let aligned_size_usize: usize = aligned_size.truncate();
+        let num_pages = aligned_size_usize / ALIGN;
         let mut pages = Vec::with_capacity(num_pages);
         let mut cur_addr: usize = shm_ref_pages_data_phys_addr.truncate();
         loop {

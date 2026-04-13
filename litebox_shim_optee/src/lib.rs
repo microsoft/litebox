@@ -393,9 +393,9 @@ impl Task {
                 {
                     let mut prop_buf = vec![0u8; buf_length as usize];
                     if name.as_usize() != 0 || name_len.as_usize() != 0 {
-                        if cfg!(debug_assertions) {
-                            todo!("return the name of a given property index");
-                        }
+                        #[cfg(debug_assertions)]
+                        todo!("return the name of a given property index");
+                        #[cfg(not(debug_assertions))]
                         Err(TeeResult::NotSupported)
                     } else {
                         self.sys_get_property(
@@ -539,9 +539,9 @@ impl Task {
                 }
             }
             _ => {
-                if cfg!(debug_assertions) {
-                    todo!();
-                }
+                #[cfg(debug_assertions)]
+                todo!("unsupported syscall request");
+                #[cfg(not(debug_assertions))]
                 Err(TeeResult::NotSupported)
             }
         };
@@ -879,7 +879,7 @@ where
 {
     if let Some(src_slice) = src.to_owned_slice(src_len)
         && let Some(length) = dst_len.read_at_offset(0)
-        && TruncateExt::<usize>::truncate(length) <= MAX_KERNEL_BUF_SIZE
+        && length <= MAX_KERNEL_BUF_SIZE as u64
     {
         let mut length: usize = length.truncate();
         let mut kernel_buf = vec![0u8; length];
@@ -1002,12 +1002,12 @@ impl TeeObjMap {
                 };
                 tee_obj.set_key(&key_box);
             } else {
-                if cfg!(debug_assertions) {
-                    todo!(
-                        "handle attribute ID: {}",
-                        user_attrs[0].attribute_id.value()
-                    );
-                }
+                #[cfg(debug_assertions)]
+                todo!(
+                    "handle attribute ID: {}",
+                    user_attrs[0].attribute_id.value()
+                );
+                #[cfg(not(debug_assertions))]
                 return Err(TeeResult::NotSupported);
             }
 

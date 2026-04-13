@@ -137,9 +137,9 @@ impl Task {
                 }
             }
             _ => {
-                if cfg!(debug_assertions) {
-                    todo!("support other system PTA commands {cmd_id}");
-                }
+                #[cfg(debug_assertions)]
+                todo!("support other system PTA commands {cmd_id}");
+                #[cfg(not(debug_assertions))]
                 Err(TeeResult::NotSupported)
             }
         }

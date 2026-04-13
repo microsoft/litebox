@@ -60,9 +60,9 @@ impl Task {
                 | MapFlags::MAP_HUGE_2MB
                 | MapFlags::MAP_HUGE_1GB,
         ) {
-            if cfg!(debug_assertions) {
-                todo!("Unsupported flags {:?}", flags);
-            }
+            #[cfg(debug_assertions)]
+            todo!("Unsupported flags {:?}", flags);
+            #[cfg(not(debug_assertions))]
             return Err(Errno::EINVAL);
         }
 
