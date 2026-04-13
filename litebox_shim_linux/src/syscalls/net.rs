@@ -1545,9 +1545,7 @@ impl<FS: ShimFS> Task<FS> {
         let Ok(sockfd) = u32::try_from(fd) else {
             return Err(Errno::EBADF);
         };
-        let msg = msg_ptr
-                .read_at_offset(0)
-                .ok_or(Errno::EFAULT)?;
+        let msg = msg_ptr.read_at_offset(0).ok_or(Errno::EFAULT)?;
 
         // Copy fields out of the packed struct to avoid unaligned references.
         let msg_name = msg.msg_name;
@@ -1602,8 +1600,7 @@ impl<FS: ShimFS> Task<FS> {
         }
 
         // Write back source address if requested.
-        if let Some(src_addr) = source_addr {
-            let addr_ptr = MutPtr::<u8>::from_usize(msg_name.as_usize());
+        if want_source {
             let addrlen_ptr = MutPtr::<u32>::from_usize(
                 msg_ptr.as_usize()
                     + core::mem::offset_of!(
@@ -1611,7 +1608,13 @@ impl<FS: ShimFS> Task<FS> {
                         msg_namelen
                     ),
             );
-            write_sockaddr_to_user(src_addr, addr_ptr, addrlen_ptr)?;
+            if let Some(src_addr) = source_addr {
+                let addr_ptr = MutPtr::<u8>::from_usize(msg_name.as_usize());
+                write_sockaddr_to_user(src_addr, addr_ptr, addrlen_ptr)?;
+            } else {
+                // No source address (e.g. connected stream socket) — zero out msg_namelen.
+                let _ = addrlen_ptr.write_at_offset(0, 0u32);
+            }
         }
 
         // Write back msg_flags with any status flags (e.g. MSG_TRUNC).
