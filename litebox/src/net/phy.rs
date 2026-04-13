@@ -12,10 +12,6 @@ pub(crate) struct Device<Platform: platform::IPInterfaceProvider + 'static> {
     pub(crate) platform: &'static Platform,
     receive_buffer: [u8; DEVICE_MTU],
     send_buffer: [u8; DEVICE_MTU],
-    /// Loopback queue: packets destined for 127.0.0.0/8 or the interface's
-    /// own IP are queued here instead of sent via IPC. The next `receive()`
-    /// returns them so smoltcp processes them as incoming packets.
-    loopback: Option<(usize, [u8; DEVICE_MTU])>,
 }
 
 impl<Platform: platform::IPInterfaceProvider> Device<Platform> {
@@ -24,32 +20,8 @@ impl<Platform: platform::IPInterfaceProvider> Device<Platform> {
             platform,
             receive_buffer: [0u8; DEVICE_MTU],
             send_buffer: [0u8; DEVICE_MTU],
-            loopback: None,
         }
     }
-}
-
-/// Check if an IPv4 packet is destined for a loopback address (127.0.0.0/8)
-/// or the interface's own IP (10.0.0.2).
-fn is_loopback_dest(packet: &[u8]) -> bool {
-    if packet.len() < 20 {
-        return false;
-    }
-    // IPv4 header: version+IHL at [0], destination IP at [16..20]
-    let version = packet[0] >> 4;
-    if version != 4 {
-        return false;
-    }
-    let dst = &packet[16..20];
-    // 127.0.0.0/8
-    if dst[0] == 127 {
-        return true;
-    }
-    // Interface IP (10.0.0.2)
-    if dst == [10, 0, 0, 2] {
-        return true;
-    }
-    false
 }
 
 impl<Platform: platform::IPInterfaceProvider> smoltcp::phy::Device for Device<Platform> {
@@ -66,22 +38,6 @@ impl<Platform: platform::IPInterfaceProvider> smoltcp::phy::Device for Device<Pl
         &mut self,
         _timestamp: smoltcp::time::Instant,
     ) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
-        // Check loopback queue first.
-        if let Some((len, ref buf)) = self.loopback {
-            self.receive_buffer[..len].copy_from_slice(&buf[..len]);
-            self.loopback = None;
-            return Some((
-                RxToken {
-                    buffer: &self.receive_buffer[..len],
-                },
-                TxToken {
-                    platform: self.platform,
-                    buffer: &mut self.send_buffer,
-                    loopback: &mut self.loopback,
-                },
-            ));
-        }
-
         match self.platform.receive_ip_packet(&mut self.receive_buffer) {
             Ok(size) => Some((
                 RxToken {
@@ -90,13 +46,11 @@ impl<Platform: platform::IPInterfaceProvider> smoltcp::phy::Device for Device<Pl
                 TxToken {
                     platform: self.platform,
                     buffer: &mut self.send_buffer,
-                    loopback: &mut self.loopback,
                 },
             )),
             Err(platform::ReceiveError::WouldBlock | platform::ReceiveError::Eof) => None,
             Err(platform::ReceiveError::ProtocolError) => {
                 // IPC stream is unrecoverably desynchronized.
-                // Treat as permanent no-data — networking is dead.
                 None
             }
         }
@@ -106,7 +60,6 @@ impl<Platform: platform::IPInterfaceProvider> smoltcp::phy::Device for Device<Pl
         Some(TxToken {
             platform: self.platform,
             buffer: &mut self.send_buffer,
-            loopback: &mut self.loopback,
         })
     }
 
@@ -134,7 +87,6 @@ impl smoltcp::phy::RxToken for RxToken<'_> {
 pub(crate) struct TxToken<'a, Platform: platform::IPInterfaceProvider> {
     platform: &'a Platform,
     buffer: &'a mut [u8],
-    loopback: &'a mut Option<(usize, [u8; DEVICE_MTU])>,
 }
 
 impl<Platform: platform::IPInterfaceProvider> smoltcp::phy::TxToken for TxToken<'_, Platform> {
@@ -144,15 +96,8 @@ impl<Platform: platform::IPInterfaceProvider> smoltcp::phy::TxToken for TxToken<
     {
         let packet = &mut self.buffer[..len];
         let res = f(packet);
-        if is_loopback_dest(packet) {
-            // Queue for loopback — will be returned by the next receive().
-            let mut buf = [0u8; DEVICE_MTU];
-            buf[..len].copy_from_slice(packet);
-            *self.loopback = Some((len, buf));
-        } else {
-            // Send via IPC to the broker.
-            let _ = self.platform.send_ip_packet(packet);
-        }
+        // Send via IPC to the broker.
+        let _ = self.platform.send_ip_packet(packet);
         res
     }
 }

@@ -126,6 +126,89 @@ struct InboundForward {
     guest_port: u16,
 }
 
+/// Routes inbound TCP connections to the correct worker's smoltcp proxy.
+///
+/// When a worker process calls `listen(port)`, it registers a channel sender
+/// in the port router. When the main proxy accepts an inbound connection for
+/// that port, it sends the host `TcpStream` (with the guest port) through the
+/// channel to the worker, which creates an inbound bridge on its own smoltcp.
+///
+/// Thread-safe: shared between the main proxy and all worker proxy threads.
+pub struct PortRouter {
+    /// Port → sender channel for forwarding accepted TCP streams to workers.
+    routes: std::sync::Mutex<HashMap<u16, std::sync::mpsc::Sender<RoutedStream>>>,
+}
+
+/// A TCP stream routed from the main proxy to a worker proxy.
+pub struct RoutedStream {
+    pub stream: std::net::TcpStream,
+    pub guest_ip: Ipv4Addr,
+    pub guest_port: u16,
+}
+
+impl Default for PortRouter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl PortRouter {
+    pub fn new() -> Self {
+        Self {
+            routes: std::sync::Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Check if any worker has registered for this port.
+    pub fn has_route(&self, port: u16) -> bool {
+        self.routes.lock().unwrap().contains_key(&port)
+    }
+
+    /// Register a worker's interest in receiving inbound connections on `port`.
+    pub fn register(&self, port: u16, sender: std::sync::mpsc::Sender<RoutedStream>) {
+        let mut routes = self.routes.lock().unwrap();
+        if routes.contains_key(&port) {
+            warn!("port {port} already registered, overwriting");
+        }
+        info!("port router: registered port {port}");
+        routes.insert(port, sender);
+    }
+
+    /// Unregister a port (e.g., when the worker stops listening).
+    pub fn unregister(&self, port: u16) {
+        let mut routes = self.routes.lock().unwrap();
+        if routes.remove(&port).is_some() {
+            info!("port router: unregistered port {port}");
+        }
+    }
+
+    /// Try to route an accepted TCP stream to the worker that owns `guest_port`.
+    /// Returns `Some(stream)` if no worker is registered (caller should handle it).
+    pub fn try_route(
+        &self,
+        guest_port: u16,
+        guest_ip: Ipv4Addr,
+        stream: std::net::TcpStream,
+    ) -> Option<std::net::TcpStream> {
+        let routes = self.routes.lock().unwrap();
+        if let Some(sender) = routes.get(&guest_port) {
+            let routed = RoutedStream { stream, guest_ip, guest_port };
+            match sender.send(routed) {
+                Ok(()) => {
+                    debug!("port router: forwarded connection to worker on port {guest_port}");
+                    None // consumed
+                }
+                Err(e) => {
+                    warn!("port router: worker channel closed for port {guest_port}");
+                    Some(e.0.stream) // return the stream
+                }
+            }
+        } else {
+            Some(stream) // no worker registered, caller handles
+        }
+    }
+}
+
 /// Parse a port-forward spec: "HOST_PORT:GUEST_IP:GUEST_PORT"
 pub fn parse_forward_spec(spec: &str) -> Option<(u16, Ipv4Addr, u16)> {
     let parts: Vec<&str> = spec.splitn(3, ':').collect();
@@ -649,6 +732,7 @@ pub fn run_with_session_slots(
     audit_log: Option<AuditLog>,
     inbound_forwards: Vec<(u16, Ipv4Addr, u16)>,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let port_router = Arc::new(PortRouter::new());
     run_inner(
         ipc_fd,
         handshake_done,
@@ -658,6 +742,9 @@ pub fn run_with_session_slots(
         sandbox_policy,
         audit_log,
         inbound_forwards,
+        port_router,
+        None, // no inbound routed receiver for the init proxy
+        None, // no inbound routed sender for the init proxy
     )
 }
 
@@ -670,6 +757,12 @@ fn run_inner(
     sandbox_policy: Option<Arc<SandboxPolicy>>,
     audit_log: Option<AuditLog>,
     inbound_forwards: Vec<(u16, Ipv4Addr, u16)>,
+    port_router: Arc<PortRouter>,
+    // Receiver for inbound TCP streams routed to this proxy by the port router.
+    inbound_routed_rx: Option<std::sync::mpsc::Receiver<RoutedStream>>,
+    // Sender for this proxy's inbound channel — registered with port_router
+    // when the guest sends a port-listen control message.
+    inbound_routed_tx: Option<std::sync::mpsc::Sender<RoutedStream>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     info!("network proxy starting");
 
@@ -745,6 +838,8 @@ fn run_inner(
     let host_dns = discover_host_dns();
     // Pending LB9P handshakes — drained non-blocking each loop iteration.
     let mut pending_handshakes: Vec<PendingHandshake> = Vec::new();
+    // Ports registered by this proxy in the port router (for cleanup on exit).
+    let mut registered_ports: Vec<u16> = Vec::new();
 
     info!("network proxy ready, entering event loop");
 
@@ -758,6 +853,27 @@ fn run_inner(
             error!("IPC protocol error: closing connection");
             device.send_shutdown();
             break;
+        }
+
+        // Step 1b: Check for port-listen control messages.
+        // Workers send these when they call listen(port) to register
+        // their interest in receiving inbound connections.
+        if let Some((port, is_listen)) = device.take_port_listen_msg() {
+            if is_listen {
+                if let Some(ref tx) = inbound_routed_tx {
+                    port_router.register(port, tx.clone());
+                    registered_ports.push(port);
+                    info!("worker registered listen on port {port}");
+                } else {
+                    // Init proxy received a listen notification — register
+                    // but no routing needed (init handles its own inbound).
+                    info!("init proxy listen on port {port} (local)");
+                }
+            } else {
+                port_router.unregister(port);
+                registered_ports.retain(|p| *p != port);
+                info!("unregistered listen on port {port}");
+            }
         }
 
         // Step 2: Resolve pending host connects BEFORE SYN dispatch.
@@ -800,62 +916,57 @@ fn run_inner(
                     );
                     // Let SYN through to smoltcp.
                 } else if dest_ipv4 == BROKER_IPV4 {
-                    // Connection to BROKER_IP — check if there's an inbound
-                    // forward for this port. If so, hairpin through localhost
-                    // (the broker's own inbound listener will accept and
-                    // relay back to the guest).
-                    let has_inbound = inbound_listeners.iter().any(|f| f.guest_port == dst_port);
-                    info!("SYN to BROKER_IP:{dst_port}, has_inbound={has_inbound}");
-                    if has_inbound {
-                        let dest = SocketAddr::V4(SocketAddrV4::new(
-                            Ipv4Addr::LOCALHOST,
-                            dst_port,
-                        ));
-                        let total_flows = pending_connects.len()
-                            + ready_host_streams.len()
-                            + accepting_sockets.len()
-                            + tcp_bridges.len()
-                            + local_bridges.len();
-                        if total_flows >= MAX_CONNECTIONS {
-                            warn!("connection limit reached, dropping hairpin SYN to {dest}");
-                            suppress_from_smoltcp = true;
-                        } else {
-                            match start_nonblocking_connect(&dest) {
-                                Ok(stream) => {
-                                    debug!(
-                                        "hairpin SYN {src_ip:?}:{src_port} → BROKER:{dst_port}, async localhost connect"
-                                    );
-                                    pending_connects.push(PendingConnect {
-                                        flow_key,
-                                        dest,
-                                        stream,
-                                        started: Instant::now(),
-                                    });
-                                    resolve_pending_connects(
-                                        &mut pending_connects,
-                                        &mut ready_host_streams,
-                                    );
-                                    if ready_host_streams.contains_key(&flow_key) {
-                                        ensure_listen_socket(
-                                            &mut sockets,
-                                            &mut listen_sockets,
-                                            &mut accepting_sockets,
-                                            dest_ipv4,
-                                            dst_port,
-                                        );
-                                    } else {
-                                        suppress_from_smoltcp = true;
-                                    }
-                                }
-                                Err(e) => {
-                                    warn!("failed to create hairpin socket for {dest}: {e}");
+                    // Connection to BROKER_IP — check if a worker registered
+                    // a listen on this port via port_router (cross-worker
+                    // loopback), or if there's an inbound forward listener.
+                    let routed_to_worker = port_router.has_route(dst_port);
+
+                    if routed_to_worker {
+                        // Cross-worker loopback: create a TCP pair.
+                        // One end stays here (as a ready host stream for
+                        // promote_established), the other end is routed
+                        // to the target worker.
+                        match create_tcp_pair() {
+                            Ok((local_end, remote_end)) => {
+                                let guest_ip = Ipv4Addr::from(dst_ip);
+                                if port_router.try_route(dst_port, guest_ip, remote_end).is_some() {
+                                    warn!("port_router rejected routed stream for port {dst_port}");
                                     suppress_from_smoltcp = true;
+                                } else {
+                                    local_end.set_nonblocking(true).ok();
+                                    ready_host_streams.insert(
+                                        flow_key,
+                                        (local_end, Instant::now()),
+                                    );
+                                    ensure_listen_socket(
+                                        &mut sockets,
+                                        &mut listen_sockets,
+                                        &mut accepting_sockets,
+                                        dest_ipv4,
+                                        dst_port,
+                                    );
+                                    debug!(
+                                        "cross-worker loopback: SYN {src_ip:?}:{src_port} → BROKER:{dst_port}, TCP pair created"
+                                    );
                                 }
                             }
+                            Err(e) => {
+                                warn!("failed to create TCP pair for cross-worker loopback: {e}");
+                                suppress_from_smoltcp = true;
+                            }
                         }
+                    } else if local_services.get(dst_port).is_some() {
+                        // Local service — create listen socket, let SYN through.
+                        ensure_listen_socket(
+                            &mut sockets,
+                            &mut listen_sockets,
+                            &mut accepting_sockets,
+                            dest_ipv4,
+                            dst_port,
+                        );
                     } else {
-                        // No service and no inbound forward — drop SYN.
-                        debug!("no local service on port {dst_port}, dropping SYN");
+                        // No service, no worker — drop SYN.
+                        debug!("no local service or worker on port {dst_port}, dropping SYN");
                         suppress_from_smoltcp = true;
                     }
                 } else {
@@ -1221,6 +1332,8 @@ fn run_inner(
                 let session_slots = Arc::clone(&session_slots);
                 let sandbox_policy = sandbox_policy.clone();
                 let audit_log = audit_log.clone();
+                let port_router = Arc::clone(&port_router);
+                let (inbound_tx, inbound_rx) = std::sync::mpsc::channel::<RoutedStream>();
                 std::thread::spawn(move || {
                     let _session_permit = session_permit;
                     if let Err(e) = send_handshake_response(&stream) {
@@ -1228,7 +1341,7 @@ fn run_inner(
                         return;
                     }
                     info!("accepted additional LBNP client, handshake complete");
-                    if let Err(e) = run_inner(stream, true, local_services, None, session_slots, sandbox_policy, audit_log, vec![]) {
+                    if let Err(e) = run_inner(stream, true, local_services, None, session_slots, sandbox_policy, audit_log, vec![], port_router, Some(inbound_rx), Some(inbound_tx)) {
                         tracing::error!("network proxy error: {e}");
                     }
                 });
@@ -1291,6 +1404,13 @@ fn run_inner(
                             fwd.guest_ip, fwd.guest_port
                         );
 
+                        // Check if a worker has registered for this port.
+                        // If so, route the stream to the worker's proxy.
+                        let stream = match port_router.try_route(fwd.guest_port, fwd.guest_ip, stream) {
+                            None => continue, // routed to worker, they handle it
+                            Some(s) => s,     // no worker, we handle it
+                        };
+
                         // Create a smoltcp TCP socket that connects to the guest.
                         let tcp_rx = smoltcp::socket::tcp::SocketBuffer::new(vec![0; SOCKET_BUFFER_SIZE]);
                         let tcp_tx = smoltcp::socket::tcp::SocketBuffer::new(vec![0; SOCKET_BUFFER_SIZE]);
@@ -1340,6 +1460,58 @@ fn run_inner(
                         break;
                     }
                 }
+            }
+        }
+
+        // Step 8d: Receive inbound streams routed to this worker by the port router.
+        if let Some(ref rx) = inbound_routed_rx {
+            while let Ok(routed) = rx.try_recv() {
+                info!(
+                    "received routed inbound stream for {}:{}",
+                    routed.guest_ip, routed.guest_port
+                );
+                routed.stream.set_nonblocking(true).ok();
+
+                // Create a smoltcp TCP socket connecting to the guest.
+                let tcp_rx = smoltcp::socket::tcp::SocketBuffer::new(vec![0; SOCKET_BUFFER_SIZE]);
+                let tcp_tx = smoltcp::socket::tcp::SocketBuffer::new(vec![0; SOCKET_BUFFER_SIZE]);
+                let mut tcp_socket = smoltcp::socket::tcp::Socket::new(tcp_rx, tcp_tx);
+                tcp_socket.set_nagle_enabled(false);
+                let handle = sockets.add(tcp_socket);
+
+                let src_port = next_inbound_src_port;
+                next_inbound_src_port = next_inbound_src_port.wrapping_add(1);
+                if next_inbound_src_port < 49152 {
+                    next_inbound_src_port = 49152;
+                }
+
+                let sock = sockets.get_mut::<smoltcp::socket::tcp::Socket>(handle);
+                let local = smoltcp::wire::IpEndpoint::new(
+                    IpAddress::Ipv4(BROKER_IP),
+                    src_port,
+                );
+                let octets = routed.guest_ip.octets();
+                let remote = smoltcp::wire::IpEndpoint::new(
+                    IpAddress::Ipv4(Ipv4Address::new(
+                        octets[0], octets[1], octets[2], octets[3],
+                    )),
+                    routed.guest_port,
+                );
+                if let Err(e) = sock.connect(iface.context(), remote, local) {
+                    error!("routed inbound: smoltcp connect failed: {e}");
+                    sockets.remove(handle);
+                    continue;
+                }
+
+                let dest = SocketAddr::V4(SocketAddrV4::new(
+                    routed.guest_ip, routed.guest_port,
+                ));
+                tcp_bridges.push(TcpBridge {
+                    smoltcp_handle: handle,
+                    host_stream: routed.stream,
+                    dest,
+                    host_eof: false,
+                });
             }
         }
 
@@ -1413,6 +1585,15 @@ fn run_inner(
     }
 
     device.send_shutdown();
+
+    // Clean up port registrations owned by this proxy.
+    for port in &registered_ports {
+        port_router.unregister(*port);
+    }
+    if !registered_ports.is_empty() {
+        info!("cleaned up {} port registrations", registered_ports.len());
+    }
+
     info!("network proxy shut down");
     Ok(())
 }
@@ -1867,6 +2048,18 @@ fn ensure_listen_socket(
 }
 
 /// Initiate a non-blocking TCP connect. Returns the IPC stream.
+/// Create a connected pair of TCP streams via a temporary localhost listener.
+/// Returns `(local_end, remote_end)` — both set to non-blocking.
+fn create_tcp_pair() -> Result<(std::net::TcpStream, std::net::TcpStream), std::io::Error> {
+    let listener = TcpListener::bind("127.0.0.1:0")?;
+    let addr = listener.local_addr()?;
+    let client = std::net::TcpStream::connect(addr)?;
+    let (server, _) = listener.accept()?;
+    client.set_nonblocking(true)?;
+    server.set_nonblocking(true)?;
+    Ok((client, server))
+}
+
 fn start_nonblocking_connect(dest: &SocketAddr) -> Result<IpcStream, std::io::Error> {
     sock_compat::start_nonblocking_connect(dest)
 }
@@ -1969,11 +2162,8 @@ fn promote_established(
     }
 
     for (handle, dest_ip, dest_port) in newly_established {
-        // For connections to BROKER_IP, first check if there's a matching
-        // host stream (e.g., hairpin from loopback redirect). If so, treat
-        // as a normal external bridge. Otherwise, try local services.
         if dest_ip == BROKER_IPV4 {
-            // Check for hairpin host stream first.
+            // Check for a ready host stream (from cross-worker loopback TCP pair).
             let socket: &tcp::Socket = sockets.get(handle);
             let remote = socket.remote_endpoint();
             let mut found_host_stream = false;
@@ -1993,7 +2183,7 @@ fn promote_established(
                         dest,
                         host_eof: false,
                     });
-                    info!("hairpin bridge created for BROKER_IP:{dest_port}");
+                    info!("cross-worker bridge created for BROKER_IP:{dest_port}");
                     found_host_stream = true;
                 }
             }

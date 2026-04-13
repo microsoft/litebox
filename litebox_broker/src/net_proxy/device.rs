@@ -65,6 +65,22 @@ impl IpcDevice {
             Err(false) => Ok(None),
         }
     }
+
+    /// Check if the staged packet is a port-listen control message (not an IP packet).
+    /// Format: [0x00, 'P', 'L', port_hi, port_lo, action]
+    /// where action: 1 = listen, 0 = unlisten.
+    /// Returns Some((port, is_listen)) if it's a control message, None otherwise.
+    pub fn take_port_listen_msg(&mut self) -> Option<(u16, bool)> {
+        let len = self.rx_len?;
+        if len >= 6 && self.rx_buf[0] == 0x00 && self.rx_buf[1] == b'P' && self.rx_buf[2] == b'L' {
+            let port = u16::from_be_bytes([self.rx_buf[3], self.rx_buf[4]]);
+            let is_listen = self.rx_buf[5] != 0;
+            self.rx_len = None; // consume the message
+            Some((port, is_listen))
+        } else {
+            None
+        }
+    }
 }
 
 /// Non-blocking receive of one framed IP packet into the provided buffer.

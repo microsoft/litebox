@@ -386,6 +386,17 @@ pub trait IPInterfaceProvider {
     /// Returns size of packet received, or a [`ReceiveError`] if unable to receive an entire
     /// packet.
     fn receive_ip_packet(&self, packet: &mut [u8]) -> Result<usize, ReceiveError>;
+
+    /// Send a port-listen control message (LBPL) to the broker to register
+    /// or unregister interest in a TCP port for inbound connections.
+    ///
+    /// The message format is: `[0x00, b'P', b'L', port_hi, port_lo, action]`
+    /// where action is 1 for listen and 0 for unlisten.
+    ///
+    /// The default implementation is a no-op (platforms without a broker).
+    fn send_port_listen_notification(&self, _port: u16, _listen: bool) -> Result<(), SendError> {
+        Ok(())
+    }
 }
 
 /// A non-exhaustive list of errors that can be thrown by [`IPInterfaceProvider::send_ip_packet`].

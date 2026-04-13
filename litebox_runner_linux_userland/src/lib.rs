@@ -2542,8 +2542,16 @@ fn fixup_env(_envp: &mut Vec<alloc::ffi::CString>) {
 
 /// Collect runner CLI flags that should be forwarded to worker host processes
 /// spawned for non-PIE child execs.
+///
+/// `--network-broker` is forwarded so each worker establishes its own IPC
+/// connection (and smoltcp stack).  The broker routes inbound connections to
+/// the correct worker via the LBPL port-registration protocol.
 fn register_worker_spawn_flags(platform: &Platform, cli_args: &CliArgs) {
     let mut flags: Vec<std::ffi::CString> = Vec::new();
+    if let Some(ref broker) = cli_args.network_broker {
+        flags.push(std::ffi::CString::new("--network-broker").unwrap());
+        flags.push(std::ffi::CString::new(broker.as_bytes()).unwrap());
+    }
     if let Some(ref broker) = cli_args.nine_p_broker {
         flags.push(std::ffi::CString::new("--nine-p-broker").unwrap());
         flags.push(std::ffi::CString::new(broker.as_bytes()).unwrap());
@@ -2552,10 +2560,6 @@ fn register_worker_spawn_flags(platform: &Platform, cli_args: &CliArgs) {
         flags.push(std::ffi::CString::new("--initial-files").unwrap());
         flags
             .push(std::ffi::CString::new(initial_files.to_str().unwrap_or("").as_bytes()).unwrap());
-    }
-    if let Some(ref broker) = cli_args.network_broker {
-        flags.push(std::ffi::CString::new("--network-broker").unwrap());
-        flags.push(std::ffi::CString::new(broker.as_bytes()).unwrap());
     }
     if let Some(ref tun) = cli_args.tun_device_name {
         flags.push(std::ffi::CString::new("--tun-device-name").unwrap());

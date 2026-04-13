@@ -4300,6 +4300,18 @@ impl litebox::platform::IPInterfaceProvider for LinuxUserland {
         }
     }
 
+    fn send_port_listen_notification(
+        &self,
+        port: u16,
+        listen: bool,
+    ) -> Result<(), litebox::platform::SendError> {
+        // LBPL control message: [0x00, 'P', 'L', port_hi, port_lo, action]
+        let port_bytes = port.to_be_bytes();
+        let msg: [u8; 6] = [0x00, b'P', b'L', port_bytes[0], port_bytes[1], listen as u8];
+        // Send through the same IPC framing as IP packets.
+        self.send_ip_packet(&msg)
+    }
+
     fn receive_ip_packet(
         &self,
         packet: &mut [u8],

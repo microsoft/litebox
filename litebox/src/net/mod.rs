@@ -112,16 +112,6 @@ where
                 Ok(()) => {}
                 Err(_) => unreachable!(),
             }
-            // Loopback address — enables connections from within the sandbox
-            // to services listening on the same sandbox (e.g., VS Code CLI's
-            // exec server, accessed via SSH dynamic port forwarding).
-            match ip_addrs.push(smoltcp::wire::IpCidr::new(
-                smoltcp::wire::IpAddress::Ipv4(smoltcp::wire::Ipv4Address::new(127, 0, 0, 1)),
-                8,
-            )) {
-                Ok(()) => {}
-                Err(_) => unreachable!(),
-            }
         });
         match interface
             .routes_mut()
@@ -1361,8 +1351,21 @@ where
             proxy.set_state(socket_channel::SocketState::Listening);
         }
 
+        // Notify the broker about the port we're listening on so it can
+        // route inbound connections to the correct worker's IPC channel.
+        let listen_port = match &socket_handle.specific {
+            ProtocolSpecific::Tcp(TcpSpecific { server_socket: Some(ss), .. }) => {
+                Some(ss.ip_listen_endpoint.port)
+            }
+            _ => None,
+        };
+        // Release locks before sending IPC (which may block briefly).
         drop(table_entry);
         drop(descriptor_table);
+
+        if let Some(port) = listen_port {
+            let _ = self.device.platform.send_port_listen_notification(port, true);
+        }
 
         self.automated_platform_interaction(PollDirection::Ingress);
         Ok(())
