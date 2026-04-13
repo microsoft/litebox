@@ -603,9 +603,9 @@ fi
 echo "Found existing installation at ${VSCODE_AGENT_FOLDER}..."
 
 # Start the VS Code CLI server.
-# Use fixed port 9100 — loopback connections (from SSH direct-tcpip) are
-# redirected through the broker's hairpin port forwarding, which needs
-# a known port.
+# Note: --parent-process-id is omitted because litebox's delayed-fork
+# migrates the CLI to a separate worker process where the sh wrapper's
+# PID is not visible. The CLI would exit thinking its parent died.
 echo "Starting VS Code CLI..."
 export VSCODE_AGENT_FOLDER
 CLI_LOG_FILE="${VSCODE_AGENT_FOLDER}/.cli.${COMMIT_ID}.log"
@@ -615,8 +615,7 @@ chmod 600 "$CLI_LOG_FILE"
 
 VSCODE_CLI_REQUIRE_TOKEN=${TOKEN} "$CLI_PATH" command-shell \
     --cli-data-dir "$VSCODE_AGENT_FOLDER/cli" \
-    --parent-process-id $$ \
-    --on-host 127.0.0.1 --on-port 9100 > "$CLI_LOG_FILE" 2>&1 < /dev/null &
+    --on-host 0.0.0.0 --on-port 9100 > "$CLI_LOG_FILE" 2>&1 < /dev/null &
 CLI_PID=$!
 echo "Spawned remote CLI: $CLI_PID"
 
