@@ -392,16 +392,17 @@ impl Drop for BrokerProcess {
 
 /// Default sandbox policy applied when no `--policy` file is specified.
 ///
-/// - Filesystem: deny access to secrets (private keys, host shadow)
+/// - Filesystem: deny access to secrets (`.ssh`, private keys, host shadow)
 /// - Network: deny all outbound connections
 ///
-/// Note: `/etc/passwd` and `.ssh/authorized_keys` are NOT denied — they
-/// are needed for SSH authentication inside the sandbox.
+/// Note: `/etc/passwd` and `/etc/group` are NOT denied — they are
+/// world-readable on any Linux system and needed by `getpwnam()` (dropbear).
+/// Only `/etc/shadow` (password hashes) is blocked.
 const DEFAULT_POLICY: &str = r#"{
     "filesystem": {
         "allow_read": [],
         "allow_write": ["/tmp/**", "**/workspace/**", "**/workspaces/**", "**/.vscode-server/**"],
-        "deny": ["**/shadow", "**/id_rsa", "**/id_ed25519"]
+        "deny": ["**/.ssh/**", "**/shadow", "**/id_rsa*", "**/id_ed25519*"]
     },
     "network": {
         "deny_all": true,
@@ -732,9 +733,6 @@ fn vscode_server(cli: &Cli, audit_log_file: Option<&std::path::Path>) -> anyhow:
     eprintln!("        User root");
     eprintln!("        StrictHostKeyChecking no");
     eprintln!("        UserKnownHostsFile /dev/null");
-    eprintln!();
-    eprintln!("  Add to VS Code settings.json:");
-    eprintln!(r#"    "remote.SSH.remotePlatform": {{ "litebox": "linux" }}"#);
     eprintln!();
     eprintln!("  Then in VS Code:");
     eprintln!("    Remote-SSH → Connect to Host → litebox");

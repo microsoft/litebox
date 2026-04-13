@@ -365,25 +365,6 @@ cat > "$OUTPUT/etc/shells" << 'EOF'
 /usr/bin/bash
 EOF
 
-# SSH authorized keys: copy host user's public keys so VS Code
-# Remote-SSH can connect without repeated password prompts.
-mkdir -p "$OUTPUT/root/.ssh"
-chmod 700 "$OUTPUT/root/.ssh"
-AUTH_KEYS="$OUTPUT/root/.ssh/authorized_keys"
-: > "$AUTH_KEYS"
-for keyfile in ~/.ssh/id_ed25519.pub ~/.ssh/id_rsa.pub ~/.ssh/id_ecdsa.pub; do
-    if [ -f "$keyfile" ]; then
-        cat "$keyfile" >> "$AUTH_KEYS"
-        echo "  Added $(basename "$keyfile") to authorized_keys"
-    fi
-done
-if [ -s "$AUTH_KEYS" ]; then
-    chmod 600 "$AUTH_KEYS"
-else
-    echo "  No SSH public keys found — password auth will be used"
-    rm -f "$AUTH_KEYS"
-fi
-
 # OS release info (VS Code bootstrap reads this to detect platform)
 cat > "$OUTPUT/etc/os-release" << 'EOF'
 PRETTY_NAME="Ubuntu 24.04 LTS (LiteBox)"
