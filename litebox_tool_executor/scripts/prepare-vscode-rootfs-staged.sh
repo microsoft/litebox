@@ -473,6 +473,18 @@ if [ -n "$VSCODE_COMMIT" ] && echo "$VSCODE_COMMIT" | grep -qE '^[a-f0-9]{40}$';
             tar -xf "$TARBALL" -C "$SERVER_DIR" --strip-components=1
             if [ -f "$SERVER_DIR/node" ]; then
                 echo "  Installed VS Code Server ($(find "$SERVER_DIR" -type f | wc -l) files)"
+                # Patch code-server launch scripts to avoid nested $(readlink -f)
+                # subshells which can fail in litebox's delayed-fork.
+                # Replace: ROOT="$(dirname "$(dirname "$(readlink -f "$0")")")"
+                # With:    SCRIPT_DIR="$(dirname "$0")"; ROOT="$(dirname "$SCRIPT_DIR")"
+                # This is version-independent — the pattern is the same across versions.
+                for launcher in "$SERVER_DIR"/bin/code-server*; do
+                    [ -f "$launcher" ] || continue
+                    if grep -q 'readlink -f' "$launcher"; then
+                        sed -i '/^ROOT=/c\SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"; ROOT="$(dirname "$SCRIPT_DIR")"' "$launcher"
+                        echo "  Patched $(basename "$launcher") to avoid readlink -f"
+                    fi
+                done
             else
                 echo "  WARNING: Server extraction failed"
                 rm -rf "$SERVER_DIR"
