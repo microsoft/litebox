@@ -1545,8 +1545,7 @@ impl<FS: ShimFS> Task<FS> {
         let Ok(sockfd) = u32::try_from(fd) else {
             return Err(Errno::EBADF);
         };
-        let msg =
-            ConstPtr::<litebox_common_linux::UserMsgHdr<Platform>>::from_usize(msg_ptr.as_usize())
+        let msg = msg_ptr
                 .read_at_offset(0)
                 .ok_or(Errno::EFAULT)?;
 
@@ -1557,7 +1556,7 @@ impl<FS: ShimFS> Task<FS> {
         let msg_controllen = msg.msg_controllen;
 
         if msg_controllen != 0 {
-            unimplemented!("ancillary data is not supported");
+            log_unsupported!("ancillary data is not supported");
         }
         if msg_iovlen == 0 || msg_iovlen > 1024 {
             return Err(Errno::EINVAL);
