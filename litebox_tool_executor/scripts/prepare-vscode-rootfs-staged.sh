@@ -454,6 +454,39 @@ else
 fi
 
 # ============================================================
+echo "=== Phase 8b: Pre-install VS Code Server ==="
+# The CLI (exec server) downloads and extracts the VS Code Server
+# (Node.js, ~91MB) on first connection. Pre-install it so the CLI
+# finds it already present. Without this, tar extraction inside
+# litebox can fail due to fork limitations.
+if [ -n "$VSCODE_COMMIT" ] && echo "$VSCODE_COMMIT" | grep -qE '^[a-f0-9]{40}$'; then
+    SERVER_DIR="$OUTPUT/root/.vscode-server/cli/servers/Stable-${VSCODE_COMMIT}/server"
+    if [ -d "$SERVER_DIR" ] && [ -f "$SERVER_DIR/node" ]; then
+        echo "  VS Code Server already installed"
+    else
+        SERVER_URL="https://update.code.visualstudio.com/commit:${VSCODE_COMMIT}/server-linux-x64/stable"
+        echo "  Downloading VS Code Server from $SERVER_URL ..."
+        TARBALL="/tmp/vscode-server-$$.tar.gz"
+        if wget -q -O "$TARBALL" "$SERVER_URL" 2>/dev/null || curl -sL -o "$TARBALL" "$SERVER_URL" 2>/dev/null; then
+            mkdir -p "$SERVER_DIR"
+            # The tarball contains a top-level vscode-server-linux-x64/ directory.
+            tar -xf "$TARBALL" -C "$SERVER_DIR" --strip-components=1
+            if [ -f "$SERVER_DIR/node" ]; then
+                echo "  Installed VS Code Server ($(find "$SERVER_DIR" -type f | wc -l) files)"
+            else
+                echo "  WARNING: Server extraction failed"
+                rm -rf "$SERVER_DIR"
+            fi
+            rm -f "$TARBALL"
+        else
+            echo "  WARNING: Server download failed"
+        fi
+    fi
+else
+    echo "  Skipping (no VS Code commit detected)"
+fi
+
+# ============================================================
 echo "=== Phase 9: Install VS Code bootstrap sh wrapper ==="
 # VS Code sends 'ssh litebox sh' and pipes a bootstrap script.
 # The bootstrap script uses $(cmd | pipe) which deadlocks in litebox.
