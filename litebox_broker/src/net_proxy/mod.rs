@@ -733,6 +733,7 @@ pub fn run_with_session_slots(
     inbound_forwards: Vec<(u16, Ipv4Addr, u16)>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let port_router = Arc::new(PortRouter::new());
+    let (init_routed_tx, init_routed_rx) = std::sync::mpsc::channel::<RoutedStream>();
     run_inner(
         ipc_fd,
         handshake_done,
@@ -743,8 +744,8 @@ pub fn run_with_session_slots(
         audit_log,
         inbound_forwards,
         port_router,
-        None, // no inbound routed receiver for the init proxy
-        None, // no inbound routed sender for the init proxy
+        Some(init_routed_rx),
+        Some(init_routed_tx),
     )
 }
 

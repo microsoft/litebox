@@ -87,6 +87,7 @@ pub fn run_coordinator(self_exe: &str) -> Vec<TestResult> {
     let expected_agents = 6;
     let mut peers: Vec<AgentReady> = Vec::new();
 
+    // Poll for connections with short sleeps between attempts.
     listener
         .set_nonblocking(true)
         .expect("set_nonblocking failed");
@@ -98,20 +99,22 @@ pub fn run_coordinator(self_exe: &str) -> Vec<TestResult> {
     {
         match listener.accept() {
             Ok((stream, _)) => {
-                let reader = BufReader::new(&stream);
-                for line in reader.lines() {
-                    let line = match line {
-                        Ok(l) => l,
-                        Err(_) => break,
-                    };
-                    if let Ok(ready) = serde_json::from_str::<AgentReady>(&line) {
+                // Read exactly one line per connection.
+                stream
+                    .set_read_timeout(Some(std::time::Duration::from_millis(500)))
+                    .ok();
+                let mut reader = BufReader::new(&stream);
+                let mut line = String::new();
+                if reader.read_line(&mut line).unwrap_or(0) > 0 {
+                    if let Ok(ready) = serde_json::from_str::<AgentReady>(line.trim()) {
                         eprintln!("[coord] agent {} registered on port {}", ready.id, ready.port);
                         peers.push(ready);
+                        continue; // immediately try next accept
                     }
                 }
             }
             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                std::thread::sleep(std::time::Duration::from_millis(200));
+                std::thread::sleep(std::time::Duration::from_millis(50));
             }
             Err(e) => {
                 eprintln!("[coord] accept error: {e}");
@@ -160,7 +163,12 @@ pub fn run_coordinator(self_exe: &str) -> Vec<TestResult> {
     while std::time::Instant::now() < deadline {
         match listener.accept() {
             Ok((stream, _)) => {
+                stream
+                    .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+                    .ok();
                 let reader = BufReader::new(&stream);
+                // Read all available lines (agent sends multiple results
+                // then closes the connection).
                 for line in reader.lines() {
                     let line = match line {
                         Ok(l) => l,
@@ -196,11 +204,29 @@ pub fn run_coordinator(self_exe: &str) -> Vec<TestResult> {
 
 /// Run as an agent node in the tree.
 pub fn run_agent(self_exe: &str, id: &str, coord_port: u16) {
+    eprintln!("[agent-{id}] starting, coord_port={coord_port}");
+
+    // Write a marker to prove this agent executed.
+    let _ = std::fs::create_dir_all("/shared");
+    let _ = std::fs::write(
+        format!("/shared/agent-{id}-alive.txt"),
+        format!("ALIVE_{id}"),
+    );
+
     let port = agent_port(id);
 
     // Listen on our assigned port.
-    let listener = TcpListener::bind(format!("0.0.0.0:{port}"))
-        .unwrap_or_else(|e| panic!("agent {id}: bind port {port}: {e}"));
+    eprintln!("[agent-{id}] binding port {port}...");
+    let listener = match TcpListener::bind(format!("0.0.0.0:{port}")) {
+        Ok(l) => {
+            eprintln!("[agent-{id}] bound port {port}");
+            l
+        }
+        Err(e) => {
+            eprintln!("[agent-{id}] FATAL: bind port {port}: {e}");
+            return;
+        }
+    };
 
     // Spawn our children (if any).
     let children = tree_children(id);
@@ -209,13 +235,28 @@ pub fn run_agent(self_exe: &str, id: &str, coord_port: u16) {
     }
 
     // Register with coordinator.
-    if let Ok(mut stream) = TcpStream::connect(format!("127.0.0.1:{coord_port}")) {
-        let ready = AgentReady {
-            id: id.to_string(),
-            pid: process::id(),
-            port,
-        };
-        let _ = writeln!(stream, "{}", serde_json::to_string(&ready).unwrap());
+    eprintln!("[agent-{id}] connecting to coordinator at 127.0.0.1:{coord_port}...");
+    match TcpStream::connect_timeout(
+        &format!("127.0.0.1:{coord_port}").parse().unwrap(),
+        std::time::Duration::from_secs(5),
+    ) {
+        Ok(mut stream) => {
+            let ready = AgentReady {
+                id: id.to_string(),
+                pid: process::id(),
+                port,
+            };
+            let msg = serde_json::to_string(&ready).unwrap();
+            eprintln!("[agent-{id}] sending registration: {msg}");
+            let _ = writeln!(stream, "{msg}");
+            let _ = stream.flush();
+            drop(stream);
+            eprintln!("[agent-{id}] registered with coordinator");
+        }
+        Err(e) => {
+            eprintln!("[agent-{id}] FATAL: can't reach coordinator at 127.0.0.1:{coord_port}: {e}");
+            return;
+        }
     }
 
     // Wait for "run tests" command.
@@ -247,8 +288,11 @@ fn spawn_child(self_exe: &str, child_id: &str, coord_port: u16) -> bool {
         .stderr(process::Stdio::inherit())
         .spawn();
     match result {
-        Ok(_child) => {
-            eprintln!("[{child_id}] spawned");
+        Ok(child) => {
+            eprintln!("[{child_id}] spawned (pid {:?})", child.id());
+            // Don't drop the child handle — keep it alive so the worker
+            // process isn't orphaned.
+            std::mem::forget(child);
             true
         }
         Err(e) => {

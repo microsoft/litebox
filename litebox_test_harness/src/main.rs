@@ -122,6 +122,66 @@ fn main() {
                 .unwrap_or(0);
             std::process::exit(code);
         }
+        "fork-diag" => {
+            // Fork+exec a child that runs the "diag" subcommand.
+            // This tests whether a worker process can execute and report.
+            eprintln!("[fork-diag] spawning child with diag...");
+            match std::process::Command::new(self_exe)
+                .arg("diag")
+                .stdout(std::process::Stdio::inherit())
+                .stderr(std::process::Stdio::inherit())
+                .output()
+            {
+                Ok(output) => {
+                    eprintln!("[fork-diag] child exit={}", output.status);
+                }
+                Err(e) => {
+                    eprintln!("[fork-diag] spawn failed: {e}");
+                }
+            }
+        }
+        "diag" => {
+            // Diagnostic: report what works in this process.
+            // Used to debug worker process capabilities.
+            eprintln!("[diag] pid={} args={:?}", std::process::id(), &args[1..]);
+            eprintln!("[diag] cwd={:?}", std::env::current_dir());
+
+            // Test file write
+            match std::fs::write("/shared/diag-test.txt", "DIAG_OK") {
+                Ok(()) => eprintln!("[diag] file write: OK"),
+                Err(e) => eprintln!("[diag] file write: FAIL ({e})"),
+            }
+
+            // Test TCP connect to localhost:9000 (coordinator)
+            match std::net::TcpStream::connect_timeout(
+                &"127.0.0.1:9000".parse().unwrap(),
+                std::time::Duration::from_secs(3),
+            ) {
+                Ok(_) => eprintln!("[diag] TCP connect 127.0.0.1:9000: OK"),
+                Err(e) => eprintln!("[diag] TCP connect 127.0.0.1:9000: FAIL ({e})"),
+            }
+
+            // Test TCP bind
+            match std::net::TcpListener::bind("0.0.0.0:9099") {
+                Ok(_) => eprintln!("[diag] TCP bind 0.0.0.0:9099: OK"),
+                Err(e) => eprintln!("[diag] TCP bind 0.0.0.0:9099: FAIL ({e})"),
+            }
+
+            // Test fork+exec of self
+            match std::process::Command::new(&args[0])
+                .arg("echo-test")
+                .stdout(std::process::Stdio::piped())
+                .output()
+            {
+                Ok(out) => {
+                    let s = String::from_utf8_lossy(&out.stdout);
+                    eprintln!("[diag] fork+exec self: exit={} out={}", out.status, s.trim());
+                }
+                Err(e) => eprintln!("[diag] fork+exec self: FAIL ({e})"),
+            }
+
+            eprintln!("[diag] done");
+        }
         other => {
             eprintln!("unknown command: {other}");
             eprintln!("usage: litebox-test-agent <spawn-tree|agent|echo-test|...>");
