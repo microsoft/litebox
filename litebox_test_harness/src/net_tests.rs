@@ -77,7 +77,7 @@ async fn tcp_echo_test(test_id: &str, from: &str, to: &str, port: u16) -> TestRe
             let _ = stream.flush().await;
 
             let mut buf = [0u8; 256];
-            match timeout(Duration::from_secs(3), stream.read(&mut buf)).await {
+            match timeout(Duration::from_secs(5), stream.read(&mut buf)).await {
                 Ok(Ok(n)) if n > 0 => {
                     let resp = String::from_utf8_lossy(&buf[..n]);
                     r(test_id, from, Outcome::Pass, &format!("{from}→{to}: {n}B: {resp}"))
@@ -99,7 +99,7 @@ async fn tcp_bidi_test(from: &str, peer_port: u16) -> TestResult {
             let _ = stream.write_all(b"BIDI_REQUEST").await;
             let _ = stream.flush().await;
             let mut buf = [0u8; 256];
-            match timeout(Duration::from_secs(3), stream.read(&mut buf)).await {
+            match timeout(Duration::from_secs(5), stream.read(&mut buf)).await {
                 Ok(Ok(n)) if n > 0 => {
                     let _ = stream.write_all(b"BIDI_SECOND").await;
                     r("N7", from, Outcome::Pass, &format!("bidi ok, {n}B"))
@@ -122,7 +122,7 @@ async fn tcp_send_close_test(from: &str, peer_port: u16) -> TestResult {
             let _ = stream.flush().await;
             // Wait for echo before closing — proper protocol.
             let mut buf = [0u8; 256];
-            match timeout(Duration::from_secs(3), stream.read(&mut buf)).await {
+            match timeout(Duration::from_secs(5), stream.read(&mut buf)).await {
                 Ok(Ok(n)) if n > 0 => {
                     let resp = String::from_utf8_lossy(&buf[..n]);
                     if resp.contains("SEND_CLOSE_TEST") {

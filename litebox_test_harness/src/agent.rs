@@ -10,7 +10,7 @@
 
 use crate::protocol::{AgentReady, Command, Outcome, TestResult};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
-use tokio::net::TcpListener;
+use tokio::net::{TcpListener, TcpStream};
 use tokio::time::Duration;
 
 fn tree_children(id: &str) -> &'static [&'static str] {
@@ -168,14 +168,52 @@ async fn run_node(
         }
     }
 
-    // Wait for each child to write {"ready":true}.
+    // Wait for each child to write {"ready":true}, then verify
+    // the child is reachable through the network. This ensures the
+    // LBPL port registration has propagated through the broker before
+    // we signal our own parent that we're ready.
     for (child_id, reader) in &mut child_stdouts {
         let mut line = String::new();
         match tokio::time::timeout(Duration::from_secs(15), reader.read_line(&mut line)).await {
             Ok(Ok(n)) if n > 0 && line.contains("\"ready\":true") => {
-                eprintln!("[{id}] {child_id} ready");
+                eprintln!("[{id}] {child_id} signaled ready, verifying reachable...");
             }
-            _ => eprintln!("[{id}] {child_id} not ready (timeout or error)"),
+            _ => {
+                eprintln!("[{id}] {child_id} not ready (timeout or error)");
+                continue;
+            }
+        }
+        // Verify network path works before propagating readiness up.
+        let port = agent_port(child_id);
+        let addr = format!("127.0.0.1:{port}");
+        let mut verified = false;
+        for _attempt in 0..50 {
+            match tokio::time::timeout(
+                Duration::from_millis(500),
+                async {
+                    let mut stream = TcpStream::connect(&addr).await?;
+                    stream.write_all(b"VERIFY").await?;
+                    stream.flush().await?;
+                    let mut buf = [0u8; 6];
+                    stream.read_exact(&mut buf).await?;
+                    Ok::<_, std::io::Error>(())
+                },
+            )
+            .await
+            {
+                Ok(Ok(())) => {
+                    verified = true;
+                    break;
+                }
+                _ => {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+            }
+        }
+        if verified {
+            eprintln!("[{id}] {child_id} verified reachable");
+        } else {
+            eprintln!("[{id}] WARNING: {child_id} not reachable");
         }
     }
 
