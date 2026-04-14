@@ -864,55 +864,30 @@ impl WriteEnd<DatagramMessage> {
     }
 }
 impl ReadEnd<DatagramMessage> {
-    /// Attempts to read datagram messages without blocking.
+    /// Attempts to read a single datagram message without blocking.
     ///
-    /// Reads multiple messages from the same source address until the buffer
-    /// is full or a message from a different source is encountered.
+    /// Reads exactly one message, preserving message boundaries. If the buffer
+    /// is smaller than the message, the excess data is discarded (truncated).
+    /// Returns the original message size (which may exceed `buf.len()`).
     fn try_read(
         &self,
-        mut buf: &mut [u8],
-        source_addr: Option<&mut Option<UnixSocketAddr>>,
+        buf: &mut [u8],
+        mut source_addr: Option<&mut Option<UnixSocketAddr>>,
     ) -> Result<usize, TryOpError<Errno>> {
-        let mut src = None;
-        let mut total_read = 0;
-        let mut stop = false;
-        while !buf.is_empty() {
-            let n = match self.peek_and_consume_one(|msg| {
-                if src.as_ref().is_some_and(|addr| *addr != msg.source) {
-                    stop = true;
-                    return Ok((false, 0));
-                }
-                if src.is_none() {
-                    src.replace(msg.source.clone());
-                }
-                if buf.len() >= msg.data.len() {
-                    buf[..msg.data.len()].copy_from_slice(&msg.data);
-                    Ok((true, msg.data.len()))
-                } else {
-                    buf.copy_from_slice(&msg.data[..buf.len()]);
-                    msg.data = msg.data.split_off(buf.len());
-                    Ok((false, buf.len()))
-                }
-            }) {
-                Ok(0) if stop => break,
-                Ok(n) => n,
-                Err(e) => {
-                    if total_read > 0 {
-                        break;
-                    }
-                    return match e {
-                        Errno::EAGAIN => Err(TryOpError::TryAgain),
-                        other => Err(TryOpError::Other(other)),
-                    };
-                }
-            };
-            total_read += n;
-            buf = &mut buf[n..];
-        }
-        if let (Some(src), Some(source_addr)) = (src, source_addr) {
-            *source_addr = Some(src);
-        }
-        Ok(total_read)
+        let msg_len = self.peek_and_consume_one(|msg| {
+            let copy_len = buf.len().min(msg.data.len());
+            buf[..copy_len].copy_from_slice(&msg.data[..copy_len]);
+            if let Some(source_addr) = source_addr.as_deref_mut() {
+                *source_addr = Some(msg.source.clone());
+            }
+            // Always consume the entire message to preserve boundaries.
+            Ok((true, msg.data.len()))
+        })
+        .map_err(|e| match e {
+            Errno::EAGAIN => TryOpError::TryAgain,
+            other => TryOpError::Other(other),
+        })?;
+        Ok(msg_len)
     }
 }
 

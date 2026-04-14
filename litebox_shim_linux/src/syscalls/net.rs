@@ -1522,11 +1522,6 @@ impl<FS: ShimFS> Task<FS> {
             )?
         };
 
-        if !flags.contains(ReceiveFlags::TRUNC) {
-            let len = buf.len();
-            assert!(size <= len, "{size} should be smaller than {len}");
-        }
-
         if let (Some(source_addr), Some(addr)) = (source_addr, addr) {
             *source_addr = Some(addr);
         }
@@ -1540,7 +1535,7 @@ impl<FS: ShimFS> Task<FS> {
         msg_ptr: MutPtr<litebox_common_linux::UserMsgHdr<Platform>>,
         flags: ReceiveFlags,
     ) -> Result<usize, Errno> {
-        const MAX_LEN: usize = 4096;
+        const MAX_LEN: usize = 65536;
 
         let Ok(sockfd) = u32::try_from(fd) else {
             return Err(Errno::EBADF);
@@ -1562,42 +1557,59 @@ impl<FS: ShimFS> Task<FS> {
 
         let iovs = msg_iov.to_owned_slice(msg_iovlen).ok_or(Errno::EFAULT)?;
 
-        // Receive into the first non-empty iov buffer.
+        // Compute total buffer capacity across all non-empty iovecs, capped at MAX_LEN.
+        let total_iov_capacity: usize = iovs
+            .iter()
+            .map(|iov| iov.iov_len)
+            .fold(0usize, |acc, len| acc.saturating_add(len))
+            .min(MAX_LEN);
+
+        if total_iov_capacity == 0 {
+            return Ok(0);
+        }
+
+        // Perform a single recv into a contiguous buffer.
         let want_source = msg_name.as_usize() != 0;
         let mut source_addr = None;
-        let mut total_received = 0usize;
         let mut ret_flags = ReceiveFlags::empty();
 
+        // Heap-allocate the recv buffer to avoid stack overflow for large iovecs.
+        let mut buffer = alloc::vec![0u8; total_iov_capacity];
+        let recv_buf = &mut buffer[..];
+        let size = self.do_recvfrom(
+            sockfd,
+            recv_buf,
+            flags,
+            if want_source {
+                Some(&mut source_addr)
+            } else {
+                None
+            },
+        )?;
+
+        // Set MSG_TRUNC if the received message was larger than the total buffer.
+        if size > total_iov_capacity {
+            ret_flags |= ReceiveFlags::TRUNC;
+        }
+
+        // Scatter the received data across iovecs sequentially.
+        let data_to_copy = size.min(total_iov_capacity);
+        let mut offset = 0usize;
         for iov in &iovs {
+            if offset >= data_to_copy {
+                break;
+            }
             if iov.iov_len == 0 {
                 continue;
             }
-            let recv_len = iov.iov_len.min(MAX_LEN);
-            let mut buffer = [0u8; MAX_LEN];
-            let recv_buf = &mut buffer[..recv_len];
-            let size = self.do_recvfrom(
-                sockfd,
-                recv_buf,
-                flags,
-                if want_source && source_addr.is_none() {
-                    Some(&mut source_addr)
-                } else {
-                    None
-                },
-            )?;
-            let copy_len = size.min(iov.iov_len);
+            let chunk = (data_to_copy - offset).min(iov.iov_len);
             iov.iov_base
-                .copy_from_slice(0, &recv_buf[..copy_len.min(recv_len)])
+                .copy_from_slice(0, &recv_buf[offset..offset + chunk])
                 .ok_or(Errno::EFAULT)?;
-            total_received += size;
-            // Set MSG_TRUNC if the received datagram was larger than the buffer.
-            if size > iov.iov_len {
-                ret_flags |= ReceiveFlags::TRUNC;
-            }
-            // Unlike sendmsg which sends all iovecs, recvmsg fills until one
-            // recv returns — a single datagram/message is received.
-            break;
+            offset += chunk;
         }
+
+        let total_received = size;
 
         // Write back source address if requested.
         if want_source {
