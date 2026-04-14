@@ -682,6 +682,25 @@ impl<FS: ShimFS> Task<FS> {
         if path.to_str().ok() == Some("/proc/self/maps") {
             return self.open_synthetic_proc_text(flags, self.proc_self_maps_contents());
         }
+        // /dev/fd/N and /proc/self/fd/N — open is equivalent to dup(N).
+        // Used by bash process substitution: cat <(echo hello) passes
+        // /dev/fd/63 as a filename; opening it should dup the pipe fd.
+        if let Some(fd_num) = path
+            .to_str()
+            .ok()
+            .and_then(|s| {
+                s.strip_prefix("/dev/fd/")
+                    .or_else(|| s.strip_prefix("/proc/self/fd/"))
+            })
+            .and_then(|n| n.parse::<i32>().ok())
+        {
+            let dup_flags = if flags.contains(OFlags::CLOEXEC) {
+                Some(OFlags::CLOEXEC)
+            } else {
+                None
+            };
+            return self.sys_dup(fd_num, None, dup_flags);
+        }
         let path = if path.to_str().ok() == Some("/proc/self/exe") {
             let exe = self.fs.borrow().exe_path.read().clone();
             if exe.is_empty() {
@@ -2670,7 +2689,12 @@ impl<FS: ShimFS> Task<FS> {
             }
             return Ok(exe);
         }
-        if let Some(stripped) = fullpath.strip_prefix("/proc/self/fd/") {
+        // Handle both /proc/self/fd/N and /dev/fd/N (the latter is a
+        // symlink to the former on real Linux).
+        let fd_suffix = fullpath
+            .strip_prefix("/proc/self/fd/")
+            .or_else(|| fullpath.strip_prefix("/dev/fd/"));
+        if let Some(stripped) = fd_suffix {
             let fd = stripped.parse::<u32>().map_err(|_| Errno::EINVAL)?;
             if let 0..=2 = fd {
                 let raw_fd = usize::try_from(fd).map_err(|_| Errno::EBADF)?;
@@ -3208,6 +3232,19 @@ impl<FS: ShimFS> Task<FS> {
             }
             let status = self.files.borrow().fs.file_status(exe.as_str())?;
             return Ok(FileStat::from(status));
+        }
+        // /dev/fd/N and /proc/self/fd/N — stat the underlying fd (like fstat).
+        if let Some(fd_num) = normalized_path
+            .as_str()
+            .strip_prefix("/dev/fd/")
+            .or_else(|| normalized_path.as_str().strip_prefix("/proc/self/fd/"))
+            .and_then(|n| n.parse::<i32>().ok())
+        {
+            if !follow_symlink {
+                // lstat: return a synthetic symlink entry.
+                return Ok(synthetic_symlink_stat(0));
+            }
+            return self.sys_fstat(fd_num);
         }
         let fs_walks_follow_symlinks = self.files.borrow().fs.walks_follow_symlinks();
         if !follow_symlink && fs_walks_follow_symlinks {
