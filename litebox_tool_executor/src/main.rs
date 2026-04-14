@@ -406,7 +406,11 @@ const DEFAULT_POLICY: &str = r#"{
     },
     "network": {
         "deny_all": true,
-        "allow_connect": []
+        "allow_connect": [
+            "update.code.visualstudio.com:443",
+            "*.vo.msecnd.net:443",
+            "*.visualstudio.com:443"
+        ]
     }
 }"#;
 

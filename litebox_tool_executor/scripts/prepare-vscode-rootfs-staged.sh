@@ -293,6 +293,11 @@ mkdir -p "$OUTPUT/usr/libexec"
 ln -sf /usr/lib/openssh/sftp-server "$OUTPUT/usr/libexec/sftp-server"
 echo "  Symlinked /usr/libexec/sftp-server → /usr/lib/openssh/sftp-server"
 
+# Symlink sftp-server where Windows OpenSSH scp expects it (/usr/lib/sftp-server).
+# Windows scp.exe passes '-D /usr/lib/sftp-server' by default.
+ln -sf /usr/lib/openssh/sftp-server "$OUTPUT/usr/lib/sftp-server"
+echo "  Symlinked /usr/lib/sftp-server → /usr/lib/openssh/sftp-server"
+
 # Generate host key (dropbear format)
 mkdir -p "$OUTPUT/etc/dropbear"
 if [ ! -f "$OUTPUT/etc/dropbear/dropbear_ed25519_host_key" ]; then
