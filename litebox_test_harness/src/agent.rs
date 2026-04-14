@@ -214,24 +214,59 @@ async fn agent_loop(self_exe: &str) {
                     .await;
                     continue;
                 }
-                match tokio::process::Command::new(&args[0])
+                let mut child = match tokio::process::Command::new(&args[0])
                     .args(&args[1..])
                     .stdout(std::process::Stdio::piped())
                     .stderr(std::process::Stdio::piped())
-                    .output()
-                    .await
+                    .spawn()
                 {
-                    Ok(output) => {
+                    Ok(c) => c,
+                    Err(e) => {
+                        respond(&Response::Error {
+                            error: format!("exec spawn: {e}"),
+                        })
+                        .await;
+                        continue;
+                    }
+                };
+                let mut child_stdout = child.stdout.take().unwrap();
+                let mut child_stderr = child.stderr.take().unwrap();
+
+                // Collect stdout/stderr and wait, with timeout for deadlock detection.
+                let result = tokio::time::timeout(Duration::from_secs(10), async {
+                    let mut out = Vec::new();
+                    let mut err = Vec::new();
+                    let (r1, r2, status) = tokio::join!(
+                        tokio::io::AsyncReadExt::read_to_end(&mut child_stdout, &mut out),
+                        tokio::io::AsyncReadExt::read_to_end(&mut child_stderr, &mut err),
+                        child.wait(),
+                    );
+                    let _ = r1;
+                    let _ = r2;
+                    (out, err, status)
+                })
+                .await;
+
+                match result {
+                    Ok((out, err, Ok(status))) => {
                         respond(&Response::ExecResult {
-                            exit_code: output.status.code().unwrap_or(-1),
-                            stdout: String::from_utf8_lossy(&output.stdout).trim().to_string(),
-                            stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
+                            exit_code: status.code().unwrap_or(-1),
+                            stdout: String::from_utf8_lossy(&out).trim().to_string(),
+                            stderr: String::from_utf8_lossy(&err).trim().to_string(),
                         })
                         .await;
                     }
-                    Err(e) => {
+                    Ok((_, _, Err(e))) => {
                         respond(&Response::Error {
-                            error: format!("exec: {e}"),
+                            error: format!("exec wait: {e}"),
+                        })
+                        .await;
+                    }
+                    Err(_) => {
+                        // Timed out — kill the child and report timeout.
+                        let _ = child.kill().await;
+                        respond(&Response::ExecTimeout {
+                            stderr: "process timed out after 10s (likely deadlocked)".to_string(),
                         })
                         .await;
                     }

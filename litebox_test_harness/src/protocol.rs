@@ -98,6 +98,10 @@ pub enum Response {
         stderr: String,
     },
 
+    /// Exec timed out (likely deadlocked).
+    #[serde(rename = "exec_timeout")]
+    ExecTimeout { stderr: String },
+
     /// Error.
     #[serde(rename = "error")]
     Error { error: String },

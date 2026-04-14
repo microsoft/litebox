@@ -379,6 +379,169 @@ async fn exec_tests(r: &mut TestRunner) {
     let resp = r.send("AAA", Command::Exec { args: vec![self_exe.clone(), "exit-with".into(), "7".into()] }).await;
     let pass = matches!(&resp, Response::ExecResult { exit_code: 7, .. });
     r.record("X5.deep_exit", "AAA", pass, &format!("{resp:?}"));
+
+    // ── Delayed-fork limitation reproduction tests ──
+    // Each test runs a shell command via bash -c to exercise specific
+    // fork patterns that stress litebox's delayed-fork (vfork) architecture.
+    // Tests that deadlock will timeout after 10s and return ExecTimeout.
+
+    let bash = |cmd: &str| -> Vec<String> {
+        vec!["bash".into(), "-c".into(), cmd.into()]
+    };
+
+    // X6: Baseline — simple bash echo (fork+exec, no pipes)
+    // Expected: pass — same as X1 but through bash.
+    let resp = r.send("A", Command::Exec { args: bash("echo hello_from_bash") }).await;
+    let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout.contains("hello_from_bash"));
+    r.record("X6.bash_echo", "A", pass, &format!("{resp:?}"));
+
+    // X7: Command substitution — $(echo inner)
+    // This forks a subshell to run `echo inner`, captures its stdout.
+    // The subshell does fork+exec of echo, then the parent reads the result.
+    let resp = r.send("A", Command::Exec { args: bash("echo $(echo inner_value)") }).await;
+    let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout.contains("inner_value"));
+    r.record("X7.cmd_substitution", "A", pass, &format!("{resp:?}"));
+
+    // X8: Pipe inside command substitution — $(echo hello | cat)
+    // Known delayed-fork stress test: subshell forks twice (echo + cat),
+    // cat calls read() which is non-pre-exec, triggering delayed fork.
+    // Pipe data from echo must be bridged to the new worker for cat.
+    let resp = r.send("A", Command::Exec { args: bash("echo $(echo pipe_data | cat)") }).await;
+    let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout.contains("pipe_data"));
+    let timeout = matches!(&resp, Response::ExecTimeout { .. });
+    r.record("X8.pipe_in_subshell", "A", pass, &format!("timeout={timeout} {resp:?}"));
+
+    // X9: Process substitution — cat <(echo hello)
+    // Uses /dev/fd/N (procfs symlink to anonymous pipe). Fails because
+    // /dev/fd and /proc/self/fd are not mounted in the litebox rootfs.
+    // This is a FILESYSTEM gap (missing devfs/procfs), not a fork issue.
+    // Expected: fail with "No such file or directory" on /dev/fd/N.
+    let resp = r.send("A", Command::Exec { args: bash("cat <(echo proc_sub_data)") }).await;
+    let is_devfd_error = matches!(&resp, Response::ExecResult { exit_code: 1, stderr, .. } if stderr.contains("/dev/fd"));
+    let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout.contains("proc_sub_data"));
+    let timeout = matches!(&resp, Response::ExecTimeout { .. });
+    // Record as xfail: expected to fail due to missing /dev/fd.
+    let result = pass || is_devfd_error;
+    r.record("X9.process_substitution", "A", result, &format!("xfail_devfd={is_devfd_error} timeout={timeout} {resp:?}"));
+
+    // X10: Simple two-stage pipe — echo | cat
+    // Shell forks twice (one for echo, one for cat), connects via pipe.
+    // Each fork is serialized due to vfork semantics.
+    let resp = r.send("A", Command::Exec { args: bash("echo pipe_two_stage | cat") }).await;
+    let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout.contains("pipe_two_stage"));
+    let timeout = matches!(&resp, Response::ExecTimeout { .. });
+    r.record("X10.simple_pipe", "A", pass, &format!("timeout={timeout} {resp:?}"));
+
+    // X11: Three-stage pipe — echo | cat | cat
+    // Three children, two pipes. Tests chained pipe bridging across
+    // multiple delayed-fork migrations.
+    let resp = r.send("A", Command::Exec { args: bash("echo three_stage | cat | cat") }).await;
+    let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout.contains("three_stage"));
+    let timeout = matches!(&resp, Response::ExecTimeout { .. });
+    r.record("X11.three_stage_pipe", "A", pass, &format!("timeout={timeout} {resp:?}"));
+
+    // X12: Background process with wait — sleep 0 & wait; echo done
+    // fork() for `sleep 0` with & makes parent continue. But vfork blocks
+    // the parent until the child does exec or exits. Tests whether
+    // backgrounding works at all.
+    let resp = r.send("A", Command::Exec { args: bash("sleep 0 & wait; echo bg_done") }).await;
+    let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout.contains("bg_done"));
+    let timeout = matches!(&resp, Response::ExecTimeout { .. });
+    r.record("X12.background_wait", "A", pass, &format!("timeout={timeout} {resp:?}"));
+
+    // X13: Multiple background processes — echo a & echo b & wait
+    // Two concurrent forks. With vfork semantics, these run serially.
+    // Tests whether the outputs from both appear.
+    let resp = r.send("A", Command::Exec { args: bash("echo bg_a & echo bg_b & wait") }).await;
+    let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout.contains("bg_a") && stdout.contains("bg_b"));
+    let timeout = matches!(&resp, Response::ExecTimeout { .. });
+    r.record("X13.multi_background", "A", pass, &format!("timeout={timeout} {resp:?}"));
+
+    // X14: Subshell exit code — (exit 42); echo $?
+    // Subshell fork with immediate exit. Tests whether exit code
+    // propagates back through the vfork/delayed-fork path.
+    let resp = r.send("A", Command::Exec { args: bash("(exit 42); echo $?") }).await;
+    let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout.contains("42"));
+    let timeout = matches!(&resp, Response::ExecTimeout { .. });
+    r.record("X14.subshell_exit_code", "A", pass, &format!("timeout={timeout} {resp:?}"));
+
+    // X15: Sequential commands without pipes (baseline)
+    // Multiple fork+exec operations chained with &&. No pipes between them,
+    // just sequential execution. Validates basic multi-command shell scripts.
+    let resp = r.send("A", Command::Exec { args: bash("echo seq_a && echo seq_b && echo seq_c") }).await;
+    let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout.contains("seq_a") && stdout.contains("seq_c"));
+    r.record("X15.sequential_cmds", "A", pass, &format!("{resp:?}"));
+
+    // ── More aggressive delayed-fork stress tests ──
+
+    // X16: Deeply nested command substitution
+    // Each $(…) creates a subshell fork. Three levels of nesting means
+    // three sequential fork+exec+capture cycles.
+    let resp = r.send("A", Command::Exec { args: bash("echo $(echo $(echo deep_nested))") }).await;
+    let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout.contains("deep_nested"));
+    let timeout = matches!(&resp, Response::ExecTimeout { .. });
+    r.record("X16.nested_subshell", "A", pass, &format!("timeout={timeout} {resp:?}"));
+
+    // X17: Here-document — uses an internal pipe to feed stdin
+    // bash creates a pipe for the heredoc content, forks the command,
+    // and the child reads from the pipe.
+    let resp = r.send("A", Command::Exec { args: bash("cat <<'EOF'\nheredoc_line\nEOF") }).await;
+    let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout.contains("heredoc_line"));
+    let timeout = matches!(&resp, Response::ExecTimeout { .. });
+    r.record("X17.heredoc", "A", pass, &format!("timeout={timeout} {resp:?}"));
+
+    // X18: Here-string — simpler variant of heredoc
+    let resp = r.send("A", Command::Exec { args: bash("cat <<< 'herestring_data'") }).await;
+    let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout.contains("herestring_data"));
+    let timeout = matches!(&resp, Response::ExecTimeout { .. });
+    r.record("X18.herestring", "A", pass, &format!("timeout={timeout} {resp:?}"));
+
+    // X19: Pipe with grep — common real-world pattern
+    // Tests pipe bridging with a program (grep) that does buffered reads.
+    let resp = r.send("A", Command::Exec { args: bash("echo -e 'alpha\\nbeta\\ngamma' | grep beta") }).await;
+    let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout.contains("beta"));
+    let timeout = matches!(&resp, Response::ExecTimeout { .. });
+    r.record("X19.pipe_grep", "A", pass, &format!("timeout={timeout} {resp:?}"));
+
+    // X20: Command substitution with pipe and wc — VS Code install pattern
+    // `$(curl ... | sh)` like patterns use command substitution + pipe.
+    let resp = r.send("A", Command::Exec { args: bash("echo $(echo 'line1\\nline2\\nline3' | wc -l)") }).await;
+    let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout.trim() != "");
+    let timeout = matches!(&resp, Response::ExecTimeout { .. });
+    r.record("X20.subshell_pipe_wc", "A", pass, &format!("timeout={timeout} {resp:?}"));
+
+    // X21: Backtick substitution (older syntax) — equivalent to $() but
+    // tests different bash code path.
+    let resp = r.send("A", Command::Exec { args: bash("echo `echo backtick_val`") }).await;
+    let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout.contains("backtick_val"));
+    let timeout = matches!(&resp, Response::ExecTimeout { .. });
+    r.record("X21.backtick_subst", "A", pass, &format!("timeout={timeout} {resp:?}"));
+
+    // X22: Pipe to while-read loop — common shell pattern that does
+    // fork + pipe + read in a loop. The read is non-pre-exec.
+    let resp = r.send("A", Command::Exec { args: bash("echo -e 'a\\nb\\nc' | while read line; do echo \"got_$line\"; done") }).await;
+    let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout.contains("got_a") && stdout.contains("got_c"));
+    let timeout = matches!(&resp, Response::ExecTimeout { .. });
+    r.record("X22.pipe_while_read", "A", pass, &format!("timeout={timeout} {resp:?}"));
+
+    // X23: Pipe from second-level worker — same as X10 but from AA.
+    // Tests whether pipe bridging works differently at deeper nesting.
+    let resp = r.send("AA", Command::Exec { args: bash("echo deeper_pipe | cat") }).await;
+    let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout.contains("deeper_pipe"));
+    let timeout = matches!(&resp, Response::ExecTimeout { .. });
+    r.record("X23.deep_pipe", "AA", pass, &format!("timeout={timeout} {resp:?}"));
+
+    // X24: Pipe in subshell from deep worker — X8 from AAA.
+    let resp = r.send("AAA", Command::Exec { args: bash("echo $(echo deep_sub | cat)") }).await;
+    let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout.contains("deep_sub"));
+    let timeout = matches!(&resp, Response::ExecTimeout { .. });
+    r.record("X24.deep_subshell_pipe", "AAA", pass, &format!("timeout={timeout} {resp:?}"));
+
+    // X25: xargs — forks multiple child processes from piped input.
+    let resp = r.send("A", Command::Exec { args: bash("echo -e 'p\\nq\\nr' | xargs -I{} echo xargs_{}") }).await;
+    let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout.contains("xargs_p") && stdout.contains("xargs_r"));
+    let timeout = matches!(&resp, Response::ExecTimeout { .. });
+    r.record("X25.xargs", "A", pass, &format!("timeout={timeout} {resp:?}"));
 }
 
 async fn env_tests(r: &mut TestRunner) {
