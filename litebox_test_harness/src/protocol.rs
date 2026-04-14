@@ -1,69 +1,113 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-//! Test result protocol for communication between sandbox agents and the host.
+//! Command/response protocol for parent-child coordination via pipes.
 
 use serde::{Deserialize, Serialize};
 
-/// Result of a single test executed by an agent.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TestResult {
-    /// Test identifier (e.g., "F1", "N3", "X4").
-    pub test: String,
-    /// Agent that ran the test (e.g., "A", "AA", "AAA").
-    pub agent: String,
-    /// Outcome.
-    pub result: Outcome,
-    /// Human-readable detail.
-    #[serde(default)]
-    pub detail: String,
-}
-
-/// Test outcome.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum Outcome {
-    /// Test passed as expected.
-    Pass,
-    /// Test failed unexpectedly.
-    Fail,
-    /// Expected failure (documents a known limitation).
-    Xfail,
-    /// Test skipped (not applicable for this agent position).
-    Skip,
-}
-
-/// Registration message sent by each agent to the coordinator.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AgentReady {
-    /// Agent identifier.
-    pub id: String,
-    /// Guest PID.
-    pub pid: u32,
-    /// TCP port this agent is listening on for test traffic.
-    pub port: u16,
-}
-
-/// Command sent by coordinator to agents.
+/// Command sent from parent to child via stdin.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "cmd")]
 pub enum Command {
-    /// All agents are registered; start running tests.
-    #[serde(rename = "run")]
-    RunTests {
-        /// Map of agent id → port for cross-agent connectivity tests.
-        peers: Vec<AgentReady>,
-    },
+    /// Spawn child processes. Child creates the named agents as its
+    /// own children with piped stdin/stdout.
+    #[serde(rename = "spawn")]
+    Spawn { children: Vec<String> },
+
+    /// Read a file and report contents (or not_found).
+    #[serde(rename = "fs_read")]
+    FsRead { path: String },
+
+    /// Write data to a file.
+    #[serde(rename = "fs_write")]
+    FsWrite { path: String, data: String },
+
+    /// Delete a file.
+    #[serde(rename = "fs_delete")]
+    FsDelete { path: String },
+
+    /// Bind a TCP listener on the given port. Starts an echo handler.
+    #[serde(rename = "net_listen")]
+    NetListen { port: u16 },
+
+    /// Stop listening on a port.
+    #[serde(rename = "net_unlisten")]
+    NetUnlisten { port: u16 },
+
+    /// Connect to addr, send data, read echo response.
+    #[serde(rename = "net_connect")]
+    NetConnect { addr: String, data: String },
+
+    /// Forward a command to a named child and return its response.
+    #[serde(rename = "forward")]
+    Forward { target: String, inner: Box<Command> },
+
+    /// Fork+exec self with args and report exit code + stdout.
+    #[serde(rename = "exec")]
+    Exec { args: Vec<String> },
+
+    /// Report an environment variable value.
+    #[serde(rename = "env_get")]
+    EnvGet { var: String },
+
+    /// Report current working directory.
+    #[serde(rename = "cwd_get")]
+    CwdGet,
+
+    /// Proceed (used after coordination points).
+    #[serde(rename = "go")]
+    Go,
+
     /// Shut down gracefully.
-    #[serde(rename = "shutdown")]
-    Shutdown,
+    #[serde(rename = "exit")]
+    Exit,
 }
 
-/// Lines written to the result pipe by agents.
+/// Response sent from child to parent via stdout.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(untagged)]
-#[allow(dead_code)]
-pub enum AgentMessage {
-    Ready(AgentReady),
-    Result(TestResult),
+#[serde(tag = "status")]
+pub enum Response {
+    /// Successful operation with optional data.
+    #[serde(rename = "ok")]
+    Ok {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        data: Option<String>,
+    },
+
+    /// File not found.
+    #[serde(rename = "not_found")]
+    NotFound,
+
+    /// TCP listener is ready.
+    #[serde(rename = "listening")]
+    Listening { port: u16 },
+
+    /// TCP connection + echo result.
+    #[serde(rename = "connected")]
+    Connected { echo: String },
+
+    /// TCP connection failed.
+    #[serde(rename = "connect_failed")]
+    ConnectFailed { error: String },
+
+    /// Exec result.
+    #[serde(rename = "exec_result")]
+    ExecResult {
+        exit_code: i32,
+        stdout: String,
+        stderr: String,
+    },
+
+    /// Error.
+    #[serde(rename = "error")]
+    Error { error: String },
+
+    /// Test result (for structured reporting).
+    #[serde(rename = "test_result")]
+    TestResult {
+        test: String,
+        agent: String,
+        result: String,
+        detail: String,
+    },
 }

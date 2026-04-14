@@ -1,316 +1,338 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-//! Agent: spawn process tree, coordinate via stdin/stdout pipes.
-//!
-//! Each parent spawns children with piped stdin/stdout. After writing
-//! test files, the parent sends the run command to each child's stdin.
-//! Children run tests (with echo server for network tests) and write
-//! JSON result lines to stdout. Parents read and aggregate results.
+//! Agent command executor. Reads commands from stdin, executes them,
+//! writes responses to stdout. Intermediate nodes forward commands to
+//! their children.
 
-use crate::protocol::{AgentReady, Command, Outcome, TestResult};
+use crate::protocol::{Command, Response};
+use std::collections::HashMap;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::TcpListener;
 use tokio::time::Duration;
 
-fn tree_children(id: &str) -> &'static [&'static str] {
-    match id {
-        "init" => &["A", "B"],
-        "A" => &["AA", "AB"],
-        "AA" => &["AAA", "AAB"],
-        _ => &[],
-    }
+struct ChildHandle {
+    stdin: tokio::process::ChildStdin,
+    stdout: BufReader<tokio::process::ChildStdout>,
+    #[allow(dead_code)]
+    process: tokio::process::Child,
 }
 
-pub fn agent_port(id: &str) -> u16 {
-    match id {
-        "init" => 9000,
-        "A" => 9001,
-        "B" => 9002,
-        "AA" => 9003,
-        "AB" => 9004,
-        "AAA" => 9005,
-        "AAB" => 9006,
-        _ => 9099,
-    }
-}
-
-const ALL_AGENTS: &[&str] = &["A", "B", "AA", "AB", "AAA", "AAB"];
-
-pub fn run_coordinator(self_exe: &str) -> Vec<TestResult> {
+/// Run the agent. Reads commands from stdin, executes, responds on stdout.
+pub fn run(self_exe: &str) {
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .expect("tokio runtime")
-        .block_on(run_node(self_exe, "init", None))
+        .block_on(agent_loop(self_exe));
 }
 
-pub fn run_agent(self_exe: &str, id: &str) {
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("tokio runtime");
-    rt.block_on(async {
-        let mut stdin = BufReader::new(tokio::io::stdin());
-        let results = run_node(self_exe, id, Some(&mut stdin)).await;
-        for r in &results {
-            println!("{}", serde_json::to_string(r).unwrap());
+async fn agent_loop(self_exe: &str) {
+    let stdin = tokio::io::stdin();
+    let mut reader = BufReader::new(stdin);
+    let mut children: HashMap<String, ChildHandle> = HashMap::new();
+    let mut listeners: HashMap<u16, tokio::task::JoinHandle<()>> = HashMap::new();
+
+    let mut line = String::new();
+    loop {
+        line.clear();
+        match reader.read_line(&mut line).await {
+            Ok(0) | Err(_) => break, // EOF or error
+            Ok(_) => {}
         }
-        println!("{{\"done\":true}}");
-        // Keep echo server alive until parent closes our stdin.
-        // Reading from stdin yields to the tokio runtime, allowing
-        // the echo server task to handle connections concurrently.
-        let mut buf = [0u8; 1];
-        let _ = stdin.read(&mut buf).await;
-    });
-}
-
-/// Core logic for any node in the tree (init or agent).
-/// Reads the run command from `parent_stdin` (None for init).
-/// Returns all results (own + children's).
-async fn run_node(
-    self_exe: &str,
-    id: &str,
-    mut parent_stdin: Option<&mut BufReader<tokio::io::Stdin>>,
-) -> Vec<TestResult> {
-    eprintln!("[{id}] starting");
-
-    // Bind echo server port.
-    let port = agent_port(id);
-    let listener = TcpListener::bind(format!("0.0.0.0:{port}"))
-        .await
-        .unwrap_or_else(|e| panic!("[{id}] bind {port}: {e}"));
-    eprintln!("[{id}] bound port {port}");
-
-    // Start echo server.
-    let echo_task = tokio::spawn(echo_server(listener));
-
-    // Spawn children with piped stdin/stdout.
-    let children_ids = tree_children(id);
-    let mut children: Vec<(&str, tokio::process::Child)> = Vec::new();
-    for &child_id in children_ids {
-        match tokio::process::Command::new(self_exe)
-            .arg("agent")
-            .arg("--id")
-            .arg(child_id)
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::inherit())
-            .spawn()
-        {
-            Ok(child) => {
-                eprintln!("[{id}] spawned {child_id}");
-                children.push((child_id, child));
-            }
-            Err(e) => eprintln!("[{id}] spawn {child_id} failed: {e}"),
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
         }
-    }
 
-    // If we have a parent, read the run command from stdin.
-    // If we're init, build the command ourselves.
-    let has_parent = parent_stdin.is_some();
-    let peers: Vec<AgentReady> = if let Some(reader) = parent_stdin.as_mut() {
-        let mut line = String::new();
-        match tokio::time::timeout(Duration::from_secs(30), reader.read_line(&mut line)).await {
-            Ok(Ok(n)) if n > 0 => {
-                if let Ok(Command::RunTests { peers }) = serde_json::from_str(line.trim()) {
-                    peers
-                } else {
-                    eprintln!("[{id}] bad command from parent: {line}");
-                    Vec::new()
-                }
-            }
-            _ => {
-                eprintln!("[{id}] no command from parent");
-                Vec::new()
-            }
-        }
-    } else {
-        // Init builds the peer list from known ports.
-        ALL_AGENTS
-            .iter()
-            .map(|&aid| AgentReady {
-                id: aid.to_string(),
-                pid: 0,
-                port: agent_port(aid),
-            })
-            .chain(std::iter::once(AgentReady {
-                id: "init".to_string(),
-                pid: std::process::id(),
-                port: agent_port("init"),
-            }))
-            .collect()
-    };
-
-    // Write parent-to-child test files BEFORE signaling children.
-    let _ = tokio::fs::create_dir_all("/shared").await;
-    for &child_id in children_ids {
-        let path = format!("/shared/{id}_for_{child_id}.txt");
-        let _ = tokio::fs::write(&path, format!("FROM_PARENT_{id}")).await;
-    }
-
-    // Two-phase protocol:
-    // Phase A: Send peers to children, wait for all to report ready.
-    let cmd = Command::RunTests {
-        peers: peers.clone(),
-    };
-    let cmd_json = serde_json::to_string(&cmd).unwrap();
-    let mut child_stdins: Vec<tokio::process::ChildStdin> = Vec::new();
-    let mut child_stdouts: Vec<(&str, BufReader<tokio::process::ChildStdout>)> = Vec::new();
-
-    for (child_id, child) in &mut children {
-        if let Some(mut stdin) = child.stdin.take() {
-            let _ = stdin.write_all(format!("{cmd_json}\n").as_bytes()).await;
-            let _ = stdin.flush().await;
-            child_stdins.push(stdin);
-        }
-        if let Some(stdout) = child.stdout.take() {
-            child_stdouts.push((child_id, BufReader::new(stdout)));
-        }
-    }
-
-    // Wait for each child to write {"ready":true}, then verify
-    // the child is reachable through the network. This ensures the
-    // LBPL port registration has propagated through the broker before
-    // we signal our own parent that we're ready.
-    for (child_id, reader) in &mut child_stdouts {
-        let mut line = String::new();
-        match tokio::time::timeout(Duration::from_secs(15), reader.read_line(&mut line)).await {
-            Ok(Ok(n)) if n > 0 && line.contains("\"ready\":true") => {
-                eprintln!("[{id}] {child_id} signaled ready, verifying reachable...");
-            }
-            _ => {
-                eprintln!("[{id}] {child_id} not ready (timeout or error)");
+        let cmd: Command = match serde_json::from_str(trimmed) {
+            Ok(c) => c,
+            Err(e) => {
+                respond(&Response::Error {
+                    error: format!("parse error: {e}"),
+                })
+                .await;
                 continue;
             }
-        }
-        // Verify network path works before propagating readiness up.
-        let port = agent_port(child_id);
-        let addr = format!("127.0.0.1:{port}");
-        let mut verified = false;
-        for _attempt in 0..50 {
-            match tokio::time::timeout(
-                Duration::from_millis(500),
-                async {
-                    let mut stream = TcpStream::connect(&addr).await?;
-                    stream.write_all(b"VERIFY").await?;
-                    stream.flush().await?;
-                    let mut buf = [0u8; 6];
-                    stream.read_exact(&mut buf).await?;
-                    Ok::<_, std::io::Error>(())
-                },
-            )
-            .await
-            {
-                Ok(Ok(())) => {
-                    verified = true;
-                    break;
+        };
+
+        match cmd {
+            Command::Spawn { children: names } => {
+                for name in &names {
+                    match spawn_child(self_exe, name).await {
+                        Ok(handle) => {
+                            children.insert(name.clone(), handle);
+                        }
+                        Err(e) => {
+                            respond(&Response::Error {
+                                error: format!("spawn {name}: {e}"),
+                            })
+                            .await;
+                        }
+                    }
                 }
-                _ => {
-                    tokio::time::sleep(Duration::from_millis(100)).await;
+                respond(&Response::Ok {
+                    data: Some(format!("{} children spawned", names.len())),
+                })
+                .await;
+            }
+
+            Command::FsRead { path } => match tokio::fs::read_to_string(&path).await {
+                Ok(data) => respond(&Response::Ok { data: Some(data) }).await,
+                Err(_) => respond(&Response::NotFound).await,
+            },
+
+            Command::FsWrite { path, data } => {
+                if let Some(parent) = std::path::Path::new(&path).parent() {
+                    let _ = tokio::fs::create_dir_all(parent).await;
+                }
+                match tokio::fs::write(&path, &data).await {
+                    Ok(()) => respond(&Response::Ok { data: None }).await,
+                    Err(e) => {
+                        respond(&Response::Error {
+                            error: format!("write: {e}"),
+                        })
+                        .await;
+                    }
                 }
             }
-        }
-        if verified {
-            eprintln!("[{id}] {child_id} verified reachable");
-        } else {
-            eprintln!("[{id}] WARNING: {child_id} not reachable");
-        }
-    }
 
-    // Phase B: Tell children to go.
-    for stdin in &mut child_stdins {
-        let _ = stdin.write_all(b"{\"cmd\":\"go\"}\n").await;
-        let _ = stdin.flush().await;
-    }
-
-    // If we have a parent, signal ready and wait for go.
-    if has_parent {
-        println!("{{\"ready\":true}}");
-        // Wait for parent's "go" signal on stdin. This yields to
-        // the tokio runtime so the echo server stays responsive.
-        if let Some(reader) = parent_stdin.as_mut() {
-            let mut line = String::new();
-            let _ = tokio::time::timeout(
-                Duration::from_secs(30),
-                reader.read_line(&mut line),
-            )
-            .await;
-        }
-    }
-
-    // Run our own tests.
-    eprintln!("[{id}] running tests");
-    let peer_map: std::collections::HashMap<&str, &AgentReady> =
-        peers.iter().map(|p| (p.id.as_str(), p)).collect();
-    let mut results = Vec::new();
-    results.extend(crate::fs_tests::run(id, &peer_map).await);
-    results.extend(crate::net_tests::run(id, &peer_map).await);
-    results.extend(crate::fork_tests::run(id).await);
-    results.extend(crate::env_tests::run(id).await);
-
-    // Collect children's results from their stdout.
-    for (child_id, reader) in &mut child_stdouts {
-        match tokio::time::timeout(Duration::from_secs(60), async {
-            let mut child_results = Vec::new();
-            let mut line = String::new();
-            while reader.read_line(&mut line).await.unwrap_or(0) > 0 {
-                let trimmed = line.trim();
-                if trimmed.contains("\"done\":true") {
-                    break;
+            Command::FsDelete { path } => match tokio::fs::remove_file(&path).await {
+                Ok(()) => respond(&Response::Ok { data: None }).await,
+                Err(e) => {
+                    respond(&Response::Error {
+                        error: format!("delete: {e}"),
+                    })
+                    .await;
                 }
-                if let Ok(result) = serde_json::from_str::<TestResult>(trimmed) {
-                    child_results.push(result);
-                }
-                line.clear();
-            }
-            child_results
-        })
-        .await
-        {
-            Ok(child_results) => {
-                eprintln!("[{id}] collected {} results from {child_id}", child_results.len());
-                results.extend(child_results);
-            }
-            Err(_) => {
-                eprintln!("[{id}] timeout reading {child_id}");
-                results.push(TestResult {
-                    test: "CHILD_TIMEOUT".to_string(),
-                    agent: child_id.to_string(),
-                    result: Outcome::Fail,
-                    detail: "parent timed out reading results".to_string(),
-                });
-            }
-        }
-    }
+            },
 
-    // Drop child stdins to signal children to exit.
-    drop(child_stdins);
-
-    echo_task.abort();
-    eprintln!("[{id}] done ({} total results)", results.len());
-    results
-}
-
-async fn echo_server(listener: TcpListener) {
-    loop {
-        match listener.accept().await {
-            Ok((mut stream, _)) => {
-                tokio::spawn(async move {
-                    let mut buf = [0u8; 4096];
-                    loop {
-                        match stream.read(&mut buf).await {
-                            Ok(0) | Err(_) => break,
-                            Ok(n) => {
-                                if stream.write_all(&buf[..n]).await.is_err() {
-                                    break;
+            Command::NetListen { port } => {
+                match TcpListener::bind(format!("0.0.0.0:{port}")).await {
+                    Ok(listener) => {
+                        // Spawn echo server task.
+                        let task = tokio::spawn(async move {
+                            loop {
+                                match listener.accept().await {
+                                    Ok((mut stream, _)) => {
+                                        tokio::spawn(async move {
+                                            let mut buf = [0u8; 4096];
+                                            loop {
+                                                match stream.read(&mut buf).await {
+                                                    Ok(0) | Err(_) => break,
+                                                    Ok(n) => {
+                                                        if stream.write_all(&buf[..n]).await.is_err()
+                                                        {
+                                                            break;
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        });
+                                    }
+                                    Err(_) => break,
                                 }
+                            }
+                        });
+                        listeners.insert(port, task);
+                        respond(&Response::Listening { port }).await;
+                    }
+                    Err(e) => {
+                        respond(&Response::Error {
+                            error: format!("bind {port}: {e}"),
+                        })
+                        .await;
+                    }
+                }
+            }
+
+            Command::NetUnlisten { port } => {
+                if let Some(task) = listeners.remove(&port) {
+                    task.abort();
+                }
+                respond(&Response::Ok { data: None }).await;
+            }
+
+            Command::NetConnect { addr, data } => {
+                match tokio::time::timeout(
+                    Duration::from_secs(5),
+                    tokio::net::TcpStream::connect(&addr),
+                )
+                .await
+                {
+                    Ok(Ok(mut stream)) => {
+                        let _ = stream.write_all(data.as_bytes()).await;
+                        let _ = stream.flush().await;
+                        let mut buf = [0u8; 4096];
+                        match tokio::time::timeout(Duration::from_secs(5), stream.read(&mut buf))
+                            .await
+                        {
+                            Ok(Ok(n)) if n > 0 => {
+                                let echo = String::from_utf8_lossy(&buf[..n]).to_string();
+                                respond(&Response::Connected { echo }).await;
+                            }
+                            _ => {
+                                respond(&Response::ConnectFailed {
+                                    error: "no echo response".to_string(),
+                                })
+                                .await;
                             }
                         }
                     }
-                });
+                    Ok(Err(e)) => {
+                        respond(&Response::ConnectFailed {
+                            error: format!("{e}"),
+                        })
+                        .await;
+                    }
+                    Err(_) => {
+                        respond(&Response::ConnectFailed {
+                            error: "connect timeout".to_string(),
+                        })
+                        .await;
+                    }
+                }
             }
-            Err(_) => break,
+
+            Command::Forward { target, inner } => {
+                if let Some(child) = children.get_mut(&target) {
+                    let resp = send_to_child(child, &inner).await;
+                    respond(&resp).await;
+                } else {
+                    respond(&Response::Error {
+                        error: format!("unknown child: {target}"),
+                    })
+                    .await;
+                }
+            }
+
+            Command::Exec { args } => {
+                if args.is_empty() {
+                    respond(&Response::Error {
+                        error: "exec requires args".to_string(),
+                    })
+                    .await;
+                    continue;
+                }
+                match tokio::process::Command::new(&args[0])
+                    .args(&args[1..])
+                    .stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::piped())
+                    .output()
+                    .await
+                {
+                    Ok(output) => {
+                        respond(&Response::ExecResult {
+                            exit_code: output.status.code().unwrap_or(-1),
+                            stdout: String::from_utf8_lossy(&output.stdout).trim().to_string(),
+                            stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
+                        })
+                        .await;
+                    }
+                    Err(e) => {
+                        respond(&Response::Error {
+                            error: format!("exec: {e}"),
+                        })
+                        .await;
+                    }
+                }
+            }
+
+            Command::EnvGet { var } => {
+                let val = std::env::var(&var).unwrap_or_else(|_| "NOT_SET".to_string());
+                respond(&Response::Ok {
+                    data: Some(val),
+                })
+                .await;
+            }
+
+            Command::CwdGet => {
+                let cwd = std::env::current_dir()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|e| format!("ERROR: {e}"));
+                respond(&Response::Ok {
+                    data: Some(cwd),
+                })
+                .await;
+            }
+
+            Command::Go => {
+                respond(&Response::Ok { data: None }).await;
+            }
+
+            Command::Exit => {
+                // Abort all echo servers.
+                for (_, task) in listeners.drain() {
+                    task.abort();
+                }
+                // Send exit to all children.
+                for (_, mut child) in children.drain() {
+                    let exit = Command::Exit;
+                    let _ = send_to_child(&mut child, &exit).await;
+                }
+                break;
+            }
         }
+    }
+}
+
+async fn respond(resp: &Response) {
+    let json = serde_json::to_string(resp).unwrap();
+    let mut stdout = tokio::io::stdout();
+    let _ = stdout.write_all(format!("{json}\n").as_bytes()).await;
+    let _ = stdout.flush().await;
+}
+
+async fn spawn_child(self_exe: &str, id: &str) -> Result<ChildHandle, String> {
+    let mut child = tokio::process::Command::new(self_exe)
+        .arg("agent")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::inherit())
+        .spawn()
+        .map_err(|e| format!("{e}"))?;
+
+    let stdin = child.stdin.take().ok_or("no stdin")?;
+    let stdout = child.stdout.take().ok_or("no stdout")?;
+
+    Ok(ChildHandle {
+        stdin,
+        stdout: BufReader::new(stdout),
+        process: child,
+    })
+}
+
+/// Send a command to a child and read its response.
+async fn send_to_child(child: &mut ChildHandle, cmd: &Command) -> Response {
+    let json = serde_json::to_string(cmd).unwrap();
+    if child
+        .stdin
+        .write_all(format!("{json}\n").as_bytes())
+        .await
+        .is_err()
+    {
+        return Response::Error {
+            error: "write to child failed".to_string(),
+        };
+    }
+    let _ = child.stdin.flush().await;
+
+    let mut line = String::new();
+    match tokio::time::timeout(Duration::from_secs(15), child.stdout.read_line(&mut line)).await {
+        Ok(Ok(n)) if n > 0 => match serde_json::from_str(line.trim()) {
+            Ok(resp) => resp,
+            Err(e) => Response::Error {
+                error: format!("child response parse: {e}: {line}"),
+            },
+        },
+        Ok(Ok(_)) => Response::Error {
+            error: "child EOF".to_string(),
+        },
+        Ok(Err(e)) => Response::Error {
+            error: format!("child read: {e}"),
+        },
+        Err(_) => Response::Error {
+            error: "child response timeout".to_string(),
+        },
     }
 }
