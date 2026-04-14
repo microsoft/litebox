@@ -107,6 +107,12 @@ fn main() -> Result<()> {
             _ => tracing::Level::TRACE,
         })
         .init();
+    if cli_args.lock_tracing && std::env::var_os("LITEBOX_LOG").is_none() {
+        warn!("--lock-tracing is enabled but LITEBOX_LOG is not set");
+        warn!("  lock trace output will not be visible");
+        warn!("  set e.g. LITEBOX_LOG=trace to see lock tracing output");
+        warn!("  also confirm the CONFIG_PRINT_* booleans in lock_tracing.rs are enabled");
+    }
     if cli_args.verbose > 2 {
         warn!(
             verbosity = cli_args.verbose,
