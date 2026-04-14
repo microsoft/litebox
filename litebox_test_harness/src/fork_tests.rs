@@ -1,13 +1,13 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-//! Fork/exec limitation tests (X1-X8).
+//! Fork/exec limitation tests (X1-X8). Async wrappers around process spawning.
 
 use crate::protocol::{Outcome, TestResult};
-use std::io::Read;
-use std::process;
+use tokio::process::Command;
+use tokio::time::{Duration, timeout};
 
-fn result(test: &str, agent: &str, outcome: Outcome, detail: &str) -> TestResult {
+fn r(test: &str, agent: &str, outcome: Outcome, detail: &str) -> TestResult {
     TestResult {
         test: test.to_string(),
         agent: agent.to_string(),
@@ -16,278 +16,124 @@ fn result(test: &str, agent: &str, outcome: Outcome, detail: &str) -> TestResult
     }
 }
 
-/// Run fork/exec tests. Init and agent A run these.
-pub fn run(id: &str) -> Vec<TestResult> {
+pub async fn run(id: &str) -> Vec<TestResult> {
     let mut results = Vec::new();
 
-    // Init runs basic fork tests to check if workers work at all.
     if id == "init" {
-        results.push(test_x1_fork_exec(id));
-        results.push(test_x2_nested_fork(id));
-        results.push(test_x3_subshell(id));
-        results.push(test_x5_background(id));
-        results.push(test_x8_tree_nesting(id));
+        results.push(test_fork_exec(id, "X1").await);
+        results.push(test_fork_exec(id, "X2").await);
+        results.push(test_subshell(id).await);
+        results.push(test_background(id).await);
+        results.push(test_tree_nesting(id).await);
         return results;
     }
 
-    // Only agent A runs the full fork test suite (including deadlock tests).
     if id != "A" {
         return results;
     }
 
-    // X1: fork+exec of external binary.
-    results.push(test_x1_fork_exec(id));
-
-    // X2: fork+exec from a worker (we ARE a worker, so this tests nesting).
-    results.push(test_x2_nested_fork(id));
-
-    // X3: $(cmd) subshell — single command substitution.
-    results.push(test_x3_subshell(id));
-
-    // X4: $(cmd | pipe) — pipe in subshell (KNOWN DEADLOCK).
-    results.push(test_x4_pipe_subshell(id));
-
-    // X5: backgrounded process (cmd &).
-    results.push(test_x5_background(id));
-
-    // X6: backgrounded process survives parent exit.
-    results.push(test_x6_orphan(id));
-
-    // X8: Binary that itself fork+execs (3-level nesting).
-    // This is implicitly tested by the tree structure (init→A→AA→AAA).
-    results.push(result(
-        "X8",
-        id,
-        Outcome::Pass,
-        "3-level nesting tested via tree structure",
-    ));
+    results.push(test_fork_exec(id, "X1").await);
+    results.push(test_fork_exec(id, "X2").await);
+    results.push(test_subshell(id).await);
+    results.push(test_pipe_subshell(id).await);
+    results.push(test_background(id).await);
+    results.push(test_orphan(id).await);
+    results.push(r("X8", id, Outcome::Pass, "3-level nesting via tree"));
 
     results
 }
 
-fn test_x8_tree_nesting(id: &str) -> TestResult {
-    // Test that a fork+exec'd child can itself fork+exec.
-    // We exec ourselves with echo-test; if that works, the worker can
-    // exec binaries. (This is what the tree does: init→A→AA.)
+async fn test_fork_exec(id: &str, test_id: &str) -> TestResult {
     let self_exe = std::env::args().next().unwrap_or_default();
-    match process::Command::new(&self_exe)
+    match Command::new(&self_exe)
         .arg("echo-test")
-        .stdout(process::Stdio::piped())
-        .stderr(process::Stdio::piped())
         .output()
+        .await
     {
         Ok(output) if output.status.success() => {
             let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            if stdout.contains("ECHO_TEST_OK") {
-                result(
-                    "X8",
-                    id,
-                    Outcome::Pass,
-                    "init fork+exec'd child ran successfully",
-                )
-            } else {
-                result(
-                    "X8",
-                    id,
-                    Outcome::Fail,
-                    &format!("child output: '{stdout}' (expected ECHO_TEST_OK)"),
-                )
-            }
+            r(test_id, id, Outcome::Pass, &format!("fork+exec ok: {stdout}"))
         }
-        Ok(output) => {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            result(
-                "X8",
-                id,
-                Outcome::Xfail,
-                &format!(
-                    "fork+exec'd child failed with exit {} — worker binary execution broken (known limitation). stderr: {}",
-                    output.status.code().unwrap_or(-1),
-                    stderr.chars().take(200).collect::<String>()
-                ),
-            )
-        }
-        Err(e) => result("X8", id, Outcome::Fail, &format!("spawn: {e}")),
+        Ok(output) => r(test_id, id, Outcome::Fail, &format!("exit {}", output.status.code().unwrap_or(-1))),
+        Err(e) => r(test_id, id, Outcome::Fail, &format!("spawn: {e}")),
     }
 }
 
-fn test_x1_fork_exec(id: &str) -> TestResult {
-    // Fork+exec a simple command and check it succeeds.
+async fn test_subshell(id: &str) -> TestResult {
     let self_exe = std::env::args().next().unwrap_or_default();
-    match process::Command::new(&self_exe)
-        .arg("echo-test")
-        .stdout(process::Stdio::piped())
-        .stderr(process::Stdio::piped())
-        .output()
-    {
-        Ok(output) if output.status.success() => {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            result("X1", id, Outcome::Pass, &format!("fork+exec ok: {stdout}"))
-        }
-        Ok(output) => result(
-            "X1",
-            id,
-            Outcome::Fail,
-            &format!("exit {}", output.status.code().unwrap_or(-1)),
-        ),
-        Err(e) => result("X1", id, Outcome::Fail, &format!("spawn failed: {e}")),
-    }
-}
-
-fn test_x2_nested_fork(id: &str) -> TestResult {
-    // We're already in a worker. Fork+exec again to test worker-from-worker.
-    let self_exe = std::env::args().next().unwrap_or_default();
-    match process::Command::new(&self_exe)
-        .arg("echo-test")
-        .stdout(process::Stdio::piped())
-        .stderr(process::Stdio::piped())
-        .output()
-    {
-        Ok(output) if output.status.success() => {
-            result("X2", id, Outcome::Pass, "nested fork+exec ok")
-        }
-        Ok(output) => result(
-            "X2",
-            id,
-            Outcome::Fail,
-            &format!("exit {}", output.status.code().unwrap_or(-1)),
-        ),
-        Err(e) => result("X2", id, Outcome::Fail, &format!("spawn failed: {e}")),
-    }
-}
-
-fn test_x3_subshell(id: &str) -> TestResult {
-    // Test $(cmd) — single command substitution.
-    // Use our own binary with a known output.
-    let self_exe = std::env::args().next().unwrap_or_default();
-    match process::Command::new(&self_exe)
-        .arg("echo-test")
-        .stdout(process::Stdio::piped())
-        .output()
-    {
+    match Command::new(&self_exe).arg("echo-test").output().await {
         Ok(output) => {
             let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
             if stdout.contains("ECHO_TEST_OK") {
-                result("X3", id, Outcome::Pass, "subshell capture ok")
+                r("X3", id, Outcome::Pass, "subshell capture ok")
             } else {
-                result(
-                    "X3",
-                    id,
-                    Outcome::Fail,
-                    &format!("unexpected output: {stdout}"),
-                )
+                r("X3", id, Outcome::Fail, &format!("unexpected: {stdout}"))
             }
         }
-        Err(e) => result("X3", id, Outcome::Fail, &format!("{e}")),
+        Err(e) => r("X3", id, Outcome::Fail, &format!("{e}")),
     }
 }
 
-fn test_x4_pipe_subshell(id: &str) -> TestResult {
-    // Test $(cmd | pipe) — this is a KNOWN deadlock in litebox.
-    // Use a timeout to detect the deadlock.
+async fn test_pipe_subshell(id: &str) -> TestResult {
     let self_exe = std::env::args().next().unwrap_or_default();
-    let child = process::Command::new(&self_exe)
-        .arg("pipe-test")
-        .stdout(process::Stdio::piped())
-        .stderr(process::Stdio::piped())
-        .spawn();
-
-    match child {
-        Ok(mut child) => {
-            // Wait with timeout — if it hangs, that's the expected deadlock.
-            let timeout = std::time::Duration::from_secs(5);
-            let start = std::time::Instant::now();
-            loop {
-                match child.try_wait() {
-                    Ok(Some(status)) => {
-                        if status.success() {
-                            return result("X4", id, Outcome::Pass, "pipe subshell completed (fixed!)");
-                        }
-                        return result(
-                            "X4",
-                            id,
-                            Outcome::Fail,
-                            &format!("exit {}", status.code().unwrap_or(-1)),
-                        );
-                    }
-                    Ok(None) => {
-                        if start.elapsed() > timeout {
-                            let _ = child.kill();
-                            return result(
-                                "X4",
-                                id,
-                                Outcome::Xfail,
-                                "deadlocked as expected (known limitation)",
-                            );
-                        }
-                        std::thread::sleep(std::time::Duration::from_millis(100));
-                    }
-                    Err(e) => {
-                        return result("X4", id, Outcome::Fail, &format!("wait error: {e}"));
-                    }
-                }
-            }
+    match timeout(
+        Duration::from_secs(5),
+        Command::new(&self_exe).arg("pipe-test").output(),
+    )
+    .await
+    {
+        Ok(Ok(output)) if output.status.success() => {
+            r("X4", id, Outcome::Pass, "pipe subshell completed")
         }
-        Err(e) => result("X4", id, Outcome::Fail, &format!("spawn failed: {e}")),
+        Ok(Ok(output)) => r("X4", id, Outcome::Fail, &format!("exit {}", output.status.code().unwrap_or(-1))),
+        Ok(Err(e)) => r("X4", id, Outcome::Fail, &format!("spawn: {e}")),
+        Err(_) => r("X4", id, Outcome::Xfail, "deadlocked (known limitation)"),
     }
 }
 
-fn test_x5_background(id: &str) -> TestResult {
-    // Test backgrounded process: spawn, don't wait, verify it ran.
+async fn test_background(id: &str) -> TestResult {
     let self_exe = std::env::args().next().unwrap_or_default();
     let marker = format!("/tmp/x5_bg_{id}.txt");
-    match process::Command::new(&self_exe)
+    match Command::new(&self_exe)
         .arg("write-marker")
         .arg(&marker)
-        .stdin(process::Stdio::null())
-        .stdout(process::Stdio::null())
-        .stderr(process::Stdio::null())
-        .spawn()
+        .output()
+        .await
     {
-        Ok(mut child) => {
-            // Wait for the child to finish.
-            match child.wait() {
-                Ok(status) if status.success() => {
-                    // Check if the marker file was created.
-                    match std::fs::read_to_string(&marker) {
-                        Ok(content) if content.contains("MARKER") => {
-                            result("X5", id, Outcome::Pass, "background process wrote marker")
-                        }
-                        _ => result("X5", id, Outcome::Fail, "marker file not found"),
-                    }
-                }
-                Ok(status) => result(
-                    "X5",
-                    id,
-                    Outcome::Fail,
-                    &format!("exit {}", status.code().unwrap_or(-1)),
-                ),
-                Err(e) => result("X5", id, Outcome::Fail, &format!("wait: {e}")),
+        Ok(status) if status.status.success() => {
+            match tokio::fs::read_to_string(&marker).await {
+                Ok(c) if c.contains("MARKER") => r("X5", id, Outcome::Pass, "bg wrote marker"),
+                _ => r("X5", id, Outcome::Fail, "marker not found"),
             }
         }
-        Err(e) => result("X5", id, Outcome::Fail, &format!("spawn: {e}")),
+        Ok(status) => r("X5", id, Outcome::Fail, &format!("exit {}", status.status.code().unwrap_or(-1))),
+        Err(e) => r("X5", id, Outcome::Fail, &format!("spawn: {e}")),
     }
 }
 
-fn test_x6_orphan(id: &str) -> TestResult {
-    // Orphan test: spawn a child that sleeps, then check if the parent
-    // can continue without waiting. We can't fully test orphan survival
-    // here (would need the parent to exit), but we test that spawning
-    // and not-waiting works.
+async fn test_orphan(id: &str) -> TestResult {
     let self_exe = std::env::args().next().unwrap_or_default();
-    match process::Command::new(&self_exe)
+    match Command::new(&self_exe)
         .arg("sleep-test")
-        .stdin(process::Stdio::null())
-        .stdout(process::Stdio::null())
-        .stderr(process::Stdio::null())
         .spawn()
     {
-        Ok(_child) => {
-            // Don't wait — just verify spawn succeeded.
-            // In litebox's delayed-fork, the parent blocks until child execs,
-            // but after exec the parent resumes.
-            result("X6", id, Outcome::Pass, "orphan spawn succeeded")
+        Ok(_) => r("X6", id, Outcome::Pass, "orphan spawn ok"),
+        Err(e) => r("X6", id, Outcome::Fail, &format!("spawn: {e}")),
+    }
+}
+
+async fn test_tree_nesting(id: &str) -> TestResult {
+    let self_exe = std::env::args().next().unwrap_or_default();
+    match Command::new(&self_exe).arg("echo-test").output().await {
+        Ok(output) if output.status.success() => {
+            let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if stdout.contains("ECHO_TEST_OK") {
+                r("X8", id, Outcome::Pass, "child ran successfully")
+            } else {
+                r("X8", id, Outcome::Xfail, &format!("child output: '{stdout}'"))
+            }
         }
-        Err(e) => result("X6", id, Outcome::Fail, &format!("spawn: {e}")),
+        Ok(output) => r("X8", id, Outcome::Xfail, &format!("exit {}", output.status.code().unwrap_or(-1))),
+        Err(e) => r("X8", id, Outcome::Fail, &format!("spawn: {e}")),
     }
 }

@@ -508,6 +508,12 @@ where
         }
     }
 
+    /// Returns `true` if there are TCP sockets still closing in the
+    /// background (data being flushed, FIN handshake in progress).
+    pub fn has_pending_closes(&self) -> bool {
+        !self.closing_in_background.is_empty()
+    }
+
     /// Remove dead sockets that were closing in the background
     fn remove_dead_sockets(&mut self) {
         self.closing_in_background.retain(|socket_handle| {

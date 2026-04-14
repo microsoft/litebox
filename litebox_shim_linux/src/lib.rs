@@ -533,6 +533,12 @@ impl<FS: ShimFS> LinuxShim<FS> {
         self.global.net.lock().perform_platform_interaction()
     }
 
+    /// Returns `true` if there are TCP sockets still closing in the
+    /// background (data being flushed, FIN handshake in progress).
+    pub fn has_pending_network_closes(&self) -> bool {
+        self.global.net.lock().has_pending_closes()
+    }
+
     /// Establish a TCP connection to the given address.
     ///
     /// Returns a [`transport::ShimTransport`] that can be used as a
