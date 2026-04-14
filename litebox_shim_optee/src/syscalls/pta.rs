@@ -6,7 +6,7 @@
 
 use crate::{Task, UserConstPtr, UserMutPtr};
 use litebox::{
-    platform::{RawConstPointer as _, RawMutPointer as _},
+    platform::{PlatformRootKeyProvider, RawConstPointer as _, RawMutPointer as _},
     utils::TruncateExt,
 };
 use litebox_common_optee::{TeeParamType, TeeResult, TeeUuid, UteeParams};
@@ -115,17 +115,21 @@ impl Task {
                     let output_addr: usize = output.0.truncate();
                     let output_ptr = UserMutPtr::<u8>::from_usize(output_addr);
 
-                    // TODO: checks whether output is within the secure memory
-
                     // TODO: derive a TA unique key using the hardware unique key (HUK), TA's UUID, and `extra_data`
                     litebox_util_log::debug!(
                         ptr:% = format_args!("{:#x}", output_addr),
                         size:% = output_len;
                         "derive key into secure memory"
                     );
-                    // TODO: replace below with a secure key derivation function
+                    let huk = self
+                        .global
+                        .platform
+                        .platform_root_key()
+                        .map_err(|_| TeeResult::NoData)?;
+                    // TODO: the below is a place holder. Replace it with a secure key derivation function (next PR)
                     let mut key_buf = alloc::vec![0u8; output_len];
-                    self.sys_cryp_random_number_generate(&mut key_buf)?;
+                    let copy_len = core::cmp::min(key_buf.len(), huk.len());
+                    key_buf[..copy_len].copy_from_slice(&huk[..copy_len]);
                     output_ptr
                         .copy_from_slice(0, &key_buf)
                         .ok_or(TeeResult::BadParameters)?;

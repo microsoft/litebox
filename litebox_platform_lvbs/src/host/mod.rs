@@ -8,6 +8,8 @@ pub mod lvbs_impl;
 pub mod per_cpu_variables;
 
 pub use lvbs_impl::LvbsLinuxKernel;
+#[cfg(feature = "optee_syscall")]
+pub use lvbs_impl::{PRK_LEN, set_platform_root_key};
 
 #[cfg(test)]
 pub mod mock;

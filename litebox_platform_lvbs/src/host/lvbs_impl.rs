@@ -114,6 +114,43 @@ impl litebox::platform::CrngProvider for LvbsLinuxKernel {
     }
 }
 
+/// Length of the Platform Root Key in bytes.
+#[cfg(feature = "optee_syscall")]
+pub const PRK_LEN: usize = 32;
+
+#[cfg(feature = "optee_syscall")]
+static PRK_ONCE: spin::Once<[u8; PRK_LEN]> = spin::Once::new();
+
+/// Sets the Platform Root Key (PRK) for this platform.
+///
+/// This should be called once during platform initialization with a key derived
+/// from hardware or a boot nonce.
+///
+/// # Panics
+/// Panics if `key` length does not match `PRK_LEN`.
+#[cfg(feature = "optee_syscall")]
+pub fn set_platform_root_key(key: &[u8]) {
+    assert_eq!(key.len(), PRK_LEN, "Platform Root Key length mismatch");
+    PRK_ONCE.call_once(|| {
+        let mut prk = [0u8; PRK_LEN];
+        prk.copy_from_slice(key);
+        prk
+    });
+}
+
+#[cfg(feature = "optee_syscall")]
+impl litebox::platform::PlatformRootKeyProvider for LvbsLinuxKernel {
+    fn platform_root_key(&self) -> Result<&[u8], litebox::platform::PlatformRootKeyError> {
+        PRK_ONCE
+            .get()
+            .map(<[u8; PRK_LEN]>::as_slice)
+            .ok_or(litebox::platform::PlatformRootKeyError)
+    }
+}
+
+#[cfg(not(feature = "optee_syscall"))]
+impl litebox::platform::PlatformRootKeyProvider for LvbsLinuxKernel {}
+
 pub struct HostLvbsInterface;
 
 impl HostLvbsInterface {}
