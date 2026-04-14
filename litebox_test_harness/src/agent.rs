@@ -53,14 +53,19 @@ pub fn run_agent(self_exe: &str, id: &str) {
     rt.block_on(async {
         let mut stdin = BufReader::new(tokio::io::stdin());
         let results = run_node(self_exe, id, Some(&mut stdin)).await;
-        // Write results to stdout for parent to read.
         for r in &results {
             println!("{}", serde_json::to_string(r).unwrap());
         }
         println!("{{\"done\":true}}");
         // Keep echo server alive until parent closes our stdin.
-        let mut buf = [0u8; 1];
-        let _ = stdin.read(&mut buf).await;
+        // Use a blocking thread so tokio can drive the echo server.
+        let (eof_tx, eof_rx) = tokio::sync::oneshot::channel::<()>();
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 1];
+            let _ = std::io::Read::read(&mut std::io::stdin(), &mut buf);
+            let _ = eof_tx.send(());
+        });
+        let _ = tokio::time::timeout(Duration::from_secs(60), eof_rx).await;
     });
 }
 
@@ -224,14 +229,17 @@ async fn run_node(
     }
 
     // If we have a parent, signal ready and wait for go.
+    // Use a blocking thread for stdin so the tokio runtime can
+    // continue driving the echo server while we wait.
     if has_parent {
-        // All our children are ready, echo server is running.
         println!("{{\"ready\":true}}");
-        // Wait for parent's "go" signal.
-        if let Some(reader) = parent_stdin.as_mut() {
+        let (go_tx, go_rx) = tokio::sync::oneshot::channel::<()>();
+        std::thread::spawn(move || {
             let mut line = String::new();
-            let _ = tokio::time::timeout(Duration::from_secs(30), reader.read_line(&mut line)).await;
-        }
+            let _ = std::io::BufRead::read_line(&mut std::io::stdin().lock(), &mut line);
+            let _ = go_tx.send(());
+        });
+        let _ = tokio::time::timeout(Duration::from_secs(30), go_rx).await;
     }
 
     // Run our own tests.
