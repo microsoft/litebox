@@ -117,6 +117,75 @@ fn main() {
                 .unwrap_or(0);
             std::process::exit(code);
         }
+        "tcp-pair-test" => {
+            // Minimal test of cross-worker TCP.
+            // Init binds port 9000, forks a child that connects and sends data.
+            use std::io::{Read, Write};
+            let listener = std::net::TcpListener::bind("0.0.0.0:9000").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            eprintln!("[tcp-pair-test] listening on 9000");
+
+            // Fork a child that connects and sends data.
+            let child = std::process::Command::new(self_exe)
+                .arg("tcp-send")
+                .arg("127.0.0.1:9000")
+                .arg("HELLO_FROM_CHILD")
+                .stdout(std::process::Stdio::inherit())
+                .stderr(std::process::Stdio::inherit())
+                .spawn();
+            match child {
+                Ok(mut c) => {
+                    eprintln!("[tcp-pair-test] child spawned, waiting...");
+                    // Poll accept for up to 10 seconds.
+                    let start = std::time::Instant::now();
+                    while start.elapsed() < std::time::Duration::from_secs(10) {
+                        match listener.accept() {
+                            Ok((mut stream, addr)) => {
+                                eprintln!("[tcp-pair-test] accepted from {addr}");
+                                stream.set_read_timeout(Some(std::time::Duration::from_secs(5))).ok();
+                                let mut buf = [0u8; 256];
+                                match stream.read(&mut buf) {
+                                    Ok(n) => {
+                                        let data = String::from_utf8_lossy(&buf[..n]);
+                                        println!("RECEIVED:{data}");
+                                    }
+                                    Err(e) => println!("READ_ERROR:{e}"),
+                                }
+                                break;
+                            }
+                            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                                std::thread::sleep(std::time::Duration::from_millis(50));
+                            }
+                            Err(e) => {
+                                println!("ACCEPT_ERROR:{e}");
+                                break;
+                            }
+                        }
+                    }
+                    let _ = c.wait();
+                }
+                Err(e) => println!("SPAWN_ERROR:{e}"),
+            }
+        }
+        "tcp-send" => {
+            // Child: connect to addr and send data, keeping connection open briefly.
+            let addr = args.get(2).expect("tcp-send requires addr");
+            let data = args.get(3).expect("tcp-send requires data");
+            eprintln!("[tcp-send] connecting to {addr}...");
+            match std::net::TcpStream::connect_timeout(
+                &addr.parse().unwrap(),
+                std::time::Duration::from_secs(5),
+            ) {
+                Ok(mut stream) => {
+                    use std::io::Write;
+                    eprintln!("[tcp-send] connected, sending {}", data.len());
+                    stream.write_all(data.as_bytes()).unwrap();
+                    stream.flush().unwrap();
+                    eprintln!("[tcp-send] done");
+                }
+                Err(e) => eprintln!("[tcp-send] connect failed: {e}"),
+            }
+        }
         "fork-diag" => {
             // Fork+exec a child that runs the "diag" subcommand.
             // This tests whether a worker process can execute and report.

@@ -2021,6 +2021,11 @@ fn run_program<FS: litebox_shim_linux::ShimFS>(
     }
 
     if let Some(net_worker) = net_worker {
+        // Allow the network worker to flush pending TCP data (e.g., data
+        // sent by the guest just before exiting). Without this, the worker
+        // shuts down immediately and cross-worker TCP bridges may lose
+        // in-flight data.
+        std::thread::sleep(core::time::Duration::from_millis(50));
         shutdown.store(true, core::sync::atomic::Ordering::Relaxed);
         net_worker.join().unwrap();
     }
