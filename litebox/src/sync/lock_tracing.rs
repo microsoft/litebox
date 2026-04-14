@@ -32,7 +32,7 @@
 
 use core::time::Duration;
 
-use arrayvec::{ArrayString, ArrayVec};
+use arrayvec::ArrayVec;
 
 use crate::platform::Instant as _;
 
@@ -477,20 +477,15 @@ struct LockTrackerX<Platform: ?Sized = dyn DynLockTrackerProvider> {
 /// lock tracking. This is necessary so that `LOCK_TRACKER` can be a singleton
 /// (no generics allowed in statics). The backing platform traits are not
 /// dyn-compatible.
+// XXX(jb): Now, after the move away from DebugLogProvider, can we remove this?
 trait DynLockTrackerProvider: Send + Sync {
     /// Gets the current time, relative to some unspecified epoch.
     fn now(&self) -> Duration;
-    /// Print a debug log message.
-    fn debug_log_print(&self, msg: &str);
 }
 
 impl<Platform: RawSyncPrimitivesProvider> DynLockTrackerProvider for LockTrackerPlatform<Platform> {
     fn now(&self) -> Duration {
         self.platform.now().duration_since(&self.start_time)
-    }
-
-    fn debug_log_print(&self, msg: &str) {
-        self.platform.debug_log_print(msg);
     }
 }
 
@@ -584,20 +579,6 @@ pub(crate) struct LockAttemptWitness {
     tracker: &'static LockTracker,
 }
 
-// A `println!` style macro that uses `debug_log_print` but gives a nicer interface.
-//
-// NOTE: If the print ever deadlocks/hangs, that means that there might be allocation being done by
-// the call, because it is longer than the size of the `SmallString`. Just bump up the number inside
-// the `SmallString` array below to 2x the value.
-macro_rules! debug_log_println {
-    ($platform:expr, $($tt:tt)*) => {{
-        use core::fmt::Write;
-        let mut t: ArrayString<1024> = ArrayString::new();
-        writeln!(t, $($tt)*).unwrap();
-        $platform.debug_log_print(&t);
-    }}
-}
-
 impl LockTracker {
     /// Mark the `lock_type` (at `lock_addr`) as being attempted to be locked. It is the caller's
     /// job to make sure `#[track_caller]` is inserted, and that things are kept in sync with the
@@ -623,6 +604,13 @@ impl LockTracker {
     pub(crate) fn mark_lock(attempt: LockAttemptWitness) -> LockedWitness {
         LockTrackerX::mark_lock(attempt)
     }
+}
+
+/// Visual indentation for lock depth in log output. The `!` is to indicate that we've gone further
+/// than we should
+fn depth_dots(n: usize) -> &'static str {
+    const DOTS: &str = ".............................................................!";
+    &DOTS[..n.min(DOTS.len())]
 }
 
 impl LockTrackerX {
@@ -660,28 +648,30 @@ impl LockTrackerX {
         };
         if CONFIG_PRINT_LOCK_ATTEMPTS {
             if let Some(t) = contended {
-                debug_log_println!(
-                    tracker.as_ref().unwrap().platform,
-                    "[LOCKTRACER{blank:.<width$}] Attempt {locked} CONTENDED @ {t}",
-                    blank = "",
-                    width = tracker.as_ref().unwrap().active(),
+                litebox_util_log::trace!(
+                    depth:% = depth_dots(tracker.as_ref().unwrap().active()),
+                    action:% = "attempt contended",
+                    lock:% = locked,
+                    contended_at:% = t;
+                    "LOCKTRACER"
                 );
             } else {
-                debug_log_println!(
-                    tracker.as_ref().unwrap().platform,
-                    "[LOCKTRACER{blank:.<width$}] Attempt {locked}",
-                    blank = "",
-                    width = tracker.as_ref().unwrap().active(),
+                litebox_util_log::trace!(
+                    depth:% = depth_dots(tracker.as_ref().unwrap().active()),
+                    action:% = "attempt",
+                    lock:% = locked;
+                    "LOCKTRACER"
                 );
             }
         } else if let Some(t) = contended
             && CONFIG_PRINT_CONTENDED_LOCKS
         {
-            debug_log_println!(
-                tracker.as_ref().unwrap().platform,
-                "[LOCKTRACER{blank:.<width$}] Attempt on {locked} is CONTENDED at {t}",
-                blank = "",
-                width = tracker.as_ref().unwrap().active(),
+            litebox_util_log::trace!(
+                depth:% = depth_dots(tracker.as_ref().unwrap().active()),
+                action:% = "attempt contended",
+                lock:% = locked,
+                contended_at:% = t;
+                "LOCKTRACER"
             );
         }
         if CONFIG_ENABLE_RECORDING {
@@ -720,20 +710,21 @@ impl LockTrackerX {
             let elapsed = tracker.platform.now().saturating_sub(start_time);
             if elapsed > max_allowed {
                 if let Some(contended) = contended_with {
-                    debug_log_println!(
-                        tracker.platform,
-                        "[LOCKTRACER{blank:.<width$}] LONG WAIT {elapsed:?} {locked}; was contended with {contended}",
-                        blank = "",
-                        width = tracker.active() - 1,
-                        locked = &tracker.held[idx].as_ref().unwrap(),
+                    litebox_util_log::warn!(
+                        depth:% = depth_dots(tracker.active() - 1),
+                        action:% = "long wait",
+                        elapsed:? = elapsed,
+                        lock:% = tracker.held[idx].as_ref().unwrap(),
+                        contended_at:% = contended;
+                        "LOCKTRACER"
                     );
                 } else {
-                    debug_log_println!(
-                        tracker.platform,
-                        "[LOCKTRACER{blank:.<width$}] LONG WAIT {elapsed:?} {locked}; was uncontended(!?!)",
-                        blank = "",
-                        width = tracker.active() - 1,
-                        locked = &tracker.held[idx].as_ref().unwrap(),
+                    litebox_util_log::warn!(
+                        depth:% = depth_dots(tracker.active() - 1),
+                        action:% = "long wait (uncontended)",
+                        elapsed:? = elapsed,
+                        lock:% = tracker.held[idx].as_ref().unwrap();
+                        "LOCKTRACER"
                     );
                 }
             }
@@ -741,19 +732,18 @@ impl LockTrackerX {
         if !CONFIG_PRINT_LOCKS_AND_UNLOCKS {
             // Do nothing
         } else if CONFIG_PRINT_REMAINING {
-            debug_log_println!(
-                tracker.platform,
-                "[LOCKTRACER{blank:.<width$}] Locked tracker={tracker}",
-                blank = "",
-                width = tracker.active() - 1,
+            litebox_util_log::trace!(
+                depth:% = depth_dots(tracker.active() - 1),
+                action:% = "locked",
+                tracker:% = &*tracker;
+                "LOCKTRACER"
             );
         } else {
-            debug_log_println!(
-                tracker.platform,
-                "[LOCKTRACER{blank:.<width$}] Locked {locked}",
-                blank = "",
-                width = tracker.active() - 1,
-                locked = &tracker.held[idx].as_ref().unwrap(),
+            litebox_util_log::trace!(
+                depth:% = depth_dots(tracker.active() - 1),
+                action:% = "locked",
+                lock:% = tracker.held[idx].as_ref().unwrap();
+                "LOCKTRACER"
             );
         }
         if CONFIG_ENABLE_RECORDING {
@@ -789,18 +779,19 @@ impl LockedWitness {
         if !CONFIG_PRINT_LOCKS_AND_UNLOCKS {
             // Do nothing
         } else if CONFIG_PRINT_REMAINING {
-            debug_log_println!(
-                tracker.platform,
-                "[LOCKTRACER{blank:.<width$}] Unlocked {locked} remaining={tracker}",
-                blank = "",
-                width = tracker.active(),
+            litebox_util_log::trace!(
+                depth:% = depth_dots(tracker.active()),
+                action:% = "unlocked",
+                lock:% = locked,
+                remaining:% = &*tracker;
+                "LOCKTRACER"
             );
         } else {
-            debug_log_println!(
-                tracker.platform,
-                "[LOCKTRACER{blank:.<width$}] Unlocked {locked}",
-                blank = "",
-                width = tracker.active(),
+            litebox_util_log::trace!(
+                depth:% = depth_dots(tracker.active()),
+                action:% = "unlocked",
+                lock:% = locked;
+                "LOCKTRACER"
             );
         }
         #[allow(clippy::manual_assert)]
