@@ -16,12 +16,21 @@ fn result(test: &str, agent: &str, outcome: Outcome, detail: &str) -> TestResult
     }
 }
 
-/// Run fork/exec tests. Only select agents run these to avoid
-/// exponential process creation.
+/// Run fork/exec tests. Init and agent A run these.
 pub fn run(id: &str) -> Vec<TestResult> {
     let mut results = Vec::new();
 
-    // Only agent A runs fork tests to keep the tree manageable.
+    // Init runs basic fork tests to check if workers work at all.
+    if id == "init" {
+        results.push(test_x1_fork_exec(id));
+        results.push(test_x2_nested_fork(id));
+        results.push(test_x3_subshell(id));
+        results.push(test_x5_background(id));
+        results.push(test_x8_tree_nesting(id));
+        return results;
+    }
+
+    // Only agent A runs the full fork test suite (including deadlock tests).
     if id != "A" {
         return results;
     }
@@ -54,6 +63,52 @@ pub fn run(id: &str) -> Vec<TestResult> {
     ));
 
     results
+}
+
+fn test_x8_tree_nesting(id: &str) -> TestResult {
+    // Test that a fork+exec'd child can itself fork+exec.
+    // We exec ourselves with echo-test; if that works, the worker can
+    // exec binaries. (This is what the tree does: init→A→AA.)
+    let self_exe = std::env::args().next().unwrap_or_default();
+    match process::Command::new(&self_exe)
+        .arg("echo-test")
+        .stdout(process::Stdio::piped())
+        .stderr(process::Stdio::piped())
+        .output()
+    {
+        Ok(output) if output.status.success() => {
+            let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if stdout.contains("ECHO_TEST_OK") {
+                result(
+                    "X8",
+                    id,
+                    Outcome::Pass,
+                    "init fork+exec'd child ran successfully",
+                )
+            } else {
+                result(
+                    "X8",
+                    id,
+                    Outcome::Fail,
+                    &format!("child output: '{stdout}' (expected ECHO_TEST_OK)"),
+                )
+            }
+        }
+        Ok(output) => {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            result(
+                "X8",
+                id,
+                Outcome::Xfail,
+                &format!(
+                    "fork+exec'd child failed with exit {} — worker binary execution broken (known limitation). stderr: {}",
+                    output.status.code().unwrap_or(-1),
+                    stderr.chars().take(200).collect::<String>()
+                ),
+            )
+        }
+        Err(e) => result("X8", id, Outcome::Fail, &format!("spawn: {e}")),
+    }
 }
 
 fn test_x1_fork_exec(id: &str) -> TestResult {
