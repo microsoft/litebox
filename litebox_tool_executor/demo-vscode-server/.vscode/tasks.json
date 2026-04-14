@@ -2,15 +2,31 @@
     "version": "2.0.0",
     "tasks": [
         {
+            "label": "LiteBox: Build",
+            "type": "process",
+            "command": "wsl.exe",
+            "args": [
+                "-d", "Ubuntu", "-u", "wportnoy", "--",
+                "bash", "-lc",
+                "cd /mnt/c/src/litebox-vscode-server && cargo build -p litebox_tool_executor -p litebox_broker -p litebox_runner_linux_userland"
+            ],
+            "group": "build",
+            "problemMatcher": "$rustc",
+            "presentation": {
+                "reveal": "always",
+                "panel": "shared",
+                "focus": false,
+                "echo": true
+            }
+        },
+        {
             "label": "LiteBox: Start VS Code Server",
             "type": "process",
             "command": "wsl.exe",
             "args": [
-                "-d", "Ubuntu", "--",
-                "/mnt/c/src/litebox-vscode-server/target/debug/litebox_tool_executor",
-                "--rootfs", "/home/wportnoy/vscode-rootfs",
-                "--vscode-server",
-                "--record-baseline"
+                "-d", "Ubuntu", "-u", "wportnoy", "--",
+                "bash", "-lc",
+                "cd /mnt/c/src/litebox-vscode-server && target/debug/litebox_tool_executor --rootfs /home/wportnoy/vscode-rootfs --vscode-server --ssh-port 2222"
             ],
             "problemMatcher": [],
             "isBackground": true,
@@ -25,13 +41,31 @@
             }
         },
         {
+            "label": "LiteBox: Start VS Code Server (Record Baseline)",
+            "type": "process",
+            "command": "wsl.exe",
+            "args": [
+                "-d", "Ubuntu", "-u", "wportnoy", "--",
+                "bash", "-lc",
+                "cd /mnt/c/src/litebox-vscode-server && target/debug/litebox_tool_executor --rootfs /home/wportnoy/vscode-rootfs --vscode-server --ssh-port 2222 --record-baseline"
+            ],
+            "problemMatcher": [],
+            "isBackground": true,
+            "presentation": {
+                "reveal": "always",
+                "panel": "dedicated",
+                "focus": false,
+                "echo": true
+            }
+        },
+        {
             "label": "LiteBox: Tail Audit Log",
             "type": "process",
             "command": "wsl.exe",
             "args": [
-                "-d", "Ubuntu", "--",
-                "bash", "-c",
-                "sleep 3 && tail -f $(ls -t /tmp/litebox-vscode-server-logs/*.jsonl 2>/dev/null | head -1) 2>/dev/null || echo 'No audit log found yet — waiting...' && sleep 30"
+                "-d", "Ubuntu", "-u", "wportnoy", "--",
+                "bash", "-lc",
+                "inotifywait -q -e create /tmp/litebox-vscode-server-logs/ 2>/dev/null; exec tail -f \"$(ls -t /tmp/litebox-vscode-server-logs/*.jsonl 2>/dev/null | head -1)\""
             ],
             "problemMatcher": [],
             "isBackground": true,
