@@ -203,18 +203,17 @@ pub fn emit_exit_event(syscall_name: &str, seq: u64, result: Result<usize, i32>)
     write_audit_line(&msg);
 }
 
-/// Write a line to the audit log fd or stderr.
+/// Write a line to the audit log fd. If no fd was configured via
+/// [`set_audit_log_fd`], the event is silently dropped.
 fn write_audit_line(msg: &str) {
     let fd = AUDIT_LOG_FD.load(Ordering::Relaxed);
     if fd >= 0 {
         use litebox::platform::DebugLogProvider as _;
         if !litebox_platform_multiplex::platform().debug_log_write_to_fd(fd, msg) {
-            litebox_platform_multiplex::platform().debug_log_print(msg);
+            // fd write failed — drop the event rather than polluting stderr.
         }
-    } else {
-        use litebox::platform::DebugLogProvider as _;
-        litebox_platform_multiplex::platform().debug_log_print(msg);
     }
+    // No fd configured → silently discard.
 }
 
 /// Helper for formatting args in the entry event.
