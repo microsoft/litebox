@@ -3,14 +3,13 @@
 
 //! Agent logic: spawn the process tree, coordinate tests, report results.
 //!
-//! Uses tokio's single-threaded runtime for concurrent TCP echo serving
-//! and test coordination without worker threads.
+//! Coordination uses 9P filesystem files (not TCP) to avoid the
+//! close-before-flush issue in cross-worker TCP bridges.
+//! TCP is used only for the network connectivity tests themselves.
 
 use crate::protocol::{AgentReady, Command, Outcome, TestResult};
 use std::collections::HashMap;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::{TcpListener, TcpStream};
-use tokio::time::{Duration, timeout};
+use tokio::time::Duration;
 
 /// Tree layout: maps parent → children.
 fn tree_children(id: &str) -> &'static [&'static str] {
@@ -36,6 +35,8 @@ pub fn agent_port(id: &str) -> u16 {
     }
 }
 
+const ALL_AGENTS: &[&str] = &["A", "B", "AA", "AB", "AAA", "AAB"];
+
 /// Run as the init/coordinator process.
 pub fn run_coordinator(self_exe: &str) -> Vec<TestResult> {
     let rt = tokio::runtime::Builder::new_current_thread()
@@ -46,231 +47,189 @@ pub fn run_coordinator(self_exe: &str) -> Vec<TestResult> {
 }
 
 /// Run as an agent node in the tree.
-pub fn run_agent(self_exe: &str, id: &str, coord_port: u16) {
+pub fn run_agent(self_exe: &str, id: &str) {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .expect("tokio runtime");
-    rt.block_on(agent_main(self_exe, id, coord_port));
+    rt.block_on(agent_main(self_exe, id));
 }
 
 async fn coordinator_main(self_exe: &str) -> Vec<TestResult> {
     let mut results = Vec::new();
+    let _ = std::fs::create_dir_all("/shared");
 
     // Phase 1: Init-only tests.
     eprintln!("[coord] Phase 1: init-only tests");
     results.extend(run_agent_tests("init", &[]));
 
-    // Phase 2: Spawn tree + collect registrations.
+    // Phase 2: Spawn tree, wait for agents via filesystem.
     eprintln!("[coord] Phase 2: spawning process tree");
-    let coord_port = agent_port("init");
-    let listener = TcpListener::bind(format!("0.0.0.0:{coord_port}"))
-        .await
-        .expect("coordinator bind");
-
     for &child_id in tree_children("init") {
-        spawn_child(self_exe, child_id, coord_port);
+        spawn_child(self_exe, child_id);
     }
 
-    // Collect registrations with timeout.
-    let expected = 6;
-    let mut peers: Vec<AgentReady> = Vec::new();
+    // Poll for ready markers from all agents.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    let mut ready_agents: Vec<AgentReady> = Vec::new();
 
-    let _ = timeout(Duration::from_secs(20), async {
-        while peers.len() < expected {
-            let (stream, _) = listener.accept().await.unwrap();
-            let mut reader = BufReader::new(stream);
-            let mut line = String::new();
-            if reader.read_line(&mut line).await.unwrap_or(0) > 0 {
-                if let Ok(ready) = serde_json::from_str::<AgentReady>(line.trim()) {
-                    eprintln!("[coord] agent {} registered on port {}", ready.id, ready.port);
-                    peers.push(ready);
+    while ready_agents.len() < ALL_AGENTS.len()
+        && tokio::time::Instant::now() < deadline
+    {
+        for &agent_id in ALL_AGENTS {
+            if ready_agents.iter().any(|r| r.id == agent_id) {
+                continue;
+            }
+            let path = format!("/shared/agent-{agent_id}-ready.json");
+            if let Ok(content) = std::fs::read_to_string(&path) {
+                if let Ok(ready) = serde_json::from_str::<AgentReady>(&content) {
+                    eprintln!("[coord] agent {} ready on port {}", ready.id, ready.port);
+                    ready_agents.push(ready);
                 }
             }
         }
-    })
-    .await;
+        if ready_agents.len() < ALL_AGENTS.len() {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
 
-    eprintln!("[coord] {} of {} agents registered", peers.len(), expected);
+    eprintln!(
+        "[coord] {} of {} agents ready",
+        ready_agents.len(),
+        ALL_AGENTS.len()
+    );
 
-    if peers.is_empty() {
+    if ready_agents.is_empty() {
         results.push(TestResult {
-            test: "TREE_REGISTER".to_string(),
+            test: "TREE".to_string(),
             agent: "init".to_string(),
             result: Outcome::Xfail,
-            detail: "no workers registered".to_string(),
+            detail: "no agents registered".to_string(),
         });
         print_results(&results);
         return results;
     }
 
-    // Phase 3: Broadcast "run tests".
-    eprintln!("[coord] Phase 3: cross-process tests ({} agents)", peers.len());
+    // Phase 3: Signal agents to run tests.
+    eprintln!("[coord] Phase 3: running cross-process tests");
     let cmd = Command::RunTests {
-        peers: peers.clone(),
+        peers: ready_agents.clone(),
     };
-    let cmd_json = serde_json::to_string(&cmd).unwrap();
-    for peer in &peers {
-        if let Ok(mut stream) =
-            TcpStream::connect(format!("127.0.0.1:{}", peer.port)).await
-        {
-            let _ = stream.write_all(format!("{cmd_json}\n").as_bytes()).await;
-        }
-    }
+    let _ = std::fs::write(
+        "/shared/run-tests.json",
+        serde_json::to_string(&cmd).unwrap(),
+    );
 
-    // Collect results with timeout.
-    let _ = timeout(Duration::from_secs(30), async {
-        loop {
-            let Ok((stream, _)) = listener.accept().await else {
-                break;
-            };
-            let mut reader = BufReader::new(stream);
-            let mut line = String::new();
-            while reader.read_line(&mut line).await.unwrap_or(0) > 0 {
-                if let Ok(result) = serde_json::from_str::<TestResult>(line.trim()) {
-                    results.push(result);
+    // Wait for agent results.
+    let result_deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let mut collected: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    while collected.len() < ready_agents.len()
+        && tokio::time::Instant::now() < result_deadline
+    {
+        for agent in &ready_agents {
+            if collected.contains(&agent.id) {
+                continue;
+            }
+            let path = format!("/shared/agent-{}-results.jsonl", agent.id);
+            if let Ok(content) = std::fs::read_to_string(&path) {
+                for line in content.lines() {
+                    if let Ok(result) = serde_json::from_str::<TestResult>(line) {
+                        results.push(result);
+                    }
                 }
-                line.clear();
+                collected.insert(agent.id.clone());
+                eprintln!("[coord] collected results from {}", agent.id);
             }
         }
-    })
-    .await;
-
-    // Broadcast shutdown.
-    let shutdown = serde_json::to_string(&Command::Shutdown).unwrap();
-    for peer in &peers {
-        if let Ok(mut stream) =
-            TcpStream::connect(format!("127.0.0.1:{}", peer.port)).await
-        {
-            let _ = stream.write_all(format!("{shutdown}\n").as_bytes()).await;
+        if collected.len() < ready_agents.len() {
+            tokio::time::sleep(Duration::from_millis(200)).await;
         }
     }
+
+    // Signal shutdown.
+    let _ = std::fs::write("/shared/shutdown", "1");
 
     print_results(&results);
     results
 }
 
-async fn agent_main(self_exe: &str, id: &str, coord_port: u16) {
-    eprintln!("[agent-{id}] starting, coord_port={coord_port}");
-
-    // Write alive marker.
+async fn agent_main(self_exe: &str, id: &str) {
+    eprintln!("[agent-{id}] starting");
     let _ = std::fs::create_dir_all("/shared");
-    let _ = std::fs::write(
-        format!("/shared/agent-{id}-alive.txt"),
-        format!("ALIVE_{id}"),
-    );
 
+    // Bind our test port.
     let port = agent_port(id);
-    let listener = TcpListener::bind(format!("0.0.0.0:{port}"))
+    let _listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{port}"))
         .await
         .unwrap_or_else(|e| panic!("agent {id}: bind {port}: {e}"));
     eprintln!("[agent-{id}] bound port {port}");
 
     // Spawn children.
     for &child_id in tree_children(id) {
-        spawn_child(self_exe, child_id, coord_port);
+        spawn_child(self_exe, child_id);
     }
 
-    // Register with coordinator.
-    eprintln!("[agent-{id}] registering with coordinator...");
-    match timeout(
-        Duration::from_secs(10),
-        TcpStream::connect(format!("127.0.0.1:{coord_port}")),
-    )
-    .await
-    {
-        Ok(Ok(mut stream)) => {
-            let ready = AgentReady {
-                id: id.to_string(),
-                pid: std::process::id(),
-                port,
-            };
-            let msg = serde_json::to_string(&ready).unwrap();
-            let _ = stream.write_all(format!("{msg}\n").as_bytes()).await;
-            let _ = stream.flush().await;
-            eprintln!("[agent-{id}] registered");
-        }
-        Ok(Err(e)) => {
-            eprintln!("[agent-{id}] FATAL: connect failed: {e}");
-            return;
-        }
-        Err(_) => {
-            eprintln!("[agent-{id}] FATAL: connect timeout");
-            return;
-        }
-    }
+    // Write ready marker.
+    let ready = AgentReady {
+        id: id.to_string(),
+        pid: std::process::id(),
+        port,
+    };
+    let _ = std::fs::write(
+        format!("/shared/agent-{id}-ready.json"),
+        serde_json::to_string(&ready).unwrap(),
+    );
+    eprintln!("[agent-{id}] ready");
 
-    // Wait for "run tests" command on our listener.
-    // Concurrently handle echo traffic on accepted connections.
-    let peers = match timeout(Duration::from_secs(30), async {
-        loop {
-            let (stream, _) = listener.accept().await.unwrap();
-            let mut reader = BufReader::new(stream);
-            let mut line = String::new();
-            if reader.read_line(&mut line).await.unwrap_or(0) > 0 {
-                if let Ok(Command::RunTests { peers }) =
-                    serde_json::from_str(line.trim())
-                {
-                    return peers;
-                }
+    // Wait for run-tests signal.
+    let peers = loop {
+        if let Ok(content) = std::fs::read_to_string("/shared/run-tests.json") {
+            if let Ok(Command::RunTests { peers }) = serde_json::from_str(&content) {
+                break peers;
             }
         }
-    })
-    .await
-    {
-        Ok(peers) => peers,
-        Err(_) => {
-            eprintln!("[agent-{id}] timeout waiting for run command");
+        if std::fs::metadata("/shared/shutdown").is_ok() {
             return;
         }
+        tokio::time::sleep(Duration::from_millis(100)).await;
     };
 
     // Run tests.
+    eprintln!("[agent-{id}] running tests");
     let test_results = run_agent_tests(id, &peers);
 
-    // Report results to coordinator.
-    if let Ok(mut stream) =
-        TcpStream::connect(format!("127.0.0.1:{coord_port}")).await
-    {
-        for r in &test_results {
-            let line = serde_json::to_string(r).unwrap();
-            let _ = stream.write_all(format!("{line}\n").as_bytes()).await;
-        }
-        let _ = stream.flush().await;
+    // Write results to file.
+    let mut output = String::new();
+    for r in &test_results {
+        output.push_str(&serde_json::to_string(r).unwrap());
+        output.push('\n');
     }
+    let _ = std::fs::write(
+        format!("/shared/agent-{id}-results.jsonl"),
+        &output,
+    );
+    eprintln!("[agent-{id}] done ({} tests)", test_results.len());
 
     // Wait for shutdown.
-    let _ = timeout(Duration::from_secs(60), async {
-        loop {
-            let Ok((stream, _)) = listener.accept().await else {
-                return;
-            };
-            let mut reader = BufReader::new(stream);
-            let mut line = String::new();
-            if reader.read_line(&mut line).await.unwrap_or(0) > 0 {
-                if serde_json::from_str::<Command>(line.trim())
-                    .is_ok_and(|c| matches!(c, Command::Shutdown))
-                {
-                    return;
-                }
-            }
+    loop {
+        if std::fs::metadata("/shared/shutdown").is_ok() {
+            return;
         }
-    })
-    .await;
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
 }
 
-fn spawn_child(self_exe: &str, child_id: &str, coord_port: u16) {
-    let result = std::process::Command::new(self_exe)
+fn spawn_child(self_exe: &str, child_id: &str) {
+    match std::process::Command::new(self_exe)
         .arg("agent")
         .arg("--id")
         .arg(child_id)
-        .arg("--coord-port")
-        .arg(coord_port.to_string())
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::inherit())
         .stderr(std::process::Stdio::inherit())
-        .spawn();
-    match result {
+        .spawn()
+    {
         Ok(child) => {
             eprintln!("[{child_id}] spawned (pid {:?})", child.id());
             std::mem::forget(child);

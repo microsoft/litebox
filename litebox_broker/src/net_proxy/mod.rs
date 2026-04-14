@@ -2313,6 +2313,17 @@ fn relay_tcp(sockets: &mut SocketSet<'_>, bridges: &mut Vec<TcpBridge>) {
     for (i, bridge) in bridges.iter_mut().enumerate() {
         let socket: &mut tcp::Socket = sockets.get_mut(bridge.smoltcp_handle);
 
+        // Log non-Established states to trace connection lifecycle.
+        let state = socket.state();
+        if state != tcp::State::Established {
+            info!(
+                "bridge[{i}] {} state={state:?} can_recv={} can_send={}",
+                bridge.dest,
+                socket.can_recv(),
+                socket.can_send(),
+            );
+        }
+
         // Guest → Host:peek from smoltcp, write to host, then consume only
         // the bytes the host actually accepted.
         if socket.can_recv() {

@@ -57,12 +57,7 @@ fn main() {
                 .and_then(|i| args.get(i + 1))
                 .map(String::as_str)
                 .unwrap_or("unknown");
-            let coord_port: u16 = args.iter()
-                .position(|a| a == "--coord-port")
-                .and_then(|i| args.get(i + 1))
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(9000);
-            agent::run_agent(self_exe, id, coord_port);
+            agent::run_agent(self_exe, id);
         }
         "echo-test" => {
             println!("ECHO_TEST_OK");
