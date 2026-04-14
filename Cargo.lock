@@ -1852,6 +1852,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "litebox_test_harness"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "litebox_tool_executor"
 version = "0.1.0"
 dependencies = [
