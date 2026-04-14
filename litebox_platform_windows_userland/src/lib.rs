@@ -1511,15 +1511,6 @@ impl litebox::platform::PunchthroughProvider for WindowsUserland {
     }
 }
 
-impl litebox::platform::DebugLogProvider for WindowsUserland {
-    fn debug_log_print(&self, msg: &str) {
-        // TODO: Implement Windows debug logging
-        // For now, use standard error output
-        use std::io::Write;
-        let _ = std::io::stderr().write_all(msg.as_bytes());
-    }
-}
-
 type UserConstPtr<T> = litebox::platform::common_providers::userspace_pointers::UserConstPtr<
     litebox::platform::common_providers::userspace_pointers::NoValidation,
     T,

@@ -1230,19 +1230,6 @@ impl litebox::platform::PunchthroughProvider for LinuxUserland {
     }
 }
 
-impl litebox::platform::DebugLogProvider for LinuxUserland {
-    fn debug_log_print(&self, msg: &str) {
-        let _ = unsafe {
-            syscalls::syscall3(
-                syscalls::Sysno::write,
-                litebox_common_linux::STDERR_FILENO as usize,
-                msg.as_ptr() as usize,
-                msg.len(),
-            )
-        };
-    }
-}
-
 type UserMutPtr<T> = litebox::platform::common_providers::userspace_pointers::UserMutPtr<
     litebox::platform::common_providers::userspace_pointers::NoValidation,
     T,

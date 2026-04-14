@@ -276,12 +276,6 @@ impl PunchthroughProvider for MockPlatform {
     }
 }
 
-impl DebugLogProvider for MockPlatform {
-    fn debug_log_print(&self, msg: &str) {
-        std::eprintln!("{msg}");
-    }
-}
-
 impl RawPointerProvider for MockPlatform {
     type RawConstPointer<T: zerocopy::FromBytes> = super::trivial_providers::TransparentConstPtr<T>;
     type RawMutPointer<T: zerocopy::FromBytes + zerocopy::IntoBytes> =

@@ -20,33 +20,13 @@ use zerocopy::{FromBytes, IntoBytes};
 
 pub use page_mgmt::PageManagementProvider;
 
-#[macro_export]
-macro_rules! log_println {
-    ($platform:expr, $s:expr) => {{
-        use $crate::platform::DebugLogProvider as _;
-        $platform.debug_log_print($s);
-    }};
-    ($platform:expr, $($tt:tt)*) => {{
-        use core::fmt::Write as _;
-        use $crate::platform::DebugLogProvider as _;
-        let mut t: arrayvec::ArrayString<8192> = arrayvec::ArrayString::new();
-        writeln!(t, $($tt)*).unwrap();
-        $platform.debug_log_print(&t);
-    }};
-}
-
 /// A provider of a platform upon which LiteBox can execute.
 ///
 /// Ideally, a [`Provider`] is zero-sized, and only exists to provide access to functionality
 /// provided by it. _However_, most of the provided APIs within the provider act upon an `&self` to
 /// allow storage of any useful "globals" within it necessary.
 pub trait Provider:
-    RawMutexProvider
-    + IPInterfaceProvider
-    + TimeProvider
-    + PunchthroughProvider
-    + DebugLogProvider
-    + RawPointerProvider
+    RawMutexProvider + IPInterfaceProvider + TimeProvider + PunchthroughProvider + RawPointerProvider
 {
 }
 
@@ -437,20 +417,6 @@ pub trait SystemTime: Send + Sync {
     /// point in time was measured; in such a case, it returns an `Err(_)` with the absolute
     /// duration.
     fn duration_since(&self, earlier: &Self) -> Result<core::time::Duration, core::time::Duration>;
-}
-
-/// An interface to dumping debug output for tracing purposes.
-pub trait DebugLogProvider {
-    /// Print `msg` to the debug log
-    ///
-    /// Newlines are *not* automatically appended to `msg`, thus the caller must make sure to
-    /// include newlines if necessary.
-    ///
-    /// One some platforms, this might be a slow/expensive operation, thus ideally callers of this
-    /// should prefer not making a large number of small prints to print a single logical message,
-    /// but instead should combine all strings part of a single logical message into a single
-    /// `debug_log_print` call.
-    fn debug_log_print(&self, msg: &str);
 }
 
 /// A common interface for raw pointers, aimed at usage in shims _above_ LiteBox.

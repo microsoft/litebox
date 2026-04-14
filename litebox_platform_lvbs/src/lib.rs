@@ -13,10 +13,9 @@ use core::{
 };
 use hashbrown::HashMap;
 use litebox::platform::{
-    DebugLogProvider, IPInterfaceProvider, ImmediatelyWokenUp, PageManagementProvider,
-    Punchthrough, PunchthroughProvider, PunchthroughToken, RawMutex as _, RawMutexProvider,
-    RawPointerProvider, StdioProvider, TimeProvider, UnblockedOrTimedOut,
-    page_mgmt::DeallocationError,
+    IPInterfaceProvider, ImmediatelyWokenUp, PageManagementProvider, Punchthrough,
+    PunchthroughProvider, PunchthroughToken, RawMutex as _, RawMutexProvider, RawPointerProvider,
+    StdioProvider, TimeProvider, UnblockedOrTimedOut, page_mgmt::DeallocationError,
 };
 use litebox::{
     mm::linux::{PAGE_SIZE, PageRange},
@@ -1051,12 +1050,6 @@ impl<Host: HostInterface> RawMutex<Host> {
                 }
             }
         }
-    }
-}
-
-impl<Host: HostInterface> DebugLogProvider for LinuxKernel<Host> {
-    fn debug_log_print(&self, msg: &str) {
-        Host::log(msg);
     }
 }
 

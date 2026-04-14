@@ -13,9 +13,8 @@ use litebox::mm::linux::PageRange;
 use litebox::platform::RawPointerProvider;
 use litebox::platform::page_mgmt::FixedAddressBehavior;
 use litebox::platform::{
-    DebugLogProvider, IPInterfaceProvider, ImmediatelyWokenUp, PageManagementProvider, Provider,
-    Punchthrough, PunchthroughProvider, PunchthroughToken, RawMutexProvider, TimeProvider,
-    UnblockedOrTimedOut,
+    IPInterfaceProvider, ImmediatelyWokenUp, PageManagementProvider, Provider, Punchthrough,
+    PunchthroughProvider, PunchthroughToken, RawMutexProvider, TimeProvider, UnblockedOrTimedOut,
 };
 use litebox_common_linux::PunchthroughSyscall;
 use litebox_common_linux::errno::Errno;
@@ -204,12 +203,6 @@ impl<Host: HostInterface> RawMutex<Host> {
                 todo!("Error: {:?}", e);
             }
         }
-    }
-}
-
-impl<Host: HostInterface> DebugLogProvider for LinuxKernel<Host> {
-    fn debug_log_print(&self, msg: &str) {
-        Host::log(msg);
     }
 }
 
