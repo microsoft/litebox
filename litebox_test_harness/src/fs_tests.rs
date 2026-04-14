@@ -19,14 +19,9 @@ fn r(test: &str, agent: &str, outcome: Outcome, detail: &str) -> TestResult {
 pub async fn run(id: &str, _peers: &HashMap<&str, &AgentReady>) -> Vec<TestResult> {
     let mut results = Vec::new();
 
-    // Write files for our children before they read.
-    for &child_id in children_of(id) {
-        let path = format!("/shared/{id}_for_{child_id}.txt");
-        let _ = fs::create_dir_all("/shared").await;
-        let _ = fs::write(&path, format!("FROM_PARENT_{id}")).await;
-    }
-
     // F1: Parent writes file, child reads it.
+    // The parent wrote /shared/{parent}_for_{child}.txt BEFORE sending
+    // the run command to our stdin, so the file should be visible.
     if id != "init" {
         let parent_id = parent_of(id);
         let path = format!("/shared/{parent_id}_for_{id}.txt");

@@ -43,6 +43,10 @@ fn main() {
             let passed = results.iter().filter(|r| r.result == protocol::Outcome::Pass).count();
             let failed = results.iter().filter(|r| r.result == protocol::Outcome::Fail).count();
             let xfail = results.iter().filter(|r| r.result == protocol::Outcome::Xfail).count();
+            // Print JSON results to stdout.
+            for r in &results {
+                println!("{}", serde_json::to_string(r).unwrap());
+            }
             eprintln!(
                 "\n=== SUMMARY: {} total, {} passed, {} failed, {} xfail ===",
                 results.len(), passed, failed, xfail
