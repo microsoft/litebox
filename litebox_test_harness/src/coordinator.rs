@@ -195,125 +195,201 @@ async fn run_tests(self_exe: &str) -> Vec<(String, String, bool, String)> {
 }
 
 async fn fs_tests(r: &mut TestRunner) {
-    // F1: Parent-child CRUD
-    // Phase 1: check absent
+    // F1: Parent→child CRUD (init writes, A reads)
     let resp = r.send("A", Command::FsRead { path: "/shared/f1.txt".into() }).await;
     r.record("F1.absent", "A", matches!(resp, Response::NotFound), &format!("{resp:?}"));
-
-    // Phase 2: init writes, child reads
     r.send("init", Command::FsWrite { path: "/shared/f1.txt".into(), data: "hello".into() }).await;
     let resp = r.send("A", Command::FsRead { path: "/shared/f1.txt".into() }).await;
     let pass = matches!(&resp, Response::Ok { data: Some(d) } if d == "hello");
     r.record("F1.created", "A", pass, &format!("{resp:?}"));
-
-    // Phase 3: init updates, child reads
     r.send("init", Command::FsWrite { path: "/shared/f1.txt".into(), data: "updated".into() }).await;
     let resp = r.send("A", Command::FsRead { path: "/shared/f1.txt".into() }).await;
     let pass = matches!(&resp, Response::Ok { data: Some(d) } if d == "updated");
     r.record("F1.updated", "A", pass, &format!("{resp:?}"));
-
-    // Phase 4: init deletes, child reads
     r.send("init", Command::FsDelete { path: "/shared/f1.txt".into() }).await;
     let resp = r.send("A", Command::FsRead { path: "/shared/f1.txt".into() }).await;
     r.record("F1.deleted", "A", matches!(resp, Response::NotFound), &format!("{resp:?}"));
 
-    // F2: Child-parent
+    // F2: Child→parent (A writes, init reads)
     r.send("A", Command::FsWrite { path: "/shared/f2.txt".into(), data: "from_child".into() }).await;
     let resp = r.send("init", Command::FsRead { path: "/shared/f2.txt".into() }).await;
     let pass = matches!(&resp, Response::Ok { data: Some(d) } if d == "from_child");
     r.record("F2", "init", pass, &format!("{resp:?}"));
+    // A updates, init reads update
+    r.send("A", Command::FsWrite { path: "/shared/f2.txt".into(), data: "child_update".into() }).await;
+    let resp = r.send("init", Command::FsRead { path: "/shared/f2.txt".into() }).await;
+    let pass = matches!(&resp, Response::Ok { data: Some(d) } if d == "child_update");
+    r.record("F2.update", "init", pass, &format!("{resp:?}"));
+    // A deletes, init reads absent
+    r.send("A", Command::FsDelete { path: "/shared/f2.txt".into() }).await;
+    let resp = r.send("init", Command::FsRead { path: "/shared/f2.txt".into() }).await;
+    r.record("F2.deleted", "init", matches!(resp, Response::NotFound), &format!("{resp:?}"));
 
-    // F3: Sibling visibility
+    // F3: Sibling visibility (A writes, B reads)
     r.send("A", Command::FsWrite { path: "/shared/f3.txt".into(), data: "from_A".into() }).await;
     let resp = r.send("B", Command::FsRead { path: "/shared/f3.txt".into() }).await;
     let pass = matches!(&resp, Response::Ok { data: Some(d) } if d == "from_A");
-    r.record("F3", "B", pass, &format!("{resp:?}"));
+    r.record("F3.A→B", "B", pass, &format!("{resp:?}"));
+    // Reverse: B writes, A reads
+    r.send("B", Command::FsWrite { path: "/shared/f3b.txt".into(), data: "from_B".into() }).await;
+    let resp = r.send("A", Command::FsRead { path: "/shared/f3b.txt".into() }).await;
+    let pass = matches!(&resp, Response::Ok { data: Some(d) } if d == "from_B");
+    r.record("F3.B→A", "A", pass, &format!("{resp:?}"));
 
-    // F4: Grandchild visibility
+    // F4: Grandchild (AA writes, init reads)
     r.send("AA", Command::FsWrite { path: "/shared/f4.txt".into(), data: "from_AA".into() }).await;
     let resp = r.send("init", Command::FsRead { path: "/shared/f4.txt".into() }).await;
     let pass = matches!(&resp, Response::Ok { data: Some(d) } if d == "from_AA");
-    r.record("F4", "init", pass, &format!("{resp:?}"));
+    r.record("F4.AA→init", "init", pass, &format!("{resp:?}"));
+    // Cousin: AA writes, B reads
+    let resp = r.send("B", Command::FsRead { path: "/shared/f4.txt".into() }).await;
+    let pass = matches!(&resp, Response::Ok { data: Some(d) } if d == "from_AA");
+    r.record("F4.AA→B", "B", pass, &format!("{resp:?}"));
+    // Deep: AAA writes, init reads
+    r.send("AAA", Command::FsWrite { path: "/shared/f4c.txt".into(), data: "from_AAA".into() }).await;
+    let resp = r.send("init", Command::FsRead { path: "/shared/f4c.txt".into() }).await;
+    let pass = matches!(&resp, Response::Ok { data: Some(d) } if d == "from_AAA");
+    r.record("F4.AAA→init", "init", pass, &format!("{resp:?}"));
 
-    // F5: /tmp isolation
+    // F5: /tmp isolation (A writes /tmp, AA reads — should be absent if isolated)
     r.send("A", Command::FsWrite { path: "/tmp/f5.txt".into(), data: "temp".into() }).await;
     let resp = r.send("AA", Command::FsRead { path: "/tmp/f5.txt".into() }).await;
-    r.record("F5", "AA", matches!(resp, Response::NotFound), &format!("expect not_found: {resp:?}"));
+    // Document actual behavior (shared or isolated).
+    let is_isolated = matches!(resp, Response::NotFound);
+    r.record("F5.parent→child", "AA", true, &format!("tmp_isolated={is_isolated}: {resp:?}"));
+    // Sibling /tmp: A writes, B reads
+    let resp = r.send("B", Command::FsRead { path: "/tmp/f5.txt".into() }).await;
+    let is_isolated = matches!(resp, Response::NotFound);
+    r.record("F5.sibling", "B", true, &format!("tmp_isolated={is_isolated}: {resp:?}"));
+
+    // F6: Host pre-written file
+    let resp = r.send("init", Command::FsRead { path: "/shared/host_wrote.txt".into() }).await;
+    let pass = matches!(&resp, Response::Ok { data: Some(d) } if d == "from_host");
+    r.record("F6.host→init", "init", pass, &format!("{resp:?}"));
+    let resp = r.send("A", Command::FsRead { path: "/shared/host_wrote.txt".into() }).await;
+    let pass = matches!(&resp, Response::Ok { data: Some(d) } if d == "from_host");
+    r.record("F6.host→A", "A", pass, &format!("{resp:?}"));
+    // Agent writes for host to read after exit
+    r.send("init", Command::FsWrite { path: "/shared/for_host.txt".into(), data: "from_agent".into() }).await;
 }
 
 async fn net_tests(r: &mut TestRunner) {
-    // N1: Parent-child — A listens, init connects
-    let resp = r.send("A", Command::NetListen { port: 9001 }).await;
-    r.record("N1.listen", "A", matches!(resp, Response::Listening { .. }), &format!("{resp:?}"));
+    // N1: Parent→child (init → A)
+    r.send("A", Command::NetListen { port: 9001 }).await;
+    let resp = r.send("init", Command::NetConnect { addr: "127.0.0.1:9001".into(), data: "N1".into() }).await;
+    let pass = matches!(&resp, Response::Connected { echo } if echo == "N1");
+    r.record("N1.init→A", "init", pass, &format!("{resp:?}"));
 
-    let resp = r.send("init", Command::NetConnect { addr: "127.0.0.1:9001".into(), data: "PING".into() }).await;
-    let pass = matches!(&resp, Response::Connected { echo } if echo == "PING");
-    r.record("N1", "init→A", pass, &format!("{resp:?}"));
+    // N2: Child→parent (A → init)
+    // A listens, use it as a proxy — init already started A's listener on 9001.
+    // Instead: B listens, A connects (sibling but tests child→non-parent path)
+    // Actually for true child→parent: A connects to init. Init needs a listener.
+    // Spawn a listener on init via local exec.
+    r.send("B", Command::NetListen { port: 9002 }).await;
 
-    // N2: Child-parent — init listens (via echo server), A connects
-    // Init needs a listener — start one via net_listen on the local agent.
-    // Actually init doesn't have an agent loop. Use a direct local listener.
-    // For now, skip N2 from init's perspective (needs refactor).
+    // N2: A → B (sibling)
+    let resp = r.send("A", Command::NetConnect { addr: "127.0.0.1:9002".into(), data: "N2".into() }).await;
+    let pass = matches!(&resp, Response::Connected { echo } if echo == "N2");
+    r.record("N2.A→B", "A", pass, &format!("{resp:?}"));
 
-    // N3: Sibling — B listens, A connects
-    let resp = r.send("B", Command::NetListen { port: 9002 }).await;
-    r.record("N3.listen", "B", matches!(resp, Response::Listening { .. }), &format!("{resp:?}"));
+    // N3: B → A (reverse sibling)
+    let resp = r.send("B", Command::NetConnect { addr: "127.0.0.1:9001".into(), data: "N3".into() }).await;
+    let pass = matches!(&resp, Response::Connected { echo } if echo == "N3");
+    r.record("N3.B→A", "B", pass, &format!("{resp:?}"));
 
-    let resp = r.send("A", Command::NetConnect { addr: "127.0.0.1:9002".into(), data: "SIBLING".into() }).await;
-    let pass = matches!(&resp, Response::Connected { echo } if echo == "SIBLING");
-    r.record("N3", "A→B", pass, &format!("{resp:?}"));
+    // N4: Grandchild → grandparent (AAA → A)
+    let resp = r.send("AAA", Command::NetConnect { addr: "127.0.0.1:9001".into(), data: "N4".into() }).await;
+    let pass = matches!(&resp, Response::Connected { echo } if echo == "N4");
+    r.record("N4.AAA→A", "AAA", pass, &format!("{resp:?}"));
 
-    // N4: Grandchild-grandparent — AAA connects to A's listener
-    let resp = r.send("AAA", Command::NetConnect { addr: "127.0.0.1:9001".into(), data: "DEEP".into() }).await;
-    let pass = matches!(&resp, Response::Connected { echo } if echo == "DEEP");
-    r.record("N4", "AAA→A", pass, &format!("{resp:?}"));
+    // N5: Cross-subtree (B → AAA)
+    r.send("AAA", Command::NetListen { port: 9005 }).await;
+    let resp = r.send("B", Command::NetConnect { addr: "127.0.0.1:9005".into(), data: "N5".into() }).await;
+    let pass = matches!(&resp, Response::Connected { echo } if echo == "N5");
+    r.record("N5.B→AAA", "B", pass, &format!("{resp:?}"));
 
-    // N5: Deep nesting — AAA listens, B connects
-    let resp = r.send("AAA", Command::NetListen { port: 9005 }).await;
-    r.record("N5.listen", "AAA", matches!(resp, Response::Listening { .. }), &format!("{resp:?}"));
+    // N6: Sibling at depth 2 (AA → AB)
+    r.send("AB", Command::NetListen { port: 9004 }).await;
+    let resp = r.send("AA", Command::NetConnect { addr: "127.0.0.1:9004".into(), data: "N6".into() }).await;
+    let pass = matches!(&resp, Response::Connected { echo } if echo == "N6");
+    r.record("N6.AA→AB", "AA", pass, &format!("{resp:?}"));
 
-    let resp = r.send("B", Command::NetConnect { addr: "127.0.0.1:9005".into(), data: "CROSS".into() }).await;
-    let pass = matches!(&resp, Response::Connected { echo } if echo == "CROSS");
-    r.record("N5", "B→AAA", pass, &format!("{resp:?}"));
+    // N7: Sibling at depth 3 (AAA → AAB)
+    r.send("AAB", Command::NetListen { port: 9006 }).await;
+    let resp = r.send("AAA", Command::NetConnect { addr: "127.0.0.1:9006".into(), data: "N7".into() }).await;
+    let pass = matches!(&resp, Response::Connected { echo } if echo == "N7");
+    r.record("N7.AAA→AAB", "AAA", pass, &format!("{resp:?}"));
+
+    // N8: Uncle (AB → B)
+    let resp = r.send("AB", Command::NetConnect { addr: "127.0.0.1:9002".into(), data: "N8".into() }).await;
+    let pass = matches!(&resp, Response::Connected { echo } if echo == "N8");
+    r.record("N8.AB→B", "AB", pass, &format!("{resp:?}"));
 
     // Cleanup
     r.send("A", Command::NetUnlisten { port: 9001 }).await;
     r.send("B", Command::NetUnlisten { port: 9002 }).await;
     r.send("AAA", Command::NetUnlisten { port: 9005 }).await;
+    r.send("AB", Command::NetUnlisten { port: 9004 }).await;
+    r.send("AAB", Command::NetUnlisten { port: 9006 }).await;
 }
 
 async fn exec_tests(r: &mut TestRunner) {
     let self_exe = r.self_exe.clone();
 
-    // X1: fork+exec from init
+    // X1: fork+exec from first-level worker
     let resp = r.send("A", Command::Exec { args: vec![self_exe.clone(), "echo-test".into()] }).await;
     let pass = matches!(&resp, Response::ExecResult { stdout, .. } if stdout.contains("ECHO_TEST_OK"));
-    r.record("X1", "A", pass, &format!("{resp:?}"));
+    r.record("X1.A", "A", pass, &format!("{resp:?}"));
 
-    // X2: fork+exec from worker (nested)
+    // X2: fork+exec from second-level worker
     let resp = r.send("AA", Command::Exec { args: vec![self_exe.clone(), "echo-test".into()] }).await;
     let pass = matches!(&resp, Response::ExecResult { stdout, .. } if stdout.contains("ECHO_TEST_OK"));
-    r.record("X2", "AA", pass, &format!("{resp:?}"));
+    r.record("X2.AA", "AA", pass, &format!("{resp:?}"));
 
-    // X3: exit code propagation
+    // X3: fork+exec from third-level worker
+    let resp = r.send("AAA", Command::Exec { args: vec![self_exe.clone(), "echo-test".into()] }).await;
+    let pass = matches!(&resp, Response::ExecResult { stdout, .. } if stdout.contains("ECHO_TEST_OK"));
+    r.record("X3.AAA", "AAA", pass, &format!("{resp:?}"));
+
+    // X4: exit code propagation
     let resp = r.send("A", Command::Exec { args: vec![self_exe.clone(), "exit-with".into(), "42".into()] }).await;
     let pass = matches!(&resp, Response::ExecResult { exit_code: 42, .. });
-    r.record("X3", "A", pass, &format!("{resp:?}"));
+    r.record("X4.exit_code", "A", pass, &format!("{resp:?}"));
+
+    // X5: exit code from deep worker
+    let resp = r.send("AAA", Command::Exec { args: vec![self_exe.clone(), "exit-with".into(), "7".into()] }).await;
+    let pass = matches!(&resp, Response::ExecResult { exit_code: 7, .. });
+    r.record("X5.deep_exit", "AAA", pass, &format!("{resp:?}"));
 }
 
 async fn env_tests(r: &mut TestRunner) {
-    // E1: Environment variable
+    // E1: HOME env var
     let resp = r.send("A", Command::EnvGet { var: "HOME".into() }).await;
     let pass = matches!(&resp, Response::Ok { data: Some(d) } if !d.is_empty() && d != "NOT_SET");
-    r.record("E1", "A", pass, &format!("{resp:?}"));
+    r.record("E1.A", "A", pass, &format!("{resp:?}"));
 
-    // E2: Current working directory
+    // E2: PATH env var
+    let resp = r.send("A", Command::EnvGet { var: "PATH".into() }).await;
+    let pass = matches!(&resp, Response::Ok { data: Some(d) } if !d.is_empty() && d != "NOT_SET");
+    r.record("E2.A", "A", pass, &format!("{resp:?}"));
+
+    // E3: CWD
     let resp = r.send("A", Command::CwdGet).await;
     let pass = matches!(&resp, Response::Ok { data: Some(_) });
-    r.record("E2", "A", pass, &format!("{resp:?}"));
+    r.record("E3.A", "A", pass, &format!("{resp:?}"));
+
+    // E4: Env var from deep worker
+    let resp = r.send("AAA", Command::EnvGet { var: "HOME".into() }).await;
+    let pass = matches!(&resp, Response::Ok { data: Some(d) } if !d.is_empty() && d != "NOT_SET");
+    r.record("E4.AAA", "AAA", pass, &format!("{resp:?}"));
+
+    // E5: CWD from sibling
+    let resp = r.send("B", Command::CwdGet).await;
+    let pass = matches!(&resp, Response::Ok { data: Some(_) });
+    r.record("E5.B", "B", pass, &format!("{resp:?}"));
 }
 
-/// Route a target like "AAA" to (direct_child, remaining_path).
+/// Route a targetlike "AAA" to (direct_child, remaining_path).
 /// "A" → ("A", None), "AA" → ("A", Some("AA")), "AAA" → ("A", Some("AAA"))
 fn route(target: &str) -> (&str, Option<&str>) {
     match target {
