@@ -12,6 +12,10 @@ use std::path::{Path, PathBuf};
 extern crate alloc;
 
 /// Run Linux programs with LiteBox on unmodified Linux
+///
+/// Detailed logging can be controlled via the `LITEBOX_LOG` environment variable. For example:
+/// - `LITEBOX_LOG=debug` to show debug and higher level logs
+/// - `LITEBOX_LOG=litebox=debug,litebox::fs=trace` for multiple filters at different levels
 #[derive(Parser, Debug)]
 #[allow(clippy::struct_excessive_bools)]
 pub struct CliArgs {
@@ -124,6 +128,16 @@ fn mmapped_file(path: impl AsRef<Path>) -> Result<MmappedFile> {
 /// panic. If it does actually panic, then ping the authors of LiteBox, and likely a better error
 /// message could be thrown instead.
 pub fn run(cli_args: CliArgs) -> Result<()> {
+    tracing_subscriber::fmt()
+        .with_timer(tracing_subscriber::fmt::time::uptime())
+        .with_level(true)
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::builder()
+                .with_env_var("LITEBOX_LOG")
+                .from_env_lossy(),
+        )
+        .init();
+
     if !cli_args.insert_files.is_empty() {
         unimplemented!(
             "this should (hopefully soon) have a nicer interface to support loading in files"
