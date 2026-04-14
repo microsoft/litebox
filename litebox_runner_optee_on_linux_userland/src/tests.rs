@@ -118,12 +118,11 @@ fn handle_ta_command_output(params: &UteeParams) {
         match param_type {
             TeeParamType::ValueOutput | TeeParamType::ValueInout => {
                 if let Ok(Some((value_a, value_b))) = params.get_values(idx) {
-                    litebox::log_println!(
-                        litebox_platform_multiplex::platform(),
-                        "output (index: {}): {:#x} {:#x}",
-                        idx,
-                        value_a,
-                        value_b,
+                    litebox_util_log::info!(
+                        idx:% = idx,
+                        value_a:% = format_args!("{:#x}", value_a),
+                        value_b:% = format_args!("{:#x}", value_b);
+                        "output"
                     );
                     // TODO: return the outcome to VTL0
                 }
@@ -134,28 +133,25 @@ fn handle_ta_command_output(params: &UteeParams) {
                     let ptr: UserConstPtr<u8> = UserConstPtr::from_ptr(addr as *const u8);
                     let slice = ptr.to_owned_slice(len).unwrap_or_default();
                     if slice.is_empty() {
-                        litebox::log_println!(
-                            litebox_platform_multiplex::platform(),
-                            "output (index: {}): {:#x}",
-                            idx,
-                            addr
+                        litebox_util_log::info!(
+                            idx:% = idx,
+                            addr:% = format_args!("{:#x}", addr);
+                            "output"
                         );
                     } else if slice.len() < 16 {
-                        litebox::log_println!(
-                            litebox_platform_multiplex::platform(),
-                            "output (index: {}): {:#x} {:?}",
-                            idx,
-                            addr,
-                            slice
+                        litebox_util_log::info!(
+                            idx:% = idx,
+                            addr:% = format_args!("{:#x}", addr),
+                            data:? = slice;
+                            "output"
                         );
                     } else {
-                        litebox::log_println!(
-                            litebox_platform_multiplex::platform(),
-                            "output (index: {}): {:#x} {:?}... (total {} bytes)",
-                            idx,
-                            addr,
-                            &slice[..16],
-                            slice.len()
+                        litebox_util_log::info!(
+                            idx:% = idx,
+                            addr:% = format_args!("{:#x}", addr),
+                            data:? = &slice[..16],
+                            total:% = slice.len();
+                            "output"
                         );
                     }
                     // TODO: return the outcome to VTL0

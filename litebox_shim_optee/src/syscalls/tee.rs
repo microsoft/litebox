@@ -38,7 +38,7 @@ impl Task {
     #[allow(clippy::unused_self)]
     pub fn sys_return(&self, ret: usize) -> usize {
         #[cfg(debug_assertions)]
-        litebox::log_println!(self.global.platform, "sys_return: ret {}", ret);
+        litebox_util_log::debug!(ret:% = ret; "sys_return");
 
         ret
     }
@@ -47,17 +47,25 @@ impl Task {
     ///
     /// Per OP-TEE OS behavior: when a TA panics, the kernel returns `TEE_ERROR_TARGET_DEAD`
     /// to the caller, regardless of the panic code. The panic code is logged for debugging.
+    #[expect(
+        clippy::unused_self,
+        reason = "self was used by the old platform-threaded logging API"
+    )]
     pub fn sys_panic(&self, code: usize) -> usize {
-        litebox::log_println!(self.global.platform, "TA panic with code {:#x}", code,);
+        litebox_util_log::error!(code:% = format_args!("{:#x}", code); "TA panic");
 
         // Return TARGET_DEAD to match OP-TEE OS behavior
         litebox_common_optee::TeeResult::TargetDead as usize
     }
 
     /// A system call to print out a message.
+    #[expect(
+        clippy::unused_self,
+        reason = "self was used by the old platform-threaded logging API"
+    )]
     pub fn sys_log(&self, buf: &[u8]) -> Result<(), TeeResult> {
         let msg = core::str::from_utf8(buf).map_err(|_| TeeResult::BadFormat)?;
-        litebox::log_println!(self.global.platform, "{}", msg);
+        litebox_util_log::info!(msg:% = msg; "sys_log");
         Ok(())
     }
 

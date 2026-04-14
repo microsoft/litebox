@@ -34,13 +34,12 @@ impl Task {
         };
 
         #[cfg(debug_assertions)]
-        litebox::log_println!(
-            self.global.platform,
-            "sys_map_zi: va {:#x} (addr {:#x}), num_bytes {}, flags {:#x}",
-            va.as_usize(),
-            addr,
-            num_bytes,
-            flags
+        litebox_util_log::debug!(
+            va:% = format_args!("{:#x}", va.as_usize()),
+            addr:% = format_args!("{:#x}", addr),
+            num_bytes:% = num_bytes,
+            flags:% = format_args!("{:#x}", flags);
+            "sys_map_zi"
         );
 
         let accept_flags = LdelfMapFlags::LDELF_MAP_FLAG_SHAREABLE;
@@ -94,11 +93,10 @@ impl Task {
     /// OP-TEE's syscall to open a TA binary.
     pub fn sys_open_bin(&self, ta_uuid: TeeUuid, handle: UserMutPtr<u32>) -> Result<(), TeeResult> {
         #[cfg(debug_assertions)]
-        litebox::log_println!(
-            self.global.platform,
-            "sys_open_bin: ta_uuid {:?}, handle {:#x}",
-            ta_uuid,
-            handle.as_usize()
+        litebox_util_log::debug!(
+            ta_uuid:? = ta_uuid,
+            handle:% = format_args!("{:#x}", handle.as_usize());
+            "sys_open_bin"
         );
 
         if self.global.get_ta_bin(&ta_uuid).is_none() {
@@ -113,7 +111,7 @@ impl Task {
     /// OP-TEE's syscall to close a TA binary.
     pub fn sys_close_bin(&self, handle: u32) -> Result<(), TeeResult> {
         #[cfg(debug_assertions)]
-        litebox::log_println!(self.global.platform, "sys_close_bin: handle {}", handle);
+        litebox_util_log::debug!(handle:% = handle; "sys_close_bin");
 
         if self.ta_handle_map.get(handle).is_none() {
             Err(TeeResult::BadParameters)
@@ -140,17 +138,16 @@ impl Task {
         };
 
         #[cfg(debug_assertions)]
-        litebox::log_println!(
-            self.global.platform,
-            "sys_map_bin: va {:#x} (addr {:#x}), num_bytes {}, handle {}, offs {}, pad_begin {}, pad_end {}, flags {:#x}",
-            va.as_usize(),
-            addr,
-            num_bytes,
-            handle,
-            offs,
-            pad_begin,
-            pad_end,
-            flags
+        litebox_util_log::debug!(
+            va:% = format_args!("{:#x}", va.as_usize()),
+            addr:% = format_args!("{:#x}", addr),
+            num_bytes:% = num_bytes,
+            handle:% = handle,
+            offs:% = offs,
+            pad_begin:% = pad_begin,
+            pad_end:% = pad_end,
+            flags:% = format_args!("{:#x}", flags);
+            "sys_map_bin"
         );
 
         let accept_flags = LdelfMapFlags::LDELF_MAP_FLAG_SHAREABLE
@@ -272,13 +269,12 @@ impl Task {
         handle: u32,
     ) -> Result<(), TeeResult> {
         #[cfg(debug_assertions)]
-        litebox::log_println!(
-            self.global.platform,
-            "sys_cp_from_bin: dst {:#x}, offs {}, num_bytes {}, handle {}",
-            dst,
-            offs,
-            num_bytes,
-            handle,
+        litebox_util_log::debug!(
+            dst:% = format_args!("{:#x}", dst),
+            offs:% = offs,
+            num_bytes:% = num_bytes,
+            handle:% = handle;
+            "sys_cp_from_bin"
         );
 
         self.read_ta_bin(handle, UserMutPtr::from_usize(dst), offs, num_bytes)

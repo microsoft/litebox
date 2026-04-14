@@ -179,10 +179,9 @@ pub fn handle_optee_smc_args(
 ) -> Result<OpteeSmcResult<'_>, OpteeSmcReturnCode> {
     let func_id = smc.func_id()?;
     #[cfg(debug_assertions)]
-    litebox::log_println!(
-        litebox_platform_multiplex::platform(),
-        "OP-TEE SMC Function: {:?}",
-        func_id
+    litebox_util_log::debug!(
+        func_id:? = func_id;
+        "OP-TEE SMC function"
     );
     match func_id {
         OpteeSmcFunction::CallWithArg => {

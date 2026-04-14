@@ -38,6 +38,7 @@ x86_64 = { version = "0.15.2", default-features = false, features = ["instructio
 
 [dev-dependencies]
 libc = "0.2.177"
+litebox_util_log = { version = "0.1.0", path = "../litebox_util_log" }
 
 [features]
 default = ["optee_syscall"]

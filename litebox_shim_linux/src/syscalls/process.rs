@@ -732,7 +732,7 @@ impl<FS: ShimFS> Task<FS> {
             )
         };
         if let Err(err) = r {
-            litebox::log_println!(self.global.platform, "failed to spawn thread: {}", err);
+            litebox_util_log::error!(err:% = err; "failed to spawn thread");
             // Treat all spawn errors as `ENOMEM`. `EAGAIN` and other errors are
             // for conditions the user can control (such as "in-shim" rlimit
             // violations).

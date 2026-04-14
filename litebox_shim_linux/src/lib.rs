@@ -70,11 +70,8 @@ impl<T: litebox::fs::FileSystem + Send + Sync + 'static> ShimFS for T {}
 
 /// On debug builds, logs that the user attempted to use an unsupported feature.
 fn log_unsupported_fmt(args: core::fmt::Arguments<'_>) {
-    use litebox::platform::DebugLogProvider as _;
-
     if cfg!(debug_assertions) {
-        let msg = alloc::format!("WARNING: unsupported: {args}\n");
-        litebox_platform_multiplex::platform().debug_log_print(&msg);
+        litebox_util_log::warn!(feature:% = args; "unsupported");
     }
 }
 

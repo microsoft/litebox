@@ -1464,10 +1464,7 @@ impl<FS: ShimFS> Task<FS> {
                         |_file_fd| {
                             // TODO: stdio NONBLOCK?
                             #[cfg(debug_assertions)]
-                            litebox::log_println!(
-                                self.global.platform,
-                                "Attempted to set non-blocking on raw fd; currently unimplemented"
-                            );
+                            litebox_util_log::debug!("set non-blocking on raw fd unimplemented");
                             Ok(())
                         },
                         |socket_fd| {
@@ -1592,7 +1589,7 @@ impl<FS: ShimFS> Task<FS> {
             )?,
             _ => {
                 #[cfg(debug_assertions)]
-                litebox::log_println!(self.global.platform, "\n\n\n{:?}\n\n\n", arg);
+                litebox_util_log::debug!(arg:? = arg; "unhandled ioctl");
                 todo!()
             }
         }

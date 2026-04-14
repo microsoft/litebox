@@ -580,12 +580,11 @@ impl<FS: ShimFS> Task<FS> {
                             // STOP is not currently supported, so treat as
                             // terminate. Core dumps are also not currently
                             // supported.
-                            litebox::log_println!(
-                                self.global.platform,
-                                "-- Fatal signal {:?}: terminating task {}:{}",
-                                signal,
-                                self.pid,
-                                self.tid,
+                            litebox_util_log::error!(
+                                signal:? = signal,
+                                pid:% = self.pid,
+                                tid:% = self.tid;
+                                "fatal signal: terminating task"
                             );
                             self.exit_group(ExitStatus::Signal(signal));
                         }

@@ -118,11 +118,10 @@ impl Task {
                     // TODO: checks whether output is within the secure memory
 
                     // TODO: derive a TA unique key using the hardware unique key (HUK), TA's UUID, and `extra_data`
-                    litebox::log_println!(
-                        self.global.platform,
-                        "derive a key and store it in the secure memory (ptr: {:#x}, size: {})",
-                        output_addr,
-                        output_len
+                    litebox_util_log::debug!(
+                        ptr:% = format_args!("{:#x}", output_addr),
+                        size:% = output_len;
+                        "derive key into secure memory"
                     );
                     // TODO: replace below with a secure key derivation function
                     let mut key_buf = alloc::vec![0u8; output_len];

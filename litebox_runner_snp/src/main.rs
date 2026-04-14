@@ -89,13 +89,12 @@ pub extern "C" fn page_fault_handler(pt_regs: &mut litebox_common_linux::PtRegs)
                     }
             }
 
-            litebox::log_println!(
-                litebox_platform_multiplex::platform(),
-                "page fault at {} for {} with code {} failed: {}",
-                pt_regs.rip,
-                addr,
-                code,
-                e
+            litebox_util_log::error!(
+                rip:% = pt_regs.rip,
+                addr:% = addr,
+                code:% = code,
+                err:% = e;
+                "page fault failed"
             );
             litebox_platform_multiplex::platform()
                 .terminate(globals::SM_SEV_TERM_SET, globals::SM_TERM_EXCEPTION);
@@ -163,7 +162,7 @@ pub extern "C" fn sandbox_process_init(
     );
     let platform = litebox_platform_linux_kernel::host::snp::snp_impl::SnpLinuxKernel::new(pgd);
     #[cfg(debug_assertions)]
-    litebox::log_println!(platform, "sandbox_process_init called\n");
+    litebox_util_log::debug!("sandbox_process_init called");
 
     litebox_platform_multiplex::set_platform(platform);
     let shim_builder = litebox_shim_linux::LinuxShimBuilder::new();
@@ -258,7 +257,7 @@ pub extern "C" fn sandbox_process_init(
     {
         Ok(program) => program,
         Err(err) => {
-            litebox::log_println!(platform, "failed to load program: {}", err);
+            litebox_util_log::error!(err:% = err; "failed to load program");
             litebox_platform_linux_kernel::host::snp::snp_impl::HostSnpInterface::terminate(
                 globals::SM_SEV_TERM_SET,
                 globals::SM_TERM_GENERAL,
@@ -299,10 +298,7 @@ pub extern "C" fn sandbox_tun_read_write() {
         core::hint::spin_loop();
     };
     #[cfg(debug_assertions)]
-    litebox::log_println!(
-        litebox_platform_multiplex::platform(),
-        "sandbox_tun_read_write started\n"
-    );
+    litebox_util_log::debug!("sandbox_tun_read_write started");
     while !litebox_platform_linux_kernel::host::snp::snp_impl::all_threads_exited() {
         let _timeout = loop {
             match shim

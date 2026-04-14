@@ -29,7 +29,6 @@ use crate::{
     },
     host::mock::{MockHostInterface, MockKernel},
     mm::{MemoryProvider, pgtable::PageTableAllocator},
-    mock_log_println,
 };
 
 use super::pgtable::PageTableImpl;
@@ -48,7 +47,7 @@ impl litebox::mm::allocator::MemoryProvider for MockKernel {
         let end = Page::<Size4KiB>::from_start_address(VirtAddr::new((start + len) as _)).unwrap();
         for page in Page::range(begin, end) {
             if mapping.is_full() {
-                mock_log_println!("MAPPING is OOM");
+                litebox_util_log::error!("MAPPING is OOM");
                 panic!()
             }
             mapping.push(page.start_address());
@@ -86,7 +85,7 @@ impl super::MemoryProvider for MockKernel {
         assert!(va.is_some());
         let va = *va.unwrap();
         if va.is_null() {
-            mock_log_println!("Invalid PA");
+            litebox_util_log::error!("Invalid PA");
             panic!("Invalid PA");
         }
         va
