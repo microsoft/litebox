@@ -63,6 +63,16 @@ pub enum InterceptionBackend {
 /// panic. If it does actually panic, then ping the authors of LiteBox, and likely a better error
 /// message could be thrown instead.
 pub fn run(cli_args: CliArgs) -> Result<()> {
+    tracing_subscriber::fmt()
+        .with_timer(tracing_subscriber::fmt::time::uptime())
+        .with_level(true)
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::builder()
+                .with_env_var("LITEBOX_LOG")
+                .from_env_lossy(),
+        )
+        .init();
+
     let ldelf_data: Vec<u8> = {
         let ldelf = PathBuf::from(&cli_args.ldelf);
         let data = std::fs::read(ldelf).unwrap();

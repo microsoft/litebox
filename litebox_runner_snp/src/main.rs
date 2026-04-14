@@ -17,6 +17,26 @@ use litebox::{
 };
 use litebox_platform_linux_kernel::{HostInterface, host::snp::ghcb::ghcb_prints};
 
+/// `log` backend that forwards to the GHCB serial console.
+struct HostLogger;
+
+impl log::Log for HostLogger {
+    fn enabled(&self, _metadata: &log::Metadata) -> bool {
+        true
+    }
+
+    fn log(&self, record: &log::Record) {
+        use core::fmt::Write;
+        let mut buf: arrayvec::ArrayString<1024> = arrayvec::ArrayString::new();
+        let _ = writeln!(buf, "[{}] {}", record.level(), record.args());
+        ghcb_prints(&buf);
+    }
+
+    fn flush(&self) {}
+}
+
+static HOST_LOGGER: HostLogger = HostLogger;
+
 type Platform = litebox_platform_linux_kernel::host::snp::snp_impl::SnpLinuxKernel;
 type DefaultFS = litebox::fs::layered::FileSystem<
     Platform,
@@ -104,6 +124,10 @@ pub extern "C" fn sandbox_kernel_init(
     boot_params: &'static litebox_platform_linux_kernel::host::snp::snp_impl::vmpl2_boot_params,
 ) {
     ghcb_prints("sandbox_kernel_init called\n");
+
+    let _ = log::set_logger(&HOST_LOGGER);
+    log::set_max_level(log::LevelFilter::Trace);
+
     let ghcb_page = litebox_platform_linux_kernel::arch::PhysAddr::new(boot_params.ghcb_page);
     let ghcb_page_va = litebox_platform_linux_kernel::arch::VirtAddr::new(boot_params.ghcb_page_va);
     if litebox_platform_linux_kernel::host::snp::ghcb::GhcbProtocol::setup_ghcb_page(

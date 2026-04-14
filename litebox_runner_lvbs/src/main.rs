@@ -21,6 +21,26 @@ use litebox_platform_lvbs::{
 use x86_64::VirtAddr;
 use x86_64::structures::paging::PageTableFlags;
 
+/// `log` backend that forwards to the serial console.
+struct HostLogger;
+
+impl log::Log for HostLogger {
+    fn enabled(&self, _metadata: &log::Metadata) -> bool {
+        true
+    }
+
+    fn log(&self, record: &log::Record) {
+        use core::fmt::Write;
+        let mut buf: arrayvec::ArrayString<1024> = arrayvec::ArrayString::new();
+        let _ = writeln!(buf, "[{}] {}", record.level(), record.args());
+        litebox_platform_lvbs::arch::ioport::serial_print_string(&buf);
+    }
+
+    fn flush(&self) {}
+}
+
+static HOST_LOGGER: HostLogger = HostLogger;
+
 /// Spinlock protecting the shared AP boot stack (`VTL1_KERNEL_STACK_PAGE`).
 ///
 /// All APs receive the same initial RSP via `hvcall_enable_vp_vtl`. VTL0
@@ -425,6 +445,9 @@ pub unsafe extern "C" fn _start() -> ! {
 
 unsafe extern "C" fn kernel_main(is_bsp: bool) -> ! {
     if is_bsp {
+        let _ = log::set_logger(&HOST_LOGGER);
+        log::set_max_level(log::LevelFilter::Trace);
+
         serial_println!("==============================");
         serial_println!(" Hello from LiteBox for LVBS! ");
         serial_println!("==============================");

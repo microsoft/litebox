@@ -51,6 +51,16 @@ pub struct CliArgs {
 /// panic. If it does actually panic, then ping the authors of LiteBox, and likely a better error
 /// message could be thrown instead.
 pub fn run(cli_args: CliArgs) -> Result<()> {
+    tracing_subscriber::fmt()
+        .with_timer(tracing_subscriber::fmt::time::uptime())
+        .with_level(true)
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::builder()
+                .with_env_var("LITEBOX_LOG")
+                .from_env_lossy(),
+        )
+        .init();
+
     let tar_file = &cli_args.initial_files;
     if tar_file.extension().and_then(|x| x.to_str()) != Some("tar") {
         anyhow::bail!("Expected a .tar file, found {}", tar_file.display());
