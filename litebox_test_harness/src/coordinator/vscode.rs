@@ -138,7 +138,7 @@ pub(super) async fn vscode_repro_tests(r: &mut TestRunner) {
         r.record("V7.auto_shutdown", "A", true, "skipped (binary not found)");
     } else {
         let still_running = matches!(&resp, Response::ExecResult { stdout, .. } if stdout.contains("STILL_RUNNING"));
-        r.record_xfail("V7.auto_shutdown","A", still_running, "Node.js I/O error prevents code-server start", &format!("{resp:?}"));
+        r.record("V7.auto_shutdown", "A", still_running, &format!("{resp:?}"));
     }
     let _ = r.send("A", exec(bash("rm -f /tmp/t7-test.sock"))).await;
 }
