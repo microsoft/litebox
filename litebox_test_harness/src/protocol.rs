@@ -63,6 +63,11 @@ pub enum Command {
     #[serde(rename = "unix_socket_test")]
     UnixSocketTest { path: String },
 
+    /// Test cross-process Unix socket relay: start a server, fork a child
+    /// that connects, verify bidirectional data flow.
+    #[serde(rename = "unix_socket_relay")]
+    UnixSocketRelay { path: String, self_exe: String },
+
     /// Proceed (used after coordination points).
     #[serde(rename = "go")]
     Go,

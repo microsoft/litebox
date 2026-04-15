@@ -301,6 +301,11 @@ async fn agent_loop(self_exe: &str) {
                 respond(&result).await;
             }
 
+            Command::UnixSocketRelay { path, self_exe } => {
+                let result = unix_socket_relay_test(&path, &self_exe).await;
+                respond(&result).await;
+            }
+
             Command::Exit => {
                 // Abort all echo servers.
                 for (_, task) in listeners.drain() {
@@ -440,6 +445,90 @@ async fn unix_socket_test(path: &str) -> Response {
             },
             Err(e) => Response::Error {
                 error: format!("unix client task: {e}"),
+            },
+        },
+    }
+}
+
+/// Test cross-process Unix socket relay: start a server in this process,
+/// fork a child (via self_exe unix-echo-client) that connects and sends data,
+/// verify the echo round-trip. This mimics the CLI↔code-server path where
+/// the CLI creates a Unix socket and code-server (a forked child) connects to it.
+async fn unix_socket_relay_test(path: &str, self_exe: &str) -> Response {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let _ = tokio::fs::remove_file(path).await;
+
+    // Step 1: Bind and listen.
+    let listener = match tokio::net::UnixListener::bind(path) {
+        Ok(l) => l,
+        Err(e) => {
+            return Response::Error {
+                error: format!("relay bind({path}): {e}"),
+            };
+        }
+    };
+
+    // Step 2: Fork a child process that connects and sends data.
+    let mut child = match tokio::process::Command::new(self_exe)
+        .args(["unix-echo-client", path, "RELAY_TEST_DATA"])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            let _ = tokio::fs::remove_file(path).await;
+            return Response::Error {
+                error: format!("relay spawn client: {e}"),
+            };
+        }
+    };
+
+    // Step 3: Accept the connection and echo data back.
+    let accept_result = tokio::time::timeout(Duration::from_secs(5), async {
+        let (mut stream, _) = listener.accept().await?;
+        let mut buf = [0u8; 4096];
+        let n = stream.read(&mut buf).await?;
+        stream.write_all(&buf[..n]).await?;
+        stream.flush().await?;
+        Ok::<usize, std::io::Error>(n)
+    })
+    .await;
+
+    // Step 4: Wait for the child and read its output.
+    let child_result =
+        tokio::time::timeout(Duration::from_secs(5), child.wait_with_output()).await;
+
+    drop(listener);
+    let _ = tokio::fs::remove_file(path).await;
+
+    match accept_result {
+        Err(_) => Response::Error {
+            error: "relay accept timeout (client never connected)".to_string(),
+        },
+        Ok(Err(e)) => Response::Error {
+            error: format!("relay accept/echo: {e}"),
+        },
+        Ok(Ok(_)) => match child_result {
+            Ok(Ok(output)) => {
+                let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+                if stdout == "RELAY_TEST_DATA" {
+                    Response::Ok {
+                        data: Some("unix_relay_ok".to_string()),
+                    }
+                } else {
+                    Response::Error {
+                        error: format!("relay got: {stdout:?} stderr: {stderr:?}"),
+                    }
+                }
+            }
+            Ok(Err(e)) => Response::Error {
+                error: format!("relay client wait: {e}"),
+            },
+            Err(_) => Response::Error {
+                error: "relay client timeout".to_string(),
             },
         },
     }

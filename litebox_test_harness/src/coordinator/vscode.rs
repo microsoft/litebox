@@ -45,17 +45,20 @@ pub(super) async fn vscode_repro_tests(r: &mut TestRunner) {
         let _ = r.send("B", Command::NetUnlisten { port: 9100 }).await;
     }
 
-    // T3: /tmp file creation from forked bash
-    // Reproduces Issue 3: /tmp/.vscode-bootstrap-N.sh: Permission denied.
-    let resp = r.send("A", exec(bash("echo tmp_write_test > /tmp/t3-test.sh && cat /tmp/t3-test.sh && rm /tmp/t3-test.sh"))).await;
-    let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout.contains("tmp_write_test"));
-    let timeout = matches!(&resp, Response::ExecTimeout { .. });
-    r.record("V3.tmp_write", "A", pass, &format!("timeout={timeout} {resp:?}"));
+    // V3: /tmp file creation from worker
+    // Verifies sandbox policy allows /tmp writes (was blocked before GlobPolicy fix).
+    r.send("A", Command::FsWrite { path: "/tmp/v3-test.txt".into(), data: "tmp_write_test".into() }).await;
+    let resp = r.send("A", Command::FsRead { path: "/tmp/v3-test.txt".into() }).await;
+    let pass = matches!(&resp, Response::Ok { data: Some(d) } if d == "tmp_write_test");
+    r.record("V3.tmp_write", "A", pass, &format!("{resp:?}"));
+    let _ = r.send("A", Command::FsDelete { path: "/tmp/v3-test.txt".into() }).await;
 
-    // T3b: /tmp write from deeper worker
-    let resp = r.send("AA", exec(bash("echo deep_tmp > /tmp/t3b-test.sh && cat /tmp/t3b-test.sh && rm /tmp/t3b-test.sh"))).await;
-    let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout.contains("deep_tmp"));
+    // V3b: /tmp write from deeper worker
+    r.send("AA", Command::FsWrite { path: "/tmp/v3b-test.txt".into(), data: "deep_tmp".into() }).await;
+    let resp = r.send("AA", Command::FsRead { path: "/tmp/v3b-test.txt".into() }).await;
+    let pass = matches!(&resp, Response::Ok { data: Some(d) } if d == "deep_tmp");
     r.record("V3b.tmp_write_deep", "AA", pass, &format!("{resp:?}"));
+    let _ = r.send("AA", Command::FsDelete { path: "/tmp/v3b-test.txt".into() }).await;
 
     // T4: Node.js code-server startup
     // Reproduces Issue 1: code-server process dies after ~75s.
@@ -79,25 +82,25 @@ pub(super) async fn vscode_repro_tests(r: &mut TestRunner) {
     // Clean up socket.
     let _ = r.send("A", exec(bash("rm -f /tmp/t4-test.sock"))).await;
 
-    // T5: Unix socket bidirectional data flow (cross-process)
-    // Mimics CLI↔code-server: one process listens on a Unix socket,
-    // another connects and sends data. Verifies echo round-trip.
-    // Uses Rust subcommands (unix-echo-server/client) instead of python3.
-    // bash orchestrates server background + client foreground.
+    // V5: Cross-process Unix socket relay
+    // The agent starts a Unix socket server, forks a child (unix-echo-client)
+    // that connects, sends data, and reads the echo. Tests the same path as
+    // CLI↔code-server (parent creates socket, forked child connects).
     let self_exe = r.self_exe.clone();
-    let resp = r.send("A", exec_timeout(bash(
-        &format!("rm -f /tmp/t5.sock; \
-         {self_exe} unix-echo-server /tmp/t5.sock & \
-         SERVER_PID=$!; \
-         sleep 1; \
-         RESULT=$({self_exe} unix-echo-client /tmp/t5.sock UNIX_ECHO_TEST 2>&1); \
-         kill -9 $SERVER_PID 2>/dev/null; \
-         echo \"t5_result=$RESULT\"; \
-         rm -f /tmp/t5.sock")
-    ), 20)).await;
-    let pass = matches!(&resp, Response::ExecResult { stdout, .. } if stdout.contains("t5_result=UNIX_ECHO_TEST"));
-    let timeout = matches!(&resp, Response::ExecTimeout { .. });
-    r.record_xfail("V5.unix_relay", "A", pass, "cross-process Unix socket data relay", &format!("timeout={timeout} {resp:?}"));
+    let resp = r.send("A", Command::UnixSocketRelay {
+        path: "/tmp/v5-relay.sock".into(),
+        self_exe: self_exe.clone(),
+    }).await;
+    let pass = matches!(&resp, Response::Ok { data: Some(d) } if d.contains("unix_relay_ok"));
+    r.record("V5.unix_relay", "A", pass, &format!("{resp:?}"));
+
+    // V5b: Same from deeper worker
+    let resp = r.send("AA", Command::UnixSocketRelay {
+        path: "/tmp/v5b-relay.sock".into(),
+        self_exe,
+    }).await;
+    let pass = matches!(&resp, Response::Ok { data: Some(d) } if d.contains("unix_relay_ok"));
+    r.record("V5b.unix_relay_deep", "AA", pass, &format!("{resp:?}"));
 
     // T6: code-server stderr capture — does it create the Unix socket?
     // Run code-server, wait briefly, check if /tmp/t6-test.sock exists.
