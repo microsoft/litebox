@@ -1,107 +1,248 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-//! Unix domain socket tests — in-process and cross-process relay.
+//! Unix domain socket tests — decomposed into primitive operations.
 
-use super::TestRunner;
+use super::{exec, TestRunner};
 use crate::protocol::{Command, Response};
 
 pub(super) async fn unix_tests(r: &mut TestRunner) {
-    // U1: In-process Unix socket lifecycle
-    // Create, bind, listen, accept (via tokio task), send, recv — all within
-    // the same agent process. Tests basic AF_UNIX support.
+    let self_exe = r.self_exe.clone();
+
+    // U1: In-process Unix socket echo
+    // Agent binds a Unix socket, then connects to itself.
+    let resp = r
+        .send("A", Command::UnixListen { path: "/tmp/u1.sock".into() })
+        .await;
+    r.record(
+        "U1.listen",
+        "A",
+        matches!(&resp, Response::UnixListening { .. }),
+        &format!("{resp:?}"),
+    );
+
     let resp = r
         .send(
             "A",
-            Command::UnixSocketTest {
+            Command::UnixConnect {
                 path: "/tmp/u1.sock".into(),
+                data: "U1_DATA".into(),
             },
         )
         .await;
-    let pass = matches!(&resp, Response::Ok { data: Some(d) } if d.contains("unix_socket_ok"));
-    r.record("U1.in_process", "A", pass, &format!("{resp:?}"));
+    let pass = matches!(&resp, Response::Connected { echo } if echo == "U1_DATA");
+    r.record("U1.connect", "A", pass, &format!("{resp:?}"));
+
+    let resp = r
+        .send("A", Command::UnixUnlisten { path: "/tmp/u1.sock".into() })
+        .await;
+    r.record(
+        "U1.unlisten",
+        "A",
+        matches!(&resp, Response::Ok { .. }),
+        &format!("{resp:?}"),
+    );
 
     // U1b: Same from a deeper worker
     let resp = r
+        .send("AA", Command::UnixListen { path: "/tmp/u1b.sock".into() })
+        .await;
+    r.record(
+        "U1b.listen",
+        "AA",
+        matches!(&resp, Response::UnixListening { .. }),
+        &format!("{resp:?}"),
+    );
+    let resp = r
         .send(
             "AA",
-            Command::UnixSocketTest {
+            Command::UnixConnect {
+                path: "/tmp/u1b.sock".into(),
+                data: "U1B_DATA".into(),
+            },
+        )
+        .await;
+    let pass = matches!(&resp, Response::Connected { echo } if echo == "U1B_DATA");
+    r.record("U1b.connect", "AA", pass, &format!("{resp:?}"));
+    let _ = r
+        .send(
+            "AA",
+            Command::UnixUnlisten {
                 path: "/tmp/u1b.sock".into(),
             },
         )
         .await;
-    let pass = matches!(&resp, Response::Ok { data: Some(d) } if d.contains("unix_socket_ok"));
-    r.record("U1b.in_process_deep", "AA", pass, &format!("{resp:?}"));
 
-    // U2: Cross-process relay — parent binds, forked child connects
-    let self_exe = r.self_exe.clone();
+    // U2: Parent server, forked child client
+    // Agent A listens, then forks unix-echo-client to connect.
     let resp = r
-        .send(
-            "A",
-            Command::UnixSocketRelay {
-                path: "/tmp/u2.sock".into(),
-                self_exe: self_exe.clone(),
-            },
-        )
+        .send("A", Command::UnixListen { path: "/tmp/u2.sock".into() })
         .await;
-    let pass = matches!(&resp, Response::Ok { data: Some(d) } if d.contains("unix_relay_ok"));
-    r.record("U2.parent_server", "A", pass, &format!("{resp:?}"));
-
-    // U3: Reverse relay — forked child binds, parent connects
-    // This is the VS Code pattern (code-server creates socket, CLI connects).
+    r.record(
+        "U2.listen",
+        "A",
+        matches!(&resp, Response::UnixListening { .. }),
+        &format!("{resp:?}"),
+    );
     let resp = r
         .send(
             "A",
-            Command::UnixSocketReverseRelay {
-                path: "/tmp/u3.sock".into(),
-                self_exe: self_exe.clone(),
-            },
+            exec(vec![
+                self_exe.clone(),
+                "unix-echo-client".into(),
+                "/tmp/u2.sock".into(),
+                "U2_CHILD_DATA".into(),
+            ]),
         )
         .await;
     let pass =
-        matches!(&resp, Response::Ok { data: Some(d) } if d.contains("unix_reverse_relay_ok"));
-    r.record("U3.child_server", "A", pass, &format!("{resp:?}"));
+        matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout.contains("U2_CHILD_DATA"));
+    r.record("U2.child_connect", "A", pass, &format!("{resp:?}"));
+    let _ = r
+        .send("A", Command::UnixUnlisten { path: "/tmp/u2.sock".into() })
+        .await;
 
-    // U4: Parent-server relay from deeper worker
+    // U3: Forked child server, parent client (VS Code pattern)
+    // Fork unix-echo-server as background process, then parent connects.
     let resp = r
         .send(
-            "AA",
-            Command::UnixSocketRelay {
-                path: "/tmp/u4.sock".into(),
-                self_exe: self_exe.clone(),
+            "A",
+            Command::ExecBackground {
+                args: vec![
+                    self_exe.clone(),
+                    "unix-echo-server".into(),
+                    "/tmp/u3.sock".into(),
+                ],
             },
         )
         .await;
-    let pass = matches!(&resp, Response::Ok { data: Some(d) } if d.contains("unix_relay_ok"));
-    r.record("U4.deep_parent_server", "AA", pass, &format!("{resp:?}"));
+    let server_pid = match &resp {
+        Response::Background { pid } => Some(*pid),
+        _ => None,
+    };
+    r.record(
+        "U3.server_start",
+        "A",
+        server_pid.is_some(),
+        &format!("{resp:?}"),
+    );
+
+    // Wait for server to bind.
+    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+
+    let resp = r
+        .send(
+            "A",
+            Command::UnixConnect {
+                path: "/tmp/u3.sock".into(),
+                data: "U3_REVERSE".into(),
+            },
+        )
+        .await;
+    let pass = matches!(&resp, Response::Connected { echo } if echo == "U3_REVERSE");
+    r.record("U3.parent_connect", "A", pass, &format!("{resp:?}"));
+
+    if let Some(pid) = server_pid {
+        let _ = r.send("A", Command::Kill { pid }).await;
+    }
+    let _ = r
+        .send("A", Command::UnixUnlisten { path: "/tmp/u3.sock".into() })
+        .await;
+
+    // U4: Parent server from deeper worker
+    let resp = r
+        .send(
+            "AA",
+            Command::UnixListen {
+                path: "/tmp/u4.sock".into(),
+            },
+        )
+        .await;
+    r.record(
+        "U4.listen",
+        "AA",
+        matches!(&resp, Response::UnixListening { .. }),
+        &format!("{resp:?}"),
+    );
+    let resp = r
+        .send(
+            "AA",
+            exec(vec![
+                self_exe.clone(),
+                "unix-echo-client".into(),
+                "/tmp/u4.sock".into(),
+                "U4_DEEP".into(),
+            ]),
+        )
+        .await;
+    let pass =
+        matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout.contains("U4_DEEP"));
+    r.record("U4.child_connect", "AA", pass, &format!("{resp:?}"));
+    let _ = r
+        .send(
+            "AA",
+            Command::UnixUnlisten {
+                path: "/tmp/u4.sock".into(),
+            },
+        )
+        .await;
 
     // U5: Reverse relay from deeper worker
     let resp = r
         .send(
             "AA",
-            Command::UnixSocketReverseRelay {
-                path: "/tmp/u5.sock".into(),
-                self_exe,
+            Command::ExecBackground {
+                args: vec![
+                    self_exe,
+                    "unix-echo-server".into(),
+                    "/tmp/u5.sock".into(),
+                ],
             },
         )
         .await;
-    let pass =
-        matches!(&resp, Response::Ok { data: Some(d) } if d.contains("unix_reverse_relay_ok"));
-    r.record("U5.deep_child_server", "AA", pass, &format!("{resp:?}"));
+    let server_pid = match &resp {
+        Response::Background { pid } => Some(*pid),
+        _ => None,
+    };
+    r.record(
+        "U5.server_start",
+        "AA",
+        server_pid.is_some(),
+        &format!("{resp:?}"),
+    );
+
+    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+
+    let resp = r
+        .send(
+            "AA",
+            Command::UnixConnect {
+                path: "/tmp/u5.sock".into(),
+                data: "U5_DEEP_REVERSE".into(),
+            },
+        )
+        .await;
+    let pass = matches!(&resp, Response::Connected { echo } if echo == "U5_DEEP_REVERSE");
+    r.record("U5.parent_connect", "AA", pass, &format!("{resp:?}"));
+
+    if let Some(pid) = server_pid {
+        let _ = r.send("AA", Command::Kill { pid }).await;
+    }
+    let _ = r
+        .send(
+            "AA",
+            Command::UnixUnlisten {
+                path: "/tmp/u5.sock".into(),
+            },
+        )
+        .await;
 
     // U6: Sibling Unix socket — document known limitation.
-    // Two sibling workers (A and B) run in separate litebox worker
-    // processes, each with an independent Unix socket address table.
-    // A socket created by worker A is not visible to worker B.
-    // This is a fundamental architecture constraint of delayed-fork:
-    // each worker is a separate host process with its own shim state.
-    // TCP works between siblings (via broker cross-worker bridging) but
-    // Unix sockets do not have an equivalent bridge.
     r.record_xfail(
         "U6.sibling",
         "A↔B",
         false,
         "sibling workers have independent Unix socket address tables",
-        "not executed — architectural limitation, not a test",
+        "not executed — architectural limitation",
     );
 }

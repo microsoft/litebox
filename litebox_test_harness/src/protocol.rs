@@ -59,20 +59,25 @@ pub enum Command {
     #[serde(rename = "cwd_get")]
     CwdGet,
 
-    /// Test Unix domain socket lifecycle (create, bind, listen, connect, send, receive).
-    #[serde(rename = "unix_socket_test")]
-    UnixSocketTest { path: String },
+    /// Bind a Unix domain socket listener. Starts an echo handler task.
+    #[serde(rename = "unix_listen")]
+    UnixListen { path: String },
 
-    /// Test cross-process Unix socket relay: start a server, fork a child
-    /// that connects, verify bidirectional data flow.
-    #[serde(rename = "unix_socket_relay")]
-    UnixSocketRelay { path: String, self_exe: String },
+    /// Stop listening on a Unix socket path.
+    #[serde(rename = "unix_unlisten")]
+    UnixUnlisten { path: String },
 
-    /// Test reverse Unix socket relay: fork a child that creates the server,
-    /// parent connects. Mimics VS Code's pattern (code-server creates socket,
-    /// CLI connects).
-    #[serde(rename = "unix_socket_reverse_relay")]
-    UnixSocketReverseRelay { path: String, self_exe: String },
+    /// Connect to a Unix domain socket, send data, read echo response.
+    #[serde(rename = "unix_connect")]
+    UnixConnect { path: String, data: String },
+
+    /// Fork+exec in background. Returns immediately with the child PID.
+    #[serde(rename = "exec_background")]
+    ExecBackground { args: Vec<String> },
+
+    /// Kill a background process by PID.
+    #[serde(rename = "kill")]
+    Kill { pid: u32 },
 
     /// Proceed (used after coordination points).
     #[serde(rename = "go")]
@@ -102,6 +107,10 @@ pub enum Response {
     #[serde(rename = "listening")]
     Listening { port: u16 },
 
+    /// Unix socket listener is ready.
+    #[serde(rename = "unix_listening")]
+    UnixListening { path: String },
+
     /// TCP connection + echo result.
     #[serde(rename = "connected")]
     Connected { echo: String },
@@ -121,6 +130,10 @@ pub enum Response {
     /// Exec timed out (likely deadlocked).
     #[serde(rename = "exec_timeout")]
     ExecTimeout { stderr: String },
+
+    /// Background process started.
+    #[serde(rename = "background")]
+    Background { pid: u32 },
 
     /// Error.
     #[serde(rename = "error")]
