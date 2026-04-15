@@ -57,45 +57,7 @@ fn main() {
                 .unwrap_or(0);
             std::process::exit(code);
         }
-        // --- Subcommands for self-contained tests (no bash/python3 dependency) ---
-        "write-file" => {
-            // Usage: write-file <path> <data>
-            let path = args.get(2).expect("write-file requires <path>");
-            let data = args.get(3).expect("write-file requires <data>");
-            std::fs::write(path, data).expect("write failed");
-            println!("OK");
-        }
-        "read-file" => {
-            // Usage: read-file <path>
-            match std::fs::read_to_string(args.get(2).expect("read-file requires <path>")) {
-                Ok(data) => println!("{data}"),
-                Err(e) => {
-                    eprintln!("{e}");
-                    std::process::exit(1);
-                }
-            }
-        }
-        "pipe-echo" => {
-            // Usage: pipe-echo <data>
-            // Creates a pipe, forks a child (via self-exe echo-test pattern),
-            // child writes data to stdout, parent captures it.
-            // Tests fork + pipe data flow in Rust.
-            let data = args.get(2).expect("pipe-echo requires <data>");
-            let output = std::process::Command::new(self_exe)
-                .arg("echo-line")
-                .arg(data)
-                .stdout(std::process::Stdio::piped())
-                .output()
-                .expect("fork+exec failed");
-            let captured = String::from_utf8_lossy(&output.stdout);
-            print!("{captured}");
-        }
-        "echo-line" => {
-            // Helper: prints args[2] to stdout. Used by pipe-echo.
-            if let Some(data) = args.get(2) {
-                println!("{data}");
-            }
-        }
+        // --- Subcommands used as child-process behaviors by tests ---
         "unix-echo-server" => {
             // Usage: unix-echo-server <path>
             // Binds a Unix domain socket, accepts ONE connection, echoes
@@ -162,24 +124,23 @@ fn main() {
             });
         }
         "trigger-delayed-fork" => {
+            // Usage: trigger-delayed-fork <cmd> [args...]
             // Triggers a delayed-fork by doing a non-pre-exec syscall (mmap
-            // via Vec allocation), then fork+execs self with echo-test.
-            // This creates the nested delayed-fork pattern:
-            //   parent fork → child triggers delayed fork → child fork+execs echo-test
-            //
-            // Usage: trigger-delayed-fork <self_exe_path>
-            // The child's echo-test output should appear on stdout.
-            let child_exe = args.get(2).expect("trigger-delayed-fork requires <self_exe_path>");
+            // via Vec allocation), then fork+execs the given command.
+            // Used to test nested delayed-fork: the parent forks this process,
+            // which migrates to a worker, then fork+execs <cmd>.
+            if args.len() < 3 {
+                eprintln!("usage: trigger-delayed-fork <cmd> [args...]");
+                std::process::exit(1);
+            }
 
             // Force a non-pre-exec syscall to trigger delayed-fork migration.
-            // A large allocation forces mmap which is not in the pre-exec allowlist.
             let _trigger: Vec<u8> = vec![0u8; 64 * 1024];
-            // Also read from the allocation to ensure it's not optimized away.
             assert_eq!(_trigger[0], 0);
 
-            // Now fork+exec echo-test from within the delayed-fork child.
-            let output = std::process::Command::new(child_exe)
-                .arg("echo-test")
+            // Fork+exec the given command from within the delayed-fork child.
+            let output = std::process::Command::new(&args[2])
+                .args(&args[3..])
                 .stdin(std::process::Stdio::null())
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::piped())

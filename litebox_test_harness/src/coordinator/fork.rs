@@ -319,6 +319,7 @@ pub(super) async fn node_exec_tests(r: &mut TestRunner) {
         self_exe.clone(),
         "trigger-delayed-fork".into(),
         self_exe.clone(),
+        "echo-test".into(),
     ])).await;
     let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout.contains("ECHO_TEST_OK"));
     r.record("X34.nested_delayed_fork", "A", pass, &format!("{resp:?}"));
@@ -328,6 +329,7 @@ pub(super) async fn node_exec_tests(r: &mut TestRunner) {
         self_exe.clone(),
         "trigger-delayed-fork".into(),
         self_exe,
+        "echo-test".into(),
     ])).await;
     let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout.contains("ECHO_TEST_OK"));
     r.record("X34b.nested_delayed_fork_deep", "AA", pass, &format!("{resp:?}"));
