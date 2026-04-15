@@ -1470,15 +1470,29 @@ impl<FS: ShimFS> Task<FS> {
                 None
             },
         )?;
-        buf.copy_from_slice(0, &recv_buf[..size.min(recv_buf.len())])
+        let capped_size = size.min(recv_buf.len());
+        buf.copy_from_slice(0, &recv_buf[..capped_size])
             .ok_or(Errno::EFAULT)?;
         if let Some(src_addr) = source_addr
             && let Some(sock_ptr) = addr
         {
             write_sockaddr_to_user(src_addr, sock_ptr, addrlen)?;
         }
-        Ok(size)
+
+        if flags.contains(ReceiveFlags::TRUNC) {
+            // the actual message size
+            Ok(size)
+        } else {
+            // the number of bytes copied
+            Ok(capped_size)
+        }
     }
+    /// Receive data from a socket.
+    ///
+    /// `source_addr` can be provided to receive the source address if available.
+    ///
+    /// On success, returns the number of bytes received. Note that for datagram sockets,
+    /// this may be larger than the provided buffer length as the excessive data will be truncated.
     fn do_recvfrom(
         &self,
         sockfd: u32,
@@ -1609,7 +1623,13 @@ impl<FS: ShimFS> Task<FS> {
             offset += chunk;
         }
 
-        let total_received = size;
+        let total_received = if flags.contains(ReceiveFlags::TRUNC) {
+            // the actual message size
+            size
+        } else {
+            // the number of bytes copied
+            size.min(total_iov_capacity)
+        };
 
         // Write back source address if requested.
         if want_source {

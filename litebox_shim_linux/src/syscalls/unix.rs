@@ -1241,7 +1241,7 @@ impl<FS: ShimFS> UnixSocket<FS> {
         flags: ReceiveFlags,
         source_addr: Option<&mut Option<UnixSocketAddr>>,
     ) -> Result<usize, Errno> {
-        let supported_flags = ReceiveFlags::DONTWAIT;
+        let supported_flags = ReceiveFlags::DONTWAIT | ReceiveFlags::TRUNC;
         if flags.intersects(supported_flags.complement()) {
             log_unsupported!("Unsupported recvfrom flags: {:?}", flags);
             return Err(Errno::EINVAL);
