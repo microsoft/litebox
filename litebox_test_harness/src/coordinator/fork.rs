@@ -214,18 +214,50 @@ pub(super) async fn node_exec_tests(r: &mut TestRunner) {
     let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout.contains("node_deep_ok"));
     r.record("X27.node_deep", "AA", pass, &format!("{resp:?}"));
 
-    // X28: Exec Node.js via shell indirection (bash → node)
-    // Mimics code-server's invocation: a shell script that execs node.
+    // X28: Exec a shell SCRIPT FILE (no node — baseline)
+    // Tests whether bash can exec a script file at all from a worker.
     let resp = r.send("A", exec(bash(
-        "/usr/local/bin/node -e 'console.log(\"script_ok\")'"
+        "echo '#!/usr/bin/bash' > /tmp/x28.sh && \
+         echo 'echo script_echo_ok' >> /tmp/x28.sh && \
+         chmod +x /tmp/x28.sh && \
+         /tmp/x28.sh; \
+         EXIT=$?; rm -f /tmp/x28.sh; exit $EXIT"
     ))).await;
-    let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout.contains("script_ok"));
-    r.record("X28.node_via_bash", "A", pass, &format!("{resp:?}"));
+    let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout.contains("script_echo_ok"));
+    r.record("X28.script_file_echo", "A", pass, &format!("{resp:?}"));
 
-    // X29: Another Node.js exec — verifies stability after multiple node invocations
+    // X28b: Script file that runs node (direct shebang)
+    // KNOWN ISSUE: node within a script file produces no stdout.
+    // Direct node exec (X26) and bash -c "node ..." both work, but
+    // script.sh → node adds an extra fork+exec level whose stdout
+    // pipe bridging loses the output. This is the same failure pattern
+    // as VS Code's code-server (a script that execs node).
+    let resp = r.send("A", exec(bash(
+        "echo '#!/usr/bin/bash' > /tmp/x28b.sh && \
+         echo '/usr/local/bin/node -e \"console.log(\\\"script_node_ok\\\")\"' >> /tmp/x28b.sh && \
+         chmod +x /tmp/x28b.sh && \
+         /tmp/x28b.sh; \
+         EXIT=$?; rm -f /tmp/x28b.sh; exit $EXIT"
+    ))).await;
+    let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout.contains("script_node_ok"));
+    r.record_xfail("X28b.script_file_node", "A", pass, "node stdout lost through script-file fork+exec depth", &format!("{resp:?}"));
+
+    // X28c: Script file with env shebang (same issue)
+    let resp = r.send("A", exec(bash(
+        "echo '#!/usr/bin/env bash' > /tmp/x28c.sh && \
+         echo '/usr/local/bin/node -e \"console.log(\\\"script_env_ok\\\")\"' >> /tmp/x28c.sh && \
+         chmod +x /tmp/x28c.sh && \
+         /tmp/x28c.sh; \
+         EXIT=$?; rm -f /tmp/x28c.sh; exit $EXIT"
+    ))).await;
+    let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout.contains("script_env_ok"));
+    r.record_xfail("X28c.script_file_env", "A", pass, "node stdout lost through script-file fork+exec depth", &format!("{resp:?}"));
+
+    // X29: Node.js process.stdout.write — tests stdout pipe state
+    // after multiple delayed-fork worker spawns from prior node execs.
     let resp = r.send("A", exec(vec![
-        "/usr/local/bin/node".into(), "-e".into(), "console.log('node_again_ok')".into(),
+        "/usr/local/bin/node".into(), "-e".into(), "process.stdout.write('stdout_write_ok\\n')".into(),
     ])).await;
-    let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout.contains("node_again_ok"));
-    r.record("X29.node_repeat", "A", pass, &format!("{resp:?}"));
+    let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout.contains("stdout_write_ok"));
+    r.record("X29.node_stdout_write", "A", pass, &format!("{resp:?}"));
 }
