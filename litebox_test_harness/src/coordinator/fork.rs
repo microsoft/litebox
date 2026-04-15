@@ -190,4 +190,69 @@ pub(super) async fn exec_tests(r: &mut TestRunner) {
     let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout.contains("xargs_p") && stdout.contains("xargs_r"));
     let timeout = matches!(&resp, Response::ExecTimeout { .. });
     r.record("X25.xargs", "A", pass, &format!("timeout={timeout} {resp:?}"));
+
+    // ── Node.js exec tests (V6 investigation) ──
+    // Incremental tests narrowing the gap between working minimal tests
+    // and the failing VS Code code-server Node.js startup.
+
+    // X26: Exec system Node.js directly from worker
+    // Skip if node is not in the rootfs (exit 127 = not found).
+    let resp = r.send("A", exec(vec![
+        "/usr/local/bin/node".into(), "-e".into(), "console.log('node_ok')".into(),
+    ])).await;
+    let not_found = matches!(&resp, Response::ExecResult { exit_code: 127, .. })
+        || matches!(&resp, Response::Error { error } if error.contains("exec spawn"));
+    if not_found {
+        r.record("X26.node_direct", "A", true, "skipped (node not in rootfs)");
+    } else {
+        let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout.contains("node_ok"));
+        r.record("X26.node_direct", "A", pass, &format!("{resp:?}"));
+    }
+
+    // X27: Exec Node.js from depth-2 worker
+    let resp = r.send("AA", exec(vec![
+        "/usr/local/bin/node".into(), "-e".into(), "console.log('node_deep_ok')".into(),
+    ])).await;
+    let not_found = matches!(&resp, Response::ExecResult { exit_code: 127, .. })
+        || matches!(&resp, Response::Error { error } if error.contains("exec spawn"));
+    if not_found {
+        r.record("X27.node_deep", "AA", true, "skipped (node not in rootfs)");
+    } else {
+        let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout.contains("node_deep_ok"));
+        r.record("X27.node_deep", "AA", pass, &format!("{resp:?}"));
+    }
+
+    // X28: Exec Node.js via shell script indirection (sh → node)
+    // This mimics code-server's invocation pattern.
+    let resp = r.send("A", exec(bash(
+        "if command -v node >/dev/null 2>&1; then \
+         echo '#!/usr/bin/env sh' > /tmp/x28.sh && \
+         echo 'exec /usr/local/bin/node -e \"console.log(\\\"script_ok\\\")\"' >> /tmp/x28.sh && \
+         chmod +x /tmp/x28.sh && \
+         /tmp/x28.sh 2>&1; \
+         rm -f /tmp/x28.sh; \
+         else echo SKIP_NOT_FOUND; fi"
+    ))).await;
+    let skipped = matches!(&resp, Response::ExecResult { stdout, .. } if stdout.contains("SKIP_NOT_FOUND"));
+    if skipped {
+        r.record("X28.node_via_script", "A", true, "skipped (node not in rootfs)");
+    } else {
+        let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout.contains("script_ok"));
+        r.record("X28.node_via_script", "A", pass, &format!("{resp:?}"));
+    }
+
+    // X29: Exec VS Code's bundled node (124MB binary)
+    let bundled_node = "/root/.vscode-server/cli/servers/Stable-ae130017f8afe532557dbb8539a6ef3bdaec6389/server/node";
+    let resp = r.send("A", exec(bash(
+        &format!("if [ -x {bundled_node} ]; then \
+         {bundled_node} -e 'console.log(\"bundled_ok\")' 2>&1; \
+         else echo SKIP_NOT_FOUND; fi")
+    ))).await;
+    let skipped = matches!(&resp, Response::ExecResult { stdout, .. } if stdout.contains("SKIP_NOT_FOUND"));
+    if skipped {
+        r.record("X29.node_bundled", "A", true, "skipped (bundled node not found)");
+    } else {
+        let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout.contains("bundled_ok"));
+        r.record("X29.node_bundled", "A", pass, &format!("{resp:?}"));
+    }
 }

@@ -104,12 +104,17 @@ fn build_rootfs(test_binary: &Path) -> tempfile::TempDir {
     stage_binary(rootfs, test_binary, "/litebox-test-harness");
 
     // 2. Stage bash + utilities needed by X6-X25 fork tests.
-    let utils = ["bash", "cat", "grep", "wc", "sleep", "xargs", "echo", "rm"];
+    let utils = ["bash", "cat", "grep", "wc", "sleep", "xargs", "echo", "rm", "chmod"];
     for name in &utils {
         if let Some(path) = which(name) {
             let guest = format!("/usr/bin/{name}");
             stage_binary(rootfs, &path, &guest);
         }
+    }
+
+    // 3. Stage Node.js for X26-X28 tests (skip if not installed on host).
+    if let Some(node_path) = which("node") {
+        stage_binary(rootfs, &node_path, "/usr/local/bin/node");
     }
 
     // 3. Stage dynamic linker at the standard path.
