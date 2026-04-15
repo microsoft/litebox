@@ -260,6 +260,21 @@ fn process_tree_tests() {
         );
     }
 
+    // Verify xfail count matches expected. This catches:
+    // - Accidental xfail additions (count goes up without updating here)
+    // - Fixed xfails that weren't removed (count goes down)
+    // Update this constant when intentionally adding/removing xfails.
+    const EXPECTED_XFAIL_COUNT: usize = 1; // U6.sibling
+    let xfail_count = results
+        .iter()
+        .filter(|r| r["result"].as_str() == Some("xfail"))
+        .count();
+    assert_eq!(
+        xfail_count, EXPECTED_XFAIL_COUNT,
+        "xfail count changed from {EXPECTED_XFAIL_COUNT} to {xfail_count}. \
+         If intentional, update EXPECTED_XFAIL_COUNT in integration.rs."
+    );
+
     // Summary.
     let mut counts: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
     for r in &results {
