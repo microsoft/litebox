@@ -1561,7 +1561,7 @@ impl<FS: ShimFS> Task<FS> {
         let total_iov_capacity: usize = iovs
             .iter()
             .map(|iov| iov.iov_len)
-            .fold(0usize, |acc, len| acc.saturating_add(len))
+            .fold(0usize, usize::saturating_add)
             .min(MAX_LEN);
 
         if total_iov_capacity == 0 {
@@ -1789,6 +1789,7 @@ mod tests {
         AddressFamily, ReceiveFlags, SendFlags, SockFlags, SockType, SocketOption,
         SocketOptionName, TcpOption, errno::Errno,
     };
+    use zerocopy::FromZeros as _;
 
     use super::SocketAddress;
     use crate::{ConstPtr, MutPtr, syscalls::tests::init_platform};
@@ -1909,7 +1910,7 @@ mod tests {
                     ])
                     .stdout(std::process::Stdio::piped())
                     .output(),
-                "recvfrom" => std::process::Command::new("sh")
+                "recvfrom" | "recvmsg" => std::process::Command::new("sh")
                     .args([
                         "-c",
                         &alloc::format!(
@@ -1979,7 +1980,6 @@ mod tests {
                     },
                 ];
                 let hdr = {
-                    use zerocopy::FromZeros as _;
                     let mut h = litebox_common_linux::UserMsgHdr::<crate::Platform>::new_zeroed();
                     h.msg_iov = ConstPtr::from_usize(iovec.as_ptr() as usize);
                     h.msg_iovlen = iovec.len();
@@ -1997,7 +1997,7 @@ mod tests {
                 let stdout = alloc::string::String::from_utf8_lossy(&output.stdout);
                 assert_eq!(stdout, alloc::format!("{buf1}{buf2}"));
             }
-            "recvfrom" => {
+            "recvfrom" | "recvmsg" => {
                 if is_nonblocking {
                     epoll_add(task, epfd, client_fd, litebox::event::Events::IN);
                     let mut events = [litebox_common_linux::EpollEvent { events: 0, data: 0 }; 2];
@@ -2009,18 +2009,30 @@ mod tests {
                     }
                 }
                 let mut recv_buf = [0u8; 48];
-                let n = task
-                    .do_recvfrom(
-                        client_fd,
-                        &mut recv_buf,
-                        if test_trunc {
-                            ReceiveFlags::TRUNC
-                        } else {
-                            ReceiveFlags::empty()
-                        },
-                        None,
-                    )
-                    .expect("Failed to receive data");
+                let flags = if test_trunc {
+                    ReceiveFlags::TRUNC
+                } else {
+                    ReceiveFlags::empty()
+                };
+                let n = match option {
+                    "recvfrom" => task
+                        .do_recvfrom(client_fd, &mut recv_buf, flags, None)
+                        .expect("Failed to receive data"),
+                    "recvmsg" => {
+                        let iovec = [litebox_common_linux::IoVec {
+                            iov_base: MutPtr::from_usize(recv_buf.as_mut_ptr().expose_provenance()),
+                            iov_len: recv_buf.len(),
+                        }];
+                        let mut msg_hdr =
+                            litebox_common_linux::UserMsgHdr::<crate::Platform>::new_zeroed();
+                        msg_hdr.msg_iov = ConstPtr::from_usize(iovec.as_ptr() as usize);
+                        msg_hdr.msg_iovlen = iovec.len();
+                        let msg_ptr = MutPtr::from_usize(&raw mut msg_hdr as usize);
+                        task.sys_recvmsg(i32::try_from(client_fd).unwrap(), msg_ptr, flags)
+                            .expect("failed to recvmsg")
+                    }
+                    _ => unreachable!(),
+                };
                 if test_trunc {
                     assert!(recv_buf.iter().all(|&b| b == 0)); // buf remains unchanged
                 } else {
@@ -2036,14 +2048,24 @@ mod tests {
         close_socket(task, server);
     }
 
-    fn test_tcp_socket_with_external_client(
-        port: u16,
-        is_nonblocking: bool,
-        test_trunc: bool,
-        option: &'static str,
-    ) {
+    fn test_tcp_socket_with_external_client(port: u16, is_nonblocking: bool, test_trunc: bool) {
         let task = init_platform(Some(TUN_DEVICE_NAME));
-        test_tcp_socket_as_server(&task, TUN_IP_ADDR, port, is_nonblocking, test_trunc, option);
+        test_tcp_socket_as_server(
+            &task,
+            TUN_IP_ADDR,
+            port,
+            is_nonblocking,
+            test_trunc,
+            "recvfrom",
+        );
+        test_tcp_socket_as_server(
+            &task,
+            TUN_IP_ADDR,
+            port,
+            is_nonblocking,
+            test_trunc,
+            "recvmsg",
+        );
     }
 
     fn test_tcp_socket_send(is_nonblocking: bool, test_trunc: bool) {
@@ -2078,17 +2100,17 @@ mod tests {
 
     #[test]
     fn test_tun_blocking_recvfrom_tcp_socket() {
-        test_tcp_socket_with_external_client(SERVER_PORT, false, false, "recvfrom");
+        test_tcp_socket_with_external_client(SERVER_PORT, false, false);
     }
 
     #[test]
     fn test_tun_nonblocking_recvfrom_tcp_socket() {
-        test_tcp_socket_with_external_client(SERVER_PORT, true, false, "recvfrom");
+        test_tcp_socket_with_external_client(SERVER_PORT, true, false);
     }
 
     #[test]
     fn test_tun_blocking_recvfrom_tcp_socket_with_truncation() {
-        test_tcp_socket_with_external_client(SERVER_PORT, false, true, "recvfrom");
+        test_tcp_socket_with_external_client(SERVER_PORT, false, true);
     }
 
     #[test]

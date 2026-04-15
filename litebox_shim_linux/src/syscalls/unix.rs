@@ -874,19 +874,20 @@ impl ReadEnd<DatagramMessage> {
         buf: &mut [u8],
         mut source_addr: Option<&mut Option<UnixSocketAddr>>,
     ) -> Result<usize, TryOpError<Errno>> {
-        let msg_len = self.peek_and_consume_one(|msg| {
-            let copy_len = buf.len().min(msg.data.len());
-            buf[..copy_len].copy_from_slice(&msg.data[..copy_len]);
-            if let Some(source_addr) = source_addr.as_deref_mut() {
-                *source_addr = Some(msg.source.clone());
-            }
-            // Always consume the entire message to preserve boundaries.
-            Ok((true, msg.data.len()))
-        })
-        .map_err(|e| match e {
-            Errno::EAGAIN => TryOpError::TryAgain,
-            other => TryOpError::Other(other),
-        })?;
+        let msg_len = self
+            .peek_and_consume_one(|msg| {
+                let copy_len = buf.len().min(msg.data.len());
+                buf[..copy_len].copy_from_slice(&msg.data[..copy_len]);
+                if let Some(source_addr) = source_addr.as_deref_mut() {
+                    *source_addr = Some(msg.source.clone());
+                }
+                // Always consume the entire message to preserve boundaries.
+                Ok((true, msg.data.len()))
+            })
+            .map_err(|e| match e {
+                Errno::EAGAIN => TryOpError::TryAgain,
+                other => TryOpError::Other(other),
+            })?;
         Ok(msg_len)
     }
 }
