@@ -8,6 +8,7 @@ pub(crate) mod env;
 pub(crate) mod fork;
 pub(crate) mod fs;
 pub(crate) mod net;
+pub(crate) mod symlink;
 pub(crate) mod unix;
 pub(crate) mod vscode;
 
@@ -129,7 +130,7 @@ impl TestRunner {
             None => {
                 return Response::Error {
                     error: format!("no child {direct}"),
-                }
+                };
             }
         };
         let actual_cmd = wrap_forwards(rest, cmd);
@@ -268,6 +269,10 @@ async fn run_tests(self_exe: &str) -> Vec<TestResult> {
     eprintln!("[coord] === Unix Socket Tests ===");
     unix::unix_tests(&mut runner).await;
 
+    // === Symlink Tests ===
+    eprintln!("[coord] === Symlink Tests ===");
+    symlink::symlink_tests(&mut runner).await;
+
     // === VS Code Reproduction Tests ===
     eprintln!("[coord] === VS Code Reproduction Tests ===");
     vscode::vscode_repro_tests(&mut runner).await;
@@ -387,7 +392,9 @@ async fn send_cmd(child: &mut Child, cmd: &Command) -> Response {
                 error: format!("parse: {e}: {line}"),
             },
         },
-        Ok(Ok(_)) => Response::Error { error: "EOF".into() },
+        Ok(Ok(_)) => Response::Error {
+            error: "EOF".into(),
+        },
         Ok(Err(e)) => Response::Error {
             error: format!("read: {e}"),
         },

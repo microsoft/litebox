@@ -109,6 +109,59 @@ async fn agent_loop(self_exe: &str) {
                 }
             },
 
+            Command::FsSymlink { target, link } => match tokio::fs::symlink(&target, &link).await {
+                Ok(()) => respond(&Response::Ok { data: None }).await,
+                Err(e) => {
+                    respond(&Response::Error {
+                        error: format!("symlink: {e}"),
+                    })
+                    .await;
+                }
+            },
+
+            Command::FsReadlink { path } => match tokio::fs::read_link(&path).await {
+                Ok(target) => {
+                    respond(&Response::Ok {
+                        data: Some(target.to_string_lossy().into_owned()),
+                    })
+                    .await;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    respond(&Response::NotFound).await;
+                }
+                Err(e) => {
+                    respond(&Response::Error {
+                        error: format!("readlink: {e}"),
+                    })
+                    .await;
+                }
+            },
+
+            Command::FsStat { path } => match tokio::fs::symlink_metadata(&path).await {
+                Ok(meta) => {
+                    let kind = if meta.is_symlink() {
+                        "symlink"
+                    } else if meta.is_dir() {
+                        "dir"
+                    } else {
+                        "file"
+                    };
+                    respond(&Response::Ok {
+                        data: Some(kind.to_string()),
+                    })
+                    .await;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    respond(&Response::NotFound).await;
+                }
+                Err(e) => {
+                    respond(&Response::Error {
+                        error: format!("stat: {e}"),
+                    })
+                    .await;
+                }
+            },
+
             Command::NetListen { port } => {
                 match TcpListener::bind(format!("0.0.0.0:{port}")).await {
                     Ok(listener) => {

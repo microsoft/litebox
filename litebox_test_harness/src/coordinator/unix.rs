@@ -3,7 +3,7 @@
 
 //! Unix domain socket tests — decomposed into primitive operations.
 
-use super::{exec, TestRunner};
+use super::{TestRunner, exec};
 use crate::protocol::{Command, Response};
 
 pub(super) async fn unix_tests(r: &mut TestRunner) {
@@ -12,7 +12,12 @@ pub(super) async fn unix_tests(r: &mut TestRunner) {
     // U1: In-process Unix socket echo
     // Agent binds a Unix socket, then connects to itself.
     let resp = r
-        .send("A", Command::UnixListen { path: "/tmp/u1.sock".into() })
+        .send(
+            "A",
+            Command::UnixListen {
+                path: "/tmp/u1.sock".into(),
+            },
+        )
         .await;
     r.record(
         "U1.listen",
@@ -34,7 +39,12 @@ pub(super) async fn unix_tests(r: &mut TestRunner) {
     r.record("U1.connect", "A", pass, &format!("{resp:?}"));
 
     let resp = r
-        .send("A", Command::UnixUnlisten { path: "/tmp/u1.sock".into() })
+        .send(
+            "A",
+            Command::UnixUnlisten {
+                path: "/tmp/u1.sock".into(),
+            },
+        )
         .await;
     r.record(
         "U1.unlisten",
@@ -45,7 +55,12 @@ pub(super) async fn unix_tests(r: &mut TestRunner) {
 
     // U1b: Same from a deeper worker
     let resp = r
-        .send("AA", Command::UnixListen { path: "/tmp/u1b.sock".into() })
+        .send(
+            "AA",
+            Command::UnixListen {
+                path: "/tmp/u1b.sock".into(),
+            },
+        )
         .await;
     r.record(
         "U1b.listen",
@@ -76,7 +91,12 @@ pub(super) async fn unix_tests(r: &mut TestRunner) {
     // U2: Parent server, forked child client
     // Agent A listens, then forks unix-echo-client to connect.
     let resp = r
-        .send("A", Command::UnixListen { path: "/tmp/u2.sock".into() })
+        .send(
+            "A",
+            Command::UnixListen {
+                path: "/tmp/u2.sock".into(),
+            },
+        )
         .await;
     r.record(
         "U2.listen",
@@ -95,11 +115,15 @@ pub(super) async fn unix_tests(r: &mut TestRunner) {
             ]),
         )
         .await;
-    let pass =
-        matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout.contains("U2_CHILD_DATA"));
+    let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout.contains("U2_CHILD_DATA"));
     r.record("U2.child_connect", "A", pass, &format!("{resp:?}"));
     let _ = r
-        .send("A", Command::UnixUnlisten { path: "/tmp/u2.sock".into() })
+        .send(
+            "A",
+            Command::UnixUnlisten {
+                path: "/tmp/u2.sock".into(),
+            },
+        )
         .await;
 
     // U3: Forked child server, parent client (VS Code pattern)
@@ -146,7 +170,12 @@ pub(super) async fn unix_tests(r: &mut TestRunner) {
         let _ = r.send("A", Command::Kill { pid }).await;
     }
     let _ = r
-        .send("A", Command::UnixUnlisten { path: "/tmp/u3.sock".into() })
+        .send(
+            "A",
+            Command::UnixUnlisten {
+                path: "/tmp/u3.sock".into(),
+            },
+        )
         .await;
 
     // U4: Parent server from deeper worker
@@ -175,8 +204,7 @@ pub(super) async fn unix_tests(r: &mut TestRunner) {
             ]),
         )
         .await;
-    let pass =
-        matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout.contains("U4_DEEP"));
+    let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout.contains("U4_DEEP"));
     r.record("U4.child_connect", "AA", pass, &format!("{resp:?}"));
     let _ = r
         .send(
@@ -193,7 +221,7 @@ pub(super) async fn unix_tests(r: &mut TestRunner) {
             "AA",
             Command::ExecBackground {
                 args: vec![
-                    self_exe,
+                    self_exe.clone(),
                     "unix-echo-server".into(),
                     "/tmp/u5.sock".into(),
                 ],
@@ -237,12 +265,132 @@ pub(super) async fn unix_tests(r: &mut TestRunner) {
         )
         .await;
 
-    // U6: Sibling Unix socket — document known limitation.
-    r.record_xfail(
-        "U6.sibling",
-        "A↔B",
-        false,
-        "sibling workers have independent Unix socket address tables",
-        "not executed — architectural limitation",
+    // U6: Sibling Unix socket — A listens, B tries to connect.
+    // Siblings have independent Unix socket address tables, so this
+    // should fail with a clean error (not hang or crash).
+    let resp = r
+        .send(
+            "A",
+            Command::UnixListen {
+                path: "/tmp/u6.sock".into(),
+            },
+        )
+        .await;
+    r.record(
+        "U6.listen",
+        "A",
+        matches!(&resp, Response::UnixListening { .. }),
+        &format!("{resp:?}"),
     );
+    let resp = r
+        .send(
+            "B",
+            Command::UnixConnect {
+                path: "/tmp/u6.sock".into(),
+                data: "U6_SIBLING".into(),
+            },
+        )
+        .await;
+    // Expected: connection refused or error — siblings can't see each other's sockets.
+    let pass = matches!(
+        &resp,
+        Response::ConnectFailed { .. } | Response::Error { .. }
+    );
+    r.record_xfail(
+        "U6.sibling_connect",
+        "B",
+        pass,
+        "sibling workers have independent Unix socket address tables",
+        &format!("{resp:?}"),
+    );
+    let _ = r
+        .send(
+            "A",
+            Command::UnixUnlisten {
+                path: "/tmp/u6.sock".into(),
+            },
+        )
+        .await;
+
+    // U7: Cross-depth — parent listens, grandchild connects.
+    // A listens, AA connects. Tests fork inheritance of socket address tables.
+    let resp = r
+        .send(
+            "A",
+            Command::UnixListen {
+                path: "/tmp/u7.sock".into(),
+            },
+        )
+        .await;
+    r.record(
+        "U7.listen",
+        "A",
+        matches!(&resp, Response::UnixListening { .. }),
+        &format!("{resp:?}"),
+    );
+    let resp = r
+        .send(
+            "AA",
+            Command::UnixConnect {
+                path: "/tmp/u7.sock".into(),
+                data: "U7_GRANDCHILD".into(),
+            },
+        )
+        .await;
+    let pass = matches!(&resp, Response::Connected { echo } if echo == "U7_GRANDCHILD");
+    r.record("U7.grandchild_connect", "AA", pass, &format!("{resp:?}"));
+    let _ = r
+        .send(
+            "A",
+            Command::UnixUnlisten {
+                path: "/tmp/u7.sock".into(),
+            },
+        )
+        .await;
+
+    // U8: Reverse cross-depth — grandchild listens, parent connects.
+    let resp = r
+        .send(
+            "AA",
+            Command::ExecBackground {
+                args: vec![self_exe, "unix-echo-server".into(), "/tmp/u8.sock".into()],
+            },
+        )
+        .await;
+    let server_pid = match &resp {
+        Response::Background { pid } => Some(*pid),
+        _ => None,
+    };
+    r.record(
+        "U8.server_start",
+        "AA",
+        server_pid.is_some(),
+        &format!("{resp:?}"),
+    );
+
+    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+
+    let resp = r
+        .send(
+            "A",
+            Command::UnixConnect {
+                path: "/tmp/u8.sock".into(),
+                data: "U8_PARENT_TO_GRANDCHILD".into(),
+            },
+        )
+        .await;
+    let pass = matches!(&resp, Response::Connected { echo } if echo == "U8_PARENT_TO_GRANDCHILD");
+    r.record("U8.parent_connect", "A", pass, &format!("{resp:?}"));
+
+    if let Some(pid) = server_pid {
+        let _ = r.send("AA", Command::Kill { pid }).await;
+    }
+    let _ = r
+        .send(
+            "AA",
+            Command::UnixUnlisten {
+                path: "/tmp/u8.sock".into(),
+            },
+        )
+        .await;
 }

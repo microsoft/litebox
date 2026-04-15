@@ -26,6 +26,18 @@ pub enum Command {
     #[serde(rename = "fs_delete")]
     FsDelete { path: String },
 
+    /// Create a symbolic link.
+    #[serde(rename = "fs_symlink")]
+    FsSymlink { target: String, link: String },
+
+    /// Read the target of a symbolic link.
+    #[serde(rename = "fs_readlink")]
+    FsReadlink { path: String },
+
+    /// Stat a path — returns type (file/dir/symlink/notfound).
+    #[serde(rename = "fs_stat")]
+    FsStat { path: String },
+
     /// Bind a TCP listener on the given port. Starts an echo handler.
     #[serde(rename = "net_listen")]
     NetListen { port: u16 },
