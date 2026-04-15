@@ -5,8 +5,11 @@ use super::*;
 use crate::protocol::{Command, Response};
 
 pub(super) async fn fs_tests(r: &mut TestRunner) {
-    // Ensure /shared/ exists.
+    // Ensure /shared/ exists and clean up stale files from prior runs.
     let _ = tokio::fs::create_dir_all("/shared").await;
+    for name in ["f1.txt", "f2.txt", "f3.txt", "f3b.txt", "f4.txt", "f4c.txt", "for_host.txt"] {
+        let _ = tokio::fs::remove_file(format!("/shared/{name}")).await;
+    }
 
     // F1: Parent→child CRUD (init writes, A reads)
     let resp = r.send("A", Command::FsRead { path: "/shared/f1.txt".into() }).await;

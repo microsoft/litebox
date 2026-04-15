@@ -88,4 +88,20 @@ pub(super) async fn unix_tests(r: &mut TestRunner) {
     let pass =
         matches!(&resp, Response::Ok { data: Some(d) } if d.contains("unix_reverse_relay_ok"));
     r.record("U5.deep_child_server", "AA", pass, &format!("{resp:?}"));
+
+    // U6: Sibling Unix socket — document known limitation.
+    // Two sibling workers (A and B) run in separate litebox worker
+    // processes, each with an independent Unix socket address table.
+    // A socket created by worker A is not visible to worker B.
+    // This is a fundamental architecture constraint of delayed-fork:
+    // each worker is a separate host process with its own shim state.
+    // TCP works between siblings (via broker cross-worker bridging) but
+    // Unix sockets do not have an equivalent bridge.
+    r.record_xfail(
+        "U6.sibling",
+        "A↔B",
+        false,
+        "sibling workers have independent Unix socket address tables",
+        "not executed — architectural limitation, not a test",
+    );
 }
