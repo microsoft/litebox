@@ -68,6 +68,12 @@ pub enum Command {
     #[serde(rename = "unix_socket_relay")]
     UnixSocketRelay { path: String, self_exe: String },
 
+    /// Test reverse Unix socket relay: fork a child that creates the server,
+    /// parent connects. Mimics VS Code's pattern (code-server creates socket,
+    /// CLI connects).
+    #[serde(rename = "unix_socket_reverse_relay")]
+    UnixSocketReverseRelay { path: String, self_exe: String },
+
     /// Proceed (used after coordination points).
     #[serde(rename = "go")]
     Go,

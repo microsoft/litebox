@@ -82,25 +82,40 @@ pub(super) async fn vscode_repro_tests(r: &mut TestRunner) {
     // Clean up socket.
     let _ = r.send("A", exec(bash("rm -f /tmp/t4-test.sock"))).await;
 
-    // V5: Cross-process Unix socket relay
-    // The agent starts a Unix socket server, forks a child (unix-echo-client)
-    // that connects, sends data, and reads the echo. Tests the same path as
-    // CLI↔code-server (parent creates socket, forked child connects).
+    // V5: Cross-process Unix socket relay (parent → child)
+    // Parent binds socket, forks child that connects. Tests: parent=server, child=client.
     let self_exe = r.self_exe.clone();
     let resp = r.send("A", Command::UnixSocketRelay {
         path: "/tmp/v5-relay.sock".into(),
         self_exe: self_exe.clone(),
     }).await;
     let pass = matches!(&resp, Response::Ok { data: Some(d) } if d.contains("unix_relay_ok"));
-    r.record("V5.unix_relay", "A", pass, &format!("{resp:?}"));
+    r.record("V5.parent_server", "A", pass, &format!("{resp:?}"));
 
-    // V5b: Same from deeper worker
+    // V5b: Reverse relay (child → parent) — VS Code's actual pattern
+    // Child creates socket (like code-server), parent connects (like CLI).
+    let resp = r.send("A", Command::UnixSocketReverseRelay {
+        path: "/tmp/v5b-reverse.sock".into(),
+        self_exe: self_exe.clone(),
+    }).await;
+    let pass = matches!(&resp, Response::Ok { data: Some(d) } if d.contains("unix_reverse_relay_ok"));
+    r.record("V5b.child_server", "A", pass, &format!("{resp:?}"));
+
+    // V5c: Same from deeper worker
     let resp = r.send("AA", Command::UnixSocketRelay {
-        path: "/tmp/v5b-relay.sock".into(),
-        self_exe,
+        path: "/tmp/v5c-relay.sock".into(),
+        self_exe: self_exe.clone(),
     }).await;
     let pass = matches!(&resp, Response::Ok { data: Some(d) } if d.contains("unix_relay_ok"));
-    r.record("V5b.unix_relay_deep", "AA", pass, &format!("{resp:?}"));
+    r.record("V5c.deep_parent_server", "AA", pass, &format!("{resp:?}"));
+
+    // V5d: Reverse from deeper worker
+    let resp = r.send("AA", Command::UnixSocketReverseRelay {
+        path: "/tmp/v5d-reverse.sock".into(),
+        self_exe,
+    }).await;
+    let pass = matches!(&resp, Response::Ok { data: Some(d) } if d.contains("unix_reverse_relay_ok"));
+    r.record("V5d.deep_child_server", "AA", pass, &format!("{resp:?}"));
 
     // T6: code-server stderr capture — does it create the Unix socket?
     // Run code-server, wait briefly, check if /tmp/t6-test.sock exists.

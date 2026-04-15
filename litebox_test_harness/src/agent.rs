@@ -306,6 +306,11 @@ async fn agent_loop(self_exe: &str) {
                 respond(&result).await;
             }
 
+            Command::UnixSocketReverseRelay { path, self_exe } => {
+                let result = unix_socket_reverse_relay_test(&path, &self_exe).await;
+                respond(&result).await;
+            }
+
             Command::Exit => {
                 // Abort all echo servers.
                 for (_, task) in listeners.drain() {
@@ -531,5 +536,84 @@ async fn unix_socket_relay_test(path: &str, self_exe: &str) -> Response {
                 error: "relay client timeout".to_string(),
             },
         },
+    }
+}
+
+/// Reverse relay: fork a child that creates a Unix socket server, then the
+/// parent connects as client. Mimics VS Code's pattern where code-server
+/// (child) creates the socket and CLI (parent) connects to it.
+async fn unix_socket_reverse_relay_test(path: &str, self_exe: &str) -> Response {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let _ = tokio::fs::remove_file(path).await;
+
+    // Step 1: Fork a child that runs unix-echo-server (binds, listens, accepts, echoes).
+    let mut child = match tokio::process::Command::new(self_exe)
+        .args(["unix-echo-server", path])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            return Response::Error {
+                error: format!("reverse relay spawn server: {e}"),
+            };
+        }
+    };
+
+    // Step 2: Wait for the child to print "LISTENING" (socket is ready).
+    let mut child_stdout = child.stdout.take().unwrap();
+    let ready = tokio::time::timeout(Duration::from_secs(5), async {
+        let mut buf = [0u8; 256];
+        let n = child_stdout.read(&mut buf).await?;
+        let output = String::from_utf8_lossy(&buf[..n]);
+        Ok::<bool, std::io::Error>(output.contains("LISTENING"))
+    })
+    .await;
+
+    let is_ready = matches!(ready, Ok(Ok(true)));
+    if !is_ready {
+        let _ = child.kill().await;
+        let _ = tokio::fs::remove_file(path).await;
+        return Response::Error {
+            error: format!("reverse relay server not ready: {ready:?}"),
+        };
+    }
+
+    // Step 3: Parent connects to the child's socket and sends data.
+    let connect_result = tokio::time::timeout(Duration::from_secs(5), async {
+        let mut stream = tokio::net::UnixStream::connect(path).await?;
+        stream.write_all(b"REVERSE_RELAY_DATA").await?;
+        stream.flush().await?;
+        let mut buf = [0u8; 4096];
+        let n = stream.read(&mut buf).await?;
+        Ok::<String, std::io::Error>(String::from_utf8_lossy(&buf[..n]).to_string())
+    })
+    .await;
+
+    // Step 4: Wait for child to exit.
+    let _ = tokio::time::timeout(Duration::from_secs(2), child.wait()).await;
+    let _ = child.kill().await;
+    let _ = tokio::fs::remove_file(path).await;
+
+    match connect_result {
+        Err(_) => Response::Error {
+            error: "reverse relay connect timeout".to_string(),
+        },
+        Ok(Err(e)) => Response::Error {
+            error: format!("reverse relay connect: {e}"),
+        },
+        Ok(Ok(echo)) => {
+            if echo == "REVERSE_RELAY_DATA" {
+                Response::Ok {
+                    data: Some("unix_reverse_relay_ok".to_string()),
+                }
+            } else {
+                Response::Error {
+                    error: format!("reverse relay echo mismatch: got {echo:?}"),
+                }
+            }
+        }
     }
 }
