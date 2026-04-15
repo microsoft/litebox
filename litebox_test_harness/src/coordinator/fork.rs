@@ -199,6 +199,7 @@ pub(super) async fn node_exec_tests(r: &mut TestRunner) {
     let bash = |cmd: &str| -> Vec<String> {
         vec!["bash".into(), "-c".into(), cmd.into()]
     };
+    let self_exe = r.self_exe.clone();
 
     // X26: Exec system Node.js directly from worker
     let resp = r.send("A", exec(vec![
@@ -260,4 +261,51 @@ pub(super) async fn node_exec_tests(r: &mut TestRunner) {
     ])).await;
     let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout.contains("stdout_write_ok"));
     r.record("X29.node_stdout_write", "A", pass, &format!("{resp:?}"));
+
+    // ── X30-X33: Narrow X28b failure ──
+
+    // X30: Script file runs `cat` (simple external binary, not node)
+    // Isolates: is it any binary from a script file, or node-specific?
+    let resp = r.send("A", exec(bash(
+        "echo '#!/usr/bin/bash' > /tmp/x30.sh && \
+         echo 'echo cat_input | cat' >> /tmp/x30.sh && \
+         chmod +x /tmp/x30.sh && \
+         /tmp/x30.sh; \
+         EXIT=$?; rm -f /tmp/x30.sh; exit $EXIT"
+    ))).await;
+    let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout.contains("cat_input"));
+    r.record("X30.script_file_cat", "A", pass, &format!("{resp:?}"));
+
+    // X31: Nested bash invocation (same depth as X28b but no script file)
+    // Isolates: is it the script-file exec or the fork depth?
+    let resp = r.send("A", exec(bash(
+        "bash -c '/usr/local/bin/node -e \"console.log(\\\"nested_ok\\\")\"'"
+    ))).await;
+    let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout.contains("nested_ok"));
+    r.record("X31.nested_bash_node", "A", pass, &format!("{resp:?}"));
+
+    // X32: Script file runs self_exe echo-test
+    // Isolates: is it node-specific or any fork+exec'd binary?
+    let resp = r.send("A", exec(bash(
+        &format!("echo '#!/usr/bin/bash' > /tmp/x32.sh && \
+         echo '{} echo-test' >> /tmp/x32.sh && \
+         chmod +x /tmp/x32.sh && \
+         /tmp/x32.sh; \
+         EXIT=$?; rm -f /tmp/x32.sh; exit $EXIT", self_exe)
+    ))).await;
+    let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout.contains("ECHO_TEST_OK"));
+    r.record("X32.script_file_self_exe", "A", pass, &format!("{resp:?}"));
+
+    // X33: Script file with `exec node` (replaces bash, no extra fork)
+    // Isolates: is it the fork depth or does `exec` (which replaces the
+    // process instead of forking) work?
+    let resp = r.send("A", exec(bash(
+        "echo '#!/usr/bin/bash' > /tmp/x33.sh && \
+         echo 'exec /usr/local/bin/node -e \"console.log(\\\"exec_ok\\\")\"' >> /tmp/x33.sh && \
+         chmod +x /tmp/x33.sh && \
+         /tmp/x33.sh; \
+         EXIT=$?; rm -f /tmp/x33.sh; exit $EXIT"
+    ))).await;
+    let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout.contains("exec_ok"));
+    r.record("X33.script_file_exec_node", "A", pass, &format!("{resp:?}"));
 }
