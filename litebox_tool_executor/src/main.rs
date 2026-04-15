@@ -409,7 +409,19 @@ const DEFAULT_POLICY: &str = r#"{
         "allow_connect": [
             "update.code.visualstudio.com:443",
             "*.vo.msecnd.net:443",
-            "*.visualstudio.com:443"
+            "*.visualstudio.com:443",
+            "*.githubcopilot.com:443",
+            "copilot-proxy.githubusercontent.com:443",
+            "copilot-telemetry.githubusercontent.com:443",
+            "origin-tracker.githubusercontent.com:443",
+            "github.com:443",
+            "api.github.com:443",
+            "vscode-auth.github.com:443",
+            "collector.github.com:443",
+            "default.exp-tas.com:443",
+            "marketplace.visualstudio.com:443",
+            "*.gallerycdn.azureedge.net:443",
+            "vscode.blob.core.windows.net:443"
         ]
     }
 }"#;
