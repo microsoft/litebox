@@ -5,27 +5,15 @@ use super::{exec, exec_timeout, TestRunner};
 use crate::protocol::{Command, Response};
 use tokio::time::Duration;
 
-/// VS Code Server reproduction tests — isolate known connection failure modes.
+/// VS Code Server reproduction tests — environment-specific tests that
+/// require the VS Code rootfs or code-server binary.
 pub(super) async fn vscode_repro_tests(r: &mut TestRunner) {
     let bash = |cmd: &str| -> Vec<String> {
         vec!["bash".into(), "-c".into(), cmd.into()]
     };
 
-    // T1: Unix domain socket lifecycle in /tmp
-    // Reproduces Issue 1: code-server uses --socket-path=/tmp/code-UUID.
-    // Tests whether AF_UNIX bind/listen/connect/accept/send/recv works.
-    let resp = r.send("A", Command::UnixSocketTest { path: "/tmp/test-t1.sock".into() }).await;
-    let pass = matches!(&resp, Response::Ok { data: Some(d) } if d.contains("unix_socket_ok"));
-    r.record("V1.unix_socket", "A", pass, &format!("{resp:?}"));
-
-    // T1b: Unix socket from deeper worker (AA)
-    let resp = r.send("AA", Command::UnixSocketTest { path: "/tmp/test-t1b.sock".into() }).await;
-    let pass = matches!(&resp, Response::Ok { data: Some(d) } if d.contains("unix_socket_ok"));
-    r.record("V1b.unix_socket_deep", "AA", pass, &format!("{resp:?}"));
-
-    // T2: Port reuse after unlisten
+    // V2: Port reuse after unlisten
     // Reproduces Issue 2: empty listeningOn when port 9100 is still held.
-    // Worker A listens on 9100, unlistens, then worker B tries to listen.
     let resp = r.send("A", Command::NetListen { port: 9100 }).await;
     let listen_ok = matches!(&resp, Response::Listening { port: 9100 });
     r.record("V2.listen_A", "A", listen_ok, &format!("{resp:?}"));
@@ -33,20 +21,16 @@ pub(super) async fn vscode_repro_tests(r: &mut TestRunner) {
     let resp = r.send("A", Command::NetUnlisten { port: 9100 }).await;
     r.record("V2.unlisten_A", "A", matches!(&resp, Response::Ok { .. }), &format!("{resp:?}"));
 
-    // Small delay for port cleanup.
     tokio::time::sleep(Duration::from_millis(500)).await;
 
     let resp = r.send("B", Command::NetListen { port: 9100 }).await;
     let pass = matches!(&resp, Response::Listening { port: 9100 });
     r.record("V2.reuse_B", "B", pass, &format!("{resp:?}"));
-
-    // Clean up.
     if pass {
         let _ = r.send("B", Command::NetUnlisten { port: 9100 }).await;
     }
 
-    // V3: /tmp file creation from worker
-    // Verifies sandbox policy allows /tmp writes (was blocked before GlobPolicy fix).
+    // V3: /tmp file write from worker
     r.send("A", Command::FsWrite { path: "/tmp/v3-test.txt".into(), data: "tmp_write_test".into() }).await;
     let resp = r.send("A", Command::FsRead { path: "/tmp/v3-test.txt".into() }).await;
     let pass = matches!(&resp, Response::Ok { data: Some(d) } if d == "tmp_write_test");
@@ -60,11 +44,7 @@ pub(super) async fn vscode_repro_tests(r: &mut TestRunner) {
     r.record("V3b.tmp_write_deep", "AA", pass, &format!("{resp:?}"));
     let _ = r.send("AA", Command::FsDelete { path: "/tmp/v3b-test.txt".into() }).await;
 
-    // T4: Node.js code-server startup
-    // Reproduces Issue 1: code-server process dies after ~75s.
-    // Try to run code-server with --socket-path; if binary exists it should
-    // start (timeout = running = good). If binary not found, skip.
-    // Note: Uses bash builtin `kill` for timeout since `timeout` cmd may not be in rootfs.
+    // V4: Node.js code-server startup (requires VS Code rootfs)
     let code_server = "/root/.vscode-server/cli/servers/Stable-ae130017f8afe532557dbb8539a6ef3bdaec6389/server/bin/code-server";
     let resp = r.send("A", exec_timeout(vec![
         "bash".into(), "-c".into(),
@@ -76,50 +56,11 @@ pub(super) async fn vscode_repro_tests(r: &mut TestRunner) {
     if skipped {
         r.record("V4.code_server", "A", true, "skipped (binary not found)");
     } else {
-        // Any output (even crash) is informative — record it.
-        r.record("V4.code_server","A", started, &format!("{resp:?}"));
+        r.record("V4.code_server", "A", started, &format!("{resp:?}"));
     }
-    // Clean up socket.
     let _ = r.send("A", exec(bash("rm -f /tmp/t4-test.sock"))).await;
 
-    // V5: Cross-process Unix socket relay (parent → child)
-    // Parent binds socket, forks child that connects. Tests: parent=server, child=client.
-    let self_exe = r.self_exe.clone();
-    let resp = r.send("A", Command::UnixSocketRelay {
-        path: "/tmp/v5-relay.sock".into(),
-        self_exe: self_exe.clone(),
-    }).await;
-    let pass = matches!(&resp, Response::Ok { data: Some(d) } if d.contains("unix_relay_ok"));
-    r.record("V5.parent_server", "A", pass, &format!("{resp:?}"));
-
-    // V5b: Reverse relay (child → parent) — VS Code's actual pattern
-    // Child creates socket (like code-server), parent connects (like CLI).
-    let resp = r.send("A", Command::UnixSocketReverseRelay {
-        path: "/tmp/v5b-reverse.sock".into(),
-        self_exe: self_exe.clone(),
-    }).await;
-    let pass = matches!(&resp, Response::Ok { data: Some(d) } if d.contains("unix_reverse_relay_ok"));
-    r.record("V5b.child_server", "A", pass, &format!("{resp:?}"));
-
-    // V5c: Same from deeper worker
-    let resp = r.send("AA", Command::UnixSocketRelay {
-        path: "/tmp/v5c-relay.sock".into(),
-        self_exe: self_exe.clone(),
-    }).await;
-    let pass = matches!(&resp, Response::Ok { data: Some(d) } if d.contains("unix_relay_ok"));
-    r.record("V5c.deep_parent_server", "AA", pass, &format!("{resp:?}"));
-
-    // V5d: Reverse from deeper worker
-    let resp = r.send("AA", Command::UnixSocketReverseRelay {
-        path: "/tmp/v5d-reverse.sock".into(),
-        self_exe,
-    }).await;
-    let pass = matches!(&resp, Response::Ok { data: Some(d) } if d.contains("unix_reverse_relay_ok"));
-    r.record("V5d.deep_child_server", "AA", pass, &format!("{resp:?}"));
-
-    // T6: code-server stderr capture — does it create the Unix socket?
-    // Run code-server, wait briefly, check if /tmp/t6-test.sock exists.
-    // If the socket file exists, code-server started successfully.
+    // V6: code-server socket creation (requires VS Code rootfs)
     let resp = r.send("A", exec_timeout(bash(
         &format!("if [ -x {code_server} ]; then \
             {code_server} --connection-token=test --accept-server-license-terms \
@@ -134,13 +75,11 @@ pub(super) async fn vscode_repro_tests(r: &mut TestRunner) {
         r.record("V6.code_server_socket", "A", true, "skipped (binary not found)");
     } else {
         let socket_created = matches!(&resp, Response::ExecResult { stdout, .. } if stdout.contains("SOCKET_CREATED"));
-        r.record_xfail("V6.code_server_socket","A", socket_created, "Node.js I/O error on startup", &format!("{resp:?}"));
+        r.record_xfail("V6.code_server_socket", "A", socket_created, "Node.js I/O error on startup", &format!("{resp:?}"));
     }
     let _ = r.send("A", exec(bash("rm -f /tmp/t6-test.sock"))).await;
 
-    // T7: code-server stays alive with auto-shutdown (no client)
-    // Run with --enable-remote-auto-shutdown and no client connecting.
-    // After 5s, check if still running. It should be (75s timeout).
+    // V7: code-server auto-shutdown (requires VS Code rootfs)
     let resp = r.send("A", exec_timeout(bash(
         &format!("if [ -x {code_server} ]; then \
             {code_server} --connection-token=test --accept-server-license-terms \

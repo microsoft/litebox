@@ -8,6 +8,7 @@ pub(crate) mod env;
 pub(crate) mod fork;
 pub(crate) mod fs;
 pub(crate) mod net;
+pub(crate) mod unix;
 pub(crate) mod vscode;
 
 use crate::protocol::{Command, Response};
@@ -262,6 +263,10 @@ async fn run_tests(self_exe: &str) -> Vec<TestResult> {
     // === Environment Tests ===
     eprintln!("[coord] === Environment Tests ===");
     env::env_tests(&mut runner).await;
+
+    // === Unix Socket Tests ===
+    eprintln!("[coord] === Unix Socket Tests ===");
+    unix::unix_tests(&mut runner).await;
 
     // === VS Code Reproduction Tests ===
     eprintln!("[coord] === VS Code Reproduction Tests ===");
