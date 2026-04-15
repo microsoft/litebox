@@ -37,7 +37,11 @@ fn main() {
             }
             eprintln!(
                 "\n=== SUMMARY: {} total, {} passed, {} failed, {} xfail, {} xpass ===",
-                results.len(), pass_count, fail_count, xfail_count, xpass_count
+                results.len(),
+                pass_count,
+                fail_count,
+                xfail_count,
+                xpass_count
             );
             // Exit non-zero only for unexpected results.
             if fail_count > 0 || xpass_count > 0 {
@@ -51,10 +55,7 @@ fn main() {
             println!("ECHO_TEST_OK");
         }
         "exit-with" => {
-            let code: i32 = args
-                .get(2)
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(0);
+            let code: i32 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(0);
             std::process::exit(code);
         }
         // --- Subcommands used as child-process behaviors by tests ---
@@ -99,14 +100,14 @@ fn main() {
                 let mut stream = tokio::net::UnixStream::connect(path)
                     .await
                     .expect("connect failed");
-                stream.write_all(data.as_bytes()).await.expect("write failed");
+                stream
+                    .write_all(data.as_bytes())
+                    .await
+                    .expect("write failed");
                 stream.flush().await.expect("flush failed");
                 let mut buf = [0u8; 4096];
-                match tokio::time::timeout(
-                    std::time::Duration::from_secs(5),
-                    stream.read(&mut buf),
-                )
-                .await
+                match tokio::time::timeout(std::time::Duration::from_secs(5), stream.read(&mut buf))
+                    .await
                 {
                     Ok(Ok(n)) => {
                         let resp = String::from_utf8_lossy(&buf[..n]);

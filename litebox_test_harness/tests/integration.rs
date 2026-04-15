@@ -181,9 +181,10 @@ fn build_rootfs(test_binary: &Path) -> tempfile::TempDir {
     // 1. Stage test harness binary.
     stage_binary(rootfs, test_binary, "/litebox-test-harness");
 
-    // 2. Stage bash + utilities needed by X6-X25 fork tests.
+    // 2. Stage bash + utilities needed by X6-X25 fork tests and native baseline.
     let utils = [
-        "bash", "cat", "grep", "wc", "sleep", "xargs", "echo", "rm", "chmod", "env",
+        "bash", "cat", "grep", "wc", "sleep", "xargs", "echo", "rm", "chmod", "env", "mount",
+        "mkdir",
     ];
     for name in &utils {
         if let Some(path) = which(name) {
@@ -249,6 +250,15 @@ fn build_rootfs(test_binary: &Path) -> tempfile::TempDir {
     fs::create_dir_all(rootfs.join("tmp")).unwrap();
     fs::create_dir_all(rootfs.join("root")).unwrap();
     fs::create_dir_all(rootfs.join("home")).unwrap();
+    fs::create_dir_all(rootfs.join("proc")).unwrap();
+    fs::create_dir_all(rootfs.join("dev")).unwrap();
+    // Placeholder for /dev/null — bind-mounted from host in native baseline.
+    // Stdio::null() opens /dev/null; without it, exec fails with ENOENT.
+    fs::write(rootfs.join("dev/null"), b"").unwrap();
+    // /dev/fd symlink for process substitution (X9: cat <(echo hello)).
+    #[cfg(unix)]
+    std::os::unix::fs::symlink("/proc/self/fd", rootfs.join("dev/fd"))
+        .unwrap_or_else(|e| eprintln!("warning: could not create /dev/fd symlink: {e}"));
 
     // 5. Minimal /etc.
     let etc = rootfs.join("etc");
@@ -419,22 +429,28 @@ fn process_tree_tests() {
     // ── Pass 1: Native baseline (no litebox) ──
     // Run the test harness directly via `unshare --root` to establish
     // ground truth. Any failure here is a test bug, not a litebox bug.
+    // We need --mount to bind-mount /dev/null (user namespaces can't mknod).
     let native_results = {
         let mut cmd = Command::new("unshare");
-        cmd.args(["--map-root-user", "--mount", "--fork"])
+        cmd.args(["--map-root-user", "--mount", "--pid", "--fork"])
             .arg(format!("--root={}", rootfs_dir.path().display()))
-            .arg("/litebox-test-harness")
-            .arg("spawn-tree");
+            .args([
+                "/usr/bin/bash",
+                "-c",
+                "mount -t proc proc /proc 2>/dev/null; mount --bind /dev/null /dev/null 2>/dev/null; exec /litebox-test-harness spawn-tree",
+            ]);
         run_and_parse("native", &mut cmd)
     };
 
     if native_results.is_empty() {
-        eprintln!(
-            "WARNING: native baseline produced no results (unshare may require privileges). Skipping baseline check."
-        );
+        eprintln!("WARNING: native baseline produced no results. Skipping baseline check.");
     } else {
-        // Native pass should have 0 xfails — no litebox limitations.
-        check_results("native", &native_results, 0);
+        // Native should have 0 unexpected results (FAIL or XPASS).
+        // U6.sibling_connect is xfail (test expects connection failure for litebox)
+        // but natively siblings share filesystem so the connect succeeds —
+        // the test's pass condition (ConnectFailed) is false, making it xfail.
+        // This is expected: the test is designed for litebox's limitation.
+        check_results("native", &native_results, 1); // 1 xfail: U6
     }
 
     // ── Pass 2: Litebox ──

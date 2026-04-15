@@ -160,6 +160,46 @@ impl TestRunner {
                     error: format!("{e}"),
                 },
             },
+            Command::FsSymlink { target, link } => {
+                #[cfg(unix)]
+                match tokio::fs::symlink(target, link).await {
+                    Ok(()) => Response::Ok { data: None },
+                    Err(e) => Response::Error {
+                        error: format!("symlink: {e}"),
+                    },
+                }
+                #[cfg(not(unix))]
+                Response::Error {
+                    error: "symlink not supported on this platform".to_string(),
+                }
+            }
+            Command::FsReadlink { path } => match tokio::fs::read_link(path).await {
+                Ok(target) => Response::Ok {
+                    data: Some(target.to_string_lossy().into_owned()),
+                },
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Response::NotFound,
+                Err(e) => Response::Error {
+                    error: format!("readlink: {e}"),
+                },
+            },
+            Command::FsStat { path } => match tokio::fs::symlink_metadata(path).await {
+                Ok(meta) => {
+                    let kind = if meta.is_symlink() {
+                        "symlink"
+                    } else if meta.is_dir() {
+                        "dir"
+                    } else {
+                        "file"
+                    };
+                    Response::Ok {
+                        data: Some(kind.to_string()),
+                    }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Response::NotFound,
+                Err(e) => Response::Error {
+                    error: format!("stat: {e}"),
+                },
+            },
             Command::NetConnect { addr, data } => {
                 use tokio::io::{AsyncReadExt, AsyncWriteExt};
                 match tokio::time::timeout(

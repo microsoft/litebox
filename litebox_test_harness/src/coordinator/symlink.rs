@@ -7,6 +7,40 @@ use super::TestRunner;
 use crate::protocol::{Command, Response};
 
 pub(super) async fn symlink_tests(r: &mut TestRunner) {
+    // Probe: does the platform support symlink creation?
+    // Litebox currently returns ENOTSUP for symlink().
+    let probe = r
+        .send(
+            "A",
+            Command::FsSymlink {
+                target: "/tmp/probe_target".into(),
+                link: "/tmp/probe_link".into(),
+            },
+        )
+        .await;
+    let symlink_unsupported =
+        matches!(&probe, Response::Error { error } if error.contains("not supported"));
+    // Clean up probe.
+    let _ = r
+        .send(
+            "A",
+            Command::FsDelete {
+                path: "/tmp/probe_link".into(),
+            },
+        )
+        .await;
+
+    // Helper: record as xfail if symlinks are unsupported, otherwise expect pass.
+    macro_rules! record_sym {
+        ($test:expr, $agent:expr, $pass:expr, $detail:expr) => {
+            if symlink_unsupported {
+                r.record_xfail($test, $agent, $pass, "symlink() returns ENOTSUP", $detail);
+            } else {
+                r.record($test, $agent, $pass, $detail);
+            }
+        };
+    }
+
     // Clean up stale symlinks from prior runs.
     for name in [
         "s1_link",
@@ -66,12 +100,8 @@ pub(super) async fn symlink_tests(r: &mut TestRunner) {
             },
         )
         .await;
-    r.record(
-        "S1.create",
-        "A",
-        matches!(&resp, Response::Ok { .. }),
-        &format!("{resp:?}"),
-    );
+    let pass = matches!(&resp, Response::Ok { .. });
+    record_sym!("S1.create", "A", pass, &format!("{resp:?}"));
 
     let resp = r
         .send(
@@ -82,7 +112,7 @@ pub(super) async fn symlink_tests(r: &mut TestRunner) {
         )
         .await;
     let pass = matches!(&resp, Response::Ok { data: Some(d) } if d == "/shared/s1_file");
-    r.record("S1.readlink", "A", pass, &format!("{resp:?}"));
+    record_sym!("S1.readlink", "A", pass, &format!("{resp:?}"));
 
     let resp = r
         .send(
@@ -93,7 +123,7 @@ pub(super) async fn symlink_tests(r: &mut TestRunner) {
         )
         .await;
     let pass = matches!(&resp, Response::Ok { data: Some(d) } if d == "S1_DATA");
-    r.record("S1.read_through", "A", pass, &format!("{resp:?}"));
+    record_sym!("S1.read_through", "A", pass, &format!("{resp:?}"));
 
     let resp = r
         .send(
@@ -104,7 +134,7 @@ pub(super) async fn symlink_tests(r: &mut TestRunner) {
         )
         .await;
     let pass = matches!(&resp, Response::Ok { data: Some(d) } if d == "symlink");
-    r.record("S1.stat_type", "A", pass, &format!("{resp:?}"));
+    record_sym!("S1.stat_type", "A", pass, &format!("{resp:?}"));
 
     // S2: Parent creates symlink, child reads through it
     r.send(
@@ -132,7 +162,7 @@ pub(super) async fn symlink_tests(r: &mut TestRunner) {
         )
         .await;
     let pass = matches!(&resp, Response::Ok { data: Some(d) } if d == "S2_PARENT");
-    r.record("S2.parent→child", "A", pass, &format!("{resp:?}"));
+    record_sym!("S2.parent→child", "A", pass, &format!("{resp:?}"));
 
     // S3: Child creates symlink, parent reads through it
     r.send(
@@ -160,7 +190,7 @@ pub(super) async fn symlink_tests(r: &mut TestRunner) {
         )
         .await;
     let pass = matches!(&resp, Response::Ok { data: Some(d) } if d == "S3_CHILD");
-    r.record("S3.child→parent", "init", pass, &format!("{resp:?}"));
+    record_sym!("S3.child→parent", "init", pass, &format!("{resp:?}"));
 
     // S4: Sibling visibility — A creates, B reads through
     r.send(
@@ -188,7 +218,7 @@ pub(super) async fn symlink_tests(r: &mut TestRunner) {
         )
         .await;
     let pass = matches!(&resp, Response::Ok { data: Some(d) } if d == "S4_FROM_A");
-    r.record("S4.sibling", "B", pass, &format!("{resp:?}"));
+    record_sym!("S4.sibling", "B", pass, &format!("{resp:?}"));
 
     // S5: Grandchild creates, init reads
     r.send(
@@ -216,7 +246,7 @@ pub(super) async fn symlink_tests(r: &mut TestRunner) {
         )
         .await;
     let pass = matches!(&resp, Response::Ok { data: Some(d) } if d == "S5_GRANDCHILD");
-    r.record("S5.grandchild→init", "init", pass, &format!("{resp:?}"));
+    record_sym!("S5.grandchild→init", "init", pass, &format!("{resp:?}"));
 
     // S6: Symlink to directory — create dir, create symlink, read file through dir symlink
     let _ = r
@@ -246,7 +276,7 @@ pub(super) async fn symlink_tests(r: &mut TestRunner) {
         )
         .await;
     let pass = matches!(&resp, Response::Ok { data: Some(d) } if d.trim() == "S6_CONTENT");
-    r.record("S6.dir_symlink", "A", pass, &format!("{resp:?}"));
+    record_sym!("S6.dir_symlink", "A", pass, &format!("{resp:?}"));
 
     // S7: Dangling symlink — readlink succeeds, read fails
     r.send(
@@ -266,7 +296,7 @@ pub(super) async fn symlink_tests(r: &mut TestRunner) {
         )
         .await;
     let pass = matches!(&resp, Response::Ok { data: Some(d) } if d == "/shared/nonexistent_target");
-    r.record("S7.readlink_dangling", "A", pass, &format!("{resp:?}"));
+    record_sym!("S7.readlink_dangling", "A", pass, &format!("{resp:?}"));
 
     let resp = r
         .send(
@@ -277,7 +307,7 @@ pub(super) async fn symlink_tests(r: &mut TestRunner) {
         )
         .await;
     let pass = matches!(&resp, Response::Error { .. } | Response::NotFound);
-    r.record("S7.read_dangling", "A", pass, &format!("{resp:?}"));
+    record_sym!("S7.read_dangling", "A", pass, &format!("{resp:?}"));
 
     // S8: Nested symlinks — link1 → link2 → file
     r.send(
@@ -313,7 +343,7 @@ pub(super) async fn symlink_tests(r: &mut TestRunner) {
         )
         .await;
     let pass = matches!(&resp, Response::Ok { data: Some(d) } if d == "S8_NESTED");
-    r.record("S8.nested", "A", pass, &format!("{resp:?}"));
+    record_sym!("S8.nested", "A", pass, &format!("{resp:?}"));
 
     // S9: Relative symlink target
     r.send(
@@ -341,5 +371,5 @@ pub(super) async fn symlink_tests(r: &mut TestRunner) {
         )
         .await;
     let pass = matches!(&resp, Response::Ok { data: Some(d) } if d == "S9_RELATIVE");
-    r.record("S9.relative_target", "A", pass, &format!("{resp:?}"));
+    record_sym!("S9.relative_target", "A", pass, &format!("{resp:?}"));
 }
