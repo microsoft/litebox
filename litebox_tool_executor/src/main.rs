@@ -421,7 +421,8 @@ const DEFAULT_POLICY: &str = r#"{
             "default.exp-tas.com:443",
             "marketplace.visualstudio.com:443",
             "*.gallerycdn.azureedge.net:443",
-            "vscode.blob.core.windows.net:443"
+            "vscode.blob.core.windows.net:443",
+            "mobile.events.data.microsoft.com:443"
         ]
     }
 }"#;
