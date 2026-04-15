@@ -40,6 +40,46 @@ check whether the underlying platform capability can be tested minimally
 (F/N/X/U-series). Add the minimal test first, then the VS Code-specific
 one if needed.
 
+### 7. No timer delays or polling to mask product bugs
+Product code issues must be fixed in the product code. Tests must never
+use `sleep`, `tokio::time::sleep`, retry loops, or polling intervals to
+work around race conditions or coordination bugs. If a test needs
+synchronization, use explicit protocol-level signals (e.g., a response
+that confirms readiness).
+
+### 8. Fix failing minimal tests before investigating further
+When a minimal test fails, fix it before moving on to additional issues.
+A failing minimal test is the highest-priority signal — it identifies
+a concrete product bug with a clear reproduction. Do not defer it to
+investigate broader or more complex failures.
+
+### 9. Never remove failing tests for convenience
+Failing minimal tests must not be deleted, commented out, or converted
+to xfail simply because they are inconvenient. If a test is failing, the
+product code must be fixed. The only valid reason to mark a test as xfail
+is a known platform limitation that cannot currently be resolved, with a
+documented reason.
+
+### 10. Cover all configurations before changing product code
+Before fixing a product code bug, write minimal tests that cover all
+relevant configurations of the affected code path. For example, a pipe
+relay fix must have tests for init→child, child→grandchild, and any
+other topology that exercises the code. This ensures the fix is correct
+for all cases, not just the one that was initially observed.
+
+## Workflow
+
+The correct sequence for fixing a bug is:
+
+1. **Write the test** that demonstrates the desired behavior
+2. **Watch it fail** (confirming the bug exists and the test catches it)
+3. **Fix the product code**
+4. **Watch the test pass** (confirming the fix is correct)
+5. **Verify no regressions** (all other tests still pass)
+
+Never fix product code without a failing test first. Never skip step 2 —
+if the test doesn't fail before the fix, it doesn't prove the fix works.
+
 ## Enforcement
 
 ### Compile-time: `#[cfg(test)]` lint in integration test
