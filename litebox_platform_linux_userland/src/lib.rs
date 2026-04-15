@@ -125,6 +125,10 @@ pub struct LinuxUserland {
     /// CoW-eligible memory regions. Maps start address of the static slice, to the info needed to
     /// re-mmap the file.
     cow_regions: std::sync::RwLock<std::collections::BTreeMap<usize, CowRegionInfo>>,
+    /// If [`Self::initialize_boot_specific_kdf_support`] has been run, this is set to a value that
+    /// is persistent across multiple process executions, however, it is ephemeral across true
+    /// reboots.
+    boot_id: std::sync::OnceLock<Vec<u8>>,
 }
 
 impl core::fmt::Debug for LinuxUserland {
@@ -258,8 +262,35 @@ impl LinuxUserland {
             reserved_pages,
             vdso_address,
             cow_regions: std::sync::RwLock::new(std::collections::BTreeMap::new()),
+            boot_id: std::sync::OnceLock::new(),
         };
         Box::leak(Box::new(platform))
+    }
+
+    /// Initializes support for KDFs by using boot-specific uniqueness.
+    ///
+    /// NOTE: The boot-specific uniqueness is NOT secure against an adversary with code execution or
+    /// file read permissions on the host file system, since other processes on the same system can
+    /// also derive the exact same keys.
+    ///
+    /// # Panics
+    ///
+    /// Panics if some standard Linux kernel-provided files are not available/accessible.
+    ///
+    /// Panics if run more than once on the same platform instance.
+    pub fn initialize_boot_specific_kdf_support(&self) {
+        let parsed: Vec<u8> = std::fs::read("/proc/sys/kernel/random/boot_id")
+            .unwrap()
+            .trim_ascii()
+            .split(|&x| x == b'-')
+            .flat_map(|chunk| {
+                chunk
+                    .chunks(2)
+                    .map(|t| u8::from_str_radix(str::from_utf8(t).unwrap(), 16).unwrap())
+            })
+            .collect();
+        assert_eq!(parsed.len(), 16);
+        self.boot_id.set(parsed).unwrap();
     }
 
     /// Register a CoW-eligible memory region backed by a file.
@@ -2744,6 +2775,34 @@ unsafe fn interrupt_signal_handler(
 impl litebox::platform::CrngProvider for LinuxUserland {
     fn fill_bytes_crng(&self, buf: &mut [u8]) {
         getrandom::fill(buf).expect("getrandom failed");
+    }
+}
+
+impl litebox::platform::DerivedKeyProvider for LinuxUserland {
+    fn derive_key(
+        &self,
+        shim_kdf: Option<fn(&[u8], litebox::platform::KDFParams)>,
+        params: litebox::platform::KDFParams,
+    ) -> Result<(), litebox::platform::DerivedKeyError> {
+        let Some(boot_id) = self.boot_id.get() else {
+            return Err(litebox::platform::DerivedKeyError::UnsupportedRebootPersistentKey);
+        };
+        match shim_kdf {
+            None => {
+                // TODO: Ideally, we'd use something like argon2 or such here to support more shims,
+                // but for now, we just return an error.
+                Err(litebox::platform::DerivedKeyError::ShimKDFRequired)
+            }
+            Some(shim_kdf) => {
+                // We trust the shim in this platform, since it is in the same trust boundary as us.
+                // Thus (unlike some other platforms) we do not need to manually hide the "key", and
+                // can just run the KDF as-is.
+                //
+                // Our key is actually just the boot ID itself.
+                shim_kdf(boot_id, params);
+                Ok(())
+            }
+        }
     }
 }
 
