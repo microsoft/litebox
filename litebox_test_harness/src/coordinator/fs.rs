@@ -91,14 +91,25 @@ pub(super) async fn fs_tests(r: &mut TestRunner) {
     r.record("F5.sibling", "B", true, &format!("tmp_isolated={is_isolated}: {resp:?}"));
 
     // F6: Host pre-written file
+    // This tests whether the host can pre-write a file that the sandbox reads.
+    // Passes when /shared/host_wrote.txt exists in the rootfs (integration test
+    // creates it; VS Code rootfs may not have it).
     let resp = r.send("init", Command::FsRead { path: "/shared/host_wrote.txt".into() }).await;
     let pass = matches!(&resp, Response::Ok { data: Some(d) } if d == "from_host");
-    if shared_writable { r.record("F6.host→init", "init", pass, &format!("{resp:?}")); }
-    else { r.record_xfail("F6.host→init", "init", pass, "no /shared/host_wrote.txt in rootfs", &format!("{resp:?}")); }
+    let missing = matches!(&resp, Response::NotFound);
+    if missing && !shared_writable {
+        r.record_xfail("F6.host→init", "init", pass, "no /shared/host_wrote.txt in rootfs", &format!("{resp:?}"));
+    } else {
+        r.record("F6.host→init", "init", pass, &format!("{resp:?}"));
+    }
     let resp = r.send("A", Command::FsRead { path: "/shared/host_wrote.txt".into() }).await;
     let pass = matches!(&resp, Response::Ok { data: Some(d) } if d == "from_host");
-    if shared_writable { r.record("F6.host→A", "A", pass, &format!("{resp:?}")); }
-    else { r.record_xfail("F6.host→A", "A", pass, "no /shared/host_wrote.txt in rootfs", &format!("{resp:?}")); }
+    let missing = matches!(&resp, Response::NotFound);
+    if missing && !shared_writable {
+        r.record_xfail("F6.host→A", "A", pass, "no /shared/host_wrote.txt in rootfs", &format!("{resp:?}"));
+    } else {
+        r.record("F6.host→A", "A", pass, &format!("{resp:?}"));
+    }
     // Agent writes for host to read after exit
     r.send("init", Command::FsWrite { path: "/shared/for_host.txt".into(), data: "from_agent".into() }).await;
 }
