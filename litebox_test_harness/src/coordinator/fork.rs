@@ -328,9 +328,48 @@ pub(super) async fn node_exec_tests(r: &mut TestRunner) {
     let resp = r.send("AA", exec(vec![
         self_exe.clone(),
         "trigger-delayed-fork".into(),
-        self_exe,
+        self_exe.clone(),
         "echo-test".into(),
     ])).await;
     let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout.contains("ECHO_TEST_OK"));
     r.record("X34b.nested_delayed_fork_deep", "AA", pass, &format!("{resp:?}"));
+
+    // X35: trigger-delayed-fork → node
+    // Does fork+exec of node from a delayed-fork child lose stdout?
+    // Removes bash/script-file from the equation.
+    let resp = r.send("A", exec(vec![
+        self_exe.clone(),
+        "trigger-delayed-fork".into(),
+        "/usr/local/bin/node".into(),
+        "-e".into(),
+        "console.log('df_node_ok')".into(),
+    ])).await;
+    let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout.contains("df_node_ok"));
+    r.record("X35.delayed_fork_then_node", "A", pass, &format!("{resp:?}"));
+
+    // X36: trigger-delayed-fork → trigger-delayed-fork → echo-test
+    // Three levels of delayed-fork nesting.
+    let resp = r.send("A", exec(vec![
+        self_exe.clone(),
+        "trigger-delayed-fork".into(),
+        self_exe.clone(),
+        "trigger-delayed-fork".into(),
+        self_exe.clone(),
+        "echo-test".into(),
+    ])).await;
+    let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout.contains("ECHO_TEST_OK"));
+    r.record("X36.triple_delayed_fork", "A", pass, &format!("{resp:?}"));
+
+    // X37: Script file that fork+execs trigger-delayed-fork → echo-test
+    // Same depth as X28b but using trigger-delayed-fork instead of node.
+    // Isolates: is the issue script+fork+delayed-fork, or script+fork+node?
+    let resp = r.send("A", exec(bash(
+        &format!("echo '#!/usr/bin/bash' > /tmp/x37.sh && \
+         echo '{self_exe} trigger-delayed-fork {self_exe} echo-test' >> /tmp/x37.sh && \
+         chmod +x /tmp/x37.sh && \
+         /tmp/x37.sh; \
+         EXIT=$?; rm -f /tmp/x37.sh; exit $EXIT")
+    ))).await;
+    let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout.contains("ECHO_TEST_OK"));
+    r.record("X37.script_fork_delayed_fork", "A", pass, &format!("{resp:?}"));
 }
