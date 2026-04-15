@@ -665,37 +665,21 @@ async fn vscode_repro_tests(r: &mut TestRunner) {
     // Clean up socket.
     let _ = r.send("A", exec(bash("rm -f /tmp/t4-test.sock"))).await;
 
-    // T5: Unix socket bidirectional data flow
+    // T5: Unix socket bidirectional data flow (cross-process)
     // Mimics CLI↔code-server: one process listens on a Unix socket,
     // another connects and sends data. Verifies echo round-trip.
-    // Uses bash + the test harness's own UnixSocketTest (T1 already validates
-    // the basic bind/listen/connect/send/recv path). T5 tests through bash
-    // fork+exec which is closer to how the CLI launches code-server.
+    // Uses Rust subcommands (unix-echo-server/client) instead of python3.
+    // bash orchestrates server background + client foreground.
+    let self_exe = r.self_exe.clone();
     let resp = r.send("A", exec_timeout(bash(
-        "rm -f /tmp/t5.sock; \
-         bash -c 'exec 3<>/dev/null; \
-         python3 -c \"
-import socket,os,sys
-s=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM)
-s.bind(chr(47)+chr(116)+chr(109)+chr(112)+chr(47)+chr(116)+chr(53)+chr(46)+chr(115)+chr(111)+chr(99)+chr(107))
-s.listen(1)
-c,_=s.accept()
-d=c.recv(1024)
-c.sendall(d)
-c.close()
-s.close()
-\" &'; \
+        &format!("rm -f /tmp/t5.sock; \
+         {self_exe} unix-echo-server /tmp/t5.sock & \
+         SERVER_PID=$!; \
          sleep 1; \
-         RESULT=$(python3 -c \"
-import socket
-s=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM)
-s.connect(chr(47)+chr(116)+chr(109)+chr(112)+chr(47)+chr(116)+chr(53)+chr(46)+chr(115)+chr(111)+chr(99)+chr(107))
-s.sendall(b'UNIX_ECHO_TEST')
-print(s.recv(1024).decode())
-s.close()
-\"); \
+         RESULT=$({self_exe} unix-echo-client /tmp/t5.sock UNIX_ECHO_TEST 2>&1); \
          echo \"t5_result=$RESULT\"; \
-         rm -f /tmp/t5.sock"
+         kill $SERVER_PID 2>/dev/null; wait $SERVER_PID 2>/dev/null; \
+         rm -f /tmp/t5.sock")
     ), 30)).await;
     let pass = matches!(&resp, Response::ExecResult { stdout, .. } if stdout.contains("t5_result=UNIX_ECHO_TEST"));
     let timeout = matches!(&resp, Response::ExecTimeout { .. });

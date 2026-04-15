@@ -1,0 +1,75 @@
+{"agent":"A","detail":"NotFound","result":"pass","test":"F1.absent"}
+{"agent":"A","detail":"NotFound","result":"fail","test":"F1.created"}
+{"agent":"A","detail":"NotFound","result":"fail","test":"F1.updated"}
+{"agent":"A","detail":"NotFound","result":"pass","test":"F1.deleted"}
+{"agent":"init","detail":"NotFound","result":"fail","test":"F2"}
+{"agent":"init","detail":"NotFound","result":"fail","test":"F2.update"}
+{"agent":"init","detail":"NotFound","result":"pass","test":"F2.deleted"}
+{"agent":"B","detail":"NotFound","result":"fail","test":"F3.A→B"}
+{"agent":"A","detail":"NotFound","result":"fail","test":"F3.B→A"}
+{"agent":"init","detail":"NotFound","result":"fail","test":"F4.AA→init"}
+{"agent":"B","detail":"NotFound","result":"fail","test":"F4.AA→B"}
+{"agent":"init","detail":"NotFound","result":"fail","test":"F4.AAA→init"}
+{"agent":"AA","detail":"tmp_isolated=false: Ok { data: Some(\"temp\") }","result":"pass","test":"F5.parent→child"}
+{"agent":"B","detail":"tmp_isolated=false: Ok { data: Some(\"temp\") }","result":"pass","test":"F5.sibling"}
+{"agent":"init","detail":"NotFound","result":"fail","test":"F6.host→init"}
+{"agent":"A","detail":"NotFound","result":"fail","test":"F6.host→A"}
+{"agent":"A","detail":"Listening { port: 9001 }","result":"pass","test":"N1.listen"}
+{"agent":"init","detail":"Connected { echo: \"N1\" }","result":"pass","test":"N1.init→A"}
+{"agent":"B","detail":"Listening { port: 9002 }","result":"pass","test":"N2.listen"}
+{"agent":"A","detail":"Connected { echo: \"N2\" }","result":"pass","test":"N2.A→B"}
+{"agent":"B","detail":"Connected { echo: \"N3\" }","result":"pass","test":"N3.B→A"}
+{"agent":"AAA","detail":"Connected { echo: \"N4\" }","result":"pass","test":"N4.AAA→A"}
+{"agent":"A","detail":"Ok { data: None }","result":"pass","test":"N1.unlisten"}
+{"agent":"AAA","detail":"Listening { port: 9005 }","result":"pass","test":"N5.listen"}
+{"agent":"B","detail":"Connected { echo: \"N5\" }","result":"pass","test":"N5.B→AAA"}
+{"agent":"AAA","detail":"Ok { data: None }","result":"pass","test":"N5.unlisten"}
+{"agent":"AB","detail":"Listening { port: 9004 }","result":"pass","test":"N6.listen"}
+{"agent":"AA","detail":"Connected { echo: \"N6\" }","result":"pass","test":"N6.AA→AB"}
+{"agent":"AB","detail":"Ok { data: None }","result":"pass","test":"N6.unlisten"}
+{"agent":"AAB","detail":"Listening { port: 9006 }","result":"pass","test":"N7.listen"}
+{"agent":"AAA","detail":"Connected { echo: \"N7\" }","result":"pass","test":"N7.AAA→AAB"}
+{"agent":"AAB","detail":"Ok { data: None }","result":"pass","test":"N7.unlisten"}
+{"agent":"AB","detail":"Connected { echo: \"N8\" }","result":"pass","test":"N8.AB→B"}
+{"agent":"B","detail":"Ok { data: None }","result":"pass","test":"N8.unlisten"}
+{"agent":"A","detail":"ExecResult { exit_code: 0, stdout: \"ECHO_TEST_OK\", stderr: \"\" }","result":"pass","test":"X1.A"}
+{"agent":"AA","detail":"ExecResult { exit_code: 0, stdout: \"ECHO_TEST_OK\", stderr: \"\" }","result":"pass","test":"X2.AA"}
+{"agent":"AAA","detail":"ExecResult { exit_code: 0, stdout: \"ECHO_TEST_OK\", stderr: \"\" }","result":"pass","test":"X3.AAA"}
+{"agent":"A","detail":"ExecResult { exit_code: 42, stdout: \"\", stderr: \"\" }","result":"pass","test":"X4.exit_code"}
+{"agent":"AAA","detail":"ExecResult { exit_code: 7, stdout: \"\", stderr: \"\" }","result":"pass","test":"X5.deep_exit"}
+{"agent":"A","detail":"ExecResult { exit_code: 0, stdout: \"hello_from_bash\", stderr: \"\" }","result":"pass","test":"X6.bash_echo"}
+{"agent":"A","detail":"ExecResult { exit_code: 0, stdout: \"inner_value\", stderr: \"\" }","result":"pass","test":"X7.cmd_substitution"}
+{"agent":"A","detail":"timeout=false ExecResult { exit_code: 0, stdout: \"pipe_data\", stderr: \"\" }","result":"pass","test":"X8.pipe_in_subshell"}
+{"agent":"A","detail":"xfail_devfd=false timeout=false ExecResult { exit_code: 0, stdout: \"proc_sub_data\", stderr: \"\" }","result":"pass","test":"X9.process_substitution"}
+{"agent":"A","detail":"timeout=false ExecResult { exit_code: 0, stdout: \"pipe_two_stage\", stderr: \"\" }","result":"pass","test":"X10.simple_pipe"}
+{"agent":"A","detail":"timeout=false ExecResult { exit_code: 0, stdout: \"three_stage\", stderr: \"\" }","result":"pass","test":"X11.three_stage_pipe"}
+{"agent":"A","detail":"timeout=false ExecResult { exit_code: 0, stdout: \"bg_done\", stderr: \"\" }","result":"pass","test":"X12.background_wait"}
+{"agent":"A","detail":"timeout=false ExecResult { exit_code: 0, stdout: \"bg_a\\nbg_b\", stderr: \"\" }","result":"pass","test":"X13.multi_background"}
+{"agent":"A","detail":"timeout=false ExecResult { exit_code: 0, stdout: \"42\", stderr: \"\" }","result":"pass","test":"X14.subshell_exit_code"}
+{"agent":"A","detail":"ExecResult { exit_code: 0, stdout: \"seq_a\\nseq_b\\nseq_c\", stderr: \"\" }","result":"pass","test":"X15.sequential_cmds"}
+{"agent":"A","detail":"timeout=false ExecResult { exit_code: 0, stdout: \"deep_nested\", stderr: \"\" }","result":"pass","test":"X16.nested_subshell"}
+{"agent":"A","detail":"timeout=false ExecResult { exit_code: 0, stdout: \"heredoc_line\", stderr: \"\" }","result":"pass","test":"X17.heredoc"}
+{"agent":"A","detail":"timeout=false ExecResult { exit_code: 0, stdout: \"herestring_data\", stderr: \"\" }","result":"pass","test":"X18.herestring"}
+{"agent":"A","detail":"timeout=false ExecResult { exit_code: 0, stdout: \"beta\", stderr: \"\" }","result":"pass","test":"X19.pipe_grep"}
+{"agent":"A","detail":"timeout=false ExecResult { exit_code: 0, stdout: \"1\", stderr: \"\" }","result":"pass","test":"X20.subshell_pipe_wc"}
+{"agent":"A","detail":"timeout=false ExecResult { exit_code: 0, stdout: \"backtick_val\", stderr: \"\" }","result":"pass","test":"X21.backtick_subst"}
+{"agent":"A","detail":"timeout=false ExecResult { exit_code: 0, stdout: \"got_a\\ngot_b\\ngot_c\", stderr: \"\" }","result":"pass","test":"X22.pipe_while_read"}
+{"agent":"AA","detail":"timeout=false ExecResult { exit_code: 0, stdout: \"deeper_pipe\", stderr: \"\" }","result":"pass","test":"X23.deep_pipe"}
+{"agent":"AAA","detail":"timeout=false ExecResult { exit_code: 0, stdout: \"deep_sub\", stderr: \"\" }","result":"pass","test":"X24.deep_subshell_pipe"}
+{"agent":"A","detail":"timeout=false ExecResult { exit_code: 0, stdout: \"xargs_p\\nxargs_q\\nxargs_r\", stderr: \"\" }","result":"pass","test":"X25.xargs"}
+{"agent":"A","detail":"Ok { data: Some(\"/root\") }","result":"pass","test":"E1.A"}
+{"agent":"A","detail":"Ok { data: Some(\"/usr/local/bin:/usr/bin:/bin\") }","result":"pass","test":"E2.A"}
+{"agent":"A","detail":"Ok { data: Some(\"/\") }","result":"pass","test":"E3.A"}
+{"agent":"AAA","detail":"Ok { data: Some(\"/root\") }","result":"pass","test":"E4.AAA"}
+{"agent":"B","detail":"Ok { data: Some(\"/\") }","result":"pass","test":"E5.B"}
+{"agent":"A","detail":"Ok { data: Some(\"unix_socket_ok\") }","result":"pass","test":"T1.unix_socket"}
+{"agent":"AA","detail":"Ok { data: Some(\"unix_socket_ok\") }","result":"pass","test":"T1b.unix_socket_deep"}
+{"agent":"A","detail":"Listening { port: 9100 }","result":"pass","test":"T2.listen_A"}
+{"agent":"A","detail":"Ok { data: None }","result":"pass","test":"T2.unlisten_A"}
+{"agent":"B","detail":"Listening { port: 9100 }","result":"pass","test":"T2.reuse_B"}
+{"agent":"A","detail":"timeout=false ExecResult { exit_code: 0, stdout: \"tmp_write_test\", stderr: \"\" }","result":"pass","test":"T3.tmp_write"}
+{"agent":"AA","detail":"ExecResult { exit_code: 0, stdout: \"deep_tmp\", stderr: \"\" }","result":"pass","test":"T3b.tmp_write_deep"}
+{"agent":"A","detail":"ExecResult { exit_code: 0, stdout: \"/root/.vscode-server/cli/servers/Stable-ae130017f8afe532557dbb8539a6ef3bdaec6389/server/bin/code-server: line 22: /root/.vscode-server/cli/servers/Stable-ae130017f8afe532557dbb8539a6ef3bdaec6389/server/node: Input/output error\\nexit=143\", stderr: \"\" }","result":"pass","test":"T4.code_server"}
+{"agent":"A","detail":"timeout=false ExecResult { exit_code: 0, stdout: \"t5_result=\", stderr: \"\" }","result":"fail","test":"T5.unix_relay"}
+{"agent":"A","detail":"ExecResult { exit_code: 143, stdout: \"SOCKET_MISSING\", stderr: \"\" }","result":"fail","test":"T6.code_server_socket"}
+{"agent":"A","detail":"ExecResult { exit_code: 143, stdout: \"STILL_RUNNING\", stderr: \"\" }","result":"pass","test":"T7.auto_shutdown"}

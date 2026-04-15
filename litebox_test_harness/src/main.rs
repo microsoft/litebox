@@ -50,6 +50,110 @@ fn main() {
                 .unwrap_or(0);
             std::process::exit(code);
         }
+        // --- Subcommands for self-contained tests (no bash/python3 dependency) ---
+        "write-file" => {
+            // Usage: write-file <path> <data>
+            let path = args.get(2).expect("write-file requires <path>");
+            let data = args.get(3).expect("write-file requires <data>");
+            std::fs::write(path, data).expect("write failed");
+            println!("OK");
+        }
+        "read-file" => {
+            // Usage: read-file <path>
+            match std::fs::read_to_string(args.get(2).expect("read-file requires <path>")) {
+                Ok(data) => println!("{data}"),
+                Err(e) => {
+                    eprintln!("{e}");
+                    std::process::exit(1);
+                }
+            }
+        }
+        "pipe-echo" => {
+            // Usage: pipe-echo <data>
+            // Creates a pipe, forks a child (via self-exe echo-test pattern),
+            // child writes data to stdout, parent captures it.
+            // Tests fork + pipe data flow in Rust.
+            let data = args.get(2).expect("pipe-echo requires <data>");
+            let output = std::process::Command::new(self_exe)
+                .arg("echo-line")
+                .arg(data)
+                .stdout(std::process::Stdio::piped())
+                .output()
+                .expect("fork+exec failed");
+            let captured = String::from_utf8_lossy(&output.stdout);
+            print!("{captured}");
+        }
+        "echo-line" => {
+            // Helper: prints args[2] to stdout. Used by pipe-echo.
+            if let Some(data) = args.get(2) {
+                println!("{data}");
+            }
+        }
+        "unix-echo-server" => {
+            // Usage: unix-echo-server <path>
+            // Binds a Unix domain socket, accepts ONE connection, echoes
+            // received data back, then exits. Prints LISTENING when ready.
+            let path = args.get(2).expect("unix-echo-server requires <path>");
+            let _ = std::fs::remove_file(path);
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("tokio runtime");
+            rt.block_on(async {
+                let listener = tokio::net::UnixListener::bind(path).expect("bind failed");
+                println!("LISTENING");
+                let (mut stream, _) = listener.accept().await.expect("accept failed");
+                let mut buf = [0u8; 4096];
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                match stream.read(&mut buf).await {
+                    Ok(n) if n > 0 => {
+                        let _ = stream.write_all(&buf[..n]).await;
+                        let _ = stream.flush().await;
+                    }
+                    _ => {}
+                }
+            });
+            let _ = std::fs::remove_file(path);
+        }
+        "unix-echo-client" => {
+            // Usage: unix-echo-client <path> <data>
+            // Connects to a Unix domain socket, sends data, reads response,
+            // prints it to stdout.
+            let path = args.get(2).expect("unix-echo-client requires <path>");
+            let data = args.get(3).expect("unix-echo-client requires <data>");
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("tokio runtime");
+            rt.block_on(async {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                let mut stream = tokio::net::UnixStream::connect(path)
+                    .await
+                    .expect("connect failed");
+                stream.write_all(data.as_bytes()).await.expect("write failed");
+                stream.flush().await.expect("flush failed");
+                let mut buf = [0u8; 4096];
+                match tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    stream.read(&mut buf),
+                )
+                .await
+                {
+                    Ok(Ok(n)) => {
+                        let resp = String::from_utf8_lossy(&buf[..n]);
+                        println!("{resp}");
+                    }
+                    Ok(Err(e)) => {
+                        eprintln!("read error: {e}");
+                        std::process::exit(1);
+                    }
+                    Err(_) => {
+                        eprintln!("read timeout");
+                        std::process::exit(1);
+                    }
+                }
+            });
+        }
         other => {
             eprintln!("unknown command: {other}");
             std::process::exit(1);
