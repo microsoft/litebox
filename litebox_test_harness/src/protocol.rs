@@ -44,7 +44,12 @@ pub enum Command {
 
     /// Fork+exec self with args and report exit code + stdout.
     #[serde(rename = "exec")]
-    Exec { args: Vec<String> },
+    Exec {
+        args: Vec<String>,
+        /// Optional timeout in seconds (default: 10).
+        #[serde(default)]
+        timeout_secs: Option<u64>,
+    },
 
     /// Report an environment variable value.
     #[serde(rename = "env_get")]

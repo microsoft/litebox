@@ -206,7 +206,7 @@ async fn agent_loop(self_exe: &str) {
                 }
             }
 
-            Command::Exec { args } => {
+            Command::Exec { args, timeout_secs } => {
                 if args.is_empty() {
                     respond(&Response::Error {
                         error: "exec requires args".to_string(),
@@ -214,6 +214,7 @@ async fn agent_loop(self_exe: &str) {
                     .await;
                     continue;
                 }
+                let timeout = Duration::from_secs(timeout_secs.unwrap_or(10));
                 let mut child = match tokio::process::Command::new(&args[0])
                     .args(&args[1..])
                     .stdout(std::process::Stdio::piped())
@@ -233,7 +234,7 @@ async fn agent_loop(self_exe: &str) {
                 let mut child_stderr = child.stderr.take().unwrap();
 
                 // Collect stdout/stderr and wait, with timeout for deadlock detection.
-                let result = tokio::time::timeout(Duration::from_secs(10), async {
+                let result = tokio::time::timeout(timeout, async {
                     let mut out = Vec::new();
                     let mut err = Vec::new();
                     let (r1, r2, status) = tokio::join!(
