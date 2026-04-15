@@ -90,7 +90,13 @@ fn build_policy(
 ) -> Arc<dyn litebox_broker::policy::Policy> {
     // If a sandbox policy is loaded, use its FS rules via GlobPolicy.
     if let Some(sp) = sandbox_policy {
-        return Arc::new(GlobPolicy::new(Arc::clone(sp)));
+        // Determine the rootfs path for stripping host prefixes from paths.
+        let root = cli
+            .root_dir
+            .as_ref()
+            .map(|p| p.canonicalize().unwrap_or_else(|_| p.clone()))
+            .unwrap_or_default();
+        return Arc::new(GlobPolicy::new(Arc::clone(sp), root));
     }
     // Otherwise fall back to the CLI flag-based policies.
     if cli.read_only {

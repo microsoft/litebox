@@ -7,7 +7,7 @@
 //! operation.  The default [`AllowAllPolicy`] permits everything — swap it out
 //! for an Oso-backed implementation when the policy engine is integrated.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// The kind of file system operation being requested.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -160,12 +160,22 @@ impl Policy for ReadOnlyWithWritablePaths {
 /// full sandbox policy file is loaded.
 pub struct GlobPolicy {
     sandbox_policy: std::sync::Arc<crate::sandbox_policy::SandboxPolicy>,
+    /// Root directory prefix to strip from host paths before matching.
+    /// For example, if root is "/home/user/rootfs" and the host path is
+    /// "/home/user/rootfs/tmp/test.sh", the policy sees "/tmp/test.sh".
+    root: PathBuf,
 }
 
 impl GlobPolicy {
     /// Create a glob-based policy from a shared sandbox policy.
-    pub fn new(sandbox_policy: std::sync::Arc<crate::sandbox_policy::SandboxPolicy>) -> Self {
-        Self { sandbox_policy }
+    pub fn new(
+        sandbox_policy: std::sync::Arc<crate::sandbox_policy::SandboxPolicy>,
+        root: PathBuf,
+    ) -> Self {
+        Self {
+            sandbox_policy,
+            root,
+        }
     }
 }
 
@@ -197,8 +207,11 @@ impl Policy for GlobPolicy {
             };
         };
 
-        let path_str = p.to_str().unwrap_or("");
-        match self.sandbox_policy.check_file_access(path_str, write) {
+        // Strip the rootfs prefix to get the guest-visible path.
+        // Host path: /home/user/rootfs/tmp/test.sh → guest path: /tmp/test.sh
+        let guest_path = p.strip_prefix(&self.root).unwrap_or(p);
+        let guest_str = format!("/{}", guest_path.to_str().unwrap_or(""));
+        match self.sandbox_policy.check_file_access(&guest_str, write) {
             crate::sandbox_policy::Decision::Allow => Decision::Allow,
             crate::sandbox_policy::Decision::Deny => Decision::Deny,
         }
