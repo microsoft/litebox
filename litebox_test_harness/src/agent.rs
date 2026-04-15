@@ -123,7 +123,10 @@ async fn agent_loop(self_exe: &str) {
                                                 match stream.read(&mut buf).await {
                                                     Ok(0) | Err(_) => break,
                                                     Ok(n) => {
-                                                        if stream.write_all(&buf[..n]).await.is_err()
+                                                        if stream
+                                                            .write_all(&buf[..n])
+                                                            .await
+                                                            .is_err()
                                                         {
                                                             break;
                                                         }
@@ -279,20 +282,14 @@ async fn agent_loop(self_exe: &str) {
 
             Command::EnvGet { var } => {
                 let val = std::env::var(&var).unwrap_or_else(|_| "NOT_SET".to_string());
-                respond(&Response::Ok {
-                    data: Some(val),
-                })
-                .await;
+                respond(&Response::Ok { data: Some(val) }).await;
             }
 
             Command::CwdGet => {
                 let cwd = std::env::current_dir()
                     .map(|p| p.display().to_string())
                     .unwrap_or_else(|e| format!("ERROR: {e}"));
-                respond(&Response::Ok {
-                    data: Some(cwd),
-                })
-                .await;
+                respond(&Response::Ok { data: Some(cwd) }).await;
             }
 
             Command::Go => {
@@ -313,7 +310,10 @@ async fn agent_loop(self_exe: &str) {
                                                 match stream.read(&mut buf).await {
                                                     Ok(0) | Err(_) => break,
                                                     Ok(n) => {
-                                                        if stream.write_all(&buf[..n]).await.is_err()
+                                                        if stream
+                                                            .write_all(&buf[..n])
+                                                            .await
+                                                            .is_err()
                                                         {
                                                             break;
                                                         }

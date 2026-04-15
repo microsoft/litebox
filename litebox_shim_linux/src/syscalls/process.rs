@@ -2807,34 +2807,50 @@ impl<FS: ShimFS> Task<FS> {
                         repl.direction,
                     );
 
-                    // Check if the parent's existing fd is a virtual pipe
-                    // WRITE-end (sender). If so, relay the remote worker's
-                    // output directly into it instead of replacing it. This
-                    // preserves the pipe chain to upstream consumers (e.g.,
-                    // the agent's Exec handler) for non-init parents like
-                    // bash inside a worker.
+                    // Check if the replacement targets a virtual pipe WRITE-end
+                    // (sender) whose pair_id is in mux_pipe_pair_ids — meaning
+                    // it was created by a prior commit_delayed_fork relay, not
+                    // by the current process (e.g. Stdio::piped()).
                     //
-                    // If the existing fd is a read-end (receiver), use the
-                    // normal replacement path — this is the case for direct
-                    // Exec from the agent where the parent created the pipe
-                    // to capture the child's stdout.
-                    let is_existing_sender = files
-                        .raw_descriptor_store
-                        .read()
-                        .fd_from_raw_integer::<litebox::pipes::Pipes<crate::Platform>>(
-                            repl.guest_fd,
-                        )
-                        .ok()
-                        .and_then(|fd| {
-                            self.global
-                                .pipes
-                                .half_pipe_type(&fd)
+                    // If so, relay the remote worker's output directly into the
+                    // existing pipe instead of replacing it. This preserves
+                    // the pipe chain to upstream consumers (e.g. the agent
+                    // reads bash's stdout through the mux relay; replacing it
+                    // would disconnect the chain).
+                    //
+                    // If the fd is NOT mux-managed (init's host-backed fds,
+                    // or dynamically created pipe pairs from Stdio::piped()),
+                    // use the default replacement path which creates a new
+                    // virtual pipe pair.
+                    let is_mux_sender = {
+                        let mux_ids = self.mux_pipe_pair_ids.borrow();
+                        if mux_ids.is_empty() {
+                            None
+                        } else {
+                            files
+                                .raw_descriptor_store
+                                .read()
+                                .fd_from_raw_integer::<litebox::pipes::Pipes<crate::Platform>>(
+                                    repl.guest_fd,
+                                )
                                 .ok()
-                                .map(|t| (Arc::clone(&fd), t))
-                        });
+                                .and_then(|fd| {
+                                    let half_type = self.global.pipes.half_pipe_type(&fd).ok()?;
+                                    if half_type != litebox::pipes::HalfPipeType::SenderHalf {
+                                        return None;
+                                    }
+                                    let pair_id = self.global.pipes.pipe_pair_id(&fd).ok()?;
+                                    if mux_ids.contains(&pair_id) {
+                                        Some((Arc::clone(&fd), half_type))
+                                    } else {
+                                        None
+                                    }
+                                })
+                        }
+                    };
 
                     if let Some((ref existing_fd, litebox::pipes::HalfPipeType::SenderHalf)) =
-                        is_existing_sender
+                        is_mux_sender
                     {
                         if repl.direction == HostPipeDirection::Read {
                             // The parent's fd is a pipe write-end (e.g., stdout).
@@ -2856,8 +2872,7 @@ impl<FS: ShimFS> Task<FS> {
                             let target_fd = Arc::clone(existing_fd);
 
                             self.global.platform.spawn_background_task(move || {
-                                let wait_state =
-                                    litebox::event::wait::WaitState::new(platform);
+                                let wait_state = litebox::event::wait::WaitState::new(platform);
                                 let cx = wait_state.context();
                                 let mut buf = alloc::vec![0u8; 65536];
                                 loop {
