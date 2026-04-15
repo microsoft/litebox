@@ -754,3 +754,59 @@ pub trait CrngProvider {
     /// failures.
     fn fill_bytes_crng(&self, buf: &mut [u8]);
 }
+
+/// Provider of derived device-specific keys.
+///
+/// Some shims need support for deriving keys that survives past reboots (for example, to support
+/// secure storage). Such keys are derived from some device-specific secret (called `root_key`) and
+/// some `context`, and a key derivation function (KDF).
+///
+/// Platforms might differ drastically on their own notion of device-specific secrets, and what
+/// "reboot-surviving" means. Some platforms might have a real never-revealed never-modified root
+/// key (e.g., TPMs), while others might have maintain a persistent key across LiteBox invocations,
+/// but that persistent-key might be re-initialized to a new value every "real" reboot, etc.
+///
+/// Concretely, no shim can depend _directly_ on the existence of a device-specific secret. However,
+/// interestingly, for cryptographically strong KDFs where you do not know the root key,
+/// `KDF(root_key, context)` is indistinguishable from `KDF(KDF'(root_key, context'), context)`, etc.
+/// Thus, while some shims might be particular about their choice of KDF, and platforms might be
+/// particular about their choice of KDFs, they can mutually-distrustingly just simply run two KDFs
+/// if needed. For performance reasons however, this is not ideal to be forced always, and thus this
+/// specific provider supports a model that allows for more pragmatic choices, while making sure
+/// that the platform has final say on the total strictness of the root key (since it is what
+/// finally owns the root key).
+pub trait DerivedKeyProvider {
+    /// Derive a new key using the `shim_kdf` (if provided) and the current context
+    /// (`params.context`), and place it into `params.output`.
+    ///
+    /// The platform is allowed to completely ignore the provided `shim_kdf` and use its own KDF
+    /// instead if if chooses to; alternatively, some platforms might not have their own KDFs, and
+    /// only run if the shim provides a KDF.
+    ///
+    /// The `shim_kdf` is a `fn` not a `Fn`/`FnMut`/`FnOnce` in order to incentivize usage of pure
+    /// functions.
+    fn derive_key(
+        &self,
+        shim_kdf: Option<fn(&[u8], KDFParams)>,
+        params: KDFParams,
+    ) -> Result<(), DerivedKeyError>;
+}
+
+/// Input and output parameters to a KDF other than the secret itself.
+pub struct KDFParams<'a> {
+    /// The input context provided to the KDF. The output is guaranteed to be the same if the same
+    /// input context is provided.
+    pub context: &'a [u8],
+    /// The output of the KDF produces a key of the exact length of the buffer provided as a
+    /// parameter.
+    pub output: &'a mut [u8],
+}
+
+#[derive(Debug, Error)]
+/// Errors that might be returned upon attempting to derive a key.
+pub enum DerivedKeyError {
+    #[error("platform does not support purely-platform KDFs")]
+    ShimKDFRequired,
+    #[error("this platform does not support reboot-persistent keys")]
+    UnsupportedRebootPersistentKey,
+}
