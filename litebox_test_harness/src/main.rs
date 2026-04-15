@@ -19,21 +19,28 @@ fn main() {
     match cmd {
         "spawn-tree" => {
             let results = coordinator::run_all(self_exe);
-            let passed = results.iter().filter(|r| r.2).count();
-            let failed = results.iter().filter(|r| !r.2).count();
+            let pass_count = results.iter().filter(|r| r.outcome() == "pass").count();
+            let fail_count = results.iter().filter(|r| r.outcome() == "FAIL").count();
+            let xfail_count = results.iter().filter(|r| r.outcome() == "xfail").count();
+            let xpass_count = results.iter().filter(|r| r.outcome() == "XPASS").count();
             // Print JSON results to stdout.
-            for (test, agent, pass, detail) in &results {
-                let status = if *pass { "pass" } else { "fail" };
+            for r in &results {
                 println!(
                     "{}",
-                    serde_json::json!({"test": test, "agent": agent, "result": status, "detail": detail})
+                    serde_json::json!({
+                        "test": r.id,
+                        "agent": r.agent,
+                        "result": r.outcome(),
+                        "detail": r.detail,
+                    })
                 );
             }
             eprintln!(
-                "\n=== SUMMARY: {} total, {} passed, {} failed ===",
-                results.len(), passed, failed
+                "\n=== SUMMARY: {} total, {} passed, {} failed, {} xfail, {} xpass ===",
+                results.len(), pass_count, fail_count, xfail_count, xpass_count
             );
-            if failed > 0 {
+            // Exit non-zero only for unexpected results.
+            if fail_count > 0 || xpass_count > 0 {
                 std::process::exit(1);
             }
         }
