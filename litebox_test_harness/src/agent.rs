@@ -217,6 +217,7 @@ async fn agent_loop(self_exe: &str) {
                 let timeout = Duration::from_secs(timeout_secs.unwrap_or(10));
                 let mut child = match tokio::process::Command::new(&args[0])
                     .args(&args[1..])
+                    .stdin(std::process::Stdio::null())
                     .stdout(std::process::Stdio::piped())
                     .stderr(std::process::Stdio::piped())
                     .spawn()

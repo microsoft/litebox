@@ -298,7 +298,7 @@ fn process_tree_tests() {
     // - Accidental xfail additions (count goes up without updating here)
     // - Fixed xfails that weren't removed (count goes down)
     // Update this constant when intentionally adding/removing xfails.
-    const EXPECTED_XFAIL_COUNT: usize = 4; // U6.sibling, X27-X29 (pipe contamination)
+    const EXPECTED_XFAIL_COUNT: usize = 1; // U6.sibling
     let xfail_count = results
         .iter()
         .filter(|r| r["result"].as_str() == Some("xfail"))
