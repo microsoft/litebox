@@ -112,10 +112,39 @@ fn build_rootfs(test_binary: &Path) -> tempfile::TempDir {
         }
     }
 
-    // 3. Stage Node.js for X26-X28 tests (skip if not installed on host).
-    if let Some(node_path) = which("node") {
-        stage_binary(rootfs, &node_path, "/usr/local/bin/node");
-    }
+    // 3. Stage Node.js for X26-X28 tests.
+    // Download if not on host, so the integration test is fully self-contained.
+    let node_path = which("node").unwrap_or_else(|| {
+        let node_version = "v24.14.1";
+        let tarball_name = format!("node-{node_version}-linux-x64.tar.xz");
+        let cache_dir = PathBuf::from("/tmp/litebox-test-node-cache");
+        let cached_node = cache_dir.join("bin/node");
+        if !cached_node.exists() {
+            eprintln!("Downloading Node.js {node_version}...");
+            fs::create_dir_all(&cache_dir).unwrap();
+            let url = format!("https://nodejs.org/dist/{node_version}/{tarball_name}");
+            let status = Command::new("curl")
+                .args(["-fsSL", "-o", "/tmp/node-download.tar.xz", &url])
+                .status()
+                .expect("curl failed");
+            assert!(status.success(), "Failed to download Node.js from {url}");
+            let status = Command::new("tar")
+                .args([
+                    "xf",
+                    "/tmp/node-download.tar.xz",
+                    "-C",
+                    cache_dir.to_str().unwrap(),
+                    "--strip-components=1",
+                ])
+                .status()
+                .expect("tar failed");
+            assert!(status.success(), "Failed to extract Node.js");
+            fs::remove_file("/tmp/node-download.tar.xz").ok();
+            eprintln!("Node.js cached at {}", cache_dir.display());
+        }
+        cached_node
+    });
+    stage_binary(rootfs, &node_path, "/usr/local/bin/node");
 
     // 3. Stage dynamic linker at the standard path.
     let ld_path = PathBuf::from("/lib64/ld-linux-x86-64.so.2");
@@ -269,7 +298,7 @@ fn process_tree_tests() {
     // - Accidental xfail additions (count goes up without updating here)
     // - Fixed xfails that weren't removed (count goes down)
     // Update this constant when intentionally adding/removing xfails.
-    const EXPECTED_XFAIL_COUNT: usize = 1; // U6.sibling
+    const EXPECTED_XFAIL_COUNT: usize = 4; // U6.sibling, X27-X29 (pipe contamination)
     let xfail_count = results
         .iter()
         .filter(|r| r["result"].as_str() == Some("xfail"))

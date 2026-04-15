@@ -272,6 +272,10 @@ async fn run_tests(self_exe: &str) -> Vec<TestResult> {
     eprintln!("[coord] === VS Code Reproduction Tests ===");
     vscode::vscode_repro_tests(&mut runner).await;
 
+    // === Node.js Exec Tests (run LAST — may contaminate agent pipes) ===
+    eprintln!("[coord] === Node.js Exec Tests ===");
+    fork::node_exec_tests(&mut runner).await;
+
     // Shutdown all children.
     for (id, mut child) in runner.children.drain() {
         let _ = send_cmd(&mut child, &Command::Exit).await;
