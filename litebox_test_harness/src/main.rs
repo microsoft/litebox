@@ -161,6 +161,33 @@ fn main() {
                 }
             });
         }
+        "trigger-delayed-fork" => {
+            // Triggers a delayed-fork by doing a non-pre-exec syscall (mmap
+            // via Vec allocation), then fork+execs self with echo-test.
+            // This creates the nested delayed-fork pattern:
+            //   parent fork → child triggers delayed fork → child fork+execs echo-test
+            //
+            // Usage: trigger-delayed-fork <self_exe_path>
+            // The child's echo-test output should appear on stdout.
+            let child_exe = args.get(2).expect("trigger-delayed-fork requires <self_exe_path>");
+
+            // Force a non-pre-exec syscall to trigger delayed-fork migration.
+            // A large allocation forces mmap which is not in the pre-exec allowlist.
+            let _trigger: Vec<u8> = vec![0u8; 64 * 1024];
+            // Also read from the allocation to ensure it's not optimized away.
+            assert_eq!(_trigger[0], 0);
+
+            // Now fork+exec echo-test from within the delayed-fork child.
+            let output = std::process::Command::new(child_exe)
+                .arg("echo-test")
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .output()
+                .expect("nested fork+exec failed");
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            print!("{stdout}");
+        }
         other => {
             eprintln!("unknown command: {other}");
             std::process::exit(1);

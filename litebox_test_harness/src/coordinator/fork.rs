@@ -308,4 +308,27 @@ pub(super) async fn node_exec_tests(r: &mut TestRunner) {
     ))).await;
     let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout.contains("exec_ok"));
     r.record("X33.script_file_exec_node", "A", pass, &format!("{resp:?}"));
+
+    // X34: Nested delayed-fork — no Node.js
+    // Fork+exec self with trigger-delayed-fork subcommand, which:
+    // 1. Triggers delayed-fork migration (via mmap/Vec allocation)
+    // 2. From within the migrated worker, fork+execs echo-test
+    // This isolates the "delayed-fork within delayed-fork" pattern
+    // without Node.js — tests pure platform behavior.
+    let resp = r.send("A", exec(vec![
+        self_exe.clone(),
+        "trigger-delayed-fork".into(),
+        self_exe.clone(),
+    ])).await;
+    let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout.contains("ECHO_TEST_OK"));
+    r.record("X34.nested_delayed_fork", "A", pass, &format!("{resp:?}"));
+
+    // X34b: Same from depth 2
+    let resp = r.send("AA", exec(vec![
+        self_exe.clone(),
+        "trigger-delayed-fork".into(),
+        self_exe,
+    ])).await;
+    let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout.contains("ECHO_TEST_OK"));
+    r.record("X34b.nested_delayed_fork_deep", "AA", pass, &format!("{resp:?}"));
 }
