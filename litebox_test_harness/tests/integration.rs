@@ -146,7 +146,32 @@ fn build_rootfs(test_binary: &Path) -> tempfile::TempDir {
     });
     stage_binary(rootfs, &node_path, "/usr/local/bin/node");
 
-    // 3. Stage dynamic linker at the standard path.
+    // 4. Build a non-PIE test binary for X40-X42.
+    // This is a tiny C program that writes "NONPIE_OK\n" to stdout.
+    let nonpie_src = rootfs.join("nonpie_echo.c");
+    fs::write(
+        &nonpie_src,
+        "#include <unistd.h>\nint main(){write(1,\"NONPIE_OK\\n\",10);return 0;}\n",
+    )
+    .unwrap();
+    let nonpie_bin = rootfs.join("nonpie-echo");
+    let status = Command::new("gcc")
+        .args([
+            "-no-pie",
+            "-o",
+            nonpie_bin.to_str().unwrap(),
+            nonpie_src.to_str().unwrap(),
+        ])
+        .status()
+        .expect("gcc failed — install build-essential for non-PIE test binary");
+    assert!(status.success(), "gcc -no-pie failed");
+    fs::remove_file(&nonpie_src).ok();
+    // Stage its dependencies (libc).
+    for dep in ldd_deps(&nonpie_bin) {
+        stage_file(rootfs, &dep);
+    }
+
+    // 5. Stage dynamic linker at the standard path.
     let ld_path = PathBuf::from("/lib64/ld-linux-x86-64.so.2");
     if ld_path.exists() {
         stage_file(rootfs, &ld_path);
@@ -298,7 +323,7 @@ fn process_tree_tests() {
     // - Accidental xfail additions (count goes up without updating here)
     // - Fixed xfails that weren't removed (count goes down)
     // Update this constant when intentionally adding/removing xfails.
-    const EXPECTED_XFAIL_COUNT: usize = 3; // U6.sibling, X28b/X28c (script-file node stdout lost)
+    const EXPECTED_XFAIL_COUNT: usize = 5; // U6, X28b/c, X41/X42 (non-PIE pipe bridging)
     let xfail_count = results
         .iter()
         .filter(|r| r["result"].as_str() == Some("xfail"))

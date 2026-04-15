@@ -398,4 +398,55 @@ pub(super) async fn node_exec_tests(r: &mut TestRunner) {
     ))).await;
     let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout.contains("ECHO_TEST_OK"));
     r.record("X39.script_fork_thread_delayed", "A", pass, &format!("{resp:?}"));
+
+    // ── Non-PIE exec reproduction tests ──
+    // The root cause of X28b is that non-PIE binaries (which load at
+    // 0x400000) trigger exec_on_remote_host, and the pipe replacement
+    // puts a read-end fd on the parent's stdout. These tests use a tiny
+    // non-PIE binary (/nonpie-echo) to reproduce without Node.js.
+
+    // X40: Direct exec of non-PIE binary from worker
+    let resp = r.send("A", exec(vec!["/nonpie-echo".into()])).await;
+    let not_found = matches!(&resp, Response::ExecResult { exit_code: 127, .. })
+        || matches!(&resp, Response::Error { .. });
+    if not_found {
+        r.record("X40.nonpie_direct", "A", true, "skipped (nonpie-echo not in rootfs)");
+    } else {
+        let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout.contains("NONPIE_OK"));
+        r.record("X40.nonpie_direct", "A", pass, &format!("{resp:?}"));
+    }
+
+    // X41: Script file that fork+execs non-PIE binary
+    // Minimal reproduction of X28b without Node.js.
+    // KNOWN ISSUE: exec_on_remote_host pipe replacement puts read-end
+    // on parent's stdout — data written by non-PIE child is lost.
+    let resp = r.send("A", exec(bash(
+        "if [ -x /nonpie-echo ]; then \
+         echo '#!/usr/bin/bash' > /tmp/x41.sh && \
+         echo '/nonpie-echo' >> /tmp/x41.sh && \
+         chmod +x /tmp/x41.sh && \
+         /tmp/x41.sh; \
+         EXIT=$?; rm -f /tmp/x41.sh; exit $EXIT; \
+         else echo SKIP; fi"
+    ))).await;
+    let skipped = matches!(&resp, Response::ExecResult { stdout, .. } if stdout.contains("SKIP"));
+    if skipped {
+        r.record("X41.nonpie_script", "A", true, "skipped (nonpie-echo not in rootfs)");
+    } else {
+        let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout.contains("NONPIE_OK"));
+        r.record_xfail("X41.nonpie_script", "A", pass, "non-PIE exec_on_remote_host stdout pipe bridging", &format!("{resp:?}"));
+    }
+
+    // X42: bash -c directly execs non-PIE binary (no script file)
+    // Even simpler reproduction — no script file needed.
+    let resp = r.send("A", exec(bash(
+        "if [ -x /nonpie-echo ]; then /nonpie-echo; else echo SKIP; fi"
+    ))).await;
+    let skipped = matches!(&resp, Response::ExecResult { stdout, .. } if stdout.contains("SKIP"));
+    if skipped {
+        r.record("X42.nonpie_inline", "A", true, "skipped (nonpie-echo not in rootfs)");
+    } else {
+        let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout.contains("NONPIE_OK"));
+        r.record_xfail("X42.nonpie_inline", "A", pass, "non-PIE exec_on_remote_host stdout pipe bridging", &format!("{resp:?}"));
+    }
 }
