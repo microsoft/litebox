@@ -16,29 +16,29 @@ pub(super) async fn vscode_repro_tests(r: &mut TestRunner) {
     // Tests whether AF_UNIX bind/listen/connect/accept/send/recv works.
     let resp = r.send("A", Command::UnixSocketTest { path: "/tmp/test-t1.sock".into() }).await;
     let pass = matches!(&resp, Response::Ok { data: Some(d) } if d.contains("unix_socket_ok"));
-    r.record("T1.unix_socket", "A", pass, &format!("{resp:?}"));
+    r.record("V1.unix_socket", "A", pass, &format!("{resp:?}"));
 
     // T1b: Unix socket from deeper worker (AA)
     let resp = r.send("AA", Command::UnixSocketTest { path: "/tmp/test-t1b.sock".into() }).await;
     let pass = matches!(&resp, Response::Ok { data: Some(d) } if d.contains("unix_socket_ok"));
-    r.record("T1b.unix_socket_deep", "AA", pass, &format!("{resp:?}"));
+    r.record("V1b.unix_socket_deep", "AA", pass, &format!("{resp:?}"));
 
     // T2: Port reuse after unlisten
     // Reproduces Issue 2: empty listeningOn when port 9100 is still held.
     // Worker A listens on 9100, unlistens, then worker B tries to listen.
     let resp = r.send("A", Command::NetListen { port: 9100 }).await;
     let listen_ok = matches!(&resp, Response::Listening { port: 9100 });
-    r.record("T2.listen_A", "A", listen_ok, &format!("{resp:?}"));
+    r.record("V2.listen_A", "A", listen_ok, &format!("{resp:?}"));
 
     let resp = r.send("A", Command::NetUnlisten { port: 9100 }).await;
-    r.record("T2.unlisten_A", "A", matches!(&resp, Response::Ok { .. }), &format!("{resp:?}"));
+    r.record("V2.unlisten_A", "A", matches!(&resp, Response::Ok { .. }), &format!("{resp:?}"));
 
     // Small delay for port cleanup.
     tokio::time::sleep(Duration::from_millis(500)).await;
 
     let resp = r.send("B", Command::NetListen { port: 9100 }).await;
     let pass = matches!(&resp, Response::Listening { port: 9100 });
-    r.record("T2.reuse_B", "B", pass, &format!("{resp:?}"));
+    r.record("V2.reuse_B", "B", pass, &format!("{resp:?}"));
 
     // Clean up.
     if pass {
@@ -50,12 +50,12 @@ pub(super) async fn vscode_repro_tests(r: &mut TestRunner) {
     let resp = r.send("A", exec(bash("echo tmp_write_test > /tmp/t3-test.sh && cat /tmp/t3-test.sh && rm /tmp/t3-test.sh"))).await;
     let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout.contains("tmp_write_test"));
     let timeout = matches!(&resp, Response::ExecTimeout { .. });
-    r.record("T3.tmp_write", "A", pass, &format!("timeout={timeout} {resp:?}"));
+    r.record("V3.tmp_write", "A", pass, &format!("timeout={timeout} {resp:?}"));
 
     // T3b: /tmp write from deeper worker
     let resp = r.send("AA", exec(bash("echo deep_tmp > /tmp/t3b-test.sh && cat /tmp/t3b-test.sh && rm /tmp/t3b-test.sh"))).await;
     let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout.contains("deep_tmp"));
-    r.record("T3b.tmp_write_deep", "AA", pass, &format!("{resp:?}"));
+    r.record("V3b.tmp_write_deep", "AA", pass, &format!("{resp:?}"));
 
     // T4: Node.js code-server startup
     // Reproduces Issue 1: code-server process dies after ~75s.
@@ -71,10 +71,10 @@ pub(super) async fn vscode_repro_tests(r: &mut TestRunner) {
     let started = matches!(&resp, Response::ExecResult { stdout, .. } if !stdout.contains("SKIP_NOT_FOUND"))
         || matches!(&resp, Response::ExecTimeout { .. });
     if skipped {
-        r.record("T4.code_server", "A", true, "skipped (binary not found)");
+        r.record("V4.code_server", "A", true, "skipped (binary not found)");
     } else {
         // Any output (even crash) is informative — record it.
-        r.record("T4.code_server", "A", started, &format!("{resp:?}"));
+        r.record("V4.code_server","A", started, &format!("{resp:?}"));
     }
     // Clean up socket.
     let _ = r.send("A", exec(bash("rm -f /tmp/t4-test.sock"))).await;
@@ -97,7 +97,7 @@ pub(super) async fn vscode_repro_tests(r: &mut TestRunner) {
     ), 20)).await;
     let pass = matches!(&resp, Response::ExecResult { stdout, .. } if stdout.contains("t5_result=UNIX_ECHO_TEST"));
     let timeout = matches!(&resp, Response::ExecTimeout { .. });
-    r.record_xfail("T5.unix_relay", "A", pass, "cross-process Unix socket data relay", &format!("timeout={timeout} {resp:?}"));
+    r.record_xfail("V5.unix_relay", "A", pass, "cross-process Unix socket data relay", &format!("timeout={timeout} {resp:?}"));
 
     // T6: code-server stderr capture — does it create the Unix socket?
     // Run code-server, wait briefly, check if /tmp/t6-test.sock exists.
@@ -113,10 +113,10 @@ pub(super) async fn vscode_repro_tests(r: &mut TestRunner) {
     ), 20)).await;
     let skipped = matches!(&resp, Response::ExecResult { stdout, .. } if stdout.contains("SKIP_NOT_FOUND"));
     if skipped {
-        r.record("T6.code_server_socket", "A", true, "skipped (binary not found)");
+        r.record("V6.code_server_socket", "A", true, "skipped (binary not found)");
     } else {
         let socket_created = matches!(&resp, Response::ExecResult { stdout, .. } if stdout.contains("SOCKET_CREATED"));
-        r.record_xfail("T6.code_server_socket", "A", socket_created, "Node.js I/O error on startup", &format!("{resp:?}"));
+        r.record_xfail("V6.code_server_socket","A", socket_created, "Node.js I/O error on startup", &format!("{resp:?}"));
     }
     let _ = r.send("A", exec(bash("rm -f /tmp/t6-test.sock"))).await;
 
@@ -135,10 +135,10 @@ pub(super) async fn vscode_repro_tests(r: &mut TestRunner) {
     ), 20)).await;
     let skipped = matches!(&resp, Response::ExecResult { stdout, .. } if stdout.contains("SKIP_NOT_FOUND"));
     if skipped {
-        r.record("T7.auto_shutdown", "A", true, "skipped (binary not found)");
+        r.record("V7.auto_shutdown", "A", true, "skipped (binary not found)");
     } else {
         let still_running = matches!(&resp, Response::ExecResult { stdout, .. } if stdout.contains("STILL_RUNNING"));
-        r.record_xfail("T7.auto_shutdown", "A", still_running, "Node.js I/O error prevents code-server start", &format!("{resp:?}"));
+        r.record_xfail("V7.auto_shutdown","A", still_running, "Node.js I/O error prevents code-server start", &format!("{resp:?}"));
     }
     let _ = r.send("A", exec(bash("rm -f /tmp/t7-test.sock"))).await;
 }
