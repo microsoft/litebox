@@ -295,6 +295,11 @@ async fn agent_loop(self_exe: &str) {
                 respond(&Response::Ok { data: None }).await;
             }
 
+            Command::UnixSocketTest { path } => {
+                let result = unix_socket_test(&path).await;
+                respond(&result).await;
+            }
+
             Command::Exit => {
                 // Abort all echo servers.
                 for (_, task) in listeners.drain() {
@@ -368,6 +373,73 @@ async fn send_to_child(child: &mut ChildHandle, cmd: &Command) -> Response {
         },
         Err(_) => Response::Error {
             error: "child response timeout".to_string(),
+        },
+    }
+}
+
+/// Test Unix domain socket lifecycle: create, bind, listen, accept+connect, send/recv.
+async fn unix_socket_test(path: &str) -> Response {
+    use tokio::net::{UnixListener, UnixStream};
+
+    // Clean up any leftover socket file.
+    let _ = tokio::fs::remove_file(path).await;
+
+    // Step 1: Bind and listen.
+    let listener = match UnixListener::bind(path) {
+        Ok(l) => l,
+        Err(e) => {
+            return Response::Error {
+                error: format!("unix bind({path}): {e}"),
+            };
+        }
+    };
+
+    // Step 2: Connect from a client task.
+    let path_owned = path.to_string();
+    let client = tokio::spawn(async move {
+        let mut stream = UnixStream::connect(&path_owned).await?;
+        tokio::io::AsyncWriteExt::write_all(&mut stream, b"UNIX_HELLO").await?;
+        tokio::io::AsyncWriteExt::flush(&mut stream).await?;
+        let mut buf = [0u8; 64];
+        let n = tokio::io::AsyncReadExt::read(&mut stream, &mut buf).await?;
+        Ok::<String, std::io::Error>(String::from_utf8_lossy(&buf[..n]).to_string())
+    });
+
+    // Step 3: Accept and echo.
+    let accept_result = tokio::time::timeout(Duration::from_secs(5), async {
+        let (mut stream, _) = listener.accept().await?;
+        let mut buf = [0u8; 64];
+        let n = tokio::io::AsyncReadExt::read(&mut stream, &mut buf).await?;
+        tokio::io::AsyncWriteExt::write_all(&mut stream, &buf[..n]).await?;
+        Ok::<usize, std::io::Error>(n)
+    })
+    .await;
+
+    // Clean up.
+    drop(listener);
+    let _ = tokio::fs::remove_file(path).await;
+
+    // Check results.
+    match accept_result {
+        Err(_) => Response::Error {
+            error: "unix accept timeout".to_string(),
+        },
+        Ok(Err(e)) => Response::Error {
+            error: format!("unix accept/echo: {e}"),
+        },
+        Ok(Ok(_)) => match client.await {
+            Ok(Ok(echo)) if echo == "UNIX_HELLO" => Response::Ok {
+                data: Some("unix_socket_ok".to_string()),
+            },
+            Ok(Ok(echo)) => Response::Error {
+                error: format!("unix echo mismatch: got {echo:?}"),
+            },
+            Ok(Err(e)) => Response::Error {
+                error: format!("unix client: {e}"),
+            },
+            Err(e) => Response::Error {
+                error: format!("unix client task: {e}"),
+            },
         },
     }
 }

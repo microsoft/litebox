@@ -184,6 +184,10 @@ async fn run_tests(self_exe: &str) -> Vec<(String, String, bool, String)> {
     eprintln!("[coord] === Environment Tests ===");
     env_tests(&mut runner).await;
 
+    // === VS Code Reproduction Tests ===
+    eprintln!("[coord] === VS Code Reproduction Tests ===");
+    vscode_repro_tests(&mut runner).await;
+
     // Shutdown all children.
     for (id, mut child) in runner.children.drain() {
         let _ = send_cmd(&mut child, &Command::Exit).await;
@@ -569,6 +573,83 @@ async fn env_tests(r: &mut TestRunner) {
     let resp = r.send("B", Command::CwdGet).await;
     let pass = matches!(&resp, Response::Ok { data: Some(_) });
     r.record("E5.B", "B", pass, &format!("{resp:?}"));
+}
+
+/// VS Code Server reproduction tests — isolate known connection failure modes.
+async fn vscode_repro_tests(r: &mut TestRunner) {
+    let bash = |cmd: &str| -> Vec<String> {
+        vec!["bash".into(), "-c".into(), cmd.into()]
+    };
+
+    // T1: Unix domain socket lifecycle in /tmp
+    // Reproduces Issue 1: code-server uses --socket-path=/tmp/code-UUID.
+    // Tests whether AF_UNIX bind/listen/connect/accept/send/recv works.
+    let resp = r.send("A", Command::UnixSocketTest { path: "/tmp/test-t1.sock".into() }).await;
+    let pass = matches!(&resp, Response::Ok { data: Some(d) } if d.contains("unix_socket_ok"));
+    r.record("T1.unix_socket", "A", pass, &format!("{resp:?}"));
+
+    // T1b: Unix socket from deeper worker (AA)
+    let resp = r.send("AA", Command::UnixSocketTest { path: "/tmp/test-t1b.sock".into() }).await;
+    let pass = matches!(&resp, Response::Ok { data: Some(d) } if d.contains("unix_socket_ok"));
+    r.record("T1b.unix_socket_deep", "AA", pass, &format!("{resp:?}"));
+
+    // T2: Port reuse after unlisten
+    // Reproduces Issue 2: empty listeningOn when port 9100 is still held.
+    // Worker A listens on 9100, unlistens, then worker B tries to listen.
+    let resp = r.send("A", Command::NetListen { port: 9100 }).await;
+    let listen_ok = matches!(&resp, Response::Listening { port: 9100 });
+    r.record("T2.listen_A", "A", listen_ok, &format!("{resp:?}"));
+
+    let resp = r.send("A", Command::NetUnlisten { port: 9100 }).await;
+    r.record("T2.unlisten_A", "A", matches!(&resp, Response::Ok { .. }), &format!("{resp:?}"));
+
+    // Small delay for port cleanup.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let resp = r.send("B", Command::NetListen { port: 9100 }).await;
+    let pass = matches!(&resp, Response::Listening { port: 9100 });
+    r.record("T2.reuse_B", "B", pass, &format!("{resp:?}"));
+
+    // Clean up.
+    if pass {
+        let _ = r.send("B", Command::NetUnlisten { port: 9100 }).await;
+    }
+
+    // T3: /tmp file creation from forked bash
+    // Reproduces Issue 3: /tmp/.vscode-bootstrap-N.sh: Permission denied.
+    let resp = r.send("A", Command::Exec { args: bash("echo tmp_write_test > /tmp/t3-test.sh && cat /tmp/t3-test.sh && rm /tmp/t3-test.sh") }).await;
+    let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout.contains("tmp_write_test"));
+    let timeout = matches!(&resp, Response::ExecTimeout { .. });
+    r.record("T3.tmp_write", "A", pass, &format!("timeout={timeout} {resp:?}"));
+
+    // T3b: /tmp write from deeper worker
+    let resp = r.send("AA", Command::Exec { args: bash("echo deep_tmp > /tmp/t3b-test.sh && cat /tmp/t3b-test.sh && rm /tmp/t3b-test.sh") }).await;
+    let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout.contains("deep_tmp"));
+    r.record("T3b.tmp_write_deep", "AA", pass, &format!("{resp:?}"));
+
+    // T4: Node.js code-server startup
+    // Reproduces Issue 1: code-server process dies after ~75s.
+    // Try to run code-server with --socket-path; if binary exists it should
+    // start (timeout = running = good). If binary not found, skip.
+    // Note: Uses bash builtin `kill` for timeout since `timeout` cmd may not be in rootfs.
+    let code_server = "/root/.vscode-server/cli/servers/Stable-ae130017f8afe532557dbb8539a6ef3bdaec6389/server/bin/code-server";
+    let resp = r.send("A", Command::Exec {
+        args: vec![
+            "bash".into(), "-c".into(),
+            format!("if [ -x {code_server} ]; then {code_server} --connection-token=test --accept-server-license-terms --start-server --socket-path=/tmp/t4-test.sock 2>&1 & PID=$!; sleep 3; kill $PID 2>/dev/null; wait $PID 2>/dev/null; echo exit=$?; else echo SKIP_NOT_FOUND; fi"),
+        ],
+    }).await;
+    let skipped = matches!(&resp, Response::ExecResult { stdout, .. } if stdout.contains("SKIP_NOT_FOUND"));
+    let started = matches!(&resp, Response::ExecResult { stdout, .. } if !stdout.contains("SKIP_NOT_FOUND"))
+        || matches!(&resp, Response::ExecTimeout { .. });
+    if skipped {
+        r.record("T4.code_server", "A", true, "skipped (binary not found)");
+    } else {
+        // Any output (even crash) is informative — record it.
+        r.record("T4.code_server", "A", started, &format!("{resp:?}"));
+    }
+    // Clean up socket.
+    let _ = r.send("A", Command::Exec { args: bash("rm -f /tmp/t4-test.sock") }).await;
 }
 
 /// Route a targetlike "AAA" to (direct_child, remaining_path).

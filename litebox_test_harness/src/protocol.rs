@@ -54,6 +54,10 @@ pub enum Command {
     #[serde(rename = "cwd_get")]
     CwdGet,
 
+    /// Test Unix domain socket lifecycle (create, bind, listen, connect, send, receive).
+    #[serde(rename = "unix_socket_test")]
+    UnixSocketTest { path: String },
+
     /// Proceed (used after coordination points).
     #[serde(rename = "go")]
     Go,
