@@ -149,6 +149,33 @@ fn main() {
             let stdout = String::from_utf8_lossy(&output.stdout);
             print!("{stdout}");
         }
+        "trigger-delayed-fork-thread" => {
+            // Usage: trigger-delayed-fork-thread <cmd> [args...]
+            // Like trigger-delayed-fork but uses thread creation (clone3)
+            // instead of mmap to trigger delayed-fork. This is how Node.js
+            // triggers it (V8 creates worker threads on startup).
+            if args.len() < 3 {
+                eprintln!("usage: trigger-delayed-fork-thread <cmd> [args...]");
+                std::process::exit(1);
+            }
+
+            // Trigger delayed-fork via thread creation (clone3).
+            let handle = std::thread::spawn(|| {
+                // Thread does nothing — just its creation triggers delayed-fork.
+            });
+            handle.join().expect("thread join failed");
+
+            // Fork+exec the given command from within the delayed-fork child.
+            let output = std::process::Command::new(&args[2])
+                .args(&args[3..])
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .output()
+                .expect("nested fork+exec failed");
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            print!("{stdout}");
+        }
         other => {
             eprintln!("unknown command: {other}");
             std::process::exit(1);

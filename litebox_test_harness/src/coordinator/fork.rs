@@ -372,4 +372,30 @@ pub(super) async fn node_exec_tests(r: &mut TestRunner) {
     ))).await;
     let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout.contains("ECHO_TEST_OK"));
     r.record("X37.script_fork_delayed_fork", "A", pass, &format!("{resp:?}"));
+
+    // X38: trigger-delayed-fork-thread → echo-test (direct)
+    // Same as X34 but triggers delayed-fork via clone3 (thread creation)
+    // instead of mmap. Tests whether thread-based delayed-fork works.
+    let resp = r.send("A", exec(vec![
+        self_exe.clone(),
+        "trigger-delayed-fork-thread".into(),
+        self_exe.clone(),
+        "echo-test".into(),
+    ])).await;
+    let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout.contains("ECHO_TEST_OK"));
+    r.record("X38.thread_delayed_fork", "A", pass, &format!("{resp:?}"));
+
+    // X39: Script file → fork trigger-delayed-fork-thread → echo-test
+    // Same as X37 but with thread-based delayed-fork trigger.
+    // If this fails while X37 passes → thread creation in a script-forked
+    // child is the root cause of X28b.
+    let resp = r.send("A", exec(bash(
+        &format!("echo '#!/usr/bin/bash' > /tmp/x39.sh && \
+         echo '{self_exe} trigger-delayed-fork-thread {self_exe} echo-test' >> /tmp/x39.sh && \
+         chmod +x /tmp/x39.sh && \
+         /tmp/x39.sh; \
+         EXIT=$?; rm -f /tmp/x39.sh; exit $EXIT")
+    ))).await;
+    let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout.contains("ECHO_TEST_OK"));
+    r.record("X39.script_fork_thread_delayed", "A", pass, &format!("{resp:?}"));
 }
