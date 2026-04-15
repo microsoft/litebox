@@ -449,4 +449,19 @@ pub(super) async fn node_exec_tests(r: &mut TestRunner) {
         let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout.contains("NONPIE_OK"));
         r.record("X42.nonpie_inline", "A", pass, &format!("{resp:?}"));
     }
+
+    // X43: Node.js os.networkInterfaces()
+    // VS Code code-server calls this on startup. Requires getifaddrs syscall.
+    let resp = r.send("A", exec(vec![
+        "/usr/local/bin/node".into(),
+        "-e".into(),
+        "try { console.log(JSON.stringify(Object.keys(require('os').networkInterfaces()))); } catch(e) { console.log('ERROR:' + e.message); }".into(),
+    ])).await;
+    let not_found = matches!(&resp, Response::ExecResult { exit_code: 127, .. });
+    if not_found {
+        r.record("X43.network_interfaces", "A", true, "skipped (node not in rootfs)");
+    } else {
+        let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if !stdout.contains("ERROR:"));
+        r.record("X43.network_interfaces", "A", pass, &format!("{resp:?}"));
+    }
 }

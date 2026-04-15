@@ -401,7 +401,7 @@ impl Drop for BrokerProcess {
 const DEFAULT_POLICY: &str = r#"{
     "filesystem": {
         "allow_read": [],
-        "allow_write": ["/tmp/**", "/shared/**", "**/workspace/**", "**/workspaces/**", "**/.vscode-server/**"],
+        "allow_write": ["/tmp/**", "/shared/**", "/root/.cache/**", "**/workspace/**", "**/workspaces/**", "**/.vscode-server/**"],
         "deny": ["**/.ssh/**", "**/shadow", "**/id_rsa*", "**/id_ed25519*"]
     },
     "network": {
