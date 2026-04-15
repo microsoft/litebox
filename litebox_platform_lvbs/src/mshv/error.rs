@@ -106,7 +106,7 @@ pub enum VsmError {
     OperationNotSupported(&'static str),
 
     // VTL0 Memory Copy Errors
-    #[error("failed to copy data to VTL0")]
+    #[error("failed to copy data from/to VTL0")]
     Vtl0CopyFailed,
 
     // Hypercall Errors
@@ -152,6 +152,9 @@ pub enum VsmError {
 
     #[error("symbol name contains invalid UTF-8")]
     SymbolNameInvalidUtf8,
+
+    #[error("root key is invalid")]
+    PlatformRootKeyInvalid,
 }
 
 impl From<VerificationError> for VsmError {
@@ -217,7 +220,8 @@ impl From<VsmError> for Errno {
             | VsmError::SymbolNameInvalidUtf8
             | VsmError::SymbolNameNoTerminator
             | VsmError::CertificateDerLengthInvalid { .. }
-            | VsmError::CertificateParseFailed => Errno::EINVAL,
+            | VsmError::CertificateParseFailed
+            | VsmError::PlatformRootKeyInvalid => Errno::EINVAL,
 
             // Signature verification failures delegate to VerificationError's Errno mapping
             VsmError::SignatureVerificationFailed(e) => Errno::from(e),

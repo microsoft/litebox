@@ -128,6 +128,9 @@ pub const VSM_VTL_CALL_FUNC_ID_KEXEC_VALIDATE: u32 = 0x1_ffea;
 pub const VSM_VTL_CALL_FUNC_ID_PATCH_TEXT: u32 = 0x1_ffeb;
 pub const VSM_VTL_CALL_FUNC_ID_ALLOCATE_RINGBUFFER_MEMORY: u32 = 0x1_ffec;
 
+// This VSM function ID for setting the platform root key is subject to change
+pub const VSM_VTL_CALL_FUNC_ID_SET_PLATFORM_ROOT_KEY: u32 = 0x1_ffed;
+
 // This VSM function ID for OP-TEE messages is subject to change
 pub const VSM_VTL_CALL_FUNC_ID_OPTEE_MESSAGE: u32 = 0x1_fff0;
 
@@ -150,6 +153,7 @@ pub enum VsmFunction {
     PatchText = VSM_VTL_CALL_FUNC_ID_PATCH_TEXT,
     OpteeMessage = VSM_VTL_CALL_FUNC_ID_OPTEE_MESSAGE,
     AllocateRingbufferMemory = VSM_VTL_CALL_FUNC_ID_ALLOCATE_RINGBUFFER_MEMORY,
+    SetPlatformRootKey = VSM_VTL_CALL_FUNC_ID_SET_PLATFORM_ROOT_KEY,
 }
 
 pub const MSR_EFER: u32 = 0xc000_0080;
