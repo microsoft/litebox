@@ -2807,6 +2807,87 @@ impl<FS: ShimFS> Task<FS> {
                         repl.direction,
                     );
 
+                    // Check if the parent's existing fd is a virtual pipe
+                    // WRITE-end (sender). If so, relay the remote worker's
+                    // output directly into it instead of replacing it. This
+                    // preserves the pipe chain to upstream consumers (e.g.,
+                    // the agent's Exec handler) for non-init parents like
+                    // bash inside a worker.
+                    //
+                    // If the existing fd is a read-end (receiver), use the
+                    // normal replacement path — this is the case for direct
+                    // Exec from the agent where the parent created the pipe
+                    // to capture the child's stdout.
+                    let is_existing_sender = files
+                        .raw_descriptor_store
+                        .read()
+                        .fd_from_raw_integer::<litebox::pipes::Pipes<crate::Platform>>(
+                            repl.guest_fd,
+                        )
+                        .ok()
+                        .and_then(|fd| {
+                            self.global
+                                .pipes
+                                .half_pipe_type(&fd)
+                                .ok()
+                                .map(|t| (Arc::clone(&fd), t))
+                        });
+
+                    if let Some((ref existing_fd, litebox::pipes::HalfPipeType::SenderHalf)) =
+                        is_existing_sender
+                    {
+                        if repl.direction == HostPipeDirection::Read {
+                            // The parent's fd is a pipe write-end (e.g., stdout).
+                            // Instead of replacing it, relay the remote worker's
+                            // output directly into it. This preserves the pipe
+                            // chain: remote worker → host pipe → relay → existing
+                            // virtual pipe → agent.
+                            #[cfg(feature = "trace_syscalls")]
+                            litebox::log_println!(
+                                self.global.platform,
+                                "[FD-REPLACE] pid={}: guest_fd={} is an existing pipe — relaying into it instead of replacing",
+                                self.pid,
+                                repl.guest_fd,
+                            );
+
+                            let platform = self.global.platform;
+                            let pipes = self.global.pipes.clone();
+                            let host_fd = repl.host_fd;
+                            let target_fd = Arc::clone(existing_fd);
+
+                            self.global.platform.spawn_background_task(move || {
+                                let wait_state =
+                                    litebox::event::wait::WaitState::new(platform);
+                                let cx = wait_state.context();
+                                let mut buf = alloc::vec![0u8; 65536];
+                                loop {
+                                    match platform.read_host_fd(host_fd, &mut buf) {
+                                        Ok(0) | Err(_) => break,
+                                        Ok(n) => {
+                                            let mut offset = 0;
+                                            while offset < n {
+                                                if let Ok(w) =
+                                                    pipes.write(&cx, &target_fd, &buf[offset..n])
+                                                {
+                                                    offset += w;
+                                                } else {
+                                                    platform.close_host_fd(host_fd);
+                                                    return;
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                platform.close_host_fd(host_fd);
+                            });
+                            continue; // Skip the normal replacement path.
+                        }
+                    }
+
+                    // Default path: create a virtual pipe pair and replace the fd.
+                    // This is used for init (whose fds are host-backed, not virtual
+                    // pipes) and for Write-direction replacements.
+
                     // Create a virtual pipe pair.  The parent keeps one
                     // end in its fd table; the relay thread owns the other.
                     let (sender, receiver) = self.global.pipes.create_pipe(

@@ -241,7 +241,7 @@ pub(super) async fn node_exec_tests(r: &mut TestRunner) {
          EXIT=$?; rm -f /tmp/x28b.sh; exit $EXIT"
     ))).await;
     let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout.contains("script_node_ok"));
-    r.record_xfail("X28b.script_file_node", "A", pass, "node stdout lost through script-file fork+exec depth", &format!("{resp:?}"));
+    r.record("X28b.script_file_node", "A", pass, &format!("{resp:?}"));
 
     // X28c: Script file with env shebang (same issue)
     let resp = r.send("A", exec(bash(
@@ -252,7 +252,7 @@ pub(super) async fn node_exec_tests(r: &mut TestRunner) {
          EXIT=$?; rm -f /tmp/x28c.sh; exit $EXIT"
     ))).await;
     let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout.contains("script_env_ok"));
-    r.record_xfail("X28c.script_file_env", "A", pass, "node stdout lost through script-file fork+exec depth", &format!("{resp:?}"));
+    r.record("X28c.script_file_env", "A", pass, &format!("{resp:?}"));
 
     // X29: Node.js process.stdout.write — tests stdout pipe state
     // after multiple delayed-fork worker spawns from prior node execs.
@@ -434,7 +434,7 @@ pub(super) async fn node_exec_tests(r: &mut TestRunner) {
         r.record("X41.nonpie_script", "A", true, "skipped (nonpie-echo not in rootfs)");
     } else {
         let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout.contains("NONPIE_OK"));
-        r.record_xfail("X41.nonpie_script", "A", pass, "non-PIE exec_on_remote_host stdout pipe bridging", &format!("{resp:?}"));
+        r.record("X41.nonpie_script", "A", pass, &format!("{resp:?}"));
     }
 
     // X42: bash -c directly execs non-PIE binary (no script file)
@@ -447,6 +447,6 @@ pub(super) async fn node_exec_tests(r: &mut TestRunner) {
         r.record("X42.nonpie_inline", "A", true, "skipped (nonpie-echo not in rootfs)");
     } else {
         let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout.contains("NONPIE_OK"));
-        r.record_xfail("X42.nonpie_inline", "A", pass, "non-PIE exec_on_remote_host stdout pipe bridging", &format!("{resp:?}"));
+        r.record("X42.nonpie_inline", "A", pass, &format!("{resp:?}"));
     }
 }
