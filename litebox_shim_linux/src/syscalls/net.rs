@@ -2072,11 +2072,26 @@ impl<FS: ShimFS> Task<FS> {
                     break;
                 }
             }
-            // Clear msg_name and msg_controllen
-            hdr.msg_namelen = 0;
+            // Write kernel source address (nl_pid=0) to msg_name if provided.
+            if hdr.msg_name.as_usize() != 0 && hdr.msg_namelen >= 12 {
+                // sockaddr_nl: family(2) + pad(2) + pid(4) + groups(4) = 12
+                let kernel_addr: [u8; 12] = {
+                    let mut a = [0u8; 12];
+                    a[0..2].copy_from_slice(&(libc::AF_NETLINK as u16).to_ne_bytes());
+                    // nl_pid = 0 (kernel), nl_groups = 0
+                    a
+                };
+                let name_ptr = MutPtr::<u8>::from_usize(hdr.msg_name.as_usize());
+                for (i, &b) in kernel_addr.iter().enumerate() {
+                    name_ptr.write_at_offset(i as isize, b);
+                }
+                hdr.msg_namelen = 12;
+            } else {
+                hdr.msg_namelen = 0;
+            }
             hdr.msg_controllen = 0;
             hdr.msg_flags = ReceiveFlags::empty();
-            msg.write_at_offset(0, hdr);
+            let _ = msg.write_at_offset(0, hdr);
             return Ok(total_written);
         }
 
