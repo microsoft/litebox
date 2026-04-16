@@ -6,7 +6,7 @@
 use core::{
     num::NonZeroUsize,
     sync::atomic::{
-        AtomicBool, AtomicU32, AtomicUsize,
+        AtomicBool, AtomicU32, AtomicU64, AtomicUsize,
         Ordering::{self, Relaxed},
     },
 };
@@ -35,6 +35,11 @@ use crate::{
 pub struct Pipes<Platform: RawSyncPrimitivesProvider + TimeProvider> {
     litebox: LiteBox<Platform>,
 }
+
+/// Monotonic counter for pipe pair IDs. Each `create_pipe()` gets a
+/// unique, never-reused value. This prevents mux_pipe_pair_ids
+/// collisions when Arc addresses are recycled by the allocator.
+static NEXT_PIPE_PAIR_ID: AtomicU64 = AtomicU64::new(1);
 
 impl<Platform: RawSyncPrimitivesProvider + TimeProvider> Clone for Pipes<Platform> {
     fn clone(&self) -> Self {
@@ -305,13 +310,13 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> Pipes<Platform> {
     pub fn pipe_pair_id(&self, fd: &PipeFd<Platform>) -> Result<usize, errors::ClosedError> {
         let dt = self.litebox.descriptor_table();
         match &dt.get_entry(fd).ok_or(errors::ClosedError::ClosedFd)?.entry {
-            PipeEnd::Sender(w) => Ok(Arc::as_ptr(w) as usize),
+            PipeEnd::Sender(w) => Ok(w.pair_id as usize),
             PipeEnd::Receiver(r) => {
-                // Use the write end pointer as the canonical identity.
+                // Use the write end's pair_id as the canonical identity.
                 // If the write end has been dropped, fall back to the read
                 // end pointer (the pipe is broken anyway).
                 match r.peer.upgrade() {
-                    Some(w) => Ok(Arc::as_ptr(&w) as usize),
+                    Some(w) => Ok(w.pair_id as usize),
                     None => Ok(Arc::as_ptr(r) as usize),
                 }
             }
@@ -487,6 +492,10 @@ struct WriteEnd<Platform: RawSyncPrimitivesProvider + TimeProvider, T> {
     /// When this reaches 0, the write end is shut down and the read peer
     /// receives HUP — even if the Arc<WriteEnd> itself hasn't been dropped yet.
     fd_ref_count: AtomicUsize,
+    /// Monotonic pair ID, unique per `create_pipe()` call. Used by
+    /// `pipe_pair_id()` instead of Arc pointer addresses to prevent
+    /// collisions when the allocator recycles freed Arc memory.
+    pair_id: u64,
 }
 
 /// Potential errors when writing or reading from a pipe
@@ -548,6 +557,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider, T> WriteEnd<Platform, T
             status: AtomicU32::new((flags | OFlags::WRONLY).bits()),
             atomic_slice_guarantee_size,
             fd_ref_count: AtomicUsize::new(1),
+            pair_id: NEXT_PIPE_PAIR_ID.fetch_add(1, Ordering::Relaxed),
         }
     }
 
