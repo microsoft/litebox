@@ -4,12 +4,9 @@
 //! Test coordinator. Runs as the init process, drives all test
 //! operations through pipes to child agents.
 
-pub(crate) mod env;
-pub(crate) mod fork;
-pub(crate) mod fs;
-pub(crate) mod net;
-pub(crate) mod symlink;
-pub(crate) mod unix;
+pub(crate) mod fork_matrix;
+pub(crate) mod matrix;
+pub(crate) mod special_cases;
 pub(crate) mod vscode;
 
 use crate::protocol::{Command, Response};
@@ -289,37 +286,21 @@ async fn run_tests(self_exe: &str) -> Vec<TestResult> {
         .await;
     eprintln!("[coord] AA spawn children: {r:?}");
 
-    // === Filesystem Tests ===
-    eprintln!("[coord] === Filesystem Tests ===");
-    fs::fs_tests(&mut runner).await;
+    // === Matrix Tests (capability × topology × dimensions) ===
+    eprintln!("[coord] === Matrix Tests ===");
+    matrix::run_matrix_tests(&mut runner).await;
 
-    // === Network Tests ===
-    eprintln!("[coord] === Network Tests ===");
-    net::net_tests(&mut runner).await;
-
-    // === Fork/Exec Tests ===
-    eprintln!("[coord] === Fork/Exec Tests ===");
-    fork::exec_tests(&mut runner).await;
-
-    // === Environment Tests ===
-    eprintln!("[coord] === Environment Tests ===");
-    env::env_tests(&mut runner).await;
-
-    // === Unix Socket Tests ===
-    eprintln!("[coord] === Unix Socket Tests ===");
-    unix::unix_tests(&mut runner).await;
-
-    // === Symlink Tests ===
-    eprintln!("[coord] === Symlink Tests ===");
-    symlink::symlink_tests(&mut runner).await;
+    // === Fork Matrix Tests (shell patterns, exec binary/method, delayed fork, stress) ===
+    eprintln!("[coord] === Fork Matrix Tests ===");
+    fork_matrix::run_fork_matrix_tests(&mut runner).await;
 
     // === VS Code Reproduction Tests ===
     eprintln!("[coord] === VS Code Reproduction Tests ===");
     vscode::vscode_repro_tests(&mut runner).await;
 
-    // === Node.js Exec Tests (run LAST — may contaminate agent pipes) ===
-    eprintln!("[coord] === Node.js Exec Tests ===");
-    // Canary: test that agent A can still exec before starting node tests.
+    // === Contamination Sequence Tests (run LAST — depend on accumulated state) ===
+    eprintln!("[coord] === Contamination Sequence Tests ===");
+    // Canary: test that agent A can still exec.
     {
         let canary_cmd = crate::protocol::Command::Exec {
             args: vec![runner.self_exe.clone(), "echo-test".into()],
@@ -327,9 +308,9 @@ async fn run_tests(self_exe: &str) -> Vec<TestResult> {
         };
         let resp = runner.send("A", canary_cmd).await;
         let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout == "ECHO_TEST_OK");
-        runner.record("X_canary.pre_node", "A", pass, &format!("{resp:?}"));
+        runner.record("X_canary.pre_sequence", "A", pass, &format!("{resp:?}"));
     }
-    fork::node_exec_tests(&mut runner).await;
+    special_cases::contamination_sequence_tests(&mut runner).await;
 
     // Shutdown all children.
     for (id, mut child) in runner.children.drain() {
