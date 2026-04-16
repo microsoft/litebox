@@ -2458,6 +2458,54 @@ mod layered_stdio {
         assert_eq!(litebox.x.platform.stderr_queue.read().unwrap().len(), 1);
         assert_eq!(litebox.x.platform.stderr_queue.read().unwrap()[0], data);
     }
+
+    /// Regression: unlink files on the lower layer (writable mode) only places
+    /// tombstones. rmdir must honour those tombstones and not forward the
+    /// remove to the lower layer where the files still physically exist.
+    #[test]
+    fn rmdir_after_unlink_lower_layer_writable() {
+        use crate::fs::layered::LayeringSemantics;
+
+        let all_rw = Mode::RWXU | Mode::RWXG | Mode::RWXO;
+        let litebox = LiteBox::new(MockPlatform::new());
+
+        // Pre-populate the lower layer with a directory containing files.
+        let mut lower = in_mem::FileSystem::new(&litebox);
+        lower.with_root_privileges(|fs| {
+            fs.chmod("/", all_rw).expect("chmod /");
+            fs.mkdir("/logs", all_rw).expect("mkdir /logs");
+            let fd = fs
+                .open("/logs/old.log", OFlags::CREAT | OFlags::WRONLY, all_rw)
+                .expect("create old.log");
+            fs.write(&fd, b"stale data", None).expect("write");
+            fs.close(&fd).expect("close");
+        });
+
+        let mut upper = in_mem::FileSystem::new(&litebox);
+        upper.with_root_privileges(|fs| {
+            fs.chmod("/", all_rw).expect("chmod /");
+        });
+
+        let fs = layered::FileSystem::new(
+            &litebox,
+            upper,
+            lower,
+            LayeringSemantics::LowerLayerWritableFiles,
+        );
+
+        // Unlink the file via the layered FS.
+        fs.unlink("/logs/old.log").expect("unlink old.log");
+
+        // The file should be invisible now.
+        assert!(fs.file_status("/logs/old.log").is_err());
+
+        // rmdir should succeed — the directory is logically empty.
+        fs.rmdir("/logs")
+            .expect("rmdir /logs should succeed after unlinking all children");
+
+        // Directory should be gone.
+        assert!(fs.file_status("/logs").is_err());
+    }
 }
 
 mod in_mem_at {

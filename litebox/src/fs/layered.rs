@@ -1613,12 +1613,27 @@ impl<
                 }
             },
         }
-        // We can now place a tombstone over the lower level file, marking it as deleted, without
-        // actually changing the lower level.
-        self.root
-            .write()
-            .entries
-            .insert(path, Arc::new(EntryX::Tombstone));
+        if let LayeringSemantics::LowerLayerReadOnly = self.layering_semantics {
+            // Read-only lower: tombstone hides the file without modifying
+            // the lower layer.
+            self.root
+                .write()
+                .entries
+                .insert(path, Arc::new(EntryX::Tombstone));
+        } else {
+            // Writable lower: actually remove from the lower layer so that
+            // a subsequent rmdir on the parent directory succeeds.
+            if let Err(e) = self.lower.unlink(path.as_str()) {
+                match e {
+                    UnlinkError::PathError(
+                        PathError::NoSuchFileOrDirectory | PathError::MissingComponent,
+                    ) => {
+                        // File only existed on upper — already removed above.
+                    }
+                    _ => return Err(e),
+                }
+            }
+        }
         Ok(())
     }
 
