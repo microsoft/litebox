@@ -290,6 +290,8 @@ mod netlink_tests {
             "bind" => test_bind(),
             "getlink" => test_getlink(),
             "getaddr" => test_getaddr(),
+            "sendmsg" => test_sendmsg_recvmsg(),
+            "double" => test_double_request(),
             "full" => test_full(),
             other => { eprintln!("unknown: {other}"); 1 }
         }
@@ -377,18 +379,155 @@ mod netlink_tests {
         fd
     }
 
+    /// NL3b: Mimics glibc's __netlink_request — uses sendmsg/recvmsg
+    /// with sockaddr_nl, iov, and msghdr. This is the exact path
+    /// getifaddrs() takes internally.
+    fn test_sendmsg_recvmsg() -> i32 {
+        let fd = open_nl();
+        if fd < 0 { println!("NETLINK_SOCKET_FAIL"); return 1; }
+
+        // Send RTM_GETLINK via sendmsg (glibc pattern)
+        let mut req = [0u8; 32]; // nlmsghdr(16) + ifinfomsg(16)
+        req[0..4].copy_from_slice(&32u32.to_ne_bytes());
+        req[4..6].copy_from_slice(&(libc::RTM_GETLINK as u16).to_ne_bytes());
+        req[6..8].copy_from_slice(&((libc::NLM_F_REQUEST | libc::NLM_F_DUMP) as u16).to_ne_bytes());
+        req[8..12].copy_from_slice(&1u32.to_ne_bytes());
+
+        let mut dst_addr: libc::sockaddr_nl = unsafe { std::mem::zeroed() };
+        dst_addr.nl_family = libc::AF_NETLINK as u16;
+
+        let mut iov = libc::iovec { iov_base: req.as_mut_ptr() as *mut _, iov_len: req.len() };
+        let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+        msg.msg_name = &mut dst_addr as *mut _ as *mut _;
+        msg.msg_namelen = std::mem::size_of::<libc::sockaddr_nl>() as u32;
+        msg.msg_iov = &mut iov;
+        msg.msg_iovlen = 1;
+
+        let sent = unsafe { libc::sendmsg(fd, &msg, 0) };
+        if sent < 0 {
+            println!("NETLINK_SENDMSG_FAIL:{}", errno());
+            unsafe { libc::close(fd) }; return 1;
+        }
+        eprintln!("[sendmsg] sent {sent} bytes");
+
+        // Recv via recvmsg (glibc pattern) — loop until NLMSG_DONE
+        let mut found_newlink = false;
+        let mut found_done = false;
+        let mut recv_count = 0;
+        let mut buf = [0u8; 8192];
+        loop {
+            let mut iov_recv = libc::iovec { iov_base: buf.as_mut_ptr() as *mut _, iov_len: buf.len() };
+            let mut src_addr: libc::sockaddr_nl = unsafe { std::mem::zeroed() };
+            let mut rmsg: libc::msghdr = unsafe { std::mem::zeroed() };
+            rmsg.msg_name = &mut src_addr as *mut _ as *mut _;
+            rmsg.msg_namelen = std::mem::size_of::<libc::sockaddr_nl>() as u32;
+            rmsg.msg_iov = &mut iov_recv;
+            rmsg.msg_iovlen = 1;
+
+            let n = unsafe { libc::recvmsg(fd, &mut rmsg, 0) };
+            recv_count += 1;
+            eprintln!("[recvmsg] call #{recv_count}: returned {n}");
+            if n <= 0 { break; }
+            let n = n as usize;
+
+            let mut off = 0;
+            while off + 16 <= n {
+                let len = u32::from_ne_bytes([buf[off], buf[off+1], buf[off+2], buf[off+3]]) as usize;
+                let mtype = u16::from_ne_bytes([buf[off+4], buf[off+5]]);
+                eprintln!("[recvmsg] msg at off={off}: len={len} type={mtype}");
+                if len < 16 || off + len > n { break; }
+                if mtype == libc::RTM_NEWLINK as u16 { found_newlink = true; }
+                if mtype == libc::NLMSG_DONE as u16 { found_done = true; }
+                off += (len + 3) & !3;
+            }
+            if found_done { break; }
+        }
+        unsafe { libc::close(fd) };
+        if found_newlink && found_done {
+            println!("NETLINK_SENDMSG_RECVMSG_OK");
+            0
+        } else {
+            println!("NETLINK_SENDMSG_RECVMSG_FAIL:newlink={found_newlink},done={found_done},recvs={recv_count}");
+            1
+        }
+    }
+
+    /// NL3c: Two sequential requests on the same socket (like getifaddrs).
+    /// Send RTM_GETLINK, read response. Then send RTM_GETADDR, read response.
+    fn test_double_request() -> i32 {
+        let fd = open_nl();
+        if fd < 0 { println!("NETLINK_SOCKET_FAIL"); return 1; }
+
+        // Request 1: RTM_GETLINK via sendto (glibc pattern)
+        let mut req1 = [0u8; 32];
+        req1[0..4].copy_from_slice(&32u32.to_ne_bytes());
+        req1[4..6].copy_from_slice(&(libc::RTM_GETLINK as u16).to_ne_bytes());
+        req1[6..8].copy_from_slice(&((libc::NLM_F_REQUEST | libc::NLM_F_DUMP) as u16).to_ne_bytes());
+        req1[8..12].copy_from_slice(&1u32.to_ne_bytes());
+
+        let mut dst: libc::sockaddr_nl = unsafe { std::mem::zeroed() };
+        dst.nl_family = libc::AF_NETLINK as u16;
+
+        eprintln!("[double] sending RTM_GETLINK via sendto");
+        let sent = unsafe { libc::sendto(fd, req1.as_ptr() as *const _, req1.len(), 0,
+            &dst as *const _ as *const libc::sockaddr, std::mem::size_of::<libc::sockaddr_nl>() as u32) };
+        eprintln!("[double] sendto returned {sent}");
+        if sent < 0 { println!("DOUBLE_SEND1_FAIL:{}", errno()); unsafe { libc::close(fd) }; return 1; }
+
+        let (link_ok, link_done) = recv_check(fd, libc::RTM_NEWLINK as u16);
+        eprintln!("[double] getlink: ok={link_ok} done={link_done}");
+        if !link_ok || !link_done {
+            println!("DOUBLE_GETLINK_FAIL:ok={link_ok},done={link_done}");
+            unsafe { libc::close(fd) }; return 1;
+        }
+
+        // Request 2: RTM_GETADDR via sendto
+        let mut req2 = [0u8; 24];
+        req2[0..4].copy_from_slice(&24u32.to_ne_bytes());
+        req2[4..6].copy_from_slice(&(libc::RTM_GETADDR as u16).to_ne_bytes());
+        req2[6..8].copy_from_slice(&((libc::NLM_F_REQUEST | libc::NLM_F_DUMP) as u16).to_ne_bytes());
+        req2[8..12].copy_from_slice(&2u32.to_ne_bytes());
+
+        eprintln!("[double] sending RTM_GETADDR via sendto");
+        let sent = unsafe { libc::sendto(fd, req2.as_ptr() as *const _, req2.len(), 0,
+            &dst as *const _ as *const libc::sockaddr, std::mem::size_of::<libc::sockaddr_nl>() as u32) };
+        eprintln!("[double] sendto returned {sent}");
+        if sent < 0 { println!("DOUBLE_SEND2_FAIL:{}", errno()); unsafe { libc::close(fd) }; return 1; }
+
+        let (addr_ok, addr_done) = recv_check(fd, libc::RTM_NEWADDR as u16);
+        eprintln!("[double] getaddr: ok={addr_ok} done={addr_done}");
+
+        unsafe { libc::close(fd) };
+        if link_ok && link_done && addr_ok && addr_done {
+            println!("NETLINK_DOUBLE_OK");
+            0
+        } else {
+            println!("NETLINK_DOUBLE_FAIL:link={link_ok}/{link_done},addr={addr_ok}/{addr_done}");
+            1
+        }
+    }
+
     fn recv_check(fd: i32, expected: u16) -> (bool, bool) {
         let mut buf = [0u8; 8192];
         let mut found = false;
         let mut done = false;
         loop {
             let n = unsafe { libc::recv(fd, buf.as_mut_ptr() as *mut _, buf.len(), 0) };
-            if n <= 0 { break; }
+            if n <= 0 {
+                eprintln!("[recv_check] recv returned {n}");
+                break;
+            }
             let n = n as usize;
+            // Dump first 80 bytes for debugging
+            let dump_len = n.min(80);
+            let hex: Vec<String> = buf[..dump_len].iter().map(|b| format!("{b:02x}")).collect();
+            eprintln!("[recv_check] recv {n} bytes: {}", hex.join(" "));
+
             let mut off = 0;
             while off + 16 <= n {
                 let len = u32::from_ne_bytes([buf[off], buf[off+1], buf[off+2], buf[off+3]]) as usize;
                 let mtype = u16::from_ne_bytes([buf[off+4], buf[off+5]]);
+                eprintln!("[recv_check] msg at off={off}: len={len} type={mtype}");
                 if len < 16 || off + len > n { break; }
                 if mtype == expected { found = true; }
                 if mtype == libc::NLMSG_DONE as u16 { done = true; }

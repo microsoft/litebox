@@ -85,11 +85,11 @@ impl NetlinkRouteSocket {
         self.recv_buf.clear();
 
         match msg_type {
-            16 => {
+            18 => {
                 // RTM_GETLINK — return loopback interface
                 self.generate_link_response(seq);
             }
-            18 => {
+            22 => {
                 // RTM_GETADDR — return loopback address
                 self.generate_addr_response(seq);
             }
