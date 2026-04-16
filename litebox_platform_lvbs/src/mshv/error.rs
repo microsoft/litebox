@@ -152,6 +152,21 @@ pub enum VsmError {
 
     #[error("symbol name contains invalid UTF-8")]
     SymbolNameInvalidUtf8,
+
+    #[error("invalid API attribute")]
+    ApiAttrInvalid,
+
+    #[error("invalid symbol info type")]
+    SymbolInfoTypeInvalid,
+
+    #[error("invalid permissions info type")]
+    PermInfoTypeInvalid,
+
+    #[error("invalid patch type")]
+    PatchTypeInvalid,
+
+    #[error("invalid data page")]
+    DataPageInvalid,
 }
 
 impl From<VerificationError> for VsmError {
@@ -217,7 +232,12 @@ impl From<VsmError> for Errno {
             | VsmError::SymbolNameInvalidUtf8
             | VsmError::SymbolNameNoTerminator
             | VsmError::CertificateDerLengthInvalid { .. }
-            | VsmError::CertificateParseFailed => Errno::EINVAL,
+            | VsmError::CertificateParseFailed
+            | VsmError::ApiAttrInvalid
+            | VsmError::SymbolInfoTypeInvalid
+            | VsmError::PermInfoTypeInvalid
+            | VsmError::DataPageInvalid
+            | VsmError::PatchTypeInvalid => Errno::EINVAL,
 
             // Signature verification failures delegate to VerificationError's Errno mapping
             VsmError::SignatureVerificationFailed(e) => Errno::from(e),
