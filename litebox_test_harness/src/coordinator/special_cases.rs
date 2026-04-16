@@ -696,6 +696,71 @@ pub(super) async fn fork_special_tests(r: &mut TestRunner) {
         &format!("{resp:?}"),
     );
 
+    // ── Delayed fork edge cases not covered by fork_matrix ──
+    // fork_matrix covers {mmap,thread}×{pie,nonpie}×{direct,script} from A.
+    // These tests cover unique patterns: depth-2, node binary, triple nesting.
+
+    eprintln!("[special] === Delayed Fork Edge Cases ===");
+
+    // X34b: Delayed fork (mmap) from depth-2 agent AA.
+    let resp = r
+        .send(
+            "AA",
+            exec(vec![
+                self_exe.clone(),
+                "trigger-delayed-fork".into(),
+                self_exe.clone(),
+                "echo-test".into(),
+            ]),
+        )
+        .await;
+    let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout.contains("ECHO_TEST_OK"));
+    r.record(
+        "X34b.nested_delayed_fork_deep",
+        "AA",
+        pass,
+        &format!("{resp:?}"),
+    );
+
+    // X35: Delayed fork (mmap) → Node.js (not generic PIE).
+    // Node.js triggers additional delayed forks via V8 thread creation.
+    let resp = r
+        .send(
+            "A",
+            exec(vec![
+                self_exe.clone(),
+                "trigger-delayed-fork".into(),
+                "/usr/local/bin/node".into(),
+                "-e".into(),
+                "console.log('df_node_ok')".into(),
+            ]),
+        )
+        .await;
+    let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout.contains("df_node_ok"));
+    r.record(
+        "X35.delayed_fork_then_node",
+        "A",
+        pass,
+        &format!("{resp:?}"),
+    );
+
+    // X36: Triple delayed fork — 3 levels of nesting.
+    let resp = r
+        .send(
+            "A",
+            exec(vec![
+                self_exe.clone(),
+                "trigger-delayed-fork".into(),
+                self_exe.clone(),
+                "trigger-delayed-fork".into(),
+                self_exe.clone(),
+                "echo-test".into(),
+            ]),
+        )
+        .await;
+    let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout.contains("ECHO_TEST_OK"));
+    r.record("X36.triple_delayed_fork", "A", pass, &format!("{resp:?}"));
+
     eprintln!("[special] === Pipe Contamination Tests ===");
 
     // X43: Init-level contamination.
