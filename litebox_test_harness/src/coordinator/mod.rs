@@ -312,6 +312,9 @@ async fn run_tests(self_exe: &str) -> Vec<TestResult> {
     }
     special_cases::contamination_sequence_tests(&mut runner).await;
 
+    // === Netlink / getifaddrs Tests ===
+    special_cases::netlink_tests(&mut runner).await;
+
     // Shutdown all children.
     for (id, mut child) in runner.children.drain() {
         let _ = send_cmd(&mut child, &Command::Exit).await;
