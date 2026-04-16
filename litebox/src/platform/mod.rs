@@ -775,6 +775,10 @@ pub trait CrngProvider {
 /// specific provider supports a model that allows for more pragmatic choices, while making sure
 /// that the platform has final say on the total strictness of the root key (since it is what
 /// finally owns the root key).
+#[expect(
+    clippy::type_complexity,
+    reason = "separating the KDF fn into its own type makes it harder to read"
+)]
 pub trait DerivedKeyProvider {
     /// Derive a new key using the `shim_kdf` (if provided) and the current context
     /// (`params.context`), and place it into `params.output`.
@@ -785,11 +789,11 @@ pub trait DerivedKeyProvider {
     ///
     /// The `shim_kdf` is a `fn` not a `Fn`/`FnMut`/`FnOnce` in order to incentivize usage of pure
     /// functions.
-    fn derive_key(
+    fn derive_key<E>(
         &self,
-        shim_kdf: Option<fn(&[u8], KDFParams)>,
+        shim_kdf: Option<fn(&[u8], KDFParams) -> Result<(), E>>,
         params: KDFParams,
-    ) -> Result<(), DerivedKeyError>;
+    ) -> Result<(), DerivedKeyError<E>>;
 }
 
 /// Input and output parameters to a KDF other than the secret itself.
@@ -804,9 +808,11 @@ pub struct KDFParams<'a> {
 
 #[derive(Debug, Error)]
 /// Errors that might be returned upon attempting to derive a key.
-pub enum DerivedKeyError {
+pub enum DerivedKeyError<ShimKDFError> {
     #[error("platform does not support purely-platform KDFs")]
     ShimKDFRequired,
+    #[error(transparent)]
+    ShimKDFError(#[from] ShimKDFError),
     #[error("this platform does not support reboot-persistent keys")]
     UnsupportedRebootPersistentKey,
 }

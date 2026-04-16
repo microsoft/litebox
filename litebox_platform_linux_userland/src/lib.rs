@@ -2779,11 +2779,11 @@ impl litebox::platform::CrngProvider for LinuxUserland {
 }
 
 impl litebox::platform::DerivedKeyProvider for LinuxUserland {
-    fn derive_key(
+    fn derive_key<E>(
         &self,
-        shim_kdf: Option<fn(&[u8], litebox::platform::KDFParams)>,
+        shim_kdf: Option<fn(&[u8], litebox::platform::KDFParams) -> Result<(), E>>,
         params: litebox::platform::KDFParams,
-    ) -> Result<(), litebox::platform::DerivedKeyError> {
+    ) -> Result<(), litebox::platform::DerivedKeyError<E>> {
         let Some(boot_id) = self.boot_id.get() else {
             return Err(litebox::platform::DerivedKeyError::UnsupportedRebootPersistentKey);
         };
@@ -2799,8 +2799,7 @@ impl litebox::platform::DerivedKeyProvider for LinuxUserland {
                 // can just run the KDF as-is.
                 //
                 // Our key is actually just the boot ID itself.
-                shim_kdf(boot_id, params);
-                Ok(())
+                Ok(shim_kdf(boot_id, params)?)
             }
         }
     }
