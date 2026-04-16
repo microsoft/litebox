@@ -1147,7 +1147,10 @@ where
                             .map(|s| s.ip_listen_endpoint.port)
                             .or_else(|| tcp.local_port.as_ref().map(|lp| lp.port()))
                             .unwrap_or(0);
-                        Ok(SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, port)))
+                        Ok(SocketAddr::V4(SocketAddrV4::new(
+                            Ipv4Addr::UNSPECIFIED,
+                            port,
+                        )))
                     }
                 }
             }
@@ -1360,9 +1363,10 @@ where
         // Notify the broker about the port we're listening on so it can
         // route inbound connections to the correct worker's IPC channel.
         let listen_port = match &socket_handle.specific {
-            ProtocolSpecific::Tcp(TcpSpecific { server_socket: Some(ss), .. }) => {
-                Some(ss.ip_listen_endpoint.port)
-            }
+            ProtocolSpecific::Tcp(TcpSpecific {
+                server_socket: Some(ss),
+                ..
+            }) => Some(ss.ip_listen_endpoint.port),
             _ => None,
         };
         // Release locks before sending IPC (which may block briefly).
@@ -1370,7 +1374,10 @@ where
         drop(descriptor_table);
 
         if let Some(port) = listen_port {
-            let _ = self.device.platform.send_port_listen_notification(port, true);
+            let _ = self
+                .device
+                .platform
+                .send_port_listen_notification(port, true);
         }
 
         self.automated_platform_interaction(PollDirection::Ingress);

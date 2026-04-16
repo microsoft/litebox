@@ -3648,9 +3648,12 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
             // share a single address space so real privilege changes are
             // meaningless. dropbear calls setgid/setuid/setgroups during
             // user switching after authentication.
-            Sysno::setuid | Sysno::setreuid
-            | Sysno::setgid | Sysno::setregid
-            | Sysno::setresuid | Sysno::setresgid
+            Sysno::setuid
+            | Sysno::setreuid
+            | Sysno::setgid
+            | Sysno::setregid
+            | Sysno::setresuid
+            | Sysno::setresgid
             | Sysno::setgroups => {
                 return Ok(SyscallRequest::Seccomp); // reuse the no-op variant
             }

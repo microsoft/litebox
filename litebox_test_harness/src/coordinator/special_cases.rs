@@ -228,31 +228,108 @@ pub(super) async fn netlink_tests(r: &mut TestRunner) {
 
     eprintln!("[special] === Netlink Tests ===");
 
-    let resp = r.send("A", exec(vec![self_exe.clone(), "getifaddrs-test".into(), "socket".into()])).await;
+    let resp = r
+        .send(
+            "A",
+            exec(vec![
+                self_exe.clone(),
+                "getifaddrs-test".into(),
+                "socket".into(),
+            ]),
+        )
+        .await;
     let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout.contains("NETLINK_SOCKET_OK"));
     r.record("NL1.netlink_socket", "A", pass, &format!("{resp:?}"));
 
-    let resp = r.send("A", exec(vec![self_exe.clone(), "getifaddrs-test".into(), "bind".into()])).await;
+    let resp = r
+        .send(
+            "A",
+            exec(vec![
+                self_exe.clone(),
+                "getifaddrs-test".into(),
+                "bind".into(),
+            ]),
+        )
+        .await;
     let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout.contains("NETLINK_BIND_OK"));
     r.record("NL2.netlink_bind", "A", pass, &format!("{resp:?}"));
 
-    let resp = r.send("A", exec(vec![self_exe.clone(), "getifaddrs-test".into(), "getlink".into()])).await;
+    let resp = r
+        .send(
+            "A",
+            exec(vec![
+                self_exe.clone(),
+                "getifaddrs-test".into(),
+                "getlink".into(),
+            ]),
+        )
+        .await;
     let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout.contains("NETLINK_GETLINK_OK"));
     r.record("NL3.netlink_getlink", "A", pass, &format!("{resp:?}"));
 
-    let resp = r.send("A", exec(vec![self_exe.clone(), "getifaddrs-test".into(), "getaddr".into()])).await;
+    let resp = r
+        .send(
+            "A",
+            exec(vec![
+                self_exe.clone(),
+                "getifaddrs-test".into(),
+                "getaddr".into(),
+            ]),
+        )
+        .await;
     let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout.contains("NETLINK_GETADDR_OK"));
     r.record("NL4.netlink_getaddr", "A", pass, &format!("{resp:?}"));
 
-    let resp = r.send("A", exec(vec![self_exe.clone(), "getifaddrs-test".into(), "sendmsg".into()])).await;
+    let resp = r
+        .send(
+            "A",
+            exec(vec![
+                self_exe.clone(),
+                "getifaddrs-test".into(),
+                "sendmsg".into(),
+            ]),
+        )
+        .await;
     let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout.contains("NETLINK_SENDMSG_RECVMSG_OK"));
     r.record("NL3b.sendmsg_recvmsg", "A", pass, &format!("{resp:?}"));
 
-    let resp = r.send("A", super::exec_timeout(vec![self_exe.clone(), "getifaddrs-test".into(), "double".into()], 30)).await;
+    let resp = r
+        .send(
+            "A",
+            super::exec_timeout(
+                vec![self_exe.clone(), "getifaddrs-test".into(), "double".into()],
+                30,
+            ),
+        )
+        .await;
     let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout.contains("NETLINK_DOUBLE_OK"));
     r.record("NL3c.double_request", "A", pass, &format!("{resp:?}"));
 
-    let resp = r.send("A", super::exec_timeout(vec![self_exe.clone(), "getifaddrs-test".into(), "full".into()], 30)).await;
+    let resp = r
+        .send(
+            "A",
+            super::exec_timeout(
+                vec![
+                    self_exe.clone(),
+                    "getifaddrs-test".into(),
+                    "peek-trunc".into(),
+                ],
+                30,
+            ),
+        )
+        .await;
+    let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout.contains("NETLINK_PEEK_TRUNC_OK"));
+    r.record("NL3d.peek_trunc", "A", pass, &format!("{resp:?}"));
+
+    let resp = r
+        .send(
+            "A",
+            super::exec_timeout(
+                vec![self_exe.clone(), "getifaddrs-test".into(), "full".into()],
+                30,
+            ),
+        )
+        .await;
     let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout.contains("GETIFADDRS_OK"));
     r.record("NL5.getifaddrs_full", "A", pass, &format!("{resp:?}"));
 
@@ -263,5 +340,10 @@ pub(super) async fn netlink_tests(r: &mut TestRunner) {
     ], 30)).await;
     let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. }
         if stdout.contains("NETIF_OK:") || stdout.contains("NETIF_ERR:"));
-    r.record("X48.node_networkInterfaces", "A", pass, &format!("{resp:?}"));
+    r.record(
+        "X48.node_networkInterfaces",
+        "A",
+        pass,
+        &format!("{resp:?}"),
+    );
 }

@@ -192,7 +192,11 @@ impl PortRouter {
     ) -> Option<std::net::TcpStream> {
         let routes = self.routes.lock().unwrap();
         if let Some(sender) = routes.get(&guest_port) {
-            let routed = RoutedStream { stream, guest_ip, guest_port };
+            let routed = RoutedStream {
+                stream,
+                guest_ip,
+                guest_port,
+            };
             match sender.send(routed) {
                 Ok(()) => {
                     debug!("port router: forwarded connection to worker on port {guest_port}");
@@ -932,15 +936,16 @@ fn run_inner(
                                 // The target worker's smoltcp connects to its
                                 // guest (10.0.0.2), not to the broker IP.
                                 let guest_ip = Ipv4Addr::new(10, 0, 0, 2);
-                                if port_router.try_route(dst_port, guest_ip, remote_end).is_some() {
+                                if port_router
+                                    .try_route(dst_port, guest_ip, remote_end)
+                                    .is_some()
+                                {
                                     warn!("port_router rejected routed stream for port {dst_port}");
                                     suppress_from_smoltcp = true;
                                 } else {
                                     local_end.set_nonblocking(true).ok();
-                                    ready_host_streams.insert(
-                                        flow_key,
-                                        (local_end, Instant::now()),
-                                    );
+                                    ready_host_streams
+                                        .insert(flow_key, (local_end, Instant::now()));
                                     ensure_listen_socket(
                                         &mut sockets,
                                         &mut listen_sockets,
@@ -1409,14 +1414,17 @@ fn run_inner(
 
                         // Check if a worker has registered for this port.
                         // If so, route the stream to the worker's proxy.
-                        let stream = match port_router.try_route(fwd.guest_port, fwd.guest_ip, stream) {
-                            None => continue, // routed to worker, they handle it
-                            Some(s) => s,     // no worker, we handle it
-                        };
+                        let stream =
+                            match port_router.try_route(fwd.guest_port, fwd.guest_ip, stream) {
+                                None => continue, // routed to worker, they handle it
+                                Some(s) => s,     // no worker, we handle it
+                            };
 
                         // Create a smoltcp TCP socket that connects to the guest.
-                        let tcp_rx = smoltcp::socket::tcp::SocketBuffer::new(vec![0; SOCKET_BUFFER_SIZE]);
-                        let tcp_tx = smoltcp::socket::tcp::SocketBuffer::new(vec![0; SOCKET_BUFFER_SIZE]);
+                        let tcp_rx =
+                            smoltcp::socket::tcp::SocketBuffer::new(vec![0; SOCKET_BUFFER_SIZE]);
+                        let tcp_tx =
+                            smoltcp::socket::tcp::SocketBuffer::new(vec![0; SOCKET_BUFFER_SIZE]);
                         let mut tcp_socket = smoltcp::socket::tcp::Socket::new(tcp_rx, tcp_tx);
                         // Disable Nagle — the broker is a relay. Nagle + delayed ACK
                         // causes multi-second stalls on the SSH key exchange.
@@ -1430,10 +1438,8 @@ fn run_inner(
                         }
 
                         let sock = sockets.get_mut::<smoltcp::socket::tcp::Socket>(handle);
-                        let local = smoltcp::wire::IpEndpoint::new(
-                            IpAddress::Ipv4(BROKER_IP),
-                            src_port,
-                        );
+                        let local =
+                            smoltcp::wire::IpEndpoint::new(IpAddress::Ipv4(BROKER_IP), src_port);
                         let octets = fwd.guest_ip.octets();
                         let remote = smoltcp::wire::IpEndpoint::new(
                             IpAddress::Ipv4(Ipv4Address::new(
@@ -1447,9 +1453,7 @@ fn run_inner(
                             continue;
                         }
 
-                        let dest = SocketAddr::V4(SocketAddrV4::new(
-                            fwd.guest_ip, fwd.guest_port,
-                        ));
+                        let dest = SocketAddr::V4(SocketAddrV4::new(fwd.guest_ip, fwd.guest_port));
                         tcp_bridges.push(TcpBridge {
                             smoltcp_handle: handle,
                             host_stream: stream,
@@ -1489,15 +1493,10 @@ fn run_inner(
                 }
 
                 let sock = sockets.get_mut::<smoltcp::socket::tcp::Socket>(handle);
-                let local = smoltcp::wire::IpEndpoint::new(
-                    IpAddress::Ipv4(BROKER_IP),
-                    src_port,
-                );
+                let local = smoltcp::wire::IpEndpoint::new(IpAddress::Ipv4(BROKER_IP), src_port);
                 let octets = routed.guest_ip.octets();
                 let remote = smoltcp::wire::IpEndpoint::new(
-                    IpAddress::Ipv4(Ipv4Address::new(
-                        octets[0], octets[1], octets[2], octets[3],
-                    )),
+                    IpAddress::Ipv4(Ipv4Address::new(octets[0], octets[1], octets[2], octets[3])),
                     routed.guest_port,
                 );
                 if let Err(e) = sock.connect(iface.context(), remote, local) {
@@ -1506,9 +1505,7 @@ fn run_inner(
                     continue;
                 }
 
-                let dest = SocketAddr::V4(SocketAddrV4::new(
-                    routed.guest_ip, routed.guest_port,
-                ));
+                let dest = SocketAddr::V4(SocketAddrV4::new(routed.guest_ip, routed.guest_port));
                 tcp_bridges.push(TcpBridge {
                     smoltcp_handle: handle,
                     host_stream: routed.stream,
