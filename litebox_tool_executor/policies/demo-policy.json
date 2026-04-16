@@ -4,7 +4,9 @@
         "allow_write": [
             "/tmp/**",
             "/shared/**",
+            "/root/.cache",
             "/root/.cache/**",
+            "/root/.vscode-server",
             "**/workspace/**",
             "**/workspaces/**",
             "**/.vscode-server/**"
