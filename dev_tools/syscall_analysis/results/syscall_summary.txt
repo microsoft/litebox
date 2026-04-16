@@ -1,0 +1,127 @@
+strace: Process 4120 attached
+strace: Process 4121 attached
+strace: Process 4122 attached
+strace: Process 4123 attached
+strace: Process 4124 attached
+strace: Process 4125 attached
+strace: Process 4126 attached
+strace: Process 4127 attached
+strace: Process 4128 attached
+strace: Process 4129 attached
+strace: Process 4130 attached
+strace: Process 4155 attached
+strace: Process 4156 attached
+strace: Process 4157 attached
+strace: Process 4158 attached
+strace: Process 4164 attached
+strace: Process 4165 attached
+strace: Process 4166 attached
+strace: Process 4167 attached
+strace: Process 4168 attached
+strace: Process 4169 attached
+strace: Process 4182 attached
+strace: Process 4183 attached
+strace: Process 4184 attached
+strace: Process 4185 attached
+strace: Process 4186 attached
+strace: Process 4187 attached
+strace: Process 4188 attached
+strace: Process 4189 attached
+strace: Process 4195 attached
+strace: Process 4119 detached
+strace: Process 4120 detached
+strace: Process 4121 detached
+strace: Process 4122 detached
+strace: Process 4123 detached
+strace: Process 4124 detached
+strace: Process 4125 detached
+strace: Process 4127 detached
+strace: Process 4128 detached
+strace: Process 4129 detached
+strace: Process 4130 detached
+% time     seconds  usecs/call     calls    errors syscall
+------ ----------- ----------- --------- --------- ------------------
+ 76.64    8.142330        4498      1810       194 futex
+ 11.53    1.225158        3877       316         1 epoll_pwait
+  5.43    0.576650       26211        22         9 wait4
+  1.29    0.137233         149       915         1 read
+  0.96    0.102093          77      1323       619 statx
+  0.79    0.084176          95       880           mprotect
+  0.44    0.046880          76       615       180 openat
+  0.32    0.033955          39       863           rt_sigprocmask
+  0.32    0.033764          65       515           mmap
+  0.31    0.032863          62       524         6 close
+  0.30    0.032225         104       309           munmap
+  0.29    0.030554         124       246           madvise
+  0.22    0.023117         108       213           write
+  0.12    0.012534         205        61           pread64
+  0.12    0.012266          29       420           rt_sigaction
+  0.11    0.012081          43       280           fstat
+  0.10    0.010321         645        16         4 mkdir
+  0.05    0.005538         461        12           execve
+  0.05    0.005453         419        13           clone
+  0.05    0.005165          45       114        45 fcntl
+  0.05    0.005079         298        17           clone3
+  0.04    0.004139        1379         3           fdatasync
+  0.04    0.004037          40        99           getpid
+  0.04    0.003931          31       123           brk
+  0.03    0.003424          30       112        51 newfstatat
+  0.03    0.002689          52        51         7 faccessat2
+  0.02    0.002555          44        57        41 ioctl
+  0.02    0.001936          41        47           getgid
+  0.02    0.001894          63        30           getdents64
+  0.02    0.001883          43        43        21 access
+  0.02    0.001840          39        47           getuid
+  0.02    0.001732          36        48           geteuid
+  0.02    0.001682          35        47           getegid
+  0.02    0.001670         185         9           socket
+  0.02    0.001632          56        29           rseq
+  0.01    0.001559          37        42           set_robust_list
+  0.01    0.001513          44        34        18 lseek
+  0.01    0.001510          45        33           capget
+  0.01    0.001388          46        30           prlimit64
+  0.01    0.001306         217         6         5 connect
+  0.01    0.001278         116        11           io_uring_enter
+  0.01    0.000949         158         6           prctl
+  0.01    0.000866          45        19           pipe2
+  0.01    0.000810          26        31           dup2
+  0.01    0.000584          97         6           io_uring_setup
+  0.01    0.000544          45        12           arch_prctl
+  0.00    0.000490          32        15           getrandom
+  0.00    0.000441          44        10           rt_sigreturn
+  0.00    0.000414         414         1           inotify_init1
+  0.00    0.000397          66         6           epoll_create1
+  0.00    0.000395          39        10         6 readlink
+  0.00    0.000369         123         3           inotify_add_watch
+  0.00    0.000343          28        12           set_tid_address
+  0.00    0.000324          40         8           recvmsg
+  0.00    0.000302          75         4           getppid
+  0.00    0.000298          21        14           setsockopt
+  0.00    0.000288          96         3           stat
+  0.00    0.000272          45         6           eventfd2
+  0.00    0.000251          35         7           getsockname
+  0.00    0.000237          79         3           bind
+  0.00    0.000220          44         5           getsockopt
+  0.00    0.000215          30         7           gettid
+  0.00    0.000210         210         1           sendmmsg
+  0.00    0.000192          27         7           getcwd
+  0.00    0.000170         170         1           fchdir
+  0.00    0.000161          40         4         1 epoll_ctl
+  0.00    0.000156          26         6           uname
+  0.00    0.000148          49         3           sendto
+  0.00    0.000111          37         3           poll
+  0.00    0.000102         102         1           dup3
+  0.00    0.000085          42         2           shutdown
+  0.00    0.000082          41         2           sched_getaffinity
+  0.00    0.000075          75         1           listen
+  0.00    0.000065          32         2           recvfrom
+  0.00    0.000063          63         1           getpgrp
+  0.00    0.000060          60         1           dup
+  0.00    0.000055          27         2           sigaltstack
+  0.00    0.000046          23         2         1 statfs
+  0.00    0.000000           0         1           writev
+  0.00    0.000000           0         2           socketpair
+  0.00    0.000000           0         1           chdir
+  0.00    0.000000           0         1           setsid
+------ ----------- ----------- --------- --------- ------------------
+100.00   10.623823        1000     10617      1210 total
