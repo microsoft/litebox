@@ -145,10 +145,8 @@ impl NetlinkRouteSocket {
         // nlmsghdr
         self.recv_buf
             .extend_from_slice(&(msg_len as u32).to_ne_bytes()); // nlmsg_len
-        self.recv_buf
-            .extend_from_slice(&RTM_NEWLINK.to_ne_bytes()); // nlmsg_type
-        self.recv_buf
-            .extend_from_slice(&NLM_F_MULTI.to_ne_bytes()); // nlmsg_flags
+        self.recv_buf.extend_from_slice(&RTM_NEWLINK.to_ne_bytes()); // nlmsg_type
+        self.recv_buf.extend_from_slice(&NLM_F_MULTI.to_ne_bytes()); // nlmsg_flags
         self.recv_buf.extend_from_slice(&seq.to_ne_bytes()); // nlmsg_seq
         self.recv_buf.extend_from_slice(&0u32.to_ne_bytes()); // nlmsg_pid
 
@@ -205,10 +203,8 @@ impl NetlinkRouteSocket {
         // nlmsghdr
         self.recv_buf
             .extend_from_slice(&(msg_len as u32).to_ne_bytes());
-        self.recv_buf
-            .extend_from_slice(&RTM_NEWADDR.to_ne_bytes());
-        self.recv_buf
-            .extend_from_slice(&NLM_F_MULTI.to_ne_bytes());
+        self.recv_buf.extend_from_slice(&RTM_NEWADDR.to_ne_bytes());
+        self.recv_buf.extend_from_slice(&NLM_F_MULTI.to_ne_bytes());
         self.recv_buf.extend_from_slice(&seq.to_ne_bytes());
         self.recv_buf.extend_from_slice(&0u32.to_ne_bytes());
 
@@ -228,8 +224,7 @@ impl NetlinkRouteSocket {
         let msg_len = NLMSG_HDR_LEN + 4; // nlmsghdr + 4 bytes padding/error code
         self.recv_buf
             .extend_from_slice(&(msg_len as u32).to_ne_bytes());
-        self.recv_buf
-            .extend_from_slice(&NLMSG_DONE.to_ne_bytes());
+        self.recv_buf.extend_from_slice(&NLMSG_DONE.to_ne_bytes());
         self.recv_buf.extend_from_slice(&0u16.to_ne_bytes()); // flags
         self.recv_buf.extend_from_slice(&seq.to_ne_bytes());
         self.recv_buf.extend_from_slice(&0u32.to_ne_bytes()); // pid

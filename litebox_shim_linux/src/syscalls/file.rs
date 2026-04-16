@@ -1090,6 +1090,15 @@ impl<FS: ShimFS> Task<FS> {
         let Ok(raw_fd) = u32::try_from(fd).and_then(usize::try_from) else {
             return Err(Errno::EBADF);
         };
+
+        // Netlink socket: return buffered data, 0 if empty.
+        if let Some(nl) = self.netlink_sockets.borrow_mut().get_mut(&(raw_fd as u32)) {
+            if !nl.has_data() {
+                return Ok(0);
+            }
+            return Ok(nl.recv(buf));
+        }
+
         let files = self.files.borrow();
 
         // Fast path: host-pipe FDs bypass the multi-subsystem dispatch.
@@ -5018,13 +5027,24 @@ impl<FS: ShimFS> Task<FS> {
         })?;
 
         let mut set = super::epoll::PollSet::with_capacity(nfds);
+        let mut netlink_ready_count: usize = 0;
         for i in 0..nfds_signed {
-            let fd = fds.read_at_offset(i).ok_or_else(|| {
+            let mut fd = fds.read_at_offset(i).ok_or_else(|| {
                 if let Some(old) = saved_mask {
                     self.signals.set_blocked(old);
                 }
                 Errno::EFAULT
             })?;
+
+            // Netlink socket: always report ready (has data or EAGAIN).
+            if let Ok(fd_u32) = u32::try_from(fd.fd) {
+                if self.netlink_sockets.borrow().contains_key(&fd_u32) {
+                    fd.revents = fd.events; // Mark as ready
+                    fds.write_at_offset(i, fd);
+                    netlink_ready_count += 1;
+                    continue;
+                }
+            }
 
             let events = litebox::event::Events::from_bits_truncate(
                 fd.events.reinterpret_as_unsigned().into(),
@@ -5032,23 +5052,26 @@ impl<FS: ShimFS> Task<FS> {
             set.add_fd(fd.fd, events);
         }
 
-        match set.wait(
-            &self.global,
-            &self.wait_cx().with_timeout(timeout),
-            &self.files.borrow(),
-        ) {
-            Ok(()) => {}
-            Err(WaitError::Interrupted) => {
-                // Defer mask restore for process_signals.
-                if let Some(old) = saved_mask {
-                    self.signals.set_restore_mask(old);
+        // If there are non-netlink fds, do the normal poll wait.
+        if !set.is_empty() {
+            match set.wait(
+                &self.global,
+                &self.wait_cx().with_timeout(timeout),
+                &self.files.borrow(),
+            ) {
+                Ok(()) => {}
+                Err(WaitError::Interrupted) => {
+                    // Defer mask restore for process_signals.
+                    if let Some(old) = saved_mask {
+                        self.signals.set_restore_mask(old);
+                    }
+                    // TODO: update the remaining time.
+                    return Err(Errno::EINTR);
                 }
-                // TODO: update the remaining time.
-                return Err(Errno::EINTR);
-            }
-            Err(WaitError::TimedOut) => {
-                // A timeout occurred. Scan one last time.
-                set.scan(&self.global, &self.files.borrow());
+                Err(WaitError::TimedOut) => {
+                    // A timeout occurred. Scan one last time.
+                    set.scan(&self.global, &self.files.borrow());
+                }
             }
         }
 
@@ -5057,9 +5080,9 @@ impl<FS: ShimFS> Task<FS> {
             self.signals.set_restore_mask(old);
         }
 
-        // Write just the revents back.
+        // Write just the revents back for non-netlink fds.
         let fds_base_addr = fds.as_usize();
-        let mut ready_count = 0;
+        let mut ready_count = netlink_ready_count;
         for (i, revents) in set.revents().enumerate() {
             // TODO: This is not great from a provenance perspective. Consider
             // adding cast+add methods to ConstPtr/MutPtr.

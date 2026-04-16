@@ -659,14 +659,17 @@ pub(super) async fn node_exec_tests(r: &mut TestRunner) {
     let resp = r
         .send(
             "A",
-            exec(vec![
-                "/usr/local/bin/node".into(),
-                "-e".into(),
-                "try { const r = require('os').networkInterfaces(); \
+            exec_timeout(
+                vec![
+                    "/usr/local/bin/node".into(),
+                    "-e".into(),
+                    "try { const r = require('os').networkInterfaces(); \
          console.log('NETIF_OK:' + Object.keys(r).length); } \
          catch(e) { console.log('NETIF_ERR:' + e.code); }"
-                    .into(),
-            ]),
+                        .into(),
+                ],
+                30,
+            ),
         )
         .await;
     let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. }

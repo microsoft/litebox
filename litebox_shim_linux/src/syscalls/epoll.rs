@@ -892,6 +892,11 @@ impl PollSet {
         }
     }
 
+    /// Returns true if no fds have been added.
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
     /// Adds an fd to the poll set with the given event mask.
     ///
     /// If fd is negative, it is ignored during polling.

@@ -2019,7 +2019,9 @@ impl<FS: ShimFS> Task<FS> {
                         delayed_fork_pending: core::cell::Cell::new(false),
                         migrated_to_remote: core::cell::Cell::new(false),
                         mux_pipe_pair_ids: core::cell::RefCell::new(alloc::vec::Vec::new()),
-                        netlink_sockets: core::cell::RefCell::new(alloc::collections::BTreeMap::new()),
+                        netlink_sockets: core::cell::RefCell::new(
+                            alloc::collections::BTreeMap::new(),
+                        ),
                     },
                 }),
             )
@@ -2753,7 +2755,9 @@ impl<FS: ShimFS> Task<FS> {
                         delayed_fork_pending: core::cell::Cell::new(delayed_fork),
                         migrated_to_remote: core::cell::Cell::new(false),
                         mux_pipe_pair_ids: core::cell::RefCell::new(alloc::vec::Vec::new()),
-                        netlink_sockets: core::cell::RefCell::new(alloc::collections::BTreeMap::new()),
+                        netlink_sockets: core::cell::RefCell::new(
+                            alloc::collections::BTreeMap::new(),
+                        ),
                     },
                 }),
             )
