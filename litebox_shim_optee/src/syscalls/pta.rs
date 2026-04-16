@@ -121,6 +121,7 @@ impl Task {
                         size:% = output_len;
                         "derive key into secure memory"
                     );
+                    // TODO: replace below with a secure key derivation function
                     let mut key_buf = alloc::vec![0u8; output_len];
                     self.sys_cryp_random_number_generate(&mut key_buf)?;
                     output_ptr
