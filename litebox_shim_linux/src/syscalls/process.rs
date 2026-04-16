@@ -2807,98 +2807,6 @@ impl<FS: ShimFS> Task<FS> {
                         repl.direction,
                     );
 
-                    // Check if the replacement targets a virtual pipe WRITE-end
-                    // (sender) whose pair_id is in mux_pipe_pair_ids — meaning
-                    // it was created by a prior commit_delayed_fork relay, not
-                    // by the current process (e.g. Stdio::piped()).
-                    //
-                    // If so, relay the remote worker's output directly into the
-                    // existing pipe instead of replacing it. This preserves
-                    // the pipe chain to upstream consumers (e.g. the agent
-                    // reads bash's stdout through the mux relay; replacing it
-                    // would disconnect the chain).
-                    //
-                    // If the fd is NOT mux-managed (init's host-backed fds,
-                    // or dynamically created pipe pairs from Stdio::piped()),
-                    // use the default replacement path which creates a new
-                    // virtual pipe pair.
-                    let is_mux_sender = {
-                        let mux_ids = self.mux_pipe_pair_ids.borrow();
-                        if mux_ids.is_empty() {
-                            None
-                        } else {
-                            files
-                                .raw_descriptor_store
-                                .read()
-                                .fd_from_raw_integer::<litebox::pipes::Pipes<crate::Platform>>(
-                                    repl.guest_fd,
-                                )
-                                .ok()
-                                .and_then(|fd| {
-                                    let half_type = self.global.pipes.half_pipe_type(&fd).ok()?;
-                                    if half_type != litebox::pipes::HalfPipeType::SenderHalf {
-                                        return None;
-                                    }
-                                    let pair_id = self.global.pipes.pipe_pair_id(&fd).ok()?;
-                                    if mux_ids.contains(&pair_id) {
-                                        Some((Arc::clone(&fd), half_type))
-                                    } else {
-                                        None
-                                    }
-                                })
-                        }
-                    };
-
-                    if let Some((ref existing_fd, litebox::pipes::HalfPipeType::SenderHalf)) =
-                        is_mux_sender
-                    {
-                        if repl.direction == HostPipeDirection::Read {
-                            // The parent's fd is a pipe write-end (e.g., stdout).
-                            // Instead of replacing it, relay the remote worker's
-                            // output directly into it. This preserves the pipe
-                            // chain: remote worker → host pipe → relay → existing
-                            // virtual pipe → agent.
-                            #[cfg(feature = "trace_syscalls")]
-                            litebox::log_println!(
-                                self.global.platform,
-                                "[FD-REPLACE] pid={}: guest_fd={} is an existing pipe — relaying into it instead of replacing",
-                                self.pid,
-                                repl.guest_fd,
-                            );
-
-                            let platform = self.global.platform;
-                            let pipes = self.global.pipes.clone();
-                            let host_fd = repl.host_fd;
-                            let target_fd = Arc::clone(existing_fd);
-
-                            self.global.platform.spawn_background_task(move || {
-                                let wait_state = litebox::event::wait::WaitState::new(platform);
-                                let cx = wait_state.context();
-                                let mut buf = alloc::vec![0u8; 65536];
-                                loop {
-                                    match platform.read_host_fd(host_fd, &mut buf) {
-                                        Ok(0) | Err(_) => break,
-                                        Ok(n) => {
-                                            let mut offset = 0;
-                                            while offset < n {
-                                                if let Ok(w) =
-                                                    pipes.write(&cx, &target_fd, &buf[offset..n])
-                                                {
-                                                    offset += w;
-                                                } else {
-                                                    platform.close_host_fd(host_fd);
-                                                    return;
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                                platform.close_host_fd(host_fd);
-                            });
-                            continue; // Skip the normal replacement path.
-                        }
-                    }
-
                     // Default path: create a virtual pipe pair and replace the fd.
                     // This is used for init (whose fds are host-backed, not virtual
                     // pipes) and for Write-direction replacements.
@@ -7938,7 +7846,6 @@ impl<FS: ShimFS> Task<FS> {
         guest_interp_image: Option<(&str, &[u8])>,
         vfork_info: Option<ExecVforkInfo>,
     ) -> Result<usize, Errno> {
-        use super::host_pipe::HostPipeDirection;
         #[cfg(feature = "trace_syscalls")]
         litebox::log_println!(
             self.global.platform,
@@ -7968,7 +7875,6 @@ impl<FS: ShimFS> Task<FS> {
             );
         }
 
-        let has_vfork_done = vfork_info.is_some();
         // Helper: signal VforkDone (if present) so the parent is never left
         // blocked on error.
         let signal_on_error = |vfork_info: &Option<ExecVforkInfo>| {
@@ -7987,30 +7893,6 @@ impl<FS: ShimFS> Task<FS> {
             );
             signal_on_error(&vfork_info);
         })?;
-
-        // Collect pipe_pair_ids + direction for pipe-backed stdio so we can
-        // map the direct-pipe fds back to the parent's counterpart by pair_id
-        // after spawn.  The child may dup2 a pipe to a different fd number
-        // between fork and exec, so pair_id matching is necessary.
-        let mut stdio_pipe_pair_ids: alloc::vec::Vec<(i32, usize, HostPipeDirection)> =
-            alloc::vec::Vec::new();
-        if has_vfork_done {
-            if let WorkerExecInputBinding::Pipe { ref pipes, ref fd } = worker_stdio.stdin
-                && let Ok(pair_id) = pipes.pipe_pair_id(fd.as_ref())
-            {
-                stdio_pipe_pair_ids.push((0, pair_id, HostPipeDirection::Read));
-            }
-            if let WorkerExecOutputBinding::Pipe { ref pipes, ref fd } = worker_stdio.stdout
-                && let Ok(pair_id) = pipes.pipe_pair_id(fd.as_ref())
-            {
-                stdio_pipe_pair_ids.push((1, pair_id, HostPipeDirection::Write));
-            }
-            if let WorkerExecOutputBinding::Pipe { ref pipes, ref fd } = worker_stdio.stderr
-                && let Ok(pair_id) = pipes.pipe_pair_id(fd.as_ref())
-            {
-                stdio_pipe_pair_ids.push((2, pair_id, HostPipeDirection::Write));
-            }
-        }
 
         // Resolve the worker load path through the current guest filesystem so
         // transferred images materialize at their real lower-tree locations
@@ -8033,7 +7915,12 @@ impl<FS: ShimFS> Task<FS> {
                 guest_exec_image,
                 guest_interp_image,
                 worker_stdio,
-                has_vfork_done,
+                // Always pass false: let the remote worker use the child's
+                // stdio bindings (pipes inherited from delayed-fork) rather
+                // than creating direct pipes + fd replacements.  This makes
+                // non-PIE exec transparent to the parent — data flows through
+                // the child's existing pipe chain, identical to PIE exec.
+                false,
             )
             .map_err(|_err| {
                 #[cfg(feature = "trace_syscalls")]
@@ -8047,87 +7934,10 @@ impl<FS: ShimFS> Task<FS> {
                 Errno::ENOMEM
             })?;
 
-        // Build pipe replacements for the parent and signal VforkDone so the
-        // parent can start using HostPipeFd for direct I/O to the child worker.
-        if let Some((vd, ref parent_pipe_fds)) = vfork_info {
-            let mut replacements: alloc::vec::Vec<crate::FdReplacement> = alloc::vec::Vec::new();
-            // Prevent double-claiming the same parent fd (e.g. 2>&1
-            // makes stdout and stderr share the same pair_id).
-            let mut claimed_parent_fds: alloc::vec::Vec<usize> = alloc::vec::Vec::new();
-            for dp in &spawn_result.direct_pipes {
-                // Look up the child's pair_id and direction for this stdio fd.
-                let child_info = stdio_pipe_pair_ids
-                    .iter()
-                    .find(|&&(fd, _, _)| fd == dp.child_stdio_fd);
-                let Some(&(_, child_pair_id, child_dir)) = child_info else {
-                    self.global.platform.close_host_fd(dp.parent_os_fd);
-                    continue;
-                };
-
-                // Find ONE parent counterpart by pair_id + opposite
-                // direction.  Use find() (not filter()) so each
-                // direct pipe claims at most one parent fd — when
-                // multiple direct pipes share a pair_id (e.g. 2>&1),
-                // each gets its own counterpart via claimed_parent_fds.
-                let pair_id_match: Option<(usize, super::host_pipe::HostPipeDirection)> =
-                    parent_pipe_fds
-                        .iter()
-                        .find(|&&(fd, dir, pid)| {
-                            pid == child_pair_id
-                                && dir != child_dir
-                                && !claimed_parent_fds.contains(&fd)
-                        })
-                        .map(|&(fd, dir, _)| (fd, dir));
-
-                // Fallback: match by fd number if pair_id matching
-                // found nothing (child may have close+pipe+dup2 after
-                // fork, creating a new pair the parent doesn't have).
-                let counterpart = if let Some(m) = pair_id_match {
-                    Some(m)
-                } else {
-                    let child_fd_usize = usize::try_from(dp.child_stdio_fd).unwrap_or(usize::MAX);
-                    let flow_dir = match child_dir {
-                        super::host_pipe::HostPipeDirection::Read => {
-                            super::host_pipe::HostPipeDirection::Write
-                        }
-                        super::host_pipe::HostPipeDirection::Write => {
-                            super::host_pipe::HostPipeDirection::Read
-                        }
-                    };
-                    parent_pipe_fds
-                        .iter()
-                        .find(|&&(fd, _, _)| {
-                            fd == child_fd_usize && !claimed_parent_fds.contains(&fd)
-                        })
-                        .map(|&(fd, _, _)| (fd, flow_dir))
-                };
-
-                if let Some((parent_fd, parent_dir)) = counterpart {
-                    claimed_parent_fds.push(parent_fd);
-                    replacements.push(crate::FdReplacement {
-                        guest_fd: parent_fd,
-                        host_fd: dp.parent_os_fd,
-                        direction: parent_dir,
-                        subsystem: crate::ReplacedSubsystem::Pipe,
-                    });
-                } else {
-                    // No counterpart in parent — close unused OS end.
-                    self.global.platform.close_host_fd(dp.parent_os_fd);
-                }
-            }
-
-            #[cfg(feature = "trace_syscalls")]
-            litebox::log_println!(
-                self.global.platform,
-                "[EXEC-REMOTE] pid={}: {} direct_pipes, {} replacements built, signaling VforkDone",
-                self.pid,
-                spawn_result.direct_pipes.len(),
-                replacements.len(),
-            );
-
-            if !replacements.is_empty() {
-                *vd.fd_replacements.lock() = replacements;
-            }
+        // Signal VforkDone so the parent can continue.  No fd replacements
+        // needed — the remote worker uses the child's stdio, which already
+        // connects to the parent's pipe chain.
+        if let Some((vd, _)) = &vfork_info {
             vd.signal();
         }
 
