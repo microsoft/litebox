@@ -1,0 +1,246 @@
+419   execve("/home/wportnoy/.vscode-server/bin/ae130017f8afe532557dbb8539a6ef3bdaec6389/node", ["/home/wportnoy/.vscode-server/bi"..., "/home/wportnoy/.vscode-server/bi"..., "--port", "9998", "--without-connection-token", "--accept-server-license-terms"], ["SHELL=/bin/bash", "WSL2_GUI_APPS_ENABLED=1", "WSL_DISTRO_NAME=Ubuntu", "WT_SESSION=cddede45-fd13-461d-ab"..., "NAME=CPC-wport-Z1BM3", "PWD=/mnt/c/src/litebox-syscall-a"..., "LOGNAME=wportnoy", "HOME=/home/wportnoy", "LANG=C.UTF-8", "WSL_INTEROP=/run/WSL/305_interop", "WAYLAND_DISPLAY=wayland-0", "TERM=xterm-256color", "USER=wportnoy", "DISPLAY=:0", "SHLVL=1", "XDG_RUNTIME_DIR=/run/user/1000/", "DEBUGINFOD_URLS=https://debuginf"..., "WSLENV=WT_SESSION:WT_PROFILE_ID:", "XDG_DATA_DIRS=/usr/local/share:/"..., "PATH=/home/wportnoy/.cargo/bin:/"..., "DBUS_SESSION_BUS_ADDRESS=unix:pa"..., "HOSTTYPE=x86_64", "PULSE_SERVER=unix:/mnt/wslg/Puls"..., "WT_PROFILE_ID={574e775e-4f2a-5b9"..., "OLDPWD=/mnt/c/src/litebox-syscal"..., "_=/usr/bin/timeout"]) = 0
+419   ioctl(0, TCGETS, {c_iflag=ICRNL|IXON, c_oflag=NL0|CR0|TAB0|BS0|VT0|FF0|OPOST|ONLCR, c_cflag=B38400|CS8|CREAD, c_lflag=ISIG|ICANON|ECHO|ECHOE|ECHOK|IEXTEN|ECHOCTL|ECHOKE, c_line=N_TTY, c_cc=[[VINTR]=0x3, [VQUIT]=0x1c, [VERASE]=0x7f, [VKILL]=0x15, [VEOF]=0x4, [VTIME]=0, [VMIN]=0x1, [VSWTC]=0, [VSTART]=0x11, [VSTOP]=0x13, [VSUSP]=0x1a, [VEOL]=0, [VREPRINT]=0x12, [VDISCARD]=0xf, [VWERASE]=0x17, [VLNEXT]=0x16, [VEOL2]=0, [17]=0, [18]=0]}) = 0
+419   ioctl(0, TCGETS, {c_iflag=ICRNL|IXON, c_oflag=NL0|CR0|TAB0|BS0|VT0|FF0|OPOST|ONLCR, c_cflag=B38400|CS8|CREAD, c_lflag=ISIG|ICANON|ECHO|ECHOE|ECHOK|IEXTEN|ECHOCTL|ECHOKE, c_line=N_TTY, c_cc=[[VINTR]=0x3, [VQUIT]=0x1c, [VERASE]=0x7f, [VKILL]=0x15, [VEOF]=0x4, [VTIME]=0, [VMIN]=0x1, [VSWTC]=0, [VSTART]=0x11, [VSTOP]=0x13, [VSUSP]=0x1a, [VEOL]=0, [VREPRINT]=0x12, [VDISCARD]=0xf, [VWERASE]=0x17, [VLNEXT]=0x16, [VEOL2]=0, [17]=0, [18]=0]}) = 0
+419   ioctl(1, TCGETS, {c_iflag=ICRNL|IXON, c_oflag=NL0|CR0|TAB0|BS0|VT0|FF0|OPOST|ONLCR, c_cflag=B38400|CS8|CREAD, c_lflag=ISIG|ICANON|ECHO|ECHOE|ECHOK|IEXTEN|ECHOCTL|ECHOKE, c_line=N_TTY, c_cc=[[VINTR]=0x3, [VQUIT]=0x1c, [VERASE]=0x7f, [VKILL]=0x15, [VEOF]=0x4, [VTIME]=0, [VMIN]=0x1, [VSWTC]=0, [VSTART]=0x11, [VSTOP]=0x13, [VSUSP]=0x1a, [VEOL]=0, [VREPRINT]=0x12, [VDISCARD]=0xf, [VWERASE]=0x17, [VLNEXT]=0x16, [VEOL2]=0, [17]=0, [18]=0]}) = 0
+419   ioctl(1, TCGETS, {c_iflag=ICRNL|IXON, c_oflag=NL0|CR0|TAB0|BS0|VT0|FF0|OPOST|ONLCR, c_cflag=B38400|CS8|CREAD, c_lflag=ISIG|ICANON|ECHO|ECHOE|ECHOK|IEXTEN|ECHOCTL|ECHOKE, c_line=N_TTY, c_cc=[[VINTR]=0x3, [VQUIT]=0x1c, [VERASE]=0x7f, [VKILL]=0x15, [VEOF]=0x4, [VTIME]=0, [VMIN]=0x1, [VSWTC]=0, [VSTART]=0x11, [VSTOP]=0x13, [VSUSP]=0x1a, [VEOL]=0, [VREPRINT]=0x12, [VDISCARD]=0xf, [VWERASE]=0x17, [VLNEXT]=0x16, [VEOL2]=0, [17]=0, [18]=0]}) = 0
+419   ioctl(2, TCGETS, 0x7ffc88329380)  = -1 ENOTTY (Inappropriate ioctl for device)
+419   pipe2([5, 6], O_CLOEXEC)          = 0
+419   pipe2([7, 8], O_NONBLOCK|O_CLOEXEC) = 0
+419   clone3({flags=CLONE_VM|CLONE_FS|CLONE_FILES|CLONE_SIGHAND|CLONE_THREAD|CLONE_SYSVSEM|CLONE_SETTLS|CLONE_PARENT_SETTID|CLONE_CHILD_CLEARTID, child_tid=0x7a8de19ff990, parent_tid=0x7a8de19ff990, exit_signal=0, stack=0x7a8de11ff000, stack_size=0x7ffe40, tls=0x7a8de19ff6c0} => {parent_tid=[420]}, 88) = 420
+420   pipe2([12, 13], O_NONBLOCK|O_CLOEXEC) = 0
+419   clone3({flags=CLONE_VM|CLONE_FS|CLONE_FILES|CLONE_SIGHAND|CLONE_THREAD|CLONE_SYSVSEM|CLONE_SETTLS|CLONE_PARENT_SETTID|CLONE_CHILD_CLEARTID, child_tid=0x7a8de11fe990, parent_tid=0x7a8de11fe990, exit_signal=0, stack=0x7a8de09fe000, stack_size=0x7ffe40, tls=0x7a8de11fe6c0} => {parent_tid=[421]}, 88) = 421
+419   clone3({flags=CLONE_VM|CLONE_FS|CLONE_FILES|CLONE_SIGHAND|CLONE_THREAD|CLONE_SYSVSEM|CLONE_SETTLS|CLONE_PARENT_SETTID|CLONE_CHILD_CLEARTID, child_tid=0x7a8de09fd990, parent_tid=0x7a8de09fd990, exit_signal=0, stack=0x7a8de01fd000, stack_size=0x7ffe40, tls=0x7a8de09fd6c0} => {parent_tid=[422]}, 88) = 422
+419   clone3({flags=CLONE_VM|CLONE_FS|CLONE_FILES|CLONE_SIGHAND|CLONE_THREAD|CLONE_SYSVSEM|CLONE_SETTLS|CLONE_PARENT_SETTID|CLONE_CHILD_CLEARTID, child_tid=0x7a8ddbfff990, parent_tid=0x7a8ddbfff990, exit_signal=0, stack=0x7a8ddb7ff000, stack_size=0x7ffe40, tls=0x7a8ddbfff6c0} => {parent_tid=[423]}, 88) = 423
+419   clone3({flags=CLONE_VM|CLONE_FS|CLONE_FILES|CLONE_SIGHAND|CLONE_THREAD|CLONE_SYSVSEM|CLONE_SETTLS|CLONE_PARENT_SETTID|CLONE_CHILD_CLEARTID, child_tid=0x7a8ddb7fe990, parent_tid=0x7a8ddb7fe990, exit_signal=0, stack=0x7a8ddaffe000, stack_size=0x7ffe40, tls=0x7a8ddb7fe6c0} => {parent_tid=[424]}, 88) = 424
+419   pipe2([17, 18], O_NONBLOCK|O_CLOEXEC) = 0
+419   clone3({flags=CLONE_VM|CLONE_FS|CLONE_FILES|CLONE_SIGHAND|CLONE_THREAD|CLONE_SYSVSEM|CLONE_SETTLS|CLONE_PARENT_SETTID|CLONE_CHILD_CLEARTID, child_tid=0x7a8de2097990, parent_tid=0x7a8de2097990, exit_signal=0, stack=0x7a8de208f000, stack_size=0x7e40, tls=0x7a8de20976c0} => {parent_tid=[425]}, 88) = 425
+419   ioctl(2, TCGETS, 0x7ffc88326e00)  = -1 ENOTTY (Inappropriate ioctl for device)
+419   clone3({flags=CLONE_VM|CLONE_FS|CLONE_FILES|CLONE_SIGHAND|CLONE_THREAD|CLONE_SYSVSEM|CLONE_SETTLS|CLONE_PARENT_SETTID|CLONE_CHILD_CLEARTID, child_tid=0x7a8dbafbf990, parent_tid=0x7a8dbafbf990, exit_signal=0, stack=0x7a8dba7bf000, stack_size=0x7ffe40, tls=0x7a8dbafbf6c0} => {parent_tid=[426]}, 88) = 426
+419   ioctl(1, TCGETS, {c_iflag=ICRNL|IXON, c_oflag=NL0|CR0|TAB0|BS0|VT0|FF0|OPOST|ONLCR, c_cflag=B38400|CS8|CREAD, c_lflag=ISIG|ICANON|ECHO|ECHOE|ECHOK|IEXTEN|ECHOCTL|ECHOKE, c_line=N_TTY, c_cc=[[VINTR]=0x3, [VQUIT]=0x1c, [VERASE]=0x7f, [VKILL]=0x15, [VEOF]=0x4, [VTIME]=0, [VMIN]=0x1, [VSWTC]=0, [VSTART]=0x11, [VSTOP]=0x13, [VSUSP]=0x1a, [VEOL]=0, [VREPRINT]=0x12, [VDISCARD]=0xf, [VWERASE]=0x17, [VLNEXT]=0x16, [VEOL2]=0, [17]=0, [18]=0]}) = 0
+419   ioctl(1, TCGETS, {c_iflag=ICRNL|IXON, c_oflag=NL0|CR0|TAB0|BS0|VT0|FF0|OPOST|ONLCR, c_cflag=B38400|CS8|CREAD, c_lflag=ISIG|ICANON|ECHO|ECHOE|ECHOK|IEXTEN|ECHOCTL|ECHOKE, c_line=N_TTY, c_cc=[[VINTR]=0x3, [VQUIT]=0x1c, [VERASE]=0x7f, [VKILL]=0x15, [VEOF]=0x4, [VTIME]=0, [VMIN]=0x1, [VSWTC]=0, [VSTART]=0x11, [VSTOP]=0x13, [VSUSP]=0x1a, [VEOL]=0, [VREPRINT]=0x12, [VDISCARD]=0xf, [VWERASE]=0x17, [VLNEXT]=0x16, [VEOL2]=0, [17]=0, [18]=0]}) = 0
+419   ioctl(1, TIOCGPTN, 0x7ffc88326150) = -1 ENOTTY (Inappropriate ioctl for device)
+419   ioctl(1, TCGETS, {c_iflag=ICRNL|IXON, c_oflag=NL0|CR0|TAB0|BS0|VT0|FF0|OPOST|ONLCR, c_cflag=B38400|CS8|CREAD, c_lflag=ISIG|ICANON|ECHO|ECHOE|ECHOK|IEXTEN|ECHOCTL|ECHOKE, c_line=N_TTY, c_cc=[[VINTR]=0x3, [VQUIT]=0x1c, [VERASE]=0x7f, [VKILL]=0x15, [VEOF]=0x4, [VTIME]=0, [VMIN]=0x1, [VSWTC]=0, [VSTART]=0x11, [VSTOP]=0x13, [VSUSP]=0x1a, [VEOL]=0, [VREPRINT]=0x12, [VDISCARD]=0xf, [VWERASE]=0x17, [VLNEXT]=0x16, [VEOL2]=0, [17]=0, [18]=0]}) = 0
+419   dup3(20, 1, O_CLOEXEC)            = 1
+419   ioctl(20, FIONBIO, [1])           = 0
+419   ioctl(20, FIONBIO, [0])           = 0
+419   ioctl(20, TIOCGWINSZ, {ws_row=80, ws_col=120, ws_xpixel=0, ws_ypixel=0}) = 0
+419   clone3({flags=CLONE_VM|CLONE_FS|CLONE_FILES|CLONE_SIGHAND|CLONE_THREAD|CLONE_SYSVSEM|CLONE_SETTLS|CLONE_PARENT_SETTID|CLONE_CHILD_CLEARTID, child_tid=0x7a8dba7be990, parent_tid=0x7a8dba7be990, exit_signal=0, stack=0x7a8db9fbe000, stack_size=0x7ffe40, tls=0x7a8dba7be6c0} => {parent_tid=[427]}, 88) = 427
+419   clone3({flags=CLONE_VM|CLONE_FS|CLONE_FILES|CLONE_SIGHAND|CLONE_THREAD|CLONE_SYSVSEM|CLONE_SETTLS|CLONE_PARENT_SETTID|CLONE_CHILD_CLEARTID, child_tid=0x7a8db9fbd990, parent_tid=0x7a8db9fbd990, exit_signal=0, stack=0x7a8db97bd000, stack_size=0x7ffe40, tls=0x7a8db9fbd6c0} => {parent_tid=[428]}, 88) = 428
+419   clone3({flags=CLONE_VM|CLONE_FS|CLONE_FILES|CLONE_SIGHAND|CLONE_THREAD|CLONE_SYSVSEM|CLONE_SETTLS|CLONE_PARENT_SETTID|CLONE_CHILD_CLEARTID, child_tid=0x7a8db97bc990, parent_tid=0x7a8db97bc990, exit_signal=0, stack=0x7a8db8fbc000, stack_size=0x7ffe40, tls=0x7a8db97bc6c0} => {parent_tid=[429]}, 88) = 429
+419   clone3({flags=CLONE_VM|CLONE_FS|CLONE_FILES|CLONE_SIGHAND|CLONE_THREAD|CLONE_SYSVSEM|CLONE_SETTLS|CLONE_PARENT_SETTID|CLONE_CHILD_CLEARTID, child_tid=0x7a8db8fbb990, parent_tid=0x7a8db8fbb990, exit_signal=0, stack=0x7a8db87bb000, stack_size=0x7ffe40, tls=0x7a8db8fbb6c0} => {parent_tid=[430]}, 88) = 430
+427   socket(AF_UNIX, SOCK_STREAM|SOCK_CLOEXEC|SOCK_NONBLOCK, 0) = 22
+427   connect(22, {sa_family=AF_UNIX, sun_path="/var/run/nscd/socket"}, 110) = -1 ENOENT (No such file or directory)
+427   socket(AF_UNIX, SOCK_STREAM|SOCK_CLOEXEC|SOCK_NONBLOCK, 0) = 22
+427   connect(22, {sa_family=AF_UNIX, sun_path="/var/run/nscd/socket"}, 110) = -1 ENOENT (No such file or directory)
+426   +++ exited with 0 +++
+419   socket(AF_INET, SOCK_STREAM|SOCK_CLOEXEC|SOCK_NONBLOCK, IPPROTO_IP) = 22
+419   setsockopt(22, SOL_SOCKET, SO_REUSEADDR, [1], 4) = 0
+419   bind(22, {sa_family=AF_INET, sin_port=htons(9998), sin_addr=inet_addr("127.0.0.1")}, 16) = 0
+419   listen(22, 511)                   = 0
+419   getsockname(22, {sa_family=AF_INET, sin_port=htons(9998), sin_addr=inet_addr("127.0.0.1")}, [128 => 16]) = 0
+419   socket(AF_NETLINK, SOCK_RAW|SOCK_CLOEXEC, NETLINK_ROUTE) = 23
+419   bind(23, {sa_family=AF_NETLINK, nl_pid=0, nl_groups=00000000}, 12) = 0
+419   getsockname(23, {sa_family=AF_NETLINK, nl_pid=419, nl_groups=00000000}, [12]) = 0
+419   ioctl(1, TCGETS, {c_iflag=ICRNL|IXON, c_oflag=NL0|CR0|TAB0|BS0|VT0|FF0|OPOST|ONLCR, c_cflag=B38400|CS8|CREAD, c_lflag=ISIG|ICANON|ECHO|ECHOE|ECHOK|IEXTEN|ECHOCTL|ECHOKE, c_line=N_TTY, c_cc=[[VINTR]=0x3, [VQUIT]=0x1c, [VERASE]=0x7f, [VKILL]=0x15, [VEOF]=0x4, [VTIME]=0, [VMIN]=0x1, [VSWTC]=0, [VSTART]=0x11, [VSTOP]=0x13, [VSUSP]=0x1a, [VEOL]=0, [VREPRINT]=0x12, [VDISCARD]=0xf, [VWERASE]=0x17, [VLNEXT]=0x16, [VEOL2]=0, [17]=0, [18]=0]}) = 0
+419   socketpair(AF_UNIX, SOCK_STREAM|SOCK_CLOEXEC, 0, [26, 28]) = 0
+419   setsockopt(26, SOL_SOCKET, SO_RCVBUF, [65536], 4) = 0
+419   setsockopt(26, SOL_SOCKET, SO_SNDBUF, [65536], 4) = 0
+419   setsockopt(28, SOL_SOCKET, SO_RCVBUF, [65536], 4) = 0
+419   setsockopt(28, SOL_SOCKET, SO_SNDBUF, [65536], 4) = 0
+419   socketpair(AF_UNIX, SOCK_STREAM|SOCK_CLOEXEC, 0, [29, 30]) = 0
+419   setsockopt(29, SOL_SOCKET, SO_RCVBUF, [65536], 4) = 0
+419   setsockopt(29, SOL_SOCKET, SO_SNDBUF, [65536], 4) = 0
+419   setsockopt(30, SOL_SOCKET, SO_RCVBUF, [65536], 4) = 0
+419   setsockopt(30, SOL_SOCKET, SO_SNDBUF, [65536], 4) = 0
+419   pipe2([31, 32], O_CLOEXEC)        = 0
+419   clone(child_stack=NULL, flags=CLONE_CHILD_CLEARTID|CLONE_CHILD_SETTID|SIGCHLD, child_tidptr=0x7a8de20cdf90) = 431
+431   pipe2([5, 6], O_CLOEXEC)          = 0
+431   dup2(28, 1)                       = 1
+431   dup2(30, 2)                       = 2
+431   execve("/bin/bash", ["/bin/bash", "-i", "-l", "-c", "'/home/wportnoy/.vscode-server/b"...], ["SHELL=/bin/bash", "WSL2_GUI_APPS_ENABLED=1", "WSL_DISTRO_NAME=Ubuntu", "WT_SESSION=cddede45-fd13-461d-ab"..., "NAME=CPC-wport-Z1BM3", "PWD=/mnt/c/src/litebox-syscall-a"..., "LOGNAME=wportnoy", "HOME=/home/wportnoy", "LANG=C.UTF-8", "WSL_INTEROP=/run/WSL/305_interop", "WAYLAND_DISPLAY=wayland-0", "TERM=xterm-256color", "USER=wportnoy", "DISPLAY=:0", "SHLVL=1", "XDG_RUNTIME_DIR=/run/user/1000/", "DEBUGINFOD_URLS=https://debuginf"..., "WSLENV=WT_SESSION:WT_PROFILE_ID:", "XDG_DATA_DIRS=/usr/local/share:/"..., "PATH=/home/wportnoy/.cargo/bin:/"..., "DBUS_SESSION_BUS_ADDRESS=unix:pa"..., "HOSTTYPE=x86_64", "PULSE_SERVER=unix:/mnt/wslg/Puls"..., "WT_PROFILE_ID={574e775e-4f2a-5b9"..., "OLDPWD=/mnt/c/src/litebox-syscal"..., "_=/usr/bin/timeout", "VSCODE_CWD=/mnt/c/src/litebox-sy"..., "VSCODE_NLS_CONFIG={\"userLocale\":"..., "VSCODE_HANDLES_SIGPIPE=true", "ELECTRON_RUN_AS_NODE=1", "ELECTRON_NO_ATTACH_CONSOLE=1", "VSCODE_RESOLVING_ENVIRONMENT=1"]) = 0
+419   ioctl(26, FIONBIO, [1])           = 0
+419   ioctl(29, FIONBIO, [1])           = 0
+431   ioctl(0, TCGETS, 0x7fff4d798060)  = -1 ENOTTY (Inappropriate ioctl for device)
+431   socket(AF_UNIX, SOCK_STREAM|SOCK_CLOEXEC|SOCK_NONBLOCK, 0) = 3
+431   connect(3, {sa_family=AF_UNIX, sun_path="/var/run/nscd/socket"}, 110) = -1 ENOENT (No such file or directory)
+431   socket(AF_UNIX, SOCK_STREAM|SOCK_CLOEXEC|SOCK_NONBLOCK, 0) = 3
+431   connect(3, {sa_family=AF_UNIX, sun_path="/var/run/nscd/socket"}, 110) = -1 ENOENT (No such file or directory)
+431   ioctl(2, TCGETS, 0x7fff4d797ef0)  = -1 ENOTTY (Inappropriate ioctl for device)
+431   dup2(3, 255)                      = 255
+431   ioctl(255, TIOCGPGRP, 0x7fff4d797f74) = -1 ENOTTY (Inappropriate ioctl for device)
+431   ioctl(255, TIOCGPGRP, 0x7fff4d797f74) = -1 ENOTTY (Inappropriate ioctl for device)
+431   ioctl(255, TIOCGPGRP, 0x7fff4d797f24) = -1 ENOTTY (Inappropriate ioctl for device)
+431   ioctl(255, TCGETS, 0x7fff4d797f40) = -1 ENOTTY (Inappropriate ioctl for device)
+431   ioctl(255, TIOCGPGRP, 0x7fff4d7980d4) = -1 ENOTTY (Inappropriate ioctl for device)
+431   pipe2([3, 4], 0)                  = 0
+431   clone(child_stack=NULL, flags=CLONE_CHILD_CLEARTID|CLONE_CHILD_SETTID|SIGCHLD, child_tidptr=0x7bd0c6587a10) = 432
+432   dup2(4, 1)                        = 1
+432   execve("/usr/bin/locale-check", ["/usr/bin/locale-check", "C.UTF-8"], ["SHELL=/bin/bash", "WSL2_GUI_APPS_ENABLED=1", "WSL_DISTRO_NAME=Ubuntu", "WT_SESSION=cddede45-fd13-461d-ab"..., "ELECTRON_RUN_AS_NODE=1", "NAME=CPC-wport-Z1BM3", "PWD=/mnt/c/src/litebox-syscall-a"..., "LOGNAME=wportnoy", "HOME=/home/wportnoy", "LANG=C.UTF-8", "WSL_INTEROP=/run/WSL/305_interop", "WAYLAND_DISPLAY=wayland-0", "VSCODE_HANDLES_SIGPIPE=true", "TERM=xterm-256color", "USER=wportnoy", "DISPLAY=:0", "SHLVL=1", "VSCODE_CWD=/mnt/c/src/litebox-sy"..., "XDG_RUNTIME_DIR=/run/user/1000/", "DEBUGINFOD_URLS=https://debuginf"..., "WSLENV=WT_SESSION:WT_PROFILE_ID:", "ELECTRON_NO_ATTACH_CONSOLE=1", "XDG_DATA_DIRS=/usr/local/share:/"..., "PATH=/home/wportnoy/.cargo/bin:/"..., "VSCODE_RESOLVING_ENVIRONMENT=1", "DBUS_SESSION_BUS_ADDRESS=unix:pa"..., "VSCODE_NLS_CONFIG={\"userLocale\":"..., "HOSTTYPE=x86_64", "PULSE_SERVER=unix:/mnt/wslg/Puls"..., "WT_PROFILE_ID={574e775e-4f2a-5b9"..., "OLDPWD=/mnt/c/src/litebox-syscal"..., "_=/usr/bin/locale-check"]) = 0
+432   +++ exited with 0 +++
+431   --- SIGCHLD {si_signo=SIGCHLD, si_code=CLD_EXITED, si_pid=432, si_uid=1000, si_status=0, si_utime=0, si_stime=0} ---
+431   pipe2([3, 4], 0)                  = 0
+431   clone(child_stack=NULL, flags=CLONE_CHILD_CLEARTID|CLONE_CHILD_SETTID|SIGCHLD, child_tidptr=0x7bd0c6587a10) = 433
+433   dup2(4, 1 <unfinished ...>
+431   clone(child_stack=NULL, flags=CLONE_CHILD_CLEARTID|CLONE_CHILD_SETTID|SIGCHLD <unfinished ...>
+433   <... dup2 resumed>)               = 1
+431   <... clone resumed>, child_tidptr=0x7bd0c6587a10) = 434
+434   dup2(3, 0)                        = 0
+434   ioctl(255, TIOCGPGRP, 0x7fff4d7969c4) = -1 ENOTTY (Inappropriate ioctl for device)
+434   dup2(3, 1)                        = 1
+434   ioctl(1, TCGETS, 0x7fff4d793bd0)  = -1 ENOTTY (Inappropriate ioctl for device)
+434   dup2(10, 1)                       = 1
+434   ioctl(0, TCGETS, 0x7fff4d793f60)  = -1 ENOTTY (Inappropriate ioctl for device)
+433   dup2(1, 2)                        = 2
+433   execve("/usr/bin/locale", ["locale"], ["SHELL=/bin/bash", "WSL2_GUI_APPS_ENABLED=1", "WSL_DISTRO_NAME=Ubuntu", "WT_SESSION=cddede45-fd13-461d-ab"..., "ELECTRON_RUN_AS_NODE=1", "NAME=CPC-wport-Z1BM3", "PWD=/mnt/c/src/litebox-syscall-a"..., "LOGNAME=wportnoy", "HOME=/home/wportnoy", "LANG=C.UTF-8", "WSL_INTEROP=/run/WSL/305_interop", "WAYLAND_DISPLAY=wayland-0", "VSCODE_HANDLES_SIGPIPE=true", "TERM=xterm-256color", "USER=wportnoy", "DISPLAY=:0", "SHLVL=2", "VSCODE_CWD=/mnt/c/src/litebox-sy"..., "XDG_RUNTIME_DIR=/run/user/1000/", "DEBUGINFOD_URLS=https://debuginf"..., "WSLENV=WT_SESSION:WT_PROFILE_ID:", "ELECTRON_NO_ATTACH_CONSOLE=1", "XDG_DATA_DIRS=/usr/local/share:/"..., "PATH=/home/wportnoy/.cargo/bin:/"..., "VSCODE_RESOLVING_ENVIRONMENT=1", "DBUS_SESSION_BUS_ADDRESS=unix:pa"..., "VSCODE_NLS_CONFIG={\"userLocale\":"..., "HOSTTYPE=x86_64", "PULSE_SERVER=unix:/mnt/wslg/Puls"..., "WT_PROFILE_ID={574e775e-4f2a-5b9"..., "OLDPWD=/mnt/c/src/litebox-syscal"..., "_=/usr/bin/locale"]) = 0
+433   +++ exited with 0 +++
+434   ioctl(0, TCGETS, 0x7fff4d793f60)  = -1 ENOTTY (Inappropriate ioctl for device)
+434   ioctl(0, TCGETS, 0x7fff4d793f60)  = -1 ENOTTY (Inappropriate ioctl for device)
+434   ioctl(0, TCGETS, 0x7fff4d793f60)  = -1 ENOTTY (Inappropriate ioctl for device)
+434   ioctl(0, TCGETS, 0x7fff4d793f60)  = -1 ENOTTY (Inappropriate ioctl for device)
+434   ioctl(0, TCGETS, 0x7fff4d793f60)  = -1 ENOTTY (Inappropriate ioctl for device)
+434   ioctl(0, TCGETS, 0x7fff4d793f60)  = -1 ENOTTY (Inappropriate ioctl for device)
+434   ioctl(0, TCGETS, 0x7fff4d793f60)  = -1 ENOTTY (Inappropriate ioctl for device)
+434   ioctl(0, TCGETS, 0x7fff4d793f60)  = -1 ENOTTY (Inappropriate ioctl for device)
+434   ioctl(0, TCGETS, 0x7fff4d793f60)  = -1 ENOTTY (Inappropriate ioctl for device)
+434   ioctl(0, TCGETS, 0x7fff4d793f60)  = -1 ENOTTY (Inappropriate ioctl for device)
+434   ioctl(0, TCGETS, 0x7fff4d793f60)  = -1 ENOTTY (Inappropriate ioctl for device)
+434   ioctl(0, TCGETS, 0x7fff4d793f60)  = -1 ENOTTY (Inappropriate ioctl for device)
+434   ioctl(0, TCGETS, 0x7fff4d793f60)  = -1 ENOTTY (Inappropriate ioctl for device)
+434   ioctl(0, TCGETS, 0x7fff4d793f60)  = -1 ENOTTY (Inappropriate ioctl for device)
+434   ioctl(0, TCGETS, 0x7fff4d793f60)  = -1 ENOTTY (Inappropriate ioctl for device)
+434   +++ exited with 0 +++
+431   ioctl(255, TCGETS, 0x7fff4d796900) = -1 ENOTTY (Inappropriate ioctl for device)
+431   --- SIGCHLD {si_signo=SIGCHLD, si_code=CLD_EXITED, si_pid=433, si_uid=1000, si_status=0, si_utime=0, si_stime=1 /* 0.01 s */} ---
+431   dup2(2, 1)                        = 1
+431   dup2(3, 1)                        = 1
+431   ioctl(1, TCGETS, 0x7fff4d795300)  = -1 ENOTTY (Inappropriate ioctl for device)
+431   dup2(11, 1)                       = 1
+431   dup2(10, 1)                       = 1
+431   dup2(3, 1)                        = 1
+431   dup2(1, 2)                        = 2
+431   dup2(11, 2)                       = 2
+431   dup2(10, 1)                       = 1
+431   pipe2([3, 4], 0)                  = 0
+431   clone(child_stack=NULL, flags=CLONE_CHILD_CLEARTID|CLONE_CHILD_SETTID|SIGCHLD, child_tidptr=0x7bd0c6587a10) = 435
+435   dup2(4, 1)                        = 1
+431   clone(child_stack=NULL, flags=CLONE_CHILD_CLEARTID|CLONE_CHILD_SETTID|SIGCHLD, child_tidptr=0x7bd0c6587a10) = 436
+435   ioctl(255, TIOCGPGRP, 0x7fff4d7969c4) = -1 ENOTTY (Inappropriate ioctl for device)
+436   dup2(3, 0)                        = 0
+435   +++ exited with 0 +++
+436   execve("/usr/bin/grep", ["grep", "-qs", "i"], ["SHELL=/bin/bash", "WSL2_GUI_APPS_ENABLED=1", "WSL_DISTRO_NAME=Ubuntu", "WT_SESSION=cddede45-fd13-461d-ab"..., "ELECTRON_RUN_AS_NODE=1", "NAME=CPC-wport-Z1BM3", "PWD=/mnt/c/src/litebox-syscall-a"..., "LOGNAME=wportnoy", "HOME=/home/wportnoy", "LANG=C.UTF-8", "WSL_INTEROP=/run/WSL/305_interop", "WAYLAND_DISPLAY=wayland-0", "VSCODE_HANDLES_SIGPIPE=true", "TERM=xterm-256color", "USER=wportnoy", "DISPLAY=:0", "SHLVL=2", "VSCODE_CWD=/mnt/c/src/litebox-sy"..., "XDG_RUNTIME_DIR=/run/user/1000/", "DEBUGINFOD_URLS=https://debuginf"..., "WSLENV=WT_SESSION:WT_PROFILE_ID:", "ELECTRON_NO_ATTACH_CONSOLE=1", "XDG_DATA_DIRS=/usr/local/share:/"..., "PATH=/home/wportnoy/.cargo/bin:/"..., "VSCODE_RESOLVING_ENVIRONMENT=1", "DBUS_SESSION_BUS_ADDRESS=unix:pa"..., "VSCODE_NLS_CONFIG={\"userLocale\":"..., "HOSTTYPE=x86_64", "PULSE_SERVER=unix:/mnt/wslg/Puls"..., "WT_PROFILE_ID={574e775e-4f2a-5b9"..., "OLDPWD=/mnt/c/src/litebox-syscal"..., "_=/usr/bin/grep"]) = 0
+436   +++ exited with 0 +++
+431   ioctl(255, TCGETS, 0x7fff4d796900) = -1 ENOTTY (Inappropriate ioctl for device)
+431   --- SIGCHLD {si_signo=SIGCHLD, si_code=CLD_EXITED, si_pid=435, si_uid=1000, si_status=0, si_utime=0, si_stime=0} ---
+431   pipe2([3, 4], 0)                  = 0
+431   clone(child_stack=NULL, flags=CLONE_CHILD_CLEARTID|CLONE_CHILD_SETTID|SIGCHLD, child_tidptr=0x7bd0c6587a10) = 437
+437   dup2(4, 1)                        = 1
+431   clone(child_stack=NULL, flags=CLONE_CHILD_CLEARTID|CLONE_CHILD_SETTID|SIGCHLD, child_tidptr=0x7bd0c6587a10) = 438
+438   dup2(3, 0)                        = 0
+437   dup2(3, 2)                        = 2
+437   execve("/usr/bin/find", ["find", "/home/wportnoy/.motd_shown", "-newermt", "today 0:00"], ["SHELL=/bin/bash", "WSL2_GUI_APPS_ENABLED=1", "WSL_DISTRO_NAME=Ubuntu", "WT_SESSION=cddede45-fd13-461d-ab"..., "ELECTRON_RUN_AS_NODE=1", "NAME=CPC-wport-Z1BM3", "PWD=/mnt/c/src/litebox-syscall-a"..., "LOGNAME=wportnoy", "HOME=/home/wportnoy", "LANG=C.UTF-8", "WSL_INTEROP=/run/WSL/305_interop", "WAYLAND_DISPLAY=wayland-0", "VSCODE_HANDLES_SIGPIPE=true", "TERM=xterm-256color", "USER=wportnoy", "DISPLAY=:0", "SHLVL=2", "VSCODE_CWD=/mnt/c/src/litebox-sy"..., "XDG_RUNTIME_DIR=/run/user/1000/", "DEBUGINFOD_URLS=https://debuginf"..., "WSLENV=WT_SESSION:WT_PROFILE_ID:", "ELECTRON_NO_ATTACH_CONSOLE=1", "XDG_DATA_DIRS=/usr/local/share:/"..., "PATH=/home/wportnoy/.cargo/bin:/"..., "VSCODE_RESOLVING_ENVIRONMENT=1", "DBUS_SESSION_BUS_ADDRESS=unix:pa"..., "VSCODE_NLS_CONFIG={\"userLocale\":"..., "HOSTTYPE=x86_64", "PULSE_SERVER=unix:/mnt/wslg/Puls"..., "WT_PROFILE_ID={574e775e-4f2a-5b9"..., "OLDPWD=/mnt/c/src/litebox-syscal"..., "_=/usr/bin/find"] <unfinished ...>
+438   execve("/usr/bin/grep", ["grep", "-q", "-m", "1", "."], ["SHELL=/bin/bash", "WSL2_GUI_APPS_ENABLED=1", "WSL_DISTRO_NAME=Ubuntu", "WT_SESSION=cddede45-fd13-461d-ab"..., "ELECTRON_RUN_AS_NODE=1", "NAME=CPC-wport-Z1BM3", "PWD=/mnt/c/src/litebox-syscall-a"..., "LOGNAME=wportnoy", "HOME=/home/wportnoy", "LANG=C.UTF-8", "WSL_INTEROP=/run/WSL/305_interop", "WAYLAND_DISPLAY=wayland-0", "VSCODE_HANDLES_SIGPIPE=true", "TERM=xterm-256color", "USER=wportnoy", "DISPLAY=:0", "SHLVL=2", "VSCODE_CWD=/mnt/c/src/litebox-sy"..., "XDG_RUNTIME_DIR=/run/user/1000/", "DEBUGINFOD_URLS=https://debuginf"..., "WSLENV=WT_SESSION:WT_PROFILE_ID:", "ELECTRON_NO_ATTACH_CONSOLE=1", "XDG_DATA_DIRS=/usr/local/share:/"..., "PATH=/home/wportnoy/.cargo/bin:/"..., "VSCODE_RESOLVING_ENVIRONMENT=1", "DBUS_SESSION_BUS_ADDRESS=unix:pa"..., "VSCODE_NLS_CONFIG={\"userLocale\":"..., "HOSTTYPE=x86_64", "PULSE_SERVER=unix:/mnt/wslg/Puls"..., "WT_PROFILE_ID={574e775e-4f2a-5b9"..., "OLDPWD=/mnt/c/src/litebox-syscal"..., "_=/usr/bin/grep"] <unfinished ...>
+437   <... execve resumed>)             = 0
+438   <... execve resumed>)             = 0
+437   ioctl(0, TCGETS, 0x7ffc62cfda10)  = -1 ENOTTY (Inappropriate ioctl for device)
+437   ioctl(1, TCGETS, 0x7ffc62cfd8f0)  = -1 ENOTTY (Inappropriate ioctl for device)
+438   +++ exited with 0 +++
+437   +++ exited with 0 +++
+431   ioctl(255, TCGETS, 0x7fff4d796680) = -1 ENOTTY (Inappropriate ioctl for device)
+431   --- SIGCHLD {si_signo=SIGCHLD, si_code=CLD_EXITED, si_pid=438, si_uid=1000, si_status=0, si_utime=0, si_stime=0} ---
+431   pipe2([3, 4], 0)                  = 0
+431   clone(child_stack=NULL, flags=CLONE_CHILD_CLEARTID|CLONE_CHILD_SETTID|SIGCHLD, child_tidptr=0x7bd0c6587a10) = 439
+439   dup2(4, 1)                        = 1
+439   execve("/usr/bin/lesspipe", ["lesspipe"], ["SHELL=/bin/sh", "WSL2_GUI_APPS_ENABLED=1", "WSL_DISTRO_NAME=Ubuntu", "WT_SESSION=cddede45-fd13-461d-ab"..., "ELECTRON_RUN_AS_NODE=1", "NAME=CPC-wport-Z1BM3", "PWD=/mnt/c/src/litebox-syscall-a"..., "LOGNAME=wportnoy", "HOME=/home/wportnoy", "LANG=C.UTF-8", "WSL_INTEROP=/run/WSL/305_interop", "WAYLAND_DISPLAY=wayland-0", "VSCODE_HANDLES_SIGPIPE=true", "TERM=xterm-256color", "USER=wportnoy", "DISPLAY=:0", "SHLVL=1", "VSCODE_CWD=/mnt/c/src/litebox-sy"..., "XDG_RUNTIME_DIR=/run/user/1000/", "DEBUGINFOD_URLS=https://debuginf"..., "WSLENV=WT_SESSION:WT_PROFILE_ID:", "ELECTRON_NO_ATTACH_CONSOLE=1", "XDG_DATA_DIRS=/usr/local/share:/"..., "PATH=/home/wportnoy/.cargo/bin:/"..., "VSCODE_RESOLVING_ENVIRONMENT=1", "DBUS_SESSION_BUS_ADDRESS=unix:pa"..., "VSCODE_NLS_CONFIG={\"userLocale\":"..., "HOSTTYPE=x86_64", "PULSE_SERVER=unix:/mnt/wslg/Puls"..., "WT_PROFILE_ID={574e775e-4f2a-5b9"..., "OLDPWD=/mnt/c/src/litebox-syscal"..., "_=/usr/bin/lesspipe"]) = 0
+439   pipe2([3, 4], 0)                  = 0
+439   clone(child_stack=NULL, flags=CLONE_CHILD_CLEARTID|CLONE_CHILD_SETTID|SIGCHLD, child_tidptr=0x784bc99c7a10) = 440
+440   dup2(4, 1)                        = 1
+440   execve("/usr/bin/basename", ["basename", "/usr/bin/lesspipe"], ["VSCODE_CWD=/mnt/c/src/litebox-sy"..., "USER=wportnoy", "VSCODE_NLS_CONFIG={\"userLocale\":"..., "SHLVL=1", "WT_PROFILE_ID={574e775e-4f2a-5b9"..., "HOME=/home/wportnoy", "OLDPWD=/mnt/c/src/litebox-syscal"..., "DBUS_SESSION_BUS_ADDRESS=unix:pa"..., "WSL_DISTRO_NAME=Ubuntu", "DEBUGINFOD_URLS=https://debuginf"..., "WAYLAND_DISPLAY=wayland-0", "LOGNAME=wportnoy", "NAME=CPC-wport-Z1BM3", "WSL_INTEROP=/run/WSL/305_interop", "VSCODE_HANDLES_SIGPIPE=true", "PULSE_SERVER=unix:/mnt/wslg/Puls"..., "_=/usr/bin/lesspipe", "TERM=xterm-256color", "VSCODE_RESOLVING_ENVIRONMENT=1", "PATH=/home/wportnoy/.cargo/bin:/"..., "WT_SESSION=cddede45-fd13-461d-ab"..., "XDG_RUNTIME_DIR=/run/user/1000/", "DISPLAY=:0", "LANG=C.UTF-8", "SHELL=/bin/sh", "ELECTRON_RUN_AS_NODE=1", "PWD=/mnt/c/src/litebox-syscall-a"..., "XDG_DATA_DIRS=/usr/local/share:/"..., "WSL2_GUI_APPS_ENABLED=1", "ELECTRON_NO_ATTACH_CONSOLE=1", "HOSTTYPE=x86_64", "WSLENV=WT_SESSION:WT_PROFILE_ID:"]) = 0
+440   +++ exited with 0 +++
+439   --- SIGCHLD {si_signo=SIGCHLD, si_code=CLD_EXITED, si_pid=440, si_uid=1000, si_status=0, si_utime=0, si_stime=0} ---
+439   pipe2([3, 4], 0)                  = 0
+439   clone(child_stack=NULL, flags=CLONE_CHILD_CLEARTID|CLONE_CHILD_SETTID|SIGCHLD, child_tidptr=0x784bc99c7a10) = 441
+441   dup2(4, 1)                        = 1
+441   pipe2([3, 4], 0)                  = 0
+441   clone(child_stack=NULL, flags=CLONE_CHILD_CLEARTID|CLONE_CHILD_SETTID|SIGCHLD, child_tidptr=0x784bc99c7a10) = 442
+442   dup2(4, 1)                        = 1
+442   execve("/usr/bin/dirname", ["dirname", "/usr/bin/lesspipe"], ["VSCODE_CWD=/mnt/c/src/litebox-sy"..., "USER=wportnoy", "VSCODE_NLS_CONFIG={\"userLocale\":"..., "SHLVL=1", "WT_PROFILE_ID={574e775e-4f2a-5b9"..., "HOME=/home/wportnoy", "OLDPWD=/mnt/c/src/litebox-syscal"..., "DBUS_SESSION_BUS_ADDRESS=unix:pa"..., "WSL_DISTRO_NAME=Ubuntu", "DEBUGINFOD_URLS=https://debuginf"..., "WAYLAND_DISPLAY=wayland-0", "LOGNAME=wportnoy", "NAME=CPC-wport-Z1BM3", "WSL_INTEROP=/run/WSL/305_interop", "VSCODE_HANDLES_SIGPIPE=true", "PULSE_SERVER=unix:/mnt/wslg/Puls"..., "_=/usr/bin/lesspipe", "TERM=xterm-256color", "VSCODE_RESOLVING_ENVIRONMENT=1", "PATH=/home/wportnoy/.cargo/bin:/"..., "WT_SESSION=cddede45-fd13-461d-ab"..., "XDG_RUNTIME_DIR=/run/user/1000/", "DISPLAY=:0", "LANG=C.UTF-8", "SHELL=/bin/sh", "ELECTRON_RUN_AS_NODE=1", "PWD=/mnt/c/src/litebox-syscall-a"..., "XDG_DATA_DIRS=/usr/local/share:/"..., "WSL2_GUI_APPS_ENABLED=1", "ELECTRON_NO_ATTACH_CONSOLE=1", "HOSTTYPE=x86_64", "WSLENV=WT_SESSION:WT_PROFILE_ID:"]) = 0
+442   +++ exited with 0 +++
+441   --- SIGCHLD {si_signo=SIGCHLD, si_code=CLD_EXITED, si_pid=442, si_uid=1000, si_status=0, si_utime=0, si_stime=2 /* 0.02 s */} ---
+441   +++ exited with 0 +++
+439   --- SIGCHLD {si_signo=SIGCHLD, si_code=CLD_EXITED, si_pid=441, si_uid=1000, si_status=0, si_utime=0, si_stime=0} ---
+439   +++ exited with 0 +++
+431   --- SIGCHLD {si_signo=SIGCHLD, si_code=CLD_EXITED, si_pid=439, si_uid=1000, si_status=0, si_utime=0, si_stime=1 /* 0.01 s */} ---
+431   pipe2([3, 4], 0)                  = 0
+431   clone(child_stack=NULL, flags=CLONE_CHILD_CLEARTID|CLONE_CHILD_SETTID|SIGCHLD, child_tidptr=0x7bd0c6587a10) = 443
+443   dup2(4, 1)                        = 1
+443   execve("/usr/bin/dircolors", ["dircolors", "-b"], ["SHELL=/bin/bash", "WSL2_GUI_APPS_ENABLED=1", "WSL_DISTRO_NAME=Ubuntu", "WT_SESSION=cddede45-fd13-461d-ab"..., "ELECTRON_RUN_AS_NODE=1", "NAME=CPC-wport-Z1BM3", "PWD=/mnt/c/src/litebox-syscall-a"..., "LOGNAME=wportnoy", "HOME=/home/wportnoy", "LANG=C.UTF-8", "WSL_INTEROP=/run/WSL/305_interop", "WAYLAND_DISPLAY=wayland-0", "LESSCLOSE=/usr/bin/lesspipe %s %"..., "VSCODE_HANDLES_SIGPIPE=true", "TERM=xterm-256color", "LESSOPEN=| /usr/bin/lesspipe %s", "USER=wportnoy", "DISPLAY=:0", "SHLVL=1", "VSCODE_CWD=/mnt/c/src/litebox-sy"..., "XDG_RUNTIME_DIR=/run/user/1000/", "DEBUGINFOD_URLS=https://debuginf"..., "WSLENV=WT_SESSION:WT_PROFILE_ID:", "ELECTRON_NO_ATTACH_CONSOLE=1", "XDG_DATA_DIRS=/usr/local/share:/"..., "PATH=/home/wportnoy/.cargo/bin:/"..., "VSCODE_RESOLVING_ENVIRONMENT=1", "DBUS_SESSION_BUS_ADDRESS=unix:pa"..., "VSCODE_NLS_CONFIG={\"userLocale\":"..., "HOSTTYPE=x86_64", "PULSE_SERVER=unix:/mnt/wslg/Puls"..., "WT_PROFILE_ID={574e775e-4f2a-5b9"..., "OLDPWD=/mnt/c/src/litebox-syscal"..., "_=/usr/bin/dircolors"]) = 0
+443   +++ exited with 0 +++
+431   --- SIGCHLD {si_signo=SIGCHLD, si_code=CLD_EXITED, si_pid=443, si_uid=1000, si_status=0, si_utime=0, si_stime=0} ---
+431   dup2(3, 1)                        = 1
+431   dup2(1, 2)                        = 2
+431   dup2(11, 2)                       = 2
+431   dup2(10, 1)                       = 1
+431   ioctl(255, TIOCGPGRP, 0x7fff4d7980d4) = -1 ENOTTY (Inappropriate ioctl for device)
+431   execve("/home/wportnoy/.vscode-server/bin/ae130017f8afe532557dbb8539a6ef3bdaec6389/node", ["/home/wportnoy/.vscode-server/bi"..., "-p", "\"6af3cf6cf195\" + JSON.stringify("...], ["SHELL=/bin/bash", "WSL2_GUI_APPS_ENABLED=1", "WSL_DISTRO_NAME=Ubuntu", "WT_SESSION=cddede45-fd13-461d-ab"..., "ELECTRON_RUN_AS_NODE=1", "NAME=CPC-wport-Z1BM3", "PWD=/mnt/c/src/litebox-syscall-a"..., "LOGNAME=wportnoy", "HOME=/home/wportnoy", "LANG=C.UTF-8", "WSL_INTEROP=/run/WSL/305_interop", "LS_COLORS=rs=0:di=01;34:ln=01;36"..., "WAYLAND_DISPLAY=wayland-0", "LESSCLOSE=/usr/bin/lesspipe %s %"..., "VSCODE_HANDLES_SIGPIPE=true", "TERM=xterm-256color", "LESSOPEN=| /usr/bin/lesspipe %s", "USER=wportnoy", "DISPLAY=:0", "SHLVL=1", "VSCODE_CWD=/mnt/c/src/litebox-sy"..., "XDG_RUNTIME_DIR=/run/user/1000/", "DEBUGINFOD_URLS=https://debuginf"..., "WSLENV=WT_SESSION:WT_PROFILE_ID:", "ELECTRON_NO_ATTACH_CONSOLE=1", "XDG_DATA_DIRS=/usr/local/share:/"..., "PATH=/home/wportnoy/.local/bin:/"..., "VSCODE_RESOLVING_ENVIRONMENT=1", "DBUS_SESSION_BUS_ADDRESS=unix:pa"..., "VSCODE_NLS_CONFIG={\"userLocale\":"..., "HOSTTYPE=x86_64", "PULSE_SERVER=unix:/mnt/wslg/Puls"..., "WT_PROFILE_ID={574e775e-4f2a-5b9"..., "OLDPWD=/mnt/c/src/litebox-syscal"..., "_=/home/wportnoy/.vscode-server/"...]) = 0
+431   ioctl(0, TCGETS, 0x7ffeb7fd0560)  = -1 ENOTTY (Inappropriate ioctl for device)
+431   ioctl(1, TCGETS, 0x7ffeb7fd0560)  = -1 ENOTTY (Inappropriate ioctl for device)
+431   getsockname(1, {sa_family=AF_UNIX}, [128 => 2]) = 0
+431   ioctl(2, TCGETS, 0x7ffeb7fd0560)  = -1 ENOTTY (Inappropriate ioctl for device)
+431   getsockname(2, {sa_family=AF_UNIX}, [128 => 2]) = 0
+431   pipe2([5, 6], O_CLOEXEC)          = 0
+431   pipe2([7, 8], O_NONBLOCK|O_CLOEXEC) = 0
+431   clone3({flags=CLONE_VM|CLONE_FS|CLONE_FILES|CLONE_SIGHAND|CLONE_THREAD|CLONE_SYSVSEM|CLONE_SETTLS|CLONE_PARENT_SETTID|CLONE_CHILD_CLEARTID, child_tid=0x7417cb3ff990, parent_tid=0x7417cb3ff990, exit_signal=0, stack=0x7417cabff000, stack_size=0x7ffe40, tls=0x7417cb3ff6c0} => {parent_tid=[444]}, 88) = 444
+444   pipe2([12, 13], O_NONBLOCK|O_CLOEXEC) = 0
+431   clone3({flags=CLONE_VM|CLONE_FS|CLONE_FILES|CLONE_SIGHAND|CLONE_THREAD|CLONE_SYSVSEM|CLONE_SETTLS|CLONE_PARENT_SETTID|CLONE_CHILD_CLEARTID, child_tid=0x7417cabfe990, parent_tid=0x7417cabfe990, exit_signal=0, stack=0x7417ca3fe000, stack_size=0x7ffe40, tls=0x7417cabfe6c0} => {parent_tid=[445]}, 88) = 445
+431   clone3({flags=CLONE_VM|CLONE_FS|CLONE_FILES|CLONE_SIGHAND|CLONE_THREAD|CLONE_SYSVSEM|CLONE_SETTLS|CLONE_PARENT_SETTID|CLONE_CHILD_CLEARTID, child_tid=0x7417ca3fd990, parent_tid=0x7417ca3fd990, exit_signal=0, stack=0x7417c9bfd000, stack_size=0x7ffe40, tls=0x7417ca3fd6c0} => {parent_tid=[446]}, 88) = 446
+431   clone3({flags=CLONE_VM|CLONE_FS|CLONE_FILES|CLONE_SIGHAND|CLONE_THREAD|CLONE_SYSVSEM|CLONE_SETTLS|CLONE_PARENT_SETTID|CLONE_CHILD_CLEARTID, child_tid=0x7417c9bfc990, parent_tid=0x7417c9bfc990, exit_signal=0, stack=0x7417c93fc000, stack_size=0x7ffe40, tls=0x7417c9bfc6c0} => {parent_tid=[447]}, 88) = 447
+431   clone3({flags=CLONE_VM|CLONE_FS|CLONE_FILES|CLONE_SIGHAND|CLONE_THREAD|CLONE_SYSVSEM|CLONE_SETTLS|CLONE_PARENT_SETTID|CLONE_CHILD_CLEARTID, child_tid=0x7417c93fb990, parent_tid=0x7417c93fb990, exit_signal=0, stack=0x7417c8bfb000, stack_size=0x7ffe40, tls=0x7417c93fb6c0} => {parent_tid=[448]}, 88) = 448
+431   pipe2([17, 18], O_NONBLOCK|O_CLOEXEC) = 0
+431   clone3({flags=CLONE_VM|CLONE_FS|CLONE_FILES|CLONE_SIGHAND|CLONE_THREAD|CLONE_SYSVSEM|CLONE_SETTLS|CLONE_PARENT_SETTID|CLONE_CHILD_CLEARTID, child_tid=0x7417cb7ff990, parent_tid=0x7417cb7ff990, exit_signal=0, stack=0x7417cb7f7000, stack_size=0x7e40, tls=0x7417cb7ff6c0} => {parent_tid=[449]}, 88) = 449
+431   ioctl(1, TCGETS, 0x7ffeb7fcd490)  = -1 ENOTTY (Inappropriate ioctl for device)
+431   getsockname(1, {sa_family=AF_UNIX}, [128 => 2]) = 0
+431   ioctl(1, TCGETS, 0x7ffeb7fcd300)  = -1 ENOTTY (Inappropriate ioctl for device)
+431   getsockname(1, {sa_family=AF_UNIX}, [128 => 2]) = 0
+431   ioctl(1, FIONBIO, [1])            = 0
+448   +++ exited with 0 +++
+447   +++ exited with 0 +++
+446   +++ exited with 0 +++
+445   +++ exited with 0 +++
+444   +++ exited with 0 +++
+449   +++ exited with 0 +++
+431   +++ exited with 0 +++
+419   --- SIGCHLD {si_signo=SIGCHLD, si_code=CLD_EXITED, si_pid=431, si_uid=1000, si_status=0, si_utime=4 /* 0.04 s */, si_stime=17 /* 0.17 s */} ---
+429   socket(AF_NETLINK, SOCK_RAW|SOCK_CLOEXEC, NETLINK_ROUTE) = 26
+429   bind(26, {sa_family=AF_NETLINK, nl_pid=0, nl_groups=00000000}, 12) = 0
+429   getsockname(26, {sa_family=AF_NETLINK, nl_pid=419, nl_groups=00000000}, [12]) = 0
+429   socket(AF_INET, SOCK_DGRAM|SOCK_CLOEXEC|SOCK_NONBLOCK, IPPROTO_IP) = 26
+429   setsockopt(26, SOL_IP, IP_RECVERR, [1], 4) = 0
+429   connect(26, {sa_family=AF_INET, sin_port=htons(53), sin_addr=inet_addr("10.255.255.254")}, 16) = 0
+429   ioctl(26, FIONREAD, [334])        = 0
+429   ioctl(26, FIONREAD, [290])        = 0
+419   socket(AF_INET, SOCK_STREAM|SOCK_CLOEXEC|SOCK_NONBLOCK, IPPROTO_IP) = 26
+419   connect(26, {sa_family=AF_INET, sin_port=htons(443), sin_addr=inet_addr("104.208.16.89")}, 16) = -1 EINPROGRESS (Operation now in progress)
+419   setsockopt(26, SOL_SOCKET, SO_KEEPALIVE, [1], 4) = 0
+419   setsockopt(26, SOL_TCP, TCP_KEEPIDLE, [1], 4) = 0
+419   setsockopt(26, SOL_TCP, TCP_KEEPINTVL, [1], 4) = 0
+419   setsockopt(26, SOL_TCP, TCP_KEEPCNT, [10], 4) = 0
+419   --- SIGTERM {si_signo=SIGTERM, si_code=SI_USER, si_pid=415, si_uid=1000} ---
+430   --- SIGCONT {si_signo=SIGCONT, si_code=SI_USER, si_pid=415, si_uid=1000} ---
+419   ioctl(0, TCGETS, {c_iflag=ICRNL|IXON, c_oflag=NL0|CR0|TAB0|BS0|VT0|FF0|OPOST|ONLCR, c_cflag=B38400|CS8|CREAD, c_lflag=ISIG|ICANON|ECHO|ECHOE|ECHOK|IEXTEN|ECHOCTL|ECHOKE, c_line=N_TTY, c_cc=[[VINTR]=0x3, [VQUIT]=0x1c, [VERASE]=0x7f, [VKILL]=0x15, [VEOF]=0x4, [VTIME]=0, [VMIN]=0x1, [VSWTC]=0, [VSTART]=0x11, [VSTOP]=0x13, [VSUSP]=0x1a, [VEOL]=0, [VREPRINT]=0x12, [VDISCARD]=0xf, [VWERASE]=0x17, [VLNEXT]=0x16, [VEOL2]=0, [17]=0, [18]=0]}) = 0
+419   ioctl(0, TCSETS, {c_iflag=ICRNL|IXON, c_oflag=NL0|CR0|TAB0|BS0|VT0|FF0|OPOST|ONLCR, c_cflag=B38400|CS8|CREAD, c_lflag=ISIG|ICANON|ECHO|ECHOE|ECHOK|IEXTEN|ECHOCTL|ECHOKE, c_line=N_TTY, c_cc=[[VINTR]=0x3, [VQUIT]=0x1c, [VERASE]=0x7f, [VKILL]=0x15, [VEOF]=0x4, [VTIME]=0, [VMIN]=0x1, [VSWTC]=0, [VSTART]=0x11, [VSTOP]=0x13, [VSUSP]=0x1a, [VEOL]=0, [VREPRINT]=0x12, [VDISCARD]=0xf, [VWERASE]=0x17, [VLNEXT]=0x16, [VEOL2]=0, [17]=0, [18]=0]}) = 0
+419   ioctl(0, TCGETS, {c_iflag=ICRNL|IXON, c_oflag=NL0|CR0|TAB0|BS0|VT0|FF0|OPOST|ONLCR, c_cflag=B38400|CS8|CREAD, c_lflag=ISIG|ICANON|ECHO|ECHOE|ECHOK|IEXTEN|ECHOCTL|ECHOKE, c_line=N_TTY, c_cc=[[VINTR]=0x3, [VQUIT]=0x1c, [VERASE]=0x7f, [VKILL]=0x15, [VEOF]=0x4, [VTIME]=0, [VMIN]=0x1, [VSWTC]=0, [VSTART]=0x11, [VSTOP]=0x13, [VSUSP]=0x1a, [VEOL]=0, [VREPRINT]=0x12, [VDISCARD]=0xf, [VWERASE]=0x17, [VLNEXT]=0x16, [VEOL2]=0, [17]=0, [18]=0]}) = 0
+419   ioctl(1, TCGETS, {c_iflag=ICRNL|IXON, c_oflag=NL0|CR0|TAB0|BS0|VT0|FF0|OPOST|ONLCR, c_cflag=B38400|CS8|CREAD, c_lflag=ISIG|ICANON|ECHO|ECHOE|ECHOK|IEXTEN|ECHOCTL|ECHOKE, c_line=N_TTY, c_cc=[[VINTR]=0x3, [VQUIT]=0x1c, [VERASE]=0x7f, [VKILL]=0x15, [VEOF]=0x4, [VTIME]=0, [VMIN]=0x1, [VSWTC]=0, [VSTART]=0x11, [VSTOP]=0x13, [VSUSP]=0x1a, [VEOL]=0, [VREPRINT]=0x12, [VDISCARD]=0xf, [VWERASE]=0x17, [VLNEXT]=0x16, [VEOL2]=0, [17]=0, [18]=0]}) = 0
+419   ioctl(1, TCSETS, {c_iflag=ICRNL|IXON, c_oflag=NL0|CR0|TAB0|BS0|VT0|FF0|OPOST|ONLCR, c_cflag=B38400|CS8|CREAD, c_lflag=ISIG|ICANON|ECHO|ECHOE|ECHOK|IEXTEN|ECHOCTL|ECHOKE, c_line=N_TTY, c_cc=[[VINTR]=0x3, [VQUIT]=0x1c, [VERASE]=0x7f, [VKILL]=0x15, [VEOF]=0x4, [VTIME]=0, [VMIN]=0x1, [VSWTC]=0, [VSTART]=0x11, [VSTOP]=0x13, [VSUSP]=0x1a, [VEOL]=0, [VREPRINT]=0x12, [VDISCARD]=0xf, [VWERASE]=0x17, [VLNEXT]=0x16, [VEOL2]=0, [17]=0, [18]=0]}) = 0
+419   ioctl(1, TCGETS, {c_iflag=ICRNL|IXON, c_oflag=NL0|CR0|TAB0|BS0|VT0|FF0|OPOST|ONLCR, c_cflag=B38400|CS8|CREAD, c_lflag=ISIG|ICANON|ECHO|ECHOE|ECHOK|IEXTEN|ECHOCTL|ECHOKE, c_line=N_TTY, c_cc=[[VINTR]=0x3, [VQUIT]=0x1c, [VERASE]=0x7f, [VKILL]=0x15, [VEOF]=0x4, [VTIME]=0, [VMIN]=0x1, [VSWTC]=0, [VSTART]=0x11, [VSTOP]=0x13, [VSUSP]=0x1a, [VEOL]=0, [VREPRINT]=0x12, [VDISCARD]=0xf, [VWERASE]=0x17, [VLNEXT]=0x16, [VEOL2]=0, [17]=0, [18]=0]}) = 0
+419   --- SIGTERM {si_signo=SIGTERM, si_code=SI_TKILL, si_pid=419, si_uid=1000} ---
+430   +++ killed by SIGTERM +++
+429   +++ killed by SIGTERM +++
+428   +++ killed by SIGTERM +++
+427   +++ killed by SIGTERM +++
+425   +++ killed by SIGTERM +++
+424   +++ killed by SIGTERM +++
+423   +++ killed by SIGTERM +++
+422   +++ killed by SIGTERM +++
+421   +++ killed by SIGTERM +++
+420   +++ killed by SIGTERM +++
+419   +++ killed by SIGTERM +++
