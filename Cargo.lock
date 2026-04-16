@@ -1310,8 +1310,8 @@ dependencies = [
  "log",
  "memchr",
  "regex-automata",
- "same-file",
- "walkdir",
+ "same-file 1.0.6",
+ "walkdir 2.5.0",
  "winapi-util",
 ]
 
@@ -1443,6 +1443,16 @@ dependencies = [
  "serde",
  "serde_json",
  "signature",
+]
+
+[[package]]
+name = "kernel32-sys"
+version = "0.2.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7507624b29483431c0ba2d82aece8ca6cdba9382bff4ddd0f7490560c056098d"
+dependencies = [
+ "winapi",
+ "winapi-build",
 ]
 
 [[package]]
@@ -1593,7 +1603,7 @@ dependencies = [
  "tar",
  "tempfile",
  "tokio",
- "walkdir",
+ "walkdir 2.5.0",
 ]
 
 [[package]]
@@ -1718,7 +1728,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
- "walkdir",
+ "walkdir 2.5.0",
 ]
 
 [[package]]
@@ -1858,7 +1868,9 @@ dependencies = [
  "libc",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
+ "walkdir 1.0.7",
 ]
 
 [[package]]
@@ -2627,6 +2639,16 @@ name = "ryu"
 version = "1.0.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
+
+[[package]]
+name = "same-file"
+version = "0.1.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d931a44fdaa43b8637009e7632a02adc4f2b2e0733c08caa4cf00e8da4a117a7"
+dependencies = [
+ "kernel32-sys",
+ "winapi",
+]
 
 [[package]]
 name = "same-file"
@@ -3448,11 +3470,22 @@ checksum = "442887c63f2c839b346c192d047a7c87e73d0689c9157b00b53dcc27dd5ea793"
 
 [[package]]
 name = "walkdir"
+version = "1.0.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bb08f9e670fab86099470b97cd2b252d6527f0b3cc1401acdb595ffc9dd288ff"
+dependencies = [
+ "kernel32-sys",
+ "same-file 0.1.3",
+ "winapi",
+]
+
+[[package]]
+name = "walkdir"
 version = "2.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "29790946404f91d9c5d06f9874efddea1dc06c5efe94541a7d6863108e3a5e4b"
 dependencies = [
- "same-file",
+ "same-file 1.0.6",
  "winapi-util",
 ]
 
@@ -3604,6 +3637,18 @@ dependencies = [
  "js-sys",
  "wasm-bindgen",
 ]
+
+[[package]]
+name = "winapi"
+version = "0.2.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "167dc9d6949a9b857f3451275e911c3f44255842c1f7a76f33c55103a909087a"
+
+[[package]]
+name = "winapi-build"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2d315eee3b34aca4797b2da6b13ed88266e6d612562a0c46390af8299fc699bc"
 
 [[package]]
 name = "winapi-util"
