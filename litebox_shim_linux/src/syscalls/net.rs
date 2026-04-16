@@ -1078,7 +1078,32 @@ impl<FS: ShimFS> Task<FS> {
                 }
                 raw_fd
             }
-            AddressFamily::INET6 | AddressFamily::NETLINK => return Err(Errno::EAFNOSUPPORT),
+            AddressFamily::INET6 => return Err(Errno::EAFNOSUPPORT),
+            AddressFamily::NETLINK => {
+                // Create a pipe pair to reserve an fd number. The writer is
+                // closed immediately — all I/O is intercepted via
+                // netlink_sockets before reaching the underlying pipe.
+                let (writer, reader) = self.global.pipes.create_pipe(
+                    4096,
+                    litebox::pipes::Flags::empty(),
+                    core::num::NonZero::new(4096),
+                );
+                self.global.pipes.close(&writer).unwrap();
+                if flags.contains(SockFlags::CLOEXEC) {
+                    let mut dt = self.global.litebox.descriptor_table_mut();
+                    let old = dt.set_fd_metadata(&reader, FileDescriptorFlags::FD_CLOEXEC);
+                    assert!(old.is_none());
+                }
+                let raw_fd = files.insert_raw_fd(reader).map_err(|reader| {
+                    self.global.pipes.close(&reader).unwrap();
+                    Errno::EMFILE
+                })?;
+                let fd_u32 = u32::try_from(raw_fd).unwrap();
+                self.netlink_sockets
+                    .borrow_mut()
+                    .insert(fd_u32, super::netlink::NetlinkRouteSocket::new());
+                raw_fd
+            }
             _ => unimplemented!(),
         };
         Ok(u32::try_from(file).unwrap())
@@ -2009,6 +2034,44 @@ impl<FS: ShimFS> Task<FS> {
             if !nl.has_data() {
                 return Ok(0);
             }
+
+            let is_peek = flags.contains(ReceiveFlags::PEEK);
+            let is_trunc = flags.contains(ReceiveFlags::TRUNC);
+
+            // MSG_PEEK | MSG_TRUNC with zero-length iov: glibc's size-query pattern.
+            // Return total buffered data length without consuming anything.
+            if is_peek && is_trunc {
+                let data_len = nl.recv_buf_len();
+                // Still need to write msg_name/flags to the msghdr.
+                let mut hdr = ConstPtr::<litebox_common_linux::UserMsgHdr<Platform>>::from_usize(
+                    msg.as_usize(),
+                )
+                .read_at_offset(0)
+                .ok_or(Errno::EFAULT)?;
+                let msg_name_addr = {
+                    let x = hdr.msg_name;
+                    x.as_usize()
+                };
+                if msg_name_addr != 0 && hdr.msg_namelen >= 12 {
+                    let kernel_addr: [u8; 12] = {
+                        let mut a = [0u8; 12];
+                        a[0..2].copy_from_slice(&16u16.to_ne_bytes()); // AF_NETLINK
+                        a
+                    };
+                    let name_ptr = MutPtr::<u8>::from_usize(msg_name_addr);
+                    for (i, &b) in kernel_addr.iter().enumerate() {
+                        name_ptr.write_at_offset(i as isize, b);
+                    }
+                    hdr.msg_namelen = 12;
+                } else {
+                    hdr.msg_namelen = 0;
+                }
+                hdr.msg_controllen = 0;
+                hdr.msg_flags = ReceiveFlags::empty();
+                let _ = msg.write_at_offset(0, hdr);
+                return Ok(data_len);
+            }
+
             let mut hdr =
                 ConstPtr::<litebox_common_linux::UserMsgHdr<Platform>>::from_usize(msg.as_usize())
                     .read_at_offset(0)
@@ -2022,12 +2085,18 @@ impl<FS: ShimFS> Task<FS> {
                 .ok_or(Errno::EFAULT)?;
 
             let mut total_written = 0;
+            // Capture total data size before draining for MSG_TRUNC.
+            let original_data_len = nl.recv_buf_len();
             for iov in &iovs {
                 if iov.iov_len == 0 {
                     continue;
                 }
                 let mut buf = alloc::vec![0u8; iov.iov_len];
-                let n = nl.recv(&mut buf);
+                let n = if is_peek {
+                    nl.peek(&mut buf)
+                } else {
+                    nl.recv(&mut buf)
+                };
                 if n == 0 {
                     break;
                 }
@@ -2042,7 +2111,10 @@ impl<FS: ShimFS> Task<FS> {
                 }
             }
             // Write kernel source address (nl_pid=0) to msg_name if provided.
-            let msg_name_addr = { let x = hdr.msg_name; x.as_usize() };
+            let msg_name_addr = {
+                let x = hdr.msg_name;
+                x.as_usize()
+            };
             let msg_name_len = hdr.msg_namelen;
             if msg_name_addr != 0 && msg_name_len >= 12 {
                 // sockaddr_nl: family(2) + pad(2) + pid(4) + groups(4) = 12
@@ -2063,7 +2135,13 @@ impl<FS: ShimFS> Task<FS> {
             hdr.msg_controllen = 0;
             hdr.msg_flags = ReceiveFlags::empty();
             let _ = msg.write_at_offset(0, hdr);
-            return Ok(total_written);
+            // For MSG_TRUNC, return the full data size (may be > total_written).
+            let result = if is_trunc {
+                original_data_len
+            } else {
+                total_written
+            };
+            return Ok(result);
         }
 
         let mut hdr =
@@ -2173,8 +2251,14 @@ impl<FS: ShimFS> Task<FS> {
             if !nl.has_data() {
                 return Ok(0);
             }
-            let n = nl.recv(buf);
-            return Ok(n);
+            let is_peek = flags.contains(ReceiveFlags::PEEK);
+            let is_trunc = flags.contains(ReceiveFlags::TRUNC);
+            if is_peek && is_trunc {
+                return Ok(nl.recv_buf_len());
+            }
+            let data_len = nl.recv_buf_len();
+            let n = if is_peek { nl.peek(buf) } else { nl.recv(buf) };
+            return Ok(if is_trunc { data_len } else { n });
         }
         self.do_recvfrom_with_fds(sockfd, buf, flags, source_addr, &mut Vec::new())
     }
@@ -2307,6 +2391,21 @@ impl<FS: ShimFS> Task<FS> {
         optval: MutPtr<u8>,
         len: u32,
     ) -> Result<usize, Errno> {
+        // Netlink socket: return reasonable defaults.
+        if self.netlink_sockets.borrow().contains_key(&sockfd) {
+            let val: u32 = match optname {
+                SocketOptionName::Socket(SocketOption::ERROR) => 0,
+                SocketOptionName::Socket(SocketOption::RCVBUF)
+                | SocketOptionName::Socket(SocketOption::SNDBUF) => 212992,
+                _ => return Ok(0),
+            };
+            if len >= 4 {
+                let ptr = MutPtr::<u32>::from_usize(optval.as_usize());
+                ptr.write_at_offset(0, val);
+                return Ok(4);
+            }
+            return Ok(0);
+        }
         self.files.borrow().with_socket(
             &self.global,
             sockfd,

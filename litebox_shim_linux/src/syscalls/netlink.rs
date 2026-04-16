@@ -104,7 +104,7 @@ impl NetlinkRouteSocket {
         Ok(data.len())
     }
 
-    /// Read response data (for recvmsg).
+    /// Read response data, draining from the buffer.
     pub fn recv(&mut self, buf: &mut [u8]) -> usize {
         if self.recv_buf.is_empty() {
             return 0;
@@ -113,6 +113,21 @@ impl NetlinkRouteSocket {
         buf[..len].copy_from_slice(&self.recv_buf[..len]);
         self.recv_buf.drain(..len);
         len
+    }
+
+    /// Peek at response data without draining (for MSG_PEEK).
+    pub fn peek(&self, buf: &mut [u8]) -> usize {
+        if self.recv_buf.is_empty() {
+            return 0;
+        }
+        let len = buf.len().min(self.recv_buf.len());
+        buf[..len].copy_from_slice(&self.recv_buf[..len]);
+        len
+    }
+
+    /// Return the total buffered response size (for MSG_TRUNC).
+    pub fn recv_buf_len(&self) -> usize {
+        self.recv_buf.len()
     }
 
     /// Generate RTM_NEWLINK response for loopback interface.
