@@ -882,7 +882,7 @@ mod test {
                 Some(&mut rfds),
                 None,
                 None,
-                Some(core::time::Duration::from_secs(60)),
+                Some(core::time::Duration::from_mins(1)),
             )
             .expect("pselect failed");
 

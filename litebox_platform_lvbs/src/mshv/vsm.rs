@@ -260,8 +260,8 @@ pub fn mshv_vsm_end_of_boot() -> i64 {
 pub fn mshv_vsm_protect_memory(pa: u64, nranges: u64) -> Result<i64, VsmError> {
     if PhysAddr::try_new(pa)
         .ok()
-        .filter(|p| p.is_aligned(Size4KiB::SIZE))
-        .is_none()
+        .as_ref()
+        .is_none_or(|p| !p.is_aligned(Size4KiB::SIZE))
         || nranges == 0
     {
         return Err(VsmError::InvalidInputAddress);
@@ -338,8 +338,8 @@ fn parse_certs(mut buf: &[u8]) -> Result<Vec<Certificate>, VsmError> {
 pub fn mshv_vsm_load_kdata(pa: u64, nranges: u64) -> Result<i64, VsmError> {
     if PhysAddr::try_new(pa)
         .ok()
-        .filter(|p| p.is_aligned(Size4KiB::SIZE))
-        .is_none()
+        .as_ref()
+        .is_none_or(|p| !p.is_aligned(Size4KiB::SIZE))
         || nranges == 0
     {
         return Err(VsmError::InvalidInputAddress);
@@ -468,8 +468,8 @@ pub fn mshv_vsm_load_kdata(pa: u64, nranges: u64) -> Result<i64, VsmError> {
 pub fn mshv_vsm_validate_guest_module(pa: u64, nranges: u64, _flags: u64) -> Result<i64, VsmError> {
     if PhysAddr::try_new(pa)
         .ok()
-        .filter(|p| p.is_aligned(Size4KiB::SIZE))
-        .is_none()
+        .as_ref()
+        .is_none_or(|p| !p.is_aligned(Size4KiB::SIZE))
         || nranges == 0
     {
         return Err(VsmError::InvalidInputAddress);

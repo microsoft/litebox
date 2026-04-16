@@ -259,7 +259,7 @@ fn run_which(prog: &str) -> std::path::PathBuf {
         .stdout;
     let prog_path_str = String::from_utf8(prog_path_str).unwrap().trim().to_string();
     let prog_path = std::path::PathBuf::from(prog_path_str);
-    assert!(prog_path.exists(), "Program binary not found",);
+    assert!(prog_path.exists(), "Program binary not found");
     prog_path
 }
 

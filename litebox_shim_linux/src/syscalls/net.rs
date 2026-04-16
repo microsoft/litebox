@@ -345,7 +345,7 @@ impl<FS: ShimFS> GlobalState<FS> {
                         deferred_tcp_option = Some(if keep_alive {
                             // default time interval is 2 hours
                             litebox::net::TcpOptionData::KEEPALIVE(Some(
-                                core::time::Duration::from_secs(2 * 60 * 60),
+                                core::time::Duration::from_hours(2),
                             ))
                         } else {
                             litebox::net::TcpOptionData::KEEPALIVE(None)
@@ -2208,7 +2208,7 @@ mod tests {
                 ])
                 .output()
         });
-        std::thread::sleep(core::time::Duration::from_millis(1000));
+        std::thread::sleep(core::time::Duration::from_secs(1));
 
         // Client socket
         let client_fd = task
@@ -2446,7 +2446,7 @@ mod tests {
             .expect("Failed to get TCP_CONGESTION");
         assert_eq!(optlen, 4);
         assert_eq!(
-            core::str::from_utf8(&congestion_name[..optlen as usize]).unwrap(),
+            core::str::from_utf8(&congestion_name[..optlen]).unwrap(),
             "none"
         );
 
@@ -2454,7 +2454,7 @@ mod tests {
             sockfd,
             SocketOptionName::TCP(TcpOption::CONGESTION),
             ConstPtr::from_usize(congestion_name.as_ptr() as usize),
-            optlen as usize,
+            optlen,
         )
         .expect("Failed to set TCP_CONGESTION");
 

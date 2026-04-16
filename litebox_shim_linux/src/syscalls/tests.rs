@@ -411,7 +411,7 @@ fn test_umask_behavior() {
     let _ = task.sys_umask(orig); // restore original
 
     // We expect the default (from implementation) to be 0o022.
-    assert_eq!(orig, 0o022, "Default umask should be 022 (got {orig:03o})",);
+    assert_eq!(orig, 0o022, "Default umask should be 022 (got {orig:03o})");
 
     // 2. Set a new umask (e.g., 0o077) and verify file creation honors it.
     let prev = task.sys_umask(0o077).bits();

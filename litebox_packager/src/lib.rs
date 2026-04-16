@@ -341,9 +341,7 @@ fn finalize_tar(
         }
         let data = std::fs::read(&inc.host_path)
             .with_context(|| format!("failed to read included file {}", inc.host_path.display()))?;
-        let mode = std::fs::metadata(&inc.host_path)
-            .map(|m| m.mode())
-            .unwrap_or(0o644);
+        let mode = std::fs::metadata(&inc.host_path).map_or(0o644, |m| m.mode());
         if args.verbose {
             eprintln!(
                 "  including {} as {}",
@@ -379,9 +377,7 @@ fn finalize_tar(
     eprintln!("Creating {}...", args.output.display());
     build_tar(&tar_entries, &args.output)?;
 
-    let tar_size = std::fs::metadata(&args.output)
-        .map(|m| m.len())
-        .unwrap_or(0);
+    let tar_size = std::fs::metadata(&args.output).map_or(0, |m| m.len());
     #[allow(clippy::cast_precision_loss)]
     let tar_size_mb = tar_size as f64 / 1_048_576.0;
     eprintln!(
