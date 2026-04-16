@@ -80,6 +80,52 @@ The correct sequence for fixing a bug is:
 Never fix product code without a failing test first. Never skip step 2 —
 if the test doesn't fail before the fix, it doesn't prove the fix works.
 
+## Debugging strategy
+
+When a test fails and the root cause is unclear, follow this order:
+
+### 11. Isolate layers with bypass tests
+Write a test that bypasses intermediate layers (e.g., the agent protocol)
+to determine WHICH layer has the bug. For example, `stress-exec` runs
+fork+exec directly from a single process, proving litebox's fork/exec
+works and the bug is in the mux relay. This avoids spending time
+analyzing the wrong layer.
+
+### 12. Vary one axis at a time
+Write focused tests that change only one variable:
+- Fresh agent vs used agent (isolates accumulated state)
+- Same agent vs sibling agent (isolates parent-level corruption)
+- PIE-only vs non-PIE-only vs mixed (isolates exec path)
+- 1 exec vs 30 execs (isolates resource leaks)
+
+Each test should have a clear hypothesis: "if this passes but that
+fails, the bug is in X."
+
+### 13. Check accumulating data structures for cleanup
+When investigating state corruption, grep for data structures that
+grow without bound. Look for `.push()` without corresponding
+`.remove()`, `.retain()`, or `.clear()`. Accumulating lists of IDs,
+handles, or references are a common source of stale-entry bugs,
+especially when IDs can be reused (pointer addresses, fd numbers,
+recycling pools).
+
+### 14. Check handle identity mechanisms
+When investigating misrouted data, verify how handles/IDs are
+generated. Compare against codebase conventions:
+- Monotonic counters (like `DescriptorObjectId`) — safe
+- Pointer addresses (`Arc::as_ptr()`) — vulnerable to reuse after free
+- Recycling pools (`IdPool`) — require caller validation
+
+If a handle uses pointer identity, verify that all tracking structures
+(like `mux_pipe_pair_ids`) are cleaned up when the handle is freed.
+
+### 15. Check cleanup ordering for concurrent resources
+When investigating data loss, verify that resources used by background
+threads are not cleaned up before those threads finish. For example,
+if a bridge thread writes to a pipe and the parent calls `exit_group`,
+the pipe must stay open until the bridge finishes. Look for
+`detach`/`move to background` patterns that skip `join()`.
+
 ## Enforcement
 
 ### Compile-time: `#[cfg(test)]` lint in integration test
