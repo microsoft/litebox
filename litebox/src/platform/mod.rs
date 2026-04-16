@@ -763,7 +763,7 @@ pub trait CrngProvider {
 ///
 /// Platforms might differ drastically on their own notion of device-specific secrets, and what
 /// "reboot-surviving" means. Some platforms might have a real never-revealed never-modified root
-/// key (e.g., TPMs), while others might have maintain a persistent key across LiteBox invocations,
+/// key (e.g., TPMs), while others might maintain a persistent key across LiteBox invocations,
 /// but that persistent-key might be re-initialized to a new value every "real" reboot, etc.
 ///
 /// Concretely, no shim can depend _directly_ on the existence of a device-specific secret. However,
@@ -784,7 +784,7 @@ pub trait DerivedKeyProvider {
     /// (`params.context`), and place it into `params.output`.
     ///
     /// The platform is allowed to completely ignore the provided `shim_kdf` and use its own KDF
-    /// instead if if chooses to; alternatively, some platforms might not have their own KDFs, and
+    /// instead if it chooses to; alternatively, some platforms might not have their own KDFs, and
     /// only run if the shim provides a KDF.
     ///
     /// The `shim_kdf` is a `fn` not a `Fn`/`FnMut`/`FnOnce` in order to incentivize usage of pure
