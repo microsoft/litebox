@@ -3,7 +3,6 @@
 
 use anyhow::{Context as _, Result};
 use clap::Parser;
-use litebox::platform::CrngProvider;
 use litebox_common_optee::{TeeUuid, UteeEntryFunc, UteeParamOwned};
 use litebox_platform_multiplex::Platform;
 use litebox_shim_optee::session::allocate_session_id;
@@ -85,11 +84,6 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     let shim_builder = litebox_shim_optee::OpteeShimBuilder::new();
     let _litebox = shim_builder.litebox();
     let shim = shim_builder.build();
-
-    // For now, we use a random PRK for this runner. We can get one via command line if needed.
-    let mut prk = [0u8; litebox_platform_linux_userland::PRK_LEN];
-    platform.fill_bytes_crng(&mut prk);
-    litebox_platform_linux_userland::set_platform_root_key(&prk);
 
     if cli_args.command_sequence.is_empty() {
         run_ta_with_default_commands(&shim, ldelf_data.as_slice(), prog_data.as_slice());

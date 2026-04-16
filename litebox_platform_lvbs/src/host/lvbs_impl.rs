@@ -138,19 +138,6 @@ pub fn set_platform_root_key(key: &[u8]) {
     });
 }
 
-#[cfg(feature = "optee_syscall")]
-impl litebox::platform::PlatformRootKeyProvider for LvbsLinuxKernel {
-    fn platform_root_key(&self) -> Result<&[u8], litebox::platform::PlatformRootKeyError> {
-        PRK_ONCE
-            .get()
-            .map(<[u8; PRK_LEN]>::as_slice)
-            .ok_or(litebox::platform::PlatformRootKeyError)
-    }
-}
-
-#[cfg(not(feature = "optee_syscall"))]
-impl litebox::platform::PlatformRootKeyProvider for LvbsLinuxKernel {}
-
 pub struct HostLvbsInterface;
 
 impl HostLvbsInterface {}
