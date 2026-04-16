@@ -1099,9 +1099,9 @@ impl<FS: ShimFS> Task<FS> {
                     Errno::EMFILE
                 })?;
                 let fd_u32 = u32::try_from(raw_fd).unwrap();
-                self.netlink_sockets
-                    .borrow_mut()
-                    .insert(fd_u32, super::netlink::NetlinkRouteSocket::new());
+                let mut nl = super::netlink::NetlinkRouteSocket::new();
+                nl.set_nl_pid(u32::try_from(self.pid).unwrap_or(0));
+                self.netlink_sockets.borrow_mut().insert(fd_u32, nl);
                 raw_fd
             }
             _ => unimplemented!(),

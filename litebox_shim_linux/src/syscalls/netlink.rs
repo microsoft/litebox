@@ -57,6 +57,11 @@ pub struct NetlinkRouteSocket {
     recv_buf: Vec<u8>,
     /// Whether the socket has been bound.
     bound: bool,
+    /// The nl_pid assigned to this socket (used in response headers).
+    /// On Linux, the kernel sets nlmsg_pid in responses to the socket's
+    /// portid. glibc's `__netlink_request` checks this field and skips
+    /// messages where `nlmsg_pid != h->pid` (from getsockname).
+    nl_pid: u32,
 }
 
 impl NetlinkRouteSocket {
@@ -64,12 +69,18 @@ impl NetlinkRouteSocket {
         Self {
             recv_buf: Vec::new(),
             bound: false,
+            nl_pid: 0,
         }
     }
 
     /// Handle bind (glibc binds with nl_pid=0).
     pub fn bind(&mut self) {
         self.bound = true;
+    }
+
+    /// Set the nl_pid for this socket (called when getsockname assigns it).
+    pub fn set_nl_pid(&mut self, pid: u32) {
+        self.nl_pid = pid;
     }
 
     /// Handle sendto — parse the netlink request and generate a response.
@@ -163,7 +174,7 @@ impl NetlinkRouteSocket {
         self.recv_buf.extend_from_slice(&RTM_NEWLINK.to_ne_bytes()); // nlmsg_type
         self.recv_buf.extend_from_slice(&NLM_F_MULTI.to_ne_bytes()); // nlmsg_flags
         self.recv_buf.extend_from_slice(&seq.to_ne_bytes()); // nlmsg_seq
-        self.recv_buf.extend_from_slice(&0u32.to_ne_bytes()); // nlmsg_pid
+        self.recv_buf.extend_from_slice(&self.nl_pid.to_ne_bytes()); // nlmsg_pid
 
         // ifinfomsg
         self.recv_buf.extend_from_slice(&ifinfo);
@@ -221,7 +232,7 @@ impl NetlinkRouteSocket {
         self.recv_buf.extend_from_slice(&RTM_NEWADDR.to_ne_bytes());
         self.recv_buf.extend_from_slice(&NLM_F_MULTI.to_ne_bytes());
         self.recv_buf.extend_from_slice(&seq.to_ne_bytes());
-        self.recv_buf.extend_from_slice(&0u32.to_ne_bytes());
+        self.recv_buf.extend_from_slice(&self.nl_pid.to_ne_bytes());
 
         // ifaddrmsg
         self.recv_buf.extend_from_slice(&ifaddr);
@@ -242,7 +253,7 @@ impl NetlinkRouteSocket {
         self.recv_buf.extend_from_slice(&NLMSG_DONE.to_ne_bytes());
         self.recv_buf.extend_from_slice(&0u16.to_ne_bytes()); // flags
         self.recv_buf.extend_from_slice(&seq.to_ne_bytes());
-        self.recv_buf.extend_from_slice(&0u32.to_ne_bytes()); // pid
+        self.recv_buf.extend_from_slice(&self.nl_pid.to_ne_bytes()); // pid
         self.recv_buf.extend_from_slice(&0i32.to_ne_bytes()); // error code / padding
     }
 

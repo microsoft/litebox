@@ -293,6 +293,7 @@ mod netlink_tests {
             "sendmsg" => test_sendmsg_recvmsg(),
             "double" => test_double_request(),
             "peek-trunc" => test_peek_trunc(),
+            "glibc-flow" => test_glibc_flow(),
             "full" => test_full(),
             other => {
                 eprintln!("unknown: {other}");
@@ -395,6 +396,124 @@ mod netlink_tests {
             println!("NETLINK_GETADDR_FAIL:newaddr={found},done={done}");
             1
         }
+    }
+
+    /// Mimics glibc's exact getifaddrs flow: sendmsg + recvmsg(PEEK|TRUNC) + recvmsg(0)
+    /// for sequential RTM_GETLINK and RTM_GETADDR requests.
+    fn test_glibc_flow() -> i32 {
+        let fd = open_nl();
+        if fd < 0 {
+            println!("GLIBC_FLOW_SOCKET_FAIL");
+            return 1;
+        }
+
+        // Helper: do one glibc-style request cycle
+        fn do_request(fd: i32, req: &[u8], label: &str) -> bool {
+            // sendmsg (glibc pattern)
+            let mut dst: libc::sockaddr_nl = unsafe { std::mem::zeroed() };
+            dst.nl_family = libc::AF_NETLINK as u16;
+            let mut iov_send = libc::iovec {
+                iov_base: req.as_ptr() as *mut _,
+                iov_len: req.len(),
+            };
+            let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+            msg.msg_name = &mut dst as *mut _ as *mut _;
+            msg.msg_namelen = std::mem::size_of::<libc::sockaddr_nl>() as u32;
+            msg.msg_iov = &mut iov_send;
+            msg.msg_iovlen = 1;
+            let sent = unsafe { libc::sendmsg(fd, &msg, 0) };
+            eprintln!("[glibc-flow] {label}: sendmsg returned {sent}");
+            if sent < 0 {
+                return false;
+            }
+
+            // recvmsg(MSG_PEEK | MSG_TRUNC) with iov_len=0
+            let mut iov_peek = libc::iovec {
+                iov_base: std::ptr::null_mut(),
+                iov_len: 0,
+            };
+            let mut src: libc::sockaddr_nl = unsafe { std::mem::zeroed() };
+            let mut rmsg: libc::msghdr = unsafe { std::mem::zeroed() };
+            rmsg.msg_name = &mut src as *mut _ as *mut _;
+            rmsg.msg_namelen = std::mem::size_of::<libc::sockaddr_nl>() as u32;
+            rmsg.msg_iov = &mut iov_peek;
+            rmsg.msg_iovlen = 1;
+            let peek_len =
+                unsafe { libc::recvmsg(fd, &mut rmsg, libc::MSG_PEEK | libc::MSG_TRUNC) };
+            eprintln!("[glibc-flow] {label}: peek returned {peek_len}");
+            if peek_len <= 0 {
+                return false;
+            }
+
+            // recvmsg(0) with properly sized buffer
+            let mut buf = vec![0u8; peek_len as usize];
+            let mut iov_read = libc::iovec {
+                iov_base: buf.as_mut_ptr() as *mut _,
+                iov_len: buf.len(),
+            };
+            let mut rmsg2: libc::msghdr = unsafe { std::mem::zeroed() };
+            rmsg2.msg_name = &mut src as *mut _ as *mut _;
+            rmsg2.msg_namelen = std::mem::size_of::<libc::sockaddr_nl>() as u32;
+            rmsg2.msg_iov = &mut iov_read;
+            rmsg2.msg_iovlen = 1;
+            let read_len = unsafe { libc::recvmsg(fd, &mut rmsg2, 0) };
+            eprintln!("[glibc-flow] {label}: read returned {read_len}");
+            if read_len <= 0 {
+                return false;
+            }
+
+            // Parse for NLMSG_DONE
+            let n = read_len as usize;
+            let mut off = 0;
+            let mut found_done = false;
+            while off + 16 <= n {
+                let len = u32::from_ne_bytes([buf[off], buf[off + 1], buf[off + 2], buf[off + 3]])
+                    as usize;
+                let mtype = u16::from_ne_bytes([buf[off + 4], buf[off + 5]]);
+                eprintln!("[glibc-flow] {label}: msg at off={off} len={len} type={mtype}");
+                if len < 16 || off + len > n {
+                    break;
+                }
+                if mtype == libc::NLMSG_DONE as u16 {
+                    found_done = true;
+                }
+                off += (len + 3) & !3;
+            }
+            eprintln!("[glibc-flow] {label}: done={found_done}");
+            found_done
+        }
+
+        // Request 1: RTM_GETLINK
+        let mut req1 = [0u8; 32];
+        req1[0..4].copy_from_slice(&32u32.to_ne_bytes());
+        req1[4..6].copy_from_slice(&(libc::RTM_GETLINK as u16).to_ne_bytes());
+        req1[6..8]
+            .copy_from_slice(&((libc::NLM_F_REQUEST | libc::NLM_F_DUMP) as u16).to_ne_bytes());
+        req1[8..12].copy_from_slice(&1u32.to_ne_bytes());
+        let ok1 = do_request(fd, &req1, "GETLINK");
+        if !ok1 {
+            println!("GLIBC_FLOW_FAIL:GETLINK");
+            unsafe { libc::close(fd) };
+            return 1;
+        }
+
+        // Request 2: RTM_GETADDR
+        let mut req2 = [0u8; 24];
+        req2[0..4].copy_from_slice(&24u32.to_ne_bytes());
+        req2[4..6].copy_from_slice(&(libc::RTM_GETADDR as u16).to_ne_bytes());
+        req2[6..8]
+            .copy_from_slice(&((libc::NLM_F_REQUEST | libc::NLM_F_DUMP) as u16).to_ne_bytes());
+        req2[8..12].copy_from_slice(&2u32.to_ne_bytes());
+        let ok2 = do_request(fd, &req2, "GETADDR");
+        if !ok2 {
+            println!("GLIBC_FLOW_FAIL:GETADDR");
+            unsafe { libc::close(fd) };
+            return 1;
+        }
+
+        unsafe { libc::close(fd) };
+        println!("GLIBC_FLOW_OK");
+        0
     }
 
     fn test_full() -> i32 {
