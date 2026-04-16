@@ -1078,38 +1078,7 @@ impl<FS: ShimFS> Task<FS> {
                 }
                 raw_fd
             }
-            AddressFamily::INET6 => return Err(Errno::EAFNOSUPPORT),
-            AddressFamily::NETLINK => {
-                // Minimal AF_NETLINK ROUTE socket for getifaddrs() support.
-                // Create a dummy pipe fd (we only need a valid fd number)
-                // and register a NetlinkRouteSocket for it.
-                let (sender, receiver) =
-                    self.global
-                        .pipes
-                        .create_pipe(4096, litebox::pipes::Flags::empty(), None);
-                // Close the receiver — we only need the sender as a placeholder fd.
-                let _ = self.global.pipes.close(&receiver);
-                let Ok(raw_fd) = files.insert_raw_fd(sender) else {
-                    return Err(Errno::EMFILE);
-                };
-                if flags.contains(SockFlags::CLOEXEC) {
-                    let files = self.files.borrow();
-                    let rds = files.raw_descriptor_store.read();
-                    if let Ok(typed) =
-                        rds.fd_from_raw_integer::<litebox::pipes::Pipes<crate::Platform>>(raw_fd)
-                    {
-                        let _ = self.global.litebox.descriptor_table_mut().set_fd_metadata(
-                            &typed,
-                            litebox_common_linux::FileDescriptorFlags::FD_CLOEXEC,
-                        );
-                    }
-                }
-                self.netlink_sockets.borrow_mut().insert(
-                    u32::try_from(raw_fd).unwrap(),
-                    crate::syscalls::netlink::NetlinkRouteSocket::new(),
-                );
-                raw_fd
-            }
+            AddressFamily::INET6 | AddressFamily::NETLINK => return Err(Errno::EAFNOSUPPORT),
             _ => unimplemented!(),
         };
         Ok(u32::try_from(file).unwrap())
@@ -2073,15 +2042,17 @@ impl<FS: ShimFS> Task<FS> {
                 }
             }
             // Write kernel source address (nl_pid=0) to msg_name if provided.
-            if hdr.msg_name.as_usize() != 0 && hdr.msg_namelen >= 12 {
+            let msg_name_addr = { let x = hdr.msg_name; x.as_usize() };
+            let msg_name_len = hdr.msg_namelen;
+            if msg_name_addr != 0 && msg_name_len >= 12 {
                 // sockaddr_nl: family(2) + pad(2) + pid(4) + groups(4) = 12
                 let kernel_addr: [u8; 12] = {
                     let mut a = [0u8; 12];
-                    a[0..2].copy_from_slice(&(libc::AF_NETLINK as u16).to_ne_bytes());
+                    a[0..2].copy_from_slice(&16u16.to_ne_bytes()); // AF_NETLINK
                     // nl_pid = 0 (kernel), nl_groups = 0
                     a
                 };
-                let name_ptr = MutPtr::<u8>::from_usize(hdr.msg_name.as_usize());
+                let name_ptr = MutPtr::<u8>::from_usize(msg_name_addr);
                 for (i, &b) in kernel_addr.iter().enumerate() {
                     name_ptr.write_at_offset(i as isize, b);
                 }
