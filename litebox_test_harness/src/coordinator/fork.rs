@@ -698,7 +698,8 @@ pub(super) async fn node_exec_tests(r: &mut TestRunner) {
             exec(vec![self_exe.clone(), "exit-with".into(), "0".into()]),
         )
         .await;
-    let pass2 = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout.is_empty());
+    let pass2 =
+        matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout.is_empty());
     r.record("X49b.pie_sequential_2", "A", pass2, &format!("{resp:?}"));
 
     // X50: PIE exec after a non-PIE exec.
@@ -727,8 +728,7 @@ pub(super) async fn node_exec_tests(r: &mut TestRunner) {
         let resp = r
             .send("A", exec(vec![self_exe.clone(), "echo-test".into()]))
             .await;
-        let pass =
-            matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout == "ECHO_TEST_OK");
+        let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout == "ECHO_TEST_OK");
         r.record("X50b.nonpie_then_pie_2", "A", pass, &format!("{resp:?}"));
     }
 
@@ -755,8 +755,7 @@ pub(super) async fn node_exec_tests(r: &mut TestRunner) {
         let resp = r
             .send("B", exec(vec![self_exe.clone(), "echo-test".into()]))
             .await;
-        let pass =
-            matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout == "ECHO_TEST_OK");
+        let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout == "ECHO_TEST_OK");
         r.record("X52a.B_nonpie_then_pie", "B", pass, &format!("{resp:?}"));
 
         // X52b: Another PIE exec — does the shift continue?
@@ -766,15 +765,15 @@ pub(super) async fn node_exec_tests(r: &mut TestRunner) {
                 exec(vec![self_exe.clone(), "exit-with".into(), "0".into()]),
             )
             .await;
-        let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout.is_empty());
+        let pass =
+            matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout.is_empty());
         r.record("X52b.B_pie_after_nonpie", "B", pass, &format!("{resp:?}"));
 
         // X52c: One more — is the shift a one-time glitch or persistent?
         let resp = r
             .send("B", exec(vec![self_exe.clone(), "echo-test".into()]))
             .await;
-        let pass =
-            matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout == "ECHO_TEST_OK");
+        let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout == "ECHO_TEST_OK");
         r.record("X52c.B_third_exec", "B", pass, &format!("{resp:?}"));
     }
 
@@ -799,7 +798,12 @@ pub(super) async fn node_exec_tests(r: &mut TestRunner) {
         }
     }
     if x53_all_pass {
-        r.record("X53.stress_pie", "AB", true, "30 sequential PIE execs all passed");
+        r.record(
+            "X53.stress_pie",
+            "AB",
+            true,
+            "30 sequential PIE execs all passed",
+        );
     }
 
     // X54: Non-PIE exec on AB after 30 PIE execs — does prior PIE state
@@ -819,8 +823,7 @@ pub(super) async fn node_exec_tests(r: &mut TestRunner) {
     let resp = r
         .send("AAB", exec(vec![self_exe.clone(), "echo-test".into()]))
         .await;
-    let pass =
-        matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout == "ECHO_TEST_OK");
+    let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout == "ECHO_TEST_OK");
     r.record("X55a.one_pie_first", "AAB", pass, &format!("{resp:?}"));
 
     let resp = r.send("AAB", exec(vec!["/nonpie-echo".into()])).await;
@@ -854,13 +857,16 @@ pub(super) async fn node_exec_tests(r: &mut TestRunner) {
         // increase probability that a new pipe reuses a freed address.
         // Then exec non-PIE — should still return correct output.
         for _ in 0..20 {
-            let _ = r
-                .send("B", exec(bash("echo churn >/dev/null")))
-                .await;
+            let _ = r.send("B", exec(bash("echo churn >/dev/null"))).await;
         }
         let resp = r.send("B", exec(vec!["/nonpie-echo".into()])).await;
         let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout.contains("NONPIE_OK"));
-        r.record("X57.pipe_churn_then_nonpie", "B", pass, &format!("{resp:?}"));
+        r.record(
+            "X57.pipe_churn_then_nonpie",
+            "B",
+            pass,
+            &format!("{resp:?}"),
+        );
 
         // X58: Alternating PIE and non-PIE execs on B.
         // PIE, non-PIE, PIE, non-PIE — each should return its own output.
@@ -928,7 +934,12 @@ pub(super) async fn node_exec_tests(r: &mut TestRunner) {
     let resp = r
         .send(
             "A",
-            exec(vec![self_exe.clone(), "stress-exec".into(), "20".into(), "pie".into()]),
+            exec(vec![
+                self_exe.clone(),
+                "stress-exec".into(),
+                "20".into(),
+                "pie".into(),
+            ]),
         )
         .await;
     let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. }
@@ -939,7 +950,12 @@ pub(super) async fn node_exec_tests(r: &mut TestRunner) {
     let resp = r
         .send(
             "A",
-            exec(vec![self_exe.clone(), "stress-exec".into(), "10".into(), "nonpie".into()]),
+            exec(vec![
+                self_exe.clone(),
+                "stress-exec".into(),
+                "10".into(),
+                "nonpie".into(),
+            ]),
         )
         .await;
     let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. }
@@ -950,7 +966,12 @@ pub(super) async fn node_exec_tests(r: &mut TestRunner) {
     let resp = r
         .send(
             "A",
-            exec(vec![self_exe.clone(), "stress-exec".into(), "10".into(), "mixed".into()]),
+            exec(vec![
+                self_exe.clone(),
+                "stress-exec".into(),
+                "10".into(),
+                "mixed".into(),
+            ]),
         )
         .await;
     let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. }
@@ -963,13 +984,22 @@ pub(super) async fn node_exec_tests(r: &mut TestRunner) {
         .send(
             "A",
             exec(vec![
-                self_exe.clone(), "stress-exec".into(), "10".into(), "mixed".into(), "tokio".into(),
+                self_exe.clone(),
+                "stress-exec".into(),
+                "10".into(),
+                "mixed".into(),
+                "tokio".into(),
             ]),
         )
         .await;
     let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. }
         if stdout.contains("STRESS_START") && stdout.contains("STRESS_END failures=0"));
-    r.record("X63.stress_exec_tokio_mixed", "A", pass, &format!("{resp:?}"));
+    r.record(
+        "X63.stress_exec_tokio_mixed",
+        "A",
+        pass,
+        &format!("{resp:?}"),
+    );
 
     // ── Non-PIE exec reproduction tests ──
     // The root cause of X28b is that non-PIE binaries (which load at

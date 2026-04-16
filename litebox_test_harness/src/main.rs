@@ -89,11 +89,15 @@ fn main() {
                             .await;
                         match result {
                             Ok(out) => {
-                                let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                                let stdout =
+                                    String::from_utf8_lossy(&out.stdout).trim().to_string();
                                 if stdout == expected {
                                     eprintln!("i={i} ok={stdout}");
                                 } else {
-                                    eprintln!("i={i} FAIL: expected={expected:?} got={stdout:?} exit={}", out.status);
+                                    eprintln!(
+                                        "i={i} FAIL: expected={expected:?} got={stdout:?} exit={}",
+                                        out.status
+                                    );
                                     failures += 1;
                                 }
                             }
@@ -125,7 +129,10 @@ fn main() {
                             if stdout == expected {
                                 eprintln!("i={i} ok={stdout}");
                             } else {
-                                eprintln!("i={i} FAIL: expected={expected:?} got={stdout:?} exit={}", out.status);
+                                eprintln!(
+                                    "i={i} FAIL: expected={expected:?} got={stdout:?} exit={}",
+                                    out.status
+                                );
                                 failures += 1;
                             }
                         }

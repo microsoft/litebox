@@ -2086,11 +2086,22 @@ impl LinuxUserland {
                 bridge_threads,
             } = worker;
             let wait_status = read_worker_result_fd(result_fd);
-            self.detached_worker_bridge_threads
-                .lock()
-                .unwrap()
-                .extend(bridge_threads);
-            self.reap_finished_worker_bridge_threads();
+            // Wait for all bridge threads to finish. The worker has exited,
+            // so the OS pipes will EOF and bridges will exit shortly. We
+            // must wait here because the caller (exec_on_remote_host) will
+            // call exit_group immediately after we return, which would close
+            // the virtual pipe senders before bridges finish writing data.
+            for bridge in bridge_threads {
+                if let Some(input_control) = bridge.input_control.as_ref() {
+                    input_control
+                        .cancel
+                        .store(true, std::sync::atomic::Ordering::Release);
+                    if let Some(thread_handle) = &input_control.thread_handle {
+                        thread_handle.interrupt();
+                    }
+                }
+                let _ = bridge.handle.join();
+            }
             if let Some(wait_status) = wait_status {
                 return wait_status;
             }
