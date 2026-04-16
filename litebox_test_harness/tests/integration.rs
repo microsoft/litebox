@@ -446,11 +446,11 @@ fn process_tree_tests() {
         eprintln!("WARNING: native baseline produced no results. Skipping baseline check.");
     } else {
         // Native should have 0 unexpected results (FAIL or XPASS).
-        // U6.sibling_connect is xfail (test expects connection failure for litebox)
+        // U.sibling.connect is xfail (test expects connection failure for litebox)
         // but natively siblings share filesystem so the connect succeeds —
         // the test's pass condition (ConnectFailed) is false, making it xfail.
         // This is expected: the test is designed for litebox's limitation.
-        check_results("native", &native_results, 1); // 1 xfail: U6
+        check_results("native", &native_results, 1); // 1 xfail: U.sibling
     }
 
     // ── Pass 2: Litebox ──
@@ -464,7 +464,10 @@ fn process_tree_tests() {
     };
 
     // Update this constant when intentionally adding/removing xfails.
-    const EXPECTED_XFAIL_COUNT: usize = 13; // S1(4) + S2-S5(4) + S6-S9(4, minus S7.read_dangling) + U6 = 13
+    // Matrix symlinks: 4 subtests × 5 topologies = 20 (if ENOTSUP)
+    // Special symlinks: S6, S7.readlink_dangling, S8, S9 = 4 (if ENOTSUP)
+    // Unix socket: U.sibling.connect = 1
+    const EXPECTED_XFAIL_COUNT: usize = 25;
     check_results("litebox", &litebox_results, EXPECTED_XFAIL_COUNT);
 
     // ── Cross-check: any test passing natively but failing in litebox is a litebox bug ──
