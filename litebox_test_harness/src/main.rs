@@ -54,6 +54,94 @@ fn main() {
         "echo-test" => {
             println!("ECHO_TEST_OK");
         }
+        "stress-exec" => {
+            // Bypass test harness protocol entirely. Directly fork+exec
+            // from a single process to test if litebox's fork/exec leaks
+            // state between sequential calls.
+            //
+            // Usage: stress-exec <count> <pie|nonpie|mixed> [sync|tokio]
+            // Outputs results to BOTH stdout and stderr.
+            let count: usize = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(10);
+            let mode = args.get(3).map(String::as_str).unwrap_or("pie");
+            let use_tokio = args.get(4).map(String::as_str) == Some("tokio");
+            let mut failures = 0;
+            println!("STRESS_START mode={mode} count={count} tokio={use_tokio}");
+            if use_tokio {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("tokio runtime");
+                failures = rt.block_on(async {
+                    let mut failures = 0;
+                    for i in 0..count {
+                        let (cmd_args, expected): (Vec<&str>, &str) = match mode {
+                            "nonpie" => (vec!["/nonpie-echo"], "NONPIE_OK"),
+                            "mixed" if i % 2 == 0 => (vec![self_exe, "echo-test"], "ECHO_TEST_OK"),
+                            "mixed" => (vec!["/nonpie-echo"], "NONPIE_OK"),
+                            _ => (vec![self_exe, "echo-test"], "ECHO_TEST_OK"),
+                        };
+                        let result = tokio::process::Command::new(cmd_args[0])
+                            .args(&cmd_args[1..])
+                            .stdin(std::process::Stdio::null())
+                            .stdout(std::process::Stdio::piped())
+                            .stderr(std::process::Stdio::piped())
+                            .output()
+                            .await;
+                        match result {
+                            Ok(out) => {
+                                let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                                if stdout == expected {
+                                    eprintln!("i={i} ok={stdout}");
+                                } else {
+                                    eprintln!("i={i} FAIL: expected={expected:?} got={stdout:?} exit={}", out.status);
+                                    failures += 1;
+                                }
+                            }
+                            Err(e) => {
+                                eprintln!("i={i} FAIL: spawn error: {e}");
+                                failures += 1;
+                            }
+                        }
+                    }
+                    failures
+                });
+            } else {
+                for i in 0..count {
+                    let (cmd_args, expected): (Vec<&str>, &str) = match mode {
+                        "nonpie" => (vec!["/nonpie-echo"], "NONPIE_OK"),
+                        "mixed" if i % 2 == 0 => (vec![self_exe, "echo-test"], "ECHO_TEST_OK"),
+                        "mixed" => (vec!["/nonpie-echo"], "NONPIE_OK"),
+                        _ => (vec![self_exe, "echo-test"], "ECHO_TEST_OK"),
+                    };
+                    let result = std::process::Command::new(cmd_args[0])
+                        .args(&cmd_args[1..])
+                        .stdin(std::process::Stdio::null())
+                        .stdout(std::process::Stdio::piped())
+                        .stderr(std::process::Stdio::piped())
+                        .output();
+                    match result {
+                        Ok(out) => {
+                            let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                            if stdout == expected {
+                                eprintln!("i={i} ok={stdout}");
+                            } else {
+                                eprintln!("i={i} FAIL: expected={expected:?} got={stdout:?} exit={}", out.status);
+                                failures += 1;
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("i={i} FAIL: spawn error: {e}");
+                            failures += 1;
+                        }
+                    }
+                }
+            }
+            println!("STRESS_END failures={failures}");
+            eprintln!("stress-exec: {count} execs, {failures} failures");
+            if failures > 0 {
+                std::process::exit(1);
+            }
+        }
         "exit-with" => {
             let code: i32 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(0);
             std::process::exit(code);

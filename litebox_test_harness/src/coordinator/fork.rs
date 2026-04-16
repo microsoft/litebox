@@ -922,6 +922,55 @@ pub(super) async fn node_exec_tests(r: &mut TestRunner) {
         }
     }
 
+    // X60: stress-exec subcommand — bypasses agent protocol entirely.
+    // Runs 20 sequential PIE execs from a single process (no forwarding).
+    // If this fails, the issue is in litebox fork/exec, not the harness.
+    let resp = r
+        .send(
+            "A",
+            exec(vec![self_exe.clone(), "stress-exec".into(), "20".into(), "pie".into()]),
+        )
+        .await;
+    let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. }
+        if stdout.contains("STRESS_START") && stdout.contains("STRESS_END failures=0"));
+    r.record("X60.stress_exec_pie", "A", pass, &format!("{resp:?}"));
+
+    // X61: stress-exec with non-PIE — 10 sequential non-PIE execs.
+    let resp = r
+        .send(
+            "A",
+            exec(vec![self_exe.clone(), "stress-exec".into(), "10".into(), "nonpie".into()]),
+        )
+        .await;
+    let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. }
+        if stdout.contains("STRESS_START") && stdout.contains("STRESS_END failures=0"));
+    r.record("X61.stress_exec_nonpie", "A", pass, &format!("{resp:?}"));
+
+    // X62: stress-exec with mixed PIE/non-PIE — 10 alternating execs.
+    let resp = r
+        .send(
+            "A",
+            exec(vec![self_exe.clone(), "stress-exec".into(), "10".into(), "mixed".into()]),
+        )
+        .await;
+    let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. }
+        if stdout.contains("STRESS_START") && stdout.contains("STRESS_END failures=0"));
+    r.record("X62.stress_exec_mixed", "A", pass, &format!("{resp:?}"));
+
+    // X63: stress-exec using tokio::process::Command (same path as agent Exec).
+    // If this fails but X62 passes, the issue is in tokio's process spawning.
+    let resp = r
+        .send(
+            "A",
+            exec(vec![
+                self_exe.clone(), "stress-exec".into(), "10".into(), "mixed".into(), "tokio".into(),
+            ]),
+        )
+        .await;
+    let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. }
+        if stdout.contains("STRESS_START") && stdout.contains("STRESS_END failures=0"));
+    r.record("X63.stress_exec_tokio_mixed", "A", pass, &format!("{resp:?}"));
+
     // ── Non-PIE exec reproduction tests ──
     // The root cause of X28b is that non-PIE binaries (which load at
     // 0x400000) trigger exec_on_remote_host, and the pipe replacement
