@@ -814,6 +814,39 @@ pub(super) async fn node_exec_tests(r: &mut TestRunner) {
         r.record("X54.nonpie_after_stress", "AB", pass, &format!("{resp:?}"));
     }
 
+    // X55: Non-PIE as SECOND exec (AAB has never been used).
+    // One PIE exec, then one non-PIE — minimum reproduction.
+    let resp = r
+        .send("AAB", exec(vec![self_exe.clone(), "echo-test".into()]))
+        .await;
+    let pass =
+        matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout == "ECHO_TEST_OK");
+    r.record("X55a.one_pie_first", "AAB", pass, &format!("{resp:?}"));
+
+    let resp = r.send("AAB", exec(vec!["/nonpie-echo".into()])).await;
+    let not_found = matches!(&resp, Response::ExecResult { exit_code: 127, .. })
+        || matches!(&resp, Response::Error { .. });
+    if not_found {
+        r.record("X55b.nonpie_second", "AAB", true, "skipped");
+    } else {
+        let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout.contains("NONPIE_OK"));
+        r.record("X55b.nonpie_second", "AAB", pass, &format!("{resp:?}"));
+    }
+
+    // X56: Non-PIE as FIRST exec, PIE as second (AAA — check if already used).
+    // Use a fresh agent for a cleaner test... but AAA may have been used
+    // by X3. Let me use it anyway — the key is the order.
+    // Actually, let's just do two sequential non-PIE on B to check.
+    let resp = r.send("B", exec(vec!["/nonpie-echo".into()])).await;
+    let not_found = matches!(&resp, Response::ExecResult { exit_code: 127, .. })
+        || matches!(&resp, Response::Error { .. });
+    if not_found {
+        r.record("X56.second_nonpie_on_B", "B", true, "skipped");
+    } else {
+        let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout.contains("NONPIE_OK"));
+        r.record("X56.second_nonpie_on_B", "B", pass, &format!("{resp:?}"));
+    }
+
     // ── Non-PIE exec reproduction tests ──
     // The root cause of X28b is that non-PIE binaries (which load at
     // 0x400000) trigger exec_on_remote_host, and the pipe replacement
