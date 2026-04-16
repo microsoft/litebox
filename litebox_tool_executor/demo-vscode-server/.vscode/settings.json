@@ -35,6 +35,7 @@
             "args": ["-d", "Ubuntu", "--",
                 "/mnt/c/src/litebox-vscode-server/target/debug/litebox_tool_executor",
                 "--rootfs", "/home/wportnoy/vscode-rootfs",
+                "--policy", "/mnt/c/src/litebox-vscode-server/litebox_tool_executor/policies/demo-policy.json",
                 "--interactive"
             ],
             "icon": "shield"

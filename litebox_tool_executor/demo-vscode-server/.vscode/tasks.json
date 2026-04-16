@@ -26,7 +26,7 @@
             "args": [
                 "-d", "Ubuntu", "-u", "wportnoy", "--",
                 "bash", "-lc",
-                "cd /mnt/c/src/litebox-vscode-server && target/debug/litebox_tool_executor --rootfs /home/wportnoy/vscode-rootfs --vscode-server --ssh-port 2222"
+                "cd /mnt/c/src/litebox-vscode-server && target/debug/litebox_tool_executor --rootfs /home/wportnoy/vscode-rootfs --vscode-server --ssh-port 2222 --policy /mnt/c/src/litebox-vscode-server/litebox_tool_executor/policies/demo-policy.json"
             ],
             "problemMatcher": [],
             "isBackground": true,
