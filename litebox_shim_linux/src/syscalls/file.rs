@@ -458,7 +458,30 @@ impl<FS: ShimFS> Task<FS> {
         files
             .run_on_raw_fd(
                 raw_fd,
-                |fd| files.fs.seek(fd, offset, whence).map_err(Errno::from),
+                |fd| match files.fs.seek(fd, offset, whence) {
+                    Ok(pos) => Ok(pos),
+                    Err(litebox::fs::errors::SeekError::NotAFile) => {
+                        let base: usize = match whence {
+                            SeekWhence::RelativeToBeginning => 0,
+                            SeekWhence::RelativeToCurrentOffset => self
+                                .global
+                                .litebox
+                                .descriptor_table()
+                                .with_metadata(fd, |off: &Diroff| off.0)
+                                .unwrap_or(0),
+                            SeekWhence::RelativeToEnd => {
+                                return Err(Errno::EINVAL);
+                            }
+                        };
+                        let new_pos = base.checked_add_signed(offset).ok_or(Errno::EINVAL)?;
+                        self.global
+                            .litebox
+                            .descriptor_table_mut()
+                            .set_fd_metadata(fd, Diroff(new_pos));
+                        Ok(new_pos)
+                    }
+                    Err(e) => Err(Errno::from(e)),
+                },
                 |_| Err(Errno::ESPIPE),
                 |_| Err(Errno::ESPIPE),
                 |_| Err(Errno::ESPIPE),

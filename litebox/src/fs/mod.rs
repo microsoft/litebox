@@ -272,6 +272,7 @@ bitflags! {
 }
 
 /// The `whence` directive to [`FileSystem::seek`]
+#[derive(Copy, Clone)]
 pub enum SeekWhence {
     /// The file offset is set to `offset` bytes.
     RelativeToBeginning,
