@@ -319,6 +319,16 @@ async fn run_tests(self_exe: &str) -> Vec<TestResult> {
 
     // === Node.js Exec Tests (run LAST — may contaminate agent pipes) ===
     eprintln!("[coord] === Node.js Exec Tests ===");
+    // Canary: test that agent A can still exec before starting node tests.
+    {
+        let canary_cmd = crate::protocol::Command::Exec {
+            args: vec![runner.self_exe.clone(), "echo-test".into()],
+            timeout_secs: None,
+        };
+        let resp = runner.send("A", canary_cmd).await;
+        let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout == "ECHO_TEST_OK");
+        runner.record("X_canary.pre_node", "A", pass, &format!("{resp:?}"));
+    }
     fork::node_exec_tests(&mut runner).await;
 
     // Shutdown all children.

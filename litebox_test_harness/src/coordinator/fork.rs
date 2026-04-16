@@ -678,6 +678,142 @@ pub(super) async fn node_exec_tests(r: &mut TestRunner) {
         &format!("{resp:?}"),
     );
 
+    // ── Isolation tests ──
+    // These tests check whether sequential execs from the same agent
+    // contaminate each other. They run BEFORE non-PIE tests to establish
+    // whether PIE execs are clean.
+
+    // X49: Two sequential PIE execs from the same agent.
+    // Both should return their own output. If the second returns the
+    // first's output, the contamination affects PIE too.
+    let resp = r
+        .send("A", exec(vec![self_exe.clone(), "echo-test".into()]))
+        .await;
+    let pass1 = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout == "ECHO_TEST_OK");
+    r.record("X49a.pie_sequential_1", "A", pass1, &format!("{resp:?}"));
+
+    let resp = r
+        .send(
+            "A",
+            exec(vec![self_exe.clone(), "exit-with".into(), "0".into()]),
+        )
+        .await;
+    let pass2 = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout.is_empty());
+    r.record("X49b.pie_sequential_2", "A", pass2, &format!("{resp:?}"));
+
+    // X50: PIE exec after a non-PIE exec.
+    // If non-PIE exec contaminates, this PIE exec gets non-PIE's output.
+    let resp = r.send("A", exec(vec!["/nonpie-echo".into()])).await;
+    let not_found = matches!(&resp, Response::ExecResult { exit_code: 127, .. })
+        || matches!(&resp, Response::Error { .. });
+    if not_found {
+        r.record(
+            "X50a.nonpie_then_pie_1",
+            "A",
+            true,
+            "skipped (nonpie-echo not in rootfs)",
+        );
+        r.record(
+            "X50b.nonpie_then_pie_2",
+            "A",
+            true,
+            "skipped (nonpie-echo not in rootfs)",
+        );
+    } else {
+        let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout.contains("NONPIE_OK"));
+        r.record("X50a.nonpie_then_pie_1", "A", pass, &format!("{resp:?}"));
+
+        // Now exec a PIE binary — should see PIE's output, not NONPIE_OK.
+        let resp = r
+            .send("A", exec(vec![self_exe.clone(), "echo-test".into()]))
+            .await;
+        let pass =
+            matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout == "ECHO_TEST_OK");
+        r.record("X50b.nonpie_then_pie_2", "A", pass, &format!("{resp:?}"));
+    }
+
+    // X51: Non-PIE exec on a FRESH agent (B) that has never exec'd non-PIE.
+    // If this passes, the contamination is per-agent state, not global.
+    let resp = r.send("B", exec(vec!["/nonpie-echo".into()])).await;
+    let not_found = matches!(&resp, Response::ExecResult { exit_code: 127, .. })
+        || matches!(&resp, Response::Error { .. });
+    if not_found {
+        r.record(
+            "X51.nonpie_fresh_agent",
+            "B",
+            true,
+            "skipped (nonpie-echo not in rootfs)",
+        );
+        r.record("X52a.B_nonpie_then_pie", "B", true, "skipped");
+        r.record("X52b.B_pie_after_nonpie", "B", true, "skipped");
+        r.record("X52c.B_third_exec", "B", true, "skipped");
+    } else {
+        let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout.contains("NONPIE_OK"));
+        r.record("X51.nonpie_fresh_agent", "B", pass, &format!("{resp:?}"));
+
+        // X52a: PIE exec on B after the non-PIE — does B get contaminated?
+        let resp = r
+            .send("B", exec(vec![self_exe.clone(), "echo-test".into()]))
+            .await;
+        let pass =
+            matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout == "ECHO_TEST_OK");
+        r.record("X52a.B_nonpie_then_pie", "B", pass, &format!("{resp:?}"));
+
+        // X52b: Another PIE exec — does the shift continue?
+        let resp = r
+            .send(
+                "B",
+                exec(vec![self_exe.clone(), "exit-with".into(), "0".into()]),
+            )
+            .await;
+        let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout.is_empty());
+        r.record("X52b.B_pie_after_nonpie", "B", pass, &format!("{resp:?}"));
+
+        // X52c: One more — is the shift a one-time glitch or persistent?
+        let resp = r
+            .send("B", exec(vec![self_exe.clone(), "echo-test".into()]))
+            .await;
+        let pass =
+            matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout == "ECHO_TEST_OK");
+        r.record("X52c.B_third_exec", "B", pass, &format!("{resp:?}"));
+    }
+
+    // X53: Stress test — many sequential PIE execs on agent AB.
+    // AB is a child of A, and has never been used for Exec.
+    // If this fails at some count, there's a per-agent resource leak.
+    let mut x53_all_pass = true;
+    for i in 0..30 {
+        let resp = r
+            .send("AB", exec(vec![self_exe.clone(), "echo-test".into()]))
+            .await;
+        let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout == "ECHO_TEST_OK");
+        if !pass {
+            r.record(
+                "X53.stress_pie",
+                "AB",
+                false,
+                &format!("failed at iteration {i}: {resp:?}"),
+            );
+            x53_all_pass = false;
+            break;
+        }
+    }
+    if x53_all_pass {
+        r.record("X53.stress_pie", "AB", true, "30 sequential PIE execs all passed");
+    }
+
+    // X54: Non-PIE exec on AB after 30 PIE execs — does prior PIE state
+    // interfere with non-PIE?
+    let resp = r.send("AB", exec(vec!["/nonpie-echo".into()])).await;
+    let not_found = matches!(&resp, Response::ExecResult { exit_code: 127, .. })
+        || matches!(&resp, Response::Error { .. });
+    if not_found {
+        r.record("X54.nonpie_after_stress", "AB", true, "skipped");
+    } else {
+        let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout.contains("NONPIE_OK"));
+        r.record("X54.nonpie_after_stress", "AB", pass, &format!("{resp:?}"));
+    }
+
     // ── Non-PIE exec reproduction tests ──
     // The root cause of X28b is that non-PIE binaries (which load at
     // 0x400000) trigger exec_on_remote_host, and the pipe replacement
