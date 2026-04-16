@@ -492,6 +492,7 @@ impl<FS: ShimFS> LinuxShim<FS> {
                 delayed_fork_pending: Cell::new(false),
                 migrated_to_remote: Cell::new(false),
                 mux_pipe_pair_ids: RefCell::new(Vec::new()),
+                netlink_sockets: RefCell::new(alloc::collections::BTreeMap::new()),
             },
         };
         let exec_filename = alloc::ffi::CString::new(exec_filename).ok();
@@ -1146,6 +1147,7 @@ impl<FS: ShimFS> LinuxShim<FS> {
                 delayed_fork_pending: Cell::new(false),
                 migrated_to_remote: Cell::new(false),
                 mux_pipe_pair_ids: RefCell::new(Vec::new()),
+                netlink_sockets: RefCell::new(alloc::collections::BTreeMap::new()),
             },
         };
 
@@ -2371,7 +2373,10 @@ impl<FS: ShimFS> Task<FS> {
         {
             audit_event.pid = self.pid;
             let comm_bytes = self.comm.get();
-            let comm_len = comm_bytes.iter().position(|&b| b == 0).unwrap_or(comm_bytes.len());
+            let comm_len = comm_bytes
+                .iter()
+                .position(|&b| b == 0)
+                .unwrap_or(comm_bytes.len());
             let _ = audit_event
                 .comm
                 .try_push_str(core::str::from_utf8(&comm_bytes[..comm_len]).unwrap_or("?"));
@@ -2417,8 +2422,8 @@ impl<FS: ShimFS> Task<FS> {
                 if flags & AT_EMPTY_PATH != 0 {
                     // fexecve path: resolve the fd to a filesystem path.
                     let path = self.fd_path_for_raw(dirfd).ok_or(Errno::EBADF)?;
-                    let path_cstr = alloc::ffi::CString::new(path.as_bytes())
-                        .map_err(|_| Errno::EINVAL)?;
+                    let path_cstr =
+                        alloc::ffi::CString::new(path.as_bytes()).map_err(|_| Errno::EINVAL)?;
                     let path_ptr = crate::ConstPtr::<i8>::from_usize(path_cstr.as_ptr() as usize);
                     // Keep path_cstr alive across the call.
                     let result = self.sys_execve(path_ptr, argv, envp, ctx);
@@ -3703,6 +3708,11 @@ struct Task<FS: ShimFS> {
     /// `ForkContext.parent_pipe_fds` can exclude them, preventing nested
     /// mux-over-mux bridging that destroys the first mux's endpoints.
     mux_pipe_pair_ids: RefCell<Vec<usize>>,
+
+    /// Active netlink sockets, keyed by guest fd number.
+    /// Used to intercept sendto/recvmsg/bind for AF_NETLINK fds.
+    netlink_sockets:
+        RefCell<alloc::collections::BTreeMap<u32, crate::syscalls::netlink::NetlinkRouteSocket>>,
 }
 
 impl<FS: ShimFS> Drop for Task<FS> {
@@ -3753,6 +3763,7 @@ mod test_utils {
                 delayed_fork_pending: Cell::new(false),
                 migrated_to_remote: Cell::new(false),
                 mux_pipe_pair_ids: RefCell::new(Vec::new()),
+                netlink_sockets: RefCell::new(alloc::collections::BTreeMap::new()),
                 process_state: self.process_state.into(),
                 global: self.global,
             }
@@ -3789,6 +3800,7 @@ mod test_utils {
                 delayed_fork_pending: Cell::new(false),
                 migrated_to_remote: Cell::new(false),
                 mux_pipe_pair_ids: RefCell::new(Vec::new()),
+                netlink_sockets: RefCell::new(alloc::collections::BTreeMap::new()),
             };
             Some(task)
         }

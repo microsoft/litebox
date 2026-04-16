@@ -11,6 +11,7 @@ pub mod host_pipe;
 pub(crate) mod misc;
 pub(crate) mod mm;
 pub(crate) mod net;
+pub(crate) mod netlink;
 pub mod process;
 pub(crate) mod unix;
 

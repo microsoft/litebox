@@ -1078,7 +1078,39 @@ impl<FS: ShimFS> Task<FS> {
                 }
                 raw_fd
             }
-            AddressFamily::INET6 | AddressFamily::NETLINK => return Err(Errno::EAFNOSUPPORT),
+            AddressFamily::INET6 => return Err(Errno::EAFNOSUPPORT),
+            AddressFamily::NETLINK => {
+                // Minimal AF_NETLINK ROUTE socket for getifaddrs() support.
+                // Create a dummy pipe fd (we only need a valid fd number)
+                // and register a NetlinkRouteSocket for it.
+                let (sender, receiver) = self.global.pipes.create_pipe(
+                    4096,
+                    litebox::pipes::Flags::empty(),
+                    None,
+                );
+                // Close the receiver — we only need the sender as a placeholder fd.
+                let _ = self.global.pipes.close(&receiver);
+                let Ok(raw_fd) = files.insert_raw_fd(sender) else {
+                    return Err(Errno::EMFILE);
+                };
+                if flags.contains(SockFlags::CLOEXEC) {
+                    let files = self.files.borrow();
+                    let rds = files.raw_descriptor_store.read();
+                    if let Ok(typed) = rds
+                        .fd_from_raw_integer::<litebox::pipes::Pipes<crate::Platform>>(raw_fd)
+                    {
+                        let _ = self.global.litebox.descriptor_table_mut().set_fd_metadata(
+                            &typed,
+                            litebox_common_linux::FileDescriptorFlags::FD_CLOEXEC,
+                        );
+                    }
+                }
+                self.netlink_sockets.borrow_mut().insert(
+                    u32::try_from(raw_fd).unwrap(),
+                    crate::syscalls::netlink::NetlinkRouteSocket::new(),
+                );
+                raw_fd
+            }
             _ => unimplemented!(),
         };
         Ok(u32::try_from(file).unwrap())
@@ -1405,6 +1437,11 @@ impl<FS: ShimFS> Task<FS> {
         self.do_bind(sockfd, sockaddr)
     }
     fn do_bind(&self, sockfd: u32, sockaddr: SocketAddress) -> Result<(), Errno> {
+        // Netlink socket: bind is a no-op.
+        if self.netlink_sockets.borrow().contains_key(&sockfd) {
+            self.netlink_sockets.borrow_mut().get_mut(&sockfd).unwrap().bind();
+            return Ok(());
+        }
         self.files.borrow().with_socket(
             &self.global,
             sockfd,
@@ -1487,6 +1524,10 @@ impl<FS: ShimFS> Task<FS> {
         flags: SendFlags,
         sockaddr: Option<SocketAddress>,
     ) -> Result<usize, Errno> {
+        // Netlink socket: parse request and generate response.
+        if let Some(nl) = self.netlink_sockets.borrow_mut().get_mut(&sockfd) {
+            return nl.sendto(buf).map_err(|_| Errno::EINVAL);
+        }
         let ret = self.files.borrow().with_socket(
             &self.global,
             sockfd,
@@ -1753,6 +1794,25 @@ impl<FS: ShimFS> Task<FS> {
         msg: &litebox_common_linux::UserMsgHdr<Platform>,
         flags: SendFlags,
     ) -> Result<usize, Errno> {
+        // Netlink socket: extract data from iovs and handle via sendto.
+        if self.netlink_sockets.borrow().contains_key(&sockfd) {
+            if msg.msg_iovlen > 1024 {
+                return Err(Errno::EINVAL);
+            }
+            let iovs = msg
+                .msg_iov
+                .to_owned_slice(msg.msg_iovlen)
+                .ok_or(Errno::EFAULT)?;
+            let buf = Self::copy_sendmsg_iovs(&iovs)?;
+            return self
+                .netlink_sockets
+                .borrow_mut()
+                .get_mut(&sockfd)
+                .unwrap()
+                .sendto(&buf)
+                .map_err(|_| Errno::EINVAL);
+        }
+
         let msg_name = msg.msg_name;
         let sock_addr = if msg_name.as_usize() != 0 {
             Some(read_sockaddr_from_user(
@@ -1936,6 +1996,49 @@ impl<FS: ShimFS> Task<FS> {
         let Ok(sockfd) = u32::try_from(fd) else {
             return Err(Errno::EBADF);
         };
+
+        // Netlink socket: return buffered response data.
+        if let Some(nl) = self.netlink_sockets.borrow_mut().get_mut(&sockfd) {
+            let mut hdr =
+                ConstPtr::<litebox_common_linux::UserMsgHdr<Platform>>::from_usize(msg.as_usize())
+                    .read_at_offset(0)
+                    .ok_or(Errno::EFAULT)?;
+            if hdr.msg_iovlen == 0 {
+                return Err(Errno::EINVAL);
+            }
+            let iovs = hdr
+                .msg_iov
+                .to_owned_slice(hdr.msg_iovlen)
+                .ok_or(Errno::EFAULT)?;
+
+            let mut total_written = 0;
+            for iov in &iovs {
+                if iov.iov_len == 0 {
+                    continue;
+                }
+                let mut buf = alloc::vec![0u8; iov.iov_len];
+                let n = nl.recv(&mut buf);
+                if n == 0 {
+                    break;
+                }
+                let iov_base = iov.iov_base;
+                let dest = MutPtr::<u8>::from_usize(iov_base.as_usize());
+                for (i, &byte) in buf[..n].iter().enumerate() {
+                    dest.write_at_offset(i as isize, byte);
+                }
+                total_written += n;
+                if n < iov.iov_len {
+                    break;
+                }
+            }
+            // Clear msg_name and msg_controllen
+            hdr.msg_namelen = 0;
+            hdr.msg_controllen = 0;
+            hdr.msg_flags = ReceiveFlags::empty();
+            msg.write_at_offset(0, hdr);
+            return Ok(total_written);
+        }
+
         let mut hdr =
             ConstPtr::<litebox_common_linux::UserMsgHdr<Platform>>::from_usize(msg.as_usize())
                 .read_at_offset(0)
@@ -2038,6 +2141,11 @@ impl<FS: ShimFS> Task<FS> {
         flags: ReceiveFlags,
         source_addr: Option<&mut Option<SocketAddress>>,
     ) -> Result<usize, Errno> {
+        // Netlink socket: return buffered response data.
+        if let Some(nl) = self.netlink_sockets.borrow_mut().get_mut(&sockfd) {
+            let n = nl.recv(buf);
+            return Ok(n);
+        }
         self.do_recvfrom_with_fds(sockfd, buf, flags, source_addr, &mut Vec::new())
     }
 
@@ -2121,6 +2229,10 @@ impl<FS: ShimFS> Task<FS> {
         optval: ConstPtr<u8>,
         optlen: usize,
     ) -> Result<(), Errno> {
+        // Netlink socket: ignore setsockopt.
+        if self.netlink_sockets.borrow().contains_key(&sockfd) {
+            return Ok(());
+        }
         self.files.borrow().with_socket(
             &self.global,
             sockfd,
@@ -2183,10 +2295,31 @@ impl<FS: ShimFS> Task<FS> {
         let Ok(sockfd) = u32::try_from(sockfd) else {
             return Err(Errno::EBADF);
         };
+        // Netlink socket: write sockaddr_nl directly.
+        if self.netlink_sockets.borrow().contains_key(&sockfd) {
+            // struct sockaddr_nl { sa_family(2) + nl_pad(2) + nl_pid(4) + nl_groups(4) } = 12
+            let mut sa = [0u8; 12];
+            sa[0..2].copy_from_slice(&16u16.to_ne_bytes()); // sa_family = AF_NETLINK
+            let pid = u32::try_from(self.pid).unwrap_or(0);
+            sa[4..8].copy_from_slice(&pid.to_ne_bytes()); // nl_pid
+            let user_len = addrlen
+                .read_at_offset(0)
+                .ok_or(Errno::EFAULT)?;
+            let copy_len = (user_len as usize).min(sa.len());
+            for i in 0..copy_len {
+                addr.write_at_offset(i as isize, sa[i]);
+            }
+            addrlen.write_at_offset(0, 12u32);
+            return Ok(());
+        }
         let sockaddr = self.do_getsockname(sockfd)?;
         write_sockaddr_to_user(sockaddr, addr, addrlen)
     }
     fn do_getsockname(&self, sockfd: u32) -> Result<SocketAddress, Errno> {
+        // Netlink socket: return a dummy address.
+        if self.netlink_sockets.borrow().contains_key(&sockfd) {
+            return Ok(SocketAddress::default());
+        }
         self.files.borrow().with_socket(
             &self.global,
             sockfd,

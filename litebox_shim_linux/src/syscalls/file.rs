@@ -2006,6 +2006,11 @@ impl<FS: ShimFS> Task<FS> {
         // trampoline RW→RX) before closing the descriptor.
         self.finalize_elf_patch(fd);
 
+        // Clean up netlink socket state if this fd was a netlink socket.
+        if let Ok(fd_u32) = u32::try_from(fd) {
+            self.netlink_sockets.borrow_mut().remove(&fd_u32);
+        }
+
         let Ok(raw_fd) = u32::try_from(fd).and_then(usize::try_from) else {
             return Err(Errno::EBADF);
         };
@@ -3634,11 +3639,15 @@ impl<FS: ShimFS> Task<FS> {
                         // Pipes inherited across exec may lack this metadata;
                         // the update_flags call above already applied the
                         // actual flag change, so just log and succeed.
-                        if self.global.litebox.descriptor_table_mut()
+                        if self
+                            .global
+                            .litebox
+                            .descriptor_table_mut()
                             .with_metadata_mut(fd, |crate::PipeStatusFlags(f)| {
                                 let diff = (*f & setfl_mask) ^ flags;
                                 f.toggle(diff);
-                            }).is_err()
+                            })
+                            .is_err()
                         {
                             log_unsupported!("pipe F_SETFL: missing PipeStatusFlags metadata");
                         }
