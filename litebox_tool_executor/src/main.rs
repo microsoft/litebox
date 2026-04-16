@@ -18,6 +18,7 @@ use std::io::Read as _;
 
 #[derive(clap::Parser, Debug)]
 #[command(name = "litebox-tool-executor")]
+#[command(group(clap::ArgGroup::new("policy_mode").required(true)))]
 /// Execute Linux commands in a LiteBox sandbox.
 struct Cli {
     /// Path to a .tar rootfs containing syscall-rewritten Linux binaries.
@@ -25,8 +26,9 @@ struct Cli {
     rootfs: std::path::PathBuf,
 
     /// Path to a JSON policy file restricting guest operations.
-    /// When provided, the broker enforces filesystem and network policy.
-    #[arg(long, value_name = "PATH", value_hint = clap::ValueHint::FilePath)]
+    /// The broker enforces filesystem and network rules from this file.
+    /// Mutually exclusive with `--record-baseline`.
+    #[arg(long, value_name = "PATH", value_hint = clap::ValueHint::FilePath, group = "policy_mode")]
     policy: Option<std::path::PathBuf>,
 
     /// Run a persistent interactive shell inside the sandbox.
@@ -58,11 +60,12 @@ struct Cli {
     #[arg(long, default_value = "2222")]
     ssh_port: u16,
 
-    /// Record a baseline: use AllowAll policy (no restrictions) so every
+    /// Record a baseline: use the allow-all policy (no restrictions) so every
     /// operation succeeds while being fully audit-logged. Use this to
-    /// capture the complete set of operations VS Code Server needs,
+    /// capture the complete set of operations a workload needs,
     /// then generate a policy from the recording.
-    #[arg(long)]
+    /// Mutually exclusive with `--policy`.
+    #[arg(long, group = "policy_mode")]
     record_baseline: bool,
 
     /// Forward a host TCP port to a guest port (HOST:GUEST_IP:GUEST_PORT).
@@ -390,88 +393,29 @@ impl Drop for BrokerProcess {
     }
 }
 
-/// Default sandbox policy applied when no `--policy` file is specified.
-///
-/// - Filesystem: deny access to secrets (`.ssh`, private keys, host shadow)
-/// - Network: deny all outbound connections
-///
-/// Note: `/etc/passwd` and `/etc/group` are NOT denied — they are
-/// world-readable on any Linux system and needed by `getpwnam()` (dropbear).
-/// Only `/etc/shadow` (password hashes) is blocked.
-const DEFAULT_POLICY: &str = r#"{
-    "filesystem": {
-        "allow_read": [],
-        "allow_write": ["/tmp/**", "/shared/**", "/root/.cache/**", "**/workspace/**", "**/workspaces/**", "**/.vscode-server/**"],
-        "deny": ["**/.ssh/**", "**/shadow", "**/id_rsa*", "**/id_ed25519*"]
-    },
-    "network": {
-        "deny_all": true,
-        "allow_connect": [
-            "update.code.visualstudio.com:443",
-            "*.vo.msecnd.net:443",
-            "*.visualstudio.com:443",
-            "*.githubcopilot.com:443",
-            "copilot-proxy.githubusercontent.com:443",
-            "copilot-telemetry.githubusercontent.com:443",
-            "origin-tracker.githubusercontent.com:443",
-            "github.com:443",
-            "api.github.com:443",
-            "vscode-auth.github.com:443",
-            "collector.github.com:443",
-            "default.exp-tas.com:443",
-            "marketplace.visualstudio.com:443",
-            "*.gallerycdn.azureedge.net:443",
-            "vscode.blob.core.windows.net:443",
-            "mobile.events.data.microsoft.com:443"
-        ]
-    }
-}"#;
-
-/// Write the default policy to a temporary file and return its path.
-fn write_default_policy() -> anyhow::Result<TempFile> {
-    let path = std::env::temp_dir().join(format!(
-        "litebox-default-policy-{}.json",
-        std::process::id()
-    ));
-    std::fs::write(&path, DEFAULT_POLICY)?;
-    Ok(TempFile(path))
-}
-
-/// A file that is deleted when dropped.
-struct TempFile(std::path::PathBuf);
-
-impl Drop for TempFile {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.0);
-    }
-}
-
-/// Spawn the broker, using the user-provided policy or the built-in default.
+/// Spawn the broker, using the user-provided `--policy` file or no policy
+/// for `--record-baseline` (the broker defaults to AllowAll when no policy
+/// is given).
 fn spawn_broker(
     cli: &Cli,
     audit_log_file: Option<&std::path::Path>,
     forward_ports: &[(u16, &str, u16)],
-) -> anyhow::Result<(BrokerProcess, Option<TempFile>)> {
-    let (policy_path, temp_policy) = if cli.record_baseline {
-        // AllowAll: no policy file → broker allows everything
-        (None, None)
-    } else if let Some(ref p) = cli.policy {
-        (Some(p.clone()), None)
+) -> anyhow::Result<BrokerProcess> {
+    let policy_path = if cli.record_baseline {
+        None
     } else {
-        let tmp = write_default_policy()?;
-        let path = tmp.0.clone();
-        (Some(path), Some(tmp))
+        cli.policy.as_deref()
     };
     // Write broker logs to a .log file alongside the audit .jsonl files.
     let broker_log = audit_log_file.map(|p| p.with_extension("broker.log"));
     let broker = BrokerProcess::spawn(
         &cli.rootfs,
-        policy_path.as_deref(),
+        policy_path,
         broker_log.as_deref(),
         audit_log_file,
         forward_ports,
     )?;
-    Ok((broker, temp_policy))
+    Ok(broker)
 }
 fn runner_command(
     cli: &Cli,
@@ -529,7 +473,16 @@ fn runner_command(
     // Run as root inside the sandbox. The host process runs as a normal
     // user, but the guest should appear as root so sshd/dropbear can
     // authenticate users and manage sessions.
-    cmd.args(["--guest-uid", "0", "--guest-euid", "0", "--guest-gid", "0", "--guest-egid", "0"]);
+    cmd.args([
+        "--guest-uid",
+        "0",
+        "--guest-euid",
+        "0",
+        "--guest-gid",
+        "0",
+        "--guest-egid",
+        "0",
+    ]);
 
     cmd.arg("--");
 
@@ -540,7 +493,13 @@ fn runner_command(
     unsafe {
         use std::os::unix::process::CommandExt as _;
         cmd.pre_exec(|| {
-            for sig in [libc::SIGINT, libc::SIGTERM, libc::SIGQUIT, libc::SIGHUP, libc::SIGPIPE] {
+            for sig in [
+                libc::SIGINT,
+                libc::SIGTERM,
+                libc::SIGQUIT,
+                libc::SIGHUP,
+                libc::SIGPIPE,
+            ] {
                 libc::signal(sig, libc::SIG_DFL);
             }
             Ok(())
@@ -558,7 +517,7 @@ fn runner_command(
 /// This prevents bash from enabling job control (which breaks pipelines in
 /// the sandbox because setpgid fails for the session-leader init process).
 fn interactive(cli: &Cli, audit_log_file: Option<&std::path::Path>) -> anyhow::Result<()> {
-    let (broker, _temp_policy) = spawn_broker(cli, audit_log_file, &[])?;
+    let broker = spawn_broker(cli, audit_log_file, &[])?;
 
     let mut cmd = runner_command(cli, audit_log_file, Some(&broker))?;
 
@@ -605,7 +564,6 @@ fn interactive(cli: &Cli, audit_log_file: Option<&std::path::Path>) -> anyhow::R
 
     // Clean up the broker process.
     drop(broker);
-    // Temp policy file cleaned up when _temp_policy drops.
 
     if !status.success() {
         std::process::exit(status.code().unwrap_or(1));
@@ -628,12 +586,14 @@ fn direct(cli: &Cli, audit_log_file: Option<&std::path::Path>) -> anyhow::Result
                     parts[2].parse::<u16>().ok()?,
                 ))
             } else {
-                eprintln!("invalid --forward-port spec: {spec} (expected HOST:GUEST_IP:GUEST_PORT)");
+                eprintln!(
+                    "invalid --forward-port spec: {spec} (expected HOST:GUEST_IP:GUEST_PORT)"
+                );
                 None
             }
         })
         .collect();
-    let (broker, _temp_policy) = spawn_broker(cli, audit_log_file, &forward_ports)?;
+    let broker = spawn_broker(cli, audit_log_file, &forward_ports)?;
 
     let mut cmd = runner_command(cli, audit_log_file, Some(&broker))?;
     cmd.args(&cli.command);
@@ -692,10 +652,8 @@ fn vscode_server(cli: &Cli, audit_log_file: Option<&std::path::Path>) -> anyhow:
     // Start the broker with inbound TCP forwarding for SSH only.
     // VS Code CLI loopback connections are handled by port registration +
     // cross-worker bridging in the broker.
-    let forward_ports = [
-        (ssh_port, guest_ip, 22u16),
-    ];
-    let (broker, _temp_policy) = spawn_broker(cli, Some(audit), &forward_ports)?;
+    let forward_ports = [(ssh_port, guest_ip, 22u16)];
+    let broker = spawn_broker(cli, Some(audit), &forward_ports)?;
 
     // Build the runner command: dropbear SSH server
     // dropbear flags:
@@ -712,7 +670,8 @@ fn vscode_server(cli: &Cli, audit_log_file: Option<&std::path::Path>) -> anyhow:
         "-E", // stderr logging
         "-B", // allow blank passwords
         "-R", // generate host keys if missing
-        "-p", "22",
+        "-p",
+        "22",
     ]);
 
     cmd.stdin(std::process::Stdio::null())
@@ -763,17 +722,14 @@ fn vscode_server(cli: &Cli, audit_log_file: Option<&std::path::Path>) -> anyhow:
     eprintln!("==============================================");
     eprintln!();
 
-    let status = cmd.status().map_err(|e| {
-        anyhow::anyhow!("Failed to spawn litebox_runner_linux_userland: {e}")
-    })?;
+    let status = cmd
+        .status()
+        .map_err(|e| anyhow::anyhow!("Failed to spawn litebox_runner_linux_userland: {e}"))?;
 
     drop(broker);
 
     if !status.success() {
-        eprintln!(
-            "sshd exited with code {}",
-            status.code().unwrap_or(-1)
-        );
+        eprintln!("sshd exited with code {}", status.code().unwrap_or(-1));
         std::process::exit(status.code().unwrap_or(1));
     }
     Ok(())

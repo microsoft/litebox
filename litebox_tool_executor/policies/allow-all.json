@@ -1,0 +1,11 @@
+{
+    "filesystem": {
+        "allow_read": [],
+        "allow_write": ["**"],
+        "deny": []
+    },
+    "network": {
+        "deny_all": false,
+        "allow_connect": []
+    }
+}
