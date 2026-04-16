@@ -286,27 +286,21 @@ async fn run_tests(self_exe: &str) -> Vec<TestResult> {
         .await;
     eprintln!("[coord] AA spawn children: {r:?}");
 
-    // === Matrix Tests (capability × topology) ===
+    // === Matrix Tests (capability × topology × dimensions) ===
     eprintln!("[coord] === Matrix Tests ===");
     matrix::run_matrix_tests(&mut runner).await;
 
-    // === Fork Matrix Tests (shell patterns, delayed fork, stress, non-PIE invocation) ===
+    // === Fork Matrix Tests (shell patterns, exec binary/method, delayed fork, stress) ===
     eprintln!("[coord] === Fork Matrix Tests ===");
     fork_matrix::run_fork_matrix_tests(&mut runner).await;
-
-    // === Special-Case Tests (not expressible as cross-products) ===
-    eprintln!("[coord] === Special-Case Tests ===");
-    special_cases::fs_special_tests(&mut runner).await;
-    special_cases::symlink_special_tests(&mut runner).await;
-    special_cases::unix_special_tests(&mut runner).await;
 
     // === VS Code Reproduction Tests ===
     eprintln!("[coord] === VS Code Reproduction Tests ===");
     vscode::vscode_repro_tests(&mut runner).await;
 
-    // === Node.js and Contamination Tests (run LAST — may contaminate agent pipes) ===
-    eprintln!("[coord] === Node.js & Contamination Tests ===");
-    // Canary: test that agent A can still exec before starting node tests.
+    // === Contamination Sequence Tests (run LAST — depend on accumulated state) ===
+    eprintln!("[coord] === Contamination Sequence Tests ===");
+    // Canary: test that agent A can still exec.
     {
         let canary_cmd = crate::protocol::Command::Exec {
             args: vec![runner.self_exe.clone(), "echo-test".into()],
@@ -314,9 +308,8 @@ async fn run_tests(self_exe: &str) -> Vec<TestResult> {
         };
         let resp = runner.send("A", canary_cmd).await;
         let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout == "ECHO_TEST_OK");
-        runner.record("X_canary.pre_node", "A", pass, &format!("{resp:?}"));
+        runner.record("X_canary.pre_sequence", "A", pass, &format!("{resp:?}"));
     }
-    special_cases::fork_special_tests(&mut runner).await;
     special_cases::contamination_sequence_tests(&mut runner).await;
 
     // Shutdown all children.

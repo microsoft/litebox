@@ -1,55 +1,55 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-//! Declarative test matrix — defines topology axes and drives "cover all
-//! configurations" tests via structured loops instead of hand-enumerating
-//! every combination.
+//! Declarative test matrix — drives "cover all configurations" tests via
+//! structured loops over typed dimensions.
 //!
-//! Each capability (fs, net, unix, symlink, env) has a single generic test
-//! function parameterized by topology. Adding a new topology automatically
-//! generates tests for all capabilities; adding a new capability
-//! automatically covers all topologies.
+//! Dimensions:
+//! - **Topology**: (source, dest) agent pairs in the process tree, including init
+//! - **FsScope**: /shared (visible) vs /tmp (isolated)
+//! - **SymlinkVariant**: basic, directory, dangling, nested, relative
+//! - **UnixPattern**: in-process, server+fork-client, background-server, cross-agent
+//! - **UnixDepth**: which agent depth runs the pattern
+//!
+//! Note: `init` (the coordinator) is a first-class node in the process tree for
+//! FS tests (it handles FsRead/FsWrite/FsDelete/FsSymlink/FsReadlink/FsStat/
+//! NetConnect locally). It cannot listen on TCP or Unix sockets.
 
 use super::TestRunner;
 use crate::protocol::{Command, Response};
-use std::collections::HashMap;
+use std::collections::HashSet;
 
 // ── Topology axis ──
 
 /// A relationship between two agents in the process tree.
-/// Each variant maps to a concrete (source, dest) agent pair.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum Topology {
-    /// Same agent acts as both source and destination.
+    /// Same agent (A writes, A reads).
     InProcess,
-    /// Parent writes, child reads (init → A).
+    /// init → A.
     ParentToChild,
-    /// Child writes, parent reads (A → init).
+    /// A → init.
     ChildToParent,
-    /// Sibling agents (A → B).
+    /// A → B.
     Sibling,
-    /// Reverse sibling (B → A).
+    /// B → A.
     SiblingReverse,
-    /// Grandchild to grandparent (AA → init).
+    /// AA → init.
     GrandchildUp,
-    /// Great-grandchild to root (AAA → init).
+    /// AAA → init.
     GreatGrandchildUp,
-    /// Cross-subtree (B → AAA).
+    /// B → AAA.
     CrossSubtree,
-    /// Sibling at depth 2 (AA → AB).
+    /// AA → AB.
     SiblingDepth2,
-    /// Sibling at depth 3 (AAA → AAB).
+    /// AAA → AAB.
     SiblingDepth3,
-    /// Uncle relationship (AB → B).
+    /// AB → B.
     Uncle,
 }
 
 impl Topology {
-    /// Returns (source_agent, dest_agent).
-    ///
-    /// For directional tests: `source` performs the action (write, listen),
-    /// `dest` observes the result (read, connect).
-    pub(crate) fn agents(self) -> (&'static str, &'static str) {
+    fn agents(self) -> (&'static str, &'static str) {
         match self {
             Self::InProcess => ("A", "A"),
             Self::ParentToChild => ("init", "A"),
@@ -65,8 +65,7 @@ impl Topology {
         }
     }
 
-    /// Short suffix for test IDs, e.g. "parent_to_child".
-    pub(crate) fn suffix(self) -> &'static str {
+    fn suffix(self) -> &'static str {
         match self {
             Self::InProcess => "in_process",
             Self::ParentToChild => "parent_to_child",
@@ -85,110 +84,100 @@ impl Topology {
 
 // ── Xfail registry ──
 
-pub(crate) type XfailKey = (&'static str, &'static str);
-
-/// Build the xfail map. Key is (capability_prefix, topology_suffix).
-pub(crate) fn build_xfail_map() -> HashMap<XfailKey, &'static str> {
-    let mut m = HashMap::new();
-    // Unix sockets: siblings have independent address tables.
-    m.insert(
-        ("U", "sibling"),
-        "sibling workers have independent Unix socket address tables",
-    );
-    m
+fn build_xfail_set() -> HashSet<&'static str> {
+    let mut s = HashSet::new();
+    s.insert("U.sibling.connect");
+    s
 }
 
-fn lookup_xfail(
-    xfails: &HashMap<XfailKey, &'static str>,
-    prefix: &'static str,
-    topo: Topology,
-) -> Option<&'static str> {
-    xfails.get(&(prefix, topo.suffix())).copied()
-}
-
-// ── Standard topology sets ──
-
-pub(crate) const FS_TOPOLOGIES: &[Topology] = &[
-    Topology::ParentToChild,
-    Topology::ChildToParent,
-    Topology::Sibling,
-    Topology::SiblingReverse,
-    Topology::GrandchildUp,
-    Topology::GreatGrandchildUp,
-];
-
-pub(crate) const NET_TOPOLOGIES: &[Topology] = &[
-    Topology::ParentToChild,
-    Topology::Sibling,
-    Topology::SiblingReverse,
-    // GrandchildUp excluded: dest=init can't listen. Covered by
-    // deep_to_ancestor test added below the loop.
-    Topology::CrossSubtree,
-    Topology::SiblingDepth2,
-    Topology::SiblingDepth3,
-    Topology::Uncle,
-];
-
-pub(crate) const UNIX_TOPOLOGIES: &[Topology] = &[
-    Topology::InProcess,
-    Topology::ParentToChild,
-    Topology::ChildToParent,
-    Topology::Sibling,
-    Topology::GrandchildUp,
-];
-
-pub(crate) const SYMLINK_TOPOLOGIES: &[Topology] = &[
-    Topology::InProcess,
-    Topology::ParentToChild,
-    Topology::ChildToParent,
-    Topology::Sibling,
-    Topology::GrandchildUp,
-];
-
-pub(crate) const EXEC_TOPOLOGIES: &[Topology] = &[
-    Topology::InProcess,
-    Topology::GrandchildUp,
-    Topology::GreatGrandchildUp,
-];
-
-pub(crate) const ENV_TOPOLOGIES: &[Topology] = &[
-    Topology::InProcess,
-    Topology::GrandchildUp,
-    Topology::GreatGrandchildUp,
-];
-
-// ── Generic test functions ──
-
-/// Test filesystem CRUD: source writes, dest reads, source updates/deletes.
-pub(crate) async fn test_fs_crud(
+fn record(
     r: &mut TestRunner,
-    topo: Topology,
-    xfails: &HashMap<XfailKey, &'static str>,
+    test_id: &str,
+    agent: &str,
+    pass: bool,
+    detail: &str,
+    xfails: &HashSet<&str>,
 ) {
-    let (source, dest) = topo.agents();
-    let suffix = topo.suffix();
-    let file = format!("/shared/matrix_{suffix}.txt");
-    let data = format!("data_{suffix}");
-    let updated = format!("updated_{suffix}");
-    let xfail_reason = lookup_xfail(xfails, "F", topo);
+    if let Some(&reason) = xfails.get(test_id) {
+        r.record_xfail(test_id, agent, pass, reason, detail);
+    } else {
+        r.record(test_id, agent, pass, detail);
+    }
+}
 
-    // Clean up from prior runs.
+fn record_xfail_if(
+    r: &mut TestRunner,
+    test_id: &str,
+    agent: &str,
+    pass: bool,
+    detail: &str,
+    xfail_reason: Option<&str>,
+) {
+    if let Some(reason) = xfail_reason {
+        r.record_xfail(test_id, agent, pass, reason, detail);
+    } else {
+        r.record(test_id, agent, pass, detail);
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// FILESYSTEM
+// ═══════════════════════════════════════════════════════════════════
+
+const FS_TOPOLOGIES: &[Topology] = &[
+    Topology::ParentToChild,
+    Topology::ChildToParent,
+    Topology::Sibling,
+    Topology::SiblingReverse,
+    Topology::GrandchildUp,
+    Topology::GreatGrandchildUp,
+];
+
+/// Scope dimension for filesystem tests.
+#[derive(Debug, Clone, Copy)]
+enum FsScope {
+    /// /shared — visible across all agents.
+    Shared,
+    /// /tmp — may be isolated per-agent.
+    TmpIsolated,
+}
+
+impl FsScope {
+    fn prefix(self) -> &'static str {
+        match self {
+            Self::Shared => "/shared",
+            Self::TmpIsolated => "/tmp",
+        }
+    }
+
+    fn suffix(self) -> &'static str {
+        match self {
+            Self::Shared => "shared",
+            Self::TmpIsolated => "tmp",
+        }
+    }
+}
+
+/// FS CRUD on /shared: source writes, dest reads, verifies.
+async fn test_fs_crud(r: &mut TestRunner, topo: Topology) {
+    let (source, dest) = topo.agents();
+    let ts = topo.suffix();
+    let file = format!("/shared/matrix_{ts}.txt");
+    let data = format!("data_{ts}");
+    let updated = format!("updated_{ts}");
+
     let _ = r
         .send("init", Command::FsDelete { path: file.clone() })
         .await;
 
-    // Absent.
     let resp = r.send(dest, Command::FsRead { path: file.clone() }).await;
-    record(
-        r,
-        &format!("F.{suffix}.absent"),
+    r.record(
+        &format!("F.shared.{ts}.absent"),
         dest,
         matches!(resp, Response::NotFound),
         &format!("{resp:?}"),
-        xfail_reason,
     );
 
-    // Create.
     r.send(
         source,
         Command::FsWrite {
@@ -199,16 +188,13 @@ pub(crate) async fn test_fs_crud(
     .await;
     let resp = r.send(dest, Command::FsRead { path: file.clone() }).await;
     let pass = matches!(&resp, Response::Ok { data: Some(d) } if *d == data);
-    record(
-        r,
-        &format!("F.{suffix}.created"),
+    r.record(
+        &format!("F.shared.{ts}.created"),
         dest,
         pass,
         &format!("{resp:?}"),
-        xfail_reason,
     );
 
-    // Update.
     r.send(
         source,
         Command::FsWrite {
@@ -219,360 +205,585 @@ pub(crate) async fn test_fs_crud(
     .await;
     let resp = r.send(dest, Command::FsRead { path: file.clone() }).await;
     let pass = matches!(&resp, Response::Ok { data: Some(d) } if *d == updated);
-    record(
-        r,
-        &format!("F.{suffix}.updated"),
+    r.record(
+        &format!("F.shared.{ts}.updated"),
         dest,
         pass,
         &format!("{resp:?}"),
-        xfail_reason,
     );
 
-    // Delete.
     r.send(source, Command::FsDelete { path: file.clone() })
         .await;
     let resp = r.send(dest, Command::FsRead { path: file.clone() }).await;
-    record(
-        r,
-        &format!("F.{suffix}.deleted"),
+    r.record(
+        &format!("F.shared.{ts}.deleted"),
         dest,
         matches!(resp, Response::NotFound),
         &format!("{resp:?}"),
-        xfail_reason,
     );
 }
 
-/// Test network echo: dest listens, source connects, verify echo, unlisten.
-pub(crate) async fn test_net_echo(
-    r: &mut TestRunner,
-    topo: Topology,
-    port: u16,
-    xfails: &HashMap<XfailKey, &'static str>,
-) {
-    let (source, dest) = topo.agents();
-    let suffix = topo.suffix();
-    let test_data = format!("net_{suffix}");
-    let xfail_reason = lookup_xfail(xfails, "N", topo);
+/// /tmp isolation: writer writes to /tmp, reader checks visibility.
+async fn test_tmp_isolation(r: &mut TestRunner, topo: Topology) {
+    let (writer, reader) = topo.agents();
+    if writer == reader {
+        return; // skip InProcess — same agent sees its own /tmp
+    }
+    let ts = topo.suffix();
+    let file = format!("/tmp/matrix_iso_{ts}.txt");
 
-    // For net, "dest" is the listener (server), "source" is the client.
-    let resp = r.send(dest, Command::NetListen { port }).await;
-    record(
-        r,
-        &format!("N.{suffix}.listen"),
-        dest,
-        matches!(resp, Response::Listening { .. }),
-        &format!("{resp:?}"),
-        xfail_reason,
-    );
-
-    let resp = r
-        .send(
-            source,
-            Command::NetConnect {
-                addr: format!("127.0.0.1:{port}"),
-                data: test_data.clone(),
-            },
-        )
-        .await;
-    let pass = matches!(&resp, Response::Connected { echo } if *echo == test_data);
-    record(
-        r,
-        &format!("N.{suffix}.connect"),
-        source,
-        pass,
-        &format!("{resp:?}"),
-        xfail_reason,
-    );
-
-    let resp = r.send(dest, Command::NetUnlisten { port }).await;
-    record(
-        r,
-        &format!("N.{suffix}.unlisten"),
-        dest,
-        matches!(resp, Response::Ok { .. }),
-        &format!("{resp:?}"),
-        xfail_reason,
+    r.send(
+        writer,
+        Command::FsWrite {
+            path: file.clone(),
+            data: "tmp_test".into(),
+        },
+    )
+    .await;
+    let resp = r.send(reader, Command::FsRead { path: file.clone() }).await;
+    let is_isolated = matches!(resp, Response::NotFound);
+    r.record(
+        &format!("F.tmp.{ts}.isolation"),
+        reader,
+        true, // informational — always pass
+        &format!("isolated={is_isolated}: {resp:?}"),
     );
 }
 
-/// Test Unix socket echo. Different topologies require different protocol
-/// patterns (in-process, parent-server/child-client, etc.).
-pub(crate) async fn test_unix_socket(
-    r: &mut TestRunner,
-    topo: Topology,
-    xfails: &HashMap<XfailKey, &'static str>,
-) {
-    let suffix = topo.suffix();
-    let sock_path = format!("/tmp/matrix_{suffix}.sock");
-    let test_data = format!("unix_{suffix}");
-    let xfail_reason = lookup_xfail(xfails, "U", topo);
-
-    match topo {
-        Topology::InProcess => {
-            let (agent, _) = topo.agents();
-            let resp = r
-                .send(
-                    agent,
-                    Command::UnixListen {
-                        path: sock_path.clone(),
-                    },
-                )
-                .await;
-            record(
-                r,
-                &format!("U.{suffix}.listen"),
+/// Host-written file visibility: build_rootfs puts /shared/host_wrote.txt.
+async fn test_host_file(r: &mut TestRunner) {
+    for agent in &["init", "A", "AA"] {
+        let resp = r
+            .send(
                 agent,
-                matches!(&resp, Response::UnixListening { .. }),
-                &format!("{resp:?}"),
-                xfail_reason,
-            );
-
-            let resp = r
-                .send(
-                    agent,
-                    Command::UnixConnect {
-                        path: sock_path.clone(),
-                        data: test_data.clone(),
-                    },
-                )
-                .await;
-            let pass = matches!(&resp, Response::Connected { echo } if *echo == test_data);
-            record(
-                r,
-                &format!("U.{suffix}.connect"),
+                Command::FsRead {
+                    path: "/shared/host_wrote.txt".into(),
+                },
+            )
+            .await;
+        let pass = matches!(&resp, Response::Ok { data: Some(d) } if d == "from_host");
+        let test_id = format!("F.host.{agent}");
+        if matches!(&resp, Response::NotFound) {
+            r.record_xfail(
+                &test_id,
                 agent,
                 pass,
+                "host_wrote.txt not in rootfs",
                 &format!("{resp:?}"),
-                xfail_reason,
             );
-
-            let _ = r
-                .send(agent, Command::UnixUnlisten { path: sock_path })
-                .await;
+        } else {
+            r.record(&test_id, agent, pass, &format!("{resp:?}"));
         }
+    }
+    // Write file for host to read after exit.
+    r.send(
+        "init",
+        Command::FsWrite {
+            path: "/shared/for_host.txt".into(),
+            data: "from_agent".into(),
+        },
+    )
+    .await;
+}
 
-        Topology::ParentToChild => {
-            // Agent listens, forks unix-echo-client to connect.
-            let (_, dest) = topo.agents();
-            let agent = dest; // A
-            let resp = r
-                .send(
-                    agent,
-                    Command::UnixListen {
-                        path: sock_path.clone(),
-                    },
-                )
-                .await;
-            record(
-                r,
-                &format!("U.{suffix}.listen"),
-                agent,
-                matches!(&resp, Response::UnixListening { .. }),
-                &format!("{resp:?}"),
-                xfail_reason,
-            );
+// ═══════════════════════════════════════════════════════════════════
+// NETWORK
+// ═══════════════════════════════════════════════════════════════════
 
-            let resp = r
-                .send(
-                    agent,
-                    super::exec(vec![
-                        r.self_exe.clone(),
-                        "unix-echo-client".into(),
-                        sock_path.clone(),
-                        test_data.clone(),
-                    ]),
-                )
-                .await;
-            let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout.contains(&test_data));
-            record(
-                r,
-                &format!("U.{suffix}.child_connect"),
-                agent,
-                pass,
-                &format!("{resp:?}"),
-                xfail_reason,
-            );
+/// Net test descriptor. Listener listens, connector connects.
+struct NetTestCase {
+    name: &'static str,
+    listener: &'static str,
+    connector: &'static str,
+}
 
-            let _ = r
-                .send(agent, Command::UnixUnlisten { path: sock_path })
-                .await;
-        }
+const NET_TESTS: &[NetTestCase] = &[
+    NetTestCase {
+        name: "init_to_A",
+        listener: "A",
+        connector: "init",
+    },
+    NetTestCase {
+        name: "A_to_B",
+        listener: "B",
+        connector: "A",
+    },
+    NetTestCase {
+        name: "B_to_A",
+        listener: "A",
+        connector: "B",
+    },
+    NetTestCase {
+        name: "AAA_to_A",
+        listener: "A",
+        connector: "AAA",
+    },
+    NetTestCase {
+        name: "B_to_AAA",
+        listener: "AAA",
+        connector: "B",
+    },
+    NetTestCase {
+        name: "AA_to_AB",
+        listener: "AB",
+        connector: "AA",
+    },
+    NetTestCase {
+        name: "AAA_to_AAB",
+        listener: "AAB",
+        connector: "AAA",
+    },
+    NetTestCase {
+        name: "AB_to_B",
+        listener: "B",
+        connector: "AB",
+    },
+];
 
-        Topology::ChildToParent => {
-            // Fork background unix-echo-server, then parent agent connects.
-            let (source, _) = topo.agents();
-            let agent = source; // A
-            let resp = r
-                .send(
-                    agent,
-                    Command::ExecBackground {
-                        args: vec![
-                            r.self_exe.clone(),
-                            "unix-echo-server".into(),
-                            sock_path.clone(),
-                        ],
-                    },
-                )
-                .await;
-            let server_pid = match &resp {
-                Response::Background { pid } => Some(*pid),
-                _ => None,
-            };
-            record(
-                r,
-                &format!("U.{suffix}.server_start"),
-                agent,
-                server_pid.is_some(),
-                &format!("{resp:?}"),
-                xfail_reason,
-            );
+async fn run_net_tests(r: &mut TestRunner) {
+    let mut port = 10_001u16;
+    for tc in NET_TESTS {
+        let test_data = format!("net_{}", tc.name);
 
-            tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+        let resp = r.send(tc.listener, Command::NetListen { port }).await;
+        r.record(
+            &format!("N.{}.listen", tc.name),
+            tc.listener,
+            matches!(resp, Response::Listening { .. }),
+            &format!("{resp:?}"),
+        );
 
-            let resp = r
-                .send(
-                    agent,
-                    Command::UnixConnect {
-                        path: sock_path.clone(),
-                        data: test_data.clone(),
-                    },
-                )
-                .await;
-            let pass = matches!(&resp, Response::Connected { echo } if *echo == test_data);
-            record(
-                r,
-                &format!("U.{suffix}.parent_connect"),
-                agent,
-                pass,
-                &format!("{resp:?}"),
-                xfail_reason,
-            );
+        let resp = r
+            .send(
+                tc.connector,
+                Command::NetConnect {
+                    addr: format!("127.0.0.1:{port}"),
+                    data: test_data.clone(),
+                },
+            )
+            .await;
+        let pass = matches!(&resp, Response::Connected { echo } if *echo == test_data);
+        r.record(
+            &format!("N.{}.connect", tc.name),
+            tc.connector,
+            pass,
+            &format!("{resp:?}"),
+        );
 
-            if let Some(pid) = server_pid {
-                let _ = r.send(agent, Command::Kill { pid }).await;
-            }
-            let _ = r
-                .send(agent, Command::UnixUnlisten { path: sock_path })
-                .await;
-        }
+        let resp = r.send(tc.listener, Command::NetUnlisten { port }).await;
+        r.record(
+            &format!("N.{}.unlisten", tc.name),
+            tc.listener,
+            matches!(resp, Response::Ok { .. }),
+            &format!("{resp:?}"),
+        );
 
-        Topology::Sibling => {
-            // Source listens, dest tries to connect (expected to fail).
-            let (source, dest) = topo.agents();
-            let resp = r
-                .send(
-                    source,
-                    Command::UnixListen {
-                        path: sock_path.clone(),
-                    },
-                )
-                .await;
-            // Listen should always pass — only connect is xfailed.
-            record(
-                r,
-                &format!("U.{suffix}.listen"),
-                source,
-                matches!(&resp, Response::UnixListening { .. }),
-                &format!("{resp:?}"),
-                None,
-            );
-
-            let resp = r
-                .send(
-                    dest,
-                    Command::UnixConnect {
-                        path: sock_path.clone(),
-                        data: test_data.clone(),
-                    },
-                )
-                .await;
-            let pass = matches!(
-                &resp,
-                Response::ConnectFailed { .. } | Response::Error { .. }
-            );
-            record(
-                r,
-                &format!("U.{suffix}.connect"),
-                dest,
-                pass,
-                &format!("{resp:?}"),
-                xfail_reason,
-            );
-
-            let _ = r
-                .send(source, Command::UnixUnlisten { path: sock_path })
-                .await;
-        }
-
-        Topology::GrandchildUp => {
-            // Source (AA) listens, parent (A) connects.
-            let (source, _) = topo.agents();
-            let connector = "A";
-            let resp = r
-                .send(
-                    source,
-                    Command::UnixListen {
-                        path: sock_path.clone(),
-                    },
-                )
-                .await;
-            record(
-                r,
-                &format!("U.{suffix}.listen"),
-                source,
-                matches!(&resp, Response::UnixListening { .. }),
-                &format!("{resp:?}"),
-                xfail_reason,
-            );
-
-            let resp = r
-                .send(
-                    connector,
-                    Command::UnixConnect {
-                        path: sock_path.clone(),
-                        data: test_data.clone(),
-                    },
-                )
-                .await;
-            let pass = matches!(&resp, Response::Connected { echo } if *echo == test_data);
-            record(
-                r,
-                &format!("U.{suffix}.connect"),
-                connector,
-                pass,
-                &format!("{resp:?}"),
-                xfail_reason,
-            );
-
-            let _ = r
-                .send(source, Command::UnixUnlisten { path: sock_path })
-                .await;
-        }
-
-        _ => {}
+        port += 1;
     }
 }
 
-/// Test symlink: source creates file + symlink, dest reads through.
-pub(crate) async fn test_symlink(
-    r: &mut TestRunner,
-    topo: Topology,
-    symlink_unsupported: bool,
-    xfails: &HashMap<XfailKey, &'static str>,
-) {
-    let (source, dest) = topo.agents();
-    let suffix = topo.suffix();
-    let file = format!("/shared/sm_{suffix}_file");
-    let link = format!("/shared/sm_{suffix}_link");
-    let data = format!("symdata_{suffix}");
+// ═══════════════════════════════════════════════════════════════════
+// EXEC & ENV
+// ═══════════════════════════════════════════════════════════════════
 
-    let xfail_reason = if symlink_unsupported {
+const EXEC_AGENTS: &[&str] = &["A", "AA", "AAA"];
+
+async fn run_exec_tests(r: &mut TestRunner) {
+    let self_exe = r.self_exe.clone();
+
+    for &agent in EXEC_AGENTS {
+        // Echo test.
+        let resp = r
+            .send(
+                agent,
+                super::exec(vec![self_exe.clone(), "echo-test".into()]),
+            )
+            .await;
+        let pass =
+            matches!(&resp, Response::ExecResult { stdout, .. } if stdout.contains("ECHO_TEST_OK"));
+        r.record(
+            &format!("X.echo.{agent}"),
+            agent,
+            pass,
+            &format!("{resp:?}"),
+        );
+    }
+
+    // Exit code propagation.
+    for &(agent, code) in &[("A", 42), ("AAA", 7)] {
+        let resp = r
+            .send(
+                agent,
+                super::exec(vec![self_exe.clone(), "exit-with".into(), code.to_string()]),
+            )
+            .await;
+        let pass = matches!(&resp, Response::ExecResult { exit_code, .. } if *exit_code == code);
+        r.record(
+            &format!("X.exit_code.{agent}.{code}"),
+            agent,
+            pass,
+            &format!("{resp:?}"),
+        );
+    }
+}
+
+async fn run_env_tests(r: &mut TestRunner) {
+    for &agent in EXEC_AGENTS {
+        let resp = r.send(agent, Command::EnvGet { var: "HOME".into() }).await;
+        let pass =
+            matches!(&resp, Response::Ok { data: Some(d) } if !d.is_empty() && d != "NOT_SET");
+        r.record(
+            &format!("E.HOME.{agent}"),
+            agent,
+            pass,
+            &format!("{resp:?}"),
+        );
+
+        let resp = r.send(agent, Command::EnvGet { var: "PATH".into() }).await;
+        let pass =
+            matches!(&resp, Response::Ok { data: Some(d) } if !d.is_empty() && d != "NOT_SET");
+        r.record(
+            &format!("E.PATH.{agent}"),
+            agent,
+            pass,
+            &format!("{resp:?}"),
+        );
+
+        let resp = r.send(agent, Command::CwdGet).await;
+        let pass = matches!(&resp, Response::Ok { data: Some(_) });
+        r.record(&format!("E.CWD.{agent}"), agent, pass, &format!("{resp:?}"));
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// UNIX SOCKETS
+// ═══════════════════════════════════════════════════════════════════
+
+/// Unix socket test pattern.
+#[derive(Debug, Clone, Copy)]
+enum UnixPattern {
+    /// Agent listens and connects to itself.
+    InProcess,
+    /// Agent listens, forks unix-echo-client child to connect.
+    ServerForkClient,
+    /// Agent starts background unix-echo-server, then connects to it.
+    BackgroundServerConnect,
+    /// Listener agent listens, separate connector agent connects.
+    CrossAgent,
+}
+
+/// Descriptor for one unix socket test case.
+struct UnixTestCase {
+    name: &'static str,
+    pattern: UnixPattern,
+    /// Primary agent (listener for InProcess/ServerForkClient/CrossAgent,
+    /// agent for BackgroundServerConnect).
+    agent: &'static str,
+    /// Connector agent for CrossAgent pattern.
+    peer: Option<&'static str>,
+    xfail_connect: bool,
+}
+
+fn unix_test_cases() -> Vec<UnixTestCase> {
+    vec![
+        UnixTestCase {
+            name: "in_process.A",
+            pattern: UnixPattern::InProcess,
+            agent: "A",
+            peer: None,
+            xfail_connect: false,
+        },
+        UnixTestCase {
+            name: "in_process.AA",
+            pattern: UnixPattern::InProcess,
+            agent: "AA",
+            peer: None,
+            xfail_connect: false,
+        },
+        UnixTestCase {
+            name: "server_fork.A",
+            pattern: UnixPattern::ServerForkClient,
+            agent: "A",
+            peer: None,
+            xfail_connect: false,
+        },
+        UnixTestCase {
+            name: "server_fork.AA",
+            pattern: UnixPattern::ServerForkClient,
+            agent: "AA",
+            peer: None,
+            xfail_connect: false,
+        },
+        UnixTestCase {
+            name: "bg_server.A",
+            pattern: UnixPattern::BackgroundServerConnect,
+            agent: "A",
+            peer: None,
+            xfail_connect: false,
+        },
+        UnixTestCase {
+            name: "bg_server.AA",
+            pattern: UnixPattern::BackgroundServerConnect,
+            agent: "AA",
+            peer: None,
+            xfail_connect: false,
+        },
+        UnixTestCase {
+            name: "sibling",
+            pattern: UnixPattern::CrossAgent,
+            agent: "A",
+            peer: Some("B"),
+            xfail_connect: true,
+        },
+        UnixTestCase {
+            name: "parent_to_grandchild",
+            pattern: UnixPattern::CrossAgent,
+            agent: "A",
+            peer: Some("AA"),
+            xfail_connect: false,
+        },
+        UnixTestCase {
+            name: "grandchild_to_parent",
+            pattern: UnixPattern::CrossAgent,
+            agent: "AA",
+            peer: Some("A"),
+            xfail_connect: false,
+        },
+    ]
+}
+
+async fn run_unix_tests(r: &mut TestRunner) {
+    let self_exe = r.self_exe.clone();
+
+    for tc in &unix_test_cases() {
+        let sock = format!("/tmp/um_{}.sock", tc.name.replace('.', "_"));
+
+        match tc.pattern {
+            UnixPattern::InProcess => {
+                let resp = r
+                    .send(tc.agent, Command::UnixListen { path: sock.clone() })
+                    .await;
+                r.record(
+                    &format!("U.{}.listen", tc.name),
+                    tc.agent,
+                    matches!(&resp, Response::UnixListening { .. }),
+                    &format!("{resp:?}"),
+                );
+
+                let data = format!("unix_{}", tc.name);
+                let resp = r
+                    .send(
+                        tc.agent,
+                        Command::UnixConnect {
+                            path: sock.clone(),
+                            data: data.clone(),
+                        },
+                    )
+                    .await;
+                let pass = matches!(&resp, Response::Connected { echo } if *echo == data);
+                r.record(
+                    &format!("U.{}.connect", tc.name),
+                    tc.agent,
+                    pass,
+                    &format!("{resp:?}"),
+                );
+
+                let _ = r.send(tc.agent, Command::UnixUnlisten { path: sock }).await;
+            }
+
+            UnixPattern::ServerForkClient => {
+                let resp = r
+                    .send(tc.agent, Command::UnixListen { path: sock.clone() })
+                    .await;
+                r.record(
+                    &format!("U.{}.listen", tc.name),
+                    tc.agent,
+                    matches!(&resp, Response::UnixListening { .. }),
+                    &format!("{resp:?}"),
+                );
+
+                let data = format!("unix_{}", tc.name);
+                let resp = r
+                    .send(
+                        tc.agent,
+                        super::exec(vec![
+                            self_exe.clone(),
+                            "unix-echo-client".into(),
+                            sock.clone(),
+                            data.clone(),
+                        ]),
+                    )
+                    .await;
+                let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout.contains(&data));
+                r.record(
+                    &format!("U.{}.child_connect", tc.name),
+                    tc.agent,
+                    pass,
+                    &format!("{resp:?}"),
+                );
+
+                let _ = r.send(tc.agent, Command::UnixUnlisten { path: sock }).await;
+            }
+
+            UnixPattern::BackgroundServerConnect => {
+                let resp = r
+                    .send(
+                        tc.agent,
+                        Command::ExecBackground {
+                            args: vec![self_exe.clone(), "unix-echo-server".into(), sock.clone()],
+                        },
+                    )
+                    .await;
+                let pid = match &resp {
+                    Response::Background { pid } => Some(*pid),
+                    _ => None,
+                };
+                r.record(
+                    &format!("U.{}.server_start", tc.name),
+                    tc.agent,
+                    pid.is_some(),
+                    &format!("{resp:?}"),
+                );
+
+                tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+
+                let data = format!("unix_{}", tc.name);
+                let resp = r
+                    .send(
+                        tc.agent,
+                        Command::UnixConnect {
+                            path: sock.clone(),
+                            data: data.clone(),
+                        },
+                    )
+                    .await;
+                let pass = matches!(&resp, Response::Connected { echo } if *echo == data);
+                r.record(
+                    &format!("U.{}.connect", tc.name),
+                    tc.agent,
+                    pass,
+                    &format!("{resp:?}"),
+                );
+
+                if let Some(pid) = pid {
+                    let _ = r.send(tc.agent, Command::Kill { pid }).await;
+                }
+                let _ = r.send(tc.agent, Command::UnixUnlisten { path: sock }).await;
+            }
+
+            UnixPattern::CrossAgent => {
+                let connector = tc.peer.unwrap();
+                let data = format!("unix_{}", tc.name);
+
+                // For sibling xfail: listener is the "server" side.
+                let resp = r
+                    .send(tc.agent, Command::UnixListen { path: sock.clone() })
+                    .await;
+                r.record(
+                    &format!("U.{}.listen", tc.name),
+                    tc.agent,
+                    matches!(&resp, Response::UnixListening { .. }),
+                    &format!("{resp:?}"),
+                );
+
+                let resp = r
+                    .send(
+                        connector,
+                        Command::UnixConnect {
+                            path: sock.clone(),
+                            data: data.clone(),
+                        },
+                    )
+                    .await;
+
+                if tc.xfail_connect {
+                    let pass = matches!(
+                        &resp,
+                        Response::ConnectFailed { .. } | Response::Error { .. }
+                    );
+                    r.record_xfail(
+                        &format!("U.{}.connect", tc.name),
+                        connector,
+                        pass,
+                        "sibling workers have independent Unix socket address tables",
+                        &format!("{resp:?}"),
+                    );
+                } else {
+                    let pass = matches!(&resp, Response::Connected { echo } if *echo == data);
+                    r.record(
+                        &format!("U.{}.connect", tc.name),
+                        connector,
+                        pass,
+                        &format!("{resp:?}"),
+                    );
+                }
+
+                let _ = r.send(tc.agent, Command::UnixUnlisten { path: sock }).await;
+            }
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// SYMLINKS
+// ═══════════════════════════════════════════════════════════════════
+
+const SYMLINK_TOPOLOGIES: &[Topology] = &[
+    Topology::InProcess,
+    Topology::ParentToChild,
+    Topology::ChildToParent,
+    Topology::Sibling,
+    Topology::GrandchildUp,
+];
+
+/// Symlink variant dimension.
+#[derive(Debug, Clone, Copy)]
+enum SymlinkVariant {
+    /// File symlink — test across all topologies.
+    Basic,
+    /// Symlink to a directory, read file through it.
+    Directory,
+    /// Symlink to nonexistent target — readlink succeeds, read fails.
+    Dangling,
+    /// link1 → link2 → file chain.
+    Nested,
+    /// Relative target path.
+    Relative,
+}
+
+impl SymlinkVariant {
+    fn suffix(self) -> &'static str {
+        match self {
+            Self::Basic => "basic",
+            Self::Directory => "dir",
+            Self::Dangling => "dangling",
+            Self::Nested => "nested",
+            Self::Relative => "relative",
+        }
+    }
+}
+
+const SYMLINK_VARIANTS: &[SymlinkVariant] = &[
+    SymlinkVariant::Basic,
+    SymlinkVariant::Directory,
+    SymlinkVariant::Dangling,
+    SymlinkVariant::Nested,
+    SymlinkVariant::Relative,
+];
+
+/// Test basic file symlink across topologies.
+async fn test_symlink_basic(r: &mut TestRunner, topo: Topology, symlink_unsupported: bool) {
+    let (source, dest) = topo.agents();
+    let ts = topo.suffix();
+    let file = format!("/shared/sm_{ts}_file");
+    let link = format!("/shared/sm_{ts}_link");
+    let data = format!("symdata_{ts}");
+    let xfail = if symlink_unsupported {
         Some("symlink() returns ENOTSUP")
     } else {
-        lookup_xfail(xfails, "S", topo)
+        None
     };
 
-    // Clean up.
     let _ = r
         .send("init", Command::FsDelete { path: link.clone() })
         .await;
@@ -580,7 +791,6 @@ pub(crate) async fn test_symlink(
         .send("init", Command::FsDelete { path: file.clone() })
         .await;
 
-    // Create file.
     r.send(
         source,
         Command::FsWrite {
@@ -590,7 +800,6 @@ pub(crate) async fn test_symlink(
     )
     .await;
 
-    // Create symlink.
     let resp = r
         .send(
             source,
@@ -600,233 +809,315 @@ pub(crate) async fn test_symlink(
             },
         )
         .await;
-    record(
+    record_xfail_if(
         r,
-        &format!("S.{suffix}.create"),
+        &format!("S.basic.{ts}.create"),
         source,
         matches!(&resp, Response::Ok { .. }),
         &format!("{resp:?}"),
-        xfail_reason,
+        xfail,
     );
 
-    // Readlink.
     let resp = r
         .send(source, Command::FsReadlink { path: link.clone() })
         .await;
     let pass = matches!(&resp, Response::Ok { data: Some(d) } if *d == file);
-    record(
+    record_xfail_if(
         r,
-        &format!("S.{suffix}.readlink"),
+        &format!("S.basic.{ts}.readlink"),
         source,
         pass,
         &format!("{resp:?}"),
-        xfail_reason,
+        xfail,
     );
 
-    // Read through.
     let resp = r.send(dest, Command::FsRead { path: link.clone() }).await;
     let pass = matches!(&resp, Response::Ok { data: Some(d) } if *d == data);
-    record(
+    record_xfail_if(
         r,
-        &format!("S.{suffix}.read_through"),
+        &format!("S.basic.{ts}.read_through"),
         dest,
         pass,
         &format!("{resp:?}"),
-        xfail_reason,
+        xfail,
     );
 
-    // Stat type.
     let resp = r.send(dest, Command::FsStat { path: link.clone() }).await;
     let pass = matches!(&resp, Response::Ok { data: Some(d) } if d == "symlink");
-    record(
+    record_xfail_if(
         r,
-        &format!("S.{suffix}.stat_type"),
+        &format!("S.basic.{ts}.stat_type"),
         dest,
         pass,
         &format!("{resp:?}"),
-        xfail_reason,
+        xfail,
     );
 }
 
-/// Test exec (echo-test) from an agent at a given topology.
-pub(crate) async fn test_exec_echo(
+/// Test symlink variants (InProcess only — tests symlink semantics).
+async fn test_symlink_variant(
     r: &mut TestRunner,
-    topo: Topology,
-    xfails: &HashMap<XfailKey, &'static str>,
+    variant: SymlinkVariant,
+    symlink_unsupported: bool,
 ) {
-    let (agent, _) = topo.agents();
-    let suffix = topo.suffix();
-    let self_exe = r.self_exe.clone();
-    let xfail_reason = lookup_xfail(xfails, "X", topo);
-
-    let resp = r
-        .send(agent, super::exec(vec![self_exe, "echo-test".into()]))
-        .await;
-    let pass =
-        matches!(&resp, Response::ExecResult { stdout, .. } if stdout.contains("ECHO_TEST_OK"));
-    record(
-        r,
-        &format!("X.{suffix}.echo"),
-        agent,
-        pass,
-        &format!("{resp:?}"),
-        xfail_reason,
-    );
-}
-
-/// Test environment variables from an agent.
-pub(crate) async fn test_env(
-    r: &mut TestRunner,
-    topo: Topology,
-    xfails: &HashMap<XfailKey, &'static str>,
-) {
-    let (agent, _) = topo.agents();
-    let suffix = topo.suffix();
-    let xfail_reason = lookup_xfail(xfails, "E", topo);
-
-    let resp = r.send(agent, Command::EnvGet { var: "HOME".into() }).await;
-    let pass = matches!(&resp, Response::Ok { data: Some(d) } if !d.is_empty() && d != "NOT_SET");
-    record(
-        r,
-        &format!("E.{suffix}.HOME"),
-        agent,
-        pass,
-        &format!("{resp:?}"),
-        xfail_reason,
-    );
-
-    let resp = r.send(agent, Command::EnvGet { var: "PATH".into() }).await;
-    let pass = matches!(&resp, Response::Ok { data: Some(d) } if !d.is_empty() && d != "NOT_SET");
-    record(
-        r,
-        &format!("E.{suffix}.PATH"),
-        agent,
-        pass,
-        &format!("{resp:?}"),
-        xfail_reason,
-    );
-
-    let resp = r.send(agent, Command::CwdGet).await;
-    let pass = matches!(&resp, Response::Ok { data: Some(_) });
-    record(
-        r,
-        &format!("E.{suffix}.CWD"),
-        agent,
-        pass,
-        &format!("{resp:?}"),
-        xfail_reason,
-    );
-}
-
-// ── Helper ──
-
-fn record(
-    r: &mut TestRunner,
-    test: &str,
-    agent: &str,
-    pass: bool,
-    detail: &str,
-    xfail_reason: Option<&str>,
-) {
-    if let Some(reason) = xfail_reason {
-        r.record_xfail(test, agent, pass, reason, detail);
+    let vs = variant.suffix();
+    let xfail = if symlink_unsupported {
+        Some("symlink() returns ENOTSUP")
     } else {
-        r.record(test, agent, pass, detail);
+        None
+    };
+    let agent = "A";
+
+    match variant {
+        SymlinkVariant::Basic => {} // handled by test_symlink_basic
+
+        SymlinkVariant::Directory => {
+            let _ = r
+                .send(
+                    agent,
+                    super::exec(vec![
+                        "rm".into(),
+                        "-rf".into(),
+                        "/shared/sv_dir".into(),
+                        "/shared/sv_dirlink".into(),
+                    ]),
+                )
+                .await;
+            let _ = r
+                .send(
+                    agent,
+                    super::exec(vec![
+                        "bash".into(),
+                        "-c".into(),
+                        "mkdir -p /shared/sv_dir && echo DIR_CONTENT > /shared/sv_dir/inside.txt"
+                            .into(),
+                    ]),
+                )
+                .await;
+            r.send(
+                agent,
+                Command::FsSymlink {
+                    target: "/shared/sv_dir".into(),
+                    link: "/shared/sv_dirlink".into(),
+                },
+            )
+            .await;
+            let resp = r
+                .send(
+                    agent,
+                    Command::FsRead {
+                        path: "/shared/sv_dirlink/inside.txt".into(),
+                    },
+                )
+                .await;
+            let pass = matches!(&resp, Response::Ok { data: Some(d) } if d.trim() == "DIR_CONTENT");
+            record_xfail_if(
+                r,
+                &format!("S.{vs}.read_through"),
+                agent,
+                pass,
+                &format!("{resp:?}"),
+                xfail,
+            );
+        }
+
+        SymlinkVariant::Dangling => {
+            let _ = r
+                .send(
+                    "init",
+                    Command::FsDelete {
+                        path: "/shared/sv_dangling".into(),
+                    },
+                )
+                .await;
+            r.send(
+                agent,
+                Command::FsSymlink {
+                    target: "/shared/nonexistent_target".into(),
+                    link: "/shared/sv_dangling".into(),
+                },
+            )
+            .await;
+            let resp = r
+                .send(
+                    agent,
+                    Command::FsReadlink {
+                        path: "/shared/sv_dangling".into(),
+                    },
+                )
+                .await;
+            let pass = matches!(&resp, Response::Ok { data: Some(d) } if d == "/shared/nonexistent_target");
+            record_xfail_if(
+                r,
+                &format!("S.{vs}.readlink"),
+                agent,
+                pass,
+                &format!("{resp:?}"),
+                xfail,
+            );
+
+            let resp = r
+                .send(
+                    agent,
+                    Command::FsRead {
+                        path: "/shared/sv_dangling".into(),
+                    },
+                )
+                .await;
+            let pass = matches!(&resp, Response::Error { .. } | Response::NotFound);
+            // read_dangling always passes regardless of symlink support.
+            r.record(
+                &format!("S.{vs}.read_fails"),
+                agent,
+                pass,
+                &format!("{resp:?}"),
+            );
+        }
+
+        SymlinkVariant::Nested => {
+            for name in ["sv_nested_link1", "sv_nested_link2", "sv_nested_file"] {
+                let _ = r
+                    .send(
+                        "init",
+                        Command::FsDelete {
+                            path: format!("/shared/{name}"),
+                        },
+                    )
+                    .await;
+            }
+            r.send(
+                agent,
+                Command::FsWrite {
+                    path: "/shared/sv_nested_file".into(),
+                    data: "NESTED_DATA".into(),
+                },
+            )
+            .await;
+            r.send(
+                agent,
+                Command::FsSymlink {
+                    target: "/shared/sv_nested_file".into(),
+                    link: "/shared/sv_nested_link2".into(),
+                },
+            )
+            .await;
+            r.send(
+                agent,
+                Command::FsSymlink {
+                    target: "/shared/sv_nested_link2".into(),
+                    link: "/shared/sv_nested_link1".into(),
+                },
+            )
+            .await;
+            let resp = r
+                .send(
+                    agent,
+                    Command::FsRead {
+                        path: "/shared/sv_nested_link1".into(),
+                    },
+                )
+                .await;
+            let pass = matches!(&resp, Response::Ok { data: Some(d) } if d == "NESTED_DATA");
+            record_xfail_if(
+                r,
+                &format!("S.{vs}.read_through"),
+                agent,
+                pass,
+                &format!("{resp:?}"),
+                xfail,
+            );
+        }
+
+        SymlinkVariant::Relative => {
+            for name in ["sv_rel_file", "sv_rel_link"] {
+                let _ = r
+                    .send(
+                        "init",
+                        Command::FsDelete {
+                            path: format!("/shared/{name}"),
+                        },
+                    )
+                    .await;
+            }
+            r.send(
+                agent,
+                Command::FsWrite {
+                    path: "/shared/sv_rel_file".into(),
+                    data: "REL_DATA".into(),
+                },
+            )
+            .await;
+            r.send(
+                agent,
+                Command::FsSymlink {
+                    target: "sv_rel_file".into(),
+                    link: "/shared/sv_rel_link".into(),
+                },
+            )
+            .await;
+            let resp = r
+                .send(
+                    agent,
+                    Command::FsRead {
+                        path: "/shared/sv_rel_link".into(),
+                    },
+                )
+                .await;
+            let pass = matches!(&resp, Response::Ok { data: Some(d) } if d == "REL_DATA");
+            record_xfail_if(
+                r,
+                &format!("S.{vs}.read_through"),
+                agent,
+                pass,
+                &format!("{resp:?}"),
+                xfail,
+            );
+        }
     }
 }
 
-// ── Matrix runner ──
+// ═══════════════════════════════════════════════════════════════════
+// MATRIX RUNNER
+// ═══════════════════════════════════════════════════════════════════
 
-/// Run all matrix-driven capability × topology tests.
 pub(crate) async fn run_matrix_tests(r: &mut TestRunner) {
-    let xfails = build_xfail_map();
-
+    // ── Filesystem: scope × topology ──
     eprintln!(
-        "[matrix] === Filesystem ({} topologies) ===",
+        "[matrix] === FS: shared × {} topologies ===",
         FS_TOPOLOGIES.len()
     );
     let _ = tokio::fs::create_dir_all("/shared").await;
     for &topo in FS_TOPOLOGIES {
-        test_fs_crud(r, topo, &xfails).await;
+        test_fs_crud(r, topo).await;
     }
 
+    eprintln!("[matrix] === FS: /tmp isolation ===");
+    for &topo in FS_TOPOLOGIES {
+        test_tmp_isolation(r, topo).await;
+    }
+
+    eprintln!("[matrix] === FS: host file ===");
+    test_host_file(r).await;
+
+    // ── Network ──
+    eprintln!("[matrix] === Network ({} cases) ===", NET_TESTS.len());
+    run_net_tests(r).await;
+
+    // ── Exec & Env ──
+    eprintln!("[matrix] === Exec ({} agents) ===", EXEC_AGENTS.len());
+    run_exec_tests(r).await;
+
+    eprintln!("[matrix] === Env ({} agents) ===", EXEC_AGENTS.len());
+    run_env_tests(r).await;
+
+    // ── Unix Sockets ──
     eprintln!(
-        "[matrix] === Network ({} topologies + deep_to_ancestor) ===",
-        NET_TOPOLOGIES.len()
+        "[matrix] === Unix Sockets ({} cases) ===",
+        unix_test_cases().len()
     );
-    let mut port = 10_001u16;
-    for &topo in NET_TOPOLOGIES {
-        test_net_echo(r, topo, port, &xfails).await;
-        port += 1;
-    }
-    // Deep-child-to-ancestor: AAA connects to A's listener.
-    // Can't use GrandchildUp topology (dest=init can't listen).
-    {
-        let listener = "A";
-        let connector = "AAA";
-        let resp = r.send(listener, Command::NetListen { port }).await;
-        record(
-            r,
-            "N.deep_to_ancestor.listen",
-            listener,
-            matches!(resp, Response::Listening { .. }),
-            &format!("{resp:?}"),
-            None,
-        );
-        let resp = r
-            .send(
-                connector,
-                Command::NetConnect {
-                    addr: format!("127.0.0.1:{port}"),
-                    data: "net_deep_to_ancestor".into(),
-                },
-            )
-            .await;
-        let pass = matches!(&resp, Response::Connected { echo } if echo == "net_deep_to_ancestor");
-        record(
-            r,
-            "N.deep_to_ancestor.connect",
-            connector,
-            pass,
-            &format!("{resp:?}"),
-            None,
-        );
-        let resp = r.send(listener, Command::NetUnlisten { port }).await;
-        record(
-            r,
-            "N.deep_to_ancestor.unlisten",
-            listener,
-            matches!(resp, Response::Ok { .. }),
-            &format!("{resp:?}"),
-            None,
-        );
-    }
+    run_unix_tests(r).await;
 
-    eprintln!(
-        "[matrix] === Exec ({} topologies) ===",
-        EXEC_TOPOLOGIES.len()
-    );
-    for &topo in EXEC_TOPOLOGIES {
-        test_exec_echo(r, topo, &xfails).await;
-    }
-
-    eprintln!("[matrix] === Env ({} topologies) ===", ENV_TOPOLOGIES.len());
-    for &topo in ENV_TOPOLOGIES {
-        test_env(r, topo, &xfails).await;
-    }
-
-    eprintln!(
-        "[matrix] === Unix Sockets ({} topologies) ===",
-        UNIX_TOPOLOGIES.len()
-    );
-    for &topo in UNIX_TOPOLOGIES {
-        test_unix_socket(r, topo, &xfails).await;
-    }
-
-    eprintln!(
-        "[matrix] === Symlinks ({} topologies) ===",
-        SYMLINK_TOPOLOGIES.len()
-    );
+    // ── Symlinks: variant × topology ──
     // Probe symlink support once.
     let probe = r
         .send(
@@ -848,7 +1139,22 @@ pub(crate) async fn run_matrix_tests(r: &mut TestRunner) {
         )
         .await;
 
+    eprintln!(
+        "[matrix] === Symlinks: basic × {} topologies ===",
+        SYMLINK_TOPOLOGIES.len()
+    );
     for &topo in SYMLINK_TOPOLOGIES {
-        test_symlink(r, topo, symlink_unsupported, &xfails).await;
+        test_symlink_basic(r, topo, symlink_unsupported).await;
+    }
+
+    eprintln!(
+        "[matrix] === Symlinks: {} variants (InProcess) ===",
+        SYMLINK_VARIANTS.len() - 1
+    );
+    for &variant in SYMLINK_VARIANTS {
+        if matches!(variant, SymlinkVariant::Basic) {
+            continue; // already covered above
+        }
+        test_symlink_variant(r, variant, symlink_unsupported).await;
     }
 }
