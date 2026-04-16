@@ -2366,6 +2366,42 @@ impl<FS: ShimFS> Task<FS> {
                 parent_pipe_fds: {
                     let files = self.files.borrow();
                     let rds = files.raw_descriptor_store.read();
+
+                    // Pass 1: collect pair_ids of all live pipe fds.
+                    let mut live_pair_ids: Vec<usize> = Vec::new();
+                    for raw_fd in rds.iter_alive() {
+                        if let Ok(typed) = rds
+                            .fd_from_raw_integer::<litebox::pipes::Pipes<crate::Platform>>(raw_fd)
+                        {
+                            if let Ok(pair_id) = self.global.pipes.pipe_pair_id(&typed) {
+                                live_pair_ids.push(pair_id);
+                            }
+                        }
+                    }
+
+                    // Purge stale entries from mux_pipe_pair_ids BEFORE the
+                    // mux check.  pipe_pair_id() returns Arc::as_ptr() — a
+                    // heap pointer.  When old relay pipes are freed, their
+                    // addresses can be reused for new pipes.  Stale entries
+                    // would cause new pipes to be incorrectly filtered.
+                    {
+                        let mut mux_ids = self.mux_pipe_pair_ids.borrow_mut();
+                        let before = mux_ids.len();
+                        mux_ids.retain(|id| live_pair_ids.contains(id));
+                        #[cfg(feature = "trace_syscalls")]
+                        if mux_ids.len() < before {
+                            litebox::log_println!(
+                                self.global.platform,
+                                "[FORK-DIAG] pid={}: purged {} stale mux_pipe_pair_ids ({} → {})",
+                                self.pid,
+                                before - mux_ids.len(),
+                                before,
+                                mux_ids.len(),
+                            );
+                        }
+                    }
+
+                    // Pass 2: build pipe_fds, skipping mux-managed pipes.
                     let mux_ids = self.mux_pipe_pair_ids.borrow();
                     let mut pipe_fds = Vec::new();
                     for raw_fd in rds.iter_alive() {
@@ -2403,6 +2439,8 @@ impl<FS: ShimFS> Task<FS> {
                             pipe_fds.push((raw_fd, direction, pair_id));
                         }
                     }
+                    drop(mux_ids);
+
                     // Diagnostic: log ALL alive fds in the parent's fd table
                     #[cfg(feature = "trace_syscalls")]
                     {

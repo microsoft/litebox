@@ -842,9 +842,84 @@ pub(super) async fn node_exec_tests(r: &mut TestRunner) {
         || matches!(&resp, Response::Error { .. });
     if not_found {
         r.record("X56.second_nonpie_on_B", "B", true, "skipped");
+        r.record("X57.pipe_churn_then_nonpie", "B", true, "skipped");
+        r.record("X58.alternating_pie_nonpie", "B", true, "skipped");
+        r.record("X59.sequential_nonpie", "B", true, "skipped");
     } else {
         let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout.contains("NONPIE_OK"));
         r.record("X56.second_nonpie_on_B", "B", pass, &format!("{resp:?}"));
+
+        // X57: Rapid pipe churn to force address reuse, then non-PIE exec.
+        // Create and close many subshells (each creates pipe pairs) to
+        // increase probability that a new pipe reuses a freed address.
+        // Then exec non-PIE — should still return correct output.
+        for _ in 0..20 {
+            let _ = r
+                .send("B", exec(bash("echo churn >/dev/null")))
+                .await;
+        }
+        let resp = r.send("B", exec(vec!["/nonpie-echo".into()])).await;
+        let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout.contains("NONPIE_OK"));
+        r.record("X57.pipe_churn_then_nonpie", "B", pass, &format!("{resp:?}"));
+
+        // X58: Alternating PIE and non-PIE execs on B.
+        // PIE, non-PIE, PIE, non-PIE — each should return its own output.
+        let results: Vec<(String, bool)> = {
+            let mut results = Vec::new();
+            let resp = r
+                .send("B", exec(vec![self_exe.clone(), "echo-test".into()]))
+                .await;
+            let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout == "ECHO_TEST_OK");
+            results.push((format!("{resp:?}"), pass));
+
+            let resp = r.send("B", exec(vec!["/nonpie-echo".into()])).await;
+            let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout.contains("NONPIE_OK"));
+            results.push((format!("{resp:?}"), pass));
+
+            let resp = r
+                .send("B", exec(vec![self_exe.clone(), "echo-test".into()]))
+                .await;
+            let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout == "ECHO_TEST_OK");
+            results.push((format!("{resp:?}"), pass));
+
+            let resp = r.send("B", exec(vec!["/nonpie-echo".into()])).await;
+            let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout.contains("NONPIE_OK"));
+            results.push((format!("{resp:?}"), pass));
+            results
+        };
+        let all_pass = results.iter().all(|(_, p)| *p);
+        let detail = results
+            .iter()
+            .enumerate()
+            .map(|(i, (d, p))| format!("[{i}]={p}: {d}"))
+            .collect::<Vec<_>>()
+            .join("; ");
+        r.record("X58.alternating_pie_nonpie", "B", all_pass, &detail);
+
+        // X59: Five sequential non-PIE execs on B. Each must return NONPIE_OK.
+        let mut x59_all_pass = true;
+        for i in 0..5 {
+            let resp = r.send("B", exec(vec!["/nonpie-echo".into()])).await;
+            let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout.contains("NONPIE_OK"));
+            if !pass {
+                r.record(
+                    "X59.sequential_nonpie",
+                    "B",
+                    false,
+                    &format!("failed at iteration {i}: {resp:?}"),
+                );
+                x59_all_pass = false;
+                break;
+            }
+        }
+        if x59_all_pass {
+            r.record(
+                "X59.sequential_nonpie",
+                "B",
+                true,
+                "5 sequential non-PIE execs all passed",
+            );
+        }
     }
 
     // ── Non-PIE exec reproduction tests ──
