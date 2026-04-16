@@ -272,9 +272,132 @@ fn main() {
             let stdout = String::from_utf8_lossy(&output.stdout);
             print!("{stdout}");
         }
+        "getifaddrs-test" => {
+            let sub = args.get(2).map(String::as_str).unwrap_or("full");
+            std::process::exit(netlink_tests::run(sub));
+        }
         other => {
             eprintln!("unknown command: {other}");
             std::process::exit(1);
         }
     }
+}
+
+mod netlink_tests {
+    pub fn run(sub: &str) -> i32 {
+        match sub {
+            "socket" => test_socket(),
+            "bind" => test_bind(),
+            "getlink" => test_getlink(),
+            "getaddr" => test_getaddr(),
+            "full" => test_full(),
+            other => { eprintln!("unknown: {other}"); 1 }
+        }
+    }
+
+    fn test_socket() -> i32 {
+        let fd = unsafe { libc::socket(libc::AF_NETLINK, libc::SOCK_RAW | libc::SOCK_CLOEXEC, libc::NETLINK_ROUTE) };
+        if fd < 0 { println!("NETLINK_SOCKET_FAIL:{}", errno()); return 1; }
+        println!("NETLINK_SOCKET_OK:{fd}");
+        unsafe { libc::close(fd) };
+        0
+    }
+
+    fn test_bind() -> i32 {
+        let fd = open_nl();
+        if fd < 0 { println!("NETLINK_SOCKET_FAIL"); return 1; }
+        let mut sa: libc::sockaddr_nl = unsafe { std::mem::zeroed() };
+        let mut len = std::mem::size_of::<libc::sockaddr_nl>() as u32;
+        if unsafe { libc::getsockname(fd, &mut sa as *mut _ as *mut libc::sockaddr, &mut len) } < 0 {
+            println!("NETLINK_GETSOCKNAME_FAIL:{}", errno());
+            unsafe { libc::close(fd) }; return 1;
+        }
+        unsafe { libc::close(fd) };
+        println!("NETLINK_BIND_OK:family={},pid={},groups={}", sa.nl_family, sa.nl_pid, sa.nl_groups);
+        if sa.nl_family != libc::AF_NETLINK as u16 { return 1; }
+        0
+    }
+
+    fn test_getlink() -> i32 {
+        let fd = open_nl();
+        if fd < 0 { println!("NETLINK_SOCKET_FAIL"); return 1; }
+        let mut req = [0u8; 32]; // nlmsghdr(16) + ifinfomsg(16)
+        req[0..4].copy_from_slice(&32u32.to_ne_bytes());
+        req[4..6].copy_from_slice(&(libc::RTM_GETLINK as u16).to_ne_bytes());
+        req[6..8].copy_from_slice(&((libc::NLM_F_REQUEST | libc::NLM_F_DUMP) as u16).to_ne_bytes());
+        req[8..12].copy_from_slice(&1u32.to_ne_bytes());
+        if unsafe { libc::send(fd, req.as_ptr() as *const _, req.len(), 0) } < 0 {
+            println!("NETLINK_SEND_FAIL:{}", errno());
+            unsafe { libc::close(fd) }; return 1;
+        }
+        let (found, done) = recv_check(fd, libc::RTM_NEWLINK as u16);
+        unsafe { libc::close(fd) };
+        if found && done { println!("NETLINK_GETLINK_OK"); 0 }
+        else { println!("NETLINK_GETLINK_FAIL:newlink={found},done={done}"); 1 }
+    }
+
+    fn test_getaddr() -> i32 {
+        let fd = open_nl();
+        if fd < 0 { println!("NETLINK_SOCKET_FAIL"); return 1; }
+        let mut req = [0u8; 24]; // nlmsghdr(16) + ifaddrmsg(8)
+        req[0..4].copy_from_slice(&24u32.to_ne_bytes());
+        req[4..6].copy_from_slice(&(libc::RTM_GETADDR as u16).to_ne_bytes());
+        req[6..8].copy_from_slice(&((libc::NLM_F_REQUEST | libc::NLM_F_DUMP) as u16).to_ne_bytes());
+        req[8..12].copy_from_slice(&2u32.to_ne_bytes());
+        if unsafe { libc::send(fd, req.as_ptr() as *const _, req.len(), 0) } < 0 {
+            println!("NETLINK_SEND_FAIL:{}", errno());
+            unsafe { libc::close(fd) }; return 1;
+        }
+        let (found, done) = recv_check(fd, libc::RTM_NEWADDR as u16);
+        unsafe { libc::close(fd) };
+        if found && done { println!("NETLINK_GETADDR_OK"); 0 }
+        else { println!("NETLINK_GETADDR_FAIL:newaddr={found},done={done}"); 1 }
+    }
+
+    fn test_full() -> i32 {
+        let mut ifaddr: *mut libc::ifaddrs = std::ptr::null_mut();
+        if unsafe { libc::getifaddrs(&mut ifaddr) } != 0 {
+            println!("GETIFADDRS_FAIL:{}", errno());
+            return 1;
+        }
+        let mut count = 0;
+        let mut ptr = ifaddr;
+        while !ptr.is_null() { count += 1; ptr = unsafe { (*ptr).ifa_next }; }
+        unsafe { libc::freeifaddrs(ifaddr) };
+        println!("GETIFADDRS_OK:{count}");
+        0
+    }
+
+    fn open_nl() -> i32 {
+        let fd = unsafe { libc::socket(libc::AF_NETLINK, libc::SOCK_RAW | libc::SOCK_CLOEXEC, libc::NETLINK_ROUTE) };
+        if fd < 0 { return fd; }
+        let mut addr: libc::sockaddr_nl = unsafe { std::mem::zeroed() };
+        addr.nl_family = libc::AF_NETLINK as u16;
+        unsafe { libc::bind(fd, &addr as *const _ as *const libc::sockaddr, std::mem::size_of::<libc::sockaddr_nl>() as u32) };
+        fd
+    }
+
+    fn recv_check(fd: i32, expected: u16) -> (bool, bool) {
+        let mut buf = [0u8; 8192];
+        let mut found = false;
+        let mut done = false;
+        loop {
+            let n = unsafe { libc::recv(fd, buf.as_mut_ptr() as *mut _, buf.len(), 0) };
+            if n <= 0 { break; }
+            let n = n as usize;
+            let mut off = 0;
+            while off + 16 <= n {
+                let len = u32::from_ne_bytes([buf[off], buf[off+1], buf[off+2], buf[off+3]]) as usize;
+                let mtype = u16::from_ne_bytes([buf[off+4], buf[off+5]]);
+                if len < 16 || off + len > n { break; }
+                if mtype == expected { found = true; }
+                if mtype == libc::NLMSG_DONE as u16 { done = true; }
+                off += (len + 3) & !3;
+            }
+            if done { break; }
+        }
+        (found, done)
+    }
+
+    fn errno() -> i32 { std::io::Error::last_os_error().raw_os_error().unwrap_or(-1) }
 }
