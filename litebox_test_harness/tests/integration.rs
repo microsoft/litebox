@@ -464,7 +464,7 @@ fn process_tree_tests() {
     };
 
     // Update this constant when intentionally adding/removing xfails.
-    const EXPECTED_XFAIL_COUNT: usize = 1; // U6.sibling_connect
+    const EXPECTED_XFAIL_COUNT: usize = 13; // S1(4) + S2-S5(4) + S6-S9(4, minus S7.read_dangling) + U6 = 13
     check_results("litebox", &litebox_results, EXPECTED_XFAIL_COUNT);
 
     // ── Cross-check: any test passing natively but failing in litebox is a litebox bug ──

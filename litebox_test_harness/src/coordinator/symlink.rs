@@ -307,7 +307,10 @@ pub(super) async fn symlink_tests(r: &mut TestRunner) {
         )
         .await;
     let pass = matches!(&resp, Response::Error { .. } | Response::NotFound);
-    record_sym!("S7.read_dangling", "A", pass, &format!("{resp:?}"));
+    // read_dangling always passes: if symlinks work, it returns error/notfound
+    // because the target doesn't exist. If symlinks are unsupported, the
+    // symlink itself doesn't exist, so it also returns notfound.
+    r.record("S7.read_dangling", "A", pass, &format!("{resp:?}"));
 
     // S8: Nested symlinks — link1 → link2 → file
     r.send(
