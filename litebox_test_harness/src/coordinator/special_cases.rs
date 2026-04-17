@@ -465,3 +465,69 @@ pub(super) async fn unix_socket_tests(r: &mut TestRunner) {
     let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout.contains("VS1_RACE_OK"));
     r.record("VS1.socket_race", "A", pass, &format!("{resp:?}"));
 }
+
+/// Node.js exit behavior tests.
+pub(super) async fn node_exit_tests(r: &mut TestRunner) {
+    eprintln!("[special] === Node.js Exit Tests ===");
+
+    // EX6: node --version should print version and exit with code 0
+    let resp = r
+        .send(
+            "A",
+            super::exec_timeout(vec!["/usr/local/bin/node".into(), "--version".into()], 10),
+        )
+        .await;
+    let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout.starts_with('v'));
+    r.record("EX6.node_version_exit", "A", pass, &format!("{resp:?}"));
+
+    // EX7: node -e 'process.exit(0)' should exit immediately with code 0
+    let resp = r
+        .send(
+            "A",
+            super::exec_timeout(
+                vec![
+                    "/usr/local/bin/node".into(),
+                    "-e".into(),
+                    "process.exit(0)".into(),
+                ],
+                10,
+            ),
+        )
+        .await;
+    let pass = matches!(&resp, Response::ExecResult { exit_code: 0, .. });
+    r.record("EX7.node_process_exit", "A", pass, &format!("{resp:?}"));
+
+    // EX8: node -e 'process.exit(42)' should exit with code 42
+    let resp = r
+        .send(
+            "A",
+            super::exec_timeout(
+                vec![
+                    "/usr/local/bin/node".into(),
+                    "-e".into(),
+                    "process.exit(42)".into(),
+                ],
+                10,
+            ),
+        )
+        .await;
+    let pass = matches!(&resp, Response::ExecResult { exit_code: 42, .. });
+    r.record("EX8.node_exit_code", "A", pass, &format!("{resp:?}"));
+
+    // EX9: node -e 'console.log("HELLO")' should print and exit
+    let resp = r
+        .send(
+            "A",
+            super::exec_timeout(
+                vec![
+                    "/usr/local/bin/node".into(),
+                    "-e".into(),
+                    "console.log(\"NODE_EXIT_OK\")".into(),
+                ],
+                10,
+            ),
+        )
+        .await;
+    let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout.contains("NODE_EXIT_OK"));
+    r.record("EX9.node_console_exit", "A", pass, &format!("{resp:?}"));
+}
