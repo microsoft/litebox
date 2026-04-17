@@ -636,13 +636,17 @@ fn vscode_server(cli: &Cli, audit_log_file: Option<&std::path::Path>) -> anyhow:
     }
 
     // Auto-create an audit log directory if none was specified.
+    // When LITEBOX_NO_AUDIT=1 is set, skip audit logging for performance testing.
     let auto_audit;
-    let audit = if let Some(p) = audit_log_file {
-        p
+    let audit: Option<&std::path::Path> = if std::env::var("LITEBOX_NO_AUDIT").as_deref() == Ok("1")
+    {
+        None
+    } else if let Some(p) = audit_log_file {
+        Some(p)
     } else {
         let dir = std::env::temp_dir().join("litebox-vscode-server-logs");
         auto_audit = create_audit_log_file(&dir)?;
-        &auto_audit
+        Some(&auto_audit)
     };
 
     // The guest IP in the broker's virtual network.
@@ -653,7 +657,7 @@ fn vscode_server(cli: &Cli, audit_log_file: Option<&std::path::Path>) -> anyhow:
     // VS Code CLI loopback connections are handled by port registration +
     // cross-worker bridging in the broker.
     let forward_ports = [(ssh_port, guest_ip, 22u16)];
-    let broker = spawn_broker(cli, Some(audit), &forward_ports)?;
+    let broker = spawn_broker(cli, audit, &forward_ports)?;
 
     // Build the runner command: dropbear SSH server
     // dropbear flags:
@@ -663,7 +667,7 @@ fn vscode_server(cli: &Cli, audit_log_file: Option<&std::path::Path>) -> anyhow:
     //   -B  allow blank passwords
     //   -R  create host keys if missing
     //   -p 22  listen on port 22 inside the sandbox
-    let mut cmd = runner_command(cli, Some(audit), Some(&broker))?;
+    let mut cmd = runner_command(cli, audit, Some(&broker))?;
     cmd.args([
         "/usr/sbin/dropbear",
         "-F", // foreground
@@ -714,11 +718,15 @@ fn vscode_server(cli: &Cli, audit_log_file: Option<&std::path::Path>) -> anyhow:
     eprintln!("    Remote-SSH → Connect to Host → litebox");
     eprintln!();
     eprintln!("  Logs:");
-    eprintln!("    Syscalls: {}", audit.display());
-    eprintln!(
-        "    Broker:   {}",
-        audit.with_extension("broker.log").display()
-    );
+    if let Some(audit) = audit {
+        eprintln!("    Syscalls: {}", audit.display());
+        eprintln!(
+            "    Broker:   {}",
+            audit.with_extension("broker.log").display()
+        );
+    } else {
+        eprintln!("    Audit logging disabled (LITEBOX_NO_AUDIT=1)");
+    }
     eprintln!("==============================================");
     eprintln!();
 
