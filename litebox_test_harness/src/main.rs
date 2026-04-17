@@ -1537,6 +1537,19 @@ mod exit_tests {
         unsafe { libc::syscall(libc::SYS_exit_group, 0) };
     }
 
+    /// EX10: ioctl(STDIN, TCGETS) — the exact syscall that hangs Node.js.
+    fn test_tcgets_stdin() {
+        let mut termios: libc::termios = unsafe { std::mem::zeroed() };
+        let ret = unsafe { libc::tcgetattr(0, &mut termios) };
+        if ret == 0 {
+            println!("EX10_TCGETS_OK:is_tty");
+        } else {
+            let err = std::io::Error::last_os_error();
+            println!("EX10_TCGETS_ERR:{}", err.raw_os_error().unwrap_or(-1));
+        }
+        std::process::exit(0);
+    }
+
     fn test_exec_exit() {
         let self_exe = std::env::current_exe().unwrap();
         let output = std::process::Command::new(&self_exe)
@@ -1567,6 +1580,7 @@ mod exit_tests {
             "fork-exit" => test_fork_exit(),
             "raw-exit-group" => test_raw_exit_group(),
             "exec-exit" => test_exec_exit(),
+            "tcgets-stdin" => test_tcgets_stdin(),
             other => {
                 eprintln!("unknown exit test: {other}");
                 std::process::exit(1);
