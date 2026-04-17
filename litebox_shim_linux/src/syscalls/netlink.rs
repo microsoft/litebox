@@ -28,7 +28,9 @@ const NLM_F_MATCH: u16 = 0x200;
 const NLM_F_DUMP: u16 = NLM_F_ROOT | NLM_F_MATCH;
 
 // Interface info attributes (IFLA_*)
+const IFLA_ADDRESS: u16 = 1;
 const IFLA_IFNAME: u16 = 3;
+const IFLA_MTU: u16 = 4;
 
 // Address attributes (IFA_*)
 const IFA_ADDRESS: u16 = 1;
@@ -141,65 +143,127 @@ impl NetlinkRouteSocket {
         self.recv_buf.len()
     }
 
-    /// Generate RTM_NEWLINK response for loopback interface.
+    /// Generate RTM_NEWLINK responses for loopback and eth0 interfaces.
     fn generate_link_response(&mut self, seq: u32) {
-        // ifinfomsg for loopback
+        self.append_link_lo(seq);
+        self.append_link_eth0(seq);
+    }
+
+    /// Append a single RTM_NEWLINK message.
+    fn append_link_msg(
+        &mut self,
+        seq: u32,
+        ifi_type: u16,
+        ifi_index: u32,
+        ifi_flags: u32,
+        name: &[u8],
+        mac: Option<&[u8; 6]>,
+        mtu: Option<u32>,
+    ) {
         let mut ifinfo = [0u8; IFINFOMSG_LEN];
         ifinfo[0] = 0; // ifi_family = AF_UNSPEC
-        // ifinfo[1] = 0; // padding
-        ifinfo[2..4].copy_from_slice(&1u16.to_ne_bytes()); // ifi_type = ARPHRD_LOOPBACK
-        ifinfo[4..8].copy_from_slice(&1u32.to_ne_bytes()); // ifi_index = 1
-        let flags = IFF_UP | IFF_LOOPBACK | IFF_RUNNING;
-        ifinfo[8..12].copy_from_slice(&flags.to_ne_bytes()); // ifi_flags
+        ifinfo[2..4].copy_from_slice(&ifi_type.to_ne_bytes());
+        ifinfo[4..8].copy_from_slice(&ifi_index.to_ne_bytes());
+        ifinfo[8..12].copy_from_slice(&ifi_flags.to_ne_bytes());
         ifinfo[12..16].copy_from_slice(&0xFFFFFFFFu32.to_ne_bytes()); // ifi_change
 
-        // IFLA_IFNAME attribute: "lo\0"
-        let ifname = b"lo\0";
-        let attr_len = NLA_HDR_LEN + ifname.len();
-        let mut attr = Vec::with_capacity(nlmsg_align(attr_len));
-        attr.extend_from_slice(&(attr_len as u16).to_ne_bytes()); // nla_len
-        attr.extend_from_slice(&IFLA_IFNAME.to_ne_bytes()); // nla_type
-        attr.extend_from_slice(ifname);
-        // Pad to 4-byte alignment
-        while attr.len() % 4 != 0 {
-            attr.push(0);
+        let mut attrs = Vec::new();
+
+        // IFLA_IFNAME
+        let name_attr_len = NLA_HDR_LEN + name.len();
+        attrs.extend_from_slice(&(name_attr_len as u16).to_ne_bytes());
+        attrs.extend_from_slice(&IFLA_IFNAME.to_ne_bytes());
+        attrs.extend_from_slice(name);
+        while attrs.len() % 4 != 0 {
+            attrs.push(0);
         }
 
-        let payload_len = IFINFOMSG_LEN + attr.len();
+        // IFLA_ADDRESS (MAC)
+        if let Some(mac) = mac {
+            let mac_attr_len = NLA_HDR_LEN + 6;
+            attrs.extend_from_slice(&(mac_attr_len as u16).to_ne_bytes());
+            attrs.extend_from_slice(&IFLA_ADDRESS.to_ne_bytes());
+            attrs.extend_from_slice(mac);
+            while attrs.len() % 4 != 0 {
+                attrs.push(0);
+            }
+        }
+
+        // IFLA_MTU
+        if let Some(mtu) = mtu {
+            let mtu_attr_len = NLA_HDR_LEN + 4;
+            attrs.extend_from_slice(&(mtu_attr_len as u16).to_ne_bytes());
+            attrs.extend_from_slice(&IFLA_MTU.to_ne_bytes());
+            attrs.extend_from_slice(&mtu.to_ne_bytes());
+        }
+
+        let payload_len = IFINFOMSG_LEN + attrs.len();
         let msg_len = NLMSG_HDR_LEN + payload_len;
 
         // nlmsghdr
         self.recv_buf
-            .extend_from_slice(&(msg_len as u32).to_ne_bytes()); // nlmsg_len
-        self.recv_buf.extend_from_slice(&RTM_NEWLINK.to_ne_bytes()); // nlmsg_type
-        self.recv_buf.extend_from_slice(&NLM_F_MULTI.to_ne_bytes()); // nlmsg_flags
-        self.recv_buf.extend_from_slice(&seq.to_ne_bytes()); // nlmsg_seq
-        self.recv_buf.extend_from_slice(&self.nl_pid.to_ne_bytes()); // nlmsg_pid
+            .extend_from_slice(&(msg_len as u32).to_ne_bytes());
+        self.recv_buf.extend_from_slice(&RTM_NEWLINK.to_ne_bytes());
+        self.recv_buf.extend_from_slice(&NLM_F_MULTI.to_ne_bytes());
+        self.recv_buf.extend_from_slice(&seq.to_ne_bytes());
+        self.recv_buf.extend_from_slice(&self.nl_pid.to_ne_bytes());
 
-        // ifinfomsg
+        // ifinfomsg + attributes
         self.recv_buf.extend_from_slice(&ifinfo);
-
-        // attributes
-        self.recv_buf.extend_from_slice(&attr);
-
-        // Pad to NLMSG_ALIGN
+        self.recv_buf.extend_from_slice(&attrs);
         while self.recv_buf.len() % 4 != 0 {
             self.recv_buf.push(0);
         }
     }
 
-    /// Generate RTM_NEWADDR response for 127.0.0.1/8 on loopback.
+    fn append_link_lo(&mut self, seq: u32) {
+        // ARPHRD_LOOPBACK = 772
+        self.append_link_msg(
+            seq,
+            772,
+            1,
+            IFF_UP | IFF_LOOPBACK | IFF_RUNNING,
+            b"lo\0",
+            Some(&[0, 0, 0, 0, 0, 0]),
+            Some(65536),
+        );
+    }
+
+    fn append_link_eth0(&mut self, seq: u32) {
+        // ARPHRD_ETHER = 1, Docker-style MAC
+        self.append_link_msg(
+            seq,
+            1,
+            2,
+            IFF_UP | IFF_RUNNING,
+            b"eth0\0",
+            Some(&[0x02, 0x42, 0xac, 0x11, 0x00, 0x02]),
+            Some(1500),
+        );
+    }
+
+    /// Generate RTM_NEWADDR responses for both loopback and eth0.
     fn generate_addr_response(&mut self, seq: u32) {
-        // ifaddrmsg for loopback address
+        self.append_addr_msg(seq, 8, 254, 1, [127, 0, 0, 1], b"lo\0"); // lo: 127.0.0.1/8
+        self.append_addr_msg(seq, 16, 0, 2, [172, 17, 0, 2], b"eth0\0"); // eth0: 172.17.0.2/16
+    }
+
+    fn append_addr_msg(
+        &mut self,
+        seq: u32,
+        prefixlen: u8,
+        scope: u8,
+        ifa_index: u32,
+        addr_bytes: [u8; 4],
+        label: &[u8],
+    ) {
         let mut ifaddr = [0u8; IFADDRMSG_LEN];
         ifaddr[0] = 2; // ifa_family = AF_INET
-        ifaddr[1] = 8; // ifa_prefixlen = 8
-        ifaddr[2] = 0; // ifa_flags = 0
-        ifaddr[3] = 254; // ifa_scope = RT_SCOPE_HOST
-        ifaddr[4..8].copy_from_slice(&1u32.to_ne_bytes()); // ifa_index = 1
+        ifaddr[1] = prefixlen;
+        ifaddr[2] = 0; // ifa_flags
+        ifaddr[3] = scope; // ifa_scope (0=RT_SCOPE_UNIVERSE, 254=RT_SCOPE_HOST)
+        ifaddr[4..8].copy_from_slice(&ifa_index.to_ne_bytes());
 
-        // IFA_ADDRESS attribute: 127.0.0.1
-        let addr_bytes: [u8; 4] = [127, 0, 0, 1];
         let addr_attr_len = NLA_HDR_LEN + 4;
         let mut attrs = Vec::new();
 
@@ -213,8 +277,7 @@ impl NetlinkRouteSocket {
         attrs.extend_from_slice(&IFA_LOCAL.to_ne_bytes());
         attrs.extend_from_slice(&addr_bytes);
 
-        // IFA_LABEL: "lo\0"
-        let label = b"lo\0";
+        // IFA_LABEL
         let label_attr_len = NLA_HDR_LEN + label.len();
         attrs.extend_from_slice(&(label_attr_len as u16).to_ne_bytes());
         attrs.extend_from_slice(&IFA_LABEL.to_ne_bytes());
@@ -226,7 +289,6 @@ impl NetlinkRouteSocket {
         let payload_len = IFADDRMSG_LEN + attrs.len();
         let msg_len = NLMSG_HDR_LEN + payload_len;
 
-        // nlmsghdr
         self.recv_buf
             .extend_from_slice(&(msg_len as u32).to_ne_bytes());
         self.recv_buf.extend_from_slice(&RTM_NEWADDR.to_ne_bytes());
@@ -234,12 +296,8 @@ impl NetlinkRouteSocket {
         self.recv_buf.extend_from_slice(&seq.to_ne_bytes());
         self.recv_buf.extend_from_slice(&self.nl_pid.to_ne_bytes());
 
-        // ifaddrmsg
         self.recv_buf.extend_from_slice(&ifaddr);
-
-        // attributes
         self.recv_buf.extend_from_slice(&attrs);
-
         while self.recv_buf.len() % 4 != 0 {
             self.recv_buf.push(0);
         }
