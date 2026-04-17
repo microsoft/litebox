@@ -888,8 +888,14 @@ mod unix_socket_tests {
     pub fn run(sub: &str) -> i32 {
         match sub {
             "cross-process" => test_cross_process(),
+            "cross-exec" => test_cross_exec(),
+            "bidirectional" => test_bidirectional(),
+            "multi-conn" => test_multi_conn(),
+            "abstract" => test_abstract_socket(),
             "race" => test_socket_race(),
             "mac" => test_mac_address(),
+            // Called by the test harness binary after fork+exec for US2
+            "us2-server" => us2_server(),
             other => {
                 eprintln!("unknown: {other}");
                 1
@@ -1117,6 +1123,359 @@ mod unix_socket_tests {
         println!("NL6_MAC_CHECK:count={iface_count},has_packet={has_packet},has_inet={has_inet}");
         // has_packet=true means there's a link-layer entry with MAC
         if has_packet { 0 } else { 1 }
+    }
+
+    /// US2: Fork+exec cross-process unix socket — tests the exec migration path.
+    /// Parent fork+execs a server process, then connects to its socket.
+    /// This is the exact pattern used by VS Code CLI → code-server.
+    fn test_cross_exec() -> i32 {
+        let sock_path = "/tmp/litebox-us2-test.sock";
+        let _ = std::fs::remove_file(sock_path);
+
+        let self_exe = std::env::current_exe().unwrap();
+        let self_exe = self_exe.to_str().unwrap();
+
+        // Spawn child via fork+exec (this triggers remote worker migration)
+        let child = std::process::Command::new(self_exe)
+            .args(["unix-socket-test", "us2-server", sock_path])
+            .spawn();
+
+        let Ok(mut child) = child else {
+            println!("US2_SPAWN_FAIL");
+            return 1;
+        };
+
+        // Wait for server to start, then try connecting
+        eprintln!(
+            "[US2-client] child spawned (pid={}), retrying connect...",
+            child.id()
+        );
+        let mut stream = None;
+        for attempt in 0..30 {
+            match UnixStream::connect(sock_path) {
+                Ok(s) => {
+                    eprintln!("[US2-client] connected on attempt {attempt}");
+                    stream = Some(s);
+                    break;
+                }
+                Err(e) => {
+                    if attempt % 5 == 0 {
+                        eprintln!("[US2-client] attempt {attempt}: {e}");
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(200));
+                }
+            }
+        }
+
+        let Some(mut stream) = stream else {
+            println!("US2_CONNECT_FAIL");
+            let _ = child.kill();
+            return 1;
+        };
+
+        if let Err(e) = stream.write_all(b"US2_HELLO") {
+            println!("US2_WRITE_FAIL:{e}");
+            let _ = child.kill();
+            return 1;
+        }
+        let mut buf = [0u8; 64];
+        let n = stream.read(&mut buf).unwrap_or(0);
+        let reply = std::str::from_utf8(&buf[..n]).unwrap_or("?");
+        drop(stream);
+
+        let status = child.wait().unwrap();
+        let _ = std::fs::remove_file(sock_path);
+
+        if reply == "US2_REPLY" && status.success() {
+            println!("US2_CROSS_EXEC_OK");
+            0
+        } else {
+            println!("US2_CROSS_EXEC_FAIL:reply={reply},status={status}");
+            1
+        }
+    }
+
+    /// Server half for US2 — called after fork+exec.
+    fn us2_server() -> i32 {
+        let sock_path = std::env::args().nth(3).unwrap_or_default();
+        if sock_path.is_empty() {
+            eprintln!("[US2-server] no path argument");
+            return 1;
+        }
+        let _ = std::fs::remove_file(&sock_path);
+        eprintln!("[US2-server] binding to {sock_path}");
+        let listener = match UnixListener::bind(&sock_path) {
+            Ok(l) => l,
+            Err(e) => {
+                eprintln!("[US2-server] bind failed: {e}");
+                return 1;
+            }
+        };
+        eprintln!("[US2-server] listening...");
+        match listener.accept() {
+            Ok((mut stream, _)) => {
+                let mut buf = [0u8; 64];
+                let n = stream.read(&mut buf).unwrap_or(0);
+                let msg = std::str::from_utf8(&buf[..n]).unwrap_or("?");
+                eprintln!("[US2-server] got: {msg}");
+                if msg == "US2_HELLO" {
+                    let _ = stream.write_all(b"US2_REPLY");
+                    0
+                } else {
+                    1
+                }
+            }
+            Err(e) => {
+                eprintln!("[US2-server] accept failed: {e}");
+                1
+            }
+        }
+    }
+
+    /// US3: Bidirectional data transfer — server sends + client sends, both read.
+    fn test_bidirectional() -> i32 {
+        let sock_path = "/tmp/litebox-us3-test.sock";
+        let _ = std::fs::remove_file(sock_path);
+
+        let pid = unsafe { libc::fork() };
+        if pid < 0 {
+            println!("US3_FORK_FAIL:{}", errno());
+            return 1;
+        }
+
+        if pid == 0 {
+            // Child = server
+            let listener = match UnixListener::bind(sock_path) {
+                Ok(l) => l,
+                Err(e) => {
+                    eprintln!("[US3-server] bind: {e}");
+                    std::process::exit(1);
+                }
+            };
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    // Read from client
+                    let mut buf = [0u8; 64];
+                    let n = stream.read(&mut buf).unwrap_or(0);
+                    // Send reply
+                    let _ = stream.write_all(b"SERVER_DATA");
+                    let msg = std::str::from_utf8(&buf[..n]).unwrap_or("?");
+                    std::process::exit(if msg == "CLIENT_DATA" { 0 } else { 2 });
+                }
+                Err(_) => std::process::exit(3),
+            }
+        }
+
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        let mut stream = None;
+        for _ in 0..10 {
+            if let Ok(s) = UnixStream::connect(sock_path) {
+                stream = Some(s);
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+
+        let Some(mut stream) = stream else {
+            println!("US3_CONNECT_FAIL");
+            let _ = unsafe { libc::waitpid(pid, std::ptr::null_mut(), 0) };
+            return 1;
+        };
+
+        let _ = stream.write_all(b"CLIENT_DATA");
+        let mut buf = [0u8; 64];
+        let n = stream.read(&mut buf).unwrap_or(0);
+        let reply = std::str::from_utf8(&buf[..n]).unwrap_or("?");
+        drop(stream);
+
+        let mut status: i32 = 0;
+        unsafe { libc::waitpid(pid, &mut status, 0) };
+        let exit_code = if libc::WIFEXITED(status) {
+            libc::WEXITSTATUS(status)
+        } else {
+            -1
+        };
+        let _ = std::fs::remove_file(sock_path);
+
+        if reply == "SERVER_DATA" && exit_code == 0 {
+            println!("US3_BIDI_OK");
+            0
+        } else {
+            println!("US3_BIDI_FAIL:reply={reply},exit={exit_code}");
+            1
+        }
+    }
+
+    /// US4: Multiple concurrent connections to the same unix socket.
+    fn test_multi_conn() -> i32 {
+        let sock_path = "/tmp/litebox-us4-test.sock";
+        let _ = std::fs::remove_file(sock_path);
+
+        let pid = unsafe { libc::fork() };
+        if pid < 0 {
+            println!("US4_FORK_FAIL:{}", errno());
+            return 1;
+        }
+
+        if pid == 0 {
+            // Child = server: accept 3 connections
+            let listener = match UnixListener::bind(sock_path) {
+                Ok(l) => l,
+                Err(e) => {
+                    eprintln!("[US4-server] bind: {e}");
+                    std::process::exit(1);
+                }
+            };
+            let mut count = 0;
+            for i in 0..3 {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let mut buf = [0u8; 64];
+                        let n = stream.read(&mut buf).unwrap_or(0);
+                        let msg = std::str::from_utf8(&buf[..n]).unwrap_or("?");
+                        eprintln!("[US4-server] conn {i}: {msg}");
+                        if msg == format!("CONN_{i}") {
+                            count += 1;
+                        }
+                    }
+                    Err(e) => eprintln!("[US4-server] accept {i}: {e}"),
+                }
+            }
+            std::process::exit(if count == 3 { 0 } else { 2 });
+        }
+
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        let mut ok_count = 0;
+        for i in 0..3 {
+            let mut connected = false;
+            for _ in 0..10 {
+                if let Ok(mut s) = UnixStream::connect(sock_path) {
+                    let _ = s.write_all(format!("CONN_{i}").as_bytes());
+                    drop(s);
+                    ok_count += 1;
+                    connected = true;
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            if !connected {
+                eprintln!("[US4-client] conn {i} failed");
+            }
+        }
+
+        let mut status: i32 = 0;
+        unsafe { libc::waitpid(pid, &mut status, 0) };
+        let exit_code = if libc::WIFEXITED(status) {
+            libc::WEXITSTATUS(status)
+        } else {
+            -1
+        };
+        let _ = std::fs::remove_file(sock_path);
+
+        if ok_count == 3 && exit_code == 0 {
+            println!("US4_MULTI_OK");
+            0
+        } else {
+            println!("US4_MULTI_FAIL:conns={ok_count},exit={exit_code}");
+            1
+        }
+    }
+
+    /// US5: Abstract unix socket cross-process.
+    fn test_abstract_socket() -> i32 {
+        let abstract_name = b"\0litebox-us5-test";
+
+        // Create socket manually for abstract namespace
+        let fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0) };
+        if fd < 0 {
+            println!("US5_SOCKET_FAIL:{}", errno());
+            return 1;
+        }
+
+        let mut addr: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+        addr.sun_family = libc::AF_UNIX as u16;
+        addr.sun_path[..abstract_name.len()]
+            .copy_from_slice(unsafe { &*(abstract_name as *const [u8] as *const [i8]) });
+        let addr_len =
+            (std::mem::size_of::<libc::sa_family_t>() + abstract_name.len()) as libc::socklen_t;
+
+        let pid = unsafe { libc::fork() };
+        if pid < 0 {
+            println!("US5_FORK_FAIL:{}", errno());
+            unsafe { libc::close(fd) };
+            return 1;
+        }
+
+        if pid == 0 {
+            // Child = server: bind + listen + accept
+            if unsafe { libc::bind(fd, &addr as *const _ as *const libc::sockaddr, addr_len) } < 0 {
+                eprintln!("[US5-server] bind: {}", errno());
+                std::process::exit(1);
+            }
+            if unsafe { libc::listen(fd, 5) } < 0 {
+                eprintln!("[US5-server] listen: {}", errno());
+                std::process::exit(2);
+            }
+            eprintln!("[US5-server] waiting for connection...");
+            let client_fd = unsafe { libc::accept(fd, std::ptr::null_mut(), std::ptr::null_mut()) };
+            if client_fd < 0 {
+                eprintln!("[US5-server] accept: {}", errno());
+                std::process::exit(3);
+            }
+            let mut buf = [0u8; 64];
+            let n = unsafe { libc::read(client_fd, buf.as_mut_ptr() as *mut _, buf.len()) };
+            unsafe {
+                libc::close(client_fd);
+                libc::close(fd);
+            }
+            let msg = std::str::from_utf8(&buf[..n.max(0) as usize]).unwrap_or("?");
+            std::process::exit(if msg == "US5_HELLO" { 0 } else { 4 });
+        }
+
+        // Parent = client
+        unsafe { libc::close(fd) }; // close the server socket in parent
+        std::thread::sleep(std::time::Duration::from_millis(300));
+
+        let cfd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0) };
+        if cfd < 0 {
+            println!("US5_CLIENT_SOCKET_FAIL:{}", errno());
+            let _ = unsafe { libc::waitpid(pid, std::ptr::null_mut(), 0) };
+            return 1;
+        }
+
+        let mut connected = false;
+        for attempt in 0..10 {
+            if unsafe { libc::connect(cfd, &addr as *const _ as *const libc::sockaddr, addr_len) }
+                == 0
+            {
+                eprintln!("[US5-client] connected on attempt {attempt}");
+                connected = true;
+                break;
+            }
+            eprintln!("[US5-client] attempt {attempt}: errno={}", errno());
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+
+        if connected {
+            unsafe { libc::write(cfd, b"US5_HELLO".as_ptr() as *const _, 9) };
+        }
+        unsafe { libc::close(cfd) };
+
+        let mut status: i32 = 0;
+        unsafe { libc::waitpid(pid, &mut status, 0) };
+        let exit_code = if libc::WIFEXITED(status) {
+            libc::WEXITSTATUS(status)
+        } else {
+            -1
+        };
+
+        if connected && exit_code == 0 {
+            println!("US5_ABSTRACT_OK");
+            0
+        } else {
+            println!("US5_ABSTRACT_FAIL:connected={connected},exit={exit_code}");
+            1
+        }
     }
 
     fn errno() -> i32 {

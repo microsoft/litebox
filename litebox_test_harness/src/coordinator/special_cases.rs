@@ -384,6 +384,74 @@ pub(super) async fn unix_socket_tests(r: &mut TestRunner) {
     let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout.contains("US1_CROSS_PROCESS_OK"));
     r.record("US1.cross_process_unix", "A", pass, &format!("{resp:?}"));
 
+    // US2: Fork+exec cross-process (tests exec migration path)
+    let resp = r
+        .send(
+            "A",
+            super::exec_timeout(
+                vec![
+                    self_exe.clone(),
+                    "unix-socket-test".into(),
+                    "cross-exec".into(),
+                ],
+                30,
+            ),
+        )
+        .await;
+    let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout.contains("US2_CROSS_EXEC_OK"));
+    r.record("US2.cross_exec_unix", "A", pass, &format!("{resp:?}"));
+
+    // US3: Bidirectional data transfer
+    let resp = r
+        .send(
+            "A",
+            super::exec_timeout(
+                vec![
+                    self_exe.clone(),
+                    "unix-socket-test".into(),
+                    "bidirectional".into(),
+                ],
+                30,
+            ),
+        )
+        .await;
+    let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout.contains("US3_BIDI_OK"));
+    r.record("US3.bidirectional_unix", "A", pass, &format!("{resp:?}"));
+
+    // US4: Multiple concurrent connections
+    let resp = r
+        .send(
+            "A",
+            super::exec_timeout(
+                vec![
+                    self_exe.clone(),
+                    "unix-socket-test".into(),
+                    "multi-conn".into(),
+                ],
+                30,
+            ),
+        )
+        .await;
+    let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout.contains("US4_MULTI_OK"));
+    r.record("US4.multi_conn_unix", "A", pass, &format!("{resp:?}"));
+
+    // US5: Abstract unix socket cross-process
+    let resp = r
+        .send(
+            "A",
+            super::exec_timeout(
+                vec![
+                    self_exe.clone(),
+                    "unix-socket-test".into(),
+                    "abstract".into(),
+                ],
+                30,
+            ),
+        )
+        .await;
+    let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout.contains("US5_ABSTRACT_OK"));
+    r.record("US5.abstract_unix", "A", pass, &format!("{resp:?}"));
+
     // VS1: Socket timing race (delayed bind)
     let resp = r
         .send(
