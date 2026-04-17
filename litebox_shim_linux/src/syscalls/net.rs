@@ -1078,7 +1078,37 @@ impl<FS: ShimFS> Task<FS> {
                 }
                 raw_fd
             }
-            AddressFamily::INET6 => return Err(Errno::EAFNOSUPPORT),
+            AddressFamily::INET6 => {
+                // Map AF_INET6 to AF_INET internally. The smoltcp stack only
+                // supports IPv4, but many programs (Node.js, VS Code) try IPv6
+                // loopback (::1). We create an AF_INET socket and map addresses:
+                //   ::1 → 127.0.0.1,  :: → 0.0.0.0
+                let protocol = IPProtocol::try_from(protocol).map_err(|_| {
+                    log_unsupported!("protocol = {protocol}");
+                    Errno::EPROTONOSUPPORT
+                })?;
+                let protocol = match ty {
+                    SockType::Stream => {
+                        if !matches!(protocol, IPProtocol::Default | IPProtocol::TCP) {
+                            return Err(Errno::EINVAL);
+                        }
+                        litebox::net::Protocol::Tcp
+                    }
+                    SockType::Datagram => {
+                        if !matches!(protocol, IPProtocol::Default | IPProtocol::UDP) {
+                            return Err(Errno::EINVAL);
+                        }
+                        litebox::net::Protocol::Udp
+                    }
+                    _ => return Err(Errno::ESOCKTNOSUPPORT),
+                };
+                let socket = self.global.net.lock().socket(protocol)?;
+                let _ = self.global.initialize_socket(&socket, ty, flags);
+                let Ok(raw_fd) = files.insert_raw_fd(socket) else {
+                    unimplemented!()
+                };
+                raw_fd
+            }
             AddressFamily::NETLINK => {
                 // Create a pipe pair to reserve an fd number. The writer is
                 // closed immediately — all I/O is intercepted via
@@ -1236,6 +1266,39 @@ pub(crate) fn read_sockaddr_from_user(
             // Netlink sockaddr — return as unnamed Unix address.
             // The actual handling is done at the syscall level.
             Ok(SocketAddress::default())
+        }
+        AddressFamily::INET6 => {
+            // Map IPv6 addresses to IPv4 for the internal smoltcp stack.
+            // sockaddr_in6: family(2) + port(2) + flowinfo(4) + addr(16) + scope(4) = 28
+            if addrlen < 28 {
+                return Err(Errno::EINVAL);
+            }
+            let raw = sockaddr.to_owned_slice(28).ok_or(Errno::EFAULT)?;
+            let port = u16::from_be_bytes([raw[2], raw[3]]);
+            let addr_bytes = &raw[8..24]; // 16-byte IPv6 address
+
+            // Map ::1 → 127.0.0.1, :: → 0.0.0.0, ::ffff:a.b.c.d → a.b.c.d
+            let ipv4 = if addr_bytes == [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1] {
+                // ::1 (IPv6 loopback) → 127.0.0.1
+                Ipv4Addr::LOCALHOST
+            } else if addr_bytes == [0u8; 16] {
+                // :: (unspecified) → 0.0.0.0
+                Ipv4Addr::UNSPECIFIED
+            } else if addr_bytes[..12] == [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff] {
+                // ::ffff:a.b.c.d (IPv4-mapped IPv6) → a.b.c.d
+                Ipv4Addr::new(
+                    addr_bytes[12],
+                    addr_bytes[13],
+                    addr_bytes[14],
+                    addr_bytes[15],
+                )
+            } else {
+                // Other IPv6 addresses: not supported
+                return Err(Errno::EAFNOSUPPORT);
+            };
+            Ok(SocketAddress::Inet(SocketAddr::V4(SocketAddrV4::new(
+                ipv4, port,
+            ))))
         }
         _ => todo!("unsupported family {family:?}"),
     }
