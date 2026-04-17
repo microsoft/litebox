@@ -531,3 +531,40 @@ pub(super) async fn node_exit_tests(r: &mut TestRunner) {
     let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout.contains("NODE_EXIT_OK"));
     r.record("EX9.node_console_exit", "A", pass, &format!("{resp:?}"));
 }
+
+/// Terminal ioctl matrix tests: op × fd.
+pub(super) async fn terminal_ioctl_tests(r: &mut TestRunner) {
+    let self_exe = r.self_exe.clone();
+    let ops = ["tcgets", "tcsets", "tcsetsw", "tcsetsf", "tiocgwinsz"];
+    let fds = [0, 1, 2];
+
+    eprintln!(
+        "[special] === Terminal Ioctl Matrix ({} ops × {} fds) ===",
+        ops.len(),
+        fds.len()
+    );
+
+    for op in &ops {
+        for fd in &fds {
+            let test_name = format!("TERM.{op}_fd{fd}");
+            let resp = r
+                .send(
+                    "A",
+                    super::exec_timeout(
+                        vec![
+                            self_exe.clone(),
+                            "exit-test".into(),
+                            "term".into(),
+                            (*op).into(),
+                            fd.to_string(),
+                        ],
+                        8,
+                    ),
+                )
+                .await;
+            let pass =
+                matches!(&resp, Response::ExecResult { stdout, .. } if stdout.contains("TERM_OK"));
+            r.record(&test_name, "A", pass, &format!("{resp:?}"));
+        }
+    }
+}

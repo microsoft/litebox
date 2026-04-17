@@ -321,6 +321,9 @@ async fn run_tests(self_exe: &str) -> Vec<TestResult> {
     // === Node.js Exit Tests ===
     special_cases::node_exit_tests(&mut runner).await;
 
+    // === Terminal Ioctl Matrix ===
+    special_cases::terminal_ioctl_tests(&mut runner).await;
+
     // Shutdown all children.
     for (id, mut child) in runner.children.drain() {
         let _ = send_cmd(&mut child, &Command::Exit).await;

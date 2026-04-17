@@ -1537,38 +1537,60 @@ mod exit_tests {
         unsafe { libc::syscall(libc::SYS_exit_group, 0) };
     }
 
-    /// EX10: ioctl(STDIN, TCGETS) — the exact syscall that hangs Node.js.
-    fn test_tcgets_stdin() {
+    /// Terminal ioctl tests — run as: exit-test term <op> <fd>
+    /// ops: tcgets, tcsets, tcsetsw, tcsetsf, tiocgwinsz
+    /// fds: 0, 1, 2
+    fn test_terminal_ioctl(op: &str, fd_num: i32) {
         let mut termios: libc::termios = unsafe { std::mem::zeroed() };
-        let ret = unsafe { libc::tcgetattr(0, &mut termios) };
-        if ret == 0 {
-            println!("EX10_TCGETS_OK:is_tty");
-        } else {
-            let err = std::io::Error::last_os_error();
-            println!("EX10_TCGETS_ERR:{}", err.raw_os_error().unwrap_or(-1));
-        }
-        std::process::exit(0);
-    }
 
-    /// EX11: ioctl(STDIN, TCSETS) — Node.js restore terminal settings.
-    /// Gets current attrs via TCGETS then writes them back via TCSETS.
-    fn test_tcsets_stdin() {
-        eprintln!("[EX11] calling tcgetattr(0)...");
-        let mut termios: libc::termios = unsafe { std::mem::zeroed() };
-        let ret = unsafe { libc::tcgetattr(0, &mut termios) };
-        if ret != 0 {
-            let e = std::io::Error::last_os_error().raw_os_error().unwrap_or(-1);
-            println!("EX11_TCGETS_FAIL:{e}");
-            std::process::exit(1);
-        }
-        eprintln!("[EX11] tcgetattr OK, calling tcsetattr(0, TCSANOW)...");
-        let ret2 = unsafe { libc::tcsetattr(0, libc::TCSANOW, &termios) };
-        if ret2 == 0 {
-            eprintln!("[EX11] tcsetattr OK");
-            println!("EX11_TCSETS_OK");
-        } else {
-            let e = std::io::Error::last_os_error().raw_os_error().unwrap_or(-1);
-            println!("EX11_TCSETS_FAIL:{e}");
+        match op {
+            "tcgets" => {
+                let ret = unsafe { libc::tcgetattr(fd_num, &mut termios) };
+                if ret == 0 {
+                    println!("TERM_OK:op={op},fd={fd_num}");
+                } else {
+                    let e = std::io::Error::last_os_error().raw_os_error().unwrap_or(-1);
+                    println!("TERM_ERR:op={op},fd={fd_num},errno={e}");
+                }
+            }
+            "tcsets" | "tcsetsw" | "tcsetsf" => {
+                // First get current attrs
+                if unsafe { libc::tcgetattr(fd_num, &mut termios) } != 0 {
+                    let e = std::io::Error::last_os_error().raw_os_error().unwrap_or(-1);
+                    println!("TERM_ERR:op={op},fd={fd_num},errno={e},phase=tcgetattr");
+                    std::process::exit(1);
+                }
+                let when = match op {
+                    "tcsets" => libc::TCSANOW,
+                    "tcsetsw" => libc::TCSADRAIN,
+                    "tcsetsf" => libc::TCSAFLUSH,
+                    _ => unreachable!(),
+                };
+                let ret = unsafe { libc::tcsetattr(fd_num, when, &termios) };
+                if ret == 0 {
+                    println!("TERM_OK:op={op},fd={fd_num}");
+                } else {
+                    let e = std::io::Error::last_os_error().raw_os_error().unwrap_or(-1);
+                    println!("TERM_ERR:op={op},fd={fd_num},errno={e}");
+                }
+            }
+            "tiocgwinsz" => {
+                let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
+                let ret = unsafe { libc::ioctl(fd_num, libc::TIOCGWINSZ, &mut ws) };
+                if ret == 0 {
+                    println!(
+                        "TERM_OK:op={op},fd={fd_num},rows={},cols={}",
+                        ws.ws_row, ws.ws_col
+                    );
+                } else {
+                    let e = std::io::Error::last_os_error().raw_os_error().unwrap_or(-1);
+                    println!("TERM_ERR:op={op},fd={fd_num},errno={e}");
+                }
+            }
+            _ => {
+                println!("TERM_ERR:unknown_op={op}");
+                std::process::exit(1);
+            }
         }
         std::process::exit(0);
     }
@@ -1603,8 +1625,15 @@ mod exit_tests {
             "fork-exit" => test_fork_exit(),
             "raw-exit-group" => test_raw_exit_group(),
             "exec-exit" => test_exec_exit(),
-            "tcgets-stdin" => test_tcgets_stdin(),
-            "tcsets-stdin" => test_tcsets_stdin(),
+            // Matrix-style: exit-test term <op> <fd>
+            "term" => {
+                let op = std::env::args().nth(3).unwrap_or_default();
+                let fd: i32 = std::env::args()
+                    .nth(4)
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(0);
+                test_terminal_ioctl(&op, fd);
+            }
             other => {
                 eprintln!("unknown exit test: {other}");
                 std::process::exit(1);
