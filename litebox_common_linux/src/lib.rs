@@ -219,6 +219,7 @@ bitflags::bitflags! {
 }
 
 #[repr(u32)]
+#[derive(IntEnum)]
 pub enum InodeType {
     /// FIFO (named pipe)
     NamedPipe = 0o010000,
@@ -2136,6 +2137,12 @@ pub enum SyscallRequest<Platform: litebox::platform::RawPointerProvider> {
         fd: i32,
         length: usize,
     },
+    Mknodat {
+        dirfd: i32,
+        pathname: Platform::RawConstPointer<i8>,
+        mode_and_type: u32,
+        dev: u32,
+    },
     Unlinkat {
         dirfd: i32,
         pathname: Platform::RawConstPointer<i8>,
@@ -2723,6 +2730,13 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
                     mode: ctx.sys_req_arg(2),
                 }
             }
+            Sysno::mknodat => sys_req!(Mknodat { dirfd,pathname:*,mode_and_type,dev }),
+            Sysno::mknod => SyscallRequest::Mknodat {
+                dirfd: AT_FDCWD,
+                pathname: ctx.sys_req_ptr(0),
+                mode_and_type: ctx.sys_req_arg(1),
+                dev: ctx.sys_req_arg(2),
+            },
             Sysno::unlinkat => sys_req!(Unlinkat { dirfd,pathname:*,flags }),
             Sysno::unlink => {
                 // unlink is equivalent to unlinkat with dirfd AT_FDCWD and flags 0

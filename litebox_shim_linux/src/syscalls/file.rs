@@ -17,8 +17,8 @@ use litebox::{
     utils::{ReinterpretSignedExt as _, ReinterpretUnsignedExt as _, TruncateExt as _},
 };
 use litebox_common_linux::{
-    AtFlags, EfdFlags, EpollCreateFlags, FcntlArg, FileDescriptorFlags, FileStat, IoReadVec,
-    IoWriteVec, IoctlArg, TimeParam, errno::Errno,
+    AtFlags, EfdFlags, EpollCreateFlags, FcntlArg, FileDescriptorFlags, FileStat, InodeType,
+    IoReadVec, IoWriteVec, IoctlArg, TimeParam, errno::Errno,
 };
 use litebox_platform_multiplex::Platform;
 
@@ -256,6 +256,45 @@ impl<FS: ShimFS> Task<FS> {
                 |_fd| Err(Errno::EINVAL),
             )
             .flatten()
+    }
+
+    /// Handle syscall `mknodat` — create a filesystem node.
+    pub(crate) fn sys_mknodat(
+        &self,
+        dirfd: i32,
+        pathname: impl path::Arg,
+        mode_and_type: u32,
+        _dev: u32,
+    ) -> Result<(), Errno> {
+        const FILE_TYPE_MASK: u32 = 0o170000;
+
+        let file_type = mode_and_type & FILE_TYPE_MASK;
+        let file_type = if file_type == 0 {
+            // zero translates to S_IFREG
+            InodeType::File
+        } else {
+            InodeType::try_from(file_type).map_err(|_| Errno::EINVAL)?
+        };
+        match file_type {
+            InodeType::File => {
+                let mode = Mode::from_bits_truncate(mode_and_type & !FILE_TYPE_MASK);
+                let fd = self.sys_openat(
+                    dirfd,
+                    pathname,
+                    OFlags::CREAT | OFlags::EXCL | OFlags::WRONLY,
+                    mode,
+                )?;
+                self.sys_close(fd.cast_signed())?;
+            }
+            // TODO: Named pipe, socket, block and char files are not supported
+            InodeType::NamedPipe
+            | InodeType::Socket
+            | InodeType::BlockDevice
+            | InodeType::CharDevice
+            | InodeType::Dir => return Err(Errno::EPERM),
+            InodeType::SymLink => return Err(Errno::EINVAL),
+        }
+        Ok(())
     }
 
     /// Handle syscall `unlinkat`
