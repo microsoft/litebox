@@ -608,8 +608,9 @@ fn fixup_phdr_alignment(buf: &mut [u8]) {
     let new_phoff = (e_phoff + padding as u64).to_le_bytes();
     buf[32..40].copy_from_slice(&new_phoff);
 
-    // Also update the PHDR segment's p_offset if present, so it matches.
-    // PT_PHDR = 6, each Elf64_Phdr is e_phentsize bytes, p_type at offset 0, p_offset at offset 8.
+    // Also update the PHDR segment's p_offset, p_vaddr, and p_paddr if present, so they match.
+    // ELF64 Elf64_Phdr layout: p_type (0, 4B), p_flags (4, 4B), p_offset (8, 8B),
+    // p_vaddr (16, 8B), p_paddr (24, 8B), p_filesz (32, 8B), p_memsz (40, 8B), p_align (48, 8B).
     let Ok(e_phentsize_usize) = usize::try_from(e_phentsize) else {
         return;
     };
@@ -620,18 +621,19 @@ fn fixup_phdr_alignment(buf: &mut [u8]) {
         let Some(entry_off) = new_start.checked_add(i.saturating_mul(e_phentsize_usize)) else {
             break;
         };
-        if entry_off + 16 > buf.len() {
+        if entry_off + 32 > buf.len() {
             break;
         }
         let p_type = u32::from_le_bytes(buf[entry_off..entry_off + 4].try_into().unwrap());
         if p_type == object::elf::PT_PHDR {
-            // PT_PHDR — update p_offset to match new location
-            let p_offset_off = entry_off + 8;
-            let old_p_offset =
-                u64::from_le_bytes(buf[p_offset_off..p_offset_off + 8].try_into().unwrap());
-            if old_p_offset == e_phoff {
-                let new_p_offset = (old_p_offset + padding as u64).to_le_bytes();
-                buf[p_offset_off..p_offset_off + 8].copy_from_slice(&new_p_offset);
+            // PT_PHDR — update p_offset, p_vaddr, and p_paddr to match new location
+            for field_off in [8usize, 16, 24] {
+                let off = entry_off + field_off;
+                let old_val = u64::from_le_bytes(buf[off..off + 8].try_into().unwrap());
+                if old_val == e_phoff {
+                    let new_val = (old_val + padding as u64).to_le_bytes();
+                    buf[off..off + 8].copy_from_slice(&new_val);
+                }
             }
             // The PHDR segment size should match the phdr table; no change needed.
         }
@@ -644,7 +646,7 @@ fn fixup_phdr_alignment(buf: &mut [u8]) {
 /// We avoid `UD2` (`0F 0B`) because it commonly appears in binaries to mark
 /// `unreachable!()` paths.  The `ICEBP; HLT` sequence is a strong, distinctive
 /// indicator of "this syscall was intentionally poisoned" — `ICEBP` alone does
-/// not trap on Linux in userspace, but `HLT` does (SIGILL in ring 3), and the
+/// not trap on Linux in userspace, but `HLT` does (SIGSEGV in ring 3), and the
 /// `F1` prefix makes it easy for a signal handler to distinguish an
 /// intentional break from a spurious one.
 ///
