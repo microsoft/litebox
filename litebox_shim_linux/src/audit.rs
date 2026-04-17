@@ -75,6 +75,8 @@ pub struct AuditEvent {
     pub result: Result<usize, i32>,
     /// Virtual PID of the process that made the syscall.
     pub pid: i32,
+    /// Virtual TID of the thread that made the syscall.
+    pub tid: i32,
     /// Command name of the process (from execve, e.g., "node", "bash").
     pub comm: ArrayString<16>,
 }
@@ -87,6 +89,7 @@ impl AuditEvent {
             args: ArrayVec::new(),
             result: Ok(0),
             pid: 0,
+            tid: 0,
             comm: ArrayString::new(),
         }
     }
@@ -183,7 +186,9 @@ pub fn emit_audit_event(event: &AuditEvent) {
 pub fn emit_entry_event(event: &AuditEvent) -> u64 {
     let seq = AUDIT_SEQ.fetch_add(1, Ordering::Relaxed);
     let msg = alloc::format!(
-        "{{\"phase\":\"enter\",\"seq\":{seq},\"syscall\":\"{}\",\"args\":[{}]}}\n",
+        "{{\"phase\":\"enter\",\"seq\":{seq},\"pid\":{},\"tid\":{},\"syscall\":\"{}\",\"args\":[{}]}}\n",
+        event.pid,
+        event.tid,
         event.syscall_name,
         FormatArgs(&event.args),
     );
@@ -192,13 +197,19 @@ pub fn emit_entry_event(event: &AuditEvent) -> u64 {
 }
 
 /// Emit the exit (post-syscall) event with the result.
-pub fn emit_exit_event(syscall_name: &str, seq: u64, result: Result<usize, i32>) {
+pub fn emit_exit_event(
+    syscall_name: &str,
+    seq: u64,
+    pid: i32,
+    tid: i32,
+    result: Result<usize, i32>,
+) {
     let result_str = match result {
         Ok(v) => alloc::format!("{{\"ok\":{v}}}"),
         Err(e) => alloc::format!("{{\"err\":{e}}}"),
     };
     let msg = alloc::format!(
-        "{{\"phase\":\"exit\",\"seq\":{seq},\"syscall\":\"{syscall_name}\",\"result\":{result_str}}}\n",
+        "{{\"phase\":\"exit\",\"seq\":{seq},\"pid\":{pid},\"tid\":{tid},\"syscall\":\"{syscall_name}\",\"result\":{result_str}}}\n",
     );
     write_audit_line(&msg);
 }

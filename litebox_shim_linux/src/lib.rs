@@ -2372,6 +2372,7 @@ impl<FS: ShimFS> Task<FS> {
         #[cfg(feature = "audit_log")]
         {
             audit_event.pid = self.pid;
+            audit_event.tid = self.tid;
             let comm_bytes = self.comm.get();
             let comm_len = comm_bytes
                 .iter()
@@ -3272,7 +3273,13 @@ impl<FS: ShimFS> Task<FS> {
                 Ok(v) => Ok(*v),
                 Err(e) => Err(e.as_neg()),
             };
-            audit::emit_exit_event(audit_event.syscall_name, audit_seq, result_val);
+            audit::emit_exit_event(
+                audit_event.syscall_name,
+                audit_seq,
+                self.pid,
+                self.tid,
+                result_val,
+            );
         }
 
         result
