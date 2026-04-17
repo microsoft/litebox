@@ -283,9 +283,12 @@ fn main() {
         "exit-test" => {
             let sub = args.get(2).map(String::as_str).unwrap_or("single");
             exit_tests::run(sub);
-            // If we get here, the test failed to exit
             eprintln!("EXIT_TEST_BUG: run() returned instead of exiting");
             std::process::exit(99);
+        }
+        "net-test" => {
+            let sub = args.get(2).map(String::as_str).unwrap_or("ipv6-socket");
+            std::process::exit(net_tests::run(sub));
         }
         other => {
             eprintln!("unknown command: {other}");
@@ -1639,5 +1642,226 @@ mod exit_tests {
                 std::process::exit(1);
             }
         }
+    }
+}
+
+mod net_tests {
+    pub fn run(sub: &str) -> i32 {
+        match sub {
+            "ipv6-socket" => test_ipv6_socket(),
+            "ipv6-listen" => test_ipv6_listen(),
+            "ipv6-connect" => test_ipv6_connect(),
+            "ipv4-listen" => test_ipv4_listen(),
+            other => {
+                eprintln!("unknown net test: {other}");
+                1
+            }
+        }
+    }
+
+    /// NET1: socket(AF_INET6, SOCK_STREAM) — can we create an IPv6 socket?
+    fn test_ipv6_socket() -> i32 {
+        let fd = unsafe { libc::socket(libc::AF_INET6, libc::SOCK_STREAM, 0) };
+        if fd >= 0 {
+            unsafe { libc::close(fd) };
+            println!("NET1_OK:fd={fd}");
+            0
+        } else {
+            let e = std::io::Error::last_os_error().raw_os_error().unwrap_or(-1);
+            println!("NET1_FAIL:errno={e}");
+            1
+        }
+    }
+
+    /// NET2: bind(::1, 0) + listen — the exact pattern VS Code extension host uses.
+    fn test_ipv6_listen() -> i32 {
+        let fd = unsafe { libc::socket(libc::AF_INET6, libc::SOCK_STREAM, 0) };
+        if fd < 0 {
+            let e = std::io::Error::last_os_error().raw_os_error().unwrap_or(-1);
+            println!("NET2_SOCKET_FAIL:errno={e}");
+            return 1;
+        }
+
+        let mut addr: libc::sockaddr_in6 = unsafe { std::mem::zeroed() };
+        addr.sin6_family = libc::AF_INET6 as u16;
+        addr.sin6_port = 0; // kernel picks port
+        addr.sin6_addr = libc::in6_addr {
+            s6_addr: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1], // ::1
+        };
+
+        let ret = unsafe {
+            libc::bind(
+                fd,
+                &addr as *const _ as *const libc::sockaddr,
+                std::mem::size_of::<libc::sockaddr_in6>() as u32,
+            )
+        };
+        if ret < 0 {
+            let e = std::io::Error::last_os_error().raw_os_error().unwrap_or(-1);
+            unsafe { libc::close(fd) };
+            println!("NET2_BIND_FAIL:errno={e}");
+            return 1;
+        }
+
+        let ret = unsafe { libc::listen(fd, 5) };
+        if ret < 0 {
+            let e = std::io::Error::last_os_error().raw_os_error().unwrap_or(-1);
+            unsafe { libc::close(fd) };
+            println!("NET2_LISTEN_FAIL:errno={e}");
+            return 1;
+        }
+
+        // Get the assigned port
+        let mut bound: libc::sockaddr_in6 = unsafe { std::mem::zeroed() };
+        let mut len = std::mem::size_of::<libc::sockaddr_in6>() as u32;
+        unsafe {
+            libc::getsockname(fd, &mut bound as *mut _ as *mut libc::sockaddr, &mut len);
+        }
+        let port = u16::from_be(bound.sin6_port);
+        unsafe { libc::close(fd) };
+        println!("NET2_OK:port={port}");
+        0
+    }
+
+    /// NET3: Full IPv6 loopback: listen + fork + child connects + data exchange.
+    fn test_ipv6_connect() -> i32 {
+        let fd = unsafe { libc::socket(libc::AF_INET6, libc::SOCK_STREAM, 0) };
+        if fd < 0 {
+            let e = std::io::Error::last_os_error().raw_os_error().unwrap_or(-1);
+            println!("NET3_SOCKET_FAIL:errno={e}");
+            return 1;
+        }
+
+        let mut addr: libc::sockaddr_in6 = unsafe { std::mem::zeroed() };
+        addr.sin6_family = libc::AF_INET6 as u16;
+        addr.sin6_port = 0;
+        addr.sin6_addr = libc::in6_addr {
+            s6_addr: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+        };
+
+        if unsafe {
+            libc::bind(
+                fd,
+                &addr as *const _ as *const libc::sockaddr,
+                std::mem::size_of::<libc::sockaddr_in6>() as u32,
+            )
+        } < 0
+        {
+            let e = std::io::Error::last_os_error().raw_os_error().unwrap_or(-1);
+            unsafe { libc::close(fd) };
+            println!("NET3_BIND_FAIL:errno={e}");
+            return 1;
+        }
+
+        if unsafe { libc::listen(fd, 5) } < 0 {
+            let e = std::io::Error::last_os_error().raw_os_error().unwrap_or(-1);
+            unsafe { libc::close(fd) };
+            println!("NET3_LISTEN_FAIL:errno={e}");
+            return 1;
+        }
+
+        let mut bound: libc::sockaddr_in6 = unsafe { std::mem::zeroed() };
+        let mut len = std::mem::size_of::<libc::sockaddr_in6>() as u32;
+        unsafe {
+            libc::getsockname(fd, &mut bound as *mut _ as *mut libc::sockaddr, &mut len);
+        }
+        let port = u16::from_be(bound.sin6_port);
+        eprintln!("[NET3] listening on [::1]:{port}");
+
+        let pid = unsafe { libc::fork() };
+        if pid == 0 {
+            // Child: connect to [::1]:port, send data
+            unsafe { libc::close(fd) };
+            let cfd = unsafe { libc::socket(libc::AF_INET6, libc::SOCK_STREAM, 0) };
+            let mut dst = addr;
+            dst.sin6_port = bound.sin6_port;
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            if unsafe {
+                libc::connect(
+                    cfd,
+                    &dst as *const _ as *const libc::sockaddr,
+                    std::mem::size_of::<libc::sockaddr_in6>() as u32,
+                )
+            } < 0
+            {
+                std::process::exit(1);
+            }
+            let msg = b"NET3_DATA";
+            unsafe { libc::write(cfd, msg.as_ptr() as *const _, msg.len()) };
+            unsafe { libc::close(cfd) };
+            std::process::exit(0);
+        }
+
+        let client = unsafe { libc::accept(fd, std::ptr::null_mut(), std::ptr::null_mut()) };
+        if client < 0 {
+            let e = std::io::Error::last_os_error().raw_os_error().unwrap_or(-1);
+            println!("NET3_ACCEPT_FAIL:errno={e}");
+            unsafe {
+                libc::close(fd);
+                libc::waitpid(pid, std::ptr::null_mut(), 0);
+            }
+            return 1;
+        }
+
+        let mut buf = [0u8; 64];
+        let n = unsafe { libc::read(client, buf.as_mut_ptr() as *mut _, buf.len()) };
+        unsafe {
+            libc::close(client);
+            libc::close(fd);
+            libc::waitpid(pid, std::ptr::null_mut(), 0);
+        }
+
+        let msg = std::str::from_utf8(&buf[..n.max(0) as usize]).unwrap_or("?");
+        if msg == "NET3_DATA" {
+            println!("NET3_OK:port={port}");
+            0
+        } else {
+            println!("NET3_FAIL:got={msg}");
+            1
+        }
+    }
+
+    /// NET4: IPv4 listen+connect baseline (should already work).
+    fn test_ipv4_listen() -> i32 {
+        let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0) };
+        if fd < 0 {
+            println!("NET4_SOCKET_FAIL");
+            return 1;
+        }
+        let mut addr: libc::sockaddr_in = unsafe { std::mem::zeroed() };
+        addr.sin_family = libc::AF_INET as u16;
+        addr.sin_port = 0;
+        addr.sin_addr.s_addr = u32::from_be(0x7f000001); // 127.0.0.1
+
+        if unsafe {
+            libc::bind(
+                fd,
+                &addr as *const _ as *const libc::sockaddr,
+                std::mem::size_of::<libc::sockaddr_in>() as u32,
+            )
+        } < 0
+        {
+            let e = std::io::Error::last_os_error().raw_os_error().unwrap_or(-1);
+            unsafe { libc::close(fd) };
+            println!("NET4_BIND_FAIL:errno={e}");
+            return 1;
+        }
+
+        if unsafe { libc::listen(fd, 5) } < 0 {
+            let e = std::io::Error::last_os_error().raw_os_error().unwrap_or(-1);
+            unsafe { libc::close(fd) };
+            println!("NET4_LISTEN_FAIL:errno={e}");
+            return 1;
+        }
+
+        let mut bound: libc::sockaddr_in = unsafe { std::mem::zeroed() };
+        let mut len = std::mem::size_of::<libc::sockaddr_in>() as u32;
+        unsafe {
+            libc::getsockname(fd, &mut bound as *mut _ as *mut libc::sockaddr, &mut len);
+        }
+        let port = u16::from_be(bound.sin_port);
+        unsafe { libc::close(fd) };
+        println!("NET4_OK:port={port}");
+        0
     }
 }
