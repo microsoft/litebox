@@ -4152,14 +4152,15 @@ impl<FS: ShimFS> Task<FS> {
             _ => StdioStream::Stderr,
         };
 
+        // Only return the stream if the host fd is actually a TTY.
+        // Don't fall through to unrelated fds — that breaks ENOTTY
+        // semantics (e.g., ioctl on stdout should fail if stdout is a pipe,
+        // not secretly use stdin's TTY).
         if self.global.platform.is_a_tty(preferred) {
-            return Ok(preferred);
+            Ok(preferred)
+        } else {
+            Err(Errno::ENOTTY)
         }
-
-        [StdioStream::Stdin, StdioStream::Stdout, StdioStream::Stderr]
-            .into_iter()
-            .find(|s| self.global.platform.is_a_tty(*s))
-            .ok_or(Errno::ENOTTY)
     }
 
     fn host_tty_session_id(&self) -> Result<litebox::process::SessionId, Errno> {
@@ -4250,19 +4251,8 @@ impl<FS: ShimFS> Task<FS> {
                     c_line: t.c_line,
                     c_cc: t.c_cc,
                 };
-                // Only the init process may change the real host terminal
-                // attributes. Child processes update a shadow so TCGETS
-                // reflects the change, but the real terminal is untouched.
-                if self.process_id != litebox::process::ProcessId::INIT {
-                    *self.global.host_tty_shadow_termios.lock() = Some(attrs);
-                    return Ok(0);
-                }
-                self.global
-                    .platform
-                    .set_terminal_attributes(stream, &attrs, SetTermiosWhen::Now)
-                    .map_err(ioctl_err_to_errno)?;
-                // Clear stale shadow so non-init TCGETS sees the new real state.
-                *self.global.host_tty_shadow_termios.lock() = None;
+                // Store in shadow — the sandbox never modifies the host terminal.
+                *self.global.host_tty_shadow_termios.lock() = Some(attrs);
                 Ok(0)
             }
             IoctlArg::TCSETSW(termios_ptr) => {
@@ -4276,15 +4266,7 @@ impl<FS: ShimFS> Task<FS> {
                     c_line: t.c_line,
                     c_cc: t.c_cc,
                 };
-                if self.process_id != litebox::process::ProcessId::INIT {
-                    *self.global.host_tty_shadow_termios.lock() = Some(attrs);
-                    return Ok(0);
-                }
-                self.global
-                    .platform
-                    .set_terminal_attributes(stream, &attrs, SetTermiosWhen::AfterDrain)
-                    .map_err(ioctl_err_to_errno)?;
-                *self.global.host_tty_shadow_termios.lock() = None;
+                *self.global.host_tty_shadow_termios.lock() = Some(attrs);
                 Ok(0)
             }
             IoctlArg::TCSETSF(termios_ptr) => {
@@ -4298,15 +4280,7 @@ impl<FS: ShimFS> Task<FS> {
                     c_line: t.c_line,
                     c_cc: t.c_cc,
                 };
-                if self.process_id != litebox::process::ProcessId::INIT {
-                    *self.global.host_tty_shadow_termios.lock() = Some(attrs);
-                    return Ok(0);
-                }
-                self.global
-                    .platform
-                    .set_terminal_attributes(stream, &attrs, SetTermiosWhen::AfterDrainFlushInput)
-                    .map_err(ioctl_err_to_errno)?;
-                *self.global.host_tty_shadow_termios.lock() = None;
+                *self.global.host_tty_shadow_termios.lock() = Some(attrs);
                 Ok(0)
             }
             IoctlArg::TIOCGWINSZ(ws_ptr) => {
