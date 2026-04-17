@@ -346,4 +346,54 @@ pub(super) async fn netlink_tests(r: &mut TestRunner) {
         pass,
         &format!("{resp:?}"),
     );
+
+    // NL6: Check if getifaddrs returns AF_PACKET entries (MAC address)
+    let resp = r
+        .send(
+            "A",
+            super::exec_timeout(
+                vec![self_exe.clone(), "unix-socket-test".into(), "mac".into()],
+                30,
+            ),
+        )
+        .await;
+    let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout.contains("NL6_MAC_CHECK"));
+    r.record("NL6.mac_address", "A", pass, &format!("{resp:?}"));
+}
+
+/// Unix socket cross-process tests.
+pub(super) async fn unix_socket_tests(r: &mut TestRunner) {
+    let self_exe = r.self_exe.clone();
+
+    eprintln!("[special] === Unix Socket Tests ===");
+
+    // US1: Cross-process unix socket bind+listen+connect+accept
+    let resp = r
+        .send(
+            "A",
+            super::exec_timeout(
+                vec![
+                    self_exe.clone(),
+                    "unix-socket-test".into(),
+                    "cross-process".into(),
+                ],
+                30,
+            ),
+        )
+        .await;
+    let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout.contains("US1_CROSS_PROCESS_OK"));
+    r.record("US1.cross_process_unix", "A", pass, &format!("{resp:?}"));
+
+    // VS1: Socket timing race (delayed bind)
+    let resp = r
+        .send(
+            "A",
+            super::exec_timeout(
+                vec![self_exe.clone(), "unix-socket-test".into(), "race".into()],
+                30,
+            ),
+        )
+        .await;
+    let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout.contains("VS1_RACE_OK"));
+    r.record("VS1.socket_race", "A", pass, &format!("{resp:?}"));
 }

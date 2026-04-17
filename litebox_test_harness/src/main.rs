@@ -276,6 +276,10 @@ fn main() {
             let sub = args.get(2).map(String::as_str).unwrap_or("full");
             std::process::exit(netlink_tests::run(sub));
         }
+        "unix-socket-test" => {
+            let sub = args.get(2).map(String::as_str).unwrap_or("cross-process");
+            std::process::exit(unix_socket_tests::run(sub));
+        }
         other => {
             eprintln!("unknown command: {other}");
             std::process::exit(1);
@@ -870,6 +874,249 @@ mod netlink_tests {
             }
         }
         (found, done)
+    }
+
+    fn errno() -> i32 {
+        std::io::Error::last_os_error().raw_os_error().unwrap_or(-1)
+    }
+}
+
+mod unix_socket_tests {
+    use std::io::{Read, Write};
+    use std::os::unix::net::{UnixListener, UnixStream};
+
+    pub fn run(sub: &str) -> i32 {
+        match sub {
+            "cross-process" => test_cross_process(),
+            "race" => test_socket_race(),
+            "mac" => test_mac_address(),
+            other => {
+                eprintln!("unknown: {other}");
+                1
+            }
+        }
+    }
+
+    /// US1: Unix socket cross-process bind+listen+connect+accept.
+    /// Reproduces the code-server ↔ CLI pattern:
+    ///   child = server: bind → listen → accept → read
+    ///   parent = client: connect → write
+    fn test_cross_process() -> i32 {
+        let sock_path = "/tmp/litebox-us1-test.sock";
+        let _ = std::fs::remove_file(sock_path);
+
+        let pid = unsafe { libc::fork() };
+        if pid < 0 {
+            println!("US1_FORK_FAIL:{}", errno());
+            return 1;
+        }
+
+        if pid == 0 {
+            // Child = server: bind + listen + accept + read
+            eprintln!("[US1-server] binding to {sock_path}");
+            let listener = match UnixListener::bind(sock_path) {
+                Ok(l) => l,
+                Err(e) => {
+                    eprintln!("[US1-server] bind failed: {e}");
+                    std::process::exit(1);
+                }
+            };
+            eprintln!("[US1-server] listening, waiting for connection...");
+            match listener.accept() {
+                Ok((mut stream, _addr)) => {
+                    let mut buf = [0u8; 64];
+                    match stream.read(&mut buf) {
+                        Ok(n) => {
+                            let msg = std::str::from_utf8(&buf[..n]).unwrap_or("?");
+                            eprintln!("[US1-server] received: {msg}");
+                            if msg == "HELLO_FROM_CLIENT" {
+                                std::process::exit(0);
+                            } else {
+                                eprintln!("[US1-server] unexpected message");
+                                std::process::exit(2);
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("[US1-server] read failed: {e}");
+                            std::process::exit(3);
+                        }
+                    }
+                }
+                Err(e) => {
+                    eprintln!("[US1-server] accept failed: {e}");
+                    std::process::exit(4);
+                }
+            }
+        }
+
+        // Parent = client: wait a bit for server, then connect + write
+        eprintln!("[US1-client] waiting for server to start (pid={pid})...");
+        std::thread::sleep(std::time::Duration::from_millis(200));
+
+        // Retry connect up to 10 times
+        let mut stream = None;
+        for attempt in 0..10 {
+            match UnixStream::connect(sock_path) {
+                Ok(s) => {
+                    eprintln!("[US1-client] connected on attempt {attempt}");
+                    stream = Some(s);
+                    break;
+                }
+                Err(e) => {
+                    eprintln!("[US1-client] connect attempt {attempt} failed: {e}");
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                }
+            }
+        }
+
+        let Some(mut stream) = stream else {
+            println!("US1_CONNECT_FAIL");
+            let _ = unsafe { libc::waitpid(pid, std::ptr::null_mut(), 0) };
+            return 1;
+        };
+
+        if let Err(e) = stream.write_all(b"HELLO_FROM_CLIENT") {
+            println!("US1_WRITE_FAIL:{e}");
+            let _ = unsafe { libc::waitpid(pid, std::ptr::null_mut(), 0) };
+            return 1;
+        }
+        drop(stream);
+
+        // Wait for server child
+        let mut status: i32 = 0;
+        unsafe { libc::waitpid(pid, &mut status, 0) };
+        let exit_code = if libc::WIFEXITED(status) {
+            libc::WEXITSTATUS(status)
+        } else {
+            -1
+        };
+        eprintln!("[US1-client] server exited with code {exit_code}");
+
+        let _ = std::fs::remove_file(sock_path);
+        if exit_code == 0 {
+            println!("US1_CROSS_PROCESS_OK");
+            0
+        } else {
+            println!("US1_CROSS_PROCESS_FAIL:exit={exit_code}");
+            1
+        }
+    }
+
+    /// VS1: Socket timing race — child delays bind, parent connects immediately.
+    /// Reproduces the code-server startup race.
+    fn test_socket_race() -> i32 {
+        let sock_path = "/tmp/litebox-vs1-race.sock";
+        let _ = std::fs::remove_file(sock_path);
+
+        let pid = unsafe { libc::fork() };
+        if pid < 0 {
+            println!("VS1_FORK_FAIL:{}", errno());
+            return 1;
+        }
+
+        if pid == 0 {
+            // Child = server: DELAY then bind + listen
+            eprintln!("[VS1-server] sleeping 500ms before bind...");
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            eprintln!("[VS1-server] binding to {sock_path}");
+            let listener = match UnixListener::bind(sock_path) {
+                Ok(l) => l,
+                Err(e) => {
+                    eprintln!("[VS1-server] bind failed: {e}");
+                    std::process::exit(1);
+                }
+            };
+            eprintln!("[VS1-server] waiting for connection...");
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    let mut buf = [0u8; 64];
+                    match stream.read(&mut buf) {
+                        Ok(n) => {
+                            let msg = std::str::from_utf8(&buf[..n]).unwrap_or("?");
+                            eprintln!("[VS1-server] got: {msg}");
+                            std::process::exit(if msg == "RACE_OK" { 0 } else { 2 });
+                        }
+                        Err(_) => std::process::exit(3),
+                    }
+                }
+                Err(_) => std::process::exit(4),
+            }
+        }
+
+        // Parent = client: try connecting immediately (should fail initially, then succeed)
+        eprintln!("[VS1-client] connecting immediately (server hasn't bound yet)...");
+        let mut connected = false;
+        let start = std::time::Instant::now();
+        for attempt in 0..20 {
+            match UnixStream::connect(sock_path) {
+                Ok(mut s) => {
+                    let elapsed = start.elapsed().as_millis();
+                    eprintln!("[VS1-client] connected after {elapsed}ms (attempt {attempt})");
+                    let _ = s.write_all(b"RACE_OK");
+                    connected = true;
+                    break;
+                }
+                Err(e) => {
+                    if attempt == 0 {
+                        eprintln!("[VS1-client] first connect failed (expected): {e}");
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                }
+            }
+        }
+
+        let mut status: i32 = 0;
+        unsafe { libc::waitpid(pid, &mut status, 0) };
+        let exit_code = if libc::WIFEXITED(status) {
+            libc::WEXITSTATUS(status)
+        } else {
+            -1
+        };
+        let _ = std::fs::remove_file(sock_path);
+
+        if connected && exit_code == 0 {
+            println!("VS1_RACE_OK");
+            0
+        } else {
+            println!("VS1_RACE_FAIL:connected={connected},exit={exit_code}");
+            1
+        }
+    }
+
+    /// NL6: Check if os.networkInterfaces() returns a MAC address.
+    /// Uses getifaddrs to check for AF_PACKET/link-layer entries.
+    fn test_mac_address() -> i32 {
+        let mut ifaddr: *mut libc::ifaddrs = std::ptr::null_mut();
+        if unsafe { libc::getifaddrs(&mut ifaddr) } != 0 {
+            println!("NL6_GETIFADDRS_FAIL:{}", errno());
+            return 1;
+        }
+
+        let mut has_packet = false;
+        let mut has_inet = false;
+        let mut iface_count = 0;
+        let mut ptr = ifaddr;
+        while !ptr.is_null() {
+            let ifa = unsafe { &*ptr };
+            let name = unsafe { std::ffi::CStr::from_ptr(ifa.ifa_name) }.to_string_lossy();
+            if !ifa.ifa_addr.is_null() {
+                let family = unsafe { (*ifa.ifa_addr).sa_family };
+                eprintln!("[NL6] interface={name} family={family}");
+                if family == libc::AF_PACKET as u16 {
+                    has_packet = true;
+                }
+                if family == libc::AF_INET as u16 {
+                    has_inet = true;
+                }
+            }
+            iface_count += 1;
+            ptr = ifa.ifa_next;
+        }
+        unsafe { libc::freeifaddrs(ifaddr) };
+
+        println!("NL6_MAC_CHECK:count={iface_count},has_packet={has_packet},has_inet={has_inet}");
+        // has_packet=true means there's a link-layer entry with MAC
+        if has_packet { 0 } else { 1 }
     }
 
     fn errno() -> i32 {

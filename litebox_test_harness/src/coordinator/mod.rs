@@ -315,6 +315,9 @@ async fn run_tests(self_exe: &str) -> Vec<TestResult> {
     // === Netlink / getifaddrs Tests ===
     special_cases::netlink_tests(&mut runner).await;
 
+    // === Unix Socket Tests ===
+    special_cases::unix_socket_tests(&mut runner).await;
+
     // Shutdown all children.
     for (id, mut child) in runner.children.drain() {
         let _ = send_cmd(&mut child, &Command::Exit).await;
