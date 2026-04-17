@@ -115,10 +115,8 @@ impl litebox::platform::CrngProvider for LvbsLinuxKernel {
 }
 
 /// Length of the Platform Root Key in bytes.
-#[cfg(feature = "optee_syscall")]
 pub const PRK_LEN: usize = 32;
 
-#[cfg(feature = "optee_syscall")]
 static PRK_ONCE: spin::Once<[u8; PRK_LEN]> = spin::Once::new();
 
 /// Sets the Platform Root Key (PRK) for this platform.
@@ -128,7 +126,6 @@ static PRK_ONCE: spin::Once<[u8; PRK_LEN]> = spin::Once::new();
 ///
 /// # Panics
 /// Panics if `key` length does not match `PRK_LEN`.
-#[cfg(feature = "optee_syscall")]
 pub fn set_platform_root_key(key: &[u8]) {
     assert_eq!(key.len(), PRK_LEN, "Platform Root Key length mismatch");
     PRK_ONCE.call_once(|| {
