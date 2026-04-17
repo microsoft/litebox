@@ -1550,6 +1550,29 @@ mod exit_tests {
         std::process::exit(0);
     }
 
+    /// EX11: ioctl(STDIN, TCSETS) — Node.js restore terminal settings.
+    /// Gets current attrs via TCGETS then writes them back via TCSETS.
+    fn test_tcsets_stdin() {
+        eprintln!("[EX11] calling tcgetattr(0)...");
+        let mut termios: libc::termios = unsafe { std::mem::zeroed() };
+        let ret = unsafe { libc::tcgetattr(0, &mut termios) };
+        if ret != 0 {
+            let e = std::io::Error::last_os_error().raw_os_error().unwrap_or(-1);
+            println!("EX11_TCGETS_FAIL:{e}");
+            std::process::exit(1);
+        }
+        eprintln!("[EX11] tcgetattr OK, calling tcsetattr(0, TCSANOW)...");
+        let ret2 = unsafe { libc::tcsetattr(0, libc::TCSANOW, &termios) };
+        if ret2 == 0 {
+            eprintln!("[EX11] tcsetattr OK");
+            println!("EX11_TCSETS_OK");
+        } else {
+            let e = std::io::Error::last_os_error().raw_os_error().unwrap_or(-1);
+            println!("EX11_TCSETS_FAIL:{e}");
+        }
+        std::process::exit(0);
+    }
+
     fn test_exec_exit() {
         let self_exe = std::env::current_exe().unwrap();
         let output = std::process::Command::new(&self_exe)
@@ -1581,6 +1604,7 @@ mod exit_tests {
             "raw-exit-group" => test_raw_exit_group(),
             "exec-exit" => test_exec_exit(),
             "tcgets-stdin" => test_tcgets_stdin(),
+            "tcsets-stdin" => test_tcsets_stdin(),
             other => {
                 eprintln!("unknown exit test: {other}");
                 std::process::exit(1);
