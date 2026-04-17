@@ -440,6 +440,15 @@ pub fn build_audit_event(
         }
 
         // --- All other syscalls: log the name from Debug repr ---
+        // Special case: Ioctl — record fd and command type.
+        SyscallRequest::Ioctl { fd, arg } => {
+            let mut ev = AuditEvent::new("ioctl");
+            ev.fd(*fd);
+            let debug_str = alloc::format!("{arg:?}");
+            let name_end = debug_str.find([' ', '(']).unwrap_or(debug_str.len());
+            ev.flags(&debug_str[..name_end]);
+            ev
+        }
         other => {
             // Extract the variant name from the Debug representation.
             // `SyscallRequest::Gettid` debugs as "Gettid", `SyscallRequest::Fcntl { fd, arg }`
