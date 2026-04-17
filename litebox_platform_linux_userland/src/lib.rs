@@ -28,8 +28,6 @@ use litebox_common_linux::{
 
 use zerocopy::{FromBytes, IntoBytes};
 
-mod syscall_intercept;
-
 extern crate alloc;
 
 // ---------------------------------------------------------------------------
@@ -116,12 +114,8 @@ macro_rules! saved_tls {
 /// traits.
 pub struct LinuxUserland {
     tun_socket_fd: std::sync::RwLock<Option<std::os::fd::OwnedFd>>,
-    #[cfg(feature = "systrap_backend")]
-    seccomp_interception_enabled: std::sync::atomic::AtomicBool,
     /// Reserved pages that are not available for guest programs to use.
     reserved_pages: Vec<core::ops::Range<usize>>,
-    /// The base address of the VDSO.
-    vdso_address: Option<usize>,
     /// CoW-eligible memory regions. Maps start address of the static slice, to the info needed to
     /// re-mmap the file.
     cow_regions: std::sync::RwLock<std::collections::BTreeMap<usize, CowRegionInfo>>,
@@ -254,13 +248,10 @@ impl LinuxUserland {
             })
             .into();
 
-        let (reserved_pages, vdso_address) = Self::read_maps_and_vdso();
+        let reserved_pages = Self::read_maps();
         let platform = Self {
             tun_socket_fd,
-            #[cfg(feature = "systrap_backend")]
-            seccomp_interception_enabled: std::sync::atomic::AtomicBool::new(false),
             reserved_pages,
-            vdso_address,
             cow_regions: std::sync::RwLock::new(std::collections::BTreeMap::new()),
             boot_id: std::sync::OnceLock::new(),
         };
@@ -335,27 +326,7 @@ impl LinuxUserland {
         None
     }
 
-    /// Enable seccomp syscall interception on the platform.
-    ///
-    /// # Panics
-    ///
-    /// Panics if this function has already been invoked on the platform earlier.
-    #[cfg(feature = "systrap_backend")]
-    pub fn enable_seccomp_based_syscall_interception(&self) {
-        assert!(
-            self.seccomp_interception_enabled
-                .compare_exchange(
-                    false,
-                    true,
-                    std::sync::atomic::Ordering::SeqCst,
-                    std::sync::atomic::Ordering::SeqCst
-                )
-                .is_ok()
-        );
-        syscall_intercept::init_sys_intercept();
-    }
-
-    fn read_maps_and_vdso() -> (alloc::vec::Vec<core::ops::Range<usize>>, Option<usize>) {
+    fn read_maps() -> alloc::vec::Vec<core::ops::Range<usize>> {
         // TODO: this function is not guaranteed to return all allocated pages, as it may
         // allocate more pages after the mapping file is read. Missing allocated pages may
         // cause the program to crash when calling `mmap` or `mremap` with the `MAP_FIXED` flag later.
@@ -371,7 +342,7 @@ impl LinuxUserland {
             )
         };
         let Ok(fd) = fd else {
-            return (alloc::vec::Vec::new(), None);
+            return alloc::vec::Vec::new();
         };
         let mut buf = [0u8; 8192];
         let mut total_read = 0;
@@ -393,8 +364,6 @@ impl LinuxUserland {
         assert!(total_read < buf.len(), "buffer too small");
 
         let mut reserved_pages = alloc::vec::Vec::new();
-        #[cfg_attr(not(feature = "systrap_backend"), expect(unused_mut))]
-        let mut vdso_address = None;
         let s = core::str::from_utf8(&buf[..total_read]).expect("invalid UTF-8");
         for line in s.lines() {
             let parts: Vec<&str> = line.split_whitespace().collect();
@@ -405,19 +374,8 @@ impl LinuxUserland {
             let start = usize::from_str_radix(range[0], 16).expect("invalid start address");
             let end = usize::from_str_radix(range[1], 16).expect("invalid end address");
             reserved_pages.push(start..end);
-
-            // Check if the line corresponds to the vdso
-            // Alternatively, we could read it from `/proc/self/auxv`
-            #[cfg(feature = "systrap_backend")]
-            {
-                if let Some(last) = parts.last()
-                    && *last == "[vdso]"
-                {
-                    vdso_address = Some(start);
-                }
-            }
         }
-        (reserved_pages, vdso_address)
+        reserved_pages
     }
 
     #[expect(
@@ -1384,13 +1342,11 @@ impl litebox::platform::IPInterfaceProvider for LinuxUserland {
             unimplemented!("networking without tun is unimplemented")
         };
         match unsafe {
-            syscalls::syscall4(
+            syscalls::syscall3(
                 syscalls::Sysno::write,
                 usize::try_from(tun_socket_fd.as_raw_fd()).unwrap(),
                 packet.as_ptr() as usize,
                 packet.len(),
-                // Unused by the syscall but would be checked by Seccomp filter if enabled.
-                syscall_intercept::SYSCALL_ARG_MAGIC,
             )
         } {
             Ok(n) => {
@@ -1414,13 +1370,11 @@ impl litebox::platform::IPInterfaceProvider for LinuxUserland {
             unimplemented!("networking without tun is unimplemented")
         };
         unsafe {
-            syscalls::syscall4(
+            syscalls::syscall3(
                 syscalls::Sysno::read,
                 usize::try_from(tun_socket_fd.as_raw_fd()).unwrap(),
                 packet.as_mut_ptr() as usize,
                 packet.len(),
-                // Unused by the syscall but would be checked by Seccomp filter if enabled.
-                syscall_intercept::SYSCALL_ARG_MAGIC,
             )
         }
         .map_err(|errno| match errno {
@@ -1576,13 +1530,11 @@ impl litebox::platform::PunchthroughProvider for LinuxUserland {
 impl litebox::platform::DebugLogProvider for LinuxUserland {
     fn debug_log_print(&self, msg: &str) {
         let _ = unsafe {
-            syscalls::syscall4(
+            syscalls::syscall3(
                 syscalls::Sysno::write,
                 litebox_common_linux::STDERR_FILENO as usize,
                 msg.as_ptr() as usize,
                 msg.len(),
-                // Unused by the syscall but would be checked by Seccomp filter if enabled.
-                syscall_intercept::SYSCALL_ARG_MAGIC,
             )
         };
     }
@@ -1658,8 +1610,7 @@ fn futex_timeout(
             },
             uaddr2 as usize,
             // argument `val3` is ignored for this futex operation;
-            // we reinterpret it as the magic value to pass through the Seccomp filter.
-            syscall_intercept::SYSCALL_ARG_MAGIC,
+            0,
         )
     }
 }
@@ -1693,8 +1644,7 @@ fn futex_val2(
             val2 as usize,
             uaddr2 as usize,
             // argument `val3` is ignored for this futex operation;
-            // we reinterpret it as the magic value to pass through the Seccomp filter.
-            syscall_intercept::SYSCALL_ARG_MAGIC,
+            0,
         )
     }
 }
@@ -1770,9 +1720,7 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Li
                 prot_flags(initial_permissions)
                     .bits()
                     .reinterpret_as_unsigned() as usize,
-                (flags.bits().reinterpret_as_unsigned()
-                    // This is to ensure it won't be intercepted by Seccomp if enabled.
-                    | syscall_intercept::MMAP_FLAG_MAGIC) as usize,
+                flags.bits().reinterpret_as_unsigned() as usize,
                 usize::MAX,
                 0,
             )
@@ -1795,16 +1743,8 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Li
         &self,
         range: core::ops::Range<usize>,
     ) -> Result<(), litebox::platform::page_mgmt::DeallocationError> {
-        let _ = unsafe {
-            syscalls::syscall3(
-                syscalls::Sysno::munmap,
-                range.start,
-                range.len(),
-                // This is to ensure it won't be intercepted by Seccomp if enabled.
-                syscall_intercept::SYSCALL_ARG_MAGIC,
-            )
-        }
-        .expect("munmap failed");
+        let _ = unsafe { syscalls::syscall2(syscalls::Sysno::munmap, range.start, range.len()) }
+            .expect("munmap failed");
         Ok(())
     }
 
@@ -1815,15 +1755,13 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Li
         _permissions: MemoryRegionPermissions,
     ) -> Result<Self::RawMutPointer<u8>, litebox::platform::page_mgmt::RemapError> {
         let res = unsafe {
-            syscalls::syscall6(
+            syscalls::syscall5(
                 syscalls::Sysno::mremap,
                 old_range.start,
                 old_range.len(),
                 new_range.len(),
                 MRemapFlags::MREMAP_MAYMOVE.bits() as usize,
                 new_range.start,
-                // Unused by the syscall but would be checked by Seccomp filter if enabled.
-                syscall_intercept::SYSCALL_ARG_MAGIC,
             )
             .expect("mremap failed")
         };
@@ -1836,13 +1774,11 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Li
         new_permissions: MemoryRegionPermissions,
     ) -> Result<(), litebox::platform::page_mgmt::PermissionUpdateError> {
         unsafe {
-            syscalls::syscall4(
+            syscalls::syscall3(
                 syscalls::Sysno::mprotect,
                 range.start,
                 range.len(),
                 prot_flags(new_permissions).bits().reinterpret_as_unsigned() as usize,
-                // This is to ensure it won't be intercepted by Seccomp if enabled.
-                syscall_intercept::SYSCALL_ARG_MAGIC,
             )
         }
         .expect("mprotect failed");
@@ -1871,13 +1807,11 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Li
             std::ffi::CString::new(file_path.as_os_str().as_encoded_bytes()).unwrap();
         // TODO(jb): We should likely be storing pre-opened FDs, right?
         let fd = unsafe {
-            syscalls::syscall4(
+            syscalls::syscall3(
                 syscalls::Sysno::open,
                 file_path_cstr.as_ptr() as usize,
                 OFlags::RDONLY.bits() as usize,
                 0,
-                // Unused by the syscall but would be checked by Seccomp filter if enabled.
-                syscall_intercept::SYSCALL_ARG_MAGIC,
             )
         };
         let fd = fd.expect("file should remain unchanged on host");
@@ -1904,9 +1838,7 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Li
                 suggested_start,
                 source_data.len(),
                 prot_flags(permissions).bits().reinterpret_as_unsigned() as usize,
-                (flags.bits().reinterpret_as_unsigned()
-                    // This is to ensure it won't be intercepted by Seccomp if enabled.
-                    | syscall_intercept::MMAP_FLAG_MAGIC) as usize,
+                flags.bits().reinterpret_as_unsigned() as usize,
                 fd,
                 {
                     #[cfg(target_arch = "x86_64")]
@@ -1922,13 +1854,7 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Li
             )
         };
 
-        let _ = unsafe {
-            syscalls::syscall2(
-                syscalls::Sysno::close,
-                fd, // This is to ensure it won't be intercepted by Seccomp if enabled.
-                syscall_intercept::SYSCALL_ARG_MAGIC,
-            )
-        };
+        let _ = unsafe { syscalls::syscall1(syscalls::Sysno::close, fd) };
 
         match result {
             Ok(ptr) => Ok(UserMutPtr::from_usize(ptr)),
@@ -1940,13 +1866,11 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Li
 impl litebox::platform::StdioProvider for LinuxUserland {
     fn read_from_stdin(&self, buf: &mut [u8]) -> Result<usize, litebox::platform::StdioReadError> {
         unsafe {
-            syscalls::syscall4(
+            syscalls::syscall3(
                 syscalls::Sysno::read,
                 usize::try_from(litebox_common_linux::STDIN_FILENO).unwrap(),
                 buf.as_ptr() as usize,
                 buf.len(),
-                // Unused by the syscall but would be checked by Seccomp filter if enabled.
-                syscall_intercept::SYSCALL_ARG_MAGIC,
             )
         }
         .map_err(|err| match err {
@@ -1961,7 +1885,7 @@ impl litebox::platform::StdioProvider for LinuxUserland {
         buf: &[u8],
     ) -> Result<usize, litebox::platform::StdioWriteError> {
         unsafe {
-            syscalls::syscall4(
+            syscalls::syscall3(
                 syscalls::Sysno::write,
                 usize::try_from(match stream {
                     litebox::platform::StdioOutStream::Stdout => {
@@ -1974,8 +1898,6 @@ impl litebox::platform::StdioProvider for LinuxUserland {
                 .unwrap(),
                 buf.as_ptr() as usize,
                 buf.len(),
-                // Unused by the syscall but would be checked by Seccomp filter if enabled.
-                syscall_intercept::SYSCALL_ARG_MAGIC,
             )
         }
         .map_err(|err| match err {
@@ -2082,16 +2004,13 @@ impl litebox::platform::SystemInfoProvider for LinuxUserland {
     }
 
     fn get_vdso_address(&self) -> Option<usize> {
-        if cfg!(target_arch = "x86") {
-            // Enabling VDSO on x86 causes glibc to not set a restorer in signal
-            // handlers, which we do not currently support. Disable VDSO for
-            // now.
-            //
-            // TODO: implement VDSO in the shim, don't try to pass through the
-            // platform VDSO.
-            return None;
-        }
-        self.vdso_address
+        // Enabling VDSO on x86 causes glibc to not set a restorer in signal
+        // handlers, which we do not currently support. Disable VDSO for
+        // now.
+        //
+        // TODO: implement VDSO in the shim, don't try to pass through the
+        // platform VDSO.
+        None
     }
 }
 

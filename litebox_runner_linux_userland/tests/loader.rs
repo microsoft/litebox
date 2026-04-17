@@ -20,7 +20,6 @@ impl TestLauncher {
         tar_data: &'static [u8],
         initial_files: &[&str],
         tun_device_name: Option<&str>,
-        enable_syscall_interception: bool,
     ) -> Self {
         let platform = Platform::new(tun_device_name);
         litebox_platform_multiplex::set_platform(platform);
@@ -53,9 +52,6 @@ impl TestLauncher {
             this.install_file(data, each);
         }
 
-        if enable_syscall_interception {
-            platform.enable_seccomp_based_syscall_interception();
-        }
         this
     }
 
@@ -138,7 +134,6 @@ fn test_load_exec_dynamic() {
             .map(std::string::String::as_str)
             .collect::<Vec<_>>(),
         None,
-        false,
     );
     launcher.install_file(executable_data, executable_path);
     launcher.test_load_exec_common(executable_path);
@@ -152,7 +147,7 @@ fn test_load_exec_static() {
     let executable_path = "/hello_exec";
     let executable_data = std::fs::read(path).unwrap();
 
-    let mut launcher = TestLauncher::init_platform(&[], &[], None, false);
+    let mut launcher = TestLauncher::init_platform(&[], &[], None);
 
     launcher.install_file(executable_data, executable_path);
 
@@ -265,7 +260,7 @@ fn test_syscall_rewriter() {
     let executable_path = "/hello_exec_nolibc.hooked";
     let executable_data = std::fs::read(hooked_path).unwrap();
 
-    let mut launcher = TestLauncher::init_platform(&[], &[], None, false);
+    let mut launcher = TestLauncher::init_platform(&[], &[], None);
     launcher.install_file(executable_data, executable_path);
     launcher.test_load_exec_common(executable_path);
 }

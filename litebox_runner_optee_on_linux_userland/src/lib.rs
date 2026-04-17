@@ -49,8 +49,6 @@ pub struct CliArgs {
 #[non_exhaustive]
 #[derive(Debug, Clone, clap::ValueEnum)]
 pub enum InterceptionBackend {
-    /// Use seccomp-based syscall interception
-    Seccomp,
     /// Depend purely on rewriten syscalls to intercept them
     Rewriter,
 }
@@ -94,17 +92,12 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     };
 
     // TODO(jb): Clean up platform initialization once we have https://github.com/MSRSSP/litebox/issues/24
-    //
-    // TODO: We also need to pick the type of syscall interception based on whether we want
-    // systrap/sigsys interception, or binary rewriting interception. Currently
-    // `litebox_platform_linux_userland` does not provide a way to pick between the two.
     let platform = Platform::new(None);
     litebox_platform_multiplex::set_platform(platform);
     let shim_builder = litebox_shim_optee::OpteeShimBuilder::new();
     let _litebox = shim_builder.litebox();
     let shim = shim_builder.build();
     match cli_args.interception_backend {
-        InterceptionBackend::Seccomp => platform.enable_seccomp_based_syscall_interception(),
         InterceptionBackend::Rewriter => {}
     }
 

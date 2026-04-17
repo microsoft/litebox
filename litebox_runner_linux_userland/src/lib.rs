@@ -87,8 +87,6 @@ pub struct CliArgs {
 #[non_exhaustive]
 #[derive(Debug, Clone, clap::ValueEnum)]
 pub enum InterceptionBackend {
-    /// Use seccomp-based syscall interception
-    Seccomp,
     /// Depend purely on rewriten syscalls to intercept them
     Rewriter,
 }
@@ -222,10 +220,6 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     };
 
     // TODO(jb): Clean up platform initialization once we have https://github.com/MSRSSP/litebox/issues/24
-    //
-    // TODO: We also need to pick the type of syscall interception based on whether we want
-    // systrap/sigsys interception, or binary rewriting interception. Currently
-    // `litebox_platform_linux_userland` does not provide a way to pick between the two.
     let platform = Platform::new(cli_args.tun_device_name.as_deref());
 
     for file in cow_eligible_regions {
@@ -337,9 +331,6 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
                         .expect("Failed to close /lib/litebox_rtld_audit.so");
                 });
             }
-            InterceptionBackend::Seccomp => {
-                // No need to include rtld_audit.so for seccomp backend
-            }
         }
 
         let tar_ro = litebox::fs::tar_ro::FileSystem::new(litebox, tar_data.into());
@@ -400,7 +391,6 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     };
 
     match cli_args.interception_backend {
-        InterceptionBackend::Seccomp => platform.enable_seccomp_based_syscall_interception(),
         InterceptionBackend::Rewriter => {
             REQUIRE_RTLD_AUDIT.store(true, core::sync::atomic::Ordering::SeqCst);
         }
