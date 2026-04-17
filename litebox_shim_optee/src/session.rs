@@ -116,7 +116,11 @@ pub struct TaInstance {
     /// after initialization because it contains internal state that may not survive moves.
     pub loaded_program: alloc::boxed::Box<LoadedProgram>,
     /// The task page table ID associated with this TA instance.
-    pub task_page_table_id: usize,
+    ///
+    /// `None` after the page table has been torn down. Any lock holder that
+    /// observes `None` must treat the instance as destroyed and bail out
+    /// without touching the page table.
+    pub task_page_table_id: Option<usize>,
 }
 
 // SAFETY: TaInstance is protected by SpinMutex and try_lock (`SessionEntry`)

@@ -547,8 +547,15 @@ fn open_session_single_instance(
 ) -> Result<(), OpteeSmcReturnCode> {
     // Use try_lock to avoid spinning - return EThreadLimit if TA is in use
     // The Linux driver will handle this by waiting and retrying
-    let instance = instance_arc
+    let mut instance = instance_arc
         .try_lock()
+        .ok_or(OpteeSmcReturnCode::EThreadLimit)?;
+
+    // `task_page_table_id == None` means the instance was destroyed by a concurrent
+    // close/panic between our cache lookup and acquiring the instance lock.
+    // Return `EThreadLimit` so the Linux driver retries.
+    let task_pt_id = instance
+        .task_page_table_id
         .ok_or(OpteeSmcReturnCode::EThreadLimit)?;
 
     // Allocate session ID BEFORE calling load_ta_context so TA gets correct ID.
@@ -562,11 +569,10 @@ fn open_session_single_instance(
     debug_serial_println!(
         "Reusing single-instance TA: uuid={:?}, task_pt_id={}, session_id={}",
         ta_uuid,
-        instance.task_page_table_id,
+        task_pt_id,
         runner_session_id
     );
 
-    let task_pt_id = instance.task_page_table_id;
     let ta_flags = instance.loaded_program.ta_flags;
 
     // Switch to the existing TA's page table
@@ -642,6 +648,9 @@ fn open_session_single_instance(
                 )?;
 
                 session_manager().remove_single_instance(&ta_uuid);
+                // Invalidate the id in the struct *before* teardown so any
+                // future lock holder observes `None` and bails.
+                instance.task_page_table_id = None;
 
                 // Safety: We are about to tear down this TA instance;
                 // no references to user-space memory will be held afterwards.
@@ -780,9 +789,6 @@ fn open_session_new_instance(
             "ldelf/TA_CreateEntryPoint failed: return_code={:?}",
             ldelf_return_code
         );
-        // Safety: We are about to tear down this TA instance;
-        // no references to user-space memory will be held afterwards.
-        unsafe { teardown_ta_page_table(&shim, task_pt_id) };
 
         // Write error response back to normal world
         write_msg_args_to_normal_world(
@@ -793,6 +799,10 @@ fn open_session_new_instance(
             None,
             Some(ta_req_info),
         )?;
+
+        // Safety: We are about to tear down this TA instance;
+        // no references to user-space memory will be held afterwards.
+        unsafe { teardown_ta_page_table(&shim, task_pt_id) };
 
         return Ok(());
     }
@@ -879,7 +889,7 @@ fn open_session_new_instance(
     let instance = Arc::new(SpinMutex::new(TaInstance {
         shim,
         loaded_program,
-        task_page_table_id: task_pt_id,
+        task_page_table_id: Some(task_pt_id),
     }));
 
     // Cache single-instance TAs for future sessions
@@ -936,11 +946,14 @@ fn handle_invoke_command(
         .ok_or(OpteeSmcReturnCode::EBadCmd)?;
     // Use try_lock to avoid spinning - return EThreadLimit if TA is in use
     // The Linux driver will handle this by waiting and retrying
-    let Some(instance) = session_entry.instance.try_lock() else {
+    let Some(mut instance) = session_entry.instance.try_lock() else {
         return Err(OpteeSmcReturnCode::EThreadLimit);
     };
-
-    let task_pt_id = instance.task_page_table_id;
+    // `task_page_table_id == None` means the instance was destroyed.
+    // Return `EBadCmd` because the client must start over with OpenSession.
+    let task_pt_id = instance
+        .task_page_table_id
+        .ok_or(OpteeSmcReturnCode::EBadCmd)?;
 
     // Switch to the TA instance's page table
     unsafe { switch_to_task_page_table(task_pt_id)? };
@@ -1021,6 +1034,7 @@ fn handle_invoke_command(
             if ta_flags.is_single_instance() {
                 session_manager().remove_single_instance(&ta_uuid);
             }
+            instance.task_page_table_id = None;
 
             // Safety: We are about to tear down this TA instance;
             // no references to user-space memory will be held afterwards.
@@ -1079,11 +1093,14 @@ fn handle_close_session(
         .ok_or(OpteeSmcReturnCode::EBadCmd)?;
     // Use try_lock to avoid spinning - return EThreadLimit if TA is in use
     // The Linux driver will handle this by waiting and retrying
-    let Some(instance) = session_entry.instance.try_lock() else {
+    let Some(mut instance) = session_entry.instance.try_lock() else {
         return Err(OpteeSmcReturnCode::EThreadLimit);
     };
-
-    let task_pt_id = instance.task_page_table_id;
+    // `task_page_table_id == None` means the instance was destroyed.
+    // Return `EBadCmd` because the client must start over with OpenSession.
+    let task_pt_id = instance
+        .task_page_table_id
+        .ok_or(OpteeSmcReturnCode::EBadCmd)?;
 
     // Switch to the TA instance's page table
     unsafe { switch_to_task_page_table(task_pt_id)? };
@@ -1151,6 +1168,7 @@ fn handle_close_session(
             if entry.ta_flags.is_single_instance() {
                 session_manager().remove_single_instance(&entry.ta_uuid);
             }
+            instance.task_page_table_id = None;
 
             // Safety: We are about to tear down this TA instance;
             // no references to user-space memory will be held afterwards.
