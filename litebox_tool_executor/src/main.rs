@@ -668,19 +668,6 @@ fn vscode_server(cli: &Cli, audit_log_file: Option<&std::path::Path>) -> anyhow:
     //   -R  create host keys if missing
     //   -p 22  listen on port 22 inside the sandbox
     let mut cmd = runner_command(cli, audit, Some(&broker))?;
-    cmd.args([
-        "/usr/sbin/dropbear",
-        "-F", // foreground
-        "-E", // stderr logging
-        "-B", // allow blank passwords
-        "-R", // generate host keys if missing
-        "-p",
-        "22",
-    ]);
-
-    cmd.stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::inherit())
-        .stderr(std::process::Stdio::inherit());
 
     // Detect WSL2 IP for connection instructions.
     let wsl_ip = std::process::Command::new("hostname")
@@ -729,6 +716,53 @@ fn vscode_server(cli: &Cli, audit_log_file: Option<&std::path::Path>) -> anyhow:
     }
     eprintln!("==============================================");
     eprintln!();
+
+    // Pre-warm: run the code-server startup inside the dropbear sandbox
+    // as a background process, so it shares the same PID namespace.
+    // The dropbear init command becomes a shell script that starts both.
+    let mut cmd = runner_command(cli, audit, Some(&broker))?;
+
+    // Find the code-server path for pre-warming.
+    let vscode_dir = cli.rootfs.join("root/.vscode-server/cli/servers");
+    let prewarm_server = std::fs::read_dir(&vscode_dir).ok().and_then(|entries| {
+        entries
+            .filter_map(|e| {
+                let e = e.ok()?;
+                let name = e.file_name().to_string_lossy().to_string();
+                if name.starts_with("Stable-") && e.path().join("server/bin/code-server").exists() {
+                    let mtime = e.metadata().ok()?.modified().ok()?;
+                    Some((mtime, name))
+                } else {
+                    None
+                }
+            })
+            .max_by_key(|(mtime, _)| *mtime)
+            .map(|(_, name)| name)
+    });
+
+    if let Some(ref server_name) = prewarm_server {
+        eprintln!("Pre-warming code-server ({server_name}) inside sandbox...");
+        // Use sh -c to start code-server in background, then exec dropbear.
+        // code-server writes pid.txt + log.txt, so the SSH CLI finds it.
+        let code_server_path =
+            format!("/root/.vscode-server/cli/servers/{server_name}/server/bin/code-server");
+        let init_script = format!(
+            "{code_server_path} \
+             --connection-token=remotessh \
+             --accept-server-license-terms \
+             --start-server \
+             --enable-remote-auto-shutdown &\n\
+             exec /usr/sbin/dropbear -F -E -B -R -p 22"
+        );
+        cmd.args(["/usr/bin/bash", "-c", &init_script]);
+    } else {
+        eprintln!("No VS Code server found for pre-warm, starting dropbear only");
+        cmd.args(["/usr/sbin/dropbear", "-F", "-E", "-B", "-R", "-p", "22"]);
+    }
+
+    cmd.stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::inherit())
+        .stderr(std::process::Stdio::inherit());
 
     let status = cmd
         .status()
