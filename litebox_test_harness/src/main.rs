@@ -1651,11 +1651,124 @@ mod net_tests {
             "ipv6-socket" => test_ipv6_socket(),
             "ipv6-listen" => test_ipv6_listen(),
             "ipv6-connect" => test_ipv6_connect(),
+            "ipv6-getaddrinfo" => test_ipv6_getaddrinfo(),
+            "ipv6-v6only" => test_ipv6_v6only(),
             "ipv4-listen" => test_ipv4_listen(),
             other => {
                 eprintln!("unknown net test: {other}");
                 1
             }
+        }
+    }
+
+    /// NET5: getaddrinfo("::1") + bind + listen — the exact Node.js pattern.
+    fn test_ipv6_getaddrinfo() -> i32 {
+        // Step 1: getaddrinfo for "::1"
+        let mut hints: libc::addrinfo = unsafe { std::mem::zeroed() };
+        hints.ai_family = libc::AF_INET6;
+        hints.ai_socktype = libc::SOCK_STREAM;
+        hints.ai_flags = libc::AI_NUMERICHOST;
+
+        let mut result: *mut libc::addrinfo = std::ptr::null_mut();
+        let host = std::ffi::CString::new("::1").unwrap();
+        let port = std::ffi::CString::new("0").unwrap();
+        let ret = unsafe { libc::getaddrinfo(host.as_ptr(), port.as_ptr(), &hints, &mut result) };
+        if ret != 0 {
+            let err = unsafe { std::ffi::CStr::from_ptr(libc::gai_strerror(ret)) };
+            println!("NET5_GAI_FAIL:ret={ret},err={}", err.to_string_lossy());
+            return 1;
+        }
+        if result.is_null() {
+            println!("NET5_GAI_NULL");
+            return 1;
+        }
+
+        let ai = unsafe { &*result };
+        eprintln!(
+            "[NET5] getaddrinfo: family={}, socktype={}, addrlen={}",
+            ai.ai_family, ai.ai_socktype, ai.ai_addrlen
+        );
+
+        // Step 2: socket
+        let fd = unsafe { libc::socket(ai.ai_family, ai.ai_socktype, ai.ai_protocol) };
+        if fd < 0 {
+            let e = std::io::Error::last_os_error().raw_os_error().unwrap_or(-1);
+            println!("NET5_SOCKET_FAIL:errno={e}");
+            unsafe { libc::freeaddrinfo(result) };
+            return 1;
+        }
+
+        // Step 3: setsockopt IPV6_V6ONLY (Node.js does this)
+        let v6only: libc::c_int = 1;
+        let ret = unsafe {
+            libc::setsockopt(
+                fd,
+                libc::IPPROTO_IPV6,
+                libc::IPV6_V6ONLY,
+                &v6only as *const _ as *const libc::c_void,
+                std::mem::size_of::<libc::c_int>() as u32,
+            )
+        };
+        eprintln!("[NET5] setsockopt IPV6_V6ONLY: ret={ret}");
+
+        // Step 4: bind
+        let ret = unsafe { libc::bind(fd, ai.ai_addr, ai.ai_addrlen) };
+        if ret < 0 {
+            let e = std::io::Error::last_os_error().raw_os_error().unwrap_or(-1);
+            println!("NET5_BIND_FAIL:errno={e}");
+            unsafe {
+                libc::close(fd);
+                libc::freeaddrinfo(result);
+            };
+            return 1;
+        }
+
+        // Step 5: listen
+        let ret = unsafe { libc::listen(fd, 128) };
+        if ret < 0 {
+            let e = std::io::Error::last_os_error().raw_os_error().unwrap_or(-1);
+            println!("NET5_LISTEN_FAIL:errno={e}");
+            unsafe {
+                libc::close(fd);
+                libc::freeaddrinfo(result);
+            };
+            return 1;
+        }
+
+        unsafe {
+            libc::close(fd);
+            libc::freeaddrinfo(result);
+        };
+        println!("NET5_OK");
+        0
+    }
+
+    /// NET6: setsockopt(IPV6_V6ONLY) — Node.js sets this before bind.
+    fn test_ipv6_v6only() -> i32 {
+        let fd = unsafe { libc::socket(libc::AF_INET6, libc::SOCK_STREAM, 0) };
+        if fd < 0 {
+            let e = std::io::Error::last_os_error().raw_os_error().unwrap_or(-1);
+            println!("NET6_SOCKET_FAIL:errno={e}");
+            return 1;
+        }
+        let v6only: libc::c_int = 1;
+        let ret = unsafe {
+            libc::setsockopt(
+                fd,
+                libc::IPPROTO_IPV6,
+                libc::IPV6_V6ONLY,
+                &v6only as *const _ as *const libc::c_void,
+                std::mem::size_of::<libc::c_int>() as u32,
+            )
+        };
+        unsafe { libc::close(fd) };
+        if ret == 0 {
+            println!("NET6_OK");
+            0
+        } else {
+            let e = std::io::Error::last_os_error().raw_os_error().unwrap_or(-1);
+            println!("NET6_FAIL:errno={e}");
+            1
         }
     }
 

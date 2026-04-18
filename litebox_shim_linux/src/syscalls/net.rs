@@ -2394,10 +2394,19 @@ impl<FS: ShimFS> Task<FS> {
             return Err(Errno::EBADF);
         };
         let optname = SocketOptionName::try_from(level, optname).ok_or_else(|| {
+            // IPv6-specific socket options (level 41 = IPPROTO_IPV6) are silently
+            // ignored since we map AF_INET6 to AF_INET internally.
+            if level == 41 {
+                return Errno::ENOPROTOOPT; // sentinel — caught below
+            }
             log_unsupported!("setsockopt(level = {level}, optname = {optname})");
             Errno::EINVAL
-        })?;
-        self.do_setsockopt(sockfd, optname, optval, optlen)
+        });
+        match optname {
+            Ok(name) => self.do_setsockopt(sockfd, name, optval, optlen),
+            Err(Errno::ENOPROTOOPT) => Ok(()), // IPv6 options silently ignored
+            Err(e) => Err(e),
+        }
     }
     fn do_setsockopt(
         &self,
