@@ -567,56 +567,15 @@ fn rewrite_elf(data: &[u8], path: &Path, verbose: bool) -> anyhow::Result<Vec<u8
 
     match litebox_syscall_rewriter::hook_syscalls_in_elf(data, None) {
         Ok((rewritten, skipped_addrs)) => {
-            if !skipped_addrs.is_empty() {
-                eprintln!(
-                    "  warning: {} has {} unpatchable syscall instruction(s) at {:?}",
-                    path.display(),
-                    skipped_addrs.len(),
-                    skipped_addrs,
-                );
-            }
+            litebox_syscall_rewriter::warn_skipped(&path.display().to_string(), &skipped_addrs);
             if verbose {
                 eprintln!("  {} (rewritten)", path.display());
             }
             Ok(rewritten)
         }
-        Err(litebox_syscall_rewriter::Error::AlreadyHooked) => {
-            eprintln!(
-                "  warning: {} is already hooked, using as-is",
-                path.display()
-            );
-            Ok(data.to_vec())
-        }
-        Err(litebox_syscall_rewriter::Error::NoSyscallInstructionsFound) => {
-            if verbose {
-                eprintln!(
-                    "  warning: {} has no syscall instructions, using as-is",
-                    path.display()
-                );
-            }
-            Ok(data.to_vec())
-        }
-        Err(litebox_syscall_rewriter::Error::UnsupportedObjectFile(_)) => {
-            if verbose {
-                eprintln!(
-                    "  warning: {} is not a supported ELF, including as-is",
-                    path.display()
-                );
-            }
-            Ok(data.to_vec())
-        }
-        Err(litebox_syscall_rewriter::Error::NoTextSectionFound) => {
-            if verbose {
-                eprintln!(
-                    "  warning: {} has no .text section, using as-is",
-                    path.display()
-                );
-            }
-            Ok(data.to_vec())
-        }
         Err(litebox_syscall_rewriter::Error::UnsupportedExecutable(_)) => {
             anyhow::bail!(
-                "{} is a Bun-packaged executable and cannot be safely packaged without syscall rewriting",
+                "{} is an executable that cannot be safely patched by syscall rewriting",
                 path.display()
             )
         }

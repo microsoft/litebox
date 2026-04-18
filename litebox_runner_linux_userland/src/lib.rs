@@ -172,13 +172,7 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
             let (rewritten, skipped_addrs) =
                 litebox_syscall_rewriter::hook_syscalls_in_elf(file.data, None)
                     .with_context(|| format!("failed to rewrite {}", prog.display()))?;
-            if !skipped_addrs.is_empty() {
-                eprintln!(
-                    "warning: program has {} unpatchable syscall instruction(s) at {:?}",
-                    skipped_addrs.len(),
-                    skipped_addrs,
-                );
-            }
+            litebox_syscall_rewriter::warn_skipped(&prog.display().to_string(), &skipped_addrs);
             rewritten.into()
         } else {
             let data = file.data.into();

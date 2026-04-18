@@ -47,27 +47,14 @@ fn main() -> anyhow::Result<()> {
     let mut input_binary = std::fs::File::open(&cli_args.input_binary)?;
     let mut input_binary_bytes = vec![];
     input_binary.read_to_end(&mut input_binary_bytes)?;
-    let (output_binary, skipped_addrs) = match litebox_syscall_rewriter::hook_syscalls_in_elf(
+    let (output_binary, skipped_addrs) = litebox_syscall_rewriter::hook_syscalls_in_elf(
         &input_binary_bytes,
         cli_args.trampoline_addr,
-    ) {
-        Ok((output_binary, skipped_addrs)) => (output_binary, skipped_addrs),
-        Err(litebox_syscall_rewriter::Error::NoSyscallInstructionsFound) => {
-            eprintln!(
-                "warning: {} has no syscall instructions, copying as-is",
-                cli_args.input_binary.display()
-            );
-            (input_binary_bytes.clone(), Vec::new())
-        }
-        Err(err) => return Err(err.into()),
-    };
-    if !skipped_addrs.is_empty() {
-        eprintln!(
-            "warning: {} unpatchable syscall instruction(s) at {:?}",
-            skipped_addrs.len(),
-            skipped_addrs,
-        );
-    }
+    )?;
+    litebox_syscall_rewriter::warn_skipped(
+        &cli_args.input_binary.display().to_string(),
+        &skipped_addrs,
+    );
     let output_path = cli_args.output_binary.unwrap_or_else(|| {
         cli_args.input_binary.with_file_name(
             cli_args

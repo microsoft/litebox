@@ -62,14 +62,7 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
             let (rewritten, skipped_addrs) =
                 litebox_syscall_rewriter::hook_syscalls_in_elf(&data, None)
                     .with_context(|| format!("failed to rewrite {}", cli_args.ldelf))?;
-            if !skipped_addrs.is_empty() {
-                eprintln!(
-                    "warning: {} has {} unpatchable syscall instruction(s) at {:?}",
-                    cli_args.ldelf,
-                    skipped_addrs.len(),
-                    skipped_addrs,
-                );
-            }
+            litebox_syscall_rewriter::warn_skipped(&cli_args.ldelf, &skipped_addrs);
             rewritten
         } else {
             data
@@ -84,14 +77,7 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
             let (rewritten, skipped_addrs) =
                 litebox_syscall_rewriter::hook_syscalls_in_elf(&data, None)
                     .with_context(|| format!("failed to rewrite {}", cli_args.program))?;
-            if !skipped_addrs.is_empty() {
-                eprintln!(
-                    "warning: {} has {} unpatchable syscall instruction(s) at {:?}",
-                    cli_args.program,
-                    skipped_addrs.len(),
-                    skipped_addrs,
-                );
-            }
+            litebox_syscall_rewriter::warn_skipped(&cli_args.program, &skipped_addrs);
             rewritten
         } else {
             data

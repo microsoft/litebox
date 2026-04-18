@@ -58,6 +58,21 @@ type Result<T> = core::result::Result<T, Error>;
 
 const BUN_FOOTER_MARKER: &[u8] = b"\n---- Bun! ----\n";
 
+/// Log a standardized warning about unpatchable syscall instructions.
+///
+/// Call this after [`hook_syscalls_in_elf`] or [`patch_code_segment`] when the
+/// returned `skipped_addrs` list is non-empty.
+pub fn warn_skipped(path: &str, skipped_addrs: &[u64]) {
+    if !skipped_addrs.is_empty() {
+        litebox_util_log::warn!(
+            path:% = path,
+            count:% = skipped_addrs.len(),
+            addrs:? = skipped_addrs;
+            "unpatchable syscall instruction(s)"
+        );
+    }
+}
+
 /// The magic bytes used to identify the trampoline data.
 /// This is checked by the loader to verify that the trampoline is valid.
 pub const TRAMPOLINE_MAGIC: &[u8; 8] = b"LITEBOX0";
@@ -115,6 +130,13 @@ struct TextSectionInfo {
 /// addresses are syscall instructions that could not be patched because there
 /// is not enough space around the instruction (replaced with `icebp; hlt` so
 /// they trap instead of escaping to the host kernel).
+///
+/// Binaries that cannot or do not need to be patched (relocatable objects,
+/// non-ELF files, already-hooked binaries, binaries without executable
+/// sections or syscall instructions) are returned unchanged with an empty
+/// skipped list — these are not errors. Only genuinely broken inputs
+/// (corrupt ELF, unsupported executables like Bun, arithmetic overflow)
+/// produce `Err`.
 pub fn hook_syscalls_in_elf(
     input_binary: &[u8],
     trampoline: Option<u64>,
@@ -132,10 +154,7 @@ pub fn hook_syscalls_in_elf(
     if input_binary.len() >= 18 {
         let e_type = u16::from_le_bytes([input_binary[16], input_binary[17]]);
         if e_type == object::elf::ET_REL {
-            // ET_REL — relocatable object file
-            return Err(Error::UnsupportedObjectFile(
-                "relocatable object file".into(),
-            ));
+            return Ok((input_binary.to_vec(), Vec::new()));
         }
     }
 
@@ -159,7 +178,7 @@ pub fn hook_syscalls_in_elf(
         let arch = match file {
             object::File::Elf64(_) => Arch::X86_64,
             object::File::Elf32(_) => Arch::X86_32,
-            _ => return Err(Error::UnsupportedObjectFile("not an ELF file".into())),
+            _ => return Ok((input_binary.to_vec(), Vec::new())),
         };
 
         let dl_sysinfo_int80 = if arch == Arch::X86_32 {
@@ -168,10 +187,14 @@ pub fn hook_syscalls_in_elf(
             None
         };
 
-        let text_sections = text_sections(&file)?;
+        let text_sections = match text_sections(&file) {
+            Ok(sections) => sections,
+            Err(Error::NoTextSectionFound) => return Ok((input_binary.to_vec(), Vec::new())),
+            Err(e) => return Err(e),
+        };
 
         if is_already_hooked(&*buf, arch) {
-            return Err(Error::AlreadyHooked);
+            return Ok((input_binary.to_vec(), Vec::new()));
         }
 
         let control_transfer_targets = get_control_transfer_targets(arch, &*buf, &text_sections)?;
