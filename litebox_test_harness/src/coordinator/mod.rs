@@ -245,6 +245,24 @@ pub fn run_all(self_exe: &str) -> Vec<TestResult> {
 }
 
 async fn run_tests(self_exe: &str) -> Vec<TestResult> {
+    // Create the non-PIE binary for SpawnRemote tests by patching the ELF header.
+    // DYN (0x03) → EXEC (0x02) at offset 16 forces remote worker migration.
+    if let Ok(mut data) = std::fs::read(self_exe) {
+        if data.len() > 18 && data[16] == 0x03 {
+            data[16] = 0x02; // ET_DYN → ET_EXEC
+            let nonpie = "/litebox-test-harness-nonpie";
+            if std::fs::write(nonpie, &data).is_ok() {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    let _ =
+                        std::fs::set_permissions(nonpie, std::fs::Permissions::from_mode(0o755));
+                }
+                eprintln!("[coord] created {nonpie} (non-PIE)");
+            }
+        }
+    }
+
     let mut runner = TestRunner {
         children: std::collections::HashMap::new(),
         results: Vec::new(),
