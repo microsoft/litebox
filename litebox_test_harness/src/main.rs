@@ -1979,6 +1979,14 @@ mod fs_tests {
                     .unwrap_or("/tmp/fs-open.txt");
                 test_exec_open_read(bin_type, path)
             }
+            // Diagnostic: pinpoint where exec-open-read hangs
+            "diag-spawn" => {
+                let path = args
+                    .get(3)
+                    .map(String::as_str)
+                    .unwrap_or("/tmp/fs-diag.txt");
+                test_diag_spawn(path)
+            }
             // Helper: write to file then sleep (keeps process alive with file written)
             "do-write-sleep" => {
                 let path = args
@@ -2075,6 +2083,58 @@ mod fs_tests {
         }
     }
 
+    /// Diagnostic: isolate where exec-open-read hangs by logging timestamps.
+    fn test_diag_spawn(path: &str) -> i32 {
+        let _ = std::fs::remove_file(path);
+        let self_exe = std::env::current_exe().unwrap();
+        let self_exe = self_exe.to_str().unwrap();
+
+        let t0 = std::time::Instant::now();
+        eprintln!("DIAG[{:>6}ms] writing file from parent first", t0.elapsed().as_millis());
+        std::fs::write(path, b"PARENT_WROTE").unwrap();
+
+        eprintln!("DIAG[{:>6}ms] reading back from parent", t0.elapsed().as_millis());
+        let r = std::fs::read_to_string(path).unwrap();
+        eprintln!("DIAG[{:>6}ms] parent read OK: {r}", t0.elapsed().as_millis());
+
+        eprintln!("DIAG[{:>6}ms] spawning child (do-write-sleep)", t0.elapsed().as_millis());
+        let mut child = std::process::Command::new(self_exe)
+            .args(["fs-test", "do-write-sleep", path, "CHILD_WROTE"])
+            .stderr(std::process::Stdio::inherit())
+            .spawn()
+            .unwrap();
+        eprintln!("DIAG[{:>6}ms] spawn returned, pid={}", t0.elapsed().as_millis(), child.id());
+
+        eprintln!("DIAG[{:>6}ms] sleeping 3s for child to write", t0.elapsed().as_millis());
+        std::thread::sleep(std::time::Duration::from_secs(3));
+
+        eprintln!("DIAG[{:>6}ms] checking if file exists", t0.elapsed().as_millis());
+        let exists = std::path::Path::new(path).exists();
+        eprintln!("DIAG[{:>6}ms] file exists={exists}", t0.elapsed().as_millis());
+
+        if exists {
+            eprintln!("DIAG[{:>6}ms] attempting read_to_string...", t0.elapsed().as_millis());
+            match std::fs::read_to_string(path) {
+                Ok(s) => {
+                    eprintln!("DIAG[{:>6}ms] read OK: {s}", t0.elapsed().as_millis());
+                    println!("DIAG_OK:content={s}");
+                }
+                Err(e) => {
+                    eprintln!("DIAG[{:>6}ms] read ERROR: {e}", t0.elapsed().as_millis());
+                    println!("DIAG_ERR:read={e}");
+                }
+            }
+        } else {
+            println!("DIAG_ERR:file_not_found");
+        }
+
+        eprintln!("DIAG[{:>6}ms] killing child", t0.elapsed().as_millis());
+        let _ = child.kill();
+        let _ = child.wait();
+        eprintln!("DIAG[{:>6}ms] done", t0.elapsed().as_millis());
+        0
+    }
+
     /// Fork+exec child that writes AND keeps running; parent reads while child alive.
     /// This is the exact pre-warm pattern — tests 9P coherence for open files on remote workers.
     fn test_exec_open_read(bin_type: &str, path: &str) -> i32 {
@@ -2092,9 +2152,13 @@ mod fs_tests {
             }
         };
 
-        // Spawn child that writes then sleeps (keeps process alive)
+        // Spawn child that writes then sleeps (keeps process alive).
+        // Use null stdout/stderr so the child doesn't hold the parent's
+        // piped stdout open (which would prevent the agent from reading EOF).
         let mut child = match std::process::Command::new(&bin)
             .args(["fs-test", "do-write-sleep", path, data])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
             .spawn()
         {
             Ok(c) => c,
@@ -2105,30 +2169,29 @@ mod fs_tests {
         };
 
         // Wait for child to write the file
-        std::thread::sleep(std::time::Duration::from_secs(2));
+        std::thread::sleep(std::time::Duration::from_secs(3));
 
-        // Read while child still alive
+        // Read while child still alive — print result BEFORE kill/wait
         let result = std::fs::read_to_string(path);
-        let _ = child.kill();
-        let _ = child.wait();
-
-        match result {
+        match &result {
             Ok(s) if s == data => {
                 println!("FS_OK:op=exec-open-read,bin={bin_type},path={path}");
-                0
             }
             Ok(s) => {
                 println!(
                     "FS_ERR:op=exec-open-read,bin={bin_type},path={path},got={}",
                     s.escape_default()
                 );
-                1
             }
             Err(e) => {
                 println!("FS_ERR:op=exec-open-read,bin={bin_type},path={path},read_err={e}");
-                1
             }
         }
+
+        // Clean up — kill may hang on wait, so don't block on it
+        let _ = child.kill();
+        // Don't call child.wait() — it can hang in litebox
+        result.map_or(1, |s| if s == data { 0 } else { 1 })
     }
 
     fn test_io(op: &str, path: &str) -> i32 {
@@ -2306,10 +2369,9 @@ mod fs_tests {
 
                 // Try to read while writer still has file open
                 let result = std::fs::read_to_string(path);
-                let _ = child.kill();
-                let _ = child.wait();
 
-                match result {
+                // Print result BEFORE kill/wait (wait can hang in litebox)
+                let rc = match &result {
                     Ok(s) if s.contains("LINE1") => {
                         println!(
                             "FS_OK:op={op},path={path},content={}",
@@ -2328,7 +2390,11 @@ mod fs_tests {
                         println!("FS_ERR:op={op},path={path},phase=read,err={e}");
                         1
                     }
-                }
+                };
+
+                let _ = child.kill();
+                // Don't call child.wait() — it can hang in litebox
+                rc
             }
             // FS7: Parent opens file for writing, forks, child writes via inherited fd,
             // parent reads. This is the pre-warm pattern: bash opens log.txt with >,
