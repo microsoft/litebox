@@ -294,6 +294,38 @@ fn main() {
             let sub = args.get(2).map(String::as_str).unwrap_or("help");
             std::process::exit(fs_tests::run(sub, &args));
         }
+        // Check if the pre-warmed code-server is running (reads pid.txt + log.txt)
+        "check-prewarm" => {
+            let sdir =
+                "/root/.vscode-server/cli/servers/Stable-ae130017f8afe532557dbb8539a6ef3bdaec6389";
+            let pid_path = format!("{sdir}/pid.txt");
+            let log_path = format!("{sdir}/log.txt");
+
+            let pid_content = std::fs::read_to_string(&pid_path).unwrap_or_default();
+            let pid_content = pid_content.trim();
+            println!("PREWARM_PID_FILE:{pid_content}");
+
+            if let Ok(pid) = pid_content.parse::<i32>() {
+                let alive = unsafe { libc::kill(pid, 0) } == 0;
+                println!("PREWARM_PID_ALIVE:{alive}");
+            } else {
+                println!("PREWARM_PID_ALIVE:no_pid");
+            }
+
+            match std::fs::read_to_string(&log_path) {
+                Ok(log) => {
+                    let lines: Vec<&str> = log.lines().collect();
+                    println!("PREWARM_LOG_LINES:{}", lines.len());
+                    let has_bound = log.contains("Server bound to");
+                    println!("PREWARM_LOG_BOUND:{has_bound}");
+                    if let Some(line) = lines.iter().find(|l| l.contains("Server bound to")) {
+                        println!("PREWARM_SOCKET:{}", line.trim());
+                    }
+                }
+                Err(e) => println!("PREWARM_LOG_ERR:{e}"),
+            }
+            std::process::exit(0);
+        }
         other => {
             eprintln!("unknown command: {other}");
             std::process::exit(1);
@@ -2193,6 +2225,60 @@ mod fs_tests {
                             "FS_OK:op={op},path={path},content={}",
                             s.trim().escape_default()
                         );
+                        0
+                    }
+                    Ok(s) => {
+                        println!(
+                            "FS_ERR:op={op},path={path},phase=read,got={}",
+                            s.escape_default()
+                        );
+                        1
+                    }
+                    Err(e) => {
+                        println!("FS_ERR:op={op},path={path},phase=read,err={e}");
+                        1
+                    }
+                }
+            }
+            // FS7: Parent opens file for writing, forks, child writes via inherited fd,
+            // parent reads. This is the pre-warm pattern: bash opens log.txt with >,
+            // backgrounds code-server (fork), child writes to inherited stdout=log.txt,
+            // later the CLI reads log.txt.
+            "parent-open-fork-read" => {
+                let f = std::fs::File::create(path).unwrap_or_else(|e| {
+                    println!("FS_ERR:op={op},path={path},phase=create,err={e}");
+                    std::process::exit(1);
+                });
+                let fd = {
+                    use std::os::unix::io::AsRawFd;
+                    f.as_raw_fd()
+                };
+
+                let pid = unsafe { libc::fork() };
+                if pid < 0 {
+                    println!("FS_ERR:op={op},path={path},phase=fork");
+                    return 1;
+                }
+                if pid == 0 {
+                    // Child: write to inherited fd, then sleep (keep fd open)
+                    let msg = b"CHILD_WROTE_THIS\n";
+                    unsafe { libc::write(fd, msg.as_ptr() as *const _, msg.len()) };
+                    std::thread::sleep(std::time::Duration::from_secs(5));
+                    std::process::exit(0);
+                }
+
+                // Parent: close our copy of the write fd, wait a bit, then read
+                drop(f);
+                std::thread::sleep(std::time::Duration::from_millis(500));
+
+                let result = std::fs::read_to_string(path);
+                unsafe {
+                    libc::kill(pid, libc::SIGKILL);
+                    libc::waitpid(pid, std::ptr::null_mut(), 0);
+                }
+                match result {
+                    Ok(s) if s.contains("CHILD_WROTE_THIS") => {
+                        println!("FS_OK:op={op},path={path}");
                         0
                     }
                     Ok(s) => {

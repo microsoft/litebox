@@ -579,6 +579,7 @@ pub(super) async fn fs_io_tests(r: &mut TestRunner) {
         "redirect-bg-read",
         "fork-write-read",
         "bg-open-read",
+        "parent-open-fork-read",
     ];
     let paths = ["/tmp/fs-test.txt", "/root/fs-test.txt"];
 
