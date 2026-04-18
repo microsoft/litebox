@@ -2020,9 +2020,6 @@ mod fs_tests {
 
     pub fn run(sub: &str, args: &[String]) -> i32 {
         match sub {
-            // Matrix-style: fs-test io <op> <path>
-            // ops: write-read, append-read, write-bg-read, redirect-bg-read, fork-write-read
-            // paths: /tmp/fs-test, /root/fs-test, /shared/fs-test
             "io" => {
                 let op = args.get(3).map(String::as_str).unwrap_or("write-read");
                 let path = args
@@ -2031,11 +2028,97 @@ mod fs_tests {
                     .unwrap_or("/tmp/fs-test.txt");
                 test_io(op, path)
             }
+            // fs-test exec-write <binary-type> <path>
+            // binary-type: pie (uses self), nonpie-node (uses node)
+            "exec-write" => {
+                let bin_type = args.get(3).map(String::as_str).unwrap_or("pie");
+                let path = args
+                    .get(4)
+                    .map(String::as_str)
+                    .unwrap_or("/tmp/fs-exec.txt");
+                test_exec_write(bin_type, path)
+            }
+            // Called by exec-write to actually write the file
+            "do-write" => {
+                let path = args
+                    .get(3)
+                    .map(String::as_str)
+                    .unwrap_or("/tmp/fs-exec.txt");
+                let data = args.get(4).map(String::as_str).unwrap_or("EXEC_WRITE_DATA");
+                match std::fs::write(path, data.as_bytes()) {
+                    Ok(_) => 0,
+                    Err(e) => {
+                        eprintln!("do-write: {e}");
+                        1
+                    }
+                }
+            }
             _ => {
-                eprintln!("fs-test subcommands: io <op> <path>");
-                eprintln!(
-                    "  ops: write-read, append-read, write-bg-read, redirect-bg-read, fork-write-read"
+                eprintln!("fs-test subcommands: io, exec-write, do-write");
+                1
+            }
+        }
+    }
+
+    /// Fork+exec a binary to write a file, then read it from the parent.
+    fn test_exec_write(bin_type: &str, path: &str) -> i32 {
+        let _ = std::fs::remove_file(path);
+        let self_exe = std::env::current_exe().unwrap();
+        let self_exe = self_exe.to_str().unwrap();
+        let data = "EXEC_WRITE_OK";
+
+        let child = match bin_type {
+            "pie" => std::process::Command::new(self_exe)
+                .args(["fs-test", "do-write", path, data])
+                .output(),
+            "nonpie-node" => {
+                let node = "/root/.vscode-server/cli/servers/Stable-ae130017f8afe532557dbb8539a6ef3bdaec6389/server/node";
+                std::process::Command::new(node)
+                    .args([
+                        "-e",
+                        &format!(
+                            "require('fs').writeFileSync('{path}', '{data}'); process.exit(0);"
+                        ),
+                    ])
+                    .output()
+            }
+            other => {
+                println!("FS_ERR:op=exec-write,unknown_bin_type={other}");
+                return 1;
+            }
+        };
+
+        match child {
+            Ok(out) if !out.status.success() => {
+                let stderr = String::from_utf8_lossy(&out.stderr);
+                println!(
+                    "FS_ERR:op=exec-write,bin={bin_type},path={path},exit={},err={}",
+                    out.status.code().unwrap_or(-1),
+                    stderr.lines().next().unwrap_or("")
                 );
+                return 1;
+            }
+            Err(e) => {
+                println!("FS_ERR:op=exec-write,bin={bin_type},path={path},spawn_err={e}");
+                return 1;
+            }
+            _ => {}
+        }
+
+        match std::fs::read_to_string(path) {
+            Ok(s) if s == data => {
+                println!("FS_OK:op=exec-write,bin={bin_type},path={path}");
+                0
+            }
+            Ok(s) => {
+                println!(
+                    "FS_ERR:op=exec-write,bin={bin_type},path={path},got={}",
+                    s.escape_default()
+                );
+                1
+            }
+            Err(e) => {
+                println!("FS_ERR:op=exec-write,bin={bin_type},path={path},read_err={e}");
                 1
             }
         }
