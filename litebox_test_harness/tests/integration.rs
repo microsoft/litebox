@@ -227,16 +227,25 @@ fn build_rootfs(test_binary: &Path) -> tempfile::TempDir {
     });
     stage_binary(rootfs, &node_path, "/usr/local/bin/node");
 
-    // 4. Generate a non-PIE test binary for X40-X42.
+    // 4. Generate a non-PIE test binary for X40-X42 contamination tests.
     // This is a minimal x86-64 ELF (ET_EXEC, loaded at 0x400000) that
     // writes "NONPIE_OK\n" to stdout and exits. Statically linked — no
-    // libc or dynamic linker needed. Replaces the gcc -no-pie dependency.
+    // libc or dynamic linker needed.
     let nonpie_bin = rootfs.join("nonpie-echo");
     fs::write(&nonpie_bin, generate_nonpie_elf()).unwrap();
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(&nonpie_bin, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    // 4b. Build the non-PIE test harness for SpawnRemote / cross-worker tests.
+    // Built via: cargo rustc -p litebox_test_harness --target-dir target/nonpie -- -C link-args=-no-pie
+    // If the pre-built binary exists, copy it; otherwise tests that need it will skip.
+    let nonpie_harness_src =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../target/nonpie/debug/litebox_test_harness");
+    if nonpie_harness_src.exists() {
+        stage_binary(rootfs, &nonpie_harness_src, "/litebox-test-harness-nonpie");
     }
 
     // 5. Stage dynamic linker at the standard path.
