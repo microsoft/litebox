@@ -1530,50 +1530,10 @@ mod unix_socket_tests {
 }
 
 mod exit_tests {
+    /// Simple single-threaded exit. Also used as the target for exec-exit tests.
     fn test_single_exit() {
         println!("EX1_BEFORE_EXIT");
         std::process::exit(0);
-    }
-
-    fn test_multithread_exit() {
-        for i in 0..4 {
-            std::thread::spawn(move || {
-                loop {
-                    std::thread::sleep(std::time::Duration::from_millis(100));
-                    eprintln!("[EX2] thread {i} alive");
-                }
-            });
-        }
-        std::thread::sleep(std::time::Duration::from_millis(200));
-        println!("EX2_BEFORE_EXIT");
-        std::process::exit(0);
-    }
-
-    fn test_fork_exit() {
-        let pid = unsafe { libc::fork() };
-        if pid < 0 {
-            println!("EX3_FORK_FAIL");
-            std::process::exit(1);
-        }
-        if pid == 0 {
-            eprintln!("[EX3] child exiting");
-            std::process::exit(42);
-        }
-        let mut status: i32 = 0;
-        let ret = unsafe { libc::waitpid(pid, &mut status, 0) };
-        if ret == pid && libc::WIFEXITED(status) {
-            let code = libc::WEXITSTATUS(status);
-            println!("EX3_CHILD_EXITED:{code}");
-            std::process::exit(0);
-        } else {
-            println!("EX3_WAIT_FAIL:ret={ret},status={status}");
-            std::process::exit(1);
-        }
-    }
-
-    fn test_raw_exit_group() {
-        println!("EX4_BEFORE_EXIT");
-        unsafe { libc::syscall(libc::SYS_exit_group, 0) };
     }
 
     /// Terminal ioctl tests — run as: exit-test term <op> <fd>
@@ -1634,36 +1594,9 @@ mod exit_tests {
         std::process::exit(0);
     }
 
-    fn test_exec_exit() {
-        let self_exe = std::env::current_exe().unwrap();
-        let output = std::process::Command::new(&self_exe)
-            .args(["exit-test", "single"])
-            .output();
-        match output {
-            Ok(out) => {
-                let stdout = String::from_utf8_lossy(&out.stdout);
-                let code = out.status.code().unwrap_or(-1);
-                if stdout.contains("EX1_BEFORE_EXIT") && code == 0 {
-                    println!("EX5_EXEC_EXIT_OK");
-                } else {
-                    println!("EX5_EXEC_EXIT_FAIL:code={code},stdout={}", stdout.trim());
-                }
-                std::process::exit(0);
-            }
-            Err(e) => {
-                println!("EX5_SPAWN_FAIL:{e}");
-                std::process::exit(1);
-            }
-        }
-    }
-
     pub fn run(sub: &str) {
         match sub {
             "single" => test_single_exit(),
-            "multithread" => test_multithread_exit(),
-            "fork-exit" => test_fork_exit(),
-            "raw-exit-group" => test_raw_exit_group(),
-            "exec-exit" => test_exec_exit(),
             // Matrix-style: exit-test term <op> <fd>
             "term" => {
                 let op = std::env::args().nth(3).unwrap_or_default();

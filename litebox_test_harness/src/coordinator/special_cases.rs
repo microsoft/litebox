@@ -692,7 +692,33 @@ pub(super) async fn fs_io_tests(r: &mut TestRunner) {
     }
 }
 
-/// Cross-worker filesystem and socket tests using SpawnRemote.
+/// IPv6 network tests.
+pub(super) async fn net_ipv6_tests(r: &mut TestRunner) {
+    let self_exe = r.self_exe.clone();
+    let tests = [
+        ("NET1.ipv6_socket", "ipv6-socket"),
+        ("NET2.ipv6_listen", "ipv6-listen"),
+        ("NET4.ipv4_listen", "ipv4-listen"),
+        ("NET5.ipv6_getaddrinfo", "ipv6-getaddrinfo"),
+        ("NET6.ipv6_v6only", "ipv6-v6only"),
+    ];
+
+    eprintln!(
+        "[special] === IPv6 Network Tests ({} cases) ===",
+        tests.len()
+    );
+
+    for (name, sub) in &tests {
+        let resp = r
+            .send(
+                "A",
+                super::exec_timeout(vec![self_exe.clone(), "net-test".into(), (*sub).into()], 10),
+            )
+            .await;
+        let pass = matches!(&resp, Response::ExecResult { stdout, .. } if stdout.contains("_OK"));
+        r.record(name, "A", pass, &format!("{resp:?}"));
+    }
+}
 pub(super) async fn cross_worker_tests(r: &mut TestRunner) {
     eprintln!("[special] === Cross-Worker Tests (SpawnRemote) ===");
 

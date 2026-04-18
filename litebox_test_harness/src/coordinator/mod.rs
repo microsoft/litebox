@@ -319,6 +319,9 @@ async fn run_tests(self_exe: &str) -> Vec<TestResult> {
     // === Netlink / getifaddrs Tests ===
     special_cases::netlink_tests(&mut runner).await;
 
+    // === IPv6 Network Tests ===
+    special_cases::net_ipv6_tests(&mut runner).await;
+
     // === Unix Socket Tests ===
     special_cases::unix_socket_tests(&mut runner).await;
 
