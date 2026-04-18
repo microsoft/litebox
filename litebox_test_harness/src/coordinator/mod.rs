@@ -245,21 +245,19 @@ pub fn run_all(self_exe: &str) -> Vec<TestResult> {
 }
 
 async fn run_tests(self_exe: &str) -> Vec<TestResult> {
-    // Create the non-PIE binary for SpawnRemote tests by patching the ELF header.
-    // DYN (0x03) → EXEC (0x02) at offset 16 forces remote worker migration.
-    if let Ok(mut data) = std::fs::read(self_exe) {
-        if data.len() > 18 && data[16] == 0x03 {
-            data[16] = 0x02; // ET_DYN → ET_EXEC
-            let nonpie = "/litebox-test-harness-nonpie";
-            if std::fs::write(nonpie, &data).is_ok() {
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::PermissionsExt;
-                    let _ =
-                        std::fs::set_permissions(nonpie, std::fs::Permissions::from_mode(0o755));
-                }
-                eprintln!("[coord] created {nonpie} (non-PIE)");
+    // Create the non-PIE binary for SpawnRemote tests.
+    // This is a minimal non-PIE ELF that does execve("/litebox-test-harness", argv)
+    // to force remote worker migration, then hands off to the real PIE agent.
+    {
+        let nonpie = "/litebox-test-harness-nonpie";
+        let elf = generate_nonpie_execve_wrapper();
+        if std::fs::write(nonpie, &elf).is_ok() {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(nonpie, std::fs::Permissions::from_mode(0o755));
             }
+            eprintln!("[coord] created {nonpie} (non-PIE execve wrapper)");
         }
     }
 
@@ -469,4 +467,116 @@ async fn send_cmd(child: &mut Child, cmd: &Command) -> Response {
             error: "timeout".into(),
         },
     }
+}
+
+/// Generate a minimal non-PIE ELF (ET_EXEC) that does:
+///   execve("/litebox-test-harness", argv, envp)
+///
+/// This binary forces remote worker migration (because it's non-PIE),
+/// then immediately replaces itself with the real PIE test harness,
+/// passing through all command-line arguments.
+///
+/// The machine code reads argc/argv from the Linux process stack layout
+/// (rsp points to argc at process entry), sets argv[0] to the target path,
+/// and calls execve.
+fn generate_nonpie_execve_wrapper() -> Vec<u8> {
+    // Target binary to exec into
+    let target = b"/litebox-test-harness\0";
+
+    // x86-64 machine code at entry:
+    //   ; On Linux entry: [rsp] = argc, [rsp+8] = argv[0], [rsp+16] = argv[1], ...
+    //   ; After argv: NULL, then envp array
+    //
+    //   lea rdi, [rip + target]      ; path = "/litebox-test-harness"
+    //   mov rsi, rsp                 ; argv = stack (argc at [rsp], but we need argv array)
+    //   add rsi, 8                   ; rsi = &argv[0]
+    //   mov [rsi], rdi               ; argv[0] = path (replace with target)
+    //
+    //   ; Find envp: skip argc + argv pointers + NULL
+    //   mov rcx, [rsp]               ; rcx = argc
+    //   lea rdx, [rsi + rcx*8 + 8]   ; rdx = &argv[argc+1] = envp
+    //
+    //   mov rax, 59                  ; SYS_execve
+    //   syscall
+    //
+    //   ; If execve fails, exit(127)
+    //   mov rax, 60                  ; SYS_exit
+    //   mov rdi, 127
+    //   syscall
+    //
+    // Assembled:
+    let code: &[u8] = &[
+        // lea rdi, [rip + offset_to_target]
+        0x48, 0x8d, 0x3d, 0x00, 0x00, 0x00, 0x00, // patched below
+        // mov rsi, rsp
+        0x48, 0x89, 0xe6, // add rsi, 8
+        0x48, 0x83, 0xc6, 0x08, // mov [rsi], rdi
+        0x48, 0x89, 0x3e, // mov rcx, [rsp]
+        0x48, 0x8b, 0x0c, 0x24, // lea rdx, [rsi + rcx*8 + 8]
+        0x48, 0x8d, 0x54, 0xce, 0x08, // mov rax, 59
+        0x48, 0xc7, 0xc0, 0x3b, 0x00, 0x00, 0x00, // syscall
+        0x0f, 0x05, // mov rax, 60
+        0x48, 0xc7, 0xc0, 0x3c, 0x00, 0x00, 0x00, // mov rdi, 127
+        0x48, 0xc7, 0xc7, 0x7f, 0x00, 0x00, 0x00, // syscall
+        0x0f, 0x05,
+    ];
+
+    // Use 0x10000 as the base address — within the partition's valid range.
+    // 0x400000 (the typical non-PIE base) may be outside the init slot.
+    let base_addr: u64 = 0x10000;
+    let ehdr_size: u16 = 64;
+    let phdr_size: u16 = 56;
+    let code_offset = (ehdr_size + phdr_size) as u64;
+    let target_offset = code_offset + code.len() as u64;
+    let entry = base_addr + code_offset;
+    let file_size = target_offset as usize + target.len();
+
+    // Patch the RIP-relative offset for `lea rdi, [rip + target]`
+    // At the lea instruction (offset 0 in code), RIP = entry + 7 (after the lea)
+    // target is at entry + code.len()
+    // offset = target_addr - rip = (code.len() - 7) as i32
+    let rip_offset = (code.len() as i32) - 7;
+    let mut code_patched = code.to_vec();
+    code_patched[3..7].copy_from_slice(&rip_offset.to_le_bytes());
+
+    let mut elf = Vec::with_capacity(file_size);
+
+    // ELF header (64 bytes)
+    elf.extend_from_slice(&[0x7f, b'E', b'L', b'F']); // magic
+    elf.push(2); // ELFCLASS64
+    elf.push(1); // ELFDATA2LSB
+    elf.push(1); // EV_CURRENT
+    elf.push(0); // ELFOSABI_NONE
+    elf.extend_from_slice(&[0; 8]); // padding
+    elf.extend_from_slice(&2u16.to_le_bytes()); // ET_EXEC (non-PIE!)
+    elf.extend_from_slice(&0x3eu16.to_le_bytes()); // EM_X86_64
+    elf.extend_from_slice(&1u32.to_le_bytes()); // version
+    elf.extend_from_slice(&entry.to_le_bytes()); // e_entry
+    elf.extend_from_slice(&(ehdr_size as u64).to_le_bytes()); // e_phoff
+    elf.extend_from_slice(&0u64.to_le_bytes()); // e_shoff
+    elf.extend_from_slice(&0u32.to_le_bytes()); // e_flags
+    elf.extend_from_slice(&ehdr_size.to_le_bytes()); // e_ehsize
+    elf.extend_from_slice(&phdr_size.to_le_bytes()); // e_phentsize
+    elf.extend_from_slice(&1u16.to_le_bytes()); // e_phnum
+    elf.extend_from_slice(&0u16.to_le_bytes()); // e_shentsize
+    elf.extend_from_slice(&0u16.to_le_bytes()); // e_shnum
+    elf.extend_from_slice(&0u16.to_le_bytes()); // e_shstrndx
+
+    // Program header (56 bytes) - PT_LOAD
+    elf.extend_from_slice(&1u32.to_le_bytes()); // p_type: PT_LOAD
+    elf.extend_from_slice(&5u32.to_le_bytes()); // p_flags: PF_R | PF_X
+    elf.extend_from_slice(&0u64.to_le_bytes()); // p_offset
+    elf.extend_from_slice(&base_addr.to_le_bytes()); // p_vaddr
+    elf.extend_from_slice(&base_addr.to_le_bytes()); // p_paddr
+    elf.extend_from_slice(&(file_size as u64).to_le_bytes()); // p_filesz
+    elf.extend_from_slice(&(file_size as u64).to_le_bytes()); // p_memsz
+    elf.extend_from_slice(&0x1000u64.to_le_bytes()); // p_align
+
+    // Code
+    elf.extend_from_slice(&code_patched);
+
+    // Target path string
+    elf.extend_from_slice(target);
+
+    elf
 }
