@@ -58,27 +58,6 @@ type Result<T> = core::result::Result<T, Error>;
 
 const BUN_FOOTER_MARKER: &[u8] = b"\n---- Bun! ----\n";
 
-/// Check for unpatchable syscall instructions and return an error if any exist.
-///
-/// Call this after [`hook_syscalls_in_elf`] or [`patch_code_segment`] to ensure
-/// all syscall instructions were successfully patched. Logs the skipped
-/// addresses as a warning before returning the error.
-pub fn ensure_all_patched(path: &str, skipped_addrs: &[u64]) -> Result<()> {
-    if skipped_addrs.is_empty() {
-        return Ok(());
-    }
-    litebox_util_log::warn!(
-        path:% = path,
-        count:% = skipped_addrs.len(),
-        addrs:? = skipped_addrs;
-        "unpatchable syscall instruction(s)"
-    );
-    Err(Error::PatchError(format!(
-        "{path} has {} unpatchable syscall instruction(s) at {skipped_addrs:?}",
-        skipped_addrs.len(),
-    )))
-}
-
 /// The magic bytes used to identify the trampoline data.
 /// This is checked by the loader to verify that the trampoline is valid.
 pub const TRAMPOLINE_MAGIC: &[u8; 8] = b"LITEBOX0";
@@ -132,21 +111,16 @@ struct TextSectionInfo {
 /// no syscall instructions are patched, the rewriter still appends the header and the initial
 /// syscall-entry placeholder so the loader/audit path can tell the binary was processed.
 ///
-/// Returns a tuple of (rewritten binary, skipped syscall addresses). Skipped
-/// addresses are syscall instructions that could not be patched because there
-/// is not enough space around the instruction (replaced with `icebp; hlt` so
-/// they trap instead of escaping to the host kernel).
+/// Returns the rewritten binary. Binaries that cannot or do not need to be
+/// patched (relocatable objects, non-ELF files, already-hooked binaries,
+/// binaries without executable sections or syscall instructions) are returned
+/// unchanged — these are not errors.
 ///
-/// Binaries that cannot or do not need to be patched (relocatable objects,
-/// non-ELF files, already-hooked binaries, binaries without executable
-/// sections or syscall instructions) are returned unchanged with an empty
-/// skipped list — these are not errors. Only genuinely broken inputs
-/// (corrupt ELF, unsupported executables like Bun, arithmetic overflow)
-/// produce `Err`.
-pub fn hook_syscalls_in_elf(
-    input_binary: &[u8],
-    trampoline: Option<u64>,
-) -> Result<(Vec<u8>, Vec<u64>)> {
+/// Returns `Err` for genuinely broken inputs (corrupt ELF, unsupported
+/// executables like Bun, arithmetic overflow) and for binaries that contain
+/// syscall instructions that could not be patched (replaced with `icebp; hlt`
+/// so they trap instead of escaping to the host kernel).
+pub fn hook_syscalls_in_elf(input_binary: &[u8], trampoline: Option<u64>) -> Result<Vec<u8>> {
     if input_binary.ends_with(BUN_FOOTER_MARKER) {
         return Err(Error::UnsupportedExecutable(
             "Bun-packaged executable".into(),
@@ -160,7 +134,7 @@ pub fn hook_syscalls_in_elf(
     if input_binary.len() >= 18 {
         let e_type = u16::from_le_bytes([input_binary[16], input_binary[17]]);
         if e_type == object::elf::ET_REL {
-            return Ok((input_binary.to_vec(), Vec::new()));
+            return Ok(input_binary.to_vec());
         }
     }
 
@@ -184,7 +158,7 @@ pub fn hook_syscalls_in_elf(
         let arch = match file {
             object::File::Elf64(_) => Arch::X86_64,
             object::File::Elf32(_) => Arch::X86_32,
-            _ => return Ok((input_binary.to_vec(), Vec::new())),
+            _ => return Ok(input_binary.to_vec()),
         };
 
         let dl_sysinfo_int80 = if arch == Arch::X86_32 {
@@ -195,12 +169,12 @@ pub fn hook_syscalls_in_elf(
 
         let text_sections = match text_sections(&file) {
             Ok(sections) => sections,
-            Err(Error::NoTextSectionFound) => return Ok((input_binary.to_vec(), Vec::new())),
+            Err(Error::NoTextSectionFound) => return Ok(input_binary.to_vec()),
             Err(e) => return Err(e),
         };
 
         if is_already_hooked(&*buf, arch) {
-            return Ok((input_binary.to_vec(), Vec::new()));
+            return Ok(input_binary.to_vec());
         }
 
         let control_transfer_targets = get_control_transfer_targets(arch, &*buf, &text_sections)?;
@@ -282,9 +256,14 @@ pub fn hook_syscalls_in_elf(
         };
         out.extend_from_slice(header.as_bytes());
     }
-    Ok((out, skipped_addrs))
+    if !skipped_addrs.is_empty() {
+        return Err(Error::PatchError(format!(
+            "{} unpatchable syscall instruction(s) at {skipped_addrs:?}",
+            skipped_addrs.len(),
+        )));
+    }
+    Ok(out)
 }
-
 /// (private) Get metadata for executable sections
 fn text_sections(file: &object::File<'_>) -> Result<Vec<TextSectionInfo>> {
     let text_sections: Vec<_> = file
@@ -718,22 +697,21 @@ fn rel32_bytes(target: u64, base: u64, context: &'static str) -> Result<[u8; 4]>
     Ok(disp.to_le_bytes())
 }
 
-/// Patch a single mapped code segment in-place, returning trampoline stubs and
-/// the addresses of any syscall instructions that could not be patched
-/// (replaced with `ICEBP; HLT` so they trap instead of escaping to the host
-/// kernel).
+/// Patch a single mapped code segment in-place, returning trampoline stubs.
 ///
 /// This is the runtime counterpart to [`hook_syscalls_in_elf`]. Instead of
 /// processing a whole ELF file, it operates on a single already-mapped code
 /// region — the caller is responsible for making the region writable before
 /// calling and restoring permissions afterwards. The caller must copy the
 /// returned stubs to `trampoline_write_vaddr`.
+///
+/// Returns `Err` if any syscall instructions could not be patched.
 pub fn patch_code_segment(
     code: &mut [u8],
     code_vaddr: u64,
     trampoline_write_vaddr: u64,
     syscall_entry_addr: u64,
-) -> Result<(Vec<u8>, Vec<u64>)> {
+) -> Result<Vec<u8>> {
     let arch = Arch::X86_64; // runtime patching is x86-64 only
 
     // Build control-transfer targets for this segment.
@@ -757,8 +735,16 @@ pub fn patch_code_segment(
         None, // dl_sysinfo_int80 — not applicable on x86-64
         &mut trampoline_data,
     ) {
-        Ok(skipped_addrs) => Ok((trampoline_data, skipped_addrs)),
-        Err(Error::NoSyscallInstructionsFound) => Ok((Vec::new(), Vec::new())),
+        Ok(skipped_addrs) => {
+            if !skipped_addrs.is_empty() {
+                return Err(Error::PatchError(format!(
+                    "{} unpatchable syscall instruction(s) at {skipped_addrs:?}",
+                    skipped_addrs.len(),
+                )));
+            }
+            Ok(trampoline_data)
+        }
+        Err(Error::NoSyscallInstructionsFound) => Ok(Vec::new()),
         Err(e) => Err(e),
     }
 }

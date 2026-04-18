@@ -47,13 +47,9 @@ fn main() -> anyhow::Result<()> {
     let mut input_binary = std::fs::File::open(&cli_args.input_binary)?;
     let mut input_binary_bytes = vec![];
     input_binary.read_to_end(&mut input_binary_bytes)?;
-    let (output_binary, skipped_addrs) = litebox_syscall_rewriter::hook_syscalls_in_elf(
+    let output_binary = litebox_syscall_rewriter::hook_syscalls_in_elf(
         &input_binary_bytes,
         cli_args.trampoline_addr,
-    )?;
-    litebox_syscall_rewriter::ensure_all_patched(
-        &cli_args.input_binary.display().to_string(),
-        &skipped_addrs,
     )?;
     let output_path = cli_args.output_binary.unwrap_or_else(|| {
         cli_args.input_binary.with_file_name(
