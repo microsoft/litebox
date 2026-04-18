@@ -742,16 +742,20 @@ fn vscode_server(cli: &Cli, audit_log_file: Option<&std::path::Path>) -> anyhow:
 
     if let Some(ref server_name) = prewarm_server {
         eprintln!("Pre-warming code-server ({server_name}) inside sandbox...");
-        // Use sh -c to start code-server in background, then exec dropbear.
-        // code-server writes pid.txt + log.txt, so the SSH CLI finds it.
         let code_server_path =
             format!("/root/.vscode-server/cli/servers/{server_name}/server/bin/code-server");
+        let server_dir = format!("/root/.vscode-server/cli/servers/{server_name}");
+        // Start code-server in background, capture its PID into pid.txt and
+        // redirect output to log.txt. The VS Code CLI checks these files to
+        // detect a running server and skip the startup delay.
         let init_script = format!(
             "{code_server_path} \
              --connection-token=remotessh \
              --accept-server-license-terms \
              --start-server \
-             --enable-remote-auto-shutdown &\n\
+             --enable-remote-auto-shutdown \
+             > {server_dir}/log.txt 2>&1 &\n\
+             echo $! > {server_dir}/pid.txt\n\
              exec /usr/sbin/dropbear -F -E -B -R -p 22"
         );
         cmd.args(["/usr/bin/bash", "-c", &init_script]);
