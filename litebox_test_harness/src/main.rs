@@ -11,6 +11,35 @@ mod agent;
 mod coordinator;
 mod protocol;
 
+/// Find the non-PIE test harness binary. Checks (in order):
+/// 1. `/litebox-test-harness-nonpie` (litebox rootfs)
+/// 2. Sibling of current exe with `_nonpie` suffix
+/// 3. Sibling of current exe with `-nonpie` suffix
+fn find_nonpie_binary() -> Option<String> {
+    let candidates = vec!["/litebox-test-harness-nonpie".to_string()];
+    let mut all = candidates;
+    if let Ok(exe) = std::env::current_exe() {
+        let dir = exe.parent().unwrap_or(std::path::Path::new("."));
+        let stem = exe
+            .file_stem()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string();
+        all.push(
+            dir.join(format!("{stem}_nonpie"))
+                .to_string_lossy()
+                .to_string(),
+        );
+        all.push(
+            dir.join(format!("{stem}-nonpie"))
+                .to_string_lossy()
+                .to_string(),
+        );
+    }
+    all.into_iter()
+        .find(|p| std::path::Path::new(p).exists())
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let cmd = args.get(1).map(String::as_str).unwrap_or("spawn-tree");
@@ -65,6 +94,7 @@ fn main() {
             let mode = args.get(3).map(String::as_str).unwrap_or("pie");
             let use_tokio = args.get(4).map(String::as_str) == Some("tokio");
             let mut failures = 0;
+            let nonpie_bin = find_nonpie_binary().unwrap_or_default();
             println!("STRESS_START mode={mode} count={count} tokio={use_tokio}");
             if use_tokio {
                 let rt = tokio::runtime::Builder::new_current_thread()
@@ -75,9 +105,13 @@ fn main() {
                     let mut failures = 0;
                     for i in 0..count {
                         let (cmd_args, expected): (Vec<&str>, &str) = match mode {
-                            "nonpie" => (vec!["/nonpie-echo"], "NONPIE_OK"),
-                            "mixed" if i % 2 == 0 => (vec![self_exe, "echo-test"], "ECHO_TEST_OK"),
-                            "mixed" => (vec!["/nonpie-echo"], "NONPIE_OK"),
+                            "nonpie" => {
+                                (vec![&nonpie_bin, "echo-test"], "ECHO_TEST_OK")
+                            }
+                            "mixed" if i % 2 == 0 => {
+                                (vec![self_exe, "echo-test"], "ECHO_TEST_OK")
+                            }
+                            "mixed" => (vec![&nonpie_bin, "echo-test"], "ECHO_TEST_OK"),
                             _ => (vec![self_exe, "echo-test"], "ECHO_TEST_OK"),
                         };
                         let result = tokio::process::Command::new(cmd_args[0])
@@ -112,9 +146,11 @@ fn main() {
             } else {
                 for i in 0..count {
                     let (cmd_args, expected): (Vec<&str>, &str) = match mode {
-                        "nonpie" => (vec!["/nonpie-echo"], "NONPIE_OK"),
-                        "mixed" if i % 2 == 0 => (vec![self_exe, "echo-test"], "ECHO_TEST_OK"),
-                        "mixed" => (vec!["/nonpie-echo"], "NONPIE_OK"),
+                        "nonpie" => (vec![&nonpie_bin, "echo-test"], "ECHO_TEST_OK"),
+                        "mixed" if i % 2 == 0 => {
+                            (vec![self_exe, "echo-test"], "ECHO_TEST_OK")
+                        }
+                        "mixed" => (vec![&nonpie_bin, "echo-test"], "ECHO_TEST_OK"),
                         _ => (vec![self_exe, "echo-test"], "ECHO_TEST_OK"),
                     };
                     let result = std::process::Command::new(cmd_args[0])
@@ -2036,8 +2072,14 @@ mod fs_tests {
                 .args(["fs-test", "do-write", path, data])
                 .output(),
             "nonpie" => {
-                // Use the ELF-header-patched copy (ET_EXEC) to force remote worker
-                std::process::Command::new("/litebox-test-harness-nonpie")
+                let bin = match crate::find_nonpie_binary() {
+                    Some(b) => b,
+                    None => {
+                        println!("FS_ERR:op=exec-write,bin=nonpie,err=nonpie binary not found");
+                        return 1;
+                    }
+                };
+                std::process::Command::new(&bin)
                     .args(["fs-test", "do-write", path, data])
                     .output()
             }
@@ -2145,7 +2187,13 @@ mod fs_tests {
 
         let bin = match bin_type {
             "pie" => self_exe.to_string(),
-            "nonpie" => "/litebox-test-harness-nonpie".to_string(),
+            "nonpie" => match crate::find_nonpie_binary() {
+                Some(b) => b,
+                None => {
+                    println!("FS_ERR:op=exec-open-read,bin=nonpie,err=nonpie binary not found");
+                    return 1;
+                }
+            },
             other => {
                 println!("FS_ERR:op=exec-open-read,unknown_bin_type={other}");
                 return 1;

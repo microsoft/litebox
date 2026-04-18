@@ -81,9 +81,18 @@ async fn agent_loop(self_exe: &str) {
 
             Command::SpawnRemote { children: names } => {
                 // Use the non-PIE binary to force remote worker migration.
-                let remote_exe = "/litebox-test-harness-nonpie";
+                let remote_exe = match crate::find_nonpie_binary() {
+                    Some(p) => p,
+                    None => {
+                        respond(&Response::Error {
+                            error: "nonpie binary not found".to_string(),
+                        })
+                        .await;
+                        continue;
+                    }
+                };
                 for name in &names {
-                    match spawn_child(remote_exe, name).await {
+                    match spawn_child(&remote_exe, name).await {
                         Ok(handle) => {
                             children.insert(name.clone(), handle);
                         }

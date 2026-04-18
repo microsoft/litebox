@@ -337,7 +337,7 @@ impl DfBinary {
     fn expected(self) -> &'static str {
         match self {
             Self::Pie => "ECHO_TEST_OK",
-            Self::NonPie => "NONPIE_OK",
+            Self::NonPie => "ECHO_TEST_OK",
             Self::Node => "df_node_ok",
         }
     }
@@ -388,7 +388,13 @@ async fn delayed_fork_matrix(r: &mut TestRunner) {
 
                     let (inner_cmd, inner_args): (String, Vec<String>) = match binary {
                         DfBinary::Pie => (self_exe.clone(), vec!["echo-test".into()]),
-                        DfBinary::NonPie => ("/nonpie-echo".into(), vec![]),
+                        DfBinary::NonPie => match crate::find_nonpie_binary() {
+                            Some(p) => (p, vec!["echo-test".into()]),
+                            None => {
+                                r.record(&test_id, agent, true, "skipped (nonpie binary not found)");
+                                continue;
+                            }
+                        },
                         DfBinary::Node => (
                             "/usr/local/bin/node".into(),
                             vec!["-e".into(), "console.log('df_node_ok')".into()],
@@ -545,12 +551,35 @@ async fn nonpie_invocation_tests(r: &mut TestRunner) {
         NONPIE_CASES.len()
     );
 
+    let nonpie_bin = match crate::find_nonpie_binary() {
+        Some(p) => p,
+        None => {
+            for nc in NONPIE_CASES {
+                r.record(
+                    &format!("XNP.{}", nc.name),
+                    "A",
+                    true,
+                    "skipped (nonpie binary not found)",
+                );
+            }
+            return;
+        }
+    };
+
     for nc in NONPIE_CASES {
         let test_id = format!("XNP.{}", nc.name);
         let resp = match nc.bash_cmd {
-            None => r.send("A", exec(vec!["/nonpie-echo".into()])).await,
+            None => {
+                r.send(
+                    "A",
+                    exec(vec![nonpie_bin.clone(), "echo-test".into()]),
+                )
+                .await
+            }
             Some(cmd) => {
-                r.send("A", exec(vec!["bash".into(), "-c".into(), cmd.into()]))
+                let resolved = cmd
+                    .replace("/nonpie-echo", &format!("{nonpie_bin} echo-test"));
+                r.send("A", exec(vec!["bash".into(), "-c".into(), resolved]))
                     .await
             }
         };
@@ -560,10 +589,10 @@ async fn nonpie_invocation_tests(r: &mut TestRunner) {
         let skipped =
             matches!(&resp, Response::ExecResult { stdout, .. } if stdout.contains("SKIP"));
         if not_found || skipped {
-            r.record(&test_id, "A", true, "skipped (nonpie-echo not in rootfs)");
+            r.record(&test_id, "A", true, "skipped (nonpie binary not found)");
         } else {
             let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. }
-                if stdout.contains("NONPIE_OK"));
+                if stdout.contains("ECHO_TEST_OK"));
             r.record(&test_id, "A", pass, &format!("{resp:?}"));
         }
     }
@@ -605,7 +634,7 @@ const CONTAMINATION_CASES: &[ContaminationCase] = &[
         bash_template: Some(
             "if [ -x /nonpie-echo ]; then bash -c '/nonpie-echo'; else echo SKIP; fi",
         ),
-        expected: "NONPIE_OK",
+        expected: "ECHO_TEST_OK",
     },
     ContaminationCase {
         name: "depth2_clean",
@@ -627,8 +656,35 @@ async fn contamination_pattern_tests(r: &mut TestRunner) {
         CONTAMINATION_CASES.len()
     );
 
+    let nonpie_bin = match crate::find_nonpie_binary() {
+        Some(p) => p,
+        None => {
+            r.record(
+                "XC.init_level",
+                "A",
+                true,
+                "skipped (nonpie binary not found)",
+            );
+            for cc in CONTAMINATION_CASES {
+                r.record(
+                    &format!("XC.{}", cc.name),
+                    "A",
+                    true,
+                    "skipped (nonpie binary not found)",
+                );
+            }
+            return;
+        }
+    };
+    let nonpie_cmd = format!("{nonpie_bin} echo-test");
+
     // Init-level: exec non-PIE, then exec PIE — check PIE output is clean.
-    let resp = r.send("A", exec(vec!["/nonpie-echo".into()])).await;
+    let resp = r
+        .send(
+            "A",
+            exec(vec![nonpie_bin.clone(), "echo-test".into()]),
+        )
+        .await;
     let not_found = matches!(&resp, Response::ExecResult { exit_code: 127, .. })
         || matches!(&resp, Response::Error { .. });
     if not_found {
@@ -636,7 +692,7 @@ async fn contamination_pattern_tests(r: &mut TestRunner) {
             "XC.init_level",
             "A",
             true,
-            "skipped (nonpie-echo not in rootfs)",
+            "skipped (nonpie binary not found)",
         );
     } else {
         let resp2 = r
@@ -649,12 +705,16 @@ async fn contamination_pattern_tests(r: &mut TestRunner) {
     // Loop over bash-based contamination patterns.
     for cc in CONTAMINATION_CASES {
         let test_id = format!("XC.{}", cc.name);
-        let cmd_str = cc.bash_template.unwrap().replace("{self_exe}", &self_exe);
+        let cmd_str = cc
+            .bash_template
+            .unwrap()
+            .replace("{self_exe}", &self_exe)
+            .replace("/nonpie-echo", &nonpie_cmd);
         let resp = r.send("A", exec(bash(&cmd_str))).await;
         let skipped =
             matches!(&resp, Response::ExecResult { stdout, .. } if stdout.contains("SKIP"));
         if skipped {
-            r.record(&test_id, "A", true, "skipped (nonpie-echo not in rootfs)");
+            r.record(&test_id, "A", true, "skipped (nonpie binary not found)");
         } else {
             let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. }
                 if stdout.contains(cc.expected));

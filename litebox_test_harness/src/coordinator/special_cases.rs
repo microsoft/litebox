@@ -18,6 +18,9 @@ pub(super) async fn contamination_sequence_tests(r: &mut TestRunner) {
 
     eprintln!("[special] === Contamination Sequence Tests ===");
 
+    let nonpie_bin = crate::find_nonpie_binary();
+    let nonpie_args = |bin: &str| -> Vec<String> { vec![bin.into(), "echo-test".into()] };
+
     // X49: Two sequential PIE execs — baseline.
     let resp = r
         .send("A", exec(vec![self_exe.clone(), "echo-test".into()]))
@@ -36,14 +39,9 @@ pub(super) async fn contamination_sequence_tests(r: &mut TestRunner) {
     r.record("X49b.pie_sequential_2", "A", pass, &format!("{resp:?}"));
 
     // X50: PIE after non-PIE on same agent.
-    let resp = r.send("A", exec(vec!["/nonpie-echo".into()])).await;
-    let not_found = matches!(&resp, Response::ExecResult { exit_code: 127, .. })
-        || matches!(&resp, Response::Error { .. });
-    if not_found {
-        r.record("X50a.nonpie_then_pie_1", "A", true, "skipped");
-        r.record("X50b.nonpie_then_pie_2", "A", true, "skipped");
-    } else {
-        let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout.contains("NONPIE_OK"));
+    if let Some(ref nonpie) = nonpie_bin {
+        let resp = r.send("A", exec(nonpie_args(nonpie))).await;
+        let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout.contains("ECHO_TEST_OK"));
         r.record("X50a.nonpie_then_pie_1", "A", pass, &format!("{resp:?}"));
 
         let resp = r
@@ -51,19 +49,15 @@ pub(super) async fn contamination_sequence_tests(r: &mut TestRunner) {
             .await;
         let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout == "ECHO_TEST_OK");
         r.record("X50b.nonpie_then_pie_2", "A", pass, &format!("{resp:?}"));
+    } else {
+        r.record("X50a.nonpie_then_pie_1", "A", true, "skipped");
+        r.record("X50b.nonpie_then_pie_2", "A", true, "skipped");
     }
 
     // X51-X52: Non-PIE on fresh agent B, then PIE sequence.
-    let resp = r.send("B", exec(vec!["/nonpie-echo".into()])).await;
-    let not_found = matches!(&resp, Response::ExecResult { exit_code: 127, .. })
-        || matches!(&resp, Response::Error { .. });
-    if not_found {
-        r.record("X51.nonpie_fresh_agent", "B", true, "skipped");
-        r.record("X52a.B_nonpie_then_pie", "B", true, "skipped");
-        r.record("X52b.B_pie_after_nonpie", "B", true, "skipped");
-        r.record("X52c.B_third_exec", "B", true, "skipped");
-    } else {
-        let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout.contains("NONPIE_OK"));
+    if let Some(ref nonpie) = nonpie_bin {
+        let resp = r.send("B", exec(nonpie_args(nonpie))).await;
+        let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout.contains("ECHO_TEST_OK"));
         r.record("X51.nonpie_fresh_agent", "B", pass, &format!("{resp:?}"));
 
         let resp = r
@@ -87,6 +81,11 @@ pub(super) async fn contamination_sequence_tests(r: &mut TestRunner) {
             .await;
         let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout == "ECHO_TEST_OK");
         r.record("X52c.B_third_exec", "B", pass, &format!("{resp:?}"));
+    } else {
+        r.record("X51.nonpie_fresh_agent", "B", true, "skipped");
+        r.record("X52a.B_nonpie_then_pie", "B", true, "skipped");
+        r.record("X52b.B_pie_after_nonpie", "B", true, "skipped");
+        r.record("X52c.B_third_exec", "B", true, "skipped");
     }
 
     // X53: Stress — 30 sequential PIE execs on fresh agent AB.
@@ -117,14 +116,12 @@ pub(super) async fn contamination_sequence_tests(r: &mut TestRunner) {
     }
 
     // X54: Non-PIE after 30 PIE execs on AB.
-    let resp = r.send("AB", exec(vec!["/nonpie-echo".into()])).await;
-    let not_found = matches!(&resp, Response::ExecResult { exit_code: 127, .. })
-        || matches!(&resp, Response::Error { .. });
-    if not_found {
-        r.record("X54.nonpie_after_stress", "AB", true, "skipped");
-    } else {
-        let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout.contains("NONPIE_OK"));
+    if let Some(ref nonpie) = nonpie_bin {
+        let resp = r.send("AB", exec(nonpie_args(nonpie))).await;
+        let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout.contains("ECHO_TEST_OK"));
         r.record("X54.nonpie_after_stress", "AB", pass, &format!("{resp:?}"));
+    } else {
+        r.record("X54.nonpie_after_stress", "AB", true, "skipped");
     }
 
     // X55: Non-PIE as second exec on fresh agent AAB.
@@ -134,35 +131,26 @@ pub(super) async fn contamination_sequence_tests(r: &mut TestRunner) {
     let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout == "ECHO_TEST_OK");
     r.record("X55a.one_pie_first", "AAB", pass, &format!("{resp:?}"));
 
-    let resp = r.send("AAB", exec(vec!["/nonpie-echo".into()])).await;
-    let not_found = matches!(&resp, Response::ExecResult { exit_code: 127, .. })
-        || matches!(&resp, Response::Error { .. });
-    if not_found {
-        r.record("X55b.nonpie_second", "AAB", true, "skipped");
-    } else {
-        let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout.contains("NONPIE_OK"));
+    if let Some(ref nonpie) = nonpie_bin {
+        let resp = r.send("AAB", exec(nonpie_args(nonpie))).await;
+        let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout.contains("ECHO_TEST_OK"));
         r.record("X55b.nonpie_second", "AAB", pass, &format!("{resp:?}"));
+    } else {
+        r.record("X55b.nonpie_second", "AAB", true, "skipped");
     }
 
     // X56-X59: Sequence tests on B.
-    let resp = r.send("B", exec(vec!["/nonpie-echo".into()])).await;
-    let not_found = matches!(&resp, Response::ExecResult { exit_code: 127, .. })
-        || matches!(&resp, Response::Error { .. });
-    if not_found {
-        r.record("X56.second_nonpie_on_B", "B", true, "skipped");
-        r.record("X57.pipe_churn_then_nonpie", "B", true, "skipped");
-        r.record("X58.alternating_pie_nonpie", "B", true, "skipped");
-        r.record("X59.sequential_nonpie", "B", true, "skipped");
-    } else {
-        let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout.contains("NONPIE_OK"));
+    if let Some(ref nonpie) = nonpie_bin {
+        let resp = r.send("B", exec(nonpie_args(nonpie))).await;
+        let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout.contains("ECHO_TEST_OK"));
         r.record("X56.second_nonpie_on_B", "B", pass, &format!("{resp:?}"));
 
         // X57: Pipe churn then non-PIE.
         for _ in 0..20 {
             let _ = r.send("B", exec(bash("echo churn >/dev/null"))).await;
         }
-        let resp = r.send("B", exec(vec!["/nonpie-echo".into()])).await;
-        let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout.contains("NONPIE_OK"));
+        let resp = r.send("B", exec(nonpie_args(nonpie))).await;
+        let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout.contains("ECHO_TEST_OK"));
         r.record(
             "X57.pipe_churn_then_nonpie",
             "B",
@@ -180,8 +168,8 @@ pub(super) async fn contamination_sequence_tests(r: &mut TestRunner) {
                 let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout == "ECHO_TEST_OK");
                 results.push((format!("{resp:?}"), pass));
 
-                let resp = r.send("B", exec(vec!["/nonpie-echo".into()])).await;
-                let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout.contains("NONPIE_OK"));
+                let resp = r.send("B", exec(nonpie_args(nonpie))).await;
+                let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout.contains("ECHO_TEST_OK"));
                 results.push((format!("{resp:?}"), pass));
             }
             results
@@ -198,8 +186,8 @@ pub(super) async fn contamination_sequence_tests(r: &mut TestRunner) {
         // X59: Sequential non-PIE.
         let mut x59_all_pass = true;
         for i in 0..5 {
-            let resp = r.send("B", exec(vec!["/nonpie-echo".into()])).await;
-            let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout.contains("NONPIE_OK"));
+            let resp = r.send("B", exec(nonpie_args(nonpie))).await;
+            let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout.contains("ECHO_TEST_OK"));
             if !pass {
                 r.record(
                     "X59.sequential_nonpie",
@@ -733,7 +721,7 @@ pub(super) async fn cross_worker_tests(r: &mut TestRunner) {
                 },
             )
             .await;
-        let pass = matches!(&resp, Response::Ok { data: Some(d), .. } if d.contains("XW_HELLO"));
+        let pass = matches!(&resp, Response::Connected { echo } if echo.contains("XW_HELLO"));
         r.record("XW3.local_connect", "A", pass, &format!("{resp:?}"));
     }
 
@@ -762,7 +750,7 @@ pub(super) async fn cross_worker_tests(r: &mut TestRunner) {
                 },
             )
             .await;
-        let pass = matches!(&resp, Response::Ok { data: Some(d), .. } if d.contains("XW_HELLO2"));
+        let pass = matches!(&resp, Response::Connected { echo } if echo.contains("XW_HELLO2"));
         r.record("XW4.remote_connect", "A", pass, &format!("{resp:?}"));
     }
 }
