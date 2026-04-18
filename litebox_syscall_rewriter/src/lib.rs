@@ -48,7 +48,7 @@ pub enum Error {
 
 /// Internal-only error variants used for control flow within the crate.
 /// These are never exposed to callers — they are caught and handled (or
-/// converted to [`Error`]) before reaching the public API boundary.
+/// converted to [`enum@Error`]) before reaching the public API boundary.
 #[derive(Debug)]
 enum InternalError {
     /// A public error that should be propagated as-is.
@@ -574,8 +574,8 @@ fn fixup_phdr_alignment(buf: &mut [u8]) {
         return;
     }
 
-    // Check ELF magic and class (must be ELF64)
-    if &buf[0..4] != b"\x7fELF" || buf[4] != 2 {
+    // Check ELF magic, class (must be ELF64), and byte order (must be little-endian).
+    if &buf[0..4] != b"\x7fELF" || buf[4] != 2 || buf[5] != 1 {
         return;
     }
 
@@ -629,13 +629,18 @@ fn fixup_phdr_alignment(buf: &mut [u8]) {
     // Move the phdr table forward (use copy_within since src and dst overlap).
     buf.copy_within(old_start..old_end, new_start);
 
+    // Zero the gap left behind so stale phdr bytes don't linger.
+    for b in &mut buf[old_start..old_start + padding] {
+        *b = 0;
+    }
+
     // Update e_phoff in the ELF header.
     let new_phoff = (e_phoff + padding as u64).to_le_bytes();
     buf[32..40].copy_from_slice(&new_phoff);
 
-    // Also update the PHDR segment's p_offset, p_vaddr, and p_paddr if present, so they match.
-    // ELF64 Elf64_Phdr layout: p_type (0, 4B), p_flags (4, 4B), p_offset (8, 8B),
-    // p_vaddr (16, 8B), p_paddr (24, 8B), p_filesz (32, 8B), p_memsz (40, 8B), p_align (48, 8B).
+    // Also update the PHDR segment's p_offset, p_vaddr, and p_paddr if present.
+    // Shifting the phdr table forward in the file shifts it within the PT_LOAD
+    // mapping by the same amount, so all three fields need the same adjustment.
     let Ok(e_phentsize_usize) = usize::try_from(e_phentsize) else {
         return;
     };
@@ -643,7 +648,10 @@ fn fixup_phdr_alignment(buf: &mut [u8]) {
         return;
     };
     for i in 0..e_phnum_usize {
-        let Some(entry_off) = new_start.checked_add(i.saturating_mul(e_phentsize_usize)) else {
+        let Some(i_times_size) = i.checked_mul(e_phentsize_usize) else {
+            break;
+        };
+        let Some(entry_off) = new_start.checked_add(i_times_size) else {
             break;
         };
         if entry_off + 32 > buf.len() {
@@ -651,14 +659,19 @@ fn fixup_phdr_alignment(buf: &mut [u8]) {
         }
         let p_type = u32::from_le_bytes(buf[entry_off..entry_off + 4].try_into().unwrap());
         if p_type == object::elf::PT_PHDR {
-            // PT_PHDR — update p_offset, p_vaddr, and p_paddr to match new location
-            for field_off in [8usize, 16, 24] {
+            use core::mem::offset_of;
+            use object::elf::ProgramHeader64;
+            use object::endian::LittleEndian;
+            // PT_PHDR — shift p_offset, p_vaddr, and p_paddr by `padding`.
+            for field_off in [
+                offset_of!(ProgramHeader64<LittleEndian>, p_offset),
+                offset_of!(ProgramHeader64<LittleEndian>, p_vaddr),
+                offset_of!(ProgramHeader64<LittleEndian>, p_paddr),
+            ] {
                 let off = entry_off + field_off;
                 let old_val = u64::from_le_bytes(buf[off..off + 8].try_into().unwrap());
-                if old_val == e_phoff {
-                    let new_val = (old_val + padding as u64).to_le_bytes();
-                    buf[off..off + 8].copy_from_slice(&new_val);
-                }
+                let new_val = (old_val + padding as u64).to_le_bytes();
+                buf[off..off + 8].copy_from_slice(&new_val);
             }
             // The PHDR segment size should match the phdr table; no change needed.
         }
