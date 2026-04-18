@@ -568,3 +568,47 @@ pub(super) async fn terminal_ioctl_tests(r: &mut TestRunner) {
         }
     }
 }
+
+/// Filesystem I/O matrix tests: op × path.
+pub(super) async fn fs_io_tests(r: &mut TestRunner) {
+    let self_exe = r.self_exe.clone();
+    let ops = [
+        "write-read",
+        "append-read",
+        "write-bg-read",
+        "redirect-bg-read",
+        "fork-write-read",
+        "bg-open-read",
+    ];
+    let paths = ["/tmp/fs-test.txt", "/root/fs-test.txt"];
+
+    eprintln!(
+        "[special] === FS I/O Matrix ({} ops × {} paths) ===",
+        ops.len(),
+        paths.len()
+    );
+
+    for op in &ops {
+        for path in &paths {
+            let test_name = format!("FS.{}_{}", op, path.rsplit('/').next().unwrap_or(path));
+            let resp = r
+                .send(
+                    "A",
+                    super::exec_timeout(
+                        vec![
+                            self_exe.clone(),
+                            "fs-test".into(),
+                            "io".into(),
+                            (*op).into(),
+                            (*path).into(),
+                        ],
+                        15,
+                    ),
+                )
+                .await;
+            let pass =
+                matches!(&resp, Response::ExecResult { stdout, .. } if stdout.contains("FS_OK"));
+            r.record(&test_name, "A", pass, &format!("{resp:?}"));
+        }
+    }
+}

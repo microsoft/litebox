@@ -290,6 +290,10 @@ fn main() {
             let sub = args.get(2).map(String::as_str).unwrap_or("ipv6-socket");
             std::process::exit(net_tests::run(sub));
         }
+        "fs-test" => {
+            let sub = args.get(2).map(String::as_str).unwrap_or("help");
+            std::process::exit(fs_tests::run(sub, &args));
+        }
         other => {
             eprintln!("unknown command: {other}");
             std::process::exit(1);
@@ -1976,5 +1980,238 @@ mod net_tests {
         unsafe { libc::close(fd) };
         println!("NET4_OK:port={port}");
         0
+    }
+}
+
+mod fs_tests {
+    use std::io::{Read, Write};
+
+    pub fn run(sub: &str, args: &[String]) -> i32 {
+        match sub {
+            // Matrix-style: fs-test io <op> <path>
+            // ops: write-read, append-read, write-bg-read, redirect-bg-read, fork-write-read
+            // paths: /tmp/fs-test, /root/fs-test, /shared/fs-test
+            "io" => {
+                let op = args.get(3).map(String::as_str).unwrap_or("write-read");
+                let path = args
+                    .get(4)
+                    .map(String::as_str)
+                    .unwrap_or("/tmp/fs-test.txt");
+                test_io(op, path)
+            }
+            _ => {
+                eprintln!("fs-test subcommands: io <op> <path>");
+                eprintln!(
+                    "  ops: write-read, append-read, write-bg-read, redirect-bg-read, fork-write-read"
+                );
+                1
+            }
+        }
+    }
+
+    fn test_io(op: &str, path: &str) -> i32 {
+        let _ = std::fs::remove_file(path);
+        match op {
+            // FS1: Simple write then read (same process, sequential)
+            "write-read" => {
+                std::fs::write(path, b"FS_DATA_42").unwrap_or_else(|e| {
+                    println!("FS_ERR:op={op},path={path},phase=write,err={e}");
+                    std::process::exit(1);
+                });
+                match std::fs::read_to_string(path) {
+                    Ok(s) if s == "FS_DATA_42" => {
+                        println!("FS_OK:op={op},path={path}");
+                        0
+                    }
+                    Ok(s) => {
+                        println!("FS_ERR:op={op},path={path},phase=read,got={s}");
+                        1
+                    }
+                    Err(e) => {
+                        println!("FS_ERR:op={op},path={path},phase=read,err={e}");
+                        1
+                    }
+                }
+            }
+            // FS2: Append then read
+            "append-read" => {
+                std::fs::write(path, b"LINE1\n").unwrap_or_else(|e| {
+                    println!("FS_ERR:op={op},path={path},phase=write1,err={e}");
+                    std::process::exit(1);
+                });
+                let mut f = std::fs::OpenOptions::new()
+                    .append(true)
+                    .open(path)
+                    .unwrap_or_else(|e| {
+                        println!("FS_ERR:op={op},path={path},phase=open-append,err={e}");
+                        std::process::exit(1);
+                    });
+                f.write_all(b"LINE2\n").unwrap();
+                drop(f);
+                match std::fs::read_to_string(path) {
+                    Ok(s) if s == "LINE1\nLINE2\n" => {
+                        println!("FS_OK:op={op},path={path}");
+                        0
+                    }
+                    Ok(s) => {
+                        println!(
+                            "FS_ERR:op={op},path={path},phase=read,got={}",
+                            s.escape_default()
+                        );
+                        1
+                    }
+                    Err(e) => {
+                        println!("FS_ERR:op={op},path={path},phase=read,err={e}");
+                        1
+                    }
+                }
+            }
+            // FS3: Write in background thread, read from main thread (concurrent)
+            "write-bg-read" => {
+                let p = path.to_string();
+                let handle = std::thread::spawn(move || {
+                    let mut f = std::fs::File::create(&p).unwrap();
+                    f.write_all(b"BG_DATA").unwrap();
+                    f.sync_all().unwrap();
+                });
+                handle.join().unwrap();
+                // Writer is done and joined — file should be readable
+                match std::fs::read_to_string(path) {
+                    Ok(s) if s == "BG_DATA" => {
+                        println!("FS_OK:op={op},path={path}");
+                        0
+                    }
+                    Ok(s) => {
+                        println!("FS_ERR:op={op},path={path},phase=read,got={s}");
+                        1
+                    }
+                    Err(e) => {
+                        println!("FS_ERR:op={op},path={path},phase=read,err={e}");
+                        1
+                    }
+                }
+            }
+            // FS4: Shell redirect (like code-server pre-warm) — background write, foreground read
+            // This is the exact pattern: `cmd > file &` then `cat file`
+            "redirect-bg-read" => {
+                let p = path.to_string();
+                // Write via a child process with stdout redirected to file
+                let child = std::process::Command::new("/usr/bin/bash")
+                    .args(["-c", &format!("echo REDIRECT_DATA > {p}")])
+                    .output();
+                match child {
+                    Ok(out) if out.status.success() => {}
+                    Ok(out) => {
+                        println!(
+                            "FS_ERR:op={op},path={path},phase=write,exit={}",
+                            out.status.code().unwrap_or(-1)
+                        );
+                        return 1;
+                    }
+                    Err(e) => {
+                        println!("FS_ERR:op={op},path={path},phase=spawn,err={e}");
+                        return 1;
+                    }
+                }
+                match std::fs::read_to_string(path) {
+                    Ok(s) if s.trim() == "REDIRECT_DATA" => {
+                        println!("FS_OK:op={op},path={path}");
+                        0
+                    }
+                    Ok(s) => {
+                        println!(
+                            "FS_ERR:op={op},path={path},phase=read,got={}",
+                            s.escape_default()
+                        );
+                        1
+                    }
+                    Err(e) => {
+                        println!("FS_ERR:op={op},path={path},phase=read,err={e}");
+                        1
+                    }
+                }
+            }
+            // FS5: Fork child writes, parent reads (cross-process, still open fd)
+            "fork-write-read" => {
+                let pid = unsafe { libc::fork() };
+                if pid < 0 {
+                    println!("FS_ERR:op={op},path={path},phase=fork");
+                    return 1;
+                }
+                if pid == 0 {
+                    // Child: write to file and exit
+                    match std::fs::write(path, b"FORK_DATA") {
+                        Ok(_) => std::process::exit(0),
+                        Err(_) => std::process::exit(1),
+                    }
+                }
+                // Parent: wait for child, then read
+                let mut status: i32 = 0;
+                unsafe { libc::waitpid(pid, &mut status, 0) };
+                match std::fs::read_to_string(path) {
+                    Ok(s) if s == "FORK_DATA" => {
+                        println!("FS_OK:op={op},path={path}");
+                        0
+                    }
+                    Ok(s) => {
+                        println!("FS_ERR:op={op},path={path},phase=read,got={s}");
+                        1
+                    }
+                    Err(e) => {
+                        println!("FS_ERR:op={op},path={path},phase=read,err={e}");
+                        1
+                    }
+                }
+            }
+            // FS6: Background process writes to file via redirect, WHILE file is still open,
+            // another process reads. This is the exact code-server pre-warm pattern.
+            "bg-open-read" => {
+                let p = path.to_string();
+                // Start a background writer that keeps the file open
+                let mut child = std::process::Command::new("/usr/bin/bash")
+                    .args([
+                        "-c",
+                        &format!("echo LINE1 > {p}; sleep 1; echo LINE2 >> {p}; sleep 5"),
+                    ])
+                    .spawn()
+                    .unwrap_or_else(|e| {
+                        println!("FS_ERR:op={op},path={path},phase=spawn,err={e}");
+                        std::process::exit(1);
+                    });
+
+                // Wait for first line to be written
+                std::thread::sleep(std::time::Duration::from_millis(500));
+
+                // Try to read while writer still has file open
+                let result = std::fs::read_to_string(path);
+                let _ = child.kill();
+                let _ = child.wait();
+
+                match result {
+                    Ok(s) if s.contains("LINE1") => {
+                        println!(
+                            "FS_OK:op={op},path={path},content={}",
+                            s.trim().escape_default()
+                        );
+                        0
+                    }
+                    Ok(s) => {
+                        println!(
+                            "FS_ERR:op={op},path={path},phase=read,got={}",
+                            s.escape_default()
+                        );
+                        1
+                    }
+                    Err(e) => {
+                        println!("FS_ERR:op={op},path={path},phase=read,err={e}");
+                        1
+                    }
+                }
+            }
+            other => {
+                println!("FS_ERR:unknown_op={other}");
+                1
+            }
+        }
     }
 }
