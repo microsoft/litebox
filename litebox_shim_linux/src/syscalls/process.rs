@@ -1304,6 +1304,41 @@ impl<FS: ShimFS> Task<FS> {
 const MAX_VEC: usize = 4096; // limit count
 const MAX_TOTAL_BYTES: usize = 256 * 1024; // size cap
 
+/// Maximum shebang (#!) recursion depth, matching Linux `BINPRM_MAX_RECURSION`.
+const SHEBANG_MAX_RECURSION: u32 = 4;
+
+/// Maximum length of a shebang line that we inspect. Matches Linux `BINPRM_BUF_SIZE`.
+const SHEBANG_MAX_LINE: usize = 256;
+
+/// Parse a `#!interpreter [optional-arg]` line from a file header buffer.
+///
+/// Returns `Some((interpreter, optional_arg))` when `buf` starts with `#!` and
+/// contains a non-empty interpreter path. The interpreter and optional argument
+/// are borrowed from `buf`. The optional argument, if present, is everything
+/// between the first whitespace after the interpreter and the end of the line
+/// (trimmed), treated as a single token — matching Linux kernel semantics.
+fn parse_shebang(buf: &[u8]) -> Option<(&str, Option<&str>)> {
+    if buf.len() < 2 || buf[0] != b'#' || buf[1] != b'!' {
+        return None;
+    }
+    let line_end = buf[2..]
+        .iter()
+        .position(|&b| b == b'\n')
+        .map_or(buf.len(), |p| p + 2);
+    let line = core::str::from_utf8(&buf[2..line_end]).ok()?;
+    let line = line.trim();
+    if line.is_empty() {
+        return None;
+    }
+    match line.find([' ', '\t']) {
+        Some(i) => {
+            let arg = line[i..].trim();
+            Some((&line[..i], if arg.is_empty() { None } else { Some(arg) }))
+        }
+        None => Some((line, None)),
+    }
+}
+
 impl<FS: ShimFS> Task<FS> {
     /// Handle syscall `execve`.
     pub(crate) fn sys_execve(
@@ -1362,7 +1397,65 @@ impl<FS: ShimFS> Task<FS> {
             copy_vector(envp, "envp")?
         };
 
-        let loader = crate::loader::elf::ElfLoader::new(self, path)?;
+        // --- Shebang (#!) detection and rewriting ---
+        //
+        // If the target file begins with "#!", it is an interpreter script.
+        // We parse the interpreter path (and optional single argument) from the
+        // first line, then rewrite argv to:
+        //
+        //   [interpreter, optional_arg?, script_path, original_argv[1:]]
+        //
+        // and retry with the interpreter as the new executable. This matches
+        // Linux kernel binfmt_script semantics. We loop (up to
+        // SHEBANG_MAX_RECURSION times) to handle chained shebangs (e.g., a
+        // script whose interpreter is itself a script).
+        let mut path = alloc::string::String::from(path);
+        let mut argv_vec = argv_vec;
+        let mut shebang_depth = 0u32;
+        loop {
+            let fd = {
+                use litebox::utils::ReinterpretSignedExt as _;
+                self.sys_open(
+                    path.as_str(),
+                    litebox::fs::OFlags::RDONLY,
+                    litebox::fs::Mode::empty(),
+                )?
+                .reinterpret_as_signed()
+            };
+            let mut header = [0u8; SHEBANG_MAX_LINE];
+            let n = match self.sys_read(fd, &mut header, Some(0)) {
+                Ok(n) => n,
+                Err(e) => {
+                    let _ = self.sys_close(fd);
+                    return Err(e);
+                }
+            };
+            let _ = self.sys_close(fd);
+
+            match parse_shebang(&header[..n]) {
+                Some((interp, opt_arg)) => {
+                    if shebang_depth >= SHEBANG_MAX_RECURSION {
+                        return Err(Errno::ELOOP);
+                    }
+                    let mut new_argv = alloc::vec::Vec::new();
+                    new_argv.push(alloc::ffi::CString::new(interp).map_err(|_| Errno::EINVAL)?);
+                    if let Some(arg) = opt_arg {
+                        new_argv.push(alloc::ffi::CString::new(arg).map_err(|_| Errno::EINVAL)?);
+                    }
+                    new_argv
+                        .push(alloc::ffi::CString::new(path.as_str()).map_err(|_| Errno::EINVAL)?);
+                    if argv_vec.len() > 1 {
+                        new_argv.extend_from_slice(&argv_vec[1..]);
+                    }
+                    path = alloc::string::String::from(interp);
+                    argv_vec = new_argv;
+                    shebang_depth += 1;
+                }
+                None => break,
+            }
+        }
+
+        let loader = crate::loader::elf::ElfLoader::new(self, &path).map_err(Errno::from)?;
 
         // After this point, the old program is torn down and failures must terminate the process.
 
@@ -1870,5 +1963,53 @@ mod tests {
             // Clean up the timer.
             handle.delete_timer();
         });
+    }
+
+    #[test]
+    fn test_parse_shebang_basic() {
+        use super::parse_shebang;
+
+        // Basic interpreter only
+        assert_eq!(
+            parse_shebang(b"#!/bin/bash\necho hello\n"),
+            Some(("/bin/bash", None))
+        );
+
+        // Interpreter with single argument
+        assert_eq!(
+            parse_shebang(b"#!/usr/bin/env python3\nimport sys\n"),
+            Some(("/usr/bin/env", Some("python3")))
+        );
+
+        // Leading spaces after #!
+        assert_eq!(parse_shebang(b"#!  /bin/sh\n"), Some(("/bin/sh", None)));
+
+        // Trailing spaces
+        assert_eq!(parse_shebang(b"#!/bin/sh  \n"), Some(("/bin/sh", None)));
+
+        // Argument with extra whitespace
+        assert_eq!(
+            parse_shebang(b"#!/usr/bin/env  -S python3\n"),
+            Some(("/usr/bin/env", Some("-S python3")))
+        );
+
+        // No newline (truncated line — still valid)
+        assert_eq!(parse_shebang(b"#!/bin/bash"), Some(("/bin/bash", None)));
+
+        // Not a shebang
+        assert_eq!(parse_shebang(b"\x7fELF"), None);
+
+        // Empty after #!
+        assert_eq!(parse_shebang(b"#!\n"), None);
+
+        // Too short
+        assert_eq!(parse_shebang(b"#"), None);
+        assert_eq!(parse_shebang(b""), None);
+
+        // Tab separator
+        assert_eq!(
+            parse_shebang(b"#!/usr/bin/env\tpython3\n"),
+            Some(("/usr/bin/env", Some("python3")))
+        );
     }
 }
