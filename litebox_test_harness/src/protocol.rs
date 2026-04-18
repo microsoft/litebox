@@ -14,6 +14,11 @@ pub enum Command {
     #[serde(rename = "spawn")]
     Spawn { children: Vec<String> },
 
+    /// Spawn child agents using a non-PIE binary, forcing them to remote
+    /// workers. Used to test cross-worker filesystem and socket coherence.
+    #[serde(rename = "spawn_remote")]
+    SpawnRemote { children: Vec<String> },
+
     /// Read a file and report contents (or not_found).
     #[serde(rename = "fs_read")]
     FsRead { path: String },

@@ -9,7 +9,7 @@
 //! non-PIE, then run PIE — does the PIE see clean output?").
 
 use super::{TestRunner, exec};
-use crate::protocol::Response;
+use crate::protocol::{Command, Response};
 
 /// Contamination isolation sequence tests (X49-X59).
 pub(super) async fn contamination_sequence_tests(r: &mut TestRunner) {
@@ -689,5 +689,145 @@ pub(super) async fn fs_io_tests(r: &mut TestRunner) {
                 &format!("{resp:?}"),
             );
         }
+    }
+}
+
+/// Cross-worker filesystem and socket tests using SpawnRemote.
+pub(super) async fn cross_worker_tests(r: &mut TestRunner) {
+    eprintln!("[special] === Cross-Worker Tests (SpawnRemote) ===");
+
+    let resp = r
+        .send(
+            "A",
+            Command::SpawnRemote {
+                children: vec!["R".to_string()],
+            },
+        )
+        .await;
+    let spawned = matches!(&resp, Response::Ok { .. });
+    r.record("XW.spawn_remote", "A", spawned, &format!("{resp:?}"));
+    if !spawned {
+        eprintln!("[special] SpawnRemote failed, skipping cross-worker tests");
+        return;
+    }
+
+    // XW1: Remote writes, local reads
+    let resp = r
+        .send(
+            "A",
+            Command::Forward {
+                target: "R".to_string(),
+                inner: Box::new(Command::FsWrite {
+                    path: "/tmp/xw1.txt".to_string(),
+                    data: "REMOTE_DATA".to_string(),
+                }),
+            },
+        )
+        .await;
+    r.record(
+        "XW1.remote_write",
+        "A",
+        matches!(&resp, Response::Ok { .. }),
+        &format!("{resp:?}"),
+    );
+
+    let resp = r
+        .send(
+            "A",
+            Command::FsRead {
+                path: "/tmp/xw1.txt".to_string(),
+            },
+        )
+        .await;
+    let pass = matches!(&resp, Response::Ok { data: Some(d), .. } if d == "REMOTE_DATA");
+    r.record("XW1.local_read", "A", pass, &format!("{resp:?}"));
+
+    // XW2: Local writes, remote reads
+    let resp = r
+        .send(
+            "A",
+            Command::FsWrite {
+                path: "/tmp/xw2.txt".to_string(),
+                data: "LOCAL_DATA".to_string(),
+            },
+        )
+        .await;
+    r.record(
+        "XW2.local_write",
+        "A",
+        matches!(&resp, Response::Ok { .. }),
+        &format!("{resp:?}"),
+    );
+
+    let resp = r
+        .send(
+            "A",
+            Command::Forward {
+                target: "R".to_string(),
+                inner: Box::new(Command::FsRead {
+                    path: "/tmp/xw2.txt".to_string(),
+                }),
+            },
+        )
+        .await;
+    let pass = matches!(&resp, Response::Ok { data: Some(d), .. } if d == "LOCAL_DATA");
+    r.record("XW2.remote_read", "A", pass, &format!("{resp:?}"));
+
+    // XW3: Remote listens unix socket, local connects
+    let resp = r
+        .send(
+            "A",
+            Command::Forward {
+                target: "R".to_string(),
+                inner: Box::new(Command::UnixListen {
+                    path: "/tmp/xw3.sock".to_string(),
+                }),
+            },
+        )
+        .await;
+    let listen_ok = matches!(&resp, Response::Ok { .. });
+    r.record("XW3.remote_listen", "A", listen_ok, &format!("{resp:?}"));
+
+    if listen_ok {
+        let resp = r
+            .send(
+                "A",
+                Command::UnixConnect {
+                    path: "/tmp/xw3.sock".to_string(),
+                    data: "XW_HELLO".to_string(),
+                },
+            )
+            .await;
+        let pass = matches!(&resp, Response::Ok { data: Some(d), .. } if d.contains("XW_HELLO"));
+        r.record("XW3.local_connect", "A", pass, &format!("{resp:?}"));
+    }
+
+    // XW4: Local listens, remote connects
+    let resp = r
+        .send(
+            "A",
+            Command::UnixListen {
+                path: "/tmp/xw4.sock".to_string(),
+            },
+        )
+        .await;
+    let listen_ok = matches!(&resp, Response::Ok { .. });
+    r.record("XW4.local_listen", "A", listen_ok, &format!("{resp:?}"));
+
+    if listen_ok {
+        let resp = r
+            .send(
+                "A",
+                Command::Forward {
+                    target: "R".to_string(),
+                    inner: Box::new(Command::UnixConnect {
+                        path: "/tmp/xw4.sock".to_string(),
+                        data: "XW_HELLO2".to_string(),
+                    }),
+                },
+            )
+            .await;
+        let pass = matches!(&resp, Response::Ok { data: Some(d), .. } if d.contains("XW_HELLO2"));
+        r.record("XW4.remote_connect", "A", pass, &format!("{resp:?}"));
     }
 }

@@ -327,6 +327,9 @@ async fn run_tests(self_exe: &str) -> Vec<TestResult> {
     // === Filesystem I/O Matrix ===
     special_cases::fs_io_tests(&mut runner).await;
 
+    // === Cross-Worker Tests ===
+    special_cases::cross_worker_tests(&mut runner).await;
+
     // Shutdown all children.
     for (id, mut child) in runner.children.drain() {
         let _ = send_cmd(&mut child, &Command::Exit).await;

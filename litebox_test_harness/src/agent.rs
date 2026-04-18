@@ -79,6 +79,28 @@ async fn agent_loop(self_exe: &str) {
                 .await;
             }
 
+            Command::SpawnRemote { children: names } => {
+                // Use the non-PIE binary to force remote worker migration.
+                let remote_exe = "/litebox-test-harness-nonpie";
+                for name in &names {
+                    match spawn_child(remote_exe, name).await {
+                        Ok(handle) => {
+                            children.insert(name.clone(), handle);
+                        }
+                        Err(e) => {
+                            respond(&Response::Error {
+                                error: format!("spawn_remote {name}: {e}"),
+                            })
+                            .await;
+                        }
+                    }
+                }
+                respond(&Response::Ok {
+                    data: Some(format!("{} remote children spawned", names.len())),
+                })
+                .await;
+            }
+
             Command::FsRead { path } => match tokio::fs::read_to_string(&path).await {
                 Ok(data) => respond(&Response::Ok { data: Some(data) }).await,
                 Err(_) => respond(&Response::NotFound).await,
