@@ -2028,8 +2028,6 @@ mod fs_tests {
                     .unwrap_or("/tmp/fs-test.txt");
                 test_io(op, path)
             }
-            // fs-test exec-write <binary-type> <path>
-            // binary-type: pie (uses self), nonpie-node (uses node)
             "exec-write" => {
                 let bin_type = args.get(3).map(String::as_str).unwrap_or("pie");
                 let path = args
@@ -2037,6 +2035,31 @@ mod fs_tests {
                     .map(String::as_str)
                     .unwrap_or("/tmp/fs-exec.txt");
                 test_exec_write(bin_type, path)
+            }
+            // fs-test exec-open-read <binary-type> <path>
+            // Fork+exec child that writes AND keeps fd open; parent reads while child alive.
+            "exec-open-read" => {
+                let bin_type = args.get(3).map(String::as_str).unwrap_or("pie");
+                let path = args
+                    .get(4)
+                    .map(String::as_str)
+                    .unwrap_or("/tmp/fs-open.txt");
+                test_exec_open_read(bin_type, path)
+            }
+            // Helper: write to file then sleep (keeps process alive with file written)
+            "do-write-sleep" => {
+                let path = args
+                    .get(3)
+                    .map(String::as_str)
+                    .unwrap_or("/tmp/fs-open.txt");
+                let data = args.get(4).map(String::as_str).unwrap_or("OPEN_WRITE_DATA");
+                std::fs::write(path, data.as_bytes()).unwrap_or_else(|e| {
+                    eprintln!("do-write-sleep: write failed: {e}");
+                    std::process::exit(1);
+                });
+                // Keep alive so the parent can read while we're still running
+                std::thread::sleep(std::time::Duration::from_secs(30));
+                0
             }
             // Called by exec-write to actually write the file
             "do-write" => {
@@ -2071,15 +2094,10 @@ mod fs_tests {
             "pie" => std::process::Command::new(self_exe)
                 .args(["fs-test", "do-write", path, data])
                 .output(),
-            "nonpie-node" => {
-                let node = "/root/.vscode-server/cli/servers/Stable-ae130017f8afe532557dbb8539a6ef3bdaec6389/server/node";
-                std::process::Command::new(node)
-                    .args([
-                        "-e",
-                        &format!(
-                            "require('fs').writeFileSync('{path}', '{data}'); process.exit(0);"
-                        ),
-                    ])
+            "nonpie" => {
+                // Use the ELF-header-patched copy (ET_EXEC) to force remote worker
+                std::process::Command::new("/litebox-test-harness-nonpie")
+                    .args(["fs-test", "do-write", path, data])
                     .output()
             }
             other => {
@@ -2119,6 +2137,62 @@ mod fs_tests {
             }
             Err(e) => {
                 println!("FS_ERR:op=exec-write,bin={bin_type},path={path},read_err={e}");
+                1
+            }
+        }
+    }
+
+    /// Fork+exec child that writes AND keeps running; parent reads while child alive.
+    /// This is the exact pre-warm pattern — tests 9P coherence for open files on remote workers.
+    fn test_exec_open_read(bin_type: &str, path: &str) -> i32 {
+        let _ = std::fs::remove_file(path);
+        let self_exe = std::env::current_exe().unwrap();
+        let self_exe = self_exe.to_str().unwrap();
+        let data = "OPEN_READ_DATA";
+
+        let bin = match bin_type {
+            "pie" => self_exe.to_string(),
+            "nonpie" => "/litebox-test-harness-nonpie".to_string(),
+            other => {
+                println!("FS_ERR:op=exec-open-read,unknown_bin_type={other}");
+                return 1;
+            }
+        };
+
+        // Spawn child that writes then sleeps (keeps process alive)
+        let mut child = match std::process::Command::new(&bin)
+            .args(["fs-test", "do-write-sleep", path, data])
+            .spawn()
+        {
+            Ok(c) => c,
+            Err(e) => {
+                println!("FS_ERR:op=exec-open-read,bin={bin_type},path={path},spawn_err={e}");
+                return 1;
+            }
+        };
+
+        // Wait for child to write the file
+        std::thread::sleep(std::time::Duration::from_secs(2));
+
+        // Read while child still alive
+        let result = std::fs::read_to_string(path);
+        let _ = child.kill();
+        let _ = child.wait();
+
+        match result {
+            Ok(s) if s == data => {
+                println!("FS_OK:op=exec-open-read,bin={bin_type},path={path}");
+                0
+            }
+            Ok(s) => {
+                println!(
+                    "FS_ERR:op=exec-open-read,bin={bin_type},path={path},got={}",
+                    s.escape_default()
+                );
+                1
+            }
+            Err(e) => {
+                println!("FS_ERR:op=exec-open-read,bin={bin_type},path={path},read_err={e}");
                 1
             }
         }

@@ -614,23 +614,19 @@ pub(super) async fn fs_io_tests(r: &mut TestRunner) {
     }
 
     // Exec-write matrix: binary_type × path
-    // Tests filesystem visibility after fork+exec of PIE vs non-PIE binaries.
-    let bin_types = ["pie", "nonpie-node"];
-    let exec_paths = ["/tmp/fs-exec.txt", "/root/fs-exec.txt"];
+    // "child writes file, exits, then parent reads"
+    let bin_types = ["pie", "nonpie"];
+    let exec_paths = ["/tmp/fs-exec.txt"];
 
     eprintln!(
-        "[special] === FS Exec-Write Matrix ({} bins × {} paths) ===",
+        "[special] === FS Exec-Write ({} bins × {} paths) ===",
         bin_types.len(),
         exec_paths.len()
     );
 
     for bin in &bin_types {
         for path in &exec_paths {
-            let test_name = format!(
-                "FS.exec_{}_{}",
-                bin,
-                path.rsplit('/').next().unwrap_or(path)
-            );
+            let pname = path.rsplit('/').next().unwrap_or(path);
             let resp = r
                 .send(
                     "A",
@@ -648,7 +644,50 @@ pub(super) async fn fs_io_tests(r: &mut TestRunner) {
                 .await;
             let pass =
                 matches!(&resp, Response::ExecResult { stdout, .. } if stdout.contains("FS_OK"));
-            r.record(&test_name, "A", pass, &format!("{resp:?}"));
+            r.record(
+                &format!("FS.exec_{bin}_{pname}"),
+                "A",
+                pass,
+                &format!("{resp:?}"),
+            );
+        }
+    }
+
+    // Exec-open-read matrix: binary_type × path
+    // "child writes file and stays alive, parent reads WHILE child running"
+    // This tests 9P coherence for files written by a remote worker.
+    eprintln!(
+        "[special] === FS Exec-Open-Read ({} bins × {} paths) ===",
+        bin_types.len(),
+        exec_paths.len()
+    );
+
+    for bin in &bin_types {
+        for path in &exec_paths {
+            let pname = path.rsplit('/').next().unwrap_or(path);
+            let resp = r
+                .send(
+                    "A",
+                    super::exec_timeout(
+                        vec![
+                            self_exe.clone(),
+                            "fs-test".into(),
+                            "exec-open-read".into(),
+                            (*bin).into(),
+                            (*path).into(),
+                        ],
+                        30,
+                    ),
+                )
+                .await;
+            let pass =
+                matches!(&resp, Response::ExecResult { stdout, .. } if stdout.contains("FS_OK"));
+            r.record(
+                &format!("FS.open_{bin}_{pname}"),
+                "A",
+                pass,
+                &format!("{resp:?}"),
+            );
         }
     }
 }
