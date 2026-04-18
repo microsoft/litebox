@@ -51,10 +51,10 @@ fn main() -> anyhow::Result<()> {
         &input_binary_bytes,
         cli_args.trampoline_addr,
     )?;
-    litebox_syscall_rewriter::warn_skipped(
+    litebox_syscall_rewriter::ensure_all_patched(
         &cli_args.input_binary.display().to_string(),
         &skipped_addrs,
-    );
+    )?;
     let output_path = cli_args.output_binary.unwrap_or_else(|| {
         cli_args.input_binary.with_file_name(
             cli_args

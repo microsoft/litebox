@@ -172,7 +172,11 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
             let (rewritten, skipped_addrs) =
                 litebox_syscall_rewriter::hook_syscalls_in_elf(file.data, None)
                     .with_context(|| format!("failed to rewrite {}", prog.display()))?;
-            litebox_syscall_rewriter::warn_skipped(&prog.display().to_string(), &skipped_addrs);
+            litebox_syscall_rewriter::ensure_all_patched(
+                &prog.display().to_string(),
+                &skipped_addrs,
+            )
+            .with_context(|| format!("failed to rewrite {}", prog.display()))?;
             rewritten.into()
         } else {
             let data = file.data.into();

@@ -58,19 +58,25 @@ type Result<T> = core::result::Result<T, Error>;
 
 const BUN_FOOTER_MARKER: &[u8] = b"\n---- Bun! ----\n";
 
-/// Log a standardized warning about unpatchable syscall instructions.
+/// Check for unpatchable syscall instructions and return an error if any exist.
 ///
-/// Call this after [`hook_syscalls_in_elf`] or [`patch_code_segment`] when the
-/// returned `skipped_addrs` list is non-empty.
-pub fn warn_skipped(path: &str, skipped_addrs: &[u64]) {
-    if !skipped_addrs.is_empty() {
-        litebox_util_log::warn!(
-            path:% = path,
-            count:% = skipped_addrs.len(),
-            addrs:? = skipped_addrs;
-            "unpatchable syscall instruction(s)"
-        );
+/// Call this after [`hook_syscalls_in_elf`] or [`patch_code_segment`] to ensure
+/// all syscall instructions were successfully patched. Logs the skipped
+/// addresses as a warning before returning the error.
+pub fn ensure_all_patched(path: &str, skipped_addrs: &[u64]) -> Result<()> {
+    if skipped_addrs.is_empty() {
+        return Ok(());
     }
+    litebox_util_log::warn!(
+        path:% = path,
+        count:% = skipped_addrs.len(),
+        addrs:? = skipped_addrs;
+        "unpatchable syscall instruction(s)"
+    );
+    Err(Error::PatchError(format!(
+        "{path} has {} unpatchable syscall instruction(s) at {skipped_addrs:?}",
+        skipped_addrs.len(),
+    )))
 }
 
 /// The magic bytes used to identify the trampoline data.

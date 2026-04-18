@@ -567,7 +567,10 @@ fn rewrite_elf(data: &[u8], path: &Path, verbose: bool) -> anyhow::Result<Vec<u8
 
     match litebox_syscall_rewriter::hook_syscalls_in_elf(data, None) {
         Ok((rewritten, skipped_addrs)) => {
-            litebox_syscall_rewriter::warn_skipped(&path.display().to_string(), &skipped_addrs);
+            litebox_syscall_rewriter::ensure_all_patched(
+                &path.display().to_string(),
+                &skipped_addrs,
+            )?;
             if verbose {
                 eprintln!("  {} (rewritten)", path.display());
             }

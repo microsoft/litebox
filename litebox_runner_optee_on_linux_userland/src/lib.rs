@@ -62,7 +62,8 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
             let (rewritten, skipped_addrs) =
                 litebox_syscall_rewriter::hook_syscalls_in_elf(&data, None)
                     .with_context(|| format!("failed to rewrite {}", cli_args.ldelf))?;
-            litebox_syscall_rewriter::warn_skipped(&cli_args.ldelf, &skipped_addrs);
+            litebox_syscall_rewriter::ensure_all_patched(&cli_args.ldelf, &skipped_addrs)
+                .with_context(|| format!("failed to rewrite {}", cli_args.ldelf))?;
             rewritten
         } else {
             data
@@ -77,7 +78,8 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
             let (rewritten, skipped_addrs) =
                 litebox_syscall_rewriter::hook_syscalls_in_elf(&data, None)
                     .with_context(|| format!("failed to rewrite {}", cli_args.program))?;
-            litebox_syscall_rewriter::warn_skipped(&cli_args.program, &skipped_addrs);
+            litebox_syscall_rewriter::ensure_all_patched(&cli_args.program, &skipped_addrs)
+                .with_context(|| format!("failed to rewrite {}", cli_args.program))?;
             rewritten
         } else {
             data
