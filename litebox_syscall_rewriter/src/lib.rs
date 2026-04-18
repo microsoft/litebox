@@ -34,24 +34,37 @@ use zerocopy::{FromBytes, Immutable, IntoBytes};
 pub enum Error {
     #[error("failed to parse: {0}")]
     ParseError(String),
-    #[error("unsupported object file: {0}")]
-    UnsupportedObjectFile(String),
     #[error("unsupported executable: {0}")]
     UnsupportedExecutable(String),
-    #[error("executable is already hooked with trampoline")]
-    AlreadyHooked,
-    #[error("no .text section found")]
-    NoTextSectionFound,
-    #[error("no syscall instructions found")]
-    NoSyscallInstructionsFound,
     #[error("failed to disassemble: {0}")]
     DisassemblyFailure(String),
-    #[error("insufficient bytes before or after syscall at {0:#x}")]
-    InsufficientBytesBeforeOrAfter(u64),
     #[error("provided trampoline address is too large for 32-bit executable")]
     TrampolineAddressTooLarge,
-    #[error("patch failed: {0}")]
-    PatchError(String),
+    #[error("address overflow: {0}")]
+    AddressOverflow(String),
+    #[error("unpatchable syscall instruction(s): {0}")]
+    UnpatchableSyscalls(String),
+}
+
+/// Internal-only error variants used for control flow within the crate.
+/// These are never exposed to callers — they are caught and handled (or
+/// converted to [`Error`]) before reaching the public API boundary.
+#[derive(Debug)]
+enum InternalError {
+    /// A public error that should be propagated as-is.
+    Public(Error),
+    /// No executable `.text` section was found.
+    NoTextSectionFound,
+    /// No `syscall`/`int 0x80`/`call gs:0x10` instructions were found.
+    NoSyscallInstructionsFound,
+    /// Insufficient space around a syscall instruction to patch it.
+    InsufficientBytesBeforeOrAfter,
+}
+
+impl From<Error> for InternalError {
+    fn from(e: Error) -> Self {
+        InternalError::Public(e)
+    }
 }
 
 type Result<T> = core::result::Result<T, Error>;
@@ -169,8 +182,9 @@ pub fn hook_syscalls_in_elf(input_binary: &[u8], trampoline: Option<u64>) -> Res
 
         let text_sections = match text_sections(&file) {
             Ok(sections) => sections,
-            Err(Error::NoTextSectionFound) => return Ok(input_binary.to_vec()),
-            Err(e) => return Err(e),
+            Err(InternalError::NoTextSectionFound) => return Ok(input_binary.to_vec()),
+            Err(InternalError::Public(e)) => return Err(e),
+            Err(e) => unreachable!("unexpected internal error: {e:?}"),
         };
 
         if is_already_hooked(&*buf, arch) {
@@ -215,8 +229,9 @@ pub fn hook_syscalls_in_elf(input_binary: &[u8], trampoline: Option<u64>) -> Res
             &mut trampoline_data,
         ) {
             Ok(addrs) => skipped_addrs.extend(addrs),
-            Err(Error::NoSyscallInstructionsFound) => {}
-            Err(e) => return Err(e),
+            Err(InternalError::NoSyscallInstructionsFound) => {}
+            Err(InternalError::Public(e)) => return Err(e),
+            Err(e) => unreachable!("unexpected internal error: {e:?}"),
         }
     }
 
@@ -257,7 +272,7 @@ pub fn hook_syscalls_in_elf(input_binary: &[u8], trampoline: Option<u64>) -> Res
         out.extend_from_slice(header.as_bytes());
     }
     if !skipped_addrs.is_empty() {
-        return Err(Error::PatchError(format!(
+        return Err(Error::UnpatchableSyscalls(format!(
             "{} unpatchable syscall instruction(s) at {skipped_addrs:?}",
             skipped_addrs.len(),
         )));
@@ -265,7 +280,9 @@ pub fn hook_syscalls_in_elf(input_binary: &[u8], trampoline: Option<u64>) -> Res
     Ok(out)
 }
 /// (private) Get metadata for executable sections
-fn text_sections(file: &object::File<'_>) -> Result<Vec<TextSectionInfo>> {
+fn text_sections(
+    file: &object::File<'_>,
+) -> core::result::Result<Vec<TextSectionInfo>, InternalError> {
     let text_sections: Vec<_> = file
         .sections()
         .filter_map(|s| {
@@ -290,7 +307,7 @@ fn text_sections(file: &object::File<'_>) -> Result<Vec<TextSectionInfo>> {
         })
         .collect();
     if text_sections.is_empty() {
-        return Err(Error::NoTextSectionFound);
+        return Err(InternalError::NoTextSectionFound);
     }
     Ok(text_sections)
 }
@@ -365,7 +382,7 @@ fn hook_syscalls_in_section(
     syscall_entry_addr: u64,
     dl_sysinfo_int80: Option<u64>,
     trampoline_data: &mut Vec<u8>,
-) -> Result<Vec<u64>> {
+) -> core::result::Result<Vec<u64>, InternalError> {
     let instructions = decode_section_instructions(arch, section_data, section_base_addr)?;
     let mut found_any = false;
     let mut skipped_addrs = Vec::new();
@@ -428,7 +445,7 @@ fn hook_syscalls_in_section(
                 i,
             ) {
                 Ok(()) => {}
-                Err(Error::InsufficientBytesBeforeOrAfter(_)) => {
+                Err(InternalError::InsufficientBytesBeforeOrAfter) => {
                     // Replace the unpatchable syscall with ICEBP;HLT so it
                     // traps instead of escaping to the host kernel.
                     replace_with_trap(section_data, section_base_addr, inst);
@@ -539,7 +556,7 @@ fn hook_syscalls_in_section(
     if found_any {
         Ok(skipped_addrs)
     } else {
-        Err(Error::NoSyscallInstructionsFound)
+        Err(InternalError::NoSyscallInstructionsFound)
     }
 }
 
@@ -651,12 +668,9 @@ fn fixup_phdr_alignment(buf: &mut [u8]) {
 /// Replace an unpatchable syscall instruction with `ICEBP; HLT` (`F1 F4`) so
 /// that reaching it traps instead of silently escaping to the host kernel.
 ///
-/// We avoid `UD2` (`0F 0B`) because it commonly appears in binaries to mark
-/// `unreachable!()` paths.  The `ICEBP; HLT` sequence is a strong, distinctive
-/// indicator of "this syscall was intentionally poisoned" — `ICEBP` alone does
-/// not trap on Linux in userspace, but `HLT` does (SIGSEGV in ring 3), and the
-/// `F1` prefix makes it easy for a signal handler to distinguish an
-/// intentional break from a spurious one.
+/// `ICEBP` alone does not trap on Linux in userspace, but `HLT` does
+/// (SIGSEGV in ring 3), and the `F1` prefix makes it easy for a signal
+/// handler to identify an intentionally poisoned syscall.
 ///
 /// `syscall` (0F 05) and `int 0x80` (CD 80) are both 2 bytes — same size as
 /// `ICEBP; HLT`.  For `call DWORD PTR gs:0x10` (7 bytes), the remaining 5
@@ -679,18 +693,18 @@ fn replace_with_trap(
 
 fn checked_add_u64(base: u64, addend: u64, context: &'static str) -> Result<u64> {
     base.checked_add(addend)
-        .ok_or_else(|| Error::PatchError(format!("{context} address overflow")))
+        .ok_or_else(|| Error::AddressOverflow(format!("{context} address overflow")))
 }
 
 fn checked_sub_u64(base: u64, subtrahend: u64, context: &'static str) -> Result<u64> {
     base.checked_sub(subtrahend)
-        .ok_or_else(|| Error::PatchError(format!("{context} address underflow")))
+        .ok_or_else(|| Error::AddressOverflow(format!("{context} address underflow")))
 }
 
 fn rel32_bytes(target: u64, base: u64, context: &'static str) -> Result<[u8; 4]> {
     let disp = i128::from(target) - i128::from(base);
     let disp = i32::try_from(disp).map_err(|_| {
-        Error::PatchError(format!(
+        Error::AddressOverflow(format!(
             "{context} displacement out of range: target {target:#x}, base {base:#x}"
         ))
     })?;
@@ -737,15 +751,16 @@ pub fn patch_code_segment(
     ) {
         Ok(skipped_addrs) => {
             if !skipped_addrs.is_empty() {
-                return Err(Error::PatchError(format!(
+                return Err(Error::UnpatchableSyscalls(format!(
                     "{} unpatchable syscall instruction(s) at {skipped_addrs:?}",
                     skipped_addrs.len(),
                 )));
             }
             Ok(trampoline_data)
         }
-        Err(Error::NoSyscallInstructionsFound) => Ok(Vec::new()),
-        Err(e) => Err(e),
+        Err(InternalError::NoSyscallInstructionsFound) => Ok(Vec::new()),
+        Err(InternalError::Public(e)) => Err(e),
+        Err(e) => unreachable!("unexpected internal error: {e:?}"),
     }
 }
 
@@ -912,7 +927,7 @@ fn hook_syscall_and_after(
     trampoline_data: &mut Vec<u8>,
     instructions: &[iced_x86::Instruction],
     inst_index: usize,
-) -> Result<()> {
+) -> core::result::Result<(), InternalError> {
     let syscall_inst = &instructions[inst_index];
 
     let replace_start = syscall_inst.ip();
@@ -1056,18 +1071,18 @@ fn hook_syscall_before_and_after(
     trampoline_data: &mut Vec<u8>,
     instructions: &[iced_x86::Instruction],
     inst_index: usize,
-) -> Result<()> {
+) -> core::result::Result<(), InternalError> {
     let syscall_inst = &instructions[inst_index];
     let syscall_inst_addr = syscall_inst.ip();
     // We only support this case for x86
     if arch != Arch::X86_32 {
-        return Err(Error::InsufficientBytesBeforeOrAfter(syscall_inst_addr));
+        return Err(InternalError::InsufficientBytesBeforeOrAfter);
     }
 
     // We expect at least one instruction before and one instruction
     // after the syscall instruction
     if inst_index == 0 || inst_index + 1 >= instructions.len() {
-        return Err(Error::InsufficientBytesBeforeOrAfter(syscall_inst_addr));
+        return Err(InternalError::InsufficientBytesBeforeOrAfter);
     }
 
     let prev_inst = &instructions[inst_index - 1];
@@ -1075,19 +1090,19 @@ fn hook_syscall_before_and_after(
 
     // Make sure we have enough space
     if prev_inst.len() + syscall_inst.len() + next_inst.len() < 5 {
-        return Err(Error::InsufficientBytesBeforeOrAfter(syscall_inst_addr));
+        return Err(InternalError::InsufficientBytesBeforeOrAfter);
     }
 
     // Both the syscall and its following instructions cannot be a control transfer target
     if control_transfer_targets.contains(&syscall_inst_addr)
         || control_transfer_targets.contains(&next_inst.ip())
     {
-        return Err(Error::InsufficientBytesBeforeOrAfter(syscall_inst_addr));
+        return Err(InternalError::InsufficientBytesBeforeOrAfter);
     }
 
     // We don't support the case when the previous instruction is a control transfer instruction
     if prev_inst.flow_control() != iced_x86::FlowControl::Next {
-        return Err(Error::InsufficientBytesBeforeOrAfter(syscall_inst_addr));
+        return Err(InternalError::InsufficientBytesBeforeOrAfter);
     }
 
     // We currently only support relative jmp or ret instructions
@@ -1097,7 +1112,7 @@ fn hook_syscall_before_and_after(
         iced_x86::FlowControl::Return => false,
         iced_x86::FlowControl::UnconditionalBranch => {
             if next_inst.near_branch_target() != prev_inst.ip() {
-                return Err(Error::InsufficientBytesBeforeOrAfter(syscall_inst_addr));
+                return Err(InternalError::InsufficientBytesBeforeOrAfter);
             }
             false
         }
@@ -1108,7 +1123,7 @@ fn hook_syscall_before_and_after(
         | iced_x86::FlowControl::Interrupt
         | iced_x86::FlowControl::XbeginXabortXend
         | iced_x86::FlowControl::Exception => {
-            return Err(Error::InsufficientBytesBeforeOrAfter(syscall_inst_addr));
+            return Err(InternalError::InsufficientBytesBeforeOrAfter);
         }
     };
 

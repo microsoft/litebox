@@ -572,12 +572,6 @@ fn rewrite_elf(data: &[u8], path: &Path, verbose: bool) -> anyhow::Result<Vec<u8
             }
             Ok(rewritten)
         }
-        Err(litebox_syscall_rewriter::Error::UnsupportedExecutable(_)) => {
-            anyhow::bail!(
-                "{} is an executable that cannot be safely patched by syscall rewriting",
-                path.display()
-            )
-        }
         Err(e) => Err(e).with_context(|| format!("failed to rewrite {}", path.display())),
     }
 }
