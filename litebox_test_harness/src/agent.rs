@@ -354,10 +354,14 @@ async fn agent_loop(self_exe: &str) {
                         .await;
                     }
                     Err(_) => {
-                        // Timed out — kill the child and report timeout.
-                        let _ = child.kill().await;
+                        // Timed out — send SIGKILL but don't await (wait can
+                        // hang in litebox due to process reaping bug).
+                        let _ = child.start_kill();
                         respond(&Response::ExecTimeout {
-                            stderr: "process timed out after 10s (likely deadlocked)".to_string(),
+                            stderr: format!(
+                                "process timed out after {}s (likely deadlocked)",
+                                timeout.as_secs()
+                            ),
                         })
                         .await;
                     }

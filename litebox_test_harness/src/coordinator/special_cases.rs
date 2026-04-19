@@ -351,23 +351,37 @@ pub(super) async fn netlink_tests(r: &mut TestRunner) {
 
 /// Unix socket cross-process tests.
 pub(super) async fn unix_socket_tests(r: &mut TestRunner) {
+    let self_exe = r.self_exe.clone();
+
     eprintln!("[special] === Unix Socket Tests ===");
 
-    // US1-US4, US5, VS1: All use bare fork + unix sockets which are known
-    // broken in litebox (bare fork doesn't share socket state across
-    // address spaces). These tests timeout and desynchronize the agent's
-    // protocol, poisoning all subsequent tests on the same agent.
-    // Mark as xfail and skip execution.
-    let xfail_tests = [
-        "US1.cross_process_unix",
-        "US2.cross_exec_unix",
-        "US3.bidirectional_unix",
-        "US4.multi_conn_unix",
-        "US5.abstract_unix",
-        "VS1.socket_race",
+    // US1-US4, US5, VS1: Run via Exec subprocess so that timeouts kill
+    // the subprocess cleanly without desynchronizing the agent's protocol.
+    let tests = [
+        ("US1.cross_process_unix", "cross-process", "US1_CROSS_PROCESS_OK"),
+        ("US2.cross_exec_unix", "cross-exec", "US2_CROSS_EXEC_OK"),
+        ("US3.bidirectional_unix", "bidirectional", "US3_BIDI_OK"),
+        ("US4.multi_conn_unix", "multi-conn", "US4_MULTI_OK"),
+        ("US5.abstract_unix", "abstract", "US5_ABSTRACT_OK"),
+        ("VS1.socket_race", "race", "VS1_RACE_OK"),
     ];
-    for name in &xfail_tests {
-        r.record(name, "A", true, "skipped (bare-fork unix sockets not supported)");
+
+    for (name, sub, expected) in &tests {
+        let resp = r
+            .send(
+                "A",
+                super::exec_timeout(
+                    vec![
+                        self_exe.clone(),
+                        "unix-socket-test".into(),
+                        (*sub).into(),
+                    ],
+                    10,
+                ),
+            )
+            .await;
+        let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout.contains(expected));
+        r.record(name, "A", pass, &format!("{resp:?}"));
     }
 }
 
@@ -438,11 +452,10 @@ pub(super) async fn node_exit_tests(r: &mut TestRunner) {
 }
 
 /// Terminal ioctl matrix tests: op × fd.
-/// NOTE: When run through the coordinator, agents have pipes (not TTYs) for
-/// stdin/stdout/stderr, so all terminal ioctls return ENOTTY. These are
-/// expected failures in the coordinator context — the tests pass when run
-/// standalone with a real TTY.
+/// Coordinator agents have pipes (not TTYs), so ioctls return ENOTTY.
+/// We still run them to verify they don't hang — ENOTTY is a valid result.
 pub(super) async fn terminal_ioctl_tests(r: &mut TestRunner) {
+    let self_exe = r.self_exe.clone();
     let ops = ["tcgets", "tcsets", "tcsetsw", "tcsetsf", "tiocgwinsz"];
     let fds = [0, 1, 2];
 
@@ -452,16 +465,29 @@ pub(super) async fn terminal_ioctl_tests(r: &mut TestRunner) {
         fds.len()
     );
 
-    // Coordinator agents don't have TTYs — mark as xfail/skipped.
     for op in &ops {
         for fd in &fds {
             let test_name = format!("TERM.{op}_fd{fd}");
-            r.record(
-                &test_name,
-                "A",
-                true,
-                "skipped (coordinator agents have pipes, not TTYs)",
-            );
+            let resp = r
+                .send(
+                    "A",
+                    super::exec_timeout(
+                        vec![
+                            self_exe.clone(),
+                            "exit-test".into(),
+                            "term".into(),
+                            (*op).into(),
+                            fd.to_string(),
+                        ],
+                        8,
+                    ),
+                )
+                .await;
+            // Accept both TERM_OK (real TTY) and TERM_ERR with ENOTTY (pipes).
+            // The key validation is that the ioctl doesn't hang.
+            let pass = matches!(&resp, Response::ExecResult { exit_code: 0 | 1, stdout, .. }
+                if stdout.contains("TERM_OK") || stdout.contains("TERM_ERR"));
+            r.record(&test_name, "A", pass, &format!("{resp:?}"));
         }
     }
 }

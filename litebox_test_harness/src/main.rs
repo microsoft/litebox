@@ -909,7 +909,10 @@ mod netlink_tests {
         }
 
         unsafe { libc::close(fd) };
-        if found_done && peek_size == read_size {
+        // Core validation: peek size matches read size (MSG_PEEK|MSG_TRUNC works).
+        // NLMSG_DONE may be in a separate message batch on real kernels with
+        // many interfaces, so we don't require found_done.
+        if peek_size == read_size && peek_size >= 20 {
             println!("NETLINK_PEEK_TRUNC_OK:size={peek_size}");
             0
         } else {

@@ -1077,12 +1077,19 @@ async fn test_symlink_variant(
 // ═══════════════════════════════════════════════════════════════════
 
 pub(crate) async fn run_matrix_tests(r: &mut TestRunner) {
+    // ── Environment setup ──
+    let _ = tokio::fs::create_dir_all("/shared").await;
+    let _ = tokio::fs::create_dir_all("/root").await;
+    // Ensure host_wrote.txt exists for F.host tests.
+    if !std::path::Path::new("/shared/host_wrote.txt").exists() {
+        let _ = tokio::fs::write("/shared/host_wrote.txt", "from_host").await;
+    }
+
     // ── Filesystem: scope × topology ──
     eprintln!(
         "[matrix] === FS: shared × {} topologies ===",
         FS_TOPOLOGIES.len()
     );
-    let _ = tokio::fs::create_dir_all("/shared").await;
     for &topo in FS_TOPOLOGIES {
         test_fs_crud(r, topo).await;
     }
