@@ -221,6 +221,51 @@ async fn test_fs_crud(r: &mut TestRunner, topo: Topology) {
     );
 }
 
+/// Cross-topology unlink: source creates file, dest unlinks it.
+/// Reproduces the VS Code pattern where code-server creates log files
+/// and a later session tries to clean them up.
+async fn test_fs_cross_unlink(r: &mut TestRunner, topo: Topology) {
+    let (source, dest) = topo.agents();
+    let ts = topo.suffix();
+    let file = format!("/shared/unlink_{ts}.txt");
+
+    // Clean up from prior runs.
+    let _ = r
+        .send("init", Command::FsDelete { path: file.clone() })
+        .await;
+
+    // Source creates the file.
+    r.send(
+        source,
+        Command::FsWrite {
+            path: file.clone(),
+            data: "unlink_me".into(),
+        },
+    )
+    .await;
+
+    // Dest unlinks it.
+    let resp = r.send(dest, Command::FsDelete { path: file.clone() }).await;
+    let delete_ok = matches!(&resp, Response::Ok { .. });
+    r.record(
+        &format!("F.unlink.{ts}.delete"),
+        dest,
+        delete_ok,
+        &format!("{resp:?}"),
+    );
+
+    // Source confirms it's gone.
+    let resp = r
+        .send(source, Command::FsRead { path: file.clone() })
+        .await;
+    r.record(
+        &format!("F.unlink.{ts}.gone"),
+        source,
+        matches!(resp, Response::NotFound),
+        &format!("{resp:?}"),
+    );
+}
+
 /// /tmp isolation: writer writes to /tmp, reader checks visibility.
 async fn test_tmp_isolation(r: &mut TestRunner, topo: Topology) {
     let (writer, reader) = topo.agents();
@@ -1097,6 +1142,14 @@ pub(crate) async fn run_matrix_tests(r: &mut TestRunner) {
     eprintln!("[matrix] === FS: /tmp isolation ===");
     for &topo in FS_TOPOLOGIES {
         test_tmp_isolation(r, topo).await;
+    }
+
+    eprintln!(
+        "[matrix] === FS: cross-unlink × {} topologies ===",
+        FS_TOPOLOGIES.len()
+    );
+    for &topo in FS_TOPOLOGIES {
+        test_fs_cross_unlink(r, topo).await;
     }
 
     eprintln!("[matrix] === FS: host file ===");
