@@ -135,11 +135,10 @@ pub(super) async fn vscode_repro_tests(r: &mut TestRunner) {
         );
     } else {
         let socket_created = matches!(&resp, Response::ExecResult { stdout, .. } if stdout.contains("SOCKET_CREATED"));
-        r.record_xfail(
+        r.record(
             "V6.code_server_socket",
             "A",
             socket_created,
-            "Node.js I/O error on startup",
             &format!("{resp:?}"),
         );
     }
