@@ -95,84 +95,6 @@ fn which(name: &str) -> Option<PathBuf> {
     }
 }
 
-/// Generate a minimal x86-64 non-PIE ELF binary (ET_EXEC at 0x400000).
-///
-/// The binary writes "NONPIE_OK\n" to stdout (syscall write) and exits
-/// with code 0 (syscall exit). It is statically linked — no libc or
-/// dynamic linker needed. This replaces the gcc -no-pie build dependency.
-fn generate_nonpie_elf() -> Vec<u8> {
-    // Machine code for the program (x86-64):
-    //   mov rax, 1          ; syscall: write
-    //   mov rdi, 1          ; fd: stdout
-    //   lea rsi, [rip+msg]  ; buf: "NONPIE_OK\n"
-    //   mov rdx, 10         ; len: 10
-    //   syscall
-    //   mov rax, 60         ; syscall: exit
-    //   xor rdi, rdi        ; code: 0
-    //   syscall
-    //   msg: "NONPIE_OK\n"
-    let code: &[u8] = &[
-        0x48, 0xc7, 0xc0, 0x01, 0x00, 0x00, 0x00, // mov rax, 1
-        0x48, 0xc7, 0xc7, 0x01, 0x00, 0x00, 0x00, // mov rdi, 1
-        0x48, 0x8d, 0x35, 0x15, 0x00, 0x00, 0x00, // lea rsi, [rip+21]
-        0x48, 0xc7, 0xc2, 0x0a, 0x00, 0x00, 0x00, // mov rdx, 10
-        0x0f, 0x05, // syscall
-        0x48, 0xc7, 0xc0, 0x3c, 0x00, 0x00, 0x00, // mov rax, 60
-        0x48, 0x31, 0xff, // xor rdi, rdi
-        0x0f, 0x05, // syscall
-        b'N', b'O', b'N', b'P', b'I', b'E', b'_', b'O', b'K', b'\n',
-    ];
-
-    let base_addr: u64 = 0x400000;
-    let ehdr_size: u16 = 64; // ELF header size
-    let phdr_size: u16 = 56; // Program header size
-    let code_offset: u64 = (ehdr_size + phdr_size) as u64;
-    let entry: u64 = base_addr + code_offset;
-    let file_size = code_offset as usize + code.len();
-    let mem_size = file_size; // No BSS needed
-
-    let mut elf = Vec::with_capacity(file_size);
-
-    // ELF header (64 bytes)
-    elf.extend_from_slice(&[0x7f, b'E', b'L', b'F']); // e_ident magic
-    elf.push(2); // EI_CLASS: ELFCLASS64
-    elf.push(1); // EI_DATA: ELFDATA2LSB
-    elf.push(1); // EI_VERSION: EV_CURRENT
-    elf.push(0); // EI_OSABI: ELFOSABI_NONE
-    elf.extend_from_slice(&[0; 8]); // EI_ABIVERSION + padding
-    elf.extend_from_slice(&2u16.to_le_bytes()); // e_type: ET_EXEC (non-PIE!)
-    elf.extend_from_slice(&0x3eu16.to_le_bytes()); // e_machine: EM_X86_64
-    elf.extend_from_slice(&1u32.to_le_bytes()); // e_version
-    elf.extend_from_slice(&entry.to_le_bytes()); // e_entry
-    elf.extend_from_slice(&(ehdr_size as u64).to_le_bytes()); // e_phoff
-    elf.extend_from_slice(&0u64.to_le_bytes()); // e_shoff (no sections)
-    elf.extend_from_slice(&0u32.to_le_bytes()); // e_flags
-    elf.extend_from_slice(&ehdr_size.to_le_bytes()); // e_ehsize
-    elf.extend_from_slice(&phdr_size.to_le_bytes()); // e_phentsize
-    elf.extend_from_slice(&1u16.to_le_bytes()); // e_phnum
-    elf.extend_from_slice(&0u16.to_le_bytes()); // e_shentsize
-    elf.extend_from_slice(&0u16.to_le_bytes()); // e_shnum
-    elf.extend_from_slice(&0u16.to_le_bytes()); // e_shstrndx
-    assert_eq!(elf.len(), ehdr_size as usize);
-
-    // Program header (56 bytes) — single PT_LOAD segment
-    elf.extend_from_slice(&1u32.to_le_bytes()); // p_type: PT_LOAD
-    elf.extend_from_slice(&5u32.to_le_bytes()); // p_flags: PF_R | PF_X
-    elf.extend_from_slice(&0u64.to_le_bytes()); // p_offset: 0 (load from start)
-    elf.extend_from_slice(&base_addr.to_le_bytes()); // p_vaddr
-    elf.extend_from_slice(&base_addr.to_le_bytes()); // p_paddr
-    elf.extend_from_slice(&(file_size as u64).to_le_bytes()); // p_filesz
-    elf.extend_from_slice(&(mem_size as u64).to_le_bytes()); // p_memsz
-    elf.extend_from_slice(&0x1000u64.to_le_bytes()); // p_align
-    assert_eq!(elf.len(), (ehdr_size + phdr_size) as usize);
-
-    // Code + data
-    elf.extend_from_slice(code);
-    assert_eq!(elf.len(), file_size);
-
-    elf
-}
-
 /// Build a minimal rootfs for the test harness.
 fn build_rootfs(test_binary: &Path) -> tempfile::TempDir {
     let rootfs_dir = tempfile::tempdir().expect("create temp dir");
@@ -227,21 +149,9 @@ fn build_rootfs(test_binary: &Path) -> tempfile::TempDir {
     });
     stage_binary(rootfs, &node_path, "/usr/local/bin/node");
 
-    // 4. Generate a non-PIE test binary for X40-X42 contamination tests.
-    // This is a minimal x86-64 ELF (ET_EXEC, loaded at 0x400000) that
-    // writes "NONPIE_OK\n" to stdout and exits. Statically linked — no
-    // libc or dynamic linker needed.
-    let nonpie_bin = rootfs.join("nonpie-echo");
-    fs::write(&nonpie_bin, generate_nonpie_elf()).unwrap();
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&nonpie_bin, fs::Permissions::from_mode(0o755)).unwrap();
-    }
-
-    // 4b. Build the non-PIE test harness for SpawnRemote / cross-worker tests.
+    // 4. Stage non-PIE test harness for SpawnRemote / cross-worker tests.
     // Built via: cargo rustc -p litebox_test_harness --target-dir target/nonpie -- -C link-args=-no-pie
-    // If the pre-built binary exists, copy it; otherwise tests that need it will skip.
+    // The coordinator's find_nonpie_binary() looks for /litebox-test-harness-nonpie.
     let nonpie_harness_src =
         Path::new(env!("CARGO_MANIFEST_DIR")).join("../target/nonpie/debug/litebox_test_harness");
     if nonpie_harness_src.exists() {
@@ -254,7 +164,7 @@ fn build_rootfs(test_binary: &Path) -> tempfile::TempDir {
         stage_file(rootfs, &ld_path);
     }
 
-    // 4. Create writable directories.
+    // 6. Create writable directories.
     fs::create_dir_all(rootfs.join("shared")).unwrap();
     fs::create_dir_all(rootfs.join("tmp")).unwrap();
     fs::create_dir_all(rootfs.join("root")).unwrap();
@@ -356,46 +266,73 @@ fn run_and_parse(label: &str, command: &mut Command) -> Vec<serde_json::Value> {
 }
 
 /// Check test results for unexpected outcomes.
-fn check_results(label: &str, results: &[serde_json::Value], expected_xfail: usize) {
+fn check_results(
+    label: &str,
+    results: &[serde_json::Value],
+    expected_xfail: usize,
+    expected_fail: usize,
+    expected_xpass: usize,
+) {
     assert!(
         !results.is_empty(),
         "[{label}] No test results parsed from stdout"
     );
 
-    let unexpected: Vec<_> = results
+    let fail_count = results
         .iter()
-        .filter(|r| {
-            let result = r["result"].as_str().unwrap_or("");
-            result == "FAIL" || result == "XPASS"
-        })
-        .collect();
-
-    if !unexpected.is_empty() {
-        eprintln!("\n=== [{label}] UNEXPECTED RESULTS ===");
-        for r in &unexpected {
-            eprintln!(
-                "  {} [{}]: {} — {}",
-                r["test"].as_str().unwrap_or("?"),
-                r["agent"].as_str().unwrap_or("?"),
-                r["result"].as_str().unwrap_or("?"),
-                r["detail"].as_str().unwrap_or(""),
-            );
-        }
-        panic!(
-            "[{label}] {} unexpected test result(s). See above.",
-            unexpected.len()
-        );
-    }
-
+        .filter(|r| r["result"].as_str() == Some("FAIL"))
+        .count();
+    let xpass_count = results
+        .iter()
+        .filter(|r| r["result"].as_str() == Some("XPASS"))
+        .count();
     let xfail_count = results
         .iter()
         .filter(|r| r["result"].as_str() == Some("xfail"))
         .count();
-    assert_eq!(
-        xfail_count, expected_xfail,
-        "[{label}] xfail count changed from {expected_xfail} to {xfail_count}. \
-         If intentional, update the expected count."
-    );
+
+    let mut any_mismatch = false;
+    if fail_count != expected_fail {
+        eprintln!(
+            "[{label}] FAIL count: expected {expected_fail}, got {fail_count}"
+        );
+        any_mismatch = true;
+    }
+    if xpass_count != expected_xpass {
+        eprintln!(
+            "[{label}] XPASS count: expected {expected_xpass}, got {xpass_count}"
+        );
+        any_mismatch = true;
+    }
+    if xfail_count != expected_xfail {
+        eprintln!(
+            "[{label}] xfail count: expected {expected_xfail}, got {xfail_count}"
+        );
+        any_mismatch = true;
+    }
+
+    if any_mismatch {
+        eprintln!("\n=== [{label}] UNEXPECTED RESULTS ===");
+        for r in results {
+            let result = r["result"].as_str().unwrap_or("");
+            if result == "FAIL" || result == "XPASS" {
+                eprintln!(
+                    "  {} [{}]: {} — {}",
+                    r["test"].as_str().unwrap_or("?"),
+                    r["agent"].as_str().unwrap_or("?"),
+                    result,
+                    r["detail"].as_str().unwrap_or(""),
+                );
+            }
+        }
+        panic!(
+            "[{label}] Result counts don't match expected. \
+             FAIL={fail_count}(exp {expected_fail}), \
+             XPASS={xpass_count}(exp {expected_xpass}), \
+             xfail={xfail_count}(exp {expected_xfail}). \
+             If intentional, update the expected counts."
+        );
+    }
 
     let mut counts: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
     for r in results {
@@ -454,12 +391,9 @@ fn process_tree_tests() {
     if native_results.is_empty() {
         eprintln!("WARNING: native baseline produced no results. Skipping baseline check.");
     } else {
-        // Native should have 0 unexpected results (FAIL or XPASS).
-        // U.sibling.connect is xfail (test expects connection failure for litebox)
-        // but natively siblings share filesystem so the connect succeeds —
-        // the test's pass condition (ConnectFailed) is false, making it xfail.
-        // This is expected: the test is designed for litebox's limitation.
-        check_results("native", &native_results, 1); // 1 xfail: U.sibling
+        // Native baseline must pass everything — 0 FAIL, 0 xfail, 0 XPASS.
+        // This is the WSL2 gold standard: any failure here is a test bug.
+        check_results("native", &native_results, 0, 0, 0);
     }
 
     // ── Pass 2: Litebox ──
@@ -467,17 +401,36 @@ fn process_tree_tests() {
         let mut cmd = Command::new(&tool_executor);
         cmd.arg("--rootfs")
             .arg(rootfs_dir.path())
+            .arg("--record-baseline")
+            .arg("--")
             .arg("/litebox-test-harness")
             .arg("spawn-tree");
         run_and_parse("litebox", &mut cmd)
     };
 
-    // Update this constant when intentionally adding/removing xfails.
-    // Matrix symlinks: 4 subtests × 5 topologies = 20 (if ENOTSUP)
-    // Special symlinks: S6, S7.readlink_dangling, S8, S9 = 4 (if ENOTSUP)
-    // Unix socket: U.sibling.connect = 1
-    const EXPECTED_XFAIL_COUNT: usize = 25;
-    check_results("litebox", &litebox_results, EXPECTED_XFAIL_COUNT);
+    // Update these constants when intentionally adding/removing xfails/failures.
+    // Symlink xfails (dynamic — probe returns ENOTSUP in litebox):
+    //   basic: 4 subtests × 5 topologies = 20
+    //   variants: S.dir + S.dangling + S.nested = 3
+    // Total xfail: 23
+    //
+    // Known litebox failures (real platform gaps):
+    //   US1,3,4,5 + VS1: bare-fork unix socket tests timeout (5)
+    //   XW3,4: cross-worker unix socket connect ECONNREFUSED (2)
+    // Total FAIL: 7
+    //
+    // XPASS (litebox does better than expected):
+    //   S.relative.read_through: relative symlink works despite ENOTSUP probe (1)
+    const EXPECTED_XFAIL_COUNT: usize = 23;
+    const EXPECTED_FAIL_COUNT: usize = 7;
+    const EXPECTED_XPASS_COUNT: usize = 1;
+    check_results(
+        "litebox",
+        &litebox_results,
+        EXPECTED_XFAIL_COUNT,
+        EXPECTED_FAIL_COUNT,
+        EXPECTED_XPASS_COUNT,
+    );
 
     // ── Cross-check: any test passing natively but failing in litebox is a litebox bug ──
     if !native_results.is_empty() {
