@@ -196,6 +196,10 @@ async fn agent_loop(self_exe: &str) {
             Command::NetListen { port } => {
                 match TcpListener::bind(format!("0.0.0.0:{port}")).await {
                     Ok(listener) => {
+                        let actual_port = listener
+                            .local_addr()
+                            .map(|a| a.port())
+                            .unwrap_or(port);
                         // Spawn echo server task.
                         let task = tokio::spawn(async move {
                             loop {
@@ -223,8 +227,8 @@ async fn agent_loop(self_exe: &str) {
                                 }
                             }
                         });
-                        listeners.insert(port, task);
-                        respond(&Response::Listening { port }).await;
+                        listeners.insert(actual_port, task);
+                        respond(&Response::Listening { port: actual_port }).await;
                     }
                     Err(e) => {
                         respond(&Response::Error {

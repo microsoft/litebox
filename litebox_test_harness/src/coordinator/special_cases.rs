@@ -779,4 +779,85 @@ pub(super) async fn cross_worker_tests(r: &mut TestRunner) {
         let pass = matches!(&resp, Response::Connected { echo } if echo.contains("XW_HELLO2"));
         r.record("XW4.remote_connect", "A", pass, &format!("{resp:?}"));
     }
+
+    // XW5: Remote listens TCP, local connects (TCP should work cross-worker)
+    let resp = r
+        .send(
+            "A",
+            Command::Forward {
+                target: "R".to_string(),
+                inner: Box::new(Command::NetListen { port: 0 }),
+            },
+        )
+        .await;
+    let remote_port = match &resp {
+        Response::Listening { port } => Some(*port),
+        _ => None,
+    };
+    r.record(
+        "XW5.remote_tcp_listen",
+        "A",
+        remote_port.is_some(),
+        &format!("{resp:?}"),
+    );
+
+    if let Some(port) = remote_port {
+        let resp = r
+            .send(
+                "A",
+                Command::NetConnect {
+                    addr: format!("127.0.0.1:{port}"),
+                    data: "XW_TCP_HELLO".to_string(),
+                },
+            )
+            .await;
+        let pass =
+            matches!(&resp, Response::Connected { echo } if echo.contains("XW_TCP_HELLO"));
+        r.record("XW5.local_tcp_connect", "A", pass, &format!("{resp:?}"));
+
+        let _ = r
+            .send(
+                "A",
+                Command::Forward {
+                    target: "R".to_string(),
+                    inner: Box::new(Command::NetUnlisten { port }),
+                },
+            )
+            .await;
+    }
+
+    // XW6: Local listens TCP, remote connects
+    let resp = r.send("A", Command::NetListen { port: 0 }).await;
+    let local_port = match &resp {
+        Response::Listening { port } => Some(*port),
+        _ => None,
+    };
+    r.record(
+        "XW6.local_tcp_listen",
+        "A",
+        local_port.is_some(),
+        &format!("{resp:?}"),
+    );
+
+    if let Some(port) = local_port {
+        let resp = r
+            .send(
+                "A",
+                Command::Forward {
+                    target: "R".to_string(),
+                    inner: Box::new(Command::NetConnect {
+                        addr: format!("127.0.0.1:{port}"),
+                        data: "XW_TCP_HELLO2".to_string(),
+                    }),
+                },
+            )
+            .await;
+        let pass =
+            matches!(&resp, Response::Connected { echo } if echo.contains("XW_TCP_HELLO2"));
+        r.record("XW6.remote_tcp_connect", "A", pass, &format!("{resp:?}"));
+
+        let _ = r
+            .send("A", Command::NetUnlisten { port })
+            .await;
+    }
 }
