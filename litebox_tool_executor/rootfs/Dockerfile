@@ -7,13 +7,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     bash coreutils findutils grep sed gawk git \
     ca-certificates curl wget xz-utils tar \
     procps less openssh-sftp-server \
-    dropbear-bin python3-minimal \
-    && rm -rf /var/lib/apt/lists/*
-
-# ── Node.js (pinned version) ──
-ARG NODE_VERSION=v24.14.1
-RUN curl -fsSL "https://nodejs.org/dist/${NODE_VERSION}/node-${NODE_VERSION}-linux-x64.tar.xz" \
-    | tar xJ -C /usr/local --strip-components=1 \
+    dropbear-bin python3-minimal nodejs \
+    && rm -rf /var/lib/apt/lists/* \
+    && echo "dash dash/sh boolean false" | debconf-set-selections \
+    && dpkg-reconfigure dash \
     && node --version
 
 # ── System config ──
@@ -29,11 +26,6 @@ RUN printf 'root:$5$feWUHaTYjlgIa1uw$9xrsiQaRuBfJSEx37HOmaCfa2l4MY6VGZ8/L3OJVSO9
 # ── Dropbear SSH ──
 RUN mkdir -p /etc/dropbear \
     && dropbearkey -t ed25519 -f /etc/dropbear/dropbear_ed25519_host_key 2>/dev/null
-
-# ── sftp-server symlinks ──
-RUN mkdir -p /usr/libexec \
-    && ln -sf /usr/lib/openssh/sftp-server /usr/libexec/sftp-server \
-    && ln -sf /usr/lib/openssh/sftp-server /usr/lib/sftp-server
 
 # ── VS Code CLI + Server (latest stable) ──
 RUN mkdir -p /root/.vscode-server \
@@ -65,7 +57,6 @@ RUN mkdir -p /root/.vscode-server/data/logs \
 RUN mkdir -p /tmp /workspaces /home /shared /dev /proc /root \
     && touch /tmp/vscode-skip-server-requirements-check \
     && [ -e /bin ] || ln -sf /usr/bin /bin \
-    && echo "nameserver 10.0.0.1" > /etc/resolv.conf.litebox \
-    && ln -sf bash /usr/bin/sh
+    && echo "nameserver 10.0.0.1" > /etc/resolv.conf.litebox
 
 EXPOSE 22

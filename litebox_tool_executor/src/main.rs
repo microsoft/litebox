@@ -740,74 +740,10 @@ fn vscode_server(cli: &Cli, audit_log_file: Option<&std::path::Path>) -> anyhow:
             .map(|(_, name)| name)
     });
 
-    if let Some(ref server_name) = prewarm_server {
-        eprintln!("Pre-warming code-server ({server_name}) inside sandbox...");
-        let code_server_path =
-            format!("/root/.vscode-server/cli/servers/{server_name}/server/bin/code-server");
-        let server_dir = format!("/root/.vscode-server/cli/servers/{server_name}");
-
-        // Patch code-server to replace --socket-path with --host/--port.
-        // In litebox, code-server (Node.js, non-PIE) runs on a remote worker.
-        // Unix sockets don't work cross-worker, but TCP does (validated by
-        // XW5/XW6 tests). The wrapper rewrites "--socket-path=X" to
-        // "--host=127.0.0.1 --port=0" so code-server listens on TCP instead.
-        let code_server_real =
-            format!("/root/.vscode-server/cli/servers/{server_name}/server/bin/code-server-real");
-        let wrapper_path = cli.rootfs.join(
-            code_server_path.trim_start_matches('/'),
-        );
-        let real_path = cli.rootfs.join(
-            code_server_real.trim_start_matches('/'),
-        );
-        // Move original to -real if not already moved.
-        if !real_path.exists() && wrapper_path.exists() {
-            if let Err(e) = std::fs::rename(&wrapper_path, &real_path) {
-                eprintln!("Warning: could not rename code-server: {e}");
-            }
-        }
-        let wrapper_script = format!(
-            r#"#!/usr/bin/bash
-# LiteBox wrapper: convert --socket-path to --host/--port for cross-worker TCP.
-ARGS=()
-for arg in "$@"; do
-    case "$arg" in
-        --socket-path=*) ARGS+=("--host=127.0.0.1" "--port=0") ;;
-        *) ARGS+=("$arg") ;;
-    esac
-done
-exec "{code_server_real}" "${{ARGS[@]}}"
-"#
-        );
-        if let Err(e) = std::fs::write(&wrapper_path, &wrapper_script) {
-            eprintln!("Warning: could not write code-server wrapper: {e}");
-        }
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(
-                &wrapper_path,
-                std::fs::Permissions::from_mode(0o755),
-            );
-        }
-
-        // Start code-server in background, capture its PID into pid.txt and
-        // redirect output to log.txt. The VS Code CLI checks these files to
-        // detect a running server and skip the startup delay.
-        let init_script = format!(
-            "{code_server_path} \
-             --connection-token=remotessh \
-             --accept-server-license-terms \
-             --start-server \
-             --enable-remote-auto-shutdown \
-             > {server_dir}/log.txt 2>&1 &\n\
-             echo $! > {server_dir}/pid.txt\n\
-             exec /usr/sbin/dropbear -F -E -B -R -p 22"
-        );
-        cmd.args(["/usr/bin/bash", "-c", &init_script]);
-    } else {
-        eprintln!("No VS Code server found for pre-warm, starting dropbear only");
-        cmd.args(["/usr/sbin/dropbear", "-F", "-E", "-B", "-R", "-p", "22"]);
-    }
+    // Start dropbear SSH server. VS Code's install script will start the
+    // code-server when it connects — no pre-warming needed since the
+    // CLI and server are pre-installed in the Docker image.
+    cmd.args(["/usr/sbin/dropbear", "-F", "-E", "-B", "-R", "-p", "22"]);
 
     cmd.stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::inherit())
