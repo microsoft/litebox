@@ -343,6 +343,9 @@ async fn run_tests(self_exe: &str) -> Vec<TestResult> {
     // === Stdin-Piped Script Tests ===
     special_cases::stdin_script_tests(&mut runner).await;
 
+    // === Capture-Pipe Fork Tests ===
+    special_cases::capture_pipe_tests(&mut runner).await;
+
     // === Cross-Worker Tests ===
     special_cases::cross_worker_tests(&mut runner).await;
 

@@ -83,6 +83,16 @@ fn main() {
         "echo-test" => {
             println!("ECHO_TEST_OK");
         }
+        "capture-pipe" => {
+            // Minimal test for $()-like capture pipe across fork.
+            // pipe() → fork() → child: dup2(write,1), exec sh -c "echo X | cat"
+            // parent: read(read_end), verify output.
+            // This isolates the delayed-fork capture pipe bridging.
+            std::process::exit(capture_pipe_test::run(
+                args.get(2).map(String::as_str).unwrap_or("pipe"),
+                args.get(3).map(String::as_str).unwrap_or("sh"),
+            ));
+        }
         "stdin-script" => {
             // Pipe a shell script to `sh` via stdin and verify output.
             // Reproduces the VS Code install script pattern where the
@@ -380,7 +390,153 @@ fn main() {
     }
 }
 
-/// Tests for scripts piped to `sh` via stdin — the VS Code install pattern.
+/// Minimal capture-pipe fork test: reproduces the exact mechanism bash uses
+/// for `$()`. Creates a pipe, forks, child dup2's write end to stdout and
+/// execs a command, parent reads the output from the read end.
+///
+/// This isolates the delayed-fork capture pipe bridging without bash overhead.
+/// The child exec triggers delayed fork migration; the parent must be able
+/// to read the child's stdout through the migrated pipe bridge.
+mod capture_pipe_test {
+    /// Run a capture-pipe test.
+    /// `cmd_type`: "simple" (echo), "pipe" (echo | cat), "multi" (echo | grep | cat),
+    ///             "noexec" (child writes directly, no exec)
+    /// `shell`: "sh" or "bash" (ignored for noexec)
+    pub fn run(cmd_type: &str, shell: &str) -> i32 {
+        if cmd_type == "noexec" {
+            return run_noexec();
+        }
+
+        let cmd = match cmd_type {
+            "simple" => "echo CAPTURE_OK",
+            "pipe" => "echo CAPTURE_OK | cat",
+            "multi" => "echo CAPTURE_OK | grep CAPTURE | cat",
+            other => {
+                eprintln!("capture-pipe: unknown cmd_type: {other}");
+                eprintln!("  options: simple, pipe, multi");
+                return 1;
+            }
+        };
+
+        // Create capture pipe
+        let mut pipe_fds = [0i32; 2];
+        let rc = unsafe { libc::pipe(pipe_fds.as_mut_ptr()) };
+        if rc != 0 {
+            println!("CP_FAIL:pipe_err={}", std::io::Error::last_os_error());
+            return 1;
+        }
+        let read_end = pipe_fds[0];
+        let write_end = pipe_fds[1];
+
+        // Fork
+        let pid = unsafe { libc::fork() };
+        if pid < 0 {
+            println!("CP_FAIL:fork_err={}", std::io::Error::last_os_error());
+            return 1;
+        }
+
+        if pid == 0 {
+            // Child: dup2 write end to stdout, close originals, exec shell
+            unsafe {
+                libc::dup2(write_end, 1);
+                libc::close(read_end);
+                libc::close(write_end);
+            }
+            let shell_c = std::ffi::CString::new(shell).unwrap();
+            let flag_c = std::ffi::CString::new("-c").unwrap();
+            let cmd_c = std::ffi::CString::new(cmd).unwrap();
+            unsafe {
+                libc::execvp(
+                    shell_c.as_ptr(),
+                    [shell_c.as_ptr(), flag_c.as_ptr(), cmd_c.as_ptr(), std::ptr::null()].as_ptr(),
+                );
+            }
+            // If exec fails
+            unsafe { libc::_exit(127) };
+        }
+
+        // Parent: close write end, read from read end
+        unsafe { libc::close(write_end) };
+
+        let mut buf = [0u8; 4096];
+        let mut output = Vec::new();
+        loop {
+            let n = unsafe { libc::read(read_end, buf.as_mut_ptr() as *mut _, buf.len()) };
+            if n <= 0 {
+                break;
+            }
+            output.extend_from_slice(&buf[..n as usize]);
+        }
+        unsafe { libc::close(read_end) };
+
+        // Wait for child
+        let mut status = 0i32;
+        unsafe { libc::waitpid(pid, &mut status, 0) };
+
+        let stdout = String::from_utf8_lossy(&output).trim().to_string();
+        if stdout.contains("CAPTURE_OK") {
+            println!("CP_OK:cmd={cmd_type},shell={shell},output={stdout}");
+            0
+        } else {
+            println!("CP_FAIL:cmd={cmd_type},shell={shell},output={stdout},status={status}");
+            1
+        }
+    }
+
+    /// Fork without exec: child writes directly to the capture pipe.
+    /// This tests the delayed-fork path where the child never execs —
+    /// exactly what bash's $() subshell does.
+    fn run_noexec() -> i32 {
+        let mut pipe_fds = [0i32; 2];
+        if unsafe { libc::pipe(pipe_fds.as_mut_ptr()) } != 0 {
+            println!("CP_FAIL:cmd=noexec,err=pipe");
+            return 1;
+        }
+        let read_end = pipe_fds[0];
+        let write_end = pipe_fds[1];
+
+        let pid = unsafe { libc::fork() };
+        if pid < 0 {
+            println!("CP_FAIL:cmd=noexec,err=fork");
+            return 1;
+        }
+
+        if pid == 0 {
+            // Child: close read end, write to write end, exit
+            unsafe { libc::close(read_end) };
+            let msg = b"CAPTURE_OK\n";
+            unsafe { libc::write(write_end, msg.as_ptr() as *const _, msg.len()) };
+            unsafe { libc::close(write_end) };
+            unsafe { libc::_exit(0) };
+        }
+
+        // Parent: close write end, read from read end
+        unsafe { libc::close(write_end) };
+
+        let mut buf = [0u8; 4096];
+        let mut output = Vec::new();
+        loop {
+            let n = unsafe { libc::read(read_end, buf.as_mut_ptr() as *mut _, buf.len()) };
+            if n <= 0 {
+                break;
+            }
+            output.extend_from_slice(&buf[..n as usize]);
+        }
+        unsafe { libc::close(read_end) };
+
+        let mut status = 0i32;
+        unsafe { libc::waitpid(pid, &mut status, 0) };
+
+        let stdout = String::from_utf8_lossy(&output).trim().to_string();
+        if stdout.contains("CAPTURE_OK") {
+            println!("CP_OK:cmd=noexec,shell=none,output={stdout}");
+            0
+        } else {
+            println!("CP_FAIL:cmd=noexec,shell=none,output={stdout},status={status}");
+            1
+        }
+    }
+}
 /// Each test pipes a script to both `sh` and `bash` and checks if the output
 /// matches expectations. Shell (sh vs bash) is a matrix dimension — every
 /// script runs with both shells to discover POSIX-mode vs native-mode

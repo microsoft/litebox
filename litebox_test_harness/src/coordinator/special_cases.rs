@@ -643,78 +643,99 @@ pub(super) async fn net_ipv6_tests(r: &mut TestRunner) {
     }
 }
 
-/// Stdin-piped script tests: pipe shell scripts to `sh` via stdin.
-/// Reproduces the VS Code install script pattern where the script is
-/// piped through `ssh host sh`. Tests pipe-in-subshell, command
-/// substitution, and multi-stage pipes — all across agent depths.
+/// Stdin-piped script tests: pipe shell scripts to sh/bash via the Exec
+/// protocol's stdin field. Reproduces the VS Code install script pattern
+/// where the script is piped through `ssh host sh`.
+///
+/// Matrix: 8 scripts × 2 shells × 2 agent depths.
 pub(super) async fn stdin_script_tests(r: &mut TestRunner) {
-    let self_exe = r.self_exe.clone();
+    const SCRIPTS: &[(&str, &str, &str)] = &[
+        ("cmd_subst", "FOO=$(echo hello)\necho FOO=$FOO\necho DONE\n", "FOO=hello"),
+        ("pipe_in_subst", "A=$(echo one | cat)\necho A=$A\necho DONE\n", "A=one"),
+        ("multi_pipe_subst", "A=$(echo data | grep data | cat)\necho A=$A\necho DONE\n", "A=data"),
+        ("file_pipe_subst", "A=$(cat /etc/hostname | cat)\necho A=$A\necho DONE\n", "DONE"),
+        ("sequential_subst", "A=$(echo first)\nB=$(echo second)\necho A=$A B=$B\necho DONE\n", "A=first B=second"),
+        ("subst_then_cmds", "A=$(echo val | cat)\necho LINE1\necho LINE2\necho LINE3\n", "LINE3"),
+        ("vscode_osrelease", "ID=$(cat /etc/os-release | grep -E '^ID=' | sed 's/ID=//g' | sed 's/\"//g')\necho ID=$ID\necho DONE\n", "DONE"),
+        ("backtick_pipe", "A=`echo one | cat`\necho A=$A\necho DONE\n", "A=one"),
+    ];
+    const SHELLS: &[&str] = &["sh", "bash"];
+    const AGENTS: &[&str] = &["A", "AA"];
 
-    eprintln!("[special] === Stdin-Piped Script Tests ===");
+    eprintln!(
+        "[special] === Stdin-Piped Script Tests ({} × {} × {}) ===",
+        SCRIPTS.len(),
+        SHELLS.len(),
+        AGENTS.len()
+    );
 
-    // Run all stdin-script tests as a single Exec. The subcommand
-    // runs each test internally and reports STDIN_OK/STDIN_FAIL.
-    for agent in &["A", "AA"] {
-        let resp = r
-            .send(
-                agent,
-                super::exec_timeout(
-                    vec![self_exe.clone(), "stdin-script".into(), "all".into()],
-                    30,
-                ),
-            )
-            .await;
-
-        // Parse individual results from stdout.
-        // Format: STDIN_OK:name=pipe_in_subst,shell=sh
-        // or:     STDIN_FAIL:name=pipe_in_subst,shell=bash,MISSING...
-        if let Response::ExecResult {
-            exit_code, stdout, ..
-        } = &resp
-        {
-            for line in stdout.lines() {
-                let (prefix, pass) = if line.starts_with("STDIN_OK:") {
-                    ("STDIN_OK:", true)
-                } else if line.starts_with("STDIN_FAIL:") {
-                    ("STDIN_FAIL:", false)
-                } else {
-                    continue;
-                };
-                let rest = &line[prefix.len()..];
-                // Parse name=X,shell=Y
-                let mut name = "";
-                let mut shell = "";
-                for kv in rest.split(',') {
-                    if let Some(v) = kv.strip_prefix("name=") {
-                        name = v;
-                    } else if let Some(v) = kv.strip_prefix("shell=") {
-                        shell = v;
-                    }
-                }
-                if !name.is_empty() && !shell.is_empty() {
-                    r.record(
-                        &format!("SS.{name}.{shell}.{agent}"),
+    for agent in AGENTS {
+        for shell in SHELLS {
+            for &(name, script, expected) in SCRIPTS {
+                let test_id = format!("SS.{name}.{shell}.{agent}");
+                let resp = r
+                    .send(
                         agent,
-                        pass,
-                        line,
-                    );
-                }
-            }
-            if *exit_code != 0 && !stdout.contains("STDIN_") {
-                r.record(
-                    &format!("SS.all.{agent}"),
-                    agent,
-                    false,
-                    &format!("{resp:?}"),
+                        Command::Exec {
+                            args: vec![(*shell).into()],
+                            timeout_secs: Some(10),
+                            stdin: Some(script.into()),
+                            background: false,
+                        },
+                    )
+                    .await;
+                let pass = matches!(
+                    &resp,
+                    Response::ExecResult { stdout, .. } if stdout.contains(expected)
                 );
+                r.record(&test_id, agent, pass, &format!("{resp:?}"));
             }
-        } else {
-            r.record(
-                &format!("SS.all.{agent}"),
-                agent,
-                false,
-                &format!("{resp:?}"),
-            );
+        }
+    }
+}
+
+/// Capture-pipe fork tests: minimal reproduction of the $() mechanism.
+/// pipe() → fork() → child: dup2 + exec → parent: read capture pipe.
+/// Tests the delayed-fork capture pipe bridging directly.
+///
+/// Matrix: 3 cmd types × 2 shells × 2 agent depths.
+pub(super) async fn capture_pipe_tests(r: &mut TestRunner) {
+    let self_exe = r.self_exe.clone();
+    const CMD_TYPES: &[&str] = &["simple", "pipe", "multi", "noexec"];
+    const SHELLS: &[&str] = &["sh", "bash"];
+    const AGENTS: &[&str] = &["A", "AA"];
+
+    eprintln!(
+        "[special] === Capture-Pipe Fork Tests ({} × {} × {}) ===",
+        CMD_TYPES.len(),
+        SHELLS.len(),
+        AGENTS.len()
+    );
+
+    for agent in AGENTS {
+        for shell in SHELLS {
+            for cmd_type in CMD_TYPES {
+                let test_id = format!("CP.{cmd_type}.{shell}.{agent}");
+                let resp = r
+                    .send(
+                        agent,
+                        super::exec_timeout(
+                            vec![
+                                self_exe.clone(),
+                                "capture-pipe".into(),
+                                (*cmd_type).into(),
+                                (*shell).into(),
+                            ],
+                            10,
+                        ),
+                    )
+                    .await;
+                let pass = matches!(
+                    &resp,
+                    Response::ExecResult { stdout, .. } if stdout.contains("CP_OK")
+                );
+                r.record(&test_id, agent, pass, &format!("{resp:?}"));
+            }
         }
     }
 }
