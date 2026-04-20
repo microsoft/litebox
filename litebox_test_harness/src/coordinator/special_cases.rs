@@ -701,7 +701,7 @@ pub(super) async fn stdin_script_tests(r: &mut TestRunner) {
 /// Matrix: 3 cmd types × 2 shells × 2 agent depths.
 pub(super) async fn capture_pipe_tests(r: &mut TestRunner) {
     let self_exe = r.self_exe.clone();
-    const CMD_TYPES: &[&str] = &["simple", "pipe", "multi", "noexec", "nested_fork"];
+    const CMD_TYPES: &[&str] = &["simple", "pipe", "multi", "noexec", "nested_fork", "subshell_pipe", "subshell_continue"];
     const SHELLS: &[&str] = &["sh", "bash"];
     const AGENTS: &[&str] = &["A", "AA"];
 

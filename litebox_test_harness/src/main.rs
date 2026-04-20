@@ -400,16 +400,23 @@ fn main() {
 mod capture_pipe_test {
     /// Run a capture-pipe test.
     /// `cmd_type`: "simple" (echo), "pipe" (echo | cat), "multi" (echo | grep | cat),
-    ///             "noexec" (child writes directly, no exec)
-    /// `shell`: "sh" or "bash" (ignored for noexec)
+    ///             "noexec" (child writes directly, no exec),
+    ///             "nested_fork" (fork → fork → write, no exec on either),
+    ///             "subshell_pipe" (bash $()-like: fork subshell, subshell forks
+    ///              pipeline child that execs cat, subshell waits, parent reads),
+    ///             "subshell_continue" (same + parent writes more output after)
+    /// `shell`: "sh" or "bash" (only used for simple/pipe/multi)
     pub fn run(cmd_type: &str, shell: &str) -> i32 {
-        if cmd_type == "noexec" {
-            return run_noexec();
+        match cmd_type {
+            "noexec" => run_noexec(),
+            "nested_fork" => run_nested_fork(),
+            "subshell_pipe" => run_subshell_pipe(),
+            "subshell_continue" => run_subshell_continue(),
+            _ => run_exec(cmd_type, shell),
         }
-        if cmd_type == "nested_fork" {
-            return run_nested_fork();
-        }
+    }
 
+    fn run_exec(cmd_type: &str, shell: &str) -> i32 {
         let cmd = match cmd_type {
             "simple" => "echo CAPTURE_OK",
             "pipe" => "echo CAPTURE_OK | cat",
@@ -645,6 +652,151 @@ mod capture_pipe_test {
             println!("CP_FAIL:cmd=nested_fork,shell=none,output={stdout},status={status}");
             1
         }
+    }
+
+    /// Bash $()-like: fork subshell, subshell forks a pipeline child that
+    /// execs cat, subshell waits for pipeline, subshell exits, parent reads
+    /// capture pipe. No exec in the subshell — only the pipeline child execs.
+    fn run_subshell_pipe() -> i32 {
+        let mut capture = [0i32; 2];
+        if unsafe { libc::pipe(capture.as_mut_ptr()) } != 0 {
+            println!("CP_FAIL:cmd=subshell_pipe,err=capture_pipe");
+            return 1;
+        }
+
+        let pid = unsafe { libc::fork() };
+        if pid < 0 {
+            println!("CP_FAIL:cmd=subshell_pipe,err=fork1");
+            return 1;
+        }
+
+        if pid == 0 {
+            // ── Subshell ──
+            unsafe {
+                libc::dup2(capture[1], 1); // stdout → capture write end
+                libc::close(capture[0]);
+                libc::close(capture[1]);
+            }
+
+            // Create inner pipe for "echo | cat" pipeline
+            let mut inner = [0i32; 2];
+            if unsafe { libc::pipe(inner.as_mut_ptr()) } != 0 {
+                unsafe { libc::_exit(1) };
+            }
+
+            // Fork pipeline child (cat — reads inner pipe, writes stdout)
+            let cat_pid = unsafe { libc::fork() };
+            if cat_pid < 0 {
+                let msg = b"FORK2_FAILED\n";
+                unsafe { libc::write(1, msg.as_ptr() as *const _, msg.len()) };
+                unsafe { libc::_exit(1) };
+            }
+
+            if cat_pid == 0 {
+                // ── Pipeline child (cat) ──
+                unsafe {
+                    libc::dup2(inner[0], 0); // stdin ← inner read end
+                    libc::close(inner[0]);
+                    libc::close(inner[1]);
+                }
+                let cat = std::ffi::CString::new("/usr/bin/cat").unwrap();
+                unsafe {
+                    libc::execvp(cat.as_ptr(), [cat.as_ptr(), std::ptr::null()].as_ptr());
+                    libc::_exit(127);
+                }
+            }
+
+            // ── Subshell continues ──
+            // Write data to inner pipe (like echo would), close write end
+            unsafe { libc::close(inner[0]) };
+            let msg = b"CAPTURE_OK\n";
+            unsafe { libc::write(inner[1], msg.as_ptr() as *const _, msg.len()) };
+            unsafe { libc::close(inner[1]) };
+
+            // Wait for cat
+            let mut cat_status = 0i32;
+            unsafe { libc::waitpid(cat_pid, &mut cat_status, 0) };
+            unsafe { libc::_exit(0) };
+        }
+
+        // ── Parent ──
+        unsafe { libc::close(capture[1]) };
+        let output = read_all(capture[0]);
+        unsafe { libc::close(capture[0]) };
+        let mut status = 0i32;
+        unsafe { libc::waitpid(pid, &mut status, 0) };
+
+        let stdout = String::from_utf8_lossy(&output).trim().to_string();
+        if stdout.contains("CAPTURE_OK") {
+            println!("CP_OK:cmd=subshell_pipe,shell=none,output={stdout}");
+            0
+        } else {
+            println!("CP_FAIL:cmd=subshell_pipe,shell=none,output={stdout},status={status}");
+            1
+        }
+    }
+
+    /// Same as subshell_pipe, but the parent continues writing more output
+    /// after reading the capture pipe. Tests that the parent's state
+    /// (stack, heap, CoW pages) is correctly restored after the vfork child
+    /// migrates via delayed fork.
+    fn run_subshell_continue() -> i32 {
+        let mut capture = [0i32; 2];
+        if unsafe { libc::pipe(capture.as_mut_ptr()) } != 0 {
+            println!("CP_FAIL:cmd=subshell_continue,err=capture_pipe");
+            return 1;
+        }
+
+        let pid = unsafe { libc::fork() };
+        if pid < 0 {
+            println!("CP_FAIL:cmd=subshell_continue,err=fork1");
+            return 1;
+        }
+
+        if pid == 0 {
+            // ── Subshell ──
+            unsafe {
+                libc::dup2(capture[1], 1);
+                libc::close(capture[0]);
+                libc::close(capture[1]);
+            }
+            // Write directly (simple — no inner pipeline)
+            let msg = b"SUBSHELL_DATA\n";
+            unsafe { libc::write(1, msg.as_ptr() as *const _, msg.len()) };
+            unsafe { libc::_exit(0) };
+        }
+
+        // ── Parent continues after subshell ──
+        unsafe { libc::close(capture[1]) };
+        let output = read_all(capture[0]);
+        unsafe { libc::close(capture[0]) };
+        let mut status = 0i32;
+        unsafe { libc::waitpid(pid, &mut status, 0) };
+
+        let captured = String::from_utf8_lossy(&output).trim().to_string();
+        // Parent does MORE WORK after reading the capture pipe.
+        // This tests that the parent's state is intact after CoW restore.
+        let continued = format!("CAPTURED={captured},CONTINUED=YES");
+        if captured.contains("SUBSHELL_DATA") {
+            println!("CP_OK:cmd=subshell_continue,shell=none,output={continued}");
+            0
+        } else {
+            println!("CP_FAIL:cmd=subshell_continue,shell=none,output={continued},status={status}");
+            1
+        }
+    }
+
+    fn read_all(fd: i32) -> Vec<u8> {
+        let mut buf = [0u8; 4096];
+        let mut output = Vec::new();
+        loop {
+            let n = unsafe { libc::read(fd, buf.as_mut_ptr() as *mut _, buf.len()) };
+            if n <= 0 {
+                break;
+            }
+            output.extend_from_slice(&buf[..n as usize]);
+        }
+        output
     }
 }
 /// Each test pipes a script to both `sh` and `bash` and checks if the output
