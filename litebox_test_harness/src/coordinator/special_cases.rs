@@ -665,26 +665,37 @@ pub(super) async fn stdin_script_tests(r: &mut TestRunner) {
             )
             .await;
 
-        // Parse individual results from stdout
+        // Parse individual results from stdout.
+        // Format: STDIN_OK:name=pipe_in_subst,shell=sh
+        // or:     STDIN_FAIL:name=pipe_in_subst,shell=bash,MISSING...
         if let Response::ExecResult {
             exit_code, stdout, ..
         } = &resp
         {
             for line in stdout.lines() {
-                if let Some(name) = line.strip_prefix("STDIN_OK:name=") {
-                    let name = name.split(',').next().unwrap_or(name);
+                let (prefix, pass) = if line.starts_with("STDIN_OK:") {
+                    ("STDIN_OK:", true)
+                } else if line.starts_with("STDIN_FAIL:") {
+                    ("STDIN_FAIL:", false)
+                } else {
+                    continue;
+                };
+                let rest = &line[prefix.len()..];
+                // Parse name=X,shell=Y
+                let mut name = "";
+                let mut shell = "";
+                for kv in rest.split(',') {
+                    if let Some(v) = kv.strip_prefix("name=") {
+                        name = v;
+                    } else if let Some(v) = kv.strip_prefix("shell=") {
+                        shell = v;
+                    }
+                }
+                if !name.is_empty() && !shell.is_empty() {
                     r.record(
-                        &format!("SS.{name}.{agent}"),
+                        &format!("SS.{name}.{shell}.{agent}"),
                         agent,
-                        true,
-                        line,
-                    );
-                } else if let Some(rest) = line.strip_prefix("STDIN_FAIL:name=") {
-                    let name = rest.split(',').next().unwrap_or(rest);
-                    r.record(
-                        &format!("SS.{name}.{agent}"),
-                        agent,
-                        false,
+                        pass,
                         line,
                     );
                 }
