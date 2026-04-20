@@ -1583,6 +1583,11 @@ fn fork_restore_and_ack<FS: litebox_shim_linux::ShimFS>(
                         (sender, receiver)
                     };
 
+                    // Set NON_BLOCKING on the relay end only so the mux
+                    // dispatcher thread can write/read without blocking
+                    // in pollee.wait (GS-based TLS not available on bg threads).
+                    let _ = pipes.update_flags(&relay_pipe_fd, litebox::pipes::Flags::NON_BLOCKING, true);
+
                     // Dup guest pipe before install (install consumes it).
                     let guest_dup = litebox_ref.descriptor_table_mut().duplicate(&guest_pipe_fd);
                     program
@@ -1610,7 +1615,44 @@ fn fork_restore_and_ack<FS: litebox_shim_linux::ShimFS>(
                     let _ = pipes.close(&fd);
                 }
 
-                // Pre-flight check: verify relay endpoints are alive.
+                // Pre-flight check + background thread write test.
+                {
+                    // Create a fresh test pipe and try writing from a background thread
+                    let (test_sender, test_receiver) = pipes.create_pipe(
+                        4096,
+                        litebox::pipes::Flags::NON_BLOCKING,
+                        core::num::NonZero::new(64),
+                    );
+                    let test_pipes = pipes.clone();
+                    let test_platform = platform;
+                    let test_sender_arc: std::sync::Arc<litebox::fd::TypedFd<litebox::pipes::Pipes<Platform>>> = test_sender.into();
+                    let test_sender_for_bg = test_sender_arc.clone();
+                    let bg_handle = litebox_platform_linux_userland::spawn_host_thread(move || {
+                        let ws = litebox::event::wait::WaitState::new(test_platform);
+                        let cx = ws.context();
+                        let r = test_pipes.write(&cx, &test_sender_for_bg, b"BG_TEST");
+                        use std::io::Write as _;
+                        if let Ok(mut f) = std::fs::OpenOptions::new()
+                            .create(true).append(true)
+                            .open("/tmp/litebox_bg_write_test.txt") {
+                            let _ = writeln!(f, "bg_write result: {:?}", r);
+                            let _ = f.flush();
+                        }
+                    });
+                    let _ = bg_handle.join();
+                    let drain_result = pipes.drain_available(&test_receiver);
+                    let _ = pipes.close(&test_sender_arc);
+                    let _ = pipes.close(&test_receiver);
+                    {
+                        use std::io::Write;
+                        if let Ok(mut f) = std::fs::OpenOptions::new()
+                            .create(true).append(true)
+                            .open("/tmp/litebox_bg_write_test.txt") {
+                            let _ = writeln!(f, "drain_result: {:?}", drain_result);
+                            let _ = f.flush();
+                        }
+                    }
+                }
                 #[cfg(feature = "trace_syscalls")]
                 for (sid, dir, relay_fd) in &relay_endpoints {
                     let eof = pipes.is_read_eof(relay_fd);
@@ -1679,6 +1721,19 @@ fn spawn_worker_mux_dispatcher(
     const MUX_MAX_PAYLOAD: usize = 61440;
 
     litebox_platform_linux_userland::spawn_host_thread(move || {
+        // NOTE: Do NOT use WaitState / WaitContext / pollee.wait on
+        // background threads — the update_waker function uses GS-based
+        // TLS which isn't initialized for non-guest threads.  Use
+        // non-blocking pipe writes with spin-sleep retries instead.
+
+        // Set all relay pipe fds to non-blocking so pipes.write
+        // returns WouldBlock instead of blocking in pollee.wait.
+        for (_, _, relay_fd) in &relay_endpoints {
+            let _ = pipes.update_flags(relay_fd, litebox::pipes::Flags::NON_BLOCKING, true);
+        }
+
+        // Create a WaitContext for drain_available (read-side, doesn't
+        // need pollee.wait for non-blocking pipes).
         let wait_state = litebox::event::wait::WaitState::new(platform);
         let cx = wait_state.context();
 
@@ -1745,18 +1800,30 @@ fn spawn_worker_mux_dispatcher(
                                 if *sid == msg.stream_id && !closed_endpoints[idx] {
                                     let mut offset = 0;
                                     while offset < msg.data.len() {
-                                        if let Ok(w) =
-                                            pipes.write(&cx, relay_fd, &msg.data[offset..])
-                                        {
-                                            offset += w;
-                                        } else {
-                                            // Local reader gone — close endpoint
-                                            // and notify peer.
-                                            let _ = pipes.close(relay_fd);
-                                            closed_endpoints[idx] = true;
-                                            let rst = MuxMessage::reset(*sid);
-                                            send_control(mux_fd, &rst);
-                                            break;
+                                        // Non-blocking write with spin-sleep
+                                        // retry.  We can't use pollee.wait
+                                        // because update_waker uses GS-based
+                                        // TLS which isn't available on
+                                        // background threads.
+                                        match pipes.write(&cx, relay_fd, &msg.data[offset..]) {
+                                            Ok(w) => {
+                                                offset += w;
+                                            }
+                                            Err(litebox::pipes::errors::WriteError::WouldBlock) => {
+                                                // Pipe full — sleep briefly and retry.
+                                                std::thread::sleep(
+                                                    std::time::Duration::from_micros(100),
+                                                );
+                                            }
+                                            Err(_) => {
+                                                // Local reader gone — close endpoint
+                                                // and notify peer.
+                                                let _ = pipes.close(relay_fd);
+                                                closed_endpoints[idx] = true;
+                                                let rst = MuxMessage::reset(*sid);
+                                                send_control(mux_fd, &rst);
+                                                break;
+                                            }
                                         }
                                     }
                                 }
