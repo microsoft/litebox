@@ -1399,13 +1399,6 @@ fn fork_restore_and_ack<FS: litebox_shim_linux::ShimFS>(
                     // and install only the receiver at read_fd.  The guest
                     // reads the data and then gets EOF.
                     if write_fd == usize::MAX {
-                        {
-                            use std::io::Write;
-                            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true)
-                                .open("/tmp/litebox_local_pipe_diag.txt") {
-                                let _ = writeln!(f, "orphan local pipe: read_fd={} drained={}", read_fd, drained.len());
-                            }
-                        }
                         let (sender, receiver) = pipes_sub.create_pipe(
                             1024 * 1024,
                             litebox::pipes::Flags::empty(),
@@ -1416,27 +1409,11 @@ fn fork_restore_and_ack<FS: litebox_shim_linux::ShimFS>(
                                 litebox_platform_multiplex::platform(),
                             );
                             let cx = wait_state.context();
-                            {
-                                use std::io::Write;
-                                if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true)
-                                    .open("/tmp/litebox_local_pipe_diag.txt") {
-                                    let _ = writeln!(f, "about to write {} bytes to local pipe", drained.len());
-                                    let _ = f.flush();
-                                }
-                            }
                             let mut offset = 0;
                             while offset < drained.len() {
                                 match pipes_sub.write(&cx, &sender, &drained[offset..]) {
                                     Ok(n) => offset += n,
                                     Err(_) => break,
-                                }
-                            }
-                            {
-                                use std::io::Write;
-                                if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true)
-                                    .open("/tmp/litebox_local_pipe_diag.txt") {
-                                    let _ = writeln!(f, "write complete, offset={}", offset);
-                                    let _ = f.flush();
                                 }
                             }
                         }
@@ -1569,7 +1546,7 @@ fn fork_restore_and_ack<FS: litebox_shim_linux::ShimFS>(
 
                     let (sender, receiver) = pipes.create_pipe(
                         1024 * 1024,
-                        litebox::pipes::Flags::empty(),
+                        litebox::pipes::Flags::NON_BLOCKING,
                         core::num::NonZero::new(4096),
                     );
 
@@ -1583,10 +1560,11 @@ fn fork_restore_and_ack<FS: litebox_shim_linux::ShimFS>(
                         (sender, receiver)
                     };
 
-                    // Set NON_BLOCKING on the relay end only so the mux
-                    // dispatcher thread can write/read without blocking
-                    // in pollee.wait (GS-based TLS not available on bg threads).
-                    let _ = pipes.update_flags(&relay_pipe_fd, litebox::pipes::Flags::NON_BLOCKING, true);
+                    // Clear NON_BLOCKING on the guest end so guest
+                    // reads/writes block normally.  The relay end stays
+                    // non-blocking for the mux dispatcher thread (which
+                    // can't use pollee.wait due to GS-based TLS).
+                    let _ = pipes.update_flags(&guest_pipe_fd, litebox::pipes::Flags::NON_BLOCKING, false);
 
                     // Dup guest pipe before install (install consumes it).
                     let guest_dup = litebox_ref.descriptor_table_mut().duplicate(&guest_pipe_fd);
@@ -1615,44 +1593,6 @@ fn fork_restore_and_ack<FS: litebox_shim_linux::ShimFS>(
                     let _ = pipes.close(&fd);
                 }
 
-                // Pre-flight check + background thread write test.
-                {
-                    // Create a fresh test pipe and try writing from a background thread
-                    let (test_sender, test_receiver) = pipes.create_pipe(
-                        4096,
-                        litebox::pipes::Flags::NON_BLOCKING,
-                        core::num::NonZero::new(64),
-                    );
-                    let test_pipes = pipes.clone();
-                    let test_platform = platform;
-                    let test_sender_arc: std::sync::Arc<litebox::fd::TypedFd<litebox::pipes::Pipes<Platform>>> = test_sender.into();
-                    let test_sender_for_bg = test_sender_arc.clone();
-                    let bg_handle = litebox_platform_linux_userland::spawn_host_thread(move || {
-                        let ws = litebox::event::wait::WaitState::new(test_platform);
-                        let cx = ws.context();
-                        let r = test_pipes.write(&cx, &test_sender_for_bg, b"BG_TEST");
-                        use std::io::Write as _;
-                        if let Ok(mut f) = std::fs::OpenOptions::new()
-                            .create(true).append(true)
-                            .open("/tmp/litebox_bg_write_test.txt") {
-                            let _ = writeln!(f, "bg_write result: {:?}", r);
-                            let _ = f.flush();
-                        }
-                    });
-                    let _ = bg_handle.join();
-                    let drain_result = pipes.drain_available(&test_receiver);
-                    let _ = pipes.close(&test_sender_arc);
-                    let _ = pipes.close(&test_receiver);
-                    {
-                        use std::io::Write;
-                        if let Ok(mut f) = std::fs::OpenOptions::new()
-                            .create(true).append(true)
-                            .open("/tmp/litebox_bg_write_test.txt") {
-                            let _ = writeln!(f, "drain_result: {:?}", drain_result);
-                            let _ = f.flush();
-                        }
-                    }
-                }
                 #[cfg(feature = "trace_syscalls")]
                 for (sid, dir, relay_fd) in &relay_endpoints {
                     let eof = pipes.is_read_eof(relay_fd);
@@ -1723,14 +1663,9 @@ fn spawn_worker_mux_dispatcher(
     litebox_platform_linux_userland::spawn_host_thread(move || {
         // NOTE: Do NOT use WaitState / WaitContext / pollee.wait on
         // background threads — the update_waker function uses GS-based
-        // TLS which isn't initialized for non-guest threads.  Use
-        // non-blocking pipe writes with spin-sleep retries instead.
-
-        // Set all relay pipe fds to non-blocking so pipes.write
-        // returns WouldBlock instead of blocking in pollee.wait.
-        for (_, _, relay_fd) in &relay_endpoints {
-            let _ = pipes.update_flags(relay_fd, litebox::pipes::Flags::NON_BLOCKING, true);
-        }
+        // TLS which isn't initialized for non-guest threads.  Relay
+        // pipes are created with NON_BLOCKING so pipes.write returns
+        // WouldBlock instead of blocking in pollee.wait.
 
         // Create a WaitContext for drain_available (read-side, doesn't
         // need pollee.wait for non-blocking pipes).
@@ -1762,9 +1697,27 @@ fn spawn_worker_mux_dispatcher(
             let mut did_work = false;
 
             // 1. Check socketpair for incoming messages (ParentToWorker data).
+            {
+                use std::io::Write;
+                if let Ok(mut f) = std::fs::OpenOptions::new()
+                    .create(true).append(true)
+                    .open("/tmp/litebox_worker_mux_loop.txt") {
+                    let _ = writeln!(f, "about to read mux_fd={}", mux_fd);
+                    let _ = f.flush();
+                }
+            }
             match platform.read_host_fd(mux_fd, &mut recv_buf) {
                 Ok(0) => {
                     // Socketpair closed — parent exited. Close all relay fds.
+                    {
+                        use std::io::Write;
+                        if let Ok(mut f) = std::fs::OpenOptions::new()
+                            .create(true).append(true)
+                            .open("/tmp/litebox_worker_mux_loop.txt") {
+                            let _ = writeln!(f, "SOCKETPAIR CLOSED (Ok(0))");
+                            let _ = f.flush();
+                        }
+                    }
                     #[cfg(feature = "trace_syscalls")]
                     eprintln!(
                         "[WORKER-MUX] socketpair closed (parent gone), {} open endpoints",
@@ -1781,6 +1734,16 @@ fn spawn_worker_mux_dispatcher(
                     if let Some(msg) = MuxMessage::deserialize(&recv_buf[..n])
                         && msg.msg_type == MSG_TYPE_DATA
                     {
+                        // Log ping from parent dispatcher
+                        if msg.stream_id == 99 {
+                            use std::io::Write;
+                            if let Ok(mut f) = std::fs::OpenOptions::new()
+                                .create(true).append(true)
+                                .open("/tmp/litebox_mux_ping.txt") {
+                                let _ = writeln!(f, "worker received ping from parent dispatcher!");
+                                let _ = f.flush();
+                            }
+                        }
                         #[cfg(feature = "trace_syscalls")]
                         eprintln!(
                             "[WORKER-MUX] recv stream={} flags={:#x} len={}",
@@ -1832,7 +1795,16 @@ fn spawn_worker_mux_dispatcher(
                     }
                 }
                 Err(litebox_common_linux::errno::Errno::EAGAIN) => {}
-                Err(_) => {
+                Err(e) => {
+                    {
+                        use std::io::Write;
+                        if let Ok(mut f) = std::fs::OpenOptions::new()
+                            .create(true).append(true)
+                            .open("/tmp/litebox_worker_mux_loop.txt") {
+                            let _ = writeln!(f, "SOCKETPAIR ERROR: {:?}", e);
+                            let _ = f.flush();
+                        }
+                    }
                     for (_, _, relay_fd) in &relay_endpoints {
                         let _ = pipes.close(relay_fd);
                     }
@@ -1842,6 +1814,26 @@ fn spawn_worker_mux_dispatcher(
             }
 
             // 2. Check WorkerToParent streams for data to send.
+            static LOOP_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let lc = LOOP_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            {
+                use std::io::Write;
+                if let Ok(mut f) = std::fs::OpenOptions::new()
+                    .create(true).append(true)
+                    .open("/tmp/litebox_worker_mux_loop.txt") {
+                    let _ = writeln!(f, "loop iter={} did_work={} open={}",
+                        lc, did_work,
+                        closed_endpoints.iter().filter(|&&c| !c).count());
+                    // Log per-endpoint status
+                    for (idx, (sid, dir, relay_fd)) in relay_endpoints.iter().enumerate() {
+                        let eof = pipes.is_read_eof(relay_fd);
+                        let half = pipes.half_pipe_type(relay_fd);
+                        let _ = writeln!(f, "  ep[{}] stream={} dir={} closed={} eof={} half={:?}",
+                            idx, sid, *dir as char, closed_endpoints[idx], eof, half);
+                    }
+                    let _ = f.flush();
+                }
+            }
             for (idx, (stream_id, direction, relay_fd)) in relay_endpoints.iter().enumerate() {
                 if *direction != b'w' || closed_endpoints[idx] {
                     continue;

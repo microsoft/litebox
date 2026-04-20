@@ -2117,7 +2117,26 @@ impl LinuxUserland {
     where
         F: FnOnce() + Send + 'static,
     {
-        let handle = spawn_host_thread(f);
+        let handle = spawn_host_thread(move || {
+            // Catch panics from the task closure so we can log them.
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+            if let Err(e) = result {
+                use std::io::Write;
+                if let Ok(mut file) = std::fs::OpenOptions::new()
+                    .create(true).append(true)
+                    .open("/tmp/litebox_bg_panic.txt") {
+                    let msg = if let Some(s) = e.downcast_ref::<&str>() {
+                        format!("background task PANICKED: {s}\n")
+                    } else if let Some(s) = e.downcast_ref::<String>() {
+                        format!("background task PANICKED: {s}\n")
+                    } else {
+                        "background task PANICKED: (unknown payload)\n".to_string()
+                    };
+                    let _ = file.write_all(msg.as_bytes());
+                    let _ = file.flush();
+                }
+            }
+        });
         self.background_handles.lock().unwrap().push(handle);
     }
 

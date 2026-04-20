@@ -3798,14 +3798,8 @@ impl<FS: ShimFS> Task<FS> {
                         // Set socketpair to non-blocking for the poll loop.
                         let _ = platform.set_host_fd_nonblock(mux_fd);
 
-                        // Set all dispatch pipe endpoints to non-blocking.
-                        // The dispatcher runs on a background thread where
-                        // pollee.wait (used by blocking pipes.write/read)
-                        // hangs because update_waker uses GS-based TLS
-                        // which isn't initialized for non-guest threads.
-                        for (_, _, relay_fd, _) in &dispatch_endpoints {
-                            let _ = pipes.update_flags(relay_fd, litebox::pipes::Flags::NON_BLOCKING, true);
-                        }
+                        // Dispatch pipe endpoints are already NON_BLOCKING
+                        // (created that way above, guest end cleared).
 
                         let mut recv_buf = alloc::vec![0u8; MUX_MAX_PAYLOAD + HEADER_SIZE];
                         let mut closed_endpoints: Vec<bool> =
