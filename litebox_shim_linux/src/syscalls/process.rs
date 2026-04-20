@@ -3002,24 +3002,35 @@ impl<FS: ShimFS> Task<FS> {
 
                 let mux_streams: Vec<crate::MuxParentStream> =
                     vd.mux_parent_streams.lock().drain(..).collect();
-                let mut orphan_streams: Vec<u32> = vd.mux_orphan_streams.lock().drain(..).collect();
+                let mut orphan_streams: Vec<(u32, Vec<u8>)> = vd.mux_orphan_streams.lock().drain(..).collect();
 
                 if mux_streams.is_empty() && !orphan_streams.is_empty() {
                     // All streams are orphans — no parent endpoints needed.
-                    // Send RESETs and close the socketpair so the worker
-                    // doesn't hang.
+                    // Send drained DATA + RESETs and close the socketpair so
+                    // the worker doesn't hang.
                     let platform = self.global.platform;
                     let mux_fd = parent_mux_raw;
                     self.global.platform.spawn_background_task(move || {
                         use crate::multiplexer::MuxMessage;
-                        for &sid in &orphan_streams {
+                        const MUX_MAX_PAYLOAD: usize = 61440;
+                        for (sid, drained) in &orphan_streams {
+                            // Send drained data before RESET so the worker
+                            // receives buffered bytes before EOF.
+                            if !drained.is_empty() {
+                                for chunk in drained.chunks(MUX_MAX_PAYLOAD) {
+                                    let msg = MuxMessage::data(*sid, chunk.to_vec());
+                                    let buf = msg.serialize();
+                                    let _ = platform.write_host_fd(mux_fd, &buf);
+                                }
+                            }
                             #[cfg(feature = "trace_syscalls")]
                             litebox::log_println!(
                                 platform,
-                                "[PARENT-MUX] sending RESET for orphan stream={} (no dispatcher)",
+                                "[PARENT-MUX] sending RESET for orphan stream={} (no dispatcher, drained={})",
                                 sid,
+                                drained.len(),
                             );
-                            let msg = MuxMessage::reset(sid);
+                            let msg = MuxMessage::reset(*sid);
                             let buf = msg.serialize();
                             let _ = platform.write_host_fd(mux_fd, &buf);
                         }
@@ -3198,11 +3209,11 @@ impl<FS: ShimFS> Task<FS> {
                                         ms.drained_data,
                                     ));
                                 } else {
-                                    orphan_streams.push(ms.stream_id);
+                                    orphan_streams.push((ms.stream_id, Vec::new()));
                                 }
                             } else {
                                 drop(rds);
-                                orphan_streams.push(ms.stream_id);
+                                orphan_streams.push((ms.stream_id, Vec::new()));
                             }
                             continue;
                         }
@@ -3703,18 +3714,34 @@ impl<FS: ShimFS> Task<FS> {
                             }
                         }
 
-                        // Send RESET for orphan streams (no parent counterpart)
-                        // so the worker closes them immediately instead of
-                        // polling forever.  Self-pipe streams are excluded
-                        // from orphans (handled separately below).
-                        for &sid in &orphan_streams {
+                        // Send drained data + RESET for orphan streams (no
+                        // parent counterpart).  For orphan read-end pipes, the
+                        // child-only pipe may have data buffered from before
+                        // migration (e.g. grandchild wrote, then closed).  Send
+                        // the drained bytes as DATA before RESET so the worker
+                        // delivers them to the guest before signaling EOF.
+                        for (sid, drained) in &orphan_streams {
+                            if !drained.is_empty() {
+                                for chunk in drained.chunks(MUX_MAX_PAYLOAD) {
+                                    let msg = MuxMessage::data(*sid, chunk.to_vec());
+                                    let buf = msg.serialize();
+                                    let _ = platform.write_host_fd(mux_fd, &buf);
+                                }
+                                #[cfg(feature = "trace_syscalls")]
+                                litebox::log_println!(
+                                    platform,
+                                    "[PARENT-MUX] sent {} drained bytes for orphan stream={}",
+                                    drained.len(),
+                                    sid,
+                                );
+                            }
                             #[cfg(feature = "trace_syscalls")]
                             litebox::log_println!(
                                 platform,
                                 "[PARENT-MUX] sending RESET for orphan stream={}",
                                 sid,
                             );
-                            let msg = MuxMessage::reset(sid);
+                            let msg = MuxMessage::reset(*sid);
                             let buf = msg.serialize();
                             let _ = platform.write_host_fd(mux_fd, &buf);
                         }
@@ -5361,7 +5388,7 @@ impl<FS: ShimFS> Task<FS> {
                 mux_worker_fd_raw = mux_worker_raw;
 
                 let mut mux_parent_streams: Vec<crate::MuxParentStream> = Vec::new();
-                let mut orphan_stream_ids: Vec<u32> = Vec::new();
+                let mut orphan_stream_ids: Vec<(u32, Vec<u8>)> = Vec::new();
 
                 for (i, &(guest_fd, child_os_fd, direction)) in
                     child_pipe_bridges.iter().enumerate()
@@ -5541,9 +5568,9 @@ impl<FS: ShimFS> Task<FS> {
                                 // No parent counterpart — stream has no parent
                                 // relay (broken pipe / already closed).  Still
                                 // include in mux_stream_specs so the worker sets
-                                // up the guest fd.  Send RESET at dispatcher
-                                // startup so the worker closes it immediately.
-                                orphan_stream_ids.push(stream_id);
+                                // up the guest fd.  Carry any drained data so the
+                                // parent dispatcher can send DATA before RESET.
+                                orphan_stream_ids.push((stream_id, drained));
                             }
                         } else {
                             for (j, &(parent_fd, parent_dir, subsystem)) in

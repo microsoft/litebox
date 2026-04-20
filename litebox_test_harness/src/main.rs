@@ -410,6 +410,7 @@ mod capture_pipe_test {
         match cmd_type {
             "noexec" => run_noexec(),
             "nested_fork" => run_nested_fork(),
+            "nested_fork_nowait" => run_nested_fork_nowait(),
             "subshell_pipe" => run_subshell_pipe(),
             "subshell_continue" => run_subshell_continue(),
             _ => run_exec(cmd_type, shell),
@@ -650,6 +651,100 @@ mod capture_pipe_test {
             1
         } else {
             println!("CP_FAIL:cmd=nested_fork,shell=none,output={stdout},status={status}");
+            1
+        }
+    }
+
+    /// Like nested_fork but skips waitpid on the grandchild.
+    /// This isolates the pipe-data-relay issue from the waitpid-across-
+    /// migration issue.
+    fn run_nested_fork_nowait() -> i32 {
+        let mut capture = [0i32; 2];
+        if unsafe { libc::pipe(capture.as_mut_ptr()) } != 0 {
+            println!("CP_FAIL:cmd=nested_fork_nowait,err=capture_pipe");
+            return 1;
+        }
+
+        let pid = unsafe { libc::fork() };
+        if pid < 0 {
+            println!("CP_FAIL:cmd=nested_fork_nowait,err=fork1");
+            return 1;
+        }
+
+        if pid == 0 {
+            // ── Child (subshell) ──
+            unsafe {
+                libc::dup2(capture[1], 1);
+                libc::close(capture[0]);
+                libc::close(capture[1]);
+            }
+
+            let mut inner = [0i32; 2];
+            if unsafe { libc::pipe(inner.as_mut_ptr()) } != 0 {
+                unsafe { libc::_exit(1) };
+            }
+
+            let gc = unsafe { libc::fork() };
+            if gc < 0 {
+                let msg = b"FORK2_FAILED\n";
+                unsafe { libc::write(1, msg.as_ptr() as *const _, msg.len()) };
+                unsafe { libc::_exit(1) };
+            }
+
+            if gc == 0 {
+                // ── Grandchild ──
+                unsafe { libc::close(inner[0]) };
+                let msg = b"CAPTURE_OK\n";
+                unsafe { libc::write(inner[1], msg.as_ptr() as *const _, msg.len()) };
+                unsafe { libc::close(inner[1]) };
+                unsafe { libc::_exit(0) };
+            }
+
+            // ── Child continues ──
+            unsafe { libc::close(inner[1]) };
+            let mut buf = [0u8; 4096];
+            loop {
+                let n =
+                    unsafe { libc::read(inner[0], buf.as_mut_ptr() as *mut _, buf.len()) };
+                if n <= 0 {
+                    break;
+                }
+                unsafe { libc::write(1, buf.as_ptr() as *const _, n as usize) };
+            }
+            unsafe { libc::close(inner[0]) };
+
+            // Skip waitpid — exit immediately to test pipe relay
+            // without depending on cross-migration waitpid.
+            unsafe { libc::_exit(0) };
+        }
+
+        // ── Parent ──
+        unsafe { libc::close(capture[1]) };
+
+        let mut buf = [0u8; 4096];
+        let mut output = Vec::new();
+        loop {
+            let n =
+                unsafe { libc::read(capture[0], buf.as_mut_ptr() as *mut _, buf.len()) };
+            if n <= 0 {
+                break;
+            }
+            output.extend_from_slice(&buf[..n as usize]);
+        }
+        unsafe { libc::close(capture[0]) };
+
+        let mut status = 0i32;
+        unsafe { libc::waitpid(pid, &mut status, 0) };
+
+        let stdout = String::from_utf8_lossy(&output).trim().to_string();
+        if stdout.contains("CAPTURE_OK") {
+            println!("CP_OK:cmd=nested_fork_nowait,shell=none,output={stdout}");
+            0
+        } else if stdout.contains("FORK2_FAILED") {
+            println!("CP_FAIL:cmd=nested_fork_nowait,shell=none,err=second_fork_failed");
+            1
+        } else {
+            println!("CP_FAIL:cmd=nested_fork_nowait,shell=none,output={stdout},status={status}");
             1
         }
     }

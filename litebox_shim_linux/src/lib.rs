@@ -3509,7 +3509,10 @@ struct VforkDone {
     mux_parent_streams: litebox::sync::Mutex<Platform, Vec<MuxParentStream>>,
     /// Stream IDs with no parent counterpart (broken pipe).
     /// The parent dispatcher sends RESET for these at startup.
-    mux_orphan_streams: litebox::sync::Mutex<Platform, Vec<u32>>,
+    /// Each entry is (stream_id, drained_data): for orphan read-end pipes
+    /// where data was buffered before migration, the drained bytes are
+    /// sent as DATA messages before the RESET so the worker doesn't lose them.
+    mux_orphan_streams: litebox::sync::Mutex<Platform, Vec<(u32, Vec<u8>)>>,
 }
 
 impl VforkDone {
