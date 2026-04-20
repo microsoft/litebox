@@ -449,7 +449,7 @@ unsafe extern "C" fn kernel_main(is_bsp: bool) -> ! {
         #[cfg(debug_assertions)]
         log::set_max_level(log::LevelFilter::Debug);
         #[cfg(not(debug_assertions))]
-        log::set_max_level(log::LevelFilter::Info);
+        log::set_max_level(log::LevelFilter::Warn);
 
         serial_println!("==============================");
         serial_println!(" Hello from LiteBox for LVBS! ");
