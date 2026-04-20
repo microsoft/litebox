@@ -406,6 +406,9 @@ mod capture_pipe_test {
         if cmd_type == "noexec" {
             return run_noexec();
         }
+        if cmd_type == "nested_fork" {
+            return run_nested_fork();
+        }
 
         let cmd = match cmd_type {
             "simple" => "echo CAPTURE_OK",
@@ -533,6 +536,113 @@ mod capture_pipe_test {
             0
         } else {
             println!("CP_FAIL:cmd=noexec,shell=none,output={stdout},status={status}");
+            1
+        }
+    }
+
+    /// Nested fork: parent forks child (subshell), child forks grandchild
+    /// (pipeline), grandchild writes to a pipe, child reads and forwards
+    /// to parent's capture pipe. This is exactly what bash does for
+    /// `A=$(echo hello | cat)`:
+    ///   parent: pipe() → fork()
+    ///   child (subshell): dup2(write,1) → pipe() → fork()
+    ///     grandchild: dup2(pipe_write,1) → write("CAPTURE_OK") → exit
+    ///   child: read(pipe_read) → write(stdout=capture) → exit
+    ///   parent: read(capture_read)
+    fn run_nested_fork() -> i32 {
+        // Capture pipe: parent reads, child writes
+        let mut capture = [0i32; 2];
+        if unsafe { libc::pipe(capture.as_mut_ptr()) } != 0 {
+            println!("CP_FAIL:cmd=nested_fork,err=capture_pipe");
+            return 1;
+        }
+
+        let pid = unsafe { libc::fork() };
+        if pid < 0 {
+            println!("CP_FAIL:cmd=nested_fork,err=fork1");
+            return 1;
+        }
+
+        if pid == 0 {
+            // ── Child (subshell) ──
+            // Redirect stdout to capture pipe
+            unsafe {
+                libc::dup2(capture[1], 1);
+                libc::close(capture[0]);
+                libc::close(capture[1]);
+            }
+
+            // Create inner pipe for "pipeline"
+            let mut inner = [0i32; 2];
+            if unsafe { libc::pipe(inner.as_mut_ptr()) } != 0 {
+                unsafe { libc::_exit(1) };
+            }
+
+            // Fork grandchild (pipeline producer)
+            let gc = unsafe { libc::fork() };
+            if gc < 0 {
+                // Fork failed — write error and exit
+                let msg = b"FORK2_FAILED\n";
+                unsafe { libc::write(1, msg.as_ptr() as *const _, msg.len()) };
+                unsafe { libc::_exit(1) };
+            }
+
+            if gc == 0 {
+                // ── Grandchild ──
+                // Write to inner pipe, exit
+                unsafe { libc::close(inner[0]) };
+                let msg = b"CAPTURE_OK\n";
+                unsafe { libc::write(inner[1], msg.as_ptr() as *const _, msg.len()) };
+                unsafe { libc::close(inner[1]) };
+                unsafe { libc::_exit(0) };
+            }
+
+            // ── Child continues ──
+            // Read from inner pipe, write to stdout (= capture pipe)
+            unsafe { libc::close(inner[1]) };
+            let mut buf = [0u8; 4096];
+            loop {
+                let n = unsafe { libc::read(inner[0], buf.as_mut_ptr() as *mut _, buf.len()) };
+                if n <= 0 {
+                    break;
+                }
+                unsafe { libc::write(1, buf.as_ptr() as *const _, n as usize) };
+            }
+            unsafe { libc::close(inner[0]) };
+
+            // Wait for grandchild
+            let mut gc_status = 0i32;
+            unsafe { libc::waitpid(gc, &mut gc_status, 0) };
+            unsafe { libc::_exit(0) };
+        }
+
+        // ── Parent ──
+        unsafe { libc::close(capture[1]) };
+
+        let mut buf = [0u8; 4096];
+        let mut output = Vec::new();
+        loop {
+            let n =
+                unsafe { libc::read(capture[0], buf.as_mut_ptr() as *mut _, buf.len()) };
+            if n <= 0 {
+                break;
+            }
+            output.extend_from_slice(&buf[..n as usize]);
+        }
+        unsafe { libc::close(capture[0]) };
+
+        let mut status = 0i32;
+        unsafe { libc::waitpid(pid, &mut status, 0) };
+
+        let stdout = String::from_utf8_lossy(&output).trim().to_string();
+        if stdout.contains("CAPTURE_OK") {
+            println!("CP_OK:cmd=nested_fork,shell=none,output={stdout}");
+            0
+        } else if stdout.contains("FORK2_FAILED") {
+            println!("CP_FAIL:cmd=nested_fork,shell=none,err=second_fork_failed");
+            1
+        } else {
+            println!("CP_FAIL:cmd=nested_fork,shell=none,output={stdout},status={status}");
             1
         }
     }
