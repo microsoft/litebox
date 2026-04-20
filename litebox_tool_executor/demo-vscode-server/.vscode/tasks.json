@@ -38,20 +38,8 @@
         },
         {
             "label": "LiteBox: Start VS Code Server",
-            "type": "process",
-            "command": "docker",
-            "args": [
-                "run", "--rm", "--name", "litebox-vscode",
-                "-p", "2222:22",
-                "--cap-add", "SYS_PTRACE",
-                "-v", "C:\\src\\litebox-vscode-server\\target\\debug:/opt/litebox:ro",
-                "litebox-rootfs",
-                "/opt/litebox/litebox_tool_executor",
-                "--rootfs", "/",
-                "--vscode-server",
-                "--ssh-port", "22",
-                "--record-baseline"
-            ],
+            "type": "shell",
+            "command": "docker rm -f litebox-vscode 2>$null; docker run --rm --name litebox-vscode -p 2222:22 --cap-add SYS_PTRACE -v C:\\src\\litebox-vscode-server\\target\\debug:/opt/litebox:ro litebox-rootfs /opt/litebox/litebox_tool_executor --rootfs / --vscode-server --ssh-port 22 --record-baseline",
             "problemMatcher": [],
             "isBackground": true,
             "runOptions": {
