@@ -99,6 +99,22 @@ pub enum Command {
     #[serde(rename = "kill")]
     Kill { pid: u32 },
 
+    /// Create a pipe, write data, poll read-end for POLLIN readiness.
+    /// Tests that file descriptors correctly report IN events in poll/epoll.
+    #[serde(rename = "poll_ready")]
+    PollReady { timeout_ms: u32 },
+
+    /// Bind a TCP socket to ANY:0, call getsockname, report the assigned port.
+    /// Tests that getsockname returns a nonzero port for bound sockets.
+    #[serde(rename = "bind_getsockname")]
+    BindGetsockname { family: String },
+
+    /// Create+drop `count` pipe pairs, then create `count` more and check
+    /// that no pair_id from the second batch collides with the first.
+    /// Tests monotonic pair_id generation (vs. Arc pointer reuse).
+    #[serde(rename = "pipe_pair_id_unique")]
+    PipePairIdUnique { count: u32 },
+
     /// Proceed (used after coordination points).
     #[serde(rename = "go")]
     Go,

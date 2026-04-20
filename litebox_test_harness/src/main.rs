@@ -11,6 +11,8 @@ mod agent;
 mod coordinator;
 mod protocol;
 
+use std::io::Write as _;
+
 /// Find the non-PIE test harness binary. Checks (in order):
 /// 1. `/litebox-test-harness-nonpie` (litebox rootfs)
 /// 2. Sibling of current exe with `_nonpie` suffix
@@ -90,6 +92,26 @@ fn main() {
         "echo-test" => {
             println!("ECHO_TEST_OK");
         }
+        "write-then-exit" => {
+            // Write exactly `size` bytes of known pattern to stdout, then exit.
+            // Used to test bridge thread join — without it, large writes truncate.
+            let size: usize = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(256);
+            let pattern = b"ABCDEFGHIJKLMNOP"; // 16-byte repeating pattern
+            let mut remaining = size;
+            while remaining > 0 {
+                let chunk = remaining.min(pattern.len());
+                use std::io::Write;
+                let _ = std::io::stdout().write_all(&pattern[..chunk]);
+                remaining -= chunk;
+            }
+            // Flush and exit immediately — exercises the bridge-join race.
+            let _ = std::io::stdout().flush();
+        }
+        "write-known" => {
+            // Write "PIPEDATA:{tag}\n" to stdout. Used for pipe chain integrity.
+            let tag = args.get(2).map(String::as_str).unwrap_or("default");
+            println!("PIPEDATA:{tag}");
+        }
         "capture-pipe" => {
             // Minimal test for $()-like capture pipe across fork.
             // pipe() → fork() → child: dup2(write,1), exec sh -c "echo X | cat"
@@ -133,12 +155,8 @@ fn main() {
                     let mut failures = 0;
                     for i in 0..count {
                         let (cmd_args, expected): (Vec<&str>, &str) = match mode {
-                            "nonpie" => {
-                                (vec![&nonpie_bin, "echo-test"], "ECHO_TEST_OK")
-                            }
-                            "mixed" if i % 2 == 0 => {
-                                (vec![self_exe, "echo-test"], "ECHO_TEST_OK")
-                            }
+                            "nonpie" => (vec![&nonpie_bin, "echo-test"], "ECHO_TEST_OK"),
+                            "mixed" if i % 2 == 0 => (vec![self_exe, "echo-test"], "ECHO_TEST_OK"),
                             "mixed" => (vec![&nonpie_bin, "echo-test"], "ECHO_TEST_OK"),
                             _ => (vec![self_exe, "echo-test"], "ECHO_TEST_OK"),
                         };
@@ -175,9 +193,7 @@ fn main() {
                 for i in 0..count {
                     let (cmd_args, expected): (Vec<&str>, &str) = match mode {
                         "nonpie" => (vec![&nonpie_bin, "echo-test"], "ECHO_TEST_OK"),
-                        "mixed" if i % 2 == 0 => {
-                            (vec![self_exe, "echo-test"], "ECHO_TEST_OK")
-                        }
+                        "mixed" if i % 2 == 0 => (vec![self_exe, "echo-test"], "ECHO_TEST_OK"),
                         "mixed" => (vec![&nonpie_bin, "echo-test"], "ECHO_TEST_OK"),
                         _ => (vec![self_exe, "echo-test"], "ECHO_TEST_OK"),
                     };
@@ -466,7 +482,13 @@ mod capture_pipe_test {
             unsafe {
                 libc::execvp(
                     shell_c.as_ptr(),
-                    [shell_c.as_ptr(), flag_c.as_ptr(), cmd_c.as_ptr(), std::ptr::null()].as_ptr(),
+                    [
+                        shell_c.as_ptr(),
+                        flag_c.as_ptr(),
+                        cmd_c.as_ptr(),
+                        std::ptr::null(),
+                    ]
+                    .as_ptr(),
                 );
             }
             // If exec fails
@@ -637,8 +659,7 @@ mod capture_pipe_test {
         let mut buf = [0u8; 4096];
         let mut output = Vec::new();
         loop {
-            let n =
-                unsafe { libc::read(capture[0], buf.as_mut_ptr() as *mut _, buf.len()) };
+            let n = unsafe { libc::read(capture[0], buf.as_mut_ptr() as *mut _, buf.len()) };
             if n <= 0 {
                 break;
             }
@@ -710,8 +731,7 @@ mod capture_pipe_test {
             unsafe { libc::close(inner[1]) };
             let mut buf = [0u8; 4096];
             loop {
-                let n =
-                    unsafe { libc::read(inner[0], buf.as_mut_ptr() as *mut _, buf.len()) };
+                let n = unsafe { libc::read(inner[0], buf.as_mut_ptr() as *mut _, buf.len()) };
                 if n <= 0 {
                     break;
                 }
@@ -730,8 +750,7 @@ mod capture_pipe_test {
         let mut buf = [0u8; 4096];
         let mut output = Vec::new();
         loop {
-            let n =
-                unsafe { libc::read(capture[0], buf.as_mut_ptr() as *mut _, buf.len()) };
+            let n = unsafe { libc::read(capture[0], buf.as_mut_ptr() as *mut _, buf.len()) };
             if n <= 0 {
                 break;
             }
@@ -1011,10 +1030,7 @@ mod stdin_script_tests {
                 if pass {
                     println!("STDIN_OK:name={},shell={shell}", script.name);
                 } else {
-                    println!(
-                        "STDIN_FAIL:name={},shell={shell},{detail}",
-                        script.name
-                    );
+                    println!("STDIN_FAIL:name={},shell={shell},{detail}", script.name);
                     failures += 1;
                 }
             }
@@ -1024,9 +1040,7 @@ mod stdin_script_tests {
             eprintln!("stdin-script: no tests matched filter '{filter}'");
             return 1;
         }
-        eprintln!(
-            "stdin-script: {total} tests, {failures} failures"
-        );
+        eprintln!("stdin-script: {total} tests, {failures} failures");
         if failures > 0 { 1 } else { 0 }
     }
 }
@@ -2797,30 +2811,58 @@ mod fs_tests {
         let self_exe = self_exe.to_str().unwrap();
 
         let t0 = std::time::Instant::now();
-        eprintln!("DIAG[{:>6}ms] writing file from parent first", t0.elapsed().as_millis());
+        eprintln!(
+            "DIAG[{:>6}ms] writing file from parent first",
+            t0.elapsed().as_millis()
+        );
         std::fs::write(path, b"PARENT_WROTE").unwrap();
 
-        eprintln!("DIAG[{:>6}ms] reading back from parent", t0.elapsed().as_millis());
+        eprintln!(
+            "DIAG[{:>6}ms] reading back from parent",
+            t0.elapsed().as_millis()
+        );
         let r = std::fs::read_to_string(path).unwrap();
-        eprintln!("DIAG[{:>6}ms] parent read OK: {r}", t0.elapsed().as_millis());
+        eprintln!(
+            "DIAG[{:>6}ms] parent read OK: {r}",
+            t0.elapsed().as_millis()
+        );
 
-        eprintln!("DIAG[{:>6}ms] spawning child (do-write-sleep)", t0.elapsed().as_millis());
+        eprintln!(
+            "DIAG[{:>6}ms] spawning child (do-write-sleep)",
+            t0.elapsed().as_millis()
+        );
         let mut child = std::process::Command::new(self_exe)
             .args(["fs-test", "do-write-sleep", path, "CHILD_WROTE"])
             .stderr(std::process::Stdio::inherit())
             .spawn()
             .unwrap();
-        eprintln!("DIAG[{:>6}ms] spawn returned, pid={}", t0.elapsed().as_millis(), child.id());
+        eprintln!(
+            "DIAG[{:>6}ms] spawn returned, pid={}",
+            t0.elapsed().as_millis(),
+            child.id()
+        );
 
-        eprintln!("DIAG[{:>6}ms] sleeping 3s for child to write", t0.elapsed().as_millis());
+        eprintln!(
+            "DIAG[{:>6}ms] sleeping 3s for child to write",
+            t0.elapsed().as_millis()
+        );
         std::thread::sleep(std::time::Duration::from_secs(3));
 
-        eprintln!("DIAG[{:>6}ms] checking if file exists", t0.elapsed().as_millis());
+        eprintln!(
+            "DIAG[{:>6}ms] checking if file exists",
+            t0.elapsed().as_millis()
+        );
         let exists = std::path::Path::new(path).exists();
-        eprintln!("DIAG[{:>6}ms] file exists={exists}", t0.elapsed().as_millis());
+        eprintln!(
+            "DIAG[{:>6}ms] file exists={exists}",
+            t0.elapsed().as_millis()
+        );
 
         if exists {
-            eprintln!("DIAG[{:>6}ms] attempting read_to_string...", t0.elapsed().as_millis());
+            eprintln!(
+                "DIAG[{:>6}ms] attempting read_to_string...",
+                t0.elapsed().as_millis()
+            );
             match std::fs::read_to_string(path) {
                 Ok(s) => {
                     eprintln!("DIAG[{:>6}ms] read OK: {s}", t0.elapsed().as_millis());
