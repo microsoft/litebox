@@ -18,6 +18,8 @@ pub(crate) fn exec(args: Vec<String>) -> Command {
     Command::Exec {
         args,
         timeout_secs: None,
+        stdin: None,
+        background: false,
     }
 }
 
@@ -26,6 +28,8 @@ pub(crate) fn exec_timeout(args: Vec<String>, secs: u64) -> Command {
     Command::Exec {
         args,
         timeout_secs: Some(secs),
+        stdin: None,
+        background: false,
     }
 }
 
@@ -309,6 +313,8 @@ async fn run_tests(self_exe: &str) -> Vec<TestResult> {
         let canary_cmd = crate::protocol::Command::Exec {
             args: vec![runner.self_exe.clone(), "echo-test".into()],
             timeout_secs: None,
+            stdin: None,
+            background: false,
         };
         let resp = runner.send("A", canary_cmd).await;
         let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout == "ECHO_TEST_OK");

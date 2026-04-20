@@ -672,8 +672,11 @@ async fn run_unix_tests(r: &mut TestRunner) {
                 let resp = r
                     .send(
                         tc.agent,
-                        Command::ExecBackground {
+                        Command::Exec {
                             args: vec![self_exe.clone(), "unix-echo-server".into(), sock.clone()],
+                            timeout_secs: None,
+                            stdin: None,
+                            background: true,
                         },
                     )
                     .await;

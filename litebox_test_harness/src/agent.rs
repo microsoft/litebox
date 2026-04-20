@@ -299,7 +299,12 @@ async fn agent_loop(self_exe: &str) {
                 }
             }
 
-            Command::Exec { args, timeout_secs } => {
+            Command::Exec {
+                args,
+                timeout_secs,
+                stdin: stdin_content,
+                background,
+            } => {
                 if args.is_empty() {
                     respond(&Response::Error {
                         error: "exec requires args".to_string(),
@@ -307,25 +312,66 @@ async fn agent_loop(self_exe: &str) {
                     .await;
                     continue;
                 }
-                let timeout = Duration::from_secs(timeout_secs.unwrap_or(10));
-                let mut child = match tokio::process::Command::new(&args[0])
-                    .args(&args[1..])
-                    .stdin(std::process::Stdio::null())
-                    .stdout(std::process::Stdio::piped())
-                    .stderr(std::process::Stdio::piped())
-                    .spawn()
-                {
-                    Ok(c) => c,
-                    Err(e) => {
-                        respond(&Response::Error {
-                            error: format!("exec spawn: {e}"),
-                        })
-                        .await;
-                        continue;
+
+                let use_piped_stdin = stdin_content.is_some();
+                let mut cmd = tokio::process::Command::new(&args[0]);
+                cmd.args(&args[1..]);
+                if use_piped_stdin {
+                    cmd.stdin(std::process::Stdio::piped());
+                } else {
+                    cmd.stdin(std::process::Stdio::null());
+                }
+
+                if background {
+                    cmd.stdout(std::process::Stdio::null());
+                    cmd.stderr(std::process::Stdio::null());
+                    match cmd.spawn() {
+                        Ok(mut child) => {
+                            // Write stdin content if provided.
+                            if let Some(content) = stdin_content {
+                                if let Some(mut child_stdin) = child.stdin.take() {
+                                    use tokio::io::AsyncWriteExt;
+                                    let _ = child_stdin.write_all(content.as_bytes()).await;
+                                    // drop closes the pipe
+                                }
+                            }
+                            let pid = child.id().unwrap_or(0);
+                            background_pids.push(child);
+                            respond(&Response::Background { pid }).await;
+                        }
+                        Err(e) => {
+                            respond(&Response::Error {
+                                error: format!("exec spawn: {e}"),
+                            })
+                            .await;
+                        }
                     }
-                };
-                let mut child_stdout = child.stdout.take().unwrap();
-                let mut child_stderr = child.stderr.take().unwrap();
+                } else {
+                    cmd.stdout(std::process::Stdio::piped());
+                    cmd.stderr(std::process::Stdio::piped());
+                    let timeout = Duration::from_secs(timeout_secs.unwrap_or(10));
+                    let mut child = match cmd.spawn() {
+                        Ok(c) => c,
+                        Err(e) => {
+                            respond(&Response::Error {
+                                error: format!("exec spawn: {e}"),
+                            })
+                            .await;
+                            continue;
+                        }
+                    };
+
+                    // Write stdin content if provided.
+                    if let Some(content) = stdin_content {
+                        if let Some(mut child_stdin) = child.stdin.take() {
+                            use tokio::io::AsyncWriteExt;
+                            let _ = child_stdin.write_all(content.as_bytes()).await;
+                            // drop closes the pipe
+                        }
+                    }
+
+                    let mut child_stdout = child.stdout.take().unwrap();
+                    let mut child_stderr = child.stderr.take().unwrap();
 
                 // Collect stdout/stderr and wait, with timeout for deadlock detection.
                 let result = tokio::time::timeout(timeout, async {
@@ -368,6 +414,7 @@ async fn agent_loop(self_exe: &str) {
                             ),
                         })
                         .await;
+                    }
                     }
                 }
             }
@@ -473,35 +520,6 @@ async fn agent_loop(self_exe: &str) {
                     Err(_) => {
                         respond(&Response::ConnectFailed {
                             error: "connect timeout".to_string(),
-                        })
-                        .await;
-                    }
-                }
-            }
-
-            Command::ExecBackground { args } => {
-                if args.is_empty() {
-                    respond(&Response::Error {
-                        error: "exec_background requires args".to_string(),
-                    })
-                    .await;
-                    continue;
-                }
-                match tokio::process::Command::new(&args[0])
-                    .args(&args[1..])
-                    .stdin(std::process::Stdio::null())
-                    .stdout(std::process::Stdio::null())
-                    .stderr(std::process::Stdio::null())
-                    .spawn()
-                {
-                    Ok(child) => {
-                        let pid = child.id().unwrap_or(0);
-                        background_pids.push(child);
-                        respond(&Response::Background { pid }).await;
-                    }
-                    Err(e) => {
-                        respond(&Response::Error {
-                            error: format!("exec_background: {e}"),
                         })
                         .await;
                     }

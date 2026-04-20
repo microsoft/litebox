@@ -59,13 +59,20 @@ pub enum Command {
     #[serde(rename = "forward")]
     Forward { target: String, inner: Box<Command> },
 
-    /// Fork+exec self with args and report exit code + stdout.
+    /// Fork+exec with args. Captures stdout/stderr and waits, or runs
+    /// in background and returns PID. Optionally pipes content to stdin.
     #[serde(rename = "exec")]
     Exec {
         args: Vec<String>,
-        /// Optional timeout in seconds (default: 10).
+        /// Timeout in seconds (default: 10). Ignored if background=true.
         #[serde(default)]
         timeout_secs: Option<u64>,
+        /// Content to pipe to the child's stdin. None = /dev/null.
+        #[serde(default)]
+        stdin: Option<String>,
+        /// If true, return Background { pid } immediately instead of waiting.
+        #[serde(default)]
+        background: bool,
     },
 
     /// Report an environment variable value.
@@ -87,10 +94,6 @@ pub enum Command {
     /// Connect to a Unix domain socket, send data, read echo response.
     #[serde(rename = "unix_connect")]
     UnixConnect { path: String, data: String },
-
-    /// Fork+exec in background. Returns immediately with the child PID.
-    #[serde(rename = "exec_background")]
-    ExecBackground { args: Vec<String> },
 
     /// Kill a background process by PID.
     #[serde(rename = "kill")]
