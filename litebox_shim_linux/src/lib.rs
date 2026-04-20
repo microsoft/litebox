@@ -2223,6 +2223,10 @@ impl<FS: ShimFS> Task<FS> {
                 // FD plumbing.
                 | Sysno::close | Sysno::close_range | Sysno::dup | Sysno::dup2 | Sysno::dup3
                 | Sysno::open | Sysno::openat | Sysno::openat2 | Sysno::pipe2 | Sysno::write
+                // Fork — bash forks for pipelines inside $() subshells.
+                // Must be pre-exec so nested forks work without triggering
+                // migration (which would break capture pipes).
+                | Sysno::clone | Sysno::clone3 | Sysno::vfork | Sysno::fork
                 // Directory.
                 | Sysno::chdir | Sysno::fchdir
                 // Process group.
