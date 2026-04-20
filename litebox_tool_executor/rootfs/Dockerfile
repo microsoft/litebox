@@ -19,9 +19,12 @@ RUN curl -fsSL "https://nodejs.org/dist/${NODE_VERSION}/node-${NODE_VERSION}-lin
 # ── System config ──
 # Note: /etc/resolv.conf is a read-only bind-mount during docker build.
 # It will be set to "nameserver 10.0.0.1" at container runtime by the entrypoint.
-RUN printf 'root::0:0:root:/root:/usr/bin/bash\nuser:x:1000:1000:user:/root:/usr/bin/bash\nnobody:x:65534:65534:nobody:/nonexistent:/usr/sbin/nologin\n' > /etc/passwd \
+# The password hash is SHA-256 of the empty string (dropbear -B accepts it).
+RUN printf 'root:$5$feWUHaTYjlgIa1uw$9xrsiQaRuBfJSEx37HOmaCfa2l4MY6VGZ8/L3OJVSO9:0:0:root:/root:/usr/bin/bash\nuser:x:1000:1000:user:/root:/usr/bin/bash\nnobody:x:65534:65534:nobody:/nonexistent:/usr/sbin/nologin\n' > /etc/passwd \
     && printf 'root:x:0:\nuser:x:1000:\nnogroup:x:65534:\n' > /etc/group \
-    && printf 'passwd: files\ngroup: files\nshadow: files\nhosts: files dns\n' > /etc/nsswitch.conf
+    && printf 'passwd: files\ngroup: files\nshadow: files\nhosts: files dns\n' > /etc/nsswitch.conf \
+    && printf 'root:$5$feWUHaTYjlgIa1uw$9xrsiQaRuBfJSEx37HOmaCfa2l4MY6VGZ8/L3OJVSO9:20553:0:99999:7:::\n' > /etc/shadow \
+    && chmod 640 /etc/shadow
 
 # ── Dropbear SSH ──
 RUN mkdir -p /etc/dropbear \
