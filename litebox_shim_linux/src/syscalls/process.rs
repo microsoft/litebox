@@ -3671,8 +3671,10 @@ impl<FS: ShimFS> Task<FS> {
                         #[cfg(feature = "trace_syscalls")]
                         litebox::log_println!(
                             platform,
-                            "[PARENT-MUX] dispatcher started, {} endpoints, mux_fd={}",
+                            "[PARENT-MUX] dispatcher started, {} endpoints, {} orphans ({} drained bytes), mux_fd={}",
                             dispatch_endpoints.len(),
+                            orphan_streams.len(),
+                            orphan_streams.iter().map(|(_, d)| d.len()).sum::<usize>(),
                             mux_fd,
                         );
 

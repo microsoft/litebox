@@ -38,12 +38,19 @@ fn find_nonpie_binary() -> Option<String> {
     }
     all.into_iter()
         .find(|p| std::path::Path::new(p).exists())
+        .inspect(|p| eprintln!("[harness] nonpie binary: {p}"))
 }
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let cmd = args.get(1).map(String::as_str).unwrap_or("spawn-tree");
     let self_exe = &args[0];
+
+    // Log the resolved binary path so stale rootfs copies are immediately
+    // obvious (args[0] may differ from the real on-disk path).
+    if let Ok(real) = std::env::current_exe() {
+        eprintln!("[harness] self_exe={self_exe} resolved={}", real.display());
+    }
 
     match cmd {
         "spawn-tree" => {
