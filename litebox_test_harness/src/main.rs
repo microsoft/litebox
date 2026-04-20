@@ -83,6 +83,17 @@ fn main() {
         "echo-test" => {
             println!("ECHO_TEST_OK");
         }
+        "stdin-script" => {
+            // Pipe a shell script to `sh` via stdin and verify output.
+            // Reproduces the VS Code install script pattern where the
+            // script is piped to `ssh host sh`.
+            //
+            // Usage: stdin-script <test-name>
+            // Each test pipes a specific script to sh and checks stdout.
+            std::process::exit(stdin_script_tests::run(
+                args.get(2).map(String::as_str).unwrap_or("all"),
+            ));
+        }
         "stress-exec" => {
             // Bypass test harness protocol entirely. Directly fork+exec
             // from a single process to test if litebox's fork/exec leaks
@@ -366,6 +377,163 @@ fn main() {
             eprintln!("unknown command: {other}");
             std::process::exit(1);
         }
+    }
+}
+
+/// Tests for scripts piped to `sh` via stdin — the VS Code install pattern.
+/// Each test pipes a script to `sh` (or `bash`) and checks if the output
+/// matches expectations. The key bug: pipe inside `$()` when the script
+/// is read from stdin can steal the remaining script content.
+mod stdin_script_tests {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+
+    struct StdinTest {
+        name: &'static str,
+        script: &'static str,
+        expected: &'static str,
+        shell: &'static str,
+    }
+
+    const TESTS: &[StdinTest] = &[
+        // Basic command substitution
+        StdinTest {
+            name: "cmd_subst",
+            script: "FOO=$(echo hello)\necho FOO=$FOO\necho DONE\n",
+            expected: "FOO=hello",
+            shell: "sh",
+        },
+        // Pipe inside $() — the VS Code bug
+        StdinTest {
+            name: "pipe_in_subst",
+            script: "A=$(echo one | cat)\necho A=$A\necho DONE\n",
+            expected: "A=one",
+            shell: "sh",
+        },
+        // Multi-stage pipe inside $()
+        StdinTest {
+            name: "multi_pipe_subst",
+            script: "A=$(echo data | grep data | cat)\necho A=$A\necho DONE\n",
+            expected: "A=data",
+            shell: "sh",
+        },
+        // File read with pipe inside $()
+        StdinTest {
+            name: "file_pipe_subst",
+            script: "A=$(cat /etc/hostname | cat)\necho A=$A\necho DONE\n",
+            expected: "DONE",
+            shell: "sh",
+        },
+        // Multiple command substitutions in sequence
+        StdinTest {
+            name: "sequential_subst",
+            script: "A=$(echo first)\nB=$(echo second)\necho A=$A B=$B\necho DONE\n",
+            expected: "A=first B=second",
+            shell: "sh",
+        },
+        // Pipe inside $() followed by more commands
+        StdinTest {
+            name: "subst_then_cmds",
+            script: "A=$(echo val | cat)\necho LINE1\necho LINE2\necho LINE3\n",
+            expected: "LINE3",
+            shell: "sh",
+        },
+        // The actual VS Code pattern: cat file | grep | sed | sed
+        StdinTest {
+            name: "vscode_osrelease",
+            script: "ID=$(cat /etc/os-release | grep -E '^ID=' | sed 's/ID=//g' | sed 's/\"//g')\necho ID=$ID\necho DONE\n",
+            expected: "DONE",
+            shell: "sh",
+        },
+        // Backtick version
+        StdinTest {
+            name: "backtick_pipe",
+            script: "A=`echo one | cat`\necho A=$A\necho DONE\n",
+            expected: "A=one",
+            shell: "sh",
+        },
+        // Same tests with bash
+        StdinTest {
+            name: "bash_pipe_in_subst",
+            script: "A=$(echo one | cat)\necho A=$A\necho DONE\n",
+            expected: "A=one",
+            shell: "bash",
+        },
+        StdinTest {
+            name: "bash_vscode_pattern",
+            script: "ID=$(cat /etc/os-release | grep -E '^ID=' | sed 's/ID=//g' | sed 's/\"//g')\necho ID=$ID\necho DONE\n",
+            expected: "DONE",
+            shell: "bash",
+        },
+    ];
+
+    fn run_one(test: &StdinTest) -> (bool, String) {
+        let mut child = match Command::new(test.shell)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+        {
+            Ok(c) => c,
+            Err(e) => return (false, format!("spawn {}: {e}", test.shell)),
+        };
+
+        // Write script to stdin, then close it
+        if let Some(mut stdin) = child.stdin.take() {
+            let _ = stdin.write_all(test.script.as_bytes());
+            // stdin drops here, closing the pipe
+        }
+
+        match child.wait_with_output() {
+            Ok(out) => {
+                let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+                let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+                let pass = stdout.contains(test.expected);
+                let detail = if pass {
+                    format!("stdout={}", stdout.trim())
+                } else {
+                    format!(
+                        "MISSING '{}' in stdout={} stderr={}",
+                        test.expected,
+                        stdout.trim(),
+                        stderr.trim()
+                    )
+                };
+                (pass, detail)
+            }
+            Err(e) => (false, format!("wait: {e}")),
+        }
+    }
+
+    pub fn run(filter: &str) -> i32 {
+        let mut failures = 0;
+        let mut total = 0;
+
+        for test in TESTS {
+            if filter != "all" && test.name != filter {
+                continue;
+            }
+            total += 1;
+            let (pass, detail) = run_one(test);
+            if pass {
+                println!("STDIN_OK:name={},shell={}", test.name, test.shell);
+            } else {
+                println!(
+                    "STDIN_FAIL:name={},shell={},{}",
+                    test.name, test.shell, detail
+                );
+                failures += 1;
+            }
+        }
+
+        if total == 0 {
+            eprintln!("stdin-script: no tests matched filter '{filter}'");
+            return 1;
+        }
+        eprintln!(
+            "stdin-script: {total} tests, {failures} failures"
+        );
+        if failures > 0 { 1 } else { 0 }
     }
 }
 

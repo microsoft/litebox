@@ -334,6 +334,9 @@ async fn run_tests(self_exe: &str) -> Vec<TestResult> {
     // === Filesystem I/O Matrix ===
     special_cases::fs_io_tests(&mut runner).await;
 
+    // === Stdin-Piped Script Tests ===
+    special_cases::stdin_script_tests(&mut runner).await;
+
     // === Cross-Worker Tests ===
     special_cases::cross_worker_tests(&mut runner).await;
 

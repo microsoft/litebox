@@ -642,6 +642,72 @@ pub(super) async fn net_ipv6_tests(r: &mut TestRunner) {
         r.record(name, "A", pass, &format!("{resp:?}"));
     }
 }
+
+/// Stdin-piped script tests: pipe shell scripts to `sh` via stdin.
+/// Reproduces the VS Code install script pattern where the script is
+/// piped through `ssh host sh`. Tests pipe-in-subshell, command
+/// substitution, and multi-stage pipes — all across agent depths.
+pub(super) async fn stdin_script_tests(r: &mut TestRunner) {
+    let self_exe = r.self_exe.clone();
+
+    eprintln!("[special] === Stdin-Piped Script Tests ===");
+
+    // Run all stdin-script tests as a single Exec. The subcommand
+    // runs each test internally and reports STDIN_OK/STDIN_FAIL.
+    for agent in &["A", "AA"] {
+        let resp = r
+            .send(
+                agent,
+                super::exec_timeout(
+                    vec![self_exe.clone(), "stdin-script".into(), "all".into()],
+                    30,
+                ),
+            )
+            .await;
+
+        // Parse individual results from stdout
+        if let Response::ExecResult {
+            exit_code, stdout, ..
+        } = &resp
+        {
+            for line in stdout.lines() {
+                if let Some(name) = line.strip_prefix("STDIN_OK:name=") {
+                    let name = name.split(',').next().unwrap_or(name);
+                    r.record(
+                        &format!("SS.{name}.{agent}"),
+                        agent,
+                        true,
+                        line,
+                    );
+                } else if let Some(rest) = line.strip_prefix("STDIN_FAIL:name=") {
+                    let name = rest.split(',').next().unwrap_or(rest);
+                    r.record(
+                        &format!("SS.{name}.{agent}"),
+                        agent,
+                        false,
+                        line,
+                    );
+                }
+            }
+            if *exit_code != 0 && !stdout.contains("STDIN_") {
+                r.record(
+                    &format!("SS.all.{agent}"),
+                    agent,
+                    false,
+                    &format!("{resp:?}"),
+                );
+            }
+        } else {
+            r.record(
+                &format!("SS.all.{agent}"),
+                agent,
+                false,
+                &format!("{resp:?}"),
+            );
+        }
+    }
+}
+
 pub(super) async fn cross_worker_tests(r: &mut TestRunner) {
     eprintln!("[special] === Cross-Worker Tests (SpawnRemote) ===");
 
