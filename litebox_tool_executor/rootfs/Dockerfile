@@ -9,8 +9,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     procps less openssh-sftp-server \
     dropbear-bin python3-minimal nodejs \
     && rm -rf /var/lib/apt/lists/* \
-    && echo "dash dash/sh boolean false" | debconf-set-selections \
-    && dpkg-reconfigure dash \
+    && ln -sf bash /bin/sh \
     && node --version
 
 # ── System config ──
