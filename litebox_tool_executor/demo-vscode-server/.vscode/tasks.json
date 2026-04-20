@@ -20,9 +20,9 @@
             }
         },
         {
-            "label": "LiteBox: Build Rootfs",
+            "label": "LiteBox: Build Docker Image",
             "type": "shell",
-            "command": "docker build -t litebox-rootfs C:\\src\\litebox-vscode-server\\litebox_tool_executor\\rootfs && docker rm -f litebox-rootfs-tmp 2>$null; docker create --name litebox-rootfs-tmp litebox-rootfs true >$null && wsl.exe -d Ubuntu -u wportnoy -- bash -c 'rm -rf /home/wportnoy/vscode-rootfs && mkdir -p /home/wportnoy/vscode-rootfs && docker export litebox-rootfs-tmp | tar x --no-same-owner -C /home/wportnoy/vscode-rootfs' && docker rm litebox-rootfs-tmp >$null && echo 'Rootfs ready at /home/wportnoy/vscode-rootfs'",
+            "command": "docker build -t litebox-rootfs C:\\src\\litebox-vscode-server\\litebox_tool_executor\\rootfs",
             "group": "build",
             "problemMatcher": [],
             "presentation": {
@@ -34,13 +34,8 @@
         },
         {
             "label": "LiteBox: Start VS Code Server",
-            "type": "process",
-            "command": "wsl.exe",
-            "args": [
-                "-d", "Ubuntu", "-u", "wportnoy", "--",
-                "bash", "-lc",
-                "cd /mnt/c/src/litebox-vscode-server && target/debug/litebox_tool_executor --rootfs /home/wportnoy/vscode-rootfs --vscode-server --ssh-port 2222 --record-baseline"
-            ],
+            "type": "shell",
+            "command": "docker rm -f litebox-vscode 2>$null; docker run --rm --name litebox-vscode -p 2222:22 --cap-add SYS_PTRACE -v C:\\src\\litebox-vscode-server\\target\\debug:/opt/litebox-src:ro litebox-rootfs bash -c 'cp /opt/litebox-src/litebox_tool_executor /opt/litebox-src/litebox_broker /opt/litebox-src/litebox_runner_linux_userland /tmp/ && /tmp/litebox_tool_executor --rootfs / --vscode-server --ssh-port 22 --record-baseline'",
             "problemMatcher": [],
             "isBackground": true,
             "runOptions": {
@@ -51,6 +46,16 @@
                 "panel": "dedicated",
                 "focus": false,
                 "echo": true
+            }
+        },
+        {
+            "label": "LiteBox: Stop VS Code Server",
+            "type": "shell",
+            "command": "docker stop litebox-vscode",
+            "problemMatcher": [],
+            "presentation": {
+                "reveal": "silent",
+                "panel": "shared"
             }
         }
     ]
