@@ -3543,6 +3543,42 @@ impl<FS: ShimFS> Task<FS> {
                                     ms.guest_fd
                                 );
                             }
+
+                            // Drain any data already in the old pipe and
+                            // pre-fill the new pipe. This handles the case
+                            // where a pipeline child (e.g. cat) wrote to the
+                            // capture pipe before delayed-fork migration.
+                            // Without this, the data would be silently lost.
+                            if ms.direction == HostPipeDirection::Read {
+                                if let Some(ref old_typed) = old_pipe {
+                                    if let Ok(drained) =
+                                        self.global.pipes.drain_available(old_typed)
+                                    {
+                                        if !drained.is_empty() {
+                                            #[cfg(feature = "trace_syscalls")]
+                                            litebox::log_println!(
+                                                self.global.platform,
+                                                "[PARENT-MUX] drained {} bytes from old pipe at fd={} into new pipe",
+                                                drained.len(),
+                                                ms.guest_fd,
+                                            );
+                                            // Write drained data into the
+                                            // dispatch pipe (sender end) so
+                                            // the parent's new receiver has it.
+                                            let wait_state =
+                                                litebox::event::wait::WaitState::new(
+                                                    self.global.platform,
+                                                );
+                                            let cx = wait_state.context();
+                                            let _ = self.global.pipes.write(
+                                                &cx,
+                                                &dispatch_pipe_fd,
+                                                &drained,
+                                            );
+                                        }
+                                    }
+                                }
+                            }
                             if let Some(old_typed) = old_pipe {
                                 // Keep the old pipe end alive — don't call
                                 // pipes.close().  The fd slot is already freed
