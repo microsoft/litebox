@@ -1072,6 +1072,26 @@ fn run_fork_restore(cli_args: CliArgs) -> Result<()> {
     // Parse local pipe pair specs (child-only pipes).
     let local_pipes = parse_local_pipe_specs(&cli_args.local_pipe)?;
 
+    // Diagnostic: log stream and pipe specs
+    {
+        use std::io::Write;
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true).append(true)
+            .open("/tmp/litebox_worker_specs.txt") {
+            let _ = writeln!(f, "mux_streams: {} local_pipes: {} mux_fd: {:?}",
+                mux_streams.len(), local_pipes.len(), mux_fd);
+            for ms in &mux_streams {
+                let _ = writeln!(f, "  mux: stream={} fd={} dir={} eof={}",
+                    ms.stream_id, ms.guest_fd, ms.direction as char, ms.initial_eof);
+            }
+            for (i, (w, r, d, wf, rf)) in local_pipes.iter().enumerate() {
+                let _ = writeln!(f, "  local[{}]: write_fd={} read_fd={} drained={} w={} r={}",
+                    i, w, r, d.len(), wf, rf);
+            }
+            let _ = f.flush();
+        }
+    }
+
     // Mark inherited fds as close-on-exec (except pipe bridge FDs and mux fd
     // which the shim/dispatcher will use directly).
     for fd in [Some(snapshot_fd), Some(ack_fd), cli_args.worker_result_fd]
