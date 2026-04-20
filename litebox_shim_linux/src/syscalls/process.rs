@@ -5512,7 +5512,9 @@ impl<FS: ShimFS> Task<FS> {
                         false
                     };
 
-                    mux_stream_specs.push((stream_id, guest_fd, dir_byte, type_byte, initial_eof));
+                    // Defer mux_stream_specs push to after orphan handling
+                    // (orphan streams with drained data are handled as local
+                    // pipes and should not appear in mux_stream_specs).
 
                     if initial_eof || has_drained_data {
                         #[cfg(feature = "trace_syscalls")]
@@ -5529,6 +5531,11 @@ impl<FS: ShimFS> Task<FS> {
                     }
 
                     let is_host_backed = bridge_host_fd.get(i).is_some_and(|&hf| hf >= 0);
+
+                    // Track whether this stream is handled as a local pipe
+                    // (orphan with drained data). If so, skip adding to
+                    // mux_stream_specs — the worker handles it via --local-pipe.
+                    let mut handled_as_local_pipe = false;
 
                     if is_host_backed {
                         // Host-backed pipe: parent mux dispatcher relays to
@@ -5605,12 +5612,29 @@ impl<FS: ShimFS> Task<FS> {
                                     pty_is_master: false,
                                 });
                             } else {
-                                // No parent counterpart — stream has no parent
-                                // relay (broken pipe / already closed).  Still
-                                // include in mux_stream_specs so the worker sets
-                                // up the guest fd.  Carry any drained data so the
-                                // parent dispatcher can send DATA before RESET.
-                                orphan_stream_ids.push((stream_id, drained));
+                                // No parent counterpart — the write end of this
+                                // pipe was closed before migration.  Use a local
+                                // pipe on the worker (like child-only pipes): the
+                                // worker creates a connected pair, pre-fills the
+                                // drained data, and closes the write end.  The
+                                // guest reads the data and then gets EOF.
+                                //
+                                // This avoids the mux path entirely for orphans,
+                                // sidestepping the pollee.wait hang that affects
+                                // mux relay writes on fork-restore workers.
+                                if direction == HostPipeDirection::Read && !drained.is_empty() {
+                                    local_pipe_pairs.push((
+                                        usize::MAX,  // write_fd sentinel: close immediately
+                                        guest_fd,    // read_fd: guest reads here
+                                        drained,
+                                        0, // write flags
+                                        0, // read flags
+                                    ));
+                                    handled_as_local_pipe = true;
+                                } else {
+                                    // No data or Write direction — send RESET via mux.
+                                    orphan_stream_ids.push((stream_id, drained));
+                                }
                             }
                         } else {
                             for (j, &(parent_fd, parent_dir, subsystem)) in
@@ -5631,6 +5655,12 @@ impl<FS: ShimFS> Task<FS> {
                                 });
                             }
                         }
+                    }
+
+                    // Push to mux_stream_specs only if not handled as a
+                    // local pipe (orphan read-end with drained data).
+                    if !handled_as_local_pipe {
+                        mux_stream_specs.push((stream_id, guest_fd, dir_byte, type_byte, initial_eof));
                     }
                 }
 

@@ -1393,6 +1393,59 @@ fn fork_restore_and_ack<FS: litebox_shim_linux::ShimFS>(
                     std::collections::HashMap::new();
 
                 for &(write_fd, read_fd, ref drained, w_flags_bits, r_flags_bits) in local_pipes {
+                    // Sentinel: write_fd == usize::MAX means this is an orphan
+                    // pipe where the write end was closed before migration.
+                    // Create a pipe, fill with drained data, close the sender,
+                    // and install only the receiver at read_fd.  The guest
+                    // reads the data and then gets EOF.
+                    if write_fd == usize::MAX {
+                        {
+                            use std::io::Write;
+                            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true)
+                                .open("/tmp/litebox_local_pipe_diag.txt") {
+                                let _ = writeln!(f, "orphan local pipe: read_fd={} drained={}", read_fd, drained.len());
+                            }
+                        }
+                        let (sender, receiver) = pipes_sub.create_pipe(
+                            1024 * 1024,
+                            litebox::pipes::Flags::empty(),
+                            core::num::NonZero::new(4096),
+                        );
+                        if !drained.is_empty() {
+                            let wait_state = litebox::event::wait::WaitState::new(
+                                litebox_platform_multiplex::platform(),
+                            );
+                            let cx = wait_state.context();
+                            {
+                                use std::io::Write;
+                                if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true)
+                                    .open("/tmp/litebox_local_pipe_diag.txt") {
+                                    let _ = writeln!(f, "about to write {} bytes to local pipe", drained.len());
+                                    let _ = f.flush();
+                                }
+                            }
+                            let mut offset = 0;
+                            while offset < drained.len() {
+                                match pipes_sub.write(&cx, &sender, &drained[offset..]) {
+                                    Ok(n) => offset += n,
+                                    Err(_) => break,
+                                }
+                            }
+                            {
+                                use std::io::Write;
+                                if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true)
+                                    .open("/tmp/litebox_local_pipe_diag.txt") {
+                                    let _ = writeln!(f, "write complete, offset={}", offset);
+                                    let _ = f.flush();
+                                }
+                            }
+                        }
+                        // Close sender → guest gets EOF after drained data.
+                        let _ = pipes_sub.close(&sender);
+                        program.entrypoints.install_mux_pipe_fd(read_fd, receiver);
+                        continue;
+                    }
+
                     let w_installed = sender_dups.contains_key(&write_fd);
                     let r_installed = receiver_dups.contains_key(&read_fd);
 
