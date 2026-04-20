@@ -65,6 +65,7 @@ RUN mkdir -p /root/.vscode-server/data/logs \
 RUN mkdir -p /tmp /workspaces /home /shared /dev /proc /root \
     && touch /tmp/vscode-skip-server-requirements-check \
     && [ -e /bin ] || ln -sf /usr/bin /bin \
-    && echo "nameserver 10.0.0.1" > /etc/resolv.conf.litebox
+    && echo "nameserver 10.0.0.1" > /etc/resolv.conf.litebox \
+    && ln -sf bash /usr/bin/sh
 
 EXPOSE 22
