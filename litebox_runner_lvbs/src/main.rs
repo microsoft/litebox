@@ -446,7 +446,10 @@ pub unsafe extern "C" fn _start() -> ! {
 unsafe extern "C" fn kernel_main(is_bsp: bool) -> ! {
     if is_bsp {
         let _ = log::set_logger(&HOST_LOGGER);
-        log::set_max_level(log::LevelFilter::Trace);
+        #[cfg(debug_assertions)]
+        log::set_max_level(log::LevelFilter::Debug);
+        #[cfg(not(debug_assertions))]
+        log::set_max_level(log::LevelFilter::Info);
 
         serial_println!("==============================");
         serial_println!(" Hello from LiteBox for LVBS! ");
