@@ -683,7 +683,6 @@ mod capture_pipe_test {
             if unsafe { libc::pipe(inner.as_mut_ptr()) } != 0 {
                 unsafe { libc::_exit(1) };
             }
-
             let gc = unsafe { libc::fork() };
             if gc < 0 {
                 let msg = b"FORK2_FAILED\n";
