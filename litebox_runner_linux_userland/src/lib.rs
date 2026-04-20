@@ -1558,17 +1558,6 @@ fn fork_restore_and_ack<FS: litebox_shim_linux::ShimFS>(
                 }
 
                 // Pre-flight check: verify relay endpoints are alive.
-                {
-                    use std::io::Write;
-                    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true)
-                        .open("/tmp/litebox_worker_mux.txt") {
-                        let _ = writeln!(f, "worker mux: {} endpoints, mux_fd={:?}", relay_endpoints.len(), mux_fd);
-                        for (sid, dir, relay_fd) in &relay_endpoints {
-                            let eof = pipes.is_read_eof(relay_fd);
-                            let _ = writeln!(f, "  stream={} dir={} is_read_eof={}", sid, *dir as char, eof);
-                        }
-                    }
-                }
                 #[cfg(feature = "trace_syscalls")]
                 for (sid, dir, relay_fd) in &relay_endpoints {
                     let eof = pipes.is_read_eof(relay_fd);
@@ -1639,13 +1628,6 @@ fn spawn_worker_mux_dispatcher(
     litebox_platform_linux_userland::spawn_host_thread(move || {
         let wait_state = litebox::event::wait::WaitState::new(platform);
         let cx = wait_state.context();
-
-        #[cfg(feature = "trace_syscalls")]
-        eprintln!(
-            "[WORKER-MUX] dispatcher started, {} endpoints, mux_fd={}",
-            relay_endpoints.len(),
-            mux_fd,
-        );
 
         // Set socketpair to non-blocking for the poll loop.
         let _ = platform.set_host_fd_nonblock(mux_fd);

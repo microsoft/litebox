@@ -3631,6 +3631,44 @@ impl<FS: ShimFS> Task<FS> {
                     let pipes = self.global.pipes.clone();
                     let mux_fd = parent_mux_raw;
 
+                    // Send orphan DATA+RESET from the main thread, before
+                    // spawning the dispatcher.  The dispatcher's background
+                    // thread may be delayed by platform scheduling; sending
+                    // orphan messages synchronously ensures the worker
+                    // receives buffered pipe data promptly.
+                    {
+                        use crate::multiplexer::MuxMessage;
+                        const MUX_MAX_PAYLOAD: usize = 61440;
+                        for (sid, drained) in &orphan_streams {
+                            if !drained.is_empty() {
+                                for chunk in drained.chunks(MUX_MAX_PAYLOAD) {
+                                    let msg = MuxMessage::data(*sid, chunk.to_vec());
+                                    let buf = msg.serialize();
+                                    let _ = platform.write_host_fd(mux_fd, &buf);
+                                }
+                                #[cfg(feature = "trace_syscalls")]
+                                litebox::log_println!(
+                                    platform,
+                                    "[PARENT-MUX] sent {} orphan drained bytes for stream={}",
+                                    drained.len(),
+                                    sid,
+                                );
+                            }
+                            let msg = MuxMessage::reset(*sid);
+                            let buf = msg.serialize();
+                            let _ = platform.write_host_fd(mux_fd, &buf);
+                            #[cfg(feature = "trace_syscalls")]
+                            litebox::log_println!(
+                                platform,
+                                "[PARENT-MUX] sent orphan RESET for stream={}",
+                                sid,
+                            );
+                        }
+                        // Clear orphan_streams so the dispatcher doesn't
+                        // re-send them.
+                        orphan_streams.clear();
+                    }
+
                     self.global.platform.spawn_background_task(move || {
                         use crate::multiplexer::{
                             HEADER_SIZE, MSG_FLAG_EOF, MSG_FLAG_RESET, MSG_TYPE_DATA, MuxMessage,
