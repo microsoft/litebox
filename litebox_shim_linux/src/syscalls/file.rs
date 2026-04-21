@@ -1091,6 +1091,19 @@ impl<FS: ShimFS> Task<FS> {
             return Err(Errno::EBADF);
         };
 
+        // Trace fork-restored reads for debugging.
+        #[cfg(feature = "trace_syscalls")]
+        if fd == 4 {
+            litebox::log_println!(
+                self.global.platform,
+                "[SYS-READ] pid={} fd={} buf_len={} has_host_pipe={}",
+                self.pid,
+                fd,
+                buf.len(),
+                self.files.borrow().try_host_pipe_fd(raw_fd).is_some(),
+            );
+        }
+
         // Netlink socket: return buffered data, 0 if empty.
         if let Some(nl) = self.netlink_sockets.borrow_mut().get_mut(&(raw_fd as u32)) {
             if !nl.has_data() {

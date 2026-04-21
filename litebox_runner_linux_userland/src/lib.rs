@@ -1419,27 +1419,41 @@ fn fork_restore_and_ack<FS: litebox_shim_linux::ShimFS>(
                     // and install only the receiver at read_fd.  The guest
                     // reads the data and then gets EOF.
                     if write_fd == usize::MAX {
-                        let (sender, receiver) = pipes_sub.create_pipe(
-                            1024 * 1024,
-                            litebox::pipes::Flags::empty(),
-                            core::num::NonZero::new(4096),
-                        );
+                        // Orphan pipe: create a real OS pipe, write drained
+                        // data, close write end, install read end at guest fd.
+                        // Using a host pipe instead of a virtual pipe avoids
+                        // the pollee.wait mechanism entirely.
+                        let (os_read, os_write) =
+                            litebox_platform_multiplex::platform().create_host_pipe()
+                                .expect("create_host_pipe for orphan");
+                        // Log OS pipe fds
+                        {
+                            use std::io::Write;
+                            if let Ok(mut f) = std::fs::OpenOptions::new()
+                                .create(true).append(true)
+                                .open("/tmp/litebox_ospipe_fds.txt") {
+                                let _ = writeln!(f, "orphan OS pipe: os_read={} os_write={} guest_fd={}",
+                                    os_read, os_write, read_fd);
+                                let _ = f.flush();
+                            }
+                        }
                         if !drained.is_empty() {
-                            let wait_state = litebox::event::wait::WaitState::new(
-                                litebox_platform_multiplex::platform(),
-                            );
-                            let cx = wait_state.context();
                             let mut offset = 0;
                             while offset < drained.len() {
-                                match pipes_sub.write(&cx, &sender, &drained[offset..]) {
+                                match litebox_platform_multiplex::platform()
+                                    .write_host_fd(os_write, &drained[offset..])
+                                {
                                     Ok(n) => offset += n,
                                     Err(_) => break,
                                 }
                             }
                         }
-                        // Close sender → guest gets EOF after drained data.
-                        let _ = pipes_sub.close(&sender);
-                        program.entrypoints.install_mux_pipe_fd(read_fd, receiver);
+                        litebox_platform_multiplex::platform().close_host_fd(os_write);
+                        program.entrypoints.install_host_pipe_fd(
+                            read_fd,
+                            os_read,
+                            litebox_shim_linux::syscalls::host_pipe::HostPipeDirection::Read,
+                        );
                         continue;
                     }
 
@@ -1628,6 +1642,7 @@ fn fork_restore_and_ack<FS: litebox_shim_linux::ShimFS>(
                 mux_thread_handle = Some(mux_handle);
             }
 
+            // Verify local pipe data before starting guest.
             // Report successful restore to parent via ack pipe.
             let mut ack_file = unsafe { std::fs::File::from_raw_fd(ack_fd) };
             ack_file.write_all(&0i32.to_le_bytes())?;
