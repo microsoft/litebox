@@ -115,12 +115,14 @@ pub struct TaInstance {
     /// Boxed to keep it at a fixed heap address - the Task inside must not be moved
     /// after initialization because it contains internal state that may not survive moves.
     pub loaded_program: alloc::boxed::Box<LoadedProgram>,
-    /// The task page table ID associated with this TA instance.
-    ///
-    /// `None` after the page table has been torn down. Any lock holder that
-    /// observes `None` must treat the instance as destroyed and bail out
-    /// without touching the page table.
-    pub task_page_table_id: Option<usize>,
+    /// The task page table ID associated with this TA instance. Valid only
+    /// while `dead == false`.
+    pub task_page_table_id: usize,
+    /// Set when the TA panics or its last session closes. Any lock holder
+    /// should first check whether `dead == true` and if it is, bail without
+    /// touching `task_page_table_id`. `shim` and `loaded_program` remain
+    /// valid until the last `Arc` is dropped.
+    pub dead: bool,
 }
 
 // SAFETY: TaInstance is protected by SpinMutex and try_lock (`SessionEntry`)
@@ -398,11 +400,6 @@ impl SessionManager {
         &self.single_instance_cache
     }
 
-    /// Get a cached single-instance TA by UUID.
-    pub fn get_single_instance(&self, uuid: &TeeUuid) -> Option<Arc<SpinMutex<TaInstance>>> {
-        self.single_instance_cache.get(uuid)
-    }
-
     /// Cache a single-instance TA.
     pub fn cache_single_instance(&self, uuid: TeeUuid, instance: Arc<SpinMutex<TaInstance>>) {
         self.single_instance_cache.insert(uuid, instance);
@@ -515,8 +512,9 @@ impl SessionManager {
             let mut state = self.creation_state.lock();
 
             if is_single_instance {
-                // Re-check single-instance cache under the creation lock to close
-                // the TOCTOU window between the caller's get_single_instance() and here.
+                // Check the single-instance cache under the creation lock. A
+                // hit means another core finished creating the instance for
+                // this UUID; reuse it instead of starting a new load.
                 if let Some(existing) = self.single_instance_cache.get(uuid) {
                     return Ok(CreationReservation::ExistingSingleInstance(existing));
                 }
