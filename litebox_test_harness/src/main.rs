@@ -438,6 +438,7 @@ mod cow_test {
                     ("capture_assign_heap", test_capture_assign_heap),
                     ("child_write_parent_read", test_child_write_parent_read),
                     ("child_builtin_capture", test_child_builtin_capture),
+                    ("capture_dup2_stdout", test_capture_dup2_stdout),
                     ("sequential_captures", test_sequential_captures),
                     ("capture_with_preexisting_heap", test_capture_with_preexisting_heap),
                 ];
@@ -464,6 +465,7 @@ mod cow_test {
                     "capture_assign" => test_capture_assign,
                     "capture_assign_heap" => test_capture_assign_heap,
                     "child_write_parent_read" => test_child_write_parent_read,
+                    "capture_dup2_stdout" => test_capture_dup2_stdout,
                     "child_builtin_capture" => test_child_builtin_capture,
                     "sequential_captures" => test_sequential_captures,
                     "capture_with_preexisting_heap" => test_capture_with_preexisting_heap,
@@ -637,6 +639,51 @@ mod cow_test {
 
         // Both the pre-fork marker and pipe-read value should be intact
         n == 8 && val == 0xCAFE_BABE && pre_fork_marker == 0xDEAD_BEEF
+    }
+
+    /// Exact bash $() pattern: pipe, fork, child dup2's pipe write end
+    /// to stdout, child writes to stdout (now the pipe), child exits.
+    /// Parent closes write end, reads from read end.
+    /// This is the EXACT mechanism bash uses for command substitution.
+    fn test_capture_dup2_stdout() -> bool {
+        let mut pipefd = [0i32; 2];
+        if unsafe { libc::pipe(pipefd.as_mut_ptr()) } != 0 {
+            return false;
+        }
+
+        let pid = unsafe { libc::fork() };
+        if pid < 0 { return false; }
+        if pid == 0 {
+            // Child: redirect stdout to pipe write end
+            unsafe {
+                libc::close(pipefd[0]);       // close read end
+                libc::dup2(pipefd[1], 1);     // stdout = pipe write
+                libc::close(pipefd[1]);       // close original write end
+            }
+            // Write to stdout (= pipe) like a bash builtin would
+            let msg = b"dup2_captured\n";
+            unsafe { libc::write(1, msg.as_ptr() as *const _, msg.len()) };
+            unsafe { libc::_exit(0) };
+        }
+
+        // Parent: close write end, read from read end
+        unsafe { libc::close(pipefd[1]) };
+        let mut buf = [0u8; 128];
+        let n = unsafe { libc::read(pipefd[0], buf.as_mut_ptr() as *mut _, buf.len()) };
+        unsafe { libc::close(pipefd[0]) };
+        let mut status = 0i32;
+        unsafe { libc::waitpid(pid, &mut status, 0) };
+
+        if n <= 0 {
+            println!("  capture_dup2_stdout: read returned {n}");
+            return false;
+        }
+        let captured = std::str::from_utf8(&buf[..n as usize]).unwrap_or("").trim();
+        if captured != "dup2_captured" {
+            println!("  capture_dup2_stdout: got {:?} expected \"dup2_captured\"", captured);
+            return false;
+        }
+        true
     }
 
     /// Bash builtin capture: child is a no-exec subshell (like bash's
