@@ -248,9 +248,7 @@ impl SingleInstanceCache {
         self.inner.lock().remove(uuid)
     }
 
-    /// Remove a cached single-instance TA by UUID, but only if the currently
-    /// cached entry is the same `Arc` as `expected`.
-    pub fn remove_if_same(&self, uuid: &TeeUuid, expected: &Arc<SpinMutex<TaInstance>>) -> bool {
+    fn remove_if_same(&self, uuid: &TeeUuid, expected: &Arc<SpinMutex<TaInstance>>) -> bool {
         let mut guard = self.inner.lock();
         match guard.get(uuid) {
             Some(current) if Arc::ptr_eq(current, expected) => {
@@ -452,8 +450,6 @@ impl SessionManager {
 
     /// Remove a single-instance TA from the cache only if the currently
     /// cached `Arc` is the same as `expected`.
-    ///
-    /// See [`SingleInstanceCache::remove_if_same`].
     pub fn remove_single_instance_if_same(
         &self,
         uuid: &TeeUuid,

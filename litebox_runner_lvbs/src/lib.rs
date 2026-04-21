@@ -520,14 +520,9 @@ fn handle_open_session(
                     // Evict the zombie. Analog of OP-TEE's `maybe_release_ta_ctx`
                     // removing the dead ctx from `tee_ctxes`.
                     session_manager().remove_single_instance_if_same(&ta_uuid, &existing);
-                    write_msg_args_to_normal_world(
-                        msg_args,
-                        msg_args_phys_addr,
-                        TeeResult::TargetDead,
-                        None,
-                        None,
-                        Some(&ta_req_info),
-                    )?;
+                    msg_args.ret = TeeResult::TargetDead;
+                    msg_args.ret_origin = TeeOrigin::Tee;
+                    write_non_ta_msg_args_to_normal_world(msg_args, msg_args_phys_addr)?;
                     Ok(())
                 }
             }
@@ -652,14 +647,14 @@ fn open_session_single_instance(
                 );
 
                 // Write error response BEFORE switching page tables (accesses user memory)
-                write_msg_args_to_normal_world(
+                let write_result = write_msg_args_to_normal_world(
                     msg_args,
                     msg_args_phys_addr,
                     return_code,
                     None, // No session ID on failure
                     Some(&ta_params),
                     Some(ta_req_info),
-                )?;
+                );
 
                 session_manager().remove_single_instance(&ta_uuid);
                 // Mark the instance dead *before* teardown so any future
@@ -676,6 +671,7 @@ fn open_session_single_instance(
                 // INSTANCE_KEEP_CRASHED, we should respawn the TA here instead of just
                 // cleaning it up. Currently we always clean up on panic.
 
+                write_result?;
                 return Ok(OpenSessionOutcome::Done);
             }
         }
@@ -805,19 +801,20 @@ fn open_session_new_instance(
         );
 
         // Write error response back to normal world
-        write_msg_args_to_normal_world(
+        let write_result = write_msg_args_to_normal_world(
             msg_args,
             msg_args_phys_addr,
             ldelf_return_code,
             None, // No session ID on failure
             None,
             Some(ta_req_info),
-        )?;
+        );
 
         // Safety: We are about to tear down this TA instance;
         // no references to user-space memory will be held afterwards.
         unsafe { teardown_ta_page_table(&shim, task_pt_id) };
 
+        write_result?;
         return Ok(());
     }
 
@@ -883,19 +880,20 @@ fn open_session_new_instance(
         );
 
         // Write error response back to normal world
-        write_msg_args_to_normal_world(
+        let write_result = write_msg_args_to_normal_world(
             msg_args,
             msg_args_phys_addr,
             return_code,
             None, // No session ID on failure
             Some(&ta_params),
             Some(ta_req_info),
-        )?;
+        );
 
         // Safety: We are about to tear down this TA instance;
         // no references to user-space memory will be held afterwards.
         unsafe { teardown_ta_page_table(&shim, task_pt_id) };
 
+        write_result?;
         return Ok(());
     }
 
@@ -969,14 +967,9 @@ fn handle_invoke_command(
     if instance.dead {
         drop(instance);
         session_manager().unregister_session(session_id);
-        write_msg_args_to_normal_world(
-            msg_args,
-            msg_args_phys_addr,
-            TeeResult::TargetDead,
-            None,
-            None,
-            None,
-        )?;
+        msg_args.ret = TeeResult::TargetDead;
+        msg_args.ret_origin = TeeOrigin::Tee;
+        write_non_ta_msg_args_to_normal_world(msg_args, msg_args_phys_addr)?;
         debug_serial_println!(
             "InvokeCommand: session_id={} on already-destroyed TA instance",
             session_id
@@ -1043,14 +1036,14 @@ fn handle_invoke_command(
         session_manager().unregister_session(session_id);
 
         // Write response BEFORE switching page tables (accesses user memory)
-        write_msg_args_to_normal_world(
+        let write_result = write_msg_args_to_normal_world(
             msg_args,
             msg_args_phys_addr,
             return_code,
             None,
             Some(&ta_params),
             Some(&ta_req_info),
-        )?;
+        );
 
         // Clear single-instance cache so new OpenSessions for this UUID
         // create a fresh instance instead of hitting the zombie one.
@@ -1077,6 +1070,7 @@ fn handle_invoke_command(
         // INSTANCE_KEEP_CRASHED, we should respawn the TA here instead of just
         // cleaning it up. Currently we always clean up on panic.
 
+        write_result?;
         return Ok(());
     }
 
@@ -1124,14 +1118,9 @@ fn handle_close_session(
     if instance.dead {
         drop(instance);
         session_manager().unregister_session(session_id);
-        write_msg_args_to_normal_world(
-            msg_args,
-            msg_args_phys_addr,
-            TeeResult::Success,
-            None,
-            None,
-            None,
-        )?;
+        msg_args.ret = TeeResult::Success;
+        msg_args.ret_origin = TeeOrigin::TrustedApp;
+        write_non_ta_msg_args_to_normal_world(msg_args, msg_args_phys_addr)?;
         debug_serial_println!(
             "CloseSession complete: session_id={}, TA instance already destroyed",
             session_id
@@ -1167,14 +1156,14 @@ fn handle_close_session(
     }
 
     // CloseSession always succeeds (TA_CloseSessionEntryPoint returns void)
-    write_msg_args_to_normal_world(
+    let write_result = write_msg_args_to_normal_world(
         msg_args,
         msg_args_phys_addr,
         TeeResult::Success,
         None,
         None,
         None,
-    )?;
+    );
 
     // Clone the instance Arc before dropping the lock for later cleanup check
     let instance_arc = session_entry.instance.clone();
@@ -1199,7 +1188,7 @@ fn handle_close_session(
                     "CloseSession complete: session_id={}, TA kept alive (INSTANCE_KEEP_ALIVE flag)",
                     session_id
                 );
-                return Ok(());
+                return write_result;
             }
 
             // Clear single-instance cache if this was a single-instance TA
@@ -1229,7 +1218,7 @@ fn handle_close_session(
         );
     }
 
-    Ok(())
+    write_result
 }
 
 /// Update msg_args with return values and write back to normal world memory.
