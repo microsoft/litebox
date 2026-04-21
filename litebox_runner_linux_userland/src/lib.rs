@@ -1072,27 +1072,7 @@ fn run_fork_restore(cli_args: CliArgs) -> Result<()> {
     // Parse local pipe pair specs (child-only pipes).
     let local_pipes = parse_local_pipe_specs(&cli_args.local_pipe)?;
 
-    // Diagnostic: log stream and pipe specs
-    {
-        use std::io::Write;
-        if let Ok(mut f) = std::fs::OpenOptions::new()
-            .create(true).append(true)
-            .open("/tmp/litebox_worker_specs.txt") {
-            let _ = writeln!(f, "mux_streams: {} local_pipes: {} mux_fd: {:?}",
-                mux_streams.len(), local_pipes.len(), mux_fd);
-            for ms in &mux_streams {
-                let _ = writeln!(f, "  mux: stream={} fd={} dir={} eof={}",
-                    ms.stream_id, ms.guest_fd, ms.direction as char, ms.initial_eof);
-            }
-            for (i, (w, r, d, wf, rf)) in local_pipes.iter().enumerate() {
-                let _ = writeln!(f, "  local[{}]: write_fd={} read_fd={} drained={} w={} r={}",
-                    i, w, r, d.len(), wf, rf);
-            }
-            let _ = f.flush();
-        }
-    }
-
-    // Mark inherited fds as close-on-exec (except pipe bridge FDs and mux fd
+    // Mark inherited fds as close-on-exec(except pipe bridge FDs and mux fd
     // which the shim/dispatcher will use directly).
     for fd in [Some(snapshot_fd), Some(ack_fd), cli_args.worker_result_fd]
         .into_iter()
@@ -1421,22 +1401,11 @@ fn fork_restore_and_ack<FS: litebox_shim_linux::ShimFS>(
                     if write_fd == usize::MAX {
                         // Orphan pipe: create a real OS pipe, write drained
                         // data, close write end, install read end at guest fd.
-                        // Using a host pipe instead of a virtual pipe avoids
-                        // the pollee.wait mechanism entirely.
+                        // Using a host pipe avoids the pollee.wait mechanism
+                        // which doesn't work on non-guest background threads.
                         let (os_read, os_write) =
                             litebox_platform_multiplex::platform().create_host_pipe()
                                 .expect("create_host_pipe for orphan");
-                        // Log OS pipe fds
-                        {
-                            use std::io::Write;
-                            if let Ok(mut f) = std::fs::OpenOptions::new()
-                                .create(true).append(true)
-                                .open("/tmp/litebox_ospipe_fds.txt") {
-                                let _ = writeln!(f, "orphan OS pipe: os_read={} os_write={} guest_fd={}",
-                                    os_read, os_write, read_fd);
-                                let _ = f.flush();
-                            }
-                        }
                         if !drained.is_empty() {
                             let mut offset = 0;
                             while offset < drained.len() {
@@ -1732,27 +1701,9 @@ fn spawn_worker_mux_dispatcher(
             let mut did_work = false;
 
             // 1. Check socketpair for incoming messages (ParentToWorker data).
-            {
-                use std::io::Write;
-                if let Ok(mut f) = std::fs::OpenOptions::new()
-                    .create(true).append(true)
-                    .open("/tmp/litebox_worker_mux_loop.txt") {
-                    let _ = writeln!(f, "about to read mux_fd={}", mux_fd);
-                    let _ = f.flush();
-                }
-            }
             match platform.read_host_fd(mux_fd, &mut recv_buf) {
                 Ok(0) => {
                     // Socketpair closed — parent exited. Close all relay fds.
-                    {
-                        use std::io::Write;
-                        if let Ok(mut f) = std::fs::OpenOptions::new()
-                            .create(true).append(true)
-                            .open("/tmp/litebox_worker_mux_loop.txt") {
-                            let _ = writeln!(f, "SOCKETPAIR CLOSED (Ok(0))");
-                            let _ = f.flush();
-                        }
-                    }
                     #[cfg(feature = "trace_syscalls")]
                     eprintln!(
                         "[WORKER-MUX] socketpair closed (parent gone), {} open endpoints",
@@ -1769,16 +1720,6 @@ fn spawn_worker_mux_dispatcher(
                     if let Some(msg) = MuxMessage::deserialize(&recv_buf[..n])
                         && msg.msg_type == MSG_TYPE_DATA
                     {
-                        // Log ping from parent dispatcher
-                        if msg.stream_id == 99 {
-                            use std::io::Write;
-                            if let Ok(mut f) = std::fs::OpenOptions::new()
-                                .create(true).append(true)
-                                .open("/tmp/litebox_mux_ping.txt") {
-                                let _ = writeln!(f, "worker received ping from parent dispatcher!");
-                                let _ = f.flush();
-                            }
-                        }
                         #[cfg(feature = "trace_syscalls")]
                         eprintln!(
                             "[WORKER-MUX] recv stream={} flags={:#x} len={}",
@@ -1831,15 +1772,7 @@ fn spawn_worker_mux_dispatcher(
                 }
                 Err(litebox_common_linux::errno::Errno::EAGAIN) => {}
                 Err(e) => {
-                    {
-                        use std::io::Write;
-                        if let Ok(mut f) = std::fs::OpenOptions::new()
-                            .create(true).append(true)
-                            .open("/tmp/litebox_worker_mux_loop.txt") {
-                            let _ = writeln!(f, "SOCKETPAIR ERROR: {:?}", e);
-                            let _ = f.flush();
-                        }
-                    }
+                    let _ = e;
                     for (_, _, relay_fd) in &relay_endpoints {
                         let _ = pipes.close(relay_fd);
                     }
@@ -1849,30 +1782,6 @@ fn spawn_worker_mux_dispatcher(
             }
 
             // 2. Check WorkerToParent streams for data to send.
-            // Small delay to let the guest thread write before we drain.
-            if !did_work {
-                std::thread::sleep(std::time::Duration::from_millis(10));
-            }
-            static LOOP_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-            let lc = LOOP_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            {
-                use std::io::Write;
-                if let Ok(mut f) = std::fs::OpenOptions::new()
-                    .create(true).append(true)
-                    .open("/tmp/litebox_worker_mux_loop.txt") {
-                    let _ = writeln!(f, "loop iter={} did_work={} open={}",
-                        lc, did_work,
-                        closed_endpoints.iter().filter(|&&c| !c).count());
-                    // Log per-endpoint status
-                    for (idx, (sid, dir, relay_fd)) in relay_endpoints.iter().enumerate() {
-                        let eof = pipes.is_read_eof(relay_fd);
-                        let half = pipes.half_pipe_type(relay_fd);
-                        let _ = writeln!(f, "  ep[{}] stream={} dir={} closed={} eof={} half={:?}",
-                            idx, sid, *dir as char, closed_endpoints[idx], eof, half);
-                    }
-                    let _ = f.flush();
-                }
-            }
             for (idx, (stream_id, direction, relay_fd)) in relay_endpoints.iter().enumerate() {
                 if *direction != b'w' || closed_endpoints[idx] {
                     continue;
@@ -2199,8 +2108,11 @@ fn run_program<FS: litebox_shim_linux::ShimFS>(
     // Join ALL background tasks (parent mux dispatchers for child
     // forks, background waiters, etc.) before exiting.  Without
     // this, std::process::exit() kills threads and buffered mux
-    // data is lost.
-    litebox_platform_multiplex::platform().join_background_tasks();
+    // data is lost.  Use a 2-second timeout to avoid hanging on
+    // stuck dispatcher threads.
+    litebox_platform_multiplex::platform().join_background_tasks_timeout(
+        std::time::Duration::from_secs(2),
+    );
     if let Some(worker_result_fd) = worker_result_fd {
         write_worker_result(wait_status, worker_result_fd);
     }

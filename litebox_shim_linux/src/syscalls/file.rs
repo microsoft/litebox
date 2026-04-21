@@ -1091,38 +1091,6 @@ impl<FS: ShimFS> Task<FS> {
             return Err(Errno::EBADF);
         };
 
-        // Trace fork-restored reads for debugging — write to a host file
-        // since log_println goes to /dev/null on workers.
-        #[cfg(feature = "trace_syscalls")]
-        if fd == 4 && self.pid != 1 {
-            // Open /tmp/litebox_sysread_diag.txt, write, close
-            // Use raw syscalls to bypass shim.
-            unsafe {
-                let path = b"/tmp/litebox_sysread_diag.txt\0";
-                let ofd = syscalls::syscall4(
-                    syscalls::Sysno::openat,
-                    (-100_i32) as usize,
-                    path.as_ptr() as usize,
-                    (1 | 0x40 | 0x400) as usize, // O_WRONLY|O_CREAT|O_APPEND
-                    0o644_usize,
-                );
-                if let Ok(ofd) = ofd {
-                    let has_hp = self.files.borrow().try_host_pipe_fd(raw_fd).is_some();
-                    let msg = alloc::format!(
-                        "sys_read pid={} fd={} buf_len={} has_host_pipe={}\n",
-                        self.pid, fd, buf.len(), has_hp
-                    );
-                    let _ = syscalls::syscall3(
-                        syscalls::Sysno::write,
-                        ofd,
-                        msg.as_ptr() as usize,
-                        msg.len(),
-                    );
-                    let _ = syscalls::syscall1(syscalls::Sysno::close, ofd);
-                }
-            }
-        }
-
         // Netlink socket: return buffered data, 0 if empty.
         if let Some(nl) = self.netlink_sockets.borrow_mut().get_mut(&(raw_fd as u32)) {
             if !nl.has_data() {

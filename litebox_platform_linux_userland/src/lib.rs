@@ -2117,26 +2117,7 @@ impl LinuxUserland {
     where
         F: FnOnce() + Send + 'static,
     {
-        let handle = spawn_host_thread(move || {
-            // Catch panics from the task closure so we can log them.
-            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
-            if let Err(e) = result {
-                use std::io::Write;
-                if let Ok(mut file) = std::fs::OpenOptions::new()
-                    .create(true).append(true)
-                    .open("/tmp/litebox_bg_panic.txt") {
-                    let msg = if let Some(s) = e.downcast_ref::<&str>() {
-                        format!("background task PANICKED: {s}\n")
-                    } else if let Some(s) = e.downcast_ref::<String>() {
-                        format!("background task PANICKED: {s}\n")
-                    } else {
-                        "background task PANICKED: (unknown payload)\n".to_string()
-                    };
-                    let _ = file.write_all(msg.as_bytes());
-                    let _ = file.flush();
-                }
-            }
-        });
+        let handle = spawn_host_thread(f);
         self.background_handles.lock().unwrap().push(handle);
     }
 
@@ -2147,6 +2128,39 @@ impl LinuxUserland {
         let handles: Vec<_> = self.background_handles.lock().unwrap().drain(..).collect();
         for handle in handles {
             let _ = handle.join();
+        }
+    }
+
+    /// Like [`join_background_tasks`](Self::join_background_tasks) but
+    /// with a total timeout.  Tasks that haven't completed by the
+    /// deadline are abandoned (the OS reclaims them on process exit).
+    pub fn join_background_tasks_timeout(&self, timeout: std::time::Duration) {
+        let deadline = std::time::Instant::now() + timeout;
+        let handles: Vec<_> = self.background_handles.lock().unwrap().drain(..).collect();
+        for handle in handles {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            // std::thread::JoinHandle has no timeout API — use a
+            // helper thread + condvar to implement one.
+            let done = std::sync::Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+            let done2 = done.clone();
+            std::thread::spawn(move || {
+                let _ = handle.join();
+                let (lock, cvar) = &*done2;
+                *lock.lock().unwrap() = true;
+                cvar.notify_one();
+            });
+            let (lock, cvar) = &*done;
+            let mut finished = lock.lock().unwrap();
+            while !*finished {
+                let (guard, result) = cvar.wait_timeout(finished, remaining).unwrap();
+                finished = guard;
+                if result.timed_out() {
+                    break;
+                }
+            }
         }
     }
 
