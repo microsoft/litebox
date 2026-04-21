@@ -984,11 +984,14 @@ fn handle_invoke_command(
     let Some(mut instance) = session_entry.instance.try_lock() else {
         return Err(OpteeSmcReturnCode::EThreadLimit);
     };
-    // `task_page_table_id == None` means the instance was destroyed.
-    // Return `EBadCmd` because the client must start over with OpenSession.
-    let task_pt_id = instance
-        .task_page_table_id
-        .ok_or(OpteeSmcReturnCode::EBadCmd)?;
+    // `task_page_table_id == None` means the TA instance was already torn
+    // down (e.g., a prior InvokeCommand panicked with TARGET_DEAD). The
+    // session is orphaned.
+    let Some(task_pt_id) = instance.task_page_table_id else {
+        drop(instance);
+        session_manager().unregister_session(session_id);
+        return Err(OpteeSmcReturnCode::EBadCmd);
+    };
 
     // Switch to the TA instance's page table
     unsafe { switch_to_task_page_table(task_pt_id)? };
@@ -1032,8 +1035,17 @@ fn handle_invoke_command(
     let return_code: u32 = ctx.rax.truncate();
     let return_code = TeeResult::try_from(return_code).unwrap_or(TeeResult::GenericError);
 
-    // Per OP-TEE OS: if TA panics (TARGET_DEAD), clean up the session/instance
-    // Reference: tee_ta_invoke_command() in tee_ta_manager.c
+    // Per OP-TEE OS: if TA panics (TARGET_DEAD), the TA context is
+    // unrecoverable; all sessions on the same single-instance TA are
+    // implicitly dead (Ref: tee_ta_invoke_command() in tee_ta_manager.c).
+    // Tear down the instance so that any subsequent op on remaining
+    // sessions observes `task_page_table_id == None` and fails cleanly.
+    // Remaining sessions stay in the session map until their clients
+    // call CloseSession; at that point `handle_close_session`'s None
+    // path will unregister them and report Success. Note that we don't
+    // unregister/recycle those session IDs immediately to avoid potential
+    // use-after-free issues (clients don't know whether those session IDs
+    // are invalid).
     if return_code == TeeResult::TargetDead {
         debug_serial_println!(
             "InvokeCommand: TA panicked (TARGET_DEAD), session_id={}",
@@ -1042,17 +1054,9 @@ fn handle_invoke_command(
 
         let ta_uuid = session_entry.ta_uuid;
         let ta_flags = session_entry.ta_flags;
-        let instance_arc = session_entry.instance.clone();
 
-        // Remove the session from the map
+        // Remove this session from the map
         session_manager().unregister_session(session_id);
-
-        // Check if this was the last session using the TA instance by counting
-        // remaining sessions that reference this instance.
-        let remaining_sessions = session_manager()
-            .sessions()
-            .count_sessions_for_instance(&instance_arc);
-        let is_last_session = remaining_sessions == 0;
 
         // Write response BEFORE switching page tables (accesses user memory)
         write_msg_args_to_normal_world(
@@ -1064,31 +1068,32 @@ fn handle_invoke_command(
             Some(&ta_req_info),
         )?;
 
-        if is_last_session {
-            // Clear single-instance cache if applicable
-            if ta_flags.is_single_instance() {
-                session_manager().remove_single_instance(&ta_uuid);
-            }
-            instance.task_page_table_id = None;
-
-            // Safety: We are about to tear down this TA instance;
-            // no references to user-space memory will be held afterwards.
-            // The lock is held, so no other core can enter the TA.
-            unsafe { teardown_ta_page_table(&instance.shim, task_pt_id) };
-
-            drop(instance);
-
-            debug_serial_println!(
-                "InvokeCommand: cleaned up dead TA instance, task_pt_id={}",
-                task_pt_id
-            );
-
-            // TODO: Per OP-TEE OS semantics, if the TA has INSTANCE_KEEP_ALIVE but not
-            // INSTANCE_KEEP_CRASHED, we should respawn the TA here instead of just
-            // cleaning it up. Currently we always clean up on panic.
-        } else {
-            drop(instance);
+        // Clear single-instance cache so new OpenSessions for this UUID
+        // create a fresh instance instead of hitting the zombie one.
+        if ta_flags.is_single_instance() {
+            session_manager().remove_single_instance(&ta_uuid);
         }
+
+        // Invalidate the id in the struct *before* teardown so any other
+        // lock holder (on another session sharing this Arc) observes `None`
+        // and bails.
+        instance.task_page_table_id = None;
+
+        // Safety: We are about to tear down this TA instance;
+        // no references to user-space memory will be held afterwards.
+        // The lock is held, so no other core can enter the TA.
+        unsafe { teardown_ta_page_table(&instance.shim, task_pt_id) };
+
+        drop(instance);
+
+        debug_serial_println!(
+            "InvokeCommand: cleaned up dead TA instance, task_pt_id={}",
+            task_pt_id
+        );
+
+        // TODO: Per OP-TEE OS semantics, if the TA has INSTANCE_KEEP_ALIVE but not
+        // INSTANCE_KEEP_CRASHED, we should respawn the TA here instead of just
+        // cleaning it up. Currently we always clean up on panic.
 
         return Ok(());
     }
