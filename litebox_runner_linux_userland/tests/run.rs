@@ -112,6 +112,13 @@ impl Runner {
         self
     }
 
+    #[cfg(target_arch = "x86_64")]
+    fn program_from_tar(&mut self, guest_path: &str) -> &mut Self {
+        self.command.arg("--program-from-tar");
+        self.cmd_path = PathBuf::from(guest_path);
+        self
+    }
+
     #[cfg_attr(not(target_arch = "x86_64"), expect(dead_code))]
     fn with_fs_path(&mut self, f: impl FnOnce(&Path)) -> &mut Self {
         f(&self.tar_dir);
@@ -566,4 +573,34 @@ fn test_tun_with_curl() {
 
     let output_str = String::from_utf8_lossy(&output);
     assert!(output_str.contains(RESPONSE_BODY), "Unexpected curl output");
+}
+
+#[cfg(target_arch = "x86_64")]
+#[test]
+fn test_shebang() {
+    let bash_path = run_which("bash");
+
+    let output = Runner::new(Backend::Rewriter, &bash_path, "shebang_rewriter")
+        .with_fs_path(|out_dir| {
+            // Place a rewritten copy of bash inside the guest filesystem so the
+            // shebang interpreter path resolves.
+            let guest_bash = out_dir.join("out/bash");
+            let success = common::rewrite_with_cache(&bash_path, &guest_bash, &[]);
+            assert!(success, "failed to rewrite bash for guest FS");
+
+            // Create a shebang script pointing to the guest bash.
+            std::fs::write(
+                out_dir.join("out/script.sh"),
+                "#!/out/bash\necho shebang_test_passed\n",
+            )
+            .unwrap();
+        })
+        .program_from_tar("/out/script.sh")
+        .output();
+
+    let output_str = String::from_utf8_lossy(&output);
+    assert!(
+        output_str.contains("shebang_test_passed"),
+        "shebang test failed, output: {output_str}"
+    );
 }

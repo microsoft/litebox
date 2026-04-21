@@ -1588,9 +1588,8 @@ impl<FS: ShimFS> Task<FS> {
                 |_fd| Err(Errno::ENOTTY),
             )?,
             _ => {
-                #[cfg(debug_assertions)]
-                litebox_util_log::debug!(arg:? = arg; "unhandled ioctl");
-                todo!()
+                log_unsupported!("ioctl with arg {:?}", arg);
+                Err(Errno::EINVAL)
             }
         }
     }

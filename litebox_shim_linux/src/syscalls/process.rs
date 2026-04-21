@@ -835,7 +835,10 @@ impl<FS: ShimFS> Task<FS> {
             | litebox_common_linux::RlimitResource::STACK => {
                 self.thread.process.limits.get_rlimit(resource)
             }
-            _ => unimplemented!("Unsupported resource for get_rlimit: {:?}", resource),
+            _ => {
+                log_unsupported!("Unsupported resource for get_rlimit: {:?}", resource);
+                return Err(Errno::EINVAL);
+            }
         };
         if let Some(new_limit) = new_limit {
             if new_limit.rlim_cur > new_limit.rlim_max {
@@ -1340,6 +1343,64 @@ fn parse_shebang(buf: &[u8]) -> Option<(&str, Option<&str>)> {
 }
 
 impl<FS: ShimFS> Task<FS> {
+    /// Resolve shebang (`#!`) chains for the given path and argv.
+    ///
+    /// Opens the file at `path`, reads its header, and—if it begins with a
+    /// `#!` shebang line—rewrites `path` and `argv` to reference the
+    /// interpreter. This loops up to [`SHEBANG_MAX_RECURSION`] times to
+    /// support chained shebangs (e.g. a script whose interpreter is itself a
+    /// script). Returns the final (path, argv) once an ELF (or other
+    /// non-shebang) binary is reached.
+    pub(crate) fn resolve_shebang(
+        &self,
+        mut path: alloc::string::String,
+        mut argv: alloc::vec::Vec<alloc::ffi::CString>,
+    ) -> Result<(alloc::string::String, alloc::vec::Vec<alloc::ffi::CString>), Errno> {
+        let mut depth = 0u32;
+        loop {
+            let fd = {
+                use litebox::utils::ReinterpretSignedExt as _;
+                self.sys_open(
+                    path.as_str(),
+                    litebox::fs::OFlags::RDONLY,
+                    litebox::fs::Mode::empty(),
+                )?
+                .reinterpret_as_signed()
+            };
+            let mut header = [0u8; SHEBANG_MAX_LINE];
+            let n = match self.sys_read(fd, &mut header, Some(0)) {
+                Ok(n) => n,
+                Err(e) => {
+                    let _ = self.sys_close(fd);
+                    return Err(e);
+                }
+            };
+            let _ = self.sys_close(fd);
+
+            match parse_shebang(&header[..n]) {
+                Some((interp, opt_arg)) => {
+                    if depth >= SHEBANG_MAX_RECURSION {
+                        return Err(Errno::ELOOP);
+                    }
+                    let mut new_argv = alloc::vec::Vec::new();
+                    new_argv.push(alloc::ffi::CString::new(interp).map_err(|_| Errno::EINVAL)?);
+                    if let Some(arg) = opt_arg {
+                        new_argv.push(alloc::ffi::CString::new(arg).map_err(|_| Errno::EINVAL)?);
+                    }
+                    new_argv
+                        .push(alloc::ffi::CString::new(path.as_str()).map_err(|_| Errno::EINVAL)?);
+                    if argv.len() > 1 {
+                        new_argv.extend_from_slice(&argv[1..]);
+                    }
+                    path = alloc::string::String::from(interp);
+                    argv = new_argv;
+                    depth += 1;
+                }
+                None => return Ok((path, argv)),
+            }
+        }
+    }
+
     /// Handle syscall `execve`.
     pub(crate) fn sys_execve(
         &self,
@@ -1398,64 +1459,9 @@ impl<FS: ShimFS> Task<FS> {
         };
 
         // --- Shebang (#!) detection and rewriting ---
-        //
-        // If the target file begins with "#!", it is an interpreter script.
-        // We parse the interpreter path (and optional single argument) from the
-        // first line, then rewrite argv to:
-        //
-        //   [interpreter, optional_arg?, script_path, original_argv[1:]]
-        //
-        // and retry with the interpreter as the new executable. This matches
-        // Linux kernel binfmt_script semantics. We loop (up to
-        // SHEBANG_MAX_RECURSION times) to handle chained shebangs (e.g., a
-        // script whose interpreter is itself a script).
-        let mut path = alloc::string::String::from(path);
-        let mut argv_vec = argv_vec;
-        let mut shebang_depth = 0u32;
-        loop {
-            let fd = {
-                use litebox::utils::ReinterpretSignedExt as _;
-                self.sys_open(
-                    path.as_str(),
-                    litebox::fs::OFlags::RDONLY,
-                    litebox::fs::Mode::empty(),
-                )?
-                .reinterpret_as_signed()
-            };
-            let mut header = [0u8; SHEBANG_MAX_LINE];
-            let n = match self.sys_read(fd, &mut header, Some(0)) {
-                Ok(n) => n,
-                Err(e) => {
-                    let _ = self.sys_close(fd);
-                    return Err(e);
-                }
-            };
-            let _ = self.sys_close(fd);
+        let (path, argv_vec) = self.resolve_shebang(alloc::string::String::from(path), argv_vec)?;
 
-            match parse_shebang(&header[..n]) {
-                Some((interp, opt_arg)) => {
-                    if shebang_depth >= SHEBANG_MAX_RECURSION {
-                        return Err(Errno::ELOOP);
-                    }
-                    let mut new_argv = alloc::vec::Vec::new();
-                    new_argv.push(alloc::ffi::CString::new(interp).map_err(|_| Errno::EINVAL)?);
-                    if let Some(arg) = opt_arg {
-                        new_argv.push(alloc::ffi::CString::new(arg).map_err(|_| Errno::EINVAL)?);
-                    }
-                    new_argv
-                        .push(alloc::ffi::CString::new(path.as_str()).map_err(|_| Errno::EINVAL)?);
-                    if argv_vec.len() > 1 {
-                        new_argv.extend_from_slice(&argv_vec[1..]);
-                    }
-                    path = alloc::string::String::from(interp);
-                    argv_vec = new_argv;
-                    shebang_depth += 1;
-                }
-                None => break,
-            }
-        }
-
-        let loader = crate::loader::elf::ElfLoader::new(self, &path).map_err(Errno::from)?;
+        let loader = crate::loader::elf::ElfLoader::new(self, &path)?;
 
         // After this point, the old program is torn down and failures must terminate the process.
 

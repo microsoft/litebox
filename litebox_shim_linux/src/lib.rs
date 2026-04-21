@@ -256,8 +256,16 @@ impl<FS: ShimFS> LinuxShim<FS> {
                 signals: syscalls::signal::SignalState::new_process(),
             },
         };
+
+        // Shebang (#!) detection: if the target file starts with "#!", rewrite
+        // path/argv to the interpreter, matching sys_execve behaviour.
+        let (path, argv) = entrypoints
+            .task
+            .resolve_shebang(alloc::string::String::from(path), argv)
+            .map_err(loader::elf::ElfLoaderError::OpenError)?;
+
         entrypoints.task.load_program(
-            loader::elf::ElfLoader::new(&entrypoints.task, path)?,
+            loader::elf::ElfLoader::new(&entrypoints.task, &path)?,
             argv,
             envp,
         )?;

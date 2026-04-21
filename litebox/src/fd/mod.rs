@@ -624,7 +624,7 @@ impl RawDescriptorStorage {
         // If this assertion failure is hit in practice, we might need to be more defensive via the
         // HashMap, rather than just silently allow big growth
         assert!(
-            raw_fd < self.stored_fds.len() + 100,
+            raw_fd < self.stored_fds.len() + 256,
             "explicit upper bound restriction for now; see implementation details"
         );
         if self.stored_fds.get(raw_fd).is_some_and(Option::is_some) {
