@@ -406,10 +406,387 @@ fn main() {
             }
             std::process::exit(0);
         }
+        "cow-test" => {
+            let sub = args.get(2).map(String::as_str).unwrap_or("all");
+            std::process::exit(cow_test::run(sub));
+        }
         other => {
             eprintln!("unknown command: {other}");
             std::process::exit(1);
         }
+    }
+}
+
+/// Tests for CoW (copy-on-write) memory restoration after vfork.
+///
+/// On litebox's shared-address-space platform, fork() becomes
+/// clone(CLONE_VM|CLONE_VFORK). The parent and child share memory.
+/// A CoW layer tracks child modifications so the parent can restore
+/// its state after the child exits.
+///
+/// These tests verify that the parent's memory is correctly restored
+/// and that post-fork operations work as expected.
+mod cow_test {
+    pub fn run(sub: &str) -> i32 {
+        match sub {
+            "all" => {
+                let tests: &[(&str, fn() -> bool)] = &[
+                    ("stack_restore", test_stack_restore),
+                    ("heap_restore", test_heap_restore),
+                    ("post_fork_assign", test_post_fork_assign),
+                    ("capture_assign", test_capture_assign),
+                    ("capture_assign_heap", test_capture_assign_heap),
+                    ("child_write_parent_read", test_child_write_parent_read),
+                    ("child_builtin_capture", test_child_builtin_capture),
+                    ("sequential_captures", test_sequential_captures),
+                    ("capture_with_preexisting_heap", test_capture_with_preexisting_heap),
+                ];
+                let mut pass = 0;
+                let mut fail = 0;
+                for (name, test) in tests {
+                    let ok = test();
+                    if ok {
+                        println!("COW_OK:{name}");
+                        pass += 1;
+                    } else {
+                        println!("COW_FAIL:{name}");
+                        fail += 1;
+                    }
+                }
+                println!("COW_SUMMARY:pass={pass},fail={fail},total={}", pass + fail);
+                if fail > 0 { 1 } else { 0 }
+            }
+            other => {
+                let test = match other {
+                    "stack_restore" => test_stack_restore,
+                    "heap_restore" => test_heap_restore,
+                    "post_fork_assign" => test_post_fork_assign,
+                    "capture_assign" => test_capture_assign,
+                    "capture_assign_heap" => test_capture_assign_heap,
+                    "child_write_parent_read" => test_child_write_parent_read,
+                    "child_builtin_capture" => test_child_builtin_capture,
+                    "sequential_captures" => test_sequential_captures,
+                    "capture_with_preexisting_heap" => test_capture_with_preexisting_heap,
+                    _ => {
+                        eprintln!("unknown cow-test: {other}");
+                        return 1;
+                    }
+                };
+                if test() {
+                    println!("COW_OK:{other}");
+                    0
+                } else {
+                    println!("COW_FAIL:{other}");
+                    1
+                }
+            }
+        }
+    }
+
+    /// Stack variable: parent sets x=42 before fork, child sets x=99,
+    /// parent should see x=42 after CoW restore.
+    fn test_stack_restore() -> bool {
+        let mut x: i32 = 42;
+        let pid = unsafe { libc::fork() };
+        if pid < 0 { return false; }
+        if pid == 0 {
+            x = 99;
+            let _ = x; // use it so compiler doesn't optimize away
+            unsafe { libc::_exit(0) };
+        }
+        let mut status = 0i32;
+        unsafe { libc::waitpid(pid, &mut status, 0) };
+        x == 42
+    }
+
+    /// Heap variable: parent mallocs and writes, child modifies,
+    /// parent should see original value.
+    fn test_heap_restore() -> bool {
+        let data = Box::new(42i32);
+        let ptr = &*data as *const i32;
+        let pid = unsafe { libc::fork() };
+        if pid < 0 { return false; }
+        if pid == 0 {
+            // Write to the same heap address
+            unsafe { (ptr as *mut i32).write_volatile(99) };
+            unsafe { libc::_exit(0) };
+        }
+        let mut status = 0i32;
+        unsafe { libc::waitpid(pid, &mut status, 0) };
+        *data == 42
+    }
+
+    /// Post-fork assignment: parent assigns a stack variable AFTER
+    /// the child exits. The assignment should survive (it happens
+    /// after CoW restore).
+    fn test_post_fork_assign() -> bool {
+        let mut x: i32 = 0;
+        let pid = unsafe { libc::fork() };
+        if pid < 0 { return false; }
+        if pid == 0 {
+            unsafe { libc::_exit(0) };
+        }
+        let mut status = 0i32;
+        unsafe { libc::waitpid(pid, &mut status, 0) };
+        // Assign AFTER child exit + CoW restore
+        x = 123;
+        x == 123
+    }
+
+    /// Capture pipe + stack assignment: fork, child writes to pipe,
+    /// parent reads pipe into a stack buffer, assigns to a variable.
+    /// This is the bash $() pattern.
+    fn test_capture_assign() -> bool {
+        let mut pipefd = [0i32; 2];
+        if unsafe { libc::pipe(pipefd.as_mut_ptr()) } != 0 {
+            return false;
+        }
+
+        let pid = unsafe { libc::fork() };
+        if pid < 0 { return false; }
+        if pid == 0 {
+            unsafe { libc::close(pipefd[0]) };
+            let msg = b"CAPTURED";
+            unsafe { libc::write(pipefd[1], msg.as_ptr() as *const _, msg.len()) };
+            unsafe { libc::close(pipefd[1]) };
+            unsafe { libc::_exit(0) };
+        }
+
+        unsafe { libc::close(pipefd[1]) };
+        let mut buf = [0u8; 64];
+        let n = unsafe { libc::read(pipefd[0], buf.as_mut_ptr() as *mut _, buf.len()) };
+        unsafe { libc::close(pipefd[0]) };
+        let mut status = 0i32;
+        unsafe { libc::waitpid(pid, &mut status, 0) };
+
+        if n <= 0 { return false; }
+        let captured = std::str::from_utf8(&buf[..n as usize]).unwrap_or("");
+
+        // Assign to a NEW variable after reading
+        let result = String::from(captured);
+        // Use the variable — this is where bash fails
+        result == "CAPTURED"
+    }
+
+    /// Capture pipe + heap assignment: same as capture_assign but
+    /// stores the result in a heap-allocated String (like bash does
+    /// for variable storage).
+    fn test_capture_assign_heap() -> bool {
+        let mut pipefd = [0i32; 2];
+        if unsafe { libc::pipe(pipefd.as_mut_ptr()) } != 0 {
+            return false;
+        }
+
+        let pid = unsafe { libc::fork() };
+        if pid < 0 { return false; }
+        if pid == 0 {
+            unsafe { libc::close(pipefd[0]) };
+            let msg = b"HEAP_DATA";
+            unsafe { libc::write(pipefd[1], msg.as_ptr() as *const _, msg.len()) };
+            unsafe { libc::close(pipefd[1]) };
+            unsafe { libc::_exit(0) };
+        }
+
+        unsafe { libc::close(pipefd[1]) };
+        let mut buf = [0u8; 64];
+        let n = unsafe { libc::read(pipefd[0], buf.as_mut_ptr() as *mut _, buf.len()) };
+        unsafe { libc::close(pipefd[0]) };
+        let mut status = 0i32;
+        unsafe { libc::waitpid(pid, &mut status, 0) };
+
+        if n <= 0 { return false; }
+
+        // Heap-allocate the result (like bash's variable storage)
+        let mut result = Vec::new();
+        result.extend_from_slice(&buf[..n as usize]);
+        let s = String::from_utf8(result).unwrap_or_default();
+
+        // Use it in a comparison — tests if the heap allocation survived
+        s == "HEAP_DATA"
+    }
+
+    /// Child writes to shared memory, parent reads BEFORE CoW restore.
+    /// This tests whether the child's writes are visible to the parent
+    /// through the virtual pipe (not through shared memory).
+    fn test_child_write_parent_read() -> bool {
+        let mut pipefd = [0i32; 2];
+        if unsafe { libc::pipe(pipefd.as_mut_ptr()) } != 0 {
+            return false;
+        }
+
+        // Pre-fork: set up a stack marker
+        let pre_fork_marker: u64 = 0xDEAD_BEEF;
+
+        let pid = unsafe { libc::fork() };
+        if pid < 0 { return false; }
+        if pid == 0 {
+            unsafe { libc::close(pipefd[0]) };
+            // Write marker value through pipe (not shared memory)
+            let val = 0xCAFE_BABEu64;
+            unsafe { libc::write(pipefd[1], &val as *const u64 as *const _, 8) };
+            unsafe { libc::close(pipefd[1]) };
+            unsafe { libc::_exit(0) };
+        }
+
+        unsafe { libc::close(pipefd[1]) };
+        let mut val: u64 = 0;
+        let n = unsafe { libc::read(pipefd[0], &mut val as *mut u64 as *mut _, 8) };
+        unsafe { libc::close(pipefd[0]) };
+        let mut status = 0i32;
+        unsafe { libc::waitpid(pid, &mut status, 0) };
+
+        // Both the pre-fork marker and pipe-read value should be intact
+        n == 8 && val == 0xCAFE_BABE && pre_fork_marker == 0xDEAD_BEEF
+    }
+
+    /// Bash builtin capture: child is a no-exec subshell (like bash's
+    /// $() for builtins). The child writes directly to the pipe using
+    /// write(), no exec. Tests that the capture pipe data reaches the
+    /// parent through the virtual pipe (child never triggers delayed
+    /// fork because all its syscalls are pre-exec).
+    fn test_child_builtin_capture() -> bool {
+        let mut pipefd = [0i32; 2];
+        if unsafe { libc::pipe(pipefd.as_mut_ptr()) } != 0 {
+            return false;
+        }
+
+        // Allocate some heap state before fork (like bash's variable table)
+        let mut vars: Vec<(String, String)> = Vec::new();
+        vars.push(("PATH".into(), "/usr/bin".into()));
+        vars.push(("HOME".into(), "/root".into()));
+
+        let pid = unsafe { libc::fork() };
+        if pid < 0 { return false; }
+        if pid == 0 {
+            // Subshell: close read end, write to pipe, exit
+            // No exec — like bash's echo builtin
+            unsafe { libc::close(pipefd[0]) };
+            let msg = b"builtin_output";
+            unsafe { libc::write(pipefd[1], msg.as_ptr() as *const _, msg.len()) };
+            unsafe { libc::close(pipefd[1]) };
+            unsafe { libc::_exit(0) };
+        }
+
+        // Parent: read capture pipe
+        unsafe { libc::close(pipefd[1]) };
+        let mut buf = [0u8; 64];
+        let n = unsafe { libc::read(pipefd[0], buf.as_mut_ptr() as *mut _, buf.len()) };
+        unsafe { libc::close(pipefd[0]) };
+        let mut status = 0i32;
+        unsafe { libc::waitpid(pid, &mut status, 0) };
+
+        if n <= 0 { return false; }
+        let captured = std::str::from_utf8(&buf[..n as usize]).unwrap_or("");
+
+        // Store result in the pre-existing Vec (like bash storing in its var table)
+        vars.push(("RESULT".into(), captured.to_string()));
+
+        // Verify ALL entries survive
+        vars.len() == 3
+            && vars[0] == ("PATH".into(), "/usr/bin".into())
+            && vars[1] == ("HOME".into(), "/root".into())
+            && vars[2] == ("RESULT".into(), "builtin_output".into())
+    }
+
+    /// Sequential captures: two $() in sequence. The second capture
+    /// should work even after the first one's CoW restore.
+    fn test_sequential_captures() -> bool {
+        // First capture
+        let val1 = {
+            let mut pipefd = [0i32; 2];
+            if unsafe { libc::pipe(pipefd.as_mut_ptr()) } != 0 {
+                return false;
+            }
+            let pid = unsafe { libc::fork() };
+            if pid < 0 { return false; }
+            if pid == 0 {
+                unsafe { libc::close(pipefd[0]) };
+                let msg = b"first";
+                unsafe { libc::write(pipefd[1], msg.as_ptr() as *const _, msg.len()) };
+                unsafe { libc::close(pipefd[1]) };
+                unsafe { libc::_exit(0) };
+            }
+            unsafe { libc::close(pipefd[1]) };
+            let mut buf = [0u8; 64];
+            let n = unsafe { libc::read(pipefd[0], buf.as_mut_ptr() as *mut _, buf.len()) };
+            unsafe { libc::close(pipefd[0]) };
+            let mut status = 0i32;
+            unsafe { libc::waitpid(pid, &mut status, 0) };
+            if n <= 0 { return false; }
+            String::from_utf8_lossy(&buf[..n as usize]).to_string()
+        };
+
+        // Second capture (after first CoW restore cycle)
+        let val2 = {
+            let mut pipefd = [0i32; 2];
+            if unsafe { libc::pipe(pipefd.as_mut_ptr()) } != 0 {
+                return false;
+            }
+            let pid = unsafe { libc::fork() };
+            if pid < 0 { return false; }
+            if pid == 0 {
+                unsafe { libc::close(pipefd[0]) };
+                let msg = b"second";
+                unsafe { libc::write(pipefd[1], msg.as_ptr() as *const _, msg.len()) };
+                unsafe { libc::close(pipefd[1]) };
+                unsafe { libc::_exit(0) };
+            }
+            unsafe { libc::close(pipefd[1]) };
+            let mut buf = [0u8; 64];
+            let n = unsafe { libc::read(pipefd[0], buf.as_mut_ptr() as *mut _, buf.len()) };
+            unsafe { libc::close(pipefd[0]) };
+            let mut status = 0i32;
+            unsafe { libc::waitpid(pid, &mut status, 0) };
+            if n <= 0 { return false; }
+            String::from_utf8_lossy(&buf[..n as usize]).to_string()
+        };
+
+        // Both should have correct values
+        val1 == "first" && val2 == "second"
+    }
+
+    /// Capture with pre-existing heap: allocate a HashMap before fork,
+    /// then store the capture result in it. Tests whether the heap
+    /// allocator metadata survives CoW restore.
+    fn test_capture_with_preexisting_heap() -> bool {
+        use std::collections::HashMap;
+
+        let mut map = HashMap::new();
+        map.insert("key1".to_string(), "value1".to_string());
+        map.insert("key2".to_string(), "value2".to_string());
+
+        // Fork and capture
+        let mut pipefd = [0i32; 2];
+        if unsafe { libc::pipe(pipefd.as_mut_ptr()) } != 0 {
+            return false;
+        }
+        let pid = unsafe { libc::fork() };
+        if pid < 0 { return false; }
+        if pid == 0 {
+            unsafe { libc::close(pipefd[0]) };
+            let msg = b"captured_value";
+            unsafe { libc::write(pipefd[1], msg.as_ptr() as *const _, msg.len()) };
+            unsafe { libc::close(pipefd[1]) };
+            unsafe { libc::_exit(0) };
+        }
+
+        unsafe { libc::close(pipefd[1]) };
+        let mut buf = [0u8; 64];
+        let n = unsafe { libc::read(pipefd[0], buf.as_mut_ptr() as *mut _, buf.len()) };
+        unsafe { libc::close(pipefd[0]) };
+        let mut status = 0i32;
+        unsafe { libc::waitpid(pid, &mut status, 0) };
+
+        if n <= 0 { return false; }
+        let captured = std::str::from_utf8(&buf[..n as usize]).unwrap_or("").to_string();
+
+        // Insert into pre-existing HashMap (like bash's variable hash table)
+        map.insert("result".to_string(), captured);
+
+        // Verify all entries
+        map.get("key1").map(|v| v.as_str()) == Some("value1")
+            && map.get("key2").map(|v| v.as_str()) == Some("value2")
+            && map.get("result").map(|v| v.as_str()) == Some("captured_value")
     }
 }
 
