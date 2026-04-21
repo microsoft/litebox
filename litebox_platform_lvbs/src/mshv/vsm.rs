@@ -898,22 +898,16 @@ fn mshv_vsm_allocate_ringbuffer_memory(phys_addr: u64, size: usize) -> Result<i6
 
 /// This function sets the platform root key by copying key data from VTL0.
 ///
-/// - `key_pa`: The physical address (VTL0) of the platform root key.
-/// - `key_size`: The size of the platform root key.
+/// - `key_pa`: Physical address (VTL0) that the platform root key is stored at.
 ///
-/// This function assumes that the caller stores the key data in a single or
-/// contiguous physical memory page(s). If the caller cannot ensure this,
-/// we should make this function use `HekiPage`.
-fn mshv_vsm_set_platform_root_key(key_pa: u64, key_size: u64) -> Result<i64, VsmError> {
+/// This function assumes that the caller stores key bytes in a single or
+/// contiguous physical memory page(s), whose length is equal to `PRK_LEN`.
+fn mshv_vsm_set_platform_root_key(key_pa: u64) -> Result<i64, VsmError> {
     if crate::platform_low().vtl0_kernel_info.check_end_of_boot() {
         return Err(VsmError::OperationAfterEndOfBoot("set platform root key"));
     }
 
     let key_pa = PhysAddr::try_new(key_pa).map_err(|_| VsmError::InvalidPhysicalAddress)?;
-    let key_size: usize = key_size.truncate();
-    if key_size != PRK_LEN {
-        return Err(VsmError::PlatformRootKeyInvalid);
-    }
 
     let mut keybuf = [0u8; PRK_LEN];
     if unsafe { crate::platform_low().copy_slice_from_vtl0_phys(key_pa, &mut keybuf) } {
@@ -947,7 +941,7 @@ pub fn vsm_dispatch(func_id: VsmFunction, params: &[u64]) -> i64 {
             let size: usize = params[1].truncate();
             mshv_vsm_allocate_ringbuffer_memory(params[0], size)
         }
-        VsmFunction::SetPlatformRootKey => mshv_vsm_set_platform_root_key(params[0], params[1]),
+        VsmFunction::SetPlatformRootKey => mshv_vsm_set_platform_root_key(params[0]),
         VsmFunction::OpteeMessage => Err(VsmError::OperationNotSupported("OP-TEE communication")),
     };
     match result {
