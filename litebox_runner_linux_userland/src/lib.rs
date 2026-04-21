@@ -1849,6 +1849,10 @@ fn spawn_worker_mux_dispatcher(
             }
 
             // 2. Check WorkerToParent streams for data to send.
+            // Small delay to let the guest thread write before we drain.
+            if !did_work {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
             static LOOP_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
             let lc = LOOP_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             {
@@ -1877,15 +1881,27 @@ fn spawn_worker_mux_dispatcher(
                     Ok(data) if data.is_empty() => {
                         // Nothing buffered — check if sender closed.
                         if pipes.is_read_eof(relay_fd) {
-                            #[cfg(feature = "trace_syscalls")]
-                            {
-                                let reason = match pipes.half_pipe_type(relay_fd) {
-                                    Ok(_) => "peer_shutdown",
-                                    Err(_) => "dt_entry_gone",
-                                };
-                                eprintln!(
-                                    "[WORKER-MUX] stream={stream_id} is_read_eof=true ({reason}), sending EOF",
-                                );
+                            // Final drain: the sender may have written data
+                            // and then closed between our drain and the eof
+                            // check.  Drain one more time to capture any
+                            // last-moment writes.
+                            if let Ok(final_data) = pipes.drain_available(relay_fd) {
+                                if !final_data.is_empty() {
+                                    did_work = true;
+                                    for chunk in final_data.chunks(MUX_MAX_PAYLOAD) {
+                                        let msg = MuxMessage::data(*stream_id, chunk.to_vec());
+                                        let buf = msg.serialize();
+                                        loop {
+                                            match platform.write_host_fd(mux_fd, &buf) {
+                                                Ok(w) if w == buf.len() => break,
+                                                Err(litebox_common_linux::errno::Errno::EAGAIN) => {
+                                                    std::thread::sleep(std::time::Duration::from_micros(100));
+                                                }
+                                                _ => break,
+                                            }
+                                        }
+                                    }
+                                }
                             }
                             let _ = pipes.close(relay_fd);
                             let msg = MuxMessage::eof(*stream_id);

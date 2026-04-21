@@ -730,17 +730,7 @@ mod capture_pipe_test {
             // ── Child continues ──
             unsafe { libc::close(inner[1]) };
             let mut buf = [0u8; 4096];
-            // Write inner[0] fd number to stderr for debugging
-            {
-                let msg = format!("CHILD: reading from fd={}\n", inner[0]);
-                unsafe { libc::write(2, msg.as_ptr() as *const _, msg.len()) };
-            }
             let first_n = unsafe { libc::read(inner[0], buf.as_mut_ptr() as *mut _, buf.len()) };
-            {
-                let msg = format!("CHILD: first read returned {}, errno={}\n", first_n,
-                    if first_n < 0 { unsafe { *libc::__errno_location() } } else { 0 });
-                unsafe { libc::write(2, msg.as_ptr() as *const _, msg.len()) };
-            }
             if first_n > 0 {
                 unsafe { libc::write(1, buf.as_ptr() as *const _, first_n as usize) };
                 // Continue reading for EOF
@@ -751,6 +741,10 @@ mod capture_pipe_test {
                     }
                     unsafe { libc::write(1, buf.as_ptr() as *const _, n as usize) };
                 }
+            } else {
+                // Read failed — write error info to capture pipe
+                let msg = format!("READ_FAIL:n={},fd={}\n", first_n, inner[0]);
+                unsafe { libc::write(1, msg.as_ptr() as *const _, msg.len()) };
             }
             unsafe { libc::close(inner[0]) };
 
