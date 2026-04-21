@@ -212,6 +212,11 @@ fn build_rootfs(test_binary: &Path) -> tempfile::TempDir {
                 }
             });
         }
+        // Ensure /usr/bin/sh exists — many tests use "sh" as the shell.
+        let sh_dest = rootfs.join("usr/bin/sh");
+        if !sh_dest.exists() {
+            let _ = std::os::unix::fs::symlink("bash", &sh_dest);
+        }
     }
 
     // 9. Pre-existing symlink in /shared for symlink read-only tests.
@@ -417,12 +422,15 @@ fn process_tree_tests() {
     // Known litebox failures (real platform gaps):
     //   US1,3,4,5 + VS1: bare-fork unix socket tests timeout (5)
     //   XW3,4: cross-worker unix socket connect ECONNREFUSED (2)
-    // Total FAIL: 7
+    //   SS.{pipe_in_subst,multi_pipe_subst,file_pipe_subst,subst_then_cmds,
+    //       vscode_osrelease,backtick_pipe}.{sh,bash}.{A,AA}: command
+    //       substitution piping loses stdout in litebox (6×2×2 = 24)
+    // Total FAIL: 31
     //
     // XPASS (litebox does better than expected):
     //   S.relative.read_through: relative symlink works despite ENOTSUP probe (1)
     const EXPECTED_XFAIL_COUNT: usize = 23;
-    const EXPECTED_FAIL_COUNT: usize = 7;
+    const EXPECTED_FAIL_COUNT: usize = 31;
     const EXPECTED_XPASS_COUNT: usize = 1;
     check_results(
         "litebox",

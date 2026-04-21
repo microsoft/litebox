@@ -196,10 +196,7 @@ async fn agent_loop(self_exe: &str) {
             Command::NetListen { port } => {
                 match TcpListener::bind(format!("0.0.0.0:{port}")).await {
                     Ok(listener) => {
-                        let actual_port = listener
-                            .local_addr()
-                            .map(|a| a.port())
-                            .unwrap_or(port);
+                        let actual_port = listener.local_addr().map(|a| a.port()).unwrap_or(port);
                         // Spawn echo server task.
                         let task = tokio::spawn(async move {
                             loop {
@@ -373,48 +370,48 @@ async fn agent_loop(self_exe: &str) {
                     let mut child_stdout = child.stdout.take().unwrap();
                     let mut child_stderr = child.stderr.take().unwrap();
 
-                // Collect stdout/stderr and wait, with timeout for deadlock detection.
-                let result = tokio::time::timeout(timeout, async {
-                    let mut out = Vec::new();
-                    let mut err = Vec::new();
-                    let (r1, r2, status) = tokio::join!(
-                        tokio::io::AsyncReadExt::read_to_end(&mut child_stdout, &mut out),
-                        tokio::io::AsyncReadExt::read_to_end(&mut child_stderr, &mut err),
-                        child.wait(),
-                    );
-                    let _ = r1;
-                    let _ = r2;
-                    (out, err, status)
-                })
-                .await;
+                    // Collect stdout/stderr and wait, with timeout for deadlock detection.
+                    let result = tokio::time::timeout(timeout, async {
+                        let mut out = Vec::new();
+                        let mut err = Vec::new();
+                        let (r1, r2, status) = tokio::join!(
+                            tokio::io::AsyncReadExt::read_to_end(&mut child_stdout, &mut out),
+                            tokio::io::AsyncReadExt::read_to_end(&mut child_stderr, &mut err),
+                            child.wait(),
+                        );
+                        let _ = r1;
+                        let _ = r2;
+                        (out, err, status)
+                    })
+                    .await;
 
-                match result {
-                    Ok((out, err, Ok(status))) => {
-                        respond(&Response::ExecResult {
-                            exit_code: status.code().unwrap_or(-1),
-                            stdout: String::from_utf8_lossy(&out).trim().to_string(),
-                            stderr: String::from_utf8_lossy(&err).trim().to_string(),
-                        })
-                        .await;
-                    }
-                    Ok((_, _, Err(e))) => {
-                        respond(&Response::Error {
-                            error: format!("exec wait: {e}"),
-                        })
-                        .await;
-                    }
-                    Err(_) => {
-                        // Timed out — send SIGKILL but don't await (wait can
-                        // hang in litebox due to process reaping bug).
-                        let _ = child.start_kill();
-                        respond(&Response::ExecTimeout {
-                            stderr: format!(
-                                "process timed out after {}s (likely deadlocked)",
-                                timeout.as_secs()
-                            ),
-                        })
-                        .await;
-                    }
+                    match result {
+                        Ok((out, err, Ok(status))) => {
+                            respond(&Response::ExecResult {
+                                exit_code: status.code().unwrap_or(-1),
+                                stdout: String::from_utf8_lossy(&out).trim().to_string(),
+                                stderr: String::from_utf8_lossy(&err).trim().to_string(),
+                            })
+                            .await;
+                        }
+                        Ok((_, _, Err(e))) => {
+                            respond(&Response::Error {
+                                error: format!("exec wait: {e}"),
+                            })
+                            .await;
+                        }
+                        Err(_) => {
+                            // Timed out — send SIGKILL but don't await (wait can
+                            // hang in litebox due to process reaping bug).
+                            let _ = child.start_kill();
+                            respond(&Response::ExecTimeout {
+                                stderr: format!(
+                                    "process timed out after {}s (likely deadlocked)",
+                                    timeout.as_secs()
+                                ),
+                            })
+                            .await;
+                        }
                     }
                 }
             }
@@ -523,6 +520,125 @@ async fn agent_loop(self_exe: &str) {
                         })
                         .await;
                     }
+                }
+            }
+
+            Command::PollReady { timeout_ms } => {
+                // Create a pipe, write data, poll read-end for POLLIN.
+                let result = (|| -> Result<&str, String> {
+                    let mut pipe_fds = [0i32; 2];
+                    if unsafe { libc::pipe(pipe_fds.as_mut_ptr()) } != 0 {
+                        return Err("pipe() failed".into());
+                    }
+                    let (read_fd, write_fd) = (pipe_fds[0], pipe_fds[1]);
+                    let data = b"poll_test_data";
+                    unsafe {
+                        libc::write(write_fd, data.as_ptr() as *const _, data.len());
+                    }
+                    let mut fds = [libc::pollfd {
+                        fd: read_fd,
+                        events: libc::POLLIN,
+                        revents: 0,
+                    }];
+                    let n = unsafe { libc::poll(fds.as_mut_ptr(), 1, timeout_ms as i32) };
+                    unsafe {
+                        libc::close(write_fd);
+                        libc::close(read_fd);
+                    }
+                    if n > 0 && (fds[0].revents & libc::POLLIN) != 0 {
+                        Ok("POLLIN")
+                    } else {
+                        Ok("TIMEOUT")
+                    }
+                })();
+                match result {
+                    Ok(status) => {
+                        respond(&Response::Ok {
+                            data: Some(status.to_string()),
+                        })
+                        .await
+                    }
+                    Err(e) => respond(&Response::Error { error: e }).await,
+                }
+            }
+
+            Command::BindGetsockname { family } => {
+                let result = match family.as_str() {
+                    "ipv4" => {
+                        let sock = std::net::TcpListener::bind("0.0.0.0:0");
+                        sock.map(|s| s.local_addr().map(|a| a.port()).unwrap_or(0))
+                            .map_err(|e| format!("{e}"))
+                    }
+                    "ipv6" => {
+                        let sock = std::net::TcpListener::bind("[::]:0");
+                        sock.map(|s| s.local_addr().map(|a| a.port()).unwrap_or(0))
+                            .map_err(|e| format!("{e}"))
+                    }
+                    other => Err(format!("unknown family: {other}")),
+                };
+                match result {
+                    Ok(port) => {
+                        respond(&Response::Ok {
+                            data: Some(format!("port={port}")),
+                        })
+                        .await;
+                    }
+                    Err(e) => respond(&Response::Error { error: e }).await,
+                }
+            }
+
+            Command::PipePairIdUnique { count } => {
+                // Create+drop pipes, then create more and check for inode reuse.
+                // On native Linux inodes are unique so this always passes.
+                // On litebox, Arc::as_ptr() pair_ids could collide after free.
+                use std::collections::HashSet;
+                let result = (|| -> Result<String, String> {
+                    let mut first_batch = HashSet::new();
+                    let mut fds = Vec::new();
+                    for _ in 0..count {
+                        let mut pipe_fds = [0i32; 2];
+                        if unsafe { libc::pipe(pipe_fds.as_mut_ptr()) } != 0 {
+                            return Err("pipe() failed".into());
+                        }
+                        // Use inode as proxy for pair_id.
+                        let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+                        if unsafe { libc::fstat(pipe_fds[0], &mut stat) } == 0 {
+                            first_batch.insert(stat.st_ino);
+                        }
+                        fds.push(pipe_fds);
+                    }
+                    for pipe_fds in fds.drain(..) {
+                        unsafe {
+                            libc::close(pipe_fds[0]);
+                            libc::close(pipe_fds[1]);
+                        }
+                    }
+                    let mut collisions = 0u32;
+                    for _ in 0..count {
+                        let mut pipe_fds = [0i32; 2];
+                        if unsafe { libc::pipe(pipe_fds.as_mut_ptr()) } != 0 {
+                            return Err("pipe() failed".into());
+                        }
+                        let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+                        if unsafe { libc::fstat(pipe_fds[0], &mut stat) } == 0
+                            && first_batch.contains(&stat.st_ino)
+                        {
+                            collisions += 1;
+                        }
+                        unsafe {
+                            libc::close(pipe_fds[0]);
+                            libc::close(pipe_fds[1]);
+                        }
+                    }
+                    if collisions > 0 {
+                        Err(format!("collision: {collisions}/{count} ids reused"))
+                    } else {
+                        Ok("unique".to_string())
+                    }
+                })();
+                match result {
+                    Ok(msg) => respond(&Response::Ok { data: Some(msg) }).await,
+                    Err(e) => respond(&Response::Error { error: e }).await,
                 }
             }
 
