@@ -1215,21 +1215,14 @@ impl<FS: ShimFS> UnixSocket<FS> {
         let is_nonblocking =
             flags.contains(SendFlags::DONTWAIT) || self.get_status().contains(OFlags::NONBLOCK);
         let timeout = self.options.lock().send_timeout;
-        let ret = match &self.inner {
+        match &self.inner {
             UnixSocketInner::Stream(stream) => {
                 stream.sendto(&task.wait_cx(), timeout, buf, is_nonblocking, addr)
             }
             UnixSocketInner::Datagram(datagram) => {
                 datagram.sendto(task, timeout, buf, is_nonblocking, addr)
             }
-        };
-        if let Err(Errno::EPIPE) = ret
-            && !flags.contains(SendFlags::NOSIGNAL)
-        {
-            // TODO: send SIGPIPE signal
-            unimplemented!("send SIGPIPE on EPIPE");
         }
-        ret
     }
 
     pub(super) fn recvfrom(

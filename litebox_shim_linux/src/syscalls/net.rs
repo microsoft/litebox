@@ -28,11 +28,11 @@ use litebox::{
 };
 use litebox_common_linux::{
     AddressFamily, FileDescriptorFlags, IPProtocol, ReceiveFlags, SendFlags, SockFlags, SockType,
-    SocketOption, SocketOptionName, TcpOption, UnixProtocol, errno::Errno,
+    SocketOption, SocketOptionName, TcpOption, UnixProtocol, errno::Errno, signal::Signal,
 };
 use zerocopy::{FromBytes, Immutable, IntoBytes};
 
-use crate::{ConstPtr, MutPtr};
+use crate::{ConstPtr, MutPtr, syscalls::signal::siginfo_kill};
 use crate::{GlobalState, ShimFS, Task};
 use crate::{
     Platform,
@@ -737,7 +737,8 @@ impl<FS: ShimFS> GlobalState<FS> {
         }
 
         // Convert `SendFlags` to `litebox::net::SendFlags`
-        // `DONTWAIT` and `NOSIGNAL` are handled in this function so we don't convert them.
+        // `DONTWAIT` is handled in this function and `NOSIGNAL` should be handled by caller,
+        // so we don't convert them.
         let new_flags = convert_flags!(
             flags,
             SendFlags,
@@ -753,8 +754,7 @@ impl<FS: ShimFS> GlobalState<FS> {
         let is_nonblock =
             self.get_status(fd).contains(OFlags::NONBLOCK) || flags.contains(SendFlags::DONTWAIT);
 
-        let ret = cx
-            .with_timeout(timeout)
+        cx.with_timeout(timeout)
             .wait_on_events(
                 is_nonblock,
                 Events::OUT,
@@ -768,13 +768,7 @@ impl<FS: ShimFS> GlobalState<FS> {
                     Err(e) => Err(TryOpError::Other(Errno::from(e))),
                 },
             )
-            .map_err(Errno::from);
-        if let Err(Errno::EPIPE) = ret
-            && !flags.contains(SendFlags::NOSIGNAL)
-        {
-            unimplemented!("send signal SIGPIPE on EPIPE");
-        }
-        ret
+            .map_err(Errno::from)
     }
 
     /// Receive data via socket channel (lock-free path).
@@ -1342,7 +1336,7 @@ impl<FS: ShimFS> Task<FS> {
         flags: SendFlags,
         sockaddr: Option<SocketAddress>,
     ) -> Result<usize, Errno> {
-        self.files.borrow().with_socket(
+        let res = self.files.borrow().with_socket(
             &self.global,
             sockfd,
             |fd| {
@@ -1360,7 +1354,13 @@ impl<FS: ShimFS> Task<FS> {
                     .transpose()?;
                 file.sendto(self, buf, flags, addr)
             },
-        )
+        );
+        if let Err(Errno::EPIPE) = res
+            && !flags.contains(SendFlags::NOSIGNAL)
+        {
+            self.send_signal(Signal::SIGPIPE, siginfo_kill(Signal::SIGPIPE));
+        }
+        res
     }
 
     /// Handle syscall `sendmsg`
@@ -1402,7 +1402,7 @@ impl<FS: ShimFS> Task<FS> {
             .msg_iov
             .to_owned_slice(msg.msg_iovlen)
             .ok_or(Errno::EFAULT)?;
-        self.files.borrow().with_socket(
+        let res = self.files.borrow().with_socket(
             &self.global,
             sockfd,
             |fd| {
@@ -1443,7 +1443,13 @@ impl<FS: ShimFS> Task<FS> {
                 }
                 Ok(total_sent)
             },
-        )
+        );
+        if let Err(Errno::EPIPE) = res
+            && !flags.contains(SendFlags::NOSIGNAL)
+        {
+            self.send_signal(Signal::SIGPIPE, siginfo_kill(Signal::SIGPIPE));
+        }
+        res
     }
 
     /// Handle syscall `recvfrom`
