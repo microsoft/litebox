@@ -467,7 +467,7 @@ fn run_rewritten_hello_static(ctx: BenchCtx<'_>) -> Result<()> {
     } else {
         cmd!(
             sh,
-            "{project_root}/target/release/litebox_runner_linux_userland --unstable --interception-backend rewriter hello_static_rewritten"
+            "{project_root}/target/release/litebox_runner_linux_userland --unstable hello_static_rewritten"
         ).run()?;
     }
     Ok(())
@@ -623,7 +623,7 @@ fn run_rewritten_node(ctx: BenchCtx<'_>) -> Result<()> {
         let mode = if release_mode { "release" } else { "debug" };
         cmd!(
             sh,
-            "{project_root}/target/{mode}/litebox_runner_linux_userland --unstable --interception-backend rewriter --env HOME=/ --initial-files {tar_file} node_rewritten hello_world.js"
+            "{project_root}/target/{mode}/litebox_runner_linux_userland --unstable --env HOME=/ --initial-files {tar_file} node_rewritten hello_world.js"
         ).run()?;
     }
     Ok(())
@@ -710,7 +710,7 @@ fn run_rewritten_iperf3(ctx: BenchCtx<'_>) -> Result<()> {
             let sh = xshell::Shell::new()?;
             cmd!(
                 sh,
-                "{runner} --unstable --interception-backend rewriter --env LD_LIBRARY_PATH=/lib64:/lib32:/lib --env HOME=/ --tun-device-name tun99 --initial-files {tar_file} {iperf3_rewritten} -s -1 -B 10.0.0.2"
+                "{runner} --unstable --env LD_LIBRARY_PATH=/lib64:/lib32:/lib --env HOME=/ --tun-device-name tun99 --initial-files {tar_file} {iperf3_rewritten} -s -1 -B 10.0.0.2"
             ).run()?;
             Ok(())
         });

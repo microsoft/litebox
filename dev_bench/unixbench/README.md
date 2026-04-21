@@ -143,5 +143,5 @@ python run_unixbench.py --mode litebox --windows --prepared-dir ./prepared --run
 ```
 
 **Key differences from Linux mode:**
-- No `--interception-backend` or `--rewrite-syscalls` needed — binaries are already pre-rewritten
+- No `--rewrite-syscalls` needed — binaries are already pre-rewritten
 - No native baseline (Linux binaries can't run natively on Windows)

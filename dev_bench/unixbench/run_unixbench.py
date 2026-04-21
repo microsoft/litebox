@@ -399,7 +399,6 @@ def run_litebox(
     cmd = [
         str(runner_path),
         "--unstable",
-        "--interception-backend", "rewriter",
         "--env", "LD_LIBRARY_PATH=/lib64:/lib32:/lib",
         "--env", "HOME=/",
     ]
