@@ -39,18 +39,18 @@ macro_rules! common_functions_for_file_status {
 }
 
 pub(crate) use common_functions_for_file_status;
-use zerocopy::{FromBytes, IntoBytes};
+use zerocopy::{FromBytes, Immutable, IntoBytes};
 
 /// Helper function to write a value of type T to user memory.
 /// If the buffer size (i.e., provided `len`) is smaller than `size_of::<T>()`, only write up to `len` bytes.
-fn write_to_user<T: FromBytes + IntoBytes>(
+fn write_to_user<T: FromBytes + IntoBytes + Immutable>(
     val: T,
     optval: crate::MutPtr<u8>,
     len: u32,
 ) -> Result<usize, litebox_common_linux::errno::Errno> {
     use litebox::platform::RawMutPointer as _;
     let length = core::mem::size_of::<T>().min(len as usize);
-    let data = unsafe { core::slice::from_raw_parts((&raw const val).cast::<u8>(), length) };
+    let data = &val.as_bytes()[..length];
     optval
         .write_slice_at_offset(0, data)
         .ok_or(litebox_common_linux::errno::Errno::EFAULT)?;

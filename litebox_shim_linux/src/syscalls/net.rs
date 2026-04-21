@@ -30,7 +30,7 @@ use litebox_common_linux::{
     AddressFamily, FileDescriptorFlags, IPProtocol, ReceiveFlags, SendFlags, SockFlags, SockType,
     SocketOption, SocketOptionName, TcpOption, UnixProtocol, errno::Errno,
 };
-use zerocopy::{FromBytes, IntoBytes};
+use zerocopy::{FromBytes, Immutable, IntoBytes};
 
 use crate::{ConstPtr, MutPtr};
 use crate::{GlobalState, ShimFS, Task};
@@ -98,7 +98,7 @@ impl<FS: ShimFS> super::file::FilesState<FS> {
     }
 }
 
-#[derive(Clone, Copy, FromBytes, IntoBytes)]
+#[derive(Clone, Copy, FromBytes, IntoBytes, Immutable)]
 #[repr(C, packed)]
 struct CSockInetAddr {
     family: i16,
@@ -1110,12 +1110,7 @@ pub(crate) fn write_sockaddr_to_user(
         SocketAddress::Inet(SocketAddr::V4(v4_addr)) => {
             let addrlen_val = size_of::<CSockInetAddr>().min(addrlen_val as usize);
             let c_addr: CSockInetAddr = v4_addr.into();
-            let bytes: &[u8] = unsafe {
-                core::slice::from_raw_parts(
-                    (&raw const c_addr).cast::<u8>(),
-                    size_of::<CSockInetAddr>(),
-                )
-            };
+            let bytes: &[u8] = c_addr.as_bytes();
             addr.write_slice_at_offset(0, &bytes[..addrlen_val])
                 .ok_or(Errno::EFAULT)?;
             size_of::<CSockInetAddr>()

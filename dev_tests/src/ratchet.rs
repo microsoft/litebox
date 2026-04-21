@@ -71,7 +71,6 @@ fn ratchet_maybe_uninit() -> Result<()> {
             ("dev_tests/", 1),
             ("litebox/", 1),
             ("litebox_platform_linux_userland/", 2),
-            ("litebox_shim_linux/", 5),
         ],
         |file| {
             Ok(file

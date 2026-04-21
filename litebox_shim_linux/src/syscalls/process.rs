@@ -1583,18 +1583,16 @@ mod tests {
     #[test]
     fn test_arch_prctl() {
         use crate::{MutPtr, syscalls::tests::init_platform};
-        use core::mem::MaybeUninit;
         use litebox::platform::RawConstPointer;
         use litebox_common_linux::ArchPrctlArg;
 
         let task = init_platform(None);
 
         // Save old FS base
-        let mut old_fs_base = MaybeUninit::<usize>::uninit();
-        let ptr = MutPtr::from_ptr(old_fs_base.as_mut_ptr());
+        let mut old_fs_base: usize = 0;
+        let ptr = MutPtr::from_ptr(&raw mut old_fs_base);
         task.sys_arch_prctl(ArchPrctlArg::GetFs(ptr))
             .expect("Failed to get FS base");
-        let old_fs_base = unsafe { old_fs_base.assume_init() };
 
         // Set new FS base
         let mut new_fs_base: [u8; 16] = [0; 16];
@@ -1603,11 +1601,10 @@ mod tests {
             .expect("Failed to set FS base");
 
         // Verify new FS base
-        let mut current_fs_base = MaybeUninit::<usize>::uninit();
-        let ptr = MutPtr::from_ptr(current_fs_base.as_mut_ptr());
+        let mut current_fs_base: usize = 0;
+        let ptr = MutPtr::from_ptr(&raw mut current_fs_base);
         task.sys_arch_prctl(ArchPrctlArg::GetFs(ptr))
             .expect("Failed to get FS base");
-        let current_fs_base = unsafe { current_fs_base.assume_init() };
         assert_eq!(current_fs_base, new_fs_base.as_ptr() as usize);
 
         // Restore old FS base

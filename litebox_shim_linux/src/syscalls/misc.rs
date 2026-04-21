@@ -166,9 +166,8 @@ impl<FS: ShimFS> Task<FS> {
 
 #[cfg(test)]
 mod tests {
-    use core::mem::MaybeUninit;
-
     use crate::syscalls::tests::init_platform;
+    use zerocopy::FromZeros as _;
 
     #[test]
     fn test_getrandom() {
@@ -193,10 +192,9 @@ mod tests {
     fn test_uname() {
         let task = init_platform(None);
 
-        let mut utsname = MaybeUninit::<litebox_common_linux::Utsname>::uninit();
-        let ptr = crate::MutPtr::from_ptr(utsname.as_mut_ptr());
+        let mut utsname = litebox_common_linux::Utsname::new_zeroed();
+        let ptr = crate::MutPtr::from_ptr(&raw mut utsname);
         task.sys_uname(ptr).expect("uname failed");
-        let utsname = unsafe { utsname.assume_init() };
 
         assert_eq!(utsname.sysname, super::SYS_INFO.sysname);
         assert_eq!(utsname.nodename, super::SYS_INFO.nodename);
