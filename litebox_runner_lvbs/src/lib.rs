@@ -474,6 +474,8 @@ fn handle_open_session(
     msg_args: &mut OpteeMsgArgs,
     msg_args_phys_addr: u64,
 ) -> Result<(), OpteeSmcReturnCode> {
+    const MAX_OPEN_SESSION_RETRIES: u32 = 4;
+
     let ta_req_info = decode_ta_request(msg_args).map_err(|_| OpteeSmcReturnCode::EBadCmd)?;
     if ta_req_info.entry_func != UteeEntryFunc::OpenSession {
         return Err(OpteeSmcReturnCode::EBadCmd);
@@ -493,46 +495,79 @@ fn handle_open_session(
     if is_single_instance {
         // Fast path: Reuse a cached single-instance TA if one exists.
         if let Some(existing) = session_manager().get_single_instance(&ta_uuid) {
-            return open_session_single_instance(
+            match open_session_single_instance(
                 msg_args,
                 msg_args_phys_addr,
-                existing,
+                existing.clone(),
                 params,
                 ta_uuid,
                 &ta_req_info,
-            );
+            )? {
+                OpenSessionOutcome::Done => return Ok(()),
+                // Cached instance was torn down in a race with a concurrent
+                // close/panic. Drop the stale entry from the cache only if
+                // still the same Arc and fall through.
+                OpenSessionOutcome::InstanceDestroyed => {
+                    session_manager().remove_single_instance_if_same(&ta_uuid, &existing);
+                }
+            }
         }
     }
 
-    // Create a new TA instance. For single-instance TAs, this also re-checks the cache
-    // under the lock and prevents concurrent instance creation of the same UUID.
-    // For multi-instance TAs, only the global capacity limit is enforced.
-    match session_manager().with_creation_slot(&ta_uuid, is_single_instance, || {
-        open_session_new_instance(
-            msg_args,
-            msg_args_phys_addr,
-            params,
-            ta_uuid,
-            client_identity,
-            &ta_req_info,
-        )
-    })? {
-        CreationReservation::ExistingSingleInstance(existing) => open_session_single_instance(
-            msg_args,
-            msg_args_phys_addr,
-            existing,
-            params,
-            ta_uuid,
-            &ta_req_info,
-        ),
-        CreationReservation::SlotReserved => Ok(()),
+    // Create a new TA instance, or reuse a freshly-cached one. For
+    // single-instance TAs, `with_creation_slot` re-checks the cache under
+    // its lock and serializes instance creation per UUID.
+    //
+    // If we observe a destroyed instance via `ExistingSingleInstance`, we
+    // clear the stale cache entry and loop. In normal operation the
+    // destroyer removes the cache entry before setting
+    // `task_page_table_id = None`, so this loop terminates in at
+    // most one extra iteration. The bounded retry cap guards
+    // against pathological cases where other cores repeatedly install and
+    // destroy fresh instances for the same UUID. After the cap we fall
+    // back to `EThreadLimit` so the driver retries the whole call.
+    for _ in 0..MAX_OPEN_SESSION_RETRIES {
+        match session_manager().with_creation_slot(&ta_uuid, is_single_instance, || {
+            open_session_new_instance(
+                msg_args,
+                msg_args_phys_addr,
+                params,
+                ta_uuid,
+                client_identity,
+                &ta_req_info,
+            )
+        })? {
+            CreationReservation::ExistingSingleInstance(existing) => {
+                match open_session_single_instance(
+                    msg_args,
+                    msg_args_phys_addr,
+                    existing.clone(),
+                    params,
+                    ta_uuid,
+                    &ta_req_info,
+                )? {
+                    OpenSessionOutcome::Done => return Ok(()),
+                    OpenSessionOutcome::InstanceDestroyed => {
+                        session_manager().remove_single_instance_if_same(&ta_uuid, &existing);
+                    }
+                }
+            }
+            CreationReservation::SlotReserved => return Ok(()),
+        }
     }
+
+    Err(OpteeSmcReturnCode::EThreadLimit)
+}
+
+/// Outcome of [`open_session_single_instance`].
+enum OpenSessionOutcome {
+    /// Session was successfully opened (or a TA-level error was written back).
+    Done,
+    /// The cached `TaInstance` was torn down concurrently.
+    InstanceDestroyed,
 }
 
 /// Open a new session on an existing single-instance TA.
-///
-/// Returns `Err(OpteeSmcReturnCode::EThreadLimit)` if the TA instance is currently in use.
-/// The Linux driver will wait and retry automatically.
 ///
 /// If the TA's OpenSession entry point returns an error, the session is not registered.
 /// For cleanup semantics, see OP-TEE OS `tee_ta_open_session()` in `tee_ta_manager.c`.
@@ -544,19 +579,19 @@ fn open_session_single_instance(
     params: &[litebox_common_optee::UteeParamOwned],
     ta_uuid: litebox_common_optee::TeeUuid,
     ta_req_info: &litebox_shim_optee::msg_handler::TaRequestInfo<PAGE_SIZE>,
-) -> Result<(), OpteeSmcReturnCode> {
+) -> Result<OpenSessionOutcome, OpteeSmcReturnCode> {
     // Use try_lock to avoid spinning - return EThreadLimit if TA is in use
     // The Linux driver will handle this by waiting and retrying
     let mut instance = instance_arc
         .try_lock()
         .ok_or(OpteeSmcReturnCode::EThreadLimit)?;
 
-    // `task_page_table_id == None` means the instance was destroyed by a concurrent
-    // close/panic between our cache lookup and acquiring the instance lock.
-    // Return `EThreadLimit` so the Linux driver retries.
-    let task_pt_id = instance
-        .task_page_table_id
-        .ok_or(OpteeSmcReturnCode::EThreadLimit)?;
+    // `task_page_table_id == None` means the instance was destroyed by a
+    // concurrent close/panic between our cache lookup and acquiring the
+    // instance lock.
+    let Some(task_pt_id) = instance.task_page_table_id else {
+        return Ok(OpenSessionOutcome::InstanceDestroyed);
+    };
 
     // Allocate session ID BEFORE calling load_ta_context so TA gets correct ID.
     // Use SessionIdGuard to ensure the ID is recycled on any error path
@@ -662,7 +697,7 @@ fn open_session_single_instance(
                 // INSTANCE_KEEP_CRASHED, we should respawn the TA here instead of just
                 // cleaning it up. Currently we always clean up on panic.
 
-                return Ok(());
+                return Ok(OpenSessionOutcome::Done);
             }
         }
 
@@ -678,7 +713,7 @@ fn open_session_single_instance(
             Some(ta_req_info),
         )?;
 
-        return Ok(());
+        return Ok(OpenSessionOutcome::Done);
     }
 
     drop(instance);
@@ -702,7 +737,7 @@ fn open_session_single_instance(
         runner_session_id
     );
 
-    Ok(())
+    Ok(OpenSessionOutcome::Done)
 }
 
 /// Create a new TA instance for a session.
@@ -1096,11 +1131,27 @@ fn handle_close_session(
     let Some(mut instance) = session_entry.instance.try_lock() else {
         return Err(OpteeSmcReturnCode::EThreadLimit);
     };
-    // `task_page_table_id == None` means the instance was destroyed.
-    // Return `EBadCmd` because the client must start over with OpenSession.
-    let task_pt_id = instance
-        .task_page_table_id
-        .ok_or(OpteeSmcReturnCode::EBadCmd)?;
+    // `task_page_table_id == None` means the TA instance was already torn
+    // down (e.g., a prior InvokeCommand panicked with TARGET_DEAD and cleaned
+    // it up). From the client's perspective the session no longer exists,
+    // so CloseSession is trivially successful.
+    let Some(task_pt_id) = instance.task_page_table_id else {
+        drop(instance);
+        session_manager().unregister_session(session_id);
+        write_msg_args_to_normal_world(
+            msg_args,
+            msg_args_phys_addr,
+            TeeResult::Success,
+            None,
+            None,
+            None,
+        )?;
+        debug_serial_println!(
+            "CloseSession complete: session_id={}, TA instance already destroyed",
+            session_id
+        );
+        return Ok(());
+    };
 
     // Switch to the TA instance's page table
     unsafe { switch_to_task_page_table(task_pt_id)? };
