@@ -724,59 +724,6 @@ fn rel32_bytes(target: u64, base: u64, context: &'static str) -> Result<[u8; 4]>
     Ok(disp.to_le_bytes())
 }
 
-/// Patch a single mapped code segment in-place, returning trampoline stubs.
-///
-/// This is the runtime counterpart to [`hook_syscalls_in_elf`]. Instead of
-/// processing a whole ELF file, it operates on a single already-mapped code
-/// region — the caller is responsible for making the region writable before
-/// calling and restoring permissions afterwards. The caller must copy the
-/// returned stubs to `trampoline_write_vaddr`.
-///
-/// Returns `Err` if any syscall instructions could not be patched.
-pub fn patch_code_segment(
-    code: &mut [u8],
-    code_vaddr: u64,
-    trampoline_write_vaddr: u64,
-    syscall_entry_addr: u64,
-) -> Result<Vec<u8>> {
-    let arch = Arch::X86_64; // runtime patching is x86-64 only
-
-    // Build control-transfer targets for this segment.
-    let instructions = decode_section_instructions(arch, code, code_vaddr)?;
-    let mut control_transfer_targets = BTreeSet::new();
-    for inst in &instructions {
-        let target = inst.near_branch_target();
-        if target != 0 {
-            control_transfer_targets.insert(target);
-        }
-    }
-
-    let mut trampoline_data = Vec::new();
-    match hook_syscalls_in_section(
-        arch,
-        &control_transfer_targets,
-        code_vaddr,
-        code,
-        trampoline_write_vaddr,
-        syscall_entry_addr,
-        None, // dl_sysinfo_int80 — not applicable on x86-64
-        &mut trampoline_data,
-    ) {
-        Ok(skipped_addrs) => {
-            if !skipped_addrs.is_empty() {
-                return Err(Error::UnpatchableSyscalls(format!(
-                    "{} unpatchable syscall instruction(s) at {skipped_addrs:?}",
-                    skipped_addrs.len(),
-                )));
-            }
-            Ok(trampoline_data)
-        }
-        Err(InternalError::NoSyscallInstructionsFound) => Ok(Vec::new()),
-        Err(InternalError::Public(e)) => Err(e),
-        Err(e) => unreachable!("unexpected internal error: {e:?}"),
-    }
-}
-
 fn find_addr_for_trampoline_code(file: &object::File<'_>) -> Result<u64> {
     // Find the highest virtual address among all PT_LOAD segments
     let max_virtual_addr = match file {
