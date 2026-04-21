@@ -518,14 +518,10 @@ fn handle_open_session(
     // single-instance TAs, `with_creation_slot` re-checks the cache under
     // its lock and serializes instance creation per UUID.
     //
-    // If we observe a destroyed instance via `ExistingSingleInstance`, we
-    // clear the stale cache entry and loop. In normal operation the
-    // destroyer removes the cache entry before setting
-    // `task_page_table_id = None`, so this loop terminates in at
-    // most one extra iteration. The bounded retry cap guards
-    // against pathological cases where other cores repeatedly install and
-    // destroy fresh instances for the same UUID. After the cap we fall
-    // back to `EThreadLimit` so the driver retries the whole call.
+    // The bounded retry cap (2 iterations suffice in steady state; 4 gives
+    // slack for back-to-back churn where other cores repeatedly install and
+    // destroy fresh instances for the same UUID) ultimately falls back to
+    // `EThreadLimit` so the driver retries the whole call.
     for _ in 0..MAX_OPEN_SESSION_RETRIES {
         match session_manager().with_creation_slot(&ta_uuid, is_single_instance, || {
             open_session_new_instance(
@@ -548,6 +544,7 @@ fn handle_open_session(
                 )? {
                     OpenSessionOutcome::Done => return Ok(()),
                     OpenSessionOutcome::InstanceDestroyed => {
+                        // defense-in-depth against future reordering of destroyer steps
                         session_manager().remove_single_instance_if_same(&ta_uuid, &existing);
                     }
                 }
@@ -568,6 +565,9 @@ enum OpenSessionOutcome {
 }
 
 /// Open a new session on an existing single-instance TA.
+///
+/// Returns `Err(OpteeSmcReturnCode::EThreadLimit)` if the TA instance is currently in use.
+/// The Linux driver will wait and retry automatically.
 ///
 /// If the TA's OpenSession entry point returns an error, the session is not registered.
 /// For cleanup semantics, see OP-TEE OS `tee_ta_open_session()` in `tee_ta_manager.c`.
@@ -986,11 +986,23 @@ fn handle_invoke_command(
     };
     // `task_page_table_id == None` means the TA instance was already torn
     // down (e.g., a prior InvokeCommand panicked with TARGET_DEAD). The
-    // session is orphaned.
+    // session is orphaned. Report TARGET_DEAD to the client.
     let Some(task_pt_id) = instance.task_page_table_id else {
         drop(instance);
         session_manager().unregister_session(session_id);
-        return Err(OpteeSmcReturnCode::EBadCmd);
+        write_msg_args_to_normal_world(
+            msg_args,
+            msg_args_phys_addr,
+            TeeResult::TargetDead,
+            None,
+            None,
+            None,
+        )?;
+        debug_serial_println!(
+            "InvokeCommand: session_id={} on already-destroyed TA instance",
+            session_id
+        );
+        return Ok(());
     };
 
     // Switch to the TA instance's page table
@@ -1233,7 +1245,6 @@ fn handle_close_session(
 
             // Drop the instance to release shim/loaded_program resources
             drop(instance);
-            drop(entry);
 
             debug_serial_println!(
                 "CloseSession complete: deleted task_pt_id={} (last session)",
