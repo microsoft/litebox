@@ -7,6 +7,7 @@
 //! trait is merely a collection of subtraits that could be composed independently from various
 //! other crates that implement them upon various types.
 
+mod arch;
 pub mod common_providers;
 pub mod page_mgmt;
 pub mod trivial_providers;
@@ -14,10 +15,10 @@ pub mod trivial_providers;
 #[cfg(test)]
 pub(crate) mod mock;
 
-use either::Either;
 use thiserror::Error;
 use zerocopy::{FromBytes, IntoBytes};
 
+pub use arch::{ArchSpecificError, ArchSpecificProvider, ArchSpecificRegister};
 pub use page_mgmt::PageManagementProvider;
 
 /// A provider of a platform upon which LiteBox can execute.
@@ -26,7 +27,7 @@ pub use page_mgmt::PageManagementProvider;
 /// provided by it. _However_, most of the provided APIs within the provider act upon an `&self` to
 /// allow storage of any useful "globals" within it necessary.
 pub trait Provider:
-    RawMutexProvider + IPInterfaceProvider + TimeProvider + PunchthroughProvider + RawPointerProvider
+    RawMutexProvider + IPInterfaceProvider + TimeProvider + ArchSpecificProvider + RawPointerProvider
 {
 }
 
@@ -142,126 +143,6 @@ pub trait SignalProvider {
     /// Platforms that support asynchronous signals should override this method.
     #[expect(unused_variables, reason = "no-op by default")]
     fn take_pending_signals(&self, f: impl FnMut(Self::Signal)) {}
-}
-
-/// Punch through any functionality for a particular platform that is not explicitly part of the
-/// common _shared_ platform interface.
-///
-/// The punchthrough primarily exists to improve auditability, rather than preventing arbitrary
-/// calls outside of the common interface, since it is impossible in Rust to prevent arbitrary
-/// external calls. Thus, it should not be thought of as a security boundary. However, this should
-/// be treated closer to "if someone is invoking things from the host without passing through a
-/// punchthrough, their code is suspicious; if all host invocations pass through the punchthrough,
-/// then it is sufficient to audit the punchthrough interface".
-pub trait PunchthroughProvider {
-    type PunchthroughToken<'a>: PunchthroughToken;
-    /// Give permission token to invoke `punchthrough`, possibly after checking that it is ok.
-    ///
-    /// Even though `&self` is taken shared, the intention with the tokens is to use them
-    /// _immediately_ before invoking other platform interactions. Ideally, we would ensure this via
-    /// an `&mut self` to guarantee exclusivity, but this would limit us from supporting the ability
-    /// for other threads being blocked when a punchthrough is done. Thus, this is kept as a
-    /// `&self`. Morally this should be viewed as a `&mut self`.
-    fn get_punchthrough_token_for<'a>(
-        &self,
-        punchthrough: <Self::PunchthroughToken<'a> as PunchthroughToken>::Punchthrough,
-    ) -> Option<Self::PunchthroughToken<'a>>;
-}
-
-/// A token that demonstrates that the platform is allowing access for a particular [`Punchthrough`]
-/// to occur (at that point, or at some indeterminate point in the future).
-pub trait PunchthroughToken {
-    type Punchthrough: Punchthrough;
-    /// Consume the token, and invoke the underlying punchthrough that it represented.
-    fn execute(
-        self,
-    ) -> Result<
-        <Self::Punchthrough as Punchthrough>::ReturnSuccess,
-        PunchthroughError<<Self::Punchthrough as Punchthrough>::ReturnFailure>,
-    >;
-}
-
-/// Punchthrough support allowing access to functionality not captured by [`Provider`].
-///
-/// Ideally, this is implemented by a (possibly `#[non_exhaustive]`) enum where a platform
-/// provider can mark any unsupported/unimplemented punchthrough functionality with a
-/// [`PunchthroughError::Unsupported`] or [`PunchthroughError::Unimplemented`].
-///
-/// The `Token` allows for obtaining permission from (and possibly, mutable access to) the platform
-pub trait Punchthrough {
-    type ReturnSuccess;
-    type ReturnFailure: core::error::Error;
-}
-
-/// Possible errors for a [`Punchthrough`]
-#[derive(Error, Debug)]
-pub enum PunchthroughError<E: core::error::Error> {
-    #[error("attempted to execute unsupported punchthrough")]
-    Unsupported,
-    #[error("punchthrough for `{0}` is not implemented")]
-    Unimplemented(&'static str),
-    #[error(transparent)]
-    Failure(#[from] E),
-}
-
-/// An error-implementing [`Either`]-style type.
-#[derive(Error, Debug)]
-pub enum EitherError<L: core::error::Error, R: core::error::Error> {
-    #[error(transparent)]
-    Left(L),
-    #[error(transparent)]
-    Right(R),
-}
-
-// To support easily composing punchthroughs, it is implemented on the `Either` type on
-// punchthroughs. An implementation of punchthrough could follow a similar implementation to
-// obtain easy internal composability, but composing across crates providing punchthroughs is
-// likely best provided using this `Either` based composition.
-impl<L, R> PunchthroughToken for Either<L, R>
-where
-    L: PunchthroughToken,
-    R: PunchthroughToken,
-{
-    type Punchthrough = Either<L::Punchthrough, R::Punchthrough>;
-
-    fn execute(
-        self,
-    ) -> Result<
-        <Self::Punchthrough as Punchthrough>::ReturnSuccess,
-        PunchthroughError<<Self::Punchthrough as Punchthrough>::ReturnFailure>,
-    > {
-        match self {
-            Either::Left(l) => match l.execute() {
-                Ok(res) => Ok(Either::Left(res)),
-                Err(PunchthroughError::Unsupported) => Err(PunchthroughError::Unsupported),
-                Err(PunchthroughError::Unimplemented(e)) => {
-                    Err(PunchthroughError::Unimplemented(e))
-                }
-                Err(PunchthroughError::Failure(e)) => {
-                    Err(PunchthroughError::Failure(EitherError::Left(e)))
-                }
-            },
-            Either::Right(r) => match r.execute() {
-                Ok(res) => Ok(Either::Right(res)),
-                Err(PunchthroughError::Unsupported) => Err(PunchthroughError::Unsupported),
-                Err(PunchthroughError::Unimplemented(e)) => {
-                    Err(PunchthroughError::Unimplemented(e))
-                }
-                Err(PunchthroughError::Failure(e)) => {
-                    Err(PunchthroughError::Failure(EitherError::Right(e)))
-                }
-            },
-        }
-    }
-}
-
-impl<L, R> Punchthrough for Either<L, R>
-where
-    L: Punchthrough,
-    R: Punchthrough,
-{
-    type ReturnSuccess = Either<L::ReturnSuccess, R::ReturnSuccess>;
-    type ReturnFailure = EitherError<L::ReturnFailure, R::ReturnFailure>;
 }
 
 /// A provider of raw mutexes
@@ -675,15 +556,6 @@ pub unsafe trait ThreadLocalStorageProvider {
     /// This can be achieved by using
     /// [`shim_thread_local!`](crate::shim_thread_local).
     unsafe fn replace_thread_local_storage(value: *mut ()) -> *mut ();
-
-    /// Clear any guest thread-local storage state for the current thread.
-    ///
-    /// This is used to help emulate certain syscalls (e.g., `execve`) that clear TLS.
-    ///
-    /// TODO: move this to a separate trait or eliminate.
-    fn clear_guest_thread_local_storage() {
-        unimplemented!()
-    }
 }
 
 /// A provider of cryptographically-secure random data.

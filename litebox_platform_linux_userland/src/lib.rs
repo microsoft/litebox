@@ -22,9 +22,7 @@ use litebox::platform::page_mgmt::{
 use litebox::platform::{ImmediatelyWokenUp, RawConstPointer as _};
 use litebox::shim::ContinueOperation;
 use litebox::utils::{ReinterpretSignedExt, ReinterpretUnsignedExt as _, TruncateExt};
-use litebox_common_linux::{
-    MRemapFlags, MapFlags, ProtFlags, PunchthroughSyscall, vmap::VmapManager,
-};
+use litebox_common_linux::{MRemapFlags, MapFlags, ProtFlags, vmap::VmapManager};
 
 use zerocopy::{FromBytes, IntoBytes};
 
@@ -1284,40 +1282,44 @@ impl litebox::platform::SystemTime for SystemTime {
     }
 }
 
-pub struct PunchthroughToken<'a> {
-    punchthrough: PunchthroughSyscall<'a, LinuxUserland>,
-}
-
-impl<'a> litebox::platform::PunchthroughToken for PunchthroughToken<'a> {
-    type Punchthrough = PunchthroughSyscall<'a, LinuxUserland>;
-    fn execute(
-        self,
-    ) -> Result<
-        <Self::Punchthrough as litebox::platform::Punchthrough>::ReturnSuccess,
-        litebox::platform::PunchthroughError<
-            <Self::Punchthrough as litebox::platform::Punchthrough>::ReturnFailure,
-        >,
-    > {
-        match self.punchthrough {
-            // We swap gs and fs before and after a syscall so at this point guest's fs base is stored in gs
-            #[cfg(target_arch = "x86_64")]
-            PunchthroughSyscall::SetFsBase { addr } => {
-                set_guest_fsbase(addr);
-                Ok(0)
+#[cfg(target_arch = "x86_64")]
+impl litebox::platform::ArchSpecificProvider for LinuxUserland {
+    // We swap gs and fs before and after a syscall, so while handling a guest
+    // syscall the guest's fs base is stored in the gs base register; the
+    // per-thread `guest_fsbase` slot holds the value that will be programmed
+    // into fs base on guest re-entry.
+    fn set_arch_specific_register(
+        &self,
+        reg: &litebox::platform::ArchSpecificRegister,
+        val: usize,
+    ) -> Result<(), litebox::platform::ArchSpecificError> {
+        match reg {
+            litebox::platform::ArchSpecificRegister::FsBase => {
+                set_guest_fsbase(val);
+                Ok(())
             }
-            #[cfg(target_arch = "x86_64")]
-            PunchthroughSyscall::GetFsBase => Ok(get_guest_fsbase()),
+            litebox::platform::ArchSpecificRegister::GsBase => {
+                // GS base is used internally by this platform to hold the host
+                // TLS base across the guest/host fs-gs swap, so it is not
+                // directly programmable by the guest.
+                Err(litebox::platform::ArchSpecificError::RegisterReserved)
+            }
+            _ => Err(litebox::platform::ArchSpecificError::RegisterUnsupported),
         }
     }
-}
-
-impl litebox::platform::PunchthroughProvider for LinuxUserland {
-    type PunchthroughToken<'a> = PunchthroughToken<'a>;
-    fn get_punchthrough_token_for<'a>(
+    fn get_arch_specific_register(
         &self,
-        punchthrough: <Self::PunchthroughToken<'a> as litebox::platform::PunchthroughToken>::Punchthrough,
-    ) -> Option<Self::PunchthroughToken<'a>> {
-        Some(PunchthroughToken { punchthrough })
+        reg: &litebox::platform::ArchSpecificRegister,
+    ) -> Result<usize, litebox::platform::ArchSpecificError> {
+        match reg {
+            litebox::platform::ArchSpecificRegister::FsBase => Ok(get_guest_fsbase()),
+            litebox::platform::ArchSpecificRegister::GsBase => {
+                // See note above: gs base is reserved for host TLS on this
+                // platform and is not exposed to the guest.
+                Err(litebox::platform::ArchSpecificError::RegisterReserved)
+            }
+            _ => Err(litebox::platform::ArchSpecificError::RegisterUnsupported),
+        }
     }
 }
 
@@ -1784,11 +1786,6 @@ unsafe impl litebox::platform::ThreadLocalStorageProvider for LinuxUserland {
 
     unsafe fn replace_thread_local_storage(value: *mut ()) -> *mut () {
         PLATFORM_TLS.replace(value)
-    }
-
-    #[cfg(target_arch = "x86_64")]
-    fn clear_guest_thread_local_storage() {
-        set_guest_fsbase(0);
     }
 }
 

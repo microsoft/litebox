@@ -13,10 +13,10 @@ use litebox::mm::linux::PageRange;
 use litebox::platform::RawPointerProvider;
 use litebox::platform::page_mgmt::FixedAddressBehavior;
 use litebox::platform::{
-    IPInterfaceProvider, ImmediatelyWokenUp, PageManagementProvider, Provider, Punchthrough,
-    PunchthroughProvider, PunchthroughToken, RawMutexProvider, TimeProvider, UnblockedOrTimedOut,
+    ArchSpecificError, ArchSpecificProvider, ArchSpecificRegister, IPInterfaceProvider,
+    ImmediatelyWokenUp, PageManagementProvider, Provider, RawMutexProvider, TimeProvider,
+    UnblockedOrTimedOut,
 };
-use litebox_common_linux::PunchthroughSyscall;
 use litebox_common_linux::errno::Errno;
 
 extern crate alloc;
@@ -54,34 +54,6 @@ impl<Host: HostInterface> core::fmt::Debug for LinuxKernel<Host> {
     }
 }
 
-pub struct LinuxPunchthroughToken<'a, Host: HostInterface> {
-    punchthrough: PunchthroughSyscall<'a, LinuxKernel<Host>>,
-    host: core::marker::PhantomData<Host>,
-}
-
-impl<'a, Host: HostInterface> PunchthroughToken for LinuxPunchthroughToken<'a, Host> {
-    type Punchthrough = PunchthroughSyscall<'a, LinuxKernel<Host>>;
-
-    fn execute(
-        self,
-    ) -> Result<
-        <Self::Punchthrough as Punchthrough>::ReturnSuccess,
-        litebox::platform::PunchthroughError<<Self::Punchthrough as Punchthrough>::ReturnFailure>,
-    > {
-        let r = match self.punchthrough {
-            PunchthroughSyscall::SetFsBase { addr } => {
-                unsafe { litebox_common_linux::wrfsbase(addr) };
-                Ok(0)
-            }
-            PunchthroughSyscall::GetFsBase => Ok(unsafe { litebox_common_linux::rdfsbase() }),
-        };
-        match r {
-            Ok(v) => Ok(v),
-            Err(e) => Err(litebox::platform::PunchthroughError::Failure(e)),
-        }
-    }
-}
-
 impl<Host: HostInterface> Provider for LinuxKernel<Host> {}
 
 // TODO: implement pointer validation to ensure the pointers are in user space.
@@ -99,17 +71,34 @@ impl<Host: HostInterface> RawPointerProvider for LinuxKernel<Host> {
     type RawMutPointer<T: zerocopy::FromBytes + zerocopy::IntoBytes> = UserMutPtr<T>;
 }
 
-impl<Host: HostInterface> PunchthroughProvider for LinuxKernel<Host> {
-    type PunchthroughToken<'a> = LinuxPunchthroughToken<'a, Host>;
-
-    fn get_punchthrough_token_for<'a>(
+impl<Host: HostInterface> ArchSpecificProvider for LinuxKernel<Host> {
+    fn set_arch_specific_register(
         &self,
-        punchthrough: <Self::PunchthroughToken<'a> as PunchthroughToken>::Punchthrough,
-    ) -> Option<Self::PunchthroughToken<'a>> {
-        Some(LinuxPunchthroughToken {
-            punchthrough,
-            host: core::marker::PhantomData,
-        })
+        reg: &ArchSpecificRegister,
+        val: usize,
+    ) -> Result<(), ArchSpecificError> {
+        match reg {
+            ArchSpecificRegister::FsBase => {
+                unsafe { litebox_common_linux::wrfsbase(val) };
+                Ok(())
+            }
+            ArchSpecificRegister::GsBase => {
+                unsafe { litebox_common_linux::wrgsbase(val) };
+                Ok(())
+            }
+            _ => Err(ArchSpecificError::RegisterUnsupported),
+        }
+    }
+
+    fn get_arch_specific_register(
+        &self,
+        reg: &ArchSpecificRegister,
+    ) -> Result<usize, ArchSpecificError> {
+        match reg {
+            ArchSpecificRegister::FsBase => Ok(unsafe { litebox_common_linux::rdfsbase() }),
+            ArchSpecificRegister::GsBase => Ok(unsafe { litebox_common_linux::rdgsbase() }),
+            _ => Err(ArchSpecificError::RegisterUnsupported),
+        }
     }
 }
 

@@ -17,7 +17,7 @@ use hashbrown::HashMap;
 use litebox::{
     LiteBox,
     mm::{PageManager, linux::PAGE_SIZE},
-    platform::{PunchthroughProvider, PunchthroughToken, RawConstPointer as _, RawMutPointer as _},
+    platform::{RawConstPointer as _, RawMutPointer as _},
     shim::ContinueOperation,
     utils::{ReinterpretUnsignedExt, TruncateExt},
 };
@@ -801,18 +801,14 @@ impl Task {
     /// every TA entry.
     #[cfg(target_arch = "x86_64")]
     fn restore_guest_tls(&self) {
+        use litebox::platform::ArchSpecificProvider as _;
         let addr = self.tls_base_addr.get();
         if addr == 0 {
             return; // TLS not allocated yet
         }
-        let punchthrough = litebox_common_linux::PunchthroughSyscall::SetFsBase { addr };
-        let token = litebox_platform_multiplex::platform()
-            .get_punchthrough_token_for(punchthrough)
-            .expect("Failed to get punchthrough token for SET_FS");
-        let _ = token.execute().map(|_| ()).map_err(|e| match e {
-            litebox::platform::PunchthroughError::Failure(errno) => errno,
-            _ => unimplemented!("Unsupported punchthrough error {:?}", e),
-        });
+        litebox_platform_multiplex::platform()
+            .set_arch_specific_register(&litebox::platform::ArchSpecificRegister::FsBase, addr)
+            .expect("requires guaranteed platform support for FsBase");
     }
 
     /// Retrieve the result of the `ldelf` execution.

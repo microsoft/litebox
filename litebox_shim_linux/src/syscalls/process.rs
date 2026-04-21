@@ -16,11 +16,10 @@ use core::time::Duration;
 use litebox::event::wait::WaitError;
 use litebox::mm::linux::VmFlags;
 use litebox::platform::ThreadProvider;
-use litebox::platform::{Instant as _, SystemTime as _, TimeProvider};
 use litebox::platform::{
-    PunchthroughProvider as _, PunchthroughToken as _, RawConstPointer as _, RawMutex as _,
-    ThreadLocalStorageProvider as _,
+    ArchSpecificProvider as _, ArchSpecificRegister, RawConstPointer as _, RawMutex as _,
 };
+use litebox::platform::{Instant as _, SystemTime as _, TimeProvider};
 use litebox::platform::{RawMutPointer as _, TimerHandle, TimerProvider};
 use litebox::sync::Mutex;
 use litebox::utils::TruncateExt as _;
@@ -410,30 +409,17 @@ impl<FS: ShimFS> Task<FS> {
     ) -> Result<(), Errno> {
         match arg {
             #[cfg(target_arch = "x86_64")]
-            ArchPrctlArg::SetFs(addr) => {
-                let punchthrough = litebox_common_linux::PunchthroughSyscall::SetFsBase { addr };
-                let token = self
-                    .global
-                    .platform
-                    .get_punchthrough_token_for(punchthrough)
-                    .expect("Failed to get punchthrough token for SET_FS");
-                token.execute().map(|_| ()).map_err(|e| match e {
-                    litebox::platform::PunchthroughError::Failure(errno) => errno,
-                    _ => unimplemented!("Unsupported punchthrough error {:?}", e),
-                })
-            }
+            ArchPrctlArg::SetFs(addr) => self
+                .global
+                .platform
+                .set_arch_specific_register(&ArchSpecificRegister::FsBase, addr)
+                .map_err(Errno::from),
             #[cfg(target_arch = "x86_64")]
             ArchPrctlArg::GetFs(addr) => {
-                let punchthrough = litebox_common_linux::PunchthroughSyscall::GetFsBase;
-                let token = self
+                let fsbase = self
                     .global
                     .platform
-                    .get_punchthrough_token_for(punchthrough)
-                    .expect("Failed to get punchthrough token for GET_FS");
-                let fsbase = token.execute().map_err(|e| match e {
-                    litebox::platform::PunchthroughError::Failure(errno) => errno,
-                    _ => unimplemented!("Unsupported punchthrough error {:?}", e),
-                })?;
+                    .get_arch_specific_register(&ArchSpecificRegister::FsBase)?;
                 addr.write_at_offset(0, fsbase).ok_or(Errno::EFAULT)?;
                 Ok(())
             }
@@ -1554,7 +1540,10 @@ impl<FS: ShimFS> Task<FS> {
         unsafe { self.global.pm.release_memory(release) }
             .expect("failed to release memory mappings");
 
-        litebox_platform_multiplex::Platform::clear_guest_thread_local_storage();
+        self.global
+            .platform
+            .set_arch_specific_register(&ArchSpecificRegister::FsBase, 0)
+            .expect("failed to clear guest TLS on execve");
 
         self.load_program(loader, argv_vec, envp_vec)
             .expect("TODO: terminate the process cleanly");

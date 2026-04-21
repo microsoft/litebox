@@ -1119,38 +1119,6 @@ pub unsafe fn wrgsbase(gs_base: usize) {
     }
 }
 
-/// Linux's `user_desc` struct used by the `set_thread_area` syscall.
-#[repr(C, packed)]
-#[derive(Debug, Clone, FromBytes, IntoBytes)]
-pub struct UserDesc {
-    pub entry_number: u32,
-    pub base_addr: u32,
-    pub limit: u32,
-    pub flags: UserDescFlags,
-}
-
-bitfield::bitfield! {
-    /// Flags for the `user_desc` struct.
-    #[derive(Clone, Copy, FromBytes, IntoBytes)]
-    #[repr(transparent)]
-    pub struct UserDescFlags(u32);
-    impl Debug;
-    /// 1 if the segment is 32-bit
-    pub seg_32bit, set_seg_32bit: 0;
-    /// Contents of the segment
-    pub contents, set_contents: 1, 2;
-    /// Read-exec only
-    pub read_exec_only, set_read_exec_only: 3;
-    /// Limit in pages
-    pub limit_in_pages, set_limit_in_pages: 4;
-    /// Segment not present
-    pub seg_not_present, set_seg_not_present: 5;
-    /// Usable by userland
-    pub useable, set_useable: 6;
-    /// 1 if the segment is 64-bit (x86_64 only)
-    pub lm, set_lm: 7;
-}
-
 /// Flags for the clone3 system call as defined in `/usr/include/linux/sched.h`.
 #[derive(Clone, Copy, Debug, FromBytes, IntoBytes)]
 #[repr(transparent)]
@@ -2312,9 +2280,9 @@ pub enum SyscallRequest<Platform: litebox::platform::RawPointerProvider> {
         args: Platform::RawConstPointer<CloneArgs>,
     },
     /// Manipulate thread-local storage information.
-    /// Returns `ENOSYS` on 64-bit.
+    /// Returns `ENOSYS` on x86_64.
     SetThreadArea {
-        user_desc: Platform::RawMutPointer<UserDesc>,
+        user_desc: Platform::RawMutPointer<u8>,
     },
     ClockGettime {
         clockid: i32,
@@ -2980,30 +2948,6 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
     }
 }
 
-/// A set of syscalls that are allowed to be punched through to platforms that work with the Linux
-/// shim.
-///
-/// NOTE: It is assumed that all punchthroughs here are non-blocking.
-#[derive(Debug)]
-pub enum PunchthroughSyscall<'a, Platform: litebox::platform::RawPointerProvider> {
-    /// Set the FS base register to the value in `addr`.
-    #[cfg(target_arch = "x86_64")]
-    SetFsBase { addr: usize },
-    /// Return the current value of the FS base register.
-    #[cfg(target_arch = "x86_64")]
-    GetFsBase,
-    /// An uninhabited variant to ensure the generics are referenced on all
-    /// architectures. Provider implementations won't need to match on this
-    /// variant, since Rust can see that it is uninhabited.
-    #[doc(hidden)]
-    _Phantom(
-        core::marker::PhantomData<&'a mut ()>,
-        core::marker::PhantomData<fn(Platform) -> Platform>,
-        // Make this variant uninhabited.
-        core::convert::Infallible,
-    ),
-}
-
 #[derive(Debug)]
 pub enum TimeParam<Platform: litebox::platform::RawPointerProvider> {
     None,
@@ -3087,13 +3031,6 @@ impl<Platform: litebox::platform::RawPointerProvider> TimeParam<Platform> {
             }
         }
     }
-}
-
-impl<Platform: litebox::platform::RawPointerProvider> litebox::platform::Punchthrough
-    for PunchthroughSyscall<'_, Platform>
-{
-    type ReturnSuccess = usize;
-    type ReturnFailure = errno::Errno;
 }
 
 /// Context saved when entering the kernel

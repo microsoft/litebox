@@ -23,7 +23,6 @@ use litebox::platform::page_mgmt::{
 };
 use litebox::shim::{ContinueOperation, Exception};
 use litebox::utils::TruncateExt as _;
-use litebox_common_linux::PunchthroughSyscall;
 
 use windows_sys::Win32::Foundation::{self as Win32_Foundation, FILETIME};
 use windows_sys::Win32::{
@@ -1473,41 +1472,40 @@ impl litebox::platform::SystemTime for SystemTime {
     }
 }
 
-pub struct PunchthroughToken<'a> {
-    punchthrough: PunchthroughSyscall<'a, WindowsUserland>,
-}
-
-impl<'a> litebox::platform::PunchthroughToken for PunchthroughToken<'a> {
-    type Punchthrough = PunchthroughSyscall<'a, WindowsUserland>;
-    fn execute(
-        self,
-    ) -> Result<
-        <Self::Punchthrough as litebox::platform::Punchthrough>::ReturnSuccess,
-        litebox::platform::PunchthroughError<
-            <Self::Punchthrough as litebox::platform::Punchthrough>::ReturnFailure,
-        >,
-    > {
-        match self.punchthrough {
-            PunchthroughSyscall::SetFsBase { addr } => {
+impl litebox::platform::ArchSpecificProvider for WindowsUserland {
+    fn set_arch_specific_register(
+        &self,
+        reg: &litebox::platform::ArchSpecificRegister,
+        val: usize,
+    ) -> Result<(), litebox::platform::ArchSpecificError> {
+        match reg {
+            litebox::platform::ArchSpecificRegister::FsBase => {
                 // Use WindowsUserland's per-thread FS base management system
-                WindowsUserland::set_thread_fs_base(addr);
-                Ok(0)
+                Self::set_thread_fs_base(val);
+                Ok(())
             }
-            PunchthroughSyscall::GetFsBase => {
-                // Use the stored FS base value from our per-thread storage
-                Ok(WindowsUserland::get_thread_fs_base())
+            litebox::platform::ArchSpecificRegister::GsBase => {
+                // Windows uses GS for its own thread environment block
+                // (TEB); the host platform does not expose a safe way for
+                // the guest to program gs base without breaking the host.
+                Err(litebox::platform::ArchSpecificError::RegisterReserved)
             }
+            _ => Err(litebox::platform::ArchSpecificError::RegisterUnsupported),
         }
     }
-}
 
-impl litebox::platform::PunchthroughProvider for WindowsUserland {
-    type PunchthroughToken<'a> = PunchthroughToken<'a>;
-    fn get_punchthrough_token_for<'a>(
+    fn get_arch_specific_register(
         &self,
-        punchthrough: <Self::PunchthroughToken<'a> as litebox::platform::PunchthroughToken>::Punchthrough,
-    ) -> Option<Self::PunchthroughToken<'a>> {
-        Some(PunchthroughToken { punchthrough })
+        reg: &litebox::platform::ArchSpecificRegister,
+    ) -> Result<usize, litebox::platform::ArchSpecificError> {
+        match reg {
+            litebox::platform::ArchSpecificRegister::FsBase => Ok(Self::get_thread_fs_base()),
+            litebox::platform::ArchSpecificRegister::GsBase => {
+                // See note above: gs base is reserved by the Windows host.
+                Err(litebox::platform::ArchSpecificError::RegisterReserved)
+            }
+            _ => Err(litebox::platform::ArchSpecificError::RegisterUnsupported),
+        }
     }
 }
 
@@ -2051,10 +2049,6 @@ unsafe impl litebox::platform::ThreadLocalStorageProvider for WindowsUserland {
 
     unsafe fn replace_thread_local_storage(new_tls: *mut ()) -> *mut () {
         PLATFORM_TLS.replace(new_tls)
-    }
-
-    fn clear_guest_thread_local_storage() {
-        Self::init_thread_fs_base();
     }
 }
 

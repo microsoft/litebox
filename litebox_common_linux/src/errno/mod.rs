@@ -607,3 +607,19 @@ impl From<litebox::fs::errors::TruncateError> for Errno {
         }
     }
 }
+
+#[cfg(target_arch = "x86_64")]
+impl From<litebox::platform::ArchSpecificError> for Errno {
+    fn from(value: litebox::platform::ArchSpecificError) -> Self {
+        match value {
+            litebox::platform::ArchSpecificError::RegisterUnsupported => {
+                // Reaching here means that a shim is attempting to easily run on a platform that
+                // fully disallows it. There is no reasonable handling here, so we panic.
+                // XXX: should this be ENOSYS?
+                panic!()
+            }
+            litebox::platform::ArchSpecificError::RegisterReserved => Errno::EINVAL,
+            _ => unimplemented!(),
+        }
+    }
+}

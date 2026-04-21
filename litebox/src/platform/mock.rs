@@ -266,13 +266,19 @@ impl TimeProvider for MockPlatform {
     }
 }
 
-impl PunchthroughProvider for MockPlatform {
-    type PunchthroughToken<'a> = trivial_providers::ImpossiblePunchthroughToken;
-    fn get_punchthrough_token_for<'a>(
+impl ArchSpecificProvider for MockPlatform {
+    fn get_arch_specific_register(
         &self,
-        punchthrough: <Self::PunchthroughToken<'a> as PunchthroughToken>::Punchthrough,
-    ) -> Option<Self::PunchthroughToken<'a>> {
-        None
+        _reg: &ArchSpecificRegister,
+    ) -> Result<usize, ArchSpecificError> {
+        Err(ArchSpecificError::RegisterUnsupported)
+    }
+    fn set_arch_specific_register(
+        &self,
+        _reg: &ArchSpecificRegister,
+        _val: usize,
+    ) -> Result<(), ArchSpecificError> {
+        Err(ArchSpecificError::RegisterUnsupported)
     }
 }
 

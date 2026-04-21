@@ -13,9 +13,10 @@ use core::{
 };
 use hashbrown::HashMap;
 use litebox::platform::{
-    IPInterfaceProvider, ImmediatelyWokenUp, PageManagementProvider, Punchthrough,
-    PunchthroughProvider, PunchthroughToken, RawMutex as _, RawMutexProvider, RawPointerProvider,
-    StdioProvider, TimeProvider, UnblockedOrTimedOut, page_mgmt::DeallocationError,
+    ArchSpecificError, ArchSpecificProvider, ArchSpecificRegister, IPInterfaceProvider,
+    ImmediatelyWokenUp, PageManagementProvider, RawMutex as _, RawMutexProvider,
+    RawPointerProvider, StdioProvider, TimeProvider, UnblockedOrTimedOut,
+    page_mgmt::DeallocationError,
 };
 use litebox::{
     mm::linux::{PAGE_SIZE, PageRange},
@@ -23,12 +24,12 @@ use litebox::{
     shim::ContinueOperation,
     utils::TruncateExt,
 };
+use litebox_common_linux::errno::Errno;
 #[cfg(feature = "optee_syscall")]
 use litebox_common_linux::vmap::{
     PhysPageAddr, PhysPageAddrArray, PhysPageMapInfo, PhysPageMapPermissions, PhysPointerError,
     VmapManager,
 };
-use litebox_common_linux::{PunchthroughSyscall, errno::Errno};
 use x86_64::{
     VirtAddr,
     structures::paging::{
@@ -407,11 +408,6 @@ pub struct LinuxKernel<Host: HostInterface> {
     vtl0_kernel_info: Vtl0KernelInfo,
 }
 
-pub struct LinuxPunchthroughToken<'a, Host: HostInterface> {
-    punchthrough: PunchthroughSyscall<'a, LinuxKernel<Host>>,
-    host: core::marker::PhantomData<Host>,
-}
-
 /// [`litebox::platform::common_providers::userspace_pointers::ValidateAccess`]
 /// implementation for LVBS that provides SMAP support.
 pub struct LvbsValidateAccess;
@@ -476,40 +472,34 @@ impl<Host: HostInterface> RawPointerProvider for LinuxKernel<Host> {
     type RawMutPointer<T: FromBytes + IntoBytes> = UserMutPtr<T>;
 }
 
-impl<'a, Host: HostInterface> PunchthroughToken for LinuxPunchthroughToken<'a, Host> {
-    type Punchthrough = PunchthroughSyscall<'a, LinuxKernel<Host>>;
-
-    fn execute(
-        self,
-    ) -> Result<
-        <Self::Punchthrough as Punchthrough>::ReturnSuccess,
-        litebox::platform::PunchthroughError<<Self::Punchthrough as Punchthrough>::ReturnFailure>,
-    > {
-        let r = match self.punchthrough {
-            PunchthroughSyscall::SetFsBase { addr } => {
-                unsafe { litebox_common_linux::wrfsbase(addr) };
-                Ok(0)
+impl<Host: HostInterface> ArchSpecificProvider for LinuxKernel<Host> {
+    fn set_arch_specific_register(
+        &self,
+        reg: &ArchSpecificRegister,
+        val: usize,
+    ) -> Result<(), ArchSpecificError> {
+        match reg {
+            ArchSpecificRegister::FsBase => {
+                unsafe { litebox_common_linux::wrfsbase(val) };
+                Ok(())
             }
-            PunchthroughSyscall::GetFsBase => Ok(unsafe { litebox_common_linux::rdfsbase() }),
-        };
-        match r {
-            Ok(v) => Ok(v),
-            Err(e) => Err(litebox::platform::PunchthroughError::Failure(e)),
+            ArchSpecificRegister::GsBase => {
+                unsafe { litebox_common_linux::wrgsbase(val) };
+                Ok(())
+            }
+            _ => Err(ArchSpecificError::RegisterUnsupported),
         }
     }
-}
 
-impl<Host: HostInterface> PunchthroughProvider for LinuxKernel<Host> {
-    type PunchthroughToken<'a> = LinuxPunchthroughToken<'a, Host>;
-
-    fn get_punchthrough_token_for<'a>(
+    fn get_arch_specific_register(
         &self,
-        punchthrough: <Self::PunchthroughToken<'a> as PunchthroughToken>::Punchthrough,
-    ) -> Option<Self::PunchthroughToken<'a>> {
-        Some(LinuxPunchthroughToken {
-            punchthrough,
-            host: core::marker::PhantomData,
-        })
+        reg: &ArchSpecificRegister,
+    ) -> Result<usize, ArchSpecificError> {
+        match reg {
+            ArchSpecificRegister::FsBase => Ok(unsafe { litebox_common_linux::rdfsbase() }),
+            ArchSpecificRegister::GsBase => Ok(unsafe { litebox_common_linux::rdgsbase() }),
+            _ => Err(ArchSpecificError::RegisterUnsupported),
+        }
     }
 }
 
