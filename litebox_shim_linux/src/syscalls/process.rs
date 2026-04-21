@@ -1132,10 +1132,12 @@ impl<FS: ShimFS> Task<FS> {
         tv: Option<crate::MutPtr<litebox_common_linux::TimeVal>>,
         tz: Option<crate::MutPtr<litebox_common_linux::TimeZone>>,
     ) -> Result<(), Errno> {
-        if tz.is_some() {
+        if let Some(tz) = tz {
             // `man 2 gettimeofday`: The use of the timezone structure is obsolete; the tz argument
-            // should normally be specified as NULL.
-            unimplemented!()
+            // should normally be specified as NULL. Linux still accepts a non-NULL tz and fills it
+            // in (typically with zeros for UTC systems) rather than returning an error.
+            let utc_tz = litebox_common_linux::TimeZone::new(0, 0);
+            tz.write_at_offset(0, utc_tz).ok_or(Errno::EFAULT)?;
         }
         if let Some(tv) = tv {
             tv.write_at_offset(0, self.real_time_as_duration_since_epoch().into())
