@@ -356,10 +356,12 @@ impl<FS: ShimFS> Task<FS> {
 
 #[cfg(test)]
 mod tests {
+    #[allow(unused_imports)]
     use litebox::{
         fs::{Mode, OFlags},
         platform::{PageManagementProvider, RawConstPointer, RawMutPointer},
     };
+    #[allow(unused_imports)]
     use litebox_common_linux::{MRemapFlags, MapFlags, ProtFlags, errno::Errno};
 
     use crate::syscalls::tests::init_platform;

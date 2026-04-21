@@ -168,6 +168,8 @@ impl<FS: ShimFS> Task<FS> {
 mod tests {
     use core::mem::MaybeUninit;
 
+    use litebox::platform::RawConstPointer as _;
+
     use crate::syscalls::tests::init_platform;
 
     #[test]
@@ -177,7 +179,7 @@ mod tests {
         let task = init_platform(None);
 
         let mut buf = [0u8; 16];
-        let ptr = crate::MutPtr::from_ptr(buf.as_mut_ptr());
+        let ptr = crate::MutPtr::from_usize(buf.as_mut_ptr() as usize);
         let count = task
             .sys_getrandom(ptr, buf.len() - 1, RngFlags::empty())
             .expect("getrandom failed");
@@ -194,7 +196,7 @@ mod tests {
         let task = init_platform(None);
 
         let mut utsname = MaybeUninit::<litebox_common_linux::Utsname>::uninit();
-        let ptr = crate::MutPtr::from_ptr(utsname.as_mut_ptr());
+        let ptr = crate::MutPtr::from_usize(utsname.as_mut_ptr() as usize);
         task.sys_uname(ptr).expect("uname failed");
         let utsname = unsafe { utsname.assume_init() };
 

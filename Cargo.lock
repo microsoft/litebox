@@ -1509,6 +1509,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "litebox_platform_freebsd_userland"
+version = "0.1.0"
+dependencies = [
+ "bitflags 2.11.0",
+ "getrandom 0.3.4",
+ "libc",
+ "litebox",
+ "litebox_common_linux",
+ "thiserror",
+ "zerocopy",
+]
+
+[[package]]
 name = "litebox_platform_linux_kernel"
 version = "0.1.0"
 dependencies = [
@@ -1579,6 +1592,7 @@ version = "0.1.0"
 dependencies = [
  "cfg-if",
  "litebox",
+ "litebox_platform_freebsd_userland",
  "litebox_platform_linux_kernel",
  "litebox_platform_linux_userland",
  "litebox_platform_lvbs",

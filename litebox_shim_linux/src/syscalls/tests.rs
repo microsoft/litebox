@@ -16,10 +16,10 @@ const TEST_TAR_FILE: &[u8] = include_bytes!("../../../litebox/src/fs/test.tar");
 pub(crate) fn init_platform(tun_device_name: Option<&str>) -> crate::Task<crate::DefaultFS> {
     static PLATFORM_INIT: std::sync::Once = std::sync::Once::new();
     PLATFORM_INIT.call_once(|| {
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "freebsd"))]
         let platform = Platform::new(tun_device_name);
 
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
         let platform = Platform::new();
 
         set_platform(platform);
