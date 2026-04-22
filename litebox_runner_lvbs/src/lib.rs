@@ -99,8 +99,18 @@ pub fn seed_initial_heap() {
 pub fn init(is_bsp: bool) -> Option<&'static Platform> {
     let ret = if is_bsp {
         let (start, size) = get_vtl1_memory_info().expect("Failed to get memory info");
+        let min_vtl1_size = ((VTL1_REMAP_PDE_PAGE + 1) * PAGE_SIZE) as u64;
+        assert!(
+            size >= min_vtl1_size,
+            "VTL1 memory size is too small for fixed boot layout"
+        );
         let vtl1_start = x86_64::PhysAddr::new(start);
-        let vtl1_end = x86_64::PhysAddr::new(start + size);
+        // this `checked_add` covers all `vtl1_start + offset` calculations within this function.
+        let vtl1_end = x86_64::PhysAddr::new(
+            start
+                .checked_add(size)
+                .expect("VTL1 memory range overflow in init()"),
+        );
 
         // Re-compute the pre-populated region bounds needed for the
         // remaining-memory add after `Platform::new()` below.
@@ -184,8 +194,10 @@ pub fn init(is_bsp: bool) -> Option<&'static Platform> {
 
         // Add the rest of the VTL1 memory to the global allocator once they are mapped to the base page table.
         let mem_fill_start = mem_fill_start + mem_fill_size;
+        let vtl1_base_va = Platform::pa_to_va(vtl1_start).as_u64();
         let mem_fill_size = TruncateExt::<usize>::truncate(
-            size - (mem_fill_start as u64 - Platform::pa_to_va(vtl1_start).as_u64()),
+            size.checked_sub((mem_fill_start as u64) - vtl1_base_va)
+                .expect("remaining VTL1 memory size underflow in init()"),
         );
         unsafe {
             Platform::mem_fill_pages(mem_fill_start, mem_fill_size);
@@ -261,7 +273,9 @@ fn optee_smc_handler_entry_inner(
     smc_args_pfn: u64,
 ) -> Result<i64, litebox_common_linux::errno::Errno> {
     let smc_args_pfn: usize = smc_args_pfn.truncate();
-    let smc_args_addr = smc_args_pfn << litebox_platform_lvbs::mshv::vtl1_mem_layout::PAGE_SHIFT;
+    let smc_args_addr = smc_args_pfn
+        .checked_mul(1usize << litebox_platform_lvbs::mshv::vtl1_mem_layout::PAGE_SHIFT)
+        .ok_or(litebox_common_linux::errno::Errno::EINVAL)?;
     let smc_args_updated = optee_smc_handler(smc_args_addr);
 
     // Write back the SMC arguments page to normal world memory.
@@ -1287,8 +1301,9 @@ fn write_rpc_args_to_normal_world(
     let mut blob = vec![0u8; rpc_args_size];
     rpc_args.serialize(&mut blob)?;
 
-    let rpc_pa: usize =
-        <u64 as litebox::utils::TruncateExt<usize>>::truncate(msg_args_phys_addr) + msg_args_size; // RPC args are placed right after the main msg_args blob
+    let rpc_pa: usize = <u64 as litebox::utils::TruncateExt<usize>>::truncate(msg_args_phys_addr)
+        .checked_add(msg_args_size)
+        .ok_or(OpteeSmcReturnCode::EBadAddr)?; // RPC args are placed right after the main msg_args blob
     let mut ptr = NormalWorldMutPtr::<u8, PAGE_SIZE>::with_contiguous_pages(rpc_pa, rpc_args_size)?;
     // SAFETY: Writing rpc_args back to normal world memory at a valid physical address.
     // The blob contains the serialized variable-length optee_msg_arg structure(s).
