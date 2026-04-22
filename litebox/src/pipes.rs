@@ -259,6 +259,24 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> Pipes<Platform> {
         }
     }
 
+    /// Check whether the write end of a pipe has been closed (regardless
+    /// of whether the buffer still contains data).  Returns `false` for
+    /// sender ends.
+    ///
+    /// Used by delayed-fork pipe bridging to decide whether an ongoing mux
+    /// relay is needed: when the writer is already closed, no more data can
+    /// arrive, so the relay can be skipped.
+    pub fn is_writer_closed(&self, fd: &PipeFd<Platform>) -> bool {
+        let dt = self.litebox.descriptor_table();
+        match dt.get_entry(fd) {
+            Some(entry) => match &entry.entry {
+                PipeEnd::Receiver(p) => p.is_peer_shutdown(),
+                PipeEnd::Sender(_) => false,
+            },
+            None => true,
+        }
+    }
+
     /// Drain all currently buffered data from a pipe receiver without blocking.
     ///
     /// Returns the buffered data (may be empty if nothing is buffered).
@@ -319,6 +337,56 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> Pipes<Platform> {
                     Some(w) => Ok(w.pair_id as usize),
                     None => Ok(Arc::as_ptr(r) as usize),
                 }
+            }
+        }
+    }
+
+    /// Snapshot the ring buffer consumer read-index for a pipe receiver.
+    ///
+    /// Used by the vfork CoW mechanism to save the parent's read position
+    /// before the child shares the ring buffer.  After the child exits,
+    /// [`restore_consumer_position`] resets the index so the parent
+    /// doesn't lose data consumed by the child.
+    ///
+    /// Returns `None` if `fd` is not a receiver.
+    pub fn snapshot_consumer_position(&self, fd: &PipeFd<Platform>) -> Option<usize> {
+        let dt = self.litebox.descriptor_table();
+        match &dt.get_entry(fd)?.entry {
+            PipeEnd::Receiver(r) => {
+                let rb = r.endpoint.rb.lock();
+                Some(rb.read_index())
+            }
+            PipeEnd::Sender(_) => None,
+        }
+    }
+
+    /// Restore the ring buffer consumer read-index for a pipe receiver.
+    ///
+    /// Counterpart to [`snapshot_consumer_position`].  Resets the
+    /// consumer to the saved position so data consumed by the vfork
+    /// child is "un-read" and available to the parent again.
+    ///
+    /// # Safety
+    /// The caller must ensure that `position` was obtained from
+    /// [`snapshot_consumer_position`] on the same pipe and that no
+    /// data has been written past the ring buffer capacity since the
+    /// snapshot (which is guaranteed for vfork children that share
+    /// the same address space and are serialized by vfork_done).
+    pub fn restore_consumer_position(&self, fd: &PipeFd<Platform>, position: usize) {
+        use ringbuf::traits::Consumer as _;
+        use ringbuf::traits::Observer as _;
+        let dt = self.litebox.descriptor_table();
+        if let Some(entry) = dt.get_entry(fd) {
+            if let PipeEnd::Receiver(r) = &entry.entry {
+                let rb = r.endpoint.rb.lock();
+                // Reset consumer to saved position.  set_read_index
+                // updates the Frozen cache + commits to the shared rb.
+                unsafe { rb.set_read_index(position) };
+                // Force the CachingCons to re-fetch the producer's
+                // write_index from the shared ring buffer.  write_index()
+                // on CachingCons triggers Frozen::fetch() which updates
+                // the cached write position.
+                let _ = rb.write_index();
             }
         }
     }

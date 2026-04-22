@@ -2808,6 +2808,35 @@ impl<FS: ShimFS> Task<FS> {
             );
         }
         if let Some(vd) = vfork_done {
+            // Snapshot pipe receiver consumer positions before the child
+            // runs.  The vfork child shares the ring buffer — its reads
+            // advance the shared consumer index.  We restore the index
+            // after CoW so the parent doesn't lose data.
+            let pipe_positions: alloc::vec::Vec<(
+                alloc::sync::Arc<litebox::fd::TypedFd<litebox::pipes::Pipes<crate::Platform>>>,
+                usize,
+            )> = {
+                let files = self.files.borrow();
+                let rds = files.raw_descriptor_store.read();
+                let mut positions = alloc::vec::Vec::new();
+                for raw_fd in rds.iter_alive() {
+                    if let Ok(typed) =
+                        rds.fd_from_raw_integer::<litebox::pipes::Pipes<crate::Platform>>(raw_fd)
+                    {
+                        if let Some(pos) = self.global.pipes.snapshot_consumer_position(&typed) {
+                            positions.push((typed, pos));
+                        }
+                    }
+                }
+                #[cfg(feature = "trace_syscalls")]
+                litebox::log_println!(
+                    self.global.platform,
+                    "[PIPE-COW] snapshotted {} pipe receiver positions",
+                    positions.len(),
+                );
+                positions
+            };
+
             // Like Linux's TASK_UNINTERRUPTIBLE wait: keep blocking even if
             // interrupted, because parent and child share the same guest stack.
             while !vd.is_done() {
@@ -2818,6 +2847,27 @@ impl<FS: ShimFS> Task<FS> {
             if let Some(cow) = &cow_state {
                 self.restore_cow_layer(cow, true);
             }
+
+            // Restore pipe receiver consumer positions so the parent
+            // sees data that the child consumed from the shared ring buffer.
+            for (typed, saved_pos) in &pipe_positions {
+                self.global
+                    .pipes
+                    .restore_consumer_position(typed, *saved_pos);
+            }
+            // Verify restoration worked by checking positions match
+            #[cfg(feature = "trace_syscalls")]
+            for (typed, saved_pos) in &pipe_positions {
+                if let Some(current) = self.global.pipes.snapshot_consumer_position(typed) {
+                    litebox::log_println!(
+                        self.global.platform,
+                        "[PIPE-COW] restored consumer: saved={} current={}",
+                        saved_pos,
+                        current,
+                    );
+                }
+            }
+            drop(pipe_positions);
 
             // Apply fd replacements deposited by commit_delayed_fork.
             // Instead of replacing with HostPipeFd (which has a no-op
@@ -3002,7 +3052,8 @@ impl<FS: ShimFS> Task<FS> {
 
                 let mux_streams: Vec<crate::MuxParentStream> =
                     vd.mux_parent_streams.lock().drain(..).collect();
-                let mut orphan_streams: Vec<(u32, Vec<u8>)> = vd.mux_orphan_streams.lock().drain(..).collect();
+                let mut orphan_streams: Vec<(u32, Vec<u8>)> =
+                    vd.mux_orphan_streams.lock().drain(..).collect();
 
                 if mux_streams.is_empty() && !orphan_streams.is_empty() {
                     // All streams are orphans — no parent endpoints needed.
@@ -3585,10 +3636,9 @@ impl<FS: ShimFS> Task<FS> {
                                             // Write drained data into the
                                             // dispatch pipe (sender end) so
                                             // the parent's new receiver has it.
-                                            let wait_state =
-                                                litebox::event::wait::WaitState::new(
-                                                    self.global.platform,
-                                                );
+                                            let wait_state = litebox::event::wait::WaitState::new(
+                                                self.global.platform,
+                                            );
                                             let cx = wait_state.context();
                                             let _ = self.global.pipes.write(
                                                 &cx,
@@ -5583,7 +5633,43 @@ impl<FS: ShimFS> Task<FS> {
                         // Build a MuxParentStream for each parent counterpart.
                         let parents = bridge_parent_info.get(i).cloned().unwrap_or_default();
 
-                        if parents.is_empty() {
+                        // Check if the pipe's writer is already closed.
+                        // When a Read-direction child pipe has a closed writer
+                        // and there's drained data, no more data can arrive.
+                        // Treat this like an orphan — use a local pipe on the
+                        // worker.  This avoids setting up a mux relay that
+                        // would consume restored ring-buffer data from the
+                        // parent's pipe after vfork CoW pipe position restore.
+                        let writer_closed = if direction == HostPipeDirection::Read {
+                            let files = self.files.borrow();
+                            let rds = files.raw_descriptor_store.read();
+                            if let Ok(typed) = rds
+                                .fd_from_raw_integer::<litebox::pipes::Pipes<crate::Platform>>(
+                                    guest_fd,
+                                )
+                            {
+                                drop(rds);
+                                self.global.pipes.is_writer_closed(&typed)
+                            } else {
+                                drop(rds);
+                                false
+                            }
+                        } else {
+                            false
+                        };
+
+                        if parents.is_empty()
+                            || (writer_closed && direction == HostPipeDirection::Read)
+                        {
+                            #[cfg(feature = "trace_syscalls")]
+                            if writer_closed && !parents.is_empty() {
+                                litebox::log_println!(
+                                    self.global.platform,
+                                    "[DELAYED-FORK] pid={}: fd={} writer closed, treating as orphan (skipping mux relay)",
+                                    self.pid,
+                                    guest_fd,
+                                );
+                            }
                             // Check if this is a PTY bridge.
                             let pty = bridge_pty_pair.get(i).and_then(Clone::clone);
                             if let Some(pty_pair) = pty {
@@ -5640,8 +5726,8 @@ impl<FS: ShimFS> Task<FS> {
                                 // mux relay writes on fork-restore workers.
                                 if direction == HostPipeDirection::Read && !drained.is_empty() {
                                     local_pipe_pairs.push((
-                                        usize::MAX,  // write_fd sentinel: close immediately
-                                        guest_fd,    // read_fd: guest reads here
+                                        usize::MAX, // write_fd sentinel: close immediately
+                                        guest_fd,   // read_fd: guest reads here
                                         drained,
                                         0, // write flags
                                         0, // read flags
@@ -5676,7 +5762,13 @@ impl<FS: ShimFS> Task<FS> {
                     // Push to mux_stream_specs only if not handled as a
                     // local pipe (orphan read-end with drained data).
                     if !handled_as_local_pipe {
-                        mux_stream_specs.push((stream_id, guest_fd, dir_byte, type_byte, initial_eof));
+                        mux_stream_specs.push((
+                            stream_id,
+                            guest_fd,
+                            dir_byte,
+                            type_byte,
+                            initial_eof,
+                        ));
                     }
                 }
 
