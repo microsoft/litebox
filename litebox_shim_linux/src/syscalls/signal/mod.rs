@@ -51,8 +51,9 @@ use alloc::collections::vec_deque::VecDeque;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::cell::{Cell, RefCell};
+use core::time::Duration;
 use litebox::{
-    platform::{RawConstPointer as _, RawMutPointer as _},
+    platform::{Instant as _, RawConstPointer as _, RawMutPointer as _, TimeProvider},
     process::{ProcessId, ProcessState},
     shim::Exception,
     sync::Mutex,
@@ -401,6 +402,21 @@ impl PendingSignals {
             .or_else(|| pending.lowest_set())?;
 
         Some(next)
+    }
+
+    /// Returns true if any pending signal is NOT in `blocked`.
+    fn has_unblocked(&self, blocked: SigSet) -> bool {
+        !(self.pending & !blocked).is_empty()
+    }
+
+    /// Returns true if `signal` is in the pending set.
+    fn is_pending(&self, signal: Signal) -> bool {
+        self.pending.contains(signal)
+    }
+
+    /// Returns the raw pending signal set.
+    fn pending_set(&self) -> SigSet {
+        self.pending
     }
 
     fn remove(&mut self, signal: Signal) -> Siginfo {
@@ -906,6 +922,153 @@ impl<FS: ShimFS> Task<FS> {
 
     pub(crate) fn sys_tgkill(&self, pid: i32, tid: i32, signal: i32) -> Result<usize, Errno> {
         self.do_kill(Some(pid), Some(tid), signal)
+    }
+
+    /// Handle syscall `rt_sigsuspend`.
+    ///
+    /// Atomically replaces the current signal mask with `mask`, then suspends
+    /// until a signal whose action is to invoke a handler is delivered.
+    /// On return, the original mask is restored and `EINTR` is returned.
+    pub(crate) fn sys_rt_sigsuspend(
+        &self,
+        mask_ptr: crate::ConstPtr<SigSet>,
+        sigsetsize: usize,
+        _ctx: &mut litebox_common_linux::ExecutionContext,
+    ) -> Result<usize, Errno> {
+        if sigsetsize != core::mem::size_of::<SigSet>() {
+            return Err(Errno::EINVAL);
+        }
+        let new_mask: SigSet = mask_ptr.read_at_offset(0).ok_or(Errno::EFAULT)?;
+        let old_mask = self.signals.blocked.get();
+
+        // Set the temporary mask and schedule restoration.
+        // The signal delivery path (process_signals) checks restore_mask
+        // and will reset the blocked mask after delivering any pending signal.
+        self.signals.blocked.set(new_mask);
+        self.signals.restore_mask.set(Some(old_mask));
+
+        // Wait until a signal becomes pending that is not blocked by new_mask.
+        let _ = self.wait_cx().wait_until(|| {
+            self.drain_thread_signals();
+            self.drain_cross_process_signals();
+            let pending = self.signals.pending.borrow();
+            let shared = self.signals.shared_pending.lock();
+            pending.has_unblocked(new_mask) || shared.has_unblocked(new_mask)
+        });
+
+        // sigsuspend always returns EINTR.  The caller (do_syscall)
+        // calls process_signals() after we return, which will deliver
+        // the signal and restore the mask via restore_mask.
+        Err(Errno::EINTR)
+    }
+
+    /// Handle syscall `rt_sigtimedwait`.
+    ///
+    /// Synchronously waits for one of the signals in `set` to become pending.
+    /// The signal is dequeued and its number is returned. If `info` is not null,
+    /// the signal's siginfo is written there.
+    pub(crate) fn sys_rt_sigtimedwait(
+        &self,
+        set_ptr: crate::ConstPtr<SigSet>,
+        _info: Option<crate::MutPtr<u8>>,
+        timeout_ptr: Option<crate::ConstPtr<litebox_common_linux::Timespec>>,
+        sigsetsize: usize,
+    ) -> Result<usize, Errno> {
+        if sigsetsize != core::mem::size_of::<SigSet>() {
+            return Err(Errno::EINVAL);
+        }
+        let wait_set: SigSet = set_ptr.read_at_offset(0).ok_or(Errno::EFAULT)?;
+        let timeout = timeout_ptr
+            .map(|p| {
+                let ts: litebox_common_linux::Timespec =
+                    p.read_at_offset(0).ok_or(Errno::EFAULT)?;
+                Duration::try_from(ts)
+            })
+            .transpose()?;
+
+        // Helper: check if any signal in wait_set is pending, dequeue it.
+        let try_dequeue = || -> Option<Signal> {
+            let mut pending = self.signals.pending.borrow_mut();
+            if let Some(sig) = (pending.pending_set() & wait_set).lowest_set() {
+                let _siginfo = pending.remove(sig);
+                return Some(sig);
+            }
+            let mut shared = self.signals.shared_pending.lock();
+            if let Some(sig) = (shared.pending_set() & wait_set).lowest_set() {
+                let _siginfo = shared.remove(sig);
+                return Some(sig);
+            }
+            None
+        };
+
+        // First try without waiting.
+        self.drain_thread_signals();
+        self.drain_cross_process_signals();
+        if let Some(sig) = try_dequeue() {
+            return Ok(sig.as_i32() as usize);
+        }
+
+        // If timeout is zero, return immediately.
+        if timeout.is_some_and(|t| t.is_zero()) {
+            return Err(Errno::EAGAIN);
+        }
+
+        // Wait with timeout.
+        let deadline = timeout.map(|t| {
+            self.global
+                .platform
+                .now()
+                .checked_add(t)
+                .unwrap_or_else(|| self.global.platform.now())
+        });
+
+        loop {
+            let _ = self.wait_cx().wait_until(|| {
+                self.drain_thread_signals();
+                self.drain_cross_process_signals();
+                let pending = self.signals.pending.borrow();
+                let shared = self.signals.shared_pending.lock();
+                let has_match = !(pending.pending_set() & wait_set).is_empty()
+                    || !(shared.pending_set() & wait_set).is_empty();
+                if has_match {
+                    return true;
+                }
+                if let Some(dl) = &deadline {
+                    return self.global.platform.now() >= *dl;
+                }
+                false
+            });
+
+            if let Some(sig) = try_dequeue() {
+                return Ok(sig.as_i32() as usize);
+            }
+
+            if let Some(dl) = &deadline {
+                if self.global.platform.now() >= *dl {
+                    return Err(Errno::EAGAIN);
+                }
+            }
+        }
+    }
+
+    /// Handle syscall `rt_sigpending`.
+    ///
+    /// Returns the set of signals that are pending for delivery.
+    pub(crate) fn sys_rt_sigpending(
+        &self,
+        set_ptr: crate::MutPtr<SigSet>,
+        sigsetsize: usize,
+    ) -> Result<usize, Errno> {
+        if sigsetsize != core::mem::size_of::<SigSet>() {
+            return Err(Errno::EINVAL);
+        }
+        self.drain_thread_signals();
+        self.drain_cross_process_signals();
+        let pending = self.signals.pending.borrow();
+        let shared = self.signals.shared_pending.lock();
+        let result = pending.pending_set() | shared.pending_set();
+        set_ptr.write_at_offset(0, result).ok_or(Errno::EFAULT)?;
+        Ok(0)
     }
 
     fn do_remote_process_kill(

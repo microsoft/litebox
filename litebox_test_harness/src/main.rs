@@ -500,27 +500,20 @@ mod syscall_test {
     /// Node.js uses this in its signal handling loop.  If it returns
     /// an unexpected error, Node.js spins calling it repeatedly.
     fn test_rt_sigsuspend() -> bool {
-        // Block SIGUSR1, then sigsuspend with an empty mask.
-        // sigsuspend should return -1 with EINTR when any signal arrives,
-        // or we can just test that the syscall doesn't return ENOSYS.
-        let mut mask: libc::sigset_t = unsafe { std::mem::zeroed() };
-        unsafe { libc::sigemptyset(&mut mask) };
-
-        // Send ourselves SIGUSR1 after a short delay so sigsuspend returns.
-        let pid = unsafe { libc::getpid() };
-        std::thread::spawn(move || {
-            std::thread::sleep(std::time::Duration::from_millis(50));
-            unsafe { libc::kill(pid, libc::SIGUSR1) };
-        });
-
-        // Install a no-op handler for SIGUSR1 so it doesn't kill us.
+        // Install a no-op handler for SIGALRM so it doesn't kill us.
         unsafe {
             let mut sa: libc::sigaction = std::mem::zeroed();
-            sa.sa_sigaction = noop_handler as usize;
+            sa.sa_sigaction = noop_handler as *const () as usize;
             libc::sigemptyset(&mut sa.sa_mask);
             sa.sa_flags = 0;
-            libc::sigaction(libc::SIGUSR1, &sa, std::ptr::null_mut());
+            libc::sigaction(libc::SIGALRM, &sa, std::ptr::null_mut());
         }
+
+        // Schedule SIGALRM in 1 second, then sigsuspend with empty mask.
+        unsafe { libc::alarm(1) };
+
+        let mut mask: libc::sigset_t = unsafe { std::mem::zeroed() };
+        unsafe { libc::sigemptyset(&mut mask) };
 
         let ret = unsafe { libc::sigsuspend(&mask) };
         // sigsuspend always returns -1 with errno=EINTR on success.
@@ -549,12 +542,16 @@ mod syscall_test {
         }
 
         let new_value = libc::itimerspec {
-            it_interval: libc::timespec { tv_sec: 0, tv_nsec: 0 },
-            it_value: libc::timespec { tv_sec: 0, tv_nsec: 100_000_000 }, // 100ms
+            it_interval: libc::timespec {
+                tv_sec: 0,
+                tv_nsec: 0,
+            },
+            it_value: libc::timespec {
+                tv_sec: 0,
+                tv_nsec: 100_000_000,
+            }, // 100ms
         };
-        let ret = unsafe {
-            libc::timer_settime(timer_id, 0, &new_value, std::ptr::null_mut())
-        };
+        let ret = unsafe { libc::timer_settime(timer_id, 0, &new_value, std::ptr::null_mut()) };
         if ret != 0 {
             let e = std::io::Error::last_os_error();
             eprintln!("  timer_settime failed: {e}");

@@ -20,10 +20,7 @@ use std::process::Command;
 fn workspace_root() -> PathBuf {
     let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
     // litebox_test_harness/Cargo.toml → workspace root is one level up.
-    manifest_dir
-        .parent()
-        .expect("workspace root")
-        .to_path_buf()
+    manifest_dir.parent().expect("workspace root").to_path_buf()
 }
 
 /// Find the target/debug directory containing built binaries.

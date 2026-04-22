@@ -185,6 +185,8 @@ pub(crate) struct Process {
     pub(crate) limits: ResourceLimits,
     /// Process-wide alarm timer.
     pub(crate) alarm_timer: Mutex<Platform, Alarm>,
+    /// POSIX per-process timers created by timer_create(2).
+    pub(crate) posix_timers: Mutex<Platform, PosixTimers>,
     /// Whether transparent huge pages are disabled for this process.
     pub(crate) thp_disabled: AtomicBool,
 }
@@ -194,6 +196,33 @@ pub(crate) struct Alarm {
     pub(crate) handle: Option<<Platform as litebox::platform::TimerProvider>::TimerHandle>,
     /// The deadline for the alarm.
     pub(crate) deadline: Option<<Platform as litebox::platform::TimeProvider>::Instant>,
+}
+
+/// POSIX per-process timers created by `timer_create(2)`.
+pub(crate) struct PosixTimers {
+    /// Map from guest timer ID to platform timer handle.
+    timers: alloc::collections::BTreeMap<i32, PosixTimerEntry>,
+    /// Next timer ID to allocate.
+    next_id: i32,
+}
+
+struct PosixTimerEntry {
+    handle: <Platform as litebox::platform::TimerProvider>::TimerHandle,
+    /// The armed interval (for timer_gettime reporting).
+    interval: core::time::Duration,
+    /// The armed value (one-shot or initial expiration).
+    value: core::time::Duration,
+    /// When the timer was last armed (for computing remaining time).
+    armed_at: Option<<Platform as litebox::platform::TimeProvider>::Instant>,
+}
+
+impl PosixTimers {
+    pub fn new() -> Self {
+        Self {
+            timers: alloc::collections::BTreeMap::new(),
+            next_id: 0,
+        }
+    }
 }
 
 /// The locked portion of the process state.
@@ -236,6 +265,7 @@ impl Process {
                 handle: None,
                 deadline: None,
             }),
+            posix_timers: Mutex::new(PosixTimers::new()),
             thp_disabled: AtomicBool::new(false),
         }
     }
@@ -266,6 +296,7 @@ impl Process {
                 handle: None,
                 deadline: None,
             }),
+            posix_timers: Mutex::new(PosixTimers::new()),
             thp_disabled: AtomicBool::new(thp_disabled),
         }
     }
@@ -7691,6 +7722,152 @@ impl<FS: ShimFS> Task<FS> {
         alarm.deadline = new_deadline;
 
         Ok(remaining)
+    }
+
+    /// Handle syscall `timer_create`.
+    pub(crate) fn sys_timer_create(
+        &self,
+        clockid: i32,
+        _sevp: Option<crate::ConstPtr<u8>>,
+        timerid_out: crate::MutPtr<i32>,
+    ) -> Result<usize, Errno> {
+        use litebox::platform::TimerProvider;
+
+        // We only support CLOCK_MONOTONIC and CLOCK_REALTIME.
+        if clockid != 1 /* CLOCK_MONOTONIC */
+            && clockid != 0 /* CLOCK_REALTIME */
+            && clockid != 2 /* CLOCK_PROCESS_CPUTIME_ID */
+            && clockid != 3
+        /* CLOCK_THREAD_CPUTIME_ID */
+        {
+            return Err(Errno::EINVAL);
+        }
+
+        // Parse the sigevent to determine which signal to deliver.
+        // For now, default to SIGALRM (like alarm()). A full
+        // implementation would parse the sigevent struct from guest
+        // memory to extract sigev_notify, sigev_signo, etc.
+        let signal = litebox_common_linux::signal::Signal::SIGALRM;
+
+        let handle = self
+            .global
+            .platform
+            .create_timer(signal)
+            .map_err(|_| Errno::EAGAIN)?;
+
+        let mut timers = self.process().posix_timers.lock();
+        let id = timers.next_id;
+        timers.next_id += 1;
+        timers.timers.insert(
+            id,
+            PosixTimerEntry {
+                handle,
+                interval: Duration::ZERO,
+                value: Duration::ZERO,
+                armed_at: None,
+            },
+        );
+        drop(timers);
+
+        timerid_out.write_at_offset(0, id).ok_or(Errno::EFAULT)?;
+        Ok(0)
+    }
+
+    /// Handle syscall `timer_settime`.
+    pub(crate) fn sys_timer_settime(
+        &self,
+        timerid: i32,
+        _flags: i32,
+        new_value: crate::ConstPtr<litebox_common_linux::Itimerspec>,
+        old_value: Option<crate::MutPtr<litebox_common_linux::Itimerspec>>,
+    ) -> Result<usize, Errno> {
+        use litebox::platform::Instant as _;
+        let spec: litebox_common_linux::Itimerspec =
+            new_value.read_at_offset(0).ok_or(Errno::EFAULT)?;
+        let value = Duration::try_from(spec.it_value).unwrap_or(Duration::ZERO);
+        let interval = Duration::try_from(spec.it_interval).unwrap_or(Duration::ZERO);
+
+        let mut timers = self.process().posix_timers.lock();
+        let entry = timers.timers.get_mut(&timerid).ok_or(Errno::EINVAL)?;
+
+        // Return old value if requested.
+        if let Some(old) = old_value {
+            let now = self.global.platform.now();
+            let remaining = entry
+                .armed_at
+                .and_then(|at| {
+                    let elapsed = now.checked_duration_since(&at)?;
+                    entry.value.checked_sub(elapsed)
+                })
+                .unwrap_or(Duration::ZERO);
+            old.write_at_offset(
+                0,
+                litebox_common_linux::Itimerspec {
+                    it_interval: entry.interval.into(),
+                    it_value: remaining.into(),
+                },
+            )
+            .ok_or(Errno::EFAULT)?;
+        }
+
+        entry.interval = interval;
+        entry.value = value;
+        entry.armed_at = if value.is_zero() {
+            None
+        } else {
+            Some(self.global.platform.now())
+        };
+        entry.handle.set_timer(value);
+
+        Ok(0)
+    }
+
+    /// Handle syscall `timer_gettime`.
+    pub(crate) fn sys_timer_gettime(
+        &self,
+        timerid: i32,
+        curr_value: crate::MutPtr<litebox_common_linux::Itimerspec>,
+    ) -> Result<usize, Errno> {
+        use litebox::platform::Instant as _;
+        let timers = self.process().posix_timers.lock();
+        let entry = timers.timers.get(&timerid).ok_or(Errno::EINVAL)?;
+        let now = self.global.platform.now();
+        let remaining = entry
+            .armed_at
+            .and_then(|at| {
+                let elapsed = now.checked_duration_since(&at)?;
+                entry.value.checked_sub(elapsed)
+            })
+            .unwrap_or(Duration::ZERO);
+        curr_value
+            .write_at_offset(
+                0,
+                litebox_common_linux::Itimerspec {
+                    it_interval: entry.interval.into(),
+                    it_value: remaining.into(),
+                },
+            )
+            .ok_or(Errno::EFAULT)?;
+        Ok(0)
+    }
+
+    /// Handle syscall `timer_delete`.
+    pub(crate) fn sys_timer_delete(&self, timerid: i32) -> Result<usize, Errno> {
+        let mut timers = self.process().posix_timers.lock();
+        let entry = timers.timers.remove(&timerid).ok_or(Errno::EINVAL)?;
+        // TimerHandle::drop calls timer_delete.
+        drop(entry.handle);
+        Ok(0)
+    }
+
+    /// Handle syscall `timer_getoverrun`.
+    pub(crate) fn sys_timer_getoverrun(&self, timerid: i32) -> Result<usize, Errno> {
+        let timers = self.process().posix_timers.lock();
+        if !timers.timers.contains_key(&timerid) {
+            return Err(Errno::EINVAL);
+        }
+        // Overrun tracking is not implemented; return 0.
+        Ok(0)
     }
 
     /// Handle syscall `getpid`.

@@ -3265,6 +3265,35 @@ impl<FS: ShimFS> Task<FS> {
             SyscallRequest::Tgkill { tgid, tid, sig } => self.sys_tgkill(tgid, tid, sig),
             SyscallRequest::Sigaltstack { ss, old_ss } => self.sys_sigaltstack(ss, old_ss, ctx),
             SyscallRequest::Alarm { seconds } => syscall!(sys_alarm(seconds)),
+            SyscallRequest::TimerCreate {
+                clockid,
+                sevp,
+                timerid,
+            } => self.sys_timer_create(clockid, sevp, timerid),
+            SyscallRequest::TimerSettime {
+                timerid,
+                flags,
+                new_value,
+                old_value,
+            } => self.sys_timer_settime(timerid, flags, new_value, old_value),
+            SyscallRequest::TimerGettime {
+                timerid,
+                curr_value,
+            } => self.sys_timer_gettime(timerid, curr_value),
+            SyscallRequest::TimerDelete { timerid } => self.sys_timer_delete(timerid),
+            SyscallRequest::TimerGetoverrun { timerid } => self.sys_timer_getoverrun(timerid),
+            SyscallRequest::RtSigsuspend { mask, sigsetsize } => {
+                self.sys_rt_sigsuspend(mask, sigsetsize, ctx)
+            }
+            SyscallRequest::RtSigtimedwait {
+                set,
+                info,
+                timeout,
+                sigsetsize,
+            } => self.sys_rt_sigtimedwait(set, info, timeout, sigsetsize),
+            SyscallRequest::Sigpending { set, sigsetsize } => {
+                self.sys_rt_sigpending(set, sigsetsize)
+            }
             _ => {
                 log_unsupported!("{request:?}");
                 Err(Errno::ENOSYS)

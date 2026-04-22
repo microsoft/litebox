@@ -1086,6 +1086,18 @@ pub struct ItimerVal {
     value: TimeVal,
 }
 
+/// POSIX interval timer specification (`struct itimerspec`).
+///
+/// Used by `timer_settime` / `timer_gettime` (POSIX per-process timers).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, FromBytes, IntoBytes)]
+pub struct Itimerspec {
+    /// Timer interval (for repeating timers).
+    pub it_interval: Timespec,
+    /// Time until next expiration.
+    pub it_value: Timespec,
+}
+
 impl TryFrom<TimeVal> for Duration {
     type Error = errno::Errno;
 
@@ -2253,6 +2265,23 @@ pub enum SyscallRequest<Platform: litebox::platform::RawPointerProvider> {
         ss: Option<Platform::RawConstPointer<signal::SigAltStack>>,
         old_ss: Option<Platform::RawMutPointer<signal::SigAltStack>>,
     },
+    /// rt_sigsuspend(2): atomically replace signal mask and suspend.
+    RtSigsuspend {
+        mask: Platform::RawConstPointer<SigSet>,
+        sigsetsize: usize,
+    },
+    /// rt_sigtimedwait(2): synchronously wait for a signal.
+    RtSigtimedwait {
+        set: Platform::RawConstPointer<SigSet>,
+        info: Option<Platform::RawMutPointer<u8>>, // siginfo_t (opaque)
+        timeout: Option<Platform::RawConstPointer<Timespec>>,
+        sigsetsize: usize,
+    },
+    /// rt_sigpending(2): query pending signals.
+    Sigpending {
+        set: Platform::RawMutPointer<SigSet>,
+        sigsetsize: usize,
+    },
     Ioctl {
         fd: i32,
         arg: IoctlArg<Platform>,
@@ -2807,6 +2836,32 @@ pub enum SyscallRequest<Platform: litebox::platform::RawPointerProvider> {
         new_value: Platform::RawConstPointer<ItimerVal>,
         old_value: Option<Platform::RawMutPointer<ItimerVal>>,
     },
+    /// POSIX timer_create(2): create a per-process interval timer.
+    TimerCreate {
+        clockid: i32,
+        sevp: Option<Platform::RawConstPointer<u8>>, // sigevent (opaque — parsed in shim)
+        timerid: Platform::RawMutPointer<i32>,
+    },
+    /// POSIX timer_settime(2): arm or disarm a timer.
+    TimerSettime {
+        timerid: i32,
+        flags: i32,
+        new_value: Platform::RawConstPointer<Itimerspec>,
+        old_value: Option<Platform::RawMutPointer<Itimerspec>>,
+    },
+    /// POSIX timer_gettime(2): query remaining time.
+    TimerGettime {
+        timerid: i32,
+        curr_value: Platform::RawMutPointer<Itimerspec>,
+    },
+    /// POSIX timer_delete(2): delete a timer.
+    TimerDelete {
+        timerid: i32,
+    },
+    /// POSIX timer_getoverrun(2): get overrun count.
+    TimerGetoverrun {
+        timerid: i32,
+    },
     Wait4 {
         pid: i32,
         wstatus: Option<Platform::RawMutPointer<i32>>,
@@ -3000,6 +3055,12 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
             Sysno::tkill => sys_req!(Tkill { tid, sig }),
             Sysno::tgkill => sys_req!(Tgkill { tgid, tid, sig }),
             Sysno::sigaltstack => sys_req!(Sigaltstack { ss:*, old_ss:* }),
+            // Signal suspension / waiting.
+            Sysno::rt_sigsuspend => sys_req!(RtSigsuspend { mask:*, sigsetsize }),
+            Sysno::rt_sigtimedwait => {
+                sys_req!(RtSigtimedwait { set:*, info:*, timeout:*, sigsetsize })
+            }
+            Sysno::rt_sigpending => sys_req!(Sigpending { set:*, sigsetsize }),
             Sysno::ioctl => SyscallRequest::Ioctl {
                 fd: ctx.sys_req_arg(0),
                 arg: {
@@ -3612,6 +3673,14 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
             Sysno::umask => sys_req!(Umask { mask }),
             Sysno::alarm => sys_req!(Alarm { seconds }),
             Sysno::setitimer => sys_req!(SetITimer { which:?, new_value:*, old_value:* }),
+            // POSIX per-process timers (timer_create family).
+            Sysno::timer_create => sys_req!(TimerCreate { clockid, sevp:*, timerid:* }),
+            Sysno::timer_settime => {
+                sys_req!(TimerSettime { timerid, flags, new_value:*, old_value:* })
+            }
+            Sysno::timer_gettime => sys_req!(TimerGettime { timerid, curr_value:* }),
+            Sysno::timer_delete => sys_req!(TimerDelete { timerid }),
+            Sysno::timer_getoverrun => sys_req!(TimerGetoverrun { timerid }),
             // utimensat: set file timestamps — no-op for in-memory FS.
             Sysno::utimensat => {
                 return Ok(SyscallRequest::Utimensat);
