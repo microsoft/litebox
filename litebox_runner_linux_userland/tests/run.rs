@@ -580,7 +580,7 @@ fn test_tun_with_curl() {
 fn test_shebang() {
     let bash_path = run_which("bash");
 
-    let output = Runner::new(Backend::Rewriter, &bash_path, "shebang_rewriter")
+    let output = Runner::new(&bash_path, "shebang_rewriter")
         .with_fs_path(|out_dir| {
             // Place a rewritten copy of bash inside the guest filesystem so the
             // shebang interpreter path resolves.
