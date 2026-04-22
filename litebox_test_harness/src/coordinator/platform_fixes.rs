@@ -440,11 +440,13 @@ pub(crate) async fn cross_worker_file_tests(r: &mut TestRunner) {
             r.record(&test_id, agent, pass, &format!("{resp:?}"));
         }
 
-        // CWF.concurrent: child writes, stays alive, parent reads.
+        // CWF.concurrent: child writes, closes fd, stays alive, parent reads.
+        // The child drops the file handle before sleeping — tests that the
+        // parent can read after the child's 9P session releases the file.
         {
             let test_id = format!("CWF.concurrent.{agent}");
             let path = format!("/shared/cwf-conc-{agent}.txt");
-            // Start child in background (it writes then sleeps).
+            // Start child in background (it writes, closes fd, then sleeps).
             let resp = r
                 .send(
                     agent,
@@ -489,12 +491,60 @@ pub(crate) async fn cross_worker_file_tests(r: &mut TestRunner) {
             }
         }
 
+        // CWF.hold: child writes, keeps fd OPEN, parent reads.
+        // This is the VS Code CLI pattern — the CLI keeps its log file
+        // open while the parent polls it for "Listening on <port>".
+        {
+            let test_id = format!("CWF.hold.{agent}");
+            let path = format!("/shared/cwf-hold-{agent}.txt");
+            let resp = r
+                .send(
+                    agent,
+                    Command::Exec {
+                        args: vec![
+                            self_exe.clone(),
+                            "cross-worker-file".into(),
+                            "write-and-hold".into(),
+                            path.clone(),
+                        ],
+                        timeout_secs: None,
+                        stdin: None,
+                        background: true,
+                    },
+                )
+                .await;
+            let bg_pid = match &resp {
+                Response::Background { pid } => Some(*pid),
+                _ => None,
+            };
+            if bg_pid.is_none() {
+                r.record(
+                    &test_id,
+                    agent,
+                    false,
+                    &format!("bg spawn failed: {resp:?}"),
+                );
+                continue;
+            }
+            tokio::time::sleep(Duration::from_secs(3)).await;
+            let resp = r.send(agent, Command::FsRead { path: path.clone() }).await;
+            let pass = matches!(
+                &resp,
+                Response::Ok { data: Some(d) } if d.starts_with("line0")
+            );
+            r.record(&test_id, agent, pass, &format!("{resp:?}"));
+            if let Some(pid) = bg_pid {
+                let _ = r.send(agent, Command::Kill { pid }).await;
+            }
+        }
+
         // CWF.redirect: bash `cmd > file &` pattern (VS Code CLI pattern).
+        // Child keeps fd open (write-and-hold), parent cats the file.
         {
             let test_id = format!("CWF.redirect.{agent}");
             let path = format!("/shared/cwf-redir-{agent}.txt");
             let script = format!(
-                "rm -f {path}; {exe} cross-worker-file write-and-sleep {path} &\nBGPID=$!\nsleep 3\ncat {path}\nkill $BGPID 2>/dev/null\n",
+                "rm -f {path}; {exe} cross-worker-file write-and-hold {path} &\nBGPID=$!\nsleep 3\ncat {path}\nkill $BGPID 2>/dev/null\n",
                 path = path,
                 exe = self_exe,
             );

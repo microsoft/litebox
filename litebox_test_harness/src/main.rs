@@ -430,7 +430,7 @@ fn main() {
             //
             // Usage: cross-worker-file [write-and-sleep|write-and-exit]
             let sub = args.get(2).map(String::as_str).unwrap_or("");
-            if sub == "write-and-sleep" || sub == "write-and-exit" {
+            if sub == "write-and-sleep" || sub == "write-and-exit" || sub == "write-and-hold" {
                 // Child mode: write lines to the file path in arg[3].
                 let path = args.get(3).map(String::as_str).unwrap_or("/tmp/cwf.log");
                 let mut f = std::fs::OpenOptions::new()
@@ -444,10 +444,15 @@ fn main() {
                     writeln!(f, "line{i}").unwrap();
                 }
                 f.flush().unwrap();
-                drop(f);
-                if sub == "write-and-sleep" {
-                    // Keep alive so parent reads concurrently.
+                if sub == "write-and-hold" {
+                    // Keep the fd OPEN (like VS Code CLI does with its log).
                     std::thread::sleep(std::time::Duration::from_secs(10));
+                    drop(f);
+                } else {
+                    drop(f);
+                    if sub == "write-and-sleep" {
+                        std::thread::sleep(std::time::Duration::from_secs(10));
+                    }
                 }
                 std::process::exit(0);
             }
