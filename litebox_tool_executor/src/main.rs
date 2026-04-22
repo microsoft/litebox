@@ -84,8 +84,8 @@ fn main() -> anyhow::Result<()> {
     if !cli.rootfs.exists() {
         anyhow::bail!(
             "Rootfs not found: {}\n\
-             For tar rootfs: bash litebox_tool_executor/scripts/prepare-bash-rootfs.sh\n\
-             For directory rootfs: bash litebox_tool_executor/scripts/prepare-vscode-rootfs-staged.sh",
+             Build Docker image: docker build --target litebox-test -t litebox-test -f litebox_tool_executor/rootfs/Dockerfile .\n\
+             Then run inside the container with --rootfs /",
             cli.rootfs.display()
         );
     }
@@ -212,7 +212,6 @@ fn print_build_info(audit_log_file: Option<&std::path::Path>) {
 
 /// Find the litebox_runner_linux_userland binary.
 fn find_runner() -> anyhow::Result<std::path::PathBuf> {
-    // 1. Check env var (set by cargo test / nextest)
     if let Ok(path) = std::env::var("LITEBOX_RUNNER") {
         let p = std::path::PathBuf::from(path);
         if p.exists() {
@@ -220,7 +219,8 @@ fn find_runner() -> anyhow::Result<std::path::PathBuf> {
         }
     }
 
-    // 2. Look next to our own binary
+    // Look next to our own binary — works for both Docker (/opt/litebox/)
+    // and local development (target/debug/).
     if let Ok(exe) = std::env::current_exe() {
         let sibling = exe
             .parent()
@@ -231,21 +231,9 @@ fn find_runner() -> anyhow::Result<std::path::PathBuf> {
         }
     }
 
-    // 3. Try well-known workspace build paths
-    for candidate in [
-        "/mnt/c/src/litebox/target/debug/litebox_runner_linux_userland",
-        "./target/debug/litebox_runner_linux_userland",
-    ] {
-        let p = std::path::PathBuf::from(candidate);
-        if p.exists() {
-            return Ok(p);
-        }
-    }
-
     anyhow::bail!(
         "Could not find litebox_runner_linux_userland. \
-         Set LITEBOX_RUNNER env var or build it with: \
-         cargo build -p litebox_runner_linux_userland --features audit_log"
+         Set LITEBOX_RUNNER env var or ensure it is built alongside litebox_tool_executor."
     );
 }
 
@@ -268,20 +256,9 @@ fn find_broker() -> anyhow::Result<std::path::PathBuf> {
         }
     }
 
-    for candidate in [
-        "/mnt/c/src/litebox/target/debug/litebox_broker",
-        "./target/debug/litebox_broker",
-    ] {
-        let p = std::path::PathBuf::from(candidate);
-        if p.exists() {
-            return Ok(p);
-        }
-    }
-
     anyhow::bail!(
         "Could not find litebox_broker. \
-         Set LITEBOX_BROKER env var or build it with: \
-         cargo build -p litebox_broker"
+         Set LITEBOX_BROKER env var or ensure it is built alongside litebox_tool_executor."
     );
 }
 
@@ -625,13 +602,15 @@ fn direct(cli: &Cli, audit_log_file: Option<&std::path::Path>) -> anyhow::Result
 /// Server — all sharing one filesystem inside the sandbox.
 ///
 /// Usage:
-///   litebox-tool-executor --rootfs /path/to/vscode-rootfs --vscode-server
+///   docker run --rm -p 2222:22 -v target/debug:/opt/litebox:ro litebox-vscode \
+///     /opt/litebox/litebox_tool_executor --rootfs / --vscode-server
 ///   # then in VS Code: Remote-SSH → litebox (port 2222)
 fn vscode_server(cli: &Cli, audit_log_file: Option<&std::path::Path>) -> anyhow::Result<()> {
     if !cli.rootfs.is_dir() {
         anyhow::bail!(
             "--vscode-server requires a directory rootfs (not a tar).\n\
-             Build one with: bash litebox_tool_executor/scripts/prepare-vscode-rootfs-staged.sh"
+             Use Docker: docker build --target litebox-vscode -t litebox-vscode -f litebox_tool_executor/rootfs/Dockerfile .\n\
+             Then: docker run --rm -p 2222:22 -v target/debug:/opt/litebox:ro litebox-vscode /opt/litebox/litebox_tool_executor --rootfs / --vscode-server"
         );
     }
 

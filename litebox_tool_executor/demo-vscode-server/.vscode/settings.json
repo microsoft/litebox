@@ -4,10 +4,10 @@
     // ================================================================
     //
     // Prerequisites:
-    //   1. Build the rootfs:
-    //      wsl -d Ubuntu -- bash scripts/prepare-vscode-rootfs-staged.sh
+    //   1. Build the Docker images:
+    //      Run task "LiteBox: Build Docker Images"
     //   2. Build the binaries in WSL2:
-    //      wsl -d Ubuntu -- bash -c 'cd /mnt/c/src/litebox-vscode-server && cargo build -p litebox_tool_executor -p litebox_broker -p litebox_runner_linux_userland'
+    //      Run task "LiteBox: Build All"
     //
     // Setup:
     //   remote.SSH.path and remote.SSH.showLoginTerminal have application
@@ -23,19 +23,24 @@
     //
     // Usage:
     //   1. Switch to the "LiteBox" profile
-    //   2. Ctrl+Shift+P → "Remote-SSH: Connect to Host..." → litebox
-    //   3. VS Code connects to the LiteBox sandbox via stdio transport
+    //   2. Run task "LiteBox: Start VS Code Server"
+    //   3. Ctrl+Shift+P → "Remote-SSH: Connect to Host..." → litebox
     //   4. All operations execute inside the sandbox
-    //   5. Logs: /tmp/litebox-vscode-server-logs/*.{jsonl,broker.log,server.log}
+    //
+    // Note: The Docker container IS the rootfs. Binaries are bind-mounted
+    // at /opt/litebox/ from target/debug/. No manual rootfs export needed.
 
-    // Terminal profiles (for shell-only sandboxing as fallback)
+    // Terminal profiles (for shell-only sandboxing via Docker)
     "terminal.integrated.profiles.windows": {
-        "LiteBox Sandbox (WSL2)": {
-            "path": "wsl.exe",
-            "args": ["-d", "Ubuntu", "--",
-                "/mnt/c/src/litebox-vscode-server/target/debug/litebox_tool_executor",
-                "--rootfs", "/home/wportnoy/vscode-rootfs",
-                "--policy", "/mnt/c/src/litebox-vscode-server/litebox_tool_executor/policies/demo-policy.json",
+        "LiteBox Sandbox (Docker)": {
+            "path": "docker",
+            "args": ["run", "--rm", "-it", "--cap-add", "SYS_PTRACE",
+                "-v", "C:\\src\\litebox-vscode-server\\target\\debug:/opt/litebox:ro",
+                "-v", "C:\\src\\litebox-vscode-server\\litebox_tool_executor\\policies:/opt/policies:ro",
+                "litebox-test",
+                "/opt/litebox/litebox_tool_executor",
+                "--rootfs", "/",
+                "--policy", "/opt/policies/demo-policy.json",
                 "--interactive"
             ],
             "icon": "shield"
