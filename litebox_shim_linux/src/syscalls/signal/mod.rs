@@ -948,7 +948,15 @@ impl<FS: ShimFS> Task<FS> {
         self.signals.restore_mask.set(Some(old_mask));
 
         // Wait until a signal becomes pending that is not blocked by new_mask.
-        let _ = self.wait_cx().wait_until(|| {
+        //
+        // Use a bounded poll loop rather than unbounded wait_until.
+        // Thread-to-thread signals (e.g. from musl's internal threads)
+        // go through the host kernel and may not wake the shim's
+        // wait_until.  The platform's take_pending_signals path
+        // (drain_thread_signals) only runs when the thread is
+        // scheduled, so we poll with short sleeps.
+        let timeout_cx = self.wait_cx().with_timeout(Duration::from_secs(2));
+        let _ = timeout_cx.wait_until(|| {
             self.drain_thread_signals();
             self.drain_cross_process_signals();
             let pending = self.signals.pending.borrow();

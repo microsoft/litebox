@@ -419,6 +419,80 @@ fn main() {
             let sub = args.get(2).map(String::as_str).unwrap_or("all");
             std::process::exit(syscall_test::run(sub));
         }
+        "cross-worker-file" => {
+            // Minimal reproduction: forked child execs a binary that writes
+            // to a file, parent reads it while child is still alive.
+            // Reproduces VS Code CLI's "Input/output error" on log file.
+            //
+            // The child must exec (triggering delayed-fork worker migration)
+            // for the bug to manifest — direct fork without exec stays in
+            // the same worker and works fine.
+            //
+            // Usage: cross-worker-file [write-and-sleep]
+            let sub = args.get(2).map(String::as_str).unwrap_or("");
+            if sub == "write-and-sleep" {
+                // Child mode: write lines to the file path in arg[3], sleep.
+                let path = args.get(3).map(String::as_str).unwrap_or("/tmp/cwf.log");
+                let mut f = std::fs::OpenOptions::new()
+                    .write(true)
+                    .create(true)
+                    .truncate(true)
+                    .open(path)
+                    .unwrap();
+                use std::io::Write;
+                for i in 0..5 {
+                    writeln!(f, "line{i}").unwrap();
+                }
+                f.flush().unwrap();
+                drop(f);
+                // Keep alive so parent reads concurrently.
+                std::thread::sleep(std::time::Duration::from_secs(10));
+                std::process::exit(0);
+            }
+
+            // Parent mode: fork+exec child that writes to a file, then read it.
+            let self_exe = std::env::current_exe().unwrap();
+            let path = "/tmp/cross-worker-test.log";
+            let _ = std::fs::remove_file(path);
+            std::fs::write(path, "").unwrap();
+
+            let child = std::process::Command::new(&self_exe)
+                .args(["cross-worker-file", "write-and-sleep", path])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn();
+            let mut child = match child {
+                Ok(c) => c,
+                Err(e) => {
+                    println!("CROSS_WORKER_FILE:fail (spawn error: {e})");
+                    std::process::exit(1);
+                }
+            };
+
+            // Wait for child to write.
+            std::thread::sleep(std::time::Duration::from_secs(3));
+
+            match std::fs::read_to_string(path) {
+                Ok(contents) => {
+                    let lines: Vec<&str> = contents.lines().collect();
+                    if lines.len() >= 5 && lines[0] == "line0" {
+                        println!("CROSS_WORKER_FILE:pass ({} lines)", lines.len());
+                    } else {
+                        println!(
+                            "CROSS_WORKER_FILE:fail (got {} lines: {:?})",
+                            lines.len(),
+                            &lines[..lines.len().min(3)]
+                        );
+                    }
+                }
+                Err(e) => {
+                    println!("CROSS_WORKER_FILE:fail (read error: {e})");
+                }
+            }
+            let _ = child.kill();
+            let _ = child.wait();
+            std::process::exit(0);
+        }
         other => {
             eprintln!("unknown command: {other}");
             std::process::exit(1);
