@@ -549,6 +549,8 @@ LLM coding agents fall into two categories with different sandboxing surfaces:
 
 - **No dynamic terminal size**: TIOCGWINSZ returns hardcoded values instead of querying the real terminal dimensions.
 
+- **Docker bind mounts from NTFS break ELF loading**: Docker Desktop on Windows cannot `mmap` ELF binaries from NTFS bind mounts (causes "unsupported version 3 of Verneed record" and SIGSEGV). Cargo must build to a WSL2-native path (`--target-dir ~/litebox-out`) and Docker containers must mount from `\\wsl$\Ubuntu\...`, never from `C:\...` or `/mnt/c/...`. See `tasks.json` and the Dockerfile header for the correct paths.
+
 ## Future Work
 
 | Item | Description | Priority |
