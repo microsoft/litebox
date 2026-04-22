@@ -255,9 +255,7 @@ async fn test_fs_cross_unlink(r: &mut TestRunner, topo: Topology) {
     );
 
     // Source confirms it's gone.
-    let resp = r
-        .send(source, Command::FsRead { path: file.clone() })
-        .await;
+    let resp = r.send(source, Command::FsRead { path: file.clone() }).await;
     r.record(
         &format!("F.unlink.{ts}.gone"),
         source,

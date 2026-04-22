@@ -358,7 +358,11 @@ pub(super) async fn unix_socket_tests(r: &mut TestRunner) {
     // US1-US4, US5, VS1: Run via Exec subprocess so that timeouts kill
     // the subprocess cleanly without desynchronizing the agent's protocol.
     let tests = [
-        ("US1.cross_process_unix", "cross-process", "US1_CROSS_PROCESS_OK"),
+        (
+            "US1.cross_process_unix",
+            "cross-process",
+            "US1_CROSS_PROCESS_OK",
+        ),
         ("US2.cross_exec_unix", "cross-exec", "US2_CROSS_EXEC_OK"),
         ("US3.bidirectional_unix", "bidirectional", "US3_BIDI_OK"),
         ("US4.multi_conn_unix", "multi-conn", "US4_MULTI_OK"),
@@ -371,11 +375,7 @@ pub(super) async fn unix_socket_tests(r: &mut TestRunner) {
             .send(
                 "A",
                 super::exec_timeout(
-                    vec![
-                        self_exe.clone(),
-                        "unix-socket-test".into(),
-                        (*sub).into(),
-                    ],
+                    vec![self_exe.clone(), "unix-socket-test".into(), (*sub).into()],
                     10,
                 ),
             )
@@ -650,14 +650,46 @@ pub(super) async fn net_ipv6_tests(r: &mut TestRunner) {
 /// Matrix: 8 scripts × 2 shells × 2 agent depths.
 pub(super) async fn stdin_script_tests(r: &mut TestRunner) {
     const SCRIPTS: &[(&str, &str, &str)] = &[
-        ("cmd_subst", "FOO=$(echo hello)\necho FOO=$FOO\necho DONE\n", "FOO=hello"),
-        ("pipe_in_subst", "A=$(echo one | cat)\necho A=$A\necho DONE\n", "A=one"),
-        ("multi_pipe_subst", "A=$(echo data | grep data | cat)\necho A=$A\necho DONE\n", "A=data"),
-        ("file_pipe_subst", "A=$(cat /etc/hostname | cat)\necho A=$A\necho DONE\n", "DONE"),
-        ("sequential_subst", "A=$(echo first)\nB=$(echo second)\necho A=$A B=$B\necho DONE\n", "A=first B=second"),
-        ("subst_then_cmds", "A=$(echo val | cat)\necho LINE1\necho LINE2\necho LINE3\n", "LINE3"),
-        ("vscode_osrelease", "ID=$(cat /etc/os-release | grep -E '^ID=' | sed 's/ID=//g' | sed 's/\"//g')\necho ID=$ID\necho DONE\n", "DONE"),
-        ("backtick_pipe", "A=`echo one | cat`\necho A=$A\necho DONE\n", "A=one"),
+        (
+            "cmd_subst",
+            "FOO=$(echo hello)\necho FOO=$FOO\necho DONE\n",
+            "FOO=hello",
+        ),
+        (
+            "pipe_in_subst",
+            "A=$(echo one | cat)\necho A=$A\necho DONE\n",
+            "A=one",
+        ),
+        (
+            "multi_pipe_subst",
+            "A=$(echo data | grep data | cat)\necho A=$A\necho DONE\n",
+            "A=data",
+        ),
+        (
+            "file_pipe_subst",
+            "A=$(cat /etc/hostname | cat)\necho A=$A\necho DONE\n",
+            "DONE",
+        ),
+        (
+            "sequential_subst",
+            "A=$(echo first)\nB=$(echo second)\necho A=$A B=$B\necho DONE\n",
+            "A=first B=second",
+        ),
+        (
+            "subst_then_cmds",
+            "A=$(echo val | cat)\necho LINE1\necho LINE2\necho LINE3\n",
+            "LINE3",
+        ),
+        (
+            "vscode_osrelease",
+            "ID=$(cat /etc/os-release | grep -E '^ID=' | sed 's/ID=//g' | sed 's/\"//g')\necho ID=$ID\necho DONE\n",
+            "DONE",
+        ),
+        (
+            "backtick_pipe",
+            "A=`echo one | cat`\necho A=$A\necho DONE\n",
+            "A=one",
+        ),
     ];
     const SHELLS: &[&str] = &["sh", "bash"];
     const AGENTS: &[&str] = &["A", "AA"];
@@ -701,7 +733,15 @@ pub(super) async fn stdin_script_tests(r: &mut TestRunner) {
 /// Matrix: 3 cmd types × 2 shells × 2 agent depths.
 pub(super) async fn capture_pipe_tests(r: &mut TestRunner) {
     let self_exe = r.self_exe.clone();
-    const CMD_TYPES: &[&str] = &["simple", "pipe", "multi", "noexec", "nested_fork", "subshell_pipe", "subshell_continue"];
+    const CMD_TYPES: &[&str] = &[
+        "simple",
+        "pipe",
+        "multi",
+        "noexec",
+        "nested_fork",
+        "subshell_pipe",
+        "subshell_continue",
+    ];
     const SHELLS: &[&str] = &["sh", "bash"];
     const AGENTS: &[&str] = &["A", "AA"];
 
@@ -909,8 +949,7 @@ pub(super) async fn cross_worker_tests(r: &mut TestRunner) {
                 },
             )
             .await;
-        let pass =
-            matches!(&resp, Response::Connected { echo } if echo.contains("XW_TCP_HELLO"));
+        let pass = matches!(&resp, Response::Connected { echo } if echo.contains("XW_TCP_HELLO"));
         r.record("XW5.local_tcp_connect", "A", pass, &format!("{resp:?}"));
 
         let _ = r
@@ -950,12 +989,9 @@ pub(super) async fn cross_worker_tests(r: &mut TestRunner) {
                 },
             )
             .await;
-        let pass =
-            matches!(&resp, Response::Connected { echo } if echo.contains("XW_TCP_HELLO2"));
+        let pass = matches!(&resp, Response::Connected { echo } if echo.contains("XW_TCP_HELLO2"));
         r.record("XW6.remote_tcp_connect", "A", pass, &format!("{resp:?}"));
 
-        let _ = r
-            .send("A", Command::NetUnlisten { port })
-            .await;
+        let _ = r.send("A", Command::NetUnlisten { port }).await;
     }
 }

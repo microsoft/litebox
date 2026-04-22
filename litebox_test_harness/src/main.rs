@@ -445,7 +445,10 @@ mod cow_test {
                     ("child_builtin_capture", test_child_builtin_capture),
                     ("capture_dup2_stdout", test_capture_dup2_stdout),
                     ("sequential_captures", test_sequential_captures),
-                    ("capture_with_preexisting_heap", test_capture_with_preexisting_heap),
+                    (
+                        "capture_with_preexisting_heap",
+                        test_capture_with_preexisting_heap,
+                    ),
                     ("pipe_position_after_fork", test_pipe_position_after_fork),
                     ("pipe_position_child_reads", test_pipe_position_child_reads),
                 ];
@@ -499,7 +502,9 @@ mod cow_test {
     fn test_stack_restore() -> bool {
         let mut x: i32 = 42;
         let pid = unsafe { libc::fork() };
-        if pid < 0 { return false; }
+        if pid < 0 {
+            return false;
+        }
         if pid == 0 {
             x = 99;
             let _ = x; // use it so compiler doesn't optimize away
@@ -516,7 +521,9 @@ mod cow_test {
         let data = Box::new(42i32);
         let ptr = &*data as *const i32;
         let pid = unsafe { libc::fork() };
-        if pid < 0 { return false; }
+        if pid < 0 {
+            return false;
+        }
         if pid == 0 {
             // Write to the same heap address
             unsafe { (ptr as *mut i32).write_volatile(99) };
@@ -533,7 +540,9 @@ mod cow_test {
     fn test_post_fork_assign() -> bool {
         let mut x: i32 = 0;
         let pid = unsafe { libc::fork() };
-        if pid < 0 { return false; }
+        if pid < 0 {
+            return false;
+        }
         if pid == 0 {
             unsafe { libc::_exit(0) };
         }
@@ -554,7 +563,9 @@ mod cow_test {
         }
 
         let pid = unsafe { libc::fork() };
-        if pid < 0 { return false; }
+        if pid < 0 {
+            return false;
+        }
         if pid == 0 {
             unsafe { libc::close(pipefd[0]) };
             let msg = b"CAPTURED";
@@ -570,7 +581,9 @@ mod cow_test {
         let mut status = 0i32;
         unsafe { libc::waitpid(pid, &mut status, 0) };
 
-        if n <= 0 { return false; }
+        if n <= 0 {
+            return false;
+        }
         let captured = std::str::from_utf8(&buf[..n as usize]).unwrap_or("");
 
         // Assign to a NEW variable after reading
@@ -589,7 +602,9 @@ mod cow_test {
         }
 
         let pid = unsafe { libc::fork() };
-        if pid < 0 { return false; }
+        if pid < 0 {
+            return false;
+        }
         if pid == 0 {
             unsafe { libc::close(pipefd[0]) };
             let msg = b"HEAP_DATA";
@@ -605,7 +620,9 @@ mod cow_test {
         let mut status = 0i32;
         unsafe { libc::waitpid(pid, &mut status, 0) };
 
-        if n <= 0 { return false; }
+        if n <= 0 {
+            return false;
+        }
 
         // Heap-allocate the result (like bash's variable storage)
         let mut result = Vec::new();
@@ -629,7 +646,9 @@ mod cow_test {
         let pre_fork_marker: u64 = 0xDEAD_BEEF;
 
         let pid = unsafe { libc::fork() };
-        if pid < 0 { return false; }
+        if pid < 0 {
+            return false;
+        }
         if pid == 0 {
             unsafe { libc::close(pipefd[0]) };
             // Write marker value through pipe (not shared memory)
@@ -661,13 +680,15 @@ mod cow_test {
         }
 
         let pid = unsafe { libc::fork() };
-        if pid < 0 { return false; }
+        if pid < 0 {
+            return false;
+        }
         if pid == 0 {
             // Child: redirect stdout to pipe write end
             unsafe {
-                libc::close(pipefd[0]);       // close read end
-                libc::dup2(pipefd[1], 1);     // stdout = pipe write
-                libc::close(pipefd[1]);       // close original write end
+                libc::close(pipefd[0]); // close read end
+                libc::dup2(pipefd[1], 1); // stdout = pipe write
+                libc::close(pipefd[1]); // close original write end
             }
             // Write to stdout (= pipe) like a bash builtin would
             let msg = b"dup2_captured\n";
@@ -689,7 +710,10 @@ mod cow_test {
         }
         let captured = std::str::from_utf8(&buf[..n as usize]).unwrap_or("").trim();
         if captured != "dup2_captured" {
-            println!("  capture_dup2_stdout: got {:?} expected \"dup2_captured\"", captured);
+            println!(
+                "  capture_dup2_stdout: got {:?} expected \"dup2_captured\"",
+                captured
+            );
             return false;
         }
         true
@@ -712,7 +736,9 @@ mod cow_test {
         vars.push(("HOME".into(), "/root".into()));
 
         let pid = unsafe { libc::fork() };
-        if pid < 0 { return false; }
+        if pid < 0 {
+            return false;
+        }
         if pid == 0 {
             // Subshell: close read end, write to pipe, exit
             // No exec — like bash's echo builtin
@@ -731,7 +757,9 @@ mod cow_test {
         let mut status = 0i32;
         unsafe { libc::waitpid(pid, &mut status, 0) };
 
-        if n <= 0 { return false; }
+        if n <= 0 {
+            return false;
+        }
         let captured = std::str::from_utf8(&buf[..n as usize]).unwrap_or("");
 
         // Store result in the pre-existing Vec (like bash storing in its var table)
@@ -754,7 +782,9 @@ mod cow_test {
                 return false;
             }
             let pid = unsafe { libc::fork() };
-            if pid < 0 { return false; }
+            if pid < 0 {
+                return false;
+            }
             if pid == 0 {
                 unsafe { libc::close(pipefd[0]) };
                 let msg = b"first";
@@ -768,7 +798,9 @@ mod cow_test {
             unsafe { libc::close(pipefd[0]) };
             let mut status = 0i32;
             unsafe { libc::waitpid(pid, &mut status, 0) };
-            if n <= 0 { return false; }
+            if n <= 0 {
+                return false;
+            }
             String::from_utf8_lossy(&buf[..n as usize]).to_string()
         };
 
@@ -779,7 +811,9 @@ mod cow_test {
                 return false;
             }
             let pid = unsafe { libc::fork() };
-            if pid < 0 { return false; }
+            if pid < 0 {
+                return false;
+            }
             if pid == 0 {
                 unsafe { libc::close(pipefd[0]) };
                 let msg = b"second";
@@ -793,7 +827,9 @@ mod cow_test {
             unsafe { libc::close(pipefd[0]) };
             let mut status = 0i32;
             unsafe { libc::waitpid(pid, &mut status, 0) };
-            if n <= 0 { return false; }
+            if n <= 0 {
+                return false;
+            }
             String::from_utf8_lossy(&buf[..n as usize]).to_string()
         };
 
@@ -817,7 +853,9 @@ mod cow_test {
             return false;
         }
         let pid = unsafe { libc::fork() };
-        if pid < 0 { return false; }
+        if pid < 0 {
+            return false;
+        }
         if pid == 0 {
             unsafe { libc::close(pipefd[0]) };
             let msg = b"captured_value";
@@ -833,8 +871,12 @@ mod cow_test {
         let mut status = 0i32;
         unsafe { libc::waitpid(pid, &mut status, 0) };
 
-        if n <= 0 { return false; }
-        let captured = std::str::from_utf8(&buf[..n as usize]).unwrap_or("").to_string();
+        if n <= 0 {
+            return false;
+        }
+        let captured = std::str::from_utf8(&buf[..n as usize])
+            .unwrap_or("")
+            .to_string();
 
         // Insert into pre-existing HashMap (like bash's variable hash table)
         map.insert("result".to_string(), captured);
@@ -869,7 +911,9 @@ mod cow_test {
         }
 
         let pid = unsafe { libc::fork() };
-        if pid < 0 { return false; }
+        if pid < 0 {
+            return false;
+        }
         if pid == 0 {
             // Child reads 2 bytes (would consume "BB")
             let mut cbuf = [0u8; 2];
@@ -922,7 +966,9 @@ mod cow_test {
         }
 
         let pid = unsafe { libc::fork() };
-        if pid < 0 { return false; }
+        if pid < 0 {
+            return false;
+        }
         if pid == 0 {
             // Child reads line 2
             let mut cbuf = [0u8; 6];
@@ -944,7 +990,10 @@ mod cow_test {
         }
         let got = std::str::from_utf8(&rest[..n as usize]).unwrap_or("???");
         if !got.starts_with("LINE") {
-            println!("  pipe_position_child_reads: got {:?} (expected LINE2 or LINE3)", got);
+            println!(
+                "  pipe_position_child_reads: got {:?} (expected LINE2 or LINE3)",
+                got
+            );
             return false;
         }
         true

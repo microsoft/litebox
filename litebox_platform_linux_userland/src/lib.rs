@@ -2144,7 +2144,8 @@ impl LinuxUserland {
             }
             // std::thread::JoinHandle has no timeout API — use a
             // helper thread + condvar to implement one.
-            let done = std::sync::Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+            let done =
+                std::sync::Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
             let done2 = done.clone();
             std::thread::spawn(move || {
                 let _ = handle.join();

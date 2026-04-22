@@ -1403,9 +1403,9 @@ fn fork_restore_and_ack<FS: litebox_shim_linux::ShimFS>(
                         // data, close write end, install read end at guest fd.
                         // Using a host pipe avoids the pollee.wait mechanism
                         // which doesn't work on non-guest background threads.
-                        let (os_read, os_write) =
-                            litebox_platform_multiplex::platform().create_host_pipe()
-                                .expect("create_host_pipe for orphan");
+                        let (os_read, os_write) = litebox_platform_multiplex::platform()
+                            .create_host_pipe()
+                            .expect("create_host_pipe for orphan");
                         if !drained.is_empty() {
                             let mut offset = 0;
                             while offset < drained.len() {
@@ -1567,7 +1567,11 @@ fn fork_restore_and_ack<FS: litebox_shim_linux::ShimFS>(
                     // reads/writes block normally.  The relay end stays
                     // non-blocking for the mux dispatcher thread (which
                     // can't use pollee.wait due to GS-based TLS).
-                    let _ = pipes.update_flags(&guest_pipe_fd, litebox::pipes::Flags::NON_BLOCKING, false);
+                    let _ = pipes.update_flags(
+                        &guest_pipe_fd,
+                        litebox::pipes::Flags::NON_BLOCKING,
+                        false,
+                    );
 
                     // Dup guest pipe before install (install consumes it).
                     let guest_dup = litebox_ref.descriptor_table_mut().duplicate(&guest_pipe_fd);
@@ -1804,7 +1808,9 @@ fn spawn_worker_mux_dispatcher(
                                             match platform.write_host_fd(mux_fd, &buf) {
                                                 Ok(w) if w == buf.len() => break,
                                                 Err(litebox_common_linux::errno::Errno::EAGAIN) => {
-                                                    std::thread::sleep(std::time::Duration::from_micros(100));
+                                                    std::thread::sleep(
+                                                        std::time::Duration::from_micros(100),
+                                                    );
                                                 }
                                                 _ => break,
                                             }
@@ -2110,9 +2116,8 @@ fn run_program<FS: litebox_shim_linux::ShimFS>(
     // this, std::process::exit() kills threads and buffered mux
     // data is lost.  Use a 2-second timeout to avoid hanging on
     // stuck dispatcher threads.
-    litebox_platform_multiplex::platform().join_background_tasks_timeout(
-        std::time::Duration::from_secs(2),
-    );
+    litebox_platform_multiplex::platform()
+        .join_background_tasks_timeout(std::time::Duration::from_secs(2));
     if let Some(worker_result_fd) = worker_result_fd {
         write_worker_result(wait_status, worker_result_fd);
     }

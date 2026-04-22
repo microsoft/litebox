@@ -391,7 +391,12 @@ async fn delayed_fork_matrix(r: &mut TestRunner) {
                         DfBinary::NonPie => match crate::find_nonpie_binary() {
                             Some(p) => (p, vec!["echo-test".into()]),
                             None => {
-                                r.record(&test_id, agent, true, "skipped (nonpie binary not found)");
+                                r.record(
+                                    &test_id,
+                                    agent,
+                                    true,
+                                    "skipped (nonpie binary not found)",
+                                );
                                 continue;
                             }
                         },
@@ -570,15 +575,11 @@ async fn nonpie_invocation_tests(r: &mut TestRunner) {
         let test_id = format!("XNP.{}", nc.name);
         let resp = match nc.bash_cmd {
             None => {
-                r.send(
-                    "A",
-                    exec(vec![nonpie_bin.clone(), "echo-test".into()]),
-                )
-                .await
+                r.send("A", exec(vec![nonpie_bin.clone(), "echo-test".into()]))
+                    .await
             }
             Some(cmd) => {
-                let resolved = cmd
-                    .replace("/nonpie-echo", &format!("{nonpie_bin} echo-test"));
+                let resolved = cmd.replace("/nonpie-echo", &format!("{nonpie_bin} echo-test"));
                 r.send("A", exec(vec!["bash".into(), "-c".into(), resolved]))
                     .await
             }
@@ -680,10 +681,7 @@ async fn contamination_pattern_tests(r: &mut TestRunner) {
 
     // Init-level: exec non-PIE, then exec PIE — check PIE output is clean.
     let resp = r
-        .send(
-            "A",
-            exec(vec![nonpie_bin.clone(), "echo-test".into()]),
-        )
+        .send("A", exec(vec![nonpie_bin.clone(), "echo-test".into()]))
         .await;
     let not_found = matches!(&resp, Response::ExecResult { exit_code: 127, .. })
         || matches!(&resp, Response::Error { .. });
