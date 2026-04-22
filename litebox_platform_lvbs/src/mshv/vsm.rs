@@ -87,11 +87,15 @@ pub(crate) fn init(is_bsp: bool) {
 
     if is_bsp {
         if let Ok((start, size)) = get_vtl1_memory_info() {
-            debug_serial_println!("VSM: Protect GPAs from {:#x} to {:#x}", start, start + size);
+            let end = start
+                .checked_add(size)
+                .ok_or(VsmError::IntegerOverflow)
+                .expect("VTL1 memory range overflow while protecting startup memory");
+            debug_serial_println!("VSM: Protect GPAs from {:#x} to {:#x}", start, end);
             if protect_physical_memory_range(
                 PhysFrame::range(
                     PhysFrame::containing_address(PhysAddr::new(start)),
-                    PhysFrame::containing_address(PhysAddr::new(start + size)),
+                    PhysFrame::containing_address(PhysAddr::new(end)),
                 ),
                 MemAttr::empty(),
             )
@@ -885,11 +889,14 @@ fn apply_vtl0_text_patch(heki_patch: HekiPatch) -> Result<(), VsmError> {
 }
 
 fn mshv_vsm_allocate_ringbuffer_memory(phys_addr: u64, size: usize) -> Result<i64, VsmError> {
+    let end = phys_addr
+        .checked_add(size as u64)
+        .ok_or(VsmError::IntegerOverflow)?;
     set_ringbuffer(PhysAddr::new(phys_addr), size);
     protect_physical_memory_range(
         PhysFrame::range(
             PhysFrame::containing_address(PhysAddr::new(phys_addr)),
-            PhysFrame::containing_address(PhysAddr::new(phys_addr + (size as u64))),
+            PhysFrame::containing_address(PhysAddr::new(end)),
         ),
         MemAttr::MEM_ATTR_READ,
     )?;
@@ -1302,7 +1309,7 @@ fn copy_heki_pages_from_vtl0(pa: u64, nranges: u64) -> Option<Vec<HekiPage>> {
             return None;
         }
 
-        range += heki_page.nranges;
+        range = range.checked_add(heki_page.nranges)?;
         next_pa = PhysAddr::new(heki_page.next_pa);
         heki_pages.push(*heki_page);
     }
@@ -1429,9 +1436,10 @@ impl MemoryContainer {
     pub fn get_range(&self) -> Option<Range<VirtAddr>> {
         let start_range = self.range.first()?;
         let end_range = self.range.last()?;
+        let end = end_range.addr.as_u64().checked_add(end_range.len)?;
         Some(Range {
             start: start_range.addr,
-            end: end_range.addr + end_range.len,
+            end: VirtAddr::try_new(end).ok()?,
         })
     }
 
@@ -1439,8 +1447,20 @@ impl MemoryContainer {
         let addr = VirtAddr::try_new(heki_range.va).map_err(|_| VsmError::InvalidVirtualAddress)?;
         let phys_addr =
             PhysAddr::try_new(heki_range.pa).map_err(|_| VsmError::InvalidPhysicalAddress)?;
+        let len = heki_range
+            .epa
+            .checked_sub(heki_range.pa)
+            .ok_or(VsmError::IntegerOverflow)?;
         if let Some(last_range) = self.range.last()
-            && last_range.addr + last_range.len != addr
+            && VirtAddr::try_new(
+                last_range
+                    .addr
+                    .as_u64()
+                    .checked_add(last_range.len)
+                    .ok_or(VsmError::IntegerOverflow)?,
+            )
+            .map_err(|_| VsmError::InvalidVirtualAddress)?
+                != addr
         {
             debug_serial_println!("Discontiguous address found {heki_range:?}");
             // NOTE: Intentionally not returning an error here.
@@ -1450,7 +1470,7 @@ impl MemoryContainer {
         self.range.push(MemoryRange {
             addr,
             phys_addr,
-            len: heki_range.epa - heki_range.pa,
+            len,
         });
         Ok(())
     }
@@ -1462,14 +1482,22 @@ impl MemoryContainer {
         if self.buf.is_empty() {
             for range in &self.range {
                 let range_len: usize = range.len.truncate();
-                len += range_len;
+                len = len
+                    .checked_add(range_len)
+                    .ok_or(MemoryContainerError::Overflow)?;
             }
             self.buf.reserve_exact(len);
         }
 
         let range = self.range.clone();
         for range in range {
-            self.write_vtl0_phys_bytes(range.phys_addr, range.phys_addr + range.len)?;
+            let phys_end = range
+                .phys_addr
+                .as_u64()
+                .checked_add(range.len)
+                .and_then(|end| PhysAddr::try_new(end).ok())
+                .ok_or(MemoryContainerError::Overflow)?;
+            self.write_vtl0_phys_bytes(range.phys_addr, phys_end)?;
         }
         Ok(())
     }
@@ -1496,7 +1524,11 @@ impl MemoryContainer {
             let src = &page.0[src_offset..src_offset + src_len];
 
             self.buf.extend_from_slice(src);
-            phys_cur += src_len as u64;
+            phys_cur = phys_cur
+                .as_u64()
+                .checked_add(src_len as u64)
+                .and_then(|next| PhysAddr::try_new(next).ok())
+                .ok_or(MemoryContainerError::Overflow)?;
             bytes_to_copy -= src_len;
         }
         Ok(())
@@ -1517,6 +1549,8 @@ impl core::ops::Deref for MemoryContainer {
 pub enum MemoryContainerError {
     #[error("failed to copy data from VTL0")]
     CopyFromVtl0Failed,
+    #[error("integer overflow while processing VTL0 memory")]
+    Overflow,
 }
 
 pub struct KexecMemoryMetadataWrapper {
@@ -1737,7 +1771,11 @@ impl PatchDataMap {
                             // Step 2 of `text_poke_bp_batch` where we only know the second to last bytes of the patch such
                             // that cannot know the address of the first page. Details are in `validate_text_poke_bp_batch`.
                             if !patch_target_pa_1.is_null()
-                                && (patch_target_pa_0 + 1).is_aligned(Size4KiB::SIZE)
+                                && patch_target_pa_0
+                                    .as_u64()
+                                    .checked_add(1)
+                                    .and_then(|next| PhysAddr::try_new(next).ok())
+                                    .is_some_and(|next| next.is_aligned(Size4KiB::SIZE))
                             {
                                 mod_mem_meta.insert_patch_target(patch_target_pa_1);
                                 inner.insert(patch_target_pa_1, patch);
@@ -1748,7 +1786,11 @@ impl PatchDataMap {
                 } else {
                     inner.insert(patch_target_pa_0, patch);
                     if !patch_target_pa_1.is_null()
-                        && (patch_target_pa_0 + 1).is_aligned(Size4KiB::SIZE)
+                        && patch_target_pa_0
+                            .as_u64()
+                            .checked_add(1)
+                            .and_then(|next| PhysAddr::try_new(next).ok())
+                            .is_some_and(|next| next.is_aligned(Size4KiB::SIZE))
                     {
                         inner.insert(patch_target_pa_1, patch);
                     }

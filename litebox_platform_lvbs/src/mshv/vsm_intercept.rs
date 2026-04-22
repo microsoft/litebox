@@ -151,7 +151,12 @@ pub fn vsm_handle_intercept() {
 
 #[inline]
 fn advance_vtl0_rip(int_msg_hdr: &HvInterceptMessageHeader) -> Result<u64, HypervCallError> {
-    let new_vtl0_rip = int_msg_hdr.rip + u64::from(int_msg_hdr.instruction_length);
+    let Some(new_vtl0_rip) = int_msg_hdr
+        .rip
+        .checked_add(u64::from(int_msg_hdr.instruction_length))
+    else {
+        return raise_vtl0_gp_fault();
+    };
     hvcall_set_vp_vtl0_registers(HV_X64_REGISTER_RIP, new_vtl0_rip)
 }
 

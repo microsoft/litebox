@@ -27,6 +27,9 @@ pub enum VsmError {
     #[error("code page offset overflow when computing VTL return address")]
     CodePageOffsetOverflow,
 
+    #[error("integer overflow while processing VTL0-controlled range data")]
+    IntegerOverflow,
+
     // End-of-Boot Restriction Errors
     #[error("{0} not allowed after end of boot")]
     OperationAfterEndOfBoot(&'static str),
@@ -195,6 +198,7 @@ impl From<VsmError> for Errno {
             | VsmError::KexecSegmentRangeInvalid
             | VsmError::ModuleElfSizeExceeded { .. }
             | VsmError::CodePageOffsetOverflow
+            | VsmError::IntegerOverflow
             | VsmError::SymbolNameTooLong
             | VsmError::SymbolTableOutOfRange => Errno::ERANGE,
 
