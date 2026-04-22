@@ -1,5 +1,14 @@
 {
     "version": "2.0.0",
+    // ────────────────────────────────────────────────────────────────
+    // IMPORTANT: ELF binaries MUST live on a Linux-native filesystem.
+    // Docker Desktop on Windows cannot mmap ELF files from NTFS bind
+    // mounts (causes "unsupported version 3 of Verneed record").
+    //
+    // The build task outputs to ~/litebox-out/ (WSL2 ext4), and the
+    // Docker run tasks mount from that path.  Do NOT change the mount
+    // source to C:\... or /mnt/c/... — it will segfault.
+    // ────────────────────────────────────────────────────────────────
     "tasks": [
         {
             "label": "LiteBox: Build All",
@@ -8,7 +17,7 @@
             "args": [
                 "-d", "Ubuntu", "-u", "wportnoy", "--",
                 "bash", "-lc",
-                "cd /mnt/c/src/litebox-vscode-server && cargo build -p litebox_tool_executor -p litebox_broker -p litebox_runner_linux_userland -p litebox_test_harness && cargo rustc -p litebox_test_harness --target-dir target/nonpie -- -C link-args=-no-pie"
+                "cd /mnt/c/src/litebox-vscode-server && mkdir -p ~/litebox-out && cargo build --target-dir ~/litebox-out -p litebox_tool_executor -p litebox_broker -p litebox_runner_linux_userland -p litebox_test_harness && cargo rustc --target-dir ~/litebox-out/nonpie -p litebox_test_harness -- -C link-args=-no-pie"
             ],
             "group": "build",
             "problemMatcher": "$rustc",
@@ -35,7 +44,7 @@
         {
             "label": "LiteBox: Start VS Code Server",
             "type": "shell",
-            "command": "docker rm -f litebox-vscode 2>$null; docker run --rm --name litebox-vscode -p 2222:22 --cap-add SYS_PTRACE -v C:\\src\\litebox-vscode-server\\target\\debug:/opt/litebox:ro -v C:\\src\\litebox-vscode-server\\litebox_tool_executor\\policies:/opt/policies:ro litebox-vscode /opt/litebox/litebox_tool_executor --rootfs / --vscode-server --ssh-port 22 --policy /opt/policies/demo-policy.json",
+            "command": "docker rm -f litebox-vscode 2>$null; docker run --rm --name litebox-vscode -p 2222:22 --cap-add SYS_PTRACE -v \\\\wsl$\\Ubuntu\\home\\wportnoy\\litebox-out\\debug:/opt/litebox:ro -v C:\\src\\litebox-vscode-server\\litebox_tool_executor\\policies:/opt/policies:ro litebox-vscode /opt/litebox/litebox_tool_executor --rootfs / --vscode-server --ssh-port 22 --policy /opt/policies/demo-policy.json",
             "problemMatcher": [],
             "isBackground": true,
             "runOptions": {
@@ -51,7 +60,7 @@
         {
             "label": "LiteBox: Start VS Code Server (Record Baseline)",
             "type": "shell",
-            "command": "docker rm -f litebox-vscode 2>$null; docker run --rm --name litebox-vscode -p 2222:22 --cap-add SYS_PTRACE -v C:\\src\\litebox-vscode-server\\target\\debug:/opt/litebox:ro litebox-vscode /opt/litebox/litebox_tool_executor --rootfs / --vscode-server --ssh-port 22 --record-baseline",
+            "command": "docker rm -f litebox-vscode 2>$null; docker run --rm --name litebox-vscode -p 2222:22 --cap-add SYS_PTRACE -v \\\\wsl$\\Ubuntu\\home\\wportnoy\\litebox-out\\debug:/opt/litebox:ro litebox-vscode /opt/litebox/litebox_tool_executor --rootfs / --vscode-server --ssh-port 22 --record-baseline",
             "problemMatcher": [],
             "isBackground": true,
             "presentation": {

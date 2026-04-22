@@ -28,14 +28,15 @@
     //   4. All operations execute inside the sandbox
     //
     // Note: The Docker container IS the rootfs. Binaries are bind-mounted
-    // at /opt/litebox/ from target/debug/. No manual rootfs export needed.
+    // at /opt/litebox/ from ~/litebox-out/debug/ (WSL2 ext4 filesystem).
+    // NTFS bind mounts (C:\...) break ELF mmap — always mount from WSL.
 
     // Terminal profiles (for shell-only sandboxing via Docker)
     "terminal.integrated.profiles.windows": {
         "LiteBox Sandbox (Docker)": {
             "path": "docker",
             "args": ["run", "--rm", "-it", "--cap-add", "SYS_PTRACE",
-                "-v", "C:\\src\\litebox-vscode-server\\target\\debug:/opt/litebox:ro",
+                "-v", "\\\\wsl$\\Ubuntu\\home\\wportnoy\\litebox-out\\debug:/opt/litebox:ro",
                 "-v", "C:\\src\\litebox-vscode-server\\litebox_tool_executor\\policies:/opt/policies:ro",
                 "litebox-test",
                 "/opt/litebox/litebox_tool_executor",

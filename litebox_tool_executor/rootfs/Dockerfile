@@ -10,18 +10,22 @@
 #   docker build --target litebox-test   -t litebox-test   -f litebox_tool_executor/rootfs/Dockerfile .
 #   docker build --target litebox-vscode -t litebox-vscode -f litebox_tool_executor/rootfs/Dockerfile .
 #
+# IMPORTANT: Binaries must be bind-mounted from a Linux-native filesystem
+# (WSL2 ext4), NOT from NTFS (/mnt/c/...).  Docker Desktop on Windows
+# cannot mmap ELF files from NTFS bind mounts.  Build with:
+#   cargo build --target-dir ~/litebox-out -p litebox_tool_executor ...
+#
 # Runtime (tests):
 #   docker run --rm --cap-add SYS_PTRACE \
-#     -v $(pwd)/target/debug:/opt/litebox:ro \
-#     -v $(pwd)/target/nonpie/debug:/opt/nonpie:ro \
+#     -v \\wsl$\Ubuntu\home\USER\litebox-out\debug:/opt/litebox:ro \
+#     -v \\wsl$\Ubuntu\home\USER\litebox-out\nonpie\debug:/opt/nonpie:ro \
 #     litebox-test /opt/litebox/litebox_test_harness spawn-tree
 #
 # Runtime (VS Code Server):
 #   docker run --rm -p 2222:22 --cap-add SYS_PTRACE \
-#     -v $(pwd)/target/debug:/opt/litebox:ro \
+#     -v \\wsl$\Ubuntu\home\USER\litebox-out\debug:/opt/litebox:ro \
 #     litebox-vscode /opt/litebox/litebox_tool_executor \
-#       --rootfs / --vscode-server --ssh-port 22 \
-#       --policy /opt/litebox/policies/demo-policy.json
+#       --rootfs / --vscode-server --ssh-port 22 --record-baseline
 # ═══════════════════════════════════════════════════════════════════
 
 # === Stage 1: shared base ===
