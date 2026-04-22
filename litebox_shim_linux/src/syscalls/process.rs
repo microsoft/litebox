@@ -1316,8 +1316,7 @@ const SHEBANG_MAX_LINE: usize = 256;
 /// Parse a `#!interpreter [optional-arg]` line from a file header buffer.
 ///
 /// Returns `Some((interpreter, optional_arg))` when `buf` starts with `#!` and
-/// contains a non-empty interpreter path. The interpreter and optional argument
-/// are borrowed from `buf`. The optional argument, if present, is everything
+/// contains a non-empty interpreter path. The optional argument, if present, is everything
 /// between the first whitespace after the interpreter and the end of the line
 /// (trimmed), treated as a single token — matching Linux kernel semantics.
 fn parse_shebang(buf: &[u8]) -> Option<(&str, Option<&str>)> {
@@ -1343,45 +1342,31 @@ fn parse_shebang(buf: &[u8]) -> Option<(&str, Option<&str>)> {
 }
 
 impl<FS: ShimFS> Task<FS> {
-    /// Resolve shebang (`#!`) chains for the given path and argv.
-    ///
-    /// Opens the file at `path`, reads its header, and—if it begins with a
-    /// `#!` shebang line—rewrites `path` and `argv` to reference the
-    /// interpreter. This loops up to [`SHEBANG_MAX_RECURSION`] times to
-    /// support chained shebangs (e.g. a script whose interpreter is itself a
-    /// script). Returns the final (path, argv) once an ELF (or other
-    /// non-shebang) binary is reached.
+    /// Resolve shebang (`#!`) chains for the given path and argv if the file starts with a shebang line.
+    /// Otherwise, returns the original path and argv.
     pub(crate) fn resolve_shebang(
         &self,
         mut path: alloc::string::String,
         mut argv: alloc::vec::Vec<alloc::ffi::CString>,
     ) -> Result<(alloc::string::String, alloc::vec::Vec<alloc::ffi::CString>), Errno> {
-        let mut depth = 0u32;
-        loop {
-            let fd = {
-                use litebox::utils::ReinterpretSignedExt as _;
-                self.sys_open(
-                    path.as_str(),
-                    litebox::fs::OFlags::RDONLY,
-                    litebox::fs::Mode::empty(),
-                )?
-                .reinterpret_as_signed()
-            };
+        for _ in 0..SHEBANG_MAX_RECURSION {
+            let fd = self.sys_open(
+                path.as_str(),
+                litebox::fs::OFlags::RDONLY,
+                litebox::fs::Mode::empty(),
+            )?;
             let mut header = [0u8; SHEBANG_MAX_LINE];
-            let n = match self.sys_read(fd, &mut header, Some(0)) {
+            let n = match self.do_read(fd, &mut header, Some(0)) {
                 Ok(n) => n,
                 Err(e) => {
-                    let _ = self.sys_close(fd);
+                    let _ = self.do_close(fd as usize);
                     return Err(e);
                 }
             };
-            let _ = self.sys_close(fd);
+            let _ = self.do_close(fd as usize);
 
             match parse_shebang(&header[..n]) {
                 Some((interp, opt_arg)) => {
-                    if depth >= SHEBANG_MAX_RECURSION {
-                        return Err(Errno::ELOOP);
-                    }
                     let mut new_argv = alloc::vec::Vec::new();
                     new_argv.push(alloc::ffi::CString::new(interp).map_err(|_| Errno::EINVAL)?);
                     if let Some(arg) = opt_arg {
@@ -1394,11 +1379,11 @@ impl<FS: ShimFS> Task<FS> {
                     }
                     path = alloc::string::String::from(interp);
                     argv = new_argv;
-                    depth += 1;
                 }
                 None => return Ok((path, argv)),
             }
         }
+        Err(Errno::ELOOP)
     }
 
     /// Handle syscall `execve`.

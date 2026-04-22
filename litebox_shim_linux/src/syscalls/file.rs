@@ -289,16 +289,24 @@ impl<FS: ShimFS> Task<FS> {
     /// `offset` is an optional offset to read from. If `None`, it will read from the current file position.
     /// If `Some`, it will read from the specified offset without changing the current file position.
     pub fn sys_read(&self, fd: i32, buf: &mut [u8], offset: Option<usize>) -> Result<usize, Errno> {
-        let Ok(raw_fd) = u32::try_from(fd).and_then(usize::try_from) else {
+        let Ok(raw_fd) = u32::try_from(fd) else {
             return Err(Errno::EBADF);
         };
+        self.do_read(raw_fd, buf, offset)
+    }
+    pub(crate) fn do_read(
+        &self,
+        fd: u32,
+        buf: &mut [u8],
+        offset: Option<usize>,
+    ) -> Result<usize, Errno> {
         let files = self.files.borrow();
         // We need to do this cell dance because otherwise Rust can't recognize that the two
         // closures are mutually exclusive.
         let buf: core::cell::RefCell<&mut [u8]> = core::cell::RefCell::new(buf);
         files
             .run_on_raw_fd(
-                raw_fd,
+                fd as usize,
                 |fd| {
                     files
                         .fs
