@@ -346,12 +346,11 @@ mod tests {
         for waiter in waiters {
             let result = waiter.join().unwrap();
             match result {
-                Ok(()) | Err(FutexError::WaitError(_)) => {}
-                Err(
-                    FutexError::ImmediatelyWokenBecauseValueMismatch
-                    | FutexError::NotAligned
-                    | FutexError::Fault,
-                ) => {
+                Ok(())
+                | Err(
+                    FutexError::WaitError(_) | FutexError::ImmediatelyWokenBecauseValueMismatch,
+                ) => {}
+                Err(FutexError::NotAligned | FutexError::Fault) => {
                     unreachable!()
                 }
             }
