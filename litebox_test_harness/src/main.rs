@@ -13,13 +13,22 @@ mod protocol;
 
 use std::io::Write as _;
 
-/// Find the non-PIE test harness binary. Checks (in order):
-/// 1. `/litebox-test-harness-nonpie` (litebox rootfs)
-/// 2. Sibling of current exe with `_nonpie` suffix
-/// 3. Sibling of current exe with `-nonpie` suffix
+/// Find the non-PIE test harness binary.
+///
+/// In Docker: bind-mounted at `/opt/nonpie/litebox_test_harness`.
+/// Locally: sibling of current exe with `_nonpie` or `-nonpie` suffix.
 fn find_nonpie_binary() -> Option<String> {
-    let candidates = vec!["/litebox-test-harness-nonpie".to_string()];
-    let mut all = candidates;
+    let candidates: &[&str] = &[
+        "/opt/nonpie/litebox_test_harness",
+        "/litebox-test-harness-nonpie",
+    ];
+    for &path in candidates {
+        if std::path::Path::new(path).exists() {
+            eprintln!("[harness] nonpie binary: {path}");
+            return Some(path.to_string());
+        }
+    }
+    // Fallback: sibling of current exe.
     if let Ok(exe) = std::env::current_exe() {
         let dir = exe.parent().unwrap_or(std::path::Path::new("."));
         let stem = exe
@@ -27,20 +36,16 @@ fn find_nonpie_binary() -> Option<String> {
             .unwrap_or_default()
             .to_string_lossy()
             .to_string();
-        all.push(
-            dir.join(format!("{stem}_nonpie"))
-                .to_string_lossy()
-                .to_string(),
-        );
-        all.push(
-            dir.join(format!("{stem}-nonpie"))
-                .to_string_lossy()
-                .to_string(),
-        );
+        for suffix in ["_nonpie", "-nonpie"] {
+            let candidate = dir.join(format!("{stem}{suffix}"));
+            if candidate.exists() {
+                let path = candidate.to_string_lossy().to_string();
+                eprintln!("[harness] nonpie binary: {path}");
+                return Some(path);
+            }
+        }
     }
-    all.into_iter()
-        .find(|p| std::path::Path::new(p).exists())
-        .inspect(|p| eprintln!("[harness] nonpie binary: {p}"))
+    None
 }
 
 fn main() {

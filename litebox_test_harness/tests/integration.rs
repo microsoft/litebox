@@ -266,9 +266,22 @@ fn process_tree_tests() {
     };
 
     // Update these constants when intentionally adding/removing xfails/failures.
-    // TODO: calibrate these after first successful Docker-based run.
-    const EXPECTED_XFAIL_COUNT: usize = 0;
-    const EXPECTED_FAIL_COUNT: usize = 0;
+    //
+    // Symlink xfails (dynamic — probe returns ENOTSUP in litebox):
+    //   basic: 4 subtests × 5 topologies = 20
+    //   variants: S.dir + S.dangling + S.nested + S.relative = 4
+    // Total xfail: 24
+    //
+    // Known litebox failures (real platform gaps):
+    //   US1,3,4,5 + VS1: bare-fork unix socket tests timeout (5)
+    //   XW3,4: cross-worker unix socket connect ECONNREFUSED (2)
+    //   SS.{pipe_in_subst,multi_pipe_subst,file_pipe_subst,subst_then_cmds,
+    //       vscode_osrelease,backtick_pipe}.{sh,bash}.{A,AA}: stdin-pipe $()
+    //       with pipelines loses stdout (6×2×2 = 24)
+    //   SP.{pipeline,file_pipe}.{A,AA,B}: stdin-pipe $() with cat|head (6)
+    // Total FAIL: 37
+    const EXPECTED_XFAIL_COUNT: usize = 24;
+    const EXPECTED_FAIL_COUNT: usize = 37;
     const EXPECTED_XPASS_COUNT: usize = 0;
     check_results(
         "litebox",

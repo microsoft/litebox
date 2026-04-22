@@ -212,7 +212,6 @@ fn print_build_info(audit_log_file: Option<&std::path::Path>) {
 
 /// Find the litebox_runner_linux_userland binary.
 fn find_runner() -> anyhow::Result<std::path::PathBuf> {
-    // 1. Check env var (set by cargo test / nextest)
     if let Ok(path) = std::env::var("LITEBOX_RUNNER") {
         let p = std::path::PathBuf::from(path);
         if p.exists() {
@@ -220,7 +219,8 @@ fn find_runner() -> anyhow::Result<std::path::PathBuf> {
         }
     }
 
-    // 2. Look next to our own binary
+    // Look next to our own binary — works for both Docker (/opt/litebox/)
+    // and local development (target/debug/).
     if let Ok(exe) = std::env::current_exe() {
         let sibling = exe
             .parent()
@@ -231,21 +231,9 @@ fn find_runner() -> anyhow::Result<std::path::PathBuf> {
         }
     }
 
-    // 3. Try well-known workspace build paths
-    for candidate in [
-        "/mnt/c/src/litebox/target/debug/litebox_runner_linux_userland",
-        "./target/debug/litebox_runner_linux_userland",
-    ] {
-        let p = std::path::PathBuf::from(candidate);
-        if p.exists() {
-            return Ok(p);
-        }
-    }
-
     anyhow::bail!(
         "Could not find litebox_runner_linux_userland. \
-         Set LITEBOX_RUNNER env var or build it with: \
-         cargo build -p litebox_runner_linux_userland --features audit_log"
+         Set LITEBOX_RUNNER env var or ensure it is built alongside litebox_tool_executor."
     );
 }
 
@@ -268,20 +256,9 @@ fn find_broker() -> anyhow::Result<std::path::PathBuf> {
         }
     }
 
-    for candidate in [
-        "/mnt/c/src/litebox/target/debug/litebox_broker",
-        "./target/debug/litebox_broker",
-    ] {
-        let p = std::path::PathBuf::from(candidate);
-        if p.exists() {
-            return Ok(p);
-        }
-    }
-
     anyhow::bail!(
         "Could not find litebox_broker. \
-         Set LITEBOX_BROKER env var or build it with: \
-         cargo build -p litebox_broker"
+         Set LITEBOX_BROKER env var or ensure it is built alongside litebox_tool_executor."
     );
 }
 
