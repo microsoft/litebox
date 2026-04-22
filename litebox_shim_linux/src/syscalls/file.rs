@@ -2091,6 +2091,10 @@ impl<FS: ShimFS> Task<FS> {
                         .next_multiple_of(align_of::<litebox_common_linux::LinuxDirent64>());
                     if nbytes + len > count {
                         // not enough space
+                        if nbytes == 0 {
+                            // not enough space for even a single entry
+                            return Err(Errno::EINVAL);
+                        }
                         break;
                     }
                     let dirent64 = litebox_common_linux::LinuxDirent64 {
@@ -2126,11 +2130,11 @@ impl<FS: ShimFS> Task<FS> {
                     .set_fd_metadata(file, Diroff(dir_off));
                 Ok(nbytes)
             },
-            |_fd| todo!("net"),
-            |_fd| todo!("pipes"),
-            |_fd| Err(Errno::EBADF),
-            |_fd| Err(Errno::EBADF),
-            |_fd| Err(Errno::EBADF),
+            |_fd| Err(Errno::ENOTDIR),
+            |_fd| Err(Errno::ENOTDIR),
+            |_fd| Err(Errno::ENOTDIR),
+            |_fd| Err(Errno::ENOTDIR),
+            |_fd| Err(Errno::ENOTDIR),
         )?
     }
 }

@@ -327,7 +327,11 @@ fn test_getdent64() {
 
     // Test 5: Zero-length buffer
     let result = task.sys_getdirent64(dir_fd, MutPtr::from_usize(buffer.as_mut_ptr() as usize), 0);
-    assert_eq!(result, Ok(0), "Should return 0 for zero-length buffer");
+    assert_eq!(
+        result,
+        Err(Errno::EINVAL),
+        "Should return EINVAL for zero-length buffer"
+    );
 
     task.sys_close(dir_fd).expect("Failed to close directory");
 
