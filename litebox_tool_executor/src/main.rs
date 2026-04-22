@@ -84,8 +84,8 @@ fn main() -> anyhow::Result<()> {
     if !cli.rootfs.exists() {
         anyhow::bail!(
             "Rootfs not found: {}\n\
-             For tar rootfs: bash litebox_tool_executor/scripts/prepare-bash-rootfs.sh\n\
-             For directory rootfs: bash litebox_tool_executor/scripts/prepare-vscode-rootfs-staged.sh",
+             Build Docker image: docker build --target litebox-test -t litebox-test -f litebox_tool_executor/rootfs/Dockerfile .\n\
+             Then run inside the container with --rootfs /",
             cli.rootfs.display()
         );
     }
@@ -602,13 +602,15 @@ fn direct(cli: &Cli, audit_log_file: Option<&std::path::Path>) -> anyhow::Result
 /// Server — all sharing one filesystem inside the sandbox.
 ///
 /// Usage:
-///   litebox-tool-executor --rootfs /path/to/vscode-rootfs --vscode-server
+///   docker run --rm -p 2222:22 -v target/debug:/opt/litebox:ro litebox-vscode \
+///     /opt/litebox/litebox_tool_executor --rootfs / --vscode-server
 ///   # then in VS Code: Remote-SSH → litebox (port 2222)
 fn vscode_server(cli: &Cli, audit_log_file: Option<&std::path::Path>) -> anyhow::Result<()> {
     if !cli.rootfs.is_dir() {
         anyhow::bail!(
             "--vscode-server requires a directory rootfs (not a tar).\n\
-             Build one with: bash litebox_tool_executor/scripts/prepare-vscode-rootfs-staged.sh"
+             Use Docker: docker build --target litebox-vscode -t litebox-vscode -f litebox_tool_executor/rootfs/Dockerfile .\n\
+             Then: docker run --rm -p 2222:22 -v target/debug:/opt/litebox:ro litebox-vscode /opt/litebox/litebox_tool_executor --rootfs / --vscode-server"
         );
     }
 
