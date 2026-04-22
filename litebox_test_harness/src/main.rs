@@ -415,11 +415,158 @@ fn main() {
             let sub = args.get(2).map(String::as_str).unwrap_or("all");
             std::process::exit(cow_test::run(sub));
         }
+        "syscall-test" => {
+            let sub = args.get(2).map(String::as_str).unwrap_or("all");
+            std::process::exit(syscall_test::run(sub));
+        }
         other => {
             eprintln!("unknown command: {other}");
             std::process::exit(1);
         }
     }
+}
+
+/// Minimal reproduction tests for unsupported syscalls that break
+/// VS Code Server's CLI `command-shell` mode inside litebox.
+///
+/// The CLI spawns Node.js which uses `timer_create` for V8's profiling
+/// timers and `rt_sigsuspend` for its signal handling loop.  When these
+/// return errors, the CLI spins in a tight loop and never produces the
+/// `Listening on <port>` output that VS Code's install script expects.
+mod syscall_test {
+    pub fn run(sub: &str) -> i32 {
+        let tests: &[(&str, fn() -> bool)] = &[
+            ("timer_create", test_timer_create),
+            ("rt_sigsuspend", test_rt_sigsuspend),
+            ("timer_settime", test_timer_settime),
+        ];
+
+        let mut pass = 0;
+        let mut fail = 0;
+        let total;
+
+        if sub == "all" {
+            total = tests.len();
+            for &(name, func) in tests {
+                if func() {
+                    println!("SYSCALL_OK:{name}");
+                    pass += 1;
+                } else {
+                    println!("SYSCALL_FAIL:{name}");
+                    fail += 1;
+                }
+            }
+        } else {
+            total = 1;
+            if let Some(&(name, func)) = tests.iter().find(|(n, _)| *n == sub) {
+                if func() {
+                    println!("SYSCALL_OK:{name}");
+                    pass += 1;
+                } else {
+                    println!("SYSCALL_FAIL:{name}");
+                    fail += 1;
+                }
+            } else {
+                eprintln!("unknown syscall-test: {sub}");
+                return 1;
+            }
+        }
+
+        println!("SYSCALL_SUMMARY:pass={pass},fail={fail},total={total}");
+        if fail > 0 { 1 } else { 0 }
+    }
+
+    /// Test timer_create + timer_delete (POSIX interval timers).
+    /// Node.js/V8 uses these for profiling and watchdog timers.
+    fn test_timer_create() -> bool {
+        // CLOCK_MONOTONIC = 1, SIGEV_SIGNAL = 0
+        let mut sev: libc::sigevent = unsafe { std::mem::zeroed() };
+        sev.sigev_notify = libc::SIGEV_NONE;
+        let mut timer_id: libc::timer_t = std::ptr::null_mut();
+
+        let ret = unsafe { libc::timer_create(libc::CLOCK_MONOTONIC, &mut sev, &mut timer_id) };
+        if ret != 0 {
+            let e = std::io::Error::last_os_error();
+            eprintln!("  timer_create failed: {e}");
+            return false;
+        }
+
+        // Clean up.
+        unsafe { libc::timer_delete(timer_id) };
+        true
+    }
+
+    /// Test rt_sigsuspend (atomically replace signal mask and suspend).
+    /// Node.js uses this in its signal handling loop.  If it returns
+    /// an unexpected error, Node.js spins calling it repeatedly.
+    fn test_rt_sigsuspend() -> bool {
+        // Block SIGUSR1, then sigsuspend with an empty mask.
+        // sigsuspend should return -1 with EINTR when any signal arrives,
+        // or we can just test that the syscall doesn't return ENOSYS.
+        let mut mask: libc::sigset_t = unsafe { std::mem::zeroed() };
+        unsafe { libc::sigemptyset(&mut mask) };
+
+        // Send ourselves SIGUSR1 after a short delay so sigsuspend returns.
+        let pid = unsafe { libc::getpid() };
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            unsafe { libc::kill(pid, libc::SIGUSR1) };
+        });
+
+        // Install a no-op handler for SIGUSR1 so it doesn't kill us.
+        unsafe {
+            let mut sa: libc::sigaction = std::mem::zeroed();
+            sa.sa_sigaction = noop_handler as usize;
+            libc::sigemptyset(&mut sa.sa_mask);
+            sa.sa_flags = 0;
+            libc::sigaction(libc::SIGUSR1, &sa, std::ptr::null_mut());
+        }
+
+        let ret = unsafe { libc::sigsuspend(&mask) };
+        // sigsuspend always returns -1 with errno=EINTR on success.
+        if ret == -1 {
+            let e = std::io::Error::last_os_error();
+            if e.raw_os_error() == Some(libc::EINTR) {
+                return true;
+            }
+            eprintln!("  sigsuspend returned unexpected error: {e}");
+            return false;
+        }
+        eprintln!("  sigsuspend returned {ret} (expected -1/EINTR)");
+        false
+    }
+
+    /// Test timer_settime (arm a POSIX timer).
+    fn test_timer_settime() -> bool {
+        let mut sev: libc::sigevent = unsafe { std::mem::zeroed() };
+        sev.sigev_notify = libc::SIGEV_NONE;
+        let mut timer_id: libc::timer_t = std::ptr::null_mut();
+
+        let ret = unsafe { libc::timer_create(libc::CLOCK_MONOTONIC, &mut sev, &mut timer_id) };
+        if ret != 0 {
+            eprintln!("  timer_create failed (prerequisite)");
+            return false;
+        }
+
+        let new_value = libc::itimerspec {
+            it_interval: libc::timespec { tv_sec: 0, tv_nsec: 0 },
+            it_value: libc::timespec { tv_sec: 0, tv_nsec: 100_000_000 }, // 100ms
+        };
+        let ret = unsafe {
+            libc::timer_settime(timer_id, 0, &new_value, std::ptr::null_mut())
+        };
+        if ret != 0 {
+            let e = std::io::Error::last_os_error();
+            eprintln!("  timer_settime failed: {e}");
+            unsafe { libc::timer_delete(timer_id) };
+            return false;
+        }
+
+        unsafe { libc::timer_delete(timer_id) };
+        true
+    }
+
+    extern "C" fn noop_handler(_sig: libc::c_int) {}
 }
 
 /// Tests for CoW (copy-on-write) memory restoration after vfork.
