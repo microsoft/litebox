@@ -1971,10 +1971,13 @@ impl<FS: ShimFS> Task<FS> {
                 }
                 DupFdRequest::LowestAvailable => Ok(rds.fd_into_raw_integer(fd)),
                 DupFdRequest::LowestAtOrAbove(min_fd) => {
-                    #[allow(clippy::maybe_infinite_iter)]
-                    let raw_fd = (min_fd..)
-                        .find(|&raw_fd| !rds.is_alive(raw_fd))
-                        .expect("raw fd search should always find a slot");
+                    let mut raw_fd = min_fd;
+                    for occupied_raw_fd in rds.iter_alive().skip_while(|&fd| fd < min_fd) {
+                        if occupied_raw_fd != raw_fd {
+                            break;
+                        }
+                        raw_fd += 1;
+                    }
                     let success = rds.fd_into_specific_raw_integer(fd, raw_fd);
                     assert!(success);
                     Ok(raw_fd)
