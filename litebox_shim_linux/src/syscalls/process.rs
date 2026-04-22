@@ -1443,7 +1443,6 @@ impl<FS: ShimFS> Task<FS> {
             copy_vector(envp, "envp")?
         };
 
-        // --- Shebang (#!) detection and rewriting ---
         let (path, argv_vec) = self.resolve_shebang(alloc::string::String::from(path), argv_vec)?;
 
         let loader = crate::loader::elf::ElfLoader::new(self, &path)?;

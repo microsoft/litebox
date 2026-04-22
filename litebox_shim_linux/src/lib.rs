@@ -257,8 +257,6 @@ impl<FS: ShimFS> LinuxShim<FS> {
             },
         };
 
-        // Shebang (#!) detection: if the target file starts with "#!", rewrite
-        // path/argv to the interpreter, matching sys_execve behaviour.
         let (path, argv) = entrypoints
             .task
             .resolve_shebang(alloc::string::String::from(path), argv)
