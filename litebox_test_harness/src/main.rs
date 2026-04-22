@@ -441,6 +441,8 @@ mod cow_test {
                     ("capture_dup2_stdout", test_capture_dup2_stdout),
                     ("sequential_captures", test_sequential_captures),
                     ("capture_with_preexisting_heap", test_capture_with_preexisting_heap),
+                    ("pipe_position_after_fork", test_pipe_position_after_fork),
+                    ("pipe_position_child_reads", test_pipe_position_child_reads),
                 ];
                 let mut pass = 0;
                 let mut fail = 0;
@@ -469,6 +471,8 @@ mod cow_test {
                     "child_builtin_capture" => test_child_builtin_capture,
                     "sequential_captures" => test_sequential_captures,
                     "capture_with_preexisting_heap" => test_capture_with_preexisting_heap,
+                    "pipe_position_after_fork" => test_pipe_position_after_fork,
+                    "pipe_position_child_reads" => test_pipe_position_child_reads,
                     _ => {
                         eprintln!("unknown cow-test: {other}");
                         return 1;
@@ -834,6 +838,111 @@ mod cow_test {
         map.get("key1").map(|v| v.as_str()) == Some("value1")
             && map.get("key2").map(|v| v.as_str()) == Some("value2")
             && map.get("result").map(|v| v.as_str()) == Some("captured_value")
+    }
+
+    /// Minimal reproduction: pipe read position shared across vfork.
+    ///
+    /// Write "AABBCC" to a pipe. Parent reads "AA". Fork. Child reads
+    /// "BB" and exits. Parent reads again — should get "CC" (native)
+    /// or "BBCC" (independent position). If the ring buffer position
+    /// is shared, the parent may get nothing.
+    fn test_pipe_position_after_fork() -> bool {
+        let mut pipefd = [0i32; 2];
+        if unsafe { libc::pipe(pipefd.as_mut_ptr()) } != 0 {
+            return false;
+        }
+
+        let data = b"AABBCC";
+        unsafe { libc::write(pipefd[1], data.as_ptr() as *const _, data.len()) };
+        unsafe { libc::close(pipefd[1]) };
+
+        // Parent reads first 2 bytes
+        let mut buf = [0u8; 2];
+        let n = unsafe { libc::read(pipefd[0], buf.as_mut_ptr() as *mut _, 2) };
+        if n != 2 || &buf != b"AA" {
+            return false;
+        }
+
+        let pid = unsafe { libc::fork() };
+        if pid < 0 { return false; }
+        if pid == 0 {
+            // Child reads 2 bytes (would consume "BB")
+            let mut cbuf = [0u8; 2];
+            let _ = unsafe { libc::read(pipefd[0], cbuf.as_mut_ptr() as *mut _, 2) };
+            unsafe { libc::_exit(0) };
+        }
+
+        let mut status = 0i32;
+        unsafe { libc::waitpid(pid, &mut status, 0) };
+
+        // Parent should still see remaining data
+        let mut rest = [0u8; 4];
+        let n = unsafe { libc::read(pipefd[0], rest.as_mut_ptr() as *mut _, 4) };
+        unsafe { libc::close(pipefd[0]) };
+
+        if n <= 0 {
+            println!("  pipe_position_after_fork: post-fork read=0 (position lost!)");
+            return false;
+        }
+        let got = std::str::from_utf8(&rest[..n as usize]).unwrap_or("???");
+        // Native fork: "BBCC" (child has independent position).
+        // Correct vfork with CoW-protected position: "BBCC".
+        // Bug: "CC" (child advanced shared position) or "" (all consumed).
+        let ok = got.contains("CC");
+        if !ok {
+            println!("  pipe_position_after_fork: got {:?}", got);
+        }
+        ok
+    }
+
+    /// Bash $() pattern at C level: parent reads a "script" from pipe
+    /// line-by-line. After line 1, parent forks. Child reads line 2
+    /// (simulates bash parsing the $() body). Parent tries to read
+    /// line 3 after child exits — lost if position is shared.
+    fn test_pipe_position_child_reads() -> bool {
+        let mut pipefd = [0i32; 2];
+        if unsafe { libc::pipe(pipefd.as_mut_ptr()) } != 0 {
+            return false;
+        }
+
+        let script = b"LINE1\nLINE2\nLINE3\n";
+        unsafe { libc::write(pipefd[1], script.as_ptr() as *const _, script.len()) };
+        unsafe { libc::close(pipefd[1]) };
+
+        // Parent reads line 1
+        let mut buf = [0u8; 6];
+        let n = unsafe { libc::read(pipefd[0], buf.as_mut_ptr() as *mut _, 6) };
+        if n != 6 || &buf != b"LINE1\n" {
+            return false;
+        }
+
+        let pid = unsafe { libc::fork() };
+        if pid < 0 { return false; }
+        if pid == 0 {
+            // Child reads line 2
+            let mut cbuf = [0u8; 6];
+            let _ = unsafe { libc::read(pipefd[0], cbuf.as_mut_ptr() as *mut _, 6) };
+            unsafe { libc::_exit(0) };
+        }
+
+        let mut status = 0i32;
+        unsafe { libc::waitpid(pid, &mut status, 0) };
+
+        // Parent reads line 3
+        let mut rest = [0u8; 6];
+        let n = unsafe { libc::read(pipefd[0], rest.as_mut_ptr() as *mut _, 6) };
+        unsafe { libc::close(pipefd[0]) };
+
+        if n <= 0 {
+            println!("  pipe_position_child_reads: line3 read=0 (position lost!)");
+            return false;
+        }
+        let got = std::str::from_utf8(&rest[..n as usize]).unwrap_or("???");
+        if !got.starts_with("LINE") {
+            println!("  pipe_position_child_reads: got {:?} (expected LINE2 or LINE3)", got);
+            return false;
+        }
+        true
     }
 }
 
