@@ -428,10 +428,10 @@ fn main() {
             // for the bug to manifest — direct fork without exec stays in
             // the same worker and works fine.
             //
-            // Usage: cross-worker-file [write-and-sleep]
+            // Usage: cross-worker-file [write-and-sleep|write-and-exit]
             let sub = args.get(2).map(String::as_str).unwrap_or("");
-            if sub == "write-and-sleep" {
-                // Child mode: write lines to the file path in arg[3], sleep.
+            if sub == "write-and-sleep" || sub == "write-and-exit" {
+                // Child mode: write lines to the file path in arg[3].
                 let path = args.get(3).map(String::as_str).unwrap_or("/tmp/cwf.log");
                 let mut f = std::fs::OpenOptions::new()
                     .write(true)
@@ -445,8 +445,10 @@ fn main() {
                 }
                 f.flush().unwrap();
                 drop(f);
-                // Keep alive so parent reads concurrently.
-                std::thread::sleep(std::time::Duration::from_secs(10));
+                if sub == "write-and-sleep" {
+                    // Keep alive so parent reads concurrently.
+                    std::thread::sleep(std::time::Duration::from_secs(10));
+                }
                 std::process::exit(0);
             }
 

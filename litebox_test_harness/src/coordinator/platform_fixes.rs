@@ -9,6 +9,7 @@
 
 use super::{TestRunner, exec};
 use crate::protocol::{Command, Response};
+use tokio::time::Duration;
 
 const AGENTS: &[&str] = &["A", "AA", "B"];
 const DEPTH_AGENTS: &[&str] = &["A", "AA"];
@@ -286,6 +287,7 @@ pub(crate) async fn run(r: &mut TestRunner) {
     exit_data_integrity_tests(r).await;
     nonpie_pipe_chain_tests(r).await;
     stdin_pipe_subst_tests(r).await;
+    cross_worker_file_tests(r).await;
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -376,6 +378,141 @@ pub(crate) async fn stdin_pipe_subst_tests(r: &mut TestRunner) {
                 &resp,
                 Response::ExecResult { stdout, .. }
                     if stdout.trim() == test.expected
+            );
+            r.record(&test_id, agent, pass, &format!("{resp:?}"));
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// CWF: Cross-worker file coherence
+// (9P broker concurrent read-while-write across worker sessions)
+// ═══════════════════════════════════════════════════════════════════
+
+/// When a fork+exec'd child writes to a file and the parent reads it,
+/// the data must be visible — even if the child is still alive (the
+/// VS Code CLI pattern).
+///
+/// The bug: after delayed-fork migration, the child writes to the file
+/// through the worker's 9P session.  The parent opens the same path
+/// through its own 9P session.  `stat` sees the correct size, but
+/// `read` returns EIO when the child's session still has the file open.
+///
+/// Tests:
+///   CWF.seq          — child writes, exits, parent reads (sequential)
+///   CWF.concurrent   — child writes, stays alive, parent reads (concurrent)
+///   CWF.redirect     — bash `cmd > file &` pattern (VS Code CLI pattern)
+pub(crate) async fn cross_worker_file_tests(r: &mut TestRunner) {
+    eprintln!(
+        "[platform] === Cross-Worker File ({} agents) ===",
+        AGENTS.len()
+    );
+
+    let self_exe = r.self_exe.clone();
+
+    for &agent in AGENTS {
+        // CWF.seq: child writes, exits, then parent reads.
+        {
+            let test_id = format!("CWF.seq.{agent}");
+            let path = format!("/shared/cwf-seq-{agent}.txt");
+            // Write via fork+exec (child writes + exits).
+            let resp = r
+                .send(
+                    agent,
+                    exec(vec![
+                        "bash".into(),
+                        "-c".into(),
+                        format!("{} cross-worker-file write-and-exit {}", self_exe, path),
+                    ]),
+                )
+                .await;
+            let wrote = matches!(&resp, Response::ExecResult { exit_code: 0, .. });
+            if !wrote {
+                r.record(&test_id, agent, false, &format!("write failed: {resp:?}"));
+                continue;
+            }
+            // Read from same agent.
+            let resp = r.send(agent, Command::FsRead { path: path.clone() }).await;
+            let pass = matches!(
+                &resp,
+                Response::Ok { data: Some(d) } if d.starts_with("line0")
+            );
+            r.record(&test_id, agent, pass, &format!("{resp:?}"));
+        }
+
+        // CWF.concurrent: child writes, stays alive, parent reads.
+        {
+            let test_id = format!("CWF.concurrent.{agent}");
+            let path = format!("/shared/cwf-conc-{agent}.txt");
+            // Start child in background (it writes then sleeps).
+            let resp = r
+                .send(
+                    agent,
+                    Command::Exec {
+                        args: vec![
+                            self_exe.clone(),
+                            "cross-worker-file".into(),
+                            "write-and-sleep".into(),
+                            path.clone(),
+                        ],
+                        timeout_secs: None,
+                        stdin: None,
+                        background: true,
+                    },
+                )
+                .await;
+            let bg_pid = match &resp {
+                Response::Background { pid } => Some(*pid),
+                _ => None,
+            };
+            if bg_pid.is_none() {
+                r.record(
+                    &test_id,
+                    agent,
+                    false,
+                    &format!("bg spawn failed: {resp:?}"),
+                );
+                continue;
+            }
+            // Wait for child to write.
+            tokio::time::sleep(Duration::from_secs(3)).await;
+            // Read file while child is alive.
+            let resp = r.send(agent, Command::FsRead { path: path.clone() }).await;
+            let pass = matches!(
+                &resp,
+                Response::Ok { data: Some(d) } if d.starts_with("line0")
+            );
+            r.record(&test_id, agent, pass, &format!("{resp:?}"));
+            // Clean up.
+            if let Some(pid) = bg_pid {
+                let _ = r.send(agent, Command::Kill { pid }).await;
+            }
+        }
+
+        // CWF.redirect: bash `cmd > file &` pattern (VS Code CLI pattern).
+        {
+            let test_id = format!("CWF.redirect.{agent}");
+            let path = format!("/shared/cwf-redir-{agent}.txt");
+            let script = format!(
+                "rm -f {path}; {exe} cross-worker-file write-and-sleep {path} &\nBGPID=$!\nsleep 3\ncat {path}\nkill $BGPID 2>/dev/null\n",
+                path = path,
+                exe = self_exe,
+            );
+            let resp = r
+                .send(
+                    agent,
+                    Command::Exec {
+                        args: vec!["bash".into(), "-c".into(), script],
+                        timeout_secs: Some(15),
+                        stdin: None,
+                        background: false,
+                    },
+                )
+                .await;
+            let pass = matches!(
+                &resp,
+                Response::ExecResult { stdout, .. }
+                    if stdout.starts_with("line0")
             );
             r.record(&test_id, agent, pass, &format!("{resp:?}"));
         }
