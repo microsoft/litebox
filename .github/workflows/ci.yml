@@ -77,43 +77,6 @@ jobs:
       - name: Build documentation (fail on warnings)
         run: ./.github/tools/github_actions_run_cargo doc --no-deps --all-features --document-private-items --workspace --exclude litebox_runner_lvbs --exclude litebox_runner_snp
 
-  build_and_test_32bit:
-    name: Build and Test (32-bit)
-    runs-on: ubuntu-latest
-    env:
-      RUSTFLAGS: -Dwarnings
-    steps:
-      - name: Check out repo
-        uses: actions/checkout@v6
-      - run: sudo apt update && sudo apt install -y gcc-multilib
-      - name: Set up Rust
-        run: |
-          rustup toolchain install $(awk -F'"' '/channel/{print $2}' rust-toolchain.toml) --profile minimal --no-self-update --component rustfmt,clippy --target i686-unknown-linux-gnu
-      - name: Set up Nextest
-        uses: taiki-e/install-action@v2
-        with:
-          tool: nextest@${{ env.NEXTEST_VERSION }}
-      - name: Install diod
-        run: |
-          sudo apt install -y diod
-      - name: Set up tun
-        run: |
-          sudo ./litebox_platform_linux_userland/scripts/tun-setup.sh
-      - uses: Swatinem/rust-cache@v2
-      - name: Cache custom out directories
-        uses: actions/cache@v5
-        with:
-          path: |
-            target/*/build/litebox_runner_linux_userland-*/out
-          key: custom-out-${{ runner.os }}-${{ github.job }}-${{ hashFiles('**/Cargo.lock') }}-${{ hashFiles('**/litebox_syscall_rewriter/**/*.rs') }}
-      - run: ./.github/tools/github_actions_run_cargo build --target=i686-unknown-linux-gnu
-      - run: ./.github/tools/github_actions_run_cargo nextest --target=i686-unknown-linux-gnu
-      - run: |
-          ./.github/tools/github_actions_run_cargo test --target=i686-unknown-linux-gnu --doc
-          # We need to run `cargo test --doc` separately because doc tests
-          # aren't included in nextest at the moment. See relevant discussion at
-          # https://github.com/nextest-rs/nextest/issues/16
-
   build_and_test_lvbs:
     name: Build and Test LVBS
     runs-on: ubuntu-latest

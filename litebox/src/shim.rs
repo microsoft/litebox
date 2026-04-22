@@ -99,7 +99,7 @@ pub enum ContinueOperation {
 }
 
 /// Information about a hardware exception.
-#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[cfg(target_arch = "x86_64")]
 #[derive(Copy, Clone, Debug)]
 pub struct ExceptionInfo {
     /// The x86 exception type.
@@ -115,12 +115,12 @@ pub struct ExceptionInfo {
 }
 
 /// An x86 exception type.
-#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[cfg(target_arch = "x86_64")]
 #[repr(transparent)]
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct Exception(pub u8);
 
-#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[cfg(target_arch = "x86_64")]
 impl Exception {
     /// #DE
     pub const DIVIDE_ERROR: Self = Self(0);

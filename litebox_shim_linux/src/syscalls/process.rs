@@ -428,23 +428,6 @@ impl<FS: ShimFS> Task<FS> {
             _ => unimplemented!(),
         }
     }
-
-    #[cfg(target_arch = "x86")]
-    pub(crate) fn set_thread_area(
-        &self,
-        user_desc: &mut litebox_common_linux::UserDesc,
-    ) -> Result<(), Errno> {
-        let punchthrough = litebox_common_linux::PunchthroughSyscall::SetThreadArea { user_desc };
-        let token = self
-            .global
-            .platform
-            .get_punchthrough_token_for(punchthrough)
-            .expect("Failed to get punchthrough token for SET_THREAD_AREA");
-        token.execute().map(|_| ()).map_err(|e| match e {
-            litebox::platform::PunchthroughError::Failure(errno) => errno,
-            _ => unimplemented!("Unsupported punchthrough error {:?}", e),
-        })
-    }
 }
 
 const ROBUST_LIST_LIMIT: isize = 2048;
@@ -552,13 +535,6 @@ impl<FS: ShimFS> Task<FS> {
 /// an arbitrary-sized memory region.
 #[cfg(target_arch = "x86_64")]
 type ThreadLocalDescriptor = MutPtr<u8>;
-
-/// A descriptor for thread-local storage (TLS).
-///
-/// On `x86`, this is represented as a `UserDesc`, which provides a more
-/// structured descriptor (e.g., base address, limit, flags).
-#[cfg(target_arch = "x86")]
-type ThreadLocalDescriptor = litebox_common_linux::UserDesc;
 
 struct NewThreadArgs<FS: ShimFS> {
     /// Task struct that maintains all per-thread data
@@ -680,25 +656,6 @@ impl<FS: ShimFS> Task<FS> {
             let addr = tls.truncate();
             #[cfg(target_arch = "x86_64")]
             let desc = MutPtr::from_usize(addr);
-            #[cfg(target_arch = "x86")]
-            let desc = {
-                let desc = MutPtr::<litebox_common_linux::UserDesc>::from_usize(addr)
-                    .read_at_offset(0)
-                    .ok_or(Errno::EFAULT)?;
-                // Note that different from `set_thread_area` syscall that returns the allocated entry number
-                // when requested (i.e., `desc.entry_number` is -1), here we just read the descriptor to LiteBox and
-                // assume the entry number is properly set so that we don't need to write it back. This is because
-                // we set up the TLS descriptor in the new thread's context, at which point the original descriptor
-                // pointer might no longer be valid. Linux does not have this problem because it sets up the TLS for
-                // the child thread in the parent thread before `clone` returns.
-                // In practice, glibc always sets the entry number to a valid value when calling `clone` with TLS as
-                // all threads can share the same TLS entry as the main thread.
-                let idx = desc.entry_number;
-                if idx == u32::MAX {
-                    return Err(Errno::EINVAL);
-                }
-                desc
-            };
             Some(desc)
         } else {
             None
@@ -1432,10 +1389,7 @@ impl<FS: ShimFS> Task<FS> {
         unsafe { self.global.pm.release_memory(release) }
             .expect("failed to release memory mappings");
 
-        litebox_platform_multiplex::Platform::clear_guest_thread_local_storage(
-            #[cfg(target_arch = "x86")]
-            ctx.xgs.truncate(),
-        );
+        litebox_platform_multiplex::Platform::clear_guest_thread_local_storage();
 
         self.load_program(loader, argv_vec, envp_vec)
             .expect("TODO: terminate the process cleanly");
@@ -1508,28 +1462,6 @@ impl<FS: ShimFS> Task<FS> {
                         ss: 0x2b, // __USER_DS
                     };
                 }
-                #[cfg(target_arch = "x86")]
-                {
-                    *ctx = litebox_common_linux::PtRegs {
-                        ebx: 0,
-                        ecx: 0,
-                        edx: 0,
-                        esi: 0,
-                        edi: 0,
-                        ebp: 0,
-                        eax: 0,
-                        xds: 0,
-                        xes: 0,
-                        xfs: 0,
-                        xgs: 0,
-                        orig_eax: 0,
-                        eip: load_info.entry_point,
-                        xcs: 0x23, // __USER_CS
-                        eflags: 0,
-                        esp: load_info.user_stack_top,
-                        xss: 0x2b, // __USER_DS
-                    };
-                }
             }
             ThreadInitState::NewThread {
                 tls,
@@ -1544,22 +1476,9 @@ impl<FS: ShimFS> Task<FS> {
                     }
                     ctx.rax = 0;
                 }
-                #[cfg(target_arch = "x86")]
-                {
-                    if let Some(stack) = stack {
-                        ctx.esp = stack;
-                    }
-                    ctx.eax = 0;
-                }
 
                 // Set the TLS for the new thread.
                 if let Some(tls) = tls {
-                    #[cfg(target_arch = "x86")]
-                    {
-                        let mut tls = tls;
-                        self.set_thread_area(&mut tls).unwrap();
-                    }
-
                     #[cfg(target_arch = "x86_64")]
                     {
                         use litebox::platform::RawConstPointer as _;
@@ -1739,13 +1658,11 @@ mod tests {
                 "nanosleep should be interrupted by SIGINT from background thread"
             );
 
-            // `process_signals` is called when about to switch back to userspace, so simulate that here.
-            let mut stack = [0u8; 4096];
-            #[cfg(target_arch = "x86_64")]
-            let mut regs = litebox_common_linux::PtRegs { rsp: stack.as_mut_ptr() as usize + stack.len(), ..Default::default() };
-            #[cfg(target_arch = "x86")]
-            let mut regs = litebox_common_linux::PtRegs { esp: stack.as_mut_ptr() as usize + stack.len(), ..Default::default() };
-            task.process_signals(&mut regs);
+             // `process_signals` is called when about to switch back to userspace, so simulate that here.
+             let mut stack = [0u8; 4096];
+             #[cfg(target_arch = "x86_64")]
+             let mut regs = litebox_common_linux::PtRegs { rsp: stack.as_mut_ptr() as usize + stack.len(), ..Default::default() };
+             task.process_signals(&mut regs);
             assert_eq!(
                 regs.get_ip(), callback_addr,
                 "after processing signals, execution should be redirected to the custom handler"

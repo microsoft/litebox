@@ -15,10 +15,9 @@ syscalls = { version = "0.6", default-features = false }
 zerocopy = { version = "0.8", default-features = false }
 
 [features]
-default = ["linux_syscall", "x86_on_x64"]
+default = ["linux_syscall"]
 linux_syscall = []
 optee_syscall = ["dep:litebox_common_optee"]
-x86_on_x64 = []
 
 [lints]
 workspace = true

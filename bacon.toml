@@ -69,16 +69,6 @@ command = [
 need_stdout = true
 analyzer = "nextest"
 
-# Run nextest on 32-bit x86
-[jobs.nextest-x86]
-command = [
-    "cargo", "nextest", "run",
-    "--target=i686-unknown-linux-gnu",
-    "--hide-progress-bar", "--failure-output", "final"
-]
-need_stdout = true
-analyzer = "nextest"
-
 # Documentation
 [jobs.doc]
 command = ["cargo", "doc", "--no-deps"]
@@ -98,7 +88,6 @@ alt-k = "job:check-all"
 c = "job:clippy"
 alt-c = "job:clippy-all"
 n = "job:nextest"
-alt-n = "job:nextest-x86"
 d = "job:doc-open"
 alt-d = "job:doc"
 v = "job:buildchecks-lvbs"

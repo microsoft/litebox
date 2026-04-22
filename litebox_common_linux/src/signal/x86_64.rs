@@ -5,7 +5,15 @@
 
 use zerocopy::{FromBytes, IntoBytes};
 
-use crate::signal::x86::FpxSwBytes;
+#[repr(C)]
+#[derive(Clone)]
+pub struct FpxSwBytes {
+    pub magic1: u32,
+    pub extended_size: u32,
+    pub xfeatures: u64,
+    pub xstate_size: u32,
+    pub padding: [u32; 7],
+}
 
 #[repr(C)]
 #[derive(Clone, FromBytes, IntoBytes)]

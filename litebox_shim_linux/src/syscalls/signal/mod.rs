@@ -3,14 +3,10 @@
 
 //! Signal handling syscalls and support.
 
-#[cfg(target_arch = "x86")]
-pub(crate) mod x86;
 #[cfg(target_arch = "x86_64")]
 mod x86_64;
 
 use litebox_common_linux::signal::SignalDisposition;
-#[cfg(target_arch = "x86")]
-use x86 as arch;
 #[cfg(target_arch = "x86_64")]
 use x86_64 as arch;
 use zerocopy::FromZeros;

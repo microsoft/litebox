@@ -3,11 +3,8 @@
 
 //! Linux signal handling definitions.
 
-pub mod x86;
 pub mod x86_64;
 
-#[cfg(target_arch = "x86")]
-use x86::Sigcontext;
 #[cfg(target_arch = "x86_64")]
 use x86_64::Sigcontext;
 
@@ -298,7 +295,7 @@ bitflags::bitflags! {
     }
 }
 
-#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[cfg(target_arch = "x86_64")]
 pub const MINSIGSTKSZ: usize = 2048;
 #[cfg(target_arch = "aarch64")]
 pub const MINSIGSTKSZ: usize = 5120;

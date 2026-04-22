@@ -44,9 +44,3 @@ pub(crate) fn init() {
     });
     unsafe { Star::write_raw(user_cs, kernel_cs) };
 }
-
-#[cfg(target_arch = "x86")]
-pub(crate) fn init(_syscall_handler: SyscallHandler) {
-    todo!("we don't support 32-bit mode syscalls for now");
-    // AMD and Intel CPUs have different syscall mechanisms in 32-bit mode.
-}

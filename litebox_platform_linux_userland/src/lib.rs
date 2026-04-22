@@ -5,7 +5,7 @@
 
 // Restrict this crate to only work on Linux. For now, we are restricting this to only x86/x86-64
 // Linux, but we _may_ allow for more in the future, if we find it useful to do so.
-#![cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "x86")))]
+#![cfg(all(target_os = "linux", target_arch = "x86_64"))]
 
 use std::cell::Cell;
 use std::os::fd::{AsRawFd as _, FromRawFd as _};
@@ -50,24 +50,12 @@ macro_rules! tls_suffix {
         "@tpoff"
     };
 }
-#[cfg(target_arch = "x86")]
-macro_rules! tls_suffix {
-    () => {
-        "@ntpoff"
-    };
-}
 
 /// Segment register used for TLS after the fs/gs swap (normal host context).
 #[cfg(target_arch = "x86_64")]
 macro_rules! tls_seg {
     () => {
         "fs"
-    };
-}
-#[cfg(target_arch = "x86")]
-macro_rules! tls_seg {
-    () => {
-        "gs"
     };
 }
 
@@ -77,12 +65,6 @@ macro_rules! tls_seg {
 macro_rules! saved_tls_seg {
     () => {
         "gs"
-    };
-}
-#[cfg(target_arch = "x86")]
-macro_rules! saved_tls_seg {
-    () => {
-        "fs"
     };
 }
 
@@ -725,166 +707,6 @@ interrupt_callback:
     );
 }
 
-/// Runs the guest thread until it terminates.
-///
-/// This saves all non-volatile register state then switches to the guest
-/// context. When the guest makes a syscall, it jumps back into the middle of
-/// this routine, at `syscall_callback`. This code then updates the guest
-/// context structure, switches back to the host stack, and calls the syscall
-/// handler.
-///
-/// When the guest thread terminates, this function returns after restoring
-/// non-volatile register state.
-#[cfg(target_arch = "x86")]
-#[unsafe(naked)]
-unsafe extern "fastcall-unwind" fn run_thread_arch(
-    thread_ctx: &mut ThreadContext,
-    ctx: *mut litebox_common_linux::PtRegs,
-    reenter: u8,
-) {
-    core::arch::naked_asm!(
-    "
-    .cfi_startproc
-    push    ebp
-    mov ebp, esp
-    .cfi_def_cfa ebp, 8
-    push ebx
-    push esi
-    push edi
-    sub esp, 8 // align
-    push ecx // save thread context
-
-    // Save host esp and ebp and guest context top in TLS
-    mov gs:host_sp@ntpoff, esp
-    mov gs:host_bp@ntpoff, ebp
-    lea edi, [edx + {GUEST_CONTEXT_SIZE}]
-    mov gs:guest_context_top@ntpoff, edi
-
-    // Save host gs in fs
-    mov ax, gs
-    mov fs, ax
-
-    // Call init_handler or reenter_handler based on reenter flag (on stack at [ebp+8])
-    sub esp, 12 // align
-    push ecx
-    mov al, [ebp + 8]  // reenter is 3rd arg, first stack arg for fastcall
-    test al, al
-    jnz 1f
-    call {init_handler}
-    jmp .Ldone
-1:
-    call {reenter_handler}
-    jmp .Ldone
-
-    // This entry point is called from the guest when it issues a syscall
-    // instruction.
-    //
-    // The stack layout at the entry of the callback (see litebox_syscall_rewriter
-    // for more details):
-    //
-    // Addr |   data   |
-    // 0    | eax      |
-    // -4:  | ret addr |  <-- esp
-    //
-    // The first two instructions adjust the stack such that it saves one
-    // instruction (i.e., `pop eax`) from the caller (trampoline code).
-    .globl  syscall_callback
-syscall_callback:
-    // Clear in_guest flag. This must be the first instruction to match the
-    // expectations of `interrupt_signal_handler`.
-    mov     BYTE PTR fs:in_guest@ntpoff, 0
-
-    // Save the parameters and switch esp to the guest context
-    pop  dword ptr fs:scratch@ntpoff  // pop ret addr
-    pop  eax                          // pop eax
-    mov  dword ptr fs:scratch2@ntpoff, esp
-    mov  esp, fs:guest_context_top@ntpoff
-
-    // Save registers and constructs pt_regs
-    push    0x2b       // pt_regs->xss = __USER_DS
-    push    dword ptr fs:scratch2@ntpoff   // pt_regs->esp
-    pushfd             // pt_regs->eflags
-    push    0x33       // pt_regs->xcs = __USER_CS
-    push    dword ptr fs:scratch@ntpoff    // pt_regs->eip
-    push    eax        // pt_regs->orig_ax
-
-    // Use explicit encodings because LLVM emits 16-bit pushes and we want 32-bit
-    .byte 0x0f, 0xa8    // push gs
-    .byte 0x0f, 0xa0    // push fs
-    .byte 0x06          // push es
-    .byte 0x1e          // push ds
-
-    push    -38         // pt_regs->eax = ENOSYS
-    push    ebp         // pt_regs->ebp
-    push    edi         // pt_regs->edi
-    push    esi         // pt_regs->esi
-    push    edx         // pt_regs->edx
-    push    ecx         // pt_regs->ecx
-    push    ebx         // pt_regs->ebx
-
-    // Restore esp and ebp
-    mov esp, fs:host_sp@ntpoff
-    mov ebp, fs:host_bp@ntpoff
-
-    // Switch to host gs
-    mov ax, fs
-    mov gs, ax
-
-    // Handle the syscall. This will jump back to the guest but
-    // will return if the thread is exiting.
-    mov ecx, [esp] // pass thread_ctx
-    call {syscall_handler_fast}
-    jmp .Ldone
-
-exception_callback:
-    // Restore esp and ebp
-    mov esp, gs:host_sp@ntpoff
-    mov ebp, gs:host_bp@ntpoff
-
-    mov edi, [esp] // pass thread_ctx
-    push ecx
-    push edx
-    push esi
-    push edi
-    call {exception_handler}
-    jmp .Ldone
-
-interrupt_callback:
-    // Restore esp and ebp
-    mov esp, gs:host_sp@ntpoff
-    mov ebp, gs:host_bp@ntpoff
-
-    mov ecx, [esp] // pass thread_ctx
-    sub esp, 12 // align
-    push ecx
-    call {interrupt_handler}
-
-.Ldone:
-
-    lea  esp, [ebp - 3*4]
-    pop  edi
-    pop  esi
-    pop  ebx
-    pop  ebp
-    .cfi_def_cfa esp, 4
-    ret 4  // pop the reenter argument (fastcall callee cleanup)
-    .cfi_endproc
-",
-    GUEST_CONTEXT_SIZE = const core::mem::size_of::<litebox_common_linux::PtRegs>(),
-    init_handler = sym init_handler,
-    reenter_handler = sym reenter_handler,
-    syscall_handler_fast = sym syscall_handler_fast,
-    exception_handler = sym exception_handler,
-    interrupt_handler = sym interrupt_handler,
-    );
-}
-
-/// Wrapper around `syscall_handler` to use the fastcall convention.
-#[cfg(target_arch = "x86")]
-unsafe extern "fastcall-unwind" fn syscall_handler_fast(thread_ctx: &mut ThreadContext) {
-    unsafe { syscall_handler(thread_ctx) }
-}
-
 /// Switches to the provided guest context.
 ///
 /// # Safety
@@ -935,73 +757,6 @@ unsafe extern "C" fn switch_to_guest(ctx: &litebox_common_linux::PtRegs) -> ! {
         "popfq",
         "pop rsp",
         "jmp gs:scratch@tpoff", // jump to the guest
-        "switch_to_guest_end:",
-    );
-}
-
-#[cfg(target_arch = "x86")]
-core::arch::global_asm!(
-    "
-    .section .tbss
-    .align 4
-scratch:
-    .long 0
-scratch2:
-    .long 0
-host_sp:
-    .long 0
-host_bp:
-    .long 0
-guest_context_top:
-    .long 0
-in_guest:
-    .byte 0
-.globl interrupt
-interrupt:
-    .byte 0
-    .align 4
-.globl pending_host_signals
-pending_host_signals:
-    .long 0
-    .align 4
-.globl wait_waker_addr
-wait_waker_addr:
-    .long 0
-    "
-);
-
-#[cfg(target_arch = "x86")]
-#[unsafe(naked)]
-unsafe extern "fastcall" fn switch_to_guest(ctx: &litebox_common_linux::PtRegs) -> ! {
-    core::arch::naked_asm!(
-        "switch_to_guest_start:",
-        // Set `in_guest` now, then check if there is a pending interrupt. If
-        // so, jump to the interrupt handler.
-        //
-        // If an interrupt arrives after the check, then the signal handler will
-        // see that the IP is between `switch_to_guest_start` and
-        // `switch_to_guest_end` and will set the `interrupt` and jump to
-        // `interrupt_callback`.
-        "mov BYTE PTR gs:in_guest@ntpoff, 1",
-        "cmp BYTE PTR gs:interrupt@ntpoff, 0",
-        "jne interrupt_callback",
-        // Restore guest context from ctx.
-        "mov esp, ecx",
-        "pop ebx",
-        "pop ecx",
-        "pop edx",
-        "pop esi",
-        "pop edi",
-        "pop ebp",
-        "pop eax",
-        "add esp, 12",           // skip xds, xes, xfs
-        ".byte 0x0f, 0xa9",      // pop gs
-        "add esp, 4",            // skip orig_eax
-        "pop fs:scratch@ntpoff", // read eip into scratch
-        "add esp, 4",            // skip xcs
-        "popfd",
-        "pop esp",
-        "jmp fs:scratch@ntpoff", // jump to the guest
         "switch_to_guest_end:",
     );
 }
@@ -1150,17 +905,6 @@ impl litebox::platform::ThreadProvider for LinuxUserland {
                 options(nostack, preserves_flags),
             );
         }
-        #[cfg(target_arch = "x86")]
-        {
-            unsafe {
-                core::arch::asm!(
-                    "mov {tmp:x}, gs",
-                    "mov fs, {tmp:x}",
-                    tmp = out(reg) _,
-                    options(nostack, preserves_flags),
-                );
-            }
-        }
 
         ThreadHandle::run_with_handle(f)
     }
@@ -1225,7 +969,6 @@ impl litebox::platform::TimerHandle for TimerHandle {
             },
             it_value: libc::timespec {
                 tv_sec: duration.as_secs().cast_signed().truncate(),
-                #[cfg_attr(target_arch = "x86", expect(clippy::useless_conversion))]
                 tv_nsec: duration.subsec_nanos().cast_signed().into(),
             },
         };
@@ -1450,42 +1193,6 @@ impl litebox::platform::SystemTime for SystemTime {
     }
 }
 
-#[cfg(target_arch = "x86")]
-fn set_thread_area(
-    user_desc: &mut litebox_common_linux::UserDesc,
-) -> Result<usize, litebox_common_linux::errno::Errno> {
-    unsafe {
-        syscalls::syscall1(
-            syscalls::Sysno::set_thread_area,
-            core::ptr::from_mut(user_desc) as usize,
-        )
-    }
-    .map_err(|err| match err {
-        syscalls::Errno::EFAULT => litebox_common_linux::errno::Errno::EFAULT,
-        syscalls::Errno::EINVAL => litebox_common_linux::errno::Errno::EINVAL,
-        syscalls::Errno::ENOSYS => litebox_common_linux::errno::Errno::ENOSYS,
-        syscalls::Errno::ESRCH => litebox_common_linux::errno::Errno::ESRCH,
-        _ => panic!("unexpected error {err}"),
-    })
-}
-
-#[cfg(target_arch = "x86")]
-fn clear_thread_area(entry_number: u32) {
-    if entry_number == u32::MAX {
-        return;
-    }
-
-    let flags = litebox_common_linux::UserDescFlags(0);
-    let mut user_desc = litebox_common_linux::UserDesc {
-        entry_number,
-        base_addr: 0,
-        limit: 0,
-        flags,
-    };
-
-    set_thread_area(&mut user_desc).expect("failed to clear TLS entry");
-}
-
 pub struct PunchthroughToken<'a> {
     punchthrough: PunchthroughSyscall<'a, LinuxUserland>,
 }
@@ -1509,10 +1216,6 @@ impl<'a> litebox::platform::PunchthroughToken for PunchthroughToken<'a> {
             }
             #[cfg(target_arch = "x86_64")]
             PunchthroughSyscall::GetFsBase => Ok(get_guest_fsbase()),
-            #[cfg(target_arch = "x86")]
-            PunchthroughSyscall::SetThreadArea { user_desc } => {
-                set_thread_area(user_desc).map_err(litebox::platform::PunchthroughError::Failure)
-            }
         }
     }
 }
@@ -1595,10 +1298,6 @@ fn futex_timeout(
                 {
                     syscalls::Sysno::futex
                 }
-                #[cfg(target_arch = "x86")]
-                {
-                    syscalls::Sysno::futex_time64
-                }
             },
             uaddr as usize,
             usize::try_from(futex_op).unwrap(),
@@ -1632,10 +1331,6 @@ fn futex_val2(
                 #[cfg(target_arch = "x86_64")]
                 {
                     syscalls::Sysno::futex
-                }
-                #[cfg(target_arch = "x86")]
-                {
-                    syscalls::Sysno::futex_time64
                 }
             },
             uaddr as usize,
@@ -1673,10 +1368,6 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Li
     const TASK_ADDR_MIN: usize = 0x1_0000; // default linux config
     #[cfg(target_arch = "x86_64")]
     const TASK_ADDR_MAX: usize = 0x7FFF_FFFF_F000; // (1 << 47) - PAGE_SIZE;
-    #[cfg(all(target_arch = "x86", not(feature = "x86_on_x64")))]
-    const TASK_ADDR_MAX: usize = 0xC000_0000; // 3 GiB (see arch/x86/include/asm/page_32_types.h)
-    #[cfg(all(target_arch = "x86", feature = "x86_on_x64"))]
-    const TASK_ADDR_MAX: usize = 0xFFFF_F000; // Note running 32-bit programs on x86_64 kernel has a different limit than native x86
 
     fn allocate_pages(
         &self,
@@ -1709,10 +1400,6 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Li
                     #[cfg(target_arch = "x86_64")]
                     {
                         syscalls::Sysno::mmap
-                    }
-                    #[cfg(target_arch = "x86")]
-                    {
-                        syscalls::Sysno::mmap2
                     }
                 },
                 suggested_range.start,
@@ -1830,10 +1517,6 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Li
                     {
                         syscalls::Sysno::mmap
                     }
-                    #[cfg(target_arch = "x86")]
-                    {
-                        syscalls::Sysno::mmap2
-                    }
                 },
                 suggested_start,
                 source_data.len(),
@@ -1844,11 +1527,6 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Li
                     #[cfg(target_arch = "x86_64")]
                     {
                         file_offset
-                    }
-                    #[cfg(target_arch = "x86")]
-                    {
-                        // mmap2 takes offset in pages, not bytes
-                        file_offset / ALIGN
                     }
                 },
             )
@@ -2033,13 +1711,6 @@ unsafe impl litebox::platform::ThreadLocalStorageProvider for LinuxUserland {
     #[cfg(target_arch = "x86_64")]
     fn clear_guest_thread_local_storage() {
         set_guest_fsbase(0);
-    }
-
-    #[cfg(target_arch = "x86")]
-    fn clear_guest_thread_local_storage(selector: u16) {
-        if selector != 0 {
-            clear_thread_area(u32::from(selector) >> 3);
-        }
     }
 }
 
@@ -2251,53 +1922,6 @@ fn signal_handler_exit_guest(
     }
 }
 
-/// Called from signal handlers to fix up thread state after potentially running
-/// in the guest.
-///
-/// Restores the proper host `gs` so that TLS can be used. Clears `in_guest` and
-/// optionally sets `interrupt`. If `in_guest` was previously set, returns the
-/// guest context pointer (which does not necessarily have up-to-date guest
-/// register state yet).
-#[cfg(target_arch = "x86")]
-fn signal_handler_exit_guest(
-    context: &libc::ucontext_t,
-    set_interrupt: bool,
-) -> Option<*mut litebox_common_linux::PtRegs> {
-    unsafe {
-        let is_in_guest = if context.uc_mcontext.gregs[libc::REG_FS as usize] == 0 {
-            false
-        } else {
-            let in_guest: u8;
-            core::arch::asm! {
-                "mov {in_guest}, BYTE PTR fs:in_guest@ntpoff",
-                "mov BYTE PTR fs:in_guest@ntpoff, 0",
-                in_guest = out(reg_byte) in_guest,
-                options(nostack, preserves_flags)
-            }
-            if set_interrupt {
-                core::arch::asm! {
-                    "mov BYTE PTR fs:interrupt@ntpoff, 1",
-                    options(nostack, preserves_flags)
-                };
-            }
-            in_guest != 0
-        };
-        if !is_in_guest {
-            return None;
-        }
-
-        let guest_context_top: *mut litebox_common_linux::PtRegs;
-        core::arch::asm! {
-            "mov gs, {gs}",
-            "mov {guest_context_top}, gs:guest_context_top@ntpoff",
-            gs = in(reg) context.uc_mcontext.gregs[libc::REG_FS as usize],
-            guest_context_top = out(reg) guest_context_top,
-            options(nostack, preserves_flags)
-        };
-        Some(guest_context_top.sub(1))
-    }
-}
-
 /// Copies register state from a Linux signal context to a LiteBox PtRegs
 /// structure.
 #[cfg(target_arch = "x86_64")]
@@ -2352,52 +1976,6 @@ fn copy_signal_context(regs: &mut litebox_common_linux::PtRegs, context: &libc::
     *orig_rax = *rax;
 }
 
-/// Copies register state from a Linux signal context to a LiteBox PtRegs
-/// structure.
-#[cfg(target_arch = "x86")]
-fn copy_signal_context(regs: &mut litebox_common_linux::PtRegs, context: &libc::ucontext_t) {
-    let litebox_common_linux::PtRegs {
-        ebx,
-        ecx,
-        edx,
-        esi,
-        edi,
-        ebp,
-        eax,
-        xds,
-        xes,
-        xfs: _,
-        xgs,
-        orig_eax,
-        eip,
-        xcs,
-        eflags,
-        esp,
-        xss,
-    } = regs;
-    for (reg, sig_reg) in [
-        (ebx, libc::REG_EBX),
-        (ecx, libc::REG_ECX),
-        (edx, libc::REG_EDX),
-        (esi, libc::REG_ESI),
-        (edi, libc::REG_EDI),
-        (ebp, libc::REG_EBP),
-        (eax, libc::REG_EAX),
-        (eip, libc::REG_EIP),
-        (eflags, libc::REG_EFL),
-        (esp, libc::REG_ESP),
-        (xds, libc::REG_DS),
-        (xes, libc::REG_ES),
-        (xgs, libc::REG_GS),
-        (xss, libc::REG_SS),
-        (xcs, libc::REG_CS),
-    ] {
-        *reg = context.uc_mcontext.gregs[sig_reg.reinterpret_as_unsigned() as usize]
-            .reinterpret_as_unsigned() as usize;
-    }
-    *orig_eax = *eax;
-}
-
 /// Updates a Linux signal context to return to `f` with the given arguments.
 #[cfg(target_arch = "x86_64")]
 fn set_signal_return(
@@ -2414,26 +1992,6 @@ fn set_signal_return(
     sigctx.gregs[libc::REG_RSI as usize] = p1 as i64;
     sigctx.gregs[libc::REG_RDX as usize] = p2 as i64;
     sigctx.gregs[libc::REG_RCX as usize] = p3 as i64;
-}
-
-/// Updates a Linux signal context to return to `f` with the given arguments.
-#[cfg(target_arch = "x86")]
-fn set_signal_return(
-    context: &mut libc::ucontext_t,
-    f: unsafe extern "C" fn(),
-    p0: isize,
-    p1: isize,
-    p2: isize,
-    p3: isize,
-) {
-    let sigctx = &mut context.uc_mcontext;
-    sigctx.gregs[libc::REG_EIP as usize] = (f as usize).reinterpret_as_signed().truncate();
-    sigctx.gregs[libc::REG_EDI as usize] = p0.truncate();
-    sigctx.gregs[libc::REG_ESI as usize] = p1.truncate();
-    sigctx.gregs[libc::REG_EDX as usize] = p2.truncate();
-    sigctx.gregs[libc::REG_ECX as usize] = p3.truncate();
-    // Restore host `gs` from `fs`.
-    sigctx.gregs[libc::REG_GS as usize] = sigctx.gregs[libc::REG_FS as usize];
 }
 
 /// Signal handler for hardware exceptions (SIGSEGV, SIGBUS, SIGFPE, SIGILL, SIGTRAP).
@@ -2458,12 +2016,6 @@ unsafe extern "C" fn exception_signal_handler(
         sigctx.gregs[libc::REG_ERR as usize].truncate(),
         sigctx.gregs[libc::REG_CR2 as usize].truncate(),
     );
-    #[cfg(target_arch = "x86")]
-    let (trapno, err, cr2) = (
-        sigctx.gregs[libc::REG_TRAPNO as usize] as isize,
-        sigctx.gregs[libc::REG_ERR as usize] as isize,
-        sigctx.cr2.reinterpret_as_signed() as isize,
-    );
     set_signal_return(context, exception_callback, 0, trapno, err, cr2);
 }
 
@@ -2481,21 +2033,12 @@ unsafe fn next_signal_handler(
                     .reinterpret_as_unsigned()
                     .truncate()
             }
-            #[cfg(target_arch = "x86")]
-            {
-                context.uc_mcontext.gregs[libc::REG_EIP as usize].reinterpret_as_unsigned() as usize
-            }
         };
         if let Some(fixup_addr) = litebox::mm::exception_table::search_exception_tables(ip) {
             #[cfg(target_arch = "x86_64")]
             {
                 context.uc_mcontext.gregs[libc::REG_RIP as usize] =
                     fixup_addr.reinterpret_as_signed() as i64;
-            }
-            #[cfg(target_arch = "x86")]
-            {
-                context.uc_mcontext.gregs[libc::REG_EIP as usize] =
-                    fixup_addr.reinterpret_as_signed().truncate();
             }
             return;
         }
@@ -2620,12 +2163,6 @@ unsafe fn interrupt_signal_handler(
             unsafe { core::arch::asm!("rdgsbase {}", out(reg) gsbase) };
             is_guest_thread = gsbase != 0;
         }
-        #[cfg(target_arch = "x86")]
-        {
-            let fs: u16;
-            unsafe { core::arch::asm!("mov {:x}, fs", out(reg) fs, options(nostack, nomem)) };
-            is_guest_thread = fs != 0;
-        }
 
         if is_guest_thread {
             // SAFETY: we verified the saved host TLS segment is valid above.
@@ -2656,8 +2193,6 @@ unsafe fn interrupt_signal_handler(
     let ip = context.uc_mcontext.gregs[libc::REG_RIP as usize]
         .reinterpret_as_unsigned()
         .truncate();
-    #[cfg(target_arch = "x86")]
-    let ip = context.uc_mcontext.gregs[libc::REG_EIP as usize].reinterpret_as_unsigned() as usize;
 
     // Case 1: at the beginning of the syscall handler.
     //

@@ -83,26 +83,7 @@ pub unsafe fn memcpy_fallible(dst: *mut u8, src: *const u8, size: usize) -> Resu
             fault = label { return Err(Fault) }
         }
     }
-    // LLVM on x86 does not allow using `esi` as an asm operand register. Save
-    // and restore it manually.
-    #[cfg(target_arch = "x86")]
-    unsafe {
-        let remaining: usize;
-        core::arch::asm! {
-            "2:",
-            "xchg esi, eax",
-            "rep movsb",
-            "3:",
-            "mov esi, eax",
-            ex_table_entry!("2b", "3b", "3b"),
-            inout("di") dst => _,
-            inout("ax") src => _,
-            inout("cx") size => remaining,
-        }
-        if remaining != 0 {
-            return Err(Fault);
-        }
-    }
+
     Ok(())
 }
 
@@ -116,7 +97,7 @@ macro_rules! read_fn {
         pub unsafe fn $name(src: *const $ty) -> Result<$ty, Fault> {
             let value: usize;
             let failed: u32;
-            #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
+            #[cfg(target_arch = "x86_64")]
             unsafe {
                 core::arch::asm! {
                     "2:",
@@ -155,7 +136,7 @@ macro_rules! write_fn {
         /// in non-Rust memory.
         pub unsafe fn $name(dest: *mut $ty, value: $ty) -> Result<(), Fault> {
             let value: usize = (u64::from(value)).truncate();
-            #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
+            #[cfg(target_arch = "x86_64")]
             unsafe {
                 core::arch::asm! {
                     "2:",
@@ -178,30 +159,6 @@ write_fn!(write_u16_fallible, u16, "mov word ptr [{dest}], {src:x}");
 write_fn!(write_u32_fallible, u32, "mov dword ptr [{dest}], {src:e}");
 #[cfg(target_pointer_width = "64")]
 write_fn!(write_u64_fallible, u64, "mov qword ptr [{dest}], {src:r}");
-
-/// Writes a value to the given `dest` pointer in a fallible manner.
-///
-/// # Safety
-/// `dest` must be valid for writes or a pointer that's guaranteed to be
-/// in non-Rust memory.
-//
-// Special case instead of the macro since 32 bit cannot use `reg` for 8-bit
-// values.
-#[cfg(target_arch = "x86")]
-pub unsafe fn write_u8_fallible(dest: *mut u8, value: u8) -> Result<(), Fault> {
-    unsafe {
-        core::arch::asm! {
-            "2:",
-            "mov byte ptr [{dest}], {src}",
-            "3:",
-            ex_table_entry!("2b", "3b", "{fault}"),
-            src = in(reg_byte) value,
-            dest = in(reg) dest,
-            fault = label { return Err(Fault) }
-        }
-    }
-    Ok(())
-}
 
 /// Exception table entry with relative offsets
 #[repr(C)]

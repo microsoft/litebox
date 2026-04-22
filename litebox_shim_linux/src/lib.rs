@@ -502,10 +502,6 @@ impl<FS: ShimFS> Task<FS> {
             Ok(v) => v,
             Err(err) => (err.as_neg() as isize).reinterpret_as_unsigned(),
         };
-        #[cfg(target_arch = "x86")]
-        {
-            ctx.eax = return_value;
-        }
         #[cfg(target_arch = "x86_64")]
         {
             ctx.rax = return_value;
@@ -520,8 +516,6 @@ impl<FS: ShimFS> Task<FS> {
             };
         }
 
-        #[cfg(target_arch = "x86")]
-        let syscall_number = ctx.orig_eax;
         #[cfg(target_arch = "x86_64")]
         let syscall_number = ctx.orig_rax;
         let request =
@@ -614,8 +608,6 @@ impl<FS: ShimFS> Task<FS> {
                 sigsetsize,
             } => self.sys_rt_sigaction(signum, act, oldact, sigsetsize),
             SyscallRequest::RtSigreturn => self.sys_rt_sigreturn(ctx),
-            #[cfg(target_arch = "x86")]
-            SyscallRequest::Sigreturn => self.sys_sigreturn(ctx),
             SyscallRequest::Ioctl { fd, arg } => syscall!(sys_ioctl(fd, arg)),
             SyscallRequest::Pread64 {
                 fd,
@@ -676,8 +668,6 @@ impl<FS: ShimFS> Task<FS> {
                 type_and_flags,
                 protocol,
             } => syscall!(sys_socket(domain, type_and_flags, protocol)),
-            #[cfg(target_arch = "x86")]
-            SyscallRequest::Socketcall { call, args } => self.sys_socketcall(call, args),
             SyscallRequest::Socketpair {
                 domain,
                 type_and_flags,
@@ -904,19 +894,6 @@ impl<FS: ShimFS> Task<FS> {
                         .map(|()| 0)
                 })
             }),
-            #[cfg(target_arch = "x86")]
-            SyscallRequest::Fstatat64 {
-                dirfd,
-                pathname,
-                buf,
-                flags,
-            } => pathname.to_cstring().map_or(Err(Errno::EFAULT), |path| {
-                self.sys_newfstatat(dirfd, path, flags).and_then(|stat| {
-                    buf.write_at_offset(0, stat.into())
-                        .ok_or(Errno::EFAULT)
-                        .map(|()| 0)
-                })
-            }),
             SyscallRequest::Eventfd2 { initval, flags } => {
                 syscall!(sys_eventfd2(initval, flags))
             }
@@ -934,23 +911,6 @@ impl<FS: ShimFS> Task<FS> {
                 {
                     let _ = user_desc;
                     Err(Errno::ENOSYS) // x86_64 does not support set_thread_area
-                }
-                #[cfg(target_arch = "x86")]
-                {
-                    user_desc
-                        .read_at_offset(0)
-                        .ok_or(Errno::EFAULT)
-                        .and_then(|mut desc| {
-                            let idx = desc.entry_number;
-                            self.set_thread_area(&mut desc)?;
-                            if idx == u32::MAX {
-                                // index -1 means the kernel should try to find and
-                                // allocate an empty descriptor.
-                                // return the allocated entry number
-                                user_desc.write_at_offset(0, desc).ok_or(Errno::EFAULT)?;
-                            }
-                            Ok(0)
-                        })
                 }
             }
             SyscallRequest::SetTidAddress { tidptr } => {
