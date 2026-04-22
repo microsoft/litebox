@@ -285,4 +285,116 @@ pub(crate) async fn run(r: &mut TestRunner) {
     pipe_pair_id_tests(r).await;
     exit_data_integrity_tests(r).await;
     nonpie_pipe_chain_tests(r).await;
+    stdin_pipe_subst_tests(r).await;
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// STDIN-PIPE-SUBST: $() inside scripts piped via stdin
+// (fix for VS Code Remote-SSH install script failure)
+// ═══════════════════════════════════════════════════════════════════
+
+/// When a shell script is piped via stdin (as VS Code Remote-SSH does),
+/// $() command substitution with pipelines must return correct output.
+///
+/// The issue: vfork children share the kernel pipe file description
+/// for stdin. Pipeline children (head, grep, sed) may consume stdin
+/// data, causing the parent shell to lose its script position.
+///
+/// Tests cover:
+///   SP.simple      — $(echo hello) via stdin pipe
+///   SP.pipeline    — $(echo hello | cat) via stdin pipe
+///   SP.file_read   — $(cat /etc/passwd) via stdin pipe
+///   SP.file_pipe   — $(cat /etc/passwd | head -1) via stdin pipe [THE BUG]
+///   SP.multi_subst — multiple $() in sequence via stdin pipe
+///   SP.os_detect   — $(uname -m) + $(uname -s) via stdin pipe [VS Code pattern]
+pub(crate) async fn stdin_pipe_subst_tests(r: &mut TestRunner) {
+    eprintln!(
+        "[platform] === Stdin-Pipe Subst ({} agents) ===",
+        AGENTS.len()
+    );
+
+    struct SubstTest {
+        name: &'static str,
+        /// Script to pipe via stdin to /bin/sh
+        script: &'static str,
+        /// Expected stdout (exact match after trim)
+        expected: &'static str,
+        /// Known failure — vfork stdin pipe offset issue
+        xfail: bool,
+    }
+
+    let tests = &[
+        SubstTest {
+            name: "simple",
+            script: "X=$(echo hello)\necho R=$X\n",
+            expected: "R=hello",
+            xfail: false,
+        },
+        SubstTest {
+            name: "pipeline",
+            script: "X=$(echo hello | cat)\necho R=$X\n",
+            expected: "R=hello",
+            xfail: false,
+        },
+        SubstTest {
+            name: "file_read",
+            script: "X=$(head -1 /etc/passwd)\necho R=${X%%:*}\n",
+            expected: "R=root",
+            xfail: false,
+        },
+        SubstTest {
+            name: "file_pipe",
+            script: "X=$(cat /etc/passwd | head -1)\necho R=${X%%:*}\n",
+            expected: "R=root",
+            // Known bug: vfork children share kernel pipe file description
+            // for stdin. Pipeline children (head) consume stdin data,
+            // causing $() to return empty.
+            xfail: true,
+        },
+        SubstTest {
+            name: "multi_subst",
+            script: "A=$(echo first)\nB=$(echo second)\necho R=$A.$B\n",
+            expected: "R=first.second",
+            xfail: false,
+        },
+        SubstTest {
+            name: "os_detect",
+            script: "ARCH=$(uname -m)\nPLATFORM=$(uname -s)\necho R=$ARCH.$PLATFORM\n",
+            expected: "R=x86_64.Linux",
+            xfail: false,
+        },
+    ];
+
+    for &agent in AGENTS {
+        for test in tests {
+            let test_id = format!("SP.{}.{}", test.name, agent);
+            let resp = r
+                .send(
+                    agent,
+                    Command::Exec {
+                        args: vec!["/bin/sh".into()],
+                        timeout_secs: Some(15),
+                        stdin: Some(test.script.into()),
+                        background: false,
+                    },
+                )
+                .await;
+            let pass = matches!(
+                &resp,
+                Response::ExecResult { stdout, .. }
+                    if stdout.trim() == test.expected
+            );
+            if test.xfail {
+                r.record_xfail(
+                    &test_id,
+                    agent,
+                    pass,
+                    "vfork stdin pipe offset shared",
+                    &format!("{resp:?}"),
+                );
+            } else {
+                r.record(&test_id, agent, pass, &format!("{resp:?}"));
+            }
+        }
+    }
 }
