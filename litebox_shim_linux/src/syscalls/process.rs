@@ -1307,7 +1307,7 @@ impl<FS: ShimFS> Task<FS> {
 const MAX_VEC: usize = 4096; // limit count
 const MAX_TOTAL_BYTES: usize = 256 * 1024; // size cap
 
-/// Maximum shebang (#!) recursion depth, matching Linux `BINPRM_MAX_RECURSION`.
+/// Maximum shebang (#!) recursion depth
 const SHEBANG_MAX_RECURSION: u32 = 4;
 
 /// Maximum length of a shebang line that we inspect. Matches Linux `BINPRM_BUF_SIZE`.
