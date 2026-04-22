@@ -84,12 +84,20 @@ RUN mkdir -p /etc/dropbear \
     && dropbearkey -t ed25519 -f /etc/dropbear/dropbear_ed25519_host_key 2>/dev/null
 
 # VS Code CLI (latest stable).
+#
+# The CLI is installed as both 'code' (generic) and 'code-<COMMIT>'
+# (commit-specific).  The VS Code Remote-SSH install script checks for
+# 'code-<COMMIT>' and skips the download when it exists.
 RUN mkdir -p /root/.vscode-server \
     && curl -fsSL "https://code.visualstudio.com/sha/download?build=stable&os=cli-alpine-x64" \
        -o /tmp/vscode-cli.tar.gz \
     && tar xzf /tmp/vscode-cli.tar.gz -C /root/.vscode-server \
     && rm /tmp/vscode-cli.tar.gz \
-    && ls -la /root/.vscode-server/code
+    && VSCODE_COMMIT=$(/root/.vscode-server/code --version 2>/dev/null \
+       | grep -oP 'commit \K[a-f0-9]{40}') \
+    && cp /root/.vscode-server/code \
+          "/root/.vscode-server/code-${VSCODE_COMMIT}" \
+    && echo "CLI installed: code + code-${VSCODE_COMMIT}"
 
 # VS Code Server — version matched to CLI commit hash.
 RUN VSCODE_COMMIT=$(/root/.vscode-server/code --version 2>/dev/null | grep -oP 'commit \K[a-f0-9]{40}') \
