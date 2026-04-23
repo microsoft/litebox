@@ -121,7 +121,7 @@ struct TextSectionInfo {
 /// - trampoline size (8 bytes for 64-bit, 4 bytes for 32-bit)
 ///
 /// This layout allows loaders to read just the last 32/20 bytes to get the metadata. Even when
-/// no syscall instructions are patched, the rewriter still appends the header and the initial
+/// there is no syscall instruction in the binary, the rewriter still appends the header and the initial
 /// syscall-entry placeholder so the loader/audit path can tell the binary was processed.
 ///
 /// Returns the rewritten binary. Binaries that cannot or do not need to be
