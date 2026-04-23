@@ -2383,8 +2383,6 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
                     })?,
                 }
             }
-            // TODO: fcntl64 is identical to fcntl except certain commands (e.g., `F_OFD_SETLK`)
-            // that we don't support yet.
             Sysno::gettimeofday => sys_req!(Gettimeofday { tv:*, tz:* }),
             Sysno::clock_gettime => {
                 sys_req!(ClockGettime { clockid, tp: { =*> TimeParam::timespec_old } })
