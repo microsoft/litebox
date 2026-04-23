@@ -538,46 +538,8 @@ pub(crate) async fn cross_worker_file_tests(r: &mut TestRunner) {
             }
         }
 
-        // CWF.redirect: bash `cmd > file &` pattern (VS Code CLI pattern).
-        // Parent shell opens file for writing (redirect), forks, child
-        // inherits the write fd.  After delayed-fork migration, parent
-        // reads the file — this is the pattern that returns EIO.
-        {
-            let test_id = format!("CWF.redirect.{agent}");
-            let path = format!("/shared/cwf-redir-{agent}.txt");
-            let script = format!(
-                concat!(
-                    "rm -f {path}; touch {path}; ",
-                    "{exe} cross-worker-file write-and-hold /dev/null ",
-                    "> {path} 2>&1 &\n",
-                    "BGPID=$!\nsleep 3\ncat {path}\n",
-                    "kill $BGPID 2>/dev/null\n",
-                ),
-                path = path,
-                exe = self_exe,
-            );
-            let resp = r
-                .send(
-                    agent,
-                    Command::Exec {
-                        args: vec!["bash".into(), "-c".into(), script],
-                        timeout_secs: Some(15),
-                        stdin: None,
-                        background: false,
-                    },
-                )
-                .await;
-            // The child writes its harness banner to stdout (= the file).
-            let pass = matches!(
-                &resp,
-                Response::ExecResult { stdout, .. }
-                    if stdout.contains("harness")
-            );
-            r.record(&test_id, agent, pass, &format!("{resp:?}"));
-        }
-
         // CWF.self_open: child opens file itself (no inherited fd).
-        // This is the pattern that WORKS — contrast with CWF.redirect.
+        // Control test — child writes to the path directly, no redirect.
         {
             let test_id = format!("CWF.self_open.{agent}");
             let path = format!("/shared/cwf-self-{agent}.txt");
@@ -606,6 +568,108 @@ pub(crate) async fn cross_worker_file_tests(r: &mut TestRunner) {
                 &resp,
                 Response::ExecResult { stdout, .. }
                     if stdout.starts_with("line0")
+            );
+            r.record(&test_id, agent, pass, &format!("{resp:?}"));
+        }
+
+        // CWF.redirect_stdout: bash `cmd > file &` — child writes to stdout
+        // which bash redirects to a file.  Parent reads the file.
+        // This is the EXACT VS Code CLI pattern.
+        {
+            let test_id = format!("CWF.redirect_stdout.{agent}");
+            let path = format!("/shared/cwf-rstdout-{agent}.txt");
+            let script = format!(
+                concat!(
+                    "rm -f {path}; ",
+                    "{exe} cross-worker-file write-stdout ",
+                    "> {path} 2>&1 &\n",
+                    "BGPID=$!\nsleep 3\ncat {path}\n",
+                    "kill $BGPID 2>/dev/null\n",
+                ),
+                path = path,
+                exe = self_exe,
+            );
+            let resp = r
+                .send(
+                    agent,
+                    Command::Exec {
+                        args: vec!["bash".into(), "-c".into(), script],
+                        timeout_secs: Some(15),
+                        stdin: None,
+                        background: false,
+                    },
+                )
+                .await;
+            let pass = matches!(
+                &resp,
+                Response::ExecResult { stdout, .. }
+                    if stdout.contains("line0")
+            );
+            r.record(&test_id, agent, pass, &format!("{resp:?}"));
+        }
+
+        // CWF.redirect_exit: same as redirect_stdout but child exits quickly.
+        // Tests if data becomes visible after the worker child exits.
+        {
+            let test_id = format!("CWF.redirect_exit.{agent}");
+            let path = format!("/shared/cwf-rexit-{agent}.txt");
+            let script = format!(
+                concat!(
+                    "rm -f {path}; ",
+                    "{exe} echo-test ",
+                    "> {path} 2>&1\n",
+                    "cat {path}\n",
+                ),
+                path = path,
+                exe = self_exe,
+            );
+            let resp = r
+                .send(
+                    agent,
+                    Command::Exec {
+                        args: vec!["bash".into(), "-c".into(), script],
+                        timeout_secs: Some(15),
+                        stdin: None,
+                        background: false,
+                    },
+                )
+                .await;
+            let pass = matches!(
+                &resp,
+                Response::ExecResult { stdout, .. }
+                    if stdout.contains("ECHO_TEST_OK")
+            );
+            r.record(&test_id, agent, pass, &format!("{resp:?}"));
+        }
+
+        // CWF.builtin_redirect: shell builtin redirected to file.
+        // No exec, no delayed fork — data should always be visible.
+        {
+            let test_id = format!("CWF.builtin_redirect.{agent}");
+            let path = format!("/shared/cwf-builtin-{agent}.txt");
+            let script = format!(
+                concat!(
+                    "rm -f {path}; ",
+                    "echo builtin-data > {path}\n",
+                    "cat {path}\n",
+                ),
+                path = path,
+            );
+            let resp = r
+                .send(
+                    agent,
+                    Command::Exec {
+                        args: vec!["bash".into(), "-c".into(), script],
+                        timeout_secs: Some(10),
+                        stdin: None,
+                        background: false,
+                    },
+                )
+                .await;
+            let pass = matches!(
+                &resp,
+                Response::ExecResult { stdout, .. }
+                    if stdout.contains("builtin-data")
             );
             r.record(&test_id, agent, pass, &format!("{resp:?}"));
         }

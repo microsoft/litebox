@@ -456,6 +456,18 @@ fn main() {
                 }
                 std::process::exit(0);
             }
+            if sub == "write-stdout" {
+                // Write to stdout (for bash redirect tests).
+                // When bash does `cmd > file &`, stdout IS the file.
+                use std::io::Write;
+                for i in 0..5 {
+                    println!("line{i}");
+                }
+                std::io::stdout().flush().unwrap();
+                // Stay alive so parent can read the file concurrently.
+                std::thread::sleep(std::time::Duration::from_secs(10));
+                std::process::exit(0);
+            }
 
             // Parent mode: fork+exec child that writes to a file, then read it.
             let self_exe = std::env::current_exe().unwrap();
