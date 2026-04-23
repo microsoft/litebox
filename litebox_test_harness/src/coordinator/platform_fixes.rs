@@ -288,6 +288,7 @@ pub(crate) async fn run(r: &mut TestRunner) {
     nonpie_pipe_chain_tests(r).await;
     stdin_pipe_subst_tests(r).await;
     cross_worker_file_tests(r).await;
+    subst_capture_tests(r).await;
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -670,6 +671,108 @@ pub(crate) async fn cross_worker_file_tests(r: &mut TestRunner) {
                 &resp,
                 Response::ExecResult { stdout, .. }
                     if stdout.contains("builtin-data")
+            );
+            r.record(&test_id, agent, pass, &format!("{resp:?}"));
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// SC: $() command substitution capture — various commands
+// (readlink -f failure blocks VS Code Server startup)
+// ═══════════════════════════════════════════════════════════════════
+
+/// Tests that $() command substitution correctly captures output from
+/// various commands.  The VS Code Server startup script uses:
+///   ROOT="$(dirname "$(dirname "$(readlink -f "$0")")")"
+/// If readlink -f returns empty in $(), ROOT="" and the server can't
+/// find its own node binary.
+///
+/// Tests cover progressively more complex capture patterns:
+///   SC.echo       — $(echo hello)                   [baseline]
+///   SC.cat        — $(cat /etc/hostname)             [file read]
+///   SC.readlink   — $(readlink -f /usr/bin/bash)     [THE BUG]
+///   SC.dirname    — $(dirname /usr/bin/bash)         [path manipulation]
+///   SC.nested     — $(dirname $(readlink -f ...))    [nested subst]
+///   SC.vscode     — full VS Code ROOT= pattern       [end-to-end]
+///   SC.which      — $(which bash)                    [path search]
+///   SC.uname      — $(uname -m)                     [system info]
+pub(crate) async fn subst_capture_tests(r: &mut TestRunner) {
+    eprintln!("[platform] === Subst Capture ({} agents) ===", AGENTS.len());
+
+    struct Test {
+        name: &'static str,
+        script: &'static str,
+        check: fn(&str) -> bool,
+    }
+
+    let tests: &[Test] = &[
+        Test {
+            name: "echo",
+            script: "X=$(echo hello); echo $X",
+            check: |s| s.trim() == "hello",
+        },
+        Test {
+            name: "cat",
+            script: "X=$(cat /etc/hostname); echo $X",
+            check: |s| !s.trim().is_empty(),
+        },
+        Test {
+            name: "readlink",
+            script: "X=$(readlink -f /usr/bin/bash); echo $X",
+            check: |s| s.trim().contains("bash"),
+        },
+        Test {
+            name: "dirname",
+            script: "X=$(dirname /usr/bin/bash); echo $X",
+            check: |s| s.trim() == "/usr/bin",
+        },
+        Test {
+            name: "nested",
+            script: "X=$(dirname $(readlink -f /usr/bin/bash)); echo $X",
+            check: |s| !s.trim().is_empty() && s.trim() != "/",
+        },
+        Test {
+            name: "vscode_root",
+            script: concat!(
+                "SCRIPT=/root/.vscode-server/cli/servers/",
+                "Stable-10c8e557c8b9f9ed0a87f61f1c9a44bde731c409/",
+                "server/bin/code-server; ",
+                "ROOT=$(dirname $(dirname $(readlink -f $SCRIPT))); ",
+                "echo $ROOT",
+            ),
+            check: |s| s.trim().contains("server"),
+        },
+        Test {
+            name: "which",
+            script: "X=$(which bash); echo $X",
+            check: |s| s.trim().contains("bash"),
+        },
+        Test {
+            name: "uname",
+            script: "X=$(uname -m); echo $X",
+            check: |s| s.trim() == "x86_64",
+        },
+    ];
+
+    for &agent in AGENTS {
+        for test in tests {
+            let test_id = format!("SC.{}.{}", test.name, agent);
+            let resp = r
+                .send(
+                    agent,
+                    Command::Exec {
+                        args: vec!["bash".into(), "-c".into(), test.script.into()],
+                        timeout_secs: Some(10),
+                        stdin: None,
+                        background: false,
+                    },
+                )
+                .await;
+            let pass = matches!(
+                &resp,
+                Response::ExecResult { stdout, .. }
+                    if (test.check)(stdout)
             );
             r.record(&test_id, agent, pass, &format!("{resp:?}"));
         }

@@ -74,10 +74,13 @@ RUN curl -fsSL "https://nodejs.org/dist/${NODE_VERSION}/node-${NODE_VERSION}-lin
 FROM litebox-base AS litebox-vscode
 
 # Additional packages for VS Code Server mode.
+# Note: nodejs is NOT installed — the VS Code CLI bundles its own
+# Node.js at cli/servers/Stable-<commit>/server/node.  A system
+# nodejs (v18 from Ubuntu) can confuse the CLI into thinking the
+# server prerequisites aren't met.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    openssh-sftp-server dropbear-bin python3-minimal nodejs git wget \
-    && rm -rf /var/lib/apt/lists/* \
-    && node --version
+    openssh-sftp-server dropbear-bin python3-minimal git wget strace \
+    && rm -rf /var/lib/apt/lists/*
 
 # Dropbear SSH server.
 RUN mkdir -p /etc/dropbear \
