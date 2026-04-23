@@ -539,12 +539,55 @@ pub(crate) async fn cross_worker_file_tests(r: &mut TestRunner) {
         }
 
         // CWF.redirect: bash `cmd > file &` pattern (VS Code CLI pattern).
-        // Child keeps fd open (write-and-hold), parent cats the file.
+        // Parent shell opens file for writing (redirect), forks, child
+        // inherits the write fd.  After delayed-fork migration, parent
+        // reads the file — this is the pattern that returns EIO.
         {
             let test_id = format!("CWF.redirect.{agent}");
             let path = format!("/shared/cwf-redir-{agent}.txt");
             let script = format!(
-                "rm -f {path}; {exe} cross-worker-file write-and-hold {path} &\nBGPID=$!\nsleep 3\ncat {path}\nkill $BGPID 2>/dev/null\n",
+                concat!(
+                    "rm -f {path}; touch {path}; ",
+                    "{exe} cross-worker-file write-and-hold /dev/null ",
+                    "> {path} 2>&1 &\n",
+                    "BGPID=$!\nsleep 3\ncat {path}\n",
+                    "kill $BGPID 2>/dev/null\n",
+                ),
+                path = path,
+                exe = self_exe,
+            );
+            let resp = r
+                .send(
+                    agent,
+                    Command::Exec {
+                        args: vec!["bash".into(), "-c".into(), script],
+                        timeout_secs: Some(15),
+                        stdin: None,
+                        background: false,
+                    },
+                )
+                .await;
+            // The child writes its harness banner to stdout (= the file).
+            let pass = matches!(
+                &resp,
+                Response::ExecResult { stdout, .. }
+                    if stdout.contains("harness")
+            );
+            r.record(&test_id, agent, pass, &format!("{resp:?}"));
+        }
+
+        // CWF.self_open: child opens file itself (no inherited fd).
+        // This is the pattern that WORKS — contrast with CWF.redirect.
+        {
+            let test_id = format!("CWF.self_open.{agent}");
+            let path = format!("/shared/cwf-self-{agent}.txt");
+            let script = format!(
+                concat!(
+                    "rm -f {path}; ",
+                    "{exe} cross-worker-file write-and-hold {path} &\n",
+                    "BGPID=$!\nsleep 3\ncat {path}\n",
+                    "kill $BGPID 2>/dev/null\n",
+                ),
                 path = path,
                 exe = self_exe,
             );
