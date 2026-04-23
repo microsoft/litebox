@@ -676,6 +676,12 @@ mod cow_test {
                     ),
                     ("pipe_position_after_fork", test_pipe_position_after_fork),
                     ("pipe_position_child_reads", test_pipe_position_child_reads),
+                    ("inherited_fd_file_read", test_inherited_fd_file_read),
+                    ("inherited_fd_exec_read", test_inherited_fd_exec_read),
+                    (
+                        "inherited_fd_exec_keep_open",
+                        test_inherited_fd_exec_keep_open,
+                    ),
                 ];
                 let mut pass = 0;
                 let mut fail = 0;
@@ -706,6 +712,9 @@ mod cow_test {
                     "capture_with_preexisting_heap" => test_capture_with_preexisting_heap,
                     "pipe_position_after_fork" => test_pipe_position_after_fork,
                     "pipe_position_child_reads" => test_pipe_position_child_reads,
+                    "inherited_fd_file_read" => test_inherited_fd_file_read,
+                    "inherited_fd_exec_read" => test_inherited_fd_exec_read,
+                    "inherited_fd_exec_keep_open" => test_inherited_fd_exec_keep_open,
                     _ => {
                         eprintln!("unknown cow-test: {other}");
                         return 1;
@@ -1219,6 +1228,283 @@ mod cow_test {
                 "  pipe_position_child_reads: got {:?} (expected LINE2 or LINE3)",
                 got
             );
+            return false;
+        }
+        true
+    }
+
+    /// Minimal reproduction of the VS Code CLI log file bug.
+    ///
+    /// Pattern: parent opens file for writing (simulating shell redirect),
+    /// forks, child writes through inherited fd, parent reads via new open.
+    ///
+    /// On native Linux: parent reads the child's data.
+    /// On litebox: parent gets EIO because the delayed-fork fd bridging
+    /// breaks the parent's ability to open the same file for reading.
+    fn test_inherited_fd_file_read() -> bool {
+        let path = c"/tmp/cow-inherited-fd-test.txt";
+
+        // Clean up from prior run.
+        unsafe { libc::unlink(path.as_ptr()) };
+
+        // 1. Parent opens file for writing (like shell `> file` redirect).
+        let write_fd = unsafe {
+            libc::open(
+                path.as_ptr(),
+                libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC,
+                0o644,
+            )
+        };
+        if write_fd < 0 {
+            println!("  inherited_fd_file_read: open for write failed");
+            return false;
+        }
+
+        // 2. Fork — child inherits the write fd.
+        let pid = unsafe { libc::fork() };
+        if pid < 0 {
+            unsafe { libc::close(write_fd) };
+            println!("  inherited_fd_file_read: fork failed");
+            return false;
+        }
+        if pid == 0 {
+            // Child: write data through the inherited fd, stay alive.
+            let data = b"child-wrote-this\n";
+            unsafe { libc::write(write_fd, data.as_ptr() as *const _, data.len()) };
+            // Sleep to keep the child alive while parent reads.
+            unsafe { libc::sleep(10) };
+            unsafe { libc::_exit(0) };
+        }
+
+        // 3. Parent: close OUR write fd (we only need to read).
+        unsafe { libc::close(write_fd) };
+
+        // Give child time to write.
+        unsafe { libc::sleep(2) };
+
+        // 4. Parent: open the SAME file for reading (new fd).
+        let read_fd = unsafe { libc::open(path.as_ptr(), libc::O_RDONLY, 0) };
+        if read_fd < 0 {
+            let e = std::io::Error::last_os_error();
+            println!("  inherited_fd_file_read: open for read failed: {e}");
+            unsafe {
+                libc::kill(pid, libc::SIGKILL);
+                libc::waitpid(pid, std::ptr::null_mut(), 0);
+            }
+            return false;
+        }
+
+        let mut buf = [0u8; 256];
+        let n = unsafe { libc::read(read_fd, buf.as_mut_ptr() as *mut _, buf.len()) };
+        unsafe { libc::close(read_fd) };
+
+        // Clean up child.
+        unsafe {
+            libc::kill(pid, libc::SIGKILL);
+            libc::waitpid(pid, std::ptr::null_mut(), 0);
+            libc::unlink(path.as_ptr());
+        }
+
+        if n <= 0 {
+            let e = if n < 0 {
+                std::io::Error::last_os_error().to_string()
+            } else {
+                "0 bytes".to_string()
+            };
+            println!("  inherited_fd_file_read: read failed: {e}");
+            return false;
+        }
+        let got = std::str::from_utf8(&buf[..n as usize]).unwrap_or("???");
+        if !got.contains("child-wrote-this") {
+            println!("  inherited_fd_file_read: unexpected content: {got:?}");
+            return false;
+        }
+        true
+    }
+
+    /// Same as inherited_fd_file_read but with fork+exec.
+    ///
+    /// The child dup2s the inherited write fd to stdout, then execs
+    /// a command. The exec triggers delayed-fork migration. The parent
+    /// reads the file after the child has written.
+    ///
+    /// This is the exact VS Code CLI pattern:
+    ///   CLI > log 2>&1 &    ← shell opens file, forks, child inherits
+    fn test_inherited_fd_exec_read() -> bool {
+        let path = c"/tmp/cow-inherited-exec-test.txt";
+        let self_exe = std::env::current_exe().unwrap();
+        let self_exe_c = std::ffi::CString::new(self_exe.to_str().unwrap()).unwrap();
+
+        unsafe { libc::unlink(path.as_ptr()) };
+
+        // Parent opens file for writing.
+        let write_fd = unsafe {
+            libc::open(
+                path.as_ptr(),
+                libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC,
+                0o644,
+            )
+        };
+        if write_fd < 0 {
+            println!("  inherited_fd_exec_read: open for write failed");
+            return false;
+        }
+
+        let pid = unsafe { libc::fork() };
+        if pid < 0 {
+            unsafe { libc::close(write_fd) };
+            println!("  inherited_fd_exec_read: fork failed");
+            return false;
+        }
+        if pid == 0 {
+            // Child: dup2 write fd to stdout, exec self with write-and-hold.
+            unsafe {
+                libc::dup2(write_fd, 1); // stdout = file
+                libc::dup2(write_fd, 2); // stderr = file
+                if write_fd > 2 {
+                    libc::close(write_fd);
+                }
+            }
+            let arg1 = c"cross-worker-file";
+            let arg2 = c"write-and-hold";
+            let arg3 = c"/dev/null"; // write output goes to file via stdout
+            let args = [
+                self_exe_c.as_ptr(),
+                arg1.as_ptr(),
+                arg2.as_ptr(),
+                arg3.as_ptr(),
+                std::ptr::null(),
+            ];
+            unsafe { libc::execv(self_exe_c.as_ptr(), args.as_ptr()) };
+            unsafe { libc::_exit(127) };
+        }
+
+        // Parent: close write fd, wait for child to write.
+        unsafe { libc::close(write_fd) };
+        unsafe { libc::sleep(3) };
+
+        // Read the file.
+        let read_fd = unsafe { libc::open(path.as_ptr(), libc::O_RDONLY, 0) };
+        if read_fd < 0 {
+            let e = std::io::Error::last_os_error();
+            println!("  inherited_fd_exec_read: open for read failed: {e}");
+            unsafe {
+                libc::kill(pid, libc::SIGKILL);
+                libc::waitpid(pid, std::ptr::null_mut(), 0);
+            }
+            return false;
+        }
+
+        let mut buf = [0u8; 256];
+        let n = unsafe { libc::read(read_fd, buf.as_mut_ptr() as *mut _, buf.len()) };
+        unsafe { libc::close(read_fd) };
+
+        unsafe {
+            libc::kill(pid, libc::SIGKILL);
+            libc::waitpid(pid, std::ptr::null_mut(), 0);
+            libc::unlink(path.as_ptr());
+        }
+
+        if n <= 0 {
+            let e = if n < 0 {
+                std::io::Error::last_os_error().to_string()
+            } else {
+                "0 bytes".to_string()
+            };
+            println!("  inherited_fd_exec_read: read failed: {e}");
+            return false;
+        }
+        // The child exec'd write-and-hold which writes to /dev/null,
+        // but its stdout (=our file) gets the harness banner.
+        let got = std::str::from_utf8(&buf[..n as usize]).unwrap_or("???");
+        if got.is_empty() {
+            println!("  inherited_fd_exec_read: empty content");
+            return false;
+        }
+        true
+    }
+
+    /// Like inherited_fd_exec_read, but the parent KEEPS the write fd open
+    /// while reading. This matches bash's `CMD > file &` pattern exactly:
+    /// bash doesn't close the redirect fd until the command group ends.
+    fn test_inherited_fd_exec_keep_open() -> bool {
+        let path = c"/tmp/cow-inherited-keep-test.txt";
+        let self_exe = std::env::current_exe().unwrap();
+        let self_exe_c = std::ffi::CString::new(self_exe.to_str().unwrap()).unwrap();
+
+        unsafe { libc::unlink(path.as_ptr()) };
+
+        // Parent opens file for writing.
+        let write_fd = unsafe {
+            libc::open(
+                path.as_ptr(),
+                libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC,
+                0o644,
+            )
+        };
+        if write_fd < 0 {
+            println!("  inherited_fd_exec_keep_open: open failed");
+            return false;
+        }
+
+        let pid = unsafe { libc::fork() };
+        if pid < 0 {
+            unsafe { libc::close(write_fd) };
+            return false;
+        }
+        if pid == 0 {
+            // Child: dup2 write fd to stdout, exec.
+            unsafe {
+                libc::dup2(write_fd, 1);
+                libc::dup2(write_fd, 2);
+                if write_fd > 2 {
+                    libc::close(write_fd);
+                }
+            }
+            let args = [
+                self_exe_c.as_ptr(),
+                c"cross-worker-file".as_ptr(),
+                c"write-and-hold".as_ptr(),
+                c"/dev/null".as_ptr(),
+                std::ptr::null(),
+            ];
+            unsafe { libc::execv(self_exe_c.as_ptr(), args.as_ptr()) };
+            unsafe { libc::_exit(127) };
+        }
+
+        // Parent: do NOT close write_fd (bash keeps it open).
+        unsafe { libc::sleep(3) };
+
+        // Read via new fd while parent still holds write_fd open.
+        let read_fd = unsafe { libc::open(path.as_ptr(), libc::O_RDONLY, 0) };
+        if read_fd < 0 {
+            let e = std::io::Error::last_os_error();
+            println!("  inherited_fd_exec_keep_open: open for read failed: {e}");
+            unsafe {
+                libc::close(write_fd);
+                libc::kill(pid, libc::SIGKILL);
+                libc::waitpid(pid, std::ptr::null_mut(), 0);
+            }
+            return false;
+        }
+
+        let mut buf = [0u8; 256];
+        let n = unsafe { libc::read(read_fd, buf.as_mut_ptr() as *mut _, buf.len()) };
+        unsafe {
+            libc::close(read_fd);
+            libc::close(write_fd);
+            libc::kill(pid, libc::SIGKILL);
+            libc::waitpid(pid, std::ptr::null_mut(), 0);
+            libc::unlink(path.as_ptr());
+        }
+
+        if n <= 0 {
+            let e = if n < 0 {
+                std::io::Error::last_os_error().to_string()
+            } else {
+                "0 bytes".to_string()
+            };
+            println!("  inherited_fd_exec_keep_open: read failed: {e}");
             return false;
         }
         true
