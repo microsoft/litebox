@@ -21,6 +21,7 @@ use litebox_common_linux::{
     IoReadVec, IoWriteVec, IoctlArg, TimeParam, errno::Errno,
 };
 use litebox_platform_multiplex::Platform;
+use thiserror::Error;
 
 use crate::{ConstPtr, GlobalState, MutPtr, ShimFS, Task};
 use core::sync::atomic::{AtomicUsize, Ordering};
@@ -598,64 +599,114 @@ impl<FS: ShimFS> Task<FS> {
     }
 
     pub(crate) fn do_close(&self, raw_fd: usize) -> Result<(), Errno> {
+        self.do_close_and_replace::<FS>(raw_fd, None)
+    }
+
+    /// Close the file at `raw_fd` and optionally place a new file in the same slot.
+    ///
+    /// This function ensure `close` and `insert` are done atomically.
+    fn do_close_and_replace<S: FdEnabledSubsystem>(
+        &self,
+        raw_fd: usize,
+        replace: Option<TypedFd<S>>,
+    ) -> Result<(), Errno> {
+        enum ConsumedFd<FS: ShimFS> {
+            Fs(alloc::sync::Arc<TypedFd<FS>>),
+            Network(alloc::sync::Arc<TypedFd<litebox::net::Network<Platform>>>),
+            Pipes(alloc::sync::Arc<TypedFd<litebox::pipes::Pipes<Platform>>>),
+            Eventfd(alloc::sync::Arc<TypedFd<super::eventfd::EventfdSubsystem>>),
+            Epoll(alloc::sync::Arc<TypedFd<super::epoll::EpollSubsystem<FS>>>),
+            Unix(alloc::sync::Arc<TypedFd<super::unix::UnixSocketSubsystem<FS>>>),
+        }
+
         let files = self.files.borrow();
         let mut rds = files.raw_descriptor_store.write();
-        match rds.fd_consume_raw_integer(raw_fd) {
-            Ok(fd) => {
-                drop(rds);
-                return files.fs.close(&fd).map_err(Errno::from);
-            }
+        let consumed: ConsumedFd<FS> = match rds.fd_consume_raw_integer::<FS>(raw_fd) {
+            Ok(fd) => ConsumedFd::Fs(fd),
             Err(litebox::fd::ErrRawIntFd::NotFound) => {
+                if let Some(new_fd) = replace {
+                    let success = rds.fd_into_specific_raw_integer(new_fd, raw_fd);
+                    assert!(success, "raw_fd slot is empty, so insert must succeed");
+                }
                 return Err(Errno::EBADF);
             }
             Err(litebox::fd::ErrRawIntFd::InvalidSubsystem) => {
-                // fallthrough
+                if let Ok(fd) =
+                    rds.fd_consume_raw_integer::<litebox::net::Network<Platform>>(raw_fd)
+                {
+                    ConsumedFd::Network(fd)
+                } else if let Ok(fd) =
+                    rds.fd_consume_raw_integer::<litebox::pipes::Pipes<Platform>>(raw_fd)
+                {
+                    ConsumedFd::Pipes(fd)
+                } else if let Ok(fd) =
+                    rds.fd_consume_raw_integer::<super::eventfd::EventfdSubsystem>(raw_fd)
+                {
+                    ConsumedFd::Eventfd(fd)
+                } else if let Ok(fd) =
+                    rds.fd_consume_raw_integer::<super::epoll::EpollSubsystem<FS>>(raw_fd)
+                {
+                    ConsumedFd::Epoll(fd)
+                } else if let Ok(fd) =
+                    rds.fd_consume_raw_integer::<super::unix::UnixSocketSubsystem<FS>>(raw_fd)
+                {
+                    ConsumedFd::Unix(fd)
+                } else {
+                    unreachable!("all subsystems covered")
+                }
+            }
+        };
+
+        // Insert the replacement into the now-vacated slot while still holding the lock.
+        if let Some(new_fd) = replace {
+            let success = rds.fd_into_specific_raw_integer(new_fd, raw_fd);
+            assert!(
+                success,
+                "we just consumed this raw_fd, so it must be available"
+            );
+        }
+        drop(rds);
+
+        if let Ok(fd) = i32::try_from(raw_fd) {
+            self.finalize_elf_patch(fd);
+        }
+
+        match consumed {
+            ConsumedFd::Fs(fd) => files.fs.close(&fd).map_err(Errno::from),
+            ConsumedFd::Network(fd) => self.global.close_socket(&self.wait_cx(), fd),
+            ConsumedFd::Pipes(fd) => self.global.pipes.close(&fd).map_err(Errno::from),
+            ConsumedFd::Eventfd(fd) => {
+                let entry = {
+                    let mut dt = self.global.litebox.descriptor_table_mut();
+                    dt.remove(&fd)
+                };
+                // do not hold any locks while dropping the entry
+                drop(entry);
+                Ok(())
+            }
+            ConsumedFd::Epoll(fd) => {
+                let entry = {
+                    let mut dt = self.global.litebox.descriptor_table_mut();
+                    dt.remove(&fd)
+                };
+                // do not hold any locks while dropping the entry
+                drop(entry);
+                Ok(())
+            }
+            ConsumedFd::Unix(fd) => {
+                let entry = {
+                    let mut dt = self.global.litebox.descriptor_table_mut();
+                    dt.remove(&fd)
+                };
+                // do not hold any locks while dropping the entry
+                drop(entry);
+                Ok(())
             }
         }
-        if let Ok(fd) = rds.fd_consume_raw_integer(raw_fd) {
-            drop(rds);
-            return self.global.close_socket(&self.wait_cx(), fd);
-        }
-        if let Ok(fd) = rds.fd_consume_raw_integer(raw_fd) {
-            drop(rds);
-            return self.global.pipes.close(&fd).map_err(Errno::from);
-        }
-        if let Ok(fd) = rds.fd_consume_raw_integer::<super::eventfd::EventfdSubsystem>(raw_fd) {
-            drop(rds);
-            let entry = {
-                let mut dt = self.global.litebox.descriptor_table_mut();
-                dt.remove(&fd)
-            };
-            drop(entry);
-            return Ok(());
-        }
-        if let Ok(fd) = rds.fd_consume_raw_integer::<super::epoll::EpollSubsystem<FS>>(raw_fd) {
-            drop(rds);
-            let entry = {
-                let mut dt = self.global.litebox.descriptor_table_mut();
-                dt.remove(&fd)
-            };
-            drop(entry);
-            return Ok(());
-        }
-        if let Ok(fd) = rds.fd_consume_raw_integer::<super::unix::UnixSocketSubsystem<FS>>(raw_fd) {
-            drop(rds);
-            let entry = {
-                let mut dt = self.global.litebox.descriptor_table_mut();
-                dt.remove(&fd)
-            };
-            drop(entry);
-            return Ok(());
-        }
-        // All the above cases should cover all the known subsystems, and we've already
-        // early-handled the "raw FD not found" case.
-        unreachable!()
     }
 
     /// Handle syscall `close`
     pub(crate) fn sys_close(&self, fd: i32) -> Result<(), Errno> {
-        self.finalize_elf_patch(fd);
-
         let Ok(raw_fd) = u32::try_from(fd).and_then(usize::try_from) else {
             return Err(Errno::EBADF);
         };
@@ -1306,22 +1357,21 @@ impl<FS: ShimFS> Task<FS> {
                     .flatten()
             }
             FcntlArg::DUPFD { cloexec, min_fd } => {
-                let max_fd = self
-                    .process()
-                    .limits
-                    .get_rlimit_cur(litebox_common_linux::RlimitResource::NOFILE);
-                if min_fd as usize >= max_fd {
-                    return Err(Errno::EINVAL);
-                }
-                let new_file = self.do_dup_inner(
-                    desc,
-                    if cloexec {
-                        OFlags::CLOEXEC
-                    } else {
-                        OFlags::empty()
-                    },
-                    DupFdRequest::LowestAtOrAbove(min_fd as usize),
-                )?;
+                let new_file = self
+                    .do_dup_inner(
+                        desc,
+                        if cloexec {
+                            OFlags::CLOEXEC
+                        } else {
+                            OFlags::empty()
+                        },
+                        DupFdRequest::LowestAtOrAbove(min_fd as usize),
+                    )
+                    .map_err(|e| match e {
+                        DupFdError::BadFd => Errno::EBADF,
+                        DupFdError::TooManyFiles => Errno::EMFILE,
+                        DupFdError::TargetFdExceedsLimit => Errno::EINVAL,
+                    })?;
                 Ok(new_file.try_into().unwrap())
             }
             _ => unimplemented!(),
@@ -2022,7 +2072,7 @@ impl<FS: ShimFS> Task<FS> {
         Ok(count)
     }
 
-    fn do_dup(&self, file: usize, flags: OFlags) -> Result<usize, Errno> {
+    fn do_dup(&self, file: usize, flags: OFlags) -> Result<usize, DupFdError> {
         self.do_dup_inner(file, flags, DupFdRequest::LowestAvailable)
     }
 
@@ -2031,30 +2081,32 @@ impl<FS: ShimFS> Task<FS> {
         file: usize,
         flags: OFlags,
         target: DupFdRequest,
-    ) -> Result<usize, Errno> {
+    ) -> Result<usize, DupFdError> {
         fn dup<FS: ShimFS, S: FdEnabledSubsystem>(
-            global: &GlobalState<FS>,
+            task: &Task<FS>,
             files: &FilesState<FS>,
             fd: &TypedFd<S>,
             close_on_exec: bool,
             target: DupFdRequest,
-        ) -> Result<usize, Errno> {
-            let mut dt = global.litebox.descriptor_table_mut();
-            let fd: TypedFd<_> = dt.duplicate(fd).ok_or(Errno::EBADF)?;
+        ) -> Result<usize, DupFdError> {
+            let mut dt = task.global.litebox.descriptor_table_mut();
+            let fd: TypedFd<_> = dt.duplicate(fd).ok_or(DupFdError::BadFd)?;
             if close_on_exec {
                 let old = dt.set_fd_metadata(&fd, FileDescriptorFlags::FD_CLOEXEC);
                 assert!(old.is_none());
             }
-            let mut rds = files.raw_descriptor_store.write();
+            drop(dt);
             match target {
                 DupFdRequest::Exact(target) => {
-                    if !rds.fd_into_specific_raw_integer(fd, target) {
-                        return Err(Errno::EBADF);
-                    }
+                    let _ = task.do_close_and_replace(target, Some(fd));
                     Ok(target)
                 }
-                DupFdRequest::LowestAvailable => Ok(rds.fd_into_raw_integer(fd)),
+                DupFdRequest::LowestAvailable => {
+                    let rds = &mut *files.raw_descriptor_store.write();
+                    Ok(rds.fd_into_raw_integer(fd))
+                }
                 DupFdRequest::LowestAtOrAbove(min_fd) => {
+                    let rds = &mut *files.raw_descriptor_store.write();
                     let mut raw_fd = min_fd;
                     for occupied_raw_fd in rds.iter_alive().skip_while(|&fd| fd < min_fd) {
                         if occupied_raw_fd != raw_fd {
@@ -2068,29 +2120,35 @@ impl<FS: ShimFS> Task<FS> {
                 }
             }
         }
+        let max_fd = self
+            .process()
+            .limits
+            .get_rlimit_cur(litebox_common_linux::RlimitResource::NOFILE);
+        match target {
+            DupFdRequest::Exact(fd) if fd >= max_fd => {
+                return Err(DupFdError::TargetFdExceedsLimit);
+            }
+            DupFdRequest::LowestAtOrAbove(min_fd) if min_fd >= max_fd => {
+                return Err(DupFdError::TargetFdExceedsLimit);
+            }
+            _ => {}
+        }
         let close_on_exec = flags.contains(OFlags::CLOEXEC);
         let files = self.files.borrow();
-        let new_fd = files.run_on_raw_fd(
-            file,
-            |fd| dup(&self.global, &files, fd, close_on_exec, target),
-            |fd| dup(&self.global, &files, fd, close_on_exec, target),
-            |fd| dup(&self.global, &files, fd, close_on_exec, target),
-            |fd| dup(&self.global, &files, fd, close_on_exec, target),
-            |fd| dup(&self.global, &files, fd, close_on_exec, target),
-            |fd| dup(&self.global, &files, fd, close_on_exec, target),
-        )??;
-        if matches!(
-            target,
-            DupFdRequest::LowestAvailable | DupFdRequest::LowestAtOrAbove(_)
-        ) {
-            let max_fd = self
-                .process()
-                .limits
-                .get_rlimit_cur(litebox_common_linux::RlimitResource::NOFILE);
-            if new_fd >= max_fd {
-                self.do_close(new_fd)?;
-                return Err(Errno::EMFILE);
-            }
+        let new_fd = files
+            .run_on_raw_fd(
+                file,
+                |fd| dup(self, &files, fd, close_on_exec, target),
+                |fd| dup(self, &files, fd, close_on_exec, target),
+                |fd| dup(self, &files, fd, close_on_exec, target),
+                |fd| dup(self, &files, fd, close_on_exec, target),
+                |fd| dup(self, &files, fd, close_on_exec, target),
+                |fd| dup(self, &files, fd, close_on_exec, target),
+            )
+            .map_err(|_| DupFdError::BadFd)??;
+        if new_fd >= max_fd {
+            let _ = self.do_close(new_fd);
+            return Err(DupFdError::TooManyFiles);
         }
         Ok(new_fd)
     }
@@ -2135,26 +2193,21 @@ impl<FS: ShimFS> Task<FS> {
                     Ok(oldfd)
                 };
             }
-            // Close whatever is at newfd before duping into it.
-            // Finalize any in-progress ELF patching for the target fd first,
-            // since dup2/dup3 implicitly closes it without going through
-            // sys_close.
             let newfd_usize = usize::try_from(newfd).or(Err(Errno::EBADF))?;
-            if let Ok(fd) = i32::try_from(newfd) {
-                self.finalize_elf_patch(fd);
-            }
-            let _ = self.do_close(newfd_usize);
             self.do_dup_inner(
                 oldfd_usize,
                 flags.unwrap_or(OFlags::empty()),
                 DupFdRequest::Exact(newfd_usize),
-            )?;
-            Ok(newfd)
+            )
         } else {
             // dup
-            let new_file = self.do_dup(oldfd_usize, flags.unwrap_or(OFlags::empty()))?;
-            Ok(u32::try_from(new_file).unwrap())
+            self.do_dup(oldfd_usize, flags.unwrap_or(OFlags::empty()))
         }
+        .map_err(|e| match e {
+            DupFdError::BadFd | DupFdError::TargetFdExceedsLimit => Errno::EBADF,
+            DupFdError::TooManyFiles => Errno::EMFILE,
+        })
+        .map(|new_fd| u32::try_from(new_fd).unwrap())
     }
 }
 
@@ -2162,7 +2215,18 @@ impl<FS: ShimFS> Task<FS> {
 enum DupFdRequest {
     LowestAvailable,
     LowestAtOrAbove(usize),
+    /// Duplicate to the specified fd, closing it first if it's open.
     Exact(usize),
+}
+
+#[derive(Error, Debug)]
+enum DupFdError {
+    #[error("Bad file descriptor")]
+    BadFd,
+    #[error("Too many open files")]
+    TooManyFiles,
+    #[error("Target fd exceeds process limit")]
+    TargetFdExceedsLimit,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
