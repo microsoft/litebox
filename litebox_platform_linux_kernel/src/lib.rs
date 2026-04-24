@@ -459,7 +459,7 @@ impl<Host: HostInterface, const ALIGN: usize> PageManagementProvider<ALIGN> for 
             .ok_or(litebox::platform::page_mgmt::RemapError::Unaligned)?;
         let new_range = PageRange::new(new_range.start, new_range.end)
             .ok_or(litebox::platform::page_mgmt::RemapError::Unaligned)?;
-        if old_range.start.max(new_range.start) <= old_range.end.min(new_range.end) {
+        if old_range.start.max(new_range.start) < old_range.end.min(new_range.end) {
             return Err(litebox::platform::page_mgmt::RemapError::Overlapping);
         }
         unsafe { self.page_table.remap_pages(old_range, new_range) }
