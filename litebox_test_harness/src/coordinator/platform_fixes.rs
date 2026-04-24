@@ -290,6 +290,7 @@ pub(crate) async fn run(r: &mut TestRunner) {
     cross_worker_file_tests(r).await;
     subst_capture_tests(r).await;
     concurrent_fork_tests(r).await;
+    touch_redirect_tests(r).await;
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -888,6 +889,121 @@ pub(crate) async fn concurrent_fork_tests(r: &mut TestRunner) {
             if let Some(pid) = pid {
                 let _ = r.send(*agent, Command::Kill { pid: *pid }).await;
             }
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// TR: Touch + redirect file coherence
+// (9P cache stale inode after touch + fork+exec redirect)
+// ═══════════════════════════════════════════════════════════════════
+
+/// When a file is pre-created with `touch`, then a fork+exec'd binary
+/// writes to it via shell redirect (`cmd > file &`), the parent's
+/// `cat` of the file must see the child's output.
+///
+/// The VS Code install script does:
+///   touch "$LOG"; chmod 600 "$LOG"
+///   CLI > "$LOG" 2>&1 < /dev/null &
+///   cat "$LOG"   ← must see CLI output
+///
+/// Tests:
+///   TR.no_touch      — no pre-creation, redirect creates file (control)
+///   TR.touch          — touch before redirect
+///   TR.touch_chmod    — touch + chmod before redirect (VS Code pattern)
+///   TR.echo_touch     — echo > file before redirect (pre-create with data)
+///   TR.builtin_touch  — touch + builtin redirect (no fork+exec)
+pub(crate) async fn touch_redirect_tests(r: &mut TestRunner) {
+    eprintln!(
+        "[platform] === Touch+Redirect ({} agents) ===",
+        AGENTS.len()
+    );
+
+    let self_exe = r.self_exe.clone();
+
+    struct TRTest {
+        name: &'static str,
+        script_template: &'static str,
+        check: fn(&str) -> bool,
+    }
+
+    let tests: &[TRTest] = &[
+        TRTest {
+            name: "no_touch",
+            script_template: concat!(
+                "rm -f {path}; ",
+                "{exe} echo-test > {path} 2>&1 &\n",
+                "BGPID=$!\nsleep 2\ncat {path}\n",
+                "kill $BGPID 2>/dev/null\n",
+            ),
+            check: |s| s.contains("ECHO_TEST_OK"),
+        },
+        TRTest {
+            name: "touch",
+            script_template: concat!(
+                "rm -f {path}; touch {path}; ",
+                "{exe} echo-test > {path} 2>&1 &\n",
+                "BGPID=$!\nsleep 2\ncat {path}\n",
+                "kill $BGPID 2>/dev/null\n",
+            ),
+            check: |s| s.contains("ECHO_TEST_OK"),
+        },
+        TRTest {
+            name: "touch_chmod",
+            script_template: concat!(
+                "rm -f {path}; touch {path}; chmod 600 {path}; ",
+                "{exe} echo-test > {path} 2>&1 &\n",
+                "BGPID=$!\nsleep 2\ncat {path}\n",
+                "kill $BGPID 2>/dev/null\n",
+            ),
+            check: |s| s.contains("ECHO_TEST_OK"),
+        },
+        TRTest {
+            name: "echo_touch",
+            script_template: concat!(
+                "rm -f {path}; echo init > {path}; ",
+                "{exe} echo-test > {path} 2>&1 &\n",
+                "BGPID=$!\nsleep 2\ncat {path}\n",
+                "kill $BGPID 2>/dev/null\n",
+            ),
+            check: |s| s.contains("ECHO_TEST_OK"),
+        },
+        TRTest {
+            name: "builtin_touch",
+            script_template: concat!(
+                "rm -f {path}; touch {path}; chmod 600 {path}; ",
+                "echo builtin-data > {path} &\n",
+                "wait\ncat {path}\n",
+            ),
+            check: |s| s.contains("builtin-data"),
+        },
+    ];
+
+    for &agent in AGENTS {
+        for test in tests {
+            let test_id = format!("TR.{}.{}", test.name, agent);
+            let path = format!("/shared/tr-{}-{}.txt", test.name, agent);
+            let script = test
+                .script_template
+                .replace("{path}", &path)
+                .replace("{exe}", &self_exe);
+            let resp = r
+                .send(
+                    agent,
+                    Command::Exec {
+                        args: vec!["bash".into(), "-c".into(), script],
+                        timeout_secs: Some(10),
+                        stdin: None,
+                        background: false,
+                    },
+                )
+                .await;
+            let pass = matches!(
+                &resp,
+                Response::ExecResult { stdout, .. }
+                    if (test.check)(stdout)
+            );
+            r.record(&test_id, agent, pass, &format!("{resp:?}"));
         }
     }
 }
