@@ -453,6 +453,99 @@ impl<FS: ShimFS> Task<FS> {
         }
     }
 
+    /// Rewrite `/proc/<N>/...` → `/proc/self/...` when N is the current
+    /// process's PID. Returns `Some(rewritten)` if rewritten, `None` if
+    /// the path doesn't match `/proc/<digit>/...`.
+    fn rewrite_proc_pid_to_self<'a>(&self, path: &'a str) -> Option<alloc::string::String> {
+        let rest = path.strip_prefix("/proc/")?;
+        let slash_pos = rest.find('/').unwrap_or(rest.len());
+        let pid_str = &rest[..slash_pos];
+        let pid_num: i32 = pid_str.parse().ok()?;
+        if pid_num == self.pid {
+            let suffix = &rest[slash_pos..]; // includes leading '/' or empty
+            Some(alloc::format!("/proc/self{suffix}"))
+        } else {
+            None
+        }
+    }
+
+    /// Check if `path` is `/proc/<N>` or `/proc/<N>/...` where N is a
+    /// positive integer PID. In the sandbox all guest processes are
+    /// considered alive, so any positive numeric PID returns Some.
+    fn proc_pid_if_known(&self, path: &str) -> Option<i32> {
+        let rest = path.strip_prefix("/proc/")?;
+        let slash_pos = rest.find('/').unwrap_or(rest.len());
+        let pid_str = &rest[..slash_pos];
+        let pid_num: i32 = pid_str.parse().ok()?;
+        if pid_num > 0 { Some(pid_num) } else { None }
+    }
+
+    /// Return the subpath after `/proc/<N>`, e.g. for `/proc/42/stat`
+    /// returns `"/stat"`. For `/proc/42` returns `""`.
+    fn proc_pid_subpath<'a>(&self, path: &'a str) -> &'a str {
+        let rest = path.strip_prefix("/proc/").unwrap_or("");
+        let slash_pos = rest.find('/').unwrap_or(rest.len());
+        &rest[slash_pos..]
+    }
+
+    /// Generate synthetic `/proc/<pid>/stat` content.
+    /// Minimal but sufficient for sysinfo to detect process liveness.
+    fn synthetic_proc_stat(&self, pid: i32) -> alloc::string::String {
+        // Format: pid (comm) S ppid pgid sid ...
+        // sysinfo only needs the first few fields to exist.
+        let comm_bytes = self.comm.get();
+        let comm = core::str::from_utf8(
+            &comm_bytes[..comm_bytes
+                .iter()
+                .position(|&b| b == 0)
+                .unwrap_or(comm_bytes.len())],
+        )
+        .unwrap_or("litebox");
+        alloc::format!(
+            "{pid} ({comm}) S {ppid} {pgid} {sid} 0 -1 0 0 0 0 0 0 0 0 0 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n",
+            pid = pid,
+            comm = comm,
+            ppid = self.ppid,
+            pgid = self.pid,
+            sid = self.pid,
+        )
+    }
+
+    /// Generate synthetic `/proc/<pid>/cmdline` content.
+    fn synthetic_proc_cmdline(&self) -> alloc::vec::Vec<u8> {
+        // NUL-separated argv. Use the exe path as a minimal approximation.
+        let exe = self.fs.borrow().exe_path.read().clone();
+        if exe.is_empty() {
+            alloc::vec![0]
+        } else {
+            let mut v = exe.into_bytes();
+            v.push(0);
+            v
+        }
+    }
+
+    /// Generate synthetic `/proc/<pid>/status` content.
+    fn synthetic_proc_status(&self, pid: i32) -> alloc::string::String {
+        let comm_bytes = self.comm.get();
+        let comm = core::str::from_utf8(
+            &comm_bytes[..comm_bytes
+                .iter()
+                .position(|&b| b == 0)
+                .unwrap_or(comm_bytes.len())],
+        )
+        .unwrap_or("litebox");
+        alloc::format!(
+            "Name:\t{comm}\nUmask:\t0022\nState:\tS (sleeping)\nTgid:\t{pid}\nPid:\t{pid}\nPPid:\t{ppid}\nUid:\t{uid}\t{euid}\t{uid}\t{euid}\nGid:\t{gid}\t{egid}\t{gid}\t{egid}\n",
+            comm = comm,
+            pid = pid,
+            ppid = self.ppid,
+            uid = self.credentials.uid,
+            euid = self.credentials.euid,
+            gid = self.credentials.gid,
+            egid = self.credentials.egid,
+        )
+    }
+
     /// Resolve an executable path to a canonical absolute path for /proc/self/exe.
     ///
     /// Linux always reports /proc/self/exe as the fully resolved path:
@@ -679,6 +772,40 @@ impl<FS: ShimFS> Task<FS> {
     /// Handle syscall `open`
     pub fn sys_open(&self, path: impl path::Arg, flags: OFlags, mode: Mode) -> Result<u32, Errno> {
         let path = self.resolve_path(path)?;
+
+        // Rewrite /proc/<N>/... → /proc/self/... for the current PID,
+        // and synthesize /proc/<N>/stat|status|cmdline for known PIDs.
+        let path = if let Some(path_str) = path.to_str().ok() {
+            if let Some(rewritten) = self.rewrite_proc_pid_to_self(path_str) {
+                CString::new(rewritten).map_err(|_| Errno::EINVAL)?
+            } else if let Some(pid) = self.proc_pid_if_known(path_str) {
+                let sub = self.proc_pid_subpath(path_str);
+                match sub {
+                    "/stat" => {
+                        return self.open_synthetic_proc_text(flags, self.synthetic_proc_stat(pid));
+                    }
+                    "/status" => {
+                        return self
+                            .open_synthetic_proc_text(flags, self.synthetic_proc_status(pid));
+                    }
+                    "/cmdline" => {
+                        let data = self.synthetic_proc_cmdline();
+                        let text = alloc::string::String::from_utf8_lossy(&data).into_owned();
+                        return self.open_synthetic_proc_text(flags, text);
+                    }
+                    "" => {
+                        // open("/proc/<N>") as directory — return EISDIR
+                        return Err(Errno::EISDIR);
+                    }
+                    _ => path, // unhandled subpath, fall through
+                }
+            } else {
+                path
+            }
+        } else {
+            path
+        };
+
         if path.to_str().ok() == Some("/proc/self/maps") {
             return self.open_synthetic_proc_text(flags, self.proc_self_maps_contents());
         }
@@ -2685,6 +2812,15 @@ impl<FS: ShimFS> Task<FS> {
     /// Note that this function only handles the following cases that we hardcoded:
     /// - `/proc/self/fd/<fd>`
     fn do_readlink(&self, fullpath: &str) -> Result<String, Errno> {
+        // Rewrite /proc/<N>/... → /proc/self/... for own PID.
+        let fullpath_owned;
+        let fullpath = if let Some(rewritten) = self.rewrite_proc_pid_to_self(fullpath) {
+            fullpath_owned = rewritten;
+            fullpath_owned.as_str()
+        } else {
+            fullpath
+        };
+
         if fullpath == "/proc/self/cwd" {
             let cwd = self.fs.borrow().cwd.read().clone();
             // Strip trailing slash (except for root "/") — Linux's
@@ -3209,6 +3345,57 @@ impl<FS: ShimFS> Task<FS> {
     /// The `pathname` must be absolute.
     fn do_stat(&self, pathname: impl path::Arg, follow_symlink: bool) -> Result<FileStat, Errno> {
         let normalized_path = pathname.normalized()?;
+        let norm_str = normalized_path.as_str();
+
+        // Handle /proc/<N>/... paths: rewrite own PID to /proc/self/,
+        // and return synthetic entries for known PIDs.
+        if let Some(_pid) = self.proc_pid_if_known(norm_str) {
+            let sub = self.proc_pid_subpath(norm_str);
+            if sub.is_empty() {
+                // stat("/proc/<N>") — synthetic directory entry.
+                return Ok(FileStat {
+                    st_dev: ANON_INODE_DEV.truncate(),
+                    st_ino: (next_anon_ino() as u64).truncate(),
+                    st_mode: ((litebox_common_linux::InodeType::Dir as u32)
+                        | (Mode::RUSR
+                            | Mode::XUSR
+                            | Mode::RGRP
+                            | Mode::XGRP
+                            | Mode::ROTH
+                            | Mode::XOTH)
+                            .bits())
+                    .truncate(),
+                    st_nlink: 1,
+                    ..Default::default()
+                });
+            }
+            match sub {
+                "/stat" | "/status" | "/cmdline" | "/comm" => {
+                    return Ok(FileStat {
+                        st_dev: ANON_INODE_DEV.truncate(),
+                        st_ino: (next_anon_ino() as u64).truncate(),
+                        st_mode: ((litebox_common_linux::InodeType::File as u32)
+                            | (Mode::RUSR | Mode::RGRP | Mode::ROTH).bits())
+                        .truncate(),
+                        st_nlink: 1,
+                        st_size: 128,
+                        ..Default::default()
+                    });
+                }
+                "/exe" | "/cwd" | "/root" => {
+                    return Ok(synthetic_symlink_stat(0));
+                }
+                _ => {
+                    // For /fd and other subpaths, rewrite to /proc/self/ and fall through
+                    if let Some(rewritten) = self.rewrite_proc_pid_to_self(norm_str) {
+                        return self.do_stat(rewritten.as_str(), follow_symlink);
+                    }
+                }
+            }
+        } else if let Some(rewritten) = self.rewrite_proc_pid_to_self(norm_str) {
+            return self.do_stat(rewritten.as_str(), follow_symlink);
+        }
+
         if normalized_path.as_str() == "/proc/self/exe" {
             let exe = self.fs.borrow().exe_path.read().clone();
             if exe.is_empty() {

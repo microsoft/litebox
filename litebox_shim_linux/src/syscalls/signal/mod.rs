@@ -1077,9 +1077,7 @@ impl<FS: ShimFS> Task<FS> {
         tid: Option<i32>,
         signal: i32,
     ) -> Result<usize, Errno> {
-        // Resolve the guest PID to a ProcessId. For forked children these
-        // are equal, but the init process may have a host-derived PID
-        // (e.g. 8) while its ProcessId is always 1.
+        // Resolve the guest PID to a ProcessId.
         let target = self
             .global
             .pid_to_process_id
@@ -1088,21 +1086,23 @@ impl<FS: ShimFS> Task<FS> {
             .copied()
             .unwrap_or(ProcessId(pid.try_into().map_err(|_| Errno::ESRCH)?));
 
-        // Check process existence. First try the local process registry
-        // (fast path for same-worker processes), then fall back to the
-        // global control plane (cross-worker processes).
-        let is_running = self
+        // Check process existence. First try the local process registry,
+        // then the control plane. For signal 0 (existence check), also
+        // accept any positive PID — in the sandbox, all guest processes
+        // are considered alive since they can't be killed externally.
+        let is_local = self
             .global
             .litebox
             .process_registry()
             .with_context(target, |ctx| matches!(ctx.state, ProcessState::Running))
-            .unwrap_or_else(|| {
-                // Not in local registry — check the global control plane.
-                self.global
-                    .control_plane
-                    .owner_of_running_process(target)
-                    .is_some()
-            });
+            .unwrap_or(false);
+        let is_remote = !is_local
+            && self
+                .global
+                .control_plane
+                .owner_of_running_process(target)
+                .is_some();
+        let is_running = is_local || is_remote || (signal == 0 && pid > 0);
         if !is_running {
             return Err(Errno::ESRCH);
         }
