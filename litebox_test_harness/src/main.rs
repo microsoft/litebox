@@ -112,6 +112,48 @@ fn main() {
             // Stay alive for a few seconds so the parent can check our PID too.
             std::thread::sleep(std::time::Duration::from_secs(3));
         }
+        "proc-probe" => {
+            // Comprehensive /proc self-check. Reports own PID visibility
+            // and optionally checks a target PID passed as arg.
+            let pid = unsafe { libc::getpid() };
+            let ppid = unsafe { libc::getppid() };
+
+            // /proc/self basics
+            let self_exists = std::path::Path::new("/proc/self").exists();
+            let self_cmdline = std::fs::read_to_string("/proc/self/cmdline")
+                .map(|s| !s.is_empty())
+                .unwrap_or(false);
+            let self_stat = std::fs::read_to_string("/proc/self/stat")
+                .map(|s| !s.is_empty())
+                .unwrap_or(false);
+
+            // /proc/<own pid>
+            let own_proc = std::path::Path::new(&format!("/proc/{pid}")).exists();
+            let own_cmdline = std::fs::read_to_string(format!("/proc/{pid}/cmdline"))
+                .map(|s| !s.is_empty())
+                .unwrap_or(false);
+
+            // /proc/<ppid>
+            let ppid_proc = std::path::Path::new(&format!("/proc/{ppid}")).exists();
+            let ppid_cmdline = std::fs::read_to_string(format!("/proc/{ppid}/cmdline"))
+                .map(|s| !s.is_empty())
+                .unwrap_or(false);
+            let ppid_kill0 = unsafe { libc::kill(ppid, 0) } == 0;
+
+            print!("pid={pid} ppid={ppid}");
+            print!(" self={self_exists} self_cmdline={self_cmdline} self_stat={self_stat}");
+            print!(" own_proc={own_proc} own_cmdline={own_cmdline}");
+            print!(" ppid_proc={ppid_proc} ppid_cmdline={ppid_cmdline} ppid_kill0={ppid_kill0}");
+
+            // Optional: check a target PID
+            if let Some(target) = args.get(2).and_then(|s| s.parse::<i32>().ok()) {
+                let t_proc = std::path::Path::new(&format!("/proc/{target}")).exists();
+                let t_kill0 = unsafe { libc::kill(target, 0) } == 0;
+                print!(" target={target} target_proc={t_proc} target_kill0={t_kill0}");
+            }
+            println!();
+            std::thread::sleep(std::time::Duration::from_secs(3));
+        }
         "write-then-exit" => {
             // Write exactly `size` bytes of known pattern to stdout, then exit.
             // Used to test bridge thread join — without it, large writes truncate.

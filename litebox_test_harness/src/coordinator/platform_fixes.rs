@@ -1123,20 +1123,30 @@ pub(crate) async fn vscode_install_pattern_tests(r: &mut TestRunner) {
 }
 
 // ═══════════════════════════════════════════════════════════════════
-// KP: kill -0 PID visibility across delayed-fork migration
-// (VS Code CLI uses --parent-process-id and monitors via /proc)
+// KP: PID and /proc visibility across delayed-fork migration
 // ═══════════════════════════════════════════════════════════════════
 
 /// After fork+exec, the child is migrated to a new worker via delayed fork.
-/// The parent must be able to see the child via kill -0, and the child must
-/// be able to see the parent via /proc/<ppid> and kill -0.
+/// These tests cover the full visibility matrix:
+///
+/// **Observation direction:**
+///   parent → child:  kill -0, /proc/<child>/cmdline
+///   child  → parent: kill -0, /proc/<ppid>, /proc/<ppid>/cmdline, getppid()
+///   self:            /proc/self, /proc/self/cmdline, /proc/self/stat, /proc/<own_pid>
+///
+/// **Conditions:**
+///   immediate vs delayed (1s), single fork vs many prior forks
 ///
 /// Tests:
-///   KP.kill0_bg       — parent kill -0 $! succeeds for background process
-///   KP.kill0_many     — kill -0 after many prior forks (higher PID)
-///   KP.ppid_proc      — child sees parent in /proc/<ppid>
-///   KP.ppid_kill0     — child can kill -0 parent
-///   KP.parent_monitor — process monitoring parent PID stays alive
+///   KP.kill0_bg           — parent kill -0 $! immediate
+///   KP.kill0_many         — parent kill -0 after many prior forks
+///   KP.proc_child         — parent /proc/<child_pid>/cmdline readable
+///   KP.proc_self          — /proc/self + /proc/<own_pid> from migrated child
+///   KP.ppid_proc          — child /proc/<ppid> visible
+///   KP.ppid_kill0         — child kill -0 ppid
+///   KP.ppid_cmdline       — child /proc/<ppid>/cmdline readable
+///   KP.getppid_correct    — child getppid() returns parent's PID
+///   KP.parent_monitor     — child stays alive while monitoring parent via /proc
 pub(crate) async fn pid_visibility_tests(r: &mut TestRunner) {
     eprintln!(
         "[platform] === PID Visibility ({} agents) ===",
@@ -1152,7 +1162,8 @@ pub(crate) async fn pid_visibility_tests(r: &mut TestRunner) {
     }
 
     let tests: &[KPTest] = &[
-        // Basic: kill -0 $! after background fork+exec
+        // --- Parent → child direction ---
+        // Basic: parent kill -0 $! after background fork+exec
         KPTest {
             name: "kill0_bg",
             script_template: concat!(
@@ -1163,7 +1174,7 @@ pub(crate) async fn pid_visibility_tests(r: &mut TestRunner) {
             ),
             check: |s| s.contains("KILL0_OK"),
         },
-        // kill -0 after many prior forks (simulates install script PID buildup)
+        // Parent kill -0 after many prior forks (higher PID, install-script-like)
         KPTest {
             name: "kill0_many",
             script_template: concat!(
@@ -1180,33 +1191,95 @@ pub(crate) async fn pid_visibility_tests(r: &mut TestRunner) {
             ),
             check: |s| s.contains("KILL0_OK") && s.contains("KILL0_1s_OK"),
         },
-        // Child checks parent visibility via /proc/<ppid>
+        // Parent reads /proc/<child>/cmdline of a migrated child
+        KPTest {
+            name: "proc_child",
+            script_template: concat!(
+                "{exe} slow-echo > /dev/null 2>&1 &\n",
+                "PID=$!\n",
+                "sleep 1\n",
+                "test -d /proc/$PID && echo PROC_DIR_OK || echo PROC_DIR_FAIL\n",
+                "cat /proc/$PID/cmdline 2>/dev/null | tr '\\0' ' ' | ",
+                "grep -q litebox_test_harness && echo CMDLINE_OK || echo CMDLINE_FAIL\n",
+                "kill $PID 2>/dev/null; wait $PID 2>/dev/null\n",
+            ),
+            check: |s| s.contains("PROC_DIR_OK") && s.contains("CMDLINE_OK"),
+        },
+        // --- Self visibility ---
+        // /proc/self and /proc/<own_pid> from a migrated child
+        KPTest {
+            name: "proc_self",
+            script_template: concat!(
+                "{exe} proc-probe > /tmp/proc-self.txt 2>&1 &\n",
+                "wait $!\n",
+                "cat /tmp/proc-self.txt\n",
+            ),
+            check: |s| {
+                s.contains("self=true")
+                    && s.contains("self_cmdline=true")
+                    && s.contains("own_proc=true")
+                    && s.contains("own_cmdline=true")
+            },
+        },
+        // --- Child → parent direction ---
+        // Child sees parent in /proc/<ppid>
         KPTest {
             name: "ppid_proc",
             script_template: concat!(
-                "{exe} check-ppid > /tmp/ppid-test.txt 2>&1 &\n",
+                "{exe} proc-probe > /tmp/ppid-proc.txt 2>&1 &\n",
                 "wait $!\n",
-                "cat /tmp/ppid-test.txt\n",
+                "cat /tmp/ppid-proc.txt\n",
             ),
-            check: |s| s.contains("proc=true"),
+            check: |s| s.contains("ppid_proc=true"),
         },
-        // Child checks parent visibility via kill -0
+        // Child can kill -0 parent
         KPTest {
             name: "ppid_kill0",
             script_template: concat!(
-                "{exe} check-ppid > /tmp/ppid-k0.txt 2>&1 &\n",
+                "{exe} proc-probe > /tmp/ppid-k0.txt 2>&1 &\n",
                 "wait $!\n",
                 "cat /tmp/ppid-k0.txt\n",
             ),
-            check: |s| s.contains("kill0=true"),
+            check: |s| s.contains("ppid_kill0=true"),
         },
-        // Simulates --parent-process-id monitoring: child checks parent
-        // periodically and exits if parent disappears. Parent must see
-        // child alive throughout.
+        // Child can read /proc/<ppid>/cmdline (sysinfo reads this)
+        KPTest {
+            name: "ppid_cmdline",
+            script_template: concat!(
+                "{exe} proc-probe > /tmp/ppid-cl.txt 2>&1 &\n",
+                "wait $!\n",
+                "cat /tmp/ppid-cl.txt\n",
+            ),
+            check: |s| s.contains("ppid_cmdline=true"),
+        },
+        // Child getppid() returns the parent's actual PID
+        KPTest {
+            name: "getppid_correct",
+            script_template: concat!(
+                "echo $$\n",
+                "{exe} check-ppid > /tmp/ppid-val.txt 2>&1 &\n",
+                "wait $!\n",
+                "cat /tmp/ppid-val.txt\n",
+            ),
+            check: |s| {
+                // First line is parent's $$, check-ppid reports ppid=N
+                let lines: Vec<&str> = s.lines().collect();
+                if lines.len() < 2 {
+                    return false;
+                }
+                let parent_pid = lines[0].trim();
+                // The ppid line may be prefixed with [harness] line
+                lines
+                    .iter()
+                    .any(|l| l.contains(&format!("ppid={parent_pid}")))
+            },
+        },
+        // --- Combined: parent-monitor pattern ---
+        // Child stays alive while parent is visible (simulates --parent-process-id)
         KPTest {
             name: "parent_monitor",
             script_template: concat!(
-                "{exe} check-ppid > /tmp/pmon.txt 2>&1 &\n",
+                "{exe} proc-probe > /tmp/pmon.txt 2>&1 &\n",
                 "PID=$!\n",
                 "sleep 1\n",
                 "kill -0 $PID 2>/dev/null && echo CHILD_ALIVE || echo CHILD_DEAD\n",
@@ -1214,7 +1287,9 @@ pub(crate) async fn pid_visibility_tests(r: &mut TestRunner) {
                 "cat /tmp/pmon.txt\n",
             ),
             check: |s| {
-                s.contains("CHILD_ALIVE") && s.contains("proc=true") && s.contains("kill0=true")
+                s.contains("CHILD_ALIVE")
+                    && s.contains("ppid_proc=true")
+                    && s.contains("ppid_kill0=true")
             },
         },
     ];
