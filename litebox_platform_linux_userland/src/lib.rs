@@ -412,6 +412,84 @@ impl LinuxUserland {
             )
         };
     }
+
+    #[cfg(target_arch = "x86_64")]
+    #[allow(
+        clippy::missing_panics_doc,
+        reason = "the seccomp filter rules are hardcoded and not expected to fail"
+    )]
+    pub fn enable_seccomp_filter() {
+        use seccompiler::{
+            BpfProgram, SeccompAction, SeccompCmpArgLen, SeccompCmpOp, SeccompCondition,
+            SeccompFilter, SeccompRule,
+        };
+
+        let rules = vec![
+            // TUN and terminal
+            (libc::SYS_read, vec![]),
+            (libc::SYS_write, vec![]),
+            (libc::SYS_poll, vec![]),
+            // memory management
+            (libc::SYS_mmap, vec![]),
+            (libc::SYS_mprotect, vec![]),
+            (libc::SYS_munmap, vec![]),
+            (libc::SYS_mremap, vec![]),
+            // signal
+            (libc::SYS_rt_sigreturn, vec![]),
+            (libc::SYS_sigaltstack, vec![]),
+            (libc::SYS_tgkill, vec![]),
+            (libc::SYS_timer_create, vec![]),
+            (libc::SYS_timer_settime, vec![]),
+            (libc::SYS_timer_delete, vec![]),
+            // thread management
+            (libc::SYS_exit, vec![]),
+            (libc::SYS_exit_group, vec![]),
+            (libc::SYS_clone3, vec![]),
+            // sync
+            (libc::SYS_futex, vec![]),
+            // misc
+            (libc::SYS_getrandom, vec![]),
+            // required by std spawn
+            (libc::SYS_rseq, vec![]),
+            (libc::SYS_set_robust_list, vec![]),
+            (libc::SYS_get_robust_list, vec![]),
+            (libc::SYS_sched_getaffinity, vec![]),
+            (libc::SYS_gettid, vec![]),
+            (libc::SYS_madvise, vec![]),
+            // required by libc allocator
+            (libc::SYS_brk, vec![]),
+            (libc::SYS_getpid, vec![]),
+            // TODO: could be removed if we pre-open files (see `try_allocate_cow_pages`)
+            (
+                libc::SYS_open,
+                vec![
+                    SeccompRule::new(vec![
+                        SeccompCondition::new(
+                            1,
+                            SeccompCmpArgLen::Dword,
+                            SeccompCmpOp::Eq,
+                            u64::from(OFlags::RDONLY.bits()),
+                        )
+                        .unwrap(),
+                    ])
+                    .unwrap(),
+                ],
+            ),
+        ];
+        let rule_map: std::collections::BTreeMap<i64, Vec<SeccompRule>> =
+            rules.into_iter().collect();
+        let filter = SeccompFilter::new(
+            rule_map,
+            SeccompAction::Errno(libc::EINVAL.cast_unsigned()),
+            SeccompAction::Allow,
+            seccompiler::TargetArch::x86_64,
+        )
+        .unwrap();
+        // TODO: bpf program can be compiled offline
+        let bpf_prog: BpfProgram = filter.try_into().unwrap();
+
+        seccompiler::apply_filter(&bpf_prog).unwrap();
+    }
 }
 
 impl litebox::platform::Provider for LinuxUserland {}

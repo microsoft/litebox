@@ -13,6 +13,7 @@ litebox_common_optee = { path = "../litebox_common_optee", version = "0.1.0", de
 spin = "0.9.8"
 syscalls = { version = "0.6", default-features = false }
 zerocopy = { version = "0.8", default-features = false }
+seccompiler = { version = "0.5.0" }
 
 [features]
 default = ["linux_syscall"]
