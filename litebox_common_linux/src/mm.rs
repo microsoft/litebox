@@ -20,12 +20,6 @@ fn align_up(addr: usize, align: usize) -> usize {
     (addr + align - 1) & !(align - 1)
 }
 
-#[inline]
-fn align_down(addr: usize, align: usize) -> usize {
-    debug_assert!(align.is_power_of_two());
-    addr & !(align - 1)
-}
-
 pub fn do_mmap<
     Platform: litebox::platform::RawPointerProvider
         + litebox::sync::RawSyncPrimitivesProvider
@@ -184,8 +178,8 @@ pub fn sys_mremap<
         return Err(Errno::EINVAL);
     }
 
-    let old_size = align_down(old_size, PAGE_SIZE);
-    let new_size = align_down(new_size, PAGE_SIZE);
+    let old_size = align_up(old_size, PAGE_SIZE);
+    let new_size = align_up(new_size, PAGE_SIZE);
     if new_size == 0 {
         return Err(Errno::EINVAL);
     }
