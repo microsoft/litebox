@@ -920,10 +920,13 @@ fn run_inner(
                         dst_port,
                     );
                     // Let SYN through to smoltcp.
-                } else if dest_ipv4 == BROKER_IPV4 {
-                    // Connection to BROKER_IP — check if a worker registered
-                    // a listen on this port via port_router (cross-worker
-                    // loopback), or if there's an inbound forward listener.
+                } else if dest_ipv4 == BROKER_IPV4
+                    || dest_ipv4 == Ipv4Addr::LOCALHOST
+                    || dest_ipv4 == Ipv4Addr::new(10, 0, 0, 2)
+                {
+                    // Connection to BROKER_IP, localhost, or the guest's own
+                    // IP — check if a worker registered a listen on this port
+                    // via port_router (cross-worker loopback).
                     let routed_to_worker = port_router.has_route(dst_port);
 
                     if routed_to_worker {

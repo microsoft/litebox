@@ -131,7 +131,6 @@ fn main() {
             };
             let kill_ok = kill_ret == 0;
             println!("ppid={ppid} proc={proc_exists} kill0={kill_ok} errno={kill_errno}");
-            std::thread::sleep(std::time::Duration::from_secs(3));
         }
         "proc-probe" => {
             // Comprehensive /proc self-check. Reports own PID visibility
@@ -181,7 +180,6 @@ fn main() {
                 print!(" target={target} target_proc={t_proc} target_kill0={t_kill0}");
             }
             println!();
-            std::thread::sleep(std::time::Duration::from_secs(3));
         }
         "write-then-exit" => {
             // Write exactly `size` bytes of known pattern to stdout, then exit.

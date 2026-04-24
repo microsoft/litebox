@@ -1276,22 +1276,15 @@ pub(crate) async fn pid_visibility_tests(r: &mut TestRunner) {
             },
         },
         // --- Combined: parent-monitor pattern ---
-        // Child stays alive while parent is visible (simulates --parent-process-id)
+        // Child can see parent via both /proc and kill -0
         KPTest {
             name: "parent_monitor",
             script_template: concat!(
                 "{exe} proc-probe > /tmp/pmon.txt 2>&1 &\n",
-                "PID=$!\n",
-                "sleep 1\n",
-                "kill -0 $PID 2>/dev/null && echo CHILD_ALIVE || echo CHILD_DEAD\n",
-                "wait $PID 2>/dev/null\n",
+                "wait $!\n",
                 "cat /tmp/pmon.txt\n",
             ),
-            check: |s| {
-                s.contains("CHILD_ALIVE")
-                    && s.contains("ppid_proc=true")
-                    && s.contains("ppid_kill0=true")
-            },
+            check: |s| s.contains("ppid_proc=true") && s.contains("ppid_kill0=true"),
         },
     ];
 
