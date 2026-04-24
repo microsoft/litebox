@@ -107,9 +107,14 @@ fn main() {
             // Used to test cross-worker PID visibility after delayed-fork migration.
             let ppid = unsafe { libc::getppid() };
             let proc_exists = std::path::Path::new(&format!("/proc/{ppid}")).exists();
-            let kill_ok = unsafe { libc::kill(ppid, 0) } == 0;
-            println!("ppid={ppid} proc={proc_exists} kill0={kill_ok}");
-            // Stay alive for a few seconds so the parent can check our PID too.
+            let kill_ret = unsafe { libc::kill(ppid, 0) };
+            let kill_errno = if kill_ret != 0 {
+                std::io::Error::last_os_error().raw_os_error().unwrap_or(-1)
+            } else {
+                0
+            };
+            let kill_ok = kill_ret == 0;
+            println!("ppid={ppid} proc={proc_exists} kill0={kill_ok} errno={kill_errno}");
             std::thread::sleep(std::time::Duration::from_secs(3));
         }
         "proc-probe" => {
@@ -138,12 +143,20 @@ fn main() {
             let ppid_cmdline = std::fs::read_to_string(format!("/proc/{ppid}/cmdline"))
                 .map(|s| !s.is_empty())
                 .unwrap_or(false);
-            let ppid_kill0 = unsafe { libc::kill(ppid, 0) } == 0;
+            let ppid_kill0_ret = unsafe { libc::kill(ppid, 0) };
+            let ppid_kill0_errno = if ppid_kill0_ret != 0 {
+                std::io::Error::last_os_error().raw_os_error().unwrap_or(-1)
+            } else {
+                0
+            };
+            let ppid_kill0 = ppid_kill0_ret == 0;
 
             print!("pid={pid} ppid={ppid}");
             print!(" self={self_exists} self_cmdline={self_cmdline} self_stat={self_stat}");
             print!(" own_proc={own_proc} own_cmdline={own_cmdline}");
-            print!(" ppid_proc={ppid_proc} ppid_cmdline={ppid_cmdline} ppid_kill0={ppid_kill0}");
+            print!(
+                " ppid_proc={ppid_proc} ppid_cmdline={ppid_cmdline} ppid_kill0={ppid_kill0} ppid_kill0_errno={ppid_kill0_errno}"
+            );
 
             // Optional: check a target PID
             if let Some(target) = args.get(2).and_then(|s| s.parse::<i32>().ok()) {
