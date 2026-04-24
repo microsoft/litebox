@@ -103,15 +103,29 @@ fn main() {
             let port: u16 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(9999);
             let listener = std::net::TcpListener::bind(format!("0.0.0.0:{port}"))
                 .expect("tcp-echo: bind failed");
+            eprintln!("[tcp-echo] listening on 0.0.0.0:{port}");
             // Accept one connection, echo data, then exit.
-            if let Ok((mut stream, _addr)) = listener.accept() {
+            if let Ok((mut stream, addr)) = listener.accept() {
+                eprintln!("[tcp-echo] accepted from {addr}");
                 use std::io::{Read, Write};
                 let mut buf = [0u8; 4096];
-                if let Ok(n) = stream.read(&mut buf) {
-                    let _ = stream.write_all(&buf[..n]);
-                    let _ = stream.flush();
+                match stream.read(&mut buf) {
+                    Ok(0) => eprintln!("[tcp-echo] read returned 0 (EOF)"),
+                    Ok(n) => {
+                        eprintln!("[tcp-echo] read {n} bytes, echoing");
+                        match stream.write_all(&buf[..n]) {
+                            Ok(()) => eprintln!("[tcp-echo] write_all OK"),
+                            Err(e) => eprintln!("[tcp-echo] write_all FAILED: {e}"),
+                        }
+                        match stream.flush() {
+                            Ok(()) => eprintln!("[tcp-echo] flush OK"),
+                            Err(e) => eprintln!("[tcp-echo] flush FAILED: {e}"),
+                        }
+                    }
+                    Err(e) => eprintln!("[tcp-echo] read error: {e}"),
                 }
             }
+            eprintln!("[tcp-echo] exiting");
         }
         "slow-echo" => {
             // Sleeps 3 seconds then prints, simulating a slow-starting server.

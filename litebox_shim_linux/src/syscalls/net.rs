@@ -932,7 +932,10 @@ impl<FS: ShimFS> GlobalState<FS> {
         let behavior = match linger_timeout {
             Some(timeout) if timeout.is_zero() => CloseBehavior::Immediate,
             Some(_) => CloseBehavior::GracefulIfNoPendingData,
-            None => CloseBehavior::Graceful,
+            // Default (no SO_LINGER): flush pending send data before FIN.
+            // Without this, a write() immediately followed by close() can
+            // lose data because smoltcp sends FIN before the queued data.
+            None => CloseBehavior::GracefulIfNoPendingData,
         };
         let proxy = self.get_proxy(&fd)?;
         match cx.with_timeout(linger_timeout).wait_on_events(
