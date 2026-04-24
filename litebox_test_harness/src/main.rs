@@ -97,6 +97,22 @@ fn main() {
         "echo-test" => {
             println!("ECHO_TEST_OK");
         }
+        "tcp-echo" => {
+            // Listen on a TCP port and echo back whatever is received.
+            // Used for cross-worker loopback TCP tests.
+            let port: u16 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(9999);
+            let listener = std::net::TcpListener::bind(format!("0.0.0.0:{port}"))
+                .expect("tcp-echo: bind failed");
+            // Accept one connection, echo data, then exit.
+            if let Ok((mut stream, _addr)) = listener.accept() {
+                use std::io::{Read, Write};
+                let mut buf = [0u8; 4096];
+                if let Ok(n) = stream.read(&mut buf) {
+                    let _ = stream.write_all(&buf[..n]);
+                    let _ = stream.flush();
+                }
+            }
+        }
         "slow-echo" => {
             // Sleeps 3 seconds then prints, simulating a slow-starting server.
             std::thread::sleep(std::time::Duration::from_secs(3));

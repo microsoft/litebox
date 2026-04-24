@@ -37,7 +37,7 @@ ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y --no-install-recommends \
     bash coreutils findutils grep sed gawk \
     ca-certificates curl xz-utils tar \
-    procps less \
+    procps less netcat-openbsd \
     && rm -rf /var/lib/apt/lists/* \
     && ln -sf bash /bin/sh
 

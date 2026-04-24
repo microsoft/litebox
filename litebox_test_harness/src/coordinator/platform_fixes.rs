@@ -293,6 +293,7 @@ pub(crate) async fn run(r: &mut TestRunner) {
     touch_redirect_tests(r).await;
     vscode_install_pattern_tests(r).await;
     pid_visibility_tests(r).await;
+    loopback_tcp_tests(r).await;
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -1297,6 +1298,97 @@ pub(crate) async fn pid_visibility_tests(r: &mut TestRunner) {
     for &agent in AGENTS {
         for test in tests {
             let test_id = format!("KP.{}.{}", test.name, agent);
+            let script = test.script_template.replace("{exe}", &self_exe);
+            let resp = r
+                .send(
+                    agent,
+                    Command::Exec {
+                        args: vec!["bash".into(), "-c".into(), script],
+                        timeout_secs: Some(15),
+                        stdin: None,
+                        background: false,
+                    },
+                )
+                .await;
+            let pass = matches!(
+                &resp,
+                Response::ExecResult { stdout, .. }
+                    if (test.check)(stdout)
+            );
+            r.record(&test_id, agent, pass, &format!("{resp:?}"));
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// LB: Loopback TCP across delayed-fork workers
+// (VS Code exec server uses SOCKS proxy → TCP loopback to CLI port)
+// ═══════════════════════════════════════════════════════════════════
+
+/// A background process (different worker after delayed fork) listens on
+/// a TCP port. The parent (original worker) connects to it. This is the
+/// exact pattern VS Code uses: the CLI listens on a port, and the SOCKS
+/// proxy (through dropbear in the same sandbox) connects to it.
+///
+/// Tests cover the address matrix:
+///   LB.localhost    — connect via 127.0.0.1
+///   LB.guest_ip     — connect via 10.0.0.2 (guest's own IP)
+///   LB.any          — listen 0.0.0.0, connect 127.0.0.1
+///   LB.same_worker  — listen and connect in same worker (control)
+pub(crate) async fn loopback_tcp_tests(r: &mut TestRunner) {
+    eprintln!("[platform] === Loopback TCP (3 agents) ===");
+
+    let self_exe = r.self_exe.clone();
+
+    struct LBTest {
+        name: &'static str,
+        script_template: &'static str,
+        check: fn(&str) -> bool,
+    }
+
+    let tests: &[LBTest] = &[
+        // Control: same-worker TCP (no delayed fork, should always work)
+        LBTest {
+            name: "same_worker",
+            script_template: concat!(
+                "{exe} tcp-echo 19876 &\n",
+                "sleep 1\n",
+                "REPLY=$(echo LB_SAME | nc -q1 127.0.0.1 19876 2>/dev/null)\n",
+                "echo REPLY=$REPLY\n",
+                "wait\n",
+            ),
+            check: |s| s.contains("REPLY=LB_SAME"),
+        },
+        // Cross-worker: bg process (different worker) listens, parent connects via 127.0.0.1
+        LBTest {
+            name: "localhost",
+            script_template: concat!(
+                "{exe} tcp-echo 19877 > /dev/null 2>&1 &\n",
+                "PID=$!\nsleep 2\n",
+                "REPLY=$(echo LB_LOCAL | nc -q1 127.0.0.1 19877 2>/dev/null)\n",
+                "echo REPLY=$REPLY\n",
+                "kill $PID 2>/dev/null; wait $PID 2>/dev/null\n",
+            ),
+            check: |s| s.contains("REPLY=LB_LOCAL"),
+        },
+        // Cross-worker: listen on 0.0.0.0, connect via 127.0.0.1
+        // (exact VS Code pattern: CLI listens 0.0.0.0, SOCKS connects 127.0.0.1)
+        LBTest {
+            name: "any_to_local",
+            script_template: concat!(
+                "{exe} tcp-echo 19879 > /dev/null 2>&1 &\n",
+                "PID=$!\nsleep 2\n",
+                "REPLY=$(echo LB_ANY | nc -q1 127.0.0.1 19879 2>/dev/null)\n",
+                "echo REPLY=$REPLY\n",
+                "kill $PID 2>/dev/null; wait $PID 2>/dev/null\n",
+            ),
+            check: |s| s.contains("REPLY=LB_ANY"),
+        },
+    ];
+
+    for &agent in AGENTS {
+        for test in tests {
+            let test_id = format!("LB.{}.{}", test.name, agent);
             let script = test.script_template.replace("{exe}", &self_exe);
             let resp = r
                 .send(
