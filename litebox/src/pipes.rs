@@ -816,15 +816,18 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider, T> ReadEnd<Platform, T>
 
         // The pipe buffer is empty and the write-end is not shut down.
         // fd_ref_count tracks the number of open FDs for the write-end
-        // (incremented on dup/fork, decremented on close). After the vfork
-        // child closes its write-end copy, if fd_ref_count == 1, the sole
-        // remaining writer is the blocked parent — a blocking read would
-        // deadlock. Return EDEADLK so the caller fails loudly instead of
-        // silently receiving a fake EOF.
+        // (incremented on dup/fork, decremented on close).
+        //
+        // Only return EDEADLK when fd_ref_count == 0 — meaning all
+        // write-end copies have been explicitly closed.  We cannot use
+        // fd_ref_count <= 1 because in nested vfork scenarios, a child
+        // that exec'd and detached still holds a write-end reference in
+        // its independent fd table, but that reference is not reflected
+        // in the shared fd_ref_count.
         if self
             .peer
             .upgrade()
-            .is_some_and(|p| p.fd_ref_count.load(Ordering::Acquire) <= 1)
+            .is_some_and(|p| p.fd_ref_count.load(Ordering::Acquire) == 0)
         {
             return Err(PipeError::Deadlock);
         }

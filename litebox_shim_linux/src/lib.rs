@@ -2322,7 +2322,26 @@ impl<FS: ShimFS> Task<FS> {
                 );
             }
             if !is_pre_exec {
-                if self.commit_delayed_fork(ctx).is_ok() {
+                // Nested vfork: if our parent is itself a delayed-fork
+                // child, do NOT migrate — the pipe bridging would corrupt
+                // the parent's fd table (shared via vfork).  Instead, let
+                // this child continue in the shared address space.  It
+                // will exec (detaching properly) or exit.
+                let parent_is_delayed = self
+                    .fork_context
+                    .borrow()
+                    .as_ref()
+                    .is_some_and(|fc| fc.parent_is_delayed_fork);
+                if parent_is_delayed {
+                    #[cfg(feature = "trace_syscalls")]
+                    litebox::log_println!(
+                        self.global.platform,
+                        "[DELAYED-FORK-NESTED] pid={}: parent is delayed-fork, skipping migration",
+                        self.pid,
+                    );
+                    self.delayed_fork_pending.set(false);
+                    // Fall through to normal syscall handling.
+                } else if self.commit_delayed_fork(ctx).is_ok() {
                     // Child migrated to worker host.  Terminate this local task.
                     #[cfg(feature = "trace_syscalls")]
                     litebox::log_println!(
@@ -3660,6 +3679,10 @@ struct ForkContext {
     /// these infrastructure pipes from child_pipes, preventing nested
     /// mux-over-mux bridging.
     parent_mux_pipe_pair_ids: Vec<usize>,
+    /// True if the parent is itself a delayed-fork child (nested vfork).
+    /// When true, `commit_delayed_fork` must not replace the parent's
+    /// pipe fds because the parent shares the grandparent's fd table.
+    parent_is_delayed_fork: bool,
 }
 
 const SHELL_WRITE_SCAN_LEN: usize = 1024;

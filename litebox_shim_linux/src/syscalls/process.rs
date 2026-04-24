@@ -2594,6 +2594,7 @@ impl<FS: ShimFS> Task<FS> {
                     pairs
                 },
                 parent_mux_pipe_pair_ids: self.mux_pipe_pair_ids.borrow().clone(),
+                parent_is_delayed_fork: self.delayed_fork_pending.get(),
             };
             (
                 self.process_state.clone(),                  // share parent's PM

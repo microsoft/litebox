@@ -694,6 +694,7 @@ mod cow_test {
                         "inherited_fd_exec_keep_open",
                         test_inherited_fd_exec_keep_open,
                     ),
+                    ("nested_capture", test_nested_capture),
                 ];
                 let mut pass = 0;
                 let mut fail = 0;
@@ -727,6 +728,7 @@ mod cow_test {
                     "inherited_fd_file_read" => test_inherited_fd_file_read,
                     "inherited_fd_exec_read" => test_inherited_fd_exec_read,
                     "inherited_fd_exec_keep_open" => test_inherited_fd_exec_keep_open,
+                    "nested_capture" => test_nested_capture,
                     _ => {
                         eprintln!("unknown cow-test: {other}");
                         return 1;
@@ -1517,6 +1519,128 @@ mod cow_test {
                 "0 bytes".to_string()
             };
             println!("  inherited_fd_exec_keep_open: read failed: {e}");
+            return false;
+        }
+        true
+    }
+
+    /// Simulates bash's nested $() at the C level:
+    ///   result = $(echo $(cat /etc/hostname))
+    ///
+    /// Step by step:
+    /// 1. Create outer capture pipe
+    /// 2. Fork outer child
+    /// 3. Outer child creates inner capture pipe
+    /// 4. Outer child forks inner child
+    /// 5. Inner child dup2(inner_write → stdout), exec("cat", "/etc/hostname")
+    /// 6. Inner child writes, exits
+    /// 7. Outer child reads inner capture pipe → gets inner result
+    /// 8. Outer child writes inner result to outer capture pipe (stdout)
+    /// 9. Outer child exits
+    /// 10. Parent reads outer capture pipe → gets final result
+    fn test_nested_capture() -> bool {
+        let self_exe = std::env::current_exe().unwrap();
+        let self_exe_c = std::ffi::CString::new(self_exe.to_str().unwrap()).unwrap();
+
+        // Outer capture pipe
+        let mut outer_pipe = [0i32; 2];
+        if unsafe { libc::pipe(outer_pipe.as_mut_ptr()) } != 0 {
+            println!("  nested_capture: outer pipe failed");
+            return false;
+        }
+
+        let outer_pid = unsafe { libc::fork() };
+        if outer_pid < 0 {
+            println!("  nested_capture: outer fork failed");
+            return false;
+        }
+        if outer_pid == 0 {
+            // === OUTER CHILD ===
+            unsafe { libc::close(outer_pipe[0]) }; // close read end
+
+            // Inner capture pipe
+            let mut inner_pipe = [0i32; 2];
+            if unsafe { libc::pipe(inner_pipe.as_mut_ptr()) } != 0 {
+                unsafe { libc::_exit(1) };
+            }
+
+            let inner_pid = unsafe { libc::fork() };
+            if inner_pid < 0 {
+                unsafe { libc::_exit(2) };
+            }
+            if inner_pid == 0 {
+                // === INNER CHILD ===
+                unsafe {
+                    libc::close(inner_pipe[0]); // close read end
+                    libc::dup2(inner_pipe[1], 1); // stdout → inner pipe write
+                    libc::close(inner_pipe[1]);
+                    libc::close(outer_pipe[1]); // close outer write end
+                }
+                // Exec "echo-test" which writes "ECHO_TEST_OK\n" to stdout
+                let args = [self_exe_c.as_ptr(), c"echo-test".as_ptr(), std::ptr::null()];
+                unsafe { libc::execv(self_exe_c.as_ptr(), args.as_ptr()) };
+                unsafe { libc::_exit(127) };
+            }
+
+            // Outer child: close inner write end, read from inner pipe
+            unsafe { libc::close(inner_pipe[1]) };
+            let mut inner_buf = [0u8; 4096];
+            let inner_n =
+                unsafe { libc::read(inner_pipe[0], inner_buf.as_mut_ptr() as *mut _, 4096) };
+            unsafe { libc::close(inner_pipe[0]) };
+
+            // Wait for inner child
+            unsafe { libc::waitpid(inner_pid, std::ptr::null_mut(), 0) };
+
+            if inner_n <= 0 {
+                // Write diagnostic to outer pipe with errno info
+                let errno = unsafe { *libc::__errno_location() };
+                let msg = format!("INNER_READ_FAILED:n={inner_n},errno={errno}\n");
+                unsafe { libc::write(outer_pipe[1], msg.as_ptr() as *const _, msg.len()) };
+            } else {
+                // Forward inner result to outer pipe
+                unsafe {
+                    libc::write(
+                        outer_pipe[1],
+                        inner_buf.as_ptr() as *const _,
+                        inner_n as usize,
+                    )
+                };
+            }
+            unsafe {
+                libc::close(outer_pipe[1]);
+                libc::_exit(0);
+            }
+        }
+
+        // === PARENT ===
+        unsafe { libc::close(outer_pipe[1]) }; // close write end
+
+        let mut outer_buf = [0u8; 4096];
+        let outer_n = unsafe { libc::read(outer_pipe[0], outer_buf.as_mut_ptr() as *mut _, 4096) };
+        unsafe { libc::close(outer_pipe[0]) };
+
+        let mut status = 0i32;
+        unsafe { libc::waitpid(outer_pid, &mut status, 0) };
+
+        if outer_n <= 0 {
+            println!(
+                "  nested_capture: parent read 0 bytes (outer child exit={})",
+                if libc::WIFEXITED(status) {
+                    libc::WEXITSTATUS(status)
+                } else {
+                    -1
+                }
+            );
+            return false;
+        }
+        let got = std::str::from_utf8(&outer_buf[..outer_n as usize]).unwrap_or("???");
+        if got.contains("INNER_READ_FAILED") {
+            println!("  nested_capture: {got}");
+            return false;
+        }
+        if !got.contains("ECHO_TEST_OK") {
+            println!("  nested_capture: unexpected output: {got:?}");
             return false;
         }
         true
