@@ -2355,7 +2355,7 @@ mod tests {
     use core::sync::atomic::AtomicU32;
     use std::thread::sleep;
 
-    use litebox::platform::RawMutex;
+    use litebox::{fs::OFlags, platform::RawMutex};
 
     use crate::LinuxUserland;
     use litebox::platform::PageManagementProvider;
@@ -2399,13 +2399,27 @@ mod tests {
     fn test_seccomp_filter() {
         let _platform = LinuxUserland::new(None);
         LinuxUserland::enable_seccomp_filter();
-        let pathname = "/tmp/test_seccomp";
+        let pathname = c"/tmp/test_seccomp";
         let res = unsafe {
             syscalls::syscall2(syscalls::Sysno::mkdir, pathname.as_ptr() as usize, 0o755)
         };
         assert!(
             res.is_err() && res.unwrap_err() == syscalls::Errno::EINVAL,
             "mkdir should be blocked by seccomp filter"
+        );
+
+        let pathname =
+            std::ffi::CString::new(format!("{}/Cargo.toml", env!("CARGO_MANIFEST_DIR"))).unwrap();
+        let res = unsafe {
+            syscalls::syscall2(
+                syscalls::Sysno::open,
+                pathname.as_ptr() as usize,
+                OFlags::RDWR.bits() as usize,
+            )
+        };
+        assert!(
+            res.is_err() && res.unwrap_err() == syscalls::Errno::EINVAL,
+            "open with RDWR should be blocked by seccomp filter"
         );
     }
 }
