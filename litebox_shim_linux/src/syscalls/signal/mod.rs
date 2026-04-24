@@ -947,25 +947,18 @@ impl<FS: ShimFS> Task<FS> {
         self.signals.blocked.set(new_mask);
         self.signals.restore_mask.set(Some(old_mask));
 
-        // Wait until a signal becomes pending that is not blocked by new_mask.
+        // Check for pending signals once, then return EINTR immediately.
         //
-        // Use a very short timeout.  Thread-to-thread signals (e.g. from
-        // musl's internal threads) go through the host kernel and may not
-        // wake the shim's wait_until.  A short timeout lets the caller
-        // retry quickly — Node.js/musl call sigsuspend in a loop, so a
-        // fast return is expected.
-        let timeout_cx = self.wait_cx().with_timeout(Duration::from_millis(10));
-        let _ = timeout_cx.wait_until(|| {
-            self.drain_thread_signals();
-            self.drain_cross_process_signals();
-            let pending = self.signals.pending.borrow();
-            let shared = self.signals.shared_pending.lock();
-            pending.has_unblocked(new_mask) || shared.has_unblocked(new_mask)
-        });
+        // Thread-to-thread signals (e.g. from musl's internal threads)
+        // go through the host kernel and are delivered asynchronously
+        // via the platform's signal handler → drain_thread_signals.
+        // Blocking here is pointless and harmful: the CLI's musl runtime
+        // calls sigsuspend thousands of times during startup, and even
+        // a 10ms wait per call adds up to tens of seconds.
+        self.drain_thread_signals();
+        self.drain_cross_process_signals();
 
-        // sigsuspend always returns EINTR.  The caller (do_syscall)
-        // calls process_signals() after we return, which will deliver
-        // the signal and restore the mask via restore_mask.
+        // sigsuspend always returns EINTR.
         Err(Errno::EINTR)
     }
 
