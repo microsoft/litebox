@@ -1377,6 +1377,19 @@ pub(crate) async fn loopback_tcp_tests(r: &mut TestRunner) {
             ),
             check: |s| s.contains("REPLY=LB_ANY"),
         },
+        // Cross-worker: server does CPU work after listen() before accept()
+        // (Node.js pattern: listen succeeds, module loading delays accept)
+        LBTest {
+            name: "busy_after_listen",
+            script_template: concat!(
+                "{exe} tcp-listen-busy 19880 3 > /dev/null 2>&1 &\n",
+                "PID=$!\nsleep 1\n",
+                "REPLY=$(echo LB_BUSY | nc -q5 -w10 127.0.0.1 19880 2>/dev/null)\n",
+                "echo REPLY=$REPLY\n",
+                "kill $PID 2>/dev/null; wait $PID 2>/dev/null\n",
+            ),
+            check: |s| s.contains("REPLY=LB_BUSY"),
+        },
     ];
 
     for &agent in AGENTS {

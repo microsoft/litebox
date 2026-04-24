@@ -97,6 +97,41 @@ fn main() {
         "echo-test" => {
             println!("ECHO_TEST_OK");
         }
+        "tcp-listen-busy" => {
+            // Listen on a TCP port, then do CPU-bound work for N seconds
+            // BEFORE calling accept(). This simulates Node.js initialization:
+            // listen() succeeds (port-listen notification sent to broker),
+            // but accept() is delayed while the runtime loads modules.
+            let port: u16 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(9999);
+            let busy_secs: u64 = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(3);
+            let listener = std::net::TcpListener::bind(format!("0.0.0.0:{port}"))
+                .expect("tcp-listen-busy: bind failed");
+            eprintln!("[tcp-listen-busy] listening on 0.0.0.0:{port}, busy for {busy_secs}s");
+            // CPU-bound busy loop (no syscalls that would trigger smoltcp polling)
+            let start = std::time::Instant::now();
+            let mut counter: u64 = 0;
+            while start.elapsed().as_secs() < busy_secs {
+                counter = counter.wrapping_add(1);
+                // Prevent the loop from being optimized away
+                std::hint::black_box(counter);
+            }
+            eprintln!("[tcp-listen-busy] busy loop done, calling accept");
+            if let Ok((mut stream, addr)) = listener.accept() {
+                eprintln!("[tcp-listen-busy] accepted from {addr}");
+                use std::io::{Read, Write};
+                let mut buf = [0u8; 4096];
+                match stream.read(&mut buf) {
+                    Ok(n) if n > 0 => {
+                        eprintln!("[tcp-listen-busy] read {n} bytes, echoing");
+                        let _ = stream.write_all(&buf[..n]);
+                        let _ = stream.flush();
+                    }
+                    Ok(_) => eprintln!("[tcp-listen-busy] read 0 bytes"),
+                    Err(e) => eprintln!("[tcp-listen-busy] read error: {e}"),
+                }
+            }
+            eprintln!("[tcp-listen-busy] exiting");
+        }
         "tcp-echo" => {
             // Listen on a TCP port and echo back whatever is received.
             // Used for cross-worker loopback TCP tests.

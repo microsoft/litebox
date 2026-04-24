@@ -276,28 +276,6 @@ impl phy::TxToken for TxToken<'_> {
         F: FnOnce(&mut [u8]) -> R,
     {
         let result = f(&mut self.tx_buf[..len]);
-        // Debug: log outgoing TCP packets for port 19880
-        let pkt = &self.tx_buf[..len];
-        if len >= 40 && pkt[9] == 6 {
-            let ihl = (pkt[0] & 0x0F) as usize * 4;
-            if len >= ihl + 14 {
-                let tcp = &pkt[ihl..];
-                let sp = u16::from_be_bytes([tcp[0], tcp[1]]);
-                let dp = u16::from_be_bytes([tcp[2], tcp[3]]);
-                if sp == 19880 || dp == 19880 || sp == 49152 || dp == 49152 {
-                    let flags = tcp[13];
-                    eprintln!(
-                        "[LB-TX] TCP {len}B: {:?}:{sp} → {:?}:{dp} flags={}{}{}{}",
-                        &pkt[12..16],
-                        &pkt[16..20],
-                        if flags & 0x02 != 0 { "S" } else { "" },
-                        if flags & 0x10 != 0 { "A" } else { "" },
-                        if flags & 0x01 != 0 { "F" } else { "" },
-                        if flags & 0x04 != 0 { "R" } else { "" },
-                    );
-                }
-            }
-        }
         send_ipc_frame(self.fd, &self.tx_buf[..len]);
         result
     }

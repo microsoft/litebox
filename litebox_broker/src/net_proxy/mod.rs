@@ -70,6 +70,8 @@ struct TcpBridge {
     dest: SocketAddr,
     /// Whether the host side has reached EOF.
     host_eof: bool,
+    /// Whether the guest side has reached EOF (FIN received).
+    guest_eof: bool,
 }
 
 /// A TCP connection in the process of connecting to the host (non-blocking).
@@ -859,44 +861,11 @@ fn run_inner(
             device.send_shutdown();
             break;
         }
-        // Debug: log staged packet details for TCP
-        if let Some(len) = device.rx_len {
-            let pkt = &device.rx_buf[..len];
-            if len >= 40 && pkt[9] == 6 {
-                // TCP packet
-                let ihl = (pkt[0] & 0x0F) as usize * 4;
-                if len >= ihl + 14 {
-                    let tcp = &pkt[ihl..];
-                    let flags = tcp[13];
-                    let src_port = u16::from_be_bytes([tcp[0], tcp[1]]);
-                    let dst_port = u16::from_be_bytes([tcp[2], tcp[3]]);
-                    let syn = flags & 0x02 != 0;
-                    let ack = flags & 0x10 != 0;
-                    let fin = flags & 0x01 != 0;
-                    let rst = flags & 0x04 != 0;
-                    if dst_port == 19880 || src_port == 19880 {
-                        eprintln!(
-                            "[LB-PKT] TCP {len}B: {:?}:{src_port} → {:?}:{dst_port} flags={}{}{}{}",
-                            &pkt[12..16],
-                            &pkt[16..20],
-                            if syn { "S" } else { "" },
-                            if ack { "A" } else { "" },
-                            if fin { "F" } else { "" },
-                            if rst { "R" } else { "" },
-                        );
-                    }
-                }
-            }
-        }
 
         // Step 1b: Check for port-listen control messages.
         // Workers send these when they call listen(port) to register
         // their interest in receiving inbound connections.
         if let Some((port, is_listen)) = device.take_port_listen_msg() {
-            eprintln!(
-                "[LB-DEBUG] port_listen_msg: port={port} is_listen={is_listen} has_inbound_tx={}",
-                inbound_routed_tx.is_some()
-            );
             if is_listen {
                 if let Some(ref tx) = inbound_routed_tx {
                     port_router.register(port, tx.clone());
@@ -927,10 +896,6 @@ fn run_inner(
             if let Some((src_ip, src_port, dst_ip, dst_port)) = device::parse_tcp_syn(packet) {
                 let dest_ipv4 = Ipv4Addr::from(dst_ip);
                 let flow_key = (src_ip, src_port, dst_ip, dst_port);
-                eprintln!(
-                    "[LB-DEBUG] SYN detected: {src_ip:?}:{src_port} → {dst_ip:?}:{dst_port} dest_ipv4={dest_ipv4} has_route={}",
-                    port_router.has_route(dst_port)
-                );
 
                 if dest_ipv4 == BROKER_IPV4 && local_services.get(dst_port).is_some() {
                     // Local service — no host connect needed. Create a listen
@@ -995,9 +960,6 @@ fn run_inner(
                                     );
                                     debug!(
                                         "cross-worker loopback: SYN {src_ip:?}:{src_port} → BROKER:{dst_port}, TCP pair created"
-                                    );
-                                    eprintln!(
-                                        "[LB-DEBUG] SYN routed: {src_ip:?}:{src_port} → {dest_ipv4}:{dst_port}, flow_key={flow_key:?}"
                                     );
                                 }
                             }
@@ -1502,6 +1464,7 @@ fn run_inner(
                             host_stream: stream,
                             dest,
                             host_eof: false,
+                            guest_eof: false,
                         });
                     }
                     Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
@@ -1547,9 +1510,6 @@ fn run_inner(
                     sockets.remove(handle);
                     continue;
                 }
-                eprintln!(
-                    "[LB-DEBUG] routed inbound: smoltcp connect {local} → {remote}, creating bridge"
-                );
 
                 let dest = SocketAddr::V4(SocketAddrV4::new(routed.guest_ip, routed.guest_port));
                 tcp_bridges.push(TcpBridge {
@@ -1557,6 +1517,7 @@ fn run_inner(
                     host_stream: routed.stream,
                     dest,
                     host_eof: false,
+                    guest_eof: false,
                 });
             }
         }
@@ -2181,11 +2142,17 @@ fn promote_established(
     local_services: &LocalServiceRegistry,
 ) {
     // Collect established sockets from listen_sockets.
+    // Also promote sockets in CloseWait — the guest may have sent data + FIN
+    // in a single TCP segment, causing the socket to skip Established and land
+    // directly in CloseWait within one iface.poll() call.
     let mut newly_established: Vec<(SocketHandle, Ipv4Addr, u16)> = Vec::new();
     let mut listen_keys_to_remove: Vec<(Ipv4Addr, u16)> = Vec::new();
     for (&key, &handle) in listen_sockets.iter() {
         let socket: &tcp::Socket = sockets.get(handle);
-        if socket.state() == tcp::State::Established {
+        if matches!(
+            socket.state(),
+            tcp::State::Established | tcp::State::CloseWait
+        ) {
             listen_keys_to_remove.push(key);
             newly_established.push((handle, key.0, key.1));
         }
@@ -2198,7 +2165,10 @@ fn promote_established(
     let mut accepting_indices: Vec<usize> = Vec::new();
     for (i, &(handle, dest_ip, dest_port)) in accepting_sockets.iter().enumerate() {
         let socket: &tcp::Socket = sockets.get(handle);
-        if socket.state() == tcp::State::Established {
+        if matches!(
+            socket.state(),
+            tcp::State::Established | tcp::State::CloseWait
+        ) {
             accepting_indices.push(i);
             newly_established.push((handle, dest_ip, dest_port));
         }
@@ -2223,10 +2193,6 @@ fn promote_established(
                     _ => [0; 4],
                 };
                 let flow_key = (src_ip, remote.port, dest_ip.octets(), dest_port);
-                eprintln!(
-                    "[LB-DEBUG] promote: checking flow_key={flow_key:?} in ready_host_streams (len={})",
-                    ready_host_streams.len()
-                );
                 if let Some((stream, _)) = ready_host_streams.remove(&flow_key) {
                     stream.set_nonblocking(true).ok();
                     let dest = SocketAddr::V4(SocketAddrV4::new(dest_ip, dest_port));
@@ -2235,6 +2201,7 @@ fn promote_established(
                         host_stream: stream,
                         dest,
                         host_eof: false,
+                        guest_eof: false,
                     });
                     info!("cross-worker bridge created for {dest_ip}:{dest_port}");
                     found_host_stream = true;
@@ -2323,6 +2290,7 @@ fn promote_established(
                     host_stream: stream,
                     dest,
                     host_eof: false,
+                    guest_eof: false,
                 });
             } else {
                 let socket: &mut tcp::Socket = sockets.get_mut(handle);
@@ -2409,6 +2377,21 @@ fn relay_tcp(sockets: &mut SocketSet<'_>, bridges: &mut Vec<TcpBridge>) {
                     continue;
                 }
             }
+        } else if !bridge.guest_eof
+            && matches!(
+                socket.state(),
+                tcp::State::CloseWait
+                    | tcp::State::LastAck
+                    | tcp::State::Closing
+                    | tcp::State::TimeWait
+            )
+        {
+            // Guest sent FIN — propagate half-close to the host stream so the
+            // other end of the TCP pair (or real host socket) sees EOF.
+            bridge.guest_eof = true;
+            use std::net::Shutdown;
+            bridge.host_stream.shutdown(Shutdown::Write).ok();
+            debug!("guest EOF, shutdown host write for {}", bridge.dest);
         }
 
         // Host → Guest: read from host only up to what smoltcp can accept.
