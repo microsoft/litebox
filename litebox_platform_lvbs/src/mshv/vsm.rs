@@ -1107,9 +1107,15 @@ impl Vtl0KernelInfo {
         self.system_certs.get().map(|b| &**b)
     }
 
-    // This function finds the precomputed patch data corresponding to the input patch data.
-    // We need this because each step of `mshv_vsm_patch_data`/`text_poke_bp_batch` only
-    // provides a part of the patch data and addresses (`patch[0]` or `patch[1..patch_size-1]`).
+    /// This function finds the precomputed patch data corresponding to the input patch data.
+    ///
+    /// Each step of `text_poke_bp_batch` only exposes a portion of the target's address range,
+    /// so we look up in the precomputed map by two keys derived from `patch_data.pa[0]`:
+    /// - `pa[0]` matches step 1 or 3 (target's first byte) and, for a precomputed patch that
+    ///   straddles at offset 1, step 2.
+    /// - `pa[0] - 1` matches step 2 where `patch.pa[0] == precomputed.pa[0] + 1`.
+    ///
+    /// No legitimate step requires looking up by `patch.pa[1]`.
     pub fn find_precomputed_patch(&self, patch_data: &HekiPatch) -> Option<HekiPatch> {
         // `HekiPatch::is_valid` already validated both physical addresses.
         let patch_pa_0 = PhysAddr::new(patch_data.pa[0]);
