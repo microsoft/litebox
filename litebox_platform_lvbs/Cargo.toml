@@ -44,6 +44,7 @@ litebox_util_log = { version = "0.1.0", path = "../litebox_util_log" }
 default = ["optee_syscall"]
 optee_syscall = []
 linux_syscall = []
+devbox = []
 
 [lints]
 workspace = true

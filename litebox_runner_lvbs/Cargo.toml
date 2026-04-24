@@ -19,5 +19,8 @@ once_cell = { version = "1.21.3", default-features = false, features = ["race", 
 [target.'cfg(target_arch = "x86_64")'.dependencies]
 x86_64 = { version = "0.15.2", default-features = false, features = ["instructions"] }
 
+[features]
+devbox = ["litebox_platform_lvbs/devbox"]
+
 [lints]
 workspace = true
