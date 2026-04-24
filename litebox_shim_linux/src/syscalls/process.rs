@@ -2742,6 +2742,12 @@ impl<FS: ShimFS> Task<FS> {
             .register_running_process_local(child_process_id)
             .expect("newly forked process must be registered to the local host");
 
+        // Register guest PID → ProcessId mapping for signal delivery.
+        self.global
+            .pid_to_process_id
+            .write()
+            .insert(child_pid, child_process_id);
+
         let r = unsafe {
             self.global.platform.spawn_thread(
                 ctx,

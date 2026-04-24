@@ -390,6 +390,7 @@ impl LinuxShimBuilder {
             epoll_graph_lock: litebox::sync::Mutex::new(()),
             control_plane,
             fork_child_host_pids: litebox::sync::RwLock::new(alloc::collections::BTreeMap::new()),
+            pid_to_process_id: litebox::sync::RwLock::new(alloc::collections::BTreeMap::new()),
         });
         LinuxShim {
             global,
@@ -451,6 +452,15 @@ impl<FS: ShimFS> LinuxShim<FS> {
         // (for example, when a child resumes in its own host process), so keep
         // future clone() allocations above that main thread ID.
         self.global.reserve_thread_id(pid);
+
+        // Register guest PID → ProcessId mapping for the init process.
+        // For the init task, `pid` comes from the host thread ID and may
+        // differ from ProcessId::INIT (1). This mapping allows sys_kill to
+        // find the correct ProcessId when given a guest PID.
+        self.global
+            .pid_to_process_id
+            .write()
+            .insert(pid, litebox::process::ProcessId::INIT);
 
         let files = syscalls::file::FilesState::new(fs);
         files.set_max_fd(syscalls::process::RLIMIT_NOFILE_CUR - 1);
@@ -3396,6 +3406,13 @@ struct GlobalState<FS: ShimFS> {
     /// Mapping from fork child guest ProcessId.0 → worker host OS PID.
     /// Used to forward signals (e.g. SIGKILL) to the correct worker host.
     fork_child_host_pids: litebox::sync::RwLock<Platform, alloc::collections::BTreeMap<u32, i32>>,
+    /// Mapping from guest PID (the value returned by getpid()) to ProcessId.
+    /// For forked children these are equal, but the init process may have a
+    /// host-derived PID (e.g. 8) while its ProcessId is always 1.
+    pid_to_process_id: litebox::sync::RwLock<
+        Platform,
+        alloc::collections::BTreeMap<i32, litebox::process::ProcessId>,
+    >,
 }
 
 impl<FS: ShimFS> GlobalState<FS> {
