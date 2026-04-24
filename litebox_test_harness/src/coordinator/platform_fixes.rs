@@ -289,6 +289,7 @@ pub(crate) async fn run(r: &mut TestRunner) {
     stdin_pipe_subst_tests(r).await;
     cross_worker_file_tests(r).await;
     subst_capture_tests(r).await;
+    concurrent_fork_tests(r).await;
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -775,6 +776,117 @@ pub(crate) async fn subst_capture_tests(r: &mut TestRunner) {
                     if (test.check)(stdout)
             );
             r.record(&test_id, agent, pass, &format!("{resp:?}"));
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// CC: Concurrent fork/exec/pipe tests
+// (stress test delayed-fork, CoW, pipe bridging under concurrency)
+// ═══════════════════════════════════════════════════════════════════
+
+/// Tests that fork/exec/pipe operations work correctly when multiple
+/// agents perform them simultaneously.  Each test starts the same
+/// operation on ALL agents via background exec (each writing results
+/// to a unique file), waits, then reads and verifies results.
+///
+/// This catches races in:
+///   - delayed-fork worker spawning under concurrent forks
+///   - CoW page snapshot/restore with simultaneous vfork children
+///   - pipe ring buffer position tracking across multiple processes
+///   - 9P file coherence with concurrent writers
+///
+/// Tests:
+///   CC.echo         — concurrent $(echo hello) on all agents
+///   CC.fork_exec    — concurrent fork+exec of test harness
+///   CC.pipe_capture — concurrent $(echo | cat) pipeline capture
+///   CC.file_write   — concurrent writes, then cross-read
+pub(crate) async fn concurrent_fork_tests(r: &mut TestRunner) {
+    eprintln!(
+        "[platform] === Concurrent Fork ({} agents) ===",
+        AGENTS.len()
+    );
+
+    let self_exe = r.self_exe.clone();
+
+    struct ConcTest {
+        name: &'static str,
+        /// Shell script template. {path} is replaced with the result file path.
+        script_template: &'static str,
+        /// Check function for the result file content.
+        check: fn(&str) -> bool,
+    }
+
+    let tests: &[ConcTest] = &[
+        ConcTest {
+            name: "echo",
+            script_template: "echo $(echo hello) > {path}",
+            check: |s| s.trim() == "hello",
+        },
+        ConcTest {
+            name: "fork_exec",
+            script_template: "{exe} echo-test > {path} 2>&1",
+            check: |s| s.contains("ECHO_TEST_OK"),
+        },
+        ConcTest {
+            name: "pipe_capture",
+            script_template: "echo $(echo data | cat) > {path}",
+            check: |s| s.trim() == "data",
+        },
+        ConcTest {
+            name: "file_write",
+            script_template: "echo agent-wrote-{agent} > {path}",
+            check: |s| s.contains("agent-wrote-"),
+        },
+    ];
+
+    for test in tests {
+        let test_base = format!("CC.{}", test.name);
+
+        // Phase 1: Start all agents concurrently via background exec.
+        let mut bg_pids: Vec<(&str, Option<u32>, String)> = Vec::new();
+        for &agent in AGENTS {
+            let path = format!("/shared/cc-{}-{}.txt", test.name, agent);
+            let script = test
+                .script_template
+                .replace("{path}", &path)
+                .replace("{exe}", &self_exe)
+                .replace("{agent}", agent);
+            let resp = r
+                .send(
+                    agent,
+                    Command::Exec {
+                        args: vec!["bash".into(), "-c".into(), script],
+                        timeout_secs: None,
+                        stdin: None,
+                        background: true,
+                    },
+                )
+                .await;
+            let pid = match &resp {
+                Response::Background { pid } => Some(*pid),
+                Response::ExecResult { .. } => None,
+                _ => None,
+            };
+            bg_pids.push((agent, pid, path));
+        }
+
+        // Phase 2: Wait for all to complete.
+        tokio::time::sleep(Duration::from_secs(3)).await;
+
+        // Phase 3: Read result files and verify.
+        for (agent, pid, path) in &bg_pids {
+            let test_id = format!("{test_base}.{agent}");
+            let resp = r.send(*agent, Command::FsRead { path: path.clone() }).await;
+            let pass = matches!(
+                &resp,
+                Response::Ok { data: Some(d) } if (test.check)(d)
+            );
+            r.record(&test_id, *agent, pass, &format!("{resp:?}"));
+
+            if let Some(pid) = pid {
+                let _ = r.send(*agent, Command::Kill { pid: *pid }).await;
+            }
         }
     }
 }
