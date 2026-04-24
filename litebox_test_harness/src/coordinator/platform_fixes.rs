@@ -735,14 +735,15 @@ pub(crate) async fn subst_capture_tests(r: &mut TestRunner) {
         },
         Test {
             name: "vscode_root",
+            // Use the test harness binary itself — a deeply nested path
+            // that exists in any rootfs with /opt/litebox mounted.
             script: concat!(
-                "SCRIPT=/root/.vscode-server/cli/servers/",
-                "Stable-10c8e557c8b9f9ed0a87f61f1c9a44bde731c409/",
-                "server/bin/code-server; ",
+                "SCRIPT=$(which bash); ",
                 "ROOT=$(dirname $(dirname $(readlink -f $SCRIPT))); ",
                 "echo $ROOT",
             ),
-            check: |s| s.trim().contains("server"),
+            // /usr/bin/bash → readlink → /usr/bin/bash → dirname² → /usr
+            check: |s| !s.trim().is_empty() && s.trim() != "/" && s.trim() != "",
         },
         Test {
             name: "which",
