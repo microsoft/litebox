@@ -292,6 +292,7 @@ pub(crate) async fn run(r: &mut TestRunner) {
     concurrent_fork_tests(r).await;
     touch_redirect_tests(r).await;
     vscode_install_pattern_tests(r).await;
+    pid_visibility_tests(r).await;
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -1100,6 +1101,128 @@ pub(crate) async fn vscode_install_pattern_tests(r: &mut TestRunner) {
                 .script_template
                 .replace("{path}", &path)
                 .replace("{exe}", &self_exe);
+            let resp = r
+                .send(
+                    agent,
+                    Command::Exec {
+                        args: vec!["bash".into(), "-c".into(), script],
+                        timeout_secs: Some(15),
+                        stdin: None,
+                        background: false,
+                    },
+                )
+                .await;
+            let pass = matches!(
+                &resp,
+                Response::ExecResult { stdout, .. }
+                    if (test.check)(stdout)
+            );
+            r.record(&test_id, agent, pass, &format!("{resp:?}"));
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// KP: kill -0 PID visibility across delayed-fork migration
+// (VS Code CLI uses --parent-process-id and monitors via /proc)
+// ═══════════════════════════════════════════════════════════════════
+
+/// After fork+exec, the child is migrated to a new worker via delayed fork.
+/// The parent must be able to see the child via kill -0, and the child must
+/// be able to see the parent via /proc/<ppid> and kill -0.
+///
+/// Tests:
+///   KP.kill0_bg       — parent kill -0 $! succeeds for background process
+///   KP.kill0_many     — kill -0 after many prior forks (higher PID)
+///   KP.ppid_proc      — child sees parent in /proc/<ppid>
+///   KP.ppid_kill0     — child can kill -0 parent
+///   KP.parent_monitor — process monitoring parent PID stays alive
+pub(crate) async fn pid_visibility_tests(r: &mut TestRunner) {
+    eprintln!(
+        "[platform] === PID Visibility ({} agents) ===",
+        AGENTS.len()
+    );
+
+    let self_exe = r.self_exe.clone();
+
+    struct KPTest {
+        name: &'static str,
+        script_template: &'static str,
+        check: fn(&str) -> bool,
+    }
+
+    let tests: &[KPTest] = &[
+        // Basic: kill -0 $! after background fork+exec
+        KPTest {
+            name: "kill0_bg",
+            script_template: concat!(
+                "{exe} slow-echo > /dev/null 2>&1 &\n",
+                "PID=$!\n",
+                "kill -0 $PID 2>/dev/null && echo KILL0_OK || echo KILL0_FAIL\n",
+                "kill $PID 2>/dev/null; wait $PID 2>/dev/null\n",
+            ),
+            check: |s| s.contains("KILL0_OK"),
+        },
+        // kill -0 after many prior forks (simulates install script PID buildup)
+        KPTest {
+            name: "kill0_many",
+            script_template: concat!(
+                "A=$(cat /etc/os-release | head -1)\n",
+                "B=$(uname -m)\n",
+                "C=$(ls /tmp | head -1)\n",
+                "D=$(echo x | cat)\n",
+                "{exe} slow-echo > /dev/null 2>&1 &\n",
+                "PID=$!\n",
+                "kill -0 $PID 2>/dev/null && echo KILL0_OK || echo KILL0_FAIL\n",
+                "sleep 1\n",
+                "kill -0 $PID 2>/dev/null && echo KILL0_1s_OK || echo KILL0_1s_FAIL\n",
+                "kill $PID 2>/dev/null; wait $PID 2>/dev/null\n",
+            ),
+            check: |s| s.contains("KILL0_OK") && s.contains("KILL0_1s_OK"),
+        },
+        // Child checks parent visibility via /proc/<ppid>
+        KPTest {
+            name: "ppid_proc",
+            script_template: concat!(
+                "{exe} check-ppid > /tmp/ppid-test.txt 2>&1 &\n",
+                "wait $!\n",
+                "cat /tmp/ppid-test.txt\n",
+            ),
+            check: |s| s.contains("proc=true"),
+        },
+        // Child checks parent visibility via kill -0
+        KPTest {
+            name: "ppid_kill0",
+            script_template: concat!(
+                "{exe} check-ppid > /tmp/ppid-k0.txt 2>&1 &\n",
+                "wait $!\n",
+                "cat /tmp/ppid-k0.txt\n",
+            ),
+            check: |s| s.contains("kill0=true"),
+        },
+        // Simulates --parent-process-id monitoring: child checks parent
+        // periodically and exits if parent disappears. Parent must see
+        // child alive throughout.
+        KPTest {
+            name: "parent_monitor",
+            script_template: concat!(
+                "{exe} check-ppid > /tmp/pmon.txt 2>&1 &\n",
+                "PID=$!\n",
+                "sleep 1\n",
+                "kill -0 $PID 2>/dev/null && echo CHILD_ALIVE || echo CHILD_DEAD\n",
+                "wait $PID 2>/dev/null\n",
+                "cat /tmp/pmon.txt\n",
+            ),
+            check: |s| {
+                s.contains("CHILD_ALIVE") && s.contains("proc=true") && s.contains("kill0=true")
+            },
+        },
+    ];
+
+    for &agent in AGENTS {
+        for test in tests {
+            let test_id = format!("KP.{}.{}", test.name, agent);
+            let script = test.script_template.replace("{exe}", &self_exe);
             let resp = r
                 .send(
                     agent,

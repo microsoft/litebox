@@ -102,6 +102,16 @@ fn main() {
             std::thread::sleep(std::time::Duration::from_secs(3));
             println!("SLOW_ECHO_OK");
         }
+        "check-ppid" => {
+            // Reports parent PID visibility via /proc and kill -0.
+            // Used to test cross-worker PID visibility after delayed-fork migration.
+            let ppid = unsafe { libc::getppid() };
+            let proc_exists = std::path::Path::new(&format!("/proc/{ppid}")).exists();
+            let kill_ok = unsafe { libc::kill(ppid, 0) } == 0;
+            println!("ppid={ppid} proc={proc_exists} kill0={kill_ok}");
+            // Stay alive for a few seconds so the parent can check our PID too.
+            std::thread::sleep(std::time::Duration::from_secs(3));
+        }
         "write-then-exit" => {
             // Write exactly `size` bytes of known pattern to stdout, then exit.
             // Used to test bridge thread join — without it, large writes truncate.
