@@ -480,7 +480,14 @@ impl LinuxUserland {
             rules.into_iter().collect();
         let filter = SeccompFilter::new(
             rule_map,
-            SeccompAction::Errno(libc::EINVAL.cast_unsigned()),
+            // In debug builds, log violations instead of silently returning an error so that
+            // it won't fail silently during development (which may hard to debug) and we can
+            // tell there are missing seccomp rules to be added by comparing debug and release runs.
+            if cfg!(debug_assertions) {
+                SeccompAction::Log
+            } else {
+                SeccompAction::Errno(libc::EINVAL.cast_unsigned())
+            },
             SeccompAction::Allow,
             seccompiler::TargetArch::x86_64,
         )
@@ -2397,29 +2404,124 @@ mod tests {
 
     #[test]
     fn test_seccomp_filter() {
-        let _platform = LinuxUserland::new(None);
+        let _platform: &LinuxUserland = LinuxUserland::new(None);
+
+        // In debug builds the default action is `SeccompAction::Log`, which only
+        // emits an `AUDIT_SECCOMP` record (visible via auditd or `dmesg`) but lets
+        // the syscall proceed. In release builds the default action is
+        // `SeccompAction::Errno(EINVAL)`, which blocks the syscall.
+        let expect_blocked = !cfg!(debug_assertions);
+
+        // In Log mode, try to open `/dev/kmsg` *before* installing the filter so
+        // that we can later read the seccomp audit messages emitted by the
+        // kernel. This requires `CAP_SYSLOG` (or `dmesg_restrict=0`); if it is
+        // not available we just skip the log-content check.
+        //
+        // We also seek to the end of the buffer here (`lseek` isn't in the
+        // seccomp allowlist, so this must happen before installing the filter).
+        let kmsg_fd: Option<usize> = if expect_blocked {
+            None
+        } else {
+            let path = c"/dev/kmsg";
+            let r = unsafe {
+                syscalls::syscall3(
+                    syscalls::Sysno::open,
+                    path.as_ptr() as usize,
+                    (OFlags::RDONLY | OFlags::NONBLOCK).bits() as usize,
+                    0,
+                )
+            };
+            match r {
+                Ok(fd) => {
+                    // Seek to the end so we only see new messages.
+                    let _ = unsafe {
+                        syscalls::syscall3(syscalls::Sysno::lseek, fd, 0, libc::SEEK_END as usize)
+                    };
+                    Some(fd)
+                }
+                Err(_) => None,
+            }
+        };
+
         LinuxUserland::enable_seccomp_filter();
+
         let pathname = c"/tmp/test_seccomp";
-        let res = unsafe {
+        let mkdir_res = unsafe {
             syscalls::syscall2(syscalls::Sysno::mkdir, pathname.as_ptr() as usize, 0o755)
         };
-        assert!(
-            res.is_err() && res.unwrap_err() == syscalls::Errno::EINVAL,
-            "mkdir should be blocked by seccomp filter"
-        );
+        if expect_blocked {
+            assert_eq!(
+                mkdir_res.unwrap_err(),
+                syscalls::Errno::EINVAL,
+                "mkdir should be blocked by seccomp filter"
+            );
+        } else {
+            // In Log mode the syscall proceeds; clean up (also generates a Log record).
+            let _ =
+                unsafe { syscalls::syscall1(syscalls::Sysno::rmdir, pathname.as_ptr() as usize) };
+        }
 
         let pathname =
             std::ffi::CString::new(format!("{}/Cargo.toml", env!("CARGO_MANIFEST_DIR"))).unwrap();
-        let res = unsafe {
+        let open_res = unsafe {
             syscalls::syscall2(
                 syscalls::Sysno::open,
                 pathname.as_ptr() as usize,
                 OFlags::RDWR.bits() as usize,
             )
         };
-        assert!(
-            res.is_err() && res.unwrap_err() == syscalls::Errno::EINVAL,
-            "open with RDWR should be blocked by seccomp filter"
-        );
+        if expect_blocked {
+            assert_eq!(
+                open_res.unwrap_err(),
+                syscalls::Errno::EINVAL,
+                "open with RDWR should be blocked by seccomp filter"
+            );
+        }
+
+        // In Log mode, drain `/dev/kmsg` and verify that the kernel emitted an
+        // `audit: type=1326 ... seccomp ...` record for one of our offending
+        // syscalls. If we couldn't open `/dev/kmsg` (no `CAP_SYSLOG`), skip.
+        if let Some(fd) = kmsg_fd {
+            let mut found = false;
+            let mut buf = [0u8; 4096];
+            loop {
+                let n = unsafe {
+                    syscalls::syscall3(
+                        syscalls::Sysno::read,
+                        fd,
+                        buf.as_mut_ptr() as usize,
+                        buf.len(),
+                    )
+                };
+                match n {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        let line = String::from_utf8_lossy(&buf[..n]);
+                        // Audit seccomp records have type=1326 and the offending
+                        // syscall number, e.g. `syscall=83` for mkdir or
+                        // `syscall=2` for open on x86_64.
+                        if line.contains("type=1326")
+                            && (line.contains(&format!("syscall={}", libc::SYS_mkdir))
+                                || line.contains(&format!("syscall={}", libc::SYS_open)))
+                        {
+                            found = true;
+                        }
+                    }
+                }
+            }
+            let _ = unsafe { syscalls::syscall1(syscalls::Sysno::close, fd) };
+            assert!(
+                found,
+                "expected an AUDIT_SECCOMP (type=1326) record for mkdir/open in /dev/kmsg"
+            );
+            eprintln!(
+                "test_seccomp_filter: found AUDIT_SECCOMP record for mkdir/open in /dev/kmsg"
+            );
+        } else if !expect_blocked {
+            eprintln!(
+                "test_seccomp_filter: /dev/kmsg not readable (need CAP_SYSLOG \
+                 or dmesg_restrict=0); skipping log-content check"
+            );
+        }
     }
 }

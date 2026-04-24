@@ -380,6 +380,9 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         envp
     };
 
+    #[cfg(target_arch = "x86_64")]
+    litebox_platform_linux_userland::LinuxUserland::enable_seccomp_filter();
+
     let program = shim.load_program(
         initial_file_system,
         platform.init_task(),
@@ -387,9 +390,6 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         argv,
         envp,
     )?;
-
-    #[cfg(target_arch = "x86_64")]
-    litebox_platform_linux_userland::LinuxUserland::enable_seccomp_filter();
 
     #[cfg(feature = "lock_tracing")]
     litebox::sync::start_recording();
