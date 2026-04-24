@@ -97,6 +97,11 @@ fn main() {
         "echo-test" => {
             println!("ECHO_TEST_OK");
         }
+        "slow-echo" => {
+            // Sleeps 3 seconds then prints, simulating a slow-starting server.
+            std::thread::sleep(std::time::Duration::from_secs(3));
+            println!("SLOW_ECHO_OK");
+        }
         "write-then-exit" => {
             // Write exactly `size` bytes of known pattern to stdout, then exit.
             // Used to test bridge thread join — without it, large writes truncate.
