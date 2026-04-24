@@ -2220,13 +2220,19 @@ impl<FS: ShimFS> Task<FS> {
             Some(
                 // Terminal — child leaves vfork mode.
                 Sysno::execve | Sysno::execveat | Sysno::exit | Sysno::exit_group
-                // FD plumbing.
+                // FD plumbing.  `read` is needed for nested $() — the
+                // outer subshell reads the inner capture pipe's output
+                // before writing it to its own stdout.
                 | Sysno::close | Sysno::close_range | Sysno::dup | Sysno::dup2 | Sysno::dup3
                 | Sysno::open | Sysno::openat | Sysno::openat2 | Sysno::pipe2 | Sysno::write
+                | Sysno::read
                 // Fork — bash forks for pipelines inside $() subshells.
                 // Must be pre-exec so nested forks work without triggering
                 // migration (which would break capture pipes).
                 | Sysno::clone | Sysno::clone3 | Sysno::vfork | Sysno::fork
+                // Wait — bash waits for inner $() children to exit before
+                // writing their captured output to its own stdout.
+                | Sysno::wait4 | Sysno::waitid
                 // Directory.
                 | Sysno::chdir | Sysno::fchdir
                 // Process group.
