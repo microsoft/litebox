@@ -132,6 +132,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
     /// from shadowing the post-rename namespace.
     fn invalidate_cache_tree(root: &mut RootDir<Upper, Lower>, path: &str) {
         root.entries.remove(path);
+        root.lower_access_modes.remove(path);
         let prefix = alloc::format!("{path}/");
         let descendants: Vec<String> = root
             .entries
@@ -141,6 +142,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
             .collect();
         for k in descendants {
             root.entries.remove(&k);
+            root.lower_access_modes.remove(&k);
         }
     }
 
@@ -379,6 +381,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
         // open descriptors, this could be slow.
         let RootDir {
             entries: root_entries,
+            lower_access_modes: root_access_modes,
         } = &mut *self.root.write();
         // First we figure out which entries need to be moved up. These entries are arc-cloned into
         // a `Vec` so that we can release the lock the file descriptor table when setting things up
@@ -447,6 +450,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
                     assert!(Arc::ptr_eq(&old_entry, &entry));
                     drop(entry);
                     let root_entry = root_entries.remove(path).unwrap();
+                    root_access_modes.remove(path);
                     assert!(Arc::ptr_eq(&old_entry, &root_entry));
                     drop(root_entry);
                     let entry = Arc::into_inner(old_entry).unwrap();
@@ -763,12 +767,38 @@ impl<
                     // up in the layered descriptor).
                     match self.lower_fd_is_shareable(fd) {
                         Ok(true) => {
-                            return Ok(self.litebox.descriptor_table_mut().insert(Descriptor {
-                                path,
-                                flags,
-                                entry,
-                                position: 0.into(),
-                            }));
+                            // Check that the cached fid's access mode is
+                            // compatible with the requested mode.  A fid
+                            // opened WRONLY cannot serve reads (9P Tread
+                            // would fail), and a RDONLY fid cannot serve
+                            // writes.  On mismatch, fall through to open a
+                            // new fid with the correct mode.
+                            let requested_access = flags.bits() & 0x3; // O_ACCMODE
+                            let cached_access = self
+                                .root
+                                .read()
+                                .lower_access_modes
+                                .get(&path)
+                                .copied()
+                                .unwrap_or(0);
+                            let needs_read = requested_access == 0 || requested_access == 2; // RDONLY or RDWR
+                            let needs_write = requested_access == 1 || requested_access == 2; // WRONLY or RDWR
+                            let cached_can_read = cached_access == 0 || cached_access == 2; // RDONLY or RDWR
+                            let cached_can_write = cached_access == 1 || cached_access == 2; // WRONLY or RDWR
+                            let compatible = (!needs_read || cached_can_read)
+                                && (!needs_write || cached_can_write);
+                            if compatible {
+                                return Ok(self.litebox.descriptor_table_mut().insert(
+                                    Descriptor {
+                                        path,
+                                        flags,
+                                        entry,
+                                        position: 0.into(),
+                                    },
+                                ));
+                            }
+                            // Incompatible access mode — fall through to
+                            // open a new fid on the lower layer.
                         }
                         Ok(false) => {}
                         Err(_) => return Err(OpenError::Io),
@@ -856,6 +886,8 @@ impl<
                         } else {
                             let entry = Arc::new(EntryX::Lower { fd: lower_fd });
                             root.entries.insert(path.clone(), Arc::clone(&entry));
+                            root.lower_access_modes
+                                .insert(path.clone(), flags.bits() & 0x3);
                             entry
                         }
                     } else {
@@ -1033,11 +1065,32 @@ impl<
                             return Err(OpenError::Io);
                         };
                         if existing_shareable {
-                            // Another thread won the race — reuse its entry and close ours.
-                            let shared = Arc::clone(existing);
-                            drop(root);
-                            let _ = self.lower.close(&lower_fd);
-                            shared
+                            // Check if the existing entry's access mode is
+                            // compatible with the requested mode before reusing.
+                            let requested_access = flags.bits() & 0x3;
+                            let cached_access =
+                                root.lower_access_modes.get(&path).copied().unwrap_or(0);
+                            let needs_read = requested_access == 0 || requested_access == 2;
+                            let needs_write = requested_access == 1 || requested_access == 2;
+                            let cached_can_read = cached_access == 0 || cached_access == 2;
+                            let cached_can_write = cached_access == 1 || cached_access == 2;
+                            let compatible = (!needs_read || cached_can_read)
+                                && (!needs_write || cached_can_write);
+                            if compatible {
+                                // Reuse the existing entry.
+                                let shared = Arc::clone(existing);
+                                drop(root);
+                                let _ = self.lower.close(&lower_fd);
+                                shared
+                            } else {
+                                // Incompatible mode — replace the cache entry
+                                // with the new fid that has the correct mode.
+                                let entry = Arc::new(EntryX::Lower { fd: lower_fd });
+                                root.entries.insert(path.clone(), Arc::clone(&entry));
+                                root.lower_access_modes
+                                    .insert(path.clone(), requested_access);
+                                entry
+                            }
                         } else {
                             drop(root);
                             let _ = self.lower.close(&lower_fd);
@@ -1055,6 +1108,8 @@ impl<
             } else {
                 let entry = Arc::new(EntryX::Lower { fd: lower_fd });
                 root.entries.insert(path.clone(), Arc::clone(&entry));
+                root.lower_access_modes
+                    .insert(path.clone(), flags.bits() & 0x3);
                 entry
             }
         } else {
@@ -1108,6 +1163,7 @@ impl<
         // change while we are reasoning about them.
         let RootDir {
             entries: root_entries,
+            lower_access_modes: root_access_modes,
         } = &mut *self.root.write();
         // Our approach to this changes depending on whether this is an upper level FD or a
         // lower FD.
@@ -1179,6 +1235,7 @@ impl<
                 // cache was evicted by rename and a new open re-populated it),
                 // put it back and treat this fd as evicted.
                 let root_entry = root_entries.remove(&path).unwrap();
+                root_access_modes.remove(&path);
                 if !Arc::ptr_eq(&entry, &root_entry) {
                     root_entries.insert(path, root_entry);
                     match Arc::into_inner(entry) {
@@ -2515,12 +2572,17 @@ struct RootDir<Upper: super::FileSystem + 'static, Lower: super::FileSystem + 's
     // Invariant: this only stores shareable lower+tombstone entries, no upper entries will show up
     // here.
     entries: HashMap<String, Entry<Upper, Lower>>,
+    /// O_ACCMODE bits (0=RDONLY, 1=WRONLY, 2=RDWR) for cached lower entries,
+    /// keyed by path. Used to detect incompatible cache hits (e.g., a WRONLY
+    /// fid reused by an RDONLY open would cause 9P Tread to fail with EIO).
+    lower_access_modes: HashMap<String, u32>,
 }
 
 impl<Upper: super::FileSystem, Lower: super::FileSystem> RootDir<Upper, Lower> {
     fn new() -> Self {
         Self {
             entries: HashMap::new(),
+            lower_access_modes: HashMap::new(),
         }
     }
 }
