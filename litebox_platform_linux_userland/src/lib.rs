@@ -2394,4 +2394,18 @@ mod tests {
             prev = page.end;
         }
     }
+
+    #[test]
+    fn test_seccomp_filter() {
+        let _platform = LinuxUserland::new(None);
+        LinuxUserland::enable_seccomp_filter();
+        let pathname = "/tmp/test_seccomp";
+        let res = unsafe {
+            syscalls::syscall2(syscalls::Sysno::mkdir, pathname.as_ptr() as usize, 0o755)
+        };
+        assert!(
+            res.is_err() && res.unwrap_err() == syscalls::Errno::EINVAL,
+            "mkdir should be blocked by seccomp filter"
+        );
+    }
 }
