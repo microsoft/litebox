@@ -163,7 +163,9 @@ pub fn hook_syscalls_in_elf(input_binary: &[u8], trampoline: Option<u64>) -> Res
 
         let text_sections = match text_sections(&file) {
             Ok(sections) => sections,
-            Err(InternalError::NoTextSectionFound) => return Ok(input_binary.to_vec()),
+            Err(InternalError::NoTextSectionFound) => {
+                return Ok(input_binary.to_vec());
+            }
             Err(InternalError::Public(e)) => return Err(e),
             Err(e) => unreachable!("unexpected internal error: {e:?}"),
         };
@@ -191,6 +193,7 @@ pub fn hook_syscalls_in_elf(input_binary: &[u8], trampoline: Option<u64>) -> Res
     trampoline_data.extend_from_slice(&trampoline.to_le_bytes());
     // Patch syscalls in-place in buf
     let mut skipped_addrs = Vec::new();
+    let mut syscall_insns_found = false;
     for s in &text_sections {
         let section_data = section_slice_mut(buf, s)?;
         match hook_syscalls_in_section(
@@ -202,11 +205,32 @@ pub fn hook_syscalls_in_elf(input_binary: &[u8], trampoline: Option<u64>) -> Res
             trampoline_base_addr, // entry point is at offset 0 of trampoline
             &mut trampoline_data,
         ) {
-            Ok(addrs) => skipped_addrs.extend(addrs),
+            Ok(addrs) => {
+                skipped_addrs.extend(addrs);
+                syscall_insns_found = true;
+            }
             Err(InternalError::NoSyscallInstructionsFound) => {}
             Err(InternalError::Public(e)) => return Err(e),
             Err(e) => unreachable!("unexpected internal error: {e:?}"),
         }
+    }
+
+    if !syscall_insns_found {
+        // No syscall instructions found. Append a header-only marker so the
+        // loader can distinguish "checked by rewriter, nothing to patch" from
+        // "never processed." The trampoline_size=0 sentinel tells the loader
+        // to skip trampoline mapping entirely.
+        // Use the original input (not `buf`) to avoid emitting the phdr
+        // alignment fixup that was only needed for the `object` crate parser.
+        let mut out = input_binary.to_vec();
+        let header = TrampolineHeader64 {
+            magic: *TRAMPOLINE_MAGIC,
+            file_offset: 0,
+            vaddr: 0,
+            trampoline_size: 0,
+        };
+        out.extend_from_slice(header.as_bytes());
+        return Ok(out);
     }
 
     // Build output: [patched ELF][padding to page boundary][trampoline code][header]
@@ -293,7 +317,8 @@ fn is_already_hooked(input_binary: &[u8], arch: Arch) -> bool {
         (header.file_offset, header.vaddr, header.trampoline_size);
 
     if trampoline_size == 0 {
-        return false;
+        // Size=0 sentinel: "checked by rewriter, no syscalls to patch."
+        return true;
     }
     if file_offset % 0x1000 != 0 {
         return false;
@@ -431,6 +456,8 @@ fn hook_syscalls_in_section(
         trampoline_data.extend_from_slice(&presyscall_bytes);
 
         let return_addr = inst.next_ip();
+        emit_trampoline_preamble(trampoline_base_addr, replace_start, trampoline_data)?;
+
         // Put jump back location into rcx.
         let jmp_back_base = checked_add_u64(
             trampoline_base_addr,
@@ -538,8 +565,8 @@ fn fixup_phdr_alignment(buf: &mut [u8]) {
         return;
     };
 
-    if old_end > buf.len() || new_end > buf.len() {
-        return; // corrupt phdr table or not enough room
+    if new_end > buf.len() {
+        return; // not enough room
     }
 
     // Only relocate when the overwritten bytes are padding. Otherwise this would corrupt the file
@@ -628,6 +655,42 @@ fn replace_with_trap(
 fn checked_add_u64(base: u64, addend: u64, context: &'static str) -> Result<u64> {
     base.checked_add(addend)
         .ok_or_else(|| Error::AddressOverflow(format!("{context} address overflow")))
+}
+
+/// Emit the trampoline preamble: reserve the SysV red zone and load R11 with
+/// the call-site restart address.
+///
+/// The red zone reservation (`LEA RSP, [RSP - 0x80]`) prevents async guest
+/// signal delivery / interrupt handling from clobbering stack locals parked
+/// below the architectural RSP.
+///
+/// R11 is loaded with `call_site_addr` (the address of the original JMP that
+/// entered the trampoline) so that SA_RESTART can rewind `ctx.rip` to re-enter
+/// the trampoline. The real `syscall` instruction clobbers R11 with RFLAGS, so
+/// this register is free from the guest's perspective.
+///
+/// CONTRACT: R11 carries the call-site restart address from this point until
+/// the platform callback saves it to a dedicated TLS variable
+/// (`saved_restart_addr`). The platform MUST preserve R11 before any clobbering
+/// instructions (fsbase swap, TLS lookup).
+fn emit_trampoline_preamble(
+    trampoline_base_addr: u64,
+    call_site_addr: u64,
+    trampoline_data: &mut Vec<u8>,
+) -> Result<()> {
+    // LEA RSP, [RSP - 0x80]
+    trampoline_data.extend_from_slice(&[0x48, 0x8D, 0x64, 0x24, 0x80]);
+
+    // LEA R11, [RIP + disp32] — disp32 targets call_site_addr
+    let r11_rip = checked_add_u64(
+        trampoline_base_addr,
+        trampoline_data.len() as u64 + 7,
+        "trampoline R11 displacement base",
+    )?;
+    let r11_disp = i64::try_from(call_site_addr).unwrap() - i64::try_from(r11_rip).unwrap();
+    trampoline_data.extend_from_slice(&[0x4C, 0x8D, 0x1D]);
+    trampoline_data.extend_from_slice(&(i32::try_from(r11_disp).unwrap().to_le_bytes()));
+    Ok(())
 }
 
 fn rel32_bytes(target: u64, base: u64, context: &'static str) -> Result<[u8; 4]> {
@@ -914,8 +977,12 @@ fn hook_syscall_and_after(
 
     // Compute preamble size so we can determine where post-syscall
     // instructions will land and encode them before committing anything.
-    // x86_64: LEA RCX,[RIP+disp32] (7) + JMP [RIP+disp32] (6) = 13
-    let preamble_len: u64 = 13;
+    // x86_64 preamble:
+    //   LEA RSP,[RSP-0x80]      (5)
+    //   LEA R11,[RIP+disp32]    (7)
+    //   LEA RCX,[RIP+disp32]    (7)
+    //   JMP [RIP+disp32]        (6)
+    let preamble_len: u64 = 25;
 
     // Encode the post-syscall instructions for the trampoline, re-encoding
     // any RIP-relative memory operands for the new location.
@@ -932,6 +999,7 @@ fn hook_syscall_and_after(
     } else {
         Vec::new()
     };
+    emit_trampoline_preamble(trampoline_base_addr, replace_start, trampoline_data)?;
 
     // Put jump back location into rcx, via lea rcx, [next instruction]
     trampoline_data.extend_from_slice(&[0x48, 0x8D, 0x0D]); // LEA RCX, [RIP + disp32]

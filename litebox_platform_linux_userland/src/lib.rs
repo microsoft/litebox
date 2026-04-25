@@ -508,6 +508,8 @@ core::arch::global_asm!(
     "
     .section .tbss
     .align 8
+saved_restart_addr:
+    .quad 0
 scratch:
     .quad 0
 host_sp:
@@ -563,7 +565,7 @@ fn get_guest_fsbase() -> usize {
 ///
 /// This saves all non-volatile register state then switches to the guest
 /// context. When the guest makes a syscall, it jumps back into the middle of
-/// this routine, at `syscall_callback`. This code then updates the guest
+/// this routine, at the syscall callback. This code then updates the guest
 /// context structure, switches back to the host stack, and calls the syscall
 /// handler.
 ///
@@ -616,11 +618,20 @@ unsafe extern "C-unwind" fn run_thread_arch(
     // At entry, the register context is the guest context with the
     // return address in rcx. r11 is an available scratch register (it would
     // contain rflags if the syscall instruction had actually been issued).
-    .globl syscall_callback
-syscall_callback:
+    .globl syscall_callback_redzone
+syscall_callback_redzone:
+    // the trampoline has already reserved 128 bytes below RSP to protect the
+    // SysV red zone.
     // Clear in_guest flag. This must be the first instruction to match the
     // expectations of `interrupt_signal_handler`.
     mov      BYTE PTR gs:in_guest@tpoff, 0
+
+    // Save guest R11 (syscall call-site restart address from the rewriter
+    // trampoline) to TLS before it is clobbered by the fsbase/gsbase save
+    // sequence below. This value is not placed in pt_regs (which holds
+    // RFLAGS in the r11 slot per the kernel ABI); instead it is kept in
+    // TLS for future SA_RESTART support.
+    mov      gs:saved_restart_addr@tpoff, r11
 
     // Restore host fs base.
     rdfsbase r11
@@ -628,9 +639,12 @@ syscall_callback:
     rdgsbase r11
     wrfsbase r11
 
-    // Switch to the top of the guest context.
-    mov     r11, rsp
+    // The trampoline lowered RSP by 128 bytes with LEA, so recover the
+    // architectural guest stack pointer before saving pt_regs.
+    lea     r11, [rsp + 128]
     mov     rsp, fs:guest_context_top@tpoff
+
+.Lsyscall_save_regs:
 
     // TODO: save float and vector registers (xsave or fxsave)
     // Save caller-saved registers
@@ -649,7 +663,7 @@ syscall_callback:
     push    r8          // pt_regs->r8
     push    r9          // pt_regs->r9
     push    r10         // pt_regs->r10
-    push    [rsp + 88]  // pt_regs->r11 = rflags
+    push    [rsp + 88]  // pt_regs->r11 = rflags (matching real syscall ABI)
     push    rbx         // pt_regs->bx
     push    rbp         // pt_regs->bp
     push    r12         // pt_regs->r12
@@ -811,7 +825,7 @@ fn thread_start(
     let shim = init_thread.init();
 
     run_thread_inner(shim.as_ref(), &mut ctx, false);
-    // TODO: have syscall_callback return if we need to terminate the process.
+    // TODO: have the syscall callback return if we need to terminate the process.
     // We should return this value to the caller so load_program can return it
     // to the user.
 }
@@ -1584,7 +1598,8 @@ impl litebox::platform::StdioProvider for LinuxUserland {
 
 unsafe extern "C" {
     // Defined in asm blocks above
-    fn syscall_callback() -> isize;
+    #[cfg(target_arch = "x86_64")]
+    fn syscall_callback_redzone() -> isize;
     fn exception_callback();
     fn interrupt_callback();
     fn switch_to_guest_start();
@@ -1665,7 +1680,10 @@ impl ThreadContext<'_> {
 
 impl litebox::platform::SystemInfoProvider for LinuxUserland {
     fn get_syscall_entry_point(&self) -> usize {
-        syscall_callback as *const () as usize
+        #[cfg(target_arch = "x86_64")]
+        {
+            syscall_callback_redzone as *const () as usize
+        }
     }
 
     fn get_vdso_address(&self) -> Option<usize> {
@@ -2186,7 +2204,8 @@ unsafe fn interrupt_signal_handler(
     // FUTURE: handle trampoline code, too. This is somewhat less important
     // because it's probably fine for the shim to observe a guest context that
     // is inside the trampoline.
-    if ip == syscall_callback as *const () as usize {
+    #[cfg(target_arch = "x86_64")]
+    if ip == syscall_callback_redzone as *const () as usize {
         // No need to clear `in_guest` or set interrupt; the syscall handler will
         // clear `in_guest` and call into the shim.
         return;

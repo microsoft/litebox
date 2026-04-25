@@ -616,7 +616,7 @@ pub trait MapMemory {
     ///
     /// Fails if any of the parameters are not page-aligned.
     fn protect(&mut self, address: usize, len: usize, prot: &Protection)
-    -> Result<(), Self::Error>;
+        -> Result<(), Self::Error>;
 }
 
 /// Trait for reading and writing memory that has been mapped via [`MapMemory`].
