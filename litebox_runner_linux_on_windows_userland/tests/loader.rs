@@ -4,9 +4,8 @@
 //! Tests for the Windows userland runner.
 //!
 //! **NOTE:** These tests depend on pre-built Linux ELF binaries in `tests/test-bins/`,
-//! including `litebox_rtld_audit.so`, shared libraries (`libc.so.6`, `ld-linux-x86-64.so.2`),
-//! and test executables. These binaries must be rebuilt on Linux and re-committed whenever
-//! the corresponding source code changes (e.g., `litebox_rtld_audit/rtld_audit.c`).
+//! including shared libraries (`libc.so.6`, `ld-linux-x86-64.so.2`)
+//! and test executables.
 
 #![cfg(all(target_os = "windows", target_arch = "x86_64"))]
 
@@ -198,7 +197,6 @@ fn test_static_linked_prog_with_rewriter() {
 
 fn run_dynamic_linked_prog_with_rewriter(
     libs_to_rewrite: &[(&str, &str)],
-    libs_without_rewrite: &[(&str, &str)],
     exec_name: &str,
     cmd_args: &[&str],
     install_files: fn(std::path::PathBuf),
@@ -276,22 +274,6 @@ fn run_dynamic_linked_prog_with_rewriter(
         );
     }
 
-    // Copy libraries that are not needed to be rewritten (`litebox_rtld_audit.so`)
-    // to the tar directory
-    for (file, prefix) in libs_without_rewrite {
-        let src = test_dir.join(file);
-        let dst_dir = tar_src_path.join(prefix.trim_start_matches('/'));
-        let dst = dst_dir.join(file);
-        std::fs::create_dir_all(&dst_dir).unwrap();
-        let _ = std::fs::remove_file(&dst);
-        println!(
-            "Copying {} to {}",
-            src.to_str().unwrap(),
-            dst.to_str().unwrap()
-        );
-        std::fs::copy(&src, &dst).unwrap();
-    }
-
     // Install the required files (e.g., scripts) to tar directory's /out
     install_files(tar_src_path.join("out"));
 
@@ -361,14 +343,6 @@ fn test_testcase_dynamic_with_rewriter() {
         ("libc.so.6", "/lib/x86_64-linux-gnu"),
         ("ld-linux-x86-64.so.2", "/lib64"),
     ];
-    let libs_without_rewrite = [("litebox_rtld_audit.so", "/lib")];
-
     // Run
-    run_dynamic_linked_prog_with_rewriter(
-        &libs_to_rewrite,
-        &libs_without_rewrite,
-        exec_name,
-        &[],
-        |_| {},
-    );
+    run_dynamic_linked_prog_with_rewriter(&libs_to_rewrite, exec_name, &[], |_| {});
 }

@@ -1700,6 +1700,7 @@ dependencies = [
  "litebox",
  "litebox_common_linux",
  "litebox_platform_multiplex",
+ "litebox_syscall_rewriter",
  "litebox_util_log",
  "once_cell",
  "ringbuf",

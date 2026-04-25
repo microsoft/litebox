@@ -126,6 +126,8 @@ pub enum ElfParseError<E> {
     BadTrampoline,
     #[error("Invalid trampoline version")]
     BadTrampolineVersion,
+    #[error("Binary not patched for syscall rewriting")]
+    UnpatchedBinary,
     #[error("Unsupported ELF type")]
     UnsupportedType,
     #[error("Bad interpreter")]
@@ -139,6 +141,7 @@ impl<E: Into<Errno>> From<ElfParseError<E>> for Errno {
             | ElfParseError::BadFormat
             | ElfParseError::BadTrampoline
             | ElfParseError::BadTrampolineVersion
+            | ElfParseError::UnpatchedBinary
             | ElfParseError::BadInterp
             | ElfParseError::UnsupportedType => Errno::ENOEXEC,
             ElfParseError::Io(err) => err.into(),
@@ -216,6 +219,11 @@ impl ElfParsedFile {
         })
     }
 
+    /// Returns `true` if a trampoline was parsed and will be mapped by `load()`.
+    pub fn has_trampoline(&self) -> bool {
+        self.trampoline.is_some()
+    }
+
     /// Parse the LiteBox trampoline data, if any.
     ///
     /// The trampoline header is located at the end of the file (last 32/20 bytes).
@@ -249,7 +257,8 @@ impl ElfParsedFile {
 
         // File must be large enough to contain the header
         if file_size < header_size as u64 {
-            return Ok(());
+            // Too small for a trampoline header — binary is unpatched.
+            return Err(ElfParseError::UnpatchedBinary);
         }
 
         // Read the header from the end of the file
@@ -265,8 +274,8 @@ impl ElfParsedFile {
             if &header_buf[0..7] == b"LITEBOX" {
                 return Err(ElfParseError::BadTrampolineVersion);
             }
-            // No trampoline found, which is OK (not all binaries are rewritten)
-            return Ok(());
+            // No trampoline found.
+            return Err(ElfParseError::UnpatchedBinary);
         }
 
         let (file_offset, vaddr, trampoline_size) = if cfg!(target_pointer_width = "64") {
@@ -291,9 +300,11 @@ impl ElfParsedFile {
             )
         };
 
-        // Validate trampoline size
+        // trampoline_size == 0 means the rewriter checked this binary and found
+        // no syscall instructions. The magic header acts as a "checked" marker so
+        // the runtime skips eager code-segment patching. No trampoline to map.
         if trampoline_size == 0 {
-            return Err(ElfParseError::BadTrampoline);
+            return Ok(());
         }
 
         // Verify the file offset is page-aligned (as required by the rewriter)
@@ -366,6 +377,7 @@ impl ElfParsedFile {
         &self,
         mapper: &mut M,
         mem: &mut impl AccessMemory,
+        reserve_trampoline: Option<usize>,
     ) -> Result<MappingInfo, ElfLoadError<M::Error>> {
         let base_addr = if self.header.e_type == elf::abi::ET_DYN {
             // Find an aligned load address that will fit all PT_LOAD segments.
@@ -473,6 +485,11 @@ impl ElfParsedFile {
 
         if self.trampoline.is_some() {
             self.load_trampoline(mapper, mem, &mut info)?;
+        } else if let Some(size) = reserve_trampoline {
+            // Reserve space for a runtime trampoline so brk starts past it.
+            // The runtime patching path (do_mmap_file → maybe_patch_exec_segment)
+            // will allocate the actual trampoline in this region via MAP_FIXED.
+            info.brk = page_align_up(info.brk) + page_align_up(size);
         }
 
         Ok(info)

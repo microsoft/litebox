@@ -133,7 +133,6 @@ const SKIP_FILES: &[&str] = &[
     "LICENSE",
     "litebox/src/sync/mutex.rs",
     "litebox/src/sync/rwlock.rs",
-    "litebox_rtld_audit/Makefile",
     "litebox_runner_linux_on_windows_userland/tests/test-bins/hello_exec_nolibc",
     "litebox_runner_linux_on_windows_userland/tests/test-bins/hello_thread",
     "litebox_runner_linux_on_windows_userland/tests/test-bins/hello_thread_static",

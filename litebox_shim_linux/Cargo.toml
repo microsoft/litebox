@@ -17,6 +17,7 @@ syscalls = { version = "0.6", default-features = false }
 seq-macro = "0.3"
 ringbuf = { version = "0.4.8", default-features = false, features = ["alloc"] }
 zerocopy = { version = "0.8", default-features = false, features = ["derive"] }
+litebox_syscall_rewriter = { version = "0.1.0", path = "../litebox_syscall_rewriter", default-features = false }
 
 [features]
 default = ["platform_linux_userland"]

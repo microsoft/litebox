@@ -197,6 +197,7 @@ impl LinuxShimBuilder {
             next_thread_id: 2.into(), // start from 2, as 1 is used by the main thread
             litebox: self.litebox,
             unix_addr_table: litebox::sync::RwLock::new(syscalls::unix::UnixAddrTable::new()),
+            elf_patch_cache: litebox::sync::Mutex::new(alloc::collections::BTreeMap::new()),
         });
         LinuxShim(global)
     }
@@ -1022,6 +1023,8 @@ struct GlobalState<FS: ShimFS> {
     next_thread_id: core::sync::atomic::AtomicI32,
     /// UNIX domain socket address table
     unix_addr_table: litebox::sync::RwLock<Platform, syscalls::unix::UnixAddrTable<FS>>,
+    /// Per-process collection of ELF patching state for runtime syscall rewriting.
+    elf_patch_cache: litebox::sync::Mutex<Platform, syscalls::mm::ElfPatchCache>,
 }
 
 struct Task<FS: ShimFS> {

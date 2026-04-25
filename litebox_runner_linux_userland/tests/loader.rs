@@ -240,7 +240,7 @@ void _start() {
 
 #[test]
 fn test_syscall_rewriter() {
-    let dir_path = std::env::var("OUT_DIR").unwrap();
+    let dir_path = env!("CARGO_TARGET_TMPDIR").to_string();
     let src_path = std::path::Path::new(dir_path.as_str()).join("hello_exec_nolibc.c");
     std::fs::write(src_path.clone(), HELLO_WORLD_NOLIBC).unwrap();
     let path = std::path::Path::new(dir_path.as_str()).join("hello_exec_nolibc");

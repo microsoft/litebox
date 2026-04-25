@@ -196,7 +196,7 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     }
 
     litebox_platform_multiplex::set_platform(platform);
-    let mut shim_builder = litebox_shim_linux::LinuxShimBuilder::new();
+    let shim_builder = litebox_shim_linux::LinuxShimBuilder::new();
     let litebox = shim_builder.litebox();
     let initial_file_system = {
         let mut in_mem = litebox::fs::in_mem::FileSystem::new(litebox);
@@ -275,28 +275,6 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
             }
         });
 
-        // include litebox_rtld_audit.so in the filesystem so tests and users don't need to include it in tar files
-        #[cfg(not(target_arch = "x86_64"))]
-        eprintln!("WARN: litebox_rtld_audit not currently supported on non-x86_64 arch");
-        #[cfg(target_arch = "x86_64")]
-        in_mem.with_root_privileges(|fs| {
-            let rwxr_xr_x = Mode::RWXU | Mode::RGRP | Mode::XGRP | Mode::ROTH | Mode::XOTH;
-            let _ = fs.mkdir("/lib", rwxr_xr_x);
-            let fd = fs
-                .open(
-                    "/lib/litebox_rtld_audit.so",
-                    litebox::fs::OFlags::WRONLY | litebox::fs::OFlags::CREAT,
-                    rwxr_xr_x,
-                )
-                .expect("Failed to create /lib/litebox_rtld_audit.so");
-            fs.initialize_primarily_read_heavy_file(
-                &fd,
-                include_bytes!(concat!(env!("OUT_DIR"), "/litebox_rtld_audit.so")).into(),
-            );
-            fs.close(&fd)
-                .expect("Failed to close /lib/litebox_rtld_audit.so");
-        });
-
         let tar_ro = litebox::fs::tar_ro::FileSystem::new(litebox, tar_data.into());
         shim_builder.default_fs(in_mem, tar_ro)
     };
@@ -318,7 +296,6 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
 
     let initial_file_system = std::sync::Arc::new(initial_file_system);
 
-    shim_builder.set_load_filter(fixup_env);
     let shim = shim_builder.build();
 
     let shutdown = std::sync::Arc::new(core::sync::atomic::AtomicBool::new(false));
@@ -429,14 +406,5 @@ fn pin_thread_to_cpu(cpu: usize) {
         if libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &raw const set) != 0 {
             eprintln!("Warning: Failed to pin thread to CPU core {cpu}");
         }
-    }
-}
-
-fn fixup_env(envp: &mut Vec<alloc::ffi::CString>) {
-    // Enable the audit library to load trampoline code for rewritten binaries.
-    let p = c"LD_AUDIT=/lib/litebox_rtld_audit.so";
-    let has_ld_audit = envp.iter().any(|var| var.as_c_str() == p);
-    if !has_ld_audit {
-        envp.push(p.into());
     }
 }

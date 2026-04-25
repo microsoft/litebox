@@ -640,6 +640,55 @@ fn rel32_bytes(target: u64, base: u64, context: &'static str) -> Result<[u8; 4]>
     Ok(disp.to_le_bytes())
 }
 
+/// Patch a single mapped code segment in-place, returning trampoline stubs and
+/// the addresses of any syscall instructions that could not be patched
+/// (replaced with `ICEBP; HLT` so they trap instead of escaping to the host
+/// kernel).
+///
+/// This is the runtime counterpart to [`hook_syscalls_in_elf`]. Instead of
+/// processing a whole ELF file, it operates on a single already-mapped code
+/// region — the caller is responsible for making the region writable before
+/// calling and restoring permissions afterwards.
+///
+/// # Returns
+///
+/// `(trampoline_stubs, skipped_addrs)`. The caller must copy the stubs to
+/// `trampoline_write_vaddr`. Returns empty vecs if no syscall instructions
+/// are found in `code`.
+pub fn patch_code_segment(
+    code: &mut [u8],
+    code_vaddr: u64,
+    trampoline_write_vaddr: u64,
+    syscall_entry_addr: u64,
+) -> Result<(Vec<u8>, Vec<u64>)> {
+    // Build control-transfer targets for this segment.
+    let instructions = decode_section_instructions(Arch::X86_64, code, code_vaddr)?;
+    let mut control_transfer_targets = BTreeSet::new();
+    for inst in &instructions {
+        let target = inst.near_branch_target();
+        if target != 0 {
+            control_transfer_targets.insert(target);
+        }
+    }
+
+    let mut trampoline_data = Vec::new();
+    match hook_syscalls_in_section(
+        Arch::X86_64,
+        &control_transfer_targets,
+        code_vaddr,
+        code,
+        trampoline_write_vaddr,
+        syscall_entry_addr,
+        None,
+        &mut trampoline_data,
+    ) {
+        Ok(skipped_addrs) => Ok((trampoline_data, skipped_addrs)),
+        Err(InternalError::NoSyscallInstructionsFound) => Ok((Vec::new(), Vec::new())),
+        Err(InternalError::Public(e)) => Err(e),
+        Err(e) => unreachable!("unexpected internal error: {e:?}"),
+    }
+}
+
 fn find_addr_for_trampoline_code(file: &object::File<'_>) -> Result<u64> {
     // Find the highest virtual address among all PT_LOAD segments
     let max_virtual_addr = match file {

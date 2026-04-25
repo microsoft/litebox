@@ -98,7 +98,7 @@ fn find_rewriter_source_files() -> Vec<PathBuf> {
 
 /// Compile C code into an executable with caching
 pub fn compile(src_path: &str, unique_name: &str, exec_or_lib: bool, nolibc: bool) -> PathBuf {
-    let dir_path = std::env::var("OUT_DIR").unwrap();
+    let dir_path = env!("CARGO_TARGET_TMPDIR").to_string();
     let path = std::path::Path::new(dir_path.as_str()).join(unique_name);
     let output = path.to_str().unwrap();
 

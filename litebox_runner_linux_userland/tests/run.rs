@@ -22,7 +22,7 @@ struct Runner {
 
 impl Runner {
     fn new(target: &Path, unique_name: &str) -> Self {
-        let dir_path = PathBuf::from(std::env::var_os("OUT_DIR").unwrap());
+        let dir_path = PathBuf::from(env!("CARGO_TARGET_TMPDIR"));
         let path = {
             // new path in out_dir with .hooked suffix
             let out_path = dir_path.join(format!(
@@ -186,7 +186,6 @@ fn find_c_test_files(dir: &str) -> Vec<PathBuf> {
     files
 }
 
-// our rtld_audit does not support x86 yet
 #[cfg(target_arch = "x86_64")]
 #[test]
 fn test_dynamic_lib_with_rewriter() {

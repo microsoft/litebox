@@ -121,7 +121,7 @@ impl From<VmFlags> for MemoryRegionPermissions {
     }
 }
 
-const DEFAULT_RESERVED_SPACE_SIZE: usize = 0x100_0000; // 16 MiB
+pub const DEFAULT_RESERVED_SPACE_SIZE: usize = 0x100_0000; // 16 MiB
 
 bitflags::bitflags! {
     /// Options for page creation.

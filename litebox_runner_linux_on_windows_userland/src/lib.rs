@@ -14,16 +14,16 @@ use std::path::PathBuf;
 
 /// Run Linux programs with LiteBox on unmodified Windows.
 ///
-/// The program binary and all its dependencies (including `litebox_rtld_audit.so`)
-/// must be provided inside a tar archive via `--initial-files`. The program path
-/// refers to a path inside the tar archive.
+/// The program binary and all its dependencies must be provided inside a tar
+/// archive via `--initial-files`. The program path refers to a path inside the
+/// tar archive.
 #[derive(Parser, Debug)]
 pub struct CliArgs {
     /// The program and arguments passed to it (e.g., `/bin/ls --color`).
     ///
     /// The program path refers to a path inside the tar archive provided via
     /// `--initial-files`. All binaries must be pre-rewritten with the syscall
-    /// rewriter and the tar must include `litebox_rtld_audit.so`.
+    /// rewriter.
     #[arg(required = true, trailing_var_arg = true, value_hint = clap::ValueHint::CommandWithArguments)]
     pub program_and_arguments: Vec<String>,
     /// Environment variables passed to the program (`K=V` pairs; can be invoked multiple times)
@@ -35,7 +35,7 @@ pub struct CliArgs {
     /// Allow using unstable options
     #[arg(short = 'Z', long = "unstable")]
     pub unstable: bool,
-    /// Tar archive containing the program, its shared libraries, and litebox_rtld_audit.so.
+    /// Tar archive containing the program and its shared libraries.
     ///
     /// All ELF binaries should be pre-rewritten with the syscall rewriter
     /// (e.g., via `litebox-packager`).
@@ -70,7 +70,7 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
 
     let platform = Platform::new();
     litebox_platform_multiplex::set_platform(platform);
-    let mut shim_builder = litebox_shim_linux::LinuxShimBuilder::new();
+    let shim_builder = litebox_shim_linux::LinuxShimBuilder::new();
     let litebox = shim_builder.litebox();
 
     // The program path is a Unix-style path inside the tar archive.
@@ -93,7 +93,6 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     };
     let initial_file_system = std::sync::Arc::new(initial_file_system);
 
-    shim_builder.set_load_filter(fixup_env);
     let shim = shim_builder.build();
     let argv = cli_args
         .program_and_arguments
@@ -137,14 +136,4 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         );
     }
     std::process::exit(program.process.wait())
-}
-
-fn fixup_env(envp: &mut Vec<alloc::ffi::CString>) {
-    // Always inject LD_AUDIT so the dynamic linker loads the audit library
-    // that sets up trampolines for rewritten binaries.
-    let p = c"LD_AUDIT=/lib/litebox_rtld_audit.so";
-    let has_ld_audit = envp.iter().any(|var| var.as_c_str() == p);
-    if !has_ld_audit {
-        envp.push(p.into());
-    }
 }
