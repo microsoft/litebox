@@ -622,3 +622,72 @@ fn test_unlinkat() {
         "Second directory should no longer exist after removal"
     );
 }
+
+/// Regression test for a bug where readers can be permanently starved on
+/// platforms where `wake_one` does not report whether it actually woke a thread
+/// (e.g. Windows with `WakeByAddressSingle`).
+#[test]
+fn test_rwlock_readers_not_starved_after_writer_handoff() {
+    use core::sync::atomic::{AtomicBool, Ordering};
+
+    // Initialize the platform (reuses the global Once-based init).
+    let _task = init_platform(None);
+
+    // We run the test many times to increase the probability of hitting the
+    // exact interleaving, since we rely on sleep-based synchronization.
+    for iteration in 0..200 {
+        let lock = alloc::sync::Arc::new(litebox::sync::RwLock::<
+            litebox_platform_multiplex::Platform,
+            u32,
+        >::new(0));
+        let reader_done = alloc::sync::Arc::new(AtomicBool::new(false));
+        let writer2_done = alloc::sync::Arc::new(AtomicBool::new(false));
+
+        // Step 1: W1 acquires the write lock on the main thread.
+        let mut w1_guard = lock.write();
+
+        // Step 2: Spawn a reader that will block (READERS_WAITING).
+        let lock_r = lock.clone();
+        let rd = reader_done.clone();
+        let reader_handle = std::thread::spawn(move || {
+            let r = lock_r.read();
+            rd.store(true, Ordering::Release);
+            drop(r);
+        });
+
+        // Step 3: Spawn W2 that will block (WRITERS_WAITING + other_writers_waiting).
+        let lock_w2 = lock.clone();
+        let wd = writer2_done.clone();
+        let writer2_handle = std::thread::spawn(move || {
+            let mut w = lock_w2.write();
+            *w += 1;
+            // Hold briefly so reader stays blocked during our unlock.
+            drop(w);
+            wd.store(true, Ordering::Release);
+        });
+
+        // Give both threads time to block and set their waiting bits.
+        std::thread::sleep(std::time::Duration::from_millis(10));
+
+        // Step 4: W1 unlocks. This triggers wake_writer_or_readers which
+        // should eventually lead to both W2 and R being served.
+        *w1_guard = 42;
+        drop(w1_guard);
+
+        // Step 5: Wait for W2 to finish (it should acquire quickly).
+        writer2_handle.join().expect("writer2 panicked");
+
+        // Step 6: The reader must also complete. On the buggy path it
+        // deadlocks here because wake_writer_or_readers returned early
+        // without waking readers.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !reader_done.load(Ordering::Acquire) {
+            if std::time::Instant::now() > deadline {
+                panic!("iteration {iteration}: reader was never woken after writer handoff");
+            }
+            std::thread::yield_now();
+        }
+
+        reader_handle.join().expect("reader panicked");
+    }
+}

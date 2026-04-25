@@ -1355,8 +1355,8 @@ impl litebox::platform::RawMutex for RawMutex {
         }
 
         // For windows, the OS kernel does not tell us how many threads were actually woken up,
-        // so we just return `n`
-        n as usize
+        // so we just return zero
+        0
     }
 
     fn block(&self, val: u32) -> Result<(), ImmediatelyWokenUp> {
