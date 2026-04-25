@@ -218,6 +218,126 @@ fn main() {
             std::thread::sleep(std::time::Duration::from_secs(3));
             println!("SLOW_ECHO_OK");
         }
+        "pipe-nonblock" => {
+            // Test pipe F_SETFL O_NONBLOCK behavior.
+            // Creates a pipe, sets the read end to non-blocking, then verifies:
+            //   1. read() returns EAGAIN (not 0) when pipe is empty
+            //   2. read() returns data after write
+            //   3. read() returns 0 only after write end is closed
+            //
+            // This is the pattern dropbear uses. If F_SETFL silently fails,
+            // read() returns 0 (EOF) instead of EAGAIN, causing a busy-loop.
+            unsafe {
+                let mut fds = [0i32; 2];
+                if libc::pipe(fds.as_mut_ptr()) != 0 {
+                    println!("PIPE_NB_PIPE=FAIL");
+                    std::process::exit(1);
+                }
+                let read_fd = fds[0];
+                let write_fd = fds[1];
+
+                // Set read end to non-blocking
+                let flags = libc::fcntl(read_fd, libc::F_GETFL);
+                let ret = libc::fcntl(read_fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+                println!("PIPE_NB_SETFL={}", if ret == 0 { "OK" } else { "FAIL" });
+
+                // Test 1: read from empty pipe should return EAGAIN, not 0
+                let mut buf = [0u8; 64];
+                let n = libc::read(read_fd, buf.as_mut_ptr().cast(), buf.len());
+                let errno = *libc::__errno_location();
+                if n == -1 && (errno == libc::EAGAIN || errno == libc::EWOULDBLOCK) {
+                    println!("PIPE_NB_EMPTY=EAGAIN");
+                } else {
+                    println!("PIPE_NB_EMPTY=UNEXPECTED n={n} errno={errno}");
+                }
+
+                // Test 2: write data, then non-blocking read should return it
+                let msg = b"HELLO";
+                libc::write(write_fd, msg.as_ptr().cast(), msg.len());
+                let n = libc::read(read_fd, buf.as_mut_ptr().cast(), buf.len());
+                if n == 5 {
+                    println!("PIPE_NB_DATA=OK");
+                } else {
+                    println!("PIPE_NB_DATA=UNEXPECTED n={n}");
+                }
+
+                // Test 3: close write end, read should return 0 (real EOF)
+                libc::close(write_fd);
+                let n = libc::read(read_fd, buf.as_mut_ptr().cast(), buf.len());
+                if n == 0 {
+                    println!("PIPE_NB_EOF=OK");
+                } else {
+                    let errno = *libc::__errno_location();
+                    println!("PIPE_NB_EOF=UNEXPECTED n={n} errno={errno}");
+                }
+
+                libc::close(read_fd);
+            }
+        }
+        "pipe-child-nonblock" => {
+            // Dropbear pattern: parent creates pipe, forks child, sets pipe
+            // to non-blocking, then polls for child exit via the pipe.
+            // The child writes a byte and exits. The parent should see:
+            //   1. EAGAIN (child alive, no data yet)
+            //   2. Data (child wrote)
+            //   3. 0/EOF (child exited, pipe closed)
+            unsafe {
+                let mut fds = [0i32; 2];
+                libc::pipe(fds.as_mut_ptr());
+                let read_fd = fds[0];
+                let write_fd = fds[1];
+
+                let pid = libc::fork();
+                if pid == 0 {
+                    // Child: close read end, sleep, write, exit
+                    libc::close(read_fd);
+                    std::thread::sleep(std::time::Duration::from_millis(500));
+                    let msg = b"X";
+                    libc::write(write_fd, msg.as_ptr().cast(), 1);
+                    libc::close(write_fd);
+                    std::process::exit(0);
+                }
+
+                // Parent: close write end, set read to non-blocking
+                libc::close(write_fd);
+                let flags = libc::fcntl(read_fd, libc::F_GETFL);
+                libc::fcntl(read_fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+
+                // Poll: initially should get EAGAIN (child still alive)
+                let mut buf = [0u8; 1];
+                let n = libc::read(read_fd, buf.as_mut_ptr().cast(), 1);
+                let errno = *libc::__errno_location();
+                if n == -1 && (errno == libc::EAGAIN || errno == libc::EWOULDBLOCK) {
+                    println!("PCHILD_INITIAL=EAGAIN");
+                } else {
+                    println!("PCHILD_INITIAL=UNEXPECTED n={n} errno={errno}");
+                }
+
+                // Wait for child to finish
+                std::thread::sleep(std::time::Duration::from_secs(1));
+
+                // Now should get the data byte
+                let n = libc::read(read_fd, buf.as_mut_ptr().cast(), 1);
+                if n == 1 {
+                    println!("PCHILD_DATA=OK");
+                } else {
+                    let errno = *libc::__errno_location();
+                    println!("PCHILD_DATA=UNEXPECTED n={n} errno={errno}");
+                }
+
+                // Then EOF
+                let n = libc::read(read_fd, buf.as_mut_ptr().cast(), 1);
+                if n == 0 {
+                    println!("PCHILD_EOF=OK");
+                } else {
+                    let errno = *libc::__errno_location();
+                    println!("PCHILD_EOF=UNEXPECTED n={n} errno={errno}");
+                }
+
+                libc::close(read_fd);
+                libc::waitpid(pid, std::ptr::null_mut(), 0);
+            }
+        }
         "check-ppid" => {
             // Reports parent PID visibility via /proc and kill -0.
             // Used to test cross-worker PID visibility after delayed-fork migration.

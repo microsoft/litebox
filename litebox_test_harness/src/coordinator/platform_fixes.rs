@@ -293,6 +293,7 @@ pub(crate) async fn run(r: &mut TestRunner) {
     touch_redirect_tests(r).await;
     vscode_install_pattern_tests(r).await;
     file_redirect_tests(r).await;
+    pipe_nonblock_tests(r).await;
     loopback_tcp_tests(r).await;
     // PID visibility tests run last — KP.proc_child can deadlock agent B
     // under litebox, causing all subsequent B-targeted tests to timeout.
@@ -1428,6 +1429,134 @@ pub(crate) async fn file_redirect_tests(r: &mut TestRunner) {
                     if (test.check)(stdout)
             );
             r.record(&test_id, agent, pass, &format!("{resp:?}"));
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// PN: Pipe Non-blocking — fcntl F_SETFL O_NONBLOCK on pipes
+// (dropbear sets pipes non-blocking for its event loop; if F_SETFL
+// silently fails, read() returns 0/EOF instead of EAGAIN, causing
+// a busy-loop that starves the network worker and blocks new SSH
+// connections including the VS Code SOCKS tunnel)
+// ═══════════════════════════════════════════════════════════════════
+
+/// Tests that pipes support F_SETFL O_NONBLOCK correctly:
+///   PN.setfl        — fcntl(F_SETFL, O_NONBLOCK) succeeds
+///   PN.empty_eagain — read() on empty non-blocking pipe returns EAGAIN
+///   PN.data         — read() returns data after write
+///   PN.eof          — read() returns 0 only after write end is closed
+///   PN.child_eagain — dropbear pattern: fork, set pipe non-blocking,
+///                     read returns EAGAIN while child is alive
+///   PN.child_data   — child writes data, parent reads it
+///   PN.child_eof    — child exits, parent gets real EOF (0)
+pub(crate) async fn pipe_nonblock_tests(r: &mut TestRunner) {
+    eprintln!(
+        "[platform] === Pipe Non-blocking ({} agents) ===",
+        AGENTS.len()
+    );
+
+    let self_exe = r.self_exe.clone();
+
+    // Test 1: basic pipe non-blocking (within a single process)
+    for &agent in AGENTS {
+        let test_prefix = format!("PN.{agent}");
+        let resp = r
+            .send(
+                agent,
+                Command::Exec {
+                    args: vec![self_exe.clone(), "pipe-nonblock".into()],
+                    timeout_secs: Some(10),
+                    stdin: None,
+                    background: false,
+                },
+            )
+            .await;
+        match &resp {
+            Response::ExecResult { stdout, .. } => {
+                r.record(
+                    &format!("{test_prefix}.setfl"),
+                    agent,
+                    stdout.contains("PIPE_NB_SETFL=OK"),
+                    &format!("{resp:?}"),
+                );
+                r.record(
+                    &format!("{test_prefix}.empty_eagain"),
+                    agent,
+                    stdout.contains("PIPE_NB_EMPTY=EAGAIN"),
+                    &format!("{resp:?}"),
+                );
+                r.record(
+                    &format!("{test_prefix}.data"),
+                    agent,
+                    stdout.contains("PIPE_NB_DATA=OK"),
+                    &format!("{resp:?}"),
+                );
+                r.record(
+                    &format!("{test_prefix}.eof"),
+                    agent,
+                    stdout.contains("PIPE_NB_EOF=OK"),
+                    &format!("{resp:?}"),
+                );
+            }
+            _ => {
+                for suffix in ["setfl", "empty_eagain", "data", "eof"] {
+                    r.record(
+                        &format!("{test_prefix}.{suffix}"),
+                        agent,
+                        false,
+                        &format!("{resp:?}"),
+                    );
+                }
+            }
+        }
+    }
+
+    // Test 2: cross-process pipe non-blocking (the dropbear pattern)
+    for &agent in DEPTH_AGENTS {
+        let test_prefix = format!("PN.child.{agent}");
+        let resp = r
+            .send(
+                agent,
+                Command::Exec {
+                    args: vec![self_exe.clone(), "pipe-child-nonblock".into()],
+                    timeout_secs: Some(10),
+                    stdin: None,
+                    background: false,
+                },
+            )
+            .await;
+        match &resp {
+            Response::ExecResult { stdout, .. } => {
+                r.record(
+                    &format!("{test_prefix}.eagain"),
+                    agent,
+                    stdout.contains("PCHILD_INITIAL=EAGAIN"),
+                    &format!("{resp:?}"),
+                );
+                r.record(
+                    &format!("{test_prefix}.data"),
+                    agent,
+                    stdout.contains("PCHILD_DATA=OK"),
+                    &format!("{resp:?}"),
+                );
+                r.record(
+                    &format!("{test_prefix}.eof"),
+                    agent,
+                    stdout.contains("PCHILD_EOF=OK"),
+                    &format!("{resp:?}"),
+                );
+            }
+            _ => {
+                for suffix in ["eagain", "data", "eof"] {
+                    r.record(
+                        &format!("{test_prefix}.{suffix}"),
+                        agent,
+                        false,
+                        &format!("{resp:?}"),
+                    );
+                }
+            }
         }
     }
 }
