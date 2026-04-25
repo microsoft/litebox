@@ -397,13 +397,21 @@ impl ElfParsedFile {
             }
             if let Some(trampoline) = &self.trampoline {
                 min = min.min(trampoline.vaddr);
-                max = max.max(trampoline.vaddr + trampoline.size);
+                max = max.max(
+                    trampoline
+                        .vaddr
+                        .checked_add(trampoline.size)
+                        .ok_or(ElfLoadError::InvalidProgramHeader)?,
+                );
             }
             let min = page_align_down(min);
-            let max = page_align_up(max);
-            mapper
-                .reserve(max - min, align)
-                .map_err(ElfLoadError::Map)?
+            let max = max
+                .checked_next_multiple_of(PAGE_SIZE)
+                .ok_or(ElfLoadError::InvalidProgramHeader)?;
+            let span = max
+                .checked_sub(min)
+                .ok_or(ElfLoadError::InvalidProgramHeader)?;
+            mapper.reserve(span, align).map_err(ElfLoadError::Map)?
         } else {
             // For ET_EXEC, load at the fixed addresses specified in the ELF.
             0

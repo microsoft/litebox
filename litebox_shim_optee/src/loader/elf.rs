@@ -45,7 +45,8 @@ fn read_at(elf: &ElfFileInMemory, offset: u64, buf: &mut [u8]) -> Result<(), Err
     if offset >= elf.buffer.len() {
         return Err(Errno::ENODATA);
     }
-    let end = core::cmp::min(offset + buf.len(), elf.buffer.len());
+    let available = elf.buffer.len() - offset;
+    let end = offset + core::cmp::min(buf.len(), available);
     let len = end - offset;
     buf[..len].copy_from_slice(&elf.buffer[offset..end]);
     Ok(())
@@ -78,7 +79,9 @@ impl litebox_common_linux::loader::MapMemory for ElfFileInMemory<'_> {
     fn reserve(&mut self, len: usize, align: usize) -> Result<usize, Self::Error> {
         // Allocate a mapping large enough that even if it's maximally misaligned we can
         // still fit `len` bytes.
-        let mapping_len = len + (align.max(PAGE_SIZE) - PAGE_SIZE);
+        let mapping_len = len
+            .checked_add(align.max(PAGE_SIZE) - PAGE_SIZE)
+            .ok_or(Errno::ENOMEM)?;
         let mapping_ptr = self
             .task
             .sys_mmap(
@@ -141,7 +144,8 @@ impl litebox_common_linux::loader::MapMemory for ElfFileInMemory<'_> {
         // MAP_ANONYMOUS ensures remaining bytes are zero if src is shorter than len.
         let offset: usize = offset.trunc();
         if len > 0 && offset < self.buffer.len() {
-            let end = core::cmp::min(offset + len, self.buffer.len());
+            let available = self.buffer.len() - offset;
+            let end = offset + core::cmp::min(len, available);
             let src = &self.buffer[offset..end];
             let user_ptr = UserMutPtr::<u8>::from_usize(mapped_addr);
             user_ptr
