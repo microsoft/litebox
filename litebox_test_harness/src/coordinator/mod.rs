@@ -8,6 +8,7 @@ pub(crate) mod fork_matrix;
 pub(crate) mod matrix;
 pub(crate) mod platform_fixes;
 pub(crate) mod special_cases;
+pub(crate) mod tcp_stress;
 pub(crate) mod vscode;
 
 use crate::protocol::{Command, Response};
@@ -306,6 +307,10 @@ async fn run_tests(self_exe: &str) -> Vec<TestResult> {
     // === Platform Fix Validation Tests ===
     eprintln!("[coord] === Platform Fix Validation Tests ===");
     platform_fixes::run(&mut runner).await;
+
+    // === TCP Stress Tests ===
+    eprintln!("[coord] === TCP Stress Tests ===");
+    tcp_stress::run(&mut runner).await;
 
     // === VS Code Reproduction Tests ===
     eprintln!("[coord] === VS Code Reproduction Tests ===");

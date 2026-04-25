@@ -1335,10 +1335,7 @@ pub(crate) async fn pid_visibility_tests(r: &mut TestRunner) {
 ///   FR.bg_cat_pipe    — piped: `echo DATA | cat > file &; wait; cat file`
 ///   FR.fg_redirect    — control: foreground redirect should always work
 pub(crate) async fn file_redirect_tests(r: &mut TestRunner) {
-    eprintln!(
-        "[platform] === File Redirect ({} agents) ===",
-        AGENTS.len()
-    );
+    eprintln!("[platform] === File Redirect ({} agents) ===", AGENTS.len());
 
     let self_exe = r.self_exe.clone();
 
@@ -1352,20 +1349,13 @@ pub(crate) async fn file_redirect_tests(r: &mut TestRunner) {
         // Control: foreground redirect (no background, no mux bridge)
         FRTest {
             name: "fg_redirect",
-            script_template: concat!(
-                "echo FR_FG > {path}\n",
-                "cat {path}\n",
-            ),
+            script_template: concat!("echo FR_FG > {path}\n", "cat {path}\n",),
             check: |s| s.contains("FR_FG"),
         },
         // Background builtin (echo) writes to redirected stdout
         FRTest {
             name: "bg_echo",
-            script_template: concat!(
-                "echo FR_BGECHO > {path} &\n",
-                "wait\n",
-                "cat {path}\n",
-            ),
+            script_template: concat!("echo FR_BGECHO > {path} &\n", "wait\n", "cat {path}\n",),
             check: |s| s.contains("FR_BGECHO"),
         },
         // Background exec'd process writes to redirected stdout.
@@ -1373,21 +1363,13 @@ pub(crate) async fn file_redirect_tests(r: &mut TestRunner) {
         // Its stdout is connected through the mux bridge.
         FRTest {
             name: "bg_exe",
-            script_template: concat!(
-                "{exe} echo-test > {path} &\n",
-                "wait\n",
-                "cat {path}\n",
-            ),
+            script_template: concat!("{exe} echo-test > {path} &\n", "wait\n", "cat {path}\n",),
             check: |s| s.contains("ECHO_TEST_OK"),
         },
         // Background pipeline writes to redirected file
         FRTest {
             name: "bg_cat_pipe",
-            script_template: concat!(
-                "echo FR_PIPE | cat > {path} &\n",
-                "wait\n",
-                "cat {path}\n",
-            ),
+            script_template: concat!("echo FR_PIPE | cat > {path} &\n", "wait\n", "cat {path}\n",),
             check: |s| s.contains("FR_PIPE"),
         },
         // Background process with append redirect (>>)

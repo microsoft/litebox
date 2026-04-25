@@ -329,7 +329,10 @@ pub(super) async fn vscode_bootstrap_replay(r: &mut TestRunner) {
                 "VSI.bootstrap",
                 "A",
                 false,
-                &format!("TIMEOUT (120s) stderr: {}", &stderr[..stderr.len().min(500)]),
+                &format!(
+                    "TIMEOUT (120s) stderr: {}",
+                    &stderr[..stderr.len().min(500)]
+                ),
             );
         }
         _ => {
@@ -423,18 +426,11 @@ pub(super) async fn vscode_bootstrap_replay(r: &mut TestRunner) {
         }
         return;
     };
-    r.record(
-        "VSI.server_start",
-        "A",
-        true,
-        &format!("port={port}"),
-    );
+    r.record("VSI.server_start", "A", true, &format!("port={port}"));
 
     // 6a. Same-worker connectivity: agent A connects to the exec server
     //     it started.  Loopback within the same worker tree.
-    let cmd = format!(
-        "echo PROBE | nc -w3 127.0.0.1 {port} >/dev/null 2>&1; echo VSI_CONN=$?"
-    );
+    let cmd = format!("echo PROBE | nc -w3 127.0.0.1 {port} >/dev/null 2>&1; echo VSI_CONN=$?");
     let resp = r
         .send("A", exec_timeout(vec!["bash".into(), "-c".into(), cmd], 10))
         .await;
@@ -453,9 +449,7 @@ pub(super) async fn vscode_bootstrap_replay(r: &mut TestRunner) {
     //     that agent A started.  This is the VS Code SOCKS proxy pattern:
     //     a different SSH session (different worker tree) connects to the
     //     CLI's listening port through cross-worker loopback TCP.
-    let cmd = format!(
-        "echo PROBE | nc -w3 127.0.0.1 {port} >/dev/null 2>&1; echo VSI_CONN=$?"
-    );
+    let cmd = format!("echo PROBE | nc -w3 127.0.0.1 {port} >/dev/null 2>&1; echo VSI_CONN=$?");
     let resp = r
         .send("B", exec_timeout(vec!["bash".into(), "-c".into(), cmd], 10))
         .await;
