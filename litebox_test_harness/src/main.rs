@@ -61,7 +61,9 @@ fn main() {
 
     match cmd {
         "spawn-tree" => {
-            let results = coordinator::run_all(self_exe);
+            // Optional: --filter=tcp to run only TCP stress tests.
+            let filter = args.iter().find_map(|a| a.strip_prefix("--filter="));
+            let results = coordinator::run_filtered(self_exe, filter);
             let pass_count = results.iter().filter(|r| r.outcome() == "pass").count();
             let fail_count = results.iter().filter(|r| r.outcome() == "FAIL").count();
             let xfail_count = results.iter().filter(|r| r.outcome() == "xfail").count();
