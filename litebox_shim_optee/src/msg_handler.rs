@@ -389,9 +389,6 @@ pub struct TaRequestInfo<const ALIGN: usize> {
 /// memory to create `UteeParamOwned` structures to avoid potential data corruption during TA
 /// execution.
 ///
-/// # Panics
-///
-/// Panics if any conversion from `u64` to `usize` fails. OP-TEE shim doesn't support a 32-bit environment.
 pub fn decode_ta_request(
     msg_args: &OpteeMsgArgs,
 ) -> Result<TaRequestInfo<PAGE_SIZE>, OpteeSmcReturnCode> {
@@ -445,6 +442,12 @@ pub fn decode_ta_request(
     };
 
     let num_params = msg_args.num_params as usize;
+    let client_params = num_params
+        .checked_sub(skip)
+        .ok_or(OpteeSmcReturnCode::EBadCmd)?;
+    if client_params > UteeParamOwned::TEE_NUM_PARAMS {
+        return Err(OpteeSmcReturnCode::EBadCmd);
+    }
     for (i, param) in msg_args
         .params
         .iter()

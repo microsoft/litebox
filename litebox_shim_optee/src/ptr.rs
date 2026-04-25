@@ -94,11 +94,6 @@ fn align_down(address: usize, align: usize) -> usize {
     address & !(align - 1)
 }
 
-#[inline]
-fn align_up(len: usize, align: usize) -> usize {
-    len.next_multiple_of(align)
-}
-
 /// Represent a physical pointer to an object with on-demand mapping.
 /// - `pages`: An array of page-aligned physical addresses. We expect physical addresses in this array are
 ///   virtually contiguous.
@@ -167,18 +162,23 @@ impl<T: Clone, const ALIGN: usize> PhysMutPtr<T, ALIGN> {
             ));
         }
         let start_page = align_down(pa, ALIGN);
-        let end_page = align_up(
-            pa.checked_add(bytes).ok_or(PhysPointerError::Overflow)?,
-            ALIGN,
-        );
-        let mut pages = alloc::vec::Vec::with_capacity((end_page - start_page) / ALIGN);
+        let end_page = pa
+            .checked_add(bytes)
+            .and_then(|end| end.checked_next_multiple_of(ALIGN))
+            .ok_or(PhysPointerError::Overflow)?;
+        let span = end_page
+            .checked_sub(start_page)
+            .ok_or(PhysPointerError::Overflow)?;
+        let mut pages = alloc::vec::Vec::with_capacity(span / ALIGN);
         let mut current_page = start_page;
         while current_page < end_page {
             pages.push(
                 PhysPageAddr::<ALIGN>::new(current_page)
                     .ok_or(PhysPointerError::InvalidPhysicalAddress(current_page))?,
             );
-            current_page += ALIGN;
+            current_page = current_page
+                .checked_add(ALIGN)
+                .ok_or(PhysPointerError::Overflow)?;
         }
         Self::new(&pages, pa - start_page)
     }
@@ -377,7 +377,10 @@ impl<T: Clone, const ALIGN: usize> PhysMutPtr<T, ALIGN> {
             )
             .ok_or(PhysPointerError::Overflow)?;
         let start = skip / ALIGN;
-        let end = (skip + size).div_ceil(ALIGN);
+        let end = skip
+            .checked_add(size)
+            .ok_or(PhysPointerError::Overflow)?
+            .div_ceil(ALIGN);
         unsafe {
             self.map_range(start, end, perms)?;
         }

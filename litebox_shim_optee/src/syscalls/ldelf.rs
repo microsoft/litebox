@@ -14,6 +14,27 @@ fn align_down(addr: usize, align: usize) -> usize {
 }
 
 impl Task {
+    #[inline]
+    fn checked_map_size(
+        num_bytes: usize,
+        pad_begin: usize,
+        pad_end: usize,
+    ) -> Result<usize, TeeResult> {
+        num_bytes
+            .checked_add(pad_begin)
+            .and_then(|t| t.checked_add(pad_end))
+            .and_then(|t| t.checked_next_multiple_of(PAGE_SIZE))
+            .ok_or(TeeResult::BadParameters)
+    }
+
+    #[inline]
+    fn checked_pad_end_start(padded_start: usize, num_bytes: usize) -> Result<usize, TeeResult> {
+        padded_start
+            .checked_add(num_bytes)
+            .and_then(|end| end.checked_next_multiple_of(PAGE_SIZE))
+            .ok_or(TeeResult::BadParameters)
+    }
+
     /// OP-TEE's syscall to map zero-initialized memory with padding.
     /// This function pads `pad_begin` bytes before and `pad_end` bytes after the
     /// zero-initialized `num_bytes` bytes. `va` can contain a hint address which
@@ -48,11 +69,7 @@ impl Task {
         }
         // TODO: Check whether flags contains `LDELF_MAP_FLAG_SHAREABLE` once we support sharing of file-based mappings.
 
-        let total_size = num_bytes
-            .checked_add(pad_begin)
-            .and_then(|t| t.checked_add(pad_end))
-            .ok_or(TeeResult::BadParameters)?
-            .next_multiple_of(PAGE_SIZE);
+        let total_size = Self::checked_map_size(num_bytes, pad_begin, pad_end)?;
         if addr.checked_add(total_size).is_none() {
             return Err(TeeResult::BadParameters);
         }
@@ -67,7 +84,10 @@ impl Task {
         let addr = self
             .sys_mmap(addr, total_size, ProtFlags::PROT_READ_WRITE, flags, -1, 0)
             .map_err(|_| TeeResult::OutOfMemory)?;
-        let padded_start = addr.as_usize() + pad_begin;
+        let padded_start = addr
+            .as_usize()
+            .checked_add(pad_begin)
+            .ok_or(TeeResult::BadParameters)?;
 
         // Unmap the padding regions to free physical memory.
         // Using munmap instead of mprotect(PROT_NONE) actually deallocates the frames.
@@ -77,8 +97,11 @@ impl Task {
             let _ = self.sys_munmap(addr, pad_begin_end - addr.as_usize());
         }
         // pad_end region: [align_up(padded_start + num_bytes, PAGE_SIZE), addr + total_size)
-        let pad_end_start = (padded_start + num_bytes).next_multiple_of(PAGE_SIZE);
-        let region_end = addr.as_usize() + total_size;
+        let pad_end_start = Self::checked_pad_end_start(padded_start, num_bytes)?;
+        let region_end = addr
+            .as_usize()
+            .checked_add(total_size)
+            .ok_or(TeeResult::BadParameters)?;
         if pad_end_start < region_end {
             let _ = self.sys_munmap(
                 UserMutPtr::from_usize(pad_end_start),
@@ -172,11 +195,7 @@ impl Task {
             return Err(TeeResult::BadParameters);
         }
 
-        let total_size = num_bytes
-            .checked_add(pad_begin)
-            .and_then(|t| t.checked_add(pad_end))
-            .ok_or(TeeResult::BadParameters)?
-            .next_multiple_of(PAGE_SIZE);
+        let total_size = Self::checked_map_size(num_bytes, pad_begin, pad_end)?;
         if addr.checked_add(total_size).is_none() {
             return Err(TeeResult::BadParameters);
         }
@@ -225,7 +244,10 @@ impl Task {
                 0,
             )
             .map_err(|_| TeeResult::OutOfMemory)?;
-        let padded_start = addr.as_usize() + pad_begin;
+        let padded_start = addr
+            .as_usize()
+            .checked_add(pad_begin)
+            .ok_or(TeeResult::BadParameters)?;
         if padded_start == 0 {
             let _ = self.sys_munmap(addr, total_size).ok();
             return Err(TeeResult::BadFormat);
@@ -250,13 +272,14 @@ impl Task {
         } else if flags.contains(LdelfMapFlags::LDELF_MAP_FLAG_EXECUTABLE) {
             prot |= ProtFlags::PROT_EXEC;
         }
+        let prot_start = align_down(padded_start, PAGE_SIZE);
+        let prot_len = padded_start
+            .checked_sub(prot_start)
+            .and_then(|offset| offset.checked_add(num_bytes))
+            .and_then(|len| len.checked_next_multiple_of(PAGE_SIZE))
+            .ok_or(TeeResult::BadParameters)?;
         if self
-            .sys_mprotect(
-                UserMutPtr::from_usize(align_down(padded_start, PAGE_SIZE)),
-                (num_bytes + padded_start - align_down(padded_start, PAGE_SIZE))
-                    .next_multiple_of(PAGE_SIZE),
-                prot,
-            )
+            .sys_mprotect(UserMutPtr::from_usize(prot_start), prot_len, prot)
             .is_err()
         {
             let _ = self.sys_munmap(addr, total_size).ok();
@@ -271,8 +294,11 @@ impl Task {
             let _ = self.sys_munmap(addr, pad_begin_end - addr.as_usize());
         }
         // pad_end region: [align_up(padded_start + num_bytes, PAGE_SIZE), addr + total_size)
-        let pad_end_start = (padded_start + num_bytes).next_multiple_of(PAGE_SIZE);
-        let region_end = addr.as_usize() + total_size;
+        let pad_end_start = Self::checked_pad_end_start(padded_start, num_bytes)?;
+        let region_end = addr
+            .as_usize()
+            .checked_add(total_size)
+            .ok_or(TeeResult::BadParameters)?;
         if pad_end_start < region_end {
             let _ = self.sys_munmap(
                 UserMutPtr::from_usize(pad_end_start),

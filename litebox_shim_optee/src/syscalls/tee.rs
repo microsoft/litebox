@@ -21,9 +21,9 @@ use crate::{
 };
 
 #[inline]
-fn align_up(addr: usize, align: usize) -> usize {
+fn align_up(addr: usize, align: usize) -> Option<usize> {
     debug_assert!(align.is_power_of_two());
-    (addr + align - 1) & !(align - 1)
+    addr.checked_next_multiple_of(align)
 }
 
 #[inline]
@@ -255,8 +255,10 @@ impl Task {
             let len = len
                 .checked_add(buf.as_usize() - align_down(buf.as_usize(), PAGE_SIZE))
                 .ok_or(TeeResult::AccessConflict)?;
-            NonZeroPageSize::<PAGE_SIZE>::new(align_up(len, PAGE_SIZE))
-                .ok_or(TeeResult::AccessConflict)?
+            NonZeroPageSize::<PAGE_SIZE>::new(
+                align_up(len, PAGE_SIZE).ok_or(TeeResult::AccessConflict)?,
+            )
+            .ok_or(TeeResult::AccessConflict)?
         };
         if let Some(perms) = self.global.pm.get_memory_permissions(start, aligned_len) {
             if (flags.contains(TeeMemoryAccessRights::TEE_MEMORY_ACCESS_READ)

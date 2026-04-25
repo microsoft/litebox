@@ -9,9 +9,9 @@ use litebox_common_linux::{MapFlags, ProtFlags, errno::Errno};
 use crate::{Task, UserMutPtr};
 
 #[inline]
-fn align_up(addr: usize, align: usize) -> usize {
+fn align_up(addr: usize, align: usize) -> Option<usize> {
     debug_assert!(align.is_power_of_two());
-    (addr + align - 1) & !(align - 1)
+    addr.checked_next_multiple_of(align)
 }
 
 impl Task {
@@ -66,7 +66,7 @@ impl Task {
             return Err(Errno::EINVAL);
         }
 
-        let aligned_len = align_up(len, PAGE_SIZE);
+        let aligned_len = align_up(len, PAGE_SIZE).ok_or(Errno::ENOMEM)?;
         if aligned_len == 0 {
             return Err(Errno::ENOMEM);
         }
