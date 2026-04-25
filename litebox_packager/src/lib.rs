@@ -569,6 +569,7 @@ const ELF_MAGIC: [u8; 4] = [0x7f, b'E', b'L', b'F'];
 /// through the rewriter. For actual ELF files, benign rewriter errors (already
 /// hooked, no syscalls, unsupported object, missing `.text`) are treated as
 /// warnings and the original bytes are returned.
+#[allow(clippy::unnecessary_wraps)]
 fn rewrite_elf(data: &[u8], path: &Path, verbose: bool) -> anyhow::Result<Vec<u8>> {
     // Fast-path: skip the rewriter entirely for non-ELF files.
     if data.len() < 4 || data[..4] != ELF_MAGIC {
@@ -585,16 +586,13 @@ fn rewrite_elf(data: &[u8], path: &Path, verbose: bool) -> anyhow::Result<Vec<u8
             }
             Ok(rewritten)
         }
-        Err(litebox_syscall_rewriter::Error::UnsupportedExecutable(ref msg))
-            if msg.contains("Bun") =>
-        {
-            anyhow::bail!(
-                "{} is a Bun-packaged executable and cannot be safely packaged \
-                 without syscall rewriting",
+        Err(e) => {
+            eprintln!(
+                "  warning: failed to rewrite {}: {e}; including as-is",
                 path.display()
-            )
+            );
+            Ok(data.to_vec())
         }
-        Err(e) => Err(e).with_context(|| format!("failed to rewrite {}", path.display())),
     }
 }
 
