@@ -153,13 +153,13 @@ pub fn hook_syscalls_in_elf(input_binary: &[u8], trampoline: Option<u64>) -> Res
     fixup_phdr_alignment(buf);
 
     // Parse the ELF and extract all metadata we need, then drop the borrow so we can mutate buf.
-    let (text_sections, control_transfer_targets, trampoline_base_addr) = {
+    let (arch, text_sections, control_transfer_targets, trampoline_base_addr) = {
         let file = object::File::parse(&*buf).map_err(|e| Error::ParseError(e.to_string()))?;
 
-        match file {
-            object::File::Elf64(_) => {}
+        let arch = match file {
+            object::File::Elf64(_) => Arch::X86_64,
             _ => return Ok(input_binary.to_vec()),
-        }
+        };
 
         let text_sections = match text_sections(&file) {
             Ok(sections) => sections,
@@ -168,15 +168,16 @@ pub fn hook_syscalls_in_elf(input_binary: &[u8], trampoline: Option<u64>) -> Res
             Err(e) => unreachable!("unexpected internal error: {e:?}"),
         };
 
-        if is_already_hooked(&*buf) {
+        if is_already_hooked(&*buf, arch) {
             return Ok(input_binary.to_vec());
         }
 
-        let control_transfer_targets = get_control_transfer_targets(&*buf, &text_sections)?;
+        let control_transfer_targets = get_control_transfer_targets(arch, &*buf, &text_sections)?;
 
         let trampoline_base_addr = find_addr_for_trampoline_code(&file)?;
 
         (
+            arch,
             text_sections,
             control_transfer_targets,
             trampoline_base_addr,
@@ -193,6 +194,7 @@ pub fn hook_syscalls_in_elf(input_binary: &[u8], trampoline: Option<u64>) -> Res
     for s in &text_sections {
         let section_data = section_slice_mut(buf, s)?;
         match hook_syscalls_in_section(
+            arch,
             &control_transfer_targets,
             s.vaddr,
             section_data,
@@ -270,8 +272,10 @@ fn text_sections(
 }
 
 /// Check if the binary is already hooked by looking for TRAMPOLINE_MAGIC at the end of the file.
-fn is_already_hooked(input_binary: &[u8]) -> bool {
-    let header_size = size_of::<TrampolineHeader64>();
+fn is_already_hooked(input_binary: &[u8], arch: Arch) -> bool {
+    let header_size = match arch {
+        Arch::X86_64 => size_of::<TrampolineHeader64>(),
+    };
 
     if input_binary.len() < header_size {
         return false;
@@ -309,7 +313,13 @@ fn is_already_hooked(input_binary: &[u8]) -> bool {
 /// `trampoline_base_addr` is the virtual address corresponding to `trampoline_data[0]`.
 /// `syscall_entry_addr` is the address of the 8-byte entry-point value that each trampoline
 /// stub jumps to (via `JMP [RIP+disp32]` on x86-64).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Arch {
+    X86_64,
+}
+
 fn hook_syscalls_in_section(
+    arch: Arch,
     control_transfer_targets: &BTreeSet<u64>,
     section_base_addr: u64,
     section_data: &mut [u8],
@@ -317,7 +327,7 @@ fn hook_syscalls_in_section(
     syscall_entry_addr: u64,
     trampoline_data: &mut Vec<u8>,
 ) -> core::result::Result<Vec<u64>, InternalError> {
-    let instructions = decode_section_instructions(section_data, section_base_addr)?;
+    let instructions = decode_section_instructions(arch, section_data, section_base_addr)?;
     let mut found_any = false;
     let mut skipped_addrs = Vec::new();
     for (i, inst) in instructions.iter().enumerate() {
@@ -351,6 +361,7 @@ fn hook_syscalls_in_section(
 
         if replace_start.is_none() {
             match hook_syscall_and_after(
+                arch,
                 control_transfer_targets,
                 section_base_addr,
                 section_data,
@@ -629,13 +640,14 @@ where
 }
 
 fn get_control_transfer_targets(
+    arch: Arch,
     input_binary: &[u8],
     text_sections: &[TextSectionInfo],
 ) -> Result<BTreeSet<u64>> {
     let mut control_transfer_targets = BTreeSet::new();
     for s in text_sections {
         let section_data = section_slice(input_binary, s)?;
-        let instructions = decode_section_instructions(section_data, s.vaddr)?;
+        let instructions = decode_section_instructions(arch, section_data, s.vaddr)?;
         control_transfer_targets.extend(instructions.into_iter().filter_map(|inst| {
             let target = inst.near_branch_target();
             (target != 0).then_some(target)
@@ -660,10 +672,13 @@ fn bytes_until_next_4g_boundary(ptr: *const u8) -> usize {
 // released onto crates.io.  We handle it by making sure that we are only ever
 // sending iced-x86 inputs that are fully within the 4GiB scope.
 fn decode_section_instructions(
+    arch: Arch,
     section_data: &[u8],
     section_base_addr: u64,
 ) -> Result<Vec<iced_x86::Instruction>> {
-    let bitness = 64;
+    let bitness = match arch {
+        Arch::X86_64 => 64,
+    };
 
     let mut instructions = Vec::new();
     let mut offset = 0usize;
@@ -736,6 +751,7 @@ fn section_slice_mut<'a>(buf: &'a mut [u8], section: &TextSectionInfo) -> Result
 
 #[allow(clippy::too_many_arguments)]
 fn hook_syscall_and_after(
+    _arch: Arch,
     control_transfer_targets: &BTreeSet<u64>,
     section_base_addr: u64,
     section_data: &mut [u8],
