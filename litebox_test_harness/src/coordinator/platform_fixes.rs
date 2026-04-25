@@ -293,6 +293,7 @@ pub(crate) async fn run(r: &mut TestRunner) {
     touch_redirect_tests(r).await;
     vscode_install_pattern_tests(r).await;
     pid_visibility_tests(r).await;
+    file_redirect_tests(r).await;
     loopback_tcp_tests(r).await;
 }
 
@@ -1298,6 +1299,122 @@ pub(crate) async fn pid_visibility_tests(r: &mut TestRunner) {
                     Command::Exec {
                         args: vec!["bash".into(), "-c".into(), script],
                         timeout_secs: Some(15),
+                        stdin: None,
+                        background: false,
+                    },
+                )
+                .await;
+            let pass = matches!(
+                &resp,
+                Response::ExecResult { stdout, .. }
+                    if (test.check)(stdout)
+            );
+            r.record(&test_id, agent, pass, &format!("{resp:?}"));
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// FR: File-Redirect — stdout of background process → file via redirect
+// (discovered during cross-worker TCP debugging: nc prints to stdout
+// but the redirected file stays empty)
+// ═══════════════════════════════════════════════════════════════════
+
+/// When a background command's stdout is redirected to a file
+/// (`cmd > file &`), the child process's fd 1 is connected through
+/// the mux bridge to the parent, which holds the file fd.
+/// Data written by the child must be visible when the parent (or a
+/// sibling) reads the file.
+///
+/// Tests cover:
+///   FR.bg_echo       — echo in background: `echo DATA > file &; wait; cat file`
+///   FR.bg_printf      — printf (no trailing newline): `printf DATA > file &; wait; cat file`
+///   FR.bg_exe         — exec'd process writes to stdout → file
+///   FR.bg_cat_pipe    — piped: `echo DATA | cat > file &; wait; cat file`
+///   FR.fg_redirect    — control: foreground redirect should always work
+pub(crate) async fn file_redirect_tests(r: &mut TestRunner) {
+    eprintln!(
+        "[platform] === File Redirect ({} agents) ===",
+        AGENTS.len()
+    );
+
+    let self_exe = r.self_exe.clone();
+
+    struct FRTest {
+        name: &'static str,
+        script_template: &'static str,
+        check: fn(&str) -> bool,
+    }
+
+    let tests: &[FRTest] = &[
+        // Control: foreground redirect (no background, no mux bridge)
+        FRTest {
+            name: "fg_redirect",
+            script_template: concat!(
+                "echo FR_FG > {path}\n",
+                "cat {path}\n",
+            ),
+            check: |s| s.contains("FR_FG"),
+        },
+        // Background builtin (echo) writes to redirected stdout
+        FRTest {
+            name: "bg_echo",
+            script_template: concat!(
+                "echo FR_BGECHO > {path} &\n",
+                "wait\n",
+                "cat {path}\n",
+            ),
+            check: |s| s.contains("FR_BGECHO"),
+        },
+        // Background exec'd process writes to redirected stdout.
+        // The child goes through delayed fork → different worker.
+        // Its stdout is connected through the mux bridge.
+        FRTest {
+            name: "bg_exe",
+            script_template: concat!(
+                "{exe} echo-test > {path} &\n",
+                "wait\n",
+                "cat {path}\n",
+            ),
+            check: |s| s.contains("ECHO_TEST_OK"),
+        },
+        // Background pipeline writes to redirected file
+        FRTest {
+            name: "bg_cat_pipe",
+            script_template: concat!(
+                "echo FR_PIPE | cat > {path} &\n",
+                "wait\n",
+                "cat {path}\n",
+            ),
+            check: |s| s.contains("FR_PIPE"),
+        },
+        // Background process with append redirect (>>)
+        FRTest {
+            name: "bg_append",
+            script_template: concat!(
+                "echo LINE1 > {path}\n",
+                "echo LINE2 >> {path} &\n",
+                "wait\n",
+                "cat {path}\n",
+            ),
+            check: |s| s.contains("LINE1") && s.contains("LINE2"),
+        },
+    ];
+
+    for &agent in AGENTS {
+        for test in tests {
+            let test_id = format!("FR.{}.{}", test.name, agent);
+            let path = format!("/shared/fr-{}-{}.txt", test.name, agent);
+            let script = test
+                .script_template
+                .replace("{path}", &path)
+                .replace("{exe}", &self_exe);
+            let resp = r
+                .send(
+                    agent,
+                    Command::Exec {
+                        args: vec!["bash".into(), "-c".into(), script],
+                        timeout_secs: Some(10),
                         stdin: None,
                         background: false,
                     },
