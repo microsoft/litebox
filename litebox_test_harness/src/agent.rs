@@ -663,6 +663,158 @@ async fn agent_loop(self_exe: &str) {
                 respond(&Response::Ok { data: None }).await;
             }
 
+            Command::NetConnectMany {
+                addr,
+                data,
+                count,
+                delay_ms,
+            } => {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                let mut handles = Vec::new();
+                for i in 0..count {
+                    let addr = addr.clone();
+                    let data = data.clone();
+                    handles.push(tokio::spawn(async move {
+                        let mut stream = match tokio::time::timeout(
+                            Duration::from_secs(5),
+                            tokio::net::TcpStream::connect(&addr),
+                        )
+                        .await
+                        {
+                            Ok(Ok(s)) => s,
+                            _ => return false,
+                        };
+                        if stream.write_all(data.as_bytes()).await.is_err() {
+                            return false;
+                        }
+                        let _ = stream.flush().await;
+                        let _ = stream.shutdown().await;
+                        let mut buf = vec![0u8; data.len() + 64];
+                        match tokio::time::timeout(Duration::from_secs(5), stream.read(&mut buf))
+                            .await
+                        {
+                            Ok(Ok(n)) if n > 0 => {
+                                String::from_utf8_lossy(&buf[..n]).contains(&data)
+                            }
+                            _ => false,
+                        }
+                    }));
+                    if delay_ms > 0 {
+                        tokio::time::sleep(Duration::from_millis(delay_ms as u64)).await;
+                    }
+                }
+                let mut success = 0u32;
+                for h in handles {
+                    if let Ok(true) = h.await {
+                        success += 1;
+                    }
+                }
+                respond(&Response::Ok {
+                    data: Some(format!("success={success}/{count}")),
+                })
+                .await;
+            }
+
+            Command::NetSendRecv { addr, size } => {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                let result = async {
+                    let mut stream = tokio::time::timeout(
+                        Duration::from_secs(10),
+                        tokio::net::TcpStream::connect(&addr),
+                    )
+                    .await
+                    .map_err(|_| "connect timeout".to_string())?
+                    .map_err(|e| format!("connect: {e}"))?;
+
+                    // Generate known pattern.
+                    let pattern: Vec<u8> = (0..size as usize)
+                        .map(|i| b"ABCDEFGHIJKLMNOP"[i % 16])
+                        .collect();
+                    stream
+                        .write_all(&pattern)
+                        .await
+                        .map_err(|e| format!("write: {e}"))?;
+                    let _ = stream.shutdown().await;
+
+                    // Read echoed data.
+                    let mut received = Vec::new();
+                    let mut buf = [0u8; 8192];
+                    loop {
+                        match tokio::time::timeout(Duration::from_secs(10), stream.read(&mut buf))
+                            .await
+                        {
+                            Ok(Ok(0)) => break,
+                            Ok(Ok(n)) => received.extend_from_slice(&buf[..n]),
+                            Ok(Err(e)) => return Err(format!("read: {e}")),
+                            Err(_) => return Err("read timeout".to_string()),
+                        }
+                    }
+
+                    // Verify integrity.
+                    if received.len() != pattern.len() {
+                        return Err(format!(
+                            "size mismatch: sent={} recv={}",
+                            pattern.len(),
+                            received.len()
+                        ));
+                    }
+                    if received != pattern {
+                        let first_diff = received
+                            .iter()
+                            .zip(pattern.iter())
+                            .position(|(a, b)| a != b)
+                            .unwrap_or(0);
+                        return Err(format!(
+                            "data mismatch at byte {first_diff}: got {:02x} expected {:02x}",
+                            received[first_diff], pattern[first_diff]
+                        ));
+                    }
+                    Ok(format!("verified={size}"))
+                }
+                .await;
+                match result {
+                    Ok(msg) => respond(&Response::Ok { data: Some(msg) }).await,
+                    Err(e) => respond(&Response::Error { error: e }).await,
+                }
+            }
+
+            Command::NetReconnectStress { addr, count, data } => {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                let mut success = 0u32;
+                for _ in 0..count {
+                    let ok = async {
+                        let mut stream = tokio::time::timeout(
+                            Duration::from_secs(5),
+                            tokio::net::TcpStream::connect(&addr),
+                        )
+                        .await
+                        .ok()?
+                        .ok()?;
+                        stream.write_all(data.as_bytes()).await.ok()?;
+                        let _ = stream.flush().await;
+                        let _ = stream.shutdown().await;
+                        let mut buf = vec![0u8; data.len() + 64];
+                        let n = tokio::time::timeout(Duration::from_secs(5), stream.read(&mut buf))
+                            .await
+                            .ok()?
+                            .ok()?;
+                        if n > 0 && String::from_utf8_lossy(&buf[..n]).contains(&data) {
+                            Some(())
+                        } else {
+                            None
+                        }
+                    }
+                    .await;
+                    if ok.is_some() {
+                        success += 1;
+                    }
+                }
+                respond(&Response::Ok {
+                    data: Some(format!("success={success}/{count}")),
+                })
+                .await;
+            }
+
             Command::Exit => {
                 // Abort all TCP echo servers.
                 for (_, task) in listeners.drain() {

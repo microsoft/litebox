@@ -8,6 +8,7 @@ pub(crate) mod fork_matrix;
 pub(crate) mod matrix;
 pub(crate) mod platform_fixes;
 pub(crate) mod special_cases;
+pub(crate) mod tcp_stress;
 pub(crate) mod vscode;
 
 use crate::protocol::{Command, Response};
@@ -242,14 +243,19 @@ impl TestRunner {
 
 /// Run all tests as the coordinator.
 pub fn run_all(self_exe: &str) -> Vec<TestResult> {
+    run_filtered(self_exe, None)
+}
+
+/// Run tests, optionally filtering to a specific suite.
+pub fn run_filtered(self_exe: &str, filter: Option<&str>) -> Vec<TestResult> {
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .expect("tokio runtime")
-        .block_on(run_tests(self_exe))
+        .block_on(run_tests(self_exe, filter))
 }
 
-async fn run_tests(self_exe: &str) -> Vec<TestResult> {
+async fn run_tests(self_exe: &str, filter: Option<&str>) -> Vec<TestResult> {
     // The non-PIE binary (/litebox-test-harness-nonpie) is pre-built via:
     //   cargo rustc -p litebox_test_harness --target-dir target/nonpie -- -C link-args=-no-pie
     // It must be copied to the rootfs before running tests.
@@ -295,67 +301,87 @@ async fn run_tests(self_exe: &str) -> Vec<TestResult> {
         .await;
     eprintln!("[coord] AA spawn children: {r:?}");
 
+    let should_run = |suite: &str| filter.is_none() || filter == Some(suite);
+
     // === Matrix Tests (capability × topology × dimensions) ===
-    eprintln!("[coord] === Matrix Tests ===");
-    matrix::run_matrix_tests(&mut runner).await;
+    if should_run("matrix") {
+        eprintln!("[coord] === Matrix Tests ===");
+        matrix::run_matrix_tests(&mut runner).await;
+    }
 
     // === Fork Matrix Tests (shell patterns, exec binary/method, delayed fork, stress) ===
-    eprintln!("[coord] === Fork Matrix Tests ===");
-    fork_matrix::run_fork_matrix_tests(&mut runner).await;
+    if should_run("fork") {
+        eprintln!("[coord] === Fork Matrix Tests ===");
+        fork_matrix::run_fork_matrix_tests(&mut runner).await;
+    }
 
     // === Platform Fix Validation Tests ===
-    eprintln!("[coord] === Platform Fix Validation Tests ===");
-    platform_fixes::run(&mut runner).await;
+    if should_run("platform") {
+        eprintln!("[coord] === Platform Fix Validation Tests ===");
+        platform_fixes::run(&mut runner).await;
+    }
+
+    // === TCP Stress Tests ===
+    if should_run("tcp") {
+        eprintln!("[coord] === TCP Stress Tests ===");
+        tcp_stress::run(&mut runner).await;
+    }
 
     // === VS Code Reproduction Tests ===
-    eprintln!("[coord] === VS Code Reproduction Tests ===");
-    vscode::vscode_repro_tests(&mut runner).await;
+    if should_run("vscode") {
+        eprintln!("[coord] === VS Code Reproduction Tests ===");
+        vscode::vscode_repro_tests(&mut runner).await;
 
-    // === VS Code Bootstrap Replay ===
-    vscode::vscode_bootstrap_replay(&mut runner).await;
+        // === VS Code Bootstrap Replay ===
+        vscode::vscode_bootstrap_replay(&mut runner).await;
+    }
 
     // === Contamination Sequence Tests (run LAST — depend on accumulated state) ===
-    eprintln!("[coord] === Contamination Sequence Tests ===");
-    // Canary: test that agent A can still exec.
-    {
-        let canary_cmd = crate::protocol::Command::Exec {
-            args: vec![runner.self_exe.clone(), "echo-test".into()],
-            timeout_secs: None,
-            stdin: None,
-            background: false,
-        };
-        let resp = runner.send("A", canary_cmd).await;
-        let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout == "ECHO_TEST_OK");
-        runner.record("X_canary.pre_sequence", "A", pass, &format!("{resp:?}"));
+    if should_run("contamination") {
+        eprintln!("[coord] === Contamination Sequence Tests ===");
+        // Canary: test that agent A can still exec.
+        {
+            let canary_cmd = crate::protocol::Command::Exec {
+                args: vec![runner.self_exe.clone(), "echo-test".into()],
+                timeout_secs: None,
+                stdin: None,
+                background: false,
+            };
+            let resp = runner.send("A", canary_cmd).await;
+            let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout == "ECHO_TEST_OK");
+            runner.record("X_canary.pre_sequence", "A", pass, &format!("{resp:?}"));
+        }
+        special_cases::contamination_sequence_tests(&mut runner).await;
     }
-    special_cases::contamination_sequence_tests(&mut runner).await;
 
-    // === Netlink / getifaddrs Tests ===
-    special_cases::netlink_tests(&mut runner).await;
+    if should_run("special") || filter.is_none() {
+        // === Netlink / getifaddrs Tests ===
+        special_cases::netlink_tests(&mut runner).await;
 
-    // === IPv6 Network Tests ===
-    special_cases::net_ipv6_tests(&mut runner).await;
+        // === IPv6 Network Tests ===
+        special_cases::net_ipv6_tests(&mut runner).await;
 
-    // === Unix Socket Tests ===
-    special_cases::unix_socket_tests(&mut runner).await;
+        // === Unix Socket Tests ===
+        special_cases::unix_socket_tests(&mut runner).await;
 
-    // === Node.js Exit Tests ===
-    special_cases::node_exit_tests(&mut runner).await;
+        // === Node.js Exit Tests ===
+        special_cases::node_exit_tests(&mut runner).await;
 
-    // === Terminal Ioctl Matrix ===
-    special_cases::terminal_ioctl_tests(&mut runner).await;
+        // === Terminal Ioctl Matrix ===
+        special_cases::terminal_ioctl_tests(&mut runner).await;
 
-    // === Filesystem I/O Matrix ===
-    special_cases::fs_io_tests(&mut runner).await;
+        // === Filesystem I/O Matrix ===
+        special_cases::fs_io_tests(&mut runner).await;
 
-    // === Stdin-Piped Script Tests ===
-    special_cases::stdin_script_tests(&mut runner).await;
+        // === Stdin-Piped Script Tests ===
+        special_cases::stdin_script_tests(&mut runner).await;
 
-    // === Capture-Pipe Fork Tests ===
-    special_cases::capture_pipe_tests(&mut runner).await;
+        // === Capture-Pipe Fork Tests ===
+        special_cases::capture_pipe_tests(&mut runner).await;
 
-    // === Cross-Worker Tests ===
-    special_cases::cross_worker_tests(&mut runner).await;
+        // === Cross-Worker Tests ===
+        special_cases::cross_worker_tests(&mut runner).await;
+    }
 
     // Shutdown all children.
     for (id, mut child) in runner.children.drain() {

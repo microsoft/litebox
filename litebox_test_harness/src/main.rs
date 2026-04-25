@@ -61,7 +61,9 @@ fn main() {
 
     match cmd {
         "spawn-tree" => {
-            let results = coordinator::run_all(self_exe);
+            // Optional: --filter=tcp to run only TCP stress tests.
+            let filter = args.iter().find_map(|a| a.strip_prefix("--filter="));
+            let results = coordinator::run_filtered(self_exe, filter);
             let pass_count = results.iter().filter(|r| r.outcome() == "pass").count();
             let fail_count = results.iter().filter(|r| r.outcome() == "FAIL").count();
             let xfail_count = results.iter().filter(|r| r.outcome() == "xfail").count();
@@ -148,12 +150,7 @@ fn main() {
                 // Use recv() instead of read() — the litebox shim may handle
                 // them differently for socket FDs.
                 let n = unsafe {
-                    libc::recv(
-                        stream.as_raw_fd(),
-                        buf.as_mut_ptr().cast(),
-                        buf.len(),
-                        0,
-                    )
+                    libc::recv(stream.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len(), 0)
                 };
                 if n > 0 {
                     let n = n as usize;
@@ -169,10 +166,7 @@ fn main() {
                 } else if n == 0 {
                     eprintln!("[tcp-echo] recv returned 0 (EOF)");
                 } else {
-                    eprintln!(
-                        "[tcp-echo] recv error: {}",
-                        std::io::Error::last_os_error()
-                    );
+                    eprintln!("[tcp-echo] recv error: {}", std::io::Error::last_os_error());
                 }
             }
             eprintln!("[tcp-echo] exiting");
@@ -212,6 +206,106 @@ fn main() {
                 print!("RECV={text}");
             }
             eprintln!("[tcp-recv-all] exiting");
+        }
+        "tcp-fullduplex" => {
+            // Listen on a TCP port. Accept one connection. Simultaneously:
+            //   - Writer thread: sends SIZE bytes of 'S' chars
+            //   - Reader thread: reads until SIZE bytes of data received
+            // Reports both totals. Tests for starvation where one direction
+            // blocks the other in the poll loop.
+            let port: u16 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(9999);
+            let size: usize = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(65536);
+            let listener = std::net::TcpListener::bind(format!("0.0.0.0:{port}"))
+                .expect("tcp-fullduplex: bind failed");
+            eprintln!("[tcp-fullduplex] listening on 0.0.0.0:{port}, size={size}");
+            if let Ok((stream, addr)) = listener.accept() {
+                eprintln!("[tcp-fullduplex] accepted from {addr}");
+                use std::io::{Read, Write};
+                let read_stream = stream.try_clone().expect("clone");
+                let write_size = size;
+                // Writer thread: send SIZE bytes of 'S'
+                let writer = std::thread::spawn(move || {
+                    let mut s = stream;
+                    let chunk = vec![b'S'; 4096.min(write_size)];
+                    let mut sent = 0usize;
+                    while sent < write_size {
+                        let n = (write_size - sent).min(chunk.len());
+                        match s.write(&chunk[..n]) {
+                            Ok(w) => sent += w,
+                            Err(_) => break,
+                        }
+                    }
+                    let _ = s.flush();
+                    let _ = s.shutdown(std::net::Shutdown::Write);
+                    sent
+                });
+                // Reader: read until EOF
+                let reader = std::thread::spawn(move || {
+                    let mut s = read_stream;
+                    let mut total = 0usize;
+                    let mut buf = [0u8; 8192];
+                    loop {
+                        match s.read(&mut buf) {
+                            Ok(0) => break,
+                            Ok(n) => total += n,
+                            Err(_) => break,
+                        }
+                    }
+                    total
+                });
+                let sent = writer.join().unwrap_or(0);
+                let recvd = reader.join().unwrap_or(0);
+                println!("FULLDUPLEX:sent={sent},recv={recvd},size={size}");
+            }
+        }
+        "tcp-fullduplex-client" => {
+            // Connect to a tcp-fullduplex server. Simultaneously:
+            //   - Write SIZE bytes of 'C' chars
+            //   - Read until EOF
+            // Reports both totals.
+            let addr = args.get(2).map(String::as_str).unwrap_or("127.0.0.1:9999");
+            let size: usize = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(65536);
+            use std::io::{Read, Write};
+            match std::net::TcpStream::connect(addr) {
+                Ok(stream) => {
+                    let read_stream = stream.try_clone().expect("clone");
+                    let writer = std::thread::spawn(move || {
+                        let mut s = stream;
+                        let chunk = vec![b'C'; 4096.min(size)];
+                        let mut sent = 0usize;
+                        while sent < size {
+                            let n = (size - sent).min(chunk.len());
+                            match s.write(&chunk[..n]) {
+                                Ok(w) => sent += w,
+                                Err(_) => break,
+                            }
+                        }
+                        let _ = s.flush();
+                        let _ = s.shutdown(std::net::Shutdown::Write);
+                        sent
+                    });
+                    let reader = std::thread::spawn(move || {
+                        let mut s = read_stream;
+                        let mut total = 0usize;
+                        let mut buf = [0u8; 8192];
+                        loop {
+                            match s.read(&mut buf) {
+                                Ok(0) => break,
+                                Ok(n) => total += n,
+                                Err(_) => break,
+                            }
+                        }
+                        total
+                    });
+                    let sent = writer.join().unwrap_or(0);
+                    let recvd = reader.join().unwrap_or(0);
+                    println!("CLIENT:sent={sent},recv={recvd}");
+                }
+                Err(e) => {
+                    eprintln!("[tcp-fullduplex-client] connect failed: {e}");
+                    std::process::exit(1);
+                }
+            }
         }
         "slow-echo" => {
             // Sleeps 3 seconds then prints, simulating a slow-starting server.
