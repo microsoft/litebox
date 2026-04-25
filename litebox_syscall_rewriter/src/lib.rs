@@ -640,11 +640,6 @@ fn rel32_bytes(target: u64, base: u64, context: &'static str) -> Result<[u8; 4]>
     Ok(disp.to_le_bytes())
 }
 
-/// Patch a single mapped code segment in-place, returning trampoline stubs and
-/// the addresses of any syscall instructions that could not be patched
-/// (replaced with `ICEBP; HLT` so they trap instead of escaping to the host
-/// kernel).
-///
 /// This is the runtime counterpart to [`hook_syscalls_in_elf`]. Instead of
 /// processing a whole ELF file, it operates on a single already-mapped code
 /// region — the caller is responsible for making the region writable before
