@@ -379,8 +379,14 @@ fn extract_tar<R: Read>(
     permissions: &mut HashMap<PathBuf, u32>,
 ) -> anyhow::Result<()> {
     let mut archive = tar::Archive::new(reader);
-    archive.set_preserve_permissions(true);
-    archive.set_unpack_xattrs(true);
+    // Preserve Unix permissions and xattrs when running on Unix hosts.
+    // On non-Unix platforms these are no-ops or unsupported; permissions are
+    // tracked separately in the `permissions` HashMap from tar headers.
+    #[cfg(unix)]
+    {
+        archive.set_preserve_permissions(true);
+        archive.set_unpack_xattrs(true);
+    }
 
     let mut deferred_links: Vec<DeferredHardLink> = Vec::new();
 
@@ -959,8 +965,12 @@ fn resolve_in_rootfs(path: &Path, rootfs: &Path, max_depth: u32) -> Option<PathB
         // Absolute symlink: resolve within rootfs
         rootfs.join(strip_unix_root(&link_target))
     } else {
-        // Relative symlink
-        path.parent()?.join(&link_target)
+        // Relative symlink — join with parent, then canonicalize `..` components
+        // to prevent escaping the rootfs boundary.
+        let joined = path.parent()?.join(&link_target);
+        // Normalize to strip `..` then re-root inside rootfs.
+        let normalized = normalize_path(joined.strip_prefix(rootfs).unwrap_or(&joined));
+        rootfs.join(normalized)
     };
 
     resolve_in_rootfs(&resolved, rootfs, max_depth - 1)
