@@ -195,8 +195,36 @@ impl<'a> FileAndParsed<'a> {
         let file = ElfFileInMemory::new(task, elf_buf);
         let mut parsed = litebox_common_linux::loader::ElfParsedFile::parse(&mut &file)
             .map_err(ElfLoaderError::ParseError)?;
-        parsed.parse_trampoline(&mut &file, task.global.platform.get_syscall_entry_point())?;
+
+        let syscall_entry_point = task.global.platform.get_syscall_entry_point();
+
+        // Try to parse an embedded trampoline. For pre-patched binaries this
+        // succeeds and load_trampoline() will map it. For unpatched binaries
+        // (UnpatchedBinary error), the runtime patching during mmap will patch
+        // code segments as they are mapped.
+        if syscall_entry_point != 0 {
+            match parsed.parse_trampoline(&mut &file, syscall_entry_point) {
+                Ok(()) | Err(litebox_common_linux::loader::ElfParseError::UnpatchedBinary) => {}
+                Err(e) => return Err(ElfLoaderError::ParseError(e)),
+            }
+        }
+
         Ok(Self { file, parsed })
+    }
+
+    /// Load the ELF into guest memory.
+    fn load_mapped(
+        &mut self,
+        platform: &(impl litebox::platform::RawPointerProvider + litebox::platform::SystemInfoProvider),
+    ) -> Result<litebox_common_linux::loader::MappingInfo, ElfLoaderError> {
+        let syscall_entry_point = self.file.task.global.platform.get_syscall_entry_point();
+        let reserve = if syscall_entry_point != 0 && !self.parsed.has_trampoline() {
+            Some(litebox::mm::linux::DEFAULT_RESERVED_SPACE_SIZE)
+        } else {
+            None
+        };
+        let result = self.parsed.load(&mut self.file, &mut &*platform, reserve);
+        Ok(result?)
     }
 }
 
@@ -214,10 +242,7 @@ impl<'a> ElfLoader<'a> {
         }
         let task = self.main.file.task;
         let global = &task.global;
-        let ldelf_info =
-            self.main
-                .parsed
-                .load(&mut self.main.file, &mut &*global.platform, None)?;
+        let ldelf_info = self.main.load_mapped(global.platform)?;
 
         let mut ta_stack = crate::loader::ta_stack::allocate_stack(task, None).ok_or(
             ElfLoaderError::MappingError(litebox::mm::linux::MappingError::OutOfMemory),
