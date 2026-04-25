@@ -24,7 +24,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use object::read::elf::{ElfFile, ProgramHeader as _};
-use object::read::{Object as _, ObjectSection as _, ObjectSymbol as _};
+use object::read::{Object as _, ObjectSection as _};
 use thiserror::Error;
 use zerocopy::{FromBytes, Immutable, IntoBytes};
 
@@ -38,8 +38,6 @@ pub enum Error {
     UnsupportedExecutable(String),
     #[error("failed to disassemble: {0}")]
     DisassemblyFailure(String),
-    #[error("provided trampoline address is too large for 32-bit executable")]
-    TrampolineAddressTooLarge,
     #[error("address overflow: {0}")]
     AddressOverflow(String),
     #[error("unpatchable syscall instruction(s): {0}")]
@@ -55,7 +53,7 @@ enum InternalError {
     Public(Error),
     /// No executable `.text` section was found.
     NoTextSectionFound,
-    /// No `syscall`/`int 0x80`/`call gs:0x10` instructions were found.
+    /// No `syscall` instructions were found.
     NoSyscallInstructionsFound,
     /// Insufficient space around a syscall instruction to patch it.
     InsufficientBytesBeforeOrAfter,
@@ -85,16 +83,6 @@ struct TrampolineHeader64 {
     trampoline_size: u64,
 }
 
-/// Trampoline header for 32-bit: 8 (magic) + 4 (file_offset) + 4 (vaddr) + 4 (size) = 20 bytes
-#[repr(C, packed)]
-#[derive(FromBytes, IntoBytes, Immutable)]
-struct TrampolineHeader32 {
-    magic: [u8; 8],
-    file_offset: u32,
-    vaddr: u32,
-    trampoline_size: u32,
-}
-
 /// Metadata about an executable section, extracted from the read-only ELF parse.
 struct TextSectionInfo {
     /// Virtual address of the section
@@ -116,11 +104,11 @@ struct TextSectionInfo {
 ///
 /// The header at the end contains:
 /// - [`TRAMPOLINE_MAGIC`] (8 bytes)
-/// - trampoline file offset (8 bytes for 64-bit, 4 bytes for 32-bit)
-/// - trampoline virtual address (8 bytes for 64-bit, 4 bytes for 32-bit)
-/// - trampoline size (8 bytes for 64-bit, 4 bytes for 32-bit)
+/// - trampoline file offset (8 bytes)
+/// - trampoline virtual address (8 bytes)
+/// - trampoline size (8 bytes)
 ///
-/// This layout allows loaders to read just the last 32/20 bytes to get the metadata. Even when
+/// This layout allows loaders to read just the last 32 bytes to get the metadata. Even when
 /// there is no syscall instruction in the binary, the rewriter still appends the header and the initial
 /// syscall-entry placeholder so the loader/audit path can tell the binary was processed.
 ///
@@ -165,20 +153,13 @@ pub fn hook_syscalls_in_elf(input_binary: &[u8], trampoline: Option<u64>) -> Res
     fixup_phdr_alignment(buf);
 
     // Parse the ELF and extract all metadata we need, then drop the borrow so we can mutate buf.
-    let (arch, dl_sysinfo_int80, text_sections, control_transfer_targets, trampoline_base_addr) = {
+    let (text_sections, control_transfer_targets, trampoline_base_addr) = {
         let file = object::File::parse(&*buf).map_err(|e| Error::ParseError(e.to_string()))?;
 
-        let arch = match file {
-            object::File::Elf64(_) => Arch::X86_64,
-            object::File::Elf32(_) => Arch::X86_32,
+        match file {
+            object::File::Elf64(_) => {}
             _ => return Ok(input_binary.to_vec()),
-        };
-
-        let dl_sysinfo_int80 = if arch == Arch::X86_32 {
-            get_symbols(&file)
-        } else {
-            None
-        };
+        }
 
         let text_sections = match text_sections(&file) {
             Ok(sections) => sections,
@@ -187,17 +168,15 @@ pub fn hook_syscalls_in_elf(input_binary: &[u8], trampoline: Option<u64>) -> Res
             Err(e) => unreachable!("unexpected internal error: {e:?}"),
         };
 
-        if is_already_hooked(&*buf, arch) {
+        if is_already_hooked(&*buf) {
             return Ok(input_binary.to_vec());
         }
 
-        let control_transfer_targets = get_control_transfer_targets(arch, &*buf, &text_sections)?;
+        let control_transfer_targets = get_control_transfer_targets(&*buf, &text_sections)?;
 
         let trampoline_base_addr = find_addr_for_trampoline_code(&file)?;
 
         (
-            arch,
-            dl_sysinfo_int80,
             text_sections,
             control_transfer_targets,
             trampoline_base_addr,
@@ -205,27 +184,20 @@ pub fn hook_syscalls_in_elf(input_binary: &[u8], trampoline: Option<u64>) -> Res
     };
 
     // Build the trampoline code (without header - header goes at the end)
-    // The code starts with the syscall entry point placeholder
+    // The code starts with the syscall entry point placeholder (8 bytes for x86-64)
     let mut trampoline_data = vec![];
     let trampoline = trampoline.unwrap_or(0);
-    if arch == Arch::X86_64 {
-        trampoline_data.extend_from_slice(&trampoline.to_le_bytes());
-    } else {
-        let trampoline = u32::try_from(trampoline).map_err(|_| Error::TrampolineAddressTooLarge)?;
-        trampoline_data.extend_from_slice(&trampoline.to_le_bytes());
-    }
+    trampoline_data.extend_from_slice(&trampoline.to_le_bytes());
     // Patch syscalls in-place in buf
     let mut skipped_addrs = Vec::new();
     for s in &text_sections {
         let section_data = section_slice_mut(buf, s)?;
         match hook_syscalls_in_section(
-            arch,
             &control_transfer_targets,
             s.vaddr,
             section_data,
             trampoline_base_addr,
             trampoline_base_addr, // entry point is at offset 0 of trampoline
-            dl_sysinfo_int80,
             &mut trampoline_data,
         ) {
             Ok(addrs) => skipped_addrs.extend(addrs),
@@ -249,28 +221,13 @@ pub fn hook_syscalls_in_elf(input_binary: &[u8], trampoline: Option<u64>) -> Res
 
     // Build the header (goes at the end of the file)
     // The entry point placeholder is at offset 0 of the trampoline code, not in the header.
-    if arch == Arch::X86_64 {
-        let header = TrampolineHeader64 {
-            magic: *TRAMPOLINE_MAGIC,
-            file_offset: trampoline_file_offset,
-            vaddr: trampoline_base_addr,
-            trampoline_size: trampoline_size as u64,
-        };
-        out.extend_from_slice(header.as_bytes());
-    } else {
-        let file_offset_32 =
-            u32::try_from(trampoline_file_offset).map_err(|_| Error::TrampolineAddressTooLarge)?;
-        let trampoline_base_addr_32 =
-            u32::try_from(trampoline_base_addr).map_err(|_| Error::TrampolineAddressTooLarge)?;
-        #[allow(clippy::cast_possible_truncation)]
-        let header = TrampolineHeader32 {
-            magic: *TRAMPOLINE_MAGIC,
-            file_offset: file_offset_32,
-            vaddr: trampoline_base_addr_32,
-            trampoline_size: trampoline_size as u32,
-        };
-        out.extend_from_slice(header.as_bytes());
-    }
+    let header = TrampolineHeader64 {
+        magic: *TRAMPOLINE_MAGIC,
+        file_offset: trampoline_file_offset,
+        vaddr: trampoline_base_addr,
+        trampoline_size: trampoline_size as u64,
+    };
+    out.extend_from_slice(header.as_bytes());
     if !skipped_addrs.is_empty() {
         return Err(Error::UnpatchableSyscalls(format!(
             "{} unpatchable syscall instruction(s) at {skipped_addrs:?}",
@@ -313,11 +270,8 @@ fn text_sections(
 }
 
 /// Check if the binary is already hooked by looking for TRAMPOLINE_MAGIC at the end of the file.
-fn is_already_hooked(input_binary: &[u8], arch: Arch) -> bool {
-    let header_size = match arch {
-        Arch::X86_64 => size_of::<TrampolineHeader64>(),
-        Arch::X86_32 => size_of::<TrampolineHeader32>(),
-    };
+fn is_already_hooked(input_binary: &[u8]) -> bool {
+    let header_size = size_of::<TrampolineHeader64>();
 
     if input_binary.len() < header_size {
         return false;
@@ -330,20 +284,9 @@ fn is_already_hooked(input_binary: &[u8], arch: Arch) -> bool {
         return false;
     }
 
-    let (file_offset, vaddr, trampoline_size) = match arch {
-        Arch::X86_64 => {
-            let header = TrampolineHeader64::read_from_bytes(header).unwrap();
-            (header.file_offset, header.vaddr, header.trampoline_size)
-        }
-        Arch::X86_32 => {
-            let header = TrampolineHeader32::read_from_bytes(header).unwrap();
-            (
-                u64::from(header.file_offset),
-                u64::from(header.vaddr),
-                u64::from(header.trampoline_size),
-            )
-        }
-    };
+    let header = TrampolineHeader64::read_from_bytes(header).unwrap();
+    let (file_offset, vaddr, trampoline_size) =
+        (header.file_offset, header.vaddr, header.trampoline_size);
 
     if trampoline_size == 0 {
         return false;
@@ -361,52 +304,26 @@ fn is_already_hooked(input_binary: &[u8], arch: Arch) -> bool {
     true
 }
 
-#[derive(PartialEq, Eq, Clone, Copy, Debug, Hash)]
-enum Arch {
-    X86_32,
-    X86_64,
-}
-
 /// (private) Hook all syscalls in `section`, possibly extending `trampoline_data` to do so.
 ///
 /// `trampoline_base_addr` is the virtual address corresponding to `trampoline_data[0]`.
 /// `syscall_entry_addr` is the address of the 8-byte entry-point value that each trampoline
-/// stub jumps to (via `JMP [RIP+disp32]` on x86-64 or `CALL [EAX+disp32]` on x86-32).
-#[allow(clippy::too_many_arguments)]
+/// stub jumps to (via `JMP [RIP+disp32]` on x86-64).
 fn hook_syscalls_in_section(
-    arch: Arch,
     control_transfer_targets: &BTreeSet<u64>,
     section_base_addr: u64,
     section_data: &mut [u8],
     trampoline_base_addr: u64,
     syscall_entry_addr: u64,
-    dl_sysinfo_int80: Option<u64>,
     trampoline_data: &mut Vec<u8>,
 ) -> core::result::Result<Vec<u64>, InternalError> {
-    let instructions = decode_section_instructions(arch, section_data, section_base_addr)?;
+    let instructions = decode_section_instructions(section_data, section_base_addr)?;
     let mut found_any = false;
     let mut skipped_addrs = Vec::new();
     for (i, inst) in instructions.iter().enumerate() {
-        // Forward search for `syscall` / `int 0x80` / `call DWORD PTR gs:0x10`
-        match arch {
-            Arch::X86_32 => {
-                if dl_sysinfo_int80.is_some_and(|x| x == inst.ip()) {
-                    continue; // Skip the `dl_sysinfo_int80` instruction
-                }
-                // `call DWORD PTR gs:0x10` or `int 0x80`
-                if !((inst.code() == iced_x86::Code::Call_rm32
-                    && inst.segment_prefix() == iced_x86::Register::GS
-                    && inst.memory_displacement32() == 0x10)
-                    || (inst.code() == iced_x86::Code::Int_imm8 && inst.immediate8() == 0x80))
-                {
-                    continue;
-                }
-            }
-            Arch::X86_64 => {
-                if inst.code() != iced_x86::Code::Syscall {
-                    continue;
-                }
-            }
+        // Forward search for `syscall`
+        if inst.code() != iced_x86::Code::Syscall {
+            continue;
         }
 
         found_any = true;
@@ -434,7 +351,6 @@ fn hook_syscalls_in_section(
 
         if replace_start.is_none() {
             match hook_syscall_and_after(
-                arch,
                 control_transfer_targets,
                 section_base_addr,
                 section_data,
@@ -474,68 +390,33 @@ fn hook_syscalls_in_section(
         }
 
         let return_addr = inst.next_ip();
-        if arch == Arch::X86_64 {
-            // Put jump back location into rcx.
-            let jmp_back_base = checked_add_u64(
-                trampoline_base_addr,
-                trampoline_data.len() as u64 + 7,
-                "x86_64 trampoline jump-back base",
-            )?;
-            trampoline_data.extend_from_slice(&[0x48, 0x8D, 0x0D]); // LEA RCX, [RIP + disp32]
-            trampoline_data.extend_from_slice(&rel32_bytes(
-                return_addr,
-                jmp_back_base,
-                "x86_64 trampoline jump-back",
-            )?);
+        // Put jump back location into rcx.
+        let jmp_back_base = checked_add_u64(
+            trampoline_base_addr,
+            trampoline_data.len() as u64 + 7,
+            "x86_64 trampoline jump-back base",
+        )?;
+        trampoline_data.extend_from_slice(&[0x48, 0x8D, 0x0D]); // LEA RCX, [RIP + disp32]
+        trampoline_data.extend_from_slice(&rel32_bytes(
+            return_addr,
+            jmp_back_base,
+            "x86_64 trampoline jump-back",
+        )?);
 
-            // Add jmp [rip + offset_to_entry_point]
-            trampoline_data.extend_from_slice(&[0xFF, 0x25]);
-            // RIP after this instruction = trampoline_base_addr + trampoline_data.len() + 4
-            // We want: RIP + disp32 = syscall_entry_addr
-            let entry_base = checked_add_u64(
-                trampoline_base_addr,
-                trampoline_data.len() as u64 + 4,
-                "x86_64 trampoline entry base",
-            )?;
-            trampoline_data.extend_from_slice(&rel32_bytes(
-                syscall_entry_addr,
-                entry_base,
-                "x86_64 trampoline entry",
-            )?);
-        } else {
-            // For 32-bit, use a different approach to simulate indirect call
-            trampoline_data.push(0x50); // PUSH EAX
-            trampoline_data.extend_from_slice(&[0xE8, 0x0, 0x0, 0x0, 0x0]); // CALL next instruction
-            trampoline_data.push(0x58); // POP EAX (effectively store IP in EAX)
-            trampoline_data.extend_from_slice(&[0xFF, 0x90]); // CALL [EAX + offset]
-            // EAX = trampoline_base_addr + (trampoline_data.len() - 3)
-            // We want: EAX + offset = syscall_entry_addr
-            let call_base = checked_add_u64(
-                trampoline_base_addr,
-                trampoline_data.len() as u64 - 3,
-                "x86 trampoline entry base",
-            )?;
-            trampoline_data.extend_from_slice(&rel32_bytes(
-                syscall_entry_addr,
-                call_base,
-                "x86 trampoline entry",
-            )?);
-            // Note we skip `POP EAX` here as it is done by the callback `syscall_callback`
-            // from litebox_shim_linux/src/lib.rs, which helps reduce the size of the trampoline.
-
-            // Add jmp back to original after syscall
-            let jmp_back_base = checked_add_u64(
-                trampoline_base_addr,
-                trampoline_data.len() as u64 + 5,
-                "x86 trampoline jump-back base",
-            )?;
-            trampoline_data.push(0xE9);
-            trampoline_data.extend_from_slice(&rel32_bytes(
-                return_addr,
-                jmp_back_base,
-                "x86 trampoline jump-back",
-            )?);
-        }
+        // Add jmp [rip + offset_to_entry_point]
+        trampoline_data.extend_from_slice(&[0xFF, 0x25]);
+        // RIP after this instruction = trampoline_base_addr + trampoline_data.len() + 4
+        // We want: RIP + disp32 = syscall_entry_addr
+        let entry_base = checked_add_u64(
+            trampoline_base_addr,
+            trampoline_data.len() as u64 + 4,
+            "x86_64 trampoline entry base",
+        )?;
+        trampoline_data.extend_from_slice(&rel32_bytes(
+            syscall_entry_addr,
+            entry_base,
+            "x86_64 trampoline entry",
+        )?);
 
         // Replace original instructions with jump to trampoline
         let replace_offset = usize::try_from(replace_start - section_base_addr).unwrap();
@@ -685,9 +566,8 @@ fn fixup_phdr_alignment(buf: &mut [u8]) {
 /// (SIGSEGV in ring 3), and the `F1` prefix makes it easy for a signal
 /// handler to identify an intentionally poisoned syscall.
 ///
-/// `syscall` (0F 05) and `int 0x80` (CD 80) are both 2 bytes — same size as
-/// `ICEBP; HLT`.  For `call DWORD PTR gs:0x10` (7 bytes), the remaining 5
-/// bytes are filled with NOPs.
+/// `syscall` (0F 05) is 2 bytes — same size as
+/// `ICEBP; HLT`.
 fn replace_with_trap(
     section_data: &mut [u8],
     section_base_addr: u64,
@@ -709,11 +589,6 @@ fn checked_add_u64(base: u64, addend: u64, context: &'static str) -> Result<u64>
         .ok_or_else(|| Error::AddressOverflow(format!("{context} address overflow")))
 }
 
-fn checked_sub_u64(base: u64, subtrahend: u64, context: &'static str) -> Result<u64> {
-    base.checked_sub(subtrahend)
-        .ok_or_else(|| Error::AddressOverflow(format!("{context} address underflow")))
-}
-
 fn rel32_bytes(target: u64, base: u64, context: &'static str) -> Result<[u8; 4]> {
     let disp = i128::from(target) - i128::from(base);
     let disp = i32::try_from(disp).map_err(|_| {
@@ -728,7 +603,6 @@ fn find_addr_for_trampoline_code(file: &object::File<'_>) -> Result<u64> {
     // Find the highest virtual address among all PT_LOAD segments
     let max_virtual_addr = match file {
         object::File::Elf64(elf) => max_load_segment_end(elf),
-        object::File::Elf32(elf) => max_load_segment_end(elf),
         _ => unreachable!(),
     }
     .ok_or_else(|| Error::ParseError("no PT_LOAD segments found".into()))?;
@@ -754,26 +628,14 @@ where
         .max()
 }
 
-fn get_symbols(file: &object::File<'_>) -> Option<u64> {
-    file.symbols()
-        .filter(|sym| sym.kind() == object::SymbolKind::Text)
-        .find_map(|sym| {
-            sym.name()
-                .ok()
-                .filter(|name| *name == "_dl_sysinfo_int80")
-                .map(|_| sym.address())
-        })
-}
-
 fn get_control_transfer_targets(
-    arch: Arch,
     input_binary: &[u8],
     text_sections: &[TextSectionInfo],
 ) -> Result<BTreeSet<u64>> {
     let mut control_transfer_targets = BTreeSet::new();
     for s in text_sections {
         let section_data = section_slice(input_binary, s)?;
-        let instructions = decode_section_instructions(arch, section_data, s.vaddr)?;
+        let instructions = decode_section_instructions(section_data, s.vaddr)?;
         control_transfer_targets.extend(instructions.into_iter().filter_map(|inst| {
             let target = inst.near_branch_target();
             (target != 0).then_some(target)
@@ -798,14 +660,10 @@ fn bytes_until_next_4g_boundary(ptr: *const u8) -> usize {
 // released onto crates.io.  We handle it by making sure that we are only ever
 // sending iced-x86 inputs that are fully within the 4GiB scope.
 fn decode_section_instructions(
-    arch: Arch,
     section_data: &[u8],
     section_base_addr: u64,
 ) -> Result<Vec<iced_x86::Instruction>> {
-    let bitness = match arch {
-        Arch::X86_32 => 32,
-        Arch::X86_64 => 64,
-    };
+    let bitness = 64;
 
     let mut instructions = Vec::new();
     let mut offset = 0usize;
@@ -878,7 +736,6 @@ fn section_slice_mut<'a>(buf: &'a mut [u8], section: &TextSectionInfo) -> Result
 
 #[allow(clippy::too_many_arguments)]
 fn hook_syscall_and_after(
-    arch: Arch,
     control_transfer_targets: &BTreeSet<u64>,
     section_base_addr: u64,
     section_data: &mut [u8],
@@ -917,17 +774,7 @@ fn hook_syscall_and_after(
     }
 
     if replace_end.is_none() {
-        return hook_syscall_before_and_after(
-            arch,
-            control_transfer_targets,
-            section_base_addr,
-            section_data,
-            trampoline_base_addr,
-            syscall_entry_addr,
-            trampoline_data,
-            instructions,
-            inst_index,
-        );
+        return Err(InternalError::InsufficientBytesBeforeOrAfter);
     }
 
     let replace_end = replace_end.unwrap();
@@ -938,46 +785,23 @@ fn hook_syscall_and_after(
         "syscall trampoline target",
     )?;
 
-    if arch == Arch::X86_64 {
-        // Put jump back location into rcx, via lea rcx, [next instruction]
-        trampoline_data.extend_from_slice(&[0x48, 0x8D, 0x0D]); // LEA RCX, [RIP + disp32]
-        trampoline_data.extend_from_slice(&6u32.to_le_bytes());
-        // Add jmp [rip + offset_to_entry_point]
-        trampoline_data.extend_from_slice(&[0xFF, 0x25]);
-        // RIP after this instruction = trampoline_base_addr + trampoline_data.len() + 4
-        // We want: RIP + disp32 = syscall_entry_addr
-        let entry_base = checked_add_u64(
-            trampoline_base_addr,
-            trampoline_data.len() as u64 + 4,
-            "x86_64 trampoline entry base",
-        )?;
-        trampoline_data.extend_from_slice(&rel32_bytes(
-            syscall_entry_addr,
-            entry_base,
-            "x86_64 trampoline entry",
-        )?);
-    } else {
-        // For 32-bit, use a different approach to simulate indirect call
-        trampoline_data.push(0x50); // PUSH EAX
-        trampoline_data.extend_from_slice(&[0xE8, 0x0, 0x0, 0x0, 0x0]); // CALL next instruction
-        trampoline_data.push(0x58); // POP EAX (effectively store IP in EAX)
-        trampoline_data.extend_from_slice(&[0xFF, 0x90]); // CALL [EAX + offset]
-        // EAX = trampoline_base_addr + (trampoline_data.len() - 3)
-        // We want: EAX + offset = syscall_entry_addr
-        let call_base = checked_add_u64(
-            trampoline_base_addr,
-            trampoline_data.len() as u64,
-            "x86 trampoline entry base",
-        )?;
-        let call_base = checked_sub_u64(call_base, 3, "x86 trampoline entry base")?;
-        trampoline_data.extend_from_slice(&rel32_bytes(
-            syscall_entry_addr,
-            call_base,
-            "x86 trampoline entry",
-        )?);
-        // Note we skip `POP EAX` here as it is done by the callback `syscall_callback`
-        // from litebox_shim_linux/src/lib.rs, which helps reduce the size of the trampoline.
-    }
+    // Put jump back location into rcx, via lea rcx, [next instruction]
+    trampoline_data.extend_from_slice(&[0x48, 0x8D, 0x0D]); // LEA RCX, [RIP + disp32]
+    trampoline_data.extend_from_slice(&6u32.to_le_bytes());
+    // Add jmp [rip + offset_to_entry_point]
+    trampoline_data.extend_from_slice(&[0xFF, 0x25]);
+    // RIP after this instruction = trampoline_base_addr + trampoline_data.len() + 4
+    // We want: RIP + disp32 = syscall_entry_addr
+    let entry_base = checked_add_u64(
+        trampoline_base_addr,
+        trampoline_data.len() as u64 + 4,
+        "x86_64 trampoline entry base",
+    )?;
+    trampoline_data.extend_from_slice(&rel32_bytes(
+        syscall_entry_addr,
+        entry_base,
+        "x86_64 trampoline entry",
+    )?);
 
     // Copy the original instructions to the trampoline
     let syscall_inst_end = syscall_inst.next_ip();
@@ -1013,148 +837,6 @@ fn hook_syscall_and_after(
 
     // Fill remaining bytes with NOP
     let replace_len = usize::try_from(replace_end - replace_start).unwrap();
-    for idx in 5..replace_len {
-        section_data[replace_offset + idx] = 0x90;
-    }
-
-    Ok(())
-}
-
-#[allow(clippy::too_many_arguments)]
-fn hook_syscall_before_and_after(
-    arch: Arch,
-    control_transfer_targets: &BTreeSet<u64>,
-    section_base_addr: u64,
-    section_data: &mut [u8],
-    trampoline_base_addr: u64,
-    syscall_entry_addr: u64,
-    trampoline_data: &mut Vec<u8>,
-    instructions: &[iced_x86::Instruction],
-    inst_index: usize,
-) -> core::result::Result<(), InternalError> {
-    let syscall_inst = &instructions[inst_index];
-    let syscall_inst_addr = syscall_inst.ip();
-    // We only support this case for x86
-    if arch != Arch::X86_32 {
-        return Err(InternalError::InsufficientBytesBeforeOrAfter);
-    }
-
-    // We expect at least one instruction before and one instruction
-    // after the syscall instruction
-    if inst_index == 0 || inst_index + 1 >= instructions.len() {
-        return Err(InternalError::InsufficientBytesBeforeOrAfter);
-    }
-
-    let prev_inst = &instructions[inst_index - 1];
-    let next_inst = &instructions[inst_index + 1];
-
-    // Make sure we have enough space
-    if prev_inst.len() + syscall_inst.len() + next_inst.len() < 5 {
-        return Err(InternalError::InsufficientBytesBeforeOrAfter);
-    }
-
-    // Both the syscall and its following instructions cannot be a control transfer target
-    if control_transfer_targets.contains(&syscall_inst_addr)
-        || control_transfer_targets.contains(&next_inst.ip())
-    {
-        return Err(InternalError::InsufficientBytesBeforeOrAfter);
-    }
-
-    // We don't support the case when the previous instruction is a control transfer instruction
-    if prev_inst.flow_control() != iced_x86::FlowControl::Next {
-        return Err(InternalError::InsufficientBytesBeforeOrAfter);
-    }
-
-    // We currently only support relative jmp or ret instructions
-    // if it's a control transfer instruction.
-    let need_jump_back = match next_inst.flow_control() {
-        iced_x86::FlowControl::Next => true,
-        iced_x86::FlowControl::Return => false,
-        iced_x86::FlowControl::UnconditionalBranch => {
-            if next_inst.near_branch_target() != prev_inst.ip() {
-                return Err(InternalError::InsufficientBytesBeforeOrAfter);
-            }
-            false
-        }
-        iced_x86::FlowControl::IndirectBranch
-        | iced_x86::FlowControl::ConditionalBranch
-        | iced_x86::FlowControl::Call
-        | iced_x86::FlowControl::IndirectCall
-        | iced_x86::FlowControl::Interrupt
-        | iced_x86::FlowControl::XbeginXabortXend
-        | iced_x86::FlowControl::Exception => {
-            return Err(InternalError::InsufficientBytesBeforeOrAfter);
-        }
-    };
-
-    let target_addr = checked_add_u64(
-        trampoline_base_addr,
-        trampoline_data.len() as u64,
-        "syscall trampoline target",
-    )?;
-    let replace_start = prev_inst.ip();
-    let replace_len = usize::try_from(next_inst.next_ip() - replace_start).unwrap();
-
-    // Copy the prev instructions to the trampoline
-    trampoline_data.extend_from_slice(
-        &section_data[usize::try_from(prev_inst.ip() - section_base_addr).unwrap()..]
-            [..prev_inst.len()],
-    );
-
-    // For 32-bit, use a different approach to simulate `call [rip + disp32]`
-    trampoline_data.push(0x50); // PUSH EAX
-    trampoline_data.extend_from_slice(&[0xE8, 0x0, 0x0, 0x0, 0x0]); // CALL next instruction
-    trampoline_data.push(0x58); // POP EAX (effectively store IP in EAX)
-    trampoline_data.extend_from_slice(&[0xFF, 0x90]); // CALL [EAX + offset]
-    // EAX = trampoline_base_addr + (trampoline_data.len() - 3)
-    // We want: EAX + offset = syscall_entry_addr
-    let call_base = checked_add_u64(
-        trampoline_base_addr,
-        trampoline_data.len() as u64,
-        "x86 trampoline entry base",
-    )?;
-    let call_base = checked_sub_u64(call_base, 3, "x86 trampoline entry base")?;
-    trampoline_data.extend_from_slice(&rel32_bytes(
-        syscall_entry_addr,
-        call_base,
-        "x86 trampoline entry",
-    )?);
-    // Note we skip `POP EAX` here as it is done by the callback `syscall_callback`
-    // from litebox_shim_linux/src/lib.rs, which helps reduce the size of the trampoline.
-
-    // Copy the next inst
-    trampoline_data.extend_from_slice(
-        &section_data[usize::try_from(next_inst.ip() - section_base_addr).unwrap()..]
-            [..next_inst.len()],
-    );
-
-    // Add jmp back to original after syscall if needed
-    if need_jump_back {
-        let return_addr = next_inst.next_ip();
-        let jmp_back_base = checked_add_u64(
-            trampoline_base_addr,
-            trampoline_data.len() as u64 + 5,
-            "x86 trampoline jump-back base",
-        )?;
-        trampoline_data.push(0xE9);
-        trampoline_data.extend_from_slice(&rel32_bytes(
-            return_addr,
-            jmp_back_base,
-            "x86 trampoline jump-back",
-        )?);
-    }
-
-    // Replace original instructions with jump to trampoline
-    let replace_offset = usize::try_from(replace_start - section_base_addr).unwrap();
-    section_data[replace_offset] = 0xE9; // JMP rel32
-    let patch_base = checked_add_u64(replace_start, 5, "syscall patch jump base")?;
-    section_data[replace_offset + 1..replace_offset + 5].copy_from_slice(&rel32_bytes(
-        target_addr,
-        patch_base,
-        "syscall patch jump",
-    )?);
-
-    // Fill remaining bytes with NOP
     for idx in 5..replace_len {
         section_data[replace_offset + idx] = 0x90;
     }
