@@ -682,9 +682,10 @@ fn test_rwlock_readers_not_starved_after_writer_handoff() {
         // without waking readers.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         while !reader_done.load(Ordering::Acquire) {
-            if std::time::Instant::now() > deadline {
-                panic!("iteration {iteration}: reader was never woken after writer handoff");
-            }
+            assert!(
+                std::time::Instant::now() <= deadline,
+                "iteration {iteration}: reader was never woken after writer handoff"
+            );
             std::thread::yield_now();
         }
 
