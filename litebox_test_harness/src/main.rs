@@ -162,6 +162,30 @@ fn main() {
             }
             eprintln!("[tcp-echo] exiting");
         }
+        "tcp-recv-all" => {
+            // Listen on a TCP port, accept one connection, read ALL data
+            // until EOF, then print the total byte count and data to stdout.
+            // Exercises half-close: the server only exits when the client's
+            // FIN is propagated through the TCP bridge as EOF on read().
+            let port: u16 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(9999);
+            let listener = std::net::TcpListener::bind(format!("0.0.0.0:{port}"))
+                .expect("tcp-recv-all: bind failed");
+            eprintln!("[tcp-recv-all] listening on 0.0.0.0:{port}");
+            if let Ok((mut stream, addr)) = listener.accept() {
+                eprintln!("[tcp-recv-all] accepted from {addr}");
+                use std::io::Read;
+                let mut data = Vec::new();
+                match stream.read_to_end(&mut data) {
+                    Ok(n) => {
+                        eprintln!("[tcp-recv-all] read_to_end: {n} bytes, EOF reached");
+                        let text = String::from_utf8_lossy(&data);
+                        print!("RECV={text}");
+                    }
+                    Err(e) => eprintln!("[tcp-recv-all] read_to_end error: {e}"),
+                }
+            }
+            eprintln!("[tcp-recv-all] exiting");
+        }
         "slow-echo" => {
             // Sleeps 3 seconds then prints, simulating a slow-starting server.
             std::thread::sleep(std::time::Duration::from_secs(3));

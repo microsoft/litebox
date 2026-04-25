@@ -1390,6 +1390,42 @@ pub(crate) async fn loopback_tcp_tests(r: &mut TestRunner) {
             ),
             check: |s| s.contains("REPLY=LB_BUSY"),
         },
+        // Cross-worker: fast-close client (data + immediate FIN).
+        // Exercises CloseWait promotion — when data+FIN arrive in rapid
+        // succession, the broker's smoltcp socket can skip Established and
+        // land directly in CloseWait within one iface.poll() call.
+        // promote_established must accept CloseWait sockets to relay the data.
+        LBTest {
+            name: "fast_close",
+            script_template: concat!(
+                "{exe} tcp-recv-all 19881 &\n",
+                "PID=$!\nsleep 2\n",
+                // -q0: close immediately after stdin EOF (fastest possible FIN)
+                "echo LB_FAST | nc -q0 127.0.0.1 19881 2>/dev/null\n",
+                "sleep 2\n",
+                // tcp-recv-all prints RECV=... to stdout, captured via wait
+                "wait $PID 2>/dev/null\n",
+            ),
+            check: |s| s.contains("RECV=LB_FAST"),
+        },
+        // Cross-worker: verify half-close FIN propagation.
+        // Server uses tcp-recv-all which calls read_to_end() — it only
+        // exits when it sees EOF on the socket. EOF requires the client's
+        // FIN to propagate through the TCP pair via shutdown(Write).
+        // Without half-close propagation, tcp-recv-all hangs forever.
+        LBTest {
+            name: "halfclose_eof",
+            script_template: concat!(
+                "{exe} tcp-recv-all 19882 &\n",
+                "PID=$!\nsleep 2\n",
+                // -w2: wait 2s after stdin EOF before closing
+                // (data and FIN arrive in separate iterations)
+                "echo LB_HALF | nc -w2 127.0.0.1 19882 2>/dev/null\n",
+                "sleep 3\n",
+                "wait $PID 2>/dev/null\n",
+            ),
+            check: |s| s.contains("RECV=LB_HALF"),
+        },
     ];
 
     for &agent in AGENTS {
