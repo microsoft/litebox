@@ -142,22 +142,37 @@ fn main() {
             // Accept one connection, echo data, then exit.
             if let Ok((mut stream, addr)) = listener.accept() {
                 eprintln!("[tcp-echo] accepted from {addr}");
-                use std::io::{Read, Write};
+                use std::io::Write;
+                use std::os::unix::io::AsRawFd;
                 let mut buf = [0u8; 4096];
-                match stream.read(&mut buf) {
-                    Ok(0) => eprintln!("[tcp-echo] read returned 0 (EOF)"),
-                    Ok(n) => {
-                        eprintln!("[tcp-echo] read {n} bytes, echoing");
-                        match stream.write_all(&buf[..n]) {
-                            Ok(()) => eprintln!("[tcp-echo] write_all OK"),
-                            Err(e) => eprintln!("[tcp-echo] write_all FAILED: {e}"),
-                        }
-                        match stream.flush() {
-                            Ok(()) => eprintln!("[tcp-echo] flush OK"),
-                            Err(e) => eprintln!("[tcp-echo] flush FAILED: {e}"),
-                        }
+                // Use recv() instead of read() — the litebox shim may handle
+                // them differently for socket FDs.
+                let n = unsafe {
+                    libc::recv(
+                        stream.as_raw_fd(),
+                        buf.as_mut_ptr().cast(),
+                        buf.len(),
+                        0,
+                    )
+                };
+                if n > 0 {
+                    let n = n as usize;
+                    eprintln!("[tcp-echo] recv {n} bytes, echoing");
+                    match stream.write_all(&buf[..n]) {
+                        Ok(()) => eprintln!("[tcp-echo] write_all OK"),
+                        Err(e) => eprintln!("[tcp-echo] write_all FAILED: {e}"),
                     }
-                    Err(e) => eprintln!("[tcp-echo] read error: {e}"),
+                    match stream.flush() {
+                        Ok(()) => eprintln!("[tcp-echo] flush OK"),
+                        Err(e) => eprintln!("[tcp-echo] flush FAILED: {e}"),
+                    }
+                } else if n == 0 {
+                    eprintln!("[tcp-echo] recv returned 0 (EOF)");
+                } else {
+                    eprintln!(
+                        "[tcp-echo] recv error: {}",
+                        std::io::Error::last_os_error()
+                    );
                 }
             }
             eprintln!("[tcp-echo] exiting");
@@ -166,23 +181,35 @@ fn main() {
             // Listen on a TCP port, accept one connection, read ALL data
             // until EOF, then print the total byte count and data to stdout.
             // Exercises half-close: the server only exits when the client's
-            // FIN is propagated through the TCP bridge as EOF on read().
+            // FIN is propagated through the TCP bridge as EOF on recv().
             let port: u16 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(9999);
             let listener = std::net::TcpListener::bind(format!("0.0.0.0:{port}"))
                 .expect("tcp-recv-all: bind failed");
             eprintln!("[tcp-recv-all] listening on 0.0.0.0:{port}");
-            if let Ok((mut stream, addr)) = listener.accept() {
+            if let Ok((stream, addr)) = listener.accept() {
                 eprintln!("[tcp-recv-all] accepted from {addr}");
-                use std::io::Read;
+                use std::os::unix::io::AsRawFd;
+                let fd = stream.as_raw_fd();
                 let mut data = Vec::new();
-                match stream.read_to_end(&mut data) {
-                    Ok(n) => {
-                        eprintln!("[tcp-recv-all] read_to_end: {n} bytes, EOF reached");
-                        let text = String::from_utf8_lossy(&data);
-                        print!("RECV={text}");
+                let mut buf = [0u8; 4096];
+                loop {
+                    let n = unsafe { libc::recv(fd, buf.as_mut_ptr().cast(), buf.len(), 0) };
+                    if n > 0 {
+                        data.extend_from_slice(&buf[..n as usize]);
+                    } else {
+                        if n == 0 {
+                            eprintln!("[tcp-recv-all] recv EOF after {} bytes", data.len());
+                        } else {
+                            eprintln!(
+                                "[tcp-recv-all] recv error: {}",
+                                std::io::Error::last_os_error()
+                            );
+                        }
+                        break;
                     }
-                    Err(e) => eprintln!("[tcp-recv-all] read_to_end error: {e}"),
                 }
+                let text = String::from_utf8_lossy(&data);
+                print!("RECV={text}");
             }
             eprintln!("[tcp-recv-all] exiting");
         }

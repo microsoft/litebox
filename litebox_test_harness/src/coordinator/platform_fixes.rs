@@ -292,9 +292,11 @@ pub(crate) async fn run(r: &mut TestRunner) {
     concurrent_fork_tests(r).await;
     touch_redirect_tests(r).await;
     vscode_install_pattern_tests(r).await;
-    pid_visibility_tests(r).await;
     file_redirect_tests(r).await;
     loopback_tcp_tests(r).await;
+    // PID visibility tests run last — KP.proc_child can deadlock agent B
+    // under litebox, causing all subsequent B-targeted tests to timeout.
+    pid_visibility_tests(r).await;
 }
 
 // ═══════════════════════════════════════════════════════════════════
