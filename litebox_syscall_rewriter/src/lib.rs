@@ -308,16 +308,16 @@ fn is_already_hooked(input_binary: &[u8], arch: Arch) -> bool {
     true
 }
 
+#[derive(PartialEq, Eq, Clone, Copy, Debug, Hash)]
+enum Arch {
+    X86_64,
+}
+
 /// (private) Hook all syscalls in `section`, possibly extending `trampoline_data` to do so.
 ///
 /// `trampoline_base_addr` is the virtual address corresponding to `trampoline_data[0]`.
 /// `syscall_entry_addr` is the address of the 8-byte entry-point value that each trampoline
 /// stub jumps to (via `JMP [RIP+disp32]` on x86-64).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Arch {
-    X86_64,
-}
-
 fn hook_syscalls_in_section(
     arch: Arch,
     control_transfer_targets: &BTreeSet<u64>,
@@ -332,8 +332,12 @@ fn hook_syscalls_in_section(
     let mut skipped_addrs = Vec::new();
     for (i, inst) in instructions.iter().enumerate() {
         // Forward search for `syscall`
-        if inst.code() != iced_x86::Code::Syscall {
-            continue;
+        match arch {
+            Arch::X86_64 => {
+                if inst.code() != iced_x86::Code::Syscall {
+                    continue;
+                }
+            }
         }
 
         found_any = true;
