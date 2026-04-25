@@ -317,7 +317,8 @@ fn is_already_hooked(input_binary: &[u8], arch: Arch) -> bool {
         (header.file_offset, header.vaddr, header.trampoline_size);
 
     if trampoline_size == 0 {
-        // Size=0 sentinel: "checked by rewriter, no syscalls to patch."
+        // Size=0 sentinel: the rewriter processed this binary but found no
+        // syscall instructions. It is already hooked (nothing to do).
         return true;
     }
     if file_offset % 0x1000 != 0 {

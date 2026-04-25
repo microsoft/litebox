@@ -300,8 +300,8 @@ impl ElfParsedFile {
             )
         };
 
-        // trampoline_size == 0 means the rewriter checked this binary and found
-        // no syscall instructions.
+        // Size=0 sentinel: the rewriter processed this binary but found no
+        // syscall instructions, so there is no trampoline region to map.
         if trampoline_size == 0 {
             return Ok(());
         }
