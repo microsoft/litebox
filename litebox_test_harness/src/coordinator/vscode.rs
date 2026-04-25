@@ -173,3 +173,167 @@ pub(super) async fn vscode_repro_tests(r: &mut TestRunner) {
     }
     let _ = r.send("A", exec(bash("rm -f /tmp/t7-test.sock"))).await;
 }
+
+/// VS Code bootstrap script replay test.
+///
+/// Replays the captured install script (the same script VS Code Remote-SSH
+/// pipes through `ssh host sh`) inside the coordinator framework. The script
+/// is patched at runtime with the correct commit hash from the Docker image's
+/// pre-installed VS Code CLI.
+///
+/// This test exercises the full bootstrap: variable assignment via $(),
+/// file existence checks, CLI version detection, and server startup.
+pub(super) async fn vscode_bootstrap_replay(r: &mut TestRunner) {
+    eprintln!("[vscode] === VS Code Bootstrap Replay ===");
+
+    // 1. Detect the VS Code commit hash from the installed CLI.
+    let resp = r
+        .send(
+            "A",
+            exec_timeout(
+                vec![
+                    "bash".into(),
+                    "-c".into(),
+                    "if [ -x /root/.vscode-server/code ]; then /root/.vscode-server/code --version 2>/dev/null | grep -oP 'commit \\K[a-f0-9]{40}'; else echo NOT_FOUND; fi".into(),
+                ],
+                10,
+            ),
+        )
+        .await;
+    let commit = match &resp {
+        Response::ExecResult {
+            exit_code: 0,
+            stdout,
+            ..
+        } => {
+            let trimmed = stdout.trim();
+            if trimmed == "NOT_FOUND" || trimmed.len() != 40 {
+                r.record(
+                    "VSI.detect_commit",
+                    "A",
+                    true,
+                    "skipped (VS Code CLI not found — use litebox-vscode image)",
+                );
+                return;
+            }
+            trimmed.to_string()
+        }
+        _ => {
+            r.record(
+                "VSI.detect_commit",
+                "A",
+                false,
+                &format!("failed to detect commit: {resp:?}"),
+            );
+            return;
+        }
+    };
+    r.record("VSI.detect_commit", "A", true, &format!("commit={commit}"));
+
+    // 2. Pre-stage the CLI at the path the bootstrap script expects.
+    //    The Docker image installs the CLI at /root/.vscode-server/code
+    //    but the bootstrap looks for /root/.vscode-server/code-{COMMIT_ID}.
+    let setup_cmd = format!(
+        "if [ ! -f \"$HOME/.vscode-server/code-{commit}\" ]; then \
+         cp /root/.vscode-server/code \"$HOME/.vscode-server/code-{commit}\" && \
+         chmod +x \"$HOME/.vscode-server/code-{commit}\" && \
+         echo STAGED; \
+         else echo EXISTS; fi"
+    );
+    let resp = r
+        .send("A", exec(vec!["bash".into(), "-c".into(), setup_cmd]))
+        .await;
+    let staged_ok = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. }
+        if stdout.trim() == "STAGED" || stdout.trim() == "EXISTS");
+    r.record("VSI.stage_cli", "A", staged_ok, &format!("{resp:?}"));
+    if !staged_ok {
+        return;
+    }
+
+    // 3. Patch the captured bootstrap script with the dynamic commit hash
+    //    and remove the keepalive loop (which would run forever).
+    let script_template =
+        include_str!("../../../litebox_tool_executor/scripts/vscode-bootstrap-captured.sh");
+    let script = script_template
+        .replace("41dd792b5e652393e7787322889ed5fdc58bd75b", &commit)
+        // Remove the keepalive loop at the end — it's designed to hold
+        // the SSH connection open forever, but we just want the output.
+        .replace("while true; do sleep 180; printf ' '; done", "exit 0");
+
+    // 4. Pipe the script to sh, just like VS Code Remote-SSH does.
+    //    The script starts the VS Code CLI server in the background,
+    //    waits for it to print "Listening on ...", then outputs structured
+    //    markers and exits (after our keepalive patch).
+    let resp = r
+        .send(
+            "A",
+            Command::Exec {
+                args: vec!["sh".into()],
+                timeout_secs: Some(120),
+                stdin: Some(script),
+                background: false,
+            },
+        )
+        .await;
+
+    // 5. Parse structured output markers.
+    match &resp {
+        Response::ExecResult {
+            exit_code,
+            stdout,
+            stderr,
+        } => {
+            let has_running = stdout.contains(": running");
+            let has_start = stdout.contains(": start");
+            let has_end = stdout.contains(": end");
+            let has_listening = stdout.contains("listeningOn==");
+            let has_exit_code = stdout.contains("exitCode==");
+            let found_existing = stdout.contains("Found existing installation");
+
+            // Report individual phases.
+            r.record(
+                "VSI.script_running",
+                "A",
+                has_running,
+                &format!("running={has_running}"),
+            );
+            r.record(
+                "VSI.found_cli",
+                "A",
+                found_existing,
+                &format!("found_existing={found_existing}"),
+            );
+            r.record(
+                "VSI.start_marker",
+                "A",
+                has_start,
+                &format!("start={has_start}"),
+            );
+
+            // The full bootstrap success: start+end markers present and
+            // listeningOn reports a real address.
+            let full_success = has_start && has_end && has_listening;
+            let detail = format!(
+                "exit_code={exit_code} running={has_running} found_cli={found_existing} \
+                 start={has_start} end={has_end} listening={has_listening} \
+                 exit_marker={has_exit_code}\n\
+                 stdout_preview: {}\n\
+                 stderr_preview: {}",
+                &stdout[..stdout.len().min(500)],
+                &stderr[..stderr.len().min(500)],
+            );
+            r.record("VSI.bootstrap", "A", full_success, &detail);
+        }
+        Response::ExecTimeout { stderr } => {
+            r.record(
+                "VSI.bootstrap",
+                "A",
+                false,
+                &format!("TIMEOUT (60s) stderr: {}", &stderr[..stderr.len().min(500)]),
+            );
+        }
+        _ => {
+            r.record("VSI.bootstrap", "A", false, &format!("{resp:?}"));
+        }
+    }
+}

@@ -311,6 +311,9 @@ async fn run_tests(self_exe: &str) -> Vec<TestResult> {
     eprintln!("[coord] === VS Code Reproduction Tests ===");
     vscode::vscode_repro_tests(&mut runner).await;
 
+    // === VS Code Bootstrap Replay ===
+    vscode::vscode_bootstrap_replay(&mut runner).await;
+
     // === Contamination Sequence Tests (run LAST — depend on accumulated state) ===
     eprintln!("[coord] === Contamination Sequence Tests ===");
     // Canary: test that agent A can still exec.
