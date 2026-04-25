@@ -347,12 +347,13 @@ fn hook_syscalls_in_section(
         let mut replace_start_idx = 0;
         for inst_id in (0..=i).rev() {
             let prev_inst = &instructions[inst_id];
-            // Check if the instruction does control transfer
-            // TODO: Check if the instruction is an instruction-relative control transfer
-            let is_control_transfer =
-                inst_id != i && prev_inst.flow_control() != iced_x86::FlowControl::Next;
-            if is_control_transfer {
-                // If it's a control transfer, we don't want to cross it
+            // For x86_32 (no re-encoding support), stop at outgoing control
+            // transfers.  For x86_64 the encoder will fix up relative
+            // displacements, so we only need to respect incoming jump targets.
+            if arch != Arch::X86_64
+                && inst_id != i
+                && prev_inst.flow_control() != iced_x86::FlowControl::Next
+            {
                 break;
             }
             if replace_end - prev_inst.ip() >= 5 {
@@ -401,12 +402,9 @@ fn hook_syscalls_in_section(
         // Encode the pre-syscall instructions for the trampoline, re-encoding
         // any RIP-relative memory operands for the new location.
         let presyscall_bytes = if replace_start < inst.ip() {
-            if let Some(bytes) = encode_instructions_for_trampoline(
-                &instructions[replace_start_idx..i],
-                section_data,
-                section_base_addr,
-                target_addr,
-            ) {
+            if let Some(bytes) =
+                reencode_instructions(&instructions[replace_start_idx..i], target_addr)
+            {
                 bytes
             } else {
                 match hook_syscall_and_after(
@@ -783,12 +781,12 @@ fn section_slice_mut<'a>(buf: &'a mut [u8], section: &TextSectionInfo) -> Result
     Ok(&mut buf[offset..end])
 }
 
-/// Re-encode a sequence of instructions at a new base address, fixing up any
-/// RIP-relative memory operands so they still reference the same absolute
-/// addresses.  Returns `Some(bytes)` on success, or `None` if any instruction
-/// cannot be re-encoded at the same length (which would shift subsequent
-/// offsets and break the 1:1 replacement).
-fn reencode_instructions_at(
+/// Re-encode a sequence of instructions at a new base address, fixing up
+/// RIP-relative memory operands and IP-relative branch targets so they still
+/// reference the same absolute addresses.  Returns `Some(bytes)` on success,
+/// or `None` if any instruction cannot be re-encoded at the same length (which
+/// would shift subsequent offsets and break the 1:1 replacement).
+fn reencode_instructions(
     instructions: &[iced_x86::Instruction],
     base_addr: u64,
 ) -> Option<Vec<u8>> {
@@ -808,39 +806,9 @@ fn reencode_instructions_at(
     Some(reencoded)
 }
 
-/// Prepare a copy of instructions for placement at `target_addr` in the
-/// trampoline.  When any instruction contains an IP-relative memory operand
-/// the entire sequence is re-encoded so displacements still resolve to the
-/// original absolute addresses.  Otherwise the raw bytes are copied directly
-/// from `section_data`.
-///
-/// Returns `Some(bytes)` on success or `None` if re-encoding failed.
-fn encode_instructions_for_trampoline(
-    instructions: &[iced_x86::Instruction],
-    section_data: &[u8],
-    section_base_addr: u64,
-    target_addr: u64,
-) -> Option<Vec<u8>> {
-    if instructions.is_empty() {
-        return Some(Vec::new());
-    }
-    let has_ip_rel = instructions
-        .iter()
-        .any(iced_x86::Instruction::is_ip_rel_memory_operand);
-    if has_ip_rel {
-        reencode_instructions_at(instructions, target_addr)
-    } else {
-        let start = instructions[0].ip();
-        let end = instructions.last().unwrap().next_ip();
-        let start_off = usize::try_from(start - section_base_addr).unwrap();
-        let end_off = usize::try_from(end - section_base_addr).unwrap();
-        Some(section_data[start_off..end_off].to_vec())
-    }
-}
-
 #[allow(clippy::too_many_arguments)]
 fn hook_syscall_and_after(
-    _arch: Arch,
+    arch: Arch,
     control_transfer_targets: &BTreeSet<u64>,
     section_base_addr: u64,
     section_data: &mut [u8],
@@ -863,12 +831,13 @@ fn hook_syscall_and_after(
             // If the next instruction is a control transfer target, we don't want to cross it
             break;
         }
-        // Check if the instruction does control transfer
-        // TODO: Check if the instruction is an instruction-relative control transfer
-        let is_control_transfer = next_inst.code() != syscall_inst.code()
-            && next_inst.flow_control() != iced_x86::FlowControl::Next;
-        if is_control_transfer {
-            // If it's a control transfer, we don't want to cross it
+        // For x86_32 (no re-encoding support), stop at outgoing control
+        // transfers.  For x86_64 the encoder will fix up relative
+        // displacements, so we only need to respect incoming jump targets.
+        if arch != Arch::X86_64
+            && next_inst.code() != syscall_inst.code()
+            && next_inst.flow_control() != iced_x86::FlowControl::Next
+        {
             break;
         }
         let next_end = next_inst.next_ip();
@@ -902,10 +871,8 @@ fn hook_syscall_and_after(
     let syscall_inst_end = syscall_inst.next_ip();
     let postsyscall_bytes = if syscall_inst_end < replace_end {
         let postsyscall_target = target_addr + preamble_len;
-        match encode_instructions_for_trampoline(
+        match reencode_instructions(
             &instructions[(inst_index + 1)..replace_end_idx],
-            section_data,
-            section_base_addr,
             postsyscall_target,
         ) {
             Some(bytes) => bytes,
