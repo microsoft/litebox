@@ -301,8 +301,7 @@ impl ElfParsedFile {
         };
 
         // trampoline_size == 0 means the rewriter checked this binary and found
-        // no syscall instructions. The magic header acts as a "checked" marker so
-        // the runtime skips eager code-segment patching. No trampoline to map.
+        // no syscall instructions.
         if trampoline_size == 0 {
             return Ok(());
         }

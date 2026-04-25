@@ -28,6 +28,9 @@ const ET_DYN: u16 = 3;
 ///
 /// Tracks base address and trampoline write cursor for each ELF file that
 /// has executable segments mapped via `do_mmap_file()`.
+///
+/// TODO (wdcui): This Elf patching inside the shim is not a perfect solution.
+/// We will revisit it in the future.
 pub(crate) struct ElfPatchState {
     /// Whether this file is already pre-patched (trampoline magic found at file tail).
     pub pre_patched: bool,
@@ -570,12 +573,6 @@ impl<FS: ShimFS> Task<FS> {
     /// fail the mapping because the code already contains JMPs to the
     /// trampoline address.
     #[allow(clippy::cast_possible_truncation)]
-    /// Attempt to patch syscall instructions in a newly-mapped PROT_EXEC segment.
-    ///
-    /// Returns `true` if it is safe to keep the mapping (patching succeeded or
-    /// was skipped/best-effort for unpatched binaries), or `false` if the mmap
-    /// must be failed (trampoline setup failed for a pre-patched binary whose
-    /// .text already contains jumps to the trampoline address).
     fn maybe_patch_exec_segment(
         &self,
         mapped_addr: MutPtr<u8>,
