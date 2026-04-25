@@ -240,8 +240,7 @@ fn run_host_mode(args: CliArgs) -> anyhow::Result<()> {
             .with_context(|| format!("failed to read included file {}", inc.host_path.display()))?;
         let mode = {
             use std::os::unix::fs::MetadataExt as _;
-            std::fs::metadata(&inc.host_path)
-                .map_or(0o755, |m| m.mode())
+            std::fs::metadata(&inc.host_path).map_or(0o755, |m| m.mode())
         };
         let rewritten = rewrite_elf(&data, &inc.host_path, args.verbose)?;
         if args.verbose {
