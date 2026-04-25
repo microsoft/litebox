@@ -329,11 +329,149 @@ pub(super) async fn vscode_bootstrap_replay(r: &mut TestRunner) {
                 "VSI.bootstrap",
                 "A",
                 false,
-                &format!("TIMEOUT (60s) stderr: {}", &stderr[..stderr.len().min(500)]),
+                &format!("TIMEOUT (120s) stderr: {}", &stderr[..stderr.len().min(500)]),
             );
         }
         _ => {
             r.record("VSI.bootstrap", "A", false, &format!("{resp:?}"));
         }
+    }
+
+    // 6. Start CLI server as a background process and test TCP connectivity.
+    //    The bootstrap script's CLI exits when the script exits (orphaned bg
+    //    process), so we start a fresh CLI with a known port for connectivity
+    //    testing.  This exercises the same path: CLI listens, cross-worker
+    //    TCP connects through the loopback bridge.
+    //
+    //    We capture the dynamically assigned port from the CLI's stderr output.
+    let start_cmd = format!(
+        "LOG=/tmp/vsi-test-cli.log; \
+         $HOME/.vscode-server/code-{commit} command-shell \
+         --cli-data-dir $HOME/.vscode-server/cli \
+         --parent-process-id $$ \
+         --on-host 0.0.0.0 > $LOG 2>&1 & \
+         CLI_PID=$!; \
+         for i in $(seq 1 15); do \
+           PORT=$(grep -oP 'Listening on [^:]+:\\K[0-9]+' $LOG 2>/dev/null); \
+           if [ -n \"$PORT\" ]; then break; fi; \
+           sleep 1; \
+         done; \
+         echo VSI_PORT=$PORT; \
+         echo VSI_CLI_PID=$CLI_PID; \
+         sleep 30"
+    );
+    let resp = r
+        .send(
+            "A",
+            Command::Exec {
+                args: vec!["bash".into(), "-c".into(), start_cmd],
+                timeout_secs: None,
+                stdin: None,
+                background: true,
+            },
+        )
+        .await;
+    let bg_pid = match &resp {
+        Response::Background { pid } => Some(*pid),
+        _ => None,
+    };
+    if bg_pid.is_none() {
+        r.record(
+            "VSI.server_start",
+            "A",
+            false,
+            &format!("bg spawn failed: {resp:?}"),
+        );
+        return;
+    }
+
+    // Wait for the CLI to start and report its port.
+    tokio::time::sleep(Duration::from_secs(10)).await;
+
+    // Read the port from the background process's output.
+    let resp = r
+        .send(
+            "A",
+            exec_timeout(
+                vec![
+                    "bash".into(),
+                    "-c".into(),
+                    "grep -oP 'Listening on [^:]+:\\K[0-9]+' /tmp/vsi-test-cli.log 2>/dev/null || echo NONE".into(),
+                ],
+                5,
+            ),
+        )
+        .await;
+    let port: Option<u16> = match &resp {
+        Response::ExecResult {
+            exit_code: 0,
+            stdout,
+            ..
+        } => stdout.trim().parse().ok(),
+        _ => None,
+    };
+
+    let Some(port) = port else {
+        r.record(
+            "VSI.server_start",
+            "A",
+            false,
+            &format!("CLI did not start or port not detected: {resp:?}"),
+        );
+        if let Some(pid) = bg_pid {
+            let _ = r.send("A", Command::Kill { pid }).await;
+        }
+        return;
+    };
+    r.record(
+        "VSI.server_start",
+        "A",
+        true,
+        &format!("port={port}"),
+    );
+
+    // 6a. Same-worker connectivity: agent A connects to the exec server
+    //     it started.  Loopback within the same worker tree.
+    let cmd = format!(
+        "echo PROBE | nc -w3 127.0.0.1 {port} >/dev/null 2>&1; echo VSI_CONN=$?"
+    );
+    let resp = r
+        .send("A", exec_timeout(vec!["bash".into(), "-c".into(), cmd], 10))
+        .await;
+    let same_ok = matches!(
+        &resp,
+        Response::ExecResult { stdout, .. } if stdout.contains("VSI_CONN=0")
+    );
+    r.record(
+        "VSI.connect_same_worker",
+        "A",
+        same_ok,
+        &format!("{resp:?}"),
+    );
+
+    // 6b. Cross-worker connectivity: agent B connects to the exec server
+    //     that agent A started.  This is the VS Code SOCKS proxy pattern:
+    //     a different SSH session (different worker tree) connects to the
+    //     CLI's listening port through cross-worker loopback TCP.
+    let cmd = format!(
+        "echo PROBE | nc -w3 127.0.0.1 {port} >/dev/null 2>&1; echo VSI_CONN=$?"
+    );
+    let resp = r
+        .send("B", exec_timeout(vec!["bash".into(), "-c".into(), cmd], 10))
+        .await;
+    let cross_ok = matches!(
+        &resp,
+        Response::ExecResult { stdout, .. } if stdout.contains("VSI_CONN=0")
+    );
+    r.record(
+        "VSI.connect_cross_worker",
+        "B",
+        cross_ok,
+        &format!("{resp:?}"),
+    );
+
+    // Clean up: kill the background CLI server.
+    if let Some(pid) = bg_pid {
+        let _ = r.send("A", Command::Kill { pid }).await;
     }
 }
