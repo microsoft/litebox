@@ -390,18 +390,72 @@ fn hook_syscalls_in_section(
         let replace_start = replace_start.unwrap();
         let replace_len = usize::try_from(replace_end - replace_start).unwrap();
 
+        let copied_presyscall_insts_have_ip_rel_mem = instructions
+            .iter()
+            .take(i)
+            .skip_while(|prev_inst| prev_inst.ip() < replace_start)
+            .any(iced_x86::Instruction::is_ip_rel_memory_operand);
+
         let target_addr = checked_add_u64(
             trampoline_base_addr,
             trampoline_data.len() as u64,
             "syscall trampoline target",
         )?;
 
-        // Copy the original instructions to the trampoline
+        // Copy the pre-syscall instructions to the trampoline.
+        // When any instruction has a RIP-relative memory operand, we
+        // re-encode them so the displacement targets the same absolute
+        // address from the new trampoline location.
         if replace_start < inst.ip() {
-            trampoline_data.extend_from_slice(
-                &section_data[usize::try_from(replace_start - section_base_addr).unwrap()
-                    ..usize::try_from(inst.ip() - section_base_addr).unwrap()],
-            );
+            if copied_presyscall_insts_have_ip_rel_mem {
+                let mut reencoded = Vec::new();
+                let mut ok = true;
+                let mut encoder = iced_x86::Encoder::new(64);
+                for pre_inst in instructions
+                    .iter()
+                    .take(i)
+                    .skip_while(|p| p.ip() < replace_start)
+                {
+                    let tramp_ip = target_addr + reencoded.len() as u64;
+                    if encoder.encode(pre_inst, tramp_ip).is_err() {
+                        ok = false;
+                        break;
+                    }
+                    let bytes = encoder.take_buffer();
+                    if bytes.len() != pre_inst.len() {
+                        ok = false;
+                        break;
+                    }
+                    reencoded.extend_from_slice(&bytes);
+                }
+                if !ok {
+                    match hook_syscall_and_after(
+                        arch,
+                        control_transfer_targets,
+                        section_base_addr,
+                        section_data,
+                        trampoline_base_addr,
+                        syscall_entry_addr,
+                        trampoline_data,
+                        &instructions,
+                        i,
+                    ) {
+                        Ok(()) => {}
+                        Err(InternalError::InsufficientBytesBeforeOrAfter) => {
+                            replace_with_trap(section_data, section_base_addr, inst);
+                            skipped_addrs.push(inst.ip());
+                        }
+                        Err(e) => return Err(e),
+                    }
+                    continue;
+                }
+                trampoline_data.extend_from_slice(&reencoded);
+            } else {
+                trampoline_data.extend_from_slice(
+                    &section_data[usize::try_from(replace_start - section_base_addr).unwrap()
+                        ..usize::try_from(inst.ip() - section_base_addr).unwrap()],
+                );
+            }
         }
 
         let return_addr = inst.next_ip();
@@ -799,6 +853,8 @@ fn hook_syscall_and_after(
 
     let replace_end = replace_end.unwrap();
 
+    let trampoline_data_checkpoint = trampoline_data.len();
+
     let target_addr = checked_add_u64(
         trampoline_base_addr,
         trampoline_data.len() as u64,
@@ -823,13 +879,48 @@ fn hook_syscall_and_after(
         "x86_64 trampoline entry",
     )?);
 
-    // Copy the original instructions to the trampoline
+    // Copy the original post-syscall instructions to the trampoline.
+    // When any instruction has a RIP-relative memory operand, we
+    // re-encode them so the displacement targets the same absolute
+    // address from the new trampoline location.
     let syscall_inst_end = syscall_inst.next_ip();
     if syscall_inst_end < replace_end {
-        trampoline_data.extend_from_slice(
-            &section_data[usize::try_from(syscall_inst_end - section_base_addr).unwrap()
-                ..usize::try_from(replace_end - section_base_addr).unwrap()],
-        );
+        let postsyscall_insts = instructions
+            .iter()
+            .skip(inst_index + 1)
+            .take_while(|next_inst| next_inst.ip() < replace_end);
+        if postsyscall_insts
+            .clone()
+            .any(iced_x86::Instruction::is_ip_rel_memory_operand)
+        {
+            let mut reencoded = Vec::new();
+            let mut ok = true;
+            let mut encoder = iced_x86::Encoder::new(64);
+            for post_inst in postsyscall_insts {
+                let tramp_ip =
+                    trampoline_base_addr + trampoline_data.len() as u64 + reencoded.len() as u64;
+                if encoder.encode(post_inst, tramp_ip).is_err() {
+                    ok = false;
+                    break;
+                }
+                let bytes = encoder.take_buffer();
+                if bytes.len() != post_inst.len() {
+                    ok = false;
+                    break;
+                }
+                reencoded.extend_from_slice(&bytes);
+            }
+            if !ok {
+                trampoline_data.truncate(trampoline_data_checkpoint);
+                return Err(InternalError::InsufficientBytesBeforeOrAfter);
+            }
+            trampoline_data.extend_from_slice(&reencoded);
+        } else {
+            trampoline_data.extend_from_slice(
+                &section_data[usize::try_from(syscall_inst_end - section_base_addr).unwrap()
+                    ..usize::try_from(replace_end - section_base_addr).unwrap()],
+            );
+        }
     }
 
     // Add jmp back to original after syscall
