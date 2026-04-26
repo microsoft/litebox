@@ -884,7 +884,21 @@ where
                     .tcp()
                     .local_shutdown
                     .store(true, Ordering::SeqCst);
+                // Drain any pending TX data to smoltcp BEFORE closing.
+                // Without this, write_all() → shutdown() in quick succession
+                // loses data: the tx ring has data but close() sends FIN
+                // before smoltcp transmits it.
                 let tcp_socket: &mut tcp::Socket = self.socket_set.get_mut(socket_handle.handle);
+                if let Some(NetworkProxy::Stream(stream_proxy)) = socket_handle.proxy.as_deref() {
+                    while tcp_socket.can_send() {
+                        let sent = stream_proxy.pop_tx_data_with(|data| {
+                            tcp_socket.send_slice(data).unwrap_or_default()
+                        });
+                        if sent == 0 {
+                            break;
+                        }
+                    }
+                }
                 tcp_socket.close();
             }
         }

@@ -947,9 +947,10 @@ impl<FS: ShimFS> GlobalState<FS> {
             // lose data because smoltcp sends FIN before the queued data.
             None => CloseBehavior::GracefulIfNoPendingData,
         };
+        let is_nonblock = self.get_status(&fd).contains(OFlags::NONBLOCK);
         let proxy = self.get_proxy(&fd)?;
         match cx.with_timeout(linger_timeout).wait_on_events(
-            self.get_status(&fd).contains(OFlags::NONBLOCK),
+            is_nonblock,
             Events::HUP,
             |observer, filter| {
                 proxy.register_observer(observer, filter);
@@ -970,6 +971,16 @@ impl<FS: ShimFS> GlobalState<FS> {
                 .lock()
                 .close(&fd, CloseBehavior::Immediate)
                 .map_err(Errno::from),
+            Err(TryOpError::TryAgain) => {
+                // close() must never return EAGAIN — the fd must be freed.
+                // If GracefulIfNoPendingData returned DataPending (on a
+                // non-blocking socket), fall back to Graceful which always
+                // succeeds and lets smoltcp flush data in the background.
+                self.net
+                    .lock()
+                    .close(&fd, CloseBehavior::Graceful)
+                    .map_err(Errno::from)
+            }
             Err(e) => Err(e.into()),
         }
     }
