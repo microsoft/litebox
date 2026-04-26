@@ -454,6 +454,78 @@ fn main() {
             std::thread::sleep(std::time::Duration::from_secs(3));
             println!("SLOW_ECHO_OK");
         }
+        "tcp-halfclose" => {
+            // Tests TCP half-close: write → shutdown(WR) → read echo.
+            // Uses blocking sockets with recv timeout to avoid infinite hang.
+            let port: u16 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(20060);
+            unsafe {
+                let srv = libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0);
+                let one: libc::c_int = 1;
+                libc::setsockopt(srv, libc::SOL_SOCKET, libc::SO_REUSEADDR,
+                    &one as *const _ as *const libc::c_void,
+                    std::mem::size_of::<libc::c_int>() as libc::socklen_t);
+                let addr = libc::sockaddr_in {
+                    sin_family: libc::AF_INET as u16, sin_port: port.to_be(),
+                    sin_addr: libc::in_addr { s_addr: 0 }, sin_zero: [0; 8],
+                };
+                libc::bind(srv, &addr as *const _ as *const libc::sockaddr,
+                    std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t);
+                libc::listen(srv, 1);
+
+                let server = std::thread::spawn(move || {
+                    let conn = libc::accept(srv, std::ptr::null_mut(), std::ptr::null_mut());
+                    // Set recv timeout
+                    let tv = libc::timeval { tv_sec: 5, tv_usec: 0 };
+                    libc::setsockopt(conn, libc::SOL_SOCKET, libc::SO_RCVTIMEO,
+                        &tv as *const _ as *const libc::c_void,
+                        std::mem::size_of::<libc::timeval>() as libc::socklen_t);
+                    let mut buf = [0u8; 1024];
+                    let n = libc::recv(conn, buf.as_mut_ptr().cast(), buf.len(), 0);
+                    if n > 0 {
+                        libc::send(conn, buf.as_ptr().cast(), n as usize, 0);
+                    }
+                    // Read EOF — this is the critical test
+                    let n2 = libc::recv(conn, buf.as_mut_ptr().cast(), buf.len(), 0);
+                    let errno2 = if n2 < 0 { *libc::__errno_location() } else { 0 };
+                    libc::close(conn);
+                    libc::close(srv);
+                    (n, n2, errno2)
+                });
+
+                std::thread::sleep(std::time::Duration::from_millis(200));
+
+                let cli = libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0);
+                let caddr = libc::sockaddr_in {
+                    sin_family: libc::AF_INET as u16, sin_port: port.to_be(),
+                    sin_addr: libc::in_addr { s_addr: u32::from_be_bytes([127,0,0,1]).to_be() },
+                    sin_zero: [0; 8],
+                };
+                libc::connect(cli, &caddr as *const _ as *const libc::sockaddr,
+                    std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t);
+                let msg = b"HALFCLOSE";
+                libc::send(cli, msg.as_ptr().cast(), msg.len(), 0);
+                libc::shutdown(cli, libc::SHUT_WR);
+                // Set recv timeout on client too
+                let tv = libc::timeval { tv_sec: 5, tv_usec: 0 };
+                libc::setsockopt(cli, libc::SOL_SOCKET, libc::SO_RCVTIMEO,
+                    &tv as *const _ as *const libc::c_void,
+                    std::mem::size_of::<libc::timeval>() as libc::socklen_t);
+                let mut buf = [0u8; 1024];
+                let echo_n = libc::recv(cli, buf.as_mut_ptr().cast(), buf.len(), 0);
+                let echo_errno = if echo_n < 0 { *libc::__errno_location() } else { 0 };
+                let eof_n = libc::recv(cli, buf.as_mut_ptr().cast(), buf.len(), 0);
+                let eof_errno = if eof_n < 0 { *libc::__errno_location() } else { 0 };
+                libc::close(cli);
+
+                let (srv_data, srv_eof, srv_errno) = server.join().unwrap_or((-1, -1, 0));
+                let ok = srv_data as usize == msg.len() && srv_eof == 0
+                    && echo_n as usize == msg.len() && eof_n == 0;
+                println!(
+                    "HALFCLOSE={} srv_data={srv_data} srv_eof={srv_eof} srv_errno={srv_errno} echo={echo_n} echo_errno={echo_errno} eof={eof_n} eof_errno={eof_errno}",
+                    if ok { "OK" } else { "FAIL" }
+                );
+            }
+        }
         "pipe-nonblock" => {
             // Test pipe F_SETFL O_NONBLOCK behavior.
             // Creates a pipe, sets the read end to non-blocking, then verifies:

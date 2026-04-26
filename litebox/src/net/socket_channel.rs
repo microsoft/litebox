@@ -419,25 +419,24 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> StreamSocketChannel<Pla
         flags: super::ReceiveFlags,
         source_addr: Option<&mut Option<SocketAddr>>,
     ) -> Result<usize, ReceiveError> {
+        // When read_shutdown is set (peer sent FIN), return remaining
+        // buffered data, then EOF once the rx ring is empty.
         if self.inner.read_shutdown.load(Ordering::Acquire) {
-            return Err(ReceiveError::SocketInInvalidState);
-        }
-
-        match self.inner.state() {
-            SocketState::Connected => {}
-            // Allow reading from a closed socket if there's still data in the
-            // rx buffer. This supports the TCP half-close pattern: the local
-            // side calls shutdown(Write) which transitions the proxy to Closed,
-            // but data from the peer that arrived before the close must still
-            // be readable.
-            SocketState::Closed => {
-                if self.inner.rx_available.load(Ordering::Acquire) == 0 {
-                    // No data remaining — return 0 (EOF).
-                    return Ok(0);
-                }
-                // Fall through to read the remaining data.
+            if self.inner.rx_available.load(Ordering::Acquire) == 0 {
+                return Err(ReceiveError::Eof);
             }
-            _ => return Err(ReceiveError::SocketInInvalidState),
+            // Fall through to read buffered data.
+        } else {
+            match self.inner.state() {
+                SocketState::Connected => {}
+                SocketState::Closed => {
+                    if self.inner.rx_available.load(Ordering::Acquire) == 0 {
+                        return Err(ReceiveError::Eof);
+                    }
+                    // Fall through to read the remaining data.
+                }
+                _ => return Err(ReceiveError::SocketInInvalidState),
+            }
         }
 
         let mut rx_cons = self.inner.rx_cons.lock();
@@ -502,6 +501,8 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> StreamSocketChannel<Pla
     /// Shutdown the read side of the socket.
     pub fn shutdown_read(&self) {
         self.inner.read_shutdown.store(true, Ordering::Release);
+        // Wake any thread blocked in recv() so it sees the shutdown.
+        self.inner.pollee.notify_observers(Events::IN | Events::HUP);
     }
 
     /// Shutdown the write side of the socket.

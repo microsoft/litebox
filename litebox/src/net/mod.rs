@@ -616,6 +616,19 @@ where
                     }
                 }
 
+                // Detect peer FIN: when the smoltcp socket enters CloseWait
+                // (peer sent FIN) and all data has been drained from smoltcp
+                // to the proxy rx ring, call shutdown_read() so the proxy
+                // returns EOF once the guest has consumed all buffered data.
+                if !tcp_socket.can_recv()
+                    && matches!(
+                        tcp_socket.state(),
+                        tcp::State::CloseWait | tcp::State::LastAck
+                    )
+                {
+                    proxy.shutdown_read();
+                }
+
                 if let tcp::State::Established = tcp_socket.state() {
                     proxy.set_state(socket_channel::SocketState::Connected);
                     proxy.clear_async_error();

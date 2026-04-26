@@ -153,6 +153,8 @@ pub enum ReceiveError {
     SocketInInvalidState,
     #[error("Operation finished")]
     OperationFinished,
+    #[error("End of file (peer closed connection)")]
+    Eof,
 }
 
 crate::utilities::macros::repr_enum! {
