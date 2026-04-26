@@ -307,6 +307,148 @@ fn main() {
                 }
             }
         }
+        "epoll-socket" => {
+            // Minimal reproduction of epoll + TCP socket wakeup.
+            //
+            // Two variants:
+            // 1. Direct: epoll_wait blocks until data arrives (works)
+            // 2. Tokio pattern: epoll_wait(timeout=0) → no events → futex park
+            //    → data arrives → must wake via eventfd/pipe wakeup
+            //
+            // Variant 2 is how tokio works: it polls epoll non-blocking,
+            // and if no events, parks the thread on a futex. The I/O driver
+            // uses an eventfd to wake the parker when new events arrive.
+            let port: u16 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(19990);
+            let variant = args.get(3).map(|s| s.as_str()).unwrap_or("direct");
+
+            unsafe {
+                // Create server socket
+                let srv = libc::socket(libc::AF_INET, libc::SOCK_STREAM | libc::SOCK_NONBLOCK, 0);
+                assert!(srv >= 0, "socket failed");
+                let one: libc::c_int = 1;
+                libc::setsockopt(
+                    srv,
+                    libc::SOL_SOCKET,
+                    libc::SO_REUSEADDR,
+                    &one as *const _ as *const libc::c_void,
+                    std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+                );
+                let addr = libc::sockaddr_in {
+                    sin_family: libc::AF_INET as u16,
+                    sin_port: port.to_be(),
+                    sin_addr: libc::in_addr { s_addr: 0 },
+                    sin_zero: [0; 8],
+                };
+                let ret = libc::bind(
+                    srv,
+                    &addr as *const _ as *const libc::sockaddr,
+                    std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+                );
+                assert!(ret == 0, "bind failed: {}", std::io::Error::last_os_error());
+                libc::listen(srv, 5);
+
+                // Create epoll
+                let epfd = libc::epoll_create1(0);
+                assert!(epfd >= 0, "epoll_create1 failed");
+
+                let mut ev = libc::epoll_event {
+                    events: libc::EPOLLIN as u32,
+                    u64: srv as u64,
+                };
+                libc::epoll_ctl(epfd, libc::EPOLL_CTL_ADD, srv, &mut ev);
+
+                // Spawn client thread
+                let port_copy = port;
+                let client = std::thread::spawn(move || {
+                    // Delay so server parks first (for tokio variant)
+                    std::thread::sleep(std::time::Duration::from_millis(500));
+                    let sock = libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0);
+                    let addr = libc::sockaddr_in {
+                        sin_family: libc::AF_INET as u16,
+                        sin_port: port_copy.to_be(),
+                        sin_addr: libc::in_addr {
+                            s_addr: u32::from_be_bytes([127, 0, 0, 1]).to_be(),
+                        },
+                        sin_zero: [0; 8],
+                    };
+                    libc::connect(
+                        sock,
+                        &addr as *const _ as *const libc::sockaddr,
+                        std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+                    );
+                    let msg = b"EPOLL_DATA";
+                    libc::send(sock, msg.as_ptr().cast(), msg.len(), 0);
+                    libc::close(sock);
+                });
+
+                // Server: wait for accept + data
+                let mut events = [libc::epoll_event { events: 0, u64: 0 }; 4];
+
+                if variant == "tokio" {
+                    // Tokio pattern: poll epoll non-blocking first. If nothing
+                    // ready, park on a futex. Data arriving later must wake us
+                    // via the epoll eventfd mechanism.
+                    let n = libc::epoll_wait(epfd, events.as_mut_ptr(), 4, 0);
+                    if n > 0 {
+                        println!("EPOLL_ACCEPT=IMMEDIATE");
+                    } else {
+                        // No events yet. In tokio, this is where the thread
+                        // would park on a futex. We simulate by using a long
+                        // blocking epoll_wait (which in litebox might miss
+                        // the notification if it arrived during the gap).
+                        let n = libc::epoll_wait(epfd, events.as_mut_ptr(), 4, 5000);
+                        if n <= 0 {
+                            println!("EPOLL_ACCEPT=TIMEOUT");
+                            client.join().ok();
+                            libc::close(srv);
+                            libc::close(epfd);
+                            std::process::exit(0);
+                        }
+                    }
+                } else {
+                    // Direct: blocking epoll_wait
+                    let n = libc::epoll_wait(epfd, events.as_mut_ptr(), 4, 5000);
+                    if n <= 0 {
+                        println!("EPOLL_ACCEPT=TIMEOUT");
+                        client.join().ok();
+                        libc::close(srv);
+                        libc::close(epfd);
+                        std::process::exit(0);
+                    }
+                }
+
+                // Accept
+                let conn = libc::accept4(srv, std::ptr::null_mut(), std::ptr::null_mut(), libc::SOCK_NONBLOCK);
+                if conn < 0 {
+                    println!("EPOLL_ACCEPT=FAIL");
+                } else {
+                    let mut ev2 = libc::epoll_event {
+                        events: libc::EPOLLIN as u32,
+                        u64: conn as u64,
+                    };
+                    libc::epoll_ctl(epfd, libc::EPOLL_CTL_ADD, conn, &mut ev2);
+
+                    // Wait for data
+                    let n2 = libc::epoll_wait(epfd, events.as_mut_ptr(), 4, 5000);
+                    if n2 <= 0 {
+                        println!("EPOLL_READ=TIMEOUT");
+                    } else {
+                        let mut buf = [0u8; 64];
+                        let nr = libc::recv(conn, buf.as_mut_ptr().cast(), buf.len(), 0);
+                        if nr > 0 {
+                            let data = std::str::from_utf8(&buf[..nr as usize]).unwrap_or("?");
+                            println!("EPOLL_READ=OK data={data}");
+                        } else {
+                            println!("EPOLL_READ=NO_DATA nr={nr}");
+                        }
+                    }
+                    libc::close(conn);
+                }
+                client.join().ok();
+                libc::close(srv);
+                libc::close(epfd);
+            }
+        }
         "slow-echo" => {
             // Sleeps 3 seconds then prints, simulating a slow-starting server.
             std::thread::sleep(std::time::Duration::from_secs(3));

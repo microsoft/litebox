@@ -425,6 +425,18 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> StreamSocketChannel<Pla
 
         match self.inner.state() {
             SocketState::Connected => {}
+            // Allow reading from a closed socket if there's still data in the
+            // rx buffer. This supports the TCP half-close pattern: the local
+            // side calls shutdown(Write) which transitions the proxy to Closed,
+            // but data from the peer that arrived before the close must still
+            // be readable.
+            SocketState::Closed => {
+                if self.inner.rx_available.load(Ordering::Acquire) == 0 {
+                    // No data remaining — return 0 (EOF).
+                    return Ok(0);
+                }
+                // Fall through to read the remaining data.
+            }
             _ => return Err(ReceiveError::SocketInInvalidState),
         }
 

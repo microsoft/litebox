@@ -887,7 +887,17 @@ impl<FS: ShimFS> GlobalState<FS> {
                     Ok(())
                 },
                 || match proxy.try_read(buf, new_flags, source_addr.as_deref_mut()) {
-                    Ok(0) => Err(TryOpError::TryAgain),
+                    // try_read returns Ok(0) in two cases:
+                    // 1. Connected + empty rx buffer → TryAgain (wait for data)
+                    // 2. Closed + empty rx buffer → real EOF (return 0 to caller)
+                    // Detect case 2 via HUP in the IO events.
+                    Ok(0) => {
+                        if proxy.check_io_events().contains(Events::HUP) {
+                            Ok(0) // EOF — socket is closed
+                        } else {
+                            Err(TryOpError::TryAgain)
+                        }
+                    }
                     Ok(n) => Ok(n),
                     Err(e) => Err(TryOpError::Other(Errno::from(e))),
                 },

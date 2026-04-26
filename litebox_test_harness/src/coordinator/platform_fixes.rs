@@ -294,6 +294,7 @@ pub(crate) async fn run(r: &mut TestRunner) {
     vscode_install_pattern_tests(r).await;
     file_redirect_tests(r).await;
     pipe_nonblock_tests(r).await;
+    epoll_socket_tests(r).await;
     loopback_tcp_tests(r).await;
     // PID visibility tests run last — KP.proc_child can deadlock agent B
     // under litebox, causing all subsequent B-targeted tests to timeout.
@@ -1533,6 +1534,101 @@ pub(crate) async fn pipe_nonblock_tests(r: &mut TestRunner) {
                 for suffix in ["eagain", "data", "eof"] {
                     r.record(
                         &format!("{test_prefix}.{suffix}"),
+                        agent,
+                        false,
+                        &format!("{resp:?}"),
+                    );
+                }
+            }
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// EP: Epoll + Socket wakeup — epoll_wait must wake when TCP data arrives
+// (the tokio pattern: epoll_wait → futex park → data arrives → must wake)
+// ═══════════════════════════════════════════════════════════════════
+
+/// Tests that epoll_wait correctly wakes when data arrives on a TCP socket.
+///
+/// This is the pattern every async runtime (tokio, async-std) uses:
+/// register a socket with epoll, then call epoll_wait. When data arrives
+/// via the network worker, epoll must wake the thread.
+///
+/// In litebox, the network worker delivers data via the proxy ring buffer
+/// and calls notify_observers(IN). This must propagate through the epoll
+/// subsystem to wake a thread sleeping in epoll_wait. If the thread is
+/// parked on a futex (tokio's parking mechanism) between the epoll check
+/// and the sleep, the notification must still reach it.
+///
+/// Tests:
+///   EP.direct.accept — blocking epoll_wait wakes for accept
+///   EP.direct.read  — blocking epoll_wait wakes for data
+///   EP.tokio.accept — epoll_wait(0) → re-wait wakes for accept
+///   EP.tokio.read   — epoll_wait(0) → re-wait wakes for data
+pub(crate) async fn epoll_socket_tests(r: &mut TestRunner) {
+    eprintln!(
+        "[platform] === Epoll Socket ({} agents) ===",
+        AGENTS.len()
+    );
+
+    let self_exe = r.self_exe.clone();
+
+    for &variant in &["direct", "tokio"] {
+        for &agent in AGENTS {
+            let port = match (variant, agent) {
+                ("direct", "A") => 19990,
+                ("direct", "AA") => 19991,
+                ("direct", _) => 19992,
+                ("tokio", "A") => 19993,
+                ("tokio", "AA") => 19994,
+                _ => 19995,
+            };
+            let resp = r
+                .send(
+                    agent,
+                    Command::Exec {
+                        args: vec![
+                            self_exe.clone(),
+                            "epoll-socket".into(),
+                            port.to_string(),
+                            variant.to_string(),
+                        ],
+                        timeout_secs: Some(15),
+                        stdin: None,
+                        background: false,
+                    },
+                )
+                .await;
+
+            match &resp {
+                Response::ExecResult { stdout, .. } => {
+                    let accept_ok =
+                        stdout.contains("EPOLL_ACCEPT=") && !stdout.contains("TIMEOUT");
+                    r.record(
+                        &format!("EP.{variant}.accept.{agent}"),
+                        agent,
+                        accept_ok,
+                        &format!("{resp:?}"),
+                    );
+
+                    let read_ok = stdout.contains("EPOLL_READ=OK");
+                    r.record(
+                        &format!("EP.{variant}.read.{agent}"),
+                        agent,
+                        read_ok,
+                        &format!("{resp:?}"),
+                    );
+                }
+                _ => {
+                    r.record(
+                        &format!("EP.{variant}.accept.{agent}"),
+                        agent,
+                        false,
+                        &format!("{resp:?}"),
+                    );
+                    r.record(
+                        &format!("EP.{variant}.read.{agent}"),
                         agent,
                         false,
                         &format!("{resp:?}"),

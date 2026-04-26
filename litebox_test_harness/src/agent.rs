@@ -744,7 +744,9 @@ async fn agent_loop(self_exe: &str) {
                             .await
                         {
                             Ok(Ok(0)) => break,
-                            Ok(Ok(n)) => received.extend_from_slice(&buf[..n]),
+                            Ok(Ok(n)) => {
+                                received.extend_from_slice(&buf[..n]);
+                            }
                             Ok(Err(e)) => return Err(format!("read: {e}")),
                             Err(_) => return Err("read timeout".to_string()),
                         }

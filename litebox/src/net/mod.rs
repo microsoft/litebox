@@ -238,6 +238,10 @@ pub(crate) struct TcpSpecific {
     server_socket: Option<TcpServerSpecific>,
     /// Whether to immediately close the socket when closed (i.e., no graceful FIN handshake)
     immediate_close: AtomicBool,
+    /// Whether the local side initiated a graceful shutdown (shutdown(Write) or close).
+    /// When true, the socket closing is NOT a peer reset — the rx buffer should remain
+    /// readable until drained.
+    local_shutdown: AtomicBool,
     /// Timestamp when `connect` was initiated
     connect_initiated_at_us: Option<smoltcp::time::Instant>,
 }
@@ -623,7 +627,6 @@ where
                     // Determine error based on previous socket state
                     match proxy.state() {
                         socket_channel::SocketState::Connecting => {
-                            // Socket closed while connecting. Distinguish RST from timeout.
                             let error = match tcp_specific.connect_initiated_at_us {
                                 Some(initiated_at) if now - initiated_at >= TCP_CONNECT_TIMEOUT => {
                                     errors::SocketAsyncError::TimedOut
@@ -634,9 +637,18 @@ where
                             proxy.set_state(socket_channel::SocketState::Error);
                         }
                         socket_channel::SocketState::Connected => {
-                            // Connection was reset by peer
-                            proxy.set_async_error(errors::SocketAsyncError::ConnectionReset);
-                            proxy.set_state(socket_channel::SocketState::Closed);
+                            if tcp_specific.local_shutdown.load(Ordering::Relaxed) {
+                                // Local side initiated the close (shutdown(Write) or close()).
+                                // This is NOT a peer reset — set Closed without an error so
+                                // the rx buffer remains readable until drained.
+                                proxy.set_state(socket_channel::SocketState::Closed);
+                            } else {
+                                // Connection was reset by peer
+                                proxy.set_async_error(
+                                    errors::SocketAsyncError::ConnectionReset,
+                                );
+                                proxy.set_state(socket_channel::SocketState::Closed);
+                            }
                         }
                         _ => {
                             proxy.set_state(socket_channel::SocketState::Closed);
@@ -797,6 +809,7 @@ where
                     local_port: None,
                     server_socket: None,
                     immediate_close: AtomicBool::new(false),
+                    local_shutdown: AtomicBool::new(false),
                     connect_initiated_at_us: None,
                 }),
                 Protocol::Udp => ProtocolSpecific::Udp(UdpSpecific {
@@ -866,6 +879,11 @@ where
             proxy.shutdown_write();
             // For TCP, initiate a graceful close (FIN) on the smoltcp socket.
             if let Protocol::Tcp = socket_handle.protocol() {
+                socket_handle
+                    .specific
+                    .tcp()
+                    .local_shutdown
+                    .store(true, Ordering::SeqCst);
                 let tcp_socket: &mut tcp::Socket = self.socket_set.get_mut(socket_handle.handle);
                 tcp_socket.close();
             }
@@ -1451,6 +1469,7 @@ where
                         local_port,
                         server_socket: None,
                         immediate_close: AtomicBool::new(false),
+                        local_shutdown: AtomicBool::new(false),
                         connect_initiated_at_us: None,
                     }),
                     proxy: None,
