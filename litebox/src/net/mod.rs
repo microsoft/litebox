@@ -1018,6 +1018,18 @@ where
                 if tcp_specific.immediate_close.load(Ordering::Relaxed) {
                     tcp_socket.abort();
                 } else {
+                    // Drain TX ring to smoltcp before close so pending data
+                    // (e.g. echo responses) is sent before the FIN.
+                    if let Some(NetworkProxy::Stream(stream_proxy)) = proxy.as_deref() {
+                        while tcp_socket.can_send() {
+                            let sent = stream_proxy.pop_tx_data_with(|data| {
+                                tcp_socket.send_slice(data).unwrap_or_default()
+                            });
+                            if sent == 0 {
+                                break;
+                            }
+                        }
+                    }
                     tcp_socket.close();
                 }
                 self.closing_in_background.push(handle);

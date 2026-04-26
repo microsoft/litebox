@@ -498,11 +498,20 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> StreamSocketChannel<Pla
         self.inner.tx_available.load(Ordering::Acquire) > 0
     }
 
-    /// Shutdown the read side of the socket.
+    /// Shutdown the read side of the socket (peer sent FIN).
+    ///
+    /// Uses `RDHUP` (not `HUP`) because this is a half-close: the peer
+    /// closed its write side but the local side can still write.  `HUP`
+    /// would signal a full disconnect, causing tokio to refuse writes
+    /// on the echo-server side of the connection.
     pub fn shutdown_read(&self) {
-        self.inner.read_shutdown.store(true, Ordering::Release);
+        if self.inner.read_shutdown.swap(true, Ordering::AcqRel) {
+            return; // already shut down
+        }
         // Wake any thread blocked in recv() so it sees the shutdown.
-        self.inner.pollee.notify_observers(Events::IN | Events::HUP);
+        self.inner
+            .pollee
+            .notify_observers(Events::IN | Events::RDHUP);
     }
 
     /// Shutdown the write side of the socket.
@@ -521,8 +530,14 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> IOPollable
     fn check_io_events(&self) -> Events {
         let mut events = Events::empty();
 
+        let read_shut = self.inner.read_shutdown.load(Ordering::Acquire);
+
         if self.is_readable() {
             events |= Events::IN;
+        } else if read_shut {
+            // Peer sent FIN, all buffered data consumed.  Report IN so
+            // epoll wakes the reader; try_read will return Eof.
+            events |= Events::IN | Events::RDHUP;
         }
 
         match self.inner.state() {
