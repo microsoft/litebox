@@ -4,6 +4,7 @@
 //! Test coordinator. Runs as the init process, drives all test
 //! operations through pipes to child agents.
 
+pub(crate) mod file_tcp;
 pub(crate) mod fork_matrix;
 pub(crate) mod matrix;
 pub(crate) mod platform_fixes;
@@ -325,6 +326,12 @@ async fn run_tests(self_exe: &str, filter: Option<&str>) -> Vec<TestResult> {
     if should_run("tcp") {
         eprintln!("[coord] === TCP Stress Tests ===");
         tcp_stress::run(&mut runner).await;
+    }
+
+    // === File+TCP Combined Tests ===
+    if should_run("ft") {
+        eprintln!("[coord] === File+TCP Combined Tests ===");
+        file_tcp::run(&mut runner).await;
     }
 
     // === VS Code Reproduction Tests ===

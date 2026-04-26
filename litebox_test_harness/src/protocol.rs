@@ -125,6 +125,16 @@ pub enum Command {
         data: String,
     },
 
+    /// Connect to `addr`, send `size` bytes, read file at `path`, then read
+    /// echoed TCP data. Reports both file content and TCP integrity. Tests for
+    /// 9P deadlock when file I/O happens while TCP sockets are active.
+    #[serde(rename = "net_send_file_recv")]
+    NetSendFileRecv {
+        addr: String,
+        size: u32,
+        path: String,
+    },
+
     /// Create a pipe, write data, poll read-end for POLLIN readiness.
     /// Tests that file descriptors correctly report IN events in poll/epoll.
     #[serde(rename = "poll_ready")]
