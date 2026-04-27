@@ -2098,7 +2098,7 @@ unsafe extern "C" fn exception_signal_handler(
             let c_path = unsafe { core::ffi::CStr::from_ptr(rsi) };
             // libc may call `openat` for certain files that we can ignore, e.g., /proc/sys/vm/overcommit_memory.
             // Log the paths in case we need to allow some of them in the future.
-            writeln!(buf, "INFO: openat with {c_path:?}").unwrap();
+            writeln!(buf, "INFO: openat with {c_path:?} is not allowed").unwrap();
         } else {
             writeln!(buf, "WARNING: disallowed syscall invoked: {sysno}").unwrap();
         }
