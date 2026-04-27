@@ -234,6 +234,48 @@ fn main() {
             }
             eprintln!("[tcp-echo] exiting");
         }
+        "tcp-echo-multi" => {
+            // Listen on a TCP port and echo back whatever is received.
+            // Handles multiple connections concurrently using threads.
+            // Usage: tcp-echo-multi <port> [max_conns]
+            let port: u16 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(9999);
+            let max_conns: usize = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(100);
+            let listener = std::net::TcpListener::bind(format!("0.0.0.0:{port}"))
+                .expect("tcp-echo-multi: bind failed");
+            eprintln!("[tcp-echo-multi] listening on 0.0.0.0:{port}, max_conns={max_conns}");
+            let mut conn_count = 0usize;
+            let mut handles = Vec::new();
+            while conn_count < max_conns {
+                match listener.accept() {
+                    Ok((mut stream, addr)) => {
+                        conn_count += 1;
+                        let id = conn_count;
+                        eprintln!("[tcp-echo-multi] accepted #{id} from {addr}");
+                        handles.push(std::thread::spawn(move || {
+                            use std::io::{Read, Write};
+                            let mut buf = [0u8; 4096];
+                            match stream.read(&mut buf) {
+                                Ok(n) if n > 0 => {
+                                    eprintln!("[tcp-echo-multi] #{id} read {n} bytes, echoing");
+                                    let _ = stream.write_all(&buf[..n]);
+                                    let _ = stream.flush();
+                                }
+                                Ok(_) => eprintln!("[tcp-echo-multi] #{id} read 0 bytes"),
+                                Err(e) => eprintln!("[tcp-echo-multi] #{id} read error: {e}"),
+                            }
+                        }));
+                    }
+                    Err(e) => {
+                        eprintln!("[tcp-echo-multi] accept error: {e}");
+                        break;
+                    }
+                }
+            }
+            for h in handles {
+                let _ = h.join();
+            }
+            eprintln!("[tcp-echo-multi] exiting");
+        }
         "tcp-recv-all" => {
             // Listen on a TCP port, accept one connection, read ALL data
             // until EOF, then print the total byte count and data to stdout.
