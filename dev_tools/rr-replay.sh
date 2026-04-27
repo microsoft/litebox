@@ -39,6 +39,11 @@ if ! command -v rr &>/dev/null; then
     exit 1
 fi
 
+# Note: rr-replay does not need PMU counters (only rr-record does).
+# However, if no trace exists, the user likely couldn't record one.
+# We don't block here — rr replay will give its own error if the trace
+# is missing or corrupt.
+
 # Parse arguments.
 TRACE_DIR=""
 BATCH=false

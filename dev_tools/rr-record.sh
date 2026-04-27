@@ -30,15 +30,29 @@ if ! command -v rr &>/dev/null; then
     exit 1
 fi
 
-# Check perf_event_paranoid.
-if [[ -f /proc/sys/kernel/perf_event_paranoid ]]; then
-    PARANOID=$(cat /proc/sys/kernel/perf_event_paranoid)
-    if (( PARANOID > 1 )); then
-        echo "ERROR: perf_event_paranoid=$PARANOID (must be ≤ 1 for rr)" >&2
-        echo "Fix with: echo 1 | sudo tee /proc/sys/kernel/perf_event_paranoid" >&2
-        exit 1
+# Verify PMU hardware counters are actually available.
+# WSL2's Hyper-V VM does NOT virtualize PMU hardware, so rr cannot work
+# even though perf_event_paranoid may be permissive.  We test by actually
+# running rr on a trivial program rather than checking perf_event_paranoid
+# (which gives a false positive under WSL2).
+if ! rr record --output-trace-dir /tmp/rr-precheck-$$ true 2>/dev/null; then
+    rm -rf /tmp/rr-precheck-$$ 2>/dev/null
+    echo "ERROR: rr cannot record — hardware PMU counters are not available." >&2
+    if grep -qi microsoft /proc/version 2>/dev/null; then
+        echo "" >&2
+        echo "You are running under WSL2. Microsoft's Hyper-V VM does not" >&2
+        echo "virtualize Performance Monitoring Unit (PMU) hardware, which rr" >&2
+        echo "requires for deterministic record/replay." >&2
+        echo "" >&2
+        echo "There is no user-side workaround. Use debug-runner.sh (GDB batch" >&2
+        echo "mode) instead — it only needs ptrace, which WSL2 fully supports." >&2
+    else
+        echo "Check: /proc/sys/kernel/perf_event_paranoid (must be ≤ 1)" >&2
+        echo "Check: VM guests need PMU virtualization enabled in the hypervisor" >&2
     fi
+    exit 1
 fi
+rm -rf /tmp/rr-precheck-$$ 2>/dev/null
 
 # Parse arguments.
 TARGET=""

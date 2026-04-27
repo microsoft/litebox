@@ -318,6 +318,8 @@ pub(crate) async fn run(r: &mut TestRunner) {
     fork_interleave_tests(r).await;
     fork_background_tests(r).await;
     fork_listen_inherit_tests(r).await;
+    child_listen_cross_connect_tests(r).await;
+    vscode_cli_cross_connect_tests(r).await;
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -480,4 +482,237 @@ pub(crate) async fn fork_listen_inherit_tests(r: &mut TestRunner) {
     if let Some(pid) = bg_pid {
         let _ = r.send("A", Command::Kill { pid }).await;
     }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// PR.child_listen: child process calls listen(), cross-worker connect
+// ═══════════════════════════════════════════════════════════════════
+
+/// Reproduces the VS Code exec server failure:
+/// Agent A exec's a child process (non-PIE → separate worker) that
+/// calls bind()+listen() immediately on startup. Then agent B connects
+/// to the port through the cross-worker TCP bridge.
+///
+/// The bug: the child's listen() port notification can go through the
+/// PARENT worker's IPC (race during delayed-fork worker creation),
+/// registering the port route on the wrong worker. The SYN arrives
+/// at the parent's smoltcp (which has no accept() call) → RST.
+pub(crate) async fn child_listen_cross_connect_tests(r: &mut TestRunner) {
+    eprintln!("[pr] === PR.child_listen: child calls listen, cross-worker connect ===");
+
+    let port = 18500u16;
+
+    // Find the non-PIE binary (forces separate worker in litebox).
+    let nonpie = if std::path::Path::new("/opt/nonpie/litebox_test_harness").exists() {
+        "/opt/nonpie/litebox_test_harness".to_string()
+    } else {
+        // Fall back to self_exe (won't reproduce on PIE, but won't crash)
+        r.self_exe.clone()
+    };
+
+    // Agent A exec's the child: tcp-listen-busy listens on the port,
+    // does a 3s busy loop, then accepts one connection and echoes.
+    let bg_resp = r
+        .send(
+            "A",
+            Command::Exec {
+                args: vec![
+                    nonpie.clone(),
+                    "tcp-echo".into(),
+                    port.to_string(),
+                ],
+                timeout_secs: Some(30),
+                stdin: None,
+                background: true,
+            },
+        )
+        .await;
+    let bg_pid = match &bg_resp {
+        Response::Background { pid } => Some(*pid),
+        _ => {
+            r.record(
+                "PR.child_listen_cross",
+                "B",
+                false,
+                &format!("bg spawn failed: {bg_resp:?}"),
+            );
+            return;
+        }
+    };
+
+    // Wait for the child to start and call listen().
+    // tcp-echo calls bind+listen immediately, then blocks on accept.
+    tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+
+    // Cross-worker connect from agent B — this is the VS Code SOCKS pattern.
+    let conn_resp = r
+        .send(
+            "B",
+            Command::NetConnect {
+                addr: format!("127.0.0.1:{port}"),
+                data: "child_listen_test".into(),
+            },
+        )
+        .await;
+    let cross_ok =
+        matches!(&conn_resp, Response::Connected { echo } if echo == "child_listen_test");
+    r.record(
+        "PR.child_listen_cross",
+        "B",
+        cross_ok,
+        &format!("{conn_resp:?}"),
+    );
+
+    if let Some(pid) = bg_pid {
+        let _ = r.send("A", Command::Kill { pid }).await;
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// PR.vscode_cli: actual VS Code CLI listen + cross-worker connect
+// ═══════════════════════════════════════════════════════════════════
+
+/// Reproduces the VS Code exec server connection failure using the
+/// actual VS Code CLI binary (100MB, statically-linked musl).
+///
+/// The sequence mirrors the real VS Code Remote-SSH bootstrap:
+///   1. Agent A background-exec's the CLI via bash
+///   2. Coordinator waits for the CLI to start listening (~45s)
+///   3. Agent A reads the port from the CLI's log
+///   4. Agent B connects to the CLI's port (cross-worker TCP bridge)
+///
+/// Skipped if the VS Code CLI is not installed.
+pub(crate) async fn vscode_cli_cross_connect_tests(r: &mut TestRunner) {
+    eprintln!("[pr] === PR.vscode_cli: VS Code CLI listen + cross-worker connect ===");
+
+    let resp = r
+        .send(
+            "A",
+            super::exec_timeout(
+                vec![
+                    "bash".into(),
+                    "-c".into(),
+                    "if [ -x /root/.vscode-server/code ]; then \
+                       /root/.vscode-server/code --version 2>/dev/null \
+                       | grep -oP 'commit \\K[a-f0-9]{40}'; \
+                     else echo MISSING; fi"
+                        .into(),
+                ],
+                60,
+            ),
+        )
+        .await;
+    let commit = match &resp {
+        Response::ExecResult {
+            exit_code: 0,
+            stdout,
+            ..
+        } if stdout.trim().len() == 40 => stdout.trim().to_string(),
+        _ => {
+            r.record(
+                "PR.vscode_cli_cross",
+                "B",
+                true,
+                "skipped (VS Code CLI not installed)",
+            );
+            return;
+        }
+    };
+
+    let start_cmd = format!(
+        "LOG=/tmp/pr-cli.log; \
+         /root/.vscode-server/code-{commit} command-shell \
+           --cli-data-dir /root/.vscode-server/cli \
+           --parent-process-id $$ \
+           --on-host 0.0.0.0 > $LOG 2>&1 & \
+         CLI_PID=$!; \
+         for i in $(seq 1 60); do \
+           PORT=$(grep -oP 'Listening on [^:]+:\\K[0-9]+' $LOG 2>/dev/null); \
+           if [ -n \"$PORT\" ]; then echo PORT=$PORT; break; fi; \
+           sleep 1; \
+         done; \
+         echo CLI_PID=$CLI_PID; \
+         sleep 60"
+    );
+    let bg_resp = r
+        .send(
+            "A",
+            Command::Exec {
+                args: vec!["bash".into(), "-c".into(), start_cmd],
+                timeout_secs: None,
+                stdin: None,
+                background: true,
+            },
+        )
+        .await;
+    let bg_pid = match &bg_resp {
+        Response::Background { pid } => *pid,
+        _ => {
+            r.record(
+                "PR.vscode_cli_cross",
+                "B",
+                false,
+                &format!("bg spawn failed: {bg_resp:?}"),
+            );
+            return;
+        }
+    };
+
+    tokio::time::sleep(tokio::time::Duration::from_secs(45)).await;
+
+    let resp = r
+        .send(
+            "A",
+            super::exec_timeout(
+                vec![
+                    "bash".into(),
+                    "-c".into(),
+                    "grep -oP 'Listening on [^:]+:\\K[0-9]+' /tmp/pr-cli.log 2>/dev/null \
+                     || echo NONE"
+                        .into(),
+                ],
+                5,
+            ),
+        )
+        .await;
+    let port: Option<u16> = match &resp {
+        Response::ExecResult {
+            exit_code: 0,
+            stdout,
+            ..
+        } => stdout.trim().parse().ok(),
+        _ => None,
+    };
+    let Some(port) = port else {
+        r.record(
+            "PR.vscode_cli_cross",
+            "B",
+            false,
+            &format!("CLI didn't start: {resp:?}"),
+        );
+        let _ = r.send("A", Command::Kill { pid: bg_pid }).await;
+        return;
+    };
+
+    let cmd = format!(
+        "echo PROBE | nc -w5 127.0.0.1 {port} >/dev/null 2>&1; echo CONN=$?"
+    );
+    let conn_resp = r
+        .send(
+            "B",
+            super::exec_timeout(vec!["bash".into(), "-c".into(), cmd], 10),
+        )
+        .await;
+    let cross_ok = matches!(
+        &conn_resp,
+        Response::ExecResult { stdout, .. } if stdout.contains("CONN=0")
+    );
+    r.record(
+        "PR.vscode_cli_cross",
+        "B",
+        cross_ok,
+        &format!("{conn_resp:?}"),
+    );
+
+    let _ = r.send("A", Command::Kill { pid: bg_pid }).await;
 }

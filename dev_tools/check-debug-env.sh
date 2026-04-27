@@ -8,12 +8,13 @@
 #
 # Checks:
 #   1. rust-gdb is installed and has Rust pretty-printers
-#   2. rr is installed
-#   3. /proc/sys/kernel/perf_event_paranoid <= 1 (required by rr)
-#   4. Debug symbols are present in built binaries
-#   5. Required litebox binaries exist (runner, broker, tool_executor)
+#   2. rr is installed and PMU hardware counters are available
+#      (rr requires hardware perf counters; WSL2's Hyper-V VM does
+#       not virtualize PMU, so rr typically does NOT work under WSL2)
+#   3. Debug symbols are present in built binaries
+#   4. Required litebox binaries exist (runner, broker, tool_executor)
 #
-# Exit code 0 if all checks pass, 1 if any fail.
+# Exit code 0 if GDB checks pass (rr is optional), 1 if GDB checks fail.
 
 set -euo pipefail
 
@@ -42,33 +43,37 @@ else
     echo "       Install with: sudo apt install gdb && rustup component add rust-gdb"
 fi
 
-# --- 2. rr ---
-echo "[2] rr (record-replay debugger)"
-if command -v rr &>/dev/null; then
+# --- 2. rr (optional — does NOT work under WSL2) ---
+echo "[2] rr (record-replay debugger) [optional]"
+RR_AVAILABLE=false
+if ! command -v rr &>/dev/null; then
+    warn "rr not installed (optional — install with: sudo apt install rr)"
+else
     RR_VERSION=$(rr version 2>/dev/null || echo "unknown")
-    pass "rr found: $RR_VERSION"
-else
-    fail "rr not found"
-    echo "       Install with: sudo apt install rr"
-    echo "       Or: https://github.com/rr-debugger/rr/releases"
-fi
-
-# --- 3. perf_event_paranoid ---
-echo "[3] perf_event_paranoid (rr requirement)"
-if [[ -f /proc/sys/kernel/perf_event_paranoid ]]; then
-    PARANOID=$(cat /proc/sys/kernel/perf_event_paranoid)
-    if (( PARANOID <= 1 )); then
-        pass "perf_event_paranoid = $PARANOID (≤ 1, rr compatible)"
+    # rr requires hardware PMU counters. WSL2's Hyper-V VM does not
+    # virtualize the PMU, so perf_event_open fails even when
+    # perf_event_paranoid is permissive.  Test by actually trying rr.
+    if rr record --output-trace-dir /tmp/rr-check-$$ true 2>/dev/null; then
+        rm -rf /tmp/rr-check-$$
+        pass "rr $RR_VERSION works (PMU counters available)"
+        RR_AVAILABLE=true
     else
-        fail "perf_event_paranoid = $PARANOID (must be ≤ 1 for rr)"
-        echo "       Fix with: echo 1 | sudo tee /proc/sys/kernel/perf_event_paranoid"
+        rm -rf /tmp/rr-check-$$ 2>/dev/null
+        # Check if this is a WSL2 environment.
+        if grep -qi microsoft /proc/version 2>/dev/null; then
+            warn "rr $RR_VERSION installed but PMU counters unavailable (WSL2 does not virtualize PMU hardware)"
+            echo "       rr requires hardware performance counters that Hyper-V does not expose to the WSL2 VM."
+            echo "       Use debug-runner.sh (GDB) instead. rr-record.sh / rr-replay.sh will not work."
+        else
+            warn "rr $RR_VERSION installed but perf_event_open failed"
+            echo "       Check: /proc/sys/kernel/perf_event_paranoid (must be ≤ 1)"
+            echo "       Check: hardware PMU support (VM guests need PMU virtualization enabled)"
+        fi
     fi
-else
-    warn "Cannot read /proc/sys/kernel/perf_event_paranoid (not on Linux?)"
 fi
 
-# --- 4. Debug symbols in built binaries ---
-echo "[4] Debug symbols"
+# --- 3. Debug symbols in built binaries ---
+echo "[3] Debug symbols"
 
 # Find the workspace root (script may be called from any directory).
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -94,8 +99,8 @@ check_debug_symbols "litebox_broker"
 check_debug_symbols "litebox_tool_executor"
 check_debug_symbols "litebox_test_harness"
 
-# --- 5. Required binaries ---
-echo "[5] Required binaries"
+# --- 4. Required binaries ---
+echo "[4] Required binaries"
 
 check_binary() {
     local binary_name="$1"

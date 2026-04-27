@@ -191,3 +191,107 @@ registry.
 | `run_copilot.sh` | Launches Copilot inside the litebox sandbox |
 | `run_copilot_ipc.sh` | Launches Copilot inside the litebox sandbox over IPC |
 | `run_claude_ipc.sh` | Launches Claude Code inside the litebox sandbox over IPC |
+| `check-debug-env.sh` | Validates debugging prerequisites (GDB, rr, debug symbols) |
+| `debug-runner.sh` | GDB batch wrapper for crash diagnosis and deadlock inspection |
+| `rr-record.sh` | Records a litebox session under rr (requires real PMU hardware) |
+| `rr-replay.sh` | Replays an rr trace with scripted GDB commands |
+| `deadlock-inspect.sh` | Attaches to running runner process(es) and dumps all thread stacks |
+
+## Debugging Litebox
+
+### Architecture
+
+The litebox runner uses **seccomp/SIGSYS** (systrap backend) for syscall
+interception — not ptrace.  This means GDB and rr can debug the runner
+without conflict: GDB ptraces the runner process while seccomp independently
+intercepts guest syscalls via SIGSYS signals.
+
+The runner may spawn **worker host processes** for non-PIE binaries
+(`--worker-exec` via `posix_spawn`) and fork restore (`--fork-restore`).
+Each worker is a separate `litebox_runner_linux_userland` process with its
+own seccomp filter.
+
+```
+litebox_tool_executor
+  ├── litebox_broker              (network proxy, 9P, policy)
+  └── litebox_runner_linux_userland   (main sandbox, seccomp/SIGSYS)
+       ├── [guest code runs in-process]
+       ├── worker host (--worker-exec)     ← non-PIE binary
+       └── worker host (--fork-restore)    ← fork child restore
+```
+
+### GDB batch mode (works everywhere, including WSL2)
+
+`debug-runner.sh` wraps any litebox entry point under `rust-gdb -batch`.
+On crash it captures a full backtrace; on deadlock you get all thread stacks.
+
+```bash
+# Debug the runner directly with a rootfs
+bash dev_tools/debug-runner.sh --target runner --rootfs /path/to/rootfs -- /program args...
+
+# Debug tool_executor (includes broker + runner)
+bash dev_tools/debug-runner.sh --target tool-executor -- --rootfs /path/to/rootfs --record-baseline -- /program
+
+# Debug the integration test
+bash dev_tools/debug-runner.sh --target integration
+
+# Debug the test harness inside the runner
+bash dev_tools/debug-runner.sh --target harness --rootfs /path/to/rootfs
+```
+
+### Deadlock inspection
+
+When a test hangs, attach to the running runner(s) without killing them:
+
+```bash
+bash dev_tools/deadlock-inspect.sh           # find and inspect all runners
+bash dev_tools/deadlock-inspect.sh <PID>     # inspect a specific process
+```
+
+### rr record/replay (requires real PMU hardware — NOT available on WSL2)
+
+rr provides deterministic record/replay with time-travel debugging.  It
+records the entire process tree (parent runner + all worker hosts) in a
+single trace.  However, **rr requires hardware performance counters (PMU)**
+that must be virtualized by the hypervisor.
+
+**WSL2 does not work with rr.**  Microsoft's Hyper-V lightweight utility VM
+does not virtualize the PMU.  The `perf_event_open` syscall returns ENOENT
+and `rr record` fails with:
+
+```
+[FATAL] Unable to open performance counter with 'perf_event_open'
+```
+
+This is a hypervisor-level limitation with no user-side workaround.  There is
+no `.wslconfig` setting to enable PMU passthrough.  The WSL2 kernel has
+`CONFIG_PERF_EVENTS=y` compiled in, but the hardware counters are simply not
+exposed by Hyper-V.
+
+rr works on:
+- Bare metal Linux
+- VMs with PMU virtualization enabled (KVM with `-cpu host`, VMware with
+  perf counter virtualization, Hyper-V with `Set-VMProcessor -Perfmon @("pmu")`)
+
+If you have a compatible environment, the scripts work as follows:
+
+```bash
+# Record a test run
+TRACE=$(bash dev_tools/rr-record.sh --target harness --rootfs /path/to/rootfs)
+
+# Replay with a breakpoint
+bash dev_tools/rr-replay.sh "$TRACE" --batch --break "litebox_shim_linux::syscalls::pipe::do_pipe2"
+
+# Interactive time-travel debugging
+bash dev_tools/rr-replay.sh "$TRACE" --interactive
+```
+
+### Verifying your environment
+
+```bash
+bash dev_tools/check-debug-env.sh
+```
+
+This checks for GDB, rr + PMU availability, debug symbols, and required
+binaries.  GDB is required; rr is optional (and will show a warning on WSL2
+explaining why it cannot work).
