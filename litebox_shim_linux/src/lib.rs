@@ -550,6 +550,16 @@ impl<FS: ShimFS> LinuxShim<FS> {
         self.global.net.lock().has_pending_closes()
     }
 
+    /// Re-send port-listen notifications for all active listen sockets.
+    ///
+    /// Must be called after fork-restore: the child worker inherits listen
+    /// sockets from the parent's snapshot but the parent already registered
+    /// them through ITS IPC. This re-registers through the child's IPC so
+    /// the broker routes inbound connections to the correct worker.
+    pub fn reannounce_listen_ports(&self) {
+        self.global.net.lock().reannounce_listen_ports();
+    }
+
     /// Establish a TCP connection to the given address.
     ///
     /// Returns a [`transport::ShimTransport`] that can be used as a

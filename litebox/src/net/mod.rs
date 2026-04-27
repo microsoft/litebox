@@ -1441,6 +1441,31 @@ where
         Ok(())
     }
 
+    /// Re-send port-listen notifications for all active listen sockets.
+    ///
+    /// Called after fork-restore: the child worker inherits listen sockets
+    /// from the parent's snapshot, but the parent already sent the port
+    /// notifications through ITS IPC before the child's IPC existed. The
+    /// broker's port router therefore points to the parent's worker. This
+    /// method re-registers every active listen port through the CHILD's
+    /// IPC so the broker routes inbound connections to the correct worker.
+    pub fn reannounce_listen_ports(&self) {
+        let table = self.litebox.descriptor_table();
+        for (_, entry) in table.iter::<Network<Platform>>() {
+            if let ProtocolSpecific::Tcp(tcp) = &entry.entry.specific {
+                if let Some(ss) = &tcp.server_socket {
+                    let port = ss.ip_listen_endpoint.port;
+                    if port != 0 {
+                        let _ = self
+                            .device
+                            .platform
+                            .send_port_listen_notification(port, true);
+                    }
+                }
+            }
+        }
+    }
+
     /// Accept a new incoming connection on a listening socket.
     ///
     /// If `peer` is provided, it is filled with the remote address of the accepted connection.

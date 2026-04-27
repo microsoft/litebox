@@ -1167,6 +1167,14 @@ fn run_fork_restore(cli_args: CliArgs) -> Result<()> {
             &mux_streams,
             &local_pipes,
         )?;
+
+        // Re-register inherited listen ports through this worker's IPC.
+        // The parent worker already sent port-listen notifications before
+        // the fork, but those went through the parent's IPC — the broker
+        // routes to the parent. Now that the child's IPC is active, re-send
+        // so the broker routes inbound connections to the correct worker.
+        shim.reannounce_listen_ports();
+
         run_program(
             program,
             shutdown,
