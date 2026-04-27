@@ -323,6 +323,12 @@ async fn run_tests(self_exe: &str, filter: Option<&str>) -> Vec<TestResult> {
         platform_fixes::run(&mut runner).await;
     }
 
+    // === Cross-worker first-connect tests ===
+    if should_run("xconn") {
+        eprintln!("[coord] === Cross-Worker First Connect Tests ===");
+        platform_fixes::cross_worker_first_connect_tests(&mut runner).await;
+    }
+
     // === TCP Stress Tests ===
     if should_run("tcp") {
         eprintln!("[coord] === TCP Stress Tests ===");

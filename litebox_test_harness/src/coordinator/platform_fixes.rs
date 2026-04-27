@@ -297,9 +297,120 @@ pub(crate) async fn run(r: &mut TestRunner) {
     epoll_socket_tests(r).await;
     loopback_tcp_tests(r).await;
     bash_fork_exec_tests(r).await;
+    cross_worker_first_connect_tests(r).await;
     // PID visibility tests run last — KP.proc_child can deadlock agent B
     // under litebox, causing all subsequent B-targeted tests to timeout.
     pid_visibility_tests(r).await;
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// XCONN: cross-worker TCP — first connection must succeed
+// ═══════════════════════════════════════════════════════════════════
+
+/// Reproduces the VS Code exec server "Connection closed" failure.
+///
+/// Agent A starts a TCP echo server (NetListen). Agent B connects
+/// to it. In litebox, this goes through the cross-worker TCP bridge.
+/// The bug: the init proxy and the worker proxy BOTH try to bridge the
+/// connection, creating duplicate smoltcp sockets with colliding source
+/// ports. The first bridge fails (SynSent → Closed), VS Code sees
+/// "Connection closed".
+///
+/// The test verifies that the FIRST connection attempt succeeds —
+/// not just that "some" connection eventually works.
+pub(crate) async fn cross_worker_first_connect_tests(r: &mut TestRunner) {
+    eprintln!("[platform] === XCONN: cross-worker first connect ===");
+
+    // Agent A listens.
+    let port = 19900u16;
+    let listen_resp = r.send("A", Command::NetListen { port }).await;
+    if !matches!(&listen_resp, Response::Listening { .. }) {
+        r.record(
+            "XCONN.cross_first",
+            "B",
+            false,
+            &format!("listen failed: {listen_resp:?}"),
+        );
+        return;
+    }
+
+    // Agent B connects — single connection, must succeed on first try.
+    let conn_resp = r
+        .send(
+            "B",
+            Command::NetConnect {
+                addr: format!("127.0.0.1:{port}"),
+                data: "first_connect".into(),
+            },
+        )
+        .await;
+    let ok = matches!(&conn_resp, Response::Connected { echo } if echo == "first_connect");
+    r.record(
+        "XCONN.cross_first",
+        "B",
+        ok,
+        &format!("{conn_resp:?}"),
+    );
+
+    // Same test but agent AA (deeper worker) connects to agent B's listener.
+    let port2 = 19901u16;
+    let listen_resp = r.send("B", Command::NetListen { port: port2 }).await;
+    if !matches!(&listen_resp, Response::Listening { .. }) {
+        r.record(
+            "XCONN.deep_cross",
+            "AA",
+            false,
+            &format!("listen on B failed: {listen_resp:?}"),
+        );
+    } else {
+        let conn_resp = r
+            .send(
+                "AA",
+                Command::NetConnect {
+                    addr: format!("127.0.0.1:{port2}"),
+                    data: "deep_cross".into(),
+                },
+            )
+            .await;
+        let ok = matches!(&conn_resp, Response::Connected { echo } if echo == "deep_cross");
+        r.record(
+            "XCONN.deep_cross",
+            "AA",
+            ok,
+            &format!("{conn_resp:?}"),
+        );
+        let _ = r.send("B", Command::NetUnlisten { port: port2 }).await;
+    }
+
+    // Rapid sequential: 3 connections from B to A's listener.
+    // Each must succeed on first try.
+    let mut all_ok = true;
+    for i in 0..3 {
+        let conn_resp = r
+            .send(
+                "B",
+                Command::NetConnect {
+                    addr: format!("127.0.0.1:{port}"),
+                    data: format!("seq_{i}"),
+                },
+            )
+            .await;
+        if !matches!(&conn_resp, Response::Connected { echo } if echo == &format!("seq_{i}")) {
+            all_ok = false;
+            r.record(
+                "XCONN.cross_seq_x3",
+                "B",
+                false,
+                &format!("connection {i} failed: {conn_resp:?}"),
+            );
+            break;
+        }
+    }
+    if all_ok {
+        r.record("XCONN.cross_seq_x3", "B", true, "3/3 sequential OK");
+    }
+
+    let _ = r.send("A", Command::NetUnlisten { port }).await;
 }
 
 // ═══════════════════════════════════════════════════════════════════

@@ -63,6 +63,24 @@ const HANDSHAKE_VERSION: u16 = 1;
 /// (guest_src_ip, guest_src_port, dst_ip, dst_port)
 type TcpFlowKey = ([u8; 4], u16, [u8; 4], u16);
 
+/// Allocate a unique ephemeral source port for smoltcp `connect()`.
+///
+/// Uses a global atomic counter so that all proxy threads (one per worker)
+/// get distinct ports. Without this, two proxies could pick the same source
+/// port for bridges in the same smoltcp instance, causing the second
+/// `connect()` to fail with a duplicate-socket RST.
+fn alloc_inbound_src_port() -> u16 {
+    static COUNTER: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(49152);
+    let port = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if port < 49152 {
+        // Wrapped around — reset to base. Extremely unlikely in practice.
+        COUNTER.store(49153, std::sync::atomic::Ordering::Relaxed);
+        49152
+    } else {
+        port
+    }
+}
+
 /// State for an active TCP bridge between smoltcp and a host socket.
 struct TcpBridge {
     smoltcp_handle: SocketHandle,
@@ -858,7 +876,6 @@ fn run_inner(
 
     // Inbound TCP port forwards: host listeners that relay to guest ports.
     let mut inbound_listeners: Vec<InboundForward> = Vec::new();
-    let mut next_inbound_src_port: u16 = 49152; // ephemeral port range
 
     for (host_port, guest_ip, guest_port) in &inbound_forwards {
         match std::net::TcpListener::bind(format!("0.0.0.0:{host_port}")) {
@@ -1472,11 +1489,7 @@ fn run_inner(
                         tcp_socket.set_nagle_enabled(false);
                         let handle = sockets.add(tcp_socket);
 
-                        let src_port = next_inbound_src_port;
-                        next_inbound_src_port = next_inbound_src_port.wrapping_add(1);
-                        if next_inbound_src_port < 49152 {
-                            next_inbound_src_port = 49152;
-                        }
+                        let src_port = alloc_inbound_src_port();
 
                         let sock = sockets.get_mut::<smoltcp::socket::tcp::Socket>(handle);
                         let local =
@@ -1528,11 +1541,7 @@ fn run_inner(
                 tcp_socket.set_nagle_enabled(false);
                 let handle = sockets.add(tcp_socket);
 
-                let src_port = next_inbound_src_port;
-                next_inbound_src_port = next_inbound_src_port.wrapping_add(1);
-                if next_inbound_src_port < 49152 {
-                    next_inbound_src_port = 49152;
-                }
+                let src_port = alloc_inbound_src_port();
 
                 let sock = sockets.get_mut::<smoltcp::socket::tcp::Socket>(handle);
                 let local = smoltcp::wire::IpEndpoint::new(IpAddress::Ipv4(BROKER_IP), src_port);
