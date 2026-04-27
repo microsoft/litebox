@@ -2091,18 +2091,25 @@ unsafe extern "C" fn exception_signal_handler(
         let sysno = context.uc_mcontext.gregs[eax_idx];
         context.uc_mcontext.gregs[eax_idx] = i64::from(-libc::EINVAL);
         // Signal-safe: format on the stack via arrayvec (no heap allocation).
-        let mut buf = arrayvec::ArrayString::<64>::new();
+        let mut buf = arrayvec::ArrayString::<320>::new();
         if sysno == libc::SYS_openat {
             #[cfg(target_arch = "x86_64")]
             let rsi = context.uc_mcontext.gregs[libc::REG_RSI as usize] as *const i8;
             let c_path = unsafe { core::ffi::CStr::from_ptr(rsi) };
             // libc may call `openat` for certain files that we can ignore, e.g., /proc/sys/vm/overcommit_memory.
             // Log the paths in case we need to allow some of them in the future.
-            writeln!(buf, "INFO: openat with {c_path:?} is not allowed").unwrap();
+            let _ = writeln!(buf, "INFO: openat with {c_path:?} is not allowed");
         } else {
-            writeln!(buf, "WARNING: disallowed syscall invoked: {sysno}").unwrap();
+            let _ = writeln!(buf, "WARNING: disallowed syscall invoked: {sysno}");
         }
-        let _ = unsafe { libc::write(libc::STDERR_FILENO, buf.as_ptr().cast(), buf.len()) };
+        let _ = unsafe {
+            syscalls::syscall3(
+                syscalls::Sysno::write,
+                libc::STDERR_FILENO as usize,
+                buf.as_ptr() as usize,
+                buf.len(),
+            )
+        };
         return;
     }
 
