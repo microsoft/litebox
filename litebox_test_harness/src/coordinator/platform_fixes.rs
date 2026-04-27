@@ -296,9 +296,97 @@ pub(crate) async fn run(r: &mut TestRunner) {
     pipe_nonblock_tests(r).await;
     epoll_socket_tests(r).await;
     loopback_tcp_tests(r).await;
+    bash_fork_exec_tests(r).await;
     // PID visibility tests run last — KP.proc_child can deadlock agent B
     // under litebox, causing all subsequent B-targeted tests to timeout.
     pid_visibility_tests(r).await;
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// BASH: bash fork+exec of child commands
+// ═══════════════════════════════════════════════════════════════════
+
+/// Reproduces the VS Code bootstrap failure: the VS Code Remote-SSH
+/// extension pipes a script to `ssh host sh`. The shell (bash) runs
+/// external commands via fork+exec. In litebox, the runner resolves
+/// relative program names (e.g., `bash` → `/usr/bin/bash`) for the
+/// initial load, but when the shell itself forks+exec's children,
+/// the child worker receives the guest exec path which must be
+/// resolvable via the 9P filesystem.
+///
+/// This test verifies that bash can fork+exec external commands
+/// (ls, cat, uname) — the same commands the VS Code bootstrap runs
+/// after spawning the CLI server.
+pub(crate) async fn bash_fork_exec_tests(r: &mut TestRunner) {
+    eprintln!("[platform] === BASH fork+exec tests ===");
+
+    for &agent in &["A", "B"] {
+        // Test 1: bash -c running an external command (ls)
+        let resp = r
+            .send(
+                agent,
+                exec(vec![
+                    "bash".into(),
+                    "-c".into(),
+                    "ls / > /dev/null && echo LS_OK".into(),
+                ]),
+            )
+            .await;
+        let pass = matches!(
+            &resp,
+            Response::ExecResult { exit_code: 0, stdout, .. } if stdout.contains("LS_OK")
+        );
+        r.record(
+            &format!("BASH.fork_ls.{agent}"),
+            agent,
+            pass,
+            &format!("{resp:?}"),
+        );
+
+        // Test 2: bash -c with command substitution (forks subshell)
+        let resp = r
+            .send(
+                agent,
+                exec(vec![
+                    "bash".into(),
+                    "-c".into(),
+                    "echo HOST=$(cat /etc/hostname)".into(),
+                ]),
+            )
+            .await;
+        let pass = matches!(
+            &resp,
+            Response::ExecResult { exit_code: 0, stdout, .. } if stdout.starts_with("HOST=")
+        );
+        r.record(
+            &format!("BASH.fork_subst.{agent}"),
+            agent,
+            pass,
+            &format!("{resp:?}"),
+        );
+
+        // Test 3: bash -c with background + foreground (VS Code pattern)
+        let resp = r
+            .send(
+                agent,
+                exec(vec![
+                    "bash".into(),
+                    "-c".into(),
+                    "sleep 0.1 & cat /etc/hostname > /dev/null; echo BG_FG_OK".into(),
+                ]),
+            )
+            .await;
+        let pass = matches!(
+            &resp,
+            Response::ExecResult { exit_code: 0, stdout, .. } if stdout.contains("BG_FG_OK")
+        );
+        r.record(
+            &format!("BASH.fork_bg_fg.{agent}"),
+            agent,
+            pass,
+            &format!("{resp:?}"),
+        );
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════
