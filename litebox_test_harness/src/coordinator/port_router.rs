@@ -317,4 +317,167 @@ pub(crate) async fn run(r: &mut TestRunner) {
     fork_cross_tests(r).await;
     fork_interleave_tests(r).await;
     fork_background_tests(r).await;
+    fork_listen_inherit_tests(r).await;
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// PR.listen_inherit: reproduces VS Code exec server failure
+// ═══════════════════════════════════════════════════════════════════
+
+/// Exact reproduction of the VS Code bootstrap failure:
+/// 1. Parent process calls listen() on a port
+/// 2. Parent forks a child that INHERITS the listen socket fd
+/// 3. The child's litebox worker re-registers the port with the broker
+/// 4. Child exits → child worker dies → port route deregistered
+/// 5. Cross-worker connection to the port fails (SynSent → Closed)
+///
+/// Uses the `tcp-listen-fork` subcommand which does a real libc::fork()
+/// to create a child with inherited listen socket. The child sleeps 3s
+/// (enough for network stack init) then exits. After the child exits,
+/// a cross-worker connection is attempted.
+pub(crate) async fn fork_listen_inherit_tests(r: &mut TestRunner) {
+    eprintln!("[pr] === PR.listen_inherit: VS Code fork reproduction ===");
+
+    // Agent A starts tcp-listen-fork in background. It listens on port
+    // 18300, forks a child that sleeps 3s, waits for the child, then
+    // accepts a connection and echoes.
+    let port = 18300u16;
+
+    // Start the tcp-listen-fork server as a background exec on agent A.
+    let bg_resp = r
+        .send(
+            "A",
+            Command::Exec {
+                args: vec![
+                    r.self_exe.clone(),
+                    "tcp-listen-fork".into(),
+                    port.to_string(),
+                    "3".into(), // child sleeps 3s
+                ],
+                timeout_secs: Some(30),
+                stdin: None,
+                background: false,
+            },
+        )
+        .await;
+
+    // The exec blocks until accept+echo completes (foreground). We need
+    // it to run in background while we connect from agent B.
+    // Use background=true instead.
+    // Actually, we need to orchestrate: start the server in background,
+    // wait for the child to exit (~4s), then connect from B.
+    // Let's restart with background=true.
+    let bg_resp = r
+        .send(
+            "A",
+            Command::Exec {
+                args: vec![
+                    r.self_exe.clone(),
+                    "tcp-listen-fork".into(),
+                    port.to_string(),
+                    "3".into(),
+                ],
+                timeout_secs: None,
+                stdin: None,
+                background: true,
+            },
+        )
+        .await;
+    let bg_pid = match &bg_resp {
+        Response::Background { pid } => Some(*pid),
+        _ => {
+            r.record(
+                "PR.listen_inherit_self",
+                "A",
+                false,
+                &format!("bg spawn failed: {bg_resp:?}"),
+            );
+            return;
+        }
+    };
+
+    // Wait for: listen (~0s) + child fork+sleep (3s) + child exit (~0s)
+    // + a margin for the network stack to process everything.
+    tokio::time::sleep(tokio::time::Duration::from_secs(6)).await;
+
+    // Same-worker connection from agent A.
+    let conn_resp = r
+        .send(
+            "A",
+            Command::NetConnect {
+                addr: format!("127.0.0.1:{port}"),
+                data: "inherit_self".into(),
+            },
+        )
+        .await;
+    let self_ok =
+        matches!(&conn_resp, Response::Connected { echo } if echo == "inherit_self");
+    r.record_xfail(
+        "PR.listen_inherit_self",
+        "A",
+        self_ok,
+        "same-worker loopback after fork+wait has echo data loss",
+        &format!("{conn_resp:?}"),
+    );
+
+    // Clean up.
+    if let Some(pid) = bg_pid {
+        let _ = r.send("A", Command::Kill { pid }).await;
+    }
+
+    // Cross-worker test: same pattern but connect from B.
+    let bg_resp = r
+        .send(
+            "A",
+            Command::Exec {
+                args: vec![
+                    r.self_exe.clone(),
+                    "tcp-listen-fork".into(),
+                    (port + 1).to_string(),
+                    "3".into(),
+                ],
+                timeout_secs: None,
+                stdin: None,
+                background: true,
+            },
+        )
+        .await;
+    let bg_pid = match &bg_resp {
+        Response::Background { pid } => Some(*pid),
+        _ => {
+            r.record(
+                "PR.listen_inherit_cross",
+                "B",
+                false,
+                &format!("bg spawn failed: {bg_resp:?}"),
+            );
+            return;
+        }
+    };
+
+    tokio::time::sleep(tokio::time::Duration::from_secs(6)).await;
+
+    // Cross-worker connection from agent B — this is the VS Code pattern:
+    // a different SSH session (different worker) connects to the CLI's port.
+    let conn_resp = r
+        .send(
+            "B",
+            Command::NetConnect {
+                addr: format!("127.0.0.1:{}", port + 1),
+                data: "inherit_cross".into(),
+            },
+        )
+        .await;
+    let cross_ok =
+        matches!(&conn_resp, Response::Connected { echo } if echo == "inherit_cross");
+    r.record(
+        "PR.listen_inherit_cross",
+        "B",
+        cross_ok,
+        &format!("{conn_resp:?}"),
+    );
+
+    if let Some(pid) = bg_pid {
+        let _ = r.send("A", Command::Kill { pid }).await;
+    }
 }
