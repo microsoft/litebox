@@ -518,8 +518,9 @@ fn run_host_tests(debug: &Path, ws_root: &Path) {
                 eprintln!("  {name}: {detail}");
             }
         }
-        // Don't panic — host tests are new and may have known issues.
-        // Log failures but don't block the overall test run.
-        eprintln!("WARNING: host-side tests had failures (non-blocking for now)");
+        panic!(
+            "[host-test] {fail_count} host-side test(s) failed. \
+             See details above."
+        );
     }
 }
