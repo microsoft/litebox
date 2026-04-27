@@ -12,6 +12,7 @@ use bitflags::bitflags;
 use core::ffi::c_uint;
 use core::num::NonZeroUsize;
 
+pub mod backend;
 pub mod devices;
 pub mod errors;
 pub mod in_mem;

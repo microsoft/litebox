@@ -11,6 +11,9 @@ use super::FileSystem;
 
 use thiserror::Error;
 
+// XXX(jayb): We probably need to introduce a notion of `Stale` to many/most of these errors, in
+// order to more correctly support network-attached file systems.
+
 /// Possible errors from [`FileSystem::open`]
 #[non_exhaustive]
 #[derive(Error, Debug)]
@@ -201,6 +204,16 @@ pub enum ReadDirError {
 pub enum FileStatusError {
     #[error("fd has been closed already")]
     ClosedFd,
+    #[error("I/O error")]
+    Io,
+    #[error(transparent)]
+    PathError(#[from] PathError),
+}
+
+/// Possible errors from a backend walk
+#[non_exhaustive]
+#[derive(Error, Debug)]
+pub enum WalkError {
     #[error("I/O error")]
     Io,
     #[error(transparent)]
