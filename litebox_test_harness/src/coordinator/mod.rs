@@ -8,6 +8,7 @@ pub(crate) mod file_tcp;
 pub(crate) mod fork_matrix;
 pub(crate) mod matrix;
 pub(crate) mod platform_fixes;
+pub(crate) mod port_router;
 pub(crate) mod special_cases;
 pub(crate) mod tcp_stress;
 pub(crate) mod vscode;
@@ -332,6 +333,12 @@ async fn run_tests(self_exe: &str, filter: Option<&str>) -> Vec<TestResult> {
     if should_run("ft") {
         eprintln!("[coord] === File+TCP Combined Tests ===");
         file_tcp::run(&mut runner).await;
+    }
+
+    // === Port Router Fork Tests ===
+    if should_run("pr") {
+        eprintln!("[coord] === Port Router Fork Tests ===");
+        port_router::run(&mut runner).await;
     }
 
     // === VS Code Reproduction Tests ===
