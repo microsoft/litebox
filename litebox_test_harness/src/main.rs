@@ -8,6 +8,7 @@
 //! - `agent` — command executor: reads commands from stdin, responds on stdout
 
 mod agent;
+mod agent_listen;
 mod coordinator;
 mod protocol;
 
@@ -95,6 +96,13 @@ fn main() {
         }
         "agent" => {
             agent::run(self_exe);
+        }
+        "agent-listen" => {
+            // TCP variant of agent mode. Listens on a TCP port, accepts
+            // one connection, and runs the same agent protocol over that
+            // connection (by dup2-ing the socket onto stdin/stdout).
+            let port: u16 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(9090);
+            agent_listen::run(self_exe, port);
         }
         "echo-test" => {
             println!("ECHO_TEST_OK");
