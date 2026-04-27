@@ -414,11 +414,10 @@ pub(crate) async fn fork_listen_inherit_tests(r: &mut TestRunner) {
         .await;
     let self_ok =
         matches!(&conn_resp, Response::Connected { echo } if echo == "inherit_self");
-    r.record_xfail(
+    r.record(
         "PR.listen_inherit_self",
         "A",
         self_ok,
-        "same-worker loopback after fork+wait has echo data loss",
         &format!("{conn_resp:?}"),
     );
 
