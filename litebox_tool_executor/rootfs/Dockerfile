@@ -131,3 +131,17 @@ RUN mkdir -p /root/.vscode-server/data/logs \
 
 EXPOSE 22
 EXPOSE 9999
+
+# === Stage 2c: VS Code Server WITHOUT litebox (native baseline) ===
+# Verifies the Docker image works without litebox so SSH + VS Code
+# issues can be attributed to litebox vs. environment problems.
+#
+# Usage:
+#   docker build --target litebox-vscode-native -t litebox-vscode-native \
+#     -f litebox_tool_executor/rootfs/Dockerfile .
+#   docker run --rm -p 2223:22 litebox-vscode-native
+#   # then in VS Code: Remote-SSH → localhost:2223 (user: root, empty password)
+FROM litebox-vscode AS litebox-vscode-native
+
+EXPOSE 22
+CMD ["/usr/sbin/dropbear", "-F", "-E", "-B", "-R", "-p", "22"]

@@ -155,27 +155,70 @@ fn create_audit_log_file(dir: &std::path::Path) -> anyhow::Result<std::path::Pat
     })?;
 
     // Generate a timestamp-based filename: YYYY-MM-DDTHH-MM-SS.jsonl
-    // Use seconds since epoch as a fallback-safe approach.
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default();
     let secs = now.as_secs();
-    // Convert to approximate human-readable (good enough for filenames).
-    let days = secs / 86400;
-    let years = 1970 + days / 365; // approximate
-    let day_of_year = days % 365;
-    let month = day_of_year / 30 + 1;
-    let day = day_of_year % 30 + 1;
+    let (year, month, day) = civil_from_days((secs / 86400) as i64);
     let time_of_day = secs % 86400;
     let hour = time_of_day / 3600;
     let minute = (time_of_day % 3600) / 60;
     let second = time_of_day % 60;
     let filename =
-        format!("{years:04}-{month:02}-{day:02}T{hour:02}-{minute:02}-{second:02}.jsonl");
+        format!("{year:04}-{month:02}-{day:02}T{hour:02}-{minute:02}-{second:02}.jsonl");
 
     let path = dir.join(filename);
     eprintln!("Audit log: {}", path.display());
     Ok(path)
+}
+
+/// Convert days since Unix epoch to (year, month, day).
+/// Algorithm from Howard Hinnant's `civil_from_days`.
+fn civil_from_days(days: i64) -> (i64, u64, u64) {
+    let z = days + 719468;
+    let era = if z >= 0 { z } else { z - 146096 } / 146097;
+    let doe = (z - era * 146097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    (y, m as u64, d as u64)
+}
+
+/// Remove old log files (.jsonl, .broker.log) from a directory, keeping only
+/// the most recent session. Prevents multi-GB audit logs from filling disk
+/// across container restarts.
+fn cleanup_old_logs(dir: &std::path::Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let mut files: Vec<(std::time::SystemTime, std::path::PathBuf)> = entries
+        .filter_map(|e| {
+            let e = e.ok()?;
+            let name = e.file_name().to_string_lossy().to_string();
+            if name.ends_with(".jsonl") || name.ends_with(".broker.log") {
+                let mtime = e.metadata().ok()?.modified().ok()?;
+                Some((mtime, e.path()))
+            } else {
+                None
+            }
+        })
+        .collect();
+    if files.len() <= 2 {
+        return; // One .jsonl + one .broker.log = current session
+    }
+    files.sort_by_key(|(mtime, _)| *mtime);
+    // Remove all but the 2 newest (current session's .jsonl and .broker.log).
+    for (_, path) in &files[..files.len().saturating_sub(2)] {
+        if let Err(e) = std::fs::remove_file(path) {
+            eprintln!("Warning: could not remove old log {}: {e}", path.display());
+        } else {
+            eprintln!("Cleaned up old log: {}", path.display());
+        }
+    }
 }
 
 /// Print build timestamps of this binary, the runner, and the broker for diagnostics.
@@ -663,6 +706,8 @@ fn vscode_server(cli: &Cli, audit_log_file: Option<&std::path::Path>) -> anyhow:
         Some(p)
     } else {
         let dir = std::env::temp_dir().join("litebox-vscode-server-logs");
+        // Clean up old log files from previous sessions to avoid filling disk.
+        cleanup_old_logs(&dir);
         auto_audit = create_audit_log_file(&dir)?;
         Some(&auto_audit)
     };
@@ -685,7 +730,6 @@ fn vscode_server(cli: &Cli, audit_log_file: Option<&std::path::Path>) -> anyhow:
     //   -B  allow blank passwords
     //   -R  create host keys if missing
     //   -p 22  listen on port 22 inside the sandbox
-    let mut cmd = runner_command(cli, audit, Some(&broker))?;
 
     // Detect WSL2 IP for connection instructions.
     let wsl_ip = std::process::Command::new("hostname")
@@ -735,32 +779,11 @@ fn vscode_server(cli: &Cli, audit_log_file: Option<&std::path::Path>) -> anyhow:
     eprintln!("==============================================");
     eprintln!();
 
-    // Pre-warm: run the code-server startup inside the dropbear sandbox
-    // as a background process, so it shares the same PID namespace.
-    // The dropbear init command becomes a shell script that starts both.
     let mut cmd = runner_command(cli, audit, Some(&broker))?;
 
-    // Find the code-server path for pre-warming.
-    let vscode_dir = cli.rootfs.join("root/.vscode-server/cli/servers");
-    let prewarm_server = std::fs::read_dir(&vscode_dir).ok().and_then(|entries| {
-        entries
-            .filter_map(|e| {
-                let e = e.ok()?;
-                let name = e.file_name().to_string_lossy().to_string();
-                if name.starts_with("Stable-") && e.path().join("server/bin/code-server").exists() {
-                    let mtime = e.metadata().ok()?.modified().ok()?;
-                    Some((mtime, name))
-                } else {
-                    None
-                }
-            })
-            .max_by_key(|(mtime, _)| *mtime)
-            .map(|(_, name)| name)
-    });
-
     // Start dropbear SSH server. VS Code's install script will start the
-    // code-server when it connects — no pre-warming needed since the
-    // CLI and server are pre-installed in the Docker image.
+    // code-server when it connects — the CLI and server are pre-installed
+    // in the Docker image, so no pre-warming is needed.
     cmd.args(["/usr/sbin/dropbear", "-F", "-E", "-B", "-R", "-p", "22"]);
 
     cmd.stdin(std::process::Stdio::null())
