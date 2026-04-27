@@ -196,7 +196,7 @@ pub(super) async fn vscode_bootstrap_replay(r: &mut TestRunner) {
                     "-c".into(),
                     "if [ -x /root/.vscode-server/code ]; then /root/.vscode-server/code --version 2>/dev/null | grep -oP 'commit \\K[a-f0-9]{40}'; else echo NOT_FOUND; fi".into(),
                 ],
-                10,
+                60,
             ),
         )
         .await;
@@ -354,14 +354,14 @@ pub(super) async fn vscode_bootstrap_replay(r: &mut TestRunner) {
          --parent-process-id $$ \
          --on-host 0.0.0.0 > $LOG 2>&1 & \
          CLI_PID=$!; \
-         for i in $(seq 1 15); do \
+         for i in $(seq 1 60); do \
            PORT=$(grep -oP 'Listening on [^:]+:\\K[0-9]+' $LOG 2>/dev/null); \
            if [ -n \"$PORT\" ]; then break; fi; \
            sleep 1; \
          done; \
          echo VSI_PORT=$PORT; \
          echo VSI_CLI_PID=$CLI_PID; \
-         sleep 30"
+         sleep 60"
     );
     let resp = r
         .send(
@@ -389,7 +389,8 @@ pub(super) async fn vscode_bootstrap_replay(r: &mut TestRunner) {
     }
 
     // Wait for the CLI to start and report its port.
-    tokio::time::sleep(Duration::from_secs(10)).await;
+    // The syscall rewriter takes ~30s for the 100MB code binary.
+    tokio::time::sleep(Duration::from_secs(45)).await;
 
     // Read the port from the background process's output.
     let resp = r
