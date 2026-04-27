@@ -1299,7 +1299,16 @@ where
                     unimplemented!()
                 }
                 socket_handle.tcp_mut().server_socket = Some(TcpServerSpecific {
-                    ip_listen_endpoint: Self::ip_listen_endpoint_v4(*addr, new_port),
+                    // Always listen on any IP (addr: None) regardless of what the
+                    // guest specified.  The runner's smoltcp has a single interface
+                    // (10.0.0.2/24).  Cross-worker inbound connections arrive with
+                    // dst=10.0.0.2, so a listen bound to 127.0.0.1 would never
+                    // match, causing RST.  Using None (INADDR_ANY) ensures all
+                    // inbound SYN packets match the listen socket.
+                    ip_listen_endpoint: smoltcp::wire::IpListenEndpoint {
+                        addr: None,
+                        port: new_port,
+                    },
                     backlog: None,
                     socket_set_handles: vec![],
                 });

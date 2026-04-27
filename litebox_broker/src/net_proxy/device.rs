@@ -319,6 +319,31 @@ pub fn parse_tcp_syn(packet: &[u8]) -> Option<([u8; 4], u16, [u8; 4], u16)> {
 /// Parsed UDP header fields: (src_ip, src_port, dst_ip, dst_port, payload_offset, payload_len).
 pub type UdpHeader = ([u8; 4], u16, [u8; 4], u16, usize, usize);
 
+/// Parse TCP source port, destination port, and flags from an IPv4 packet.
+/// Returns `(src_port, dst_port, flags)`.
+pub fn parse_tcp_flags(packet: &[u8]) -> Option<(u16, u16, u8)> {
+    if packet.len() < 40 {
+        return None;
+    }
+    let version = packet[0] >> 4;
+    if version != 4 {
+        return None;
+    }
+    let protocol = packet[9];
+    if protocol != 6 {
+        return None;
+    }
+    let ihl = (packet[0] & 0x0F) as usize * 4;
+    if packet.len() < ihl + 14 {
+        return None;
+    }
+    let tcp = &packet[ihl..];
+    let src_port = u16::from_be_bytes([tcp[0], tcp[1]]);
+    let dst_port = u16::from_be_bytes([tcp[2], tcp[3]]);
+    let flags = tcp[13];
+    Some((src_port, dst_port, flags))
+}
+
 /// Parse an IPv4+UDP packet header.
 pub fn parse_udp(packet: &[u8]) -> Option<UdpHeader> {
     if packet.len() < 28 {

@@ -945,6 +945,17 @@ fn run_inner(
         let mut suppress_from_smoltcp = false;
         if let Some(len) = device.rx_len {
             let packet = &device.rx_buf[..len];
+
+            // Diagnostic: detect RST packets from the runner.
+            if let Some((src_port, dst_port, flags)) = device::parse_tcp_flags(packet) {
+                if flags & 0x04 != 0 {
+                    // RST flag set
+                    warn!(
+                        "RST packet received: src_port={src_port} dst_port={dst_port} flags=0x{flags:02x}"
+                    );
+                }
+            }
+
             // TCP SYN dispatch.
             if let Some((src_ip, src_port, dst_ip, dst_port)) = device::parse_tcp_syn(packet) {
                 let dest_ipv4 = Ipv4Addr::from(dst_ip);
@@ -1178,9 +1189,38 @@ fn run_inner(
         if suppress_from_smoltcp {
             device.rx_len = None;
         }
+
+        // Diagnostic: snapshot SynSent bridges before iface.poll() so we can
+        // detect transitions caused by incoming packets (e.g. RST from runner).
+        let pre_poll_synsent: Vec<(usize, std::net::SocketAddr)> = tcp_bridges
+            .iter()
+            .enumerate()
+            .filter(|(_, b)| {
+                let s: &tcp::Socket = sockets.get(b.smoltcp_handle);
+                s.state() == tcp::State::SynSent
+            })
+            .map(|(i, b)| (i, b.dest))
+            .collect();
+
+        let had_rx = device.rx_len.is_some();
         iface.poll(smoltcp_now, &mut device, &mut sockets);
         // Clear staged packet after poll — enforce single-consumption.
         device.rx_len = None;
+
+        // Diagnostic: check if any SynSent bridges changed state during poll.
+        for (i, dest) in &pre_poll_synsent {
+            if let Some(bridge) = tcp_bridges.get(*i) {
+                if bridge.dest == *dest {
+                    let s: &tcp::Socket = sockets.get(bridge.smoltcp_handle);
+                    let new_state = s.state();
+                    if new_state != tcp::State::SynSent {
+                        warn!(
+                            "bridge[{i}] {dest} SynSent → {new_state:?} during iface.poll() (had_rx={had_rx})"
+                        );
+                    }
+                }
+            }
+        }
 
         // Step 5: Promote ESTABLISHED connections to TcpBridge or LocalBridge.
         // After promoting, recreate listen sockets for any remaining
