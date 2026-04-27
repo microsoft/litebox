@@ -2,23 +2,24 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT license.
 #
-# gdb-connect.sh — Connect GDB to a litebox runner via gdbserver remote.
+# gdb-connect.sh — Connect GDB to a litebox session via gdbserver remote.
 #
 # Usage:
 #   bash dev_tools/gdb-connect.sh [--port PORT] [-- <extra-gdb-args>]
 #
-# Connects to a litebox runner running under gdbserver inside a Docker
+# Connects to a litebox_tool_executor running under gdbserver inside a Docker
 # container (started with litebox_tool_executor --debug).
 #
-# The script finds the runner binary with debug symbols and configures
-# GDB for litebox debugging (SIGSYS passthrough for seccomp compatibility).
+# The --debug flag wraps the entire tool_executor under gdbserver, so the
+# broker and runner (spawned as children) are all debuggable. GDB is
+# configured with `set detach-on-fork off` to track all child processes.
 #
 # Options:
 #   --port PORT   GDB remote port (default: 9999)
 #   --            Extra arguments passed to GDB
 #
 # Environment:
-#   LITEBOX_RUNNER_SYMBOLS  Override path to runner binary with debug symbols
+#   LITEBOX_SYMBOLS_DIR     Override directory containing debug binaries
 #   CARGO_TARGET_DIR        Override cargo target directory
 
 set -euo pipefail
@@ -44,43 +45,45 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-# Find the runner binary with debug symbols.
-find_runner_symbols() {
-    if [[ -n "${LITEBOX_RUNNER_SYMBOLS:-}" ]]; then
-        echo "$LITEBOX_RUNNER_SYMBOLS"
+# Find the debug symbols directory.
+find_symbols_dir() {
+    if [[ -n "${LITEBOX_SYMBOLS_DIR:-}" ]]; then
+        echo "$LITEBOX_SYMBOLS_DIR"
         return
     fi
 
     local candidates=(
-        "$HOME/litebox-out/debug/litebox_runner_linux_userland"
+        "$HOME/litebox-out/debug"
     )
 
-    # Try CARGO_TARGET_DIR or workspace-relative paths.
     local script_dir
     script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
     local workspace_root
     workspace_root="$(cd "$script_dir/.." && pwd)"
     local target_dir="${CARGO_TARGET_DIR:-$workspace_root/target}/debug"
-    candidates+=("$target_dir/litebox_runner_linux_userland")
+    candidates+=("$target_dir")
 
     for c in "${candidates[@]}"; do
-        if [[ -f "$c" ]]; then
+        if [[ -f "$c/litebox_tool_executor" ]]; then
             echo "$c"
             return
         fi
     done
 
-    echo "ERROR: Cannot find litebox_runner_linux_userland with debug symbols." >&2
+    echo "ERROR: Cannot find litebox binaries with debug symbols." >&2
     echo "  Looked in:" >&2
     for c in "${candidates[@]}"; do
         echo "    $c" >&2
     done
-    echo "  Set LITEBOX_RUNNER_SYMBOLS or build with:" >&2
-    echo "    cargo build --target-dir ~/litebox-out -p litebox_runner_linux_userland" >&2
+    echo "  Set LITEBOX_SYMBOLS_DIR or build with:" >&2
+    echo "    cargo build --target-dir ~/litebox-out -p litebox_tool_executor -p litebox_runner_linux_userland -p litebox_broker" >&2
     exit 1
 }
 
-RUNNER_SYMBOLS="$(find_runner_symbols)"
+SYMBOLS_DIR="$(find_symbols_dir)"
+EXECUTOR="$SYMBOLS_DIR/litebox_tool_executor"
+RUNNER="$SYMBOLS_DIR/litebox_runner_linux_userland"
+BROKER="$SYMBOLS_DIR/litebox_broker"
 
 # Find GDB.
 if command -v rust-gdb &>/dev/null; then
@@ -94,23 +97,34 @@ else
 fi
 
 echo "=== GDB Connect ===" >&2
-echo "  Runner symbols: $RUNNER_SYMBOLS" >&2
-echo "  GDB remote:     localhost:$PORT" >&2
-echo "  GDB binary:     $GDB" >&2
+echo "  Symbols dir:     $SYMBOLS_DIR" >&2
+echo "  GDB remote:      localhost:$PORT" >&2
+echo "  GDB binary:      $GDB" >&2
 echo "" >&2
 echo "  Tips:" >&2
-echo "    break do_clone        — guest fork/clone" >&2
-echo "    break sys_execve      — guest exec" >&2
-echo "    break exit_group      — guest process exit" >&2
-echo "    info threads           — list all threads" >&2
-echo "    thread apply all bt    — all thread backtraces" >&2
+echo "    info inferiors             — list all processes (executor, broker, runner)" >&2
+echo "    inferior 2                 — switch to broker" >&2
+echo "    break process.rs:LINE      — breakpoint by file:line (handles monomorphization)" >&2
+echo "    break do_clone             — guest fork/clone" >&2
+echo "    break exit_group           — guest process exit" >&2
+echo "    thread apply all bt        — all thread backtraces" >&2
 echo "===================" >&2
 echo "" >&2
 
+# Configure GDB to:
+# - Pass SIGSYS/SIGSEGV to the program (seccomp/guest faults)
+# - Track ALL child processes (broker + runner + workers)
+# - Load symbols for all litebox binaries
 exec "$GDB" \
     -ex "set pagination off" \
     -ex "set print pretty on" \
     -ex "handle SIGSYS nostop noprint pass" \
+    -ex "handle SIGSEGV nostop noprint pass" \
+    -ex "set detach-on-fork off" \
+    -ex "set follow-fork-mode child" \
+    -ex "set schedule-multiple on" \
     -ex "target remote localhost:$PORT" \
+    -ex "add-symbol-file $RUNNER" \
+    -ex "add-symbol-file $BROKER" \
     "${EXTRA_ARGS[@]}" \
-    "$RUNNER_SYMBOLS"
+    "$EXECUTOR"

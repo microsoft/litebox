@@ -1546,6 +1546,11 @@ fn run_inner(
                     sockets.remove(handle);
                     continue;
                 }
+                info!(
+                    "routed inbound: smoltcp connect {}:{} → {}:{} state={:?}",
+                    BROKER_IP, src_port, routed.guest_ip, routed.guest_port,
+                    sockets.get::<smoltcp::socket::tcp::Socket>(handle).state()
+                );
 
                 let dest = SocketAddr::V4(SocketAddrV4::new(routed.guest_ip, routed.guest_port));
                 tcp_bridges.push(TcpBridge {
@@ -2469,7 +2474,12 @@ fn relay_tcp(sockets: &mut SocketSet<'_>, bridges: &mut Vec<TcpBridge>) {
         // Check if connection is fully closed.
         match socket.state() {
             tcp::State::Closed | tcp::State::TimeWait => {
-                debug!("TCP bridge closed for {}", bridge.dest);
+                info!(
+                    "TCP bridge closed for {} state={:?} remote={:?}",
+                    bridge.dest,
+                    socket.state(),
+                    socket.remote_endpoint(),
+                );
                 to_remove.push(i);
             }
             _ => {}

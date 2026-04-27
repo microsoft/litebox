@@ -88,6 +88,34 @@ struct Cli {
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
+    // When --debug is set, re-exec the entire tool_executor under gdbserver
+    // so that both the broker and runner (spawned as children) are debuggable.
+    // GDB can then use `set detach-on-fork off` to follow all processes.
+    if let Some(port) = cli.debug {
+        if std::env::var("_LITEBOX_UNDER_GDB").is_err() {
+            let self_exe = std::env::current_exe()?;
+            let args: Vec<String> = std::env::args().collect();
+            eprintln!();
+            eprintln!("=== GDB DEBUG MODE ===");
+            eprintln!("  gdbserver listening on port {port}");
+            eprintln!("  Connect from host with:");
+            eprintln!(
+                "    gdb -ex 'target remote localhost:{port}' {}",
+                self_exe.display()
+            );
+            eprintln!("  Or use: bash dev_tools/gdb-connect.sh --port {port}");
+            eprintln!("======================");
+            eprintln!();
+            let err = std::process::Command::new("gdbserver")
+                .arg(format!(":{port}"))
+                .arg(&self_exe)
+                .args(&args[1..])
+                .env("_LITEBOX_UNDER_GDB", "1")
+                .status()?;
+            std::process::exit(err.code().unwrap_or(1));
+        }
+    }
+
     if !cli.rootfs.exists() {
         anyhow::bail!(
             "Rootfs not found: {}\n\
@@ -408,25 +436,9 @@ fn runner_command(
 ) -> anyhow::Result<std::process::Command> {
     let runner = find_runner()?;
 
-    // When --debug is set, wrap the runner under gdbserver. gdbserver
-    // becomes the top-level process and the runner is its child.
-    let (mut cmd, runner_is_gdbserver_child) = if let Some(port) = cli.debug {
-        let mut cmd = std::process::Command::new("gdbserver");
-        cmd.arg(format!(":{port}"));
-        cmd.arg(&runner);
-        eprintln!();
-        eprintln!("=== GDB DEBUG MODE ===");
-        eprintln!("  gdbserver listening on port {port}");
-        eprintln!("  Connect from host with:");
-        eprintln!("    gdb -ex 'target remote localhost:{port}' {}", runner.display());
-        eprintln!("  Or use: bash dev_tools/gdb-connect.sh --port {port}");
-        eprintln!("======================");
-        eprintln!();
-        (cmd, true)
-    } else {
-        (std::process::Command::new(&runner), false)
-    };
-    let _ = runner_is_gdbserver_child;
+    // --debug is now handled at the top of main() by wrapping the entire
+    // tool_executor under gdbserver. The runner is started directly.
+    let mut cmd = std::process::Command::new(&runner);
 
     cmd.arg("--unstable");
 
