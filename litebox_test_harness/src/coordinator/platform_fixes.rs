@@ -298,7 +298,8 @@ pub(crate) async fn run(r: &mut TestRunner) {
     loopback_tcp_tests(r).await;
     bash_fork_exec_tests(r).await;
     cross_worker_first_connect_tests(r).await;
-    // PID visibility tests run last — KP.proc_child can deadlock agent B
+    cross_worker_self_connect_tests(r).await;
+    // PID visibility tests run last— KP.proc_child can deadlock agent B
     // under litebox, causing all subsequent B-targeted tests to timeout.
     pid_visibility_tests(r).await;
 }
@@ -411,6 +412,91 @@ pub(crate) async fn cross_worker_first_connect_tests(r: &mut TestRunner) {
     }
 
     let _ = r.send("A", Command::NetUnlisten { port }).await;
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// XCONN.self: same-worker loopback (VS Code pattern)
+// ═══════════════════════════════════════════════════════════════════
+
+/// VS Code topology: the CLI (listener) and dropbear (connector) are
+/// in the SAME worker. The connector calls connect(127.0.0.1:PORT)
+/// which goes through the same smoltcp instance as the listener.
+///
+/// This tests same-worker loopback via NetListen + NetConnect on the
+/// SAME agent, and also the parent→child topology (A listens, AA connects)
+/// which mirrors how the CLI runs in the init worker and dropbear
+/// (also in init worker) connects via the SSH direct-tcpip channel.
+pub(crate) async fn cross_worker_self_connect_tests(r: &mut TestRunner) {
+    eprintln!("[platform] === XCONN.self: same-worker loopback ===");
+
+    // Same agent: A listens, A connects to itself.
+    let port = 19910u16;
+    let listen_resp = r.send("A", Command::NetListen { port }).await;
+    if !matches!(&listen_resp, Response::Listening { .. }) {
+        r.record("XCONN.self_A", "A", false, &format!("listen failed: {listen_resp:?}"));
+        return;
+    }
+    let conn_resp = r
+        .send("A", Command::NetConnect {
+            addr: format!("127.0.0.1:{port}"),
+            data: "self_loopback".into(),
+        })
+        .await;
+    let ok = matches!(&conn_resp, Response::Connected { echo } if echo == "self_loopback");
+    r.record("XCONN.self_A", "A", ok, &format!("{conn_resp:?}"));
+    let _ = r.send("A", Command::NetUnlisten { port }).await;
+
+    // Parent→child: A listens, AA connects (AA is a child process of A,
+    // so in litebox with PIE they share the same worker).
+    let port2 = 19911u16;
+    let listen_resp = r.send("A", Command::NetListen { port: port2 }).await;
+    if !matches!(&listen_resp, Response::Listening { .. }) {
+        r.record("XCONN.parent_child", "AA", false, &format!("listen failed: {listen_resp:?}"));
+        return;
+    }
+    let conn_resp = r
+        .send("AA", Command::NetConnect {
+            addr: format!("127.0.0.1:{port2}"),
+            data: "parent_child".into(),
+        })
+        .await;
+    let ok = matches!(&conn_resp, Response::Connected { echo } if echo == "parent_child");
+    r.record("XCONN.parent_child", "AA", ok, &format!("{conn_resp:?}"));
+    let _ = r.send("A", Command::NetUnlisten { port: port2 }).await;
+
+    // Child→parent: AA listens, A connects.
+    let port3 = 19912u16;
+    let listen_resp = r.send("AA", Command::NetListen { port: port3 }).await;
+    if !matches!(&listen_resp, Response::Listening { .. }) {
+        r.record("XCONN.child_parent", "A", false, &format!("listen failed: {listen_resp:?}"));
+        return;
+    }
+    let conn_resp = r
+        .send("A", Command::NetConnect {
+            addr: format!("127.0.0.1:{port3}"),
+            data: "child_parent".into(),
+        })
+        .await;
+    let ok = matches!(&conn_resp, Response::Connected { echo } if echo == "child_parent");
+    r.record("XCONN.child_parent", "A", ok, &format!("{conn_resp:?}"));
+    let _ = r.send("AA", Command::NetUnlisten { port: port3 }).await;
+
+    // Sibling: A listens, AB connects (AB is sibling of AA, both children of A).
+    let port4 = 19913u16;
+    let listen_resp = r.send("A", Command::NetListen { port: port4 }).await;
+    if !matches!(&listen_resp, Response::Listening { .. }) {
+        r.record("XCONN.sibling_AB", "AB", false, &format!("listen failed: {listen_resp:?}"));
+        return;
+    }
+    let conn_resp = r
+        .send("AB", Command::NetConnect {
+            addr: format!("127.0.0.1:{port4}"),
+            data: "sibling_connect".into(),
+        })
+        .await;
+    let ok = matches!(&conn_resp, Response::Connected { echo } if echo == "sibling_connect");
+    r.record("XCONN.sibling_AB", "AB", ok, &format!("{conn_resp:?}"));
+    let _ = r.send("A", Command::NetUnlisten { port: port4 }).await;
 }
 
 // ═══════════════════════════════════════════════════════════════════
