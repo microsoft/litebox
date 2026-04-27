@@ -380,16 +380,12 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         envp
     };
 
+    let task_params = platform.init_task();
+
     #[cfg(target_arch = "x86_64")]
     litebox_platform_linux_userland::LinuxUserland::enable_seccomp_filter();
 
-    let program = shim.load_program(
-        initial_file_system,
-        platform.init_task(),
-        prog_path,
-        argv,
-        envp,
-    )?;
+    let program = shim.load_program(initial_file_system, task_params, prog_path, argv, envp)?;
 
     #[cfg(feature = "lock_tracing")]
     litebox::sync::start_recording();

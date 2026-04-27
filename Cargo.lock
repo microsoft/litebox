@@ -1531,6 +1531,7 @@ dependencies = [
 name = "litebox_platform_linux_userland"
 version = "0.1.0"
 dependencies = [
+ "arrayvec",
  "cfg-if",
  "getrandom 0.3.4",
  "libc",
