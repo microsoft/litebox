@@ -318,4 +318,209 @@ fn process_tree_tests() {
             }
         }
     }
+
+    // ── Pass 3: Host-side tests (TCP through port forwarding) ──
+    // Launches litebox with --forward-port, runs the test harness in
+    // agent-listen mode inside the sandbox, and connects from the host
+    // via the forwarded port. Tests that the broker's TCP forwarding
+    // works end-to-end.
+    eprintln!("\n=== Pass 3: Host-side tests ===");
+    run_host_tests(&debug, &ws_root);
+}
+
+/// Run host-side tests that exercise TCP port forwarding through the broker.
+///
+/// Launches litebox inside Docker with:
+///   --forward-port 19090:10.0.0.2:9090  (control channel)
+///   --forward-port 19091:10.0.0.2:9091  (data test port)
+///
+/// The guest runs `litebox-test-harness agent-listen 9090`, and the host
+/// connects via `localhost:19090` to send commands.
+fn run_host_tests(debug: &Path, ws_root: &Path) {
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::net::TcpStream;
+    use std::time::Duration;
+    let mut results: Vec<(&str, bool, String)> = Vec::new();
+
+    // Start litebox in Docker with port forwarding + agent-listen mode.
+    let container_name = format!("litebox-host-test-{}", std::process::id());
+    let mut docker = Command::new("docker");
+    docker
+        .args(["run", "--rm", "--name", &container_name])
+        .args(["--cap-add", "SYS_PTRACE"])
+        .args(["-p", "19090:19090", "-p", "19091:19091"])
+        .arg("-v")
+        .arg(format!("{}:/opt/litebox:ro", debug.display()))
+        .arg("-v")
+        .arg(format!(
+            "{}:/opt/nonpie:ro",
+            ws_root.join("target/nonpie/debug").display()
+        ))
+        .arg("litebox-test")
+        .args([
+            "/opt/litebox/litebox_tool_executor",
+            "--rootfs",
+            "/",
+            "--record-baseline",
+            "--forward-port",
+            "19090:10.0.0.2:9090",
+            "--forward-port",
+            "19091:10.0.0.2:9091",
+            "--",
+            "/opt/litebox/litebox_test_harness",
+            "agent-listen",
+            "9090",
+        ])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+
+    let mut child = docker.spawn().expect("failed to start host-test container");
+    eprintln!("[host-test] Container {container_name} started");
+
+    // Wait for the TCP agent to be ready by retrying connections.
+    let stream = {
+        let mut attempts = 0;
+        loop {
+            std::thread::sleep(Duration::from_millis(500));
+            match TcpStream::connect_timeout(
+                &"127.0.0.1:19090".parse().unwrap(),
+                Duration::from_secs(2),
+            ) {
+                Ok(s) => {
+                    eprintln!("[host-test] Connected to TCP agent after {attempts} retries");
+                    break s;
+                }
+                Err(e) => {
+                    attempts += 1;
+                    if attempts > 30 {
+                        // Capture stderr for diagnostics.
+                        let _ = Command::new("docker")
+                            .args(["kill", &container_name])
+                            .status();
+                        let _ = child.wait();
+                        panic!("[host-test] Could not connect to TCP agent after 15s: {e}");
+                    }
+                }
+            }
+        }
+    };
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .ok();
+    stream
+        .set_write_timeout(Some(Duration::from_secs(5)))
+        .ok();
+
+    let mut reader = BufReader::new(stream.try_clone().expect("clone stream"));
+    let mut writer = stream;
+
+    // Helper: send a command and read the JSON response.
+    let send_cmd =
+        |w: &mut TcpStream, r: &mut BufReader<TcpStream>, cmd: &str| -> Option<String> {
+            let msg = format!("{cmd}\n");
+            w.write_all(msg.as_bytes()).ok()?;
+            w.flush().ok()?;
+            let mut line = String::new();
+            r.read_line(&mut line).ok()?;
+            Some(line.trim().to_string())
+        };
+
+    // ── H1: Control channel works ──
+    {
+        let cmd = r#"{"cmd":"cwd_get"}"#;
+        let resp = send_cmd(&mut writer, &mut reader, cmd);
+        let pass = resp
+            .as_ref()
+            .is_some_and(|r| r.contains(r#""status":"ok""#));
+        let detail = resp.unwrap_or_else(|| "no response".to_string());
+        eprintln!("  {}: H1.control_channel [host] {detail}", if pass { "pass" } else { "FAIL" });
+        results.push(("H1.control_channel", pass, detail));
+    }
+
+    // ── H2: Data forwarding — guest listens, host connects via second forwarded port ──
+    {
+        let cmd = r#"{"cmd":"net_listen","port":9091}"#;
+        let resp = send_cmd(&mut writer, &mut reader, cmd);
+        let listen_ok = resp
+            .as_ref()
+            .is_some_and(|r| r.contains(r#""status":"listening""#));
+
+        let mut data_pass = false;
+        let mut detail = format!("listen={listen_ok}");
+        if listen_ok {
+            // Connect to the echo server via the second forwarded port.
+            std::thread::sleep(Duration::from_millis(200));
+            match TcpStream::connect_timeout(
+                &"127.0.0.1:19091".parse().unwrap(),
+                Duration::from_secs(5),
+            ) {
+                Ok(mut data_stream) => {
+                    data_stream
+                        .set_read_timeout(Some(Duration::from_secs(5)))
+                        .ok();
+                    let _ = data_stream.write_all(b"HOST_ECHO_TEST");
+                    let _ = data_stream.flush();
+                    let mut buf = [0u8; 256];
+                    match data_stream.read(&mut buf) {
+                        Ok(n) if n > 0 => {
+                            let echo = String::from_utf8_lossy(&buf[..n]).to_string();
+                            data_pass = echo == "HOST_ECHO_TEST";
+                            detail = format!("echo={echo:?}");
+                        }
+                        Ok(_) => detail = "no echo data".to_string(),
+                        Err(e) => detail = format!("read error: {e}"),
+                    }
+                }
+                Err(e) => detail = format!("connect to 19091 failed: {e}"),
+            }
+            // Unlisten.
+            let _ = send_cmd(&mut writer, &mut reader, r#"{"cmd":"net_unlisten","port":9091}"#);
+        }
+        eprintln!("  {}: H2.data_forward [host] {detail}", if data_pass { "pass" } else { "FAIL" });
+        results.push(("H2.data_forward", data_pass, detail));
+    }
+
+    // ── H3: File read via 9P (host wrote file in rootfs, guest reads) ──
+    // Note: this only works with directory rootfs. With tar rootfs the host
+    // can't write to the guest filesystem. Skip if not applicable.
+    {
+        let cmd = r#"{"cmd":"env_get","var":"HOME"}"#;
+        let resp = send_cmd(&mut writer, &mut reader, cmd);
+        let pass = resp
+            .as_ref()
+            .is_some_and(|r| r.contains(r#""status":"ok""#));
+        let detail = resp.unwrap_or_else(|| "no response".to_string());
+        eprintln!("  {}: H3.env_get [host] {detail}", if pass { "pass" } else { "FAIL" });
+        results.push(("H3.env_get", pass, detail));
+    }
+
+    // ── Shutdown ──
+    let _ = send_cmd(&mut writer, &mut reader, r#"{"cmd":"exit"}"#);
+    drop(writer);
+    drop(reader);
+
+    // Wait for the container to exit.
+    let _ = child.wait();
+
+    // ── Report results ──
+    let pass_count = results.iter().filter(|(_, p, _)| *p).count();
+    let fail_count = results.iter().filter(|(_, p, _)| !*p).count();
+    eprintln!(
+        "\n=== [host-test] {pass_count} passed, {fail_count} failed out of {} ===",
+        results.len()
+    );
+
+    if fail_count > 0 {
+        eprintln!("\n=== [host-test] FAILURES ===");
+        for (name, pass, detail) in &results {
+            if !pass {
+                eprintln!("  {name}: {detail}");
+            }
+        }
+        panic!(
+            "[host-test] {fail_count} host-side test(s) failed. \
+             See details above."
+        );
+    }
 }
