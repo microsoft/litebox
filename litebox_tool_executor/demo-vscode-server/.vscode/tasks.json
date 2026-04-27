@@ -47,9 +47,19 @@
             "command": "docker rm -f litebox-vscode 2>$null; docker run --rm --name litebox-vscode -p 2222:2222 --cap-add SYS_PTRACE -v \\\\wsl$\\Ubuntu\\home\\wportnoy\\litebox-out\\debug:/opt/litebox:ro litebox-vscode /opt/litebox/litebox_tool_executor --rootfs / --vscode-server --ssh-port 2222 --record-baseline",
             "problemMatcher": [],
             "isBackground": true,
-            "runOptions": {
-                "runOn": "folderOpen"
-            },
+            "presentation": {
+                "reveal": "always",
+                "panel": "dedicated",
+                "focus": false,
+                "echo": true
+            }
+        },
+        {
+            "label": "LiteBox: Start VS Code Server (Debug)",
+            "type": "shell",
+            "command": "docker rm -f litebox-vscode 2>$null; docker run --rm --name litebox-vscode -p 2222:2222 -p 9999:9999 --cap-add SYS_PTRACE -v \\\\wsl$\\Ubuntu\\home\\wportnoy\\litebox-out\\debug:/opt/litebox:ro litebox-vscode /opt/litebox/litebox_tool_executor --rootfs / --vscode-server --ssh-port 2222 --record-baseline --debug",
+            "problemMatcher": [],
+            "isBackground": true,
             "presentation": {
                 "reveal": "always",
                 "panel": "dedicated",

@@ -37,7 +37,7 @@ ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y --no-install-recommends \
     bash coreutils findutils grep sed gawk \
     ca-certificates curl xz-utils tar \
-    procps less netcat-openbsd gdb \
+    procps less netcat-openbsd gdb gdbserver \
     && rm -rf /var/lib/apt/lists/* \
     && ln -sf bash /bin/sh
 
@@ -130,3 +130,4 @@ RUN mkdir -p /root/.vscode-server/data/logs \
 #   /opt/litebox/ — litebox_tool_executor, litebox_broker, litebox_runner
 
 EXPOSE 22
+EXPOSE 9999

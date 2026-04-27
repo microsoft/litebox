@@ -196,6 +196,7 @@ registry.
 | `rr-record.sh` | Records a litebox session under rr (requires real PMU hardware) |
 | `rr-replay.sh` | Replays an rr trace with scripted GDB commands |
 | `deadlock-inspect.sh` | Attaches to running runner process(es) and dumps all thread stacks |
+| `gdb-connect.sh` | Connects GDB to a litebox runner running under gdbserver in Docker |
 
 ## Debugging Litebox
 
@@ -295,3 +296,71 @@ bash dev_tools/check-debug-env.sh
 This checks for GDB, rr + PMU availability, debug symbols, and required
 binaries.  GDB is required; rr is optional (and will show a warning on WSL2
 explaining why it cannot work).
+
+### GDB remote debugging (VS Code Server in Docker)
+
+For debugging the litebox runner during VS Code Remote-SSH testing, the
+tool executor supports a `--debug` flag that runs the runner under
+`gdbserver` inside the Docker container. The agent connects from WSL2.
+
+```
+┌─ Docker container ──────────────────────────┐
+│  litebox_tool_executor --debug               │
+│    ├── litebox_broker                        │
+│    └── gdbserver :9999                       │
+│         └── litebox_runner ... dropbear ...  │
+│                                              │
+│  Port 2222: SSH (VS Code Remote-SSH)         │
+│  Port 9999: GDB remote protocol              │
+└──────────────────────────────────────────────┘
+         ↑
+         │ target remote localhost:9999
+┌─ WSL2 ─┴──────────────────────────────────┐
+│  gdb ./litebox_runner_linux_userland       │
+│  (debug symbols from ~/litebox-out/debug/) │
+└────────────────────────────────────────────┘
+```
+
+**Start the container in debug mode** (VS Code task "LiteBox: Start VS Code
+Server (Debug)" or manually):
+
+```bash
+docker run --rm --name litebox-vscode \
+  -p 2222:2222 -p 9999:9999 --cap-add SYS_PTRACE \
+  -v \\\\wsl$\\Ubuntu\\home\\$USER\\litebox-out\\debug:/opt/litebox:ro \
+  litebox-vscode /opt/litebox/litebox_tool_executor \
+    --rootfs / --vscode-server --ssh-port 2222 --record-baseline --debug
+```
+
+**Connect GDB from WSL2:**
+
+```bash
+bash dev_tools/gdb-connect.sh --port 9999
+```
+
+The script finds the runner binary with debug symbols and configures GDB
+with `handle SIGSYS nostop noprint pass` for seccomp compatibility.
+
+**Useful breakpoints for process lifecycle:**
+
+```
+break do_clone         — guest fork/clone
+break sys_execve       — guest exec
+break exit_group       — guest process exit
+```
+
+**Coding agent usage** (via async powershell + write_powershell):
+
+```python
+# Start GDB session
+powershell("wsl.exe -- bash dev_tools/gdb-connect.sh", mode="async", shellId="gdb")
+
+# Set breakpoints and continue
+write_powershell(shellId="gdb", input="break do_clone{enter}")
+write_powershell(shellId="gdb", input="continue{enter}")
+
+# When breakpoint fires, inspect
+write_powershell(shellId="gdb", input="bt{enter}")
+write_powershell(shellId="gdb", input="info locals{enter}")
+write_powershell(shellId="gdb", input="continue{enter}")
+```

@@ -73,6 +73,13 @@ struct Cli {
     #[arg(long = "forward-port")]
     forward_port: Vec<String>,
 
+    /// Run the litebox runner under gdbserver for remote debugging.
+    /// The runner listens on the specified port (default: 9999) for GDB
+    /// remote connections. Connect from the host with:
+    ///   gdb -ex "target remote localhost:<port>" path/to/litebox_runner
+    #[arg(long, value_name = "PORT", default_missing_value = "9999", num_args = 0..=1)]
+    debug: Option<u16>,
+
     /// The command and arguments to run. Omit for interactive mode.
     #[arg(trailing_var_arg = true)]
     command: Vec<String>,
@@ -400,7 +407,27 @@ fn runner_command(
     broker: Option<&BrokerProcess>,
 ) -> anyhow::Result<std::process::Command> {
     let runner = find_runner()?;
-    let mut cmd = std::process::Command::new(&runner);
+
+    // When --debug is set, wrap the runner under gdbserver. gdbserver
+    // becomes the top-level process and the runner is its child.
+    let (mut cmd, runner_is_gdbserver_child) = if let Some(port) = cli.debug {
+        let mut cmd = std::process::Command::new("gdbserver");
+        cmd.arg(format!(":{port}"));
+        cmd.arg(&runner);
+        eprintln!();
+        eprintln!("=== GDB DEBUG MODE ===");
+        eprintln!("  gdbserver listening on port {port}");
+        eprintln!("  Connect from host with:");
+        eprintln!("    gdb -ex 'target remote localhost:{port}' {}", runner.display());
+        eprintln!("  Or use: bash dev_tools/gdb-connect.sh --port {port}");
+        eprintln!("======================");
+        eprintln!();
+        (cmd, true)
+    } else {
+        (std::process::Command::new(&runner), false)
+    };
+    let _ = runner_is_gdbserver_child;
+
     cmd.arg("--unstable");
 
     let rootfs_is_dir = cli.rootfs.is_dir();
