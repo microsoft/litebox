@@ -74,12 +74,12 @@ RUN curl -fsSL "https://nodejs.org/dist/${NODE_VERSION}/node-${NODE_VERSION}-lin
 FROM litebox-base AS litebox-vscode
 
 # Additional packages for VS Code Server mode.
-# Note: nodejs is NOT installed — the VS Code CLI bundles its own
-# Node.js at cli/servers/Stable-<commit>/server/node.  A system
-# nodejs (v18 from Ubuntu) can confuse the CLI into thinking the
-# server prerequisites aren't met.
+# System nodejs is intentionally excluded — the VS Code Server bundles its
+# own Node.js at cli/servers/Stable-<commit>/server/node. Installing the
+# system nodejs (v18 from Ubuntu) confuses the CLI's prerequisites check
+# into thinking the server requirements aren't met.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    openssh-sftp-server dropbear-bin python3-minimal git wget strace \
+    openssh-sftp-server dropbear-bin git strace \
     && rm -rf /var/lib/apt/lists/*
 
 # Dropbear SSH server.
@@ -87,6 +87,11 @@ RUN mkdir -p /etc/dropbear \
     && dropbearkey -t ed25519 -f /etc/dropbear/dropbear_ed25519_host_key 2>/dev/null
 
 # VS Code CLI (latest stable).
+#
+# Only the alpine/musl variant (cli-alpine-x64) is distributed by Microsoft;
+# cli-linux-x64 returns 404. The CLI is statically linked, but litebox's
+# syscall rewriter patches syscall instructions at load time regardless of
+# libc, so all CLI syscalls still go through the sandbox.
 #
 # The CLI is installed as both 'code' (generic) and 'code-<COMMIT>'
 # (commit-specific).  The VS Code Remote-SSH install script checks for
@@ -118,7 +123,7 @@ RUN VSCODE_COMMIT=$(/root/.vscode-server/code --version 2>/dev/null | grep -oP '
 RUN mkdir -p /root/.vscode-server/data/logs \
              /root/.vscode-server/data/Machine \
              /root/.vscode-server/extensions \
-    && chmod -R 777 /root/.vscode-server \
+    && chmod -R 755 /root/.vscode-server \
     && touch /tmp/vscode-skip-server-requirements-check
 
 # Litebox binaries are bind-mounted at runtime:
