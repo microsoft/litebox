@@ -137,8 +137,12 @@ struct InboundForward {
 ///
 /// Thread-safe: shared between the main proxy and all worker proxy threads.
 pub struct PortRouter {
-    /// Port → sender channel for forwarding accepted TCP streams to workers.
-    routes: std::sync::Mutex<HashMap<u16, std::sync::mpsc::Sender<RoutedStream>>>,
+    /// Port → (worker_id, sender) for forwarding accepted TCP streams.
+    /// The worker_id tracks ownership so that cleanup only removes
+    /// routes belonging to the dying worker, not routes re-registered
+    /// by a different (still-alive) worker.
+    routes: std::sync::Mutex<HashMap<u16, (u64, std::sync::mpsc::Sender<RoutedStream>)>>,
+    next_worker_id: std::sync::atomic::AtomicU64,
 }
 
 /// A TCP stream routed from the main proxy to a worker proxy.
@@ -158,7 +162,14 @@ impl PortRouter {
     pub fn new() -> Self {
         Self {
             routes: std::sync::Mutex::new(HashMap::new()),
+            next_worker_id: std::sync::atomic::AtomicU64::new(1),
         }
+    }
+
+    /// Allocate a unique worker ID for ownership tracking.
+    pub fn alloc_worker_id(&self) -> u64 {
+        self.next_worker_id
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Check if any worker has registered for this port.
@@ -167,13 +178,18 @@ impl PortRouter {
     }
 
     /// Register a worker's interest in receiving inbound connections on `port`.
-    pub fn register(&self, port: u16, sender: std::sync::mpsc::Sender<RoutedStream>) {
+    pub fn register(
+        &self,
+        port: u16,
+        worker_id: u64,
+        sender: std::sync::mpsc::Sender<RoutedStream>,
+    ) {
         let mut routes = self.routes.lock().unwrap();
         if routes.contains_key(&port) {
             warn!("port {port} already registered, overwriting");
         }
-        info!("port router: registered port {port}");
-        routes.insert(port, sender);
+        info!("port router: registered port {port} (worker {worker_id})");
+        routes.insert(port, (worker_id, sender));
     }
 
     /// Unregister a port (e.g., when the worker stops listening).
@@ -181,6 +197,25 @@ impl PortRouter {
         let mut routes = self.routes.lock().unwrap();
         if routes.remove(&port).is_some() {
             info!("port router: unregistered port {port}");
+        }
+    }
+
+    /// Unregister a port only if it is still owned by `worker_id`.
+    /// Fork children inherit listen sockets and may re-register the
+    /// same port. When the child dies, this prevents removing the
+    /// parent's (or another worker's) registration.
+    pub fn unregister_if_owner(&self, port: u16, worker_id: u64) {
+        let mut routes = self.routes.lock().unwrap();
+        if let Some(&(owner, _)) = routes.get(&port) {
+            if owner == worker_id {
+                routes.remove(&port);
+                info!("port router: unregistered port {port} (worker {worker_id})");
+            } else {
+                info!(
+                    "port router: skipping unregister of port {port} \
+                     (owned by worker {owner}, not {worker_id})"
+                );
+            }
         }
     }
 
@@ -193,7 +228,7 @@ impl PortRouter {
         stream: std::net::TcpStream,
     ) -> Option<std::net::TcpStream> {
         let routes = self.routes.lock().unwrap();
-        if let Some(sender) = routes.get(&guest_port) {
+        if let Some((_, sender)) = routes.get(&guest_port) {
             let routed = RoutedStream {
                 stream,
                 guest_ip,
@@ -847,6 +882,7 @@ fn run_inner(
     let mut pending_handshakes: Vec<PendingHandshake> = Vec::new();
     // Ports registered by this proxy in the port router (for cleanup on exit).
     let mut registered_ports: Vec<u16> = Vec::new();
+    let worker_id = port_router.alloc_worker_id();
 
     info!("network proxy ready, entering event loop");
 
@@ -868,7 +904,7 @@ fn run_inner(
         if let Some((port, is_listen)) = device.take_port_listen_msg() {
             if is_listen {
                 if let Some(ref tx) = inbound_routed_tx {
-                    port_router.register(port, tx.clone());
+                    port_router.register(port, worker_id, tx.clone());
                     registered_ports.push(port);
                     info!("worker registered listen on port {port}");
                 } else {
@@ -1595,7 +1631,7 @@ fn run_inner(
 
     // Clean up port registrations owned by this proxy.
     for port in &registered_ports {
-        port_router.unregister(*port);
+        port_router.unregister_if_owner(*port, worker_id);
     }
     if !registered_ports.is_empty() {
         info!("cleaned up {} port registrations", registered_ports.len());
