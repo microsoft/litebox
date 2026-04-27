@@ -101,60 +101,65 @@ fn main() {
         }
         "tcp-listen-fork" => {
             // Simulates the VS Code bootstrap pattern:
-            // 1. Listen on a TCP port (parent registers port with broker)
-            // 2. Fork a child (child inherits listen socket, creates new
-            //    worker whose network stack re-registers the port)
-            // 3. Child sleeps briefly then exits (child worker dies,
-            //    cleanup deregisters the port)
+            // 1. Listen on a TCP port
+            // 2. Fork+exec a child that ALSO listens on the same port.
+            //    The exec triggers litebox delayed-fork, creating a new
+            //    worker whose listen() re-registers the port with the broker.
+            // 3. Child exits → child worker dies → port route deregistered
             // 4. Parent accepts one connection and echoes
             //
             // Without the port router ownership fix, the child's death
             // deregisters the parent's port route, and step 4 fails.
             let port: u16 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(18300);
-            let child_secs: u64 = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(3);
+            let child_secs: &str = args.get(3).map(|s| s.as_str()).unwrap_or("3");
             let listener = std::net::TcpListener::bind(format!("0.0.0.0:{port}"))
                 .expect("tcp-listen-fork: bind failed");
             eprintln!("[tcp-listen-fork] listening on 0.0.0.0:{port}");
 
-            // Fork a child that inherits the listen socket.
-            let pid = unsafe { libc::fork() };
-            if pid == 0 {
-                // Child: sleep long enough for the worker's network stack to
-                // initialize and send a port-listen notification, then exit.
-                eprintln!("[tcp-listen-fork] child: sleeping {child_secs}s");
-                std::thread::sleep(std::time::Duration::from_secs(child_secs));
-                eprintln!("[tcp-listen-fork] child: exiting");
-                std::process::exit(0);
-            } else if pid > 0 {
-                eprintln!("[tcp-listen-fork] forked child pid={pid}");
-                // Wait for child to exit.
-                let mut status: libc::c_int = 0;
-                unsafe { libc::waitpid(pid, &mut status, 0) };
-                eprintln!("[tcp-listen-fork] child exited, accepting connection");
-                // Accept one connection and echo.
-                listener
-                    .set_nonblocking(false)
-                    .expect("set_nonblocking(false)");
-                match listener.accept() {
-                    Ok((mut stream, addr)) => {
-                        eprintln!("[tcp-listen-fork] accepted from {addr}");
-                        use std::io::{Read, Write};
-                        let mut buf = [0u8; 4096];
-                        match stream.read(&mut buf) {
-                            Ok(n) if n > 0 => {
-                                let _ = stream.write_all(&buf[..n]);
-                                let _ = stream.flush();
-                                println!("ECHO_OK={n}");
-                            }
-                            Ok(_) => println!("ECHO_EOF"),
-                            Err(e) => println!("ECHO_ERR={e}"),
-                        }
-                    }
-                    Err(e) => println!("ACCEPT_ERR={e}"),
-                }
+            // Fork+exec a child that also listens on a port (to trigger
+            // network stack init in the child worker). We use a DIFFERENT
+            // port to avoid EADDRINUSE, but the child still inherits the
+            // parent's listen socket fd for the original port.
+            //
+            // Try the non-PIE binary first (forces a separate worker in
+            // litebox), fall back to self_exe.
+            let child_port = port + 100;
+            let child_exe = if std::path::Path::new("/opt/nonpie/litebox_test_harness").exists() {
+                "/opt/nonpie/litebox_test_harness"
             } else {
-                eprintln!("[tcp-listen-fork] fork failed");
-                println!("FORK_ERR");
+                self_exe
+            };
+            eprintln!("[tcp-listen-fork] exec child: {child_exe} tcp-listen-busy {child_port} {child_secs}");
+            let status = std::process::Command::new(child_exe)
+                .args(["tcp-listen-busy", &child_port.to_string(), child_secs])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::inherit())
+                .status();
+            match status {
+                Ok(s) => eprintln!("[tcp-listen-fork] child exited: {s}"),
+                Err(e) => eprintln!("[tcp-listen-fork] child failed: {e}"),
+            }
+
+            eprintln!("[tcp-listen-fork] accepting connection on port {port}");
+            listener
+                .set_nonblocking(false)
+                .expect("set_nonblocking(false)");
+            match listener.accept() {
+                Ok((mut stream, addr)) => {
+                    eprintln!("[tcp-listen-fork] accepted from {addr}");
+                    use std::io::{Read, Write};
+                    let mut buf = [0u8; 4096];
+                    match stream.read(&mut buf) {
+                        Ok(n) if n > 0 => {
+                            let _ = stream.write_all(&buf[..n]);
+                            let _ = stream.flush();
+                            println!("ECHO_OK={n}");
+                        }
+                        Ok(_) => println!("ECHO_EOF"),
+                        Err(e) => println!("ECHO_ERR={e}"),
+                    }
+                }
+                Err(e) => println!("ACCEPT_ERR={e}"),
             }
         }
         "tcp-listen-busy" => {
