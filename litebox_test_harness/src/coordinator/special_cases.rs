@@ -1113,4 +1113,92 @@ pub(super) async fn cross_worker_tests(r: &mut TestRunner) {
             )
             .await;
     }
+
+    // ─── VS Code SOCKS pattern: cross-subtree TCP connect ───
+    // VS Code opens a SECOND SSH session (new fork from INIT worker)
+    // with a SOCKS proxy that connects to port 63084. The listener
+    // is in a DIFFERENT fork-restore worker. This tests the exact
+    // pattern: listener in one subtree, connector in a completely
+    // independent subtree spawned later.
+    //
+    // XW10: D3 (subtree under AA) listens TCP, B (independent subtree) connects
+    // This reproduces: fork-restore worker 1 listens, fork-restore worker 2 connects.
+    let resp = r.send("D3", Command::NetListen { port: 0 }).await;
+    let listen_port = match &resp {
+        Response::Listening { port } => Some(*port),
+        _ => None,
+    };
+    r.record(
+        "XW10.d3_tcp_listen",
+        "D3",
+        listen_port.is_some(),
+        &format!("{resp:?}"),
+    );
+
+    if let Some(port) = listen_port {
+        // B connects — B is in a completely separate subtree from D3.
+        // This SYN goes: B's smoltcp → broker → needs PortRouter to
+        // route to D3's broker proxy.
+        let resp = r
+            .send(
+                "B",
+                Command::NetConnect {
+                    addr: format!("127.0.0.1:{port}"),
+                    data: "XW10_CROSS_SUBTREE".to_string(),
+                },
+            )
+            .await;
+        let pass = matches!(&resp, Response::Connected { echo } if echo.contains("XW10_CROSS_SUBTREE"));
+        r.record("XW10.b_tcp_connect", "B", pass, &format!("{resp:?}"));
+
+        let _ = r.send("D3", Command::NetUnlisten { port }).await;
+    }
+
+    // XW11: Same but with a freshly-spawned remote worker as connector.
+    // This is even closer to VS Code: the connector doesn't exist when
+    // the listener starts.
+    let resp = r.send("D3", Command::NetListen { port: 0 }).await;
+    let listen_port = match &resp {
+        Response::Listening { port } => Some(*port),
+        _ => None,
+    };
+    r.record(
+        "XW11.d3_tcp_listen",
+        "D3",
+        listen_port.is_some(),
+        &format!("{resp:?}"),
+    );
+
+    if let Some(port) = listen_port {
+        // Spawn a fresh remote worker under B (different subtree).
+        let resp = r
+            .send(
+                "B",
+                Command::SpawnRemote {
+                    children: vec!["R2".to_string()],
+                },
+            )
+            .await;
+        let spawned = matches!(&resp, Response::Ok { .. });
+        r.record("XW11.spawn_r2", "B", spawned, &format!("{resp:?}"));
+
+        if spawned {
+            let resp = r
+                .send(
+                    "B",
+                    Command::Forward {
+                        target: "R2".to_string(),
+                        inner: Box::new(Command::NetConnect {
+                            addr: format!("127.0.0.1:{port}"),
+                            data: "XW11_LATE_SPAWN".to_string(),
+                        }),
+                    },
+                )
+                .await;
+            let pass = matches!(&resp, Response::Connected { echo } if echo.contains("XW11_LATE_SPAWN"));
+            r.record("XW11.r2_tcp_connect", "R2", pass, &format!("{resp:?}"));
+        }
+
+        let _ = r.send("D3", Command::NetUnlisten { port }).await;
+    }
 }

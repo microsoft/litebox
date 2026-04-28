@@ -924,10 +924,19 @@ fn run_inner(
                     port_router.register(port, worker_id, tx.clone());
                     registered_ports.push(port);
                     info!("worker registered listen on port {port}");
+                    // File-based diagnostic
+                    use std::io::Write;
+                    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/rst-diag.log") {
+                        let _ = writeln!(f, "BROKER PORT REGISTER: port={port} worker_id={worker_id}");
+                    }
                 } else {
                     // Init proxy received a listen notification — register
                     // but no routing needed (init handles its own inbound).
                     info!("init proxy listen on port {port} (local)");
+                    use std::io::Write;
+                    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/rst-diag.log") {
+                        let _ = writeln!(f, "BROKER PORT REGISTER (init, local): port={port}");
+                    }
                 }
             } else {
                 port_router.unregister(port);

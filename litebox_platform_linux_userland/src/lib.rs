@@ -4312,8 +4312,7 @@ impl litebox::platform::IPInterfaceProvider for LinuxUserland {
                             packet[ihl + 13],
                             std::process::id()
                         );
-                        eprintln!("{}", msg.trim());
-                        // Also write to a file since fork-restored workers have stderr=/dev/null.
+                        // Write to file only — stderr is reserved for guest use.
                         use std::io::Write;
                         if let Ok(mut f) = std::fs::OpenOptions::new()
                             .create(true).append(true).open("/tmp/rst-diag.log")
@@ -4407,7 +4406,6 @@ impl litebox::platform::IPInterfaceProvider for LinuxUserland {
              listen_ports={listen_ports:?} listen_addrs={addrs_decoded:?} pid={} tid={tid}\n",
             std::process::id()
         );
-        eprintln!("{}", msg.trim());
         use std::io::Write;
         if let Ok(mut f) = std::fs::OpenOptions::new()
             .create(true)
@@ -4421,18 +4419,48 @@ impl litebox::platform::IPInterfaceProvider for LinuxUserland {
     fn on_listen_socket_change(&self, port: u16, added: bool, total_tcp: u16, caller: &str) {
         let tid = unsafe { libc::syscall(libc::SYS_gettid) };
         let action = if added { "ADDED" } else { "REMOVED" };
+        use std::io::Write;
         let msg = format!(
             "LISTEN {action}: port={port} total_tcp={total_tcp} pid={} tid={tid} caller={caller}\n",
             std::process::id()
         );
-        eprintln!("{}", msg.trim());
-        use std::io::Write;
         if let Ok(mut f) = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
             .open("/tmp/rst-diag.log")
         {
             let _ = f.write_all(msg.as_bytes());
+        }
+
+        // Notify the broker so its PortRouter can route cross-worker
+        // TCP connections to this worker.
+        match self.send_port_listen_notification(port, added) {
+            Ok(()) => {
+                let msg2 = format!(
+                    "PORT NOTIFY OK: port={port} added={added} pid={}\n",
+                    std::process::id()
+                );
+                if let Ok(mut f) = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open("/tmp/rst-diag.log")
+                {
+                    let _ = f.write_all(msg2.as_bytes());
+                }
+            }
+            Err(e) => {
+                let msg2 = format!(
+                    "PORT NOTIFY FAILED: port={port} added={added} pid={} err={e:?}\n",
+                    std::process::id()
+                );
+                if let Ok(mut f) = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open("/tmp/rst-diag.log")
+                {
+                    let _ = f.write_all(msg2.as_bytes());
+                }
+            }
         }
     }
 
@@ -4443,7 +4471,6 @@ impl litebox::platform::IPInterfaceProvider for LinuxUserland {
             "LISTEN DESTROYED: port={port} pid={} tid={tid}\nbacktrace:\n{bt}\n",
             std::process::id()
         );
-        eprintln!("{}", msg.trim());
         use std::io::Write;
         if let Ok(mut f) = std::fs::OpenOptions::new()
             .create(true)
