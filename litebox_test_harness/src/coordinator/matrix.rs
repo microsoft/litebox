@@ -46,6 +46,14 @@ pub(crate) enum Topology {
     SiblingDepth3,
     /// AB → B.
     Uncle,
+    /// A → NP (non-PIE child via SpawnRemote).
+    PieToNonPie,
+    /// NP → A (non-PIE writes, PIE reads).
+    NonPieToParent,
+    /// NPC → A (PIE-from-non-PIE reads, PIE reads).
+    NonPieChildUp,
+    /// D5 → B (depth 5 from non-PIE root, cross-subtree).
+    DeepNonPie,
 }
 
 impl Topology {
@@ -62,6 +70,10 @@ impl Topology {
             Self::SiblingDepth2 => ("AA", "AB"),
             Self::SiblingDepth3 => ("AAA", "AAB"),
             Self::Uncle => ("AB", "B"),
+            Self::PieToNonPie => ("A", "NP"),
+            Self::NonPieToParent => ("NP", "A"),
+            Self::NonPieChildUp => ("NPC", "A"),
+            Self::DeepNonPie => ("D5", "B"),
         }
     }
 
@@ -78,7 +90,19 @@ impl Topology {
             Self::SiblingDepth2 => "sibling_d2",
             Self::SiblingDepth3 => "sibling_d3",
             Self::Uncle => "uncle",
+            Self::PieToNonPie => "pie_to_nonpie",
+            Self::NonPieToParent => "nonpie_to_parent",
+            Self::NonPieChildUp => "nonpie_child_up",
+            Self::DeepNonPie => "deep_nonpie",
         }
+    }
+
+    /// Whether this topology requires non-PIE agents (NP, NPC, D3-D5).
+    fn requires_nonpie(self) -> bool {
+        matches!(
+            self,
+            Self::PieToNonPie | Self::NonPieToParent | Self::NonPieChildUp | Self::DeepNonPie
+        )
     }
 }
 
@@ -129,6 +153,10 @@ const FS_TOPOLOGIES: &[Topology] = &[
     Topology::SiblingReverse,
     Topology::GrandchildUp,
     Topology::GreatGrandchildUp,
+    Topology::PieToNonPie,
+    Topology::NonPieToParent,
+    Topology::NonPieChildUp,
+    Topology::DeepNonPie,
 ];
 
 /// Scope dimension for filesystem tests.
@@ -331,6 +359,11 @@ async fn test_host_file(r: &mut TestRunner) {
 // NETWORK
 // ═══════════════════════════════════════════════════════════════════
 
+/// Whether an agent name requires the non-PIE subtree.
+fn agent_requires_nonpie(name: &str) -> bool {
+    matches!(name, "NP" | "NPC" | "D3" | "D4" | "D5")
+}
+
 /// Net test descriptor. Listener listens, connector connects.
 struct NetTestCase {
     name: &'static str,
@@ -379,11 +412,49 @@ const NET_TESTS: &[NetTestCase] = &[
         listener: "B",
         connector: "AB",
     },
+    // Non-PIE tree: NP listens, A connects (cross-type boundary).
+    NetTestCase {
+        name: "NP_to_A",
+        listener: "NP",
+        connector: "A",
+    },
+    // PIE listens, non-PIE child connects.
+    NetTestCase {
+        name: "A_to_NPC",
+        listener: "A",
+        connector: "NPC",
+    },
+    // Non-PIE child listens, PIE from other subtree connects.
+    NetTestCase {
+        name: "NPC_to_B",
+        listener: "NPC",
+        connector: "B",
+    },
+    // Depth 5 (from non-PIE root) to depth 1 — the VS Code server path.
+    NetTestCase {
+        name: "D5_to_B",
+        listener: "D5",
+        connector: "B",
+    },
 ];
 
 async fn run_net_tests(r: &mut TestRunner) {
+    let has_nonpie = crate::find_nonpie_binary().is_some();
     let mut port = 10_001u16;
     for tc in NET_TESTS {
+        if !has_nonpie
+            && (agent_requires_nonpie(tc.listener) || agent_requires_nonpie(tc.connector))
+        {
+            r.record(
+                &format!("N.{}.listen", tc.name),
+                tc.listener,
+                true,
+                "skipped (nonpie binary not found)",
+            );
+            port += 1;
+            continue;
+        }
+
         let test_data = format!("net_{}", tc.name);
 
         let resp = r.send(tc.listener, Command::NetListen { port }).await;
@@ -427,12 +498,22 @@ async fn run_net_tests(r: &mut TestRunner) {
 // EXEC & ENV
 // ═══════════════════════════════════════════════════════════════════
 
-const EXEC_AGENTS: &[&str] = &["A", "AA", "AAA"];
+const EXEC_AGENTS: &[&str] = &["A", "AA", "AAA", "NP", "NPC", "D5"];
 
 async fn run_exec_tests(r: &mut TestRunner) {
     let self_exe = r.self_exe.clone();
+    let has_nonpie = crate::find_nonpie_binary().is_some();
 
     for &agent in EXEC_AGENTS {
+        if !has_nonpie && agent_requires_nonpie(agent) {
+            r.record(
+                &format!("X.echo.{agent}"),
+                agent,
+                true,
+                "skipped (nonpie binary not found)",
+            );
+            continue;
+        }
         // Echo test.
         let resp = r
             .send(
@@ -469,7 +550,17 @@ async fn run_exec_tests(r: &mut TestRunner) {
 }
 
 async fn run_env_tests(r: &mut TestRunner) {
+    let has_nonpie = crate::find_nonpie_binary().is_some();
     for &agent in EXEC_AGENTS {
+        if !has_nonpie && agent_requires_nonpie(agent) {
+            r.record(
+                &format!("E.HOME.{agent}"),
+                agent,
+                true,
+                "skipped (nonpie binary not found)",
+            );
+            continue;
+        }
         let resp = r.send(agent, Command::EnvGet { var: "HOME".into() }).await;
         let pass =
             matches!(&resp, Response::Ok { data: Some(d) } if !d.is_empty() && d != "NOT_SET");
@@ -1131,17 +1222,32 @@ pub(crate) async fn run_matrix_tests(r: &mut TestRunner) {
         let _ = tokio::fs::write("/shared/host_wrote.txt", "from_host").await;
     }
 
+    let has_nonpie = crate::find_nonpie_binary().is_some();
+
     // ── Filesystem: scope × topology ──
     eprintln!(
         "[matrix] === FS: shared × {} topologies ===",
         FS_TOPOLOGIES.len()
     );
     for &topo in FS_TOPOLOGIES {
+        if topo.requires_nonpie() && !has_nonpie {
+            let ts = topo.suffix();
+            r.record(
+                &format!("F.shared.{ts}.absent"),
+                topo.agents().1,
+                true,
+                "skipped (nonpie binary not found)",
+            );
+            continue;
+        }
         test_fs_crud(r, topo).await;
     }
 
     eprintln!("[matrix] === FS: /tmp isolation ===");
     for &topo in FS_TOPOLOGIES {
+        if topo.requires_nonpie() && !has_nonpie {
+            continue;
+        }
         test_tmp_isolation(r, topo).await;
     }
 
@@ -1150,6 +1256,9 @@ pub(crate) async fn run_matrix_tests(r: &mut TestRunner) {
         FS_TOPOLOGIES.len()
     );
     for &topo in FS_TOPOLOGIES {
+        if topo.requires_nonpie() && !has_nonpie {
+            continue;
+        }
         test_fs_cross_unlink(r, topo).await;
     }
 
