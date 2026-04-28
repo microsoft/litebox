@@ -303,6 +303,94 @@ async fn run_tests(self_exe: &str, filter: Option<&str>) -> Vec<TestResult> {
         .await;
     eprintln!("[coord] AA spawn children: {r:?}");
 
+    // Spawn non-PIE subtree: NP (non-PIE) under A, NPC (PIE) under NP.
+    // This exercises fork-restore from within a worker-exec host — the
+    // exact pattern when VS Code's non-PIE node binary forks children.
+    // Conditional on the non-PIE binary being available.
+    let has_nonpie = crate::find_nonpie_binary().is_some();
+    if has_nonpie {
+        eprintln!("[coord] spawning non-PIE subtree (NP → NPC)");
+        let r = runner
+            .send(
+                "A",
+                Command::SpawnRemote {
+                    children: vec!["NP".to_string()],
+                },
+            )
+            .await;
+        eprintln!("[coord] SpawnRemote NP: {r:?}");
+
+        if matches!(&r, Response::Ok { .. }) {
+            // NP (non-PIE, in worker-exec host) spawns PIE child NPC.
+            let r = runner
+                .send(
+                    "A",
+                    Command::Forward {
+                        target: "NP".to_string(),
+                        inner: Box::new(Command::Spawn {
+                            children: vec!["NPC".to_string()],
+                        }),
+                    },
+                )
+                .await;
+            eprintln!("[coord] NP spawn NPC: {r:?}");
+        }
+
+        // Deep mixed chain: AA → D3 (PIE) → D4 (non-PIE) → D5 (PIE)
+        // Mirrors the VS Code Remote-SSH process tree at depths 3-5:
+        //
+        //   A  (PIE, depth 1)  ≈ dropbear sshd
+        //   AA (PIE, depth 2)  ≈ bash (bootstrap script)
+        //   D3 (PIE, depth 3)  ≈ VS Code CLI
+        //   D4 (non-PIE, depth 4) ≈ node (VS Code Server) — worker-exec
+        //   D5 (PIE, depth 5)  ≈ node (extension host) — fork-restore from worker-exec
+        eprintln!("[coord] building deep mixed chain (D3 → D4 → D5)");
+        let r = runner
+            .send(
+                "AA",
+                Command::Spawn {
+                    children: vec!["D3".to_string()],
+                },
+            )
+            .await;
+        eprintln!("[coord] AA spawn D3: {r:?}");
+
+        if matches!(&r, Response::Ok { .. }) {
+            let r = runner
+                .send(
+                    "AA",
+                    Command::Forward {
+                        target: "D3".to_string(),
+                        inner: Box::new(Command::SpawnRemote {
+                            children: vec!["D4".to_string()],
+                        }),
+                    },
+                )
+                .await;
+            eprintln!("[coord] D3 SpawnRemote D4: {r:?}");
+
+            if matches!(&r, Response::Ok { .. }) {
+                let r = runner
+                    .send(
+                        "AA",
+                        Command::Forward {
+                            target: "D3".to_string(),
+                            inner: Box::new(Command::Forward {
+                                target: "D4".to_string(),
+                                inner: Box::new(Command::Spawn {
+                                    children: vec!["D5".to_string()],
+                                }),
+                            }),
+                        },
+                    )
+                    .await;
+                eprintln!("[coord] D4 spawn D5: {r:?}");
+            }
+        }
+    } else {
+        eprintln!("[coord] non-PIE binary not found, skipping mixed tree");
+    }
+
     let should_run = |suite: &str| filter.is_none() || filter == Some(suite);
 
     // === Matrix Tests (capability × topology × dimensions) ===
@@ -414,12 +502,14 @@ async fn run_tests(self_exe: &str, filter: Option<&str>) -> Vec<TestResult> {
     runner.results
 }
 
-/// Route a targetlike "AAA" to (direct_child, remaining_path).
-/// "A" → ("A", None), "AA" → ("A", Some("AA")), "AAA" → ("A", Some("AAA"))
+/// Route a target agent name to (direct_child, remaining_path).
+/// "A" → ("A", None), "AA" → ("A", Some("AA")), "NP" → ("A", Some("NP"))
 fn route(target: &str) -> (&str, Option<&str>) {
     match target {
         "A" | "B" => (target, None),
-        s if s.starts_with("A") => ("A", Some(s)),
+        // Agents under A: AA*, AB, NP, NPC, D3, D4, D5
+        "NP" | "NPC" | "D3" | "D4" | "D5" => ("A", Some(target)),
+        s if s.starts_with('A') => ("A", Some(s)),
         _ => (target, None),
     }
 }
@@ -429,19 +519,70 @@ fn wrap_forwards(remaining: Option<&str>, cmd: Command) -> Command {
     match remaining {
         None => cmd,
         Some(target) => {
-            // "AA" → forward to AA, "AAA" → forward to AA which forwards to AAA
+            // "AA" or "AB" → forward directly (children of A)
             if target == "AA" || target == "AB" {
                 Command::Forward {
                     target: target.to_string(),
                     inner: Box::new(cmd),
                 }
-            } else if target.starts_with("AA") {
-                // "AAA" or "AAB" → forward to AA, then forward to target
+            } else if target.starts_with("AA") && target != "AA" {
+                // "AAA", "AAB" → forward to AA, then forward to target
                 Command::Forward {
                     target: "AA".to_string(),
                     inner: Box::new(Command::Forward {
                         target: target.to_string(),
                         inner: Box::new(cmd),
+                    }),
+                }
+            } else if target == "NP" {
+                // NP is a direct child of A (via SpawnRemote)
+                Command::Forward {
+                    target: "NP".to_string(),
+                    inner: Box::new(cmd),
+                }
+            } else if target == "NPC" {
+                // NPC is a child of NP → forward through NP
+                Command::Forward {
+                    target: "NP".to_string(),
+                    inner: Box::new(Command::Forward {
+                        target: "NPC".to_string(),
+                        inner: Box::new(cmd),
+                    }),
+                }
+            } else if target == "D3" {
+                // D3 is a child of AA
+                Command::Forward {
+                    target: "AA".to_string(),
+                    inner: Box::new(Command::Forward {
+                        target: "D3".to_string(),
+                        inner: Box::new(cmd),
+                    }),
+                }
+            } else if target == "D4" {
+                // D4 is a child of D3 (under AA)
+                Command::Forward {
+                    target: "AA".to_string(),
+                    inner: Box::new(Command::Forward {
+                        target: "D3".to_string(),
+                        inner: Box::new(Command::Forward {
+                            target: "D4".to_string(),
+                            inner: Box::new(cmd),
+                        }),
+                    }),
+                }
+            } else if target == "D5" {
+                // D5 is a child of D4 (under D3 under AA)
+                Command::Forward {
+                    target: "AA".to_string(),
+                    inner: Box::new(Command::Forward {
+                        target: "D3".to_string(),
+                        inner: Box::new(Command::Forward {
+                            target: "D4".to_string(),
+                            inner: Box::new(Command::Forward {
+                                target: "D5".to_string(),
+                                inner: Box::new(cmd),
+                            }),
+                        }),
                     }),
                 }
             } else {
