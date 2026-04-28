@@ -115,6 +115,121 @@ async fn agent_loop(self_exe: &str) {
                 Err(_) => respond(&Response::NotFound).await,
             },
 
+            Command::Fork {
+                name,
+                binary,
+                inherit_listen_ports,
+            } => {
+                let exe = match binary.as_str() {
+                    "nonpie" => match crate::find_nonpie_binary() {
+                        Some(p) => p,
+                        None => {
+                            respond(&Response::Error {
+                                error: "nonpie binary not found".to_string(),
+                            })
+                            .await;
+                            continue;
+                        }
+                    },
+                    _ => self_exe.to_string(), // "self" or default
+                };
+
+                // inherit_listen_ports is tracked for future use.
+                let _ = &inherit_listen_ports;
+
+                match spawn_child(&exe, &name).await {
+                    Ok(handle) => {
+                        children.insert(name.clone(), handle);
+                        respond(&Response::Ok {
+                            data: Some(format!("forked {name} (binary={binary})")),
+                        })
+                        .await;
+                    }
+                    Err(e) => {
+                        respond(&Response::Error {
+                            error: format!("fork {name}: {e}"),
+                        })
+                        .await;
+                    }
+                }
+            }
+
+            Command::NetAccept { port, timeout_secs } => {
+                // Accept one connection on an already-listening port.
+                // The echo handler is already running from NetListen —
+                // we just wait for one connection to arrive and report.
+                //
+                // Since the echo handler auto-accepts, NetAccept is
+                // currently equivalent to "verify the listener is working"
+                // by connecting to it locally.
+                let timeout = Duration::from_secs(timeout_secs);
+                match tokio::time::timeout(
+                    timeout,
+                    tokio::net::TcpStream::connect(format!("127.0.0.1:{port}")),
+                )
+                .await
+                {
+                    Ok(Ok(mut stream)) => {
+                        let probe = b"__accept_probe__";
+                        let _ = stream.write_all(probe).await;
+                        let _ = stream.flush().await;
+                        let mut buf = [0u8; 64];
+                        match tokio::time::timeout(
+                            Duration::from_secs(5),
+                            stream.read(&mut buf),
+                        )
+                        .await
+                        {
+                            Ok(Ok(n)) if n > 0 => {
+                                respond(&Response::Connected {
+                                    echo: String::from_utf8_lossy(&buf[..n]).to_string(),
+                                })
+                                .await;
+                            }
+                            _ => {
+                                respond(&Response::ConnectFailed {
+                                    error: "accept probe: no echo".to_string(),
+                                })
+                                .await;
+                            }
+                        }
+                    }
+                    Ok(Err(e)) => {
+                        respond(&Response::ConnectFailed {
+                            error: format!("accept probe connect: {e}"),
+                        })
+                        .await;
+                    }
+                    Err(_) => {
+                        respond(&Response::ConnectFailed {
+                            error: "accept probe timeout".to_string(),
+                        })
+                        .await;
+                    }
+                }
+            }
+
+            Command::NetCloseListener { port } => {
+                // Close the listen socket but leave the echo handler task.
+                // This reproduces the parent-close-after-fork pattern.
+                if let Some(task) = listeners.remove(&port) {
+                    task.abort();
+                }
+                respond(&Response::Ok {
+                    data: Some(format!("listener on port {port} closed")),
+                })
+                .await;
+            }
+
+            Command::GetPid => {
+                let pid = std::process::id();
+                respond(&Response::Ok {
+                    data: Some(pid.to_string()),
+                })
+                .await;
+            }
+
+
             Command::FsWrite { path, data } => {
                 if let Some(parent) = std::path::Path::new(&path).parent() {
                     let _ = tokio::fs::create_dir_all(parent).await;
@@ -430,42 +545,6 @@ async fn agent_loop(self_exe: &str) {
 
             Command::Go => {
                 respond(&Response::Ok { data: None }).await;
-            }
-
-            Command::NetListenForkClose { port } => {
-                // Reproduce the VS Code CLI pattern using libc::fork():
-                // 1. bind+listen on port
-                // 2. fork() — child inherits the listen fd
-                // 3. Parent closes its listen fd
-                // 4. Child calls accept() on the inherited fd
-                //
-                // Uses tcp-fork-listen-accept subcommand which does the
-                // fork+close+accept pattern with libc::fork() (no exec),
-                // so the child truly inherits the fd without re-binding.
-                let self_exe = std::env::current_exe()
-                    .unwrap_or_else(|_| std::path::PathBuf::from("litebox_test_harness"));
-                let child = std::process::Command::new(&self_exe)
-                    .args(["tcp-fork-listen-accept", &port.to_string()])
-                    .stdout(std::process::Stdio::inherit())
-                    .stderr(std::process::Stdio::inherit())
-                    .spawn();
-                match child {
-                    Ok(mut c) => {
-                        let pid = c.id();
-                        tokio::spawn(async move {
-                            let _ = tokio::task::spawn_blocking(move || c.wait()).await;
-                        });
-                        // Give the subprocess time to bind+listen+fork.
-                        tokio::time::sleep(Duration::from_secs(1)).await;
-                        respond(&Response::Listening { port }).await;
-                        eprintln!("[agent] NetListenForkClose: started tcp-fork-listen-accept pid={pid}");
-                    }
-                    Err(e) => {
-                        respond(&Response::Error {
-                            error: format!("spawn failed: {e}"),
-                        }).await;
-                    }
-                }
             }
 
             Command::UnixListen { path } => {

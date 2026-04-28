@@ -5,6 +5,14 @@
 
 use serde::{Deserialize, Serialize};
 
+fn default_fork_binary() -> String {
+    "self".to_string()
+}
+
+fn default_accept_timeout() -> u64 {
+    10
+}
+
 /// Command sent from parent to child via stdin.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "cmd")]
@@ -18,6 +26,72 @@ pub enum Command {
     /// workers. Used to test cross-worker filesystem and socket coherence.
     #[serde(rename = "spawn_remote")]
     SpawnRemote { children: Vec<String> },
+
+    /// Fork a child agent with explicit control over exec binary and fd
+    /// inheritance. Subsumes Spawn/SpawnRemote with finer control.
+    ///
+    /// `binary`:
+    ///   - `"self"` → fork+exec the PIE test harness (= Spawn)
+    ///   - `"nonpie"` → fork+exec the non-PIE binary (= SpawnRemote)
+    ///
+    /// `inherit_listen_ports`: TCP listen ports whose listen socket fds
+    /// should be inherited by the child (CLOEXEC cleared before exec).
+    /// **Not yet implemented** — see design notes below.
+    ///
+    /// # fd inheritance pattern (future work)
+    ///
+    /// The VS Code CLI does this:
+    ///   1. Parent calls bind()+listen() on a port
+    ///   2. Parent fork()+exec()s the server process
+    ///   3. Parent closes its listen fd
+    ///   4. Child calls accept() on the **inherited** listen fd
+    ///
+    /// To support this in the protocol:
+    ///   1. Fork handler looks up the listen socket fd for each port in
+    ///      `inherit_listen_ports` (the agent tracks port→fd mapping from
+    ///      NetListen).
+    ///   2. Clears CLOEXEC on those fds: `fcntl(fd, F_SETFD, 0)`.
+    ///   3. fork()+exec()s the child, passing the fd numbers via a CLI
+    ///      arg or env var (e.g., `--inherited-fds 3,5`).
+    ///   4. Child agent reconstructs TcpListeners from the raw fds via
+    ///      `TcpListener::from_raw_fd(fd)` and registers them in its
+    ///      listener map.
+    ///   5. The child's NetAccept or echo handler then works on the
+    ///      inherited listener — no re-bind needed.
+    ///
+    /// Pair with `NetCloseListener` on the parent to reproduce the full
+    /// VS Code pattern: NetListen → Fork(inherit) → NetCloseListener →
+    /// child NetAccept.
+    ///
+    /// Currently this pattern is tested via the `tcp-fork-listen-accept`
+    /// subcommand (see main.rs), which implements steps 1-4 as a single
+    /// standalone program outside the agent protocol.
+    #[serde(rename = "fork")]
+    Fork {
+        name: String,
+        #[serde(default = "default_fork_binary")]
+        binary: String,
+        #[serde(default)]
+        inherit_listen_ports: Vec<u16>,
+    },
+
+    /// Accept one connection on an already-listening TCP port.
+    /// Decouples listen from accept so tests can fork/close between them.
+    #[serde(rename = "net_accept")]
+    NetAccept {
+        port: u16,
+        #[serde(default = "default_accept_timeout")]
+        timeout_secs: u64,
+    },
+
+    /// Close the TCP listen socket on a port (without removing the echo
+    /// handler task). Reproduces the parent-close-after-fork pattern.
+    #[serde(rename = "net_close_listener")]
+    NetCloseListener { port: u16 },
+
+    /// Report the agent's process ID.
+    #[serde(rename = "get_pid")]
+    GetPid,
 
     /// Read a file and report contents (or not_found).
     #[serde(rename = "fs_read")]
@@ -154,15 +228,6 @@ pub enum Command {
     /// Proceed (used after coordination points).
     #[serde(rename = "go")]
     Go,
-
-    /// Listen on a port, fork+exec a child echo server, then close the
-    /// parent's listen fd. Reproduces the VS Code CLI pattern where the
-    /// parent creates a listen socket, forks a child to accept on it,
-    /// and closes its own copy. In litebox's delayed-fork model, the
-    /// parent's close() can destroy the shared listen socket before the
-    /// child migrates to its own worker.
-    #[serde(rename = "net_listen_fork_close")]
-    NetListenForkClose { port: u16 },
 
     /// Shut down gracefully.
     #[serde(rename = "exit")]

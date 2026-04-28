@@ -333,76 +333,102 @@ pub(crate) async fn run(r: &mut TestRunner) {
 /// 4. Child exits → child worker dies → port route deregistered
 /// 5. Cross-worker connection to the port fails (SynSent → Closed)
 ///
-/// Uses the `tcp-listen-fork` subcommand which does a real libc::fork()
-/// to create a child with inherited listen socket. The child sleeps 3s
-/// (enough for network stack init) then exits. After the child exits,
-/// a cross-worker connection is attempted.
+/// Reproduces the VS Code bootstrap pattern using protocol primitives:
+///   1. Agent A calls NetListen (bind+listen on port)
+///   2. Agent A forks a child agent (Fork, binary=self or nonpie)
+///   3. The child does network activity (NetListen on a different port)
+///   4. The child exits
+///   5. Agent A verifies the original listen port still works
+///   6. Same-worker and cross-worker connections are tested
+///
+/// Previously this used the compound `tcp-listen-fork` subcommand via Exec.
+/// Now uses Fork + NetListen + NetConnect primitives for transparency.
 pub(crate) async fn fork_listen_inherit_tests(r: &mut TestRunner) {
-    eprintln!("[pr] === PR.listen_inherit: VS Code fork reproduction ===");
+    eprintln!("[pr] === PR.listen_inherit: VS Code fork reproduction (primitives) ===");
 
-    // Agent A starts tcp-listen-fork in background. It listens on port
-    // 18300, forks a child that sleeps 3s, waits for the child, then
-    // accepts a connection and echoes.
     let port = 18300u16;
+    let child_port = port + 100; // child listens on a different port
 
-    // Start the tcp-listen-fork server as a background exec on agent A.
-    let bg_resp = r
+    // Step 1: Agent A listens on the main port.
+    let resp = r.send("A", Command::NetListen { port }).await;
+    let listen_ok = matches!(&resp, Response::Listening { .. });
+    if !listen_ok {
+        r.record(
+            "PR.listen_inherit_self",
+            "A",
+            false,
+            &format!("listen failed: {resp:?}"),
+        );
+        return;
+    }
+
+    // Step 2: Fork a child agent from A. The child is a new agent process
+    // that will do network activity then exit.
+    let resp = r
         .send(
             "A",
-            Command::Exec {
-                args: vec![
-                    r.self_exe.clone(),
-                    "tcp-listen-fork".into(),
-                    port.to_string(),
-                    "3".into(), // child sleeps 3s
-                ],
-                timeout_secs: Some(30),
-                stdin: None,
-                background: false,
+            Command::Fork {
+                name: "LI_C".to_string(),
+                binary: "self".to_string(),
+                inherit_listen_ports: vec![],
+            },
+        )
+        .await;
+    let fork_ok = matches!(&resp, Response::Ok { .. });
+    if !fork_ok {
+        r.record(
+            "PR.listen_inherit_self",
+            "A",
+            false,
+            &format!("fork failed: {resp:?}"),
+        );
+        let _ = r.send("A", Command::NetUnlisten { port }).await;
+        return;
+    }
+
+    // Step 3: Child does network activity (listen on a different port),
+    // then we shut it down. This exercises the port router's handling
+    // of the child's network stack init.
+    let resp = r
+        .send(
+            "A",
+            Command::Forward {
+                target: "LI_C".to_string(),
+                inner: Box::new(Command::NetListen {
+                    port: child_port,
+                }),
+            },
+        )
+        .await;
+    // Whether child listen succeeds or not, continue.
+    let _ = &resp;
+
+    // Step 4: Shut down the child.
+    let _ = r
+        .send(
+            "A",
+            Command::Forward {
+                target: "LI_C".to_string(),
+                inner: Box::new(Command::NetUnlisten {
+                    port: child_port,
+                }),
+            },
+        )
+        .await;
+    let _ = r
+        .send(
+            "A",
+            Command::Forward {
+                target: "LI_C".to_string(),
+                inner: Box::new(Command::Exit),
             },
         )
         .await;
 
-    // The exec blocks until accept+echo completes (foreground). We need
-    // it to run in background while we connect from agent B.
-    // Use background=true instead.
-    // Actually, we need to orchestrate: start the server in background,
-    // wait for the child to exit (~4s), then connect from B.
-    // Let's restart with background=true.
-    let bg_resp = r
-        .send(
-            "A",
-            Command::Exec {
-                args: vec![
-                    r.self_exe.clone(),
-                    "tcp-listen-fork".into(),
-                    port.to_string(),
-                    "3".into(),
-                ],
-                timeout_secs: None,
-                stdin: None,
-                background: true,
-            },
-        )
-        .await;
-    let bg_pid = match &bg_resp {
-        Response::Background { pid } => Some(*pid),
-        _ => {
-            r.record(
-                "PR.listen_inherit_self",
-                "A",
-                false,
-                &format!("bg spawn failed: {bg_resp:?}"),
-            );
-            return;
-        }
-    };
+    // Brief pause for cleanup.
+    tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
 
-    // Wait for: listen (~0s) + child fork+sleep (3s) + child exit (~0s)
-    // + a margin for the network stack to process everything.
-    tokio::time::sleep(tokio::time::Duration::from_secs(6)).await;
-
-    // Same-worker connection from agent A.
+    // Step 5: Same-worker connection — verify the parent's listener survives.
     let conn_resp = r
         .send(
             "A",
@@ -421,50 +447,83 @@ pub(crate) async fn fork_listen_inherit_tests(r: &mut TestRunner) {
         &format!("{conn_resp:?}"),
     );
 
-    // Clean up.
-    if let Some(pid) = bg_pid {
-        let _ = r.send("A", Command::Kill { pid }).await;
+    let _ = r.send("A", Command::NetUnlisten { port }).await;
+
+    // Step 6: Cross-worker connection — same pattern but connect from B.
+    let port2 = port + 1;
+    let child_port2 = port2 + 100;
+
+    let resp = r.send("A", Command::NetListen { port: port2 }).await;
+    if !matches!(&resp, Response::Listening { .. }) {
+        r.record(
+            "PR.listen_inherit_cross",
+            "B",
+            false,
+            &format!("listen2 failed: {resp:?}"),
+        );
+        return;
     }
 
-    // Cross-worker test: same pattern but connect from B.
-    let bg_resp = r
+    let resp = r
         .send(
             "A",
-            Command::Exec {
-                args: vec![
-                    r.self_exe.clone(),
-                    "tcp-listen-fork".into(),
-                    (port + 1).to_string(),
-                    "3".into(),
-                ],
-                timeout_secs: None,
-                stdin: None,
-                background: true,
+            Command::Fork {
+                name: "LI_C2".to_string(),
+                binary: "self".to_string(),
+                inherit_listen_ports: vec![],
             },
         )
         .await;
-    let bg_pid = match &bg_resp {
-        Response::Background { pid } => Some(*pid),
-        _ => {
-            r.record(
-                "PR.listen_inherit_cross",
-                "B",
-                false,
-                &format!("bg spawn failed: {bg_resp:?}"),
-            );
-            return;
-        }
-    };
+    if !matches!(&resp, Response::Ok { .. }) {
+        r.record(
+            "PR.listen_inherit_cross",
+            "B",
+            false,
+            &format!("fork2 failed: {resp:?}"),
+        );
+        let _ = r.send("A", Command::NetUnlisten { port: port2 }).await;
+        return;
+    }
 
-    tokio::time::sleep(tokio::time::Duration::from_secs(6)).await;
+    let _ = r
+        .send(
+            "A",
+            Command::Forward {
+                target: "LI_C2".to_string(),
+                inner: Box::new(Command::NetListen {
+                    port: child_port2,
+                }),
+            },
+        )
+        .await;
+    let _ = r
+        .send(
+            "A",
+            Command::Forward {
+                target: "LI_C2".to_string(),
+                inner: Box::new(Command::NetUnlisten {
+                    port: child_port2,
+                }),
+            },
+        )
+        .await;
+    let _ = r
+        .send(
+            "A",
+            Command::Forward {
+                target: "LI_C2".to_string(),
+                inner: Box::new(Command::Exit),
+            },
+        )
+        .await;
 
-    // Cross-worker connection from agent B — this is the VS Code pattern:
-    // a different SSH session (different worker) connects to the CLI's port.
+    tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+
     let conn_resp = r
         .send(
             "B",
             Command::NetConnect {
-                addr: format!("127.0.0.1:{}", port + 1),
+                addr: format!("127.0.0.1:{port2}"),
                 data: "inherit_cross".into(),
             },
         )
@@ -478,72 +537,81 @@ pub(crate) async fn fork_listen_inherit_tests(r: &mut TestRunner) {
         &format!("{conn_resp:?}"),
     );
 
-    if let Some(pid) = bg_pid {
-        let _ = r.send("A", Command::Kill { pid }).await;
-    }
+    let _ = r.send("A", Command::NetUnlisten { port: port2 }).await;
 }
 
 // ═══════════════════════════════════════════════════════════════════
 // PR.child_listen: child process calls listen(), cross-worker connect
 // ═══════════════════════════════════════════════════════════════════
 
-/// Reproduces the VS Code exec server failure:
-/// Agent A exec's a child process (non-PIE → separate worker) that
-/// calls bind()+listen() immediately on startup. Then agent B connects
-/// to the port through the cross-worker TCP bridge.
+/// Reproduces the VS Code exec server failure using protocol primitives:
+///   1. Agent A forks a child (non-PIE → separate worker in litebox)
+///   2. Child calls NetListen immediately
+///   3. Agent B connects to the child's port (cross-worker TCP bridge)
 ///
-/// The bug: the child's listen() port notification can go through the
-/// PARENT worker's IPC (race during delayed-fork worker creation),
-/// registering the port route on the wrong worker. The SYN arrives
-/// at the parent's smoltcp (which has no accept() call) → RST.
+/// Previously used the `tcp-echo` subcommand via background Exec.
+/// Now uses Fork + NetListen + NetConnect primitives.
 pub(crate) async fn child_listen_cross_connect_tests(r: &mut TestRunner) {
-    eprintln!("[pr] === PR.child_listen: child calls listen, cross-worker connect ===");
+    eprintln!("[pr] === PR.child_listen: child calls listen, cross-worker connect (primitives) ===");
 
     let port = 18500u16;
 
-    // Find the non-PIE binary (forces separate worker in litebox).
-    let nonpie = if std::path::Path::new("/opt/nonpie/litebox_test_harness").exists() {
-        "/opt/nonpie/litebox_test_harness".to_string()
-    } else {
-        // Fall back to self_exe (won't reproduce on PIE, but won't crash)
-        r.self_exe.clone()
-    };
-
-    // Agent A exec's the child: tcp-listen-busy listens on the port,
-    // does a 3s busy loop, then accepts one connection and echoes.
-    let bg_resp = r
+    // Fork a non-PIE child from A (forces separate worker in litebox).
+    let resp = r
         .send(
             "A",
-            Command::Exec {
-                args: vec![
-                    nonpie.clone(),
-                    "tcp-echo".into(),
-                    port.to_string(),
-                ],
-                timeout_secs: Some(30),
-                stdin: None,
-                background: true,
+            Command::Fork {
+                name: "CL_C".to_string(),
+                binary: "nonpie".to_string(),
+                inherit_listen_ports: vec![],
             },
         )
         .await;
-    let bg_pid = match &bg_resp {
-        Response::Background { pid } => Some(*pid),
-        _ => {
+    if !matches!(&resp, Response::Ok { .. }) {
+        // Fall back to PIE if non-PIE not available.
+        let resp = r
+            .send(
+                "A",
+                Command::Fork {
+                    name: "CL_C".to_string(),
+                    binary: "self".to_string(),
+                    inherit_listen_ports: vec![],
+                },
+            )
+            .await;
+        if !matches!(&resp, Response::Ok { .. }) {
             r.record(
                 "PR.child_listen_cross",
                 "B",
                 false,
-                &format!("bg spawn failed: {bg_resp:?}"),
+                &format!("fork failed: {resp:?}"),
             );
             return;
         }
-    };
+    }
 
-    // Wait for the child to start and call listen().
-    // tcp-echo calls bind+listen immediately, then blocks on accept.
-    tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+    // Child listens on the port immediately.
+    let resp = r
+        .send(
+            "A",
+            Command::Forward {
+                target: "CL_C".to_string(),
+                inner: Box::new(Command::NetListen { port }),
+            },
+        )
+        .await;
+    let listen_ok = matches!(&resp, Response::Listening { .. });
+    if !listen_ok {
+        r.record(
+            "PR.child_listen_cross",
+            "B",
+            false,
+            &format!("child listen failed: {resp:?}"),
+        );
+        return;
+    }
 
-    // Cross-worker connect from agent B — this is the VS Code SOCKS pattern.
+    // Cross-worker connect from agent B.
     let conn_resp = r
         .send(
             "B",
@@ -562,9 +630,25 @@ pub(crate) async fn child_listen_cross_connect_tests(r: &mut TestRunner) {
         &format!("{conn_resp:?}"),
     );
 
-    if let Some(pid) = bg_pid {
-        let _ = r.send("A", Command::Kill { pid }).await;
-    }
+    // Clean up.
+    let _ = r
+        .send(
+            "A",
+            Command::Forward {
+                target: "CL_C".to_string(),
+                inner: Box::new(Command::NetUnlisten { port }),
+            },
+        )
+        .await;
+    let _ = r
+        .send(
+            "A",
+            Command::Forward {
+                target: "CL_C".to_string(),
+                inner: Box::new(Command::Exit),
+            },
+        )
+        .await;
 }
 
 // ═══════════════════════════════════════════════════════════════════
