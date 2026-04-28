@@ -29,9 +29,66 @@ also not a substitute for a harness test.
 
 Coding agent sessions run in separate git worktrees and branches. When a
 session also brings up the Docker container, it must use a unique
-container name, ssh port, and ideally its own `CARGO_TARGET_DIR` so
-parallel sessions do not invalidate each other's incremental builds or
-collide on host resources.
+container name, ssh port, and its own target directory so parallel
+sessions do not invalidate each other's incremental builds or collide on
+host resources.
+
+### Build target directory convention
+
+This project must be built on ext4 (not NTFS) for performance. Each git
+worktree **must** have its own target directory under `~/litebox-out/`:
+
+```bash
+WORKTREE=$(basename $(git rev-parse --show-toplevel))
+cargo build --target-dir ~/litebox-out/$WORKTREE
+
+# Non-PIE variant for test harness
+cargo rustc -p litebox_test_harness --target-dir ~/litebox-out/$WORKTREE/nonpie -- -C link-args=-no-pie
+```
+
+**Never use `--target-dir ~/litebox-out` directly** — multiple worktrees
+sharing the same target dir causes stale binary contamination (one
+session's build overwrites another's binaries).
+
+### Running tests
+
+Always use the `litebox-test` Docker image. See `litebox_test_harness/CLAUDE.md`
+for test authoring rules.
+
+```bash
+WORKTREE=$(basename $(git rev-parse --show-toplevel))
+
+# Native (gold standard — real kernel):
+docker run --rm --cap-add SYS_PTRACE \
+  -v ~/litebox-out/$WORKTREE/debug:/opt/litebox:ro \
+  -v ~/litebox-out/$WORKTREE/nonpie/debug:/opt/nonpie:ro \
+  litebox-test /opt/litebox/litebox_test_harness spawn-tree
+
+# Litebox sandbox (tests the shim):
+docker run --rm --cap-add SYS_PTRACE -e LITEBOX_NO_AUDIT=1 \
+  -v ~/litebox-out/$WORKTREE/debug:/opt/litebox:ro \
+  -v ~/litebox-out/$WORKTREE/nonpie/debug:/opt/nonpie:ro \
+  litebox-test /opt/litebox/litebox_tool_executor \
+    --rootfs / --record-baseline \
+    -- /opt/litebox/litebox_test_harness spawn-tree
+```
+
+Running `litebox_test_harness` directly (without `litebox_tool_executor`)
+tests the **native kernel**, NOT litebox's shim. The coordinator prints
+`[coord] runtime:` at startup to identify the environment.
+
+### Docker images
+
+```bash
+docker build --target litebox-test   -t litebox-test   -f litebox_tool_executor/rootfs/Dockerfile .
+docker build --target litebox-vscode -t litebox-vscode -f litebox_tool_executor/rootfs/Dockerfile .
+```
+
+### Logging
+
+Never write diagnostic output to stdout or stderr from the runner or shim —
+these are reserved for guest use (VS Code captures them). Use
+`debug_log_print` which writes to `/tmp/rst-diag.log`.
 
 ## Code standards
 
