@@ -1135,25 +1135,13 @@ impl<FS: ShimFS> UnixStream<FS> {
             Ok((listen.backlog.clone(), listen.tcp_proxy.clone()))
         })?;
 
-        // Before each attempt, drain any pending TCP connections from the
-        // internal cross-worker TCP listener into the unix socket backlog.
-        let drain_tcp = || {
-            self.with_state_mut_ref(|state| {
-                if let UnixStreamState::Listen(listen) = state {
-                    listen.drain_tcp_to_backlog();
-                }
-            });
-        };
-
-        drain_tcp();
-
         cx.wait_on_events(
             is_nonblocking,
             Events::IN,
             |observer, mask| {
                 backlog.pollee.register_observer(observer.clone(), mask);
-                // Also register on the TCP proxy so we wake up when cross-
-                // worker TCP connections arrive.
+                // Also register on the TCP proxy so we wake when cross-worker
+                // TCP connections complete the handshake.
                 if let Some(ref proxy) = tcp_proxy {
                     use litebox::event::IOPollable;
                     proxy.register_observer(observer, mask);
@@ -1161,14 +1149,52 @@ impl<FS: ShimFS> UnixStream<FS> {
                 Ok(())
             },
             || {
-                drain_tcp();
-                let accepted = backlog.try_accept()?;
-                if let Some(peer) = peer.as_deref_mut() {
-                    *peer = accepted.get_peer_addr();
+                // First try to accept from the local backlog (same-worker).
+                match backlog.try_accept() {
+                    Ok(accepted) => {
+                        if let Some(peer) = peer.as_deref_mut() {
+                            *peer = accepted.get_peer_addr();
+                        }
+                        return Ok(UnixSocketInner::Stream(UnixStream::new(
+                            UnixStreamState::Connected(accepted),
+                        )));
+                    }
+                    Err(TryOpError::TryAgain) => {}
+                    Err(e) => return Err(e),
                 }
-                Ok(UnixSocketInner::Stream(UnixStream::new(
-                    UnixStreamState::Connected(accepted),
-                )))
+
+                // Then try to accept from the internal TCP listener (cross-worker).
+                // Access tcp_fd from the listen state each time since it's not Clone.
+                let result = self.with_state_ref(|state| {
+                    let listen = state.listen()?;
+                    let tcp_fd = listen.tcp_fd.as_ref()?;
+                    let accepted = listen.global.net.lock().accept(tcp_fd, None).ok()?;
+                    let proxy = listen.global.initialize_socket(
+                        &accepted,
+                        SockType::Stream,
+                        SockFlags::empty(),
+                    );
+                    Some(UnixConnectedStream {
+                        addr: AddrView {
+                            addr: Some(listen.backlog.addr.clone()),
+                            peer: None,
+                        },
+                        transport: UnixTransport::Tcp { proxy },
+                        peer_cred: listen.backlog.listener_cred,
+                        pollee: Arc::new(Pollee::new()),
+                    })
+                });
+
+                if let Some(connected) = result {
+                    if let Some(peer) = peer.as_deref_mut() {
+                        *peer = connected.get_peer_addr();
+                    }
+                    return Ok(UnixSocketInner::Stream(UnixStream::new(
+                        UnixStreamState::Connected(connected),
+                    )));
+                }
+
+                Err(TryOpError::TryAgain)
             },
         )
         .map_err(Errno::from)

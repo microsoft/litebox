@@ -1088,6 +1088,114 @@ async fn run_unix_tests(r: &mut TestRunner) {
             }
         }
     }
+
+    // Diagnostic: verify sidecar file and TCP port reachability for cross-worker cases.
+    // This helps debug whether the TCP listener, sidecar, and broker routing work.
+    {
+        let sock = "/tmp/um_diag_xworker.sock".to_string();
+        let sidecar = format!("{}.litebox-uds-meta", sock);
+
+        // D3 listens (same worker as init/A/B), then check sidecar from D4 (different worker).
+        if has_nonpie {
+            let resp = r
+                .send("D3", Command::UnixListen { path: sock.clone() })
+                .await;
+            let listen_ok = matches!(&resp, Response::UnixListening { .. });
+            r.record("U.diag.listen", "D3", listen_ok, &format!("{resp:?}"));
+
+            if listen_ok {
+                // Read the sidecar file from the listener's own worker.
+                let resp = r
+                    .send(
+                        "D3",
+                        Command::FsRead {
+                            path: sidecar.clone(),
+                        },
+                    )
+                    .await;
+                let sidecar_content = match &resp {
+                    Response::Ok {
+                        data: Some(content),
+                    } => content.clone(),
+                    _ => String::new(),
+                };
+                let has_sidecar = !sidecar_content.is_empty();
+                r.record(
+                    "U.diag.sidecar_local",
+                    "D3",
+                    has_sidecar,
+                    &format!("sidecar={sidecar_content:?} resp={resp:?}"),
+                );
+
+                // Read the sidecar from the remote worker (D4).
+                let resp = r
+                    .send(
+                        "D4",
+                        Command::FsRead {
+                            path: sidecar.clone(),
+                        },
+                    )
+                    .await;
+                let remote_content = match &resp {
+                    Response::Ok {
+                        data: Some(content),
+                    } => content.clone(),
+                    _ => String::new(),
+                };
+                r.record(
+                    "U.diag.sidecar_remote",
+                    "D4",
+                    !remote_content.is_empty(),
+                    &format!("sidecar={remote_content:?} resp={resp:?}"),
+                );
+
+                // If sidecar has a port, try a raw TCP connect from D4.
+                if let Ok(port) = sidecar_content.trim().parse::<u16>() {
+                    if port > 0 {
+                        // Verify: does regular TCP listen+accept work on this port?
+                        // D3 does NetListen on a new port, D4 does NetConnect.
+                        let tcp_test_port = port + 1;
+                        let resp = r
+                            .send(
+                                "D3",
+                                Command::NetListen {
+                                    port: tcp_test_port,
+                                },
+                            )
+                            .await;
+                        let tcp_listen_ok = matches!(&resp, Response::Listening { .. });
+                        r.record(
+                            "U.diag.tcp_listen",
+                            "D3",
+                            tcp_listen_ok,
+                            &format!("port={tcp_test_port} resp={resp:?}"),
+                        );
+
+                        if tcp_listen_ok {
+                            let resp = r
+                                .send(
+                                    "D4",
+                                    Command::NetConnect {
+                                        addr: format!("127.0.0.1:{tcp_test_port}"),
+                                        data: "TCP_XWORKER_TEST".to_string(),
+                                    },
+                                )
+                                .await;
+                            let tcp_xworker = matches!(&resp, Response::Connected { echo } if echo.contains("TCP_XWORKER_TEST"));
+                            r.record(
+                                "U.diag.tcp_xworker_echo",
+                                "D4",
+                                tcp_xworker,
+                                &format!("port={tcp_test_port} resp={resp:?}"),
+                            );
+                        }
+                    }
+                }
+
+                let _ = r.send("D3", Command::UnixUnlisten { path: sock }).await;
+            }
+        }
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════
