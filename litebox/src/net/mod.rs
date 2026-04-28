@@ -1117,7 +1117,8 @@ where
         // Handle loopback connections (127.0.0.0/8 or self IP).
         // smoltcp can't route packets to its own sockets. Redirect to the
         // gateway (broker) which can hairpin via inbound port forwarding.
-        let addr = if addr.ip().is_loopback() || *addr.ip() == INTERFACE_IP_ADDR {
+        let is_redirect = addr.ip().is_loopback() || *addr.ip() == INTERFACE_IP_ADDR;
+        let addr = if is_redirect {
             &SocketAddrV4::new(GATEWAY_IP_ADDR, addr.port())
         } else {
             addr

@@ -719,9 +719,26 @@ impl<FS: ShimFS> GlobalState<FS> {
         fd: &SocketFd,
         sockaddr: SocketAddr,
     ) -> Result<(), Errno> {
-        if sockaddr.port() == 0 || sockaddr.ip().is_unspecified() {
+        if sockaddr.port() == 0 {
             return Err(Errno::ECONNREFUSED);
         }
+        // Linux treats connect(0.0.0.0:port) as connect(127.0.0.1:port).
+        // Similarly, connect to the guest's own virtual interface IP
+        // (10.0.0.2 in smoltcp) should be treated as loopback.
+        // Apply these mappings here so the Network::connect redirect
+        // (which converts loopback to the gateway) handles them correctly.
+        let sockaddr = match sockaddr {
+            SocketAddr::V4(v4)
+                if v4.ip().is_unspecified()
+                    || *v4.ip() == core::net::Ipv4Addr::new(10, 0, 0, 2) =>
+            {
+                SocketAddr::V4(core::net::SocketAddrV4::new(
+                    core::net::Ipv4Addr::LOCALHOST,
+                    v4.port(),
+                ))
+            }
+            other => other,
+        };
         let mut check_progress = false;
         cx.wait_on_events::<_, Errno>(
             self.get_status(fd).contains(OFlags::NONBLOCK),
