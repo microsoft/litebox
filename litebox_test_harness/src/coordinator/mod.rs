@@ -17,6 +17,61 @@ use crate::protocol::{Command, Response};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::time::Duration;
 
+/// Detect whether we're running inside litebox or on native Linux.
+///
+/// Returns a human-readable string like:
+///   "litebox (rewritten syscalls, smoltcp network)"
+///   "native Linux (WSL2/Docker, real kernel syscalls)"
+fn detect_runtime_environment() -> String {
+    // Check 1: Look for litebox's syscall rewriting artifacts in /proc/self/maps.
+    // The rewriter patches syscall instructions and maps a trampoline page.
+    let has_trampoline = std::fs::read_to_string("/proc/self/maps")
+        .map(|maps| maps.contains("litebox_rtld_audit") || maps.contains("[trampoline]"))
+        .unwrap_or(false);
+
+    // Check 2: litebox's synthetic /proc/self/stat reports the runner's
+    // host process name (e.g., "litebox_broker" or "litebox_runner")
+    // instead of the guest binary's actual name. If we're the test harness
+    // but /proc/self/stat says we're litebox_broker, we're in the sandbox.
+    let proc_stat_litebox = std::fs::read_to_string("/proc/self/stat")
+        .map(|s| s.contains("(litebox_broker)") || s.contains("(litebox_runner"))
+        .unwrap_or(false);
+
+    // Check 2: litebox sets specific environment variables for the guest.
+    let has_litebox_env = std::env::var("LITEBOX_RUNNER").is_ok();
+
+    // Check 3: Check if PID 1 is the litebox init (not systemd/init).
+    let pid1_is_litebox = std::fs::read_to_string("/proc/1/cmdline")
+        .map(|cmd| cmd.contains("litebox") || cmd.contains("dropbear"))
+        .unwrap_or(false);
+
+    // Check 4: Network — litebox uses 10.0.0.x virtual network.
+    let has_virtual_net = std::fs::read_to_string("/proc/net/fib_trie")
+        .map(|t| t.contains("10.0.0.2"))
+        .unwrap_or(false);
+
+    if has_trampoline || has_litebox_env || proc_stat_litebox {
+        format!(
+            "litebox sandbox (trampoline={has_trampoline} env={has_litebox_env} \
+             proc_stat={proc_stat_litebox} vnet={has_virtual_net} pid1_litebox={pid1_is_litebox})"
+        )
+    } else if pid1_is_litebox {
+        // Running inside litebox's Docker container but NOT through the runner.
+        // Tests will use native kernel syscalls, not litebox's shim.
+        format!(
+            "WARNING: litebox container but NOT sandboxed! \
+             Tests use native kernel, not litebox shim. \
+             To test litebox, run through litebox_tool_executor or litebox_runner. \
+             (pid1_litebox={pid1_is_litebox} vnet={has_virtual_net})"
+        )
+    } else {
+        format!(
+            "native Linux (gold standard — real kernel syscalls, \
+             pid1_litebox={pid1_is_litebox} vnet={has_virtual_net})"
+        )
+    }
+}
+
 /// Create an Exec command with default 10s timeout.
 pub(crate) fn exec(args: Vec<String>) -> Command {
     Command::Exec {
@@ -258,6 +313,13 @@ pub fn run_filtered(self_exe: &str, filter: Option<&str>) -> Vec<TestResult> {
 }
 
 async fn run_tests(self_exe: &str, filter: Option<&str>) -> Vec<TestResult> {
+    // Detect runtime environment: litebox sandbox vs native Linux.
+    // This is critical for interpreting test results — tests running on
+    // native Linux validate the gold-standard kernel behavior, while
+    // tests running inside litebox validate the sandbox's emulation.
+    let runtime_env = detect_runtime_environment();
+    eprintln!("[coord] runtime: {runtime_env}");
+
     // The non-PIE binary (/litebox-test-harness-nonpie) is pre-built via:
     //   cargo rustc -p litebox_test_harness --target-dir target/nonpie -- -C link-args=-no-pie
     // It must be copied to the rootfs before running tests.

@@ -732,6 +732,12 @@ impl<FS: ShimFS> GlobalState<FS> {
                 if v4.ip().is_unspecified()
                     || *v4.ip() == core::net::Ipv4Addr::new(10, 0, 0, 2) =>
             {
+                let msg = alloc::format!(
+                    "SHIM CONNECT REMAP: {}:{} -> 127.0.0.1:{}\n",
+                    v4.ip(), v4.port(), v4.port()
+                );
+                use litebox::platform::DebugLogProvider as _;
+                litebox_platform_multiplex::platform().debug_log_print(&msg);
                 SocketAddr::V4(core::net::SocketAddrV4::new(
                     core::net::Ipv4Addr::LOCALHOST,
                     v4.port(),
