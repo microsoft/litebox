@@ -203,6 +203,9 @@ pub enum Command {
     #[serde(rename = "go")]
     Go,
 
+    /// **Deprecated**: Use Fork + NetListen + NetCloseListener primitives
+    /// instead. This compound command bundles too many operations.
+    ///
     /// Listen on a port, fork+exec a child echo server, then close the
     /// parent's listen fd. Reproduces the VS Code CLI pattern where the
     /// parent creates a listen socket, forks a child to accept on it,
