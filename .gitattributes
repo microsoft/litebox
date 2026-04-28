@@ -1,2 +1,2 @@
-litebox_tool_executor/scripts/*.sh text eol=lf
+litebox_tool_executor/scripts/**/*.sh text eol=lf
 dev_tools/*.sh text eol=lf

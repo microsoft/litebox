@@ -253,7 +253,7 @@ pub(super) async fn vscode_bootstrap_replay(r: &mut TestRunner) {
     // 3. Patch the captured bootstrap script with the dynamic commit hash
     //    and remove the keepalive loop (which would run forever).
     let script_template =
-        include_str!("../../../litebox_tool_executor/scripts/vscode-bootstrap-captured.sh");
+        include_str!("../../../litebox_tool_executor/scripts/vscode/vscode-bootstrap-captured.sh");
     let script = script_template
         .replace("41dd792b5e652393e7787322889ed5fdc58bd75b", &commit)
         // Remove the keepalive loop at the end — it's designed to hold
