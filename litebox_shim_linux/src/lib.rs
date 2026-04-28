@@ -543,17 +543,9 @@ impl<FS: ShimFS> LinuxShim<FS> {
     ) -> litebox::net::PlatformInteractionReinvocationAdvice {
         let mut net = self.global.net.lock();
         let result = net.perform_platform_interaction();
-        // Diagnostic: log when smoltcp sends RST (helps debug cross-worker SYN failures).
-        if let Some((src_port, dst_port, summary)) = net.take_rst_diagnostic() {
-            let listen_ports = &summary.listen_ports[..summary.listen_count as usize];
-            let msg = alloc::format!(
-                "SHIM RST: src={src_port} dst={dst_port} \
-                 tcp_sockets={} listen_sockets={} listen_ports={listen_ports:?}\n",
-                summary.tcp_count, summary.listen_count
-            );
-            use litebox::platform::DebugLogProvider as _;
-            litebox_platform_multiplex::platform().debug_log_print(&msg);
-        }
+        // Consume RST diagnostic (if any) to prevent stale data buildup,
+        // but don't log to stderr — it pollutes VS Code's output.
+        let _ = net.take_rst_diagnostic();
         result
     }
 

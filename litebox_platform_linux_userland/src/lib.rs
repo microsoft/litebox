@@ -4763,29 +4763,17 @@ impl litebox::platform::PunchthroughProvider for LinuxUserland {
 
 impl litebox::platform::DebugLogProvider for LinuxUserland {
     fn debug_log_print(&self, msg: &str) {
-        let _ = unsafe {
-            syscalls::syscall4(
-                syscalls::Sysno::write,
-                litebox_common_linux::STDERR_FILENO as usize,
-                msg.as_ptr() as usize,
-                msg.len(),
-                // Unused by the syscall but would be checked by Seccomp filter if enabled.
-                syscall_intercept::SYSCALL_ARG_MAGIC,
-            )
-        };
-        // Also write diagnostic messages to /tmp/rst-diag.log for fork-restored
-        // workers whose stderr is /dev/null.
-        if msg.starts_with("NET CLOSE") {
-            use std::io::Write;
-            if let Ok(mut f) = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open("/tmp/rst-diag.log")
-            {
-                let _ = f.write_all(msg.as_bytes());
-                if !msg.ends_with('\n') {
-                    let _ = f.write_all(b"\n");
-                }
+        // Write to /tmp/rst-diag.log instead of stderr.
+        // stderr is reserved for guest use (VS Code captures it).
+        use std::io::Write;
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open("/tmp/rst-diag.log")
+        {
+            let _ = f.write_all(msg.as_bytes());
+            if !msg.ends_with('\n') {
+                let _ = f.write_all(b"\n");
             }
         }
     }
