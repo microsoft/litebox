@@ -472,12 +472,26 @@ pub(crate) struct Message {
 /// Represents a connected Unix stream socket.
 struct UnixConnectedStream<FS: ShimFS> {
     addr: AddrView<FS>,
-    /// The read end of the local socket's channel for receiving messages.
-    recv_channel: crate::channel::ReadEnd<Message>,
-    /// The write end of the connected peer socket for sending messages.
-    connected_send_channel: crate::channel::WriteEnd<Message>,
+    transport: UnixTransport,
     peer_cred: Ucred,
     pollee: Arc<Pollee<crate::Platform>>,
+}
+
+/// Data transport for a connected unix socket.
+///
+/// Same-worker connections use in-memory channels (fast, zero-copy).
+/// Cross-worker connections use a TCP stream through the broker's smoltcp
+/// proxy, discovered via a sidecar metadata file on the shared filesystem.
+enum UnixTransport {
+    /// Same-worker: in-memory ring-buffer channels.
+    Channel {
+        recv: crate::channel::ReadEnd<Message>,
+        send: crate::channel::WriteEnd<Message>,
+    },
+    /// Cross-worker: TCP-backed stream through broker/smoltcp.
+    Tcp {
+        proxy: Arc<litebox::net::socket_channel::NetworkProxy<crate::Platform>>,
+    },
 }
 
 const UNIX_BUF_SIZE: usize = 65536;
@@ -496,9 +510,14 @@ impl<FS: ShimFS> UnixConnectedStream<FS> {
     /// Stable across `clone_for_fork` because both clones share the same
     /// underlying `Arc` allocations.
     pub(crate) fn socket_pair_id(&self) -> usize {
-        let recv_ptr = self.recv_channel.endpoint_ptr() as usize;
-        let send_peer_ptr = self.connected_send_channel.peer_ptr() as usize;
-        core::cmp::min(recv_ptr, send_peer_ptr)
+        match &self.transport {
+            UnixTransport::Channel { recv, send } => {
+                let recv_ptr = recv.endpoint_ptr() as usize;
+                let send_peer_ptr = send.peer_ptr() as usize;
+                core::cmp::min(recv_ptr, send_peer_ptr)
+            }
+            UnixTransport::Tcp { proxy } => Arc::as_ptr(proxy) as usize,
+        }
     }
 
     /// Creates a pair of connected Unix stream sockets.
@@ -520,15 +539,19 @@ impl<FS: ShimFS> UnixConnectedStream<FS> {
             // Cross-wire: each socket keeps the other side's send channel.
             UnixConnectedStream {
                 addr: addr1,
-                recv_channel,
-                connected_send_channel: send_channel_peer,
+                transport: UnixTransport::Channel {
+                    recv: recv_channel,
+                    send: send_channel_peer,
+                },
                 peer_cred: second_cred,
                 pollee: pollee1,
             },
             UnixConnectedStream {
                 addr: addr2,
-                recv_channel: recv_channel_peer,
-                connected_send_channel: send_channel,
+                transport: UnixTransport::Channel {
+                    recv: recv_channel_peer,
+                    send: send_channel,
+                },
                 peer_cred: first_cred,
                 pollee: pollee2,
             },
@@ -554,12 +577,57 @@ impl<FS: ShimFS> UnixConnectedStream<FS> {
     }
 
     fn try_sendto(&self, msg: Message) -> Result<(), (Message, Errno)> {
-        // TODO: write partial data?
-        self.connected_send_channel.try_write_one(msg)
+        match &self.transport {
+            UnixTransport::Channel { send, .. } => {
+                // TODO: write partial data?
+                send.try_write_one(msg)
+            }
+            UnixTransport::Tcp { proxy } => {
+                use litebox::net::socket_channel::NetworkProxy;
+                match proxy.as_ref() {
+                    NetworkProxy::Stream(stream) => {
+                        match stream.try_write(&msg.data) {
+                            Ok(_n) => Ok(()),
+                            Err(_) => Err((msg, Errno::EPIPE)),
+                        }
+                    }
+                    _ => Err((msg, Errno::EINVAL)),
+                }
+            }
+        }
     }
 
     fn try_recvfrom(
         &self,
+        mut buf: &mut [u8],
+        seqpacket: bool,
+        received_fds: &mut Vec<PassedFd>,
+    ) -> Result<usize, TryOpError<Errno>> {
+        match &self.transport {
+            UnixTransport::Tcp { proxy } => {
+                use litebox::net::socket_channel::NetworkProxy;
+                match proxy.as_ref() {
+                    NetworkProxy::Stream(stream) => {
+                        match stream.try_read(buf, litebox::net::ReceiveFlags::empty(), None) {
+                            Ok(n) => Ok(n),
+                            Err(litebox::net::errors::ReceiveError::SocketInInvalidState) => {
+                                Err(TryOpError::TryAgain)
+                            }
+                            Err(_) => Err(TryOpError::Other(Errno::ECONNRESET)),
+                        }
+                    }
+                    _ => Err(TryOpError::Other(Errno::EINVAL)),
+                }
+            }
+            UnixTransport::Channel { recv, .. } => {
+                self.try_recvfrom_channel(recv, buf, seqpacket, received_fds)
+            }
+        }
+    }
+
+    fn try_recvfrom_channel(
+        &self,
+        recv: &crate::channel::ReadEnd<Message>,
         mut buf: &mut [u8],
         seqpacket: bool,
         received_fds: &mut Vec<PassedFd>,
@@ -569,8 +637,7 @@ impl<FS: ShimFS> UnixConnectedStream<FS> {
             // If the buffer is smaller than the message, truncate (the
             // remainder is discarded, matching Linux semantics without
             // MSG_TRUNC).
-            return self
-                .recv_channel
+            return recv
                 .peek_and_consume_one(|msg| {
                     let copy_len = buf.len().min(msg.data.len());
                     buf[..copy_len].copy_from_slice(&msg.data[..copy_len]);
@@ -587,7 +654,7 @@ impl<FS: ShimFS> UnixConnectedStream<FS> {
         // message consumption.
         let mut total_read = 0;
         while !buf.is_empty() {
-            let n = match self.recv_channel.peek_and_consume_one(|msg| {
+            let n = match recv.peek_and_consume_one(|msg| {
                 // Extract any passed fds from the first message that carries them.
                 if !msg.passed_fds.is_empty() {
                     received_fds.append(&mut msg.passed_fds);
@@ -622,26 +689,30 @@ impl<FS: ShimFS> UnixConnectedStream<FS> {
     }
 
     fn check_io_events(&self) -> Events {
-        let mut events = Events::empty();
-        let is_read_shutdown = self.recv_channel.is_shutdown();
-        let is_write_shutdown = self.connected_send_channel.is_shutdown();
-        // Detect when the peer socket has been closed (e.g., child process exit).
-        let recv_peer_closed = self.recv_channel.is_peer_shutdown();
-        let send_peer_closed = self.connected_send_channel.is_peer_shutdown();
+        match &self.transport {
+            UnixTransport::Tcp { proxy } => proxy.check_io_events(),
+            UnixTransport::Channel { recv, send } => {
+                let mut events = Events::empty();
+                let is_read_shutdown = recv.is_shutdown();
+                let is_write_shutdown = send.is_shutdown();
+                let recv_peer_closed = recv.is_peer_shutdown();
+                let send_peer_closed = send.is_peer_shutdown();
 
-        if is_read_shutdown || recv_peer_closed {
-            events |= Events::RDHUP | Events::IN;
-            if is_write_shutdown || send_peer_closed {
-                events |= Events::HUP;
+                if is_read_shutdown || recv_peer_closed {
+                    events |= Events::RDHUP | Events::IN;
+                    if is_write_shutdown || send_peer_closed {
+                        events |= Events::HUP;
+                    }
+                }
+                if !recv.is_empty() {
+                    events |= Events::IN;
+                }
+                if !send_peer_closed && !send.is_full() {
+                    events |= Events::OUT;
+                }
+                events
             }
         }
-        if !self.recv_channel.is_empty() {
-            events |= Events::IN;
-        }
-        if !send_peer_closed && !self.connected_send_channel.is_full() {
-            events |= Events::OUT;
-        }
-        events
     }
 }
 
@@ -1407,8 +1478,8 @@ impl<FS: ShimFS> UnixSocket<FS> {
     pub(crate) fn drain_recv_one(&self) -> Option<Message> {
         match &self.inner {
             UnixSocketInner::Stream(stream) => stream.with_state_ref(|s| {
-                s.connected().and_then(|c| {
-                    c.recv_channel
+                s.connected().and_then(|c| match &c.transport {
+                    UnixTransport::Channel { recv, .. } => recv
                         .peek_and_consume_one(|msg| {
                             Ok((
                                 true,
@@ -1418,7 +1489,25 @@ impl<FS: ShimFS> UnixSocket<FS> {
                                 },
                             ))
                         })
-                        .ok()
+                        .ok(),
+                    UnixTransport::Tcp { proxy } => {
+                        use litebox::net::socket_channel::NetworkProxy;
+                        if let NetworkProxy::Stream(stream) = proxy.as_ref() {
+                            let mut buf = alloc::vec![0u8; UNIX_BUF_SIZE];
+                            match stream.try_read(&mut buf, litebox::net::ReceiveFlags::empty(), None) {
+                                Ok(n) => {
+                                    buf.truncate(n);
+                                    Some(Message {
+                                        data: buf,
+                                        passed_fds: Vec::new(),
+                                    })
+                                }
+                                Err(_) => None,
+                            }
+                        } else {
+                            None
+                        }
+                    }
                 })
             }),
             UnixSocketInner::Datagram(_) => None,
@@ -1569,11 +1658,26 @@ impl<FS: ShimFS> UnixSocket<FS> {
         if let UnixSocketInner::Stream(stream) = &self.inner {
             let state = stream.state.read();
             if let Some(UnixStreamState::Connected(conn)) = &*state {
-                if read {
-                    conn.recv_channel.shutdown();
-                }
-                if write {
-                    conn.connected_send_channel.shutdown();
+                match &conn.transport {
+                    UnixTransport::Channel { recv, send } => {
+                        if read {
+                            recv.shutdown();
+                        }
+                        if write {
+                            send.shutdown();
+                        }
+                    }
+                    UnixTransport::Tcp { proxy } => {
+                        use litebox::net::socket_channel::NetworkProxy;
+                        if let NetworkProxy::Stream(stream) = proxy.as_ref() {
+                            if read {
+                                stream.shutdown_read();
+                            }
+                            if write {
+                                stream.shutdown_write();
+                            }
+                        }
+                    }
                 }
             }
         }
