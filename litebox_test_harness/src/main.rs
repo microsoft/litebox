@@ -198,44 +198,125 @@ fn main() {
             // unaffected because it's on a different port.
         }
         "tcp-fork-listen-accept" => {
-            // Reproduces the VS Code CLI pattern:
+            // Reproduces the VS Code CLI pattern exactly:
             //   1. bind() + listen() on a port
-            //   2. fork()+exec() a child that will accept()
-            //   3. Parent closes the listen fd and exits
-            //   4. Child (new worker) accepts connections and echoes
+            //   2. fork()+exec() — child inherits the listen fd
+            //   3. Parent closes the listen fd
+            //   4. Child calls accept() on the INHERITED fd and echoes
             //
-            // In litebox's delayed-fork model, step 3 destroys the shared
-            // listen socket before the child migrates to its own worker.
-            // This test exposes that bug.
+            // Uses std::process::Command (fork+exec) so the child migrates
+            // to a new worker in litebox. The child subcommand
+            // "tcp-accept-inherited" accepts on the already-bound port
+            // without re-binding.
             let port: u16 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(18400);
             let listener = std::net::TcpListener::bind(format!("0.0.0.0:{port}"))
                 .expect("tcp-fork-listen-accept: bind failed");
             eprintln!("[tcp-fork-listen-accept] listening on 0.0.0.0:{port}");
-            eprintln!("[tcp-fork-listen-accept] forking child to accept...");
 
-            // Fork+exec a child that accepts on the SAME port.
-            // The child re-binds+listens (since delayed fork doesn't
-            // inherit the smoltcp socket). In a real VS Code scenario,
-            // the child inherits the fd and the parent closes it.
-            let child_exe = self_exe;
-            let child = std::process::Command::new(child_exe)
-                .args(["tcp-echo-multi", &port.to_string(), "5"])
+            // Fork+exec child — uses the same binary with "tcp-accept-inherited"
+            // subcommand. The child inherits the listen fd via fork, but exec
+            // triggers litebox delayed-fork migration to a new worker. The child
+            // must reconstruct the listener from the inherited raw fd.
+            use std::os::unix::io::AsRawFd;
+            let listen_fd = listener.as_raw_fd();
+            // Clear CLOEXEC so the fd survives exec.
+            unsafe { libc::fcntl(listen_fd, libc::F_SETFD, 0) };
+            eprintln!("[tcp-fork-listen-accept] forking child, listen_fd={listen_fd}");
+
+            let child = std::process::Command::new(self_exe)
+                .args(["tcp-accept-inherited", &listen_fd.to_string()])
                 .stdout(std::process::Stdio::inherit())
                 .stderr(std::process::Stdio::inherit())
                 .spawn();
 
-            // Parent closes its listen fd (drop the TcpListener).
-            // In the real VS Code case, this close() is what destroys
-            // the listen socket in litebox's delayed-fork model.
+            // Parent closes its listen fd — this is the critical step.
+            // In litebox, this may destroy the shared listen socket.
             drop(listener);
             eprintln!("[tcp-fork-listen-accept] parent closed listen fd");
 
             match child {
                 Ok(mut c) => {
                     eprintln!("[tcp-fork-listen-accept] waiting for child pid={}", c.id());
-                    let _ = c.wait();
+                    let status = c.wait();
+                    eprintln!("[tcp-fork-listen-accept] child exited: {status:?}");
                 }
-                Err(e) => eprintln!("[tcp-fork-listen-accept] fork failed: {e}"),
+                Err(e) => eprintln!("[tcp-fork-listen-accept] spawn failed: {e}"),
+            }
+        }
+        "tcp-accept-inherited" => {
+            // Accept connections on an INHERITED listen fd (from parent via fork).
+            // Does NOT re-bind or re-listen — uses the fd as-is.
+            let fd: i32 = args.get(2).and_then(|s| s.parse().ok()).expect("need fd arg");
+            eprintln!("[tcp-accept-inherited] accepting on inherited fd={fd}");
+            use std::os::unix::io::FromRawFd;
+            let listener = unsafe { std::net::TcpListener::from_raw_fd(fd) };
+            listener.set_nonblocking(false).ok();
+            match listener.accept() {
+                Ok((mut stream, addr)) => {
+                    eprintln!("[tcp-accept-inherited] accepted from {addr}");
+                    use std::io::{Read, Write};
+                    let mut buf = [0u8; 4096];
+                    match stream.read(&mut buf) {
+                        Ok(n) if n > 0 => {
+                            let _ = stream.write_all(&buf[..n]);
+                            let _ = stream.flush();
+                            eprintln!("[tcp-accept-inherited] echoed {n} bytes");
+                            println!("ECHO_OK={n}");
+                        }
+                        Ok(_) => eprintln!("[tcp-accept-inherited] read 0"),
+                        Err(e) => eprintln!("[tcp-accept-inherited] read err: {e}"),
+                    }
+                }
+                Err(e) => eprintln!("[tcp-accept-inherited] accept failed: {e}"),
+            }
+        }
+        "tcp-listen-close-reuse" => {
+            // Reproduces the VS Code CLI server.close() + re-listen pattern:
+            //   1. bind() + listen() on port P
+            //   2. close() the listen socket (Node.js server.close())
+            //   3. bind() + listen() on port P again (re-use)
+            //   4. accept() connections
+            //
+            // Tests whether closing a listen socket properly frees the port
+            // so it can be re-bound immediately.
+            let port: u16 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(18500);
+            
+            // Step 1: bind + listen
+            let listener1 = std::net::TcpListener::bind(format!("0.0.0.0:{port}"))
+                .expect("tcp-listen-close-reuse: first bind failed");
+            eprintln!("[tcp-listen-close-reuse] first listen on 0.0.0.0:{port}");
+            
+            // Step 2: close
+            drop(listener1);
+            eprintln!("[tcp-listen-close-reuse] closed first listener");
+            
+            // Step 3: re-bind + re-listen
+            match std::net::TcpListener::bind(format!("0.0.0.0:{port}")) {
+                Ok(listener2) => {
+                    eprintln!("[tcp-listen-close-reuse] re-bound on 0.0.0.0:{port}, accepting...");
+                    listener2.set_nonblocking(false).ok();
+                    match listener2.accept() {
+                        Ok((mut stream, addr)) => {
+                            eprintln!("[tcp-listen-close-reuse] accepted from {addr}");
+                            use std::io::{Read, Write};
+                            let mut buf = [0u8; 4096];
+                            match stream.read(&mut buf) {
+                                Ok(n) if n > 0 => {
+                                    let _ = stream.write_all(&buf[..n]);
+                                    let _ = stream.flush();
+                                    eprintln!("[tcp-listen-close-reuse] echoed {n} bytes");
+                                }
+                                Ok(_) => eprintln!("[tcp-listen-close-reuse] read 0"),
+                                Err(e) => eprintln!("[tcp-listen-close-reuse] read err: {e}"),
+                            }
+                        }
+                        Err(e) => eprintln!("[tcp-listen-close-reuse] accept failed: {e}"),
+                    }
+                }
+                Err(e) => {
+                    eprintln!("[tcp-listen-close-reuse] re-bind FAILED: {e}");
+                    std::process::exit(1);
+                }
             }
         }
         "tcp-echo" => {

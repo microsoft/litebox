@@ -433,54 +433,36 @@ async fn agent_loop(self_exe: &str) {
             }
 
             Command::NetListenForkClose { port } => {
-                // Reproduce the VS Code CLI pattern:
+                // Reproduce the VS Code CLI pattern using libc::fork():
                 // 1. bind+listen on port
-                // 2. fork+exec a child echo server on the SAME port
-                // 3. Parent drops (closes) its listen fd
+                // 2. fork() — child inherits the listen fd
+                // 3. Parent closes its listen fd
+                // 4. Child calls accept() on the inherited fd
                 //
-                // In litebox delayed-fork, step 3 destroys the shared
-                // listen socket before the child migrates. The child's
-                // re-bind in tcp-echo-multi may fail or the listen
-                // sockets from step 1 are lost.
-                //
-                // TODO: This is a simplified reproduction. A more accurate
-                // test would use fd tracking in the protocol so the parent
-                // can pass the inherited listen fd to the child without
-                // re-binding. That would exercise the exact delayed-fork
-                // fd inheritance path that VS Code uses.
-                match std::net::TcpListener::bind(format!("0.0.0.0:{port}")) {
-                    Ok(listener) => {
-                        // Fork+exec a child that will accept on this port.
-                        let self_exe = std::env::current_exe()
-                            .unwrap_or_else(|_| std::path::PathBuf::from("litebox_test_harness"));
-                        let child = std::process::Command::new(&self_exe)
-                            .args(["tcp-echo-multi", &port.to_string(), "10"])
-                            .stdout(std::process::Stdio::null())
-                            .stderr(std::process::Stdio::inherit())
-                            .spawn();
-                        // Parent closes its listen fd.
-                        drop(listener);
-                        match child {
-                            Ok(mut c) => {
-                                let pid = c.id();
-                                // Don't wait — let the child run in background.
-                                // Store the child handle to avoid zombie.
-                                tokio::spawn(async move {
-                                    let _ = tokio::task::spawn_blocking(move || c.wait()).await;
-                                });
-                                respond(&Response::Listening { port }).await;
-                                eprintln!("[agent] NetListenForkClose: forked child pid={pid}, parent closed listen fd");
-                            }
-                            Err(e) => {
-                                respond(&Response::Error {
-                                    error: format!("fork failed: {e}"),
-                                }).await;
-                            }
-                        }
+                // Uses tcp-fork-listen-accept subcommand which does the
+                // fork+close+accept pattern with libc::fork() (no exec),
+                // so the child truly inherits the fd without re-binding.
+                let self_exe = std::env::current_exe()
+                    .unwrap_or_else(|_| std::path::PathBuf::from("litebox_test_harness"));
+                let child = std::process::Command::new(&self_exe)
+                    .args(["tcp-fork-listen-accept", &port.to_string()])
+                    .stdout(std::process::Stdio::inherit())
+                    .stderr(std::process::Stdio::inherit())
+                    .spawn();
+                match child {
+                    Ok(mut c) => {
+                        let pid = c.id();
+                        tokio::spawn(async move {
+                            let _ = tokio::task::spawn_blocking(move || c.wait()).await;
+                        });
+                        // Give the subprocess time to bind+listen+fork.
+                        tokio::time::sleep(Duration::from_secs(1)).await;
+                        respond(&Response::Listening { port }).await;
+                        eprintln!("[agent] NetListenForkClose: started tcp-fork-listen-accept pid={pid}");
                     }
                     Err(e) => {
                         respond(&Response::Error {
-                            error: format!("bind {port}: {e}"),
+                            error: format!("spawn failed: {e}"),
                         }).await;
                     }
                 }

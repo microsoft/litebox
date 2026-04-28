@@ -2084,34 +2084,46 @@ pub(crate) async fn loopback_tcp_tests(r: &mut TestRunner) {
 pub(crate) async fn fork_listen_close_tests(r: &mut TestRunner) {
     eprintln!("[platform] === FKLC: fork-listen-close ===");
 
+    // Test 1: Listen then immediately unlisten, then cross-worker connect.
+    // This reproduces the VS Code CLI pattern where the listen socket
+    // is created and then closed before the cross-worker SYN arrives.
     let port = 19920u16;
 
-    // Agent A: listen, fork child echo server, parent closes listen fd.
-    let listen_resp = r
-        .send("A", Command::NetListenForkClose { port })
-        .await;
+    // Agent A: listen then unlisten (simulating VS Code CLI close).
+    let listen_resp = r.send("A", Command::NetListen { port }).await;
     if !matches!(&listen_resp, Response::Listening { .. }) {
-        r.record(
-            "FKLC.cross_connect",
-            "B",
-            false,
-            &format!("listen-fork-close failed: {listen_resp:?}"),
-        );
+        r.record("FKLC.listen_unlisten", "B", false, &format!("listen failed: {listen_resp:?}"));
         return;
     }
+    // Immediately unlisten — the port is still registered in the broker
+    // until the broker processes the unlisten message.
+    let _ = r.send("A", Command::NetUnlisten { port }).await;
 
-    // Give the child echo server time to start.
-    tokio::time::sleep(Duration::from_secs(3)).await;
-
-    // Agent B connects — this goes through the cross-worker bridge.
+    // Agent B connects — the broker still has the port registered,
+    // but the runner's smoltcp no longer has listen sockets.
     let conn_resp = r
-        .send(
-            "B",
-            Command::NetConnect {
-                addr: format!("127.0.0.1:{port}"),
-                data: "fork_listen_close".into(),
-            },
-        )
+        .send("B", Command::NetConnect {
+            addr: format!("127.0.0.1:{port}"),
+            data: "listen_unlisten".into(),
+        })
+        .await;
+    // This SHOULD fail (RST) — the listen socket was closed.
+    let got_rst = matches!(&conn_resp, Response::ConnectFailed { .. });
+    r.record("FKLC.listen_unlisten", "B", got_rst, &format!("expected RST: {conn_resp:?}"));
+
+    // Test 2: NetListenForkClose pattern (fork+exec child inherits fd).
+    let port2 = 19921u16;
+    let listen_resp = r.send("A", Command::NetListenForkClose { port: port2 }).await;
+    if !matches!(&listen_resp, Response::Listening { .. }) {
+        r.record("FKLC.cross_connect", "B", false, &format!("fork-close failed: {listen_resp:?}"));
+        return;
+    }
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    let conn_resp = r
+        .send("B", Command::NetConnect {
+            addr: format!("127.0.0.1:{port2}"),
+            data: "fork_listen_close".into(),
+        })
         .await;
     let pass = matches!(&conn_resp, Response::Connected { echo } if echo == "fork_listen_close");
     r.record("FKLC.cross_connect", "B", pass, &format!("{conn_resp:?}"));
