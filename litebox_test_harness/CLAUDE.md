@@ -1,6 +1,45 @@
 # Testing Rules for litebox_test_harness
 
-These rules are mandatory when adding, modifying, or reviewing tests.
+These rules are mandatory when adding, modifying, or reviewing tests,
+**and when investigating any failure observed in VS Code server, Node.js,
+or sshd running inside Litebox**.
+
+## Investigating a failure
+
+This section applies whenever a failure is observed in the integration
+stack (VS Code remote server, Node.js, sshd, or any other guest workload),
+regardless of whether you intend to "just debug" or to add a test.
+
+Before reading any syscall audit log, attaching gdbserver, or re-running
+the full Docker stack to test a hypothesis:
+
+1. **Name the suspect capability.** Examples: `epoll` + `pidfd`,
+   `pty` + `TIOCSPGRP`, fork + CLOEXEC inheritance, `io_uring` probe,
+   `/proc/self/*` reads, `clone3` flags, `eventfd` semantics.
+2. **Find or add a self-contained test** in this harness that exercises
+   only that capability. Prefer protocol commands over bash; follow all
+   rules in "Writing Tests" below.
+3. **Run native first.** It must pass on the WSL2 chroot baseline. If it
+   fails native, the test is wrong, not Litebox.
+4. **Run under Litebox.** If it reproduces, you now have a minimal,
+   deterministic repro. Fix the product code per the fix-first workflow
+   (rule 12).
+5. **Only now** consult the syscall audit log or attach gdbserver, and
+   only to inform the *next* minimal test. The audit log is never the
+   fix target; a failing harness test is.
+
+**Forbidden shortcuts:**
+
+- Reverse-engineering a fix from a syscall audit log without a failing
+  harness test.
+- Re-running the full Docker → sshd → VS Code server → Litebox stack to
+  validate a hypothesis. The harness exists so you don't have to.
+- "I'll just attach gdb and poke around" before steps 1–3.
+
+If the failing capability genuinely cannot be expressed in the harness
+(e.g., requires fd inheritance not yet supported by the protocol — see
+"fd Inheritance Pattern" below), say so explicitly, and the first fix is
+to extend the harness/protocol so it can.
 
 ## Test Categories
 
