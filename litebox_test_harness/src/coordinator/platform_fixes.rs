@@ -299,6 +299,7 @@ pub(crate) async fn run(r: &mut TestRunner) {
     bash_fork_exec_tests(r).await;
     cross_worker_first_connect_tests(r).await;
     cross_worker_self_connect_tests(r).await;
+    fork_listen_close_tests(r).await;
     // PID visibility tests run last— KP.proc_child can deadlock agent B
     // under litebox, causing all subsequent B-targeted tests to timeout.
     pid_visibility_tests(r).await;
@@ -2062,4 +2063,56 @@ pub(crate) async fn loopback_tcp_tests(r: &mut TestRunner) {
             r.record(&test_id, agent, pass, &format!("{resp:?}"));
         }
     }
+}
+
+
+// ═══════════════════════════════════════════════════════════════════
+// FKLC: fork-listen-close — VS Code CLI pattern
+// ═══════════════════════════════════════════════════════════════════
+
+/// Reproduces the VS Code CLI listen-fork-close pattern:
+///   1. Agent A calls NetListenForkClose(port) — binds, listens, forks
+///      a child echo server, then parent closes its listen fd.
+///   2. Agent B connects to that port.
+///
+/// In litebox delayed-fork, the parent's close() destroys the shared
+/// listen socket before the child migrates, so B's connection gets RST.
+///
+/// This is the root cause of the VS Code "Connection closed" failure:
+/// the VS Code CLI process forks a child to handle connections, closes
+/// its own listen fd, and the child's listen socket is destroyed.
+pub(crate) async fn fork_listen_close_tests(r: &mut TestRunner) {
+    eprintln!("[platform] === FKLC: fork-listen-close ===");
+
+    let port = 19920u16;
+
+    // Agent A: listen, fork child echo server, parent closes listen fd.
+    let listen_resp = r
+        .send("A", Command::NetListenForkClose { port })
+        .await;
+    if !matches!(&listen_resp, Response::Listening { .. }) {
+        r.record(
+            "FKLC.cross_connect",
+            "B",
+            false,
+            &format!("listen-fork-close failed: {listen_resp:?}"),
+        );
+        return;
+    }
+
+    // Give the child echo server time to start.
+    tokio::time::sleep(Duration::from_secs(3)).await;
+
+    // Agent B connects — this goes through the cross-worker bridge.
+    let conn_resp = r
+        .send(
+            "B",
+            Command::NetConnect {
+                addr: format!("127.0.0.1:{port}"),
+                data: "fork_listen_close".into(),
+            },
+        )
+        .await;
+    let pass = matches!(&conn_resp, Response::Connected { echo } if echo == "fork_listen_close");
+    r.record("FKLC.cross_connect", "B", pass, &format!("{conn_resp:?}"));
 }

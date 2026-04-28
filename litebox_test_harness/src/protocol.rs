@@ -155,6 +155,15 @@ pub enum Command {
     #[serde(rename = "go")]
     Go,
 
+    /// Listen on a port, fork+exec a child echo server, then close the
+    /// parent's listen fd. Reproduces the VS Code CLI pattern where the
+    /// parent creates a listen socket, forks a child to accept on it,
+    /// and closes its own copy. In litebox's delayed-fork model, the
+    /// parent's close() can destroy the shared listen socket before the
+    /// child migrates to its own worker.
+    #[serde(rename = "net_listen_fork_close")]
+    NetListenForkClose { port: u16 },
+
     /// Shut down gracefully.
     #[serde(rename = "exit")]
     Exit,

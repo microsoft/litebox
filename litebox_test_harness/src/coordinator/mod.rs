@@ -418,6 +418,12 @@ async fn run_tests(self_exe: &str, filter: Option<&str>) -> Vec<TestResult> {
         platform_fixes::cross_worker_self_connect_tests(&mut runner).await;
     }
 
+    // === Fork-Listen-Close Tests (VS Code pattern) ===
+    if should_run("fklc") {
+        eprintln!("[coord] === Fork-Listen-Close Tests ===");
+        platform_fixes::fork_listen_close_tests(&mut runner).await;
+    }
+
     // === TCP Stress Tests ===
     if should_run("tcp") {
         eprintln!("[coord] === TCP Stress Tests ===");

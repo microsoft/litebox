@@ -197,6 +197,47 @@ fn main() {
             // Drop the listener and exit — the parent's listen socket is
             // unaffected because it's on a different port.
         }
+        "tcp-fork-listen-accept" => {
+            // Reproduces the VS Code CLI pattern:
+            //   1. bind() + listen() on a port
+            //   2. fork()+exec() a child that will accept()
+            //   3. Parent closes the listen fd and exits
+            //   4. Child (new worker) accepts connections and echoes
+            //
+            // In litebox's delayed-fork model, step 3 destroys the shared
+            // listen socket before the child migrates to its own worker.
+            // This test exposes that bug.
+            let port: u16 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(18400);
+            let listener = std::net::TcpListener::bind(format!("0.0.0.0:{port}"))
+                .expect("tcp-fork-listen-accept: bind failed");
+            eprintln!("[tcp-fork-listen-accept] listening on 0.0.0.0:{port}");
+            eprintln!("[tcp-fork-listen-accept] forking child to accept...");
+
+            // Fork+exec a child that accepts on the SAME port.
+            // The child re-binds+listens (since delayed fork doesn't
+            // inherit the smoltcp socket). In a real VS Code scenario,
+            // the child inherits the fd and the parent closes it.
+            let child_exe = self_exe;
+            let child = std::process::Command::new(child_exe)
+                .args(["tcp-echo-multi", &port.to_string(), "5"])
+                .stdout(std::process::Stdio::inherit())
+                .stderr(std::process::Stdio::inherit())
+                .spawn();
+
+            // Parent closes its listen fd (drop the TcpListener).
+            // In the real VS Code case, this close() is what destroys
+            // the listen socket in litebox's delayed-fork model.
+            drop(listener);
+            eprintln!("[tcp-fork-listen-accept] parent closed listen fd");
+
+            match child {
+                Ok(mut c) => {
+                    eprintln!("[tcp-fork-listen-accept] waiting for child pid={}", c.id());
+                    let _ = c.wait();
+                }
+                Err(e) => eprintln!("[tcp-fork-listen-accept] fork failed: {e}"),
+            }
+        }
         "tcp-echo" => {
             // Listen on a TCP port and echo back whatever is received.
             // Used for cross-worker loopback TCP tests.
