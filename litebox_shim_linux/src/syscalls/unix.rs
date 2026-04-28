@@ -263,6 +263,7 @@ impl<FS: ShimFS> UnixInitStream<FS> {
             global: global.clone(),
             tcp_port: 0,
             tcp_fd: None,
+            tcp_proxy: None,
             _tcp_bridge: None,
         })
     }
@@ -393,6 +394,8 @@ struct UnixListenStream<FS: ShimFS> {
     tcp_port: u16,
     /// TCP socket fd for the cross-worker listener (if allocated).
     tcp_fd: Option<crate::syscalls::net::SocketFd>,
+    /// TCP proxy for the cross-worker listener (for observer registration).
+    tcp_proxy: Option<Arc<litebox::net::socket_channel::NetworkProxy<crate::Platform>>>,
     /// Bridge observer kept alive to forward TCP events to backlog pollee.
     _tcp_bridge: Option<Arc<BacklogTcpBridge<FS>>>,
 }
@@ -438,7 +441,7 @@ impl<FS: ShimFS> UnixListenStream<FS> {
         };
 
         // Initialize the socket proxy so the network subsystem can drive I/O.
-        let _proxy = global.initialize_socket(&tcp_fd, SockType::Stream, SockFlags::empty());
+        let tcp_proxy = global.initialize_socket(&tcp_fd, SockType::Stream, SockFlags::empty());
 
         // Bind to ephemeral port (port 0 = kernel picks).
         let bind_addr = core::net::SocketAddr::V4(core::net::SocketAddrV4::new(
@@ -464,7 +467,8 @@ impl<FS: ShimFS> UnixListenStream<FS> {
             return 0;
         }
 
-        let msg = alloc::format!("UNIX TCP LISTENER: listening on port {} for cross-worker unix\n", port);
+        use litebox::platform::DebugLogProvider as _;
+        let msg = alloc::format!("UNIX TCP LISTENER: port={} started\n", port);
         litebox_platform_multiplex::platform().debug_log_print(&msg);
 
         // Register a bridge observer: when the TCP proxy fires IN events
@@ -477,12 +481,13 @@ impl<FS: ShimFS> UnixListenStream<FS> {
             });
             let bridge_weak = Arc::downgrade(&bridge)
                 as Weak<dyn litebox::event::observer::Observer<Events>>;
-            _proxy.register_observer(bridge_weak, Events::IN);
+            tcp_proxy.register_observer(bridge_weak, Events::IN);
             self._tcp_bridge = Some(bridge);
         }
 
         self.tcp_port = port;
         self.tcp_fd = Some(tcp_fd);
+        self.tcp_proxy = Some(tcp_proxy);
         port
     }
 
@@ -493,6 +498,8 @@ impl<FS: ShimFS> UnixListenStream<FS> {
 
         loop {
             // Non-blocking try_accept on the internal TCP socket.
+            // This also drives automated_platform_interaction() to process
+            // pending smoltcp packets (TCP handshake progress).
             let accepted_fd = match self.global.net.lock().accept(tcp_fd, None) {
                 Ok(fd) => fd,
                 Err(_) => break, // No pending connections.
@@ -1123,9 +1130,9 @@ impl<FS: ShimFS> UnixStream<FS> {
         mut peer: Option<&mut UnixSocketAddr>,
         is_nonblocking: bool,
     ) -> Result<UnixSocketInner<FS>, Errno> {
-        let backlog = self.with_state_ref(|state| -> Result<Arc<Backlog<FS>>, Errno> {
+        let (backlog, tcp_proxy) = self.with_state_ref(|state| -> Result<_, Errno> {
             let listen = state.listen().ok_or(Errno::EINVAL)?;
-            Ok(listen.backlog.clone())
+            Ok((listen.backlog.clone(), listen.tcp_proxy.clone()))
         })?;
 
         // Before each attempt, drain any pending TCP connections from the
@@ -1144,7 +1151,13 @@ impl<FS: ShimFS> UnixStream<FS> {
             is_nonblocking,
             Events::IN,
             |observer, mask| {
-                backlog.pollee.register_observer(observer, mask);
+                backlog.pollee.register_observer(observer.clone(), mask);
+                // Also register on the TCP proxy so we wake up when cross-
+                // worker TCP connections arrive.
+                if let Some(ref proxy) = tcp_proxy {
+                    use litebox::event::IOPollable;
+                    proxy.register_observer(observer, mask);
+                }
                 Ok(())
             },
             || {
@@ -2157,6 +2170,10 @@ unsafe impl<FS: ShimFS> Sync for BacklogTcpBridge<FS> {}
 impl<FS: ShimFS> litebox::event::observer::Observer<Events> for BacklogTcpBridge<FS> {
     fn on_events(&self, events: &Events) {
         if events.contains(Events::IN) {
+            use litebox::platform::DebugLogProvider as _;
+            litebox_platform_multiplex::platform().debug_log_print(
+                "UNIX TCP BRIDGE: TCP IN event → waking backlog pollee\n",
+            );
             self.backlog.pollee.notify_observers(Events::IN);
         }
     }
