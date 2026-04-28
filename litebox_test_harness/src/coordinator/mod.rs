@@ -20,8 +20,9 @@ use tokio::time::Duration;
 /// Detect whether we're running inside litebox or on native Linux.
 ///
 /// Returns a human-readable string like:
-///   "litebox (rewritten syscalls, smoltcp network)"
-///   "native Linux (WSL2/Docker, real kernel syscalls)"
+///   "litebox sandbox (rewritten syscalls, smoltcp network)"
+///   "native Docker (litebox-test container, real kernel syscalls)"
+///   "native non-Docker — use litebox-test Docker image for reproducible results"
 fn detect_runtime_environment() -> String {
     // Check 1: Look for litebox's syscall rewriting artifacts in /proc/self/maps.
     // The rewriter patches syscall instructions and maps a trampoline page.
@@ -37,38 +38,44 @@ fn detect_runtime_environment() -> String {
         .map(|s| s.contains("(litebox_broker)") || s.contains("(litebox_runner"))
         .unwrap_or(false);
 
-    // Check 2: litebox sets specific environment variables for the guest.
+    // Check 3: litebox sets specific environment variables for the guest.
     let has_litebox_env = std::env::var("LITEBOX_RUNNER").is_ok();
 
-    // Check 3: Check if PID 1 is the litebox init (not systemd/init).
+    // Check 4: Check if PID 1 is the litebox init (not systemd/init).
     let pid1_is_litebox = std::fs::read_to_string("/proc/1/cmdline")
         .map(|cmd| cmd.contains("litebox") || cmd.contains("dropbear"))
         .unwrap_or(false);
 
-    // Check 4: Network — litebox uses 10.0.0.x virtual network.
+    // Check 5: Network — litebox uses 10.0.0.x virtual network.
     let has_virtual_net = std::fs::read_to_string("/proc/net/fib_trie")
         .map(|t| t.contains("10.0.0.2"))
         .unwrap_or(false);
+
+    // Check 6: Are we inside a Docker container?
+    let in_docker = std::path::Path::new("/.dockerenv").exists();
 
     if has_trampoline || has_litebox_env || proc_stat_litebox {
         format!(
             "litebox sandbox (trampoline={has_trampoline} env={has_litebox_env} \
              proc_stat={proc_stat_litebox} vnet={has_virtual_net} pid1_litebox={pid1_is_litebox})"
         )
-    } else if pid1_is_litebox {
+    } else if pid1_is_litebox && in_docker {
         // Running inside litebox's Docker container but NOT through the runner.
-        // Tests will use native kernel syscalls, not litebox's shim.
         format!(
-            "WARNING: litebox container but NOT sandboxed! \
+            "WARNING: litebox Docker container but NOT sandboxed! \
              Tests use native kernel, not litebox shim. \
-             To test litebox, run through litebox_tool_executor or litebox_runner. \
-             (pid1_litebox={pid1_is_litebox} vnet={has_virtual_net})"
+             To test litebox, run through litebox_tool_executor: \
+             litebox_tool_executor --rootfs / --record-baseline -- litebox_test_harness spawn-tree"
         )
+    } else if in_docker {
+        // Inside a Docker container (e.g., litebox-test) — native gold standard.
+        "native Docker (litebox-test container — gold standard, real kernel syscalls)".to_string()
     } else {
-        format!(
-            "native Linux (gold standard — real kernel syscalls, \
-             pid1_litebox={pid1_is_litebox} vnet={has_virtual_net})"
-        )
+        // Bare metal or WSL2 — warn to use the Docker image for reproducibility.
+        "WARNING: running outside Docker — use the litebox-test Docker image \
+         for reproducible results: \
+         docker run --rm litebox-test /opt/litebox/litebox_test_harness spawn-tree"
+            .to_string()
     }
 }
 
