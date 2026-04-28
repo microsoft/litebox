@@ -468,6 +468,45 @@ impl<FS: ShimFS> UnixListenStream<FS> {
         self.tcp_fd = Some(tcp_fd);
         port
     }
+
+    /// Drain pending TCP connections from the internal TCP listener and push
+    /// them into the unix socket backlog as TCP-backed connected streams.
+    fn drain_tcp_to_backlog(&self) {
+        let Some(tcp_fd) = &self.tcp_fd else { return };
+
+        loop {
+            // Non-blocking try_accept on the internal TCP socket.
+            let accepted_fd = match self.global.net.lock().accept(tcp_fd, None) {
+                Ok(fd) => fd,
+                Err(_) => break, // No pending connections.
+            };
+
+            // Initialize the accepted TCP socket's proxy.
+            let proxy = self.global.initialize_socket(
+                &accepted_fd,
+                SockType::Stream,
+                SockFlags::empty(),
+            );
+
+            // Create a TCP-backed unix connected stream and push it
+            // into the backlog so accept() returns it.
+            let server_stream = UnixConnectedStream {
+                addr: AddrView {
+                    addr: Some(self.backlog.addr.clone()),
+                    peer: None,
+                },
+                transport: UnixTransport::Tcp { proxy },
+                peer_cred: self.backlog.listener_cred,
+                pollee: Arc::new(Pollee::new()),
+            };
+
+            let mut sockets = self.backlog.sockets.lock();
+            if let Some(sockets) = &mut *sockets {
+                sockets.push_back(server_stream);
+                self.backlog.pollee.notify_observers(Events::IN);
+            }
+        }
+    }
 }
 
 impl<FS: ShimFS> Drop for UnixListenStream<FS> {
@@ -1071,6 +1110,19 @@ impl<FS: ShimFS> UnixStream<FS> {
             let listen = state.listen().ok_or(Errno::EINVAL)?;
             Ok(listen.backlog.clone())
         })?;
+
+        // Before each attempt, drain any pending TCP connections from the
+        // internal cross-worker TCP listener into the unix socket backlog.
+        let drain_tcp = || {
+            self.with_state_mut_ref(|state| {
+                if let UnixStreamState::Listen(listen) = state {
+                    listen.drain_tcp_to_backlog();
+                }
+            });
+        };
+
+        drain_tcp();
+
         cx.wait_on_events(
             is_nonblocking,
             Events::IN,
@@ -1079,6 +1131,7 @@ impl<FS: ShimFS> UnixStream<FS> {
                 Ok(())
             },
             || {
+                drain_tcp();
                 let accepted = backlog.try_accept()?;
                 if let Some(peer) = peer.as_deref_mut() {
                     *peer = accepted.get_peer_addr();
