@@ -2649,6 +2649,13 @@ fn register_worker_spawn_flags(platform: &Platform, cli_args: &CliArgs) {
     if cli_args.program_from_tar {
         flags.push(std::ffi::CString::new("--program-from-tar").unwrap());
     }
+    #[cfg(feature = "audit_log")]
+    if let Some(ref audit_path) = cli_args.audit_log {
+        flags.push(std::ffi::CString::new("--audit-log").unwrap());
+        flags.push(
+            std::ffi::CString::new(audit_path.to_str().unwrap_or("").as_bytes()).unwrap(),
+        );
+    }
     if !flags.is_empty() {
         platform.set_worker_spawn_flags(flags);
     }
