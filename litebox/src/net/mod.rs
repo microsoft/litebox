@@ -86,9 +86,16 @@ where
         platform::IPInterfaceProvider + platform::TimeProvider + sync::RawSyncPrimitivesProvider,
 {
     fn ip_listen_endpoint_v4(addr: SocketAddrV4, port: u16) -> smoltcp::wire::IpListenEndpoint {
+        // Always use addr=None (INADDR_ANY) regardless of the guest's bind address.
+        // The runner's smoltcp has a single interface (10.0.0.2/24). Cross-worker
+        // inbound connections arrive with dst=10.0.0.2, so a listen bound to
+        // 127.0.0.1 would never match (smoltcp checks listen_addr == dst_addr).
+        // Using None ensures all inbound SYN packets match the listen socket,
+        // matching real Linux behavior where 127.0.0.1 accepts connections
+        // arriving on any interface via the loopback redirect in connect().
+        let _ = addr; // suppress unused warning
         smoltcp::wire::IpListenEndpoint {
-            addr: (!addr.ip().is_unspecified())
-                .then_some(smoltcp::wire::IpAddress::Ipv4(*addr.ip())),
+            addr: None,
             port,
         }
     }
@@ -504,12 +511,19 @@ where
         let mut tcp_count = 0u16;
         let mut listen_count = 0u16;
         let mut listen_ports: [u16; 8] = [0; 8];
+        let mut listen_addrs: [u8; 8] = [0; 8]; // 0=None, 1=loopback, 2=10.0.0.2, 3=other
         for (_handle, socket) in self.socket_set.iter() {
             if let smoltcp::socket::Socket::Tcp(tcp) = socket {
                 tcp_count += 1;
                 if tcp.state() == smoltcp::socket::tcp::State::Listen {
                     if (listen_count as usize) < listen_ports.len() {
                         listen_ports[listen_count as usize] = tcp.listen_endpoint().port;
+                        listen_addrs[listen_count as usize] = match tcp.listen_endpoint().addr {
+                            None => 0,
+                            Some(smoltcp::wire::IpAddress::Ipv4(ip)) if ip == smoltcp::wire::Ipv4Address::new(127,0,0,1) => 1,
+                            Some(smoltcp::wire::IpAddress::Ipv4(ip)) if ip == smoltcp::wire::Ipv4Address::new(10,0,0,2) => 2,
+                            _ => 3,
+                        };
                     }
                     listen_count += 1;
                 }
@@ -520,6 +534,7 @@ where
             tcp_count,
             listen_count,
             listen_ports,
+            listen_addrs,
         }));
 
         let result = self

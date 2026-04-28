@@ -14,6 +14,8 @@ pub struct RstSocketSummary {
     pub tcp_count: u16,
     pub listen_count: u16,
     pub listen_ports: [u16; 8],
+    /// 0=None(INADDR_ANY), 1=127.0.0.1, 2=10.0.0.2, 3=other
+    pub listen_addrs: [u8; 8],
 }
 
 pub(crate) struct Device<Platform: platform::IPInterfaceProvider + 'static> {
@@ -132,6 +134,7 @@ impl<Platform: platform::IPInterfaceProvider> smoltcp::phy::TxToken for TxToken<
                         summary.tcp_count,
                         summary.listen_count,
                         &summary.listen_ports[..n],
+                        &summary.listen_addrs[..n],
                     );
                 }
             }

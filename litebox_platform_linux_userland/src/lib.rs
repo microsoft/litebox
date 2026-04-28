@@ -4391,12 +4391,20 @@ impl litebox::platform::IPInterfaceProvider for LinuxUserland {
         tcp_count: u16,
         listen_count: u16,
         listen_ports: &[u16],
+        listen_addrs: &[u8],
     ) {
         let tid = unsafe { libc::syscall(libc::SYS_gettid) };
+        // Decode addr codes: 0=ANY, 1=127.0.0.1, 2=10.0.0.2, 3=other
+        let addrs_decoded: Vec<&str> = listen_addrs.iter().map(|&a| match a {
+            0 => "ANY",
+            1 => "127.0.0.1",
+            2 => "10.0.0.2",
+            _ => "other",
+        }).collect();
         let msg = format!(
             "RUNNER RST (on_rst_transmitted): src={src_port} dst={dst_port} \
              tcp_sockets={tcp_count} listen_sockets={listen_count} \
-             listen_ports={listen_ports:?} pid={} tid={tid}\n",
+             listen_ports={listen_ports:?} listen_addrs={addrs_decoded:?} pid={} tid={tid}\n",
             std::process::id()
         );
         eprintln!("{}", msg.trim());

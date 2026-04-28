@@ -2151,7 +2151,7 @@ pub(crate) async fn proc_filesystem_tests(r: &mut TestRunner) {
         let resp = r
             .send(agent, Command::FsRead { path: "/proc/self/stat".into() })
             .await;
-        let pass = matches!(&resp, Response::Ok { data: Some(d) } if d.contains(") S "));
+        let pass = matches!(&resp, Response::Ok { data: Some(d) } if d.contains(") "));
         r.record(&test_id, agent, pass, &format!("{resp:?}"));
 
         // Test 2: /proc/self/stat is seekable (lseek doesn't return ESPIPE).

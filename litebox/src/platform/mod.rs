@@ -408,6 +408,7 @@ pub trait IPInterfaceProvider {
         _tcp_count: u16,
         _listen_count: u16,
         _listen_ports: &[u16],
+        _listen_addrs: &[u8],
     ) {
     }
 
