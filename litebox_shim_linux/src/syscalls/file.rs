@@ -314,6 +314,7 @@ impl<FS: ShimFS> Task<FS> {
                         .map_err(Errno::from)
                 },
                 |fd| {
+                    reject_offset_for_non_seekable(offset)?;
                     self.global.receive(
                         &self.wait_cx(),
                         fd,
@@ -323,6 +324,7 @@ impl<FS: ShimFS> Task<FS> {
                     )
                 },
                 |fd| {
+                    reject_offset_for_non_seekable(offset)?;
                     self.global
                         .pipes
                         .read(&self.wait_cx(), fd, &mut buf.borrow_mut())
@@ -335,6 +337,7 @@ impl<FS: ShimFS> Task<FS> {
                         .descriptor_table()
                         .entry_handle(fd)
                         .ok_or(Errno::EBADF)?;
+                    reject_offset_for_non_seekable(offset)?;
                     handle.with_entry(|file| {
                         let buf = &mut buf.borrow_mut();
                         if buf.len() < size_of::<u64>() {
@@ -353,6 +356,7 @@ impl<FS: ShimFS> Task<FS> {
                         .descriptor_table()
                         .entry_handle(fd)
                         .ok_or(Errno::EBADF)?;
+                    reject_offset_for_non_seekable(offset)?;
                     handle.with_entry(|file| {
                         file.recvfrom(
                             &self.wait_cx(),
@@ -380,6 +384,7 @@ impl<FS: ShimFS> Task<FS> {
                 raw_fd,
                 |fd| files.fs.write(fd, buf, offset).map_err(Errno::from),
                 |fd| {
+                    reject_offset_for_non_seekable(offset)?;
                     self.global.sendto(
                         &self.wait_cx(),
                         fd,
@@ -389,6 +394,7 @@ impl<FS: ShimFS> Task<FS> {
                     )
                 },
                 |fd| {
+                    reject_offset_for_non_seekable(offset)?;
                     self.global
                         .pipes
                         .write(&self.wait_cx(), fd, buf)
@@ -401,6 +407,7 @@ impl<FS: ShimFS> Task<FS> {
                         .descriptor_table()
                         .entry_handle(fd)
                         .ok_or(Errno::EBADF)?;
+                    reject_offset_for_non_seekable(offset)?;
                     handle.with_entry(|file| {
                         if buf.len() < size_of::<u64>() {
                             return Err(Errno::EINVAL);
@@ -421,6 +428,7 @@ impl<FS: ShimFS> Task<FS> {
                         .descriptor_table()
                         .entry_handle(fd)
                         .ok_or(Errno::EBADF)?;
+                    reject_offset_for_non_seekable(offset)?;
                     handle.with_entry(|file| {
                         file.sendto(self, buf, litebox_common_linux::SendFlags::empty(), None)
                     })
@@ -443,6 +451,14 @@ impl<FS: ShimFS> Task<FS> {
     pub fn sys_pwrite64(&self, fd: i32, buf: &[u8], offset: i64) -> Result<usize, Errno> {
         let pos = usize::try_from(offset).map_err(|_| Errno::EINVAL)?;
         self.sys_write(fd, buf, Some(pos))
+    }
+}
+
+fn reject_offset_for_non_seekable(offset: Option<usize>) -> Result<(), Errno> {
+    if offset.is_some() {
+        Err(Errno::ESPIPE)
+    } else {
+        Ok(())
     }
 }
 
