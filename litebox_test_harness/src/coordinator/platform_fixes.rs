@@ -2261,22 +2261,8 @@ pub(crate) async fn connect_addr_tests(r: &mut TestRunner) {
         let pass = matches!(
             &resp,
             Response::ExecResult { exit_code: 0, stdout, .. }
-                if stdout.contains("CONNECT_ADDRS_OK") || stdout.contains("CONNECT_ADDRS_PARTIAL")
-        );
-        // Also check if 10.0.0.2 specifically failed (xfail on native, must-pass on litebox)
-        let has_10002_fail = matches!(
-            &resp,
-            Response::ExecResult { stdout, .. } if stdout.contains("CONNECT_ADDRS_PARTIAL")
+                if stdout.contains("CONNECT_ADDRS_OK")
         );
         r.record(&test_id, agent, pass, &format!("{resp:?}"));
-        if has_10002_fail {
-            r.record_xfail(
-                &format!("ADDR.10002.{agent}"),
-                agent,
-                false,
-                "10.0.0.2 connect not working (native: no interface, litebox: redirect bug)",
-                &format!("{resp:?}"),
-            );
-        }
     }
 }

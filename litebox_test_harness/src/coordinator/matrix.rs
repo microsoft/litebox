@@ -517,12 +517,8 @@ async fn run_net_tests(r: &mut TestRunner) {
 
 const CONNECT_ADDRS: &[&str] = &["127.0.0.1", "0.0.0.0"];
 
-/// Litebox-only address — the guest virtual interface IP in smoltcp.
-/// Not testable because 10.0.0.2 is an internal implementation detail:
-/// - Can't bind() to it (not a real local interface)
-/// - connect() redirect exists but the address isn't user-facing
-/// - Neither native nor litebox can run tests against it
-/// Kept as documentation of the virtual network topology.
+/// Historical litebox-only address — kept for documentation.
+/// The matrix now discovers the self-IP dynamically via `hostname -I`.
 #[allow(dead_code)]
 const LITEBOX_ADDRS: &[&str] = &["10.0.0.2"];
 
@@ -552,15 +548,37 @@ async fn run_net_addr_tests(r: &mut TestRunner) {
     let has_nonpie = crate::find_nonpie_binary().is_some();
     let mut port = 11_001u16;
 
-    // All addresses: portable + litebox-only
-    let all_addrs: Vec<&str> = CONNECT_ADDRS
-        .iter()
-        .chain(LITEBOX_ADDRS.iter())
-        .copied()
-        .collect();
+    // Discover the host's non-loopback IP dynamically.
+    // On native Docker: bridge IP (e.g., 172.17.0.5)
+    // On litebox: smoltcp virtual IP (10.0.0.2)
+    let self_ip = tokio::process::Command::new("hostname")
+        .arg("-I")
+        .output()
+        .await
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .and_then(|s| {
+            s.split_whitespace()
+                .find(|ip| *ip != "127.0.0.1" && !ip.contains(':'))
+                .map(String::from)
+        });
+
+    // Build address list: portable + self-IP (if discovered)
+    let mut addrs: Vec<&str> = CONNECT_ADDRS.to_vec();
+    if let Some(ref ip) = self_ip {
+        addrs.push(ip.as_str());
+    }
+
+    let self_ip_label = self_ip.as_deref().unwrap_or("none");
+    eprintln!(
+        "[matrix] === Network Address ({} pairs × {} addrs [127.0.0.1, 0.0.0.0, {self_ip_label}]) ===",
+        NET_ADDR_PAIRS.len(),
+        addrs.len(),
+    );
 
     for &(agent_a, agent_b) in NET_ADDR_PAIRS {
-        for &addr in CONNECT_ADDRS {
+        for &addr in &addrs {
+            let is_self_ip = self_ip.as_deref() == Some(addr);
             // Skip non-PIE agents if binary not available
             if !has_nonpie
                 && (agent_requires_nonpie(agent_a) || agent_requires_nonpie(agent_b))
@@ -574,8 +592,6 @@ async fn run_net_addr_tests(r: &mut TestRunner) {
                 port += 1;
                 continue;
             }
-
-            let is_litebox_only = LITEBOX_ADDRS.contains(&addr);
 
             // Direction 1: agent_a listens, agent_b connects
             let test_id = format!("NA.{agent_a}_to_{agent_b}.{addr}");
@@ -600,18 +616,12 @@ async fn run_net_addr_tests(r: &mut TestRunner) {
                 .await;
             let pass = matches!(&resp, Response::Connected { echo } if *echo == test_data);
 
-            if is_litebox_only {
-                // 10.0.0.2 is the guest virtual IP. Connecting to it doesn't
-                // work even same-worker because smoltcp sends the SYN out
-                // the interface to the broker instead of loopback. Mark as
-                // xfail until loopback-to-self routing is implemented.
-                r.record_xfail(
-                    &test_id,
-                    agent_b,
-                    pass,
-                    "10.0.0.2 loopback not implemented",
-                    &format!("{resp:?}"),
-                );
+            if is_self_ip {
+                // 10.0.0.2 (or the native equivalent) — on native this is
+                // the Docker bridge IP, on litebox it's the smoltcp virtual IP.
+                // Both should work as self-connect. If the address wasn't
+                // discoverable, the test was skipped (no is_litebox_only entry).
+                r.record(&test_id, agent_b, pass, &format!("{resp:?}"));
             } else {
                 r.record(&test_id, agent_b, pass, &format!("{resp:?}"));
             }
@@ -1464,14 +1474,6 @@ pub(crate) async fn run_matrix_tests(r: &mut TestRunner) {
     run_net_tests(r).await;
 
     // ── Network Address Matrix ──
-    let all_addr_count = CONNECT_ADDRS.len() + LITEBOX_ADDRS.len();
-    let addr_test_count = NET_ADDR_PAIRS.len() * all_addr_count;
-    eprintln!(
-        "[matrix] === Network Address ({} pairs × {} addrs = {} cases) ===",
-        NET_ADDR_PAIRS.len(),
-        all_addr_count,
-        addr_test_count,
-    );
     run_net_addr_tests(r).await;
 
     // ── Unix Socket Address Matrix ──

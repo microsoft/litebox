@@ -71,6 +71,23 @@ fn find_nonpie_binary() -> Option<String> {
     None
 }
 
+/// Get the first non-loopback IPv4 address of this host.
+/// On native Docker: returns the container bridge IP (e.g., 172.17.0.5).
+/// On litebox: returns the smoltcp virtual IP (10.0.0.2).
+fn get_self_ip() -> Option<String> {
+    // Use hostname -I which returns space-separated IPs.
+    if let Ok(output) = std::process::Command::new("hostname").arg("-I").output() {
+        if let Ok(s) = String::from_utf8(output.stdout) {
+            for ip in s.split_whitespace() {
+                if ip != "127.0.0.1" && !ip.contains(':') {
+                    return Some(ip.to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let cmd = args.get(1).map(String::as_str).unwrap_or("spawn-tree");
@@ -140,15 +157,18 @@ fn main() {
             let listener = std::net::TcpListener::bind(format!("0.0.0.0:{port}"))
                 .expect("connect-addrs: bind failed");
 
-            // Always test all three addresses. On native Linux, 10.0.0.2
-            // will fail (no such interface). On litebox, it should work via
-            // the smoltcp redirect to the gateway.
-            let addrs = ["127.0.0.1", "0.0.0.0", "10.0.0.2"];
+            // Detect the host's non-loopback IP address dynamically.
+            // On native Linux: Docker bridge IP (e.g., 172.17.0.5)
+            // On litebox: smoltcp virtual IP (10.0.0.2)
+            // Both should work for self-connect (loopback to own IP).
+            let self_ip = get_self_ip();
+
+            let addrs: Vec<&str> = if let Some(ref ip) = self_ip {
+                vec!["127.0.0.1", "0.0.0.0", ip.as_str()]
+            } else {
+                vec!["127.0.0.1", "0.0.0.0"]
+            };
             let n_addrs = addrs.len();
-            // 127.0.0.1 and 0.0.0.0 must work everywhere. 10.0.0.2 is
-            // litebox-specific — its failure doesn't fail the overall test
-            // on native, but it must pass on litebox.
-            let required_addrs = ["127.0.0.1", "0.0.0.0"];
 
             // Spawn connect threads for each address
             let mut handles = Vec::new();
@@ -211,26 +231,9 @@ fn main() {
             for r in &results {
                 eprintln!("[connect-addrs] {r}");
             }
-            // Required addresses (must pass everywhere)
-            let required_ok = results
-                .iter()
-                .filter(|r| required_addrs.iter().any(|a| r.starts_with(a)))
-                .all(|r| r.contains(":OK:"));
-            // Optional address (10.0.0.2 — litebox only)
-            let optional_results: Vec<_> = results
-                .iter()
-                .filter(|r| r.starts_with("10.0.0.2"))
-                .collect();
-            let optional_ok = optional_results.iter().all(|r| r.contains(":OK:"));
-
-            if required_ok && optional_ok {
+            let all_ok = results.iter().all(|r| r.contains(":OK:"));
+            if all_ok {
                 println!("CONNECT_ADDRS_OK");
-            } else if required_ok && !optional_ok {
-                // 10.0.0.2 failed but core addresses work
-                println!("CONNECT_ADDRS_PARTIAL");
-                for r in &optional_results {
-                    println!("  {r}");
-                }
             } else {
                 println!("CONNECT_ADDRS_FAIL");
                 for r in &results {
