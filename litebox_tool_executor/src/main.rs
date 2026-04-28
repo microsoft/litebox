@@ -125,12 +125,8 @@ fn main() -> anyhow::Result<()> {
         );
     }
 
-    // Resolve audit log: create directory and generate a timestamped file path.
-    let audit_log_file = if let Some(ref dir) = cli.audit_log {
-        Some(create_audit_log_file(dir)?)
-    } else {
-        None
-    };
+    // Resolve audit log for all modes.
+    let audit_log_file = resolve_audit_log(&cli)?;
 
     // Print binary build times for diagnostics.
     print_build_info(audit_log_file.as_deref());
@@ -141,6 +137,24 @@ fn main() -> anyhow::Result<()> {
         interactive(&cli, audit_log_file.as_deref())
     } else {
         direct(&cli, audit_log_file.as_deref())
+    }
+}
+
+/// Resolve the audit log file path for all modes.
+///
+/// Priority:
+/// 1. `--audit-log DIR` → create timestamped file in that directory
+/// 2. `LITEBOX_NO_AUDIT=1` → no audit logging
+/// 3. Otherwise → auto-create in `/tmp/litebox-vscode-server-logs/` with cleanup
+fn resolve_audit_log(cli: &Cli) -> anyhow::Result<Option<std::path::PathBuf>> {
+    if let Some(ref dir) = cli.audit_log {
+        Ok(Some(create_audit_log_file(dir)?))
+    } else if std::env::var("LITEBOX_NO_AUDIT").as_deref() == Ok("1") {
+        Ok(None)
+    } else {
+        let dir = std::env::temp_dir().join("litebox-vscode-server-logs");
+        cleanup_old_logs(&dir);
+        Ok(Some(create_audit_log_file(&dir)?))
     }
 }
 
@@ -632,16 +646,26 @@ fn interactive(cli: &Cli, audit_log_file: Option<&std::path::Path>) -> anyhow::R
 
 /// Direct mode: run a single command.
 fn direct(cli: &Cli, audit_log_file: Option<&std::path::Path>) -> anyhow::Result<()> {
-    // Parse --forward-port specs for direct mode.
-    let forward_ports: Vec<(u16, &str, u16)> = cli
-        .forward_port
+    let forward_ports = parse_forward_ports(&cli.forward_port);
+    run_sandbox(
+        cli,
+        audit_log_file,
+        &forward_ports,
+        &cli.command.iter().map(String::as_str).collect::<Vec<_>>(),
+        std::process::Stdio::inherit(),
+    )
+}
+
+/// Parse --forward-port specs into (host_port, guest_ip, guest_port) tuples.
+fn parse_forward_ports(specs: &[String]) -> Vec<(u16, String, u16)> {
+    specs
         .iter()
         .filter_map(|spec| {
             let parts: Vec<&str> = spec.split(':').collect();
             if parts.len() == 3 {
                 Some((
                     parts[0].parse::<u16>().ok()?,
-                    parts[1],
+                    parts[1].to_string(),
                     parts[2].parse::<u16>().ok()?,
                 ))
             } else {
@@ -651,13 +675,27 @@ fn direct(cli: &Cli, audit_log_file: Option<&std::path::Path>) -> anyhow::Result
                 None
             }
         })
+        .collect()
+}
+
+/// Core sandbox execution: spawn broker + runner with the given configuration.
+fn run_sandbox(
+    cli: &Cli,
+    audit_log_file: Option<&std::path::Path>,
+    forward_ports: &[(u16, String, u16)],
+    guest_command: &[&str],
+    stdin_mode: std::process::Stdio,
+) -> anyhow::Result<()> {
+    let forward_refs: Vec<(u16, &str, u16)> = forward_ports
+        .iter()
+        .map(|(h, g, p)| (*h, g.as_str(), *p))
         .collect();
-    let broker = spawn_broker(cli, audit_log_file, &forward_ports)?;
+    let broker = spawn_broker(cli, audit_log_file, &forward_refs)?;
 
     let mut cmd = runner_command(cli, audit_log_file, Some(&broker))?;
-    cmd.args(&cli.command);
+    cmd.args(guest_command);
 
-    cmd.stdin(std::process::Stdio::inherit())
+    cmd.stdin(stdin_mode)
         .stdout(std::process::Stdio::inherit())
         .stderr(std::process::Stdio::inherit());
 
@@ -696,40 +734,11 @@ fn vscode_server(cli: &Cli, audit_log_file: Option<&std::path::Path>) -> anyhow:
         );
     }
 
-    // Auto-create an audit log directory if none was specified.
-    // When LITEBOX_NO_AUDIT=1 is set, skip audit logging for performance testing.
-    let auto_audit;
-    let audit: Option<&std::path::Path> = if std::env::var("LITEBOX_NO_AUDIT").as_deref() == Ok("1")
-    {
-        None
-    } else if let Some(p) = audit_log_file {
-        Some(p)
-    } else {
-        let dir = std::env::temp_dir().join("litebox-vscode-server-logs");
-        // Clean up old log files from previous sessions to avoid filling disk.
-        cleanup_old_logs(&dir);
-        auto_audit = create_audit_log_file(&dir)?;
-        Some(&auto_audit)
-    };
-
-    // The guest IP in the broker's virtual network.
     let guest_ip = "10.0.0.2";
     let ssh_port = cli.ssh_port;
 
-    // Start the broker with inbound TCP forwarding for SSH only.
-    // VS Code CLI loopback connections are handled by port registration +
-    // cross-worker bridging in the broker.
-    let forward_ports = [(ssh_port, guest_ip, 22u16)];
-    let broker = spawn_broker(cli, audit, &forward_ports)?;
-
-    // Build the runner command: dropbear SSH server
-    // dropbear flags:
-    //   -F  don't fork into background (foreground mode)
-    //   -E  log to stderr
-    //   -s  disable password login (empty passwords via -B instead)
-    //   -B  allow blank passwords
-    //   -R  create host keys if missing
-    //   -p 22  listen on port 22 inside the sandbox
+    // SSH port forwarding: host:ssh_port → guest:22
+    let forward_ports = vec![(ssh_port, guest_ip.to_string(), 22u16)];
 
     // Detect WSL2 IP for connection instructions.
     let wsl_ip = std::process::Command::new("hostname")
@@ -767,7 +776,7 @@ fn vscode_server(cli: &Cli, audit_log_file: Option<&std::path::Path>) -> anyhow:
     eprintln!("    Remote-SSH → Connect to Host → litebox");
     eprintln!();
     eprintln!("  Logs:");
-    if let Some(audit) = audit {
+    if let Some(audit) = audit_log_file {
         eprintln!("    Syscalls: {}", audit.display());
         eprintln!(
             "    Broker:   {}",
@@ -779,26 +788,21 @@ fn vscode_server(cli: &Cli, audit_log_file: Option<&std::path::Path>) -> anyhow:
     eprintln!("==============================================");
     eprintln!();
 
-    let mut cmd = runner_command(cli, audit, Some(&broker))?;
+    let guest_command = [
+        "/usr/sbin/dropbear",
+        "-F",
+        "-E",
+        "-B",
+        "-R",
+        "-p",
+        "22",
+    ];
 
-    // Start dropbear SSH server. VS Code's install script will start the
-    // code-server when it connects — the CLI and server are pre-installed
-    // in the Docker image, so no pre-warming is needed.
-    cmd.args(["/usr/sbin/dropbear", "-F", "-E", "-B", "-R", "-p", "22"]);
-
-    cmd.stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::inherit())
-        .stderr(std::process::Stdio::inherit());
-
-    let status = cmd
-        .status()
-        .map_err(|e| anyhow::anyhow!("Failed to spawn litebox_runner_linux_userland: {e}"))?;
-
-    drop(broker);
-
-    if !status.success() {
-        eprintln!("sshd exited with code {}", status.code().unwrap_or(-1));
-        std::process::exit(status.code().unwrap_or(1));
-    }
-    Ok(())
+    run_sandbox(
+        cli,
+        audit_log_file,
+        &forward_ports,
+        &guest_command,
+        std::process::Stdio::null(),
+    )
 }
