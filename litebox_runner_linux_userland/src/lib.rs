@@ -348,6 +348,28 @@ fn initial_program_data(
 /// panic. If it does actually panic, then ping the authors of LiteBox, and likely a better error
 /// message could be thrown instead.
 pub fn run(cli_args: CliArgs) -> Result<()> {
+    // Open audit log file if specified. Must happen before any early-return
+    // path (worker_exec, fork_restore) so ALL workers get audit logging.
+    #[cfg(feature = "audit_log")]
+    if let Some(ref audit_path) = cli_args.audit_log {
+        use std::os::unix::io::IntoRawFd as _;
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(audit_path)
+            .map_err(|e| {
+                anyhow::anyhow!("Could not open audit log {}: {e}", audit_path.display())
+            })?;
+        let raw_fd = file.into_raw_fd();
+        let high_fd = unsafe { libc::fcntl(raw_fd, libc::F_DUPFD_CLOEXEC, 100) };
+        if high_fd >= 0 {
+            unsafe { libc::close(raw_fd) };
+            litebox_shim_linux::audit::set_audit_log_fd(high_fd);
+        } else {
+            litebox_shim_linux::audit::set_audit_log_fd(raw_fd);
+        }
+    }
+
     // When running as a worker host for a non-PIE child exec, take the
     // simplified worker path that skips VA partitioning.
     if cli_args.worker_exec {
@@ -363,31 +385,6 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         unimplemented!(
             "this should (hopefully soon) have a nicer interface to support loading in files"
         )
-    }
-
-    // Open audit log file if specified. Events will be written directly to
-    // this fd by the shim, bypassing stderr.
-    #[cfg(feature = "audit_log")]
-    if let Some(ref audit_path) = cli_args.audit_log {
-        use std::os::unix::io::IntoRawFd as _;
-        let file = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(audit_path)
-            .map_err(|e| {
-                anyhow::anyhow!("Could not open audit log {}: {e}", audit_path.display())
-            })?;
-        let raw_fd = file.into_raw_fd();
-        // Move to a high fd number so it doesn't collide with guest pipe fds
-        // (bash creates pipes starting from fd 3). F_DUPFD_CLOEXEC = 1030.
-        let high_fd = unsafe { libc::fcntl(raw_fd, libc::F_DUPFD_CLOEXEC, 100) };
-        if high_fd >= 0 {
-            unsafe { libc::close(raw_fd) };
-            litebox_shim_linux::audit::set_audit_log_fd(high_fd);
-        } else {
-            // Fallback: use original fd if fcntl fails
-            litebox_shim_linux::audit::set_audit_log_fd(raw_fd);
-        }
     }
 
     // --program-from-tar loads pre-rewritten binaries that depend on litebox_rtld_audit.so,
@@ -1055,27 +1052,7 @@ fn terminate_host_with_guest_wait_status(wait_status: i32) -> ! {
 /// child process state, and resumes guest execution. Writes a restore ack to
 /// the parent via the ack pipe before resuming.
 fn run_fork_restore(cli_args: CliArgs) -> Result<()> {
-    // Open audit log file if specified — must happen before any syscall
-    // processing so that all worker 2 syscalls are recorded.
-    #[cfg(feature = "audit_log")]
-    if let Some(ref audit_path) = cli_args.audit_log {
-        use std::os::unix::io::IntoRawFd as _;
-        let file = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(audit_path)
-            .map_err(|e| {
-                anyhow::anyhow!("Could not open audit log {}: {e}", audit_path.display())
-            })?;
-        let raw_fd = file.into_raw_fd();
-        let high_fd = unsafe { libc::fcntl(raw_fd, libc::F_DUPFD_CLOEXEC, 100) };
-        if high_fd >= 0 {
-            unsafe { libc::close(raw_fd) };
-            litebox_shim_linux::audit::set_audit_log_fd(high_fd);
-        } else {
-            litebox_shim_linux::audit::set_audit_log_fd(raw_fd);
-        }
-    }
+    // Audit log is now set up in run() before this is called.
 
     let snapshot_fd = cli_args
         .fork_restore_fd
@@ -1927,26 +1904,7 @@ fn spawn_worker_mux_dispatcher(
 /// at its canonical addresses, runs it to completion, and exits with its code.
 #[allow(clippy::similar_names)]
 fn run_worker_exec(cli_args: CliArgs) -> Result<()> {
-    // Open audit log file if specified.
-    #[cfg(feature = "audit_log")]
-    if let Some(ref audit_path) = cli_args.audit_log {
-        use std::os::unix::io::IntoRawFd as _;
-        let file = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(audit_path)
-            .map_err(|e| {
-                anyhow::anyhow!("Could not open audit log {}: {e}", audit_path.display())
-            })?;
-        let raw_fd = file.into_raw_fd();
-        let high_fd = unsafe { libc::fcntl(raw_fd, libc::F_DUPFD_CLOEXEC, 100) };
-        if high_fd >= 0 {
-            unsafe { libc::close(raw_fd) };
-            litebox_shim_linux::audit::set_audit_log_fd(high_fd);
-        } else {
-            litebox_shim_linux::audit::set_audit_log_fd(raw_fd);
-        }
-    }
+    // Audit log is now set up in run() before this is called.
 
     // program_and_arguments layout from the parent:
     //   [0] = resolved load path (the binary to load from the FS)
