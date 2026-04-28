@@ -20,19 +20,10 @@ all encoded the manual full-stack workflow we are trying to eliminate.
 
 ### `audit/`
 
-Audit-log analysis and baseline tooling.
+Audit-log viewers.
 
 - `View-AuditLog.ps1`, `Tail-AuditLog.ps1` — audit log viewers.
   Referenced from `litebox_tool_executor/demo/.vscode/tasks.json`.
-- `generate-audit-baseline.sh` — record an audit baseline for a
-  workload.
-- `analyze-baseline.py` — derive a sandbox policy from a recorded
-  baseline.
-
-**Python carve-out:** `analyze-baseline.py` is a developer-side
-analysis tool, not test logic. Test logic must remain Rust per
-`litebox_test_harness/CLAUDE.md` rule 7; developer analysis tools in
-this directory are exempt.
 
 ### `vscode/`
 
@@ -42,8 +33,6 @@ VS Code remote-server bring-up artifacts.
   bootstrap script. Embedded into the harness via `include_str!` from
   `litebox_test_harness/src/coordinator/vscode.rs`. Do not move
   without updating that path.
-- `litebox-ssh-shim.ps1` — VS Code SSH shim for client-side
-  configuration.
 
 ## Rootfs
 
