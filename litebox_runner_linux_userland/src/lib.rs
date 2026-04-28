@@ -1927,6 +1927,27 @@ fn spawn_worker_mux_dispatcher(
 /// at its canonical addresses, runs it to completion, and exits with its code.
 #[allow(clippy::similar_names)]
 fn run_worker_exec(cli_args: CliArgs) -> Result<()> {
+    // Open audit log file if specified.
+    #[cfg(feature = "audit_log")]
+    if let Some(ref audit_path) = cli_args.audit_log {
+        use std::os::unix::io::IntoRawFd as _;
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(audit_path)
+            .map_err(|e| {
+                anyhow::anyhow!("Could not open audit log {}: {e}", audit_path.display())
+            })?;
+        let raw_fd = file.into_raw_fd();
+        let high_fd = unsafe { libc::fcntl(raw_fd, libc::F_DUPFD_CLOEXEC, 100) };
+        if high_fd >= 0 {
+            unsafe { libc::close(raw_fd) };
+            litebox_shim_linux::audit::set_audit_log_fd(high_fd);
+        } else {
+            litebox_shim_linux::audit::set_audit_log_fd(raw_fd);
+        }
+    }
+
     // program_and_arguments layout from the parent:
     //   [0] = resolved load path (the binary to load from the FS)
     //   [1..] = original guest argv (may be empty for argc==0 execs)
