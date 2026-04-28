@@ -90,86 +90,120 @@ pub(super) async fn vscode_repro_tests(r: &mut TestRunner) {
         .await;
 
     // V4: Node.js code-server startup (requires VS Code rootfs)
-    let code_server = "/root/.vscode-server/cli/servers/Stable-ae130017f8afe532557dbb8539a6ef3bdaec6389/server/bin/code-server";
-    let resp = r.send("A", exec_timeout(vec![
-        "bash".into(), "-c".into(),
-        format!("if [ -x {code_server} ]; then {code_server} --connection-token=test --accept-server-license-terms --start-server --socket-path=/tmp/t4-test.sock 2>&1 & PID=$!; sleep 3; kill $PID 2>/dev/null; wait $PID 2>/dev/null; echo exit=$?; else echo SKIP_NOT_FOUND; fi"),
-    ], 30)).await;
-    let skipped =
-        matches!(&resp, Response::ExecResult { stdout, .. } if stdout.contains("SKIP_NOT_FOUND"));
-    let started = matches!(&resp, Response::ExecResult { stdout, .. } if !stdout.contains("SKIP_NOT_FOUND"))
-        || matches!(&resp, Response::ExecTimeout { .. });
-    if skipped {
-        r.record("V4.code_server", "A", true, "skipped (binary not found)");
-    } else {
+    // Discover the code-server path dynamically — the commit hash changes
+    // with each VS Code update.
+    let code_server_resp = r
+        .send(
+            "A",
+            exec(bash(
+                "ls -d /root/.vscode-server/cli/servers/Stable-*/server/bin/code-server 2>/dev/null | head -1",
+            )),
+        )
+        .await;
+    let code_server = match &code_server_resp {
+        Response::ExecResult {
+            exit_code: 0,
+            stdout,
+            ..
+        } if !stdout.trim().is_empty() => Some(stdout.trim().to_string()),
+        _ => None,
+    };
+
+    if let Some(ref cs) = code_server {
+        let resp = r
+            .send(
+                "A",
+                exec_timeout(
+                    bash(&format!(
+                        "{cs} --connection-token=test --accept-server-license-terms \
+                     --start-server --socket-path=/tmp/t4-test.sock 2>&1 & \
+                     PID=$!; sleep 3; kill $PID 2>/dev/null; wait $PID 2>/dev/null; echo exit=$?"
+                    )),
+                    30,
+                ),
+            )
+            .await;
+        let started = matches!(&resp, Response::ExecResult { stdout, .. } if stdout.contains("exit="))
+            || matches!(&resp, Response::ExecTimeout { .. });
         r.record("V4.code_server", "A", started, &format!("{resp:?}"));
+    } else {
+        r.record(
+            "V4.code_server",
+            "A",
+            false,
+            "FAIL: code-server binary not found in /root/.vscode-server/cli/servers/Stable-*/",
+        );
     }
     let _ = r.send("A", exec(bash("rm -f /tmp/t4-test.sock"))).await;
 
     // V6: code-server socket creation (requires VS Code rootfs)
-    let resp = r
-        .send(
-            "A",
-            exec_timeout(
-                bash(&format!(
-                    "if [ -x {code_server} ]; then \
-            {code_server} --connection-token=test --accept-server-license-terms \
-            --start-server --socket-path=/tmp/t6-test.sock >/dev/null 2>&1 & \
-            PID=$!; sleep 3; \
-            if [ -S /tmp/t6-test.sock ]; then echo SOCKET_CREATED; else echo SOCKET_MISSING; fi; \
-            kill -9 $PID 2>/dev/null; \
-         else echo SKIP_NOT_FOUND; fi"
-                )),
-                20,
-            ),
-        )
-        .await;
-    let skipped =
-        matches!(&resp, Response::ExecResult { stdout, .. } if stdout.contains("SKIP_NOT_FOUND"));
-    if skipped {
-        r.record(
-            "V6.code_server_socket",
-            "A",
-            true,
-            "skipped (binary not found)",
-        );
-    } else {
-        let socket_created = matches!(&resp, Response::ExecResult { stdout, .. } if stdout.contains("SOCKET_CREATED"));
+    if let Some(ref cs) = code_server {
+        let resp = r
+            .send(
+                "A",
+                exec_timeout(
+                    bash(&format!(
+                        "{cs} --connection-token=test --accept-server-license-terms \
+                     --start-server --socket-path=/tmp/t6-test.sock >/dev/null 2>&1 & \
+                     PID=$!; sleep 3; \
+                     if [ -S /tmp/t6-test.sock ]; then echo SOCKET_CREATED; else echo SOCKET_MISSING; fi; \
+                     kill -9 $PID 2>/dev/null"
+                    )),
+                    20,
+                ),
+            )
+            .await;
+        let socket_created =
+            matches!(&resp, Response::ExecResult { stdout, .. } if stdout.contains("SOCKET_CREATED"));
         r.record(
             "V6.code_server_socket",
             "A",
             socket_created,
             &format!("{resp:?}"),
         );
+    } else {
+        r.record(
+            "V6.code_server_socket",
+            "A",
+            false,
+            "FAIL: code-server binary not found",
+        );
     }
     let _ = r.send("A", exec(bash("rm -f /tmp/t6-test.sock"))).await;
 
     // V7: code-server auto-shutdown (requires VS Code rootfs)
-    let resp = r
-        .send(
+    if let Some(ref cs) = code_server {
+        let resp = r
+            .send(
+                "A",
+                exec_timeout(
+                    bash(&format!(
+                        "{cs} --connection-token=test --accept-server-license-terms \
+                     --start-server --enable-remote-auto-shutdown \
+                     --socket-path=/tmp/t7-test.sock >/dev/null 2>&1 & \
+                     PID=$!; sleep 5; \
+                     if kill -0 $PID 2>/dev/null; then echo STILL_RUNNING; else echo EXITED_EARLY; fi; \
+                     kill -9 $PID 2>/dev/null"
+                    )),
+                    20,
+                ),
+            )
+            .await;
+        let still_running =
+            matches!(&resp, Response::ExecResult { stdout, .. } if stdout.contains("STILL_RUNNING"));
+        r.record(
+            "V7.auto_shutdown",
             "A",
-            exec_timeout(
-                bash(&format!(
-                    "if [ -x {code_server} ]; then \
-            {code_server} --connection-token=test --accept-server-license-terms \
-            --start-server --enable-remote-auto-shutdown \
-            --socket-path=/tmp/t7-test.sock >/dev/null 2>&1 & \
-            PID=$!; sleep 5; \
-            if kill -0 $PID 2>/dev/null; then echo STILL_RUNNING; else echo EXITED_EARLY; fi; \
-            kill -9 $PID 2>/dev/null; \
-         else echo SKIP_NOT_FOUND; fi"
-                )),
-                20,
-            ),
-        )
-        .await;
-    let skipped =
-        matches!(&resp, Response::ExecResult { stdout, .. } if stdout.contains("SKIP_NOT_FOUND"));
-    if skipped {
-        r.record("V7.auto_shutdown", "A", true, "skipped (binary not found)");
+            still_running,
+            &format!("{resp:?}"),
+        );
     } else {
-        let still_running = matches!(&resp, Response::ExecResult { stdout, .. } if stdout.contains("STILL_RUNNING"));
-        r.record("V7.auto_shutdown", "A", still_running, &format!("{resp:?}"));
+        r.record(
+            "V7.auto_shutdown",
+            "A",
+            false,
+            "FAIL: code-server binary not found",
+        );
     }
     let _ = r.send("A", exec(bash("rm -f /tmp/t7-test.sock"))).await;
 }
