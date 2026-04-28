@@ -637,8 +637,6 @@ impl<FS: ShimFS> Task<FS> {
         flags: OFlags,
         contents: alloc::string::String,
     ) -> Result<u32, Errno> {
-        use litebox::pipes::Flags;
-
         if flags.intersects(OFlags::WRONLY | OFlags::RDWR) {
             return Err(Errno::EACCES);
         }
@@ -646,41 +644,48 @@ impl<FS: ShimFS> Task<FS> {
             return Err(Errno::ENOTDIR);
         }
 
-        let mut pipe_flags = Flags::empty();
-        pipe_flags.set(Flags::NON_BLOCKING, flags.contains(OFlags::NONBLOCK));
-        let (writer, reader) = self.global.pipes.create_pipe(
-            DEFAULT_PIPE_BUF_SIZE,
-            pipe_flags,
-            core::num::NonZero::new(4096),
-        );
+        // Create a seekable in-memory file instead of a pipe.
+        // On real Linux, /proc files are seekable (lseek returns 0).
+        // Using a pipe breaks programs (like the VS Code Server) that
+        // call lseek() on /proc/PID/stat to check seekability.
+        let files = self.files.borrow();
 
-        {
-            let initial_status = OFlags::from(pipe_flags);
+        // Create a temporary file path that won't collide.
+        static PROC_COUNTER: core::sync::atomic::AtomicU64 =
+            core::sync::atomic::AtomicU64::new(0);
+        let n = PROC_COUNTER.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        let tmp_path = alloc::format!("/tmp/.proc_synthetic_{n}");
+
+        // Create, write, close, then reopen read-only.
+        let write_fd = files
+            .fs
+            .open(
+                &tmp_path,
+                OFlags::WRONLY | OFlags::CREAT | OFlags::TRUNC,
+                litebox::fs::Mode::RWXU,
+            )
+            .map_err(Errno::from)?;
+        files.fs.write(&write_fd, contents.as_bytes(), None).map_err(Errno::from)?;
+        files.fs.close(&write_fd).map_err(Errno::from)?;
+
+        let read_fd = files
+            .fs
+            .open(&tmp_path, OFlags::RDONLY, litebox::fs::Mode::empty())
+            .map_err(Errno::from)?;
+
+        // Delete the file so it's cleaned up when the fd is closed.
+        let _ = files.fs.unlink(&tmp_path);
+
+        // Apply CLOEXEC if requested.
+        if flags.contains(OFlags::CLOEXEC) {
             let mut dt = self.global.litebox.descriptor_table_mut();
-            let old = dt.set_entry_metadata(
-                &reader,
-                crate::PipeStatusFlags(initial_status | OFlags::RDONLY),
-            );
-            assert!(old.is_none());
-            if flags.contains(OFlags::CLOEXEC) {
-                let None = dt.set_fd_metadata(&reader, FileDescriptorFlags::FD_CLOEXEC) else {
-                    unreachable!()
-                };
-            }
+            let None = dt.set_fd_metadata(&read_fd, FileDescriptorFlags::FD_CLOEXEC) else {
+                unreachable!()
+            };
         }
 
-        let write_result = self
-            .global
-            .pipes
-            .write(&self.wait_cx(), &writer, contents.as_bytes())
-            .map_err(Errno::from);
-        self.global.pipes.close(&writer).unwrap();
-        let written = write_result?;
-        debug_assert_eq!(written, contents.len());
-
-        let files = self.files.borrow();
-        let raw_fd = files.insert_raw_fd(reader).map_err(|reader| {
-            self.global.pipes.close(&reader).unwrap();
+        let raw_fd = files.insert_raw_fd(read_fd).map_err(|read_fd| {
+            files.fs.close(&read_fd).ok();
             Errno::EMFILE
         })?;
         Ok(u32::try_from(raw_fd).unwrap())

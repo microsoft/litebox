@@ -1055,6 +1055,28 @@ fn terminate_host_with_guest_wait_status(wait_status: i32) -> ! {
 /// child process state, and resumes guest execution. Writes a restore ack to
 /// the parent via the ack pipe before resuming.
 fn run_fork_restore(cli_args: CliArgs) -> Result<()> {
+    // Open audit log file if specified — must happen before any syscall
+    // processing so that all worker 2 syscalls are recorded.
+    #[cfg(feature = "audit_log")]
+    if let Some(ref audit_path) = cli_args.audit_log {
+        use std::os::unix::io::IntoRawFd as _;
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(audit_path)
+            .map_err(|e| {
+                anyhow::anyhow!("Could not open audit log {}: {e}", audit_path.display())
+            })?;
+        let raw_fd = file.into_raw_fd();
+        let high_fd = unsafe { libc::fcntl(raw_fd, libc::F_DUPFD_CLOEXEC, 100) };
+        if high_fd >= 0 {
+            unsafe { libc::close(raw_fd) };
+            litebox_shim_linux::audit::set_audit_log_fd(high_fd);
+        } else {
+            litebox_shim_linux::audit::set_audit_log_fd(raw_fd);
+        }
+    }
+
     let snapshot_fd = cli_args
         .fork_restore_fd
         .ok_or_else(|| anyhow!("--fork-restore requires --fork-restore-fd"))?;
