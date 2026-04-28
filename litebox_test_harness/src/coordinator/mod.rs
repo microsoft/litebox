@@ -424,6 +424,12 @@ async fn run_tests(self_exe: &str, filter: Option<&str>) -> Vec<TestResult> {
         platform_fixes::fork_listen_close_tests(&mut runner).await;
     }
 
+    // === Proc Filesystem Tests ===
+    if should_run("proc") {
+        eprintln!("[coord] === Proc Filesystem Tests ===");
+        platform_fixes::proc_filesystem_tests(&mut runner).await;
+    }
+
     // === TCP Stress Tests ===
     if should_run("tcp") {
         eprintln!("[coord] === TCP Stress Tests ===");

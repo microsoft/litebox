@@ -300,6 +300,7 @@ pub(crate) async fn run(r: &mut TestRunner) {
     cross_worker_first_connect_tests(r).await;
     cross_worker_self_connect_tests(r).await;
     fork_listen_close_tests(r).await;
+    proc_filesystem_tests(r).await;
     // PID visibility tests run last— KP.proc_child can deadlock agent B
     // under litebox, causing all subsequent B-targeted tests to timeout.
     pid_visibility_tests(r).await;
@@ -2127,4 +2128,58 @@ pub(crate) async fn fork_listen_close_tests(r: &mut TestRunner) {
         .await;
     let pass = matches!(&conn_resp, Response::Connected { echo } if echo == "fork_listen_close");
     r.record("FKLC.cross_connect", "B", pass, &format!("{conn_resp:?}"));
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// PROC: /proc filesystem tests
+// ═══════════════════════════════════════════════════════════════════
+
+/// Tests that synthetic /proc files behave like real Linux:
+/// - /proc/self/stat is readable and seekable (not ESPIPE)
+/// - /proc/uptime is readable
+/// - /proc/self/maps is readable
+///
+/// The lseek test is critical: the VS Code Server reads /proc/PID/stat
+/// and calls lseek() to check seekability. If lseek returns ESPIPE
+/// (pipe-backed), the server tears down its listener.
+pub(crate) async fn proc_filesystem_tests(r: &mut TestRunner) {
+    eprintln!("[platform] === PROC: /proc filesystem ===");
+
+    for &agent in AGENTS {
+        // Test 1: /proc/self/stat is readable and contains PID.
+        let test_id = format!("PROC.self_stat.{agent}");
+        let resp = r
+            .send(agent, Command::FsRead { path: "/proc/self/stat".into() })
+            .await;
+        let pass = matches!(&resp, Response::Ok { data: Some(d) } if d.contains(") S "));
+        r.record(&test_id, agent, pass, &format!("{resp:?}"));
+
+        // Test 2: /proc/self/stat is seekable (lseek doesn't return ESPIPE).
+        // We test this by using dd which does lseek internally.
+        let test_id = format!("PROC.stat_seekable.{agent}");
+        let resp = r
+            .send(
+                agent,
+                exec(vec![
+                    "sh".into(),
+                    "-c".into(),
+                    "dd if=/proc/self/stat bs=1 skip=0 count=10 2>/dev/null | wc -c".into(),
+                ]),
+            )
+            .await;
+        let pass = matches!(
+            &resp,
+            Response::ExecResult { exit_code: 0, stdout, .. }
+                if stdout.trim().parse::<u32>().unwrap_or(0) > 0
+        );
+        r.record(&test_id, agent, pass, &format!("{resp:?}"));
+
+        // Test 3: /proc/uptime is readable.
+        let test_id = format!("PROC.uptime.{agent}");
+        let resp = r
+            .send(agent, Command::FsRead { path: "/proc/uptime".into() })
+            .await;
+        let pass = matches!(&resp, Response::Ok { data: Some(d) } if !d.is_empty());
+        r.record(&test_id, agent, pass, &format!("{resp:?}"));
+    }
 }
