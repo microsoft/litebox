@@ -5,6 +5,14 @@
 
 use serde::{Deserialize, Serialize};
 
+fn default_fork_binary() -> String {
+    "self".to_string()
+}
+
+fn default_accept_timeout() -> u64 {
+    10
+}
+
 /// Command sent from parent to child via stdin.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "cmd")]
@@ -18,6 +26,46 @@ pub enum Command {
     /// workers. Used to test cross-worker filesystem and socket coherence.
     #[serde(rename = "spawn_remote")]
     SpawnRemote { children: Vec<String> },
+
+    /// Fork a child agent with explicit control over exec binary and fd
+    /// inheritance. Subsumes Spawn/SpawnRemote with finer control.
+    ///
+    /// `binary`:
+    ///   - `"self"` → fork+exec the PIE test harness (= Spawn)
+    ///   - `"nonpie"` → fork+exec the non-PIE binary (= SpawnRemote)
+    ///   - `"none"` → true fork, no exec. Child shares parent's address
+    ///     space until it receives an Exec or Exit command. Models the
+    ///     pre-migration window in litebox's delayed fork where the child
+    ///     can immediately accept() on inherited sockets.
+    ///
+    /// `inherit_listen_ports`: TCP listen ports whose fds should remain
+    /// open in the child (not closed by CLOEXEC).
+    #[serde(rename = "fork")]
+    Fork {
+        name: String,
+        #[serde(default = "default_fork_binary")]
+        binary: String,
+        #[serde(default)]
+        inherit_listen_ports: Vec<u16>,
+    },
+
+    /// Accept one connection on an already-listening TCP port.
+    /// Decouples listen from accept so tests can fork/close between them.
+    #[serde(rename = "net_accept")]
+    NetAccept {
+        port: u16,
+        #[serde(default = "default_accept_timeout")]
+        timeout_secs: u64,
+    },
+
+    /// Close the TCP listen socket on a port (without removing the echo
+    /// handler task). Reproduces the parent-close-after-fork pattern.
+    #[serde(rename = "net_close_listener")]
+    NetCloseListener { port: u16 },
+
+    /// Report the agent's process ID.
+    #[serde(rename = "get_pid")]
+    GetPid,
 
     /// Read a file and report contents (or not_found).
     #[serde(rename = "fs_read")]
