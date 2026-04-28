@@ -131,23 +131,10 @@ async fn agent_loop(self_exe: &str) {
                             continue;
                         }
                     },
-                    "none" => {
-                        // TODO: true fork without exec (binary="none") is not
-                        // yet implemented. It requires libc::fork() + running
-                        // a second agent loop in the child without exec, which
-                        // interacts with tokio's runtime in complex ways.
-                        respond(&Response::Error {
-                            error: "fork binary=none not yet implemented".to_string(),
-                        })
-                        .await;
-                        continue;
-                    }
                     _ => self_exe.to_string(), // "self" or default
                 };
 
-                // For now, inherit_listen_ports is noted but not acted on —
-                // the Spawn mechanism doesn't support fd inheritance yet.
-                // The listen ports are tracked for future use.
+                // inherit_listen_ports is tracked for future use.
                 let _ = &inherit_listen_ports;
 
                 match spawn_child(&exe, &name).await {
@@ -558,42 +545,6 @@ async fn agent_loop(self_exe: &str) {
 
             Command::Go => {
                 respond(&Response::Ok { data: None }).await;
-            }
-
-            Command::NetListenForkClose { port } => {
-                // Reproduce the VS Code CLI pattern using libc::fork():
-                // 1. bind+listen on port
-                // 2. fork() — child inherits the listen fd
-                // 3. Parent closes its listen fd
-                // 4. Child calls accept() on the inherited fd
-                //
-                // Uses tcp-fork-listen-accept subcommand which does the
-                // fork+close+accept pattern with libc::fork() (no exec),
-                // so the child truly inherits the fd without re-binding.
-                let self_exe = std::env::current_exe()
-                    .unwrap_or_else(|_| std::path::PathBuf::from("litebox_test_harness"));
-                let child = std::process::Command::new(&self_exe)
-                    .args(["tcp-fork-listen-accept", &port.to_string()])
-                    .stdout(std::process::Stdio::inherit())
-                    .stderr(std::process::Stdio::inherit())
-                    .spawn();
-                match child {
-                    Ok(mut c) => {
-                        let pid = c.id();
-                        tokio::spawn(async move {
-                            let _ = tokio::task::spawn_blocking(move || c.wait()).await;
-                        });
-                        // Give the subprocess time to bind+listen+fork.
-                        tokio::time::sleep(Duration::from_secs(1)).await;
-                        respond(&Response::Listening { port }).await;
-                        eprintln!("[agent] NetListenForkClose: started tcp-fork-listen-accept pid={pid}");
-                    }
-                    Err(e) => {
-                        respond(&Response::Error {
-                            error: format!("spawn failed: {e}"),
-                        }).await;
-                    }
-                }
             }
 
             Command::UnixListen { path } => {

@@ -2111,20 +2111,63 @@ pub(crate) async fn fork_listen_close_tests(r: &mut TestRunner) {
     let got_rst = matches!(&conn_resp, Response::ConnectFailed { .. });
     r.record("FKLC.listen_unlisten", "B", got_rst, &format!("expected RST: {conn_resp:?}"));
 
-    // Test 2: NetListenForkClose pattern (fork+exec child inherits fd).
+    // Test 2: fd inheritance across fork+exec — the VS Code CLI pattern.
+    // Uses tcp-fork-listen-accept subcommand which:
+    //   1. bind+listen on port
+    //   2. Clear CLOEXEC on listen fd
+    //   3. fork+exec child ("tcp-accept-inherited") that accepts on inherited fd
+    //   4. Parent closes its listen fd
+    //   5. Child accepts and echoes
+    //
+    // This tests whether the child's inherited listen fd survives the
+    // parent closing its copy. Cannot be expressed via protocol primitives
+    // because the child needs to accept on a raw fd, not re-bind.
     let port2 = 19921u16;
-    let listen_resp = r.send("A", Command::NetListenForkClose { port: port2 }).await;
-    if !matches!(&listen_resp, Response::Listening { .. }) {
-        r.record("FKLC.cross_connect", "B", false, &format!("fork-close failed: {listen_resp:?}"));
-        return;
-    }
+    let bg_resp = r
+        .send(
+            "A",
+            Command::Exec {
+                args: vec![
+                    r.self_exe.clone(),
+                    "tcp-fork-listen-accept".into(),
+                    port2.to_string(),
+                ],
+                timeout_secs: None,
+                stdin: None,
+                background: true,
+            },
+        )
+        .await;
+    let bg_pid = match &bg_resp {
+        Response::Background { pid } => Some(*pid),
+        _ => {
+            r.record(
+                "FKLC.cross_connect",
+                "B",
+                false,
+                &format!("bg spawn failed: {bg_resp:?}"),
+            );
+            return;
+        }
+    };
+
+    // Wait for bind+listen+fork+parent-close to complete.
     tokio::time::sleep(Duration::from_secs(3)).await;
+
+    // Cross-worker connect from B — the child should accept and echo.
     let conn_resp = r
-        .send("B", Command::NetConnect {
-            addr: format!("127.0.0.1:{port2}"),
-            data: "fork_listen_close".into(),
-        })
+        .send(
+            "B",
+            Command::NetConnect {
+                addr: format!("127.0.0.1:{port2}"),
+                data: "fork_listen_close".into(),
+            },
+        )
         .await;
     let pass = matches!(&conn_resp, Response::Connected { echo } if echo == "fork_listen_close");
     r.record("FKLC.cross_connect", "B", pass, &format!("{conn_resp:?}"));
+
+    if let Some(pid) = bg_pid {
+        let _ = r.send("A", Command::Kill { pid }).await;
+    }
 }

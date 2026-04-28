@@ -33,13 +33,9 @@ pub enum Command {
     /// `binary`:
     ///   - `"self"` → fork+exec the PIE test harness (= Spawn)
     ///   - `"nonpie"` → fork+exec the non-PIE binary (= SpawnRemote)
-    ///   - `"none"` → true fork, no exec. Child shares parent's address
-    ///     space until it receives an Exec or Exit command. Models the
-    ///     pre-migration window in litebox's delayed fork where the child
-    ///     can immediately accept() on inherited sockets.
     ///
     /// `inherit_listen_ports`: TCP listen ports whose fds should remain
-    /// open in the child (not closed by CLOEXEC).
+    /// open in the child (not closed by CLOEXEC). Reserved for future use.
     #[serde(rename = "fork")]
     Fork {
         name: String,
@@ -202,18 +198,6 @@ pub enum Command {
     /// Proceed (used after coordination points).
     #[serde(rename = "go")]
     Go,
-
-    /// **Deprecated**: Use Fork + NetListen + NetCloseListener primitives
-    /// instead. This compound command bundles too many operations.
-    ///
-    /// Listen on a port, fork+exec a child echo server, then close the
-    /// parent's listen fd. Reproduces the VS Code CLI pattern where the
-    /// parent creates a listen socket, forks a child to accept on it,
-    /// and closes its own copy. In litebox's delayed-fork model, the
-    /// parent's close() can destroy the shared listen socket before the
-    /// child migrates to its own worker.
-    #[serde(rename = "net_listen_fork_close")]
-    NetListenForkClose { port: u16 },
 
     /// Shut down gracefully.
     #[serde(rename = "exit")]
