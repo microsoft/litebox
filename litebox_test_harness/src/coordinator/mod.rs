@@ -337,7 +337,13 @@ async fn run_tests(self_exe: &str, filter: Option<&str>) -> Vec<TestResult> {
         }
 
         // Deep mixed chain: AA → D3 (PIE) → D4 (non-PIE) → D5 (PIE)
-        // Mirrors: bash → CLI → node → extension host at depths 3-5.
+        // Mirrors the VS Code Remote-SSH process tree at depths 3-5:
+        //
+        //   A  (PIE, depth 1)  ≈ dropbear sshd
+        //   AA (PIE, depth 2)  ≈ bash (bootstrap script)
+        //   D3 (PIE, depth 3)  ≈ VS Code CLI
+        //   D4 (non-PIE, depth 4) ≈ node (VS Code Server) — worker-exec
+        //   D5 (PIE, depth 5)  ≈ node (extension host) — fork-restore from worker-exec
         eprintln!("[coord] building deep mixed chain (D3 → D4 → D5)");
         let r = runner
             .send(
