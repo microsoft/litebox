@@ -4720,6 +4720,21 @@ impl litebox::platform::DebugLogProvider for LinuxUserland {
                 syscall_intercept::SYSCALL_ARG_MAGIC,
             )
         };
+        // Also write diagnostic messages to /tmp/rst-diag.log for fork-restored
+        // workers whose stderr is /dev/null.
+        if msg.starts_with("NET CLOSE") {
+            use std::io::Write;
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open("/tmp/rst-diag.log")
+            {
+                let _ = f.write_all(msg.as_bytes());
+                if !msg.ends_with('\n') {
+                    let _ = f.write_all(b"\n");
+                }
+            }
+        }
     }
 
     fn debug_log_write_to_fd(&self, fd: i32, msg: &str) -> bool {
