@@ -263,6 +263,7 @@ impl<FS: ShimFS> UnixInitStream<FS> {
             global: global.clone(),
             tcp_port: 0,
             tcp_fd: None,
+            _tcp_bridge: None,
         })
     }
 
@@ -392,6 +393,8 @@ struct UnixListenStream<FS: ShimFS> {
     tcp_port: u16,
     /// TCP socket fd for the cross-worker listener (if allocated).
     tcp_fd: Option<crate::syscalls::net::SocketFd>,
+    /// Bridge observer kept alive to forward TCP events to backlog pollee.
+    _tcp_bridge: Option<Arc<BacklogTcpBridge<FS>>>,
 }
 
 impl<FS: ShimFS> UnixListenStream<FS> {
@@ -463,6 +466,20 @@ impl<FS: ShimFS> UnixListenStream<FS> {
 
         let msg = alloc::format!("UNIX TCP LISTENER: listening on port {} for cross-worker unix\n", port);
         litebox_platform_multiplex::platform().debug_log_print(&msg);
+
+        // Register a bridge observer: when the TCP proxy fires IN events
+        // (new connection ready), wake the backlog pollee so that the unix
+        // socket accept() loop drains TCP connections.
+        {
+            use litebox::event::IOPollable;
+            let bridge = Arc::new(BacklogTcpBridge {
+                backlog: self.backlog.clone(),
+            });
+            let bridge_weak = Arc::downgrade(&bridge)
+                as Weak<dyn litebox::event::observer::Observer<Events>>;
+            _proxy.register_observer(bridge_weak, Events::IN);
+            self._tcp_bridge = Some(bridge);
+        }
 
         self.tcp_port = port;
         self.tcp_fd = Some(tcp_fd);
@@ -2126,6 +2143,24 @@ enum UnixEntryInner<FS: ShimFS> {
 
 /// Type alias for the global Unix socket address table.
 pub(crate) type UnixAddrTable<FS> = BTreeMap<UnixSocketAddrKey, UnixEntry<FS>>;
+
+/// Bridge observer that forwards TCP proxy IN events to the unix socket
+/// backlog pollee, waking accept() when cross-worker TCP connections arrive.
+struct BacklogTcpBridge<FS: ShimFS> {
+    backlog: Arc<Backlog<FS>>,
+}
+
+// Safety: BacklogTcpBridge only holds an Arc and is Send+Sync if FS is.
+unsafe impl<FS: ShimFS> Send for BacklogTcpBridge<FS> {}
+unsafe impl<FS: ShimFS> Sync for BacklogTcpBridge<FS> {}
+
+impl<FS: ShimFS> litebox::event::observer::Observer<Events> for BacklogTcpBridge<FS> {
+    fn on_events(&self, events: &Events) {
+        if events.contains(Events::IN) {
+            self.backlog.pollee.notify_observers(Events::IN);
+        }
+    }
+}
 
 // ── Cross-worker unix socket discovery via sidecar metadata files ──
 //
