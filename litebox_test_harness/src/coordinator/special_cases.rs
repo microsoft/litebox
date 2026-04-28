@@ -383,6 +383,28 @@ pub(super) async fn unix_socket_tests(r: &mut TestRunner) {
         let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout.contains(expected));
         r.record(name, "A", pass, &format!("{resp:?}"));
     }
+
+    // Run the same fork+bind+connect pattern on different agents to validate
+    // across worker topologies (fork-restore, worker-exec, etc.).
+    let fork_agents = ["A", "AA", "B"];
+    for agent in &fork_agents {
+        let test_name = format!("UF.fork_unix.{agent}");
+        let resp = r
+            .send(
+                agent,
+                super::exec_timeout(
+                    vec![
+                        self_exe.clone(),
+                        "unix-socket-test".into(),
+                        "cross-process".into(),
+                    ],
+                    15,
+                ),
+            )
+            .await;
+        let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout.contains("US1_CROSS_PROCESS_OK"));
+        r.record(&test_name, agent, pass, &format!("{resp:?}"));
+    }
 }
 
 /// Node.js exit behavior tests.

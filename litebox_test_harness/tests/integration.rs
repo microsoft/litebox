@@ -271,14 +271,17 @@ fn process_tree_tests() {
     //
     // Known litebox failures (real platform gaps):
     //   US1,3,4,5 + VS1: bare-fork unix socket tests timeout (5)
+    //   UF.fork_unix.{A,AA,B}: bare-fork unix coordinator tests (3)
     //   XW3,4: cross-worker unix socket connect ECONNREFUSED (2)
+    //   U.{vscode_d3_d4,vscode_d4_d3,d4_to_sibling_b,d5_to_a,a_to_np,np_to_a}:
+    //       cross-worker unix socket matrix tests ECONNREFUSED (6)
     //   SS.{pipe_in_subst,multi_pipe_subst,file_pipe_subst,subst_then_cmds,
     //       vscode_osrelease,backtick_pipe}.{sh,bash}.{A,AA}: stdin-pipe $()
     //       with pipelines loses stdout (6×2×2 = 24)
     //   SP.{pipeline,file_pipe}.{A,AA,B}: stdin-pipe $() with cat|head (6)
-    // Total FAIL: 37
+    // Total FAIL: 46
     const EXPECTED_XFAIL_COUNT: usize = 24;
-    const EXPECTED_FAIL_COUNT: usize = 37;
+    const EXPECTED_FAIL_COUNT: usize = 46;
     const EXPECTED_XPASS_COUNT: usize = 0;
     check_results(
         "litebox",
