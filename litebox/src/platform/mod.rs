@@ -410,6 +410,10 @@ pub trait IPInterfaceProvider {
         _listen_ports: &[u16],
     ) {
     }
+
+    /// Diagnostic callback: a TCP listen socket was added or removed.
+    /// Default is no-op.
+    fn on_listen_socket_change(&self, _port: u16, _added: bool, _total_tcp: u16) {}
 }
 
 /// A non-exhaustive list of errors that can be thrown by [`IPInterfaceProvider::send_ip_packet`].

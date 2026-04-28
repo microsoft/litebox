@@ -1044,9 +1044,15 @@ where
                 let tcp_specific = specific.tcp_mut();
                 if let Some(server_socket) = tcp_specific.server_socket.take() {
                     // remove all listening sockets in the backlog
+                    let port = server_socket.ip_listen_endpoint.port;
+                    let count = server_socket.socket_set_handles.len();
                     for handle in server_socket.socket_set_handles {
                         let _ = self.socket_set.remove(handle);
                     }
+                    // Diagnostic: log listen socket removal.
+                    let total_tcp = self.socket_set.iter().filter(|(_, s)| matches!(s, smoltcp::socket::Socket::Tcp(_))).count();
+                    self.device.platform.on_listen_socket_change(port, false, total_tcp as u16);
+                    let _ = count; // suppress unused warning
                 }
                 if let Some(local_port) = tcp_specific.local_port.take() {
                     self.local_port_allocator.deallocate(local_port);
@@ -1444,6 +1450,13 @@ where
                     server_socket.socket_set_handles = Vec::with_capacity(backlog.into());
                 }
                 server_socket.refill_to_backlog(&mut self.socket_set);
+                // Diagnostic: log listen socket creation.
+                let total_tcp = self.socket_set.iter().filter(|(_, s)| matches!(s, smoltcp::socket::Socket::Tcp(_))).count();
+                self.device.platform.on_listen_socket_change(
+                    server_socket.ip_listen_endpoint.port,
+                    true,
+                    total_tcp as u16,
+                );
             }
             ProtocolSpecific::Udp(_) => unimplemented!(),
             ProtocolSpecific::Icmp(_) => unimplemented!(),
