@@ -6,6 +6,28 @@
 //! Two modes:
 //! - `spawn-tree` — coordinator: spawns tree, drives tests through pipes
 //! - `agent` — command executor: reads commands from stdin, responds on stdout
+//!
+//! # IMPORTANT: Running tests inside litebox vs native
+//!
+//! This binary can run on **native Linux** (gold standard) or **inside litebox**
+//! (sandbox under test). The environment affects what syscall implementation is
+//! tested:
+//!
+//! - **Native**: `litebox_test_harness spawn-tree` — tests the real kernel
+//! - **Litebox**: `litebox_tool_executor --rootfs / --record-baseline -- litebox_test_harness spawn-tree`
+//!
+//! Running directly via `docker exec` runs on the native kernel, NOT through
+//! litebox's shim. The coordinator prints a `[coord] runtime:` diagnostic at
+//! startup to make the environment visible.
+//!
+//! To run tests inside litebox from Docker:
+//! ```sh
+//! docker run --rm --cap-add SYS_PTRACE \
+//!   -v /path/to/litebox-out/debug:/opt/litebox:ro \
+//!   litebox-vscode /opt/litebox/litebox_tool_executor \
+//!     --rootfs / --record-baseline \
+//!     -- /opt/litebox/litebox_test_harness spawn-tree
+//! ```
 
 mod agent;
 mod agent_listen;
