@@ -71,23 +71,6 @@ fn find_nonpie_binary() -> Option<String> {
     None
 }
 
-/// Get the first non-loopback IPv4 address of this host.
-/// On native Docker: returns the container bridge IP (e.g., 172.17.0.5).
-/// On litebox: returns the smoltcp virtual IP (10.0.0.2) via the
-/// virtualized netlink interface.
-fn get_self_ip() -> Option<String> {
-    if let Ok(output) = std::process::Command::new("hostname").arg("-I").output() {
-        if let Ok(s) = String::from_utf8(output.stdout) {
-            for ip in s.split_whitespace() {
-                if ip != "127.0.0.1" && !ip.contains(':') {
-                    return Some(ip.to_string());
-                }
-            }
-        }
-    }
-    None
-}
-
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let cmd = args.get(1).map(String::as_str).unwrap_or("spawn-tree");
@@ -145,101 +128,6 @@ fn main() {
         }
         "echo-test" => {
             println!("ECHO_TEST_OK");
-        }
-        "connect-addrs" => {
-            // Test TCP connect to 127.0.0.1, 0.0.0.0, and (if available) 10.0.0.2.
-            // On litebox, 10.0.0.2 is the guest virtual interface — connect should
-            // work via redirect to gateway. On native, 10.0.0.2 doesn't exist so
-            // we skip it.
-            use std::io::{Read, Write};
-            use std::os::unix::io::AsRawFd;
-            let port: u16 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(19999);
-            let listener = std::net::TcpListener::bind(format!("0.0.0.0:{port}"))
-                .expect("connect-addrs: bind failed");
-
-            // Detect the host's non-loopback IP address dynamically.
-            // On native Linux: Docker bridge IP (e.g., 172.17.0.5)
-            // On litebox: smoltcp virtual IP (10.0.0.2)
-            // Both should work for self-connect (loopback to own IP).
-            let self_ip = get_self_ip();
-
-            let addrs: Vec<&str> = if let Some(ref ip) = self_ip {
-                vec!["127.0.0.1", "0.0.0.0", ip.as_str()]
-            } else {
-                vec!["127.0.0.1", "0.0.0.0"]
-            };
-            let n_addrs = addrs.len();
-
-            // Spawn connect threads for each address
-            let mut handles = Vec::new();
-            for addr in &addrs {
-                let addr = addr.to_string();
-                let p = port;
-                handles.push(std::thread::spawn(move || {
-                    std::thread::sleep(std::time::Duration::from_millis(50));
-                    let target = format!("{addr}:{p}");
-                    match std::net::TcpStream::connect_timeout(
-                        &target.parse().unwrap(),
-                        std::time::Duration::from_secs(3),
-                    ) {
-                        Ok(mut stream) => {
-                            let msg = format!("hello_{addr}");
-                            let _ = stream.write_all(msg.as_bytes());
-                            let _ = stream.flush();
-                            let mut buf = [0u8; 64];
-                            let _ = stream.set_read_timeout(Some(
-                                std::time::Duration::from_secs(3),
-                            ));
-                            match stream.read(&mut buf) {
-                                Ok(n) if n > 0 => {
-                                    let echo = String::from_utf8_lossy(&buf[..n]);
-                                    format!("{addr}:OK:{echo}")
-                                }
-                                _ => format!("{addr}:NO_ECHO"),
-                            }
-                        }
-                        Err(e) => format!("{addr}:FAIL:{e}"),
-                    }
-                }));
-            }
-
-            // Accept connections with a timeout
-            let _ = unsafe {
-                let tv = libc::timeval { tv_sec: 8, tv_usec: 0 };
-                libc::setsockopt(
-                    listener.as_raw_fd(),
-                    libc::SOL_SOCKET,
-                    libc::SO_RCVTIMEO,
-                    &tv as *const _ as *const libc::c_void,
-                    std::mem::size_of::<libc::timeval>() as u32,
-                )
-            };
-            for _ in 0..n_addrs {
-                match listener.accept() {
-                    Ok((mut stream, _)) => {
-                        let mut buf = [0u8; 64];
-                        if let Ok(n) = stream.read(&mut buf) {
-                            let _ = stream.write_all(&buf[..n]);
-                        }
-                    }
-                    Err(_) => break,
-                }
-            }
-
-            let results: Vec<String> = handles.into_iter().map(|h| h.join().unwrap()).collect();
-
-            for r in &results {
-                eprintln!("[connect-addrs] {r}");
-            }
-            let all_ok = results.iter().all(|r| r.contains(":OK:"));
-            if all_ok {
-                println!("CONNECT_ADDRS_OK");
-            } else {
-                println!("CONNECT_ADDRS_FAIL");
-                for r in &results {
-                    println!("  {r}");
-                }
-            }
         }
         "tcp-listen-busy" => {
             // Listen on a TCP port, do CPU-bound work for N seconds, then
