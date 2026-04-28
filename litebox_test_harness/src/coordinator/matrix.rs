@@ -512,10 +512,15 @@ async fn run_net_tests(r: &mut TestRunner) {
 // - 0.0.0.0 connects to INADDR_ANY (Linux treats as loopback)
 //
 // Both addresses must work on native Linux (gold standard) AND litebox.
-// litebox-specific IPs like 10.0.0.2 are NOT tested here since they
-// don't exist on native and would fail the baseline.
+// 10.0.0.2 is the litebox guest virtual IP — only tested on litebox
+// (it doesn't exist on native containers which use Docker bridge IPs).
 
 const CONNECT_ADDRS: &[&str] = &["127.0.0.1", "0.0.0.0"];
+
+/// Litebox-only address — the guest virtual interface IP in smoltcp.
+/// On native Linux this IP doesn't exist, so tests using it are skipped
+/// when the address is unreachable.
+const LITEBOX_ADDRS: &[&str] = &["10.0.0.2"];
 
 /// Cross-worker pairs to test with address variants.
 /// Each pair is tested with all CONNECT_ADDRS in both directions.
@@ -543,8 +548,15 @@ async fn run_net_addr_tests(r: &mut TestRunner) {
     let has_nonpie = crate::find_nonpie_binary().is_some();
     let mut port = 11_001u16;
 
+    // All addresses: portable + litebox-only
+    let all_addrs: Vec<&str> = CONNECT_ADDRS
+        .iter()
+        .chain(LITEBOX_ADDRS.iter())
+        .copied()
+        .collect();
+
     for &(agent_a, agent_b) in NET_ADDR_PAIRS {
-        for &addr in CONNECT_ADDRS {
+        for &addr in &all_addrs {
             // Skip non-PIE agents if binary not available
             if !has_nonpie
                 && (agent_requires_nonpie(agent_a) || agent_requires_nonpie(agent_b))
@@ -558,6 +570,8 @@ async fn run_net_addr_tests(r: &mut TestRunner) {
                 port += 1;
                 continue;
             }
+
+            let is_litebox_only = LITEBOX_ADDRS.contains(&addr);
 
             // Direction 1: agent_a listens, agent_b connects
             let test_id = format!("NA.{agent_a}_to_{agent_b}.{addr}");
@@ -581,7 +595,22 @@ async fn run_net_addr_tests(r: &mut TestRunner) {
                 )
                 .await;
             let pass = matches!(&resp, Response::Connected { echo } if *echo == test_data);
-            r.record(&test_id, agent_b, pass, &format!("{resp:?}"));
+
+            if is_litebox_only {
+                // 10.0.0.2 is the guest virtual IP. Connecting to it doesn't
+                // work even same-worker because smoltcp sends the SYN out
+                // the interface to the broker instead of loopback. Mark as
+                // xfail until loopback-to-self routing is implemented.
+                r.record_xfail(
+                    &test_id,
+                    agent_b,
+                    pass,
+                    "10.0.0.2 loopback not implemented",
+                    &format!("{resp:?}"),
+                );
+            } else {
+                r.record(&test_id, agent_b, pass, &format!("{resp:?}"));
+            }
 
             let _ = r.send(agent_a, Command::NetUnlisten { port }).await;
             port += 1;
@@ -1431,11 +1460,12 @@ pub(crate) async fn run_matrix_tests(r: &mut TestRunner) {
     run_net_tests(r).await;
 
     // ── Network Address Matrix ──
-    let addr_test_count = NET_ADDR_PAIRS.len() * CONNECT_ADDRS.len();
+    let all_addr_count = CONNECT_ADDRS.len() + LITEBOX_ADDRS.len();
+    let addr_test_count = NET_ADDR_PAIRS.len() * all_addr_count;
     eprintln!(
         "[matrix] === Network Address ({} pairs × {} addrs = {} cases) ===",
         NET_ADDR_PAIRS.len(),
-        CONNECT_ADDRS.len(),
+        all_addr_count,
         addr_test_count,
     );
     run_net_addr_tests(r).await;
