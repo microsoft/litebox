@@ -25,6 +25,12 @@ in the harness is not permitted.** Manually re-running the full
 Docker → sshd → VS Code server → Litebox stack to verify a hypothesis is
 also not a substitute for a harness test.
 
+**Do not create new probe scripts in `litebox_tool_executor/scripts/`.**
+That directory is bring-up and tooling only — see
+`litebox_tool_executor/scripts/README.md`. New `test-*.sh`,
+`check-*.sh`, `debug-*.sh`, or `verify-*.sh` scripts there will be
+deleted on sight; reproduce in `litebox_test_harness` instead.
+
 ## Per-session isolation
 
 Coding agent sessions run in separate git worktrees and branches. When a
