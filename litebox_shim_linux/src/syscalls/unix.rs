@@ -1168,7 +1168,7 @@ impl<FS: ShimFS> UnixStream<FS> {
                 let result = self.with_state_ref(|state| {
                     let listen = state.listen()?;
                     let tcp_fd = listen.tcp_fd.as_ref()?;
-                    let accepted = listen.global.net.lock().accept(tcp_fd, None).ok()?;
+                    let accepted = listen.global.try_accept(tcp_fd, None).ok()?;
                     let proxy = listen.global.initialize_socket(
                         &accepted,
                         SockType::Stream,

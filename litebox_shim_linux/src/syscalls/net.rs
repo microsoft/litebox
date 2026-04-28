@@ -678,7 +678,7 @@ impl<FS: ShimFS> GlobalState<FS> {
         super::write_to_user(val, optval, len)
     }
 
-    fn try_accept(
+    pub(super) fn try_accept(
         &self,
         fd: &SocketFd,
         peer: Option<&mut SocketAddr>,
