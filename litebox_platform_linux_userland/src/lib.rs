@@ -4296,6 +4296,7 @@ impl litebox::platform::IPInterfaceProvider for LinuxUserland {
             }
             NetworkTransport::Ipc(fd) => {
                 // Diagnostic: detect TCP RST packets being sent to the broker.
+                // Write to /tmp/rst-diag.log since fork-restored workers have stderr=/dev/null.
                 if packet.len() >= 40 && packet[0] >> 4 == 4 && packet[9] == 6 {
                     let ihl = (packet[0] & 0x0F) as usize * 4;
                     if packet.len() >= ihl + 14 && packet[ihl + 13] & 0x04 != 0 {
@@ -4303,12 +4304,21 @@ impl litebox::platform::IPInterfaceProvider for LinuxUserland {
                         let dst_port = u16::from_be_bytes([packet[ihl + 2], packet[ihl + 3]]);
                         let src_ip = &packet[12..16];
                         let dst_ip = &packet[16..20];
-                        eprintln!(
-                            "RUNNER send_ip_packet RST: {}.{}.{}.{}:{} → {}.{}.{}.{}:{} flags=0x{:02x}",
+                        let msg = format!(
+                            "RUNNER RST: {}.{}.{}.{}:{} → {}.{}.{}.{}:{} flags=0x{:02x} pid={}\n",
                             src_ip[0], src_ip[1], src_ip[2], src_ip[3], src_port,
                             dst_ip[0], dst_ip[1], dst_ip[2], dst_ip[3], dst_port,
-                            packet[ihl + 13]
+                            packet[ihl + 13],
+                            std::process::id()
                         );
+                        eprintln!("{}", msg.trim());
+                        // Also write to a file since fork-restored workers have stderr=/dev/null.
+                        use std::io::Write;
+                        if let Ok(mut f) = std::fs::OpenOptions::new()
+                            .create(true).append(true).open("/tmp/rst-diag.log")
+                        {
+                            let _ = f.write_all(msg.as_bytes());
+                        }
                     }
                 }
                 // IPC framing: 4-byte LE length prefix + packet.
@@ -4371,6 +4381,31 @@ impl litebox::platform::IPInterfaceProvider for LinuxUserland {
         let msg: [u8; 6] = [0x00, b'P', b'L', port_bytes[0], port_bytes[1], listen as u8];
         // Send through the same IPC framing as IP packets.
         self.send_ip_packet(&msg)
+    }
+
+    fn on_rst_transmitted(
+        &self,
+        src_port: u16,
+        dst_port: u16,
+        tcp_count: u16,
+        listen_count: u16,
+        listen_ports: &[u16],
+    ) {
+        let msg = format!(
+            "RUNNER RST (on_rst_transmitted): src={src_port} dst={dst_port} \
+             tcp_sockets={tcp_count} listen_sockets={listen_count} \
+             listen_ports={listen_ports:?} pid={}\n",
+            std::process::id()
+        );
+        eprintln!("{}", msg.trim());
+        use std::io::Write;
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open("/tmp/rst-diag.log")
+        {
+            let _ = f.write_all(msg.as_bytes());
+        }
     }
 
     fn receive_ip_packet(

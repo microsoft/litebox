@@ -13,7 +13,7 @@
 use crate::sock_compat::{self, IpcStream, MSG_PEEK, POLLOUT, PollFd, RawSock};
 
 use smoltcp::phy;
-use tracing::{error, warn};
+use tracing::{error, info, warn};
 
 /// MTU matching the guest-side smoltcp configuration.
 pub const DEVICE_MTU: usize = 1600;
@@ -276,17 +276,32 @@ impl phy::TxToken for TxToken<'_> {
         F: FnOnce(&mut [u8]) -> R,
     {
         let result = f(&mut self.tx_buf[..len]);
-        // Diagnostic: detect RST packets being transmitted by the broker proxy.
+        // Diagnostic: detect RST and log all port-63084 TCP packets being transmitted.
         let pkt = &self.tx_buf[..len];
         if len >= 40 && pkt[0] >> 4 == 4 && pkt[9] == 6 {
             let ihl = (pkt[0] & 0x0F) as usize * 4;
-            if len >= ihl + 14 && pkt[ihl + 13] & 0x04 != 0 {
+            if len >= ihl + 14 {
+                let flags = pkt[ihl + 13];
                 let src_port = u16::from_be_bytes([pkt[ihl], pkt[ihl + 1]]);
                 let dst_port = u16::from_be_bytes([pkt[ihl + 2], pkt[ihl + 3]]);
-                warn!(
-                    "BROKER TxToken RST: src_port={src_port} dst_port={dst_port} flags=0x{:02x}",
-                    pkt[ihl + 13]
-                );
+                if flags & 0x04 != 0 {
+                    let src_ip = &pkt[12..16];
+                    let dst_ip = &pkt[16..20];
+                    warn!(
+                        "BROKER TxToken RST: {}.{}.{}.{}:{} → {}.{}.{}.{}:{} flags=0x{flags:02x}",
+                        src_ip[0], src_ip[1], src_ip[2], src_ip[3], src_port,
+                        dst_ip[0], dst_ip[1], dst_ip[2], dst_ip[3], dst_port,
+                    );
+                }
+                if src_port == 63084 || dst_port == 63084 {
+                    let src_ip = &pkt[12..16];
+                    let dst_ip = &pkt[16..20];
+                    info!(
+                        "BROKER TxToken pkt: {}.{}.{}.{}:{} → {}.{}.{}.{}:{} flags=0x{flags:02x}",
+                        src_ip[0], src_ip[1], src_ip[2], src_ip[3], src_port,
+                        dst_ip[0], dst_ip[1], dst_ip[2], dst_ip[3], dst_port,
+                    );
+                }
             }
         }
         send_ipc_frame(self.fd, &self.tx_buf[..len]);

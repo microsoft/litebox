@@ -397,6 +397,19 @@ pub trait IPInterfaceProvider {
     fn send_port_listen_notification(&self, _port: u16, _listen: bool) -> Result<(), SendError> {
         Ok(())
     }
+
+    /// Diagnostic callback: smoltcp generated a RST packet.
+    /// Called from TxToken with the pre-poll TCP socket state.
+    /// Default is no-op; overridden by platforms that can log.
+    fn on_rst_transmitted(
+        &self,
+        _src_port: u16,
+        _dst_port: u16,
+        _tcp_count: u16,
+        _listen_count: u16,
+        _listen_ports: &[u16],
+    ) {
+    }
 }
 
 /// A non-exhaustive list of errors that can be thrown by [`IPInterfaceProvider::send_ip_packet`].

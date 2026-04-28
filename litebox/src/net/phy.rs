@@ -61,6 +61,7 @@ impl<Platform: platform::IPInterfaceProvider> smoltcp::phy::Device for Device<Pl
                     platform: self.platform,
                     buffer: &mut self.send_buffer,
                     rst_info: &self.last_rst_info,
+                    rst_socket_summary: &self.rst_socket_summary,
                 },
             )),
             Err(platform::ReceiveError::WouldBlock | platform::ReceiveError::Eof) => None,
@@ -76,6 +77,7 @@ impl<Platform: platform::IPInterfaceProvider> smoltcp::phy::Device for Device<Pl
             platform: self.platform,
             buffer: &mut self.send_buffer,
             rst_info: &self.last_rst_info,
+            rst_socket_summary: &self.rst_socket_summary,
         })
     }
 
@@ -104,6 +106,7 @@ pub(crate) struct TxToken<'a, Platform: platform::IPInterfaceProvider> {
     platform: &'a Platform,
     buffer: &'a mut [u8],
     rst_info: &'a core::cell::Cell<Option<(u16, u16)>>,
+    rst_socket_summary: &'a core::cell::Cell<Option<RstSocketSummary>>,
 }
 
 impl<Platform: platform::IPInterfaceProvider> smoltcp::phy::TxToken for TxToken<'_, Platform> {
@@ -120,6 +123,17 @@ impl<Platform: platform::IPInterfaceProvider> smoltcp::phy::TxToken for TxToken<
                 let src_port = u16::from_be_bytes([packet[ihl], packet[ihl + 1]]);
                 let dst_port = u16::from_be_bytes([packet[ihl + 2], packet[ihl + 3]]);
                 self.rst_info.set(Some((src_port, dst_port)));
+                // Call platform diagnostic with pre-poll socket state.
+                if let Some(summary) = self.rst_socket_summary.get() {
+                    let n = summary.listen_count as usize;
+                    self.platform.on_rst_transmitted(
+                        src_port,
+                        dst_port,
+                        summary.tcp_count,
+                        summary.listen_count,
+                        &summary.listen_ports[..n],
+                    );
+                }
             }
         }
         // Send via IPC to the broker.

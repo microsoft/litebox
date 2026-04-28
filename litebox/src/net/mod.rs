@@ -499,34 +499,32 @@ where
         // Drain all socket channel buffers before polling to ensure data flows
         self.drain_all_socket_channel_buffers();
 
+        // Snapshot listen sockets BEFORE poll — if smoltcp generates RST during
+        // poll, the listen sockets may change. We want the pre-poll state.
+        let mut tcp_count = 0u16;
+        let mut listen_count = 0u16;
+        let mut listen_ports: [u16; 8] = [0; 8];
+        for (_handle, socket) in self.socket_set.iter() {
+            if let smoltcp::socket::Socket::Tcp(tcp) = socket {
+                tcp_count += 1;
+                if tcp.state() == smoltcp::socket::tcp::State::Listen {
+                    if (listen_count as usize) < listen_ports.len() {
+                        listen_ports[listen_count as usize] = tcp.listen_endpoint().port;
+                    }
+                    listen_count += 1;
+                }
+            }
+        }
+        // Store pre-poll snapshot so TxToken RST detection can include it.
+        self.device.rst_socket_summary.set(Some(phy::RstSocketSummary {
+            tcp_count,
+            listen_count,
+            listen_ports,
+        }));
+
         let result = self
             .interface
             .poll(self.now(), &mut self.device, &mut self.socket_set);
-
-        // If smoltcp generated a RST during poll, record socket state.
-        // Don't clear previous RST info — it persists until take_rst_diagnostic().
-        if let Some((rst_src_port, rst_dst_port)) = self.device.last_rst_info.get() {
-            let mut tcp_count = 0u16;
-            let mut listen_count = 0u16;
-            let mut listen_ports: [u16; 8] = [0; 8];
-            for (_handle, socket) in self.socket_set.iter() {
-                if let smoltcp::socket::Socket::Tcp(tcp) = socket {
-                    tcp_count += 1;
-                    if tcp.state() == smoltcp::socket::tcp::State::Listen {
-                        if (listen_count as usize) < listen_ports.len() {
-                            listen_ports[listen_count as usize] = tcp.listen_endpoint().port;
-                        }
-                        listen_count += 1;
-                    }
-                }
-            }
-            self.device.last_rst_info.set(Some((rst_src_port, rst_dst_port)));
-            self.device.rst_socket_summary.set(Some(phy::RstSocketSummary {
-                tcp_count,
-                listen_count,
-                listen_ports,
-            }));
-        }
 
         result
     }

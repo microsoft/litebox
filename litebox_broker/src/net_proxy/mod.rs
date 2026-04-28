@@ -946,12 +946,21 @@ fn run_inner(
         if let Some(len) = device.rx_len {
             let packet = &device.rx_buf[..len];
 
-            // Diagnostic: detect RST packets from the runner.
+            // Diagnostic: detect RST packets and log all TCP packets with port 63084.
             if let Some((src_port, dst_port, flags)) = device::parse_tcp_flags(packet) {
                 if flags & 0x04 != 0 {
-                    // RST flag set
                     warn!(
-                        "RST packet received: src_port={src_port} dst_port={dst_port} flags=0x{flags:02x}"
+                        "RST packet received (worker {worker_id}): src_port={src_port} dst_port={dst_port} flags=0x{flags:02x}"
+                    );
+                }
+                // Log ALL TCP packets involving the VS Code port for debugging.
+                if src_port == 63084 || dst_port == 63084 {
+                    let src_ip = &packet[12..16];
+                    let dst_ip = &packet[16..20];
+                    info!(
+                        "TCP pkt rx (worker {worker_id}): {}.{}.{}.{}:{} → {}.{}.{}.{}:{} flags=0x{flags:02x}",
+                        src_ip[0], src_ip[1], src_ip[2], src_ip[3], src_port,
+                        dst_ip[0], dst_ip[1], dst_ip[2], dst_ip[3], dst_port,
                     );
                 }
             }
@@ -1215,7 +1224,7 @@ fn run_inner(
                     let new_state = s.state();
                     if new_state != tcp::State::SynSent {
                         warn!(
-                            "bridge[{i}] {dest} SynSent → {new_state:?} during iface.poll() (had_rx={had_rx})"
+                            "bridge[{i}] {dest} SynSent → {new_state:?} during iface.poll() (worker {worker_id}, had_rx={had_rx})"
                         );
                     }
                 }
