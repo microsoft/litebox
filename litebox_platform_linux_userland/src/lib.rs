@@ -4410,11 +4410,29 @@ impl litebox::platform::IPInterfaceProvider for LinuxUserland {
         }
     }
 
-    fn on_listen_socket_change(&self, port: u16, added: bool, total_tcp: u16) {
+    fn on_listen_socket_change(&self, port: u16, added: bool, total_tcp: u16, caller: &str) {
         let tid = unsafe { libc::syscall(libc::SYS_gettid) };
         let action = if added { "ADDED" } else { "REMOVED" };
         let msg = format!(
-            "LISTEN {action}: port={port} total_tcp={total_tcp} pid={} tid={tid}\n",
+            "LISTEN {action}: port={port} total_tcp={total_tcp} pid={} tid={tid} caller={caller}\n",
+            std::process::id()
+        );
+        eprintln!("{}", msg.trim());
+        use std::io::Write;
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open("/tmp/rst-diag.log")
+        {
+            let _ = f.write_all(msg.as_bytes());
+        }
+    }
+
+    fn on_listen_socket_destroyed(&self, port: u16) {
+        let tid = unsafe { libc::syscall(libc::SYS_gettid) };
+        let bt = std::backtrace::Backtrace::force_capture();
+        let msg = format!(
+            "LISTEN DESTROYED: port={port} pid={} tid={tid}\nbacktrace:\n{bt}\n",
             std::process::id()
         );
         eprintln!("{}", msg.trim());

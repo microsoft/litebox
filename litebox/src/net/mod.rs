@@ -1049,9 +1049,10 @@ where
                     for handle in server_socket.socket_set_handles {
                         let _ = self.socket_set.remove(handle);
                     }
-                    // Diagnostic: log listen socket removal.
+                    // Diagnostic: log listen socket removal and trigger debugger.
                     let total_tcp = self.socket_set.iter().filter(|(_, s)| matches!(s, smoltcp::socket::Socket::Tcp(_))).count();
-                    self.device.platform.on_listen_socket_change(port, false, total_tcp as u16);
+                    self.device.platform.on_listen_socket_change(port, false, total_tcp as u16, "close_handle");
+                    self.device.platform.on_listen_socket_destroyed(port);
                     let _ = count; // suppress unused warning
                 }
                 if let Some(local_port) = tcp_specific.local_port.take() {
@@ -1456,6 +1457,7 @@ where
                     server_socket.ip_listen_endpoint.port,
                     true,
                     total_tcp as u16,
+                    "listen",
                 );
             }
             ProtocolSpecific::Udp(_) => unimplemented!(),

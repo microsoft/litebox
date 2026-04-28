@@ -412,8 +412,13 @@ pub trait IPInterfaceProvider {
     }
 
     /// Diagnostic callback: a TCP listen socket was added or removed.
+    /// `caller` is a short tag identifying which code path triggered this.
     /// Default is no-op.
-    fn on_listen_socket_change(&self, _port: u16, _added: bool, _total_tcp: u16) {}
+    fn on_listen_socket_change(&self, _port: u16, _added: bool, _total_tcp: u16, _caller: &str) {}
+
+    /// Diagnostic: called when close_handle destroys a listen socket.
+    /// Platforms can panic or trigger a debugger break to get a backtrace.
+    fn on_listen_socket_destroyed(&self, _port: u16) {}
 }
 
 /// A non-exhaustive list of errors that can be thrown by [`IPInterfaceProvider::send_ip_packet`].
