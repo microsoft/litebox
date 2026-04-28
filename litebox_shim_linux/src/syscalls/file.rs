@@ -2027,6 +2027,11 @@ impl<FS: ShimFS> Task<FS> {
                 );
             }
             drop(rds);
+            litebox::log_println!(
+                self.global.platform,
+                "NET CLOSE: fd={} pid={}",
+                raw_fd, self.pid
+            );
             return self.global.close_socket(&self.wait_cx(), fd);
         }
         if let Ok(fd) = rds.fd_consume_raw_integer(raw_fd) {

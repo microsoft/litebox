@@ -244,6 +244,15 @@ impl<FS: ShimFS> UnixInitStream<FS> {
             return Err((self, Errno::EINVAL));
         };
         let key = addr.to_key();
+        {
+            let msg = alloc::format!(
+                "UNIX LISTEN: key={:?} table_size={}\n",
+                key,
+                global.unix_addr_table.read().len(),
+            );
+            use litebox::platform::DebugLogProvider as _;
+            litebox_platform_multiplex::platform().debug_log_print(&msg);
+        }
         let backlog = Arc::new(Backlog::new(addr, backlog, self.pollee, listener_cred));
         global
             .unix_addr_table
@@ -738,6 +747,16 @@ impl<FS: ShimFS> UnixStream<FS> {
             return Err(Errno::EINVAL);
         };
         let Some(entry) = guard.get(&key) else {
+            let table_keys: alloc::vec::Vec<_> = guard.keys().collect();
+            let msg = alloc::format!(
+                "UNIX CONNECT REFUSED: path={:?} table_size={} keys={:?} pid={}\n",
+                key,
+                guard.len(),
+                table_keys,
+                task.process_id.0,
+            );
+            use litebox::platform::DebugLogProvider as _;
+            litebox_platform_multiplex::platform().debug_log_print(&msg);
             return Err(Errno::ECONNREFUSED);
         };
         match &entry.0 {
