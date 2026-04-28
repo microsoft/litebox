@@ -994,4 +994,123 @@ pub(super) async fn cross_worker_tests(r: &mut TestRunner) {
 
         let _ = r.send("A", Command::NetUnlisten { port }).await;
     }
+
+    // ─── Deep-topology Unix socket tests ───
+    // These exercise the VS Code process tree pattern where the
+    // server (worker-exec) and client (fork-restore) are in different
+    // workers connected through a deep chain.
+    //
+    // D3 (PIE, fork-restore) ≈ VS Code CLI
+    // D4 (non-PIE, worker-exec) ≈ node server
+    // This matches the VS Code failure: CLI connects to socket
+    // created by exec'd node server in a different worker.
+
+    // XW7: D4 (worker-exec) listens, D3 (fork-restore) connects
+    // This is the EXACT VS Code pattern.
+    let resp = r
+        .send(
+            "D4",
+            Command::UnixListen {
+                path: "/tmp/xw7.sock".to_string(),
+            },
+        )
+        .await;
+    let listen_ok = matches!(&resp, Response::UnixListening { .. });
+    r.record("XW7.d4_listen", "D4", listen_ok, &format!("{resp:?}"));
+
+    if listen_ok {
+        let resp = r
+            .send(
+                "D3",
+                Command::UnixConnect {
+                    path: "/tmp/xw7.sock".to_string(),
+                    data: "XW7_D3_TO_D4".to_string(),
+                },
+            )
+            .await;
+        let pass =
+            matches!(&resp, Response::Connected { echo } if echo.contains("XW7_D3_TO_D4"));
+        r.record("XW7.d3_connect", "D3", pass, &format!("{resp:?}"));
+
+        let _ = r
+            .send(
+                "D4",
+                Command::UnixUnlisten {
+                    path: "/tmp/xw7.sock".to_string(),
+                },
+            )
+            .await;
+    }
+
+    // XW8: D3 (fork-restore) listens, D4 (worker-exec) connects
+    let resp = r
+        .send(
+            "D3",
+            Command::UnixListen {
+                path: "/tmp/xw8.sock".to_string(),
+            },
+        )
+        .await;
+    let listen_ok = matches!(&resp, Response::UnixListening { .. });
+    r.record("XW8.d3_listen", "D3", listen_ok, &format!("{resp:?}"));
+
+    if listen_ok {
+        let resp = r
+            .send(
+                "D4",
+                Command::UnixConnect {
+                    path: "/tmp/xw8.sock".to_string(),
+                    data: "XW8_D4_TO_D3".to_string(),
+                },
+            )
+            .await;
+        let pass =
+            matches!(&resp, Response::Connected { echo } if echo.contains("XW8_D4_TO_D3"));
+        r.record("XW8.d4_connect", "D4", pass, &format!("{resp:?}"));
+
+        let _ = r
+            .send(
+                "D3",
+                Command::UnixUnlisten {
+                    path: "/tmp/xw8.sock".to_string(),
+                },
+            )
+            .await;
+    }
+
+    // XW9: D4 (worker-exec) listens, AA (grandparent, 2 hops away) connects
+    let resp = r
+        .send(
+            "D4",
+            Command::UnixListen {
+                path: "/tmp/xw9.sock".to_string(),
+            },
+        )
+        .await;
+    let listen_ok = matches!(&resp, Response::UnixListening { .. });
+    r.record("XW9.d4_listen", "D4", listen_ok, &format!("{resp:?}"));
+
+    if listen_ok {
+        let resp = r
+            .send(
+                "AA",
+                Command::UnixConnect {
+                    path: "/tmp/xw9.sock".to_string(),
+                    data: "XW9_AA_TO_D4".to_string(),
+                },
+            )
+            .await;
+        let pass =
+            matches!(&resp, Response::Connected { echo } if echo.contains("XW9_AA_TO_D4"));
+        r.record("XW9.aa_connect", "AA", pass, &format!("{resp:?}"));
+
+        let _ = r
+            .send(
+                "D4",
+                Command::UnixUnlisten {
+                    path: "/tmp/xw9.sock".to_string(),
+                },
+            )
+            .await;
+    }
 }

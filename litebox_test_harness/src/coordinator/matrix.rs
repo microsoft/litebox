@@ -371,6 +371,15 @@ struct NetTestCase {
     connector: &'static str,
 }
 
+/// Net test with explicit connect address (to test cross-worker routing).
+struct NetAddrTestCase {
+    name: &'static str,
+    listener: &'static str,
+    connector: &'static str,
+    /// Address the connector uses: "127.0.0.1", "10.0.0.2", or "0.0.0.0".
+    connect_addr: &'static str,
+}
+
 const NET_TESTS: &[NetTestCase] = &[
     NetTestCase {
         name: "init_to_A",
@@ -491,6 +500,158 @@ async fn run_net_tests(r: &mut TestRunner) {
         );
 
         port += 1;
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// NET ADDRESS MATRIX — cross-worker TCP with different connect addresses
+// ═══════════════════════════════════════════════════════════════════
+//
+// The VS Code failure showed that the connect address matters:
+// - 127.0.0.1 is standard loopback
+// - 0.0.0.0 connects to INADDR_ANY (Linux treats as loopback)
+//
+// Both addresses must work on native Linux (gold standard) AND litebox.
+// litebox-specific IPs like 10.0.0.2 are NOT tested here since they
+// don't exist on native and would fail the baseline.
+
+const CONNECT_ADDRS: &[&str] = &["127.0.0.1", "0.0.0.0"];
+
+/// Cross-worker pairs to test with address variants.
+/// Each pair is tested with all CONNECT_ADDRS in both directions.
+const NET_ADDR_PAIRS: &[(&str, &str)] = &[
+    // Same worker (baseline)
+    ("A", "A"),
+    ("AA", "AA"),
+    // Parent-child (init → fork-restore)
+    ("A", "AA"),
+    // Sibling fork-restores
+    ("A", "B"),
+    // VS Code topology: fork-restore ↔ worker-exec
+    ("D3", "D4"),
+    // Deeper: worker-exec ↔ fork-restore-from-worker-exec
+    ("D4", "D5"),
+    // Cross-subtree with worker-exec
+    ("D4", "B"),
+    ("D4", "A"),
+    // Non-PIE worker-exec ↔ PIE parent
+    ("NP", "A"),
+    ("A", "NP"),
+];
+
+async fn run_net_addr_tests(r: &mut TestRunner) {
+    let has_nonpie = crate::find_nonpie_binary().is_some();
+    let mut port = 11_001u16;
+
+    for &(agent_a, agent_b) in NET_ADDR_PAIRS {
+        for &addr in CONNECT_ADDRS {
+            // Skip non-PIE agents if binary not available
+            if !has_nonpie
+                && (agent_requires_nonpie(agent_a) || agent_requires_nonpie(agent_b))
+            {
+                r.record(
+                    &format!("NA.{agent_a}_to_{agent_b}.{addr}"),
+                    agent_a,
+                    true,
+                    "skipped (nonpie binary not found)",
+                );
+                port += 1;
+                continue;
+            }
+
+            // Direction 1: agent_a listens, agent_b connects
+            let test_id = format!("NA.{agent_a}_to_{agent_b}.{addr}");
+            let test_data = format!("na_{agent_a}_{agent_b}_{addr}");
+
+            let resp = r.send(agent_a, Command::NetListen { port }).await;
+            let listen_ok = matches!(resp, Response::Listening { .. });
+            if !listen_ok {
+                r.record(&test_id, agent_a, false, &format!("listen failed: {resp:?}"));
+                port += 1;
+                continue;
+            }
+
+            let resp = r
+                .send(
+                    agent_b,
+                    Command::NetConnect {
+                        addr: format!("{addr}:{port}"),
+                        data: test_data.clone(),
+                    },
+                )
+                .await;
+            let pass = matches!(&resp, Response::Connected { echo } if *echo == test_data);
+            r.record(&test_id, agent_b, pass, &format!("{resp:?}"));
+
+            let _ = r.send(agent_a, Command::NetUnlisten { port }).await;
+            port += 1;
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// UNIX SOCKET ADDRESS MATRIX — cross-worker Unix sockets across topology
+// ═══════════════════════════════════════════════════════════════════
+//
+// Tests Unix domain sockets across the same topology pairs as TCP,
+// ensuring cross-worker Unix sockets work at every depth.
+
+async fn run_unix_addr_tests(r: &mut TestRunner) {
+    let has_nonpie = crate::find_nonpie_binary().is_some();
+    let mut idx = 0u32;
+
+    for &(agent_a, agent_b) in NET_ADDR_PAIRS {
+        if !has_nonpie && (agent_requires_nonpie(agent_a) || agent_requires_nonpie(agent_b)) {
+            r.record(
+                &format!("UA.{agent_a}_to_{agent_b}"),
+                agent_a,
+                true,
+                "skipped (nonpie binary not found)",
+            );
+            idx += 1;
+            continue;
+        }
+
+        let test_id = format!("UA.{agent_a}_to_{agent_b}");
+        let sock_path = format!("/tmp/ua-{idx}.sock");
+        let test_data = format!("ua_{agent_a}_{agent_b}");
+
+        let resp = r
+            .send(
+                agent_a,
+                Command::UnixListen {
+                    path: sock_path.clone(),
+                },
+            )
+            .await;
+        let listen_ok = matches!(&resp, Response::UnixListening { .. });
+        if !listen_ok {
+            r.record(&test_id, agent_a, false, &format!("listen failed: {resp:?}"));
+            idx += 1;
+            continue;
+        }
+
+        let resp = r
+            .send(
+                agent_b,
+                Command::UnixConnect {
+                    path: sock_path.clone(),
+                    data: test_data.clone(),
+                },
+            )
+            .await;
+        let pass = matches!(&resp, Response::Connected { echo } if *echo == test_data);
+        r.record(&test_id, agent_b, pass, &format!("{resp:?}"));
+
+        let _ = r
+            .send(
+                agent_a,
+                Command::UnixUnlisten {
+                    path: sock_path,
+                },
+            )
+            .await;
+        idx += 1;
     }
 }
 
@@ -1268,6 +1429,23 @@ pub(crate) async fn run_matrix_tests(r: &mut TestRunner) {
     // ── Network ──
     eprintln!("[matrix] === Network ({} cases) ===", NET_TESTS.len());
     run_net_tests(r).await;
+
+    // ── Network Address Matrix ──
+    let addr_test_count = NET_ADDR_PAIRS.len() * CONNECT_ADDRS.len();
+    eprintln!(
+        "[matrix] === Network Address ({} pairs × {} addrs = {} cases) ===",
+        NET_ADDR_PAIRS.len(),
+        CONNECT_ADDRS.len(),
+        addr_test_count,
+    );
+    run_net_addr_tests(r).await;
+
+    // ── Unix Socket Address Matrix ──
+    eprintln!(
+        "[matrix] === Unix Socket Address ({} pairs) ===",
+        NET_ADDR_PAIRS.len(),
+    );
+    run_unix_addr_tests(r).await;
 
     // ── Exec & Env ──
     eprintln!("[matrix] === Exec ({} agents) ===", EXEC_AGENTS.len());
