@@ -11,23 +11,32 @@
 //!
 //! This binary can run on **native Linux** (gold standard) or **inside litebox**
 //! (sandbox under test). The environment affects what syscall implementation is
-//! tested:
+//! tested. Always use the `litebox-test` Docker image for reproducible results.
 //!
-//! - **Native**: `litebox_test_harness spawn-tree` — tests the real kernel
-//! - **Litebox**: `litebox_tool_executor --rootfs / --record-baseline -- litebox_test_harness spawn-tree`
-//!
-//! Running directly via `docker exec` runs on the native kernel, NOT through
-//! litebox's shim. The coordinator prints a `[coord] runtime:` diagnostic at
-//! startup to make the environment visible.
-//!
-//! To run tests inside litebox from Docker:
+//! ## Native (gold standard — real kernel syscalls):
 //! ```sh
 //! docker run --rm --cap-add SYS_PTRACE \
-//!   -v /path/to/litebox-out/debug:/opt/litebox:ro \
-//!   litebox-vscode /opt/litebox/litebox_tool_executor \
+//!   -v \\wsl$\Ubuntu\home\USER\litebox-out\debug:/opt/litebox:ro \
+//!   -v \\wsl$\Ubuntu\home\USER\litebox-out\nonpie\debug:/opt/nonpie:ro \
+//!   litebox-test /opt/litebox/litebox_test_harness spawn-tree
+//! ```
+//!
+//! ## Litebox sandbox (tests the shim's syscall virtualization):
+//! ```sh
+//! docker run --rm --cap-add SYS_PTRACE -e LITEBOX_NO_AUDIT=1 \
+//!   -v \\wsl$\Ubuntu\home\USER\litebox-out\debug:/opt/litebox:ro \
+//!   -v \\wsl$\Ubuntu\home\USER\litebox-out\nonpie\debug:/opt/nonpie:ro \
+//!   litebox-test /opt/litebox/litebox_tool_executor \
 //!     --rootfs / --record-baseline \
 //!     -- /opt/litebox/litebox_test_harness spawn-tree
 //! ```
+//!
+//! Add `--filter=matrix` (or `special`, `proc`, `tcp`, etc.) to run a
+//! specific test suite.
+//!
+//! The coordinator prints a `[coord] runtime:` diagnostic at startup to
+//! make the environment visible. Running outside Docker or without
+//! `litebox_tool_executor` will produce a warning.
 
 mod agent;
 mod agent_listen;
