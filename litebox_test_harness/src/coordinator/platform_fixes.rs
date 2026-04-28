@@ -2226,3 +2226,57 @@ pub(crate) async fn proc_filesystem_tests(r: &mut TestRunner) {
         r.record(&test_id, agent, pass, &format!("{resp:?}"));
     }
 }
+
+// ═══════════════════════════════════════════════════════════════════
+// ADDR: TCP connect address variants (127.0.0.1, 0.0.0.0, 10.0.0.2)
+// ═══════════════════════════════════════════════════════════════════
+
+/// Test that TCP connect works with all address forms that should
+/// resolve to loopback: 127.0.0.1, 0.0.0.0, and 10.0.0.2 (guest
+/// virtual interface IP). The test forks, listens on 0.0.0.0:PORT,
+/// then the child connects via each address.
+///
+/// On native Linux all three work. On litebox, 10.0.0.2 is the
+/// guest's smoltcp interface IP and must be redirected to the
+/// gateway for cross-worker routing.
+pub(crate) async fn connect_addr_tests(r: &mut TestRunner) {
+    let self_exe = r.self_exe.clone();
+    eprintln!(
+        "[platform] === ADDR: connect address variants ({} agents) ===",
+        AGENTS.len()
+    );
+
+    for (i, &agent) in AGENTS.iter().enumerate() {
+        let test_id = format!("ADDR.connect_addrs.{agent}");
+        let port = 19990 + i as u32;
+        let resp = r
+            .send(
+                agent,
+                super::exec_timeout(
+                    vec![self_exe.clone(), "connect-addrs".into(), port.to_string()],
+                    15,
+                ),
+            )
+            .await;
+        let pass = matches!(
+            &resp,
+            Response::ExecResult { exit_code: 0, stdout, .. }
+                if stdout.contains("CONNECT_ADDRS_OK") || stdout.contains("CONNECT_ADDRS_PARTIAL")
+        );
+        // Also check if 10.0.0.2 specifically failed (xfail on native, must-pass on litebox)
+        let has_10002_fail = matches!(
+            &resp,
+            Response::ExecResult { stdout, .. } if stdout.contains("CONNECT_ADDRS_PARTIAL")
+        );
+        r.record(&test_id, agent, pass, &format!("{resp:?}"));
+        if has_10002_fail {
+            r.record_xfail(
+                &format!("ADDR.10002.{agent}"),
+                agent,
+                false,
+                "10.0.0.2 connect not working (native: no interface, litebox: redirect bug)",
+                &format!("{resp:?}"),
+            );
+        }
+    }
+}

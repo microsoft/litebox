@@ -4376,6 +4376,11 @@ impl litebox::platform::IPInterfaceProvider for LinuxUserland {
         port: u16,
         listen: bool,
     ) -> Result<(), litebox::platform::SendError> {
+        // Check if network transport is available (it won't be during
+        // shutdown or when running without a broker).
+        if self.network_transport.read().unwrap().is_none() {
+            return Ok(());
+        }
         // LBPL control message: [0x00, 'P', 'L', port_hi, port_lo, action]
         let port_bytes = port.to_be_bytes();
         let msg: [u8; 6] = [0x00, b'P', b'L', port_bytes[0], port_bytes[1], listen as u8];

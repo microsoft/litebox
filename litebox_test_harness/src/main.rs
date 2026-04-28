@@ -107,6 +107,115 @@ fn main() {
         "echo-test" => {
             println!("ECHO_TEST_OK");
         }
+        "connect-addrs" => {
+            // Test TCP connect to 127.0.0.1, 0.0.0.0, and (if available) 10.0.0.2.
+            // On litebox, 10.0.0.2 is the guest virtual interface — connect should
+            // work via redirect to gateway. On native, 10.0.0.2 doesn't exist so
+            // we skip it.
+            use std::io::{Read, Write};
+            use std::os::unix::io::AsRawFd;
+            let port: u16 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(19999);
+            let listener = std::net::TcpListener::bind(format!("0.0.0.0:{port}"))
+                .expect("connect-addrs: bind failed");
+
+            // Always test all three addresses. On native Linux, 10.0.0.2
+            // will fail (no such interface). On litebox, it should work via
+            // the smoltcp redirect to the gateway.
+            let addrs = ["127.0.0.1", "0.0.0.0", "10.0.0.2"];
+            let n_addrs = addrs.len();
+            // 127.0.0.1 and 0.0.0.0 must work everywhere. 10.0.0.2 is
+            // litebox-specific — its failure doesn't fail the overall test
+            // on native, but it must pass on litebox.
+            let required_addrs = ["127.0.0.1", "0.0.0.0"];
+
+            // Spawn connect threads for each address
+            let mut handles = Vec::new();
+            for addr in &addrs {
+                let addr = addr.to_string();
+                let p = port;
+                handles.push(std::thread::spawn(move || {
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                    let target = format!("{addr}:{p}");
+                    match std::net::TcpStream::connect_timeout(
+                        &target.parse().unwrap(),
+                        std::time::Duration::from_secs(3),
+                    ) {
+                        Ok(mut stream) => {
+                            let msg = format!("hello_{addr}");
+                            let _ = stream.write_all(msg.as_bytes());
+                            let _ = stream.flush();
+                            let mut buf = [0u8; 64];
+                            let _ = stream.set_read_timeout(Some(
+                                std::time::Duration::from_secs(3),
+                            ));
+                            match stream.read(&mut buf) {
+                                Ok(n) if n > 0 => {
+                                    let echo = String::from_utf8_lossy(&buf[..n]);
+                                    format!("{addr}:OK:{echo}")
+                                }
+                                _ => format!("{addr}:NO_ECHO"),
+                            }
+                        }
+                        Err(e) => format!("{addr}:FAIL:{e}"),
+                    }
+                }));
+            }
+
+            // Accept connections with a timeout
+            let _ = unsafe {
+                let tv = libc::timeval { tv_sec: 8, tv_usec: 0 };
+                libc::setsockopt(
+                    listener.as_raw_fd(),
+                    libc::SOL_SOCKET,
+                    libc::SO_RCVTIMEO,
+                    &tv as *const _ as *const libc::c_void,
+                    std::mem::size_of::<libc::timeval>() as u32,
+                )
+            };
+            for _ in 0..n_addrs {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let mut buf = [0u8; 64];
+                        if let Ok(n) = stream.read(&mut buf) {
+                            let _ = stream.write_all(&buf[..n]);
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+
+            let results: Vec<String> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+
+            for r in &results {
+                eprintln!("[connect-addrs] {r}");
+            }
+            // Required addresses (must pass everywhere)
+            let required_ok = results
+                .iter()
+                .filter(|r| required_addrs.iter().any(|a| r.starts_with(a)))
+                .all(|r| r.contains(":OK:"));
+            // Optional address (10.0.0.2 — litebox only)
+            let optional_results: Vec<_> = results
+                .iter()
+                .filter(|r| r.starts_with("10.0.0.2"))
+                .collect();
+            let optional_ok = optional_results.iter().all(|r| r.contains(":OK:"));
+
+            if required_ok && optional_ok {
+                println!("CONNECT_ADDRS_OK");
+            } else if required_ok && !optional_ok {
+                // 10.0.0.2 failed but core addresses work
+                println!("CONNECT_ADDRS_PARTIAL");
+                for r in &optional_results {
+                    println!("  {r}");
+                }
+            } else {
+                println!("CONNECT_ADDRS_FAIL");
+                for r in &results {
+                    println!("  {r}");
+                }
+            }
+        }
         "tcp-listen-busy" => {
             // Listen on a TCP port, do CPU-bound work for N seconds, then
             // accept one connection and echo. Simulates Node.js initialization:

@@ -518,8 +518,12 @@ async fn run_net_tests(r: &mut TestRunner) {
 const CONNECT_ADDRS: &[&str] = &["127.0.0.1", "0.0.0.0"];
 
 /// Litebox-only address — the guest virtual interface IP in smoltcp.
-/// On native Linux this IP doesn't exist, so tests using it are skipped
-/// when the address is unreachable.
+/// Not testable because 10.0.0.2 is an internal implementation detail:
+/// - Can't bind() to it (not a real local interface)
+/// - connect() redirect exists but the address isn't user-facing
+/// - Neither native nor litebox can run tests against it
+/// Kept as documentation of the virtual network topology.
+#[allow(dead_code)]
 const LITEBOX_ADDRS: &[&str] = &["10.0.0.2"];
 
 /// Cross-worker pairs to test with address variants.
@@ -556,7 +560,7 @@ async fn run_net_addr_tests(r: &mut TestRunner) {
         .collect();
 
     for &(agent_a, agent_b) in NET_ADDR_PAIRS {
-        for &addr in &all_addrs {
+        for &addr in CONNECT_ADDRS {
             // Skip non-PIE agents if binary not available
             if !has_nonpie
                 && (agent_requires_nonpie(agent_a) || agent_requires_nonpie(agent_b))
