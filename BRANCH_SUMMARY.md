@@ -34,7 +34,6 @@ subprocesses to sandbox Linux workloads. Supports three modes:
   9P/network boundary)
 - `--policy` XOR `--record-baseline` CLI contract — no implicit defaults
 - Baseline recording mode captures all operations for policy generation
-  (`analyze-baseline.py`)
 - Demo policy covers VS Code/Copilot/GitHub endpoints + package registries
   (npm, pypi)
 

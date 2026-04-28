@@ -9,7 +9,7 @@
                 "-NoProfile",
                 "-ExecutionPolicy", "Bypass",
                 "-File",
-                "C:\\src\\litebox\\litebox_tool_executor\\scripts\\Tail-AuditLog.ps1",
+                "C:\\src\\litebox\\litebox_tool_executor\\scripts\\audit\\Tail-AuditLog.ps1",
                 "-Raw"
             ],
             "problemMatcher": [],
@@ -27,7 +27,7 @@
                 "-NoProfile",
                 "-ExecutionPolicy", "Bypass",
                 "-File",
-                "C:\\src\\litebox\\litebox_tool_executor\\scripts\\Tail-AuditLog.ps1"
+                "C:\\src\\litebox\\litebox_tool_executor\\scripts\\audit\\Tail-AuditLog.ps1"
             ],
             "problemMatcher": [],
             "runOptions": {

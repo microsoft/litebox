@@ -447,7 +447,7 @@ exec control by restricting which files can be accessed.
 
 The sandbox is exposed as a VS Code terminal profile. A demo workspace (`litebox_tool_executor/demo/`) provides:
 - Three terminal profiles: "LiteBox Sandbox (Windows)", "LiteBox Sandbox (WSL2)", "PowerShell"
-- Audit log viewer (`View-AuditLog.ps1`) with color-coded syscall names and regex filtering
+- Audit log viewer (`scripts/audit/View-AuditLog.ps1`) with color-coded syscall names and regex filtering
 - Auto-tail task that streams the audit log on workspace open
 
 ### Bug Fixes Along the Way
