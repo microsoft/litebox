@@ -17,7 +17,10 @@
     //   1. File → Preferences → Profiles → Create Profile → name it "LiteBox"
     //   2. In the LiteBox profile's user settings (JSON), add:
     //        "remote.SSH.showLoginTerminal": true,
-    //        "remote.SSH.remotePlatform": { "litebox": "linux" }
+    //        "remote.SSH.remotePlatform": { "litebox": "linux" },
+    //        "remote.SSH.enableReconnection": false
+    //   And in ~/.ssh/config add ConnectionAttempts 1 + ServerAliveCountMax 1
+    //   to the litebox host block to prevent SSH/VS Code retries.
     //   All remote.SSH.* settings have application scope — they cannot
     //   be set per-workspace, only in user settings (Default profile).
     //
