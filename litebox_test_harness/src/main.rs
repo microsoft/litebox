@@ -73,9 +73,9 @@ fn find_nonpie_binary() -> Option<String> {
 
 /// Get the first non-loopback IPv4 address of this host.
 /// On native Docker: returns the container bridge IP (e.g., 172.17.0.5).
-/// On litebox: returns the smoltcp virtual IP (10.0.0.2).
+/// On litebox: returns the smoltcp virtual IP (10.0.0.2) via the
+/// virtualized netlink interface.
 fn get_self_ip() -> Option<String> {
-    // Use hostname -I which returns space-separated IPs.
     if let Ok(output) = std::process::Command::new("hostname").arg("-I").output() {
         if let Ok(s) = String::from_utf8(output.stdout) {
             for ip in s.split_whitespace() {

@@ -245,7 +245,7 @@ impl NetlinkRouteSocket {
     /// Generate RTM_NEWADDR responses for both loopback and eth0.
     fn generate_addr_response(&mut self, seq: u32) {
         self.append_addr_msg(seq, 8, 254, 1, [127, 0, 0, 1], b"lo\0"); // lo: 127.0.0.1/8
-        self.append_addr_msg(seq, 16, 0, 2, [172, 17, 0, 2], b"eth0\0"); // eth0: 172.17.0.2/16
+        self.append_addr_msg(seq, 24, 0, 2, [10, 0, 0, 2], b"eth0\0"); // eth0: 10.0.0.2/24 (smoltcp virtual interface)
     }
 
     fn append_addr_msg(
