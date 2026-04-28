@@ -498,8 +498,37 @@ where
 
         // Drain all socket channel buffers before polling to ensure data flows
         self.drain_all_socket_channel_buffers();
-        self.interface
-            .poll(self.now(), &mut self.device, &mut self.socket_set)
+
+        let result = self
+            .interface
+            .poll(self.now(), &mut self.device, &mut self.socket_set);
+
+        // If smoltcp generated a RST during poll, record socket state.
+        // Don't clear previous RST info — it persists until take_rst_diagnostic().
+        if let Some((rst_src_port, rst_dst_port)) = self.device.last_rst_info.get() {
+            let mut tcp_count = 0u16;
+            let mut listen_count = 0u16;
+            let mut listen_ports: [u16; 8] = [0; 8];
+            for (_handle, socket) in self.socket_set.iter() {
+                if let smoltcp::socket::Socket::Tcp(tcp) = socket {
+                    tcp_count += 1;
+                    if tcp.state() == smoltcp::socket::tcp::State::Listen {
+                        if (listen_count as usize) < listen_ports.len() {
+                            listen_ports[listen_count as usize] = tcp.listen_endpoint().port;
+                        }
+                        listen_count += 1;
+                    }
+                }
+            }
+            self.device.last_rst_info.set(Some((rst_src_port, rst_dst_port)));
+            self.device.rst_socket_summary.set(Some(phy::RstSocketSummary {
+                tcp_count,
+                listen_count,
+                listen_ports,
+            }));
+        }
+
+        result
     }
 
     /// (Internal-only API) Perform the queued interactions.
@@ -516,6 +545,16 @@ where
     /// background (data being flushed, FIN handshake in progress).
     pub fn has_pending_closes(&self) -> bool {
         !self.closing_in_background.is_empty()
+    }
+
+    /// Check if a RST was sent during the last platform interaction.
+    /// Returns `(src_port, dst_port, summary)` if so.
+    pub fn take_rst_diagnostic(&self) -> Option<(u16, u16, phy::RstSocketSummary)> {
+        let (src, dst) = self.device.last_rst_info.get()?;
+        let summary = self.device.rst_socket_summary.get()?;
+        self.device.last_rst_info.set(None);
+        self.device.rst_socket_summary.set(None);
+        Some((src, dst, summary))
     }
 
     /// Remove dead sockets that were closing in the background
@@ -1299,16 +1338,7 @@ where
                     unimplemented!()
                 }
                 socket_handle.tcp_mut().server_socket = Some(TcpServerSpecific {
-                    // Always listen on any IP (addr: None) regardless of what the
-                    // guest specified.  The runner's smoltcp has a single interface
-                    // (10.0.0.2/24).  Cross-worker inbound connections arrive with
-                    // dst=10.0.0.2, so a listen bound to 127.0.0.1 would never
-                    // match, causing RST.  Using None (INADDR_ANY) ensures all
-                    // inbound SYN packets match the listen socket.
-                    ip_listen_endpoint: smoltcp::wire::IpListenEndpoint {
-                        addr: None,
-                        port: new_port,
-                    },
+                    ip_listen_endpoint: Self::ip_listen_endpoint_v4(*addr, new_port),
                     backlog: None,
                     socket_set_handles: vec![],
                 });

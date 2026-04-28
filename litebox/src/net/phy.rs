@@ -8,10 +8,22 @@ use crate::platform;
 /// The maximum transmission unit for a device
 pub(crate) const DEVICE_MTU: usize = 1600;
 
+/// Diagnostic info about TCP socket state when an RST was sent.
+#[derive(Clone, Copy)]
+pub struct RstSocketSummary {
+    pub tcp_count: u16,
+    pub listen_count: u16,
+    pub listen_ports: [u16; 8],
+}
+
 pub(crate) struct Device<Platform: platform::IPInterfaceProvider + 'static> {
     pub(crate) platform: &'static Platform,
     receive_buffer: [u8; DEVICE_MTU],
     send_buffer: [u8; DEVICE_MTU],
+    /// Diagnostic: (src_port, dst_port) of last RST transmitted during poll.
+    pub(crate) last_rst_info: core::cell::Cell<Option<(u16, u16)>>,
+    /// Diagnostic: socket state summary at time of RST.
+    pub(crate) rst_socket_summary: core::cell::Cell<Option<RstSocketSummary>>,
 }
 
 impl<Platform: platform::IPInterfaceProvider> Device<Platform> {
@@ -20,6 +32,8 @@ impl<Platform: platform::IPInterfaceProvider> Device<Platform> {
             platform,
             receive_buffer: [0u8; DEVICE_MTU],
             send_buffer: [0u8; DEVICE_MTU],
+            last_rst_info: core::cell::Cell::new(None),
+            rst_socket_summary: core::cell::Cell::new(None),
         }
     }
 }
@@ -46,6 +60,7 @@ impl<Platform: platform::IPInterfaceProvider> smoltcp::phy::Device for Device<Pl
                 TxToken {
                     platform: self.platform,
                     buffer: &mut self.send_buffer,
+                    rst_info: &self.last_rst_info,
                 },
             )),
             Err(platform::ReceiveError::WouldBlock | platform::ReceiveError::Eof) => None,
@@ -60,6 +75,7 @@ impl<Platform: platform::IPInterfaceProvider> smoltcp::phy::Device for Device<Pl
         Some(TxToken {
             platform: self.platform,
             buffer: &mut self.send_buffer,
+            rst_info: &self.last_rst_info,
         })
     }
 
@@ -87,6 +103,7 @@ impl smoltcp::phy::RxToken for RxToken<'_> {
 pub(crate) struct TxToken<'a, Platform: platform::IPInterfaceProvider> {
     platform: &'a Platform,
     buffer: &'a mut [u8],
+    rst_info: &'a core::cell::Cell<Option<(u16, u16)>>,
 }
 
 impl<Platform: platform::IPInterfaceProvider> smoltcp::phy::TxToken for TxToken<'_, Platform> {
@@ -96,6 +113,15 @@ impl<Platform: platform::IPInterfaceProvider> smoltcp::phy::TxToken for TxToken<
     {
         let packet = &mut self.buffer[..len];
         let res = f(packet);
+        // Detect RST packets for diagnostics.
+        if len >= 40 && packet[0] >> 4 == 4 && packet[9] == 6 {
+            let ihl = (packet[0] & 0x0F) as usize * 4;
+            if len >= ihl + 14 && packet[ihl + 13] & 0x04 != 0 {
+                let src_port = u16::from_be_bytes([packet[ihl], packet[ihl + 1]]);
+                let dst_port = u16::from_be_bytes([packet[ihl + 2], packet[ihl + 3]]);
+                self.rst_info.set(Some((src_port, dst_port)));
+            }
+        }
         // Send via IPC to the broker.
         let _ = self.platform.send_ip_packet(packet);
         res

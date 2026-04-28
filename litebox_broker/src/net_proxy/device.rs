@@ -13,7 +13,7 @@
 use crate::sock_compat::{self, IpcStream, MSG_PEEK, POLLOUT, PollFd, RawSock};
 
 use smoltcp::phy;
-use tracing::error;
+use tracing::{error, warn};
 
 /// MTU matching the guest-side smoltcp configuration.
 pub const DEVICE_MTU: usize = 1600;
@@ -276,6 +276,19 @@ impl phy::TxToken for TxToken<'_> {
         F: FnOnce(&mut [u8]) -> R,
     {
         let result = f(&mut self.tx_buf[..len]);
+        // Diagnostic: detect RST packets being transmitted by the broker proxy.
+        let pkt = &self.tx_buf[..len];
+        if len >= 40 && pkt[0] >> 4 == 4 && pkt[9] == 6 {
+            let ihl = (pkt[0] & 0x0F) as usize * 4;
+            if len >= ihl + 14 && pkt[ihl + 13] & 0x04 != 0 {
+                let src_port = u16::from_be_bytes([pkt[ihl], pkt[ihl + 1]]);
+                let dst_port = u16::from_be_bytes([pkt[ihl + 2], pkt[ihl + 3]]);
+                warn!(
+                    "BROKER TxToken RST: src_port={src_port} dst_port={dst_port} flags=0x{:02x}",
+                    pkt[ihl + 13]
+                );
+            }
+        }
         send_ipc_frame(self.fd, &self.tx_buf[..len]);
         result
     }

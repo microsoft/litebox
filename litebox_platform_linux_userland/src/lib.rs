@@ -4295,6 +4295,22 @@ impl litebox::platform::IPInterfaceProvider for LinuxUserland {
                 }
             }
             NetworkTransport::Ipc(fd) => {
+                // Diagnostic: detect TCP RST packets being sent to the broker.
+                if packet.len() >= 40 && packet[0] >> 4 == 4 && packet[9] == 6 {
+                    let ihl = (packet[0] & 0x0F) as usize * 4;
+                    if packet.len() >= ihl + 14 && packet[ihl + 13] & 0x04 != 0 {
+                        let src_port = u16::from_be_bytes([packet[ihl], packet[ihl + 1]]);
+                        let dst_port = u16::from_be_bytes([packet[ihl + 2], packet[ihl + 3]]);
+                        let src_ip = &packet[12..16];
+                        let dst_ip = &packet[16..20];
+                        eprintln!(
+                            "RUNNER send_ip_packet RST: {}.{}.{}.{}:{} → {}.{}.{}.{}:{} flags=0x{:02x}",
+                            src_ip[0], src_ip[1], src_ip[2], src_ip[3], src_port,
+                            dst_ip[0], dst_ip[1], dst_ip[2], dst_ip[3], dst_port,
+                            packet[ihl + 13]
+                        );
+                    }
+                }
                 // IPC framing: 4-byte LE length prefix + packet.
                 // Must handle partial writes to prevent stream misalignment.
                 let mut frame = Vec::with_capacity(4 + packet.len());
