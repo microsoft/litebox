@@ -713,7 +713,7 @@ impl<FS: ShimFS> GlobalState<FS> {
         self.net.lock().bind(fd, &sockaddr).map_err(Errno::from)
     }
 
-    fn connect(
+    pub(super) fn connect(
         &self,
         cx: &WaitContext<'_, Platform>,
         fd: &SocketFd,

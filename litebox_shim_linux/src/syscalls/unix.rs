@@ -261,6 +261,8 @@ impl<FS: ShimFS> UnixInitStream<FS> {
         Ok(UnixListenStream {
             backlog,
             global: global.clone(),
+            tcp_port: 0,
+            tcp_fd: None,
         })
     }
 
@@ -386,6 +388,10 @@ impl<FS: ShimFS> Backlog<FS> {
 struct UnixListenStream<FS: ShimFS> {
     backlog: Arc<Backlog<FS>>,
     global: Arc<GlobalState<FS>>,
+    /// TCP port allocated for cross-worker connections (0 = none).
+    tcp_port: u16,
+    /// TCP socket fd for the cross-worker listener (if allocated).
+    tcp_fd: Option<crate::syscalls::net::SocketFd>,
 }
 
 impl<FS: ShimFS> UnixListenStream<FS> {
@@ -406,11 +412,80 @@ impl<FS: ShimFS> UnixListenStream<FS> {
     fn get_local_addr(&self) -> &UnixBoundSocketAddr<FS> {
         self.backlog.addr.as_ref()
     }
+
+    /// Allocate an internal TCP listener for cross-worker unix socket connections.
+    ///
+    /// Creates a TCP socket, binds to an ephemeral port, and starts listening.
+    /// Returns the allocated port number (0 on failure).
+    fn start_tcp_listener(
+        &mut self,
+        global: &Arc<GlobalState<FS>>,
+        cx: &WaitContext<'_, crate::Platform>,
+    ) -> u16 {
+        use litebox::platform::DebugLogProvider as _;
+
+        // Create TCP socket.
+        let tcp_fd = match global.net.lock().socket(litebox::net::Protocol::Tcp) {
+            Ok(fd) => fd,
+            Err(e) => {
+                let msg = alloc::format!("UNIX TCP LISTENER: socket failed: {:?}\n", e);
+                litebox_platform_multiplex::platform().debug_log_print(&msg);
+                return 0;
+            }
+        };
+
+        // Initialize the socket proxy so the network subsystem can drive I/O.
+        let _proxy = global.initialize_socket(&tcp_fd, SockType::Stream, SockFlags::empty());
+
+        // Bind to ephemeral port (port 0 = kernel picks).
+        let bind_addr = core::net::SocketAddr::V4(core::net::SocketAddrV4::new(
+            core::net::Ipv4Addr::UNSPECIFIED,
+            0,
+        ));
+        if let Err(e) = global.net.lock().bind(&tcp_fd, &bind_addr) {
+            let msg = alloc::format!("UNIX TCP LISTENER: bind failed: {:?}\n", e);
+            litebox_platform_multiplex::platform().debug_log_print(&msg);
+            return 0;
+        }
+
+        // Get the assigned port.
+        let port = match global.net.lock().get_local_addr(&tcp_fd) {
+            Ok(addr) => addr.port(),
+            Err(_) => return 0,
+        };
+
+        // Start listening.
+        if let Err(e) = global.net.lock().listen(&tcp_fd, 8) {
+            let msg = alloc::format!("UNIX TCP LISTENER: listen failed: {:?}\n", e);
+            litebox_platform_multiplex::platform().debug_log_print(&msg);
+            return 0;
+        }
+
+        let msg = alloc::format!("UNIX TCP LISTENER: listening on port {} for cross-worker unix\n", port);
+        litebox_platform_multiplex::platform().debug_log_print(&msg);
+
+        self.tcp_port = port;
+        self.tcp_fd = Some(tcp_fd);
+        port
+    }
 }
 
 impl<FS: ShimFS> Drop for UnixListenStream<FS> {
     fn drop(&mut self) {
         self.backlog.shutdown();
+
+        // Clean up sidecar metadata file.
+        if let UnixBoundSocketAddr::Path((path, _, fs)) = self.backlog.addr.as_ref() {
+            remove_sidecar(fs.as_ref(), path.as_str());
+        }
+
+        // Close the internal TCP listener if we allocated one.
+        if let Some(tcp_fd) = self.tcp_fd.take() {
+            let _ = self.global.net.lock().close(
+                &tcp_fd,
+                litebox::net::CloseBehavior::Immediate,
+            );
+        }
 
         let key = self.backlog.addr.to_key();
         let mut table = self.global.unix_addr_table.write();
@@ -797,8 +872,30 @@ impl<FS: ShimFS> UnixStream<FS> {
         self.with_state(|state| {
             let ret = match state {
                 UnixStreamState::Init(init) => {
+                    // Extract the socket path before consuming init (for sidecar).
+                    let sock_path = init.addr.as_ref().and_then(|a| match a {
+                        UnixBoundSocketAddr::Path((p, ..)) => Some(p.clone()),
+                        _ => None,
+                    });
+
                     return match init.listen(backlog, global, task.current_ucred()) {
-                        Ok(listen) => (UnixStreamState::Listen(listen), Ok(())),
+                        Ok(mut listen) => {
+                            // Write sidecar metadata for cross-worker discovery.
+                            // TODO: allocate a real TCP port and register with
+                            // PortRouter. For now write a placeholder port 0
+                            // (connecting side will fail gracefully).
+                            if let Some(path) = sock_path {
+                                let fs = task.files.borrow().fs.clone();
+                                // Allocate an ephemeral TCP port for cross-worker
+                                // connections. Create a TCP listener socket and
+                                // register it so the broker routes connections here.
+                                let tcp_port = listen.start_tcp_listener(global, &task.wait_cx());
+                                if tcp_port != 0 {
+                                    write_sidecar(fs.as_ref(), path.as_str(), tcp_port);
+                                }
+                            }
+                            (UnixStreamState::Listen(listen), Ok(()))
+                        }
                         Err((init, err)) => (UnixStreamState::Init(init), Err(err)),
                     };
                 }
@@ -859,20 +956,109 @@ impl<FS: ShimFS> UnixStream<FS> {
         addr: UnixSocketAddr,
         is_nonblocking: bool,
     ) -> Result<(), Errno> {
-        let backlog = self.lookup(task, &addr)?;
-        // check if we can bind to the address
-        let _ = addr.bind(task, false)?;
-        task.wait_cx()
-            .wait_on_events(
-                is_nonblocking,
-                Events::OUT,
-                |observer, mask| {
-                    backlog.pollee.register_observer(observer, mask);
-                    Ok(())
-                },
-                || self.try_connect(&backlog, task.current_ucred()),
-            )
-            .map_err(Errno::from)
+        match self.lookup(task, &addr) {
+            Ok(backlog) => {
+                // Same-worker: connect via in-memory backlog.
+                let _ = addr.bind(task, false)?;
+                task.wait_cx()
+                    .wait_on_events(
+                        is_nonblocking,
+                        Events::OUT,
+                        |observer, mask| {
+                            backlog.pollee.register_observer(observer, mask);
+                            Ok(())
+                        },
+                        || self.try_connect(&backlog, task.current_ucred()),
+                    )
+                    .map_err(Errno::from)
+            }
+            Err(Errno::ECONNREFUSED) => {
+                // Local lookup failed — try cross-worker path via sidecar file.
+                self.try_connect_remote(task, &addr, is_nonblocking)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Attempt a cross-worker unix socket connection by reading the sidecar
+    /// metadata file and establishing a TCP connection through the broker.
+    fn try_connect_remote(
+        &self,
+        task: &Task<FS>,
+        addr: &UnixSocketAddr,
+        is_nonblocking: bool,
+    ) -> Result<(), Errno> {
+        let sock_path = match addr {
+            UnixSocketAddr::Path(p) => p.clone(),
+            _ => return Err(Errno::ECONNREFUSED),
+        };
+
+        let fs = task.files.borrow().fs.clone();
+        let tcp_port = read_sidecar(fs.as_ref(), sock_path.as_str()).ok_or_else(|| {
+            use litebox::platform::DebugLogProvider as _;
+            let msg = alloc::format!(
+                "UNIX CONNECT REFUSED (no sidecar): path={:?} pid={}\n",
+                sock_path,
+                task.process_id.0,
+            );
+            litebox_platform_multiplex::platform().debug_log_print(&msg);
+            Errno::ECONNREFUSED
+        })?;
+
+        use litebox::platform::DebugLogProvider as _;
+        let msg = alloc::format!(
+            "UNIX CROSS-WORKER CONNECT: path={:?} tcp_port={} pid={}\n",
+            sock_path,
+            tcp_port,
+            task.process_id.0,
+        );
+        litebox_platform_multiplex::platform().debug_log_print(&msg);
+
+        // Create an internal TCP socket and connect to 127.0.0.1:<tcp_port>.
+        let tcp_fd = task
+            .global
+            .net
+            .lock()
+            .socket(litebox::net::Protocol::Tcp)
+            .map_err(|_| Errno::ENOMEM)?;
+        let proxy = task.global.initialize_socket(&tcp_fd, SockType::Stream, SockFlags::empty());
+
+        let sockaddr = core::net::SocketAddr::V4(core::net::SocketAddrV4::new(
+            core::net::Ipv4Addr::LOCALHOST,
+            tcp_port,
+        ));
+
+        // Perform TCP connect (goes through smoltcp → broker → PortRouter).
+        task.global.connect(&task.wait_cx(), &tcp_fd, sockaddr)?;
+
+        // Wrap the TCP proxy in a unix-socket connected stream.
+        let peer_addr = UnixBoundSocketAddr::Path((
+            sock_path,
+            // We don't have the actual file fd for the remote socket, use a
+            // dummy open so AddrView can report the path.
+            {
+                let f = fs.open("/dev/null", OFlags::RDONLY, Mode::empty())
+                    .map_err(|_| Errno::ECONNREFUSED)?;
+                f
+            },
+            fs,
+        ));
+
+        self.with_state(|state| match state {
+            UnixStreamState::Init(init) => {
+                let connected = UnixConnectedStream {
+                    addr: AddrView {
+                        addr: init.addr.map(Arc::new),
+                        peer: Some(Arc::new(peer_addr)),
+                    },
+                    transport: UnixTransport::Tcp { proxy },
+                    peer_cred: task.current_ucred(),
+                    pollee: Arc::new(Pollee::new()),
+                };
+                (UnixStreamState::Connected(connected), Ok(()))
+            }
+            other => (other, Err(Errno::EISCONN)),
+        })
     }
 
     fn accept(
@@ -1887,3 +2073,49 @@ enum UnixEntryInner<FS: ShimFS> {
 
 /// Type alias for the global Unix socket address table.
 pub(crate) type UnixAddrTable<FS> = BTreeMap<UnixSocketAddrKey, UnixEntry<FS>>;
+
+// ── Cross-worker unix socket discovery via sidecar metadata files ──
+//
+// When a unix socket listener is created, a sidecar file is written at
+// `<path>.litebox-uds-meta` containing the TCP port number that backs
+// this listener for cross-worker connections. Other workers read this
+// file when their local unix_addr_table doesn't have the entry.
+
+/// Sidecar file suffix for cross-worker unix socket discovery.
+const SIDECAR_SUFFIX: &str = ".litebox-uds-meta";
+
+/// Build the sidecar metadata path for a unix socket path.
+fn sidecar_path(sock_path: &str) -> String {
+    alloc::format!("{}{}", sock_path, SIDECAR_SUFFIX)
+}
+
+/// Write the TCP port to a sidecar metadata file.
+fn write_sidecar<FS: ShimFS>(fs: &FS, sock_path: &str, tcp_port: u16) {
+    let path = sidecar_path(sock_path);
+    let data = alloc::format!("{}", tcp_port);
+    if let Ok(fd) = fs.open(
+        path.as_str(),
+        OFlags::CREAT | OFlags::RDWR | OFlags::TRUNC,
+        Mode::RWXU,
+    ) {
+        let _ = fs.write(&fd, data.as_bytes(), Some(0));
+        let _ = fs.close(&fd);
+    }
+}
+
+/// Read the TCP port from a sidecar metadata file. Returns None if not found.
+fn read_sidecar<FS: ShimFS>(fs: &FS, sock_path: &str) -> Option<u16> {
+    let path = sidecar_path(sock_path);
+    let fd = fs.open(path.as_str(), OFlags::RDONLY, Mode::empty()).ok()?;
+    let mut buf = [0u8; 16];
+    let n = fs.read(&fd, &mut buf, Some(0)).ok()?;
+    let _ = fs.close(&fd);
+    let s = core::str::from_utf8(&buf[..n]).ok()?;
+    s.trim().parse::<u16>().ok()
+}
+
+/// Remove the sidecar metadata file.
+fn remove_sidecar<FS: ShimFS>(fs: &FS, sock_path: &str) {
+    let path = sidecar_path(sock_path);
+    let _ = fs.unlink(path.as_str());
+}
