@@ -1194,6 +1194,9 @@ impl<FS: ShimFS> Task<FS> {
                 let Ok(raw_fd) = files.insert_raw_fd(socket) else {
                     unimplemented!()
                 };
+                // Track this fd as AF_INET6 so getsockname/getpeername
+                // return sockaddr_in6 with v4-mapped addresses.
+                self.inet6_fds.borrow_mut().insert(u32::try_from(raw_fd).unwrap());
                 raw_fd
             }
             AddressFamily::NETLINK => {
@@ -1462,6 +1465,42 @@ pub(crate) fn write_sockaddr_to_user(
     addrlen.write_at_offset(0, len).ok_or(Errno::EFAULT)
 }
 
+/// Write a `sockaddr_in6` with a v4-mapped IPv6 address to user memory.
+///
+/// Converts an IPv4 `SocketAddress::Inet(V4)` to a `sockaddr_in6` with
+/// address `::ffff:x.x.x.x`. This is needed for sockets created as
+/// AF_INET6 that were internally mapped to AF_INET by the shim.
+fn write_sockaddr_v6_mapped_to_user(
+    sock_addr: SocketAddress,
+    addr: crate::MutPtr<u8>,
+    addrlen: crate::MutPtr<u32>,
+) -> Result<(), Errno> {
+    let addrlen_val = addrlen.read_at_offset(0).ok_or(Errno::EFAULT)?;
+    match sock_addr {
+        SocketAddress::Inet(SocketAddr::V4(v4_addr)) => {
+            // struct sockaddr_in6 = 28 bytes
+            let mut sa6 = [0u8; 28];
+            // sin6_family = AF_INET6 (10)
+            sa6[0..2].copy_from_slice(&10u16.to_ne_bytes());
+            // sin6_port (network byte order)
+            sa6[2..4].copy_from_slice(&v4_addr.port().to_be_bytes());
+            // sin6_flowinfo = 0 (bytes 4-7, already zero)
+            // sin6_addr: v4-mapped IPv6 = ::ffff:x.x.x.x (bytes 8-23)
+            // First 10 bytes zero, then 2 bytes 0xff, then 4 bytes IPv4
+            sa6[18] = 0xff;
+            sa6[19] = 0xff;
+            sa6[20..24].copy_from_slice(&v4_addr.ip().octets());
+            // sin6_scope_id = 0 (bytes 24-27, already zero)
+
+            let copy_len = (addrlen_val as usize).min(28);
+            addr.write_slice_at_offset(0, &sa6[..copy_len])
+                .ok_or(Errno::EFAULT)?;
+            addrlen.write_at_offset(0, 28u32).ok_or(Errno::EFAULT)
+        }
+        other => write_sockaddr_to_user(other, addr, addrlen),
+    }
+}
+
 impl<FS: ShimFS> Task<FS> {
     /// Handle syscall `accept`
     pub(crate) fn sys_accept(
@@ -1474,12 +1513,21 @@ impl<FS: ShimFS> Task<FS> {
         let Ok(sockfd) = u32::try_from(sockfd) else {
             return Err(Errno::EBADF);
         };
+        let is_inet6 = self.inet6_fds.borrow().contains(&sockfd);
         let mut remote_addr = addr.is_some().then(SocketAddress::default);
         let fd = self.do_accept(sockfd, remote_addr.as_mut(), flags)?;
+        // Accepted fds on AF_INET6 listeners should also be marked AF_INET6.
+        if is_inet6 {
+            self.inet6_fds.borrow_mut().insert(fd);
+        }
         if let (Some(addr), Some(remote_addr)) = (addr, remote_addr) {
             let addrlen = addrlen.ok_or(Errno::EFAULT)?;
-            if let Err(err) = write_sockaddr_to_user(remote_addr, addr, addrlen) {
-                // If we fail to write the address back to user, we need to close the accepted socket.
+            let write_result = if is_inet6 {
+                write_sockaddr_v6_mapped_to_user(remote_addr, addr, addrlen)
+            } else {
+                write_sockaddr_to_user(remote_addr, addr, addrlen)
+            };
+            if let Err(err) = write_result {
                 self.sys_close(i32::try_from(fd).unwrap())
                     .expect("close a newly-accepted socket failed");
                 return Err(err);
@@ -2622,7 +2670,12 @@ impl<FS: ShimFS> Task<FS> {
             return Ok(());
         }
         let sockaddr = self.do_getsockname(sockfd)?;
-        write_sockaddr_to_user(sockaddr, addr, addrlen)
+        let is_inet6 = self.inet6_fds.borrow().contains(&sockfd);
+        if is_inet6 {
+            write_sockaddr_v6_mapped_to_user(sockaddr, addr, addrlen)
+        } else {
+            write_sockaddr_to_user(sockaddr, addr, addrlen)
+        }
     }
     fn do_getsockname(&self, sockfd: u32) -> Result<SocketAddress, Errno> {
         // Netlink socket: return a dummy address.
@@ -2655,7 +2708,12 @@ impl<FS: ShimFS> Task<FS> {
             return Err(Errno::EBADF);
         };
         let sockaddr = self.do_getpeername(sockfd)?;
-        write_sockaddr_to_user(sockaddr, addr, addrlen)
+        let is_inet6 = self.inet6_fds.borrow().contains(&sockfd);
+        if is_inet6 {
+            write_sockaddr_v6_mapped_to_user(sockaddr, addr, addrlen)
+        } else {
+            write_sockaddr_to_user(sockaddr, addr, addrlen)
+        }
     }
     fn do_getpeername(&self, sockfd: u32) -> Result<SocketAddress, Errno> {
         self.files.borrow().with_socket(

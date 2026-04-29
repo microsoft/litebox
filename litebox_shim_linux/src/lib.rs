@@ -503,6 +503,7 @@ impl<FS: ShimFS> LinuxShim<FS> {
                 migrated_to_remote: Cell::new(false),
                 mux_pipe_pair_ids: RefCell::new(Vec::new()),
                 netlink_sockets: RefCell::new(alloc::collections::BTreeMap::new()),
+            inet6_fds: RefCell::new(alloc::collections::BTreeSet::new()),
             },
         };
         let exec_filename = alloc::ffi::CString::new(exec_filename).ok();
@@ -1181,6 +1182,7 @@ impl<FS: ShimFS> LinuxShim<FS> {
                 migrated_to_remote: Cell::new(false),
                 mux_pipe_pair_ids: RefCell::new(Vec::new()),
                 netlink_sockets: RefCell::new(alloc::collections::BTreeMap::new()),
+            inet6_fds: RefCell::new(alloc::collections::BTreeSet::new()),
             },
         };
 
@@ -3825,6 +3827,9 @@ struct Task<FS: ShimFS> {
     /// Used to intercept sendto/recvmsg/bind for AF_NETLINK fds.
     netlink_sockets:
         RefCell<alloc::collections::BTreeMap<u32, crate::syscalls::netlink::NetlinkRouteSocket>>,
+    /// Raw fd numbers created via AF_INET6 that were internally mapped to AF_INET.
+    /// getsockname/getpeername/accept must return sockaddr_in6 with v4-mapped addresses.
+    inet6_fds: RefCell<alloc::collections::BTreeSet<u32>>,
 }
 
 impl<FS: ShimFS> Drop for Task<FS> {
@@ -3876,6 +3881,7 @@ mod test_utils {
                 migrated_to_remote: Cell::new(false),
                 mux_pipe_pair_ids: RefCell::new(Vec::new()),
                 netlink_sockets: RefCell::new(alloc::collections::BTreeMap::new()),
+            inet6_fds: RefCell::new(alloc::collections::BTreeSet::new()),
                 process_state: self.process_state.into(),
                 global: self.global,
             }
@@ -3913,6 +3919,7 @@ mod test_utils {
                 migrated_to_remote: Cell::new(false),
                 mux_pipe_pair_ids: RefCell::new(Vec::new()),
                 netlink_sockets: RefCell::new(alloc::collections::BTreeMap::new()),
+            inet6_fds: RefCell::new(alloc::collections::BTreeSet::new()),
             };
             Some(task)
         }

@@ -2053,6 +2053,9 @@ impl<FS: ShimFS> Task<FS> {
                         netlink_sockets: core::cell::RefCell::new(
                             alloc::collections::BTreeMap::new(),
                         ),
+                        inet6_fds: core::cell::RefCell::new(
+                            alloc::collections::BTreeSet::new(),
+                        ),
                     },
                 }),
             )
@@ -2795,6 +2798,9 @@ impl<FS: ShimFS> Task<FS> {
                         mux_pipe_pair_ids: core::cell::RefCell::new(alloc::vec::Vec::new()),
                         netlink_sockets: core::cell::RefCell::new(
                             alloc::collections::BTreeMap::new(),
+                        ),
+                        inet6_fds: core::cell::RefCell::new(
+                            alloc::collections::BTreeSet::new(),
                         ),
                     },
                 }),
