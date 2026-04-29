@@ -906,18 +906,20 @@ impl<FS: ShimFS> UnixStream<FS> {
 
                     return match init.listen(backlog, global, task.current_ucred()) {
                         Ok(mut listen) => {
-                            // Write sidecar metadata for cross-worker discovery.
-                            // TODO: allocate a real TCP port and register with
-                            // PortRouter. For now write a placeholder port 0
-                            // (connecting side will fail gracefully).
                             if let Some(path) = sock_path {
                                 let fs = task.files.borrow().fs.clone();
-                                // Allocate an ephemeral TCP port for cross-worker
-                                // connections. Create a TCP listener socket and
-                                // register it so the broker routes connections here.
                                 let tcp_port = listen.start_tcp_listener(global, task);
                                 if tcp_port != 0 {
                                     write_sidecar(fs.as_ref(), path.as_str(), tcp_port);
+                                    // Log: sidecar write with port, raw_fd, path
+                                    let diag = alloc::format!(
+                                        "SIDECAR WRITE: path={} port={} raw_fd={:?} pid={}\n",
+                                        path, tcp_port, listen.tcp_raw_fd, task.process_id.0,
+                                    );
+                                    if let Ok(f) = fs.open("/tmp/unix-port-trace.log", OFlags::CREAT | OFlags::RDWR | OFlags::APPEND, Mode::RWXU) {
+                                        let _ = fs.write(&f, diag.as_bytes(), None);
+                                        let _ = fs.close(&f);
+                                    }
                                 }
                             }
                             (UnixStreamState::Listen(listen), Ok(()))
@@ -1054,10 +1056,10 @@ impl<FS: ShimFS> UnixStream<FS> {
         // Write diagnostic BEFORE connect.
         {
             let diag = alloc::format!(
-                "TRY_CONNECT_REMOTE: tcp_raw_fd={} tcp_port={} pid={}\n",
-                tcp_raw_fd, tcp_port, task.process_id.0,
+                "CONNECT: path={:?} sidecar_port={} tcp_raw_fd={} pid={}\n",
+                sock_path, tcp_port, tcp_raw_fd, task.process_id.0,
             );
-            if let Ok(f) = fs.open("/tmp/unix-tcp-connect-diag.log", OFlags::CREAT | OFlags::RDWR | OFlags::APPEND, Mode::RWXU) {
+            if let Ok(f) = fs.open("/tmp/unix-port-trace.log", OFlags::CREAT | OFlags::RDWR | OFlags::APPEND, Mode::RWXU) {
                 let _ = fs.write(&f, diag.as_bytes(), None);
                 let _ = fs.close(&f);
             }
@@ -1071,10 +1073,10 @@ impl<FS: ShimFS> UnixStream<FS> {
         // Write diagnostic AFTER connect.
         {
             let diag = alloc::format!(
-                "TRY_CONNECT_REMOTE RESULT: tcp_raw_fd={} tcp_port={} result={:?}\n",
-                tcp_raw_fd, tcp_port, connect_result,
+                "CONNECT RESULT: sidecar_port={} result={:?} pid={}\n",
+                tcp_port, connect_result, task.process_id.0,
             );
-            if let Ok(f) = fs.open("/tmp/unix-tcp-connect-diag.log", OFlags::CREAT | OFlags::RDWR | OFlags::APPEND, Mode::RWXU) {
+            if let Ok(f) = fs.open("/tmp/unix-port-trace.log", OFlags::CREAT | OFlags::RDWR | OFlags::APPEND, Mode::RWXU) {
                 let _ = fs.write(&f, diag.as_bytes(), None);
                 let _ = fs.close(&f);
             }
@@ -1164,13 +1166,20 @@ impl<FS: ShimFS> UnixStream<FS> {
                 // Then try to accept from the internal TCP listener (cross-worker)
                 // using the guest syscall path so TCP SYN packets reach the broker.
                 if let Some(task) = task {
-                    // Write diagnostic to verify this path runs.
+                    // Log the port being checked in accept.
                     self.with_state_ref(|state| {
                         if let Some(listen) = state.listen() {
-                            if let Some(raw_fd) = listen.tcp_raw_fd {
-                                if let UnixBoundSocketAddr::Path((_, _, ref fs)) = *listen.backlog.addr {
-                                    let _ = fs.open("/tmp/unix-accept-tried.flag", OFlags::CREAT | OFlags::RDWR, Mode::RWXU)
-                                        .map(|f| { let _ = fs.write(&f, b"1", Some(0)); let _ = fs.close(&f); });
+                            if let (Some(raw_fd), port) = (listen.tcp_raw_fd, listen.tcp_port) {
+                                if let UnixBoundSocketAddr::Path((ref path, _, ref fs)) = *listen.backlog.addr {
+                                    let actual_port = task.do_getsockname_inet_port(raw_fd);
+                                    let diag = alloc::format!(
+                                        "ACCEPT CHECK: path={} stored_port={} raw_fd={} actual_port={:?} pid={}\n",
+                                        path, port, raw_fd, actual_port, task.process_id.0,
+                                    );
+                                    if let Ok(f) = fs.open("/tmp/unix-port-trace.log", OFlags::CREAT | OFlags::RDWR | OFlags::APPEND, Mode::RWXU) {
+                                        let _ = fs.write(&f, diag.as_bytes(), None);
+                                        let _ = fs.close(&f);
+                                    }
                                 }
                             }
                         }
