@@ -489,6 +489,32 @@ pub(super) async fn unix_socket_tests(r: &mut TestRunner) {
         let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout.contains("US6R_SOCKETPAIR_FORK_READ_OK"));
         r.record(&test_name, agent, pass, &format!("{resp:?}"));
     }
+
+    // US6c: socketpair(AF_UNIX) + fork+exec — bidirectional IPC.
+    // Reproduces the exact VS Code extension host pattern:
+    //   parent: socketpair() → fork+exec(child) → write → read reply
+    //   child (exec'd): read from inherited fd → write reply → exit
+    // This is the critical test — the exec triggers SpawnRemote migration,
+    // and the inherited socketpair fd must survive the exec boundary.
+    let exec_agents = ["A", "AA", "B", "D3", "D4", "NP"];
+    for agent in &exec_agents {
+        let test_name = format!("US6.socketpair_exec.{agent}");
+        let resp = r
+            .send(
+                agent,
+                super::exec_timeout(
+                    vec![
+                        self_exe.clone(),
+                        "unix-socket-test".into(),
+                        "socketpair-exec".into(),
+                    ],
+                    20,
+                ),
+            )
+            .await;
+        let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout.contains("US6E_SOCKETPAIR_EXEC_OK"));
+        r.record(&test_name, agent, pass, &format!("{resp:?}"));
+    }
 }
 
 /// Node.js exit behavior tests.

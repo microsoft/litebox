@@ -3731,6 +3731,9 @@ mod unix_socket_tests {
             "socketpair-fork" => test_socketpair_fork_write(),
             "socketpair-fork-write" => test_socketpair_fork_write(),
             "socketpair-fork-read" => test_socketpair_fork_read(),
+            "socketpair-exec" => test_socketpair_exec(),
+            // Helper: child side of socketpair-exec (inherits fd from parent)
+            "socketpair-exec-child" => socketpair_exec_child(),
             // Called by the test harness binary after fork+exec for US2
             "us2-server" => us2_server(),
             other => {
@@ -4459,6 +4462,131 @@ mod unix_socket_tests {
         } else {
             println!("US6R_SOCKETPAIR_FORK_READ_FAIL:exit={exit_code}");
             1
+        }
+    }
+
+    /// US6c: socketpair(AF_UNIX) + fork+exec — bidirectional IPC.
+    /// Reproduces the exact VS Code extension host pattern:
+    ///   parent: socketpair() → fork+exec(child, inheriting fd) → write → read
+    ///   child (exec'd): read from inherited fd → write reply → exit
+    /// After exec, parent and child run concurrently in separate workers.
+    fn test_socketpair_exec() -> i32 {
+        let mut fds = [0i32; 2];
+        let rc = unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, fds.as_mut_ptr()) };
+        if rc != 0 {
+            println!("US6E_SOCKETPAIR_FAIL:{}", errno());
+            return 1;
+        }
+        let parent_fd = fds[0];
+        let child_fd = fds[1];
+        eprintln!("[US6c] socketpair ok: parent_fd={parent_fd}, child_fd={child_fd}");
+
+        // Clear CLOEXEC on child_fd so it survives exec.
+        unsafe { libc::fcntl(child_fd, libc::F_SETFD, 0) };
+
+        // Fork+exec a child that inherits child_fd.
+        let self_exe = std::env::current_exe().unwrap();
+        let child = std::process::Command::new(&self_exe)
+            .args([
+                "unix-socket-test",
+                "socketpair-exec-child",
+                &child_fd.to_string(),
+            ])
+            .spawn();
+
+        let Ok(mut child) = child else {
+            println!("US6E_SPAWN_FAIL");
+            return 1;
+        };
+
+        // Close child end in parent.
+        unsafe { libc::close(child_fd) };
+
+        // Parent writes to its end.
+        let msg = b"US6E_FROM_PARENT";
+        let n = unsafe {
+            libc::write(parent_fd, msg.as_ptr() as *const libc::c_void, msg.len())
+        };
+        if n != msg.len() as isize {
+            println!("US6E_WRITE_FAIL:n={n},errno={}", errno());
+            let _ = child.kill();
+            return 1;
+        }
+        eprintln!("[US6c-parent] wrote {n} bytes");
+
+        // Read reply from child.
+        let tv = libc::timeval { tv_sec: 10, tv_usec: 0 };
+        unsafe {
+            libc::setsockopt(
+                parent_fd,
+                libc::SOL_SOCKET,
+                libc::SO_RCVTIMEO,
+                &tv as *const _ as *const libc::c_void,
+                core::mem::size_of::<libc::timeval>() as libc::socklen_t,
+            );
+        }
+        let mut buf = [0u8; 64];
+        let n = unsafe {
+            libc::read(parent_fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len())
+        };
+        unsafe { libc::close(parent_fd) };
+
+        let status = child.wait().unwrap();
+        let exit_code = status.code().unwrap_or(99);
+
+        if n <= 0 {
+            println!("US6E_READ_FAIL:n={n},errno={},exit={exit_code}", errno());
+            return 1;
+        }
+        let reply = std::str::from_utf8(&buf[..n as usize]).unwrap_or("?");
+        eprintln!("[US6c-parent] got reply: {reply}");
+
+        if reply == "US6E_FROM_CHILD" && exit_code == 0 {
+            println!("US6E_SOCKETPAIR_EXEC_OK");
+            0
+        } else {
+            println!("US6E_SOCKETPAIR_EXEC_FAIL:reply={reply},exit={exit_code}");
+            1
+        }
+    }
+
+    /// Helper for US6c: exec'd child reads from inherited socketpair fd,
+    /// writes reply, exits.
+    fn socketpair_exec_child() -> i32 {
+        let fd: i32 = std::env::args().nth(3).and_then(|s| s.parse().ok()).unwrap_or(-1);
+        if fd < 0 {
+            eprintln!("[US6c-child] bad fd arg");
+            return 1;
+        }
+
+        let tv = libc::timeval { tv_sec: 5, tv_usec: 0 };
+        unsafe {
+            libc::setsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                libc::SO_RCVTIMEO,
+                &tv as *const _ as *const libc::c_void,
+                core::mem::size_of::<libc::timeval>() as libc::socklen_t,
+            );
+        }
+
+        let mut buf = [0u8; 64];
+        let n = unsafe { libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
+        if n <= 0 {
+            eprintln!("[US6c-child] read failed: n={n} errno={}", errno());
+            return 1;
+        }
+        let msg = std::str::from_utf8(&buf[..n as usize]).unwrap_or("?");
+        eprintln!("[US6c-child] got: {msg}");
+
+        let reply = b"US6E_FROM_CHILD";
+        let w = unsafe { libc::write(fd, reply.as_ptr() as *const libc::c_void, reply.len()) };
+        unsafe { libc::close(fd) };
+
+        if msg == "US6E_FROM_PARENT" && w == reply.len() as isize {
+            0
+        } else {
+            2
         }
     }
 
