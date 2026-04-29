@@ -152,10 +152,12 @@ async fn shell_pattern_tests(r: &mut TestRunner) {
 
 /// Binary type for direct exec tests.
 #[derive(Debug, Clone, Copy)]
+#[allow(dead_code)]
 enum ExecBinary {
     Node,
 }
 
+#[allow(dead_code)]
 impl ExecBinary {
     fn suffix(self) -> &'static str {
         match self {
@@ -728,5 +730,6 @@ pub(super) async fn run_fork_matrix_tests(r: &mut TestRunner) {
     stress_exec_matrix(r).await;
     contamination_pattern_tests(r).await;
 }
+
 
 

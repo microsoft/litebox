@@ -786,7 +786,7 @@ async fn agent_loop(self_exe: &str) {
             } => {
                 use tokio::io::{AsyncReadExt, AsyncWriteExt};
                 let mut handles = Vec::new();
-                for i in 0..count {
+                for _i in 0..count {
                     let addr = addr.clone();
                     let data = data.clone();
                     handles.push(tokio::spawn(async move {
@@ -1044,7 +1044,7 @@ async fn respond(resp: &Response) {
     let _ = stdout.flush().await;
 }
 
-async fn spawn_child(self_exe: &str, id: &str) -> Result<ChildHandle, String> {
+async fn spawn_child(self_exe: &str, _id: &str) -> Result<ChildHandle, String> {
     let mut child = tokio::process::Command::new(self_exe)
         .arg("agent")
         .stdin(std::process::Stdio::piped())

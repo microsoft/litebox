@@ -12,7 +12,7 @@
 //! The port router ownership fix (worker_id tracking) prevents a
 //! re-registering child from deregistering the parent's route on exit.
 
-use super::{TestRunner, exec, exec_timeout};
+use super::{TestRunner, exec};
 use crate::protocol::{Command, Response};
 
 // ═══════════════════════════════════════════════════════════════════

@@ -11,7 +11,7 @@
 //! - TF: full-duplex simultaneous read+write
 //! - TW: cross-worker concurrent TCP
 
-use super::{TestRunner, exec, exec_timeout};
+use super::{TestRunner, exec_timeout};
 use crate::protocol::{Command, Response};
 
 // ═══════════════════════════════════════════════════════════════════
