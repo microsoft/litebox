@@ -1168,21 +1168,43 @@ impl<FS: ShimFS> UnixStream<FS> {
                 let result = self.with_state_ref(|state| {
                     let listen = state.listen()?;
                     let tcp_fd = listen.tcp_fd.as_ref()?;
-                    let accepted = listen.global.try_accept(tcp_fd, None).ok()?;
-                    let proxy = listen.global.initialize_socket(
-                        &accepted,
-                        SockType::Stream,
-                        SockFlags::empty(),
-                    );
-                    Some(UnixConnectedStream {
-                        addr: AddrView {
-                            addr: Some(listen.backlog.addr.clone()),
-                            peer: None,
-                        },
-                        transport: UnixTransport::Tcp { proxy },
-                        peer_cred: listen.backlog.listener_cred,
-                        pollee: Arc::new(Pollee::new()),
-                    })
+                    match listen.global.try_accept(tcp_fd, None) {
+                        Ok(accepted) => {
+                            let proxy = listen.global.initialize_socket(
+                                &accepted,
+                                SockType::Stream,
+                                SockFlags::empty(),
+                            );
+                            Some(UnixConnectedStream {
+                                addr: AddrView {
+                                    addr: Some(listen.backlog.addr.clone()),
+                                    peer: None,
+                                },
+                                transport: UnixTransport::Tcp { proxy },
+                                peer_cred: listen.backlog.listener_cred,
+                                pollee: Arc::new(Pollee::new()),
+                            })
+                        }
+                        Err(ref e) => {
+                            // Write diagnostic to a file visible to the test.
+                            if let UnixBoundSocketAddr::Path((_, _, ref fs)) = *listen.backlog.addr {
+                                let diag_path = "/tmp/unix-tcp-accept-diag.log";
+                                if let Ok(f) = fs.open(
+                                    diag_path,
+                                    OFlags::CREAT | OFlags::RDWR | OFlags::APPEND,
+                                    Mode::RWXU,
+                                ) {
+                                    let msg = alloc::format!(
+                                        "ACCEPT FAIL: port={} err={:?}\n",
+                                        listen.tcp_port, e,
+                                    );
+                                    let _ = fs.write(&f, msg.as_bytes(), None);
+                                    let _ = fs.close(&f);
+                                }
+                            }
+                            None
+                        }
+                    }
                 });
 
                 if let Some(connected) = result {

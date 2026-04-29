@@ -1189,6 +1189,27 @@ async fn run_unix_tests(r: &mut TestRunner) {
                                 &format!("port={tcp_test_port} resp={resp:?}"),
                             );
                         }
+
+                        // Read the TCP accept diagnostic log.
+                        tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+                        let resp = r
+                            .send(
+                                "D3",
+                                Command::FsRead {
+                                    path: "/tmp/unix-tcp-accept-diag.log".to_string(),
+                                },
+                            )
+                            .await;
+                        let diag_content = match &resp {
+                            Response::Ok { data: Some(content) } => content.clone(),
+                            _ => "no diag file".to_string(),
+                        };
+                        r.record(
+                            "U.diag.accept_log",
+                            "D3",
+                            !diag_content.is_empty(),
+                            &format!("diag={diag_content:?}"),
+                        );
                     }
                 }
 
