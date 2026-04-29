@@ -31,8 +31,8 @@
 //!     -- /opt/litebox/litebox_test_harness spawn-tree
 //! ```
 //!
-//! Add `--filter=matrix` (or `special`, `proc`, `tcp`, etc.) to run a
-//! specific test suite.
+//! Add `--filter=<suite>` to run a specific test suite:
+//! `matrix`, `fork`, `shell`, `xworker`, `vscode`, `stress`, `contamination`.
 //!
 //! The coordinator prints a `[coord] runtime:` diagnostic at startup to
 //! make the environment visible. Running outside Docker or without
@@ -93,7 +93,7 @@ fn main() {
 
     match cmd {
         "spawn-tree" => {
-            // Optional: --filter=tcp to run only TCP stress tests.
+            // Optional: --filter=matrix to run only matrix tests.
             let filter = args.iter().find_map(|a| a.strip_prefix("--filter="));
             let results = coordinator::run_filtered(self_exe, filter);
             let pass_count = results.iter().filter(|r| r.outcome() == "pass").count();

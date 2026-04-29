@@ -462,74 +462,93 @@ async fn run_tests(self_exe: &str, filter: Option<&str>) -> Vec<TestResult> {
 
     let should_run = |suite: &str| filter.is_none() || filter == Some(suite);
 
-    // === Matrix Tests (capability × topology × dimensions) ===
+    // =================================================================
+    // MATRIX: Capability x topology cross-product tests
+    // FS CRUD, TCP, Unix sockets, exec, env, network addresses,
+    // symlinks, netlink, IPv6, terminal ioctl, filesystem I/O,
+    // syscall capabilities (poll, getsockname, epoll, pipe, proc, TCP).
+    // =================================================================
     if should_run("matrix") {
         eprintln!("[coord] === Matrix Tests ===");
         matrix::run_matrix_tests(&mut runner).await;
-    }
-
-    // === Fork Matrix Tests (shell patterns, exec binary/method, delayed fork, stress) ===
-    if should_run("fork") {
-        eprintln!("[coord] === Fork Matrix Tests ===");
-        fork_matrix::run_fork_matrix_tests(&mut runner).await;
-    }
-
-    // === Platform Fix Validation Tests ===
-    if should_run("platform") {
-        eprintln!("[coord] === Platform Fix Validation Tests ===");
-        platform_fixes::run(&mut runner).await;
-    }
-
-    // === Cross-worker first-connect tests ===
-    if should_run("xconn") {
-        eprintln!("[coord] === Cross-Worker First Connect Tests ===");
-        platform_fixes::cross_worker_first_connect_tests(&mut runner).await;
-        platform_fixes::cross_worker_self_connect_tests(&mut runner).await;
-    }
-
-    // === Fork-Listen-Close Tests (VS Code pattern) ===
-    if should_run("fklc") {
-        eprintln!("[coord] === Fork-Listen-Close Tests ===");
-        platform_fixes::fork_listen_close_tests(&mut runner).await;
-    }
-
-    // === Proc Filesystem Tests ===
-    if should_run("proc") {
-        eprintln!("[coord] === Proc Filesystem Tests ===");
+        special_cases::netlink_tests(&mut runner).await;
+        special_cases::net_ipv6_tests(&mut runner).await;
+        special_cases::terminal_ioctl_tests(&mut runner).await;
+        special_cases::fs_io_tests(&mut runner).await;
+        platform_fixes::poll_ready_tests(&mut runner).await;
+        platform_fixes::bind_getsockname_tests(&mut runner).await;
+        platform_fixes::pipe_pair_id_tests(&mut runner).await;
+        platform_fixes::pipe_nonblock_tests(&mut runner).await;
+        platform_fixes::epoll_socket_tests(&mut runner).await;
+        platform_fixes::loopback_tcp_tests(&mut runner).await;
         platform_fixes::proc_filesystem_tests(&mut runner).await;
     }
 
-    // === TCP Stress Tests ===
-    if should_run("tcp") {
-        eprintln!("[coord] === TCP Stress Tests ===");
+    // =================================================================
+    // FORK: Fork/exec patterns, delayed fork, PIE/non-PIE, pipes
+    // =================================================================
+    if should_run("fork") {
+        eprintln!("[coord] === Fork Tests ===");
+        fork_matrix::run_fork_matrix_tests(&mut runner).await;
+        platform_fixes::exit_data_integrity_tests(&mut runner).await;
+        platform_fixes::nonpie_pipe_chain_tests(&mut runner).await;
+        platform_fixes::bash_fork_exec_tests(&mut runner).await;
+        platform_fixes::concurrent_fork_tests(&mut runner).await;
+        platform_fixes::pid_visibility_tests(&mut runner).await;
+        special_cases::capture_pipe_tests(&mut runner).await;
+        special_cases::node_exit_tests(&mut runner).await;
+    }
+
+    // =================================================================
+    // SHELL: Bash-specific redirect, touch, stdin-pipe patterns
+    // =================================================================
+    if should_run("shell") {
+        eprintln!("[coord] === Shell Tests ===");
+        platform_fixes::stdin_pipe_subst_tests(&mut runner).await;
+        platform_fixes::subst_capture_tests(&mut runner).await;
+        platform_fixes::touch_redirect_tests(&mut runner).await;
+        platform_fixes::file_redirect_tests(&mut runner).await;
+        special_cases::stdin_script_tests(&mut runner).await;
+    }
+
+    // =================================================================
+    // XWORKER: Cross-worker FS, TCP, Unix sockets, port routing
+    // =================================================================
+    if should_run("xworker") {
+        eprintln!("[coord] === Cross-Worker Tests ===");
+        platform_fixes::cross_worker_first_connect_tests(&mut runner).await;
+        platform_fixes::cross_worker_self_connect_tests(&mut runner).await;
+        platform_fixes::cross_worker_file_tests(&mut runner).await;
+        platform_fixes::fork_listen_close_tests(&mut runner).await;
+        special_cases::unix_socket_tests(&mut runner).await;
+        special_cases::cross_worker_tests(&mut runner).await;
+    }
+
+    // =================================================================
+    // VSCODE: VS Code Server patterns (needs litebox-vscode image)
+    // =================================================================
+    if should_run("vscode") {
+        eprintln!("[coord] === VS Code Tests ===");
+        vscode::vscode_repro_tests(&mut runner).await;
+        vscode::vscode_bootstrap_replay(&mut runner).await;
+        platform_fixes::vscode_install_pattern_tests(&mut runner).await;
+    }
+
+    // =================================================================
+    // STRESS: TCP stress, port router, file+TCP combined (slow)
+    // =================================================================
+    if should_run("stress") {
+        eprintln!("[coord] === Stress Tests ===");
         tcp_stress::run(&mut runner).await;
-    }
-
-    // === File+TCP Combined Tests ===
-    if should_run("ft") {
-        eprintln!("[coord] === File+TCP Combined Tests ===");
         file_tcp::run(&mut runner).await;
-    }
-
-    // === Port Router Fork Tests ===
-    if should_run("pr") {
-        eprintln!("[coord] === Port Router Fork Tests ===");
         port_router::run(&mut runner).await;
     }
 
-    // === VS Code Reproduction Tests ===
-    if should_run("vscode") {
-        eprintln!("[coord] === VS Code Reproduction Tests ===");
-        vscode::vscode_repro_tests(&mut runner).await;
-
-        // === VS Code Bootstrap Replay ===
-        vscode::vscode_bootstrap_replay(&mut runner).await;
-    }
-
-    // === Contamination Sequence Tests (run LAST — depend on accumulated state) ===
+    // =================================================================
+    // CONTAMINATION: State accumulation tests (MUST run last)
+    // =================================================================
     if should_run("contamination") {
         eprintln!("[coord] === Contamination Sequence Tests ===");
-        // Canary: test that agent A can still exec.
         {
             let canary_cmd = crate::protocol::Command::Exec {
                 args: vec![runner.self_exe.clone(), "echo-test".into()],
@@ -542,35 +561,6 @@ async fn run_tests(self_exe: &str, filter: Option<&str>) -> Vec<TestResult> {
             runner.record("X_canary.pre_sequence", "A", pass, &format!("{resp:?}"));
         }
         special_cases::contamination_sequence_tests(&mut runner).await;
-    }
-
-    if should_run("special") || filter.is_none() {
-        // === Netlink / getifaddrs Tests ===
-        special_cases::netlink_tests(&mut runner).await;
-
-        // === IPv6 Network Tests ===
-        special_cases::net_ipv6_tests(&mut runner).await;
-
-        // === Unix Socket Tests ===
-        special_cases::unix_socket_tests(&mut runner).await;
-
-        // === Node.js Exit Tests ===
-        special_cases::node_exit_tests(&mut runner).await;
-
-        // === Terminal Ioctl Matrix ===
-        special_cases::terminal_ioctl_tests(&mut runner).await;
-
-        // === Filesystem I/O Matrix ===
-        special_cases::fs_io_tests(&mut runner).await;
-
-        // === Stdin-Piped Script Tests ===
-        special_cases::stdin_script_tests(&mut runner).await;
-
-        // === Capture-Pipe Fork Tests ===
-        special_cases::capture_pipe_tests(&mut runner).await;
-
-        // === Cross-Worker Tests ===
-        special_cases::cross_worker_tests(&mut runner).await;
     }
 
     // Shutdown all children.
