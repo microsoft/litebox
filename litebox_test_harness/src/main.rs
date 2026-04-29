@@ -3681,7 +3681,9 @@ mod unix_socket_tests {
             "abstract" => test_abstract_socket(),
             "race" => test_socket_race(),
             "mac" => test_mac_address(),
-            "socketpair-fork" => test_socketpair_fork(),
+            "socketpair-fork" => test_socketpair_fork_write(),
+            "socketpair-fork-write" => test_socketpair_fork_write(),
+            "socketpair-fork-read" => test_socketpair_fork_read(),
             // Called by the test harness binary after fork+exec for US2
             "us2-server" => us2_server(),
             other => {
@@ -4266,15 +4268,12 @@ mod unix_socket_tests {
         }
     }
 
-    /// US6: socketpair(AF_UNIX) + fork — child writes to inherited fd.
-    /// Reproduces the VS Code extension host IPC pattern:
-    ///   parent: socketpair() → fork() → read from parent_end
-    ///   child:  write "HELLO" to child_end → exit
-    /// This tests that unix socket fds survive fork (including SpawnRemote
-    /// delayed-fork) and remain writable in the child. Uses vfork-compatible
-    /// sequencing: child writes + exits before parent reads.
-    fn test_socketpair_fork() -> i32 {
-        // Create a connected unix socketpair.
+    /// US6a: socketpair(AF_UNIX) + fork — child WRITES to inherited fd.
+    /// Reproduces the VS Code extension host IPC pattern (child→parent):
+    ///   parent: socketpair() → fork() → waitpid → read from parent_end
+    ///   child:  write to child_end → exit
+    /// Uses vfork-compatible sequencing: child writes + exits before parent reads.
+    fn test_socketpair_fork_write() -> i32 {
         let mut fds = [0i32; 2];
         let rc = unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, fds.as_mut_ptr()) };
         if rc != 0 {
@@ -4283,7 +4282,7 @@ mod unix_socket_tests {
         }
         let parent_fd = fds[0];
         let child_fd = fds[1];
-        eprintln!("[US6] socketpair ok: parent_fd={parent_fd}, child_fd={child_fd}");
+        eprintln!("[US6a] socketpair ok: parent_fd={parent_fd}, child_fd={child_fd}");
 
         let pid = unsafe { libc::fork() };
         if pid < 0 {
@@ -4292,33 +4291,24 @@ mod unix_socket_tests {
         }
 
         if pid == 0 {
-            // Child: close parent end, write to child end, exit.
-            // (vfork-compatible: no blocking reads before exit)
             unsafe { libc::close(parent_fd) };
             let msg = b"US6_FROM_CHILD";
             let n = unsafe {
                 libc::write(child_fd, msg.as_ptr() as *const libc::c_void, msg.len())
             };
             if n != msg.len() as isize {
-                eprintln!("[US6-child] write failed: n={n} errno={}", errno());
+                eprintln!("[US6a-child] write failed: n={n} errno={}", errno());
                 std::process::exit(1);
             }
-            eprintln!("[US6-child] wrote {n} bytes");
+            eprintln!("[US6a-child] wrote {n} bytes");
             unsafe { libc::close(child_fd) };
             std::process::exit(0);
         }
 
-        // Parent: close child end, wait for child, then read from parent end.
         unsafe { libc::close(child_fd) };
-
-        // Wait for child to finish (vfork: parent resumes after child exit/exec).
         let mut status = 0i32;
         unsafe { libc::waitpid(pid, &mut status, 0) };
-        let exit_code = if libc::WIFEXITED(status) {
-            libc::WEXITSTATUS(status)
-        } else {
-            99
-        };
+        let exit_code = if libc::WIFEXITED(status) { libc::WEXITSTATUS(status) } else { 99 };
 
         if exit_code != 0 {
             println!("US6_CHILD_FAIL:exit={exit_code}");
@@ -4326,7 +4316,6 @@ mod unix_socket_tests {
             return 1;
         }
 
-        // Read data the child wrote.
         let mut buf = [0u8; 64];
         let n = unsafe {
             libc::read(parent_fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len())
@@ -4338,13 +4327,91 @@ mod unix_socket_tests {
             return 1;
         }
         let msg = std::str::from_utf8(&buf[..n as usize]).unwrap_or("?");
-        eprintln!("[US6-parent] got: {msg}");
+        eprintln!("[US6a-parent] got: {msg}");
 
         if msg == "US6_FROM_CHILD" {
             println!("US6_SOCKETPAIR_FORK_OK");
             0
         } else {
             println!("US6_SOCKETPAIR_FORK_FAIL:msg={msg}");
+            1
+        }
+    }
+
+    /// US6b: socketpair(AF_UNIX) + fork — child READS from inherited fd.
+    /// Tests the reverse direction (parent→child):
+    ///   parent: socketpair() → fork() → write to parent_end → waitpid
+    ///   child:  read from child_end → exit(based on data)
+    /// Uses vfork-compatible sequencing: parent writes after fork returns
+    /// (vfork resumes parent after child blocks on read or execs).
+    fn test_socketpair_fork_read() -> i32 {
+        let mut fds = [0i32; 2];
+        let rc = unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, fds.as_mut_ptr()) };
+        if rc != 0 {
+            println!("US6R_SOCKETPAIR_FAIL:{}", errno());
+            return 1;
+        }
+        let parent_fd = fds[0];
+        let child_fd = fds[1];
+        eprintln!("[US6b] socketpair ok: parent_fd={parent_fd}, child_fd={child_fd}");
+
+        let pid = unsafe { libc::fork() };
+        if pid < 0 {
+            println!("US6R_FORK_FAIL:{}", errno());
+            return 1;
+        }
+
+        if pid == 0 {
+            // Child: close parent end, read from child end, exit.
+            unsafe { libc::close(parent_fd) };
+            // Set a 5-second read timeout to avoid hanging forever.
+            let tv = libc::timeval { tv_sec: 5, tv_usec: 0 };
+            unsafe {
+                libc::setsockopt(
+                    child_fd,
+                    libc::SOL_SOCKET,
+                    libc::SO_RCVTIMEO,
+                    &tv as *const _ as *const libc::c_void,
+                    core::mem::size_of::<libc::timeval>() as libc::socklen_t,
+                );
+            }
+            let mut buf = [0u8; 64];
+            let n = unsafe {
+                libc::read(child_fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len())
+            };
+            if n <= 0 {
+                eprintln!("[US6b-child] read failed: n={n} errno={}", errno());
+                std::process::exit(1);
+            }
+            let msg = std::str::from_utf8(&buf[..n as usize]).unwrap_or("?");
+            eprintln!("[US6b-child] got: {msg}");
+            std::process::exit(if msg == "US6_FROM_PARENT" { 0 } else { 2 });
+        }
+
+        // Parent: close child end, write to parent end, waitpid.
+        unsafe { libc::close(child_fd) };
+        let msg = b"US6_FROM_PARENT";
+        let n = unsafe {
+            libc::write(parent_fd, msg.as_ptr() as *const libc::c_void, msg.len())
+        };
+        unsafe { libc::close(parent_fd) };
+
+        if n != msg.len() as isize {
+            println!("US6R_WRITE_FAIL:n={n},errno={}", errno());
+            unsafe { libc::kill(pid, libc::SIGKILL) };
+            return 1;
+        }
+        eprintln!("[US6b-parent] wrote {n} bytes");
+
+        let mut status = 0i32;
+        unsafe { libc::waitpid(pid, &mut status, 0) };
+        let exit_code = if libc::WIFEXITED(status) { libc::WEXITSTATUS(status) } else { 99 };
+
+        if exit_code == 0 {
+            println!("US6R_SOCKETPAIR_FORK_READ_OK");
+            0
+        } else {
+            println!("US6R_SOCKETPAIR_FORK_READ_FAIL:exit={exit_code}");
             1
         }
     }

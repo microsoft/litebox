@@ -406,14 +406,15 @@ pub(super) async fn unix_socket_tests(r: &mut TestRunner) {
         r.record(&test_name, agent, pass, &format!("{resp:?}"));
     }
 
-    // US6: socketpair(AF_UNIX) + fork — child writes to inherited fd.
-    // Reproduces the VS Code extension host IPC pattern where a forked
-    // child inherits one end of a socketpair and uses it for bidirectional
-    // communication. Runs across all agent topologies to catch SpawnRemote
-    // snapshot issues where unix socket fds fail to transfer.
+    // US6: socketpair(AF_UNIX) + fork — tests both directions.
+    // US6a (write): child writes to inherited fd, parent reads after waitpid.
+    // US6b (read): parent writes, child reads from inherited fd.
+    // Runs across all agent topologies to catch SpawnRemote snapshot issues
+    // where unix socket fds fail to transfer.
     let socketpair_agents = ["A", "AA", "B", "D3", "D4", "NP"];
     for agent in &socketpair_agents {
-        let test_name = format!("US6.socketpair_fork.{agent}");
+        // child→parent (write direction)
+        let test_name = format!("US6.socketpair_write.{agent}");
         let resp = r
             .send(
                 agent,
@@ -421,13 +422,31 @@ pub(super) async fn unix_socket_tests(r: &mut TestRunner) {
                     vec![
                         self_exe.clone(),
                         "unix-socket-test".into(),
-                        "socketpair-fork".into(),
+                        "socketpair-fork-write".into(),
                     ],
                     15,
                 ),
             )
             .await;
         let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout.contains("US6_SOCKETPAIR_FORK_OK"));
+        r.record(&test_name, agent, pass, &format!("{resp:?}"));
+
+        // parent→child (read direction)
+        let test_name = format!("US6.socketpair_read.{agent}");
+        let resp = r
+            .send(
+                agent,
+                super::exec_timeout(
+                    vec![
+                        self_exe.clone(),
+                        "unix-socket-test".into(),
+                        "socketpair-fork-read".into(),
+                    ],
+                    15,
+                ),
+            )
+            .await;
+        let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout.contains("US6R_SOCKETPAIR_FORK_READ_OK"));
         r.record(&test_name, agent, pass, &format!("{resp:?}"));
     }
 }
