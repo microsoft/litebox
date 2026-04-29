@@ -1337,7 +1337,17 @@ impl<FS: ShimFS> UnixStream<FS> {
             UnixStreamState::Init(init) => init.pollee.register_observer(observer, mask),
             UnixStreamState::Listen(listen) => listen.register_observer(observer, mask),
             UnixStreamState::Connected(connect) => {
-                connect.pollee.register_observer(observer, mask);
+                match &connect.transport {
+                    UnixTransport::Tcp { proxy } => {
+                        // For TCP-backed connections, register on the TCP proxy's
+                        // pollee so we get woken when data arrives from smoltcp.
+                        use litebox::event::IOPollable;
+                        proxy.register_observer(observer, mask);
+                    }
+                    UnixTransport::Channel { .. } => {
+                        connect.pollee.register_observer(observer, mask);
+                    }
+                }
             }
         });
     }
