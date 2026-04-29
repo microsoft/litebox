@@ -979,6 +979,18 @@ fn run_inner(
                 let dest_ipv4 = Ipv4Addr::from(dst_ip);
                 let flow_key = (src_ip, src_port, dst_ip, dst_port);
 
+                // Diagnostic: log ALL SYN dispatches for ephemeral ports.
+                if dst_port >= 49000 {
+                    use std::io::Write;
+                    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/rst-diag.log") {
+                        let is_local_svc = dest_ipv4 == BROKER_IPV4 && local_services.get(dst_port).is_some();
+                        let is_pending = pending_connects.iter().any(|pc| pc.flow_key == flow_key);
+                        let is_ready = ready_host_streams.contains_key(&flow_key);
+                        let has_route = port_router.has_route(dst_port);
+                        let _ = writeln!(f, "SYN DISPATCH: dst_port={dst_port} dest={dest_ipv4} worker={worker_id} local_svc={is_local_svc} pending={is_pending} ready={is_ready} route={has_route}");
+                    }
+                }
+
                 if dest_ipv4 == BROKER_IPV4 && local_services.get(dst_port).is_some() {
                     // Local service — no host connect needed. Create a listen
                     // socket immediately and let the SYN through to smoltcp.
