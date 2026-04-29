@@ -2053,9 +2053,7 @@ impl<FS: ShimFS> Task<FS> {
                         netlink_sockets: core::cell::RefCell::new(
                             alloc::collections::BTreeMap::new(),
                         ),
-                        inet6_fds: core::cell::RefCell::new(
-                            alloc::collections::BTreeSet::new(),
-                        ),
+                        inet6_fds: core::cell::RefCell::new(alloc::collections::BTreeSet::new()),
                     },
                 }),
             )
@@ -2799,9 +2797,7 @@ impl<FS: ShimFS> Task<FS> {
                         netlink_sockets: core::cell::RefCell::new(
                             alloc::collections::BTreeMap::new(),
                         ),
-                        inet6_fds: core::cell::RefCell::new(
-                            alloc::collections::BTreeSet::new(),
-                        ),
+                        inet6_fds: core::cell::RefCell::new(alloc::collections::BTreeSet::new()),
                     },
                 }),
             )
@@ -2968,6 +2964,9 @@ impl<FS: ShimFS> Task<FS> {
                     let (parent_pipe_fd, relay_pipe_fd) = match repl.direction {
                         HostPipeDirection::Read => (receiver, sender),
                         HostPipeDirection::Write => (sender, receiver),
+                        HostPipeDirection::ReadWrite => {
+                            unreachable!("bidi sockets use passthrough")
+                        }
                     };
 
                     // Consume the old virtual fd and install the virtual pipe
@@ -3080,6 +3079,9 @@ impl<FS: ShimFS> Task<FS> {
                                 // EOF by closing the OS pipe.
                                 platform.close_host_fd(host_fd);
                                 let _ = pipes.close(&relay_pipe_fd);
+                            }
+                            HostPipeDirection::ReadWrite => {
+                                unreachable!("bidi sockets use passthrough")
                             }
                         }
                     });
@@ -3255,6 +3257,7 @@ impl<FS: ShimFS> Task<FS> {
                         let dir_byte = match ms.direction {
                             HostPipeDirection::Read => b'r',
                             HostPipeDirection::Write => b'w',
+                            HostPipeDirection::ReadWrite => b'b',
                         };
 
                         if ms.use_existing_pipe {
@@ -3333,6 +3336,9 @@ impl<FS: ShimFS> Task<FS> {
                         let (parent_pipe_fd, dispatch_pipe_fd) = match ms.direction {
                             HostPipeDirection::Read => (receiver, sender),
                             HostPipeDirection::Write => (sender, receiver),
+                            HostPipeDirection::ReadWrite => {
+                                unreachable!("bidi sockets use passthrough")
+                            }
                         };
 
                         // Clear NON_BLOCKING on the guest end so guest
@@ -3422,6 +3428,9 @@ impl<FS: ShimFS> Task<FS> {
                                             platform.close_host_fd(host_fd);
                                         }
                                         let _ = pipes_clone.close(&relay_fd);
+                                    }
+                                    HostPipeDirection::ReadWrite => {
+                                        unreachable!("bidi sockets use passthrough")
                                     }
                                 }
                             });
@@ -3591,6 +3600,9 @@ impl<FS: ShimFS> Task<FS> {
                                             }
                                         }
                                         let _ = pipes_clone.close(&relay_fd);
+                                    }
+                                    HostPipeDirection::ReadWrite => {
+                                        unreachable!("bidi sockets use passthrough")
                                     }
                                 }
                             });
@@ -4369,6 +4381,10 @@ impl<FS: ShimFS> Task<FS> {
         // Dup'd pipe aliases: (alias_fd, primary_bridge_index).
         // The worker dups the primary stream's pipe end to alias_fd.
         let mut mux_aliases: Vec<(usize, usize)> = Vec::new();
+        // Bidirectional unix sockets bypass the mux — they use a direct OS
+        // socketpair passthrough with a relay thread.
+        // Collect (guest_fd, child_os_fd, parent_os_fd) here.
+        let mut bidi_passthrough: Vec<(usize, i32, i32)> = Vec::new();
         {
             use super::host_pipe::HostPipeDirection;
 
@@ -4673,6 +4689,7 @@ impl<FS: ShimFS> Task<FS> {
                 let (child_os_fd, parent_os_fd) = match child_dir {
                     HostPipeDirection::Read => (os_read, os_write),
                     HostPipeDirection::Write => (os_write, os_read),
+                    HostPipeDirection::ReadWrite => unreachable!("bidi sockets use passthrough"),
                 };
 
                 // For Read-direction children: drain any data already buffered
@@ -4805,6 +4822,7 @@ impl<FS: ShimFS> Task<FS> {
                 let flow_dir = match child_dir {
                     HostPipeDirection::Read => HostPipeDirection::Write,
                     HostPipeDirection::Write => HostPipeDirection::Read,
+                    HostPipeDirection::ReadWrite => unreachable!("bidi sockets use passthrough"),
                 };
                 // Strategy 1.5: pair_id + SAME direction.  Handles
                 // inherited/dup2'd pipe ends where the child got a copy of the
@@ -5001,8 +5019,12 @@ impl<FS: ShimFS> Task<FS> {
                         if let Some(pair_id) = pair_id {
                             let direction = if *raw_fd == 0 {
                                 HostPipeDirection::Read
-                            } else {
+                            } else if *raw_fd <= 2 {
                                 HostPipeDirection::Write
+                            } else {
+                                // Non-stdio unix sockets need bidirectional
+                                // bridging (e.g. Node.js IPC on fd 3).
+                                HostPipeDirection::ReadWrite
                             };
                             child_sockets.push(ChildSocketInfo {
                                 child_fd: *raw_fd,
@@ -5052,6 +5074,27 @@ impl<FS: ShimFS> Task<FS> {
                 let mut bridged_objects: Vec<(u64, HostPipeDirection, usize)> = Vec::new();
 
                 for info in &child_sockets {
+                    // Bidirectional sockets: create OS socketpair, pass
+                    // child end as a passthrough fd (bypasses mux).
+                    if info.direction == HostPipeDirection::ReadWrite {
+                        match self.global.platform.create_host_socketpair() {
+                            Ok((child_end, parent_end)) => {
+                                bidi_passthrough.push((info.child_fd, child_end, parent_end));
+                            }
+                            Err(_e) => {
+                                #[cfg(feature = "trace_syscalls")]
+                                litebox::log_println!(
+                                    self.global.platform,
+                                    "[DELAYED-FORK] pid={}: create_host_socketpair failed for bidi socket bridge fd={}: {}",
+                                    self.pid,
+                                    info.child_fd,
+                                    _e,
+                                );
+                            }
+                        }
+                        continue;
+                    }
+
                     // Dedup: if same object_id already bridged with same
                     // direction, record as alias (same stream_id) instead
                     // of creating a separate bridge.
@@ -5063,7 +5106,7 @@ impl<FS: ShimFS> Task<FS> {
                         continue;
                     }
 
-                    // Create OS pipe pair.
+                    // Create OS pipe pair for unidirectional bridges.
                     let (os_read, os_write) = match self.global.platform.create_host_pipe() {
                         Ok(pair) => pair,
                         Err(_e) => {
@@ -5092,6 +5135,7 @@ impl<FS: ShimFS> Task<FS> {
                     let (child_os_fd, parent_os_fd) = match info.direction {
                         HostPipeDirection::Read => (os_read, os_write),
                         HostPipeDirection::Write => (os_write, os_read),
+                        HostPipeDirection::ReadWrite => unreachable!("handled above"),
                     };
 
                     // G4: Drain recv_channel into OS pipe for Read direction.
@@ -5218,6 +5262,7 @@ impl<FS: ShimFS> Task<FS> {
                     let parent_dir = match info.direction {
                         HostPipeDirection::Read => HostPipeDirection::Write,
                         HostPipeDirection::Write => HostPipeDirection::Read,
+                        HostPipeDirection::ReadWrite => unreachable!("handled above"),
                     };
 
                     let mut this_parent_info: Vec<(
@@ -5362,6 +5407,9 @@ impl<FS: ShimFS> Task<FS> {
                     let (child_os_fd, parent_os_fd) = match direction {
                         HostPipeDirection::Read => (read_fd, write_fd),
                         HostPipeDirection::Write => (write_fd, read_fd),
+                        HostPipeDirection::ReadWrite => {
+                            unreachable!("bidi sockets use passthrough")
+                        }
                     };
 
                     // Close the parent OS fd — the mux replaces per-fd relay.
@@ -5467,6 +5515,9 @@ impl<FS: ShimFS> Task<FS> {
                     let (child_os_fd, parent_os_fd) = match direction {
                         HostPipeDirection::Read => (read_fd, write_fd),
                         HostPipeDirection::Write => (write_fd, read_fd),
+                        HostPipeDirection::ReadWrite => {
+                            unreachable!("bidi sockets use passthrough")
+                        }
                     };
 
                     // Close the parent OS fd — the mux host_pipe_fd relay
@@ -5547,6 +5598,7 @@ impl<FS: ShimFS> Task<FS> {
                     let dir_byte = match direction {
                         HostPipeDirection::Read => b'r',
                         HostPipeDirection::Write => b'w',
+                        HostPipeDirection::ReadWrite => unreachable!("bidi sockets bypass mux"),
                     };
                     let type_byte = if bridge_pty_pair.get(i).is_some_and(Option::is_some) {
                         b't' // PTY-backed stream
@@ -5654,6 +5706,9 @@ impl<FS: ShimFS> Task<FS> {
                         let parent_dir = match direction {
                             HostPipeDirection::Read => HostPipeDirection::Write,
                             HostPipeDirection::Write => HostPipeDirection::Read,
+                            HostPipeDirection::ReadWrite => {
+                                unreachable!("bidi sockets use passthrough")
+                            }
                         };
                         mux_parent_streams.push(crate::MuxParentStream {
                             stream_id,
@@ -5735,6 +5790,9 @@ impl<FS: ShimFS> Task<FS> {
                                 let parent_dir = match direction {
                                     HostPipeDirection::Read => HostPipeDirection::Write,
                                     HostPipeDirection::Write => HostPipeDirection::Read,
+                                    HostPipeDirection::ReadWrite => {
+                                        unreachable!("bidi sockets use passthrough")
+                                    }
                                 };
                                 #[cfg(feature = "trace_syscalls")]
                                 litebox::log_println!(
@@ -5832,6 +5890,7 @@ impl<FS: ShimFS> Task<FS> {
                     let dir_byte = match direction {
                         HostPipeDirection::Read => b'r',
                         HostPipeDirection::Write => b'w',
+                        HostPipeDirection::ReadWrite => b'b',
                     };
                     mux_stream_specs.push((stream_id, alias_fd, dir_byte, b'p', false));
                 }
@@ -5931,12 +5990,17 @@ impl<FS: ShimFS> Task<FS> {
         };
 
         // Spawn the child worker host.
+        // Build passthrough fds for bidirectional unix socket bridges.
+        let bidi_pt: Vec<(usize, i32, u8)> = bidi_passthrough
+            .iter()
+            .map(|&(guest_fd, child_fd, _)| (guest_fd, child_fd, b'b'))
+            .collect();
         let host_pid = match self.global.platform.spawn_worker_host_for_fork_restore(
             &snapshot_bytes,
             stdio,
             mux_fd_opt,
             &mux_stream_specs,
-            &[],
+            &bidi_pt,
             &local_pipe_pairs,
         ) {
             Ok(pid) => pid,
@@ -5975,6 +6039,86 @@ impl<FS: ShimFS> Task<FS> {
             self.pid,
             host_pid,
         );
+
+        // Close child ends of bidirectional socketpair bridges and
+        // set up parent-side fd replacements so the parent's reads/writes
+        // go through the OS socketpair to the child worker.
+        for &(guest_fd, child_fd, parent_fd) in &bidi_passthrough {
+            self.global.platform.close_host_fd(child_fd);
+            // Find the parent's peer unix socket fd for this guest_fd.
+            // The parent's peer has the OTHER object_id from the same
+            // pair_id. We need to find which parent fd to replace.
+            // For the simple case (socketpair fd 3/4), the parent holds
+            // the peer end. Replace it with a HostPipeFd backed by the
+            // OS socketpair parent end.
+            let files = self.files.borrow();
+            let rds = files.raw_descriptor_store.read();
+            // Find parent unix socket fds with matching pair_id.
+            let dt = self.global.litebox.descriptor_table();
+            let mut parent_fds_to_replace: Vec<usize> = Vec::new();
+            // Look for the peer socket (same pair_id, different object_id).
+            if let Ok(child_typed) =
+                rds.fd_from_raw_integer::<super::unix::UnixSocketSubsystem<FS>>(guest_fd)
+            {
+                let child_pair = dt
+                    .with_entry(&child_typed, |sock: &super::unix::UnixSocket<FS>| {
+                        sock.socket_pair_id()
+                    })
+                    .flatten();
+                if let Some(child_pair_id) = child_pair {
+                    let child_oid = child_typed.object_id().as_u64();
+                    for raw_fd in rds.iter_alive() {
+                        if raw_fd == guest_fd {
+                            continue;
+                        }
+                        if let Ok(typed) =
+                            rds.fd_from_raw_integer::<super::unix::UnixSocketSubsystem<FS>>(raw_fd)
+                        {
+                            let pair_id = dt
+                                .with_entry(&typed, |sock: &super::unix::UnixSocket<FS>| {
+                                    sock.socket_pair_id()
+                                })
+                                .flatten();
+                            if pair_id == Some(child_pair_id)
+                                && typed.object_id().as_u64() != child_oid
+                            {
+                                parent_fds_to_replace.push(raw_fd);
+                            }
+                        }
+                    }
+                }
+            }
+            drop(dt);
+            drop(rds);
+            drop(files);
+
+            // Replace the parent's peer fd with a HostPipeFd backed by
+            // the OS socketpair's parent end.
+            for peer_fd in &parent_fds_to_replace {
+                let entry = super::host_pipe::HostPipeFd::new(
+                    parent_fd,
+                    super::host_pipe::HostPipeDirection::ReadWrite,
+                );
+                let typed_fd: litebox::fd::TypedFd<super::host_pipe::HostPipeSubsystem> =
+                    self.global.litebox.descriptor_table_mut().insert(entry);
+
+                let files = self.files.borrow();
+                let mut rds = files.raw_descriptor_store.write();
+                // Remove old unix socket at this slot.
+                if let Ok(old_sock) =
+                    rds.fd_consume_raw_integer::<super::unix::UnixSocketSubsystem<FS>>(*peer_fd)
+                {
+                    drop(rds);
+                    let _ = self.global.litebox.descriptor_table_mut().remove(&old_sock);
+                    rds = files.raw_descriptor_store.write();
+                }
+                let _ = rds.fd_into_specific_raw_integer(typed_fd, *peer_fd);
+            }
+            if parent_fds_to_replace.is_empty() {
+                // No peer found — just close the parent OS fd.
+                self.global.platform.close_host_fd(parent_fd);
+            }
+        }
 
         // Migrate: unregister from local control plane, re-register as remote.
         let local_host = self.global.control_plane.local_host();

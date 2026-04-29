@@ -3074,6 +3074,9 @@ fn descriptor_stat<FS: ShimFS>(raw_fd: usize, task: &Task<FS>) -> Result<FileSta
         let read_write_mode = match dir {
             super::host_pipe::HostPipeDirection::Read => Mode::RUSR,
             super::host_pipe::HostPipeDirection::Write => Mode::WUSR,
+            super::host_pipe::HostPipeDirection::ReadWrite => {
+                Mode::from_bits_truncate(Mode::RUSR.bits() | Mode::WUSR.bits())
+            }
         };
         return Ok(FileStat {
             st_dev: PIPEFS_DEV.truncate(),
