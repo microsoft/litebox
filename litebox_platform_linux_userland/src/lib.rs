@@ -1302,21 +1302,22 @@ impl LinuxUserland {
             spawn_argv.push(CString::new("--env").unwrap());
             spawn_argv.push(env_entry.clone());
         }
-        spawn_argv.push(CString::new("--").unwrap());
-        // Forward the full original guest argv (argv[0] may differ from
-        // guest_binary_path for symlinks/busybox-style applets).
-        spawn_argv.push(CString::new(guest_binary_path).map_err(|_| -1_i32)?);
-        for arg in argv {
-            spawn_argv.push(arg.clone());
-        }
-
         // Add --pipe-bridge for extra inherited fds (e.g. socketpair IPC).
+        // Must be BEFORE the -- separator so they're parsed as runner args.
         for &(guest_fd, host_fd) in &safe_extra_fds {
             let _ = self.clear_cloexec(host_fd);
             spawn_argv.push(CString::new("--pipe-bridge").unwrap());
             spawn_argv.push(
                 CString::new(format!("{guest_fd}:b:{host_fd}")).map_err(|_| -1_i32)?,
             );
+        }
+
+        spawn_argv.push(CString::new("--").unwrap());
+        // Forward the full original guest argv (argv[0] may differ from
+        // guest_binary_path for symlinks/busybox-style applets).
+        spawn_argv.push(CString::new(guest_binary_path).map_err(|_| -1_i32)?);
+        for arg in argv {
+            spawn_argv.push(arg.clone());
         }
 
         let argv_ptrs: Vec<*const libc::c_char> = spawn_argv
@@ -1475,6 +1476,21 @@ impl LinuxUserland {
             worker_output_write_fds.push(write_fd);
             let first_target_fd = group.target_fds[0];
             output_bridges.push((group.sink, read_fd, first_target_fd));
+        }
+
+        // Map extra fds (socketpair bridges) to their guest fd numbers
+        // at the kernel level via dup2 file actions.
+        for &(guest_fd, host_fd) in &safe_extra_fds {
+            if unsafe {
+                libc::posix_spawn_file_actions_adddup2(
+                    file_actions_ptr,
+                    host_fd,
+                    guest_fd as i32,
+                )
+            } != 0
+            {
+                return Err(-1_i32);
+            }
         }
 
         // The worker inherits the current host environment.

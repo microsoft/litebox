@@ -791,17 +791,33 @@ fn finish_run_with_nine_p<FS: litebox_shim_linux::ShimFS>(
 
         // Install pipe bridges for inherited non-stdio fds (e.g. socketpair IPC).
         let pipe_bridges = parse_pipe_bridge_specs(&cli_args.pipe_bridge)?;
-        for bridge in &pipe_bridges {
-            let direction = match bridge.direction {
-                b'r' => litebox_shim_linux::syscalls::host_pipe::HostPipeDirection::Read,
-                b'b' => litebox_shim_linux::syscalls::host_pipe::HostPipeDirection::ReadWrite,
-                _ => litebox_shim_linux::syscalls::host_pipe::HostPipeDirection::Write,
-            };
-            program.entrypoints.install_host_pipe_fd(
-                bridge.guest_fd,
-                bridge.host_fd,
-                direction,
-            );
+        if !pipe_bridges.is_empty() {
+            use std::io::Write;
+            let mut diag = std::fs::OpenOptions::new()
+                .create(true).append(true)
+                .open("/tmp/rst-diag.log")
+                .ok();
+            if let Some(f) = diag.as_mut() {
+                let _ = writeln!(f, "[pipe-bridge-9p] pid={} installing {} bridges",
+                    std::process::id(), pipe_bridges.len());
+            }
+            for bridge in &pipe_bridges {
+                let fd_valid = unsafe { libc::fcntl(bridge.host_fd, libc::F_GETFD) } >= 0;
+                if let Some(f) = diag.as_mut() {
+                    let _ = writeln!(f, "[pipe-bridge-9p] guest_fd={} host_fd={} dir={} valid={}",
+                        bridge.guest_fd, bridge.host_fd, bridge.direction as char, fd_valid);
+                }
+                let direction = match bridge.direction {
+                    b'r' => litebox_shim_linux::syscalls::host_pipe::HostPipeDirection::Read,
+                    b'b' => litebox_shim_linux::syscalls::host_pipe::HostPipeDirection::ReadWrite,
+                    _ => litebox_shim_linux::syscalls::host_pipe::HostPipeDirection::Write,
+                };
+                program.entrypoints.install_host_pipe_fd(
+                    bridge.guest_fd,
+                    bridge.host_fd,
+                    direction,
+                );
+            }
         }
 
         run_program(program, shutdown, net_worker, worker_result_fd, None);
