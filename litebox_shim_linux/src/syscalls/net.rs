@@ -683,11 +683,13 @@ impl<FS: ShimFS> GlobalState<FS> {
         fd: &SocketFd,
         peer: Option<&mut SocketAddr>,
     ) -> Result<SocketFd, TryOpError<Errno>> {
-        // Don't call perform_platform_interaction() here — it holds the
-        // net mutex and prevents the network thread from processing packets.
-        // The network thread drives smoltcp continuously and will fire the
-        // observer when the TCP handshake completes.
-        self.net.lock().accept(fd, peer).map_err(|e| match e {
+        // Drive smoltcp explicitly — platform_interaction is Manual, so
+        // automated_platform_interaction inside accept() is a no-op.
+        // Without this, the network thread's poll results aren't visible
+        // to Network::accept() because it doesn't re-poll.
+        let mut net = self.net.lock();
+        let _ = net.perform_platform_interaction();
+        net.accept(fd, peer).map_err(|e| match e {
             AcceptError::NoConnectionsReady => TryOpError::TryAgain,
             AcceptError::InvalidFd | AcceptError::NotListening => TryOpError::Other(e.into()),
             _ => unimplemented!(),
@@ -728,14 +730,13 @@ impl<FS: ShimFS> GlobalState<FS> {
             self,
             raw_fd,
             |fd| {
-                let result = self.try_accept(fd, None).map_err(|e| match e {
+                self.try_accept(fd, None).map_err(|e| match e {
                     TryOpError::TryAgain => Errno::EAGAIN,
                     TryOpError::Other(e) => e,
                     TryOpError::WaitError(_) => Errno::EINTR,
-                });
-                result
+                })
             },
-            |_| Err(Errno::ENOTSOCK), // Unix socket, not INET — shouldn't happen
+            |_| Err(Errno::ENOTSOCK),
         )
     }
 

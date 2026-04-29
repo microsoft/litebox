@@ -299,6 +299,9 @@ struct Backlog<FS: ShimFS> {
     /// Queue of pending connections (None when shut down)
     sockets: Mutex<crate::Platform, Option<VecDeque<UnixConnectedStream<FS>>>>,
     pollee: Pollee<crate::Platform>,
+    /// Count of pending cross-worker TCP connections that haven't been
+    /// accepted yet. Set by the bridge observer, checked by check_io_events.
+    pending_tcp_connections: AtomicU32,
 }
 
 impl<FS: ShimFS> Backlog<FS> {
@@ -314,6 +317,7 @@ impl<FS: ShimFS> Backlog<FS> {
             listener_cred,
             sockets: litebox::sync::Mutex::new(Some(VecDeque::new())),
             pollee,
+            pending_tcp_connections: AtomicU32::new(0),
         }
     }
 
@@ -370,7 +374,8 @@ impl<FS: ShimFS> Backlog<FS> {
             return Events::HUP;
         };
         let mut events = Events::empty();
-        if !sockets.is_empty() {
+        let tcp_pending = self.pending_tcp_connections.load(Ordering::Relaxed);
+        if !sockets.is_empty() || tcp_pending > 0 {
             events |= Events::IN;
         }
         if sockets.len() < self.limit.load(Ordering::Relaxed) as usize {
@@ -1136,9 +1141,10 @@ impl<FS: ShimFS> UnixStream<FS> {
             self.with_state_ref(|state| {
                 if let Some(listen) = state.listen() {
                     if let UnixBoundSocketAddr::Path((ref path, _, ref fs)) = *listen.backlog.addr {
+                        let bridge_fires = super::unix::bridge_fire_count();
                         let diag = alloc::format!(
-                            "ACCEPT ENTRY: path={} has_task={} tcp_port={}\n",
-                            path, has_task, listen.tcp_port,
+                            "ACCEPT ENTRY: path={} has_task={} tcp_port={} bridge_fires={}\n",
+                            path, has_task, listen.tcp_port, bridge_fires,
                         );
                         if let Ok(f) = fs.open("/tmp/unix-port-trace.log", OFlags::CREAT | OFlags::RDWR | OFlags::APPEND, Mode::RWXU) {
                             let _ = fs.write(&f, diag.as_bytes(), None);
@@ -1226,7 +1232,20 @@ impl<FS: ShimFS> UnixStream<FS> {
                         let raw_fd = listen.tcp_raw_fd?;
                         let accepted_fd = match listen.global.try_accept_by_raw_fd(raw_fd, &task.files) {
                             Ok(fd) => fd,
-                            Err(_) => return None, // No connections ready
+                            Err(e) => {
+                                // Log the error for diagnostics.
+                                if let UnixBoundSocketAddr::Path((ref path, _, ref fs)) = *listen.backlog.addr {
+                                    let diag = alloc::format!(
+                                        "TCP_ACCEPT_FAIL: path={} raw_fd={} err={:?}\n",
+                                        path, raw_fd, e,
+                                    );
+                                    if let Ok(f) = fs.open("/tmp/unix-port-trace.log", OFlags::CREAT | OFlags::RDWR | OFlags::APPEND, Mode::RWXU) {
+                                        let _ = fs.write(&f, diag.as_bytes(), None);
+                                        let _ = fs.close(&f);
+                                    }
+                                }
+                                return None;
+                            }
                         };
                         let proxy = listen.global.initialize_socket(
                             &accepted_fd,
@@ -1245,6 +1264,13 @@ impl<FS: ShimFS> UnixStream<FS> {
                     });
 
                     if let Some(connected) = result {
+                        // Decrement the pending TCP connection counter.
+                        self.with_state_ref(|state| {
+                            if let Some(listen) = state.listen() {
+                                listen.backlog.pending_tcp_connections
+                                    .fetch_sub(1, core::sync::atomic::Ordering::Relaxed);
+                            }
+                        });
                         if let Some(peer) = peer.as_deref_mut() {
                             *peer = connected.get_peer_addr();
                         }
@@ -2269,10 +2295,23 @@ unsafe impl<FS: ShimFS> Sync for BacklogTcpBridge<FS> {}
 impl<FS: ShimFS> litebox::event::observer::Observer<Events> for BacklogTcpBridge<FS> {
     fn on_events(&self, events: &Events) {
         if events.contains(Events::IN) {
-            // Wake the guest's accept() which is blocked in wait_on_events.
+            // Signal that a cross-worker TCP connection is ready.
+            // This makes check_io_events() return IN so epoll wakes tokio.
+            self.backlog
+                .pending_tcp_connections
+                .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            BRIDGE_FIRE_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
             self.backlog.pollee.notify_observers(Events::IN);
         }
     }
+}
+
+/// Global counter for bridge firings (diagnostic).
+static BRIDGE_FIRE_COUNT: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// Returns the number of times any bridge observer has fired.
+pub(crate) fn bridge_fire_count() -> u32 {
+    BRIDGE_FIRE_COUNT.load(core::sync::atomic::Ordering::Relaxed)
 }
 
 // ── Cross-worker unix socket discovery via sidecar metadata files ──
