@@ -280,31 +280,6 @@ pub(crate) async fn nonpie_pipe_chain_tests(r: &mut TestRunner) {
 }
 
 /// Run all platform fix validation tests.
-pub(crate) async fn run(r: &mut TestRunner) {
-    poll_ready_tests(r).await;
-    bind_getsockname_tests(r).await;
-    pipe_pair_id_tests(r).await;
-    exit_data_integrity_tests(r).await;
-    nonpie_pipe_chain_tests(r).await;
-    stdin_pipe_subst_tests(r).await;
-    cross_worker_file_tests(r).await;
-    subst_capture_tests(r).await;
-    concurrent_fork_tests(r).await;
-    touch_redirect_tests(r).await;
-    vscode_install_pattern_tests(r).await;
-    file_redirect_tests(r).await;
-    pipe_nonblock_tests(r).await;
-    epoll_socket_tests(r).await;
-    loopback_tcp_tests(r).await;
-    bash_fork_exec_tests(r).await;
-    cross_worker_first_connect_tests(r).await;
-    cross_worker_self_connect_tests(r).await;
-    fork_listen_close_tests(r).await;
-    proc_filesystem_tests(r).await;
-    // PID visibility tests run last— KP.proc_child can deadlock agent B
-    // under litebox, causing all subsequent B-targeted tests to timeout.
-    pid_visibility_tests(r).await;
-}
 
 // ═══════════════════════════════════════════════════════════════════
 // XCONN: cross-worker TCP — first connection must succeed

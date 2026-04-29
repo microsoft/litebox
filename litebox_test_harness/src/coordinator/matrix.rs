@@ -39,12 +39,20 @@ pub(crate) enum Topology {
     /// AAA → init.
     GreatGrandchildUp,
     /// B → AAA.
+    #[allow(dead_code)]
+
     CrossSubtree,
     /// AA → AB.
+    #[allow(dead_code)]
+
     SiblingDepth2,
     /// AAA → AAB.
+    #[allow(dead_code)]
+
     SiblingDepth3,
     /// AB → B.
+    #[allow(dead_code)]
+
     Uncle,
     /// A → NP (non-PIE child via SpawnRemote).
     PieToNonPie,
@@ -108,10 +116,12 @@ impl Topology {
 
 // ── Xfail registry ──
 
+#[allow(dead_code)]
 fn build_xfail_set() -> HashSet<&'static str> {
     HashSet::new()
 }
 
+#[allow(dead_code)]
 fn record(
     r: &mut TestRunner,
     test_id: &str,
@@ -161,6 +171,7 @@ const FS_TOPOLOGIES: &[Topology] = &[
 
 /// Scope dimension for filesystem tests.
 #[derive(Debug, Clone, Copy)]
+#[allow(dead_code)]
 enum FsScope {
     /// /shared — visible across all agents.
     Shared,
@@ -168,6 +179,7 @@ enum FsScope {
     TmpIsolated,
 }
 
+#[allow(dead_code)]
 impl FsScope {
     fn prefix(self) -> &'static str {
         match self {
@@ -370,6 +382,7 @@ struct NetTestCase {
 }
 
 /// Net test with explicit connect address (to test cross-worker routing).
+#[allow(dead_code)]
 struct NetAddrTestCase {
     name: &'static str,
     listener: &'static str,
@@ -1613,5 +1626,6 @@ pub(crate) async fn run_matrix_tests(r: &mut TestRunner) {
         test_symlink_variant(r, variant, symlink_unsupported).await;
     }
 }
+
 
 

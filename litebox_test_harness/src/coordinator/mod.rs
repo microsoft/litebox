@@ -112,6 +112,7 @@ pub(crate) enum Expectation {
     /// Test is expected to pass.
     Pass,
     /// Test is expected to fail (known limitation). Contains reason.
+    #[allow(dead_code)]
     Fail(String),
 }
 
@@ -134,11 +135,6 @@ impl TestResult {
             (Expectation::Fail(_), false) => "xfail",
             (Expectation::Fail(_), true) => "XPASS",
         }
-    }
-
-    /// True if the outcome is unexpected (FAIL or XPASS).
-    pub fn is_unexpected(&self) -> bool {
-        matches!(self.outcome(), "FAIL" | "XPASS")
     }
 }
 
@@ -303,11 +299,6 @@ impl TestRunner {
             },
         }
     }
-}
-
-/// Run all tests as the coordinator.
-pub fn run_all(self_exe: &str) -> Vec<TestResult> {
-    run_filtered(self_exe, None)
 }
 
 /// Run tests, optionally filtering to a specific suite.
@@ -738,3 +729,6 @@ async fn send_cmd(child: &mut Child, cmd: &Command) -> Response {
         },
     }
 }
+
+
+

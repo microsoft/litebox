@@ -1570,7 +1570,6 @@ mod cow_test {
     /// the child exits. The assignment should survive (it happens
     /// after CoW restore).
     fn test_post_fork_assign() -> bool {
-        let mut x: i32 = 0;
         let pid = unsafe { libc::fork() };
         if pid < 0 {
             return false;
@@ -1581,7 +1580,7 @@ mod cow_test {
         let mut status = 0i32;
         unsafe { libc::waitpid(pid, &mut status, 0) };
         // Assign AFTER child exit + CoW restore
-        x = 123;
+        let x = 123;
         x == 123
     }
 
@@ -4775,7 +4774,7 @@ mod net_tests {
 }
 
 mod fs_tests {
-    use std::io::{Read, Write};
+    use std::io::Write;
 
     pub fn run(sub: &str, args: &[String]) -> i32 {
         match sub {
