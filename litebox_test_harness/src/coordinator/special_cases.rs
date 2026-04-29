@@ -405,6 +405,31 @@ pub(super) async fn unix_socket_tests(r: &mut TestRunner) {
         let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout.contains("US1_CROSS_PROCESS_OK"));
         r.record(&test_name, agent, pass, &format!("{resp:?}"));
     }
+
+    // US6: socketpair(AF_UNIX) + fork — child writes to inherited fd.
+    // Reproduces the VS Code extension host IPC pattern where a forked
+    // child inherits one end of a socketpair and uses it for bidirectional
+    // communication. Runs across all agent topologies to catch SpawnRemote
+    // snapshot issues where unix socket fds fail to transfer.
+    let socketpair_agents = ["A", "AA", "B", "D3", "D4", "NP"];
+    for agent in &socketpair_agents {
+        let test_name = format!("US6.socketpair_fork.{agent}");
+        let resp = r
+            .send(
+                agent,
+                super::exec_timeout(
+                    vec![
+                        self_exe.clone(),
+                        "unix-socket-test".into(),
+                        "socketpair-fork".into(),
+                    ],
+                    15,
+                ),
+            )
+            .await;
+        let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout.contains("US6_SOCKETPAIR_FORK_OK"));
+        r.record(&test_name, agent, pass, &format!("{resp:?}"));
+    }
 }
 
 /// Node.js exit behavior tests.
