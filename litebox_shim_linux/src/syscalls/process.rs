@@ -4954,12 +4954,12 @@ impl<FS: ShimFS> Task<FS> {
                 bridge_parent_info.push(Vec::new());
             }
 
-            // --- Unix socket bridging (stdio slots only) ---
-            // For each connected Unix socket on fd 0/1/2 in the child's
-            // table, create an OS pipe bridge so parent and child communicate
-            // across host processes after migration.
+            // --- Unix socket bridging ---
+            // For each connected Unix socket in the child's table, create
+            // an OS pipe bridge so parent and child communicate across host
+            // processes after migration.
             {
-                // Collect child unix socket fds on stdio slots.
+                // Collect child unix socket fds on any slot.
                 struct ChildSocketInfo<S: litebox::fd::FdEnabledSubsystem> {
                     child_fd: usize,
                     direction: super::host_pipe::HostPipeDirection,
@@ -4977,7 +4977,7 @@ impl<FS: ShimFS> Task<FS> {
                     let files = self.files.borrow();
                     let rds = files.raw_descriptor_store.read();
                     let mut out = Vec::new();
-                    for raw_fd in 0..=2usize {
+                    for raw_fd in rds.iter_alive() {
                         if let Ok(typed) =
                             rds.fd_from_raw_integer::<super::unix::UnixSocketSubsystem<FS>>(raw_fd)
                         {
@@ -6649,7 +6649,7 @@ impl<FS: ShimFS> Task<FS> {
                 }
                 FdClass::FilesystemFd if terminal_meta.is_some() => {}
                 FdClass::FilesystemFd if raw_fd > 2 => {}
-                FdClass::UnixSocket if raw_fd <= 2 && socket_pair_id.is_some() => {}
+                FdClass::UnixSocket if socket_pair_id.is_some() => {}
                 _ => {
                     reject.push(ForkRejectReason::UnsupportedFdClass { fd: raw_fd, class });
                 }
