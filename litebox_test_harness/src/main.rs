@@ -3734,6 +3734,8 @@ mod unix_socket_tests {
             "socketpair-exec" => test_socketpair_exec(),
             // Helper: child side of socketpair-exec (inherits fd from parent)
             "socketpair-exec-child" => socketpair_exec_child(),
+            // Nested: exec a child that itself does socketpair+fork+exec
+            "socketpair-nested-exec" => test_socketpair_nested_exec(),
             // Called by the test harness binary after fork+exec for US2
             "us2-server" => us2_server(),
             other => {
@@ -4467,9 +4469,9 @@ mod unix_socket_tests {
 
     /// US6c: socketpair(AF_UNIX) + fork+exec — bidirectional IPC.
     /// Reproduces the exact VS Code extension host pattern:
-    ///   parent: socketpair() → fork+exec(child, inheriting fd) → write → read
+    ///   parent: socketpair() → fork() → exec(child, inheriting fd) → write → read
     ///   child (exec'd): read from inherited fd → write reply → exit
-    /// After exec, parent and child run concurrently in separate workers.
+    /// Uses raw fork+exec (not posix_spawn) to trigger litebox's delayed fork.
     fn test_socketpair_exec() -> i32 {
         let mut fds = [0i32; 2];
         let rc = unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, fds.as_mut_ptr()) };
@@ -4484,43 +4486,60 @@ mod unix_socket_tests {
         // Clear CLOEXEC on child_fd so it survives exec.
         unsafe { libc::fcntl(child_fd, libc::F_SETFD, 0) };
 
-        // Fork+exec a child that inherits child_fd.
-        let self_exe = std::env::current_exe().unwrap();
-        let child = std::process::Command::new(&self_exe)
-            .args([
-                "unix-socket-test",
-                "socketpair-exec-child",
-                &child_fd.to_string(),
-            ])
-            .spawn();
-
-        let Ok(mut child) = child else {
-            println!("US6E_SPAWN_FAIL");
+        let pid = unsafe { libc::fork() };
+        if pid < 0 {
+            println!("US6E_FORK_FAIL:{}", errno());
             return 1;
-        };
+        }
 
-        // Close child end in parent.
+        if pid == 0 {
+            // Child: close parent end, then trigger delayed fork commit
+            // by doing a non-pre-exec syscall (like Node.js does with
+            // setsockopt on the IPC fd), then exec.
+            unsafe { libc::close(parent_fd) };
+            // setsockopt is NOT a pre-exec syscall — triggers commit_delayed_fork
+            let val: i32 = 1;
+            unsafe {
+                libc::setsockopt(
+                    child_fd,
+                    libc::SOL_SOCKET,
+                    libc::SO_KEEPALIVE,
+                    &val as *const _ as *const libc::c_void,
+                    core::mem::size_of::<i32>() as libc::socklen_t,
+                );
+            }
+            let self_exe = std::env::current_exe().unwrap();
+            let self_exe = self_exe.to_str().unwrap();
+            let fd_str = child_fd.to_string();
+            let c_exe = std::ffi::CString::new(self_exe).unwrap();
+            let c_arg1 = std::ffi::CString::new("unix-socket-test").unwrap();
+            let c_arg2 = std::ffi::CString::new("socketpair-exec-child").unwrap();
+            let c_arg3 = std::ffi::CString::new(fd_str.as_str()).unwrap();
+            let args = [c_exe.as_ptr(), c_arg1.as_ptr(), c_arg2.as_ptr(), c_arg3.as_ptr(), core::ptr::null()];
+            unsafe { libc::execv(c_exe.as_ptr(), args.as_ptr()) };
+            eprintln!("[US6c-child] execv failed: {}", errno());
+            std::process::exit(127);
+        }
+
+        // Parent: close child end, write, read reply, waitpid.
         unsafe { libc::close(child_fd) };
 
-        // Parent writes to its end.
         let msg = b"US6E_FROM_PARENT";
         let n = unsafe {
             libc::write(parent_fd, msg.as_ptr() as *const libc::c_void, msg.len())
         };
         if n != msg.len() as isize {
             println!("US6E_WRITE_FAIL:n={n},errno={}", errno());
-            let _ = child.kill();
+            unsafe { libc::kill(pid, libc::SIGKILL) };
             return 1;
         }
         eprintln!("[US6c-parent] wrote {n} bytes");
 
-        // Read reply from child.
+        // Read reply with timeout.
         let tv = libc::timeval { tv_sec: 10, tv_usec: 0 };
         unsafe {
             libc::setsockopt(
-                parent_fd,
-                libc::SOL_SOCKET,
-                libc::SO_RCVTIMEO,
+                parent_fd, libc::SOL_SOCKET, libc::SO_RCVTIMEO,
                 &tv as *const _ as *const libc::c_void,
                 core::mem::size_of::<libc::timeval>() as libc::socklen_t,
             );
@@ -4531,8 +4550,9 @@ mod unix_socket_tests {
         };
         unsafe { libc::close(parent_fd) };
 
-        let status = child.wait().unwrap();
-        let exit_code = status.code().unwrap_or(99);
+        let mut status = 0i32;
+        unsafe { libc::waitpid(pid, &mut status, 0) };
+        let exit_code = if libc::WIFEXITED(status) { libc::WEXITSTATUS(status) } else { 99 };
 
         if n <= 0 {
             println!("US6E_READ_FAIL:n={n},errno={},exit={exit_code}", errno());
@@ -4587,6 +4607,37 @@ mod unix_socket_tests {
             0
         } else {
             2
+        }
+    }
+
+    /// US6d: Nested socketpair+fork+exec — reproduces VS Code extension host.
+    /// The parent exec's itself, and the exec'd child does socketpair+fork+exec.
+    /// This triggers nested delayed fork commit with socketpair fd bridging.
+    ///   exec(self, socketpair-exec) → socketpair → fork → exec(self, child) → IPC
+    fn test_socketpair_nested_exec() -> i32 {
+        let self_exe = std::env::current_exe().unwrap();
+        let output = std::process::Command::new(&self_exe)
+            .args(["unix-socket-test", "socketpair-exec"])
+            .output();
+
+        let Ok(output) = output else {
+            println!("US6N_SPAWN_FAIL");
+            return 1;
+        };
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let exit_code = output.status.code().unwrap_or(99);
+
+        eprintln!("[US6d] child stdout: {stdout}");
+        eprintln!("[US6d] child stderr: {stderr}");
+
+        if stdout.contains("US6E_SOCKETPAIR_EXEC_OK") && exit_code == 0 {
+            println!("US6N_NESTED_EXEC_OK");
+            0
+        } else {
+            println!("US6N_NESTED_EXEC_FAIL:exit={exit_code},stdout={stdout}");
+            1
         }
     }
 
