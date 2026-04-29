@@ -513,6 +513,7 @@ async fn run_tests(self_exe: &str, filter: Option<&str>) -> Vec<TestResult> {
         platform_fixes::fork_listen_close_tests(&mut runner).await;
         special_cases::unix_socket_tests(&mut runner).await;
         special_cases::cross_worker_tests(&mut runner).await;
+        special_cases::pipe_eof_tests(&mut runner).await;
     }
 
     // =================================================================

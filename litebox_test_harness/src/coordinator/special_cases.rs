@@ -545,7 +545,81 @@ pub(super) async fn unix_socket_tests(r: &mut TestRunner) {
     }
 }
 
-/// Node.js exit behavior tests.
+/// Pipe EOF lifecycle tests — verify relay pipes close properly after child exits.
+pub(super) async fn pipe_eof_tests(r: &mut TestRunner) {
+    let self_exe = r.self_exe.clone();
+
+    eprintln!("[special] === Pipe EOF Lifecycle Tests ===");
+
+    // P1: pipe + fork — child writes + exits → parent gets data + EOF.
+    let fork_agents = ["A", "AA", "B", "D3", "D4", "NP"];
+    for agent in &fork_agents {
+        let test_name = format!("P1.pipe_eof_fork.{agent}");
+        let resp = r
+            .send(
+                agent,
+                super::exec_timeout(
+                    vec![
+                        self_exe.clone(),
+                        "pipe-test".into(),
+                        "eof-fork".into(),
+                    ],
+                    20,
+                ),
+            )
+            .await;
+        let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout.contains("P1_EOF_OK"));
+        r.record(&test_name, agent, pass, &format!("{resp:?}"));
+    }
+
+    // P2-PIE: fork+exec(PIE) → parent reads child stdout → expects data + EOF.
+    let exec_agents = ["A", "AA", "B"];
+    for agent in &exec_agents {
+        let test_name = format!("P2.pipe_eof_exec_pie.{agent}");
+        let resp = r
+            .send(
+                agent,
+                super::exec_timeout(
+                    vec![
+                        self_exe.clone(),
+                        "pipe-test".into(),
+                        "eof-exec".into(),
+                        self_exe.clone(), // PIE binary
+                    ],
+                    20,
+                ),
+            )
+            .await;
+        let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout.contains("P2_EOF_OK"));
+        r.record(&test_name, agent, pass, &format!("{resp:?}"));
+    }
+
+    // P2-NONPIE: fork+exec(nonpie) → triggers exec-on-remote-host with mux relay.
+    // This is the critical test — the mux relay pipe's write end must close
+    // when the child worker exits so the parent gets EOF.
+    if let Some(nonpie) = crate::find_nonpie_binary() {
+        let nonpie_agents = ["A", "AA", "B"];
+        for agent in &nonpie_agents {
+            let test_name = format!("P2.pipe_eof_exec_nonpie.{agent}");
+            let resp = r
+                .send(
+                    agent,
+                    super::exec_timeout(
+                        vec![
+                            self_exe.clone(),
+                            "pipe-test".into(),
+                            "eof-exec".into(),
+                            nonpie.clone(), // non-PIE → exec-on-remote-host
+                        ],
+                        20,
+                    ),
+                )
+                .await;
+            let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout.contains("P2_EOF_OK"));
+            r.record(&test_name, agent, pass, &format!("{resp:?}"));
+        }
+    }
+}
 pub(super) async fn node_exit_tests(r: &mut TestRunner) {
     eprintln!("[special] === Node.js Exit Tests ===");
 

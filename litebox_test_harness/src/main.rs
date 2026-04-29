@@ -1196,6 +1196,10 @@ fn main() {
             let sub = args.get(2).map(String::as_str).unwrap_or("cross-process");
             std::process::exit(unix_socket_tests::run(sub));
         }
+        "pipe-test" => {
+            let sub = args.get(2).map(String::as_str).unwrap_or("help");
+            std::process::exit(pipe_lifecycle_tests::run(sub, &args));
+        }
         "exit-test" => {
             let sub = args.get(2).map(String::as_str).unwrap_or("single");
             exit_tests::run(sub);
@@ -4682,6 +4686,202 @@ mod unix_socket_tests {
 
     fn errno() -> i32 {
         std::io::Error::last_os_error().raw_os_error().unwrap_or(-1)
+    }
+}
+
+/// Pipe lifecycle tests — verify that pipe EOF is delivered when child exits.
+///
+/// Tests the relay pipe lifecycle across fork, exec, and exec-on-remote-host
+/// (nonpie) paths. The VS Code extension host pattern requires that when a
+/// fork+exec'd child exits, the parent's read on the child's stdout pipe
+/// returns EOF — not block forever.
+mod pipe_lifecycle_tests {
+    use std::io::Read;
+
+    fn errno() -> i32 {
+        std::io::Error::last_os_error().raw_os_error().unwrap_or(-1)
+    }
+
+    pub fn run(sub: &str, args: &[String]) -> i32 {
+        match sub {
+            "eof-fork" => test_eof_fork(),
+            "eof-exec" => test_eof_exec(args),
+            // Helper: child that writes to stdout and exits.
+            "echo-exit" => {
+                println!("PIPE_CHILD_DATA");
+                0
+            }
+            other => {
+                eprintln!("unknown pipe-test: {other}");
+                1
+            }
+        }
+    }
+
+    /// P1: pipe() → fork() → child writes to pipe + exits → parent reads → expects data + EOF.
+    fn test_eof_fork() -> i32 {
+        let mut pipe_fds = [0i32; 2];
+        if unsafe { libc::pipe(pipe_fds.as_mut_ptr()) } != 0 {
+            println!("P1_PIPE_FAIL:{}", errno());
+            return 1;
+        }
+
+        let pid = unsafe { libc::fork() };
+        if pid < 0 {
+            println!("P1_FORK_FAIL:{}", errno());
+            return 1;
+        }
+
+        if pid == 0 {
+            // Child: close read end, write to pipe, exit.
+            unsafe { libc::close(pipe_fds[0]) };
+            let msg = b"P1_CHILD_DATA\n";
+            let _ = unsafe {
+                libc::write(pipe_fds[1], msg.as_ptr() as *const libc::c_void, msg.len())
+            };
+            unsafe { libc::close(pipe_fds[1]) };
+            std::process::exit(0);
+        }
+
+        // Parent: close write end, read all data, expect EOF.
+        unsafe { libc::close(pipe_fds[1]) };
+
+        // Set read timeout to catch blocking.
+        let tv = libc::timeval { tv_sec: 10, tv_usec: 0 };
+        unsafe {
+            libc::setsockopt(
+                pipe_fds[0], libc::SOL_SOCKET, libc::SO_RCVTIMEO,
+                &tv as *const _ as *const libc::c_void,
+                core::mem::size_of::<libc::timeval>() as libc::socklen_t,
+            );
+        }
+
+        let mut all_data = Vec::new();
+        let mut buf = [0u8; 4096];
+        loop {
+            let n = unsafe {
+                libc::read(pipe_fds[0], buf.as_mut_ptr() as *mut libc::c_void, buf.len())
+            };
+            if n == 0 {
+                break; // EOF
+            }
+            if n < 0 {
+                println!("P1_READ_FAIL:errno={}", errno());
+                return 1;
+            }
+            all_data.extend_from_slice(&buf[..n as usize]);
+        }
+        unsafe { libc::close(pipe_fds[0]) };
+
+        let mut status = 0i32;
+        unsafe { libc::waitpid(pid, &mut status, 0) };
+
+        let data = String::from_utf8_lossy(&all_data);
+        if data.contains("P1_CHILD_DATA") {
+            println!("P1_EOF_OK");
+            0
+        } else {
+            println!("P1_EOF_FAIL:data={data}");
+            1
+        }
+    }
+
+    /// P2: fork() → exec(binary, pipe-test, echo-exit) → parent reads stdout → expects data + EOF.
+    /// Uses raw fork+exec to trigger litebox's delayed fork / exec-on-remote-host.
+    /// The `binary` arg determines PIE vs nonpie exec path.
+    fn test_eof_exec(args: &[String]) -> i32 {
+        // args[3] = binary path (optional, defaults to self)
+        let exe = if let Some(bin) = args.get(3) {
+            bin.clone()
+        } else {
+            std::env::current_exe().unwrap().to_str().unwrap().to_string()
+        };
+
+        // Create pipe for child stdout.
+        let mut pipe_fds = [0i32; 2];
+        if unsafe { libc::pipe(pipe_fds.as_mut_ptr()) } != 0 {
+            println!("P2_PIPE_FAIL:{}", errno());
+            return 1;
+        }
+
+        let pid = unsafe { libc::fork() };
+        if pid < 0 {
+            println!("P2_FORK_FAIL:{}", errno());
+            return 1;
+        }
+
+        if pid == 0 {
+            // Child: redirect stdout to pipe, exec binary with echo-exit.
+            unsafe { libc::close(pipe_fds[0]) };
+            unsafe { libc::dup2(pipe_fds[1], 1) };
+            unsafe { libc::close(pipe_fds[1]) };
+
+            let c_exe = std::ffi::CString::new(exe.as_str()).unwrap();
+            let c_arg1 = std::ffi::CString::new("pipe-test").unwrap();
+            let c_arg2 = std::ffi::CString::new("echo-exit").unwrap();
+            let argv = [c_exe.as_ptr(), c_arg1.as_ptr(), c_arg2.as_ptr(), core::ptr::null()];
+            unsafe { libc::execv(c_exe.as_ptr(), argv.as_ptr()) };
+            std::process::exit(127);
+        }
+
+        // Parent: close write end, read with timeout, expect data + EOF.
+        unsafe { libc::close(pipe_fds[1]) };
+
+        let mut all_data = Vec::new();
+        let mut buf = [0u8; 4096];
+
+        // Use poll with timeout to detect blocking.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        loop {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                println!("P2_TIMEOUT:read blocked, no EOF after 15s, data_len={}", all_data.len());
+                unsafe { libc::kill(pid, libc::SIGKILL) };
+                return 1;
+            }
+
+            let mut pfd = libc::pollfd {
+                fd: pipe_fds[0],
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            let timeout_ms = remaining.as_millis().min(1000) as i32;
+            let poll_ret = unsafe { libc::poll(&mut pfd, 1, timeout_ms) };
+
+            if poll_ret == 0 {
+                continue; // poll timeout, retry
+            }
+            if poll_ret < 0 {
+                println!("P2_POLL_FAIL:errno={}", errno());
+                return 1;
+            }
+
+            let n = unsafe {
+                libc::read(pipe_fds[0], buf.as_mut_ptr() as *mut libc::c_void, buf.len())
+            };
+            if n == 0 {
+                break; // EOF!
+            }
+            if n < 0 {
+                println!("P2_READ_FAIL:errno={}", errno());
+                return 1;
+            }
+            all_data.extend_from_slice(&buf[..n as usize]);
+        }
+        unsafe { libc::close(pipe_fds[0]) };
+
+        let mut status = 0i32;
+        unsafe { libc::waitpid(pid, &mut status, 0) };
+        let exit_code = if libc::WIFEXITED(status) { libc::WEXITSTATUS(status) } else { 99 };
+
+        let data = String::from_utf8_lossy(&all_data);
+        if data.contains("PIPE_CHILD_DATA") && exit_code == 0 {
+            println!("P2_EOF_OK");
+            0
+        } else {
+            println!("P2_EOF_FAIL:exit={exit_code},data={data}");
+            1
+        }
     }
 }
 
