@@ -515,6 +515,30 @@ pub(super) async fn unix_socket_tests(r: &mut TestRunner) {
         let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout.contains("US6E_SOCKETPAIR_EXEC_OK"));
         r.record(&test_name, agent, pass, &format!("{resp:?}"));
     }
+
+    // US6d: Nested socketpair+fork+exec — reproduces VS Code extension host.
+    // exec(self) → socketpair → fork → exec(self, child) → bidirectional IPC.
+    // The nesting triggers delayed fork commit with socketpair fd bridging
+    // in a worker that was itself spawned via delayed fork.
+    let nested_agents = ["A", "AA", "B", "D3", "D4", "NP"];
+    for agent in &nested_agents {
+        let test_name = format!("US6.socketpair_nested.{agent}");
+        let resp = r
+            .send(
+                agent,
+                super::exec_timeout(
+                    vec![
+                        self_exe.clone(),
+                        "unix-socket-test".into(),
+                        "socketpair-nested-exec".into(),
+                    ],
+                    30,
+                ),
+            )
+            .await;
+        let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout.contains("US6N_NESTED_EXEC_OK"));
+        r.record(&test_name, agent, pass, &format!("{resp:?}"));
+    }
 }
 
 /// Node.js exit behavior tests.

@@ -3734,6 +3734,8 @@ mod unix_socket_tests {
             "socketpair-exec" => test_socketpair_exec(),
             // Helper: child side of socketpair-exec (inherits fd from parent)
             "socketpair-exec-child" => socketpair_exec_child(),
+            // Nested: exec a child that itself does socketpair+fork+exec
+            "socketpair-nested-exec" => test_socketpair_nested_exec(),
             // Called by the test harness binary after fork+exec for US2
             "us2-server" => us2_server(),
             other => {
@@ -4587,6 +4589,37 @@ mod unix_socket_tests {
             0
         } else {
             2
+        }
+    }
+
+    /// US6d: Nested socketpair+fork+exec — reproduces VS Code extension host.
+    /// The parent exec's itself, and the exec'd child does socketpair+fork+exec.
+    /// This triggers nested delayed fork commit with socketpair fd bridging.
+    ///   exec(self, socketpair-exec) → socketpair → fork → exec(self, child) → IPC
+    fn test_socketpair_nested_exec() -> i32 {
+        let self_exe = std::env::current_exe().unwrap();
+        let output = std::process::Command::new(&self_exe)
+            .args(["unix-socket-test", "socketpair-exec"])
+            .output();
+
+        let Ok(output) = output else {
+            println!("US6N_SPAWN_FAIL");
+            return 1;
+        };
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let exit_code = output.status.code().unwrap_or(99);
+
+        eprintln!("[US6d] child stdout: {stdout}");
+        eprintln!("[US6d] child stderr: {stderr}");
+
+        if stdout.contains("US6E_SOCKETPAIR_EXEC_OK") && exit_code == 0 {
+            println!("US6N_NESTED_EXEC_OK");
+            0
+        } else {
+            println!("US6N_NESTED_EXEC_FAIL:exit={exit_code},stdout={stdout}");
+            1
         }
     }
 

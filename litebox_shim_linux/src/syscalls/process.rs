@@ -5933,8 +5933,12 @@ impl<FS: ShimFS> Task<FS> {
                 }
 
                 // Close parent-side OS pipe fds — the mux replaces them.
+                // Skip bidirectional (ReadWrite) fds — those are stored in
+                // fd_replacements and will be used by the parent after VforkDone.
                 for pr in &parent_replacements {
-                    self.global.platform.close_host_fd(pr.host_fd);
+                    if pr.direction != HostPipeDirection::ReadWrite {
+                        self.global.platform.close_host_fd(pr.host_fd);
+                    }
                 }
 
                 // Append alias entries to mux_stream_specs: same
