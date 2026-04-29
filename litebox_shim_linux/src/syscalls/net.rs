@@ -696,7 +696,7 @@ impl<FS: ShimFS> GlobalState<FS> {
         })
     }
 
-    fn accept(
+    pub(super) fn accept(
         &self,
         cx: &WaitContext<'_, Platform>,
         fd: &SocketFd,

@@ -1135,56 +1135,26 @@ impl<FS: ShimFS> UnixStream<FS> {
         mut peer: Option<&mut UnixSocketAddr>,
         is_nonblocking: bool,
     ) -> Result<UnixSocketInner<FS>, Errno> {
-        // Diagnostic: unconditional log to see if accept() is called at all.
-        {
-            let has_task = task.is_some();
-            self.with_state_ref(|state| {
-                if let Some(listen) = state.listen() {
-                    if let UnixBoundSocketAddr::Path((ref path, _, ref fs)) = *listen.backlog.addr {
-                        let bridge_fires = super::unix::bridge_fire_count();
-                        let diag = alloc::format!(
-                            "ACCEPT ENTRY: path={} has_task={} tcp_port={} bridge_fires={}\n",
-                            path, has_task, listen.tcp_port, bridge_fires,
-                        );
-                        if let Ok(f) = fs.open("/tmp/unix-port-trace.log", OFlags::CREAT | OFlags::RDWR | OFlags::APPEND, Mode::RWXU) {
-                            let _ = fs.write(&f, diag.as_bytes(), None);
-                            let _ = fs.close(&f);
-                        }
-                    }
-                }
-            });
-        }
+        let (backlog, tcp_proxy, tcp_raw_fd, listen_addr, listener_cred) =
+            self.with_state_ref(|state| -> Result<_, Errno> {
+                let listen = state.listen().ok_or(Errno::EINVAL)?;
+                Ok((
+                    listen.backlog.clone(),
+                    listen.tcp_proxy.clone(),
+                    listen.tcp_raw_fd,
+                    listen.backlog.addr.clone(),
+                    listen.backlog.listener_cred,
+                ))
+            })?;
 
-        let (backlog, tcp_proxy) = self.with_state_ref(|state| -> Result<_, Errno> {
-            let listen = state.listen().ok_or(Errno::EINVAL)?;
-            Ok((listen.backlog.clone(), listen.tcp_proxy.clone()))
-        })?;
-
-        // Diagnostic: log whether tcp_proxy is available for this accept.
-        if let Some(task) = task {
-            self.with_state_ref(|state| {
-                if let Some(listen) = state.listen() {
-                    if let UnixBoundSocketAddr::Path((ref path, _, ref fs)) = *listen.backlog.addr {
-                        let diag = alloc::format!(
-                            "ACCEPT SETUP: path={} tcp_proxy={} tcp_raw_fd={:?} tcp_port={}\n",
-                            path, tcp_proxy.is_some(), listen.tcp_raw_fd, listen.tcp_port,
-                        );
-                        if let Ok(f) = fs.open("/tmp/unix-port-trace.log", OFlags::CREAT | OFlags::RDWR | OFlags::APPEND, Mode::RWXU) {
-                            let _ = fs.write(&f, diag.as_bytes(), None);
-                            let _ = fs.close(&f);
-                        }
-                    }
-                }
-            });
-        }
-
+        // Single wait_on_events that watches BOTH the local backlog pollee
+        // AND the TCP proxy pollee (if cross-worker is configured).
+        // This is the same pattern TCP uses — one wait loop, one observer.
         cx.wait_on_events(
             is_nonblocking,
             Events::IN,
             |observer, mask| {
                 backlog.pollee.register_observer(observer.clone(), mask);
-                // Also register on the TCP proxy so we wake when cross-worker
-                // TCP connections complete the handshake.
                 if let Some(ref proxy) = tcp_proxy {
                     use litebox::event::IOPollable;
                     proxy.register_observer(observer, mask);
@@ -1192,7 +1162,7 @@ impl<FS: ShimFS> UnixStream<FS> {
                 Ok(())
             },
             || {
-                // First try to accept from the local backlog (same-worker).
+                // Try local backlog first (same-worker).
                 match backlog.try_accept() {
                     Ok(accepted) => {
                         if let Some(peer) = peer.as_deref_mut() {
@@ -1206,77 +1176,41 @@ impl<FS: ShimFS> UnixStream<FS> {
                     Err(e) => return Err(e),
                 }
 
-                // Then try to accept from the internal TCP listener (cross-worker)
-                // using the guest syscall path so TCP SYN packets reach the broker.
-                if let Some(task) = task {
-                    // Log the port being checked in accept.
-                    self.with_state_ref(|state| {
-                        if let Some(listen) = state.listen() {
-                            if let (Some(raw_fd), port) = (listen.tcp_raw_fd, listen.tcp_port) {
-                                if let UnixBoundSocketAddr::Path((ref path, _, ref fs)) = *listen.backlog.addr {
-                                    let actual_port = task.do_getsockname_inet_port(raw_fd);
-                                    let diag = alloc::format!(
-                                        "ACCEPT CHECK: path={} stored_port={} raw_fd={} actual_port={:?} pid={}\n",
-                                        path, port, raw_fd, actual_port, task.process_id.0,
-                                    );
-                                    if let Ok(f) = fs.open("/tmp/unix-port-trace.log", OFlags::CREAT | OFlags::RDWR | OFlags::APPEND, Mode::RWXU) {
-                                        let _ = fs.write(&f, diag.as_bytes(), None);
-                                        let _ = fs.close(&f);
-                                    }
-                                }
+                // Try cross-worker TCP accept (non-blocking).
+                if let (Some(task), Some(raw_fd)) = (task, tcp_raw_fd) {
+                    match task.files.borrow().with_socket(
+                        &task.global,
+                        raw_fd,
+                        |fd| task.global.try_accept(fd, None).map_err(|e| match e {
+                            TryOpError::TryAgain => Errno::EAGAIN,
+                            TryOpError::Other(e) => e,
+                            TryOpError::WaitError(_) => Errno::EINTR,
+                        }),
+                        |_| Err(Errno::EINVAL),
+                    ) {
+                        Ok(accepted_tcp_fd) => {
+                            let proxy = task.global.initialize_socket(
+                                &accepted_tcp_fd,
+                                SockType::Stream,
+                                SockFlags::empty(),
+                            );
+                            let connected = UnixConnectedStream {
+                                addr: AddrView {
+                                    addr: Some(listen_addr.clone()),
+                                    peer: None,
+                                },
+                                transport: UnixTransport::Tcp { proxy },
+                                peer_cred: listener_cred,
+                                pollee: Arc::new(Pollee::new()),
+                            };
+                            if let Some(peer) = peer.as_deref_mut() {
+                                *peer = connected.get_peer_addr();
                             }
+                            return Ok(UnixSocketInner::Stream(UnixStream::new(
+                                UnixStreamState::Connected(connected),
+                            )));
                         }
-                    });
-                    let result = self.with_state_ref(|state| -> Option<UnixConnectedStream<FS>> {
-                        let listen = state.listen()?;
-                        let raw_fd = listen.tcp_raw_fd?;
-                        let accepted_fd = match listen.global.try_accept_by_raw_fd(raw_fd, &task.files) {
-                            Ok(fd) => fd,
-                            Err(e) => {
-                                // Log the error for diagnostics.
-                                if let UnixBoundSocketAddr::Path((ref path, _, ref fs)) = *listen.backlog.addr {
-                                    let diag = alloc::format!(
-                                        "TCP_ACCEPT_FAIL: path={} raw_fd={} err={:?}\n",
-                                        path, raw_fd, e,
-                                    );
-                                    if let Ok(f) = fs.open("/tmp/unix-port-trace.log", OFlags::CREAT | OFlags::RDWR | OFlags::APPEND, Mode::RWXU) {
-                                        let _ = fs.write(&f, diag.as_bytes(), None);
-                                        let _ = fs.close(&f);
-                                    }
-                                }
-                                return None;
-                            }
-                        };
-                        let proxy = listen.global.initialize_socket(
-                            &accepted_fd,
-                            SockType::Stream,
-                            SockFlags::empty(),
-                        );
-                        Some(UnixConnectedStream {
-                            addr: AddrView {
-                                addr: Some(listen.backlog.addr.clone()),
-                                peer: None,
-                            },
-                            transport: UnixTransport::Tcp { proxy },
-                            peer_cred: listen.backlog.listener_cred,
-                            pollee: Arc::new(Pollee::new()),
-                        })
-                    });
-
-                    if let Some(connected) = result {
-                        // Decrement the pending TCP connection counter.
-                        self.with_state_ref(|state| {
-                            if let Some(listen) = state.listen() {
-                                listen.backlog.pending_tcp_connections
-                                    .fetch_sub(1, core::sync::atomic::Ordering::Relaxed);
-                            }
-                        });
-                        if let Some(peer) = peer.as_deref_mut() {
-                            *peer = connected.get_peer_addr();
-                        }
-                        return Ok(UnixSocketInner::Stream(UnixStream::new(
-                            UnixStreamState::Connected(connected),
-                        )));
+                        Err(_) => {} // No TCP connections ready yet.
                     }
                 }
 
