@@ -22,6 +22,10 @@ static AUDIT_LOG_FD: AtomicI32 = AtomicI32::new(-1);
 /// Monotonically increasing sequence number for correlating entry/exit events.
 static AUDIT_SEQ: AtomicU64 = AtomicU64::new(0);
 
+/// Host OS PID of this runner process. Disambiguates guest PIDs across
+/// fork-restore/worker-exec workers (each has its own host PID).
+static WORKER_ID: AtomicI32 = AtomicI32::new(0);
+
 /// Redirect audit events to the given host file descriptor.
 ///
 /// Call this before the guest starts. The fd must be a valid host-side file
@@ -29,6 +33,12 @@ static AUDIT_SEQ: AtomicU64 = AtomicU64::new(0);
 /// The caller is responsible for keeping the fd open for the lifetime of the sandbox.
 pub fn set_audit_log_fd(fd: i32) {
     AUDIT_LOG_FD.store(fd, Ordering::Release);
+}
+
+/// Set the worker ID (host OS PID) for this runner process.
+/// Called by the runner before the guest starts.
+pub fn set_worker_id(id: i32) {
+    WORKER_ID.store(id, Ordering::Release);
 }
 
 /// Maximum number of arguments recorded per syscall event.
@@ -185,8 +195,9 @@ pub fn emit_audit_event(event: &AuditEvent) {
 /// Returns the sequence number for pairing with the exit event.
 pub fn emit_entry_event(event: &AuditEvent) -> u64 {
     let seq = AUDIT_SEQ.fetch_add(1, Ordering::Relaxed);
+    let worker = WORKER_ID.load(Ordering::Relaxed);
     let msg = alloc::format!(
-        "{{\"phase\":\"enter\",\"seq\":{seq},\"pid\":{},\"tid\":{},\"syscall\":\"{}\",\"args\":[{}]}}\n",
+        "{{\"phase\":\"enter\",\"seq\":{seq},\"pid\":{},\"tid\":{},\"worker\":{worker},\"syscall\":\"{}\",\"args\":[{}]}}\n",
         event.pid,
         event.tid,
         event.syscall_name,
@@ -208,8 +219,9 @@ pub fn emit_exit_event(
         Ok(v) => alloc::format!("{{\"ok\":{v}}}"),
         Err(e) => alloc::format!("{{\"err\":{e}}}"),
     };
+    let worker = WORKER_ID.load(Ordering::Relaxed);
     let msg = alloc::format!(
-        "{{\"phase\":\"exit\",\"seq\":{seq},\"pid\":{pid},\"tid\":{tid},\"syscall\":\"{syscall_name}\",\"result\":{result_str}}}\n",
+        "{{\"phase\":\"exit\",\"seq\":{seq},\"pid\":{pid},\"tid\":{tid},\"worker\":{worker},\"syscall\":\"{syscall_name}\",\"result\":{result_str}}}\n",
     );
     write_audit_line(&msg);
 }

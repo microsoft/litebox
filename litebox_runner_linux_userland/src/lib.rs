@@ -370,6 +370,13 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         }
     }
 
+    // Set the worker ID for audit log disambiguation.
+    // Each runner process (init, fork-restore, worker-exec) gets a unique
+    // host OS PID, which distinguishes guest PIDs that are reused across
+    // SSH retries.
+    #[cfg(feature = "audit_log")]
+    litebox_shim_linux::audit::set_worker_id(std::process::id() as i32);
+
     // When running as a worker host for a non-PIE child exec, take the
     // simplified worker path that skips VA partitioning.
     if cli_args.worker_exec {

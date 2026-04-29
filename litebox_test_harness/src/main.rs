@@ -4494,19 +4494,21 @@ mod unix_socket_tests {
 
         if pid == 0 {
             // Child: close parent end, then trigger delayed fork commit
-            // by doing a non-pre-exec syscall (like Node.js does with
-            // setsockopt on the IPC fd), then exec.
+            // by doing a non-pre-exec syscall, then exec.
             unsafe { libc::close(parent_fd) };
-            // setsockopt is NOT a pre-exec syscall — triggers commit_delayed_fork
-            let val: i32 = 1;
-            unsafe {
-                libc::setsockopt(
-                    child_fd,
-                    libc::SOL_SOCKET,
-                    libc::SO_KEEPALIVE,
-                    &val as *const _ as *const libc::c_void,
-                    core::mem::size_of::<i32>() as libc::socklen_t,
-                );
+            // mmap is NOT pre-exec — triggers commit_delayed_fork.
+            let p = unsafe {
+                libc::mmap(
+                    core::ptr::null_mut(),
+                    4096,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                    -1,
+                    0,
+                )
+            };
+            if p != libc::MAP_FAILED {
+                unsafe { libc::munmap(p, 4096) };
             }
             let self_exe = std::env::current_exe().unwrap();
             let self_exe = self_exe.to_str().unwrap();
