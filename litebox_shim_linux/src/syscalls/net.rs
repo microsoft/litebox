@@ -683,10 +683,6 @@ impl<FS: ShimFS> GlobalState<FS> {
         fd: &SocketFd,
         peer: Option<&mut SocketAddr>,
     ) -> Result<SocketFd, TryOpError<Errno>> {
-        // Drive the smoltcp event loop explicitly since platform_interaction
-        // is Manual and automated_platform_interaction() is a no-op.
-        // This processes any pending packets (SYN-ACK, ACK) that may
-        // transition backlog sockets to Established.
         let mut net = self.net.lock();
         let _ = net.perform_platform_interaction();
         net.accept(fd, peer).map_err(|e| match e {
