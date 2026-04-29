@@ -473,8 +473,8 @@ impl<FS: ShimFS> UnixListenStream<FS> {
         };
 
         // Register a bridge observer: when the TCP proxy fires IN events
-        // (new connection ready), wake the backlog pollee so that the unix
-        // socket accept() loop drains TCP connections.
+        // (new connection ready), accept the TCP connection and push it into
+        // the backlog directly from the network thread.
         {
             use litebox::event::IOPollable;
             let bridge = Arc::new(BacklogTcpBridge {
@@ -1130,10 +1130,47 @@ impl<FS: ShimFS> UnixStream<FS> {
         mut peer: Option<&mut UnixSocketAddr>,
         is_nonblocking: bool,
     ) -> Result<UnixSocketInner<FS>, Errno> {
+        // Diagnostic: unconditional log to see if accept() is called at all.
+        {
+            let has_task = task.is_some();
+            self.with_state_ref(|state| {
+                if let Some(listen) = state.listen() {
+                    if let UnixBoundSocketAddr::Path((ref path, _, ref fs)) = *listen.backlog.addr {
+                        let diag = alloc::format!(
+                            "ACCEPT ENTRY: path={} has_task={} tcp_port={}\n",
+                            path, has_task, listen.tcp_port,
+                        );
+                        if let Ok(f) = fs.open("/tmp/unix-port-trace.log", OFlags::CREAT | OFlags::RDWR | OFlags::APPEND, Mode::RWXU) {
+                            let _ = fs.write(&f, diag.as_bytes(), None);
+                            let _ = fs.close(&f);
+                        }
+                    }
+                }
+            });
+        }
+
         let (backlog, tcp_proxy) = self.with_state_ref(|state| -> Result<_, Errno> {
             let listen = state.listen().ok_or(Errno::EINVAL)?;
             Ok((listen.backlog.clone(), listen.tcp_proxy.clone()))
         })?;
+
+        // Diagnostic: log whether tcp_proxy is available for this accept.
+        if let Some(task) = task {
+            self.with_state_ref(|state| {
+                if let Some(listen) = state.listen() {
+                    if let UnixBoundSocketAddr::Path((ref path, _, ref fs)) = *listen.backlog.addr {
+                        let diag = alloc::format!(
+                            "ACCEPT SETUP: path={} tcp_proxy={} tcp_raw_fd={:?} tcp_port={}\n",
+                            path, tcp_proxy.is_some(), listen.tcp_raw_fd, listen.tcp_port,
+                        );
+                        if let Ok(f) = fs.open("/tmp/unix-port-trace.log", OFlags::CREAT | OFlags::RDWR | OFlags::APPEND, Mode::RWXU) {
+                            let _ = fs.write(&f, diag.as_bytes(), None);
+                            let _ = fs.close(&f);
+                        }
+                    }
+                }
+            });
+        }
 
         cx.wait_on_events(
             is_nonblocking,
@@ -2212,22 +2249,27 @@ enum UnixEntryInner<FS: ShimFS> {
 /// Type alias for the global Unix socket address table.
 pub(crate) type UnixAddrTable<FS> = BTreeMap<UnixSocketAddrKey, UnixEntry<FS>>;
 
-/// Bridge observer that forwards TCP proxy IN events to the unix socket
-/// backlog pollee, waking accept() when cross-worker TCP connections arrive.
+/// Bridge observer that accepts cross-worker TCP connections when the
+/// network thread signals that a TCP handshake has completed. Pushes
+/// accepted connections into the unix socket backlog so that the guest's
+/// unix accept() returns them.
+///
+/// IMPORTANT: on_events is called from the network thread which holds
+/// the net mutex. We must NOT call Network::accept() here (deadlock).
+/// Instead we just notify the backlog pollee to wake the guest's
+/// accept() which will do the Network::accept() on the guest thread.
 struct BacklogTcpBridge<FS: ShimFS> {
     backlog: Arc<Backlog<FS>>,
 }
 
-// Safety: BacklogTcpBridge only holds an Arc and is Send+Sync if FS is.
+// Safety: BacklogTcpBridge holds an Arc, thread-safe.
 unsafe impl<FS: ShimFS> Send for BacklogTcpBridge<FS> {}
 unsafe impl<FS: ShimFS> Sync for BacklogTcpBridge<FS> {}
 
 impl<FS: ShimFS> litebox::event::observer::Observer<Events> for BacklogTcpBridge<FS> {
     fn on_events(&self, events: &Events) {
         if events.contains(Events::IN) {
-            use litebox::platform::DebugLogProvider as _;
-            litebox_platform_multiplex::platform()
-                .debug_log_print("UNIX TCP BRIDGE: TCP IN event → waking backlog pollee\n");
+            // Wake the guest's accept() which is blocked in wait_on_events.
             self.backlog.pollee.notify_observers(Events::IN);
         }
     }

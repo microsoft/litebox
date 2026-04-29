@@ -683,9 +683,11 @@ impl<FS: ShimFS> GlobalState<FS> {
         fd: &SocketFd,
         peer: Option<&mut SocketAddr>,
     ) -> Result<SocketFd, TryOpError<Errno>> {
-        let mut net = self.net.lock();
-        let _ = net.perform_platform_interaction();
-        net.accept(fd, peer).map_err(|e| match e {
+        // Don't call perform_platform_interaction() here — it holds the
+        // net mutex and prevents the network thread from processing packets.
+        // The network thread drives smoltcp continuously and will fire the
+        // observer when the TCP handshake completes.
+        self.net.lock().accept(fd, peer).map_err(|e| match e {
             AcceptError::NoConnectionsReady => TryOpError::TryAgain,
             AcceptError::InvalidFd | AcceptError::NotListening => TryOpError::Other(e.into()),
             _ => unimplemented!(),
