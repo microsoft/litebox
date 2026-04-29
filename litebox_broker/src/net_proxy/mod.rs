@@ -1012,9 +1012,23 @@ fn run_inner(
                     // IP — check if a worker registered a listen on this port
                     // via port_router (cross-worker loopback).
                     let routed_to_worker = port_router.has_route(dst_port);
+                    // Diagnostic for internal TCP ports.
+                    if dst_port >= 49000 {
+                        use std::io::Write;
+                        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/rst-diag.log") {
+                            let _ = writeln!(f, "BROKER SYN CHECK: dst_port={dst_port} routed={routed_to_worker} worker_id={worker_id}");
+                        }
+                    }
 
                     if routed_to_worker {
                         // Cross-worker loopback: create a TCP pair.
+                        // Diagnostic: log the routing.
+                        {
+                            use std::io::Write;
+                            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/rst-diag.log") {
+                                let _ = writeln!(f, "BROKER XWORKER LOOPBACK: dst_port={dst_port} src_port={src_port}");
+                            }
+                        }
                         // One end stays here (as a ready host stream for
                         // promote_established), the other end is routed
                         // to the target worker.
@@ -1590,6 +1604,13 @@ fn run_inner(
                     "received routed inbound stream for {}:{}",
                     routed.guest_ip, routed.guest_port
                 );
+                // Diagnostic: log to file.
+                {
+                    use std::io::Write;
+                    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/rst-diag.log") {
+                        let _ = writeln!(f, "BROKER ROUTED INBOUND: guest_ip={} guest_port={}", routed.guest_ip, routed.guest_port);
+                    }
+                }
                 routed.stream.set_nonblocking(true).ok();
 
                 // Create a smoltcp TCP socket connecting to the guest.

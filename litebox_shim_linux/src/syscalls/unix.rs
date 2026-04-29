@@ -1189,14 +1189,18 @@ impl<FS: ShimFS> UnixStream<FS> {
                             // Write diagnostic to a file visible to the test.
                             if let UnixBoundSocketAddr::Path((_, _, ref fs)) = *listen.backlog.addr {
                                 let diag_path = "/tmp/unix-tcp-accept-diag.log";
+                                // Count smoltcp TCP sockets in various states.
+                                let net = listen.global.net.lock();
+                                let local_addr = net.get_local_addr(tcp_fd).ok();
+                                drop(net);
                                 if let Ok(f) = fs.open(
                                     diag_path,
                                     OFlags::CREAT | OFlags::RDWR | OFlags::APPEND,
                                     Mode::RWXU,
                                 ) {
                                     let msg = alloc::format!(
-                                        "ACCEPT FAIL: port={} err={:?}\n",
-                                        listen.tcp_port, e,
+                                        "ACCEPT FAIL: port={} local_addr={:?} err={:?}\n",
+                                        listen.tcp_port, local_addr, e,
                                     );
                                     let _ = fs.write(&f, msg.as_bytes(), None);
                                     let _ = fs.close(&f);
