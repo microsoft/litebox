@@ -2432,9 +2432,8 @@ impl<FS: ShimFS> Task<FS> {
         self.record_syscall_entry(ctx, syscall_number);
 
         #[cfg(feature = "audit_log")]
-        let mut audit_event = audit::build_audit_event(&request);
-        #[cfg(feature = "audit_log")]
-        {
+        let (audit_seq, audit_syscall_name) = if audit::is_enabled() {
+            let mut audit_event = audit::build_audit_event(&request);
             audit_event.pid = self.pid;
             audit_event.tid = self.tid;
             let comm_bytes = self.comm.get();
@@ -2445,9 +2444,11 @@ impl<FS: ShimFS> Task<FS> {
             let _ = audit_event
                 .comm
                 .try_push_str(core::str::from_utf8(&comm_bytes[..comm_len]).unwrap_or("?"));
-        }
-        #[cfg(feature = "audit_log")]
-        let audit_seq = audit::emit_entry_event(&audit_event);
+            let name = audit_event.syscall_name;
+            (audit::emit_entry_event(&audit_event), name)
+        } else {
+            (0, "")
+        };
 
         let result = match request {
             SyscallRequest::Exit { status } => {
@@ -3361,13 +3362,13 @@ impl<FS: ShimFS> Task<FS> {
         };
 
         #[cfg(feature = "audit_log")]
-        {
+        if audit::is_enabled() {
             let result_val = match &result {
                 Ok(v) => Ok(*v),
                 Err(e) => Err(e.as_neg()),
             };
             audit::emit_exit_event(
-                audit_event.syscall_name,
+                audit_syscall_name,
                 audit_seq,
                 self.pid,
                 self.tid,

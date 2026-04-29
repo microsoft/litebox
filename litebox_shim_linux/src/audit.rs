@@ -26,6 +26,15 @@ static AUDIT_SEQ: AtomicU64 = AtomicU64::new(0);
 /// fork-restore/worker-exec workers (each has its own host PID).
 static WORKER_ID: AtomicI32 = AtomicI32::new(0);
 
+/// Check whether audit logging is active (an fd has been configured).
+///
+/// Callers use this to skip `build_audit_event` entirely when logging
+/// is disabled, avoiding the argument extraction overhead.
+#[inline]
+pub fn is_enabled() -> bool {
+    AUDIT_LOG_FD.load(Ordering::Relaxed) >= 0
+}
+
 /// Redirect audit events to the given host file descriptor.
 ///
 /// Call this before the guest starts. The fd must be a valid host-side file
@@ -194,16 +203,37 @@ pub fn emit_audit_event(event: &AuditEvent) {
 ///
 /// Returns the sequence number for pairing with the exit event.
 pub fn emit_entry_event(event: &AuditEvent) -> u64 {
+    let fd = AUDIT_LOG_FD.load(Ordering::Relaxed);
+    if fd < 0 {
+        return 0; // No audit log fd — skip formatting entirely.
+    }
     let seq = AUDIT_SEQ.fetch_add(1, Ordering::Relaxed);
     let worker = WORKER_ID.load(Ordering::Relaxed);
-    let msg = alloc::format!(
+    // Try stack-based formatting first (covers >99% of events).
+    let mut buf = ArrayString::<512>::new();
+    use core::fmt::Write;
+    let fit = write!(
+        &mut buf,
         "{{\"phase\":\"enter\",\"seq\":{seq},\"pid\":{},\"tid\":{},\"worker\":{worker},\"syscall\":\"{}\",\"args\":[{}]}}\n",
         event.pid,
         event.tid,
         event.syscall_name,
         FormatArgs(&event.args),
-    );
-    write_audit_line(&msg);
+    )
+    .is_ok();
+    if fit {
+        write_audit_line_to_fd(fd, buf.as_str());
+    } else {
+        // Rare: event too large for stack buffer (long paths). Fall back to heap.
+        let msg = alloc::format!(
+            "{{\"phase\":\"enter\",\"seq\":{seq},\"pid\":{},\"tid\":{},\"worker\":{worker},\"syscall\":\"{}\",\"args\":[{}]}}\n",
+            event.pid,
+            event.tid,
+            event.syscall_name,
+            FormatArgs(&event.args),
+        );
+        write_audit_line_to_fd(fd, &msg);
+    }
     seq
 }
 
@@ -215,15 +245,42 @@ pub fn emit_exit_event(
     tid: i32,
     result: Result<usize, i32>,
 ) {
-    let result_str = match result {
-        Ok(v) => alloc::format!("{{\"ok\":{v}}}"),
-        Err(e) => alloc::format!("{{\"err\":{e}}}"),
-    };
+    let fd = AUDIT_LOG_FD.load(Ordering::Relaxed);
+    if fd < 0 {
+        return; // No audit log fd — skip formatting entirely.
+    }
     let worker = WORKER_ID.load(Ordering::Relaxed);
-    let msg = alloc::format!(
-        "{{\"phase\":\"exit\",\"seq\":{seq},\"pid\":{pid},\"tid\":{tid},\"worker\":{worker},\"syscall\":\"{syscall_name}\",\"result\":{result_str}}}\n",
-    );
-    write_audit_line(&msg);
+    let mut buf = ArrayString::<256>::new();
+    use core::fmt::Write;
+    let fit = match result {
+        Ok(v) => write!(
+            &mut buf,
+            "{{\"phase\":\"exit\",\"seq\":{seq},\"pid\":{pid},\"tid\":{tid},\"worker\":{worker},\"syscall\":\"{syscall_name}\",\"result\":{{\"ok\":{v}}}}}\n",
+        ),
+        Err(e) => write!(
+            &mut buf,
+            "{{\"phase\":\"exit\",\"seq\":{seq},\"pid\":{pid},\"tid\":{tid},\"worker\":{worker},\"syscall\":\"{syscall_name}\",\"result\":{{\"err\":{e}}}}}\n",
+        ),
+    }
+    .is_ok();
+    if fit {
+        write_audit_line_to_fd(fd, buf.as_str());
+    } else {
+        let result_str = match result {
+            Ok(v) => alloc::format!("{{\"ok\":{v}}}"),
+            Err(e) => alloc::format!("{{\"err\":{e}}}"),
+        };
+        let msg = alloc::format!(
+            "{{\"phase\":\"exit\",\"seq\":{seq},\"pid\":{pid},\"tid\":{tid},\"worker\":{worker},\"syscall\":\"{syscall_name}\",\"result\":{result_str}}}\n",
+        );
+        write_audit_line_to_fd(fd, &msg);
+    }
+}
+
+/// Write a line directly to the given audit log fd.
+fn write_audit_line_to_fd(fd: i32, msg: &str) {
+    use litebox::platform::DebugLogProvider as _;
+    litebox_platform_multiplex::platform().debug_log_write_to_fd(fd, msg);
 }
 
 /// Write a line to the audit log fd. If no fd was configured via
@@ -231,12 +288,8 @@ pub fn emit_exit_event(
 fn write_audit_line(msg: &str) {
     let fd = AUDIT_LOG_FD.load(Ordering::Relaxed);
     if fd >= 0 {
-        use litebox::platform::DebugLogProvider as _;
-        if !litebox_platform_multiplex::platform().debug_log_write_to_fd(fd, msg) {
-            // fd write failed — drop the event rather than polluting stderr.
-        }
+        write_audit_line_to_fd(fd, msg);
     }
-    // No fd configured → silently discard.
 }
 
 /// Helper for formatting args in the entry event.
