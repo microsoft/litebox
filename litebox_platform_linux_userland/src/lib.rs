@@ -1197,6 +1197,7 @@ impl LinuxUserland {
         guest_interp_image: Option<(&str, &[u8])>,
         stdio: WorkerExecStdioBindings<FS, LinuxUserland>,
         direct_pipe_io: bool,
+        extra_fds: &[(usize, i32)],
     ) -> Result<WorkerExecSpawnResult, i32>
     where
         FS: litebox::fs::FileSystem + Send + Sync + 'static,
@@ -1290,6 +1291,15 @@ impl LinuxUserland {
         spawn_argv.push(CString::new(guest_binary_path).map_err(|_| -1_i32)?);
         for arg in argv {
             spawn_argv.push(arg.clone());
+        }
+
+        // Add --pipe-bridge for extra inherited fds (e.g. socketpair IPC).
+        for &(guest_fd, host_fd) in extra_fds {
+            let _ = self.clear_cloexec(host_fd);
+            spawn_argv.push(CString::new("--pipe-bridge").unwrap());
+            spawn_argv.push(
+                CString::new(format!("{guest_fd}:b:{host_fd}")).map_err(|_| -1_i32)?,
+            );
         }
 
         let argv_ptrs: Vec<*const libc::c_char> = spawn_argv

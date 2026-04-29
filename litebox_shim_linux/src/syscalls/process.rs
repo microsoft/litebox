@@ -45,6 +45,8 @@ use litebox_platform_multiplex::Platform;
 type ExecVforkInfo = (
     Arc<crate::VforkDone>,
     Vec<(usize, super::host_pipe::HostPipeDirection, usize)>,
+    // parent_unix_socket_fds: (fd, pair_id, object_id)
+    Vec<(usize, usize, u64)>,
 );
 
 /// Process-management-related state on [`Task`].
@@ -8486,7 +8488,7 @@ impl<FS: ShimFS> Task<FS> {
         // Helper: signal VforkDone (if present) so the parent is never left
         // blocked on error.
         let signal_on_error = |vfork_info: &Option<ExecVforkInfo>| {
-            if let Some((vd, _)) = vfork_info {
+            if let Some((vd, _, _)) = vfork_info {
                 vd.signal();
             }
         };
@@ -8501,6 +8503,54 @@ impl<FS: ShimFS> Task<FS> {
             );
             signal_on_error(&vfork_info);
         })?;
+
+        // Collect non-stdio unix socket fds without CLOEXEC to bridge
+        // to the remote worker (e.g. Node.js IPC socketpair on fd 3).
+        // Create OS socketpair for each so the child can read/write.
+        let mut extra_fds: Vec<(usize, i32)> = Vec::new();
+        let mut parent_bidi_replacements: Vec<(usize, i32, usize, u64)> = Vec::new(); // (child_guest_fd, parent_os_fd, pair_id, child_oid)
+        {
+            // Phase 1: collect unix socket fds and pair_ids under read lock.
+            let socket_info: Vec<(
+                usize,
+                usize,
+                u64,
+                alloc::sync::Arc<litebox::fd::TypedFd<super::unix::UnixSocketSubsystem<FS>>>,
+            )> = {
+                let files = self.files.borrow();
+                let rds = files.raw_descriptor_store.read();
+                let dt = self.global.litebox.descriptor_table();
+                let mut out = Vec::new();
+                for raw_fd in rds.iter_alive() {
+                    if raw_fd <= 2 { continue; }
+                    if let Ok(typed) = rds.fd_from_raw_integer::<
+                        super::unix::UnixSocketSubsystem<FS>,
+                    >(raw_fd) {
+                        let pair_id = dt
+                            .with_entry(&typed, |sock: &super::unix::UnixSocket<FS>| {
+                                sock.socket_pair_id()
+                            })
+                            .flatten();
+                        if let Some(pair_id) = pair_id {
+                            out.push((raw_fd, pair_id, typed.object_id().as_u64(), typed));
+                        }
+                    }
+                }
+                out
+            }; // rds + dt dropped
+
+            // Phase 2: create bridges for all non-stdio socket fds.
+            // CLOEXEC check is skipped — if the fd had CLOEXEC, exec would
+            // close it anyway and the bridge fd is harmless (unused by child).
+            for (raw_fd, pair_id, oid, _typed) in &socket_info {
+                if let Ok((child_end, parent_end)) =
+                    self.global.platform.create_host_socketpair()
+                {
+                    extra_fds.push((*raw_fd, child_end));
+                    parent_bidi_replacements.push((*raw_fd, parent_end, *pair_id, *oid));
+                }
+            }
+        }
 
         // Resolve the worker load path through the current guest filesystem so
         // transferred images materialize at their real lower-tree locations
@@ -8529,6 +8579,7 @@ impl<FS: ShimFS> Task<FS> {
                 // non-PIE exec transparent to the parent — data flows through
                 // the child's existing pipe chain, identical to PIE exec.
                 false,
+                &extra_fds,
             )
             .map_err(|_err| {
                 #[cfg(feature = "trace_syscalls")]
@@ -8538,15 +8589,48 @@ impl<FS: ShimFS> Task<FS> {
                     self.pid,
                     _err,
                 );
+                // Clean up bidi socketpair fds on failure.
+                for &(_, child_fd) in &extra_fds {
+                    self.global.platform.close_host_fd(child_fd);
+                }
+                for &(_, parent_fd, _, _) in &parent_bidi_replacements {
+                    self.global.platform.close_host_fd(parent_fd);
+                }
                 signal_on_error(&vfork_info);
                 Errno::ENOMEM
             })?;
 
-        // Signal VforkDone so the parent can continue.  No fd replacements
-        // needed — the remote worker uses the child's stdio, which already
-        // connects to the parent's pipe chain.
-        if let Some((vd, _)) = &vfork_info {
+        // Close child ends of bidi socketpair bridges (child inherited them).
+        for &(_, child_fd) in &extra_fds {
+            self.global.platform.close_host_fd(child_fd);
+        }
+
+        // Replace parent's peer unix socket fds with HostPipeFd backed
+        // by the OS socketpair parent end. Find the peer by pair_id.
+        if let Some((vd, _parent_pipe_fds, parent_socket_fds)) = &vfork_info {
+            for &(child_guest_fd, parent_os_fd, child_pair_id, child_oid) in &parent_bidi_replacements {
+                let mut stored = false;
+                for &(parent_fd, parent_pair_id, parent_oid) in parent_socket_fds {
+                    if parent_pair_id == child_pair_id && parent_oid != child_oid {
+                        vd.fd_replacements.lock().push(crate::FdReplacement {
+                            guest_fd: parent_fd,
+                            host_fd: parent_os_fd,
+                            direction: super::host_pipe::HostPipeDirection::ReadWrite,
+                            subsystem: crate::ReplacedSubsystem::UnixSocket,
+                        });
+                        stored = true;
+                    }
+                }
+                if !stored {
+                    self.global.platform.close_host_fd(parent_os_fd);
+                }
+            }
             vd.signal();
+        } else {
+            // No vfork info — close parent OS fds, signal nothing.
+            for &(_, parent_fd, _, _) in &parent_bidi_replacements {
+                self.global.platform.close_host_fd(parent_fd);
+            }
         }
 
         let host_pid = spawn_result.host_pid;
@@ -8799,7 +8883,7 @@ impl<FS: ShimFS> Task<FS> {
                 // Don't signal VforkDone here — exec_on_remote_host will signal
                 // it after spawning the worker and setting up pipe replacements
                 // so the parent can use direct HostPipeFd I/O.
-                vfork_info_for_exec = Some((fc.vfork_done, fc.parent_pipe_fds));
+                vfork_info_for_exec = Some((fc.vfork_done, fc.parent_pipe_fds, fc.parent_unix_socket_fds));
                 detached_from_shared_fork = true;
             }
             let Some(remote_exec_image) = remote_exec_image.as_deref() else {
