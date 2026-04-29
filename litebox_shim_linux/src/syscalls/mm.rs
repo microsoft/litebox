@@ -5,7 +5,6 @@
 //! Most of these syscalls which are not backed by files are implemented in [`litebox_common_linux::mm`].
 
 use alloc::collections::BTreeMap;
-use alloc::collections::BTreeSet;
 use litebox::{
     mm::linux::{MappingError, PAGE_SIZE, PageRange},
     platform::{
@@ -48,9 +47,11 @@ pub(crate) struct ElfPatchState {
     /// Whether any runtime-generated stubs were successfully linked from code
     /// in this fd to the trampoline.
     pub runtime_patches_committed: bool,
-    /// File offsets of segments that have already been patched. Guards against
+    /// Virtual address ranges that have already been patched. Guards against
     /// double-patching if the same segment is re-mapped (e.g. MAP_FIXED).
-    pub patched_offsets: BTreeSet<usize>,
+    /// Maps (vaddr, len) → file_offset so that munmap can clear entries and
+    /// allow re-patching if the region is mapped again with fresh file bytes.
+    pub patched_mappings: BTreeMap<(usize, usize), usize>,
 }
 
 /// Per-process collection of ELF patching state, keyed by fd number.
@@ -367,7 +368,26 @@ impl<FS: ShimFS> Task<FS> {
     /// Handle syscall `munmap`
     #[inline]
     pub(crate) fn sys_munmap(&self, addr: crate::MutPtr<u8>, len: usize) -> Result<(), Errno> {
-        litebox_common_linux::mm::sys_munmap(&self.global.pm, addr, len)
+        let result = litebox_common_linux::mm::sys_munmap(&self.global.pm, addr, len);
+        if result.is_ok() {
+            self.clear_patched_offsets_for_range(addr.as_usize(), len);
+        }
+        result
+    }
+
+    /// Clear `patched_mappings` entries for any segments that overlap the
+    /// unmapped range, so that re-mapping the same file region will be
+    /// re-patched instead of skipped.
+    fn clear_patched_offsets_for_range(&self, unmap_start: usize, unmap_len: usize) {
+        let unmap_end = unmap_start.saturating_add(unmap_len);
+        let mut cache = self.global.elf_patch_cache.lock();
+        for state in cache.values_mut() {
+            state.patched_mappings.retain(|&(vaddr, seg_len), _| {
+                let seg_end = vaddr.saturating_add(seg_len);
+                // Keep entries that don't overlap the unmapped range.
+                seg_end <= unmap_start || vaddr >= unmap_end
+            });
+        }
     }
 
     /// Handle syscall `mprotect`
@@ -532,7 +552,7 @@ impl<FS: ShimFS> Task<FS> {
             trampoline_mapped: false,
             trampoline_mapped_len: 0,
             runtime_patches_committed: false,
-            patched_offsets: BTreeSet::new(),
+            patched_mappings: BTreeMap::new(),
         });
     }
 
@@ -730,9 +750,11 @@ impl<FS: ShimFS> Task<FS> {
         // Guard against double-patching the same segment (e.g. MAP_FIXED
         // re-mapping). Feeding already-rewritten JMP instructions back into
         // the rewriter would corrupt code.
-        if !state.patched_offsets.insert(offset) {
+        let mapping_key = (mapped_addr.as_usize(), len);
+        if state.patched_mappings.contains_key(&mapping_key) {
             return true;
         }
+        state.patched_mappings.insert(mapping_key, offset);
 
         let restore_trampoline_rx = |task: &Self, state: &ElfPatchState| {
             if state.trampoline_mapped_len > 0 {
@@ -876,7 +898,15 @@ impl<FS: ShimFS> Task<FS> {
                 state.runtime_patches_committed = true;
             }
             Ok(_) => {
-                // No syscalls found — no patching needed.
+                // No trampoline stubs were generated, but the rewriter may
+                // have replaced unpatchable syscalls with trap instructions.
+                // Write back the modified code if it changed.
+                if code_buf != original_code && mapped_addr.copy_from_slice(0, &code_buf).is_none()
+                {
+                    litebox_util_log::warn!("failed to write trap bytes back to code segment");
+                    let _ = mapped_addr.copy_from_slice(0, &original_code);
+                }
+                // Fall through to restore RX protections below.
             }
             Err(e) => {
                 litebox_util_log::warn!(err:? = e; "failed to patch code segment");
