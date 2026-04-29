@@ -651,8 +651,7 @@ impl<FS: ShimFS> Task<FS> {
         let files = self.files.borrow();
 
         // Create a temporary file path that won't collide.
-        static PROC_COUNTER: core::sync::atomic::AtomicU64 =
-            core::sync::atomic::AtomicU64::new(0);
+        static PROC_COUNTER: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
         let n = PROC_COUNTER.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         let tmp_path = alloc::format!("/tmp/.proc_synthetic_{n}");
 
@@ -665,7 +664,10 @@ impl<FS: ShimFS> Task<FS> {
                 litebox::fs::Mode::RWXU,
             )
             .map_err(Errno::from)?;
-        files.fs.write(&write_fd, contents.as_bytes(), None).map_err(Errno::from)?;
+        files
+            .fs
+            .write(&write_fd, contents.as_bytes(), None)
+            .map_err(Errno::from)?;
         files.fs.close(&write_fd).map_err(Errno::from)?;
 
         let read_fd = files
@@ -2030,7 +2032,8 @@ impl<FS: ShimFS> Task<FS> {
             litebox::log_println!(
                 self.global.platform,
                 "NET CLOSE: fd={} pid={}",
-                raw_fd, self.pid
+                raw_fd,
+                self.pid
             );
             return self.global.close_socket(&self.wait_cx(), fd);
         }

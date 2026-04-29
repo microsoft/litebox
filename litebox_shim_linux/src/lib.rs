@@ -548,7 +548,8 @@ impl<FS: ShimFS> LinuxShim<FS> {
             let msg = alloc::format!(
                 "SHIM RST: src={src_port} dst={dst_port} \
                  tcp_sockets={} listen_sockets={} listen_ports={listen_ports:?}\n",
-                summary.tcp_count, summary.listen_count
+                summary.tcp_count,
+                summary.listen_count
             );
             use litebox::platform::DebugLogProvider as _;
             litebox_platform_multiplex::platform().debug_log_print(&msg);

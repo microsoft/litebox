@@ -262,7 +262,7 @@ impl<FS: ShimFS> UnixInitStream<FS> {
             backlog,
             global: global.clone(),
             tcp_port: 0,
-            tcp_fd: None,
+            tcp_raw_fd: None,
             tcp_proxy: None,
             _tcp_bridge: None,
         })
@@ -392,8 +392,8 @@ struct UnixListenStream<FS: ShimFS> {
     global: Arc<GlobalState<FS>>,
     /// TCP port allocated for cross-worker connections (0 = none).
     tcp_port: u16,
-    /// TCP socket fd for the cross-worker listener (if allocated).
-    tcp_fd: Option<crate::syscalls::net::SocketFd>,
+    /// Raw fd for the cross-worker TCP listener (if allocated).
+    tcp_raw_fd: Option<u32>,
     /// TCP proxy for the cross-worker listener (for observer registration).
     tcp_proxy: Option<Arc<litebox::net::socket_channel::NetworkProxy<crate::Platform>>>,
     /// Bridge observer kept alive to forward TCP events to backlog pollee.
@@ -421,55 +421,56 @@ impl<FS: ShimFS> UnixListenStream<FS> {
 
     /// Allocate an internal TCP listener for cross-worker unix socket connections.
     ///
-    /// Creates a TCP socket, binds to an ephemeral port, and starts listening.
+    /// Uses the guest syscall path (`do_socket`/`do_bind`/`do_listen`) so that
+    /// TCP SYN packets are properly routed through the broker even when
+    /// `platform_interaction = Manual`.
     /// Returns the allocated port number (0 on failure).
-    fn start_tcp_listener(
-        &mut self,
-        global: &Arc<GlobalState<FS>>,
-        cx: &WaitContext<'_, crate::Platform>,
-    ) -> u16 {
+    fn start_tcp_listener(&mut self, global: &Arc<GlobalState<FS>>, task: &Task<FS>) -> u16 {
         use litebox::platform::DebugLogProvider as _;
+        use litebox_common_linux::{AddressFamily, SockFlags, SockType};
 
-        // Create TCP socket.
-        let tcp_fd = match global.net.lock().socket(litebox::net::Protocol::Tcp) {
-            Ok(fd) => fd,
-            Err(e) => {
-                let msg = alloc::format!("UNIX TCP LISTENER: socket failed: {:?}\n", e);
-                litebox_platform_multiplex::platform().debug_log_print(&msg);
-                return 0;
-            }
-        };
-
-        // Initialize the socket proxy so the network subsystem can drive I/O.
-        let tcp_proxy = global.initialize_socket(&tcp_fd, SockType::Stream, SockFlags::empty());
+        // Create TCP socket via guest syscall path.
+        let raw_fd =
+            match task.do_socket(AddressFamily::INET, SockType::Stream, SockFlags::empty(), 0) {
+                Ok(fd) => fd,
+                Err(e) => {
+                    let msg = alloc::format!("UNIX TCP LISTENER: socket failed: {:?}\n", e);
+                    litebox_platform_multiplex::platform().debug_log_print(&msg);
+                    return 0;
+                }
+            };
 
         // Bind to ephemeral port (port 0 = kernel picks).
-        let bind_addr = core::net::SocketAddr::V4(core::net::SocketAddrV4::new(
-            core::net::Ipv4Addr::UNSPECIFIED,
-            0,
+        let bind_addr = crate::syscalls::net::SocketAddress::Inet(core::net::SocketAddr::V4(
+            core::net::SocketAddrV4::new(core::net::Ipv4Addr::UNSPECIFIED, 0),
         ));
-        if let Err(e) = global.net.lock().bind(&tcp_fd, &bind_addr) {
+        if let Err(e) = task.do_bind(raw_fd, bind_addr) {
             let msg = alloc::format!("UNIX TCP LISTENER: bind failed: {:?}\n", e);
             litebox_platform_multiplex::platform().debug_log_print(&msg);
             return 0;
         }
 
-        // Get the assigned port.
-        let port = match global.net.lock().get_local_addr(&tcp_fd) {
-            Ok(addr) => addr.port(),
-            Err(_) => return 0,
-        };
-
         // Start listening.
-        if let Err(e) = global.net.lock().listen(&tcp_fd, 8) {
+        if let Err(e) = task.do_listen(raw_fd, 8) {
             let msg = alloc::format!("UNIX TCP LISTENER: listen failed: {:?}\n", e);
             litebox_platform_multiplex::platform().debug_log_print(&msg);
             return 0;
         }
 
-        use litebox::platform::DebugLogProvider as _;
+        // Get the assigned port.
+        let port = match task.do_getsockname_inet_port(raw_fd) {
+            Some(p) if p != 0 => p,
+            _ => return 0,
+        };
+
         let msg = alloc::format!("UNIX TCP LISTENER: port={} started\n", port);
         litebox_platform_multiplex::platform().debug_log_print(&msg);
+
+        // Get the proxy for the TCP socket.
+        let tcp_proxy = match global.get_proxy_by_raw_fd(raw_fd, &task.files) {
+            Some(p) => p,
+            None => return 0,
+        };
 
         // Register a bridge observer: when the TCP proxy fires IN events
         // (new connection ready), wake the backlog pollee so that the unix
@@ -479,57 +480,26 @@ impl<FS: ShimFS> UnixListenStream<FS> {
             let bridge = Arc::new(BacklogTcpBridge {
                 backlog: self.backlog.clone(),
             });
-            let bridge_weak = Arc::downgrade(&bridge)
-                as Weak<dyn litebox::event::observer::Observer<Events>>;
+            let bridge_weak =
+                Arc::downgrade(&bridge) as Weak<dyn litebox::event::observer::Observer<Events>>;
             tcp_proxy.register_observer(bridge_weak, Events::IN);
             self._tcp_bridge = Some(bridge);
         }
 
         self.tcp_port = port;
-        self.tcp_fd = Some(tcp_fd);
+        self.tcp_raw_fd = Some(raw_fd);
         self.tcp_proxy = Some(tcp_proxy);
         port
     }
 
     /// Drain pending TCP connections from the internal TCP listener and push
     /// them into the unix socket backlog as TCP-backed connected streams.
+    ///
+    /// Note: With the guest syscall path, TCP accept is handled in
+    /// `UnixStream::accept()` using `task.do_accept()`. This method is
+    /// retained for potential future use.
     fn drain_tcp_to_backlog(&self) {
-        let Some(tcp_fd) = &self.tcp_fd else { return };
-
-        loop {
-            // Non-blocking try_accept on the internal TCP socket.
-            // This also drives automated_platform_interaction() to process
-            // pending smoltcp packets (TCP handshake progress).
-            let accepted_fd = match self.global.net.lock().accept(tcp_fd, None) {
-                Ok(fd) => fd,
-                Err(_) => break, // No pending connections.
-            };
-
-            // Initialize the accepted TCP socket's proxy.
-            let proxy = self.global.initialize_socket(
-                &accepted_fd,
-                SockType::Stream,
-                SockFlags::empty(),
-            );
-
-            // Create a TCP-backed unix connected stream and push it
-            // into the backlog so accept() returns it.
-            let server_stream = UnixConnectedStream {
-                addr: AddrView {
-                    addr: Some(self.backlog.addr.clone()),
-                    peer: None,
-                },
-                transport: UnixTransport::Tcp { proxy },
-                peer_cred: self.backlog.listener_cred,
-                pollee: Arc::new(Pollee::new()),
-            };
-
-            let mut sockets = self.backlog.sockets.lock();
-            if let Some(sockets) = &mut *sockets {
-                sockets.push_back(server_stream);
-                self.backlog.pollee.notify_observers(Events::IN);
-            }
-        }
+        // TCP accept is now done via guest syscall path in UnixStream::accept().
     }
 }
 
@@ -542,13 +512,8 @@ impl<FS: ShimFS> Drop for UnixListenStream<FS> {
             remove_sidecar(fs.as_ref(), path.as_str());
         }
 
-        // Close the internal TCP listener if we allocated one.
-        if let Some(tcp_fd) = self.tcp_fd.take() {
-            let _ = self.global.net.lock().close(
-                &tcp_fd,
-                litebox::net::CloseBehavior::Immediate,
-            );
-        }
+        // The internal TCP listener raw fd is cleaned up when the process
+        // exits (it lives in the guest fd table managed by do_socket).
 
         let key = self.backlog.addr.to_key();
         let mut table = self.global.unix_addr_table.write();
@@ -723,12 +688,10 @@ impl<FS: ShimFS> UnixConnectedStream<FS> {
             UnixTransport::Tcp { proxy } => {
                 use litebox::net::socket_channel::NetworkProxy;
                 match proxy.as_ref() {
-                    NetworkProxy::Stream(stream) => {
-                        match stream.try_write(&msg.data) {
-                            Ok(_n) => Ok(()),
-                            Err(_) => Err((msg, Errno::EPIPE)),
-                        }
-                    }
+                    NetworkProxy::Stream(stream) => match stream.try_write(&msg.data) {
+                        Ok(_n) => Ok(()),
+                        Err(_) => Err((msg, Errno::EPIPE)),
+                    },
                     _ => Err((msg, Errno::EINVAL)),
                 }
             }
@@ -952,7 +915,7 @@ impl<FS: ShimFS> UnixStream<FS> {
                                 // Allocate an ephemeral TCP port for cross-worker
                                 // connections. Create a TCP listener socket and
                                 // register it so the broker routes connections here.
-                                let tcp_port = listen.start_tcp_listener(global, &task.wait_cx());
+                                let tcp_port = listen.start_tcp_listener(global, task);
                                 if tcp_port != 0 {
                                     write_sidecar(fs.as_ref(), path.as_str(), tcp_port);
                                 }
@@ -1077,22 +1040,29 @@ impl<FS: ShimFS> UnixStream<FS> {
         );
         litebox_platform_multiplex::platform().debug_log_print(&msg);
 
-        // Create an internal TCP socket and connect to 127.0.0.1:<tcp_port>.
-        let tcp_fd = task
-            .global
-            .net
-            .lock()
-            .socket(litebox::net::Protocol::Tcp)
+        // Create an internal TCP socket and connect through the guest syscall
+        // path so the SYN goes through the broker's port router.
+        let tcp_raw_fd = task
+            .do_socket(
+                litebox_common_linux::AddressFamily::INET,
+                SockType::Stream,
+                SockFlags::empty(),
+                0,
+            )
             .map_err(|_| Errno::ENOMEM)?;
-        let proxy = task.global.initialize_socket(&tcp_fd, SockType::Stream, SockFlags::empty());
 
-        let sockaddr = core::net::SocketAddr::V4(core::net::SocketAddrV4::new(
-            core::net::Ipv4Addr::LOCALHOST,
-            tcp_port,
+        let connect_addr = super::net::SocketAddress::Inet(core::net::SocketAddr::V4(
+            core::net::SocketAddrV4::new(core::net::Ipv4Addr::LOCALHOST, tcp_port),
         ));
+        task.do_connect(tcp_raw_fd, connect_addr)?;
 
-        // Perform TCP connect (goes through smoltcp → broker → PortRouter).
-        task.global.connect(&task.wait_cx(), &tcp_fd, sockaddr)?;
+        // Get the proxy for the connected TCP socket.
+        let proxy = task.files.borrow().with_socket(
+            &task.global,
+            tcp_raw_fd,
+            |fd| task.global.get_proxy(fd),
+            |_| Err(Errno::EINVAL),
+        )?;
 
         // Wrap the TCP proxy in a unix-socket connected stream.
         let peer_addr = UnixBoundSocketAddr::Path((
@@ -1100,7 +1070,8 @@ impl<FS: ShimFS> UnixStream<FS> {
             // We don't have the actual file fd for the remote socket, use a
             // dummy open so AddrView can report the path.
             {
-                let f = fs.open("/dev/null", OFlags::RDONLY, Mode::empty())
+                let f = fs
+                    .open("/dev/null", OFlags::RDONLY, Mode::empty())
                     .map_err(|_| Errno::ECONNREFUSED)?;
                 f
             },
@@ -1126,6 +1097,7 @@ impl<FS: ShimFS> UnixStream<FS> {
 
     fn accept(
         &self,
+        task: Option<&Task<FS>>,
         cx: &WaitContext<'_, crate::Platform>,
         mut peer: Option<&mut UnixSocketAddr>,
         is_nonblocking: bool,
@@ -1163,61 +1135,43 @@ impl<FS: ShimFS> UnixStream<FS> {
                     Err(e) => return Err(e),
                 }
 
-                // Then try to accept from the internal TCP listener (cross-worker).
-                // Access tcp_fd from the listen state each time since it's not Clone.
-                let result = self.with_state_ref(|state| {
-                    let listen = state.listen()?;
-                    let tcp_fd = listen.tcp_fd.as_ref()?;
-                    match listen.global.try_accept(tcp_fd, None) {
-                        Ok(accepted) => {
-                            let proxy = listen.global.initialize_socket(
-                                &accepted,
-                                SockType::Stream,
-                                SockFlags::empty(),
-                            );
-                            Some(UnixConnectedStream {
-                                addr: AddrView {
-                                    addr: Some(listen.backlog.addr.clone()),
-                                    peer: None,
-                                },
-                                transport: UnixTransport::Tcp { proxy },
-                                peer_cred: listen.backlog.listener_cred,
-                                pollee: Arc::new(Pollee::new()),
-                            })
-                        }
-                        Err(ref e) => {
-                            // Write diagnostic to a file visible to the test.
-                            if let UnixBoundSocketAddr::Path((_, _, ref fs)) = *listen.backlog.addr {
-                                let diag_path = "/tmp/unix-tcp-accept-diag.log";
-                                // Count smoltcp TCP sockets in various states.
-                                let net = listen.global.net.lock();
-                                let local_addr = net.get_local_addr(tcp_fd).ok();
-                                drop(net);
-                                if let Ok(f) = fs.open(
-                                    diag_path,
-                                    OFlags::CREAT | OFlags::RDWR | OFlags::APPEND,
-                                    Mode::RWXU,
-                                ) {
-                                    let msg = alloc::format!(
-                                        "ACCEPT FAIL: port={} local_addr={:?} err={:?}\n",
-                                        listen.tcp_port, local_addr, e,
-                                    );
-                                    let _ = fs.write(&f, msg.as_bytes(), None);
-                                    let _ = fs.close(&f);
-                                }
-                            }
-                            None
-                        }
-                    }
-                });
+                // Then try to accept from the internal TCP listener (cross-worker)
+                // using the guest syscall path so TCP SYN packets reach the broker.
+                if let Some(task) = task {
+                    let result = self.with_state_ref(|state| -> Option<UnixConnectedStream<FS>> {
+                        let listen = state.listen()?;
+                        let raw_fd = listen.tcp_raw_fd?;
+                        // Non-blocking try_accept: look up SocketFd via
+                        // get_proxy_by_raw_fd then try_accept on the network.
+                        let accepted_fd = {
+                            // We need to go through the descriptor table directly
+                            // since with_socket is private. Use try_accept_by_raw_fd.
+                            listen.global.try_accept_by_raw_fd(raw_fd, &task.files).ok()?
+                        };
+                        let proxy = listen.global.initialize_socket(
+                            &accepted_fd,
+                            SockType::Stream,
+                            SockFlags::empty(),
+                        );
+                        Some(UnixConnectedStream {
+                            addr: AddrView {
+                                addr: Some(listen.backlog.addr.clone()),
+                                peer: None,
+                            },
+                            transport: UnixTransport::Tcp { proxy },
+                            peer_cred: listen.backlog.listener_cred,
+                            pollee: Arc::new(Pollee::new()),
+                        })
+                    });
 
-                if let Some(connected) = result {
-                    if let Some(peer) = peer.as_deref_mut() {
-                        *peer = connected.get_peer_addr();
+                    if let Some(connected) = result {
+                        if let Some(peer) = peer.as_deref_mut() {
+                            *peer = connected.get_peer_addr();
+                        }
+                        return Ok(UnixSocketInner::Stream(UnixStream::new(
+                            UnixStreamState::Connected(connected),
+                        )));
                     }
-                    return Ok(UnixSocketInner::Stream(UnixStream::new(
-                        UnixStreamState::Connected(connected),
-                    )));
                 }
 
                 Err(TryOpError::TryAgain)
@@ -1815,7 +1769,11 @@ impl<FS: ShimFS> UnixSocket<FS> {
                         use litebox::net::socket_channel::NetworkProxy;
                         if let NetworkProxy::Stream(stream) = proxy.as_ref() {
                             let mut buf = alloc::vec![0u8; UNIX_BUF_SIZE];
-                            match stream.try_read(&mut buf, litebox::net::ReceiveFlags::empty(), None) {
+                            match stream.try_read(
+                                &mut buf,
+                                litebox::net::ReceiveFlags::empty(),
+                                None,
+                            ) {
                                 Ok(n) => {
                                     buf.truncate(n);
                                     Some(Message {
@@ -1863,6 +1821,7 @@ impl<FS: ShimFS> UnixSocket<FS> {
 
     pub(super) fn accept(
         &self,
+        task: Option<&Task<FS>>,
         cx: &WaitContext<'_, crate::Platform>,
         flags: SockFlags,
         peer: Option<&mut UnixSocketAddr>,
@@ -1870,6 +1829,7 @@ impl<FS: ShimFS> UnixSocket<FS> {
         match &self.inner {
             UnixSocketInner::Stream(stream) => {
                 let accepted = stream.accept(
+                    task,
                     cx,
                     peer,
                     self.get_status().contains(OFlags::NONBLOCK)
@@ -2223,9 +2183,8 @@ impl<FS: ShimFS> litebox::event::observer::Observer<Events> for BacklogTcpBridge
     fn on_events(&self, events: &Events) {
         if events.contains(Events::IN) {
             use litebox::platform::DebugLogProvider as _;
-            litebox_platform_multiplex::platform().debug_log_print(
-                "UNIX TCP BRIDGE: TCP IN event → waking backlog pollee\n",
-            );
+            litebox_platform_multiplex::platform()
+                .debug_log_print("UNIX TCP BRIDGE: TCP IN event → waking backlog pollee\n");
             self.backlog.pollee.notify_observers(Events::IN);
         }
     }
