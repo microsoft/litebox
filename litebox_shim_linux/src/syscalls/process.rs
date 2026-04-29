@@ -8546,8 +8546,21 @@ impl<FS: ShimFS> Task<FS> {
                 if let Ok((child_end, parent_end)) =
                     self.global.platform.create_host_socketpair()
                 {
-                    extra_fds.push((*raw_fd, child_end));
-                    parent_bidi_replacements.push((*raw_fd, parent_end, *pair_id, *oid));
+                    // Dup parent end to a high fd number to prevent
+                    // clobbering by memfd/pipe creation in spawn.
+                    let safe_parent = self.global.platform.dup_host_fd(parent_end);
+                    match safe_parent {
+                        Ok(safe_fd) => {
+                            self.global.platform.close_host_fd(parent_end);
+                            extra_fds.push((*raw_fd, child_end));
+                            parent_bidi_replacements.push((*raw_fd, safe_fd, *pair_id, *oid));
+                        }
+                        Err(_) => {
+                            // dup failed — use original (risky)
+                            extra_fds.push((*raw_fd, child_end));
+                            parent_bidi_replacements.push((*raw_fd, parent_end, *pair_id, *oid));
+                        }
+                    }
                 }
             }
         }

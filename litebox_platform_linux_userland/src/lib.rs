@@ -1221,6 +1221,23 @@ impl LinuxUserland {
 
         let _spawn_guard = self.worker_spawn_serial.lock().unwrap();
         self.reap_finished_worker_bridge_threads();
+
+        // Dup extra_fds to high fd numbers so they don't get clobbered by
+        // memfd/pipe creation below. The original fds are closed after dup.
+        let mut safe_extra_fds: Vec<(usize, i32)> = Vec::new();
+        for &(guest_fd, host_fd) in extra_fds {
+            // F_DUPFD_CLOEXEC with min=100 to get a high fd number.
+            // We'll clear CLOEXEC later before spawn.
+            let safe_fd = unsafe { libc::fcntl(host_fd, libc::F_DUPFD, 100) };
+            if safe_fd >= 0 {
+                unsafe { libc::close(host_fd) };
+                safe_extra_fds.push((guest_fd, safe_fd));
+            } else {
+                // dup failed — keep original (risky but better than nothing).
+                safe_extra_fds.push((guest_fd, host_fd));
+            }
+        }
+
         let exec_image_fd = create_worker_exec_image_fd(guest_exec_image).map_err(|_| -1_i32)?;
         let (result_read_fd, result_write_fd) = create_worker_result_pipe().map_err(|_| -1_i32)?;
         let interp_image_fd = guest_interp_image
@@ -1294,7 +1311,7 @@ impl LinuxUserland {
         }
 
         // Add --pipe-bridge for extra inherited fds (e.g. socketpair IPC).
-        for &(guest_fd, host_fd) in extra_fds {
+        for &(guest_fd, host_fd) in &safe_extra_fds {
             let _ = self.clear_cloexec(host_fd);
             spawn_argv.push(CString::new("--pipe-bridge").unwrap());
             spawn_argv.push(
