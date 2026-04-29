@@ -1194,6 +1194,7 @@ impl<FS: ShimFS> UnixStream<FS> {
                                 SockType::Stream,
                                 SockFlags::empty(),
                             );
+                            proxy.set_state(litebox::net::socket_channel::SocketState::Connected);
                             let connected = UnixConnectedStream {
                                 addr: AddrView {
                                     addr: Some(listen_addr.clone()),
