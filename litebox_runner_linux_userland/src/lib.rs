@@ -789,6 +789,21 @@ fn finish_run_with_nine_p<FS: litebox_shim_linux::ShimFS>(
             cli_args.working_directory.clone(),
         )?;
 
+        // Install pipe bridges for inherited non-stdio fds (e.g. socketpair IPC).
+        let pipe_bridges = parse_pipe_bridge_specs(&cli_args.pipe_bridge)?;
+        for bridge in &pipe_bridges {
+            let direction = match bridge.direction {
+                b'r' => litebox_shim_linux::syscalls::host_pipe::HostPipeDirection::Read,
+                b'b' => litebox_shim_linux::syscalls::host_pipe::HostPipeDirection::ReadWrite,
+                _ => litebox_shim_linux::syscalls::host_pipe::HostPipeDirection::Write,
+            };
+            program.entrypoints.install_host_pipe_fd(
+                bridge.guest_fd,
+                bridge.host_fd,
+                direction,
+            );
+        }
+
         run_program(program, shutdown, net_worker, worker_result_fd, None);
     }
 
@@ -858,6 +873,21 @@ fn finish_run_with_nine_p<FS: litebox_shim_linux::ShimFS>(
         envp,
         cli_args.working_directory.clone(),
     )?;
+
+    // Install pipe bridges for inherited non-stdio fds.
+    let pipe_bridges_tcp = parse_pipe_bridge_specs(&cli_args.pipe_bridge)?;
+    for bridge in &pipe_bridges_tcp {
+        let direction = match bridge.direction {
+            b'r' => litebox_shim_linux::syscalls::host_pipe::HostPipeDirection::Read,
+            b'b' => litebox_shim_linux::syscalls::host_pipe::HostPipeDirection::ReadWrite,
+            _ => litebox_shim_linux::syscalls::host_pipe::HostPipeDirection::Write,
+        };
+        program.entrypoints.install_host_pipe_fd(
+            bridge.guest_fd,
+            bridge.host_fd,
+            direction,
+        );
+    }
 
     run_program(program, shutdown, net_worker, worker_result_fd, None);
 }
