@@ -214,8 +214,8 @@ impl<'a> ElfLoader<'a> {
         }
         let task = self.main.file.task;
         let global = &task.global;
-        let ldelf_info =
-            self.main
+        let ldelf_info = self
+                .main
                 .parsed
                 .load(&mut self.main.file, &mut &*global.platform, None)?;
 
