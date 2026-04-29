@@ -1559,18 +1559,33 @@ where
                 if server_socket.backlog.is_none() {
                     return Err(AcceptError::NotListening);
                 }
+                let port = server_socket.ip_listen_endpoint.port;
+                let num_handles = server_socket.socket_set_handles.len();
                 // (Purely an optimization) remove all handles that are closed, by only keeping ones
                 // that are not closed
                 server_socket.socket_set_handles.retain(|&h| {
                     let socket: &tcp::Socket = self.socket_set.get(h);
                     socket.is_open()
                 });
+                let after_retain = server_socket.socket_set_handles.len();
                 // Find a socket that has progressed further in its TCP state machine, by finding a
                 // socket in an established state
-                let Some(position) = server_socket.socket_set_handles.iter().position(|&h| {
+                let states: alloc::vec::Vec<_> = server_socket.socket_set_handles.iter().map(|&h| {
                     let socket: &tcp::Socket = self.socket_set.get(h);
-                    socket.state() == tcp::State::Established
-                }) else {
+                    socket.state()
+                }).collect();
+
+                // Log state for ephemeral port sockets (our internal TCP listeners).
+                if port >= 49000 {
+                    self.device.platform.on_listen_socket_change(
+                        port,
+                        true,
+                        states.len() as u16,
+                        &alloc::format!("accept_check: handles={num_handles}→{after_retain} states={states:?}"),
+                    );
+                }
+
+                let Some(position) = states.iter().position(|s| *s == tcp::State::Established) else {
                     if let Some(proxy) = &socket_handle.proxy {
                         // No connections are ready; make sure the readable flag is cleared
                         proxy.set_readable(false);

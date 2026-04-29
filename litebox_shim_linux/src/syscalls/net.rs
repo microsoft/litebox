@@ -71,7 +71,7 @@ impl<FS: ShimFS> super::file::FilesState<FS> {
     ///
     /// For `LiteBoxRawFd` sockets, the `inet_op` closure is called with the socket fd.
     /// For Unix sockets, the `unix_op` closure is called with a cloned Arc to the socket.
-    fn with_socket<R>(
+    pub(super) fn with_socket<R>(
         &self,
         global: &GlobalState<FS>,
         sockfd: u32,
@@ -678,19 +678,25 @@ impl<FS: ShimFS> GlobalState<FS> {
         super::write_to_user(val, optval, len)
     }
 
-    fn try_accept(
+    pub(super) fn try_accept(
         &self,
         fd: &SocketFd,
         peer: Option<&mut SocketAddr>,
     ) -> Result<SocketFd, TryOpError<Errno>> {
-        self.net.lock().accept(fd, peer).map_err(|e| match e {
+        // Drive smoltcp explicitly — platform_interaction is Manual, so
+        // automated_platform_interaction inside accept() is a no-op.
+        // Without this, the network thread's poll results aren't visible
+        // to Network::accept() because it doesn't re-poll.
+        let mut net = self.net.lock();
+        let _ = net.perform_platform_interaction();
+        net.accept(fd, peer).map_err(|e| match e {
             AcceptError::NoConnectionsReady => TryOpError::TryAgain,
             AcceptError::InvalidFd | AcceptError::NotListening => TryOpError::Other(e.into()),
             _ => unimplemented!(),
         })
     }
 
-    fn accept(
+    pub(super) fn accept(
         &self,
         cx: &WaitContext<'_, Platform>,
         fd: &SocketFd,
@@ -713,7 +719,28 @@ impl<FS: ShimFS> GlobalState<FS> {
         self.net.lock().bind(fd, &sockaddr).map_err(Errno::from)
     }
 
-    fn connect(
+    /// Non-blocking TCP accept by raw guest fd number. Looks up the SocketFd
+    /// through the FilesState fd table, then calls try_accept.
+    pub(super) fn try_accept_by_raw_fd(
+        &self,
+        raw_fd: u32,
+        files: &core::cell::RefCell<alloc::sync::Arc<crate::syscalls::file::FilesState<FS>>>,
+    ) -> Result<SocketFd, Errno> {
+        files.borrow().with_socket(
+            self,
+            raw_fd,
+            |fd| {
+                self.try_accept(fd, None).map_err(|e| match e {
+                    TryOpError::TryAgain => Errno::EAGAIN,
+                    TryOpError::Other(e) => e,
+                    TryOpError::WaitError(_) => Errno::EINTR,
+                })
+            },
+            |_| Err(Errno::ENOTSOCK),
+        )
+    }
+
+    pub(super) fn connect(
         &self,
         cx: &WaitContext<'_, Platform>,
         fd: &SocketFd,
@@ -734,7 +761,9 @@ impl<FS: ShimFS> GlobalState<FS> {
             {
                 let msg = alloc::format!(
                     "SHIM CONNECT REMAP: {}:{} -> 127.0.0.1:{}\n",
-                    v4.ip(), v4.port(), v4.port()
+                    v4.ip(),
+                    v4.port(),
+                    v4.port()
                 );
                 use litebox::platform::DebugLogProvider as _;
                 litebox_platform_multiplex::platform().debug_log_print(&msg);
@@ -949,6 +978,24 @@ impl<FS: ShimFS> GlobalState<FS> {
             })
     }
 
+    /// Look up the network proxy for a socket given its raw fd integer.
+    pub(super) fn get_proxy_by_raw_fd(
+        &self,
+        raw_fd: u32,
+        files: &core::cell::RefCell<Arc<crate::syscalls::file::FilesState<FS>>>,
+    ) -> Option<Arc<NetworkProxy<Platform>>> {
+        files
+            .borrow()
+            .with_socket(
+                self,
+                raw_fd,
+                |fd| self.get_proxy(fd).map(Some),
+                |_| Ok(None),
+            )
+            .ok()
+            .flatten()
+    }
+
     pub(crate) fn close_socket(
         &self,
         cx: &WaitContext<'_, Platform>,
@@ -1028,7 +1075,7 @@ impl<FS: ShimFS> Task<FS> {
         })?;
         self.do_socket(domain, ty, flags, protocol)
     }
-    fn do_socket(
+    pub(super) fn do_socket(
         &self,
         domain: AddressFamily,
         ty: SockType,
@@ -1440,7 +1487,7 @@ impl<FS: ShimFS> Task<FS> {
         }
         Ok(fd)
     }
-    fn do_accept(
+    pub(super) fn do_accept(
         &self,
         sockfd: u32,
         peer: Option<&mut SocketAddress>,
@@ -1471,7 +1518,8 @@ impl<FS: ShimFS> Task<FS> {
             },
             |file| {
                 let mut socket_addr = want_peer.then_some(UnixSocketAddr::Unnamed);
-                let accepted_file = file.accept(&self.wait_cx(), flags, socket_addr.as_mut())?;
+                let accepted_file =
+                    file.accept(Some(self), &self.wait_cx(), flags, socket_addr.as_mut())?;
                 let peer_addr = socket_addr.map(SocketAddress::Unix);
                 let mut dt = self.global.litebox.descriptor_table_mut();
                 let typed =
@@ -1509,7 +1557,7 @@ impl<FS: ShimFS> Task<FS> {
         let sockaddr = read_sockaddr_from_user(sockaddr, addrlen)?;
         self.do_connect(fd, sockaddr)
     }
-    fn do_connect(&self, sockfd: u32, sockaddr: SocketAddress) -> Result<(), Errno> {
+    pub(super) fn do_connect(&self, sockfd: u32, sockaddr: SocketAddress) -> Result<(), Errno> {
         self.files.borrow().with_socket(
             &self.global,
             sockfd,
@@ -1537,7 +1585,7 @@ impl<FS: ShimFS> Task<FS> {
         let sockaddr = read_sockaddr_from_user(sockaddr, addrlen)?;
         self.do_bind(sockfd, sockaddr)
     }
-    fn do_bind(&self, sockfd: u32, sockaddr: SocketAddress) -> Result<(), Errno> {
+    pub(super) fn do_bind(&self, sockfd: u32, sockaddr: SocketAddress) -> Result<(), Errno> {
         // Netlink socket: bind is a no-op.
         if self.netlink_sockets.borrow().contains_key(&sockfd) {
             self.netlink_sockets
@@ -1568,13 +1616,35 @@ impl<FS: ShimFS> Task<FS> {
         };
         self.do_listen(sockfd, backlog)
     }
-    fn do_listen(&self, sockfd: u32, backlog: u16) -> Result<(), Errno> {
+    pub(super) fn do_listen(&self, sockfd: u32, backlog: u16) -> Result<(), Errno> {
         self.files.borrow().with_socket(
             &self.global,
             sockfd,
             |fd| self.global.listen(fd, backlog),
             |file| file.listen(self, backlog, &self.global),
         )
+    }
+
+    /// Get the local port for an INET socket. Returns None if not bound.
+    pub(super) fn do_getsockname_inet_port(&self, sockfd: u32) -> Option<u16> {
+        self.files
+            .borrow()
+            .with_socket(
+                &self.global,
+                sockfd,
+                |fd| {
+                    Ok(self
+                        .global
+                        .net
+                        .lock()
+                        .get_local_addr(fd)
+                        .ok()
+                        .map(|a| a.port()))
+                },
+                |_| Ok(None),
+            )
+            .ok()
+            .flatten()
     }
 
     /// Handle syscall `shutdown`

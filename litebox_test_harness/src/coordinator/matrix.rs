@@ -815,7 +815,6 @@ struct UnixTestCase {
     agent: &'static str,
     /// Connector agent for CrossAgent pattern.
     peer: Option<&'static str>,
-    xfail_connect: bool,
 }
 
 fn unix_test_cases() -> Vec<UnixTestCase> {
@@ -825,71 +824,124 @@ fn unix_test_cases() -> Vec<UnixTestCase> {
             pattern: UnixPattern::InProcess,
             agent: "A",
             peer: None,
-            xfail_connect: false,
         },
         UnixTestCase {
             name: "in_process.AA",
             pattern: UnixPattern::InProcess,
             agent: "AA",
             peer: None,
-            xfail_connect: false,
         },
         UnixTestCase {
             name: "server_fork.A",
             pattern: UnixPattern::ServerForkClient,
             agent: "A",
             peer: None,
-            xfail_connect: false,
         },
         UnixTestCase {
             name: "server_fork.AA",
             pattern: UnixPattern::ServerForkClient,
             agent: "AA",
             peer: None,
-            xfail_connect: false,
         },
         UnixTestCase {
             name: "bg_server.A",
             pattern: UnixPattern::BackgroundServerConnect,
             agent: "A",
             peer: None,
-            xfail_connect: false,
         },
         UnixTestCase {
             name: "bg_server.AA",
             pattern: UnixPattern::BackgroundServerConnect,
             agent: "AA",
             peer: None,
-            xfail_connect: false,
         },
+        // Same-worker CrossAgent cases (all connected via Spawn chains,
+        // share one worker process and one unix_addr_table).
         UnixTestCase {
             name: "sibling",
             pattern: UnixPattern::CrossAgent,
             agent: "A",
             peer: Some("B"),
-            xfail_connect: true,
         },
         UnixTestCase {
             name: "parent_to_grandchild",
             pattern: UnixPattern::CrossAgent,
             agent: "A",
             peer: Some("AA"),
-            xfail_connect: false,
         },
         UnixTestCase {
             name: "grandchild_to_parent",
             pattern: UnixPattern::CrossAgent,
             agent: "AA",
             peer: Some("A"),
-            xfail_connect: false,
+        },
+        UnixTestCase {
+            name: "cross_subtree",
+            pattern: UnixPattern::CrossAgent,
+            agent: "B",
+            peer: Some("AAA"),
+        },
+        // Cross-worker CrossAgent cases — these cross a SpawnRemote boundary
+        // (different OS worker processes, separate unix_addr_table).
+        // Worker boundaries: {init,A,B,AA,AB,AAA,AAB,D3} | {NP,NPC} | {D4,D5}
+        UnixTestCase {
+            name: "vscode_d3_d4",
+            pattern: UnixPattern::CrossAgent,
+            agent: "D3",
+            peer: Some("D4"),
+        },
+        UnixTestCase {
+            name: "vscode_d4_d3",
+            pattern: UnixPattern::CrossAgent,
+            agent: "D4",
+            peer: Some("D3"),
+        },
+        UnixTestCase {
+            name: "d4_to_sibling_b",
+            pattern: UnixPattern::CrossAgent,
+            agent: "D4",
+            peer: Some("B"),
+        },
+        UnixTestCase {
+            name: "d5_to_a",
+            pattern: UnixPattern::CrossAgent,
+            agent: "D5",
+            peer: Some("A"),
+        },
+        UnixTestCase {
+            name: "a_to_np",
+            pattern: UnixPattern::CrossAgent,
+            agent: "A",
+            peer: Some("NP"),
+        },
+        UnixTestCase {
+            name: "np_to_a",
+            pattern: UnixPattern::CrossAgent,
+            agent: "NP",
+            peer: Some("A"),
         },
     ]
 }
 
 async fn run_unix_tests(r: &mut TestRunner) {
     let self_exe = r.self_exe.clone();
+    let has_nonpie = crate::find_nonpie_binary().is_some();
 
     for tc in &unix_test_cases() {
+        // Skip tests that require non-PIE agents when the binary isn't available.
+        if !has_nonpie
+            && (agent_requires_nonpie(tc.agent)
+                || tc.peer.is_some_and(|p| agent_requires_nonpie(p)))
+        {
+            r.record(
+                &format!("U.{}.listen", tc.name),
+                tc.agent,
+                true,
+                "skipped (nonpie binary not found)",
+            );
+            continue;
+        }
+
         let sock = format!("/tmp/um_{}.sock", tc.name.replace('.', "_"));
 
         match tc.pattern {
@@ -1012,7 +1064,6 @@ async fn run_unix_tests(r: &mut TestRunner) {
                 let connector = tc.peer.unwrap();
                 let data = format!("unix_{}", tc.name);
 
-                // For sibling xfail: listener is the "server" side.
                 let resp = r
                     .send(tc.agent, Command::UnixListen { path: sock.clone() })
                     .await;
@@ -1033,28 +1084,54 @@ async fn run_unix_tests(r: &mut TestRunner) {
                     )
                     .await;
 
-                if tc.xfail_connect {
-                    // Sibling connect may fail on litebox (independent socket tables).
-                    // Record as normal pass/fail — passes on WSL2, may fail on litebox.
-                    let pass = matches!(&resp, Response::Connected { echo } if *echo == data);
-                    r.record(
-                        &format!("U.{}.connect", tc.name),
-                        connector,
-                        pass,
-                        &format!("{resp:?}"),
-                    );
-                } else {
-                    let pass = matches!(&resp, Response::Connected { echo } if *echo == data);
-                    r.record(
-                        &format!("U.{}.connect", tc.name),
-                        connector,
-                        pass,
-                        &format!("{resp:?}"),
-                    );
-                }
+                let pass = matches!(&resp, Response::Connected { echo } if *echo == data);
+                r.record(
+                    &format!("U.{}.connect", tc.name),
+                    connector,
+                    pass,
+                    &format!("{resp:?}"),
+                );
 
                 let _ = r.send(tc.agent, Command::UnixUnlisten { path: sock }).await;
             }
+        }
+    }
+
+    // ── Minimal cross-worker unix socket repro ──
+    // This test isolates the exact failure point:
+    //   1. D3 (init worker) listens on a unix socket → TCP listener starts
+    //   2. D4 (worker-exec) connects → TCP connect succeeds through broker
+    //   3. D3's echo task should accept() and echo back → FAILS
+    //
+    // Control: same-agent connect (D3→D3) works. Cross-agent (D4→D3) doesn't.
+    // Root cause: tokio's reactor isn't woken by backlog.pollee.notify_observers
+    // because the unix socket fd's epoll observer doesn't propagate the wakeup.
+    if has_nonpie {
+        let sock = "/tmp/um_repro_xworker.sock".to_string();
+
+        // Step 1: D3 listens.
+        let resp = r.send("D3", Command::UnixListen { path: sock.clone() }).await;
+        let listen_ok = matches!(&resp, Response::UnixListening { .. });
+        r.record("U.repro.listen", "D3", listen_ok, &format!("{resp:?}"));
+
+        if listen_ok {
+            // Step 2: Same-agent connect (D3→D3) — should work.
+            let resp = r.send("D3", Command::UnixConnect {
+                path: sock.clone(),
+                data: "SAME_AGENT".to_string(),
+            }).await;
+            let same_ok = matches!(&resp, Response::Connected { echo } if echo.contains("SAME_AGENT"));
+            r.record("U.repro.same_agent", "D3", same_ok, &format!("{resp:?}"));
+
+            // Step 3: Cross-agent connect (D4→D3) — this is the bug.
+            let resp = r.send("D4", Command::UnixConnect {
+                path: sock.clone(),
+                data: "CROSS_WORKER".to_string(),
+            }).await;
+            let cross_ok = matches!(&resp, Response::Connected { echo } if echo.contains("CROSS_WORKER"));
+            r.record("U.repro.cross_worker", "D4", cross_ok, &format!("{resp:?}"));
+
+            let _ = r.send("D3", Command::UnixUnlisten { path: sock }).await;
         }
     }
 }

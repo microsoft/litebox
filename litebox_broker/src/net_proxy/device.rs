@@ -293,6 +293,19 @@ impl phy::TxToken for TxToken<'_> {
                         dst_ip[0], dst_ip[1], dst_ip[2], dst_ip[3], dst_port,
                     );
                 }
+                // Log all TX packets involving ephemeral ports (our internal TCP).
+                if dst_port >= 49000 || src_port >= 49000 {
+                    let src_ip = &pkt[12..16];
+                    let dst_ip = &pkt[16..20];
+                    use std::io::Write;
+                    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/rst-diag.log") {
+                        let is_syn = flags & 0x02 != 0 && flags & 0x10 == 0;
+                        let _ = writeln!(f, "BROKER TX: {}.{}.{}.{}:{} → {}.{}.{}.{}:{} flags=0x{flags:02x} syn={is_syn}",
+                            src_ip[0], src_ip[1], src_ip[2], src_ip[3], src_port,
+                            dst_ip[0], dst_ip[1], dst_ip[2], dst_ip[3], dst_port,
+                        );
+                    }
+                }
                 if src_port == 63084 || dst_port == 63084 {
                     let src_ip = &pkt[12..16];
                     let dst_ip = &pkt[16..20];
