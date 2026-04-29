@@ -336,9 +336,7 @@ async fn test_host_file(r: &mut TestRunner) {
             // File not in rootfs — skip (environment precondition, not a test failure).
             r.record(
                 &test_id,
-                agent,
-                true,
-                "skipped (host_wrote.txt not in rootfs)",
+                agent, false,                "FAIL: host_wrote.txt not in rootfs",
             );
         } else {
             r.record(&test_id, agent, pass, &format!("{resp:?}"));
@@ -457,8 +455,8 @@ async fn run_net_tests(r: &mut TestRunner) {
             r.record(
                 &format!("N.{}.listen", tc.name),
                 tc.listener,
-                true,
-                "skipped (nonpie binary not found)",
+                false,
+                "FAIL: nonpie binary not found — mount at /opt/nonpie",
             );
             port += 1;
             continue;
@@ -586,8 +584,8 @@ async fn run_net_addr_tests(r: &mut TestRunner) {
                 r.record(
                     &format!("NA.{agent_a}_to_{agent_b}.{addr}"),
                     agent_a,
-                    true,
-                    "skipped (nonpie binary not found)",
+                    false,
+                    "FAIL: nonpie binary not found — mount at /opt/nonpie",
                 );
                 port += 1;
                 continue;
@@ -648,8 +646,8 @@ async fn run_unix_addr_tests(r: &mut TestRunner) {
             r.record(
                 &format!("UA.{agent_a}_to_{agent_b}"),
                 agent_a,
-                true,
-                "skipped (nonpie binary not found)",
+                false,
+                "FAIL: nonpie binary not found — mount at /opt/nonpie",
             );
             idx += 1;
             continue;
@@ -713,8 +711,8 @@ async fn run_exec_tests(r: &mut TestRunner) {
             r.record(
                 &format!("X.echo.{agent}"),
                 agent,
-                true,
-                "skipped (nonpie binary not found)",
+                false,
+                "FAIL: nonpie binary not found — mount at /opt/nonpie",
             );
             continue;
         }
@@ -760,8 +758,8 @@ async fn run_env_tests(r: &mut TestRunner) {
             r.record(
                 &format!("E.HOME.{agent}"),
                 agent,
-                true,
-                "skipped (nonpie binary not found)",
+                false,
+                "FAIL: nonpie binary not found — mount at /opt/nonpie",
             );
             continue;
         }
@@ -1439,8 +1437,8 @@ pub(crate) async fn run_matrix_tests(r: &mut TestRunner) {
             r.record(
                 &format!("F.shared.{ts}.absent"),
                 topo.agents().1,
-                true,
-                "skipped (nonpie binary not found)",
+                false,
+                "FAIL: nonpie binary not found — mount at /opt/nonpie",
             );
             continue;
         }
@@ -1538,3 +1536,5 @@ pub(crate) async fn run_matrix_tests(r: &mut TestRunner) {
         test_symlink_variant(r, variant, symlink_unsupported).await;
     }
 }
+
+

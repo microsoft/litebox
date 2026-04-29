@@ -127,7 +127,7 @@ pub(crate) async fn exit_data_integrity_tests(r: &mut TestRunner) {
                     None => {
                         for &agent in DEPTH_AGENTS {
                             let test_id = format!("EXITD.{size}.{binary}.{agent}");
-                            r.record(&test_id, agent, true, "skipped (nonpie binary not found)");
+                            r.record(&test_id, agent, false, "FAIL: nonpie binary not found — mount at /opt/nonpie");
                         }
                         continue;
                     }
@@ -191,7 +191,7 @@ pub(crate) async fn nonpie_pipe_chain_tests(r: &mut TestRunner) {
                 for pattern in &["seq", "interleaved"] {
                     for &agent in DEPTH_AGENTS {
                         let test_id = format!("NPIPE.{pattern}.x{reps}.{agent}");
-                        r.record(&test_id, agent, true, "skipped (nonpie binary not found)");
+                        r.record(&test_id, agent, false, "FAIL: nonpie binary not found — mount at /opt/nonpie");
                     }
                 }
             }

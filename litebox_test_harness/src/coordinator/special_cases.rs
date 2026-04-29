@@ -50,8 +50,8 @@ pub(super) async fn contamination_sequence_tests(r: &mut TestRunner) {
         let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout == "ECHO_TEST_OK");
         r.record("X50b.nonpie_then_pie_2", "A", pass, &format!("{resp:?}"));
     } else {
-        r.record("X50a.nonpie_then_pie_1", "A", true, "skipped");
-        r.record("X50b.nonpie_then_pie_2", "A", true, "skipped");
+        r.record("X50a.nonpie_then_pie_1", "A", false, "FAIL: nonpie binary not found — mount at /opt/nonpie");
+        r.record("X50b.nonpie_then_pie_2", "A", false, "FAIL: nonpie binary not found — mount at /opt/nonpie");
     }
 
     // X51-X52: Non-PIE on fresh agent B, then PIE sequence.
@@ -82,10 +82,10 @@ pub(super) async fn contamination_sequence_tests(r: &mut TestRunner) {
         let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout == "ECHO_TEST_OK");
         r.record("X52c.B_third_exec", "B", pass, &format!("{resp:?}"));
     } else {
-        r.record("X51.nonpie_fresh_agent", "B", true, "skipped");
-        r.record("X52a.B_nonpie_then_pie", "B", true, "skipped");
-        r.record("X52b.B_pie_after_nonpie", "B", true, "skipped");
-        r.record("X52c.B_third_exec", "B", true, "skipped");
+        r.record("X51.nonpie_fresh_agent", "B", false, "FAIL: nonpie binary not found — mount at /opt/nonpie");
+        r.record("X52a.B_nonpie_then_pie", "B", false, "FAIL: nonpie binary not found — mount at /opt/nonpie");
+        r.record("X52b.B_pie_after_nonpie", "B", false, "FAIL: nonpie binary not found — mount at /opt/nonpie");
+        r.record("X52c.B_third_exec", "B", false, "FAIL: nonpie binary not found — mount at /opt/nonpie");
     }
 
     // X53: Stress — 30 sequential PIE execs on fresh agent AB.
@@ -121,7 +121,7 @@ pub(super) async fn contamination_sequence_tests(r: &mut TestRunner) {
         let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout.contains("ECHO_TEST_OK"));
         r.record("X54.nonpie_after_stress", "AB", pass, &format!("{resp:?}"));
     } else {
-        r.record("X54.nonpie_after_stress", "AB", true, "skipped");
+        r.record("X54.nonpie_after_stress", "AB", false, "FAIL: nonpie binary not found — mount at /opt/nonpie");
     }
 
     // X55: Non-PIE as second exec on fresh agent AAB.
@@ -136,7 +136,7 @@ pub(super) async fn contamination_sequence_tests(r: &mut TestRunner) {
         let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout.contains("ECHO_TEST_OK"));
         r.record("X55b.nonpie_second", "AAB", pass, &format!("{resp:?}"));
     } else {
-        r.record("X55b.nonpie_second", "AAB", true, "skipped");
+        r.record("X55b.nonpie_second", "AAB", false, "FAIL: nonpie binary not found — mount at /opt/nonpie");
     }
 
     // X56-X59: Sequence tests on B.
@@ -1202,3 +1202,5 @@ pub(super) async fn cross_worker_tests(r: &mut TestRunner) {
         let _ = r.send("D3", Command::NetUnlisten { port }).await;
     }
 }
+
+

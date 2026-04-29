@@ -694,9 +694,7 @@ pub(crate) async fn vscode_cli_cross_connect_tests(r: &mut TestRunner) {
         _ => {
             r.record(
                 "PR.vscode_cli_cross",
-                "B",
-                true,
-                "skipped (VS Code CLI not installed)",
+                "B", false,                "FAIL: VS Code CLI not installed — use litebox-vscode image",
             );
             return;
         }
@@ -799,3 +797,5 @@ pub(crate) async fn vscode_cli_cross_connect_tests(r: &mut TestRunner) {
 
     let _ = r.send("A", Command::Kill { pid: bg_pid }).await;
 }
+
+

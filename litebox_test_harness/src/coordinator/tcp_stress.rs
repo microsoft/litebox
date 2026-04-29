@@ -455,14 +455,14 @@ pub(crate) async fn tcp_cross_worker_concurrent_tests(r: &mut TestRunner) {
             r.record(
                 &format!("TW.remote_listen.x{count}"),
                 "A",
-                true,
-                "skipped (SpawnRemote unavailable)",
+                false,
+                "FAIL: SpawnRemote unavailable",
             );
             r.record(
                 &format!("TW.local_listen.x{count}"),
                 "A",
-                true,
-                "skipped (SpawnRemote unavailable)",
+                false,
+                "FAIL: SpawnRemote unavailable",
             );
         }
         return;
@@ -554,3 +554,5 @@ pub(crate) async fn run(r: &mut TestRunner) {
     tcp_fullduplex_tests(r).await;
     tcp_cross_worker_concurrent_tests(r).await;
 }
+
+

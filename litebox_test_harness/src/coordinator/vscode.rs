@@ -244,9 +244,7 @@ pub(super) async fn vscode_bootstrap_replay(r: &mut TestRunner) {
             if trimmed == "NOT_FOUND" || trimmed.len() != 40 {
                 r.record(
                     "VSI.detect_commit",
-                    "A",
-                    true,
-                    "skipped (VS Code CLI not found — use litebox-vscode image)",
+                    "A", false,                    "FAIL: VS Code CLI not found — use litebox-vscode image)",
                 );
                 return;
             }
@@ -504,3 +502,5 @@ pub(super) async fn vscode_bootstrap_replay(r: &mut TestRunner) {
         let _ = r.send("A", Command::Kill { pid }).await;
     }
 }
+
+

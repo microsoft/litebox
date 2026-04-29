@@ -393,9 +393,7 @@ async fn delayed_fork_matrix(r: &mut TestRunner) {
                             None => {
                                 r.record(
                                     &test_id,
-                                    agent,
-                                    true,
-                                    "skipped (nonpie binary not found)",
+                                    agent, false,                                    "FAIL: nonpie binary not found — mount at /opt/nonpie",
                                 );
                                 continue;
                             }
@@ -450,7 +448,7 @@ async fn delayed_fork_matrix(r: &mut TestRunner) {
                     let not_found = matches!(&resp, Response::ExecResult { exit_code: 127, .. })
                         || matches!(&resp, Response::Error { error } if error.contains("not found"));
                     if not_found {
-                        r.record(&test_id, agent, true, "skipped (binary not in rootfs)");
+                        r.record(&test_id, agent, false, "FAIL: binary not in rootfs");
                         continue;
                     }
 
@@ -563,8 +561,8 @@ async fn nonpie_invocation_tests(r: &mut TestRunner) {
                 r.record(
                     &format!("XNP.{}", nc.name),
                     "A",
-                    true,
-                    "skipped (nonpie binary not found)",
+                    false,
+                    "FAIL: nonpie binary not found — mount at /opt/nonpie",
                 );
             }
             return;
@@ -590,7 +588,7 @@ async fn nonpie_invocation_tests(r: &mut TestRunner) {
         let skipped =
             matches!(&resp, Response::ExecResult { stdout, .. } if stdout.contains("SKIP"));
         if not_found || skipped {
-            r.record(&test_id, "A", true, "skipped (nonpie binary not found)");
+            r.record(&test_id, "A", false, "FAIL: nonpie binary not found — mount at /opt/nonpie");
         } else {
             let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. }
                 if stdout.contains("ECHO_TEST_OK"));
@@ -662,16 +660,14 @@ async fn contamination_pattern_tests(r: &mut TestRunner) {
         None => {
             r.record(
                 "XC.init_level",
-                "A",
-                true,
-                "skipped (nonpie binary not found)",
+                "A", false,                "FAIL: nonpie binary not found — mount at /opt/nonpie",
             );
             for cc in CONTAMINATION_CASES {
                 r.record(
                     &format!("XC.{}", cc.name),
                     "A",
-                    true,
-                    "skipped (nonpie binary not found)",
+                    false,
+                    "FAIL: nonpie binary not found — mount at /opt/nonpie",
                 );
             }
             return;
@@ -688,9 +684,7 @@ async fn contamination_pattern_tests(r: &mut TestRunner) {
     if not_found {
         r.record(
             "XC.init_level",
-            "A",
-            true,
-            "skipped (nonpie binary not found)",
+            "A", false,            "FAIL: nonpie binary not found — mount at /opt/nonpie",
         );
     } else {
         let resp2 = r
@@ -712,7 +706,7 @@ async fn contamination_pattern_tests(r: &mut TestRunner) {
         let skipped =
             matches!(&resp, Response::ExecResult { stdout, .. } if stdout.contains("SKIP"));
         if skipped {
-            r.record(&test_id, "A", true, "skipped (nonpie binary not found)");
+            r.record(&test_id, "A", false, "FAIL: nonpie binary not found — mount at /opt/nonpie");
         } else {
             let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. }
                 if stdout.contains(cc.expected));
@@ -734,3 +728,5 @@ pub(super) async fn run_fork_matrix_tests(r: &mut TestRunner) {
     stress_exec_matrix(r).await;
     contamination_pattern_tests(r).await;
 }
+
+
