@@ -1089,132 +1089,41 @@ async fn run_unix_tests(r: &mut TestRunner) {
         }
     }
 
-    // Diagnostic: verify sidecar file and TCP port reachability for cross-worker cases.
-    // This helps debug whether the TCP listener, sidecar, and broker routing work.
-    {
-        let sock = "/tmp/um_diag_xworker.sock".to_string();
-        let sidecar = format!("{}.litebox-uds-meta", sock);
+    // ── Minimal cross-worker unix socket repro ──
+    // This test isolates the exact failure point:
+    //   1. D3 (init worker) listens on a unix socket → TCP listener starts
+    //   2. D4 (worker-exec) connects → TCP connect succeeds through broker
+    //   3. D3's echo task should accept() and echo back → FAILS
+    //
+    // Control: same-agent connect (D3→D3) works. Cross-agent (D4→D3) doesn't.
+    // Root cause: tokio's reactor isn't woken by backlog.pollee.notify_observers
+    // because the unix socket fd's epoll observer doesn't propagate the wakeup.
+    if has_nonpie {
+        let sock = "/tmp/um_repro_xworker.sock".to_string();
 
-        // D3 listens (same worker as init/A/B), then check sidecar from D4 (different worker).
-        if has_nonpie {
-            let resp = r
-                .send("D3", Command::UnixListen { path: sock.clone() })
-                .await;
-            let listen_ok = matches!(&resp, Response::UnixListening { .. });
-            r.record("U.diag.listen", "D3", listen_ok, &format!("{resp:?}"));
+        // Step 1: D3 listens.
+        let resp = r.send("D3", Command::UnixListen { path: sock.clone() }).await;
+        let listen_ok = matches!(&resp, Response::UnixListening { .. });
+        r.record("U.repro.listen", "D3", listen_ok, &format!("{resp:?}"));
 
-            if listen_ok {
-                // Read the sidecar file from the listener's own worker.
-                let resp = r
-                    .send(
-                        "D3",
-                        Command::FsRead {
-                            path: sidecar.clone(),
-                        },
-                    )
-                    .await;
-                let sidecar_content = match &resp {
-                    Response::Ok {
-                        data: Some(content),
-                    } => content.clone(),
-                    _ => String::new(),
-                };
-                let has_sidecar = !sidecar_content.is_empty();
-                r.record(
-                    "U.diag.sidecar_local",
-                    "D3",
-                    has_sidecar,
-                    &format!("sidecar={sidecar_content:?} resp={resp:?}"),
-                );
+        if listen_ok {
+            // Step 2: Same-agent connect (D3→D3) — should work.
+            let resp = r.send("D3", Command::UnixConnect {
+                path: sock.clone(),
+                data: "SAME_AGENT".to_string(),
+            }).await;
+            let same_ok = matches!(&resp, Response::Connected { echo } if echo.contains("SAME_AGENT"));
+            r.record("U.repro.same_agent", "D3", same_ok, &format!("{resp:?}"));
 
-                // Read the sidecar from the remote worker (D4).
-                let resp = r
-                    .send(
-                        "D4",
-                        Command::FsRead {
-                            path: sidecar.clone(),
-                        },
-                    )
-                    .await;
-                let remote_content = match &resp {
-                    Response::Ok {
-                        data: Some(content),
-                    } => content.clone(),
-                    _ => String::new(),
-                };
-                r.record(
-                    "U.diag.sidecar_remote",
-                    "D4",
-                    !remote_content.is_empty(),
-                    &format!("sidecar={remote_content:?} resp={resp:?}"),
-                );
+            // Step 3: Cross-agent connect (D4→D3) — this is the bug.
+            let resp = r.send("D4", Command::UnixConnect {
+                path: sock.clone(),
+                data: "CROSS_WORKER".to_string(),
+            }).await;
+            let cross_ok = matches!(&resp, Response::Connected { echo } if echo.contains("CROSS_WORKER"));
+            r.record("U.repro.cross_worker", "D4", cross_ok, &format!("{resp:?}"));
 
-                // If sidecar has a port, try a raw TCP connect from D4.
-                if let Ok(port) = sidecar_content.trim().parse::<u16>() {
-                    if port > 0 {
-                        // Verify: does regular TCP listen+accept work on this port?
-                        // D3 does NetListen on a new port, D4 does NetConnect.
-                        let tcp_test_port = port + 1;
-                        let resp = r
-                            .send(
-                                "D3",
-                                Command::NetListen {
-                                    port: tcp_test_port,
-                                },
-                            )
-                            .await;
-                        let tcp_listen_ok = matches!(&resp, Response::Listening { .. });
-                        r.record(
-                            "U.diag.tcp_listen",
-                            "D3",
-                            tcp_listen_ok,
-                            &format!("port={tcp_test_port} resp={resp:?}"),
-                        );
-
-                        if tcp_listen_ok {
-                            let resp = r
-                                .send(
-                                    "D4",
-                                    Command::NetConnect {
-                                        addr: format!("127.0.0.1:{tcp_test_port}"),
-                                        data: "TCP_XWORKER_TEST".to_string(),
-                                    },
-                                )
-                                .await;
-                            let tcp_xworker = matches!(&resp, Response::Connected { echo } if echo.contains("TCP_XWORKER_TEST"));
-                            r.record(
-                                "U.diag.tcp_xworker_echo",
-                                "D4",
-                                tcp_xworker,
-                                &format!("port={tcp_test_port} resp={resp:?}"),
-                            );
-                        }
-
-                        // Read the TCP accept diagnostic log.
-                        tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
-                        let resp = r
-                            .send(
-                                "D3",
-                                Command::FsRead {
-                                    path: "/tmp/unix-tcp-accept-diag.log".to_string(),
-                                },
-                            )
-                            .await;
-                        let diag_content = match &resp {
-                            Response::Ok { data: Some(content) } => content.clone(),
-                            _ => "no diag file".to_string(),
-                        };
-                        r.record(
-                            "U.diag.accept_log",
-                            "D3",
-                            !diag_content.is_empty(),
-                            &format!("diag={diag_content:?}"),
-                        );
-                    }
-                }
-
-                let _ = r.send("D3", Command::UnixUnlisten { path: sock }).await;
-            }
+            let _ = r.send("D3", Command::UnixUnlisten { path: sock }).await;
         }
     }
 }
