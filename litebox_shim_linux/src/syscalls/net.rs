@@ -723,12 +723,15 @@ impl<FS: ShimFS> GlobalState<FS> {
         files.borrow().with_socket(
             self,
             raw_fd,
-            |fd| self.try_accept(fd, None).map_err(|e| match e {
-                TryOpError::TryAgain => Errno::EAGAIN,
-                TryOpError::Other(e) => e,
-                TryOpError::WaitError(_) => Errno::EINTR,
-            }),
-            |_| Err(Errno::EINVAL),
+            |fd| {
+                let result = self.try_accept(fd, None).map_err(|e| match e {
+                    TryOpError::TryAgain => Errno::EAGAIN,
+                    TryOpError::Other(e) => e,
+                    TryOpError::WaitError(_) => Errno::EINTR,
+                });
+                result
+            },
+            |_| Err(Errno::ENOTSOCK), // Unix socket, not INET — shouldn't happen
         )
     }
 

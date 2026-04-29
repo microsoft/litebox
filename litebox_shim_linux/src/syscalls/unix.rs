@@ -1051,10 +1051,36 @@ impl<FS: ShimFS> UnixStream<FS> {
             )
             .map_err(|_| Errno::ENOMEM)?;
 
+        // Write diagnostic BEFORE connect.
+        {
+            let diag = alloc::format!(
+                "TRY_CONNECT_REMOTE: tcp_raw_fd={} tcp_port={} pid={}\n",
+                tcp_raw_fd, tcp_port, task.process_id.0,
+            );
+            if let Ok(f) = fs.open("/tmp/unix-tcp-connect-diag.log", OFlags::CREAT | OFlags::RDWR | OFlags::APPEND, Mode::RWXU) {
+                let _ = fs.write(&f, diag.as_bytes(), None);
+                let _ = fs.close(&f);
+            }
+        }
+
         let connect_addr = super::net::SocketAddress::Inet(core::net::SocketAddr::V4(
             core::net::SocketAddrV4::new(core::net::Ipv4Addr::LOCALHOST, tcp_port),
         ));
-        task.do_connect(tcp_raw_fd, connect_addr)?;
+        let connect_result = task.do_connect(tcp_raw_fd, connect_addr);
+
+        // Write diagnostic AFTER connect.
+        {
+            let diag = alloc::format!(
+                "TRY_CONNECT_REMOTE RESULT: tcp_raw_fd={} tcp_port={} result={:?}\n",
+                tcp_raw_fd, tcp_port, connect_result,
+            );
+            if let Ok(f) = fs.open("/tmp/unix-tcp-connect-diag.log", OFlags::CREAT | OFlags::RDWR | OFlags::APPEND, Mode::RWXU) {
+                let _ = fs.write(&f, diag.as_bytes(), None);
+                let _ = fs.close(&f);
+            }
+        }
+
+        connect_result?;
 
         // Get the proxy for the connected TCP socket.
         let proxy = task.files.borrow().with_socket(
@@ -1138,15 +1164,23 @@ impl<FS: ShimFS> UnixStream<FS> {
                 // Then try to accept from the internal TCP listener (cross-worker)
                 // using the guest syscall path so TCP SYN packets reach the broker.
                 if let Some(task) = task {
+                    // Write diagnostic to verify this path runs.
+                    self.with_state_ref(|state| {
+                        if let Some(listen) = state.listen() {
+                            if let Some(raw_fd) = listen.tcp_raw_fd {
+                                if let UnixBoundSocketAddr::Path((_, _, ref fs)) = *listen.backlog.addr {
+                                    let _ = fs.open("/tmp/unix-accept-tried.flag", OFlags::CREAT | OFlags::RDWR, Mode::RWXU)
+                                        .map(|f| { let _ = fs.write(&f, b"1", Some(0)); let _ = fs.close(&f); });
+                                }
+                            }
+                        }
+                    });
                     let result = self.with_state_ref(|state| -> Option<UnixConnectedStream<FS>> {
                         let listen = state.listen()?;
                         let raw_fd = listen.tcp_raw_fd?;
-                        // Non-blocking try_accept: look up SocketFd via
-                        // get_proxy_by_raw_fd then try_accept on the network.
-                        let accepted_fd = {
-                            // We need to go through the descriptor table directly
-                            // since with_socket is private. Use try_accept_by_raw_fd.
-                            listen.global.try_accept_by_raw_fd(raw_fd, &task.files).ok()?
+                        let accepted_fd = match listen.global.try_accept_by_raw_fd(raw_fd, &task.files) {
+                            Ok(fd) => fd,
+                            Err(_) => return None, // No connections ready
                         };
                         let proxy = listen.global.initialize_socket(
                             &accepted_fd,
