@@ -40,19 +40,15 @@ pub(crate) enum Topology {
     GreatGrandchildUp,
     /// B → AAA.
     #[allow(dead_code)]
-
     CrossSubtree,
     /// AA → AB.
     #[allow(dead_code)]
-
     SiblingDepth2,
     /// AAA → AAB.
     #[allow(dead_code)]
-
     SiblingDepth3,
     /// AB → B.
     #[allow(dead_code)]
-
     Uncle,
     /// A → NP (non-PIE child via SpawnRemote).
     PieToNonPie,
@@ -346,10 +342,7 @@ async fn test_host_file(r: &mut TestRunner) {
         let test_id = format!("F.host.{agent}");
         if matches!(&resp, Response::NotFound) {
             // File not in rootfs — skip (environment precondition, not a test failure).
-            r.record(
-                &test_id,
-                agent, false,                "FAIL: host_wrote.txt not in rootfs",
-            );
+            r.record(&test_id, agent, false, "FAIL: host_wrote.txt not in rootfs");
         } else {
             r.record(&test_id, agent, pass, &format!("{resp:?}"));
         }
@@ -591,9 +584,7 @@ async fn run_net_addr_tests(r: &mut TestRunner) {
         for &addr in &addrs {
             let is_self_ip = self_ip.as_deref() == Some(addr);
             // Skip non-PIE agents if binary not available
-            if !has_nonpie
-                && (agent_requires_nonpie(agent_a) || agent_requires_nonpie(agent_b))
-            {
+            if !has_nonpie && (agent_requires_nonpie(agent_a) || agent_requires_nonpie(agent_b)) {
                 r.record(
                     &format!("NA.{agent_a}_to_{agent_b}.{addr}"),
                     agent_a,
@@ -611,7 +602,12 @@ async fn run_net_addr_tests(r: &mut TestRunner) {
             let resp = r.send(agent_a, Command::NetListen { port }).await;
             let listen_ok = matches!(resp, Response::Listening { .. });
             if !listen_ok {
-                r.record(&test_id, agent_a, false, &format!("listen failed: {resp:?}"));
+                r.record(
+                    &test_id,
+                    agent_a,
+                    false,
+                    &format!("listen failed: {resp:?}"),
+                );
                 port += 1;
                 continue;
             }
@@ -680,7 +676,12 @@ async fn run_unix_addr_tests(r: &mut TestRunner) {
             .await;
         let listen_ok = matches!(&resp, Response::UnixListening { .. });
         if !listen_ok {
-            r.record(&test_id, agent_a, false, &format!("listen failed: {resp:?}"));
+            r.record(
+                &test_id,
+                agent_a,
+                false,
+                &format!("listen failed: {resp:?}"),
+            );
             idx += 1;
             continue;
         }
@@ -698,12 +699,7 @@ async fn run_unix_addr_tests(r: &mut TestRunner) {
         r.record(&test_id, agent_b, pass, &format!("{resp:?}"));
 
         let _ = r
-            .send(
-                agent_a,
-                Command::UnixUnlisten {
-                    path: sock_path,
-                },
-            )
+            .send(agent_a, Command::UnixUnlisten { path: sock_path })
             .await;
         idx += 1;
     }
@@ -1123,25 +1119,39 @@ async fn run_unix_tests(r: &mut TestRunner) {
         let sock = "/tmp/um_repro_xworker.sock".to_string();
 
         // Step 1: D3 listens.
-        let resp = r.send("D3", Command::UnixListen { path: sock.clone() }).await;
+        let resp = r
+            .send("D3", Command::UnixListen { path: sock.clone() })
+            .await;
         let listen_ok = matches!(&resp, Response::UnixListening { .. });
         r.record("U.repro.listen", "D3", listen_ok, &format!("{resp:?}"));
 
         if listen_ok {
             // Step 2: Same-agent connect (D3→D3) — should work.
-            let resp = r.send("D3", Command::UnixConnect {
-                path: sock.clone(),
-                data: "SAME_AGENT".to_string(),
-            }).await;
-            let same_ok = matches!(&resp, Response::Connected { echo } if echo.contains("SAME_AGENT"));
+            let resp = r
+                .send(
+                    "D3",
+                    Command::UnixConnect {
+                        path: sock.clone(),
+                        data: "SAME_AGENT".to_string(),
+                    },
+                )
+                .await;
+            let same_ok =
+                matches!(&resp, Response::Connected { echo } if echo.contains("SAME_AGENT"));
             r.record("U.repro.same_agent", "D3", same_ok, &format!("{resp:?}"));
 
             // Step 3: Cross-agent connect (D4→D3) — this is the bug.
-            let resp = r.send("D4", Command::UnixConnect {
-                path: sock.clone(),
-                data: "CROSS_WORKER".to_string(),
-            }).await;
-            let cross_ok = matches!(&resp, Response::Connected { echo } if echo.contains("CROSS_WORKER"));
+            let resp = r
+                .send(
+                    "D4",
+                    Command::UnixConnect {
+                        path: sock.clone(),
+                        data: "CROSS_WORKER".to_string(),
+                    },
+                )
+                .await;
+            let cross_ok =
+                matches!(&resp, Response::Connected { echo } if echo.contains("CROSS_WORKER"));
             r.record("U.repro.cross_worker", "D4", cross_ok, &format!("{resp:?}"));
 
             let _ = r.send("D3", Command::UnixUnlisten { path: sock }).await;
@@ -1626,6 +1636,3 @@ pub(crate) async fn run_matrix_tests(r: &mut TestRunner) {
         test_symlink_variant(r, variant, symlink_unsupported).await;
     }
 }
-
-
-

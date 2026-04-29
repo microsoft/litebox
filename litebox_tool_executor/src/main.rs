@@ -178,8 +178,7 @@ fn create_audit_log_file(dir: &std::path::Path) -> anyhow::Result<std::path::Pat
     let hour = time_of_day / 3600;
     let minute = (time_of_day % 3600) / 60;
     let second = time_of_day % 60;
-    let filename =
-        format!("{year:04}-{month:02}-{day:02}T{hour:02}-{minute:02}-{second:02}.jsonl");
+    let filename = format!("{year:04}-{month:02}-{day:02}T{hour:02}-{minute:02}-{second:02}.jsonl");
 
     let path = dir.join(filename);
     eprintln!("Audit log: {}", path.display());
@@ -788,15 +787,7 @@ fn vscode_server(cli: &Cli, audit_log_file: Option<&std::path::Path>) -> anyhow:
     eprintln!("==============================================");
     eprintln!();
 
-    let guest_command = [
-        "/usr/sbin/dropbear",
-        "-F",
-        "-E",
-        "-B",
-        "-R",
-        "-p",
-        "22",
-    ];
+    let guest_command = ["/usr/sbin/dropbear", "-F", "-E", "-B", "-R", "-p", "22"];
 
     run_sandbox(
         cli,

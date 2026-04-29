@@ -94,10 +94,7 @@ where
         // matching real Linux behavior where 127.0.0.1 accepts connections
         // arriving on any interface via the loopback redirect in connect().
         let _ = addr; // suppress unused warning
-        smoltcp::wire::IpListenEndpoint {
-            addr: None,
-            port,
-        }
+        smoltcp::wire::IpListenEndpoint { addr: None, port }
     }
 
     /// Construct a new `Network` instance
@@ -520,8 +517,16 @@ where
                         listen_ports[listen_count as usize] = tcp.listen_endpoint().port;
                         listen_addrs[listen_count as usize] = match tcp.listen_endpoint().addr {
                             None => 0,
-                            Some(smoltcp::wire::IpAddress::Ipv4(ip)) if ip == smoltcp::wire::Ipv4Address::new(127,0,0,1) => 1,
-                            Some(smoltcp::wire::IpAddress::Ipv4(ip)) if ip == smoltcp::wire::Ipv4Address::new(10,0,0,2) => 2,
+                            Some(smoltcp::wire::IpAddress::Ipv4(ip))
+                                if ip == smoltcp::wire::Ipv4Address::new(127, 0, 0, 1) =>
+                            {
+                                1
+                            }
+                            Some(smoltcp::wire::IpAddress::Ipv4(ip))
+                                if ip == smoltcp::wire::Ipv4Address::new(10, 0, 0, 2) =>
+                            {
+                                2
+                            }
                             _ => 3,
                         };
                     }
@@ -530,12 +535,14 @@ where
             }
         }
         // Store pre-poll snapshot so TxToken RST detection can include it.
-        self.device.rst_socket_summary.set(Some(phy::RstSocketSummary {
-            tcp_count,
-            listen_count,
-            listen_ports,
-            listen_addrs,
-        }));
+        self.device
+            .rst_socket_summary
+            .set(Some(phy::RstSocketSummary {
+                tcp_count,
+                listen_count,
+                listen_ports,
+                listen_addrs,
+            }));
 
         let result = self
             .interface
@@ -709,9 +716,7 @@ where
                                 proxy.set_state(socket_channel::SocketState::Closed);
                             } else {
                                 // Connection was reset by peer
-                                proxy.set_async_error(
-                                    errors::SocketAsyncError::ConnectionReset,
-                                );
+                                proxy.set_async_error(errors::SocketAsyncError::ConnectionReset);
                                 proxy.set_state(socket_channel::SocketState::Closed);
                             }
                         }
@@ -1065,8 +1070,17 @@ where
                         let _ = self.socket_set.remove(handle);
                     }
                     // Diagnostic: log listen socket removal and trigger debugger.
-                    let total_tcp = self.socket_set.iter().filter(|(_, s)| matches!(s, smoltcp::socket::Socket::Tcp(_))).count();
-                    self.device.platform.on_listen_socket_change(port, false, total_tcp as u16, "close_handle");
+                    let total_tcp = self
+                        .socket_set
+                        .iter()
+                        .filter(|(_, s)| matches!(s, smoltcp::socket::Socket::Tcp(_)))
+                        .count();
+                    self.device.platform.on_listen_socket_change(
+                        port,
+                        false,
+                        total_tcp as u16,
+                        "close_handle",
+                    );
                     self.device.platform.on_listen_socket_destroyed(port);
                     let _ = count; // suppress unused warning
                 }
@@ -1468,7 +1482,11 @@ where
                 }
                 server_socket.refill_to_backlog(&mut self.socket_set);
                 // Diagnostic: log listen socket creation.
-                let total_tcp = self.socket_set.iter().filter(|(_, s)| matches!(s, smoltcp::socket::Socket::Tcp(_))).count();
+                let total_tcp = self
+                    .socket_set
+                    .iter()
+                    .filter(|(_, s)| matches!(s, smoltcp::socket::Socket::Tcp(_)))
+                    .count();
                 self.device.platform.on_listen_socket_change(
                     server_socket.ip_listen_endpoint.port,
                     true,

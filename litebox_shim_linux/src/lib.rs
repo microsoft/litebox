@@ -503,7 +503,7 @@ impl<FS: ShimFS> LinuxShim<FS> {
                 migrated_to_remote: Cell::new(false),
                 mux_pipe_pair_ids: RefCell::new(Vec::new()),
                 netlink_sockets: RefCell::new(alloc::collections::BTreeMap::new()),
-            inet6_fds: RefCell::new(alloc::collections::BTreeSet::new()),
+                inet6_fds: RefCell::new(alloc::collections::BTreeSet::new()),
             },
         };
         let exec_filename = alloc::ffi::CString::new(exec_filename).ok();
@@ -1182,7 +1182,7 @@ impl<FS: ShimFS> LinuxShim<FS> {
                 migrated_to_remote: Cell::new(false),
                 mux_pipe_pair_ids: RefCell::new(Vec::new()),
                 netlink_sockets: RefCell::new(alloc::collections::BTreeMap::new()),
-            inet6_fds: RefCell::new(alloc::collections::BTreeSet::new()),
+                inet6_fds: RefCell::new(alloc::collections::BTreeSet::new()),
             },
         };
 
@@ -3540,7 +3540,7 @@ enum ReplacedSubsystem {
 ///
 /// Used by the exec-on-remote-host path.  The fork-restore path uses the
 /// stream multiplexer instead (see [`MuxParentStream`]).
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct FdReplacement {
     /// The guest FD number to replace.
     guest_fd: usize,
@@ -3881,7 +3881,7 @@ mod test_utils {
                 migrated_to_remote: Cell::new(false),
                 mux_pipe_pair_ids: RefCell::new(Vec::new()),
                 netlink_sockets: RefCell::new(alloc::collections::BTreeMap::new()),
-            inet6_fds: RefCell::new(alloc::collections::BTreeSet::new()),
+                inet6_fds: RefCell::new(alloc::collections::BTreeSet::new()),
                 process_state: self.process_state.into(),
                 global: self.global,
             }
@@ -3919,7 +3919,7 @@ mod test_utils {
                 migrated_to_remote: Cell::new(false),
                 mux_pipe_pair_ids: RefCell::new(Vec::new()),
                 netlink_sockets: RefCell::new(alloc::collections::BTreeMap::new()),
-            inet6_fds: RefCell::new(alloc::collections::BTreeSet::new()),
+                inet6_fds: RefCell::new(alloc::collections::BTreeSet::new()),
             };
             Some(task)
         }

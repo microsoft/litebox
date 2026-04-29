@@ -408,26 +408,21 @@ fn run_host_tests(debug: &Path, ws_root: &Path) {
             }
         }
     };
-    stream
-        .set_read_timeout(Some(Duration::from_secs(10)))
-        .ok();
-    stream
-        .set_write_timeout(Some(Duration::from_secs(5)))
-        .ok();
+    stream.set_read_timeout(Some(Duration::from_secs(10))).ok();
+    stream.set_write_timeout(Some(Duration::from_secs(5))).ok();
 
     let mut reader = BufReader::new(stream.try_clone().expect("clone stream"));
     let mut writer = stream;
 
     // Helper: send a command and read the JSON response.
-    let send_cmd =
-        |w: &mut TcpStream, r: &mut BufReader<TcpStream>, cmd: &str| -> Option<String> {
-            let msg = format!("{cmd}\n");
-            w.write_all(msg.as_bytes()).ok()?;
-            w.flush().ok()?;
-            let mut line = String::new();
-            r.read_line(&mut line).ok()?;
-            Some(line.trim().to_string())
-        };
+    let send_cmd = |w: &mut TcpStream, r: &mut BufReader<TcpStream>, cmd: &str| -> Option<String> {
+        let msg = format!("{cmd}\n");
+        w.write_all(msg.as_bytes()).ok()?;
+        w.flush().ok()?;
+        let mut line = String::new();
+        r.read_line(&mut line).ok()?;
+        Some(line.trim().to_string())
+    };
 
     // ── H1: Control channel works ──
     {
@@ -437,7 +432,10 @@ fn run_host_tests(debug: &Path, ws_root: &Path) {
             .as_ref()
             .is_some_and(|r| r.contains(r#""status":"ok""#));
         let detail = resp.unwrap_or_else(|| "no response".to_string());
-        eprintln!("  {}: H1.control_channel [host] {detail}", if pass { "pass" } else { "FAIL" });
+        eprintln!(
+            "  {}: H1.control_channel [host] {detail}",
+            if pass { "pass" } else { "FAIL" }
+        );
         results.push(("H1.control_channel", pass, detail));
     }
 
@@ -478,9 +476,16 @@ fn run_host_tests(debug: &Path, ws_root: &Path) {
                 Err(e) => detail = format!("connect to 19091 failed: {e}"),
             }
             // Unlisten.
-            let _ = send_cmd(&mut writer, &mut reader, r#"{"cmd":"net_unlisten","port":9091}"#);
+            let _ = send_cmd(
+                &mut writer,
+                &mut reader,
+                r#"{"cmd":"net_unlisten","port":9091}"#,
+            );
         }
-        eprintln!("  {}: H2.data_forward [host] {detail}", if data_pass { "pass" } else { "FAIL" });
+        eprintln!(
+            "  {}: H2.data_forward [host] {detail}",
+            if data_pass { "pass" } else { "FAIL" }
+        );
         results.push(("H2.data_forward", data_pass, detail));
     }
 
@@ -494,7 +499,10 @@ fn run_host_tests(debug: &Path, ws_root: &Path) {
             .as_ref()
             .is_some_and(|r| r.contains(r#""status":"ok""#));
         let detail = resp.unwrap_or_else(|| "no response".to_string());
-        eprintln!("  {}: H3.env_get [host] {detail}", if pass { "pass" } else { "FAIL" });
+        eprintln!(
+            "  {}: H3.env_get [host] {detail}",
+            if pass { "pass" } else { "FAIL" }
+        );
         results.push(("H3.env_get", pass, detail));
     }
 

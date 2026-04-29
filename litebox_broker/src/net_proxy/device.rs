@@ -289,8 +289,16 @@ impl phy::TxToken for TxToken<'_> {
                     let dst_ip = &pkt[16..20];
                     warn!(
                         "BROKER TxToken RST: {}.{}.{}.{}:{} → {}.{}.{}.{}:{} flags=0x{flags:02x}",
-                        src_ip[0], src_ip[1], src_ip[2], src_ip[3], src_port,
-                        dst_ip[0], dst_ip[1], dst_ip[2], dst_ip[3], dst_port,
+                        src_ip[0],
+                        src_ip[1],
+                        src_ip[2],
+                        src_ip[3],
+                        src_port,
+                        dst_ip[0],
+                        dst_ip[1],
+                        dst_ip[2],
+                        dst_ip[3],
+                        dst_port,
                     );
                 }
                 if src_port == 63084 || dst_port == 63084 {
@@ -298,8 +306,16 @@ impl phy::TxToken for TxToken<'_> {
                     let dst_ip = &pkt[16..20];
                     info!(
                         "BROKER TxToken pkt: {}.{}.{}.{}:{} → {}.{}.{}.{}:{} flags=0x{flags:02x}",
-                        src_ip[0], src_ip[1], src_ip[2], src_ip[3], src_port,
-                        dst_ip[0], dst_ip[1], dst_ip[2], dst_ip[3], dst_port,
+                        src_ip[0],
+                        src_ip[1],
+                        src_ip[2],
+                        src_ip[3],
+                        src_port,
+                        dst_ip[0],
+                        dst_ip[1],
+                        dst_ip[2],
+                        dst_ip[3],
+                        dst_port,
                     );
                 }
             }

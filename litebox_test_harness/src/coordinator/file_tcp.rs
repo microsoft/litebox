@@ -34,9 +34,7 @@ pub(crate) async fn listen_file_tests(r: &mut TestRunner) {
         let port = if agent == "A" { 18100 } else { 18101 };
 
         // Start a TCP listener.
-        let listen_resp = r
-            .send(agent, Command::NetListen { port })
-            .await;
+        let listen_resp = r.send(agent, Command::NetListen { port }).await;
         let listening = matches!(&listen_resp, Response::Listening { .. });
         if !listening {
             r.record(
@@ -121,7 +119,12 @@ pub(crate) async fn conn_file_tests(r: &mut TestRunner) {
     // Start echo server.
     let listen_resp = r.send(agent, Command::NetListen { port }).await;
     if !matches!(&listen_resp, Response::Listening { .. }) {
-        r.record("FT.conn_echo", agent, false, &format!("listen failed: {listen_resp:?}"));
+        r.record(
+            "FT.conn_echo",
+            agent,
+            false,
+            &format!("listen failed: {listen_resp:?}"),
+        );
         return;
     }
 
@@ -178,7 +181,12 @@ pub(crate) async fn conn_file_tests(r: &mut TestRunner) {
         )
         .await;
     let readback_ok = matches!(&readback, Response::Ok { data: Some(d) } if d == "during_conn");
-    r.record("FT.conn_readback", agent, readback_ok, &format!("{readback:?}"));
+    r.record(
+        "FT.conn_readback",
+        agent,
+        readback_ok,
+        &format!("{readback:?}"),
+    );
 
     let _ = r.send(agent, Command::NetUnlisten { port }).await;
 }
@@ -231,7 +239,12 @@ pub(crate) async fn interleave_tests(r: &mut TestRunner) {
                 )
                 .await;
             let pass = matches!(&resp, Response::Ok { data: Some(d) } if d.contains("tcp_ok=64"));
-            r.record("FT.interleave_self_small", agent, pass, &format!("{resp:?}"));
+            r.record(
+                "FT.interleave_self_small",
+                agent,
+                pass,
+                &format!("{resp:?}"),
+            );
 
             // Medium data: 4 KB — needs multiple smoltcp segments.
             let resp = r
@@ -324,7 +337,12 @@ pub(crate) async fn multi_cycle_tests(r: &mut TestRunner) {
 
     let listen_resp = r.send(agent, Command::NetListen { port }).await;
     if !matches!(&listen_resp, Response::Listening { .. }) {
-        r.record("FT.multi_x5", agent, false, &format!("listen failed: {listen_resp:?}"));
+        r.record(
+            "FT.multi_x5",
+            agent,
+            false,
+            &format!("listen failed: {listen_resp:?}"),
+        );
         return;
     }
 
@@ -446,10 +464,7 @@ pub(crate) async fn exec_during_tcp_tests(r: &mut TestRunner) {
     let exec_resp = r
         .send(
             agent,
-            exec_timeout(
-                vec!["cat".into(), "/tmp/ft_exec.txt".into()],
-                5,
-            ),
+            exec_timeout(vec!["cat".into(), "/tmp/ft_exec.txt".into()], 5),
         )
         .await;
     let exec_ok = matches!(

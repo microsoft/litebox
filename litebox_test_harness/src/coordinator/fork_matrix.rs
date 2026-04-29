@@ -395,7 +395,9 @@ async fn delayed_fork_matrix(r: &mut TestRunner) {
                             None => {
                                 r.record(
                                     &test_id,
-                                    agent, false,                                    "FAIL: nonpie binary not found — mount at /opt/nonpie",
+                                    agent,
+                                    false,
+                                    "FAIL: nonpie binary not found — mount at /opt/nonpie",
                                 );
                                 continue;
                             }
@@ -590,7 +592,12 @@ async fn nonpie_invocation_tests(r: &mut TestRunner) {
         let skipped =
             matches!(&resp, Response::ExecResult { stdout, .. } if stdout.contains("SKIP"));
         if not_found || skipped {
-            r.record(&test_id, "A", false, "FAIL: nonpie binary not found — mount at /opt/nonpie");
+            r.record(
+                &test_id,
+                "A",
+                false,
+                "FAIL: nonpie binary not found — mount at /opt/nonpie",
+            );
         } else {
             let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. }
                 if stdout.contains("ECHO_TEST_OK"));
@@ -662,7 +669,9 @@ async fn contamination_pattern_tests(r: &mut TestRunner) {
         None => {
             r.record(
                 "XC.init_level",
-                "A", false,                "FAIL: nonpie binary not found — mount at /opt/nonpie",
+                "A",
+                false,
+                "FAIL: nonpie binary not found — mount at /opt/nonpie",
             );
             for cc in CONTAMINATION_CASES {
                 r.record(
@@ -686,7 +695,9 @@ async fn contamination_pattern_tests(r: &mut TestRunner) {
     if not_found {
         r.record(
             "XC.init_level",
-            "A", false,            "FAIL: nonpie binary not found — mount at /opt/nonpie",
+            "A",
+            false,
+            "FAIL: nonpie binary not found — mount at /opt/nonpie",
         );
     } else {
         let resp2 = r
@@ -708,7 +719,12 @@ async fn contamination_pattern_tests(r: &mut TestRunner) {
         let skipped =
             matches!(&resp, Response::ExecResult { stdout, .. } if stdout.contains("SKIP"));
         if skipped {
-            r.record(&test_id, "A", false, "FAIL: nonpie binary not found — mount at /opt/nonpie");
+            r.record(
+                &test_id,
+                "A",
+                false,
+                "FAIL: nonpie binary not found — mount at /opt/nonpie",
+            );
         } else {
             let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. }
                 if stdout.contains(cc.expected));
@@ -730,6 +746,3 @@ pub(super) async fn run_fork_matrix_tests(r: &mut TestRunner) {
     stress_exec_matrix(r).await;
     contamination_pattern_tests(r).await;
 }
-
-
-

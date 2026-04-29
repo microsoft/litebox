@@ -50,8 +50,18 @@ pub(super) async fn contamination_sequence_tests(r: &mut TestRunner) {
         let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout == "ECHO_TEST_OK");
         r.record("X50b.nonpie_then_pie_2", "A", pass, &format!("{resp:?}"));
     } else {
-        r.record("X50a.nonpie_then_pie_1", "A", false, "FAIL: nonpie binary not found — mount at /opt/nonpie");
-        r.record("X50b.nonpie_then_pie_2", "A", false, "FAIL: nonpie binary not found — mount at /opt/nonpie");
+        r.record(
+            "X50a.nonpie_then_pie_1",
+            "A",
+            false,
+            "FAIL: nonpie binary not found — mount at /opt/nonpie",
+        );
+        r.record(
+            "X50b.nonpie_then_pie_2",
+            "A",
+            false,
+            "FAIL: nonpie binary not found — mount at /opt/nonpie",
+        );
     }
 
     // X51-X52: Non-PIE on fresh agent B, then PIE sequence.
@@ -82,10 +92,30 @@ pub(super) async fn contamination_sequence_tests(r: &mut TestRunner) {
         let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout == "ECHO_TEST_OK");
         r.record("X52c.B_third_exec", "B", pass, &format!("{resp:?}"));
     } else {
-        r.record("X51.nonpie_fresh_agent", "B", false, "FAIL: nonpie binary not found — mount at /opt/nonpie");
-        r.record("X52a.B_nonpie_then_pie", "B", false, "FAIL: nonpie binary not found — mount at /opt/nonpie");
-        r.record("X52b.B_pie_after_nonpie", "B", false, "FAIL: nonpie binary not found — mount at /opt/nonpie");
-        r.record("X52c.B_third_exec", "B", false, "FAIL: nonpie binary not found — mount at /opt/nonpie");
+        r.record(
+            "X51.nonpie_fresh_agent",
+            "B",
+            false,
+            "FAIL: nonpie binary not found — mount at /opt/nonpie",
+        );
+        r.record(
+            "X52a.B_nonpie_then_pie",
+            "B",
+            false,
+            "FAIL: nonpie binary not found — mount at /opt/nonpie",
+        );
+        r.record(
+            "X52b.B_pie_after_nonpie",
+            "B",
+            false,
+            "FAIL: nonpie binary not found — mount at /opt/nonpie",
+        );
+        r.record(
+            "X52c.B_third_exec",
+            "B",
+            false,
+            "FAIL: nonpie binary not found — mount at /opt/nonpie",
+        );
     }
 
     // X53: Stress — 30 sequential PIE execs on fresh agent AB.
@@ -121,7 +151,12 @@ pub(super) async fn contamination_sequence_tests(r: &mut TestRunner) {
         let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout.contains("ECHO_TEST_OK"));
         r.record("X54.nonpie_after_stress", "AB", pass, &format!("{resp:?}"));
     } else {
-        r.record("X54.nonpie_after_stress", "AB", false, "FAIL: nonpie binary not found — mount at /opt/nonpie");
+        r.record(
+            "X54.nonpie_after_stress",
+            "AB",
+            false,
+            "FAIL: nonpie binary not found — mount at /opt/nonpie",
+        );
     }
 
     // X55: Non-PIE as second exec on fresh agent AAB.
@@ -136,7 +171,12 @@ pub(super) async fn contamination_sequence_tests(r: &mut TestRunner) {
         let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout.contains("ECHO_TEST_OK"));
         r.record("X55b.nonpie_second", "AAB", pass, &format!("{resp:?}"));
     } else {
-        r.record("X55b.nonpie_second", "AAB", false, "FAIL: nonpie binary not found — mount at /opt/nonpie");
+        r.record(
+            "X55b.nonpie_second",
+            "AAB",
+            false,
+            "FAIL: nonpie binary not found — mount at /opt/nonpie",
+        );
     }
 
     // X56-X59: Sequence tests on B.
@@ -1094,8 +1134,7 @@ pub(super) async fn cross_worker_tests(r: &mut TestRunner) {
                 },
             )
             .await;
-        let pass =
-            matches!(&resp, Response::Connected { echo } if echo.contains("XW7_D3_TO_D4"));
+        let pass = matches!(&resp, Response::Connected { echo } if echo.contains("XW7_D3_TO_D4"));
         r.record("XW7.d3_connect", "D3", pass, &format!("{resp:?}"));
 
         let _ = r
@@ -1130,8 +1169,7 @@ pub(super) async fn cross_worker_tests(r: &mut TestRunner) {
                 },
             )
             .await;
-        let pass =
-            matches!(&resp, Response::Connected { echo } if echo.contains("XW8_D4_TO_D3"));
+        let pass = matches!(&resp, Response::Connected { echo } if echo.contains("XW8_D4_TO_D3"));
         r.record("XW8.d4_connect", "D4", pass, &format!("{resp:?}"));
 
         let _ = r
@@ -1166,8 +1204,7 @@ pub(super) async fn cross_worker_tests(r: &mut TestRunner) {
                 },
             )
             .await;
-        let pass =
-            matches!(&resp, Response::Connected { echo } if echo.contains("XW9_AA_TO_D4"));
+        let pass = matches!(&resp, Response::Connected { echo } if echo.contains("XW9_AA_TO_D4"));
         r.record("XW9.aa_connect", "AA", pass, &format!("{resp:?}"));
 
         let _ = r
@@ -1214,7 +1251,8 @@ pub(super) async fn cross_worker_tests(r: &mut TestRunner) {
                 },
             )
             .await;
-        let pass = matches!(&resp, Response::Connected { echo } if echo.contains("XW10_CROSS_SUBTREE"));
+        let pass =
+            matches!(&resp, Response::Connected { echo } if echo.contains("XW10_CROSS_SUBTREE"));
         r.record("XW10.b_tcp_connect", "B", pass, &format!("{resp:?}"));
 
         let _ = r.send("D3", Command::NetUnlisten { port }).await;
@@ -1261,12 +1299,11 @@ pub(super) async fn cross_worker_tests(r: &mut TestRunner) {
                     },
                 )
                 .await;
-            let pass = matches!(&resp, Response::Connected { echo } if echo.contains("XW11_LATE_SPAWN"));
+            let pass =
+                matches!(&resp, Response::Connected { echo } if echo.contains("XW11_LATE_SPAWN"));
             r.record("XW11.r2_tcp_connect", "R2", pass, &format!("{resp:?}"));
         }
 
         let _ = r.send("D3", Command::NetUnlisten { port }).await;
     }
 }
-
-

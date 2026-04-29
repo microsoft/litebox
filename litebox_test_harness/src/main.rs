@@ -238,7 +238,10 @@ fn main() {
         "tcp-accept-inherited" => {
             // Accept on an INHERITED listen fd (from parent via fork+exec).
             // Does NOT re-bind or re-listen — uses the fd as-is.
-            let fd: i32 = args.get(2).and_then(|s| s.parse().ok()).expect("need fd arg");
+            let fd: i32 = args
+                .get(2)
+                .and_then(|s| s.parse().ok())
+                .expect("need fd arg");
             eprintln!("[tcp-accept-inherited] accepting on inherited fd={fd}");
             use std::os::unix::io::FromRawFd;
             let listener = unsafe { std::net::TcpListener::from_raw_fd(fd) };
@@ -590,7 +593,12 @@ fn main() {
                 }
 
                 // Accept
-                let conn = libc::accept4(srv, std::ptr::null_mut(), std::ptr::null_mut(), libc::SOCK_NONBLOCK);
+                let conn = libc::accept4(
+                    srv,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    libc::SOCK_NONBLOCK,
+                );
                 if conn < 0 {
                     println!("EPOLL_ACCEPT=FAIL");
                 } else {
@@ -633,24 +641,40 @@ fn main() {
             unsafe {
                 let srv = libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0);
                 let one: libc::c_int = 1;
-                libc::setsockopt(srv, libc::SOL_SOCKET, libc::SO_REUSEADDR,
+                libc::setsockopt(
+                    srv,
+                    libc::SOL_SOCKET,
+                    libc::SO_REUSEADDR,
                     &one as *const _ as *const libc::c_void,
-                    std::mem::size_of::<libc::c_int>() as libc::socklen_t);
+                    std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+                );
                 let addr = libc::sockaddr_in {
-                    sin_family: libc::AF_INET as u16, sin_port: port.to_be(),
-                    sin_addr: libc::in_addr { s_addr: 0 }, sin_zero: [0; 8],
+                    sin_family: libc::AF_INET as u16,
+                    sin_port: port.to_be(),
+                    sin_addr: libc::in_addr { s_addr: 0 },
+                    sin_zero: [0; 8],
                 };
-                libc::bind(srv, &addr as *const _ as *const libc::sockaddr,
-                    std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t);
+                libc::bind(
+                    srv,
+                    &addr as *const _ as *const libc::sockaddr,
+                    std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+                );
                 libc::listen(srv, 1);
 
                 let server = std::thread::spawn(move || {
                     let conn = libc::accept(srv, std::ptr::null_mut(), std::ptr::null_mut());
                     // Set recv timeout
-                    let tv = libc::timeval { tv_sec: 5, tv_usec: 0 };
-                    libc::setsockopt(conn, libc::SOL_SOCKET, libc::SO_RCVTIMEO,
+                    let tv = libc::timeval {
+                        tv_sec: 5,
+                        tv_usec: 0,
+                    };
+                    libc::setsockopt(
+                        conn,
+                        libc::SOL_SOCKET,
+                        libc::SO_RCVTIMEO,
                         &tv as *const _ as *const libc::c_void,
-                        std::mem::size_of::<libc::timeval>() as libc::socklen_t);
+                        std::mem::size_of::<libc::timeval>() as libc::socklen_t,
+                    );
                     let mut buf = [0u8; 1024];
                     let n = libc::recv(conn, buf.as_mut_ptr().cast(), buf.len(), 0);
                     if n > 0 {
@@ -668,30 +692,53 @@ fn main() {
 
                 let cli = libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0);
                 let caddr = libc::sockaddr_in {
-                    sin_family: libc::AF_INET as u16, sin_port: port.to_be(),
-                    sin_addr: libc::in_addr { s_addr: u32::from_be_bytes([127,0,0,1]).to_be() },
+                    sin_family: libc::AF_INET as u16,
+                    sin_port: port.to_be(),
+                    sin_addr: libc::in_addr {
+                        s_addr: u32::from_be_bytes([127, 0, 0, 1]).to_be(),
+                    },
                     sin_zero: [0; 8],
                 };
-                libc::connect(cli, &caddr as *const _ as *const libc::sockaddr,
-                    std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t);
+                libc::connect(
+                    cli,
+                    &caddr as *const _ as *const libc::sockaddr,
+                    std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+                );
                 let msg = b"HALFCLOSE";
                 libc::send(cli, msg.as_ptr().cast(), msg.len(), 0);
                 libc::shutdown(cli, libc::SHUT_WR);
                 // Set recv timeout on client too
-                let tv = libc::timeval { tv_sec: 5, tv_usec: 0 };
-                libc::setsockopt(cli, libc::SOL_SOCKET, libc::SO_RCVTIMEO,
+                let tv = libc::timeval {
+                    tv_sec: 5,
+                    tv_usec: 0,
+                };
+                libc::setsockopt(
+                    cli,
+                    libc::SOL_SOCKET,
+                    libc::SO_RCVTIMEO,
                     &tv as *const _ as *const libc::c_void,
-                    std::mem::size_of::<libc::timeval>() as libc::socklen_t);
+                    std::mem::size_of::<libc::timeval>() as libc::socklen_t,
+                );
                 let mut buf = [0u8; 1024];
                 let echo_n = libc::recv(cli, buf.as_mut_ptr().cast(), buf.len(), 0);
-                let echo_errno = if echo_n < 0 { *libc::__errno_location() } else { 0 };
+                let echo_errno = if echo_n < 0 {
+                    *libc::__errno_location()
+                } else {
+                    0
+                };
                 let eof_n = libc::recv(cli, buf.as_mut_ptr().cast(), buf.len(), 0);
-                let eof_errno = if eof_n < 0 { *libc::__errno_location() } else { 0 };
+                let eof_errno = if eof_n < 0 {
+                    *libc::__errno_location()
+                } else {
+                    0
+                };
                 libc::close(cli);
 
                 let (srv_data, srv_eof, srv_errno) = server.join().unwrap_or((-1, -1, 0));
-                let ok = srv_data as usize == msg.len() && srv_eof == 0
-                    && echo_n as usize == msg.len() && eof_n == 0;
+                let ok = srv_data as usize == msg.len()
+                    && srv_eof == 0
+                    && echo_n as usize == msg.len()
+                    && eof_n == 0;
                 println!(
                     "HALFCLOSE={} srv_data={srv_data} srv_eof={srv_eof} srv_errno={srv_errno} echo={echo_n} echo_errno={echo_errno} eof={eof_n} eof_errno={eof_errno}",
                     if ok { "OK" } else { "FAIL" }
@@ -4293,9 +4340,8 @@ mod unix_socket_tests {
         if pid == 0 {
             unsafe { libc::close(parent_fd) };
             let msg = b"US6_FROM_CHILD";
-            let n = unsafe {
-                libc::write(child_fd, msg.as_ptr() as *const libc::c_void, msg.len())
-            };
+            let n =
+                unsafe { libc::write(child_fd, msg.as_ptr() as *const libc::c_void, msg.len()) };
             if n != msg.len() as isize {
                 eprintln!("[US6a-child] write failed: n={n} errno={}", errno());
                 std::process::exit(1);
@@ -4308,7 +4354,11 @@ mod unix_socket_tests {
         unsafe { libc::close(child_fd) };
         let mut status = 0i32;
         unsafe { libc::waitpid(pid, &mut status, 0) };
-        let exit_code = if libc::WIFEXITED(status) { libc::WEXITSTATUS(status) } else { 99 };
+        let exit_code = if libc::WIFEXITED(status) {
+            libc::WEXITSTATUS(status)
+        } else {
+            99
+        };
 
         if exit_code != 0 {
             println!("US6_CHILD_FAIL:exit={exit_code}");
@@ -4317,9 +4367,7 @@ mod unix_socket_tests {
         }
 
         let mut buf = [0u8; 64];
-        let n = unsafe {
-            libc::read(parent_fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len())
-        };
+        let n = unsafe { libc::read(parent_fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
         unsafe { libc::close(parent_fd) };
 
         if n <= 0 {
@@ -4342,8 +4390,7 @@ mod unix_socket_tests {
     /// Tests the reverse direction (parent→child):
     ///   parent: socketpair() → fork() → write to parent_end → waitpid
     ///   child:  read from child_end → exit(based on data)
-    /// Uses vfork-compatible sequencing: parent writes after fork returns
-    /// (vfork resumes parent after child blocks on read or execs).
+    /// Requires true concurrent fork (not vfork).
     fn test_socketpair_fork_read() -> i32 {
         let mut fds = [0i32; 2];
         let rc = unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, fds.as_mut_ptr()) };
@@ -4364,7 +4411,6 @@ mod unix_socket_tests {
         if pid == 0 {
             // Child: close parent end, read from child end, exit.
             unsafe { libc::close(parent_fd) };
-            // Set a 5-second read timeout to avoid hanging forever.
             let tv = libc::timeval { tv_sec: 5, tv_usec: 0 };
             unsafe {
                 libc::setsockopt(

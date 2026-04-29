@@ -2941,6 +2941,35 @@ impl<FS: ShimFS> Task<FS> {
                         repl.direction,
                     );
 
+                    // Bidirectional (ReadWrite): install HostPipeFd directly
+                    // backed by the OS socketpair fd. No virtual pipe or relay
+                    // thread needed — reads/writes go straight to the OS fd.
+                    if repl.direction == HostPipeDirection::ReadWrite {
+                        let entry = super::host_pipe::HostPipeFd::new(
+                            repl.host_fd,
+                            HostPipeDirection::ReadWrite,
+                        );
+                        let typed_fd: litebox::fd::TypedFd<
+                            super::host_pipe::HostPipeSubsystem,
+                        > = self.global.litebox.descriptor_table_mut().insert(entry);
+
+                        let mut rds = files.raw_descriptor_store.write();
+                        // Remove old unix socket at this slot.
+                        if let Ok(old_sock) = rds.fd_consume_raw_integer::<
+                            super::unix::UnixSocketSubsystem<FS>,
+                        >(repl.guest_fd) {
+                            drop(rds);
+                            let _ = self
+                                .global
+                                .litebox
+                                .descriptor_table_mut()
+                                .remove(&old_sock);
+                            rds = files.raw_descriptor_store.write();
+                        }
+                        let _ = rds.fd_into_specific_raw_integer(typed_fd, repl.guest_fd);
+                        continue;
+                    }
+
                     // Default path: create a virtual pipe pair and replace the fd.
                     // This is used for init (whose fds are host-backed, not virtual
                     // pipes) and for Write-direction replacements.
@@ -5076,10 +5105,28 @@ impl<FS: ShimFS> Task<FS> {
                 for info in &child_sockets {
                     // Bidirectional sockets: create OS socketpair, pass
                     // child end as a passthrough fd (bypasses mux).
+                    // Find the parent's peer fd using fc.parent_unix_socket_fds
+                    // (captured at fork time, before the child closed any fds).
                     if info.direction == HostPipeDirection::ReadWrite {
                         match self.global.platform.create_host_socketpair() {
                             Ok((child_end, parent_end)) => {
                                 bidi_passthrough.push((info.child_fd, child_end, parent_end));
+
+                                // Find parent's peer: same pair_id, different object_id.
+                                for &(parent_fd, parent_pair_id, parent_oid) in
+                                    &fc.parent_unix_socket_fds
+                                {
+                                    if parent_pair_id == info.pair_id
+                                        && parent_oid != info.object_id
+                                    {
+                                        parent_replacements.push(crate::FdReplacement {
+                                            guest_fd: parent_fd,
+                                            host_fd: parent_end,
+                                            direction: HostPipeDirection::ReadWrite,
+                                            subsystem: crate::ReplacedSubsystem::UnixSocket,
+                                        });
+                                    }
+                                }
                             }
                             Err(_e) => {
                                 #[cfg(feature = "trace_syscalls")]
@@ -5558,6 +5605,17 @@ impl<FS: ShimFS> Task<FS> {
                     *fc.vfork_done.fd_replacements.lock() = parent_replacements;
                 }
             } else {
+                // Store any bidirectional (ReadWrite) replacements in
+                // fd_replacements — these bypass the mux and need direct
+                // host pipe fd installation on the parent side.
+                let bidi_repls: Vec<crate::FdReplacement> = parent_replacements
+                    .iter()
+                    .filter(|r| r.direction == HostPipeDirection::ReadWrite)
+                    .cloned()
+                    .collect();
+                if !bidi_repls.is_empty() {
+                    *fc.vfork_done.fd_replacements.lock() = bidi_repls;
+                }
                 let (mux_parent_raw, mux_worker_raw) =
                     match self.global.platform.create_host_socketpair() {
                         Ok(pair) => pair,
@@ -6040,84 +6098,11 @@ impl<FS: ShimFS> Task<FS> {
             host_pid,
         );
 
-        // Close child ends of bidirectional socketpair bridges and
-        // set up parent-side fd replacements so the parent's reads/writes
-        // go through the OS socketpair to the child worker.
-        for &(guest_fd, child_fd, parent_fd) in &bidi_passthrough {
+        // Close child ends of bidirectional socketpair bridges.
+        // The parent-side fd replacement is stored in fd_replacements
+        // (via parent_replacements) and applied by the parent after VforkDone.
+        for &(_, child_fd, _) in &bidi_passthrough {
             self.global.platform.close_host_fd(child_fd);
-            // Find the parent's peer unix socket fd for this guest_fd.
-            // The parent's peer has the OTHER object_id from the same
-            // pair_id. We need to find which parent fd to replace.
-            // For the simple case (socketpair fd 3/4), the parent holds
-            // the peer end. Replace it with a HostPipeFd backed by the
-            // OS socketpair parent end.
-            let files = self.files.borrow();
-            let rds = files.raw_descriptor_store.read();
-            // Find parent unix socket fds with matching pair_id.
-            let dt = self.global.litebox.descriptor_table();
-            let mut parent_fds_to_replace: Vec<usize> = Vec::new();
-            // Look for the peer socket (same pair_id, different object_id).
-            if let Ok(child_typed) =
-                rds.fd_from_raw_integer::<super::unix::UnixSocketSubsystem<FS>>(guest_fd)
-            {
-                let child_pair = dt
-                    .with_entry(&child_typed, |sock: &super::unix::UnixSocket<FS>| {
-                        sock.socket_pair_id()
-                    })
-                    .flatten();
-                if let Some(child_pair_id) = child_pair {
-                    let child_oid = child_typed.object_id().as_u64();
-                    for raw_fd in rds.iter_alive() {
-                        if raw_fd == guest_fd {
-                            continue;
-                        }
-                        if let Ok(typed) =
-                            rds.fd_from_raw_integer::<super::unix::UnixSocketSubsystem<FS>>(raw_fd)
-                        {
-                            let pair_id = dt
-                                .with_entry(&typed, |sock: &super::unix::UnixSocket<FS>| {
-                                    sock.socket_pair_id()
-                                })
-                                .flatten();
-                            if pair_id == Some(child_pair_id)
-                                && typed.object_id().as_u64() != child_oid
-                            {
-                                parent_fds_to_replace.push(raw_fd);
-                            }
-                        }
-                    }
-                }
-            }
-            drop(dt);
-            drop(rds);
-            drop(files);
-
-            // Replace the parent's peer fd with a HostPipeFd backed by
-            // the OS socketpair's parent end.
-            for peer_fd in &parent_fds_to_replace {
-                let entry = super::host_pipe::HostPipeFd::new(
-                    parent_fd,
-                    super::host_pipe::HostPipeDirection::ReadWrite,
-                );
-                let typed_fd: litebox::fd::TypedFd<super::host_pipe::HostPipeSubsystem> =
-                    self.global.litebox.descriptor_table_mut().insert(entry);
-
-                let files = self.files.borrow();
-                let mut rds = files.raw_descriptor_store.write();
-                // Remove old unix socket at this slot.
-                if let Ok(old_sock) =
-                    rds.fd_consume_raw_integer::<super::unix::UnixSocketSubsystem<FS>>(*peer_fd)
-                {
-                    drop(rds);
-                    let _ = self.global.litebox.descriptor_table_mut().remove(&old_sock);
-                    rds = files.raw_descriptor_store.write();
-                }
-                let _ = rds.fd_into_specific_raw_integer(typed_fd, *peer_fd);
-            }
-            if parent_fds_to_replace.is_empty() {
-                // No peer found — just close the parent OS fd.
-                self.global.platform.close_host_fd(parent_fd);
-            }
         }
 
         // Migrate: unregister from local control plane, re-register as remote.

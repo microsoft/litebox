@@ -1721,7 +1721,7 @@ impl LinuxUserland {
         stdio: WorkerExecStdioBindings<FS, LinuxUserland>,
         mux_fd: Option<i32>,
         mux_streams: &[(u32, usize, u8, u8, bool)],
-        passthrough_fds: &[(usize, i32, bool)],
+        passthrough_fds: &[(usize, i32, u8)],
         local_pipe_pairs: &[(usize, usize, Vec<u8>, u32, u32)],
     ) -> Result<i32, i32>
     where
@@ -1808,9 +1808,13 @@ impl LinuxUserland {
         }
 
         // Add --pipe-bridge for host-pipe passthrough fds (from prior bridges).
-        for &(guest_fd, host_fd, is_read) in passthrough_fds {
+        for &(guest_fd, host_fd, dir) in passthrough_fds {
             let _ = self.clear_cloexec(host_fd);
-            let dir_char = if is_read { 'r' } else { 'w' };
+            let dir_char = match dir {
+                b'r' => 'r',
+                b'b' => 'b',
+                _ => 'w',
+            };
             spawn_argv.push(CString::new("--pipe-bridge").unwrap());
             spawn_argv.push(
                 CString::new(format!("{guest_fd}:{dir_char}:{host_fd}")).map_err(|_| -1_i32)?,
@@ -4307,15 +4311,25 @@ impl litebox::platform::IPInterfaceProvider for LinuxUserland {
                         let tid = unsafe { libc::syscall(libc::SYS_gettid) };
                         let msg = format!(
                             "RUNNER RST: {}.{}.{}.{}:{} → {}.{}.{}.{}:{} flags=0x{:02x} pid={} tid={tid}\n",
-                            src_ip[0], src_ip[1], src_ip[2], src_ip[3], src_port,
-                            dst_ip[0], dst_ip[1], dst_ip[2], dst_ip[3], dst_port,
+                            src_ip[0],
+                            src_ip[1],
+                            src_ip[2],
+                            src_ip[3],
+                            src_port,
+                            dst_ip[0],
+                            dst_ip[1],
+                            dst_ip[2],
+                            dst_ip[3],
+                            dst_port,
                             packet[ihl + 13],
                             std::process::id()
                         );
                         // Write to file only — stderr is reserved for guest use.
                         use std::io::Write;
                         if let Ok(mut f) = std::fs::OpenOptions::new()
-                            .create(true).append(true).open("/tmp/rst-diag.log")
+                            .create(true)
+                            .append(true)
+                            .open("/tmp/rst-diag.log")
                         {
                             let _ = f.write_all(msg.as_bytes());
                         }
@@ -4399,12 +4413,15 @@ impl litebox::platform::IPInterfaceProvider for LinuxUserland {
     ) {
         let tid = unsafe { libc::syscall(libc::SYS_gettid) };
         // Decode addr codes: 0=ANY, 1=127.0.0.1, 2=10.0.0.2, 3=other
-        let addrs_decoded: Vec<&str> = listen_addrs.iter().map(|&a| match a {
-            0 => "ANY",
-            1 => "127.0.0.1",
-            2 => "10.0.0.2",
-            _ => "other",
-        }).collect();
+        let addrs_decoded: Vec<&str> = listen_addrs
+            .iter()
+            .map(|&a| match a {
+                0 => "ANY",
+                1 => "127.0.0.1",
+                2 => "10.0.0.2",
+                _ => "other",
+            })
+            .collect();
         let msg = format!(
             "RUNNER RST (on_rst_transmitted): src={src_port} dst={dst_port} \
              tcp_sockets={tcp_count} listen_sockets={listen_count} \

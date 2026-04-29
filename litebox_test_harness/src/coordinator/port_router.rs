@@ -44,9 +44,7 @@ pub(crate) async fn fork_port_tests(r: &mut TestRunner) {
         // Exec a child that exits immediately. The child process inherits
         // the listening socket fd. In litebox, this creates a new worker
         // that registers the same port, then dies and deregisters it.
-        let exec_resp = r
-            .send(agent, exec(vec!["true".into()]))
-            .await;
+        let exec_resp = r.send(agent, exec(vec!["true".into()])).await;
         let exec_ok = matches!(&exec_resp, Response::ExecResult { exit_code: 0, .. });
         r.record(
             &format!("PR.fork_exec.{agent}"),
@@ -100,9 +98,7 @@ pub(crate) async fn fork_multi_tests(r: &mut TestRunner) {
 
     // Spawn 5 sequential children that each exit immediately.
     for i in 0..5 {
-        let resp = r
-            .send(agent, exec(vec!["true".into()]))
-            .await;
+        let resp = r.send(agent, exec(vec!["true".into()])).await;
         if !matches!(&resp, Response::ExecResult { exit_code: 0, .. }) {
             r.record(
                 "PR.fork_multi_x5",
@@ -125,8 +121,7 @@ pub(crate) async fn fork_multi_tests(r: &mut TestRunner) {
             },
         )
         .await;
-    let conn_ok =
-        matches!(&conn_resp, Response::Connected { echo } if echo == "after_5_forks");
+    let conn_ok = matches!(&conn_resp, Response::Connected { echo } if echo == "after_5_forks");
     r.record(
         "PR.fork_multi_x5",
         agent,
@@ -172,8 +167,7 @@ pub(crate) async fn fork_cross_tests(r: &mut TestRunner) {
             },
         )
         .await;
-    let conn_ok =
-        matches!(&conn_resp, Response::Connected { echo } if echo == "cross_after_fork");
+    let conn_ok = matches!(&conn_resp, Response::Connected { echo } if echo == "cross_after_fork");
     r.record(
         "PR.fork_cross",
         connector,
@@ -294,8 +288,7 @@ pub(crate) async fn fork_background_tests(r: &mut TestRunner) {
             },
         )
         .await;
-    let conn_ok =
-        matches!(&conn_resp, Response::Connected { echo } if echo == "after_bg_fork");
+    let conn_ok = matches!(&conn_resp, Response::Connected { echo } if echo == "after_bg_fork");
     r.record(
         "PR.fork_bg",
         agent,
@@ -394,9 +387,7 @@ pub(crate) async fn fork_listen_inherit_tests(r: &mut TestRunner) {
             "A",
             Command::Forward {
                 target: "LI_C".to_string(),
-                inner: Box::new(Command::NetListen {
-                    port: child_port,
-                }),
+                inner: Box::new(Command::NetListen { port: child_port }),
             },
         )
         .await;
@@ -409,9 +400,7 @@ pub(crate) async fn fork_listen_inherit_tests(r: &mut TestRunner) {
             "A",
             Command::Forward {
                 target: "LI_C".to_string(),
-                inner: Box::new(Command::NetUnlisten {
-                    port: child_port,
-                }),
+                inner: Box::new(Command::NetUnlisten { port: child_port }),
             },
         )
         .await;
@@ -438,8 +427,7 @@ pub(crate) async fn fork_listen_inherit_tests(r: &mut TestRunner) {
             },
         )
         .await;
-    let self_ok =
-        matches!(&conn_resp, Response::Connected { echo } if echo == "inherit_self");
+    let self_ok = matches!(&conn_resp, Response::Connected { echo } if echo == "inherit_self");
     r.record(
         "PR.listen_inherit_self",
         "A",
@@ -490,9 +478,7 @@ pub(crate) async fn fork_listen_inherit_tests(r: &mut TestRunner) {
             "A",
             Command::Forward {
                 target: "LI_C2".to_string(),
-                inner: Box::new(Command::NetListen {
-                    port: child_port2,
-                }),
+                inner: Box::new(Command::NetListen { port: child_port2 }),
             },
         )
         .await;
@@ -501,9 +487,7 @@ pub(crate) async fn fork_listen_inherit_tests(r: &mut TestRunner) {
             "A",
             Command::Forward {
                 target: "LI_C2".to_string(),
-                inner: Box::new(Command::NetUnlisten {
-                    port: child_port2,
-                }),
+                inner: Box::new(Command::NetUnlisten { port: child_port2 }),
             },
         )
         .await;
@@ -528,8 +512,7 @@ pub(crate) async fn fork_listen_inherit_tests(r: &mut TestRunner) {
             },
         )
         .await;
-    let cross_ok =
-        matches!(&conn_resp, Response::Connected { echo } if echo == "inherit_cross");
+    let cross_ok = matches!(&conn_resp, Response::Connected { echo } if echo == "inherit_cross");
     r.record(
         "PR.listen_inherit_cross",
         "B",
@@ -552,7 +535,9 @@ pub(crate) async fn fork_listen_inherit_tests(r: &mut TestRunner) {
 /// Previously used the `tcp-echo` subcommand via background Exec.
 /// Now uses Fork + NetListen + NetConnect primitives.
 pub(crate) async fn child_listen_cross_connect_tests(r: &mut TestRunner) {
-    eprintln!("[pr] === PR.child_listen: child calls listen, cross-worker connect (primitives) ===");
+    eprintln!(
+        "[pr] === PR.child_listen: child calls listen, cross-worker connect (primitives) ==="
+    );
 
     let port = 18500u16;
 
@@ -694,7 +679,9 @@ pub(crate) async fn vscode_cli_cross_connect_tests(r: &mut TestRunner) {
         _ => {
             r.record(
                 "PR.vscode_cli_cross",
-                "B", false,                "FAIL: VS Code CLI not installed — use litebox-vscode image",
+                "B",
+                false,
+                "FAIL: VS Code CLI not installed — use litebox-vscode image",
             );
             return;
         }
@@ -775,9 +762,7 @@ pub(crate) async fn vscode_cli_cross_connect_tests(r: &mut TestRunner) {
         return;
     };
 
-    let cmd = format!(
-        "echo PROBE | nc -w5 127.0.0.1 {port} >/dev/null 2>&1; echo CONN=$?"
-    );
+    let cmd = format!("echo PROBE | nc -w5 127.0.0.1 {port} >/dev/null 2>&1; echo CONN=$?");
     let conn_resp = r
         .send(
             "B",
@@ -797,5 +782,3 @@ pub(crate) async fn vscode_cli_cross_connect_tests(r: &mut TestRunner) {
 
     let _ = r.send("A", Command::Kill { pid: bg_pid }).await;
 }
-
-

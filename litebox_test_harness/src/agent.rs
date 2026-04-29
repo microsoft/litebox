@@ -174,11 +174,8 @@ async fn agent_loop(self_exe: &str) {
                         let _ = stream.write_all(probe).await;
                         let _ = stream.flush().await;
                         let mut buf = [0u8; 64];
-                        match tokio::time::timeout(
-                            Duration::from_secs(5),
-                            stream.read(&mut buf),
-                        )
-                        .await
+                        match tokio::time::timeout(Duration::from_secs(5), stream.read(&mut buf))
+                            .await
                         {
                             Ok(Ok(n)) if n > 0 => {
                                 respond(&Response::Connected {
@@ -228,7 +225,6 @@ async fn agent_loop(self_exe: &str) {
                 })
                 .await;
             }
-
 
             Command::FsWrite { path, data } => {
                 if let Some(parent) = std::path::Path::new(&path).parent() {
@@ -932,11 +928,7 @@ async fn agent_loop(self_exe: &str) {
                 .await;
             }
 
-            Command::NetSendFileRecv {
-                addr,
-                size,
-                path,
-            } => {
+            Command::NetSendFileRecv { addr, size, path } => {
                 use tokio::io::{AsyncReadExt, AsyncWriteExt};
                 let result = async {
                     // 1. Connect and send data.
@@ -969,11 +961,8 @@ async fn agent_loop(self_exe: &str) {
                     let mut received = Vec::new();
                     let mut buf = [0u8; 8192];
                     loop {
-                        match tokio::time::timeout(
-                            Duration::from_secs(10),
-                            stream.read(&mut buf),
-                        )
-                        .await
+                        match tokio::time::timeout(Duration::from_secs(10), stream.read(&mut buf))
+                            .await
                         {
                             Ok(Ok(0)) => break,
                             Ok(Ok(n)) => received.extend_from_slice(&buf[..n]),
@@ -1001,10 +990,7 @@ async fn agent_loop(self_exe: &str) {
                             received[first_diff], pattern[first_diff]
                         ));
                     }
-                    Ok(format!(
-                        "tcp_ok={size},file_len={}",
-                        file_content.len()
-                    ))
+                    Ok(format!("tcp_ok={size},file_len={}", file_content.len()))
                 }
                 .await;
                 match result {

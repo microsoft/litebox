@@ -1196,7 +1196,9 @@ impl<FS: ShimFS> Task<FS> {
                 };
                 // Track this fd as AF_INET6 so getsockname/getpeername
                 // return sockaddr_in6 with v4-mapped addresses.
-                self.inet6_fds.borrow_mut().insert(u32::try_from(raw_fd).unwrap());
+                self.inet6_fds
+                    .borrow_mut()
+                    .insert(u32::try_from(raw_fd).unwrap());
                 raw_fd
             }
             AddressFamily::NETLINK => {

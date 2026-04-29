@@ -729,6 +729,3 @@ async fn send_cmd(child: &mut Child, cmd: &Command) -> Response {
         },
     }
 }
-
-
-

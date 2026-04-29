@@ -127,7 +127,12 @@ pub(crate) async fn exit_data_integrity_tests(r: &mut TestRunner) {
                     None => {
                         for &agent in DEPTH_AGENTS {
                             let test_id = format!("EXITD.{size}.{binary}.{agent}");
-                            r.record(&test_id, agent, false, "FAIL: nonpie binary not found — mount at /opt/nonpie");
+                            r.record(
+                                &test_id,
+                                agent,
+                                false,
+                                "FAIL: nonpie binary not found — mount at /opt/nonpie",
+                            );
                         }
                         continue;
                     }
@@ -191,7 +196,12 @@ pub(crate) async fn nonpie_pipe_chain_tests(r: &mut TestRunner) {
                 for pattern in &["seq", "interleaved"] {
                     for &agent in DEPTH_AGENTS {
                         let test_id = format!("NPIPE.{pattern}.x{reps}.{agent}");
-                        r.record(&test_id, agent, false, "FAIL: nonpie binary not found — mount at /opt/nonpie");
+                        r.record(
+                            &test_id,
+                            agent,
+                            false,
+                            "FAIL: nonpie binary not found — mount at /opt/nonpie",
+                        );
                     }
                 }
             }
@@ -323,12 +333,7 @@ pub(crate) async fn cross_worker_first_connect_tests(r: &mut TestRunner) {
         )
         .await;
     let ok = matches!(&conn_resp, Response::Connected { echo } if echo == "first_connect");
-    r.record(
-        "XCONN.cross_first",
-        "B",
-        ok,
-        &format!("{conn_resp:?}"),
-    );
+    r.record("XCONN.cross_first", "B", ok, &format!("{conn_resp:?}"));
 
     // Same test but agent AA (deeper worker) connects to agent B's listener.
     let port2 = 19901u16;
@@ -351,12 +356,7 @@ pub(crate) async fn cross_worker_first_connect_tests(r: &mut TestRunner) {
             )
             .await;
         let ok = matches!(&conn_resp, Response::Connected { echo } if echo == "deep_cross");
-        r.record(
-            "XCONN.deep_cross",
-            "AA",
-            ok,
-            &format!("{conn_resp:?}"),
-        );
+        r.record("XCONN.deep_cross", "AA", ok, &format!("{conn_resp:?}"));
         let _ = r.send("B", Command::NetUnlisten { port: port2 }).await;
     }
 
@@ -410,14 +410,22 @@ pub(crate) async fn cross_worker_self_connect_tests(r: &mut TestRunner) {
     let port = 19910u16;
     let listen_resp = r.send("A", Command::NetListen { port }).await;
     if !matches!(&listen_resp, Response::Listening { .. }) {
-        r.record("XCONN.self_A", "A", false, &format!("listen failed: {listen_resp:?}"));
+        r.record(
+            "XCONN.self_A",
+            "A",
+            false,
+            &format!("listen failed: {listen_resp:?}"),
+        );
         return;
     }
     let conn_resp = r
-        .send("A", Command::NetConnect {
-            addr: format!("127.0.0.1:{port}"),
-            data: "self_loopback".into(),
-        })
+        .send(
+            "A",
+            Command::NetConnect {
+                addr: format!("127.0.0.1:{port}"),
+                data: "self_loopback".into(),
+            },
+        )
         .await;
     let ok = matches!(&conn_resp, Response::Connected { echo } if echo == "self_loopback");
     r.record("XCONN.self_A", "A", ok, &format!("{conn_resp:?}"));
@@ -428,14 +436,22 @@ pub(crate) async fn cross_worker_self_connect_tests(r: &mut TestRunner) {
     let port2 = 19911u16;
     let listen_resp = r.send("A", Command::NetListen { port: port2 }).await;
     if !matches!(&listen_resp, Response::Listening { .. }) {
-        r.record("XCONN.parent_child", "AA", false, &format!("listen failed: {listen_resp:?}"));
+        r.record(
+            "XCONN.parent_child",
+            "AA",
+            false,
+            &format!("listen failed: {listen_resp:?}"),
+        );
         return;
     }
     let conn_resp = r
-        .send("AA", Command::NetConnect {
-            addr: format!("127.0.0.1:{port2}"),
-            data: "parent_child".into(),
-        })
+        .send(
+            "AA",
+            Command::NetConnect {
+                addr: format!("127.0.0.1:{port2}"),
+                data: "parent_child".into(),
+            },
+        )
         .await;
     let ok = matches!(&conn_resp, Response::Connected { echo } if echo == "parent_child");
     r.record("XCONN.parent_child", "AA", ok, &format!("{conn_resp:?}"));
@@ -445,14 +461,22 @@ pub(crate) async fn cross_worker_self_connect_tests(r: &mut TestRunner) {
     let port3 = 19912u16;
     let listen_resp = r.send("AA", Command::NetListen { port: port3 }).await;
     if !matches!(&listen_resp, Response::Listening { .. }) {
-        r.record("XCONN.child_parent", "A", false, &format!("listen failed: {listen_resp:?}"));
+        r.record(
+            "XCONN.child_parent",
+            "A",
+            false,
+            &format!("listen failed: {listen_resp:?}"),
+        );
         return;
     }
     let conn_resp = r
-        .send("A", Command::NetConnect {
-            addr: format!("127.0.0.1:{port3}"),
-            data: "child_parent".into(),
-        })
+        .send(
+            "A",
+            Command::NetConnect {
+                addr: format!("127.0.0.1:{port3}"),
+                data: "child_parent".into(),
+            },
+        )
         .await;
     let ok = matches!(&conn_resp, Response::Connected { echo } if echo == "child_parent");
     r.record("XCONN.child_parent", "A", ok, &format!("{conn_resp:?}"));
@@ -462,14 +486,22 @@ pub(crate) async fn cross_worker_self_connect_tests(r: &mut TestRunner) {
     let port4 = 19913u16;
     let listen_resp = r.send("A", Command::NetListen { port: port4 }).await;
     if !matches!(&listen_resp, Response::Listening { .. }) {
-        r.record("XCONN.sibling_AB", "AB", false, &format!("listen failed: {listen_resp:?}"));
+        r.record(
+            "XCONN.sibling_AB",
+            "AB",
+            false,
+            &format!("listen failed: {listen_resp:?}"),
+        );
         return;
     }
     let conn_resp = r
-        .send("AB", Command::NetConnect {
-            addr: format!("127.0.0.1:{port4}"),
-            data: "sibling_connect".into(),
-        })
+        .send(
+            "AB",
+            Command::NetConnect {
+                addr: format!("127.0.0.1:{port4}"),
+                data: "sibling_connect".into(),
+            },
+        )
         .await;
     let ok = matches!(&conn_resp, Response::Connected { echo } if echo == "sibling_connect");
     r.record("XCONN.sibling_AB", "AB", ok, &format!("{conn_resp:?}"));
@@ -1829,10 +1861,7 @@ pub(crate) async fn pipe_nonblock_tests(r: &mut TestRunner) {
 ///   EP.tokio.accept — epoll_wait(0) → re-wait wakes for accept
 ///   EP.tokio.read   — epoll_wait(0) → re-wait wakes for data
 pub(crate) async fn epoll_socket_tests(r: &mut TestRunner) {
-    eprintln!(
-        "[platform] === Epoll Socket ({} agents) ===",
-        AGENTS.len()
-    );
+    eprintln!("[platform] === Epoll Socket ({} agents) ===", AGENTS.len());
 
     let self_exe = r.self_exe.clone();
 
@@ -1865,8 +1894,7 @@ pub(crate) async fn epoll_socket_tests(r: &mut TestRunner) {
 
             match &resp {
                 Response::ExecResult { stdout, .. } => {
-                    let accept_ok =
-                        stdout.contains("EPOLL_ACCEPT=") && !stdout.contains("TIMEOUT");
+                    let accept_ok = stdout.contains("EPOLL_ACCEPT=") && !stdout.contains("TIMEOUT");
                     r.record(
                         &format!("EP.{variant}.accept.{agent}"),
                         agent,
@@ -2041,7 +2069,6 @@ pub(crate) async fn loopback_tcp_tests(r: &mut TestRunner) {
     }
 }
 
-
 // ═══════════════════════════════════════════════════════════════════
 // FKLC: fork-listen-close — VS Code CLI pattern
 // ═══════════════════════════════════════════════════════════════════
@@ -2068,7 +2095,12 @@ pub(crate) async fn fork_listen_close_tests(r: &mut TestRunner) {
     // Agent A: listen then unlisten (simulating VS Code CLI close).
     let listen_resp = r.send("A", Command::NetListen { port }).await;
     if !matches!(&listen_resp, Response::Listening { .. }) {
-        r.record("FKLC.listen_unlisten", "B", false, &format!("listen failed: {listen_resp:?}"));
+        r.record(
+            "FKLC.listen_unlisten",
+            "B",
+            false,
+            &format!("listen failed: {listen_resp:?}"),
+        );
         return;
     }
     // Immediately unlisten — the port is still registered in the broker
@@ -2078,14 +2110,22 @@ pub(crate) async fn fork_listen_close_tests(r: &mut TestRunner) {
     // Agent B connects — the broker still has the port registered,
     // but the runner's smoltcp no longer has listen sockets.
     let conn_resp = r
-        .send("B", Command::NetConnect {
-            addr: format!("127.0.0.1:{port}"),
-            data: "listen_unlisten".into(),
-        })
+        .send(
+            "B",
+            Command::NetConnect {
+                addr: format!("127.0.0.1:{port}"),
+                data: "listen_unlisten".into(),
+            },
+        )
         .await;
     // This SHOULD fail (RST) — the listen socket was closed.
     let got_rst = matches!(&conn_resp, Response::ConnectFailed { .. });
-    r.record("FKLC.listen_unlisten", "B", got_rst, &format!("expected RST: {conn_resp:?}"));
+    r.record(
+        "FKLC.listen_unlisten",
+        "B",
+        got_rst,
+        &format!("expected RST: {conn_resp:?}"),
+    );
 
     // Test 2: fd inheritance across fork+exec — the VS Code CLI pattern.
     // Uses tcp-fork-listen-accept subcommand which:
@@ -2167,7 +2207,12 @@ pub(crate) async fn proc_filesystem_tests(r: &mut TestRunner) {
         // Test 1: /proc/self/stat is readable and contains PID.
         let test_id = format!("PROC.self_stat.{agent}");
         let resp = r
-            .send(agent, Command::FsRead { path: "/proc/self/stat".into() })
+            .send(
+                agent,
+                Command::FsRead {
+                    path: "/proc/self/stat".into(),
+                },
+            )
             .await;
         let pass = matches!(&resp, Response::Ok { data: Some(d) } if d.contains(") "));
         r.record(&test_id, agent, pass, &format!("{resp:?}"));
@@ -2195,7 +2240,12 @@ pub(crate) async fn proc_filesystem_tests(r: &mut TestRunner) {
         // Test 3: /proc/uptime is readable.
         let test_id = format!("PROC.uptime.{agent}");
         let resp = r
-            .send(agent, Command::FsRead { path: "/proc/uptime".into() })
+            .send(
+                agent,
+                Command::FsRead {
+                    path: "/proc/uptime".into(),
+                },
+            )
             .await;
         let pass = matches!(&resp, Response::Ok { data: Some(d) } if !d.is_empty());
         r.record(&test_id, agent, pass, &format!("{resp:?}"));

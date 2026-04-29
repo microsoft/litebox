@@ -919,9 +919,16 @@ impl<FS: ShimFS> UnixStream<FS> {
                                     // Log: sidecar write with port, raw_fd, path
                                     let diag = alloc::format!(
                                         "SIDECAR WRITE: path={} port={} raw_fd={:?} pid={}\n",
-                                        path, tcp_port, listen.tcp_raw_fd, task.process_id.0,
+                                        path,
+                                        tcp_port,
+                                        listen.tcp_raw_fd,
+                                        task.process_id.0,
                                     );
-                                    if let Ok(f) = fs.open("/tmp/unix-port-trace.log", OFlags::CREAT | OFlags::RDWR | OFlags::APPEND, Mode::RWXU) {
+                                    if let Ok(f) = fs.open(
+                                        "/tmp/unix-port-trace.log",
+                                        OFlags::CREAT | OFlags::RDWR | OFlags::APPEND,
+                                        Mode::RWXU,
+                                    ) {
                                         let _ = fs.write(&f, diag.as_bytes(), None);
                                         let _ = fs.close(&f);
                                     }
@@ -1062,9 +1069,16 @@ impl<FS: ShimFS> UnixStream<FS> {
         {
             let diag = alloc::format!(
                 "CONNECT: path={:?} sidecar_port={} tcp_raw_fd={} pid={}\n",
-                sock_path, tcp_port, tcp_raw_fd, task.process_id.0,
+                sock_path,
+                tcp_port,
+                tcp_raw_fd,
+                task.process_id.0,
             );
-            if let Ok(f) = fs.open("/tmp/unix-port-trace.log", OFlags::CREAT | OFlags::RDWR | OFlags::APPEND, Mode::RWXU) {
+            if let Ok(f) = fs.open(
+                "/tmp/unix-port-trace.log",
+                OFlags::CREAT | OFlags::RDWR | OFlags::APPEND,
+                Mode::RWXU,
+            ) {
                 let _ = fs.write(&f, diag.as_bytes(), None);
                 let _ = fs.close(&f);
             }
@@ -1079,9 +1093,15 @@ impl<FS: ShimFS> UnixStream<FS> {
         {
             let diag = alloc::format!(
                 "CONNECT RESULT: sidecar_port={} result={:?} pid={}\n",
-                tcp_port, connect_result, task.process_id.0,
+                tcp_port,
+                connect_result,
+                task.process_id.0,
             );
-            if let Ok(f) = fs.open("/tmp/unix-port-trace.log", OFlags::CREAT | OFlags::RDWR | OFlags::APPEND, Mode::RWXU) {
+            if let Ok(f) = fs.open(
+                "/tmp/unix-port-trace.log",
+                OFlags::CREAT | OFlags::RDWR | OFlags::APPEND,
+                Mode::RWXU,
+            ) {
                 let _ = fs.write(&f, diag.as_bytes(), None);
                 let _ = fs.close(&f);
             }
@@ -1181,11 +1201,13 @@ impl<FS: ShimFS> UnixStream<FS> {
                     match task.files.borrow().with_socket(
                         &task.global,
                         raw_fd,
-                        |fd| task.global.try_accept(fd, None).map_err(|e| match e {
-                            TryOpError::TryAgain => Errno::EAGAIN,
-                            TryOpError::Other(e) => e,
-                            TryOpError::WaitError(_) => Errno::EINTR,
-                        }),
+                        |fd| {
+                            task.global.try_accept(fd, None).map_err(|e| match e {
+                                TryOpError::TryAgain => Errno::EAGAIN,
+                                TryOpError::Other(e) => e,
+                                TryOpError::WaitError(_) => Errno::EINTR,
+                            })
+                        },
                         |_| Err(Errno::EINVAL),
                     ) {
                         Ok(accepted_tcp_fd) => {

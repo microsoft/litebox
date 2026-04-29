@@ -1213,7 +1213,8 @@ fn run_fork_restore(cli_args: CliArgs) -> Result<()> {
 struct PipeBridgeSpec {
     guest_fd: usize,
     host_fd: i32,
-    is_read: bool,
+    /// 'r' = read, 'w' = write, 'b' = bidirectional (unix socketpair).
+    direction: u8,
 }
 
 fn parse_pipe_bridge_specs(specs: &[String]) -> Result<Vec<PipeBridgeSpec>> {
@@ -1226,9 +1227,10 @@ fn parse_pipe_bridge_specs(specs: &[String]) -> Result<Vec<PipeBridgeSpec>> {
         let guest_fd: usize = parts[0]
             .parse()
             .map_err(|_| anyhow!("bad guest_fd in --pipe-bridge: {spec}"))?;
-        let is_read = match parts[1] {
-            "r" => true,
-            "w" => false,
+        let direction = match parts[1] {
+            "r" => b'r',
+            "w" => b'w',
+            "b" => b'b',
             _ => anyhow::bail!("bad direction in --pipe-bridge: {spec}"),
         };
         let host_fd: i32 = parts[2]
@@ -1237,7 +1239,7 @@ fn parse_pipe_bridge_specs(specs: &[String]) -> Result<Vec<PipeBridgeSpec>> {
         bridges.push(PipeBridgeSpec {
             guest_fd,
             host_fd,
-            is_read,
+            direction,
         });
     }
     Ok(bridges)
@@ -1364,10 +1366,10 @@ fn fork_restore_and_ack<FS: litebox_shim_linux::ShimFS>(
 
             // Install HostPipe FDs for passthrough pipe bridges.
             for bridge in pipe_bridges {
-                let direction = if bridge.is_read {
-                    litebox_shim_linux::syscalls::host_pipe::HostPipeDirection::Read
-                } else {
-                    litebox_shim_linux::syscalls::host_pipe::HostPipeDirection::Write
+                let direction = match bridge.direction {
+                    b'r' => litebox_shim_linux::syscalls::host_pipe::HostPipeDirection::Read,
+                    b'b' => litebox_shim_linux::syscalls::host_pipe::HostPipeDirection::ReadWrite,
+                    _ => litebox_shim_linux::syscalls::host_pipe::HostPipeDirection::Write,
                 };
                 program.entrypoints.install_host_pipe_fd(
                     bridge.guest_fd,
@@ -2653,9 +2655,7 @@ fn register_worker_spawn_flags(platform: &Platform, cli_args: &CliArgs) {
     #[cfg(feature = "audit_log")]
     if let Some(ref audit_path) = cli_args.audit_log {
         flags.push(std::ffi::CString::new("--audit-log").unwrap());
-        flags.push(
-            std::ffi::CString::new(audit_path.to_str().unwrap_or("").as_bytes()).unwrap(),
-        );
+        flags.push(std::ffi::CString::new(audit_path.to_str().unwrap_or("").as_bytes()).unwrap());
     }
     if !flags.is_empty() {
         platform.set_worker_spawn_flags(flags);

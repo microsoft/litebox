@@ -153,8 +153,7 @@ pub(super) async fn vscode_repro_tests(r: &mut TestRunner) {
                 ),
             )
             .await;
-        let socket_created =
-            matches!(&resp, Response::ExecResult { stdout, .. } if stdout.contains("SOCKET_CREATED"));
+        let socket_created = matches!(&resp, Response::ExecResult { stdout, .. } if stdout.contains("SOCKET_CREATED"));
         r.record(
             "V6.code_server_socket",
             "A",
@@ -189,14 +188,8 @@ pub(super) async fn vscode_repro_tests(r: &mut TestRunner) {
                 ),
             )
             .await;
-        let still_running =
-            matches!(&resp, Response::ExecResult { stdout, .. } if stdout.contains("STILL_RUNNING"));
-        r.record(
-            "V7.auto_shutdown",
-            "A",
-            still_running,
-            &format!("{resp:?}"),
-        );
+        let still_running = matches!(&resp, Response::ExecResult { stdout, .. } if stdout.contains("STILL_RUNNING"));
+        r.record("V7.auto_shutdown", "A", still_running, &format!("{resp:?}"));
     } else {
         r.record(
             "V7.auto_shutdown",
@@ -244,7 +237,9 @@ pub(super) async fn vscode_bootstrap_replay(r: &mut TestRunner) {
             if trimmed == "NOT_FOUND" || trimmed.len() != 40 {
                 r.record(
                     "VSI.detect_commit",
-                    "A", false,                    "FAIL: VS Code CLI not found — use litebox-vscode image)",
+                    "A",
+                    false,
+                    "FAIL: VS Code CLI not found — use litebox-vscode image)",
                 );
                 return;
             }
@@ -502,5 +497,3 @@ pub(super) async fn vscode_bootstrap_replay(r: &mut TestRunner) {
         let _ = r.send("A", Command::Kill { pid }).await;
     }
 }
-
-

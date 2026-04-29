@@ -44,6 +44,8 @@ impl FdEnabledSubsystem for HostPipeSubsystem {
 pub enum HostPipeDirection {
     Read,
     Write,
+    /// Bidirectional — used for unix socketpair bridges across workers.
+    ReadWrite,
 }
 
 /// A file descriptor entry backed by a real host OS pipe.
@@ -100,11 +102,9 @@ impl IOPollable for HostPipeFd {
 
     fn check_io_events(&self) -> Events {
         match self.direction {
-            // Read ends are always considered readable (the kernel manages
-            // blocking on the actual host read).
             HostPipeDirection::Read => Events::IN,
-            // Write ends are always considered writable.
             HostPipeDirection::Write => Events::OUT,
+            HostPipeDirection::ReadWrite => Events::IN | Events::OUT,
         }
     }
 
@@ -121,7 +121,7 @@ pub(crate) fn read_host_pipe(
     fd: &HostPipeFd,
     buf: &mut [u8],
 ) -> Result<usize, Errno> {
-    if fd.direction != HostPipeDirection::Read {
+    if fd.direction == HostPipeDirection::Write {
         return Err(Errno::EBADF);
     }
     let raw = fd.raw_fd();
@@ -142,7 +142,7 @@ pub(crate) fn write_host_pipe(
     fd: &HostPipeFd,
     buf: &[u8],
 ) -> Result<usize, Errno> {
-    if fd.direction != HostPipeDirection::Write {
+    if fd.direction == HostPipeDirection::Read {
         return Err(Errno::EBADF);
     }
     let raw = fd.raw_fd();
