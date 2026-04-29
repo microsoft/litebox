@@ -4493,23 +4493,10 @@ mod unix_socket_tests {
         }
 
         if pid == 0 {
-            // Child: close parent end, then trigger delayed fork commit
-            // by doing a non-pre-exec syscall, then exec.
+            // Child: close parent end, exec self with child fd arg.
+            // Only pre-exec syscalls before execv — triggers exec-on-remote-host
+            // path (not commit_delayed_fork).
             unsafe { libc::close(parent_fd) };
-            // mmap is NOT pre-exec — triggers commit_delayed_fork.
-            let p = unsafe {
-                libc::mmap(
-                    core::ptr::null_mut(),
-                    4096,
-                    libc::PROT_READ | libc::PROT_WRITE,
-                    libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
-                    -1,
-                    0,
-                )
-            };
-            if p != libc::MAP_FAILED {
-                unsafe { libc::munmap(p, 4096) };
-            }
             let self_exe = std::env::current_exe().unwrap();
             let self_exe = self_exe.to_str().unwrap();
             let fd_str = child_fd.to_string();
@@ -4612,27 +4599,77 @@ mod unix_socket_tests {
         }
     }
 
-    /// US6d: Nested socketpair+fork+exec — reproduces VS Code extension host.
-    /// The parent exec's itself, and the exec'd child does socketpair+fork+exec.
-    /// This triggers nested delayed fork commit with socketpair fd bridging.
-    ///   exec(self, socketpair-exec) → socketpair → fork → exec(self, child) → IPC
+    /// US6d: Nested socketpair+fork+exec via nonpie — reproduces VS Code pattern.
+    /// Uses raw fork+exec to trigger litebox's delayed fork, then the nonpie
+    /// exec triggers exec-on-remote-host. Inside that remote worker,
+    /// socketpair → fork → exec creates the nested delayed fork with IPC fd.
+    ///   fork() → exec(nonpie, socketpair-exec) → socketpair → fork → exec(child) → IPC
     fn test_socketpair_nested_exec() -> i32 {
-        let self_exe = std::env::current_exe().unwrap();
-        let output = std::process::Command::new(&self_exe)
-            .args(["unix-socket-test", "socketpair-exec"])
-            .output();
-
-        let Ok(output) = output else {
-            println!("US6N_SPAWN_FAIL");
-            return 1;
+        let nonpie = crate::find_nonpie_binary();
+        let exe = nonpie.as_deref().unwrap_or_else(|| {
+            // Fall back to self (PIE) if no nonpie binary available.
+            // This won't trigger exec-on-remote-host but is still useful
+            // for native testing.
+            ""
+        });
+        let exe = if exe.is_empty() {
+            let self_exe = std::env::current_exe().unwrap();
+            self_exe.to_str().unwrap().to_string()
+        } else {
+            exe.to_string()
         };
 
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let exit_code = output.status.code().unwrap_or(99);
+        // Use pipe to capture child stdout.
+        let mut pipe_fds = [0i32; 2];
+        if unsafe { libc::pipe(pipe_fds.as_mut_ptr()) } != 0 {
+            println!("US6N_PIPE_FAIL");
+            return 1;
+        }
 
+        let pid = unsafe { libc::fork() };
+        if pid < 0 {
+            println!("US6N_FORK_FAIL:{}", errno());
+            return 1;
+        }
+
+        if pid == 0 {
+            // Child: redirect stdout to pipe, exec nonpie with socketpair-exec.
+            unsafe { libc::close(pipe_fds[0]) };
+            unsafe { libc::dup2(pipe_fds[1], 1) };
+            unsafe { libc::close(pipe_fds[1]) };
+            // Also redirect stderr to suppress noise.
+            let devnull = unsafe { libc::open(b"/dev/null\0".as_ptr() as *const _, libc::O_WRONLY) };
+            if devnull >= 0 {
+                unsafe { libc::dup2(devnull, 2) };
+                unsafe { libc::close(devnull) };
+            }
+
+            let c_exe = std::ffi::CString::new(exe.as_str()).unwrap();
+            let c_arg1 = std::ffi::CString::new("unix-socket-test").unwrap();
+            let c_arg2 = std::ffi::CString::new("socketpair-exec").unwrap();
+            let args = [c_exe.as_ptr(), c_arg1.as_ptr(), c_arg2.as_ptr(), core::ptr::null()];
+            unsafe { libc::execv(c_exe.as_ptr(), args.as_ptr()) };
+            std::process::exit(127);
+        }
+
+        // Parent: read stdout from child, waitpid.
+        unsafe { libc::close(pipe_fds[1]) };
+
+        let mut stdout_buf = Vec::new();
+        let mut buf = [0u8; 4096];
+        loop {
+            let n = unsafe { libc::read(pipe_fds[0], buf.as_mut_ptr() as *mut _, buf.len()) };
+            if n <= 0 { break; }
+            stdout_buf.extend_from_slice(&buf[..n as usize]);
+        }
+        unsafe { libc::close(pipe_fds[0]) };
+
+        let mut status = 0i32;
+        unsafe { libc::waitpid(pid, &mut status, 0) };
+        let exit_code = if libc::WIFEXITED(status) { libc::WEXITSTATUS(status) } else { 99 };
+
+        let stdout = String::from_utf8_lossy(&stdout_buf);
         eprintln!("[US6d] child stdout: {stdout}");
-        eprintln!("[US6d] child stderr: {stderr}");
 
         if stdout.contains("US6E_SOCKETPAIR_EXEC_OK") && exit_code == 0 {
             println!("US6N_NESTED_EXEC_OK");
