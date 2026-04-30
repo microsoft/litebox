@@ -4,7 +4,7 @@
 //! Implementation of memory management related syscalls, eg., `mmap`, `munmap`, etc.
 //! Most of these syscalls which are not backed by files are implemented in [`litebox_common_linux::mm`].
 
-use alloc::collections::BTreeMap;
+use alloc::collections::{BTreeMap, BTreeSet};
 use litebox::{
     mm::linux::{MappingError, PAGE_SIZE, PageRange},
     platform::{
@@ -47,11 +47,15 @@ pub(crate) struct ElfPatchState {
     /// Whether any runtime-generated stubs were successfully linked from code
     /// in this fd to the trampoline.
     pub runtime_patches_committed: bool,
-    /// Virtual address ranges that have already been patched. Guards against
-    /// double-patching if the same segment is re-mapped (e.g. MAP_FIXED).
-    /// Maps (vaddr, len) → file_offset so that munmap can clear entries and
-    /// allow re-patching if the region is mapped again with fresh file bytes.
-    pub patched_mappings: BTreeMap<(usize, usize), usize>,
+    /// Tracks file-backed mappings for this fd as (vaddr, len) pairs.
+    /// Used to find mappings that need patching when mprotect adds PROT_EXEC.
+    /// Cleared on munmap to allow re-patching.
+    pub file_mappings: BTreeSet<(usize, usize)>,
+    /// Ranges that have already been patched by the runtime rewriter.
+    /// This is a performance guard only — re-running the rewriter on
+    /// already-patched code is safe because the second run will not see
+    /// syscall instructions. Cleared on munmap alongside file_mappings.
+    pub patched_ranges: BTreeSet<(usize, usize)>,
 }
 
 /// Per-process collection of ELF patching state, keyed by fd number.
@@ -130,8 +134,7 @@ impl<FS: ShimFS> Task<FS> {
         // Runtime syscall rewriting: patch PROT_EXEC segments in-place.
         if is_exec {
             let syscall_entry = self.global.platform.get_syscall_entry_point();
-            if syscall_entry != 0
-                && !self.maybe_patch_exec_segment(result, len, fd, offset, syscall_entry)
+            if syscall_entry != 0 && !self.maybe_patch_exec_segment(result, len, fd, syscall_entry)
             {
                 // Trampoline setup failed for a pre-patched binary whose
                 // .text already contains JMPs to the trampoline address.
@@ -140,10 +143,16 @@ impl<FS: ShimFS> Task<FS> {
                 let _ = self.sys_munmap(result, len);
                 return Err(MappingError::OutOfMemory);
             }
-        } else if !self.global.elf_patch_cache.lock().contains_key(&fd) {
-            // First mmap for this fd (non-exec): record patch state for later
-            // exec segment mappings.
+        } else {
+            // Ensure patch state is initialized for this fd (no-op if already done).
             self.init_elf_patch_state(fd, result.as_usize());
+            // Track non-exec file mappings so we can patch them if they later
+            // gain PROT_EXEC via mprotect.
+            let mut cache = self.global.elf_patch_cache.lock();
+            if let Some(state) = cache.get_mut(&fd) {
+                let mapping_key = (result.as_usize(), len);
+                state.file_mappings.insert(mapping_key);
+            }
         }
 
         Ok(result)
@@ -370,21 +379,24 @@ impl<FS: ShimFS> Task<FS> {
     pub(crate) fn sys_munmap(&self, addr: crate::MutPtr<u8>, len: usize) -> Result<(), Errno> {
         let result = litebox_common_linux::mm::sys_munmap(&self.global.pm, addr, len);
         if result.is_ok() {
-            self.clear_patched_offsets_for_range(addr.as_usize(), len);
+            self.clear_file_mappings_for_range(addr.as_usize(), len);
         }
         result
     }
 
-    /// Clear `patched_mappings` entries for any segments that overlap the
+    /// Clear `file_mappings` entries for any segments that overlap the
     /// unmapped range, so that re-mapping the same file region will be
     /// re-patched instead of skipped.
-    fn clear_patched_offsets_for_range(&self, unmap_start: usize, unmap_len: usize) {
+    fn clear_file_mappings_for_range(&self, unmap_start: usize, unmap_len: usize) {
         let unmap_end = unmap_start.saturating_add(unmap_len);
         let mut cache = self.global.elf_patch_cache.lock();
         for state in cache.values_mut() {
-            state.patched_mappings.retain(|&(vaddr, seg_len), _| {
+            state.file_mappings.retain(|&(vaddr, seg_len)| {
                 let seg_end = vaddr.saturating_add(seg_len);
-                // Keep entries that don't overlap the unmapped range.
+                seg_end <= unmap_start || vaddr >= unmap_end
+            });
+            state.patched_ranges.retain(|&(vaddr, seg_len)| {
+                let seg_end = vaddr.saturating_add(seg_len);
                 seg_end <= unmap_start || vaddr >= unmap_end
             });
         }
@@ -393,6 +405,25 @@ impl<FS: ShimFS> Task<FS> {
     /// Handle syscall `mprotect`
     #[inline]
     pub(crate) fn sys_mprotect(
+        &self,
+        addr: crate::MutPtr<u8>,
+        len: usize,
+        prot: ProtFlags,
+    ) -> Result<(), Errno> {
+        // Intercept transitions to PROT_EXEC: patch unpatched file mappings.
+        if prot.contains(ProtFlags::PROT_EXEC) {
+            let syscall_entry = self.global.platform.get_syscall_entry_point();
+            if syscall_entry != 0 {
+                self.maybe_patch_on_mprotect_exec(addr, len, syscall_entry);
+            }
+        }
+        self.sys_mprotect_raw(addr, len, prot)
+    }
+
+    /// Raw mprotect without exec interception — used internally by the
+    /// patching logic to avoid deadlocks (the patch path holds elf_patch_cache).
+    #[inline]
+    fn sys_mprotect_raw(
         &self,
         addr: crate::MutPtr<u8>,
         len: usize,
@@ -438,6 +469,68 @@ impl<FS: ShimFS> Task<FS> {
     }
 
     // ── Runtime ELF syscall patching ─────────────────────────────────────
+
+    /// Check all tracked file mappings for unpatched regions that overlap the
+    /// mprotect range. If found, run the runtime rewriter before the region
+    /// becomes executable.
+    fn maybe_patch_on_mprotect_exec(
+        &self,
+        addr: crate::MutPtr<u8>,
+        len: usize,
+        syscall_entry: usize,
+    ) {
+        let mprotect_start = addr.as_usize();
+        let mprotect_end = mprotect_start.saturating_add(len);
+
+        // Find unpatched file mappings that overlap this mprotect range.
+        // We collect (fd, vaddr, seg_len, file_offset) to avoid holding
+        // the lock while patching.
+        let to_patch: alloc::vec::Vec<(i32, usize, usize)> = {
+            let cache = self.global.elf_patch_cache.lock();
+            let mut result = alloc::vec::Vec::new();
+            for (&fd, state) in cache.iter() {
+                if state.pre_patched {
+                    continue;
+                }
+                for &(seg_start, seg_len) in &state.file_mappings {
+                    let seg_end = seg_start.saturating_add(seg_len);
+                    // Check overlap with the mprotect range.
+                    if seg_start < mprotect_end && seg_end > mprotect_start {
+                        result.push((fd, seg_start, seg_len));
+                    }
+                }
+            }
+            result
+        };
+
+        // A single mprotect range should only overlap mappings from one fd
+        // (a given vaddr range is backed by at most one file at a time).
+        if to_patch.len() > 1 {
+            let fds: BTreeSet<i32> = to_patch.iter().map(|(fd, _, _)| *fd).collect();
+            if fds.len() > 1 {
+                litebox_util_log::warn!(
+                    addr:? = mprotect_start, len:? = len, fds:? = fds;
+                    "mprotect +EXEC range overlaps file mappings from multiple fds"
+                );
+            }
+        }
+
+        for (fd, seg_start, seg_len) in to_patch {
+            // Clamp to the intersection of the tracked mapping and the
+            // mprotect range — only patch the portion becoming executable.
+            // Re-running the rewriter on already-patched bytes is safe,
+            // so we don't need to track sub-range overlaps precisely.
+            let seg_end = seg_start.saturating_add(seg_len);
+            let patch_start = seg_start.max(mprotect_start);
+            let patch_end = seg_end.min(mprotect_end);
+            let patch_len = patch_end.saturating_sub(patch_start);
+            if patch_len == 0 {
+                continue;
+            }
+            let mapped_addr = MutPtr::<u8>::from_usize(patch_start);
+            self.maybe_patch_exec_segment(mapped_addr, patch_len, fd, syscall_entry);
+        }
+    }
 
     /// Initialize ELF patch state for an fd on its first mmap at offset 0.
     ///
@@ -552,7 +645,8 @@ impl<FS: ShimFS> Task<FS> {
             trampoline_mapped: false,
             trampoline_mapped_len: 0,
             runtime_patches_committed: false,
-            patched_mappings: BTreeMap::new(),
+            file_mappings: BTreeSet::new(),
+            patched_ranges: BTreeSet::new(),
         });
     }
 
@@ -598,7 +692,6 @@ impl<FS: ShimFS> Task<FS> {
         mapped_addr: MutPtr<u8>,
         len: usize,
         fd: i32,
-        offset: usize,
         syscall_entry: usize,
     ) -> bool {
         // Initialize patch state if this is the first mmap for this fd.
@@ -667,7 +760,7 @@ impl<FS: ShimFS> Task<FS> {
 
                 // Protect as RX immediately.
                 if self
-                    .sys_mprotect(
+                    .sys_mprotect_raw(
                         tramp_ptr,
                         tramp_len,
                         ProtFlags::PROT_READ | ProtFlags::PROT_EXEC,
@@ -747,18 +840,16 @@ impl<FS: ShimFS> Task<FS> {
             state.trampoline_mapped_len = PAGE_SIZE;
         }
 
-        // Guard against double-patching the same segment (e.g. MAP_FIXED
-        // re-mapping). Feeding already-rewritten JMP instructions back into
-        // the rewriter would corrupt code.
+        // Performance guard: skip if this exact range was already patched.
         let mapping_key = (mapped_addr.as_usize(), len);
-        if state.patched_mappings.contains_key(&mapping_key) {
+        if state.patched_ranges.contains(&mapping_key) {
             return true;
         }
-        state.patched_mappings.insert(mapping_key, offset);
+        state.patched_ranges.insert(mapping_key);
 
         let restore_trampoline_rx = |task: &Self, state: &ElfPatchState| {
             if state.trampoline_mapped_len > 0 {
-                let _ = task.sys_mprotect(
+                let _ = task.sys_mprotect_raw(
                     MutPtr::<u8>::from_usize(state.trampoline_addr),
                     state.trampoline_mapped_len,
                     ProtFlags::PROT_READ | ProtFlags::PROT_EXEC,
@@ -769,7 +860,7 @@ impl<FS: ShimFS> Task<FS> {
         // Make the trampoline RW for writing stubs.
         if state.trampoline_mapped_len > 0
             && self
-                .sys_mprotect(
+                .sys_mprotect_raw(
                     MutPtr::<u8>::from_usize(state.trampoline_addr),
                     state.trampoline_mapped_len,
                     ProtFlags::PROT_READ | ProtFlags::PROT_WRITE,
@@ -780,7 +871,7 @@ impl<FS: ShimFS> Task<FS> {
             return true;
         }
         if self
-            .sys_mprotect(
+            .sys_mprotect_raw(
                 mapped_addr,
                 len,
                 ProtFlags::PROT_READ | ProtFlags::PROT_WRITE,
@@ -795,7 +886,7 @@ impl<FS: ShimFS> Task<FS> {
         // Read the mapped code into a buffer, patch it, write back.
         let Some(code_owned) = mapped_addr.to_owned_slice(len) else {
             litebox_util_log::warn!("failed to read code segment for patching");
-            let _ = self.sys_mprotect(
+            let _ = self.sys_mprotect_raw(
                 mapped_addr,
                 len,
                 ProtFlags::PROT_READ | ProtFlags::PROT_EXEC,
@@ -832,7 +923,7 @@ impl<FS: ShimFS> Task<FS> {
             Ok(stubs) if !stubs.is_empty() => {
                 let Some(new_cursor) = state.trampoline_cursor.checked_add(stubs.len()) else {
                     litebox_util_log::warn!("trampoline cursor overflow");
-                    let _ = self.sys_mprotect(
+                    let _ = self.sys_mprotect_raw(
                         mapped_addr,
                         len,
                         ProtFlags::PROT_READ | ProtFlags::PROT_EXEC,
@@ -856,7 +947,7 @@ impl<FS: ShimFS> Task<FS> {
                         .is_err()
                     {
                         litebox_util_log::warn!("failed to expand trampoline region");
-                        let _ = self.sys_mprotect(
+                        let _ = self.sys_mprotect_raw(
                             mapped_addr,
                             len,
                             ProtFlags::PROT_READ | ProtFlags::PROT_EXEC,
@@ -873,7 +964,7 @@ impl<FS: ShimFS> Task<FS> {
                     MutPtr::<u8>::from_usize(state.trampoline_addr + state.trampoline_cursor);
                 if tramp_write_ptr.copy_from_slice(0, &stubs).is_none() {
                     litebox_util_log::warn!("failed to write trampoline stubs");
-                    let _ = self.sys_mprotect(
+                    let _ = self.sys_mprotect_raw(
                         mapped_addr,
                         len,
                         ProtFlags::PROT_READ | ProtFlags::PROT_EXEC,
@@ -886,7 +977,7 @@ impl<FS: ShimFS> Task<FS> {
                 if mapped_addr.copy_from_slice(0, &code_buf).is_none() {
                     litebox_util_log::warn!("failed to write patched code back to code segment");
                     let _ = mapped_addr.copy_from_slice(0, &original_code);
-                    let _ = self.sys_mprotect(
+                    let _ = self.sys_mprotect_raw(
                         mapped_addr,
                         len,
                         ProtFlags::PROT_READ | ProtFlags::PROT_EXEC,
@@ -910,7 +1001,7 @@ impl<FS: ShimFS> Task<FS> {
             }
             Err(e) => {
                 litebox_util_log::warn!(err:? = e; "failed to patch code segment");
-                let _ = self.sys_mprotect(
+                let _ = self.sys_mprotect_raw(
                     mapped_addr,
                     len,
                     ProtFlags::PROT_READ | ProtFlags::PROT_EXEC,
@@ -921,7 +1012,7 @@ impl<FS: ShimFS> Task<FS> {
         }
 
         // Restore the code segment to RX.
-        let _ = self.sys_mprotect(
+        let _ = self.sys_mprotect_raw(
             mapped_addr,
             len,
             ProtFlags::PROT_READ | ProtFlags::PROT_EXEC,
@@ -948,7 +1039,7 @@ impl<FS: ShimFS> Task<FS> {
                         self.sys_munmap(MutPtr::<u8>::from_usize(state.trampoline_addr), tramp_len);
                     return;
                 }
-                let _ = self.sys_mprotect(
+                let _ = self.sys_mprotect_raw(
                     MutPtr::<u8>::from_usize(state.trampoline_addr),
                     tramp_len,
                     ProtFlags::PROT_READ | ProtFlags::PROT_EXEC,
