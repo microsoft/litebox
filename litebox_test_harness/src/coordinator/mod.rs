@@ -142,6 +142,10 @@ pub(crate) struct TestRunner {
     children: std::collections::HashMap<String, Child>,
     results: Vec<TestResult>,
     pub(crate) self_exe: String,
+    /// Agents whose protocol streams are desynchronized (e.g., after a
+    /// command timeout). Further sends to these agents return immediate
+    /// errors instead of risking hangs on stale pipe data.
+    poisoned: std::collections::HashSet<String>,
 }
 
 impl TestRunner {
@@ -188,6 +192,14 @@ impl TestRunner {
         // Route through the tree: "A" → direct child,
         // "AA" → forward through A, "AAA" → forward through A → AA.
         let (direct, rest) = route(target);
+
+        // Fail fast if the direct child is poisoned (desynchronized).
+        if self.poisoned.contains(direct) {
+            return Response::Error {
+                error: format!("agent {direct} is poisoned (previous timeout)"),
+            };
+        }
+
         let child = match self.children.get_mut(direct) {
             Some(c) => c,
             None => {
@@ -197,7 +209,72 @@ impl TestRunner {
             }
         };
         let actual_cmd = wrap_forwards(rest, cmd);
-        send_cmd(child, &actual_cmd).await
+        let resp = send_cmd(child, &actual_cmd).await;
+
+        // If we got a timeout, the agent's stdout stream is now
+        // desynchronized — future reads would return stale data.
+        // Kill the process and mark it poisoned.
+        if matches!(&resp, Response::Error { error } if error == "timeout") {
+            eprintln!(
+                "[coord] agent {direct} timed out — poisoning \
+                 (killing process, future sends will fail immediately)"
+            );
+            self.poison_agent(direct).await;
+        }
+
+        resp
+    }
+
+    /// Kill an agent process and mark it as poisoned. All agents routed
+    /// through this direct child (e.g., AA, AAA through A) will also be
+    /// unreachable.
+    async fn poison_agent(&mut self, direct: &str) {
+        self.poisoned.insert(direct.to_string());
+        if let Some(mut child) = self.children.remove(direct) {
+            let _ = child.process.kill().await;
+            let _ = child.process.wait().await;
+            eprintln!("[coord] killed poisoned agent {direct}");
+        }
+    }
+
+    /// Attempt to respawn a poisoned agent. Returns true on success.
+    /// This only respawns direct children (A, B) — their sub-trees
+    /// are NOT rebuilt (would require re-running Spawn/SpawnRemote).
+    async fn respawn_if_poisoned(&mut self, id: &str) -> bool {
+        if !self.poisoned.contains(id) {
+            return true; // not poisoned, nothing to do
+        }
+        eprintln!("[coord] attempting to respawn poisoned agent {id}");
+        match spawn_child(&self.self_exe).await {
+            Ok(child) => {
+                self.children.insert(id.to_string(), child);
+                self.poisoned.remove(id);
+                eprintln!("[coord] respawned agent {id} (sub-tree NOT rebuilt)");
+                true
+            }
+            Err(e) => {
+                eprintln!("[coord] failed to respawn agent {id}: {e}");
+                false
+            }
+        }
+    }
+
+    /// After a suite timeout, kill all agents that might be
+    /// desynchronized and try to respawn the direct children (A, B)
+    /// so subsequent suites have a chance of running.
+    async fn recover_agents(&mut self) {
+        eprintln!("[coord] recovering agents after suite timeout");
+        // Collect all direct child IDs.
+        let ids: Vec<String> = self.children.keys().cloned().collect();
+        // Poison everything — a timeout means we don't know which
+        // agent's pipe is desynchronized.
+        for id in &ids {
+            self.poison_agent(id).await;
+        }
+        // Respawn direct children.
+        for id in &ids {
+            self.respawn_if_poisoned(id).await;
+        }
     }
 
     async fn exec_local(&self, cmd: &Command) -> Response {
@@ -326,6 +403,7 @@ async fn run_tests(self_exe: &str, filter: Option<&str>) -> Vec<TestResult> {
         children: std::collections::HashMap::new(),
         results: Vec::new(),
         self_exe: self_exe.to_string(),
+        poisoned: std::collections::HashSet::new(),
     };
 
     // Spawn direct children A and B.
@@ -453,6 +531,17 @@ async fn run_tests(self_exe: &str, filter: Option<&str>) -> Vec<TestResult> {
 
     let should_run = |suite: &str| filter.is_none() || filter == Some(suite);
 
+    // Per-suite wall-clock budgets (seconds). If a suite exceeds its
+    // budget, we record a FAIL, kill desynchronized agents, and attempt
+    // to respawn them so subsequent suites can still run.
+    const MATRIX_TIMEOUT: u64 = 120;
+    const FORK_TIMEOUT: u64 = 120;
+    const SHELL_TIMEOUT: u64 = 60;
+    const XWORKER_TIMEOUT: u64 = 120;
+    const VSCODE_TIMEOUT: u64 = 300;
+    const STRESS_TIMEOUT: u64 = 300;
+    const CONTAMINATION_TIMEOUT: u64 = 60;
+
     // =================================================================
     // MATRIX: Capability x topology cross-product tests
     // FS CRUD, TCP, Unix sockets, exec, env, network addresses,
@@ -461,18 +550,31 @@ async fn run_tests(self_exe: &str, filter: Option<&str>) -> Vec<TestResult> {
     // =================================================================
     if should_run("matrix") {
         eprintln!("[coord] === Matrix Tests ===");
-        matrix::run_matrix_tests(&mut runner).await;
-        special_cases::netlink_tests(&mut runner).await;
-        special_cases::net_ipv6_tests(&mut runner).await;
-        special_cases::terminal_ioctl_tests(&mut runner).await;
-        special_cases::fs_io_tests(&mut runner).await;
-        platform_fixes::poll_ready_tests(&mut runner).await;
-        platform_fixes::bind_getsockname_tests(&mut runner).await;
-        platform_fixes::pipe_pair_id_tests(&mut runner).await;
-        platform_fixes::pipe_nonblock_tests(&mut runner).await;
-        platform_fixes::epoll_socket_tests(&mut runner).await;
-        platform_fixes::loopback_tcp_tests(&mut runner).await;
-        platform_fixes::proc_filesystem_tests(&mut runner).await;
+        if tokio::time::timeout(Duration::from_secs(MATRIX_TIMEOUT), async {
+            matrix::run_matrix_tests(&mut runner).await;
+            special_cases::netlink_tests(&mut runner).await;
+            special_cases::net_ipv6_tests(&mut runner).await;
+            special_cases::terminal_ioctl_tests(&mut runner).await;
+            special_cases::fs_io_tests(&mut runner).await;
+            platform_fixes::poll_ready_tests(&mut runner).await;
+            platform_fixes::bind_getsockname_tests(&mut runner).await;
+            platform_fixes::pipe_pair_id_tests(&mut runner).await;
+            platform_fixes::pipe_nonblock_tests(&mut runner).await;
+            platform_fixes::epoll_socket_tests(&mut runner).await;
+            platform_fixes::loopback_tcp_tests(&mut runner).await;
+            platform_fixes::proc_filesystem_tests(&mut runner).await;
+        })
+        .await
+        .is_err()
+        {
+            runner.record(
+                "SUITE_TIMEOUT.matrix",
+                "coord",
+                false,
+                &format!("matrix suite exceeded {MATRIX_TIMEOUT}s wall-clock budget"),
+            );
+            runner.recover_agents().await;
+        }
     }
 
     // =================================================================
@@ -480,14 +582,27 @@ async fn run_tests(self_exe: &str, filter: Option<&str>) -> Vec<TestResult> {
     // =================================================================
     if should_run("fork") {
         eprintln!("[coord] === Fork Tests ===");
-        fork_matrix::run_fork_matrix_tests(&mut runner).await;
-        platform_fixes::exit_data_integrity_tests(&mut runner).await;
-        platform_fixes::nonpie_pipe_chain_tests(&mut runner).await;
-        platform_fixes::bash_fork_exec_tests(&mut runner).await;
-        platform_fixes::concurrent_fork_tests(&mut runner).await;
-        platform_fixes::pid_visibility_tests(&mut runner).await;
-        special_cases::capture_pipe_tests(&mut runner).await;
-        special_cases::node_exit_tests(&mut runner).await;
+        if tokio::time::timeout(Duration::from_secs(FORK_TIMEOUT), async {
+            fork_matrix::run_fork_matrix_tests(&mut runner).await;
+            platform_fixes::exit_data_integrity_tests(&mut runner).await;
+            platform_fixes::nonpie_pipe_chain_tests(&mut runner).await;
+            platform_fixes::bash_fork_exec_tests(&mut runner).await;
+            platform_fixes::concurrent_fork_tests(&mut runner).await;
+            platform_fixes::pid_visibility_tests(&mut runner).await;
+            special_cases::capture_pipe_tests(&mut runner).await;
+            special_cases::node_exit_tests(&mut runner).await;
+        })
+        .await
+        .is_err()
+        {
+            runner.record(
+                "SUITE_TIMEOUT.fork",
+                "coord",
+                false,
+                &format!("fork suite exceeded {FORK_TIMEOUT}s wall-clock budget"),
+            );
+            runner.recover_agents().await;
+        }
     }
 
     // =================================================================
@@ -495,11 +610,24 @@ async fn run_tests(self_exe: &str, filter: Option<&str>) -> Vec<TestResult> {
     // =================================================================
     if should_run("shell") {
         eprintln!("[coord] === Shell Tests ===");
-        platform_fixes::stdin_pipe_subst_tests(&mut runner).await;
-        platform_fixes::subst_capture_tests(&mut runner).await;
-        platform_fixes::touch_redirect_tests(&mut runner).await;
-        platform_fixes::file_redirect_tests(&mut runner).await;
-        special_cases::stdin_script_tests(&mut runner).await;
+        if tokio::time::timeout(Duration::from_secs(SHELL_TIMEOUT), async {
+            platform_fixes::stdin_pipe_subst_tests(&mut runner).await;
+            platform_fixes::subst_capture_tests(&mut runner).await;
+            platform_fixes::touch_redirect_tests(&mut runner).await;
+            platform_fixes::file_redirect_tests(&mut runner).await;
+            special_cases::stdin_script_tests(&mut runner).await;
+        })
+        .await
+        .is_err()
+        {
+            runner.record(
+                "SUITE_TIMEOUT.shell",
+                "coord",
+                false,
+                &format!("shell suite exceeded {SHELL_TIMEOUT}s wall-clock budget"),
+            );
+            runner.recover_agents().await;
+        }
     }
 
     // =================================================================
@@ -507,13 +635,26 @@ async fn run_tests(self_exe: &str, filter: Option<&str>) -> Vec<TestResult> {
     // =================================================================
     if should_run("xworker") {
         eprintln!("[coord] === Cross-Worker Tests ===");
-        platform_fixes::cross_worker_first_connect_tests(&mut runner).await;
-        platform_fixes::cross_worker_self_connect_tests(&mut runner).await;
-        platform_fixes::cross_worker_file_tests(&mut runner).await;
-        platform_fixes::fork_listen_close_tests(&mut runner).await;
-        special_cases::unix_socket_tests(&mut runner).await;
-        special_cases::cross_worker_tests(&mut runner).await;
-        special_cases::pipe_eof_tests(&mut runner).await;
+        if tokio::time::timeout(Duration::from_secs(XWORKER_TIMEOUT), async {
+            platform_fixes::cross_worker_first_connect_tests(&mut runner).await;
+            platform_fixes::cross_worker_self_connect_tests(&mut runner).await;
+            platform_fixes::cross_worker_file_tests(&mut runner).await;
+            platform_fixes::fork_listen_close_tests(&mut runner).await;
+            special_cases::unix_socket_tests(&mut runner).await;
+            special_cases::cross_worker_tests(&mut runner).await;
+            special_cases::pipe_eof_tests(&mut runner).await;
+        })
+        .await
+        .is_err()
+        {
+            runner.record(
+                "SUITE_TIMEOUT.xworker",
+                "coord",
+                false,
+                &format!("xworker suite exceeded {XWORKER_TIMEOUT}s wall-clock budget"),
+            );
+            runner.recover_agents().await;
+        }
     }
 
     // =================================================================
@@ -521,9 +662,22 @@ async fn run_tests(self_exe: &str, filter: Option<&str>) -> Vec<TestResult> {
     // =================================================================
     if should_run("vscode") {
         eprintln!("[coord] === VS Code Tests ===");
-        vscode::vscode_repro_tests(&mut runner).await;
-        vscode::vscode_bootstrap_replay(&mut runner).await;
-        platform_fixes::vscode_install_pattern_tests(&mut runner).await;
+        if tokio::time::timeout(Duration::from_secs(VSCODE_TIMEOUT), async {
+            vscode::vscode_repro_tests(&mut runner).await;
+            vscode::vscode_bootstrap_replay(&mut runner).await;
+            platform_fixes::vscode_install_pattern_tests(&mut runner).await;
+        })
+        .await
+        .is_err()
+        {
+            runner.record(
+                "SUITE_TIMEOUT.vscode",
+                "coord",
+                false,
+                &format!("vscode suite exceeded {VSCODE_TIMEOUT}s wall-clock budget"),
+            );
+            runner.recover_agents().await;
+        }
     }
 
     // =================================================================
@@ -531,9 +685,22 @@ async fn run_tests(self_exe: &str, filter: Option<&str>) -> Vec<TestResult> {
     // =================================================================
     if should_run("stress") {
         eprintln!("[coord] === Stress Tests ===");
-        tcp_stress::run(&mut runner).await;
-        file_tcp::run(&mut runner).await;
-        port_router::run(&mut runner).await;
+        if tokio::time::timeout(Duration::from_secs(STRESS_TIMEOUT), async {
+            tcp_stress::run(&mut runner).await;
+            file_tcp::run(&mut runner).await;
+            port_router::run(&mut runner).await;
+        })
+        .await
+        .is_err()
+        {
+            runner.record(
+                "SUITE_TIMEOUT.stress",
+                "coord",
+                false,
+                &format!("stress suite exceeded {STRESS_TIMEOUT}s wall-clock budget"),
+            );
+            runner.recover_agents().await;
+        }
     }
 
     // =================================================================
@@ -541,18 +708,33 @@ async fn run_tests(self_exe: &str, filter: Option<&str>) -> Vec<TestResult> {
     // =================================================================
     if should_run("contamination") {
         eprintln!("[coord] === Contamination Sequence Tests ===");
+        if tokio::time::timeout(Duration::from_secs(CONTAMINATION_TIMEOUT), async {
+            {
+                let canary_cmd = crate::protocol::Command::Exec {
+                    args: vec![runner.self_exe.clone(), "echo-test".into()],
+                    timeout_secs: None,
+                    stdin: None,
+                    background: false,
+                };
+                let resp = runner.send("A", canary_cmd).await;
+                let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout == "ECHO_TEST_OK");
+                runner.record("X_canary.pre_sequence", "A", pass, &format!("{resp:?}"));
+            }
+            special_cases::contamination_sequence_tests(&mut runner).await;
+        })
+        .await
+        .is_err()
         {
-            let canary_cmd = crate::protocol::Command::Exec {
-                args: vec![runner.self_exe.clone(), "echo-test".into()],
-                timeout_secs: None,
-                stdin: None,
-                background: false,
-            };
-            let resp = runner.send("A", canary_cmd).await;
-            let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout == "ECHO_TEST_OK");
-            runner.record("X_canary.pre_sequence", "A", pass, &format!("{resp:?}"));
+            runner.record(
+                "SUITE_TIMEOUT.contamination",
+                "coord",
+                false,
+                &format!(
+                    "contamination suite exceeded {CONTAMINATION_TIMEOUT}s wall-clock budget"
+                ),
+            );
+            runner.recover_agents().await;
         }
-        special_cases::contamination_sequence_tests(&mut runner).await;
     }
 
     // Shutdown all children.
@@ -728,5 +910,193 @@ async fn send_cmd(child: &mut Child, cmd: &Command) -> Response {
         Err(_) => Response::Error {
             error: "timeout".into(),
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Helper: resolve path to the non-test harness binary. In test mode
+    /// `current_exe()` points to the test runner in `deps/`; we need the
+    /// regular binary that dispatches to "agent" mode.
+    fn harness_binary() -> String {
+        let test_exe = std::env::current_exe().unwrap();
+        // test_exe: .../target/debug/deps/litebox_test_harness-HASH
+        // binary:   .../target/debug/litebox_test_harness
+        let debug_dir = test_exe.parent().unwrap().parent().unwrap();
+        let bin = debug_dir.join("litebox_test_harness");
+        assert!(
+            bin.exists(),
+            "harness binary not found at {}; run `cargo build` first",
+            bin.display()
+        );
+        bin.to_string_lossy().into_owned()
+    }
+
+    /// Helper: create a TestRunner with no children.
+    fn empty_runner() -> TestRunner {
+        TestRunner {
+            children: std::collections::HashMap::new(),
+            results: Vec::new(),
+            self_exe: harness_binary(),
+            poisoned: std::collections::HashSet::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn poisoned_agent_rejects_sends() {
+        let mut runner = empty_runner();
+
+        // Spawn agent "T" (test agent).
+        let child = spawn_child(&runner.self_exe).await.unwrap();
+        runner.children.insert("T".to_string(), child);
+
+        // Verify it works before poisoning.
+        let resp = send_cmd(
+            runner.children.get_mut("T").unwrap(),
+            &Command::EnvGet {
+                var: "HOME".to_string(),
+            },
+        )
+        .await;
+        assert!(
+            !matches!(&resp, Response::Error { .. }),
+            "pre-poison send should succeed, got: {resp:?}"
+        );
+
+        // Poison agent T.
+        runner.poison_agent("T").await;
+        assert!(runner.poisoned.contains("T"));
+        assert!(!runner.children.contains_key("T"));
+
+        // Sends to poisoned agent should return immediate error.
+        let resp = runner
+            .send(
+                "T",
+                Command::EnvGet {
+                    var: "HOME".to_string(),
+                },
+            )
+            .await;
+        match &resp {
+            Response::Error { error } => {
+                assert!(
+                    error.contains("poisoned"),
+                    "expected 'poisoned' in error, got: {error}"
+                );
+            }
+            _ => panic!("expected Error response for poisoned agent, got: {resp:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn respawn_recovers_poisoned_agent() {
+        let mut runner = empty_runner();
+
+        // Spawn and immediately poison.
+        let child = spawn_child(&runner.self_exe).await.unwrap();
+        runner.children.insert("T".to_string(), child);
+        runner.poison_agent("T").await;
+        assert!(runner.poisoned.contains("T"));
+
+        // Respawn.
+        let ok = runner.respawn_if_poisoned("T").await;
+        assert!(ok, "respawn should succeed");
+        assert!(
+            !runner.poisoned.contains("T"),
+            "should no longer be poisoned"
+        );
+        assert!(
+            runner.children.contains_key("T"),
+            "child should exist again"
+        );
+
+        // Verify the respawned agent works.
+        let resp = runner
+            .send(
+                "T",
+                Command::EnvGet {
+                    var: "HOME".to_string(),
+                },
+            )
+            .await;
+        assert!(
+            !matches!(&resp, Response::Error { .. }),
+            "post-respawn send should work, got: {resp:?}"
+        );
+
+        // Clean up.
+        let _ = runner.send("T", Command::Exit).await;
+    }
+
+    #[tokio::test]
+    async fn recover_agents_kills_and_respawns_all() {
+        let mut runner = empty_runner();
+
+        // Spawn two agents.
+        for id in &["X", "Y"] {
+            let child = spawn_child(&runner.self_exe).await.unwrap();
+            runner.children.insert(id.to_string(), child);
+        }
+
+        // Verify both work.
+        for id in &["X", "Y"] {
+            let resp = runner
+                .send(
+                    id,
+                    Command::EnvGet {
+                        var: "HOME".to_string(),
+                    },
+                )
+                .await;
+            assert!(
+                !matches!(&resp, Response::Error { .. }),
+                "agent {id} should work before recovery, got: {resp:?}"
+            );
+        }
+
+        // Simulate suite timeout: recover_agents poisons all then respawns.
+        runner.recover_agents().await;
+        assert!(
+            runner.poisoned.is_empty(),
+            "all agents should be un-poisoned after recovery"
+        );
+        assert_eq!(runner.children.len(), 2, "both agents should be respawned");
+
+        // Verify respawned agents work.
+        for id in &["X", "Y"] {
+            let resp = runner
+                .send(
+                    id,
+                    Command::EnvGet {
+                        var: "HOME".to_string(),
+                    },
+                )
+                .await;
+            assert!(
+                !matches!(&resp, Response::Error { .. }),
+                "agent {id} should work after recovery, got: {resp:?}"
+            );
+        }
+
+        // Clean up.
+        for id in &["X", "Y"] {
+            let _ = runner.send(id, Command::Exit).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn respawn_noop_for_healthy_agent() {
+        let mut runner = empty_runner();
+        let child = spawn_child(&runner.self_exe).await.unwrap();
+        runner.children.insert("T".to_string(), child);
+
+        // respawn_if_poisoned on a healthy agent is a no-op.
+        let ok = runner.respawn_if_poisoned("T").await;
+        assert!(ok);
+        assert!(runner.children.contains_key("T"));
+
+        let _ = runner.send("T", Command::Exit).await;
     }
 }

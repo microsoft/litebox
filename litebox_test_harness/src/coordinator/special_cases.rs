@@ -559,11 +559,7 @@ pub(super) async fn pipe_eof_tests(r: &mut TestRunner) {
             .send(
                 agent,
                 super::exec_timeout(
-                    vec![
-                        self_exe.clone(),
-                        "pipe-test".into(),
-                        "eof-fork".into(),
-                    ],
+                    vec![self_exe.clone(), "pipe-test".into(), "eof-fork".into()],
                     20,
                 ),
             )
