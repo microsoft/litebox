@@ -199,22 +199,42 @@ pub fn emit_audit_event(event: &AuditEvent) {
     write_audit_line(&msg);
 }
 
+/// Get monotonic nanoseconds for timestamping audit events.
+/// Uses a raw syscall to avoid going through the platform trait (no_std safe).
+fn monotonic_nanos() -> u64 {
+    #[repr(C)]
+    struct Timespec {
+        tv_sec: i64,
+        tv_nsec: i64,
+    }
+    let mut ts = Timespec { tv_sec: 0, tv_nsec: 0 };
+    // CLOCK_MONOTONIC = 1
+    let _ = unsafe {
+        syscalls::syscall2(
+            syscalls::Sysno::clock_gettime,
+            1,
+            core::ptr::addr_of_mut!(ts) as usize,
+        )
+    };
+    ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64
+}
+
 /// Allocate a new sequence number and emit the entry (pre-syscall) event.
 ///
 /// Returns the sequence number for pairing with the exit event.
 pub fn emit_entry_event(event: &AuditEvent) -> u64 {
     let fd = AUDIT_LOG_FD.load(Ordering::Relaxed);
     if fd < 0 {
-        return 0; // No audit log fd — skip formatting entirely.
+        return 0;
     }
     let seq = AUDIT_SEQ.fetch_add(1, Ordering::Relaxed);
     let worker = WORKER_ID.load(Ordering::Relaxed);
-    // Try stack-based formatting first (covers >99% of events).
+    let ts = monotonic_nanos();
     let mut buf = ArrayString::<512>::new();
     use core::fmt::Write;
     let fit = write!(
         &mut buf,
-        "{{\"phase\":\"enter\",\"seq\":{seq},\"pid\":{},\"tid\":{},\"worker\":{worker},\"syscall\":\"{}\",\"args\":[{}]}}\n",
+        "{{\"phase\":\"enter\",\"ts\":{ts},\"seq\":{seq},\"pid\":{},\"tid\":{},\"worker\":{worker},\"syscall\":\"{}\",\"args\":[{}]}}\n",
         event.pid,
         event.tid,
         event.syscall_name,
@@ -224,9 +244,8 @@ pub fn emit_entry_event(event: &AuditEvent) -> u64 {
     if fit {
         write_audit_line_to_fd(fd, buf.as_str());
     } else {
-        // Rare: event too large for stack buffer (long paths). Fall back to heap.
         let msg = alloc::format!(
-            "{{\"phase\":\"enter\",\"seq\":{seq},\"pid\":{},\"tid\":{},\"worker\":{worker},\"syscall\":\"{}\",\"args\":[{}]}}\n",
+            "{{\"phase\":\"enter\",\"ts\":{ts},\"seq\":{seq},\"pid\":{},\"tid\":{},\"worker\":{worker},\"syscall\":\"{}\",\"args\":[{}]}}\n",
             event.pid,
             event.tid,
             event.syscall_name,
@@ -247,19 +266,20 @@ pub fn emit_exit_event(
 ) {
     let fd = AUDIT_LOG_FD.load(Ordering::Relaxed);
     if fd < 0 {
-        return; // No audit log fd — skip formatting entirely.
+        return;
     }
     let worker = WORKER_ID.load(Ordering::Relaxed);
+    let ts = monotonic_nanos();
     let mut buf = ArrayString::<256>::new();
     use core::fmt::Write;
     let fit = match result {
         Ok(v) => write!(
             &mut buf,
-            "{{\"phase\":\"exit\",\"seq\":{seq},\"pid\":{pid},\"tid\":{tid},\"worker\":{worker},\"syscall\":\"{syscall_name}\",\"result\":{{\"ok\":{v}}}}}\n",
+            "{{\"phase\":\"exit\",\"ts\":{ts},\"seq\":{seq},\"pid\":{pid},\"tid\":{tid},\"worker\":{worker},\"syscall\":\"{syscall_name}\",\"result\":{{\"ok\":{v}}}}}\n",
         ),
         Err(e) => write!(
             &mut buf,
-            "{{\"phase\":\"exit\",\"seq\":{seq},\"pid\":{pid},\"tid\":{tid},\"worker\":{worker},\"syscall\":\"{syscall_name}\",\"result\":{{\"err\":{e}}}}}\n",
+            "{{\"phase\":\"exit\",\"ts\":{ts},\"seq\":{seq},\"pid\":{pid},\"tid\":{tid},\"worker\":{worker},\"syscall\":\"{syscall_name}\",\"result\":{{\"err\":{e}}}}}\n",
         ),
     }
     .is_ok();
@@ -271,7 +291,7 @@ pub fn emit_exit_event(
             Err(e) => alloc::format!("{{\"err\":{e}}}"),
         };
         let msg = alloc::format!(
-            "{{\"phase\":\"exit\",\"seq\":{seq},\"pid\":{pid},\"tid\":{tid},\"worker\":{worker},\"syscall\":\"{syscall_name}\",\"result\":{result_str}}}\n",
+            "{{\"phase\":\"exit\",\"ts\":{ts},\"seq\":{seq},\"pid\":{pid},\"tid\":{tid},\"worker\":{worker},\"syscall\":\"{syscall_name}\",\"result\":{result_str}}}\n",
         );
         write_audit_line_to_fd(fd, &msg);
     }
