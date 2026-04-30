@@ -912,3 +912,191 @@ async fn send_cmd(child: &mut Child, cmd: &Command) -> Response {
         },
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Helper: resolve path to the non-test harness binary. In test mode
+    /// `current_exe()` points to the test runner in `deps/`; we need the
+    /// regular binary that dispatches to "agent" mode.
+    fn harness_binary() -> String {
+        let test_exe = std::env::current_exe().unwrap();
+        // test_exe: .../target/debug/deps/litebox_test_harness-HASH
+        // binary:   .../target/debug/litebox_test_harness
+        let debug_dir = test_exe.parent().unwrap().parent().unwrap();
+        let bin = debug_dir.join("litebox_test_harness");
+        assert!(
+            bin.exists(),
+            "harness binary not found at {}; run `cargo build` first",
+            bin.display()
+        );
+        bin.to_string_lossy().into_owned()
+    }
+
+    /// Helper: create a TestRunner with no children.
+    fn empty_runner() -> TestRunner {
+        TestRunner {
+            children: std::collections::HashMap::new(),
+            results: Vec::new(),
+            self_exe: harness_binary(),
+            poisoned: std::collections::HashSet::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn poisoned_agent_rejects_sends() {
+        let mut runner = empty_runner();
+
+        // Spawn agent "T" (test agent).
+        let child = spawn_child(&runner.self_exe).await.unwrap();
+        runner.children.insert("T".to_string(), child);
+
+        // Verify it works before poisoning.
+        let resp = send_cmd(
+            runner.children.get_mut("T").unwrap(),
+            &Command::EnvGet {
+                var: "HOME".to_string(),
+            },
+        )
+        .await;
+        assert!(
+            !matches!(&resp, Response::Error { .. }),
+            "pre-poison send should succeed, got: {resp:?}"
+        );
+
+        // Poison agent T.
+        runner.poison_agent("T").await;
+        assert!(runner.poisoned.contains("T"));
+        assert!(!runner.children.contains_key("T"));
+
+        // Sends to poisoned agent should return immediate error.
+        let resp = runner
+            .send(
+                "T",
+                Command::EnvGet {
+                    var: "HOME".to_string(),
+                },
+            )
+            .await;
+        match &resp {
+            Response::Error { error } => {
+                assert!(
+                    error.contains("poisoned"),
+                    "expected 'poisoned' in error, got: {error}"
+                );
+            }
+            _ => panic!("expected Error response for poisoned agent, got: {resp:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn respawn_recovers_poisoned_agent() {
+        let mut runner = empty_runner();
+
+        // Spawn and immediately poison.
+        let child = spawn_child(&runner.self_exe).await.unwrap();
+        runner.children.insert("T".to_string(), child);
+        runner.poison_agent("T").await;
+        assert!(runner.poisoned.contains("T"));
+
+        // Respawn.
+        let ok = runner.respawn_if_poisoned("T").await;
+        assert!(ok, "respawn should succeed");
+        assert!(
+            !runner.poisoned.contains("T"),
+            "should no longer be poisoned"
+        );
+        assert!(
+            runner.children.contains_key("T"),
+            "child should exist again"
+        );
+
+        // Verify the respawned agent works.
+        let resp = runner
+            .send(
+                "T",
+                Command::EnvGet {
+                    var: "HOME".to_string(),
+                },
+            )
+            .await;
+        assert!(
+            !matches!(&resp, Response::Error { .. }),
+            "post-respawn send should work, got: {resp:?}"
+        );
+
+        // Clean up.
+        let _ = runner.send("T", Command::Exit).await;
+    }
+
+    #[tokio::test]
+    async fn recover_agents_kills_and_respawns_all() {
+        let mut runner = empty_runner();
+
+        // Spawn two agents.
+        for id in &["X", "Y"] {
+            let child = spawn_child(&runner.self_exe).await.unwrap();
+            runner.children.insert(id.to_string(), child);
+        }
+
+        // Verify both work.
+        for id in &["X", "Y"] {
+            let resp = runner
+                .send(
+                    id,
+                    Command::EnvGet {
+                        var: "HOME".to_string(),
+                    },
+                )
+                .await;
+            assert!(
+                !matches!(&resp, Response::Error { .. }),
+                "agent {id} should work before recovery, got: {resp:?}"
+            );
+        }
+
+        // Simulate suite timeout: recover_agents poisons all then respawns.
+        runner.recover_agents().await;
+        assert!(
+            runner.poisoned.is_empty(),
+            "all agents should be un-poisoned after recovery"
+        );
+        assert_eq!(runner.children.len(), 2, "both agents should be respawned");
+
+        // Verify respawned agents work.
+        for id in &["X", "Y"] {
+            let resp = runner
+                .send(
+                    id,
+                    Command::EnvGet {
+                        var: "HOME".to_string(),
+                    },
+                )
+                .await;
+            assert!(
+                !matches!(&resp, Response::Error { .. }),
+                "agent {id} should work after recovery, got: {resp:?}"
+            );
+        }
+
+        // Clean up.
+        for id in &["X", "Y"] {
+            let _ = runner.send(id, Command::Exit).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn respawn_noop_for_healthy_agent() {
+        let mut runner = empty_runner();
+        let child = spawn_child(&runner.self_exe).await.unwrap();
+        runner.children.insert("T".to_string(), child);
+
+        // respawn_if_poisoned on a healthy agent is a no-op.
+        let ok = runner.respawn_if_poisoned("T").await;
+        assert!(ok);
+        assert!(runner.children.contains_key("T"));
+
+        let _ = runner.send("T", Command::Exit).await;
+    }
+}
