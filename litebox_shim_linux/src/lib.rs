@@ -539,6 +539,9 @@ impl<FS: ShimFS> LinuxShim<FS> {
     /// Perform queued network interactions with the outside world.
     ///
     /// This function should be invoked in a loop, based on the returned advice.
+    /// When called from a guest thread (e.g. via `try_accept`), this also
+    /// wakes the network worker so it can handle any follow-up transmissions
+    /// (ACKs, retransmissions) without waiting for its poll timeout.
     pub fn perform_network_interaction(
         &self,
     ) -> litebox::net::PlatformInteractionReinvocationAdvice {
@@ -554,6 +557,12 @@ impl<FS: ShimFS> LinuxShim<FS> {
             );
             use litebox::platform::DebugLogProvider as _;
             litebox_platform_multiplex::platform().debug_log_print(&msg);
+        }
+        // Wake the network worker so it can handle follow-up work
+        // (e.g. transmit packets queued by this interaction, process
+        // ACKs, fire retransmission timers).
+        if result.call_again_immediately() {
+            litebox_platform_multiplex::platform().wake_network_worker();
         }
         result
     }

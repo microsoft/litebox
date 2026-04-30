@@ -222,6 +222,11 @@ pub struct LinuxUserland {
     /// Once set, `receive_ip_packet` and `wait_on_network` short-circuit to
     /// prevent busy-looping on the unreadable fd.
     ipc_dead: std::sync::atomic::AtomicBool,
+    /// Eventfd used to wake the network worker thread when guest code
+    /// produces outgoing data (connect SYN, send data, close FIN).
+    /// Without this, outgoing packets sit in smoltcp's queue until the
+    /// network worker's poll timeout fires.  -1 means no eventfd.
+    network_wake_fd: std::sync::atomic::AtomicI32,
     /// Optional dedicated fd for direct (non-IP) message passing to the broker.
     /// Used for 9P in IPC mode to bypass the smoltcp network stack.
     raw_message_fd: std::sync::RwLock<Option<std::os::fd::OwnedFd>>,
@@ -812,6 +817,11 @@ impl LinuxUserland {
         let platform = Self {
             network_transport: transport.into(),
             ipc_dead: std::sync::atomic::AtomicBool::new(false),
+            network_wake_fd: std::sync::atomic::AtomicI32::new({
+                // Create a non-blocking eventfd for waking the network worker.
+                let fd = unsafe { libc::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC) };
+                if fd < 0 { -1 } else { fd }
+            }),
             raw_message_fd: std::sync::RwLock::new(None),
             #[cfg(feature = "systrap_backend")]
             seccomp_interception_enabled: std::sync::atomic::AtomicBool::new(false),
@@ -2235,6 +2245,10 @@ impl LinuxUserland {
 
     /// Wait until there is data available on the network transport (TUN or IPC).
     ///
+    /// Also monitors the network wake eventfd so that guest threads can
+    /// wake the network worker immediately when they produce outgoing data
+    /// (connect SYN, send data, close FIN).
+    ///
     /// # Panics
     ///
     /// Panics if no network transport is configured.
@@ -2252,16 +2266,15 @@ impl LinuxUserland {
 
         let transport = self.network_transport.read().unwrap();
         let is_ipc = matches!(transport.as_ref(), Some(NetworkTransport::Ipc(_)));
-        let fd = match transport.as_ref().expect("no network transport configured") {
+        let net_fd = match transport.as_ref().expect("no network transport configured") {
             NetworkTransport::Tun(fd) | NetworkTransport::Ipc(fd) => fd.as_raw_fd(),
         };
-        let mut pfd = libc::pollfd {
-            fd,
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        // Use ppoll for sub-millisecond precision. The runner's network worker
-        // uses a 100µs default timeout; poll() truncates that to 0ms (busy-spin).
+        let wake_fd = self.network_wake_fd.load(std::sync::atomic::Ordering::Relaxed);
+        let mut pfds = [
+            libc::pollfd { fd: net_fd, events: libc::POLLIN, revents: 0 },
+            libc::pollfd { fd: wake_fd, events: libc::POLLIN, revents: 0 },
+        ];
+        let nfds: libc::nfds_t = if wake_fd >= 0 { 2 } else { 1 };
         let ts = timeout.map(|t| libc::timespec {
             #[allow(clippy::cast_possible_wrap)]
             tv_sec: t.as_secs() as libc::time_t,
@@ -2269,19 +2282,39 @@ impl LinuxUserland {
         });
         let _ = unsafe {
             libc::ppoll(
-                &raw mut pfd,
-                1,
+                pfds.as_mut_ptr(),
+                nfds,
                 ts.as_ref()
                     .map_or(std::ptr::null(), std::ptr::from_ref::<libc::timespec>),
                 std::ptr::null(),
             )
         };
 
+        // Drain the eventfd to reset it (non-blocking read of 8 bytes).
+        if wake_fd >= 0 && (pfds[1].revents & libc::POLLIN) != 0 {
+            let mut val: u64 = 0;
+            unsafe {
+                libc::read(wake_fd, (&raw mut val).cast::<libc::c_void>(), 8);
+            }
+        }
+
         // For IPC transport, detect broker closure via POLLHUP/POLLERR.
-        // These are always reported regardless of the events mask.
-        if is_ipc && (pfd.revents & (libc::POLLHUP | libc::POLLERR) != 0) {
+        if is_ipc && (pfds[0].revents & (libc::POLLHUP | libc::POLLERR) != 0) {
             self.ipc_dead
                 .store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// Wake the network worker thread so it runs `perform_platform_interaction`
+    /// immediately.  Called by guest threads after modifying smoltcp state
+    /// (e.g. initiating a TCP connect, writing data, closing a socket).
+    pub fn wake_network_worker(&self) {
+        let fd = self.network_wake_fd.load(std::sync::atomic::Ordering::Relaxed);
+        if fd >= 0 {
+            let val: u64 = 1;
+            unsafe {
+                libc::write(fd, (&raw const val).cast::<libc::c_void>(), 8);
+            }
         }
     }
 

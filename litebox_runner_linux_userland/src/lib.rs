@@ -2639,7 +2639,7 @@ fn start_network_worker<FS: litebox_shim_linux::ShimFS>(
         // packets still wake the thread immediately via POLLIN on the IPC
         // socket; this timeout only governs how often we re-check smoltcp
         // timers when the socket is idle.
-        const DEFAULT_TIMEOUT: core::time::Duration = core::time::Duration::from_millis(50);
+        const DEFAULT_TIMEOUT: core::time::Duration = core::time::Duration::from_millis(200);
         pin_thread_to_cpu(0);
 
         while !shutdown_clone.load(core::sync::atomic::Ordering::Relaxed) {

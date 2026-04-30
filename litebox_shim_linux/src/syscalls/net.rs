@@ -689,11 +689,16 @@ impl<FS: ShimFS> GlobalState<FS> {
         // to Network::accept() because it doesn't re-poll.
         let mut net = self.net.lock();
         let _ = net.perform_platform_interaction();
-        net.accept(fd, peer).map_err(|e| match e {
+        let result = net.accept(fd, peer).map_err(|e| match e {
             AcceptError::NoConnectionsReady => TryOpError::TryAgain,
             AcceptError::InvalidFd | AcceptError::NotListening => TryOpError::Other(e.into()),
             _ => unimplemented!(),
-        })
+        });
+        drop(net);
+        // Wake the network worker to handle follow-up transmissions
+        // (SYN-ACK, ACKs for accepted connections).
+        litebox_platform_multiplex::platform().wake_network_worker();
+        result
     }
 
     pub(super) fn accept(
@@ -783,13 +788,26 @@ impl<FS: ShimFS> GlobalState<FS> {
                 proxy.register_observer(observer, filter);
                 Ok(())
             },
-            || match self.net.lock().connect(fd, &sockaddr, check_progress) {
-                Ok(()) => Ok(()),
-                Err(litebox::net::errors::ConnectError::InProgress) => {
-                    check_progress = true;
-                    Err(TryOpError::TryAgain)
+            || {
+                // Drive smoltcp explicitly — platform_interaction is Manual, so
+                // automated_platform_interaction inside connect() is a no-op.
+                // Without this, the SYN packet sits in smoltcp's queue until
+                // the network worker's poll timeout fires.
+                let mut net = self.net.lock();
+                let _ = net.perform_platform_interaction();
+                let result = net.connect(fd, &sockaddr, check_progress);
+                drop(net);
+                // Wake the network worker to handle follow-up packets
+                // (SYN-ACK processing, retransmissions).
+                litebox_platform_multiplex::platform().wake_network_worker();
+                match result {
+                    Ok(()) => Ok(()),
+                    Err(litebox::net::errors::ConnectError::InProgress) => {
+                        check_progress = true;
+                        Err(TryOpError::TryAgain)
+                    }
+                    Err(e) => Err(TryOpError::Other(e.into())),
                 }
-                Err(e) => Err(TryOpError::Other(e.into())),
             },
         )
         .map_err(|err| match err {
