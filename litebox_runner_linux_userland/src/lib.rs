@@ -2631,7 +2631,15 @@ fn start_network_worker<FS: litebox_shim_linux::ShimFS>(
     let shim = shim.clone();
     let shutdown_clone = shutdown.clone();
     let child = litebox_platform_linux_userland::spawn_host_thread(move || {
-        const DEFAULT_TIMEOUT: core::time::Duration = core::time::Duration::from_micros(100);
+        // Idle timeout for the network poll loop. The previous 100µs default
+        // caused ~10 000 wakeups/s per worker even when no traffic was
+        // flowing, burning an entire CPU core per worker.  Since 9P uses
+        // shared-memory rings (not the virtual network), increasing this
+        // timeout does NOT affect filesystem performance.  Incoming network
+        // packets still wake the thread immediately via POLLIN on the IPC
+        // socket; this timeout only governs how often we re-check smoltcp
+        // timers when the socket is idle.
+        const DEFAULT_TIMEOUT: core::time::Duration = core::time::Duration::from_millis(50);
         pin_thread_to_cpu(0);
 
         while !shutdown_clone.load(core::sync::atomic::Ordering::Relaxed) {
@@ -2643,10 +2651,10 @@ fn start_network_worker<FS: litebox_shim_linux::ShimFS>(
                     }
                 }
             };
-            let wait = match timeout {
-                Some(t) if t < DEFAULT_TIMEOUT => t,
-                _ => DEFAULT_TIMEOUT,
-            };
+            // Respect smoltcp's suggested timeout (which accounts for TCP
+            // retransmission timers, keepalives, etc.).  Fall back to the
+            // default only when smoltcp has no pending timers (None).
+            let wait = timeout.unwrap_or(DEFAULT_TIMEOUT);
             litebox_platform_multiplex::platform().wait_on_network(Some(wait));
         }
         while shim.perform_network_interaction().call_again_immediately() {}
