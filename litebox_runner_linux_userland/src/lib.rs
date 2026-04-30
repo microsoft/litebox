@@ -794,18 +794,26 @@ fn finish_run_with_nine_p<FS: litebox_shim_linux::ShimFS>(
         if !pipe_bridges.is_empty() {
             use std::io::Write;
             let mut diag = std::fs::OpenOptions::new()
-                .create(true).append(true)
+                .create(true)
+                .append(true)
                 .open("/tmp/rst-diag.log")
                 .ok();
             if let Some(f) = diag.as_mut() {
-                let _ = writeln!(f, "[pipe-bridge-9p] pid={} installing {} bridges",
-                    std::process::id(), pipe_bridges.len());
+                let _ = writeln!(
+                    f,
+                    "[pipe-bridge-9p] pid={} installing {} bridges",
+                    std::process::id(),
+                    pipe_bridges.len()
+                );
             }
             for bridge in &pipe_bridges {
                 let fd_valid = unsafe { libc::fcntl(bridge.host_fd, libc::F_GETFD) } >= 0;
                 if let Some(f) = diag.as_mut() {
-                    let _ = writeln!(f, "[pipe-bridge-9p] guest_fd={} host_fd={} dir={} valid={}",
-                        bridge.guest_fd, bridge.host_fd, bridge.direction as char, fd_valid);
+                    let _ = writeln!(
+                        f,
+                        "[pipe-bridge-9p] guest_fd={} host_fd={} dir={} valid={}",
+                        bridge.guest_fd, bridge.host_fd, bridge.direction as char, fd_valid
+                    );
                 }
                 let direction = match bridge.direction {
                     b'r' => litebox_shim_linux::syscalls::host_pipe::HostPipeDirection::Read,
@@ -898,11 +906,9 @@ fn finish_run_with_nine_p<FS: litebox_shim_linux::ShimFS>(
             b'b' => litebox_shim_linux::syscalls::host_pipe::HostPipeDirection::ReadWrite,
             _ => litebox_shim_linux::syscalls::host_pipe::HostPipeDirection::Write,
         };
-        program.entrypoints.install_host_pipe_fd(
-            bridge.guest_fd,
-            bridge.host_fd,
-            direction,
-        );
+        program
+            .entrypoints
+            .install_host_pipe_fd(bridge.guest_fd, bridge.host_fd, direction);
     }
 
     run_program(program, shutdown, net_worker, worker_result_fd, None);
@@ -1960,12 +1966,7 @@ fn spawn_worker_mux_dispatcher(
                     tv_nsec: 5_000_000, // 5ms — short enough for relay responsiveness
                 };
                 unsafe {
-                    libc::ppoll(
-                        &raw mut pfd,
-                        1,
-                        &raw const ts,
-                        std::ptr::null(),
-                    );
+                    libc::ppoll(&raw mut pfd, 1, &raw const ts, std::ptr::null());
                 }
             }
         }
@@ -2139,11 +2140,9 @@ fn run_worker_exec(cli_args: CliArgs) -> Result<()> {
                 b'b' => litebox_shim_linux::syscalls::host_pipe::HostPipeDirection::ReadWrite,
                 _ => litebox_shim_linux::syscalls::host_pipe::HostPipeDirection::Write,
             };
-            program.entrypoints.install_host_pipe_fd(
-                bridge.guest_fd,
-                bridge.host_fd,
-                direction,
-            );
+            program
+                .entrypoints
+                .install_host_pipe_fd(bridge.guest_fd, bridge.host_fd, direction);
         }
 
         run_program(

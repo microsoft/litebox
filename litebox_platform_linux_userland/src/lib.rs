@@ -1317,9 +1317,7 @@ impl LinuxUserland {
         for &(guest_fd, host_fd) in &safe_extra_fds {
             let _ = self.clear_cloexec(host_fd);
             spawn_argv.push(CString::new("--pipe-bridge").unwrap());
-            spawn_argv.push(
-                CString::new(format!("{guest_fd}:b:{host_fd}")).map_err(|_| -1_i32)?,
-            );
+            spawn_argv.push(CString::new(format!("{guest_fd}:b:{host_fd}")).map_err(|_| -1_i32)?);
         }
 
         spawn_argv.push(CString::new("--").unwrap());
@@ -1492,11 +1490,7 @@ impl LinuxUserland {
         // at the kernel level via dup2 file actions.
         for &(guest_fd, host_fd) in &safe_extra_fds {
             if unsafe {
-                libc::posix_spawn_file_actions_adddup2(
-                    file_actions_ptr,
-                    host_fd,
-                    guest_fd as i32,
-                )
+                libc::posix_spawn_file_actions_adddup2(file_actions_ptr, host_fd, guest_fd as i32)
             } != 0
             {
                 return Err(-1_i32);
@@ -2269,10 +2263,20 @@ impl LinuxUserland {
         let net_fd = match transport.as_ref().expect("no network transport configured") {
             NetworkTransport::Tun(fd) | NetworkTransport::Ipc(fd) => fd.as_raw_fd(),
         };
-        let wake_fd = self.network_wake_fd.load(std::sync::atomic::Ordering::Relaxed);
+        let wake_fd = self
+            .network_wake_fd
+            .load(std::sync::atomic::Ordering::Relaxed);
         let mut pfds = [
-            libc::pollfd { fd: net_fd, events: libc::POLLIN, revents: 0 },
-            libc::pollfd { fd: wake_fd, events: libc::POLLIN, revents: 0 },
+            libc::pollfd {
+                fd: net_fd,
+                events: libc::POLLIN,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: wake_fd,
+                events: libc::POLLIN,
+                revents: 0,
+            },
         ];
         let nfds: libc::nfds_t = if wake_fd >= 0 { 2 } else { 1 };
         let ts = timeout.map(|t| libc::timespec {
@@ -2309,7 +2313,9 @@ impl LinuxUserland {
     /// immediately.  Called by guest threads after modifying smoltcp state
     /// (e.g. initiating a TCP connect, writing data, closing a socket).
     pub fn wake_network_worker(&self) {
-        let fd = self.network_wake_fd.load(std::sync::atomic::Ordering::Relaxed);
+        let fd = self
+            .network_wake_fd
+            .load(std::sync::atomic::Ordering::Relaxed);
         if fd >= 0 {
             let val: u64 = 1;
             unsafe {

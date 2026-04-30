@@ -1494,7 +1494,9 @@ impl<FS: ShimFS> Task<FS> {
             litebox::log_println!(
                 self.global.platform,
                 "[WRITE-EINVAL] pid={} fd=3 len={} hp={} subsystem reached EINVAL path",
-                self.pid, buf.len(), has_hp,
+                self.pid,
+                buf.len(),
+                has_hp,
             );
         }
         if let Err(Errno::EPIPE) = res {

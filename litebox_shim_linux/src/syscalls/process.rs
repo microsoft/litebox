@@ -2951,21 +2951,18 @@ impl<FS: ShimFS> Task<FS> {
                             repl.host_fd,
                             HostPipeDirection::ReadWrite,
                         );
-                        let typed_fd: litebox::fd::TypedFd<
-                            super::host_pipe::HostPipeSubsystem,
-                        > = self.global.litebox.descriptor_table_mut().insert(entry);
+                        let typed_fd: litebox::fd::TypedFd<super::host_pipe::HostPipeSubsystem> =
+                            self.global.litebox.descriptor_table_mut().insert(entry);
 
                         let mut rds = files.raw_descriptor_store.write();
                         // Remove old unix socket at this slot.
-                        if let Ok(old_sock) = rds.fd_consume_raw_integer::<
-                            super::unix::UnixSocketSubsystem<FS>,
-                        >(repl.guest_fd) {
+                        if let Ok(old_sock) = rds
+                            .fd_consume_raw_integer::<super::unix::UnixSocketSubsystem<FS>>(
+                                repl.guest_fd,
+                            )
+                        {
                             drop(rds);
-                            let _ = self
-                                .global
-                                .litebox
-                                .descriptor_table_mut()
-                                .remove(&old_sock);
+                            let _ = self.global.litebox.descriptor_table_mut().remove(&old_sock);
                             rds = files.raw_descriptor_store.write();
                         }
                         let _ = rds.fd_into_specific_raw_integer(typed_fd, repl.guest_fd);
@@ -8522,10 +8519,12 @@ impl<FS: ShimFS> Task<FS> {
                 let dt = self.global.litebox.descriptor_table();
                 let mut out = Vec::new();
                 for raw_fd in rds.iter_alive() {
-                    if raw_fd <= 2 { continue; }
-                    if let Ok(typed) = rds.fd_from_raw_integer::<
-                        super::unix::UnixSocketSubsystem<FS>,
-                    >(raw_fd) {
+                    if raw_fd <= 2 {
+                        continue;
+                    }
+                    if let Ok(typed) =
+                        rds.fd_from_raw_integer::<super::unix::UnixSocketSubsystem<FS>>(raw_fd)
+                    {
                         let pair_id = dt
                             .with_entry(&typed, |sock: &super::unix::UnixSocket<FS>| {
                                 sock.socket_pair_id()
@@ -8543,9 +8542,7 @@ impl<FS: ShimFS> Task<FS> {
             // CLOEXEC check is skipped — if the fd had CLOEXEC, exec would
             // close it anyway and the bridge fd is harmless (unused by child).
             for (raw_fd, pair_id, oid, _typed) in &socket_info {
-                if let Ok((child_end, parent_end)) =
-                    self.global.platform.create_host_socketpair()
-                {
+                if let Ok((child_end, parent_end)) = self.global.platform.create_host_socketpair() {
                     // Dup parent end to a high fd number to prevent
                     // clobbering by memfd/pipe creation in spawn.
                     let safe_parent = self.global.platform.dup_host_fd(parent_end);
@@ -8621,7 +8618,9 @@ impl<FS: ShimFS> Task<FS> {
         // Replace parent's peer unix socket fds with HostPipeFd backed
         // by the OS socketpair parent end. Find the peer by pair_id.
         if let Some((vd, _parent_pipe_fds, parent_socket_fds)) = &vfork_info {
-            for &(child_guest_fd, parent_os_fd, child_pair_id, child_oid) in &parent_bidi_replacements {
+            for &(child_guest_fd, parent_os_fd, child_pair_id, child_oid) in
+                &parent_bidi_replacements
+            {
                 let mut stored = false;
                 for &(parent_fd, parent_pair_id, parent_oid) in parent_socket_fds {
                     if parent_pair_id == child_pair_id && parent_oid != child_oid {
@@ -8896,7 +8895,8 @@ impl<FS: ShimFS> Task<FS> {
                 // Don't signal VforkDone here — exec_on_remote_host will signal
                 // it after spawning the worker and setting up pipe replacements
                 // so the parent can use direct HostPipeFd I/O.
-                vfork_info_for_exec = Some((fc.vfork_done, fc.parent_pipe_fds, fc.parent_unix_socket_fds));
+                vfork_info_for_exec =
+                    Some((fc.vfork_done, fc.parent_pipe_fds, fc.parent_unix_socket_fds));
                 detached_from_shared_fork = true;
             }
             let Some(remote_exec_image) = remote_exec_image.as_deref() else {

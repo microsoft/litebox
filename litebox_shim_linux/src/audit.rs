@@ -207,7 +207,10 @@ fn monotonic_nanos() -> u64 {
         tv_sec: i64,
         tv_nsec: i64,
     }
-    let mut ts = Timespec { tv_sec: 0, tv_nsec: 0 };
+    let mut ts = Timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
     // CLOCK_MONOTONIC = 1
     let _ = unsafe {
         syscalls::syscall2(
