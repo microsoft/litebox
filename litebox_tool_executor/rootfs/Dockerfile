@@ -2,13 +2,15 @@
 # LiteBox rootfs Dockerfile — multi-target build
 #
 # Targets:
-#   litebox-base   — shared Ubuntu 24.04 foundation (not used directly)
-#   litebox-test   — test harness rootfs (bash + coreutils + Node.js)
-#   litebox-vscode — VS Code Server rootfs (adds SSH, VS Code CLI+Server)
+#   litebox-base             — shared Ubuntu 24.04 foundation (not used directly)
+#   litebox-test             — test harness rootfs (bash + coreutils + Node.js)
+#   litebox-vscode           — VS Code Server rootfs (adds SSH, VS Code CLI+Server)
+#   litebox-vscode-prewrite  — VS Code + pre-rewritten node binary (faster startup)
 #
 # Usage:
 #   docker build --target litebox-test   -t litebox-test   -f litebox_tool_executor/rootfs/Dockerfile .
 #   docker build --target litebox-vscode -t litebox-vscode -f litebox_tool_executor/rootfs/Dockerfile .
+#   docker build --target litebox-vscode-prewrite -t litebox-vscode-prewrite -f litebox_tool_executor/rootfs/Dockerfile .
 #
 # IMPORTANT: Binaries must be bind-mounted from a Linux-native filesystem
 # (WSL2 ext4), NOT from NTFS (/mnt/c/...).  Docker Desktop on Windows
@@ -132,7 +134,40 @@ RUN mkdir -p /root/.vscode-server/data/logs \
 EXPOSE 22
 EXPOSE 9999
 
-# === Stage 2c: VS Code Server WITHOUT litebox (native baseline) ===
+# === Stage 2c: VS Code Server with pre-rewritten rootfs ===
+#
+# All ELF binaries are pre-rewritten with syscall trampolines.
+# This image is ONLY used under litebox — never run natively.
+# The original litebox-vscode image is preserved for ad-hoc scripts.
+#
+# Eliminates ~10.5s of runtime rewriting:
+#   node (119MB): 7.5s, libc (2MB): 2.6s, libstdc++: 0.2s, etc.
+#
+# Runtime rewriting stays enabled for binaries that appear later
+# (e.g., VS Code extensions with native modules).
+#
+# Requires litebox_syscall_rewriter in the build context. Build with:
+#   cargo build --release -p litebox_syscall_rewriter
+#
+# Usage:
+#   docker build --target litebox-vscode-prewrite -t litebox-vscode-prewrite \
+#     -f litebox_tool_executor/rootfs/Dockerfile .
+FROM litebox-vscode AS litebox-vscode-prewrite
+
+COPY litebox_tool_executor/rootfs/litebox_syscall_rewriter /tmp/rewriter
+# Rewrite guest EXECUTABLES only — NOT shared libraries. The litebox
+# infrastructure (tool_executor, broker, runner) runs natively and
+# links against the container's libc/ld-linux. Pre-rewriting those
+# would crash the infrastructure. The broker's ElfCache handles
+# shared library rewriting at runtime (cached after first load).
+RUN chmod +x /tmp/rewriter \
+    && SERVER_DIR=$(ls -d /root/.vscode-server/cli/servers/Stable-*/server) \
+    && /tmp/rewriter "$SERVER_DIR/node" -o "$SERVER_DIR/node" \
+    && /tmp/rewriter /usr/sbin/dropbear -o /usr/sbin/dropbear \
+    && /tmp/rewriter /usr/bin/bash -o /tmp/bash.tmp && mv /tmp/bash.tmp /usr/bin/bash \
+    && rm /tmp/rewriter
+
+# === Stage 2d: VS Code Server WITHOUT litebox (native baseline) ===
 # Verifies the Docker image works without litebox so SSH + VS Code
 # issues can be attributed to litebox vs. environment problems.
 #

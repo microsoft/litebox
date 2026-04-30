@@ -1697,6 +1697,22 @@ impl Server {
             }
         }
 
+        // Quick check: if the binary is already patched (has LITEBOX0 magic
+        // trailer), skip the expensive full-file read + scan. Pre-rewritten
+        // binaries on disk are served as-is through 9P.
+        let file_len = file.metadata().ok()?.len();
+        if file_len >= 32 {
+            let mut trailer = [0u8; 8];
+            if file.seek(SeekFrom::End(-32)).is_ok()
+                && file.read_exact(&mut trailer).is_ok()
+                && &trailer == litebox_syscall_rewriter::TRAMPOLINE_MAGIC
+            {
+                let _ = file.seek(SeekFrom::Start(0));
+                return None;
+            }
+            let _ = file.seek(SeekFrom::Start(0));
+        }
+
         // Read the full file
         let mut content = Vec::new();
         file.seek(SeekFrom::Start(0)).ok()?;
@@ -1719,6 +1735,7 @@ impl Server {
         }
 
         let mut skipped_addrs = Vec::new();
+        let start = std::time::Instant::now();
         let patched = match litebox_syscall_rewriter::hook_syscalls_in_elf(
             &content,
             None,
@@ -1730,6 +1747,24 @@ impl Server {
                 return None;
             }
         };
+        let elapsed = start.elapsed();
+
+        // Write timing to diagnostic log.
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open("/tmp/rst-diag.log")
+        {
+            use std::io::Write;
+            let _ = writeln!(
+                f,
+                "[perf] broker hook_syscalls_in_elf({}, {} bytes): {}.{:03}s",
+                path.display(),
+                content.len(),
+                elapsed.as_secs(),
+                elapsed.subsec_millis(),
+            );
+        }
 
         debug!(
             path = %path.display(),
