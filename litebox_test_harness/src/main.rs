@@ -4420,7 +4420,10 @@ mod unix_socket_tests {
         if pid == 0 {
             // Child: close parent end, read from child end, exit.
             unsafe { libc::close(parent_fd) };
-            let tv = libc::timeval { tv_sec: 5, tv_usec: 0 };
+            let tv = libc::timeval {
+                tv_sec: 5,
+                tv_usec: 0,
+            };
             unsafe {
                 libc::setsockopt(
                     child_fd,
@@ -4431,9 +4434,8 @@ mod unix_socket_tests {
                 );
             }
             let mut buf = [0u8; 64];
-            let n = unsafe {
-                libc::read(child_fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len())
-            };
+            let n =
+                unsafe { libc::read(child_fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
             if n <= 0 {
                 eprintln!("[US6b-child] read failed: n={n} errno={}", errno());
                 std::process::exit(1);
@@ -4446,9 +4448,7 @@ mod unix_socket_tests {
         // Parent: close child end, write to parent end, waitpid.
         unsafe { libc::close(child_fd) };
         let msg = b"US6_FROM_PARENT";
-        let n = unsafe {
-            libc::write(parent_fd, msg.as_ptr() as *const libc::c_void, msg.len())
-        };
+        let n = unsafe { libc::write(parent_fd, msg.as_ptr() as *const libc::c_void, msg.len()) };
         unsafe { libc::close(parent_fd) };
 
         if n != msg.len() as isize {
@@ -4460,7 +4460,11 @@ mod unix_socket_tests {
 
         let mut status = 0i32;
         unsafe { libc::waitpid(pid, &mut status, 0) };
-        let exit_code = if libc::WIFEXITED(status) { libc::WEXITSTATUS(status) } else { 99 };
+        let exit_code = if libc::WIFEXITED(status) {
+            libc::WEXITSTATUS(status)
+        } else {
+            99
+        };
 
         if exit_code == 0 {
             println!("US6R_SOCKETPAIR_FORK_READ_OK");
@@ -4508,7 +4512,13 @@ mod unix_socket_tests {
             let c_arg1 = std::ffi::CString::new("unix-socket-test").unwrap();
             let c_arg2 = std::ffi::CString::new("socketpair-exec-child").unwrap();
             let c_arg3 = std::ffi::CString::new(fd_str.as_str()).unwrap();
-            let args = [c_exe.as_ptr(), c_arg1.as_ptr(), c_arg2.as_ptr(), c_arg3.as_ptr(), core::ptr::null()];
+            let args = [
+                c_exe.as_ptr(),
+                c_arg1.as_ptr(),
+                c_arg2.as_ptr(),
+                c_arg3.as_ptr(),
+                core::ptr::null(),
+            ];
             unsafe { libc::execv(c_exe.as_ptr(), args.as_ptr()) };
             eprintln!("[US6c-child] execv failed: {}", errno());
             std::process::exit(127);
@@ -4518,9 +4528,7 @@ mod unix_socket_tests {
         unsafe { libc::close(child_fd) };
 
         let msg = b"US6E_FROM_PARENT";
-        let n = unsafe {
-            libc::write(parent_fd, msg.as_ptr() as *const libc::c_void, msg.len())
-        };
+        let n = unsafe { libc::write(parent_fd, msg.as_ptr() as *const libc::c_void, msg.len()) };
         if n != msg.len() as isize {
             println!("US6E_WRITE_FAIL:n={n},errno={}", errno());
             unsafe { libc::kill(pid, libc::SIGKILL) };
@@ -4529,23 +4537,30 @@ mod unix_socket_tests {
         eprintln!("[US6c-parent] wrote {n} bytes");
 
         // Read reply with timeout.
-        let tv = libc::timeval { tv_sec: 10, tv_usec: 0 };
+        let tv = libc::timeval {
+            tv_sec: 10,
+            tv_usec: 0,
+        };
         unsafe {
             libc::setsockopt(
-                parent_fd, libc::SOL_SOCKET, libc::SO_RCVTIMEO,
+                parent_fd,
+                libc::SOL_SOCKET,
+                libc::SO_RCVTIMEO,
                 &tv as *const _ as *const libc::c_void,
                 core::mem::size_of::<libc::timeval>() as libc::socklen_t,
             );
         }
         let mut buf = [0u8; 64];
-        let n = unsafe {
-            libc::read(parent_fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len())
-        };
+        let n = unsafe { libc::read(parent_fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
         unsafe { libc::close(parent_fd) };
 
         let mut status = 0i32;
         unsafe { libc::waitpid(pid, &mut status, 0) };
-        let exit_code = if libc::WIFEXITED(status) { libc::WEXITSTATUS(status) } else { 99 };
+        let exit_code = if libc::WIFEXITED(status) {
+            libc::WEXITSTATUS(status)
+        } else {
+            99
+        };
 
         if n <= 0 {
             println!("US6E_READ_FAIL:n={n},errno={},exit={exit_code}", errno());
@@ -4566,13 +4581,19 @@ mod unix_socket_tests {
     /// Helper for US6c: exec'd child reads from inherited socketpair fd,
     /// writes reply, exits.
     fn socketpair_exec_child() -> i32 {
-        let fd: i32 = std::env::args().nth(3).and_then(|s| s.parse().ok()).unwrap_or(-1);
+        let fd: i32 = std::env::args()
+            .nth(3)
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(-1);
         if fd < 0 {
             eprintln!("[US6c-child] bad fd arg");
             return 1;
         }
 
-        let tv = libc::timeval { tv_sec: 5, tv_usec: 0 };
+        let tv = libc::timeval {
+            tv_sec: 5,
+            tv_usec: 0,
+        };
         unsafe {
             libc::setsockopt(
                 fd,
@@ -4642,7 +4663,8 @@ mod unix_socket_tests {
             unsafe { libc::dup2(pipe_fds[1], 1) };
             unsafe { libc::close(pipe_fds[1]) };
             // Also redirect stderr to suppress noise.
-            let devnull = unsafe { libc::open(b"/dev/null\0".as_ptr() as *const _, libc::O_WRONLY) };
+            let devnull =
+                unsafe { libc::open(b"/dev/null\0".as_ptr() as *const _, libc::O_WRONLY) };
             if devnull >= 0 {
                 unsafe { libc::dup2(devnull, 2) };
                 unsafe { libc::close(devnull) };
@@ -4651,7 +4673,12 @@ mod unix_socket_tests {
             let c_exe = std::ffi::CString::new(exe.as_str()).unwrap();
             let c_arg1 = std::ffi::CString::new("unix-socket-test").unwrap();
             let c_arg2 = std::ffi::CString::new("socketpair-exec").unwrap();
-            let args = [c_exe.as_ptr(), c_arg1.as_ptr(), c_arg2.as_ptr(), core::ptr::null()];
+            let args = [
+                c_exe.as_ptr(),
+                c_arg1.as_ptr(),
+                c_arg2.as_ptr(),
+                core::ptr::null(),
+            ];
             unsafe { libc::execv(c_exe.as_ptr(), args.as_ptr()) };
             std::process::exit(127);
         }
@@ -4663,14 +4690,20 @@ mod unix_socket_tests {
         let mut buf = [0u8; 4096];
         loop {
             let n = unsafe { libc::read(pipe_fds[0], buf.as_mut_ptr() as *mut _, buf.len()) };
-            if n <= 0 { break; }
+            if n <= 0 {
+                break;
+            }
             stdout_buf.extend_from_slice(&buf[..n as usize]);
         }
         unsafe { libc::close(pipe_fds[0]) };
 
         let mut status = 0i32;
         unsafe { libc::waitpid(pid, &mut status, 0) };
-        let exit_code = if libc::WIFEXITED(status) { libc::WEXITSTATUS(status) } else { 99 };
+        let exit_code = if libc::WIFEXITED(status) {
+            libc::WEXITSTATUS(status)
+        } else {
+            99
+        };
 
         let stdout = String::from_utf8_lossy(&stdout_buf);
         eprintln!("[US6d] child stdout: {stdout}");
@@ -4736,9 +4769,8 @@ mod pipe_lifecycle_tests {
             // Child: close read end, write to pipe, exit.
             unsafe { libc::close(pipe_fds[0]) };
             let msg = b"P1_CHILD_DATA\n";
-            let _ = unsafe {
-                libc::write(pipe_fds[1], msg.as_ptr() as *const libc::c_void, msg.len())
-            };
+            let _ =
+                unsafe { libc::write(pipe_fds[1], msg.as_ptr() as *const libc::c_void, msg.len()) };
             unsafe { libc::close(pipe_fds[1]) };
             std::process::exit(0);
         }
@@ -4747,10 +4779,15 @@ mod pipe_lifecycle_tests {
         unsafe { libc::close(pipe_fds[1]) };
 
         // Set read timeout to catch blocking.
-        let tv = libc::timeval { tv_sec: 10, tv_usec: 0 };
+        let tv = libc::timeval {
+            tv_sec: 10,
+            tv_usec: 0,
+        };
         unsafe {
             libc::setsockopt(
-                pipe_fds[0], libc::SOL_SOCKET, libc::SO_RCVTIMEO,
+                pipe_fds[0],
+                libc::SOL_SOCKET,
+                libc::SO_RCVTIMEO,
                 &tv as *const _ as *const libc::c_void,
                 core::mem::size_of::<libc::timeval>() as libc::socklen_t,
             );
@@ -4760,7 +4797,11 @@ mod pipe_lifecycle_tests {
         let mut buf = [0u8; 4096];
         loop {
             let n = unsafe {
-                libc::read(pipe_fds[0], buf.as_mut_ptr() as *mut libc::c_void, buf.len())
+                libc::read(
+                    pipe_fds[0],
+                    buf.as_mut_ptr() as *mut libc::c_void,
+                    buf.len(),
+                )
             };
             if n == 0 {
                 break; // EOF
@@ -4794,7 +4835,11 @@ mod pipe_lifecycle_tests {
         let exe = if let Some(bin) = args.get(3) {
             bin.clone()
         } else {
-            std::env::current_exe().unwrap().to_str().unwrap().to_string()
+            std::env::current_exe()
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .to_string()
         };
 
         // Create pipe for child stdout.
@@ -4819,7 +4864,12 @@ mod pipe_lifecycle_tests {
             let c_exe = std::ffi::CString::new(exe.as_str()).unwrap();
             let c_arg1 = std::ffi::CString::new("pipe-test").unwrap();
             let c_arg2 = std::ffi::CString::new("echo-exit").unwrap();
-            let argv = [c_exe.as_ptr(), c_arg1.as_ptr(), c_arg2.as_ptr(), core::ptr::null()];
+            let argv = [
+                c_exe.as_ptr(),
+                c_arg1.as_ptr(),
+                c_arg2.as_ptr(),
+                core::ptr::null(),
+            ];
             unsafe { libc::execv(c_exe.as_ptr(), argv.as_ptr()) };
             std::process::exit(127);
         }
@@ -4835,7 +4885,10 @@ mod pipe_lifecycle_tests {
         loop {
             let remaining = deadline.saturating_duration_since(std::time::Instant::now());
             if remaining.is_zero() {
-                println!("P2_TIMEOUT:read blocked, no EOF after 15s, data_len={}", all_data.len());
+                println!(
+                    "P2_TIMEOUT:read blocked, no EOF after 15s, data_len={}",
+                    all_data.len()
+                );
                 unsafe { libc::kill(pid, libc::SIGKILL) };
                 return 1;
             }
@@ -4857,7 +4910,11 @@ mod pipe_lifecycle_tests {
             }
 
             let n = unsafe {
-                libc::read(pipe_fds[0], buf.as_mut_ptr() as *mut libc::c_void, buf.len())
+                libc::read(
+                    pipe_fds[0],
+                    buf.as_mut_ptr() as *mut libc::c_void,
+                    buf.len(),
+                )
             };
             if n == 0 {
                 break; // EOF!
@@ -4872,7 +4929,11 @@ mod pipe_lifecycle_tests {
 
         let mut status = 0i32;
         unsafe { libc::waitpid(pid, &mut status, 0) };
-        let exit_code = if libc::WIFEXITED(status) { libc::WEXITSTATUS(status) } else { 99 };
+        let exit_code = if libc::WIFEXITED(status) {
+            libc::WEXITSTATUS(status)
+        } else {
+            99
+        };
 
         let data = String::from_utf8_lossy(&all_data);
         if data.contains("PIPE_CHILD_DATA") && exit_code == 0 {
