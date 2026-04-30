@@ -143,7 +143,6 @@ impl<FS: ShimFS> LinuxShimEntrypoints<FS> {
 pub struct LinuxShimBuilder {
     platform: &'static Platform,
     litebox: LiteBox<Platform>,
-    load_filter: Option<LoadFilter>,
 }
 
 impl Default for LinuxShimBuilder {
@@ -159,7 +158,6 @@ impl LinuxShimBuilder {
         Self {
             platform,
             litebox: LiteBox::new(platform),
-            load_filter: None,
         }
     }
 
@@ -177,11 +175,6 @@ impl LinuxShimBuilder {
         default_fs(&self.litebox, in_mem_fs, tar_ro_fs)
     }
 
-    /// Set the load filter, which can augment envp or auxv when starting a new program.
-    pub fn set_load_filter(&mut self, callback: LoadFilter) {
-        self.load_filter = Some(callback);
-    }
-
     /// Build the shim.
     pub fn build<FS: ShimFS>(self) -> LinuxShim<FS> {
         let mut net = Network::new(&self.litebox);
@@ -193,7 +186,6 @@ impl LinuxShimBuilder {
             pipes: Pipes::new(&self.litebox),
             net: litebox::sync::Mutex::new(net),
             boot_time: self.platform.now(),
-            load_filter: self.load_filter,
             next_thread_id: 2.into(), // start from 2, as 1 is used by the main thread
             litebox: self.litebox,
             unix_addr_table: litebox::sync::RwLock::new(syscalls::unix::UnixAddrTable::new()),
@@ -1016,8 +1008,6 @@ struct GlobalState<FS: ShimFS> {
     net: litebox::sync::Mutex<Platform, Network<Platform>>,
     /// The time when the shim was started.
     boot_time: <Platform as TimeProvider>::Instant,
-    /// Optional load filter function to modify environment variables during program loading.
-    load_filter: Option<LoadFilter>,
     /// Next thread ID to assign.
     // TODO: better management of thread IDs
     next_thread_id: core::sync::atomic::AtomicI32,
@@ -1055,8 +1045,6 @@ impl<FS: ShimFS> Drop for Task<FS> {
         self.prepare_for_exit();
     }
 }
-
-pub type LoadFilter = fn(envp: &mut alloc::vec::Vec<alloc::ffi::CString>);
 
 #[cfg(test)]
 mod test_utils {

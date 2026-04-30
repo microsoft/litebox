@@ -67,10 +67,6 @@ fn align_up(addr: usize, align: usize) -> usize {
     (addr + align - 1) & !(align - 1)
 }
 
-#[expect(
-    dead_code,
-    reason = "unused but exists to be symmetric to `align_up` here"
-)]
 #[inline]
 fn align_down(addr: usize, align: usize) -> usize {
     debug_assert!(align.is_power_of_two());
@@ -134,7 +130,8 @@ impl<FS: ShimFS> Task<FS> {
         // Runtime syscall rewriting: patch PROT_EXEC segments in-place.
         if is_exec {
             let syscall_entry = self.global.platform.get_syscall_entry_point();
-            if syscall_entry != 0 && !self.maybe_patch_exec_segment(result, len, fd, syscall_entry)
+            if syscall_entry != 0
+                && !self.maybe_patch_exec_segment(result, len, fd, syscall_entry, Some(offset))
             {
                 // Trampoline setup failed for a pre-patched binary whose
                 // .text already contains JMPs to the trampoline address.
@@ -145,7 +142,7 @@ impl<FS: ShimFS> Task<FS> {
             }
         } else {
             // Ensure patch state is initialized for this fd (no-op if already done).
-            self.init_elf_patch_state(fd, result.as_usize());
+            self.init_elf_patch_state(fd, result.as_usize(), offset);
             // Track non-exec file mappings so we can patch them if they later
             // gain PROT_EXEC via mprotect.
             let mut cache = self.global.elf_patch_cache.lock();
@@ -535,19 +532,25 @@ impl<FS: ShimFS> Task<FS> {
                 continue;
             }
             let mapped_addr = MutPtr::<u8>::from_usize(patch_start);
-            self.maybe_patch_exec_segment(mapped_addr, patch_len, fd, syscall_entry);
+            self.maybe_patch_exec_segment(mapped_addr, patch_len, fd, syscall_entry, None);
         }
     }
 
-    /// Initialize ELF patch state for an fd on its first mmap at offset 0.
+    /// Initialize ELF patch state for an fd on its first mmap.
     ///
     /// Reads the ELF header to determine the trampoline address (page-aligned
     /// end of the highest PT_LOAD segment) and checks the file tail for the
     /// trampoline magic to determine if it's pre-patched.
     ///
+    /// For ET_DYN binaries (PIE/shared libs), virtual addresses in program
+    /// headers are relative to a base address chosen at load time. We derive
+    /// the base from the caller's mapping: `base = mapped_addr - p_vaddr` of
+    /// the segment being mapped. The `file_offset` parameter identifies which
+    /// segment is being mapped so we can look up its `p_vaddr`.
+    ///
     /// x86_64 only: assumes 64-bit ELF layout and program header offsets.
     #[allow(clippy::cast_possible_truncation)]
-    fn init_elf_patch_state(&self, fd: i32, base_addr: usize) {
+    fn init_elf_patch_state(&self, fd: i32, mapped_addr: usize, file_offset: usize) {
         // Quick check: skip if already initialized.
         if self.global.elf_patch_cache.lock().contains_key(&fd) {
             return;
@@ -590,14 +593,17 @@ impl<FS: ShimFS> Task<FS> {
             _ => return,
         }
 
-        // Find highest PT_LOAD end (p_vaddr + p_memsz)
+        // Find highest PT_LOAD end (p_vaddr + p_memsz) and compute base_addr
+        // by matching the segment whose p_offset corresponds to file_offset.
         let mut max_load_end: u64 = 0;
+        let mut base_addr: Option<usize> = None;
         for i in 0..e_phnum {
             let ph = &phdrs_buf[i * e_phentsize..][..e_phentsize];
             let p_type = u32::from_le_bytes(ph[0..4].try_into().unwrap());
             if p_type != PT_LOAD {
                 continue;
             }
+            let p_offset = u64::from_le_bytes(ph[8..16].try_into().unwrap()) as usize;
             let p_vaddr = u64::from_le_bytes(ph[16..24].try_into().unwrap());
             let p_memsz = u64::from_le_bytes(ph[40..48].try_into().unwrap());
             let Some(end) = p_vaddr.checked_add(p_memsz) else {
@@ -610,35 +616,46 @@ impl<FS: ShimFS> Task<FS> {
             if end > max_load_end {
                 max_load_end = end;
             }
+            // Match segment by page-aligned file offset to derive base address.
+            if base_addr.is_none()
+                && align_down(p_offset, PAGE_SIZE) == align_down(file_offset, PAGE_SIZE)
+            {
+                base_addr = Some(mapped_addr.wrapping_sub(p_vaddr as usize));
+            }
         }
 
         if max_load_end == 0 {
             return; // No PT_LOAD segments
         }
 
-        // For ET_DYN (PIE/shared libs), p_vaddr is relative to base_addr.
-        // For ET_EXEC, p_vaddr is absolute and base_addr is 0.
-        let trampoline_vaddr = if e_type == ET_DYN {
-            // ET_DYN
-            base_addr + (max_load_end as usize).next_multiple_of(PAGE_SIZE)
-        } else {
-            // ET_EXEC
-            (max_load_end as usize).next_multiple_of(PAGE_SIZE)
-        };
-
         // Check if file is pre-patched by reading the last 32 bytes for magic
         let (pre_patched, tramp_file_offset, tramp_vaddr, tramp_file_size) =
             self.check_trampoline_magic(fd);
 
-        // For pre-patched binaries, use the vaddr from the header instead.
+        // Compute the trampoline virtual address.
+        // - Pre-patched: use the exact address from the trampoline header (the
+        //   code already contains JMPs there, so we MUST map at this address).
+        // - Unpatched: place it just past the highest PT_LOAD end (this is just
+        //   a hint — validated by the ±2GB distance check with trap fallback).
+        // For ET_DYN, virtual addresses are relative to the load base.
         let trampoline_vaddr = if pre_patched {
             if e_type == ET_DYN {
-                base_addr + tramp_vaddr as usize
+                let Some(base) = base_addr else {
+                    panic!(
+                        "fatal: pre-patched ET_DYN binary but cannot determine load base address"
+                    );
+                };
+                base + tramp_vaddr as usize
             } else {
                 tramp_vaddr as usize
             }
         } else {
-            trampoline_vaddr
+            let base = if e_type == ET_DYN {
+                base_addr.unwrap_or(mapped_addr)
+            } else {
+                0
+            };
+            base + (max_load_end as usize).next_multiple_of(PAGE_SIZE)
         };
 
         // Insert under lock (re-check for races).
@@ -747,12 +764,13 @@ impl<FS: ShimFS> Task<FS> {
         len: usize,
         fd: i32,
         syscall_entry: usize,
+        file_offset: Option<usize>,
     ) -> bool {
         // Initialize patch state if this is the first mmap for this fd.
         // Typically the first mapping is at offset 0 (the ELF header), but
         // some loaders may map an executable segment at a non-zero offset first.
         if !self.global.elf_patch_cache.lock().contains_key(&fd) {
-            self.init_elf_patch_state(fd, mapped_addr.as_usize());
+            self.init_elf_patch_state(fd, mapped_addr.as_usize(), file_offset.unwrap_or(0));
         }
 
         // This lock guards the elf_patch_cache and is held for the entire

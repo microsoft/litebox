@@ -1487,12 +1487,8 @@ impl<FS: ShimFS> Task<FS> {
         &self,
         mut loader: crate::loader::elf::ElfLoader<'_, FS>,
         argv: Vec<alloc::ffi::CString>,
-        mut envp: Vec<alloc::ffi::CString>,
+        envp: Vec<alloc::ffi::CString>,
     ) -> Result<(), crate::loader::elf::ElfLoaderError> {
-        if let Some(filter) = self.global.load_filter {
-            filter(&mut envp);
-        }
-
         let load_info = loader.load(argv, envp, self.init_auxv())?;
 
         self.set_task_comm(loader.comm());
