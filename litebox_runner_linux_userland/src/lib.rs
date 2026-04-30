@@ -1946,7 +1946,27 @@ fn spawn_worker_mux_dispatcher(
             }
 
             if !did_work {
-                std::thread::sleep(std::time::Duration::from_micros(100));
+                // No work this iteration — wait for the mux socketpair to
+                // become readable (incoming data from parent) or a short
+                // timeout (to drain outgoing relay pipes).  The previous
+                // 100µs sleep burned an entire CPU core per worker.
+                let mut pfd = libc::pollfd {
+                    fd: mux_fd,
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+                let ts = libc::timespec {
+                    tv_sec: 0,
+                    tv_nsec: 5_000_000, // 5ms — short enough for relay responsiveness
+                };
+                unsafe {
+                    libc::ppoll(
+                        &raw mut pfd,
+                        1,
+                        &raw const ts,
+                        std::ptr::null(),
+                    );
+                }
             }
         }
     })
