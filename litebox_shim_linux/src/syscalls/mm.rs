@@ -377,11 +377,18 @@ impl<FS: ShimFS> Task<FS> {
     /// Handle syscall `munmap`
     #[inline]
     pub(crate) fn sys_munmap(&self, addr: crate::MutPtr<u8>, len: usize) -> Result<(), Errno> {
-        let result = litebox_common_linux::mm::sys_munmap(&self.global.pm, addr, len);
+        let result = self.sys_munmap_raw(addr, len);
         if result.is_ok() {
             self.clear_file_mappings_for_range(addr.as_usize(), len);
         }
         result
+    }
+
+    /// Raw munmap without clearing file_mappings — used internally by the
+    /// patching logic to avoid deadlocks (the patch path holds elf_patch_cache).
+    #[inline]
+    fn sys_munmap_raw(&self, addr: crate::MutPtr<u8>, len: usize) -> Result<(), Errno> {
+        litebox_common_linux::mm::sys_munmap(&self.global.pm, addr, len)
     }
 
     /// Clear `file_mappings` entries for any segments that overlap the
@@ -675,6 +682,53 @@ impl<FS: ShimFS> Task<FS> {
         (true, file_offset, vaddr, trampoline_size)
     }
 
+    /// Apply the trap fallback to a mapped code segment: replace all `syscall`
+    /// instructions with traps (`ICEBP;HLT`), then restore RX.
+    ///
+    /// If `already_rw` is true, the segment is assumed to already be writable
+    /// and the initial mprotect RW is skipped.
+    ///
+    /// Panics on infrastructure failures (mprotect/read/write/disassembly).
+    fn apply_trap_fallback(&self, mapped_addr: crate::MutPtr<u8>, len: usize, already_rw: bool) {
+        if !already_rw {
+            self.sys_mprotect_raw(
+                mapped_addr,
+                len,
+                ProtFlags::PROT_READ | ProtFlags::PROT_WRITE,
+            )
+            .expect("fatal: failed to mprotect code segment RW for trap fallback");
+        }
+
+        // Read, patch using the rewriter (proper disassembly), write back.
+        let Some(code_owned) = mapped_addr.to_owned_slice(len) else {
+            panic!("fatal: failed to read code segment for trap fallback");
+        };
+        let mut code_buf = code_owned.into_vec();
+        let code_vaddr = mapped_addr.as_usize() as u64;
+        let count = litebox_syscall_rewriter::trap_all_syscalls_in_code(&mut code_buf, code_vaddr)
+            .unwrap_or_else(|e| {
+                panic!("fatal: failed to disassemble code segment for trap fallback: {e:?}");
+            });
+        if count > 0 {
+            litebox_util_log::warn!(
+                count:? = count, addr:? = mapped_addr.as_usize(), len:? = len;
+                "applied trap fallback to syscall instructions"
+            );
+        }
+        assert!(
+            mapped_addr.copy_from_slice(0, &code_buf).is_some(),
+            "fatal: failed to write trap bytes back to code segment"
+        );
+
+        // Restore RX.
+        self.sys_mprotect_raw(
+            mapped_addr,
+            len,
+            ProtFlags::PROT_READ | ProtFlags::PROT_EXEC,
+        )
+        .expect("fatal: failed to restore code segment to RX after trap fallback");
+    }
+
     /// Patch an executable segment in-place after it has been mapped.
     ///
     /// For pre-patched binaries: maps the trampoline from the file and writes
@@ -731,7 +785,7 @@ impl<FS: ShimFS> Task<FS> {
                 };
                 let actual_addr = alloc_ptr.as_usize();
                 if actual_addr != tramp_addr {
-                    let _ = self.sys_munmap(MutPtr::<u8>::from_usize(actual_addr), tramp_len);
+                    let _ = self.sys_munmap_raw(MutPtr::<u8>::from_usize(actual_addr), tramp_len);
                     return false;
                 }
 
@@ -742,7 +796,7 @@ impl<FS: ShimFS> Task<FS> {
                 match self.sys_read(fd, &mut tramp_data, Some(file_off)) {
                     Ok(n) if n == tramp_data.len() => {}
                     _ => {
-                        let _ = self.sys_munmap(tramp_ptr, tramp_len);
+                        let _ = self.sys_munmap_raw(tramp_ptr, tramp_len);
                         return false;
                     }
                 }
@@ -754,7 +808,7 @@ impl<FS: ShimFS> Task<FS> {
 
                 // Write to the mapped region.
                 if tramp_ptr.copy_from_slice(0, &tramp_data).is_none() {
-                    let _ = self.sys_munmap(tramp_ptr, tramp_len);
+                    let _ = self.sys_munmap_raw(tramp_ptr, tramp_len);
                     return false;
                 }
 
@@ -767,7 +821,7 @@ impl<FS: ShimFS> Task<FS> {
                     )
                     .is_err()
                 {
-                    let _ = self.sys_munmap(tramp_ptr, tramp_len);
+                    let _ = self.sys_munmap_raw(tramp_ptr, tramp_len);
                     return false;
                 }
 
@@ -804,6 +858,7 @@ impl<FS: ShimFS> Task<FS> {
                 });
             let Ok(actual_addr_ptr) = actual_addr else {
                 litebox_util_log::warn!("failed to allocate trampoline region");
+                self.apply_trap_fallback(mapped_addr, len, false);
                 return true;
             };
             let actual_addr = actual_addr_ptr.as_usize();
@@ -819,7 +874,8 @@ impl<FS: ShimFS> Task<FS> {
                     distance:? = distance;
                     "trampoline too far from code segment, skipping patching"
                 );
-                let _ = self.sys_munmap(MutPtr::<u8>::from_usize(actual_addr), PAGE_SIZE);
+                let _ = self.sys_munmap_raw(MutPtr::<u8>::from_usize(actual_addr), PAGE_SIZE);
+                self.apply_trap_fallback(mapped_addr, len, false);
                 return true;
             }
 
@@ -832,7 +888,8 @@ impl<FS: ShimFS> Task<FS> {
                 .is_none()
             {
                 litebox_util_log::warn!("failed to write syscall entry point to trampoline");
-                let _ = self.sys_munmap(MutPtr::<u8>::from_usize(actual_addr), PAGE_SIZE);
+                let _ = self.sys_munmap_raw(MutPtr::<u8>::from_usize(actual_addr), PAGE_SIZE);
+                self.apply_trap_fallback(mapped_addr, len, false);
                 return true;
             }
             state.trampoline_cursor = 8; // stubs start after the 8-byte entry
@@ -867,8 +924,7 @@ impl<FS: ShimFS> Task<FS> {
                 )
                 .is_err()
         {
-            litebox_util_log::warn!("failed to mprotect trampoline to RW");
-            return true;
+            panic!("fatal: failed to mprotect trampoline to RW");
         }
         if self
             .sys_mprotect_raw(
@@ -878,21 +934,19 @@ impl<FS: ShimFS> Task<FS> {
             )
             .is_err()
         {
-            litebox_util_log::warn!("failed to mprotect code segment to RW for patching");
             restore_trampoline_rx(self, state);
-            return true;
+            panic!("fatal: failed to mprotect code segment to RW for patching");
         }
 
         // Read the mapped code into a buffer, patch it, write back.
         let Some(code_owned) = mapped_addr.to_owned_slice(len) else {
-            litebox_util_log::warn!("failed to read code segment for patching");
             let _ = self.sys_mprotect_raw(
                 mapped_addr,
                 len,
                 ProtFlags::PROT_READ | ProtFlags::PROT_EXEC,
             );
             restore_trampoline_rx(self, state);
-            return true;
+            panic!("fatal: failed to read code segment for patching");
         };
         let mut code_buf = code_owned.into_vec();
         let original_code = code_buf.clone();
@@ -923,11 +977,7 @@ impl<FS: ShimFS> Task<FS> {
             Ok(stubs) if !stubs.is_empty() => {
                 let Some(new_cursor) = state.trampoline_cursor.checked_add(stubs.len()) else {
                     litebox_util_log::warn!("trampoline cursor overflow");
-                    let _ = self.sys_mprotect_raw(
-                        mapped_addr,
-                        len,
-                        ProtFlags::PROT_READ | ProtFlags::PROT_EXEC,
-                    );
+                    self.apply_trap_fallback(mapped_addr, len, true);
                     restore_trampoline_rx(self, state);
                     return true;
                 };
@@ -947,11 +997,7 @@ impl<FS: ShimFS> Task<FS> {
                         .is_err()
                     {
                         litebox_util_log::warn!("failed to expand trampoline region");
-                        let _ = self.sys_mprotect_raw(
-                            mapped_addr,
-                            len,
-                            ProtFlags::PROT_READ | ProtFlags::PROT_EXEC,
-                        );
+                        self.apply_trap_fallback(mapped_addr, len, true);
                         restore_trampoline_rx(self, state);
                         return true;
                     }
@@ -963,19 +1009,17 @@ impl<FS: ShimFS> Task<FS> {
                 let tramp_write_ptr =
                     MutPtr::<u8>::from_usize(state.trampoline_addr + state.trampoline_cursor);
                 if tramp_write_ptr.copy_from_slice(0, &stubs).is_none() {
-                    litebox_util_log::warn!("failed to write trampoline stubs");
                     let _ = self.sys_mprotect_raw(
                         mapped_addr,
                         len,
                         ProtFlags::PROT_READ | ProtFlags::PROT_EXEC,
                     );
                     restore_trampoline_rx(self, state);
-                    return true;
+                    panic!("fatal: failed to write trampoline stubs");
                 }
 
                 // Write patched code back to the mapped region.
                 if mapped_addr.copy_from_slice(0, &code_buf).is_none() {
-                    litebox_util_log::warn!("failed to write patched code back to code segment");
                     let _ = mapped_addr.copy_from_slice(0, &original_code);
                     let _ = self.sys_mprotect_raw(
                         mapped_addr,
@@ -983,7 +1027,7 @@ impl<FS: ShimFS> Task<FS> {
                         ProtFlags::PROT_READ | ProtFlags::PROT_EXEC,
                     );
                     restore_trampoline_rx(self, state);
-                    return true;
+                    panic!("fatal: failed to write patched code back to code segment");
                 }
                 state.trampoline_cursor = new_cursor;
                 state.runtime_patches_committed = true;
@@ -994,18 +1038,14 @@ impl<FS: ShimFS> Task<FS> {
                 // Write back the modified code if it changed.
                 if code_buf != original_code && mapped_addr.copy_from_slice(0, &code_buf).is_none()
                 {
-                    litebox_util_log::warn!("failed to write trap bytes back to code segment");
                     let _ = mapped_addr.copy_from_slice(0, &original_code);
+                    panic!("fatal: failed to write trap bytes back to code segment");
                 }
                 // Fall through to restore RX protections below.
             }
             Err(e) => {
-                litebox_util_log::warn!(err:? = e; "failed to patch code segment");
-                let _ = self.sys_mprotect_raw(
-                    mapped_addr,
-                    len,
-                    ProtFlags::PROT_READ | ProtFlags::PROT_EXEC,
-                );
+                litebox_util_log::warn!(err:? = e; "patch_code_segment failed");
+                self.apply_trap_fallback(mapped_addr, len, true);
                 restore_trampoline_rx(self, state);
                 return true;
             }

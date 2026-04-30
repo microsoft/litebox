@@ -683,6 +683,24 @@ pub fn patch_code_segment(
     }
 }
 
+/// Replace all `syscall` instructions in `code` with trap sequences (`ICEBP; HLT`).
+///
+/// This is the fallback when trampoline-based patching cannot be performed
+/// (e.g. trampoline allocation failed or is too far away).
+///
+/// Returns the number of syscall instructions that were patched.
+pub fn trap_all_syscalls_in_code(code: &mut [u8], code_vaddr: u64) -> Result<usize> {
+    let instructions = decode_section_instructions(Arch::X86_64, code, code_vaddr)?;
+    let mut count = 0;
+    for inst in &instructions {
+        if inst.code() == iced_x86::Code::Syscall {
+            replace_with_trap(code, code_vaddr, inst);
+            count += 1;
+        }
+    }
+    Ok(count)
+}
+
 fn find_addr_for_trampoline_code(file: &object::File<'_>) -> Result<u64> {
     // Find the highest virtual address among all PT_LOAD segments
     let max_virtual_addr = match file {
