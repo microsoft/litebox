@@ -674,7 +674,6 @@ pub fn patch_code_segment(
         code,
         trampoline_write_vaddr,
         syscall_entry_addr,
-        None,
         &mut trampoline_data,
     ) {
         Ok(skipped_addrs) => Ok((trampoline_data, skipped_addrs)),
