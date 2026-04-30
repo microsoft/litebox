@@ -135,6 +135,93 @@ impl Server {
         Arc::new(Mutex::new(HashMap::new()))
     }
 
+    /// Pre-warm the ELF cache by rewriting the specified binaries in a
+    /// background thread.  This is called at broker startup so that the
+    /// first worker connection doesn't pay the ~3s rewriting cost for
+    /// shared libraries like libc.
+    pub fn pre_warm_elf_cache(
+        elf_cache: &Arc<Mutex<ElfCache>>,
+        root: &Path,
+        paths: &[&str],
+    ) {
+        use std::io::{Read, Seek, SeekFrom};
+
+        for rel_path in paths {
+            let full = root.join(rel_path.trim_start_matches('/'));
+            let resolved = match fs::canonicalize(&full) {
+                Ok(p) => p,
+                Err(_) => continue,
+            };
+            let mut file = match fs::File::open(&resolved) {
+                Ok(f) => f,
+                Err(_) => continue,
+            };
+
+            // Check ELF magic
+            let mut magic = [0u8; 4];
+            if file.read_exact(&mut magic).is_err() || &magic != b"\x7fELF" {
+                continue;
+            }
+            let _ = file.seek(SeekFrom::Start(0));
+
+            let current_mtime = match file
+                .metadata()
+                .ok()
+                .and_then(|m| m.modified().ok())
+                .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
+            {
+                Some(d) => d.as_secs() as i64,
+                None => continue,
+            };
+
+            // Already cached?
+            {
+                let cache = mutex_lock(elf_cache, "elf_cache");
+                if let Some((mtime, _)) = cache.get(&resolved) {
+                    if *mtime == current_mtime {
+                        continue;
+                    }
+                }
+            }
+
+            // Quick check for already-patched binary
+            let file_len = file.metadata().map(|m| m.len()).unwrap_or(0);
+            if file_len >= 32 {
+                let mut trailer = [0u8; 8];
+                if file.seek(SeekFrom::End(-32)).is_ok()
+                    && file.read_exact(&mut trailer).is_ok()
+                    && &trailer == litebox_syscall_rewriter::TRAMPOLINE_MAGIC
+                {
+                    let _ = file.seek(SeekFrom::Start(0));
+                    continue;
+                }
+                let _ = file.seek(SeekFrom::Start(0));
+            }
+
+            // Read and rewrite
+            let mut content = Vec::new();
+            if file.read_to_end(&mut content).is_err() {
+                continue;
+            }
+
+            let mut skipped_addrs = Vec::new();
+            if let Ok(patched) = litebox_syscall_rewriter::hook_syscalls_in_elf(
+                &content,
+                None,
+                &mut skipped_addrs,
+            ) {
+                let arc = Arc::new(patched);
+                let mut cache = mutex_lock(elf_cache, "elf_cache");
+                cache.insert(resolved.clone(), (current_mtime, Arc::clone(&arc)));
+                eprintln!(
+                    "[broker] pre-warmed ELF cache: {} ({} bytes)",
+                    resolved.display(),
+                    arc.len(),
+                );
+            }
+        }
+    }
+
     /// Canonicalize `path` and verify it is contained within the server root.
     ///
     /// Returns the canonical path on success, or an `EPERM` error response

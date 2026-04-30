@@ -280,6 +280,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Shared ELF patch cache — persists across connections so that
         // expensive ELF patching is amortized over the broker's lifetime.
         let elf_cache = litebox_broker::nine_p::server::Server::new_elf_cache();
+
+        // Pre-warm the cache with shared libraries that every guest process
+        // loads. Without this, the first worker connection pays ~3s for
+        // libc alone.
+        if cli.rewrite_syscalls {
+            if let Some(ref root_dir) = cli.root_dir {
+                let root = root_dir.canonicalize().unwrap_or_else(|_| root_dir.clone());
+                litebox_broker::nine_p::server::Server::pre_warm_elf_cache(
+                    &elf_cache,
+                    &root,
+                    &[
+                        "/usr/lib/x86_64-linux-gnu/libc.so.6",
+                        "/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2",
+                        "/usr/lib/x86_64-linux-gnu/libstdc++.so.6.0.33",
+                        "/usr/lib/x86_64-linux-gnu/libm.so.6",
+                        "/usr/lib/x86_64-linux-gnu/libgcc_s.so.1",
+                    ],
+                );
+            }
+        }
         let extra_session_slots = Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
         // Accept connections, validating the LBNP handshake before entering the
