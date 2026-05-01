@@ -4,17 +4,17 @@
 //! RingBuffer implementation and functions
 
 use crate::Vtl0PhysMutPtr;
-use alloc::vec::Vec;
 use core::fmt;
 use litebox::mm::linux::PAGE_SIZE;
 use litebox::utils::TruncateExt;
-use litebox_common_linux::vmap::PhysPageAddr;
 use spin::{Mutex, Once};
 use x86_64::PhysAddr;
 
 pub struct RingBuffer {
     rb_pa: PhysAddr,
     write_offset: usize,
+    // TODO: If ring buffers are constrained to page-sized/page-aligned ranges,
+    // wraparound writes can be optimized into a single non-contiguous mapping.
     size: usize,
 }
 
@@ -28,71 +28,63 @@ impl RingBuffer {
     }
 
     pub fn write(&mut self, buf: &[u8]) {
+        if self.size == 0 || buf.is_empty() {
+            return;
+        }
+
         // If the input buffer is longer than the ring buffer, fill the whole ring buffer with
         // the final [ring buffer size] values from the input buffer
-        let (mut ptr, write_buf, next_write_offset) = if buf.len() >= self.size {
-            let write_buf = &buf[(buf.len() - self.size)..];
-            let Ok(ptr) = Vtl0PhysMutPtr::<u8, PAGE_SIZE>::with_contiguous_pages(
+        if buf.len() >= self.size {
+            let single_slice = &buf[(buf.len() - self.size)..];
+            let Ok(mut ptr) = Vtl0PhysMutPtr::<u8, PAGE_SIZE>::with_contiguous_pages(
                 self.rb_pa.as_u64().truncate(),
-                write_buf.len(),
+                single_slice.len(),
             ) else {
                 return;
             };
-            (ptr, write_buf, 0)
-        } else {
-            // Otherwise, calculate if wraparound needed
-            let space_remaining: usize = self.size - self.write_offset;
-            if buf.len() > space_remaining {
-                let write_pa = self.rb_pa + self.write_offset as u64;
-                let write_start = write_pa.align_down(PAGE_SIZE as u64);
-                let write_end = (write_pa + space_remaining as u64).align_up(PAGE_SIZE as u64);
-                let wraparound_end =
-                    (self.rb_pa + (buf.len() - space_remaining) as u64).align_up(PAGE_SIZE as u64);
-                let tail_page_count: usize =
-                    ((write_end - write_start) / PAGE_SIZE as u64).truncate();
-                let wraparound_page_count: usize =
-                    ((wraparound_end - self.rb_pa.align_down(PAGE_SIZE as u64)) / PAGE_SIZE as u64)
-                        .truncate();
-                let mut pages = Vec::with_capacity(tail_page_count + wraparound_page_count);
-                let mut cur_page = write_start;
-                while cur_page < write_end {
-                    let Some(page) = PhysPageAddr::<PAGE_SIZE>::new(cur_page.as_u64().truncate())
-                    else {
-                        return;
-                    };
-                    pages.push(page);
-                    cur_page += PAGE_SIZE as u64;
-                }
-                cur_page = self.rb_pa.align_down(PAGE_SIZE as u64);
-                while cur_page < wraparound_end {
-                    let Some(page) = PhysPageAddr::<PAGE_SIZE>::new(cur_page.as_u64().truncate())
-                    else {
-                        return;
-                    };
-                    pages.push(page);
-                    cur_page += PAGE_SIZE as u64;
-                }
-                let Ok(ptr) = Vtl0PhysMutPtr::<u8, PAGE_SIZE>::new(
-                    &pages,
-                    (write_pa - write_start).truncate(),
-                ) else {
-                    return;
-                };
-                (ptr, buf, (self.write_offset + buf.len()) % self.size)
-            } else {
-                let Ok(ptr) = Vtl0PhysMutPtr::<u8, PAGE_SIZE>::with_contiguous_pages(
-                    (self.rb_pa + self.write_offset as u64).as_u64().truncate(),
-                    buf.len(),
-                ) else {
-                    return;
-                };
-                (ptr, buf, (self.write_offset + buf.len()) % self.size)
+            if unsafe { ptr.write_slice_at_offset(0, single_slice) }.is_err() {
+                return;
             }
-        };
-
-        if unsafe { ptr.write_slice_at_offset(0, write_buf) }.is_ok() {
-            self.write_offset = next_write_offset;
+            self.write_offset = 0;
+            return;
         }
+
+        // Otherwise, calculate if wraparound needed
+        let space_remaining: usize = self.size - self.write_offset;
+        if buf.len() > space_remaining {
+            let first_slice = &buf[..space_remaining];
+            let wraparound_slice = &buf[space_remaining..];
+            let Ok(mut ptr) = Vtl0PhysMutPtr::<u8, PAGE_SIZE>::with_contiguous_pages(
+                (self.rb_pa + self.write_offset as u64).as_u64().truncate(),
+                first_slice.len(),
+            ) else {
+                return;
+            };
+            if unsafe { ptr.write_slice_at_offset(0, first_slice) }.is_err() {
+                return;
+            }
+
+            let Ok(mut ptr) = Vtl0PhysMutPtr::<u8, PAGE_SIZE>::with_contiguous_pages(
+                self.rb_pa.as_u64().truncate(),
+                wraparound_slice.len(),
+            ) else {
+                return;
+            };
+            if unsafe { ptr.write_slice_at_offset(0, wraparound_slice) }.is_err() {
+                return;
+            }
+        } else {
+            let Ok(mut ptr) = Vtl0PhysMutPtr::<u8, PAGE_SIZE>::with_contiguous_pages(
+                (self.rb_pa + self.write_offset as u64).as_u64().truncate(),
+                buf.len(),
+            ) else {
+                return;
+            };
+            if unsafe { ptr.write_slice_at_offset(0, buf) }.is_err() {
+                return;
+            }
+        }
+        self.write_offset = (self.write_offset + buf.len()) % self.size;
     }
 }
 
