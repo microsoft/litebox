@@ -49,7 +49,7 @@ use core::{
 };
 use hashbrown::{HashMap, HashSet};
 use litebox::utils::TruncateExt;
-use litebox_common_linux::errno::Errno;
+use litebox_common_linux::{errno::Errno, vmap::PhysPageAddr};
 use spin::Once;
 use thiserror::Error;
 use x86_64::{
@@ -57,12 +57,8 @@ use x86_64::{
     structures::paging::{PageSize, PhysFrame, Size4KiB, frame::PhysFrameRange},
 };
 use x509_cert::{Certificate, der::Decode};
-use zerocopy::{FromBytes, FromZeros, Immutable, IntoBytes, KnownLayout};
+use zerocopy::{FromBytes, FromZeros, IntoBytes};
 use zeroize::Zeroizing;
-
-#[derive(Copy, Clone, FromBytes, Immutable, KnownLayout)]
-#[repr(align(4096))]
-struct AlignedPage([u8; PAGE_SIZE]);
 
 // For now, we do not validate large kernel modules due to the VTL1's memory size limitation.
 const MODULE_VALIDATION_MAX_SIZE: usize = 64 * 1024 * 1024;
@@ -129,7 +125,7 @@ pub fn mshv_vsm_boot_aps(cpu_online_mask_pfn: u64) -> Result<i64, VsmError> {
         .ok_or(VsmError::InvalidPhysicalAddress)?;
 
     let mut cpu_mask_ptr = Vtl0PhysConstPtr::<CpuMask, PAGE_SIZE>::with_usize(
-        cpu_online_mask_page_addr.as_u64().truncate(),
+        cpu_online_mask_page_addr.as_u64().trunc(),
     )
     .map_err(|_| VsmError::CpuOnlineMaskCopyFailed)?;
     let cpu_mask =
@@ -850,7 +846,7 @@ fn copy_heki_patch_from_vtl0(patch_pa_0: u64, patch_pa_1: u64) -> Result<HekiPat
         || (patch_pa_0.align_up(Size4KiB::SIZE) == patch_pa_1.align_down(Size4KiB::SIZE))
     {
         let mut ptr =
-            Vtl0PhysConstPtr::<HekiPatch, PAGE_SIZE>::with_usize(patch_pa_0.as_u64().truncate())
+            Vtl0PhysConstPtr::<HekiPatch, PAGE_SIZE>::with_usize(patch_pa_0.as_u64().trunc())
                 .map_err(|_| VsmError::Vtl0CopyFailed)?;
         unsafe { ptr.read_at_offset(0) }
             .map(|boxed| *boxed)
@@ -858,24 +854,21 @@ fn copy_heki_patch_from_vtl0(patch_pa_0: u64, patch_pa_1: u64) -> Result<HekiPat
     } else {
         let mut heki_patch = HekiPatch::new_zeroed();
         let heki_patch_bytes = heki_patch.as_mut_bytes();
+        let pages = [
+            PhysPageAddr::<PAGE_SIZE>::new(
+                patch_pa_0.align_down(Size4KiB::SIZE).as_u64().trunc(),
+            )
+            .ok_or(VsmError::Vtl0CopyFailed)?,
+            PhysPageAddr::<PAGE_SIZE>::new(patch_pa_1.as_u64().trunc())
+                .ok_or(VsmError::Vtl0CopyFailed)?,
+        ];
+        let mut ptr = Vtl0PhysConstPtr::<u8, PAGE_SIZE>::new(
+            &pages,
+            (patch_pa_0 - patch_pa_0.align_down(Size4KiB::SIZE)).trunc(),
+        )
+        .map_err(|_| VsmError::Vtl0CopyFailed)?;
         unsafe {
-            let mut first_ptr = Vtl0PhysConstPtr::<u8, PAGE_SIZE>::with_contiguous_pages(
-                patch_pa_0.as_u64().truncate(),
-                bytes_in_first_page,
-            )
-            .map_err(|_| VsmError::Vtl0CopyFailed)?;
-            first_ptr
-                .read_slice_at_offset(0, heki_patch_bytes.get_unchecked_mut(..bytes_in_first_page))
-                .map_err(|_| VsmError::Vtl0CopyFailed)?;
-
-            let second_len = core::mem::size_of::<HekiPatch>() - bytes_in_first_page;
-            let mut second_ptr = Vtl0PhysConstPtr::<u8, PAGE_SIZE>::with_contiguous_pages(
-                patch_pa_1.as_u64().truncate(),
-                second_len,
-            )
-            .map_err(|_| VsmError::Vtl0CopyFailed)?;
-            second_ptr
-                .read_slice_at_offset(0, heki_patch_bytes.get_unchecked_mut(bytes_in_first_page..))
+            ptr.read_slice_at_offset(0, heki_patch_bytes)
                 .map_err(|_| VsmError::Vtl0CopyFailed)?;
         }
         Ok(heki_patch)
@@ -905,7 +898,7 @@ fn apply_vtl0_text_patch(heki_patch: HekiPatch) -> Result<(), VsmError> {
         let patch = &heki_patch.code[..usize::from(heki_patch.size)];
         if !patch.is_empty() {
             let mut ptr = Vtl0PhysMutPtr::<u8, PAGE_SIZE>::with_contiguous_pages(
-                heki_patch_pa_0.as_u64().truncate(),
+                heki_patch_pa_0.as_u64().trunc(),
                 patch.len(),
             )
             .map_err(|_| VsmError::Vtl0CopyFailed)?;
@@ -914,23 +907,29 @@ fn apply_vtl0_text_patch(heki_patch: HekiPatch) -> Result<(), VsmError> {
     } else {
         let (patch_first, patch_second) =
             heki_patch.code[..usize::from(heki_patch.size)].split_at(bytes_in_first_page);
+        let pages = [
+            PhysPageAddr::<PAGE_SIZE>::new(
+                heki_patch_pa_0
+                    .align_down(Size4KiB::SIZE)
+                    .as_u64()
+                    .trunc(),
+            )
+            .ok_or(VsmError::Vtl0CopyFailed)?,
+            PhysPageAddr::<PAGE_SIZE>::new(heki_patch_pa_1.as_u64().trunc())
+                .ok_or(VsmError::Vtl0CopyFailed)?,
+        ];
+        let mut ptr = Vtl0PhysMutPtr::<u8, PAGE_SIZE>::new(
+            &pages,
+            (heki_patch_pa_0 - heki_patch_pa_0.align_down(Size4KiB::SIZE)).trunc(),
+        )
+        .map_err(|_| VsmError::Vtl0CopyFailed)?;
 
         if !patch_first.is_empty() {
-            let mut ptr = Vtl0PhysMutPtr::<u8, PAGE_SIZE>::with_contiguous_pages(
-                heki_patch_pa_0.as_u64().truncate(),
-                patch_first.len(),
-            )
-            .map_err(|_| VsmError::Vtl0CopyFailed)?;
             unsafe { ptr.write_slice_at_offset(0, patch_first) }
                 .map_err(|_| VsmError::Vtl0CopyFailed)?;
         }
         if !patch_second.is_empty() {
-            let mut ptr = Vtl0PhysMutPtr::<u8, PAGE_SIZE>::with_contiguous_pages(
-                heki_patch_pa_1.as_u64().truncate(),
-                patch_second.len(),
-            )
-            .map_err(|_| VsmError::Vtl0CopyFailed)?;
-            unsafe { ptr.write_slice_at_offset(0, patch_second) }
+            unsafe { ptr.write_slice_at_offset(patch_first.len(), patch_second) }
                 .map_err(|_| VsmError::Vtl0CopyFailed)?;
         }
     }
@@ -1399,7 +1398,7 @@ fn copy_heki_pages_from_vtl0(pa: u64, nranges: u64) -> Option<Vec<HekiPage>> {
             return None;
         }
         let mut ptr =
-            Vtl0PhysConstPtr::<HekiPage, PAGE_SIZE>::with_usize(next_pa.as_u64().truncate())
+            Vtl0PhysConstPtr::<HekiPage, PAGE_SIZE>::with_usize(next_pa.as_u64().trunc())
                 .ok()?;
         let heki_page = unsafe { ptr.read_at_offset(0) }.ok()?;
         if !heki_page.is_valid() {
@@ -1672,29 +1671,33 @@ impl MemoryContainer {
         phys_start: PhysAddr,
         phys_end: PhysAddr,
     ) -> Result<(), MemoryContainerError> {
-        let mut bytes_to_copy: usize = (phys_end - phys_start).trunc();
-        let mut phys_cur = phys_start;
+        let bytes_to_copy: usize = (phys_end - phys_start).trunc();
+        if bytes_to_copy == 0 {
+            return Ok(());
+        }
 
-        while phys_cur < phys_end {
-            let phys_aligned = phys_cur.align_down(Size4KiB::SIZE);
-            let mut ptr = Vtl0PhysConstPtr::<AlignedPage, PAGE_SIZE>::with_usize(
-                phys_aligned.as_u64().truncate(),
-            )
+        let phys_aligned_start = phys_start.align_down(Size4KiB::SIZE);
+        let phys_aligned_end = phys_end.align_up(Size4KiB::SIZE);
+        let aligned_len: usize = (phys_aligned_end - phys_aligned_start).trunc();
+        let mut pages = Vec::with_capacity(aligned_len.div_ceil(PAGE_SIZE));
+        let mut phys_cur = phys_aligned_start;
+        while phys_cur < phys_aligned_end {
+            pages.push(
+                PhysPageAddr::<PAGE_SIZE>::new(phys_cur.as_u64().trunc())
+                    .ok_or(MemoryContainerError::CopyFromVtl0Failed)?,
+            );
+            phys_cur += PAGE_SIZE as u64;
+        }
+
+        let page_offset: usize = (phys_start - phys_aligned_start).trunc();
+        let mut ptr = Vtl0PhysConstPtr::<u8, PAGE_SIZE>::new(&pages, page_offset)
             .map_err(|_| MemoryContainerError::CopyFromVtl0Failed)?;
-            let page = unsafe { ptr.read_at_offset(0) }
-                .map_err(|_| MemoryContainerError::CopyFromVtl0Failed)?;
 
-            let src_offset: usize = (phys_cur - phys_aligned).trunc();
-            let src_len = core::cmp::min(bytes_to_copy, PAGE_SIZE - src_offset);
-            let src = &page.0[src_offset..src_offset + src_len];
-
-            self.buf.extend_from_slice(src);
-            phys_cur = phys_cur
-                .as_u64()
-                .checked_add(src_len as u64)
-                .and_then(|next| PhysAddr::try_new(next).ok())
-                .ok_or(MemoryContainerError::Overflow)?;
-            bytes_to_copy -= src_len;
+        let old_len = self.buf.len();
+        self.buf.resize(old_len + bytes_to_copy, 0);
+        if unsafe { ptr.read_slice_at_offset(0, &mut self.buf[old_len..]) }.is_err() {
+            self.buf.truncate(old_len);
+            return Err(MemoryContainerError::CopyFromVtl0Failed);
         }
         Ok(())
     }
