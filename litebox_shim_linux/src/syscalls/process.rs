@@ -8763,18 +8763,22 @@ impl<FS: ShimFS> Task<FS> {
             exit_code,
         );
 
+        // Use thread-only exit instead of exit_group.  The vfork child
+        // still shares the parent's Process object (only ProcessState
+        // was detached).  exit_group would mark ALL parent threads as
+        // is_exiting, killing relay threads that bridge pipe data from
+        // the child worker back to the parent.
+        //
+        // exit_thread only marks this thread as exiting, leaving the
+        // parent's threads (including relay threads) alive so they can
+        // finish draining bridge data.
         if exit_code > 255 {
-            let signal = litebox_common_linux::signal::Signal::try_from(exit_code - 256)
-                .expect("worker host reported an invalid signal");
-            self.exit_group(ExitStatus::Signal(signal));
+            // Signal exit: use 128 + signal as the exit code (shell convention).
+            self.exit_thread((exit_code - 256).truncate());
         } else {
-            // The worker ran the guest binary to completion. Terminate this
-            // guest process with the same exit code so the parent sees the
-            // correct status via wait4/SIGCHLD.
-            self.exit_group(ExitStatus::Exit(exit_code.truncate()));
+            self.exit_thread(exit_code.truncate());
         }
 
-        // exit_group triggers process teardown and SIGCHLD to the parent.
         // The syscall handler loop will notice is_exiting and stop running
         // guest code. Return ENOSYS as a placeholder — this path should
         // not be reached in practice.
