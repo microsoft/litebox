@@ -98,9 +98,13 @@ these are reserved for guest use (VS Code captures them). Use
 
 ### Analyzing audit logs
 
-**Always use `litebox_audit_query` for audit log analysis — do NOT parse
-JSONL manually with grep, jq, or Python.** The tool imports the log into
-SQLite and lets you run ad-hoc SQL queries.
+For quick checks, `grep` on the JSONL file is fine (e.g., `grep '"err"' audit.jsonl`).
+
+For deeper analysis — finding needle-in-the-haystack errors, measuring syscall
+latency distributions, or tracing cross-thread interactions — use
+`litebox_audit_query` to import the log into SQLite. This pre-joins enter/exit
+events and lets you run ad-hoc SQL queries (950× faster than grep for indexed
+lookups on large logs).
 
 ```bash
 # Import and query in one step
