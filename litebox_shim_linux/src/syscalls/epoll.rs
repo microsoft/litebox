@@ -54,6 +54,7 @@ pub(crate) enum EpollDescriptor<FS: ShimFS> {
     Socket(Arc<super::net::SocketFd>),
     Pipe(Arc<litebox::pipes::PipeFd<Platform>>),
     Unix(Arc<TypedFd<crate::syscalls::unix::UnixSocketSubsystem<FS>>>),
+    HostPipe(Arc<TypedFd<super::host_pipe::HostPipeSubsystem>>),
 }
 
 impl<FS: ShimFS> EpollDescriptor<FS> {
@@ -69,6 +70,7 @@ impl<FS: ShimFS> EpollDescriptor<FS> {
             Eventfd(Arc<TypedFd<super::eventfd::EventfdSubsystem>>),
             Epoll(Arc<TypedFd<EpollSubsystem<FS>>>),
             Unix(Arc<TypedFd<crate::syscalls::unix::UnixSocketSubsystem<FS>>>),
+            HostPipe(Arc<TypedFd<super::host_pipe::HostPipeSubsystem>>),
         }
 
         let resolved = {
@@ -91,6 +93,10 @@ impl<FS: ShimFS> EpollDescriptor<FS> {
                 rds.fd_from_raw_integer::<super::unix::UnixSocketSubsystem<FS>>(raw_fd)
             {
                 ResolvedFd::Unix(fd)
+            } else if let Ok(fd) =
+                rds.fd_from_raw_integer::<super::host_pipe::HostPipeSubsystem>(raw_fd)
+            {
+                ResolvedFd::HostPipe(fd)
             } else {
                 return Err(Errno::EBADF);
             }
@@ -110,6 +116,7 @@ impl<FS: ShimFS> EpollDescriptor<FS> {
                 EpollDescriptor::Epoll(handle)
             }
             ResolvedFd::Unix(fd) => EpollDescriptor::Unix(fd),
+            ResolvedFd::HostPipe(fd) => EpollDescriptor::HostPipe(fd),
         })
     }
 }
@@ -121,6 +128,7 @@ enum DescriptorRef<FS: ShimFS> {
     Socket(Weak<super::net::SocketFd>),
     Pipe(Weak<litebox::pipes::PipeFd<Platform>>),
     Unix(Weak<TypedFd<crate::syscalls::unix::UnixSocketSubsystem<FS>>>),
+    HostPipe(Weak<TypedFd<super::host_pipe::HostPipeSubsystem>>),
 }
 
 impl<FS: ShimFS> DescriptorRef<FS> {
@@ -132,6 +140,7 @@ impl<FS: ShimFS> DescriptorRef<FS> {
             EpollDescriptor::Socket(socket) => Self::Socket(Arc::downgrade(socket)),
             EpollDescriptor::Pipe(pipe) => Self::Pipe(Arc::downgrade(pipe)),
             EpollDescriptor::Unix(unix) => Self::Unix(Arc::downgrade(unix)),
+            EpollDescriptor::HostPipe(hp) => Self::HostPipe(Arc::downgrade(hp)),
         }
     }
 
@@ -143,6 +152,7 @@ impl<FS: ShimFS> DescriptorRef<FS> {
             DescriptorRef::Socket(socket) => socket.upgrade().map(EpollDescriptor::Socket),
             DescriptorRef::Pipe(pipe) => pipe.upgrade().map(EpollDescriptor::Pipe),
             DescriptorRef::Unix(unix) => unix.upgrade().map(EpollDescriptor::Unix),
+            DescriptorRef::HostPipe(hp) => hp.upgrade().map(EpollDescriptor::HostPipe),
         }
     }
 }
@@ -200,6 +210,10 @@ impl<FS: ShimFS> EpollDescriptor<FS> {
                 let handle = global.litebox.descriptor_table().entry_handle(fd)?;
                 Some(handle.with_entry(|entry| poll(entry)))
             }
+            EpollDescriptor::HostPipe(fd) => {
+                let handle = global.litebox.descriptor_table().entry_handle(fd)?;
+                Some(handle.with_entry(|entry| poll(entry)))
+            }
         }
     }
 
@@ -220,6 +234,7 @@ impl<FS: ShimFS> EpollDescriptor<FS> {
             EpollDescriptor::File(file) => fs
                 .get_io_pollable(file)
                 .is_some_and(|p| p.needs_host_poll()),
+            EpollDescriptor::HostPipe(_) => true,
             _ => false,
         }
     }
@@ -670,6 +685,7 @@ impl EpollEntryKey {
             EpollDescriptor::Socket(socket_fd) => socket_fd.object_id(),
             EpollDescriptor::Pipe(pipe_fd) => pipe_fd.object_id(),
             EpollDescriptor::Unix(unix) => unix.object_id(),
+            EpollDescriptor::HostPipe(hp) => hp.object_id(),
         };
         Self(fd, object_id)
     }

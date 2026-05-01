@@ -4759,6 +4759,8 @@ mod pipe_lifecycle_tests {
             "delayed-write-on-fd" => helper_delayed_write_on_fd(args),
             // Epoll wakeup test: pipe + fork+exec(nonpie) + epoll_wait.
             "epoll-pipe-bridge" => test_epoll_pipe_bridge(args),
+            // Epoll wakeup test for socketpair (ReadWrite HostPipeFd).
+            "epoll-socketpair-bridge" => test_epoll_socketpair_bridge(args),
             other => {
                 eprintln!("unknown pipe-test: {other}");
                 1
@@ -5580,6 +5582,140 @@ mod pipe_lifecycle_tests {
             println!("EPOLL_BRIDGE_ERROR:epoll_wait={nev},errno={}", errno());
             1
         }
+    }
+
+    /// Epoll wakeup test for socketpair bridge (ReadWrite HostPipeFd).
+    ///
+    /// This tests the exact VS Code ptyHost IPC pattern: the parent
+    /// creates an AF_UNIX socketpair, fork+exec's a non-PIE child that
+    /// writes after a delay, and the parent uses epoll_wait to detect
+    /// data on the socketpair.
+    ///
+    /// The socketpair bridge installs a ReadWrite HostPipeFd. If
+    /// check_io_events always returns IN|OUT, epoll_wait never blocks
+    /// and the event loop spins at 100% CPU.
+    ///
+    /// Usage: pipe-test epoll-socketpair-bridge [binary] [delay_ms]
+    fn test_epoll_socketpair_bridge(args: &[String]) -> i32 {
+        let exe = args.get(3).cloned().unwrap_or_else(|| {
+            std::env::current_exe()
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .to_string()
+        });
+        let delay_ms = args.get(4).map(String::as_str).unwrap_or("500");
+
+        let mut fds = [0i32; 2];
+        if unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, fds.as_mut_ptr()) } != 0 {
+            println!("EPOLL_SP_SOCKETPAIR_FAIL:{}", errno());
+            return 1;
+        }
+        eprintln!("[epoll-sp-bridge] socketpair: {}, {}", fds[0], fds[1]);
+
+        let pid = unsafe { libc::fork() };
+        if pid < 0 {
+            println!("EPOLL_SP_FORK_FAIL:{}", errno());
+            return 1;
+        }
+
+        if pid == 0 {
+            // Child: close fd[0], delayed write to fd[1].
+            unsafe { libc::close(fds[0]) };
+            let fd_str = fds[1].to_string();
+            do_execv(
+                &exe,
+                &["pipe-test", "delayed-write-on-fd", &fd_str, delay_ms],
+            );
+        }
+
+        // Parent: close fd[1], epoll_wait on fd[0].
+        unsafe { libc::close(fds[1]) };
+
+        // Set non-blocking for epoll.
+        unsafe {
+            let flags = libc::fcntl(fds[0], libc::F_GETFL);
+            libc::fcntl(fds[0], libc::F_SETFL, flags | libc::O_NONBLOCK);
+        }
+
+        let epfd = unsafe { libc::epoll_create1(0) };
+        if epfd < 0 {
+            println!("EPOLL_SP_EPOLL_FAIL:{}", errno());
+            return 1;
+        }
+
+        let mut ev = libc::epoll_event {
+            events: libc::EPOLLIN as u32,
+            u64: fds[0] as u64,
+        };
+        if unsafe { libc::epoll_ctl(epfd, libc::EPOLL_CTL_ADD, fds[0], &mut ev) } != 0 {
+            println!("EPOLL_SP_CTL_FAIL:{}", errno());
+            return 1;
+        }
+
+        // Count how many times epoll_wait returns with 0 events before
+        // data arrives. If check_io_events is always-ready, epoll_wait
+        // returns immediately each time and spin_count will be huge.
+        let mut spin_count: u32 = 0;
+        let mut events = [libc::epoll_event { events: 0, u64: 0 }; 1];
+        let t0 = std::time::Instant::now();
+        let deadline = t0 + std::time::Duration::from_secs(10);
+
+        loop {
+            let remaining_ms = deadline
+                .saturating_duration_since(std::time::Instant::now())
+                .as_millis()
+                .min(1000) as i32;
+            if remaining_ms == 0 {
+                break;
+            }
+
+            let nev = unsafe { libc::epoll_wait(epfd, events.as_mut_ptr(), 1, remaining_ms) };
+
+            if nev > 0 && (events[0].events & libc::EPOLLIN as u32) != 0 {
+                // Data ready!
+                let elapsed_ms = t0.elapsed().as_millis();
+                let mut buf = [0u8; 256];
+                let n =
+                    unsafe { libc::read(fds[0], buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
+                unsafe {
+                    libc::close(fds[0]);
+                    libc::close(epfd);
+                }
+                wait_child(pid);
+                let data = if n > 0 {
+                    String::from_utf8_lossy(&buf[..n as usize]).to_string()
+                } else {
+                    String::new()
+                };
+                // spin_count should be small (< 10) if epoll blocks correctly.
+                // If always-ready, spin_count will be thousands+.
+                if data.contains("PB_DELAYED_WRITE") && elapsed_ms < 5000 && spin_count < 50 {
+                    println!("EPOLL_SP_OK:{elapsed_ms}ms,spins={spin_count}");
+                    return 0;
+                } else {
+                    println!(
+                        "EPOLL_SP_FAIL:elapsed={elapsed_ms}ms,spins={spin_count},data={}",
+                        data.trim()
+                    );
+                    return 1;
+                }
+            } else if nev == 0 {
+                spin_count += 1;
+            } else {
+                // Error
+                break;
+            }
+        }
+
+        unsafe {
+            libc::close(fds[0]);
+            libc::close(epfd);
+        }
+        wait_child(pid);
+        let elapsed_ms = t0.elapsed().as_millis();
+        println!("EPOLL_SP_TIMEOUT:elapsed={elapsed_ms}ms,spins={spin_count} (wakeup broken)");
+        1
     }
 }
 

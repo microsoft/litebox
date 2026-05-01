@@ -459,4 +459,69 @@ pub(crate) async fn pipe_bridge_tests(r: &mut TestRunner) {
             );
         }
     }
+
+    // ─── PB.epoll_sp: epoll wakeup on socketpair bridge ────────────
+    // Tests the VS Code ptyHost IPC pattern: socketpair (ReadWrite
+    // HostPipeFd) with epoll_wait. Without the check_io_events fix,
+    // epoll_wait returns immediately and the event loop spins.
+    // The test counts spins — if > 50, the fd reports as always-ready.
+    eprintln!("[pipe-bridge] --- PB.epoll_sp (epoll on socketpair bridge) ---");
+    for &agent in PB_AGENTS {
+        let test = format!("PB.epoll_sp.pie.{agent}");
+        let resp = r
+            .send(
+                agent,
+                exec_timeout(
+                    vec![
+                        self_exe.clone(),
+                        "pipe-test".into(),
+                        "epoll-socketpair-bridge".into(),
+                        self_exe.clone(),
+                        "500".into(),
+                    ],
+                    15,
+                ),
+            )
+            .await;
+        let pass = matches!(
+            &resp,
+            Response::ExecResult { exit_code: 0, stdout, .. } if stdout.contains("EPOLL_SP_OK")
+        );
+        r.record(&test, agent, pass, &format!("{resp:?}"));
+    }
+
+    if let Some(ref nonpie_bin) = nonpie {
+        for &agent in PB_AGENTS {
+            let test = format!("PB.epoll_sp.nonpie.{agent}");
+            let resp = r
+                .send(
+                    agent,
+                    exec_timeout(
+                        vec![
+                            self_exe.clone(),
+                            "pipe-test".into(),
+                            "epoll-socketpair-bridge".into(),
+                            nonpie_bin.clone(),
+                            "500".into(),
+                        ],
+                        15,
+                    ),
+                )
+                .await;
+            let pass = matches!(
+                &resp,
+                Response::ExecResult { exit_code: 0, stdout, .. } if stdout.contains("EPOLL_SP_OK")
+            );
+            r.record(&test, agent, pass, &format!("{resp:?}"));
+        }
+    } else {
+        for &agent in PB_AGENTS {
+            r.record(
+                &format!("PB.epoll_sp.nonpie.{agent}"),
+                agent,
+                false,
+                "FAIL: nonpie binary not found — mount at /opt/nonpie",
+            );
+        }
+    }
 }

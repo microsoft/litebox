@@ -97,15 +97,52 @@ impl IOPollable for HostPipeFd {
         _mask: Events,
     ) {
         // Host-pipe FDs do not support asynchronous observer notifications.
-        // Callers should use periodic polling.
+        // Callers should use periodic polling via needs_host_poll().
     }
 
     fn check_io_events(&self) -> Events {
-        match self.direction {
-            HostPipeDirection::Read => Events::IN,
-            HostPipeDirection::Write => Events::OUT,
-            HostPipeDirection::ReadWrite => Events::IN | Events::OUT,
+        // Poll the real host fd to determine readiness instead of always
+        // returning ready.  Without this, epoll_wait(timeout=0) always
+        // reports this fd as ready, causing Node.js's libuv event loop
+        // to spin at 100% CPU.
+        let fd = self.host_fd.load(Ordering::Relaxed);
+        if fd < 0 {
+            return Events::HUP;
         }
+
+        // Use raw poll(2) syscall to check readiness.
+        // struct pollfd { fd: i32, events: i16, revents: i16 }
+        let mut pfd: [u8; 8] = [0; 8];
+        // fd (i32 at offset 0)
+        pfd[0..4].copy_from_slice(&fd.to_ne_bytes());
+        // events (i16 at offset 4): POLLIN(1) | POLLOUT(4)
+        pfd[4..6].copy_from_slice(&5i16.to_ne_bytes());
+        // revents (i16 at offset 6): 0
+        // poll(fds, nfds=1, timeout=0)
+        let ret =
+            unsafe { syscalls::syscall3(syscalls::Sysno::poll, pfd.as_mut_ptr() as usize, 1, 0) };
+        if ret.is_err() || matches!(ret, Ok(0)) {
+            return Events::empty();
+        }
+        let revents = i16::from_ne_bytes([pfd[6], pfd[7]]);
+        let mut events = Events::empty();
+        if revents & 1 != 0 {
+            // POLLIN
+            events |= Events::IN;
+        }
+        if revents & 4 != 0 {
+            // POLLOUT
+            events |= Events::OUT;
+        }
+        if revents & 16 != 0 {
+            // POLLHUP
+            events |= Events::HUP;
+        }
+        if revents & 8 != 0 {
+            // POLLERR
+            events |= Events::ERR;
+        }
+        events
     }
 
     fn needs_host_poll(&self) -> bool {
