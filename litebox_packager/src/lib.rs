@@ -189,7 +189,7 @@ fn run_host_mode(args: CliArgs) -> anyhow::Result<()> {
                 }
                 data
             } else {
-                rewrite_elf(&data, real_path, verbose)?
+                rewrite_elf(&data, real_path, verbose)
             };
 
             let mut entries = Vec::new();
@@ -242,7 +242,7 @@ fn run_host_mode(args: CliArgs) -> anyhow::Result<()> {
             use std::os::unix::fs::MetadataExt as _;
             std::fs::metadata(&inc.host_path).map_or(0o755, |m| m.mode())
         };
-        let rewritten = rewrite_elf(&data, &inc.host_path, args.verbose)?;
+        let rewritten = rewrite_elf(&data, &inc.host_path, args.verbose);
         if args.verbose {
             eprintln!(
                 "  including {} as {}",
@@ -309,7 +309,7 @@ fn run_oci(image_ref: &str, args: &CliArgs) -> anyhow::Result<()> {
                 .with_context(|| format!("failed to read {}", entry.read_path.display()))?;
 
             let rewritten = if entry.is_executable && !no_rewrite.contains(&entry.read_path) {
-                rewrite_elf(&data, &entry.read_path, verbose)?
+                rewrite_elf(&data, &entry.read_path, verbose)
             } else {
                 data
             };
@@ -599,14 +599,13 @@ fn target_elf_machine() -> u16 {
 /// through the rewriter. For actual ELF files, benign rewriter errors (already
 /// hooked, no syscalls, unsupported object, missing `.text`) are treated as
 /// warnings and the original bytes are returned.
-#[allow(clippy::unnecessary_wraps)]
-fn rewrite_elf(data: &[u8], path: &Path, verbose: bool) -> anyhow::Result<Vec<u8>> {
+fn rewrite_elf(data: &[u8], path: &Path, verbose: bool) -> Vec<u8> {
     // Fast-path: skip the rewriter entirely for non-ELF files.
     if data.len() < 4 || data[..4] != ELF_MAGIC {
         if verbose {
             eprintln!("  {} (not ELF, skipping rewrite)", path.display());
         }
-        return Ok(data.to_vec());
+        return data.to_vec();
     }
 
     // Skip ELF files whose architecture doesn't match the target. OCI images
@@ -620,7 +619,7 @@ fn rewrite_elf(data: &[u8], path: &Path, verbose: bool) -> anyhow::Result<Vec<u8
                 path.display()
             );
         }
-        return Ok(data.to_vec());
+        return data.to_vec();
     }
 
     match litebox_syscall_rewriter::hook_syscalls_in_elf(data, None) {
@@ -628,7 +627,7 @@ fn rewrite_elf(data: &[u8], path: &Path, verbose: bool) -> anyhow::Result<Vec<u8
             if verbose {
                 eprintln!("  {} (rewritten)", path.display());
             }
-            Ok(rewritten)
+            rewritten
         }
         Err(e) => {
             // Include the file as-is when rewriting fails. This can happen for
@@ -639,7 +638,7 @@ fn rewrite_elf(data: &[u8], path: &Path, verbose: bool) -> anyhow::Result<Vec<u8
                 "  warning: failed to rewrite {}: {e}; including as-is",
                 path.display()
             );
-            Ok(data.to_vec())
+            data.to_vec()
         }
     }
 }

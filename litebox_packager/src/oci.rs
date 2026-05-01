@@ -380,13 +380,12 @@ fn extract_tar<R: Read>(
     permissions: &mut HashMap<PathBuf, u32>,
 ) -> anyhow::Result<()> {
     let mut archive = tar::Archive::new(reader);
-    // Preserve Unix permissions and xattrs when running on Unix hosts.
-    // On non-Unix platforms these are no-ops or unsupported; permissions are
-    // tracked separately in the `permissions` HashMap from tar headers.
+    // Preserve Unix permissions when running on Unix hosts.
+    // On non-Unix platforms permissions are tracked separately in the
+    // `permissions` HashMap from tar headers.
     #[cfg(unix)]
     {
         archive.set_preserve_permissions(true);
-        archive.set_unpack_xattrs(true);
     }
 
     let mut deferred_links: Vec<DeferredHardLink> = Vec::new();
@@ -532,11 +531,17 @@ fn extract_tar<R: Read>(
         }
 
         // Normal file/directory: use the standard unpack.
-        // If a previous layer recorded a symlink at this path (or any
-        // ancestor recorded symlinks with this path as a prefix), the real
-        // file/directory from an upper layer takes precedence — remove the
-        // stale symlink entries.
-        symlinks.retain(|s| s.rel_path != path && !s.rel_path.starts_with(&path));
+        // If a previous layer recorded a symlink at this path, as a child of
+        // this path, or as an ancestor of this path, the real file/directory
+        // from an upper layer takes precedence — remove the stale symlink
+        // entries. The ancestor check prevents stale symlinks from being
+        // resolved during scan_rootfs and incorrectly pulling in lower-layer
+        // content.
+        symlinks.retain(|s| {
+            s.rel_path != path
+                && !s.rel_path.starts_with(&path)
+                && !path.starts_with(&s.rel_path)
+        });
         entry
             .unpack(&target)
             .with_context(|| format!("failed to unpack entry: {path_str}"))?;
