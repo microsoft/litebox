@@ -347,14 +347,17 @@ fn hook_syscalls_in_section(
         let mut replace_start_idx = 0;
         for inst_id in (0..=i).rev() {
             let prev_inst = &instructions[inst_id];
-            // For x86_32 (no re-encoding support), stop at outgoing control
-            // transfers.  For x86_64 the encoder will fix up relative
-            // displacements, so we only need to respect incoming jump targets.
-            if arch != Arch::X86_64
-                && inst_id != i
-                && prev_inst.flow_control() != iced_x86::FlowControl::Next
-            {
-                break;
+            // For x86_64 the encoder will fix up relative displacements,
+            // so we only need to respect incoming jump targets
+            // — except for call instructions, which must not be relocated
+            // because the return address pushed would point into the trampoline.
+            if inst_id != i {
+                let flow = prev_inst.flow_control();
+                if flow == iced_x86::FlowControl::Call
+                    || flow == iced_x86::FlowControl::IndirectCall
+                {
+                    break;
+                }
             }
             if replace_end - prev_inst.ip() >= 5 {
                 replace_start = Some(prev_inst.ip());
@@ -368,7 +371,6 @@ fn hook_syscalls_in_section(
 
         if replace_start.is_none() {
             match hook_syscall_and_after(
-                arch,
                 control_transfer_targets,
                 section_base_addr,
                 section_data,
@@ -408,7 +410,6 @@ fn hook_syscalls_in_section(
                 bytes
             } else {
                 match hook_syscall_and_after(
-                    arch,
                     control_transfer_targets,
                     section_base_addr,
                     section_data,
@@ -808,7 +809,6 @@ fn reencode_instructions(
 
 #[allow(clippy::too_many_arguments)]
 fn hook_syscall_and_after(
-    arch: Arch,
     control_transfer_targets: &BTreeSet<u64>,
     section_base_addr: u64,
     section_data: &mut [u8],
@@ -831,14 +831,15 @@ fn hook_syscall_and_after(
             // If the next instruction is a control transfer target, we don't want to cross it
             break;
         }
-        // For x86_32 (no re-encoding support), stop at outgoing control
-        // transfers.  For x86_64 the encoder will fix up relative
-        // displacements, so we only need to respect incoming jump targets.
-        if arch != Arch::X86_64
-            && next_inst.code() != syscall_inst.code()
-            && next_inst.flow_control() != iced_x86::FlowControl::Next
-        {
-            break;
+        // For x86_64 the encoder will fix up relative displacements, so we
+        // only need to respect incoming jump targets — except for call instructions,
+        // which must not be relocated because the return address pushed would point
+        // into the trampoline.
+        if next_inst.code() != syscall_inst.code() {
+            let flow = next_inst.flow_control();
+            if flow == iced_x86::FlowControl::Call || flow == iced_x86::FlowControl::IndirectCall {
+                break;
+            }
         }
         let next_end = next_inst.next_ip();
 
