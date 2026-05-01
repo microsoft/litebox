@@ -1,0 +1,10 @@
+[package]
+name = "litebox_audit_query"
+version = "0.1.0"
+edition = "2024"
+description = "CLI tool for importing and querying litebox audit logs via SQLite"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+rusqlite = { version = "0.35", features = ["bundled"] }
+serde_json = "1"

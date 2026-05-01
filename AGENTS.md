@@ -96,6 +96,29 @@ Never write diagnostic output to stdout or stderr from the runner or shim —
 these are reserved for guest use (VS Code captures them). Use
 `debug_log_print` which writes to `/tmp/rst-diag.log`.
 
+### Analyzing audit logs
+
+For quick checks, `grep` on the JSONL file is fine (e.g., `grep '"err"' audit.jsonl`).
+
+For deeper analysis — finding needle-in-the-haystack errors, measuring syscall
+latency distributions, or tracing cross-thread interactions — use
+`litebox_audit_query` to import the log into SQLite. This pre-joins enter/exit
+events and lets you run ad-hoc SQL queries (950× faster than grep for indexed
+lookups on large logs).
+
+```bash
+# Import and query in one step
+litebox_audit_query sql --file /path/to/audit.jsonl \
+  "SELECT syscall, result_err, COUNT(*) AS cnt FROM syscalls WHERE result_err IS NOT NULL GROUP BY syscall, result_err ORDER BY cnt DESC"
+
+# See the full schema and example queries
+litebox_audit_query schema
+```
+
+Key columns: `syscall`, `args` (JSON), `duration_ns`, `result_ok`, `result_err`
+(negated errno), `worker` (host PID), `pid`/`tid` (guest). See `schema` output
+for the complete reference and 10+ ready-to-use queries.
+
 ## Code standards
 
 See the per-crate `CLAUDE.md` / `README.md` files and the repository-wide
