@@ -151,14 +151,7 @@ where
     /// returns `Err(PhysPointerError)`.
     pub fn new(pages: &[PhysPageAddr<ALIGN>], offset: usize) -> Result<Self, PhysPointerError> {
         if core::mem::size_of::<T>() == 0 {
-            return Ok(Self {
-                pages: pages.into(),
-                offset,
-                count: usize::MAX,
-                map_info: None,
-                _type: PhantomData,
-                _provider: PhantomData,
-            });
+            return Err(PhysPointerError::UnsupportedZeroSizedType);
         }
         if offset >= ALIGN {
             return Err(PhysPointerError::InvalidBaseOffset(offset, ALIGN));
@@ -196,9 +189,6 @@ where
     /// This function assumes that `pa`, ..., `pa+bytes` are both physically and virtually contiguous. If not,
     /// later accesses through `PhysMutPtr` may read/write data in a wrong order.
     pub fn with_contiguous_pages(pa: usize, bytes: usize) -> Result<Self, PhysPointerError> {
-        if core::mem::size_of::<T>() == 0 {
-            return Self::new(&[], 0);
-        }
         if bytes < core::mem::size_of::<T>() {
             return Err(PhysPointerError::InsufficientPhysicalPages(
                 bytes,
@@ -246,9 +236,6 @@ where
     where
         T: FromBytes,
     {
-        if core::mem::size_of::<T>() == 0 {
-            return Ok(alloc::boxed::Box::new(T::new_zeroed()));
-        }
         if count >= self.count {
             return Err(PhysPointerError::IndexOutOfBounds(count, self.count));
         }
@@ -289,7 +276,7 @@ where
     where
         T: FromBytes,
     {
-        if core::mem::size_of::<T>() == 0 || values.is_empty() {
+        if values.is_empty() {
             return Ok(());
         }
         if count
@@ -330,9 +317,6 @@ where
         count: usize,
         value: T,
     ) -> Result<(), PhysPointerError> {
-        if core::mem::size_of::<T>() == 0 {
-            return Ok(());
-        }
         if count >= self.count {
             return Err(PhysPointerError::IndexOutOfBounds(count, self.count));
         }
@@ -368,7 +352,7 @@ where
         count: usize,
         values: &[T],
     ) -> Result<(), PhysPointerError> {
-        if core::mem::size_of::<T>() == 0 || values.is_empty() {
+        if values.is_empty() {
             return Ok(());
         }
         if count
