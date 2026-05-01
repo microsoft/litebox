@@ -32,17 +32,20 @@ impl RingBuffer {
             return;
         }
 
+        let write_slice = |pa: PhysAddr, slice: &[u8]| -> bool {
+            Vtl0PhysMutPtr::<u8, PAGE_SIZE>::with_contiguous_pages(
+                pa.as_u64().truncate(),
+                slice.len(),
+            )
+            .and_then(|mut ptr| unsafe { ptr.write_slice_at_offset(0, slice) })
+            .is_ok()
+        };
+
         // If the input buffer is longer than the ring buffer, fill the whole ring buffer with
         // the final [ring buffer size] values from the input buffer
         if buf.len() >= self.size {
             let single_slice = &buf[(buf.len() - self.size)..];
-            let Ok(mut ptr) = Vtl0PhysMutPtr::<u8, PAGE_SIZE>::with_contiguous_pages(
-                self.rb_pa.as_u64().truncate(),
-                single_slice.len(),
-            ) else {
-                return;
-            };
-            if unsafe { ptr.write_slice_at_offset(0, single_slice) }.is_err() {
+            if !write_slice(self.rb_pa, single_slice) {
                 return;
             }
             self.write_offset = 0;
@@ -54,33 +57,13 @@ impl RingBuffer {
         if buf.len() > space_remaining {
             let first_slice = &buf[..space_remaining];
             let wraparound_slice = &buf[space_remaining..];
-            let Ok(mut ptr) = Vtl0PhysMutPtr::<u8, PAGE_SIZE>::with_contiguous_pages(
-                (self.rb_pa + self.write_offset as u64).as_u64().truncate(),
-                first_slice.len(),
-            ) else {
-                return;
-            };
-            if unsafe { ptr.write_slice_at_offset(0, first_slice) }.is_err() {
-                return;
-            }
-
-            let Ok(mut ptr) = Vtl0PhysMutPtr::<u8, PAGE_SIZE>::with_contiguous_pages(
-                self.rb_pa.as_u64().truncate(),
-                wraparound_slice.len(),
-            ) else {
-                return;
-            };
-            if unsafe { ptr.write_slice_at_offset(0, wraparound_slice) }.is_err() {
+            if !write_slice(self.rb_pa + self.write_offset as u64, first_slice)
+                || !write_slice(self.rb_pa, wraparound_slice)
+            {
                 return;
             }
         } else {
-            let Ok(mut ptr) = Vtl0PhysMutPtr::<u8, PAGE_SIZE>::with_contiguous_pages(
-                (self.rb_pa + self.write_offset as u64).as_u64().truncate(),
-                buf.len(),
-            ) else {
-                return;
-            };
-            if unsafe { ptr.write_slice_at_offset(0, buf) }.is_err() {
+            if !write_slice(self.rb_pa + self.write_offset as u64, buf) {
                 return;
             }
         }
