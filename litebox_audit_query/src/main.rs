@@ -152,11 +152,11 @@ const CREATE_TABLE: &str = "\
 CREATE TABLE IF NOT EXISTS syscalls (
     seq         INTEGER NOT NULL,
     worker      INTEGER NOT NULL,
-    pid         INTEGER,
-    tid         INTEGER,
+    pid         INTEGER NOT NULL,
+    tid         INTEGER NOT NULL,
     syscall     TEXT NOT NULL,
-    args        TEXT,
-    enter_ts    INTEGER,
+    args        TEXT NOT NULL,
+    enter_ts    INTEGER NOT NULL,
     exit_ts     INTEGER,
     duration_ns INTEGER,
     result_ok   INTEGER,
@@ -304,7 +304,7 @@ fn import(jsonl_path: &Path, db_path: &Path) -> Result<ImportStats, String> {
                                 tid,
                                 syscall,
                                 "[]",
-                                rusqlite::types::Null,
+                                0i64, // enter_ts unknown
                                 ts,
                                 rusqlite::types::Null,
                                 result_ok,
@@ -326,7 +326,7 @@ fn import(jsonl_path: &Path, db_path: &Path) -> Result<ImportStats, String> {
                             tid,
                             syscall,
                             args,
-                            rusqlite::types::Null,
+                            0i64, // enter_ts unknown
                             rusqlite::types::Null,
                             rusqlite::types::Null,
                             result_ok,
@@ -491,15 +491,15 @@ fn print_schema() {
 {CREATE_INDEXES};
 
 Column reference:
-  seq         - Monotonic sequence number (unique per worker)
-  worker      - Host OS PID of the runner process (disambiguates across SSH retries)
-  pid         - Guest virtual PID
-  tid         - Guest virtual TID (important for Node.js worker threads)
-  syscall     - Syscall name: "openat", "read", "connect", "other" (with flags for name)
-  args        - JSON array of arguments from the entry event
-  enter_ts    - Monotonic nanoseconds at syscall entry
+  seq         - Monotonic sequence number (unique per worker)          NOT NULL
+  worker      - Host OS PID of the runner process                      NOT NULL
+  pid         - Guest virtual PID                                      NOT NULL
+  tid         - Guest virtual TID (important for Node.js worker threads) NOT NULL
+  syscall     - Syscall name: "openat", "read", "connect", "other"    NOT NULL
+  args        - JSON array of arguments from the entry event           NOT NULL
+  enter_ts    - Monotonic nanoseconds at syscall entry (0 if unknown)  NOT NULL
   exit_ts     - Monotonic nanoseconds at syscall exit (NULL if never returned)
-  duration_ns - exit_ts - enter_ts (NULL if never returned)
+  duration_ns - exit_ts - enter_ts (NULL if no exit or no entry timing)
   result_ok   - Value from {{"ok": N}} on success (NULL on error or no exit)
   result_err  - Value from {{"err": N}} = negated errno on failure (NULL on success)
 
