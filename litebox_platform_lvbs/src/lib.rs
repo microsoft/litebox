@@ -451,19 +451,18 @@ type UserMutPtr<T> =
 pub struct Vtl0PhysMapProvider;
 
 impl<const ALIGN: usize> PhysMapProvider<ALIGN> for Vtl0PhysMapProvider {
-    fn validate_unowned(&self, pages: &PhysPageAddrArray<ALIGN>) -> Result<(), PhysPointerError> {
+    fn validate_unowned(pages: &PhysPageAddrArray<ALIGN>) -> Result<(), PhysPointerError> {
         VmapManager::validate_unowned(crate::platform_low(), pages)
     }
 
     unsafe fn vmap(
-        &self,
         pages: &PhysPageAddrArray<ALIGN>,
         perms: PhysPageMapPermissions,
     ) -> Result<PhysPageMapInfo<ALIGN>, PhysPointerError> {
         unsafe { VmapManager::vmap(crate::platform_low(), pages, perms) }
     }
 
-    unsafe fn vunmap(&self, map_info: PhysPageMapInfo<ALIGN>) -> Result<(), PhysPointerError> {
+    unsafe fn vunmap(map_info: PhysPageMapInfo<ALIGN>) -> Result<(), PhysPointerError> {
         unsafe { VmapManager::vunmap(crate::platform_low(), map_info) }
     }
 }
