@@ -1506,7 +1506,7 @@ impl SessionIdPool {
 pub struct NormalWorldVmapProvider;
 
 impl<const ALIGN: usize> PhysMapProvider<ALIGN> for NormalWorldVmapProvider {
-    fn validate_unowned(&self, pages: &PhysPageAddrArray<ALIGN>) -> Result<(), PhysPointerError> {
+    fn validate_unowned(pages: &PhysPageAddrArray<ALIGN>) -> Result<(), PhysPointerError> {
         litebox_common_linux::vmap::VmapManager::validate_unowned(
             litebox_platform_multiplex::platform(),
             pages,
@@ -1514,7 +1514,6 @@ impl<const ALIGN: usize> PhysMapProvider<ALIGN> for NormalWorldVmapProvider {
     }
 
     unsafe fn vmap(
-        &self,
         pages: &PhysPageAddrArray<ALIGN>,
         perms: PhysPageMapPermissions,
     ) -> Result<PhysPageMapInfo<ALIGN>, PhysPointerError> {
@@ -1527,7 +1526,7 @@ impl<const ALIGN: usize> PhysMapProvider<ALIGN> for NormalWorldVmapProvider {
         }
     }
 
-    unsafe fn vunmap(&self, map_info: PhysPageMapInfo<ALIGN>) -> Result<(), PhysPointerError> {
+    unsafe fn vunmap(map_info: PhysPageMapInfo<ALIGN>) -> Result<(), PhysPointerError> {
         unsafe {
             litebox_common_linux::vmap::VmapManager::vunmap(
                 litebox_platform_multiplex::platform(),
