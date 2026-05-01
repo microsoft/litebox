@@ -4754,6 +4754,11 @@ mod pipe_lifecycle_tests {
             "write-on-fd" => helper_write_on_fd(args),
             "read-on-fd" => helper_read_on_fd(args),
             "echo-on-fd" => helper_echo_on_fd(args),
+            // Delayed write: wait N ms, then write to fd.
+            // Used as child in epoll-pipe-bridge test.
+            "delayed-write-on-fd" => helper_delayed_write_on_fd(args),
+            // Epoll wakeup test: pipe + fork+exec(nonpie) + epoll_wait.
+            "epoll-pipe-bridge" => test_epoll_pipe_bridge(args),
             other => {
                 eprintln!("unknown pipe-test: {other}");
                 1
@@ -5404,6 +5409,176 @@ mod pipe_lifecycle_tests {
         } else {
             eprintln!("[echo-on-fd] echoed {n} bytes");
             0
+        }
+    }
+
+    /// Delayed write: sleep for N ms, then write to fd(s).
+    /// Usage: pipe-test delayed-write-on-fd <fd>[,<fd>,...] [delay_ms]
+    fn helper_delayed_write_on_fd(args: &[String]) -> i32 {
+        let fd_arg = args.get(3).map(String::as_str).unwrap_or("3");
+        let delay_ms: u64 = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(500);
+        let fds: Vec<i32> = fd_arg.split(',').filter_map(|s| s.parse().ok()).collect();
+
+        eprintln!("[delayed-write] sleeping {delay_ms}ms before writing to fds {fd_arg}");
+        std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+
+        let mut ok = true;
+        for &fd in &fds {
+            let msg = format!("PB_DELAYED_WRITE:fd={fd}\n");
+            // Safety: fd is a valid fd inherited from the parent.
+            let n = unsafe { libc::write(fd, msg.as_ptr() as *const libc::c_void, msg.len()) };
+            if n < 0 {
+                eprintln!(
+                    "[delayed-write] write(fd={fd}) failed: {}",
+                    std::io::Error::last_os_error()
+                );
+                ok = false;
+            } else {
+                eprintln!("[delayed-write] wrote {} bytes to fd {fd}", n);
+            }
+            // Safety: fd is a valid fd.
+            unsafe { libc::close(fd) };
+        }
+        if ok { 0 } else { 1 }
+    }
+
+    /// Epoll wakeup test for pipe bridge across fork+exec.
+    ///
+    /// Tests the VS Code ptyHost pattern: parent creates a pipe,
+    /// fork+exec's a child that writes after a delay, and the parent
+    /// uses epoll_wait (blocking, with timeout) to detect the data.
+    ///
+    /// If the pipe bridge's relay thread doesn't wake the epoll Pollee,
+    /// epoll_wait returns 0 (timeout) even though data arrived.
+    ///
+    /// Usage: pipe-test epoll-pipe-bridge [binary] [delay_ms]
+    fn test_epoll_pipe_bridge(args: &[String]) -> i32 {
+        let exe = args.get(3).cloned().unwrap_or_else(|| {
+            std::env::current_exe()
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .to_string()
+        });
+        let delay_ms = args.get(4).map(String::as_str).unwrap_or("200");
+
+        let mut pipe_fds = [0i32; 2];
+        // Safety: pipe_fds is a valid array.
+        if unsafe { libc::pipe(pipe_fds.as_mut_ptr()) } != 0 {
+            println!("EPOLL_BRIDGE_PIPE_FAIL:{}", errno());
+            return 1;
+        }
+        eprintln!(
+            "[epoll-bridge] pipe: read={}, write={}",
+            pipe_fds[0], pipe_fds[1]
+        );
+
+        // Safety: fork() is safe (no threads in test binary).
+        let pid = unsafe { libc::fork() };
+        if pid < 0 {
+            println!("EPOLL_BRIDGE_FORK_FAIL:{}", errno());
+            return 1;
+        }
+
+        if pid == 0 {
+            // Child: close read end, exec with delayed write.
+            // Safety: pipe_fds[0] is a valid fd from pipe().
+            unsafe { libc::close(pipe_fds[0]) };
+            let wfd_str = pipe_fds[1].to_string();
+            do_execv(
+                &exe,
+                &["pipe-test", "delayed-write-on-fd", &wfd_str, delay_ms],
+            );
+        }
+
+        // Parent: close write end.
+        // Safety: pipe_fds[1] is a valid fd from pipe().
+        unsafe { libc::close(pipe_fds[1]) };
+
+        // Set read end non-blocking for epoll.
+        // Safety: pipe_fds[0] is a valid fd.
+        unsafe {
+            let flags = libc::fcntl(pipe_fds[0], libc::F_GETFL);
+            libc::fcntl(pipe_fds[0], libc::F_SETFL, flags | libc::O_NONBLOCK);
+        }
+
+        // Create epoll and add the pipe read end.
+        // Safety: standard epoll creation.
+        let epfd = unsafe { libc::epoll_create1(0) };
+        if epfd < 0 {
+            println!("EPOLL_BRIDGE_EPOLL_FAIL:{}", errno());
+            return 1;
+        }
+
+        let mut ev = libc::epoll_event {
+            events: libc::EPOLLIN as u32,
+            u64: pipe_fds[0] as u64,
+        };
+        // Safety: epfd and pipe_fds[0] are valid fds, ev is valid.
+        if unsafe { libc::epoll_ctl(epfd, libc::EPOLL_CTL_ADD, pipe_fds[0], &mut ev) } != 0 {
+            println!("EPOLL_BRIDGE_CTL_FAIL:{}", errno());
+            return 1;
+        }
+
+        // epoll_wait with 10s timeout. The child writes after delay_ms.
+        // If wakeup works, we should get EPOLLIN within delay_ms + margin.
+        // If broken, we'll hit the 10s timeout.
+        let mut events = [libc::epoll_event { events: 0, u64: 0 }; 1];
+        let t0 = std::time::Instant::now();
+        // Safety: epfd is valid, events buffer is valid.
+        let nev = unsafe { libc::epoll_wait(epfd, events.as_mut_ptr(), 1, 10_000) };
+        let elapsed_ms = t0.elapsed().as_millis();
+
+        // Safety: epfd and pipe_fds[0] are valid fds.
+        unsafe {
+            libc::close(epfd);
+        }
+
+        if nev > 0 && (events[0].events & libc::EPOLLIN as u32) != 0 {
+            // Read the data.
+            let mut buf = [0u8; 256];
+            // Safety: pipe_fds[0] is valid, buf is valid.
+            let n = unsafe {
+                libc::read(
+                    pipe_fds[0],
+                    buf.as_mut_ptr() as *mut libc::c_void,
+                    buf.len(),
+                )
+            };
+            // Safety: pipe_fds[0] is valid.
+            unsafe { libc::close(pipe_fds[0]) };
+            wait_child(pid);
+
+            let data = if n > 0 {
+                String::from_utf8_lossy(&buf[..n as usize]).to_string()
+            } else {
+                String::new()
+            };
+
+            if data.contains("PB_DELAYED_WRITE") && elapsed_ms < 5000 {
+                println!("EPOLL_BRIDGE_OK:{elapsed_ms}ms");
+                0
+            } else {
+                println!(
+                    "EPOLL_BRIDGE_FAIL:data={},elapsed={elapsed_ms}ms",
+                    data.trim()
+                );
+                1
+            }
+        } else if nev == 0 {
+            // Safety: pipe_fds[0] is valid.
+            unsafe { libc::close(pipe_fds[0]) };
+            wait_child(pid);
+            println!(
+                "EPOLL_BRIDGE_TIMEOUT:epoll_wait returned 0 after {elapsed_ms}ms (wakeup broken)"
+            );
+            1
+        } else {
+            // Safety: pipe_fds[0] is valid.
+            unsafe { libc::close(pipe_fds[0]) };
+            wait_child(pid);
+            println!("EPOLL_BRIDGE_ERROR:epoll_wait={nev},errno={}", errno());
+            1
         }
     }
 }

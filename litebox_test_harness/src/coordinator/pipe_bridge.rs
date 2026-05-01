@@ -395,4 +395,68 @@ pub(crate) async fn pipe_bridge_tests(r: &mut TestRunner) {
             );
         }
     }
+
+    // ─── PB.epoll: epoll wakeup on pipe bridge ─────────────────────
+    // Tests the VS Code ptyHost pattern: parent uses epoll_wait to
+    // detect data from a child worker. If the bridge relay doesn't
+    // wake the epoll Pollee, the parent blocks until timeout.
+    eprintln!("[pipe-bridge] --- PB.epoll (epoll wakeup on pipe bridge) ---");
+    for &agent in PB_AGENTS {
+        let test = format!("PB.epoll.pie.{agent}");
+        let resp = r
+            .send(
+                agent,
+                exec_timeout(
+                    vec![
+                        self_exe.clone(),
+                        "pipe-test".into(),
+                        "epoll-pipe-bridge".into(),
+                        self_exe.clone(),
+                        "200".into(),
+                    ],
+                    15,
+                ),
+            )
+            .await;
+        let pass = matches!(
+            &resp,
+            Response::ExecResult { exit_code: 0, stdout, .. } if stdout.contains("EPOLL_BRIDGE_OK")
+        );
+        r.record(&test, agent, pass, &format!("{resp:?}"));
+    }
+
+    if let Some(ref nonpie_bin) = nonpie {
+        for &agent in PB_AGENTS {
+            let test = format!("PB.epoll.nonpie.{agent}");
+            let resp = r
+                .send(
+                    agent,
+                    exec_timeout(
+                        vec![
+                            self_exe.clone(),
+                            "pipe-test".into(),
+                            "epoll-pipe-bridge".into(),
+                            nonpie_bin.clone(),
+                            "200".into(),
+                        ],
+                        15,
+                    ),
+                )
+                .await;
+            let pass = matches!(
+                &resp,
+                Response::ExecResult { exit_code: 0, stdout, .. } if stdout.contains("EPOLL_BRIDGE_OK")
+            );
+            r.record(&test, agent, pass, &format!("{resp:?}"));
+        }
+    } else {
+        for &agent in PB_AGENTS {
+            r.record(
+                &format!("PB.epoll.nonpie.{agent}"),
+                agent,
+                false,
+                "FAIL: nonpie binary not found — mount at /opt/nonpie",
+            );
+        }
+    }
 }
