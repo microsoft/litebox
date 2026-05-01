@@ -186,7 +186,6 @@ fn find_c_test_files(dir: &str) -> Vec<PathBuf> {
     files
 }
 
-#[cfg(target_arch = "x86_64")]
 #[test]
 fn test_dynamic_lib_with_rewriter() {
     for path in find_c_test_files("./tests") {
