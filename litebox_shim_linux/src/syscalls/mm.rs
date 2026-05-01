@@ -17,6 +17,10 @@ use litebox_common_linux::{MRemapFlags, MapFlags, ProtFlags, errno::Errno};
 use crate::MutPtr;
 use crate::ShimFS;
 use crate::Task;
+use litebox::utils::TruncateExt as _;
+
+#[cfg(not(target_pointer_width = "64"))]
+compile_error!("ELF patching code assumes 64-bit pointers (u64 <-> usize is lossless)");
 
 /// ELF program header type for loadable segments.
 const PT_LOAD: u32 = 1;
@@ -32,30 +36,30 @@ const ET_DYN: u16 = 3;
 /// We will revisit it in the future.
 pub(crate) struct ElfPatchState {
     /// Whether this file is already pre-patched (trampoline magic found at file tail).
-    pub pre_patched: bool,
+    pre_patched: bool,
     /// For pre-patched binaries: file offset and size of the trampoline data.
-    pub trampoline_file_offset: u64,
-    pub trampoline_file_size: usize,
+    trampoline_file_offset: u64,
+    trampoline_file_size: usize,
     /// Start address of the trampoline region (runtime).
-    pub trampoline_addr: usize,
+    trampoline_addr: usize,
     /// Current write position within the trampoline (byte offset from `trampoline_addr`).
-    pub trampoline_cursor: usize,
+    trampoline_cursor: usize,
     /// Whether the trampoline region has been allocated.
-    pub trampoline_mapped: bool,
+    trampoline_mapped: bool,
     /// Total number of trampoline bytes currently mapped.
-    pub trampoline_mapped_len: usize,
+    trampoline_mapped_len: usize,
     /// Whether any runtime-generated stubs were successfully linked from code
     /// in this fd to the trampoline.
-    pub runtime_patches_committed: bool,
+    runtime_patches_committed: bool,
     /// Tracks file-backed mappings for this fd as (vaddr, len) pairs.
     /// Used to find mappings that need patching when mprotect adds PROT_EXEC.
     /// Cleared on munmap to allow re-patching.
-    pub file_mappings: BTreeSet<(usize, usize)>,
+    file_mappings: BTreeSet<(usize, usize)>,
     /// Ranges that have already been patched by the runtime rewriter.
     /// This is a performance guard only — re-running the rewriter on
     /// already-patched code is safe because the second run will not see
     /// syscall instructions. Cleared on munmap alongside file_mappings.
-    pub patched_ranges: BTreeSet<(usize, usize)>,
+    patched_ranges: BTreeSet<(usize, usize)>,
 }
 
 /// Per-process collection of ELF patching state, keyed by fd number.
@@ -148,6 +152,10 @@ impl<FS: ShimFS> Task<FS> {
             let mut cache = self.global.elf_patch_cache.lock();
             if let Some(state) = cache.get_mut(&fd) {
                 let mapping_key = (result.as_usize(), len);
+                // Overlapping entries are safe here: file_mappings is only used
+                // to know which (addr, len) ranges belong to this fd so we can
+                // patch them later if mprotect adds PROT_EXEC.  Duplicates or
+                // overlaps are harmless — the patching logic is idempotent.
                 state.file_mappings.insert(mapping_key);
             }
         }
@@ -549,7 +557,6 @@ impl<FS: ShimFS> Task<FS> {
     /// segment is being mapped so we can look up its `p_vaddr`.
     ///
     /// x86_64 only: assumes 64-bit ELF layout and program header offsets.
-    #[allow(clippy::cast_possible_truncation)]
     fn init_elf_patch_state(&self, fd: i32, mapped_addr: usize, file_offset: usize) {
         // Quick check: skip if already initialized.
         if self.global.elf_patch_cache.lock().contains_key(&fd) {
@@ -569,7 +576,7 @@ impl<FS: ShimFS> Task<FS> {
         }
 
         // Parse as 64-bit ELF (runtime patching is x86-64 only).
-        let e_phoff = u64::from_le_bytes(ehdr_buf[32..40].try_into().unwrap()) as usize;
+        let e_phoff = u64::from_le_bytes(ehdr_buf[32..40].try_into().unwrap()).truncate();
         let e_phentsize = u16::from_le_bytes(ehdr_buf[54..56].try_into().unwrap()) as usize;
         let e_phnum = u16::from_le_bytes(ehdr_buf[56..58].try_into().unwrap()) as usize;
         let e_type = u16::from_le_bytes(ehdr_buf[16..18].try_into().unwrap());
@@ -603,7 +610,7 @@ impl<FS: ShimFS> Task<FS> {
             if p_type != PT_LOAD {
                 continue;
             }
-            let p_offset = u64::from_le_bytes(ph[8..16].try_into().unwrap()) as usize;
+            let p_offset: usize = u64::from_le_bytes(ph[8..16].try_into().unwrap()).truncate();
             let p_vaddr = u64::from_le_bytes(ph[16..24].try_into().unwrap());
             let p_memsz = u64::from_le_bytes(ph[40..48].try_into().unwrap());
             let Some(end) = p_vaddr.checked_add(p_memsz) else {
@@ -620,7 +627,7 @@ impl<FS: ShimFS> Task<FS> {
             if base_addr.is_none()
                 && align_down(p_offset, PAGE_SIZE) == align_down(file_offset, PAGE_SIZE)
             {
-                base_addr = Some(mapped_addr.wrapping_sub(p_vaddr as usize));
+                base_addr = Some(mapped_addr.wrapping_sub(p_vaddr.truncate()));
             }
         }
 
@@ -645,9 +652,10 @@ impl<FS: ShimFS> Task<FS> {
                         "fatal: pre-patched ET_DYN binary but cannot determine load base address"
                     );
                 };
-                base + tramp_vaddr as usize
+                let vaddr: usize = tramp_vaddr.truncate();
+                base + vaddr
             } else {
-                tramp_vaddr as usize
+                tramp_vaddr.truncate()
             }
         } else {
             let base = if e_type == ET_DYN {
@@ -655,7 +663,8 @@ impl<FS: ShimFS> Task<FS> {
             } else {
                 0
             };
-            base + (max_load_end as usize).next_multiple_of(PAGE_SIZE)
+            let max_end: usize = max_load_end.truncate();
+            base + max_end.next_multiple_of(PAGE_SIZE)
         };
 
         // Insert under lock (re-check for races).
@@ -663,7 +672,7 @@ impl<FS: ShimFS> Task<FS> {
         cache.entry(fd).or_insert(ElfPatchState {
             pre_patched,
             trampoline_file_offset: tramp_file_offset,
-            trampoline_file_size: tramp_file_size as usize,
+            trampoline_file_size: tramp_file_size.truncate(),
             trampoline_addr: trampoline_vaddr,
             trampoline_cursor: 0,
             trampoline_mapped: false,
@@ -757,7 +766,6 @@ impl<FS: ShimFS> Task<FS> {
     /// pre-patched binary's trampoline could not be set up — the caller must
     /// fail the mapping because the code already contains JMPs to the
     /// trampoline address.
-    #[allow(clippy::cast_possible_truncation)]
     fn maybe_patch_exec_segment(
         &self,
         mapped_addr: MutPtr<u8>,
@@ -809,7 +817,7 @@ impl<FS: ShimFS> Task<FS> {
 
                 // Read trampoline data from the file.
                 let mut tramp_data = alloc::vec![0u8; state.trampoline_file_size];
-                let file_off = state.trampoline_file_offset as usize;
+                let file_off = state.trampoline_file_offset.truncate();
                 let tramp_ptr = MutPtr::<u8>::from_usize(tramp_addr);
                 match self.sys_read(fd, &mut tramp_data, Some(file_off)) {
                     Ok(n) if n == tramp_data.len() => {}
