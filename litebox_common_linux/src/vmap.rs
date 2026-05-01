@@ -8,8 +8,8 @@ use thiserror::Error;
 ///
 /// `ALIGN`: The page frame size.
 ///
-/// This provider exists to service `litebox_shim_optee::ptr::PhysMutPtr` and
-/// `litebox_shim_optee::ptr::PhysConstPtr`. It can benefit other modules which need
+/// This provider exists to service [`crate::physical_pointers::PhysMutPtr`] and
+/// [`crate::physical_pointers::PhysConstPtr`]. It can benefit other modules which need
 /// Linux kernel's `vmap()` and `vunmap()` functionalities (e.g., HVCI/HEKI, drivers).
 pub trait VmapManager<const ALIGN: usize> {
     /// Map the given `PhysPageAddrArray` into virtually contiguous addresses with the given
