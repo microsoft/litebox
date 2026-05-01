@@ -537,6 +537,85 @@ pub fn build_audit_event(
             ev.flags(&debug_str[..name_end]);
             ev
         }
+
+        // --- fd-bearing syscalls that need explicit logging ---
+        SyscallRequest::Fstat { fd, .. } => {
+            let mut ev = AuditEvent::new("fstat");
+            ev.fd(*fd);
+            ev
+        }
+        SyscallRequest::Newfstatat {
+            dirfd, pathname, ..
+        } => {
+            let mut ev = AuditEvent::new("newfstatat");
+            ev.fd(*dirfd);
+            if let Some(p) = pathname.to_cstring() {
+                ev.path(p.to_str().unwrap_or("?"));
+            }
+            ev
+        }
+        SyscallRequest::Fcntl { fd, arg } => {
+            let mut ev = AuditEvent::new("fcntl");
+            ev.fd(*fd);
+            let debug_str = alloc::format!("{arg:?}");
+            let name_end = debug_str.find([' ', '(']).unwrap_or(debug_str.len());
+            ev.flags(&debug_str[..name_end]);
+            ev
+        }
+        SyscallRequest::EpollCtl { epfd, op, fd, .. } => {
+            let mut ev = AuditEvent::new("epoll_ctl");
+            ev.fd(*epfd);
+            ev.int(*fd as u64);
+            let debug_str = alloc::format!("{op:?}");
+            let name_end = debug_str.find([' ', '(']).unwrap_or(debug_str.len());
+            ev.flags(&debug_str[..name_end]);
+            ev
+        }
+        SyscallRequest::EpollCreate { flags, .. } => {
+            let mut ev = AuditEvent::new("epoll_create");
+            ev.int(u64::from(flags.bits()));
+            ev
+        }
+        SyscallRequest::EpollPwait { epfd, timeout, .. } => {
+            let mut ev = AuditEvent::new("epoll_pwait");
+            ev.fd(*epfd);
+            // timeout is a TimeParam which isn't directly castable
+            let debug_str = alloc::format!("{timeout:?}");
+            ev.flags(&debug_str);
+            ev
+        }
+        SyscallRequest::Getsockopt {
+            sockfd,
+            level,
+            optname,
+            ..
+        } => {
+            let mut ev = AuditEvent::new("getsockopt");
+            ev.fd(*sockfd);
+            ev.int(u64::from(*level));
+            ev.int(u64::from(*optname));
+            ev
+        }
+        SyscallRequest::Getsockname { sockfd, .. } => {
+            let mut ev = AuditEvent::new("getsockname");
+            ev.fd(*sockfd);
+            ev
+        }
+        SyscallRequest::Getpeername { sockfd, .. } => {
+            let mut ev = AuditEvent::new("getpeername");
+            ev.fd(*sockfd);
+            ev
+        }
+        SyscallRequest::Dup { oldfd, .. } => {
+            let mut ev = AuditEvent::new("dup");
+            ev.fd(*oldfd);
+            ev
+        }
+        SyscallRequest::Pipe2 { flags, .. } => {
+            let mut ev = AuditEvent::new("pipe2");
+            ev.int(flags.bits() as u64);
+            ev
+        }
         other => {
             // Extract the variant name from the Debug representation.
             // `SyscallRequest::Gettid` debugs as "Gettid", `SyscallRequest::Fcntl { fd, arg }`
