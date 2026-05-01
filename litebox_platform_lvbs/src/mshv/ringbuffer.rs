@@ -62,10 +62,8 @@ impl RingBuffer {
             {
                 return;
             }
-        } else {
-            if !write_slice(self.rb_pa + self.write_offset as u64, buf) {
-                return;
-            }
+        } else if !write_slice(self.rb_pa + self.write_offset as u64, buf) {
+            return;
         }
         self.write_offset = (self.write_offset + buf.len()) % self.size;
     }
