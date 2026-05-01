@@ -58,6 +58,7 @@ use x86_64::{
 };
 use x509_cert::{Certificate, der::Decode};
 use zerocopy::{FromBytes, FromZeros, Immutable, IntoBytes, KnownLayout};
+use zeroize::Zeroizing;
 
 #[derive(Copy, Clone, FromBytes, Immutable, KnownLayout)]
 #[repr(align(4096))]
@@ -909,9 +910,9 @@ fn mshv_vsm_set_platform_root_key(key_pa: u64) -> Result<i64, VsmError> {
 
     let key_pa = PhysAddr::try_new(key_pa).map_err(|_| VsmError::InvalidPhysicalAddress)?;
 
-    let mut keybuf = [0u8; PRK_LEN];
-    if unsafe { crate::platform_low().copy_slice_from_vtl0_phys(key_pa, &mut keybuf) } {
-        set_platform_root_key(&keybuf);
+    let mut keybuf = Zeroizing::new([0u8; PRK_LEN]);
+    if unsafe { crate::platform_low().copy_slice_from_vtl0_phys(key_pa, &mut *keybuf) } {
+        set_platform_root_key(&*keybuf);
         Ok(0)
     } else {
         Err(VsmError::Vtl0CopyFailed)

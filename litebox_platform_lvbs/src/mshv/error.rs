@@ -152,9 +152,6 @@ pub enum VsmError {
 
     #[error("symbol name contains invalid UTF-8")]
     SymbolNameInvalidUtf8,
-
-    #[error("root key is invalid")]
-    PlatformRootKeyInvalid,
 }
 
 impl From<VerificationError> for VsmError {
@@ -220,8 +217,7 @@ impl From<VsmError> for Errno {
             | VsmError::SymbolNameInvalidUtf8
             | VsmError::SymbolNameNoTerminator
             | VsmError::CertificateDerLengthInvalid { .. }
-            | VsmError::CertificateParseFailed
-            | VsmError::PlatformRootKeyInvalid => Errno::EINVAL,
+            | VsmError::CertificateParseFailed => Errno::EINVAL,
 
             // Signature verification failures delegate to VerificationError's Errno mapping
             VsmError::SignatureVerificationFailed(e) => Errno::from(e),

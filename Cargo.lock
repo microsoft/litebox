@@ -1572,6 +1572,7 @@ dependencies = [
  "x509-cert",
  "x86_64",
  "zerocopy",
+ "zeroize",
 ]
 
 [[package]]

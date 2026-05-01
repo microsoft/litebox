@@ -7,6 +7,7 @@ use crate::{
     Errno, HostInterface, arch::ioport::serial_print_string,
     host::per_cpu_variables::with_per_cpu_variables,
 };
+use zeroize::Zeroizing;
 
 pub type LvbsLinuxKernel = crate::LinuxKernel<HostLvbsInterface>;
 
@@ -129,9 +130,9 @@ static PRK_ONCE: spin::Once<[u8; PRK_LEN]> = spin::Once::new();
 pub fn set_platform_root_key(key: &[u8]) {
     assert_eq!(key.len(), PRK_LEN, "Platform Root Key length mismatch");
     PRK_ONCE.call_once(|| {
-        let mut prk = [0u8; PRK_LEN];
+        let mut prk = Zeroizing::new([0u8; PRK_LEN]);
         prk.copy_from_slice(key);
-        prk
+        *prk
     });
 }
 
