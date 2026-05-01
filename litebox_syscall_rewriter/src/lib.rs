@@ -130,6 +130,17 @@ pub fn hook_syscalls_in_elf(
         }
     }
 
+    // Quick check for the LITEBOX0 magic trailer BEFORE the expensive
+    // full-binary copy + parse.  Pre-rewritten binaries (e.g. from a
+    // Docker build step) have the trampoline already embedded.
+    // The trailer is in the last 32 bytes (64-bit) or 20 bytes (32-bit).
+    if input_binary.len() >= 32 {
+        let trailer_start = input_binary.len() - 32;
+        if &input_binary[trailer_start..trailer_start + 8] == TRAMPOLINE_MAGIC {
+            return Err(Error::AlreadyHooked);
+        }
+    }
+
     // Make a single mutable, 8-byte-aligned copy of the input binary. This serves as both the
     // parse buffer (object::File::parse requires 8-byte alignment) and the output buffer for
     // in-place patching. We use a Vec<u64> to guarantee alignment, then view it as bytes.

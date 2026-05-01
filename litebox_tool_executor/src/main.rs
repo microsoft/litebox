@@ -73,6 +73,13 @@ struct Cli {
     #[arg(long = "forward-port")]
     forward_port: Vec<String>,
 
+    /// Pre-load a tar archive into the in-memory filesystem layer (tar_ro).
+    /// Files in the tar are served from memory, bypassing 9P. Misses fall
+    /// through to 9P normally. Use this with directory rootfs to cache
+    /// frequently-read files (e.g. node binary, shared libraries).
+    #[arg(long = "cache-tar", value_name = "PATH", value_hint = clap::ValueHint::FilePath)]
+    cache_tar: Option<std::path::PathBuf>,
+
     /// Run the litebox runner under gdbserver for remote debugging.
     /// The runner listens on the specified port (default: 9999) for GDB
     /// remote connections. Connect from the host with:
@@ -503,6 +510,11 @@ fn runner_command(
     if rootfs_is_dir {
         // Directory rootfs: program loads from 9P, not from a tar file.
         // The broker serves the directory; the runner connects via --nine-p-broker.
+        // If a cache tar is provided, pre-load it into the tar_ro layer
+        // so files in the tar are served from memory (bypassing 9P).
+        if let Some(ref cache_tar) = cli.cache_tar {
+            cmd.arg("--initial-files").arg(cache_tar);
+        }
     } else {
         // Tar rootfs: runner extracts the tar and loads the program from it.
         cmd.arg("--initial-files").arg(&cli.rootfs);

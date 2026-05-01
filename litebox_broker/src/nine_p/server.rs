@@ -79,6 +79,10 @@ pub struct Server {
     rewrite_syscalls: bool,
     /// Cache of patched ELF data, keyed by canonical path.
     elf_cache: Arc<Mutex<ElfCache>>,
+    /// Cache of canonical path resolutions. Maps raw path → (canonical path, qid).
+    /// Avoids repeated `fs::canonicalize` + `fs::metadata` calls in `handle_walk`.
+    /// Invalidated on mutations (unlink, rename, mkdir, symlink, write).
+    canonical_cache: Mutex<HashMap<PathBuf, (PathBuf, fcall::Qid)>>,
     /// Optional audit log for structured policy events.
     audit_log: Option<crate::audit::AuditLog>,
 }
@@ -121,6 +125,7 @@ impl Server {
             msize: AtomicU32::new(4 * 1024 * 1024),
             rewrite_syscalls,
             elf_cache,
+            canonical_cache: Mutex::new(HashMap::new()),
             audit_log: None,
         }
     }
@@ -135,6 +140,93 @@ impl Server {
         Arc::new(Mutex::new(HashMap::new()))
     }
 
+    /// Pre-warm the ELF cache by rewriting the specified binaries in a
+    /// background thread.  This is called at broker startup so that the
+    /// first worker connection doesn't pay the ~3s rewriting cost for
+    /// shared libraries like libc.
+    pub fn pre_warm_elf_cache(
+        elf_cache: &Arc<Mutex<ElfCache>>,
+        root: &Path,
+        paths: &[&str],
+    ) {
+        use std::io::{Read, Seek, SeekFrom};
+
+        for rel_path in paths {
+            let full = root.join(rel_path.trim_start_matches('/'));
+            let resolved = match fs::canonicalize(&full) {
+                Ok(p) => p,
+                Err(_) => continue,
+            };
+            let mut file = match fs::File::open(&resolved) {
+                Ok(f) => f,
+                Err(_) => continue,
+            };
+
+            // Check ELF magic
+            let mut magic = [0u8; 4];
+            if file.read_exact(&mut magic).is_err() || &magic != b"\x7fELF" {
+                continue;
+            }
+            let _ = file.seek(SeekFrom::Start(0));
+
+            let current_mtime = match file
+                .metadata()
+                .ok()
+                .and_then(|m| m.modified().ok())
+                .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
+            {
+                Some(d) => d.as_secs() as i64,
+                None => continue,
+            };
+
+            // Already cached?
+            {
+                let cache = mutex_lock(elf_cache, "elf_cache");
+                if let Some((mtime, _)) = cache.get(&resolved) {
+                    if *mtime == current_mtime {
+                        continue;
+                    }
+                }
+            }
+
+            // Quick check for already-patched binary
+            let file_len = file.metadata().map(|m| m.len()).unwrap_or(0);
+            if file_len >= 32 {
+                let mut trailer = [0u8; 8];
+                if file.seek(SeekFrom::End(-32)).is_ok()
+                    && file.read_exact(&mut trailer).is_ok()
+                    && &trailer == litebox_syscall_rewriter::TRAMPOLINE_MAGIC
+                {
+                    let _ = file.seek(SeekFrom::Start(0));
+                    continue;
+                }
+                let _ = file.seek(SeekFrom::Start(0));
+            }
+
+            // Read and rewrite
+            let mut content = Vec::new();
+            if file.read_to_end(&mut content).is_err() {
+                continue;
+            }
+
+            let mut skipped_addrs = Vec::new();
+            if let Ok(patched) = litebox_syscall_rewriter::hook_syscalls_in_elf(
+                &content,
+                None,
+                &mut skipped_addrs,
+            ) {
+                let arc = Arc::new(patched);
+                let mut cache = mutex_lock(elf_cache, "elf_cache");
+                cache.insert(resolved.clone(), (current_mtime, Arc::clone(&arc)));
+                eprintln!(
+                    "[broker] pre-warmed ELF cache: {} ({} bytes)",
+                    resolved.display(),
+                    arc.len(),
+                );
+            }
+        }
+    }
+
     /// Canonicalize `path` and verify it is contained within the server root.
     ///
     /// Returns the canonical path on success, or an `EPERM` error response
@@ -147,6 +239,41 @@ impl Server {
         } else {
             Err(libc::EPERM as u32)
         }
+    }
+
+    /// Invalidate canonical path cache entries at or under `path`.
+    /// Called on mutations (unlink, rename, mkdir, symlink, write).
+    fn invalidate_canonical_cache(&self, path: &Path) {
+        let mut cache = mutex_lock(&self.canonical_cache, "canonical_cache");
+        cache.retain(|k, _| !k.starts_with(path));
+    }
+
+    /// Cached canonicalize + metadata lookup for walk steps.
+    /// Returns (canonical_path, qid) or None on failure.
+    fn cached_canonicalize(&self, raw_path: &Path) -> Option<(PathBuf, fcall::Qid)> {
+        // Check cache first
+        {
+            let cache = mutex_lock(&self.canonical_cache, "canonical_cache");
+            if let Some((canonical, qid)) = cache.get(raw_path) {
+                return Some((canonical.clone(), *qid));
+            }
+        }
+
+        // Cache miss — do the real work
+        let canonical = fs::canonicalize(raw_path).ok()?;
+        if !canonical.starts_with(&self.root) {
+            return None;
+        }
+        let meta = fs::metadata(&canonical).ok()?;
+        let qid = metadata_to_qid(&meta);
+
+        // Store in cache
+        let mut cache = mutex_lock(&self.canonical_cache, "canonical_cache");
+        // Limit cache size to prevent unbounded growth
+        if cache.len() < 10_000 {
+            cache.insert(raw_path.to_path_buf(), (canonical.clone(), qid));
+        }
+        Some((canonical, qid))
     }
 
     /// Fast containment check when the path is already canonical (from walk).
@@ -736,9 +863,10 @@ impl Server {
 
             // Canonicalize to follow symlinks. This resolves the real path
             // so subsequent walk steps work correctly even through symlinks.
-            let resolved = match fs::canonicalize(&next) {
-                Ok(p) => p,
-                Err(_) => break,
+            // Uses the canonical cache to avoid repeated host FS calls.
+            let (resolved, qid) = match self.cached_canonicalize(&next) {
+                Some(r) => r,
+                None => break,
             };
 
             // Containment check on the resolved (real) path
@@ -746,15 +874,8 @@ impl Server {
                 break;
             }
 
-            // Use metadata (follows symlinks) for the QID so the client sees
-            // the target type (dir/file), not the symlink itself.
-            match fs::metadata(&resolved) {
-                Ok(meta) => {
-                    wqids.push(metadata_to_qid(&meta));
-                    current_path = resolved;
-                }
-                Err(_) => break,
-            }
+            wqids.push(qid);
+            current_path = resolved;
         }
 
         // Per 9P spec: if no names were walked, return error
@@ -986,6 +1107,7 @@ impl Server {
                 state.readlink_path = None;
 
                 let msize = self.msize.load(Ordering::Acquire);
+                self.invalidate_canonical_cache(&resolved_target);
                 Fcall::Rlcreate(fcall::Rlcreate {
                     qid,
                     iounit: msize - fcall::IOHDRSZ,
@@ -1353,7 +1475,10 @@ impl Server {
         }
 
         match path_to_qid(&target) {
-            Ok(qid) => Fcall::Rmkdir(fcall::Rmkdir { qid }),
+            Ok(qid) => {
+                self.invalidate_canonical_cache(&target);
+                Fcall::Rmkdir(fcall::Rmkdir { qid })
+            }
             Err(errno) => error_response(errno),
         }
     }
@@ -1401,7 +1526,10 @@ impl Server {
         };
 
         match result {
-            Ok(()) => Fcall::Runlinkat(fcall::Runlinkat {}),
+            Ok(()) => {
+                self.invalidate_canonical_cache(&target);
+                Fcall::Runlinkat(fcall::Runlinkat {})
+            }
             Err(e) => io_error_response(e),
         }
     }
@@ -1464,7 +1592,9 @@ impl Server {
             Ok(()) => {
                 // Update the FID's path to the new location
                 let mut state = write_lock(&src_arc, "fid");
-                state.path = dst;
+                state.path = dst.clone();
+                self.invalidate_canonical_cache(&resolved_src);
+                self.invalidate_canonical_cache(&dst);
                 Fcall::Rrename(fcall::Rrename {})
             }
             Err(e) => io_error_response(e),
@@ -1534,7 +1664,11 @@ impl Server {
         }
 
         match fs::rename(&src, &dst) {
-            Ok(()) => Fcall::Rrenameat(fcall::Rrenameat {}),
+            Ok(()) => {
+                self.invalidate_canonical_cache(&src);
+                self.invalidate_canonical_cache(&dst);
+                Fcall::Rrenameat(fcall::Rrenameat {})
+            }
             Err(e) => io_error_response(e),
         }
     }
@@ -1697,6 +1831,22 @@ impl Server {
             }
         }
 
+        // Quick check: if the binary is already patched (has LITEBOX0 magic
+        // trailer), skip the expensive full-file read + scan. Pre-rewritten
+        // binaries on disk are served as-is through 9P.
+        let file_len = file.metadata().ok()?.len();
+        if file_len >= 32 {
+            let mut trailer = [0u8; 8];
+            if file.seek(SeekFrom::End(-32)).is_ok()
+                && file.read_exact(&mut trailer).is_ok()
+                && &trailer == litebox_syscall_rewriter::TRAMPOLINE_MAGIC
+            {
+                let _ = file.seek(SeekFrom::Start(0));
+                return None;
+            }
+            let _ = file.seek(SeekFrom::Start(0));
+        }
+
         // Read the full file
         let mut content = Vec::new();
         file.seek(SeekFrom::Start(0)).ok()?;
@@ -1719,6 +1869,7 @@ impl Server {
         }
 
         let mut skipped_addrs = Vec::new();
+        let start = std::time::Instant::now();
         let patched = match litebox_syscall_rewriter::hook_syscalls_in_elf(
             &content,
             None,
@@ -1730,6 +1881,24 @@ impl Server {
                 return None;
             }
         };
+        let elapsed = start.elapsed();
+
+        // Write timing to diagnostic log.
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open("/tmp/rst-diag.log")
+        {
+            use std::io::Write;
+            let _ = writeln!(
+                f,
+                "[perf] broker hook_syscalls_in_elf({}, {} bytes): {}.{:03}s",
+                path.display(),
+                content.len(),
+                elapsed.as_secs(),
+                elapsed.subsec_millis(),
+            );
+        }
 
         debug!(
             path = %path.display(),

@@ -306,8 +306,26 @@ fn initial_program_data(
 ) -> Result<alloc::borrow::Cow<'static, [u8]>> {
     if rewrite_syscalls {
         let mut skipped_addrs = Vec::new();
+        let start = std::time::Instant::now();
         match litebox_syscall_rewriter::hook_syscalls_in_elf(file.data, None, &mut skipped_addrs) {
             Ok(data) => {
+                let elapsed = start.elapsed();
+                // Write to /tmp/rst-diag.log (same as other litebox diagnostics)
+                if let Ok(mut f) = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open("/tmp/rst-diag.log")
+                {
+                    use std::io::Write;
+                    let _ = writeln!(
+                        f,
+                        "[perf] hook_syscalls_in_elf({}, {} bytes): {}.{:03}s",
+                        program_path.display(),
+                        file.data.len(),
+                        elapsed.as_secs(),
+                        elapsed.subsec_millis(),
+                    );
+                }
                 if !skipped_addrs.is_empty() {
                     eprintln!(
                         "warning: {} has {} unpatchable syscall instruction(s) at {:?}",
