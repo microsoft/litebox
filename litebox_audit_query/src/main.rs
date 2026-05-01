@@ -149,7 +149,7 @@ fn should_reimport(jsonl_path: &Path, db_path: &Path) -> bool {
 // ─── Schema ──────────────────────────────────────────────────────────
 
 const CREATE_TABLE: &str = "\
-CREATE TABLE IF NOT EXISTS syscalls (
+CREATE TABLE syscalls (
     seq         INTEGER NOT NULL,
     worker      INTEGER NOT NULL,
     pid         INTEGER NOT NULL,
@@ -165,9 +165,9 @@ CREATE TABLE IF NOT EXISTS syscalls (
 )";
 
 const CREATE_INDEXES: &str = "\
-CREATE INDEX IF NOT EXISTS idx_syscall ON syscalls(syscall);
-CREATE INDEX IF NOT EXISTS idx_errors ON syscalls(result_err) WHERE result_err IS NOT NULL;
-CREATE INDEX IF NOT EXISTS idx_worker_seq ON syscalls(worker, seq)";
+CREATE INDEX idx_syscall ON syscalls(syscall);
+CREATE INDEX idx_errors ON syscalls(result_err) WHERE result_err IS NOT NULL;
+CREATE INDEX idx_worker_seq ON syscalls(worker, seq)";
 
 fn create_schema(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute_batch(CREATE_TABLE)?;
@@ -225,7 +225,7 @@ fn import(jsonl_path: &Path, db_path: &Path) -> Result<ImportStats, String> {
     {
         let mut insert_stmt = tx
             .prepare(
-                "INSERT OR REPLACE INTO syscalls \
+                "INSERT INTO syscalls \
                  (seq, worker, pid, tid, syscall, args, enter_ts, exit_ts, duration_ns, result_ok, result_err) \
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             )
@@ -295,44 +295,17 @@ fn import(jsonl_path: &Path, db_path: &Path) -> Result<ImportStats, String> {
                             ])
                             .map_err(|e| format!("insert matched: {e}"))?;
                     } else {
-                        // Exit without enter (log started mid-syscall).
-                        insert_stmt
-                            .execute(params![
-                                seq,
-                                worker,
-                                pid,
-                                tid,
-                                syscall,
-                                "[]",
-                                0i64, // enter_ts unknown
-                                ts,
-                                rusqlite::types::Null,
-                                result_ok,
-                                result_err,
-                            ])
-                            .map_err(|e| format!("insert exit-only: {e}"))?;
+                        // Exit without matching enter — unexpected. Count
+                        // and skip rather than manufacturing fake data.
+                        eprintln!(
+                            "warning: exit event seq={seq} worker={worker} has no matching enter, skipping"
+                        );
+                        stats.orphan_count += 1;
                     }
                 }
                 _ => {
-                    // Legacy format: single event (no phase field).
-                    // Import as a complete row with no timing data.
-                    let args = v["args"].to_string();
-                    let (result_ok, result_err) = parse_result(&v["result"]);
-                    insert_stmt
-                        .execute(params![
-                            seq,
-                            worker,
-                            pid,
-                            tid,
-                            syscall,
-                            args,
-                            0i64, // enter_ts unknown
-                            rusqlite::types::Null,
-                            rusqlite::types::Null,
-                            result_ok,
-                            result_err,
-                        ])
-                        .map_err(|e| format!("insert legacy: {e}"))?;
+                    // No "phase" field — unexpected format. Skip.
+                    eprintln!("warning: event with unknown phase {:?}, skipping", phase);
                 }
             }
         }
@@ -342,7 +315,7 @@ fn import(jsonl_path: &Path, db_path: &Path) -> Result<ImportStats, String> {
     {
         let mut insert_orphan = tx
             .prepare(
-                "INSERT OR REPLACE INTO syscalls \
+                "INSERT INTO syscalls \
                  (seq, worker, pid, tid, syscall, args, enter_ts, exit_ts, duration_ns, result_ok, result_err) \
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, NULL, NULL, NULL)",
             )
@@ -497,9 +470,9 @@ Column reference:
   tid         - Guest virtual TID (important for Node.js worker threads) NOT NULL
   syscall     - Syscall name: "openat", "read", "connect", "other"    NOT NULL
   args        - JSON array of arguments from the entry event           NOT NULL
-  enter_ts    - Monotonic nanoseconds at syscall entry (0 if unknown)  NOT NULL
+  enter_ts    - Monotonic nanoseconds at syscall entry                  NOT NULL
   exit_ts     - Monotonic nanoseconds at syscall exit (NULL if never returned)
-  duration_ns - exit_ts - enter_ts (NULL if no exit or no entry timing)
+  duration_ns - exit_ts - enter_ts (NULL if never returned)
   result_ok   - Value from {{"ok": N}} on success (NULL on error or no exit)
   result_err  - Value from {{"err": N}} = negated errno on failure (NULL on success)
 
