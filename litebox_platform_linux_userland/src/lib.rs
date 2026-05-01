@@ -2,6 +2,22 @@
 // Licensed under the MIT license.
 
 //! A [LiteBox platform](../litebox/platform/index.html) for running LiteBox on userland Linux.
+//!
+//! ## Host fd range conventions
+//!
+//! Worker processes use three disjoint fd ranges to prevent collisions
+//! between bridge fds and infrastructure fds during `posix_spawn`:
+//!
+//! | Range     | Owner                 | Constant               |
+//! |-----------|-----------------------|------------------------|
+//! | 0–2       | stdio                 | —                      |
+//! | 3–99      | guest bridge targets  | (posix_spawn dup2)     |
+//! | 100–199   | parent bridge fds     | `PARENT_BRIDGE_FD_MIN` |
+//! | 200–499   | child bridge host fds | `WORKER_BRIDGE_FD_MIN` |
+//! | 500+      | infrastructure fds    | `INFRA_FD_MIN`         |
+//!
+//! **All new fd allocation must respect these ranges.** Use the named
+//! constants below — never hardcode fd minimums.
 
 // Restrict this crate to only work on Linux. For now, we are restricting this to only x86/x86-64
 // Linux, but we _may_ allow for more in the future, if we find it useful to do so.
@@ -36,6 +52,24 @@ use zerocopy::{FromBytes, IntoBytes};
 mod syscall_intercept;
 
 extern crate alloc;
+
+// ─── Host fd range constants ─────────────────────────────────────────
+// See module-level docs for the full range table.
+
+/// Minimum fd number for parent-side bridge fds (socketpair ends kept
+/// by the parent after spawning a child worker).  Used by `dup_host_fd`.
+pub const PARENT_BRIDGE_FD_MIN: i32 = 100;
+
+/// Minimum fd number for bridge host fds inherited by the child worker
+/// process.  Used by `spawn_worker_host_for_exec` when dup'ing
+/// extra_fds before `posix_spawn`.
+pub const WORKER_BRIDGE_FD_MIN: i32 = 200;
+
+/// Minimum fd number for infrastructure fds (memfd exec image, result
+/// pipe, interpreter fd).  These are relocated here before building
+/// `posix_spawn` file actions so that bridge dup2 actions (which target
+/// guest fd numbers 3-99) cannot clobber them.
+pub const INFRA_FD_MIN: i32 = 500;
 
 /// Flag used to defer seccomp filter activation until inside `init_handler`,
 /// after `wrgsbase` has set up gs_base in the run_thread_arch assembly.
@@ -1236,9 +1270,9 @@ impl LinuxUserland {
         // memfd/pipe creation below. The original fds are closed after dup.
         let mut safe_extra_fds: Vec<(usize, i32)> = Vec::new();
         for &(guest_fd, host_fd) in extra_fds {
-            // F_DUPFD_CLOEXEC with min=100 to get a high fd number.
-            // We'll clear CLOEXEC later before spawn.
-            let safe_fd = unsafe { libc::fcntl(host_fd, libc::F_DUPFD, 100) };
+            // Dup bridge host fds into the worker bridge range (200+)
+            // so they don't collide with infrastructure fds (500+).
+            let safe_fd = unsafe { libc::fcntl(host_fd, libc::F_DUPFD, WORKER_BRIDGE_FD_MIN) };
             if safe_fd >= 0 {
                 unsafe { libc::close(host_fd) };
                 safe_extra_fds.push((guest_fd, safe_fd));
@@ -1254,6 +1288,16 @@ impl LinuxUserland {
             .map(|(_, image)| create_worker_exec_image_fd(image))
             .transpose()
             .map_err(|_| -1_i32)?;
+
+        // Relocate infrastructure fds to the INFRA range (500+) so that
+        // posix_spawn bridge dup2 actions (which target guest fd numbers
+        // 3-99) cannot clobber them.
+        let exec_image_fd = relocate_fd_to_infra_range(exec_image_fd)?;
+        let result_read_fd = relocate_fd_to_infra_range(result_read_fd)?;
+        let result_write_fd = relocate_fd_to_infra_range(result_write_fd)?;
+        let interp_image_fd = interp_image_fd
+            .map(|fd| relocate_fd_to_infra_range(fd))
+            .transpose()?;
         let host_stdio_temp_sources =
             duplicate_host_stdio_sources_for_spawn(&stdio).map_err(|_| -1_i32)?;
 
@@ -1651,9 +1695,12 @@ impl LinuxUserland {
     }
 
     /// Duplicate a host OS file descriptor with `O_CLOEXEC` set.
+    ///
+    /// The new fd is placed at [`PARENT_BRIDGE_FD_MIN`] or higher to
+    /// avoid colliding with guest bridge targets (0–99).
     pub fn dup_host_fd(&self, fd: i32) -> Result<i32, litebox_common_linux::errno::Errno> {
         // Safety: fd is a valid host FD.
-        let new_fd = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 3) };
+        let new_fd = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, PARENT_BRIDGE_FD_MIN) };
         if new_fd < 0 {
             return Err(litebox_common_linux::errno::Errno::EMFILE);
         }
@@ -1801,6 +1848,14 @@ impl LinuxUserland {
 
         // Create result pipe for exit status (reuses exec infrastructure).
         let (result_read_fd, result_write_fd) = create_worker_result_pipe().map_err(|_| -1_i32)?;
+
+        // Relocate infrastructure fds to the INFRA range (500+) so
+        // passthrough/bridge fd dup2 actions don't clobber them.
+        let snapshot_fd = relocate_fd_to_infra_range(snapshot_fd)?;
+        let ack_read_fd = relocate_fd_to_infra_range(ack_read_fd)?;
+        let ack_write_fd = relocate_fd_to_infra_range(ack_write_fd)?;
+        let result_read_fd = relocate_fd_to_infra_range(result_read_fd)?;
+        let result_write_fd = relocate_fd_to_infra_range(result_write_fd)?;
 
         let host_stdio_temp_sources =
             duplicate_host_stdio_sources_for_spawn(&stdio).map_err(|_| -1_i32)?;
@@ -2365,6 +2420,30 @@ fn move_fd_away_from_stdio(fd: std::os::fd::OwnedFd) -> std::io::Result<std::os:
         return Err(std::io::Error::last_os_error());
     }
     drop(fd);
+    Ok(unsafe { std::os::fd::OwnedFd::from_raw_fd(new_raw_fd) })
+}
+
+/// Relocate an fd to the infrastructure range ([`INFRA_FD_MIN`]+) so it
+/// cannot be clobbered by posix_spawn dup2 actions for bridge fds.
+/// Preserves the CLOEXEC flag from the original fd.
+fn relocate_fd_to_infra_range(fd: std::os::fd::OwnedFd) -> Result<std::os::fd::OwnedFd, i32> {
+    if fd.as_raw_fd() >= INFRA_FD_MIN {
+        return Ok(fd); // already in the safe range
+    }
+    let fd_flags = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFD) };
+    if fd_flags < 0 {
+        return Err(-1);
+    }
+    let dup_cmd = if fd_flags & libc::FD_CLOEXEC != 0 {
+        libc::F_DUPFD_CLOEXEC
+    } else {
+        libc::F_DUPFD
+    };
+    let new_raw_fd = unsafe { libc::fcntl(fd.as_raw_fd(), dup_cmd, INFRA_FD_MIN) };
+    if new_raw_fd < 0 {
+        return Err(-1);
+    }
+    drop(fd); // closes the original low-numbered fd
     Ok(unsafe { std::os::fd::OwnedFd::from_raw_fd(new_raw_fd) })
 }
 

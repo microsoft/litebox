@@ -119,6 +119,25 @@ Key columns: `syscall`, `args` (JSON), `duration_ns`, `result_ok`, `result_err`
 (negated errno), `worker` (host PID), `pid`/`tid` (guest). See `schema` output
 for the complete reference and 10+ ready-to-use queries.
 
+## Host fd range conventions
+
+Worker processes use three disjoint fd ranges to prevent collisions
+between bridge fds and infrastructure fds during `posix_spawn`.
+**All new fd allocation in `litebox_platform_linux_userland` must
+respect these ranges.** Use the named constants — never hardcode
+fd minimums.
+
+| Range   | Owner                 | Constant               |
+|---------|-----------------------|------------------------|
+| 0–2     | stdio                 | —                      |
+| 3–99    | guest bridge targets  | (posix_spawn dup2)     |
+| 100–199 | parent bridge fds     | `PARENT_BRIDGE_FD_MIN` |
+| 200–499 | child bridge host fds | `WORKER_BRIDGE_FD_MIN` |
+| 500+    | infrastructure fds    | `INFRA_FD_MIN`         |
+
+Constants are defined in `litebox_platform_linux_userland/src/lib.rs`.
+See the module-level doc comment for details.
+
 ## Code standards
 
 See the per-crate `CLAUDE.md` / `README.md` files and the repository-wide
