@@ -329,4 +329,70 @@ pub(crate) async fn pipe_bridge_tests(r: &mut TestRunner) {
             r.record(&test, agent, pass, &format!("{resp:?}"));
         }
     }
+
+    // ─── PB.many: many extra pipes (fd collision stress test) ───────
+    // Creates 10 pipes (fds 3-22) before fork+exec(nonpie).  This
+    // forces bridge guest fd numbers (3, 5, 7, ...) to overlap with
+    // the worker's infrastructure fds (exec_image_fd ~5, result_fd ~8).
+    // Without proper fd range separation, posix_spawn's dup2 for the
+    // bridge clobbers the infrastructure memfd and the worker hangs.
+    eprintln!("[pipe-bridge] --- PB.many (10 pipes, fd collision stress) ---");
+    for &agent in PB_AGENTS {
+        let test = format!("PB.many.pie.{agent}");
+        let resp = r
+            .send(
+                agent,
+                exec_timeout(
+                    vec![
+                        self_exe.clone(),
+                        "pipe-test".into(),
+                        "extra-pipe-multi".into(),
+                        self_exe.clone(),
+                        "10".into(),
+                    ],
+                    20,
+                ),
+            )
+            .await;
+        let pass = matches!(
+            &resp,
+            Response::ExecResult { exit_code: 0, stdout, .. } if stdout.contains("PB_MULTI_OK")
+        );
+        r.record(&test, agent, pass, &format!("{resp:?}"));
+    }
+
+    if let Some(ref nonpie_bin) = nonpie {
+        for &agent in PB_AGENTS {
+            let test = format!("PB.many.nonpie.{agent}");
+            let resp = r
+                .send(
+                    agent,
+                    exec_timeout(
+                        vec![
+                            self_exe.clone(),
+                            "pipe-test".into(),
+                            "extra-pipe-multi".into(),
+                            nonpie_bin.clone(),
+                            "10".into(),
+                        ],
+                        20,
+                    ),
+                )
+                .await;
+            let pass = matches!(
+                &resp,
+                Response::ExecResult { exit_code: 0, stdout, .. } if stdout.contains("PB_MULTI_OK")
+            );
+            r.record(&test, agent, pass, &format!("{resp:?}"));
+        }
+    } else {
+        for &agent in PB_AGENTS {
+            r.record(
+                &format!("PB.many.nonpie.{agent}"),
+                agent,
+                false,
+                "FAIL: nonpie binary not found — mount at /opt/nonpie",
+            );
+        }
+    }
 }
