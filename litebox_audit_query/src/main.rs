@@ -161,6 +161,7 @@ CREATE TABLE syscalls (
     duration_ns INTEGER,
     result_ok   INTEGER,
     result_err  INTEGER,
+    pending_ns  INTEGER,
     PRIMARY KEY (seq, worker)
 )";
 
@@ -371,6 +372,20 @@ fn import(jsonl_path: &Path, db_path: &Path) -> Result<ImportStats, String> {
     conn.execute_batch("PRAGMA synchronous=NORMAL")
         .map_err(|e| format!("restore sync: {e}"))?;
 
+    // Fill pending_ns for orphan rows: how long the syscall had been
+    // in-flight when logging stopped. Lets agents distinguish genuinely
+    // hung syscalls (large pending_ns) from shutdown-interrupted ones
+    // (small pending_ns near the end of the log).
+    if stats.orphan_count > 0 {
+        conn.execute(
+            "UPDATE syscalls SET pending_ns = \
+             (SELECT MAX(COALESCE(exit_ts, enter_ts)) FROM syscalls) - enter_ts \
+             WHERE exit_ts IS NULL",
+            [],
+        )
+        .map_err(|e| format!("fill pending_ns: {e}"))?;
+    }
+
     let elapsed = start_time.elapsed().as_secs_f64();
     eprintln!(
         "  done: {rows_inserted} rows in {elapsed:.1}s ({:.0}/s)",
@@ -514,6 +529,8 @@ Column reference:
   duration_ns - exit_ts - enter_ts (NULL if never returned)
   result_ok   - Value from {{"ok": N}} on success (NULL on error or no exit)
   result_err  - Value from {{"err": N}} = negated errno on failure (NULL on success)
+  pending_ns  - For orphans only: log_end_ts - enter_ts (NULL for completed syscalls)
+                Small = interrupted by shutdown. Large = potentially hung/deadlocked.
 
 Error codes: result_err is the negated errno, e.g.:
   -2  = ENOENT (No such file or directory)
@@ -535,9 +552,10 @@ SELECT syscall, result_err, COUNT(*) AS cnt
 FROM syscalls WHERE result_err IS NOT NULL
 GROUP BY syscall, result_err ORDER BY cnt DESC;
 
--- Syscalls that never returned (hung / killed)
-SELECT seq, worker, pid, tid, syscall, args, enter_ts
-FROM syscalls WHERE exit_ts IS NULL;
+-- Incomplete syscalls: pending_ns distinguishes hung from shutdown-interrupted.
+-- Large pending_ns (seconds+) = potentially hung. Small = interrupted by shutdown.
+SELECT syscall, args, worker, pid, tid, pending_ns/1000000 AS pending_ms
+FROM syscalls WHERE exit_ts IS NULL ORDER BY pending_ns DESC;
 
 -- Per-syscall timing summary (count, min, avg, max in microseconds)
 SELECT syscall,
@@ -664,6 +682,29 @@ mod tests {
             )
             .unwrap();
         assert!(orphan_exit.is_none());
+
+        // Query: pending_ns for orphan — futex entered at 103000,
+        // last event exit_ts is 102100, so pending = 102100 - 103000 would
+        // be negative. But log_end_ts = MAX(COALESCE(exit_ts,enter_ts)) = 103000
+        // (the futex enter itself), so pending = 103000 - 103000 = 0.
+        let pending: Option<i64> = conn
+            .query_row(
+                "SELECT pending_ns FROM syscalls WHERE syscall = 'futex'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(pending, Some(0)); // entered at the very end of the log
+
+        // Completed syscalls should have NULL pending_ns.
+        let completed_pending: Option<i64> = conn
+            .query_row(
+                "SELECT pending_ns FROM syscalls WHERE syscall = 'openat'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(completed_pending.is_none());
 
         // Clean up.
         let _ = std::fs::remove_file(&jsonl_path);
