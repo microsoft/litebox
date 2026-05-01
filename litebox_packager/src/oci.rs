@@ -108,7 +108,8 @@ pub fn pull_and_extract(image_ref: &str, verbose: bool) -> anyhow::Result<Extrac
                     .iter()
                     .find(|entry| {
                         entry.platform.as_ref().is_some_and(|p| {
-                            p.os == "linux".into() && p.architecture == "amd64".into()
+                            p.os == oci_spec::image::Os::Linux
+                                && p.architecture == oci_spec::image::Arch::Amd64
                         })
                     })
                     .map(|e| e.digest.clone())
@@ -510,6 +511,19 @@ fn extract_tar<R: Read>(
             // A later layer may override this symlink, so remove any stale
             // entry with the same rel_path.
             symlinks.retain(|s| s.rel_path != path);
+            // If a previous layer extracted a file or directory at this path,
+            // remove it so the symlink takes precedence.
+            if target.is_dir() {
+                if let Err(e) = std::fs::remove_dir_all(&target) {
+                    eprintln!(
+                        "  warning: failed to remove directory for symlink override {path_str}: {e}"
+                    );
+                }
+            } else if target.exists()
+                && let Err(e) = std::fs::remove_file(&target)
+            {
+                eprintln!("  warning: failed to remove file for symlink override {path_str}: {e}");
+            }
             symlinks.push(DeferredSymlink {
                 rel_path: path.clone(),
                 link_target,
@@ -517,7 +531,12 @@ fn extract_tar<R: Read>(
             continue;
         }
 
-        // Normal file/directory: use the standard unpack
+        // Normal file/directory: use the standard unpack.
+        // If a previous layer recorded a symlink at this path (or any
+        // ancestor recorded symlinks with this path as a prefix), the real
+        // file/directory from an upper layer takes precedence — remove the
+        // stale symlink entries.
+        symlinks.retain(|s| s.rel_path != path && !s.rel_path.starts_with(&path));
         entry
             .unpack(&target)
             .with_context(|| format!("failed to unpack entry: {path_str}"))?;
@@ -586,7 +605,7 @@ fn resolve_symlink_in_rootfs(
     if let Some(link_target) = symlink_map.get(rel_path) {
         // Resolve the target to a new rel_path
         let resolved_rel = if is_unix_absolute(link_target) {
-            strip_unix_root(link_target)
+            normalize_path(link_target)
         } else {
             // Relative target: resolve from parent of the symlink
             let parent = rel_path.parent().unwrap_or(Path::new(""));
@@ -603,7 +622,7 @@ fn resolve_symlink_in_rootfs(
         let prefix: PathBuf = components[..i].iter().collect();
         if let Some(link_target) = symlink_map.get(&prefix) {
             let resolved_prefix = if is_unix_absolute(link_target) {
-                strip_unix_root(link_target)
+                normalize_path(link_target)
             } else {
                 let parent = prefix.parent().unwrap_or(Path::new(""));
                 normalize_path(&parent.join(link_target))
@@ -631,15 +650,6 @@ fn is_unix_absolute(path: &Path) -> bool {
     path.as_os_str()
         .to_str()
         .is_some_and(|s| s.starts_with('/'))
-}
-
-/// Strip the leading `/` from a Unix-style absolute path to make it
-/// rootfs-relative. Returns the path unchanged if it doesn't start with `/`.
-fn strip_unix_root(path: &Path) -> PathBuf {
-    if let Some(stripped) = path.as_os_str().to_str().and_then(|s| s.strip_prefix('/')) {
-        return PathBuf::from(stripped);
-    }
-    path.strip_prefix("/").unwrap_or(path).to_path_buf()
 }
 
 /// Normalize a path by resolving `.` and `..` components without touching the
@@ -962,8 +972,8 @@ fn resolve_in_rootfs(path: &Path, rootfs: &Path, max_depth: u32) -> Option<PathB
 
     let link_target = std::fs::read_link(path).ok()?;
     let resolved = if is_unix_absolute(&link_target) {
-        // Absolute symlink: resolve within rootfs
-        rootfs.join(strip_unix_root(&link_target))
+        // Absolute symlink: resolve within rootfs (normalize to prevent traversal)
+        rootfs.join(normalize_path(&link_target))
     } else {
         // Relative symlink — join with parent, then canonicalize `..` components
         // to prevent escaping the rootfs boundary.

@@ -562,6 +562,36 @@ fn discover_all_dependencies(
 /// ELF magic bytes: `\x7fELF`.
 const ELF_MAGIC: [u8; 4] = [0x7f, b'E', b'L', b'F'];
 
+/// ELF e_machine value for x86_64.
+const EM_X86_64: u16 = 62;
+/// ELF e_machine value for AArch64.
+const EM_AARCH64: u16 = 183;
+
+/// Read the ELF e_machine field using the `object` crate for proper header parsing.
+fn elf_machine(data: &[u8]) -> Option<u16> {
+    use object::read::elf::FileHeader;
+    if let Ok(header) = object::elf::FileHeader64::<object::Endianness>::parse(data) {
+        let endian = header.endian().ok()?;
+        Some(header.e_machine(endian))
+    } else if let Ok(header) = object::elf::FileHeader32::<object::Endianness>::parse(data) {
+        let endian = header.endian().ok()?;
+        Some(header.e_machine(endian))
+    } else {
+        None
+    }
+}
+
+/// Returns the expected ELF e_machine value for the current target architecture.
+fn target_elf_machine() -> u16 {
+    if cfg!(target_arch = "x86_64") {
+        EM_X86_64
+    } else if cfg!(target_arch = "aarch64") {
+        EM_AARCH64
+    } else {
+        0 // Unknown — skip arch check
+    }
+}
+
 /// Rewrite an ELF file's syscall instructions using the litebox syscall rewriter.
 ///
 /// Non-ELF files (shell scripts, data files with executable bits, etc.) are
@@ -579,6 +609,20 @@ fn rewrite_elf(data: &[u8], path: &Path, verbose: bool) -> anyhow::Result<Vec<u8
         return Ok(data.to_vec());
     }
 
+    // Skip ELF files whose architecture doesn't match the target. OCI images
+    // may contain cross-architecture binaries (e.g., aarch64 in an x86_64
+    // image) which the rewriter cannot handle.
+    let target_machine = target_elf_machine();
+    if target_machine != 0 && elf_machine(data).is_some_and(|machine| machine != target_machine) {
+        if verbose {
+            eprintln!(
+                "  {} (wrong ELF architecture, skipping rewrite)",
+                path.display()
+            );
+        }
+        return Ok(data.to_vec());
+    }
+
     match litebox_syscall_rewriter::hook_syscalls_in_elf(data, None) {
         Ok(rewritten) => {
             if verbose {
@@ -587,6 +631,10 @@ fn rewrite_elf(data: &[u8], path: &Path, verbose: bool) -> anyhow::Result<Vec<u8
             Ok(rewritten)
         }
         Err(e) => {
+            // Include the file as-is when rewriting fails. This can happen for
+            // ELFs with unsupported architectures (e.g., aarch64 binaries in an
+            // x86_64 image) or unusual ELF layouts. The runtime patcher or
+            // platform syscall interception will handle these at execution time.
             eprintln!(
                 "  warning: failed to rewrite {}: {e}; including as-is",
                 path.display()
@@ -612,6 +660,10 @@ fn build_tar(entries: &[TarEntry], output: &Path) -> anyhow::Result<()> {
     let mut builder = Builder::new(file);
 
     for entry in entries {
+        // Note: we use the ustar format because the runtime tar filesystem
+        // (`litebox/src/fs/tar_ro.rs`) uses the `tar_no_std` crate which only
+        // supports ustar. This limits path lengths to 256 bytes (with the
+        // name/prefix split).
         let mut header = Header::new_ustar();
         header.set_size(entry.data.len() as u64);
         // Mask to permission bits only (rwxrwxrwx). The full st_mode from

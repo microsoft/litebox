@@ -1499,6 +1499,7 @@ dependencies = [
  "clap",
  "flate2",
  "litebox_syscall_rewriter",
+ "object",
  "oci-client",
  "oci-spec",
  "rayon",

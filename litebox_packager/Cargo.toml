@@ -9,6 +9,7 @@ clap = { version = "4.5.33", features = ["derive"] }
 litebox_syscall_rewriter = { version = "0.1.0", path = "../litebox_syscall_rewriter" }
 rayon = "1.10"
 tar = "0.4"
+object = { version = "0.36.7", default-features = false, features = ["elf", "read_core"] }
 
 # OCI image support — only on x86_64 (the images we pull are amd64 and the
 # native-tls feature pulls in openssl-sys which requires a matching libssl).
