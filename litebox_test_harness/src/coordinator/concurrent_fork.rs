@@ -274,3 +274,37 @@ pub(crate) async fn vscode_install_pipeline_tests(r: &mut TestRunner) {
         }
     }
 }
+
+/// Test concurrent file open+close from forked children.
+///
+/// Reproduces the RwLock deadlock on the layered FS RootDir where
+/// concurrent `open()` (read lock + 9P) and `close()` (write lock)
+/// from sibling processes cause a fair-RwLock deadlock.
+pub(crate) async fn concurrent_fs_rwlock_tests(r: &mut TestRunner) {
+    let self_exe = r.self_exe.clone();
+
+    eprintln!("[concurrent-fork] === Concurrent FS RwLock Tests ===");
+
+    // CF.rwlock: fork N children that concurrently open+close files.
+    // With the RwLock deadlock, 3+ children causes a hang.
+    for &n in &[2, 3, 4] {
+        for &agent in CF_AGENTS {
+            let test = format!("CF.rwlock_{n}.{agent}");
+            let resp = r
+                .send(
+                    agent,
+                    exec_timeout(
+                        vec![self_exe.clone(), "concurrent-fs".into(), n.to_string()],
+                        20,
+                    ),
+                )
+                .await;
+            let pass = matches!(
+                &resp,
+                Response::ExecResult { exit_code: 0, stdout, .. }
+                    if stdout.contains("CONCURRENT_FS_OK")
+            );
+            r.record(&test, agent, pass, &format!("{resp:?}"));
+        }
+    }
+}

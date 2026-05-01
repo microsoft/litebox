@@ -649,6 +649,7 @@ async fn run_tests(self_exe: &str, filter: Option<&str>) -> Vec<TestResult> {
             concurrent_fork::concurrent_fork_pipeline_tests(&mut runner).await;
             concurrent_fork::concurrent_exec_tests(&mut runner).await;
             concurrent_fork::vscode_install_pipeline_tests(&mut runner).await;
+            concurrent_fork::concurrent_fs_rwlock_tests(&mut runner).await;
         })
         .await
         .is_err()

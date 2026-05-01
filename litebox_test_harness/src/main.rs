@@ -1347,6 +1347,96 @@ fn main() {
             let _ = child.wait();
             std::process::exit(0);
         }
+        "concurrent-fs" => {
+            // Reproduction of the RwLock deadlock on layered FS RootDir.
+            //
+            // Forks N children that simultaneously:
+            //   - open a shared library (triggers read lock + 9P)
+            //   - close a file (triggers write lock)
+            //
+            // With a fair RwLock, this deadlocks when a reader holds the
+            // lock during a blocking 9P call and a writer queues behind it,
+            // blocking subsequent readers.
+            //
+            // Usage: concurrent-fs [nchildren] [file_to_open]
+            let n_children: usize = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(3);
+            let file_to_open = args
+                .get(3)
+                .map(String::as_str)
+                .unwrap_or("/lib/x86_64-linux-gnu/libc.so.6");
+
+            eprintln!("[concurrent-fs] forking {n_children} children, each opens {file_to_open}");
+
+            let mut child_pids = Vec::new();
+            for i in 0..n_children {
+                // Open a file BEFORE fork so the child has an fd to close
+                // (triggers write lock on RootDir in close path).
+                let pre_fd = std::fs::File::open(file_to_open);
+
+                let pid = unsafe { libc::fork() };
+                if pid < 0 {
+                    eprintln!("[concurrent-fs] fork {i} failed");
+                    continue;
+                }
+                if pid == 0 {
+                    // Child: close the pre-opened fd (write lock on RootDir),
+                    // then open a file (read lock on RootDir + 9P).
+                    // This concurrent pattern triggers the deadlock.
+                    drop(pre_fd);
+                    match std::fs::File::open(file_to_open) {
+                        Ok(f) => {
+                            // Read a few bytes to force 9P interaction.
+                            use std::io::Read;
+                            let mut buf = [0u8; 16];
+                            let mut f = f;
+                            let _ = f.read(&mut buf);
+                            drop(f);
+                            eprintln!("[concurrent-fs] child {i} OK");
+                            std::process::exit(0);
+                        }
+                        Err(e) => {
+                            eprintln!("[concurrent-fs] child {i} open failed: {e}");
+                            std::process::exit(1);
+                        }
+                    }
+                }
+                child_pids.push(pid);
+            }
+
+            // Parent: wait for all children with timeout.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+            let mut all_ok = true;
+            for (i, &pid) in child_pids.iter().enumerate() {
+                let mut status = 0i32;
+                loop {
+                    let ret = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
+                    if ret > 0 {
+                        if libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0 {
+                            break;
+                        } else {
+                            eprintln!("[concurrent-fs] child {i} bad exit: {status}");
+                            all_ok = false;
+                            break;
+                        }
+                    }
+                    if std::time::Instant::now() >= deadline {
+                        eprintln!("[concurrent-fs] child {i} TIMEOUT (RwLock deadlock?)");
+                        unsafe { libc::kill(pid, libc::SIGKILL) };
+                        unsafe { libc::waitpid(pid, std::ptr::null_mut(), 0) };
+                        all_ok = false;
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+            }
+
+            if all_ok {
+                println!("CONCURRENT_FS_OK:{n_children}");
+            } else {
+                println!("CONCURRENT_FS_FAIL:{n_children} (concurrent open+close deadlocked)");
+            }
+            std::process::exit(if all_ok { 0 } else { 1 });
+        }
         other => {
             eprintln!("unknown command: {other}");
             std::process::exit(1);
