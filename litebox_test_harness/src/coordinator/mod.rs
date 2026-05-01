@@ -4,6 +4,7 @@
 //! Test coordinator. Runs as the init process, drives all test
 //! operations through pipes to child agents.
 
+pub(crate) mod concurrent_fork;
 pub(crate) mod file_tcp;
 pub(crate) mod fork_matrix;
 pub(crate) mod matrix;
@@ -645,6 +646,9 @@ async fn run_tests(self_exe: &str, filter: Option<&str>) -> Vec<TestResult> {
             special_cases::cross_worker_tests(&mut runner).await;
             special_cases::pipe_eof_tests(&mut runner).await;
             pipe_bridge::pipe_bridge_tests(&mut runner).await;
+            concurrent_fork::concurrent_fork_pipeline_tests(&mut runner).await;
+            concurrent_fork::concurrent_exec_tests(&mut runner).await;
+            concurrent_fork::vscode_install_pipeline_tests(&mut runner).await;
         })
         .await
         .is_err()
