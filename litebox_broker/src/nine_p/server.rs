@@ -79,6 +79,10 @@ pub struct Server {
     rewrite_syscalls: bool,
     /// Cache of patched ELF data, keyed by canonical path.
     elf_cache: Arc<Mutex<ElfCache>>,
+    /// Cache of canonical path resolutions. Maps raw path → (canonical path, qid).
+    /// Avoids repeated `fs::canonicalize` + `fs::metadata` calls in `handle_walk`.
+    /// Invalidated on mutations (unlink, rename, mkdir, symlink, write).
+    canonical_cache: Mutex<HashMap<PathBuf, (PathBuf, fcall::Qid)>>,
     /// Optional audit log for structured policy events.
     audit_log: Option<crate::audit::AuditLog>,
 }
@@ -121,6 +125,7 @@ impl Server {
             msize: AtomicU32::new(4 * 1024 * 1024),
             rewrite_syscalls,
             elf_cache,
+            canonical_cache: Mutex::new(HashMap::new()),
             audit_log: None,
         }
     }
@@ -234,6 +239,41 @@ impl Server {
         } else {
             Err(libc::EPERM as u32)
         }
+    }
+
+    /// Invalidate canonical path cache entries at or under `path`.
+    /// Called on mutations (unlink, rename, mkdir, symlink, write).
+    fn invalidate_canonical_cache(&self, path: &Path) {
+        let mut cache = mutex_lock(&self.canonical_cache, "canonical_cache");
+        cache.retain(|k, _| !k.starts_with(path));
+    }
+
+    /// Cached canonicalize + metadata lookup for walk steps.
+    /// Returns (canonical_path, qid) or None on failure.
+    fn cached_canonicalize(&self, raw_path: &Path) -> Option<(PathBuf, fcall::Qid)> {
+        // Check cache first
+        {
+            let cache = mutex_lock(&self.canonical_cache, "canonical_cache");
+            if let Some((canonical, qid)) = cache.get(raw_path) {
+                return Some((canonical.clone(), *qid));
+            }
+        }
+
+        // Cache miss — do the real work
+        let canonical = fs::canonicalize(raw_path).ok()?;
+        if !canonical.starts_with(&self.root) {
+            return None;
+        }
+        let meta = fs::metadata(&canonical).ok()?;
+        let qid = metadata_to_qid(&meta);
+
+        // Store in cache
+        let mut cache = mutex_lock(&self.canonical_cache, "canonical_cache");
+        // Limit cache size to prevent unbounded growth
+        if cache.len() < 10_000 {
+            cache.insert(raw_path.to_path_buf(), (canonical.clone(), qid));
+        }
+        Some((canonical, qid))
     }
 
     /// Fast containment check when the path is already canonical (from walk).
@@ -823,9 +863,10 @@ impl Server {
 
             // Canonicalize to follow symlinks. This resolves the real path
             // so subsequent walk steps work correctly even through symlinks.
-            let resolved = match fs::canonicalize(&next) {
-                Ok(p) => p,
-                Err(_) => break,
+            // Uses the canonical cache to avoid repeated host FS calls.
+            let (resolved, qid) = match self.cached_canonicalize(&next) {
+                Some(r) => r,
+                None => break,
             };
 
             // Containment check on the resolved (real) path
@@ -833,15 +874,8 @@ impl Server {
                 break;
             }
 
-            // Use metadata (follows symlinks) for the QID so the client sees
-            // the target type (dir/file), not the symlink itself.
-            match fs::metadata(&resolved) {
-                Ok(meta) => {
-                    wqids.push(metadata_to_qid(&meta));
-                    current_path = resolved;
-                }
-                Err(_) => break,
-            }
+            wqids.push(qid);
+            current_path = resolved;
         }
 
         // Per 9P spec: if no names were walked, return error
@@ -1073,6 +1107,7 @@ impl Server {
                 state.readlink_path = None;
 
                 let msize = self.msize.load(Ordering::Acquire);
+                self.invalidate_canonical_cache(&resolved_target);
                 Fcall::Rlcreate(fcall::Rlcreate {
                     qid,
                     iounit: msize - fcall::IOHDRSZ,
@@ -1440,7 +1475,10 @@ impl Server {
         }
 
         match path_to_qid(&target) {
-            Ok(qid) => Fcall::Rmkdir(fcall::Rmkdir { qid }),
+            Ok(qid) => {
+                self.invalidate_canonical_cache(&target);
+                Fcall::Rmkdir(fcall::Rmkdir { qid })
+            }
             Err(errno) => error_response(errno),
         }
     }
@@ -1488,7 +1526,10 @@ impl Server {
         };
 
         match result {
-            Ok(()) => Fcall::Runlinkat(fcall::Runlinkat {}),
+            Ok(()) => {
+                self.invalidate_canonical_cache(&target);
+                Fcall::Runlinkat(fcall::Runlinkat {})
+            }
             Err(e) => io_error_response(e),
         }
     }
@@ -1551,7 +1592,9 @@ impl Server {
             Ok(()) => {
                 // Update the FID's path to the new location
                 let mut state = write_lock(&src_arc, "fid");
-                state.path = dst;
+                state.path = dst.clone();
+                self.invalidate_canonical_cache(&resolved_src);
+                self.invalidate_canonical_cache(&dst);
                 Fcall::Rrename(fcall::Rrename {})
             }
             Err(e) => io_error_response(e),
@@ -1621,7 +1664,11 @@ impl Server {
         }
 
         match fs::rename(&src, &dst) {
-            Ok(()) => Fcall::Rrenameat(fcall::Rrenameat {}),
+            Ok(()) => {
+                self.invalidate_canonical_cache(&src);
+                self.invalidate_canonical_cache(&dst);
+                Fcall::Rrenameat(fcall::Rrenameat {})
+            }
             Err(e) => io_error_response(e),
         }
     }
