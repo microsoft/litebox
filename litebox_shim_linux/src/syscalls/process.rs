@@ -8501,13 +8501,22 @@ impl<FS: ShimFS> Task<FS> {
             signal_on_error(&vfork_info);
         })?;
 
-        // Collect non-stdio unix socket fds without CLOEXEC to bridge
-        // to the remote worker (e.g. Node.js IPC socketpair on fd 3).
+        // Collect non-stdio fds to bridge to the remote worker.
+        // Two categories:
+        //   1. Unix socket fds with pair_ids (e.g. Node.js IPC socketpair on fd 3)
+        //   2. Pipe fds beyond stdio (e.g. extra pipes from child_process.fork)
         // Create OS socketpair for each so the child can read/write.
         let mut extra_fds: Vec<(usize, i32)> = Vec::new();
         let mut parent_bidi_replacements: Vec<(usize, i32, usize, u64)> = Vec::new(); // (child_guest_fd, parent_os_fd, pair_id, child_oid)
+        // Pipe bridges: (child_guest_fd, parent_os_fd, pair_id, child_direction)
+        let mut parent_pipe_replacements: Vec<(
+            usize,
+            i32,
+            usize,
+            super::host_pipe::HostPipeDirection,
+        )> = Vec::new();
         {
-            // Phase 1: collect unix socket fds and pair_ids under read lock.
+            // Phase 1a: collect unix socket fds and pair_ids under read lock.
             let socket_info: Vec<(
                 usize,
                 usize,
@@ -8538,7 +8547,44 @@ impl<FS: ShimFS> Task<FS> {
                 out
             }; // rds + dt dropped
 
-            // Phase 2: create bridges for all non-stdio socket fds.
+            // Phase 1b: collect pipe fds beyond stdio.
+            // These are extra pipes created by the parent (e.g. Node.js
+            // child_process.fork with stdio: ['pipe','pipe','pipe','ipc','pipe']).
+            // Skip mux-managed pipes to avoid nested bridging.
+            let pipe_info: Vec<(usize, usize, super::host_pipe::HostPipeDirection)> = {
+                let files = self.files.borrow();
+                let rds = files.raw_descriptor_store.read();
+                let mux_ids = self.mux_pipe_pair_ids.borrow();
+                let mut out = Vec::new();
+                for raw_fd in rds.iter_alive() {
+                    if raw_fd <= 2 {
+                        continue;
+                    }
+                    if let Ok(typed) =
+                        rds.fd_from_raw_integer::<litebox::pipes::Pipes<crate::Platform>>(raw_fd)
+                    {
+                        let direction = match self.global.pipes.half_pipe_type(&typed) {
+                            Ok(litebox::pipes::HalfPipeType::ReceiverHalf) => {
+                                super::host_pipe::HostPipeDirection::Read
+                            }
+                            Ok(litebox::pipes::HalfPipeType::SenderHalf) => {
+                                super::host_pipe::HostPipeDirection::Write
+                            }
+                            Err(_) => continue,
+                        };
+                        let Ok(pair_id) = self.global.pipes.pipe_pair_id(&typed) else {
+                            continue;
+                        };
+                        if mux_ids.contains(&pair_id) {
+                            continue;
+                        }
+                        out.push((raw_fd, pair_id, direction));
+                    }
+                }
+                out
+            };
+
+            // Phase 2a: create bridges for all non-stdio socket fds.
             // CLOEXEC check is skipped — if the fd had CLOEXEC, exec would
             // close it anyway and the bridge fd is harmless (unused by child).
             for (raw_fd, pair_id, oid, _typed) in &socket_info {
@@ -8556,6 +8602,26 @@ impl<FS: ShimFS> Task<FS> {
                             // dup failed — use original (risky)
                             extra_fds.push((*raw_fd, child_end));
                             parent_bidi_replacements.push((*raw_fd, parent_end, *pair_id, *oid));
+                        }
+                    }
+                }
+            }
+
+            // Phase 2b: create bridges for pipe fds beyond stdio.
+            // Use socketpair (bidirectional) even though pipes are unidirectional —
+            // the direction is enforced at the HostPipeFd level.
+            for &(raw_fd, pair_id, direction) in &pipe_info {
+                if let Ok((child_end, parent_end)) = self.global.platform.create_host_socketpair() {
+                    let safe_parent = self.global.platform.dup_host_fd(parent_end);
+                    match safe_parent {
+                        Ok(safe_fd) => {
+                            self.global.platform.close_host_fd(parent_end);
+                            extra_fds.push((raw_fd, child_end));
+                            parent_pipe_replacements.push((raw_fd, safe_fd, pair_id, direction));
+                        }
+                        Err(_) => {
+                            extra_fds.push((raw_fd, child_end));
+                            parent_pipe_replacements.push((raw_fd, parent_end, pair_id, direction));
                         }
                     }
                 }
@@ -8606,18 +8672,22 @@ impl<FS: ShimFS> Task<FS> {
                 for &(_, parent_fd, _, _) in &parent_bidi_replacements {
                     self.global.platform.close_host_fd(parent_fd);
                 }
+                for &(_, parent_fd, _, _) in &parent_pipe_replacements {
+                    self.global.platform.close_host_fd(parent_fd);
+                }
                 signal_on_error(&vfork_info);
                 Errno::ENOMEM
             })?;
 
-        // Close child ends of bidi socketpair bridges (child inherited them).
-        for &(_, child_fd) in &extra_fds {
-            self.global.platform.close_host_fd(child_fd);
-        }
+        // Note: child ends of bridge socketpairs are already closed by
+        // spawn_worker_host_for_exec (it dups them to 100+ and closes the
+        // originals).  Do NOT close them again here — that would double-close
+        // and trigger IO Safety violations if the fd number was reused.
 
         // Replace parent's peer unix socket fds with HostPipeFd backed
         // by the OS socketpair parent end. Find the peer by pair_id.
-        if let Some((vd, _parent_pipe_fds, parent_socket_fds)) = &vfork_info {
+        // Also replace parent's peer pipe fds.
+        if let Some((vd, parent_pipe_fds, parent_socket_fds)) = &vfork_info {
             for &(child_guest_fd, parent_os_fd, child_pair_id, child_oid) in
                 &parent_bidi_replacements
             {
@@ -8637,10 +8707,38 @@ impl<FS: ShimFS> Task<FS> {
                     self.global.platform.close_host_fd(parent_os_fd);
                 }
             }
+
+            // Replace parent's peer pipe fds.  The child has one end (read or
+            // write); the parent has the opposite end with the same pair_id.
+            // The parent's replacement direction is the OPPOSITE of the child's.
+            for &(_, parent_os_fd, child_pair_id, child_direction) in &parent_pipe_replacements {
+                let mut stored = false;
+                for &(parent_fd, parent_direction, parent_pair_id) in parent_pipe_fds {
+                    if parent_pair_id == child_pair_id && parent_direction != child_direction {
+                        // Parent's HostPipeFd direction matches its original
+                        // pipe direction: if parent had the read end, it reads
+                        // from the bridge; if write end, it writes.
+                        vd.fd_replacements.lock().push(crate::FdReplacement {
+                            guest_fd: parent_fd,
+                            host_fd: parent_os_fd,
+                            direction: parent_direction,
+                            subsystem: crate::ReplacedSubsystem::Pipe,
+                        });
+                        stored = true;
+                    }
+                }
+                if !stored {
+                    self.global.platform.close_host_fd(parent_os_fd);
+                }
+            }
+
             vd.signal();
         } else {
             // No vfork info — close parent OS fds, signal nothing.
             for &(_, parent_fd, _, _) in &parent_bidi_replacements {
+                self.global.platform.close_host_fd(parent_fd);
+            }
+            for &(_, parent_fd, _, _) in &parent_pipe_replacements {
                 self.global.platform.close_host_fd(parent_fd);
             }
         }
