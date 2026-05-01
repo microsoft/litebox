@@ -182,6 +182,10 @@ fn create_audit_log_file(dir: &std::path::Path) -> anyhow::Result<std::path::Pat
 
     let path = dir.join(filename);
     eprintln!("Audit log: {}", path.display());
+    eprintln!(
+        "  Query with: litebox_audit_query sql --file {} '<SQL>'",
+        path.display()
+    );
     Ok(path)
 }
 
