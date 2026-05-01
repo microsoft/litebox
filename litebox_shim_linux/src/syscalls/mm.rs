@@ -18,14 +18,15 @@ use crate::MutPtr;
 use crate::ShimFS;
 use crate::Task;
 use litebox::utils::TruncateExt as _;
+use object::elf::{ET_DYN, FileHeader64, PT_LOAD, ProgramHeader64};
+use object::endian::LittleEndian;
 
 #[cfg(not(target_pointer_width = "64"))]
 compile_error!("ELF patching code assumes 64-bit pointers (u64 <-> usize is lossless)");
 
-/// ELF program header type for loadable segments.
-const PT_LOAD: u32 = 1;
-/// ELF type for shared objects and position-independent executables (PIE).
-const ET_DYN: u16 = 3;
+/// Convenience alias for the endianness used throughout (x86-64 is little-endian).
+type LE = LittleEndian;
+const ENDIAN: LE = LittleEndian;
 
 /// Per-fd state for the shim's runtime ELF syscall rewriter.
 ///
@@ -563,31 +564,34 @@ impl<FS: ShimFS> Task<FS> {
             return;
         }
 
-        // Read the ELF header (first 64 bytes covers both 32-bit and 64-bit).
-        let mut ehdr_buf = [0u8; 64];
+        // Read the ELF header (64 bytes for Elf64).
+        let mut ehdr_buf = [0u8; core::mem::size_of::<FileHeader64<LE>>()];
         match self.sys_read(fd, &mut ehdr_buf, Some(0)) {
             Ok(n) if n == ehdr_buf.len() => {}
             _ => return, // Not readable or short read, skip
         }
 
+        // Parse as typed ELF64 header.
+        let Ok((ehdr, _)) = object::from_bytes::<FileHeader64<LE>>(&ehdr_buf) else {
+            return;
+        };
+
         // Verify ELF magic
-        if &ehdr_buf[0..4] != b"\x7fELF" {
-            return; // Not an ELF file
-        }
-
-        // Parse as 64-bit ELF (runtime patching is x86-64 only).
-        let e_phoff = u64::from_le_bytes(ehdr_buf[32..40].try_into().unwrap()).truncate();
-        let e_phentsize = u16::from_le_bytes(ehdr_buf[54..56].try_into().unwrap()) as usize;
-        let e_phnum = u16::from_le_bytes(ehdr_buf[56..58].try_into().unwrap()) as usize;
-        let e_type = u16::from_le_bytes(ehdr_buf[16..18].try_into().unwrap());
-
-        // Validate e_phentsize: must be at least sizeof(Elf64_Phdr) = 56 bytes,
-        // otherwise the field accesses (e.g. ph[40..48] for p_memsz) will panic.
-        if e_phentsize < 56 {
+        if &ehdr.e_ident.magic != b"\x7fELF" {
             return;
         }
 
-        // Read program headers to find max PT_LOAD end
+        let e_type = ehdr.e_type.get(ENDIAN);
+        let e_phoff: usize = ehdr.e_phoff.get(ENDIAN).truncate();
+        let e_phentsize = ehdr.e_phentsize.get(ENDIAN) as usize;
+        let e_phnum = ehdr.e_phnum.get(ENDIAN) as usize;
+
+        // Validate e_phentsize: must be at least sizeof(Elf64_Phdr).
+        if e_phentsize < core::mem::size_of::<ProgramHeader64<LE>>() {
+            return;
+        }
+
+        // Read program headers.
         let Some(phdrs_size) = e_phentsize.checked_mul(e_phnum) else {
             return;
         };
@@ -605,14 +609,16 @@ impl<FS: ShimFS> Task<FS> {
         let mut max_load_end: u64 = 0;
         let mut base_addr: Option<usize> = None;
         for i in 0..e_phnum {
-            let ph = &phdrs_buf[i * e_phentsize..][..e_phentsize];
-            let p_type = u32::from_le_bytes(ph[0..4].try_into().unwrap());
-            if p_type != PT_LOAD {
+            let ph_bytes = &phdrs_buf[i * e_phentsize..][..e_phentsize];
+            let Ok((ph, _)) = object::from_bytes::<ProgramHeader64<LE>>(ph_bytes) else {
+                continue;
+            };
+            if ph.p_type.get(ENDIAN) != PT_LOAD {
                 continue;
             }
-            let p_offset: usize = u64::from_le_bytes(ph[8..16].try_into().unwrap()).truncate();
-            let p_vaddr = u64::from_le_bytes(ph[16..24].try_into().unwrap());
-            let p_memsz = u64::from_le_bytes(ph[40..48].try_into().unwrap());
+            let p_offset: usize = ph.p_offset.get(ENDIAN).truncate();
+            let p_vaddr = ph.p_vaddr.get(ENDIAN);
+            let p_memsz = ph.p_memsz.get(ENDIAN);
             let Some(end) = p_vaddr.checked_add(p_memsz) else {
                 litebox_util_log::warn!(
                     p_vaddr:? = p_vaddr, p_memsz:? = p_memsz;

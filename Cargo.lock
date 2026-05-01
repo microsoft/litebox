@@ -1702,6 +1702,7 @@ dependencies = [
  "litebox_platform_multiplex",
  "litebox_syscall_rewriter",
  "litebox_util_log",
+ "object",
  "once_cell",
  "ringbuf",
  "seq-macro",
