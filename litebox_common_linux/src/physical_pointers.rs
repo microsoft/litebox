@@ -58,14 +58,57 @@
 //! if this module always requires a list of physical addresses, the caller might
 //! provide a wrong list by mistake or intentionally).
 
-// TODO: Since the below `PhysMutPtr` and `PhysConstPtr` are not OP-TEE specific,
-// we can move them to a different crate (e.g., `litebox`) if needed.
-
-use litebox_common_linux::vmap::{
-    PhysPageAddr, PhysPageMapInfo, PhysPageMapPermissions, PhysPointerError, VmapManager,
+use crate::vmap::{
+    PhysPageAddr, PhysPageAddrArray, PhysPageMapInfo, PhysPageMapPermissions, PhysPointerError,
+    VmapManager,
 };
-use litebox_platform_multiplex::platform;
 use zerocopy::FromBytes;
+
+/// Provider for physical page mapping operations used by physical pointers.
+pub trait PhysMapProvider<const ALIGN: usize>: Clone {
+    fn validate_unowned(&self, _pages: &PhysPageAddrArray<ALIGN>) -> Result<(), PhysPointerError> {
+        Ok(())
+    }
+
+    /// # Safety
+    ///
+    /// Same as [`VmapManager::vmap`].
+    unsafe fn vmap(
+        &self,
+        _pages: &PhysPageAddrArray<ALIGN>,
+        _perms: PhysPageMapPermissions,
+    ) -> Result<PhysPageMapInfo<ALIGN>, PhysPointerError> {
+        Err(PhysPointerError::UnsupportedOperation)
+    }
+
+    /// # Safety
+    ///
+    /// Same as [`VmapManager::vunmap`].
+    unsafe fn vunmap(&self, _map_info: PhysPageMapInfo<ALIGN>) -> Result<(), PhysPointerError> {
+        Err(PhysPointerError::UnsupportedOperation)
+    }
+}
+
+impl<P, const ALIGN: usize> PhysMapProvider<ALIGN> for &P
+where
+    P: VmapManager<ALIGN> + ?Sized,
+{
+    fn validate_unowned(&self, pages: &PhysPageAddrArray<ALIGN>) -> Result<(), PhysPointerError> {
+        <P as VmapManager<ALIGN>>::validate_unowned(*self, pages)
+    }
+
+    unsafe fn vmap(
+        &self,
+        pages: &PhysPageAddrArray<ALIGN>,
+        perms: PhysPageMapPermissions,
+    ) -> Result<PhysPageMapInfo<ALIGN>, PhysPointerError> {
+        unsafe { <P as VmapManager<ALIGN>>::vmap(*self, pages, perms) }
+    }
+
+    unsafe fn vunmap(&self, map_info: PhysPageMapInfo<ALIGN>) -> Result<(), PhysPointerError> {
+        unsafe { <P as VmapManager<ALIGN>>::vunmap(*self, map_info) }
+    }
+}
 
 /// Allocate a zeroed `Box<T>` on the heap.
 ///
@@ -109,7 +152,8 @@ fn align_up(len: usize, align: usize) -> usize {
 ///   memory for an object of type `T`.
 #[derive(Clone)]
 #[repr(C)]
-pub struct PhysMutPtr<T: Clone, const ALIGN: usize> {
+pub struct PhysMutPtr<T: Clone, const ALIGN: usize, P: PhysMapProvider<ALIGN>> {
+    provider: P,
     pages: alloc::boxed::Box<[PhysPageAddr<ALIGN>]>,
     offset: usize,
     count: usize,
@@ -117,14 +161,38 @@ pub struct PhysMutPtr<T: Clone, const ALIGN: usize> {
     _type: core::marker::PhantomData<T>,
 }
 
-impl<T: Clone, const ALIGN: usize> PhysMutPtr<T, ALIGN> {
+impl<T: Clone, const ALIGN: usize, P> PhysMutPtr<T, ALIGN, P>
+where
+    P: PhysMapProvider<ALIGN>,
+{
     /// Create a new `PhysMutPtr` from the given physical page array and offset.
     ///
     /// All addresses in `pages` should be valid and aligned to `ALIGN`, and `offset` should be
     /// smaller than `ALIGN`. Also, `pages` should contain enough pages to cover at least one
     /// object of type `T` starting from `offset`. If these conditions are not met, this function
     /// returns `Err(PhysPointerError)`.
-    pub fn new(pages: &[PhysPageAddr<ALIGN>], offset: usize) -> Result<Self, PhysPointerError> {
+    pub fn new(pages: &[PhysPageAddr<ALIGN>], offset: usize) -> Result<Self, PhysPointerError>
+    where
+        P: Default,
+    {
+        Self::new_with_provider(P::default(), pages, offset)
+    }
+
+    pub fn new_with_provider(
+        provider: P,
+        pages: &[PhysPageAddr<ALIGN>],
+        offset: usize,
+    ) -> Result<Self, PhysPointerError> {
+        if core::mem::size_of::<T>() == 0 {
+            return Ok(Self {
+                provider,
+                pages: pages.into(),
+                offset,
+                count: usize::MAX,
+                map_info: None,
+                _type: core::marker::PhantomData,
+            });
+        }
         if offset >= ALIGN {
             return Err(PhysPointerError::InvalidBaseOffset(offset, ALIGN));
         }
@@ -143,8 +211,9 @@ impl<T: Clone, const ALIGN: usize> PhysMutPtr<T, ALIGN> {
                 core::mem::size_of::<T>(),
             ));
         }
-        platform().validate_unowned(pages)?;
+        provider.validate_unowned(pages)?;
         Ok(Self {
+            provider,
             pages: pages.into(),
             offset,
             count: size / core::mem::size_of::<T>(),
@@ -159,7 +228,18 @@ impl<T: Clone, const ALIGN: usize> PhysMutPtr<T, ALIGN> {
     /// `PhysMutPtr::new([align_down(pa), align_down(pa) + ALIGN, ..., align_up(pa + bytes) - ALIGN], pa % ALIGN)`.
     /// This function assumes that `pa`, ..., `pa+bytes` are both physically and virtually contiguous. If not,
     /// later accesses through `PhysMutPtr` may read/write data in a wrong order.
-    pub fn with_contiguous_pages(pa: usize, bytes: usize) -> Result<Self, PhysPointerError> {
+    pub fn with_contiguous_pages(pa: usize, bytes: usize) -> Result<Self, PhysPointerError>
+    where
+        P: Default,
+    {
+        Self::with_contiguous_pages_with_provider(P::default(), pa, bytes)
+    }
+
+    pub fn with_contiguous_pages_with_provider(
+        provider: P,
+        pa: usize,
+        bytes: usize,
+    ) -> Result<Self, PhysPointerError> {
         if bytes < core::mem::size_of::<T>() {
             return Err(PhysPointerError::InsufficientPhysicalPages(
                 bytes,
@@ -180,7 +260,7 @@ impl<T: Clone, const ALIGN: usize> PhysMutPtr<T, ALIGN> {
             );
             current_page += ALIGN;
         }
-        Self::new(&pages, pa - start_page)
+        Self::new_with_provider(provider, &pages, pa - start_page)
     }
 
     /// Create a new `PhysMutPtr` from the given physical address for a single object.
@@ -188,8 +268,15 @@ impl<T: Clone, const ALIGN: usize> PhysMutPtr<T, ALIGN> {
     /// This is a shortcut for `PhysMutPtr::with_contiguous_pages(pa, size_of::<T>())`.
     ///
     /// Note: This module doesn't provide `as_usize` because LiteBox should not dereference physical addresses directly.
-    pub fn with_usize(pa: usize) -> Result<Self, PhysPointerError> {
-        Self::with_contiguous_pages(pa, core::mem::size_of::<T>())
+    pub fn with_usize(pa: usize) -> Result<Self, PhysPointerError>
+    where
+        P: Default,
+    {
+        Self::with_usize_with_provider(P::default(), pa)
+    }
+
+    pub fn with_usize_with_provider(provider: P, pa: usize) -> Result<Self, PhysPointerError> {
+        Self::with_contiguous_pages_with_provider(provider, pa, core::mem::size_of::<T>())
     }
 
     /// Read the value at the given offset from the physical pointer.
@@ -207,6 +294,9 @@ impl<T: Clone, const ALIGN: usize> PhysMutPtr<T, ALIGN> {
     where
         T: FromBytes,
     {
+        if core::mem::size_of::<T>() == 0 {
+            return Ok(alloc::boxed::Box::new(T::new_zeroed()));
+        }
         if count >= self.count {
             return Err(PhysPointerError::IndexOutOfBounds(count, self.count));
         }
@@ -247,6 +337,9 @@ impl<T: Clone, const ALIGN: usize> PhysMutPtr<T, ALIGN> {
     where
         T: FromBytes,
     {
+        if core::mem::size_of::<T>() == 0 || values.is_empty() {
+            return Ok(());
+        }
         if count
             .checked_add(values.len())
             .is_none_or(|end| end > self.count)
@@ -285,6 +378,9 @@ impl<T: Clone, const ALIGN: usize> PhysMutPtr<T, ALIGN> {
         count: usize,
         value: T,
     ) -> Result<(), PhysPointerError> {
+        if core::mem::size_of::<T>() == 0 {
+            return Ok(());
+        }
         if count >= self.count {
             return Err(PhysPointerError::IndexOutOfBounds(count, self.count));
         }
@@ -320,6 +416,9 @@ impl<T: Clone, const ALIGN: usize> PhysMutPtr<T, ALIGN> {
         count: usize,
         values: &[T],
     ) -> Result<(), PhysPointerError> {
+        if core::mem::size_of::<T>() == 0 || values.is_empty() {
+            return Ok(());
+        }
         if count
             .checked_add(values.len())
             .is_none_or(|end| end > self.count)
@@ -367,7 +466,7 @@ impl<T: Clone, const ALIGN: usize> PhysMutPtr<T, ALIGN> {
         count: usize,
         size: usize,
         perms: PhysPageMapPermissions,
-    ) -> Result<MappedGuard<'_, T, ALIGN>, PhysPointerError> {
+    ) -> Result<MappedGuard<'_, T, ALIGN, P>, PhysPointerError> {
         let skip = self
             .offset
             .checked_add(
@@ -416,7 +515,7 @@ impl<T: Clone, const ALIGN: usize> PhysMutPtr<T, ALIGN> {
         if self.map_info.is_none() {
             let sub_pages = &self.pages[start..end];
             unsafe {
-                self.map_info = Some(platform().vmap(sub_pages, perms)?);
+                self.map_info = Some(self.provider.vmap(sub_pages, perms)?);
             }
             Ok(())
         } else {
@@ -435,7 +534,7 @@ impl<T: Clone, const ALIGN: usize> PhysMutPtr<T, ALIGN> {
     unsafe fn unmap(&mut self) -> Result<(), PhysPointerError> {
         if let Some(map_info) = self.map_info.take() {
             unsafe {
-                platform().vunmap(map_info)?;
+                self.provider.vunmap(map_info)?;
             }
             Ok(())
         } else {
@@ -450,13 +549,15 @@ impl<T: Clone, const ALIGN: usize> PhysMutPtr<T, ALIGN> {
 ///
 /// Created by `map_and_get_ptr_guard`. Holds a mutable borrow on the parent
 /// `PhysMutPtr` and provides the mapped base pointer for the duration of the mapping.
-struct MappedGuard<'a, T: Clone, const ALIGN: usize> {
-    owner: &'a mut PhysMutPtr<T, ALIGN>,
+struct MappedGuard<'a, T: Clone, const ALIGN: usize, P: PhysMapProvider<ALIGN>> {
+    owner: &'a mut PhysMutPtr<T, ALIGN, P>,
     ptr: *mut T,
     size: usize,
 }
 
-impl<T: Clone, const ALIGN: usize> Drop for MappedGuard<'_, T, ALIGN> {
+impl<T: Clone, const ALIGN: usize, P: PhysMapProvider<ALIGN>> Drop
+    for MappedGuard<'_, T, ALIGN, P>
+{
     fn drop(&mut self) {
         // SAFETY: The platform is expected to handle unmapping safely, including
         // the case where pages were never mapped (returns Unmapped error, ignored).
@@ -468,7 +569,7 @@ impl<T: Clone, const ALIGN: usize> Drop for MappedGuard<'_, T, ALIGN> {
     }
 }
 
-impl<T: Clone, const ALIGN: usize> Drop for PhysMutPtr<T, ALIGN> {
+impl<T: Clone, const ALIGN: usize, P: PhysMapProvider<ALIGN>> Drop for PhysMutPtr<T, ALIGN, P> {
     fn drop(&mut self) {
         // SAFETY: The platform is expected to handle unmapping safely, including
         // the case where pages were never mapped (returns Unmapped error, ignored).
@@ -480,7 +581,9 @@ impl<T: Clone, const ALIGN: usize> Drop for PhysMutPtr<T, ALIGN> {
     }
 }
 
-impl<T: Clone, const ALIGN: usize> core::fmt::Debug for PhysMutPtr<T, ALIGN> {
+impl<T: Clone, const ALIGN: usize, P: PhysMapProvider<ALIGN>> core::fmt::Debug
+    for PhysMutPtr<T, ALIGN, P>
+{
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("PhysMutPtr")
             .field("pages[0]", &self.pages.first().map_or(0, |p| p.as_usize()))
@@ -493,20 +596,34 @@ impl<T: Clone, const ALIGN: usize> core::fmt::Debug for PhysMutPtr<T, ALIGN> {
 /// exposes only read access.
 #[derive(Clone)]
 #[repr(C)]
-pub struct PhysConstPtr<T: Clone, const ALIGN: usize> {
-    inner: PhysMutPtr<T, ALIGN>,
+pub struct PhysConstPtr<T: Clone, const ALIGN: usize, P: PhysMapProvider<ALIGN>> {
+    inner: PhysMutPtr<T, ALIGN, P>,
 }
 
-impl<T: Clone + FromBytes, const ALIGN: usize> PhysConstPtr<T, ALIGN> {
+impl<T: Clone + FromBytes, const ALIGN: usize, P> PhysConstPtr<T, ALIGN, P>
+where
+    P: PhysMapProvider<ALIGN>,
+{
     /// Create a new `PhysConstPtr` from the given physical page array and offset.
     ///
     /// All addresses in `pages` should be valid and aligned to `ALIGN`, and `offset` should be smaller
     /// than `ALIGN`. Also, `pages` should contain enough pages to cover at least one object of
     /// type `T` starting from `offset`. If these conditions are not met, this function returns
     /// `Err(PhysPointerError)`.
-    pub fn new(pages: &[PhysPageAddr<ALIGN>], offset: usize) -> Result<Self, PhysPointerError> {
+    pub fn new(pages: &[PhysPageAddr<ALIGN>], offset: usize) -> Result<Self, PhysPointerError>
+    where
+        P: Default,
+    {
+        Self::new_with_provider(P::default(), pages, offset)
+    }
+
+    pub fn new_with_provider(
+        provider: P,
+        pages: &[PhysPageAddr<ALIGN>],
+        offset: usize,
+    ) -> Result<Self, PhysPointerError> {
         Ok(Self {
-            inner: PhysMutPtr::new(pages, offset)?,
+            inner: PhysMutPtr::new_with_provider(provider, pages, offset)?,
         })
     }
 
@@ -516,9 +633,20 @@ impl<T: Clone + FromBytes, const ALIGN: usize> PhysConstPtr<T, ALIGN> {
     /// `PhysConstPtr::new([align_down(pa), align_down(pa) + ALIGN, ..., align_up(pa + bytes) - ALIGN], pa % ALIGN)`.
     /// This function assumes that `pa`, ..., `pa+bytes` are both physically and virtually contiguous. If not,
     /// later accesses through `PhysConstPtr` may read data in a wrong order.
-    pub fn with_contiguous_pages(pa: usize, bytes: usize) -> Result<Self, PhysPointerError> {
+    pub fn with_contiguous_pages(pa: usize, bytes: usize) -> Result<Self, PhysPointerError>
+    where
+        P: Default,
+    {
+        Self::with_contiguous_pages_with_provider(P::default(), pa, bytes)
+    }
+
+    pub fn with_contiguous_pages_with_provider(
+        provider: P,
+        pa: usize,
+        bytes: usize,
+    ) -> Result<Self, PhysPointerError> {
         Ok(Self {
-            inner: PhysMutPtr::with_contiguous_pages(pa, bytes)?,
+            inner: PhysMutPtr::with_contiguous_pages_with_provider(provider, pa, bytes)?,
         })
     }
 
@@ -527,9 +655,16 @@ impl<T: Clone + FromBytes, const ALIGN: usize> PhysConstPtr<T, ALIGN> {
     /// This is a shortcut for `PhysConstPtr::with_contiguous_pages(pa, size_of::<T>())`.
     ///
     /// Note: This module doesn't provide `as_usize` because LiteBox should not dereference physical addresses directly.
-    pub fn with_usize(pa: usize) -> Result<Self, PhysPointerError> {
+    pub fn with_usize(pa: usize) -> Result<Self, PhysPointerError>
+    where
+        P: Default,
+    {
+        Self::with_usize_with_provider(P::default(), pa)
+    }
+
+    pub fn with_usize_with_provider(provider: P, pa: usize) -> Result<Self, PhysPointerError> {
         Ok(Self {
-            inner: PhysMutPtr::with_usize(pa)?,
+            inner: PhysMutPtr::with_usize_with_provider(provider, pa)?,
         })
     }
 
@@ -569,7 +704,9 @@ impl<T: Clone + FromBytes, const ALIGN: usize> PhysConstPtr<T, ALIGN> {
     }
 }
 
-impl<T: Clone, const ALIGN: usize> core::fmt::Debug for PhysConstPtr<T, ALIGN> {
+impl<T: Clone, const ALIGN: usize, P: PhysMapProvider<ALIGN>> core::fmt::Debug
+    for PhysConstPtr<T, ALIGN, P>
+{
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("PhysConstPtr")
             .field(

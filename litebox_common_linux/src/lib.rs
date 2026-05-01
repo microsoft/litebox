@@ -21,6 +21,7 @@ use crate::signal::SigSet;
 pub mod errno;
 pub mod loader;
 pub mod mm;
+pub mod physical_pointers;
 pub mod signal;
 pub mod vmap;
 

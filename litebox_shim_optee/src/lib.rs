@@ -21,7 +21,12 @@ use litebox::{
     shim::ContinueOperation,
     utils::{ReinterpretUnsignedExt, TruncateExt},
 };
-use litebox_common_linux::{MapFlags, ProtFlags, errno::Errno};
+use litebox_common_linux::{
+    MapFlags, ProtFlags,
+    errno::Errno,
+    physical_pointers::PhysMapProvider,
+    vmap::{PhysPageAddrArray, PhysPageMapInfo, PhysPageMapPermissions, PhysPointerError},
+};
 use litebox_common_optee::{
     LdelfArg, LdelfSyscallRequest, SyscallRequest, TaFlags, TeeAlgorithm, TeeAlgorithmClass,
     TeeAttributeType, TeeCrypStateHandle, TeeHandleFlag, TeeIdentity, TeeLogin, TeeObjHandle,
@@ -34,7 +39,6 @@ pub mod session;
 pub(crate) mod syscalls;
 
 pub mod msg_handler;
-pub mod ptr;
 
 // Re-export session management types for convenience
 pub use session::{
@@ -1412,8 +1416,45 @@ impl SessionIdPool {
     }
 }
 
-pub type NormalWorldConstPtr<T, const ALIGN: usize> = crate::ptr::PhysConstPtr<T, ALIGN>;
-pub type NormalWorldMutPtr<T, const ALIGN: usize> = crate::ptr::PhysMutPtr<T, ALIGN>;
+#[derive(Clone, Copy, Debug, Default)]
+pub struct NormalWorldVmapProvider;
+
+impl<const ALIGN: usize> PhysMapProvider<ALIGN> for NormalWorldVmapProvider {
+    fn validate_unowned(&self, pages: &PhysPageAddrArray<ALIGN>) -> Result<(), PhysPointerError> {
+        litebox_common_linux::vmap::VmapManager::validate_unowned(
+            litebox_platform_multiplex::platform(),
+            pages,
+        )
+    }
+
+    unsafe fn vmap(
+        &self,
+        pages: &PhysPageAddrArray<ALIGN>,
+        perms: PhysPageMapPermissions,
+    ) -> Result<PhysPageMapInfo<ALIGN>, PhysPointerError> {
+        unsafe {
+            litebox_common_linux::vmap::VmapManager::vmap(
+                litebox_platform_multiplex::platform(),
+                pages,
+                perms,
+            )
+        }
+    }
+
+    unsafe fn vunmap(&self, map_info: PhysPageMapInfo<ALIGN>) -> Result<(), PhysPointerError> {
+        unsafe {
+            litebox_common_linux::vmap::VmapManager::vunmap(
+                litebox_platform_multiplex::platform(),
+                map_info,
+            )
+        }
+    }
+}
+
+pub type NormalWorldConstPtr<T, const ALIGN: usize> =
+    litebox_common_linux::physical_pointers::PhysConstPtr<T, ALIGN, NormalWorldVmapProvider>;
+pub type NormalWorldMutPtr<T, const ALIGN: usize> =
+    litebox_common_linux::physical_pointers::PhysMutPtr<T, ALIGN, NormalWorldVmapProvider>;
 
 #[cfg(test)]
 mod test_utils {
