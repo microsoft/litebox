@@ -24,17 +24,12 @@ use object::endian::LittleEndian;
 #[cfg(not(target_pointer_width = "64"))]
 compile_error!("ELF patching code assumes 64-bit pointers (u64 <-> usize is lossless)");
 
-/// Convenience alias for the endianness used throughout (x86-64 is little-endian).
-type LE = LittleEndian;
-const ENDIAN: LE = LittleEndian;
+const ENDIAN: LittleEndian = LittleEndian;
 
 /// Per-fd state for the shim's runtime ELF syscall rewriter.
 ///
 /// Tracks base address and trampoline write cursor for each ELF file that
 /// has executable segments mapped via `do_mmap_file()`.
-///
-/// TODO (wdcui): This Elf patching inside the shim is not a perfect solution.
-/// We will revisit it in the future.
 pub(crate) struct ElfPatchState {
     /// Whether this file is already pre-patched (trampoline magic found at file tail).
     pre_patched: bool,
@@ -565,14 +560,14 @@ impl<FS: ShimFS> Task<FS> {
         }
 
         // Read the ELF header (64 bytes for Elf64).
-        let mut ehdr_buf = [0u8; core::mem::size_of::<FileHeader64<LE>>()];
+        let mut ehdr_buf = [0u8; core::mem::size_of::<FileHeader64<LittleEndian>>()];
         match self.sys_read(fd, &mut ehdr_buf, Some(0)) {
             Ok(n) if n == ehdr_buf.len() => {}
             _ => return, // Not readable or short read, skip
         }
 
         // Parse as typed ELF64 header.
-        let Ok((ehdr, _)) = object::from_bytes::<FileHeader64<LE>>(&ehdr_buf) else {
+        let Ok((ehdr, _)) = object::from_bytes::<FileHeader64<LittleEndian>>(&ehdr_buf) else {
             return;
         };
 
@@ -587,7 +582,7 @@ impl<FS: ShimFS> Task<FS> {
         let e_phnum = ehdr.e_phnum.get(ENDIAN) as usize;
 
         // Validate e_phentsize: must be at least sizeof(Elf64_Phdr).
-        if e_phentsize < core::mem::size_of::<ProgramHeader64<LE>>() {
+        if e_phentsize < core::mem::size_of::<ProgramHeader64<LittleEndian>>() {
             return;
         }
 
@@ -610,7 +605,7 @@ impl<FS: ShimFS> Task<FS> {
         let mut base_addr: Option<usize> = None;
         for i in 0..e_phnum {
             let ph_bytes = &phdrs_buf[i * e_phentsize..][..e_phentsize];
-            let Ok((ph, _)) = object::from_bytes::<ProgramHeader64<LE>>(ph_bytes) else {
+            let Ok((ph, _)) = object::from_bytes::<ProgramHeader64<LittleEndian>>(ph_bytes) else {
                 continue;
             };
             if ph.p_type.get(ENDIAN) != PT_LOAD {
