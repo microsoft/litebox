@@ -4729,7 +4729,6 @@ mod unix_socket_tests {
 /// fork+exec'd child exits, the parent's read on the child's stdout pipe
 /// returns EOF — not block forever.
 mod pipe_lifecycle_tests {
-    use std::io::Read;
 
     fn errno() -> i32 {
         std::io::Error::last_os_error().raw_os_error().unwrap_or(-1)
@@ -4744,6 +4743,17 @@ mod pipe_lifecycle_tests {
                 println!("PIPE_CHILD_DATA");
                 0
             }
+            // PB (Pipe Bridge) tests: extra pipe fds across fork+exec.
+            // These test the VS Code child_process.fork() pattern where
+            // extra pipes beyond stdio (fd 0-2) must survive exec.
+            "extra-pipe-c2p" => test_extra_pipe_c2p(args),
+            "extra-pipe-p2c" => test_extra_pipe_p2c(args),
+            "extra-pipe-multi" => test_extra_pipe_multi(args),
+            "extra-socketpair" => test_extra_socketpair(args),
+            // Child helpers for PB tests.
+            "write-on-fd" => helper_write_on_fd(args),
+            "read-on-fd" => helper_read_on_fd(args),
+            "echo-on-fd" => helper_echo_on_fd(args),
             other => {
                 eprintln!("unknown pipe-test: {other}");
                 1
@@ -4942,6 +4952,458 @@ mod pipe_lifecycle_tests {
         } else {
             println!("P2_EOF_FAIL:exit={exit_code},data={data}");
             1
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // PB (Pipe Bridge) tests: extra pipe fds across fork+exec
+    //
+    // These test the pattern where Node.js child_process.fork() creates
+    // additional pipes beyond stdio (fds 0-2).  In litebox, non-PIE exec
+    // goes through exec_on_remote_host which must bridge ALL inherited
+    // pipe fds — not just unix sockets — to the new worker.
+    // ═══════════════════════════════════════════════════════════════════
+
+    /// Read from a fd with poll-based timeout.  Returns (data, got_eof).
+    fn read_with_poll_timeout(fd: i32, timeout_secs: u64) -> (Vec<u8>, bool) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
+        let mut all_data = Vec::new();
+        let mut buf = [0u8; 4096];
+        let mut got_eof = false;
+
+        loop {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+
+            let mut pfd = libc::pollfd {
+                fd,
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            let timeout_ms = remaining.as_millis().min(1000) as i32;
+            let poll_ret = unsafe { libc::poll(&mut pfd, 1, timeout_ms) };
+
+            if poll_ret == 0 {
+                continue;
+            }
+            if poll_ret < 0 {
+                break;
+            }
+
+            // Safety: buf is valid, fd is a valid pipe fd from pipe().
+            let n = unsafe { libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
+            if n == 0 {
+                got_eof = true;
+                break;
+            }
+            if n < 0 {
+                break;
+            }
+            all_data.extend_from_slice(&buf[..n as usize]);
+        }
+        (all_data, got_eof)
+    }
+
+    /// Wait for child and return exit code.
+    fn wait_child(pid: i32) -> i32 {
+        let mut status = 0i32;
+        // Safety: pid is a valid child pid from fork().
+        unsafe { libc::waitpid(pid, &mut status, 0) };
+        if libc::WIFEXITED(status) {
+            libc::WEXITSTATUS(status)
+        } else {
+            99
+        }
+    }
+
+    /// Exec in the current process (does not return on success).
+    fn do_execv(exe: &str, args: &[&str]) -> ! {
+        let c_exe = std::ffi::CString::new(exe).unwrap();
+        let c_args: Vec<std::ffi::CString> = args
+            .iter()
+            .map(|a| std::ffi::CString::new(*a).unwrap())
+            .collect();
+        let mut argv_ptrs: Vec<*const libc::c_char> = Vec::new();
+        argv_ptrs.push(c_exe.as_ptr());
+        for a in &c_args {
+            argv_ptrs.push(a.as_ptr());
+        }
+        argv_ptrs.push(core::ptr::null());
+        // Safety: c_exe and argv_ptrs are valid C strings with null terminator.
+        unsafe { libc::execv(c_exe.as_ptr(), argv_ptrs.as_ptr()) };
+        eprintln!("[execv] failed: {}", std::io::Error::last_os_error());
+        std::process::exit(127);
+    }
+
+    /// PB-C2P: Child writes to an extra pipe fd (not stdio) after fork+exec.
+    ///
+    /// Tests the VS Code ptyHost IPC pattern: code-server creates extra
+    /// pipes, fork+exec's the child.  If exec migrates to a remote worker
+    /// (non-PIE), the pipe fd must be bridged or parent blocks forever.
+    ///
+    /// Usage: pipe-test extra-pipe-c2p [binary]
+    fn test_extra_pipe_c2p(args: &[String]) -> i32 {
+        let exe = args.get(3).cloned().unwrap_or_else(|| {
+            std::env::current_exe()
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .to_string()
+        });
+
+        let mut pipe_fds = [0i32; 2];
+        // Safety: pipe_fds is a valid array.
+        if unsafe { libc::pipe(pipe_fds.as_mut_ptr()) } != 0 {
+            println!("PB_C2P_PIPE_FAIL:{}", errno());
+            return 1;
+        }
+        eprintln!(
+            "[PB-C2P] pipe fds: read={}, write={}",
+            pipe_fds[0], pipe_fds[1]
+        );
+
+        // Safety: fork() is safe (no threads in test binary).
+        let pid = unsafe { libc::fork() };
+        if pid < 0 {
+            println!("PB_C2P_FORK_FAIL:{}", errno());
+            return 1;
+        }
+
+        if pid == 0 {
+            // Child: close read end, keep write end open, exec.
+            // The write fd is NOT stdio — it's an extra fd (typically fd 4+).
+            // Safety: pipe_fds[0] is a valid fd from pipe().
+            unsafe { libc::close(pipe_fds[0]) };
+            let wfd_str = pipe_fds[1].to_string();
+            do_execv(&exe, &["pipe-test", "write-on-fd", &wfd_str]);
+        }
+
+        // Parent: close write end, read from read end with timeout.
+        // Safety: pipe_fds[1] is a valid fd from pipe().
+        unsafe { libc::close(pipe_fds[1]) };
+
+        let (data, _got_eof) = read_with_poll_timeout(pipe_fds[0], 15);
+        // Safety: pipe_fds[0] is a valid fd.
+        unsafe { libc::close(pipe_fds[0]) };
+
+        let exit_code = wait_child(pid);
+        let text = String::from_utf8_lossy(&data);
+
+        if text.contains("PB_CHILD_WROTE") && exit_code == 0 {
+            println!("PB_C2P_OK");
+            0
+        } else if data.is_empty() {
+            println!(
+                "PB_C2P_FAIL:no_data (pipe fd likely not bridged to child worker), exit={}",
+                exit_code
+            );
+            1
+        } else {
+            println!("PB_C2P_FAIL:exit={exit_code},data={text}");
+            1
+        }
+    }
+
+    /// PB-P2C: Parent writes to an extra pipe fd, child reads after fork+exec.
+    ///
+    /// Usage: pipe-test extra-pipe-p2c [binary]
+    fn test_extra_pipe_p2c(args: &[String]) -> i32 {
+        let exe = args.get(3).cloned().unwrap_or_else(|| {
+            std::env::current_exe()
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .to_string()
+        });
+
+        let mut pipe_fds = [0i32; 2];
+        // Safety: pipe_fds is a valid array.
+        if unsafe { libc::pipe(pipe_fds.as_mut_ptr()) } != 0 {
+            println!("PB_P2C_PIPE_FAIL:{}", errno());
+            return 1;
+        }
+        eprintln!(
+            "[PB-P2C] pipe fds: read={}, write={}",
+            pipe_fds[0], pipe_fds[1]
+        );
+
+        // Safety: fork() is safe (no threads in test binary).
+        let pid = unsafe { libc::fork() };
+        if pid < 0 {
+            println!("PB_P2C_FORK_FAIL:{}", errno());
+            return 1;
+        }
+
+        if pid == 0 {
+            // Child: close write end, keep read end, exec.
+            // The read fd is an extra fd (not stdio).
+            // Safety: pipe_fds[1] is a valid fd from pipe().
+            unsafe { libc::close(pipe_fds[1]) };
+            let rfd_str = pipe_fds[0].to_string();
+            do_execv(&exe, &["pipe-test", "read-on-fd", &rfd_str]);
+        }
+
+        // Parent: close read end, write message, close write end (sends EOF).
+        // Safety: pipe_fds[0] is a valid fd from pipe().
+        unsafe { libc::close(pipe_fds[0]) };
+
+        let msg = b"PB_PARENT_WROTE\n";
+        // Safety: pipe_fds[1] is a valid fd, msg is valid memory.
+        let written =
+            unsafe { libc::write(pipe_fds[1], msg.as_ptr() as *const libc::c_void, msg.len()) };
+        // Safety: pipe_fds[1] is a valid fd.
+        unsafe { libc::close(pipe_fds[1]) };
+
+        if written < 0 {
+            println!("PB_P2C_WRITE_FAIL:{}", errno());
+            return 1;
+        }
+
+        let exit_code = wait_child(pid);
+        // The child prints what it read to stdout.  Since this process's
+        // stdout is captured by the agent, we see the child's output.
+        if exit_code == 0 {
+            println!("PB_P2C_OK");
+            0
+        } else {
+            println!("PB_P2C_FAIL:exit={exit_code}");
+            1
+        }
+    }
+
+    /// PB-MULTI: Multiple extra pipe fds across fork+exec.
+    ///
+    /// Creates N pipes, child writes to all of them.  Tests that ALL
+    /// extra pipe fds are bridged, not just the first one.
+    ///
+    /// Usage: pipe-test extra-pipe-multi [binary] [count]
+    fn test_extra_pipe_multi(args: &[String]) -> i32 {
+        let exe = args.get(3).cloned().unwrap_or_else(|| {
+            std::env::current_exe()
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .to_string()
+        });
+        let count: usize = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(3);
+
+        let mut pipes: Vec<[i32; 2]> = Vec::new();
+        for i in 0..count {
+            let mut fds = [0i32; 2];
+            // Safety: fds is a valid array.
+            if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
+                println!("PB_MULTI_PIPE_FAIL:pipe={i},errno={}", errno());
+                return 1;
+            }
+            eprintln!("[PB-MULTI] pipe {i}: read={}, write={}", fds[0], fds[1]);
+            pipes.push(fds);
+        }
+
+        // Safety: fork() is safe (no threads in test binary).
+        let pid = unsafe { libc::fork() };
+        if pid < 0 {
+            println!("PB_MULTI_FORK_FAIL:{}", errno());
+            return 1;
+        }
+
+        if pid == 0 {
+            // Child: close all read ends, exec with all write fd numbers.
+            for fds in &pipes {
+                // Safety: fds[0] is a valid fd from pipe().
+                unsafe { libc::close(fds[0]) };
+            }
+            let write_fds: Vec<String> = pipes.iter().map(|fds| fds[1].to_string()).collect();
+            let fd_list = write_fds.join(",");
+            do_execv(&exe, &["pipe-test", "write-on-fd", &fd_list]);
+        }
+
+        // Parent: close all write ends, read from all read ends.
+        for fds in &pipes {
+            // Safety: fds[1] is a valid fd from pipe().
+            unsafe { libc::close(fds[1]) };
+        }
+
+        let mut ok_count = 0;
+        for (i, fds) in pipes.iter().enumerate() {
+            let (data, _got_eof) = read_with_poll_timeout(fds[0], 15);
+            // Safety: fds[0] is a valid fd from pipe().
+            unsafe { libc::close(fds[0]) };
+            let text = String::from_utf8_lossy(&data);
+            if text.contains("PB_CHILD_WROTE") {
+                ok_count += 1;
+            } else {
+                eprintln!("[PB-MULTI] pipe {i}: no data (got: {text})");
+            }
+        }
+
+        let exit_code = wait_child(pid);
+        if ok_count == count && exit_code == 0 {
+            println!("PB_MULTI_OK:{count}");
+            0
+        } else {
+            println!("PB_MULTI_FAIL:ok={ok_count}/{count},exit={exit_code}");
+            1
+        }
+    }
+
+    /// PB-SOCKETPAIR: Extra AF_UNIX socketpair fd across fork+exec.
+    ///
+    /// Positive control: exec_on_remote_host already bridges unix socket
+    /// fds, so this should pass for both PIE and non-PIE.  Validates the
+    /// bridge mechanism itself is working.
+    ///
+    /// Usage: pipe-test extra-socketpair [binary]
+    fn test_extra_socketpair(args: &[String]) -> i32 {
+        let exe = args.get(3).cloned().unwrap_or_else(|| {
+            std::env::current_exe()
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .to_string()
+        });
+
+        let mut fds = [0i32; 2];
+        // Safety: fds is a valid array.
+        if unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, fds.as_mut_ptr()) } != 0 {
+            println!("PB_SP_SOCKETPAIR_FAIL:{}", errno());
+            return 1;
+        }
+        eprintln!("[PB-SP] socketpair fds: {}, {}", fds[0], fds[1]);
+
+        // Safety: fork() is safe (no threads in test binary).
+        let pid = unsafe { libc::fork() };
+        if pid < 0 {
+            println!("PB_SP_FORK_FAIL:{}", errno());
+            return 1;
+        }
+
+        if pid == 0 {
+            // Child: close fd[0], use fd[1] for echo.
+            // Safety: fds[0] is a valid fd from socketpair().
+            unsafe { libc::close(fds[0]) };
+            let fd_str = fds[1].to_string();
+            do_execv(&exe, &["pipe-test", "echo-on-fd", &fd_str]);
+        }
+
+        // Parent: close fd[1], write+read on fd[0].
+        // Safety: fds[1] is a valid fd from socketpair().
+        unsafe { libc::close(fds[1]) };
+
+        let msg = b"PB_SP_PING";
+        // Safety: fds[0] is a valid fd, msg is valid memory.
+        let written =
+            unsafe { libc::write(fds[0], msg.as_ptr() as *const libc::c_void, msg.len()) };
+        if written < 0 {
+            println!("PB_SP_WRITE_FAIL:{}", errno());
+            return 1;
+        }
+
+        let (data, _) = read_with_poll_timeout(fds[0], 15);
+        // Safety: fds[0] is a valid fd.
+        unsafe { libc::close(fds[0]) };
+
+        let exit_code = wait_child(pid);
+        let text = String::from_utf8_lossy(&data);
+
+        if text.contains("PB_SP_PING") && exit_code == 0 {
+            println!("PB_SP_OK");
+            0
+        } else if data.is_empty() {
+            println!("PB_SP_FAIL:no_data,exit={exit_code}");
+            1
+        } else {
+            println!("PB_SP_FAIL:exit={exit_code},data={text}");
+            1
+        }
+    }
+
+    // ─── Child helper subcommands ────────────────────────────────────
+
+    /// Write a known message to one or more fds (comma-separated).
+    /// Usage: pipe-test write-on-fd <fd>[,<fd>,...]
+    fn helper_write_on_fd(args: &[String]) -> i32 {
+        let fd_arg = args.get(3).map(String::as_str).unwrap_or("3");
+        let fds: Vec<i32> = fd_arg.split(',').filter_map(|s| s.parse().ok()).collect();
+
+        if fds.is_empty() {
+            eprintln!("[write-on-fd] no valid fds in: {fd_arg}");
+            return 1;
+        }
+
+        let mut ok = true;
+        for &fd in &fds {
+            let msg = format!("PB_CHILD_WROTE:fd={fd}\n");
+            // Safety: fd is a valid fd inherited from the parent.
+            let n = unsafe { libc::write(fd, msg.as_ptr() as *const libc::c_void, msg.len()) };
+            if n < 0 {
+                eprintln!(
+                    "[write-on-fd] write(fd={fd}) failed: {}",
+                    std::io::Error::last_os_error()
+                );
+                ok = false;
+            } else {
+                eprintln!("[write-on-fd] wrote {} bytes to fd {fd}", n);
+            }
+            // Safety: fd is a valid fd.
+            unsafe { libc::close(fd) };
+        }
+
+        if ok { 0 } else { 1 }
+    }
+
+    /// Read from an extra fd, print what was read to stdout.
+    /// Usage: pipe-test read-on-fd <fd>
+    fn helper_read_on_fd(args: &[String]) -> i32 {
+        let fd: i32 = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(3);
+
+        let (data, _) = read_with_poll_timeout(fd, 10);
+        // Safety: fd is a valid fd inherited from the parent.
+        unsafe { libc::close(fd) };
+
+        let text = String::from_utf8_lossy(&data);
+        if text.contains("PB_PARENT_WROTE") {
+            eprintln!("[read-on-fd] got: {text}");
+            0
+        } else {
+            eprintln!("[read-on-fd] expected PB_PARENT_WROTE, got: {text}");
+            1
+        }
+    }
+
+    /// Echo data on a socketpair fd: read → write back → exit.
+    /// Usage: pipe-test echo-on-fd <fd>
+    fn helper_echo_on_fd(args: &[String]) -> i32 {
+        let fd: i32 = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(3);
+
+        let mut buf = [0u8; 4096];
+        // Safety: fd is a valid fd inherited from the parent, buf is valid.
+        let n = unsafe { libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
+        if n <= 0 {
+            eprintln!(
+                "[echo-on-fd] read failed: {}",
+                std::io::Error::last_os_error()
+            );
+            // Safety: fd is a valid fd.
+            unsafe { libc::close(fd) };
+            return 1;
+        }
+        let n = n as usize;
+        // Safety: fd is a valid fd, buf[..n] contains the data we just read.
+        let w = unsafe { libc::write(fd, buf.as_ptr() as *const libc::c_void, n) };
+        // Safety: fd is a valid fd.
+        unsafe { libc::close(fd) };
+
+        if w < 0 {
+            eprintln!(
+                "[echo-on-fd] write failed: {}",
+                std::io::Error::last_os_error()
+            );
+            1
+        } else {
+            eprintln!("[echo-on-fd] echoed {n} bytes");
+            0
         }
     }
 }

@@ -7,6 +7,7 @@
 pub(crate) mod file_tcp;
 pub(crate) mod fork_matrix;
 pub(crate) mod matrix;
+pub(crate) mod pipe_bridge;
 pub(crate) mod platform_fixes;
 pub(crate) mod port_router;
 pub(crate) mod special_cases;
@@ -643,6 +644,7 @@ async fn run_tests(self_exe: &str, filter: Option<&str>) -> Vec<TestResult> {
             special_cases::unix_socket_tests(&mut runner).await;
             special_cases::cross_worker_tests(&mut runner).await;
             special_cases::pipe_eof_tests(&mut runner).await;
+            pipe_bridge::pipe_bridge_tests(&mut runner).await;
         })
         .await
         .is_err()
