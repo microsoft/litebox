@@ -1676,22 +1676,11 @@ impl MemoryContainer {
             return Ok(());
         }
 
-        let phys_aligned_start = phys_start.align_down(Size4KiB::SIZE);
-        let phys_aligned_end = phys_end.align_up(Size4KiB::SIZE);
-        let aligned_len: usize = (phys_aligned_end - phys_aligned_start).trunc();
-        let mut pages = Vec::with_capacity(aligned_len.div_ceil(PAGE_SIZE));
-        let mut phys_cur = phys_aligned_start;
-        while phys_cur < phys_aligned_end {
-            pages.push(
-                PhysPageAddr::<PAGE_SIZE>::new(phys_cur.as_u64().trunc())
-                    .ok_or(MemoryContainerError::CopyFromVtl0Failed)?,
-            );
-            phys_cur += PAGE_SIZE as u64;
-        }
-
-        let page_offset: usize = (phys_start - phys_aligned_start).trunc();
-        let mut ptr = Vtl0PhysConstPtr::<u8, PAGE_SIZE>::new(&pages, page_offset)
-            .map_err(|_| MemoryContainerError::CopyFromVtl0Failed)?;
+        let mut ptr = Vtl0PhysConstPtr::<u8, PAGE_SIZE>::with_contiguous_pages(
+            phys_start.as_u64().trunc(),
+            bytes_to_copy,
+        )
+        .map_err(|_| MemoryContainerError::CopyFromVtl0Failed)?;
 
         let old_len = self.buf.len();
         self.buf.resize(old_len + bytes_to_copy, 0);
