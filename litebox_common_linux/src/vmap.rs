@@ -156,6 +156,8 @@ pub enum PhysPointerError {
         "The total size of the given pages ({0} bytes) is insufficient for the requested type ({1} bytes)"
     )]
     InsufficientPhysicalPages(usize, usize),
+    #[error("Zero-sized types are unsupported for physical pointers")]
+    UnsupportedZeroSizedType,
     #[error("Index {0} is out of bounds (count: {1})")]
     IndexOutOfBounds(usize, usize),
     #[error("Physical address {0:#x} is already mapped")]
