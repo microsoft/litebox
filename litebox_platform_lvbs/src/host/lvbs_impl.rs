@@ -7,6 +7,7 @@ use crate::{
     Errno, HostInterface, arch::ioport::serial_print_string,
     host::per_cpu_variables::with_per_cpu_variables,
 };
+use rand_core::{RngCore, SeedableRng};
 use zeroize::Zeroizing;
 
 pub type LvbsLinuxKernel = crate::LinuxKernel<HostLvbsInterface>;
@@ -103,15 +104,13 @@ unsafe impl litebox::platform::ThreadLocalStorageProvider for LvbsLinuxKernel {
 
 impl litebox::platform::CrngProvider for LvbsLinuxKernel {
     fn fill_bytes_crng(&self, buf: &mut [u8]) {
-        // FIXME: generate real random data.
-        static RANDOM: spin::mutex::SpinMutex<litebox::utils::rng::FastRng> =
-            spin::mutex::SpinMutex::new(litebox::utils::rng::FastRng::new_from_seed(
-                core::num::NonZeroU64::new(0x4d595df4d0f33173).unwrap(),
-            ));
+        static RANDOM: spin::mutex::SpinMutex<Option<rand_chacha::ChaCha20Rng>> =
+            spin::mutex::SpinMutex::new(None);
+
         let mut random = RANDOM.lock();
-        for b in buf.chunks_mut(8) {
-            b.copy_from_slice(&random.next_u64().to_ne_bytes()[..b.len()]);
-        }
+        random
+            .get_or_insert_with(|| rand_chacha::ChaCha20Rng::from_seed(rdrand_seed()))
+            .fill_bytes(buf);
     }
 }
 
@@ -154,6 +153,23 @@ impl litebox::platform::DerivedKeyProvider for LvbsLinuxKernel {
             Some(kdf) => Ok(kdf(prk, params)?),
         }
     }
+}
+
+fn rdrand_seed() -> <rand_chacha::ChaCha20Rng as SeedableRng>::Seed {
+    let mut seed = <rand_chacha::ChaCha20Rng as SeedableRng>::Seed::default();
+    for chunk in seed.chunks_mut(8) {
+        let mut word = 0;
+        loop {
+            // Safety: `RDRAND` is available on the LVBS target CPUs. A false
+            // carry flag means random data is temporarily unavailable.
+            if unsafe { core::arch::x86_64::_rdrand64_step(&mut word) } == 1 {
+                break;
+            }
+            core::hint::spin_loop();
+        }
+        chunk.copy_from_slice(&word.to_ne_bytes()[..chunk.len()]);
+    }
+    seed
 }
 
 pub struct HostLvbsInterface;

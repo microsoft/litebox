@@ -1576,6 +1576,8 @@ dependencies = [
  "num_enum",
  "object",
  "once_cell",
+ "rand_chacha",
+ "rand_core",
  "rangemap",
  "raw-cpuid",
  "rsa",
