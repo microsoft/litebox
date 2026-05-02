@@ -1065,7 +1065,7 @@ async fn send_to_child(child: &mut ChildHandle, cmd: &Command) -> Response {
     let _ = child.stdin.flush().await;
 
     let mut line = String::new();
-    match tokio::time::timeout(Duration::from_secs(15), child.stdout.read_line(&mut line)).await {
+    match tokio::time::timeout(Duration::from_secs(60), child.stdout.read_line(&mut line)).await {
         Ok(Ok(n)) if n > 0 => match serde_json::from_str(line.trim()) {
             Ok(resp) => resp,
             Err(e) => Response::Error {

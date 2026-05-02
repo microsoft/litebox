@@ -867,8 +867,9 @@ async fn spawn_child(self_exe: &str) -> Result<Child, String> {
 }
 
 async fn send_cmd(child: &mut Child, cmd: &Command) -> Response {
-    // Use a longer response timeout for Exec commands with custom timeouts.
-    // Dig through Forward wrappers to find the inner command's timeout.
+    // Use a longer response timeout for Exec commands with custom timeouts
+    // and for Spawn/SpawnRemote commands which may trigger broker syscall
+    // rewriting (8+ seconds for large binaries) plus fork-restore setup.
     let inner_timeout = {
         let mut c = cmd;
         loop {
@@ -878,6 +879,7 @@ async fn send_cmd(child: &mut Child, cmd: &Command) -> Response {
                     timeout_secs: Some(t),
                     ..
                 } => break Some(*t),
+                Command::Spawn { .. } | Command::SpawnRemote { .. } => break Some(60),
                 _ => break None,
             }
         }
