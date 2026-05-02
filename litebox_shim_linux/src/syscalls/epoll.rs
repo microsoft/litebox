@@ -155,6 +155,18 @@ impl<FS: ShimFS> DescriptorRef<FS> {
             DescriptorRef::HostPipe(hp) => hp.upgrade().map(EpollDescriptor::HostPipe),
         }
     }
+
+    fn type_name(&self) -> &'static str {
+        match self {
+            DescriptorRef::Eventfd(_) => "Eventfd",
+            DescriptorRef::Epoll(_) => "Epoll",
+            DescriptorRef::File(_) => "File",
+            DescriptorRef::Socket(_) => "Socket",
+            DescriptorRef::Pipe(_) => "Pipe",
+            DescriptorRef::Unix(_) => "Unix",
+            DescriptorRef::HostPipe(_) => "HostPipe",
+        }
+    }
 }
 
 impl<FS: ShimFS> EpollDescriptor<FS> {
@@ -369,7 +381,19 @@ impl<FS: ShimFS> EpollFile<FS> {
             if entry.is_ready.load(core::sync::atomic::Ordering::Relaxed) {
                 continue; // already in the ready set
             }
-            if let Some((Some(_event), _)) = entry.poll(global, fs, false) {
+            if let Some((Some(event), _)) = entry.poll(global, fs, false) {
+                {
+                    use litebox::platform::DebugLogProvider as _;
+                    let ev = { event.events };
+                    let dt = { event.data };
+                    let msg = alloc::format!(
+                        "[epoll-diag] rescan_ready type={} events=0x{:x} data={}\n",
+                        entry.desc.type_name(),
+                        ev,
+                        dt,
+                    );
+                    litebox_platform_multiplex::platform().debug_log_print(&msg);
+                }
                 self.ready.push(&entry);
             }
         }
@@ -599,12 +623,30 @@ impl<FS: ShimFS> EpollFile<FS> {
         if !events.is_empty() {
             self.ready.push(&entry);
         }
-        if file.needs_host_poll(global, fs)
+        let is_host_poll = file.needs_host_poll(global, fs);
+        if is_host_poll
             && !self
                 .needs_host_poll
                 .swap(true, core::sync::atomic::Ordering::Relaxed)
         {
             self.ready.pollee.notify_observers(Events::IN);
+        }
+        {
+            use litebox::platform::DebugLogProvider as _;
+            let fd_type = match file {
+                EpollDescriptor::Eventfd(_) => "Eventfd",
+                EpollDescriptor::Epoll(_) => "Epoll",
+                EpollDescriptor::File(_) => "File",
+                EpollDescriptor::Socket(_) => "Socket",
+                EpollDescriptor::Pipe(_) => "Pipe",
+                EpollDescriptor::Unix(_) => "Unix",
+                EpollDescriptor::HostPipe(_) => "HostPipe",
+            };
+            let msg = alloc::format!(
+                "[epoll-diag] ADD fd={fd} type={fd_type} mask={mask:?} events={events:?} host_poll={is_host_poll} ready={}\n",
+                !events.is_empty(),
+            );
+            litebox_platform_multiplex::platform().debug_log_print(&msg);
         }
         interests.insert(key, entry);
         drop(interests);
