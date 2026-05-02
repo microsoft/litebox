@@ -1437,6 +1437,125 @@ fn main() {
             }
             std::process::exit(if all_ok { 0 } else { 1 });
         }
+        "concurrent-fs-multi" => {
+            // Targets the open() write-lock-during-9P deadlock (lines 1058-1062
+            // in layered.rs).
+            //
+            // Each child opens a DIFFERENT set of shared libraries so every
+            // open() misses the cache and goes through:
+            //   lower.open() → lower_fd_is_shareable() → root.write()
+            //
+            // When two children race to insert the same path, the second
+            // finder enters the "existing entry" branch at line 1059 and
+            // calls lower_fd_is_shareable(existing_fd) — a 9P fstat — WHILE
+            // holding the write lock.  Meanwhile the first child may be
+            // doing close() (also needs write lock) or file_status() (needs
+            // read lock, blocked by fair RwLock's queued writer).
+            //
+            // NOTE: no pipe barrier — litebox uses vfork semantics where
+            // the parent blocks until each child exits.  Concurrency comes
+            // from fork-restore children running in separate threads within
+            // the same worker.
+            //
+            // Usage: concurrent-fs-multi [nchildren]
+
+            // Libraries that load distinct transitive deps so each child
+            // opens files the others haven't cached yet.
+            let libs: &[&str] = &[
+                "/lib/x86_64-linux-gnu/libc.so.6",
+                "/lib/x86_64-linux-gnu/libm.so.6",
+                "/lib/x86_64-linux-gnu/libdl.so.2",
+                "/lib/x86_64-linux-gnu/libpthread.so.0",
+                "/lib/x86_64-linux-gnu/librt.so.1",
+                "/lib/x86_64-linux-gnu/libresolv.so.2",
+                "/lib/x86_64-linux-gnu/libnss_files.so.2",
+                "/lib/x86_64-linux-gnu/libnss_dns.so.2",
+            ];
+
+            let n_children: usize = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(4);
+            eprintln!(
+                "[concurrent-fs-multi] forking {n_children} children, each opens {} libs",
+                libs.len()
+            );
+
+            let mut child_pids = Vec::new();
+            for i in 0..n_children {
+                // Pre-open a few files so the child has fds to close
+                // (triggers write-lock contention with concurrent opens).
+                let pre_fds: Vec<_> = libs.iter().filter_map(|p| std::fs::File::open(p).ok()).collect();
+
+                let pid = unsafe { libc::fork() };
+                if pid < 0 {
+                    eprintln!("[concurrent-fs-multi] fork {i} failed");
+                    continue;
+                }
+                if pid == 0 {
+                    // Close pre-opened fds (write lock contention).
+                    drop(pre_fds);
+
+                    // Open all libs — each triggers uncached lower.open() + write lock.
+                    let mut ok = true;
+                    for &lib in libs {
+                        match std::fs::File::open(lib) {
+                            Ok(f) => {
+                                use std::io::Read;
+                                let mut buf = [0u8; 16];
+                                let mut f = f;
+                                let _ = f.read(&mut buf);
+                                // Close immediately to add write-lock pressure.
+                                drop(f);
+                            }
+                            Err(e) => {
+                                // Some libs may not exist on this system — skip.
+                                eprintln!("[concurrent-fs-multi] child {i} open {lib}: {e}");
+                                ok = false;
+                            }
+                        }
+                    }
+                    eprintln!("[concurrent-fs-multi] child {i} done ok={ok}");
+                    std::process::exit(if ok { 0 } else { 1 });
+                }
+                child_pids.push(pid);
+            }
+
+            // Wait with timeout.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+            let mut all_ok = true;
+            for (i, &pid) in child_pids.iter().enumerate() {
+                let mut status = 0i32;
+                loop {
+                    let ret = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
+                    if ret > 0 {
+                        if libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0 {
+                            break;
+                        } else {
+                            eprintln!("[concurrent-fs-multi] child {i} bad exit: {status}");
+                            all_ok = false;
+                            break;
+                        }
+                    }
+                    if std::time::Instant::now() >= deadline {
+                        eprintln!(
+                            "[concurrent-fs-multi] child {i} TIMEOUT (open() write-lock deadlock?)"
+                        );
+                        unsafe { libc::kill(pid, libc::SIGKILL) };
+                        unsafe { libc::waitpid(pid, std::ptr::null_mut(), 0) };
+                        all_ok = false;
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+            }
+
+            if all_ok {
+                println!("CONCURRENT_FS_MULTI_OK:{n_children}");
+            } else {
+                println!(
+                    "CONCURRENT_FS_MULTI_FAIL:{n_children} (open write-lock deadlock)"
+                );
+            }
+            std::process::exit(if all_ok { 0 } else { 1 });
+        }
         other => {
             eprintln!("unknown command: {other}");
             std::process::exit(1);

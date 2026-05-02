@@ -285,8 +285,8 @@ pub(crate) async fn concurrent_fs_rwlock_tests(r: &mut TestRunner) {
 
     eprintln!("[concurrent-fork] === Concurrent FS RwLock Tests ===");
 
-    // CF.rwlock: fork N children that concurrently open+close files.
-    // With the RwLock deadlock, 3+ children causes a hang.
+    // CF.rwlock: fork N children that concurrently open+close the SAME file.
+    // Tests the close() path holding write lock during 9P.
     for &n in &[2, 3, 4] {
         for &agent in CF_AGENTS {
             let test = format!("CF.rwlock_{n}.{agent}");
@@ -303,6 +303,36 @@ pub(crate) async fn concurrent_fs_rwlock_tests(r: &mut TestRunner) {
                 &resp,
                 Response::ExecResult { exit_code: 0, stdout, .. }
                     if stdout.contains("CONCURRENT_FS_OK")
+            );
+            r.record(&test, agent, pass, &format!("{resp:?}"));
+        }
+    }
+
+    // CF.rwlock_multi: fork N children that concurrently open DIFFERENT files.
+    // Each child opens multiple shared libraries, triggering uncached
+    // lower.open() → write lock.  When two children race to insert the
+    // same path, the second hits lower_fd_is_shareable() under the write
+    // lock — a 9P fstat that deadlocks with the fair RwLock.
+    for &n in &[3, 4, 6] {
+        for &agent in CF_AGENTS {
+            let test = format!("CF.rwlock_multi_{n}.{agent}");
+            let resp = r
+                .send(
+                    agent,
+                    exec_timeout(
+                        vec![
+                            self_exe.clone(),
+                            "concurrent-fs-multi".into(),
+                            n.to_string(),
+                        ],
+                        20,
+                    ),
+                )
+                .await;
+            let pass = matches!(
+                &resp,
+                Response::ExecResult { exit_code: 0, stdout, .. }
+                    if stdout.contains("CONCURRENT_FS_MULTI_OK")
             );
             r.record(&test, agent, pass, &format!("{resp:?}"));
         }

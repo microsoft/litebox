@@ -68,6 +68,14 @@ pub struct FileSystem<
     lower: Lower,
     // TODO: Possibly support a single-threaded variant that doesn't have the cost of requiring a
     // sync-primitives platform, as well as cost of mutexes and such?
+    //
+    // INVARIANT: never hold this lock (read OR write) across any call into
+    // `self.lower` (9P filesystem).  The RwLock is writer-preferring: a
+    // queued writer blocks all new readers.  If a thread holds this lock
+    // while a 9P round-trip blocks, concurrent open()/close()/fstat()
+    // callers deadlock behind the queued writer.  Pattern: take lock →
+    // extract/clone what you need → drop lock → call 9P → re-lock if
+    // mutation is required.
     root: sync::RwLock<Platform, RootDir<Upper, Lower>>,
     layering_semantics: LayeringSemantics,
     // cwd invariant: always ends with a `/`
@@ -856,39 +864,59 @@ impl<
                         return Err(OpenError::Io);
                     };
                     let entry = if shareable {
-                        let mut root = self.root.write();
-                        if let Some(existing) = root.entries.get(&path) {
-                            match existing.as_ref() {
-                                EntryX::Lower { fd } => {
-                                    let Ok(existing_shareable) = self.lower_fd_is_shareable(fd)
-                                    else {
-                                        drop(root);
-                                        let _ = self.lower.close(&lower_fd);
-                                        return Err(OpenError::Io);
-                                    };
-                                    if existing_shareable {
-                                        let shared = Arc::clone(existing);
-                                        drop(root);
-                                        let _ = self.lower.close(&lower_fd);
-                                        shared
-                                    } else {
+                        // Check if another thread already inserted an entry
+                        // for this path.  We must NOT call lower_fd_is_shareable()
+                        // (9P fstat) while holding the write lock — the writer-
+                        // preferring RwLock would deadlock concurrent readers.
+                        let existing_arc = {
+                            let root = self.root.write();
+                            match root.entries.get(&path) {
+                                Some(existing) => match existing.as_ref() {
+                                    EntryX::Lower { .. } => Some(Arc::clone(existing)),
+                                    EntryX::Upper { .. } | EntryX::Tombstone => {
                                         drop(root);
                                         let _ = self.lower.close(&lower_fd);
                                         return Err(PathError::NoSuchFileOrDirectory.into());
                                     }
-                                }
-                                EntryX::Upper { .. } | EntryX::Tombstone => {
-                                    drop(root);
-                                    let _ = self.lower.close(&lower_fd);
-                                    return Err(PathError::NoSuchFileOrDirectory.into());
-                                }
+                                },
+                                None => None,
+                            }
+                            // write lock released here
+                        };
+                        if let Some(existing_arc) = existing_arc {
+                            // Call lower_fd_is_shareable OUTSIDE the lock.
+                            let existing_shareable = match &*existing_arc {
+                                EntryX::Lower { fd } => self.lower_fd_is_shareable(fd),
+                                _ => unreachable!(),
+                            };
+                            let Ok(existing_shareable) = existing_shareable else {
+                                let _ = self.lower.close(&lower_fd);
+                                return Err(OpenError::Io);
+                            };
+                            if existing_shareable {
+                                let _ = self.lower.close(&lower_fd);
+                                existing_arc
+                            } else {
+                                let _ = self.lower.close(&lower_fd);
+                                return Err(PathError::NoSuchFileOrDirectory.into());
                             }
                         } else {
-                            let entry = Arc::new(EntryX::Lower { fd: lower_fd });
-                            root.entries.insert(path.clone(), Arc::clone(&entry));
-                            root.lower_access_modes
-                                .insert(path.clone(), flags.bits() & 0x3);
-                            entry
+                            // No existing entry — insert under the write lock.
+                            let mut root = self.root.write();
+                            // Re-check: another thread may have inserted while
+                            // we briefly released the lock above.
+                            if let Some(existing) = root.entries.get(&path) {
+                                let shared = Arc::clone(existing);
+                                drop(root);
+                                let _ = self.lower.close(&lower_fd);
+                                shared
+                            } else {
+                                let entry = Arc::new(EntryX::Lower { fd: lower_fd });
+                                root.entries.insert(path.clone(), Arc::clone(&entry));
+                                root.lower_access_modes
+                                    .insert(path.clone(), flags.bits() & 0x3);
+                                entry
+                            }
                         }
                     } else {
                         Arc::new(EntryX::Lower { fd: lower_fd })
@@ -1055,62 +1083,87 @@ impl<
             // Insert into root entries, handling the race where another thread may have
             // already inserted an entry for the same path between our earlier read-lock
             // check and this write-lock acquisition.
-            let mut root = self.root.write();
-            if let Some(existing) = root.entries.get(&path) {
-                match existing.as_ref() {
-                    EntryX::Lower { fd } => {
-                        let Ok(existing_shareable) = self.lower_fd_is_shareable(fd) else {
-                            drop(root);
-                            let _ = self.lower.close(&lower_fd);
-                            return Err(OpenError::Io);
-                        };
-                        if existing_shareable {
-                            // Check if the existing entry's access mode is
-                            // compatible with the requested mode before reusing.
-                            let requested_access = flags.bits() & 0x3;
+            //
+            // IMPORTANT: we must NOT call lower_fd_is_shareable() (which does
+            // a 9P fstat) while holding the write lock.  The writer-preferring
+            // RwLock would block all concurrent readers/writers, causing deadlock.
+            // Instead we: take write lock → clone Arc → drop lock → call 9P → re-lock.
+            let existing_info = {
+                let root = self.root.write();
+                match root.entries.get(&path) {
+                    Some(existing) => match existing.as_ref() {
+                        EntryX::Lower { .. } => {
+                            let arc = Arc::clone(existing);
                             let cached_access =
                                 root.lower_access_modes.get(&path).copied().unwrap_or(0);
-                            let needs_read = requested_access == 0 || requested_access == 2;
-                            let needs_write = requested_access == 1 || requested_access == 2;
-                            let cached_can_read = cached_access == 0 || cached_access == 2;
-                            let cached_can_write = cached_access == 1 || cached_access == 2;
-                            let compatible = (!needs_read || cached_can_read)
-                                && (!needs_write || cached_can_write);
-                            if compatible {
-                                // Reuse the existing entry.
-                                let shared = Arc::clone(existing);
-                                drop(root);
-                                let _ = self.lower.close(&lower_fd);
-                                shared
-                            } else {
-                                // Incompatible mode — replace the cache entry
-                                // with the new fid that has the correct mode.
-                                let entry = Arc::new(EntryX::Lower { fd: lower_fd });
-                                root.entries.insert(path.clone(), Arc::clone(&entry));
-                                root.lower_access_modes
-                                    .insert(path.clone(), requested_access);
-                                entry
-                            }
-                        } else {
+                            Some((arc, cached_access))
+                        }
+                        EntryX::Upper { .. } | EntryX::Tombstone => {
+                            // Tombstone or Upper inserted concurrently — shouldn't happen in
+                            // normal operation, but close the FD we opened and bail out.
                             drop(root);
                             let _ = self.lower.close(&lower_fd);
                             return Err(PathError::NoSuchFileOrDirectory.into());
                         }
-                    }
-                    EntryX::Upper { .. } | EntryX::Tombstone => {
-                        // Tombstone or Upper inserted concurrently — shouldn't happen in
-                        // normal operation, but close the FD we opened and bail out.
-                        drop(root);
+                    },
+                    None => None,
+                }
+                // write lock released here
+            };
+            if let Some((existing_arc, cached_access)) = existing_info {
+                // Call lower_fd_is_shareable OUTSIDE the lock (9P fstat).
+                let existing_shareable = match &*existing_arc {
+                    EntryX::Lower { fd } => self.lower_fd_is_shareable(fd),
+                    _ => unreachable!(),
+                };
+                let Ok(existing_shareable) = existing_shareable else {
+                    let _ = self.lower.close(&lower_fd);
+                    return Err(OpenError::Io);
+                };
+                if existing_shareable {
+                    // Check if the existing entry's access mode is
+                    // compatible with the requested mode before reusing.
+                    let requested_access = flags.bits() & 0x3;
+                    let needs_read = requested_access == 0 || requested_access == 2;
+                    let needs_write = requested_access == 1 || requested_access == 2;
+                    let cached_can_read = cached_access == 0 || cached_access == 2;
+                    let cached_can_write = cached_access == 1 || cached_access == 2;
+                    let compatible =
+                        (!needs_read || cached_can_read) && (!needs_write || cached_can_write);
+                    if compatible {
+                        // Reuse the existing entry.
                         let _ = self.lower.close(&lower_fd);
-                        return Err(PathError::NoSuchFileOrDirectory.into());
+                        existing_arc
+                    } else {
+                        // Incompatible mode — replace the cache entry
+                        // with the new fid that has the correct mode.
+                        let mut root = self.root.write();
+                        let entry = Arc::new(EntryX::Lower { fd: lower_fd });
+                        root.entries.insert(path.clone(), Arc::clone(&entry));
+                        root.lower_access_modes
+                            .insert(path.clone(), requested_access);
+                        entry
                     }
+                } else {
+                    let _ = self.lower.close(&lower_fd);
+                    return Err(PathError::NoSuchFileOrDirectory.into());
                 }
             } else {
-                let entry = Arc::new(EntryX::Lower { fd: lower_fd });
-                root.entries.insert(path.clone(), Arc::clone(&entry));
-                root.lower_access_modes
-                    .insert(path.clone(), flags.bits() & 0x3);
-                entry
+                // No existing entry — insert under write lock.
+                let mut root = self.root.write();
+                // Re-check for race: another thread may have inserted.
+                if let Some(existing) = root.entries.get(&path) {
+                    let shared = Arc::clone(existing);
+                    drop(root);
+                    let _ = self.lower.close(&lower_fd);
+                    shared
+                } else {
+                    let entry = Arc::new(EntryX::Lower { fd: lower_fd });
+                    root.entries.insert(path.clone(), Arc::clone(&entry));
+                    root.lower_access_modes
+                        .insert(path.clone(), flags.bits() & 0x3);
+                    entry
+                }
             }
         } else {
             Arc::new(EntryX::Lower { fd: lower_fd })
@@ -2148,7 +2201,10 @@ impl<
         if self.is_hidden_by_tombstone(&path)? {
             return Err(PathError::NoSuchFileOrDirectory)?;
         }
-        if let Some(entry) = self.root.read().entries.get(&path) {
+        if let Some(entry) = self.root.read().entries.get(&path).cloned() {
+            // Clone the Arc above and let the read lock drop before calling
+            // into lower/upper — 9P calls under the RwLock cause deadlocks
+            // with concurrent writers (the RwLock is writer-preferring).
             let FileStatus {
                 file_type,
                 mode,
