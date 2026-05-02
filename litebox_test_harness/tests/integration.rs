@@ -4,12 +4,20 @@
 //! Integration test: runs the test harness inside a Docker container to
 //! verify behavior against the native Linux gold standard and litebox.
 //!
-//! Usage: `cargo test -p litebox_test_harness --test integration`
+//! Usage:
+//!   cargo test -p litebox_test_harness --test integration              # all passes
+//!   cargo test -p litebox_test_harness --test integration test_native  # native only
+//!   cargo test -p litebox_test_harness --test integration test_litebox # litebox only
+//!   LITEBOX_FILTER=fork cargo test ... --test integration test_native  # filtered
 //!
 //! The Docker image (`litebox-test`) is built from the multi-target
 //! Dockerfile at `litebox_tool_executor/rootfs/Dockerfile`. All rootfs
 //! dependencies (bash, coreutils, Node.js, etc.) come from the Dockerfile —
 //! never from the host. Test harness and litebox binaries are bind-mounted.
+//!
+//! Target directory: uses `CARGO_TARGET_DIR` if set, otherwise derives
+//! `~/litebox-out/<worktree-basename>` per AGENTS.md convention (ext4 for
+//! performance).
 //!
 //! To add a rootfs dependency, edit the Dockerfile. There is no other path.
 
@@ -23,11 +31,47 @@ fn workspace_root() -> PathBuf {
     manifest_dir.parent().expect("workspace root").to_path_buf()
 }
 
-/// Find the target/debug directory containing built binaries.
+/// Determine the target directory for builds.
+///
+/// Uses `CARGO_TARGET_DIR` if set (standard cargo env var), otherwise
+/// derives `~/litebox-out/<worktree-basename>` per AGENTS.md convention.
+/// This ensures builds land on ext4 (not NTFS) for performance.
+fn target_dir() -> PathBuf {
+    if let Ok(dir) = std::env::var("CARGO_TARGET_DIR") {
+        return PathBuf::from(dir);
+    }
+    let ws = workspace_root();
+    let name = ws
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_string();
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+    PathBuf::from(format!("{home}/litebox-out/{name}"))
+}
+
+/// Directory containing PIE debug binaries.
 fn debug_dir() -> PathBuf {
-    let exe = std::env::current_exe().expect("current_exe");
-    // target/debug/deps/integration-xxx → target/debug
-    exe.parent().unwrap().parent().unwrap().to_path_buf()
+    target_dir().join("debug")
+}
+
+/// Directory containing non-PIE debug binaries.
+fn nonpie_dir() -> PathBuf {
+    target_dir().join("nonpie/debug")
+}
+
+/// Optional spawn-tree filter from `LITEBOX_FILTER` env var.
+fn spawn_tree_filter() -> Option<String> {
+    std::env::var("LITEBOX_FILTER").ok()
+}
+
+/// Build spawn-tree command args, including optional filter.
+fn spawn_tree_args() -> Vec<String> {
+    let mut args = vec!["spawn-tree".to_string()];
+    if let Some(filter) = spawn_tree_filter() {
+        args.push(format!("--filter={filter}"));
+    }
+    args
 }
 
 /// Build the Docker test image if needed.
@@ -55,13 +99,18 @@ fn ensure_docker_image(ws_root: &Path) {
     assert!(status.success(), "Docker build failed");
 }
 
-/// Build all required binaries (PIE + non-PIE).
+/// Build all required binaries (PIE + non-PIE) to the target directory.
 fn ensure_binaries_built(ws_root: &Path) {
-    eprintln!("Building litebox binaries (PIE)...");
+    let td = target_dir();
+    let td_str = td.to_string_lossy();
+
+    eprintln!("Building litebox binaries (PIE) to {td_str}...");
     let status = Command::new("cargo")
         .current_dir(ws_root)
         .args([
             "build",
+            "--target-dir",
+            &td_str,
             "-p",
             "litebox_tool_executor",
             "-p",
@@ -75,7 +124,9 @@ fn ensure_binaries_built(ws_root: &Path) {
         .expect("cargo build");
     assert!(status.success(), "cargo build (PIE) failed");
 
-    eprintln!("Building litebox_test_harness (non-PIE)...");
+    let nonpie_td = td.join("nonpie");
+    let nonpie_td_str = nonpie_td.to_string_lossy();
+    eprintln!("Building litebox_test_harness (non-PIE) to {nonpie_td_str}...");
     let status = Command::new("cargo")
         .current_dir(ws_root)
         .args([
@@ -83,7 +134,7 @@ fn ensure_binaries_built(ws_root: &Path) {
             "-p",
             "litebox_test_harness",
             "--target-dir",
-            "target/nonpie",
+            &nonpie_td_str,
             "--",
             "-C",
             "link-args=-no-pie",
@@ -189,12 +240,12 @@ fn check_results(
     );
 }
 
-#[test]
-fn process_tree_tests() {
+/// Shared setup: build binaries and Docker image, return paths.
+fn setup() -> (PathBuf, PathBuf, PathBuf) {
     let ws_root = workspace_root();
     let debug = debug_dir();
+    let nonpie = nonpie_dir();
 
-    // ── Build everything ──
     ensure_binaries_built(&ws_root);
     ensure_docker_image(&ws_root);
 
@@ -204,82 +255,75 @@ fn process_tree_tests() {
         "litebox_test_harness not found at {}",
         harness.display()
     );
-    let nonpie = ws_root.join("target/nonpie/debug/litebox_test_harness");
+    let nonpie_bin = nonpie.join("litebox_test_harness");
     assert!(
-        nonpie.exists(),
+        nonpie_bin.exists(),
         "non-PIE litebox_test_harness not found at {}",
-        nonpie.display()
+        nonpie_bin.display()
     );
 
-    // ── Pass 1: Native baseline (no litebox, inside Docker) ──
-    // The Docker container's filesystem IS the rootfs — immutable.
-    // Test harness and non-PIE binaries are bind-mounted read-only.
+    (ws_root, debug, nonpie)
+}
+
+/// Native baseline: 0 FAIL, 0 xfail, 0 XPASS.
+/// This is the gold standard — any failure here is a test or Dockerfile bug.
+#[test]
+fn test_native() {
+    let (_ws_root, debug, nonpie) = setup();
+
+    let args = spawn_tree_args();
+    let harness_args: Vec<&str> = std::iter::once("/opt/litebox/litebox_test_harness")
+        .chain(args.iter().map(|s| s.as_str()))
+        .collect();
+
     let native_results = {
         let mut cmd = Command::new("docker");
         cmd.args(["run", "--rm", "--cap-add", "SYS_PTRACE"])
             .arg("-v")
             .arg(format!("{}:/opt/litebox:ro", debug.display()))
             .arg("-v")
-            .arg(format!(
-                "{}:/opt/nonpie:ro",
-                ws_root.join("target/nonpie/debug").display()
-            ))
+            .arg(format!("{}:/opt/nonpie:ro", nonpie.display()))
             .arg("litebox-test")
-            .args(["/opt/litebox/litebox_test_harness", "spawn-tree"]);
+            .args(&harness_args);
         run_and_parse("native", &mut cmd)
     };
 
-    if native_results.is_empty() {
-        eprintln!("WARNING: native baseline produced no results.");
-    } else {
-        // Native baseline must pass everything — 0 FAIL, 0 xfail, 0 XPASS.
-        // This is the gold standard: any failure here is a test or Dockerfile bug.
-        check_results("native", &native_results, 0, 0, 0);
-    }
+    assert!(
+        !native_results.is_empty(),
+        "native baseline produced no results"
+    );
+    check_results("native", &native_results, 0, 0, 0);
+}
 
-    // ── Pass 2: Litebox ──
-    // Run the test harness inside litebox, inside the same Docker container.
+/// Litebox pass: expected fail/xfail counts must match.
+#[test]
+fn test_litebox() {
+    let (_ws_root, debug, nonpie) = setup();
+
+    let args = spawn_tree_args();
+    let mut harness_args: Vec<String> = vec![
+        "/opt/litebox/litebox_tool_executor".into(),
+        "--rootfs".into(),
+        "/".into(),
+        "--record-baseline".into(),
+        "--".into(),
+        "/opt/litebox/litebox_test_harness".into(),
+    ];
+    harness_args.extend(args);
+
     let litebox_results = {
         let mut cmd = Command::new("docker");
         cmd.args(["run", "--rm", "--cap-add", "SYS_PTRACE"])
             .arg("-v")
             .arg(format!("{}:/opt/litebox:ro", debug.display()))
             .arg("-v")
-            .arg(format!(
-                "{}:/opt/nonpie:ro",
-                ws_root.join("target/nonpie/debug").display()
-            ))
+            .arg(format!("{}:/opt/nonpie:ro", nonpie.display()))
             .arg("litebox-test")
-            .args([
-                "/opt/litebox/litebox_tool_executor",
-                "--rootfs",
-                "/",
-                "--record-baseline",
-                "--",
-                "/opt/litebox/litebox_test_harness",
-                "spawn-tree",
-            ]);
+            .args(harness_args.iter().map(|s| s.as_str()));
         run_and_parse("litebox", &mut cmd)
     };
 
     // Update these constants when intentionally adding/removing xfails/failures.
-    //
-    // Symlink xfails (dynamic — probe returns ENOTSUP in litebox):
-    //   basic: 4 subtests × 5 topologies = 20
-    //   variants: S.dir + S.dangling + S.nested + S.relative = 4
-    // Total xfail: 24
-    //
-    // Known litebox failures (real platform gaps):
-    //   US1,3,4,5 + VS1: bare-fork unix socket tests timeout (5)
-    //   UF.fork_unix.{A,AA,B}: bare-fork unix coordinator tests (3)
-    //   XW3,4: cross-worker unix socket connect ECONNREFUSED (2)
-    //   U.{vscode_d3_d4,vscode_d4_d3,d4_to_sibling_b,d5_to_a,a_to_np,np_to_a}:
-    //       cross-worker unix socket matrix tests ECONNREFUSED (6)
-    //   SS.{pipe_in_subst,multi_pipe_subst,file_pipe_subst,subst_then_cmds,
-    //       vscode_osrelease,backtick_pipe}.{sh,bash}.{A,AA}: stdin-pipe $()
-    //       with pipelines loses stdout (6×2×2 = 24)
-    //   SP.{pipeline,file_pipe}.{A,AA,B}: stdin-pipe $() with cat|head (6)
-    // Total FAIL: 46
     const EXPECTED_XFAIL_COUNT: usize = 24;
     const EXPECTED_FAIL_COUNT: usize = 46;
     const EXPECTED_XPASS_COUNT: usize = 0;
@@ -290,45 +334,13 @@ fn process_tree_tests() {
         EXPECTED_FAIL_COUNT,
         EXPECTED_XPASS_COUNT,
     );
+}
 
-    // ── Cross-check: any test passing natively but failing in litebox is a regression ──
-    if !native_results.is_empty() {
-        let native_pass: std::collections::HashSet<String> = native_results
-            .iter()
-            .filter(|r| r["result"].as_str() == Some("pass"))
-            .filter_map(|r| r["test"].as_str().map(String::from))
-            .collect();
-
-        let litebox_fail: Vec<_> = litebox_results
-            .iter()
-            .filter(|r| r["result"].as_str() == Some("FAIL"))
-            .filter(|r| {
-                r["test"]
-                    .as_str()
-                    .map_or(false, |t| native_pass.contains(t))
-            })
-            .collect();
-
-        if !litebox_fail.is_empty() {
-            eprintln!("\n=== LITEBOX REGRESSIONS (pass natively, fail in litebox) ===");
-            for r in &litebox_fail {
-                eprintln!(
-                    "  {} [{}]: {}",
-                    r["test"].as_str().unwrap_or("?"),
-                    r["agent"].as_str().unwrap_or("?"),
-                    r["detail"].as_str().unwrap_or(""),
-                );
-            }
-        }
-    }
-
-    // ── Pass 3: Host-side tests (TCP through port forwarding) ──
-    // Launches litebox with --forward-port, runs the test harness in
-    // agent-listen mode inside the sandbox, and connects from the host
-    // via the forwarded port. Tests that the broker's TCP forwarding
-    // works end-to-end.
-    eprintln!("\n=== Pass 3: Host-side tests ===");
-    run_host_tests(&debug, &ws_root);
+/// Host-side tests: TCP port forwarding through the broker.
+#[test]
+fn test_host_fwd() {
+    let (_ws_root, debug, nonpie) = setup();
+    run_host_tests(&debug, &nonpie);
 }
 
 /// Run host-side tests that exercise TCP port forwarding through the broker.
@@ -339,7 +351,7 @@ fn process_tree_tests() {
 ///
 /// The guest runs `litebox-test-harness agent-listen 9090`, and the host
 /// connects via `localhost:19090` to send commands.
-fn run_host_tests(debug: &Path, ws_root: &Path) {
+fn run_host_tests(debug: &Path, nonpie: &Path) {
     use std::io::{BufRead, BufReader, Read, Write};
     use std::net::TcpStream;
     use std::time::Duration;
@@ -355,10 +367,7 @@ fn run_host_tests(debug: &Path, ws_root: &Path) {
         .arg("-v")
         .arg(format!("{}:/opt/litebox:ro", debug.display()))
         .arg("-v")
-        .arg(format!(
-            "{}:/opt/nonpie:ro",
-            ws_root.join("target/nonpie/debug").display()
-        ))
+        .arg(format!("{}:/opt/nonpie:ro", nonpie.display()))
         .arg("litebox-test")
         .args([
             "/opt/litebox/litebox_tool_executor",
