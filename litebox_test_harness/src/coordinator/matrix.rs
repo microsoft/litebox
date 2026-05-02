@@ -945,8 +945,8 @@ async fn run_unix_tests(r: &mut TestRunner) {
             r.record(
                 &format!("U.{}.listen", tc.name),
                 tc.agent,
-                true,
-                "skipped (nonpie binary not found)",
+                false,
+                "FAIL: nonpie binary not found — mount at /opt/nonpie",
             );
             continue;
         }

@@ -528,7 +528,9 @@ async fn run_tests(self_exe: &str, filter: Option<&str>) -> Vec<TestResult> {
             }
         }
     } else {
-        eprintln!("[coord] non-PIE binary not found, skipping mixed tree");
+        // Non-PIE binary is a required dependency. Record failures for
+        // all tests that need the NP/D3/D4/D5 agents.
+        eprintln!("[coord] non-PIE binary not found — mount at /opt/nonpie");
     }
 
     let should_run = |suite: &str| filter.is_none() || filter == Some(suite);
