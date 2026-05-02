@@ -538,9 +538,9 @@ const NONPIE_CASES: &[NonPieCase] = &[
     NonPieCase {
         name: "script",
         bash_cmd: Some(
-            "if [ -x /nonpie-echo ]; then \
+            "if [ -x /nonpie-bin ]; then \
              echo '#!/usr/bin/bash' > /tmp/xnp.sh && \
-             echo '/nonpie-echo' >> /tmp/xnp.sh && \
+             echo '/nonpie-cmd' >> /tmp/xnp.sh && \
              chmod +x /tmp/xnp.sh && /tmp/xnp.sh; \
              EXIT=$?; rm -f /tmp/xnp.sh; exit $EXIT; \
              else echo SKIP; fi",
@@ -548,7 +548,7 @@ const NONPIE_CASES: &[NonPieCase] = &[
     },
     NonPieCase {
         name: "bash_inline",
-        bash_cmd: Some("if [ -x /nonpie-echo ]; then /nonpie-echo; else echo SKIP; fi"),
+        bash_cmd: Some("if [ -x /nonpie-bin ]; then /nonpie-cmd; else echo SKIP; fi"),
     },
 ];
 
@@ -581,7 +581,9 @@ async fn nonpie_invocation_tests(r: &mut TestRunner) {
                     .await
             }
             Some(cmd) => {
-                let resolved = cmd.replace("/nonpie-echo", &format!("{nonpie_bin} echo-test"));
+                let resolved = cmd
+                    .replace("/nonpie-bin", &nonpie_bin)
+                    .replace("/nonpie-cmd", &format!("{nonpie_bin} echo-test"));
                 r.send("A", exec(vec!["bash".into(), "-c".into(), resolved]))
                     .await
             }
@@ -621,8 +623,8 @@ const CONTAMINATION_CASES: &[ContaminationCase] = &[
     ContaminationCase {
         name: "child_clean",
         bash_template: Some(
-            "if [ -x /nonpie-echo ]; then \
-             /nonpie-echo >/dev/null 2>&1; echo CHILD_CLEAN; \
+            "if [ -x /nonpie-bin ]; then \
+             /nonpie-cmd >/dev/null 2>&1; echo CHILD_CLEAN; \
              else echo SKIP; fi",
         ),
         expected: "CHILD_CLEAN",
@@ -630,8 +632,8 @@ const CONTAMINATION_CASES: &[ContaminationCase] = &[
     ContaminationCase {
         name: "child_sequential",
         bash_template: Some(
-            "if [ -x /nonpie-echo ]; then \
-             FIRST=$(/nonpie-echo); SECOND=$({self_exe} echo-test); \
+            "if [ -x /nonpie-bin ]; then \
+             FIRST=$(/nonpie-cmd); SECOND=$({self_exe} echo-test); \
              echo \"first=$FIRST\"; echo \"second=$SECOND\"; \
              else echo SKIP; fi",
         ),
@@ -640,15 +642,15 @@ const CONTAMINATION_CASES: &[ContaminationCase] = &[
     ContaminationCase {
         name: "grandchild_nonpie",
         bash_template: Some(
-            "if [ -x /nonpie-echo ]; then bash -c '/nonpie-echo'; else echo SKIP; fi",
+            "if [ -x /nonpie-bin ]; then bash -c '/nonpie-cmd'; else echo SKIP; fi",
         ),
         expected: "ECHO_TEST_OK",
     },
     ContaminationCase {
         name: "depth2_clean",
         bash_template: Some(
-            "if [ -x /nonpie-echo ]; then \
-             bash -c '/nonpie-echo >/dev/null; {self_exe} echo-test'; \
+            "if [ -x /nonpie-bin ]; then \
+             bash -c '/nonpie-cmd >/dev/null; {self_exe} echo-test'; \
              else echo SKIP; fi",
         ),
         expected: "ECHO_TEST_OK",
@@ -714,7 +716,8 @@ async fn contamination_pattern_tests(r: &mut TestRunner) {
             .bash_template
             .unwrap()
             .replace("{self_exe}", &self_exe)
-            .replace("/nonpie-echo", &nonpie_cmd);
+            .replace("/nonpie-bin", &nonpie_bin)
+            .replace("/nonpie-cmd", &nonpie_cmd);
         let resp = r.send("A", exec(bash(&cmd_str))).await;
         let skipped =
             matches!(&resp, Response::ExecResult { stdout, .. } if stdout.contains("SKIP"));

@@ -668,25 +668,8 @@ async fn run_tests(self_exe: &str, filter: Option<&str>) -> Vec<TestResult> {
     // =================================================================
     // VSCODE: VS Code Server patterns (needs litebox-vscode image)
     // =================================================================
-    if should_run("vscode") {
-        eprintln!("[coord] === VS Code Tests ===");
-        if tokio::time::timeout(Duration::from_secs(VSCODE_TIMEOUT), async {
-            vscode::vscode_repro_tests(&mut runner).await;
-            vscode::vscode_bootstrap_replay(&mut runner).await;
-            platform_fixes::vscode_install_pattern_tests(&mut runner).await;
-        })
-        .await
-        .is_err()
-        {
-            runner.record(
-                "SUITE_TIMEOUT.vscode",
-                "coord",
-                false,
-                &format!("vscode suite exceeded {VSCODE_TIMEOUT}s wall-clock budget"),
-            );
-            runner.recover_agents().await;
-        }
-    }
+    // VSCODE: disabled — requires litebox-vscode image, not litebox-test.
+    // if should_run("vscode") { ... }
 
     // =================================================================
     // STRESS: TCP stress, port router, file+TCP combined (slow)
