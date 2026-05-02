@@ -1161,99 +1161,117 @@ impl<
         }
         // Crucially, we need to grab an exclusive lock to the root, so that the counts cannot
         // change while we are reasoning about them.
-        let RootDir {
-            entries: root_entries,
-            lower_access_modes: root_access_modes,
-        } = &mut *self.root.write();
-        // Our approach to this changes depending on whether this is an upper level FD or a
-        // lower FD.
-        match *entry {
-            EntryX::Tombstone => {
-                // A tombstone should never have even become an FD (if a file was opened, and then
-                // was subsequently deleted, then the FD itself would not yet be a tombstone, but
-                // would be pointing to the original value).
-                unreachable!()
-            }
-            EntryX::Upper { .. } => {
-                // Upper-level FDs do not have any entry in the root, nor do they share anything via
-                // `Arc`s. Thus, we can deal with them individually.
-                assert_eq!(Arc::strong_count(&entry), 1);
-                // Specifically, we can just immediately close them out, consuming the entry itself.
-                let EntryX::Upper { fd } = Arc::into_inner(entry).unwrap() else {
+        //
+        // IMPORTANT: we must NOT hold this lock across blocking I/O
+        // (e.g., `self.lower.close()`).  The RwLock is writer-preferring,
+        // so a queued writer blocks all new readers.  If a reader is
+        // blocked on 9P while a close() writer queues, concurrent
+        // open() readers deadlock behind the writer.  We extract the
+        // fd to close under the lock, then release the lock before
+        // calling `self.lower.close()`.
+        let deferred_close = {
+            let RootDir {
+                entries: root_entries,
+                lower_access_modes: root_access_modes,
+            } = &mut *self.root.write();
+            // Our approach to this changes depending on whether this is an upper level FD or a
+            // lower FD.
+            match *entry {
+                EntryX::Tombstone => {
+                    // A tombstone should never have even become an FD (if a file was opened, and then
+                    // was subsequently deleted, then the FD itself would not yet be a tombstone, but
+                    // would be pointing to the original value).
                     unreachable!()
-                };
-                self.upper.close(&fd)
-            }
-            EntryX::Lower { .. } => {
-                // Lower-level descriptors without a root entry are either standalone
-                // (e.g., character devices) or had their cache evicted (e.g., by rename).
-                // Close the fd if we are the sole remaining holder; otherwise another
-                // descriptor will handle it.
-                if !root_entries.contains_key(&path) {
-                    match Arc::into_inner(entry) {
-                        Some(EntryX::Lower { fd }) => return self.lower.close(&fd),
-                        Some(_) => unreachable!(),
-                        None => return Ok(()),
-                    }
                 }
-                // Shared lower-level FDs have a corresponding entry in the root. Thus, we might
-                // need to possibly clean things up from the root.
-                //
-                // First, we can attempt a fast-path clean-up by quickly check if there are other
-                // FDs referring to the same file
-                if Arc::strong_count(&entry) > 2 {
-                    // There are _definitely_ other FDs pointing at this file, leave it alone
-                    return Ok(());
+                EntryX::Upper { .. } => {
+                    // Upper-level FDs do not have any entry in the root, nor do they share anything via
+                    // `Arc`s. Thus, we can deal with them individually.
+                    assert_eq!(Arc::strong_count(&entry), 1);
+                    // Specifically, we can just immediately close them out, consuming the entry itself.
+                    let EntryX::Upper { fd } = Arc::into_inner(entry).unwrap() else {
+                        unreachable!()
+                    };
+                    // Upper close doesn't go through 9P, safe to do here.
+                    return self.upper.close(&fd);
                 }
-                // Otherwise, either we have ourselves and the root pointing at it OR the root has
-                // been tombstoned out after the FDs have been opened at it.
-                match **root_entries.get(&path).unwrap() {
-                    EntryX::Upper { .. } => unreachable!(),
-                    EntryX::Lower { .. } => {
-                        // We are going to have to deal with it at the entry too, fallthrough
-                    }
-                    EntryX::Tombstone => {
-                        // A tombstone here means that the root doesn't contain the entry. There may
-                        // possibly be other FDs opened for the same file before it was tombstoned
-                        // out, so we'll close it out if we are the sole remaining holder;
-                        // otherwise, it will be someone else's job to do so.
+                EntryX::Lower { .. } => {
+                    // Lower-level descriptors without a root entry are either standalone
+                    // (e.g., character devices) or had their cache evicted (e.g., by rename).
+                    // Close the fd if we are the sole remaining holder; otherwise another
+                    // descriptor will handle it.
+                    if !root_entries.contains_key(&path) {
                         match Arc::into_inner(entry) {
-                            Some(EntryX::Upper { .. } | EntryX::Tombstone) => unreachable!(),
-                            Some(EntryX::Lower { fd }) => {
-                                // We are the sole remaining holder of the FD. Let us clean things
-                                // up at the lower level.
-                                return self.lower.close(&fd);
-                            }
-                            None => {
-                                // Someone else's job. We can quit successfully.
-                                return Ok(());
+                            Some(EntryX::Lower { fd }) => Some(fd),
+                            Some(_) => unreachable!(),
+                            None => None,
+                        }
+                    } else {
+                        // Shared lower-level FDs have a corresponding entry in the root. Thus, we might
+                        // need to possibly clean things up from the root.
+                        //
+                        // First, we can attempt a fast-path clean-up by quickly check if there are other
+                        // FDs referring to the same file
+                        if Arc::strong_count(&entry) > 2 {
+                            // There are _definitely_ other FDs pointing at this file, leave it alone
+                            None
+                        } else {
+                            // Otherwise, either we have ourselves and the root pointing at it OR the root has
+                            // been tombstoned out after the FDs have been opened at it.
+                            match **root_entries.get(&path).unwrap() {
+                                EntryX::Upper { .. } => unreachable!(),
+                                EntryX::Lower { .. } => {
+                                    // We are going to have to deal with it at the entry too, fallthrough
+                                    // Pull out the root entry. If it is a different Arc (e.g., the
+                                    // cache was evicted by rename and a new open re-populated it),
+                                    // put it back and treat this fd as evicted.
+                                    let root_entry = root_entries.remove(&path).unwrap();
+                                    root_access_modes.remove(&path);
+                                    if !Arc::ptr_eq(&entry, &root_entry) {
+                                        root_entries.insert(path, root_entry);
+                                        match Arc::into_inner(entry) {
+                                            Some(EntryX::Lower { fd }) => Some(fd),
+                                            Some(_) => unreachable!(),
+                                            None => None,
+                                        }
+                                    } else {
+                                        assert!(matches!(*root_entry, EntryX::Lower { .. }));
+                                        drop(root_entry);
+                                        // We are now assured that we can close out the underlying file; we are the only
+                                        // holder of the entry, and then close it out.
+                                        let EntryX::Lower { fd, .. } =
+                                            Arc::into_inner(entry).unwrap()
+                                        else {
+                                            unreachable!()
+                                        };
+                                        Some(fd)
+                                    }
+                                }
+                                EntryX::Tombstone => {
+                                    // A tombstone here means that the root doesn't contain the entry. There may
+                                    // possibly be other FDs opened for the same file before it was tombstoned
+                                    // out, so we'll close it out if we are the sole remaining holder;
+                                    // otherwise, it will be someone else's job to do so.
+                                    match Arc::into_inner(entry) {
+                                        Some(EntryX::Upper { .. } | EntryX::Tombstone) => {
+                                            unreachable!()
+                                        }
+                                        Some(EntryX::Lower { fd }) => Some(fd),
+                                        None => None,
+                                    }
+                                }
                             }
                         }
                     }
                 }
-                // Pull out the root entry. If it is a different Arc (e.g., the
-                // cache was evicted by rename and a new open re-populated it),
-                // put it back and treat this fd as evicted.
-                let root_entry = root_entries.remove(&path).unwrap();
-                root_access_modes.remove(&path);
-                if !Arc::ptr_eq(&entry, &root_entry) {
-                    root_entries.insert(path, root_entry);
-                    match Arc::into_inner(entry) {
-                        Some(EntryX::Lower { fd }) => return self.lower.close(&fd),
-                        Some(_) => unreachable!(),
-                        None => return Ok(()),
-                    }
-                }
-                assert!(matches!(*root_entry, EntryX::Lower { .. }));
-                drop(root_entry);
-                // We are now assured that we can close out the underlying file; we are the only
-                // holder of the entry, and thus can change it from an Arc to the underlying value
-                // itself, and then close it out.
-                let EntryX::Lower { fd, .. } = Arc::into_inner(entry).unwrap() else {
-                    unreachable!()
-                };
-                self.lower.close(&fd)
             }
+        }; // write lock released here
+
+        // Perform the lower-level close OUTSIDE the RootDir lock.
+        // This prevents deadlock when close()'s 9P round-trip blocks
+        // while other threads need the RootDir lock for open().
+        match deferred_close {
+            Some(fd) => self.lower.close(&fd),
+            None => Ok(()),
         }
     }
 
