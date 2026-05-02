@@ -138,6 +138,135 @@ fn main() {
         "echo-test" => {
             println!("ECHO_TEST_OK");
         }
+        "fork-exec-nonpie" => {
+            // Fork a child that exec's a non-PIE binary.  Reproduces the
+            // VS Code pattern: code-server (PIE) forks node (ET_EXEC).
+            // Also used to test fork from within a worker-exec host.
+            //
+            // Usage: fork-exec-nonpie <binary> [subcommand]
+            let binary = args.get(2).map(String::as_str).unwrap_or_else(|| {
+                for p in [
+                    "/opt/nonpie/litebox_test_harness",
+                    "/litebox-test-harness-nonpie",
+                ] {
+                    if std::path::Path::new(p).exists() {
+                        return p;
+                    }
+                }
+                "/opt/nonpie/litebox_test_harness"
+            });
+            let sub = args.get(3).map(String::as_str).unwrap_or("echo-test");
+
+            eprintln!("[fork-exec-nonpie] pid={} forking child to exec {binary} {sub}",
+                std::process::id());
+
+            let pid = unsafe { libc::fork() };
+            if pid < 0 {
+                eprintln!("[fork-exec-nonpie] fork failed: {}",
+                    std::io::Error::last_os_error());
+                println!("FORK_EXEC_NONPIE_FAIL:fork");
+                std::process::exit(1);
+            }
+            if pid == 0 {
+                use std::ffi::CString;
+                let bin = CString::new(binary).unwrap();
+                let arg_sub = CString::new(sub).unwrap();
+                let args = [bin.as_ptr(), arg_sub.as_ptr(), core::ptr::null()];
+                unsafe { libc::execv(bin.as_ptr(), args.as_ptr()) };
+                let err = std::io::Error::last_os_error();
+                eprintln!("[fork-exec-nonpie] child execv failed: {err}");
+                std::process::exit(127);
+            }
+
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+            let mut status = 0i32;
+            loop {
+                let ret = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
+                if ret > 0 {
+                    if libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0 {
+                        eprintln!("[fork-exec-nonpie] child exited OK");
+                        println!("FORK_EXEC_NONPIE_OK");
+                        std::process::exit(0);
+                    } else {
+                        eprintln!("[fork-exec-nonpie] child bad exit: {status}");
+                        println!("FORK_EXEC_NONPIE_FAIL:exit={status}");
+                        std::process::exit(1);
+                    }
+                }
+                if std::time::Instant::now() >= deadline {
+                    eprintln!("[fork-exec-nonpie] child TIMEOUT (execve hung?)");
+                    unsafe { libc::kill(pid, libc::SIGKILL) };
+                    unsafe { libc::waitpid(pid, std::ptr::null_mut(), 0) };
+                    println!("FORK_EXEC_NONPIE_FAIL:timeout");
+                    std::process::exit(1);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+        }
+        "fork-exec-pie" => {
+            // Fork a child that exec's a PIE binary.  Tests fork from
+            // within a worker-exec host (the VS Code ptyHost pattern:
+            // worker-exec node forks a PIE child like bash).
+            //
+            // Usage: fork-exec-pie <binary> [subcommand]
+            let binary = args.get(2).map(String::as_str).unwrap_or_else(|| {
+                for p in [
+                    "/opt/litebox/litebox_test_harness",
+                ] {
+                    if std::path::Path::new(p).exists() {
+                        return p;
+                    }
+                }
+                "/opt/litebox/litebox_test_harness"
+            });
+            let sub = args.get(3).map(String::as_str).unwrap_or("echo-test");
+
+            eprintln!("[fork-exec-pie] pid={} forking child to exec {binary} {sub}",
+                std::process::id());
+
+            let pid = unsafe { libc::fork() };
+            if pid < 0 {
+                eprintln!("[fork-exec-pie] fork failed: {}",
+                    std::io::Error::last_os_error());
+                println!("FORK_EXEC_PIE_FAIL:fork");
+                std::process::exit(1);
+            }
+            if pid == 0 {
+                use std::ffi::CString;
+                let bin = CString::new(binary).unwrap();
+                let arg_sub = CString::new(sub).unwrap();
+                let args = [bin.as_ptr(), arg_sub.as_ptr(), core::ptr::null()];
+                unsafe { libc::execv(bin.as_ptr(), args.as_ptr()) };
+                let err = std::io::Error::last_os_error();
+                eprintln!("[fork-exec-pie] child execv failed: {err}");
+                std::process::exit(127);
+            }
+
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+            let mut status = 0i32;
+            loop {
+                let ret = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
+                if ret > 0 {
+                    if libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0 {
+                        eprintln!("[fork-exec-pie] child exited OK");
+                        println!("FORK_EXEC_PIE_OK");
+                        std::process::exit(0);
+                    } else {
+                        eprintln!("[fork-exec-pie] child bad exit: {status}");
+                        println!("FORK_EXEC_PIE_FAIL:exit={status}");
+                        std::process::exit(1);
+                    }
+                }
+                if std::time::Instant::now() >= deadline {
+                    eprintln!("[fork-exec-pie] child TIMEOUT (execve hung?)");
+                    unsafe { libc::kill(pid, libc::SIGKILL) };
+                    unsafe { libc::waitpid(pid, std::ptr::null_mut(), 0) };
+                    println!("FORK_EXEC_PIE_FAIL:timeout");
+                    std::process::exit(1);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+        }
         "tcp-listen-busy" => {
             // Listen on a TCP port, do CPU-bound work for N seconds, then
             // accept one connection and echo. Simulates Node.js initialization:

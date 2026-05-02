@@ -589,6 +589,7 @@ async fn run_tests(self_exe: &str, filter: Option<&str>) -> Vec<TestResult> {
             platform_fixes::exit_data_integrity_tests(&mut runner).await;
             platform_fixes::nonpie_pipe_chain_tests(&mut runner).await;
             platform_fixes::bash_fork_exec_tests(&mut runner).await;
+            platform_fixes::fork_from_worker_exec_tests(&mut runner).await;
             platform_fixes::concurrent_fork_tests(&mut runner).await;
             platform_fixes::pid_visibility_tests(&mut runner).await;
             special_cases::capture_pipe_tests(&mut runner).await;

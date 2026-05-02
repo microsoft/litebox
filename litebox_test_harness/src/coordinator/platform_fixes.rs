@@ -7,7 +7,7 @@
 //! Each test category targets a commit in the wportnoy/vscode-server-in-litebox
 //! branch and must pass on both native WSL2 (gold standard) and litebox.
 
-use super::{TestRunner, exec};
+use super::{TestRunner, exec, exec_timeout};
 use crate::protocol::{Command, Response};
 use tokio::time::Duration;
 
@@ -596,9 +596,127 @@ pub(crate) async fn bash_fork_exec_tests(r: &mut TestRunner) {
 }
 
 // ═══════════════════════════════════════════════════════════════════
-// STDIN-PIPE-SUBST: $() inside scripts piped via stdin
-// (fix for VS Code Remote-SSH install script failure)
+// FORK-FROM-WORKER-EXEC: fork+exec from non-PIE worker-exec hosts
+// (reproduces VS Code ptyHost/extensionHost spawn hang)
 // ═══════════════════════════════════════════════════════════════════
+
+/// Tests fork+exec from within a worker-exec host.
+///
+/// VS Code's code-server (running as a non-PIE node binary in a worker-exec)
+/// spawns ptyHost/extensionHost by forking and exec'ing node.  This test
+/// validates that path using the coordinator's agent tree:
+///
+/// - FWE.pie_from_init: fork+exec PIE from init worker (baseline)
+/// - FWE.nonpie_from_init: fork+exec nonpie from init worker (baseline)
+/// - FWE.pie_from_worker_exec: fork+exec PIE from NP (worker-exec host)
+/// - FWE.nonpie_from_worker_exec: fork+exec nonpie from NP (worker-exec)
+pub(crate) async fn fork_from_worker_exec_tests(r: &mut TestRunner) {
+    let self_exe = r.self_exe.clone();
+    let nonpie = crate::find_nonpie_binary();
+
+    eprintln!("[platform] === Fork from Worker-Exec Tests ===");
+
+    let Some(ref nonpie_bin) = nonpie else {
+        for name in ["pie_from_init", "nonpie_from_init", "pie_from_worker_exec", "nonpie_from_worker_exec"] {
+            r.record(
+                &format!("FWE.{name}"),
+                "A",
+                false,
+                "FAIL: nonpie binary not found — mount at /opt/nonpie",
+            );
+        }
+        return;
+    };
+
+    // Baseline: fork+exec PIE from init worker (agent A, PIE)
+    let resp = r
+        .send(
+            "A",
+            exec_timeout(
+                vec![
+                    self_exe.clone(),
+                    "fork-exec-nonpie".into(),
+                    nonpie_bin.clone(),
+                    "echo-test".into(),
+                ],
+                20,
+            ),
+        )
+        .await;
+    let pass = matches!(
+        &resp,
+        Response::ExecResult { exit_code: 0, stdout, .. }
+            if stdout.contains("FORK_EXEC_NONPIE_OK")
+    );
+    r.record("FWE.nonpie_from_init", "A", pass, &format!("{resp:?}"));
+
+    // Baseline: fork+exec PIE from init worker
+    let resp = r
+        .send(
+            "A",
+            exec_timeout(
+                vec![
+                    self_exe.clone(),
+                    "fork-exec-pie".into(),
+                    self_exe.clone(),
+                    "echo-test".into(),
+                ],
+                20,
+            ),
+        )
+        .await;
+    let pass = matches!(
+        &resp,
+        Response::ExecResult { exit_code: 0, stdout, .. }
+            if stdout.contains("FORK_EXEC_PIE_OK")
+    );
+    r.record("FWE.pie_from_init", "A", pass, &format!("{resp:?}"));
+
+    // Key test: fork+exec PIE from NP (worker-exec host).
+    // This is the VS Code pattern: worker-exec node forks bash/node.
+    let resp = r
+        .send(
+            "NP",
+            exec_timeout(
+                vec![
+                    nonpie_bin.clone(),
+                    "fork-exec-pie".into(),
+                    self_exe.clone(),
+                    "echo-test".into(),
+                ],
+                30,
+            ),
+        )
+        .await;
+    let pass = matches!(
+        &resp,
+        Response::ExecResult { exit_code: 0, stdout, .. }
+            if stdout.contains("FORK_EXEC_PIE_OK")
+    );
+    r.record("FWE.pie_from_worker_exec", "NP", pass, &format!("{resp:?}"));
+
+    // Fork+exec nonpie from NP (nested worker-exec).
+    let resp = r
+        .send(
+            "NP",
+            exec_timeout(
+                vec![
+                    nonpie_bin.clone(),
+                    "fork-exec-nonpie".into(),
+                    nonpie_bin.clone(),
+                    "echo-test".into(),
+                ],
+                30,
+            ),
+        )
+        .await;
+    let pass = matches!(
+        &resp,
+        Response::ExecResult { exit_code: 0, stdout, .. }
+            if stdout.contains("FORK_EXEC_NONPIE_OK")
+    );
+    r.record("FWE.nonpie_from_worker_exec", "NP", pass, &format!("{resp:?}"));
+}
 
 /// When a shell script is piped via stdin (as VS Code Remote-SSH does),
 /// $() command substitution with pipelines must return correct output.
