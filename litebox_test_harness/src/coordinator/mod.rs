@@ -666,12 +666,6 @@ async fn run_tests(self_exe: &str, filter: Option<&str>) -> Vec<TestResult> {
     }
 
     // =================================================================
-    // VSCODE: VS Code Server patterns (needs litebox-vscode image)
-    // =================================================================
-    // VSCODE: disabled — requires litebox-vscode image, not litebox-test.
-    // if should_run("vscode") { ... }
-
-    // =================================================================
     // STRESS: TCP stress, port router, file+TCP combined (slow)
     // =================================================================
     if should_run("stress") {

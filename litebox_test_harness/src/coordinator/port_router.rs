@@ -312,7 +312,6 @@ pub(crate) async fn run(r: &mut TestRunner) {
     fork_background_tests(r).await;
     fork_listen_inherit_tests(r).await;
     child_listen_cross_connect_tests(r).await;
-    // vscode_cli_cross_connect_tests: disabled — requires litebox-vscode image.
 }
 
 // ═══════════════════════════════════════════════════════════════════
