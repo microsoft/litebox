@@ -390,6 +390,37 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> Pipes<Platform> {
             }
         }
     }
+
+    /// Snapshot the writer's `fd_ref_count` for a pipe sender.
+    ///
+    /// Used by the vfork CoW mechanism: when the vfork child closes a
+    /// pipe write-end, `on_close` decrements the shared `fd_ref_count`
+    /// to 0, signaling EOF to readers.  After CoW restore the parent's
+    /// fd table re-contains the write-end entry, but the `fd_ref_count`
+    /// is still 0.  We must restore it so the pipe doesn't report EOF.
+    ///
+    /// Returns `None` if `fd` is not a sender.
+    pub fn snapshot_writer_ref_count(&self, fd: &PipeFd<Platform>) -> Option<usize> {
+        let dt = self.litebox.descriptor_table();
+        match &dt.get_entry(fd)?.entry {
+            PipeEnd::Sender(w) => Some(w.fd_ref_count.load(Ordering::Acquire)),
+            PipeEnd::Receiver(_) => None,
+        }
+    }
+
+    /// Restore the writer's `fd_ref_count` for a pipe sender.
+    ///
+    /// Counterpart to [`snapshot_writer_ref_count`].  Resets the count
+    /// so the reader side doesn't see a spurious EOF caused by the
+    /// vfork child's close.
+    pub fn restore_writer_ref_count(&self, fd: &PipeFd<Platform>, count: usize) {
+        let dt = self.litebox.descriptor_table();
+        if let Some(entry) = dt.get_entry(fd) {
+            if let PipeEnd::Sender(w) = &entry.entry {
+                w.fd_ref_count.store(count, Ordering::Release);
+            }
+        }
+    }
 }
 
 /// Whether a particular pipe end is the sender half or the receiver half

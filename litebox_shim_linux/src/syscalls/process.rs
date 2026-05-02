@@ -2854,6 +2854,14 @@ impl<FS: ShimFS> Task<FS> {
             // runs.  The vfork child shares the ring buffer — its reads
             // advance the shared consumer index.  We restore the index
             // after CoW so the parent doesn't lose data.
+            //
+            // Also snapshot pipe writer fd_ref_counts.  The vfork child
+            // may close pipe write-ends (e.g. tokio's Command::spawn
+            // closes the parent's write-end in the child).  on_close
+            // decrements the shared fd_ref_count to 0, signaling EOF to
+            // readers.  After CoW restore the fd table re-contains the
+            // write-end entry, but the fd_ref_count is still 0.  We must
+            // restore it so pipes don't report spurious EOF.
             let pipe_positions: alloc::vec::Vec<(
                 alloc::sync::Arc<litebox::fd::TypedFd<litebox::pipes::Pipes<crate::Platform>>>,
                 usize,
@@ -2877,6 +2885,24 @@ impl<FS: ShimFS> Task<FS> {
                     positions.len(),
                 );
                 positions
+            };
+            let pipe_writer_ref_counts: alloc::vec::Vec<(
+                alloc::sync::Arc<litebox::fd::TypedFd<litebox::pipes::Pipes<crate::Platform>>>,
+                usize,
+            )> = {
+                let files = self.files.borrow();
+                let rds = files.raw_descriptor_store.read();
+                let mut counts = alloc::vec::Vec::new();
+                for raw_fd in rds.iter_alive() {
+                    if let Ok(typed) =
+                        rds.fd_from_raw_integer::<litebox::pipes::Pipes<crate::Platform>>(raw_fd)
+                    {
+                        if let Some(count) = self.global.pipes.snapshot_writer_ref_count(&typed) {
+                            counts.push((typed, count));
+                        }
+                    }
+                }
+                counts
             };
 
             // Like Linux's TASK_UNINTERRUPTIBLE wait: keep blocking even if
@@ -2910,6 +2936,15 @@ impl<FS: ShimFS> Task<FS> {
                 }
             }
             drop(pipe_positions);
+
+            // Restore pipe writer fd_ref_counts so readers don't see
+            // spurious EOF from the vfork child's close.
+            for (typed, saved_count) in &pipe_writer_ref_counts {
+                self.global
+                    .pipes
+                    .restore_writer_ref_count(typed, *saved_count);
+            }
+            drop(pipe_writer_ref_counts);
 
             // Apply fd replacements deposited by commit_delayed_fork.
             // Instead of replacing with HostPipeFd (which has a no-op
