@@ -55,7 +55,7 @@ fn get_pass_results(pass: &str, filter_arg: &str) -> Vec<serde_json::Value> {
         spawn_args.push(format!("--filter={filter_arg}"));
     }
 
-    let results = match pass {
+    let mut results = match pass {
         "native" => {
             let mut cmd = Command::new("docker");
             cmd.args(["run", "--rm", "--cap-add", "SYS_PTRACE"])
@@ -90,6 +90,42 @@ fn get_pass_results(pass: &str, filter_arg: &str) -> Vec<serde_json::Value> {
         }
         _ => panic!("unknown pass: {pass}"),
     };
+
+    // Fill in missing test IDs from the native baseline so litebox
+    // reports the same test count as native. This runs on the host
+    // (not inside docker) so it's not affected by container timeouts.
+    if !results.is_empty() {
+        let recorded: std::collections::HashSet<String> = results
+            .iter()
+            .filter_map(|r| {
+                let test = r["test"].as_str()?;
+                let agent = r["agent"].as_str()?;
+                Some(format!("{test} {agent}"))
+            })
+            .collect();
+
+        let baseline = include_str!("../native-test-ids.txt");
+        let mut filled = 0usize;
+        for line in baseline.lines() {
+            let line = line.trim();
+            if line.is_empty() || recorded.contains(line) {
+                continue;
+            }
+            let mut parts = line.splitn(2, ' ');
+            let Some(test) = parts.next() else { continue };
+            let Some(agent) = parts.next() else { continue };
+            results.push(serde_json::json!({
+                "test": test,
+                "agent": agent,
+                "result": "FAIL",
+                "detail": "not executed (baseline)",
+            }));
+            filled += 1;
+        }
+        if filled > 0 {
+            eprintln!("[{pass}] baseline: filled {filled} missing test IDs as FAIL");
+        }
+    }
 
     map.insert(pass.to_string(), results.clone());
     results

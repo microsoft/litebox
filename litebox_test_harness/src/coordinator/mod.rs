@@ -621,6 +621,7 @@ async fn run_tests(self_exe: &str, filter: Option<&str>) -> Vec<TestResult> {
 
     // Clean shutdown.
     runner.teardown_tree().await;
+
     runner.results
 }
 

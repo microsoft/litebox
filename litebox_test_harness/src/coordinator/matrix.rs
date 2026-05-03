@@ -580,13 +580,24 @@ async fn run_net_addr_tests(r: &mut TestRunner) {
         addrs.len(),
     );
 
+    // Use a stable label for the container IP in test IDs so they
+    // don't change across docker runs (172.17.0.2 vs 172.17.0.3).
+    let addr_label = |addr: &str| -> String {
+        if self_ip.as_deref() == Some(addr) {
+            "self_ip".to_string()
+        } else {
+            addr.to_string()
+        }
+    };
+
     for &(agent_a, agent_b) in NET_ADDR_PAIRS {
         for &addr in &addrs {
             let is_self_ip = self_ip.as_deref() == Some(addr);
+            let label = addr_label(addr);
             // Skip non-PIE agents if binary not available
             if !has_nonpie && (agent_requires_nonpie(agent_a) || agent_requires_nonpie(agent_b)) {
                 r.record(
-                    &format!("NA.{agent_a}_to_{agent_b}.{addr}"),
+                    &format!("NA.{agent_a}_to_{agent_b}.{label}"),
                     agent_a,
                     false,
                     "FAIL: nonpie binary not found — mount at /opt/nonpie",
@@ -596,8 +607,8 @@ async fn run_net_addr_tests(r: &mut TestRunner) {
             }
 
             // Direction 1: agent_a listens, agent_b connects
-            let test_id = format!("NA.{agent_a}_to_{agent_b}.{addr}");
-            let test_data = format!("na_{agent_a}_{agent_b}_{addr}");
+            let test_id = format!("NA.{agent_a}_to_{agent_b}.{label}");
+            let test_data = format!("na_{agent_a}_{agent_b}_{label}");
 
             let resp = r.send(agent_a, Command::NetListen { port }).await;
             let listen_ok = matches!(resp, Response::Listening { .. });
