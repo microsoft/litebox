@@ -274,9 +274,57 @@ impl TestRunner {
         for id in &ids {
             self.poison_agent(id).await;
         }
-        // Respawn direct children.
+        // Respawn direct children and rebuild sub-trees.
         for id in &ids {
             self.respawn_if_poisoned(id).await;
+        }
+        self.rebuild_subtree().await;
+    }
+
+    /// Check if any agents are poisoned and recover them.
+    /// Called between test groups to prevent cascade failures.
+    async fn recover_if_needed(&mut self) {
+        if self.poisoned.is_empty() {
+            return;
+        }
+        eprintln!(
+            "[coord] recovering poisoned agents: {:?}",
+            self.poisoned.iter().collect::<Vec<_>>()
+        );
+        let poisoned: Vec<String> = self.poisoned.iter().cloned().collect();
+        for id in &poisoned {
+            self.respawn_if_poisoned(id).await;
+        }
+        self.rebuild_subtree().await;
+    }
+
+    /// Rebuild agent A's sub-tree (AA, AB, AAA, AAB) after A is respawned.
+    async fn rebuild_subtree(&mut self) {
+        // Only rebuild if A exists and is healthy.
+        if !self.children.contains_key("A") || self.poisoned.contains("A") {
+            return;
+        }
+        // Tell A to spawn AA and AB.
+        let r = send_cmd(
+            self.children.get_mut("A").unwrap(),
+            &Command::Spawn {
+                children: vec!["AA".to_string(), "AB".to_string()],
+            },
+        )
+        .await;
+        eprintln!("[coord] rebuild: A spawn AA,AB: {r:?}");
+
+        if matches!(&r, Response::Ok { .. }) {
+            // Tell AA to spawn AAA, AAB.
+            let r = self
+                .send(
+                    "AA",
+                    Command::Spawn {
+                        children: vec!["AAA".to_string(), "AAB".to_string()],
+                    },
+                )
+                .await;
+            eprintln!("[coord] rebuild: AA spawn AAA,AAB: {r:?}");
         }
     }
 
@@ -646,6 +694,9 @@ async fn run_tests(self_exe: &str, filter: Option<&str>) -> Vec<TestResult> {
             );
             runner.recover_agents().await;
         }
+        // Recover any agents poisoned by send timeouts within the group,
+        // preventing cascade failures into subsequent groups.
+        runner.recover_if_needed().await;
     }
 
     // Shutdown all children.
