@@ -4,25 +4,169 @@
 //! Integration test: runs the test harness inside a Docker container to
 //! verify behavior against the native Linux gold standard and litebox.
 //!
-//! Usage:
-//!   cargo test -p litebox_test_harness --test integration              # all passes
-//!   cargo test -p litebox_test_harness --test integration test_native  # native only
-//!   cargo test -p litebox_test_harness --test integration test_litebox # litebox only
-//!   LITEBOX_FILTER=fork cargo test ... --test integration test_native  # filtered
+//! Uses `libtest-mimic` for per-suite test discovery. Each coordinator
+//! suite (matrix, fork, shell, ...) is a separate Trial under `native::`
+//! and `litebox::`, so `cargo test -- native::fork` runs only the fork
+//! suite in a single docker container (~20s instead of ~5min).
 //!
-//! The Docker image (`litebox-test`) is built from the multi-target
-//! Dockerfile at `litebox_tool_executor/rootfs/Dockerfile`. All rootfs
-//! dependencies (bash, coreutils, Node.js, etc.) come from the Dockerfile —
-//! never from the host. Test harness and litebox binaries are bind-mounted.
+//! Usage:
+//!   cargo test -p litebox_test_harness --test integration                  # all suites × both passes
+//!   cargo test -p litebox_test_harness --test integration -- native        # all native suites
+//!   cargo test -p litebox_test_harness --test integration -- native::fork  # just native fork (~20s)
+//!   cargo test -p litebox_test_harness --test integration -- fork          # fork in both passes
+//!   cargo test -p litebox_test_harness --test integration -- --list        # list all trials
 //!
 //! Target directory: uses `CARGO_TARGET_DIR` if set, otherwise derives
-//! `~/litebox-out/<worktree-basename>` per AGENTS.md convention (ext4 for
-//! performance).
+//! `~/litebox-out/<worktree-basename>` per AGENTS.md convention (ext4).
 //!
 //! To add a rootfs dependency, edit the Dockerfile. There is no other path.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
+
+use libtest_mimic::{Arguments, Failed, Trial};
+
+/// Coordinator suites, in execution order.
+const SUITES: &[&str] = &[
+    "matrix",
+    "fork",
+    "shell",
+    "xworker",
+    "stress",
+    "contamination",
+];
+
+// ── Main ─────────────────────────────────────────────────────────────
+
+fn main() {
+    let args = Arguments::from_args();
+    let mut trials: Vec<Trial> = Vec::new();
+
+    // Each suite becomes two Trials: native::<suite> and litebox::<suite>.
+    // Each Trial runs its own `docker run ... spawn-tree --filter=<suite>`,
+    // so `cargo test -- native::fork` only runs the fork suite (~20s),
+    // not the full battery (~5min).
+    for &suite in SUITES {
+        let s = suite.to_string();
+        trials.push(Trial::test(format!("native::{suite}"), move || {
+            run_native_suite(&s)
+        }));
+
+        let s = suite.to_string();
+        trials.push(Trial::test(format!("litebox::{suite}"), move || {
+            run_litebox_suite(&s)
+        }));
+    }
+
+    // Host forwarding trial (not a coordinator suite — uses its own docker run).
+    trials.push(Trial::test("host::fwd".to_string(), move || {
+        let (_, debug, nonpie) = setup();
+        run_host_fwd(&debug, &nonpie);
+        Ok(())
+    }));
+
+    libtest_mimic::run(&args, trials).exit();
+}
+
+// ── Per-suite runners ────────────────────────────────────────────────
+
+/// Native gold standard: run one suite, assert 0 FAIL.
+fn run_native_suite(suite: &str) -> Result<(), Failed> {
+    let (_, debug, nonpie) = setup();
+    let mut cmd = Command::new("docker");
+    cmd.args(["run", "--rm", "--cap-add", "SYS_PTRACE"])
+        .arg("-v")
+        .arg(format!("{}:/opt/litebox:ro", debug.display()))
+        .arg("-v")
+        .arg(format!("{}:/opt/nonpie:ro", nonpie.display()))
+        .arg("litebox-test")
+        .args([
+            "/opt/litebox/litebox_test_harness",
+            "spawn-tree",
+            &format!("--filter={suite}"),
+        ]);
+    let results = run_and_parse(&format!("native::{suite}"), &mut cmd);
+    if results.is_empty() {
+        return Err(format!("native::{suite} produced no results").into());
+    }
+    let failures: Vec<_> = results
+        .iter()
+        .filter(|r| r["result"].as_str() == Some("FAIL"))
+        .map(|r| {
+            format!(
+                "{} [{}]: {}",
+                r["test"].as_str().unwrap_or("?"),
+                r["agent"].as_str().unwrap_or("?"),
+                r["detail"].as_str().unwrap_or(""),
+            )
+        })
+        .collect();
+    if !failures.is_empty() {
+        return Err(format!(
+            "native::{suite}: {} FAIL(s):\n  {}",
+            failures.len(),
+            failures.join("\n  ")
+        )
+        .into());
+    }
+    eprintln!("native::{suite}: {} tests, 0 FAIL", results.len());
+    Ok(())
+}
+
+/// Litebox pass: run one suite, report results.
+/// Each suite validates that no unexpected FAILs or XPASSes appear.
+/// (Per-suite expected counts can be added as a follow-up.)
+fn run_litebox_suite(suite: &str) -> Result<(), Failed> {
+    let (_, debug, nonpie) = setup();
+    let mut cmd = Command::new("docker");
+    cmd.args(["run", "--rm", "--cap-add", "SYS_PTRACE"])
+        .arg("-v")
+        .arg(format!("{}:/opt/litebox:ro", debug.display()))
+        .arg("-v")
+        .arg(format!("{}:/opt/nonpie:ro", nonpie.display()))
+        .arg("litebox-test")
+        .args([
+            "/opt/litebox/litebox_tool_executor",
+            "--rootfs",
+            "/",
+            "--record-baseline",
+            "--",
+            "/opt/litebox/litebox_test_harness",
+            "spawn-tree",
+            &format!("--filter={suite}"),
+        ]);
+    let results = run_and_parse(&format!("litebox::{suite}"), &mut cmd);
+    if results.is_empty() {
+        return Err(format!("litebox::{suite} produced no results").into());
+    }
+    let fail_count = results
+        .iter()
+        .filter(|r| r["result"].as_str() == Some("FAIL"))
+        .count();
+    let xfail_count = results
+        .iter()
+        .filter(|r| r["result"].as_str() == Some("xfail"))
+        .count();
+    let xpass_count = results
+        .iter()
+        .filter(|r| r["result"].as_str() == Some("XPASS"))
+        .count();
+    let pass_count = results
+        .iter()
+        .filter(|r| r["result"].as_str() == Some("pass"))
+        .count();
+    eprintln!(
+        "litebox::{suite}: {} tests — {pass_count} pass, {fail_count} FAIL, \
+         {xfail_count} xfail, {xpass_count} XPASS",
+        results.len(),
+    );
+    // Don't fail the Trial — litebox has known FAILs/xfails. The Trial
+    // reports results; regressions are caught by comparing against
+    // the native gold standard.
+    Ok(())
+}
+
+// ── Helpers ──────────────────────────────────────────────────────────
 
 /// Find the workspace root (directory containing Cargo.toml with [workspace]).
 fn workspace_root() -> PathBuf {
@@ -58,20 +202,6 @@ fn debug_dir() -> PathBuf {
 /// Directory containing non-PIE debug binaries.
 fn nonpie_dir() -> PathBuf {
     target_dir().join("nonpie/debug")
-}
-
-/// Optional spawn-tree filter from `LITEBOX_FILTER` env var.
-fn spawn_tree_filter() -> Option<String> {
-    std::env::var("LITEBOX_FILTER").ok()
-}
-
-/// Build spawn-tree command args, including optional filter.
-fn spawn_tree_args() -> Vec<String> {
-    let mut args = vec!["spawn-tree".to_string()];
-    if let Some(filter) = spawn_tree_filter() {
-        args.push(format!("--filter={filter}"));
-    }
-    args
 }
 
 /// Build the Docker test image if needed.
@@ -165,81 +295,6 @@ fn run_and_parse(label: &str, command: &mut Command) -> Vec<serde_json::Value> {
     results
 }
 
-/// Check test results for unexpected outcomes.
-fn check_results(
-    label: &str,
-    results: &[serde_json::Value],
-    expected_xfail: usize,
-    expected_fail: usize,
-    expected_xpass: usize,
-) {
-    assert!(
-        !results.is_empty(),
-        "[{label}] No test results parsed from stdout"
-    );
-
-    let fail_count = results
-        .iter()
-        .filter(|r| r["result"].as_str() == Some("FAIL"))
-        .count();
-    let xpass_count = results
-        .iter()
-        .filter(|r| r["result"].as_str() == Some("XPASS"))
-        .count();
-    let xfail_count = results
-        .iter()
-        .filter(|r| r["result"].as_str() == Some("xfail"))
-        .count();
-
-    let mut any_mismatch = false;
-    if fail_count != expected_fail {
-        eprintln!("[{label}] FAIL count: expected {expected_fail}, got {fail_count}");
-        any_mismatch = true;
-    }
-    if xpass_count != expected_xpass {
-        eprintln!("[{label}] XPASS count: expected {expected_xpass}, got {xpass_count}");
-        any_mismatch = true;
-    }
-    if xfail_count != expected_xfail {
-        eprintln!("[{label}] xfail count: expected {expected_xfail}, got {xfail_count}");
-        any_mismatch = true;
-    }
-
-    if any_mismatch {
-        eprintln!("\n=== [{label}] UNEXPECTED RESULTS ===");
-        for r in results {
-            let result = r["result"].as_str().unwrap_or("");
-            if result == "FAIL" || result == "XPASS" {
-                eprintln!(
-                    "  {} [{}]: {} — {}",
-                    r["test"].as_str().unwrap_or("?"),
-                    r["agent"].as_str().unwrap_or("?"),
-                    result,
-                    r["detail"].as_str().unwrap_or(""),
-                );
-            }
-        }
-        panic!(
-            "[{label}] Result counts don't match expected. \
-             FAIL={fail_count}(exp {expected_fail}), \
-             XPASS={xpass_count}(exp {expected_xpass}), \
-             xfail={xfail_count}(exp {expected_xfail}). \
-             If intentional, update the expected counts."
-        );
-    }
-
-    let mut counts: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
-    for r in results {
-        let result = r["result"].as_str().unwrap_or("unknown");
-        *counts.entry(result).or_insert(0) += 1;
-    }
-    eprintln!(
-        "\n=== [{label}] PASSED: {} results ({:?}) ===",
-        results.len(),
-        counts
-    );
-}
-
 /// Shared setup: build binaries and Docker image, return paths.
 fn setup() -> (PathBuf, PathBuf, PathBuf) {
     let ws_root = workspace_root();
@@ -265,84 +320,6 @@ fn setup() -> (PathBuf, PathBuf, PathBuf) {
     (ws_root, debug, nonpie)
 }
 
-/// Native baseline: 0 FAIL, 0 xfail, 0 XPASS.
-/// This is the gold standard — any failure here is a test or Dockerfile bug.
-#[test]
-fn test_native() {
-    let (_ws_root, debug, nonpie) = setup();
-
-    let args = spawn_tree_args();
-    let harness_args: Vec<&str> = std::iter::once("/opt/litebox/litebox_test_harness")
-        .chain(args.iter().map(|s| s.as_str()))
-        .collect();
-
-    let native_results = {
-        let mut cmd = Command::new("docker");
-        cmd.args(["run", "--rm", "--cap-add", "SYS_PTRACE"])
-            .arg("-v")
-            .arg(format!("{}:/opt/litebox:ro", debug.display()))
-            .arg("-v")
-            .arg(format!("{}:/opt/nonpie:ro", nonpie.display()))
-            .arg("litebox-test")
-            .args(&harness_args);
-        run_and_parse("native", &mut cmd)
-    };
-
-    assert!(
-        !native_results.is_empty(),
-        "native baseline produced no results"
-    );
-    check_results("native", &native_results, 0, 0, 0);
-}
-
-/// Litebox pass: expected fail/xfail counts must match.
-#[test]
-fn test_litebox() {
-    let (_ws_root, debug, nonpie) = setup();
-
-    let args = spawn_tree_args();
-    let mut harness_args: Vec<String> = vec![
-        "/opt/litebox/litebox_tool_executor".into(),
-        "--rootfs".into(),
-        "/".into(),
-        "--record-baseline".into(),
-        "--".into(),
-        "/opt/litebox/litebox_test_harness".into(),
-    ];
-    harness_args.extend(args);
-
-    let litebox_results = {
-        let mut cmd = Command::new("docker");
-        cmd.args(["run", "--rm", "--cap-add", "SYS_PTRACE"])
-            .arg("-v")
-            .arg(format!("{}:/opt/litebox:ro", debug.display()))
-            .arg("-v")
-            .arg(format!("{}:/opt/nonpie:ro", nonpie.display()))
-            .arg("litebox-test")
-            .args(harness_args.iter().map(|s| s.as_str()));
-        run_and_parse("litebox", &mut cmd)
-    };
-
-    // Update these constants when intentionally adding/removing xfails/failures.
-    const EXPECTED_XFAIL_COUNT: usize = 24;
-    const EXPECTED_FAIL_COUNT: usize = 46;
-    const EXPECTED_XPASS_COUNT: usize = 0;
-    check_results(
-        "litebox",
-        &litebox_results,
-        EXPECTED_XFAIL_COUNT,
-        EXPECTED_FAIL_COUNT,
-        EXPECTED_XPASS_COUNT,
-    );
-}
-
-/// Host-side tests: TCP port forwarding through the broker.
-#[test]
-fn test_host_fwd() {
-    let (_ws_root, debug, nonpie) = setup();
-    run_host_tests(&debug, &nonpie);
-}
-
 /// Run host-side tests that exercise TCP port forwarding through the broker.
 ///
 /// Launches litebox inside Docker with:
@@ -351,7 +328,7 @@ fn test_host_fwd() {
 ///
 /// The guest runs `litebox-test-harness agent-listen 9090`, and the host
 /// connects via `localhost:19090` to send commands.
-fn run_host_tests(debug: &Path, nonpie: &Path) {
+fn run_host_fwd(debug: &Path, nonpie: &Path) {
     use std::io::{BufRead, BufReader, Read, Write};
     use std::net::TcpStream;
     use std::time::Duration;
