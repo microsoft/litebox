@@ -17,8 +17,7 @@
 //!   cargo test -p litebox_test_harness --test integration -- fork                  # fork in both passes
 //!   cargo test -p litebox_test_harness --test integration -- --list                # list all trials
 //!
-//! Target directory: uses `CARGO_TARGET_DIR` if set, otherwise derives
-//! `~/litebox-out/<worktree-basename>` per AGENTS.md convention (ext4).
+//! Target directory: uses `CARGO_TARGET_DIR` if set, otherwise `target/`.
 //!
 //! To add a rootfs dependency, edit the Dockerfile. There is no other path.
 
@@ -256,21 +255,13 @@ fn workspace_root() -> PathBuf {
 
 /// Determine the target directory for builds.
 ///
-/// Uses `CARGO_TARGET_DIR` if set (standard cargo env var), otherwise
-/// derives `~/litebox-out/<worktree-basename>` per AGENTS.md convention.
-/// This ensures builds land on ext4 (not NTFS) for performance.
+/// Uses `CARGO_TARGET_DIR` if set, otherwise `target/` in the workspace
+/// root (the natural cargo default).
 fn target_dir() -> PathBuf {
     if let Ok(dir) = std::env::var("CARGO_TARGET_DIR") {
         return PathBuf::from(dir);
     }
-    let ws = workspace_root();
-    let name = ws
-        .file_name()
-        .unwrap_or_default()
-        .to_string_lossy()
-        .to_string();
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
-    PathBuf::from(format!("{home}/litebox-out/{name}"))
+    workspace_root().join("target")
 }
 
 /// Directory containing PIE debug binaries.
