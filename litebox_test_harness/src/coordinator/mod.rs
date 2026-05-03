@@ -16,6 +16,7 @@ pub(crate) mod tcp_stress;
 pub(crate) mod vscode;
 
 use crate::protocol::{Command, Response};
+use crate::test_registry::{TEST_GROUPS, group_timeout, matches_filter};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::time::Duration;
 
@@ -380,6 +381,96 @@ impl TestRunner {
     }
 }
 
+/// Dispatch a single test group to the appropriate async test function.
+async fn run_group(runner: &mut TestRunner, suite: &str, group: &str) {
+    match (suite, group) {
+        // matrix
+        ("matrix", "run_matrix") => matrix::run_matrix_tests(runner).await,
+        ("matrix", "netlink") => special_cases::netlink_tests(runner).await,
+        ("matrix", "net_ipv6") => special_cases::net_ipv6_tests(runner).await,
+        ("matrix", "terminal_ioctl") => special_cases::terminal_ioctl_tests(runner).await,
+        ("matrix", "fs_io") => special_cases::fs_io_tests(runner).await,
+        ("matrix", "poll_ready") => platform_fixes::poll_ready_tests(runner).await,
+        ("matrix", "bind_getsockname") => platform_fixes::bind_getsockname_tests(runner).await,
+        ("matrix", "pipe_pair_id") => platform_fixes::pipe_pair_id_tests(runner).await,
+        ("matrix", "pipe_nonblock") => platform_fixes::pipe_nonblock_tests(runner).await,
+        ("matrix", "epoll_socket") => platform_fixes::epoll_socket_tests(runner).await,
+        ("matrix", "loopback_tcp") => platform_fixes::loopback_tcp_tests(runner).await,
+        ("matrix", "proc_filesystem") => platform_fixes::proc_filesystem_tests(runner).await,
+        // fork
+        ("fork", "fork_matrix") => fork_matrix::run_fork_matrix_tests(runner).await,
+        ("fork", "exit_data_integrity") => platform_fixes::exit_data_integrity_tests(runner).await,
+        ("fork", "nonpie_pipe_chain") => platform_fixes::nonpie_pipe_chain_tests(runner).await,
+        ("fork", "bash_fork_exec") => platform_fixes::bash_fork_exec_tests(runner).await,
+        ("fork", "fork_from_worker_exec") => {
+            platform_fixes::fork_from_worker_exec_tests(runner).await
+        }
+        ("fork", "concurrent_fork") => platform_fixes::concurrent_fork_tests(runner).await,
+        ("fork", "pid_visibility") => platform_fixes::pid_visibility_tests(runner).await,
+        ("fork", "capture_pipe") => special_cases::capture_pipe_tests(runner).await,
+        ("fork", "node_exit") => special_cases::node_exit_tests(runner).await,
+        // shell
+        ("shell", "stdin_pipe_subst") => platform_fixes::stdin_pipe_subst_tests(runner).await,
+        ("shell", "subst_capture") => platform_fixes::subst_capture_tests(runner).await,
+        ("shell", "touch_redirect") => platform_fixes::touch_redirect_tests(runner).await,
+        ("shell", "file_redirect") => platform_fixes::file_redirect_tests(runner).await,
+        ("shell", "stdin_script") => special_cases::stdin_script_tests(runner).await,
+        // xworker
+        ("xworker", "cross_worker_first_connect") => {
+            platform_fixes::cross_worker_first_connect_tests(runner).await
+        }
+        ("xworker", "cross_worker_self_connect") => {
+            platform_fixes::cross_worker_self_connect_tests(runner).await
+        }
+        ("xworker", "cross_worker_file") => platform_fixes::cross_worker_file_tests(runner).await,
+        ("xworker", "fork_listen_close") => platform_fixes::fork_listen_close_tests(runner).await,
+        ("xworker", "unix_socket") => special_cases::unix_socket_tests(runner).await,
+        ("xworker", "cross_worker") => special_cases::cross_worker_tests(runner).await,
+        ("xworker", "pipe_eof") => special_cases::pipe_eof_tests(runner).await,
+        ("xworker", "pipe_bridge") => pipe_bridge::pipe_bridge_tests(runner).await,
+        ("xworker", "concurrent_fork_pipeline") => {
+            concurrent_fork::concurrent_fork_pipeline_tests(runner).await
+        }
+        ("xworker", "concurrent_exec") => concurrent_fork::concurrent_exec_tests(runner).await,
+        ("xworker", "vscode_install_pipeline") => {
+            concurrent_fork::vscode_install_pipeline_tests(runner).await
+        }
+        ("xworker", "concurrent_fs_rwlock") => {
+            concurrent_fork::concurrent_fs_rwlock_tests(runner).await
+        }
+        // stress
+        ("stress", "tcp_stress") => tcp_stress::run(runner).await,
+        ("stress", "file_tcp") => file_tcp::run(runner).await,
+        ("stress", "port_router") => port_router::run(runner).await,
+        // contamination
+        ("contamination", "canary") => {
+            let canary_cmd = crate::protocol::Command::Exec {
+                args: vec![runner.self_exe.clone(), "echo-test".into()],
+                timeout_secs: None,
+                stdin: None,
+                background: false,
+            };
+            let resp = runner.send("A", canary_cmd).await;
+            let pass = matches!(
+                &resp,
+                Response::ExecResult { exit_code: 0, stdout, .. } if stdout == "ECHO_TEST_OK"
+            );
+            runner.record("X_canary.pre_sequence", "A", pass, &format!("{resp:?}"));
+        }
+        ("contamination", "contamination_sequence") => {
+            special_cases::contamination_sequence_tests(runner).await
+        }
+        _ => {
+            runner.record(
+                &format!("UNKNOWN_GROUP.{suite}.{group}"),
+                "coord",
+                false,
+                "test group not found in run_group dispatch — add a match arm",
+            );
+        }
+    }
+}
+
 /// Run tests, optionally filtering to a specific suite.
 pub fn run_filtered(self_exe: &str, filter: Option<&str>) -> Vec<TestResult> {
     tokio::runtime::Builder::new_current_thread()
@@ -533,192 +624,25 @@ async fn run_tests(self_exe: &str, filter: Option<&str>) -> Vec<TestResult> {
         eprintln!("[coord] non-PIE binary not found — mount at /opt/nonpie");
     }
 
-    let should_run = |suite: &str| filter.is_none() || filter == Some(suite);
-
-    // Per-suite wall-clock budgets (seconds). If a suite exceeds its
-    // budget, we record a FAIL, kill desynchronized agents, and attempt
-    // to respawn them so subsequent suites can still run.
-    const MATRIX_TIMEOUT: u64 = 120;
-    const FORK_TIMEOUT: u64 = 120;
-    const SHELL_TIMEOUT: u64 = 60;
-    const XWORKER_TIMEOUT: u64 = 120;
-    const VSCODE_TIMEOUT: u64 = 300;
-    const STRESS_TIMEOUT: u64 = 300;
-    const CONTAMINATION_TIMEOUT: u64 = 60;
-
-    // =================================================================
-    // MATRIX: Capability x topology cross-product tests
-    // FS CRUD, TCP, Unix sockets, exec, env, network addresses,
-    // symlinks, netlink, IPv6, terminal ioctl, filesystem I/O,
-    // syscall capabilities (poll, getsockname, epoll, pipe, proc, TCP).
-    // =================================================================
-    if should_run("matrix") {
-        eprintln!("[coord] === Matrix Tests ===");
-        if tokio::time::timeout(Duration::from_secs(MATRIX_TIMEOUT), async {
-            matrix::run_matrix_tests(&mut runner).await;
-            special_cases::netlink_tests(&mut runner).await;
-            special_cases::net_ipv6_tests(&mut runner).await;
-            special_cases::terminal_ioctl_tests(&mut runner).await;
-            special_cases::fs_io_tests(&mut runner).await;
-            platform_fixes::poll_ready_tests(&mut runner).await;
-            platform_fixes::bind_getsockname_tests(&mut runner).await;
-            platform_fixes::pipe_pair_id_tests(&mut runner).await;
-            platform_fixes::pipe_nonblock_tests(&mut runner).await;
-            platform_fixes::epoll_socket_tests(&mut runner).await;
-            platform_fixes::loopback_tcp_tests(&mut runner).await;
-            platform_fixes::proc_filesystem_tests(&mut runner).await;
-        })
-        .await
-        .is_err()
-        {
-            runner.record(
-                "SUITE_TIMEOUT.matrix",
-                "coord",
-                false,
-                &format!("matrix suite exceeded {MATRIX_TIMEOUT}s wall-clock budget"),
-            );
-            runner.recover_agents().await;
+    // Run test groups that match the filter.
+    for &(suite, group) in TEST_GROUPS {
+        if !matches_filter(filter, suite, group) {
+            continue;
         }
-    }
-
-    // =================================================================
-    // FORK: Fork/exec patterns, delayed fork, PIE/non-PIE, pipes
-    // =================================================================
-    if should_run("fork") {
-        eprintln!("[coord] === Fork Tests ===");
-        if tokio::time::timeout(Duration::from_secs(FORK_TIMEOUT), async {
-            fork_matrix::run_fork_matrix_tests(&mut runner).await;
-            platform_fixes::exit_data_integrity_tests(&mut runner).await;
-            platform_fixes::nonpie_pipe_chain_tests(&mut runner).await;
-            platform_fixes::bash_fork_exec_tests(&mut runner).await;
-            platform_fixes::fork_from_worker_exec_tests(&mut runner).await;
-            platform_fixes::concurrent_fork_tests(&mut runner).await;
-            platform_fixes::pid_visibility_tests(&mut runner).await;
-            special_cases::capture_pipe_tests(&mut runner).await;
-            special_cases::node_exit_tests(&mut runner).await;
-        })
+        let timeout = group_timeout(suite, group);
+        eprintln!("[coord] --- {suite}::{group} (timeout {timeout}s) ---");
+        if tokio::time::timeout(
+            Duration::from_secs(timeout),
+            run_group(&mut runner, suite, group),
+        )
         .await
         .is_err()
         {
             runner.record(
-                "SUITE_TIMEOUT.fork",
+                &format!("GROUP_TIMEOUT.{suite}.{group}"),
                 "coord",
                 false,
-                &format!("fork suite exceeded {FORK_TIMEOUT}s wall-clock budget"),
-            );
-            runner.recover_agents().await;
-        }
-    }
-
-    // =================================================================
-    // SHELL: Bash-specific redirect, touch, stdin-pipe patterns
-    // =================================================================
-    if should_run("shell") {
-        eprintln!("[coord] === Shell Tests ===");
-        if tokio::time::timeout(Duration::from_secs(SHELL_TIMEOUT), async {
-            platform_fixes::stdin_pipe_subst_tests(&mut runner).await;
-            platform_fixes::subst_capture_tests(&mut runner).await;
-            platform_fixes::touch_redirect_tests(&mut runner).await;
-            platform_fixes::file_redirect_tests(&mut runner).await;
-            special_cases::stdin_script_tests(&mut runner).await;
-        })
-        .await
-        .is_err()
-        {
-            runner.record(
-                "SUITE_TIMEOUT.shell",
-                "coord",
-                false,
-                &format!("shell suite exceeded {SHELL_TIMEOUT}s wall-clock budget"),
-            );
-            runner.recover_agents().await;
-        }
-    }
-
-    // =================================================================
-    // XWORKER: Cross-worker FS, TCP, Unix sockets, port routing
-    // =================================================================
-    if should_run("xworker") {
-        eprintln!("[coord] === Cross-Worker Tests ===");
-        if tokio::time::timeout(Duration::from_secs(XWORKER_TIMEOUT), async {
-            platform_fixes::cross_worker_first_connect_tests(&mut runner).await;
-            platform_fixes::cross_worker_self_connect_tests(&mut runner).await;
-            platform_fixes::cross_worker_file_tests(&mut runner).await;
-            platform_fixes::fork_listen_close_tests(&mut runner).await;
-            special_cases::unix_socket_tests(&mut runner).await;
-            special_cases::cross_worker_tests(&mut runner).await;
-            special_cases::pipe_eof_tests(&mut runner).await;
-            pipe_bridge::pipe_bridge_tests(&mut runner).await;
-            concurrent_fork::concurrent_fork_pipeline_tests(&mut runner).await;
-            concurrent_fork::concurrent_exec_tests(&mut runner).await;
-            concurrent_fork::vscode_install_pipeline_tests(&mut runner).await;
-            concurrent_fork::concurrent_fs_rwlock_tests(&mut runner).await;
-        })
-        .await
-        .is_err()
-        {
-            runner.record(
-                "SUITE_TIMEOUT.xworker",
-                "coord",
-                false,
-                &format!("xworker suite exceeded {XWORKER_TIMEOUT}s wall-clock budget"),
-            );
-            runner.recover_agents().await;
-        }
-    }
-
-    // =================================================================
-    // STRESS: TCP stress, port router, file+TCP combined (slow)
-    // =================================================================
-    if should_run("stress") {
-        eprintln!("[coord] === Stress Tests ===");
-        if tokio::time::timeout(Duration::from_secs(STRESS_TIMEOUT), async {
-            tcp_stress::run(&mut runner).await;
-            file_tcp::run(&mut runner).await;
-            port_router::run(&mut runner).await;
-        })
-        .await
-        .is_err()
-        {
-            runner.record(
-                "SUITE_TIMEOUT.stress",
-                "coord",
-                false,
-                &format!("stress suite exceeded {STRESS_TIMEOUT}s wall-clock budget"),
-            );
-            runner.recover_agents().await;
-        }
-    }
-
-    // =================================================================
-    // CONTAMINATION: State accumulation tests (MUST run last)
-    // =================================================================
-    if should_run("contamination") {
-        eprintln!("[coord] === Contamination Sequence Tests ===");
-        if tokio::time::timeout(Duration::from_secs(CONTAMINATION_TIMEOUT), async {
-            {
-                let canary_cmd = crate::protocol::Command::Exec {
-                    args: vec![runner.self_exe.clone(), "echo-test".into()],
-                    timeout_secs: None,
-                    stdin: None,
-                    background: false,
-                };
-                let resp = runner.send("A", canary_cmd).await;
-                let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout == "ECHO_TEST_OK");
-                runner.record("X_canary.pre_sequence", "A", pass, &format!("{resp:?}"));
-            }
-            special_cases::contamination_sequence_tests(&mut runner).await;
-        })
-        .await
-        .is_err()
-        {
-            runner.record(
-                "SUITE_TIMEOUT.contamination",
-                "coord",
-                false,
-                &format!(
-                    "contamination suite exceeded {CONTAMINATION_TIMEOUT}s wall-clock budget"
-                ),
+                &format!("{suite}::{group} exceeded {timeout}s timeout"),
             );
             runner.recover_agents().await;
         }

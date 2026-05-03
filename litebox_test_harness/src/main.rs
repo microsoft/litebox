@@ -31,8 +31,8 @@
 //!     -- /opt/litebox/litebox_test_harness spawn-tree
 //! ```
 //!
-//! Add `--filter=<suite>` to run a specific test suite:
-//! `matrix`, `fork`, `shell`, `xworker`, `vscode`, `stress`, `contamination`.
+//! Add `--filter=<suite>` or `--filter=<suite>.<group>` to run a subset:
+//!   `--filter=fork` (all fork groups), `--filter=fork.capture_pipe` (one group).
 //!
 //! The coordinator prints a `[coord] runtime:` diagnostic at startup to
 //! make the environment visible. Running outside Docker or without
@@ -42,6 +42,7 @@ mod agent;
 mod agent_listen;
 mod coordinator;
 mod protocol;
+mod test_registry;
 
 use std::io::Write as _;
 
@@ -157,13 +158,17 @@ fn main() {
             });
             let sub = args.get(3).map(String::as_str).unwrap_or("echo-test");
 
-            eprintln!("[fork-exec-nonpie] pid={} forking child to exec {binary} {sub}",
-                std::process::id());
+            eprintln!(
+                "[fork-exec-nonpie] pid={} forking child to exec {binary} {sub}",
+                std::process::id()
+            );
 
             let pid = unsafe { libc::fork() };
             if pid < 0 {
-                eprintln!("[fork-exec-nonpie] fork failed: {}",
-                    std::io::Error::last_os_error());
+                eprintln!(
+                    "[fork-exec-nonpie] fork failed: {}",
+                    std::io::Error::last_os_error()
+                );
                 println!("FORK_EXEC_NONPIE_FAIL:fork");
                 std::process::exit(1);
             }
@@ -210,9 +215,7 @@ fn main() {
             //
             // Usage: fork-exec-pie <binary> [subcommand]
             let binary = args.get(2).map(String::as_str).unwrap_or_else(|| {
-                for p in [
-                    "/opt/litebox/litebox_test_harness",
-                ] {
+                for p in ["/opt/litebox/litebox_test_harness"] {
                     if std::path::Path::new(p).exists() {
                         return p;
                     }
@@ -221,13 +224,17 @@ fn main() {
             });
             let sub = args.get(3).map(String::as_str).unwrap_or("echo-test");
 
-            eprintln!("[fork-exec-pie] pid={} forking child to exec {binary} {sub}",
-                std::process::id());
+            eprintln!(
+                "[fork-exec-pie] pid={} forking child to exec {binary} {sub}",
+                std::process::id()
+            );
 
             let pid = unsafe { libc::fork() };
             if pid < 0 {
-                eprintln!("[fork-exec-pie] fork failed: {}",
-                    std::io::Error::last_os_error());
+                eprintln!(
+                    "[fork-exec-pie] fork failed: {}",
+                    std::io::Error::last_os_error()
+                );
                 println!("FORK_EXEC_PIE_FAIL:fork");
                 std::process::exit(1);
             }
@@ -1611,7 +1618,10 @@ fn main() {
             for i in 0..n_children {
                 // Pre-open a few files so the child has fds to close
                 // (triggers write-lock contention with concurrent opens).
-                let pre_fds: Vec<_> = libs.iter().filter_map(|p| std::fs::File::open(p).ok()).collect();
+                let pre_fds: Vec<_> = libs
+                    .iter()
+                    .filter_map(|p| std::fs::File::open(p).ok())
+                    .collect();
 
                 let pid = unsafe { libc::fork() };
                 if pid < 0 {
@@ -1679,9 +1689,7 @@ fn main() {
             if all_ok {
                 println!("CONCURRENT_FS_MULTI_OK:{n_children}");
             } else {
-                println!(
-                    "CONCURRENT_FS_MULTI_FAIL:{n_children} (open write-lock deadlock)"
-                );
+                println!("CONCURRENT_FS_MULTI_FAIL:{n_children} (open write-lock deadlock)");
             }
             std::process::exit(if all_ok { 0 } else { 1 });
         }
