@@ -22,7 +22,7 @@
 //!
 //! To add a rootfs dependency, edit the Dockerfile. There is no other path.
 
-use std::collections::HashMap;
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Mutex;
@@ -30,28 +30,31 @@ use std::sync::Mutex;
 use libtest_mimic::{Arguments, Failed, Trial};
 use litebox_test_harness::test_registry::TEST_GROUPS;
 
-// ── Suite result cache ───────────────────────────────────────────────
+// ── Pass result cache ────────────────────────────────────────────────
 //
-// One docker run per suite, shared across all group Trials in that suite.
-// Key: "native::{suite}" or "litebox::{suite}".
-// libtest_mimic runs Trials sequentially, so Mutex contention is zero.
+// One docker run per pass (native/litebox). The docker run executes
+// spawn-tree with `--filter=suite1,suite2,...` for only the suites
+// that have matching Trials. Results are cached so all Trials in the
+// same pass share one docker run.
 
-static SUITE_CACHE: Mutex<Option<HashMap<String, Vec<serde_json::Value>>>> = Mutex::new(None);
+static PASS_CACHE: Mutex<Option<std::collections::HashMap<String, Vec<serde_json::Value>>>> =
+    Mutex::new(None);
 
-/// Get (or compute) results for a suite. Runs docker once per suite.
-/// The lock is held during docker run to prevent parallel trials from
-/// spawning duplicate containers for the same suite.
-fn get_suite_results(pass: &str, suite: &str) -> Vec<serde_json::Value> {
-    let key = format!("{pass}::{suite}");
-    let mut cache = SUITE_CACHE.lock().unwrap();
-    let map = cache.get_or_insert_with(HashMap::new);
-    if let Some(results) = map.get(&key) {
+/// Get (or compute) results for a pass. Runs docker once per pass.
+fn get_pass_results(pass: &str, filter_arg: &str) -> Vec<serde_json::Value> {
+    let mut cache = PASS_CACHE.lock().unwrap();
+    let map = cache.get_or_insert_with(std::collections::HashMap::new);
+    if let Some(results) = map.get(pass) {
         return results.clone();
     }
 
-    // Hold the lock while running docker — serializes all docker runs,
-    // which is what we want (parallel containers thrash the machine).
     let (_, debug, nonpie) = setup();
+
+    let mut spawn_args: Vec<String> = vec!["spawn-tree".into()];
+    if !filter_arg.is_empty() {
+        spawn_args.push(format!("--filter={filter_arg}"));
+    }
+
     let results = match pass {
         "native" => {
             let mut cmd = Command::new("docker");
@@ -61,12 +64,9 @@ fn get_suite_results(pass: &str, suite: &str) -> Vec<serde_json::Value> {
                 .arg("-v")
                 .arg(format!("{}:/opt/nonpie:ro", nonpie.display()))
                 .arg("litebox-test")
-                .args([
-                    "/opt/litebox/litebox_test_harness",
-                    "spawn-tree",
-                    &format!("--filter={suite}"),
-                ]);
-            run_and_parse(&key, &mut cmd)
+                .arg("/opt/litebox/litebox_test_harness")
+                .args(&spawn_args);
+            run_and_parse(&format!("native[{filter_arg}]"), &mut cmd)
         }
         "litebox" => {
             let mut cmd = Command::new("docker");
@@ -76,6 +76,7 @@ fn get_suite_results(pass: &str, suite: &str) -> Vec<serde_json::Value> {
                 .arg("-v")
                 .arg(format!("{}:/opt/nonpie:ro", nonpie.display()))
                 .arg("litebox-test")
+                .args(["timeout", "--signal=KILL", "1200"])
                 .args([
                     "/opt/litebox/litebox_tool_executor",
                     "--rootfs",
@@ -83,46 +84,77 @@ fn get_suite_results(pass: &str, suite: &str) -> Vec<serde_json::Value> {
                     "--record-baseline",
                     "--",
                     "/opt/litebox/litebox_test_harness",
-                    "spawn-tree",
-                    &format!("--filter={suite}"),
-                ]);
-            run_and_parse(&key, &mut cmd)
+                ])
+                .args(&spawn_args);
+            run_and_parse(&format!("litebox[{filter_arg}]"), &mut cmd)
         }
         _ => panic!("unknown pass: {pass}"),
     };
 
-    map.insert(key, results.clone());
+    map.insert(pass.to_string(), results.clone());
     results
+}
+
+/// Determine which suites are needed based on the cargo test filter.
+/// Returns comma-separated suite names, or empty string for all suites.
+fn compute_suite_filter(cargo_filter: &str) -> String {
+    if cargo_filter.is_empty() {
+        return String::new();
+    }
+    // Collect suites whose Trial names match the cargo test filter.
+    // libtest_mimic uses substring matching.
+    let mut suites: HashSet<&str> = HashSet::new();
+    for &(suite, group) in TEST_GROUPS {
+        let native_name = format!("native::{suite}::{group}");
+        let litebox_name = format!("litebox::{suite}::{group}");
+        if native_name.contains(cargo_filter) || litebox_name.contains(cargo_filter) {
+            suites.insert(suite);
+        }
+    }
+    // Also check if "host::fwd" matches (no suite filter needed for that).
+    if suites.is_empty() && "host::fwd".contains(cargo_filter) {
+        return String::new(); // host-only, no spawn-tree needed
+    }
+    // If all suites are selected, no filter needed.
+    let all_suites: HashSet<&str> = TEST_GROUPS.iter().map(|(s, _)| *s).collect();
+    if suites == all_suites {
+        return String::new();
+    }
+    let mut sorted: Vec<&str> = suites.into_iter().collect();
+    sorted.sort();
+    sorted.join(",")
 }
 
 // ── Main ─────────────────────────────────────────────────────────────
 
 fn main() {
     let args = Arguments::from_args();
+
+    // Compute which suites are needed based on the cargo test filter.
+    // This determines the --filter= argument for docker run.
+    let cargo_filter = args.filter.as_deref().unwrap_or("");
+    let suite_filter = compute_suite_filter(cargo_filter);
+    if !suite_filter.is_empty() {
+        eprintln!("[integration] suite filter: {suite_filter}");
+    }
+
     let mut trials: Vec<Trial> = Vec::new();
 
     // Each test group becomes two Trials: native::<suite>::<group> and
-    // litebox::<suite>::<group>. Docker results are cached per suite, so
-    // multiple groups in the same suite share one docker run.
-    //
-    // Substring matching works naturally:
-    //   cargo test -- native          → all native groups (6 docker runs)
-    //   cargo test -- fork            → all fork groups (2 docker runs)
-    //   cargo test -- native::fork    → all native fork groups (1 docker run)
-    //   cargo test -- native::fork::capture_pipe  → 1 docker run, validates fork suite
+    // litebox::<suite>::<group>. All Trials in the same pass share one
+    // docker run (cached). The docker run is filtered to only the
+    // needed suites.
     for &(suite, group) in TEST_GROUPS {
-        let s = suite.to_string();
-        let g = group.to_string();
+        let sf = suite_filter.clone();
         trials.push(Trial::test(
             format!("native::{suite}::{group}"),
-            move || run_native_group(&s, &g),
+            move || run_native_group(&sf),
         ));
 
-        let s = suite.to_string();
-        let g = group.to_string();
+        let sf = suite_filter.clone();
         trials.push(Trial::test(
             format!("litebox::{suite}::{group}"),
-            move || run_litebox_group(&s, &g),
+            move || run_litebox_group(&sf),
         ));
     }
 
@@ -136,13 +168,13 @@ fn main() {
     libtest_mimic::run(&args, trials).exit();
 }
 
-// ── Per-group runners (backed by suite cache) ────────────────────────
+// ── Per-group runners (backed by pass cache) ─────────────────────────
 
-/// Native gold standard: get suite results from cache, assert 0 FAIL.
-fn run_native_group(suite: &str, _group: &str) -> Result<(), Failed> {
-    let results = get_suite_results("native", suite);
+/// Native gold standard: get pass results from cache, assert 0 FAIL.
+fn run_native_group(suite_filter: &str) -> Result<(), Failed> {
+    let results = get_pass_results("native", suite_filter);
     if results.is_empty() {
-        return Err(format!("native::{suite} produced no results").into());
+        return Err("native produced no results".into());
     }
     let failures: Vec<_> = results
         .iter()
@@ -158,7 +190,7 @@ fn run_native_group(suite: &str, _group: &str) -> Result<(), Failed> {
         .collect();
     if !failures.is_empty() {
         return Err(format!(
-            "native::{suite}: {} FAIL(s):\n  {}",
+            "native: {} FAIL(s):\n  {}",
             failures.len(),
             failures.join("\n  ")
         )
@@ -167,14 +199,13 @@ fn run_native_group(suite: &str, _group: &str) -> Result<(), Failed> {
     Ok(())
 }
 
-/// Litebox pass: get suite results from cache, report counts.
-fn run_litebox_group(suite: &str, _group: &str) -> Result<(), Failed> {
-    let results = get_suite_results("litebox", suite);
+/// Litebox pass: get results from cache, report counts.
+fn run_litebox_group(suite_filter: &str) -> Result<(), Failed> {
+    let results = get_pass_results("litebox", suite_filter);
     if results.is_empty() {
-        return Err(format!("litebox::{suite} produced no results").into());
+        return Err("litebox produced no results".into());
     }
-    // Don't fail — litebox has known FAILs/xfails. The per-suite
-    // eprintln in get_suite_results already reported the counts.
+    // Don't fail — litebox has known FAILs/xfails.
     Ok(())
 }
 
@@ -289,6 +320,9 @@ fn ensure_binaries_built(ws_root: &Path) {
 }
 
 /// Run the test harness and parse JSON results from stdout.
+/// Falls back to parsing coordinator eprintln output from stderr
+/// when running under litebox (litebox_tool_executor doesn't forward
+/// guest stdout).
 fn run_and_parse(label: &str, command: &mut Command) -> Vec<serde_json::Value> {
     eprintln!("Launching {label}...");
     let output = command
@@ -299,12 +333,49 @@ fn run_and_parse(label: &str, command: &mut Command) -> Vec<serde_json::Value> {
     let stderr = String::from_utf8_lossy(&output.stderr);
     eprintln!("{stderr}");
 
+    // Try JSON from stdout first (native runs).
     let mut results: Vec<serde_json::Value> = Vec::new();
     for line in stdout.lines() {
         if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
             results.push(v);
         }
     }
+
+    // Fallback: parse coordinator eprintln output from stderr (litebox runs).
+    // Lines look like: "  pass: TEST_ID [AGENT] DETAIL"
+    //                  "  FAIL: TEST_ID [AGENT] DETAIL"
+    //                  "  xfail: TEST_ID [AGENT] DETAIL"
+    if results.is_empty() {
+        for line in stderr.lines() {
+            let line = line.trim();
+            let (result, rest) = if let Some(r) = line.strip_prefix("pass: ") {
+                ("pass", r)
+            } else if let Some(r) = line.strip_prefix("FAIL: ") {
+                ("FAIL", r)
+            } else if let Some(r) = line.strip_prefix("xfail: ") {
+                ("xfail", r)
+            } else if let Some(r) = line.strip_prefix("XPASS: ") {
+                ("XPASS", r)
+            } else {
+                continue;
+            };
+            // Parse "TEST_ID [AGENT] DETAIL"
+            let (test, agent) = if let Some(bracket) = rest.find('[') {
+                let test = rest[..bracket].trim();
+                let agent_end = rest[bracket..].find(']').unwrap_or(rest.len() - bracket);
+                let agent = &rest[bracket + 1..bracket + agent_end];
+                (test, agent)
+            } else {
+                (rest, "?")
+            };
+            results.push(serde_json::json!({
+                "test": test,
+                "agent": agent,
+                "result": result,
+            }));
+        }
+    }
+
     eprintln!("[{label}] Parsed {} test results", results.len());
     results
 }

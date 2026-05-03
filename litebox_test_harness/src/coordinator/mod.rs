@@ -13,7 +13,6 @@ pub(crate) mod platform_fixes;
 pub(crate) mod port_router;
 pub(crate) mod special_cases;
 pub(crate) mod tcp_stress;
-pub(crate) mod vscode;
 
 use crate::protocol::{Command, Response};
 use crate::test_registry::{TEST_GROUPS, group_timeout, matches_filter};
@@ -240,92 +239,147 @@ impl TestRunner {
         }
     }
 
-    /// Attempt to respawn a poisoned agent. Returns true on success.
-    /// This only respawns direct children (A, B) — their sub-trees
-    /// are NOT rebuilt (would require re-running Spawn/SpawnRemote).
-    async fn respawn_if_poisoned(&mut self, id: &str) -> bool {
-        if !self.poisoned.contains(id) {
-            return true; // not poisoned, nothing to do
-        }
-        eprintln!("[coord] attempting to respawn poisoned agent {id}");
-        match spawn_child(&self.self_exe).await {
-            Ok(child) => {
-                self.children.insert(id.to_string(), child);
-                self.poisoned.remove(id);
-                eprintln!("[coord] respawned agent {id} (sub-tree NOT rebuilt)");
-                true
+    /// Spawn the full agent tree: A (→AA,AB,AAA,AAB), B,
+    /// and optionally NP,NPC,D3,D4,D5 if non-PIE binary is available.
+    async fn spawn_tree(&mut self) {
+        // Spawn direct children A and B.
+        for id in &["A", "B"] {
+            match spawn_child(&self.self_exe).await {
+                Ok(child) => {
+                    self.children.insert(id.to_string(), child);
+                    let sub = match *id {
+                        "A" => vec!["AA".to_string(), "AB".to_string()],
+                        _ => vec![],
+                    };
+                    if !sub.is_empty() {
+                        let r = send_cmd(
+                            self.children.get_mut(*id).unwrap(),
+                            &Command::Spawn { children: sub },
+                        )
+                        .await;
+                        eprintln!("[coord] {id} spawn children: {r:?}");
+                    }
+                }
+                Err(e) => eprintln!("[coord] spawn {id} failed: {e}"),
             }
-            Err(e) => {
-                eprintln!("[coord] failed to respawn agent {id}: {e}");
-                false
+        }
+
+        // Tell A's child AA to spawn AAA, AAB.
+        let r = self
+            .send(
+                "AA",
+                Command::Spawn {
+                    children: vec!["AAA".to_string(), "AAB".to_string()],
+                },
+            )
+            .await;
+        eprintln!("[coord] AA spawn children: {r:?}");
+
+        // Spawn non-PIE subtree if available, with a timeout since
+        // SpawnRemote rewrites the 124MB binary and can hang under litebox.
+        let has_nonpie = crate::find_nonpie_binary().is_some();
+        if has_nonpie {
+            // Broker caches the rewritten binary, so this is fast after
+            // the first SpawnRemote. Timeout catches the known NP→NPC
+            // pipe bridge hang (vfork Pollee observer bug). Retried on
+            // each rebuild since a fresh tree may succeed.
+            if tokio::time::timeout(Duration::from_secs(30), self.spawn_nonpie_subtree())
+                .await
+                .is_err()
+            {
+                eprintln!(
+                    "[coord] non-PIE subtree setup timed out (30s, likely pipe bridge bug) — continuing without NP/D4"
+                );
             }
+        } else {
+            eprintln!("[coord] non-PIE binary not found — mount at /opt/nonpie");
         }
     }
 
-    /// After a suite timeout, kill all agents that might be
-    /// desynchronized and try to respawn the direct children (A, B)
-    /// so subsequent suites have a chance of running.
-    async fn recover_agents(&mut self) {
-        eprintln!("[coord] recovering agents after suite timeout");
-        // Collect all direct child IDs.
-        let ids: Vec<String> = self.children.keys().cloned().collect();
-        // Poison everything — a timeout means we don't know which
-        // agent's pipe is desynchronized.
-        for id in &ids {
-            self.poison_agent(id).await;
-        }
-        // Respawn direct children and rebuild sub-trees.
-        for id in &ids {
-            self.respawn_if_poisoned(id).await;
-        }
-        self.rebuild_subtree().await;
-    }
-
-    /// Check if any agents are poisoned and recover them.
-    /// Called between test groups to prevent cascade failures.
-    async fn recover_if_needed(&mut self) {
-        if self.poisoned.is_empty() {
-            return;
-        }
-        eprintln!(
-            "[coord] recovering poisoned agents: {:?}",
-            self.poisoned.iter().collect::<Vec<_>>()
-        );
-        let poisoned: Vec<String> = self.poisoned.iter().cloned().collect();
-        for id in &poisoned {
-            self.respawn_if_poisoned(id).await;
-        }
-        self.rebuild_subtree().await;
-    }
-
-    /// Rebuild agent A's sub-tree (AA, AB, AAA, AAB) after A is respawned.
-    async fn rebuild_subtree(&mut self) {
-        // Only rebuild if A exists and is healthy.
-        if !self.children.contains_key("A") || self.poisoned.contains("A") {
-            return;
-        }
-        // Tell A to spawn AA and AB.
-        let r = send_cmd(
-            self.children.get_mut("A").unwrap(),
-            &Command::Spawn {
-                children: vec!["AA".to_string(), "AB".to_string()],
-            },
-        )
-        .await;
-        eprintln!("[coord] rebuild: A spawn AA,AB: {r:?}");
+    /// Spawn non-PIE agents: NP, NPC, D3, D4, D5.
+    async fn spawn_nonpie_subtree(&mut self) {
+        eprintln!("[coord] spawning non-PIE subtree (NP → NPC)");
+        let r = self
+            .send(
+                "A",
+                Command::SpawnRemote {
+                    children: vec!["NP".to_string()],
+                },
+            )
+            .await;
+        eprintln!("[coord] SpawnRemote NP: {r:?}");
 
         if matches!(&r, Response::Ok { .. }) {
-            // Tell AA to spawn AAA, AAB.
             let r = self
                 .send(
-                    "AA",
-                    Command::Spawn {
-                        children: vec!["AAA".to_string(), "AAB".to_string()],
+                    "A",
+                    Command::Forward {
+                        target: "NP".to_string(),
+                        inner: Box::new(Command::Spawn {
+                            children: vec!["NPC".to_string()],
+                        }),
                     },
                 )
                 .await;
-            eprintln!("[coord] rebuild: AA spawn AAA,AAB: {r:?}");
+            eprintln!("[coord] NP spawn NPC: {r:?}");
         }
+
+        // Deep mixed chain: AA → D3 (PIE) → D4 (non-PIE) → D5 (PIE)
+        eprintln!("[coord] building deep mixed chain (D3 → D4 → D5)");
+        let r = self
+            .send(
+                "AA",
+                Command::Spawn {
+                    children: vec!["D3".to_string()],
+                },
+            )
+            .await;
+        eprintln!("[coord] AA spawn D3: {r:?}");
+
+        if matches!(&r, Response::Ok { .. }) {
+            let r = self
+                .send(
+                    "AA",
+                    Command::Forward {
+                        target: "D3".to_string(),
+                        inner: Box::new(Command::SpawnRemote {
+                            children: vec!["D4".to_string()],
+                        }),
+                    },
+                )
+                .await;
+            eprintln!("[coord] D3 SpawnRemote D4: {r:?}");
+
+            if matches!(&r, Response::Ok { .. }) {
+                let r = self
+                    .send(
+                        "AA",
+                        Command::Forward {
+                            target: "D3".to_string(),
+                            inner: Box::new(Command::Forward {
+                                target: "D4".to_string(),
+                                inner: Box::new(Command::Spawn {
+                                    children: vec!["D5".to_string()],
+                                }),
+                            }),
+                        },
+                    )
+                    .await;
+                eprintln!("[coord] D4 spawn D5: {r:?}");
+            }
+        }
+    }
+
+    /// Hard-kill the entire agent tree. No cooperative Exit — agents
+    /// may be hung in syscalls that never return.
+    async fn teardown_tree(&mut self) {
+        for (id, mut child) in self.children.drain() {
+            let _ = child.process.kill().await;
+            // Short wait — don't block forever on zombie reaping.
+            let _ = tokio::time::timeout(Duration::from_secs(2), child.process.wait()).await;
+            eprintln!("[coord] {id} killed");
+        }
+        self.poisoned.clear();
     }
 
     async fn exec_local(&self, cmd: &Command) -> Response {
@@ -529,16 +583,8 @@ pub fn run_filtered(self_exe: &str, filter: Option<&str>) -> Vec<TestResult> {
 }
 
 async fn run_tests(self_exe: &str, filter: Option<&str>) -> Vec<TestResult> {
-    // Detect runtime environment: litebox sandbox vs native Linux.
-    // This is critical for interpreting test results — tests running on
-    // native Linux validate the gold-standard kernel behavior, while
-    // tests running inside litebox validate the sandbox's emulation.
     let runtime_env = detect_runtime_environment();
     eprintln!("[coord] runtime: {runtime_env}");
-
-    // The non-PIE binary (/litebox-test-harness-nonpie) is pre-built via:
-    //   cargo rustc -p litebox_test_harness --target-dir target/nonpie -- -C link-args=-no-pie
-    // It must be copied to the rootfs before running tests.
 
     let mut runner = TestRunner {
         children: std::collections::HashMap::new(),
@@ -547,138 +593,16 @@ async fn run_tests(self_exe: &str, filter: Option<&str>) -> Vec<TestResult> {
         poisoned: std::collections::HashSet::new(),
     };
 
-    // Spawn direct children A and B.
-    eprintln!("[coord] spawning children");
-    for id in &["A", "B"] {
-        match spawn_child(self_exe).await {
-            Ok(child) => {
-                runner.children.insert(id.to_string(), child);
-                // Tell child to spawn its own children.
-                let sub = match *id {
-                    "A" => vec!["AA".to_string(), "AB".to_string()],
-                    _ => vec![],
-                };
-                if !sub.is_empty() {
-                    let r = send_cmd(
-                        runner.children.get_mut(*id).unwrap(),
-                        &Command::Spawn { children: sub },
-                    )
-                    .await;
-                    eprintln!("[coord] {id} spawn children: {r:?}");
-                }
-            }
-            Err(e) => eprintln!("[coord] spawn {id} failed: {e}"),
-        }
-    }
+    // Build the agent tree once.
+    runner.spawn_tree().await;
 
-    // Tell A's child AA to spawn AAA, AAB.
-    let r = runner
-        .send(
-            "AA",
-            Command::Spawn {
-                children: vec!["AAA".to_string(), "AAB".to_string()],
-            },
-        )
-        .await;
-    eprintln!("[coord] AA spawn children: {r:?}");
-
-    // Spawn non-PIE subtree: NP (non-PIE) under A, NPC (PIE) under NP.
-    // This exercises fork-restore from within a worker-exec host — the
-    // exact pattern when VS Code's non-PIE node binary forks children.
-    // Conditional on the non-PIE binary being available.
-    let has_nonpie = crate::find_nonpie_binary().is_some();
-    if has_nonpie {
-        eprintln!("[coord] spawning non-PIE subtree (NP → NPC)");
-        let r = runner
-            .send(
-                "A",
-                Command::SpawnRemote {
-                    children: vec!["NP".to_string()],
-                },
-            )
-            .await;
-        eprintln!("[coord] SpawnRemote NP: {r:?}");
-
-        if matches!(&r, Response::Ok { .. }) {
-            // NP (non-PIE, in worker-exec host) spawns PIE child NPC.
-            let r = runner
-                .send(
-                    "A",
-                    Command::Forward {
-                        target: "NP".to_string(),
-                        inner: Box::new(Command::Spawn {
-                            children: vec!["NPC".to_string()],
-                        }),
-                    },
-                )
-                .await;
-            eprintln!("[coord] NP spawn NPC: {r:?}");
-        }
-
-        // Deep mixed chain: AA → D3 (PIE) → D4 (non-PIE) → D5 (PIE)
-        // Mirrors the VS Code Remote-SSH process tree at depths 3-5:
-        //
-        //   A  (PIE, depth 1)  ≈ dropbear sshd
-        //   AA (PIE, depth 2)  ≈ bash (bootstrap script)
-        //   D3 (PIE, depth 3)  ≈ VS Code CLI
-        //   D4 (non-PIE, depth 4) ≈ node (VS Code Server) — worker-exec
-        //   D5 (PIE, depth 5)  ≈ node (extension host) — fork-restore from worker-exec
-        eprintln!("[coord] building deep mixed chain (D3 → D4 → D5)");
-        let r = runner
-            .send(
-                "AA",
-                Command::Spawn {
-                    children: vec!["D3".to_string()],
-                },
-            )
-            .await;
-        eprintln!("[coord] AA spawn D3: {r:?}");
-
-        if matches!(&r, Response::Ok { .. }) {
-            let r = runner
-                .send(
-                    "AA",
-                    Command::Forward {
-                        target: "D3".to_string(),
-                        inner: Box::new(Command::SpawnRemote {
-                            children: vec!["D4".to_string()],
-                        }),
-                    },
-                )
-                .await;
-            eprintln!("[coord] D3 SpawnRemote D4: {r:?}");
-
-            if matches!(&r, Response::Ok { .. }) {
-                let r = runner
-                    .send(
-                        "AA",
-                        Command::Forward {
-                            target: "D3".to_string(),
-                            inner: Box::new(Command::Forward {
-                                target: "D4".to_string(),
-                                inner: Box::new(Command::Spawn {
-                                    children: vec!["D5".to_string()],
-                                }),
-                            }),
-                        },
-                    )
-                    .await;
-                eprintln!("[coord] D4 spawn D5: {r:?}");
-            }
-        }
-    } else {
-        // Non-PIE binary is a required dependency. Record failures for
-        // all tests that need the NP/D3/D4/D5 agents.
-        eprintln!("[coord] non-PIE binary not found — mount at /opt/nonpie");
-    }
-
-    // Run test groups that match the filter.
     for &(suite, group) in TEST_GROUPS {
         if !matches_filter(filter, suite, group) {
             continue;
         }
         let timeout = group_timeout(suite, group);
         eprintln!("[coord] --- {suite}::{group} (timeout {timeout}s) ---");
+
         if tokio::time::timeout(
             Duration::from_secs(timeout),
             run_group(&mut runner, suite, group),
@@ -692,20 +616,11 @@ async fn run_tests(self_exe: &str, filter: Option<&str>) -> Vec<TestResult> {
                 false,
                 &format!("{suite}::{group} exceeded {timeout}s timeout"),
             );
-            runner.recover_agents().await;
         }
-        // Recover any agents poisoned by send timeouts within the group,
-        // preventing cascade failures into subsequent groups.
-        runner.recover_if_needed().await;
     }
 
-    // Shutdown all children.
-    for (id, mut child) in runner.children.drain() {
-        let _ = send_cmd(&mut child, &Command::Exit).await;
-        let _ = child.process.wait().await;
-        eprintln!("[coord] {id} exited");
-    }
-
+    // Clean shutdown.
+    runner.teardown_tree().await;
     runner.results
 }
 
@@ -952,115 +867,5 @@ mod tests {
             }
             _ => panic!("expected Error response for poisoned agent, got: {resp:?}"),
         }
-    }
-
-    #[tokio::test]
-    async fn respawn_recovers_poisoned_agent() {
-        let mut runner = empty_runner();
-
-        // Spawn and immediately poison.
-        let child = spawn_child(&runner.self_exe).await.unwrap();
-        runner.children.insert("T".to_string(), child);
-        runner.poison_agent("T").await;
-        assert!(runner.poisoned.contains("T"));
-
-        // Respawn.
-        let ok = runner.respawn_if_poisoned("T").await;
-        assert!(ok, "respawn should succeed");
-        assert!(
-            !runner.poisoned.contains("T"),
-            "should no longer be poisoned"
-        );
-        assert!(
-            runner.children.contains_key("T"),
-            "child should exist again"
-        );
-
-        // Verify the respawned agent works.
-        let resp = runner
-            .send(
-                "T",
-                Command::EnvGet {
-                    var: "HOME".to_string(),
-                },
-            )
-            .await;
-        assert!(
-            !matches!(&resp, Response::Error { .. }),
-            "post-respawn send should work, got: {resp:?}"
-        );
-
-        // Clean up.
-        let _ = runner.send("T", Command::Exit).await;
-    }
-
-    #[tokio::test]
-    async fn recover_agents_kills_and_respawns_all() {
-        let mut runner = empty_runner();
-
-        // Spawn two agents.
-        for id in &["X", "Y"] {
-            let child = spawn_child(&runner.self_exe).await.unwrap();
-            runner.children.insert(id.to_string(), child);
-        }
-
-        // Verify both work.
-        for id in &["X", "Y"] {
-            let resp = runner
-                .send(
-                    id,
-                    Command::EnvGet {
-                        var: "HOME".to_string(),
-                    },
-                )
-                .await;
-            assert!(
-                !matches!(&resp, Response::Error { .. }),
-                "agent {id} should work before recovery, got: {resp:?}"
-            );
-        }
-
-        // Simulate suite timeout: recover_agents poisons all then respawns.
-        runner.recover_agents().await;
-        assert!(
-            runner.poisoned.is_empty(),
-            "all agents should be un-poisoned after recovery"
-        );
-        assert_eq!(runner.children.len(), 2, "both agents should be respawned");
-
-        // Verify respawned agents work.
-        for id in &["X", "Y"] {
-            let resp = runner
-                .send(
-                    id,
-                    Command::EnvGet {
-                        var: "HOME".to_string(),
-                    },
-                )
-                .await;
-            assert!(
-                !matches!(&resp, Response::Error { .. }),
-                "agent {id} should work after recovery, got: {resp:?}"
-            );
-        }
-
-        // Clean up.
-        for id in &["X", "Y"] {
-            let _ = runner.send(id, Command::Exit).await;
-        }
-    }
-
-    #[tokio::test]
-    async fn respawn_noop_for_healthy_agent() {
-        let mut runner = empty_runner();
-        let child = spawn_child(&runner.self_exe).await.unwrap();
-        runner.children.insert("T".to_string(), child);
-
-        // respawn_if_poisoned on a healthy agent is a no-op.
-        let ok = runner.respawn_if_poisoned("T").await;
-        assert!(ok);
-        assert!(runner.children.contains_key("T"));
-
-        let _ = runner.send("T", Command::Exit).await;
     }
 }

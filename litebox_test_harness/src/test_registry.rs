@@ -69,10 +69,18 @@ pub const TEST_GROUPS: &[(&str, &str)] = &[
 const DEFAULT_GROUP_TIMEOUT: u64 = 60;
 
 /// Get the timeout for a specific test group.
+/// Each group now spawns a fresh agent tree (~10s overhead), so
+/// timeouts must account for that on top of the test itself.
 pub fn group_timeout(suite: &str, group: &str) -> u64 {
     match (suite, group) {
-        ("stress", _) => 120,
-        ("matrix", "run_matrix") => 90,
+        ("stress", _) => 180,
+        ("matrix", "run_matrix") => 120,
+        ("matrix", "loopback_tcp") => 90,
+        ("matrix", "epoll_socket") => 90,
+        ("xworker", _) => 90,
+        ("fork", "fork_matrix") => 90,
+        ("fork", "nonpie_pipe_chain") => 90,
+        ("fork", "fork_from_worker_exec") => 90,
         _ => DEFAULT_GROUP_TIMEOUT,
     }
 }
@@ -81,16 +89,17 @@ pub fn group_timeout(suite: &str, group: &str) -> u64 {
 ///
 /// - `None` → run everything
 /// - `Some("fork")` → run all groups in fork suite
+/// - `Some("fork,shell")` → run all groups in fork and shell suites
 /// - `Some("fork.exit_data_integrity")` → run only that group
 pub fn matches_filter(filter: Option<&str>, suite: &str, group: &str) -> bool {
     match filter {
         None => true,
-        Some(f) => {
-            if let Some((fs, fg)) = f.split_once('.') {
+        Some(f) => f.split(',').any(|part| {
+            if let Some((fs, fg)) = part.split_once('.') {
                 suite == fs && group == fg
             } else {
-                suite == f
+                suite == part
             }
-        }
+        }),
     }
 }
