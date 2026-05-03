@@ -261,6 +261,8 @@ fn ensure_binaries_built(ws_root: &Path) {
             "rustc",
             "-p",
             "litebox_test_harness",
+            "--bin",
+            "litebox_test_harness",
             "--target-dir",
             &nonpie_td_str,
             "--",

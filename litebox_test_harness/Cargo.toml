@@ -10,6 +10,12 @@ libc = "0.2"
 tokio = { version = "1", features = ["rt", "net", "io-util", "io-std", "time", "macros", "fs", "process"] }
 
 [dev-dependencies]
+libtest-mimic = "0.8"
+
+[[test]]
+name = "integration"
+path = "tests/integration.rs"
+harness = false
 
 [lints]
 workspace = true

@@ -617,7 +617,12 @@ pub(crate) async fn fork_from_worker_exec_tests(r: &mut TestRunner) {
     eprintln!("[platform] === Fork from Worker-Exec Tests ===");
 
     let Some(ref nonpie_bin) = nonpie else {
-        for name in ["pie_from_init", "nonpie_from_init", "pie_from_worker_exec", "nonpie_from_worker_exec"] {
+        for name in [
+            "pie_from_init",
+            "nonpie_from_init",
+            "pie_from_worker_exec",
+            "nonpie_from_worker_exec",
+        ] {
             r.record(
                 &format!("FWE.{name}"),
                 "A",
@@ -715,7 +720,12 @@ pub(crate) async fn fork_from_worker_exec_tests(r: &mut TestRunner) {
         Response::ExecResult { exit_code: 0, stdout, .. }
             if stdout.contains("FORK_EXEC_NONPIE_OK")
     );
-    r.record("FWE.nonpie_from_worker_exec", "NP", pass, &format!("{resp:?}"));
+    r.record(
+        "FWE.nonpie_from_worker_exec",
+        "NP",
+        pass,
+        &format!("{resp:?}"),
+    );
 }
 
 /// When a shell script is piped via stdin (as VS Code Remote-SSH does),
