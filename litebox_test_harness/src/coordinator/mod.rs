@@ -148,6 +148,8 @@ pub(crate) struct TestRunner {
     /// command timeout). Further sends to these agents return immediate
     /// errors instead of risking hangs on stale pipe data.
     poisoned: std::collections::HashSet<String>,
+    /// Track recorded test IDs to detect duplicates.
+    recorded_ids: std::collections::HashSet<String>,
 }
 
 impl TestRunner {
@@ -175,6 +177,10 @@ impl TestRunner {
         expected: Expectation,
         detail: &str,
     ) {
+        let key = format!("{test} {agent}");
+        if !self.recorded_ids.insert(key) {
+            eprintln!("  WARNING: duplicate test ID: {test} [{agent}]");
+        }
         let result = TestResult {
             id: test.to_string(),
             agent: agent.to_string(),
@@ -591,6 +597,7 @@ async fn run_tests(self_exe: &str, filter: Option<&str>) -> Vec<TestResult> {
         results: Vec::new(),
         self_exe: self_exe.to_string(),
         poisoned: std::collections::HashSet::new(),
+        recorded_ids: std::collections::HashSet::new(),
     };
 
     // Build the agent tree once.
@@ -821,6 +828,7 @@ mod tests {
             results: Vec::new(),
             self_exe: harness_binary(),
             poisoned: std::collections::HashSet::new(),
+            recorded_ids: std::collections::HashSet::new(),
         }
     }
 

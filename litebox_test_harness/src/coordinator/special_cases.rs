@@ -744,7 +744,12 @@ pub(super) async fn fs_io_tests(r: &mut TestRunner) {
 
     for op in &ops {
         for path in &paths {
-            let test_name = format!("FS.{}_{}", op, path.rsplit('/').next().unwrap_or(path));
+            let dir = if path.contains("/tmp/") {
+                "tmp"
+            } else {
+                "root"
+            };
+            let test_name = format!("FS.{op}.{dir}");
             let resp = r
                 .send(
                     "A",
