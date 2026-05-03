@@ -22,11 +22,78 @@
 //!
 //! To add a rootfs dependency, edit the Dockerfile. There is no other path.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Mutex;
 
 use libtest_mimic::{Arguments, Failed, Trial};
 use litebox_test_harness::test_registry::TEST_GROUPS;
+
+// ── Suite result cache ───────────────────────────────────────────────
+//
+// One docker run per suite, shared across all group Trials in that suite.
+// Key: "native::{suite}" or "litebox::{suite}".
+// libtest_mimic runs Trials sequentially, so Mutex contention is zero.
+
+static SUITE_CACHE: Mutex<Option<HashMap<String, Vec<serde_json::Value>>>> = Mutex::new(None);
+
+/// Get (or compute) results for a suite. Runs docker once per suite.
+/// The lock is held during docker run to prevent parallel trials from
+/// spawning duplicate containers for the same suite.
+fn get_suite_results(pass: &str, suite: &str) -> Vec<serde_json::Value> {
+    let key = format!("{pass}::{suite}");
+    let mut cache = SUITE_CACHE.lock().unwrap();
+    let map = cache.get_or_insert_with(HashMap::new);
+    if let Some(results) = map.get(&key) {
+        return results.clone();
+    }
+
+    // Hold the lock while running docker — serializes all docker runs,
+    // which is what we want (parallel containers thrash the machine).
+    let (_, debug, nonpie) = setup();
+    let results = match pass {
+        "native" => {
+            let mut cmd = Command::new("docker");
+            cmd.args(["run", "--rm", "--cap-add", "SYS_PTRACE"])
+                .arg("-v")
+                .arg(format!("{}:/opt/litebox:ro", debug.display()))
+                .arg("-v")
+                .arg(format!("{}:/opt/nonpie:ro", nonpie.display()))
+                .arg("litebox-test")
+                .args([
+                    "/opt/litebox/litebox_test_harness",
+                    "spawn-tree",
+                    &format!("--filter={suite}"),
+                ]);
+            run_and_parse(&key, &mut cmd)
+        }
+        "litebox" => {
+            let mut cmd = Command::new("docker");
+            cmd.args(["run", "--rm", "--cap-add", "SYS_PTRACE"])
+                .arg("-v")
+                .arg(format!("{}:/opt/litebox:ro", debug.display()))
+                .arg("-v")
+                .arg(format!("{}:/opt/nonpie:ro", nonpie.display()))
+                .arg("litebox-test")
+                .args([
+                    "/opt/litebox/litebox_tool_executor",
+                    "--rootfs",
+                    "/",
+                    "--record-baseline",
+                    "--",
+                    "/opt/litebox/litebox_test_harness",
+                    "spawn-tree",
+                    &format!("--filter={suite}"),
+                ]);
+            run_and_parse(&key, &mut cmd)
+        }
+        _ => panic!("unknown pass: {pass}"),
+    };
+
+    map.insert(key, results.clone());
+    results
+}
 
 // ── Main ─────────────────────────────────────────────────────────────
 
@@ -35,26 +102,27 @@ fn main() {
     let mut trials: Vec<Trial> = Vec::new();
 
     // Each test group becomes two Trials: native::<suite>::<group> and
-    // litebox::<suite>::<group>. Each Trial runs its own docker container
-    // with `spawn-tree --filter=<suite>.<group>`, so a single group
-    // takes ~5s instead of the full battery (~5min).
+    // litebox::<suite>::<group>. Docker results are cached per suite, so
+    // multiple groups in the same suite share one docker run.
     //
     // Substring matching works naturally:
-    //   cargo test -- native          → all native groups
-    //   cargo test -- fork            → all fork groups (both passes)
-    //   cargo test -- native::fork    → all native fork groups
+    //   cargo test -- native          → all native groups (6 docker runs)
+    //   cargo test -- fork            → all fork groups (2 docker runs)
+    //   cargo test -- native::fork    → all native fork groups (1 docker run)
+    //   cargo test -- native::fork::capture_pipe  → 1 docker run, validates fork suite
     for &(suite, group) in TEST_GROUPS {
-        let filter_arg = format!("{suite}.{group}");
-        let fa = filter_arg.clone();
+        let s = suite.to_string();
+        let g = group.to_string();
         trials.push(Trial::test(
             format!("native::{suite}::{group}"),
-            move || run_native_group(&fa),
+            move || run_native_group(&s, &g),
         ));
 
-        let fa = filter_arg;
+        let s = suite.to_string();
+        let g = group.to_string();
         trials.push(Trial::test(
             format!("litebox::{suite}::{group}"),
-            move || run_litebox_group(&fa),
+            move || run_litebox_group(&s, &g),
         ));
     }
 
@@ -68,26 +136,13 @@ fn main() {
     libtest_mimic::run(&args, trials).exit();
 }
 
-// ── Per-suite runners ────────────────────────────────────────────────
+// ── Per-group runners (backed by suite cache) ────────────────────────
 
-/// Native gold standard: run one test group, assert 0 FAIL.
-fn run_native_group(filter: &str) -> Result<(), Failed> {
-    let (_, debug, nonpie) = setup();
-    let mut cmd = Command::new("docker");
-    cmd.args(["run", "--rm", "--cap-add", "SYS_PTRACE"])
-        .arg("-v")
-        .arg(format!("{}:/opt/litebox:ro", debug.display()))
-        .arg("-v")
-        .arg(format!("{}:/opt/nonpie:ro", nonpie.display()))
-        .arg("litebox-test")
-        .args([
-            "/opt/litebox/litebox_test_harness",
-            "spawn-tree",
-            &format!("--filter={filter}"),
-        ]);
-    let results = run_and_parse(&format!("native::{filter}"), &mut cmd);
+/// Native gold standard: get suite results from cache, assert 0 FAIL.
+fn run_native_group(suite: &str, _group: &str) -> Result<(), Failed> {
+    let results = get_suite_results("native", suite);
     if results.is_empty() {
-        return Err(format!("native::{filter} produced no results").into());
+        return Err(format!("native::{suite} produced no results").into());
     }
     let failures: Vec<_> = results
         .iter()
@@ -103,64 +158,23 @@ fn run_native_group(filter: &str) -> Result<(), Failed> {
         .collect();
     if !failures.is_empty() {
         return Err(format!(
-            "native::{filter}: {} FAIL(s):\n  {}",
+            "native::{suite}: {} FAIL(s):\n  {}",
             failures.len(),
             failures.join("\n  ")
         )
         .into());
     }
-    eprintln!("native::{filter}: {} tests, 0 FAIL", results.len());
     Ok(())
 }
 
-/// Litebox pass: run one test group, report results.
-fn run_litebox_group(filter: &str) -> Result<(), Failed> {
-    let (_, debug, nonpie) = setup();
-    let mut cmd = Command::new("docker");
-    cmd.args(["run", "--rm", "--cap-add", "SYS_PTRACE"])
-        .arg("-v")
-        .arg(format!("{}:/opt/litebox:ro", debug.display()))
-        .arg("-v")
-        .arg(format!("{}:/opt/nonpie:ro", nonpie.display()))
-        .arg("litebox-test")
-        .args([
-            "/opt/litebox/litebox_tool_executor",
-            "--rootfs",
-            "/",
-            "--record-baseline",
-            "--",
-            "/opt/litebox/litebox_test_harness",
-            "spawn-tree",
-            &format!("--filter={filter}"),
-        ]);
-    let results = run_and_parse(&format!("litebox::{filter}"), &mut cmd);
+/// Litebox pass: get suite results from cache, report counts.
+fn run_litebox_group(suite: &str, _group: &str) -> Result<(), Failed> {
+    let results = get_suite_results("litebox", suite);
     if results.is_empty() {
-        return Err(format!("litebox::{filter} produced no results").into());
+        return Err(format!("litebox::{suite} produced no results").into());
     }
-    let fail_count = results
-        .iter()
-        .filter(|r| r["result"].as_str() == Some("FAIL"))
-        .count();
-    let xfail_count = results
-        .iter()
-        .filter(|r| r["result"].as_str() == Some("xfail"))
-        .count();
-    let xpass_count = results
-        .iter()
-        .filter(|r| r["result"].as_str() == Some("XPASS"))
-        .count();
-    let pass_count = results
-        .iter()
-        .filter(|r| r["result"].as_str() == Some("pass"))
-        .count();
-    eprintln!(
-        "litebox::{filter}: {} tests — {pass_count} pass, {fail_count} FAIL, \
-         {xfail_count} xfail, {xpass_count} XPASS",
-        results.len(),
-    );
-    // Don't fail the Trial — litebox has known FAILs/xfails. The Trial
-    // reports results; regressions are caught by comparing against
-    // the native gold standard.
+    // Don't fail — litebox has known FAILs/xfails. The per-suite
+    // eprintln in get_suite_results already reported the counts.
     Ok(())
 }
 
