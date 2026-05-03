@@ -598,7 +598,7 @@ async fn run_net_addr_tests(r: &mut TestRunner) {
             if !has_nonpie && (agent_requires_nonpie(agent_a) || agent_requires_nonpie(agent_b)) {
                 r.record(
                     &format!("NA.{agent_a}_to_{agent_b}.{label}"),
-                    agent_a,
+                    agent_b,
                     false,
                     "FAIL: nonpie binary not found — mount at /opt/nonpie",
                 );
@@ -615,7 +615,7 @@ async fn run_net_addr_tests(r: &mut TestRunner) {
             if !listen_ok {
                 r.record(
                     &test_id,
-                    agent_a,
+                    agent_b,
                     false,
                     &format!("listen failed: {resp:?}"),
                 );
@@ -665,7 +665,7 @@ async fn run_unix_addr_tests(r: &mut TestRunner) {
         if !has_nonpie && (agent_requires_nonpie(agent_a) || agent_requires_nonpie(agent_b)) {
             r.record(
                 &format!("UA.{agent_a}_to_{agent_b}"),
-                agent_a,
+                agent_b,
                 false,
                 "FAIL: nonpie binary not found — mount at /opt/nonpie",
             );
@@ -689,7 +689,7 @@ async fn run_unix_addr_tests(r: &mut TestRunner) {
         if !listen_ok {
             r.record(
                 &test_id,
-                agent_a,
+                agent_b,
                 false,
                 &format!("listen failed: {resp:?}"),
             );
@@ -1647,3 +1647,4 @@ pub(crate) async fn run_matrix_tests(r: &mut TestRunner) {
         test_symlink_variant(r, variant, symlink_unsupported).await;
     }
 }
+// force
