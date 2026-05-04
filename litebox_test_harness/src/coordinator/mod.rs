@@ -525,8 +525,6 @@ async fn run_group(runner: &mut TestRunner, suite: &str, group: &str) {
         ("matrix", "run_matrix") => matrix::run_matrix_tests(runner).await,
         // Converted to register_netlink (new-style)
         // ("matrix", "netlink") => special_cases::netlink_tests(runner).await,
-        ("matrix", "net_ipv6") => special_cases::net_ipv6_tests(runner).await,
-        ("matrix", "terminal_ioctl") => special_cases::terminal_ioctl_tests(runner).await,
         ("matrix", "fs_io") => special_cases::fs_io_tests(runner).await,
         ("matrix", "poll_ready") => platform_fixes::poll_ready_tests(runner).await,
         ("matrix", "bind_getsockname") => platform_fixes::bind_getsockname_tests(runner).await,
@@ -546,7 +544,6 @@ async fn run_group(runner: &mut TestRunner, suite: &str, group: &str) {
         ("fork", "concurrent_fork") => platform_fixes::concurrent_fork_tests(runner).await,
         ("fork", "pid_visibility") => platform_fixes::pid_visibility_tests(runner).await,
         ("fork", "capture_pipe") => special_cases::capture_pipe_tests(runner).await,
-        ("fork", "node_exit") => special_cases::node_exit_tests(runner).await,
         // shell
         ("shell", "stdin_pipe_subst") => platform_fixes::stdin_pipe_subst_tests(runner).await,
         ("shell", "subst_capture") => platform_fixes::subst_capture_tests(runner).await,
@@ -566,16 +563,6 @@ async fn run_group(runner: &mut TestRunner, suite: &str, group: &str) {
         ("xworker", "cross_worker") => special_cases::cross_worker_tests(runner).await,
         ("xworker", "pipe_eof") => special_cases::pipe_eof_tests(runner).await,
         ("xworker", "pipe_bridge") => pipe_bridge::pipe_bridge_tests(runner).await,
-        ("xworker", "concurrent_fork_pipeline") => {
-            concurrent_fork::concurrent_fork_pipeline_tests(runner).await
-        }
-        ("xworker", "concurrent_exec") => concurrent_fork::concurrent_exec_tests(runner).await,
-        ("xworker", "vscode_install_pipeline") => {
-            concurrent_fork::vscode_install_pipeline_tests(runner).await
-        }
-        ("xworker", "concurrent_fs_rwlock") => {
-            concurrent_fork::concurrent_fs_rwlock_tests(runner).await
-        }
         // stress
         ("stress", "tcp_stress") => tcp_stress::run(runner).await,
         ("stress", "file_tcp") => file_tcp::run(runner).await,
@@ -679,6 +666,13 @@ async fn run_tests(self_exe: &str, filter: Option<&str>) -> Vec<TestResult> {
     // Collect registered tests.
     let mut new_tests: Vec<Test> = Vec::new();
     special_cases::register_netlink(&mut new_tests);
+    concurrent_fork::register_concurrent_fork_pipeline(&mut new_tests);
+    concurrent_fork::register_concurrent_exec(&mut new_tests);
+    concurrent_fork::register_vscode_install_pipeline(&mut new_tests);
+    concurrent_fork::register_concurrent_fs_rwlock(&mut new_tests);
+    special_cases::register_net_ipv6(&mut new_tests);
+    special_cases::register_terminal_ioctl(&mut new_tests);
+    special_cases::register_node_exit(&mut new_tests);
 
     // Filter to only tests matching the --filter argument.
     let new_filtered: Vec<Test> = new_tests

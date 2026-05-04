@@ -1610,3 +1610,160 @@ pub(super) fn register_netlink(tests: &mut Vec<super::Test>) {
         |s| s.contains("NL6_MAC_CHECK"),
     ));
 }
+/// Register IPv6 network tests.
+pub(super) fn register_net_ipv6(tests: &mut Vec<super::Test>) {
+    let cases: &[(&str, &str)] = &[
+        ("NET1.ipv6_socket", "ipv6-socket"),
+        ("NET2.ipv6_listen", "ipv6-listen"),
+        ("NET4.ipv4_listen", "ipv4-listen"),
+        ("NET5.ipv6_getaddrinfo", "ipv6-getaddrinfo"),
+        ("NET6.ipv6_v6only", "ipv6-v6only"),
+    ];
+    for &(name, sub) in cases {
+        let id = name.to_string();
+        let sub = sub.to_string();
+        tests.push(super::Test {
+            suite: "matrix",
+            group: "net_ipv6",
+            id,
+            xfail: None,
+            run: Box::new(move |r| {
+                let self_exe = r.self_exe.clone();
+                Box::pin(async move {
+                    let resp = r
+                        .send("A", super::exec_timeout(vec![self_exe, "net-test".into(), sub], 10))
+                        .await;
+                    let pass = matches!(&resp, crate::protocol::Response::ExecResult { stdout, .. } if stdout.contains("_OK"));
+                    super::TestOutcome::new("A", pass, format!("{resp:?}"))
+                })
+            }),
+        });
+    }
+}
+
+/// Register terminal ioctl tests.
+pub(super) fn register_terminal_ioctl(tests: &mut Vec<super::Test>) {
+    let ops = ["tcgets", "tcsets", "tcsetsw", "tcsetsf", "tiocgwinsz"];
+    let fds = [0, 1, 2];
+    for op in &ops {
+        for fd in &fds {
+            let id = format!("TERM.{op}_fd{fd}");
+            let op = op.to_string();
+            let fd_str = fd.to_string();
+            tests.push(super::Test {
+                suite: "matrix",
+                group: "terminal_ioctl",
+                id,
+                xfail: None,
+                run: Box::new(move |r| {
+                    let self_exe = r.self_exe.clone();
+                    Box::pin(async move {
+                        let resp = r
+                            .send(
+                                "A",
+                                super::exec_timeout(
+                                    vec![self_exe, "exit-test".into(), "term".into(), op, fd_str],
+                                    8,
+                                ),
+                            )
+                            .await;
+                        let pass = matches!(
+                            &resp,
+                            crate::protocol::Response::ExecResult { exit_code: 0 | 1, stdout, .. }
+                                if stdout.contains("TERM_OK") || stdout.contains("TERM_ERR")
+                        );
+                        super::TestOutcome::new("A", pass, format!("{resp:?}"))
+                    })
+                }),
+            });
+        }
+    }
+}
+
+/// Register Node.js exit tests.
+pub(super) fn register_node_exit(tests: &mut Vec<super::Test>) {
+    let node_tests: &[(
+        &str,
+        Vec<&str>,
+        Box<dyn Fn(&crate::protocol::Response) -> bool + Send + Sync>,
+    )] = &[];
+    // Simpler: just push each test individually.
+
+    tests.push(super::Test {
+        suite: "fork", group: "node_exit",
+        id: "EX6.node_version_exit".into(), xfail: None,
+        run: Box::new(|r| Box::pin(async move {
+            let resp = r.send("A", super::exec_timeout(vec!["/usr/local/bin/node".into(), "--version".into()], 10)).await;
+            let pass = matches!(&resp, crate::protocol::Response::ExecResult { exit_code: 0, stdout, .. } if stdout.starts_with('v'));
+            super::TestOutcome::new("A", pass, format!("{resp:?}"))
+        })),
+    });
+
+    tests.push(super::Test {
+        suite: "fork",
+        group: "node_exit",
+        id: "EX7.node_process_exit".into(),
+        xfail: None,
+        run: Box::new(|r| {
+            Box::pin(async move {
+                let resp = r
+                    .send(
+                        "A",
+                        super::exec_timeout(
+                            vec![
+                                "/usr/local/bin/node".into(),
+                                "-e".into(),
+                                "process.exit(0)".into(),
+                            ],
+                            10,
+                        ),
+                    )
+                    .await;
+                let pass = matches!(
+                    &resp,
+                    crate::protocol::Response::ExecResult { exit_code: 0, .. }
+                );
+                super::TestOutcome::new("A", pass, format!("{resp:?}"))
+            })
+        }),
+    });
+
+    tests.push(super::Test {
+        suite: "fork",
+        group: "node_exit",
+        id: "EX8.node_exit_code".into(),
+        xfail: None,
+        run: Box::new(|r| {
+            Box::pin(async move {
+                let resp = r
+                    .send(
+                        "A",
+                        super::exec_timeout(
+                            vec![
+                                "/usr/local/bin/node".into(),
+                                "-e".into(),
+                                "process.exit(42)".into(),
+                            ],
+                            10,
+                        ),
+                    )
+                    .await;
+                let pass = matches!(
+                    &resp,
+                    crate::protocol::Response::ExecResult { exit_code: 42, .. }
+                );
+                super::TestOutcome::new("A", pass, format!("{resp:?}"))
+            })
+        }),
+    });
+
+    tests.push(super::Test {
+        suite: "fork", group: "node_exit",
+        id: "EX9.node_console_exit".into(), xfail: None,
+        run: Box::new(|r| Box::pin(async move {
+            let resp = r.send("A", super::exec_timeout(vec!["/usr/local/bin/node".into(), "-e".into(), "console.log(\"NODE_EXIT_OK\")".into()], 10)).await;
+            let pass = matches!(&resp, crate::protocol::Response::ExecResult { exit_code: 0, stdout, .. } if stdout.contains("NODE_EXIT_OK"));
+            super::TestOutcome::new("A", pass, format!("{resp:?}"))
+        })),
+    });
+}

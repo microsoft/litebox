@@ -338,3 +338,292 @@ pub(crate) async fn concurrent_fs_rwlock_tests(r: &mut TestRunner) {
         }
     }
 }
+/// Register concurrent fork pipeline tests.
+pub(crate) fn register_concurrent_fork_pipeline(tests: &mut Vec<super::Test>) {
+    for &agent in CF_AGENTS {
+        for pat in PIPELINE_PATTERNS {
+            let name = pat.name;
+            let cmd = pat.cmd;
+            let expected = pat.expected;
+            let agent_s = agent.to_string();
+            tests.push(super::Test {
+                suite: "xworker",
+                group: "concurrent_fork_pipeline",
+                id: format!("CF.{name}.{agent}"),
+                xfail: None,
+                run: Box::new(move |r| {
+                    Box::pin(async move {
+                        let resp = r
+                            .send(
+                                &agent_s,
+                                super::exec_timeout(
+                                    vec!["bash".into(), "-c".into(), cmd.into()],
+                                    15,
+                                ),
+                            )
+                            .await;
+                        let pass = match &resp {
+                            crate::protocol::Response::ExecResult {
+                                exit_code: 0,
+                                stdout,
+                                ..
+                            } => stdout.trim().contains(expected),
+                            _ => false,
+                        };
+                        super::TestOutcome::new(&agent_s, pass, format!("{resp:?}"))
+                    })
+                }),
+            });
+        }
+    }
+
+    // xworker agents
+    for &agent in &["NP", "D4"] {
+        let agent_s = agent.to_string();
+        let agent_s2 = agent_s.clone();
+        tests.push(super::Test {
+            suite: "xworker",
+            group: "concurrent_fork_pipeline",
+            id: format!("CF.pipe4_vscode.{agent}"),
+            xfail: None,
+            run: Box::new(move |r| {
+                Box::pin(async move {
+                    let resp = r
+                        .send(
+                            &agent_s,
+                            super::exec_timeout(
+                                vec![
+                                    "bash".into(),
+                                    "-c".into(),
+                                    "echo 'pipe4_vscode_ok: test' | cat | grep pipe4 | sed 's/test/pass/'"
+                                        .into(),
+                                ],
+                                15,
+                            ),
+                        )
+                        .await;
+                    let pass = match &resp {
+                        crate::protocol::Response::ExecResult {
+                            exit_code: 0,
+                            stdout,
+                            ..
+                        } => stdout.trim().contains("pipe4_vscode_ok: pass"),
+                        _ => false,
+                    };
+                    super::TestOutcome::new(&agent_s, pass, format!("{resp:?}"))
+                })
+            }),
+        });
+
+        tests.push(super::Test {
+            suite: "xworker",
+            group: "concurrent_fork_pipeline",
+            id: format!("CF.sequential_control.{agent}"),
+            xfail: None,
+            run: Box::new(move |r| {
+                Box::pin(async move {
+                    let resp = r
+                        .send(
+                            &agent_s2,
+                            super::exec_timeout(
+                                vec![
+                                    "bash".into(),
+                                    "-c".into(),
+                                    "echo seq_a > /tmp/cf_test && cat /tmp/cf_test && rm /tmp/cf_test"
+                                        .into(),
+                                ],
+                                15,
+                            ),
+                        )
+                        .await;
+                    let pass = match &resp {
+                        crate::protocol::Response::ExecResult {
+                            exit_code: 0,
+                            stdout,
+                            ..
+                        } => stdout.trim().contains("seq_a"),
+                        _ => false,
+                    };
+                    super::TestOutcome::new(&agent_s2, pass, format!("{resp:?}"))
+                })
+            }),
+        });
+    }
+}
+
+/// Register concurrent exec tests.
+pub(crate) fn register_concurrent_exec(tests: &mut Vec<super::Test>) {
+    for &count in &[2usize, 3, 4] {
+        for &agent in CF_AGENTS {
+            let agent_s = agent.to_string();
+            tests.push(super::Test {
+                suite: "xworker",
+                group: "concurrent_exec",
+                id: format!("CF.concurrent_exec_{count}.{agent}"),
+                xfail: None,
+                run: Box::new(move |r| {
+                    let self_exe = r.self_exe.clone();
+                    Box::pin(async move {
+                        let cmd = (0..count)
+                            .map(|_| format!("{self_exe} echo-test &"))
+                            .collect::<Vec<_>>()
+                            .join(" ");
+                        let full_cmd = format!("{cmd} wait");
+                        let resp = r
+                            .send(
+                                &agent_s,
+                                super::exec_timeout(vec!["bash".into(), "-c".into(), full_cmd], 15),
+                            )
+                            .await;
+                        let pass = match &resp {
+                            crate::protocol::Response::ExecResult {
+                                exit_code: 0,
+                                stdout,
+                                ..
+                            } => stdout.matches("ECHO_TEST_OK").count() == count,
+                            _ => false,
+                        };
+                        let detail = match &resp {
+                            crate::protocol::Response::ExecResult { stdout, .. } => {
+                                format!(
+                                    "got {}/{count} ECHO_TEST_OK",
+                                    stdout.matches("ECHO_TEST_OK").count()
+                                )
+                            }
+                            _ => format!("{resp:?}"),
+                        };
+                        super::TestOutcome::new(&agent_s, pass, detail)
+                    })
+                }),
+            });
+        }
+    }
+}
+
+/// Register VS Code install pipeline tests.
+pub(crate) fn register_vscode_install_pipeline(tests: &mut Vec<super::Test>) {
+    let vscode_cmds: &[(&str, &str, &str)] = &[
+        ("proc_cat_grep", "cat /proc/loadavg | grep -o '[0-9]'", ""),
+        (
+            "proc_pipeline_3",
+            "cat /proc/cpuinfo | grep -i 'model name' | head -1",
+            "",
+        ),
+        (
+            "proc_pipeline_4",
+            "cat /proc/meminfo | grep MemTotal | sed 's/MemTotal://' | sed 's/ //g'",
+            "kB",
+        ),
+        (
+            "uname_pipeline",
+            "uname -a | grep -o 'Linux' | head -1",
+            "Linux",
+        ),
+    ];
+
+    for &agent in CF_AGENTS {
+        for &(name, cmd, expected) in vscode_cmds {
+            let agent_s = agent.to_string();
+            let cmd_s = cmd.to_string();
+            let expected_s = expected.to_string();
+            tests.push(super::Test {
+                suite: "xworker",
+                group: "vscode_install_pipeline",
+                id: format!("CF.vscode.{name}.{agent}"),
+                xfail: None,
+                run: Box::new(move |r| {
+                    Box::pin(async move {
+                        let resp = r
+                            .send(
+                                &agent_s,
+                                super::exec_timeout(vec!["bash".into(), "-c".into(), cmd_s], 15),
+                            )
+                            .await;
+                        let pass = match &resp {
+                            crate::protocol::Response::ExecResult {
+                                exit_code: 0,
+                                stdout,
+                                ..
+                            } => {
+                                if expected_s.is_empty() {
+                                    !stdout.trim().is_empty()
+                                } else {
+                                    stdout.contains(&*expected_s)
+                                }
+                            }
+                            _ => false,
+                        };
+                        super::TestOutcome::new(&agent_s, pass, format!("{resp:?}"))
+                    })
+                }),
+            });
+        }
+    }
+}
+
+/// Register concurrent FS rwlock tests.
+pub(crate) fn register_concurrent_fs_rwlock(tests: &mut Vec<super::Test>) {
+    for &n in &[2usize, 3, 4] {
+        for &agent in CF_AGENTS {
+            let agent_s = agent.to_string();
+            tests.push(super::Test {
+                suite: "xworker",
+                group: "concurrent_fs_rwlock",
+                id: format!("CF.rwlock_{n}.{agent}"),
+                xfail: None,
+                run: Box::new(move |r| {
+                    let self_exe = r.self_exe.clone();
+                    Box::pin(async move {
+                        let resp = r
+                            .send(
+                                &agent_s,
+                                super::exec_timeout(
+                                    vec![self_exe, "concurrent-fs".into(), n.to_string()],
+                                    20,
+                                ),
+                            )
+                            .await;
+                        let pass = matches!(
+                            &resp,
+                            crate::protocol::Response::ExecResult { exit_code: 0, stdout, .. }
+                                if stdout.contains("CONCURRENT_FS_OK")
+                        );
+                        super::TestOutcome::new(&agent_s, pass, format!("{resp:?}"))
+                    })
+                }),
+            });
+        }
+    }
+
+    for &n in &[3usize, 4, 6] {
+        for &agent in CF_AGENTS {
+            let agent_s = agent.to_string();
+            tests.push(super::Test {
+                suite: "xworker",
+                group: "concurrent_fs_rwlock",
+                id: format!("CF.rwlock_multi_{n}.{agent}"),
+                xfail: None,
+                run: Box::new(move |r| {
+                    let self_exe = r.self_exe.clone();
+                    Box::pin(async move {
+                        let resp = r
+                            .send(
+                                &agent_s,
+                                super::exec_timeout(
+                                    vec![self_exe, "concurrent-fs-multi".into(), n.to_string()],
+                                    20,
+                                ),
+                            )
+                            .await;
+                        let pass = matches!(
+                            &resp,
+                            crate::protocol::Response::ExecResult { exit_code: 0, stdout, .. }
+                                if stdout.contains("CONCURRENT_FS_MULTI_OK")
+                        );
+                        super::TestOutcome::new(&agent_s, pass, format!("{resp:?}"))
+                    })
+                }),
+            });
+        }
+    }
+}

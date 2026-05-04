@@ -17,8 +17,8 @@ pub const TEST_GROUPS: &[(&str, &str)] = &[
     // matrix — capability × topology cross-product
     ("matrix", "run_matrix"),
     // ("matrix", "netlink"), // converted to register_netlink
-    ("matrix", "net_ipv6"),
-    ("matrix", "terminal_ioctl"),
+    // ("matrix", "net_ipv6"), // converted
+    // ("matrix", "terminal_ioctl"), // converted
     ("matrix", "fs_io"),
     ("matrix", "poll_ready"),
     ("matrix", "bind_getsockname"),
@@ -36,7 +36,7 @@ pub const TEST_GROUPS: &[(&str, &str)] = &[
     ("fork", "concurrent_fork"),
     ("fork", "pid_visibility"),
     ("fork", "capture_pipe"),
-    ("fork", "node_exit"),
+    // ("fork", "node_exit"), // converted
     // shell — bash-specific redirect, touch, stdin-pipe
     ("shell", "stdin_pipe_subst"),
     ("shell", "subst_capture"),
@@ -52,10 +52,10 @@ pub const TEST_GROUPS: &[(&str, &str)] = &[
     ("xworker", "cross_worker"),
     ("xworker", "pipe_eof"),
     ("xworker", "pipe_bridge"),
-    ("xworker", "concurrent_fork_pipeline"),
-    ("xworker", "concurrent_exec"),
-    ("xworker", "vscode_install_pipeline"),
-    ("xworker", "concurrent_fs_rwlock"),
+    // ("xworker", "concurrent_fork_pipeline"), // converted
+    // ("xworker", "concurrent_exec"), // converted
+    // ("xworker", "vscode_install_pipeline"), // converted
+    // ("xworker", "concurrent_fs_rwlock"), // converted
     // stress — TCP stress, port router, file+TCP combined
     ("stress", "tcp_stress"),
     ("stress", "file_tcp"),
