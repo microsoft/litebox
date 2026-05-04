@@ -39,22 +39,18 @@ container name, ssh port, and its own target directory so parallel
 sessions do not invalidate each other's incremental builds or collide on
 host resources.
 
-### Build target directory convention
+### Build
 
-This project must be built on ext4 (not NTFS) for performance. Each git
-worktree **must** have its own target directory under `~/litebox-out/`:
+With the repo on ext4, use cargo s default target/ directory.
+No --target-dir needed.
 
 ```bash
-WORKTREE=$(basename $(git rev-parse --show-toplevel))
-cargo build --target-dir ~/litebox-out/$WORKTREE
+cargo build
+cargo test -p litebox_test_harness --test integration
 
-# Non-PIE variant for test harness
-cargo rustc -p litebox_test_harness --target-dir ~/litebox-out/$WORKTREE/nonpie -- -C link-args=-no-pie
+# Non-PIE variant
+cargo rustc -p litebox_test_harness --bin litebox_test_harness --target-dir target/nonpie -- -C link-args=-no-pie
 ```
-
-**Never use `--target-dir ~/litebox-out` directly** — multiple worktrees
-sharing the same target dir causes stale binary contamination (one
-session's build overwrites another's binaries).
 
 ### Running tests
 
@@ -62,18 +58,17 @@ Always use the `litebox-test` Docker image. See `litebox_test_harness/CLAUDE.md`
 for test authoring rules.
 
 ```bash
-WORKTREE=$(basename $(git rev-parse --show-toplevel))
 
 # Native (gold standard — real kernel):
 docker run --rm --cap-add SYS_PTRACE \
-  -v ~/litebox-out/$WORKTREE/debug:/opt/litebox:ro \
-  -v ~/litebox-out/$WORKTREE/nonpie/debug:/opt/nonpie:ro \
+  -v $(pwd)/target/debug:/opt/litebox:ro \
+  -v $(pwd)/target/nonpie/debug:/opt/nonpie:ro \
   litebox-test /opt/litebox/litebox_test_harness spawn-tree
 
 # Litebox sandbox (tests the shim):
 docker run --rm --cap-add SYS_PTRACE -e LITEBOX_NO_AUDIT=1 \
-  -v ~/litebox-out/$WORKTREE/debug:/opt/litebox:ro \
-  -v ~/litebox-out/$WORKTREE/nonpie/debug:/opt/nonpie:ro \
+  -v $(pwd)/target/debug:/opt/litebox:ro \
+  -v $(pwd)/target/nonpie/debug:/opt/nonpie:ro \
   litebox-test /opt/litebox/litebox_tool_executor \
     --rootfs / --record-baseline \
     -- /opt/litebox/litebox_test_harness spawn-tree
