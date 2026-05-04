@@ -56,6 +56,7 @@ RUN printf 'root:$5$feWUHaTYjlgIa1uw$9xrsiQaRuBfJSEx37HOmaCfa2l4MY6VGZ8/L3OJVSO9
 # because /proc is not mounted. It's created at runtime by litebox or
 # by the unshare --mount native baseline.
 RUN mkdir -p /tmp /shared /workspaces /root /home /proc /dev \
+    && echo -n from_host > /shared/host_wrote.txt \
     && [ -e /bin ] || ln -sf /usr/bin /bin \
     && echo "nameserver 10.0.0.1" > /etc/resolv.conf.litebox
 
