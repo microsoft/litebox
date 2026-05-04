@@ -23,7 +23,7 @@ use std::future::Future;
 use std::pin::Pin;
 
 /// Outcome of a single test execution.
-pub(crate) struct TestOutcome {
+pub struct TestOutcome {
     pub pass: bool,
     pub agent: String,
     pub detail: String,
@@ -40,7 +40,7 @@ impl TestOutcome {
 }
 
 /// A registered test: metadata + deferred execution closure.
-pub(crate) struct Test {
+pub struct Test {
     pub suite: &'static str,
     pub group: &'static str,
     pub id: String,
@@ -140,7 +140,7 @@ struct Child {
 
 /// Expected outcome of a test.
 #[derive(Debug, Clone)]
-pub(crate) enum Expectation {
+pub enum Expectation {
     /// Test is expected to pass.
     Pass,
     /// Test is expected to fail (known limitation). Contains reason.
@@ -170,7 +170,7 @@ impl TestResult {
     }
 }
 
-pub(crate) struct TestRunner {
+pub struct TestRunner {
     children: std::collections::HashMap<String, Child>,
     results: Vec<TestResult>,
     pub(crate) self_exe: String,
@@ -640,7 +640,7 @@ async fn run_tests(self_exe: &str, filter: Option<&str>) -> Vec<TestResult> {
     };
 
     // --- New-style declarative tests (proof of concept) ---
-    let mut new_tests = collect_all_tests();
+    let new_tests = collect_all_tests();
 
     // Filter to only tests matching the --filter argument.
     // Protocol header: output all registered test IDs before execution.

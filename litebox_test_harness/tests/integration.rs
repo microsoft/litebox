@@ -35,24 +35,17 @@ use libtest_mimic::{Arguments, Failed, Trial};
 // that have matching Trials. Results are cached so all Trials in the
 // same pass share one docker run.
 
-/// Cached test IDs from list-ids (computed once, shared).
+/// Cached test IDs from collect_all_tests (direct library call, no subprocess).
 static TEST_IDS: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
 
 fn get_test_ids() -> &'static Vec<String> {
     TEST_IDS.get_or_init(|| {
-        let (_, debug, _) = setup();
-        let harness = debug.join("litebox_test_harness");
-        let output = Command::new(&harness)
-            .arg("list-ids")
-            .output()
-            .expect("failed to run list-ids");
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let ids: Vec<String> = stdout
-            .lines()
-            .map(|l| l.trim().to_string())
-            .filter(|l| !l.is_empty())
-            .collect();
-        eprintln!("[integration] {} test IDs from list-ids", ids.len());
+        let tests = litebox_test_harness::coordinator::collect_all_tests();
+        let ids: Vec<String> = tests.into_iter().map(|t| t.id).collect();
+        eprintln!(
+            "[integration] {} test IDs from collect_all_tests",
+            ids.len()
+        );
         ids
     })
 }
