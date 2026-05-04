@@ -16,7 +16,7 @@
 pub const TEST_GROUPS: &[(&str, &str)] = &[
     // matrix — capability × topology cross-product
     ("matrix", "run_matrix"),
-    ("matrix", "netlink"),
+    // ("matrix", "netlink"), // converted to register_netlink
     ("matrix", "net_ipv6"),
     ("matrix", "terminal_ioctl"),
     ("matrix", "fs_io"),

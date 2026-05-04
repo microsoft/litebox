@@ -523,7 +523,8 @@ async fn run_group(runner: &mut TestRunner, suite: &str, group: &str) {
     match (suite, group) {
         // matrix
         ("matrix", "run_matrix") => matrix::run_matrix_tests(runner).await,
-        ("matrix", "netlink") => special_cases::netlink_tests(runner).await,
+        // Converted to register_netlink (new-style)
+        // ("matrix", "netlink") => special_cases::netlink_tests(runner).await,
         ("matrix", "net_ipv6") => special_cases::net_ipv6_tests(runner).await,
         ("matrix", "terminal_ioctl") => special_cases::terminal_ioctl_tests(runner).await,
         ("matrix", "fs_io") => special_cases::fs_io_tests(runner).await,
@@ -617,6 +618,22 @@ pub fn run_filtered(self_exe: &str, filter: Option<&str>) -> Vec<TestResult> {
         .block_on(run_tests(self_exe, filter))
 }
 
+/// Check whether a Test matches the --filter argument.
+/// Matches by suite, suite.group, or test ID prefix.
+fn matches_test(filter: Option<&str>, test: &Test) -> bool {
+    match filter {
+        None => true,
+        Some(f) => {
+            // Try suite.group match first
+            if matches_filter(Some(f), test.suite, test.group) {
+                return true;
+            }
+            // Then try test ID prefix match
+            test.id.starts_with(f) || test.id.contains(f)
+        }
+    }
+}
+
 async fn run_tests(self_exe: &str, filter: Option<&str>) -> Vec<TestResult> {
     let runtime_env = detect_runtime_environment();
     eprintln!("[coord] runtime: {runtime_env}");
@@ -657,6 +674,45 @@ async fn run_tests(self_exe: &str, filter: Option<&str>) -> Vec<TestResult> {
 
     // Clean shutdown.
     runner.teardown_tree().await;
+
+    // --- New-style declarative tests (proof of concept) ---
+    // Collect registered tests.
+    let mut new_tests: Vec<Test> = Vec::new();
+    special_cases::register_netlink(&mut new_tests);
+
+    // Filter to only tests matching the --filter argument.
+    let new_filtered: Vec<Test> = new_tests
+        .into_iter()
+        .filter(|t| matches_test(filter, t))
+        .collect();
+
+    if !new_filtered.is_empty() {
+        eprintln!("[coord] running {} registered tests", new_filtered.len());
+        // Need a fresh tree for these.
+        runner.spawn_tree().await;
+        for test in new_filtered {
+            let timeout_dur = Duration::from_secs(30);
+            match tokio::time::timeout(timeout_dur, (test.run)(&mut runner)).await {
+                Ok(outcome) => {
+                    if let Some(reason) = &test.xfail {
+                        runner.record_xfail(
+                            &test.id,
+                            &outcome.agent,
+                            outcome.pass,
+                            reason,
+                            &outcome.detail,
+                        );
+                    } else {
+                        runner.record(&test.id, &outcome.agent, outcome.pass, &outcome.detail);
+                    }
+                }
+                Err(_) => {
+                    runner.record(&test.id, "?", false, "test timeout (30s)");
+                }
+            }
+        }
+        runner.teardown_tree().await;
+    }
 
     runner.results
 }

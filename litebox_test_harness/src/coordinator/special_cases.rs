@@ -1436,3 +1436,177 @@ pub(super) async fn cross_worker_tests(r: &mut TestRunner) {
         let _ = r.send("D3", Command::NetUnlisten { port }).await;
     }
 }
+/// Register netlink tests. Each test is self-contained: one exec + check.
+pub(super) fn register_netlink(tests: &mut Vec<super::Test>) {
+    // Helper: create a test that execs a subcommand and checks stdout.
+    let nl =
+        |id: &str, args: Vec<String>, timeout_secs: u64, check: fn(&str) -> bool| -> super::Test {
+            let id = id.to_string();
+            let id2 = id.clone();
+            super::Test {
+                suite: "matrix",
+                group: "netlink",
+                id,
+                xfail: None,
+                run: Box::new(move |r| {
+                    Box::pin(async move {
+                        let cmd = if timeout_secs > 0 {
+                            super::exec_timeout(args, timeout_secs)
+                        } else {
+                            super::exec(args)
+                        };
+                        let resp = r.send("A", cmd).await;
+                        let pass = matches!(
+                            &resp,
+                            crate::protocol::Response::ExecResult { exit_code: 0, stdout, .. }
+                                if check(stdout)
+                        );
+                        super::TestOutcome::new("A", pass, format!("{resp:?}"))
+                    })
+                }),
+            }
+        };
+
+    let exe = || {
+        std::env::current_exe()
+            .unwrap()
+            .to_string_lossy()
+            .to_string()
+    };
+    // We can't call r.self_exe here (no runner yet), so tests will
+    // use the self_exe from the runner. Let's capture it differently.
+    // Actually, the closure captures the runner, so we can read self_exe there.
+    // But our helper doesn't have the runner. Let's restructure:
+
+    // Each test captures its args as a closure over the runner.
+    let self_exe_test =
+        |id: &str, subcmd: &str, arg: &str, timeout: u64, check: fn(&str) -> bool| {
+            let id = id.to_string();
+            let subcmd = subcmd.to_string();
+            let arg = arg.to_string();
+            super::Test {
+                suite: "matrix",
+                group: "netlink",
+                id: id.clone(),
+                xfail: None,
+                run: Box::new(move |r| {
+                    let self_exe = r.self_exe.clone();
+                    Box::pin(async move {
+                        let args = vec![self_exe, subcmd, arg];
+                        let cmd = if timeout > 0 {
+                            super::exec_timeout(args, timeout)
+                        } else {
+                            super::exec(args)
+                        };
+                        let resp = r.send("A", cmd).await;
+                        let pass = matches!(
+                            &resp,
+                            crate::protocol::Response::ExecResult { exit_code: 0, stdout, .. }
+                                if check(stdout)
+                        );
+                        super::TestOutcome::new("A", pass, format!("{resp:?}"))
+                    })
+                }),
+            }
+        };
+
+    tests.push(self_exe_test(
+        "NL1.netlink_socket",
+        "getifaddrs-test",
+        "socket",
+        0,
+        |s| s.contains("NETLINK_SOCKET_OK"),
+    ));
+    tests.push(self_exe_test(
+        "NL2.netlink_bind",
+        "getifaddrs-test",
+        "bind",
+        0,
+        |s| s.contains("NETLINK_BIND_OK"),
+    ));
+    tests.push(self_exe_test(
+        "NL3.netlink_getlink",
+        "getifaddrs-test",
+        "getlink",
+        0,
+        |s| s.contains("NETLINK_GETLINK_OK"),
+    ));
+    tests.push(self_exe_test(
+        "NL4.netlink_getaddr",
+        "getifaddrs-test",
+        "getaddr",
+        0,
+        |s| s.contains("NETLINK_GETADDR_OK"),
+    ));
+    tests.push(self_exe_test(
+        "NL3b.sendmsg_recvmsg",
+        "getifaddrs-test",
+        "sendmsg",
+        0,
+        |s| s.contains("NETLINK_SENDMSG_RECVMSG_OK"),
+    ));
+    tests.push(self_exe_test(
+        "NL3c.double_request",
+        "getifaddrs-test",
+        "double",
+        30,
+        |s| s.contains("NETLINK_DOUBLE_OK"),
+    ));
+    tests.push(self_exe_test(
+        "NL3d.peek_trunc",
+        "getifaddrs-test",
+        "peek-trunc",
+        30,
+        |s| s.contains("NETLINK_PEEK_TRUNC_OK"),
+    ));
+    tests.push(self_exe_test(
+        "NL5.getifaddrs_full",
+        "getifaddrs-test",
+        "full",
+        30,
+        |s| s.contains("GETIFADDRS_OK"),
+    ));
+
+    // X48: Node.js os.networkInterfaces()
+    {
+        let id = "X48.node_networkInterfaces".to_string();
+        tests.push(super::Test {
+            suite: "matrix",
+            group: "netlink",
+            id: id.clone(),
+            xfail: None,
+            run: Box::new(move |r| {
+                Box::pin(async move {
+                    let resp = r
+                        .send(
+                            "A",
+                            super::exec_timeout(
+                                vec![
+                                    "/usr/local/bin/node".into(),
+                                    "-e".into(),
+                                    "try { const r = require('os').networkInterfaces(); console.log('NETIF_OK:' + Object.keys(r).length); } catch(e) { console.log('NETIF_ERR:' + e.code); }".into(),
+                                ],
+                                30,
+                            ),
+                        )
+                        .await;
+                    let pass = matches!(
+                        &resp,
+                        crate::protocol::Response::ExecResult { exit_code: 0, stdout, .. }
+                            if stdout.contains("NETIF_OK:") || stdout.contains("NETIF_ERR:")
+                    );
+                    super::TestOutcome::new("A", pass, format!("{resp:?}"))
+                })
+            }),
+        });
+    }
+
+    // NL6: MAC address via getifaddrs
+    tests.push(self_exe_test(
+        "NL6.mac_address",
+        "unix-socket-test",
+        "mac",
+        30,
+        |s| s.contains("NL6_MAC_CHECK"),
+    ));
+}
