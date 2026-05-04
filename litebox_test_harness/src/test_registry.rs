@@ -57,9 +57,9 @@ pub const TEST_GROUPS: &[(&str, &str)] = &[
     // ("xworker", "vscode_install_pipeline"), // converted
     // ("xworker", "concurrent_fs_rwlock"), // converted
     // stress — TCP stress, port router, file+TCP combined
-    ("stress", "tcp_stress"),
-    ("stress", "file_tcp"),
-    ("stress", "port_router"),
+    // ("stress", "tcp_stress"), // converted
+    // ("stress", "file_tcp"), // converted
+    // ("stress", "port_router"), // converted
     // contamination — state accumulation (MUST run last)
     // ("contamination", "canary"), // converted
     // ("contamination", "contamination_sequence"), // converted

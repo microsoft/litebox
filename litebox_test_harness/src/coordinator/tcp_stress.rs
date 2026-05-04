@@ -554,3 +554,390 @@ pub(crate) async fn run(r: &mut TestRunner) {
     tcp_fullduplex_tests(r).await;
     tcp_cross_worker_concurrent_tests(r).await;
 }
+
+pub(crate) fn register_tcp_stress(tests: &mut Vec<super::Test>) {
+    register_tcp_concurrency_tests(tests);
+    register_tcp_data_size_tests(tests);
+    register_tcp_reconnect_stress_tests(tests);
+    register_tcp_fullduplex_tests(tests);
+    register_tcp_cross_worker_concurrent_tests(tests);
+}
+
+fn register_tcp_concurrency_tests(tests: &mut Vec<super::Test>) {
+    let mut port = 20_001u16;
+    for tc in TC_CASES {
+        let test_id = format!("TC.{}.x{}.d{}", tc.name, tc.count, tc.delay_ms);
+        let listener = tc.listener.to_string();
+        let connector = tc.connector.to_string();
+        let count = tc.count;
+        let delay_ms = tc.delay_ms;
+        let name = tc.name.to_string();
+        let p = port;
+        port += 1;
+
+        tests.push(super::Test {
+            suite: "stress",
+            group: "tcp_stress",
+            id: test_id,
+            xfail: None,
+            run: Box::new(move |r| {
+                Box::pin(async move {
+                    let resp = r
+                        .send(&listener, crate::protocol::Command::NetListen { port: p })
+                        .await;
+                    if !matches!(resp, crate::protocol::Response::Listening { .. }) {
+                        return super::TestOutcome::new(
+                            &connector,
+                            false,
+                            format!("listen failed: {resp:?}"),
+                        );
+                    }
+                    let resp = r
+                        .send(
+                            &connector,
+                            crate::protocol::Command::NetConnectMany {
+                                addr: format!("127.0.0.1:{p}"),
+                                data: format!("TC_{name}"),
+                                count,
+                                delay_ms,
+                            },
+                        )
+                        .await;
+                    let pass = match &resp {
+                        crate::protocol::Response::Ok { data: Some(d) } => {
+                            d == &format!("success={count}/{count}")
+                        }
+                        _ => false,
+                    };
+                    let _ = r
+                        .send(&listener, crate::protocol::Command::NetUnlisten { port: p })
+                        .await;
+                    super::TestOutcome::new(&connector, pass, format!("{resp:?}"))
+                })
+            }),
+        });
+    }
+}
+
+fn register_tcp_data_size_tests(tests: &mut Vec<super::Test>) {
+    let mut port = 20_100u16;
+    for tc in TD_CASES {
+        let size_label = if tc.size >= 262144 {
+            "256K"
+        } else if tc.size >= 65536 {
+            "64K"
+        } else {
+            "1K"
+        };
+        let test_id = format!("TD.{}.{}", size_label, tc.name);
+        let listener = tc.listener.to_string();
+        let connector = tc.connector.to_string();
+        let size = tc.size;
+        let p = port;
+        port += 1;
+
+        tests.push(super::Test {
+            suite: "stress",
+            group: "tcp_stress",
+            id: test_id,
+            xfail: None,
+            run: Box::new(move |r| {
+                Box::pin(async move {
+                    let resp = r
+                        .send(&listener, crate::protocol::Command::NetListen { port: p })
+                        .await;
+                    if !matches!(resp, crate::protocol::Response::Listening { .. }) {
+                        return super::TestOutcome::new(
+                            &connector,
+                            false,
+                            format!("listen failed: {resp:?}"),
+                        );
+                    }
+                    let resp = r
+                        .send(
+                            &connector,
+                            crate::protocol::Command::NetSendRecv {
+                                addr: format!("127.0.0.1:{p}"),
+                                size,
+                            },
+                        )
+                        .await;
+                    let pass = matches!(&resp, crate::protocol::Response::Ok { data: Some(d) }
+                        if d.starts_with("verified="));
+                    let _ = r
+                        .send(&listener, crate::protocol::Command::NetUnlisten { port: p })
+                        .await;
+                    super::TestOutcome::new(&connector, pass, format!("{resp:?}"))
+                })
+            }),
+        });
+    }
+}
+
+fn register_tcp_reconnect_stress_tests(tests: &mut Vec<super::Test>) {
+    let mut port = 20_200u16;
+    for tc in TRR_CASES {
+        let test_id = format!("TRR.x{}.{}", tc.count, tc.name);
+        let listener = tc.listener.to_string();
+        let connector = tc.connector.to_string();
+        let count = tc.count;
+        let name = tc.name.to_string();
+        let p = port;
+        port += 1;
+
+        tests.push(super::Test {
+            suite: "stress",
+            group: "tcp_stress",
+            id: test_id,
+            xfail: None,
+            run: Box::new(move |r| {
+                Box::pin(async move {
+                    let resp = r
+                        .send(&listener, crate::protocol::Command::NetListen { port: p })
+                        .await;
+                    if !matches!(resp, crate::protocol::Response::Listening { .. }) {
+                        return super::TestOutcome::new(
+                            &connector,
+                            false,
+                            format!("listen failed: {resp:?}"),
+                        );
+                    }
+                    let resp = r
+                        .send(
+                            &connector,
+                            crate::protocol::Command::NetReconnectStress {
+                                addr: format!("127.0.0.1:{p}"),
+                                count,
+                                data: format!("TRR_{name}"),
+                            },
+                        )
+                        .await;
+                    let pass = matches!(&resp, crate::protocol::Response::Ok { data: Some(d) }
+                        if d == &format!("success={count}/{count}"));
+                    let _ = r
+                        .send(&listener, crate::protocol::Command::NetUnlisten { port: p })
+                        .await;
+                    super::TestOutcome::new(&connector, pass, format!("{resp:?}"))
+                })
+            }),
+        });
+    }
+}
+
+fn register_tcp_fullduplex_tests(tests: &mut Vec<super::Test>) {
+    let mut port = 20_300u16;
+    for &agent in TF_AGENTS {
+        let test_id = format!("TF.{agent}");
+        let agent_s = agent.to_string();
+        let p = port;
+        port += 1;
+
+        tests.push(super::Test {
+            suite: "stress",
+            group: "tcp_stress",
+            id: test_id,
+            xfail: None,
+            run: Box::new(move |r| {
+                let self_exe = r.self_exe.clone();
+                Box::pin(async move {
+                    let server_resp = r
+                        .send(
+                            &agent_s,
+                            crate::protocol::Command::Exec {
+                                args: vec![
+                                    self_exe.clone(),
+                                    "tcp-fullduplex".into(),
+                                    p.to_string(),
+                                    TF_SIZE.to_string(),
+                                ],
+                                timeout_secs: Some(30),
+                                stdin: None,
+                                background: true,
+                            },
+                        )
+                        .await;
+                    let server_pid = match &server_resp {
+                        crate::protocol::Response::Background { pid } => Some(*pid),
+                        _ => {
+                            return super::TestOutcome::new(
+                                &agent_s,
+                                false,
+                                format!("server spawn failed: {server_resp:?}"),
+                            );
+                        }
+                    };
+                    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+                    let client_resp = r
+                        .send(
+                            &agent_s,
+                            super::exec_timeout(
+                                vec![
+                                    self_exe,
+                                    "tcp-fullduplex-client".into(),
+                                    format!("127.0.0.1:{p}"),
+                                    TF_SIZE.to_string(),
+                                ],
+                                15,
+                            ),
+                        )
+                        .await;
+                    if let Some(pid) = server_pid {
+                        let _ = r
+                            .send(&agent_s, crate::protocol::Command::Kill { pid })
+                            .await;
+                    }
+                    let pass = match &client_resp {
+                        crate::protocol::Response::ExecResult { stdout, .. } => {
+                            stdout.contains(&format!("CLIENT:sent={TF_SIZE}"))
+                                && stdout.contains("recv=")
+                        }
+                        _ => false,
+                    };
+                    super::TestOutcome::new(&agent_s, pass, format!("{client_resp:?}"))
+                })
+            }),
+        });
+    }
+}
+
+fn register_tcp_cross_worker_concurrent_tests(tests: &mut Vec<super::Test>) {
+    let mut port = 20_400u16;
+    for &count in TW_COUNTS {
+        {
+            let test_id = format!("TW.remote_listen.x{count}");
+            let p = port;
+            port += 1;
+
+            tests.push(super::Test {
+                suite: "stress",
+                group: "tcp_stress",
+                id: test_id,
+                xfail: None,
+                run: Box::new(move |r| {
+                    Box::pin(async move {
+                        let resp = r
+                            .send(
+                                "A",
+                                crate::protocol::Command::SpawnRemote {
+                                    children: vec!["ARemote".to_string()],
+                                },
+                            )
+                            .await;
+                        if !matches!(&resp, crate::protocol::Response::Ok { .. }) {
+                            return super::TestOutcome::new(
+                                "A",
+                                false,
+                                "FAIL: SpawnRemote unavailable",
+                            );
+                        }
+                        let resp = r
+                            .send(
+                                "A",
+                                crate::protocol::Command::Forward {
+                                    target: "ARemote".to_string(),
+                                    inner: Box::new(crate::protocol::Command::NetListen {
+                                        port: p,
+                                    }),
+                                },
+                            )
+                            .await;
+                        if !matches!(resp, crate::protocol::Response::Listening { .. }) {
+                            return super::TestOutcome::new(
+                                "A",
+                                false,
+                                format!("listen failed: {resp:?}"),
+                            );
+                        }
+                        let resp = r
+                            .send(
+                                "A",
+                                crate::protocol::Command::NetConnectMany {
+                                    addr: format!("127.0.0.1:{p}"),
+                                    data: "TW_REMOTE".to_string(),
+                                    count,
+                                    delay_ms: 0,
+                                },
+                            )
+                            .await;
+                        let pass = matches!(&resp, crate::protocol::Response::Ok { data: Some(d) }
+                            if d == &format!("success={count}/{count}"));
+                        let _ = r
+                            .send(
+                                "A",
+                                crate::protocol::Command::Forward {
+                                    target: "ARemote".to_string(),
+                                    inner: Box::new(crate::protocol::Command::NetUnlisten {
+                                        port: p,
+                                    }),
+                                },
+                            )
+                            .await;
+                        super::TestOutcome::new("A", pass, format!("{resp:?}"))
+                    })
+                }),
+            });
+        }
+
+        {
+            let test_id = format!("TW.local_listen.x{count}");
+            let p = port;
+            port += 1;
+
+            tests.push(super::Test {
+                suite: "stress",
+                group: "tcp_stress",
+                id: test_id,
+                xfail: None,
+                run: Box::new(move |r| {
+                    Box::pin(async move {
+                        let resp = r
+                            .send(
+                                "A",
+                                crate::protocol::Command::SpawnRemote {
+                                    children: vec!["ARemote".to_string()],
+                                },
+                            )
+                            .await;
+                        if !matches!(&resp, crate::protocol::Response::Ok { .. }) {
+                            return super::TestOutcome::new(
+                                "A",
+                                false,
+                                "FAIL: SpawnRemote unavailable",
+                            );
+                        }
+                        let resp = r
+                            .send("A", crate::protocol::Command::NetListen { port: p })
+                            .await;
+                        if !matches!(resp, crate::protocol::Response::Listening { .. }) {
+                            return super::TestOutcome::new(
+                                "A",
+                                false,
+                                format!("listen failed: {resp:?}"),
+                            );
+                        }
+                        let resp = r
+                            .send(
+                                "A",
+                                crate::protocol::Command::Forward {
+                                    target: "ARemote".to_string(),
+                                    inner: Box::new(crate::protocol::Command::NetConnectMany {
+                                        addr: format!("127.0.0.1:{p}"),
+                                        data: "TW_LOCAL".to_string(),
+                                        count,
+                                        delay_ms: 0,
+                                    }),
+                                },
+                            )
+                            .await;
+                        let pass = matches!(&resp, crate::protocol::Response::Ok { data: Some(d) }
+                            if d == &format!("success={count}/{count}"));
+                        let _ = r
+                            .send("A", crate::protocol::Command::NetUnlisten { port: p })
+                            .await;
+                        super::TestOutcome::new("A", pass, format!("{resp:?}"))
+                    })
+                }),
+            });
+        }
+    }
+}

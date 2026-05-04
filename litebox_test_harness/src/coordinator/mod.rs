@@ -534,9 +534,6 @@ async fn run_group(runner: &mut TestRunner, suite: &str, group: &str) {
         // ("xworker", "pipe_eof") => special_cases::pipe_eof_tests(runner).await, // converted
         // ("xworker", "pipe_bridge") => pipe_bridge::pipe_bridge_tests(runner).await, // converted
         // stress
-        ("stress", "tcp_stress") => tcp_stress::run(runner).await,
-        ("stress", "file_tcp") => file_tcp::run(runner).await,
-        ("stress", "port_router") => port_router::run(runner).await,
         // contamination
         // ("contamination", "contamination_sequence") => special_cases::contamination_sequence_tests(runner).await, // converted
         _ => {
@@ -686,6 +683,9 @@ async fn run_tests(self_exe: &str, filter: Option<&str>) -> Vec<TestResult> {
     special_cases::register_cross_worker(&mut new_tests);
     special_cases::register_pipe_eof(&mut new_tests);
     pipe_bridge::register_pipe_bridge(&mut new_tests);
+    tcp_stress::register_tcp_stress(&mut new_tests);
+    file_tcp::register_file_tcp(&mut new_tests);
+    port_router::register_port_router(&mut new_tests);
     special_cases::register_contamination_sequence(&mut new_tests);
 
     // Filter to only tests matching the --filter argument.
