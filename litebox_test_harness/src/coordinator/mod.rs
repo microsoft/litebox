@@ -208,7 +208,8 @@ impl TestRunner {
     ) {
         let key = format!("{test} {agent}");
         if !self.recorded_ids.insert(key) {
-            eprintln!("  WARNING: duplicate test ID: {test} [{agent}]");
+            eprintln!("  WARNING: duplicate test ID: {test} [{agent}] — skipping");
+            return;
         }
         let result = TestResult {
             id: test.to_string(),
