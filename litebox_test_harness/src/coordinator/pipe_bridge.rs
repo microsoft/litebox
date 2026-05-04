@@ -525,3 +525,211 @@ pub(crate) async fn pipe_bridge_tests(r: &mut TestRunner) {
         }
     }
 }
+
+pub(crate) fn register_pipe_bridge(tests: &mut Vec<super::Test>) {
+    struct PbCase {
+        mode: &'static str,
+        subcmd: &'static str,
+        use_nonpie: bool,
+        extra_args: &'static [&'static str],
+        expected: &'static str,
+        agents: &'static [&'static str],
+        timeout: u64,
+    }
+
+    const XWORKER_AGENTS: &[&str] = &["NP", "D4"];
+
+    let cases: &[PbCase] = &[
+        PbCase {
+            mode: "c2p.pie",
+            subcmd: "extra-pipe-c2p",
+            use_nonpie: false,
+            extra_args: &[],
+            expected: "PB_C2P_OK",
+            agents: PB_AGENTS,
+            timeout: 20,
+        },
+        PbCase {
+            mode: "c2p.nonpie",
+            subcmd: "extra-pipe-c2p",
+            use_nonpie: true,
+            extra_args: &[],
+            expected: "PB_C2P_OK",
+            agents: PB_AGENTS,
+            timeout: 20,
+        },
+        PbCase {
+            mode: "p2c.pie",
+            subcmd: "extra-pipe-p2c",
+            use_nonpie: false,
+            extra_args: &[],
+            expected: "PB_P2C_OK",
+            agents: PB_AGENTS,
+            timeout: 20,
+        },
+        PbCase {
+            mode: "p2c.nonpie",
+            subcmd: "extra-pipe-p2c",
+            use_nonpie: true,
+            extra_args: &[],
+            expected: "PB_P2C_OK",
+            agents: PB_AGENTS,
+            timeout: 20,
+        },
+        PbCase {
+            mode: "multi.pie",
+            subcmd: "extra-pipe-multi",
+            use_nonpie: false,
+            extra_args: &["3"],
+            expected: "PB_MULTI_OK",
+            agents: PB_AGENTS,
+            timeout: 20,
+        },
+        PbCase {
+            mode: "multi.nonpie",
+            subcmd: "extra-pipe-multi",
+            use_nonpie: true,
+            extra_args: &["3"],
+            expected: "PB_MULTI_OK",
+            agents: PB_AGENTS,
+            timeout: 20,
+        },
+        PbCase {
+            mode: "sp.pie",
+            subcmd: "extra-socketpair",
+            use_nonpie: false,
+            extra_args: &[],
+            expected: "PB_SP_OK",
+            agents: PB_AGENTS,
+            timeout: 20,
+        },
+        PbCase {
+            mode: "sp.nonpie",
+            subcmd: "extra-socketpair",
+            use_nonpie: true,
+            extra_args: &[],
+            expected: "PB_SP_OK",
+            agents: PB_AGENTS,
+            timeout: 20,
+        },
+        PbCase {
+            mode: "c2p.xworker_pie",
+            subcmd: "extra-pipe-c2p",
+            use_nonpie: false,
+            extra_args: &[],
+            expected: "PB_C2P_OK",
+            agents: XWORKER_AGENTS,
+            timeout: 20,
+        },
+        PbCase {
+            mode: "c2p.xworker_nonpie",
+            subcmd: "extra-pipe-c2p",
+            use_nonpie: true,
+            extra_args: &[],
+            expected: "PB_C2P_OK",
+            agents: XWORKER_AGENTS,
+            timeout: 20,
+        },
+        PbCase {
+            mode: "many.pie",
+            subcmd: "extra-pipe-multi",
+            use_nonpie: false,
+            extra_args: &["10"],
+            expected: "PB_MULTI_OK",
+            agents: PB_AGENTS,
+            timeout: 20,
+        },
+        PbCase {
+            mode: "many.nonpie",
+            subcmd: "extra-pipe-multi",
+            use_nonpie: true,
+            extra_args: &["10"],
+            expected: "PB_MULTI_OK",
+            agents: PB_AGENTS,
+            timeout: 20,
+        },
+        PbCase {
+            mode: "epoll.pie",
+            subcmd: "epoll-pipe-bridge",
+            use_nonpie: false,
+            extra_args: &["200"],
+            expected: "EPOLL_BRIDGE_OK",
+            agents: PB_AGENTS,
+            timeout: 15,
+        },
+        PbCase {
+            mode: "epoll.nonpie",
+            subcmd: "epoll-pipe-bridge",
+            use_nonpie: true,
+            extra_args: &["200"],
+            expected: "EPOLL_BRIDGE_OK",
+            agents: PB_AGENTS,
+            timeout: 15,
+        },
+        PbCase {
+            mode: "epoll_sp.pie",
+            subcmd: "epoll-socketpair-bridge",
+            use_nonpie: false,
+            extra_args: &["500"],
+            expected: "EPOLL_SP_OK",
+            agents: PB_AGENTS,
+            timeout: 15,
+        },
+        PbCase {
+            mode: "epoll_sp.nonpie",
+            subcmd: "epoll-socketpair-bridge",
+            use_nonpie: true,
+            extra_args: &["500"],
+            expected: "EPOLL_SP_OK",
+            agents: PB_AGENTS,
+            timeout: 15,
+        },
+    ];
+
+    for case in cases {
+        for &agent in case.agents {
+            let id = format!("PB.{}.{agent}", case.mode);
+            let agent_s = agent.to_string();
+            let subcmd = case.subcmd.to_string();
+            let use_nonpie = case.use_nonpie;
+            let extra: Vec<String> = case.extra_args.iter().map(|s| s.to_string()).collect();
+            let expected = case.expected.to_string();
+            let timeout = case.timeout;
+
+            tests.push(super::Test {
+                suite: "xworker",
+                group: "pipe_bridge",
+                id,
+                xfail: None,
+                run: Box::new(move |r| {
+                    let self_exe = r.self_exe.clone();
+                    Box::pin(async move {
+                        let child_bin = if use_nonpie {
+                            match crate::find_nonpie_binary() {
+                                Some(p) => p,
+                                None => {
+                                    return super::TestOutcome::new(
+                                        &agent_s,
+                                        false,
+                                        "FAIL: nonpie binary not found",
+                                    );
+                                }
+                            }
+                        } else {
+                            self_exe.clone()
+                        };
+                        let mut args = vec![self_exe, "pipe-test".into(), subcmd, child_bin];
+                        args.extend(extra);
+                        let resp = r.send(&agent_s, super::exec_timeout(args, timeout)).await;
+                        let pass = matches!(
+                            &resp,
+                            crate::protocol::Response::ExecResult { exit_code: 0, stdout, .. }
+                                if stdout.contains(&*expected)
+                        );
+                        super::TestOutcome::new(&agent_s, pass, format!("{resp:?}"))
+                    })
+                }),
+            });
+        }
+    }
+}

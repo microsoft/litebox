@@ -525,35 +525,19 @@ async fn run_group(runner: &mut TestRunner, suite: &str, group: &str) {
         // Converted to register_netlink (new-style)
         // ("matrix", "netlink") => special_cases::netlink_tests(runner).await,
         // fork
-        ("fork", "fork_matrix") => fork_matrix::run_fork_matrix_tests(runner).await,
+        // ("fork", "fork_matrix") => fork_matrix::run_fork_matrix_tests(runner).await, // converted
         // shell
         // xworker
-        ("xworker", "unix_socket") => special_cases::unix_socket_tests(runner).await,
-        ("xworker", "cross_worker") => special_cases::cross_worker_tests(runner).await,
-        ("xworker", "pipe_eof") => special_cases::pipe_eof_tests(runner).await,
-        ("xworker", "pipe_bridge") => pipe_bridge::pipe_bridge_tests(runner).await,
+        // ("xworker", "unix_socket") => special_cases::unix_socket_tests(runner).await, // converted
+        // ("xworker", "cross_worker") => special_cases::cross_worker_tests(runner).await, // converted
+        // ("xworker", "pipe_eof") => special_cases::pipe_eof_tests(runner).await, // converted
+        // ("xworker", "pipe_bridge") => pipe_bridge::pipe_bridge_tests(runner).await, // converted
         // stress
         ("stress", "tcp_stress") => tcp_stress::run(runner).await,
         ("stress", "file_tcp") => file_tcp::run(runner).await,
         ("stress", "port_router") => port_router::run(runner).await,
         // contamination
-        ("contamination", "canary") => {
-            let canary_cmd = crate::protocol::Command::Exec {
-                args: vec![runner.self_exe.clone(), "echo-test".into()],
-                timeout_secs: None,
-                stdin: None,
-                background: false,
-            };
-            let resp = runner.send("A", canary_cmd).await;
-            let pass = matches!(
-                &resp,
-                Response::ExecResult { exit_code: 0, stdout, .. } if stdout == "ECHO_TEST_OK"
-            );
-            runner.record("X_canary.pre_sequence", "A", pass, &format!("{resp:?}"));
-        }
-        ("contamination", "contamination_sequence") => {
-            special_cases::contamination_sequence_tests(runner).await
-        }
+        // ("contamination", "contamination_sequence") => special_cases::contamination_sequence_tests(runner).await, // converted
         _ => {
             runner.record(
                 &format!("UNKNOWN_GROUP.{suite}.{group}"),
@@ -572,6 +556,34 @@ pub fn run_filtered(self_exe: &str, filter: Option<&str>) -> Vec<TestResult> {
         .build()
         .expect("tokio runtime")
         .block_on(run_tests(self_exe, filter))
+}
+
+/// Register the contamination canary test.
+fn register_canary(tests: &mut Vec<Test>) {
+    tests.push(Test {
+        suite: "contamination",
+        group: "canary",
+        id: "X_canary.pre_sequence".to_string(),
+        xfail: None,
+        run: Box::new(|r| {
+            let self_exe = r.self_exe.clone();
+            Box::pin(async move {
+                let canary_cmd = crate::protocol::Command::Exec {
+                    args: vec![self_exe, "echo-test".into()],
+                    timeout_secs: None,
+                    stdin: None,
+                    background: false,
+                };
+                let resp = r.send("A", canary_cmd).await;
+                let pass = matches!(
+                    &resp,
+                    crate::protocol::Response::ExecResult { exit_code: 0, stdout, .. }
+                        if stdout == "ECHO_TEST_OK"
+                );
+                TestOutcome::new("A", pass, format!("{resp:?}"))
+            })
+        }),
+    });
 }
 
 /// Check whether a Test matches the --filter argument.
@@ -645,6 +657,7 @@ async fn run_tests(self_exe: &str, filter: Option<&str>) -> Vec<TestResult> {
     special_cases::register_fs_io(&mut new_tests);
     special_cases::register_capture_pipe(&mut new_tests);
     special_cases::register_stdin_script(&mut new_tests);
+    register_canary(&mut new_tests);
     matrix::register_matrix(&mut new_tests);
     new_tests.extend(platform_fixes::register_poll_ready_tests());
     new_tests.extend(platform_fixes::register_bind_getsockname_tests());
@@ -667,6 +680,12 @@ async fn run_tests(self_exe: &str, filter: Option<&str>) -> Vec<TestResult> {
     new_tests.extend(platform_fixes::register_loopback_tcp_tests());
     new_tests.extend(platform_fixes::register_fork_listen_close_tests());
     new_tests.extend(platform_fixes::register_proc_filesystem_tests());
+    fork_matrix::register_fork_matrix(&mut new_tests);
+    special_cases::register_unix_socket(&mut new_tests);
+    special_cases::register_cross_worker(&mut new_tests);
+    special_cases::register_pipe_eof(&mut new_tests);
+    pipe_bridge::register_pipe_bridge(&mut new_tests);
+    special_cases::register_contamination_sequence(&mut new_tests);
 
     // Filter to only tests matching the --filter argument.
     let new_filtered: Vec<Test> = new_tests

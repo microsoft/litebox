@@ -28,7 +28,7 @@ pub const TEST_GROUPS: &[(&str, &str)] = &[
     // ("matrix", "loopback_tcp"), // converted
     // ("matrix", "proc_filesystem"), // converted
     // fork — fork/exec patterns, delayed fork, PIE/non-PIE
-    ("fork", "fork_matrix"),
+    // ("fork", "fork_matrix"), // converted
     // ("fork", "exit_data_integrity"), // converted
     // ("fork", "nonpie_pipe_chain"), // converted
     // ("fork", "bash_fork_exec"), // converted
@@ -48,10 +48,10 @@ pub const TEST_GROUPS: &[(&str, &str)] = &[
     // ("xworker", "cross_worker_self_connect"), // converted
     // ("xworker", "cross_worker_file"), // converted
     // ("xworker", "fork_listen_close"), // converted
-    ("xworker", "unix_socket"),
-    ("xworker", "cross_worker"),
-    ("xworker", "pipe_eof"),
-    ("xworker", "pipe_bridge"),
+    // ("xworker", "unix_socket"), // converted
+    // ("xworker", "cross_worker"), // converted
+    // ("xworker", "pipe_eof"), // converted
+    // ("xworker", "pipe_bridge"), // converted
     // ("xworker", "concurrent_fork_pipeline"), // converted
     // ("xworker", "concurrent_exec"), // converted
     // ("xworker", "vscode_install_pipeline"), // converted
@@ -61,8 +61,8 @@ pub const TEST_GROUPS: &[(&str, &str)] = &[
     ("stress", "file_tcp"),
     ("stress", "port_router"),
     // contamination — state accumulation (MUST run last)
-    ("contamination", "canary"),
-    ("contamination", "contamination_sequence"),
+    // ("contamination", "canary"), // converted
+    // ("contamination", "contamination_sequence"), // converted
 ];
 
 /// Default per-group timeout in seconds.
