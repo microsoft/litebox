@@ -5,12 +5,19 @@
 //! the functions of built-in TAs.
 
 use crate::{Task, UserConstPtr, UserMutPtr};
-use litebox::{
-    platform::{RawConstPointer as _, RawMutPointer as _},
-    utils::TruncateExt,
+use alloc::vec;
+use alloc::vec::Vec;
+use hmac::{Hmac, Mac};
+use litebox::platform::{
+    DerivedKeyError, DerivedKeyProvider, KDFParams, RawConstPointer as _, RawMutPointer as _,
 };
-use litebox_common_optee::{TeeParamType, TeeResult, TeeUuid, UteeParams};
+use litebox::utils::TruncateExt;
+use litebox_common_optee::{
+    HUK_SUBKEY_MAX_LEN, HukSubkeyUsage, TeeParamType, TeeResult, TeeUuid, UteeParams,
+};
 use num_enum::TryFromPrimitive;
+use sha2::Sha256;
+use zeroize::{Zeroize, Zeroizing};
 
 pub const PTA_SYSTEM_UUID: TeeUuid = TeeUuid {
     time_low: 0x3a2f_8978,
@@ -33,6 +40,13 @@ const PTA_SYSTEM_DLOPEN: u32 = 10;
 const PTA_SYSTEM_DLSYM: u32 = 11;
 const PTA_SYSTEM_GET_TPM_EVENT_LOG: u32 = 12;
 const PTA_SYSTEM_SUPP_PLUGIN_INVOKE: u32 = 13;
+
+/// Minimum size of a derived key in bytes.
+const TA_DERIVED_KEY_MIN_SIZE: usize = 16;
+/// Maximum size of a derived key in bytes.
+const TA_DERIVED_KEY_MAX_SIZE: usize = 32;
+/// Maximum size of extra data for key derivation in bytes.
+const TA_DERIVED_EXTRA_DATA_MAX_SIZE: usize = 1024;
 
 /// `PTA_SYSTEM_*` command ID from `optee_os/lib/libutee/include/pta_system.h`
 #[derive(Clone, Copy, TryFromPrimitive)]
@@ -72,6 +86,8 @@ pub fn is_pta_session(ta_sess_id: u32) -> bool {
     ta_sess_id == crate::SessionIdPool::get_pta_session_id()
 }
 
+type HmacSha256 = Hmac<Sha256>;
+
 impl Task {
     /// Handle a command of the system PTA.
     pub fn handle_system_pta_command(
@@ -81,58 +97,7 @@ impl Task {
     ) -> Result<(), TeeResult> {
         #[allow(clippy::single_match_else)]
         match PtaSystemCommandId::try_from(cmd_id).map_err(|_| TeeResult::BadParameters)? {
-            PtaSystemCommandId::DeriveTaUniqueKey => {
-                if params
-                    .get_type(0)
-                    .is_ok_and(|t| t == TeeParamType::MemrefInput)
-                    && params
-                        .get_type(1)
-                        .is_ok_and(|t| t == TeeParamType::MemrefOutput)
-                    && params.get_type(2).is_ok_and(|t| t == TeeParamType::None)
-                    && params.get_type(3).is_ok_and(|t| t == TeeParamType::None)
-                    && let Ok(Some(input)) =
-                        params.get_values(0).map_err(|_| TeeResult::BadParameters)
-                    && let Ok(Some(output)) =
-                        params.get_values(1).map_err(|_| TeeResult::BadParameters)
-                {
-                    // TODO: revisit buffer size limits based on OP-TEE spec and deployment constraints
-                    let input_len =
-                        usize::try_from(input.1).map_err(|_| TeeResult::BadParameters)?;
-                    if input_len > crate::MAX_KERNEL_BUF_SIZE {
-                        return Err(TeeResult::BadParameters);
-                    }
-                    let input_addr: usize = input.0.truncate();
-                    let input_ptr = UserConstPtr::<u8>::from_usize(input_addr);
-                    let _extra_data = input_ptr
-                        .to_owned_slice(input_len)
-                        .ok_or(TeeResult::BadParameters)?;
-
-                    let output_len =
-                        usize::try_from(output.1).map_err(|_| TeeResult::BadParameters)?;
-                    if output_len > crate::MAX_KERNEL_BUF_SIZE {
-                        return Err(TeeResult::BadParameters);
-                    }
-                    let output_addr: usize = output.0.truncate();
-                    let output_ptr = UserMutPtr::<u8>::from_usize(output_addr);
-
-                    // TODO: derive a TA unique key using the hardware unique key (HUK), TA's UUID, and `extra_data`
-                    litebox_util_log::debug!(
-                        ptr:% = format_args!("{:#x}", output_addr),
-                        size:% = output_len;
-                        "derive key into secure memory"
-                    );
-                    // TODO: replace below with a secure key derivation function
-                    let mut key_buf = alloc::vec![0u8; output_len];
-                    self.sys_cryp_random_number_generate(&mut key_buf)?;
-                    output_ptr
-                        .copy_from_slice(0, &key_buf)
-                        .ok_or(TeeResult::BadParameters)?;
-
-                    Ok(())
-                } else {
-                    Err(TeeResult::BadParameters)
-                }
-            }
+            PtaSystemCommandId::DeriveTaUniqueKey => self.derive_ta_unique_key(params),
             _ => {
                 #[cfg(debug_assertions)]
                 todo!("support other system PTA commands {cmd_id}");
@@ -141,4 +106,118 @@ impl Task {
             }
         }
     }
+
+    /// Derives a unique key for a TA using HUK.
+    ///
+    /// This follows the OP-TEE `system_derive_ta_unique_key` implementation from
+    /// `core/pta/system.c`.
+    fn derive_ta_unique_key(&self, params: &UteeParams) -> Result<(), TeeResult> {
+        use TeeParamType::{MemrefInput, MemrefOutput, None};
+
+        if !params.has_types([MemrefInput, MemrefOutput, None, None]) {
+            return Err(TeeResult::BadParameters);
+        }
+
+        let (extra_data_addr, extra_data_size_u64) = params
+            .get_values(0)
+            .map_err(|_| TeeResult::BadParameters)?
+            .ok_or(TeeResult::BadParameters)?;
+        let extra_data_size: usize = extra_data_size_u64.truncate();
+
+        let (subkey_addr, subkey_size_u64) = params
+            .get_values(1)
+            .map_err(|_| TeeResult::BadParameters)?
+            .ok_or(TeeResult::BadParameters)?;
+        let subkey_size: usize = subkey_size_u64.truncate();
+
+        if extra_data_size > TA_DERIVED_EXTRA_DATA_MAX_SIZE
+            || !(TA_DERIVED_KEY_MIN_SIZE..=TA_DERIVED_KEY_MAX_SIZE).contains(&subkey_size)
+            || subkey_addr == 0
+        {
+            return Err(TeeResult::BadParameters);
+        }
+
+        let extra_data = if extra_data_size == 0 {
+            Vec::new().into_boxed_slice()
+        } else {
+            let extra_data_ptr = UserConstPtr::<u8>::from_usize(extra_data_addr.truncate());
+            extra_data_ptr
+                .to_owned_slice(extra_data_size)
+                .ok_or(TeeResult::BadParameters)?
+        };
+
+        // In LiteBox for LVBS, TA's address space is always in the secure world.
+        let subkey_ptr = UserMutPtr::<u8>::from_usize(subkey_addr.truncate());
+
+        // subkey = KDF(huk, usage || ta_uuid || extra_data)
+        let ta_uuid_bytes = self.ta_app_id.to_le_bytes();
+        let mut subkey_buf = Zeroizing::new(vec![0u8; subkey_size]);
+        self.huk_subkey_derive(
+            HukSubkeyUsage::UniqueTa,
+            &[&ta_uuid_bytes, &extra_data],
+            &mut subkey_buf,
+        )
+        .and_then(|()| {
+            subkey_ptr
+                .copy_from_slice(0, &subkey_buf)
+                .ok_or(TeeResult::AccessDenied)
+        })
+    }
+
+    /// Derive a subkey using HUK and constant data.
+    ///
+    /// This follows the OP-TEE `huk_subkey_derive` interface from `core/kernel/huk_subkey.c`.
+    fn huk_subkey_derive(
+        &self,
+        usage: HukSubkeyUsage,
+        const_data: &[&[u8]],
+        subkey: &mut [u8],
+    ) -> Result<(), TeeResult> {
+        let subkey_len = subkey.len();
+        if subkey_len > HUK_SUBKEY_MAX_LEN {
+            return Err(TeeResult::BadParameters);
+        }
+
+        let kdf_context_len =
+            core::mem::size_of::<u32>() + const_data.iter().map(|chunk| chunk.len()).sum::<usize>();
+        let mut kdf_context = Zeroizing::new(Vec::with_capacity(kdf_context_len));
+        kdf_context.extend_from_slice(&(usage as u32).to_le_bytes());
+        for chunk in const_data {
+            kdf_context.extend_from_slice(chunk);
+        }
+        let kdf_params = KDFParams {
+            context: kdf_context.as_slice(),
+            output: subkey,
+        };
+
+        self.global
+            .platform
+            .derive_key(Some(huk_subkey_derive_inner), kdf_params)
+            .map_err(|err| match err {
+                DerivedKeyError::ShimKDFRequired => {
+                    unreachable!("we always provide a shim KDF callback")
+                }
+                DerivedKeyError::UnsupportedRebootPersistentKey => TeeResult::NotSupported,
+                DerivedKeyError::ShimKDFError(err) => err,
+            })?;
+
+        Ok(())
+    }
+}
+
+/// A KDF callback that derives a subkey from `huk` and `params.context` to be passed to
+/// the underlying platform implementation of `derive_key`.
+fn huk_subkey_derive_inner(huk: &[u8], params: KDFParams<'_>) -> Result<(), TeeResult> {
+    let subkey_len = params.output.len();
+    if subkey_len > HUK_SUBKEY_MAX_LEN {
+        return Err(TeeResult::BadParameters);
+    }
+
+    let mut hmac = HmacSha256::new_from_slice(huk).map_err(|_| TeeResult::BadParameters)?;
+    hmac.update(params.context);
+
+    let mut hmac_bytes = hmac.finalize().into_bytes();
+    params.output.copy_from_slice(&hmac_bytes[..subkey_len]);
+    hmac_bytes.zeroize();
+    Ok(())
 }

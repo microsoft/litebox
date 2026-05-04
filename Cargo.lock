@@ -668,6 +668,7 @@ dependencies = [
  "block-buffer",
  "const-oid",
  "crypto-common",
+ "subtle",
 ]
 
 [[package]]
@@ -1018,6 +1019,15 @@ name = "heck"
 version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
+
+[[package]]
+name = "hmac"
+version = "0.12.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6c49c37c09c17a53d937dfbb742eb3a961d65a994e6bcdcf37e7399d0cc8ab5e"
+dependencies = [
+ "digest",
+]
 
 [[package]]
 name = "http"
@@ -1722,16 +1732,20 @@ dependencies = [
  "ctr",
  "elf",
  "hashbrown",
+ "hmac",
  "litebox",
  "litebox_common_linux",
  "litebox_common_optee",
+ "litebox_platform_linux_userland",
  "litebox_platform_multiplex",
  "litebox_util_log",
  "num_enum",
  "once_cell",
+ "sha2",
  "spin 0.10.0",
  "thiserror",
  "zerocopy",
+ "zeroize",
 ]
 
 [[package]]

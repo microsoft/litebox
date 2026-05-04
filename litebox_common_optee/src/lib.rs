@@ -482,6 +482,11 @@ pub enum TeeParamType {
 impl UteeParams {
     pub const TEE_NUM_PARAMS: usize = TEE_NUM_PARAMS;
 
+    /// Return `true` if every parameter matches the expected type.
+    pub fn has_types(&self, expected: [TeeParamType; Self::TEE_NUM_PARAMS]) -> bool {
+        (0..Self::TEE_NUM_PARAMS).all(|i| self.get_type(i).is_ok_and(|t| t == expected[i]))
+    }
+
     pub fn get_type(&self, index: usize) -> Result<TeeParamType, Errno> {
         let type_byte = match index {
             0 => self.types.type_0(),
@@ -618,6 +623,16 @@ impl TeeUuid {
         bytes[0..8].copy_from_slice(&data[0].to_le_bytes());
         bytes[8..16].copy_from_slice(&data[1].to_le_bytes());
         Self::from_bytes(bytes)
+    }
+
+    /// Converts the UUID to a 16-byte array with little-endian encoding.
+    pub fn to_le_bytes(self) -> [u8; 16] {
+        let mut bytes = [0u8; 16];
+        bytes[0..4].copy_from_slice(&self.time_low.to_le_bytes());
+        bytes[4..6].copy_from_slice(&self.time_mid.to_le_bytes());
+        bytes[6..8].copy_from_slice(&self.time_hi_and_version.to_le_bytes());
+        bytes[8..16].copy_from_slice(&self.clock_seq_and_node);
+        bytes
     }
 }
 
@@ -2305,6 +2320,27 @@ pub fn parse_ta_head(elf_data: &[u8]) -> Option<TaHead> {
     }
     None
 }
+
+/// Hardware Unique Key (HUK) subkey usage identifiers based on OP-TEE's `enum huk_subkey_usage`.
+#[derive(Clone, Copy)]
+#[repr(u32)]
+pub enum HukSubkeyUsage {
+    /// RPMB key
+    Rpmb = 0,
+    /// Secure Storage Key
+    Ssk = 1,
+    /// Die ID
+    DieId = 2,
+    /// TA unique key
+    UniqueTa = 3,
+    /// TA encryption key
+    TaEnc = 4,
+    /// SCP03 set of encryption keys
+    Se050 = 5,
+}
+
+/// Maximum length of an HUK subkey in bytes.
+pub const HUK_SUBKEY_MAX_LEN: usize = 32;
 
 #[cfg(test)]
 mod tests {

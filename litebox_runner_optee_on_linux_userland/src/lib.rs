@@ -85,6 +85,8 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     let _litebox = shim_builder.litebox();
     let shim = shim_builder.build();
 
+    platform.initialize_boot_specific_kdf_support();
+
     if cli_args.command_sequence.is_empty() {
         run_ta_with_default_commands(&shim, ldelf_data.as_slice(), prog_data.as_slice());
     } else {
