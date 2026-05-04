@@ -93,6 +93,15 @@ fn main() {
     }
 
     match cmd {
+        "list-ids" => {
+            // Print all registered test IDs without executing anything.
+            // Used by integration.rs to generate Trials.
+            let tests = coordinator::collect_all_tests();
+            for t in &tests {
+                println!("{}", t.id);
+            }
+            eprintln!("[harness] {} test IDs", tests.len());
+        }
         "spawn-tree" => {
             // Optional: --filter=matrix to run only matrix tests.
             let filter = args.iter().find_map(|a| a.strip_prefix("--filter="));

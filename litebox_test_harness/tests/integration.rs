@@ -35,6 +35,28 @@ use libtest_mimic::{Arguments, Failed, Trial};
 // that have matching Trials. Results are cached so all Trials in the
 // same pass share one docker run.
 
+/// Cached test IDs from list-ids (computed once, shared).
+static TEST_IDS: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+
+fn get_test_ids() -> &'static Vec<String> {
+    TEST_IDS.get_or_init(|| {
+        let (_, debug, _) = setup();
+        let harness = debug.join("litebox_test_harness");
+        let output = Command::new(&harness)
+            .arg("list-ids")
+            .output()
+            .expect("failed to run list-ids");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let ids: Vec<String> = stdout
+            .lines()
+            .map(|l| l.trim().to_string())
+            .filter(|l| !l.is_empty())
+            .collect();
+        eprintln!("[integration] {} test IDs from list-ids", ids.len());
+        ids
+    })
+}
+
 static PASS_CACHE: Mutex<Option<std::collections::HashMap<String, Vec<serde_json::Value>>>> =
     Mutex::new(None);
 
@@ -93,35 +115,54 @@ fn get_pass_results(pass: &str, filter_arg: &str) -> Vec<serde_json::Value> {
     // reports the same test count as native. This runs on the host
     // (not inside docker) so it's not affected by container timeouts.
     if !results.is_empty() {
-        let recorded: std::collections::HashSet<String> = results
+        let recorded_ids: std::collections::HashSet<String> = results
             .iter()
-            .filter_map(|r| {
-                let test = r["test"].as_str()?;
-                let agent = r["agent"].as_str()?;
-                Some(format!("{test} {agent}"))
-            })
+            .filter_map(|r| r["test"].as_str().map(String::from))
             .collect();
 
-        let baseline = include_str!("../native-test-ids.txt");
+        let all_ids = get_test_ids();
         let mut filled = 0usize;
-        for line in baseline.lines() {
-            let line = line.trim();
-            if line.is_empty() || recorded.contains(line) {
-                continue;
+        for test_id in all_ids {
+            if !recorded_ids.contains(test_id.as_str()) {
+                results.push(serde_json::json!({
+                    "test": test_id,
+                    "agent": "?",
+                    "result": "FAIL",
+                    "detail": "not executed",
+                }));
+                filled += 1;
             }
-            let mut parts = line.splitn(2, ' ');
-            let Some(test) = parts.next() else { continue };
-            let Some(agent) = parts.next() else { continue };
-            results.push(serde_json::json!({
-                "test": test,
-                "agent": agent,
-                "result": "FAIL",
-                "detail": "not executed (baseline)",
-            }));
-            filled += 1;
         }
         if filled > 0 {
-            eprintln!("[{pass}] baseline: filled {filled} missing test IDs as FAIL");
+            eprintln!("[{pass}] filled {filled} unexecuted test IDs as FAIL");
+        }
+    }
+
+    // Drift check: parse TEST_IDS from stderr and compare against baseline.
+    // Warn if registered IDs don't match the baseline file.
+    let test_ids = get_test_ids();
+    let baseline_ids: std::collections::HashSet<&str> =
+        test_ids.iter().map(|s| s.as_str()).collect();
+    let registered_ids: std::collections::HashSet<String> = results
+        .iter()
+        .filter(|r| {
+            r["detail"]
+                .as_str()
+                .map_or(true, |d| !d.starts_with("not executed"))
+        })
+        .filter_map(|r| r["test"].as_str().map(String::from))
+        .collect();
+    let extra: Vec<_> = registered_ids
+        .iter()
+        .filter(|id| !baseline_ids.contains(id.as_str()))
+        .collect();
+    if !extra.is_empty() {
+        eprintln!(
+            "[{pass}] DRIFT: {} test IDs not in registered test IDs (new tests added?):",
+            extra.len()
+        );
+        for id in extra.iter().take(10) {
+            eprintln!("  + {id}");
         }
     }
 
@@ -185,23 +226,10 @@ fn main() {
 
     let mut trials: Vec<Trial> = Vec::new();
 
-    // Generate one Trial per test ID from the baseline file.
-    // This gives per-test filtering: cargo test -- NL1.netlink_socket
-    let baseline = include_str!("../native-test-ids.txt");
-    for line in baseline.lines() {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        let mut parts = line.splitn(2, ' ');
-        let Some(test_id) = parts.next() else {
-            continue;
-        };
-        let Some(_agent) = parts.next() else {
-            continue;
-        };
-        let tid = test_id.to_string();
-
+    // Generate one Trial per test ID from the harness binary's list-ids.
+    // No docker needed — just calls register_*() functions.
+    let test_ids = get_test_ids();
+    for tid in test_ids.iter().cloned() {
         let sf = suite_filter.clone();
         let tid2 = tid.clone();
         trials.push(Trial::test(format!("native::{tid}"), move || {

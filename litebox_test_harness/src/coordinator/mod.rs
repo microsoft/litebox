@@ -576,6 +576,57 @@ fn matches_test(filter: Option<&str>, test: &Test) -> bool {
     }
 }
 
+/// Collect all registered tests without executing any.
+/// Returns the full set of Test structs with their IDs and closures.
+/// No agents, no docker — just builds the test list.
+pub fn collect_all_tests() -> Vec<Test> {
+    let mut tests: Vec<Test> = Vec::new();
+    register_canary(&mut tests);
+    special_cases::register_netlink(&mut tests);
+    concurrent_fork::register_concurrent_fork_pipeline(&mut tests);
+    concurrent_fork::register_concurrent_exec(&mut tests);
+    concurrent_fork::register_vscode_install_pipeline(&mut tests);
+    concurrent_fork::register_concurrent_fs_rwlock(&mut tests);
+    special_cases::register_net_ipv6(&mut tests);
+    special_cases::register_terminal_ioctl(&mut tests);
+    special_cases::register_node_exit(&mut tests);
+    special_cases::register_fs_io(&mut tests);
+    special_cases::register_capture_pipe(&mut tests);
+    special_cases::register_stdin_script(&mut tests);
+    matrix::register_matrix(&mut tests);
+    tests.extend(platform_fixes::register_poll_ready_tests());
+    tests.extend(platform_fixes::register_bind_getsockname_tests());
+    tests.extend(platform_fixes::register_pipe_pair_id_tests());
+    tests.extend(platform_fixes::register_exit_data_integrity_tests());
+    tests.extend(platform_fixes::register_nonpie_pipe_chain_tests());
+    tests.extend(platform_fixes::register_cross_worker_first_connect_tests());
+    tests.extend(platform_fixes::register_cross_worker_self_connect_tests());
+    tests.extend(platform_fixes::register_bash_fork_exec_tests());
+    tests.extend(platform_fixes::register_fork_from_worker_exec_tests());
+    tests.extend(platform_fixes::register_stdin_pipe_subst_tests());
+    tests.extend(platform_fixes::register_cross_worker_file_tests());
+    tests.extend(platform_fixes::register_subst_capture_tests());
+    tests.extend(platform_fixes::register_concurrent_fork_tests());
+    tests.extend(platform_fixes::register_touch_redirect_tests());
+    tests.extend(platform_fixes::register_pid_visibility_tests());
+    tests.extend(platform_fixes::register_file_redirect_tests());
+    tests.extend(platform_fixes::register_pipe_nonblock_tests());
+    tests.extend(platform_fixes::register_epoll_socket_tests());
+    tests.extend(platform_fixes::register_loopback_tcp_tests());
+    tests.extend(platform_fixes::register_fork_listen_close_tests());
+    tests.extend(platform_fixes::register_proc_filesystem_tests());
+    fork_matrix::register_fork_matrix(&mut tests);
+    special_cases::register_unix_socket(&mut tests);
+    special_cases::register_cross_worker(&mut tests);
+    special_cases::register_pipe_eof(&mut tests);
+    pipe_bridge::register_pipe_bridge(&mut tests);
+    tcp_stress::register_tcp_stress(&mut tests);
+    file_tcp::register_file_tcp(&mut tests);
+    port_router::register_port_router(&mut tests);
+    special_cases::register_contamination_sequence(&mut tests);
+    tests
+}
+
 async fn run_tests(self_exe: &str, filter: Option<&str>) -> Vec<TestResult> {
     let runtime_env = detect_runtime_environment();
     eprintln!("[coord] runtime: {runtime_env}");
@@ -589,51 +640,7 @@ async fn run_tests(self_exe: &str, filter: Option<&str>) -> Vec<TestResult> {
     };
 
     // --- New-style declarative tests (proof of concept) ---
-    // Collect registered tests.
-    let mut new_tests: Vec<Test> = Vec::new();
-    register_canary(&mut new_tests);
-    special_cases::register_netlink(&mut new_tests);
-    concurrent_fork::register_concurrent_fork_pipeline(&mut new_tests);
-    concurrent_fork::register_concurrent_exec(&mut new_tests);
-    concurrent_fork::register_vscode_install_pipeline(&mut new_tests);
-    concurrent_fork::register_concurrent_fs_rwlock(&mut new_tests);
-    special_cases::register_net_ipv6(&mut new_tests);
-    special_cases::register_terminal_ioctl(&mut new_tests);
-    special_cases::register_node_exit(&mut new_tests);
-    special_cases::register_fs_io(&mut new_tests);
-    special_cases::register_capture_pipe(&mut new_tests);
-    special_cases::register_stdin_script(&mut new_tests);
-    matrix::register_matrix(&mut new_tests);
-    new_tests.extend(platform_fixes::register_poll_ready_tests());
-    new_tests.extend(platform_fixes::register_bind_getsockname_tests());
-    new_tests.extend(platform_fixes::register_pipe_pair_id_tests());
-    new_tests.extend(platform_fixes::register_exit_data_integrity_tests());
-    new_tests.extend(platform_fixes::register_nonpie_pipe_chain_tests());
-    new_tests.extend(platform_fixes::register_cross_worker_first_connect_tests());
-    new_tests.extend(platform_fixes::register_cross_worker_self_connect_tests());
-    new_tests.extend(platform_fixes::register_bash_fork_exec_tests());
-    new_tests.extend(platform_fixes::register_fork_from_worker_exec_tests());
-    new_tests.extend(platform_fixes::register_stdin_pipe_subst_tests());
-    new_tests.extend(platform_fixes::register_cross_worker_file_tests());
-    new_tests.extend(platform_fixes::register_subst_capture_tests());
-    new_tests.extend(platform_fixes::register_concurrent_fork_tests());
-    new_tests.extend(platform_fixes::register_touch_redirect_tests());
-    new_tests.extend(platform_fixes::register_pid_visibility_tests());
-    new_tests.extend(platform_fixes::register_file_redirect_tests());
-    new_tests.extend(platform_fixes::register_pipe_nonblock_tests());
-    new_tests.extend(platform_fixes::register_epoll_socket_tests());
-    new_tests.extend(platform_fixes::register_loopback_tcp_tests());
-    new_tests.extend(platform_fixes::register_fork_listen_close_tests());
-    new_tests.extend(platform_fixes::register_proc_filesystem_tests());
-    fork_matrix::register_fork_matrix(&mut new_tests);
-    special_cases::register_unix_socket(&mut new_tests);
-    special_cases::register_cross_worker(&mut new_tests);
-    special_cases::register_pipe_eof(&mut new_tests);
-    pipe_bridge::register_pipe_bridge(&mut new_tests);
-    tcp_stress::register_tcp_stress(&mut new_tests);
-    file_tcp::register_file_tcp(&mut new_tests);
-    port_router::register_port_router(&mut new_tests);
-    special_cases::register_contamination_sequence(&mut new_tests);
+    let mut new_tests = collect_all_tests();
 
     // Filter to only tests matching the --filter argument.
     // Protocol header: output all registered test IDs before execution.
