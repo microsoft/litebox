@@ -221,6 +221,21 @@ impl TestRunner {
         };
         let outcome = result.outcome();
         eprintln!("  {outcome}: {test} [{agent}] {detail}");
+        // Emit the JSON record incrementally on stdout, flushed immediately,
+        // so partial runs survive the integration-test pipeline even if the
+        // coordinator process is killed before reaching end-of-main. Native
+        // and litebox now produce the same JSON-on-stdout stream.
+        println!(
+            "{}",
+            serde_json::json!({
+                "test": test,
+                "agent": agent,
+                "result": outcome,
+                "detail": detail,
+            })
+        );
+        use std::io::Write as _;
+        let _ = std::io::stdout().flush();
         self.results.push(result);
     }
 

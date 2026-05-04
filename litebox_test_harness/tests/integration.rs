@@ -390,9 +390,14 @@ fn ensure_binaries_built(ws_root: &Path) {
 }
 
 /// Run the test harness and parse JSON results from stdout.
-/// Falls back to parsing coordinator eprintln output from stderr
-/// when running under litebox (litebox_tool_executor doesn't forward
-/// guest stdout).
+///
+/// JSON records are emitted incrementally by the harness coordinator as
+/// each test completes (one `println!` per result, flushed immediately;
+/// see `litebox_test_harness::coordinator::record_expected`). This means
+/// stdout is the single source of truth on **both** native and litebox
+/// passes, even if the harness process is killed before main() reaches
+/// its end-of-run code path (which can happen under litebox during
+/// teardown of the spawned agent tree).
 fn run_and_parse(label: &str, command: &mut Command) -> Vec<serde_json::Value> {
     eprintln!("Launching {label}...");
     let output = command
@@ -403,46 +408,10 @@ fn run_and_parse(label: &str, command: &mut Command) -> Vec<serde_json::Value> {
     let stderr = String::from_utf8_lossy(&output.stderr);
     eprintln!("{stderr}");
 
-    // Try JSON from stdout first (native runs).
     let mut results: Vec<serde_json::Value> = Vec::new();
     for line in stdout.lines() {
         if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
             results.push(v);
-        }
-    }
-
-    // Fallback: parse coordinator eprintln output from stderr (litebox runs).
-    // Lines look like: "  pass: TEST_ID [AGENT] DETAIL"
-    //                  "  FAIL: TEST_ID [AGENT] DETAIL"
-    //                  "  xfail: TEST_ID [AGENT] DETAIL"
-    if results.is_empty() {
-        for line in stderr.lines() {
-            let line = line.trim();
-            let (result, rest) = if let Some(r) = line.strip_prefix("pass: ") {
-                ("pass", r)
-            } else if let Some(r) = line.strip_prefix("FAIL: ") {
-                ("FAIL", r)
-            } else if let Some(r) = line.strip_prefix("xfail: ") {
-                ("xfail", r)
-            } else if let Some(r) = line.strip_prefix("XPASS: ") {
-                ("XPASS", r)
-            } else {
-                continue;
-            };
-            // Parse "TEST_ID [AGENT] DETAIL"
-            let (test, agent) = if let Some(bracket) = rest.find('[') {
-                let test = rest[..bracket].trim();
-                let agent_end = rest[bracket..].find(']').unwrap_or(rest.len() - bracket);
-                let agent = &rest[bracket + 1..bracket + agent_end];
-                (test, agent)
-            } else {
-                (rest, "?")
-            };
-            results.push(serde_json::json!({
-                "test": test,
-                "agent": agent,
-                "result": result,
-            }));
         }
     }
 

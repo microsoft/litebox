@@ -70,23 +70,14 @@ fn main() {
         "spawn-tree" => {
             // Optional: --filter=matrix to run only matrix tests.
             let filter = args.iter().find_map(|a| a.strip_prefix("--filter="));
+            // JSON results are emitted incrementally on stdout from
+            // record_expected as each test completes (see coordinator/mod.rs).
+            // We just compute the summary counts here.
             let results = coordinator::run_filtered(self_exe, filter);
             let pass_count = results.iter().filter(|r| r.outcome() == "pass").count();
             let fail_count = results.iter().filter(|r| r.outcome() == "FAIL").count();
             let xfail_count = results.iter().filter(|r| r.outcome() == "xfail").count();
             let xpass_count = results.iter().filter(|r| r.outcome() == "XPASS").count();
-            // Print JSON results to stdout.
-            for r in &results {
-                println!(
-                    "{}",
-                    serde_json::json!({
-                        "test": r.id,
-                        "agent": r.agent,
-                        "result": r.outcome(),
-                        "detail": r.detail,
-                    })
-                );
-            }
             eprintln!(
                 "\n=== SUMMARY: {} total, {} passed, {} failed, {} xfail, {} xpass ===",
                 results.len(),
