@@ -132,32 +132,43 @@ fn get_pass_results(pass: &str, filter_arg: &str) -> Vec<serde_json::Value> {
 
 /// Determine which suites are needed based on the cargo test filter.
 /// Returns comma-separated suite names, or empty string for all suites.
+/// Compute the --filter argument for spawn-tree from the cargo test filter.
+///
+/// The cargo test filter matches Trial names like:
+///   "native::matrix::netlink::NL1.netlink_socket"
+///
+/// We extract the part after the pass prefix (native::/litebox::) and
+/// pass it to the coordinator, which handles:
+///   "matrix" (suite), "matrix.netlink" (group), "NL1" (test ID prefix)
 fn compute_suite_filter(cargo_filter: &str) -> String {
     if cargo_filter.is_empty() {
         return String::new();
     }
-    // Collect suites whose Trial names match the cargo test filter.
-    // libtest_mimic uses substring matching.
-    let mut suites: HashSet<&str> = HashSet::new();
-    for &(suite, group) in TEST_GROUPS {
-        let native_name = format!("native::{suite}::{group}");
-        let litebox_name = format!("litebox::{suite}::{group}");
-        if native_name.contains(cargo_filter) || litebox_name.contains(cargo_filter) {
-            suites.insert(suite);
-        }
-    }
-    // Also check if "host::fwd" matches (no suite filter needed for that).
-    if suites.is_empty() && "host::fwd".contains(cargo_filter) {
-        return String::new(); // host-only, no spawn-tree needed
-    }
-    // If all suites are selected, no filter needed.
-    let all_suites: HashSet<&str> = TEST_GROUPS.iter().map(|(s, _)| *s).collect();
-    if suites == all_suites {
+
+    // Strip pass prefix if present.
+    // Strip pass prefix if present.
+    let filter = cargo_filter
+        .strip_prefix("native::")
+        .or_else(|| cargo_filter.strip_prefix("litebox::"))
+        .unwrap_or(cargo_filter);
+
+    // If the filter is just the pass name or empty, run all.
+    if filter.is_empty() || filter == "native" || filter == "litebox" {
         return String::new();
     }
-    let mut sorted: Vec<&str> = suites.into_iter().collect();
-    sorted.sort();
-    sorted.join(",")
+
+    // If it looks like a suite::group::testid, convert :: to . for coordinator.
+    // "matrix::netlink::NL1" → "NL1" (test ID takes precedence)
+    // "matrix::netlink" → "matrix.netlink" (group filter)
+    // "matrix" → "matrix" (suite filter)
+    // "NL1" → "NL1" (test ID filter)
+    let parts: Vec<&str> = filter.split("::").collect();
+    match parts.len() {
+        3 => parts[2].to_string(),                 // suite::group::testid → testid
+        2 => format!("{}.{}", parts[0], parts[1]), // suite::group → suite.group
+        1 => parts[0].to_string(),                 // suite or testid
+        _ => filter.to_string(),
+    }
 }
 
 // ── Main ─────────────────────────────────────────────────────────────
@@ -175,22 +186,34 @@ fn main() {
 
     let mut trials: Vec<Trial> = Vec::new();
 
-    // Each test group becomes two Trials: native::<suite>::<group> and
-    // litebox::<suite>::<group>. All Trials in the same pass share one
-    // docker run (cached). The docker run is filtered to only the
-    // needed suites.
-    for &(suite, group) in TEST_GROUPS {
-        let sf = suite_filter.clone();
-        trials.push(Trial::test(
-            format!("native::{suite}::{group}"),
-            move || run_native_group(&sf),
-        ));
+    // Generate one Trial per test ID from the baseline file.
+    // This gives per-test filtering: cargo test -- NL1.netlink_socket
+    let baseline = include_str!("../native-test-ids.txt");
+    for line in baseline.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let mut parts = line.splitn(2, ' ');
+        let Some(test_id) = parts.next() else {
+            continue;
+        };
+        let Some(_agent) = parts.next() else {
+            continue;
+        };
+        let tid = test_id.to_string();
 
         let sf = suite_filter.clone();
-        trials.push(Trial::test(
-            format!("litebox::{suite}::{group}"),
-            move || run_litebox_group(&sf),
-        ));
+        let tid2 = tid.clone();
+        trials.push(Trial::test(format!("native::{tid}"), move || {
+            run_pass_group("native", &sf, &tid2)
+        }));
+
+        let sf = suite_filter.clone();
+        let tid2 = tid.clone();
+        trials.push(Trial::test(format!("litebox::{tid}"), move || {
+            run_pass_group("litebox", &sf, &tid2)
+        }));
     }
 
     // Host forwarding trial (not a coordinator suite — uses its own docker run).
@@ -206,41 +229,29 @@ fn main() {
 // ── Per-group runners (backed by pass cache) ─────────────────────────
 
 /// Native gold standard: get pass results from cache, assert 0 FAIL.
-fn run_native_group(suite_filter: &str) -> Result<(), Failed> {
-    let results = get_pass_results("native", suite_filter);
+/// Validate a single test ID from cached pass results.
+fn run_pass_group(pass: &str, suite_filter: &str, test_id: &str) -> Result<(), Failed> {
+    let results = get_pass_results(pass, suite_filter);
     if results.is_empty() {
-        return Err("native produced no results".into());
+        return Err(format!("{pass} produced no results").into());
     }
-    let failures: Vec<_> = results
+    let matching: Vec<_> = results
         .iter()
-        .filter(|r| r["result"].as_str() == Some("FAIL"))
-        .map(|r| {
-            format!(
-                "{} [{}]: {}",
-                r["test"].as_str().unwrap_or("?"),
-                r["agent"].as_str().unwrap_or("?"),
-                r["detail"].as_str().unwrap_or(""),
-            )
-        })
+        .filter(|r| r["test"].as_str() == Some(test_id))
         .collect();
-    if !failures.is_empty() {
-        return Err(format!(
-            "native: {} FAIL(s):\n  {}",
-            failures.len(),
-            failures.join("\n  ")
-        )
-        .into());
+    if matching.is_empty() {
+        return Err(format!("{pass}::{test_id}: not found in results").into());
     }
-    Ok(())
-}
-
-/// Litebox pass: get results from cache, report counts.
-fn run_litebox_group(suite_filter: &str) -> Result<(), Failed> {
-    let results = get_pass_results("litebox", suite_filter);
-    if results.is_empty() {
-        return Err("litebox produced no results".into());
+    for r in &matching {
+        let result = r["result"].as_str().unwrap_or("?");
+        if result == "FAIL" {
+            let detail = r["detail"].as_str().unwrap_or("");
+            if pass == "litebox" {
+                return Ok(());
+            }
+            return Err(format!("{pass}::{test_id}: {detail}").into());
+        }
     }
-    // Don't fail — litebox has known FAILs/xfails.
     Ok(())
 }
 
