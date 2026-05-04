@@ -15,7 +15,7 @@
 /// Registry of all test groups. Each entry is `(suite, group_name)`.
 pub const TEST_GROUPS: &[(&str, &str)] = &[
     // matrix — capability × topology cross-product
-    ("matrix", "run_matrix"),
+    // ("matrix", "run_matrix"), // converted
     // ("matrix", "netlink"), // converted to register_netlink
     // ("matrix", "net_ipv6"), // converted
     // ("matrix", "terminal_ioctl"), // converted

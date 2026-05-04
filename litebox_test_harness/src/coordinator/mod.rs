@@ -522,7 +522,6 @@ impl TestRunner {
 async fn run_group(runner: &mut TestRunner, suite: &str, group: &str) {
     match (suite, group) {
         // matrix
-        ("matrix", "run_matrix") => matrix::run_matrix_tests(runner).await,
         // Converted to register_netlink (new-style)
         // ("matrix", "netlink") => special_cases::netlink_tests(runner).await,
         ("matrix", "fs_io") => special_cases::fs_io_tests(runner).await,
@@ -673,6 +672,18 @@ async fn run_tests(self_exe: &str, filter: Option<&str>) -> Vec<TestResult> {
     special_cases::register_net_ipv6(&mut new_tests);
     special_cases::register_terminal_ioctl(&mut new_tests);
     special_cases::register_node_exit(&mut new_tests);
+    matrix::register_fs_crud(&mut new_tests);
+    matrix::register_fs_cross_unlink(&mut new_tests);
+    matrix::register_tmp_isolation(&mut new_tests);
+    matrix::register_host_file(&mut new_tests);
+    matrix::register_net_tests(&mut new_tests);
+    matrix::register_net_addr_tests(&mut new_tests);
+    matrix::register_unix_addr_tests(&mut new_tests);
+    matrix::register_exec_tests(&mut new_tests);
+    matrix::register_env_tests(&mut new_tests);
+    matrix::register_symlink_basic(&mut new_tests);
+    matrix::register_symlink_variants(&mut new_tests);
+    matrix::register_unix_tests(&mut new_tests);
 
     // Filter to only tests matching the --filter argument.
     let new_filtered: Vec<Test> = new_tests
