@@ -61,6 +61,21 @@ static PASS_CACHE: Mutex<Option<std::collections::HashMap<String, Vec<serde_json
     Mutex::new(None);
 
 /// Get (or compute) results for a pass. Runs docker once per pass.
+
+/// Whether to keep docker containers after exit (for debugging).
+fn keep_containers() -> bool {
+    std::env::var("LITEBOX_KEEP_CONTAINER").is_ok()
+}
+
+/// Docker run args: --rm unless LITEBOX_KEEP_CONTAINER is set.
+fn docker_run_args() -> Vec<&'static str> {
+    if keep_containers() {
+        vec!["run", "--cap-add", "SYS_PTRACE"]
+    } else {
+        vec!["run", "--rm", "--cap-add", "SYS_PTRACE"]
+    }
+}
+
 fn get_pass_results(pass: &str, filter_arg: &str) -> Vec<serde_json::Value> {
     let mut cache = PASS_CACHE.lock().unwrap();
     let map = cache.get_or_insert_with(std::collections::HashMap::new);
@@ -78,7 +93,7 @@ fn get_pass_results(pass: &str, filter_arg: &str) -> Vec<serde_json::Value> {
     let mut results = match pass {
         "native" => {
             let mut cmd = Command::new("docker");
-            cmd.args(["run", "--rm", "--cap-add", "SYS_PTRACE"])
+            cmd.args(docker_run_args())
                 .arg("-v")
                 .arg(format!("{}:/opt/litebox:ro", debug.display()))
                 .arg("-v")
@@ -90,7 +105,7 @@ fn get_pass_results(pass: &str, filter_arg: &str) -> Vec<serde_json::Value> {
         }
         "litebox" => {
             let mut cmd = Command::new("docker");
-            cmd.args(["run", "--rm", "--cap-add", "SYS_PTRACE"])
+            cmd.args(docker_run_args())
                 .arg("-v")
                 .arg(format!("{}:/opt/litebox:ro", debug.display()))
                 .arg("-v")
@@ -482,12 +497,22 @@ fn run_host_fwd(debug: &Path, nonpie: &Path) {
     let mut results: Vec<(&str, bool, String)> = Vec::new();
 
     // Start litebox in Docker with port forwarding + agent-listen mode.
-    let container_name = format!("litebox-host-test-{}", std::process::id());
+    let pid = std::process::id();
+    let container_name = format!("litebox-host-test-{pid}");
+    // Dynamic ports to avoid collisions with concurrent test runs.
+    let ctrl_port = 19000 + (pid % 1000) * 2;
+    let data_port = ctrl_port + 1;
+    let ctrl_map = format!("{ctrl_port}:19090");
+    let data_map = format!("{data_port}:19091");
     let mut docker = Command::new("docker");
     docker
-        .args(["run", "--rm", "--name", &container_name])
+        .args(if keep_containers() {
+            vec!["run", "--name", &container_name]
+        } else {
+            vec!["run", "--rm", "--name", &container_name]
+        })
         .args(["--cap-add", "SYS_PTRACE"])
-        .args(["-p", "19090:19090", "-p", "19091:19091"])
+        .args(["-p", &ctrl_map, "-p", &data_map])
         .arg("-v")
         .arg(format!("{}:/opt/litebox:ro", debug.display()))
         .arg("-v")
@@ -520,7 +545,7 @@ fn run_host_fwd(debug: &Path, nonpie: &Path) {
         loop {
             std::thread::sleep(Duration::from_millis(500));
             match TcpStream::connect_timeout(
-                &"127.0.0.1:19090".parse().unwrap(),
+                &format!("127.0.0.1:{ctrl_port}").parse().unwrap(),
                 Duration::from_secs(2),
             ) {
                 Ok(s) => {
@@ -586,7 +611,7 @@ fn run_host_fwd(debug: &Path, nonpie: &Path) {
             // Connect to the echo server via the second forwarded port.
             std::thread::sleep(Duration::from_millis(200));
             match TcpStream::connect_timeout(
-                &"127.0.0.1:19091".parse().unwrap(),
+                &format!("127.0.0.1:{data_port}").parse().unwrap(),
                 Duration::from_secs(5),
             ) {
                 Ok(mut data_stream) => {
