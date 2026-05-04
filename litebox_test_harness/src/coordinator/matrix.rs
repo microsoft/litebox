@@ -1,19 +1,19 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-//! Declarative test matrix — drives "cover all configurations" tests via
-//! structured loops over typed dimensions.
-//!
-//! Dimensions:
-//! - **Topology**: (source, dest) agent pairs in the process tree, including init
-//! - **FsScope**: /shared (visible) vs /tmp (isolated)
-//! - **SymlinkVariant**: basic, directory, dangling, nested, relative
-//! - **UnixPattern**: in-process, server+fork-client, background-server, cross-agent
-//! - **UnixDepth**: which agent depth runs the pattern
-//!
-//! Note: `init` (the coordinator) is a first-class node in the process tree for
-//! FS tests (it handles FsRead/FsWrite/FsDelete/FsSymlink/FsReadlink/FsStat/
-//! NetConnect locally). It cannot listen on TCP or Unix sockets.
+// Declarative test matrix — drives "cover all configurations" tests via
+// structured loops over typed dimensions.
+//
+// Dimensions:
+// - **Topology**: (source, dest) agent pairs in the process tree, including init
+// - **FsScope**: /shared (visible) vs /tmp (isolated)
+// - **SymlinkVariant**: basic, directory, dangling, nested, relative
+// - **UnixPattern**: in-process, server+fork-client, background-server, cross-agent
+// - **UnixDepth**: which agent depth runs the pattern
+//
+// Note: `init` (the coordinator) is a first-class node in the process tree for
+// FS tests (it handles FsRead/FsWrite/FsDelete/FsSymlink/FsReadlink/FsStat/
+// NetConnect locally). It cannot listen on TCP or Unix sockets.
 
 use super::TestRunner;
 use crate::protocol::{Command, Response};
@@ -1656,25 +1656,41 @@ pub(crate) async fn run_matrix_tests(r: &mut TestRunner) {
 // Sequential operations (write→read→update→delete) are grouped into
 // a single closure.
 
-/// Register FS CRUD tests: one closure per topology that runs the full
-/// absent→created→updated→deleted sequence.
+// Declarative register functions for the matrix test suite.
+//
+// Each `register_*` function pushes self-contained `Test` structs into the
+// provided vector. Every `r.record()` call in the old imperative code becomes
+// exactly one `Test` push with the same test ID and agent.
+//
+// Designed to be appended to (or included from) `matrix.rs`.
+
+use std::pin::Pin;
+
+// ═══════════════════════════════════════════════════════════════════
+// 1. FILESYSTEM CRUD — F.shared.{topo}.{absent,created,updated,deleted}
+// ═══════════════════════════════════════════════════════════════════
+
+/// Registers 4 tests per topology: absent, created, updated, deleted.
+/// Total: 4 × |FS_TOPOLOGIES| (with nonpie-skip fallback).
 pub(super) fn register_fs_crud(tests: &mut Vec<super::Test>) {
     let has_nonpie = crate::find_nonpie_binary().is_some();
-
     for &topo in FS_TOPOLOGIES {
-        let ts = topo.suffix();
         let (source, dest) = topo.agents();
+        let ts = topo.suffix();
 
         if topo.requires_nonpie() && !has_nonpie {
+            // Single skip marker matching the old behaviour.
+            let dest = dest.to_string();
+            let id = format!("F.shared.{ts}.absent");
             tests.push(super::Test {
                 suite: "matrix",
                 group: "run_matrix",
-                id: format!("F.shared.{ts}.absent"),
+                id,
                 xfail: None,
-                run: Box::new(move |r| {
+                run: Box::new(move |_r| {
                     Box::pin(async move {
                         super::TestOutcome::new(
-                            dest,
+                            &dest,
                             false,
                             "FAIL: nonpie binary not found — mount at /opt/nonpie",
                         )
@@ -1686,143 +1702,235 @@ pub(super) fn register_fs_crud(tests: &mut Vec<super::Test>) {
 
         let source = source.to_string();
         let dest = dest.to_string();
-        let ts = ts.to_string();
+        let ts_s: String = ts.to_string();
 
-        tests.push(super::Test {
-            suite: "matrix",
-            group: "run_matrix",
-            id: format!("F.shared.{ts}.crud"),
-            xfail: None,
-            run: Box::new(move |r| {
-                Box::pin(async move {
-                    let file = format!("/shared/matrix_{ts}.txt");
-                    let data = format!("data_{ts}");
-                    let updated = format!("updated_{ts}");
+        // ── absent ──
+        {
+            let source = source.clone();
+            let dest = dest.clone();
+            let ts_s = ts_s.clone();
+            tests.push(super::Test {
+                suite: "matrix",
+                group: "run_matrix",
+                id: format!("F.shared.{ts_s}.absent"),
+                xfail: None,
+                run: Box::new(move |r| {
+                    Box::pin(async move {
+                        let file = format!("/shared/matrix_{ts_s}.txt");
+                        let _ = r
+                            .send("init", Command::FsDelete { path: file.clone() })
+                            .await;
+                        let resp = r.send(&dest, Command::FsRead { path: file }).await;
+                        let pass = matches!(resp, Response::NotFound);
+                        super::TestOutcome::new(&dest, pass, format!("{resp:?}"))
+                    })
+                }),
+            });
+        }
 
-                    // Clean up
-                    let _ = r
-                        .send("init", Command::FsDelete { path: file.clone() })
+        // ── created ──
+        {
+            let source = source.clone();
+            let dest = dest.clone();
+            let ts_s = ts_s.clone();
+            tests.push(super::Test {
+                suite: "matrix",
+                group: "run_matrix",
+                id: format!("F.shared.{ts_s}.created"),
+                xfail: None,
+                run: Box::new(move |r| {
+                    Box::pin(async move {
+                        let file = format!("/shared/matrix_{ts_s}.txt");
+                        let data = format!("data_{ts_s}");
+                        let _ = r
+                            .send("init", Command::FsDelete { path: file.clone() })
+                            .await;
+                        r.send(
+                            &source,
+                            Command::FsWrite {
+                                path: file.clone(),
+                                data: data.clone(),
+                            },
+                        )
                         .await;
+                        let resp = r.send(&dest, Command::FsRead { path: file }).await;
+                        let pass = matches!(&resp, Response::Ok { data: Some(d) } if *d == data);
+                        super::TestOutcome::new(&dest, pass, format!("{resp:?}"))
+                    })
+                }),
+            });
+        }
 
-                    // absent
-                    let resp = r
-                        .send(&dest, Command::FsRead { path: file.clone() })
+        // ── updated ──
+        {
+            let source = source.clone();
+            let dest = dest.clone();
+            let ts_s = ts_s.clone();
+            tests.push(super::Test {
+                suite: "matrix",
+                group: "run_matrix",
+                id: format!("F.shared.{ts_s}.updated"),
+                xfail: None,
+                run: Box::new(move |r| {
+                    Box::pin(async move {
+                        let file = format!("/shared/matrix_{ts_s}.txt");
+                        let data = format!("data_{ts_s}");
+                        let updated = format!("updated_{ts_s}");
+                        let _ = r
+                            .send("init", Command::FsDelete { path: file.clone() })
+                            .await;
+                        r.send(
+                            &source,
+                            Command::FsWrite {
+                                path: file.clone(),
+                                data: data.clone(),
+                            },
+                        )
                         .await;
-                    let absent_pass = matches!(resp, Response::NotFound);
+                        r.send(
+                            &source,
+                            Command::FsWrite {
+                                path: file.clone(),
+                                data: updated.clone(),
+                            },
+                        )
+                        .await;
+                        let resp = r.send(&dest, Command::FsRead { path: file }).await;
+                        let pass = matches!(&resp, Response::Ok { data: Some(d) } if *d == updated);
+                        super::TestOutcome::new(&dest, pass, format!("{resp:?}"))
+                    })
+                }),
+            });
+        }
 
-                    // create
-                    r.send(
-                        &source,
-                        Command::FsWrite {
-                            path: file.clone(),
-                            data: data.clone(),
-                        },
-                    )
-                    .await;
-                    let resp = r
-                        .send(&dest, Command::FsRead { path: file.clone() })
+        // ── deleted ──
+        {
+            let source = source.clone();
+            let dest = dest.clone();
+            let ts_s = ts_s.clone();
+            tests.push(super::Test {
+                suite: "matrix",
+                group: "run_matrix",
+                id: format!("F.shared.{ts_s}.deleted"),
+                xfail: None,
+                run: Box::new(move |r| {
+                    Box::pin(async move {
+                        let file = format!("/shared/matrix_{ts_s}.txt");
+                        let data = format!("data_{ts_s}");
+                        let _ = r
+                            .send("init", Command::FsDelete { path: file.clone() })
+                            .await;
+                        r.send(
+                            &source,
+                            Command::FsWrite {
+                                path: file.clone(),
+                                data,
+                            },
+                        )
                         .await;
-                    let created_pass =
-                        matches!(&resp, Response::Ok { data: Some(d) } if *d == data);
-
-                    // update
-                    r.send(
-                        &source,
-                        Command::FsWrite {
-                            path: file.clone(),
-                            data: updated.clone(),
-                        },
-                    )
-                    .await;
-                    let resp = r
-                        .send(&dest, Command::FsRead { path: file.clone() })
-                        .await;
-                    let updated_pass =
-                        matches!(&resp, Response::Ok { data: Some(d) } if *d == updated);
-
-                    // delete
-                    r.send(&source, Command::FsDelete { path: file.clone() })
-                        .await;
-                    let resp = r
-                        .send(&dest, Command::FsRead { path: file.clone() })
-                        .await;
-                    let deleted_pass = matches!(resp, Response::NotFound);
-
-                    let pass =
-                        absent_pass && created_pass && updated_pass && deleted_pass;
-                    let detail = format!(
-                        "absent={absent_pass} created={created_pass} updated={updated_pass} deleted={deleted_pass}"
-                    );
-                    super::TestOutcome::new(&dest, pass, detail)
-                })
-            }),
-        });
+                        r.send(&source, Command::FsDelete { path: file.clone() })
+                            .await;
+                        let resp = r.send(&dest, Command::FsRead { path: file }).await;
+                        let pass = matches!(resp, Response::NotFound);
+                        super::TestOutcome::new(&dest, pass, format!("{resp:?}"))
+                    })
+                }),
+            });
+        }
     }
 }
 
-/// Register cross-topology unlink tests: source creates, dest unlinks.
+// ═══════════════════════════════════════════════════════════════════
+// 2. FILESYSTEM CROSS-UNLINK — F.unlink.{topo}.{delete,gone}
+// ═══════════════════════════════════════════════════════════════════
+
 pub(super) fn register_fs_cross_unlink(tests: &mut Vec<super::Test>) {
     let has_nonpie = crate::find_nonpie_binary().is_some();
-
     for &topo in FS_TOPOLOGIES {
         if topo.requires_nonpie() && !has_nonpie {
             continue;
         }
-
-        let ts = topo.suffix().to_string();
         let (source, dest) = topo.agents();
+        let ts = topo.suffix();
         let source = source.to_string();
         let dest = dest.to_string();
+        let ts_s = ts.to_string();
 
-        tests.push(super::Test {
-            suite: "matrix",
-            group: "run_matrix",
-            id: format!("F.unlink.{ts}.crud"),
-            xfail: None,
-            run: Box::new(move |r| {
-                Box::pin(async move {
-                    let file = format!("/shared/unlink_{ts}.txt");
-
-                    // Clean up from prior runs.
-                    let _ = r
-                        .send("init", Command::FsDelete { path: file.clone() })
+        // ── delete ──
+        {
+            let source = source.clone();
+            let dest = dest.clone();
+            let ts_s = ts_s.clone();
+            tests.push(super::Test {
+                suite: "matrix",
+                group: "run_matrix",
+                id: format!("F.unlink.{ts_s}.delete"),
+                xfail: None,
+                run: Box::new(move |r| {
+                    Box::pin(async move {
+                        let file = format!("/shared/unlink_{ts_s}.txt");
+                        let _ = r
+                            .send("init", Command::FsDelete { path: file.clone() })
+                            .await;
+                        r.send(
+                            &source,
+                            Command::FsWrite {
+                                path: file.clone(),
+                                data: "unlink_me".into(),
+                            },
+                        )
                         .await;
+                        let resp = r.send(&dest, Command::FsDelete { path: file }).await;
+                        let pass = matches!(&resp, Response::Ok { .. });
+                        super::TestOutcome::new(&dest, pass, format!("{resp:?}"))
+                    })
+                }),
+            });
+        }
 
-                    // Source creates the file.
-                    r.send(
-                        &source,
-                        Command::FsWrite {
-                            path: file.clone(),
-                            data: "unlink_me".into(),
-                        },
-                    )
-                    .await;
-
-                    // Dest unlinks it.
-                    let resp = r
-                        .send(&dest, Command::FsDelete { path: file.clone() })
+        // ── gone ──
+        {
+            let source = source.clone();
+            let dest = dest.clone();
+            let ts_s = ts_s.clone();
+            tests.push(super::Test {
+                suite: "matrix",
+                group: "run_matrix",
+                id: format!("F.unlink.{ts_s}.gone"),
+                xfail: None,
+                run: Box::new(move |r| {
+                    Box::pin(async move {
+                        let file = format!("/shared/unlink_{ts_s}.txt");
+                        let _ = r
+                            .send("init", Command::FsDelete { path: file.clone() })
+                            .await;
+                        r.send(
+                            &source,
+                            Command::FsWrite {
+                                path: file.clone(),
+                                data: "unlink_me".into(),
+                            },
+                        )
                         .await;
-                    let delete_ok = matches!(&resp, Response::Ok { .. });
-
-                    // Source confirms it's gone.
-                    let resp = r
-                        .send(&source, Command::FsRead { path: file.clone() })
-                        .await;
-                    let gone = matches!(resp, Response::NotFound);
-
-                    let pass = delete_ok && gone;
-                    let detail = format!("delete={delete_ok} gone={gone}");
-                    super::TestOutcome::new(&dest, pass, detail)
-                })
-            }),
-        });
+                        let _ = r
+                            .send(&dest, Command::FsDelete { path: file.clone() })
+                            .await;
+                        let resp = r.send(&source, Command::FsRead { path: file }).await;
+                        let pass = matches!(resp, Response::NotFound);
+                        super::TestOutcome::new(&source, pass, format!("{resp:?}"))
+                    })
+                }),
+            });
+        }
     }
 }
 
-/// Register /tmp isolation tests: writer writes to /tmp, reader checks.
+// ═══════════════════════════════════════════════════════════════════
+// 3. /tmp ISOLATION — F.tmp.{topo}.isolation
+// ═══════════════════════════════════════════════════════════════════
+
 pub(super) fn register_tmp_isolation(tests: &mut Vec<super::Test>) {
     let has_nonpie = crate::find_nonpie_binary().is_some();
-
     for &topo in FS_TOPOLOGIES {
         if topo.requires_nonpie() && !has_nonpie {
             continue;
@@ -1831,20 +1939,19 @@ pub(super) fn register_tmp_isolation(tests: &mut Vec<super::Test>) {
         if writer == reader {
             continue; // skip InProcess
         }
-
-        let ts = topo.suffix().to_string();
+        let ts = topo.suffix();
         let writer = writer.to_string();
         let reader = reader.to_string();
+        let ts_s = ts.to_string();
 
         tests.push(super::Test {
             suite: "matrix",
             group: "run_matrix",
-            id: format!("F.tmp.{ts}.isolation"),
+            id: format!("F.tmp.{ts_s}.isolation"),
             xfail: None,
             run: Box::new(move |r| {
                 Box::pin(async move {
-                    let file = format!("/tmp/matrix_iso_{ts}.txt");
-
+                    let file = format!("/tmp/matrix_iso_{ts_s}.txt");
                     r.send(
                         &writer,
                         Command::FsWrite {
@@ -1853,14 +1960,11 @@ pub(super) fn register_tmp_isolation(tests: &mut Vec<super::Test>) {
                         },
                     )
                     .await;
-                    let resp = r
-                        .send(&reader, Command::FsRead { path: file.clone() })
-                        .await;
+                    let resp = r.send(&reader, Command::FsRead { path: file }).await;
                     let is_isolated = matches!(resp, Response::NotFound);
-                    // Informational — always pass.
                     super::TestOutcome::new(
                         &reader,
-                        true,
+                        true, // informational — always pass
                         format!("isolated={is_isolated}: {resp:?}"),
                     )
                 })
@@ -1869,7 +1973,10 @@ pub(super) fn register_tmp_isolation(tests: &mut Vec<super::Test>) {
     }
 }
 
-/// Register host-written file visibility tests.
+// ═══════════════════════════════════════════════════════════════════
+// 4. HOST FILE — F.host.{agent} + write_for_host
+// ═══════════════════════════════════════════════════════════════════
+
 pub(super) fn register_host_file(tests: &mut Vec<super::Test>) {
     for &agent in &["init", "A", "AA"] {
         let agent = agent.to_string();
@@ -1900,170 +2007,183 @@ pub(super) fn register_host_file(tests: &mut Vec<super::Test>) {
     }
 
     // Write file for host to read after exit.
-    tests.push(super::Test {
-        suite: "matrix",
-        group: "run_matrix",
-        id: "F.host.write_for_host".to_string(),
-        xfail: None,
-        run: Box::new(move |r| {
-            Box::pin(async move {
-                r.send(
-                    "init",
-                    Command::FsWrite {
-                        path: "/shared/for_host.txt".into(),
-                        data: "from_agent".into(),
-                    },
-                )
-                .await;
-                super::TestOutcome::new("init", true, "wrote /shared/for_host.txt")
-            })
-        }),
-    });
 }
 
-/// Register TCP network tests (N.* prefix).
+// ═══════════════════════════════════════════════════════════════════
+// 5. TCP NETWORK — N.{name}.{listen,connect,unlisten}
+// ═══════════════════════════════════════════════════════════════════
+
 pub(super) fn register_net_tests(tests: &mut Vec<super::Test>) {
     let has_nonpie = crate::find_nonpie_binary().is_some();
     let mut port = 10_001u16;
 
     for tc in NET_TESTS {
-        let name = tc.name;
-        let listener = tc.listener;
-        let connector = tc.connector;
         let p = port;
+        port += 1;
 
-        if !has_nonpie && (agent_requires_nonpie(listener) || agent_requires_nonpie(connector)) {
+        if !has_nonpie
+            && (agent_requires_nonpie(tc.listener) || agent_requires_nonpie(tc.connector))
+        {
+            let listener = tc.listener.to_string();
             tests.push(super::Test {
                 suite: "matrix",
                 group: "run_matrix",
-                id: format!("N.{name}.listen"),
+                id: format!("N.{}.listen", tc.name),
                 xfail: None,
                 run: Box::new(move |_r| {
                     Box::pin(async move {
                         super::TestOutcome::new(
-                            listener,
+                            &listener,
                             false,
                             "FAIL: nonpie binary not found — mount at /opt/nonpie",
                         )
                     })
                 }),
             });
-            port += 1;
             continue;
         }
 
-        let listener = listener.to_string();
-        let connector = connector.to_string();
-        let name = name.to_string();
+        let name: &'static str = tc.name;
+        let listener: &'static str = tc.listener;
+        let connector: &'static str = tc.connector;
 
-        tests.push(super::Test {
-            suite: "matrix",
-            group: "run_matrix",
-            id: format!("N.{name}"),
-            xfail: None,
-            run: Box::new(move |r| {
-                Box::pin(async move {
-                    let test_data = format!("net_{name}");
+        // ── listen ──
+        {
+            tests.push(super::Test {
+                suite: "matrix",
+                group: "run_matrix",
+                id: format!("N.{name}.listen"),
+                xfail: None,
+                run: Box::new(move |r| {
+                    Box::pin(async move {
+                        let resp = r.send(listener, Command::NetListen { port: p }).await;
+                        let pass = matches!(resp, Response::Listening { .. });
+                        // Clean up: unlisten so the port is free.
+                        let _ = r.send(listener, Command::NetUnlisten { port: p }).await;
+                        super::TestOutcome::new(listener, pass, format!("{resp:?}"))
+                    })
+                }),
+            });
+        }
 
-                    let resp = r
-                        .send(&listener, Command::NetListen { port: p })
-                        .await;
-                    let listen_ok = matches!(resp, Response::Listening { .. });
-                    if !listen_ok {
-                        return super::TestOutcome::new(
-                            &listener,
-                            false,
-                            format!("listen failed: {resp:?}"),
-                        );
-                    }
+        // ── connect ──
+        {
+            let test_data = format!("net_{name}");
+            tests.push(super::Test {
+                suite: "matrix",
+                group: "run_matrix",
+                id: format!("N.{name}.connect"),
+                xfail: None,
+                run: Box::new(move |r| {
+                    Box::pin(async move {
+                        // Self-contained: listen, connect, unlisten.
+                        let resp = r.send(listener, Command::NetListen { port: p }).await;
+                        if !matches!(resp, Response::Listening { .. }) {
+                            return super::TestOutcome::new(
+                                connector,
+                                false,
+                                format!("listen failed: {resp:?}"),
+                            );
+                        }
+                        let resp = r
+                            .send(
+                                connector,
+                                Command::NetConnect {
+                                    addr: format!("127.0.0.1:{p}"),
+                                    data: test_data.clone(),
+                                },
+                            )
+                            .await;
+                        let pass =
+                            matches!(&resp, Response::Connected { echo } if *echo == test_data);
+                        let _ = r.send(listener, Command::NetUnlisten { port: p }).await;
+                        super::TestOutcome::new(connector, pass, format!("{resp:?}"))
+                    })
+                }),
+            });
+        }
 
-                    let resp = r
-                        .send(
-                            &connector,
-                            Command::NetConnect {
-                                addr: format!("127.0.0.1:{p}"),
-                                data: test_data.clone(),
-                            },
-                        )
-                        .await;
-                    let connect_pass =
-                        matches!(&resp, Response::Connected { echo } if *echo == test_data);
-
-                    let unlisten_resp = r
-                        .send(&listener, Command::NetUnlisten { port: p })
-                        .await;
-                    let unlisten_ok = matches!(unlisten_resp, Response::Ok { .. });
-
-                    let pass = listen_ok && connect_pass && unlisten_ok;
-                    let detail = format!(
-                        "listen={listen_ok} connect={connect_pass} unlisten={unlisten_ok} last={resp:?}"
-                    );
-                    super::TestOutcome::new(&connector, pass, detail)
-                })
-            }),
-        });
-
-        port += 1;
+        // ── unlisten ──
+        {
+            tests.push(super::Test {
+                suite: "matrix",
+                group: "run_matrix",
+                id: format!("N.{name}.unlisten"),
+                xfail: None,
+                run: Box::new(move |r| {
+                    Box::pin(async move {
+                        // Self-contained: listen then unlisten.
+                        let _ = r.send(listener, Command::NetListen { port: p }).await;
+                        let resp = r.send(listener, Command::NetUnlisten { port: p }).await;
+                        let pass = matches!(resp, Response::Ok { .. });
+                        super::TestOutcome::new(listener, pass, format!("{resp:?}"))
+                    })
+                }),
+            });
+        }
     }
 }
 
-/// Register network address matrix tests (NA.* prefix).
+// ═══════════════════════════════════════════════════════════════════
+// 6. NETWORK ADDRESS MATRIX — NA.{a}_to_{b}.{addr}
+// ═══════════════════════════════════════════════════════════════════
+
 pub(super) fn register_net_addr_tests(tests: &mut Vec<super::Test>) {
     let has_nonpie = crate::find_nonpie_binary().is_some();
     let mut port = 11_001u16;
 
-    // Build address list at registration time (self_ip discovered at run time).
+    // We register tests for the two portable addresses; the self_ip
+    // address is discovered at runtime and added dynamically.
+    // To keep test IDs stable, the self_ip test uses "self_ip" as label.
+
     for &(agent_a, agent_b) in NET_ADDR_PAIRS {
+        // Static addresses: 127.0.0.1, 0.0.0.0
         for &addr in CONNECT_ADDRS {
-            let label = addr.to_string();
+            let p = port;
+            port += 1;
 
             if !has_nonpie && (agent_requires_nonpie(agent_a) || agent_requires_nonpie(agent_b)) {
+                let agent_b_s = agent_b.to_string();
+                let id = format!("NA.{agent_a}_to_{agent_b}.{addr}");
                 tests.push(super::Test {
                     suite: "matrix",
                     group: "run_matrix",
-                    id: format!("NA.{agent_a}_to_{agent_b}.{label}"),
+                    id,
                     xfail: None,
                     run: Box::new(move |_r| {
                         Box::pin(async move {
                             super::TestOutcome::new(
-                                agent_b,
+                                &agent_b_s,
                                 false,
                                 "FAIL: nonpie binary not found — mount at /opt/nonpie",
                             )
                         })
                     }),
                 });
-                port += 1;
                 continue;
             }
 
-            let agent_a = agent_a.to_string();
-            let agent_b = agent_b.to_string();
-            let addr = addr.to_string();
-            let p = port;
+            let test_id = format!("NA.{agent_a}_to_{agent_b}.{addr}");
+            let test_data = format!("na_{agent_a}_{agent_b}_{addr}");
 
             tests.push(super::Test {
                 suite: "matrix",
                 group: "run_matrix",
-                id: format!("NA.{agent_a}_to_{agent_b}.{label}"),
+                id: test_id,
                 xfail: None,
                 run: Box::new(move |r| {
                     Box::pin(async move {
-                        let test_data = format!("na_{agent_a}_{agent_b}_{addr}");
-
-                        let resp = r.send(&agent_a, Command::NetListen { port: p }).await;
-                        let listen_ok = matches!(resp, Response::Listening { .. });
-                        if !listen_ok {
+                        let resp = r.send(agent_a, Command::NetListen { port: p }).await;
+                        if !matches!(resp, Response::Listening { .. }) {
                             return super::TestOutcome::new(
-                                &agent_b,
+                                agent_b,
                                 false,
                                 format!("listen failed: {resp:?}"),
                             );
                         }
-
                         let resp = r
                             .send(
-                                &agent_b,
+                                agent_b,
                                 Command::NetConnect {
                                     addr: format!("{addr}:{p}"),
                                     data: test_data.clone(),
@@ -2072,27 +2192,40 @@ pub(super) fn register_net_addr_tests(tests: &mut Vec<super::Test>) {
                             .await;
                         let pass =
                             matches!(&resp, Response::Connected { echo } if *echo == test_data);
-
-                        let _ = r.send(&agent_a, Command::NetUnlisten { port: p }).await;
-
-                        super::TestOutcome::new(&agent_b, pass, format!("{resp:?}"))
+                        let _ = r.send(agent_a, Command::NetUnlisten { port: p }).await;
+                        super::TestOutcome::new(agent_b, pass, format!("{resp:?}"))
                     })
                 }),
             });
-
-            port += 1;
         }
 
-        // Also register a self_ip variant discovered at runtime.
-        if !has_nonpie && (agent_requires_nonpie(agent_a) || agent_requires_nonpie(agent_b)) {
-            port += 1;
-            continue;
-        }
+        // self_ip address (discovered at runtime via `hostname -I`)
         {
-            let agent_a = agent_a.to_string();
-            let agent_b = agent_b.to_string();
             let p = port;
+            port += 1;
 
+            if !has_nonpie && (agent_requires_nonpie(agent_a) || agent_requires_nonpie(agent_b)) {
+                let agent_b_s = agent_b.to_string();
+                let id = format!("NA.{agent_a}_to_{agent_b}.self_ip");
+                tests.push(super::Test {
+                    suite: "matrix",
+                    group: "run_matrix",
+                    id,
+                    xfail: None,
+                    run: Box::new(move |_r| {
+                        Box::pin(async move {
+                            super::TestOutcome::new(
+                                &agent_b_s,
+                                false,
+                                "FAIL: nonpie binary not found — mount at /opt/nonpie",
+                            )
+                        })
+                    }),
+                });
+                continue;
+            }
+
+            let test_data = format!("na_{agent_a}_{agent_b}_self_ip");
             tests.push(super::Test {
                 suite: "matrix",
                 group: "run_matrix",
@@ -2100,7 +2233,7 @@ pub(super) fn register_net_addr_tests(tests: &mut Vec<super::Test>) {
                 xfail: None,
                 run: Box::new(move |r| {
                     Box::pin(async move {
-                        // Discover the host's non-loopback IP dynamically.
+                        // Discover self IP at test time.
                         let self_ip = tokio::process::Command::new("hostname")
                             .arg("-I")
                             .output()
@@ -2112,33 +2245,24 @@ pub(super) fn register_net_addr_tests(tests: &mut Vec<super::Test>) {
                                     .find(|ip| *ip != "127.0.0.1" && !ip.contains(':'))
                                     .map(String::from)
                             });
-
-                        let addr = match self_ip {
-                            Some(ip) => ip,
-                            None => {
-                                return super::TestOutcome::new(
-                                    &agent_b,
-                                    true,
-                                    "skipped: no self-IP discovered",
-                                );
-                            }
-                        };
-
-                        let test_data = format!("na_{agent_a}_{agent_b}_self_ip");
-
-                        let resp = r.send(&agent_a, Command::NetListen { port: p }).await;
-                        let listen_ok = matches!(resp, Response::Listening { .. });
-                        if !listen_ok {
+                        let Some(addr) = self_ip else {
                             return super::TestOutcome::new(
-                                &agent_b,
+                                agent_b,
+                                true, // skip — no self IP
+                                "self_ip not discoverable, skipping",
+                            );
+                        };
+                        let resp = r.send(agent_a, Command::NetListen { port: p }).await;
+                        if !matches!(resp, Response::Listening { .. }) {
+                            return super::TestOutcome::new(
+                                agent_b,
                                 false,
                                 format!("listen failed: {resp:?}"),
                             );
                         }
-
                         let resp = r
                             .send(
-                                &agent_b,
+                                agent_b,
                                 Command::NetConnect {
                                     addr: format!("{addr}:{p}"),
                                     data: test_data.clone(),
@@ -2147,28 +2271,29 @@ pub(super) fn register_net_addr_tests(tests: &mut Vec<super::Test>) {
                             .await;
                         let pass =
                             matches!(&resp, Response::Connected { echo } if *echo == test_data);
-
-                        let _ = r.send(&agent_a, Command::NetUnlisten { port: p }).await;
-
-                        super::TestOutcome::new(&agent_b, pass, format!("{resp:?}"))
+                        let _ = r.send(agent_a, Command::NetUnlisten { port: p }).await;
+                        super::TestOutcome::new(agent_b, pass, format!("{resp:?}"))
                     })
                 }),
             });
-
-            port += 1;
         }
     }
 }
 
-/// Register Unix address matrix tests (UA.* prefix).
+// ═══════════════════════════════════════════════════════════════════
+// 7. UNIX ADDRESS MATRIX — UA.{a}_to_{b}
+// ═══════════════════════════════════════════════════════════════════
+
 pub(super) fn register_unix_addr_tests(tests: &mut Vec<super::Test>) {
     let has_nonpie = crate::find_nonpie_binary().is_some();
     let mut idx = 0u32;
 
     for &(agent_a, agent_b) in NET_ADDR_PAIRS {
         let i = idx;
+        idx += 1;
 
         if !has_nonpie && (agent_requires_nonpie(agent_a) || agent_requires_nonpie(agent_b)) {
+            let agent_b_s = agent_b.to_string();
             tests.push(super::Test {
                 suite: "matrix",
                 group: "run_matrix",
@@ -2177,20 +2302,17 @@ pub(super) fn register_unix_addr_tests(tests: &mut Vec<super::Test>) {
                 run: Box::new(move |_r| {
                     Box::pin(async move {
                         super::TestOutcome::new(
-                            agent_b,
+                            &agent_b_s,
                             false,
                             "FAIL: nonpie binary not found — mount at /opt/nonpie",
                         )
                     })
                 }),
             });
-            idx += 1;
             continue;
         }
 
-        let agent_a = agent_a.to_string();
-        let agent_b = agent_b.to_string();
-
+        let test_data = format!("ua_{agent_a}_{agent_b}");
         tests.push(super::Test {
             suite: "matrix",
             group: "run_matrix",
@@ -2199,28 +2321,24 @@ pub(super) fn register_unix_addr_tests(tests: &mut Vec<super::Test>) {
             run: Box::new(move |r| {
                 Box::pin(async move {
                     let sock_path = format!("/tmp/ua-{i}.sock");
-                    let test_data = format!("ua_{agent_a}_{agent_b}");
-
                     let resp = r
                         .send(
-                            &agent_a,
+                            agent_a,
                             Command::UnixListen {
                                 path: sock_path.clone(),
                             },
                         )
                         .await;
-                    let listen_ok = matches!(&resp, Response::UnixListening { .. });
-                    if !listen_ok {
+                    if !matches!(&resp, Response::UnixListening { .. }) {
                         return super::TestOutcome::new(
-                            &agent_b,
+                            agent_b,
                             false,
                             format!("listen failed: {resp:?}"),
                         );
                     }
-
                     let resp = r
                         .send(
-                            &agent_b,
+                            agent_b,
                             Command::UnixConnect {
                                 path: sock_path.clone(),
                                 data: test_data.clone(),
@@ -2228,27 +2346,26 @@ pub(super) fn register_unix_addr_tests(tests: &mut Vec<super::Test>) {
                         )
                         .await;
                     let pass = matches!(&resp, Response::Connected { echo } if *echo == test_data);
-
                     let _ = r
-                        .send(&agent_a, Command::UnixUnlisten { path: sock_path })
+                        .send(agent_a, Command::UnixUnlisten { path: sock_path })
                         .await;
-
-                    super::TestOutcome::new(&agent_b, pass, format!("{resp:?}"))
+                    super::TestOutcome::new(agent_b, pass, format!("{resp:?}"))
                 })
             }),
         });
-
-        idx += 1;
     }
 }
 
-/// Register exec tests (X.* prefix).
+// ═══════════════════════════════════════════════════════════════════
+// 8. EXEC — X.echo.{agent}, X.exit_code.{agent}.{code}
+// ═══════════════════════════════════════════════════════════════════
+
 pub(super) fn register_exec_tests(tests: &mut Vec<super::Test>) {
     let has_nonpie = crate::find_nonpie_binary().is_some();
 
-    // Echo tests per agent.
     for &agent in EXEC_AGENTS {
         if !has_nonpie && agent_requires_nonpie(agent) {
+            let agent_s = agent.to_string();
             tests.push(super::Test {
                 suite: "matrix",
                 group: "run_matrix",
@@ -2257,7 +2374,7 @@ pub(super) fn register_exec_tests(tests: &mut Vec<super::Test>) {
                 run: Box::new(move |_r| {
                     Box::pin(async move {
                         super::TestOutcome::new(
-                            agent,
+                            &agent_s,
                             false,
                             "FAIL: nonpie binary not found — mount at /opt/nonpie",
                         )
@@ -2273,42 +2390,41 @@ pub(super) fn register_exec_tests(tests: &mut Vec<super::Test>) {
             id: format!("X.echo.{agent}"),
             xfail: None,
             run: Box::new(move |r| {
-                let self_exe = r.self_exe.clone();
                 Box::pin(async move {
+                    let self_exe = r.self_exe.clone();
                     let resp = r
-                        .send(
-                            agent,
-                            super::exec(vec![self_exe, "echo-test".into()]),
-                        )
+                        .send(agent, super::exec(vec![self_exe, "echo-test".into()]))
                         .await;
-                    let pass = matches!(&resp, Response::ExecResult { stdout, .. } if stdout.contains("ECHO_TEST_OK"));
+                    let pass = matches!(
+                        &resp,
+                        Response::ExecResult { stdout, .. } if stdout.contains("ECHO_TEST_OK")
+                    );
                     super::TestOutcome::new(agent, pass, format!("{resp:?}"))
                 })
             }),
         });
     }
 
-    // Exit code propagation tests.
-    for &(agent, code) in &[("A", 42), ("AAA", 7)] {
+    // Exit code propagation.
+    for &(agent, code) in &[("A", 42i32), ("AAA", 7i32)] {
         tests.push(super::Test {
             suite: "matrix",
             group: "run_matrix",
             id: format!("X.exit_code.{agent}.{code}"),
             xfail: None,
             run: Box::new(move |r| {
-                let self_exe = r.self_exe.clone();
                 Box::pin(async move {
+                    let self_exe = r.self_exe.clone();
                     let resp = r
                         .send(
                             agent,
-                            super::exec(vec![
-                                self_exe,
-                                "exit-with".into(),
-                                code.to_string(),
-                            ]),
+                            super::exec(vec![self_exe, "exit-with".into(), code.to_string()]),
                         )
                         .await;
-                    let pass = matches!(&resp, Response::ExecResult { exit_code, .. } if *exit_code == code);
+                    let pass = matches!(
+                        &resp,
+                        Response::ExecResult { exit_code, .. } if *exit_code == code
+                    );
                     super::TestOutcome::new(agent, pass, format!("{resp:?}"))
                 })
             }),
@@ -2316,12 +2432,16 @@ pub(super) fn register_exec_tests(tests: &mut Vec<super::Test>) {
     }
 }
 
-/// Register env tests (E.* prefix).
+// ═══════════════════════════════════════════════════════════════════
+// 9. ENV — E.HOME.{agent}, E.PATH.{agent}, E.CWD.{agent}
+// ═══════════════════════════════════════════════════════════════════
+
 pub(super) fn register_env_tests(tests: &mut Vec<super::Test>) {
     let has_nonpie = crate::find_nonpie_binary().is_some();
 
     for &agent in EXEC_AGENTS {
         if !has_nonpie && agent_requires_nonpie(agent) {
+            let agent_s = agent.to_string();
             tests.push(super::Test {
                 suite: "matrix",
                 group: "run_matrix",
@@ -2330,7 +2450,7 @@ pub(super) fn register_env_tests(tests: &mut Vec<super::Test>) {
                 run: Box::new(move |_r| {
                     Box::pin(async move {
                         super::TestOutcome::new(
-                            agent,
+                            &agent_s,
                             false,
                             "FAIL: nonpie binary not found — mount at /opt/nonpie",
                         )
@@ -2340,114 +2460,144 @@ pub(super) fn register_env_tests(tests: &mut Vec<super::Test>) {
             continue;
         }
 
-        // HOME
-        tests.push(super::Test {
-            suite: "matrix",
-            group: "run_matrix",
-            id: format!("E.HOME.{agent}"),
-            xfail: None,
-            run: Box::new(move |r| {
-                Box::pin(async move {
-                    let resp = r
-                        .send(agent, Command::EnvGet { var: "HOME".into() })
-                        .await;
-                    let pass = matches!(&resp, Response::Ok { data: Some(d) } if !d.is_empty() && d != "NOT_SET");
-                    super::TestOutcome::new(agent, pass, format!("{resp:?}"))
-                })
-            }),
-        });
+        // E.HOME
+        {
+            tests.push(super::Test {
+                suite: "matrix",
+                group: "run_matrix",
+                id: format!("E.HOME.{agent}"),
+                xfail: None,
+                run: Box::new(move |r| {
+                    Box::pin(async move {
+                        let resp = r.send(agent, Command::EnvGet { var: "HOME".into() }).await;
+                        let pass = matches!(
+                            &resp,
+                            Response::Ok { data: Some(d) } if !d.is_empty() && d != "NOT_SET"
+                        );
+                        super::TestOutcome::new(agent, pass, format!("{resp:?}"))
+                    })
+                }),
+            });
+        }
 
-        // PATH
-        tests.push(super::Test {
-            suite: "matrix",
-            group: "run_matrix",
-            id: format!("E.PATH.{agent}"),
-            xfail: None,
-            run: Box::new(move |r| {
-                Box::pin(async move {
-                    let resp = r
-                        .send(agent, Command::EnvGet { var: "PATH".into() })
-                        .await;
-                    let pass = matches!(&resp, Response::Ok { data: Some(d) } if !d.is_empty() && d != "NOT_SET");
-                    super::TestOutcome::new(agent, pass, format!("{resp:?}"))
-                })
-            }),
-        });
+        // E.PATH
+        {
+            tests.push(super::Test {
+                suite: "matrix",
+                group: "run_matrix",
+                id: format!("E.PATH.{agent}"),
+                xfail: None,
+                run: Box::new(move |r| {
+                    Box::pin(async move {
+                        let resp = r.send(agent, Command::EnvGet { var: "PATH".into() }).await;
+                        let pass = matches!(
+                            &resp,
+                            Response::Ok { data: Some(d) } if !d.is_empty() && d != "NOT_SET"
+                        );
+                        super::TestOutcome::new(agent, pass, format!("{resp:?}"))
+                    })
+                }),
+            });
+        }
 
-        // CWD
-        tests.push(super::Test {
-            suite: "matrix",
-            group: "run_matrix",
-            id: format!("E.CWD.{agent}"),
-            xfail: None,
-            run: Box::new(move |r| {
-                Box::pin(async move {
-                    let resp = r.send(agent, Command::CwdGet).await;
-                    let pass = matches!(&resp, Response::Ok { data: Some(_) });
-                    super::TestOutcome::new(agent, pass, format!("{resp:?}"))
-                })
-            }),
-        });
+        // E.CWD
+        {
+            tests.push(super::Test {
+                suite: "matrix",
+                group: "run_matrix",
+                id: format!("E.CWD.{agent}"),
+                xfail: None,
+                run: Box::new(move |r| {
+                    Box::pin(async move {
+                        let resp = r.send(agent, Command::CwdGet).await;
+                        let pass = matches!(&resp, Response::Ok { data: Some(_) });
+                        super::TestOutcome::new(agent, pass, format!("{resp:?}"))
+                    })
+                }),
+            });
+        }
     }
 }
 
-/// Register symlink basic tests (S.basic.* prefix) — one per topology.
+// ═══════════════════════════════════════════════════════════════════
+// 10. SYMLINK BASIC — S.basic.{topo}.{create,readlink,read_through,stat_type}
+// ═══════════════════════════════════════════════════════════════════
+
 pub(super) fn register_symlink_basic(tests: &mut Vec<super::Test>) {
     for &topo in SYMLINK_TOPOLOGIES {
-        let ts = topo.suffix().to_string();
         let (source, dest) = topo.agents();
+        let ts = topo.suffix();
         let source = source.to_string();
         let dest = dest.to_string();
+        let ts_s = ts.to_string();
 
-        tests.push(super::Test {
-            suite: "matrix",
-            group: "run_matrix",
-            id: format!("S.basic.{ts}"),
-            xfail: None,
-            run: Box::new(move |r| {
-                Box::pin(async move {
-                    // Probe symlink support.
-                    let probe = r
-                        .send(
-                            "A",
-                            Command::FsSymlink {
-                                target: "/tmp/matrix_probe_target".into(),
-                                link: "/tmp/matrix_probe_link".into(),
+        // S.basic.{ts}.create
+        {
+            let source = source.clone();
+            let ts_s = ts_s.clone();
+            tests.push(super::Test {
+                suite: "matrix",
+                group: "run_matrix",
+                id: format!("S.basic.{ts_s}.create"),
+                xfail: None, // xfail probed at runtime
+                run: Box::new(move |r| {
+                    Box::pin(async move {
+                        let file = format!("/shared/sm_{ts_s}_file");
+                        let link = format!("/shared/sm_{ts_s}_link");
+                        let data = format!("symdata_{ts_s}");
+                        let _ = r
+                            .send("init", Command::FsDelete { path: link.clone() })
+                            .await;
+                        let _ = r
+                            .send("init", Command::FsDelete { path: file.clone() })
+                            .await;
+                        r.send(
+                            &source,
+                            Command::FsWrite {
+                                path: file.clone(),
+                                data,
                             },
                         )
                         .await;
-                    let symlink_unsupported = matches!(&probe, Response::Error { error } if error.contains("not supported"));
-                    let _ = r
-                        .send(
-                            "A",
-                            Command::FsDelete {
-                                path: "/tmp/matrix_probe_link".into(),
+                        let resp = r
+                            .send(&source, Command::FsSymlink { target: file, link })
+                            .await;
+                        let pass = matches!(&resp, Response::Ok { .. });
+                        super::TestOutcome::new(&source, pass, format!("{resp:?}"))
+                    })
+                }),
+            });
+        }
+
+        // S.basic.{ts}.readlink
+        {
+            let source = source.clone();
+            let ts_s = ts_s.clone();
+            tests.push(super::Test {
+                suite: "matrix",
+                group: "run_matrix",
+                id: format!("S.basic.{ts_s}.readlink"),
+                xfail: None,
+                run: Box::new(move |r| {
+                    Box::pin(async move {
+                        let file = format!("/shared/sm_{ts_s}_file");
+                        let link = format!("/shared/sm_{ts_s}_link");
+                        let data = format!("symdata_{ts_s}");
+                        let _ = r
+                            .send("init", Command::FsDelete { path: link.clone() })
+                            .await;
+                        let _ = r
+                            .send("init", Command::FsDelete { path: file.clone() })
+                            .await;
+                        r.send(
+                            &source,
+                            Command::FsWrite {
+                                path: file.clone(),
+                                data,
                             },
                         )
                         .await;
-
-                    let file = format!("/shared/sm_{ts}_file");
-                    let link = format!("/shared/sm_{ts}_link");
-                    let data = format!("symdata_{ts}");
-
-                    let _ = r
-                        .send("init", Command::FsDelete { path: link.clone() })
-                        .await;
-                    let _ = r
-                        .send("init", Command::FsDelete { path: file.clone() })
-                        .await;
-
-                    r.send(
-                        &source,
-                        Command::FsWrite {
-                            path: file.clone(),
-                            data: data.clone(),
-                        },
-                    )
-                    .await;
-
-                    let resp = r
-                        .send(
+                        r.send(
                             &source,
                             Command::FsSymlink {
                                 target: file.clone(),
@@ -2455,295 +2605,376 @@ pub(super) fn register_symlink_basic(tests: &mut Vec<super::Test>) {
                             },
                         )
                         .await;
-                    let create_pass = matches!(&resp, Response::Ok { .. });
-
-                    let resp = r
-                        .send(&source, Command::FsReadlink { path: link.clone() })
-                        .await;
-                    let readlink_pass =
-                        matches!(&resp, Response::Ok { data: Some(d) } if *d == file);
-
-                    let resp = r
-                        .send(&dest, Command::FsRead { path: link.clone() })
-                        .await;
-                    let read_through_pass =
-                        matches!(&resp, Response::Ok { data: Some(d) } if *d == data);
-
-                    let resp = r
-                        .send(&dest, Command::FsStat { path: link.clone() })
-                        .await;
-                    let stat_pass =
-                        matches!(&resp, Response::Ok { data: Some(d) } if d == "symlink");
-
-                    let pass = if symlink_unsupported {
-                        // xfail: all sub-checks expected to fail
-                        true
-                    } else {
-                        create_pass && readlink_pass && read_through_pass && stat_pass
-                    };
-                    let detail = format!(
-                        "unsupported={symlink_unsupported} create={create_pass} readlink={readlink_pass} read_through={read_through_pass} stat={stat_pass}"
-                    );
-                    super::TestOutcome::new(&dest, pass, detail)
-                })
-            }),
-        });
-    }
-}
-
-/// Register symlink variant tests (S.dir/dangling/nested/relative).
-pub(super) fn register_symlink_variants(tests: &mut Vec<super::Test>) {
-    for &variant in SYMLINK_VARIANTS {
-        if matches!(variant, SymlinkVariant::Basic) {
-            continue; // handled by register_symlink_basic
+                        let resp = r.send(&source, Command::FsReadlink { path: link }).await;
+                        let pass = matches!(&resp, Response::Ok { data: Some(d) } if *d == file);
+                        super::TestOutcome::new(&source, pass, format!("{resp:?}"))
+                    })
+                }),
+            });
         }
 
-        let vs = variant.suffix().to_string();
-
-        tests.push(super::Test {
-            suite: "matrix",
-            group: "run_matrix",
-            id: format!("S.{vs}"),
-            xfail: None,
-            run: Box::new(move |r| {
-                let self_exe = r.self_exe.clone();
-                Box::pin(async move {
-                    // Probe symlink support.
-                    let probe = r
-                        .send(
-                            "A",
+        // S.basic.{ts}.read_through
+        {
+            let source = source.clone();
+            let dest = dest.clone();
+            let ts_s = ts_s.clone();
+            tests.push(super::Test {
+                suite: "matrix",
+                group: "run_matrix",
+                id: format!("S.basic.{ts_s}.read_through"),
+                xfail: None,
+                run: Box::new(move |r| {
+                    Box::pin(async move {
+                        let file = format!("/shared/sm_{ts_s}_file");
+                        let link = format!("/shared/sm_{ts_s}_link");
+                        let data = format!("symdata_{ts_s}");
+                        let _ = r
+                            .send("init", Command::FsDelete { path: link.clone() })
+                            .await;
+                        let _ = r
+                            .send("init", Command::FsDelete { path: file.clone() })
+                            .await;
+                        r.send(
+                            &source,
+                            Command::FsWrite {
+                                path: file.clone(),
+                                data: data.clone(),
+                            },
+                        )
+                        .await;
+                        r.send(
+                            &source,
                             Command::FsSymlink {
-                                target: "/tmp/matrix_probe_target".into(),
-                                link: "/tmp/matrix_probe_link".into(),
+                                target: file,
+                                link: link.clone(),
                             },
                         )
                         .await;
-                    let symlink_unsupported = matches!(&probe, Response::Error { error } if error.contains("not supported"));
-                    let _ = r
-                        .send(
-                            "A",
-                            Command::FsDelete {
-                                path: "/tmp/matrix_probe_link".into(),
+                        let resp = r.send(&dest, Command::FsRead { path: link }).await;
+                        let pass = matches!(&resp, Response::Ok { data: Some(d) } if *d == data);
+                        super::TestOutcome::new(&dest, pass, format!("{resp:?}"))
+                    })
+                }),
+            });
+        }
+
+        // S.basic.{ts}.stat_type
+        {
+            let source = source.clone();
+            let dest = dest.clone();
+            let ts_s = ts_s.clone();
+            tests.push(super::Test {
+                suite: "matrix",
+                group: "run_matrix",
+                id: format!("S.basic.{ts_s}.stat_type"),
+                xfail: None,
+                run: Box::new(move |r| {
+                    Box::pin(async move {
+                        let file = format!("/shared/sm_{ts_s}_file");
+                        let link = format!("/shared/sm_{ts_s}_link");
+                        let data = format!("symdata_{ts_s}");
+                        let _ = r
+                            .send("init", Command::FsDelete { path: link.clone() })
+                            .await;
+                        let _ = r
+                            .send("init", Command::FsDelete { path: file.clone() })
+                            .await;
+                        r.send(
+                            &source,
+                            Command::FsWrite {
+                                path: file.clone(),
+                                data,
                             },
                         )
                         .await;
-
-                    let agent = "A";
-
-                    match vs.as_str() {
-                        "dir" => {
-                            let _ = r
-                                .send(
-                                    agent,
-                                    super::exec(vec![
-                                        "rm".into(),
-                                        "-rf".into(),
-                                        "/shared/sv_dir".into(),
-                                        "/shared/sv_dirlink".into(),
-                                    ]),
-                                )
-                                .await;
-                            let _ = r
-                                .send(
-                                    agent,
-                                    super::exec(vec![
-                                        "bash".into(),
-                                        "-c".into(),
-                                        "mkdir -p /shared/sv_dir && echo DIR_CONTENT > /shared/sv_dir/inside.txt"
-                                            .into(),
-                                    ]),
-                                )
-                                .await;
-                            r.send(
-                                agent,
-                                Command::FsSymlink {
-                                    target: "/shared/sv_dir".into(),
-                                    link: "/shared/sv_dirlink".into(),
-                                },
-                            )
-                            .await;
-                            let resp = r
-                                .send(
-                                    agent,
-                                    Command::FsRead {
-                                        path: "/shared/sv_dirlink/inside.txt".into(),
-                                    },
-                                )
-                                .await;
-                            let pass = matches!(&resp, Response::Ok { data: Some(d) } if d.trim() == "DIR_CONTENT");
-                            let pass = if symlink_unsupported { true } else { pass };
-                            super::TestOutcome::new(agent, pass, format!("{resp:?}"))
-                        }
-
-                        "dangling" => {
-                            let _ = r
-                                .send(
-                                    "init",
-                                    Command::FsDelete {
-                                        path: "/shared/sv_dangling".into(),
-                                    },
-                                )
-                                .await;
-                            r.send(
-                                agent,
-                                Command::FsSymlink {
-                                    target: "/shared/nonexistent_target".into(),
-                                    link: "/shared/sv_dangling".into(),
-                                },
-                            )
-                            .await;
-                            let resp = r
-                                .send(
-                                    agent,
-                                    Command::FsReadlink {
-                                        path: "/shared/sv_dangling".into(),
-                                    },
-                                )
-                                .await;
-                            let readlink_pass = matches!(&resp, Response::Ok { data: Some(d) } if d == "/shared/nonexistent_target");
-
-                            let resp = r
-                                .send(
-                                    agent,
-                                    Command::FsRead {
-                                        path: "/shared/sv_dangling".into(),
-                                    },
-                                )
-                                .await;
-                            let read_fails =
-                                matches!(&resp, Response::Error { .. } | Response::NotFound);
-
-                            let pass = if symlink_unsupported {
-                                read_fails // read_fails always passes regardless
-                            } else {
-                                readlink_pass && read_fails
-                            };
-                            super::TestOutcome::new(
-                                agent,
-                                pass,
-                                format!("readlink={readlink_pass} read_fails={read_fails}"),
-                            )
-                        }
-
-                        "nested" => {
-                            for name in ["sv_nested_link1", "sv_nested_link2", "sv_nested_file"] {
-                                let _ = r
-                                    .send(
-                                        "init",
-                                        Command::FsDelete {
-                                            path: format!("/shared/{name}"),
-                                        },
-                                    )
-                                    .await;
-                            }
-                            r.send(
-                                agent,
-                                Command::FsWrite {
-                                    path: "/shared/sv_nested_file".into(),
-                                    data: "NESTED_DATA".into(),
-                                },
-                            )
-                            .await;
-                            r.send(
-                                agent,
-                                Command::FsSymlink {
-                                    target: "/shared/sv_nested_file".into(),
-                                    link: "/shared/sv_nested_link2".into(),
-                                },
-                            )
-                            .await;
-                            r.send(
-                                agent,
-                                Command::FsSymlink {
-                                    target: "/shared/sv_nested_link2".into(),
-                                    link: "/shared/sv_nested_link1".into(),
-                                },
-                            )
-                            .await;
-                            let resp = r
-                                .send(
-                                    agent,
-                                    Command::FsRead {
-                                        path: "/shared/sv_nested_link1".into(),
-                                    },
-                                )
-                                .await;
-                            let pass = matches!(&resp, Response::Ok { data: Some(d) } if d == "NESTED_DATA");
-                            let pass = if symlink_unsupported { true } else { pass };
-                            super::TestOutcome::new(agent, pass, format!("{resp:?}"))
-                        }
-
-                        "relative" => {
-                            for name in ["sv_rel_file", "sv_rel_link"] {
-                                let _ = r
-                                    .send(
-                                        "init",
-                                        Command::FsDelete {
-                                            path: format!("/shared/{name}"),
-                                        },
-                                    )
-                                    .await;
-                            }
-                            r.send(
-                                agent,
-                                Command::FsWrite {
-                                    path: "/shared/sv_rel_file".into(),
-                                    data: "REL_DATA".into(),
-                                },
-                            )
-                            .await;
-                            r.send(
-                                agent,
-                                Command::FsSymlink {
-                                    target: "sv_rel_file".into(),
-                                    link: "/shared/sv_rel_link".into(),
-                                },
-                            )
-                            .await;
-                            let resp = r
-                                .send(
-                                    agent,
-                                    Command::FsRead {
-                                        path: "/shared/sv_rel_link".into(),
-                                    },
-                                )
-                                .await;
-                            let pass = matches!(&resp, Response::Ok { data: Some(d) } if d == "REL_DATA");
-                            let pass = if symlink_unsupported { true } else { pass };
-                            super::TestOutcome::new(agent, pass, format!("{resp:?}"))
-                        }
-
-                        _ => super::TestOutcome::new("A", true, "unknown variant"),
-                    }
-                })
-            }),
-        });
+                        r.send(
+                            &source,
+                            Command::FsSymlink {
+                                target: file,
+                                link: link.clone(),
+                            },
+                        )
+                        .await;
+                        let resp = r.send(&dest, Command::FsStat { path: link }).await;
+                        let pass =
+                            matches!(&resp, Response::Ok { data: Some(d) } if d == "symlink");
+                        super::TestOutcome::new(&dest, pass, format!("{resp:?}"))
+                    })
+                }),
+            });
+        }
     }
 }
 
-/// Register Unix socket pattern tests (U.* prefix).
+// ═══════════════════════════════════════════════════════════════════
+// 11. SYMLINK VARIANTS — S.{dir,dangling,nested,relative}.*
+// ═══════════════════════════════════════════════════════════════════
+
+pub(super) fn register_symlink_variants(tests: &mut Vec<super::Test>) {
+    // S.dir.read_through
+    tests.push(super::Test {
+        suite: "matrix",
+        group: "run_matrix",
+        id: "S.dir.read_through".to_string(),
+        xfail: None,
+        run: Box::new(move |r| {
+            Box::pin(async move {
+                let agent = "A";
+                let _ = r
+                    .send(
+                        agent,
+                        super::exec(vec![
+                            "rm".into(),
+                            "-rf".into(),
+                            "/shared/sv_dir".into(),
+                            "/shared/sv_dirlink".into(),
+                        ]),
+                    )
+                    .await;
+                let _ = r
+                    .send(
+                        agent,
+                        super::exec(vec![
+                            "bash".into(),
+                            "-c".into(),
+                            "mkdir -p /shared/sv_dir && echo DIR_CONTENT > /shared/sv_dir/inside.txt"
+                                .into(),
+                        ]),
+                    )
+                    .await;
+                r.send(
+                    agent,
+                    Command::FsSymlink {
+                        target: "/shared/sv_dir".into(),
+                        link: "/shared/sv_dirlink".into(),
+                    },
+                )
+                .await;
+                let resp = r
+                    .send(
+                        agent,
+                        Command::FsRead {
+                            path: "/shared/sv_dirlink/inside.txt".into(),
+                        },
+                    )
+                    .await;
+                let pass =
+                    matches!(&resp, Response::Ok { data: Some(d) } if d.trim() == "DIR_CONTENT");
+                super::TestOutcome::new(agent, pass, format!("{resp:?}"))
+            })
+        }),
+    });
+
+    // S.dangling.readlink
+    tests.push(super::Test {
+        suite: "matrix",
+        group: "run_matrix",
+        id: "S.dangling.readlink".to_string(),
+        xfail: None,
+        run: Box::new(move |r| {
+            Box::pin(async move {
+                let agent = "A";
+                let _ = r
+                    .send(
+                        "init",
+                        Command::FsDelete {
+                            path: "/shared/sv_dangling".into(),
+                        },
+                    )
+                    .await;
+                r.send(
+                    agent,
+                    Command::FsSymlink {
+                        target: "/shared/nonexistent_target".into(),
+                        link: "/shared/sv_dangling".into(),
+                    },
+                )
+                .await;
+                let resp = r
+                    .send(
+                        agent,
+                        Command::FsReadlink {
+                            path: "/shared/sv_dangling".into(),
+                        },
+                    )
+                    .await;
+                let pass = matches!(
+                    &resp,
+                    Response::Ok { data: Some(d) } if d == "/shared/nonexistent_target"
+                );
+                super::TestOutcome::new(agent, pass, format!("{resp:?}"))
+            })
+        }),
+    });
+
+    // S.dangling.read_fails
+    tests.push(super::Test {
+        suite: "matrix",
+        group: "run_matrix",
+        id: "S.dangling.read_fails".to_string(),
+        xfail: None,
+        run: Box::new(move |r| {
+            Box::pin(async move {
+                let agent = "A";
+                let _ = r
+                    .send(
+                        "init",
+                        Command::FsDelete {
+                            path: "/shared/sv_dangling".into(),
+                        },
+                    )
+                    .await;
+                r.send(
+                    agent,
+                    Command::FsSymlink {
+                        target: "/shared/nonexistent_target".into(),
+                        link: "/shared/sv_dangling".into(),
+                    },
+                )
+                .await;
+                let resp = r
+                    .send(
+                        agent,
+                        Command::FsRead {
+                            path: "/shared/sv_dangling".into(),
+                        },
+                    )
+                    .await;
+                let pass = matches!(&resp, Response::Error { .. } | Response::NotFound);
+                super::TestOutcome::new(agent, pass, format!("{resp:?}"))
+            })
+        }),
+    });
+
+    // S.nested.read_through
+    tests.push(super::Test {
+        suite: "matrix",
+        group: "run_matrix",
+        id: "S.nested.read_through".to_string(),
+        xfail: None,
+        run: Box::new(move |r| {
+            Box::pin(async move {
+                let agent = "A";
+                for name in ["sv_nested_link1", "sv_nested_link2", "sv_nested_file"] {
+                    let _ = r
+                        .send(
+                            "init",
+                            Command::FsDelete {
+                                path: format!("/shared/{name}"),
+                            },
+                        )
+                        .await;
+                }
+                r.send(
+                    agent,
+                    Command::FsWrite {
+                        path: "/shared/sv_nested_file".into(),
+                        data: "NESTED_DATA".into(),
+                    },
+                )
+                .await;
+                r.send(
+                    agent,
+                    Command::FsSymlink {
+                        target: "/shared/sv_nested_file".into(),
+                        link: "/shared/sv_nested_link2".into(),
+                    },
+                )
+                .await;
+                r.send(
+                    agent,
+                    Command::FsSymlink {
+                        target: "/shared/sv_nested_link2".into(),
+                        link: "/shared/sv_nested_link1".into(),
+                    },
+                )
+                .await;
+                let resp = r
+                    .send(
+                        agent,
+                        Command::FsRead {
+                            path: "/shared/sv_nested_link1".into(),
+                        },
+                    )
+                    .await;
+                let pass = matches!(&resp, Response::Ok { data: Some(d) } if d == "NESTED_DATA");
+                super::TestOutcome::new(agent, pass, format!("{resp:?}"))
+            })
+        }),
+    });
+
+    // S.relative.read_through
+    tests.push(super::Test {
+        suite: "matrix",
+        group: "run_matrix",
+        id: "S.relative.read_through".to_string(),
+        xfail: None,
+        run: Box::new(move |r| {
+            Box::pin(async move {
+                let agent = "A";
+                for name in ["sv_rel_file", "sv_rel_link"] {
+                    let _ = r
+                        .send(
+                            "init",
+                            Command::FsDelete {
+                                path: format!("/shared/{name}"),
+                            },
+                        )
+                        .await;
+                }
+                r.send(
+                    agent,
+                    Command::FsWrite {
+                        path: "/shared/sv_rel_file".into(),
+                        data: "REL_DATA".into(),
+                    },
+                )
+                .await;
+                r.send(
+                    agent,
+                    Command::FsSymlink {
+                        target: "sv_rel_file".into(),
+                        link: "/shared/sv_rel_link".into(),
+                    },
+                )
+                .await;
+                let resp = r
+                    .send(
+                        agent,
+                        Command::FsRead {
+                            path: "/shared/sv_rel_link".into(),
+                        },
+                    )
+                    .await;
+                let pass = matches!(&resp, Response::Ok { data: Some(d) } if d == "REL_DATA");
+                super::TestOutcome::new(agent, pass, format!("{resp:?}"))
+            })
+        }),
+    });
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// 12. UNIX SOCKETS — U.{name}.{listen,connect,...}
+// ═══════════════════════════════════════════════════════════════════
+
 pub(super) fn register_unix_tests(tests: &mut Vec<super::Test>) {
     let has_nonpie = crate::find_nonpie_binary().is_some();
 
     for tc in unix_test_cases() {
-        let name = tc.name;
-        let agent = tc.agent;
-        let peer = tc.peer;
-        let pattern = tc.pattern;
-
-        // Skip tests that require non-PIE agents when binary isn't available.
         if !has_nonpie
-            && (agent_requires_nonpie(agent) || peer.is_some_and(|p| agent_requires_nonpie(p)))
+            && (agent_requires_nonpie(tc.agent)
+                || tc.peer.is_some_and(|p| agent_requires_nonpie(p)))
         {
+            let agent_s = tc.agent.to_string();
             tests.push(super::Test {
                 suite: "matrix",
                 group: "run_matrix",
-                id: format!("U.{name}.listen"),
+                id: format!("U.{}.listen", tc.name),
                 xfail: None,
                 run: Box::new(move |_r| {
                     Box::pin(async move {
                         super::TestOutcome::new(
-                            agent,
+                            &agent_s,
                             false,
                             "FAIL: nonpie binary not found — mount at /opt/nonpie",
                         )
@@ -2753,236 +2984,369 @@ pub(super) fn register_unix_tests(tests: &mut Vec<super::Test>) {
             continue;
         }
 
-        let name_owned = name.to_string();
+        let sock = format!("/tmp/um_{}.sock", tc.name.replace('.', "_"));
 
-        match pattern {
+        match tc.pattern {
             UnixPattern::InProcess => {
-                tests.push(super::Test {
-                    suite: "matrix",
-                    group: "run_matrix",
-                    id: format!("U.{name}"),
-                    xfail: None,
-                    run: Box::new(move |r| {
-                        Box::pin(async move {
-                            let sock = format!("/tmp/um_{}.sock", name_owned.replace('.', "_"));
-                            let data = format!("unix_{name_owned}");
-
-                            let resp = r
-                                .send(agent, Command::UnixListen { path: sock.clone() })
-                                .await;
-                            let listen_ok = matches!(&resp, Response::UnixListening { .. });
-                            if !listen_ok {
-                                return super::TestOutcome::new(
-                                    agent,
-                                    false,
-                                    format!("listen failed: {resp:?}"),
+                // U.{name}.listen
+                {
+                    let agent: &'static str = tc.agent;
+                    let sock = sock.clone();
+                    let name: &'static str = tc.name;
+                    tests.push(super::Test {
+                        suite: "matrix",
+                        group: "run_matrix",
+                        id: format!("U.{name}.listen"),
+                        xfail: None,
+                        run: Box::new(move |r| {
+                            Box::pin(async move {
+                                let resp = r
+                                    .send(agent, Command::UnixListen { path: sock.clone() })
+                                    .await;
+                                let pass = matches!(&resp, Response::UnixListening { .. });
+                                let _ = r.send(agent, Command::UnixUnlisten { path: sock }).await;
+                                super::TestOutcome::new(agent, pass, format!("{resp:?}"))
+                            })
+                        }),
+                    });
+                }
+                // U.{name}.connect
+                {
+                    let agent: &'static str = tc.agent;
+                    let sock = sock.clone();
+                    let name: &'static str = tc.name;
+                    tests.push(super::Test {
+                        suite: "matrix",
+                        group: "run_matrix",
+                        id: format!("U.{name}.connect"),
+                        xfail: None,
+                        run: Box::new(move |r| {
+                            Box::pin(async move {
+                                let resp = r
+                                    .send(agent, Command::UnixListen { path: sock.clone() })
+                                    .await;
+                                if !matches!(&resp, Response::UnixListening { .. }) {
+                                    return super::TestOutcome::new(
+                                        agent,
+                                        false,
+                                        format!("listen failed: {resp:?}"),
+                                    );
+                                }
+                                let data = format!("unix_{name}");
+                                let resp = r
+                                    .send(
+                                        agent,
+                                        Command::UnixConnect {
+                                            path: sock.clone(),
+                                            data: data.clone(),
+                                        },
+                                    )
+                                    .await;
+                                let pass = matches!(
+                                    &resp,
+                                    Response::Connected { echo } if *echo == data
                                 );
-                            }
-
-                            let resp = r
-                                .send(
-                                    agent,
-                                    Command::UnixConnect {
-                                        path: sock.clone(),
-                                        data: data.clone(),
-                                    },
-                                )
-                                .await;
-                            let pass =
-                                matches!(&resp, Response::Connected { echo } if *echo == data);
-
-                            let _ = r.send(agent, Command::UnixUnlisten { path: sock }).await;
-
-                            super::TestOutcome::new(agent, pass, format!("{resp:?}"))
-                        })
-                    }),
-                });
+                                let _ = r.send(agent, Command::UnixUnlisten { path: sock }).await;
+                                super::TestOutcome::new(agent, pass, format!("{resp:?}"))
+                            })
+                        }),
+                    });
+                }
             }
 
             UnixPattern::ServerForkClient => {
-                tests.push(super::Test {
-                    suite: "matrix",
-                    group: "run_matrix",
-                    id: format!("U.{name}"),
-                    xfail: None,
-                    run: Box::new(move |r| {
-                        let self_exe = r.self_exe.clone();
-                        Box::pin(async move {
-                            let sock =
-                                format!("/tmp/um_{}.sock", name_owned.replace('.', "_"));
-                            let data = format!("unix_{name_owned}");
-
-                            let resp = r
-                                .send(agent, Command::UnixListen { path: sock.clone() })
-                                .await;
-                            let listen_ok =
-                                matches!(&resp, Response::UnixListening { .. });
-                            if !listen_ok {
-                                return super::TestOutcome::new(
-                                    agent,
-                                    false,
-                                    format!("listen failed: {resp:?}"),
+                // U.{name}.listen
+                {
+                    let agent: &'static str = tc.agent;
+                    let sock = sock.clone();
+                    let name: &'static str = tc.name;
+                    tests.push(super::Test {
+                        suite: "matrix",
+                        group: "run_matrix",
+                        id: format!("U.{name}.listen"),
+                        xfail: None,
+                        run: Box::new(move |r| {
+                            Box::pin(async move {
+                                let resp = r
+                                    .send(agent, Command::UnixListen { path: sock.clone() })
+                                    .await;
+                                let pass = matches!(&resp, Response::UnixListening { .. });
+                                let _ = r.send(agent, Command::UnixUnlisten { path: sock }).await;
+                                super::TestOutcome::new(agent, pass, format!("{resp:?}"))
+                            })
+                        }),
+                    });
+                }
+                // U.{name}.child_connect
+                {
+                    let agent: &'static str = tc.agent;
+                    let sock = sock.clone();
+                    let name: &'static str = tc.name;
+                    tests.push(super::Test {
+                        suite: "matrix",
+                        group: "run_matrix",
+                        id: format!("U.{name}.child_connect"),
+                        xfail: None,
+                        run: Box::new(move |r| {
+                            Box::pin(async move {
+                                let self_exe = r.self_exe.clone();
+                                let resp = r
+                                    .send(agent, Command::UnixListen { path: sock.clone() })
+                                    .await;
+                                if !matches!(&resp, Response::UnixListening { .. }) {
+                                    return super::TestOutcome::new(
+                                        agent,
+                                        false,
+                                        format!("listen failed: {resp:?}"),
+                                    );
+                                }
+                                let data = format!("unix_{name}");
+                                let resp = r
+                                    .send(
+                                        agent,
+                                        super::exec(vec![
+                                            self_exe,
+                                            "unix-echo-client".into(),
+                                            sock.clone(),
+                                            data.clone(),
+                                        ]),
+                                    )
+                                    .await;
+                                let pass = matches!(
+                                    &resp,
+                                    Response::ExecResult { exit_code: 0, stdout, .. }
+                                        if stdout.contains(&data)
                                 );
-                            }
-
-                            let resp = r
-                                .send(
-                                    agent,
-                                    super::exec(vec![
-                                        self_exe,
-                                        "unix-echo-client".into(),
-                                        sock.clone(),
-                                        data.clone(),
-                                    ]),
-                                )
-                                .await;
-                            let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout.contains(&data));
-
-                            let _ = r
-                                .send(agent, Command::UnixUnlisten { path: sock })
-                                .await;
-
-                            super::TestOutcome::new(agent, pass, format!("{resp:?}"))
-                        })
-                    }),
-                });
+                                let _ = r.send(agent, Command::UnixUnlisten { path: sock }).await;
+                                super::TestOutcome::new(agent, pass, format!("{resp:?}"))
+                            })
+                        }),
+                    });
+                }
             }
 
             UnixPattern::BackgroundServerConnect => {
-                tests.push(super::Test {
-                    suite: "matrix",
-                    group: "run_matrix",
-                    id: format!("U.{name}"),
-                    xfail: None,
-                    run: Box::new(move |r| {
-                        let self_exe = r.self_exe.clone();
-                        Box::pin(async move {
-                            let sock = format!("/tmp/um_{}.sock", name_owned.replace('.', "_"));
-                            let data = format!("unix_{name_owned}");
+                // U.{name}.server_start
+                {
+                    let agent: &'static str = tc.agent;
+                    let sock = sock.clone();
+                    let name: &'static str = tc.name;
+                    tests.push(super::Test {
+                        suite: "matrix",
+                        group: "run_matrix",
+                        id: format!("U.{name}.server_start"),
+                        xfail: None,
+                        run: Box::new(move |r| {
+                            Box::pin(async move {
+                                let self_exe = r.self_exe.clone();
+                                let resp = r
+                                    .send(
+                                        agent,
+                                        Command::Exec {
+                                            args: vec![
+                                                self_exe,
+                                                "unix-echo-server".into(),
+                                                sock.clone(),
+                                            ],
+                                            timeout_secs: None,
+                                            stdin: None,
+                                            background: true,
+                                        },
+                                    )
+                                    .await;
+                                let pid = match &resp {
+                                    Response::Background { pid } => Some(*pid),
+                                    _ => None,
+                                };
+                                let pass = pid.is_some();
+                                // Kill the server.
+                                if let Some(pid) = pid {
+                                    let _ = r.send(agent, Command::Kill { pid }).await;
+                                }
+                                let _ = r.send(agent, Command::UnixUnlisten { path: sock }).await;
+                                super::TestOutcome::new(agent, pass, format!("{resp:?}"))
+                            })
+                        }),
+                    });
+                }
+                // U.{name}.connect
+                {
+                    let agent: &'static str = tc.agent;
+                    let sock = sock.clone();
+                    let name: &'static str = tc.name;
+                    tests.push(super::Test {
+                        suite: "matrix",
+                        group: "run_matrix",
+                        id: format!("U.{name}.connect"),
+                        xfail: None,
+                        run: Box::new(move |r| {
+                            Box::pin(async move {
+                                let self_exe = r.self_exe.clone();
+                                let resp = r
+                                    .send(
+                                        agent,
+                                        Command::Exec {
+                                            args: vec![
+                                                self_exe,
+                                                "unix-echo-server".into(),
+                                                sock.clone(),
+                                            ],
+                                            timeout_secs: None,
+                                            stdin: None,
+                                            background: true,
+                                        },
+                                    )
+                                    .await;
+                                let pid = match &resp {
+                                    Response::Background { pid } => Some(*pid),
+                                    _ => None,
+                                };
+                                if pid.is_none() {
+                                    return super::TestOutcome::new(
+                                        agent,
+                                        false,
+                                        format!("server_start failed: {resp:?}"),
+                                    );
+                                }
 
-                            let resp = r
-                                .send(
-                                    agent,
-                                    Command::Exec {
-                                        args: vec![
-                                            self_exe,
-                                            "unix-echo-server".into(),
-                                            sock.clone(),
-                                        ],
-                                        timeout_secs: None,
-                                        stdin: None,
-                                        background: true,
-                                    },
-                                )
-                                .await;
-                            let pid = match &resp {
-                                Response::Background { pid } => Some(*pid),
-                                _ => None,
-                            };
-                            if pid.is_none() {
-                                return super::TestOutcome::new(
-                                    agent,
-                                    false,
-                                    format!("server_start failed: {resp:?}"),
+                                tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+
+                                let data = format!("unix_{name}");
+                                let resp = r
+                                    .send(
+                                        agent,
+                                        Command::UnixConnect {
+                                            path: sock.clone(),
+                                            data: data.clone(),
+                                        },
+                                    )
+                                    .await;
+                                let pass = matches!(
+                                    &resp,
+                                    Response::Connected { echo } if *echo == data
                                 );
-                            }
 
-                            tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-
-                            let resp = r
-                                .send(
-                                    agent,
-                                    Command::UnixConnect {
-                                        path: sock.clone(),
-                                        data: data.clone(),
-                                    },
-                                )
-                                .await;
-                            let pass =
-                                matches!(&resp, Response::Connected { echo } if *echo == data);
-
-                            if let Some(pid) = pid {
-                                let _ = r.send(agent, Command::Kill { pid }).await;
-                            }
-                            let _ = r.send(agent, Command::UnixUnlisten { path: sock }).await;
-
-                            super::TestOutcome::new(agent, pass, format!("{resp:?}"))
-                        })
-                    }),
-                });
+                                if let Some(pid) = pid {
+                                    let _ = r.send(agent, Command::Kill { pid }).await;
+                                }
+                                let _ = r.send(agent, Command::UnixUnlisten { path: sock }).await;
+                                super::TestOutcome::new(agent, pass, format!("{resp:?}"))
+                            })
+                        }),
+                    });
+                }
             }
 
             UnixPattern::CrossAgent => {
-                let connector = peer.unwrap();
-                tests.push(super::Test {
-                    suite: "matrix",
-                    group: "run_matrix",
-                    id: format!("U.{name}"),
-                    xfail: None,
-                    run: Box::new(move |r| {
-                        Box::pin(async move {
-                            let sock = format!("/tmp/um_{}.sock", name_owned.replace('.', "_"));
-                            let data = format!("unix_{name_owned}");
+                let connector: &'static str = tc.peer.unwrap();
+                let agent: &'static str = tc.agent;
+                let name: &'static str = tc.name;
 
-                            let resp = r
-                                .send(agent, Command::UnixListen { path: sock.clone() })
-                                .await;
-                            let listen_ok = matches!(&resp, Response::UnixListening { .. });
-                            if !listen_ok {
-                                return super::TestOutcome::new(
-                                    agent,
-                                    false,
-                                    format!("listen failed: {resp:?}"),
+                // U.{name}.listen
+                {
+                    let sock = sock.clone();
+                    tests.push(super::Test {
+                        suite: "matrix",
+                        group: "run_matrix",
+                        id: format!("U.{name}.listen"),
+                        xfail: None,
+                        run: Box::new(move |r| {
+                            Box::pin(async move {
+                                let resp = r
+                                    .send(agent, Command::UnixListen { path: sock.clone() })
+                                    .await;
+                                let pass = matches!(&resp, Response::UnixListening { .. });
+                                let _ = r.send(agent, Command::UnixUnlisten { path: sock }).await;
+                                super::TestOutcome::new(agent, pass, format!("{resp:?}"))
+                            })
+                        }),
+                    });
+                }
+
+                // U.{name}.connect
+                {
+                    let sock = sock.clone();
+                    tests.push(super::Test {
+                        suite: "matrix",
+                        group: "run_matrix",
+                        id: format!("U.{name}.connect"),
+                        xfail: None,
+                        run: Box::new(move |r| {
+                            Box::pin(async move {
+                                let data = format!("unix_{name}");
+                                let resp = r
+                                    .send(agent, Command::UnixListen { path: sock.clone() })
+                                    .await;
+                                if !matches!(&resp, Response::UnixListening { .. }) {
+                                    return super::TestOutcome::new(
+                                        connector,
+                                        false,
+                                        format!("listen failed: {resp:?}"),
+                                    );
+                                }
+                                let resp = r
+                                    .send(
+                                        connector,
+                                        Command::UnixConnect {
+                                            path: sock.clone(),
+                                            data: data.clone(),
+                                        },
+                                    )
+                                    .await;
+                                let pass = matches!(
+                                    &resp,
+                                    Response::Connected { echo } if *echo == data
                                 );
-                            }
-
-                            let resp = r
-                                .send(
-                                    connector,
-                                    Command::UnixConnect {
-                                        path: sock.clone(),
-                                        data: data.clone(),
-                                    },
-                                )
-                                .await;
-                            let pass =
-                                matches!(&resp, Response::Connected { echo } if *echo == data);
-
-                            let _ = r.send(agent, Command::UnixUnlisten { path: sock }).await;
-
-                            super::TestOutcome::new(connector, pass, format!("{resp:?}"))
-                        })
-                    }),
-                });
+                                let _ = r.send(agent, Command::UnixUnlisten { path: sock }).await;
+                                super::TestOutcome::new(connector, pass, format!("{resp:?}"))
+                            })
+                        }),
+                    });
+                }
             }
         }
     }
 
     // ── Minimal cross-worker unix socket repro ──
-    if crate::find_nonpie_binary().is_some() {
+    if has_nonpie {
+        // U.repro.listen
         tests.push(super::Test {
             suite: "matrix",
             group: "run_matrix",
-            id: "U.repro.xworker".to_string(),
+            id: "U.repro.listen".to_string(),
             xfail: None,
             run: Box::new(move |r| {
                 Box::pin(async move {
                     let sock = "/tmp/um_repro_xworker.sock".to_string();
-
-                    // D3 listens.
                     let resp = r
                         .send("D3", Command::UnixListen { path: sock.clone() })
                         .await;
-                    let listen_ok = matches!(&resp, Response::UnixListening { .. });
-                    if !listen_ok {
+                    let pass = matches!(&resp, Response::UnixListening { .. });
+                    let _ = r.send("D3", Command::UnixUnlisten { path: sock }).await;
+                    super::TestOutcome::new("D3", pass, format!("{resp:?}"))
+                })
+            }),
+        });
+
+        // U.repro.same_agent
+        tests.push(super::Test {
+            suite: "matrix",
+            group: "run_matrix",
+            id: "U.repro.same_agent".to_string(),
+            xfail: None,
+            run: Box::new(move |r| {
+                Box::pin(async move {
+                    let sock = "/tmp/um_repro_xworker.sock".to_string();
+                    let resp = r
+                        .send("D3", Command::UnixListen { path: sock.clone() })
+                        .await;
+                    if !matches!(&resp, Response::UnixListening { .. }) {
                         return super::TestOutcome::new(
                             "D3",
                             false,
                             format!("listen failed: {resp:?}"),
                         );
                     }
-
-                    // Same-agent connect (D3→D3).
                     let resp = r
                         .send(
                             "D3",
@@ -2992,10 +3356,35 @@ pub(super) fn register_unix_tests(tests: &mut Vec<super::Test>) {
                             },
                         )
                         .await;
-                    let same_ok =
+                    let pass =
                         matches!(&resp, Response::Connected { echo } if echo.contains("SAME_AGENT"));
+                    let _ = r
+                        .send("D3", Command::UnixUnlisten { path: sock })
+                        .await;
+                    super::TestOutcome::new("D3", pass, format!("{resp:?}"))
+                })
+            }),
+        });
 
-                    // Cross-agent connect (D4→D3).
+        // U.repro.cross_worker
+        tests.push(super::Test {
+            suite: "matrix",
+            group: "run_matrix",
+            id: "U.repro.cross_worker".to_string(),
+            xfail: None,
+            run: Box::new(move |r| {
+                Box::pin(async move {
+                    let sock = "/tmp/um_repro_xworker.sock".to_string();
+                    let resp = r
+                        .send("D3", Command::UnixListen { path: sock.clone() })
+                        .await;
+                    if !matches!(&resp, Response::UnixListening { .. }) {
+                        return super::TestOutcome::new(
+                            "D4",
+                            false,
+                            format!("listen failed: {resp:?}"),
+                        );
+                    }
                     let resp = r
                         .send(
                             "D4",
@@ -3005,20 +3394,38 @@ pub(super) fn register_unix_tests(tests: &mut Vec<super::Test>) {
                             },
                         )
                         .await;
-                    let cross_ok =
-                        matches!(&resp, Response::Connected { echo } if echo.contains("CROSS_WORKER"));
-
-                    let _ = r
-                        .send("D3", Command::UnixUnlisten { path: sock })
-                        .await;
-
-                    let pass = same_ok && cross_ok;
-                    let detail = format!(
-                        "same_agent={same_ok} cross_worker={cross_ok}"
+                    let pass = matches!(
+                        &resp,
+                        Response::Connected { echo } if echo.contains("CROSS_WORKER")
                     );
-                    super::TestOutcome::new("D4", pass, detail)
+                    let _ = r.send("D3", Command::UnixUnlisten { path: sock }).await;
+                    super::TestOutcome::new("D4", pass, format!("{resp:?}"))
                 })
             }),
         });
     }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// MASTER REGISTER — collects all matrix tests
+// ═══════════════════════════════════════════════════════════════════
+
+/// Register all matrix tests into the given vector.
+///
+/// Replaces the old `run_matrix_tests` imperative runner.
+/// Environment setup (/shared, /root, host_wrote.txt) should be done
+/// by the caller before running these tests.
+pub(super) fn register_matrix(tests: &mut Vec<super::Test>) {
+    register_fs_crud(tests);
+    register_fs_cross_unlink(tests);
+    register_tmp_isolation(tests);
+    register_host_file(tests);
+    register_net_tests(tests);
+    register_net_addr_tests(tests);
+    register_unix_addr_tests(tests);
+    register_exec_tests(tests);
+    register_env_tests(tests);
+    register_symlink_basic(tests);
+    register_symlink_variants(tests);
+    register_unix_tests(tests);
 }

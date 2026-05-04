@@ -524,7 +524,6 @@ async fn run_group(runner: &mut TestRunner, suite: &str, group: &str) {
         // matrix
         // Converted to register_netlink (new-style)
         // ("matrix", "netlink") => special_cases::netlink_tests(runner).await,
-        ("matrix", "fs_io") => special_cases::fs_io_tests(runner).await,
         ("matrix", "poll_ready") => platform_fixes::poll_ready_tests(runner).await,
         ("matrix", "bind_getsockname") => platform_fixes::bind_getsockname_tests(runner).await,
         ("matrix", "pipe_pair_id") => platform_fixes::pipe_pair_id_tests(runner).await,
@@ -542,13 +541,11 @@ async fn run_group(runner: &mut TestRunner, suite: &str, group: &str) {
         }
         ("fork", "concurrent_fork") => platform_fixes::concurrent_fork_tests(runner).await,
         ("fork", "pid_visibility") => platform_fixes::pid_visibility_tests(runner).await,
-        ("fork", "capture_pipe") => special_cases::capture_pipe_tests(runner).await,
         // shell
         ("shell", "stdin_pipe_subst") => platform_fixes::stdin_pipe_subst_tests(runner).await,
         ("shell", "subst_capture") => platform_fixes::subst_capture_tests(runner).await,
         ("shell", "touch_redirect") => platform_fixes::touch_redirect_tests(runner).await,
         ("shell", "file_redirect") => platform_fixes::file_redirect_tests(runner).await,
-        ("shell", "stdin_script") => special_cases::stdin_script_tests(runner).await,
         // xworker
         ("xworker", "cross_worker_first_connect") => {
             platform_fixes::cross_worker_first_connect_tests(runner).await
@@ -672,18 +669,10 @@ async fn run_tests(self_exe: &str, filter: Option<&str>) -> Vec<TestResult> {
     special_cases::register_net_ipv6(&mut new_tests);
     special_cases::register_terminal_ioctl(&mut new_tests);
     special_cases::register_node_exit(&mut new_tests);
-    matrix::register_fs_crud(&mut new_tests);
-    matrix::register_fs_cross_unlink(&mut new_tests);
-    matrix::register_tmp_isolation(&mut new_tests);
-    matrix::register_host_file(&mut new_tests);
-    matrix::register_net_tests(&mut new_tests);
-    matrix::register_net_addr_tests(&mut new_tests);
-    matrix::register_unix_addr_tests(&mut new_tests);
-    matrix::register_exec_tests(&mut new_tests);
-    matrix::register_env_tests(&mut new_tests);
-    matrix::register_symlink_basic(&mut new_tests);
-    matrix::register_symlink_variants(&mut new_tests);
-    matrix::register_unix_tests(&mut new_tests);
+    special_cases::register_fs_io(&mut new_tests);
+    special_cases::register_capture_pipe(&mut new_tests);
+    special_cases::register_stdin_script(&mut new_tests);
+    matrix::register_matrix(&mut new_tests);
 
     // Filter to only tests matching the --filter argument.
     let new_filtered: Vec<Test> = new_tests

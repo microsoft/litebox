@@ -19,7 +19,7 @@ pub const TEST_GROUPS: &[(&str, &str)] = &[
     // ("matrix", "netlink"), // converted to register_netlink
     // ("matrix", "net_ipv6"), // converted
     // ("matrix", "terminal_ioctl"), // converted
-    ("matrix", "fs_io"),
+    // ("matrix", "fs_io"), // converted
     ("matrix", "poll_ready"),
     ("matrix", "bind_getsockname"),
     ("matrix", "pipe_pair_id"),
@@ -35,14 +35,14 @@ pub const TEST_GROUPS: &[(&str, &str)] = &[
     ("fork", "fork_from_worker_exec"),
     ("fork", "concurrent_fork"),
     ("fork", "pid_visibility"),
-    ("fork", "capture_pipe"),
+    // ("fork", "capture_pipe"), // converted
     // ("fork", "node_exit"), // converted
     // shell — bash-specific redirect, touch, stdin-pipe
     ("shell", "stdin_pipe_subst"),
     ("shell", "subst_capture"),
     ("shell", "touch_redirect"),
     ("shell", "file_redirect"),
-    ("shell", "stdin_script"),
+    // ("shell", "stdin_script"), // converted
     // xworker — cross-worker FS, TCP, unix sockets, port routing
     ("xworker", "cross_worker_first_connect"),
     ("xworker", "cross_worker_self_connect"),

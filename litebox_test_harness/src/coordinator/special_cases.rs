@@ -1767,3 +1767,176 @@ pub(super) fn register_node_exit(tests: &mut Vec<super::Test>) {
         })),
     });
 }
+/// Register FS I/O matrix tests.
+pub(super) fn register_fs_io(tests: &mut Vec<super::Test>) {
+    let ops: &[&str] = &[
+        "write-read",
+        "append-read",
+        "write-bg-read",
+        "redirect-bg-read",
+        "fork-write-read",
+        "bg-open-read",
+        "parent-open-fork-read",
+    ];
+    let paths: &[(&str, &str)] = &[("/tmp/fs-test.txt", "tmp"), ("/root/fs-test.txt", "root")];
+
+    for &op in ops {
+        for &(path, dir) in paths {
+            let id = format!("FS.{op}.{dir}");
+            let op = op.to_string();
+            let path = path.to_string();
+            tests.push(super::Test {
+                suite: "matrix", group: "fs_io", id, xfail: None,
+                run: Box::new(move |r| {
+                    let self_exe = r.self_exe.clone();
+                    Box::pin(async move {
+                        let resp = r.send("A", super::exec_timeout(
+                            vec![self_exe, "fs-test".into(), "io".into(), op, path], 15,
+                        )).await;
+                        let pass = matches!(&resp, crate::protocol::Response::ExecResult { stdout, .. } if stdout.contains("FS_OK"));
+                        super::TestOutcome::new("A", pass, format!("{resp:?}"))
+                    })
+                }),
+            });
+        }
+    }
+
+    // Exec-write and exec-open-read
+    for &mode in &["exec-write", "exec-open-read"] {
+        let prefix = if mode == "exec-write" { "exec" } else { "open" };
+        for &bin in &["pie", "nonpie"] {
+            let path = "/tmp/fs-exec.txt";
+            let pname = "fs-exec.txt";
+            let id = format!("FS.{prefix}_{bin}_{pname}");
+            let mode = mode.to_string();
+            let bin = bin.to_string();
+            let path = path.to_string();
+            tests.push(super::Test {
+                suite: "matrix", group: "fs_io", id, xfail: None,
+                run: Box::new(move |r| {
+                    let self_exe = r.self_exe.clone();
+                    Box::pin(async move {
+                        let resp = r.send("A", super::exec_timeout(
+                            vec![self_exe, "fs-test".into(), mode, bin, path], 30,
+                        )).await;
+                        let pass = matches!(&resp, crate::protocol::Response::ExecResult { stdout, .. } if stdout.contains("FS_OK"));
+                        super::TestOutcome::new("A", pass, format!("{resp:?}"))
+                    })
+                }),
+            });
+        }
+    }
+}
+
+/// Register capture-pipe fork tests.
+pub(super) fn register_capture_pipe(tests: &mut Vec<super::Test>) {
+    const CMD_TYPES: &[&str] = &[
+        "simple",
+        "pipe",
+        "multi",
+        "noexec",
+        "nested_fork",
+        "subshell_pipe",
+        "subshell_continue",
+    ];
+    const SHELLS: &[&str] = &["sh", "bash"];
+    const CP_AGENTS: &[&str] = &["A", "AA"];
+
+    for &agent in CP_AGENTS {
+        for &shell in SHELLS {
+            for &cmd_type in CMD_TYPES {
+                let id = format!("CP.{cmd_type}.{shell}.{agent}");
+                let agent = agent.to_string();
+                let shell = shell.to_string();
+                let cmd_type = cmd_type.to_string();
+                tests.push(super::Test {
+                    suite: "fork", group: "capture_pipe", id, xfail: None,
+                    run: Box::new(move |r| {
+                        let self_exe = r.self_exe.clone();
+                        Box::pin(async move {
+                            let resp = r.send(&agent, super::exec_timeout(
+                                vec![self_exe, "capture-pipe".into(), cmd_type, shell], 10,
+                            )).await;
+                            let pass = matches!(&resp, crate::protocol::Response::ExecResult { stdout, .. } if stdout.contains("CP_OK"));
+                            super::TestOutcome::new(&agent, pass, format!("{resp:?}"))
+                        })
+                    }),
+                });
+            }
+        }
+    }
+}
+/// Register stdin-piped script tests.
+pub(super) fn register_stdin_script(tests: &mut Vec<super::Test>) {
+    const SCRIPTS: &[(&str, &str, &str)] = &[
+        (
+            "cmd_subst",
+            "FOO=$(echo hello)\necho FOO=$FOO\necho DONE\n",
+            "FOO=hello",
+        ),
+        (
+            "pipe_in_subst",
+            "A=$(echo one | cat)\necho A=$A\necho DONE\n",
+            "A=one",
+        ),
+        (
+            "multi_pipe_subst",
+            "A=$(echo data | grep data | cat)\necho A=$A\necho DONE\n",
+            "A=data",
+        ),
+        (
+            "file_pipe_subst",
+            "A=$(cat /etc/hostname | cat)\necho A=$A\necho DONE\n",
+            "DONE",
+        ),
+        (
+            "sequential_subst",
+            "A=$(echo first)\nB=$(echo second)\necho A=$A B=$B\necho DONE\n",
+            "A=first B=second",
+        ),
+        (
+            "subst_then_cmds",
+            "A=$(echo val | cat)\necho LINE1\necho LINE2\necho LINE3\n",
+            "LINE3",
+        ),
+        (
+            "vscode_osrelease",
+            "ID=$(cat /etc/os-release | grep -E '^ID=' | sed 's/ID=//g' | sed 's/\"//g')\necho ID=$ID\necho DONE\n",
+            "DONE",
+        ),
+        (
+            "backtick_pipe",
+            "A=`echo one | cat`\necho A=$A\necho DONE\n",
+            "A=one",
+        ),
+    ];
+    const SHELLS: &[&str] = &["sh", "bash"];
+    const SS_AGENTS: &[&str] = &["A", "AA"];
+
+    for &agent in SS_AGENTS {
+        for &shell in SHELLS {
+            for &(name, script, expected) in SCRIPTS {
+                let id = format!("SS.{name}.{shell}.{agent}");
+                let agent = agent.to_string();
+                let shell = shell.to_string();
+                let script = script.to_string();
+                let expected = expected.to_string();
+                tests.push(super::Test {
+                    suite: "shell", group: "stdin_script", id, xfail: None,
+                    run: Box::new(move |r| {
+                        Box::pin(async move {
+                            let resp = r.send(&agent, crate::protocol::Command::Exec {
+                                args: vec![shell],
+                                timeout_secs: Some(10),
+                                stdin: Some(script),
+                                background: false,
+                            }).await;
+                            let pass = matches!(&resp, crate::protocol::Response::ExecResult { stdout, .. } if stdout.contains(&*expected));
+                            super::TestOutcome::new(&agent, pass, format!("{resp:?}"))
+                        })
+                    }),
+                });
+            }
+        }
+    }
+}
