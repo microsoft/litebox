@@ -16,16 +16,16 @@
 //! ## Native (gold standard — real kernel syscalls):
 //! ```sh
 //! docker run --rm --cap-add SYS_PTRACE \
-//!   -v \\wsl$\Ubuntu\home\USER\litebox-out\debug:/opt/litebox:ro \
-//!   -v \\wsl$\Ubuntu\home\USER\litebox-out\nonpie\debug:/opt/nonpie:ro \
+//!   -v target/debug:/opt/litebox:ro \
+//!   -v target/nonpie/debug:/opt/nonpie:ro \
 //!   litebox-test /opt/litebox/litebox_test_harness spawn-tree
 //! ```
 //!
 //! ## Litebox sandbox (tests the shim's syscall virtualization):
 //! ```sh
 //! docker run --rm --cap-add SYS_PTRACE -e LITEBOX_NO_AUDIT=1 \
-//!   -v \\wsl$\Ubuntu\home\USER\litebox-out\debug:/opt/litebox:ro \
-//!   -v \\wsl$\Ubuntu\home\USER\litebox-out\nonpie\debug:/opt/nonpie:ro \
+//!   -v target/debug:/opt/litebox:ro \
+//!   -v target/nonpie/debug:/opt/nonpie:ro \
 //!   litebox-test /opt/litebox/litebox_tool_executor \
 //!     --rootfs / --record-baseline \
 //!     -- /opt/litebox/litebox_test_harness spawn-tree
