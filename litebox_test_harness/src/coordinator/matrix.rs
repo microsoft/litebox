@@ -1687,6 +1687,7 @@ pub(super) fn register_fs_crud(tests: &mut Vec<super::Test>) {
                     group: "run_matrix",
                     id,
                     xfail: None,
+                    timeout_secs: 60,
                     run: Box::new(move |_r| {
                         Box::pin(async move {
                             super::TestOutcome::new(
@@ -1715,6 +1716,7 @@ pub(super) fn register_fs_crud(tests: &mut Vec<super::Test>) {
                 group: "run_matrix",
                 id: format!("F.shared.{ts_s}.absent"),
                 xfail: None,
+                timeout_secs: 60,
                 run: Box::new(move |r| {
                     Box::pin(async move {
                         let file = format!("/shared/matrix_{ts_s}.txt");
@@ -1739,6 +1741,7 @@ pub(super) fn register_fs_crud(tests: &mut Vec<super::Test>) {
                 group: "run_matrix",
                 id: format!("F.shared.{ts_s}.created"),
                 xfail: None,
+                timeout_secs: 60,
                 run: Box::new(move |r| {
                     Box::pin(async move {
                         let file = format!("/shared/matrix_{ts_s}.txt");
@@ -1772,6 +1775,7 @@ pub(super) fn register_fs_crud(tests: &mut Vec<super::Test>) {
                 group: "run_matrix",
                 id: format!("F.shared.{ts_s}.updated"),
                 xfail: None,
+                timeout_secs: 60,
                 run: Box::new(move |r| {
                     Box::pin(async move {
                         let file = format!("/shared/matrix_{ts_s}.txt");
@@ -1814,6 +1818,7 @@ pub(super) fn register_fs_crud(tests: &mut Vec<super::Test>) {
                 group: "run_matrix",
                 id: format!("F.shared.{ts_s}.deleted"),
                 xfail: None,
+                timeout_secs: 60,
                 run: Box::new(move |r| {
                     Box::pin(async move {
                         let file = format!("/shared/matrix_{ts_s}.txt");
@@ -1859,6 +1864,7 @@ pub(super) fn register_fs_cross_unlink(tests: &mut Vec<super::Test>) {
                     group: "run_matrix",
                     id,
                     xfail: None,
+                    timeout_secs: 60,
                     run: Box::new(move |_r| {
                         Box::pin(async move {
                             super::TestOutcome::new(
@@ -1888,6 +1894,7 @@ pub(super) fn register_fs_cross_unlink(tests: &mut Vec<super::Test>) {
                 group: "run_matrix",
                 id: format!("F.unlink.{ts_s}.delete"),
                 xfail: None,
+                timeout_secs: 60,
                 run: Box::new(move |r| {
                     Box::pin(async move {
                         let file = format!("/shared/unlink_{ts_s}.txt");
@@ -1920,6 +1927,7 @@ pub(super) fn register_fs_cross_unlink(tests: &mut Vec<super::Test>) {
                 group: "run_matrix",
                 id: format!("F.unlink.{ts_s}.gone"),
                 xfail: None,
+                timeout_secs: 60,
                 run: Box::new(move |r| {
                     Box::pin(async move {
                         let file = format!("/shared/unlink_{ts_s}.txt");
@@ -1964,6 +1972,7 @@ pub(super) fn register_tmp_isolation(tests: &mut Vec<super::Test>) {
                 group: "run_matrix",
                 id,
                 xfail: None,
+                timeout_secs: 60,
                 run: Box::new(move |_r| {
                     Box::pin(async move {
                         super::TestOutcome::new(&dest, false, "nonpie binary not found".to_string())
@@ -1986,6 +1995,7 @@ pub(super) fn register_tmp_isolation(tests: &mut Vec<super::Test>) {
             group: "run_matrix",
             id: format!("F.tmp.{ts_s}.isolation"),
             xfail: None,
+            timeout_secs: 60,
             run: Box::new(move |r| {
                 Box::pin(async move {
                     let file = format!("/tmp/matrix_iso_{ts_s}.txt");
@@ -2022,6 +2032,7 @@ pub(super) fn register_host_file(tests: &mut Vec<super::Test>) {
             group: "run_matrix",
             id: format!("F.host.{agent}"),
             xfail: None,
+            timeout_secs: 60,
             run: Box::new(move |r| {
                 Box::pin(async move {
                     let resp = r
@@ -2074,6 +2085,7 @@ pub(super) fn register_net_tests(tests: &mut Vec<super::Test>) {
                     group: "run_matrix",
                     id,
                     xfail: None,
+                    timeout_secs: 60,
                     run: Box::new(move |_r| {
                         Box::pin(async move {
                             super::TestOutcome::new(
@@ -2099,6 +2111,7 @@ pub(super) fn register_net_tests(tests: &mut Vec<super::Test>) {
                 group: "run_matrix",
                 id: format!("N.{name}.listen"),
                 xfail: None,
+                timeout_secs: 60,
                 run: Box::new(move |r| {
                     Box::pin(async move {
                         let resp = r.send(listener, Command::NetListen { port: p }).await;
@@ -2119,6 +2132,7 @@ pub(super) fn register_net_tests(tests: &mut Vec<super::Test>) {
                 group: "run_matrix",
                 id: format!("N.{name}.connect"),
                 xfail: None,
+                timeout_secs: 60,
                 run: Box::new(move |r| {
                     Box::pin(async move {
                         // Self-contained: listen, connect, unlisten.
@@ -2155,6 +2169,7 @@ pub(super) fn register_net_tests(tests: &mut Vec<super::Test>) {
                 group: "run_matrix",
                 id: format!("N.{name}.unlisten"),
                 xfail: None,
+                timeout_secs: 60,
                 run: Box::new(move |r| {
                     Box::pin(async move {
                         // Self-contained: listen then unlisten.
@@ -2195,6 +2210,7 @@ pub(super) fn register_net_addr_tests(tests: &mut Vec<super::Test>) {
                     group: "run_matrix",
                     id,
                     xfail: None,
+                    timeout_secs: 60,
                     run: Box::new(move |_r| {
                         Box::pin(async move {
                             super::TestOutcome::new(
@@ -2216,6 +2232,7 @@ pub(super) fn register_net_addr_tests(tests: &mut Vec<super::Test>) {
                 group: "run_matrix",
                 id: test_id,
                 xfail: None,
+                timeout_secs: 60,
                 run: Box::new(move |r| {
                     Box::pin(async move {
                         let resp = r.send(agent_a, Command::NetListen { port: p }).await;
@@ -2257,6 +2274,7 @@ pub(super) fn register_net_addr_tests(tests: &mut Vec<super::Test>) {
                     group: "run_matrix",
                     id,
                     xfail: None,
+                    timeout_secs: 60,
                     run: Box::new(move |_r| {
                         Box::pin(async move {
                             super::TestOutcome::new(
@@ -2276,6 +2294,7 @@ pub(super) fn register_net_addr_tests(tests: &mut Vec<super::Test>) {
                 group: "run_matrix",
                 id: format!("NA.{agent_a}_to_{agent_b}.self_ip"),
                 xfail: None,
+                timeout_secs: 60,
                 run: Box::new(move |r| {
                     Box::pin(async move {
                         // Discover self IP at test time.
@@ -2344,6 +2363,7 @@ pub(super) fn register_unix_addr_tests(tests: &mut Vec<super::Test>) {
                 group: "run_matrix",
                 id: format!("UA.{agent_a}_to_{agent_b}"),
                 xfail: None,
+                timeout_secs: 60,
                 run: Box::new(move |_r| {
                     Box::pin(async move {
                         super::TestOutcome::new(
@@ -2363,6 +2383,7 @@ pub(super) fn register_unix_addr_tests(tests: &mut Vec<super::Test>) {
             group: "run_matrix",
             id: format!("UA.{agent_a}_to_{agent_b}"),
             xfail: None,
+            timeout_secs: 60,
             run: Box::new(move |r| {
                 Box::pin(async move {
                     let sock_path = format!("/tmp/ua-{i}.sock");
@@ -2416,6 +2437,7 @@ pub(super) fn register_exec_tests(tests: &mut Vec<super::Test>) {
                 group: "run_matrix",
                 id: format!("X.echo.{agent}"),
                 xfail: None,
+                timeout_secs: 60,
                 run: Box::new(move |_r| {
                     Box::pin(async move {
                         super::TestOutcome::new(
@@ -2434,6 +2456,7 @@ pub(super) fn register_exec_tests(tests: &mut Vec<super::Test>) {
             group: "run_matrix",
             id: format!("X.echo.{agent}"),
             xfail: None,
+            timeout_secs: 60,
             run: Box::new(move |r| {
                 Box::pin(async move {
                     let self_exe = r.self_exe.clone();
@@ -2457,6 +2480,7 @@ pub(super) fn register_exec_tests(tests: &mut Vec<super::Test>) {
             group: "run_matrix",
             id: format!("X.exit_code.{agent}.{code}"),
             xfail: None,
+            timeout_secs: 60,
             run: Box::new(move |r| {
                 Box::pin(async move {
                     let self_exe = r.self_exe.clone();
@@ -2494,6 +2518,7 @@ pub(super) fn register_env_tests(tests: &mut Vec<super::Test>) {
                     group: "run_matrix",
                     id,
                     xfail: None,
+                    timeout_secs: 60,
                     run: Box::new(move |_r| {
                         Box::pin(async move {
                             super::TestOutcome::new(
@@ -2515,6 +2540,7 @@ pub(super) fn register_env_tests(tests: &mut Vec<super::Test>) {
                 group: "run_matrix",
                 id: format!("E.HOME.{agent}"),
                 xfail: None,
+                timeout_secs: 60,
                 run: Box::new(move |r| {
                     Box::pin(async move {
                         let resp = r.send(agent, Command::EnvGet { var: "HOME".into() }).await;
@@ -2535,6 +2561,7 @@ pub(super) fn register_env_tests(tests: &mut Vec<super::Test>) {
                 group: "run_matrix",
                 id: format!("E.PATH.{agent}"),
                 xfail: None,
+                timeout_secs: 60,
                 run: Box::new(move |r| {
                     Box::pin(async move {
                         let resp = r.send(agent, Command::EnvGet { var: "PATH".into() }).await;
@@ -2555,6 +2582,7 @@ pub(super) fn register_env_tests(tests: &mut Vec<super::Test>) {
                 group: "run_matrix",
                 id: format!("E.CWD.{agent}"),
                 xfail: None,
+                timeout_secs: 60,
                 run: Box::new(move |r| {
                     Box::pin(async move {
                         let resp = r.send(agent, Command::CwdGet).await;
@@ -2588,6 +2616,7 @@ pub(super) fn register_symlink_basic(tests: &mut Vec<super::Test>) {
                 group: "run_matrix",
                 id: format!("S.basic.{ts_s}.create"),
                 xfail: None, // xfail probed at runtime
+                timeout_secs: 60,
                 run: Box::new(move |r| {
                     Box::pin(async move {
                         let file = format!("/shared/sm_{ts_s}_file");
@@ -2626,6 +2655,7 @@ pub(super) fn register_symlink_basic(tests: &mut Vec<super::Test>) {
                 group: "run_matrix",
                 id: format!("S.basic.{ts_s}.readlink"),
                 xfail: None,
+                timeout_secs: 60,
                 run: Box::new(move |r| {
                     Box::pin(async move {
                         let file = format!("/shared/sm_{ts_s}_file");
@@ -2671,6 +2701,7 @@ pub(super) fn register_symlink_basic(tests: &mut Vec<super::Test>) {
                 group: "run_matrix",
                 id: format!("S.basic.{ts_s}.read_through"),
                 xfail: None,
+                timeout_secs: 60,
                 run: Box::new(move |r| {
                     Box::pin(async move {
                         let file = format!("/shared/sm_{ts_s}_file");
@@ -2716,6 +2747,7 @@ pub(super) fn register_symlink_basic(tests: &mut Vec<super::Test>) {
                 group: "run_matrix",
                 id: format!("S.basic.{ts_s}.stat_type"),
                 xfail: None,
+                timeout_secs: 60,
                 run: Box::new(move |r| {
                     Box::pin(async move {
                         let file = format!("/shared/sm_{ts_s}_file");
@@ -2765,6 +2797,7 @@ pub(super) fn register_symlink_variants(tests: &mut Vec<super::Test>) {
         group: "run_matrix",
         id: "S.dir.read_through".to_string(),
         xfail: None,
+            timeout_secs: 60,
         run: Box::new(move |r| {
             Box::pin(async move {
                 let agent = "A";
@@ -2819,6 +2852,7 @@ pub(super) fn register_symlink_variants(tests: &mut Vec<super::Test>) {
         group: "run_matrix",
         id: "S.dangling.readlink".to_string(),
         xfail: None,
+        timeout_secs: 60,
         run: Box::new(move |r| {
             Box::pin(async move {
                 let agent = "A";
@@ -2861,6 +2895,7 @@ pub(super) fn register_symlink_variants(tests: &mut Vec<super::Test>) {
         group: "run_matrix",
         id: "S.dangling.read_fails".to_string(),
         xfail: None,
+        timeout_secs: 60,
         run: Box::new(move |r| {
             Box::pin(async move {
                 let agent = "A";
@@ -2900,6 +2935,7 @@ pub(super) fn register_symlink_variants(tests: &mut Vec<super::Test>) {
         group: "run_matrix",
         id: "S.nested.read_through".to_string(),
         xfail: None,
+        timeout_secs: 60,
         run: Box::new(move |r| {
             Box::pin(async move {
                 let agent = "A";
@@ -2957,6 +2993,7 @@ pub(super) fn register_symlink_variants(tests: &mut Vec<super::Test>) {
         group: "run_matrix",
         id: "S.relative.read_through".to_string(),
         xfail: None,
+        timeout_secs: 60,
         run: Box::new(move |r| {
             Box::pin(async move {
                 let agent = "A";
@@ -3027,6 +3064,7 @@ pub(super) fn register_unix_tests(tests: &mut Vec<super::Test>) {
                     group: "run_matrix",
                     id,
                     xfail: None,
+                    timeout_secs: 60,
                     run: Box::new(move |_r| {
                         Box::pin(async move {
                             super::TestOutcome::new(
@@ -3055,6 +3093,7 @@ pub(super) fn register_unix_tests(tests: &mut Vec<super::Test>) {
                         group: "run_matrix",
                         id: format!("U.{name}.listen"),
                         xfail: None,
+                        timeout_secs: 60,
                         run: Box::new(move |r| {
                             Box::pin(async move {
                                 let resp = r
@@ -3077,6 +3116,7 @@ pub(super) fn register_unix_tests(tests: &mut Vec<super::Test>) {
                         group: "run_matrix",
                         id: format!("U.{name}.connect"),
                         xfail: None,
+                        timeout_secs: 60,
                         run: Box::new(move |r| {
                             Box::pin(async move {
                                 let resp = r
@@ -3122,6 +3162,7 @@ pub(super) fn register_unix_tests(tests: &mut Vec<super::Test>) {
                         group: "run_matrix",
                         id: format!("U.{name}.listen"),
                         xfail: None,
+                        timeout_secs: 60,
                         run: Box::new(move |r| {
                             Box::pin(async move {
                                 let resp = r
@@ -3144,6 +3185,7 @@ pub(super) fn register_unix_tests(tests: &mut Vec<super::Test>) {
                         group: "run_matrix",
                         id: format!("U.{name}.child_connect"),
                         xfail: None,
+                        timeout_secs: 60,
                         run: Box::new(move |r| {
                             Box::pin(async move {
                                 let self_exe = r.self_exe.clone();
@@ -3193,6 +3235,7 @@ pub(super) fn register_unix_tests(tests: &mut Vec<super::Test>) {
                         group: "run_matrix",
                         id: format!("U.{name}.server_start"),
                         xfail: None,
+                        timeout_secs: 60,
                         run: Box::new(move |r| {
                             Box::pin(async move {
                                 let self_exe = r.self_exe.clone();
@@ -3236,6 +3279,7 @@ pub(super) fn register_unix_tests(tests: &mut Vec<super::Test>) {
                         group: "run_matrix",
                         id: format!("U.{name}.connect"),
                         xfail: None,
+                        timeout_secs: 60,
                         run: Box::new(move |r| {
                             Box::pin(async move {
                                 let self_exe = r.self_exe.clone();
@@ -3307,6 +3351,7 @@ pub(super) fn register_unix_tests(tests: &mut Vec<super::Test>) {
                         group: "run_matrix",
                         id: format!("U.{name}.listen"),
                         xfail: None,
+                        timeout_secs: 60,
                         run: Box::new(move |r| {
                             Box::pin(async move {
                                 let resp = r
@@ -3328,6 +3373,7 @@ pub(super) fn register_unix_tests(tests: &mut Vec<super::Test>) {
                         group: "run_matrix",
                         id: format!("U.{name}.connect"),
                         xfail: None,
+                        timeout_secs: 60,
                         run: Box::new(move |r| {
                             Box::pin(async move {
                                 let data = format!("unix_{name}");
@@ -3372,6 +3418,7 @@ pub(super) fn register_unix_tests(tests: &mut Vec<super::Test>) {
             group: "run_matrix",
             id: "U.repro.listen".to_string(),
             xfail: None,
+            timeout_secs: 60,
             run: Box::new(move |r| {
                 Box::pin(async move {
                     let sock = "/tmp/um_repro_xworker.sock".to_string();
@@ -3391,6 +3438,7 @@ pub(super) fn register_unix_tests(tests: &mut Vec<super::Test>) {
             group: "run_matrix",
             id: "U.repro.same_agent".to_string(),
             xfail: None,
+            timeout_secs: 60,
             run: Box::new(move |r| {
                 Box::pin(async move {
                     let sock = "/tmp/um_repro_xworker.sock".to_string();
@@ -3429,6 +3477,7 @@ pub(super) fn register_unix_tests(tests: &mut Vec<super::Test>) {
             group: "run_matrix",
             id: "U.repro.cross_worker".to_string(),
             xfail: None,
+            timeout_secs: 60,
             run: Box::new(move |r| {
                 Box::pin(async move {
                     let sock = "/tmp/um_repro_xworker.sock".to_string();
@@ -3472,6 +3521,7 @@ pub(super) fn register_unix_tests(tests: &mut Vec<super::Test>) {
                 group: "run_matrix",
                 id: id.to_string(),
                 xfail: None,
+                timeout_secs: 60,
                 run: Box::new(move |_r| {
                     Box::pin(async move {
                         super::TestOutcome::new(

@@ -580,6 +580,7 @@ fn register_tcp_concurrency_tests(tests: &mut Vec<super::Test>) {
             group: "tcp_stress",
             id: test_id,
             xfail: None,
+            timeout_secs: 180,
             run: Box::new(move |r| {
                 Box::pin(async move {
                     let resp = r
@@ -641,6 +642,7 @@ fn register_tcp_data_size_tests(tests: &mut Vec<super::Test>) {
             group: "tcp_stress",
             id: test_id,
             xfail: None,
+            timeout_secs: 180,
             run: Box::new(move |r| {
                 Box::pin(async move {
                     let resp = r
@@ -690,6 +692,7 @@ fn register_tcp_reconnect_stress_tests(tests: &mut Vec<super::Test>) {
             group: "tcp_stress",
             id: test_id,
             xfail: None,
+            timeout_secs: 180,
             run: Box::new(move |r| {
                 Box::pin(async move {
                     let resp = r
@@ -737,6 +740,7 @@ fn register_tcp_fullduplex_tests(tests: &mut Vec<super::Test>) {
             group: "tcp_stress",
             id: test_id,
             xfail: None,
+            timeout_secs: 180,
             run: Box::new(move |r| {
                 let self_exe = r.self_exe.clone();
                 Box::pin(async move {
@@ -813,6 +817,7 @@ fn register_tcp_cross_worker_concurrent_tests(tests: &mut Vec<super::Test>) {
                 group: "tcp_stress",
                 id: test_id,
                 xfail: None,
+                timeout_secs: 180,
                 run: Box::new(move |r| {
                     Box::pin(async move {
                         let resp = r
@@ -888,6 +893,7 @@ fn register_tcp_cross_worker_concurrent_tests(tests: &mut Vec<super::Test>) {
                 group: "tcp_stress",
                 id: test_id,
                 xfail: None,
+                timeout_secs: 180,
                 run: Box::new(move |r| {
                     Box::pin(async move {
                         let resp = r

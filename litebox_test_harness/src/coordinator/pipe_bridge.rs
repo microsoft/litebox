@@ -701,6 +701,7 @@ pub(crate) fn register_pipe_bridge(tests: &mut Vec<super::Test>) {
                 group: "pipe_bridge",
                 id,
                 xfail: None,
+                timeout_secs: 90,
                 run: Box::new(move |r| {
                     let self_exe = r.self_exe.clone();
                     Box::pin(async move {

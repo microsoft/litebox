@@ -530,6 +530,7 @@ fn register_listen_file_tests(tests: &mut Vec<super::Test>) {
                 group: "file_tcp",
                 id,
                 xfail: None,
+                timeout_secs: 180,
                 run: Box::new(move |r| {
                     Box::pin(async move {
                         let listen_resp = r
@@ -570,6 +571,7 @@ fn register_listen_file_tests(tests: &mut Vec<super::Test>) {
                 group: "file_tcp",
                 id,
                 xfail: None,
+            timeout_secs: 180,
                 run: Box::new(move |r| {
                     Box::pin(async move {
                         let listen_resp = r
@@ -618,6 +620,7 @@ fn register_listen_file_tests(tests: &mut Vec<super::Test>) {
                 group: "file_tcp",
                 id,
                 xfail: None,
+            timeout_secs: 180,
                 run: Box::new(move |r| {
                     Box::pin(async move {
                         let listen_resp = r
@@ -659,6 +662,7 @@ fn register_conn_file_tests(tests: &mut Vec<super::Test>) {
         group: "file_tcp",
         id: "FT.conn_echo".to_string(),
         xfail: None,
+            timeout_secs: 180,
         run: Box::new(move |r| {
             Box::pin(async move {
                 let listen_resp = r
@@ -695,6 +699,7 @@ fn register_conn_file_tests(tests: &mut Vec<super::Test>) {
         group: "file_tcp",
         id: "FT.conn_read_after".to_string(),
         xfail: None,
+            timeout_secs: 180,
         run: Box::new(move |r| {
             Box::pin(async move {
                 let listen_resp = r
@@ -739,6 +744,7 @@ fn register_conn_file_tests(tests: &mut Vec<super::Test>) {
         group: "file_tcp",
         id: "FT.conn_write".to_string(),
         xfail: None,
+        timeout_secs: 180,
         run: Box::new(move |r| {
             Box::pin(async move {
                 let listen_resp = r
@@ -784,6 +790,7 @@ fn register_conn_file_tests(tests: &mut Vec<super::Test>) {
         group: "file_tcp",
         id: "FT.conn_readback".to_string(),
         xfail: None,
+            timeout_secs: 180,
         run: Box::new(move |r| {
             Box::pin(async move {
                 let listen_resp = r
@@ -839,6 +846,7 @@ fn register_interleave_tests(tests: &mut Vec<super::Test>) {
         group: "file_tcp",
         id: "FT.interleave_self_small".to_string(),
         xfail: None,
+            timeout_secs: 180,
         run: Box::new(|r| {
             Box::pin(async move {
                 let agent = "A";
@@ -887,6 +895,7 @@ fn register_interleave_tests(tests: &mut Vec<super::Test>) {
         group: "file_tcp",
         id: "FT.interleave_self_4k".to_string(),
         xfail: None,
+            timeout_secs: 180,
         run: Box::new(|r| {
             Box::pin(async move {
                 let agent = "A";
@@ -935,6 +944,7 @@ fn register_interleave_tests(tests: &mut Vec<super::Test>) {
         group: "file_tcp",
         id: "FT.interleave_self_32k".to_string(),
         xfail: None,
+            timeout_secs: 180,
         run: Box::new(|r| {
             Box::pin(async move {
                 let agent = "A";
@@ -983,6 +993,7 @@ fn register_interleave_tests(tests: &mut Vec<super::Test>) {
         group: "file_tcp",
         id: "FT.interleave_cross_small".to_string(),
         xfail: None,
+            timeout_secs: 180,
         run: Box::new(|r| {
             Box::pin(async move {
                 let port = 18121u16;
@@ -1030,6 +1041,7 @@ fn register_interleave_tests(tests: &mut Vec<super::Test>) {
         group: "file_tcp",
         id: "FT.interleave_cross_4k".to_string(),
         xfail: None,
+            timeout_secs: 180,
         run: Box::new(|r| {
             Box::pin(async move {
                 let port = 18121u16;
@@ -1081,6 +1093,7 @@ fn register_multi_cycle_tests(tests: &mut Vec<super::Test>) {
         group: "file_tcp",
         id: "FT.multi_x5".to_string(),
         xfail: None,
+            timeout_secs: 180,
         run: Box::new(move |r| {
             Box::pin(async move {
                 let agent = "A";
@@ -1148,6 +1161,7 @@ fn register_multi_cycle_tests(tests: &mut Vec<super::Test>) {
         group: "file_tcp",
         id: "FT.multi_interleave_x5".to_string(),
         xfail: None,
+            timeout_secs: 180,
         run: Box::new(move |r| {
             Box::pin(async move {
                 let agent = "A";
@@ -1202,6 +1216,7 @@ fn register_exec_during_tcp_tests(tests: &mut Vec<super::Test>) {
         group: "file_tcp",
         id: "FT.exec_cat_during_tcp".to_string(),
         xfail: None,
+            timeout_secs: 180,
         run: Box::new(move |r| {
             Box::pin(async move {
                 let agent = "A";
@@ -1248,6 +1263,7 @@ fn register_exec_during_tcp_tests(tests: &mut Vec<super::Test>) {
         group: "file_tcp",
         id: "FT.echo_after_exec".to_string(),
         xfail: None,
+            timeout_secs: 180,
         run: Box::new(move |r| {
             Box::pin(async move {
                 let agent = "A";

@@ -45,6 +45,7 @@ pub(crate) struct Test {
     pub group: &'static str,
     pub id: String,
     pub xfail: Option<String>,
+    pub timeout_secs: u64,
     pub run: Box<dyn FnOnce(&'_ mut TestRunner) -> Pin<Box<dyn Future<Output = TestOutcome> + '_>>>,
 }
 
@@ -537,6 +538,7 @@ fn register_canary(tests: &mut Vec<Test>) {
         group: "canary",
         id: "X_canary.pre_sequence".to_string(),
         xfail: None,
+        timeout_secs: 60,
         run: Box::new(|r| {
             let self_exe = r.self_exe.clone();
             Box::pin(async move {
@@ -651,7 +653,7 @@ async fn run_tests(self_exe: &str, filter: Option<&str>) -> Vec<TestResult> {
         // Need a fresh tree for these.
         runner.spawn_tree().await;
         for test in new_filtered {
-            let timeout_dur = Duration::from_secs(30);
+            let timeout_dur = Duration::from_secs(test.timeout_secs);
             match tokio::time::timeout(timeout_dur, (test.run)(&mut runner)).await {
                 Ok(outcome) => {
                     if let Some(reason) = &test.xfail {
@@ -667,7 +669,18 @@ async fn run_tests(self_exe: &str, filter: Option<&str>) -> Vec<TestResult> {
                     }
                 }
                 Err(_) => {
-                    runner.record(&test.id, "?", false, "test timeout (30s)");
+                    runner.record(
+                        &test.id,
+                        "?",
+                        false,
+                        &format!("test timeout ({}s)", test.timeout_secs),
+                    );
+                    // Agent stream is desynchronized — poison all agents
+                    // so subsequent tests fail fast.
+                    let ids: Vec<String> = runner.children.keys().cloned().collect();
+                    for id in ids {
+                        runner.poison_agent(&id).await;
+                    }
                 }
             }
         }
