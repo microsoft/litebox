@@ -756,7 +756,7 @@ fn open_session_new_instance(
         shim.load_ldelf(
             LDELF_BINARY,
             ta_uuid,
-            Some(TA_BINARY),
+            find_ta_binary(ta_uuid),
             client_identity,
             runner_session_id,
         )
@@ -1314,6 +1314,21 @@ fn write_rpc_args_to_normal_world(
 // use include_bytes! to include ldelf and (KMPP) TA binaries
 const LDELF_BINARY: &[u8] = &[0u8; 0];
 const TA_BINARY: &[u8] = &[0u8; 0];
+const TA_BINARIES: &[&[u8]] = &[TA_BINARY];
+
+// Look up TA binary by UUID.
+fn find_ta_binary(ta_uuid: litebox_common_optee::TeeUuid) -> Option<&'static [u8]> {
+    use litebox_common_optee::parse_ta_head;
+
+    for ta_binary in TA_BINARIES {
+        if let Some(ta_head) = parse_ta_head(ta_binary)
+            && ta_head.uuid == ta_uuid
+        {
+            return Some(ta_binary);
+        }
+    }
+    None
+}
 
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
