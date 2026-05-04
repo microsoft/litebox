@@ -501,6 +501,7 @@ impl<FS: ShimFS> LinuxShim<FS> {
                 deferred_vfork_park: Cell::new(false),
                 delayed_fork_pending: Cell::new(false),
                 migrated_to_remote: Cell::new(false),
+                local_task_terminated: Cell::new(false),
                 mux_pipe_pair_ids: RefCell::new(Vec::new()),
                 netlink_sockets: RefCell::new(alloc::collections::BTreeMap::new()),
                 inet6_fds: RefCell::new(alloc::collections::BTreeSet::new()),
@@ -1189,6 +1190,7 @@ impl<FS: ShimFS> LinuxShim<FS> {
                 deferred_vfork_park: Cell::new(false),
                 delayed_fork_pending: Cell::new(false),
                 migrated_to_remote: Cell::new(false),
+                local_task_terminated: Cell::new(false),
                 mux_pipe_pair_ids: RefCell::new(Vec::new()),
                 netlink_sockets: RefCell::new(alloc::collections::BTreeMap::new()),
                 inet6_fds: RefCell::new(alloc::collections::BTreeSet::new()),
@@ -2386,14 +2388,17 @@ impl<FS: ShimFS> Task<FS> {
                     self.delayed_fork_pending.set(false);
                     // Fall through to normal syscall handling.
                 } else if self.commit_delayed_fork(ctx).is_ok() {
-                    // Child migrated to worker host.  Terminate this local task.
+                    // Child migrated to a worker host.  Stop this local shim
+                    // task without marking the current host thread as exiting:
+                    // the host thread belongs to the parent runtime and must
+                    // remain available after the migrated child is handed off.
                     #[cfg(feature = "trace_syscalls")]
                     litebox::log_println!(
                         self.global.platform,
-                        "[DELAYED-FORK-TRIGGER] pid={}: commit SUCCESS — child migrated, exiting local task",
+                        "[DELAYED-FORK-TRIGGER] pid={}: commit SUCCESS — child migrated, terminating local task",
                         self.pid,
                     );
-                    self.exit_thread(0);
+                    self.local_task_terminated.set(true);
                     return Ok(0);
                 }
                 // Delayed fork could not migrate this child (e.g. unsupported
@@ -3538,7 +3543,7 @@ pub(crate) struct VforkParking {
 }
 
 /// Which virtual subsystem the replaced fd belonged to.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ReplacedSubsystem {
     Pipe,
     UnixSocket,
@@ -3826,6 +3831,10 @@ struct Task<FS: ShimFS> {
     /// was migrated to a remote worker host (the background waiter handles
     /// the real exit).
     migrated_to_remote: Cell<bool>,
+    /// Set when the local shim task should stop without marking its host
+    /// thread's `ThreadRemote` as exiting (for remote exec handoff paths where
+    /// the host thread belongs to the parent runtime and must remain alive).
+    local_task_terminated: Cell<bool>,
     /// Pipe pair_ids of virtual pipes created by the mux dispatcher or fd
     /// replacement relay setup.  These are infrastructure pipes that should
     /// NOT be bridged again when a subsequent child forks.  Tracked so that
@@ -3889,6 +3898,7 @@ mod test_utils {
                 deferred_vfork_park: Cell::new(false),
                 delayed_fork_pending: Cell::new(false),
                 migrated_to_remote: Cell::new(false),
+                local_task_terminated: Cell::new(false),
                 mux_pipe_pair_ids: RefCell::new(Vec::new()),
                 netlink_sockets: RefCell::new(alloc::collections::BTreeMap::new()),
                 inet6_fds: RefCell::new(alloc::collections::BTreeSet::new()),
@@ -3927,6 +3937,7 @@ mod test_utils {
                 deferred_vfork_park: Cell::new(false),
                 delayed_fork_pending: Cell::new(false),
                 migrated_to_remote: Cell::new(false),
+                local_task_terminated: Cell::new(false),
                 mux_pipe_pair_ids: RefCell::new(Vec::new()),
                 netlink_sockets: RefCell::new(alloc::collections::BTreeMap::new()),
                 inet6_fds: RefCell::new(alloc::collections::BTreeSet::new()),

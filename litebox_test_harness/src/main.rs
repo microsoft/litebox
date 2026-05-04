@@ -443,8 +443,8 @@ fn main() {
             let scratch = format!("/tmp/m3-{parent_pid}.txt");
             let write_res = std::fs::write(&scratch, b"M3_PARENT_ALIVE\n")
                 .map_err(|e| format!("write {scratch}: {e}"));
-            let read_back = std::fs::read_to_string(&scratch)
-                .map_err(|e| format!("read {scratch}: {e}"));
+            let read_back =
+                std::fs::read_to_string(&scratch).map_err(|e| format!("read {scratch}: {e}"));
             let _ = std::fs::remove_file(&scratch);
             match (stat, write_res, read_back) {
                 (Ok(_), Ok(()), Ok(s)) if s.contains("M3_PARENT_ALIVE") => {

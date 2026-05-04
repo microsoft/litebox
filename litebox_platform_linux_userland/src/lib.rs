@@ -1485,18 +1485,27 @@ impl LinuxUserland {
         let mut output_bridges = Vec::new();
         let mut worker_output_write_fds = Vec::new();
         for group in output_groups.drain(..) {
-            let (write_nonblocking, write_capacity) = match &group.sink {
-                WorkerExecOutputSink::Pipe { pipes, fd } => (
-                    pipes
-                        .get_flags(fd.as_ref())
-                        .map(|flags| flags.contains(litebox::pipes::Flags::NON_BLOCKING))
-                        .unwrap_or(false),
-                    pipes
-                        .writable_bytes(fd.as_ref())
-                        .ok()
-                        .filter(|capacity| supports_bridge_pipe_capacity(*capacity)),
-                ),
-                WorkerExecOutputSink::Fs { .. } | WorkerExecOutputSink::Stream(_) => (false, None),
+            let direct_output_pipe = direct_pipe_io
+                && group.target_fds.contains(&1)
+                && matches!(&group.sink, WorkerExecOutputSink::Pipe { .. });
+            let (write_nonblocking, write_capacity) = if direct_output_pipe {
+                (false, None)
+            } else {
+                match &group.sink {
+                    WorkerExecOutputSink::Pipe { pipes, fd } => (
+                        pipes
+                            .get_flags(fd.as_ref())
+                            .map(|flags| flags.contains(litebox::pipes::Flags::NON_BLOCKING))
+                            .unwrap_or(false),
+                        pipes
+                            .writable_bytes(fd.as_ref())
+                            .ok()
+                            .filter(|capacity| supports_bridge_pipe_capacity(*capacity)),
+                    ),
+                    WorkerExecOutputSink::Fs { .. } | WorkerExecOutputSink::Stream(_) => {
+                        (false, None)
+                    }
+                }
             };
             if write_nonblocking && write_capacity.is_none() {
                 return Err(-1_i32);
@@ -1582,7 +1591,10 @@ impl LinuxUserland {
             }
         }
         for (sink, read_fd, target_fd) in output_bridges {
-            if direct_pipe_io && matches!(&sink, WorkerExecOutputSink::Pipe { .. }) {
+            if direct_pipe_io
+                && target_fd == 1
+                && matches!(&sink, WorkerExecOutputSink::Pipe { .. })
+            {
                 let raw_fd = read_fd.into_raw_fd();
                 direct_pipes.push(ExecPipeDirectIo {
                     child_stdio_fd: target_fd,

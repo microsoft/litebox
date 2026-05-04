@@ -2051,6 +2051,7 @@ impl<FS: ShimFS> Task<FS> {
                         deferred_vfork_park: core::cell::Cell::new(false),
                         delayed_fork_pending: core::cell::Cell::new(false),
                         migrated_to_remote: core::cell::Cell::new(false),
+                        local_task_terminated: core::cell::Cell::new(false),
                         mux_pipe_pair_ids: core::cell::RefCell::new(alloc::vec::Vec::new()),
                         netlink_sockets: core::cell::RefCell::new(
                             alloc::collections::BTreeMap::new(),
@@ -2795,6 +2796,7 @@ impl<FS: ShimFS> Task<FS> {
                         deferred_vfork_park: core::cell::Cell::new(false),
                         delayed_fork_pending: core::cell::Cell::new(delayed_fork),
                         migrated_to_remote: core::cell::Cell::new(false),
+                        local_task_terminated: core::cell::Cell::new(false),
                         mux_pipe_pair_ids: core::cell::RefCell::new(alloc::vec::Vec::new()),
                         netlink_sockets: core::cell::RefCell::new(
                             alloc::collections::BTreeMap::new(),
@@ -2978,14 +2980,15 @@ impl<FS: ShimFS> Task<FS> {
                         repl.direction,
                     );
 
-                    // Bidirectional (ReadWrite): install HostPipeFd directly
-                    // backed by the OS socketpair fd. No virtual pipe or relay
-                    // thread needed — reads/writes go straight to the OS fd.
-                    if repl.direction == HostPipeDirection::ReadWrite {
-                        let entry = super::host_pipe::HostPipeFd::new(
-                            repl.host_fd,
-                            HostPipeDirection::ReadWrite,
-                        );
+                    // Bidirectional sockets and read-only pipe replacements can
+                    // use HostPipeFd directly. HostPipeFd participates in epoll
+                    // via host polling, so direct read ends avoid an extra relay
+                    // that can miss the parent epoll wakeup during remote exec.
+                    if repl.direction == HostPipeDirection::ReadWrite
+                        || (repl.direction == HostPipeDirection::Read
+                            && repl.subsystem == crate::ReplacedSubsystem::Pipe)
+                    {
+                        let entry = super::host_pipe::HostPipeFd::new(repl.host_fd, repl.direction);
                         let typed_fd: litebox::fd::TypedFd<super::host_pipe::HostPipeSubsystem> =
                             self.global.litebox.descriptor_table_mut().insert(entry);
 
@@ -8535,6 +8538,46 @@ impl<FS: ShimFS> Task<FS> {
             );
             signal_on_error(&vfork_info);
         })?;
+        let stdio_pipe_info: Vec<(i32, usize, super::host_pipe::HostPipeDirection)> = {
+            let files = self.files.borrow();
+            let rds = files.raw_descriptor_store.read();
+            let mut out = Vec::new();
+            for raw_fd in 0..=2_usize {
+                if let Ok(typed) =
+                    rds.fd_from_raw_integer::<litebox::pipes::Pipes<crate::Platform>>(raw_fd)
+                {
+                    let direction = match self.global.pipes.half_pipe_type(&typed) {
+                        Ok(litebox::pipes::HalfPipeType::ReceiverHalf) => {
+                            super::host_pipe::HostPipeDirection::Read
+                        }
+                        Ok(litebox::pipes::HalfPipeType::SenderHalf) => {
+                            super::host_pipe::HostPipeDirection::Write
+                        }
+                        Err(_) => continue,
+                    };
+                    if let Ok(pair_id) = self.global.pipes.pipe_pair_id(&typed) {
+                        out.push((raw_fd as i32, pair_id, direction));
+                    }
+                }
+            }
+            out
+        };
+
+        let use_direct_stdio = if let Some((_, parent_pipe_fds, _)) = &vfork_info {
+            !stdio_pipe_info.is_empty()
+                && stdio_pipe_info
+                    .iter()
+                    .all(|(_, child_pair_id, child_direction)| {
+                        parent_pipe_fds
+                            .iter()
+                            .any(|&(_, parent_direction, parent_pair_id)| {
+                                parent_pair_id == *child_pair_id
+                                    && parent_direction != *child_direction
+                            })
+                    })
+        } else {
+            false
+        };
 
         // Collect non-stdio fds to bridge to the remote worker.
         // Two categories:
@@ -8684,12 +8727,12 @@ impl<FS: ShimFS> Task<FS> {
                 guest_exec_image,
                 guest_interp_image,
                 worker_stdio,
-                // Always pass false: let the remote worker use the child's
-                // stdio bindings (pipes inherited from delayed-fork) rather
-                // than creating direct pipes + fd replacements.  This makes
-                // non-PIE exec transparent to the parent — data flows through
-                // the child's existing pipe chain, identical to PIE exec.
-                false,
+                // For vfork-style children, route stdio through direct host
+                // pipes and install parent-side replacements below.  The local
+                // child fd table is transient; a platform bridge that writes
+                // back through the child's inherited virtual pipe can miss the
+                // PIE parent's epoll interest after the remote handoff.
+                use_direct_stdio,
                 &extra_fds,
             )
             .map_err(|_err| {
@@ -8723,7 +8766,32 @@ impl<FS: ShimFS> Task<FS> {
         // by the OS socketpair parent end. Find the peer by pair_id.
         // Also replace parent's peer pipe fds.
         if let Some((vd, parent_pipe_fds, parent_socket_fds)) = &vfork_info {
-            for &(child_guest_fd, parent_os_fd, child_pair_id, child_oid) in
+            for direct in spawn_result.direct_pipes {
+                let mut stored = false;
+                if let Some((_, child_pair_id, child_direction)) = stdio_pipe_info
+                    .iter()
+                    .find(|(fd, _, _)| *fd == direct.child_stdio_fd)
+                {
+                    for &(parent_fd, parent_direction, parent_pair_id) in parent_pipe_fds {
+                        if parent_pair_id == *child_pair_id && parent_direction != *child_direction
+                        {
+                            vd.fd_replacements.lock().push(crate::FdReplacement {
+                                guest_fd: parent_fd,
+                                host_fd: direct.parent_os_fd,
+                                direction: parent_direction,
+                                subsystem: crate::ReplacedSubsystem::Pipe,
+                            });
+                            stored = true;
+                            break;
+                        }
+                    }
+                }
+                if !stored {
+                    self.global.platform.close_host_fd(direct.parent_os_fd);
+                }
+            }
+
+            for &(_child_guest_fd, parent_os_fd, child_pair_id, child_oid) in
                 &parent_bidi_replacements
             {
                 let mut stored = false;
@@ -8798,24 +8866,26 @@ impl<FS: ShimFS> Task<FS> {
             exit_code,
         );
 
-        // Use thread-only exit instead of exit_group.  The vfork child
-        // still shares the parent's Process object (only ProcessState
-        // was detached).  exit_group would mark ALL parent threads as
-        // is_exiting, killing relay threads that bridge pipe data from
-        // the child worker back to the parent.
-        //
-        // exit_thread only marks this thread as exiting, leaving the
-        // parent's threads (including relay threads) alive so they can
-        // finish draining bridge data.
-        if exit_code > 255 {
+        if vfork_info.is_some() {
+            let status = if exit_code > 255 {
+                match litebox_common_linux::signal::Signal::try_from(exit_code - 256) {
+                    Ok(signal) => ExitStatus::Signal(signal),
+                    Err(_) => ExitStatus::Exit(127_i32.truncate()),
+                }
+            } else {
+                ExitStatus::Exit(exit_code.truncate())
+            };
+            self.thread.process.inner.lock().exit_status = status;
+            self.local_task_terminated.set(true);
+        } else if exit_code > 255 {
             // Signal exit: use 128 + signal as the exit code (shell convention).
             self.exit_thread((exit_code - 256).truncate());
         } else {
             self.exit_thread(exit_code.truncate());
         }
 
-        // The syscall handler loop will notice is_exiting and stop running
-        // guest code. Return ENOSYS as a placeholder — this path should
+        // The syscall handler loop will stop the local shim task before it can
+        // resume guest code. Return ENOSYS as a placeholder — this path should
         // not be reached in practice.
         Err(Errno::ENOSYS)
     }
@@ -9050,7 +9120,11 @@ impl<FS: ShimFS> Task<FS> {
                 remote_interp_image,
                 vfork_info_for_exec,
             );
-            if detached_from_shared_fork && result.is_err() && !self.is_exiting() {
+            if detached_from_shared_fork
+                && result.is_err()
+                && !self.is_exiting()
+                && !self.local_task_terminated.get()
+            {
                 litebox::log_println!(
                     self.global.platform,
                     "execve({:?}): remote worker handoff failed after detach — terminating child",
