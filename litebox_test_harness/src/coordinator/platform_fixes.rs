@@ -826,6 +826,86 @@ pub(crate) fn register_fork_from_worker_exec_tests(reg: &mut Registry<'_>) {
 }
 
 // ═══════════════════════════════════════════════════════════════════
+// M1-M4: Minimal canary repros for SpawnRemote/non-PIE bug
+// ═══════════════════════════════════════════════════════════════════
+//
+// These are the minimal repros for the wave-0 canary cascade. The
+// canary itself runs `Exec [self_exe, "echo-test"]` on agent A. It
+// times out under litebox not because echo-test is broken, but
+// because spawn_tree's earlier SpawnRemote NP call killed agent A
+// as a side effect.
+//
+// Each M test runs as `Exec [self_exe, "M{N}-..."]` from a launcher
+// agent. The M subprocess then spawns a non-PIE child via the
+// indicated mechanism and verifies the parent process is still
+// alive after wait. If the parent dies before printing M{N}_OK,
+// the launcher's Exec times out or returns a bad exit code, and
+// the test FAILs.
+//
+// Matrix: 4 M variants × 5 launchers (A, AA, D3, D4, D5):
+//   - A, AA, D3, D5 are PIE — they exec a PIE M-subprocess. The
+//     canary mechanism (PIE process tokio runtime spawning non-PIE
+//     child) is reproduced inside the M subprocess.
+//   - D4 is non-PIE — it execs a non-PIE M-subprocess. This tests
+//     the related non-PIE → non-PIE spawn path.
+//
+// Native must pass all 20 tests.
+
+pub(crate) fn register_minimal_canary_tests(reg: &mut Registry<'_>) {
+    const M_LAUNCHERS: &[AgentName] = &[
+        AgentName::A,
+        AgentName::AA,
+        AgentName::D3,
+        AgentName::D4,
+        AgentName::D5,
+    ];
+    const M_VARIANTS: &[(&str, &str, &str, u64)] = &[
+        // (id_prefix, subcommand, expected_stdout_marker, exec_timeout_secs)
+        ("M1", "M1-tokio-spawn-nonpie", "M1_OK", 30),
+        ("M2", "M2-libc-spawn-nonpie", "M2_OK", 30),
+        ("M3", "M3-tokio-spawn-nonpie-then-work", "M3_OK", 30),
+        ("M4", "M4-tokio-spawn-nonpie-repeated", "M4_OK", 60),
+    ];
+
+    for &launcher in M_LAUNCHERS {
+        for &(id_prefix, subcommand, marker, timeout_secs) in M_VARIANTS {
+            let launcher_s = launcher.to_string();
+            let subcommand_s: String = subcommand.into();
+            let marker_s: String = marker.into();
+            reg.test(
+                "fork",
+                "minimal_canary",
+                format!("{id_prefix}.{launcher_s}"),
+            )
+            .timeout(timeout_secs + 10)
+            .build(move |cx| {
+                let handle = cx.require(launcher);
+                Box::new(move |run| {
+                    let l = launcher_s.clone();
+                    let sc = subcommand_s.clone();
+                    let m = marker_s.clone();
+                    let self_exe = run.self_exe().to_string();
+                    Box::pin(async move {
+                        let resp = run
+                            .send(
+                                &handle,
+                                super::exec_timeout(vec![self_exe, sc], timeout_secs),
+                            )
+                            .await;
+                        let pass = matches!(
+                            &resp,
+                            Response::ExecResult { exit_code: 0, stdout, .. }
+                                if stdout.contains(m.as_str())
+                        );
+                        super::TestOutcome::new(&l, pass, format!("{resp:?}"))
+                    })
+                })
+            });
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
 // SP: stdin-pipe command substitution
 // ═══════════════════════════════════════════════════════════════════
 
