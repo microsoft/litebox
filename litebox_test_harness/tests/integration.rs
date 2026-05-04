@@ -27,7 +27,6 @@ use std::process::Command;
 use std::sync::Mutex;
 
 use libtest_mimic::{Arguments, Failed, Trial};
-use litebox_test_harness::test_registry::TEST_GROUPS;
 
 // ── Pass result cache ────────────────────────────────────────────────
 //
@@ -246,9 +245,6 @@ fn run_pass_group(pass: &str, suite_filter: &str, test_id: &str) -> Result<(), F
         let result = r["result"].as_str().unwrap_or("?");
         if result == "FAIL" {
             let detail = r["detail"].as_str().unwrap_or("");
-            if pass == "litebox" {
-                return Ok(());
-            }
             return Err(format!("{pass}::{test_id}: {detail}").into());
         }
     }

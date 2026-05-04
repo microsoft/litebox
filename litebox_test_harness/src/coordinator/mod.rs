@@ -15,7 +15,7 @@ pub(crate) mod special_cases;
 pub(crate) mod tcp_stress;
 
 use crate::protocol::{Command, Response};
-use crate::test_registry::{TEST_GROUPS, group_timeout, matches_filter};
+use crate::test_registry::matches_filter;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::time::Duration;
 
@@ -520,32 +520,6 @@ impl TestRunner {
 }
 
 /// Dispatch a single test group to the appropriate async test function.
-async fn run_group(runner: &mut TestRunner, suite: &str, group: &str) {
-    match (suite, group) {
-        // matrix
-        // Converted to register_netlink (new-style)
-        // ("matrix", "netlink") => special_cases::netlink_tests(runner).await,
-        // fork
-        // ("fork", "fork_matrix") => fork_matrix::run_fork_matrix_tests(runner).await, // converted
-        // shell
-        // xworker
-        // ("xworker", "unix_socket") => special_cases::unix_socket_tests(runner).await, // converted
-        // ("xworker", "cross_worker") => special_cases::cross_worker_tests(runner).await, // converted
-        // ("xworker", "pipe_eof") => special_cases::pipe_eof_tests(runner).await, // converted
-        // ("xworker", "pipe_bridge") => pipe_bridge::pipe_bridge_tests(runner).await, // converted
-        // stress
-        // contamination
-        // ("contamination", "contamination_sequence") => special_cases::contamination_sequence_tests(runner).await, // converted
-        _ => {
-            runner.record(
-                &format!("UNKNOWN_GROUP.{suite}.{group}"),
-                "coord",
-                false,
-                "test group not found in run_group dispatch — add a match arm",
-            );
-        }
-    }
-}
 
 /// Run tests, optionally filtering to a specific suite.
 pub fn run_filtered(self_exe: &str, filter: Option<&str>) -> Vec<TestResult> {
@@ -595,7 +569,7 @@ fn matches_test(filter: Option<&str>, test: &Test) -> bool {
                 return true;
             }
             // Then try test ID prefix match
-            test.id.starts_with(f) || test.id.contains(f)
+            test.id.starts_with(f)
         }
     }
 }
@@ -612,38 +586,10 @@ async fn run_tests(self_exe: &str, filter: Option<&str>) -> Vec<TestResult> {
         recorded_ids: std::collections::HashSet::new(),
     };
 
-    // Build the agent tree once.
-    runner.spawn_tree().await;
-
-    for &(suite, group) in TEST_GROUPS {
-        if !matches_filter(filter, suite, group) {
-            continue;
-        }
-        let timeout = group_timeout(suite, group);
-        eprintln!("[coord] --- {suite}::{group} (timeout {timeout}s) ---");
-
-        if tokio::time::timeout(
-            Duration::from_secs(timeout),
-            run_group(&mut runner, suite, group),
-        )
-        .await
-        .is_err()
-        {
-            runner.record(
-                &format!("GROUP_TIMEOUT.{suite}.{group}"),
-                "coord",
-                false,
-                &format!("{suite}::{group} exceeded {timeout}s timeout"),
-            );
-        }
-    }
-
-    // Clean shutdown.
-    runner.teardown_tree().await;
-
     // --- New-style declarative tests (proof of concept) ---
     // Collect registered tests.
     let mut new_tests: Vec<Test> = Vec::new();
+    register_canary(&mut new_tests);
     special_cases::register_netlink(&mut new_tests);
     concurrent_fork::register_concurrent_fork_pipeline(&mut new_tests);
     concurrent_fork::register_concurrent_exec(&mut new_tests);
@@ -655,7 +601,6 @@ async fn run_tests(self_exe: &str, filter: Option<&str>) -> Vec<TestResult> {
     special_cases::register_fs_io(&mut new_tests);
     special_cases::register_capture_pipe(&mut new_tests);
     special_cases::register_stdin_script(&mut new_tests);
-    register_canary(&mut new_tests);
     matrix::register_matrix(&mut new_tests);
     new_tests.extend(platform_fixes::register_poll_ready_tests());
     new_tests.extend(platform_fixes::register_bind_getsockname_tests());
@@ -689,6 +634,13 @@ async fn run_tests(self_exe: &str, filter: Option<&str>) -> Vec<TestResult> {
     special_cases::register_contamination_sequence(&mut new_tests);
 
     // Filter to only tests matching the --filter argument.
+    // Protocol header: output all registered test IDs before execution.
+    eprintln!("TEST_IDS_BEGIN");
+    for test in &new_tests {
+        eprintln!("{}", test.id);
+    }
+    eprintln!("TEST_IDS_END {}", new_tests.len());
+
     let new_filtered: Vec<Test> = new_tests
         .into_iter()
         .filter(|t| matches_test(filter, t))
