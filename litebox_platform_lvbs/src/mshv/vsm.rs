@@ -1160,6 +1160,9 @@ pub fn vsm_dispatch(func_id: VsmFunction, params: &[u64]) -> i64 {
             mshv_vsm_allocate_ringbuffer_memory(params[0], size)
         }
         VsmFunction::SetPlatformRootKey => mshv_vsm_set_platform_root_key(params[0]),
+        VsmFunction::GenerateIdentitySigningKey => {
+            Err(VsmError::OperationNotSupported("Identity key generation"))
+        }
         VsmFunction::OpteeMessage => Err(VsmError::OperationNotSupported("OP-TEE communication")),
     };
     match result {

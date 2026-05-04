@@ -36,6 +36,9 @@ pub(crate) mod syscalls;
 
 pub mod msg_handler;
 
+#[cfg(feature = "platform_lvbs")]
+pub mod idk;
+
 // Re-export session management types for convenience
 pub use session::{OpenSessionTarget, SessionManager, SessionToken, TaInstance};
 
