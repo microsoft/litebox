@@ -19,6 +19,35 @@ use crate::test_registry::{TEST_GROUPS, group_timeout, matches_filter};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::time::Duration;
 
+use std::future::Future;
+use std::pin::Pin;
+
+/// Outcome of a single test execution.
+pub(crate) struct TestOutcome {
+    pub pass: bool,
+    pub agent: String,
+    pub detail: String,
+}
+
+impl TestOutcome {
+    pub fn new(agent: &str, pass: bool, detail: impl Into<String>) -> Self {
+        Self {
+            pass,
+            agent: agent.to_string(),
+            detail: detail.into(),
+        }
+    }
+}
+
+/// A registered test: metadata + deferred execution closure.
+pub(crate) struct Test {
+    pub suite: &'static str,
+    pub group: &'static str,
+    pub id: String,
+    pub xfail: Option<String>,
+    pub run: Box<dyn FnOnce(&'_ mut TestRunner) -> Pin<Box<dyn Future<Output = TestOutcome> + '_>>>,
+}
+
 /// Detect whether we're running inside litebox or on native Linux.
 ///
 /// Returns a human-readable string like:
