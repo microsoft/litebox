@@ -524,37 +524,10 @@ async fn run_group(runner: &mut TestRunner, suite: &str, group: &str) {
         // matrix
         // Converted to register_netlink (new-style)
         // ("matrix", "netlink") => special_cases::netlink_tests(runner).await,
-        ("matrix", "poll_ready") => platform_fixes::poll_ready_tests(runner).await,
-        ("matrix", "bind_getsockname") => platform_fixes::bind_getsockname_tests(runner).await,
-        ("matrix", "pipe_pair_id") => platform_fixes::pipe_pair_id_tests(runner).await,
-        ("matrix", "pipe_nonblock") => platform_fixes::pipe_nonblock_tests(runner).await,
-        ("matrix", "epoll_socket") => platform_fixes::epoll_socket_tests(runner).await,
-        ("matrix", "loopback_tcp") => platform_fixes::loopback_tcp_tests(runner).await,
-        ("matrix", "proc_filesystem") => platform_fixes::proc_filesystem_tests(runner).await,
         // fork
         ("fork", "fork_matrix") => fork_matrix::run_fork_matrix_tests(runner).await,
-        ("fork", "exit_data_integrity") => platform_fixes::exit_data_integrity_tests(runner).await,
-        ("fork", "nonpie_pipe_chain") => platform_fixes::nonpie_pipe_chain_tests(runner).await,
-        ("fork", "bash_fork_exec") => platform_fixes::bash_fork_exec_tests(runner).await,
-        ("fork", "fork_from_worker_exec") => {
-            platform_fixes::fork_from_worker_exec_tests(runner).await
-        }
-        ("fork", "concurrent_fork") => platform_fixes::concurrent_fork_tests(runner).await,
-        ("fork", "pid_visibility") => platform_fixes::pid_visibility_tests(runner).await,
         // shell
-        ("shell", "stdin_pipe_subst") => platform_fixes::stdin_pipe_subst_tests(runner).await,
-        ("shell", "subst_capture") => platform_fixes::subst_capture_tests(runner).await,
-        ("shell", "touch_redirect") => platform_fixes::touch_redirect_tests(runner).await,
-        ("shell", "file_redirect") => platform_fixes::file_redirect_tests(runner).await,
         // xworker
-        ("xworker", "cross_worker_first_connect") => {
-            platform_fixes::cross_worker_first_connect_tests(runner).await
-        }
-        ("xworker", "cross_worker_self_connect") => {
-            platform_fixes::cross_worker_self_connect_tests(runner).await
-        }
-        ("xworker", "cross_worker_file") => platform_fixes::cross_worker_file_tests(runner).await,
-        ("xworker", "fork_listen_close") => platform_fixes::fork_listen_close_tests(runner).await,
         ("xworker", "unix_socket") => special_cases::unix_socket_tests(runner).await,
         ("xworker", "cross_worker") => special_cases::cross_worker_tests(runner).await,
         ("xworker", "pipe_eof") => special_cases::pipe_eof_tests(runner).await,
@@ -673,6 +646,27 @@ async fn run_tests(self_exe: &str, filter: Option<&str>) -> Vec<TestResult> {
     special_cases::register_capture_pipe(&mut new_tests);
     special_cases::register_stdin_script(&mut new_tests);
     matrix::register_matrix(&mut new_tests);
+    new_tests.extend(platform_fixes::register_poll_ready_tests());
+    new_tests.extend(platform_fixes::register_bind_getsockname_tests());
+    new_tests.extend(platform_fixes::register_pipe_pair_id_tests());
+    new_tests.extend(platform_fixes::register_exit_data_integrity_tests());
+    new_tests.extend(platform_fixes::register_nonpie_pipe_chain_tests());
+    new_tests.extend(platform_fixes::register_cross_worker_first_connect_tests());
+    new_tests.extend(platform_fixes::register_cross_worker_self_connect_tests());
+    new_tests.extend(platform_fixes::register_bash_fork_exec_tests());
+    new_tests.extend(platform_fixes::register_fork_from_worker_exec_tests());
+    new_tests.extend(platform_fixes::register_stdin_pipe_subst_tests());
+    new_tests.extend(platform_fixes::register_cross_worker_file_tests());
+    new_tests.extend(platform_fixes::register_subst_capture_tests());
+    new_tests.extend(platform_fixes::register_concurrent_fork_tests());
+    new_tests.extend(platform_fixes::register_touch_redirect_tests());
+    new_tests.extend(platform_fixes::register_pid_visibility_tests());
+    new_tests.extend(platform_fixes::register_file_redirect_tests());
+    new_tests.extend(platform_fixes::register_pipe_nonblock_tests());
+    new_tests.extend(platform_fixes::register_epoll_socket_tests());
+    new_tests.extend(platform_fixes::register_loopback_tcp_tests());
+    new_tests.extend(platform_fixes::register_fork_listen_close_tests());
+    new_tests.extend(platform_fixes::register_proc_filesystem_tests());
 
     // Filter to only tests matching the --filter argument.
     let new_filtered: Vec<Test> = new_tests

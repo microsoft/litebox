@@ -20,34 +20,34 @@ pub const TEST_GROUPS: &[(&str, &str)] = &[
     // ("matrix", "net_ipv6"), // converted
     // ("matrix", "terminal_ioctl"), // converted
     // ("matrix", "fs_io"), // converted
-    ("matrix", "poll_ready"),
-    ("matrix", "bind_getsockname"),
-    ("matrix", "pipe_pair_id"),
-    ("matrix", "pipe_nonblock"),
-    ("matrix", "epoll_socket"),
-    ("matrix", "loopback_tcp"),
-    ("matrix", "proc_filesystem"),
+    // ("matrix", "poll_ready"), // converted
+    // ("matrix", "bind_getsockname"), // converted
+    // ("matrix", "pipe_pair_id"), // converted
+    // ("matrix", "pipe_nonblock"), // converted
+    // ("matrix", "epoll_socket"), // converted
+    // ("matrix", "loopback_tcp"), // converted
+    // ("matrix", "proc_filesystem"), // converted
     // fork — fork/exec patterns, delayed fork, PIE/non-PIE
     ("fork", "fork_matrix"),
-    ("fork", "exit_data_integrity"),
-    ("fork", "nonpie_pipe_chain"),
-    ("fork", "bash_fork_exec"),
-    ("fork", "fork_from_worker_exec"),
-    ("fork", "concurrent_fork"),
-    ("fork", "pid_visibility"),
+    // ("fork", "exit_data_integrity"), // converted
+    // ("fork", "nonpie_pipe_chain"), // converted
+    // ("fork", "bash_fork_exec"), // converted
+    // ("fork", "fork_from_worker_exec"), // converted
+    // ("fork", "concurrent_fork"), // converted
+    // ("fork", "pid_visibility"), // converted
     // ("fork", "capture_pipe"), // converted
     // ("fork", "node_exit"), // converted
     // shell — bash-specific redirect, touch, stdin-pipe
-    ("shell", "stdin_pipe_subst"),
-    ("shell", "subst_capture"),
-    ("shell", "touch_redirect"),
-    ("shell", "file_redirect"),
+    // ("shell", "stdin_pipe_subst"), // converted
+    // ("shell", "subst_capture"), // converted
+    // ("shell", "touch_redirect"), // converted
+    // ("shell", "file_redirect"), // converted
     // ("shell", "stdin_script"), // converted
     // xworker — cross-worker FS, TCP, unix sockets, port routing
-    ("xworker", "cross_worker_first_connect"),
-    ("xworker", "cross_worker_self_connect"),
-    ("xworker", "cross_worker_file"),
-    ("xworker", "fork_listen_close"),
+    // ("xworker", "cross_worker_first_connect"), // converted
+    // ("xworker", "cross_worker_self_connect"), // converted
+    // ("xworker", "cross_worker_file"), // converted
+    // ("xworker", "fork_listen_close"), // converted
     ("xworker", "unix_socket"),
     ("xworker", "cross_worker"),
     ("xworker", "pipe_eof"),
