@@ -1679,24 +1679,25 @@ pub(super) fn register_fs_crud(tests: &mut Vec<super::Test>) {
         let ts = topo.suffix();
 
         if topo.requires_nonpie() && !has_nonpie {
-            // Single skip marker matching the old behaviour.
-            let dest = dest.to_string();
-            let id = format!("F.shared.{ts}.absent");
-            tests.push(super::Test {
-                suite: "matrix",
-                group: "run_matrix",
-                id,
-                xfail: None,
-                run: Box::new(move |_r| {
-                    Box::pin(async move {
-                        super::TestOutcome::new(
-                            &dest,
-                            false,
-                            "FAIL: nonpie binary not found — mount at /opt/nonpie",
-                        )
-                    })
-                }),
-            });
+            for op in &["absent", "created", "updated", "deleted"] {
+                let dest = dest.to_string();
+                let id = format!("F.shared.{ts}.{op}");
+                tests.push(super::Test {
+                    suite: "matrix",
+                    group: "run_matrix",
+                    id,
+                    xfail: None,
+                    run: Box::new(move |_r| {
+                        Box::pin(async move {
+                            super::TestOutcome::new(
+                                &dest,
+                                false,
+                                "FAIL: nonpie binary not found — mount at /opt/nonpie",
+                            )
+                        })
+                    }),
+                });
+            }
             continue;
         }
 
@@ -1848,6 +1849,27 @@ pub(super) fn register_fs_cross_unlink(tests: &mut Vec<super::Test>) {
     let has_nonpie = crate::find_nonpie_binary().is_some();
     for &topo in FS_TOPOLOGIES {
         if topo.requires_nonpie() && !has_nonpie {
+            let ts = topo.suffix();
+            let (_, dest) = topo.agents();
+            for op in &["delete", "gone"] {
+                let id = format!("F.unlink.{ts}.{op}");
+                let dest = dest.to_string();
+                tests.push(super::Test {
+                    suite: "matrix",
+                    group: "run_matrix",
+                    id,
+                    xfail: None,
+                    run: Box::new(move |_r| {
+                        Box::pin(async move {
+                            super::TestOutcome::new(
+                                &dest,
+                                false,
+                                "nonpie binary not found".to_string(),
+                            )
+                        })
+                    }),
+                });
+            }
             continue;
         }
         let (source, dest) = topo.agents();
@@ -1933,6 +1955,21 @@ pub(super) fn register_tmp_isolation(tests: &mut Vec<super::Test>) {
     let has_nonpie = crate::find_nonpie_binary().is_some();
     for &topo in FS_TOPOLOGIES {
         if topo.requires_nonpie() && !has_nonpie {
+            let ts = topo.suffix();
+            let (_, dest) = topo.agents();
+            let id = format!("F.tmp.{ts}.isolation");
+            let dest = dest.to_string();
+            tests.push(super::Test {
+                suite: "matrix",
+                group: "run_matrix",
+                id,
+                xfail: None,
+                run: Box::new(move |_r| {
+                    Box::pin(async move {
+                        super::TestOutcome::new(&dest, false, "nonpie binary not found".to_string())
+                    })
+                }),
+            });
             continue;
         }
         let (writer, reader) = topo.agents();
@@ -2029,22 +2066,25 @@ pub(super) fn register_net_tests(tests: &mut Vec<super::Test>) {
         if !has_nonpie
             && (agent_requires_nonpie(tc.listener) || agent_requires_nonpie(tc.connector))
         {
-            let listener = tc.listener.to_string();
-            tests.push(super::Test {
-                suite: "matrix",
-                group: "run_matrix",
-                id: format!("N.{}.listen", tc.name),
-                xfail: None,
-                run: Box::new(move |_r| {
-                    Box::pin(async move {
-                        super::TestOutcome::new(
-                            &listener,
-                            false,
-                            "FAIL: nonpie binary not found — mount at /opt/nonpie",
-                        )
-                    })
-                }),
-            });
+            for suffix in &["listen", "connect", "unlisten"] {
+                let listener = tc.listener.to_string();
+                let id = format!("N.{}.{suffix}", tc.name);
+                tests.push(super::Test {
+                    suite: "matrix",
+                    group: "run_matrix",
+                    id,
+                    xfail: None,
+                    run: Box::new(move |_r| {
+                        Box::pin(async move {
+                            super::TestOutcome::new(
+                                &listener,
+                                false,
+                                "FAIL: nonpie binary not found — mount at /opt/nonpie",
+                            )
+                        })
+                    }),
+                });
+            }
             continue;
         }
 
@@ -2446,22 +2486,25 @@ pub(super) fn register_env_tests(tests: &mut Vec<super::Test>) {
 
     for &agent in EXEC_AGENTS {
         if !has_nonpie && agent_requires_nonpie(agent) {
-            let agent_s = agent.to_string();
-            tests.push(super::Test {
-                suite: "matrix",
-                group: "run_matrix",
-                id: format!("E.HOME.{agent}"),
-                xfail: None,
-                run: Box::new(move |_r| {
-                    Box::pin(async move {
-                        super::TestOutcome::new(
-                            &agent_s,
-                            false,
-                            "FAIL: nonpie binary not found — mount at /opt/nonpie",
-                        )
-                    })
-                }),
-            });
+            for var in &["HOME", "PATH", "CWD"] {
+                let agent_s = agent.to_string();
+                let id = format!("E.{var}.{agent}");
+                tests.push(super::Test {
+                    suite: "matrix",
+                    group: "run_matrix",
+                    id,
+                    xfail: None,
+                    run: Box::new(move |_r| {
+                        Box::pin(async move {
+                            super::TestOutcome::new(
+                                &agent_s,
+                                false,
+                                "FAIL: nonpie binary not found — mount at /opt/nonpie",
+                            )
+                        })
+                    }),
+                });
+            }
             continue;
         }
 
@@ -2970,22 +3013,31 @@ pub(super) fn register_unix_tests(tests: &mut Vec<super::Test>) {
             && (agent_requires_nonpie(tc.agent)
                 || tc.peer.is_some_and(|p| agent_requires_nonpie(p)))
         {
-            let agent_s = tc.agent.to_string();
-            tests.push(super::Test {
-                suite: "matrix",
-                group: "run_matrix",
-                id: format!("U.{}.listen", tc.name),
-                xfail: None,
-                run: Box::new(move |_r| {
-                    Box::pin(async move {
-                        super::TestOutcome::new(
-                            &agent_s,
-                            false,
-                            "FAIL: nonpie binary not found — mount at /opt/nonpie",
-                        )
-                    })
-                }),
-            });
+            let suffixes: &[&str] = match tc.pattern {
+                UnixPattern::InProcess => &["listen", "connect"],
+                UnixPattern::ServerForkClient => &["listen", "child_connect"],
+                UnixPattern::BackgroundServerConnect => &["server_start", "connect"],
+                UnixPattern::CrossAgent => &["listen", "connect"],
+            };
+            for suffix in suffixes {
+                let agent_s = tc.agent.to_string();
+                let id = format!("U.{}.{suffix}", tc.name);
+                tests.push(super::Test {
+                    suite: "matrix",
+                    group: "run_matrix",
+                    id,
+                    xfail: None,
+                    run: Box::new(move |_r| {
+                        Box::pin(async move {
+                            super::TestOutcome::new(
+                                &agent_s,
+                                false,
+                                "FAIL: nonpie binary not found — mount at /opt/nonpie",
+                            )
+                        })
+                    }),
+                });
+            }
             continue;
         }
 
@@ -3408,6 +3460,29 @@ pub(super) fn register_unix_tests(tests: &mut Vec<super::Test>) {
                 })
             }),
         });
+    } else {
+        for (id, agent) in [
+            ("U.repro.listen", "D3"),
+            ("U.repro.same_agent", "D3"),
+            ("U.repro.cross_worker", "D4"),
+        ] {
+            let agent = agent.to_string();
+            tests.push(super::Test {
+                suite: "matrix",
+                group: "run_matrix",
+                id: id.to_string(),
+                xfail: None,
+                run: Box::new(move |_r| {
+                    Box::pin(async move {
+                        super::TestOutcome::new(
+                            &agent,
+                            false,
+                            "FAIL: nonpie binary not found — mount at /opt/nonpie",
+                        )
+                    })
+                }),
+            });
+        }
     }
 }
 
