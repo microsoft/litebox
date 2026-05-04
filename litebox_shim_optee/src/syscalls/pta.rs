@@ -194,10 +194,8 @@ impl Task {
             .platform
             .derive_key(Some(huk_subkey_derive_inner), kdf_params)
             .map_err(|err| match err {
-                DerivedKeyError::ShimKDFRequired => {
-                    unreachable!("we always provide a shim KDF callback")
-                }
-                DerivedKeyError::UnsupportedRebootPersistentKey => TeeResult::NotSupported,
+                DerivedKeyError::ShimKDFRequired
+                | DerivedKeyError::UnsupportedRebootPersistentKey => TeeResult::NotSupported,
                 DerivedKeyError::ShimKDFError(err) => err,
             })?;
 

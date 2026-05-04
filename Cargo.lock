@@ -1736,7 +1736,6 @@ dependencies = [
  "litebox",
  "litebox_common_linux",
  "litebox_common_optee",
- "litebox_platform_linux_userland",
  "litebox_platform_multiplex",
  "litebox_util_log",
  "num_enum",
