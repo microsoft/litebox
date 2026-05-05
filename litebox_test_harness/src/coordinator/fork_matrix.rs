@@ -12,8 +12,6 @@
 //! - Non-PIE invocation method
 //! - Contamination pattern (non-PIE then PIE, various depths)
 
-use super::{TestRunner, exec, exec_timeout};
-use crate::protocol::Response;
 
 // ═══════════════════════════════════════════════════════════════════
 // SHELL PATTERNS × DEPTH

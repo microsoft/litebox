@@ -8,15 +8,14 @@
 //! on the state left by the previous exec on the same agent (e.g., "run
 //! non-PIE, then run PIE — does the PIE see clean output?").
 
-use super::{TestRunner, exec};
 use crate::protocol::{Command, Response};
 /// Register netlink tests. Each test is self-contained: one exec + check.
 pub(super) fn register_netlink(tests: &mut Vec<super::Test>) {
     // Helper: create a test that execs a subcommand and checks stdout.
-    let nl =
+    let _nl =
         |id: &str, args: Vec<String>, timeout_secs: u64, check: fn(&str) -> bool| -> super::Test {
             let id = id.to_string();
-            let id2 = id.clone();
+            let _id2 = id.clone();
             super::Test {
                 suite: "matrix",
                 group: "netlink",
@@ -42,7 +41,7 @@ pub(super) fn register_netlink(tests: &mut Vec<super::Test>) {
             }
         };
 
-    let exe = || {
+    let _exe = || {
         std::env::current_exe()
             .unwrap()
             .to_string_lossy()
@@ -261,7 +260,7 @@ pub(super) fn register_terminal_ioctl(tests: &mut Vec<super::Test>) {
 
 /// Register Node.js exit tests.
 pub(super) fn register_node_exit(tests: &mut Vec<super::Test>) {
-    let node_tests: &[(
+    let _node_tests: &[(
         &str,
         Vec<&str>,
         Box<dyn Fn(&crate::protocol::Response) -> bool + Send + Sync>,

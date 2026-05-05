@@ -14,8 +14,6 @@
 //! - FT.interleave: file I/O interleaved between TCP send and recv
 //! - FT.multi: multiple file+TCP round-trips in sequence
 
-use super::{TestRunner, exec_timeout};
-use crate::protocol::{Command, Response};
 
 const TEST_FILE: &str = "/tmp/ft_test.txt";
 const TEST_DATA: &str = "file_tcp_test_data_1234567890";

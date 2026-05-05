@@ -490,7 +490,6 @@ const SYMLINK_TOPOLOGIES: &[Topology] = &[
 //
 // Designed to be appended to (or included from) `matrix.rs`.
 
-use std::pin::Pin;
 
 // ═══════════════════════════════════════════════════════════════════
 // 1. FILESYSTEM CRUD — F.shared.{topo}.{absent,created,updated,deleted}
@@ -534,7 +533,7 @@ pub(super) fn register_fs_crud(tests: &mut Vec<super::Test>) {
 
         // ── absent ──
         {
-            let source = source.clone();
+            let _source = source.clone();
             let dest = dest.clone();
             let ts_s = ts_s.clone();
             tests.push(super::Test {

@@ -19,7 +19,6 @@
 
 
 
-use crate::protocol::Response;
 
 /// Agents to run concurrent fork tests on.
 const CF_AGENTS: &[&str] = &["A", "AA", "B"];
