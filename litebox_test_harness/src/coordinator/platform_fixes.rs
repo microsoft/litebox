@@ -865,6 +865,12 @@ pub(crate) fn register_minimal_canary_tests(reg: &mut Registry<'_>) {
         ("M2", "M2-libc-spawn-nonpie", "M2_OK", 30),
         ("M3", "M3-tokio-spawn-nonpie-then-work", "M3_OK", 30),
         ("M4", "M4-tokio-spawn-nonpie-repeated", "M4_OK", 60),
+        // BS-variants: minimal stdio-direction repros for Bug B.
+        // Same matrix shape as M1-M4. See main.rs comments for what
+        // each subcommand exercises.
+        ("BS1", "BS1-tokio-spawn-nonpie-stderr", "BS1_OK", 30),
+        ("BS2", "BS2-tokio-spawn-nonpie-stdin-echo", "BS2_OK", 30),
+        ("BS3", "BS3-tokio-spawn-nonpie-large-stdout", "BS3_OK", 30),
     ];
 
     for &launcher in M_LAUNCHERS {

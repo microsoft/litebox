@@ -114,6 +114,57 @@ fn main() {
         "echo-test" => {
             println!("ECHO_TEST_OK");
         }
+        // ── Minimal stdio-direction repros (B1-B4) ──────────────────────
+        // These exist to isolate which DIRECTION of stdio bridging is
+        // broken in Bug B (non-PIE worker child stdio data lost to PIE
+        // parent). Used by the BS.* test family in platform_fixes.rs.
+        // Run as the non-PIE child of an M-style spawn.
+        "stderr-only-test" => {
+            // Child writes to stderr only, nothing to stdout. Tests
+            // whether stderr bridging has the same Bug-B shape.
+            eprintln!("STDERR_ONLY_OK");
+        }
+        "stdin-echo-test" => {
+            // Child reads stdin, echoes the bytes to stdout. Tests
+            // bidirectional bridging: parent writes to child stdin
+            // AND reads child stdout. Should print whatever bytes
+            // the parent fed in.
+            let mut buf = [0u8; 4096];
+            let n = unsafe { libc::read(0, buf.as_mut_ptr() as *mut _, buf.len()) };
+            if n > 0 {
+                let _ = unsafe {
+                    libc::write(1, buf.as_ptr() as *const _, n as usize)
+                };
+            }
+        }
+        "large-stdout-test" => {
+            // Child writes a fixed N-byte payload to stdout. Tests
+            // whether stdout bridging works for larger payloads (vs
+            // the small "ECHO_TEST_OK\n" of echo-test). Default 65536.
+            let n_bytes: usize =
+                args.get(2).and_then(|s| s.parse().ok()).unwrap_or(65536);
+            let chunk = b"X".repeat(64);
+            let mut written = 0;
+            while written < n_bytes {
+                let want = (n_bytes - written).min(chunk.len());
+                let r = unsafe {
+                    libc::write(1, chunk.as_ptr() as *const _, want)
+                };
+                if r <= 0 {
+                    break;
+                }
+                written += r as usize;
+            }
+            // Trailer so the test can detect truncation.
+            let trailer = format!("\nLARGE_STDOUT_OK n={written}\n");
+            let _ = unsafe {
+                libc::write(
+                    1,
+                    trailer.as_ptr() as *const _,
+                    trailer.len(),
+                )
+            };
+        }
         "fork-exec-nonpie" => {
             // Fork a child that exec's a non-PIE binary.  Reproduces the
             // VS Code pattern: code-server (PIE) forks node (ET_EXEC).
@@ -501,6 +552,157 @@ fn main() {
                 }
                 Err(e) => {
                     println!("M4_FAIL:{e}");
+                    std::process::exit(1);
+                }
+            }
+        }
+        "BS1-tokio-spawn-nonpie-stderr" => {
+            // BS1: PIE process, tokio runtime, spawns non-PIE child that
+            // writes only to stderr. Tests whether STDERR bridging from
+            // a non-PIE worker has the same Bug-B shape as STDOUT (which
+            // M1 covers). If BS1 passes but M1 fails (or vice versa),
+            // the bug is direction-specific.
+            let nonpie = find_nonpie_binary().unwrap_or_else(|| {
+                println!("BS1_FAIL:no_nonpie_binary");
+                std::process::exit(1);
+            });
+            let parent_pid = std::process::id();
+            eprintln!("[BS1] pid={parent_pid} spawning nonpie={nonpie} stderr-only-test");
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("tokio runtime");
+            let result: Result<(), String> = rt.block_on(async {
+                let out = tokio::process::Command::new(&nonpie)
+                    .arg("stderr-only-test")
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::piped())
+                    .output()
+                    .await
+                    .map_err(|e| format!("spawn: {e}"))?;
+                if !out.status.success() {
+                    return Err(format!("child exit: {:?}", out.status));
+                }
+                let stderr = String::from_utf8_lossy(&out.stderr);
+                if !stderr.contains("STDERR_ONLY_OK") {
+                    return Err(format!("child stderr missing STDERR_ONLY_OK: {stderr:?}"));
+                }
+                Ok(())
+            });
+            match result {
+                Ok(()) => {
+                    eprintln!("[BS1] pid={parent_pid} OK");
+                    println!("BS1_OK pid={parent_pid}");
+                }
+                Err(e) => {
+                    println!("BS1_FAIL:{e}");
+                    std::process::exit(1);
+                }
+            }
+        }
+        "BS2-tokio-spawn-nonpie-stdin-echo" => {
+            // BS2: PIE process, tokio, spawns non-PIE child with stdin
+            // piped + stdout piped. Parent writes "BS2_PING\n" to child
+            // stdin; child echoes back to stdout. Parent verifies it
+            // reads "BS2_PING\n" from stdout. Tests bidirectional
+            // bridging: parent → child stdin AND child → parent stdout.
+            let nonpie = find_nonpie_binary().unwrap_or_else(|| {
+                println!("BS2_FAIL:no_nonpie_binary");
+                std::process::exit(1);
+            });
+            let parent_pid = std::process::id();
+            eprintln!("[BS2] pid={parent_pid} spawning nonpie={nonpie} stdin-echo-test");
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("tokio runtime");
+            let result: Result<(), String> = rt.block_on(async {
+                use tokio::io::AsyncWriteExt;
+                let mut child = tokio::process::Command::new(&nonpie)
+                    .arg("stdin-echo-test")
+                    .stdin(std::process::Stdio::piped())
+                    .stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::piped())
+                    .spawn()
+                    .map_err(|e| format!("spawn: {e}"))?;
+                if let Some(mut stdin) = child.stdin.take() {
+                    stdin
+                        .write_all(b"BS2_PING\n")
+                        .await
+                        .map_err(|e| format!("write stdin: {e}"))?;
+                    drop(stdin);
+                }
+                let out = child
+                    .wait_with_output()
+                    .await
+                    .map_err(|e| format!("wait: {e}"))?;
+                if !out.status.success() {
+                    return Err(format!("child exit: {:?}", out.status));
+                }
+                let stdout = String::from_utf8_lossy(&out.stdout);
+                if !stdout.contains("BS2_PING") {
+                    return Err(format!("child stdout missing BS2_PING: {stdout:?}"));
+                }
+                Ok(())
+            });
+            match result {
+                Ok(()) => {
+                    eprintln!("[BS2] pid={parent_pid} OK");
+                    println!("BS2_OK pid={parent_pid}");
+                }
+                Err(e) => {
+                    println!("BS2_FAIL:{e}");
+                    std::process::exit(1);
+                }
+            }
+        }
+        "BS3-tokio-spawn-nonpie-large-stdout" => {
+            // BS3: PIE process, tokio, spawns non-PIE child that writes
+            // 65536 bytes to stdout. Tests whether stdout bridging works
+            // for payloads larger than typical pipe buffers (~64K). If
+            // M1 fails (small) but BS3 passes (large), the bug is
+            // small-payload-specific (e.g. lost wakeup before EOF).
+            // If both fail, the bug is general.
+            let nonpie = find_nonpie_binary().unwrap_or_else(|| {
+                println!("BS3_FAIL:no_nonpie_binary");
+                std::process::exit(1);
+            });
+            let parent_pid = std::process::id();
+            eprintln!("[BS3] pid={parent_pid} spawning nonpie={nonpie} large-stdout-test");
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("tokio runtime");
+            let result: Result<(), String> = rt.block_on(async {
+                let out = tokio::process::Command::new(&nonpie)
+                    .arg("large-stdout-test")
+                    .arg("65536")
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::piped())
+                    .output()
+                    .await
+                    .map_err(|e| format!("spawn: {e}"))?;
+                if !out.status.success() {
+                    return Err(format!("child exit: {:?}", out.status));
+                }
+                let stdout = String::from_utf8_lossy(&out.stdout);
+                if !stdout.contains("LARGE_STDOUT_OK") {
+                    return Err(format!(
+                        "child stdout missing LARGE_STDOUT_OK (got {} bytes)",
+                        stdout.len()
+                    ));
+                }
+                Ok(())
+            });
+            match result {
+                Ok(()) => {
+                    eprintln!("[BS3] pid={parent_pid} OK");
+                    println!("BS3_OK pid={parent_pid}");
+                }
+                Err(e) => {
+                    println!("BS3_FAIL:{e}");
                     std::process::exit(1);
                 }
             }
