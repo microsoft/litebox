@@ -538,9 +538,7 @@ fn extract_tar<R: Read>(
         // resolved during scan_rootfs and incorrectly pulling in lower-layer
         // content.
         symlinks.retain(|s| {
-            s.rel_path != path
-                && !s.rel_path.starts_with(&path)
-                && !path.starts_with(&s.rel_path)
+            s.rel_path != path && !s.rel_path.starts_with(&path) && !path.starts_with(&s.rel_path)
         });
         entry
             .unpack(&target)
