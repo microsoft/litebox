@@ -1782,33 +1782,17 @@ impl LinuxUserland {
         Ok(())
     }
 
-    /// Set or clear `O_NONBLOCK` on a host file descriptor.
-    pub fn set_host_fd_nonblocking(
-        &self,
-        fd: i32,
-        nonblocking: bool,
-    ) -> Result<(), litebox_common_linux::errno::Errno> {
+    /// Set `O_NONBLOCK` on a host file descriptor.
+    pub fn set_host_fd_nonblock(&self, fd: i32) -> Result<(), litebox_common_linux::errno::Errno> {
         // SAFETY: fd is a valid host FD.
         let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
         if flags < 0 {
             return Err(litebox_common_linux::errno::Errno::EBADF);
         }
-        let new_flags = if nonblocking {
-            flags | libc::O_NONBLOCK
-        } else {
-            flags & !libc::O_NONBLOCK
-        };
-        // SAFETY: fd is a valid host FD and new_flags came from F_GETFL with
-        // only O_NONBLOCK changed.
-        if unsafe { libc::fcntl(fd, libc::F_SETFL, new_flags) } < 0 {
+        if unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
             return Err(litebox_common_linux::errno::Errno::EBADF);
         }
         Ok(())
-    }
-
-    /// Set `O_NONBLOCK` on a host file descriptor.
-    pub fn set_host_fd_nonblock(&self, fd: i32) -> Result<(), litebox_common_linux::errno::Errno> {
-        self.set_host_fd_nonblocking(fd, true)
     }
 
     /// Sleep for `us` microseconds on the calling host thread.

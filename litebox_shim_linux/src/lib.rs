@@ -1274,10 +1274,6 @@ pub(crate) struct HostTtyAlias;
 #[derive(Clone)]
 pub(crate) struct PipeStatusFlags(pub litebox::fs::OFlags);
 
-/// Forces the next non-blocking pipe read to observe EAGAIN once.
-#[derive(Clone, Copy)]
-pub(crate) struct PipeNonblockEagainOnce(pub bool);
-
 impl<FS: ShimFS> syscalls::file::FilesState<FS> {
     fn initialize_stdio_in_shared_descriptors_table(&self, global: &GlobalState<FS>) {
         use litebox::fs::{Mode, OFlags};
