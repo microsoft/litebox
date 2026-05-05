@@ -41,6 +41,14 @@ If the failing capability genuinely cannot be expressed in the harness
 "fd Inheritance Pattern" below), say so explicitly, and the first fix is
 to extend the harness/protocol so it can.
 
+### Per-session worktree
+
+Coding-agent sessions run in separate git worktrees so parallel sessions
+don't invalidate each other's incremental builds or kill each other's
+containers. When investigating an integration-stack failure, build and
+run from the worktree, not the canonical checkout. See `AGENTS.md`
+"Per-session isolation" for details.
+
 ## Test Categories
 
 **Self-contained tests** depend only on bash and the test harness binaries.
@@ -52,12 +60,18 @@ for the underlying platform capability first.
 
 ## WSL2 Gold Standard
 
-The native baseline (chroot into rootfs on real Linux) is the gold standard.
-Every test must pass there — **0 FAIL, 0 xfail** on native.
+The native baseline is the gold standard. Every test must pass there —
+**0 FAIL, 0 xfail** on native.
 
-- `tests/integration.rs` runs native baseline via `unshare --root`
-- Any native failure is a **test bug**, not a litebox bug
-- The rootfs is built programmatically by `build_rootfs()` — no manual setup
+- `tests/integration.rs` runs the native baseline inside the
+  `litebox-test` Docker image (`docker run --rm --cap-add SYS_PTRACE
+  -v target/debug:/opt/litebox:ro … litebox-test
+  /opt/litebox/litebox_test_harness spawn-tree …`).
+- The same image is reused for the litebox pass, with
+  `litebox_tool_executor --rootfs / --record-baseline --` prepended.
+- Any native failure is a **test bug**, not a litebox bug.
+- The Docker image is built on demand by `ensure_docker_image()` from
+  `litebox_tool_executor/rootfs/Dockerfile` — no manual setup.
 
 Litebox xfails are only for **dynamically detected** platform limitations
 (e.g., symlink probe returns ENOTSUP). Never use static/hardcoded xfails.
@@ -88,8 +102,10 @@ Litebox xfails are only for **dynamically detected** platform limitations
 5. **No timer delays** — never use sleep/retry loops to mask product bugs.
    Use protocol-level signals for synchronization.
 
-6. **Self-contained rootfs** — `cargo test --test integration` must pass
-   without manual rootfs setup. Add new deps to `build_rootfs()`.
+6. **Self-contained rootfs** — `cargo test -p litebox_test_harness
+   --test integration` must pass without manual rootfs setup. Add new
+   guest binaries / files to `litebox_tool_executor/rootfs/Dockerfile`
+   so they're baked into the `litebox-test` image.
 
 7. **No python3 or other interpreters** — all test logic is in Rust.
    If a test needs a server/client pattern, add a subcommand to the
@@ -166,25 +182,58 @@ When a test fails and the root cause is unclear:
 - Do NOT let Exec timeouts desync the agent — use subprocess isolation
 - Do NOT add python3, ruby, or other interpreter dependencies
 - Do NOT remove failing tests for convenience
+- Do NOT batch coordinator output to be flushed only at end-of-main() —
+  the spawn-tree process can be SIGKILL'd during `teardown_tree` under
+  litebox, dropping anything not already on the pipe. Emit progress
+  records (JSON / log lines) incrementally and flush. See
+  `coordinator::record_expected` for the pattern: one `println!` +
+  `stdout().flush()` per result, alongside the existing `eprintln!`.
 
 ## Enforcement
 
-### Integration test: `cargo test -p litebox_test_harness --test integration`
-Verifies:
-- Native baseline: 0 FAIL, 0 XPASS, 0 xfail
-- Litebox: expected FAIL/XPASS/xfail counts match constants
-- Cross-check: any test passing native but failing litebox is a regression
-- Any new test that breaks self-containment fails CI
+### Integration test
 
-Update `EXPECTED_XFAIL_COUNT`, `EXPECTED_FAIL_COUNT`, `EXPECTED_XPASS_COUNT`
-in `tests/integration.rs` when intentionally changing expectations.
+Always run with **`cargo test`**, not `cargo nextest`:
+
+```sh
+cargo test -p litebox_test_harness --test integration
+# Subset (one Trial per pass per test ID):
+cargo test -p litebox_test_harness --test integration -- native::NL1
+cargo test -p litebox_test_harness --test integration -- 'litebox::PN.B.eof'
+# Multiple test ID prefixes (comma-separated also works):
+cargo test -p litebox_test_harness --test integration -- 'native::NL'
+```
+
+The harness uses `libtest_mimic` (custom `harness = false`) and registers
+two trials per test ID: `native::<id>` and `litebox::<id>`. Trials share
+docker invocations through a process-scoped `PASS_CACHE` Mutex
+(`tests/integration.rs:53`), so all ~945 native trials map to one
+`docker run` per cargo invocation, and likewise for litebox.
+
+**Do not run this suite under `cargo nextest`.** Nextest forks a
+separate process per test, defeating `PASS_CACHE` and triggering
+~1900 separate `docker run` invocations.
+
+The integration test verifies:
+- Native baseline: every `native::<id>` trial passes (0 FAIL).
+- Litebox: every `litebox::<id>` trial that is not declared `xfail`
+  must pass; XPASS on a previously-xfailed test is also a failure.
+  Any test passing native but failing litebox is a regression.
+- Drift check: registered test IDs match the baseline; new IDs are
+  surfaced as warnings so the baseline can be updated intentionally.
+
+There are no longer "expected counts" constants to update — each trial
+is asserted individually. To intentionally accept a new litebox-only
+failure, add a `record_xfail()` call with a reason string at the
+relevant suite registration point (never a static allowlist).
 
 ### Code review checklist
 When adding tests, verify:
 - [ ] Uses protocol commands, not bash (unless testing bash behavior)
 - [ ] No new interpreter dependencies
 - [ ] Tests all relevant axes (parent↔child, sibling, depth 2+)
-- [ ] Added to `build_rootfs()` if new binary/file needed
+- [ ] Added to `litebox_tool_executor/rootfs/Dockerfile` if a new
+      guest binary/file is required
 - [ ] xfail has a reason string
 - [ ] VS Code concern has a corresponding minimal self-contained test
 - [ ] Passes on native baseline (WSL2 gold standard)
