@@ -706,7 +706,20 @@ async fn run_tests(self_exe: &str, filter: Option<&str>) -> Vec<TestResult> {
                 }
             }
         }
-        runner.teardown_tree().await;
+        // Bound teardown wall-clock. Under litebox the per-child wait
+        // already has a 2s timeout (see `teardown_tree`), but a stuck
+        // tokio reactor can keep the outer `block_on` parked in
+        // `epoll_pwait(-1)` indefinitely. A top-level cap ensures the
+        // coordinator returns to `main` so we can hard-exit even if
+        // tokio's per-future timer didn't fire as intended.
+        if tokio::time::timeout(Duration::from_secs(10), runner.teardown_tree())
+            .await
+            .is_err()
+        {
+            eprintln!(
+                "[coord] teardown_tree exceeded 10s — abandoning agent cleanup, hard-exit will reap"
+            );
+        }
     }
 
     runner.results

@@ -87,9 +87,20 @@ fn main() {
                 xpass_count
             );
             // Exit non-zero only for unexpected results.
-            if fail_count > 0 || xpass_count > 0 {
-                std::process::exit(1);
-            }
+            //
+            // Use `std::process::exit` (not a `return` from `main`) so we
+            // skip Drop on the tokio runtime and on any leaked
+            // `tokio::process::Child` handles. Under litebox, `teardown_tree`
+            // can leave non-PIE worker processes (NP, NPC, D4) running as
+            // host child processes whose pipe-relay threads in the runner
+            // would otherwise prevent the runner from exiting; the kernel
+            // SIGKILLs everything when this process terminates.
+            let exit_code = if fail_count > 0 || xpass_count > 0 {
+                1
+            } else {
+                0
+            };
+            std::process::exit(exit_code);
         }
         "agent" => {
             agent::run(self_exe);
