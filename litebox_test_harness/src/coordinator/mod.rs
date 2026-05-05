@@ -179,6 +179,14 @@ pub struct TestRunner {
     poisoned: std::collections::HashSet<String>,
     /// Track recorded test IDs to detect duplicates.
     recorded_ids: std::collections::HashSet<String>,
+    /// Agent names actually contacted via `send()`. Used at end-of-run
+    /// to validate that the lazy-matrix decision (which agents to
+    /// spawn) was correct: every contacted agent must have been
+    /// spawned. See `validate_lazy_matrix`.
+    contacted_agents: std::collections::HashSet<String>,
+    /// Agent names actually spawned by `spawn_tree`. Compared against
+    /// `contacted_agents` at end-of-run.
+    spawned_agents: std::collections::HashSet<String>,
 }
 
 impl TestRunner {
@@ -242,6 +250,9 @@ impl TestRunner {
         if target == "init" {
             return self.exec_local(&cmd).await;
         }
+        // Track for lazy-matrix validation: any agent contacted via
+        // send() must be in spawned_agents at end-of-run.
+        self.contacted_agents.insert(target.to_string());
         // Route through the tree: "A" → direct child,
         // "AA" → forward through A, "AAA" → forward through A → AA.
         let (direct, rest) = route(target);
@@ -292,7 +303,18 @@ impl TestRunner {
 
     /// Spawn the full agent tree: A (→AA,AB,AAA,AAB), B,
     /// and optionally NP,NPC,D3,D4,D5 if non-PIE binary is available.
-    async fn spawn_tree(&mut self) {
+    ///
+    /// `wants_nonpie` controls whether the expensive non-PIE subtree is
+    /// spawned. Most tests (~97 % of the suite) are PIE-only and don't
+    /// need NP/NPC/D3/D4/D5; skipping the non-PIE path saves ~30 s of
+    /// known `spawn_nonpie_subtree` timeout per harness invocation.
+    /// Set to `true` if any test in the filter references those agent
+    /// names; see `filter_needs_nonpie`.
+    async fn spawn_tree(&mut self, wants_nonpie: bool) {
+        // Always-on PIE matrix: A, AA, AB, AAA, AAB, B (cheap, ~3s).
+        for &name in &["A", "AA", "AB", "AAA", "AAB", "B"] {
+            self.spawned_agents.insert(name.to_string());
+        }
         // Spawn direct children A and B.
         for id in &["A", "B"] {
             match spawn_child(&self.self_exe).await {
@@ -326,8 +348,19 @@ impl TestRunner {
             .await;
         eprintln!("[coord] AA spawn children: {r:?}");
 
-        // Spawn non-PIE subtree if available, with a timeout since
-        // SpawnRemote rewrites the 124MB binary and can hang under litebox.
+        // Spawn non-PIE subtree only if any filtered test needs it.
+        // ~97% of tests are PIE-only and would just pay the 30s
+        // spawn_nonpie_subtree timeout for nothing. validate_lazy_matrix
+        // surfaces a loud failure if a contacted agent wasn't spawned.
+        if !wants_nonpie {
+            eprintln!(
+                "[coord] skipping non-PIE subtree (no filtered test references NP/NPC/D3/D4/D5)"
+            );
+            return;
+        }
+        for &name in &["NP", "NPC", "D3", "D4", "D5"] {
+            self.spawned_agents.insert(name.to_string());
+        }
         let has_nonpie = crate::find_nonpie_binary().is_some();
         if has_nonpie {
             // Broker caches the rewritten binary, so this is fast after
@@ -431,6 +464,38 @@ impl TestRunner {
             eprintln!("[coord] {id} killed");
         }
         self.poisoned.clear();
+    }
+
+    /// Validate the lazy-matrix decision: every agent contacted via
+    /// `send()` must have been spawned by `spawn_tree`. A mismatch
+    /// means `filter_needs_nonpie` (or the agent-set heuristic) is
+    /// wrong — the test references an agent the coordinator didn't
+    /// know to spawn. Recorded as a synthetic `FAIL` so the
+    /// integration pipeline surfaces it loudly.
+    fn validate_lazy_matrix(&mut self) {
+        let mut unexpected: Vec<_> = self
+            .contacted_agents
+            .difference(&self.spawned_agents)
+            .cloned()
+            .collect();
+        unexpected.sort();
+        if unexpected.is_empty() {
+            return;
+        }
+        let detail = format!(
+            "tests contacted agents that were not spawned: {} (spawned={:?}). \
+             Either the test ID needs an agent suffix that filter_needs_nonpie \
+             recognizes, or the heuristic in coordinator/mod.rs needs updating. \
+             Workaround: re-run with LITEBOX_FORCE_FULL_MATRIX=1.",
+            unexpected.join(","),
+            {
+                let mut s: Vec<_> = self.spawned_agents.iter().cloned().collect();
+                s.sort();
+                s
+            },
+        );
+        eprintln!("[coord] LAZY MATRIX VALIDATION FAILED: {detail}");
+        self.record("__lazy_matrix.validation", "?", false, &detail);
     }
 
     async fn exec_local(&self, cmd: &Command) -> Response {
@@ -652,6 +717,8 @@ async fn run_tests(self_exe: &str, filter: Option<&str>) -> Vec<TestResult> {
         self_exe: self_exe.to_string(),
         poisoned: std::collections::HashSet::new(),
         recorded_ids: std::collections::HashSet::new(),
+        contacted_agents: std::collections::HashSet::new(),
+        spawned_agents: std::collections::HashSet::new(),
     };
 
     // --- New-style declarative tests (proof of concept) ---
@@ -672,8 +739,11 @@ async fn run_tests(self_exe: &str, filter: Option<&str>) -> Vec<TestResult> {
 
     if !new_filtered.is_empty() {
         eprintln!("[coord] running {} registered tests", new_filtered.len());
-        // Need a fresh tree for these.
-        runner.spawn_tree().await;
+        // Lazy agent matrix: only spawn the expensive non-PIE subtree
+        // if any filtered test references those agents. Validation at
+        // end-of-run detects mismatches.
+        let wants_nonpie = filter_needs_nonpie(&new_filtered);
+        runner.spawn_tree(wants_nonpie).await;
         for test in new_filtered {
             let timeout_dur = Duration::from_secs(test.timeout_secs);
             match tokio::time::timeout(timeout_dur, (test.run)(&mut runner)).await {
@@ -720,9 +790,31 @@ async fn run_tests(self_exe: &str, filter: Option<&str>) -> Vec<TestResult> {
                 "[coord] teardown_tree exceeded 10s — abandoning agent cleanup, hard-exit will reap"
             );
         }
+        // Validate the lazy-matrix decision: every contacted agent
+        // must have been spawned. A mismatch is a heuristic bug
+        // (test_id-based prediction missed an agent reference) and
+        // is recorded as a synthetic FAIL so it surfaces in the
+        // integration test pipeline.
+        runner.validate_lazy_matrix();
     }
 
     runner.results
+}
+
+/// Returns true if any filtered test references a non-PIE agent in
+/// its ID. Heuristic: dot-separated component matches one of NP, NPC,
+/// D3, D4, D5. Used to gate the expensive `spawn_nonpie_subtree`
+/// (which can take 30s under litebox due to the known vfork pipe
+/// bridge bug). Validation in `validate_lazy_matrix` catches
+/// false-negatives at end-of-run.
+fn filter_needs_nonpie(tests: &[Test]) -> bool {
+    const NONPIE: &[&str] = &["NP", "NPC", "D3", "D4", "D5"];
+    if std::env::var("LITEBOX_FORCE_FULL_MATRIX").is_ok() {
+        return true;
+    }
+    tests
+        .iter()
+        .any(|t| t.id.split('.').any(|component| NONPIE.contains(&component)))
 }
 
 /// Route a target agent name to (direct_child, remaining_path).
