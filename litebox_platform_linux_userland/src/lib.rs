@@ -174,15 +174,14 @@ struct WorkerHostProcess {
     bridge_threads: Vec<DetachedWorkerBridge>,
 }
 
-/// Describes a pipe-backed stdio fd that was set up with direct OS pipe I/O
+/// Describes a pipe-backed stdin fd that was set up with direct OS pipe I/O
 /// (no bridge thread). The parent should install a `HostPipeFd` wrapping
 /// `parent_os_fd` at the appropriate guest fd number.
 pub struct ExecPipeDirectIo {
-    /// The child worker's stdio fd number (0, 1, or 2).
+    /// The child worker's stdio fd number. Currently only stdin (0) uses this path.
     pub child_stdio_fd: i32,
-    /// The raw host OS fd for the parent's end of the pipe.
-    /// For child stdin (fd 0): write-end (parent writes → child reads).
-    /// For child stdout/stderr: read-end (child writes → parent reads).
+    /// The raw host OS write fd for the parent's end of child stdin
+    /// (parent writes → child reads).
     pub parent_os_fd: i32,
 }
 
@@ -190,10 +189,10 @@ pub struct ExecPipeDirectIo {
 pub struct WorkerExecSpawnResult {
     /// The host PID of the spawned worker process.
     pub host_pid: i32,
-    /// Pipe-backed stdio fds that use direct OS pipe I/O instead of bridge
-    /// threads. Non-empty only when `direct_pipe_io` was requested. The caller
-    /// is responsible for installing `HostPipeFd` entries for these and closing
-    /// them on error.
+    /// Pipe-backed stdin fds that use direct OS pipe I/O instead of bridge
+    /// threads. Non-empty only when `direct_pipe_io` was requested. Worker
+    /// stdout/stderr always use platform bridge threads so they write into the
+    /// parent's existing virtual pipe and keep its epoll state intact.
     pub direct_pipes: Vec<ExecPipeDirectIo>,
 }
 
@@ -1485,27 +1484,18 @@ impl LinuxUserland {
         let mut output_bridges = Vec::new();
         let mut worker_output_write_fds = Vec::new();
         for group in output_groups.drain(..) {
-            let direct_output_pipe = direct_pipe_io
-                && group.target_fds.contains(&1)
-                && matches!(&group.sink, WorkerExecOutputSink::Pipe { .. });
-            let (write_nonblocking, write_capacity) = if direct_output_pipe {
-                (false, None)
-            } else {
-                match &group.sink {
-                    WorkerExecOutputSink::Pipe { pipes, fd } => (
-                        pipes
-                            .get_flags(fd.as_ref())
-                            .map(|flags| flags.contains(litebox::pipes::Flags::NON_BLOCKING))
-                            .unwrap_or(false),
-                        pipes
-                            .writable_bytes(fd.as_ref())
-                            .ok()
-                            .filter(|capacity| supports_bridge_pipe_capacity(*capacity)),
-                    ),
-                    WorkerExecOutputSink::Fs { .. } | WorkerExecOutputSink::Stream(_) => {
-                        (false, None)
-                    }
-                }
+            let (write_nonblocking, write_capacity) = match &group.sink {
+                WorkerExecOutputSink::Pipe { pipes, fd } => (
+                    pipes
+                        .get_flags(fd.as_ref())
+                        .map(|flags| flags.contains(litebox::pipes::Flags::NON_BLOCKING))
+                        .unwrap_or(false),
+                    pipes
+                        .writable_bytes(fd.as_ref())
+                        .ok()
+                        .filter(|capacity| supports_bridge_pipe_capacity(*capacity)),
+                ),
+                WorkerExecOutputSink::Fs { .. } | WorkerExecOutputSink::Stream(_) => (false, None),
             };
             if write_nonblocking && write_capacity.is_none() {
                 return Err(-1_i32);
@@ -1590,31 +1580,20 @@ impl LinuxUserland {
                 bridge_threads.push(bridge);
             }
         }
-        for (sink, read_fd, target_fd) in output_bridges {
-            if direct_pipe_io
-                && target_fd == 1
-                && matches!(&sink, WorkerExecOutputSink::Pipe { .. })
-            {
-                let raw_fd = read_fd.into_raw_fd();
-                direct_pipes.push(ExecPipeDirectIo {
-                    child_stdio_fd: target_fd,
-                    parent_os_fd: raw_fd,
-                });
+        for (sink, read_fd, _target_fd) in output_bridges {
+            let bridge = if let Ok(handle) = spawn_worker_output_bridge(self, sink, read_fd) {
+                DetachedWorkerBridge {
+                    handle,
+                    input_control: None,
+                }
             } else {
-                let bridge = if let Ok(handle) = spawn_worker_output_bridge(self, sink, read_fd) {
-                    DetachedWorkerBridge {
-                        handle,
-                        input_control: None,
-                    }
-                } else {
-                    for dp in &direct_pipes {
-                        close_raw_fd(dp.parent_os_fd);
-                    }
-                    terminate_worker_after_bridge_spawn_failure(self, pid, bridge_threads);
-                    return Err(-1_i32);
-                };
-                bridge_threads.push(bridge);
-            }
+                for dp in &direct_pipes {
+                    close_raw_fd(dp.parent_os_fd);
+                }
+                terminate_worker_after_bridge_spawn_failure(self, pid, bridge_threads);
+                return Err(-1_i32);
+            };
+            bridge_threads.push(bridge);
         }
         self.worker_processes.lock().unwrap().insert(
             pid,
