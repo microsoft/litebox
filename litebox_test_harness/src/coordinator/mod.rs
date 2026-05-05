@@ -131,11 +131,10 @@ pub(crate) fn exec_timeout(args: Vec<String>, secs: u64) -> Command {
     }
 }
 
-struct Child {
-    stdin: tokio::process::ChildStdin,
-    stdout: BufReader<tokio::process::ChildStdout>,
-    #[allow(dead_code)]
-    process: tokio::process::Child,
+pub(crate) struct Child {
+    pub(crate) stdin: tokio::process::ChildStdin,
+    pub(crate) stdout: BufReader<tokio::process::ChildStdout>,
+    pub(crate) process: tokio::process::Child,
 }
 
 /// Expected outcome of a test.
@@ -630,6 +629,7 @@ pub fn collect_all_tests() -> Vec<Test> {
     tests.extend(platform_fixes::register_loopback_tcp_tests());
     tests.extend(platform_fixes::register_fork_listen_close_tests());
     tests.extend(platform_fixes::register_proc_filesystem_tests());
+    tests.extend(platform_fixes::register_subtree_kill_tests());
     fork_matrix::register_fork_matrix(&mut tests);
     special_cases::register_unix_socket(&mut tests);
     special_cases::register_cross_worker(&mut tests);
@@ -818,7 +818,7 @@ fn wrap_forwards(remaining: Option<&str>, cmd: Command) -> Command {
     }
 }
 
-async fn spawn_child(self_exe: &str) -> Result<Child, String> {
+pub(crate) async fn spawn_child(self_exe: &str) -> Result<Child, String> {
     let mut child = tokio::process::Command::new(self_exe)
         .arg("agent")
         .stdin(std::process::Stdio::piped())
@@ -837,7 +837,7 @@ async fn spawn_child(self_exe: &str) -> Result<Child, String> {
     })
 }
 
-async fn send_cmd(child: &mut Child, cmd: &Command) -> Response {
+pub(crate) async fn send_cmd(child: &mut Child, cmd: &Command) -> Response {
     // Use a longer response timeout for Exec commands with custom timeouts
     // and for Spawn/SpawnRemote commands which may trigger broker syscall
     // rewriting (8+ seconds for large binaries) plus fork-restore setup.

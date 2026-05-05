@@ -4618,3 +4618,236 @@ pub(crate) fn register_proc_filesystem_tests() -> Vec<super::Test> {
     }
     tests
 }
+
+// ═══════════════════════════════════════════════════════════════════
+// SK: SIGKILL of a parent agent whose subtree contains SpawnRemote
+// (non-PIE) descendants. Reproduces the production hang we hit in
+// `cargo test -- 'litebox::PN.B.eof'`: the harness coordinator
+// SIGKILLs agent A in teardown, but A's vfork-child stub thread that
+// did `wait_worker_host(NP_host_pid)` blocks A's process from being
+// reaped because the non-PIE host worker (NP) is never sent a signal.
+// The cascading effect is that the coordinator's `Child::wait()` for A
+// can hang indefinitely, plus orphan host workers remain alive after
+// container shutdown.
+//
+// Each test spawns its own fresh agent E — independent of the global
+// matrix — builds the suspect subtree shape, then SIGKILLs E and
+// asserts that the wait completes within a small wall-clock budget.
+// On native this is sub-second; under litebox with the platform bug
+// unfixed the wait will not return and these tests time out (FAIL).
+//
+// No `xfail` is recorded: a real FAIL on litebox is the desired
+// signal that the underlying platform bug needs fixing. The test
+// harness's own teardown is wrapped in a 10-s timeout (commit
+// f99cac06), so a FAIL here does not stall the docker container.
+// ═══════════════════════════════════════════════════════════════════
+
+/// Wall-clock budget for `Child::wait()` after SIGKILL. Native
+/// completes in < 50 ms; we give 5 s to absorb tokio scheduling
+/// jitter under heavy parallelism without masking real hangs.
+const SK_WAIT_BUDGET_SECS: u64 = 5;
+
+/// Per-test outer budget. Must exceed SpawnRemote setup cost
+/// (the broker rewrites a 124 MB binary on first use, plus the
+/// well-known `spawn_nonpie_subtree` 30-s timeout under litebox).
+const SK_TEST_TIMEOUT_SECS: u64 = 90;
+
+pub(crate) fn register_subtree_kill_tests() -> Vec<super::Test> {
+    let mut tests = Vec::new();
+
+    // SK.subtree.direct_nonpie — SIGKILL E whose immediate child is a
+    // non-PIE worker spawned via SpawnRemote. Reproduces the exact
+    // shape that hung the PN.B.eof teardown.
+    tests.push(super::Test {
+        suite: "matrix",
+        group: "subtree_kill",
+        id: "SK.subtree.direct_nonpie".to_string(),
+        xfail: None,
+        timeout_secs: SK_TEST_TIMEOUT_SECS,
+        run: Box::new(|r| {
+            let self_exe = r.self_exe.clone();
+            Box::pin(async move {
+                if crate::find_nonpie_binary().is_none() {
+                    return super::TestOutcome::new(
+                        "?",
+                        false,
+                        "FAIL: nonpie binary not found — mount at /opt/nonpie",
+                    );
+                }
+                run_subtree_kill(&self_exe, |e| {
+                    Box::pin(async move {
+                        let r = super::send_cmd(
+                            e,
+                            &Command::SpawnRemote {
+                                children: vec!["NPx".into()],
+                            },
+                        )
+                        .await;
+                        if !matches!(r, Response::Ok { .. }) {
+                            return Err(format!("SpawnRemote failed: {r:?}"));
+                        }
+                        Ok(())
+                    })
+                })
+                .await
+            })
+        }),
+    });
+
+    // SK.subtree.deep_nonpie — SIGKILL E whose subtree is
+    // E → EE → NPx (non-PIE leaf). Generalizes the depth axis: tests
+    // that the wait4 stub at the *grandchild* level still propagates
+    // back when the *root* is SIGKILLed.
+    tests.push(super::Test {
+        suite: "matrix",
+        group: "subtree_kill",
+        id: "SK.subtree.deep_nonpie".to_string(),
+        xfail: None,
+        timeout_secs: SK_TEST_TIMEOUT_SECS,
+        run: Box::new(|r| {
+            let self_exe = r.self_exe.clone();
+            Box::pin(async move {
+                if crate::find_nonpie_binary().is_none() {
+                    return super::TestOutcome::new(
+                        "?",
+                        false,
+                        "FAIL: nonpie binary not found — mount at /opt/nonpie",
+                    );
+                }
+                run_subtree_kill(&self_exe, |e| {
+                    Box::pin(async move {
+                        let r = super::send_cmd(
+                            e,
+                            &Command::Spawn {
+                                children: vec!["EE".into()],
+                            },
+                        )
+                        .await;
+                        if !matches!(r, Response::Ok { .. }) {
+                            return Err(format!("Spawn EE failed: {r:?}"));
+                        }
+                        let r = super::send_cmd(
+                            e,
+                            &Command::Forward {
+                                target: "EE".into(),
+                                inner: Box::new(Command::SpawnRemote {
+                                    children: vec!["NPx".into()],
+                                }),
+                            },
+                        )
+                        .await;
+                        if !matches!(r, Response::Ok { .. }) {
+                            return Err(format!("EE.SpawnRemote(NPx) failed: {r:?}"));
+                        }
+                        Ok(())
+                    })
+                })
+                .await
+            })
+        }),
+    });
+
+    // SK.subtree.exit_then_kill — cooperative Exit on the non-PIE
+    // descendant first, then SIGKILL the root. Inverts the timing
+    // relative to direct_nonpie: by the time the root is killed, the
+    // wait_worker_host stub thread has already seen its host worker
+    // exit. SIGKILL+wait should be especially fast. If this also
+    // hangs, the bug is in stub-thread cleanup itself, not in
+    // worker-exit-signal propagation.
+    tests.push(super::Test {
+        suite: "matrix",
+        group: "subtree_kill",
+        id: "SK.subtree.exit_then_kill".to_string(),
+        xfail: None,
+        timeout_secs: SK_TEST_TIMEOUT_SECS,
+        run: Box::new(|r| {
+            let self_exe = r.self_exe.clone();
+            Box::pin(async move {
+                if crate::find_nonpie_binary().is_none() {
+                    return super::TestOutcome::new(
+                        "?",
+                        false,
+                        "FAIL: nonpie binary not found — mount at /opt/nonpie",
+                    );
+                }
+                run_subtree_kill(&self_exe, |e| {
+                    Box::pin(async move {
+                        let r = super::send_cmd(
+                            e,
+                            &Command::SpawnRemote {
+                                children: vec!["NPx".into()],
+                            },
+                        )
+                        .await;
+                        if !matches!(r, Response::Ok { .. }) {
+                            return Err(format!("SpawnRemote failed: {r:?}"));
+                        }
+                        // Cooperative shutdown of the non-PIE descendant
+                        // before we kill the root. Forward(Exit) reaches
+                        // NPx via E. If the response stream desyncs we
+                        // ignore — the goal is just to make NPx exit.
+                        let _ = super::send_cmd(
+                            e,
+                            &Command::Forward {
+                                target: "NPx".into(),
+                                inner: Box::new(Command::Exit),
+                            },
+                        )
+                        .await;
+                        Ok(())
+                    })
+                })
+                .await
+            })
+        }),
+    });
+
+    tests
+}
+
+/// Spawn a fresh ephemeral agent E, run the caller-supplied subtree
+/// builder against it, then SIGKILL E and time the `wait()`. Returns
+/// pass=true only if `wait()` returns within `SK_WAIT_BUDGET_SECS`.
+async fn run_subtree_kill<F>(self_exe: &str, build: F) -> super::TestOutcome
+where
+    F: for<'a> FnOnce(
+        &'a mut super::Child,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<(), String>> + Send + 'a>,
+    >,
+{
+    let mut e = match super::spawn_child(self_exe).await {
+        Ok(c) => c,
+        Err(err) => return super::TestOutcome::new("E", false, format!("spawn_child: {err}")),
+    };
+
+    if let Err(detail) = build(&mut e).await {
+        // Best-effort cleanup before reporting the setup failure.
+        let _ = e.process.start_kill();
+        let _ = tokio::time::timeout(Duration::from_secs(2), e.process.wait()).await;
+        return super::TestOutcome::new("E", false, format!("setup: {detail}"));
+    }
+
+    // Send SIGKILL via tokio's start_kill (non-async; just delivers
+    // the signal). Then time how long the kernel takes to report the
+    // child as reapable. Under litebox the wait can hang because of
+    // un-reaped wait_worker_host stub threads in vfork descendants.
+    let send_ok = e.process.start_kill().is_ok();
+    let t0 = std::time::Instant::now();
+    let wait_res =
+        tokio::time::timeout(Duration::from_secs(SK_WAIT_BUDGET_SECS), e.process.wait()).await;
+    let elapsed = t0.elapsed();
+
+    let pass = send_ok && matches!(wait_res, Ok(Ok(_)));
+    let detail = format!(
+        "send_ok={send_ok} wait={} elapsed={}ms budget={}s",
+        match &wait_res {
+            Ok(Ok(s)) => format!("Ok({s:?})"),
+            Ok(Err(err)) => format!("Err({err})"),
+            Err(_) => "TIMEOUT".to_string(),
+        },
+        elapsed.as_millis(),
+        SK_WAIT_BUDGET_SECS,
+    );
+    super::TestOutcome::new("E", pass, detail)
+}
