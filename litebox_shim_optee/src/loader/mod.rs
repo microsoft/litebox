@@ -6,6 +6,8 @@
 pub(crate) mod elf;
 pub(crate) mod ta_stack;
 
+pub use elf::ElfLoaderError;
+
 /// The magic number used to identify the LiteBox rewriter and where we should
 /// update the syscall callback pointer.
 pub const REWRITER_MAGIC_NUMBER: u64 = u64::from_le_bytes(*b"LITE BOX");

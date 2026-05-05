@@ -227,9 +227,6 @@ impl OpteeShim {
         client: Option<TeeIdentity>,
         session_id: u32,
     ) -> Result<LoadedProgram, loader::elf::ElfLoaderError> {
-        if ta_bin.is_none() {
-            return Err(loader::elf::ElfLoaderError::InvalidUuid);
-        }
         let entrypoints = crate::OpteeShimEntrypoints {
             _not_send: core::marker::PhantomData,
             task: Task {

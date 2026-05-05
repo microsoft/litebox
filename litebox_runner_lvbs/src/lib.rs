@@ -40,6 +40,7 @@ use litebox_platform_lvbs::{
     serial_println,
 };
 use litebox_platform_multiplex::Platform;
+use litebox_shim_optee::loader::ElfLoaderError;
 use litebox_shim_optee::msg_handler::{
     decode_ta_request, handle_optee_msg_args, handle_optee_smc_args, update_optee_msg_args,
 };
@@ -725,6 +726,8 @@ fn open_session_new_instance(
     client_identity: Option<litebox_common_optee::TeeIdentity>,
     ta_req_info: &litebox_shim_optee::msg_handler::TaRequestInfo<PAGE_SIZE>,
 ) -> Result<(), OpteeSmcReturnCode> {
+    let ta_bin = find_ta_binary(ta_uuid).map_err(|_| OpteeSmcReturnCode::ENotAvail)?;
+
     // Create and switch to new page table
     let task_pt_id = create_task_page_table()?;
 
@@ -756,7 +759,7 @@ fn open_session_new_instance(
         shim.load_ldelf(
             LDELF_BINARY,
             ta_uuid,
-            find_ta_binary(ta_uuid),
+            Some(ta_bin),
             client_identity,
             runner_session_id,
         )
@@ -1317,17 +1320,17 @@ const TA_BINARY: &[u8] = &[0u8; 0];
 const TA_BINARIES: &[&[u8]] = &[TA_BINARY];
 
 // Look up TA binary by UUID.
-fn find_ta_binary(ta_uuid: litebox_common_optee::TeeUuid) -> Option<&'static [u8]> {
+fn find_ta_binary(ta_uuid: litebox_common_optee::TeeUuid) -> Result<&'static [u8], ElfLoaderError> {
     use litebox_common_optee::parse_ta_head;
 
     for ta_binary in TA_BINARIES {
         if let Some(ta_head) = parse_ta_head(ta_binary)
             && ta_head.uuid == ta_uuid
         {
-            return Some(ta_binary);
+            return Ok(ta_binary);
         }
     }
-    None
+    Err(ElfLoaderError::InvalidUuid)
 }
 
 #[panic_handler]
