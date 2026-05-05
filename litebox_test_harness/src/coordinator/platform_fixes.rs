@@ -775,7 +775,7 @@ pub(crate) async fn stdin_pipe_subst_tests(r: &mut TestRunner) {
         // Known litebox bug: vfork children share kernel pipe file
         // description for stdin. Pipeline children (head) consume
         // stdin data, causing $() to return empty.
-        // Passes on WSL2, fails on litebox (counted in EXPECTED_FAIL_COUNT).
+        // Passes on WSL2, fails on litebox.
         SubstTest {
             name: "file_pipe",
             script: "X=$(cat /etc/passwd | head -1)\necho R=${X%%:*}\n",
