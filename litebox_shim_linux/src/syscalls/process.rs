@@ -8760,9 +8760,11 @@ impl<FS: ShimFS> Task<FS> {
                 guest_exec_image,
                 guest_interp_image,
                 worker_stdio,
-                // For vfork-style children, route direct host pipes only for
-                // stdin. Worker stdout/stderr stay on platform bridge threads
-                // so output lands in the parent's existing virtual pipe.
+                // For vfork-style children, route stdio through direct host
+                // pipes and install parent-side replacements below.  The local
+                // child fd table is transient; a platform bridge that writes
+                // back through the child's inherited virtual pipe can miss the
+                // PIE parent's epoll interest after the remote handoff.
                 use_direct_stdio,
                 &extra_fds,
             )
