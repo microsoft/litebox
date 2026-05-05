@@ -16,7 +16,9 @@ use litebox::{
     fd::{ErrRawIntFd, FdEnabledSubsystem, MetadataError, TypedFd},
     fs::{Mode, OFlags, SeekWhence},
     path,
-    platform::{RawConstPointer, RawMutPointer, StdioProvider as _},
+    platform::{
+        Instant as _, RawConstPointer, RawMutPointer, StdioProvider as _, TimeProvider as _,
+    },
     utils::{ReinterpretSignedExt as _, ReinterpretUnsignedExt as _, TruncateExt as _},
 };
 use litebox_common_linux::{
@@ -5319,6 +5321,16 @@ impl<FS: ShimFS> Task<FS> {
             None
         };
         let timeout = timeout.read()?;
+        let timeout = match self.process().alarm_timer.lock().deadline {
+            Some(alarm_deadline) => {
+                let now = self.global.platform.now();
+                let alarm_timeout = alarm_deadline
+                    .checked_duration_since(&now)
+                    .unwrap_or(core::time::Duration::ZERO);
+                Some(timeout.map_or(alarm_timeout, |t| t.min(alarm_timeout)))
+            }
+            None => timeout,
+        };
         let nfds_signed = isize::try_from(nfds).map_err(|_| {
             if let Some(old) = saved_mask {
                 self.signals.set_blocked(old);

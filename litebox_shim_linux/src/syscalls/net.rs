@@ -901,7 +901,10 @@ impl<FS: ShimFS> GlobalState<FS> {
                 || match proxy.try_write(buf, new_flags, sockaddr) {
                     Ok(0) if buf.is_empty() => Ok(0),
                     Ok(0) => Err(TryOpError::TryAgain),
-                    Ok(n) => Ok(n),
+                    Ok(n) => {
+                        litebox_platform_multiplex::platform().wake_network_worker();
+                        Ok(n)
+                    }
                     Err(e) => Err(TryOpError::Other(Errno::from(e))),
                 },
             )
