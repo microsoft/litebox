@@ -444,29 +444,38 @@ fn ensure_binaries_built(ws_root: &Path) {
     assert!(status.success(), "cargo build (non-PIE) failed");
 }
 
-/// Shared setup: build binaries and Docker image, return paths.
+/// Shared setup: build binaries and Docker image once per `cargo test`
+/// process, return cached paths. libtest-mimic dispatches Trials in
+/// threads of one process, so a `OnceLock` guarantees `cargo build`
+/// and `docker build` are invoked at most once per run rather than
+/// once per Trial. Under `cargo nextest` (where each Trial is its
+/// own process) we'd additionally need a `flock`-based file lock;
+/// out of scope for this iteration.
+static SETUP_ONCE: std::sync::OnceLock<(PathBuf, PathBuf, PathBuf)> = std::sync::OnceLock::new();
+
 fn setup() -> (PathBuf, PathBuf, PathBuf) {
-    let ws_root = workspace_root();
-    let debug = debug_dir();
-    let nonpie = nonpie_dir();
-
-    ensure_binaries_built(&ws_root);
-    ensure_docker_image(&ws_root);
-
-    let harness = debug.join("litebox_test_harness");
-    assert!(
-        harness.exists(),
-        "litebox_test_harness not found at {}",
-        harness.display()
-    );
-    let nonpie_bin = nonpie.join("litebox_test_harness");
-    assert!(
-        nonpie_bin.exists(),
-        "non-PIE litebox_test_harness not found at {}",
-        nonpie_bin.display()
-    );
-
-    (ws_root, debug, nonpie)
+    SETUP_ONCE
+        .get_or_init(|| {
+            let ws_root = workspace_root();
+            ensure_binaries_built(&ws_root);
+            ensure_docker_image(&ws_root);
+            let debug = debug_dir();
+            let nonpie = nonpie_dir();
+            let harness = debug.join("litebox_test_harness");
+            assert!(
+                harness.exists(),
+                "litebox_test_harness not found at {}",
+                harness.display()
+            );
+            let nonpie_bin = nonpie.join("litebox_test_harness");
+            assert!(
+                nonpie_bin.exists(),
+                "non-PIE litebox_test_harness not found at {}",
+                nonpie_bin.display()
+            );
+            (ws_root, debug, nonpie)
+        })
+        .clone()
 }
 
 /// Run host-side tests that exercise TCP port forwarding through the broker.
