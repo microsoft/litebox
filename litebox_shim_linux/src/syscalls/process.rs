@@ -3,7 +3,7 @@
 
 //! Process/thread related syscalls.
 
-use crate::syscalls::file::get_file_descriptor_flags;
+use crate::syscalls::file::{get_file_descriptor_flags, proc_cmdline_from_argv};
 use crate::{ConstPtr, MutPtr, ShimFS, Task, multihost::ExecRoute};
 use alloc::boxed::Box;
 use alloc::collections::btree_map::BTreeMap;
@@ -2751,6 +2751,11 @@ impl<FS: ShimFS> Task<FS> {
             .pid_to_process_id
             .write()
             .insert(child_pid, child_process_id);
+        let child_cmdline = self.global.proc_cmdline(self.pid).unwrap_or_else(|| {
+            let exe = self.fs.borrow().exe_path.read().clone();
+            proc_cmdline_from_argv(&[], &exe)
+        });
+        self.global.set_proc_cmdline(child_pid, child_cmdline);
 
         let r = unsafe {
             self.global.platform.spawn_thread(
@@ -2818,6 +2823,7 @@ impl<FS: ShimFS> Task<FS> {
                 .global
                 .control_plane
                 .unregister_running_process(child_process_id);
+            self.global.remove_proc_cmdline(child_pid);
             // On failure, restore write permissions if CoW was set up.
             if let Some(cow) = &cow_state {
                 self.restore_cow_layer_permissions(cow);
@@ -9004,6 +9010,8 @@ impl<FS: ShimFS> Task<FS> {
             }
         }
         let loader = crate::loader::elf::ElfLoader::new(self, &path).map_err(Errno::from)?;
+        let resolved_exe_path = self.resolve_exe_path(&path);
+        let proc_cmdline = proc_cmdline_from_argv(&argv_vec, &resolved_exe_path);
 
         // Check whether the parsed ELF is a non-PIE binary whose fixed load
         // addresses fall outside this process's VA partition. For a shared-
@@ -9112,6 +9120,8 @@ impl<FS: ShimFS> Task<FS> {
             let remote_interp_image = remote_interp_image
                 .as_ref()
                 .map(|(path, data)| (path.as_str(), data.as_slice()));
+            *self.fs.borrow().exe_path.write() = resolved_exe_path;
+            self.global.set_proc_cmdline(self.pid, proc_cmdline);
             let result = self.exec_on_remote_host(
                 &path,
                 argv_vec,
@@ -9214,8 +9224,9 @@ impl<FS: ShimFS> Task<FS> {
 
         match self.load_program(loader, argv_vec, envp_vec, Some(&path_cstr)) {
             Ok(()) => {
-                // Update /proc/self/exe to point to the new executable.
-                *self.fs.borrow().exe_path.write() = self.resolve_exe_path(&path);
+                // Update /proc/self/exe and /proc/self/cmdline for the new executable.
+                *self.fs.borrow().exe_path.write() = resolved_exe_path;
+                self.global.set_proc_cmdline(self.pid, proc_cmdline);
             }
             Err(e) => {
                 if let Some(vd) = vfork_done.take() {

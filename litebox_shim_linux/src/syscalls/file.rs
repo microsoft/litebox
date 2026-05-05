@@ -44,6 +44,25 @@ fn is_host_tty_path(path: &str) -> bool {
     path == "/dev/tty"
 }
 
+/// Build Linux-style NUL-separated `/proc/<pid>/cmdline` data.
+pub(crate) fn proc_cmdline_from_argv(argv: &[CString], fallback_exe: &str) -> Vec<u8> {
+    if argv.is_empty() {
+        if fallback_exe.is_empty() {
+            return vec![0];
+        }
+        let mut out = fallback_exe.as_bytes().to_vec();
+        out.push(0);
+        return out;
+    }
+
+    let mut out = Vec::new();
+    for arg in argv {
+        out.extend_from_slice(arg.as_bytes());
+        out.push(0);
+    }
+    out
+}
+
 /// Check if a path matches the host's actual PTY device path (e.g., `/dev/pts/156`).
 fn is_host_pty_device_path(path: &str, platform: &litebox_platform_multiplex::Platform) -> bool {
     platform
@@ -512,16 +531,13 @@ impl<FS: ShimFS> Task<FS> {
     }
 
     /// Generate synthetic `/proc/<pid>/cmdline` content.
-    fn synthetic_proc_cmdline(&self) -> alloc::vec::Vec<u8> {
-        // NUL-separated argv. Use the exe path as a minimal approximation.
-        let exe = self.fs.borrow().exe_path.read().clone();
-        if exe.is_empty() {
-            alloc::vec![0]
-        } else {
-            let mut v = exe.into_bytes();
-            v.push(0);
-            v
+    fn synthetic_proc_cmdline(&self, pid: i32) -> alloc::vec::Vec<u8> {
+        if let Some(cmdline) = self.global.proc_cmdline(pid) {
+            return cmdline;
         }
+
+        let exe = self.fs.borrow().exe_path.read().clone();
+        proc_cmdline_from_argv(&[], &exe)
     }
 
     /// Generate synthetic `/proc/<pid>/status` content.
@@ -796,7 +812,7 @@ impl<FS: ShimFS> Task<FS> {
                             .open_synthetic_proc_text(flags, self.synthetic_proc_status(pid));
                     }
                     "/cmdline" => {
-                        let data = self.synthetic_proc_cmdline();
+                        let data = self.synthetic_proc_cmdline(pid);
                         let text = alloc::string::String::from_utf8_lossy(&data).into_owned();
                         return self.open_synthetic_proc_text(flags, text);
                     }

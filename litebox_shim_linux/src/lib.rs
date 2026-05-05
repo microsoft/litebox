@@ -391,6 +391,7 @@ impl LinuxShimBuilder {
             control_plane,
             fork_child_host_pids: litebox::sync::RwLock::new(alloc::collections::BTreeMap::new()),
             pid_to_process_id: litebox::sync::RwLock::new(alloc::collections::BTreeMap::new()),
+            proc_cmdlines: litebox::sync::RwLock::new(alloc::collections::BTreeMap::new()),
         });
         LinuxShim {
             global,
@@ -512,14 +513,16 @@ impl<FS: ShimFS> LinuxShim<FS> {
             .task
             .resolve_shebang_program(path, argv)
             .map_err(loader::elf::ElfLoaderError::OpenError)?;
+        let resolved_exe_path = entrypoints.task.resolve_exe_path(resolved_path.as_str());
+        let proc_cmdline = syscalls::file::proc_cmdline_from_argv(&argv, &resolved_exe_path);
         entrypoints.task.load_program(
             loader::elf::ElfLoader::new(&entrypoints.task, resolved_path.as_str())?,
             argv,
             envp,
             exec_filename.as_ref(),
         )?;
-        *entrypoints.task.fs.borrow().exe_path.write() =
-            entrypoints.task.resolve_exe_path(resolved_path.as_str());
+        *entrypoints.task.fs.borrow().exe_path.write() = resolved_exe_path;
+        entrypoints.task.global.set_proc_cmdline(pid, proc_cmdline);
         let process = LinuxShimProcess(entrypoints.task.process().clone());
         Ok(LoadedProgram {
             entrypoints,
@@ -3453,9 +3456,23 @@ struct GlobalState<FS: ShimFS> {
         Platform,
         alloc::collections::BTreeMap<i32, litebox::process::ProcessId>,
     >,
+    /// Synthetic `/proc/<pid>/cmdline` contents for locally-known guest PIDs.
+    proc_cmdlines: litebox::sync::RwLock<Platform, alloc::collections::BTreeMap<i32, Vec<u8>>>,
 }
 
 impl<FS: ShimFS> GlobalState<FS> {
+    fn set_proc_cmdline(&self, pid: i32, cmdline: Vec<u8>) {
+        self.proc_cmdlines.write().insert(pid, cmdline);
+    }
+
+    fn proc_cmdline(&self, pid: i32) -> Option<Vec<u8>> {
+        self.proc_cmdlines.read().get(&pid).cloned()
+    }
+
+    fn remove_proc_cmdline(&self, pid: i32) {
+        self.proc_cmdlines.write().remove(&pid);
+    }
+
     /// Keeps the global thread allocator above a thread ID that was assigned
     /// outside `next_thread_id` (for example, when bootstrapping a process in a
     /// new host process).
