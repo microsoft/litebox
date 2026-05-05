@@ -1090,27 +1090,18 @@ impl<FS: ShimFS> Task<FS> {
 
     /// Finalize the ELF patching state for `fd`.
     ///
-    /// If the fd has a trampoline region that was allocated (RW), mprotect it
-    /// to RX so the trampoline stubs become executable and non-writable.
-    /// The cache entry is removed regardless.
+    /// Removes the cache entry (preventing stale state if the fd is reused)
+    /// and unmaps any trampoline that was allocated but never used.
     pub(crate) fn finalize_elf_patch(&self, fd: i32) {
         let state = self.global.elf_patch_cache.lock().remove(&fd);
         if let Some(state) = state
             && state.trampoline_mapped
             && !state.pre_patched
+            && !state.runtime_patches_committed
         {
             let tramp_len = state.trampoline_mapped_len;
             if tramp_len > 0 {
-                if !state.runtime_patches_committed {
-                    let _ =
-                        self.sys_munmap(MutPtr::<u8>::from_usize(state.trampoline_addr), tramp_len);
-                    return;
-                }
-                let _ = self.sys_mprotect_raw(
-                    MutPtr::<u8>::from_usize(state.trampoline_addr),
-                    tramp_len,
-                    ProtFlags::PROT_READ | ProtFlags::PROT_EXEC,
-                );
+                let _ = self.sys_munmap(MutPtr::<u8>::from_usize(state.trampoline_addr), tramp_len);
             }
         }
     }

@@ -570,8 +570,6 @@ impl<FS: ShimFS> Task<FS> {
 
     /// Handle syscall `close`
     pub(crate) fn sys_close(&self, fd: i32) -> Result<(), Errno> {
-        // Finalize any in-progress ELF patching for this fd (mprotect
-        // trampoline RW→RX) before closing the descriptor.
         self.finalize_elf_patch(fd);
 
         let Ok(raw_fd) = u32::try_from(fd).and_then(usize::try_from) else {
