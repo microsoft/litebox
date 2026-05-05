@@ -793,6 +793,7 @@ impl Server {
         };
 
         let mut current_path = src_path;
+        let mut current_is_canonical = src_is_canonical;
         let mut wqids = Vec::new();
         let mut readlink_path = None;
 
@@ -860,7 +861,14 @@ impl Server {
                 && let Ok(meta) = fs::symlink_metadata(&next)
                 && meta.file_type().is_symlink()
             {
+                if !next.starts_with(&self.root) {
+                    break;
+                }
                 readlink_path = Some(next.clone());
+                wqids.push(metadata_to_qid(&meta));
+                current_path = next;
+                current_is_canonical = false;
+                continue;
             }
 
             // Canonicalize to follow symlinks. This resolves the real path
@@ -878,6 +886,7 @@ impl Server {
 
             wqids.push(qid);
             current_path = resolved;
+            current_is_canonical = true;
         }
 
         // Per 9P spec: if no names were walked, return error
@@ -902,7 +911,7 @@ impl Server {
                     state.patched_data = None;
                     state.patched_offset = 0;
                     state.is_open = false;
-                    state.is_canonical = true;
+                    state.is_canonical = current_is_canonical;
                 }
             } else {
                 let mut fids = write_lock(&self.fids, "fids");
@@ -922,7 +931,7 @@ impl Server {
                         patched_offset: 0,
                         qid,
                         is_open: false,
-                        is_canonical: true,
+                        is_canonical: current_is_canonical,
                     })),
                 );
             }
