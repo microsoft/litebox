@@ -576,18 +576,18 @@ fn register_canary(tests: &mut Vec<Test>) {
 }
 
 /// Check whether a Test matches the --filter argument.
-/// Matches by suite, suite.group, or test ID prefix.
+/// Matches by suite, suite.group, or test ID prefix. The filter may be
+/// a comma-separated list of parts; the test matches if **any** part
+/// matches by suite, suite.group, or test ID prefix.
 fn matches_test(filter: Option<&str>, test: &Test) -> bool {
     match filter {
         None => true,
-        Some(f) => {
-            // Try suite.group match first
-            if matches_filter(Some(f), test.suite, test.group) {
-                return true;
-            }
-            // Then try test ID prefix match
-            test.id.starts_with(f)
-        }
+        Some(f) => f.split(',').any(|part| {
+            // Try suite or suite.group exact match for this part.
+            matches_filter(Some(part), test.suite, test.group)
+                // Fall back to test ID prefix match for this part.
+                || test.id.starts_with(part)
+        }),
     }
 }
 
