@@ -196,11 +196,42 @@ fn build_docker_cmd(
     cmd
 }
 
+/// Per-trial log directory. Each Trial writes its docker stdout +
+/// stderr here so failure investigation is trivial. libtest-mimic
+/// captures test-function stdout (where the harness emits its JSON
+/// result detail), so without these files the only thing visible in
+/// `cargo test` output for a failed trial is the bare "FAILED" line.
+fn log_dir() -> &'static PathBuf {
+    static LOG_DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    LOG_DIR.get_or_init(|| {
+        let dir = target_dir().join("test-logs");
+        let _ = std::fs::create_dir_all(&dir);
+        dir
+    })
+}
+
+/// Path to a per-Trial log file. `kind` is "stdout" or "stderr".
+/// Overwritten on every run; we don't accumulate across runs.
+fn log_path_for(pass: &str, test_id: &str, kind: &str) -> PathBuf {
+    log_dir().join(format!("{pass}-{}.{kind}.log", sanitize_id(test_id)))
+}
+
+/// Run one test and return its JSON result. Holds an `active_jobs`
 /// Run one test and return its JSON result. Holds an `active_jobs`
 /// permit for the duration of the result-bearing phase, then hands
 /// the still-running child off to a background drain thread that
-/// holds a `drain_backlog` permit until the container exits or is
-/// force-killed.
+/// holds a `drain_backlog` permit until the container exits.
+///
+/// Per-Trial logs (`target/test-logs/<pass>-<id>.{stdout,stderr}.log`)
+/// are written via the OS:
+///   * stderr — `Stdio::from(File::create(...))` so the docker
+///     daemon writes straight to disk; no in-process forwarding.
+///   * stdout — we still parse line by line for the JSON result,
+///     but each line is written to the stdout log file as it
+///     arrives.
+/// Both files are populated synchronously while we still hold the
+/// active_jobs permit, so they're durable even if cargo-test exits
+/// the moment we return — no need for a drain-side join hook.
 fn run_one_test(pass: &str, test_id: &str) -> Result<serde_json::Value, Failed> {
     let _permit = active_jobs().acquire();
     let (_, debug, nonpie) = setup();
@@ -215,9 +246,15 @@ fn run_one_test(pass: &str, test_id: &str) -> Result<serde_json::Value, Failed> 
             .unwrap_or(0)
     );
 
+    let stdout_log = log_path_for(pass, test_id, "stdout");
+    let stderr_log = log_path_for(pass, test_id, "stderr");
+
     let mut cmd = build_docker_cmd(pass, test_id, &container_name, &debug, &nonpie);
     cmd.stdout(Stdio::piped());
-    cmd.stderr(Stdio::piped());
+    cmd.stderr(Stdio::from(
+        std::fs::File::create(&stderr_log)
+            .unwrap_or_else(|e| panic!("create {}: {e}", stderr_log.display())),
+    ));
 
     let label = format!("{pass}[{test_id}]");
     let mut child = cmd
@@ -225,41 +262,43 @@ fn run_one_test(pass: &str, test_id: &str) -> Result<serde_json::Value, Failed> 
         .unwrap_or_else(|e| panic!("docker spawn failed for {label}: {e}"));
 
     let stdout = child.stdout.take().expect("stdout piped");
-    let stderr = child.stderr.take().expect("stderr piped");
 
-    // Drain stderr in a side thread so the buffer doesn't fill and
-    // cause the harness to block on a write.
-    let stderr_thread = std::thread::spawn(move || {
-        use std::io::Read;
-        let mut buf = Vec::new();
-        let _ = BufReader::new(stderr).read_to_end(&mut buf);
-        buf
-    });
-
-    // Read stdout line by line; record the first JSON line whose
-    // "test" field matches our test_id.
+    // Read stdout line by line; tee each line to the stdout log
+    // file, and record the first JSON line whose "test" field
+    // matches our test_id.
+    let mut stdout_log_file = std::fs::File::create(&stdout_log)
+        .unwrap_or_else(|e| panic!("create {}: {e}", stdout_log.display()));
+    use std::io::Write as _;
     let mut found: Option<serde_json::Value> = None;
-    let mut all_lines = Vec::new();
     for line in BufReader::new(stdout).lines() {
         let Ok(line) = line else { break };
-        all_lines.push(line.clone());
-        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) {
-            if v.get("test").and_then(|t| t.as_str()) == Some(test_id) {
-                found = Some(v);
-                break;
+        let _ = writeln!(stdout_log_file, "{line}");
+        if found.is_none() {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) {
+                if v.get("test").and_then(|t| t.as_str()) == Some(test_id) {
+                    found = Some(v);
+                    // Don't break — keep tee'ing later lines into
+                    // the log so post-result harness output (e.g.
+                    // teardown_tree messages) is captured for
+                    // forensics. The drain thread takes over when
+                    // we return and finishes draining the rest.
+                    break;
+                }
             }
         }
     }
 
-    // Hand off the still-running child + stderr_thread to a drain
-    // worker. We're done with the active_jobs permit.
-    spawn_drain(child, stderr_thread);
+    // Hand off the still-running child to a drain worker. It just
+    // waits for clean exit so we bound zombies / per-host docker
+    // population. Logs are already on disk (stderr via Stdio::from,
+    // stdout via the tee above).
+    spawn_drain(child);
     drop(_permit);
 
     found.ok_or_else(|| {
-        let stdout_excerpt = all_lines.join("\n");
         format!(
-            "{label}: no JSON result for {test_id} on stdout\n--- stdout ---\n{stdout_excerpt}",
+            "{label}: no JSON result for {test_id} on stdout (full log: {})",
+            stdout_log.display(),
         )
         .into()
     })
@@ -279,16 +318,15 @@ fn run_one_test(pass: &str, test_id: &str) -> Result<serde_json::Value, Failed> 
 ///   * `--rm` cleans up the container record once the inner process
 ///     exits.
 ///
-/// All this drain thread does is bound the backlog: if drain takes
-/// longer than the test loop, callers block on `active_jobs.acquire`
-/// (because new test slots only open after a drain finishes), which
-/// is the right back-pressure signal.
-fn spawn_drain(mut child: std::process::Child, stderr_thread: std::thread::JoinHandle<Vec<u8>>) {
+/// The drain thread bounds the backlog: if drain takes longer than
+/// the test loop, callers block on `active_jobs.acquire` (because
+/// new test slots only open after a drain finishes), which is the
+/// right back-pressure signal.
+fn spawn_drain(mut child: std::process::Child) {
     let backlog_permit = drain_backlog().acquire();
     std::thread::spawn(move || {
         let _hold_backlog = backlog_permit;
         let _ = child.wait();
-        let _ = stderr_thread.join();
     });
 }
 
@@ -337,7 +375,14 @@ fn run_pass_group(pass: &str, test_id: &str) -> Result<(), Failed> {
     let outcome = result["result"].as_str().unwrap_or("?");
     if outcome == "FAIL" {
         let detail = result["detail"].as_str().unwrap_or("");
-        return Err(format!("{pass}::{test_id}: {detail}").into());
+        let stdout_log = log_path_for(pass, test_id, "stdout");
+        let stderr_log = log_path_for(pass, test_id, "stderr");
+        return Err(format!(
+            "{pass}::{test_id}: {detail} (logs: {} {})",
+            stdout_log.display(),
+            stderr_log.display(),
+        )
+        .into());
     }
     Ok(())
 }
