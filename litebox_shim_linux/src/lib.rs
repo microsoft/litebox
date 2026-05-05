@@ -3593,6 +3593,25 @@ struct FdReplacement {
     /// The virtual subsystem that owned the original fd.
     #[allow(dead_code)] // Useful for debug logging; may drive close logic in future.
     subsystem: ReplacedSubsystem,
+    /// Whether this replacement comes from `spawn_result.direct_pipes`
+    /// (true: stdin/stdout for non-PIE worker, where the host_fd IS the
+    /// other end of a host OS pipe directly connected to the worker
+    /// child's stdio fd) vs `parent_pipe_replacements` (false: bridged
+    /// via a relay thread that copies between an OS pipe and the
+    /// parent's existing virtual pipe).
+    ///
+    /// When `direct: true`, the parent's guest fd MUST be installed as
+    /// a HostPipeFd over `host_fd` (consume the old slot, install the
+    /// new HostPipeFd), so reads/writes flow directly to the OS pipe
+    /// connected to the worker.
+    ///
+    /// When `direct: false`, the bridge thread already handles the data
+    /// flow via the parent's existing virtual pipe; the FdReplacement
+    /// here installs the HostPipeFd at a slot that's NOT the parent's
+    /// virtual pipe (different guest fd), or no installation is
+    /// necessary. Consuming the parent's virtual pipe at the slot
+    /// would orphan the bridge thread.
+    direct: bool,
 }
 
 /// Describes a single stream in the multiplexer that the parent dispatcher

@@ -132,24 +132,19 @@ fn main() {
             let mut buf = [0u8; 4096];
             let n = unsafe { libc::read(0, buf.as_mut_ptr() as *mut _, buf.len()) };
             if n > 0 {
-                let _ = unsafe {
-                    libc::write(1, buf.as_ptr() as *const _, n as usize)
-                };
+                let _ = unsafe { libc::write(1, buf.as_ptr() as *const _, n as usize) };
             }
         }
         "large-stdout-test" => {
             // Child writes a fixed N-byte payload to stdout. Tests
             // whether stdout bridging works for larger payloads (vs
             // the small "ECHO_TEST_OK\n" of echo-test). Default 65536.
-            let n_bytes: usize =
-                args.get(2).and_then(|s| s.parse().ok()).unwrap_or(65536);
+            let n_bytes: usize = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(65536);
             let chunk = b"X".repeat(64);
             let mut written = 0;
             while written < n_bytes {
                 let want = (n_bytes - written).min(chunk.len());
-                let r = unsafe {
-                    libc::write(1, chunk.as_ptr() as *const _, want)
-                };
+                let r = unsafe { libc::write(1, chunk.as_ptr() as *const _, want) };
                 if r <= 0 {
                     break;
                 }
@@ -157,13 +152,7 @@ fn main() {
             }
             // Trailer so the test can detect truncation.
             let trailer = format!("\nLARGE_STDOUT_OK n={written}\n");
-            let _ = unsafe {
-                libc::write(
-                    1,
-                    trailer.as_ptr() as *const _,
-                    trailer.len(),
-                )
-            };
+            let _ = unsafe { libc::write(1, trailer.as_ptr() as *const _, trailer.len()) };
         }
         "fork-exec-nonpie" => {
             // Fork a child that exec's a non-PIE binary.  Reproduces the

@@ -2990,14 +2990,33 @@ impl<FS: ShimFS> Task<FS> {
                         repl.direction,
                     );
 
-                    // Bidirectional sockets and read-only pipe replacements can
-                    // use HostPipeFd directly. HostPipeFd participates in epoll
-                    // via host polling, so direct read ends avoid an extra relay
-                    // that can miss the parent epoll wakeup during remote exec.
+                    // Bidirectional sockets always go via HostPipeFd. For
+                    // Read+Pipe, only direct_pipes-derived replacements (e.g.
+                    // worker child stdout for non-PIE exec) consume+install at
+                    // the parent's slot; bridged Read+Pipe replacements (e.g.
+                    // stderr) keep the parent's virtual pipe so the bridge
+                    // thread continues to deliver data through it.
                     if repl.direction == HostPipeDirection::ReadWrite
-                        || (repl.direction == HostPipeDirection::Read
+                        || (repl.direct
+                            && repl.direction == HostPipeDirection::Read
                             && repl.subsystem == crate::ReplacedSubsystem::Pipe)
                     {
+                        // Skip duplicate FdReplacement entries: a previous
+                        // iteration may already have installed a HostPipeFd at
+                        // this slot. Close our extra host_fd and continue.
+                        {
+                            let rds_check = files.raw_descriptor_store.read();
+                            let already_hostpipe = rds_check
+                                .fd_from_raw_integer::<super::host_pipe::HostPipeSubsystem>(
+                                    repl.guest_fd,
+                                )
+                                .is_ok();
+                            if already_hostpipe {
+                                self.global.platform.close_host_fd(repl.host_fd);
+                                continue;
+                            }
+                        }
+
                         let entry = super::host_pipe::HostPipeFd::new(repl.host_fd, repl.direction);
                         let typed_fd: litebox::fd::TypedFd<super::host_pipe::HostPipeSubsystem> =
                             self.global.litebox.descriptor_table_mut().insert(entry);
@@ -3013,6 +3032,21 @@ impl<FS: ShimFS> Task<FS> {
                             let _ = self.global.litebox.descriptor_table_mut().remove(&old_sock);
                             rds = files.raw_descriptor_store.write();
                         }
+                        // For direct Read+Pipe replacements only: consume the
+                        // parent's existing virtual pipe at this slot so
+                        // fd_into_specific_raw_integer below can install the
+                        // HostPipeFd. mem::forget keeps the underlying virtual
+                        // pipe alive (drop would close it which the in-progress
+                        // exec_on_remote_host syscall may still reference).
+                        if repl.direct && repl.direction == HostPipeDirection::Read {
+                            if let Ok(old_pipe) = rds
+                                .fd_consume_raw_integer::<litebox::pipes::Pipes<crate::Platform>>(
+                                    repl.guest_fd,
+                                )
+                            {
+                                core::mem::forget(old_pipe);
+                            }
+                        }
                         let _ = rds.fd_into_specific_raw_integer(typed_fd, repl.guest_fd);
                         continue;
                     }
@@ -3020,6 +3054,25 @@ impl<FS: ShimFS> Task<FS> {
                     // Default path: create a virtual pipe pair and replace the fd.
                     // This is used for init (whose fds are host-backed, not virtual
                     // pipes) and for Write-direction replacements.
+
+                    // Skip if a HostPipeFd is already installed at this slot
+                    // (e.g. by a prior direct-pipe replacement targeting the
+                    // same parent slot — stdio at raw_fd > 2 can appear in
+                    // both spawn_result.direct_pipes and parent_pipe_replacements).
+                    // Close our extra host_fd so the bridge socketpair end
+                    // doesn't leak; the bridge thread will exit on EPIPE.
+                    {
+                        let rds_check = files.raw_descriptor_store.read();
+                        let already_hostpipe = rds_check
+                            .fd_from_raw_integer::<super::host_pipe::HostPipeSubsystem>(
+                                repl.guest_fd,
+                            )
+                            .is_ok();
+                        if already_hostpipe {
+                            self.global.platform.close_host_fd(repl.host_fd);
+                            continue;
+                        }
+                    }
 
                     // Create a virtual pipe pair.  The parent keeps one
                     // end in its fd table; the relay thread owns the other.
@@ -5023,6 +5076,7 @@ impl<FS: ShimFS> Task<FS> {
                                 host_fd,
                                 direction: parent_dir,
                                 subsystem: crate::ReplacedSubsystem::Pipe,
+                                direct: false,
                             });
                         }
                     } else {
@@ -5175,6 +5229,7 @@ impl<FS: ShimFS> Task<FS> {
                                             host_fd: parent_end,
                                             direction: HostPipeDirection::ReadWrite,
                                             subsystem: crate::ReplacedSubsystem::UnixSocket,
+                                            direct: false,
                                         });
                                     }
                                 }
@@ -5411,6 +5466,7 @@ impl<FS: ShimFS> Task<FS> {
                                 host_fd: parent_host_fd,
                                 direction: parent_dir,
                                 subsystem: crate::ReplacedSubsystem::UnixSocket,
+                                direct: false,
                             });
                             this_parent_info.push((
                                 parent_fd,
@@ -8689,6 +8745,19 @@ impl<FS: ShimFS> Task<FS> {
                         if mux_ids.contains(&pair_id) {
                             continue;
                         }
+                        // Skip pipes whose pair is also tied to worker stdio
+                        // (target_fd 0/1/2). Those are handled by direct_pipes
+                        // (stdin/stdout when use_direct_stdio) or by the
+                        // platform's output_bridges (stderr always). The
+                        // parent's existing virtual pipe at the matching slot
+                        // is the bridge sink; consuming and replacing it would
+                        // orphan the bridge thread.
+                        if stdio_pipe_info
+                            .iter()
+                            .any(|(_, sp_id, _)| *sp_id == pair_id)
+                        {
+                            continue;
+                        }
                         out.push((raw_fd, pair_id, direction));
                     }
                 }
@@ -8813,6 +8882,7 @@ impl<FS: ShimFS> Task<FS> {
                                 host_fd: direct.parent_os_fd,
                                 direction: parent_direction,
                                 subsystem: crate::ReplacedSubsystem::Pipe,
+                                direct: true,
                             });
                             stored = true;
                             break;
@@ -8835,6 +8905,7 @@ impl<FS: ShimFS> Task<FS> {
                             host_fd: parent_os_fd,
                             direction: super::host_pipe::HostPipeDirection::ReadWrite,
                             subsystem: crate::ReplacedSubsystem::UnixSocket,
+                            direct: true,
                         });
                         stored = true;
                     }
@@ -8859,6 +8930,7 @@ impl<FS: ShimFS> Task<FS> {
                             host_fd: parent_os_fd,
                             direction: parent_direction,
                             subsystem: crate::ReplacedSubsystem::Pipe,
+                            direct: false,
                         });
                         stored = true;
                     }
