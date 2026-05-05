@@ -19,7 +19,7 @@ use thiserror::Error;
 use crate::fs::OFlags;
 use crate::fs::errors::{
     ChmodError, ChownError, FileStatusError, MkdirError, OpenError, PathError, ReadDirError,
-    ReadError, RmdirError, SeekError, TruncateError, UnlinkError, WriteError,
+    ReadError, RmdirError, SeekError, SymlinkError, TruncateError, UnlinkError, WriteError,
 };
 use crate::fs::nine_p::fcall::Rlerror;
 use crate::path::Arg;
@@ -135,6 +135,25 @@ impl From<Error> for MkdirError {
                 _ => MkdirError::Io,
             },
             Error::Io | Error::InvalidResponse | Error::Interrupted => MkdirError::Io,
+        }
+    }
+}
+
+impl From<Error> for SymlinkError {
+    fn from(e: Error) -> Self {
+        match e {
+            Error::InvalidPathname => SymlinkError::PathError(PathError::InvalidPathname),
+            Error::Remote(errno) => match errno {
+                ENOENT => SymlinkError::PathError(PathError::NoSuchFileOrDirectory),
+                EEXIST => SymlinkError::AlreadyExists,
+                EPERM | EACCES => SymlinkError::NoWritePerms,
+                ENOTDIR => SymlinkError::PathError(PathError::ComponentNotADirectory),
+                ENAMETOOLONG | EINVAL => SymlinkError::PathError(PathError::InvalidPathname),
+                EROFS => SymlinkError::ReadOnlyFileSystem,
+                ENOSYS | EOPNOTSUPP => SymlinkError::NotSupported,
+                _ => SymlinkError::Io,
+            },
+            Error::Io | Error::InvalidResponse | Error::Interrupted => SymlinkError::Io,
         }
     }
 }
@@ -1936,6 +1955,29 @@ impl<Platform: sync::RawSyncPrimitivesProvider, W: transport::Write> super::File
         }
 
         result.map(|_| ()).map_err(MkdirError::from)
+    }
+
+    fn symlink(
+        &self,
+        target: impl crate::path::Arg,
+        linkpath: impl crate::path::Arg,
+    ) -> Result<(), SymlinkError> {
+        let target = target
+            .as_rust_str()
+            .map_err(|_| SymlinkError::PathError(PathError::InvalidPathname))?;
+        let linkpath = self.absolute_path(linkpath)?;
+        let (parent_fid, name) = self.walk_to_parent(&linkpath)?;
+
+        let result = self.client.symlink(parent_fid, name, target, 0);
+        self.client.clunk_async(parent_fid);
+
+        if result.is_ok() {
+            self.invalidate_negative_stat_cache(&[&linkpath]);
+            self.invalidate_parent_stat_cache(&linkpath);
+            self.invalidate_readlink_cache(&[&linkpath]);
+        }
+
+        result.map(|_| ()).map_err(SymlinkError::from)
     }
 
     fn rmdir(&self, path: impl crate::path::Arg) -> Result<(), RmdirError> {

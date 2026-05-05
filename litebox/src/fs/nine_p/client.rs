@@ -739,6 +739,29 @@ impl<Platform: RawSyncPrimitivesProvider, W: Write> Client<Platform, W> {
         )
     }
 
+    /// Create a symbolic link in a directory.
+    pub(super) fn symlink(
+        &self,
+        dfid: fcall::Fid,
+        name: &str,
+        target: &str,
+        gid: u32,
+    ) -> Result<fcall::Qid, Error> {
+        self.fcall(
+            Fcall::Tsymlink(fcall::Tsymlink {
+                fid: dfid,
+                name: fcall::FcallStr::Borrowed(name.as_bytes()),
+                symtgt: fcall::FcallStr::Borrowed(target.as_bytes()),
+                gid,
+            }),
+            |response| match response {
+                Fcall::Rsymlink(fcall::Rsymlink { qid }) => Ok(qid),
+                Fcall::Rlerror(e) => Err(Error::from(e)),
+                _ => Err(Error::InvalidResponse),
+            },
+        )
+    }
+
     /// Remove the file represented by fid and clunk the fid, even if the remove fails
     pub(super) fn remove(&self, fid: fcall::Fid) -> Result<(), Error> {
         self.fcall(

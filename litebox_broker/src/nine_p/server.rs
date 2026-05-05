@@ -19,6 +19,7 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fs;
 use std::io::{Read as _, Seek, SeekFrom};
+use std::os::unix::ffi::OsStrExt;
 use std::panic::{self, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -353,6 +354,7 @@ impl Server {
                 OwnedRequest::Walk { .. } => "walk",
                 OwnedRequest::Lopen { .. } => "lopen",
                 OwnedRequest::Lcreate { .. } => "lcreate",
+                OwnedRequest::Symlink { .. } => "symlink",
                 OwnedRequest::Read { .. } => "read",
                 OwnedRequest::Write { .. } => "write",
                 OwnedRequest::Getattr { .. } => "getattr",
@@ -640,6 +642,12 @@ impl Server {
                 mode,
                 gid,
             } => self.handle_lcreate(fid, name, flags, mode, gid),
+            OwnedRequest::Symlink {
+                fid,
+                name,
+                symtgt,
+                gid,
+            } => self.handle_symlink(fid, name, symtgt, gid),
             OwnedRequest::Read { fid, offset, count } => {
                 self.handle_read(fcall::Tread { fid, offset, count })
             }
@@ -1107,6 +1115,50 @@ impl Server {
                     iounit: msize - fcall::IOHDRSZ,
                 })
             }
+            Err(e) => io_error_response(e),
+        }
+    }
+
+    fn handle_symlink<'a>(&self, fid: u32, name: String, symtgt: Vec<u8>, _gid: u32) -> Fcall<'a> {
+        let fid_arc = match self.get_fid(fid) {
+            Ok(fid_arc) => fid_arc,
+            Err(errno) => return error_response(errno),
+        };
+
+        if name.contains('/') || name.contains('\0') || name == "." || name == ".." {
+            return error_response(libc::EINVAL as u32);
+        }
+        if symtgt.contains(&0) {
+            return error_response(libc::EINVAL as u32);
+        }
+
+        let (parent_path, is_canonical) = {
+            let state = read_lock(&fid_arc, "fid");
+            (state.path.clone(), state.is_canonical)
+        };
+
+        let resolved_parent = match self.resolve_fid_path(&parent_path, is_canonical) {
+            Ok(p) => p,
+            Err(errno) => return error_response(errno),
+        };
+        let target = resolved_parent.join(&name);
+        if !target.starts_with(&self.root) {
+            return error_response(libc::EPERM as u32);
+        }
+
+        if self.policy.check(Action::Write, Some(&target)) == Decision::Deny {
+            return error_response(libc::EPERM as u32);
+        }
+
+        let link_target = std::ffi::OsStr::from_bytes(&symtgt);
+        match std::os::unix::fs::symlink(Path::new(link_target), &target) {
+            Ok(()) => match path_to_qid(&target) {
+                Ok(qid) => {
+                    self.invalidate_canonical_cache(&target);
+                    Fcall::Rsymlink(fcall::Rsymlink { qid })
+                }
+                Err(errno) => error_response(errno),
+            },
             Err(e) => io_error_response(e),
         }
     }
@@ -1940,6 +1992,12 @@ enum OwnedRequest {
         mode: u32,
         gid: u32,
     },
+    Symlink {
+        fid: u32,
+        name: String,
+        symtgt: Vec<u8>,
+        gid: u32,
+    },
     Read {
         fid: u32,
         offset: u64,
@@ -2032,6 +2090,12 @@ impl OwnedRequest {
                 name: String::from_utf8_lossy(&r.name).into_owned(),
                 flags: r.flags,
                 mode: r.mode,
+                gid: r.gid,
+            },
+            Fcall::Tsymlink(r) => OwnedRequest::Symlink {
+                fid: r.fid,
+                name: String::from_utf8_lossy(&r.name).into_owned(),
+                symtgt: r.symtgt.into_owned(),
                 gid: r.gid,
             },
             Fcall::Tread(r) => OwnedRequest::Read {
