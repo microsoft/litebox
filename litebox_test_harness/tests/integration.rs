@@ -21,19 +21,37 @@
 //!
 //! To add a rootfs dependency, edit the Dockerfile. There is no other path.
 
-use std::collections::HashSet;
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
-use std::process::Command;
-use std::sync::Mutex;
+use std::process::{Command, Stdio};
+use std::sync::{Condvar, Mutex};
 
 use libtest_mimic::{Arguments, Failed, Trial};
 
-// ── Pass result cache ────────────────────────────────────────────────
+// ── Per-test docker run model ────────────────────────────────────────
 //
-// One docker run per pass (native/litebox). The docker run executes
-// spawn-tree with `--filter=suite1,suite2,...` for only the suites
-// that have matching Trials. Results are cached so all Trials in the
-// same pass share one docker run.
+// Each Trial spawns its own docker run with `--filter=<test_id>`. We
+// read stdout incrementally; the moment the harness emits the JSON
+// result line for our test ID, we record the verdict and let the
+// container drain (teardown_tree, kernel reap) in a background thread
+// so the next Trial isn't blocked by the ~10 s teardown.
+//
+// Concurrency is bounded by two semaphores:
+//   * `active_jobs` (default 5, env LITEBOX_TEST_JOBS): how many
+//     `docker run` invocations may be in their "useful" phase
+//     (bringing up agent matrix + running the test). This is the cap
+//     that controls peak memory / docker pressure.
+//   * `drain_backlog` (default 20, env LITEBOX_DRAIN_BACKLOG): how
+//     many post-result containers can be draining concurrently. When
+//     we hit this cap the test loop exerts back-pressure rather than
+//     letting zombies pile up. With teardown bounded at ~10 s, 20 is
+//     comfortably above the steady-state size of (active_jobs *
+//     teardown / per_test_useful_phase).
+//
+// The slow-exit fix (commit 1c1ae050) and lazy-agent-matrix
+// (441c7efb) make the per-test useful phase cheap enough (~6 s for
+// PIE-only tests) that this model is competitive with the old
+// single-docker-per-pass cache.
 
 /// Cached test IDs from collect_all_tests (direct library call, no subprocess).
 static TEST_IDS: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
@@ -50,18 +68,14 @@ fn get_test_ids() -> &'static Vec<String> {
     })
 }
 
-static PASS_CACHE: Mutex<Option<std::collections::HashMap<String, Vec<serde_json::Value>>>> =
-    Mutex::new(None);
-
-/// Get (or compute) results for a pass. Runs docker once per pass.
-
 /// Whether to keep docker containers after exit (for debugging).
 fn keep_containers() -> bool {
     std::env::var("LITEBOX_KEEP_CONTAINER").is_ok()
 }
 
-/// Docker run args: --rm unless LITEBOX_KEEP_CONTAINER is set.
-fn docker_run_args() -> Vec<&'static str> {
+/// `--rm` unless LITEBOX_KEEP_CONTAINER is set. We pass `--name` so
+/// the container is identifiable in `docker ps` for debugging.
+fn docker_run_base_args() -> Vec<&'static str> {
     if keep_containers() {
         vec!["run", "--cap-add", "SYS_PTRACE"]
     } else {
@@ -69,42 +83,103 @@ fn docker_run_args() -> Vec<&'static str> {
     }
 }
 
-fn get_pass_results(pass: &str, filter_arg: &str) -> Vec<serde_json::Value> {
-    let mut cache = PASS_CACHE.lock().unwrap();
-    let map = cache.get_or_insert_with(std::collections::HashMap::new);
-    if let Some(results) = map.get(pass) {
-        return results.clone();
+// ── Bounded semaphore (std-only) ─────────────────────────────────────
+
+struct Semaphore {
+    permits: Mutex<usize>,
+    cv: Condvar,
+}
+
+impl Semaphore {
+    fn new(n: usize) -> Self {
+        Self {
+            permits: Mutex::new(n),
+            cv: Condvar::new(),
+        }
     }
 
-    let (_, debug, nonpie) = setup();
-
-    let mut spawn_args: Vec<String> = vec!["spawn-tree".into()];
-    if !filter_arg.is_empty() {
-        spawn_args.push(format!("--filter={filter_arg}"));
+    fn acquire(&'static self) -> SemaphoreGuard {
+        let mut p = self.permits.lock().unwrap();
+        while *p == 0 {
+            p = self.cv.wait(p).unwrap();
+        }
+        *p -= 1;
+        SemaphoreGuard { sem: self }
     }
+}
 
-    let mut results = match pass {
+struct SemaphoreGuard {
+    sem: &'static Semaphore,
+}
+
+impl Drop for SemaphoreGuard {
+    fn drop(&mut self) {
+        let mut p = self.sem.permits.lock().unwrap();
+        *p += 1;
+        self.sem.cv.notify_one();
+    }
+}
+
+static ACTIVE_JOBS: std::sync::OnceLock<Semaphore> = std::sync::OnceLock::new();
+static DRAIN_BACKLOG: std::sync::OnceLock<Semaphore> = std::sync::OnceLock::new();
+
+fn active_jobs() -> &'static Semaphore {
+    ACTIVE_JOBS.get_or_init(|| {
+        let n = std::env::var("LITEBOX_TEST_JOBS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(5);
+        eprintln!("[integration] LITEBOX_TEST_JOBS={n}");
+        Semaphore::new(n)
+    })
+}
+
+fn drain_backlog() -> &'static Semaphore {
+    DRAIN_BACKLOG.get_or_init(|| {
+        let n = std::env::var("LITEBOX_DRAIN_BACKLOG")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(20);
+        Semaphore::new(n)
+    })
+}
+
+/// Best-effort sanitize a test id into a docker container name suffix.
+fn sanitize_id(id: &str) -> String {
+    id.chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect()
+}
+
+/// Build the docker command for a single-test run. We pass `--name`
+/// so the container is identifiable in `docker ps` and so
+/// `LITEBOX_KEEP_CONTAINER` users can find it after the test
+/// finishes; the orchestrator never force-kills it externally.
+fn build_docker_cmd(
+    pass: &str,
+    test_id: &str,
+    container_name: &str,
+    debug: &Path,
+    nonpie: &Path,
+) -> Command {
+    let filter = format!("--filter={test_id}");
+    let mut cmd = Command::new("docker");
+    cmd.args(docker_run_base_args())
+        .arg("--name")
+        .arg(container_name)
+        .arg("-v")
+        .arg(format!("{}:/opt/litebox:ro", debug.display()))
+        .arg("-v")
+        .arg(format!("{}:/opt/nonpie:ro", nonpie.display()))
+        .arg("litebox-test");
+    match pass {
         "native" => {
-            let mut cmd = Command::new("docker");
-            cmd.args(docker_run_args())
-                .arg("-v")
-                .arg(format!("{}:/opt/litebox:ro", debug.display()))
-                .arg("-v")
-                .arg(format!("{}:/opt/nonpie:ro", nonpie.display()))
-                .arg("litebox-test")
-                .arg("/opt/litebox/litebox_test_harness")
-                .args(&spawn_args);
-            run_and_parse(&format!("native[{filter_arg}]"), &mut cmd)
+            cmd.arg("/opt/litebox/litebox_test_harness")
+                .arg("spawn-tree")
+                .arg(&filter);
         }
         "litebox" => {
-            let mut cmd = Command::new("docker");
-            cmd.args(docker_run_args())
-                .arg("-v")
-                .arg(format!("{}:/opt/litebox:ro", debug.display()))
-                .arg("-v")
-                .arg(format!("{}:/opt/nonpie:ro", nonpie.display()))
-                .arg("litebox-test")
-                .args(["timeout", "--signal=KILL", "1200"])
+            cmd.args(["timeout", "--signal=KILL", "120"])
                 .args([
                     "/opt/litebox/litebox_tool_executor",
                     "--rootfs",
@@ -112,111 +187,109 @@ fn get_pass_results(pass: &str, filter_arg: &str) -> Vec<serde_json::Value> {
                     "--record-baseline",
                     "--",
                     "/opt/litebox/litebox_test_harness",
+                    "spawn-tree",
                 ])
-                .args(&spawn_args);
-            run_and_parse(&format!("litebox[{filter_arg}]"), &mut cmd)
+                .arg(&filter);
         }
         _ => panic!("unknown pass: {pass}"),
-    };
-
-    // Fill in missing test IDs from the native baseline so litebox
-    // reports the same test count as native. This runs on the host
-    // (not inside docker) so it's not affected by container timeouts.
-    if !results.is_empty() {
-        let recorded_ids: std::collections::HashSet<String> = results
-            .iter()
-            .filter_map(|r| r["test"].as_str().map(String::from))
-            .collect();
-
-        let all_ids = get_test_ids();
-        let mut filled = 0usize;
-        for test_id in all_ids {
-            if !recorded_ids.contains(test_id.as_str()) {
-                results.push(serde_json::json!({
-                    "test": test_id,
-                    "agent": "?",
-                    "result": "FAIL",
-                    "detail": "not executed",
-                }));
-                filled += 1;
-            }
-        }
-        if filled > 0 {
-            eprintln!("[{pass}] filled {filled} unexecuted test IDs as FAIL");
-        }
     }
-
-    // Drift check: parse TEST_IDS from stderr and compare against baseline.
-    // Warn if registered IDs don't match the baseline file.
-    let test_ids = get_test_ids();
-    let baseline_ids: std::collections::HashSet<&str> =
-        test_ids.iter().map(|s| s.as_str()).collect();
-    let registered_ids: std::collections::HashSet<String> = results
-        .iter()
-        .filter(|r| {
-            r["detail"]
-                .as_str()
-                .map_or(true, |d| !d.starts_with("not executed"))
-        })
-        .filter_map(|r| r["test"].as_str().map(String::from))
-        .collect();
-    let extra: Vec<_> = registered_ids
-        .iter()
-        .filter(|id| !baseline_ids.contains(id.as_str()))
-        .collect();
-    if !extra.is_empty() {
-        eprintln!(
-            "[{pass}] DRIFT: {} test IDs not in registered test IDs (new tests added?):",
-            extra.len()
-        );
-        for id in extra.iter().take(10) {
-            eprintln!("  + {id}");
-        }
-    }
-
-    map.insert(pass.to_string(), results.clone());
-    results
+    cmd
 }
 
-/// Determine which suites are needed based on the cargo test filter.
-/// Returns comma-separated suite names, or empty string for all suites.
-/// Compute the --filter argument for spawn-tree from the cargo test filter.
+/// Run one test and return its JSON result. Holds an `active_jobs`
+/// permit for the duration of the result-bearing phase, then hands
+/// the still-running child off to a background drain thread that
+/// holds a `drain_backlog` permit until the container exits or is
+/// force-killed.
+fn run_one_test(pass: &str, test_id: &str) -> Result<serde_json::Value, Failed> {
+    let _permit = active_jobs().acquire();
+    let (_, debug, nonpie) = setup();
+    let container_name = format!(
+        "litebox-{}-{}-{}-{}",
+        pass,
+        sanitize_id(test_id),
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.subsec_nanos())
+            .unwrap_or(0)
+    );
+
+    let mut cmd = build_docker_cmd(pass, test_id, &container_name, &debug, &nonpie);
+    cmd.stdout(Stdio::piped());
+    cmd.stderr(Stdio::piped());
+
+    let label = format!("{pass}[{test_id}]");
+    let mut child = cmd
+        .spawn()
+        .unwrap_or_else(|e| panic!("docker spawn failed for {label}: {e}"));
+
+    let stdout = child.stdout.take().expect("stdout piped");
+    let stderr = child.stderr.take().expect("stderr piped");
+
+    // Drain stderr in a side thread so the buffer doesn't fill and
+    // cause the harness to block on a write.
+    let stderr_thread = std::thread::spawn(move || {
+        use std::io::Read;
+        let mut buf = Vec::new();
+        let _ = BufReader::new(stderr).read_to_end(&mut buf);
+        buf
+    });
+
+    // Read stdout line by line; record the first JSON line whose
+    // "test" field matches our test_id.
+    let mut found: Option<serde_json::Value> = None;
+    let mut all_lines = Vec::new();
+    for line in BufReader::new(stdout).lines() {
+        let Ok(line) = line else { break };
+        all_lines.push(line.clone());
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) {
+            if v.get("test").and_then(|t| t.as_str()) == Some(test_id) {
+                found = Some(v);
+                break;
+            }
+        }
+    }
+
+    // Hand off the still-running child + stderr_thread to a drain
+    // worker. We're done with the active_jobs permit.
+    spawn_drain(child, stderr_thread);
+    drop(_permit);
+
+    found.ok_or_else(|| {
+        let stdout_excerpt = all_lines.join("\n");
+        format!(
+            "{label}: no JSON result for {test_id} on stdout\n--- stdout ---\n{stdout_excerpt}",
+        )
+        .into()
+    })
+}
+
+/// Background drain: hold a `drain_backlog` permit until the child
+/// container exits on its own. We deliberately do **not** force-kill
+/// from out here:
 ///
-/// The cargo test filter matches Trial names like:
-///   "native::matrix::netlink::NL1.netlink_socket"
+///   * The harness's `teardown_tree` is already wall-clock-bounded
+///     (commit 1c1ae050: 10 s) and main hard-exits via
+///     `std::process::exit`, so the host process tree collapses
+///     promptly.
+///   * The outer `docker run` for the litebox pass wraps its inner
+///     process in `timeout --signal=KILL`, so a genuinely stuck
+///     container will be killed by docker itself.
+///   * `--rm` cleans up the container record once the inner process
+///     exits.
 ///
-/// We extract the part after the pass prefix (native::/litebox::) and
-/// pass it to the coordinator, which handles:
-///   "matrix" (suite), "matrix.netlink" (group), "NL1" (test ID prefix)
-fn compute_suite_filter(cargo_filter: &str) -> String {
-    if cargo_filter.is_empty() {
-        return String::new();
-    }
-
-    // Strip pass prefix if present.
-    // Strip pass prefix if present.
-    let filter = cargo_filter
-        .strip_prefix("native::")
-        .or_else(|| cargo_filter.strip_prefix("litebox::"))
-        .unwrap_or(cargo_filter);
-
-    // If the filter is just the pass name or empty, run all.
-    if filter.is_empty() || filter == "native" || filter == "litebox" {
-        return String::new();
-    }
-
-    // If it looks like a suite::group::testid, convert :: to . for coordinator.
-    // "matrix::netlink::NL1" → "NL1" (test ID takes precedence)
-    // "matrix::netlink" → "matrix.netlink" (group filter)
-    // "matrix" → "matrix" (suite filter)
-    // "NL1" → "NL1" (test ID filter)
-    let parts: Vec<&str> = filter.split("::").collect();
-    match parts.len() {
-        3 => parts[2].to_string(),                 // suite::group::testid → testid
-        2 => format!("{}.{}", parts[0], parts[1]), // suite::group → suite.group
-        1 => parts[0].to_string(),                 // suite or testid
-        _ => filter.to_string(),
-    }
+/// All this drain thread does is bound the backlog: if drain takes
+/// longer than the test loop, callers block on `active_jobs.acquire`
+/// (because new test slots only open after a drain finishes), which
+/// is the right back-pressure signal.
+fn spawn_drain(mut child: std::process::Child, stderr_thread: std::thread::JoinHandle<Vec<u8>>) {
+    let backlog_permit = drain_backlog().acquire();
+    std::thread::spawn(move || {
+        let _hold_backlog = backlog_permit;
+        let _ = child.wait();
+        let _ = stderr_thread.join();
+    });
 }
 
 // ── Main ─────────────────────────────────────────────────────────────
@@ -224,30 +297,24 @@ fn compute_suite_filter(cargo_filter: &str) -> String {
 fn main() {
     let args = Arguments::from_args();
 
-    // Compute which suites are needed based on the cargo test filter.
-    // This determines the --filter= argument for docker run.
-    let cargo_filter = args.filter.as_deref().unwrap_or("");
-    let suite_filter = compute_suite_filter(cargo_filter);
-    if !suite_filter.is_empty() {
-        eprintln!("[integration] suite filter: {suite_filter}");
-    }
-
     let mut trials: Vec<Trial> = Vec::new();
 
-    // Generate one Trial per test ID from the harness binary's list-ids.
-    // No docker needed — just calls register_*() functions.
+    // Generate one Trial per test ID. Each Trial spawns its own
+    // docker run with `--filter=<test_id>`; results are recorded as
+    // soon as the JSON line for that test ID is observed on stdout,
+    // and the container is allowed to drain in a background thread
+    // (see `spawn_drain`). Concurrent docker runs are bounded by
+    // LITEBOX_TEST_JOBS (default 5).
     let test_ids = get_test_ids();
     for tid in test_ids.iter().cloned() {
-        let sf = suite_filter.clone();
         let tid2 = tid.clone();
         trials.push(Trial::test(format!("native::{tid}"), move || {
-            run_pass_group("native", &sf, &tid2)
+            run_pass_group("native", &tid2)
         }));
 
-        let sf = suite_filter.clone();
         let tid2 = tid.clone();
         trials.push(Trial::test(format!("litebox::{tid}"), move || {
-            run_pass_group("litebox", &sf, &tid2)
+            run_pass_group("litebox", &tid2)
         }));
     }
 
@@ -261,28 +328,16 @@ fn main() {
     libtest_mimic::run(&args, trials).exit();
 }
 
-// ── Per-group runners (backed by pass cache) ─────────────────────────
+// ── Per-Trial runner ─────────────────────────────────────────────────
 
-/// Native gold standard: get pass results from cache, assert 0 FAIL.
-/// Validate a single test ID from cached pass results.
-fn run_pass_group(pass: &str, suite_filter: &str, test_id: &str) -> Result<(), Failed> {
-    let results = get_pass_results(pass, suite_filter);
-    if results.is_empty() {
-        return Err(format!("{pass} produced no results").into());
-    }
-    let matching: Vec<_> = results
-        .iter()
-        .filter(|r| r["test"].as_str() == Some(test_id))
-        .collect();
-    if matching.is_empty() {
-        return Err(format!("{pass}::{test_id}: not found in results").into());
-    }
-    for r in &matching {
-        let result = r["result"].as_str().unwrap_or("?");
-        if result == "FAIL" {
-            let detail = r["detail"].as_str().unwrap_or("");
-            return Err(format!("{pass}::{test_id}: {detail}").into());
-        }
+/// Run one Trial: spawn its own `docker run` with `--filter=<test_id>`,
+/// read the JSON result, return pass/fail.
+fn run_pass_group(pass: &str, test_id: &str) -> Result<(), Failed> {
+    let result = run_one_test(pass, test_id)?;
+    let outcome = result["result"].as_str().unwrap_or("?");
+    if outcome == "FAIL" {
+        let detail = result["detail"].as_str().unwrap_or("");
+        return Err(format!("{pass}::{test_id}: {detail}").into());
     }
     Ok(())
 }
@@ -387,36 +442,6 @@ fn ensure_binaries_built(ws_root: &Path) {
         .status()
         .expect("cargo rustc nonpie");
     assert!(status.success(), "cargo build (non-PIE) failed");
-}
-
-/// Run the test harness and parse JSON results from stdout.
-///
-/// JSON records are emitted incrementally by the harness coordinator as
-/// each test completes (one `println!` per result, flushed immediately;
-/// see `litebox_test_harness::coordinator::record_expected`). This means
-/// stdout is the single source of truth on **both** native and litebox
-/// passes, even if the harness process is killed before main() reaches
-/// its end-of-run code path (which can happen under litebox during
-/// teardown of the spawned agent tree).
-fn run_and_parse(label: &str, command: &mut Command) -> Vec<serde_json::Value> {
-    eprintln!("Launching {label}...");
-    let output = command
-        .output()
-        .unwrap_or_else(|e| panic!("failed to launch {label}: {e}"));
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    eprintln!("{stderr}");
-
-    let mut results: Vec<serde_json::Value> = Vec::new();
-    for line in stdout.lines() {
-        if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
-            results.push(v);
-        }
-    }
-
-    eprintln!("[{label}] Parsed {} test results", results.len());
-    results
 }
 
 /// Shared setup: build binaries and Docker image, return paths.

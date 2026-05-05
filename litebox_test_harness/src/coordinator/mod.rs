@@ -1014,6 +1014,8 @@ mod tests {
             self_exe: harness_binary(),
             poisoned: std::collections::HashSet::new(),
             recorded_ids: std::collections::HashSet::new(),
+            contacted_agents: std::collections::HashSet::new(),
+            spawned_agents: std::collections::HashSet::new(),
         }
     }
 
