@@ -7,6 +7,7 @@ use crate::{
     Errno, HostInterface, arch::ioport::serial_print_string,
     host::per_cpu_variables::with_per_cpu_variables,
 };
+use digest::Digest;
 use rand_core::{RngCore, SeedableRng};
 use zeroize::Zeroizing;
 
@@ -104,13 +105,67 @@ unsafe impl litebox::platform::ThreadLocalStorageProvider for LvbsLinuxKernel {
 
 impl litebox::platform::CrngProvider for LvbsLinuxKernel {
     fn fill_bytes_crng(&self, buf: &mut [u8]) {
-        static RANDOM: spin::mutex::SpinMutex<Option<rand_chacha::ChaCha20Rng>> =
-            spin::mutex::SpinMutex::new(None);
+        static RANDOM: spin::mutex::SpinMutex<Option<LvbsCrng>> = spin::mutex::SpinMutex::new(None);
 
         let mut random = RANDOM.lock();
         random
-            .get_or_insert_with(|| rand_chacha::ChaCha20Rng::from_seed(rdrand_seed()))
-            .fill_bytes(buf);
+            .get_or_insert_with(|| LvbsCrng::new(PRK_ONCE.wait(), rdrand_seed()))
+            .fill_bytes(buf, rdrand_seed);
+    }
+}
+
+const CRNG_RESEED_INTERVAL_BYTES: usize = 1024 * 1024;
+const CRNG_RESEED_STATE_BYTES: usize = 32;
+
+struct LvbsCrng {
+    random: rand_chacha::ChaCha20Rng,
+    bytes_until_reseed: usize,
+    reseed_counter: usize,
+}
+
+impl LvbsCrng {
+    fn new(
+        prk: &[u8; PRK_LEN],
+        rdrand_seed: <rand_chacha::ChaCha20Rng as SeedableRng>::Seed,
+    ) -> Self {
+        Self {
+            random: rand_chacha::ChaCha20Rng::from_seed(crng_seed_from_prk_and_rdrand(
+                prk,
+                rdrand_seed,
+            )),
+            bytes_until_reseed: CRNG_RESEED_INTERVAL_BYTES,
+            reseed_counter: 0,
+        }
+    }
+
+    fn fill_bytes(
+        &mut self,
+        mut buf: &mut [u8],
+        rdrand_seed: impl Fn() -> <rand_chacha::ChaCha20Rng as SeedableRng>::Seed,
+    ) {
+        while !buf.is_empty() {
+            let len = buf.len().min(self.bytes_until_reseed);
+            let (chunk, rest) = buf.split_at_mut(len);
+            self.random.fill_bytes(chunk);
+            buf = rest;
+            self.bytes_until_reseed -= len;
+
+            if self.bytes_until_reseed == 0 {
+                self.reseed(rdrand_seed());
+            }
+        }
+    }
+
+    fn reseed(&mut self, rdrand_seed: <rand_chacha::ChaCha20Rng as SeedableRng>::Seed) {
+        self.reseed_counter += 1;
+        let mut current_state = Zeroizing::new([0u8; CRNG_RESEED_STATE_BYTES]);
+        self.random.fill_bytes(&mut *current_state);
+        self.random = rand_chacha::ChaCha20Rng::from_seed(crng_reseed_from_rdrand_and_state(
+            rdrand_seed,
+            self.reseed_counter,
+            &current_state,
+        ));
+        self.bytes_until_reseed = CRNG_RESEED_INTERVAL_BYTES;
     }
 }
 
@@ -170,6 +225,30 @@ fn rdrand_seed() -> <rand_chacha::ChaCha20Rng as SeedableRng>::Seed {
         chunk.copy_from_slice(&word.to_ne_bytes()[..chunk.len()]);
     }
     seed
+}
+
+fn crng_seed_from_prk_and_rdrand(
+    prk: &[u8; PRK_LEN],
+    rdrand_seed: <rand_chacha::ChaCha20Rng as SeedableRng>::Seed,
+) -> <rand_chacha::ChaCha20Rng as SeedableRng>::Seed {
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(b"litebox-lvbs-crng-seed-v1");
+    hasher.update(prk);
+    hasher.update(rdrand_seed);
+    hasher.finalize().into()
+}
+
+fn crng_reseed_from_rdrand_and_state(
+    rdrand_seed: <rand_chacha::ChaCha20Rng as SeedableRng>::Seed,
+    reseed_counter: usize,
+    current_state: &[u8; CRNG_RESEED_STATE_BYTES],
+) -> <rand_chacha::ChaCha20Rng as SeedableRng>::Seed {
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(b"litebox-lvbs-crng-reseed-v1");
+    hasher.update(rdrand_seed);
+    hasher.update(reseed_counter.to_le_bytes());
+    hasher.update(current_state);
+    hasher.finalize().into()
 }
 
 pub struct HostLvbsInterface;
