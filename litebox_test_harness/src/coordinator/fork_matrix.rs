@@ -12,7 +12,6 @@
 //! - Non-PIE invocation method
 //! - Contamination pattern (non-PIE then PIE, various depths)
 
-
 // ═══════════════════════════════════════════════════════════════════
 // SHELL PATTERNS × DEPTH
 // ═══════════════════════════════════════════════════════════════════

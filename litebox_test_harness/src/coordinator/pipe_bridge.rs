@@ -16,7 +16,6 @@
 //!   - Count: single pipe, multiple pipes
 //!   - Agent topology: various depths (A, AA, B, NP, D4)
 
-
 /// Agents for pipe bridge tests.  Includes depths 1-2 and the
 /// non-PIE worker agent (NP) to test nested worker-exec.
 const PB_AGENTS: &[&str] = &["A", "AA", "B"];

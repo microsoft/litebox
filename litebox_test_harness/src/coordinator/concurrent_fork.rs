@@ -17,9 +17,6 @@
 //!   - Agent topology: A (depth 1), AA (depth 2), NP (non-PIE worker)
 //!   - Subcommand vs bash: protocol Exec(bash -c ...) and direct fork
 
-
-
-
 /// Agents to run concurrent fork tests on.
 const CF_AGENTS: &[&str] = &["A", "AA", "B"];
 

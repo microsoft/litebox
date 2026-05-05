@@ -13,110 +13,16 @@ use tokio::time::Duration;
 const AGENTS: &[&str] = &["A", "AA", "B"];
 const DEPTH_AGENTS: &[&str] = &["A", "AA"];
 
-// ═══════════════════════════════════════════════════════════════════
-// POLL: epoll/ppoll IN events (fix 0fb258e2)
-// ═══════════════════════════════════════════════════════════════════
-
-// ═══════════════════════════════════════════════════════════════════
-// GSN: getsockname port after bind (fix 336dc79e)
-// ═══════════════════════════════════════════════════════════════════
+// Constants used by the register_* functions further down. Each test
+// category gets a section divider immediately above its `register_*`
+// function (POLL, GSN, PID, EXITD, NPIPE, …).
 
 const FAMILIES: &[&str] = &["ipv4", "ipv6"];
-
-// ═══════════════════════════════════════════════════════════════════
-// PID: monotonic pipe pair_id (fix c2d0abdc)
-// ═══════════════════════════════════════════════════════════════════
-
-// ═══════════════════════════════════════════════════════════════════
-// EXITD: bridge thread join before exit (fix 2def3ac6)
-// ═══════════════════════════════════════════════════════════════════
 
 const EXIT_SIZES: &[usize] = &[256, 4096, 65536];
 const EXIT_BINARIES: &[&str] = &["pie", "nonpie"];
 
-// ═══════════════════════════════════════════════════════════════════
-// NPIPE: non-PIE pipe chain integrity (fix febc3e41)
-// ═══════════════════════════════════════════════════════════════════
-
 const NPIPE_REPS: &[usize] = &[1, 5, 10];
-
-/// Run all platform fix validation tests.
-
-// ═══════════════════════════════════════════════════════════════════
-// XCONN: cross-worker TCP — first connection must succeed
-// ═══════════════════════════════════════════════════════════════════
-
-// ═══════════════════════════════════════════════════════════════════
-// XCONN.self: same-worker loopback (VS Code pattern)
-// ═══════════════════════════════════════════════════════════════════
-
-// ═══════════════════════════════════════════════════════════════════
-// BASH: bash fork+exec of child commands
-// ═══════════════════════════════════════════════════════════════════
-
-// ═══════════════════════════════════════════════════════════════════
-// FORK-FROM-WORKER-EXEC: fork+exec from non-PIE worker-exec hosts
-// (reproduces VS Code ptyHost/extensionHost spawn hang)
-// ═══════════════════════════════════════════════════════════════════
-
-// ═══════════════════════════════════════════════════════════════════
-// CWF: Cross-worker file coherence
-// (9P broker concurrent read-while-write across worker sessions)
-// ═══════════════════════════════════════════════════════════════════
-
-// ═══════════════════════════════════════════════════════════════════
-// SC: $() command substitution capture — various commands
-// (readlink -f failure blocks VS Code Server startup)
-// ═══════════════════════════════════════════════════════════════════
-
-// ═══════════════════════════════════════════════════════════════════
-// CC: Concurrent fork/exec/pipe tests
-// (stress test delayed-fork, CoW, pipe bridging under concurrency)
-// ═══════════════════════════════════════════════════════════════════
-
-// ═══════════════════════════════════════════════════════════════════
-// TR: Touch + redirect file coherence
-// (9P cache stale inode after touch + fork+exec redirect)
-// ═══════════════════════════════════════════════════════════════════
-
-// ═══════════════════════════════════════════════════════════════════
-// KP: PID and /proc visibility across delayed-fork migration
-// ═══════════════════════════════════════════════════════════════════
-
-// ═══════════════════════════════════════════════════════════════════
-// FR: File-Redirect — stdout of background process → file via redirect
-// (discovered during cross-worker TCP debugging: nc prints to stdout
-// but the redirected file stays empty)
-// ═══════════════════════════════════════════════════════════════════
-
-// ═══════════════════════════════════════════════════════════════════
-// PN: Pipe Non-blocking — fcntl F_SETFL O_NONBLOCK on pipes
-// (dropbear sets pipes non-blocking for its event loop; if F_SETFL
-// silently fails, read() returns 0/EOF instead of EAGAIN, causing
-// a busy-loop that starves the network worker and blocks new SSH
-// connections including the VS Code SOCKS tunnel)
-// ═══════════════════════════════════════════════════════════════════
-
-// ═══════════════════════════════════════════════════════════════════
-// EP: Epoll + Socket wakeup — epoll_wait must wake when TCP data arrives
-// (the tokio pattern: epoll_wait → futex park → data arrives → must wake)
-// ═══════════════════════════════════════════════════════════════════
-
-// ═══════════════════════════════════════════════════════════════════
-// LB: Loopback TCP across delayed-fork workers
-// (VS Code exec server uses SOCKS proxy → TCP loopback to CLI port)
-// ═══════════════════════════════════════════════════════════════════
-
-// ═══════════════════════════════════════════════════════════════════
-// FKLC: fork-listen-close — VS Code CLI pattern
-// ═══════════════════════════════════════════════════════════════════
-
-// ═══════════════════════════════════════════════════════════════════
-// PROC: /proc filesystem tests
-// ═══════════════════════════════════════════════════════════════════
-
-// Register functions that convert platform fix tests into `super::Test` structs.
-// Each `register_*` function returns a `Vec<super::Test>`.
 
 // ═══════════════════════════════════════════════════════════════════
 // POLL: epoll/ppoll IN events (fix 0fb258e2)

@@ -471,25 +471,13 @@ const SYMLINK_TOPOLOGIES: &[Topology] = &[
 ];
 
 // ═══════════════════════════════════════════════════════════════════
-// MATRIX RUNNER
-// ═══════════════════════════════════════════════════════════════════
-// force
-// ═══════════════════════════════════════════════════════════════════
-// DECLARATIVE REGISTRATION — append to matrix.rs
+// DECLARATIVE REGISTRATION
 // ═══════════════════════════════════════════════════════════════════
 //
-// Each `register_*` function pushes `super::Test` structs into a Vec.
-// Sequential operations (write→read→update→delete) are grouped into
-// a single closure.
-
-// Declarative register functions for the matrix test suite.
-//
-// Each `register_*` function pushes self-contained `Test` structs into the
-// provided vector. Every `r.record()` call in the old imperative code becomes
-// exactly one `Test` push with the same test ID and agent.
-//
-// Designed to be appended to (or included from) `matrix.rs`.
-
+// Each `register_*` function pushes self-contained `Test` structs
+// into the provided vector. Sequential operations
+// (write → read → update → delete) are grouped into a single closure
+// per Test.
 
 // ═══════════════════════════════════════════════════════════════════
 // 1. FILESYSTEM CRUD — F.shared.{topo}.{absent,created,updated,deleted}

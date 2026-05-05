@@ -14,29 +14,8 @@
 //! - FT.interleave: file I/O interleaved between TCP send and recv
 //! - FT.multi: multiple file+TCP round-trips in sequence
 
-
 const TEST_FILE: &str = "/tmp/ft_test.txt";
 const TEST_DATA: &str = "file_tcp_test_data_1234567890";
-
-// ═══════════════════════════════════════════════════════════════════
-// FT.listen: file operations while a TCP listener is active
-// ═══════════════════════════════════════════════════════════════════
-
-// ═══════════════════════════════════════════════════════════════════
-// FT.conn: file operations while a TCP connection is established
-// ═══════════════════════════════════════════════════════════════════
-
-// ═══════════════════════════════════════════════════════════════════
-// FT.interleave: file I/O between TCP send and recv (9P deadlock)
-// ═══════════════════════════════════════════════════════════════════
-
-// ═══════════════════════════════════════════════════════════════════
-// FT.multi: repeated file+TCP cycles (stress the interaction)
-// ═══════════════════════════════════════════════════════════════════
-
-// ═══════════════════════════════════════════════════════════════════
-// FT.exec_file: exec a process that does file I/O while TCP is active
-// ═══════════════════════════════════════════════════════════════════
 
 pub(crate) fn register_file_tcp(tests: &mut Vec<super::Test>) {
     register_listen_file_tests(tests);

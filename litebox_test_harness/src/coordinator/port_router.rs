@@ -12,19 +12,6 @@
 //! The port router ownership fix (worker_id tracking) prevents a
 //! re-registering child from deregistering the parent's route on exit.
 
-
-// ═══════════════════════════════════════════════════════════════════
-// PR.fork: port survives child fork+exit
-// ═══════════════════════════════════════════════════════════════════
-
-// ═══════════════════════════════════════════════════════════════════
-// PR.listen_inherit: reproduces VS Code exec server failure
-// ═══════════════════════════════════════════════════════════════════
-
-// ═══════════════════════════════════════════════════════════════════
-// PR.child_listen: child process calls listen(), cross-worker connect
-// ═══════════════════════════════════════════════════════════════════
-
 pub(crate) fn register_port_router(tests: &mut Vec<super::Test>) {
     register_fork_port_tests(tests);
     register_fork_multi_tests(tests);
