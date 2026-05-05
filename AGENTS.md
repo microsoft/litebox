@@ -54,16 +54,40 @@ cargo rustc -p litebox_test_harness --bin litebox_test_harness --target-dir targ
 
 ### Running tests
 
-Always use the `litebox-test` Docker image. See `litebox_test_harness/CLAUDE.md`
-for test authoring rules.
+Use the integration test harness via `cargo test`:
 
 ```bash
+# Full suite (both native and litebox passes):
+cargo test -p litebox_test_harness --test integration
 
+# Single test (one trial per pass):
+cargo test -p litebox_test_harness --test integration -- 'litebox::PN.B.eof' --exact
+
+# Tune concurrency (default 5):
+LITEBOX_TEST_JOBS=8 cargo test -p litebox_test_harness --test integration
+
+# Only native or only litebox:
+cargo test -p litebox_test_harness --test integration -- 'native::'
+cargo test -p litebox_test_harness --test integration -- 'litebox::'
+```
+
+Each Trial spawns its own `docker run` (`litebox-test` image),
+gets a fresh `litebox_tool_executor` + broker + runner + agent
+matrix, and writes per-Trial logs to
+`target/test-logs/<pass>-<sanitized_id>.{stdout,stderr}.log`.
+Use `cargo test`, not `cargo nextest` (the cross-process build
+lock is not yet implemented). Don't run multiple cargo test
+invocations against the same target dir simultaneously — the
+build cache will thrash.
+
+To run a docker invocation by hand for debugging:
+
+```bash
 # Native (gold standard — real kernel):
 docker run --rm --cap-add SYS_PTRACE \
   -v $(pwd)/target/debug:/opt/litebox:ro \
   -v $(pwd)/target/nonpie/debug:/opt/nonpie:ro \
-  litebox-test /opt/litebox/litebox_test_harness spawn-tree
+  litebox-test /opt/litebox/litebox_test_harness spawn-tree --filter=PN.B.eof
 
 # Litebox sandbox (tests the shim):
 docker run --rm --cap-add SYS_PTRACE -e LITEBOX_NO_AUDIT=1 \
@@ -71,12 +95,22 @@ docker run --rm --cap-add SYS_PTRACE -e LITEBOX_NO_AUDIT=1 \
   -v $(pwd)/target/nonpie/debug:/opt/nonpie:ro \
   litebox-test /opt/litebox/litebox_tool_executor \
     --rootfs / --record-baseline \
-    -- /opt/litebox/litebox_test_harness spawn-tree
+    -- /opt/litebox/litebox_test_harness spawn-tree --filter=PN.B.eof
 ```
 
 Running `litebox_test_harness` directly (without `litebox_tool_executor`)
 tests the **native kernel**, NOT litebox's shim. The coordinator prints
 `[coord] runtime:` at startup to identify the environment.
+
+Useful integration-test env vars (all read by `tests/integration.rs`):
+
+- `LITEBOX_TEST_JOBS=N` — concurrent docker runs (default 5).
+- `LITEBOX_DRAIN_BACKLOG=N` — concurrent draining containers (default 20).
+- `LITEBOX_FORCE_FULL_MATRIX=1` — opt out of the lazy non-PIE
+  spawn heuristic; always spawn the full agent matrix.
+- `LITEBOX_KEEP_CONTAINER=1` — drop `--rm`; containers survive
+  for `docker logs <name>` inspection.
+- `LITEBOX_NO_AUDIT=1` — disable audit logging in the runner.
 
 ### Docker images
 

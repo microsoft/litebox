@@ -205,22 +205,47 @@ cargo test -p litebox_test_harness --test integration -- 'native::NL'
 ```
 
 The harness uses `libtest_mimic` (custom `harness = false`) and registers
-two trials per test ID: `native::<id>` and `litebox::<id>`. Trials share
-docker invocations through a process-scoped `PASS_CACHE` Mutex
-(`tests/integration.rs:53`), so all ~945 native trials map to one
-`docker run` per cargo invocation, and likewise for litebox.
+two trials per test ID: `native::<id>` and `litebox::<id>`. Each trial
+spawns its own `docker run` with `--filter=<test_id>` so every test
+gets a fresh `litebox_tool_executor` + broker + runner + agent
+matrix. Tests cannot contaminate each other.
 
-**Do not run this suite under `cargo nextest`.** Nextest forks a
-separate process per test, defeating `PASS_CACHE` and triggering
-~1900 separate `docker run` invocations.
+**Concurrency knobs (env vars, std-only semaphores):**
+
+| Variable | Default | Effect |
+|----------|---:|--------|
+| `LITEBOX_TEST_JOBS` | 5 | Max concurrent `docker run` invocations in their result-bearing phase. |
+| `LITEBOX_DRAIN_BACKLOG` | 20 | Max post-result containers draining concurrently. Back-pressures the test loop if drain falls behind. |
+| `LITEBOX_FORCE_FULL_MATRIX` | unset | When set, always spawn the non-PIE subtree even if the filter doesn't reference NP/NPC/D3/D4/D5. |
+| `LITEBOX_KEEP_CONTAINER` | unset | Don't pass `--rm`; containers stay around for `docker logs`. Each is `--name`d as `litebox-<pass>-<id>-<pid>-<ns>`. |
+
+**Per-Trial logs**: each trial's docker stdout/stderr is written
+to `target/test-logs/<pass>-<sanitized_id>.{stdout,stderr}.log`
+(stderr via `Stdio::from(File::create(...))`, stdout tee'd as we
+parse for the JSON result line). On Trial failure, the `Err`
+message includes both log paths.
+
+**Lazy agent matrix**: the harness spawn_tree only spawns the
+non-PIE subtree (NP, NPC, D3, D4, D5) when at least one filtered
+test ID contains those agent names as a dot-separated component.
+~97 % of tests are PIE-only and skip the 30 s
+`spawn_nonpie_subtree` setup. End-of-run validation
+(`validate_lazy_matrix` in `coordinator/mod.rs`) records a
+synthetic `__lazy_matrix.validation` FAIL if any agent contacted
+via `TestRunner::send` was not actually spawned, so a
+heuristic miss is loudly visible.
+
+**Why not `cargo nextest`?** Each Trial in nextest is its own
+process; `setup()`'s `OnceLock` caching of build/image checks
+becomes per-process (no help) and there's no cross-process
+build lock yet. `cargo test` keeps everything in one libtest
+process where the OnceLock works.
 
 The integration test verifies:
 - Native baseline: every `native::<id>` trial passes (0 FAIL).
 - Litebox: every `litebox::<id>` trial that is not declared `xfail`
   must pass; XPASS on a previously-xfailed test is also a failure.
   Any test passing native but failing litebox is a regression.
-- Drift check: registered test IDs match the baseline; new IDs are
-  surfaced as warnings so the baseline can be updated intentionally.
 
 There are no longer "expected counts" constants to update — each trial
 is asserted individually. To intentionally accept a new litebox-only
