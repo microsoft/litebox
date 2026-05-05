@@ -352,14 +352,7 @@ fn hook_syscalls_in_section(
         if !control_transfer_targets.contains(&inst.ip()) {
             for inst_id in (0..i).rev() {
                 let prev_inst = &instructions[inst_id];
-                // For x86_64 the encoder will fix up relative displacements,
-                // so we only need to respect incoming jump targets
-                // — except for call instructions, which must not be relocated
-                // because the return address pushed would point into the trampoline.
-                let flow = prev_inst.flow_control();
-                if flow == iced_x86::FlowControl::Call
-                    || flow == iced_x86::FlowControl::IndirectCall
-                {
+                if prev_inst.flow_control() != iced_x86::FlowControl::Next {
                     break;
                 }
                 if replace_end - prev_inst.ip() >= 5 {
@@ -833,19 +826,15 @@ fn hook_syscall_and_after(
             // If the next instruction is a control transfer target, we don't want to cross it
             break;
         }
-        // For x86_64 the encoder will fix up relative displacements, so we
-        // only need to respect incoming jump targets — except for call instructions,
-        // which must not be relocated because the return address pushed would point
-        // into the trampoline.
-        let flow = next_inst.flow_control();
-        if flow == iced_x86::FlowControl::Call || flow == iced_x86::FlowControl::IndirectCall {
-            break;
-        }
         let next_end = next_inst.next_ip();
 
         if next_end - syscall_inst.ip() >= 5 {
             replace_end = Some(next_end);
             replace_end_idx = idx + 1;
+            break;
+        }
+
+        if next_inst.flow_control() != iced_x86::FlowControl::Next {
             break;
         }
     }
