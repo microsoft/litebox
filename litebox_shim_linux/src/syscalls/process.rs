@@ -1030,7 +1030,7 @@ impl<FS: ShimFS> Task<FS> {
         // If this is a vfork child, unblock the parent only after all exit
         // cleanup that may touch shared guest memory has completed.
         if let Some(fc) = self.fork_context.get_mut() {
-            fc.vfork_done.signal();
+            fc.vfork_done.signal_exit();
         }
     }
 
@@ -2050,6 +2050,7 @@ impl<FS: ShimFS> Task<FS> {
                         in_syscall: core::cell::Cell::new(false),
                         deferred_vfork_park: core::cell::Cell::new(false),
                         delayed_fork_pending: core::cell::Cell::new(false),
+                        recent_delayed_fork_resume: core::cell::Cell::new(false),
                         migrated_to_remote: core::cell::Cell::new(false),
                         local_task_terminated: core::cell::Cell::new(false),
                         mux_pipe_pair_ids: core::cell::RefCell::new(alloc::vec::Vec::new()),
@@ -2800,6 +2801,7 @@ impl<FS: ShimFS> Task<FS> {
                         in_syscall: core::cell::Cell::new(false),
                         deferred_vfork_park: core::cell::Cell::new(false),
                         delayed_fork_pending: core::cell::Cell::new(delayed_fork),
+                        recent_delayed_fork_resume: core::cell::Cell::new(false),
                         migrated_to_remote: core::cell::Cell::new(false),
                         local_task_terminated: core::cell::Cell::new(false),
                         mux_pipe_pair_ids: core::cell::RefCell::new(alloc::vec::Vec::new()),
@@ -2918,6 +2920,8 @@ impl<FS: ShimFS> Task<FS> {
             while !vd.is_done() {
                 let _ = self.wait_cx().wait_until(|| vd.is_done());
             }
+
+            let resumed_from_child_exit = vd.was_signaled_by_exit();
 
             // Restore pages modified by the child and clear CoW state.
             if let Some(cow) = &cow_state {
@@ -4212,6 +4216,10 @@ impl<FS: ShimFS> Task<FS> {
                         // _keepalive_guard dropped here → cleanup runs.
                     });
                 }
+            }
+
+            if resumed_from_child_exit {
+                self.recent_delayed_fork_resume.set(true);
             }
 
             // Unpark other threads now that CoW is fully restored.

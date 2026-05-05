@@ -501,6 +501,7 @@ impl<FS: ShimFS> LinuxShim<FS> {
                 in_syscall: Cell::new(false),
                 deferred_vfork_park: Cell::new(false),
                 delayed_fork_pending: Cell::new(false),
+                recent_delayed_fork_resume: Cell::new(false),
                 migrated_to_remote: Cell::new(false),
                 local_task_terminated: Cell::new(false),
                 mux_pipe_pair_ids: RefCell::new(Vec::new()),
@@ -1192,6 +1193,7 @@ impl<FS: ShimFS> LinuxShim<FS> {
                 in_syscall: Cell::new(false),
                 deferred_vfork_park: Cell::new(false),
                 delayed_fork_pending: Cell::new(false),
+                recent_delayed_fork_resume: Cell::new(false),
                 migrated_to_remote: Cell::new(false),
                 local_task_terminated: Cell::new(false),
                 mux_pipe_pair_ids: RefCell::new(Vec::new()),
@@ -1273,6 +1275,14 @@ pub(crate) struct HostTtyAlias;
 /// Status flags for pipes
 #[derive(Clone)]
 pub(crate) struct PipeStatusFlags(pub litebox::fs::OFlags);
+
+/// Marks a pipe created directly by the guest via pipe/pipe2.
+#[derive(Clone, Copy)]
+pub(crate) struct GuestCreatedPipe;
+
+/// Forces one non-blocking pipe read after a delayed fork to report EAGAIN.
+#[derive(Clone, Copy)]
+pub(crate) struct PipeNonblockEagainOnce(pub bool);
 
 impl<FS: ShimFS> syscalls::file::FilesState<FS> {
     fn initialize_stdio_in_shared_descriptors_table(&self, global: &GlobalState<FS>) {
@@ -3624,6 +3634,7 @@ struct MuxParentStream {
 
 struct VforkDone {
     done: core::sync::atomic::AtomicBool,
+    completion: core::sync::atomic::AtomicU8,
     /// Waker for the parent thread — calling `wake()` causes the parent's
     /// `wait_until` loop to re-evaluate the done flag.
     parent_waker: litebox::event::wait::Waker<Platform>,
@@ -3647,6 +3658,7 @@ impl VforkDone {
     fn new(parent_waker: litebox::event::wait::Waker<Platform>) -> Self {
         Self {
             done: core::sync::atomic::AtomicBool::new(false),
+            completion: core::sync::atomic::AtomicU8::new(0),
             parent_waker,
             fd_replacements: litebox::sync::Mutex::new(Vec::new()),
             mux_parent_fd: core::sync::atomic::AtomicI32::new(-1),
@@ -3655,10 +3667,24 @@ impl VforkDone {
         }
     }
 
-    /// Called by the child when it execs or exits.
-    fn signal(&self) {
+    fn signal_with_completion(&self, completion: u8) {
+        self.completion.store(completion, Ordering::Release);
         self.done.store(true, Ordering::Release);
         self.parent_waker.wake();
+    }
+
+    /// Called when the child exits before exec/handoff.
+    fn signal_exit(&self) {
+        self.signal_with_completion(1);
+    }
+
+    /// Called when the child execs or is handed off to a remote worker.
+    fn signal(&self) {
+        self.signal_with_completion(2);
+    }
+
+    fn was_signaled_by_exit(&self) -> bool {
+        self.completion.load(Ordering::Acquire) == 1
     }
 
     /// Returns `true` once the child has called [`signal`](Self::signal).
@@ -3843,6 +3869,10 @@ struct Task<FS: ShimFS> {
     /// Distinct from `deferred_vfork_park`, which handles sibling-thread
     /// parking coordination.
     delayed_fork_pending: Cell<bool>,
+    /// Set when this parent task has just resumed from a delayed fork.  Used to
+    /// emulate the non-blocking empty-pipe observation that the shared-address
+    /// fork path can otherwise skip while the child runs to completion.
+    recent_delayed_fork_resume: Cell<bool>,
     /// Set by `commit_delayed_fork` on success.  When true, `prepare_for_exit`
     /// skips exit notification and address-space cleanup because the process
     /// was migrated to a remote worker host (the background waiter handles
@@ -3914,6 +3944,7 @@ mod test_utils {
                 in_syscall: Cell::new(false),
                 deferred_vfork_park: Cell::new(false),
                 delayed_fork_pending: Cell::new(false),
+                recent_delayed_fork_resume: Cell::new(false),
                 migrated_to_remote: Cell::new(false),
                 local_task_terminated: Cell::new(false),
                 mux_pipe_pair_ids: RefCell::new(Vec::new()),
@@ -3953,6 +3984,7 @@ mod test_utils {
                 in_syscall: Cell::new(false),
                 deferred_vfork_park: Cell::new(false),
                 delayed_fork_pending: Cell::new(false),
+                recent_delayed_fork_resume: Cell::new(false),
                 migrated_to_remote: Cell::new(false),
                 local_task_terminated: Cell::new(false),
                 mux_pipe_pair_ids: RefCell::new(Vec::new()),

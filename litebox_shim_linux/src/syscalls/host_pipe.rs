@@ -13,9 +13,9 @@
 //!
 //! ## Known v1 Limitations
 //!
-//! - Only `read`, `write`, and `close` are supported.  Other fd operations
-//!   (dup, readv/writev, poll/epoll, fcntl) are not yet handled and will
-//!   fall through to EBADF.
+//! - Only `read`, `write`, `close`, poll/epoll readiness, and fcntl status
+//!   flags are supported.  Other fd operations (dup, readv/writev) are not yet
+//!   handled and will fall through to EBADF.
 //! - Dup'd pipe endpoints are bridged independently rather than sharing a
 //!   single OS pipe, which could break aliased-fd semantics.
 //! - `O_NONBLOCK` and `FD_CLOEXEC` flags are not preserved across bridging.
@@ -23,11 +23,12 @@
 //!   is silently lost.  The OS pipe starts empty, so any unread data written
 //!   before `commit_delayed_fork` will not be delivered.
 
-use core::sync::atomic::{AtomicI32, Ordering};
+use core::sync::atomic::{AtomicI32, AtomicU32, Ordering};
 
 use litebox::{
     event::{Events, IOPollable},
     fd::{FdEnabledSubsystem, FdEnabledSubsystemEntry},
+    fs::OFlags,
 };
 use litebox_common_linux::errno::Errno;
 use litebox_platform_multiplex::Platform;
@@ -59,20 +60,42 @@ pub(crate) struct HostPipeFd {
     host_fd: AtomicI32,
     /// Whether this endpoint is a read or write end.
     pub(crate) direction: HostPipeDirection,
+    /// Guest-visible open status flags for fcntl(F_GETFL/F_SETFL).
+    status: AtomicU32,
 }
 
 impl HostPipeFd {
     /// Create a new host-pipe entry.
     pub(crate) fn new(host_fd: i32, direction: HostPipeDirection) -> Self {
+        let access = match direction {
+            HostPipeDirection::Read => OFlags::RDONLY,
+            HostPipeDirection::Write => OFlags::WRONLY,
+            HostPipeDirection::ReadWrite => OFlags::RDWR,
+        };
         Self {
             host_fd: AtomicI32::new(host_fd),
             direction,
+            status: AtomicU32::new(access.bits()),
         }
     }
 
     /// Return the raw host file descriptor.
     pub(crate) fn raw_fd(&self) -> i32 {
         self.host_fd.load(Ordering::Relaxed)
+    }
+
+    /// Return guest-visible open status flags.
+    pub(crate) fn get_status(&self) -> OFlags {
+        OFlags::from_bits_truncate(self.status.load(Ordering::Relaxed)) & OFlags::STATUS_FLAGS_MASK
+    }
+
+    /// Update guest-visible open status flags.
+    pub(crate) fn set_status(&self, flags: OFlags) {
+        let access = self.get_status() & (OFlags::RDONLY | OFlags::WRONLY | OFlags::RDWR);
+        self.status.store(
+            (access | (flags & OFlags::STATUS_FLAGS_MASK)).bits(),
+            Ordering::Relaxed,
+        );
     }
 
     /// Atomically take the host fd, replacing it with -1.
