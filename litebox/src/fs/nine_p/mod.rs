@@ -776,17 +776,10 @@ impl<Platform: sync::RawSyncPrimitivesProvider, W: transport::Write> FileSystem<
         cache.retain(|k| k.as_str() != path && !k.starts_with(&prefix));
     }
 
-    /// If `err` is ENOENT and no concurrent mutation happened, insert `path`
-    /// into the negative stat cache so subsequent lookups can skip the RPC.
-    fn try_cache_negative(&self, path: &str, err: &FileStatusError, gen_before: usize) {
-        if matches!(
-            err,
-            FileStatusError::PathError(PathError::NoSuchFileOrDirectory)
-        ) && self.cache_generation.load(Ordering::SeqCst) == gen_before
-        {
-            self.negative_stat_cache.lock().insert(path.into());
-        }
-    }
+    /// Negative stat results are intentionally not cached for the mutable 9P
+    /// backing store. Other agents may create the path through independent 9P
+    /// connections, and this client has no cross-connection invalidation signal.
+    fn try_cache_negative(&self, _path: &str, _err: &FileStatusError, _gen_before: usize) {}
 
     /// Gives the absolute path for `path`, resolving any `.` or `..`s, and making sure to account
     /// for any relative paths from current working directory.
