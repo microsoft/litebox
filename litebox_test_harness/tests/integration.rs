@@ -580,39 +580,6 @@ fn run_host_fwd(debug: &Path, nonpie: &Path) {
     let mut child = docker.spawn().expect("failed to start host-test container");
     eprintln!("[host-test] Container {container_name} started");
 
-    // Wait for the TCP agent to be ready by retrying connections.
-    let stream = {
-        let mut attempts = 0;
-        loop {
-            std::thread::sleep(Duration::from_millis(500));
-            match TcpStream::connect_timeout(
-                &format!("127.0.0.1:{ctrl_port}").parse().unwrap(),
-                Duration::from_secs(2),
-            ) {
-                Ok(s) => {
-                    eprintln!("[host-test] Connected to TCP agent after {attempts} retries");
-                    break s;
-                }
-                Err(e) => {
-                    attempts += 1;
-                    if attempts > 30 {
-                        // Capture stderr for diagnostics.
-                        let _ = Command::new("docker")
-                            .args(["kill", &container_name])
-                            .status();
-                        let _ = child.wait();
-                        panic!("[host-test] Could not connect to TCP agent after 15s: {e}");
-                    }
-                }
-            }
-        }
-    };
-    stream.set_read_timeout(Some(Duration::from_secs(10))).ok();
-    stream.set_write_timeout(Some(Duration::from_secs(5))).ok();
-
-    let mut reader = BufReader::new(stream.try_clone().expect("clone stream"));
-    let mut writer = stream;
-
     // Helper: send a command and read the JSON response.
     let send_cmd = |w: &mut TcpStream, r: &mut BufReader<TcpStream>, cmd: &str| -> Option<String> {
         let msg = format!("{cmd}\n");
@@ -621,6 +588,50 @@ fn run_host_fwd(debug: &Path, nonpie: &Path) {
         let mut line = String::new();
         r.read_line(&mut line).ok()?;
         Some(line.trim().to_string())
+    };
+
+    // Wait for the TCP agent to be ready by retrying a protocol command.
+    // Docker's published port can accept before the broker/guest listener is
+    // ready, so a bare TCP connect is not a sufficient readiness signal: we
+    // probe by issuing `cwd_get` until it returns a well-formed response.
+    // The probed connection is then handed off to the H tests; H1 below
+    // independently re-issues `cwd_get` and asserts the contract.
+    let (mut writer, mut reader) = {
+        let mut attempts = 0;
+        let mut last_error: Option<String>;
+        loop {
+            std::thread::sleep(Duration::from_millis(500));
+            match TcpStream::connect_timeout(
+                &format!("127.0.0.1:{ctrl_port}").parse().unwrap(),
+                Duration::from_secs(2),
+            ) {
+                Ok(mut stream) => {
+                    stream.set_read_timeout(Some(Duration::from_secs(10))).ok();
+                    stream.set_write_timeout(Some(Duration::from_secs(5))).ok();
+                    let mut probe_reader =
+                        BufReader::new(stream.try_clone().expect("clone stream"));
+                    match send_cmd(&mut stream, &mut probe_reader, r#"{"cmd":"cwd_get"}"#) {
+                        Some(resp) if resp.contains(r#""status":"ok""#) => {
+                            eprintln!("[host-test] Agent ready after {attempts} retries");
+                            break (stream, probe_reader);
+                        }
+                        Some(resp) => last_error = Some(format!("unexpected response: {resp}")),
+                        None => last_error = Some("no response".to_string()),
+                    }
+                }
+                Err(e) => last_error = Some(e.to_string()),
+            }
+
+            attempts += 1;
+            if attempts > 30 {
+                let _ = Command::new("docker")
+                    .args(["kill", &container_name])
+                    .status();
+                let _ = child.wait();
+                let detail = last_error.unwrap_or_else(|| "no readiness attempts made".to_string());
+                panic!("[host-test] TCP agent not ready after 15s: {detail}");
+            }
+        }
     };
 
     // ── H1: Control channel works ──
