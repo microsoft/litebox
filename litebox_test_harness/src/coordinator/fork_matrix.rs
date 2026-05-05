@@ -120,32 +120,6 @@ const SHELL_PATTERNS: &[ShellPattern] = &[
 
 const DEPTH_AGENTS: &[&str] = &["A", "AA", "AAA"];
 
-async fn shell_pattern_tests(r: &mut TestRunner) {
-    eprintln!(
-        "[fork_matrix] === Shell Patterns ({} × {} depths) ===",
-        SHELL_PATTERNS.len(),
-        DEPTH_AGENTS.len()
-    );
-    for &agent in DEPTH_AGENTS {
-        for pat in SHELL_PATTERNS {
-            let cmd = vec!["bash".into(), "-c".into(), pat.cmd.into()];
-            let resp = r.send(agent, exec(cmd)).await;
-            let pass = if pat.expected.is_empty() {
-                matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if !stdout.trim().is_empty())
-            } else {
-                matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout.contains(pat.expected))
-            };
-            let timeout = matches!(&resp, Response::ExecTimeout { .. });
-            r.record(
-                &format!("XB.{}.{agent}", pat.name),
-                agent,
-                pass,
-                &format!("timeout={timeout} {resp:?}"),
-            );
-        }
-    }
-}
-
 // ═══════════════════════════════════════════════════════════════════
 // EXEC BINARY × DEPTH
 // ═══════════════════════════════════════════════════════════════════
@@ -164,49 +138,6 @@ impl ExecBinary {
             Self::Node => "node",
         }
     }
-}
-
-async fn exec_binary_tests(r: &mut TestRunner) {
-    // SelfExe is already covered by matrix.rs run_exec_tests.
-    // Node.js at each depth:
-    eprintln!(
-        "[fork_matrix] === Exec Binary: Node × {} depths ===",
-        DEPTH_AGENTS.len()
-    );
-    for &agent in DEPTH_AGENTS {
-        let resp = r
-            .send(
-                agent,
-                exec(vec![
-                    "/usr/local/bin/node".into(),
-                    "-e".into(),
-                    format!("console.log('node_{agent}_ok')"),
-                ]),
-            )
-            .await;
-        let expected = format!("node_{agent}_ok");
-        let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout.contains(&expected));
-        r.record(
-            &format!("X.node.{agent}"),
-            agent,
-            pass,
-            &format!("{resp:?}"),
-        );
-    }
-
-    // Node.js process.stdout.write (tests different output path).
-    let resp = r
-        .send(
-            "A",
-            exec(vec![
-                "/usr/local/bin/node".into(),
-                "-e".into(),
-                "process.stdout.write('stdout_write_ok\\n')".into(),
-            ]),
-        )
-        .await;
-    let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout.contains("stdout_write_ok"));
-    r.record("X.node_stdout_write.A", "A", pass, &format!("{resp:?}"));
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -257,44 +188,6 @@ const EXEC_METHODS: &[ExecMethodCase] = &[
         expected: "exec_ok",
     },
 ];
-
-async fn exec_method_tests(r: &mut TestRunner) {
-    let self_exe = r.self_exe.clone();
-
-    eprintln!(
-        "[fork_matrix] === Exec Method ({} cases) ===",
-        EXEC_METHODS.len()
-    );
-    for em in EXEC_METHODS {
-        let cmd_str = em.cmd_template.replace("{self_exe}", &self_exe);
-        let resp = r
-            .send("A", exec(vec!["bash".into(), "-c".into(), cmd_str]))
-            .await;
-        let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout.contains(em.expected));
-        r.record(&format!("XM.{}", em.name), "A", pass, &format!("{resp:?}"));
-    }
-
-    // Node.js os.networkInterfaces() — VS Code calls this on startup.
-    let resp = r
-        .send(
-            "A",
-            exec_timeout(
-                vec![
-                    "/usr/local/bin/node".into(),
-                    "-e".into(),
-                    "try { const r = require('os').networkInterfaces(); \
-                     console.log('NETIF_OK:' + Object.keys(r).length); } \
-                     catch(e) { console.log('NETIF_ERR:' + e.code); }"
-                        .into(),
-                ],
-                30,
-            ),
-        )
-        .await;
-    let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. }
-        if stdout.contains("NETIF_OK:") || stdout.contains("NETIF_ERR:"));
-    r.record("XM.node_networkInterfaces", "A", pass, &format!("{resp:?}"));
-}
 
 // ═══════════════════════════════════════════════════════════════════
 // DELAYED FORK: trigger × binary × invocation × depth × nesting
@@ -365,160 +258,12 @@ const DF_BINARIES: &[DfBinary] = &[DfBinary::Pie, DfBinary::NonPie, DfBinary::No
 const DF_INVOCATIONS: &[DfInvocation] = &[DfInvocation::Direct, DfInvocation::ScriptFile];
 const DF_AGENTS: &[&str] = &["A", "AA"];
 
-async fn delayed_fork_matrix(r: &mut TestRunner) {
-    let self_exe = r.self_exe.clone();
-
-    // trigger × binary × invocation × depth
-    eprintln!(
-        "[fork_matrix] === Delayed Fork ({} × {} × {} × {} depths) ===",
-        DF_TRIGGERS.len(),
-        DF_BINARIES.len(),
-        DF_INVOCATIONS.len(),
-        DF_AGENTS.len()
-    );
-
-    for &trigger in DF_TRIGGERS {
-        for &binary in DF_BINARIES {
-            for &invocation in DF_INVOCATIONS {
-                for &agent in DF_AGENTS {
-                    let test_id = format!(
-                        "XDF.{}.{}.{}.{agent}",
-                        trigger.suffix(),
-                        binary.suffix(),
-                        invocation.suffix()
-                    );
-
-                    let (inner_cmd, inner_args): (String, Vec<String>) = match binary {
-                        DfBinary::Pie => (self_exe.clone(), vec!["echo-test".into()]),
-                        DfBinary::NonPie => match crate::find_nonpie_binary() {
-                            Some(p) => (p, vec!["echo-test".into()]),
-                            None => {
-                                r.record(
-                                    &test_id,
-                                    agent,
-                                    false,
-                                    "FAIL: nonpie binary not found — mount at /opt/nonpie",
-                                );
-                                continue;
-                            }
-                        },
-                        DfBinary::Node => (
-                            "/usr/local/bin/node".into(),
-                            vec!["-e".into(), "console.log('df_node_ok')".into()],
-                        ),
-                    };
-
-                    let resp = match invocation {
-                        DfInvocation::Direct => {
-                            let mut args =
-                                vec![self_exe.clone(), trigger.subcommand().into(), inner_cmd];
-                            args.extend(inner_args);
-                            r.send(agent, exec(args)).await
-                        }
-                        DfInvocation::ScriptFile => {
-                            let script = format!("/tmp/xdf_{}.sh", test_id.replace('.', "_"));
-                            let inner_full = if inner_args.is_empty() {
-                                inner_cmd.clone()
-                            } else {
-                                // Quote args that contain special characters.
-                                let escaped: Vec<String> = inner_args
-                                    .iter()
-                                    .map(|a| {
-                                        if a.contains(|c: char| {
-                                            !c.is_alphanumeric()
-                                                && c != '_'
-                                                && c != '-'
-                                                && c != '.'
-                                                && c != '/'
-                                        }) {
-                                            format!("\"{}\"", a.replace('"', "\\\""))
-                                        } else {
-                                            a.clone()
-                                        }
-                                    })
-                                    .collect();
-                                format!("{inner_cmd} {}", escaped.join(" "))
-                            };
-                            // Use heredoc to avoid nested quoting issues.
-                            let body = format!(
-                                "cat > {script} <<'XEOF'\n#!/usr/bin/bash\n{self_exe} {} {inner_full}\nXEOF\nchmod +x {script} && {script}; EXIT=$?; rm -f {script}; exit $EXIT",
-                                trigger.subcommand()
-                            );
-                            r.send(agent, exec(vec!["bash".into(), "-c".into(), body]))
-                                .await
-                        }
-                    };
-
-                    let not_found = matches!(&resp, Response::ExecResult { exit_code: 127, .. })
-                        || matches!(&resp, Response::Error { error } if error.contains("not found"));
-                    if not_found {
-                        r.record(&test_id, agent, false, "FAIL: binary not in rootfs");
-                        continue;
-                    }
-
-                    let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. }
-                        if stdout.contains(binary.expected()));
-                    r.record(&test_id, agent, pass, &format!("{resp:?}"));
-                }
-            }
-        }
-    }
-
-    // Triple nesting (3 levels of delayed fork).
-    eprintln!("[fork_matrix] === Delayed Fork Nesting ===");
-    let resp = r
-        .send(
-            "A",
-            exec(vec![
-                self_exe.clone(),
-                "trigger-delayed-fork".into(),
-                self_exe.clone(),
-                "trigger-delayed-fork".into(),
-                self_exe.clone(),
-                "echo-test".into(),
-            ]),
-        )
-        .await;
-    let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout.contains("ECHO_TEST_OK"));
-    r.record("XDF.triple_nesting", "A", pass, &format!("{resp:?}"));
-}
-
 // ═══════════════════════════════════════════════════════════════════
 // STRESS EXEC: mode × spawn method
 // ═══════════════════════════════════════════════════════════════════
 
 const STRESS_MODES: &[&str] = &["pie", "nonpie", "mixed"];
 const SPAWN_METHODS: &[(&str, &[&str])] = &[("sync", &[]), ("tokio", &["tokio"])];
-
-async fn stress_exec_matrix(r: &mut TestRunner) {
-    let self_exe = r.self_exe.clone();
-    let count = "10";
-
-    eprintln!(
-        "[fork_matrix] === Stress Exec ({} × {} spawn) ===",
-        STRESS_MODES.len(),
-        SPAWN_METHODS.len()
-    );
-
-    for &mode in STRESS_MODES {
-        for &(spawn_name, spawn_args) in SPAWN_METHODS {
-            let test_id = format!("XS.{mode}.{spawn_name}");
-            let mut args = vec![
-                self_exe.clone(),
-                "stress-exec".into(),
-                count.into(),
-                mode.into(),
-            ];
-            for &a in spawn_args {
-                args.push(a.into());
-            }
-            let resp = r.send("A", exec(args)).await;
-            let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. }
-                if stdout.contains("STRESS_START") && stdout.contains("STRESS_END failures=0"));
-            r.record(&test_id, "A", pass, &format!("{resp:?}"));
-        }
-    }
-}
 
 // ═══════════════════════════════════════════════════════════════════
 // NON-PIE INVOCATION METHOD
@@ -551,62 +296,6 @@ const NONPIE_CASES: &[NonPieCase] = &[
         bash_cmd: Some("if [ -x /nonpie-bin ]; then /nonpie-cmd; else echo SKIP; fi"),
     },
 ];
-
-async fn nonpie_invocation_tests(r: &mut TestRunner) {
-    eprintln!(
-        "[fork_matrix] === Non-PIE Invocation ({} methods) ===",
-        NONPIE_CASES.len()
-    );
-
-    let nonpie_bin = match crate::find_nonpie_binary() {
-        Some(p) => p,
-        None => {
-            for nc in NONPIE_CASES {
-                r.record(
-                    &format!("XNP.{}", nc.name),
-                    "A",
-                    false,
-                    "FAIL: nonpie binary not found — mount at /opt/nonpie",
-                );
-            }
-            return;
-        }
-    };
-
-    for nc in NONPIE_CASES {
-        let test_id = format!("XNP.{}", nc.name);
-        let resp = match nc.bash_cmd {
-            None => {
-                r.send("A", exec(vec![nonpie_bin.clone(), "echo-test".into()]))
-                    .await
-            }
-            Some(cmd) => {
-                let resolved = cmd
-                    .replace("/nonpie-bin", &nonpie_bin)
-                    .replace("/nonpie-cmd", &format!("{nonpie_bin} echo-test"));
-                r.send("A", exec(vec!["bash".into(), "-c".into(), resolved]))
-                    .await
-            }
-        };
-
-        let not_found = matches!(&resp, Response::ExecResult { exit_code: 127, .. })
-            || matches!(&resp, Response::Error { .. });
-        let skipped =
-            matches!(&resp, Response::ExecResult { stdout, .. } if stdout.contains("SKIP"));
-        if not_found || skipped {
-            r.record(
-                &test_id,
-                "A",
-                false,
-                "FAIL: nonpie binary not found — mount at /opt/nonpie",
-            );
-        } else {
-            let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. }
-                if stdout.contains("ECHO_TEST_OK"));
-            r.record(&test_id, "A", pass, &format!("{resp:?}"));
-        }
-    }
-}
 
 // ═══════════════════════════════════════════════════════════════════
 // CONTAMINATION PATTERNS
@@ -657,98 +346,9 @@ const CONTAMINATION_CASES: &[ContaminationCase] = &[
     },
 ];
 
-async fn contamination_pattern_tests(r: &mut TestRunner) {
-    let self_exe = r.self_exe.clone();
-    let bash = |cmd: &str| -> Vec<String> { vec!["bash".into(), "-c".into(), cmd.into()] };
-
-    eprintln!(
-        "[fork_matrix] === Contamination Patterns ({} + init-level) ===",
-        CONTAMINATION_CASES.len()
-    );
-
-    let nonpie_bin = match crate::find_nonpie_binary() {
-        Some(p) => p,
-        None => {
-            r.record(
-                "XC.init_level",
-                "A",
-                false,
-                "FAIL: nonpie binary not found — mount at /opt/nonpie",
-            );
-            for cc in CONTAMINATION_CASES {
-                r.record(
-                    &format!("XC.{}", cc.name),
-                    "A",
-                    false,
-                    "FAIL: nonpie binary not found — mount at /opt/nonpie",
-                );
-            }
-            return;
-        }
-    };
-    let nonpie_cmd = format!("{nonpie_bin} echo-test");
-
-    // Init-level: exec non-PIE, then exec PIE — check PIE output is clean.
-    let resp = r
-        .send("A", exec(vec![nonpie_bin.clone(), "echo-test".into()]))
-        .await;
-    let not_found = matches!(&resp, Response::ExecResult { exit_code: 127, .. })
-        || matches!(&resp, Response::Error { .. });
-    if not_found {
-        r.record(
-            "XC.init_level",
-            "A",
-            false,
-            "FAIL: nonpie binary not found — mount at /opt/nonpie",
-        );
-    } else {
-        let resp2 = r
-            .send("A", exec(vec![self_exe.clone(), "echo-test".into()]))
-            .await;
-        let pass = matches!(&resp2, Response::ExecResult { exit_code: 0, stdout, .. } if stdout == "ECHO_TEST_OK");
-        r.record("XC.init_level", "A", pass, &format!("{resp2:?}"));
-    }
-
-    // Loop over bash-based contamination patterns.
-    for cc in CONTAMINATION_CASES {
-        let test_id = format!("XC.{}", cc.name);
-        let cmd_str = cc
-            .bash_template
-            .unwrap()
-            .replace("{self_exe}", &self_exe)
-            .replace("/nonpie-bin", &nonpie_bin)
-            .replace("/nonpie-cmd", &nonpie_cmd);
-        let resp = r.send("A", exec(bash(&cmd_str))).await;
-        let skipped =
-            matches!(&resp, Response::ExecResult { stdout, .. } if stdout.contains("SKIP"));
-        if skipped {
-            r.record(
-                &test_id,
-                "A",
-                false,
-                "FAIL: nonpie binary not found — mount at /opt/nonpie",
-            );
-        } else {
-            let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. }
-                if stdout.contains(cc.expected));
-            r.record(&test_id, "A", pass, &format!("{resp:?}"));
-        }
-    }
-}
-
 // ═══════════════════════════════════════════════════════════════════
 // RUNNER
 // ═══════════════════════════════════════════════════════════════════
-
-pub(super) async fn run_fork_matrix_tests(r: &mut TestRunner) {
-    shell_pattern_tests(r).await;
-    exec_binary_tests(r).await;
-    exec_method_tests(r).await;
-    delayed_fork_matrix(r).await;
-    nonpie_invocation_tests(r).await;
-    stress_exec_matrix(r).await;
-    contamination_pattern_tests(r).await;
-}
 
 pub(crate) fn register_fork_matrix(tests: &mut Vec<super::Test>) {
     // Shell patterns x depth
