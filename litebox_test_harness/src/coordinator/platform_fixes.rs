@@ -1714,6 +1714,142 @@ pub(crate) fn register_pid_visibility_tests(reg: &mut Registry<'_>) {
 }
 
 // ═══════════════════════════════════════════════════════════════════
+// KPX: Cross-agent PID and /proc visibility
+// ═══════════════════════════════════════════════════════════════════
+
+#[derive(Clone, Copy)]
+struct KpxProcCase {
+    name: &'static str,
+    observer: AgentName,
+    target: AgentName,
+}
+
+const KPX_PROC_CASES: &[KpxProcCase] = &[
+    KpxProcCase {
+        name: "same_agent",
+        observer: AgentName::A,
+        target: AgentName::A,
+    },
+    KpxProcCase {
+        name: "parent_to_child",
+        observer: AgentName::A,
+        target: AgentName::AA,
+    },
+    KpxProcCase {
+        name: "child_to_parent",
+        observer: AgentName::AA,
+        target: AgentName::A,
+    },
+    KpxProcCase {
+        name: "root_sibling",
+        observer: AgentName::A,
+        target: AgentName::B,
+    },
+    KpxProcCase {
+        name: "nested_sibling",
+        observer: AgentName::AA,
+        target: AgentName::AB,
+    },
+    KpxProcCase {
+        name: "depth1_to_depth2",
+        observer: AgentName::AB,
+        target: AgentName::AAA,
+    },
+    KpxProcCase {
+        name: "depth2_to_depth1",
+        observer: AgentName::AAA,
+        target: AgentName::AB,
+    },
+    KpxProcCase {
+        name: "depth2_sibling",
+        observer: AgentName::AAA,
+        target: AgentName::AAB,
+    },
+    KpxProcCase {
+        name: "cross_subtree",
+        observer: AgentName::B,
+        target: AgentName::AAA,
+    },
+];
+
+fn kpx_pid(resp: &Response) -> Result<u32, String> {
+    match resp {
+        Response::Ok { data: Some(pid) } => pid
+            .parse::<u32>()
+            .map_err(|e| format!("GetPid returned non-numeric pid {pid:?}: {e}")),
+        other => Err(format!("GetPid failed: {other:?}")),
+    }
+}
+
+fn kpx_observe_proc_cmd(pid: u32) -> Command {
+    let script = format!(
+        "pid={pid}\n\
+         if test -d \"/proc/$pid\"; then echo PROC_DIR_OK; else echo PROC_DIR_FAIL; fi\n\
+         cat \"/proc/$pid/cmdline\"\n\
+         printf '\\n'\n\
+         if kill -0 \"$pid\" 2>/dev/null; then echo KILL0_OK; else echo KILL0_FAIL; fi\n"
+    );
+    Command::Exec {
+        args: vec!["/bin/sh".into(), "-c".into(), script],
+        timeout_secs: Some(10),
+        stdin: None,
+        background: false,
+    }
+}
+
+fn kpx_observe_proc_pass(resp: &Response) -> bool {
+    matches!(
+        resp,
+        Response::ExecResult {
+            exit_code: 0,
+            stdout,
+            ..
+        } if stdout.contains("PROC_DIR_OK")
+            && stdout.contains("litebox_test_harness")
+            && stdout.contains("KILL0_OK")
+    )
+}
+
+#[allow(clippy::too_many_lines)] // exhaustive pair matrix
+pub(crate) fn register_cross_pid_visibility_tests(reg: &mut Registry<'_>) {
+    for &case in KPX_PROC_CASES {
+        let observer = case.observer;
+        let target = case.target;
+        let test_id = format!("KPX.cross.{}.{}.to.{target}", case.name, observer);
+        reg.test("fork", "cross_pid_visibility", test_id)
+            .timeout(60)
+            .build(move |cx| {
+                let observer_handle = cx.require(observer);
+                let target_handle = cx.require(target);
+                Box::new(move |run| {
+                    Box::pin(async move {
+                        let pid_resp = run.send(&target_handle, Command::GetPid).await;
+                        let pid = match kpx_pid(&pid_resp) {
+                            Ok(pid) => pid,
+                            Err(e) => {
+                                return super::TestOutcome::new(
+                                    observer.name(),
+                                    false,
+                                    format!("{e}; resp={pid_resp:?}"),
+                                );
+                            }
+                        };
+                        let observe_resp = run.send(&observer_handle, kpx_observe_proc_cmd(pid)).await;
+                        let pass = kpx_observe_proc_pass(&observe_resp);
+                        super::TestOutcome::new(
+                            observer.name(),
+                            pass,
+                            format!(
+                                "observer={observer} target={target} target_pid={pid} pid_resp={pid_resp:?} observe_resp={observe_resp:?}"
+                            ),
+                        )
+                    })
+                })
+            });
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
 // FR: File-Redirect — stdout of background process → file
 // ═══════════════════════════════════════════════════════════════════
 
