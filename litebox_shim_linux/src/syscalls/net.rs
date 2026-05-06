@@ -959,13 +959,29 @@ impl<FS: ShimFS> GlobalState<FS> {
                     proxy.register_observer(observer, filter);
                     Ok(())
                 },
-                || match proxy.try_read(buf, new_flags, source_addr.as_deref_mut()) {
-                    Ok(0) => Err(TryOpError::TryAgain),
-                    Ok(n) => Ok(n),
-                    // Eof: peer closed the connection and all data has been
-                    // consumed. Return 0 to the guest (standard EOF).
-                    Err(litebox::net::errors::ReceiveError::Eof) => Ok(0),
-                    Err(e) => Err(TryOpError::Other(Errno::from(e))),
+                || {
+                    // Drive smoltcp synchronously before checking the proxy ring:
+                    // platform interaction is manual, and the background network
+                    // worker can otherwise sleep with ACKed data still queued in
+                    // smoltcp but not yet visible to this socket channel.
+                    loop {
+                        let advice = self.net.lock().perform_platform_interaction();
+                        if !advice.call_again_immediately() {
+                            break;
+                        }
+                    }
+
+                    match proxy.try_read(buf, new_flags, source_addr.as_deref_mut()) {
+                        Ok(0) => {
+                            litebox_platform_multiplex::platform().wake_network_worker();
+                            Err(TryOpError::TryAgain)
+                        }
+                        Ok(n) => Ok(n),
+                        // Eof: peer closed the connection and all data has been
+                        // consumed. Return 0 to the guest (standard EOF).
+                        Err(litebox::net::errors::ReceiveError::Eof) => Ok(0),
+                        Err(e) => Err(TryOpError::Other(Errno::from(e))),
+                    }
                 },
             )
             .map_err(Errno::from)

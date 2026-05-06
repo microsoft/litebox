@@ -548,7 +548,19 @@ where
             .interface
             .poll(self.now(), &mut self.device, &mut self.socket_set);
 
-        result
+        // `poll` may receive TCP payload and ACK it without reporting a socket
+        // state change. Drain again so proxy-backed sockets become readable
+        // before the network worker goes back to sleep waiting for more packets.
+        let tcp_rx_ready = self.socket_set.iter().any(
+            |(_, socket)| matches!(socket, smoltcp::socket::Socket::Tcp(tcp) if tcp.can_recv()),
+        );
+        self.drain_all_socket_channel_buffers();
+
+        if tcp_rx_ready {
+            smoltcp::iface::PollResult::SocketStateChanged
+        } else {
+            result
+        }
     }
 
     /// (Internal-only API) Perform the queued interactions.
