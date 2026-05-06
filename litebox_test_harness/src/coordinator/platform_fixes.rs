@@ -2351,114 +2351,6 @@ pub(crate) fn register_epoll_socket_tests(reg: &mut Registry<'_>) {
 }
 
 // ═══════════════════════════════════════════════════════════════════
-// LB: Loopback TCP across delayed-fork workers
-// ═══════════════════════════════════════════════════════════════════
-
-#[allow(clippy::too_many_lines)] // exhaustive registration / runner
-pub(crate) fn register_loopback_tcp_tests(reg: &mut Registry<'_>) {
-    struct Def {
-        name: &'static str,
-        script_template: &'static str,
-        check: fn(&str) -> bool,
-    }
-    let defs: &[Def] = &[
-        Def {
-            name: "same_worker",
-            script_template: concat!(
-                "{exe} tcp-echo 19876 &\n",
-                "sleep 1\n",
-                "REPLY=$(echo LB_SAME | nc -q1 127.0.0.1 19876 2>/dev/null)\n",
-                "echo REPLY=$REPLY\n",
-                "wait\n",
-            ),
-            check: |s| s.contains("REPLY=LB_SAME"),
-        },
-        Def {
-            name: "localhost",
-            script_template: concat!(
-                "{exe} tcp-echo 19877 > /dev/null 2>&1 &\n",
-                "PID=$!\nsleep 2\n",
-                "REPLY=$(echo LB_LOCAL | nc -q1 127.0.0.1 19877 2>/dev/null)\n",
-                "echo REPLY=$REPLY\n",
-                "kill $PID 2>/dev/null; wait $PID 2>/dev/null\n",
-            ),
-            check: |s| s.contains("REPLY=LB_LOCAL"),
-        },
-        Def {
-            name: "any_to_local",
-            script_template: concat!(
-                "{exe} tcp-echo 19879 > /dev/null 2>&1 &\n",
-                "PID=$!\nsleep 2\n",
-                "REPLY=$(echo LB_ANY | nc -q1 127.0.0.1 19879 2>/dev/null)\n",
-                "echo REPLY=$REPLY\n",
-                "kill $PID 2>/dev/null; wait $PID 2>/dev/null\n",
-            ),
-            check: |s| s.contains("REPLY=LB_ANY"),
-        },
-        Def {
-            name: "fast_close",
-            script_template: concat!(
-                "{exe} tcp-recv-all 19881 &\n",
-                "PID=$!\nsleep 2\n",
-                "echo LB_FAST | nc -q0 127.0.0.1 19881 2>/dev/null\n",
-                "sleep 2\n",
-                "wait $PID 2>/dev/null\n",
-            ),
-            check: |s| s.contains("RECV=LB_FAST"),
-        },
-        Def {
-            name: "halfclose_eof",
-            script_template: concat!(
-                "{exe} tcp-recv-all 19882 &\n",
-                "PID=$!\nsleep 2\n",
-                "echo LB_HALF | nc -w2 127.0.0.1 19882 2>/dev/null\n",
-                "sleep 3\n",
-                "wait $PID 2>/dev/null\n",
-            ),
-            check: |s| s.contains("RECV=LB_HALF"),
-        },
-    ];
-    for &agent in AGENTS {
-        for def in defs {
-            let agent_s = agent.to_string();
-            let template: String = def.script_template.into();
-            let check = def.check;
-            let name = def.name;
-            reg.test("matrix", "loopback_tcp", format!("LB.{name}.{agent}"))
-                .timeout(60)
-                .build(move |cx| {
-                    let handle = cx.require(agent);
-                    Box::new(move |run| {
-                        let a = agent_s.clone();
-                        let t = template.clone();
-                        let self_exe = run.self_exe().to_string();
-                        Box::pin(async move {
-                            let script = t.replace("{exe}", &self_exe);
-                            let resp = run
-                                .send(
-                                    &handle,
-                                    Command::Exec {
-                                        args: vec!["bash".into(), "-c".into(), script],
-                                        timeout_secs: Some(15),
-                                        stdin: None,
-                                        background: false,
-                                    },
-                                )
-                                .await;
-                            let pass = matches!(
-                                &resp,
-                                Response::ExecResult { stdout, .. }
-                                    if check(stdout)
-                            );
-                            super::TestOutcome::new(&a, pass, format!("{resp:?}"))
-                        })
-                    })
-                });
-        }
-    }
-}
-
-// ═══════════════════════════════════════════════════════════════════
 // THC: TCP half-close EOF
 // ═══════════════════════════════════════════════════════════════════
 
@@ -2507,37 +2399,19 @@ pub(crate) fn register_tcp_halfclose_tests(reg: &mut Registry<'_>) {
                 let server = cx.require(case.server);
                 let client = cx.require(case.client);
                 Box::new(move |run| {
-                    let agent_label = format!("{server_label}->{client_label}");
+                    let server_label = server_label.clone();
+                    let client_label = client_label.clone();
                     let payload = case.payload.to_string();
                     Box::pin(async move {
-                        let listen_resp = run.send(&server, Command::NetListen { port: 0 }).await;
-                        let port = match &listen_resp {
-                            Response::Listening { port } => *port,
-                            _ => {
-                                return super::TestOutcome::new(
-                                    &agent_label,
-                                    false,
-                                    format!("listen failed: {listen_resp:?}"),
-                                );
-                            }
-                        };
-
-                        let halfclose_resp = run
-                            .send(
-                                &client,
-                                Command::NetHalfCloseEcho {
-                                    addr: format!("127.0.0.1:{port}"),
-                                    write_data: payload.clone(),
-                                    half: "wr".into(),
-                                },
-                            )
-                            .await;
-                        let _ = run.send(&server, Command::NetUnlisten { port }).await;
-                        let pass = matches!(
-                            &halfclose_resp,
-                            Response::HalfClosed { echo } if echo == &payload
-                        );
-                        super::TestOutcome::new(&agent_label, pass, format!("{halfclose_resp:?}"))
+                        crate::coordinator::tcp_state::run_write_shutdown_read_eof_case(
+                            run,
+                            &server,
+                            &client,
+                            &server_label,
+                            &client_label,
+                            &payload,
+                        )
+                        .await
                     })
                 })
             });

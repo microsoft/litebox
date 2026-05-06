@@ -15,6 +15,7 @@ pub(crate) mod port_router;
 pub(crate) mod registry;
 pub(crate) mod run_context;
 pub(crate) mod special_cases;
+pub(crate) mod tcp_state;
 pub(crate) mod tcp_stress;
 
 use crate::protocol::{Command, Response};
@@ -765,7 +766,7 @@ pub fn collect_all_tests() -> Vec<Test> {
     platform_fixes::register_file_redirect_tests(&mut registry::Registry::new(&mut tests));
     platform_fixes::register_pipe_nonblock_tests(&mut registry::Registry::new(&mut tests));
     platform_fixes::register_epoll_socket_tests(&mut registry::Registry::new(&mut tests));
-    platform_fixes::register_loopback_tcp_tests(&mut registry::Registry::new(&mut tests));
+    tcp_state::register_tcp_state_tests(&mut registry::Registry::new(&mut tests));
     platform_fixes::register_tcp_halfclose_tests(&mut registry::Registry::new(&mut tests));
     platform_fixes::register_fork_listen_close_tests(&mut registry::Registry::new(&mut tests));
     platform_fixes::register_proc_filesystem_tests(&mut registry::Registry::new(&mut tests));
