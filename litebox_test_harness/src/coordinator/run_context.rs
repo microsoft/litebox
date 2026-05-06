@@ -47,10 +47,15 @@ impl<'a> RunContext<'a> {
     /// Send a protocol command to the agent identified by `handle`,
     /// returning its response.
     pub async fn send(&mut self, handle: &AgentHandle, cmd: Command) -> Response {
-        if handle.name().name() == "init" {
+        let wire = handle.name().name();
+        // Track contact for the over-spawn validator. Init bypasses
+        // `runner.send()` (it goes straight to `exec_local`), so we
+        // record it explicitly here.
+        self.runner.contacted_agents.insert(wire.to_string());
+        if wire == "init" {
             return self.runner.exec_local(&cmd).await;
         }
-        self.runner.send(handle.name().name(), cmd).await
+        self.runner.send(wire, cmd).await
     }
 
     /// Spawn the ephemeral child agent identified by `handle` under
@@ -120,10 +125,13 @@ impl<'a> RunContext<'a> {
     ) -> Result<Duration, Duration> {
         let wire = handle.name().name();
         // Pull the Child out of the runner so we own its lifecycle.
+        // Note: leave `spawned_agents` intact — it's a historical
+        // record of which agents `spawn_tree` brought up, used by
+        // `validate_lazy_matrix`. The test killing an agent doesn't
+        // un-spawn it for accounting purposes.
         let Some(mut child) = self.runner.children.remove(wire) else {
             return Err(Duration::ZERO);
         };
-        self.runner.spawned_agents.remove(wire);
         let _ = child.process.start_kill();
         let start = std::time::Instant::now();
         match tokio::time::timeout(budget, child.process.wait()).await {

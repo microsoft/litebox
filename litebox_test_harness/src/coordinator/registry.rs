@@ -86,7 +86,6 @@ pub struct TestBuilder<'b, 'a: 'b> {
     suite: &'static str,
     group: &'static str,
     id: String,
-    xfail: Option<String>,
     timeout_secs: u64,
 }
 
@@ -129,7 +128,6 @@ impl<'b, 'a: 'b> TestBuilder<'b, 'a> {
             suite: self.suite,
             group: self.group,
             id: self.id,
-            xfail: self.xfail,
             timeout_secs: self.timeout_secs,
             declared_agents: declared,
             needs_nonpie_for_ephemerals,
@@ -153,8 +151,8 @@ impl<'a> Registry<'a> {
     }
 
     /// Begin registering a test with the given suite/group/id.
-    /// Subsequent builder calls (`timeout`, `xfail`, `build`)
-    /// configure and finalize it.
+    /// Subsequent builder calls (`timeout`, `build`) configure and
+    /// finalize it.
     pub fn test(
         &mut self,
         suite: &'static str,
@@ -166,7 +164,6 @@ impl<'a> Registry<'a> {
             suite,
             group,
             id: id.into(),
-            xfail: None,
             timeout_secs: 60,
         }
     }

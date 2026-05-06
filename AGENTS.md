@@ -39,6 +39,84 @@ container name, ssh port, and its own target directory so parallel
 sessions do not invalidate each other's incremental builds or collide on
 host resources.
 
+## Branch and merge discipline
+
+`wportnoy/vscode-server-in-litebox` is the **amalgamation branch** —
+the integration of multiple work streams. Its history should be a
+series of merge commits (one per work stream landed), not a linear
+chain of work-stream commits. Each merge commit records *which*
+work stream landed *when*, which is the property we lose if work
+gets fast-forwarded onto the amalgamation.
+
+Each agent session works on `wportnoy/<work-stream>` (e.g.,
+`wportnoy/litebox-platform-fixes`, `wportnoy/typed-handles`).
+Work-stream branches stay linear and accumulate per-session
+commits. They don't have to be pushed to `origin` — they're visible
+across worktrees of the same clone, so the amalgamation worktree
+can merge from a local work-stream by name.
+
+### Landing a work stream
+
+The worktree containing `wportnoy/vscode-server-in-litebox`
+(typically the main `litebox` clone) is the only place that lands
+work onto the amalgamation. The pattern, for a work-stream `W`:
+
+```sh
+# From a local W (no origin push needed):
+cd <main-worktree>           # already on vscode-server-in-litebox
+git merge --no-ff W
+git push origin wportnoy/vscode-server-in-litebox
+
+# From a pushed origin/W:
+cd <main-worktree>
+git fetch origin
+git merge --no-ff origin/W
+git push origin wportnoy/vscode-server-in-litebox
+```
+
+`--no-ff` is **mandatory**. The merge commit it creates is the
+durable record of which work stream landed.
+
+### Things not to do
+
+| Wrong | Why |
+|---|---|
+| `git push origin W:wportnoy/vscode-server-in-litebox` | Fast-forwards origin to W's tip. Bypasses any `--no-ff` merge commit you made locally. Succeeds silently. |
+| `git rebase origin/wportnoy/vscode-server-in-litebox` (on W, then push) | Linearises history. Same bypass-merge effect as the shortcut push. |
+| `git push origin wportnoy/vscode-server-in-litebox` when local HEAD is a single-parent commit (i.e., you forgot to wrap in `merge --no-ff`) | Pushes a flat extension. `.githooks/pre-push` (below) blocks this. |
+| Push `wportnoy/vscode-server-in-litebox` from a session whose work isn't yet merged | Risk of clobbering another session's local merge structure. Always pull first or land via the amalgamation worktree. |
+
+### If you need newer code from the amalgamation in your work stream
+
+Don't rebase. Merge the amalgamation **into** your work stream
+with `--no-ff`:
+
+```sh
+cd <your-work-stream-worktree>
+git fetch origin
+git merge --no-ff origin/wportnoy/vscode-server-in-litebox
+```
+
+This keeps the work-stream history linear-from-its-own-perspective
+while still incorporating the amalgamation's state. When the
+amalgamation worktree later lands the work stream, the resulting
+merge commit will collapse cleanly.
+
+### Local-only enforcement (`.githooks/pre-push`)
+
+The repo ships a pre-push hook that rejects pushes setting
+`wportnoy/vscode-server-in-litebox` to a single-parent commit.
+Enable it once per clone:
+
+```sh
+git config --local core.hooksPath .githooks
+```
+
+The hook is a guardrail, not a guarantee — it doesn't run on the
+server side, and any session can disable it. Server-side
+enforcement (GitHub branch protection requiring `--no-ff` merges)
+would be the only true block.
+
 ### Build
 
 With the repo on ext4, use cargo s default target/ directory.

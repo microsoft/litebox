@@ -69,6 +69,29 @@ impl AgentName {
         }
     }
 
+    /// Inverse of `name()` — looks up a static `AgentName` from the
+    /// wire-level identifier. Returns `None` for unknown names
+    /// (e.g., ephemeral child labels like `R`, `R2`, `NPx`).
+    pub(super) fn from_wire(name: &str) -> Option<Self> {
+        match name {
+            "init" => Some(AgentName::Init),
+            "A" => Some(AgentName::A),
+            "AA" => Some(AgentName::AA),
+            "AB" => Some(AgentName::AB),
+            "AAA" => Some(AgentName::AAA),
+            "AAB" => Some(AgentName::AAB),
+            "B" => Some(AgentName::B),
+            "NP" => Some(AgentName::NP),
+            "NPC" => Some(AgentName::NPC),
+            "D3" => Some(AgentName::D3),
+            "D4" => Some(AgentName::D4),
+            "D5" => Some(AgentName::D5),
+            "E" => Some(AgentName::E),
+            "EE" => Some(AgentName::EE),
+            _ => None,
+        }
+    }
+
     /// The chain of agents that must already exist for `self` to be
     /// reachable. For A and B this is empty; for D5 it is
     /// `[A, AA, D3, D4]`. Used by `spawn_tree` to expand a per-test

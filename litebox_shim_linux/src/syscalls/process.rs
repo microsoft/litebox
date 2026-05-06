@@ -2756,7 +2756,7 @@ impl<FS: ShimFS> Task<FS> {
             let exe = self.fs.borrow().exe_path.read().clone();
             proc_cmdline_from_argv(&[], &exe)
         });
-        self.global.set_proc_cmdline_bytes(child_pid, child_cmdline);
+        self.global.set_proc_cmdline(child_pid, child_cmdline);
 
         let r = unsafe {
             self.global.platform.spawn_thread(
@@ -9247,7 +9247,7 @@ impl<FS: ShimFS> Task<FS> {
                 .as_ref()
                 .map(|(path, data)| (path.as_str(), data.as_slice()));
             *self.fs.borrow().exe_path.write() = resolved_exe_path;
-            self.global.set_proc_cmdline_bytes(self.pid, proc_cmdline);
+            self.global.set_proc_cmdline(self.pid, proc_cmdline);
             let result = self.exec_on_remote_host(
                 &path,
                 argv_vec,
@@ -9352,7 +9352,7 @@ impl<FS: ShimFS> Task<FS> {
             Ok(()) => {
                 // Update /proc/self/exe and /proc/self/cmdline for the new executable.
                 *self.fs.borrow().exe_path.write() = resolved_exe_path;
-                self.global.set_proc_cmdline_bytes(self.pid, proc_cmdline);
+                self.global.set_proc_cmdline(self.pid, proc_cmdline);
             }
             Err(e) => {
                 if let Some(vd) = vfork_done.take() {
@@ -9399,7 +9399,6 @@ impl<FS: ShimFS> Task<FS> {
             filter(&mut envp);
         }
 
-        self.global.set_proc_cmdline(self.pid, &argv);
         let load_info = loader.load(argv, envp, self.init_auxv(), exec_filename)?;
 
         self.set_task_comm(loader.comm());
