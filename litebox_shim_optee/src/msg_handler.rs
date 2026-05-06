@@ -360,6 +360,16 @@ pub fn decode_ta_request(
     msg_args: &OpteeMsgArgs,
 ) -> Result<TaRequestInfo<PAGE_SIZE>, OpteeSmcReturnCode> {
     let ta_entry_func: UteeEntryFunc = msg_args.cmd.try_into()?;
+    let num_params =
+        usize::try_from(msg_args.num_params).map_err(|_| OpteeSmcReturnCode::EBadCmd)?;
+    if ta_entry_func == UteeEntryFunc::OpenSession {
+        if num_params < 2 || num_params - 2 > UteeParamOwned::TEE_NUM_PARAMS {
+            return Err(OpteeSmcReturnCode::EBadCmd);
+        }
+    } else if num_params > UteeParamOwned::TEE_NUM_PARAMS {
+        return Err(OpteeSmcReturnCode::EBadCmd);
+    }
+
     let (ta_uuid, client_identity, skip): (Option<TeeUuid>, Option<TeeIdentity>, usize) =
         if ta_entry_func == UteeEntryFunc::OpenSession {
             // If it is an OpenSession request, extract UUIDs and login from params[0] and params[1]
