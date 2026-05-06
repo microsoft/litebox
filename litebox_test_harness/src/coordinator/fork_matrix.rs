@@ -229,6 +229,7 @@ impl DfBinary {
             Self::Node => "node",
         }
     }
+    #[allow(clippy::match_same_arms)] // Pie/NonPie deliberately share the same expected output.
     fn expected(self) -> &'static str {
         match self {
             Self::Pie => "ECHO_TEST_OK",

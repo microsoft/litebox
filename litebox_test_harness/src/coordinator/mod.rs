@@ -60,9 +60,15 @@ pub struct Test {
     /// up the non-PIE infrastructure even if no static `NP`/`NPC`/
     /// `D{3..5}` handle was required.
     pub(crate) needs_nonpie_for_ephemerals: bool,
-    pub(crate) run:
-        Box<dyn FnOnce(&'_ mut TestRunner) -> Pin<Box<dyn Future<Output = TestOutcome> + '_>>>,
+    pub(crate) run: TestRunFn,
 }
+
+/// Type alias for the type-erased async closure registered with each
+/// [`Test`]. The closure borrows a `&mut TestRunner` and yields a
+/// `TestOutcome`; the lifetime parameter ties the future to the
+/// runner borrow.
+type TestRunFn =
+    Box<dyn FnOnce(&'_ mut TestRunner) -> Pin<Box<dyn Future<Output = TestOutcome> + '_>>>;
 
 /// Detect whether we're running inside litebox or on native Linux.
 ///
@@ -278,13 +284,10 @@ impl TestRunner {
             };
         }
 
-        let child = match self.children.get_mut(direct) {
-            Some(c) => c,
-            None => {
-                return Response::Error {
-                    error: format!("no child {direct}"),
-                };
-            }
+        let Some(child) = self.children.get_mut(direct) else {
+            return Response::Error {
+                error: format!("no child {direct}"),
+            };
         };
         let actual_cmd = wrap_forwards(rest, cmd);
         let resp = send_cmd(child, &actual_cmd).await;
@@ -331,7 +334,7 @@ impl TestRunner {
         }
         // Spawn direct children A and B.
         for id in &["A", "B"] {
-            match spawn_child(&self.self_exe).await {
+            match spawn_child(&self.self_exe) {
                 Ok(child) => {
                     self.children.insert(id.to_string(), child);
                     let sub = match *id {
@@ -367,7 +370,7 @@ impl TestRunner {
         // mesh as A/B so tests can reach them via TestRunner::send.
         if wants_e {
             self.spawned_agents.insert("E".to_string());
-            match spawn_child(&self.self_exe).await {
+            match spawn_child(&self.self_exe) {
                 Ok(child) => {
                     self.children.insert("E".to_string(), child);
                     self.spawned_agents.insert("EE".to_string());
@@ -639,8 +642,10 @@ impl TestRunner {
 }
 
 /// Dispatch a single test group to the appropriate async test function.
-
 /// Run tests, optionally filtering to a specific suite.
+///
+/// # Panics
+/// Panics if the tokio current-thread runtime fails to build.
 pub fn run_filtered(self_exe: &str, filter: Option<&str>) -> Vec<TestResult> {
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -980,7 +985,7 @@ fn wrap_forwards(remaining: Option<&str>, cmd: Command) -> Command {
     }
 }
 
-pub(crate) async fn spawn_child(self_exe: &str) -> Result<Child, String> {
+pub(crate) fn spawn_child(self_exe: &str) -> Result<Child, String> {
     let mut child = tokio::process::Command::new(self_exe)
         .arg("agent")
         .stdin(std::process::Stdio::piped())
@@ -1094,7 +1099,7 @@ mod tests {
         let mut runner = empty_runner();
 
         // Spawn agent "T" (test agent).
-        let child = spawn_child(&runner.self_exe).await.unwrap();
+        let child = spawn_child(&runner.self_exe).unwrap();
         runner.children.insert("T".to_string(), child);
 
         // Verify it works before poisoning.

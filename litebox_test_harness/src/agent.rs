@@ -61,7 +61,7 @@ async fn agent_loop(self_exe: &str) {
         match cmd {
             Command::Spawn { children: names } => {
                 for name in &names {
-                    match spawn_child(self_exe, name).await {
+                    match spawn_child(self_exe, name) {
                         Ok(handle) => {
                             children.insert(name.clone(), handle);
                         }
@@ -91,7 +91,7 @@ async fn agent_loop(self_exe: &str) {
                     continue;
                 };
                 for name in &names {
-                    match spawn_child(&remote_exe, name).await {
+                    match spawn_child(&remote_exe, name) {
                         Ok(handle) => {
                             children.insert(name.clone(), handle);
                         }
@@ -137,7 +137,7 @@ async fn agent_loop(self_exe: &str) {
                 // inherit_listen_ports is tracked for future use.
                 let _ = &inherit_listen_ports;
 
-                match spawn_child(&exe, &name).await {
+                match spawn_child(&exe, &name) {
                     Ok(handle) => {
                         children.insert(name.clone(), handle);
                         respond(&Response::Ok {
@@ -1029,7 +1029,7 @@ async fn respond(resp: &Response) {
     let _ = stdout.flush().await;
 }
 
-async fn spawn_child(self_exe: &str, _id: &str) -> Result<ChildHandle, String> {
+fn spawn_child(self_exe: &str, _id: &str) -> Result<ChildHandle, String> {
     let mut child = tokio::process::Command::new(self_exe)
         .arg("agent")
         .stdin(std::process::Stdio::piped())

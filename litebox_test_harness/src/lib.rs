@@ -55,6 +55,10 @@ pub fn find_nonpie_binary() -> Option<String> {
 /// Use [`find_nonpie_binary`] only in non-test infrastructure
 /// (e.g., `coordinator::TestRunner::spawn_tree`) that legitimately
 /// wants to skip work when the binary isn't mounted.
+///
+/// # Panics
+/// Panics if neither the bind-mounted Docker path nor a sibling
+/// `*_nonpie` / `*-nonpie` binary exists alongside the current exe.
 #[must_use]
 pub fn nonpie_binary() -> String {
     find_nonpie_binary().unwrap_or_else(|| {

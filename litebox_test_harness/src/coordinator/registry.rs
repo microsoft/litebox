@@ -11,7 +11,7 @@
 //! cannot mention an agent it didn't declare.
 
 use super::agents::{AgentHandle, AgentName, EphemeralHandle, SpawnKind};
-use super::{Test, TestOutcome};
+use super::{Test, TestOutcome, TestRunFn};
 
 use std::collections::BTreeSet;
 use std::future::Future;
@@ -119,11 +119,7 @@ impl<'b, 'a: 'b> TestBuilder<'b, 'a> {
         // TestRunner-based closure that `coordinator::run_tests`
         // currently invokes. RunContext::new wraps a borrowed
         // TestRunner; the wire-level identifier mapping is hidden.
-        let bridged: Box<
-            dyn FnOnce(
-                &'_ mut super::TestRunner,
-            ) -> Pin<Box<dyn Future<Output = TestOutcome> + '_>>,
-        > = Box::new(move |runner| {
+        let bridged: TestRunFn = Box::new(move |runner| {
             Box::pin(async move {
                 let mut rc = super::run_context::RunContext::new(runner);
                 inner(&mut rc).await

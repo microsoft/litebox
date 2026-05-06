@@ -17,5 +17,38 @@ name = "integration"
 path = "tests/integration.rs"
 harness = false
 
-[lints]
-workspace = true
+[lints.rust]
+warnings = "deny"
+
+[lints.clippy]
+# Escalate clippy::pedantic from "warn" (workspace default) to "deny".
+pedantic = { level = "deny", priority = -1 }
+
+# Mirror the workspace-level allow list (we override [lints]
+# entirely so it isn't inherited automatically).
+unreadable_literal = "allow"
+doc_markdown = "allow"
+missing_errors_doc = "allow"
+needless_pass_by_value = "allow"
+redundant_else = "allow"
+must_use_candidate = "allow"
+too_many_lines = "allow"
+
+# Test code makes heavy use of bounded numeric casts (port numbers,
+# small indices, packet sizes) where truncation/sign-flip is
+# structurally impossible.
+cast_possible_truncation = "allow"
+cast_possible_wrap = "allow"
+cast_sign_loss = "allow"
+
+# Test code routinely defines small structs/consts inside fn bodies
+# for locality.
+items_after_statements = "allow"
+
+# `AgentName` variants like `NPC`, `AAA`, `D{3..5}` are wire-protocol
+# identifiers; renaming them would obscure their meaning.
+upper_case_acronyms = "allow"
+
+# Test fixtures use names like `a`/`aa`/`aaa` that mirror the agent
+# matrix.
+similar_names = "allow"

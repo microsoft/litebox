@@ -229,11 +229,12 @@ fn log_path_for(pass: &str, test_id: &str, kind: &str) -> PathBuf {
 ///   * stdout — we still parse line by line for the JSON result,
 ///     but each line is written to the stdout log file as it
 ///     arrives.
+///
 /// Both files are populated synchronously while we still hold the
 /// active_jobs permit, so they're durable even if cargo-test exits
 /// the moment we return — no need for a drain-side join hook.
 fn run_one_test(pass: &str, test_id: &str) -> Result<serde_json::Value, Failed> {
-    let _permit = active_jobs().acquire();
+    let permit = active_jobs().acquire();
     let (_, debug, nonpie) = setup();
     let container_name = format!(
         "litebox-{}-{}-{}-{}",
@@ -292,7 +293,7 @@ fn run_one_test(pass: &str, test_id: &str) -> Result<serde_json::Value, Failed> 
     // population. Logs are already on disk (stderr via Stdio::from,
     // stdout via the tee above).
     spawn_drain(child);
-    drop(_permit);
+    drop(permit);
 
     found.ok_or_else(|| {
         format!(

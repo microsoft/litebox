@@ -1,6 +1,18 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
+// main.rs is a flat collection of integration-test sub-commands and
+// agent runtime helpers. Many of the pedantic lints below would
+// require structural refactors that don't improve correctness; the
+// allow list keeps them from blocking warnings-as-errors enforcement.
+#![allow(clippy::empty_line_after_doc_comments)]
+#![allow(clippy::match_same_arms)]
+#![allow(clippy::manual_let_else)]
+#![allow(clippy::while_let_loop)]
+#![allow(clippy::used_underscore_binding)]
+#![allow(clippy::if_not_else)]
+#![allow(clippy::no_effect_underscore_binding)]
+
 //! LiteBox process tree test harness.
 //!
 //! Two modes:
@@ -388,21 +400,25 @@ fn main() {
                 let n = unsafe {
                     libc::recv(stream.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len(), 0)
                 };
-                if n > 0 {
-                    let n = n as usize;
-                    eprintln!("[tcp-echo] recv {n} bytes, echoing");
-                    match stream.write_all(&buf[..n]) {
-                        Ok(()) => eprintln!("[tcp-echo] write_all OK"),
-                        Err(e) => eprintln!("[tcp-echo] write_all FAILED: {e}"),
+                match n.cmp(&0) {
+                    std::cmp::Ordering::Greater => {
+                        let n = n as usize;
+                        eprintln!("[tcp-echo] recv {n} bytes, echoing");
+                        match stream.write_all(&buf[..n]) {
+                            Ok(()) => eprintln!("[tcp-echo] write_all OK"),
+                            Err(e) => eprintln!("[tcp-echo] write_all FAILED: {e}"),
+                        }
+                        match stream.flush() {
+                            Ok(()) => eprintln!("[tcp-echo] flush OK"),
+                            Err(e) => eprintln!("[tcp-echo] flush FAILED: {e}"),
+                        }
                     }
-                    match stream.flush() {
-                        Ok(()) => eprintln!("[tcp-echo] flush OK"),
-                        Err(e) => eprintln!("[tcp-echo] flush FAILED: {e}"),
+                    std::cmp::Ordering::Equal => {
+                        eprintln!("[tcp-echo] recv returned 0 (EOF)");
                     }
-                } else if n == 0 {
-                    eprintln!("[tcp-echo] recv returned 0 (EOF)");
-                } else {
-                    eprintln!("[tcp-echo] recv error: {}", std::io::Error::last_os_error());
+                    std::cmp::Ordering::Less => {
+                        eprintln!("[tcp-echo] recv error: {}", std::io::Error::last_os_error());
+                    }
                 }
             }
             eprintln!("[tcp-echo] exiting");
@@ -5161,7 +5177,10 @@ mod fs_tests {
             // another process reads. This is the exact code-server pre-warm pattern.
             "bg-open-read" => {
                 let p = path.to_string();
-                // Start a background writer that keeps the file open
+                // Start a background writer that keeps the file open.
+                // Intentionally never wait()ed — wait can hang under
+                // litebox; we kill() before returning.
+                #[allow(clippy::zombie_processes)]
                 let mut child = std::process::Command::new("/usr/bin/bash")
                     .args([
                         "-c",
@@ -5202,7 +5221,6 @@ mod fs_tests {
                 };
 
                 let _ = child.kill();
-                // Don't call child.wait() — it can hang in litebox
                 rc
             }
             // FS7: Parent opens file for writing, forks, child writes via inherited fd,

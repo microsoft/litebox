@@ -120,9 +120,8 @@ impl<'a> RunContext<'a> {
     ) -> Result<Duration, Duration> {
         let wire = handle.name().name();
         // Pull the Child out of the runner so we own its lifecycle.
-        let mut child = match self.runner.children.remove(wire) {
-            Some(c) => c,
-            None => return Err(Duration::ZERO),
+        let Some(mut child) = self.runner.children.remove(wire) else {
+            return Err(Duration::ZERO);
         };
         self.runner.spawned_agents.remove(wire);
         let _ = child.process.start_kill();

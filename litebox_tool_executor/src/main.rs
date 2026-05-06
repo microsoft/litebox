@@ -180,7 +180,7 @@ fn create_audit_log_file(dir: &std::path::Path) -> anyhow::Result<std::path::Pat
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default();
     let secs = now.as_secs();
-    let (year, month, day) = civil_from_days((secs / 86400) as i64);
+    let (year, month, day) = civil_from_days(i64::try_from(secs / 86400).unwrap_or(0));
     let time_of_day = secs % 86400;
     let hour = time_of_day / 3600;
     let minute = (time_of_day % 3600) / 60;
@@ -198,6 +198,7 @@ fn create_audit_log_file(dir: &std::path::Path) -> anyhow::Result<std::path::Pat
 
 /// Convert days since Unix epoch to (year, month, day).
 /// Algorithm from Howard Hinnant's `civil_from_days`.
+#[allow(clippy::cast_sign_loss, clippy::cast_possible_wrap)] // Algorithm requires bounded sign-flipping; values are small.
 fn civil_from_days(days: i64) -> (i64, u64, u64) {
     let z = days + 719468;
     let era = if z >= 0 { z } else { z - 146096 } / 146097;
@@ -223,7 +224,12 @@ fn cleanup_old_logs(dir: &std::path::Path) {
         .filter_map(|e| {
             let e = e.ok()?;
             let name = e.file_name().to_string_lossy().to_string();
-            if name.ends_with(".jsonl") || name.ends_with(".broker.log") {
+            let path_ext = std::path::Path::new(&name)
+                .extension()
+                .and_then(|s| s.to_str());
+            let is_jsonl = path_ext.is_some_and(|s| s.eq_ignore_ascii_case("jsonl"));
+            let is_broker_log = name.to_ascii_lowercase().ends_with(".broker.log");
+            if is_jsonl || is_broker_log {
                 let mtime = e.metadata().ok()?.modified().ok()?;
                 Some((mtime, e.path()))
             } else {
@@ -634,6 +640,7 @@ fn interactive(cli: &Cli, audit_log_file: Option<&std::path::Path>) -> anyhow::R
                         break; // child closed stdin
                     }
                 }
+                #[allow(clippy::match_same_arms)] // Distinct cases for documentation.
                 Err(_) => break,
             }
         }

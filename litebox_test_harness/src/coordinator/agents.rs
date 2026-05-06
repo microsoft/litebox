@@ -72,6 +72,7 @@ impl AgentName {
     /// reachable. For A and B this is empty; for D5 it is
     /// `[A, AA, D3, D4]`. Used by `spawn_tree` to expand a per-test
     /// declared set into the full set of agents that must be alive.
+    #[allow(clippy::match_same_arms)] // Each variant is intentionally distinct even if some chains coincide.
     pub const fn ancestors(self) -> &'static [AgentName] {
         match self {
             AgentName::Init | AgentName::A | AgentName::B => &[],

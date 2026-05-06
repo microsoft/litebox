@@ -971,10 +971,8 @@ pub(super) fn register_net_addr_tests(reg: &mut Registry<'_>) {
 }
 
 pub(super) fn register_unix_addr_tests(reg: &mut Registry<'_>) {
-    let mut idx = 0u32;
-    for &(agent_a, agent_b) in NET_ADDR_PAIRS {
-        let i = idx;
-        idx += 1;
+    for (i, &(agent_a, agent_b)) in NET_ADDR_PAIRS.iter().enumerate() {
+        let i = u32::try_from(i).expect("NET_ADDR_PAIRS too large");
 
         let test_data = format!("ua_{agent_a}_{agent_b}");
         matrix_test(
