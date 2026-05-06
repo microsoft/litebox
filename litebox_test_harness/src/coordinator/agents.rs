@@ -110,3 +110,65 @@ impl AgentHandle {
         self.name
     }
 }
+
+/// How an ephemeral child agent is materialized at runtime. Selected
+/// at registration time so the lazy matrix knows whether non-PIE
+/// infrastructure must be brought up.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SpawnKind {
+    /// PIE child via `Command::Spawn { children: vec![label] }`.
+    Pie,
+    /// Non-PIE child via `Command::SpawnRemote { children: vec![label] }`.
+    /// Implies the lazy matrix must spawn the non-PIE infrastructure.
+    NonPie,
+    /// `Command::Fork { name, binary, inherit_listen_ports }`. Used by
+    /// `port_router`. `binary` is `"self"` (PIE) or `"nonpie"`.
+    /// Inheriting non-empty `inherit_listen_ports` requires non-PIE
+    /// infra only when `binary == "nonpie"`.
+    Fork {
+        binary: &'static str,
+        inherit_listen_ports: Vec<u16>,
+    },
+}
+
+impl SpawnKind {
+    /// Whether this kind requires the non-PIE subtree to be spawned
+    /// up front (so the broker has the rewritten non-PIE binary
+    /// cached and the host worker is ready).
+    pub(super) fn needs_nonpie(&self) -> bool {
+        match self {
+            SpawnKind::Pie => false,
+            SpawnKind::NonPie => true,
+            SpawnKind::Fork { binary, .. } => *binary == "nonpie",
+        }
+    }
+}
+
+/// Capability to send commands to an ephemeral child agent that the
+/// test will spawn under a static parent at runtime. Distinct from
+/// [`AgentHandle`] because the runner does not own the process —
+/// lifecycle (spawn / Exit / SIGKILL) is driven by routed commands
+/// through the parent.
+///
+/// Constructed only by [`RegistrationContext::declare_ephemeral`].
+/// The wire-level label and parent are private; tests can only use
+/// the handle through [`crate::coordinator::run_context::RunContext`]
+/// methods that take `&EphemeralHandle`.
+#[derive(Clone, Debug)]
+pub struct EphemeralHandle {
+    pub(super) parent: AgentName,
+    pub(super) label: String,
+    pub(super) kind: SpawnKind,
+}
+
+impl EphemeralHandle {
+    pub(super) fn parent(&self) -> AgentName {
+        self.parent
+    }
+    pub(super) fn label(&self) -> &str {
+        &self.label
+    }
+    pub(super) fn kind(&self) -> &SpawnKind {
+        &self.kind
+    }
+}

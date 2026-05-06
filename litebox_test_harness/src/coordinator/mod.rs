@@ -44,17 +44,23 @@ impl TestOutcome {
 
 /// A registered test: metadata + deferred execution closure.
 pub struct Test {
-    pub suite: &'static str,
-    pub group: &'static str,
+    pub(crate) suite: &'static str,
+    pub(crate) group: &'static str,
     pub id: String,
-    pub xfail: Option<String>,
-    pub timeout_secs: u64,
+    pub(crate) xfail: Option<String>,
+    pub(crate) timeout_secs: u64,
     /// Agents this test will contact, expressed as an explicit set
-    /// declared at registration time via `RegistrationContext::require`.
-    /// `spawn_tree` uses the union (plus routing-chain ancestors) over
-    /// all filtered tests to decide which agents to spawn.
-    pub declared_agents: Vec<agents::AgentName>,
-    pub run: Box<dyn FnOnce(&'_ mut TestRunner) -> Pin<Box<dyn Future<Output = TestOutcome> + '_>>>,
+    /// declared at registration time via `RegistrationContext::require`
+    /// (and the parents of `declare_ephemeral` calls). `spawn_tree`
+    /// uses the union (plus routing-chain ancestors) over all
+    /// filtered tests to decide which agents to spawn.
+    pub(crate) declared_agents: Vec<agents::AgentName>,
+    /// Set when the test declared an ephemeral with a non-PIE
+    /// [`agents::SpawnKind`]. Forces `filter_needs_nonpie` to bring
+    /// up the non-PIE infrastructure even if no static `NP`/`NPC`/
+    /// `D{3..5}` handle was required.
+    pub(crate) needs_nonpie_for_ephemerals: bool,
+    pub(crate) run: Box<dyn FnOnce(&'_ mut TestRunner) -> Pin<Box<dyn Future<Output = TestOutcome> + '_>>>,
 }
 
 /// Detect whether we're running inside litebox or on native Linux.
@@ -857,9 +863,10 @@ fn filter_needs_nonpie(tests: &[Test]) -> bool {
     if std::env::var("LITEBOX_FORCE_FULL_MATRIX").is_ok() {
         return true;
     }
-    tests
-        .iter()
-        .any(|t| t.declared_agents.iter().any(|a| NONPIE.contains(a)))
+    tests.iter().any(|t| {
+        t.needs_nonpie_for_ephemerals
+            || t.declared_agents.iter().any(|a| NONPIE.contains(a))
+    })
 }
 
 /// Whether any test in the filter declares the SK.subtree.* ephemeral

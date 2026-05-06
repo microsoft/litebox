@@ -21,7 +21,7 @@ use std::time::Duration;
 use crate::protocol::{Command, Response};
 
 use super::TestRunner;
-use super::agents::AgentHandle;
+use super::agents::{AgentHandle, EphemeralHandle, SpawnKind};
 
 /// Run-time access for a registered test. Borrows the underlying
 /// [`TestRunner`] for the duration of one test's execution.
@@ -53,40 +53,48 @@ impl<'a> RunContext<'a> {
         self.runner.send(handle.name().name(), cmd).await
     }
 
-    /// Send a `Forward { target: handle, inner: cmd }` to the
-    /// coordinator routing layer. Equivalent to constructing the
-    /// `Forward` command by hand, but without exposing a public
-    /// constructor that takes a string target.
-    pub async fn forward(&mut self, handle: &AgentHandle, inner: Command) -> Response {
+    /// Spawn the ephemeral child agent identified by `handle` under
+    /// its declared parent. Sends `Spawn` / `SpawnRemote` / `Fork` to
+    /// the parent depending on the handle's [`SpawnKind`]. Returns
+    /// the parent's response (typically `Ok` with a count).
+    pub async fn spawn_ephemeral(&mut self, handle: &EphemeralHandle) -> Response {
+        let parent = handle.parent().name();
+        let label = handle.label().to_string();
+        let cmd = match handle.kind() {
+            SpawnKind::Pie => Command::Spawn {
+                children: vec![label],
+            },
+            SpawnKind::NonPie => Command::SpawnRemote {
+                children: vec![label],
+            },
+            SpawnKind::Fork {
+                binary,
+                inherit_listen_ports,
+            } => Command::Fork {
+                name: label,
+                binary: (*binary).to_string(),
+                inherit_listen_ports: inherit_listen_ports.clone(),
+            },
+        };
+        self.runner.send(parent, cmd).await
+    }
+
+    /// Send `inner` to the ephemeral child agent identified by
+    /// `handle` by wrapping it as
+    /// `Forward { target: label, inner }` to the parent. The
+    /// wire-level label is private to the handle; tests cannot
+    /// construct a `Forward` to an unrelated string target.
+    pub async fn forward(&mut self, handle: &EphemeralHandle, inner: Command) -> Response {
+        let parent = handle.parent().name();
+        let target = handle.label().to_string();
         self.runner
             .send(
-                handle.name().name(),
+                parent,
                 Command::Forward {
-                    target: handle.name().name().to_string(),
+                    target,
                     inner: Box::new(inner),
                 },
             )
-            .await
-    }
-
-    /// Read a file from the coordinator's local filesystem (the
-    /// `init` target).
-    pub async fn fs_read(&self, path: &str) -> Response {
-        self.runner
-            .exec_local(&Command::FsRead {
-                path: path.to_string(),
-            })
-            .await
-    }
-
-    /// Write a file to the coordinator's local filesystem (the
-    /// `init` target).
-    pub async fn fs_write(&self, path: &str, data: &str) -> Response {
-        self.runner
-            .exec_local(&Command::FsWrite {
-                path: path.to_string(),
-                data: data.to_string(),
-            })
             .await
     }
 

@@ -10,7 +10,7 @@
 //! identifier. Under-declaration is therefore a compile error: a test
 //! cannot mention an agent it didn't declare.
 
-use super::agents::{AgentHandle, AgentName};
+use super::agents::{AgentHandle, AgentName, EphemeralHandle, SpawnKind};
 use super::{Test, TestOutcome};
 
 use std::collections::BTreeSet;
@@ -26,12 +26,17 @@ use std::pin::Pin;
 /// it.
 pub struct RegistrationContext {
     declared: BTreeSet<AgentName>,
+    /// Set when any declared ephemeral has a non-PIE [`SpawnKind`].
+    /// Forces `filter_needs_nonpie` to bring up the non-PIE subtree
+    /// even if no static `NP`/`NPC`/`D{3..5}` handle was required.
+    needs_nonpie_for_ephemerals: bool,
 }
 
 impl RegistrationContext {
     fn new() -> Self {
         Self {
             declared: BTreeSet::new(),
+            needs_nonpie_for_ephemerals: false,
         }
     }
 
@@ -45,6 +50,33 @@ impl RegistrationContext {
         }
         self.declared.insert(agent);
         AgentHandle { name: agent }
+    }
+
+    /// Declare an ephemeral child agent the test will spawn under
+    /// `parent` at runtime. Returns an [`EphemeralHandle`] the test
+    /// uses with [`crate::coordinator::run_context::RunContext::spawn_ephemeral`]
+    /// and [`crate::coordinator::run_context::RunContext::forward`].
+    ///
+    /// Records `parent` in `declared_agents` automatically. If
+    /// `kind` requires non-PIE infrastructure, also flags
+    /// `needs_nonpie_for_ephemerals` so the lazy matrix brings up
+    /// `NP`/`NPC` even when the test doesn't directly route through
+    /// them.
+    pub fn declare_ephemeral(
+        &mut self,
+        parent: AgentName,
+        label: impl Into<String>,
+        kind: SpawnKind,
+    ) -> EphemeralHandle {
+        let _ = self.require(parent);
+        if kind.needs_nonpie() {
+            self.needs_nonpie_for_ephemerals = true;
+        }
+        EphemeralHandle {
+            parent,
+            label: label.into(),
+            kind,
+        }
     }
 }
 
@@ -88,6 +120,7 @@ impl<'b, 'a: 'b> TestBuilder<'b, 'a> {
         let mut cx = RegistrationContext::new();
         let inner = body(&mut cx);
         let declared: Vec<AgentName> = cx.declared.into_iter().collect();
+        let needs_nonpie_for_ephemerals = cx.needs_nonpie_for_ephemerals;
         // Bridge from the typed RunContext-based closure to the legacy
         // TestRunner-based closure that `coordinator::run_tests`
         // currently invokes. RunContext::new wraps a borrowed
@@ -109,6 +142,7 @@ impl<'b, 'a: 'b> TestBuilder<'b, 'a> {
             xfail: self.xfail,
             timeout_secs: self.timeout_secs,
             declared_agents: declared,
+            needs_nonpie_for_ephemerals,
             run: bridged,
         });
     }
