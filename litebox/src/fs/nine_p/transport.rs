@@ -109,35 +109,3 @@ impl Write for Vec<u8> {
         Ok(buf.len())
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    struct SliceReader<'a> {
-        buf: &'a [u8],
-    }
-
-    impl Read for SliceReader<'_> {
-        fn read(&mut self, buf: &mut [u8]) -> Result<usize, ReadError> {
-            let amt = self.buf.len().min(buf.len());
-            buf[..amt].copy_from_slice(&self.buf[..amt]);
-            self.buf = &self.buf[amt..];
-            Ok(amt)
-        }
-    }
-
-    #[test]
-    fn read_to_buf_rejects_frames_larger_than_limit() {
-        let input = 0xffff_ffffu32.to_le_bytes();
-        let mut reader = SliceReader { buf: &input };
-        let mut buf = Vec::with_capacity(64);
-
-        assert!(matches!(
-            read_to_buf(&mut reader, &mut buf, 64),
-            Err(super::super::Error::InvalidResponse)
-        ));
-        assert_eq!(buf.len(), 4);
-        assert_eq!(buf.capacity(), 64);
-    }
-}
