@@ -533,12 +533,10 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
     for FileSystem<Platform, T>
 {
     fn drop(&mut self) {
-        // Clunk the root fid. We need to consume the Fid; replace `self.root.1`
-        // with a clone of itself, then clunk the original. (Cheap: just an Arc bump.)
-        // Actually the cleanest way is to use mem::replace with an unused dummy,
-        // but Fid has no `Default`. Instead: clone, then drop the clone via clunk.
-        let root = self.root.1.clone();
-        self.client.clunk(root);
+        // `clunk` consumes the Fid by value, but we only have `&mut self`,
+        // so clunk a clone (one Arc bump); the field's own drop reclaims the
+        // pool slot when the last clone — the original — goes away.
+        self.client.clunk(self.root.1.clone());
     }
 }
 
@@ -583,23 +581,8 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
             let (_, dfid) = self
                 .client
                 .walk(&self.root.1, &components[..components.len() - 1])?;
-            // `create` consumes dfid: on success the same fid value points to
-            // the new file server-side and is returned; on failure we get the
-            // dfid back and need to clunk it ourselves.
-            let dfid_for_cleanup = dfid.clone();
-            match self
-                .client
-                .create(dfid, components.last().unwrap(), lflags, mode.bits(), 0)
-            {
-                Ok(v) => {
-                    drop(dfid_for_cleanup); // we don't need the extra ref
-                    v
-                }
-                Err(err) => {
-                    self.client.clunk(dfid_for_cleanup);
-                    return Err(err.into());
-                }
-            }
+            self.client
+                .create(dfid, components.last().unwrap(), lflags, mode.bits(), 0)?
         } else {
             let (_, new_fid) = self.client.walk(&self.root.1, &components)?;
             let qid = match self.client.open(&new_fid, lflags) {

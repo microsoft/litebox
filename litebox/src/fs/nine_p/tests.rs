@@ -3,6 +3,7 @@
 
 extern crate std;
 
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::io::{Read as _, Write as _};
 use std::net::{TcpListener, TcpStream};
 use std::path::Path;
@@ -448,8 +449,6 @@ fn test_nine_p_host_files_visible() {
 // ---------------------------------------------------------------------------
 // Broken-connection transport: wraps TcpTransport and breaks after N writes
 // ---------------------------------------------------------------------------
-
-use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 /// A transport wrapper that allows a fixed number of write-message calls to
 /// succeed, then fails all subsequent I/O. This simulates a connection that
@@ -980,12 +979,12 @@ fn test_nine_p_explicit_offset_read_write() {
 }
 
 /// Regression test for the fid-reuse race. The 9P client defends against it via refcounted
-/// `Fid` handles: each open holds an `Arc<FidGuard>` whose `Drop` returns the value to the
-/// `IdPool`. Concurrent in-flight ops on a fd hold their own clones, so the pool slot stays
-/// reserved across `close` — meaning the underlying fid VALUE will not be reassigned to a
-/// different file while a stale Tread is in flight. The server destroys the server-side fid
-/// on `close`'s Tclunk, so a stale Tread *will* see EBADF (visible as `ReadError::Io`), but
-/// data corruption (reading a different file's bytes) is impossible.
+/// `Fid` handles whose inner `Drop` returns the value to the `IdPool` only when the last
+/// clone is dropped. Concurrent in-flight ops on a fd hold their own clones, so the pool
+/// slot stays reserved across `close` — meaning the underlying fid value will not be
+/// reassigned to a different file while a stale Tread is in flight. The server destroys
+/// the server-side fid on `close`'s Tclunk, so a stale Tread *will* see EBADF (visible as
+/// `ReadError::Io`), but data corruption (reading a different file's bytes) is impossible.
 ///
 /// Many concurrent readers share a single `fd_a` filled with 'A' bytes; a separate thread
 /// closes it and then thrashes the fid pool by opening/closing a different file (filled with

@@ -16,7 +16,7 @@ use super::Error;
 use super::fcall::{self, Fcall, FcallStr, GetattrMask, TaggedFcall};
 use super::transport::{self, Read, Write};
 
-/// Pool of 9P fid VALUES, shared between the [`Client`] and every live
+/// Pool of 9P fid values, shared between the [`Client`] and every live
 /// [`Fid`] handle. Recycling a value back to the pool happens only when the
 /// last `Fid` clone for that value is dropped, so an in-flight read or write
 /// keeps the pool slot reserved even after the descriptor that owned it has
@@ -27,23 +27,25 @@ struct FidPool<Platform: RawSyncPrimitivesProvider> {
 }
 
 impl<Platform: RawSyncPrimitivesProvider> FidPool<Platform> {
+    /// Create a fresh empty pool with no fids in use.
     fn new() -> Self {
         Self {
             inner: Mutex::new(IdPool::new()),
         }
     }
 
-    /// Allocate a raw fid VALUE. The caller is fully responsible for the
+    /// Allocate a raw fid value. The caller is fully responsible for the
     /// lifecycle: call [`recycle`](Self::recycle) if the value never reached
-    /// the server (e.g., a Twalk that errored), or [`Client::clunk_raw`] +
-    /// recycle if it did. Used for short-lived intermediates inside
-    /// [`Client::walk_chunked`] that never escape to user code.
+    /// the server (e.g., a Twalk that errored), or [`Client::clunk_raw`]
+    /// (which recycles internally) if it did. Used for short-lived
+    /// intermediates inside [`Client::walk_chunked`] that never escape to
+    /// user code.
     fn allocate_raw(&self) -> Result<fcall::Fid, Error> {
         self.inner.lock().allocate().ok_or(Error::Io)
     }
 
     /// Wrap a raw fid value into a refcounted handle, transferring ownership
-    /// of the pool slot. The slot is recycled when the LAST [`Fid`] clone is
+    /// of the pool slot. The slot is recycled when the last [`Fid`] clone is
     /// dropped.
     fn adopt(self: &Arc<Self>, id: fcall::Fid) -> Fid<Platform> {
         Fid {
@@ -62,6 +64,8 @@ impl<Platform: RawSyncPrimitivesProvider> FidPool<Platform> {
         Ok(self.adopt(id))
     }
 
+    /// Return a raw fid value to the pool, making it available for future
+    /// allocations.
     fn recycle(&self, id: fcall::Fid) {
         self.inner.lock().recycle(id);
     }
@@ -89,7 +93,7 @@ impl<Platform: RawSyncPrimitivesProvider> Clone for Fid<Platform> {
 
 impl<Platform: RawSyncPrimitivesProvider> Fid<Platform> {
     /// The wire-level u32 fid for encoding into 9P messages.
-    pub(super) fn id(&self) -> fcall::Fid {
+    fn id(&self) -> fcall::Fid {
         self.inner.id
     }
 }
@@ -137,7 +141,13 @@ pub(super) struct Client<Platform: RawSyncPrimitivesProvider, T: Read + Write> {
 }
 
 impl<Platform: RawSyncPrimitivesProvider, T: Read + Write> Client<Platform, T> {
+    /// Cap on the number of entries `readdir_all` will accumulate from an
+    /// untrusted server before bailing with `InvalidResponse`.
     const MAX_READDIR_ENTRIES: usize = 1_000_000;
+    /// Cap on the aggregate byte size of names accumulated by `readdir_all`.
+    /// Bounds memory in the case where a server returns a huge number of
+    /// entries with maximally long names.
+    const MAX_READDIR_NAME_BYTES: usize = 64 * 1024 * 1024;
 
     /// Create a new 9P client and perform version negotiation
     ///
@@ -183,7 +193,9 @@ impl<Platform: RawSyncPrimitivesProvider, T: Read + Write> Client<Platform, T> {
             } => return Err(Error::from(e)),
             _ => return Err(Error::InvalidResponse),
         };
-        if msize < fcall::IOHDRSZ.max(fcall::READDIRHDRSZ) {
+        // Reject a negotiated msize so small that subsequent reads/writes
+        // would have effectively zero payload (count = msize - IOHDRSZ).
+        if msize < MIN_MSIZE {
             return Err(Error::InvalidResponse);
         }
 
@@ -220,22 +232,19 @@ impl<Platform: RawSyncPrimitivesProvider, T: Read + Write> Client<Platform, T> {
     }
 
     fn next_tag(&self) -> u16 {
-        loop {
-            let current = self.next_tag.load(Ordering::Relaxed);
-            debug_assert!(current != fcall::NOTAG);
-            let next = if current == fcall::NOTAG - 1 {
-                1
-            } else {
-                current + 1
-            };
-            if self
-                .next_tag
-                .compare_exchange(current, next, Ordering::Relaxed, Ordering::Relaxed)
-                .is_ok()
-            {
-                return current;
-            }
-        }
+        // NOTAG is reserved for Tversion/Rversion, so cycle through 1..NOTAG.
+        // `fetch_update` returns the value before the update, which is the tag
+        // we want to use for this fcall.
+        self.next_tag
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                debug_assert!(current != fcall::NOTAG);
+                Some(if current == fcall::NOTAG - 1 {
+                    1
+                } else {
+                    current + 1
+                })
+            })
+            .unwrap()
     }
 
     /// Attach to a remote filesystem
@@ -284,6 +293,7 @@ impl<Platform: RawSyncPrimitivesProvider, T: Read + Write> Client<Platform, T> {
             return Err(Error::InvalidPathname);
         }
         let new_fid = self.fids.allocate_raw()?;
+        let wnames_len = wnames.len();
         let ret = self.fcall(
             Fcall::Twalk(fcall::Twalk {
                 fid,
@@ -291,7 +301,14 @@ impl<Platform: RawSyncPrimitivesProvider, T: Read + Write> Client<Platform, T> {
                 wnames: wnames.to_vec(),
             }),
             |response| match response {
-                Fcall::Rwalk(fcall::Rwalk { wqids }) => Ok(wqids),
+                Fcall::Rwalk(fcall::Rwalk { wqids }) => {
+                    // A server returning more qids than we requested is a
+                    // protocol violation; reject rather than silently accept.
+                    if wqids.len() > wnames_len {
+                        return Err(Error::InvalidResponse);
+                    }
+                    Ok(wqids)
+                }
                 Fcall::Rlerror(err) => Err(Error::from(err)),
                 _ => Err(Error::InvalidResponse),
             },
@@ -368,11 +385,11 @@ impl<Platform: RawSyncPrimitivesProvider, T: Read + Write> Client<Platform, T> {
                 self.clunk_raw(p);
             }
             if new_len < chunk.len() {
-                // Partial Rwalk: see `test_nine_p_partial_walk_newfid_lifecycle`
-                // — diod establishes new_fid even on a partial walk, so we
-                // must clunk it (server-side cleanup). `clunk_raw` swallows
-                // any Rlerror, so this is also safe against servers that
-                // follow a stricter spec read.
+                // Partial Rwalk. The 9P2000.L spec says new_fid is unaffected
+                // when nwqid < nwname, but diod establishes it anyway, so we
+                // send Tclunk for server-side cleanup. `clunk_raw` swallows
+                // Rlerror, so this is also safe against stricter servers
+                // where the clunk would be on an unestablished fid.
                 self.clunk_raw(new_f);
                 return Err(Error::Remote(super::ENOENT));
             }
@@ -597,6 +614,7 @@ impl<Platform: RawSyncPrimitivesProvider, T: Read + Write> Client<Platform, T> {
         fid: &Fid<Platform>,
     ) -> Result<Vec<fcall::DirEntry<'static>>, Error> {
         let mut all_entries = Vec::new();
+        let mut name_bytes: usize = 0;
         let mut offset = 0u64;
         loop {
             let entries = self.readdir(fid, offset)?;
@@ -612,6 +630,16 @@ impl<Platform: RawSyncPrimitivesProvider, T: Read + Write> Client<Platform, T> {
                 .checked_add(entries.len())
                 .is_none_or(|len| len > Self::MAX_READDIR_ENTRIES)
             {
+                return Err(Error::InvalidResponse);
+            }
+            let chunk_bytes = entries
+                .iter()
+                .try_fold(0usize, |acc, e| acc.checked_add(e.name.len()))
+                .ok_or(Error::InvalidResponse)?;
+            name_bytes = name_bytes
+                .checked_add(chunk_bytes)
+                .ok_or(Error::InvalidResponse)?;
+            if name_bytes > Self::MAX_READDIR_NAME_BYTES {
                 return Err(Error::InvalidResponse);
             }
             offset = next_offset;
