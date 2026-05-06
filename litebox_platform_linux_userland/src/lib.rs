@@ -1021,6 +1021,11 @@ impl LinuxUserland {
         Ok(written)
     }
 
+    /// Return whether a file is directly visible on the host filesystem.
+    pub fn host_file_exists(&self, path: &str) -> bool {
+        std::fs::metadata(path).is_ok_and(|meta| meta.is_file())
+    }
+
     /// Read a file directly from the host filesystem.
     pub fn read_host_file(&self, path: &str) -> Result<Vec<u8>, ()> {
         std::fs::read(path).map_err(|_| ())
@@ -1378,7 +1383,7 @@ impl LinuxUserland {
         let result_read_fd = relocate_fd_to_infra_range(result_read_fd)?;
         let result_write_fd = relocate_fd_to_infra_range(result_write_fd)?;
         let interp_image_fd = interp_image_fd
-            .map(|fd| relocate_fd_to_infra_range(fd))
+            .map(relocate_fd_to_infra_range)
             .transpose()?;
         let host_stdio_temp_sources =
             duplicate_host_stdio_sources_for_spawn(&stdio).map_err(|_| -1_i32)?;
