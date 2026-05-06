@@ -1268,22 +1268,45 @@ impl LinuxUserland {
             }
         }
 
+        struct SafeExtraFds(Vec<(usize, i32)>);
+        impl SafeExtraFds {
+            fn push(&mut self, guest_fd: usize, host_fd: i32) {
+                self.0.push((guest_fd, host_fd));
+            }
+
+            fn iter(&self) -> core::slice::Iter<'_, (usize, i32)> {
+                self.0.iter()
+            }
+
+            fn close_all(&mut self) {
+                for &(_, fd) in &self.0 {
+                    close_raw_fd(fd);
+                }
+                self.0.clear();
+            }
+        }
+        impl Drop for SafeExtraFds {
+            fn drop(&mut self) {
+                self.close_all();
+            }
+        }
+
         let _spawn_guard = self.worker_spawn_serial.lock().unwrap();
         self.reap_finished_worker_bridge_threads();
 
         // Dup extra_fds to high fd numbers so they don't get clobbered by
         // memfd/pipe creation below. The original fds are closed after dup.
-        let mut safe_extra_fds: Vec<(usize, i32)> = Vec::new();
+        let mut safe_extra_fds = SafeExtraFds(Vec::new());
         for &(guest_fd, host_fd) in extra_fds {
             // Dup bridge host fds into the worker bridge range (200+)
             // so they don't collide with infrastructure fds (500+).
             let safe_fd = unsafe { libc::fcntl(host_fd, libc::F_DUPFD, WORKER_BRIDGE_FD_MIN) };
             if safe_fd >= 0 {
-                unsafe { libc::close(host_fd) };
-                safe_extra_fds.push((guest_fd, safe_fd));
+                close_raw_fd(host_fd);
+                safe_extra_fds.push(guest_fd, safe_fd);
             } else {
                 // dup failed — keep original (risky but better than nothing).
-                safe_extra_fds.push((guest_fd, host_fd));
+                safe_extra_fds.push(guest_fd, host_fd);
             }
         }
 
@@ -1363,10 +1386,10 @@ impl LinuxUserland {
         }
         // Add --pipe-bridge for extra inherited fds (e.g. socketpair IPC).
         // Must be BEFORE the -- separator so they're parsed as runner args.
-        for &(guest_fd, host_fd) in &safe_extra_fds {
+        for &(guest_fd, host_fd) in safe_extra_fds.iter() {
             let _ = self.clear_cloexec(host_fd);
             spawn_argv.push(CString::new("--pipe-bridge").unwrap());
-            spawn_argv.push(CString::new(format!("{guest_fd}:b:{host_fd}")).map_err(|_| -1_i32)?);
+            spawn_argv.push(CString::new(format!("{guest_fd}:b:{guest_fd}")).map_err(|_| -1_i32)?);
         }
 
         spawn_argv.push(CString::new("--").unwrap());
@@ -1545,11 +1568,20 @@ impl LinuxUserland {
         }
 
         // Map extra fds (socketpair bridges) to their guest fd numbers
-        // at the kernel level via dup2 file actions.
-        for &(guest_fd, host_fd) in &safe_extra_fds {
+        // at the kernel level via dup2 file actions. The runner's
+        // --pipe-bridge specs use the guest fd as the host fd, so close the
+        // high staging fd in the spawned worker after dup2; otherwise that
+        // duplicate keeps the peer open and pipe readers never observe EOF.
+        for &(guest_fd, host_fd) in safe_extra_fds.iter() {
             if unsafe {
                 libc::posix_spawn_file_actions_adddup2(file_actions_ptr, host_fd, guest_fd as i32)
             } != 0
+            {
+                return Err(-1_i32);
+            }
+            if host_fd != guest_fd as i32
+                && unsafe { libc::posix_spawn_file_actions_addclose(file_actions_ptr, host_fd) }
+                    != 0
             {
                 return Err(-1_i32);
             }
@@ -1570,6 +1602,7 @@ impl LinuxUserland {
         if ret != 0 {
             return Err(ret);
         }
+        safe_extra_fds.close_all();
         drop(worker_input_read_fds);
         drop(worker_output_write_fds);
         drop(host_stdio_temp_sources);
