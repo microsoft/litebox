@@ -740,6 +740,7 @@ pub fn collect_all_tests() -> Vec<Test> {
     platform_fixes::register_concurrent_fork_tests(&mut registry::Registry::new(&mut tests));
     platform_fixes::register_touch_redirect_tests(&mut registry::Registry::new(&mut tests));
     platform_fixes::register_pid_visibility_tests(&mut registry::Registry::new(&mut tests));
+    platform_fixes::register_cross_pid_visibility_tests(&mut registry::Registry::new(&mut tests));
     platform_fixes::register_file_redirect_tests(&mut registry::Registry::new(&mut tests));
     platform_fixes::register_pipe_nonblock_tests(&mut registry::Registry::new(&mut tests));
     platform_fixes::register_epoll_socket_tests(&mut registry::Registry::new(&mut tests));

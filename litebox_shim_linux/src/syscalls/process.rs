@@ -2750,6 +2750,9 @@ impl<FS: ShimFS> Task<FS> {
             .pid_to_process_id
             .write()
             .insert(child_pid, child_process_id);
+        if let Some(cmdline) = self.global.proc_cmdline(self.pid) {
+            self.global.proc_cmdlines.write().insert(child_pid, cmdline);
+        }
 
         let r = unsafe {
             self.global.platform.spawn_thread(
@@ -9188,6 +9191,7 @@ impl<FS: ShimFS> Task<FS> {
             filter(&mut envp);
         }
 
+        self.global.set_proc_cmdline(self.pid, &argv);
         let load_info = loader.load(argv, envp, self.init_auxv(), exec_filename)?;
 
         self.set_task_comm(loader.comm());

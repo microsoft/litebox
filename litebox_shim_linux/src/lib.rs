@@ -391,6 +391,7 @@ impl LinuxShimBuilder {
             control_plane,
             fork_child_host_pids: litebox::sync::RwLock::new(alloc::collections::BTreeMap::new()),
             pid_to_process_id: litebox::sync::RwLock::new(alloc::collections::BTreeMap::new()),
+            proc_cmdlines: litebox::sync::RwLock::new(alloc::collections::BTreeMap::new()),
         });
         LinuxShim {
             global,
@@ -3448,9 +3449,33 @@ struct GlobalState<FS: ShimFS> {
         Platform,
         alloc::collections::BTreeMap<i32, litebox::process::ProcessId>,
     >,
+    /// Synthetic `/proc/<pid>/cmdline` bytes for guest processes owned by this host.
+    proc_cmdlines: litebox::sync::RwLock<Platform, alloc::collections::BTreeMap<i32, Vec<u8>>>,
 }
 
 impl<FS: ShimFS> GlobalState<FS> {
+    fn cmdline_from_argv(argv: &[alloc::ffi::CString]) -> Vec<u8> {
+        if argv.is_empty() {
+            return vec![0];
+        }
+        let mut cmdline = Vec::new();
+        for arg in argv {
+            cmdline.extend_from_slice(arg.as_bytes());
+            cmdline.push(0);
+        }
+        cmdline
+    }
+
+    fn set_proc_cmdline(&self, pid: i32, argv: &[alloc::ffi::CString]) {
+        self.proc_cmdlines
+            .write()
+            .insert(pid, Self::cmdline_from_argv(argv));
+    }
+
+    fn proc_cmdline(&self, pid: i32) -> Option<Vec<u8>> {
+        self.proc_cmdlines.read().get(&pid).cloned()
+    }
+
     /// Keeps the global thread allocator above a thread ID that was assigned
     /// outside `next_thread_id` (for example, when bootstrapping a process in a
     /// new host process).

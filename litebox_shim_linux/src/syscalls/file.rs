@@ -512,8 +512,12 @@ impl<FS: ShimFS> Task<FS> {
     }
 
     /// Generate synthetic `/proc/<pid>/cmdline` content.
-    fn synthetic_proc_cmdline(&self) -> alloc::vec::Vec<u8> {
-        // NUL-separated argv. Use the exe path as a minimal approximation.
+    fn synthetic_proc_cmdline(&self, pid: i32) -> alloc::vec::Vec<u8> {
+        if let Some(cmdline) = self.global.proc_cmdline(pid) {
+            return cmdline;
+        }
+
+        // NUL-separated argv. Use this task's exe path as a minimal fallback.
         let exe = self.fs.borrow().exe_path.read().clone();
         if exe.is_empty() {
             alloc::vec![0]
@@ -796,7 +800,7 @@ impl<FS: ShimFS> Task<FS> {
                             .open_synthetic_proc_text(flags, self.synthetic_proc_status(pid));
                     }
                     "/cmdline" => {
-                        let data = self.synthetic_proc_cmdline();
+                        let data = self.synthetic_proc_cmdline(pid);
                         let text = alloc::string::String::from_utf8_lossy(&data).into_owned();
                         return self.open_synthetic_proc_text(flags, text);
                     }
