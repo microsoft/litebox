@@ -12,7 +12,7 @@
 //! The port router ownership fix (worker_id tracking) prevents a
 //! re-registering child from deregistering the parent's route on exit.
 
-use super::agents::AgentName;
+use super::agents::{AgentName, SpawnKind};
 use super::registry::Registry;
 use crate::protocol::{Command, Response};
 
@@ -24,13 +24,6 @@ pub(crate) fn register_port_router(reg: &mut Registry<'_>) {
     register_fork_background_tests(reg);
     register_fork_listen_inherit_tests(reg);
     register_child_listen_cross_connect_tests(reg);
-}
-
-fn forward_to(target: &str, inner: Command) -> Command {
-    Command::Forward {
-        target: target.to_string(),
-        inner: Box::new(inner),
-    }
 }
 
 fn register_fork_port_tests(reg: &mut Registry<'_>) {
@@ -320,7 +313,16 @@ fn register_fork_listen_inherit_tests(reg: &mut Registry<'_>) {
         .timeout(180)
         .build(|cx| {
             let handle_a = cx.require(AgentName::A);
+            let li_c = cx.declare_ephemeral(
+                AgentName::A,
+                "LI_C",
+                SpawnKind::Fork {
+                    binary: "self",
+                    inherit_listen_ports: vec![],
+                },
+            );
             Box::new(move |run| {
+                let li_c = li_c.clone();
                 Box::pin(async move {
                     let port = 18300u16;
                     let child_port = port + 100;
@@ -332,16 +334,7 @@ fn register_fork_listen_inherit_tests(reg: &mut Registry<'_>) {
                             format!("listen failed: {resp:?}"),
                         );
                     }
-                    let resp = run
-                        .send(
-                            &handle_a,
-                            Command::Fork {
-                                name: "LI_C".to_string(),
-                                binary: "self".to_string(),
-                                inherit_listen_ports: vec![],
-                            },
-                        )
-                        .await;
+                    let resp = run.spawn_ephemeral(&li_c).await;
                     if !matches!(&resp, Response::Ok { .. }) {
                         let _ = run.send(&handle_a, Command::NetUnlisten { port }).await;
                         return super::TestOutcome::new(
@@ -351,20 +344,12 @@ fn register_fork_listen_inherit_tests(reg: &mut Registry<'_>) {
                         );
                     }
                     let _ = run
-                        .send(
-                            &handle_a,
-                            forward_to("LI_C", Command::NetListen { port: child_port }),
-                        )
+                        .forward(&li_c, Command::NetListen { port: child_port })
                         .await;
                     let _ = run
-                        .send(
-                            &handle_a,
-                            forward_to("LI_C", Command::NetUnlisten { port: child_port }),
-                        )
+                        .forward(&li_c, Command::NetUnlisten { port: child_port })
                         .await;
-                    let _ = run
-                        .send(&handle_a, forward_to("LI_C", Command::Exit))
-                        .await;
+                    let _ = run.forward(&li_c, Command::Exit).await;
                     tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
                     let conn_resp = run
                         .send(
@@ -388,7 +373,16 @@ fn register_fork_listen_inherit_tests(reg: &mut Registry<'_>) {
         .build(|cx| {
             let handle_a = cx.require(AgentName::A);
             let handle_b = cx.require(AgentName::B);
+            let li_c2 = cx.declare_ephemeral(
+                AgentName::A,
+                "LI_C2",
+                SpawnKind::Fork {
+                    binary: "self",
+                    inherit_listen_ports: vec![],
+                },
+            );
             Box::new(move |run| {
+                let li_c2 = li_c2.clone();
                 Box::pin(async move {
                     let port2 = 18301u16;
                     let child_port2 = port2 + 100;
@@ -402,16 +396,7 @@ fn register_fork_listen_inherit_tests(reg: &mut Registry<'_>) {
                             format!("listen2 failed: {resp:?}"),
                         );
                     }
-                    let resp = run
-                        .send(
-                            &handle_a,
-                            Command::Fork {
-                                name: "LI_C2".to_string(),
-                                binary: "self".to_string(),
-                                inherit_listen_ports: vec![],
-                            },
-                        )
-                        .await;
+                    let resp = run.spawn_ephemeral(&li_c2).await;
                     if !matches!(&resp, Response::Ok { .. }) {
                         let _ = run
                             .send(&handle_a, Command::NetUnlisten { port: port2 })
@@ -423,20 +408,12 @@ fn register_fork_listen_inherit_tests(reg: &mut Registry<'_>) {
                         );
                     }
                     let _ = run
-                        .send(
-                            &handle_a,
-                            forward_to("LI_C2", Command::NetListen { port: child_port2 }),
-                        )
+                        .forward(&li_c2, Command::NetListen { port: child_port2 })
                         .await;
                     let _ = run
-                        .send(
-                            &handle_a,
-                            forward_to("LI_C2", Command::NetUnlisten { port: child_port2 }),
-                        )
+                        .forward(&li_c2, Command::NetUnlisten { port: child_port2 })
                         .await;
-                    let _ = run
-                        .send(&handle_a, forward_to("LI_C2", Command::Exit))
-                        .await;
+                    let _ = run.forward(&li_c2, Command::Exit).await;
                     tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
                     let conn_resp = run
                         .send(
@@ -465,30 +442,34 @@ fn register_child_listen_cross_connect_tests(reg: &mut Registry<'_>) {
         .build(move |cx| {
             let handle_a = cx.require(AgentName::A);
             let handle_b = cx.require(AgentName::B);
+            // Try CL_C as a non-PIE Fork first; fall back to PIE.
+            // Both share the same wire label so forwarding works
+            // regardless of which kind succeeded.
+            let cl_c_nonpie = cx.declare_ephemeral(
+                AgentName::A,
+                "CL_C",
+                SpawnKind::Fork {
+                    binary: "nonpie",
+                    inherit_listen_ports: vec![],
+                },
+            );
+            let cl_c_pie = cx.declare_ephemeral(
+                AgentName::A,
+                "CL_C",
+                SpawnKind::Fork {
+                    binary: "self",
+                    inherit_listen_ports: vec![],
+                },
+            );
             Box::new(move |run| {
+                let cl_c_nonpie = cl_c_nonpie.clone();
+                let cl_c_pie = cl_c_pie.clone();
                 Box::pin(async move {
-                    let resp = run
-                        .send(
-                            &handle_a,
-                            Command::Fork {
-                                name: "CL_C".to_string(),
-                                binary: "nonpie".to_string(),
-                                inherit_listen_ports: vec![],
-                            },
-                        )
-                        .await;
-                    let fork_ok = matches!(&resp, Response::Ok { .. });
-                    if !fork_ok {
-                        let resp = run
-                            .send(
-                                &handle_a,
-                                Command::Fork {
-                                    name: "CL_C".to_string(),
-                                    binary: "self".to_string(),
-                                    inherit_listen_ports: vec![],
-                                },
-                            )
-                            .await;
+                    let resp = run.spawn_ephemeral(&cl_c_nonpie).await;
+                    let cl_c = if matches!(&resp, Response::Ok { .. }) {
+                        cl_c_nonpie
+                    } else {
+                        let resp = run.spawn_ephemeral(&cl_c_pie).await;
                         if !matches!(&resp, Response::Ok { .. }) {
                             return super::TestOutcome::new(
                                 "B",
@@ -496,9 +477,10 @@ fn register_child_listen_cross_connect_tests(reg: &mut Registry<'_>) {
                                 format!("fork failed: {resp:?}"),
                             );
                         }
-                    }
+                        cl_c_pie
+                    };
                     let resp = run
-                        .send(&handle_a, forward_to("CL_C", Command::NetListen { port }))
+                        .forward(&cl_c, Command::NetListen { port })
                         .await;
                     if !matches!(&resp, Response::Listening { .. }) {
                         return super::TestOutcome::new(
@@ -518,11 +500,9 @@ fn register_child_listen_cross_connect_tests(reg: &mut Registry<'_>) {
                         .await;
                     let cross_ok = matches!(&conn_resp, Response::Connected { echo } if echo == "child_listen_test");
                     let _ = run
-                        .send(&handle_a, forward_to("CL_C", Command::NetUnlisten { port }))
+                        .forward(&cl_c, Command::NetUnlisten { port })
                         .await;
-                    let _ = run
-                        .send(&handle_a, forward_to("CL_C", Command::Exit))
-                        .await;
+                    let _ = run.forward(&cl_c, Command::Exit).await;
                     super::TestOutcome::new("B", cross_ok, format!("{conn_resp:?}"))
                 })
             })

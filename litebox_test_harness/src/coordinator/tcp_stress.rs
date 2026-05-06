@@ -11,7 +11,7 @@
 //! - TF: full-duplex simultaneous read+write
 //! - TW: cross-worker concurrent TCP
 
-use super::agents::AgentName;
+use super::agents::{AgentName, SpawnKind};
 use super::registry::Registry;
 
 // ═══════════════════════════════════════════════════════════════════
@@ -454,14 +454,16 @@ fn register_tcp_cross_worker_concurrent_tests(reg: &mut Registry<'_>) {
                 .timeout(180)
                 .build(move |cx| {
                     let handle = cx.require(AgentName::A);
+                    let aremote = cx.declare_ephemeral(AgentName::A, "ARemote", SpawnKind::NonPie);
                     Box::new(move |run| {
+                        let aremote = aremote.clone();
                         Box::pin(async move {
-                            let resp = run.send(&handle, crate::protocol::Command::SpawnRemote { children: vec!["ARemote".to_string()] }).await;
+                            let resp = run.spawn_ephemeral(&aremote).await;
                             if !matches!(&resp, crate::protocol::Response::Ok { .. }) {
                                 return super::TestOutcome::new("A", false, "FAIL: SpawnRemote unavailable");
                             }
                             let resp = run
-                                .send(&handle, crate::protocol::Command::Forward { target: "ARemote".to_string(), inner: Box::new(crate::protocol::Command::NetListen { port: p }) })
+                                .forward(&aremote, crate::protocol::Command::NetListen { port: p })
                                 .await;
                             if !matches!(resp, crate::protocol::Response::Listening { .. }) {
                                 return super::TestOutcome::new("A", false, format!("listen failed: {resp:?}"));
@@ -471,7 +473,7 @@ fn register_tcp_cross_worker_concurrent_tests(reg: &mut Registry<'_>) {
                                 .await;
                             let pass = matches!(&resp, crate::protocol::Response::Ok { data: Some(d) } if d == &format!("success={count}/{count}"));
                             let _ = run
-                                .send(&handle, crate::protocol::Command::Forward { target: "ARemote".to_string(), inner: Box::new(crate::protocol::Command::NetUnlisten { port: p }) })
+                                .forward(&aremote, crate::protocol::Command::NetUnlisten { port: p })
                                 .await;
                             super::TestOutcome::new("A", pass, format!("{resp:?}"))
                         })
@@ -488,9 +490,11 @@ fn register_tcp_cross_worker_concurrent_tests(reg: &mut Registry<'_>) {
                 .timeout(180)
                 .build(move |cx| {
                     let handle = cx.require(AgentName::A);
+                    let aremote = cx.declare_ephemeral(AgentName::A, "ARemote", SpawnKind::NonPie);
                     Box::new(move |run| {
+                        let aremote = aremote.clone();
                         Box::pin(async move {
-                            let resp = run.send(&handle, crate::protocol::Command::SpawnRemote { children: vec!["ARemote".to_string()] }).await;
+                            let resp = run.spawn_ephemeral(&aremote).await;
                             if !matches!(&resp, crate::protocol::Response::Ok { .. }) {
                                 return super::TestOutcome::new("A", false, "FAIL: SpawnRemote unavailable");
                             }
@@ -499,7 +503,7 @@ fn register_tcp_cross_worker_concurrent_tests(reg: &mut Registry<'_>) {
                                 return super::TestOutcome::new("A", false, format!("listen failed: {resp:?}"));
                             }
                             let resp = run
-                                .send(&handle, crate::protocol::Command::Forward { target: "ARemote".to_string(), inner: Box::new(crate::protocol::Command::NetConnectMany { addr: format!("127.0.0.1:{p}"), data: "TW_LOCAL".to_string(), count, delay_ms: 0 }) })
+                                .forward(&aremote, crate::protocol::Command::NetConnectMany { addr: format!("127.0.0.1:{p}"), data: "TW_LOCAL".to_string(), count, delay_ms: 0 })
                                 .await;
                             let pass = matches!(&resp, crate::protocol::Response::Ok { data: Some(d) } if d == &format!("success={count}/{count}"));
                             let _ = run.send(&handle, crate::protocol::Command::NetUnlisten { port: p }).await;

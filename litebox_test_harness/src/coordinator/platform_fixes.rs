@@ -10,7 +10,7 @@
 use crate::protocol::{Command, Response};
 use tokio::time::Duration;
 
-use super::agents::AgentName;
+use super::agents::{AgentName, SpawnKind};
 use super::registry::Registry;
 
 const AGENTS: &[AgentName] = &[AgentName::A, AgentName::AA, AgentName::B];
@@ -2408,9 +2408,10 @@ pub(crate) fn register_subtree_kill_tests(reg: &mut Registry<'_>) {
     .timeout(SK_TEST_TIMEOUT_SECS)
     .build(move |cx| {
         let e = cx.require(AgentName::E);
-        let _np = cx.require(AgentName::NP);
+        let npx = cx.declare_ephemeral(AgentName::E, "NPx", SpawnKind::NonPie);
         Box::new(move |run| {
             let e = e.clone();
+            let npx = npx.clone();
             Box::pin(async move {
                 if crate::find_nonpie_binary().is_none() {
                     return super::TestOutcome::new(
@@ -2419,19 +2420,12 @@ pub(crate) fn register_subtree_kill_tests(reg: &mut Registry<'_>) {
                         "FAIL: nonpie binary not found — mount at /opt/nonpie",
                     );
                 }
-                let r = run
-                    .send(
-                        &e,
-                        Command::SpawnRemote {
-                            children: vec!["NPx".into()],
-                        },
-                    )
-                    .await;
+                let r = run.spawn_ephemeral(&npx).await;
                 if !matches!(r, Response::Ok { .. }) {
                     return super::TestOutcome::new(
                         "E",
                         false,
-                        format!("setup: SpawnRemote(NPx) failed: {r:?}"),
+                        format!("setup: spawn_ephemeral(NPx) failed: {r:?}"),
                     );
                 }
                 run_subtree_kill(run, &e).await
@@ -2451,11 +2445,12 @@ pub(crate) fn register_subtree_kill_tests(reg: &mut Registry<'_>) {
     .timeout(SK_TEST_TIMEOUT_SECS)
     .build(move |cx| {
         let e = cx.require(AgentName::E);
-        let ee = cx.require(AgentName::EE);
-        let _np = cx.require(AgentName::NP);
+        let _ee = cx.require(AgentName::EE);
+        // NPx is a non-PIE child of EE, two levels below E.
+        let npx = cx.declare_ephemeral(AgentName::EE, "NPx", SpawnKind::NonPie);
         Box::new(move |run| {
             let e = e.clone();
-            let ee = ee.clone();
+            let npx = npx.clone();
             Box::pin(async move {
                 if crate::find_nonpie_binary().is_none() {
                     return super::TestOutcome::new(
@@ -2465,21 +2460,14 @@ pub(crate) fn register_subtree_kill_tests(reg: &mut Registry<'_>) {
                     );
                 }
                 // EE was already spawned under E by spawn_tree when
-                // the test declared AgentName::EE. Just ask EE to
-                // SpawnRemote NPx as its non-PIE descendant.
-                let r = run
-                    .send(
-                        &ee,
-                        Command::SpawnRemote {
-                            children: vec!["NPx".into()],
-                        },
-                    )
-                    .await;
+                // the test declared AgentName::EE. Ask EE to spawn
+                // its own non-PIE descendant.
+                let r = run.spawn_ephemeral(&npx).await;
                 if !matches!(r, Response::Ok { .. }) {
                     return super::TestOutcome::new(
                         "E",
                         false,
-                        format!("setup: EE.SpawnRemote(NPx) failed: {r:?}"),
+                        format!("setup: spawn_ephemeral(NPx via EE) failed: {r:?}"),
                     );
                 }
                 run_subtree_kill(run, &e).await
@@ -2502,9 +2490,10 @@ pub(crate) fn register_subtree_kill_tests(reg: &mut Registry<'_>) {
     .timeout(SK_TEST_TIMEOUT_SECS)
     .build(move |cx| {
         let e = cx.require(AgentName::E);
-        let _np = cx.require(AgentName::NP);
+        let npx = cx.declare_ephemeral(AgentName::E, "NPx", SpawnKind::NonPie);
         Box::new(move |run| {
             let e = e.clone();
+            let npx = npx.clone();
             Box::pin(async move {
                 if crate::find_nonpie_binary().is_none() {
                     return super::TestOutcome::new(
@@ -2513,34 +2502,19 @@ pub(crate) fn register_subtree_kill_tests(reg: &mut Registry<'_>) {
                         "FAIL: nonpie binary not found — mount at /opt/nonpie",
                     );
                 }
-                let r = run
-                    .send(
-                        &e,
-                        Command::SpawnRemote {
-                            children: vec!["NPx".into()],
-                        },
-                    )
-                    .await;
+                let r = run.spawn_ephemeral(&npx).await;
                 if !matches!(r, Response::Ok { .. }) {
                     return super::TestOutcome::new(
                         "E",
                         false,
-                        format!("setup: SpawnRemote(NPx) failed: {r:?}"),
+                        format!("setup: spawn_ephemeral(NPx) failed: {r:?}"),
                     );
                 }
                 // Cooperative shutdown of the non-PIE descendant
                 // before we kill the root. Forward(Exit) reaches NPx
                 // via E. If the response stream desyncs we ignore —
                 // the goal is just to make NPx exit.
-                let _ = run
-                    .send(
-                        &e,
-                        Command::Forward {
-                            target: "NPx".into(),
-                            inner: Box::new(Command::Exit),
-                        },
-                    )
-                    .await;
+                let _ = run.forward(&npx, Command::Exit).await;
                 run_subtree_kill(run, &e).await
             })
         })

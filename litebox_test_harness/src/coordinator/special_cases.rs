@@ -8,7 +8,7 @@
 //! on the state left by the previous exec on the same agent (e.g., "run
 //! non-PIE, then run PIE — does the PIE see clean output?").
 
-use super::agents::AgentName;
+use super::agents::{AgentName, SpawnKind};
 use super::registry::Registry;
 use crate::protocol::{Command, Response};
 
@@ -19,18 +19,19 @@ macro_rules! typed_test {
             Box::new(move |$run| Box::pin(async move $body))
         });
     }};
-}
-
-macro_rules! spawn_remote_r {
-    ($run:ident, $a:ident) => {{
-        let _ = $run
-            .send(
-                &$a,
-                Command::SpawnRemote {
-                    children: vec!["R".to_string()],
-                },
-            )
-            .await;
+    // Variant with both static agents and ephemerals.
+    ($reg:ident, $suite:expr, $group:expr, $id:expr, timeout = $timeout:expr,
+     agents [$($handle:ident = $agent:expr),+ $(,)?],
+     ephemerals [$($eh:ident = ($parent:expr, $label:expr, $kind:expr)),+ $(,)?],
+     |$run:ident| $body:block) => {{
+        $reg.test($suite, $group, $id).timeout($timeout).build(move |cx| {
+            $(let $handle = cx.require($agent);)+
+            $(let $eh = cx.declare_ephemeral($parent, $label, $kind);)+
+            Box::new(move |$run| Box::pin(async move {
+                $(let $eh = $eh.clone();)+
+                $body
+            }))
+        });
     }};
 }
 
@@ -774,19 +775,14 @@ pub(crate) fn register_cross_worker(reg: &mut Registry<'_>) {
         "XW1.remote_write",
         timeout = 60,
         agents[a = AgentName::A],
+        ephemerals[r = (AgentName::A, "R", SpawnKind::NonPie)],
         |run| {
-            spawn_remote_r!(run, a);
+            let _ = run.spawn_ephemeral(&r).await;
             let resp = run
-                .send(
-                    &a,
-                    Command::Forward {
-                        target: "R".to_string(),
-                        inner: Box::new(Command::FsWrite {
+                .forward(&r, Command::FsWrite {
                             path: "/tmp/xw1.txt".to_string(),
                             data: "REMOTE_DATA".to_string(),
-                        }),
-                    },
-                )
+                        })
                 .await;
             let pass = matches!(&resp, Response::Ok { .. });
             super::TestOutcome::new("A", pass, format!("{resp:?}"))
@@ -800,19 +796,14 @@ pub(crate) fn register_cross_worker(reg: &mut Registry<'_>) {
         "XW1.local_read",
         timeout = 60,
         agents[a = AgentName::A],
+        ephemerals[r = (AgentName::A, "R", SpawnKind::NonPie)],
         |run| {
-            spawn_remote_r!(run, a);
+            let _ = run.spawn_ephemeral(&r).await;
             let setup_resp = run
-                .send(
-                    &a,
-                    Command::Forward {
-                        target: "R".to_string(),
-                        inner: Box::new(Command::FsWrite {
+                .forward(&r, Command::FsWrite {
                             path: "/tmp/xw1.txt".to_string(),
                             data: "REMOTE_DATA".to_string(),
-                        }),
-                    },
-                )
+                        })
                 .await;
             if !matches!(&setup_resp, Response::Ok { .. }) {
                 return super::TestOutcome::new(
@@ -863,8 +854,9 @@ pub(crate) fn register_cross_worker(reg: &mut Registry<'_>) {
         "XW2.remote_read",
         timeout = 60,
         agents[a = AgentName::A],
+        ephemerals[r = (AgentName::A, "R", SpawnKind::NonPie)],
         |run| {
-            spawn_remote_r!(run, a);
+            let _ = run.spawn_ephemeral(&r).await;
             let setup_resp = run
                 .send(
                     &a,
@@ -882,15 +874,9 @@ pub(crate) fn register_cross_worker(reg: &mut Registry<'_>) {
                 );
             }
             let resp = run
-                .send(
-                    &a,
-                    Command::Forward {
-                        target: "R".to_string(),
-                        inner: Box::new(Command::FsRead {
+                .forward(&r, Command::FsRead {
                             path: "/tmp/xw2.txt".to_string(),
-                        }),
-                    },
-                )
+                        })
                 .await;
             let pass = matches!(&resp, Response::Ok { data: Some(d), .. } if d == "LOCAL_DATA");
             super::TestOutcome::new("A", pass, format!("{resp:?}"))
@@ -904,18 +890,13 @@ pub(crate) fn register_cross_worker(reg: &mut Registry<'_>) {
         "XW3.remote_listen",
         timeout = 60,
         agents[a = AgentName::A],
+        ephemerals[r = (AgentName::A, "R", SpawnKind::NonPie)],
         |run| {
-            spawn_remote_r!(run, a);
+            let _ = run.spawn_ephemeral(&r).await;
             let resp = run
-                .send(
-                    &a,
-                    Command::Forward {
-                        target: "R".to_string(),
-                        inner: Box::new(Command::UnixListen {
+                .forward(&r, Command::UnixListen {
                             path: "/tmp/xw3.sock".to_string(),
-                        }),
-                    },
-                )
+                        })
                 .await;
             let pass = matches!(&resp, Response::UnixListening { .. });
             super::TestOutcome::new("A", pass, format!("{resp:?}"))
@@ -929,18 +910,13 @@ pub(crate) fn register_cross_worker(reg: &mut Registry<'_>) {
         "XW3.local_connect",
         timeout = 60,
         agents[a = AgentName::A],
+        ephemerals[r = (AgentName::A, "R", SpawnKind::NonPie)],
         |run| {
-            spawn_remote_r!(run, a);
+            let _ = run.spawn_ephemeral(&r).await;
             let listen_resp = run
-                .send(
-                    &a,
-                    Command::Forward {
-                        target: "R".to_string(),
-                        inner: Box::new(Command::UnixListen {
+                .forward(&r, Command::UnixListen {
                             path: "/tmp/xw3c.sock".to_string(),
-                        }),
-                    },
-                )
+                        })
                 .await;
             if !matches!(&listen_resp, Response::UnixListening { .. }) {
                 return super::TestOutcome::new(
@@ -991,8 +967,9 @@ pub(crate) fn register_cross_worker(reg: &mut Registry<'_>) {
         "XW4.remote_connect",
         timeout = 60,
         agents[a = AgentName::A],
+        ephemerals[r = (AgentName::A, "R", SpawnKind::NonPie)],
         |run| {
-            spawn_remote_r!(run, a);
+            let _ = run.spawn_ephemeral(&r).await;
             let listen_resp = run
                 .send(
                     &a,
@@ -1009,16 +986,10 @@ pub(crate) fn register_cross_worker(reg: &mut Registry<'_>) {
                 );
             }
             let resp = run
-                .send(
-                    &a,
-                    Command::Forward {
-                        target: "R".to_string(),
-                        inner: Box::new(Command::UnixConnect {
+                .forward(&r, Command::UnixConnect {
                             path: "/tmp/xw4c.sock".to_string(),
                             data: "XW_HELLO2".to_string(),
-                        }),
-                    },
-                )
+                        })
                 .await;
             let pass = matches!(&resp, Response::Connected { echo } if echo.contains("XW_HELLO2"));
             super::TestOutcome::new("A", pass, format!("{resp:?}"))
@@ -1032,16 +1003,11 @@ pub(crate) fn register_cross_worker(reg: &mut Registry<'_>) {
         "XW5.remote_tcp_listen",
         timeout = 60,
         agents[a = AgentName::A],
+        ephemerals[r = (AgentName::A, "R", SpawnKind::NonPie)],
         |run| {
-            spawn_remote_r!(run, a);
+            let _ = run.spawn_ephemeral(&r).await;
             let resp = run
-                .send(
-                    &a,
-                    Command::Forward {
-                        target: "R".to_string(),
-                        inner: Box::new(Command::NetListen { port: 0 }),
-                    },
-                )
+                .forward(&r, Command::NetListen { port: 0 })
                 .await;
             let pass = matches!(&resp, Response::Listening { .. });
             super::TestOutcome::new("A", pass, format!("{resp:?}"))
@@ -1055,16 +1021,11 @@ pub(crate) fn register_cross_worker(reg: &mut Registry<'_>) {
         "XW5.local_tcp_connect",
         timeout = 60,
         agents[a = AgentName::A],
+        ephemerals[r = (AgentName::A, "R", SpawnKind::NonPie)],
         |run| {
-            spawn_remote_r!(run, a);
+            let _ = run.spawn_ephemeral(&r).await;
             let listen_resp = run
-                .send(
-                    &a,
-                    Command::Forward {
-                        target: "R".to_string(),
-                        inner: Box::new(Command::NetListen { port: 0 }),
-                    },
-                )
+                .forward(&r, Command::NetListen { port: 0 })
                 .await;
             let port = match &listen_resp {
                 Response::Listening { port } => *port,
@@ -1088,13 +1049,7 @@ pub(crate) fn register_cross_worker(reg: &mut Registry<'_>) {
             let pass =
                 matches!(&resp, Response::Connected { echo } if echo.contains("XW_TCP_HELLO"));
             let _ = run
-                .send(
-                    &a,
-                    Command::Forward {
-                        target: "R".to_string(),
-                        inner: Box::new(Command::NetUnlisten { port }),
-                    },
-                )
+                .forward(&r, Command::NetUnlisten { port })
                 .await;
             super::TestOutcome::new("A", pass, format!("{resp:?}"))
         }
@@ -1121,8 +1076,9 @@ pub(crate) fn register_cross_worker(reg: &mut Registry<'_>) {
         "XW6.remote_tcp_connect",
         timeout = 60,
         agents[a = AgentName::A],
+        ephemerals[r = (AgentName::A, "R", SpawnKind::NonPie)],
         |run| {
-            spawn_remote_r!(run, a);
+            let _ = run.spawn_ephemeral(&r).await;
             let listen_resp = run.send(&a, Command::NetListen { port: 0 }).await;
             let port = match &listen_resp {
                 Response::Listening { port } => *port,
@@ -1135,16 +1091,10 @@ pub(crate) fn register_cross_worker(reg: &mut Registry<'_>) {
                 }
             };
             let resp = run
-                .send(
-                    &a,
-                    Command::Forward {
-                        target: "R".to_string(),
-                        inner: Box::new(Command::NetConnect {
+                .forward(&r, Command::NetConnect {
                             addr: format!("127.0.0.1:{port}"),
                             data: "XW_TCP_HELLO2".to_string(),
-                        }),
-                    },
-                )
+                        })
                 .await;
             let pass =
                 matches!(&resp, Response::Connected { echo } if echo.contains("XW_TCP_HELLO2"));
@@ -1301,36 +1251,37 @@ pub(crate) fn register_cross_worker(reg: &mut Registry<'_>) {
         "XW11.spawn_r2",
         timeout = 60,
         agents[b = AgentName::B],
+        ephemerals[r2 = (AgentName::B, "R2", SpawnKind::NonPie)],
         |run| {
-            let resp = run
-                .send(
-                    &b,
-                    Command::SpawnRemote {
-                        children: vec!["R2".to_string()],
-                    },
-                )
-                .await;
+            let resp = run.spawn_ephemeral(&r2).await;
             let pass = matches!(&resp, Response::Ok { .. });
             super::TestOutcome::new("B", pass, format!("{resp:?}"))
         }
     );
 
-    typed_test!(reg, "xworker", "cross_worker", "XW11.r2_tcp_connect", timeout = 60, agents [d3 = AgentName::D3, b = AgentName::B], |run| {
-        let listen_resp = run.send(&d3, Command::NetListen { port: 0 }).await;
-        let port = match &listen_resp {
-            Response::Listening { port } => *port,
-            _ => return super::TestOutcome::new("R2", false, format!("listen setup failed: {listen_resp:?}")),
-        };
-        let _ = run
-            .send(&b, Command::SpawnRemote { children: vec!["R2".to_string()] })
-            .await;
-        let resp = run
-            .send(&b, Command::Forward { target: "R2".to_string(), inner: Box::new(Command::NetConnect { addr: format!("127.0.0.1:{port}"), data: "XW11_LATE_SPAWN".to_string() }) })
-            .await;
-        let pass = matches!(&resp, Response::Connected { echo } if echo.contains("XW11_LATE_SPAWN"));
-        let _ = run.send(&d3, Command::NetUnlisten { port }).await;
-        super::TestOutcome::new("R2", pass, format!("{resp:?}"))
-    });
+    typed_test!(
+        reg,
+        "xworker",
+        "cross_worker",
+        "XW11.r2_tcp_connect",
+        timeout = 60,
+        agents[d3 = AgentName::D3, b = AgentName::B],
+        ephemerals[r2 = (AgentName::B, "R2", SpawnKind::NonPie)],
+        |run| {
+            let listen_resp = run.send(&d3, Command::NetListen { port: 0 }).await;
+            let port = match &listen_resp {
+                Response::Listening { port } => *port,
+                _ => return super::TestOutcome::new("R2", false, format!("listen setup failed: {listen_resp:?}")),
+            };
+            let _ = run.spawn_ephemeral(&r2).await;
+            let resp = run
+                .forward(&r2, Command::NetConnect { addr: format!("127.0.0.1:{port}"), data: "XW11_LATE_SPAWN".to_string() })
+                .await;
+            let pass = matches!(&resp, Response::Connected { echo } if echo.contains("XW11_LATE_SPAWN"));
+            let _ = run.send(&d3, Command::NetUnlisten { port }).await;
+            super::TestOutcome::new("R2", pass, format!("{resp:?}"))
+        }
+    );
 }
 
 // Register pipe EOF tests.
