@@ -8,189 +8,146 @@
 //! on the state left by the previous exec on the same agent (e.g., "run
 //! non-PIE, then run PIE — does the PIE see clean output?").
 
+use super::agents::AgentName;
+use super::registry::Registry;
 use crate::protocol::{Command, Response};
+
+macro_rules! typed_test {
+    ($reg:ident, $suite:expr, $group:expr, $id:expr, timeout = $timeout:expr, agents [$($handle:ident = $agent:expr),+ $(,)?], |$run:ident| $body:block) => {{
+        $reg.test($suite, $group, $id).timeout($timeout).build(move |cx| {
+            $(let $handle = cx.require($agent);)+
+            Box::new(move |$run| Box::pin(async move $body))
+        });
+    }};
+}
+
+macro_rules! spawn_remote_r {
+    ($run:ident, $a:ident) => {{
+        let _ = $run
+            .send(
+                &$a,
+                Command::SpawnRemote {
+                    children: vec!["R".to_string()],
+                },
+            )
+            .await;
+    }};
+}
+
 /// Register netlink tests. Each test is self-contained: one exec + check.
-pub(super) fn register_netlink(tests: &mut Vec<super::Test>) {
-    // Helper: create a test that execs a subcommand and checks stdout.
-    let _nl =
-        |id: &str, args: Vec<String>, timeout_secs: u64, check: fn(&str) -> bool| -> super::Test {
-            let id = id.to_string();
-            let _id2 = id.clone();
-            super::Test {
-                suite: "matrix",
-                group: "netlink",
-                id,
-                xfail: None,
-                timeout_secs: 60,
-                declared_agents: Vec::new(),
-                run: Box::new(move |r| {
-                    Box::pin(async move {
-                        let cmd = if timeout_secs > 0 {
-                            super::exec_timeout(args, timeout_secs)
-                        } else {
-                            super::exec(args)
-                        };
-                        let resp = r.send("A", cmd).await;
-                        let pass = matches!(
-                            &resp,
-                            crate::protocol::Response::ExecResult { exit_code: 0, stdout, .. }
-                                if check(stdout)
-                        );
-                        super::TestOutcome::new("A", pass, format!("{resp:?}"))
-                    })
-                }),
-            }
-        };
-
-    let _exe = || {
-        std::env::current_exe()
-            .unwrap()
-            .to_string_lossy()
-            .to_string()
-    };
-    // We can't call r.self_exe here (no runner yet), so tests will
-    // use the self_exe from the runner. Let's capture it differently.
-    // Actually, the closure captures the runner, so we can read self_exe there.
-    // But our helper doesn't have the runner. Let's restructure:
-
-    // Each test captures its args as a closure over the runner.
-    let self_exe_test =
+pub(super) fn register_netlink(reg: &mut Registry<'_>) {
+    let mut self_exe_test =
         |id: &str, subcmd: &str, arg: &str, timeout: u64, check: fn(&str) -> bool| {
             let id = id.to_string();
             let subcmd = subcmd.to_string();
             let arg = arg.to_string();
-            super::Test {
-                suite: "matrix",
-                group: "netlink",
-                id: id.clone(),
-                xfail: None,
-                timeout_secs: 60,
-                declared_agents: Vec::new(),
-                run: Box::new(move |r| {
-                    let self_exe = r.self_exe.clone();
-                    Box::pin(async move {
-                        let args = vec![self_exe, subcmd, arg];
-                        let cmd = if timeout > 0 {
-                            super::exec_timeout(args, timeout)
-                        } else {
-                            super::exec(args)
-                        };
-                        let resp = r.send("A", cmd).await;
-                        let pass = matches!(
-                            &resp,
-                            crate::protocol::Response::ExecResult { exit_code: 0, stdout, .. }
-                                if check(stdout)
-                        );
-                        super::TestOutcome::new("A", pass, format!("{resp:?}"))
-                    })
-                }),
-            }
+            typed_test!(
+                reg,
+                "matrix",
+                "netlink",
+                id,
+                timeout = 60,
+                agents[a = AgentName::A],
+                |run| {
+                    let self_exe = run.self_exe().to_string();
+                    let args = vec![self_exe, subcmd, arg];
+                    let cmd = if timeout > 0 {
+                        super::exec_timeout(args, timeout)
+                    } else {
+                        super::exec(args)
+                    };
+                    let resp = run.send(&a, cmd).await;
+                    let pass = matches!(
+                        &resp,
+                        Response::ExecResult { exit_code: 0, stdout, .. } if check(stdout)
+                    );
+                    super::TestOutcome::new("A", pass, format!("{resp:?}"))
+                }
+            );
         };
 
-    tests.push(self_exe_test(
-        "NL1.netlink_socket",
-        "getifaddrs-test",
-        "socket",
-        0,
-        |s| s.contains("NETLINK_SOCKET_OK"),
-    ));
-    tests.push(self_exe_test(
-        "NL2.netlink_bind",
-        "getifaddrs-test",
-        "bind",
-        0,
-        |s| s.contains("NETLINK_BIND_OK"),
-    ));
-    tests.push(self_exe_test(
+    self_exe_test("NL1.netlink_socket", "getifaddrs-test", "socket", 0, |s| {
+        s.contains("NETLINK_SOCKET_OK")
+    });
+    self_exe_test("NL2.netlink_bind", "getifaddrs-test", "bind", 0, |s| {
+        s.contains("NETLINK_BIND_OK")
+    });
+    self_exe_test(
         "NL3.netlink_getlink",
         "getifaddrs-test",
         "getlink",
         0,
         |s| s.contains("NETLINK_GETLINK_OK"),
-    ));
-    tests.push(self_exe_test(
+    );
+    self_exe_test(
         "NL4.netlink_getaddr",
         "getifaddrs-test",
         "getaddr",
         0,
         |s| s.contains("NETLINK_GETADDR_OK"),
-    ));
-    tests.push(self_exe_test(
+    );
+    self_exe_test(
         "NL3b.sendmsg_recvmsg",
         "getifaddrs-test",
         "sendmsg",
         0,
         |s| s.contains("NETLINK_SENDMSG_RECVMSG_OK"),
-    ));
-    tests.push(self_exe_test(
+    );
+    self_exe_test(
         "NL3c.double_request",
         "getifaddrs-test",
         "double",
         30,
         |s| s.contains("NETLINK_DOUBLE_OK"),
-    ));
-    tests.push(self_exe_test(
+    );
+    self_exe_test(
         "NL3d.peek_trunc",
         "getifaddrs-test",
         "peek-trunc",
         30,
         |s| s.contains("NETLINK_PEEK_TRUNC_OK"),
-    ));
-    tests.push(self_exe_test(
-        "NL5.getifaddrs_full",
-        "getifaddrs-test",
-        "full",
-        30,
-        |s| s.contains("GETIFADDRS_OK"),
-    ));
+    );
+    self_exe_test("NL5.getifaddrs_full", "getifaddrs-test", "full", 30, |s| {
+        s.contains("GETIFADDRS_OK")
+    });
 
-    // X48: Node.js os.networkInterfaces()
-    {
-        let id = "X48.node_networkInterfaces".to_string();
-        tests.push(super::Test {
-            suite: "matrix",
-            group: "netlink",
-            id: id.clone(),
-            xfail: None,
-            timeout_secs: 60,
-            declared_agents: Vec::new(),
-            run: Box::new(move |r| {
-                Box::pin(async move {
-                    let resp = r
-                        .send(
-                            "A",
-                            super::exec_timeout(
-                                vec![
-                                    "/usr/local/bin/node".into(),
-                                    "-e".into(),
-                                    "try { const r = require('os').networkInterfaces(); console.log('NETIF_OK:' + Object.keys(r).length); } catch(e) { console.log('NETIF_ERR:' + e.code); }".into(),
-                                ],
-                                30,
-                            ),
-                        )
-                        .await;
-                    let pass = matches!(
-                        &resp,
-                        crate::protocol::Response::ExecResult { exit_code: 0, stdout, .. }
-                            if stdout.contains("NETIF_OK:") || stdout.contains("NETIF_ERR:")
-                    );
-                    super::TestOutcome::new("A", pass, format!("{resp:?}"))
-                })
-            }),
-        });
-    }
+    self_exe_test("NL6.mac_address", "unix-socket-test", "mac", 30, |s| {
+        s.contains("NL6_MAC_CHECK")
+    });
 
-    // NL6: MAC address via getifaddrs
-    tests.push(self_exe_test(
-        "NL6.mac_address",
-        "unix-socket-test",
-        "mac",
-        30,
-        |s| s.contains("NL6_MAC_CHECK"),
-    ));
+    typed_test!(
+        reg,
+        "matrix",
+        "netlink",
+        "X48.node_networkInterfaces",
+        timeout = 60,
+        agents[a = AgentName::A],
+        |run| {
+            let resp = run
+            .send(
+                &a,
+                super::exec_timeout(
+                    vec![
+                        "/usr/local/bin/node".into(),
+                        "-e".into(),
+                        "try { const r = require('os').networkInterfaces(); console.log('NETIF_OK:' + Object.keys(r).length); } catch(e) { console.log('NETIF_ERR:' + e.code); }".into(),
+                    ],
+                    30,
+                ),
+            )
+            .await;
+            let pass = matches!(
+                &resp,
+                Response::ExecResult { exit_code: 0, stdout, .. }
+                    if stdout.contains("NETIF_OK:") || stdout.contains("NETIF_ERR:")
+            );
+            super::TestOutcome::new("A", pass, format!("{resp:?}"))
+        }
+    );
 }
+
 /// Register IPv6 network tests.
-pub(super) fn register_net_ipv6(tests: &mut Vec<super::Test>) {
+pub(super) fn register_net_ipv6(reg: &mut Registry<'_>) {
     let cases: &[(&str, &str)] = &[
         ("NET1.ipv6_socket", "ipv6-socket"),
         ("NET2.ipv6_listen", "ipv6-listen"),
@@ -201,29 +158,31 @@ pub(super) fn register_net_ipv6(tests: &mut Vec<super::Test>) {
     for &(name, sub) in cases {
         let id = name.to_string();
         let sub = sub.to_string();
-        tests.push(super::Test {
-            suite: "matrix",
-            group: "net_ipv6",
+        typed_test!(
+            reg,
+            "matrix",
+            "net_ipv6",
             id,
-            xfail: None,
-            timeout_secs: 60,
-            declared_agents: Vec::new(),
-            run: Box::new(move |r| {
-                let self_exe = r.self_exe.clone();
-                Box::pin(async move {
-                    let resp = r
-                        .send("A", super::exec_timeout(vec![self_exe, "net-test".into(), sub], 10))
-                        .await;
-                    let pass = matches!(&resp, crate::protocol::Response::ExecResult { stdout, .. } if stdout.contains("_OK"));
-                    super::TestOutcome::new("A", pass, format!("{resp:?}"))
-                })
-            }),
-        });
+            timeout = 60,
+            agents[a = AgentName::A],
+            |run| {
+                let self_exe = run.self_exe().to_string();
+                let resp = run
+                    .send(
+                        &a,
+                        super::exec_timeout(vec![self_exe, "net-test".into(), sub], 10),
+                    )
+                    .await;
+                let pass =
+                    matches!(&resp, Response::ExecResult { stdout, .. } if stdout.contains("_OK"));
+                super::TestOutcome::new("A", pass, format!("{resp:?}"))
+            }
+        );
     }
 }
 
 /// Register terminal ioctl tests.
-pub(super) fn register_terminal_ioctl(tests: &mut Vec<super::Test>) {
+pub(super) fn register_terminal_ioctl(reg: &mut Registry<'_>) {
     let ops = ["tcgets", "tcsets", "tcsetsw", "tcsetsf", "tiocgwinsz"];
     let fds = [0, 1, 2];
     for op in &ops {
@@ -231,135 +190,138 @@ pub(super) fn register_terminal_ioctl(tests: &mut Vec<super::Test>) {
             let id = format!("TERM.{op}_fd{fd}");
             let op = op.to_string();
             let fd_str = fd.to_string();
-            tests.push(super::Test {
-                suite: "matrix",
-                group: "terminal_ioctl",
+            typed_test!(
+                reg,
+                "matrix",
+                "terminal_ioctl",
                 id,
-                xfail: None,
-                timeout_secs: 60,
-                declared_agents: Vec::new(),
-                run: Box::new(move |r| {
-                    let self_exe = r.self_exe.clone();
-                    Box::pin(async move {
-                        let resp = r
-                            .send(
-                                "A",
-                                super::exec_timeout(
-                                    vec![self_exe, "exit-test".into(), "term".into(), op, fd_str],
-                                    8,
-                                ),
-                            )
-                            .await;
-                        let pass = matches!(
-                            &resp,
-                            crate::protocol::Response::ExecResult { exit_code: 0 | 1, stdout, .. }
-                                if stdout.contains("TERM_OK") || stdout.contains("TERM_ERR")
-                        );
-                        super::TestOutcome::new("A", pass, format!("{resp:?}"))
-                    })
-                }),
-            });
+                timeout = 60,
+                agents[a = AgentName::A],
+                |run| {
+                    let self_exe = run.self_exe().to_string();
+                    let resp = run
+                        .send(
+                            &a,
+                            super::exec_timeout(
+                                vec![self_exe, "exit-test".into(), "term".into(), op, fd_str],
+                                8,
+                            ),
+                        )
+                        .await;
+                    let pass = matches!(
+                        &resp,
+                        Response::ExecResult { exit_code: 0 | 1, stdout, .. }
+                            if stdout.contains("TERM_OK") || stdout.contains("TERM_ERR")
+                    );
+                    super::TestOutcome::new("A", pass, format!("{resp:?}"))
+                }
+            );
         }
     }
 }
 
 /// Register Node.js exit tests.
-pub(super) fn register_node_exit(tests: &mut Vec<super::Test>) {
-    let _node_tests: &[(
-        &str,
-        Vec<&str>,
-        Box<dyn Fn(&crate::protocol::Response) -> bool + Send + Sync>,
-    )] = &[];
-    // Simpler: just push each test individually.
-
-    tests.push(super::Test {
-        suite: "fork", group: "node_exit",
-        id: "EX6.node_version_exit".into(), xfail: None,
-            timeout_secs: 60,
-        declared_agents: Vec::new(),
-        run: Box::new(|r| Box::pin(async move {
-            let resp = r.send("A", super::exec_timeout(vec!["/usr/local/bin/node".into(), "--version".into()], 10)).await;
-            let pass = matches!(&resp, crate::protocol::Response::ExecResult { exit_code: 0, stdout, .. } if stdout.starts_with('v'));
+pub(super) fn register_node_exit(reg: &mut Registry<'_>) {
+    typed_test!(
+        reg,
+        "fork",
+        "node_exit",
+        "EX6.node_version_exit",
+        timeout = 60,
+        agents[a = AgentName::A],
+        |run| {
+            let resp = run
+                .send(
+                    &a,
+                    super::exec_timeout(vec!["/usr/local/bin/node".into(), "--version".into()], 10),
+                )
+                .await;
+            let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout.starts_with('v'));
             super::TestOutcome::new("A", pass, format!("{resp:?}"))
-        })),
-    });
+        }
+    );
 
-    tests.push(super::Test {
-        suite: "fork",
-        group: "node_exit",
-        id: "EX7.node_process_exit".into(),
-        xfail: None,
-        timeout_secs: 60,
-        declared_agents: Vec::new(),
-        run: Box::new(|r| {
-            Box::pin(async move {
-                let resp = r
-                    .send(
-                        "A",
-                        super::exec_timeout(
-                            vec![
-                                "/usr/local/bin/node".into(),
-                                "-e".into(),
-                                "process.exit(0)".into(),
-                            ],
-                            10,
-                        ),
-                    )
-                    .await;
-                let pass = matches!(
-                    &resp,
-                    crate::protocol::Response::ExecResult { exit_code: 0, .. }
-                );
-                super::TestOutcome::new("A", pass, format!("{resp:?}"))
-            })
-        }),
-    });
-
-    tests.push(super::Test {
-        suite: "fork",
-        group: "node_exit",
-        id: "EX8.node_exit_code".into(),
-        xfail: None,
-        timeout_secs: 60,
-        declared_agents: Vec::new(),
-        run: Box::new(|r| {
-            Box::pin(async move {
-                let resp = r
-                    .send(
-                        "A",
-                        super::exec_timeout(
-                            vec![
-                                "/usr/local/bin/node".into(),
-                                "-e".into(),
-                                "process.exit(42)".into(),
-                            ],
-                            10,
-                        ),
-                    )
-                    .await;
-                let pass = matches!(
-                    &resp,
-                    crate::protocol::Response::ExecResult { exit_code: 42, .. }
-                );
-                super::TestOutcome::new("A", pass, format!("{resp:?}"))
-            })
-        }),
-    });
-
-    tests.push(super::Test {
-        suite: "fork", group: "node_exit",
-        id: "EX9.node_console_exit".into(), xfail: None,
-            timeout_secs: 60,
-        declared_agents: Vec::new(),
-        run: Box::new(|r| Box::pin(async move {
-            let resp = r.send("A", super::exec_timeout(vec!["/usr/local/bin/node".into(), "-e".into(), "console.log(\"NODE_EXIT_OK\")".into()], 10)).await;
-            let pass = matches!(&resp, crate::protocol::Response::ExecResult { exit_code: 0, stdout, .. } if stdout.contains("NODE_EXIT_OK"));
+    typed_test!(
+        reg,
+        "fork",
+        "node_exit",
+        "EX7.node_process_exit",
+        timeout = 60,
+        agents[a = AgentName::A],
+        |run| {
+            let resp = run
+                .send(
+                    &a,
+                    super::exec_timeout(
+                        vec![
+                            "/usr/local/bin/node".into(),
+                            "-e".into(),
+                            "process.exit(0)".into(),
+                        ],
+                        10,
+                    ),
+                )
+                .await;
+            let pass = matches!(&resp, Response::ExecResult { exit_code: 0, .. });
             super::TestOutcome::new("A", pass, format!("{resp:?}"))
-        })),
-    });
+        }
+    );
+
+    typed_test!(
+        reg,
+        "fork",
+        "node_exit",
+        "EX8.node_exit_code",
+        timeout = 60,
+        agents[a = AgentName::A],
+        |run| {
+            let resp = run
+                .send(
+                    &a,
+                    super::exec_timeout(
+                        vec![
+                            "/usr/local/bin/node".into(),
+                            "-e".into(),
+                            "process.exit(42)".into(),
+                        ],
+                        10,
+                    ),
+                )
+                .await;
+            let pass = matches!(&resp, Response::ExecResult { exit_code: 42, .. });
+            super::TestOutcome::new("A", pass, format!("{resp:?}"))
+        }
+    );
+
+    typed_test!(
+        reg,
+        "fork",
+        "node_exit",
+        "EX9.node_console_exit",
+        timeout = 60,
+        agents[a = AgentName::A],
+        |run| {
+            let resp = run
+                .send(
+                    &a,
+                    super::exec_timeout(
+                        vec![
+                            "/usr/local/bin/node".into(),
+                            "-e".into(),
+                            "console.log(\"NODE_EXIT_OK\")".into(),
+                        ],
+                        10,
+                    ),
+                )
+                .await;
+            let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout.contains("NODE_EXIT_OK"));
+            super::TestOutcome::new("A", pass, format!("{resp:?}"))
+        }
+    );
 }
+
 /// Register FS I/O matrix tests.
-pub(super) fn register_fs_io(tests: &mut Vec<super::Test>) {
+pub(super) fn register_fs_io(reg: &mut Registry<'_>) {
     let ops: &[&str] = &[
         "write-read",
         "append-read",
@@ -376,25 +338,31 @@ pub(super) fn register_fs_io(tests: &mut Vec<super::Test>) {
             let id = format!("FS.{op}.{dir}");
             let op = op.to_string();
             let path = path.to_string();
-            tests.push(super::Test {
-                suite: "matrix", group: "fs_io", id, xfail: None,
-            timeout_secs: 60,
-                declared_agents: Vec::new(),
-                run: Box::new(move |r| {
-                    let self_exe = r.self_exe.clone();
-                    Box::pin(async move {
-                        let resp = r.send("A", super::exec_timeout(
-                            vec![self_exe, "fs-test".into(), "io".into(), op, path], 15,
-                        )).await;
-                        let pass = matches!(&resp, crate::protocol::Response::ExecResult { stdout, .. } if stdout.contains("FS_OK"));
-                        super::TestOutcome::new("A", pass, format!("{resp:?}"))
-                    })
-                }),
-            });
+            typed_test!(
+                reg,
+                "matrix",
+                "fs_io",
+                id,
+                timeout = 60,
+                agents[a = AgentName::A],
+                |run| {
+                    let self_exe = run.self_exe().to_string();
+                    let resp = run
+                        .send(
+                            &a,
+                            super::exec_timeout(
+                                vec![self_exe, "fs-test".into(), "io".into(), op, path],
+                                15,
+                            ),
+                        )
+                        .await;
+                    let pass = matches!(&resp, Response::ExecResult { stdout, .. } if stdout.contains("FS_OK"));
+                    super::TestOutcome::new("A", pass, format!("{resp:?}"))
+                }
+            );
         }
     }
 
-    // Exec-write and exec-open-read
     for &mode in &["exec-write", "exec-open-read"] {
         let prefix = if mode == "exec-write" { "exec" } else { "open" };
         for &bin in &["pie", "nonpie"] {
@@ -404,27 +372,34 @@ pub(super) fn register_fs_io(tests: &mut Vec<super::Test>) {
             let mode = mode.to_string();
             let bin = bin.to_string();
             let path = path.to_string();
-            tests.push(super::Test {
-                suite: "matrix", group: "fs_io", id, xfail: None,
-            timeout_secs: 60,
-                declared_agents: Vec::new(),
-                run: Box::new(move |r| {
-                    let self_exe = r.self_exe.clone();
-                    Box::pin(async move {
-                        let resp = r.send("A", super::exec_timeout(
-                            vec![self_exe, "fs-test".into(), mode, bin, path], 30,
-                        )).await;
-                        let pass = matches!(&resp, crate::protocol::Response::ExecResult { stdout, .. } if stdout.contains("FS_OK"));
-                        super::TestOutcome::new("A", pass, format!("{resp:?}"))
-                    })
-                }),
-            });
+            typed_test!(
+                reg,
+                "matrix",
+                "fs_io",
+                id,
+                timeout = 60,
+                agents[a = AgentName::A],
+                |run| {
+                    let self_exe = run.self_exe().to_string();
+                    let resp = run
+                        .send(
+                            &a,
+                            super::exec_timeout(
+                                vec![self_exe, "fs-test".into(), mode, bin, path],
+                                30,
+                            ),
+                        )
+                        .await;
+                    let pass = matches!(&resp, Response::ExecResult { stdout, .. } if stdout.contains("FS_OK"));
+                    super::TestOutcome::new("A", pass, format!("{resp:?}"))
+                }
+            );
         }
     }
 }
 
 /// Register capture-pipe fork tests.
-pub(super) fn register_capture_pipe(tests: &mut Vec<super::Test>) {
+pub(super) fn register_capture_pipe(reg: &mut Registry<'_>) {
     const CMD_TYPES: &[&str] = &[
         "simple",
         "pipe",
@@ -435,36 +410,45 @@ pub(super) fn register_capture_pipe(tests: &mut Vec<super::Test>) {
         "subshell_continue",
     ];
     const SHELLS: &[&str] = &["sh", "bash"];
-    const CP_AGENTS: &[&str] = &["A", "AA"];
+    const CP_AGENTS: &[AgentName] = &[AgentName::A, AgentName::AA];
 
     for &agent in CP_AGENTS {
         for &shell in SHELLS {
             for &cmd_type in CMD_TYPES {
                 let id = format!("CP.{cmd_type}.{shell}.{agent}");
-                let agent = agent.to_string();
+                let agent_name = agent;
+                let agent_label = agent.to_string();
                 let shell = shell.to_string();
                 let cmd_type = cmd_type.to_string();
-                tests.push(super::Test {
-                    suite: "fork", group: "capture_pipe", id, xfail: None,
-            timeout_secs: 60,
-                    declared_agents: Vec::new(),
-                    run: Box::new(move |r| {
-                        let self_exe = r.self_exe.clone();
-                        Box::pin(async move {
-                            let resp = r.send(&agent, super::exec_timeout(
-                                vec![self_exe, "capture-pipe".into(), cmd_type, shell], 10,
-                            )).await;
-                            let pass = matches!(&resp, crate::protocol::Response::ExecResult { stdout, .. } if stdout.contains("CP_OK"));
-                            super::TestOutcome::new(&agent, pass, format!("{resp:?}"))
-                        })
-                    }),
-                });
+                typed_test!(
+                    reg,
+                    "fork",
+                    "capture_pipe",
+                    id,
+                    timeout = 60,
+                    agents[handle = agent_name],
+                    |run| {
+                        let self_exe = run.self_exe().to_string();
+                        let resp = run
+                            .send(
+                                &handle,
+                                super::exec_timeout(
+                                    vec![self_exe, "capture-pipe".into(), cmd_type, shell],
+                                    10,
+                                ),
+                            )
+                            .await;
+                        let pass = matches!(&resp, Response::ExecResult { stdout, .. } if stdout.contains("CP_OK"));
+                        super::TestOutcome::new(&agent_label, pass, format!("{resp:?}"))
+                    }
+                );
             }
         }
     }
 }
+
 /// Register stdin-piped script tests.
-pub(super) fn register_stdin_script(tests: &mut Vec<super::Test>) {
+pub(super) fn register_stdin_script(reg: &mut Registry<'_>) {
     const SCRIPTS: &[(&str, &str, &str)] = &[
         (
             "cmd_subst",
@@ -508,41 +492,47 @@ pub(super) fn register_stdin_script(tests: &mut Vec<super::Test>) {
         ),
     ];
     const SHELLS: &[&str] = &["sh", "bash"];
-    const SS_AGENTS: &[&str] = &["A", "AA"];
+    const SS_AGENTS: &[AgentName] = &[AgentName::A, AgentName::AA];
 
     for &agent in SS_AGENTS {
         for &shell in SHELLS {
             for &(name, script, expected) in SCRIPTS {
                 let id = format!("SS.{name}.{shell}.{agent}");
-                let agent = agent.to_string();
+                let agent_name = agent;
+                let agent_label = agent.to_string();
                 let shell = shell.to_string();
                 let script = script.to_string();
                 let expected = expected.to_string();
-                tests.push(super::Test {
-                    suite: "shell", group: "stdin_script", id, xfail: None,
-            timeout_secs: 60,
-                    declared_agents: Vec::new(),
-                    run: Box::new(move |r| {
-                        Box::pin(async move {
-                            let resp = r.send(&agent, crate::protocol::Command::Exec {
-                                args: vec![shell],
-                                timeout_secs: Some(10),
-                                stdin: Some(script),
-                                background: false,
-                            }).await;
-                            let pass = matches!(&resp, crate::protocol::Response::ExecResult { stdout, .. } if stdout.contains(&*expected));
-                            super::TestOutcome::new(&agent, pass, format!("{resp:?}"))
-                        })
-                    }),
-                });
+                typed_test!(
+                    reg,
+                    "shell",
+                    "stdin_script",
+                    id,
+                    timeout = 60,
+                    agents[handle = agent_name],
+                    |run| {
+                        let resp = run
+                            .send(
+                                &handle,
+                                Command::Exec {
+                                    args: vec![shell],
+                                    timeout_secs: Some(10),
+                                    stdin: Some(script),
+                                    background: false,
+                                },
+                            )
+                            .await;
+                        let pass = matches!(&resp, Response::ExecResult { stdout, .. } if stdout.contains(&*expected));
+                        super::TestOutcome::new(&agent_label, pass, format!("{resp:?}"))
+                    }
+                );
             }
         }
     }
 }
 
 // Register unix socket tests.
-pub(crate) fn register_unix_socket(tests: &mut Vec<super::Test>) {
-    // Simple exec tests on agent A
+pub(crate) fn register_unix_socket(reg: &mut Registry<'_>) {
     let simple_tests: &[(&str, &str, &str)] = &[
         (
             "US1.cross_process_unix",
@@ -559,1626 +549,1264 @@ pub(crate) fn register_unix_socket(tests: &mut Vec<super::Test>) {
         let id = name.to_string();
         let sub = sub.to_string();
         let expected = expected.to_string();
-        tests.push(super::Test {
-            suite: "xworker",
-            group: "unix_socket",
+        typed_test!(
+            reg,
+            "xworker",
+            "unix_socket",
             id,
-            xfail: None,
-            timeout_secs: 60,
-            declared_agents: Vec::new(),
-            run: Box::new(move |r| {
-                let self_exe = r.self_exe.clone();
-                Box::pin(async move {
-                    let resp = r
-                        .send(
-                            "A",
-                            super::exec_timeout(vec![self_exe, "unix-socket-test".into(), sub], 10),
-                        )
-                        .await;
-                    let pass = matches!(
-                        &resp,
-                        crate::protocol::Response::ExecResult { exit_code: 0, stdout, .. }
-                            if stdout.contains(&*expected)
-                    );
-                    super::TestOutcome::new("A", pass, format!("{resp:?}"))
-                })
-            }),
-        });
+            timeout = 60,
+            agents[a = AgentName::A],
+            |run| {
+                let self_exe = run.self_exe().to_string();
+                let resp = run
+                    .send(
+                        &a,
+                        super::exec_timeout(vec![self_exe, "unix-socket-test".into(), sub], 10),
+                    )
+                    .await;
+                let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout.contains(&*expected));
+                super::TestOutcome::new("A", pass, format!("{resp:?}"))
+            }
+        );
     }
 
-    // Fork agents: cross-process on different agents
-    for &agent in &["A", "AA", "B"] {
+    for &agent in &[AgentName::A, AgentName::AA, AgentName::B] {
         let id = format!("UF.fork_unix.{agent}");
-        let agent_s = agent.to_string();
-        tests.push(super::Test {
-            suite: "xworker",
-            group: "unix_socket",
+        let agent_name = agent;
+        let agent_label = agent.to_string();
+        typed_test!(
+            reg,
+            "xworker",
+            "unix_socket",
             id,
-            xfail: None,
-            timeout_secs: 60,
-            declared_agents: Vec::new(),
-            run: Box::new(move |r| {
-                let self_exe = r.self_exe.clone();
-                Box::pin(async move {
-                    let resp = r
-                        .send(
-                            &agent_s,
-                            super::exec_timeout(
-                                vec![self_exe, "unix-socket-test".into(), "cross-process".into()],
-                                15,
-                            ),
-                        )
-                        .await;
-                    let pass = matches!(
-                        &resp,
-                        crate::protocol::Response::ExecResult { exit_code: 0, stdout, .. }
-                            if stdout.contains("US1_CROSS_PROCESS_OK")
-                    );
-                    super::TestOutcome::new(&agent_s, pass, format!("{resp:?}"))
-                })
-            }),
-        });
+            timeout = 60,
+            agents[handle = agent_name],
+            |run| {
+                let self_exe = run.self_exe().to_string();
+                let resp = run
+                    .send(
+                        &handle,
+                        super::exec_timeout(
+                            vec![self_exe, "unix-socket-test".into(), "cross-process".into()],
+                            15,
+                        ),
+                    )
+                    .await;
+                let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout.contains("US1_CROSS_PROCESS_OK"));
+                super::TestOutcome::new(&agent_label, pass, format!("{resp:?}"))
+            }
+        );
     }
 
-    // Socketpair write/read across agents
-    for &agent in &["A", "AA", "B", "D3", "D4", "NP"] {
-        // write direction
+    for &agent in &[
+        AgentName::A,
+        AgentName::AA,
+        AgentName::B,
+        AgentName::D3,
+        AgentName::D4,
+        AgentName::NP,
+    ] {
+        let agent_name = agent;
+        let agent_label = agent.to_string();
         let id = format!("US6.socketpair_write.{agent}");
-        let agent_s = agent.to_string();
-        tests.push(super::Test {
-            suite: "xworker",
-            group: "unix_socket",
+        typed_test!(
+            reg,
+            "xworker",
+            "unix_socket",
             id,
-            xfail: None,
-            timeout_secs: 60,
-            declared_agents: Vec::new(),
-            run: Box::new(move |r| {
-                let self_exe = r.self_exe.clone();
-                Box::pin(async move {
-                    let resp = r
-                        .send(
-                            &agent_s,
-                            super::exec_timeout(
-                                vec![
-                                    self_exe,
-                                    "unix-socket-test".into(),
-                                    "socketpair-fork-write".into(),
-                                ],
-                                15,
-                            ),
-                        )
-                        .await;
-                    let pass = matches!(
-                        &resp,
-                        crate::protocol::Response::ExecResult { exit_code: 0, stdout, .. }
-                            if stdout.contains("US6_SOCKETPAIR_FORK_OK")
-                    );
-                    super::TestOutcome::new(&agent_s, pass, format!("{resp:?}"))
-                })
-            }),
-        });
+            timeout = 60,
+            agents[handle = agent_name],
+            |run| {
+                let self_exe = run.self_exe().to_string();
+                let resp = run
+                    .send(
+                        &handle,
+                        super::exec_timeout(
+                            vec![
+                                self_exe,
+                                "unix-socket-test".into(),
+                                "socketpair-fork-write".into(),
+                            ],
+                            15,
+                        ),
+                    )
+                    .await;
+                let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout.contains("US6_SOCKETPAIR_FORK_OK"));
+                super::TestOutcome::new(&agent_label, pass, format!("{resp:?}"))
+            }
+        );
 
-        // read direction
+        let agent_name = agent;
+        let agent_label = agent.to_string();
         let id = format!("US6.socketpair_read.{agent}");
-        let agent_s = agent.to_string();
-        tests.push(super::Test {
-            suite: "xworker",
-            group: "unix_socket",
+        typed_test!(
+            reg,
+            "xworker",
+            "unix_socket",
             id,
-            xfail: None,
-            timeout_secs: 60,
-            declared_agents: Vec::new(),
-            run: Box::new(move |r| {
-                let self_exe = r.self_exe.clone();
-                Box::pin(async move {
-                    let resp = r
-                        .send(
-                            &agent_s,
-                            super::exec_timeout(
-                                vec![
-                                    self_exe,
-                                    "unix-socket-test".into(),
-                                    "socketpair-fork-read".into(),
-                                ],
-                                15,
-                            ),
-                        )
-                        .await;
-                    let pass = matches!(
-                        &resp,
-                        crate::protocol::Response::ExecResult { exit_code: 0, stdout, .. }
-                            if stdout.contains("US6R_SOCKETPAIR_FORK_READ_OK")
-                    );
-                    super::TestOutcome::new(&agent_s, pass, format!("{resp:?}"))
-                })
-            }),
-        });
+            timeout = 60,
+            agents[handle = agent_name],
+            |run| {
+                let self_exe = run.self_exe().to_string();
+                let resp = run
+                    .send(
+                        &handle,
+                        super::exec_timeout(
+                            vec![
+                                self_exe,
+                                "unix-socket-test".into(),
+                                "socketpair-fork-read".into(),
+                            ],
+                            15,
+                        ),
+                    )
+                    .await;
+                let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout.contains("US6R_SOCKETPAIR_FORK_READ_OK"));
+                super::TestOutcome::new(&agent_label, pass, format!("{resp:?}"))
+            }
+        );
     }
 
-    // Socketpair exec across agents
-    for &agent in &["A", "AA", "B", "D3", "D4", "NP"] {
+    for &agent in &[
+        AgentName::A,
+        AgentName::AA,
+        AgentName::B,
+        AgentName::D3,
+        AgentName::D4,
+        AgentName::NP,
+    ] {
         let id = format!("US6.socketpair_exec.{agent}");
-        let agent_s = agent.to_string();
-        tests.push(super::Test {
-            suite: "xworker",
-            group: "unix_socket",
+        let agent_name = agent;
+        let agent_label = agent.to_string();
+        typed_test!(
+            reg,
+            "xworker",
+            "unix_socket",
             id,
-            xfail: None,
-            timeout_secs: 60,
-            declared_agents: Vec::new(),
-            run: Box::new(move |r| {
-                let self_exe = r.self_exe.clone();
-                Box::pin(async move {
-                    let resp = r
-                        .send(
-                            &agent_s,
-                            super::exec_timeout(
-                                vec![
-                                    self_exe,
-                                    "unix-socket-test".into(),
-                                    "socketpair-exec".into(),
-                                ],
-                                20,
-                            ),
-                        )
-                        .await;
-                    let pass = matches!(
-                        &resp,
-                        crate::protocol::Response::ExecResult { exit_code: 0, stdout, .. }
-                            if stdout.contains("US6E_SOCKETPAIR_EXEC_OK")
-                    );
-                    super::TestOutcome::new(&agent_s, pass, format!("{resp:?}"))
-                })
-            }),
-        });
+            timeout = 60,
+            agents[handle = agent_name],
+            |run| {
+                let self_exe = run.self_exe().to_string();
+                let resp = run
+                    .send(
+                        &handle,
+                        super::exec_timeout(
+                            vec![
+                                self_exe,
+                                "unix-socket-test".into(),
+                                "socketpair-exec".into(),
+                            ],
+                            20,
+                        ),
+                    )
+                    .await;
+                let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout.contains("US6E_SOCKETPAIR_EXEC_OK"));
+                super::TestOutcome::new(&agent_label, pass, format!("{resp:?}"))
+            }
+        );
     }
 
-    // Socketpair nonpie
-    for &agent in &["A", "AA", "B"] {
+    for &agent in &[AgentName::A, AgentName::AA, AgentName::B] {
         let id = format!("US6.socketpair_nonpie.{agent}");
-        let agent_s = agent.to_string();
-        tests.push(super::Test {
-            suite: "xworker",
-            group: "unix_socket",
+        let agent_name = agent;
+        let agent_label = agent.to_string();
+        typed_test!(
+            reg,
+            "xworker",
+            "unix_socket",
             id,
-            xfail: None,
-            timeout_secs: 60,
-            declared_agents: Vec::new(),
-            run: Box::new(move |r| {
-                Box::pin(async move {
-                    let nonpie = match crate::find_nonpie_binary() {
-                        Some(p) => p,
-                        None => {
-                            return super::TestOutcome::new(
-                                &agent_s,
-                                false,
-                                "FAIL: nonpie binary not found",
-                            );
-                        }
-                    };
-                    let resp = r
-                        .send(
-                            &agent_s,
-                            super::exec_timeout(
-                                vec![nonpie, "unix-socket-test".into(), "socketpair-exec".into()],
-                                30,
-                            ),
-                        )
-                        .await;
-                    let pass = matches!(
-                        &resp,
-                        crate::protocol::Response::ExecResult { exit_code: 0, stdout, .. }
-                            if stdout.contains("US6E_SOCKETPAIR_EXEC_OK")
-                    );
-                    super::TestOutcome::new(&agent_s, pass, format!("{resp:?}"))
-                })
-            }),
-        });
+            timeout = 60,
+            agents[handle = agent_name],
+            |run| {
+                let nonpie = match crate::find_nonpie_binary() {
+                    Some(p) => p,
+                    None => {
+                        return super::TestOutcome::new(
+                            &agent_label,
+                            false,
+                            "FAIL: nonpie binary not found",
+                        );
+                    }
+                };
+                let resp = run
+                    .send(
+                        &handle,
+                        super::exec_timeout(
+                            vec![nonpie, "unix-socket-test".into(), "socketpair-exec".into()],
+                            30,
+                        ),
+                    )
+                    .await;
+                let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout.contains("US6E_SOCKETPAIR_EXEC_OK"));
+                super::TestOutcome::new(&agent_label, pass, format!("{resp:?}"))
+            }
+        );
     }
 }
 
 // Register cross-worker tests.
-pub(crate) fn register_cross_worker(tests: &mut Vec<super::Test>) {
-    // XW.spawn_remote
-    tests.push(super::Test {
-        suite: "xworker",
-        group: "cross_worker",
-        id: "XW.spawn_remote".to_string(),
-        xfail: None,
-        timeout_secs: 60,
-        declared_agents: Vec::new(),
-        run: Box::new(|r| {
-            Box::pin(async move {
-                let resp = r
-                    .send(
-                        "A",
-                        Command::SpawnRemote {
-                            children: vec!["R".to_string()],
-                        },
-                    )
-                    .await;
-                let pass = matches!(&resp, Response::Ok { .. });
-                super::TestOutcome::new("A", pass, format!("{resp:?}"))
-            })
-        }),
-    });
+pub(crate) fn register_cross_worker(reg: &mut Registry<'_>) {
+    typed_test!(
+        reg,
+        "xworker",
+        "cross_worker",
+        "XW.spawn_remote",
+        timeout = 60,
+        agents[a = AgentName::A],
+        |run| {
+            let resp = run
+                .send(
+                    &a,
+                    Command::SpawnRemote {
+                        children: vec!["R".to_string()],
+                    },
+                )
+                .await;
+            let pass = matches!(&resp, Response::Ok { .. });
+            super::TestOutcome::new("A", pass, format!("{resp:?}"))
+        }
+    );
 
-    // XW1.remote_write
-    tests.push(super::Test {
-        suite: "xworker",
-        group: "cross_worker",
-        id: "XW1.remote_write".to_string(),
-        xfail: None,
-        timeout_secs: 60,
-        declared_agents: Vec::new(),
-        run: Box::new(|r| {
-            Box::pin(async move {
-                let resp = r
-                    .send(
-                        "A",
-                        Command::Forward {
-                            target: "R".to_string(),
-                            inner: Box::new(Command::FsWrite {
-                                path: "/tmp/xw1.txt".to_string(),
-                                data: "REMOTE_DATA".to_string(),
-                            }),
-                        },
-                    )
-                    .await;
-                let pass = matches!(&resp, Response::Ok { .. });
-                super::TestOutcome::new("A", pass, format!("{resp:?}"))
-            })
-        }),
-    });
-
-    // XW1.local_read
-    tests.push(super::Test {
-        suite: "xworker",
-        group: "cross_worker",
-        id: "XW1.local_read".to_string(),
-        xfail: None,
-        timeout_secs: 60,
-        declared_agents: Vec::new(),
-        run: Box::new(|r| {
-            Box::pin(async move {
-                let resp = r
-                    .send(
-                        "A",
-                        Command::FsRead {
+    typed_test!(
+        reg,
+        "xworker",
+        "cross_worker",
+        "XW1.remote_write",
+        timeout = 60,
+        agents[a = AgentName::A],
+        |run| {
+            spawn_remote_r!(run, a);
+            let resp = run
+                .send(
+                    &a,
+                    Command::Forward {
+                        target: "R".to_string(),
+                        inner: Box::new(Command::FsWrite {
                             path: "/tmp/xw1.txt".to_string(),
-                        },
-                    )
-                    .await;
-                let pass =
-                    matches!(&resp, Response::Ok { data: Some(d), .. } if d == "REMOTE_DATA");
-                super::TestOutcome::new("A", pass, format!("{resp:?}"))
-            })
-        }),
-    });
+                            data: "REMOTE_DATA".to_string(),
+                        }),
+                    },
+                )
+                .await;
+            let pass = matches!(&resp, Response::Ok { .. });
+            super::TestOutcome::new("A", pass, format!("{resp:?}"))
+        }
+    );
 
-    // XW2.local_write
-    tests.push(super::Test {
-        suite: "xworker",
-        group: "cross_worker",
-        id: "XW2.local_write".to_string(),
-        xfail: None,
-        timeout_secs: 60,
-        declared_agents: Vec::new(),
-        run: Box::new(|r| {
-            Box::pin(async move {
-                let resp = r
-                    .send(
-                        "A",
-                        Command::FsWrite {
+    typed_test!(
+        reg,
+        "xworker",
+        "cross_worker",
+        "XW1.local_read",
+        timeout = 60,
+        agents[a = AgentName::A],
+        |run| {
+            spawn_remote_r!(run, a);
+            let setup_resp = run
+                .send(
+                    &a,
+                    Command::Forward {
+                        target: "R".to_string(),
+                        inner: Box::new(Command::FsWrite {
+                            path: "/tmp/xw1.txt".to_string(),
+                            data: "REMOTE_DATA".to_string(),
+                        }),
+                    },
+                )
+                .await;
+            if !matches!(&setup_resp, Response::Ok { .. }) {
+                return super::TestOutcome::new(
+                    "A",
+                    false,
+                    format!("write setup failed: {setup_resp:?}"),
+                );
+            }
+            let resp = run
+                .send(
+                    &a,
+                    Command::FsRead {
+                        path: "/tmp/xw1.txt".to_string(),
+                    },
+                )
+                .await;
+            let pass = matches!(&resp, Response::Ok { data: Some(d), .. } if d == "REMOTE_DATA");
+            super::TestOutcome::new("A", pass, format!("{resp:?}"))
+        }
+    );
+
+    typed_test!(
+        reg,
+        "xworker",
+        "cross_worker",
+        "XW2.local_write",
+        timeout = 60,
+        agents[a = AgentName::A],
+        |run| {
+            let resp = run
+                .send(
+                    &a,
+                    Command::FsWrite {
+                        path: "/tmp/xw2.txt".to_string(),
+                        data: "LOCAL_DATA".to_string(),
+                    },
+                )
+                .await;
+            let pass = matches!(&resp, Response::Ok { .. });
+            super::TestOutcome::new("A", pass, format!("{resp:?}"))
+        }
+    );
+
+    typed_test!(
+        reg,
+        "xworker",
+        "cross_worker",
+        "XW2.remote_read",
+        timeout = 60,
+        agents[a = AgentName::A],
+        |run| {
+            spawn_remote_r!(run, a);
+            let setup_resp = run
+                .send(
+                    &a,
+                    Command::FsWrite {
+                        path: "/tmp/xw2.txt".to_string(),
+                        data: "LOCAL_DATA".to_string(),
+                    },
+                )
+                .await;
+            if !matches!(&setup_resp, Response::Ok { .. }) {
+                return super::TestOutcome::new(
+                    "A",
+                    false,
+                    format!("write setup failed: {setup_resp:?}"),
+                );
+            }
+            let resp = run
+                .send(
+                    &a,
+                    Command::Forward {
+                        target: "R".to_string(),
+                        inner: Box::new(Command::FsRead {
                             path: "/tmp/xw2.txt".to_string(),
-                            data: "LOCAL_DATA".to_string(),
-                        },
-                    )
-                    .await;
-                let pass = matches!(&resp, Response::Ok { .. });
-                super::TestOutcome::new("A", pass, format!("{resp:?}"))
-            })
-        }),
-    });
+                        }),
+                    },
+                )
+                .await;
+            let pass = matches!(&resp, Response::Ok { data: Some(d), .. } if d == "LOCAL_DATA");
+            super::TestOutcome::new("A", pass, format!("{resp:?}"))
+        }
+    );
 
-    // XW2.remote_read
-    tests.push(super::Test {
-        suite: "xworker",
-        group: "cross_worker",
-        id: "XW2.remote_read".to_string(),
-        xfail: None,
-        timeout_secs: 60,
-        declared_agents: Vec::new(),
-        run: Box::new(|r| {
-            Box::pin(async move {
-                let resp = r
-                    .send(
-                        "A",
-                        Command::Forward {
-                            target: "R".to_string(),
-                            inner: Box::new(Command::FsRead {
-                                path: "/tmp/xw2.txt".to_string(),
-                            }),
-                        },
-                    )
-                    .await;
-                let pass = matches!(&resp, Response::Ok { data: Some(d), .. } if d == "LOCAL_DATA");
-                super::TestOutcome::new("A", pass, format!("{resp:?}"))
-            })
-        }),
-    });
+    typed_test!(
+        reg,
+        "xworker",
+        "cross_worker",
+        "XW3.remote_listen",
+        timeout = 60,
+        agents[a = AgentName::A],
+        |run| {
+            spawn_remote_r!(run, a);
+            let resp = run
+                .send(
+                    &a,
+                    Command::Forward {
+                        target: "R".to_string(),
+                        inner: Box::new(Command::UnixListen {
+                            path: "/tmp/xw3.sock".to_string(),
+                        }),
+                    },
+                )
+                .await;
+            let pass = matches!(&resp, Response::UnixListening { .. });
+            super::TestOutcome::new("A", pass, format!("{resp:?}"))
+        }
+    );
 
-    // XW3.remote_listen
-    tests.push(super::Test {
-        suite: "xworker",
-        group: "cross_worker",
-        id: "XW3.remote_listen".to_string(),
-        xfail: None,
-        timeout_secs: 60,
-        declared_agents: Vec::new(),
-        run: Box::new(|r| {
-            Box::pin(async move {
-                let resp = r
-                    .send(
-                        "A",
-                        Command::Forward {
-                            target: "R".to_string(),
-                            inner: Box::new(Command::UnixListen {
-                                path: "/tmp/xw3.sock".to_string(),
-                            }),
-                        },
-                    )
-                    .await;
-                let pass = matches!(&resp, Response::UnixListening { .. });
-                super::TestOutcome::new("A", pass, format!("{resp:?}"))
-            })
-        }),
-    });
-
-    // XW3.local_connect — does own listen setup on unique path
-    tests.push(super::Test {
-        suite: "xworker",
-        group: "cross_worker",
-        id: "XW3.local_connect".to_string(),
-        xfail: None,
-        timeout_secs: 60,
-        declared_agents: Vec::new(),
-        run: Box::new(|r| {
-            Box::pin(async move {
-                // Listen on a unique path (setup)
-                let listen_resp = r
-                    .send(
-                        "A",
-                        Command::Forward {
-                            target: "R".to_string(),
-                            inner: Box::new(Command::UnixListen {
-                                path: "/tmp/xw3c.sock".to_string(),
-                            }),
-                        },
-                    )
-                    .await;
-                if !matches!(&listen_resp, Response::UnixListening { .. }) {
-                    return super::TestOutcome::new(
-                        "A",
-                        false,
-                        format!("listen setup failed: {listen_resp:?}"),
-                    );
-                }
-                let resp = r
-                    .send(
-                        "A",
-                        Command::UnixConnect {
+    typed_test!(
+        reg,
+        "xworker",
+        "cross_worker",
+        "XW3.local_connect",
+        timeout = 60,
+        agents[a = AgentName::A],
+        |run| {
+            spawn_remote_r!(run, a);
+            let listen_resp = run
+                .send(
+                    &a,
+                    Command::Forward {
+                        target: "R".to_string(),
+                        inner: Box::new(Command::UnixListen {
                             path: "/tmp/xw3c.sock".to_string(),
-                            data: "XW_HELLO".to_string(),
-                        },
-                    )
-                    .await;
-                let pass =
-                    matches!(&resp, Response::Connected { echo } if echo.contains("XW_HELLO"));
-                super::TestOutcome::new("A", pass, format!("{resp:?}"))
-            })
-        }),
-    });
+                        }),
+                    },
+                )
+                .await;
+            if !matches!(&listen_resp, Response::UnixListening { .. }) {
+                return super::TestOutcome::new(
+                    "A",
+                    false,
+                    format!("listen setup failed: {listen_resp:?}"),
+                );
+            }
+            let resp = run
+                .send(
+                    &a,
+                    Command::UnixConnect {
+                        path: "/tmp/xw3c.sock".to_string(),
+                        data: "XW_HELLO".to_string(),
+                    },
+                )
+                .await;
+            let pass = matches!(&resp, Response::Connected { echo } if echo.contains("XW_HELLO"));
+            super::TestOutcome::new("A", pass, format!("{resp:?}"))
+        }
+    );
 
-    // XW4.local_listen
-    tests.push(super::Test {
-        suite: "xworker",
-        group: "cross_worker",
-        id: "XW4.local_listen".to_string(),
-        xfail: None,
-        timeout_secs: 60,
-        declared_agents: Vec::new(),
-        run: Box::new(|r| {
-            Box::pin(async move {
-                let resp = r
-                    .send(
-                        "A",
-                        Command::UnixListen {
-                            path: "/tmp/xw4.sock".to_string(),
-                        },
-                    )
-                    .await;
-                let pass = matches!(&resp, Response::UnixListening { .. });
-                super::TestOutcome::new("A", pass, format!("{resp:?}"))
-            })
-        }),
-    });
+    typed_test!(
+        reg,
+        "xworker",
+        "cross_worker",
+        "XW4.local_listen",
+        timeout = 60,
+        agents[a = AgentName::A],
+        |run| {
+            let resp = run
+                .send(
+                    &a,
+                    Command::UnixListen {
+                        path: "/tmp/xw4.sock".to_string(),
+                    },
+                )
+                .await;
+            let pass = matches!(&resp, Response::UnixListening { .. });
+            super::TestOutcome::new("A", pass, format!("{resp:?}"))
+        }
+    );
 
-    // XW4.remote_connect — does own listen setup on unique path
-    tests.push(super::Test {
-        suite: "xworker",
-        group: "cross_worker",
-        id: "XW4.remote_connect".to_string(),
-        xfail: None,
-        timeout_secs: 60,
-        declared_agents: Vec::new(),
-        run: Box::new(|r| {
-            Box::pin(async move {
-                let listen_resp = r
-                    .send(
-                        "A",
-                        Command::UnixListen {
+    typed_test!(
+        reg,
+        "xworker",
+        "cross_worker",
+        "XW4.remote_connect",
+        timeout = 60,
+        agents[a = AgentName::A],
+        |run| {
+            spawn_remote_r!(run, a);
+            let listen_resp = run
+                .send(
+                    &a,
+                    Command::UnixListen {
+                        path: "/tmp/xw4c.sock".to_string(),
+                    },
+                )
+                .await;
+            if !matches!(&listen_resp, Response::UnixListening { .. }) {
+                return super::TestOutcome::new(
+                    "A",
+                    false,
+                    format!("listen setup failed: {listen_resp:?}"),
+                );
+            }
+            let resp = run
+                .send(
+                    &a,
+                    Command::Forward {
+                        target: "R".to_string(),
+                        inner: Box::new(Command::UnixConnect {
                             path: "/tmp/xw4c.sock".to_string(),
-                        },
-                    )
-                    .await;
-                if !matches!(&listen_resp, Response::UnixListening { .. }) {
+                            data: "XW_HELLO2".to_string(),
+                        }),
+                    },
+                )
+                .await;
+            let pass = matches!(&resp, Response::Connected { echo } if echo.contains("XW_HELLO2"));
+            super::TestOutcome::new("A", pass, format!("{resp:?}"))
+        }
+    );
+
+    typed_test!(
+        reg,
+        "xworker",
+        "cross_worker",
+        "XW5.remote_tcp_listen",
+        timeout = 60,
+        agents[a = AgentName::A],
+        |run| {
+            spawn_remote_r!(run, a);
+            let resp = run
+                .send(
+                    &a,
+                    Command::Forward {
+                        target: "R".to_string(),
+                        inner: Box::new(Command::NetListen { port: 0 }),
+                    },
+                )
+                .await;
+            let pass = matches!(&resp, Response::Listening { .. });
+            super::TestOutcome::new("A", pass, format!("{resp:?}"))
+        }
+    );
+
+    typed_test!(
+        reg,
+        "xworker",
+        "cross_worker",
+        "XW5.local_tcp_connect",
+        timeout = 60,
+        agents[a = AgentName::A],
+        |run| {
+            spawn_remote_r!(run, a);
+            let listen_resp = run
+                .send(
+                    &a,
+                    Command::Forward {
+                        target: "R".to_string(),
+                        inner: Box::new(Command::NetListen { port: 0 }),
+                    },
+                )
+                .await;
+            let port = match &listen_resp {
+                Response::Listening { port } => *port,
+                _ => {
                     return super::TestOutcome::new(
                         "A",
                         false,
                         format!("listen setup failed: {listen_resp:?}"),
                     );
                 }
-                let resp = r
-                    .send(
-                        "A",
-                        Command::Forward {
-                            target: "R".to_string(),
-                            inner: Box::new(Command::UnixConnect {
-                                path: "/tmp/xw4c.sock".to_string(),
-                                data: "XW_HELLO2".to_string(),
-                            }),
-                        },
-                    )
-                    .await;
-                let pass =
-                    matches!(&resp, Response::Connected { echo } if echo.contains("XW_HELLO2"));
-                super::TestOutcome::new("A", pass, format!("{resp:?}"))
-            })
-        }),
-    });
+            };
+            let resp = run
+                .send(
+                    &a,
+                    Command::NetConnect {
+                        addr: format!("127.0.0.1:{port}"),
+                        data: "XW_TCP_HELLO".to_string(),
+                    },
+                )
+                .await;
+            let pass =
+                matches!(&resp, Response::Connected { echo } if echo.contains("XW_TCP_HELLO"));
+            let _ = run
+                .send(
+                    &a,
+                    Command::Forward {
+                        target: "R".to_string(),
+                        inner: Box::new(Command::NetUnlisten { port }),
+                    },
+                )
+                .await;
+            super::TestOutcome::new("A", pass, format!("{resp:?}"))
+        }
+    );
 
-    // XW5.remote_tcp_listen
-    tests.push(super::Test {
-        suite: "xworker",
-        group: "cross_worker",
-        id: "XW5.remote_tcp_listen".to_string(),
-        xfail: None,
-        timeout_secs: 60,
-        declared_agents: Vec::new(),
-        run: Box::new(|r| {
-            Box::pin(async move {
-                let resp = r
-                    .send(
-                        "A",
-                        Command::Forward {
-                            target: "R".to_string(),
-                            inner: Box::new(Command::NetListen { port: 0 }),
-                        },
-                    )
-                    .await;
-                let pass = matches!(&resp, Response::Listening { .. });
-                super::TestOutcome::new("A", pass, format!("{resp:?}"))
-            })
-        }),
-    });
+    typed_test!(
+        reg,
+        "xworker",
+        "cross_worker",
+        "XW6.local_tcp_listen",
+        timeout = 60,
+        agents[a = AgentName::A],
+        |run| {
+            let resp = run.send(&a, Command::NetListen { port: 0 }).await;
+            let pass = matches!(&resp, Response::Listening { .. });
+            super::TestOutcome::new("A", pass, format!("{resp:?}"))
+        }
+    );
 
-    // XW5.local_tcp_connect — does own listen setup
-    tests.push(super::Test {
-        suite: "xworker",
-        group: "cross_worker",
-        id: "XW5.local_tcp_connect".to_string(),
-        xfail: None,
-        timeout_secs: 60,
-        declared_agents: Vec::new(),
-        run: Box::new(|r| {
-            Box::pin(async move {
-                let listen_resp = r
-                    .send(
+    typed_test!(
+        reg,
+        "xworker",
+        "cross_worker",
+        "XW6.remote_tcp_connect",
+        timeout = 60,
+        agents[a = AgentName::A],
+        |run| {
+            spawn_remote_r!(run, a);
+            let listen_resp = run.send(&a, Command::NetListen { port: 0 }).await;
+            let port = match &listen_resp {
+                Response::Listening { port } => *port,
+                _ => {
+                    return super::TestOutcome::new(
                         "A",
-                        Command::Forward {
-                            target: "R".to_string(),
-                            inner: Box::new(Command::NetListen { port: 0 }),
-                        },
-                    )
-                    .await;
-                let port = match &listen_resp {
-                    Response::Listening { port } => *port,
-                    _ => {
-                        return super::TestOutcome::new(
-                            "A",
-                            false,
-                            format!("listen setup failed: {listen_resp:?}"),
-                        );
-                    }
-                };
-                let resp = r
-                    .send(
-                        "A",
-                        Command::NetConnect {
+                        false,
+                        format!("listen setup failed: {listen_resp:?}"),
+                    );
+                }
+            };
+            let resp = run
+                .send(
+                    &a,
+                    Command::Forward {
+                        target: "R".to_string(),
+                        inner: Box::new(Command::NetConnect {
                             addr: format!("127.0.0.1:{port}"),
-                            data: "XW_TCP_HELLO".to_string(),
-                        },
-                    )
-                    .await;
-                let pass = matches!(
-                    &resp,
-                    Response::Connected { echo } if echo.contains("XW_TCP_HELLO")
-                );
-                let _ = r
-                    .send(
-                        "A",
-                        Command::Forward {
-                            target: "R".to_string(),
-                            inner: Box::new(Command::NetUnlisten { port }),
-                        },
-                    )
-                    .await;
-                super::TestOutcome::new("A", pass, format!("{resp:?}"))
-            })
-        }),
+                            data: "XW_TCP_HELLO2".to_string(),
+                        }),
+                    },
+                )
+                .await;
+            let pass =
+                matches!(&resp, Response::Connected { echo } if echo.contains("XW_TCP_HELLO2"));
+            let _ = run.send(&a, Command::NetUnlisten { port }).await;
+            super::TestOutcome::new("A", pass, format!("{resp:?}"))
+        }
+    );
+
+    typed_test!(
+        reg,
+        "xworker",
+        "cross_worker",
+        "XW7.d4_listen",
+        timeout = 60,
+        agents[d4 = AgentName::D4],
+        |run| {
+            let resp = run
+                .send(
+                    &d4,
+                    Command::UnixListen {
+                        path: "/tmp/xw7.sock".to_string(),
+                    },
+                )
+                .await;
+            let pass = matches!(&resp, Response::UnixListening { .. });
+            super::TestOutcome::new("D4", pass, format!("{resp:?}"))
+        }
+    );
+
+    typed_test!(reg, "xworker", "cross_worker", "XW7.d3_connect", timeout = 60, agents [d4 = AgentName::D4, d3 = AgentName::D3], |run| {
+        let listen_resp = run.send(&d4, Command::UnixListen { path: "/tmp/xw7c.sock".to_string() }).await;
+        if !matches!(&listen_resp, Response::UnixListening { .. }) {
+            return super::TestOutcome::new("D3", false, format!("listen setup failed: {listen_resp:?}"));
+        }
+        let resp = run
+            .send(&d3, Command::UnixConnect { path: "/tmp/xw7c.sock".to_string(), data: "XW7_D3_TO_D4".to_string() })
+            .await;
+        let pass = matches!(&resp, Response::Connected { echo } if echo.contains("XW7_D3_TO_D4"));
+        super::TestOutcome::new("D3", pass, format!("{resp:?}"))
     });
 
-    // XW6.local_tcp_listen
-    tests.push(super::Test {
-        suite: "xworker",
-        group: "cross_worker",
-        id: "XW6.local_tcp_listen".to_string(),
-        xfail: None,
-        timeout_secs: 60,
-        declared_agents: Vec::new(),
-        run: Box::new(|r| {
-            Box::pin(async move {
-                let resp = r.send("A", Command::NetListen { port: 0 }).await;
-                let pass = matches!(&resp, Response::Listening { .. });
-                super::TestOutcome::new("A", pass, format!("{resp:?}"))
-            })
-        }),
+    typed_test!(
+        reg,
+        "xworker",
+        "cross_worker",
+        "XW8.d3_listen",
+        timeout = 60,
+        agents[d3 = AgentName::D3],
+        |run| {
+            let resp = run
+                .send(
+                    &d3,
+                    Command::UnixListen {
+                        path: "/tmp/xw8.sock".to_string(),
+                    },
+                )
+                .await;
+            let pass = matches!(&resp, Response::UnixListening { .. });
+            super::TestOutcome::new("D3", pass, format!("{resp:?}"))
+        }
+    );
+
+    typed_test!(reg, "xworker", "cross_worker", "XW8.d4_connect", timeout = 60, agents [d3 = AgentName::D3, d4 = AgentName::D4], |run| {
+        let listen_resp = run.send(&d3, Command::UnixListen { path: "/tmp/xw8c.sock".to_string() }).await;
+        if !matches!(&listen_resp, Response::UnixListening { .. }) {
+            return super::TestOutcome::new("D4", false, format!("listen setup failed: {listen_resp:?}"));
+        }
+        let resp = run
+            .send(&d4, Command::UnixConnect { path: "/tmp/xw8c.sock".to_string(), data: "XW8_D4_TO_D3".to_string() })
+            .await;
+        let pass = matches!(&resp, Response::Connected { echo } if echo.contains("XW8_D4_TO_D3"));
+        super::TestOutcome::new("D4", pass, format!("{resp:?}"))
     });
 
-    // XW6.remote_tcp_connect — does own listen setup
-    tests.push(super::Test {
-        suite: "xworker",
-        group: "cross_worker",
-        id: "XW6.remote_tcp_connect".to_string(),
-        xfail: None,
-        timeout_secs: 60,
-        declared_agents: Vec::new(),
-        run: Box::new(|r| {
-            Box::pin(async move {
-                let listen_resp = r.send("A", Command::NetListen { port: 0 }).await;
-                let port = match &listen_resp {
-                    Response::Listening { port } => *port,
-                    _ => {
-                        return super::TestOutcome::new(
-                            "A",
-                            false,
-                            format!("listen setup failed: {listen_resp:?}"),
-                        );
-                    }
-                };
-                let resp = r
-                    .send(
-                        "A",
-                        Command::Forward {
-                            target: "R".to_string(),
-                            inner: Box::new(Command::NetConnect {
-                                addr: format!("127.0.0.1:{port}"),
-                                data: "XW_TCP_HELLO2".to_string(),
-                            }),
-                        },
-                    )
-                    .await;
-                let pass = matches!(
-                    &resp,
-                    Response::Connected { echo } if echo.contains("XW_TCP_HELLO2")
-                );
-                let _ = r.send("A", Command::NetUnlisten { port }).await;
-                super::TestOutcome::new("A", pass, format!("{resp:?}"))
-            })
-        }),
+    typed_test!(
+        reg,
+        "xworker",
+        "cross_worker",
+        "XW9.d4_listen",
+        timeout = 60,
+        agents[d4 = AgentName::D4],
+        |run| {
+            let resp = run
+                .send(
+                    &d4,
+                    Command::UnixListen {
+                        path: "/tmp/xw9.sock".to_string(),
+                    },
+                )
+                .await;
+            let pass = matches!(&resp, Response::UnixListening { .. });
+            super::TestOutcome::new("D4", pass, format!("{resp:?}"))
+        }
+    );
+
+    typed_test!(reg, "xworker", "cross_worker", "XW9.aa_connect", timeout = 60, agents [d4 = AgentName::D4, aa = AgentName::AA], |run| {
+        let listen_resp = run.send(&d4, Command::UnixListen { path: "/tmp/xw9c.sock".to_string() }).await;
+        if !matches!(&listen_resp, Response::UnixListening { .. }) {
+            return super::TestOutcome::new("AA", false, format!("listen setup failed: {listen_resp:?}"));
+        }
+        let resp = run
+            .send(&aa, Command::UnixConnect { path: "/tmp/xw9c.sock".to_string(), data: "XW9_AA_TO_D4".to_string() })
+            .await;
+        let pass = matches!(&resp, Response::Connected { echo } if echo.contains("XW9_AA_TO_D4"));
+        super::TestOutcome::new("AA", pass, format!("{resp:?}"))
     });
 
-    // XW7.d4_listen
-    tests.push(super::Test {
-        suite: "xworker",
-        group: "cross_worker",
-        id: "XW7.d4_listen".to_string(),
-        xfail: None,
-        timeout_secs: 60,
-        declared_agents: Vec::new(),
-        run: Box::new(|r| {
-            Box::pin(async move {
-                let resp = r
-                    .send(
-                        "D4",
-                        Command::UnixListen {
-                            path: "/tmp/xw7.sock".to_string(),
-                        },
-                    )
-                    .await;
-                let pass = matches!(&resp, Response::UnixListening { .. });
-                super::TestOutcome::new("D4", pass, format!("{resp:?}"))
-            })
-        }),
+    typed_test!(
+        reg,
+        "xworker",
+        "cross_worker",
+        "XW10.d3_tcp_listen",
+        timeout = 60,
+        agents[d3 = AgentName::D3],
+        |run| {
+            let resp = run.send(&d3, Command::NetListen { port: 0 }).await;
+            let pass = matches!(&resp, Response::Listening { .. });
+            super::TestOutcome::new("D3", pass, format!("{resp:?}"))
+        }
+    );
+
+    typed_test!(reg, "xworker", "cross_worker", "XW10.b_tcp_connect", timeout = 60, agents [d3 = AgentName::D3, b = AgentName::B], |run| {
+        let listen_resp = run.send(&d3, Command::NetListen { port: 0 }).await;
+        let port = match &listen_resp {
+            Response::Listening { port } => *port,
+            _ => return super::TestOutcome::new("B", false, format!("listen setup failed: {listen_resp:?}")),
+        };
+        let resp = run
+            .send(&b, Command::NetConnect { addr: format!("127.0.0.1:{port}"), data: "XW10_CROSS_SUBTREE".to_string() })
+            .await;
+        let pass = matches!(&resp, Response::Connected { echo } if echo.contains("XW10_CROSS_SUBTREE"));
+        let _ = run.send(&d3, Command::NetUnlisten { port }).await;
+        super::TestOutcome::new("B", pass, format!("{resp:?}"))
     });
 
-    // XW7.d3_connect — does own listen setup
-    tests.push(super::Test {
-        suite: "xworker",
-        group: "cross_worker",
-        id: "XW7.d3_connect".to_string(),
-        xfail: None,
-        timeout_secs: 60,
-        declared_agents: Vec::new(),
-        run: Box::new(|r| {
-            Box::pin(async move {
-                let listen_resp = r
-                    .send(
-                        "D4",
-                        Command::UnixListen {
-                            path: "/tmp/xw7c.sock".to_string(),
-                        },
-                    )
-                    .await;
-                if !matches!(&listen_resp, Response::UnixListening { .. }) {
-                    return super::TestOutcome::new(
-                        "D3",
-                        false,
-                        format!("listen setup failed: {listen_resp:?}"),
-                    );
-                }
-                let resp = r
-                    .send(
-                        "D3",
-                        Command::UnixConnect {
-                            path: "/tmp/xw7c.sock".to_string(),
-                            data: "XW7_D3_TO_D4".to_string(),
-                        },
-                    )
-                    .await;
-                let pass = matches!(
-                    &resp,
-                    Response::Connected { echo } if echo.contains("XW7_D3_TO_D4")
-                );
-                super::TestOutcome::new("D3", pass, format!("{resp:?}"))
-            })
-        }),
-    });
+    typed_test!(
+        reg,
+        "xworker",
+        "cross_worker",
+        "XW11.d3_tcp_listen",
+        timeout = 60,
+        agents[d3 = AgentName::D3],
+        |run| {
+            let resp = run.send(&d3, Command::NetListen { port: 0 }).await;
+            let pass = matches!(&resp, Response::Listening { .. });
+            super::TestOutcome::new("D3", pass, format!("{resp:?}"))
+        }
+    );
 
-    // XW8.d3_listen
-    tests.push(super::Test {
-        suite: "xworker",
-        group: "cross_worker",
-        id: "XW8.d3_listen".to_string(),
-        xfail: None,
-        timeout_secs: 60,
-        declared_agents: Vec::new(),
-        run: Box::new(|r| {
-            Box::pin(async move {
-                let resp = r
-                    .send(
-                        "D3",
-                        Command::UnixListen {
-                            path: "/tmp/xw8.sock".to_string(),
-                        },
-                    )
-                    .await;
-                let pass = matches!(&resp, Response::UnixListening { .. });
-                super::TestOutcome::new("D3", pass, format!("{resp:?}"))
-            })
-        }),
-    });
+    typed_test!(
+        reg,
+        "xworker",
+        "cross_worker",
+        "XW11.spawn_r2",
+        timeout = 60,
+        agents[b = AgentName::B],
+        |run| {
+            let resp = run
+                .send(
+                    &b,
+                    Command::SpawnRemote {
+                        children: vec!["R2".to_string()],
+                    },
+                )
+                .await;
+            let pass = matches!(&resp, Response::Ok { .. });
+            super::TestOutcome::new("B", pass, format!("{resp:?}"))
+        }
+    );
 
-    // XW8.d4_connect — does own listen setup
-    tests.push(super::Test {
-        suite: "xworker",
-        group: "cross_worker",
-        id: "XW8.d4_connect".to_string(),
-        xfail: None,
-        timeout_secs: 60,
-        declared_agents: Vec::new(),
-        run: Box::new(|r| {
-            Box::pin(async move {
-                let listen_resp = r
-                    .send(
-                        "D3",
-                        Command::UnixListen {
-                            path: "/tmp/xw8c.sock".to_string(),
-                        },
-                    )
-                    .await;
-                if !matches!(&listen_resp, Response::UnixListening { .. }) {
-                    return super::TestOutcome::new(
-                        "D4",
-                        false,
-                        format!("listen setup failed: {listen_resp:?}"),
-                    );
-                }
-                let resp = r
-                    .send(
-                        "D4",
-                        Command::UnixConnect {
-                            path: "/tmp/xw8c.sock".to_string(),
-                            data: "XW8_D4_TO_D3".to_string(),
-                        },
-                    )
-                    .await;
-                let pass = matches!(
-                    &resp,
-                    Response::Connected { echo } if echo.contains("XW8_D4_TO_D3")
-                );
-                super::TestOutcome::new("D4", pass, format!("{resp:?}"))
-            })
-        }),
-    });
-
-    // XW9.d4_listen
-    tests.push(super::Test {
-        suite: "xworker",
-        group: "cross_worker",
-        id: "XW9.d4_listen".to_string(),
-        xfail: None,
-        timeout_secs: 60,
-        declared_agents: Vec::new(),
-        run: Box::new(|r| {
-            Box::pin(async move {
-                let resp = r
-                    .send(
-                        "D4",
-                        Command::UnixListen {
-                            path: "/tmp/xw9.sock".to_string(),
-                        },
-                    )
-                    .await;
-                let pass = matches!(&resp, Response::UnixListening { .. });
-                super::TestOutcome::new("D4", pass, format!("{resp:?}"))
-            })
-        }),
-    });
-
-    // XW9.aa_connect — does own listen setup
-    tests.push(super::Test {
-        suite: "xworker",
-        group: "cross_worker",
-        id: "XW9.aa_connect".to_string(),
-        xfail: None,
-        timeout_secs: 60,
-        declared_agents: Vec::new(),
-        run: Box::new(|r| {
-            Box::pin(async move {
-                let listen_resp = r
-                    .send(
-                        "D4",
-                        Command::UnixListen {
-                            path: "/tmp/xw9c.sock".to_string(),
-                        },
-                    )
-                    .await;
-                if !matches!(&listen_resp, Response::UnixListening { .. }) {
-                    return super::TestOutcome::new(
-                        "AA",
-                        false,
-                        format!("listen setup failed: {listen_resp:?}"),
-                    );
-                }
-                let resp = r
-                    .send(
-                        "AA",
-                        Command::UnixConnect {
-                            path: "/tmp/xw9c.sock".to_string(),
-                            data: "XW9_AA_TO_D4".to_string(),
-                        },
-                    )
-                    .await;
-                let pass = matches!(
-                    &resp,
-                    Response::Connected { echo } if echo.contains("XW9_AA_TO_D4")
-                );
-                super::TestOutcome::new("AA", pass, format!("{resp:?}"))
-            })
-        }),
-    });
-
-    // XW10.d3_tcp_listen
-    tests.push(super::Test {
-        suite: "xworker",
-        group: "cross_worker",
-        id: "XW10.d3_tcp_listen".to_string(),
-        xfail: None,
-        timeout_secs: 60,
-        declared_agents: Vec::new(),
-        run: Box::new(|r| {
-            Box::pin(async move {
-                let resp = r.send("D3", Command::NetListen { port: 0 }).await;
-                let pass = matches!(&resp, Response::Listening { .. });
-                super::TestOutcome::new("D3", pass, format!("{resp:?}"))
-            })
-        }),
-    });
-
-    // XW10.b_tcp_connect — does own listen setup
-    tests.push(super::Test {
-        suite: "xworker",
-        group: "cross_worker",
-        id: "XW10.b_tcp_connect".to_string(),
-        xfail: None,
-        timeout_secs: 60,
-        declared_agents: Vec::new(),
-        run: Box::new(|r| {
-            Box::pin(async move {
-                let listen_resp = r.send("D3", Command::NetListen { port: 0 }).await;
-                let port = match &listen_resp {
-                    Response::Listening { port } => *port,
-                    _ => {
-                        return super::TestOutcome::new(
-                            "B",
-                            false,
-                            format!("listen setup failed: {listen_resp:?}"),
-                        );
-                    }
-                };
-                let resp = r
-                    .send(
-                        "B",
-                        Command::NetConnect {
-                            addr: format!("127.0.0.1:{port}"),
-                            data: "XW10_CROSS_SUBTREE".to_string(),
-                        },
-                    )
-                    .await;
-                let pass = matches!(
-                    &resp,
-                    Response::Connected { echo } if echo.contains("XW10_CROSS_SUBTREE")
-                );
-                let _ = r.send("D3", Command::NetUnlisten { port }).await;
-                super::TestOutcome::new("B", pass, format!("{resp:?}"))
-            })
-        }),
-    });
-
-    // XW11.d3_tcp_listen
-    tests.push(super::Test {
-        suite: "xworker",
-        group: "cross_worker",
-        id: "XW11.d3_tcp_listen".to_string(),
-        xfail: None,
-        timeout_secs: 60,
-        declared_agents: Vec::new(),
-        run: Box::new(|r| {
-            Box::pin(async move {
-                let resp = r.send("D3", Command::NetListen { port: 0 }).await;
-                let pass = matches!(&resp, Response::Listening { .. });
-                super::TestOutcome::new("D3", pass, format!("{resp:?}"))
-            })
-        }),
-    });
-
-    // XW11.spawn_r2
-    tests.push(super::Test {
-        suite: "xworker",
-        group: "cross_worker",
-        id: "XW11.spawn_r2".to_string(),
-        xfail: None,
-        timeout_secs: 60,
-        declared_agents: Vec::new(),
-        run: Box::new(|r| {
-            Box::pin(async move {
-                let resp = r
-                    .send(
-                        "B",
-                        Command::SpawnRemote {
-                            children: vec!["R2".to_string()],
-                        },
-                    )
-                    .await;
-                let pass = matches!(&resp, Response::Ok { .. });
-                super::TestOutcome::new("B", pass, format!("{resp:?}"))
-            })
-        }),
-    });
-
-    // XW11.r2_tcp_connect — does own setup (listen + spawn)
-    tests.push(super::Test {
-        suite: "xworker",
-        group: "cross_worker",
-        id: "XW11.r2_tcp_connect".to_string(),
-        xfail: None,
-        timeout_secs: 60,
-        declared_agents: Vec::new(),
-        run: Box::new(|r| {
-            Box::pin(async move {
-                // Setup: listen on D3
-                let listen_resp = r.send("D3", Command::NetListen { port: 0 }).await;
-                let port = match &listen_resp {
-                    Response::Listening { port } => *port,
-                    _ => {
-                        return super::TestOutcome::new(
-                            "R2",
-                            false,
-                            format!("listen setup failed: {listen_resp:?}"),
-                        );
-                    }
-                };
-                // Setup: spawn R2 under B (may already exist)
-                let _ = r
-                    .send(
-                        "B",
-                        Command::SpawnRemote {
-                            children: vec!["R2".to_string()],
-                        },
-                    )
-                    .await;
-                // Connect from R2
-                let resp = r
-                    .send(
-                        "B",
-                        Command::Forward {
-                            target: "R2".to_string(),
-                            inner: Box::new(Command::NetConnect {
-                                addr: format!("127.0.0.1:{port}"),
-                                data: "XW11_LATE_SPAWN".to_string(),
-                            }),
-                        },
-                    )
-                    .await;
-                let pass = matches!(
-                    &resp,
-                    Response::Connected { echo } if echo.contains("XW11_LATE_SPAWN")
-                );
-                let _ = r.send("D3", Command::NetUnlisten { port }).await;
-                super::TestOutcome::new("R2", pass, format!("{resp:?}"))
-            })
-        }),
+    typed_test!(reg, "xworker", "cross_worker", "XW11.r2_tcp_connect", timeout = 60, agents [d3 = AgentName::D3, b = AgentName::B], |run| {
+        let listen_resp = run.send(&d3, Command::NetListen { port: 0 }).await;
+        let port = match &listen_resp {
+            Response::Listening { port } => *port,
+            _ => return super::TestOutcome::new("R2", false, format!("listen setup failed: {listen_resp:?}")),
+        };
+        let _ = run
+            .send(&b, Command::SpawnRemote { children: vec!["R2".to_string()] })
+            .await;
+        let resp = run
+            .send(&b, Command::Forward { target: "R2".to_string(), inner: Box::new(Command::NetConnect { addr: format!("127.0.0.1:{port}"), data: "XW11_LATE_SPAWN".to_string() }) })
+            .await;
+        let pass = matches!(&resp, Response::Connected { echo } if echo.contains("XW11_LATE_SPAWN"));
+        let _ = run.send(&d3, Command::NetUnlisten { port }).await;
+        super::TestOutcome::new("R2", pass, format!("{resp:?}"))
     });
 }
 
 // Register pipe EOF tests.
-pub(crate) fn register_pipe_eof(tests: &mut Vec<super::Test>) {
-    // P1: pipe + fork
-    for &agent in &["A", "AA", "B", "D3", "D4", "NP"] {
+pub(crate) fn register_pipe_eof(reg: &mut Registry<'_>) {
+    for &agent in &[
+        AgentName::A,
+        AgentName::AA,
+        AgentName::B,
+        AgentName::D3,
+        AgentName::D4,
+        AgentName::NP,
+    ] {
         let id = format!("P1.pipe_eof_fork.{agent}");
-        let agent_s = agent.to_string();
-        tests.push(super::Test {
-            suite: "xworker",
-            group: "pipe_eof",
+        let agent_name = agent;
+        let agent_label = agent.to_string();
+        typed_test!(
+            reg,
+            "xworker",
+            "pipe_eof",
             id,
-            xfail: None,
-            timeout_secs: 60,
-            declared_agents: Vec::new(),
-            run: Box::new(move |r| {
-                let self_exe = r.self_exe.clone();
-                Box::pin(async move {
-                    let resp = r
-                        .send(
-                            &agent_s,
-                            super::exec_timeout(
-                                vec![self_exe, "pipe-test".into(), "eof-fork".into()],
-                                20,
-                            ),
-                        )
-                        .await;
-                    let pass = matches!(
-                        &resp,
-                        crate::protocol::Response::ExecResult { exit_code: 0, stdout, .. }
-                            if stdout.contains("P1_EOF_OK")
-                    );
-                    super::TestOutcome::new(&agent_s, pass, format!("{resp:?}"))
-                })
-            }),
-        });
+            timeout = 60,
+            agents[handle = agent_name],
+            |run| {
+                let self_exe = run.self_exe().to_string();
+                let resp = run
+                    .send(
+                        &handle,
+                        super::exec_timeout(
+                            vec![self_exe, "pipe-test".into(), "eof-fork".into()],
+                            20,
+                        ),
+                    )
+                    .await;
+                let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout.contains("P1_EOF_OK"));
+                super::TestOutcome::new(&agent_label, pass, format!("{resp:?}"))
+            }
+        );
     }
 
-    // P2: fork+exec(PIE)
-    for &agent in &["A", "AA", "B"] {
+    for &agent in &[AgentName::A, AgentName::AA, AgentName::B] {
         let id = format!("P2.pipe_eof_exec_pie.{agent}");
-        let agent_s = agent.to_string();
-        tests.push(super::Test {
-            suite: "xworker",
-            group: "pipe_eof",
+        let agent_name = agent;
+        let agent_label = agent.to_string();
+        typed_test!(
+            reg,
+            "xworker",
+            "pipe_eof",
             id,
-            xfail: None,
-            timeout_secs: 60,
-            declared_agents: Vec::new(),
-            run: Box::new(move |r| {
-                let self_exe = r.self_exe.clone();
-                Box::pin(async move {
-                    let resp = r
-                        .send(
-                            &agent_s,
-                            super::exec_timeout(
-                                vec![
-                                    self_exe.clone(),
-                                    "pipe-test".into(),
-                                    "eof-exec".into(),
-                                    self_exe,
-                                ],
-                                20,
-                            ),
-                        )
-                        .await;
-                    let pass = matches!(
-                        &resp,
-                        crate::protocol::Response::ExecResult { exit_code: 0, stdout, .. }
-                            if stdout.contains("P2_EOF_OK")
-                    );
-                    super::TestOutcome::new(&agent_s, pass, format!("{resp:?}"))
-                })
-            }),
-        });
+            timeout = 60,
+            agents[handle = agent_name],
+            |run| {
+                let self_exe = run.self_exe().to_string();
+                let resp = run
+                    .send(
+                        &handle,
+                        super::exec_timeout(
+                            vec![
+                                self_exe.clone(),
+                                "pipe-test".into(),
+                                "eof-exec".into(),
+                                self_exe,
+                            ],
+                            20,
+                        ),
+                    )
+                    .await;
+                let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout.contains("P2_EOF_OK"));
+                super::TestOutcome::new(&agent_label, pass, format!("{resp:?}"))
+            }
+        );
     }
 
-    // P2: fork+exec(nonpie)
-    for &agent in &["A", "AA", "B"] {
+    for &agent in &[AgentName::A, AgentName::AA, AgentName::B] {
         let id = format!("P2.pipe_eof_exec_nonpie.{agent}");
-        let agent_s = agent.to_string();
-        tests.push(super::Test {
-            suite: "xworker",
-            group: "pipe_eof",
+        let agent_name = agent;
+        let agent_label = agent.to_string();
+        typed_test!(
+            reg,
+            "xworker",
+            "pipe_eof",
             id,
-            xfail: None,
-            timeout_secs: 60,
-            declared_agents: Vec::new(),
-            run: Box::new(move |r| {
-                let self_exe = r.self_exe.clone();
-                Box::pin(async move {
-                    let nonpie = match crate::find_nonpie_binary() {
-                        Some(p) => p,
-                        None => {
-                            return super::TestOutcome::new(
-                                &agent_s,
-                                false,
-                                "FAIL: nonpie binary not found",
-                            );
-                        }
-                    };
-                    let resp = r
-                        .send(
-                            &agent_s,
-                            super::exec_timeout(
-                                vec![self_exe, "pipe-test".into(), "eof-exec".into(), nonpie],
-                                20,
-                            ),
-                        )
-                        .await;
-                    let pass = matches!(
-                        &resp,
-                        crate::protocol::Response::ExecResult { exit_code: 0, stdout, .. }
-                            if stdout.contains("P2_EOF_OK")
-                    );
-                    super::TestOutcome::new(&agent_s, pass, format!("{resp:?}"))
-                })
-            }),
-        });
+            timeout = 60,
+            agents[handle = agent_name],
+            |run| {
+                let self_exe = run.self_exe().to_string();
+                let nonpie = match crate::find_nonpie_binary() {
+                    Some(p) => p,
+                    None => {
+                        return super::TestOutcome::new(
+                            &agent_label,
+                            false,
+                            "FAIL: nonpie binary not found",
+                        );
+                    }
+                };
+                let resp = run
+                    .send(
+                        &handle,
+                        super::exec_timeout(
+                            vec![self_exe, "pipe-test".into(), "eof-exec".into(), nonpie],
+                            20,
+                        ),
+                    )
+                    .await;
+                let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout.contains("P2_EOF_OK"));
+                super::TestOutcome::new(&agent_label, pass, format!("{resp:?}"))
+            }
+        );
     }
 }
 
 // Register contamination sequence tests (X49-X59).
-pub(crate) fn register_contamination_sequence(tests: &mut Vec<super::Test>) {
-    // X49a
-    tests.push(super::Test {
-        suite: "contamination",
-        group: "contamination_sequence",
-        id: "X49a.pie_sequential_1".to_string(),
-        xfail: None,
-        timeout_secs: 60,
-        declared_agents: Vec::new(),
-        run: Box::new(|r| {
-            let self_exe = r.self_exe.clone();
-            Box::pin(async move {
-                let resp = r
-                    .send("A", super::exec(vec![self_exe, "echo-test".into()]))
-                    .await;
-                let pass = matches!(
-                    &resp,
-                    crate::protocol::Response::ExecResult { exit_code: 0, stdout, .. }
-                        if stdout == "ECHO_TEST_OK"
-                );
-                super::TestOutcome::new("A", pass, format!("{resp:?}"))
-            })
-        }),
-    });
+pub(crate) fn register_contamination_sequence(reg: &mut Registry<'_>) {
+    typed_test!(
+        reg,
+        "contamination",
+        "contamination_sequence",
+        "X49a.pie_sequential_1",
+        timeout = 60,
+        agents[a = AgentName::A],
+        |run| {
+            let self_exe = run.self_exe().to_string();
+            let resp = run
+                .send(&a, super::exec(vec![self_exe, "echo-test".into()]))
+                .await;
+            let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout == "ECHO_TEST_OK");
+            super::TestOutcome::new("A", pass, format!("{resp:?}"))
+        }
+    );
 
-    // X49b
-    tests.push(super::Test {
-        suite: "contamination",
-        group: "contamination_sequence",
-        id: "X49b.pie_sequential_2".to_string(),
-        xfail: None,
-        timeout_secs: 60,
-        declared_agents: Vec::new(),
-        run: Box::new(|r| {
-            let self_exe = r.self_exe.clone();
-            Box::pin(async move {
-                let resp = r
+    typed_test!(
+        reg,
+        "contamination",
+        "contamination_sequence",
+        "X49b.pie_sequential_2",
+        timeout = 60,
+        agents[a = AgentName::A],
+        |run| {
+            let self_exe = run.self_exe().to_string();
+            let resp = run
+                .send(
+                    &a,
+                    super::exec(vec![self_exe, "exit-with".into(), "0".into()]),
+                )
+                .await;
+            let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout.is_empty());
+            super::TestOutcome::new("A", pass, format!("{resp:?}"))
+        }
+    );
+
+    typed_test!(
+        reg,
+        "contamination",
+        "contamination_sequence",
+        "X50a.nonpie_then_pie_1",
+        timeout = 60,
+        agents[a = AgentName::A],
+        |run| {
+            let nonpie = match crate::find_nonpie_binary() {
+                Some(p) => p,
+                None => {
+                    return super::TestOutcome::new("A", false, "FAIL: nonpie binary not found");
+                }
+            };
+            let resp = run
+                .send(&a, super::exec(vec![nonpie, "echo-test".into()]))
+                .await;
+            let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout.contains("ECHO_TEST_OK"));
+            super::TestOutcome::new("A", pass, format!("{resp:?}"))
+        }
+    );
+
+    typed_test!(
+        reg,
+        "contamination",
+        "contamination_sequence",
+        "X50b.nonpie_then_pie_2",
+        timeout = 60,
+        agents[a = AgentName::A],
+        |run| {
+            let self_exe = run.self_exe().to_string();
+            let resp = run
+                .send(&a, super::exec(vec![self_exe, "echo-test".into()]))
+                .await;
+            let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout == "ECHO_TEST_OK");
+            super::TestOutcome::new("A", pass, format!("{resp:?}"))
+        }
+    );
+
+    typed_test!(
+        reg,
+        "contamination",
+        "contamination_sequence",
+        "X51.nonpie_fresh_agent",
+        timeout = 60,
+        agents[b = AgentName::B],
+        |run| {
+            let nonpie = match crate::find_nonpie_binary() {
+                Some(p) => p,
+                None => {
+                    return super::TestOutcome::new("B", false, "FAIL: nonpie binary not found");
+                }
+            };
+            let resp = run
+                .send(&b, super::exec(vec![nonpie, "echo-test".into()]))
+                .await;
+            let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout.contains("ECHO_TEST_OK"));
+            super::TestOutcome::new("B", pass, format!("{resp:?}"))
+        }
+    );
+
+    typed_test!(
+        reg,
+        "contamination",
+        "contamination_sequence",
+        "X52a.B_nonpie_then_pie",
+        timeout = 60,
+        agents[b = AgentName::B],
+        |run| {
+            let self_exe = run.self_exe().to_string();
+            let resp = run
+                .send(&b, super::exec(vec![self_exe, "echo-test".into()]))
+                .await;
+            let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout == "ECHO_TEST_OK");
+            super::TestOutcome::new("B", pass, format!("{resp:?}"))
+        }
+    );
+
+    typed_test!(
+        reg,
+        "contamination",
+        "contamination_sequence",
+        "X52b.B_pie_after_nonpie",
+        timeout = 60,
+        agents[b = AgentName::B],
+        |run| {
+            let self_exe = run.self_exe().to_string();
+            let resp = run
+                .send(
+                    &b,
+                    super::exec(vec![self_exe, "exit-with".into(), "0".into()]),
+                )
+                .await;
+            let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout.is_empty());
+            super::TestOutcome::new("B", pass, format!("{resp:?}"))
+        }
+    );
+
+    typed_test!(
+        reg,
+        "contamination",
+        "contamination_sequence",
+        "X52c.B_third_exec",
+        timeout = 60,
+        agents[b = AgentName::B],
+        |run| {
+            let self_exe = run.self_exe().to_string();
+            let resp = run
+                .send(&b, super::exec(vec![self_exe, "echo-test".into()]))
+                .await;
+            let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout == "ECHO_TEST_OK");
+            super::TestOutcome::new("B", pass, format!("{resp:?}"))
+        }
+    );
+
+    typed_test!(
+        reg,
+        "contamination",
+        "contamination_sequence",
+        "X53.stress_pie",
+        timeout = 60,
+        agents[ab = AgentName::AB],
+        |run| {
+            let self_exe = run.self_exe().to_string();
+            for i in 0..30 {
+                let resp = run
+                    .send(&ab, super::exec(vec![self_exe.clone(), "echo-test".into()]))
+                    .await;
+                let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout == "ECHO_TEST_OK");
+                if !pass {
+                    return super::TestOutcome::new(
+                        "AB",
+                        false,
+                        format!("failed at iteration {i}: {resp:?}"),
+                    );
+                }
+            }
+            super::TestOutcome::new("AB", true, "30 sequential PIE execs all passed")
+        }
+    );
+
+    typed_test!(
+        reg,
+        "contamination",
+        "contamination_sequence",
+        "X54.nonpie_after_stress",
+        timeout = 60,
+        agents[ab = AgentName::AB],
+        |run| {
+            let nonpie = match crate::find_nonpie_binary() {
+                Some(p) => p,
+                None => {
+                    return super::TestOutcome::new("AB", false, "FAIL: nonpie binary not found");
+                }
+            };
+            let resp = run
+                .send(&ab, super::exec(vec![nonpie, "echo-test".into()]))
+                .await;
+            let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout.contains("ECHO_TEST_OK"));
+            super::TestOutcome::new("AB", pass, format!("{resp:?}"))
+        }
+    );
+
+    typed_test!(
+        reg,
+        "contamination",
+        "contamination_sequence",
+        "X55a.one_pie_first",
+        timeout = 60,
+        agents[aab = AgentName::AAB],
+        |run| {
+            let self_exe = run.self_exe().to_string();
+            let resp = run
+                .send(&aab, super::exec(vec![self_exe, "echo-test".into()]))
+                .await;
+            let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout == "ECHO_TEST_OK");
+            super::TestOutcome::new("AAB", pass, format!("{resp:?}"))
+        }
+    );
+
+    typed_test!(
+        reg,
+        "contamination",
+        "contamination_sequence",
+        "X55b.nonpie_second",
+        timeout = 60,
+        agents[aab = AgentName::AAB],
+        |run| {
+            let nonpie = match crate::find_nonpie_binary() {
+                Some(p) => p,
+                None => {
+                    return super::TestOutcome::new("AAB", false, "FAIL: nonpie binary not found");
+                }
+            };
+            let resp = run
+                .send(&aab, super::exec(vec![nonpie, "echo-test".into()]))
+                .await;
+            let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout.contains("ECHO_TEST_OK"));
+            super::TestOutcome::new("AAB", pass, format!("{resp:?}"))
+        }
+    );
+
+    typed_test!(
+        reg,
+        "contamination",
+        "contamination_sequence",
+        "X56.second_nonpie_on_B",
+        timeout = 60,
+        agents[b = AgentName::B],
+        |run| {
+            let nonpie = match crate::find_nonpie_binary() {
+                Some(p) => p,
+                None => {
+                    return super::TestOutcome::new("B", false, "FAIL: nonpie binary not found");
+                }
+            };
+            let resp = run
+                .send(&b, super::exec(vec![nonpie, "echo-test".into()]))
+                .await;
+            let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout.contains("ECHO_TEST_OK"));
+            super::TestOutcome::new("B", pass, format!("{resp:?}"))
+        }
+    );
+
+    typed_test!(
+        reg,
+        "contamination",
+        "contamination_sequence",
+        "X57.pipe_churn_then_nonpie",
+        timeout = 60,
+        agents[b = AgentName::B],
+        |run| {
+            let nonpie = match crate::find_nonpie_binary() {
+                Some(p) => p,
+                None => {
+                    return super::TestOutcome::new("B", false, "FAIL: nonpie binary not found");
+                }
+            };
+            for _ in 0..20 {
+                let _ = run
                     .send(
-                        "A",
-                        super::exec(vec![self_exe, "exit-with".into(), "0".into()]),
+                        &b,
+                        super::exec(vec![
+                            "bash".into(),
+                            "-c".into(),
+                            "echo churn >/dev/null".into(),
+                        ]),
                     )
                     .await;
-                let pass = matches!(
-                    &resp,
-                    crate::protocol::Response::ExecResult { exit_code: 0, stdout, .. }
-                        if stdout.is_empty()
-                );
-                super::TestOutcome::new("A", pass, format!("{resp:?}"))
-            })
-        }),
-    });
+            }
+            let resp = run
+                .send(&b, super::exec(vec![nonpie, "echo-test".into()]))
+                .await;
+            let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout.contains("ECHO_TEST_OK"));
+            super::TestOutcome::new("B", pass, format!("{resp:?}"))
+        }
+    );
 
-    // X50a
-    tests.push(super::Test {
-        suite: "contamination",
-        group: "contamination_sequence",
-        id: "X50a.nonpie_then_pie_1".to_string(),
-        xfail: None,
-        timeout_secs: 60,
-        declared_agents: Vec::new(),
-        run: Box::new(|r| {
-            Box::pin(async move {
-                let nonpie = match crate::find_nonpie_binary() {
-                    Some(p) => p,
-                    None => {
-                        return super::TestOutcome::new(
-                            "A",
-                            false,
-                            "FAIL: nonpie binary not found",
-                        );
-                    }
-                };
-                let resp = r
-                    .send("A", super::exec(vec![nonpie, "echo-test".into()]))
+    typed_test!(
+        reg,
+        "contamination",
+        "contamination_sequence",
+        "X58.alternating_pie_nonpie",
+        timeout = 60,
+        agents[b = AgentName::B],
+        |run| {
+            let self_exe = run.self_exe().to_string();
+            let nonpie = match crate::find_nonpie_binary() {
+                Some(p) => p,
+                None => {
+                    return super::TestOutcome::new("B", false, "FAIL: nonpie binary not found");
+                }
+            };
+            let mut results: Vec<(String, bool)> = Vec::new();
+            for _ in 0..2 {
+                let resp = run
+                    .send(&b, super::exec(vec![self_exe.clone(), "echo-test".into()]))
                     .await;
-                let pass = matches!(
-                    &resp,
-                    crate::protocol::Response::ExecResult { exit_code: 0, stdout, .. }
-                        if stdout.contains("ECHO_TEST_OK")
-                );
-                super::TestOutcome::new("A", pass, format!("{resp:?}"))
-            })
-        }),
-    });
+                let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout == "ECHO_TEST_OK");
+                results.push((format!("{resp:?}"), pass));
 
-    // X50b
-    tests.push(super::Test {
-        suite: "contamination",
-        group: "contamination_sequence",
-        id: "X50b.nonpie_then_pie_2".to_string(),
-        xfail: None,
-        timeout_secs: 60,
-        declared_agents: Vec::new(),
-        run: Box::new(|r| {
-            let self_exe = r.self_exe.clone();
-            Box::pin(async move {
-                let resp = r
-                    .send("A", super::exec(vec![self_exe, "echo-test".into()]))
+                let resp = run
+                    .send(&b, super::exec(vec![nonpie.clone(), "echo-test".into()]))
                     .await;
-                let pass = matches!(
-                    &resp,
-                    crate::protocol::Response::ExecResult { exit_code: 0, stdout, .. }
-                        if stdout == "ECHO_TEST_OK"
-                );
-                super::TestOutcome::new("A", pass, format!("{resp:?}"))
-            })
-        }),
-    });
+                let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout.contains("ECHO_TEST_OK"));
+                results.push((format!("{resp:?}"), pass));
+            }
+            let all_pass = results.iter().all(|(_, p)| *p);
+            let detail = results
+                .iter()
+                .enumerate()
+                .map(|(i, (d, p))| format!("[{i}]={p}: {d}"))
+                .collect::<Vec<_>>()
+                .join("; ");
+            super::TestOutcome::new("B", all_pass, detail)
+        }
+    );
 
-    // X51
-    tests.push(super::Test {
-        suite: "contamination",
-        group: "contamination_sequence",
-        id: "X51.nonpie_fresh_agent".to_string(),
-        xfail: None,
-        timeout_secs: 60,
-        declared_agents: Vec::new(),
-        run: Box::new(|r| {
-            Box::pin(async move {
-                let nonpie = match crate::find_nonpie_binary() {
-                    Some(p) => p,
-                    None => {
-                        return super::TestOutcome::new(
-                            "B",
-                            false,
-                            "FAIL: nonpie binary not found",
-                        );
-                    }
-                };
-                let resp = r
-                    .send("B", super::exec(vec![nonpie, "echo-test".into()]))
+    typed_test!(
+        reg,
+        "contamination",
+        "contamination_sequence",
+        "X59.sequential_nonpie",
+        timeout = 60,
+        agents[b = AgentName::B],
+        |run| {
+            let nonpie = match crate::find_nonpie_binary() {
+                Some(p) => p,
+                None => {
+                    return super::TestOutcome::new("B", false, "FAIL: nonpie binary not found");
+                }
+            };
+            for i in 0..5 {
+                let resp = run
+                    .send(&b, super::exec(vec![nonpie.clone(), "echo-test".into()]))
                     .await;
-                let pass = matches!(
-                    &resp,
-                    crate::protocol::Response::ExecResult { exit_code: 0, stdout, .. }
-                        if stdout.contains("ECHO_TEST_OK")
-                );
-                super::TestOutcome::new("B", pass, format!("{resp:?}"))
-            })
-        }),
-    });
-
-    // X52a
-    tests.push(super::Test {
-        suite: "contamination",
-        group: "contamination_sequence",
-        id: "X52a.B_nonpie_then_pie".to_string(),
-        xfail: None,
-        timeout_secs: 60,
-        declared_agents: Vec::new(),
-        run: Box::new(|r| {
-            let self_exe = r.self_exe.clone();
-            Box::pin(async move {
-                let resp = r
-                    .send("B", super::exec(vec![self_exe, "echo-test".into()]))
-                    .await;
-                let pass = matches!(
-                    &resp,
-                    crate::protocol::Response::ExecResult { exit_code: 0, stdout, .. }
-                        if stdout == "ECHO_TEST_OK"
-                );
-                super::TestOutcome::new("B", pass, format!("{resp:?}"))
-            })
-        }),
-    });
-
-    // X52b
-    tests.push(super::Test {
-        suite: "contamination",
-        group: "contamination_sequence",
-        id: "X52b.B_pie_after_nonpie".to_string(),
-        xfail: None,
-        timeout_secs: 60,
-        declared_agents: Vec::new(),
-        run: Box::new(|r| {
-            let self_exe = r.self_exe.clone();
-            Box::pin(async move {
-                let resp = r
-                    .send(
+                let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout.contains("ECHO_TEST_OK"));
+                if !pass {
+                    return super::TestOutcome::new(
                         "B",
-                        super::exec(vec![self_exe, "exit-with".into(), "0".into()]),
-                    )
-                    .await;
-                let pass = matches!(
-                    &resp,
-                    crate::protocol::Response::ExecResult { exit_code: 0, stdout, .. }
-                        if stdout.is_empty()
-                );
-                super::TestOutcome::new("B", pass, format!("{resp:?}"))
-            })
-        }),
-    });
-
-    // X52c
-    tests.push(super::Test {
-        suite: "contamination",
-        group: "contamination_sequence",
-        id: "X52c.B_third_exec".to_string(),
-        xfail: None,
-        timeout_secs: 60,
-        declared_agents: Vec::new(),
-        run: Box::new(|r| {
-            let self_exe = r.self_exe.clone();
-            Box::pin(async move {
-                let resp = r
-                    .send("B", super::exec(vec![self_exe, "echo-test".into()]))
-                    .await;
-                let pass = matches!(
-                    &resp,
-                    crate::protocol::Response::ExecResult { exit_code: 0, stdout, .. }
-                        if stdout == "ECHO_TEST_OK"
-                );
-                super::TestOutcome::new("B", pass, format!("{resp:?}"))
-            })
-        }),
-    });
-
-    // X53 — 30 sequential PIE execs on AB
-    tests.push(super::Test {
-        suite: "contamination",
-        group: "contamination_sequence",
-        id: "X53.stress_pie".to_string(),
-        xfail: None,
-        timeout_secs: 60,
-        declared_agents: Vec::new(),
-        run: Box::new(|r| {
-            let self_exe = r.self_exe.clone();
-            Box::pin(async move {
-                for i in 0..30 {
-                    let resp = r
-                        .send(
-                            "AB",
-                            super::exec(vec![self_exe.clone(), "echo-test".into()]),
-                        )
-                        .await;
-                    let pass = matches!(
-                        &resp,
-                        crate::protocol::Response::ExecResult { exit_code: 0, stdout, .. }
-                            if stdout == "ECHO_TEST_OK"
+                        false,
+                        format!("failed at iteration {i}: {resp:?}"),
                     );
-                    if !pass {
-                        return super::TestOutcome::new(
-                            "AB",
-                            false,
-                            format!("failed at iteration {i}: {resp:?}"),
-                        );
-                    }
                 }
-                super::TestOutcome::new("AB", true, "30 sequential PIE execs all passed")
-            })
-        }),
-    });
-
-    // X54
-    tests.push(super::Test {
-        suite: "contamination",
-        group: "contamination_sequence",
-        id: "X54.nonpie_after_stress".to_string(),
-        xfail: None,
-        timeout_secs: 60,
-        declared_agents: Vec::new(),
-        run: Box::new(|r| {
-            Box::pin(async move {
-                let nonpie = match crate::find_nonpie_binary() {
-                    Some(p) => p,
-                    None => {
-                        return super::TestOutcome::new(
-                            "AB",
-                            false,
-                            "FAIL: nonpie binary not found",
-                        );
-                    }
-                };
-                let resp = r
-                    .send("AB", super::exec(vec![nonpie, "echo-test".into()]))
-                    .await;
-                let pass = matches!(
-                    &resp,
-                    crate::protocol::Response::ExecResult { exit_code: 0, stdout, .. }
-                        if stdout.contains("ECHO_TEST_OK")
-                );
-                super::TestOutcome::new("AB", pass, format!("{resp:?}"))
-            })
-        }),
-    });
-
-    // X55a
-    tests.push(super::Test {
-        suite: "contamination",
-        group: "contamination_sequence",
-        id: "X55a.one_pie_first".to_string(),
-        xfail: None,
-        timeout_secs: 60,
-        declared_agents: Vec::new(),
-        run: Box::new(|r| {
-            let self_exe = r.self_exe.clone();
-            Box::pin(async move {
-                let resp = r
-                    .send("AAB", super::exec(vec![self_exe, "echo-test".into()]))
-                    .await;
-                let pass = matches!(
-                    &resp,
-                    crate::protocol::Response::ExecResult { exit_code: 0, stdout, .. }
-                        if stdout == "ECHO_TEST_OK"
-                );
-                super::TestOutcome::new("AAB", pass, format!("{resp:?}"))
-            })
-        }),
-    });
-
-    // X55b
-    tests.push(super::Test {
-        suite: "contamination",
-        group: "contamination_sequence",
-        id: "X55b.nonpie_second".to_string(),
-        xfail: None,
-        timeout_secs: 60,
-        declared_agents: Vec::new(),
-        run: Box::new(|r| {
-            Box::pin(async move {
-                let nonpie = match crate::find_nonpie_binary() {
-                    Some(p) => p,
-                    None => {
-                        return super::TestOutcome::new(
-                            "AAB",
-                            false,
-                            "FAIL: nonpie binary not found",
-                        );
-                    }
-                };
-                let resp = r
-                    .send("AAB", super::exec(vec![nonpie, "echo-test".into()]))
-                    .await;
-                let pass = matches!(
-                    &resp,
-                    crate::protocol::Response::ExecResult { exit_code: 0, stdout, .. }
-                        if stdout.contains("ECHO_TEST_OK")
-                );
-                super::TestOutcome::new("AAB", pass, format!("{resp:?}"))
-            })
-        }),
-    });
-
-    // X56
-    tests.push(super::Test {
-        suite: "contamination",
-        group: "contamination_sequence",
-        id: "X56.second_nonpie_on_B".to_string(),
-        xfail: None,
-        timeout_secs: 60,
-        declared_agents: Vec::new(),
-        run: Box::new(|r| {
-            Box::pin(async move {
-                let nonpie = match crate::find_nonpie_binary() {
-                    Some(p) => p,
-                    None => {
-                        return super::TestOutcome::new(
-                            "B",
-                            false,
-                            "FAIL: nonpie binary not found",
-                        );
-                    }
-                };
-                let resp = r
-                    .send("B", super::exec(vec![nonpie, "echo-test".into()]))
-                    .await;
-                let pass = matches!(
-                    &resp,
-                    crate::protocol::Response::ExecResult { exit_code: 0, stdout, .. }
-                        if stdout.contains("ECHO_TEST_OK")
-                );
-                super::TestOutcome::new("B", pass, format!("{resp:?}"))
-            })
-        }),
-    });
-
-    // X57 — 20 pipe churns then nonpie
-    tests.push(super::Test {
-        suite: "contamination",
-        group: "contamination_sequence",
-        id: "X57.pipe_churn_then_nonpie".to_string(),
-        xfail: None,
-        timeout_secs: 60,
-        declared_agents: Vec::new(),
-        run: Box::new(|r| {
-            Box::pin(async move {
-                let nonpie = match crate::find_nonpie_binary() {
-                    Some(p) => p,
-                    None => {
-                        return super::TestOutcome::new(
-                            "B",
-                            false,
-                            "FAIL: nonpie binary not found",
-                        );
-                    }
-                };
-                for _ in 0..20 {
-                    let _ = r
-                        .send(
-                            "B",
-                            super::exec(vec![
-                                "bash".into(),
-                                "-c".into(),
-                                "echo churn >/dev/null".into(),
-                            ]),
-                        )
-                        .await;
-                }
-                let resp = r
-                    .send("B", super::exec(vec![nonpie, "echo-test".into()]))
-                    .await;
-                let pass = matches!(
-                    &resp,
-                    crate::protocol::Response::ExecResult { exit_code: 0, stdout, .. }
-                        if stdout.contains("ECHO_TEST_OK")
-                );
-                super::TestOutcome::new("B", pass, format!("{resp:?}"))
-            })
-        }),
-    });
-
-    // X58 — alternating PIE and non-PIE
-    tests.push(super::Test {
-        suite: "contamination",
-        group: "contamination_sequence",
-        id: "X58.alternating_pie_nonpie".to_string(),
-        xfail: None,
-        timeout_secs: 60,
-        declared_agents: Vec::new(),
-        run: Box::new(|r| {
-            let self_exe = r.self_exe.clone();
-            Box::pin(async move {
-                let nonpie = match crate::find_nonpie_binary() {
-                    Some(p) => p,
-                    None => {
-                        return super::TestOutcome::new(
-                            "B",
-                            false,
-                            "FAIL: nonpie binary not found",
-                        );
-                    }
-                };
-                let mut results: Vec<(String, bool)> = Vec::new();
-                for _ in 0..2 {
-                    let resp = r
-                        .send("B", super::exec(vec![self_exe.clone(), "echo-test".into()]))
-                        .await;
-                    let pass = matches!(
-                        &resp,
-                        crate::protocol::Response::ExecResult { exit_code: 0, stdout, .. }
-                            if stdout == "ECHO_TEST_OK"
-                    );
-                    results.push((format!("{resp:?}"), pass));
-
-                    let resp = r
-                        .send("B", super::exec(vec![nonpie.clone(), "echo-test".into()]))
-                        .await;
-                    let pass = matches!(
-                        &resp,
-                        crate::protocol::Response::ExecResult { exit_code: 0, stdout, .. }
-                            if stdout.contains("ECHO_TEST_OK")
-                    );
-                    results.push((format!("{resp:?}"), pass));
-                }
-                let all_pass = results.iter().all(|(_, p)| *p);
-                let detail = results
-                    .iter()
-                    .enumerate()
-                    .map(|(i, (d, p))| format!("[{i}]={p}: {d}"))
-                    .collect::<Vec<_>>()
-                    .join("; ");
-                super::TestOutcome::new("B", all_pass, detail)
-            })
-        }),
-    });
-
-    // X59 — 5 sequential non-PIE
-    tests.push(super::Test {
-        suite: "contamination",
-        group: "contamination_sequence",
-        id: "X59.sequential_nonpie".to_string(),
-        xfail: None,
-        timeout_secs: 60,
-        declared_agents: Vec::new(),
-        run: Box::new(|r| {
-            Box::pin(async move {
-                let nonpie = match crate::find_nonpie_binary() {
-                    Some(p) => p,
-                    None => {
-                        return super::TestOutcome::new(
-                            "B",
-                            false,
-                            "FAIL: nonpie binary not found",
-                        );
-                    }
-                };
-                for i in 0..5 {
-                    let resp = r
-                        .send("B", super::exec(vec![nonpie.clone(), "echo-test".into()]))
-                        .await;
-                    let pass = matches!(
-                        &resp,
-                        crate::protocol::Response::ExecResult { exit_code: 0, stdout, .. }
-                            if stdout.contains("ECHO_TEST_OK")
-                    );
-                    if !pass {
-                        return super::TestOutcome::new(
-                            "B",
-                            false,
-                            format!("failed at iteration {i}: {resp:?}"),
-                        );
-                    }
-                }
-                super::TestOutcome::new("B", true, "5 sequential non-PIE execs all passed")
-            })
-        }),
-    });
+            }
+            super::TestOutcome::new("B", true, "5 sequential non-PIE execs all passed")
+        }
+    );
 }
