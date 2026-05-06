@@ -15,12 +15,10 @@
 // FS tests (it handles FsRead/FsWrite/FsDelete/FsSymlink/FsReadlink/FsStat/
 // NetConnect locally). It cannot listen on TCP or Unix sockets.
 
-use super::TestRunner;
 use super::agents::{AgentHandle, AgentName};
 use super::registry::Registry;
 use super::run_context::RunContext;
 use crate::protocol::{Command, Response};
-use std::collections::HashSet;
 use std::future::Future;
 use std::pin::Pin;
 
@@ -104,29 +102,6 @@ impl Topology {
             Self::NonPieChildUp => "nonpie_child_up",
             Self::DeepNonPie => "deep_nonpie",
         }
-    }
-}
-
-// ── Xfail registry ──
-
-#[allow(dead_code)]
-fn build_xfail_set() -> HashSet<&'static str> {
-    HashSet::new()
-}
-
-#[allow(dead_code)]
-fn record(
-    r: &mut TestRunner,
-    test_id: &str,
-    agent: &str,
-    pass: bool,
-    detail: &str,
-    xfails: &HashSet<&str>,
-) {
-    if let Some(&reason) = xfails.get(test_id) {
-        r.record_xfail(test_id, agent, pass, reason, detail);
-    } else {
-        r.record(test_id, agent, pass, detail);
     }
 }
 

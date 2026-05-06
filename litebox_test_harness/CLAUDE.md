@@ -61,7 +61,7 @@ for the underlying platform capability first.
 ## WSL2 Gold Standard
 
 The native baseline is the gold standard. Every test must pass there —
-**0 FAIL, 0 xfail** on native.
+**0 FAIL** on native.
 
 - `tests/integration.rs` runs the native baseline inside the
   `litebox-test` Docker image (`docker run --rm --cap-add SYS_PTRACE
@@ -73,8 +73,12 @@ The native baseline is the gold standard. Every test must pass there —
 - The Docker image is built on demand by `ensure_docker_image()` from
   `litebox_tool_executor/rootfs/Dockerfile` — no manual setup.
 
-Litebox xfails are only for **dynamically detected** platform limitations
-(e.g., symlink probe returns ENOTSUP). Never use static/hardcoded xfails.
+There is no expected-failure mechanism in this harness. Outcomes are
+strictly `pass` or `FAIL`. A litebox test that does not work fails for
+real, every run, until the product code is fixed. Do not add any
+form of "expected fail" allowlist, dynamic skip, or static xfail set —
+they are not supported and existed only as dead code in earlier
+iterations.
 
 ## Principles
 
@@ -111,10 +115,11 @@ Litebox xfails are only for **dynamically detected** platform limitations
    If a test needs a server/client pattern, add a subcommand to the
    test binary (main.rs) rather than invoking an interpreter.
 
-8. **xfail must have a reason and track a real issue** — every
-   `record_xfail()` call must include a reason string. When the
-   limitation is fixed, the test becomes XPASS and forces the
-   expectation to be updated.
+8. **Reason every failing test, never paper over it** — every test
+   must have a clear pass/FAIL semantic and a clear reproduction.
+   When a test fails, fix the product code; do not add an "expected
+   fail" mechanism, do not introduce a skip path, and do not record
+   `pass` with a "skipped" detail string.
 
 ### Fixing Bugs
 
@@ -122,10 +127,10 @@ Litebox xfails are only for **dynamically detected** platform limitations
    minimal test is the highest-priority signal. It identifies a concrete
    product bug with a clear reproduction. Do not defer it.
 
-10. **Never remove failing tests for convenience** — failing tests must
-    not be deleted, commented out, or converted to xfail simply because
-    they are inconvenient. The product code must be fixed. The only valid
-    xfail reason is a known platform limitation with a documented reason.
+10. **Never remove or paper over failing tests for convenience** —
+    failing tests must not be deleted, commented out, converted to a
+    "skip" path, or hidden behind a dynamic gate just because they are
+    inconvenient. The product code must be fixed.
 
 11. **Cover all configurations before changing product code** — before
     fixing a bug, write minimal tests covering all relevant configurations
@@ -176,7 +181,9 @@ When a test fails and the root cause is unclear:
 
 ## What NOT to Do
 
-- Do NOT add static xfail sets or hardcoded expected-failure lists
+- Do NOT introduce any "expected fail" mechanism — no `xfail` /
+  `XPASS` outcomes, no allowlists of known-failing tests, no dynamic
+  skip paths. Outcomes are `pass` or `FAIL`, period.
 - Do NOT skip tests by recording `pass` with "skipped" detail — that hides failures
 - Do NOT use `child.kill().await` in litebox (hangs; use `start_kill()`)
 - Do NOT let Exec timeouts desync the agent — use subprocess isolation
@@ -186,7 +193,7 @@ When a test fails and the root cause is unclear:
   the spawn-tree process can be SIGKILL'd during `teardown_tree` under
   litebox, dropping anything not already on the pipe. Emit progress
   records (JSON / log lines) incrementally and flush. See
-  `coordinator::record_expected` for the pattern: one `println!` +
+  `TestRunner::record` for the pattern: one `println!` +
   `stdout().flush()` per result, alongside the existing `eprintln!`.
 
 ## Enforcement
@@ -243,14 +250,13 @@ process where the OnceLock works.
 
 The integration test verifies:
 - Native baseline: every `native::<id>` trial passes (0 FAIL).
-- Litebox: every `litebox::<id>` trial that is not declared `xfail`
-  must pass; XPASS on a previously-xfailed test is also a failure.
-  Any test passing native but failing litebox is a regression.
+- Litebox: every `litebox::<id>` trial passes. There is no
+  expected-failure escape hatch; any test that fails on litebox but
+  passes on native is a real product bug and must be fixed in the
+  shim, not annotated away.
 
-There are no longer "expected counts" constants to update — each trial
-is asserted individually. To intentionally accept a new litebox-only
-failure, add a `record_xfail()` call with a reason string at the
-relevant suite registration point (never a static allowlist).
+There are no "expected counts" constants and no allowlist of tolerated
+litebox failures. Each trial is asserted individually: pass or fail.
 
 ### Code review checklist
 When adding tests, verify:
@@ -259,7 +265,7 @@ When adding tests, verify:
 - [ ] Tests all relevant axes (parent↔child, sibling, depth 2+)
 - [ ] Added to `litebox_tool_executor/rootfs/Dockerfile` if a new
       guest binary/file is required
-- [ ] xfail has a reason string
+- [ ] No "expected fail" / skip / dynamic gate dressed up as a pass
 - [ ] VS Code concern has a corresponding minimal self-contained test
 - [ ] Passes on native baseline (WSL2 gold standard)
 

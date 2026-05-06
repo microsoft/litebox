@@ -47,7 +47,6 @@ pub struct Test {
     pub(crate) suite: &'static str,
     pub(crate) group: &'static str,
     pub id: String,
-    pub(crate) xfail: Option<String>,
     pub(crate) timeout_secs: u64,
     /// Agents this test will contact, expressed as an explicit set
     /// declared at registration time via `RegistrationContext::require`
@@ -157,36 +156,22 @@ pub(crate) struct Child {
     pub(crate) process: tokio::process::Child,
 }
 
-/// Expected outcome of a test.
-#[derive(Debug, Clone)]
-pub enum Expectation {
-    /// Test is expected to pass.
-    Pass,
-    /// Test is expected to fail (known limitation). Contains reason.
-    #[allow(dead_code)]
-    Fail(String),
-}
-
-/// Result of a single test.
+/// Result of a single test. Outcomes are strictly `pass` or `FAIL` —
+/// there is no expected-failure mechanism: a litebox test that does
+/// not work fails for real, and a native baseline test must pass.
 #[derive(Debug, Clone)]
 pub struct TestResult {
     pub id: String,
     pub agent: String,
     pub actual_pass: bool,
-    pub expected: Expectation,
     pub detail: String,
 }
 
 impl TestResult {
-    /// Effective outcome: pass, fail, xfail, or xpass.
+    /// Effective outcome: `"pass"` or `"FAIL"`.
     #[must_use]
     pub fn outcome(&self) -> &'static str {
-        match (&self.expected, self.actual_pass) {
-            (Expectation::Pass, true) => "pass",
-            (Expectation::Pass, false) => "FAIL",
-            (Expectation::Fail(_), false) => "xfail",
-            (Expectation::Fail(_), true) => "XPASS",
-        }
+        if self.actual_pass { "pass" } else { "FAIL" }
     }
 }
 
@@ -217,30 +202,9 @@ pub struct TestRunner {
 }
 
 impl TestRunner {
-    /// Record a test expected to pass.
+    /// Record a test result. The only outcomes are `pass` and `FAIL`;
+    /// there is no expected-failure path.
     fn record(&mut self, test: &str, agent: &str, pass: bool, detail: &str) {
-        self.record_expected(test, agent, pass, Expectation::Pass, detail);
-    }
-
-    /// Record a test with an expected failure (known limitation).
-    fn record_xfail(&mut self, test: &str, agent: &str, pass: bool, reason: &str, detail: &str) {
-        self.record_expected(
-            test,
-            agent,
-            pass,
-            Expectation::Fail(reason.to_string()),
-            detail,
-        );
-    }
-
-    fn record_expected(
-        &mut self,
-        test: &str,
-        agent: &str,
-        pass: bool,
-        expected: Expectation,
-        detail: &str,
-    ) {
         use std::io::Write as _;
         let key = format!("{test} {agent}");
         if !self.recorded_ids.insert(key) {
@@ -251,7 +215,6 @@ impl TestRunner {
             id: test.to_string(),
             agent: agent.to_string(),
             actual_pass: pass,
-            expected,
             detail: detail.to_string(),
         };
         let outcome = result.outcome();
@@ -425,16 +388,11 @@ impl TestRunner {
                     self.spawned_agents.insert(n.name().to_string());
                 }
             }
-            if tokio::time::timeout(
-                Duration::from_secs(30),
-                self.spawn_nonpie_subtree(needed),
-            )
-            .await
-            .is_err()
+            if tokio::time::timeout(Duration::from_secs(30), self.spawn_nonpie_subtree(needed))
+                .await
+                .is_err()
             {
-                eprintln!(
-                    "[coord] non-PIE subtree setup timed out (30s, likely pipe bridge bug)"
-                );
+                eprintln!("[coord] non-PIE subtree setup timed out (30s, likely pipe bridge bug)");
             }
         }
     }
@@ -916,17 +874,7 @@ async fn run_tests(self_exe: &str, filter: Option<&str>) -> Vec<TestResult> {
         for test in new_filtered {
             let timeout_dur = Duration::from_secs(test.timeout_secs);
             if let Ok(outcome) = tokio::time::timeout(timeout_dur, (test.run)(&mut runner)).await {
-                if let Some(reason) = &test.xfail {
-                    runner.record_xfail(
-                        &test.id,
-                        &outcome.agent,
-                        outcome.pass,
-                        reason,
-                        &outcome.detail,
-                    );
-                } else {
-                    runner.record(&test.id, &outcome.agent, outcome.pass, &outcome.detail);
-                }
+                runner.record(&test.id, &outcome.agent, outcome.pass, &outcome.detail);
             } else {
                 runner.record(
                     &test.id,

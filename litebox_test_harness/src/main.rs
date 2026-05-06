@@ -92,22 +92,19 @@ fn main() {
             // Optional: --filter=matrix to run only matrix tests.
             let filter = args.iter().find_map(|a| a.strip_prefix("--filter="));
             // JSON results are emitted incrementally on stdout from
-            // record_expected as each test completes (see coordinator/mod.rs).
-            // We just compute the summary counts here.
+            // TestRunner::record as each test completes (see coordinator/mod.rs).
+            // We just compute the summary counts here. Outcomes are strictly
+            // `pass` or `FAIL` — there is no expected-failure mechanism.
             let results = coordinator::run_filtered(self_exe, filter);
             let pass_count = results.iter().filter(|r| r.outcome() == "pass").count();
             let fail_count = results.iter().filter(|r| r.outcome() == "FAIL").count();
-            let xfail_count = results.iter().filter(|r| r.outcome() == "xfail").count();
-            let xpass_count = results.iter().filter(|r| r.outcome() == "XPASS").count();
             eprintln!(
-                "\n=== SUMMARY: {} total, {} passed, {} failed, {} xfail, {} xpass ===",
+                "\n=== SUMMARY: {} total, {} passed, {} failed ===",
                 results.len(),
                 pass_count,
                 fail_count,
-                xfail_count,
-                xpass_count
             );
-            // Exit non-zero only for unexpected results.
+            // Exit non-zero on any FAIL.
             //
             // Use `std::process::exit` (not a `return` from `main`) so we
             // skip Drop on the tokio runtime and on any leaked
@@ -116,7 +113,7 @@ fn main() {
             // host child processes whose pipe-relay threads in the runner
             // would otherwise prevent the runner from exiting; the kernel
             // SIGKILLs everything when this process terminates.
-            let exit_code = i32::from(fail_count > 0 || xpass_count > 0);
+            let exit_code = i32::from(fail_count > 0);
             std::process::exit(exit_code);
         }
         "agent" => {
