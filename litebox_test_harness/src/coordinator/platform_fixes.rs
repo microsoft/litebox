@@ -38,6 +38,7 @@ pub(crate) fn register_poll_ready_tests() -> Vec<super::Test> {
             id: format!("POLL.pipe.{agent}"),
             xfail: None,
             timeout_secs: 60,
+            declared_agents: Vec::new(),
             run: Box::new(move |r| {
                 let a = agent_s.clone();
                 Box::pin(async move {
@@ -67,6 +68,7 @@ pub(crate) fn register_bind_getsockname_tests() -> Vec<super::Test> {
                 id: format!("GSN.{family}.{agent}"),
                 xfail: None,
                 timeout_secs: 60,
+                declared_agents: Vec::new(),
                 run: Box::new(move |r| {
                     let a = agent_s.clone();
                     let f = family_s.clone();
@@ -102,6 +104,7 @@ pub(crate) fn register_pipe_pair_id_tests() -> Vec<super::Test> {
             id: format!("PID.{agent}"),
             xfail: None,
             timeout_secs: 60,
+            declared_agents: Vec::new(),
             run: Box::new(move |r| {
                 let a = agent_s.clone();
                 Box::pin(async move {
@@ -132,6 +135,7 @@ pub(crate) fn register_exit_data_integrity_tests() -> Vec<super::Test> {
                     id: format!("EXITD.{size}.{binary}.{agent}"),
                     xfail: None,
                     timeout_secs: 60,
+                    declared_agents: Vec::new(),
                     run: Box::new(move |r| {
                         let a = agent_s.clone();
                         let b = binary_s.clone();
@@ -202,6 +206,7 @@ pub(crate) fn register_nonpie_pipe_chain_tests() -> Vec<super::Test> {
                 id: format!("NPIPE.seq.x{reps}.{agent}"),
                 xfail: None,
                 timeout_secs: 60,
+                declared_agents: Vec::new(),
                 run: Box::new(move |r| {
                     let a = agent_s.clone();
                     let _self_exe = r.self_exe.clone();
@@ -259,6 +264,7 @@ pub(crate) fn register_nonpie_pipe_chain_tests() -> Vec<super::Test> {
                 id: format!("NPIPE.interleaved.x{reps}.{agent}"),
                 xfail: None,
                 timeout_secs: 60,
+                declared_agents: Vec::new(),
                 run: Box::new(move |r| {
                     let a = agent_s2.clone();
                     let self_exe = r.self_exe.clone();
@@ -340,6 +346,7 @@ pub(crate) fn register_cross_worker_first_connect_tests() -> Vec<super::Test> {
             id: "XCONN.cross_first".to_string(),
             xfail: None,
             timeout_secs: 60,
+            declared_agents: Vec::new(),
             run: Box::new(move |r| {
                 Box::pin(async move {
                     let port = 19900u16;
@@ -373,6 +380,7 @@ pub(crate) fn register_cross_worker_first_connect_tests() -> Vec<super::Test> {
             id: "XCONN.deep_cross".to_string(),
             xfail: None,
             timeout_secs: 60,
+            declared_agents: Vec::new(),
             run: Box::new(move |r| {
                 Box::pin(async move {
                     let port = 19901u16;
@@ -407,6 +415,7 @@ pub(crate) fn register_cross_worker_first_connect_tests() -> Vec<super::Test> {
             id: "XCONN.cross_seq_x3".to_string(),
             xfail: None,
             timeout_secs: 60,
+            declared_agents: Vec::new(),
             run: Box::new(move |r| {
                 Box::pin(async move {
                     let port = 19902u16;
@@ -463,6 +472,7 @@ pub(crate) fn register_cross_worker_self_connect_tests() -> Vec<super::Test> {
             id: "XCONN.self_A".to_string(),
             xfail: None,
             timeout_secs: 60,
+            declared_agents: Vec::new(),
             run: Box::new(move |r| {
                 Box::pin(async move {
                     let port = 19910u16;
@@ -496,6 +506,7 @@ pub(crate) fn register_cross_worker_self_connect_tests() -> Vec<super::Test> {
             id: "XCONN.parent_child".to_string(),
             xfail: None,
             timeout_secs: 60,
+            declared_agents: Vec::new(),
             run: Box::new(move |r| {
                 Box::pin(async move {
                     let port = 19911u16;
@@ -529,6 +540,7 @@ pub(crate) fn register_cross_worker_self_connect_tests() -> Vec<super::Test> {
             id: "XCONN.child_parent".to_string(),
             xfail: None,
             timeout_secs: 60,
+            declared_agents: Vec::new(),
             run: Box::new(move |r| {
                 Box::pin(async move {
                     let port = 19912u16;
@@ -562,6 +574,7 @@ pub(crate) fn register_cross_worker_self_connect_tests() -> Vec<super::Test> {
             id: "XCONN.sibling_AB".to_string(),
             xfail: None,
             timeout_secs: 60,
+            declared_agents: Vec::new(),
             run: Box::new(move |r| {
                 Box::pin(async move {
                     let port = 19913u16;
@@ -608,6 +621,7 @@ pub(crate) fn register_bash_fork_exec_tests() -> Vec<super::Test> {
             id: format!("BASH.fork_ls.{agent}"),
             xfail: None,
             timeout_secs: 60,
+            declared_agents: Vec::new(),
             run: Box::new(move |r| {
                 let a = a.clone();
                 Box::pin(async move {
@@ -639,6 +653,7 @@ pub(crate) fn register_bash_fork_exec_tests() -> Vec<super::Test> {
             id: format!("BASH.fork_subst.{agent}"),
             xfail: None,
             timeout_secs: 60,
+            declared_agents: Vec::new(),
             run: Box::new(move |r| {
                 let a = a.clone();
                 Box::pin(async move {
@@ -670,6 +685,7 @@ pub(crate) fn register_bash_fork_exec_tests() -> Vec<super::Test> {
             id: format!("BASH.fork_bg_fg.{agent}"),
             xfail: None,
             timeout_secs: 60,
+            declared_agents: Vec::new(),
             run: Box::new(move |r| {
                 let a = a.clone();
                 Box::pin(async move {
@@ -709,6 +725,7 @@ pub(crate) fn register_fork_from_worker_exec_tests() -> Vec<super::Test> {
             id: "FWE.nonpie_from_init".to_string(),
             xfail: None,
             timeout_secs: 60,
+            declared_agents: Vec::new(),
             run: Box::new(move |r| {
                 let self_exe = r.self_exe.clone();
                 Box::pin(async move {
@@ -752,6 +769,7 @@ pub(crate) fn register_fork_from_worker_exec_tests() -> Vec<super::Test> {
             id: "FWE.pie_from_init".to_string(),
             xfail: None,
             timeout_secs: 60,
+            declared_agents: Vec::new(),
             run: Box::new(move |r| {
                 let self_exe = r.self_exe.clone();
                 Box::pin(async move {
@@ -785,6 +803,7 @@ pub(crate) fn register_fork_from_worker_exec_tests() -> Vec<super::Test> {
             id: "FWE.pie_from_worker_exec".to_string(),
             xfail: None,
             timeout_secs: 60,
+            declared_agents: Vec::new(),
             run: Box::new(move |r| {
                 let self_exe = r.self_exe.clone();
                 Box::pin(async move {
@@ -823,6 +842,7 @@ pub(crate) fn register_fork_from_worker_exec_tests() -> Vec<super::Test> {
             id: "FWE.nonpie_from_worker_exec".to_string(),
             xfail: None,
             timeout_secs: 60,
+            declared_agents: Vec::new(),
             run: Box::new(move |r| {
                 let _self_exe = r.self_exe.clone();
                 Box::pin(async move {
@@ -918,6 +938,7 @@ pub(crate) fn register_stdin_pipe_subst_tests() -> Vec<super::Test> {
                 id: format!("SP.{name}.{agent}"),
                 xfail: None,
                 timeout_secs: 60,
+                declared_agents: Vec::new(),
                 run: Box::new(move |r| {
                     let a = agent_s.clone();
                     let s = script.clone();
@@ -966,6 +987,7 @@ pub(crate) fn register_cross_worker_file_tests() -> Vec<super::Test> {
                 id: format!("CWF.seq.{agent}"),
                 xfail: None,
                 timeout_secs: 60,
+                declared_agents: Vec::new(),
                 run: Box::new(move |r| {
                     let a = a.clone();
                     let self_exe = r.self_exe.clone();
@@ -1011,6 +1033,7 @@ pub(crate) fn register_cross_worker_file_tests() -> Vec<super::Test> {
                 id: format!("CWF.concurrent.{agent}"),
                 xfail: None,
                 timeout_secs: 60,
+                declared_agents: Vec::new(),
                 run: Box::new(move |r| {
                     let a = a.clone();
                     let self_exe = r.self_exe.clone();
@@ -1066,6 +1089,7 @@ pub(crate) fn register_cross_worker_file_tests() -> Vec<super::Test> {
                 id: format!("CWF.hold.{agent}"),
                 xfail: None,
                 timeout_secs: 60,
+                declared_agents: Vec::new(),
                 run: Box::new(move |r| {
                     let a = a.clone();
                     let self_exe = r.self_exe.clone();
@@ -1121,6 +1145,7 @@ pub(crate) fn register_cross_worker_file_tests() -> Vec<super::Test> {
                 id: format!("CWF.self_open.{agent}"),
                 xfail: None,
                 timeout_secs: 60,
+                declared_agents: Vec::new(),
                 run: Box::new(move |r| {
                     let a = a.clone();
                     let self_exe = r.self_exe.clone();
@@ -1167,6 +1192,7 @@ pub(crate) fn register_cross_worker_file_tests() -> Vec<super::Test> {
                 id: format!("CWF.redirect_stdout.{agent}"),
                 xfail: None,
                 timeout_secs: 60,
+                declared_agents: Vec::new(),
                 run: Box::new(move |r| {
                     let a = a.clone();
                     let self_exe = r.self_exe.clone();
@@ -1214,6 +1240,7 @@ pub(crate) fn register_cross_worker_file_tests() -> Vec<super::Test> {
                 id: format!("CWF.redirect_exit.{agent}"),
                 xfail: None,
                 timeout_secs: 60,
+                declared_agents: Vec::new(),
                 run: Box::new(move |r| {
                     let a = a.clone();
                     let self_exe = r.self_exe.clone();
@@ -1260,6 +1287,7 @@ pub(crate) fn register_cross_worker_file_tests() -> Vec<super::Test> {
                 id: format!("CWF.builtin_redirect.{agent}"),
                 xfail: None,
                 timeout_secs: 60,
+                declared_agents: Vec::new(),
                 run: Box::new(move |r| {
                     let a = a.clone();
                     Box::pin(async move {
@@ -1367,6 +1395,7 @@ pub(crate) fn register_subst_capture_tests() -> Vec<super::Test> {
                 id: format!("SC.{name}.{agent}"),
                 xfail: None,
                 timeout_secs: 60,
+                declared_agents: Vec::new(),
                 run: Box::new(move |r| {
                     let a = agent_s.clone();
                     let s = script.clone();
@@ -1442,6 +1471,7 @@ pub(crate) fn register_concurrent_fork_tests() -> Vec<super::Test> {
                 id: format!("CC.{name}.{agent}"),
                 xfail: None,
                 timeout_secs: 60,
+                declared_agents: Vec::new(),
                 run: Box::new(move |r| {
                     let a = agent_s.clone();
                     let t = template.clone();
@@ -1560,6 +1590,7 @@ pub(crate) fn register_touch_redirect_tests() -> Vec<super::Test> {
                 id: format!("TR.{name}.{agent}"),
                 xfail: None,
                 timeout_secs: 60,
+                declared_agents: Vec::new(),
                 run: Box::new(move |r| {
                     let a = agent_s.clone();
                     let t = template.clone();
@@ -1726,6 +1757,7 @@ pub(crate) fn register_pid_visibility_tests() -> Vec<super::Test> {
                 id: format!("KP.{name}.{agent}"),
                 xfail: None,
                 timeout_secs: 60,
+                declared_agents: Vec::new(),
                 run: Box::new(move |r| {
                     let a = agent_s.clone();
                     let t = template.clone();
@@ -1813,6 +1845,7 @@ pub(crate) fn register_file_redirect_tests() -> Vec<super::Test> {
                 id: format!("FR.{name}.{agent}"),
                 xfail: None,
                 timeout_secs: 60,
+                declared_agents: Vec::new(),
                 run: Box::new(move |r| {
                     let a = agent_s.clone();
                     let t = template.clone();
@@ -1868,6 +1901,7 @@ pub(crate) fn register_pipe_nonblock_tests() -> Vec<super::Test> {
                 id: format!("PN.{agent}.{suffix}"),
                 xfail: None,
                 timeout_secs: 60,
+                declared_agents: Vec::new(),
                 run: Box::new(move |r| {
                     let a = agent_s.clone();
                     let m = marker_s.clone();
@@ -1911,6 +1945,7 @@ pub(crate) fn register_pipe_nonblock_tests() -> Vec<super::Test> {
                 id: format!("PN.child.{agent}.{suffix}"),
                 xfail: None,
                 timeout_secs: 60,
+                declared_agents: Vec::new(),
                 run: Box::new(move |r| {
                     let a = agent_s.clone();
                     let m = marker_s.clone();
@@ -1969,6 +2004,7 @@ pub(crate) fn register_epoll_socket_tests() -> Vec<super::Test> {
                     id: format!("EP.{variant}.accept.{agent}"),
                     xfail: None,
             timeout_secs: 60,
+                    declared_agents: Vec::new(),
                     run: Box::new(move |r| {
                         let a = agent_s.clone();
                         let v = variant_s.clone();
@@ -2011,6 +2047,7 @@ pub(crate) fn register_epoll_socket_tests() -> Vec<super::Test> {
                     id: format!("EP.{variant}.read.{agent}"),
                     xfail: None,
                     timeout_secs: 60,
+                    declared_agents: Vec::new(),
                     run: Box::new(move |r| {
                         let a = agent_s.clone();
                         let v = variant_s.clone();
@@ -2139,6 +2176,7 @@ pub(crate) fn register_loopback_tcp_tests() -> Vec<super::Test> {
                 id: format!("LB.{name}.{agent}"),
                 xfail: None,
                 timeout_secs: 60,
+                declared_agents: Vec::new(),
                 run: Box::new(move |r| {
                     let a = agent_s.clone();
                     let t = template.clone();
@@ -2184,6 +2222,7 @@ pub(crate) fn register_fork_listen_close_tests() -> Vec<super::Test> {
             id: "FKLC.listen_unlisten".to_string(),
             xfail: None,
             timeout_secs: 60,
+            declared_agents: Vec::new(),
             run: Box::new(move |r| {
                 Box::pin(async move {
                     let port = 19920u16;
@@ -2218,6 +2257,7 @@ pub(crate) fn register_fork_listen_close_tests() -> Vec<super::Test> {
             id: "FKLC.cross_connect".to_string(),
             xfail: None,
             timeout_secs: 60,
+            declared_agents: Vec::new(),
             run: Box::new(move |r| {
                 let self_exe = r.self_exe.clone();
                 Box::pin(async move {
@@ -2289,6 +2329,7 @@ pub(crate) fn register_proc_filesystem_tests() -> Vec<super::Test> {
                 id: format!("PROC.self_stat.{agent}"),
                 xfail: None,
                 timeout_secs: 60,
+                declared_agents: Vec::new(),
                 run: Box::new(move |r| {
                     let a = a.clone();
                     Box::pin(async move {
@@ -2317,6 +2358,7 @@ pub(crate) fn register_proc_filesystem_tests() -> Vec<super::Test> {
                 id: format!("PROC.stat_seekable.{agent}"),
                 xfail: None,
                 timeout_secs: 60,
+                declared_agents: Vec::new(),
                 run: Box::new(move |r| {
                     let a = a.clone();
                     Box::pin(async move {
@@ -2351,6 +2393,7 @@ pub(crate) fn register_proc_filesystem_tests() -> Vec<super::Test> {
                 id: format!("PROC.uptime.{agent}"),
                 xfail: None,
                 timeout_secs: 60,
+                declared_agents: Vec::new(),
                 run: Box::new(move |r| {
                     let a = a.clone();
                     Box::pin(async move {
@@ -2417,6 +2460,7 @@ pub(crate) fn register_subtree_kill_tests() -> Vec<super::Test> {
         id: "SK.subtree.direct_nonpie".to_string(),
         xfail: None,
         timeout_secs: SK_TEST_TIMEOUT_SECS,
+        declared_agents: Vec::new(),
         run: Box::new(|r| {
             let self_exe = r.self_exe.clone();
             Box::pin(async move {
@@ -2457,6 +2501,7 @@ pub(crate) fn register_subtree_kill_tests() -> Vec<super::Test> {
         id: "SK.subtree.deep_nonpie".to_string(),
         xfail: None,
         timeout_secs: SK_TEST_TIMEOUT_SECS,
+        declared_agents: Vec::new(),
         run: Box::new(|r| {
             let self_exe = r.self_exe.clone();
             Box::pin(async move {
@@ -2513,6 +2558,7 @@ pub(crate) fn register_subtree_kill_tests() -> Vec<super::Test> {
         id: "SK.subtree.exit_then_kill".to_string(),
         xfail: None,
         timeout_secs: SK_TEST_TIMEOUT_SECS,
+        declared_agents: Vec::new(),
         run: Box::new(|r| {
             let self_exe = r.self_exe.clone();
             Box::pin(async move {

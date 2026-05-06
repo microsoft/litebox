@@ -85,6 +85,7 @@ pub(crate) fn register_concurrent_fork_pipeline(tests: &mut Vec<super::Test>) {
                 id: format!("CF.{name}.{agent}"),
                 xfail: None,
                 timeout_secs: 90,
+                declared_agents: Vec::new(),
                 run: Box::new(move |r| {
                     Box::pin(async move {
                         let resp = r
@@ -121,6 +122,7 @@ pub(crate) fn register_concurrent_fork_pipeline(tests: &mut Vec<super::Test>) {
             id: format!("CF.pipe4_vscode.{agent}"),
             xfail: None,
             timeout_secs: 90,
+            declared_agents: Vec::new(),
             run: Box::new(move |r| {
                 Box::pin(async move {
                     let resp = r
@@ -156,6 +158,7 @@ pub(crate) fn register_concurrent_fork_pipeline(tests: &mut Vec<super::Test>) {
             id: format!("CF.sequential_control.{agent}"),
             xfail: None,
             timeout_secs: 90,
+            declared_agents: Vec::new(),
             run: Box::new(move |r| {
                 Box::pin(async move {
                     let resp = r
@@ -198,6 +201,7 @@ pub(crate) fn register_concurrent_exec(tests: &mut Vec<super::Test>) {
                 id: format!("CF.concurrent_exec_{count}.{agent}"),
                 xfail: None,
                 timeout_secs: 90,
+                declared_agents: Vec::new(),
                 run: Box::new(move |r| {
                     let self_exe = r.self_exe.clone();
                     Box::pin(async move {
@@ -269,6 +273,7 @@ pub(crate) fn register_vscode_install_pipeline(tests: &mut Vec<super::Test>) {
                 id: format!("CF.vscode.{name}.{agent}"),
                 xfail: None,
                 timeout_secs: 90,
+                declared_agents: Vec::new(),
                 run: Box::new(move |r| {
                     Box::pin(async move {
                         let resp = r
@@ -310,6 +315,7 @@ pub(crate) fn register_concurrent_fs_rwlock(tests: &mut Vec<super::Test>) {
                 id: format!("CF.rwlock_{n}.{agent}"),
                 xfail: None,
                 timeout_secs: 90,
+                declared_agents: Vec::new(),
                 run: Box::new(move |r| {
                     let self_exe = r.self_exe.clone();
                     Box::pin(async move {
@@ -343,6 +349,7 @@ pub(crate) fn register_concurrent_fs_rwlock(tests: &mut Vec<super::Test>) {
                 id: format!("CF.rwlock_multi_{n}.{agent}"),
                 xfail: None,
                 timeout_secs: 90,
+                declared_agents: Vec::new(),
                 run: Box::new(move |r| {
                     let self_exe = r.self_exe.clone();
                     Box::pin(async move {

@@ -22,6 +22,7 @@ pub(super) fn register_netlink(tests: &mut Vec<super::Test>) {
                 id,
                 xfail: None,
                 timeout_secs: 60,
+                declared_agents: Vec::new(),
                 run: Box::new(move |r| {
                     Box::pin(async move {
                         let cmd = if timeout_secs > 0 {
@@ -64,6 +65,7 @@ pub(super) fn register_netlink(tests: &mut Vec<super::Test>) {
                 id: id.clone(),
                 xfail: None,
                 timeout_secs: 60,
+                declared_agents: Vec::new(),
                 run: Box::new(move |r| {
                     let self_exe = r.self_exe.clone();
                     Box::pin(async move {
@@ -151,6 +153,7 @@ pub(super) fn register_netlink(tests: &mut Vec<super::Test>) {
             id: id.clone(),
             xfail: None,
             timeout_secs: 60,
+            declared_agents: Vec::new(),
             run: Box::new(move |r| {
                 Box::pin(async move {
                     let resp = r
@@ -204,6 +207,7 @@ pub(super) fn register_net_ipv6(tests: &mut Vec<super::Test>) {
             id,
             xfail: None,
             timeout_secs: 60,
+            declared_agents: Vec::new(),
             run: Box::new(move |r| {
                 let self_exe = r.self_exe.clone();
                 Box::pin(async move {
@@ -233,6 +237,7 @@ pub(super) fn register_terminal_ioctl(tests: &mut Vec<super::Test>) {
                 id,
                 xfail: None,
                 timeout_secs: 60,
+                declared_agents: Vec::new(),
                 run: Box::new(move |r| {
                     let self_exe = r.self_exe.clone();
                     Box::pin(async move {
@@ -271,6 +276,7 @@ pub(super) fn register_node_exit(tests: &mut Vec<super::Test>) {
         suite: "fork", group: "node_exit",
         id: "EX6.node_version_exit".into(), xfail: None,
             timeout_secs: 60,
+        declared_agents: Vec::new(),
         run: Box::new(|r| Box::pin(async move {
             let resp = r.send("A", super::exec_timeout(vec!["/usr/local/bin/node".into(), "--version".into()], 10)).await;
             let pass = matches!(&resp, crate::protocol::Response::ExecResult { exit_code: 0, stdout, .. } if stdout.starts_with('v'));
@@ -284,6 +290,7 @@ pub(super) fn register_node_exit(tests: &mut Vec<super::Test>) {
         id: "EX7.node_process_exit".into(),
         xfail: None,
         timeout_secs: 60,
+        declared_agents: Vec::new(),
         run: Box::new(|r| {
             Box::pin(async move {
                 let resp = r
@@ -314,6 +321,7 @@ pub(super) fn register_node_exit(tests: &mut Vec<super::Test>) {
         id: "EX8.node_exit_code".into(),
         xfail: None,
         timeout_secs: 60,
+        declared_agents: Vec::new(),
         run: Box::new(|r| {
             Box::pin(async move {
                 let resp = r
@@ -342,6 +350,7 @@ pub(super) fn register_node_exit(tests: &mut Vec<super::Test>) {
         suite: "fork", group: "node_exit",
         id: "EX9.node_console_exit".into(), xfail: None,
             timeout_secs: 60,
+        declared_agents: Vec::new(),
         run: Box::new(|r| Box::pin(async move {
             let resp = r.send("A", super::exec_timeout(vec!["/usr/local/bin/node".into(), "-e".into(), "console.log(\"NODE_EXIT_OK\")".into()], 10)).await;
             let pass = matches!(&resp, crate::protocol::Response::ExecResult { exit_code: 0, stdout, .. } if stdout.contains("NODE_EXIT_OK"));
@@ -370,6 +379,7 @@ pub(super) fn register_fs_io(tests: &mut Vec<super::Test>) {
             tests.push(super::Test {
                 suite: "matrix", group: "fs_io", id, xfail: None,
             timeout_secs: 60,
+                declared_agents: Vec::new(),
                 run: Box::new(move |r| {
                     let self_exe = r.self_exe.clone();
                     Box::pin(async move {
@@ -397,6 +407,7 @@ pub(super) fn register_fs_io(tests: &mut Vec<super::Test>) {
             tests.push(super::Test {
                 suite: "matrix", group: "fs_io", id, xfail: None,
             timeout_secs: 60,
+                declared_agents: Vec::new(),
                 run: Box::new(move |r| {
                     let self_exe = r.self_exe.clone();
                     Box::pin(async move {
@@ -436,6 +447,7 @@ pub(super) fn register_capture_pipe(tests: &mut Vec<super::Test>) {
                 tests.push(super::Test {
                     suite: "fork", group: "capture_pipe", id, xfail: None,
             timeout_secs: 60,
+                    declared_agents: Vec::new(),
                     run: Box::new(move |r| {
                         let self_exe = r.self_exe.clone();
                         Box::pin(async move {
@@ -509,6 +521,7 @@ pub(super) fn register_stdin_script(tests: &mut Vec<super::Test>) {
                 tests.push(super::Test {
                     suite: "shell", group: "stdin_script", id, xfail: None,
             timeout_secs: 60,
+                    declared_agents: Vec::new(),
                     run: Box::new(move |r| {
                         Box::pin(async move {
                             let resp = r.send(&agent, crate::protocol::Command::Exec {
@@ -552,6 +565,7 @@ pub(crate) fn register_unix_socket(tests: &mut Vec<super::Test>) {
             id,
             xfail: None,
             timeout_secs: 60,
+            declared_agents: Vec::new(),
             run: Box::new(move |r| {
                 let self_exe = r.self_exe.clone();
                 Box::pin(async move {
@@ -582,6 +596,7 @@ pub(crate) fn register_unix_socket(tests: &mut Vec<super::Test>) {
             id,
             xfail: None,
             timeout_secs: 60,
+            declared_agents: Vec::new(),
             run: Box::new(move |r| {
                 let self_exe = r.self_exe.clone();
                 Box::pin(async move {
@@ -616,6 +631,7 @@ pub(crate) fn register_unix_socket(tests: &mut Vec<super::Test>) {
             id,
             xfail: None,
             timeout_secs: 60,
+            declared_agents: Vec::new(),
             run: Box::new(move |r| {
                 let self_exe = r.self_exe.clone();
                 Box::pin(async move {
@@ -651,6 +667,7 @@ pub(crate) fn register_unix_socket(tests: &mut Vec<super::Test>) {
             id,
             xfail: None,
             timeout_secs: 60,
+            declared_agents: Vec::new(),
             run: Box::new(move |r| {
                 let self_exe = r.self_exe.clone();
                 Box::pin(async move {
@@ -688,6 +705,7 @@ pub(crate) fn register_unix_socket(tests: &mut Vec<super::Test>) {
             id,
             xfail: None,
             timeout_secs: 60,
+            declared_agents: Vec::new(),
             run: Box::new(move |r| {
                 let self_exe = r.self_exe.clone();
                 Box::pin(async move {
@@ -725,6 +743,7 @@ pub(crate) fn register_unix_socket(tests: &mut Vec<super::Test>) {
             id,
             xfail: None,
             timeout_secs: 60,
+            declared_agents: Vec::new(),
             run: Box::new(move |r| {
                 Box::pin(async move {
                     let nonpie = match crate::find_nonpie_binary() {
@@ -767,6 +786,7 @@ pub(crate) fn register_cross_worker(tests: &mut Vec<super::Test>) {
         id: "XW.spawn_remote".to_string(),
         xfail: None,
         timeout_secs: 60,
+        declared_agents: Vec::new(),
         run: Box::new(|r| {
             Box::pin(async move {
                 let resp = r
@@ -790,6 +810,7 @@ pub(crate) fn register_cross_worker(tests: &mut Vec<super::Test>) {
         id: "XW1.remote_write".to_string(),
         xfail: None,
         timeout_secs: 60,
+        declared_agents: Vec::new(),
         run: Box::new(|r| {
             Box::pin(async move {
                 let resp = r
@@ -817,6 +838,7 @@ pub(crate) fn register_cross_worker(tests: &mut Vec<super::Test>) {
         id: "XW1.local_read".to_string(),
         xfail: None,
         timeout_secs: 60,
+        declared_agents: Vec::new(),
         run: Box::new(|r| {
             Box::pin(async move {
                 let resp = r
@@ -841,6 +863,7 @@ pub(crate) fn register_cross_worker(tests: &mut Vec<super::Test>) {
         id: "XW2.local_write".to_string(),
         xfail: None,
         timeout_secs: 60,
+        declared_agents: Vec::new(),
         run: Box::new(|r| {
             Box::pin(async move {
                 let resp = r
@@ -865,6 +888,7 @@ pub(crate) fn register_cross_worker(tests: &mut Vec<super::Test>) {
         id: "XW2.remote_read".to_string(),
         xfail: None,
         timeout_secs: 60,
+        declared_agents: Vec::new(),
         run: Box::new(|r| {
             Box::pin(async move {
                 let resp = r
@@ -891,6 +915,7 @@ pub(crate) fn register_cross_worker(tests: &mut Vec<super::Test>) {
         id: "XW3.remote_listen".to_string(),
         xfail: None,
         timeout_secs: 60,
+        declared_agents: Vec::new(),
         run: Box::new(|r| {
             Box::pin(async move {
                 let resp = r
@@ -917,6 +942,7 @@ pub(crate) fn register_cross_worker(tests: &mut Vec<super::Test>) {
         id: "XW3.local_connect".to_string(),
         xfail: None,
         timeout_secs: 60,
+        declared_agents: Vec::new(),
         run: Box::new(|r| {
             Box::pin(async move {
                 // Listen on a unique path (setup)
@@ -961,6 +987,7 @@ pub(crate) fn register_cross_worker(tests: &mut Vec<super::Test>) {
         id: "XW4.local_listen".to_string(),
         xfail: None,
         timeout_secs: 60,
+        declared_agents: Vec::new(),
         run: Box::new(|r| {
             Box::pin(async move {
                 let resp = r
@@ -984,6 +1011,7 @@ pub(crate) fn register_cross_worker(tests: &mut Vec<super::Test>) {
         id: "XW4.remote_connect".to_string(),
         xfail: None,
         timeout_secs: 60,
+        declared_agents: Vec::new(),
         run: Box::new(|r| {
             Box::pin(async move {
                 let listen_resp = r
@@ -1027,6 +1055,7 @@ pub(crate) fn register_cross_worker(tests: &mut Vec<super::Test>) {
         id: "XW5.remote_tcp_listen".to_string(),
         xfail: None,
         timeout_secs: 60,
+        declared_agents: Vec::new(),
         run: Box::new(|r| {
             Box::pin(async move {
                 let resp = r
@@ -1051,6 +1080,7 @@ pub(crate) fn register_cross_worker(tests: &mut Vec<super::Test>) {
         id: "XW5.local_tcp_connect".to_string(),
         xfail: None,
         timeout_secs: 60,
+        declared_agents: Vec::new(),
         run: Box::new(|r| {
             Box::pin(async move {
                 let listen_resp = r
@@ -1106,6 +1136,7 @@ pub(crate) fn register_cross_worker(tests: &mut Vec<super::Test>) {
         id: "XW6.local_tcp_listen".to_string(),
         xfail: None,
         timeout_secs: 60,
+        declared_agents: Vec::new(),
         run: Box::new(|r| {
             Box::pin(async move {
                 let resp = r.send("A", Command::NetListen { port: 0 }).await;
@@ -1122,6 +1153,7 @@ pub(crate) fn register_cross_worker(tests: &mut Vec<super::Test>) {
         id: "XW6.remote_tcp_connect".to_string(),
         xfail: None,
         timeout_secs: 60,
+        declared_agents: Vec::new(),
         run: Box::new(|r| {
             Box::pin(async move {
                 let listen_resp = r.send("A", Command::NetListen { port: 0 }).await;
@@ -1164,6 +1196,7 @@ pub(crate) fn register_cross_worker(tests: &mut Vec<super::Test>) {
         id: "XW7.d4_listen".to_string(),
         xfail: None,
         timeout_secs: 60,
+        declared_agents: Vec::new(),
         run: Box::new(|r| {
             Box::pin(async move {
                 let resp = r
@@ -1187,6 +1220,7 @@ pub(crate) fn register_cross_worker(tests: &mut Vec<super::Test>) {
         id: "XW7.d3_connect".to_string(),
         xfail: None,
         timeout_secs: 60,
+        declared_agents: Vec::new(),
         run: Box::new(|r| {
             Box::pin(async move {
                 let listen_resp = r
@@ -1229,6 +1263,7 @@ pub(crate) fn register_cross_worker(tests: &mut Vec<super::Test>) {
         id: "XW8.d3_listen".to_string(),
         xfail: None,
         timeout_secs: 60,
+        declared_agents: Vec::new(),
         run: Box::new(|r| {
             Box::pin(async move {
                 let resp = r
@@ -1252,6 +1287,7 @@ pub(crate) fn register_cross_worker(tests: &mut Vec<super::Test>) {
         id: "XW8.d4_connect".to_string(),
         xfail: None,
         timeout_secs: 60,
+        declared_agents: Vec::new(),
         run: Box::new(|r| {
             Box::pin(async move {
                 let listen_resp = r
@@ -1294,6 +1330,7 @@ pub(crate) fn register_cross_worker(tests: &mut Vec<super::Test>) {
         id: "XW9.d4_listen".to_string(),
         xfail: None,
         timeout_secs: 60,
+        declared_agents: Vec::new(),
         run: Box::new(|r| {
             Box::pin(async move {
                 let resp = r
@@ -1317,6 +1354,7 @@ pub(crate) fn register_cross_worker(tests: &mut Vec<super::Test>) {
         id: "XW9.aa_connect".to_string(),
         xfail: None,
         timeout_secs: 60,
+        declared_agents: Vec::new(),
         run: Box::new(|r| {
             Box::pin(async move {
                 let listen_resp = r
@@ -1359,6 +1397,7 @@ pub(crate) fn register_cross_worker(tests: &mut Vec<super::Test>) {
         id: "XW10.d3_tcp_listen".to_string(),
         xfail: None,
         timeout_secs: 60,
+        declared_agents: Vec::new(),
         run: Box::new(|r| {
             Box::pin(async move {
                 let resp = r.send("D3", Command::NetListen { port: 0 }).await;
@@ -1375,6 +1414,7 @@ pub(crate) fn register_cross_worker(tests: &mut Vec<super::Test>) {
         id: "XW10.b_tcp_connect".to_string(),
         xfail: None,
         timeout_secs: 60,
+        declared_agents: Vec::new(),
         run: Box::new(|r| {
             Box::pin(async move {
                 let listen_resp = r.send("D3", Command::NetListen { port: 0 }).await;
@@ -1414,6 +1454,7 @@ pub(crate) fn register_cross_worker(tests: &mut Vec<super::Test>) {
         id: "XW11.d3_tcp_listen".to_string(),
         xfail: None,
         timeout_secs: 60,
+        declared_agents: Vec::new(),
         run: Box::new(|r| {
             Box::pin(async move {
                 let resp = r.send("D3", Command::NetListen { port: 0 }).await;
@@ -1430,6 +1471,7 @@ pub(crate) fn register_cross_worker(tests: &mut Vec<super::Test>) {
         id: "XW11.spawn_r2".to_string(),
         xfail: None,
         timeout_secs: 60,
+        declared_agents: Vec::new(),
         run: Box::new(|r| {
             Box::pin(async move {
                 let resp = r
@@ -1453,6 +1495,7 @@ pub(crate) fn register_cross_worker(tests: &mut Vec<super::Test>) {
         id: "XW11.r2_tcp_connect".to_string(),
         xfail: None,
         timeout_secs: 60,
+        declared_agents: Vec::new(),
         run: Box::new(|r| {
             Box::pin(async move {
                 // Setup: listen on D3
@@ -1512,6 +1555,7 @@ pub(crate) fn register_pipe_eof(tests: &mut Vec<super::Test>) {
             id,
             xfail: None,
             timeout_secs: 60,
+            declared_agents: Vec::new(),
             run: Box::new(move |r| {
                 let self_exe = r.self_exe.clone();
                 Box::pin(async move {
@@ -1545,6 +1589,7 @@ pub(crate) fn register_pipe_eof(tests: &mut Vec<super::Test>) {
             id,
             xfail: None,
             timeout_secs: 60,
+            declared_agents: Vec::new(),
             run: Box::new(move |r| {
                 let self_exe = r.self_exe.clone();
                 Box::pin(async move {
@@ -1583,6 +1628,7 @@ pub(crate) fn register_pipe_eof(tests: &mut Vec<super::Test>) {
             id,
             xfail: None,
             timeout_secs: 60,
+            declared_agents: Vec::new(),
             run: Box::new(move |r| {
                 let self_exe = r.self_exe.clone();
                 Box::pin(async move {
@@ -1626,6 +1672,7 @@ pub(crate) fn register_contamination_sequence(tests: &mut Vec<super::Test>) {
         id: "X49a.pie_sequential_1".to_string(),
         xfail: None,
         timeout_secs: 60,
+        declared_agents: Vec::new(),
         run: Box::new(|r| {
             let self_exe = r.self_exe.clone();
             Box::pin(async move {
@@ -1649,6 +1696,7 @@ pub(crate) fn register_contamination_sequence(tests: &mut Vec<super::Test>) {
         id: "X49b.pie_sequential_2".to_string(),
         xfail: None,
         timeout_secs: 60,
+        declared_agents: Vec::new(),
         run: Box::new(|r| {
             let self_exe = r.self_exe.clone();
             Box::pin(async move {
@@ -1675,6 +1723,7 @@ pub(crate) fn register_contamination_sequence(tests: &mut Vec<super::Test>) {
         id: "X50a.nonpie_then_pie_1".to_string(),
         xfail: None,
         timeout_secs: 60,
+        declared_agents: Vec::new(),
         run: Box::new(|r| {
             Box::pin(async move {
                 let nonpie = match crate::find_nonpie_binary() {
@@ -1707,6 +1756,7 @@ pub(crate) fn register_contamination_sequence(tests: &mut Vec<super::Test>) {
         id: "X50b.nonpie_then_pie_2".to_string(),
         xfail: None,
         timeout_secs: 60,
+        declared_agents: Vec::new(),
         run: Box::new(|r| {
             let self_exe = r.self_exe.clone();
             Box::pin(async move {
@@ -1730,6 +1780,7 @@ pub(crate) fn register_contamination_sequence(tests: &mut Vec<super::Test>) {
         id: "X51.nonpie_fresh_agent".to_string(),
         xfail: None,
         timeout_secs: 60,
+        declared_agents: Vec::new(),
         run: Box::new(|r| {
             Box::pin(async move {
                 let nonpie = match crate::find_nonpie_binary() {
@@ -1762,6 +1813,7 @@ pub(crate) fn register_contamination_sequence(tests: &mut Vec<super::Test>) {
         id: "X52a.B_nonpie_then_pie".to_string(),
         xfail: None,
         timeout_secs: 60,
+        declared_agents: Vec::new(),
         run: Box::new(|r| {
             let self_exe = r.self_exe.clone();
             Box::pin(async move {
@@ -1785,6 +1837,7 @@ pub(crate) fn register_contamination_sequence(tests: &mut Vec<super::Test>) {
         id: "X52b.B_pie_after_nonpie".to_string(),
         xfail: None,
         timeout_secs: 60,
+        declared_agents: Vec::new(),
         run: Box::new(|r| {
             let self_exe = r.self_exe.clone();
             Box::pin(async move {
@@ -1811,6 +1864,7 @@ pub(crate) fn register_contamination_sequence(tests: &mut Vec<super::Test>) {
         id: "X52c.B_third_exec".to_string(),
         xfail: None,
         timeout_secs: 60,
+        declared_agents: Vec::new(),
         run: Box::new(|r| {
             let self_exe = r.self_exe.clone();
             Box::pin(async move {
@@ -1834,6 +1888,7 @@ pub(crate) fn register_contamination_sequence(tests: &mut Vec<super::Test>) {
         id: "X53.stress_pie".to_string(),
         xfail: None,
         timeout_secs: 60,
+        declared_agents: Vec::new(),
         run: Box::new(|r| {
             let self_exe = r.self_exe.clone();
             Box::pin(async move {
@@ -1869,6 +1924,7 @@ pub(crate) fn register_contamination_sequence(tests: &mut Vec<super::Test>) {
         id: "X54.nonpie_after_stress".to_string(),
         xfail: None,
         timeout_secs: 60,
+        declared_agents: Vec::new(),
         run: Box::new(|r| {
             Box::pin(async move {
                 let nonpie = match crate::find_nonpie_binary() {
@@ -1901,6 +1957,7 @@ pub(crate) fn register_contamination_sequence(tests: &mut Vec<super::Test>) {
         id: "X55a.one_pie_first".to_string(),
         xfail: None,
         timeout_secs: 60,
+        declared_agents: Vec::new(),
         run: Box::new(|r| {
             let self_exe = r.self_exe.clone();
             Box::pin(async move {
@@ -1924,6 +1981,7 @@ pub(crate) fn register_contamination_sequence(tests: &mut Vec<super::Test>) {
         id: "X55b.nonpie_second".to_string(),
         xfail: None,
         timeout_secs: 60,
+        declared_agents: Vec::new(),
         run: Box::new(|r| {
             Box::pin(async move {
                 let nonpie = match crate::find_nonpie_binary() {
@@ -1956,6 +2014,7 @@ pub(crate) fn register_contamination_sequence(tests: &mut Vec<super::Test>) {
         id: "X56.second_nonpie_on_B".to_string(),
         xfail: None,
         timeout_secs: 60,
+        declared_agents: Vec::new(),
         run: Box::new(|r| {
             Box::pin(async move {
                 let nonpie = match crate::find_nonpie_binary() {
@@ -1988,6 +2047,7 @@ pub(crate) fn register_contamination_sequence(tests: &mut Vec<super::Test>) {
         id: "X57.pipe_churn_then_nonpie".to_string(),
         xfail: None,
         timeout_secs: 60,
+        declared_agents: Vec::new(),
         run: Box::new(|r| {
             Box::pin(async move {
                 let nonpie = match crate::find_nonpie_binary() {
@@ -2032,6 +2092,7 @@ pub(crate) fn register_contamination_sequence(tests: &mut Vec<super::Test>) {
         id: "X58.alternating_pie_nonpie".to_string(),
         xfail: None,
         timeout_secs: 60,
+        declared_agents: Vec::new(),
         run: Box::new(|r| {
             let self_exe = r.self_exe.clone();
             Box::pin(async move {
@@ -2086,6 +2147,7 @@ pub(crate) fn register_contamination_sequence(tests: &mut Vec<super::Test>) {
         id: "X59.sequential_nonpie".to_string(),
         xfail: None,
         timeout_secs: 60,
+        declared_agents: Vec::new(),
         run: Box::new(|r| {
             Box::pin(async move {
                 let nonpie = match crate::find_nonpie_binary() {

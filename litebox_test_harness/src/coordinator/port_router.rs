@@ -37,6 +37,7 @@ fn register_fork_port_tests(tests: &mut Vec<super::Test>) {
                 id,
                 xfail: None,
                 timeout_secs: 180,
+                declared_agents: Vec::new(),
                 run: Box::new(move |r| {
                     Box::pin(async move {
                         let listen_resp = r
@@ -73,6 +74,7 @@ fn register_fork_port_tests(tests: &mut Vec<super::Test>) {
                 id,
                 xfail: None,
             timeout_secs: 180,
+                declared_agents: Vec::new(),
                 run: Box::new(move |r| {
                     Box::pin(async move {
                         let listen_resp = r
@@ -118,6 +120,7 @@ fn register_fork_multi_tests(tests: &mut Vec<super::Test>) {
         id: "PR.fork_multi_x5".to_string(),
         xfail: None,
             timeout_secs: 180,
+        declared_agents: Vec::new(),
         run: Box::new(move |r| {
             Box::pin(async move {
                 let agent = "A";
@@ -173,6 +176,7 @@ fn register_fork_cross_tests(tests: &mut Vec<super::Test>) {
         id: "PR.fork_cross".to_string(),
         xfail: None,
             timeout_secs: 180,
+        declared_agents: Vec::new(),
         run: Box::new(move |r| {
             Box::pin(async move {
                 let listener = "A";
@@ -218,6 +222,7 @@ fn register_fork_interleave_tests(tests: &mut Vec<super::Test>) {
         id: "PR.fork_interleave".to_string(),
         xfail: None,
             timeout_secs: 180,
+        declared_agents: Vec::new(),
         run: Box::new(move |r| {
             Box::pin(async move {
                 let agent = "A";
@@ -274,6 +279,7 @@ fn register_fork_background_tests(tests: &mut Vec<super::Test>) {
         id: "PR.fork_bg".to_string(),
         xfail: None,
             timeout_secs: 180,
+        declared_agents: Vec::new(),
         run: Box::new(move |r| {
             Box::pin(async move {
                 let agent = "A";
@@ -342,6 +348,7 @@ fn register_fork_listen_inherit_tests(tests: &mut Vec<super::Test>) {
         id: "PR.listen_inherit_self".to_string(),
         xfail: None,
             timeout_secs: 180,
+        declared_agents: Vec::new(),
         run: Box::new(|r| {
             Box::pin(async move {
                 let port = 18300u16;
@@ -433,6 +440,7 @@ fn register_fork_listen_inherit_tests(tests: &mut Vec<super::Test>) {
         id: "PR.listen_inherit_cross".to_string(),
         xfail: None,
             timeout_secs: 180,
+        declared_agents: Vec::new(),
         run: Box::new(|r| {
             Box::pin(async move {
                 let port2 = 18301u16;
@@ -527,6 +535,7 @@ fn register_child_listen_cross_connect_tests(tests: &mut Vec<super::Test>) {
         id: "PR.child_listen_cross".to_string(),
         xfail: None,
             timeout_secs: 180,
+        declared_agents: Vec::new(),
         run: Box::new(move |r| {
             Box::pin(async move {
                 let resp = r

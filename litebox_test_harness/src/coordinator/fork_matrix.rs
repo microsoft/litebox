@@ -361,6 +361,7 @@ pub(crate) fn register_fork_matrix(tests: &mut Vec<super::Test>) {
                 id,
                 xfail: None,
                 timeout_secs: 60,
+                declared_agents: Vec::new(),
                 run: Box::new(move |r| {
                     Box::pin(async move {
                         let cmd = vec!["bash".into(), "-c".into(), cmd_str];
@@ -401,6 +402,7 @@ pub(crate) fn register_fork_matrix(tests: &mut Vec<super::Test>) {
             id,
             xfail: None,
             timeout_secs: 60,
+            declared_agents: Vec::new(),
             run: Box::new(move |r| {
                 let agent_s2 = agent_s.clone();
                 Box::pin(async move {
@@ -433,6 +435,7 @@ pub(crate) fn register_fork_matrix(tests: &mut Vec<super::Test>) {
         id: "X.node_stdout_write.A".to_string(),
         xfail: None,
         timeout_secs: 60,
+        declared_agents: Vec::new(),
         run: Box::new(|r| {
             Box::pin(async move {
                 let resp = r
@@ -466,6 +469,7 @@ pub(crate) fn register_fork_matrix(tests: &mut Vec<super::Test>) {
             id,
             xfail: None,
             timeout_secs: 60,
+            declared_agents: Vec::new(),
             run: Box::new(move |r| {
                 let self_exe = r.self_exe.clone();
                 Box::pin(async move {
@@ -491,6 +495,7 @@ pub(crate) fn register_fork_matrix(tests: &mut Vec<super::Test>) {
         id: "XM.node_networkInterfaces".to_string(),
         xfail: None,
         timeout_secs: 60,
+        declared_agents: Vec::new(),
         run: Box::new(|r| {
             Box::pin(async move {
                 let resp = r
@@ -540,6 +545,7 @@ pub(crate) fn register_fork_matrix(tests: &mut Vec<super::Test>) {
                         id,
                         xfail: None,
                         timeout_secs: 60,
+                        declared_agents: Vec::new(),
                         run: Box::new(move |r| {
                             let self_exe = r.self_exe.clone();
                             Box::pin(async move {
@@ -650,6 +656,7 @@ pub(crate) fn register_fork_matrix(tests: &mut Vec<super::Test>) {
         id: "XDF.triple_nesting".to_string(),
         xfail: None,
         timeout_secs: 60,
+        declared_agents: Vec::new(),
         run: Box::new(|r| {
             let self_exe = r.self_exe.clone();
             Box::pin(async move {
@@ -688,6 +695,7 @@ pub(crate) fn register_fork_matrix(tests: &mut Vec<super::Test>) {
                 id,
                 xfail: None,
                 timeout_secs: 60,
+                declared_agents: Vec::new(),
                 run: Box::new(move |r| {
                     let self_exe = r.self_exe.clone();
                     Box::pin(async move {
@@ -717,6 +725,7 @@ pub(crate) fn register_fork_matrix(tests: &mut Vec<super::Test>) {
             id,
             xfail: None,
             timeout_secs: 60,
+            declared_agents: Vec::new(),
             run: Box::new(move |r| {
                 Box::pin(async move {
                     let nonpie_bin = match crate::find_nonpie_binary() {
@@ -779,6 +788,7 @@ pub(crate) fn register_fork_matrix(tests: &mut Vec<super::Test>) {
         id: "XC.init_level".to_string(),
         xfail: None,
         timeout_secs: 60,
+        declared_agents: Vec::new(),
         run: Box::new(|r| {
             let self_exe = r.self_exe.clone();
             Box::pin(async move {
@@ -826,6 +836,7 @@ pub(crate) fn register_fork_matrix(tests: &mut Vec<super::Test>) {
             id,
             xfail: None,
             timeout_secs: 60,
+            declared_agents: Vec::new(),
             run: Box::new(move |r| {
                 let self_exe = r.self_exe.clone();
                 Box::pin(async move {

@@ -196,6 +196,7 @@ pub(crate) fn register_pipe_bridge(tests: &mut Vec<super::Test>) {
                 id,
                 xfail: None,
                 timeout_secs: 90,
+                declared_agents: Vec::new(),
                 run: Box::new(move |r| {
                     let self_exe = r.self_exe.clone();
                     Box::pin(async move {

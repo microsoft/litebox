@@ -4,6 +4,7 @@
 //! Test coordinator. Runs as the init process, drives all test
 //! operations through pipes to child agents.
 
+pub(crate) mod agents;
 pub(crate) mod concurrent_fork;
 pub(crate) mod file_tcp;
 pub(crate) mod fork_matrix;
@@ -11,6 +12,8 @@ pub(crate) mod matrix;
 pub(crate) mod pipe_bridge;
 pub(crate) mod platform_fixes;
 pub(crate) mod port_router;
+pub(crate) mod registry;
+pub(crate) mod run_context;
 pub(crate) mod special_cases;
 pub(crate) mod tcp_stress;
 
@@ -46,6 +49,14 @@ pub struct Test {
     pub id: String,
     pub xfail: Option<String>,
     pub timeout_secs: u64,
+    /// Agents this test will contact, expressed as an explicit set
+    /// declared at registration time. Empty means "test was registered
+    /// via the legacy `Test {…}` literal path that hasn't migrated to
+    /// the typed `Registry` API yet"; in that case `spawn_tree` falls
+    /// back to spawning the full agent matrix to stay safe. Non-empty
+    /// means `spawn_tree` will spawn precisely the union (plus
+    /// routing-chain ancestors) over all filtered tests.
+    pub declared_agents: Vec<agents::AgentName>,
     pub run: Box<dyn FnOnce(&'_ mut TestRunner) -> Pin<Box<dyn Future<Output = TestOutcome> + '_>>>,
 }
 
@@ -618,6 +629,7 @@ fn register_canary(tests: &mut Vec<Test>) {
         id: "X_canary.pre_sequence".to_string(),
         xfail: None,
         timeout_secs: 60,
+        declared_agents: Vec::new(),
         run: Box::new(|r| {
             let self_exe = r.self_exe.clone();
             Box::pin(async move {
@@ -805,16 +817,45 @@ async fn run_tests(self_exe: &str, filter: Option<&str>) -> Vec<TestResult> {
 /// its ID. Heuristic: dot-separated component matches one of NP, NPC,
 /// D3, D4, D5. Used to gate the expensive `spawn_nonpie_subtree`
 /// (which can take 30s under litebox due to the known vfork pipe
-/// bridge bug). Validation in `validate_lazy_matrix` catches
-/// false-negatives at end-of-run.
+/// Decide whether to spawn the non-PIE subtree (NP/NPC/D3/D4/D5)
+/// for the given filtered test set.
+///
+/// Rules, in order:
+/// 1. If `LITEBOX_FORCE_FULL_MATRIX` is set, always spawn the
+///    non-PIE subtree (debug/safety opt-out).
+/// 2. If **any** filtered test was registered via the typed
+///    `Registry` API (i.e. `declared_agents` is non-empty) and
+///    declares a non-PIE agent, spawn it. The typed declaration is
+///    structurally accurate — the test cannot send to an undeclared
+///    agent, so this signal is precise.
+/// 3. If **all** filtered tests have non-empty `declared_agents`
+///    and none declare a non-PIE agent, skip the non-PIE subtree.
+/// 4. Otherwise (any filtered test still lives on the legacy
+///    string-id path), fall back to spawning the non-PIE subtree
+///    to stay safe. This is the `declared_agents.is_empty()`
+///    branch and goes away once every registration is migrated.
 fn filter_needs_nonpie(tests: &[Test]) -> bool {
-    const NONPIE: &[&str] = &["NP", "NPC", "D3", "D4", "D5"];
+    use agents::AgentName;
+    const NONPIE: &[AgentName] = &[
+        AgentName::NP,
+        AgentName::NPC,
+        AgentName::D3,
+        AgentName::D4,
+        AgentName::D5,
+    ];
     if std::env::var("LITEBOX_FORCE_FULL_MATRIX").is_ok() {
+        return true;
+    }
+    let any_legacy = tests.iter().any(|t| t.declared_agents.is_empty());
+    if any_legacy {
+        // Legacy path: at least one test in the filter hasn't
+        // migrated to the typed API. Spawn the non-PIE subtree to
+        // be safe (correctness > speed during migration).
         return true;
     }
     tests
         .iter()
-        .any(|t| t.id.split('.').any(|component| NONPIE.contains(&component)))
+        .any(|t| t.declared_agents.iter().any(|a| NONPIE.contains(a)))
 }
 
 /// Route a target agent name to (direct_child, remaining_path).
