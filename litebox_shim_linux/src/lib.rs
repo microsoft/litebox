@@ -1127,6 +1127,36 @@ impl<FS: ShimFS> LinuxShim<FS> {
             }
         }
 
+        // Recreate unconnected Unix sockets. Connected/socketpair descriptors
+        // are also seeded here so any bridge fd installation below has an fd
+        // table entry to replace with the cross-process host pipe.
+        {
+            use litebox_common_linux::{SockFlags, SockType};
+            use syscalls::fork_snapshot::FdClass;
+
+            for entry in &fd_table.entries {
+                if entry.class != FdClass::UnixSocket {
+                    continue;
+                }
+
+                if let Some(socket) =
+                    syscalls::unix::UnixSocket::<FS>::new(SockType::Stream, SockFlags::empty())
+                {
+                    let file = self
+                        .global
+                        .litebox
+                        .descriptor_table_mut()
+                        .insert::<syscalls::unix::UnixSocketSubsystem<FS>>(socket);
+                    let mut rds = child_files.raw_descriptor_store.write();
+                    if entry.fd <= 2 {
+                        let _ = rds.fd_consume_raw_integer::<FS>(entry.fd);
+                    }
+                    let success = rds.fd_into_specific_raw_integer(file, entry.fd);
+                    debug_assert!(success, "unix fd slot {} occupied during restore", entry.fd);
+                }
+            }
+        }
+
         // --- 11. Build credentials. -----------------------------------------
         let child_credentials = Arc::new(syscalls::process::Credentials {
             uid: id.credentials.uid,
@@ -2268,10 +2298,39 @@ impl<FS: ShimFS> Task<FS> {
     /// Two syscalls (`fcntl` and `prctl`) require argument-level inspection
     /// because they multiplex many operations through a single syscall number.
     #[cfg(target_arch = "x86_64")]
+    #[cfg(test)]
     fn is_pre_exec_syscall(ctx: &litebox_common_linux::ExecutionContext) -> bool {
+        Self::is_pre_exec_syscall_impl(ctx, false)
+    }
+
+    fn is_pre_exec_syscall_for_task(&self, ctx: &litebox_common_linux::ExecutionContext) -> bool {
+        use ::syscalls::Sysno;
+
+        let unix_socket_read = matches!(Sysno::new(ctx.orig_rax), Some(Sysno::read))
+            && self
+                .files
+                .borrow()
+                .raw_descriptor_store
+                .read()
+                .fd_from_raw_integer::<syscalls::unix::UnixSocketSubsystem<FS>>(ctx.rdi)
+                .is_ok();
+        Self::is_pre_exec_syscall_impl(ctx, unix_socket_read)
+    }
+
+    fn is_pre_exec_syscall_impl(
+        ctx: &litebox_common_linux::ExecutionContext,
+        unix_socket_read: bool,
+    ) -> bool {
         use ::syscalls::Sysno;
 
         let nr = ctx.orig_rax;
+
+        // A blocking read from an inherited Unix socket is real post-fork work,
+        // not fork/exec bookkeeping.  Let delayed-fork migration run first so
+        // the parent can resume and communicate with the child.
+        if unix_socket_read {
+            return false;
+        }
 
         // Match on syscall number, with argument inspection for fcntl/prctl.
         match Sysno::new(nr) {
@@ -2352,7 +2411,7 @@ impl<FS: ShimFS> Task<FS> {
         // the pre-exec allowlist.  If not, commit the delayed fork now.
         #[cfg(target_arch = "x86_64")]
         if self.delayed_fork_pending.get() {
-            let is_pre_exec = Self::is_pre_exec_syscall(ctx);
+            let is_pre_exec = self.is_pre_exec_syscall_for_task(ctx);
             #[cfg(feature = "trace_syscalls")]
             {
                 let sysname = ::syscalls::Sysno::new(ctx.orig_rax).map_or_else(

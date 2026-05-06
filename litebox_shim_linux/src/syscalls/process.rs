@@ -6907,8 +6907,14 @@ impl<FS: ShimFS> Task<FS> {
                     // Sandbox PTY slave — accepted on any fd slot for bridging.
                 }
                 FdClass::FilesystemFd if terminal_meta.is_some() => {}
-                FdClass::FilesystemFd if raw_fd > 2 => {}
-                FdClass::UnixSocket if socket_pair_id.is_some() => {}
+                // Non-terminal filesystem fds (including /dev/null on stdio
+                // after posix_spawn-style setup) are restored by reopening
+                // their captured path, with /dev/null as a safe fallback.
+                FdClass::FilesystemFd => {}
+                // Unconnected Unix sockets can be recreated during restore;
+                // connected/socketpair fds are recreated first, then replaced
+                // by fork-bridge host fds when needed.
+                FdClass::UnixSocket => {}
                 _ => {
                     reject.push(ForkRejectReason::UnsupportedFdClass { fd: raw_fd, class });
                 }
