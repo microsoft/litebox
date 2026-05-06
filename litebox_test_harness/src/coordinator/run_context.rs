@@ -21,7 +21,7 @@ use std::time::Duration;
 use crate::protocol::{Command, Response};
 
 use super::TestRunner;
-use super::agents::{AgentHandle, EphemeralHandle};
+use super::agents::AgentHandle;
 
 /// Run-time access for a registered test. Borrows the underlying
 /// [`TestRunner`] for the duration of one test's execution.
@@ -123,24 +123,5 @@ impl<'a> RunContext<'a> {
             Ok(_) => Ok(start.elapsed()),
             Err(_) => Err(start.elapsed()),
         }
-    }
-
-    /// Spawn a fresh ephemeral child agent that is not part of the
-    /// global matrix. Returns a handle distinct from `AgentHandle`
-    /// (no global routing applies; the caller owns the lifecycle).
-    /// Used by tests like `SK.subtree.*` that build their own
-    /// subtree to exercise specific kill/teardown patterns.
-    ///
-    /// **Currently a placeholder**: ephemeral spawn requires deeper
-    /// integration with the existing `spawn_child` plumbing, which
-    /// the SK.subtree tests use directly today. Wired up in a
-    /// follow-up; for now `RunContext` exposes the same shape but
-    /// suite migrations that need ephemeral spawn keep using the
-    /// existing internal helpers temporarily.
-    pub async fn spawn_ephemeral_agent(&mut self, _label: &str) -> EphemeralHandle {
-        unimplemented!(
-            "ephemeral agent spawn through RunContext is reserved for the SK.subtree migration; \
-             until then those tests use coordinator-internal helpers"
-        );
     }
 }

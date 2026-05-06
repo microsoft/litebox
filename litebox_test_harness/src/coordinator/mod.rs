@@ -50,12 +50,9 @@ pub struct Test {
     pub xfail: Option<String>,
     pub timeout_secs: u64,
     /// Agents this test will contact, expressed as an explicit set
-    /// declared at registration time. Empty means "test was registered
-    /// via the legacy `Test {…}` literal path that hasn't migrated to
-    /// the typed `Registry` API yet"; in that case `spawn_tree` falls
-    /// back to spawning the full agent matrix to stay safe. Non-empty
-    /// means `spawn_tree` will spawn precisely the union (plus
-    /// routing-chain ancestors) over all filtered tests.
+    /// declared at registration time via `RegistrationContext::require`.
+    /// `spawn_tree` uses the union (plus routing-chain ancestors) over
+    /// all filtered tests to decide which agents to spawn.
     pub declared_agents: Vec<agents::AgentName>,
     pub run: Box<dyn FnOnce(&'_ mut TestRunner) -> Pin<Box<dyn Future<Output = TestOutcome> + '_>>>,
 }
@@ -502,10 +499,11 @@ impl TestRunner {
 
     /// Validate the lazy-matrix decision: every agent contacted via
     /// `send()` must have been spawned by `spawn_tree`. A mismatch
-    /// means `filter_needs_nonpie` (or the agent-set heuristic) is
-    /// wrong — the test references an agent the coordinator didn't
-    /// know to spawn. Recorded as a synthetic `FAIL` so the
-    /// integration pipeline surfaces it loudly.
+    /// means a test contacted an agent it didn't declare via
+    /// `RegistrationContext::require` — should be impossible through
+    /// the typed API, so this is a final-safety belt-and-braces check.
+    /// Recorded as a synthetic `FAIL` so the integration pipeline
+    /// surfaces it loudly.
     fn validate_lazy_matrix(&mut self) {
         let mut unexpected: Vec<_> = self
             .contacted_agents
@@ -518,9 +516,10 @@ impl TestRunner {
         }
         let detail = format!(
             "tests contacted agents that were not spawned: {} (spawned={:?}). \
-             Either the test ID needs an agent suffix that filter_needs_nonpie \
-             recognizes, or the heuristic in coordinator/mod.rs needs updating. \
-             Workaround: re-run with LITEBOX_FORCE_FULL_MATRIX=1.",
+             A test sent to an agent it didn't declare via \
+             RegistrationContext::require — should be unreachable through \
+             the typed API. Workaround: re-run with \
+             LITEBOX_FORCE_FULL_MATRIX=1 to confirm.",
             unexpected.join(","),
             {
                 let mut s: Vec<_> = self.spawned_agents.iter().cloned().collect();
@@ -838,27 +837,14 @@ async fn run_tests(self_exe: &str, filter: Option<&str>) -> Vec<TestResult> {
     runner.results
 }
 
-/// Returns true if any filtered test references a non-PIE agent in
-/// its ID. Heuristic: dot-separated component matches one of NP, NPC,
-/// D3, D4, D5. Used to gate the expensive `spawn_nonpie_subtree`
-/// (which can take 30s under litebox due to the known vfork pipe
-/// Decide whether to spawn the non-PIE subtree (NP/NPC/D3/D4/D5)
-/// for the given filtered test set.
+/// Returns true if any filtered test references a non-PIE agent.
+/// Used to gate the expensive `spawn_nonpie_subtree` (which can take
+/// 30s under litebox due to the known vfork pipe-bridge bug).
 ///
-/// Rules, in order:
-/// 1. If `LITEBOX_FORCE_FULL_MATRIX` is set, always spawn the
-///    non-PIE subtree (debug/safety opt-out).
-/// 2. If **any** filtered test was registered via the typed
-///    `Registry` API (i.e. `declared_agents` is non-empty) and
-///    declares a non-PIE agent, spawn it. The typed declaration is
-///    structurally accurate — the test cannot send to an undeclared
-///    agent, so this signal is precise.
-/// 3. If **all** filtered tests have non-empty `declared_agents`
-///    and none declare a non-PIE agent, skip the non-PIE subtree.
-/// 4. Otherwise (any filtered test still lives on the legacy
-///    string-id path), fall back to spawning the non-PIE subtree
-///    to stay safe. This is the `declared_agents.is_empty()`
-///    branch and goes away once every registration is migrated.
+/// The signal is precise: tests declare their agent dependencies via
+/// `RegistrationContext::require`, and the type system prevents a
+/// test from sending to an undeclared agent. `LITEBOX_FORCE_FULL_MATRIX`
+/// is honored as a debug escape hatch.
 fn filter_needs_nonpie(tests: &[Test]) -> bool {
     use agents::AgentName;
     const NONPIE: &[AgentName] = &[
@@ -869,13 +855,6 @@ fn filter_needs_nonpie(tests: &[Test]) -> bool {
         AgentName::D5,
     ];
     if std::env::var("LITEBOX_FORCE_FULL_MATRIX").is_ok() {
-        return true;
-    }
-    let any_legacy = tests.iter().any(|t| t.declared_agents.is_empty());
-    if any_legacy {
-        // Legacy path: at least one test in the filter hasn't
-        // migrated to the typed API. Spawn the non-PIE subtree to
-        // be safe (correctness > speed during migration).
         return true;
     }
     tests

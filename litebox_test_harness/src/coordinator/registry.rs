@@ -9,13 +9,6 @@
 //! only `&mut RunContext`, with no method that takes a string agent
 //! identifier. Under-declaration is therefore a compile error: a test
 //! cannot mention an agent it didn't declare.
-//!
-//! Phase 1 of the migration: this module exists alongside the legacy
-//! `Test {…}` literal path. Tests registered via the legacy path have
-//! `declared_agents.is_empty()` and trigger the safe full-matrix
-//! fallback in `spawn_tree`. Once every registration is migrated, the
-//! legacy path is deleted and the type system enforces declaration
-//! invariants forever.
 
 use super::agents::{AgentHandle, AgentName};
 use super::{Test, TestOutcome};

@@ -110,18 +110,3 @@ impl AgentHandle {
         self.name
     }
 }
-
-/// Capability to send commands to an ephemeral agent the test
-/// spawned itself (e.g., the SK.subtree.* tests). Distinct from
-/// [`AgentHandle`] because ephemeral agents are not part of the
-/// global matrix and are not gated by the per-test declared set.
-#[derive(Debug)]
-pub struct EphemeralHandle {
-    pub(super) wire_name: String,
-}
-
-impl EphemeralHandle {
-    pub(super) fn wire_name(&self) -> &str {
-        &self.wire_name
-    }
-}
