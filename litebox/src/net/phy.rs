@@ -13,9 +13,9 @@ pub(crate) const DEVICE_MTU: usize = 1600;
 pub struct RstSocketSummary {
     pub tcp_count: u16,
     pub listen_count: u16,
-    pub listen_ports: [u16; 8],
+    pub listen_ports: [u16; 32],
     /// 0=None(INADDR_ANY), 1=127.0.0.1, 2=10.0.0.2, 3=other
-    pub listen_addrs: [u8; 8],
+    pub listen_addrs: [u8; 32],
 }
 
 pub(crate) struct Device<Platform: platform::IPInterfaceProvider + 'static> {
@@ -127,7 +127,7 @@ impl<Platform: platform::IPInterfaceProvider> smoltcp::phy::TxToken for TxToken<
                 self.rst_info.set(Some((src_port, dst_port)));
                 // Call platform diagnostic with pre-poll socket state.
                 if let Some(summary) = self.rst_socket_summary.get() {
-                    let n = summary.listen_count as usize;
+                    let n = (summary.listen_count as usize).min(summary.listen_ports.len());
                     self.platform.on_rst_transmitted(
                         src_port,
                         dst_port,

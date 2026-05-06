@@ -821,10 +821,19 @@ impl<FS: ShimFS> GlobalState<FS> {
     }
 
     fn shutdown(&self, fd: &SocketFd, read: bool, write: bool) -> Result<(), Errno> {
-        self.net
+        let result = self
+            .net
             .lock()
             .shutdown(fd, read, write)
-            .map_err(Errno::from)
+            .map_err(Errno::from);
+        if result.is_ok() && write {
+            // shutdown(WR) drains pending TX data into smoltcp and queues FIN;
+            // in manual-interaction mode, wake the network worker so that work
+            // is flushed even if the preceding send wake raced and was already
+            // consumed.
+            litebox_platform_multiplex::platform().wake_network_worker();
+        }
+        result
     }
 
     /// Send data via socket channel (lock-free path).
