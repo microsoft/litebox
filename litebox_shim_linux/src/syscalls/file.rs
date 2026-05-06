@@ -4872,6 +4872,24 @@ impl<FS: ShimFS> Task<FS> {
             IoctlArg::FIONBIO(arg) => {
                 let val = arg.read_at_offset(0).ok_or(Errno::EFAULT)?;
                 let files = self.files.borrow();
+                if let Some(hp_fd) = files.try_host_pipe_fd(desc) {
+                    let handle = self
+                        .global
+                        .litebox
+                        .descriptor_table()
+                        .entry_handle(&hp_fd)
+                        .ok_or(Errno::EBADF)?;
+                    handle.with_entry(|file: &crate::syscalls::host_pipe::HostPipeFd| {
+                        self.global
+                            .platform
+                            .set_host_fd_nonblocking(file.raw_fd(), val != 0)?;
+                        let mut flags = file.get_status();
+                        flags.set(OFlags::NONBLOCK, val != 0);
+                        file.set_status(flags);
+                        Ok::<(), Errno>(())
+                    })?;
+                    return Ok(0);
+                }
                 files
                     .run_on_raw_fd(
                         desc,

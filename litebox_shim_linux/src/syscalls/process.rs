@@ -9135,14 +9135,25 @@ impl<FS: ShimFS> Task<FS> {
             false
         };
         let remote_exec_image = if needs_remote {
-            Some(loader.main_file_bytes()?)
+            Some(
+                match self.global.platform.read_host_file(&resolved_exe_path) {
+                    Ok(data) => data,
+                    Err(()) => loader.main_file_bytes()?,
+                },
+            )
         } else {
             None
         };
         let remote_interp_image = if needs_remote {
-            loader
-                .interp_file_bytes()?
-                .map(|(interp_path, data)| (self.resolve_exe_path(&interp_path), data))
+            loader.interp_file_bytes()?.map(|(interp_path, data)| {
+                let resolved = self.resolve_exe_path(&interp_path);
+                let data = self
+                    .global
+                    .platform
+                    .read_host_file(&resolved)
+                    .unwrap_or(data);
+                (resolved, data)
+            })
         } else {
             None
         };

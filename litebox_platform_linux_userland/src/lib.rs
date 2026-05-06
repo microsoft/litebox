@@ -1015,6 +1015,11 @@ impl LinuxUserland {
         Ok(written)
     }
 
+    /// Read a file directly from the host filesystem.
+    pub fn read_host_file(&self, path: &str) -> Result<Vec<u8>, ()> {
+        std::fs::read(path).map_err(|_| ())
+    }
+
     /// Register a CoW-eligible memory region backed by a file.
     ///
     /// # Panics
