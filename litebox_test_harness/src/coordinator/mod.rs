@@ -681,7 +681,7 @@ pub fn collect_all_tests() -> Vec<Test> {
     special_cases::register_fs_io(&mut tests);
     special_cases::register_capture_pipe(&mut tests);
     special_cases::register_stdin_script(&mut tests);
-    matrix::register_matrix(&mut tests);
+    matrix::register_matrix(&mut registry::Registry::new(&mut tests));
     platform_fixes::register_poll_ready_tests(&mut registry::Registry::new(&mut tests));
     platform_fixes::register_bind_getsockname_tests(&mut registry::Registry::new(&mut tests));
     platform_fixes::register_pipe_pair_id_tests(&mut registry::Registry::new(&mut tests));
