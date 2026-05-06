@@ -743,6 +743,7 @@ pub fn collect_all_tests() -> Vec<Test> {
     platform_fixes::register_pipe_nonblock_tests(&mut registry::Registry::new(&mut tests));
     platform_fixes::register_epoll_socket_tests(&mut registry::Registry::new(&mut tests));
     platform_fixes::register_loopback_tcp_tests(&mut registry::Registry::new(&mut tests));
+    platform_fixes::register_tcp_halfclose_tests(&mut registry::Registry::new(&mut tests));
     platform_fixes::register_fork_listen_close_tests(&mut registry::Registry::new(&mut tests));
     platform_fixes::register_proc_filesystem_tests(&mut registry::Registry::new(&mut tests));
     platform_fixes::register_subtree_kill_tests(&mut registry::Registry::new(&mut tests));
