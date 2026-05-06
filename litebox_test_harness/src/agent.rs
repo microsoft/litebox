@@ -307,11 +307,7 @@ async fn agent_loop(self_exe: &str) {
                                         match stream.read(&mut buf).await {
                                             Ok(0) | Err(_) => break,
                                             Ok(n) => {
-                                                if stream
-                                                    .write_all(&buf[..n])
-                                                    .await
-                                                    .is_err()
-                                                {
+                                                if stream.write_all(&buf[..n]).await.is_err() {
                                                     break;
                                                 }
                                             }
@@ -485,8 +481,8 @@ async fn agent_loop(self_exe: &str) {
                         Ok((out, err, Ok(status))) => {
                             respond(&Response::ExecResult {
                                 exit_code: status.code().unwrap_or(-1),
-                                stdout: String::from_utf8_lossy(&out).trim().to_string(),
-                                stderr: String::from_utf8_lossy(&err).trim().to_string(),
+                                stdout: String::from_utf8_lossy(&out).to_string(),
+                                stderr: String::from_utf8_lossy(&err).to_string(),
                             })
                             .await;
                         }
@@ -539,11 +535,7 @@ async fn agent_loop(self_exe: &str) {
                                         match stream.read(&mut buf).await {
                                             Ok(0) | Err(_) => break,
                                             Ok(n) => {
-                                                if stream
-                                                    .write_all(&buf[..n])
-                                                    .await
-                                                    .is_err()
-                                                {
+                                                if stream.write_all(&buf[..n]).await.is_err() {
                                                     break;
                                                 }
                                             }
