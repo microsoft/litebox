@@ -1739,16 +1739,17 @@ pub(super) fn register_unix_tests(reg: &mut Registry<'_>) {
                                 run,
                                 &handles,
                                 agent,
-                                Command::Exec {
+                                Command::ExecReady {
                                     args: vec![self_exe, "unix-echo-server".into(), sock.clone()],
-                                    timeout_secs: None,
+                                    ready_marker: "LISTENING".into(),
+                                    timeout_secs: Some(10),
                                     stdin: None,
-                                    background: true,
+                                    stream: "stdout".into(),
                                 },
                             )
                             .await;
                             let pid = match &resp {
-                                Response::Background { pid } => Some(*pid),
+                                Response::BackgroundReady { pid } => Some(*pid),
                                 _ => None,
                             };
                             if pid.is_none() {
@@ -1758,7 +1759,6 @@ pub(super) fn register_unix_tests(reg: &mut Registry<'_>) {
                                     format!("server_start failed: {resp:?}"),
                                 );
                             }
-                            tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
                             let data = format!("unix_{name}");
                             let resp = send_to(
                                 run,

@@ -13,6 +13,10 @@ fn default_accept_timeout() -> u64 {
     10
 }
 
+fn default_marker_stream() -> String {
+    "either".to_string()
+}
+
 /// Command sent from parent to child via stdin.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "cmd")]
@@ -150,6 +154,53 @@ pub enum Command {
         background: bool,
     },
 
+    /// Fork+exec in the background, but return only after stdout/stderr
+    /// contains the requested readiness marker. Output remains captured for
+    /// WaitBackground, and is drained after readiness so helpers cannot block.
+    #[serde(rename = "exec_ready")]
+    ExecReady {
+        args: Vec<String>,
+        /// Stdout/stderr substring that, once observed, signals readiness.
+        ready_marker: String,
+        /// Hard cap on wait. None = 30 seconds.
+        #[serde(default)]
+        timeout_secs: Option<u64>,
+        #[serde(default)]
+        stdin: Option<String>,
+        /// Where to look for the marker: "stdout" | "stderr" | "either".
+        #[serde(default = "default_marker_stream")]
+        stream: String,
+    },
+
+    /// Wait until this agent or a named child agent has accepted protocol
+    /// commands. A child agent can only answer after its init phase entered
+    /// the command loop, making this a process-ready beacon.
+    #[serde(rename = "wait_ready")]
+    WaitReady {
+        agent: String,
+        #[serde(default)]
+        timeout_secs: Option<u64>,
+    },
+
+    /// Wait for a previously backgrounded process to exit and return its
+    /// captured output. For plain Exec background commands stdout/stderr are
+    /// empty; ExecReady backgrounds retain captured output.
+    #[serde(rename = "wait_background")]
+    WaitBackground {
+        pid: u32,
+        #[serde(default)]
+        timeout_secs: Option<u64>,
+    },
+
+    /// Wait for an observed state predicate on this agent. This is a bounded
+    /// protocol-level replacement for coordinator sleeps.
+    #[serde(rename = "wait_for")]
+    WaitFor {
+        predicate: WaitPredicate,
+        #[serde(default)]
+        timeout_secs: Option<u64>,
+    },
+
     /// Report an environment variable value.
     #[serde(rename = "env_get")]
     EnvGet { var: String },
@@ -235,6 +286,13 @@ pub enum Command {
     Exit,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum WaitPredicate {
+    PortListening { port: u16, host: String },
+    FileExists { path: String },
+}
+
 /// Response sent from child to parent via stdout.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "status")]
@@ -301,6 +359,14 @@ pub enum Response {
     /// Background process started.
     #[serde(rename = "background")]
     Background { pid: u32 },
+
+    /// Background process reached its readiness marker.
+    #[serde(rename = "background_ready")]
+    BackgroundReady { pid: u32 },
+
+    /// Readiness or wait predicate satisfied.
+    #[serde(rename = "ready")]
+    Ready,
 
     /// Error.
     #[serde(rename = "error")]

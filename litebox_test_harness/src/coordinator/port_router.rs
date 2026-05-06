@@ -352,7 +352,6 @@ fn register_fork_listen_inherit_tests(reg: &mut Registry<'_>) {
                         .forward(&li_c, Command::NetUnlisten { port: child_port })
                         .await;
                     let _ = run.forward(&li_c, Command::Exit).await;
-                    tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
                     let conn_resp = run
                         .send(
                             &handle_a,
@@ -416,7 +415,6 @@ fn register_fork_listen_inherit_tests(reg: &mut Registry<'_>) {
                         .forward(&li_c2, Command::NetUnlisten { port: child_port2 })
                         .await;
                     let _ = run.forward(&li_c2, Command::Exit).await;
-                    tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
                     let conn_resp = run
                         .send(
                             &handle_b,

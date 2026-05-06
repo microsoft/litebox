@@ -5,11 +5,12 @@
 //! writes responses to stdout. Intermediate nodes forward commands to
 //! their children.
 
-use crate::protocol::{Command, Response};
+use crate::protocol::{Command, Response, WaitPredicate};
 use std::collections::HashMap;
 use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd};
-use std::sync::Arc;
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::time::Duration;
 
@@ -23,6 +24,53 @@ struct ChildHandle {
 struct ListenerEntry {
     fd: OwnedFd,
     task: tokio::task::JoinHandle<()>,
+}
+
+struct BackgroundProcess {
+    process: tokio::process::Child,
+    stdout: Arc<Mutex<Vec<u8>>>,
+    stderr: Arc<Mutex<Vec<u8>>>,
+    drains: Vec<tokio::task::JoinHandle<()>>,
+}
+
+fn marker_stream_matches(configured: &str, actual: &str) -> bool {
+    matches!(configured, "either") || configured == actual
+}
+
+fn spawn_output_capture<R>(
+    reader: R,
+    actual_stream: &'static str,
+    marker_stream: String,
+    ready_marker: String,
+    ready_seen: Arc<AtomicBool>,
+    buffer: Arc<Mutex<Vec<u8>>>,
+) -> tokio::task::JoinHandle<()>
+where
+    R: AsyncRead + Unpin + Send + 'static,
+{
+    tokio::spawn(async move {
+        let mut reader = BufReader::new(reader);
+        let mut line = Vec::new();
+        loop {
+            line.clear();
+            match reader.read_until(b'\n', &mut line).await {
+                Ok(0) => break,
+                Ok(_) => {
+                    buffer
+                        .lock()
+                        .expect("output buffer mutex")
+                        .extend_from_slice(&line);
+                    if marker_stream_matches(&marker_stream, actual_stream) {
+                        let text = String::from_utf8_lossy(&line);
+                        if text.contains(&ready_marker) {
+                            ready_seen.store(true, Ordering::SeqCst);
+                        }
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    })
 }
 
 const INHERITED_LISTEN_FDS_ENV: &str = "LITEBOX_TEST_HARNESS_INHERITED_LISTEN_FDS";
@@ -55,7 +103,7 @@ async fn agent_loop(self_exe: &str) {
     let mut unix_listeners: HashMap<String, tokio::task::JoinHandle<()>> = HashMap::new();
     let mut connections: HashMap<u64, TcpConn> = HashMap::new();
     let mut next_conn_id = 1u64;
-    let mut background_pids: Vec<tokio::process::Child> = Vec::new();
+    let mut background_pids: HashMap<u32, BackgroundProcess> = HashMap::new();
 
     let mut line = String::new();
     loop {
@@ -583,7 +631,15 @@ async fn agent_loop(self_exe: &str) {
                                 // drop closes the pipe
                             }
                             let pid = child.id().unwrap_or(0);
-                            background_pids.push(child);
+                            background_pids.insert(
+                                pid,
+                                BackgroundProcess {
+                                    process: child,
+                                    stdout: Arc::new(Mutex::new(Vec::new())),
+                                    stderr: Arc::new(Mutex::new(Vec::new())),
+                                    drains: Vec::new(),
+                                },
+                            );
                             respond(&Response::Background { pid }).await;
                         }
                         Err(e) => {
@@ -663,6 +719,267 @@ async fn agent_loop(self_exe: &str) {
                             .await;
                         }
                     }
+                }
+            }
+
+            Command::ExecReady {
+                args,
+                ready_marker,
+                timeout_secs,
+                stdin: stdin_content,
+                stream,
+            } => {
+                if args.is_empty() {
+                    respond(&Response::Error {
+                        error: "exec_ready requires args".to_string(),
+                    })
+                    .await;
+                    continue;
+                }
+                if !matches!(stream.as_str(), "stdout" | "stderr" | "either") {
+                    respond(&Response::Error {
+                        error: format!(
+                            "invalid marker stream {stream:?}; expected stdout, stderr, or either"
+                        ),
+                    })
+                    .await;
+                    continue;
+                }
+
+                let mut cmd = tokio::process::Command::new(&args[0]);
+                cmd.args(&args[1..]);
+                if stdin_content.is_some() {
+                    cmd.stdin(std::process::Stdio::piped());
+                } else {
+                    cmd.stdin(std::process::Stdio::null());
+                }
+                cmd.stdout(std::process::Stdio::piped());
+                cmd.stderr(std::process::Stdio::piped());
+
+                let mut child = match cmd.spawn() {
+                    Ok(c) => c,
+                    Err(e) => {
+                        respond(&Response::Error {
+                            error: format!("exec_ready spawn: {e}"),
+                        })
+                        .await;
+                        continue;
+                    }
+                };
+
+                if let Some(content) = stdin_content
+                    && let Some(mut child_stdin) = child.stdin.take()
+                {
+                    let _ = child_stdin.write_all(content.as_bytes()).await;
+                    let _ = child_stdin.flush().await;
+                    drop(child_stdin);
+                }
+
+                let Some(stdout) = child.stdout.take() else {
+                    respond(&Response::Error {
+                        error: "exec_ready: stdout pipe missing".to_string(),
+                    })
+                    .await;
+                    continue;
+                };
+                let Some(stderr) = child.stderr.take() else {
+                    respond(&Response::Error {
+                        error: "exec_ready: stderr pipe missing".to_string(),
+                    })
+                    .await;
+                    continue;
+                };
+
+                let stdout_buf = Arc::new(Mutex::new(Vec::new()));
+                let stderr_buf = Arc::new(Mutex::new(Vec::new()));
+                let ready_seen = Arc::new(AtomicBool::new(false));
+                let stdout_task = spawn_output_capture(
+                    stdout,
+                    "stdout",
+                    stream.clone(),
+                    ready_marker.clone(),
+                    Arc::clone(&ready_seen),
+                    Arc::clone(&stdout_buf),
+                );
+                let stderr_task = spawn_output_capture(
+                    stderr,
+                    "stderr",
+                    stream,
+                    ready_marker,
+                    Arc::clone(&ready_seen),
+                    Arc::clone(&stderr_buf),
+                );
+
+                let timeout = Duration::from_secs(timeout_secs.unwrap_or(30));
+                let ready = tokio::time::timeout(timeout, async {
+                    loop {
+                        if ready_seen.load(Ordering::SeqCst) {
+                            break Ok(());
+                        }
+                        match child.try_wait() {
+                            Ok(Some(status)) => {
+                                if ready_seen.load(Ordering::SeqCst) {
+                                    break Ok(());
+                                }
+                                break Err(format!(
+                                    "process exited before ready_marker (status={status})"
+                                ));
+                            }
+                            Ok(None) => {}
+                            Err(e) => break Err(format!("exec_ready poll: {e}")),
+                        }
+                        tokio::time::sleep(Duration::from_millis(25)).await;
+                    }
+                })
+                .await;
+
+                match ready {
+                    Ok(Ok(())) => {
+                        let pid = child.id().unwrap_or(0);
+                        background_pids.insert(
+                            pid,
+                            BackgroundProcess {
+                                process: child,
+                                stdout: stdout_buf,
+                                stderr: stderr_buf,
+                                drains: vec![stdout_task, stderr_task],
+                            },
+                        );
+                        respond(&Response::BackgroundReady { pid }).await;
+                    }
+                    Ok(Err(error)) => {
+                        let _ = child.start_kill();
+                        stdout_task.abort();
+                        stderr_task.abort();
+                        respond(&Response::Error { error }).await;
+                    }
+                    Err(_) => {
+                        let _ = child.start_kill();
+                        stdout_task.abort();
+                        stderr_task.abort();
+                        respond(&Response::Error {
+                            error: format!(
+                                "ready_marker not observed within {}s",
+                                timeout.as_secs()
+                            ),
+                        })
+                        .await;
+                    }
+                }
+            }
+
+            Command::WaitReady {
+                agent,
+                timeout_secs,
+            } => {
+                if agent.is_empty() || agent == "self" {
+                    respond(&Response::Ready).await;
+                } else if let Some(child) = children.get_mut(&agent) {
+                    let timeout = Duration::from_secs(timeout_secs.unwrap_or(30));
+                    let ready_cmd = Command::WaitReady {
+                        agent: "self".to_string(),
+                        timeout_secs,
+                    };
+                    let wait = send_to_child(child, &ready_cmd);
+                    match tokio::time::timeout(timeout, wait).await {
+                        Ok(Response::Ready) => respond(&Response::Ready).await,
+                        Ok(resp) => respond(&resp).await,
+                        Err(_) => {
+                            respond(&Response::Error {
+                                error: format!(
+                                    "agent {agent} not ready within {}s",
+                                    timeout.as_secs()
+                                ),
+                            })
+                            .await;
+                        }
+                    }
+                } else {
+                    respond(&Response::Error {
+                        error: format!("unknown child: {agent}"),
+                    })
+                    .await;
+                }
+            }
+
+            Command::WaitBackground { pid, timeout_secs } => {
+                let Some(mut bg) = background_pids.remove(&pid) else {
+                    respond(&Response::Error {
+                        error: format!("unknown background pid: {pid}"),
+                    })
+                    .await;
+                    continue;
+                };
+                let timeout = Duration::from_secs(timeout_secs.unwrap_or(30));
+                match tokio::time::timeout(timeout, bg.process.wait()).await {
+                    Ok(Ok(status)) => {
+                        for drain in bg.drains {
+                            let _ = drain.await;
+                        }
+                        let stdout = bg.stdout.lock().expect("stdout buffer mutex").clone();
+                        let stderr = bg.stderr.lock().expect("stderr buffer mutex").clone();
+                        respond(&Response::ExecResult {
+                            exit_code: status.code().unwrap_or(-1),
+                            stdout: String::from_utf8_lossy(&stdout).to_string(),
+                            stderr: String::from_utf8_lossy(&stderr).to_string(),
+                        })
+                        .await;
+                    }
+                    Ok(Err(e)) => {
+                        respond(&Response::Error {
+                            error: format!("wait_background: {e}"),
+                        })
+                        .await;
+                    }
+                    Err(_) => {
+                        let _ = bg.process.start_kill();
+                        for drain in bg.drains {
+                            drain.abort();
+                        }
+                        respond(&Response::ExecTimeout {
+                            stderr: format!(
+                                "background process timed out after {}s",
+                                timeout.as_secs()
+                            ),
+                        })
+                        .await;
+                    }
+                }
+            }
+
+            Command::WaitFor {
+                predicate,
+                timeout_secs,
+            } => {
+                let timeout = Duration::from_secs(timeout_secs.unwrap_or(30));
+                let deadline = tokio::time::Instant::now() + timeout;
+                loop {
+                    let satisfied = match &predicate {
+                        WaitPredicate::PortListening { port, host } => tokio::time::timeout(
+                            Duration::from_millis(200),
+                            tokio::net::TcpStream::connect(format!("{host}:{port}")),
+                        )
+                        .await
+                        .is_ok_and(|r| r.is_ok()),
+                        WaitPredicate::FileExists { path } => {
+                            tokio::fs::metadata(path).await.is_ok()
+                        }
+                    };
+                    if satisfied {
+                        respond(&Response::Ready).await;
+                        break;
+                    }
+                    if tokio::time::Instant::now() >= deadline {
+                        respond(&Response::Error {
+                            error: format!(
+                                "wait_for {predicate:?} not satisfied within {}s",
+                                timeout.as_secs()
+                            ),
+                        })
+                        .await;
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(25)).await;
                 }
             }
 
@@ -883,18 +1200,12 @@ async fn agent_loop(self_exe: &str) {
             }
 
             Command::Kill { pid } => {
-                // Try to kill by pid. Also clean up our background_pids list.
-                let mut killed = false;
-                background_pids.retain_mut(|child| {
-                    if child.id() == Some(pid) {
-                        let _ = child.start_kill();
-                        killed = true;
-                        false // remove from list
-                    } else {
-                        true
+                if let Some(mut child) = background_pids.remove(&pid) {
+                    let _ = child.process.start_kill();
+                    for drain in child.drains {
+                        drain.abort();
                     }
-                });
-                if !killed {
+                } else {
                     // Try OS-level kill as fallback.
                     unsafe {
                         libc::kill(pid as i32, libc::SIGKILL);
@@ -1135,8 +1446,11 @@ async fn agent_loop(self_exe: &str) {
                     task.abort();
                 }
                 // Kill background processes.
-                for mut child in background_pids.drain(..) {
-                    let _ = child.kill().await;
+                for (_, mut child) in background_pids.drain() {
+                    let _ = child.process.start_kill();
+                    for drain in child.drains {
+                        drain.abort();
+                    }
                 }
                 // Send exit to all children.
                 for (_, mut child) in children.drain() {
