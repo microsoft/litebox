@@ -685,28 +685,32 @@ pub fn collect_all_tests() -> Vec<Test> {
     special_cases::register_capture_pipe(&mut tests);
     special_cases::register_stdin_script(&mut tests);
     matrix::register_matrix(&mut tests);
-    tests.extend(platform_fixes::register_poll_ready_tests());
-    tests.extend(platform_fixes::register_bind_getsockname_tests());
-    tests.extend(platform_fixes::register_pipe_pair_id_tests());
-    tests.extend(platform_fixes::register_exit_data_integrity_tests());
-    tests.extend(platform_fixes::register_nonpie_pipe_chain_tests());
-    tests.extend(platform_fixes::register_cross_worker_first_connect_tests());
-    tests.extend(platform_fixes::register_cross_worker_self_connect_tests());
-    tests.extend(platform_fixes::register_bash_fork_exec_tests());
-    tests.extend(platform_fixes::register_fork_from_worker_exec_tests());
-    tests.extend(platform_fixes::register_stdin_pipe_subst_tests());
-    tests.extend(platform_fixes::register_cross_worker_file_tests());
-    tests.extend(platform_fixes::register_subst_capture_tests());
-    tests.extend(platform_fixes::register_concurrent_fork_tests());
-    tests.extend(platform_fixes::register_touch_redirect_tests());
-    tests.extend(platform_fixes::register_pid_visibility_tests());
-    tests.extend(platform_fixes::register_file_redirect_tests());
-    tests.extend(platform_fixes::register_pipe_nonblock_tests());
-    tests.extend(platform_fixes::register_epoll_socket_tests());
-    tests.extend(platform_fixes::register_loopback_tcp_tests());
-    tests.extend(platform_fixes::register_fork_listen_close_tests());
-    tests.extend(platform_fixes::register_proc_filesystem_tests());
-    tests.extend(platform_fixes::register_subtree_kill_tests());
+    platform_fixes::register_poll_ready_tests(&mut registry::Registry::new(&mut tests));
+    platform_fixes::register_bind_getsockname_tests(&mut registry::Registry::new(&mut tests));
+    platform_fixes::register_pipe_pair_id_tests(&mut registry::Registry::new(&mut tests));
+    platform_fixes::register_exit_data_integrity_tests(&mut registry::Registry::new(&mut tests));
+    platform_fixes::register_nonpie_pipe_chain_tests(&mut registry::Registry::new(&mut tests));
+    platform_fixes::register_cross_worker_first_connect_tests(&mut registry::Registry::new(
+        &mut tests,
+    ));
+    platform_fixes::register_cross_worker_self_connect_tests(&mut registry::Registry::new(
+        &mut tests,
+    ));
+    platform_fixes::register_bash_fork_exec_tests(&mut registry::Registry::new(&mut tests));
+    platform_fixes::register_fork_from_worker_exec_tests(&mut registry::Registry::new(&mut tests));
+    platform_fixes::register_stdin_pipe_subst_tests(&mut registry::Registry::new(&mut tests));
+    platform_fixes::register_cross_worker_file_tests(&mut registry::Registry::new(&mut tests));
+    platform_fixes::register_subst_capture_tests(&mut registry::Registry::new(&mut tests));
+    platform_fixes::register_concurrent_fork_tests(&mut registry::Registry::new(&mut tests));
+    platform_fixes::register_touch_redirect_tests(&mut registry::Registry::new(&mut tests));
+    platform_fixes::register_pid_visibility_tests(&mut registry::Registry::new(&mut tests));
+    platform_fixes::register_file_redirect_tests(&mut registry::Registry::new(&mut tests));
+    platform_fixes::register_pipe_nonblock_tests(&mut registry::Registry::new(&mut tests));
+    platform_fixes::register_epoll_socket_tests(&mut registry::Registry::new(&mut tests));
+    platform_fixes::register_loopback_tcp_tests(&mut registry::Registry::new(&mut tests));
+    platform_fixes::register_fork_listen_close_tests(&mut registry::Registry::new(&mut tests));
+    platform_fixes::register_proc_filesystem_tests(&mut registry::Registry::new(&mut tests));
+    platform_fixes::register_subtree_kill_tests(&mut registry::Registry::new(&mut tests));
     fork_matrix::register_fork_matrix(&mut tests);
     special_cases::register_unix_socket(&mut tests);
     special_cases::register_cross_worker(&mut tests);
