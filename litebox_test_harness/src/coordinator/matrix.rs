@@ -106,13 +106,6 @@ impl Topology {
         }
     }
 
-    /// Whether this topology requires non-PIE agents (NP, NPC, D3-D5).
-    fn requires_nonpie(self) -> bool {
-        matches!(
-            self,
-            Self::PieToNonPie | Self::NonPieToParent | Self::NonPieChildUp | Self::DeepNonPie
-        )
-    }
 }
 
 // ── Xfail registry ──
@@ -186,13 +179,6 @@ impl FsScope {
 // NETWORK
 // ═══════════════════════════════════════════════════════════════════
 
-/// Whether an agent name requires the non-PIE subtree.
-fn agent_requires_nonpie(name: AgentName) -> bool {
-    matches!(
-        name,
-        AgentName::NP | AgentName::NPC | AgentName::D3 | AgentName::D4 | AgentName::D5
-    )
-}
 
 /// Net test descriptor. Listener listens, connector connects.
 struct NetTestCase {

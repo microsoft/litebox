@@ -115,6 +115,7 @@ impl AgentHandle {
 /// at registration time so the lazy matrix knows whether non-PIE
 /// infrastructure must be brought up.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[allow(dead_code)] // `Pie` is intentional API surface; no current consumer.
 pub enum SpawnKind {
     /// PIE child via `Command::Spawn { children: vec![label] }`.
     Pie,

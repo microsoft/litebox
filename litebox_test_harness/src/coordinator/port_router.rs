@@ -440,7 +440,7 @@ fn register_child_listen_cross_connect_tests(reg: &mut Registry<'_>) {
     reg.test("stress", "port_router", "PR.child_listen_cross")
         .timeout(180)
         .build(move |cx| {
-            let handle_a = cx.require(AgentName::A);
+            let _handle_a = cx.require(AgentName::A);
             let handle_b = cx.require(AgentName::B);
             // Try CL_C as a non-PIE Fork first; fall back to PIE.
             // Both share the same wire label so forwarding works

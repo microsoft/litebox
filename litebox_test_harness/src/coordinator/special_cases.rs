@@ -15,7 +15,7 @@ use crate::protocol::{Command, Response};
 macro_rules! typed_test {
     ($reg:ident, $suite:expr, $group:expr, $id:expr, timeout = $timeout:expr, agents [$($handle:ident = $agent:expr),+ $(,)?], |$run:ident| $body:block) => {{
         $reg.test($suite, $group, $id).timeout($timeout).build(move |cx| {
-            $(let $handle = cx.require($agent);)+
+            $(#[allow(unused_variables)] let $handle = cx.require($agent);)+
             Box::new(move |$run| Box::pin(async move $body))
         });
     }};
@@ -25,7 +25,7 @@ macro_rules! typed_test {
      ephemerals [$($eh:ident = ($parent:expr, $label:expr, $kind:expr)),+ $(,)?],
      |$run:ident| $body:block) => {{
         $reg.test($suite, $group, $id).timeout($timeout).build(move |cx| {
-            $(let $handle = cx.require($agent);)+
+            $(#[allow(unused_variables)] let $handle = cx.require($agent);)+
             $(let $eh = cx.declare_ephemeral($parent, $label, $kind);)+
             Box::new(move |$run| Box::pin(async move {
                 $(let $eh = $eh.clone();)+

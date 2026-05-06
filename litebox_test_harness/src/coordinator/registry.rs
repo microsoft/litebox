@@ -97,11 +97,6 @@ impl<'b, 'a: 'b> TestBuilder<'b, 'a> {
         self
     }
 
-    /// Mark this test as expected-to-fail with the given reason.
-    pub fn xfail(mut self, reason: impl Into<String>) -> Self {
-        self.xfail = Some(reason.into());
-        self
-    }
 
     /// Build the test. The closure receives a `RegistrationContext`
     /// for declaring agent dependencies and must return a closure
