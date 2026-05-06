@@ -577,8 +577,16 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
             let (_, dfid) = self
                 .client
                 .walk(self.root.1, &components[..components.len() - 1])?;
-            self.client
-                .create(dfid, components.last().unwrap(), lflags, mode.bits(), 0)?
+            match self
+                .client
+                .create(dfid, components.last().unwrap(), lflags, mode.bits(), 0)
+            {
+                Ok(v) => v,
+                Err(err) => {
+                    let _ = self.client.clunk(dfid);
+                    return Err(err.into());
+                }
+            }
         } else {
             let (_, new_fid) = self.client.walk(self.root.1, &components)?;
             let qid = self.client.open(new_fid, lflags)?;
@@ -609,15 +617,12 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
         buf: &mut [u8],
         offset: Option<usize>,
     ) -> Result<usize, super::errors::ReadError> {
-        // Extract fid and current offset, releasing the descriptor table lock
-        // before performing potentially blocking I/O.
-        let (fid, current_offset) = self
-            .litebox
-            .descriptor_table()
-            .with_entry(fd, |desc| {
-                (desc.entry.fid, desc.entry.offset.load(Ordering::SeqCst))
-            })
+        let descriptors = self.litebox.descriptor_table();
+        let desc = descriptors
+            .get_entry(fd)
             .ok_or(super::errors::ReadError::ClosedFd)?;
+        let fid = desc.entry.fid;
+        let current_offset = desc.entry.offset.load(Ordering::SeqCst);
 
         let read_offset = match offset {
             Some(o) => o,
@@ -628,9 +633,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
 
         // Update offset if not using explicit offset
         if offset.is_none() {
-            self.litebox.descriptor_table().with_entry(fd, |desc| {
-                desc.entry.offset.fetch_add(bytes_read, Ordering::SeqCst);
-            });
+            desc.entry.offset.fetch_add(bytes_read, Ordering::SeqCst);
         }
 
         Ok(bytes_read)
@@ -642,15 +645,12 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
         buf: &[u8],
         offset: Option<usize>,
     ) -> Result<usize, super::errors::WriteError> {
-        // Extract fid and current offset, releasing the descriptor table lock
-        // before performing potentially blocking I/O.
-        let (fid, current_offset) = self
-            .litebox
-            .descriptor_table()
-            .with_entry(fd, |desc| {
-                (desc.entry.fid, desc.entry.offset.load(Ordering::SeqCst))
-            })
+        let descriptors = self.litebox.descriptor_table();
+        let desc = descriptors
+            .get_entry(fd)
             .ok_or(super::errors::WriteError::ClosedFd)?;
+        let fid = desc.entry.fid;
+        let current_offset = desc.entry.offset.load(Ordering::SeqCst);
 
         let write_offset = match offset {
             Some(o) => o,
@@ -661,9 +661,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
 
         // Update offset if not using explicit offset
         if offset.is_none() {
-            self.litebox.descriptor_table().with_entry(fd, |desc| {
-                desc.entry.offset.fetch_add(bytes_written, Ordering::SeqCst);
-            });
+            desc.entry.offset.fetch_add(bytes_written, Ordering::SeqCst);
         }
 
         Ok(bytes_written)
@@ -675,15 +673,10 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
         offset: isize,
         whence: super::SeekWhence,
     ) -> Result<usize, SeekError> {
-        // Extract fid and current offset, releasing the descriptor table lock
-        // before performing potentially blocking I/O (getattr for SeekWhence::RelativeToEnd).
-        let (fid, current_offset) = self
-            .litebox
-            .descriptor_table()
-            .with_entry(fd, |desc| {
-                (desc.entry.fid, desc.entry.offset.load(Ordering::SeqCst))
-            })
-            .ok_or(SeekError::ClosedFd)?;
+        let descriptors = self.litebox.descriptor_table();
+        let desc = descriptors.get_entry(fd).ok_or(SeekError::ClosedFd)?;
+        let fid = desc.entry.fid;
+        let current_offset = desc.entry.offset.load(Ordering::SeqCst);
 
         let base = match whence {
             super::SeekWhence::RelativeToBeginning => 0,
@@ -697,9 +690,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
             .checked_add_signed(offset)
             .ok_or(SeekError::InvalidOffset)?;
 
-        self.litebox.descriptor_table().with_entry(fd, |desc| {
-            desc.entry.offset.store(new_offset, Ordering::SeqCst);
-        });
+        desc.entry.offset.store(new_offset, Ordering::SeqCst);
         Ok(new_offset)
     }
 
@@ -709,13 +700,12 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
         length: usize,
         reset_offset: bool,
     ) -> Result<(), super::errors::TruncateError> {
-        // Extract fid and qid, releasing the descriptor table lock
-        // before performing potentially blocking I/O.
-        let (fid, qid) = self
-            .litebox
-            .descriptor_table()
-            .with_entry(fd, |desc| (desc.entry.fid, desc.entry.qid))
+        let descriptors = self.litebox.descriptor_table();
+        let desc = descriptors
+            .get_entry(fd)
             .ok_or(super::errors::TruncateError::ClosedFd)?;
+        let fid = desc.entry.fid;
+        let qid = desc.entry.qid;
 
         if qid.typ.contains(fcall::QidType::DIR) {
             return Err(super::errors::TruncateError::IsDirectory);
@@ -732,9 +722,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
         self.client.setattr(fid, fcall::SetattrMask::SIZE, stat)?;
 
         if reset_offset {
-            self.litebox.descriptor_table().with_entry(fd, |desc| {
-                desc.entry.offset.store(0, Ordering::SeqCst);
-            });
+            desc.entry.offset.store(0, Ordering::SeqCst);
         }
 
         Ok(())
@@ -820,13 +808,12 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
         &self,
         fd: &FileFd<Platform, T>,
     ) -> Result<Vec<crate::fs::DirEntry>, super::errors::ReadDirError> {
-        // Extract fid and qid, releasing the descriptor table lock
-        // before performing potentially blocking I/O.
-        let (fid, qid) = self
-            .litebox
-            .descriptor_table()
-            .with_entry(fd, |desc| (desc.entry.fid, desc.entry.qid))
+        let descriptors = self.litebox.descriptor_table();
+        let desc = descriptors
+            .get_entry(fd)
             .ok_or(super::errors::ReadDirError::ClosedFd)?;
+        let fid = desc.entry.fid;
+        let qid = desc.entry.qid;
 
         if !qid.typ.contains(fcall::QidType::DIR) {
             return Err(super::errors::ReadDirError::NotADirectory);
@@ -878,15 +865,12 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
         &self,
         fd: &FileFd<Platform, T>,
     ) -> Result<super::FileStatus, super::errors::FileStatusError> {
-        // Extract fid, releasing the descriptor table lock
-        // before performing potentially blocking I/O.
-        let fid = self
-            .litebox
-            .descriptor_table()
-            .with_entry(fd, |desc| desc.entry.fid)
+        let descriptors = self.litebox.descriptor_table();
+        let desc = descriptors
+            .get_entry(fd)
             .ok_or(super::errors::FileStatusError::ClosedFd)?;
+        let fid = desc.entry.fid;
 
-        // Perform blocking I/O without holding any locks.
         let attr = self.client.getattr(fid, fcall::GetattrMask::ALL)?;
 
         Ok(Self::rgetattr_to_file_status(&attr)?)

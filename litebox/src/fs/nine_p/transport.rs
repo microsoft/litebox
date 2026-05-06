@@ -64,7 +64,11 @@ pub(super) fn write_message<W: Write>(
 }
 
 /// Read a 9P message size header (4 bytes) and then the full message
-pub(super) fn read_to_buf<R: Read>(r: &mut R, buf: &mut Vec<u8>) -> Result<(), super::Error> {
+pub(super) fn read_to_buf<R: Read>(
+    r: &mut R,
+    buf: &mut Vec<u8>,
+    max_size: usize,
+) -> Result<(), super::Error> {
     buf.resize(4, 0);
     r.read_exact(&mut buf[..]).map_err(|_| super::Error::Io)?;
     let sz = u32::from_le_bytes(buf[..4].try_into().unwrap()) as usize;
@@ -72,8 +76,8 @@ pub(super) fn read_to_buf<R: Read>(r: &mut R, buf: &mut Vec<u8>) -> Result<(), s
         // Minimum message size: size(4) + type(1) + tag(2)
         return Err(super::Error::InvalidResponse);
     }
-    if sz > buf.capacity() {
-        buf.reserve(sz - buf.len());
+    if sz > max_size {
+        return Err(super::Error::InvalidResponse);
     }
     buf.resize(sz, 0);
     r.read_exact(&mut buf[4..]).map_err(|_| super::Error::Io)
@@ -83,8 +87,9 @@ pub(super) fn read_to_buf<R: Read>(r: &mut R, buf: &mut Vec<u8>) -> Result<(), s
 pub(super) fn read_message<'a, R: Read>(
     r: &mut R,
     buf: &'a mut Vec<u8>,
+    max_size: usize,
 ) -> Result<super::fcall::TaggedFcall<'a>, super::Error> {
-    read_to_buf(r, buf)?;
+    read_to_buf(r, buf, max_size)?;
     super::fcall::TaggedFcall::decode(&buf[..])
 }
 
@@ -102,5 +107,37 @@ impl Write for Vec<u8> {
     fn write(&mut self, buf: &[u8]) -> Result<usize, WriteError> {
         self.extend_from_slice(buf);
         Ok(buf.len())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct SliceReader<'a> {
+        buf: &'a [u8],
+    }
+
+    impl Read for SliceReader<'_> {
+        fn read(&mut self, buf: &mut [u8]) -> Result<usize, ReadError> {
+            let amt = self.buf.len().min(buf.len());
+            buf[..amt].copy_from_slice(&self.buf[..amt]);
+            self.buf = &self.buf[amt..];
+            Ok(amt)
+        }
+    }
+
+    #[test]
+    fn read_to_buf_rejects_frames_larger_than_limit() {
+        let input = 0xffff_ffffu32.to_le_bytes();
+        let mut reader = SliceReader { buf: &input };
+        let mut buf = Vec::with_capacity(64);
+
+        assert!(matches!(
+            read_to_buf(&mut reader, &mut buf, 64),
+            Err(super::super::Error::InvalidResponse)
+        ));
+        assert_eq!(buf.len(), 4);
+        assert_eq!(buf.capacity(), 64);
     }
 }

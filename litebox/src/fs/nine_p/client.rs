@@ -71,6 +71,8 @@ pub(super) struct Client<Platform: RawSyncPrimitivesProvider, T: Read + Write> {
 }
 
 impl<Platform: RawSyncPrimitivesProvider, T: Read + Write> Client<Platform, T> {
+    const MAX_READDIR_ENTRIES: usize = 1_000_000;
+
     /// Create a new 9P client and perform version negotiation
     ///
     /// # Arguments
@@ -97,7 +99,7 @@ impl<Platform: RawSyncPrimitivesProvider, T: Read + Write> Client<Platform, T> {
         )
         .map_err(|_| Error::Io)?;
 
-        let response = transport::read_message(&mut transport, &mut rbuf)?;
+        let response = transport::read_message(&mut transport, &mut rbuf, bufsize as usize)?;
 
         let msize = match response {
             TaggedFcall {
@@ -115,6 +117,9 @@ impl<Platform: RawSyncPrimitivesProvider, T: Read + Write> Client<Platform, T> {
             } => return Err(Error::from(e)),
             _ => return Err(Error::InvalidResponse),
         };
+        if msize < fcall::IOHDRSZ.max(fcall::READDIRHDRSZ) {
+            return Err(Error::InvalidResponse);
+        }
 
         wbuf.truncate(msize as usize);
         rbuf.truncate(msize as usize);
@@ -133,10 +138,7 @@ impl<Platform: RawSyncPrimitivesProvider, T: Read + Write> Client<Platform, T> {
     where
         F: FnOnce(Fcall<'_>) -> Result<R, Error>,
     {
-        let tag = self.next_tag.fetch_add(1, Ordering::Relaxed);
-        if tag == fcall::NOTAG {
-            todo!("tag wraparound");
-        }
+        let tag = self.next_tag();
 
         let mut write_state = self.write_state.lock();
         let ClientWriteState { transport, wbuf } = &mut *write_state;
@@ -144,13 +146,24 @@ impl<Platform: RawSyncPrimitivesProvider, T: Read + Write> Client<Platform, T> {
             .map_err(|_| Error::Io)?;
 
         let mut rbuf = self.rbuf.lock();
+        let response = transport::read_message(transport, &mut rbuf, self.msize as usize)?;
+        if response.tag != tag {
+            return Err(Error::InvalidResponse);
+        }
+        f(response.fcall)
+    }
 
-        // Loop until we get a response with matching tag (in case of stale responses)
-        // TODO: support concurrent requests by allowing out-of-order responses and matching tags accordingly
+    fn next_tag(&self) -> u16 {
         loop {
-            let response = transport::read_message(transport, &mut rbuf)?;
-            if response.tag == tag {
-                return f(response.fcall);
+            let current = self.next_tag.load(Ordering::Relaxed);
+            let tag = if current == fcall::NOTAG { 1 } else { current };
+            let next = if tag == fcall::NOTAG - 1 { 1 } else { tag + 1 };
+            if self
+                .next_tag
+                .compare_exchange(current, next, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+            {
+                return tag;
             }
         }
     }
@@ -228,23 +241,28 @@ impl<Platform: RawSyncPrimitivesProvider, T: Read + Write> Client<Platform, T> {
         let mut wqids = Vec::with_capacity(fcall::MAXWELEM);
         let mut f = fid;
         for wnames in wnames.chunks(fcall::MAXWELEM) {
-            let (mut new_wqids, new_f) = self.walk_once(f, wnames)?;
+            let (mut new_wqids, new_f) = match self.walk_once(f, wnames) {
+                Ok(v) => v,
+                Err(err) => {
+                    if f != fid {
+                        let _ = self.clunk(f);
+                    }
+                    return Err(err);
+                }
+            };
             let new_len = new_wqids.len();
             wqids.append(&mut new_wqids);
             // Clunk the old fid if it's not the original fid
-            if f != fid {
-                let _ = self.clunk(f);
+            if f != fid
+                && let Err(err) = self.clunk(f)
+            {
+                let _ = self.clunk(new_f);
+                return Err(err);
             }
             f = new_f;
             // It means that the walk failed at the nwqid-th element
             if new_len < wnames.len() {
-                if wqids
-                    .last()
-                    .is_some_and(|e| e.typ == fcall::QidType::SYMLINK)
-                {
-                    todo!("symlink");
-                }
-                let _ = self.clunk(f);
+                self.clunk(f)?;
                 return Err(Error::Remote(super::ENOENT));
             }
         }
@@ -317,7 +335,11 @@ impl<Platform: RawSyncPrimitivesProvider, T: Read + Write> Client<Platform, T> {
         offset: u64,
         buf: &mut [u8],
     ) -> Result<usize, Error> {
-        let count = buf.len().min((self.msize - fcall::IOHDRSZ) as usize);
+        let max_count = self
+            .msize
+            .checked_sub(fcall::IOHDRSZ)
+            .ok_or(Error::InvalidResponse)? as usize;
+        let count = buf.len().min(max_count);
         self.fcall(
             Fcall::Tread(fcall::Tread {
                 fid,
@@ -326,6 +348,9 @@ impl<Platform: RawSyncPrimitivesProvider, T: Read + Write> Client<Platform, T> {
             }),
             |response| match response {
                 Fcall::Rread(fcall::Rread { data }) => {
+                    if data.len() > count || data.len() > buf.len() {
+                        return Err(Error::InvalidResponse);
+                    }
                     buf[..data.len()].copy_from_slice(&data);
                     Ok(data.len())
                 }
@@ -337,7 +362,11 @@ impl<Platform: RawSyncPrimitivesProvider, T: Read + Write> Client<Platform, T> {
 
     /// Write to a file
     pub(super) fn write(&self, fid: fcall::Fid, offset: u64, data: &[u8]) -> Result<usize, Error> {
-        let count = data.len().min((self.msize - fcall::IOHDRSZ) as usize);
+        let max_count = self
+            .msize
+            .checked_sub(fcall::IOHDRSZ)
+            .ok_or(Error::InvalidResponse)? as usize;
+        let count = data.len().min(max_count);
         self.fcall(
             Fcall::Twrite(fcall::Twrite {
                 fid,
@@ -345,7 +374,13 @@ impl<Platform: RawSyncPrimitivesProvider, T: Read + Write> Client<Platform, T> {
                 data: alloc::borrow::Cow::Borrowed(&data[..count]),
             }),
             |response| match response {
-                Fcall::Rwrite(fcall::Rwrite { count }) => Ok(count as usize),
+                Fcall::Rwrite(fcall::Rwrite { count: written }) => {
+                    let written = written as usize;
+                    if written > count {
+                        return Err(Error::InvalidResponse);
+                    }
+                    Ok(written)
+                }
                 Fcall::Rlerror(e) => Err(Error::from(e)),
                 _ => Err(Error::InvalidResponse),
             },
@@ -395,7 +430,10 @@ impl<Platform: RawSyncPrimitivesProvider, T: Read + Write> Client<Platform, T> {
         fid: fcall::Fid,
         offset: u64,
     ) -> Result<Vec<fcall::DirEntry<'static>>, Error> {
-        let count = self.msize - fcall::READDIRHDRSZ;
+        let count = self
+            .msize
+            .checked_sub(fcall::READDIRHDRSZ)
+            .ok_or(Error::InvalidResponse)?;
         self.fcall(
             Fcall::Treaddir(fcall::Treaddir { fid, offset, count }),
             |response| match response {
@@ -422,7 +460,18 @@ impl<Platform: RawSyncPrimitivesProvider, T: Read + Write> Client<Platform, T> {
             if entries.is_empty() {
                 break;
             }
-            offset = entries.last().unwrap().offset;
+            let next_offset = entries.last().unwrap().offset;
+            if next_offset <= offset {
+                return Err(Error::InvalidResponse);
+            }
+            if all_entries
+                .len()
+                .checked_add(entries.len())
+                .is_none_or(|len| len > Self::MAX_READDIR_ENTRIES)
+            {
+                return Err(Error::InvalidResponse);
+            }
+            offset = next_offset;
             all_entries.extend(entries);
         }
         Ok(all_entries)
@@ -527,7 +576,9 @@ impl<Platform: RawSyncPrimitivesProvider, T: Read + Write> Client<Platform, T> {
                 _ => Err(Error::InvalidResponse),
             },
         );
-        self.fids.free(fid);
+        if result.is_ok() {
+            self.fids.free(fid);
+        }
         result
     }
 

@@ -329,10 +329,17 @@ impl<'a> DirEntryData<'a> {
     }
 
     fn decode_from(d: &mut FcallDecoder<'a>) -> Result<Self, super::Error> {
-        let end_len = d.buf.len() - d.decode_le::<u32>()? as usize;
+        let len = d.decode_le::<u32>()? as usize;
+        if len > d.buf.len() {
+            return Err(super::Error::InvalidResponse);
+        }
+        let end_len = d.buf.len() - len;
         let mut v = Vec::new();
         while d.buf.len() > end_len {
             v.push(DirEntry::decode_from(d)?);
+        }
+        if d.buf.len() != end_len {
+            return Err(super::Error::InvalidResponse);
         }
         Ok(DirEntryData { data: v })
     }
@@ -1179,6 +1186,10 @@ impl<'a> TaggedFcall<'a> {
         if buf.len() < 7 {
             return Err(super::Error::InvalidResponse);
         }
+        let sz = u32::from_le_bytes(buf[..4].try_into().unwrap()) as usize;
+        if sz != buf.len() {
+            return Err(super::Error::InvalidResponse);
+        }
 
         let mut decoder = FcallDecoder { buf: &buf[4..] };
         decoder.decode_message()
@@ -1304,6 +1315,9 @@ impl<'b> FcallDecoder<'b> {
 
     fn decode_vec_qid(&mut self) -> Result<Vec<Qid>, super::Error> {
         let len = self.decode_le::<u16>()?;
+        if usize::from(len) > MAXWELEM {
+            return Err(super::Error::InvalidResponse);
+        }
         let mut v = Vec::new();
         for _ in 0..len {
             v.push(Qid::decode_from(self)?);
@@ -1313,6 +1327,9 @@ impl<'b> FcallDecoder<'b> {
 
     fn decode_vec_str(&mut self) -> Result<Vec<FcallStr<'b>>, super::Error> {
         let len = self.decode_le::<u16>()?;
+        if usize::from(len) > MAXWELEM {
+            return Err(super::Error::InvalidResponse);
+        }
         let mut v = Vec::new();
         for _ in 0..len {
             v.push(self.decode_str()?);
@@ -1329,5 +1346,49 @@ impl<'b> FcallDecoder<'b> {
         } else {
             Err(super::Error::InvalidResponse)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn frame(msg_type: FcallType, tag: u16, payload: &[u8]) -> Vec<u8> {
+        let size = 4 + 1 + 2 + payload.len();
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&u32::try_from(size).unwrap().to_le_bytes());
+        buf.push(msg_type as u8);
+        buf.extend_from_slice(&tag.to_le_bytes());
+        buf.extend_from_slice(payload);
+        buf
+    }
+
+    #[test]
+    fn rejects_rreaddir_data_len_beyond_remaining_frame() {
+        let payload = 1u32.to_le_bytes();
+        let buf = frame(FcallType::Rreaddir, 1, &payload);
+
+        assert!(matches!(
+            TaggedFcall::decode(&buf),
+            Err(super::super::Error::InvalidResponse)
+        ));
+    }
+
+    #[test]
+    fn rejects_rwalk_qid_count_above_protocol_limit() {
+        let mut payload = Vec::new();
+        let qid_count = u16::try_from(MAXWELEM).unwrap() + 1;
+        payload.extend_from_slice(&qid_count.to_le_bytes());
+        for _ in 0..=MAXWELEM {
+            payload.push(0);
+            payload.extend_from_slice(&0u32.to_le_bytes());
+            payload.extend_from_slice(&0u64.to_le_bytes());
+        }
+        let buf = frame(FcallType::Rwalk, 1, &payload);
+
+        assert!(matches!(
+            TaggedFcall::decode(&buf),
+            Err(super::super::Error::InvalidResponse)
+        ));
     }
 }
