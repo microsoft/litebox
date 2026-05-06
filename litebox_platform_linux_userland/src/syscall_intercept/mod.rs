@@ -14,7 +14,7 @@ pub(crate) use systrap::init_sys_intercept;
 #[cfg(all(target_arch = "x86_64", feature = "systrap_backend"))]
 pub(crate) use systrap::register_syscall_handler;
 
-#[cfg(all(target_arch = "x86_64", feature = "systrap_backend"))]
+#[cfg(all(target_arch = "x86_64", feature = "systrap_backend", not(test)))]
 pub(crate) use systrap::activate_seccomp_filter;
 
 #[cfg(target_arch = "x86")]

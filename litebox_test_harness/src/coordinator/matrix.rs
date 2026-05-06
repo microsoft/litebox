@@ -55,7 +55,7 @@ pub(crate) enum Topology {
     /// AB → B.
     #[allow(dead_code)]
     Uncle,
-    /// A → NP (non-PIE child via SpawnRemote).
+    /// A → NP (non-PIE child via `SpawnRemote`).
     PieToNonPie,
     /// NP → A (non-PIE writes, PIE reads).
     NonPieToParent,
@@ -282,7 +282,7 @@ const CONNECT_ADDRS: &[&str] = &["127.0.0.1", "0.0.0.0"];
 const LITEBOX_ADDRS: &[&str] = &["10.0.0.2"];
 
 /// Cross-worker pairs to test with address variants.
-/// Each pair is tested with all CONNECT_ADDRS in both directions.
+/// Each pair is tested with all `CONNECT_ADDRS` in both directions.
 const NET_ADDR_PAIRS: &[(AgentName, AgentName)] = &[
     (AgentName::A, AgentName::A),
     (AgentName::AA, AgentName::AA),
@@ -338,9 +338,9 @@ struct UnixTestCase {
     name: &'static str,
     pattern: UnixPattern,
     /// Primary agent (listener for InProcess/ServerForkClient/CrossAgent,
-    /// agent for BackgroundServerConnect).
+    /// agent for `BackgroundServerConnect`).
     agent: AgentName,
-    /// Connector agent for CrossAgent pattern.
+    /// Connector agent for `CrossAgent` pattern.
     peer: Option<AgentName>,
 }
 
@@ -500,6 +500,7 @@ async fn send_to(
     run.send(handle_for(handles, agent), cmd).await
 }
 
+#[allow(clippy::too_many_lines)] // exhaustive registration / runner
 pub(super) fn register_fs_crud(reg: &mut Registry<'_>) {
     for &topo in FS_TOPOLOGIES {
         let (source, dest) = topo.agents();
@@ -1104,6 +1105,7 @@ pub(super) fn register_env_tests(reg: &mut Registry<'_>) {
     }
 }
 
+#[allow(clippy::too_many_lines)] // exhaustive registration / runner
 pub(super) fn register_symlink_basic(reg: &mut Registry<'_>) {
     for &topo in SYMLINK_TOPOLOGIES {
         let (source, dest) = topo.agents();
@@ -1305,6 +1307,7 @@ pub(super) fn register_symlink_basic(reg: &mut Registry<'_>) {
     }
 }
 
+#[allow(clippy::too_many_lines)] // exhaustive registration / runner
 pub(super) fn register_symlink_variants(reg: &mut Registry<'_>) {
     let agent = AgentName::A;
     matrix_test(
@@ -1557,6 +1560,7 @@ pub(super) fn register_symlink_variants(reg: &mut Registry<'_>) {
     );
 }
 
+#[allow(clippy::too_many_lines)] // exhaustive registration / runner
 pub(super) fn register_unix_tests(reg: &mut Registry<'_>) {
     for tc in unix_test_cases() {
         let sock = format!("/tmp/um_{}.sock", tc.name.replace('.', "_"));

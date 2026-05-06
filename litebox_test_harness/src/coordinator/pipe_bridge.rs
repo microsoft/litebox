@@ -12,7 +12,7 @@
 //! Test axes:
 //!   - Direction: child→parent (c2p), parent→child (p2c)
 //!   - Fd type: pipe (unidirectional), socketpair (bidirectional)
-//!   - Binary: PIE (in-process exec), non-PIE (exec_on_remote_host)
+//!   - Binary: PIE (in-process exec), non-PIE (`exec_on_remote_host`)
 //!   - Count: single pipe, multiple pipes
 //!   - Agent topology: various depths (A, AA, B, NP, D4)
 
@@ -23,6 +23,7 @@ use super::registry::Registry;
 /// non-PIE worker agent (NP) to test nested worker-exec.
 const PB_AGENTS: &[AgentName] = &[AgentName::A, AgentName::AA, AgentName::B];
 
+#[allow(clippy::too_many_lines)] // exhaustive registration / runner
 pub(crate) fn register_pipe_bridge(reg: &mut Registry<'_>) {
     struct PbCase {
         mode: &'static str,

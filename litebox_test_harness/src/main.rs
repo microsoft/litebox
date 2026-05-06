@@ -1,19 +1,32 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-// main.rs is a flat collection of integration-test sub-commands and
-// agent runtime helpers. Many of the pedantic lints below would
-// require structural refactors that don't improve correctness; the
-// allow list keeps them from blocking warnings-as-errors enforcement.
-#![allow(clippy::empty_line_after_doc_comments)]
+// main.rs holds agent runtime + integration sub-commands. Three lint
+// classes are pervasive here and not signal:
+//
+//   * cast_possible_truncation / cast_possible_wrap / cast_sign_loss —
+//     test code routinely deals in port numbers, fd indices, packet
+//     lengths whose value range is structurally safe. Per-site
+//     try_from would add boilerplate without catching real bugs.
+//
+//   * items_after_statements — sub-commands often inline small
+//     helper fns next to where they're used, for readability.
+//
+//   * match_same_arms — protocol dispatch tables intentionally
+//     enumerate distinct cases that share a body, for documentation.
+//
+//   * similar_names — pid/ppid, args/argv, src/dst show up in many
+//     POSIX-shaped test bodies; renaming reduces clarity.
+//
+// Everything else stays under pedantic-deny.
+#![allow(clippy::cast_possible_truncation)]
+#![allow(clippy::cast_possible_wrap)]
+#![allow(clippy::cast_sign_loss)]
+#![allow(clippy::items_after_statements)]
 #![allow(clippy::match_same_arms)]
-#![allow(clippy::manual_let_else)]
-#![allow(clippy::while_let_loop)]
-#![allow(clippy::used_underscore_binding)]
-#![allow(clippy::if_not_else)]
-#![allow(clippy::no_effect_underscore_binding)]
+#![allow(clippy::similar_names)]
 
-//! LiteBox process tree test harness.
+//! `LiteBox` process tree test harness.
 //!
 //! Two modes:
 //! - `spawn-tree` — coordinator: spawns tree, drives tests through pipes
@@ -58,6 +71,7 @@ use litebox_test_harness::protocol;
 
 use std::io::Write as _;
 
+#[allow(clippy::too_many_lines)] // exhaustive runner / dispatch table
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let cmd = args.get(1).map_or("spawn-tree", String::as_str);
@@ -693,61 +707,6 @@ fn main() {
                 Err(e) => {
                     println!("BS3_FAIL:{e}");
                     std::process::exit(1);
-                }
-            }
-        }
-        "tcp-listen-busy" => {
-            // Listen on a TCP port, do CPU-bound work for N seconds, then
-            // accept one connection and echo. Simulates Node.js initialization:
-            // listen() succeeds, module loading delays accept().
-            let port: u16 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(9999);
-            let busy_secs: u64 = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(3);
-            let listener = std::net::TcpListener::bind(format!("0.0.0.0:{port}"))
-                .expect("tcp-listen-busy: bind failed");
-            eprintln!("[tcp-listen-busy] listening on 0.0.0.0:{port}, busy for {busy_secs}s");
-            let start = std::time::Instant::now();
-            let mut counter: u64 = 0;
-            while start.elapsed().as_secs() < busy_secs {
-                counter = counter.wrapping_add(1);
-                std::hint::black_box(counter);
-            }
-            eprintln!("[tcp-listen-busy] busy done, accepting with timeout");
-            // Accept with a timeout so this process doesn't block forever
-            // if nobody connects (e.g., when used as a child of tcp-listen-fork
-            // where the parent connects to a different port).
-            listener.set_nonblocking(false).ok();
-            let timeout = std::time::Duration::from_secs(10);
-            let deadline = std::time::Instant::now() + timeout;
-            // Use a polling loop since std TcpListener doesn't have set_timeout.
-            listener.set_nonblocking(true).ok();
-            loop {
-                match listener.accept() {
-                    Ok((mut stream, addr)) => {
-                        eprintln!("[tcp-listen-busy] accepted from {addr}");
-                        use std::io::{Read, Write};
-                        let mut buf = [0u8; 4096];
-                        match stream.read(&mut buf) {
-                            Ok(n) if n > 0 => {
-                                let _ = stream.write_all(&buf[..n]);
-                                use std::net::Shutdown;
-                                let _ = stream.shutdown(Shutdown::Write);
-                                eprintln!("[tcp-listen-busy] echoed {n} bytes");
-                            }
-                            _ => {}
-                        }
-                        break;
-                    }
-                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                        if std::time::Instant::now() >= deadline {
-                            eprintln!("[tcp-listen-busy] accept timeout, exiting");
-                            break;
-                        }
-                        std::thread::sleep(std::time::Duration::from_millis(50));
-                    }
-                    Err(e) => {
-                        eprintln!("[tcp-listen-busy] accept error: {e}");
-                        break;
-                    }
                 }
             }
         }
@@ -1431,7 +1390,12 @@ fn main() {
             let mode = args.get(3).map_or("pie", String::as_str);
             let use_tokio = args.get(4).map(String::as_str) == Some("tokio");
             let mut failures = 0;
-            let nonpie_bin = find_nonpie_binary().unwrap_or_default();
+            // Lazy: only pay the panic if mode actually needs it.
+            let nonpie_bin: String = if matches!(mode, "nonpie" | "mixed") {
+                litebox_test_harness::nonpie_binary()
+            } else {
+                String::new()
+            };
             println!("STRESS_START mode={mode} count={count} tokio={use_tokio}");
             if use_tokio {
                 let rt = tokio::runtime::Builder::new_current_thread()
@@ -1598,8 +1562,8 @@ fn main() {
             }
 
             // Force a non-pre-exec syscall to trigger delayed-fork migration.
-            let _trigger: Vec<u8> = vec![0u8; 64 * 1024];
-            assert_eq!(_trigger[0], 0);
+            let trigger: Vec<u8> = vec![0u8; 64 * 1024];
+            assert_eq!(trigger[0], 0);
 
             // Fork+exec the given command from within the delayed-fork child.
             let output = std::process::Command::new(&args[2])
@@ -1824,11 +1788,10 @@ fn main() {
                     if ret > 0 {
                         if libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0 {
                             break;
-                        } else {
-                            eprintln!("[concurrent-fs] child {i} bad exit: {status}");
-                            all_ok = false;
-                            break;
                         }
+                        eprintln!("[concurrent-fs] child {i} bad exit: {status}");
+                        all_ok = false;
+                        break;
                     }
                     if std::time::Instant::now() >= deadline {
                         eprintln!("[concurrent-fs] child {i} TIMEOUT (RwLock deadlock?)");
@@ -1942,11 +1905,10 @@ fn main() {
                     if ret > 0 {
                         if libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0 {
                             break;
-                        } else {
-                            eprintln!("[concurrent-fs-multi] child {i} bad exit: {status}");
-                            all_ok = false;
-                            break;
                         }
+                        eprintln!("[concurrent-fs-multi] child {i} bad exit: {status}");
+                        all_ok = false;
+                        break;
                     }
                     if std::time::Instant::now() >= deadline {
                         eprintln!(
@@ -1975,24 +1937,6 @@ fn main() {
     }
 }
 
-/// Minimal reproduction tests for unsupported syscalls that break
-/// VS Code Server's CLI `command-shell` mode inside litebox.
-///
-/// The CLI spawns Node.js which uses `timer_create` for V8's profiling
-/// timers and `rt_sigsuspend` for its signal handling loop.  When these
-/// return errors, the CLI spins in a tight loop and never produces the
-/// `Listening on <port>` output that VS Code's install script expects.
-
-/// Tests for CoW (copy-on-write) memory restoration after vfork.
-///
-/// On litebox's shared-address-space platform, fork() becomes
-/// clone(CLONE_VM|CLONE_VFORK). The parent and child share memory.
-/// A CoW layer tracks child modifications so the parent can restore
-/// its state after the child exits.
-///
-/// These tests verify that the parent's memory is correctly restored
-/// and that post-fork operations work as expected.
-
 /// Minimal capture-pipe fork test: reproduces the exact mechanism bash uses
 /// for `$()`. Creates a pipe, forks, child dup2's write end to stdout and
 /// execs a command, parent reads the output from the read end.
@@ -2004,10 +1948,10 @@ mod capture_pipe_test {
     /// Run a capture-pipe test.
     /// `cmd_type`: "simple" (echo), "pipe" (echo | cat), "multi" (echo | grep | cat),
     ///             "noexec" (child writes directly, no exec),
-    ///             "nested_fork" (fork → fork → write, no exec on either),
-    ///             "subshell_pipe" (bash $()-like: fork subshell, subshell forks
+    ///             "`nested_fork`" (fork → fork → write, no exec on either),
+    ///             "`subshell_pipe`" (bash $()-like: fork subshell, subshell forks
     ///              pipeline child that execs cat, subshell waits, parent reads),
-    ///             "subshell_continue" (same + parent writes more output after)
+    ///             "`subshell_continue`" (same + parent writes more output after)
     /// `shell`: "sh" or "bash" (only used for simple/pipe/multi)
     pub fn run(cmd_type: &str, shell: &str) -> i32 {
         match cmd_type {
@@ -2160,11 +2104,11 @@ mod capture_pipe_test {
     /// (pipeline), grandchild writes to a pipe, child reads and forwards
     /// to parent's capture pipe. This is exactly what bash does for
     /// `A=$(echo hello | cat)`:
-    ///   parent: pipe() → fork()
-    ///   child (subshell): dup2(write,1) → pipe() → fork()
-    ///     grandchild: dup2(pipe_write,1) → write("CAPTURE_OK") → exit
-    ///   child: read(pipe_read) → write(stdout=capture) → exit
-    ///   parent: read(capture_read)
+    ///   parent: `pipe()` → `fork()`
+    ///   child (subshell): dup2(write,1) → `pipe()` → `fork()`
+    ///     grandchild: `dup2(pipe_write,1)` → `write("CAPTURE_OK`") → exit
+    ///   child: `read(pipe_read)` → write(stdout=capture) → exit
+    ///   parent: `read(capture_read)`
     fn run_nested_fork() -> i32 {
         // Capture pipe: parent reads, child writes
         let mut capture = [0i32; 2];
@@ -2262,10 +2206,6 @@ mod capture_pipe_test {
         }
     }
 
-    /// Like nested_fork but skips waitpid on the grandchild.
-    /// This isolates the pipe-data-relay issue from the waitpid-across-
-    /// migration issue.
-
     /// Bash $()-like: fork subshell, subshell forks a pipeline child that
     /// execs cat, subshell waits for pipeline, subshell exits, parent reads
     /// capture pipe. No exec in the subshell — only the pipeline child execs.
@@ -2348,9 +2288,9 @@ mod capture_pipe_test {
         }
     }
 
-    /// Same as subshell_pipe, but the parent continues writing more output
+    /// Same as `subshell_pipe`, but the parent continues writing more output
     /// after reading the capture pipe. Tests that the parent's state
-    /// (stack, heap, CoW pages) is correctly restored after the vfork child
+    /// (stack, heap, `CoW` pages) is correctly restored after the vfork child
     /// migrates via delayed fork.
     fn run_subshell_continue() -> i32 {
         let mut capture = [0i32; 2];
@@ -2652,9 +2592,6 @@ mod netlink_tests {
         }
     }
 
-    /// Mimics glibc's exact getifaddrs flow: sendmsg + recvmsg(PEEK|TRUNC) + recvmsg(0)
-    /// for sequential RTM_GETLINK and RTM_GETADDR requests.
-
     fn test_full() -> i32 {
         let mut ifaddr: *mut libc::ifaddrs = std::ptr::null_mut();
         if unsafe { libc::getifaddrs(&raw mut ifaddr) } != 0 {
@@ -2695,9 +2632,9 @@ mod netlink_tests {
         fd
     }
 
-    /// NL3b: Mimics glibc's __netlink_request — uses sendmsg/recvmsg
-    /// with sockaddr_nl, iov, and msghdr. This is the exact path
-    /// getifaddrs() takes internally.
+    /// `NL3b`: Mimics glibc's __`netlink_request` — uses sendmsg/recvmsg
+    /// with `sockaddr_nl`, iov, and msghdr. This is the exact path
+    /// `getifaddrs()` takes internally.
     fn test_sendmsg_recvmsg() -> i32 {
         let fd = open_nl();
         if fd < 0 {
@@ -2791,8 +2728,8 @@ mod netlink_tests {
         }
     }
 
-    /// NL3c: Two sequential requests on the same socket (like getifaddrs).
-    /// Send RTM_GETLINK, read response. Then send RTM_GETADDR, read response.
+    /// `NL3c`: Two sequential requests on the same socket (like getifaddrs).
+    /// Send `RTM_GETLINK`, read response. Then send `RTM_GETADDR`, read response.
     fn test_double_request() -> i32 {
         let fd = open_nl();
         if fd < 0 {
@@ -2876,8 +2813,8 @@ mod netlink_tests {
         }
     }
 
-    /// NL3d: MSG_PEEK + MSG_TRUNC pattern — mimics glibc's __netlink_request.
-    /// glibc first does recvmsg(MSG_PEEK|MSG_TRUNC) with iov_len=0 to query
+    /// `NL3d`: `MSG_PEEK` + `MSG_TRUNC` pattern — mimics glibc's __`netlink_request`.
+    /// glibc first does `recvmsg(MSG_PEEK|MSG_TRUNC)` with `iov_len=0` to query
     /// the response size, then recvmsg(0) with a properly sized buffer.
     fn test_peek_trunc() -> i32 {
         let fd = open_nl();
@@ -3235,7 +3172,7 @@ mod unix_socket_tests {
         }
     }
 
-    /// NL6: Check if os.networkInterfaces() returns a MAC address.
+    /// NL6: Check if `os.networkInterfaces()` returns a MAC address.
     /// Uses getifaddrs to check for AF_PACKET/link-layer entries.
     fn test_mac_address() -> i32 {
         let mut ifaddr: *mut libc::ifaddrs = std::ptr::null_mut();
@@ -3625,10 +3562,10 @@ mod unix_socket_tests {
         }
     }
 
-    /// US6a: socketpair(AF_UNIX) + fork — child WRITES to inherited fd.
+    /// `US6a`: `socketpair(AF_UNIX)` + fork — child WRITES to inherited fd.
     /// Reproduces the VS Code extension host IPC pattern (child→parent):
-    ///   parent: socketpair() → fork() → waitpid → read from parent_end
-    ///   child:  write to child_end → exit
+    ///   parent: `socketpair()` → `fork()` → waitpid → read from `parent_end`
+    ///   child:  write to `child_end` → exit
     /// Uses vfork-compatible sequencing: child writes + exits before parent reads.
     fn test_socketpair_fork_write() -> i32 {
         let mut fds = [0i32; 2];
@@ -3702,10 +3639,10 @@ mod unix_socket_tests {
         }
     }
 
-    /// US6b: socketpair(AF_UNIX) + fork — child READS from inherited fd.
+    /// `US6b`: `socketpair(AF_UNIX)` + fork — child READS from inherited fd.
     /// Tests the reverse direction (parent→child):
-    ///   parent: socketpair() → fork() → write to parent_end → waitpid
-    ///   child:  read from child_end → exit(based on data)
+    ///   parent: `socketpair()` → `fork()` → write to `parent_end` → waitpid
+    ///   child:  read from `child_end` → exit(based on data)
     /// Requires true concurrent fork (not vfork).
     fn test_socketpair_fork_read() -> i32 {
         let mut fds = [0i32; 2];
@@ -3782,11 +3719,11 @@ mod unix_socket_tests {
         }
     }
 
-    /// US6c: socketpair(AF_UNIX) + fork+exec — bidirectional IPC.
+    /// `US6c`: `socketpair(AF_UNIX)` + fork+exec — bidirectional IPC.
     /// Reproduces the exact VS Code extension host pattern:
-    ///   parent: socketpair() → fork() → exec(child, inheriting fd) → write → read
+    ///   parent: `socketpair()` → `fork()` → exec(child, inheriting fd) → write → read
     ///   child (exec'd): read from inherited fd → write reply → exit
-    /// Uses raw fork+exec (not posix_spawn) to trigger litebox's delayed fork.
+    /// Uses raw fork+exec (not `posix_spawn`) to trigger litebox's delayed fork.
     fn test_socketpair_exec() -> i32 {
         let mut fds = [0i32; 2];
         let rc = unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, fds.as_mut_ptr()) };
@@ -3891,7 +3828,7 @@ mod unix_socket_tests {
         }
     }
 
-    /// Helper for US6c: exec'd child reads from inherited socketpair fd,
+    /// Helper for `US6c`: exec'd child reads from inherited socketpair fd,
     /// writes reply, exits.
     fn socketpair_exec_child() -> i32 {
         let fd: i32 = std::env::args()
@@ -3936,12 +3873,6 @@ mod unix_socket_tests {
             2
         }
     }
-
-    /// US6d: Nested socketpair+fork+exec via nonpie — reproduces VS Code pattern.
-    /// Uses raw fork+exec to trigger litebox's delayed fork, then the nonpie
-    /// exec triggers exec-on-remote-host. Inside that remote worker,
-    /// socketpair → fork → exec creates the nested delayed fork with IPC fd.
-    ///   fork() → exec(nonpie, socketpair-exec) → socketpair → fork → exec(child) → IPC
 
     fn errno() -> i32 {
         std::io::Error::last_os_error().raw_os_error().unwrap_or(-1)
@@ -3994,7 +3925,7 @@ mod pipe_lifecycle_tests {
         }
     }
 
-    /// P1: pipe() → fork() → child writes to pipe + exits → parent reads → expects data + EOF.
+    /// P1: `pipe()` → `fork()` → child writes to pipe + exits → parent reads → expects data + EOF.
     fn test_eof_fork() -> i32 {
         let mut pipe_fds = [0i32; 2];
         if unsafe { libc::pipe(pipe_fds.as_mut_ptr()) } != 0 {
@@ -4070,7 +4001,7 @@ mod pipe_lifecycle_tests {
         }
     }
 
-    /// P2: fork() → exec(binary, pipe-test, echo-exit) → parent reads stdout → expects data + EOF.
+    /// P2: `fork()` → exec(binary, pipe-test, echo-exit) → parent reads stdout → expects data + EOF.
     /// Uses raw fork+exec to trigger litebox's delayed fork / exec-on-remote-host.
     /// The `binary` arg determines PIE vs nonpie exec path.
     fn test_eof_exec(args: &[String]) -> i32 {
@@ -4197,7 +4128,7 @@ mod pipe_lifecycle_tests {
     // pipe fds — not just unix sockets — to the new worker.
     // ═══════════════════════════════════════════════════════════════════
 
-    /// Read from a fd with poll-based timeout.  Returns (data, got_eof).
+    /// Read from a fd with poll-based timeout.  Returns (data, `got_eof`).
     fn read_with_poll_timeout(fd: i32, timeout_secs: u64) -> (Vec<u8>, bool) {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
         let mut all_data = Vec::new();
@@ -4480,9 +4411,9 @@ mod pipe_lifecycle_tests {
         }
     }
 
-    /// PB-SOCKETPAIR: Extra AF_UNIX socketpair fd across fork+exec.
+    /// PB-SOCKETPAIR: Extra `AF_UNIX` socketpair fd across fork+exec.
     ///
-    /// Positive control: exec_on_remote_host already bridges unix socket
+    /// Positive control: `exec_on_remote_host` already bridges unix socket
     /// fds, so this should pass for both PIE and non-PIE.  Validates the
     /// bridge mechanism itself is working.
     ///
@@ -4640,7 +4571,7 @@ mod pipe_lifecycle_tests {
     }
 
     /// Delayed write: sleep for N ms, then write to fd(s).
-    /// Usage: pipe-test delayed-write-on-fd <fd>[,<fd>,...] [delay_ms]
+    /// Usage: pipe-test delayed-write-on-fd <fd>[,<fd>,...] [`delay_ms`]
     fn helper_delayed_write_on_fd(args: &[String]) -> i32 {
         let fd_arg = args.get(3).map_or("3", String::as_str);
         let delay_ms: u64 = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(500);
@@ -4673,12 +4604,12 @@ mod pipe_lifecycle_tests {
     ///
     /// Tests the VS Code ptyHost pattern: parent creates a pipe,
     /// fork+exec's a child that writes after a delay, and the parent
-    /// uses epoll_wait (blocking, with timeout) to detect the data.
+    /// uses `epoll_wait` (blocking, with timeout) to detect the data.
     ///
     /// If the pipe bridge's relay thread doesn't wake the epoll Pollee,
-    /// epoll_wait returns 0 (timeout) even though data arrived.
+    /// `epoll_wait` returns 0 (timeout) even though data arrived.
     ///
-    /// Usage: pipe-test epoll-pipe-bridge [binary] [delay_ms]
+    /// Usage: pipe-test epoll-pipe-bridge [binary] [`delay_ms`]
     fn test_epoll_pipe_bridge(args: &[String]) -> i32 {
         let exe = args.get(3).cloned().unwrap_or_else(|| {
             std::env::current_exe()
@@ -4809,18 +4740,18 @@ mod pipe_lifecycle_tests {
         }
     }
 
-    /// Epoll wakeup test for socketpair bridge (ReadWrite HostPipeFd).
+    /// Epoll wakeup test for socketpair bridge (`ReadWrite` `HostPipeFd`).
     ///
     /// This tests the exact VS Code ptyHost IPC pattern: the parent
-    /// creates an AF_UNIX socketpair, fork+exec's a non-PIE child that
-    /// writes after a delay, and the parent uses epoll_wait to detect
+    /// creates an `AF_UNIX` socketpair, fork+exec's a non-PIE child that
+    /// writes after a delay, and the parent uses `epoll_wait` to detect
     /// data on the socketpair.
     ///
-    /// The socketpair bridge installs a ReadWrite HostPipeFd. If
-    /// check_io_events always returns IN|OUT, epoll_wait never blocks
+    /// The socketpair bridge installs a `ReadWrite` `HostPipeFd`. If
+    /// `check_io_events` always returns IN|OUT, `epoll_wait` never blocks
     /// and the event loop spins at 100% CPU.
     ///
-    /// Usage: pipe-test epoll-socketpair-bridge [binary] [delay_ms]
+    /// Usage: pipe-test epoll-socketpair-bridge [binary] [`delay_ms`]
     fn test_epoll_socketpair_bridge(args: &[String]) -> i32 {
         let exe = args.get(3).cloned().unwrap_or_else(|| {
             std::env::current_exe()
@@ -4919,13 +4850,12 @@ mod pipe_lifecycle_tests {
                 if data.contains("PB_DELAYED_WRITE") && elapsed_ms < 5000 && spin_count < 50 {
                     println!("EPOLL_SP_OK:{elapsed_ms}ms,spins={spin_count}");
                     return 0;
-                } else {
-                    println!(
-                        "EPOLL_SP_FAIL:elapsed={elapsed_ms}ms,spins={spin_count},data={}",
-                        data.trim()
-                    );
-                    return 1;
                 }
+                println!(
+                    "EPOLL_SP_FAIL:elapsed={elapsed_ms}ms,spins={spin_count},data={}",
+                    data.trim()
+                );
+                return 1;
             } else if nev == 0 {
                 spin_count += 1;
             } else {
@@ -5045,7 +4975,7 @@ mod net_tests {
         }
     }
 
-    /// NET5: getaddrinfo("::1") + bind + listen — the exact Node.js pattern.
+    /// NET5: `getaddrinfo("::1`") + bind + listen — the exact Node.js pattern.
     fn test_ipv6_getaddrinfo() -> i32 {
         // Step 1: getaddrinfo for "::1"
         let mut hints: libc::addrinfo = unsafe { std::mem::zeroed() };
@@ -5134,7 +5064,7 @@ mod net_tests {
         0
     }
 
-    /// NET6: setsockopt(IPV6_V6ONLY) — Node.js sets this before bind.
+    /// NET6: `setsockopt(IPV6_V6ONLY)` — Node.js sets this before bind.
     fn test_ipv6_v6only() -> i32 {
         let fd = unsafe { libc::socket(libc::AF_INET6, libc::SOCK_STREAM, 0) };
         if fd < 0 {
@@ -5163,7 +5093,7 @@ mod net_tests {
         }
     }
 
-    /// NET1: socket(AF_INET6, SOCK_STREAM) — can we create an IPv6 socket?
+    /// NET1: `socket(AF_INET6`, `SOCK_STREAM`) — can we create an IPv6 socket?
     fn test_ipv6_socket() -> i32 {
         let fd = unsafe { libc::socket(libc::AF_INET6, libc::SOCK_STREAM, 0) };
         if fd >= 0 {
@@ -5177,7 +5107,7 @@ mod net_tests {
         }
     }
 
-    /// NET2: bind(::1, 0) + listen — the exact pattern VS Code extension host uses.
+    /// NET2: `bind(::1`, 0) + listen — the exact pattern VS Code extension host uses.
     fn test_ipv6_listen() -> i32 {
         let fd = unsafe { libc::socket(libc::AF_INET6, libc::SOCK_STREAM, 0) };
         if fd < 0 {
@@ -5227,8 +5157,6 @@ mod net_tests {
         0
     }
 
-    /// NET3: Full IPv6 loopback: listen + fork + child connects + data exchange.
-
     /// NET4: IPv4 listen+connect baseline (should already work).
     fn test_ipv4_listen() -> i32 {
         let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0) };
@@ -5239,7 +5167,7 @@ mod net_tests {
         let mut addr: libc::sockaddr_in = unsafe { std::mem::zeroed() };
         addr.sin_family = libc::AF_INET as u16;
         addr.sin_port = 0;
-        addr.sin_addr.s_addr = u32::from_be(0x7f000001); // 127.0.0.1
+        addr.sin_addr.s_addr = u32::from_be(0x7f00_0001); // 127.0.0.1
 
         if unsafe {
             libc::bind(
@@ -5340,12 +5268,7 @@ mod fs_tests {
                 .args(["fs-test", "do-write", path, data])
                 .output(),
             "nonpie" => {
-                let bin = if let Some(b) = crate::find_nonpie_binary() {
-                    b
-                } else {
-                    println!("FS_ERR:op=exec-write,bin=nonpie,err=nonpie binary not found");
-                    return 1;
-                };
+                let bin = litebox_test_harness::nonpie_binary();
                 std::process::Command::new(&bin)
                     .args(["fs-test", "do-write", path, data])
                     .output()
@@ -5392,8 +5315,6 @@ mod fs_tests {
         }
     }
 
-    /// Diagnostic: isolate where exec-open-read hangs by logging timestamps.
-
     /// Fork+exec child that writes AND keeps running; parent reads while child alive.
     /// This is the exact pre-warm pattern — tests 9P coherence for open files on remote workers.
     fn test_exec_open_read(bin_type: &str, path: &str) -> i32 {
@@ -5404,14 +5325,7 @@ mod fs_tests {
 
         let bin = match bin_type {
             "pie" => self_exe.to_string(),
-            "nonpie" => {
-                if let Some(b) = crate::find_nonpie_binary() {
-                    b
-                } else {
-                    println!("FS_ERR:op=exec-open-read,bin=nonpie,err=nonpie binary not found");
-                    return 1;
-                }
-            }
+            "nonpie" => litebox_test_harness::nonpie_binary(),
             other => {
                 println!("FS_ERR:op=exec-open-read,unknown_bin_type={other}");
                 return 1;
@@ -5460,6 +5374,7 @@ mod fs_tests {
         result.map_or(1, |s| i32::from(s != data))
     }
 
+    #[allow(clippy::too_many_lines)] // exhaustive runner / dispatch table
     fn test_io(op: &str, path: &str) -> i32 {
         let _ = std::fs::remove_file(path);
         match op {

@@ -10,12 +10,12 @@
 //! suite in a single docker container (~20s instead of ~5min).
 //!
 //! Usage:
-//!   cargo test -p litebox_test_harness --test integration                          # all
-//!   cargo test -p litebox_test_harness --test integration -- native                # all native
-//!   cargo test -p litebox_test_harness --test integration -- native::fork          # native fork groups
-//!   cargo test -p litebox_test_harness --test integration -- native::fork::capture_pipe  # one group
-//!   cargo test -p litebox_test_harness --test integration -- fork                  # fork in both passes
-//!   cargo test -p litebox_test_harness --test integration -- --list                # list all trials
+//!   cargo test -p `litebox_test_harness` --test integration                          # all
+//!   cargo test -p `litebox_test_harness` --test integration -- native                # all native
+//!   cargo test -p `litebox_test_harness` --test integration -- `native::fork`          # native fork groups
+//!   cargo test -p `litebox_test_harness` --test integration -- `native::fork::capture_pipe`  # one group
+//!   cargo test -p `litebox_test_harness` --test integration -- fork                  # fork in both passes
+//!   cargo test -p `litebox_test_harness` --test integration -- --list                # list all trials
 //!
 //! Target directory: uses `CARGO_TARGET_DIR` if set, otherwise `target/`.
 //!
@@ -53,7 +53,7 @@ use libtest_mimic::{Arguments, Failed, Trial};
 // PIE-only tests) that this model is competitive with the old
 // single-docker-per-pass cache.
 
-/// Cached test IDs from collect_all_tests (direct library call, no subprocess).
+/// Cached test IDs from `collect_all_tests` (direct library call, no subprocess).
 static TEST_IDS: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
 
 fn get_test_ids() -> &'static Vec<String> {
@@ -73,7 +73,7 @@ fn keep_containers() -> bool {
     std::env::var("LITEBOX_KEEP_CONTAINER").is_ok()
 }
 
-/// `--rm` unless LITEBOX_KEEP_CONTAINER is set. We pass `--name` so
+/// `--rm` unless `LITEBOX_KEEP_CONTAINER` is set. We pass `--name` so
 /// the container is identifiable in `docker ps` for debugging.
 fn docker_run_base_args() -> Vec<&'static str> {
     if keep_containers() {
@@ -231,9 +231,10 @@ fn log_path_for(pass: &str, test_id: &str, kind: &str) -> PathBuf {
 ///     arrives.
 ///
 /// Both files are populated synchronously while we still hold the
-/// active_jobs permit, so they're durable even if cargo-test exits
+/// `active_jobs` permit, so they're durable even if cargo-test exits
 /// the moment we return — no need for a drain-side join hook.
 fn run_one_test(pass: &str, test_id: &str) -> Result<serde_json::Value, Failed> {
+    use std::io::Write as _;
     let permit = active_jobs().acquire();
     let (_, debug, nonpie) = setup();
     let container_name = format!(
@@ -269,7 +270,6 @@ fn run_one_test(pass: &str, test_id: &str) -> Result<serde_json::Value, Failed> 
     // matches our test_id.
     let mut stdout_log_file = std::fs::File::create(&stdout_log)
         .unwrap_or_else(|e| panic!("create {}: {e}", stdout_log.display()));
-    use std::io::Write as _;
     let mut found: Option<serde_json::Value> = None;
     for line in BufReader::new(stdout).lines() {
         let Ok(line) = line else { break };
@@ -531,6 +531,7 @@ fn setup() -> (PathBuf, PathBuf, PathBuf) {
 ///
 /// The guest runs `litebox-test-harness agent-listen 9090`, and the host
 /// connects via `localhost:19090` to send commands.
+#[allow(clippy::too_many_lines)] // exhaustive runner / dispatch table
 fn run_host_fwd(debug: &Path, nonpie: &Path) {
     use std::io::{BufRead, BufReader, Read, Write};
     use std::net::TcpStream;

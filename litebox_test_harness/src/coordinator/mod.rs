@@ -179,6 +179,7 @@ pub struct TestResult {
 
 impl TestResult {
     /// Effective outcome: pass, fail, xfail, or xpass.
+    #[must_use]
     pub fn outcome(&self) -> &'static str {
         match (&self.expected, self.actual_pass) {
             (Expectation::Pass, true) => "pass",
@@ -234,6 +235,7 @@ impl TestRunner {
         expected: Expectation,
         detail: &str,
     ) {
+        use std::io::Write as _;
         let key = format!("{test} {agent}");
         if !self.recorded_ids.insert(key) {
             eprintln!("  WARNING: duplicate test ID: {test} [{agent}] — skipping");
@@ -261,11 +263,11 @@ impl TestRunner {
                 "detail": detail,
             })
         );
-        use std::io::Write as _;
         let _ = std::io::stdout().flush();
         self.results.push(result);
     }
 
+    #[allow(clippy::similar_names)] // `rest` (routing tail) vs `resp` (response).
     async fn send(&mut self, target: &str, cmd: Command) -> Response {
         if target == "init" {
             return self.exec_local(&cmd).await;
@@ -401,22 +403,22 @@ impl TestRunner {
         for &name in &["NP", "NPC", "D3", "D4", "D5"] {
             self.spawned_agents.insert(name.to_string());
         }
-        let has_nonpie = crate::find_nonpie_binary().is_some();
-        if has_nonpie {
-            // Broker caches the rewritten binary, so this is fast after
-            // the first SpawnRemote. Timeout catches the known NP→NPC
-            // pipe bridge hang (vfork Pollee observer bug). Retried on
-            // each rebuild since a fresh tree may succeed.
-            if tokio::time::timeout(Duration::from_secs(30), self.spawn_nonpie_subtree())
-                .await
-                .is_err()
-            {
-                eprintln!(
-                    "[coord] non-PIE subtree setup timed out (30s, likely pipe bridge bug) — continuing without NP/D4"
-                );
-            }
-        } else {
-            eprintln!("[coord] non-PIE binary not found — mount at /opt/nonpie");
+        // Required dependency: panic now with a clear message rather
+        // than silently skipping the subtree spawn and letting tests
+        // fail with confusing "no child NP" routing errors several
+        // seconds later.
+        let _ = crate::nonpie_binary();
+        // Broker caches the rewritten binary, so this is fast after
+        // the first SpawnRemote. Timeout catches the known NP→NPC
+        // pipe bridge hang (vfork Pollee observer bug). Retried on
+        // each rebuild since a fresh tree may succeed.
+        if tokio::time::timeout(Duration::from_secs(30), self.spawn_nonpie_subtree())
+            .await
+            .is_err()
+        {
+            eprintln!(
+                "[coord] non-PIE subtree setup timed out (30s, likely pipe bridge bug) — continuing without NP/D4"
+            );
         }
     }
 
@@ -646,6 +648,7 @@ impl TestRunner {
 ///
 /// # Panics
 /// Panics if the tokio current-thread runtime fails to build.
+#[must_use]
 pub fn run_filtered(self_exe: &str, filter: Option<&str>) -> Vec<TestResult> {
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -673,7 +676,7 @@ fn register_canary(reg: &mut registry::Registry<'_>) {
                     let pass = matches!(
                         &resp,
                         crate::protocol::Response::ExecResult { exit_code: 0, stdout, .. }
-                            if stdout == "ECHO_TEST_OK"
+                            if stdout.trim() == "ECHO_TEST_OK"
                     );
                     TestOutcome::new("A", pass, format!("{resp:?}"))
                 })
@@ -700,6 +703,7 @@ fn matches_test(filter: Option<&str>, test: &Test) -> bool {
 /// Collect all registered tests without executing any.
 /// Returns the full set of Test structs with their IDs and closures.
 /// No agents, no docker — just builds the test list.
+#[must_use]
 pub fn collect_all_tests() -> Vec<Test> {
     let mut tests: Vec<Test> = Vec::new();
     register_canary(&mut registry::Registry::new(&mut tests));
@@ -714,6 +718,7 @@ pub fn collect_all_tests() -> Vec<Test> {
     special_cases::register_fs_io(&mut registry::Registry::new(&mut tests));
     special_cases::register_capture_pipe(&mut registry::Registry::new(&mut tests));
     special_cases::register_stdin_script(&mut registry::Registry::new(&mut tests));
+    special_cases::register_xsi_stdin_script(&mut registry::Registry::new(&mut tests));
     matrix::register_matrix(&mut registry::Registry::new(&mut tests));
     platform_fixes::register_poll_ready_tests(&mut registry::Registry::new(&mut tests));
     platform_fixes::register_bind_getsockname_tests(&mut registry::Registry::new(&mut tests));
@@ -726,6 +731,7 @@ pub fn collect_all_tests() -> Vec<Test> {
     platform_fixes::register_cross_worker_self_connect_tests(&mut registry::Registry::new(
         &mut tests,
     ));
+    platform_fixes::register_tcp_listen_busy_tests(&mut registry::Registry::new(&mut tests));
     platform_fixes::register_bash_fork_exec_tests(&mut registry::Registry::new(&mut tests));
     platform_fixes::register_fork_from_worker_exec_tests(&mut registry::Registry::new(&mut tests));
     platform_fixes::register_minimal_canary_tests(&mut registry::Registry::new(&mut tests));
@@ -735,10 +741,12 @@ pub fn collect_all_tests() -> Vec<Test> {
     platform_fixes::register_concurrent_fork_tests(&mut registry::Registry::new(&mut tests));
     platform_fixes::register_touch_redirect_tests(&mut registry::Registry::new(&mut tests));
     platform_fixes::register_pid_visibility_tests(&mut registry::Registry::new(&mut tests));
+    platform_fixes::register_cross_pid_visibility_tests(&mut registry::Registry::new(&mut tests));
     platform_fixes::register_file_redirect_tests(&mut registry::Registry::new(&mut tests));
     platform_fixes::register_pipe_nonblock_tests(&mut registry::Registry::new(&mut tests));
     platform_fixes::register_epoll_socket_tests(&mut registry::Registry::new(&mut tests));
     platform_fixes::register_loopback_tcp_tests(&mut registry::Registry::new(&mut tests));
+    platform_fixes::register_tcp_halfclose_tests(&mut registry::Registry::new(&mut tests));
     platform_fixes::register_fork_listen_close_tests(&mut registry::Registry::new(&mut tests));
     platform_fixes::register_proc_filesystem_tests(&mut registry::Registry::new(&mut tests));
     platform_fixes::register_subtree_kill_tests(&mut registry::Registry::new(&mut tests));
@@ -886,7 +894,7 @@ fn filter_needs_e(tests: &[Test]) -> bool {
     })
 }
 
-/// Route a target agent name to (direct_child, remaining_path).
+/// Route a target agent name to (`direct_child`, `remaining_path`).
 /// "A" → ("A", None), "AA" → ("A", Some("AA")), "NP" → ("A", Some("NP"))
 fn route(target: &str) -> (&str, Option<&str>) {
     match target {
@@ -1082,7 +1090,7 @@ mod tests {
         bin.to_string_lossy().into_owned()
     }
 
-    /// Helper: create a TestRunner with no children.
+    /// Helper: create a `TestRunner` with no children.
     fn empty_runner() -> TestRunner {
         TestRunner {
             children: std::collections::HashMap::new(),

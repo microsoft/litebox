@@ -523,7 +523,10 @@ impl<FS: ShimFS> LinuxShim<FS> {
             exec_filename.as_ref(),
         )?;
         *entrypoints.task.fs.borrow().exe_path.write() = resolved_exe_path;
-        entrypoints.task.global.set_proc_cmdline(pid, proc_cmdline);
+        entrypoints
+            .task
+            .global
+            .set_proc_cmdline_bytes(pid, proc_cmdline);
         let process = LinuxShimProcess(entrypoints.task.process().clone());
         Ok(LoadedProgram {
             entrypoints,
@@ -3521,12 +3524,33 @@ struct GlobalState<FS: ShimFS> {
         Platform,
         alloc::collections::BTreeMap<i32, litebox::process::ProcessId>,
     >,
-    /// Synthetic `/proc/<pid>/cmdline` contents for locally-known guest PIDs.
+    /// Synthetic `/proc/<pid>/cmdline` bytes for guest processes owned by this host.
     proc_cmdlines: litebox::sync::RwLock<Platform, alloc::collections::BTreeMap<i32, Vec<u8>>>,
 }
 
 impl<FS: ShimFS> GlobalState<FS> {
-    fn set_proc_cmdline(&self, pid: i32, cmdline: Vec<u8>) {
+    fn cmdline_from_argv(argv: &[alloc::ffi::CString]) -> Vec<u8> {
+        if argv.is_empty() {
+            return vec![0];
+        }
+        let mut cmdline = Vec::new();
+        for arg in argv {
+            cmdline.extend_from_slice(arg.as_bytes());
+            cmdline.push(0);
+        }
+        cmdline
+    }
+
+    fn set_proc_cmdline(&self, pid: i32, argv: &[alloc::ffi::CString]) {
+        self.proc_cmdlines
+            .write()
+            .insert(pid, Self::cmdline_from_argv(argv));
+    }
+
+    /// Set a pre-formatted `/proc/<pid>/cmdline` body for `pid`.
+    /// Used by call sites that already have the formatted bytes (e.g. forked
+    /// children inheriting their parent's cmdline).
+    fn set_proc_cmdline_bytes(&self, pid: i32, cmdline: Vec<u8>) {
         self.proc_cmdlines.write().insert(pid, cmdline);
     }
 

@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-//! CLI entrypoint for the LiteBox tool executor.
+//! CLI entrypoint for the `LiteBox` tool executor.
 //!
 //! Supports two modes:
 //! - **Direct mode**: `litebox-tool-executor --rootfs rootfs.tar -- /usr/bin/bash -c "echo hello"`
@@ -19,7 +19,7 @@ use std::io::Read as _;
 #[derive(clap::Parser, Debug)]
 #[command(name = "litebox-tool-executor")]
 #[command(group(clap::ArgGroup::new("policy_mode").required(true)))]
-/// Execute Linux commands in a LiteBox sandbox.
+/// Execute Linux commands in a `LiteBox` sandbox.
 struct Cli {
     /// Path to a .tar rootfs containing syscall-rewritten Linux binaries.
     #[arg(long, value_name = "PATH", value_hint = clap::ValueHint::FilePath)]
@@ -68,12 +68,12 @@ struct Cli {
     #[arg(long, group = "policy_mode")]
     record_baseline: bool,
 
-    /// Forward a host TCP port to a guest port (HOST:GUEST_IP:GUEST_PORT).
+    /// Forward a host TCP port to a guest port (`HOST:GUEST_IP:GUEST_PORT`).
     /// Can be specified multiple times. E.g. --forward-port 2223:10.0.0.2:22
     #[arg(long = "forward-port")]
     forward_port: Vec<String>,
 
-    /// Pre-load a tar archive into the in-memory filesystem layer (tar_ro).
+    /// Pre-load a tar archive into the in-memory filesystem layer (`tar_ro`).
     /// Files in the tar are served from memory, bypassing 9P. Misses fall
     /// through to 9P normally. Use this with directory rootfs to cache
     /// frequently-read files (e.g. node binary, shared libraries).
@@ -83,7 +83,7 @@ struct Cli {
     /// Run the litebox runner under gdbserver for remote debugging.
     /// The runner listens on the specified port (default: 9999) for GDB
     /// remote connections. Connect from the host with:
-    ///   gdb -ex "target remote localhost:<port>" path/to/litebox_runner
+    ///   gdb -ex "target remote localhost:<port>" `path/to/litebox_runner`
     #[arg(long, value_name = "PORT", default_missing_value = "9999", num_args = 0..=1)]
     debug: Option<u16>,
 
@@ -200,10 +200,10 @@ fn create_audit_log_file(dir: &std::path::Path) -> anyhow::Result<std::path::Pat
 /// Algorithm from Howard Hinnant's `civil_from_days`.
 #[allow(clippy::cast_sign_loss, clippy::cast_possible_wrap)] // Algorithm requires bounded sign-flipping; values are small.
 fn civil_from_days(days: i64) -> (i64, u64, u64) {
-    let z = days + 719468;
-    let era = if z >= 0 { z } else { z - 146096 } / 146097;
-    let doe = (z - era * 146097) as u64;
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
     let y = yoe as i64 + era * 400;
     let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
     let mp = (5 * doy + 2) / 153;
@@ -314,7 +314,7 @@ fn print_build_info(audit_log_file: Option<&std::path::Path>) {
     }
 }
 
-/// Find the litebox_runner_linux_userland binary.
+/// Find the `litebox_runner_linux_userland` binary.
 fn find_runner() -> anyhow::Result<std::path::PathBuf> {
     if let Ok(path) = std::env::var("LITEBOX_RUNNER") {
         let p = std::path::PathBuf::from(path);
@@ -341,7 +341,7 @@ fn find_runner() -> anyhow::Result<std::path::PathBuf> {
     );
 }
 
-/// Find the litebox_broker binary.
+/// Find the `litebox_broker` binary.
 fn find_broker() -> anyhow::Result<std::path::PathBuf> {
     if let Ok(path) = std::env::var("LITEBOX_BROKER") {
         let p = std::path::PathBuf::from(path);
@@ -475,7 +475,7 @@ impl Drop for BrokerProcess {
 }
 
 /// Spawn the broker, using the user-provided `--policy` file or no policy
-/// for `--record-baseline` (the broker defaults to AllowAll when no policy
+/// for `--record-baseline` (the broker defaults to `AllowAll` when no policy
 /// is given).
 fn spawn_broker(
     cli: &Cli,
@@ -674,7 +674,7 @@ fn direct(cli: &Cli, audit_log_file: Option<&std::path::Path>) -> anyhow::Result
     )
 }
 
-/// Parse --forward-port specs into (host_port, guest_ip, guest_port) tuples.
+/// Parse --forward-port specs into (`host_port`, `guest_ip`, `guest_port`) tuples.
 fn parse_forward_ports(specs: &[String]) -> Vec<(u16, String, u16)> {
     specs
         .iter()
@@ -741,7 +741,7 @@ fn run_sandbox(
 ///
 /// Usage:
 ///   docker run --rm -p 2222:22 -v target/debug:/opt/litebox:ro litebox-vscode \
-///     /opt/litebox/litebox_tool_executor --rootfs / --vscode-server
+///     /`opt/litebox/litebox_tool_executor` --rootfs / --vscode-server
 ///   # then in VS Code: Remote-SSH → litebox (port 2222)
 fn vscode_server(cli: &Cli, audit_log_file: Option<&std::path::Path>) -> anyhow::Result<()> {
     if !cli.rootfs.is_dir() {

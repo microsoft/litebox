@@ -8,8 +8,9 @@
 //! on the state left by the previous exec on the same agent (e.g., "run
 //! non-PIE, then run PIE — does the PIE see clean output?").
 
-use super::agents::{AgentName, SpawnKind};
+use super::agents::{AgentHandle, AgentName, EphemeralHandle, SpawnKind};
 use super::registry::Registry;
+use super::run_context::RunContext;
 use crate::protocol::{Command, Response};
 
 macro_rules! typed_test {
@@ -36,6 +37,7 @@ macro_rules! typed_test {
 }
 
 /// Register netlink tests. Each test is self-contained: one exec + check.
+#[allow(clippy::too_many_lines)] // exhaustive registration / runner
 pub(super) fn register_netlink(reg: &mut Registry<'_>) {
     let mut self_exe_test =
         |id: &str, subcmd: &str, arg: &str, timeout: u64, check: fn(&str) -> bool| {
@@ -532,7 +534,172 @@ pub(super) fn register_stdin_script(reg: &mut Registry<'_>) {
     }
 }
 
+#[derive(Clone, Copy)]
+enum XsiExpectation {
+    Exact {
+        exit_code: i32,
+        stdout: &'static str,
+    },
+    NonZero {
+        stdout: &'static str,
+    },
+    Contains {
+        exit_code: i32,
+        parts: &'static [&'static str],
+    },
+}
+
+impl XsiExpectation {
+    fn matches(self, resp: &Response) -> bool {
+        match (self, resp) {
+            (
+                Self::Exact { exit_code, stdout },
+                Response::ExecResult {
+                    exit_code: actual,
+                    stdout: actual_stdout,
+                    stderr,
+                },
+            ) => *actual == exit_code && actual_stdout == stdout && stderr.is_empty(),
+            (
+                Self::NonZero { stdout },
+                Response::ExecResult {
+                    exit_code,
+                    stdout: actual_stdout,
+                    ..
+                },
+            ) => *exit_code != 0 && actual_stdout == stdout,
+            (
+                Self::Contains { exit_code, parts },
+                Response::ExecResult {
+                    exit_code: actual,
+                    stdout,
+                    stderr,
+                },
+            ) => {
+                *actual == exit_code
+                    && stderr.is_empty()
+                    && parts.iter().all(|part| stdout.contains(part))
+            }
+            _ => false,
+        }
+    }
+}
+
+struct XsiScript {
+    name: &'static str,
+    script: &'static str,
+    expectation: XsiExpectation,
+}
+
+const XSI_SCRIPTS: &[XsiScript] = &[
+    XsiScript {
+        name: "simple",
+        script: "echo hello\n",
+        expectation: XsiExpectation::Exact {
+            exit_code: 0,
+            stdout: "hello\n",
+        },
+    },
+    XsiScript {
+        name: "multiline_set_e",
+        script: "set -e\necho before\nfalse\necho after\n",
+        expectation: XsiExpectation::NonZero { stdout: "before\n" },
+    },
+    XsiScript {
+        name: "heredoc_style",
+        script: "cat <<'XSI_EOF'\nalpha\nbeta\ngamma\ndelta\nXSI_EOF\nprintf 'done\\n'\n",
+        expectation: XsiExpectation::Exact {
+            exit_code: 0,
+            stdout: "alpha\nbeta\ngamma\ndelta\ndone\n",
+        },
+    },
+    XsiScript {
+        name: "fork_exec",
+        script: "echo before\nsh -c 'echo child_ok; /bin/true'\ncat /etc/hostname\necho after\n",
+        expectation: XsiExpectation::Contains {
+            exit_code: 0,
+            parts: &["before\n", "child_ok\n", "after\n"],
+        },
+    },
+];
+
+fn xsi_exec(script: &'static str) -> Command {
+    Command::Exec {
+        args: vec!["/bin/sh".into()],
+        timeout_secs: Some(10),
+        stdin: Some(script.into()),
+        background: false,
+    }
+}
+
+async fn run_xsi_on_agent(
+    run: &mut RunContext<'_>,
+    handle: &AgentHandle,
+    script: &'static XsiScript,
+) -> (bool, String) {
+    let resp = run.send(handle, xsi_exec(script.script)).await;
+    (script.expectation.matches(&resp), format!("{resp:?}"))
+}
+
+async fn run_xsi_on_ephemeral(
+    run: &mut RunContext<'_>,
+    handle: &EphemeralHandle,
+    script: &'static XsiScript,
+) -> (bool, String) {
+    let resp = run.forward(handle, xsi_exec(script.script)).await;
+    (script.expectation.matches(&resp), format!("{resp:?}"))
+}
+
+/// Register protocol-level stdin script tests for `sh < script` workflows.
+pub(super) fn register_xsi_stdin_script(reg: &mut Registry<'_>) {
+    for script in XSI_SCRIPTS {
+        let id = format!("XSI.stdin_script.{}", script.name);
+        reg.test("shell", "xsi_stdin_script", id)
+            .timeout(60)
+            .build(move |cx| {
+                let in_process = cx.require(AgentName::A);
+                let depth_two = cx.require(AgentName::AA);
+                let fork_target = cx.declare_ephemeral(
+                    AgentName::A,
+                    format!("XSI_{}", script.name),
+                    SpawnKind::Fork {
+                        binary: "self",
+                        inherit_listen_ports: Vec::new(),
+                    },
+                );
+                Box::new(move |run| {
+                    Box::pin(async move {
+                        let mut details = Vec::new();
+                        let mut pass = true;
+
+                        let (axis_pass, detail) = run_xsi_on_agent(run, &in_process, script).await;
+                        pass &= axis_pass;
+                        details.push(format!("in_process={axis_pass}:{detail}"));
+
+                        let spawn_resp = run.spawn_ephemeral(&fork_target).await;
+                        let fork_spawned = matches!(&spawn_resp, Response::Ok { .. });
+                        pass &= fork_spawned;
+                        details.push(format!("fork_spawn={fork_spawned}:{spawn_resp:?}"));
+                        if fork_spawned {
+                            let (axis_pass, detail) =
+                                run_xsi_on_ephemeral(run, &fork_target, script).await;
+                            pass &= axis_pass;
+                            details.push(format!("fork_target={axis_pass}:{detail}"));
+                        }
+
+                        let (axis_pass, detail) = run_xsi_on_agent(run, &depth_two, script).await;
+                        pass &= axis_pass;
+                        details.push(format!("depth2={axis_pass}:{detail}"));
+
+                        super::TestOutcome::new("A+fork+AA", pass, details.join("; "))
+                    })
+                })
+            });
+    }
+}
+
 // Register unix socket tests.
+#[allow(clippy::too_many_lines)] // exhaustive registration / runner
 pub(crate) fn register_unix_socket(reg: &mut Registry<'_>) {
     let simple_tests: &[(&str, &str, &str)] = &[
         (
@@ -737,6 +904,7 @@ pub(crate) fn register_unix_socket(reg: &mut Registry<'_>) {
 }
 
 // Register cross-worker tests.
+#[allow(clippy::too_many_lines)] // exhaustive registration / runner
 pub(crate) fn register_cross_worker(reg: &mut Registry<'_>) {
     typed_test!(
         reg,
@@ -1391,6 +1559,7 @@ pub(crate) fn register_pipe_eof(reg: &mut Registry<'_>) {
 }
 
 // Register contamination sequence tests (X49-X59).
+#[allow(clippy::too_many_lines)] // exhaustive registration / runner
 pub(crate) fn register_contamination_sequence(reg: &mut Registry<'_>) {
     typed_test!(
         reg,
@@ -1404,7 +1573,7 @@ pub(crate) fn register_contamination_sequence(reg: &mut Registry<'_>) {
             let resp = run
                 .send(&a, super::exec(vec![self_exe, "echo-test".into()]))
                 .await;
-            let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout == "ECHO_TEST_OK");
+            let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout.trim() == "ECHO_TEST_OK");
             super::TestOutcome::new("A", pass, format!("{resp:?}"))
         }
     );
@@ -1458,7 +1627,7 @@ pub(crate) fn register_contamination_sequence(reg: &mut Registry<'_>) {
             let resp = run
                 .send(&a, super::exec(vec![self_exe, "echo-test".into()]))
                 .await;
-            let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout == "ECHO_TEST_OK");
+            let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout.trim() == "ECHO_TEST_OK");
             super::TestOutcome::new("A", pass, format!("{resp:?}"))
         }
     );
@@ -1492,7 +1661,7 @@ pub(crate) fn register_contamination_sequence(reg: &mut Registry<'_>) {
             let resp = run
                 .send(&b, super::exec(vec![self_exe, "echo-test".into()]))
                 .await;
-            let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout == "ECHO_TEST_OK");
+            let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout.trim() == "ECHO_TEST_OK");
             super::TestOutcome::new("B", pass, format!("{resp:?}"))
         }
     );
@@ -1529,7 +1698,7 @@ pub(crate) fn register_contamination_sequence(reg: &mut Registry<'_>) {
             let resp = run
                 .send(&b, super::exec(vec![self_exe, "echo-test".into()]))
                 .await;
-            let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout == "ECHO_TEST_OK");
+            let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout.trim() == "ECHO_TEST_OK");
             super::TestOutcome::new("B", pass, format!("{resp:?}"))
         }
     );
@@ -1547,7 +1716,7 @@ pub(crate) fn register_contamination_sequence(reg: &mut Registry<'_>) {
                 let resp = run
                     .send(&ab, super::exec(vec![self_exe.clone(), "echo-test".into()]))
                     .await;
-                let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout == "ECHO_TEST_OK");
+                let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout.trim() == "ECHO_TEST_OK");
                 if !pass {
                     return super::TestOutcome::new(
                         "AB",
@@ -1589,7 +1758,7 @@ pub(crate) fn register_contamination_sequence(reg: &mut Registry<'_>) {
             let resp = run
                 .send(&aab, super::exec(vec![self_exe, "echo-test".into()]))
                 .await;
-            let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout == "ECHO_TEST_OK");
+            let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout.trim() == "ECHO_TEST_OK");
             super::TestOutcome::new("AAB", pass, format!("{resp:?}"))
         }
     );
@@ -1672,7 +1841,7 @@ pub(crate) fn register_contamination_sequence(reg: &mut Registry<'_>) {
                 let resp = run
                     .send(&b, super::exec(vec![self_exe.clone(), "echo-test".into()]))
                     .await;
-                let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout == "ECHO_TEST_OK");
+                let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout.trim() == "ECHO_TEST_OK");
                 results.push((format!("{resp:?}"), pass));
 
                 let resp = run

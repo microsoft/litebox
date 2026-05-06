@@ -13,12 +13,3 @@ warnings = "deny"
 
 [lints.clippy]
 pedantic = { level = "deny", priority = -1 }
-
-# Mirror the workspace allow list.
-unreadable_literal = "allow"
-doc_markdown = "allow"
-missing_errors_doc = "allow"
-needless_pass_by_value = "allow"
-redundant_else = "allow"
-must_use_candidate = "allow"
-too_many_lines = "allow"

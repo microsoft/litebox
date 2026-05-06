@@ -76,6 +76,7 @@ const PIPELINE_PATTERNS: &[PipelinePattern] = &[
 ];
 
 /// Register concurrent fork pipeline tests.
+#[allow(clippy::too_many_lines)] // exhaustive registration / runner
 pub(crate) fn register_concurrent_fork_pipeline(reg: &mut Registry<'_>) {
     for &agent in CF_AGENTS {
         for pat in PIPELINE_PATTERNS {

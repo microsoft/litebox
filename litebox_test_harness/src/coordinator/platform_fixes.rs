@@ -10,8 +10,9 @@
 use crate::protocol::{Command, Response};
 use tokio::time::Duration;
 
-use super::agents::{AgentName, SpawnKind};
+use super::agents::{AgentHandle, AgentName, SpawnKind};
 use super::registry::Registry;
+use super::run_context::RunContext;
 
 const AGENTS: &[AgentName] = &[AgentName::A, AgentName::AA, AgentName::B];
 const DEPTH_AGENTS: &[AgentName] = &[AgentName::A, AgentName::AA];
@@ -181,6 +182,7 @@ pub(crate) fn register_exit_data_integrity_tests(reg: &mut Registry<'_>) {
 // NPIPE: non-PIE pipe chain integrity (fix febc3e41)
 // ═══════════════════════════════════════════════════════════════════
 
+#[allow(clippy::too_many_lines)] // exhaustive registration / runner
 pub(crate) fn register_nonpie_pipe_chain_tests(reg: &mut Registry<'_>) {
     for &reps in NPIPE_REPS {
         for &agent in DEPTH_AGENTS {
@@ -307,6 +309,7 @@ pub(crate) fn register_nonpie_pipe_chain_tests(reg: &mut Registry<'_>) {
 // XCONN: cross-worker TCP — first connection must succeed
 // ═══════════════════════════════════════════════════════════════════
 
+#[allow(clippy::too_many_lines)] // exhaustive registration / runner
 pub(crate) fn register_cross_worker_first_connect_tests(reg: &mut Registry<'_>) {
     // XCONN.cross_first: A listens, B connects — first attempt must succeed.
     reg.test(
@@ -432,6 +435,7 @@ pub(crate) fn register_cross_worker_first_connect_tests(reg: &mut Registry<'_>) 
 // XCONN.self: same-worker loopback (VS Code pattern)
 // ═══════════════════════════════════════════════════════════════════
 
+#[allow(clippy::too_many_lines)] // exhaustive registration / runner
 pub(crate) fn register_cross_worker_self_connect_tests(reg: &mut Registry<'_>) {
     // XCONN.self_A: A listens, A connects to itself.
     reg.test(
@@ -583,6 +587,142 @@ pub(crate) fn register_cross_worker_self_connect_tests(reg: &mut Registry<'_>) {
 }
 
 // ═══════════════════════════════════════════════════════════════════
+// TLB: TCP listen remains usable after delayed accept window
+// ═══════════════════════════════════════════════════════════════════
+
+const TLB_DELAY_SECS: u64 = 1;
+
+struct TlbListenBusyDef {
+    name: &'static str,
+    listener: AgentName,
+    connector: AgentName,
+}
+
+async fn run_tlb_listen_busy_case(
+    run: &mut RunContext<'_>,
+    listener: &AgentHandle,
+    connector: &AgentHandle,
+    listener_name: &str,
+    connector_name: &str,
+    data: &str,
+    delay_secs: u64,
+) -> super::TestOutcome {
+    let listen_resp = run.send(listener, Command::NetListen { port: 0 }).await;
+    let port = match &listen_resp {
+        Response::Listening { port } => *port,
+        _ => {
+            return super::TestOutcome::new(
+                connector_name,
+                false,
+                format!("{listener_name} listen failed: {listen_resp:?}"),
+            );
+        }
+    };
+
+    let sleep_resp = run
+        .send(
+            listener,
+            Command::Exec {
+                args: vec!["sleep".into(), delay_secs.to_string()],
+                timeout_secs: Some(delay_secs + 5),
+                stdin: None,
+                background: false,
+            },
+        )
+        .await;
+    if !matches!(&sleep_resp, Response::ExecResult { exit_code: 0, .. }) {
+        let _ = run.send(listener, Command::NetUnlisten { port }).await;
+        return super::TestOutcome::new(
+            connector_name,
+            false,
+            format!("{listener_name} delay failed: {sleep_resp:?}"),
+        );
+    }
+
+    let conn_resp = run
+        .send(
+            connector,
+            Command::NetConnect {
+                addr: format!("127.0.0.1:{port}"),
+                data: data.to_string(),
+            },
+        )
+        .await;
+    let _ = run.send(listener, Command::NetUnlisten { port }).await;
+    let pass = matches!(&conn_resp, Response::Connected { echo } if echo == data);
+    super::TestOutcome::new(
+        connector_name,
+        pass,
+        format!(
+            "listener={listener_name} connector={connector_name} delay={delay_secs}s {conn_resp:?}"
+        ),
+    )
+}
+
+pub(crate) fn register_tcp_listen_busy_tests(reg: &mut Registry<'_>) {
+    let defs = [
+        TlbListenBusyDef {
+            name: "same_agent",
+            listener: AgentName::A,
+            connector: AgentName::A,
+        },
+        TlbListenBusyDef {
+            name: "parent_child",
+            listener: AgentName::A,
+            connector: AgentName::AA,
+        },
+        TlbListenBusyDef {
+            name: "child_parent",
+            listener: AgentName::AA,
+            connector: AgentName::A,
+        },
+        TlbListenBusyDef {
+            name: "sibling",
+            listener: AgentName::AA,
+            connector: AgentName::AB,
+        },
+        TlbListenBusyDef {
+            name: "depth2",
+            listener: AgentName::AAA,
+            connector: AgentName::AAB,
+        },
+    ];
+
+    for def in defs {
+        let listener_name = def.listener.to_string();
+        let connector_name = def.connector.to_string();
+        let data = format!("TLB_{}", def.name);
+        reg.test(
+            "xworker",
+            "tcp_listen_busy",
+            format!("TLB.listen_busy.{}", def.name),
+        )
+        .timeout(60)
+        .build(move |cx| {
+            let listener = cx.require(def.listener);
+            let connector = cx.require(def.connector);
+            Box::new(move |run| {
+                let listener_name = listener_name.clone();
+                let connector_name = connector_name.clone();
+                let data = data.clone();
+                Box::pin(async move {
+                    run_tlb_listen_busy_case(
+                        run,
+                        &listener,
+                        &connector,
+                        &listener_name,
+                        &connector_name,
+                        &data,
+                        TLB_DELAY_SECS,
+                    )
+                    .await
+                })
+            })
+        });
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
 // BASH: bash fork+exec of child commands
 // ═══════════════════════════════════════════════════════════════════
 
@@ -684,6 +824,7 @@ pub(crate) fn register_bash_fork_exec_tests(reg: &mut Registry<'_>) {
 // FWE: fork+exec from non-PIE worker-exec hosts
 // ═══════════════════════════════════════════════════════════════════
 
+#[allow(clippy::too_many_lines)] // exhaustive registration / runner
 pub(crate) fn register_fork_from_worker_exec_tests(reg: &mut Registry<'_>) {
     // FWE.nonpie_from_init: fork+exec nonpie from init worker (agent A)
     reg.test(
@@ -996,6 +1137,7 @@ pub(crate) fn register_stdin_pipe_subst_tests(reg: &mut Registry<'_>) {
 // CWF: Cross-worker file coherence
 // ═══════════════════════════════════════════════════════════════════
 
+#[allow(clippy::too_many_lines)] // exhaustive registration / runner
 pub(crate) fn register_cross_worker_file_tests(reg: &mut Registry<'_>) {
     for &agent in AGENTS {
         let agent_s = agent.to_string();
@@ -1637,6 +1779,7 @@ pub(crate) fn register_touch_redirect_tests(reg: &mut Registry<'_>) {
 // KP: PID and /proc visibility across delayed-fork migration
 // ═══════════════════════════════════════════════════════════════════
 
+#[allow(clippy::too_many_lines)] // exhaustive registration / runner
 pub(crate) fn register_pid_visibility_tests(reg: &mut Registry<'_>) {
     struct Def {
         name: &'static str,
@@ -1790,6 +1933,142 @@ pub(crate) fn register_pid_visibility_tests(reg: &mut Registry<'_>) {
                     })
                 });
         }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// KPX: Cross-agent PID and /proc visibility
+// ═══════════════════════════════════════════════════════════════════
+
+#[derive(Clone, Copy)]
+struct KpxProcCase {
+    name: &'static str,
+    observer: AgentName,
+    target: AgentName,
+}
+
+const KPX_PROC_CASES: &[KpxProcCase] = &[
+    KpxProcCase {
+        name: "same_agent",
+        observer: AgentName::A,
+        target: AgentName::A,
+    },
+    KpxProcCase {
+        name: "parent_to_child",
+        observer: AgentName::A,
+        target: AgentName::AA,
+    },
+    KpxProcCase {
+        name: "child_to_parent",
+        observer: AgentName::AA,
+        target: AgentName::A,
+    },
+    KpxProcCase {
+        name: "root_sibling",
+        observer: AgentName::A,
+        target: AgentName::B,
+    },
+    KpxProcCase {
+        name: "nested_sibling",
+        observer: AgentName::AA,
+        target: AgentName::AB,
+    },
+    KpxProcCase {
+        name: "depth1_to_depth2",
+        observer: AgentName::AB,
+        target: AgentName::AAA,
+    },
+    KpxProcCase {
+        name: "depth2_to_depth1",
+        observer: AgentName::AAA,
+        target: AgentName::AB,
+    },
+    KpxProcCase {
+        name: "depth2_sibling",
+        observer: AgentName::AAA,
+        target: AgentName::AAB,
+    },
+    KpxProcCase {
+        name: "cross_subtree",
+        observer: AgentName::B,
+        target: AgentName::AAA,
+    },
+];
+
+fn kpx_pid(resp: &Response) -> Result<u32, String> {
+    match resp {
+        Response::Ok { data: Some(pid) } => pid
+            .parse::<u32>()
+            .map_err(|e| format!("GetPid returned non-numeric pid {pid:?}: {e}")),
+        other => Err(format!("GetPid failed: {other:?}")),
+    }
+}
+
+fn kpx_observe_proc_cmd(pid: u32) -> Command {
+    let script = format!(
+        "pid={pid}\n\
+         if test -d \"/proc/$pid\"; then echo PROC_DIR_OK; else echo PROC_DIR_FAIL; fi\n\
+         cat \"/proc/$pid/cmdline\"\n\
+         printf '\\n'\n\
+         if kill -0 \"$pid\" 2>/dev/null; then echo KILL0_OK; else echo KILL0_FAIL; fi\n"
+    );
+    Command::Exec {
+        args: vec!["/bin/sh".into(), "-c".into(), script],
+        timeout_secs: Some(10),
+        stdin: None,
+        background: false,
+    }
+}
+
+fn kpx_observe_proc_pass(resp: &Response) -> bool {
+    matches!(
+        resp,
+        Response::ExecResult {
+            exit_code: 0,
+            stdout,
+            ..
+        } if stdout.contains("PROC_DIR_OK")
+            && stdout.contains("litebox_test_harness")
+            && stdout.contains("KILL0_OK")
+    )
+}
+
+#[allow(clippy::too_many_lines)] // exhaustive pair matrix
+pub(crate) fn register_cross_pid_visibility_tests(reg: &mut Registry<'_>) {
+    for &case in KPX_PROC_CASES {
+        let observer = case.observer;
+        let target = case.target;
+        let test_id = format!("KPX.cross.{}.{}.to.{target}", case.name, observer);
+        reg.test("fork", "cross_pid_visibility", test_id)
+            .timeout(60)
+            .build(move |cx| {
+                let observer_handle = cx.require(observer);
+                let target_handle = cx.require(target);
+                Box::new(move |run| {
+                    Box::pin(async move {
+                        let pid_resp = run.send(&target_handle, Command::GetPid).await;
+                        let pid = match kpx_pid(&pid_resp) {
+                            Ok(pid) => pid,
+                            Err(e) => {
+                                return super::TestOutcome::new(
+                                    observer.name(),
+                                    false,
+                                    format!("{e}; resp={pid_resp:?}"),
+                                );
+                            }
+                        };
+                        let observe_resp = run.send(&observer_handle, kpx_observe_proc_cmd(pid)).await;
+                        let pass = kpx_observe_proc_pass(&observe_resp);
+                        super::TestOutcome::new(
+                            observer.name(),
+                            pass,
+                            format!(
+                                "observer={observer} target={target} target_pid={pid} pid_resp={pid_resp:?} observe_resp={observe_resp:?}"
+                            ),
+                        )
+                    })
+                })
+            });
     }
 }
 
@@ -2075,6 +2354,7 @@ pub(crate) fn register_epoll_socket_tests(reg: &mut Registry<'_>) {
 // LB: Loopback TCP across delayed-fork workers
 // ═══════════════════════════════════════════════════════════════════
 
+#[allow(clippy::too_many_lines)] // exhaustive registration / runner
 pub(crate) fn register_loopback_tcp_tests(reg: &mut Registry<'_>) {
     struct Def {
         name: &'static str,
@@ -2114,17 +2394,6 @@ pub(crate) fn register_loopback_tcp_tests(reg: &mut Registry<'_>) {
                 "kill $PID 2>/dev/null; wait $PID 2>/dev/null\n",
             ),
             check: |s| s.contains("REPLY=LB_ANY"),
-        },
-        Def {
-            name: "busy_after_listen",
-            script_template: concat!(
-                "{exe} tcp-listen-busy 19880 3 > /dev/null 2>&1 &\n",
-                "PID=$!\nsleep 1\n",
-                "REPLY=$(echo LB_BUSY | nc -q5 -w10 127.0.0.1 19880 2>/dev/null)\n",
-                "echo REPLY=$REPLY\n",
-                "kill $PID 2>/dev/null; wait $PID 2>/dev/null\n",
-            ),
-            check: |s| s.contains("REPLY=LB_BUSY"),
         },
         Def {
             name: "fast_close",
@@ -2186,6 +2455,92 @@ pub(crate) fn register_loopback_tcp_tests(reg: &mut Registry<'_>) {
                     })
                 });
         }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// THC: TCP half-close EOF
+// ═══════════════════════════════════════════════════════════════════
+
+pub(crate) fn register_tcp_halfclose_tests(reg: &mut Registry<'_>) {
+    #[derive(Clone, Copy)]
+    struct Case {
+        id: &'static str,
+        server: AgentName,
+        client: AgentName,
+        payload: &'static str,
+    }
+
+    let cases = [
+        Case {
+            id: "THC.halfclose.eof.same_agent",
+            server: AgentName::A,
+            client: AgentName::A,
+            payload: "THC_SAME_AGENT_PAYLOAD",
+        },
+        Case {
+            id: "THC.halfclose.eof.cross_agent",
+            server: AgentName::A,
+            client: AgentName::B,
+            payload: "THC_CROSS_AGENT_PAYLOAD",
+        },
+        Case {
+            id: "THC.halfclose.eof.sibling",
+            server: AgentName::AA,
+            client: AgentName::AB,
+            payload: "THC_SIBLING_PAYLOAD",
+        },
+        Case {
+            id: "THC.halfclose.eof.depth2",
+            server: AgentName::AAA,
+            client: AgentName::AAB,
+            payload: "THC_DEPTH2_PAYLOAD",
+        },
+    ];
+
+    for case in cases {
+        let server_label = case.server.to_string();
+        let client_label = case.client.to_string();
+        reg.test("matrix", "tcp_halfclose", case.id)
+            .timeout(60)
+            .build(move |cx| {
+                let server = cx.require(case.server);
+                let client = cx.require(case.client);
+                Box::new(move |run| {
+                    let agent_label = format!("{server_label}->{client_label}");
+                    let payload = case.payload.to_string();
+                    Box::pin(async move {
+                        let listen_resp = run.send(&server, Command::NetListen { port: 0 }).await;
+                        let port = match &listen_resp {
+                            Response::Listening { port } => *port,
+                            _ => {
+                                return super::TestOutcome::new(
+                                    &agent_label,
+                                    false,
+                                    format!("listen failed: {listen_resp:?}"),
+                                );
+                            }
+                        };
+
+                        let halfclose_resp = run
+                            .send(
+                                &client,
+                                Command::NetHalfCloseEcho {
+                                    addr: format!("127.0.0.1:{port}"),
+                                    write_data: payload.clone(),
+                                    half: "wr".into(),
+                                },
+                            )
+                            .await;
+                        let _ = run.send(&server, Command::NetUnlisten { port }).await;
+                        let pass = matches!(
+                            &halfclose_resp,
+                            Response::HalfClosed { echo } if echo == &payload
+                        );
+                        super::TestOutcome::new(&agent_label, pass, format!("{halfclose_resp:?}"))
+                    })
+                })
+            });
     }
 }
 
@@ -2420,7 +2775,7 @@ pub(crate) fn register_proc_filesystem_tests(reg: &mut Registry<'_>) {
 /// jitter under heavy parallelism without masking real hangs.
 const SK_WAIT_BUDGET_SECS: u64 = 5;
 
-/// Per-test outer budget. Must exceed SpawnRemote setup cost
+/// Per-test outer budget. Must exceed `SpawnRemote` setup cost
 /// (the broker rewrites a 124 MB binary on first use, plus the
 /// well-known `spawn_nonpie_subtree` 30-s timeout under litebox).
 const SK_TEST_TIMEOUT_SECS: u64 = 90;

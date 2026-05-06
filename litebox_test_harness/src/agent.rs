@@ -18,6 +18,40 @@ struct ChildHandle {
     process: tokio::process::Child,
 }
 
+fn net_halfclose_echo_blocking(addr: &str, write_data: &str, half: &str) -> Result<String, String> {
+    use std::io::{Read, Write};
+    use std::net::Shutdown;
+    use std::time::Duration as StdDuration;
+
+    let mut stream = std::net::TcpStream::connect(addr).map_err(|e| format!("connect: {e}"))?;
+    stream
+        .set_read_timeout(Some(StdDuration::from_secs(5)))
+        .map_err(|e| format!("set read timeout: {e}"))?;
+    stream
+        .set_write_timeout(Some(StdDuration::from_secs(5)))
+        .map_err(|e| format!("set write timeout: {e}"))?;
+    stream
+        .write_all(write_data.as_bytes())
+        .map_err(|e| format!("write: {e}"))?;
+    stream.flush().map_err(|e| format!("flush: {e}"))?;
+
+    let shutdown = match half {
+        "wr" => Shutdown::Write,
+        "rd" => Shutdown::Read,
+        "rdwr" => Shutdown::Both,
+        other => return Err(format!("invalid half {other:?}; expected wr, rd, or rdwr")),
+    };
+    stream
+        .shutdown(shutdown)
+        .map_err(|e| format!("shutdown({half}): {e}"))?;
+
+    let mut received = Vec::new();
+    stream
+        .read_to_end(&mut received)
+        .map_err(|e| format!("read_to_eof: {e}"))?;
+    Ok(String::from_utf8_lossy(&received).to_string())
+}
+
 /// Run the agent. Reads commands from stdin, executes, responds on stdout.
 pub fn run(self_exe: &str) {
     tokio::runtime::Builder::new_current_thread()
@@ -27,6 +61,7 @@ pub fn run(self_exe: &str) {
         .block_on(agent_loop(self_exe));
 }
 
+#[allow(clippy::too_many_lines)] // exhaustive runner / dispatch table
 async fn agent_loop(self_exe: &str) {
     let stdin = tokio::io::stdin();
     let mut reader = BufReader::new(stdin);
@@ -81,15 +116,13 @@ async fn agent_loop(self_exe: &str) {
 
             Command::SpawnRemote { children: names } => {
                 // Use the non-PIE binary to force remote worker migration.
-                let remote_exe = if let Some(p) = crate::find_nonpie_binary() {
-                    p
-                } else {
-                    respond(&Response::Error {
-                        error: "nonpie binary not found".to_string(),
-                    })
-                    .await;
-                    continue;
-                };
+                // Required dependency: panic if missing rather than
+                // returning Response::Error — the registration system
+                // ensures only tests that declared a NonPie ephemeral
+                // reach this command, so a missing binary at this
+                // point indicates a setup error that should surface
+                // loudly.
+                let remote_exe = litebox_test_harness::nonpie_binary();
                 for name in &names {
                     match spawn_child(&remote_exe, name) {
                         Ok(handle) => {
@@ -120,17 +153,8 @@ async fn agent_loop(self_exe: &str) {
                 inherit_listen_ports,
             } => {
                 let exe = match binary.as_str() {
-                    "nonpie" => {
-                        if let Some(p) = crate::find_nonpie_binary() {
-                            p
-                        } else {
-                            respond(&Response::Error {
-                                error: "nonpie binary not found".to_string(),
-                            })
-                            .await;
-                            continue;
-                        }
-                    }
+                    // Required dependency; panic for clarity (see SpawnRemote handler).
+                    "nonpie" => litebox_test_harness::nonpie_binary(),
                     _ => self_exe.to_string(), // "self" or default
                 };
 
@@ -310,29 +334,20 @@ async fn agent_loop(self_exe: &str) {
                         let actual_port = listener.local_addr().map(|a| a.port()).unwrap_or(port);
                         // Spawn echo server task.
                         let task = tokio::spawn(async move {
-                            loop {
-                                match listener.accept().await {
-                                    Ok((mut stream, _)) => {
-                                        tokio::spawn(async move {
-                                            let mut buf = [0u8; 4096];
-                                            loop {
-                                                match stream.read(&mut buf).await {
-                                                    Ok(0) | Err(_) => break,
-                                                    Ok(n) => {
-                                                        if stream
-                                                            .write_all(&buf[..n])
-                                                            .await
-                                                            .is_err()
-                                                        {
-                                                            break;
-                                                        }
-                                                    }
+                            while let Ok((mut stream, _)) = listener.accept().await {
+                                tokio::spawn(async move {
+                                    let mut buf = [0u8; 4096];
+                                    loop {
+                                        match stream.read(&mut buf).await {
+                                            Ok(0) | Err(_) => break,
+                                            Ok(n) => {
+                                                if stream.write_all(&buf[..n]).await.is_err() {
+                                                    break;
                                                 }
                                             }
-                                        });
+                                        }
                                     }
-                                    Err(_) => break,
-                                }
+                                });
                             }
                         });
                         listeners.insert(actual_port, task);
@@ -389,6 +404,36 @@ async fn agent_loop(self_exe: &str) {
                     Err(_) => {
                         respond(&Response::ConnectFailed {
                             error: "connect timeout".to_string(),
+                        })
+                        .await;
+                    }
+                }
+            }
+
+            Command::NetHalfCloseEcho {
+                addr,
+                write_data,
+                half,
+            } => {
+                let result = tokio::time::timeout(
+                    Duration::from_secs(10),
+                    tokio::task::spawn_blocking(move || {
+                        net_halfclose_echo_blocking(&addr, &write_data, &half)
+                    }),
+                )
+                .await;
+                match result {
+                    Ok(Ok(Ok(echo))) => respond(&Response::HalfClosed { echo }).await,
+                    Ok(Ok(Err(error))) => respond(&Response::HalfCloseFailed { error }).await,
+                    Ok(Err(e)) => {
+                        respond(&Response::HalfCloseFailed {
+                            error: format!("halfclose task join: {e}"),
+                        })
+                        .await;
+                    }
+                    Err(_) => {
+                        respond(&Response::HalfCloseFailed {
+                            error: "halfclose timeout".to_string(),
                         })
                         .await;
                     }
@@ -500,8 +545,8 @@ async fn agent_loop(self_exe: &str) {
                         Ok((out, err, Ok(status))) => {
                             respond(&Response::ExecResult {
                                 exit_code: status.code().unwrap_or(-1),
-                                stdout: String::from_utf8_lossy(&out).trim().to_string(),
-                                stderr: String::from_utf8_lossy(&err).trim().to_string(),
+                                stdout: String::from_utf8_lossy(&out).to_string(),
+                                stderr: String::from_utf8_lossy(&err).to_string(),
                             })
                             .await;
                         }
@@ -547,29 +592,20 @@ async fn agent_loop(self_exe: &str) {
                 match tokio::net::UnixListener::bind(&path) {
                     Ok(listener) => {
                         let task = tokio::spawn(async move {
-                            loop {
-                                match listener.accept().await {
-                                    Ok((mut stream, _)) => {
-                                        tokio::spawn(async move {
-                                            let mut buf = [0u8; 4096];
-                                            loop {
-                                                match stream.read(&mut buf).await {
-                                                    Ok(0) | Err(_) => break,
-                                                    Ok(n) => {
-                                                        if stream
-                                                            .write_all(&buf[..n])
-                                                            .await
-                                                            .is_err()
-                                                        {
-                                                            break;
-                                                        }
-                                                    }
+                            while let Ok((mut stream, _)) = listener.accept().await {
+                                tokio::spawn(async move {
+                                    let mut buf = [0u8; 4096];
+                                    loop {
+                                        match stream.read(&mut buf).await {
+                                            Ok(0) | Err(_) => break,
+                                            Ok(n) => {
+                                                if stream.write_all(&buf[..n]).await.is_err() {
+                                                    break;
                                                 }
                                             }
-                                        });
+                                        }
                                     }
-                                    Err(_) => break,
-                                }
+                                });
                             }
                         });
                         unix_listeners.insert(path.clone(), task);
@@ -785,14 +821,13 @@ async fn agent_loop(self_exe: &str) {
                     let addr = addr.clone();
                     let data = data.clone();
                     handles.push(tokio::spawn(async move {
-                        let mut stream = match tokio::time::timeout(
+                        let Ok(Ok(mut stream)) = tokio::time::timeout(
                             Duration::from_secs(5),
                             tokio::net::TcpStream::connect(&addr),
                         )
                         .await
-                        {
-                            Ok(Ok(s)) => s,
-                            _ => return false,
+                        else {
+                            return false;
                         };
                         if stream.write_all(data.as_bytes()).await.is_err() {
                             return false;

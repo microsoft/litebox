@@ -106,7 +106,7 @@ impl<'a> RunContext<'a> {
     /// clear error rather than blocking.
     ///
     /// Returns `Err(Duration::ZERO)` if the agent is no longer
-    /// tracked (e.g., already SIGKILLed by the runner's poisoning
+    /// tracked (e.g., already `SIGKILLed` by the runner's poisoning
     /// machinery after a prior command timed out). The test is
     /// expected to surface that as a setup failure rather than
     /// silently treating it as a kill-success.
