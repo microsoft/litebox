@@ -19,6 +19,17 @@ use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 pub mod syscall_nr;
 
+const MAX_SYSCALL_COPY_SIZE: usize = 8 * 1024 * 1024;
+const MAX_CRYP_OBJ_POPULATE_ATTRS: usize = 1;
+
+#[inline]
+fn checked_syscall_copy_size(size: usize) -> Result<usize, Errno> {
+    if size > MAX_SYSCALL_COPY_SIZE {
+        return Err(Errno::EINVAL);
+    }
+    Ok(size)
+}
+
 // Based on `optee_os/lib/libutee/include/utee_syscalls.h`
 #[non_exhaustive]
 pub enum SyscallRequest<Platform: litebox::platform::RawPointerProvider> {
@@ -141,7 +152,7 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
             },
             TeeSyscallNr::Log => SyscallRequest::Log {
                 buf: Platform::RawConstPointer::from_usize(ctx.syscall_arg(0)),
-                len: ctx.syscall_arg(1),
+                len: checked_syscall_copy_size(ctx.syscall_arg(1))?,
             },
             TeeSyscallNr::Panic => SyscallRequest::Panic {
                 code: ctx.syscall_arg(0),
@@ -158,7 +169,7 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
             TeeSyscallNr::GetPropertyNameToIndex => SyscallRequest::GetPropertyNameToIndex {
                 prop_set: TeePropSet::try_from_usize(ctx.syscall_arg(0))?,
                 name: Platform::RawConstPointer::from_usize(ctx.syscall_arg(1)),
-                name_len: ctx.syscall_arg(2),
+                name_len: checked_syscall_copy_size(ctx.syscall_arg(2))?,
                 index: Platform::RawMutPointer::from_usize(ctx.syscall_arg(3)),
             },
             TeeSyscallNr::OpenTaSession => SyscallRequest::OpenTaSession {
@@ -196,19 +207,19 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
             TeeSyscallNr::CipherInit => SyscallRequest::CipherInit {
                 state: TeeCrypStateHandle::try_from_usize(ctx.syscall_arg(0))?,
                 iv: Platform::RawConstPointer::from_usize(ctx.syscall_arg(1)),
-                iv_len: ctx.syscall_arg(2),
+                iv_len: checked_syscall_copy_size(ctx.syscall_arg(2))?,
             },
             TeeSyscallNr::CipherUpdate => SyscallRequest::CipherUpdate {
                 state: TeeCrypStateHandle::try_from_usize(ctx.syscall_arg(0))?,
                 src: Platform::RawConstPointer::from_usize(ctx.syscall_arg(1)),
-                src_len: ctx.syscall_arg(2),
+                src_len: checked_syscall_copy_size(ctx.syscall_arg(2))?,
                 dst: Platform::RawMutPointer::from_usize(ctx.syscall_arg(3)),
                 dst_len: Platform::RawMutPointer::from_usize(ctx.syscall_arg(4)),
             },
             TeeSyscallNr::CipherFinal => SyscallRequest::CipherFinal {
                 state: TeeCrypStateHandle::try_from_usize(ctx.syscall_arg(0))?,
                 src: Platform::RawConstPointer::from_usize(ctx.syscall_arg(1)),
-                src_len: ctx.syscall_arg(2),
+                src_len: checked_syscall_copy_size(ctx.syscall_arg(2))?,
                 dst: Platform::RawMutPointer::from_usize(ctx.syscall_arg(3)),
                 dst_len: Platform::RawMutPointer::from_usize(ctx.syscall_arg(4)),
             },
@@ -230,7 +241,10 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
             TeeSyscallNr::CrypObjPopulate => SyscallRequest::CrypObjPopulate {
                 obj: TeeObjHandle::try_from_usize(ctx.syscall_arg(0))?,
                 attrs: Platform::RawConstPointer::from_usize(ctx.syscall_arg(1)),
-                attr_count: ctx.syscall_arg(2),
+                attr_count: match ctx.syscall_arg(2) {
+                    count if count <= MAX_CRYP_OBJ_POPULATE_ATTRS => count,
+                    _ => return Err(Errno::EINVAL),
+                },
             },
             TeeSyscallNr::CrypObjCopy => SyscallRequest::CrypObjCopy {
                 dst_obj: TeeObjHandle::try_from_usize(ctx.syscall_arg(0))?,
@@ -1149,7 +1163,7 @@ impl<Platform: litebox::platform::RawPointerProvider> LdelfSyscallRequest<Platfo
             },
             LdelfSyscallNr::Log => LdelfSyscallRequest::Log {
                 buf: Platform::RawConstPointer::from_usize(ctx.syscall_arg(0)),
-                len: ctx.syscall_arg(1),
+                len: checked_syscall_copy_size(ctx.syscall_arg(1))?,
             },
             LdelfSyscallNr::Panic => LdelfSyscallRequest::Panic {
                 code: ctx.syscall_arg(0),

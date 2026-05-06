@@ -19,7 +19,7 @@ use crate::{NormalWorldConstPtr, NormalWorldMutPtr};
 use alloc::{boxed::Box, vec::Vec};
 use core::mem::size_of;
 use hashbrown::HashMap;
-use litebox::{mm::linux::PAGE_SIZE, utils::TruncateExt};
+use litebox::{mm::linux::PAGE_SIZE, platform::RawConstPointer, utils::TruncateExt};
 use litebox_common_linux::vmap::{PhysPageAddr, PhysPointerError};
 use litebox_common_optee::{
     OpteeMessageCommand, OpteeMsgArgs, OpteeMsgArgsHeader, OpteeMsgAttrType, OpteeMsgParamRmem,
@@ -54,14 +54,31 @@ const OPTEE_MSG_OS_OPTEE_UUID_3: u32 = 0xa5d5_c51b;
 // We do not support notification for now
 const MAX_NOTIF_VALUE: usize = 0;
 
+/// Maximum secure-world heap copy for a single OP-TEE memref parameter.
+///
+/// OP-TEE OS validates memref sizes against their backing shared-memory objects, but it does not
+/// define a universal ABI maximum. OP-TEE shim copies input/inout memrefs into owned buffers, so
+/// this is a local resource policy to keep one normal-world request from consuming a large fraction
+/// of the default 128 MiB memory budget.
+const MAX_SHM_MEMREF_SIZE: usize = 8 * 1024 * 1024;
+const MAX_SHM_REF_MAP_ENTRIES: usize = 1024;
+
 #[inline]
 fn page_align_down(address: u64) -> u64 {
     address & !(PAGE_SIZE as u64 - 1)
 }
 
 #[inline]
-fn page_align_up(len: u64) -> u64 {
-    len.next_multiple_of(PAGE_SIZE as u64)
+fn page_align_up(len: u64) -> Option<u64> {
+    len.checked_next_multiple_of(PAGE_SIZE as u64)
+}
+
+#[inline]
+fn checked_memref_size(size: u64) -> Result<usize, OpteeSmcReturnCode> {
+    if size > MAX_SHM_MEMREF_SIZE as u64 {
+        return Err(OpteeSmcReturnCode::ENomem);
+    }
+    Ok(size.truncate())
 }
 
 fn parse_optee_msg_args(
@@ -305,7 +322,10 @@ pub fn handle_optee_msg_args(msg_args: &OpteeMsgArgs) -> Result<(), OpteeSmcRetu
             // - The page offset of the first shared memory page (`pages_list[0]`)
             let shm_ref_pages_data_phys_addr = page_align_down(tmem.buf_ptr);
             let page_offset = tmem.buf_ptr - shm_ref_pages_data_phys_addr;
-            let aligned_size = page_align_up(page_offset + tmem.size);
+            let size = page_offset
+                .checked_add(tmem.size)
+                .ok_or(OpteeSmcReturnCode::ENomem)?;
+            let aligned_size = page_align_up(size).ok_or(OpteeSmcReturnCode::ENomem)?;
             shm_ref_map().register_shm(
                 shm_ref_pages_data_phys_addr,
                 page_offset,
@@ -435,44 +455,44 @@ pub fn decode_ta_request(
             }
             OpteeMsgAttrType::TmemInput => {
                 let tmem = param.get_param_tmem().ok_or(OpteeSmcReturnCode::EBadCmd)?;
+                let data_size = checked_memref_size(tmem.size)?;
                 let shm_info = get_shm_info_from_optee_msg_param_tmem(tmem)?;
-                let data_size = tmem.size.truncate();
                 build_memref_input(&shm_info, data_size)?
             }
             OpteeMsgAttrType::RmemInput => {
                 let rmem = param.get_param_rmem().ok_or(OpteeSmcReturnCode::EBadCmd)?;
+                let data_size = checked_memref_size(rmem.size)?;
                 let shm_info = get_shm_info_from_optee_msg_param_rmem(rmem)?;
-                let data_size = rmem.size.truncate();
                 build_memref_input(&shm_info, data_size)?
             }
             OpteeMsgAttrType::TmemOutput => {
                 let tmem = param.get_param_tmem().ok_or(OpteeSmcReturnCode::EBadCmd)?;
+                let buffer_size = checked_memref_size(tmem.size)?;
                 let shm_info = get_shm_info_from_optee_msg_param_tmem(tmem)?;
-                let buffer_size = tmem.size.truncate();
 
                 ta_req_info.out_shm_info[i] = Some(shm_info);
                 UteeParamOwned::MemrefOutput { buffer_size }
             }
             OpteeMsgAttrType::RmemOutput => {
                 let rmem = param.get_param_rmem().ok_or(OpteeSmcReturnCode::EBadCmd)?;
+                let buffer_size = checked_memref_size(rmem.size)?;
                 let shm_info = get_shm_info_from_optee_msg_param_rmem(rmem)?;
-                let buffer_size = rmem.size.truncate();
 
                 ta_req_info.out_shm_info[i] = Some(shm_info);
                 UteeParamOwned::MemrefOutput { buffer_size }
             }
             OpteeMsgAttrType::TmemInout => {
                 let tmem = param.get_param_tmem().ok_or(OpteeSmcReturnCode::EBadCmd)?;
+                let buffer_size = checked_memref_size(tmem.size)?;
                 let shm_info = get_shm_info_from_optee_msg_param_tmem(tmem)?;
-                let buffer_size = tmem.size.truncate();
 
                 ta_req_info.out_shm_info[i] = Some(shm_info.clone());
                 build_memref_inout(&shm_info, buffer_size)?
             }
             OpteeMsgAttrType::RmemInout => {
                 let rmem = param.get_param_rmem().ok_or(OpteeSmcReturnCode::EBadCmd)?;
+                let buffer_size = checked_memref_size(rmem.size)?;
                 let shm_info = get_shm_info_from_optee_msg_param_rmem(rmem)?;
-                let buffer_size = rmem.size.truncate();
 
                 ta_req_info.out_shm_info[i] = Some(shm_info.clone());
                 build_memref_inout(&shm_info, buffer_size)?
@@ -555,18 +575,18 @@ pub fn update_optee_msg_args(
             }
             TeeParamType::MemrefOutput | TeeParamType::MemrefInout => {
                 if let Ok(Some((addr, len))) = ta_params.get_values(index) {
+                    let len = checked_memref_size(len)?;
                     // SAFETY
                     // `addr` is expected to be a valid address of a TA and `addr + len` does not
                     // exceed the TA's memory region.
-                    use litebox::platform::RawConstPointer;
                     let ptr = crate::UserConstPtr::<u8>::from_usize(addr.truncate());
                     let slice = ptr
-                        .to_owned_slice(len.truncate())
+                        .to_owned_slice(len)
                         .ok_or(OpteeSmcReturnCode::EBadAddr)?;
 
                     // Update the output size in msg_args
                     // For rmem/tmem params, size is at the same offset as value.b in the union
-                    msg_args.set_param_memref_size(index, len)?;
+                    msg_args.set_param_memref_size(index, len as u64)?;
 
                     if slice.is_empty() {
                         continue;
@@ -663,6 +683,8 @@ impl<const ALIGN: usize> ShmRefMap<ALIGN> {
         let mut guard = self.inner.lock();
         if guard.contains_key(&shm_ref) {
             Err(OpteeSmcReturnCode::ENotAvail)
+        } else if guard.len() >= MAX_SHM_REF_MAP_ENTRIES {
+            Err(OpteeSmcReturnCode::ENomem)
         } else {
             let _ = guard.insert(shm_ref, info);
             Ok(())
@@ -695,11 +717,21 @@ impl<const ALIGN: usize> ShmRefMap<ALIGN> {
         if page_offset >= ALIGN as u64 || aligned_size == 0 {
             return Err(OpteeSmcReturnCode::EBadAddr);
         }
-        let aligned_size_usize: usize = aligned_size.truncate();
+        let aligned_size_usize =
+            usize::try_from(aligned_size).map_err(|_| OpteeSmcReturnCode::ENomem)?;
+        if aligned_size_usize == 0 || aligned_size_usize > MAX_SHM_MEMREF_SIZE {
+            return Err(OpteeSmcReturnCode::ENomem);
+        }
         let num_pages = aligned_size_usize / ALIGN;
         let mut pages = Vec::with_capacity(num_pages);
         let mut cur_addr: usize = shm_ref_pages_data_phys_addr.truncate();
+        let mut num_nodes = 0;
         loop {
+            if num_nodes > num_pages {
+                return Err(OpteeSmcReturnCode::EBadAddr);
+            }
+            num_nodes += 1;
+            let prev_len = pages.len();
             let mut cur_ptr = NormalWorldConstPtr::<ShmRefPagesData, ALIGN>::with_usize(cur_addr)
                 .map_err(|_| OpteeSmcReturnCode::EBadAddr)?;
             let pages_data =
@@ -713,6 +745,9 @@ impl<const ALIGN: usize> ShmRefMap<ALIGN> {
                             .ok_or(OpteeSmcReturnCode::EBadAddr)?,
                     );
                 }
+            }
+            if pages.len() == prev_len {
+                return Err(OpteeSmcReturnCode::EBadAddr);
             }
             if pages_data.next_page_data == 0 || pages.len() == num_pages {
                 break;
