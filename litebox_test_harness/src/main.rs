@@ -5,7 +5,6 @@
 // agent runtime helpers. Many of the pedantic lints below would
 // require structural refactors that don't improve correctness; the
 // allow list keeps them from blocking warnings-as-errors enforcement.
-#![allow(clippy::empty_line_after_doc_comments)]
 #![allow(clippy::match_same_arms)]
 #![allow(clippy::manual_let_else)]
 #![allow(clippy::while_let_loop)]
@@ -1534,24 +1533,6 @@ fn main() {
     }
 }
 
-/// Minimal reproduction tests for unsupported syscalls that break
-/// VS Code Server's CLI `command-shell` mode inside litebox.
-///
-/// The CLI spawns Node.js which uses `timer_create` for V8's profiling
-/// timers and `rt_sigsuspend` for its signal handling loop.  When these
-/// return errors, the CLI spins in a tight loop and never produces the
-/// `Listening on <port>` output that VS Code's install script expects.
-
-/// Tests for CoW (copy-on-write) memory restoration after vfork.
-///
-/// On litebox's shared-address-space platform, fork() becomes
-/// clone(CLONE_VM|CLONE_VFORK). The parent and child share memory.
-/// A CoW layer tracks child modifications so the parent can restore
-/// its state after the child exits.
-///
-/// These tests verify that the parent's memory is correctly restored
-/// and that post-fork operations work as expected.
-
 /// Minimal capture-pipe fork test: reproduces the exact mechanism bash uses
 /// for `$()`. Creates a pipe, forks, child dup2's write end to stdout and
 /// execs a command, parent reads the output from the read end.
@@ -1820,10 +1801,6 @@ mod capture_pipe_test {
             1
         }
     }
-
-    /// Like nested_fork but skips waitpid on the grandchild.
-    /// This isolates the pipe-data-relay issue from the waitpid-across-
-    /// migration issue.
 
     /// Bash $()-like: fork subshell, subshell forks a pipeline child that
     /// execs cat, subshell waits for pipeline, subshell exits, parent reads
@@ -2210,9 +2187,6 @@ mod netlink_tests {
             1
         }
     }
-
-    /// Mimics glibc's exact getifaddrs flow: sendmsg + recvmsg(PEEK|TRUNC) + recvmsg(0)
-    /// for sequential RTM_GETLINK and RTM_GETADDR requests.
 
     fn test_full() -> i32 {
         let mut ifaddr: *mut libc::ifaddrs = std::ptr::null_mut();
@@ -3495,12 +3469,6 @@ mod unix_socket_tests {
             2
         }
     }
-
-    /// US6d: Nested socketpair+fork+exec via nonpie — reproduces VS Code pattern.
-    /// Uses raw fork+exec to trigger litebox's delayed fork, then the nonpie
-    /// exec triggers exec-on-remote-host. Inside that remote worker,
-    /// socketpair → fork → exec creates the nested delayed fork with IPC fd.
-    ///   fork() → exec(nonpie, socketpair-exec) → socketpair → fork → exec(child) → IPC
 
     fn errno() -> i32 {
         std::io::Error::last_os_error().raw_os_error().unwrap_or(-1)
@@ -4786,8 +4754,6 @@ mod net_tests {
         0
     }
 
-    /// NET3: Full IPv6 loopback: listen + fork + child connects + data exchange.
-
     /// NET4: IPv4 listen+connect baseline (should already work).
     fn test_ipv4_listen() -> i32 {
         let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0) };
@@ -4950,8 +4916,6 @@ mod fs_tests {
             }
         }
     }
-
-    /// Diagnostic: isolate where exec-open-read hangs by logging timestamps.
 
     /// Fork+exec child that writes AND keeps running; parent reads while child alive.
     /// This is the exact pre-warm pattern — tests 9P coherence for open files on remote workers.
