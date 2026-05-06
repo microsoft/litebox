@@ -129,6 +129,16 @@ pub enum Command {
     #[serde(rename = "net_connect")]
     NetConnect { addr: String, data: String },
 
+    /// Connect to addr, write data, shutdown one half of the TCP connection,
+    /// then read echoed data until EOF. `half` must be `"wr"`, `"rd"`, or
+    /// `"rdwr"`; TCP half-close EOF tests use `"wr"`.
+    #[serde(rename = "net_halfclose_echo")]
+    NetHalfCloseEcho {
+        addr: String,
+        write_data: String,
+        half: String,
+    },
+
     /// Forward a command to a named child and return its response.
     #[serde(rename = "forward")]
     Forward { target: String, inner: Box<Command> },
@@ -260,6 +270,14 @@ pub enum Response {
     /// TCP connection + echo result.
     #[serde(rename = "connected")]
     Connected { echo: String },
+
+    /// TCP half-close echo result.
+    #[serde(rename = "halfclosed")]
+    HalfClosed { echo: String },
+
+    /// TCP half-close operation failed.
+    #[serde(rename = "halfclose_failed")]
+    HalfCloseFailed { error: String },
 
     /// TCP connection failed.
     #[serde(rename = "connect_failed")]

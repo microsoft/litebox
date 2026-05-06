@@ -2111,6 +2111,92 @@ pub(crate) fn register_loopback_tcp_tests(reg: &mut Registry<'_>) {
 }
 
 // ═══════════════════════════════════════════════════════════════════
+// THC: TCP half-close EOF
+// ═══════════════════════════════════════════════════════════════════
+
+pub(crate) fn register_tcp_halfclose_tests(reg: &mut Registry<'_>) {
+    #[derive(Clone, Copy)]
+    struct Case {
+        id: &'static str,
+        server: AgentName,
+        client: AgentName,
+        payload: &'static str,
+    }
+
+    let cases = [
+        Case {
+            id: "THC.halfclose.eof.same_agent",
+            server: AgentName::A,
+            client: AgentName::A,
+            payload: "THC_SAME_AGENT_PAYLOAD",
+        },
+        Case {
+            id: "THC.halfclose.eof.cross_agent",
+            server: AgentName::A,
+            client: AgentName::B,
+            payload: "THC_CROSS_AGENT_PAYLOAD",
+        },
+        Case {
+            id: "THC.halfclose.eof.sibling",
+            server: AgentName::AA,
+            client: AgentName::AB,
+            payload: "THC_SIBLING_PAYLOAD",
+        },
+        Case {
+            id: "THC.halfclose.eof.depth2",
+            server: AgentName::AAA,
+            client: AgentName::AAB,
+            payload: "THC_DEPTH2_PAYLOAD",
+        },
+    ];
+
+    for case in cases {
+        let server_label = case.server.to_string();
+        let client_label = case.client.to_string();
+        reg.test("matrix", "tcp_halfclose", case.id)
+            .timeout(60)
+            .build(move |cx| {
+                let server = cx.require(case.server);
+                let client = cx.require(case.client);
+                Box::new(move |run| {
+                    let agent_label = format!("{server_label}->{client_label}");
+                    let payload = case.payload.to_string();
+                    Box::pin(async move {
+                        let listen_resp = run.send(&server, Command::NetListen { port: 0 }).await;
+                        let port = match &listen_resp {
+                            Response::Listening { port } => *port,
+                            _ => {
+                                return super::TestOutcome::new(
+                                    &agent_label,
+                                    false,
+                                    format!("listen failed: {listen_resp:?}"),
+                                );
+                            }
+                        };
+
+                        let halfclose_resp = run
+                            .send(
+                                &client,
+                                Command::NetHalfCloseEcho {
+                                    addr: format!("127.0.0.1:{port}"),
+                                    write_data: payload.clone(),
+                                    half: "wr".into(),
+                                },
+                            )
+                            .await;
+                        let _ = run.send(&server, Command::NetUnlisten { port }).await;
+                        let pass = matches!(
+                            &halfclose_resp,
+                            Response::HalfClosed { echo } if echo == &payload
+                        );
+                        super::TestOutcome::new(&agent_label, pass, format!("{halfclose_resp:?}"))
+                    })
+                })
+            });
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
 // FKLC: fork-listen-close — VS Code CLI pattern
 // ═══════════════════════════════════════════════════════════════════
 

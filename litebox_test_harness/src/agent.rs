@@ -18,6 +18,40 @@ struct ChildHandle {
     process: tokio::process::Child,
 }
 
+fn net_halfclose_echo_blocking(addr: &str, write_data: &str, half: &str) -> Result<String, String> {
+    use std::io::{Read, Write};
+    use std::net::Shutdown;
+    use std::time::Duration as StdDuration;
+
+    let mut stream = std::net::TcpStream::connect(addr).map_err(|e| format!("connect: {e}"))?;
+    stream
+        .set_read_timeout(Some(StdDuration::from_secs(5)))
+        .map_err(|e| format!("set read timeout: {e}"))?;
+    stream
+        .set_write_timeout(Some(StdDuration::from_secs(5)))
+        .map_err(|e| format!("set write timeout: {e}"))?;
+    stream
+        .write_all(write_data.as_bytes())
+        .map_err(|e| format!("write: {e}"))?;
+    stream.flush().map_err(|e| format!("flush: {e}"))?;
+
+    let shutdown = match half {
+        "wr" => Shutdown::Write,
+        "rd" => Shutdown::Read,
+        "rdwr" => Shutdown::Both,
+        other => return Err(format!("invalid half {other:?}; expected wr, rd, or rdwr")),
+    };
+    stream
+        .shutdown(shutdown)
+        .map_err(|e| format!("shutdown({half}): {e}"))?;
+
+    let mut received = Vec::new();
+    stream
+        .read_to_end(&mut received)
+        .map_err(|e| format!("read_to_eof: {e}"))?;
+    Ok(String::from_utf8_lossy(&received).to_string())
+}
+
 /// Run the agent. Reads commands from stdin, executes, responds on stdout.
 pub fn run(self_exe: &str) {
     tokio::runtime::Builder::new_current_thread()
@@ -307,11 +341,7 @@ async fn agent_loop(self_exe: &str) {
                                         match stream.read(&mut buf).await {
                                             Ok(0) | Err(_) => break,
                                             Ok(n) => {
-                                                if stream
-                                                    .write_all(&buf[..n])
-                                                    .await
-                                                    .is_err()
-                                                {
+                                                if stream.write_all(&buf[..n]).await.is_err() {
                                                     break;
                                                 }
                                             }
@@ -374,6 +404,36 @@ async fn agent_loop(self_exe: &str) {
                     Err(_) => {
                         respond(&Response::ConnectFailed {
                             error: "connect timeout".to_string(),
+                        })
+                        .await;
+                    }
+                }
+            }
+
+            Command::NetHalfCloseEcho {
+                addr,
+                write_data,
+                half,
+            } => {
+                let result = tokio::time::timeout(
+                    Duration::from_secs(10),
+                    tokio::task::spawn_blocking(move || {
+                        net_halfclose_echo_blocking(&addr, &write_data, &half)
+                    }),
+                )
+                .await;
+                match result {
+                    Ok(Ok(Ok(echo))) => respond(&Response::HalfClosed { echo }).await,
+                    Ok(Ok(Err(error))) => respond(&Response::HalfCloseFailed { error }).await,
+                    Ok(Err(e)) => {
+                        respond(&Response::HalfCloseFailed {
+                            error: format!("halfclose task join: {e}"),
+                        })
+                        .await;
+                    }
+                    Err(_) => {
+                        respond(&Response::HalfCloseFailed {
+                            error: "halfclose timeout".to_string(),
                         })
                         .await;
                     }
@@ -539,11 +599,7 @@ async fn agent_loop(self_exe: &str) {
                                         match stream.read(&mut buf).await {
                                             Ok(0) | Err(_) => break,
                                             Ok(n) => {
-                                                if stream
-                                                    .write_all(&buf[..n])
-                                                    .await
-                                                    .is_err()
-                                                {
+                                                if stream.write_all(&buf[..n]).await.is_err() {
                                                     break;
                                                 }
                                             }
