@@ -14,6 +14,7 @@ pub mod test_registry;
 ///
 /// In Docker: bind-mounted at `/opt/nonpie/litebox_test_harness`.
 /// Locally: sibling of current exe with `_nonpie` or `-nonpie` suffix.
+#[must_use]
 pub fn find_nonpie_binary() -> Option<String> {
     let candidates: &[&str] = &[
         "/opt/nonpie/litebox_test_harness",

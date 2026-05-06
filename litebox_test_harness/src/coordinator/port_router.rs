@@ -9,7 +9,7 @@
 //! inherit the listen socket fd), and the children exit. Connections
 //! to the port must still succeed after the children die.
 //!
-//! The port router ownership fix (worker_id tracking) prevents a
+//! The port router ownership fix (`worker_id` tracking) prevents a
 //! re-registering child from deregistering the parent's route on exit.
 
 use super::agents::{AgentName, SpawnKind};
@@ -191,6 +191,7 @@ fn register_fork_cross_tests(reg: &mut Registry<'_>) {
         });
 }
 
+#[allow(clippy::similar_names)] // `post` vs `port`: distinct test fixture names.
 fn register_fork_interleave_tests(reg: &mut Registry<'_>) {
     let port = 18230u16;
 
@@ -307,6 +308,7 @@ fn register_fork_background_tests(reg: &mut Registry<'_>) {
         });
 }
 
+#[allow(clippy::too_many_lines)] // exhaustive registration / runner
 fn register_fork_listen_inherit_tests(reg: &mut Registry<'_>) {
     // PR.listen_inherit_self
     reg.test("stress", "port_router", "PR.listen_inherit_self")

@@ -8,7 +8,8 @@
 /// - None -> run everything
 /// - Some("fork") -> run all groups in fork suite
 /// - Some("fork,shell") -> run all groups in fork and shell suites
-/// - Some("fork.exit_data_integrity") -> run only that group
+/// - `Some("fork.exit_data_integrity`") -> run only that group
+#[must_use]
 pub fn matches_filter(filter: Option<&str>, suite: &str, group: &str) -> bool {
     match filter {
         None => true,

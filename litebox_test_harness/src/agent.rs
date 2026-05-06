@@ -27,6 +27,7 @@ pub fn run(self_exe: &str) {
         .block_on(agent_loop(self_exe));
 }
 
+#[allow(clippy::too_many_lines)] // exhaustive runner / dispatch table
 async fn agent_loop(self_exe: &str) {
     let stdin = tokio::io::stdin();
     let mut reader = BufReader::new(stdin);
@@ -81,9 +82,7 @@ async fn agent_loop(self_exe: &str) {
 
             Command::SpawnRemote { children: names } => {
                 // Use the non-PIE binary to force remote worker migration.
-                let remote_exe = if let Some(p) = crate::find_nonpie_binary() {
-                    p
-                } else {
+                let Some(remote_exe) = crate::find_nonpie_binary() else {
                     respond(&Response::Error {
                         error: "nonpie binary not found".to_string(),
                     })
@@ -310,29 +309,24 @@ async fn agent_loop(self_exe: &str) {
                         let actual_port = listener.local_addr().map(|a| a.port()).unwrap_or(port);
                         // Spawn echo server task.
                         let task = tokio::spawn(async move {
-                            loop {
-                                match listener.accept().await {
-                                    Ok((mut stream, _)) => {
-                                        tokio::spawn(async move {
-                                            let mut buf = [0u8; 4096];
-                                            loop {
-                                                match stream.read(&mut buf).await {
-                                                    Ok(0) | Err(_) => break,
-                                                    Ok(n) => {
-                                                        if stream
-                                                            .write_all(&buf[..n])
-                                                            .await
-                                                            .is_err()
-                                                        {
-                                                            break;
-                                                        }
-                                                    }
+                            while let Ok((mut stream, _)) = listener.accept().await {
+                                tokio::spawn(async move {
+                                    let mut buf = [0u8; 4096];
+                                    loop {
+                                        match stream.read(&mut buf).await {
+                                            Ok(0) | Err(_) => break,
+                                            Ok(n) => {
+                                                if stream
+                                                    .write_all(&buf[..n])
+                                                    .await
+                                                    .is_err()
+                                                {
+                                                    break;
                                                 }
                                             }
-                                        });
+                                        }
                                     }
-                                    Err(_) => break,
-                                }
+                                });
                             }
                         });
                         listeners.insert(actual_port, task);
@@ -547,29 +541,24 @@ async fn agent_loop(self_exe: &str) {
                 match tokio::net::UnixListener::bind(&path) {
                     Ok(listener) => {
                         let task = tokio::spawn(async move {
-                            loop {
-                                match listener.accept().await {
-                                    Ok((mut stream, _)) => {
-                                        tokio::spawn(async move {
-                                            let mut buf = [0u8; 4096];
-                                            loop {
-                                                match stream.read(&mut buf).await {
-                                                    Ok(0) | Err(_) => break,
-                                                    Ok(n) => {
-                                                        if stream
-                                                            .write_all(&buf[..n])
-                                                            .await
-                                                            .is_err()
-                                                        {
-                                                            break;
-                                                        }
-                                                    }
+                            while let Ok((mut stream, _)) = listener.accept().await {
+                                tokio::spawn(async move {
+                                    let mut buf = [0u8; 4096];
+                                    loop {
+                                        match stream.read(&mut buf).await {
+                                            Ok(0) | Err(_) => break,
+                                            Ok(n) => {
+                                                if stream
+                                                    .write_all(&buf[..n])
+                                                    .await
+                                                    .is_err()
+                                                {
+                                                    break;
                                                 }
                                             }
-                                        });
+                                        }
                                     }
-                                    Err(_) => break,
-                                }
+                                });
                             }
                         });
                         unix_listeners.insert(path.clone(), task);
@@ -785,14 +774,13 @@ async fn agent_loop(self_exe: &str) {
                     let addr = addr.clone();
                     let data = data.clone();
                     handles.push(tokio::spawn(async move {
-                        let mut stream = match tokio::time::timeout(
+                        let Ok(Ok(mut stream)) = tokio::time::timeout(
                             Duration::from_secs(5),
                             tokio::net::TcpStream::connect(&addr),
                         )
                         .await
-                        {
-                            Ok(Ok(s)) => s,
-                            _ => return false,
+                        else {
+                            return false;
                         };
                         if stream.write_all(data.as_bytes()).await.is_err() {
                             return false;
