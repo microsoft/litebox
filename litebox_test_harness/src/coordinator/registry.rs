@@ -56,8 +56,8 @@ impl RegistrationContext {
 }
 
 /// Builder for a single test. Created by [`Registry::test`].
-pub struct TestBuilder<'a> {
-    registry: &'a mut Registry,
+pub struct TestBuilder<'b, 'a: 'b> {
+    registry: &'b mut Registry<'a>,
     suite: &'static str,
     group: &'static str,
     id: String,
@@ -65,7 +65,7 @@ pub struct TestBuilder<'a> {
     timeout_secs: u64,
 }
 
-impl<'a> TestBuilder<'a> {
+impl<'b, 'a: 'b> TestBuilder<'b, 'a> {
     /// Override the per-test timeout (default: 60 seconds).
     pub fn timeout(mut self, secs: u64) -> Self {
         self.timeout_secs = secs;
@@ -121,16 +121,18 @@ impl<'a> TestBuilder<'a> {
     }
 }
 
-/// Sink for registered tests. A `Registry` is created by the
-/// coordinator's collect-all-tests routine and passed to each
-/// suite's `register_*` function.
-pub struct Registry {
-    pub(super) tests: Vec<Test>,
+/// Sink for registered tests. Borrows the destination `Vec<Test>`
+/// owned by the coordinator's `collect_all_tests` driver, so a
+/// `register_<suite>(&mut reg)` call site composes naturally with
+/// the legacy `register_<suite>(&mut tests)` call sites that haven't
+/// migrated yet.
+pub struct Registry<'a> {
+    pub(super) tests: &'a mut Vec<Test>,
 }
 
-impl Registry {
-    pub(super) fn new() -> Self {
-        Self { tests: Vec::new() }
+impl<'a> Registry<'a> {
+    pub(super) fn new(tests: &'a mut Vec<Test>) -> Self {
+        Self { tests }
     }
 
     /// Begin registering a test with the given suite/group/id.
@@ -141,7 +143,7 @@ impl Registry {
         suite: &'static str,
         group: &'static str,
         id: impl Into<String>,
-    ) -> TestBuilder<'_> {
+    ) -> TestBuilder<'_, 'a> {
         TestBuilder {
             registry: self,
             suite,

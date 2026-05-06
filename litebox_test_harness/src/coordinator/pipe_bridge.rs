@@ -16,22 +16,25 @@
 //!   - Count: single pipe, multiple pipes
 //!   - Agent topology: various depths (A, AA, B, NP, D4)
 
+use super::agents::AgentName;
+use super::registry::Registry;
+
 /// Agents for pipe bridge tests.  Includes depths 1-2 and the
 /// non-PIE worker agent (NP) to test nested worker-exec.
-const PB_AGENTS: &[&str] = &["A", "AA", "B"];
+const PB_AGENTS: &[AgentName] = &[AgentName::A, AgentName::AA, AgentName::B];
 
-pub(crate) fn register_pipe_bridge(tests: &mut Vec<super::Test>) {
+pub(crate) fn register_pipe_bridge(reg: &mut Registry<'_>) {
     struct PbCase {
         mode: &'static str,
         subcmd: &'static str,
         use_nonpie: bool,
         extra_args: &'static [&'static str],
         expected: &'static str,
-        agents: &'static [&'static str],
+        agents: &'static [AgentName],
         timeout: u64,
     }
 
-    const XWORKER_AGENTS: &[&str] = &["NP", "D4"];
+    const XWORKER_AGENTS: &[AgentName] = &[AgentName::NP, AgentName::D4];
 
     let cases: &[PbCase] = &[
         PbCase {
@@ -183,49 +186,46 @@ pub(crate) fn register_pipe_bridge(tests: &mut Vec<super::Test>) {
     for case in cases {
         for &agent in case.agents {
             let id = format!("PB.{}.{agent}", case.mode);
-            let agent_s = agent.to_string();
             let subcmd = case.subcmd.to_string();
             let use_nonpie = case.use_nonpie;
             let extra: Vec<String> = case.extra_args.iter().map(|s| s.to_string()).collect();
             let expected = case.expected.to_string();
             let timeout = case.timeout;
+            let agent_label = agent.to_string();
 
-            tests.push(super::Test {
-                suite: "xworker",
-                group: "pipe_bridge",
-                id,
-                xfail: None,
-                timeout_secs: 90,
-                declared_agents: Vec::new(),
-                run: Box::new(move |r| {
-                    let self_exe = r.self_exe.clone();
-                    Box::pin(async move {
-                        let child_bin = if use_nonpie {
-                            match crate::find_nonpie_binary() {
-                                Some(p) => p,
-                                None => {
-                                    return super::TestOutcome::new(
-                                        &agent_s,
-                                        false,
-                                        "FAIL: nonpie binary not found",
-                                    );
+            reg.test("xworker", "pipe_bridge", id)
+                .timeout(90)
+                .build(move |cx| {
+                    let handle = cx.require(agent);
+                    Box::new(move |run| {
+                        Box::pin(async move {
+                            let self_exe = run.self_exe().to_string();
+                            let child_bin = if use_nonpie {
+                                match crate::find_nonpie_binary() {
+                                    Some(p) => p,
+                                    None => {
+                                        return super::TestOutcome::new(
+                                            &agent_label,
+                                            false,
+                                            "FAIL: nonpie binary not found",
+                                        );
+                                    }
                                 }
-                            }
-                        } else {
-                            self_exe.clone()
-                        };
-                        let mut args = vec![self_exe, "pipe-test".into(), subcmd, child_bin];
-                        args.extend(extra);
-                        let resp = r.send(&agent_s, super::exec_timeout(args, timeout)).await;
-                        let pass = matches!(
-                            &resp,
-                            crate::protocol::Response::ExecResult { exit_code: 0, stdout, .. }
-                                if stdout.contains(&*expected)
-                        );
-                        super::TestOutcome::new(&agent_s, pass, format!("{resp:?}"))
+                            } else {
+                                self_exe.clone()
+                            };
+                            let mut args = vec![self_exe, "pipe-test".into(), subcmd, child_bin];
+                            args.extend(extra);
+                            let resp = run.send(&handle, super::exec_timeout(args, timeout)).await;
+                            let pass = matches!(
+                                &resp,
+                                crate::protocol::Response::ExecResult { exit_code: 0, stdout, .. }
+                                    if stdout.contains(&*expected)
+                            );
+                            super::TestOutcome::new(&agent_label, pass, format!("{resp:?}"))
+                        })
                     })
-                }),
-            });
+                });
         }
     }
 }

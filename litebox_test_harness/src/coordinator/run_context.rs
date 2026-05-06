@@ -36,6 +36,12 @@ impl<'a> RunContext<'a> {
         Self { runner }
     }
 
+    /// Path to the self-executable that test code can pass to its
+    /// `Exec` commands as the binary to spawn.
+    pub fn self_exe(&self) -> &str {
+        &self.runner.self_exe
+    }
+
     /// Send a protocol command to the agent identified by `handle`,
     /// returning its response.
     pub async fn send(&mut self, handle: &AgentHandle, cmd: Command) -> Response {
