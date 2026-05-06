@@ -24,6 +24,8 @@ use std::fmt;
 /// the protocol's `Forward { target, .. }` field.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum AgentName {
+    /// The coordinator process itself (local `init` target).
+    Init,
     A,
     AA,
     AB,
@@ -41,6 +43,7 @@ impl AgentName {
     /// Wire-level name used in protocol commands.
     pub const fn name(self) -> &'static str {
         match self {
+            AgentName::Init => "init",
             AgentName::A => "A",
             AgentName::AA => "AA",
             AgentName::AB => "AB",
@@ -61,7 +64,7 @@ impl AgentName {
     /// declared set into the full set of agents that must be alive.
     pub const fn ancestors(self) -> &'static [AgentName] {
         match self {
-            AgentName::A | AgentName::B => &[],
+            AgentName::Init | AgentName::A | AgentName::B => &[],
             AgentName::AA | AgentName::AB => &[AgentName::A],
             AgentName::AAA | AgentName::AAB => &[AgentName::A, AgentName::AA],
             AgentName::NP => &[AgentName::A],

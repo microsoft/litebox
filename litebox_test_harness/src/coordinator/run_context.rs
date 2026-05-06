@@ -45,6 +45,9 @@ impl<'a> RunContext<'a> {
     /// Send a protocol command to the agent identified by `handle`,
     /// returning its response.
     pub async fn send(&mut self, handle: &AgentHandle, cmd: Command) -> Response {
+        if handle.name().name() == "init" {
+            return self.runner.exec_local(&cmd).await;
+        }
         self.runner.send(handle.name().name(), cmd).await
     }
 
