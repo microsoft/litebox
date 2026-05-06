@@ -798,7 +798,7 @@ pub(crate) fn register_fork_matrix(reg: &mut Registry<'_>) {
                     let pass = matches!(
                         &resp2,
                         crate::protocol::Response::ExecResult { exit_code: 0, stdout, .. }
-                            if stdout == "ECHO_TEST_OK"
+                            if stdout.trim() == "ECHO_TEST_OK"
                     );
                     super::TestOutcome::new("A", pass, format!("{resp2:?}"))
                 })

@@ -676,7 +676,7 @@ fn register_canary(reg: &mut registry::Registry<'_>) {
                     let pass = matches!(
                         &resp,
                         crate::protocol::Response::ExecResult { exit_code: 0, stdout, .. }
-                            if stdout == "ECHO_TEST_OK"
+                            if stdout.trim() == "ECHO_TEST_OK"
                     );
                     TestOutcome::new("A", pass, format!("{resp:?}"))
                 })
@@ -718,6 +718,7 @@ pub fn collect_all_tests() -> Vec<Test> {
     special_cases::register_fs_io(&mut registry::Registry::new(&mut tests));
     special_cases::register_capture_pipe(&mut registry::Registry::new(&mut tests));
     special_cases::register_stdin_script(&mut registry::Registry::new(&mut tests));
+    special_cases::register_xsi_stdin_script(&mut registry::Registry::new(&mut tests));
     matrix::register_matrix(&mut registry::Registry::new(&mut tests));
     platform_fixes::register_poll_ready_tests(&mut registry::Registry::new(&mut tests));
     platform_fixes::register_bind_getsockname_tests(&mut registry::Registry::new(&mut tests));
