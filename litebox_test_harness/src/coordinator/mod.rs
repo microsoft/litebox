@@ -673,17 +673,17 @@ fn matches_test(filter: Option<&str>, test: &Test) -> bool {
 pub fn collect_all_tests() -> Vec<Test> {
     let mut tests: Vec<Test> = Vec::new();
     register_canary(&mut tests);
-    special_cases::register_netlink(&mut tests);
+    special_cases::register_netlink(&mut registry::Registry::new(&mut tests));
     concurrent_fork::register_concurrent_fork_pipeline(&mut tests);
     concurrent_fork::register_concurrent_exec(&mut tests);
     concurrent_fork::register_vscode_install_pipeline(&mut tests);
     concurrent_fork::register_concurrent_fs_rwlock(&mut tests);
-    special_cases::register_net_ipv6(&mut tests);
-    special_cases::register_terminal_ioctl(&mut tests);
-    special_cases::register_node_exit(&mut tests);
-    special_cases::register_fs_io(&mut tests);
-    special_cases::register_capture_pipe(&mut tests);
-    special_cases::register_stdin_script(&mut tests);
+    special_cases::register_net_ipv6(&mut registry::Registry::new(&mut tests));
+    special_cases::register_terminal_ioctl(&mut registry::Registry::new(&mut tests));
+    special_cases::register_node_exit(&mut registry::Registry::new(&mut tests));
+    special_cases::register_fs_io(&mut registry::Registry::new(&mut tests));
+    special_cases::register_capture_pipe(&mut registry::Registry::new(&mut tests));
+    special_cases::register_stdin_script(&mut registry::Registry::new(&mut tests));
     matrix::register_matrix(&mut tests);
     tests.extend(platform_fixes::register_poll_ready_tests());
     tests.extend(platform_fixes::register_bind_getsockname_tests());
@@ -708,14 +708,14 @@ pub fn collect_all_tests() -> Vec<Test> {
     tests.extend(platform_fixes::register_proc_filesystem_tests());
     tests.extend(platform_fixes::register_subtree_kill_tests());
     fork_matrix::register_fork_matrix(&mut tests);
-    special_cases::register_unix_socket(&mut tests);
-    special_cases::register_cross_worker(&mut tests);
-    special_cases::register_pipe_eof(&mut tests);
+    special_cases::register_unix_socket(&mut registry::Registry::new(&mut tests));
+    special_cases::register_cross_worker(&mut registry::Registry::new(&mut tests));
+    special_cases::register_pipe_eof(&mut registry::Registry::new(&mut tests));
     pipe_bridge::register_pipe_bridge(&mut registry::Registry::new(&mut tests));
     tcp_stress::register_tcp_stress(&mut tests);
     file_tcp::register_file_tcp(&mut tests);
     port_router::register_port_router(&mut tests);
-    special_cases::register_contamination_sequence(&mut tests);
+    special_cases::register_contamination_sequence(&mut registry::Registry::new(&mut tests));
     tests
 }
 
