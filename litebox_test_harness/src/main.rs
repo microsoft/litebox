@@ -1157,11 +1157,6 @@ fn main() {
                 libc::close(epfd);
             }
         }
-        "slow-echo" => {
-            // Sleeps 3 seconds then prints, simulating a slow-starting server.
-            std::thread::sleep(std::time::Duration::from_secs(3));
-            println!("SLOW_ECHO_OK");
-        }
         "pipe-nonblock" => {
             // Test pipe F_SETFL O_NONBLOCK behavior.
             // Creates a pipe, sets the read end to non-blocking, then verifies:
@@ -1662,6 +1657,7 @@ fn main() {
                     writeln!(f, "line{i}").unwrap();
                 }
                 f.flush().unwrap();
+                eprintln!("[cross-worker-file] READY");
                 if sub == "write-and-hold" {
                     // Keep the fd OPEN (like VS Code CLI does with its log).
                     std::thread::sleep(std::time::Duration::from_secs(10));
@@ -1682,6 +1678,7 @@ fn main() {
                     println!("line{i}");
                 }
                 std::io::stdout().flush().unwrap();
+                eprintln!("[cross-worker-file] READY");
                 // Stay alive so parent can read the file concurrently.
                 std::thread::sleep(std::time::Duration::from_secs(10));
                 std::process::exit(0);

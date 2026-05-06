@@ -1046,6 +1046,22 @@ pub(crate) async fn send_cmd(child: &mut Child, cmd: &Command) -> Response {
                 Command::Exec {
                     timeout_secs: Some(t),
                     ..
+                }
+                | Command::ExecReady {
+                    timeout_secs: Some(t),
+                    ..
+                }
+                | Command::WaitReady {
+                    timeout_secs: Some(t),
+                    ..
+                }
+                | Command::WaitBackground {
+                    timeout_secs: Some(t),
+                    ..
+                }
+                | Command::WaitFor {
+                    timeout_secs: Some(t),
+                    ..
                 } => break Some(*t),
                 Command::Spawn { .. } | Command::SpawnRemote { .. } => break Some(60),
                 _ => break None,

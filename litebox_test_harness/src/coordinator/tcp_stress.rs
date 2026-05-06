@@ -385,21 +385,22 @@ fn register_tcp_fullduplex_tests(reg: &mut Registry<'_>) {
                         let server_resp = run
                             .send(
                                 &handle,
-                                crate::protocol::Command::Exec {
+                                crate::protocol::Command::ExecReady {
                                     args: vec![
                                         self_exe.clone(),
                                         "tcp-fullduplex".into(),
                                         p.to_string(),
                                         TF_SIZE.to_string(),
                                     ],
+                                    ready_marker: "[tcp-fullduplex] listening".into(),
                                     timeout_secs: Some(30),
                                     stdin: None,
-                                    background: true,
+                                    stream: "stderr".into(),
                                 },
                             )
                             .await;
                         let server_pid = match &server_resp {
-                            crate::protocol::Response::Background { pid } => Some(*pid),
+                            crate::protocol::Response::BackgroundReady { pid } => Some(*pid),
                             _ => {
                                 return super::TestOutcome::new(
                                     &agent_label,
@@ -408,7 +409,6 @@ fn register_tcp_fullduplex_tests(reg: &mut Registry<'_>) {
                                 );
                             }
                         };
-                        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
                         let client_resp = run
                             .send(
                                 &handle,
