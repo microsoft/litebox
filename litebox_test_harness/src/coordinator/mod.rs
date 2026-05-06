@@ -403,22 +403,22 @@ impl TestRunner {
         for &name in &["NP", "NPC", "D3", "D4", "D5"] {
             self.spawned_agents.insert(name.to_string());
         }
-        let has_nonpie = crate::find_nonpie_binary().is_some();
-        if has_nonpie {
-            // Broker caches the rewritten binary, so this is fast after
-            // the first SpawnRemote. Timeout catches the known NP→NPC
-            // pipe bridge hang (vfork Pollee observer bug). Retried on
-            // each rebuild since a fresh tree may succeed.
-            if tokio::time::timeout(Duration::from_secs(30), self.spawn_nonpie_subtree())
-                .await
-                .is_err()
-            {
-                eprintln!(
-                    "[coord] non-PIE subtree setup timed out (30s, likely pipe bridge bug) — continuing without NP/D4"
-                );
-            }
-        } else {
-            eprintln!("[coord] non-PIE binary not found — mount at /opt/nonpie");
+        // Required dependency: panic now with a clear message rather
+        // than silently skipping the subtree spawn and letting tests
+        // fail with confusing "no child NP" routing errors several
+        // seconds later.
+        let _ = crate::nonpie_binary();
+        // Broker caches the rewritten binary, so this is fast after
+        // the first SpawnRemote. Timeout catches the known NP→NPC
+        // pipe bridge hang (vfork Pollee observer bug). Retried on
+        // each rebuild since a fresh tree may succeed.
+        if tokio::time::timeout(Duration::from_secs(30), self.spawn_nonpie_subtree())
+            .await
+            .is_err()
+        {
+            eprintln!(
+                "[coord] non-PIE subtree setup timed out (30s, likely pipe bridge bug) — continuing without NP/D4"
+            );
         }
     }
 

@@ -66,7 +66,6 @@
 mod agent;
 mod agent_listen;
 use litebox_test_harness::coordinator;
-use litebox_test_harness::find_nonpie_binary;
 use litebox_test_harness::protocol;
 
 use std::io::Write as _;
@@ -1004,7 +1003,12 @@ fn main() {
             let mode = args.get(3).map_or("pie", String::as_str);
             let use_tokio = args.get(4).map(String::as_str) == Some("tokio");
             let mut failures = 0;
-            let nonpie_bin = find_nonpie_binary().unwrap_or_default();
+            // Lazy: only pay the panic if mode actually needs it.
+            let nonpie_bin: String = if matches!(mode, "nonpie" | "mixed") {
+                litebox_test_harness::nonpie_binary()
+            } else {
+                String::new()
+            };
             println!("STRESS_START mode={mode} count={count} tokio={use_tokio}");
             if use_tokio {
                 let rt = tokio::runtime::Builder::new_current_thread()
@@ -4877,10 +4881,7 @@ mod fs_tests {
                 .args(["fs-test", "do-write", path, data])
                 .output(),
             "nonpie" => {
-                let Some(bin) = crate::find_nonpie_binary() else {
-                    println!("FS_ERR:op=exec-write,bin=nonpie,err=nonpie binary not found");
-                    return 1;
-                };
+                let bin = litebox_test_harness::nonpie_binary();
                 std::process::Command::new(&bin)
                     .args(["fs-test", "do-write", path, data])
                     .output()
@@ -4937,14 +4938,7 @@ mod fs_tests {
 
         let bin = match bin_type {
             "pie" => self_exe.to_string(),
-            "nonpie" => {
-                if let Some(b) = crate::find_nonpie_binary() {
-                    b
-                } else {
-                    println!("FS_ERR:op=exec-open-read,bin=nonpie,err=nonpie binary not found");
-                    return 1;
-                }
-            }
+            "nonpie" => litebox_test_harness::nonpie_binary(),
             other => {
                 println!("FS_ERR:op=exec-open-read,unknown_bin_type={other}");
                 return 1;

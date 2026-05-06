@@ -82,13 +82,13 @@ async fn agent_loop(self_exe: &str) {
 
             Command::SpawnRemote { children: names } => {
                 // Use the non-PIE binary to force remote worker migration.
-                let Some(remote_exe) = crate::find_nonpie_binary() else {
-                    respond(&Response::Error {
-                        error: "nonpie binary not found".to_string(),
-                    })
-                    .await;
-                    continue;
-                };
+                // Required dependency: panic if missing rather than
+                // returning Response::Error — the registration system
+                // ensures only tests that declared a NonPie ephemeral
+                // reach this command, so a missing binary at this
+                // point indicates a setup error that should surface
+                // loudly.
+                let remote_exe = litebox_test_harness::nonpie_binary();
                 for name in &names {
                     match spawn_child(&remote_exe, name) {
                         Ok(handle) => {
@@ -119,17 +119,8 @@ async fn agent_loop(self_exe: &str) {
                 inherit_listen_ports,
             } => {
                 let exe = match binary.as_str() {
-                    "nonpie" => {
-                        if let Some(p) = crate::find_nonpie_binary() {
-                            p
-                        } else {
-                            respond(&Response::Error {
-                                error: "nonpie binary not found".to_string(),
-                            })
-                            .await;
-                            continue;
-                        }
-                    }
+                    // Required dependency; panic for clarity (see SpawnRemote handler).
+                    "nonpie" => litebox_test_harness::nonpie_binary(),
                     _ => self_exe.to_string(), // "self" or default
                 };
 
