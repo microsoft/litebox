@@ -2406,9 +2406,11 @@ pub(crate) fn register_subtree_kill_tests(reg: &mut Registry<'_>) {
         "SK.subtree.direct_nonpie".to_string(),
     )
     .timeout(SK_TEST_TIMEOUT_SECS)
-    .build(move |_cx| {
+    .build(move |cx| {
+        let e = cx.require(AgentName::E);
+        let _np = cx.require(AgentName::NP);
         Box::new(move |run| {
-            let self_exe = run.self_exe().to_string();
+            let e = e.clone();
             Box::pin(async move {
                 if crate::find_nonpie_binary().is_none() {
                     return super::TestOutcome::new(
@@ -2417,22 +2419,22 @@ pub(crate) fn register_subtree_kill_tests(reg: &mut Registry<'_>) {
                         "FAIL: nonpie binary not found — mount at /opt/nonpie",
                     );
                 }
-                run_subtree_kill(&self_exe, |e| {
-                    Box::pin(async move {
-                        let r = super::send_cmd(
-                            e,
-                            &Command::SpawnRemote {
-                                children: vec!["NPx".into()],
-                            },
-                        )
-                        .await;
-                        if !matches!(r, Response::Ok { .. }) {
-                            return Err(format!("SpawnRemote failed: {r:?}"));
-                        }
-                        Ok(())
-                    })
-                })
-                .await
+                let r = run
+                    .send(
+                        &e,
+                        Command::SpawnRemote {
+                            children: vec!["NPx".into()],
+                        },
+                    )
+                    .await;
+                if !matches!(r, Response::Ok { .. }) {
+                    return super::TestOutcome::new(
+                        "E",
+                        false,
+                        format!("setup: SpawnRemote(NPx) failed: {r:?}"),
+                    );
+                }
+                run_subtree_kill(run, &e).await
             })
         })
     });
@@ -2447,9 +2449,13 @@ pub(crate) fn register_subtree_kill_tests(reg: &mut Registry<'_>) {
         "SK.subtree.deep_nonpie".to_string(),
     )
     .timeout(SK_TEST_TIMEOUT_SECS)
-    .build(move |_cx| {
+    .build(move |cx| {
+        let e = cx.require(AgentName::E);
+        let ee = cx.require(AgentName::EE);
+        let _np = cx.require(AgentName::NP);
         Box::new(move |run| {
-            let self_exe = run.self_exe().to_string();
+            let e = e.clone();
+            let ee = ee.clone();
             Box::pin(async move {
                 if crate::find_nonpie_binary().is_none() {
                     return super::TestOutcome::new(
@@ -2458,35 +2464,25 @@ pub(crate) fn register_subtree_kill_tests(reg: &mut Registry<'_>) {
                         "FAIL: nonpie binary not found — mount at /opt/nonpie",
                     );
                 }
-                run_subtree_kill(&self_exe, |e| {
-                    Box::pin(async move {
-                        let r = super::send_cmd(
-                            e,
-                            &Command::Spawn {
-                                children: vec!["EE".into()],
-                            },
-                        )
-                        .await;
-                        if !matches!(r, Response::Ok { .. }) {
-                            return Err(format!("Spawn EE failed: {r:?}"));
-                        }
-                        let r = super::send_cmd(
-                            e,
-                            &Command::Forward {
-                                target: "EE".into(),
-                                inner: Box::new(Command::SpawnRemote {
-                                    children: vec!["NPx".into()],
-                                }),
-                            },
-                        )
-                        .await;
-                        if !matches!(r, Response::Ok { .. }) {
-                            return Err(format!("EE.SpawnRemote(NPx) failed: {r:?}"));
-                        }
-                        Ok(())
-                    })
-                })
-                .await
+                // EE was already spawned under E by spawn_tree when
+                // the test declared AgentName::EE. Just ask EE to
+                // SpawnRemote NPx as its non-PIE descendant.
+                let r = run
+                    .send(
+                        &ee,
+                        Command::SpawnRemote {
+                            children: vec!["NPx".into()],
+                        },
+                    )
+                    .await;
+                if !matches!(r, Response::Ok { .. }) {
+                    return super::TestOutcome::new(
+                        "E",
+                        false,
+                        format!("setup: EE.SpawnRemote(NPx) failed: {r:?}"),
+                    );
+                }
+                run_subtree_kill(run, &e).await
             })
         })
     });
@@ -2504,9 +2500,11 @@ pub(crate) fn register_subtree_kill_tests(reg: &mut Registry<'_>) {
         "SK.subtree.exit_then_kill".to_string(),
     )
     .timeout(SK_TEST_TIMEOUT_SECS)
-    .build(move |_cx| {
+    .build(move |cx| {
+        let e = cx.require(AgentName::E);
+        let _np = cx.require(AgentName::NP);
         Box::new(move |run| {
-            let self_exe = run.self_exe().to_string();
+            let e = e.clone();
             Box::pin(async move {
                 if crate::find_nonpie_binary().is_none() {
                     return super::TestOutcome::new(
@@ -2515,82 +2513,65 @@ pub(crate) fn register_subtree_kill_tests(reg: &mut Registry<'_>) {
                         "FAIL: nonpie binary not found — mount at /opt/nonpie",
                     );
                 }
-                run_subtree_kill(&self_exe, |e| {
-                    Box::pin(async move {
-                        let r = super::send_cmd(
-                            e,
-                            &Command::SpawnRemote {
-                                children: vec!["NPx".into()],
-                            },
-                        )
-                        .await;
-                        if !matches!(r, Response::Ok { .. }) {
-                            return Err(format!("SpawnRemote failed: {r:?}"));
-                        }
-                        // Cooperative shutdown of the non-PIE descendant
-                        // before we kill the root. Forward(Exit) reaches
-                        // NPx via E. If the response stream desyncs we
-                        // ignore — the goal is just to make NPx exit.
-                        let _ = super::send_cmd(
-                            e,
-                            &Command::Forward {
-                                target: "NPx".into(),
-                                inner: Box::new(Command::Exit),
-                            },
-                        )
-                        .await;
-                        Ok(())
-                    })
-                })
-                .await
+                let r = run
+                    .send(
+                        &e,
+                        Command::SpawnRemote {
+                            children: vec!["NPx".into()],
+                        },
+                    )
+                    .await;
+                if !matches!(r, Response::Ok { .. }) {
+                    return super::TestOutcome::new(
+                        "E",
+                        false,
+                        format!("setup: SpawnRemote(NPx) failed: {r:?}"),
+                    );
+                }
+                // Cooperative shutdown of the non-PIE descendant
+                // before we kill the root. Forward(Exit) reaches NPx
+                // via E. If the response stream desyncs we ignore —
+                // the goal is just to make NPx exit.
+                let _ = run
+                    .send(
+                        &e,
+                        Command::Forward {
+                            target: "NPx".into(),
+                            inner: Box::new(Command::Exit),
+                        },
+                    )
+                    .await;
+                run_subtree_kill(run, &e).await
             })
         })
     });
 }
 
-/// Spawn a fresh ephemeral agent E, run the caller-supplied subtree
-/// builder against it, then SIGKILL E and time the `wait()`. Returns
-/// pass=true only if `wait()` returns within `SK_WAIT_BUDGET_SECS`.
-async fn run_subtree_kill<F>(self_exe: &str, build: F) -> super::TestOutcome
-where
-    F: for<'a> FnOnce(
-        &'a mut super::Child,
-    ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<(), String>> + Send + 'a>,
-    >,
-{
-    let mut e = match super::spawn_child(self_exe).await {
-        Ok(c) => c,
-        Err(err) => return super::TestOutcome::new("E", false, format!("spawn_child: {err}")),
+/// SIGKILL the static `E` agent and time how long the wait takes.
+/// Returns pass=true iff wait completes within `SK_WAIT_BUDGET_SECS`.
+async fn run_subtree_kill(
+    cx: &mut super::run_context::RunContext<'_>,
+    e: &super::agents::AgentHandle,
+) -> super::TestOutcome {
+    let budget = Duration::from_secs(SK_WAIT_BUDGET_SECS);
+    let result = cx.kill_and_wait(e, budget).await;
+    let (pass, detail) = match result {
+        Ok(elapsed) => (
+            true,
+            format!(
+                "kill_and_wait Ok elapsed={}ms budget={}s",
+                elapsed.as_millis(),
+                SK_WAIT_BUDGET_SECS,
+            ),
+        ),
+        Err(elapsed) => (
+            false,
+            format!(
+                "kill_and_wait TIMEOUT elapsed={}ms budget={}s",
+                elapsed.as_millis(),
+                SK_WAIT_BUDGET_SECS,
+            ),
+        ),
     };
-
-    if let Err(detail) = build(&mut e).await {
-        // Best-effort cleanup before reporting the setup failure.
-        let _ = e.process.start_kill();
-        let _ = tokio::time::timeout(Duration::from_secs(2), e.process.wait()).await;
-        return super::TestOutcome::new("E", false, format!("setup: {detail}"));
-    }
-
-    // Send SIGKILL via tokio's start_kill (non-async; just delivers
-    // the signal). Then time how long the kernel takes to report the
-    // child as reapable. Under litebox the wait can hang because of
-    // un-reaped wait_worker_host stub threads in vfork descendants.
-    let send_ok = e.process.start_kill().is_ok();
-    let t0 = std::time::Instant::now();
-    let wait_res =
-        tokio::time::timeout(Duration::from_secs(SK_WAIT_BUDGET_SECS), e.process.wait()).await;
-    let elapsed = t0.elapsed();
-
-    let pass = send_ok && matches!(wait_res, Ok(Ok(_)));
-    let detail = format!(
-        "send_ok={send_ok} wait={} elapsed={}ms budget={}s",
-        match &wait_res {
-            Ok(Ok(s)) => format!("Ok({s:?})"),
-            Ok(Err(err)) => format!("Err({err})"),
-            Err(_) => "TIMEOUT".to_string(),
-        },
-        elapsed.as_millis(),
-        SK_WAIT_BUDGET_SECS,
-    );
     super::TestOutcome::new("E", pass, detail)
 }

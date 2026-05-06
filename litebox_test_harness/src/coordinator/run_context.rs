@@ -16,6 +16,8 @@
 //! `AgentHandle -> &'static str` mapping is private to this module
 //! and is the only place the wire-level name is materialized.
 
+use std::time::Duration;
+
 use crate::protocol::{Command, Response};
 
 use super::TestRunner;
@@ -86,6 +88,41 @@ impl<'a> RunContext<'a> {
                 data: data.to_string(),
             })
             .await
+    }
+
+    /// SIGKILL the process backing `handle` and time how long the
+    /// subsequent `wait()` takes. Returns `Ok(elapsed)` if the wait
+    /// completes within `budget`, or `Err(elapsed_at_timeout)` if the
+    /// wait was abandoned at the budget. Removes the agent from the
+    /// runner's tracked set so future routing through it returns a
+    /// clear error rather than blocking.
+    ///
+    /// Returns `Err(Duration::ZERO)` if the agent is no longer
+    /// tracked (e.g., already SIGKILLed by the runner's poisoning
+    /// machinery after a prior command timed out). The test is
+    /// expected to surface that as a setup failure rather than
+    /// silently treating it as a kill-success.
+    ///
+    /// Used by `SK.subtree.*` tests to assert that SIGKILL of an
+    /// agent with non-PIE descendants completes promptly.
+    pub async fn kill_and_wait(
+        &mut self,
+        handle: &AgentHandle,
+        budget: Duration,
+    ) -> Result<Duration, Duration> {
+        let wire = handle.name().name();
+        // Pull the Child out of the runner so we own its lifecycle.
+        let mut child = match self.runner.children.remove(wire) {
+            Some(c) => c,
+            None => return Err(Duration::ZERO),
+        };
+        self.runner.spawned_agents.remove(wire);
+        let _ = child.process.start_kill();
+        let start = std::time::Instant::now();
+        match tokio::time::timeout(budget, child.process.wait()).await {
+            Ok(_) => Ok(start.elapsed()),
+            Err(_) => Err(start.elapsed()),
+        }
     }
 
     /// Spawn a fresh ephemeral child agent that is not part of the

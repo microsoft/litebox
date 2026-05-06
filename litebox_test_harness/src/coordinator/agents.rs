@@ -37,6 +37,14 @@ pub enum AgentName {
     D3,
     D4,
     D5,
+    /// Subtree-kill ephemeral root. Spawned as a direct child of the
+    /// coordinator (like A, B) and intended to be SIGKILLed by the
+    /// SK.subtree.* tests. Per-Trial docker isolation guarantees no
+    /// pollution across tests.
+    E,
+    /// Direct child of `E`. Used by `SK.subtree.deep_nonpie` to test
+    /// non-PIE descendants two levels deep.
+    EE,
 }
 
 impl AgentName {
@@ -55,6 +63,8 @@ impl AgentName {
             AgentName::D3 => "D3",
             AgentName::D4 => "D4",
             AgentName::D5 => "D5",
+            AgentName::E => "E",
+            AgentName::EE => "EE",
         }
     }
 
@@ -72,6 +82,8 @@ impl AgentName {
             AgentName::D3 => &[AgentName::A, AgentName::AA],
             AgentName::D4 => &[AgentName::A, AgentName::AA, AgentName::D3],
             AgentName::D5 => &[AgentName::A, AgentName::AA, AgentName::D3, AgentName::D4],
+            AgentName::E => &[],
+            AgentName::EE => &[AgentName::E],
         }
     }
 }

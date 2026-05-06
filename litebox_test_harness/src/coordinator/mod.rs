@@ -181,7 +181,7 @@ impl TestResult {
 }
 
 pub struct TestRunner {
-    children: std::collections::HashMap<String, Child>,
+    pub(super) children: std::collections::HashMap<String, Child>,
     results: Vec<TestResult>,
     pub(crate) self_exe: String,
     /// Agents whose protocol streams are desynchronized (e.g., after a
@@ -197,7 +197,7 @@ pub struct TestRunner {
     contacted_agents: std::collections::HashSet<String>,
     /// Agent names actually spawned by `spawn_tree`. Compared against
     /// `contacted_agents` at end-of-run.
-    spawned_agents: std::collections::HashSet<String>,
+    pub(super) spawned_agents: std::collections::HashSet<String>,
 }
 
 impl TestRunner {
@@ -321,7 +321,7 @@ impl TestRunner {
     /// known `spawn_nonpie_subtree` timeout per harness invocation.
     /// Set to `true` if any test in the filter references those agent
     /// names; see `filter_needs_nonpie`.
-    async fn spawn_tree(&mut self, wants_nonpie: bool) {
+    async fn spawn_tree(&mut self, wants_nonpie: bool, wants_e: bool) {
         // Always-on PIE matrix: A, AA, AB, AAA, AAB, B (cheap, ~3s).
         for &name in &["A", "AA", "AB", "AAA", "AAB", "B"] {
             self.spawned_agents.insert(name.to_string());
@@ -358,6 +358,29 @@ impl TestRunner {
             )
             .await;
         eprintln!("[coord] AA spawn children: {r:?}");
+
+        // Spawn E (and EE) on demand. SK.subtree.* tests use these as
+        // the SIGKILL target, but they're spawned on the same routing
+        // mesh as A/B so tests can reach them via TestRunner::send.
+        if wants_e {
+            self.spawned_agents.insert("E".to_string());
+            match spawn_child(&self.self_exe).await {
+                Ok(child) => {
+                    self.children.insert("E".to_string(), child);
+                    self.spawned_agents.insert("EE".to_string());
+                    let r = self
+                        .send(
+                            "E",
+                            Command::Spawn {
+                                children: vec!["EE".to_string()],
+                            },
+                        )
+                        .await;
+                    eprintln!("[coord] E spawn EE: {r:?}");
+                }
+                Err(e) => eprintln!("[coord] spawn E failed: {e}"),
+            }
+        }
 
         // Spawn non-PIE subtree only if any filtered test needs it.
         // ~97% of tests are PIE-only and would just pay the 30s
@@ -756,7 +779,8 @@ async fn run_tests(self_exe: &str, filter: Option<&str>) -> Vec<TestResult> {
         // if any filtered test references those agents. Validation at
         // end-of-run detects mismatches.
         let wants_nonpie = filter_needs_nonpie(&new_filtered);
-        runner.spawn_tree(wants_nonpie).await;
+        let wants_e = filter_needs_e(&new_filtered);
+        runner.spawn_tree(wants_nonpie, wants_e).await;
         for test in new_filtered {
             let timeout_dur = Duration::from_secs(test.timeout_secs);
             match tokio::time::timeout(timeout_dur, (test.run)(&mut runner)).await {
@@ -859,13 +883,29 @@ fn filter_needs_nonpie(tests: &[Test]) -> bool {
         .any(|t| t.declared_agents.iter().any(|a| NONPIE.contains(a)))
 }
 
+/// Whether any test in the filter declares the SK.subtree.* ephemeral
+/// root `E` (or its child `EE`). Gates spawning of the E subtree so
+/// the cost is paid only when needed.
+fn filter_needs_e(tests: &[Test]) -> bool {
+    use agents::AgentName;
+    if std::env::var("LITEBOX_FORCE_FULL_MATRIX").is_ok() {
+        return true;
+    }
+    tests.iter().any(|t| {
+        t.declared_agents
+            .iter()
+            .any(|a| matches!(a, AgentName::E | AgentName::EE))
+    })
+}
+
 /// Route a target agent name to (direct_child, remaining_path).
 /// "A" → ("A", None), "AA" → ("A", Some("AA")), "NP" → ("A", Some("NP"))
 fn route(target: &str) -> (&str, Option<&str>) {
     match target {
-        "A" | "B" => (target, None),
+        "A" | "B" | "E" => (target, None),
         // Agents under A: AA*, AB, NP, NPC, D3, D4, D5
         "NP" | "NPC" | "D3" | "D4" | "D5" => ("A", Some(target)),
+        "EE" => ("E", Some("EE")),
         s if s.starts_with('A') => ("A", Some(s)),
         _ => (target, None),
     }
@@ -941,6 +981,12 @@ fn wrap_forwards(remaining: Option<&str>, cmd: Command) -> Command {
                             }),
                         }),
                     }),
+                }
+            } else if target == "EE" {
+                // EE is a direct child of E
+                Command::Forward {
+                    target: "EE".to_string(),
+                    inner: Box::new(cmd),
                 }
             } else {
                 Command::Forward {
