@@ -712,7 +712,7 @@ pub fn collect_all_tests() -> Vec<Test> {
     special_cases::register_cross_worker(&mut tests);
     special_cases::register_pipe_eof(&mut tests);
     pipe_bridge::register_pipe_bridge(&mut registry::Registry::new(&mut tests));
-    tcp_stress::register_tcp_stress(&mut tests);
+    tcp_stress::register_tcp_stress(&mut registry::Registry::new(&mut tests));
     file_tcp::register_file_tcp(&mut tests);
     port_router::register_port_router(&mut tests);
     special_cases::register_contamination_sequence(&mut tests);
