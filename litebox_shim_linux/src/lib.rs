@@ -2344,13 +2344,9 @@ impl<FS: ShimFS> Task<FS> {
                 | Sysno::close | Sysno::close_range | Sysno::dup | Sysno::dup2 | Sysno::dup3
                 | Sysno::open | Sysno::openat | Sysno::openat2 | Sysno::pipe2 | Sysno::write
                 | Sysno::read
-                // Fork — bash forks for pipelines inside $() subshells.
-                // Must be pre-exec so nested forks work without triggering
-                // migration (which would break capture pipes).
-                | Sysno::clone | Sysno::clone3 | Sysno::vfork | Sysno::fork
-                // Wait — bash waits for inner $() children to exit before
-                // writing their captured output to its own stdout.
-                | Sysno::wait4 | Sysno::waitid
+                // A nested fork or wait is real post-fork shell work.  Commit
+                // delayed fork first so the parent shell can resume and service
+                // command-substitution pipes while the child shell runs.
                 // Directory.
                 | Sysno::chdir | Sysno::fchdir
                 // Process group.

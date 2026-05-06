@@ -8582,7 +8582,7 @@ impl<FS: ShimFS> Task<FS> {
         path: &str,
         argv: alloc::vec::Vec<alloc::ffi::CString>,
         envp: alloc::vec::Vec<alloc::ffi::CString>,
-        guest_exec_image: &[u8],
+        guest_exec_image: Option<&[u8]>,
         guest_interp_image: Option<(&str, &[u8])>,
         vfork_info: Option<ExecVforkInfo>,
     ) -> Result<usize, Errno> {
@@ -9140,25 +9140,38 @@ impl<FS: ShimFS> Task<FS> {
         } else {
             false
         };
-        let remote_exec_image = if needs_remote {
-            Some(
-                match self.global.platform.read_host_file(&resolved_exe_path) {
-                    Ok(data) => data,
-                    Err(()) => loader.main_file_bytes()?,
-                },
-            )
+        let transfer_remote_images =
+            needs_remote && !self.global.platform.worker_exec_can_load_from_guest_fs();
+        let remote_exec_image = if transfer_remote_images {
+            // If the resolved binary is visible on the host filesystem, let
+            // the worker load it through its normal filesystem view. Avoids
+            // transferring large debug images through a memfd on every exec.
+            if self.global.platform.host_file_exists(&resolved_exe_path) {
+                None
+            } else {
+                Some(
+                    match self.global.platform.read_host_file(&resolved_exe_path) {
+                        Ok(data) => data,
+                        Err(()) => loader.main_file_bytes()?,
+                    },
+                )
+            }
         } else {
             None
         };
-        let remote_interp_image = if needs_remote {
-            loader.interp_file_bytes()?.map(|(interp_path, data)| {
+        let remote_interp_image = if transfer_remote_images {
+            loader.interp_file_bytes()?.and_then(|(interp_path, data)| {
                 let resolved = self.resolve_exe_path(&interp_path);
-                let data = self
-                    .global
-                    .platform
-                    .read_host_file(&resolved)
-                    .unwrap_or(data);
-                (resolved, data)
+                if self.global.platform.host_file_exists(&resolved) {
+                    None
+                } else {
+                    let data = self
+                        .global
+                        .platform
+                        .read_host_file(&resolved)
+                        .unwrap_or(data);
+                    Some((resolved, data))
+                }
             })
         } else {
             None
@@ -9230,9 +9243,6 @@ impl<FS: ShimFS> Task<FS> {
                     Some((fc.vfork_done, fc.parent_pipe_fds, fc.parent_unix_socket_fds));
                 detached_from_shared_fork = true;
             }
-            let Some(remote_exec_image) = remote_exec_image.as_deref() else {
-                unreachable!("needs_remote must capture the main executable bytes");
-            };
             let remote_interp_image = remote_interp_image
                 .as_ref()
                 .map(|(path, data)| (path.as_str(), data.as_slice()));
@@ -9242,7 +9252,7 @@ impl<FS: ShimFS> Task<FS> {
                 &path,
                 argv_vec,
                 envp_vec,
-                remote_exec_image,
+                remote_exec_image.as_deref(),
                 remote_interp_image,
                 vfork_info_for_exec,
             );
