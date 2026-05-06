@@ -1,0 +1,64 @@
+#!/usr/bin/env sh
+# pre-push: protect the wportnoy/vscode-server-in-litebox amalgamation
+# branch from being advanced by single-parent commits.
+#
+# Background: the amalgamation branch is supposed to land work streams
+# only via `git merge --no-ff <work-stream>`. A single-parent commit
+# being pushed to it means either:
+#   (a) the `git push origin W:wportnoy/vscode-server-in-litebox`
+#       shortcut, which fast-forwards along the work-stream tip and
+#       bypasses any merge commit you'd made locally, or
+#   (b) a rebase-then-push, which linearises history and has the same
+#       bypass-merge effect.
+#
+# Both are reversible — you can re-merge with --no-ff later — but
+# they leave a flat history on origin without per-work-stream merge
+# commits.
+#
+# This hook fires only for pushes targeting refs/heads/wportnoy/vscode-server-in-litebox
+# and only rejects single-parent commits being pushed there. It is a
+# guardrail, not a guarantee: server-side enforcement (GitHub branch
+# protection) is the only real block.
+#
+# Enable: git config --local core.hooksPath .githooks
+# Bypass (use sparingly): git push --no-verify ...
+
+set -eu
+
+while read -r local_ref local_sha remote_ref remote_sha; do
+    case "$remote_ref" in
+        refs/heads/wportnoy/vscode-server-in-litebox)
+            # Skip deletes (local_sha == 0…0)
+            zero=$(printf '%040d' 0)
+            if [ "$local_sha" = "$zero" ]; then
+                continue
+            fi
+            n_parents=$(git cat-file -p "$local_sha" | grep -c '^parent ')
+            if [ "$n_parents" -lt 2 ]; then
+                cat >&2 <<MSG
+ERROR: refusing push to $remote_ref of single-parent commit $local_sha.
+
+  The amalgamation branch lands work via 'git merge --no-ff' only.
+  This push would advance origin's history linearly and lose the
+  merge-commit record of which work stream landed.
+
+  If you meant to land a work stream W:
+    cd <main-worktree>     # the one on wportnoy/vscode-server-in-litebox
+    git merge --no-ff W    # creates a merge commit
+    git push origin wportnoy/vscode-server-in-litebox
+
+  Do not use 'git push origin W:wportnoy/vscode-server-in-litebox',
+  and do not rebase your work-stream onto the amalgamation.
+
+  See AGENTS.md "Branch and merge discipline" for the full model.
+
+  Bypass (only when you know exactly what you're doing):
+    git push --no-verify ...
+MSG
+                exit 1
+            fi
+            ;;
+    esac
+done
+
+exit 0
