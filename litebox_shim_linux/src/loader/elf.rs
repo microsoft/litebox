@@ -11,8 +11,11 @@ use alloc::{
 use core::mem::size_of;
 use litebox::{
     fs::{Mode, OFlags},
-    mm::linux::{CreatePagesFlags, MappingError, PAGE_SIZE},
-    platform::{RawConstPointer as _, RawMutPointer as _, SystemInfoProvider as _},
+    mm::linux::{CreatePagesFlags, MappingError, PAGE_SIZE, PageRange},
+    platform::{
+        RawConstPointer as _, RawMutPointer as _, SystemInfoProvider as _,
+        page_mgmt::MemoryRegionPermissions,
+    },
     utils::{ReinterpretSignedExt, TruncateExt},
 };
 use litebox_common_linux::{
@@ -39,7 +42,11 @@ struct ElfFile<'a, FS: ShimFS> {
 impl<'a, FS: ShimFS> ElfFile<'a, FS> {
     fn new(task: &'a Task<FS>, path: impl litebox::path::Arg) -> Result<Self, Errno> {
         let fd = task
-            .sys_open(path, OFlags::RDONLY, Mode::empty())?
+            .sys_open(
+                path,
+                OFlags::RDONLY | OFlags::LITEBOX_NO_ELF_PATCH,
+                Mode::empty(),
+            )?
             .reinterpret_as_signed();
         Ok(ElfFile { task, fd })
     }
@@ -173,6 +180,11 @@ struct PatchedMapper<'a, 'b, FS: ShimFS> {
     data: &'b [u8],
 }
 
+struct HostFileMapper<'a, 'b, FS: ShimFS> {
+    inner: &'b mut ElfFile<'a, FS>,
+    path: &'b str,
+}
+
 impl<FS: ShimFS> litebox_common_linux::loader::MapMemory for PatchedMapper<'_, '_, FS> {
     type Error = Errno;
 
@@ -286,6 +298,71 @@ impl<FS: ShimFS> litebox_common_linux::loader::MapMemory for PatchedMapper<'_, '
     }
 }
 
+impl<FS: ShimFS> litebox_common_linux::loader::MapMemory for HostFileMapper<'_, '_, FS> {
+    type Error = Errno;
+
+    fn reserve(&mut self, len: usize, align: usize) -> Result<usize, Self::Error> {
+        self.inner.reserve(len, align)
+    }
+
+    fn map_file(
+        &mut self,
+        address: usize,
+        len: usize,
+        offset: u64,
+        prot: &litebox_common_linux::loader::Protection,
+    ) -> Result<(), Self::Error> {
+        let resolved = self.inner.task.resolve_exe_path(self.path);
+        let mapped = self
+            .inner
+            .task
+            .global
+            .platform
+            .mmap_host_file(&resolved, address, len, prot.flags(), offset.truncate())
+            .map_err(|()| Errno::EFAULT)?;
+        if mapped != address {
+            return Err(Errno::ENOMEM);
+        }
+
+        let mut permissions = MemoryRegionPermissions::empty();
+        permissions.set(MemoryRegionPermissions::READ, prot.read);
+        permissions.set(MemoryRegionPermissions::WRITE, prot.write);
+        permissions.set(MemoryRegionPermissions::EXEC, prot.execute);
+        let range = PageRange::new(address, address.checked_add(len).ok_or(Errno::ENOMEM)?)
+            .ok_or(Errno::ENOMEM)?;
+        // SAFETY: mmap_host_file just installed a MAP_FIXED file mapping for exactly this range
+        // with the permissions computed above.
+        unsafe {
+            self.inner
+                .task
+                .process_state
+                .borrow()
+                .pm
+                .register_existing_mapping(range, permissions, true, true, false, false)
+        }
+        .ok_or(Errno::ENOMEM)?;
+        Ok(())
+    }
+
+    fn map_zero(
+        &mut self,
+        address: usize,
+        len: usize,
+        prot: &litebox_common_linux::loader::Protection,
+    ) -> Result<(), Self::Error> {
+        self.inner.map_zero(address, len, prot)
+    }
+
+    fn protect(
+        &mut self,
+        address: usize,
+        len: usize,
+        prot: &litebox_common_linux::loader::Protection,
+    ) -> Result<(), Self::Error> {
+        self.inner.protect(address, len, prot)
+    }
+}
+
 /// Struct to hold the information needed to start the program
 /// (entry point and user stack top).
 pub struct ElfLoadInfo {
@@ -307,6 +384,8 @@ struct FileAndParsed<'a, FS: ShimFS> {
     /// When the rewriter backend is active and the binary was not pre-patched,
     /// the loader patches it on the fly and loads from this in-memory copy.
     patched_data: Option<Vec<u8>>,
+    needs_syscall_patch: bool,
+    host_mmap_large: bool,
     exec_bias_applied: bool,
 }
 
@@ -997,64 +1076,40 @@ impl<'a, FS: ShimFS> FileAndParsed<'a, FS> {
         let mut parsed = litebox_common_linux::loader::ElfParsedFile::parse(&mut &file)
             .map_err(ElfLoaderError::ParseError)?;
 
+        let file_size: usize = (&mut &file)
+            .size()
+            .map_err(ElfLoaderError::OpenError)?
+            .truncate();
         let syscall_entry_point = task.global.platform.get_syscall_entry_point();
-        let trampoline_result = parsed.parse_trampoline(&mut &file, syscall_entry_point);
-
-        // If the rewriter backend is active (syscall_entry_point != 0) and the
-        // binary lacks a trampoline, patch it on the fly so that both the main
-        // program and the dynamic linker are covered.
-        let patched_data = if syscall_entry_point != 0 && trampoline_result.is_err() {
-            let size: usize = (&mut &file)
-                .size()
-                .map_err(ElfLoaderError::OpenError)?
-                .truncate();
-            let mut buf = alloc::vec![0u8; size];
-            (&mut &file)
-                .read_at(0, &mut buf)
-                .map_err(ElfLoaderError::OpenError)?;
-
-            let mut skipped_addrs = alloc::vec::Vec::new();
-            match litebox_syscall_rewriter::hook_syscalls_in_elf(&buf, None, &mut skipped_addrs) {
-                Ok(patched) => {
-                    if !skipped_addrs.is_empty() {
-                        litebox::log_println!(
-                            task.global.platform,
-                            "warning: {} unpatchable syscall instruction(s) in {:?} (addresses: {:?})",
-                            skipped_addrs.len(),
-                            path_string,
-                            skipped_addrs,
-                        );
-                    }
-                    // Re-parse the patched binary and extract its trampoline.
-                    parsed =
-                        litebox_common_linux::loader::ElfParsedFile::parse(&mut patched.as_slice())
-                            .map_err(ElfLoaderError::ParseError)?;
-                    parsed
-                        .parse_trampoline(&mut patched.as_slice(), syscall_entry_point)
-                        .map_err(ElfLoaderError::ParseError)?;
-                    Some(patched)
-                }
-                Err(_) => {
-                    // Patching failed (e.g. ET_REL, no .text). Proceed without
-                    // a trampoline — the binary may simply have no syscalls.
-                    None
-                }
-            }
-        } else {
-            None
-        };
+        let missing_trampoline = syscall_entry_point != 0
+            && parsed
+                .parse_trampoline(&mut &file, syscall_entry_point)
+                .is_err();
+        let host_mmap_large = file_size > 32 * 1024 * 1024;
 
         Ok(Self {
             path: path_string,
             file,
             parsed,
-            patched_data,
+            patched_data: None,
+            needs_syscall_patch: missing_trampoline && !host_mmap_large,
+            host_mmap_large,
             exec_bias_applied: false,
         })
     }
 
     fn materialize_file_data(&mut self) -> Result<Vec<u8>, ElfLoaderError> {
         if let Some(data) = self.patched_data.take() {
+            return Ok(data);
+        }
+        let resolved_path = self.file.task.resolve_exe_path(&self.path);
+        if let Ok(data) = self
+            .file
+            .task
+            .global
+            .platform
+            .read_host_file(&resolved_path)
+        {
             return Ok(data);
         }
         let size: usize = (&mut &self.file)
@@ -1068,6 +1123,46 @@ impl<'a, FS: ShimFS> FileAndParsed<'a, FS> {
         Ok(data)
     }
 
+    fn ensure_syscall_trampoline(
+        &mut self,
+        platform: &(impl litebox::platform::SystemInfoProvider + litebox::platform::DebugLogProvider),
+    ) -> Result<(), ElfLoaderError> {
+        if !self.needs_syscall_patch {
+            return Ok(());
+        }
+
+        let data = self.materialize_file_data()?;
+        let mut skipped_addrs = alloc::vec::Vec::new();
+        match litebox_syscall_rewriter::hook_syscalls_in_elf(&data, None, &mut skipped_addrs) {
+            Ok(patched) => {
+                if !skipped_addrs.is_empty() {
+                    litebox::log_println!(
+                        platform,
+                        "warning: {} unpatchable syscall instruction(s) in {:?} (addresses: {:?})",
+                        skipped_addrs.len(),
+                        self.path,
+                        skipped_addrs,
+                    );
+                }
+                let mut parsed =
+                    litebox_common_linux::loader::ElfParsedFile::parse(&mut patched.as_slice())
+                        .map_err(ElfLoaderError::ParseError)?;
+                parsed
+                    .parse_trampoline(&mut patched.as_slice(), platform.get_syscall_entry_point())
+                    .map_err(ElfLoaderError::ParseError)?;
+                self.parsed = parsed;
+                self.patched_data = Some(patched);
+            }
+            Err(_) => {
+                // Patching failed (e.g. ET_REL, no .text). Proceed without a
+                // trampoline — the binary may simply have no syscalls.
+                self.patched_data = Some(data);
+            }
+        }
+        self.needs_syscall_patch = false;
+        Ok(())
+    }
+
     #[cfg(target_arch = "x86_64")]
     fn ensure_biased_exec_image(
         &mut self,
@@ -1076,6 +1171,7 @@ impl<'a, FS: ShimFS> FileAndParsed<'a, FS> {
         if self.exec_bias_applied {
             return Ok(());
         }
+        self.ensure_syscall_trampoline(platform)?;
         let mut data = self.materialize_file_data()?;
         let layout = parse_elf64_exec_layout(&data)?;
         let reserved_start = self
@@ -1128,8 +1224,16 @@ impl<'a, FS: ShimFS> FileAndParsed<'a, FS> {
             self.ensure_biased_exec_image(platform)?;
             #[cfg(not(target_arch = "x86_64"))]
             return Err(ElfLoaderError::OutOfRange);
+        } else {
+            self.ensure_syscall_trampoline(platform)?;
         }
-        if let Some(ref data) = self.patched_data {
+        if self.host_mmap_large {
+            let mut mapper = HostFileMapper {
+                inner: &mut self.file,
+                path: &self.path,
+            };
+            Ok(self.parsed.load(&mut mapper, &mut &*platform)?)
+        } else if let Some(ref data) = self.patched_data {
             let mut mapper = PatchedMapper {
                 inner: &mut self.file,
                 data,

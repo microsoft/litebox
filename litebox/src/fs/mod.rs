@@ -486,6 +486,8 @@ bitflags! {
         const SYNC = 0x101000;
         /// `O_TMPFILE`: create an unnamed temporary file
         const TMPFILE = 0x410000;
+        /// Litebox-internal: open an ELF without broker-side syscall rewriting.
+        const LITEBOX_NO_ELF_PATCH = 0x8000_0000;
         /// `O_TRUNC`: truncate the file to zero length
         const TRUNC = 0x200;
         /// <https://docs.rs/bitflags/*/bitflags/#externally-defined-flags>
