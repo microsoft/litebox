@@ -19,7 +19,7 @@ use thiserror::Error;
 use crate::fs::OFlags;
 use crate::fs::errors::{
     ChmodError, ChownError, FileStatusError, MkdirError, OpenError, PathError, ReadDirError,
-    ReadError, RmdirError, SeekError, TruncateError, UnlinkError, WriteError,
+    ReadError, RmdirError, SeekError, SymlinkError, TruncateError, UnlinkError, WriteError,
 };
 use crate::fs::nine_p::fcall::Rlerror;
 use crate::path::Arg;
@@ -135,6 +135,25 @@ impl From<Error> for MkdirError {
                 _ => MkdirError::Io,
             },
             Error::Io | Error::InvalidResponse | Error::Interrupted => MkdirError::Io,
+        }
+    }
+}
+
+impl From<Error> for SymlinkError {
+    fn from(e: Error) -> Self {
+        match e {
+            Error::InvalidPathname => SymlinkError::PathError(PathError::InvalidPathname),
+            Error::Remote(errno) => match errno {
+                ENOENT => SymlinkError::PathError(PathError::NoSuchFileOrDirectory),
+                EEXIST => SymlinkError::AlreadyExists,
+                EPERM | EACCES => SymlinkError::NoWritePerms,
+                ENOTDIR => SymlinkError::PathError(PathError::ComponentNotADirectory),
+                ENAMETOOLONG | EINVAL => SymlinkError::PathError(PathError::InvalidPathname),
+                EROFS => SymlinkError::ReadOnlyFileSystem,
+                ENOSYS | EOPNOTSUPP => SymlinkError::NotSupported,
+                _ => SymlinkError::Io,
+            },
+            Error::Io | Error::InvalidResponse | Error::Interrupted => SymlinkError::Io,
         }
     }
 }
@@ -757,17 +776,10 @@ impl<Platform: sync::RawSyncPrimitivesProvider, W: transport::Write> FileSystem<
         cache.retain(|k| k.as_str() != path && !k.starts_with(&prefix));
     }
 
-    /// If `err` is ENOENT and no concurrent mutation happened, insert `path`
-    /// into the negative stat cache so subsequent lookups can skip the RPC.
-    fn try_cache_negative(&self, path: &str, err: &FileStatusError, gen_before: usize) {
-        if matches!(
-            err,
-            FileStatusError::PathError(PathError::NoSuchFileOrDirectory)
-        ) && self.cache_generation.load(Ordering::SeqCst) == gen_before
-        {
-            self.negative_stat_cache.lock().insert(path.into());
-        }
-    }
+    /// Negative stat results are intentionally not cached for the mutable 9P
+    /// backing store. Other agents may create the path through independent 9P
+    /// connections, and this client has no cross-connection invalidation signal.
+    fn try_cache_negative(&self, _path: &str, _err: &FileStatusError, _gen_before: usize) {}
 
     /// Gives the absolute path for `path`, resolving any `.` or `..`s, and making sure to account
     /// for any relative paths from current working directory.
@@ -1936,6 +1948,29 @@ impl<Platform: sync::RawSyncPrimitivesProvider, W: transport::Write> super::File
         }
 
         result.map(|_| ()).map_err(MkdirError::from)
+    }
+
+    fn symlink(
+        &self,
+        target: impl crate::path::Arg,
+        linkpath: impl crate::path::Arg,
+    ) -> Result<(), SymlinkError> {
+        let target = target
+            .as_rust_str()
+            .map_err(|_| SymlinkError::PathError(PathError::InvalidPathname))?;
+        let linkpath = self.absolute_path(linkpath)?;
+        let (parent_fid, name) = self.walk_to_parent(&linkpath)?;
+
+        let result = self.client.symlink(parent_fid, name, target, 0);
+        self.client.clunk_async(parent_fid);
+
+        if result.is_ok() {
+            self.invalidate_negative_stat_cache(&[&linkpath]);
+            self.invalidate_parent_stat_cache(&linkpath);
+            self.invalidate_readlink_cache(&[&linkpath]);
+        }
+
+        result.map(|_| ()).map_err(SymlinkError::from)
     }
 
     fn rmdir(&self, path: impl crate::path::Arg) -> Result<(), RmdirError> {

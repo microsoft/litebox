@@ -250,6 +250,9 @@ pub(crate) fn activate_seccomp_filter() {
     register_seccomp_filter();
 }
 
+#[cfg(test)]
+pub(crate) fn activate_seccomp_filter() {}
+
 /// Initialize the syscall interception mechanism (legacy single-call API).
 ///
 /// This function sets up the syscall handler and registers seccomp

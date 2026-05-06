@@ -650,10 +650,10 @@ Serializer! {
     /// Symlink request
     #[derive(Clone, Debug)]
     pub(crate) struct Tsymlink<'a> {
-        fid: u32,
-        name: FcallStr<'a>,
-        symtgt: FcallStr<'a>,
-        gid: u32,
+        pub(crate) fid: u32,
+        pub(crate) name: FcallStr<'a>,
+        pub(crate) symtgt: FcallStr<'a>,
+        pub(crate) gid: u32,
     }
 }
 
@@ -661,7 +661,7 @@ Serializer! {
     /// Symlink response
     #[derive(Clone, Debug)]
     pub(crate) struct Rsymlink {
-        qid: Qid,
+        pub(crate) qid: Qid,
     }
 }
 

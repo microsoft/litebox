@@ -19,8 +19,8 @@ use crate::sync;
 
 use super::errors::{
     ChmodError, ChownError, CloseError, FileStatusError, MkdirError, OpenError, PathError,
-    ReadDirError, ReadError, RenameError, RmdirError, SeekError, TruncateError, UnlinkError,
-    WriteError,
+    ReadDirError, ReadError, RenameError, RmdirError, SeekError, SymlinkError, TruncateError,
+    UnlinkError, WriteError,
 };
 use super::{DirEntry, FileStatus, FileType, Mode, NodeInfo, OFlags, SeekWhence};
 
@@ -2020,6 +2020,88 @@ impl<
         self.mkdir_migrating_ancestor_dirs(&path)?;
         // And then now we can make the upper directory.
         self.upper.mkdir(path, mode)
+    }
+
+    fn symlink(
+        &self,
+        target: impl crate::path::Arg,
+        linkpath: impl crate::path::Arg,
+    ) -> Result<(), SymlinkError> {
+        let target = target
+            .as_rust_str()
+            .map_err(|e| SymlinkError::PathError(e.into()))?;
+        let path = self.absolute_path(linkpath)?;
+        if self.has_tombstoned_ancestor(&path)? {
+            return Err(PathError::NoSuchFileOrDirectory)?;
+        }
+
+        if matches!(
+            self.layering_semantics,
+            LayeringSemantics::LowerLayerWritableFiles
+        ) {
+            match self.upper.file_status(path.as_str()) {
+                Ok(_) => return Err(SymlinkError::AlreadyExists),
+                Err(FileStatusError::PathError(
+                    PathError::NoSuchFileOrDirectory | PathError::MissingComponent,
+                )) => {}
+                Err(FileStatusError::PathError(p)) => return Err(SymlinkError::PathError(p)),
+                Err(_) => return Err(SymlinkError::Io),
+            }
+            match self.lower.symlink(target, path.as_str()) {
+                Ok(()) => {
+                    let mut root = self.root.write();
+                    Self::invalidate_cache_tree(&mut root, &path);
+                    return Ok(());
+                }
+                Err(
+                    SymlinkError::PathError(
+                        PathError::NoSuchFileOrDirectory | PathError::MissingComponent,
+                    )
+                    | SymlinkError::ReadOnlyFileSystem
+                    | SymlinkError::NotSupported
+                    | SymlinkError::Io,
+                ) => {}
+                Err(e) => return Err(e),
+            }
+        }
+
+        match self.upper.symlink(target, path.as_str()) {
+            Ok(()) => {
+                let mut root = self.root.write();
+                Self::invalidate_cache_tree(&mut root, &path);
+                return Ok(());
+            }
+            Err(e) => match e {
+                SymlinkError::NoWritePerms
+                | SymlinkError::AlreadyExists
+                | SymlinkError::ReadOnlyFileSystem
+                | SymlinkError::NotSupported
+                | SymlinkError::PathError(
+                    PathError::ComponentNotADirectory
+                    | PathError::InvalidPathname
+                    | PathError::NoSearchPerms { .. },
+                ) => return Err(e),
+                SymlinkError::PathError(
+                    PathError::NoSuchFileOrDirectory | PathError::MissingComponent,
+                )
+                | SymlinkError::Io => {}
+            },
+        }
+
+        self.mkdir_migrating_ancestor_dirs(&path)
+            .map_err(|e| match e {
+                MkdirError::AlreadyExists => SymlinkError::AlreadyExists,
+                MkdirError::ReadOnlyFileSystem => SymlinkError::ReadOnlyFileSystem,
+                MkdirError::NoWritePerms => SymlinkError::NoWritePerms,
+                MkdirError::Io => SymlinkError::Io,
+                MkdirError::PathError(p) => SymlinkError::PathError(p),
+            })?;
+        let result = self.upper.symlink(target, path.as_str());
+        if result.is_ok() {
+            let mut root = self.root.write();
+            Self::invalidate_cache_tree(&mut root, &path);
+        }
+        result
     }
 
     fn rmdir(&self, path: impl crate::path::Arg) -> Result<(), RmdirError> {

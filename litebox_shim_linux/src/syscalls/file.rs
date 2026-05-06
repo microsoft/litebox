@@ -16,7 +16,9 @@ use litebox::{
     fd::{ErrRawIntFd, FdEnabledSubsystem, MetadataError, TypedFd},
     fs::{Mode, OFlags, SeekWhence},
     path,
-    platform::{RawConstPointer, RawMutPointer, StdioProvider as _},
+    platform::{
+        Instant as _, RawConstPointer, RawMutPointer, StdioProvider as _, TimeProvider as _,
+    },
     utils::{ReinterpretSignedExt as _, ReinterpretUnsignedExt as _, TruncateExt as _},
 };
 use litebox_common_linux::{
@@ -42,6 +44,25 @@ fn host_stdio_source_for_path(path: &str) -> Option<i32> {
 
 fn is_host_tty_path(path: &str) -> bool {
     path == "/dev/tty"
+}
+
+/// Build Linux-style NUL-separated `/proc/<pid>/cmdline` data.
+pub(crate) fn proc_cmdline_from_argv(argv: &[CString], fallback_exe: &str) -> Vec<u8> {
+    if argv.is_empty() {
+        if fallback_exe.is_empty() {
+            return vec![0];
+        }
+        let mut out = fallback_exe.as_bytes().to_vec();
+        out.push(0);
+        return out;
+    }
+
+    let mut out = Vec::new();
+    for arg in argv {
+        out.extend_from_slice(arg.as_bytes());
+        out.push(0);
+    }
+    out
 }
 
 /// Check if a path matches the host's actual PTY device path (e.g., `/dev/pts/156`).
@@ -517,15 +538,8 @@ impl<FS: ShimFS> Task<FS> {
             return cmdline;
         }
 
-        // NUL-separated argv. Use this task's exe path as a minimal fallback.
         let exe = self.fs.borrow().exe_path.read().clone();
-        if exe.is_empty() {
-            alloc::vec![0]
-        } else {
-            let mut v = exe.into_bytes();
-            v.push(0);
-            v
-        }
+        proc_cmdline_from_argv(&[], &exe)
     }
 
     /// Generate synthetic `/proc/<pid>/status` content.
@@ -1326,6 +1340,31 @@ impl<FS: ShimFS> Task<FS> {
                     )
                 },
                 |fd| {
+                    if !buf.borrow().is_empty()
+                        && matches!(
+                            self.global.pipes.half_pipe_type(fd),
+                            Ok(litebox::pipes::HalfPipeType::ReceiverHalf)
+                        )
+                        && self
+                            .global
+                            .litebox
+                            .descriptor_table()
+                            .with_metadata(fd, |crate::PipeNonblockEagainOnce(enabled)| *enabled)
+                            .unwrap_or(false)
+                    {
+                        let completed_with_data = self
+                            .global
+                            .pipes
+                            .with_iopollable(fd, |pollable| {
+                                let events = pollable.check_io_events();
+                                events.contains(Events::IN) && events.contains(Events::HUP)
+                            })
+                            .unwrap_or(false);
+                        let _ = consume_pipe_eagain_once(self, fd);
+                        if completed_with_data {
+                            return Err(Errno::EAGAIN);
+                        }
+                    }
                     let is_vfork_child = self.fork_context.borrow().is_some();
                     self.global
                         .pipes
@@ -2429,6 +2468,21 @@ where
     Ok(total_written)
 }
 
+fn consume_pipe_eagain_once<FS: ShimFS, S: FdEnabledSubsystem>(
+    task: &Task<FS>,
+    fd: &TypedFd<S>,
+) -> bool {
+    task.global
+        .litebox
+        .descriptor_table_mut()
+        .with_metadata_mut(fd, |crate::PipeNonblockEagainOnce(enabled)| {
+            let was_enabled = *enabled;
+            *enabled = false;
+            was_enabled
+        })
+        .unwrap_or(false)
+}
+
 fn fcntl_status_flags<FS: ShimFS>(
     task: &Task<FS>,
     files: &FilesState<FS>,
@@ -2455,6 +2509,17 @@ fn fcntl_status_flags<FS: ShimFS>(
             handle.with_entry(|file| Ok(file.get_status()))
         }};
     }
+    if let Some(hp_fd) = files.try_host_pipe_fd(desc) {
+        let handle = task
+            .global
+            .litebox
+            .descriptor_table()
+            .entry_handle(&hp_fd)
+            .ok_or(Errno::EBADF)?;
+        return handle
+            .with_entry(|file: &crate::syscalls::host_pipe::HostPipeFd| Ok(file.get_status()));
+    }
+
     files
         .run_on_raw_fd(
             desc,
@@ -3818,6 +3883,29 @@ impl<FS: ShimFS> Task<FS> {
                             })
                     };
                 }
+                if let Some(hp_fd) = files.try_host_pipe_fd(desc) {
+                    let handle = self
+                        .global
+                        .litebox
+                        .descriptor_table()
+                        .entry_handle(&hp_fd)
+                        .ok_or(Errno::EBADF)?;
+                    return handle.with_entry(|file: &crate::syscalls::host_pipe::HostPipeFd| {
+                        let diff = (file.get_status() & setfl_mask) ^ flags;
+                        if diff.intersects(OFlags::APPEND | OFlags::DIRECT | OFlags::NOATIME) {
+                            log_unsupported!("unsupported flags");
+                        }
+                        if diff.intersects(OFlags::NONBLOCK) {
+                            self.global.platform.set_host_fd_nonblocking(
+                                file.raw_fd(),
+                                flags.intersects(OFlags::NONBLOCK),
+                            )?;
+                        }
+                        file.set_status(flags);
+                        Ok(0)
+                    });
+                }
+
                 files.run_on_raw_fd(
                     desc,
                     |fd| {
@@ -3853,15 +3941,33 @@ impl<FS: ShimFS> Task<FS> {
                         )
                     },
                     |fd| {
-                        // Update the actual pipe non-blocking behavior
+                        let nonblocking = flags.intersects(OFlags::NONBLOCK);
+                        let receiver = matches!(
+                            self.global.pipes.half_pipe_type(fd),
+                            Ok(litebox::pipes::HalfPipeType::ReceiverHalf)
+                        );
+                        // Update the actual pipe non-blocking behavior.
                         self.global
                             .pipes
-                            .update_flags(
-                                fd,
-                                litebox::pipes::Flags::NON_BLOCKING,
-                                flags.intersects(OFlags::NONBLOCK),
-                            )
+                            .update_flags(fd, litebox::pipes::Flags::NON_BLOCKING, nonblocking)
                             .map_err(Errno::from)?;
+                        let guest_created = self
+                            .global
+                            .litebox
+                            .descriptor_table()
+                            .with_metadata(fd, |crate::GuestCreatedPipe| true)
+                            .unwrap_or(false);
+                        if receiver
+                            && guest_created
+                            && nonblocking
+                            && self.recent_delayed_fork_resume.replace(false)
+                        {
+                            let _ = self
+                                .global
+                                .litebox
+                                .descriptor_table_mut()
+                                .set_entry_metadata(fd, crate::PipeNonblockEagainOnce(true));
+                        }
                         // Record all status flags in metadata for F_GETFL.
                         // Pipes inherited across exec may lack this metadata;
                         // the update_flags call above already applied the
@@ -4054,6 +4160,10 @@ impl<FS: ShimFS> Task<FS> {
                 &reader,
                 crate::PipeStatusFlags(initial_status | OFlags::RDONLY),
             );
+            assert!(old.is_none());
+            let old = dt.set_entry_metadata(&writer, crate::GuestCreatedPipe);
+            assert!(old.is_none());
+            let old = dt.set_entry_metadata(&reader, crate::GuestCreatedPipe);
             assert!(old.is_none());
         }
 
@@ -4762,6 +4872,24 @@ impl<FS: ShimFS> Task<FS> {
             IoctlArg::FIONBIO(arg) => {
                 let val = arg.read_at_offset(0).ok_or(Errno::EFAULT)?;
                 let files = self.files.borrow();
+                if let Some(hp_fd) = files.try_host_pipe_fd(desc) {
+                    let handle = self
+                        .global
+                        .litebox
+                        .descriptor_table()
+                        .entry_handle(&hp_fd)
+                        .ok_or(Errno::EBADF)?;
+                    handle.with_entry(|file: &crate::syscalls::host_pipe::HostPipeFd| {
+                        self.global
+                            .platform
+                            .set_host_fd_nonblocking(file.raw_fd(), val != 0)?;
+                        let mut flags = file.get_status();
+                        flags.set(OFlags::NONBLOCK, val != 0);
+                        file.set_status(flags);
+                        Ok::<(), Errno>(())
+                    })?;
+                    return Ok(0);
+                }
                 files
                     .run_on_raw_fd(
                         desc,
@@ -5211,6 +5339,16 @@ impl<FS: ShimFS> Task<FS> {
             None
         };
         let timeout = timeout.read()?;
+        let timeout = match self.process().alarm_timer.lock().deadline {
+            Some(alarm_deadline) => {
+                let now = self.global.platform.now();
+                let alarm_timeout = alarm_deadline
+                    .checked_duration_since(&now)
+                    .unwrap_or(core::time::Duration::ZERO);
+                Some(timeout.map_or(alarm_timeout, |t| t.min(alarm_timeout)))
+            }
+            None => timeout,
+        };
         let nfds_signed = isize::try_from(nfds).map_err(|_| {
             if let Some(old) = saved_mask {
                 self.signals.set_blocked(old);

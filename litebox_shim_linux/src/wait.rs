@@ -75,7 +75,7 @@ impl<FS: ShimFS> Task<FS> {
                 ctx.esp,
                 ctx.eax,
             );
-            !self.is_exiting()
+            !self.is_exiting() && !self.local_task_terminated.get()
         })
     }
 

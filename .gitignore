@@ -194,3 +194,6 @@ dev_bench/unixbench/prepared/
 dev_bench/unixbench/byte-unixbench-*/
 dev_bench/unixbench/*.zip
 litebox_tool_executor/rootfs/litebox_syscall_rewriter
+
+# Session-scoped diagnostic artifacts (audit logs, discovery output)
+/files/

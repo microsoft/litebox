@@ -501,7 +501,9 @@ impl<FS: ShimFS> LinuxShim<FS> {
                 in_syscall: Cell::new(false),
                 deferred_vfork_park: Cell::new(false),
                 delayed_fork_pending: Cell::new(false),
+                recent_delayed_fork_resume: Cell::new(false),
                 migrated_to_remote: Cell::new(false),
+                local_task_terminated: Cell::new(false),
                 mux_pipe_pair_ids: RefCell::new(Vec::new()),
                 netlink_sockets: RefCell::new(alloc::collections::BTreeMap::new()),
                 inet6_fds: RefCell::new(alloc::collections::BTreeSet::new()),
@@ -512,14 +514,16 @@ impl<FS: ShimFS> LinuxShim<FS> {
             .task
             .resolve_shebang_program(path, argv)
             .map_err(loader::elf::ElfLoaderError::OpenError)?;
+        let resolved_exe_path = entrypoints.task.resolve_exe_path(resolved_path.as_str());
+        let proc_cmdline = syscalls::file::proc_cmdline_from_argv(&argv, &resolved_exe_path);
         entrypoints.task.load_program(
             loader::elf::ElfLoader::new(&entrypoints.task, resolved_path.as_str())?,
             argv,
             envp,
             exec_filename.as_ref(),
         )?;
-        *entrypoints.task.fs.borrow().exe_path.write() =
-            entrypoints.task.resolve_exe_path(resolved_path.as_str());
+        *entrypoints.task.fs.borrow().exe_path.write() = resolved_exe_path;
+        entrypoints.task.global.set_proc_cmdline(pid, proc_cmdline);
         let process = LinuxShimProcess(entrypoints.task.process().clone());
         Ok(LoadedProgram {
             entrypoints,
@@ -1123,6 +1127,36 @@ impl<FS: ShimFS> LinuxShim<FS> {
             }
         }
 
+        // Recreate unconnected Unix sockets. Connected/socketpair descriptors
+        // are also seeded here so any bridge fd installation below has an fd
+        // table entry to replace with the cross-process host pipe.
+        {
+            use litebox_common_linux::{SockFlags, SockType};
+            use syscalls::fork_snapshot::FdClass;
+
+            for entry in &fd_table.entries {
+                if entry.class != FdClass::UnixSocket {
+                    continue;
+                }
+
+                if let Some(socket) =
+                    syscalls::unix::UnixSocket::<FS>::new(SockType::Stream, SockFlags::empty())
+                {
+                    let file = self
+                        .global
+                        .litebox
+                        .descriptor_table_mut()
+                        .insert::<syscalls::unix::UnixSocketSubsystem<FS>>(socket);
+                    let mut rds = child_files.raw_descriptor_store.write();
+                    if entry.fd <= 2 {
+                        let _ = rds.fd_consume_raw_integer::<FS>(entry.fd);
+                    }
+                    let success = rds.fd_into_specific_raw_integer(file, entry.fd);
+                    debug_assert!(success, "unix fd slot {} occupied during restore", entry.fd);
+                }
+            }
+        }
+
         // --- 11. Build credentials. -----------------------------------------
         let child_credentials = Arc::new(syscalls::process::Credentials {
             uid: id.credentials.uid,
@@ -1189,7 +1223,9 @@ impl<FS: ShimFS> LinuxShim<FS> {
                 in_syscall: Cell::new(false),
                 deferred_vfork_park: Cell::new(false),
                 delayed_fork_pending: Cell::new(false),
+                recent_delayed_fork_resume: Cell::new(false),
                 migrated_to_remote: Cell::new(false),
+                local_task_terminated: Cell::new(false),
                 mux_pipe_pair_ids: RefCell::new(Vec::new()),
                 netlink_sockets: RefCell::new(alloc::collections::BTreeMap::new()),
                 inet6_fds: RefCell::new(alloc::collections::BTreeSet::new()),
@@ -1269,6 +1305,14 @@ pub(crate) struct HostTtyAlias;
 /// Status flags for pipes
 #[derive(Clone)]
 pub(crate) struct PipeStatusFlags(pub litebox::fs::OFlags);
+
+/// Marks a pipe created directly by the guest via pipe/pipe2.
+#[derive(Clone, Copy)]
+pub(crate) struct GuestCreatedPipe;
+
+/// Forces one non-blocking pipe read after a delayed fork to report EAGAIN.
+#[derive(Clone, Copy)]
+pub(crate) struct PipeNonblockEagainOnce(pub bool);
 
 impl<FS: ShimFS> syscalls::file::FilesState<FS> {
     fn initialize_stdio_in_shared_descriptors_table(&self, global: &GlobalState<FS>) {
@@ -2254,10 +2298,39 @@ impl<FS: ShimFS> Task<FS> {
     /// Two syscalls (`fcntl` and `prctl`) require argument-level inspection
     /// because they multiplex many operations through a single syscall number.
     #[cfg(target_arch = "x86_64")]
+    #[cfg(test)]
     fn is_pre_exec_syscall(ctx: &litebox_common_linux::ExecutionContext) -> bool {
+        Self::is_pre_exec_syscall_impl(ctx, false)
+    }
+
+    fn is_pre_exec_syscall_for_task(&self, ctx: &litebox_common_linux::ExecutionContext) -> bool {
+        use ::syscalls::Sysno;
+
+        let unix_socket_read = matches!(Sysno::new(ctx.orig_rax), Some(Sysno::read))
+            && self
+                .files
+                .borrow()
+                .raw_descriptor_store
+                .read()
+                .fd_from_raw_integer::<syscalls::unix::UnixSocketSubsystem<FS>>(ctx.rdi)
+                .is_ok();
+        Self::is_pre_exec_syscall_impl(ctx, unix_socket_read)
+    }
+
+    fn is_pre_exec_syscall_impl(
+        ctx: &litebox_common_linux::ExecutionContext,
+        unix_socket_read: bool,
+    ) -> bool {
         use ::syscalls::Sysno;
 
         let nr = ctx.orig_rax;
+
+        // A blocking read from an inherited Unix socket is real post-fork work,
+        // not fork/exec bookkeeping.  Let delayed-fork migration run first so
+        // the parent can resume and communicate with the child.
+        if unix_socket_read {
+            return false;
+        }
 
         // Match on syscall number, with argument inspection for fcntl/prctl.
         match Sysno::new(nr) {
@@ -2338,7 +2411,7 @@ impl<FS: ShimFS> Task<FS> {
         // the pre-exec allowlist.  If not, commit the delayed fork now.
         #[cfg(target_arch = "x86_64")]
         if self.delayed_fork_pending.get() {
-            let is_pre_exec = Self::is_pre_exec_syscall(ctx);
+            let is_pre_exec = self.is_pre_exec_syscall_for_task(ctx);
             #[cfg(feature = "trace_syscalls")]
             {
                 let sysname = ::syscalls::Sysno::new(ctx.orig_rax).map_or_else(
@@ -2387,14 +2460,17 @@ impl<FS: ShimFS> Task<FS> {
                     self.delayed_fork_pending.set(false);
                     // Fall through to normal syscall handling.
                 } else if self.commit_delayed_fork(ctx).is_ok() {
-                    // Child migrated to worker host.  Terminate this local task.
+                    // Child migrated to a worker host.  Stop this local shim
+                    // task without marking the current host thread as exiting:
+                    // the host thread belongs to the parent runtime and must
+                    // remain available after the migrated child is handed off.
                     #[cfg(feature = "trace_syscalls")]
                     litebox::log_println!(
                         self.global.platform,
-                        "[DELAYED-FORK-TRIGGER] pid={}: commit SUCCESS — child migrated, exiting local task",
+                        "[DELAYED-FORK-TRIGGER] pid={}: commit SUCCESS — child migrated, terminating local task",
                         self.pid,
                     );
-                    self.exit_thread(0);
+                    self.local_task_terminated.set(true);
                     return Ok(0);
                 }
                 // Delayed fork could not migrate this child (e.g. unsupported
@@ -3449,31 +3525,21 @@ struct GlobalState<FS: ShimFS> {
         Platform,
         alloc::collections::BTreeMap<i32, litebox::process::ProcessId>,
     >,
-    /// Synthetic `/proc/<pid>/cmdline` bytes for guest processes owned by this host.
+    /// Synthetic `/proc/<pid>/cmdline` contents for locally-known guest PIDs.
     proc_cmdlines: litebox::sync::RwLock<Platform, alloc::collections::BTreeMap<i32, Vec<u8>>>,
 }
 
 impl<FS: ShimFS> GlobalState<FS> {
-    fn cmdline_from_argv(argv: &[alloc::ffi::CString]) -> Vec<u8> {
-        if argv.is_empty() {
-            return vec![0];
-        }
-        let mut cmdline = Vec::new();
-        for arg in argv {
-            cmdline.extend_from_slice(arg.as_bytes());
-            cmdline.push(0);
-        }
-        cmdline
-    }
-
-    fn set_proc_cmdline(&self, pid: i32, argv: &[alloc::ffi::CString]) {
-        self.proc_cmdlines
-            .write()
-            .insert(pid, Self::cmdline_from_argv(argv));
+    fn set_proc_cmdline(&self, pid: i32, cmdline: Vec<u8>) {
+        self.proc_cmdlines.write().insert(pid, cmdline);
     }
 
     fn proc_cmdline(&self, pid: i32) -> Option<Vec<u8>> {
         self.proc_cmdlines.read().get(&pid).cloned()
+    }
+
+    fn remove_proc_cmdline(&self, pid: i32) {
+        self.proc_cmdlines.write().remove(&pid);
     }
 
     /// Keeps the global thread allocator above a thread ID that was assigned
@@ -3563,7 +3629,7 @@ pub(crate) struct VforkParking {
 }
 
 /// Which virtual subsystem the replaced fd belonged to.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ReplacedSubsystem {
     Pipe,
     UnixSocket,
@@ -3586,6 +3652,25 @@ struct FdReplacement {
     /// The virtual subsystem that owned the original fd.
     #[allow(dead_code)] // Useful for debug logging; may drive close logic in future.
     subsystem: ReplacedSubsystem,
+    /// Whether this replacement comes from `spawn_result.direct_pipes`
+    /// (true: stdin/stdout for non-PIE worker, where the host_fd IS the
+    /// other end of a host OS pipe directly connected to the worker
+    /// child's stdio fd) vs `parent_pipe_replacements` (false: bridged
+    /// via a relay thread that copies between an OS pipe and the
+    /// parent's existing virtual pipe).
+    ///
+    /// When `direct: true`, the parent's guest fd MUST be installed as
+    /// a HostPipeFd over `host_fd` (consume the old slot, install the
+    /// new HostPipeFd), so reads/writes flow directly to the OS pipe
+    /// connected to the worker.
+    ///
+    /// When `direct: false`, the bridge thread already handles the data
+    /// flow via the parent's existing virtual pipe; the FdReplacement
+    /// here installs the HostPipeFd at a slot that's NOT the parent's
+    /// virtual pipe (different guest fd), or no installation is
+    /// necessary. Consuming the parent's virtual pipe at the slot
+    /// would orphan the bridge thread.
+    direct: bool,
 }
 
 /// Describes a single stream in the multiplexer that the parent dispatcher
@@ -3627,6 +3712,7 @@ struct MuxParentStream {
 
 struct VforkDone {
     done: core::sync::atomic::AtomicBool,
+    completion: core::sync::atomic::AtomicU8,
     /// Waker for the parent thread — calling `wake()` causes the parent's
     /// `wait_until` loop to re-evaluate the done flag.
     parent_waker: litebox::event::wait::Waker<Platform>,
@@ -3650,6 +3736,7 @@ impl VforkDone {
     fn new(parent_waker: litebox::event::wait::Waker<Platform>) -> Self {
         Self {
             done: core::sync::atomic::AtomicBool::new(false),
+            completion: core::sync::atomic::AtomicU8::new(0),
             parent_waker,
             fd_replacements: litebox::sync::Mutex::new(Vec::new()),
             mux_parent_fd: core::sync::atomic::AtomicI32::new(-1),
@@ -3658,10 +3745,24 @@ impl VforkDone {
         }
     }
 
-    /// Called by the child when it execs or exits.
-    fn signal(&self) {
+    fn signal_with_completion(&self, completion: u8) {
+        self.completion.store(completion, Ordering::Release);
         self.done.store(true, Ordering::Release);
         self.parent_waker.wake();
+    }
+
+    /// Called when the child exits before exec/handoff.
+    fn signal_exit(&self) {
+        self.signal_with_completion(1);
+    }
+
+    /// Called when the child execs or is handed off to a remote worker.
+    fn signal(&self) {
+        self.signal_with_completion(2);
+    }
+
+    fn was_signaled_by_exit(&self) -> bool {
+        self.completion.load(Ordering::Acquire) == 1
     }
 
     /// Returns `true` once the child has called [`signal`](Self::signal).
@@ -3846,11 +3947,19 @@ struct Task<FS: ShimFS> {
     /// Distinct from `deferred_vfork_park`, which handles sibling-thread
     /// parking coordination.
     delayed_fork_pending: Cell<bool>,
+    /// Set when this parent task has just resumed from a delayed fork.  Used to
+    /// emulate the non-blocking empty-pipe observation that the shared-address
+    /// fork path can otherwise skip while the child runs to completion.
+    recent_delayed_fork_resume: Cell<bool>,
     /// Set by `commit_delayed_fork` on success.  When true, `prepare_for_exit`
     /// skips exit notification and address-space cleanup because the process
     /// was migrated to a remote worker host (the background waiter handles
     /// the real exit).
     migrated_to_remote: Cell<bool>,
+    /// Set when the local shim task should stop without marking its host
+    /// thread's `ThreadRemote` as exiting (for remote exec handoff paths where
+    /// the host thread belongs to the parent runtime and must remain alive).
+    local_task_terminated: Cell<bool>,
     /// Pipe pair_ids of virtual pipes created by the mux dispatcher or fd
     /// replacement relay setup.  These are infrastructure pipes that should
     /// NOT be bridged again when a subsequent child forks.  Tracked so that
@@ -3913,7 +4022,9 @@ mod test_utils {
                 in_syscall: Cell::new(false),
                 deferred_vfork_park: Cell::new(false),
                 delayed_fork_pending: Cell::new(false),
+                recent_delayed_fork_resume: Cell::new(false),
                 migrated_to_remote: Cell::new(false),
+                local_task_terminated: Cell::new(false),
                 mux_pipe_pair_ids: RefCell::new(Vec::new()),
                 netlink_sockets: RefCell::new(alloc::collections::BTreeMap::new()),
                 inet6_fds: RefCell::new(alloc::collections::BTreeSet::new()),
@@ -3951,7 +4062,9 @@ mod test_utils {
                 in_syscall: Cell::new(false),
                 deferred_vfork_park: Cell::new(false),
                 delayed_fork_pending: Cell::new(false),
+                recent_delayed_fork_resume: Cell::new(false),
                 migrated_to_remote: Cell::new(false),
+                local_task_terminated: Cell::new(false),
                 mux_pipe_pair_ids: RefCell::new(Vec::new()),
                 netlink_sockets: RefCell::new(alloc::collections::BTreeMap::new()),
                 inet6_fds: RefCell::new(alloc::collections::BTreeSet::new()),

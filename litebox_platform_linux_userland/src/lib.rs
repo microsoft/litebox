@@ -1015,6 +1015,11 @@ impl LinuxUserland {
         Ok(written)
     }
 
+    /// Read a file directly from the host filesystem.
+    pub fn read_host_file(&self, path: &str) -> Result<Vec<u8>, ()> {
+        std::fs::read(path).map_err(|_| ())
+    }
+
     /// Register a CoW-eligible memory region backed by a file.
     ///
     /// # Panics
@@ -1263,22 +1268,45 @@ impl LinuxUserland {
             }
         }
 
+        struct SafeExtraFds(Vec<(usize, i32)>);
+        impl SafeExtraFds {
+            fn push(&mut self, guest_fd: usize, host_fd: i32) {
+                self.0.push((guest_fd, host_fd));
+            }
+
+            fn iter(&self) -> core::slice::Iter<'_, (usize, i32)> {
+                self.0.iter()
+            }
+
+            fn close_all(&mut self) {
+                for &(_, fd) in &self.0 {
+                    close_raw_fd(fd);
+                }
+                self.0.clear();
+            }
+        }
+        impl Drop for SafeExtraFds {
+            fn drop(&mut self) {
+                self.close_all();
+            }
+        }
+
         let _spawn_guard = self.worker_spawn_serial.lock().unwrap();
         self.reap_finished_worker_bridge_threads();
 
         // Dup extra_fds to high fd numbers so they don't get clobbered by
         // memfd/pipe creation below. The original fds are closed after dup.
-        let mut safe_extra_fds: Vec<(usize, i32)> = Vec::new();
+        let mut safe_extra_fds = SafeExtraFds(Vec::new());
         for &(guest_fd, host_fd) in extra_fds {
             // Dup bridge host fds into the worker bridge range (200+)
             // so they don't collide with infrastructure fds (500+).
             let safe_fd = unsafe { libc::fcntl(host_fd, libc::F_DUPFD, WORKER_BRIDGE_FD_MIN) };
             if safe_fd >= 0 {
-                unsafe { libc::close(host_fd) };
-                safe_extra_fds.push((guest_fd, safe_fd));
+                close_raw_fd(host_fd);
+                safe_extra_fds.push(guest_fd, safe_fd);
             } else {
                 // dup failed — keep original (risky but better than nothing).
-                safe_extra_fds.push((guest_fd, host_fd));
+                safe_extra_fds.push(guest_fd, host_fd);
             }
         }
 
@@ -1358,10 +1386,10 @@ impl LinuxUserland {
         }
         // Add --pipe-bridge for extra inherited fds (e.g. socketpair IPC).
         // Must be BEFORE the -- separator so they're parsed as runner args.
-        for &(guest_fd, host_fd) in &safe_extra_fds {
+        for &(guest_fd, host_fd) in safe_extra_fds.iter() {
             let _ = self.clear_cloexec(host_fd);
             spawn_argv.push(CString::new("--pipe-bridge").unwrap());
-            spawn_argv.push(CString::new(format!("{guest_fd}:b:{host_fd}")).map_err(|_| -1_i32)?);
+            spawn_argv.push(CString::new(format!("{guest_fd}:b:{guest_fd}")).map_err(|_| -1_i32)?);
         }
 
         spawn_argv.push(CString::new("--").unwrap());
@@ -1485,18 +1513,27 @@ impl LinuxUserland {
         let mut output_bridges = Vec::new();
         let mut worker_output_write_fds = Vec::new();
         for group in output_groups.drain(..) {
-            let (write_nonblocking, write_capacity) = match &group.sink {
-                WorkerExecOutputSink::Pipe { pipes, fd } => (
-                    pipes
-                        .get_flags(fd.as_ref())
-                        .map(|flags| flags.contains(litebox::pipes::Flags::NON_BLOCKING))
-                        .unwrap_or(false),
-                    pipes
-                        .writable_bytes(fd.as_ref())
-                        .ok()
-                        .filter(|capacity| supports_bridge_pipe_capacity(*capacity)),
-                ),
-                WorkerExecOutputSink::Fs { .. } | WorkerExecOutputSink::Stream(_) => (false, None),
+            let direct_output_pipe = direct_pipe_io
+                && group.target_fds.contains(&1)
+                && matches!(&group.sink, WorkerExecOutputSink::Pipe { .. });
+            let (write_nonblocking, write_capacity) = if direct_output_pipe {
+                (false, None)
+            } else {
+                match &group.sink {
+                    WorkerExecOutputSink::Pipe { pipes, fd } => (
+                        pipes
+                            .get_flags(fd.as_ref())
+                            .map(|flags| flags.contains(litebox::pipes::Flags::NON_BLOCKING))
+                            .unwrap_or(false),
+                        pipes
+                            .writable_bytes(fd.as_ref())
+                            .ok()
+                            .filter(|capacity| supports_bridge_pipe_capacity(*capacity)),
+                    ),
+                    WorkerExecOutputSink::Fs { .. } | WorkerExecOutputSink::Stream(_) => {
+                        (false, None)
+                    }
+                }
             };
             if write_nonblocking && write_capacity.is_none() {
                 return Err(-1_i32);
@@ -1531,11 +1568,20 @@ impl LinuxUserland {
         }
 
         // Map extra fds (socketpair bridges) to their guest fd numbers
-        // at the kernel level via dup2 file actions.
-        for &(guest_fd, host_fd) in &safe_extra_fds {
+        // at the kernel level via dup2 file actions. The runner's
+        // --pipe-bridge specs use the guest fd as the host fd, so close the
+        // high staging fd in the spawned worker after dup2; otherwise that
+        // duplicate keeps the peer open and pipe readers never observe EOF.
+        for &(guest_fd, host_fd) in safe_extra_fds.iter() {
             if unsafe {
                 libc::posix_spawn_file_actions_adddup2(file_actions_ptr, host_fd, guest_fd as i32)
             } != 0
+            {
+                return Err(-1_i32);
+            }
+            if host_fd != guest_fd as i32
+                && unsafe { libc::posix_spawn_file_actions_addclose(file_actions_ptr, host_fd) }
+                    != 0
             {
                 return Err(-1_i32);
             }
@@ -1556,6 +1602,7 @@ impl LinuxUserland {
         if ret != 0 {
             return Err(ret);
         }
+        safe_extra_fds.close_all();
         drop(worker_input_read_fds);
         drop(worker_output_write_fds);
         drop(host_stdio_temp_sources);
@@ -1582,7 +1629,10 @@ impl LinuxUserland {
             }
         }
         for (sink, read_fd, target_fd) in output_bridges {
-            if direct_pipe_io && matches!(&sink, WorkerExecOutputSink::Pipe { .. }) {
+            if direct_pipe_io
+                && target_fd == 1
+                && matches!(&sink, WorkerExecOutputSink::Pipe { .. })
+            {
                 let raw_fd = read_fd.into_raw_fd();
                 direct_pipes.push(ExecPipeDirectIo {
                     child_stdio_fd: target_fd,
@@ -1770,17 +1820,33 @@ impl LinuxUserland {
         Ok(())
     }
 
-    /// Set `O_NONBLOCK` on a host file descriptor.
-    pub fn set_host_fd_nonblock(&self, fd: i32) -> Result<(), litebox_common_linux::errno::Errno> {
+    /// Set or clear `O_NONBLOCK` on a host file descriptor.
+    pub fn set_host_fd_nonblocking(
+        &self,
+        fd: i32,
+        nonblocking: bool,
+    ) -> Result<(), litebox_common_linux::errno::Errno> {
         // SAFETY: fd is a valid host FD.
         let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
         if flags < 0 {
             return Err(litebox_common_linux::errno::Errno::EBADF);
         }
-        if unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+        let new_flags = if nonblocking {
+            flags | libc::O_NONBLOCK
+        } else {
+            flags & !libc::O_NONBLOCK
+        };
+        // SAFETY: fd is a valid host FD and new_flags came from F_GETFL with
+        // only O_NONBLOCK changed.
+        if unsafe { libc::fcntl(fd, libc::F_SETFL, new_flags) } < 0 {
             return Err(litebox_common_linux::errno::Errno::EBADF);
         }
         Ok(())
+    }
+
+    /// Set `O_NONBLOCK` on a host file descriptor.
+    pub fn set_host_fd_nonblock(&self, fd: i32) -> Result<(), litebox_common_linux::errno::Errno> {
+        self.set_host_fd_nonblocking(fd, true)
     }
 
     /// Sleep for `us` microseconds on the calling host thread.

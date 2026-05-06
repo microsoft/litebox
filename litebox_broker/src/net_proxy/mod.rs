@@ -3126,7 +3126,8 @@ mod tests {
             .write_all(&build_lbnp_handshake())
             .expect("write client1 handshake");
         let server_ipc = accept_ipc_client(&listener, None, Some(Duration::from_secs(2)))
-            .expect("accept client1");
+            .expect("accept client1")
+            .expect("client1 should be an LBNP connection");
         let mut resp = [0u8; 8];
         client1
             .read_exact(&mut resp)
@@ -3134,7 +3135,16 @@ mod tests {
         assert_eq!(&resp[0..4], HANDSHAKE_MAGIC);
 
         let run_thread = std::thread::spawn(move || {
-            run(server_ipc, true, None, Some(&listener)).expect("proxy thread should run")
+            run(
+                server_ipc,
+                true,
+                None,
+                Some(&listener),
+                None,
+                None,
+                Vec::new(),
+            )
+            .expect("proxy thread should run")
         });
 
         let mut client2 = std::os::unix::net::UnixStream::connect(&path).expect("connect client2");

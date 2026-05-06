@@ -734,7 +734,10 @@ where
                         .iter()
                         .any(|&h| {
                             let socket: &tcp::Socket = socket_set.get(h);
-                            socket.state() == tcp::State::Established
+                            matches!(
+                                socket.state(),
+                                tcp::State::Established | tcp::State::CloseWait
+                            )
                         })
                         .then(|| {
                             proxy.set_readable(true);
@@ -1587,7 +1590,10 @@ where
                 // socket in an established state
                 let Some(position) = server_socket.socket_set_handles.iter().position(|&h| {
                     let socket: &tcp::Socket = self.socket_set.get(h);
-                    socket.state() == tcp::State::Established
+                    matches!(
+                        socket.state(),
+                        tcp::State::Established | tcp::State::CloseWait
+                    )
                 }) else {
                     if let Some(proxy) = &socket_handle.proxy {
                         // No connections are ready; make sure the readable flag is cleared

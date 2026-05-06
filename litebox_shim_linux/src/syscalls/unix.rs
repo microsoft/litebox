@@ -70,14 +70,14 @@ pub(crate) enum UnixSocketAddr {
 /// when this structure is dropped.
 enum UnixBoundSocketAddr<FS: ShimFS> {
     Path((String, FileFd<FS>, Arc<FS>)),
-    Abstract(Vec<u8>),
+    Abstract((Vec<u8>, Arc<FS>)),
 }
 
 /// Key type for indexing Unix socket addresses in the global address table.
 ///
 /// This is used internally to track which addresses are currently bound
 /// by listening sockets.
-#[derive(PartialEq, Eq, Hash, Debug, Ord, PartialOrd)]
+#[derive(Clone, PartialEq, Eq, Hash, Debug, Ord, PartialOrd)]
 pub(crate) enum UnixSocketAddrKey {
     // TODO: add inode reference once the file system supports it.
     Path(String),
@@ -137,7 +137,10 @@ impl UnixSocketAddr {
             }
             UnixSocketAddr::Abstract(data) => {
                 // TODO: check if the abstract address is already in use
-                Ok(UnixBoundSocketAddr::Abstract(data))
+                Ok(UnixBoundSocketAddr::Abstract((
+                    data,
+                    task.files.borrow().fs.clone(),
+                )))
             }
             UnixSocketAddr::Unnamed => {
                 // Autobind: assign a unique abstract address. Linux uses a
@@ -146,7 +149,10 @@ impl UnixSocketAddr {
                     core::sync::atomic::AtomicU32::new(1);
                 let id = AUTOBIND_COUNTER.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                 let name = alloc::format!("{id:05x}");
-                Ok(UnixBoundSocketAddr::Abstract(name.into_bytes()))
+                Ok(UnixBoundSocketAddr::Abstract((
+                    name.into_bytes(),
+                    task.files.borrow().fs.clone(),
+                )))
             }
         }
     }
@@ -168,7 +174,7 @@ impl<FS: ShimFS> UnixBoundSocketAddr<FS> {
     fn to_key(&self) -> UnixSocketAddrKey {
         match self {
             Self::Path((path, ..)) => UnixSocketAddrKey::Path(path.clone()),
-            Self::Abstract(addr) => UnixSocketAddrKey::Abstract(addr.clone()),
+            Self::Abstract((addr, _)) => UnixSocketAddrKey::Abstract(addr.clone()),
         }
     }
 }
@@ -188,7 +194,7 @@ impl<FS: ShimFS> From<&UnixBoundSocketAddr<FS>> for UnixSocketAddr {
     fn from(addr: &UnixBoundSocketAddr<FS>) -> Self {
         match addr {
             UnixBoundSocketAddr::Path((path, ..)) => UnixSocketAddr::Path(path.clone()),
-            UnixBoundSocketAddr::Abstract(data) => UnixSocketAddr::Abstract(data.clone()),
+            UnixBoundSocketAddr::Abstract((data, _)) => UnixSocketAddr::Abstract(data.clone()),
         }
     }
 }
@@ -513,8 +519,13 @@ impl<FS: ShimFS> Drop for UnixListenStream<FS> {
         self.backlog.shutdown();
 
         // Clean up sidecar metadata file.
-        if let UnixBoundSocketAddr::Path((path, _, fs)) = self.backlog.addr.as_ref() {
-            remove_sidecar(fs.as_ref(), path.as_str());
+        if self.tcp_port != 0 {
+            let key = self.backlog.addr.to_key();
+            match self.backlog.addr.as_ref() {
+                UnixBoundSocketAddr::Path((_, _, fs)) | UnixBoundSocketAddr::Abstract((_, fs)) => {
+                    remove_sidecar(fs.as_ref(), &key)
+                }
+            }
         }
 
         // The internal TCP listener raw fd is cleaned up when the process
@@ -694,7 +705,11 @@ impl<FS: ShimFS> UnixConnectedStream<FS> {
                 use litebox::net::socket_channel::NetworkProxy;
                 match proxy.as_ref() {
                     NetworkProxy::Stream(stream) => match stream.try_write(&msg.data) {
-                        Ok(_n) => Ok(()),
+                        Ok(n) if n > 0 => {
+                            litebox_platform_multiplex::platform().wake_network_worker();
+                            Ok(())
+                        }
+                        Ok(_) => Err((msg, Errno::EAGAIN)),
                         Err(_) => Err((msg, Errno::EPIPE)),
                     },
                     _ => Err((msg, Errno::EINVAL)),
@@ -715,10 +730,12 @@ impl<FS: ShimFS> UnixConnectedStream<FS> {
                 match proxy.as_ref() {
                     NetworkProxy::Stream(stream) => {
                         match stream.try_read(buf, litebox::net::ReceiveFlags::empty(), None) {
+                            Ok(0) => Err(TryOpError::TryAgain),
                             Ok(n) => Ok(n),
                             Err(litebox::net::errors::ReceiveError::SocketInInvalidState) => {
                                 Err(TryOpError::TryAgain)
                             }
+                            Err(litebox::net::errors::ReceiveError::Eof) => Ok(0),
                             Err(_) => Err(TryOpError::Other(Errno::ECONNRESET)),
                         }
                     }
@@ -792,6 +809,20 @@ impl<FS: ShimFS> UnixConnectedStream<FS> {
             buf = &mut buf[n..];
         }
         Ok(total_read)
+    }
+
+    fn register_observer(
+        &self,
+        observer: Weak<dyn litebox::event::observer::Observer<Events>>,
+        mask: Events,
+    ) {
+        match &self.transport {
+            UnixTransport::Tcp { proxy } => {
+                use litebox::event::IOPollable;
+                proxy.register_observer(observer, mask);
+            }
+            UnixTransport::Channel { .. } => self.pollee.register_observer(observer, mask),
+        }
     }
 
     fn check_io_events(&self) -> Events {
@@ -903,35 +934,15 @@ impl<FS: ShimFS> UnixStream<FS> {
         self.with_state(|state| {
             let ret = match state {
                 UnixStreamState::Init(init) => {
-                    // Extract the socket path before consuming init (for sidecar).
-                    let sock_path = init.addr.as_ref().and_then(|a| match a {
-                        UnixBoundSocketAddr::Path((p, ..)) => Some(p.clone()),
-                        _ => None,
-                    });
+                    let sidecar_key = init.addr.as_ref().map(|a| a.to_key());
 
                     return match init.listen(backlog, global, task.current_ucred()) {
                         Ok(mut listen) => {
-                            if let Some(path) = sock_path {
+                            if let Some(key) = sidecar_key {
                                 let fs = task.files.borrow().fs.clone();
                                 let tcp_port = listen.start_tcp_listener(global, task);
                                 if tcp_port != 0 {
-                                    write_sidecar(fs.as_ref(), path.as_str(), tcp_port);
-                                    // Log: sidecar write with port, raw_fd, path
-                                    let diag = alloc::format!(
-                                        "SIDECAR WRITE: path={} port={} raw_fd={:?} pid={}\n",
-                                        path,
-                                        tcp_port,
-                                        listen.tcp_raw_fd,
-                                        task.process_id.0,
-                                    );
-                                    if let Ok(f) = fs.open(
-                                        "/tmp/unix-port-trace.log",
-                                        OFlags::CREAT | OFlags::RDWR | OFlags::APPEND,
-                                        Mode::RWXU,
-                                    ) {
-                                        let _ = fs.write(&f, diag.as_bytes(), None);
-                                        let _ = fs.close(&f);
-                                    }
+                                    write_sidecar(fs.as_ref(), &key, tcp_port);
                                 }
                             }
                             (UnixStreamState::Listen(listen), Ok(()))
@@ -1028,17 +1039,16 @@ impl<FS: ShimFS> UnixStream<FS> {
         addr: &UnixSocketAddr,
         is_nonblocking: bool,
     ) -> Result<(), Errno> {
-        let sock_path = match addr {
-            UnixSocketAddr::Path(p) => p.clone(),
-            _ => return Err(Errno::ECONNREFUSED),
+        let Some(key) = addr.to_key() else {
+            return Err(Errno::ECONNREFUSED);
         };
 
         let fs = task.files.borrow().fs.clone();
-        let tcp_port = read_sidecar(fs.as_ref(), sock_path.as_str()).ok_or_else(|| {
+        let tcp_port = read_sidecar(fs.as_ref(), &key).ok_or_else(|| {
             use litebox::platform::DebugLogProvider as _;
             let msg = alloc::format!(
-                "UNIX CONNECT REFUSED (no sidecar): path={:?} pid={}\n",
-                sock_path,
+                "UNIX CONNECT REFUSED (no sidecar): key={:?} pid={}\n",
+                key,
                 task.process_id.0,
             );
             litebox_platform_multiplex::platform().debug_log_print(&msg);
@@ -1047,8 +1057,8 @@ impl<FS: ShimFS> UnixStream<FS> {
 
         use litebox::platform::DebugLogProvider as _;
         let msg = alloc::format!(
-            "UNIX CROSS-WORKER CONNECT: path={:?} tcp_port={} pid={}\n",
-            sock_path,
+            "UNIX CROSS-WORKER CONNECT: key={:?} tcp_port={} pid={}\n",
+            key,
             tcp_port,
             task.process_id.0,
         );
@@ -1065,49 +1075,10 @@ impl<FS: ShimFS> UnixStream<FS> {
             )
             .map_err(|_| Errno::ENOMEM)?;
 
-        // Write diagnostic BEFORE connect.
-        {
-            let diag = alloc::format!(
-                "CONNECT: path={:?} sidecar_port={} tcp_raw_fd={} pid={}\n",
-                sock_path,
-                tcp_port,
-                tcp_raw_fd,
-                task.process_id.0,
-            );
-            if let Ok(f) = fs.open(
-                "/tmp/unix-port-trace.log",
-                OFlags::CREAT | OFlags::RDWR | OFlags::APPEND,
-                Mode::RWXU,
-            ) {
-                let _ = fs.write(&f, diag.as_bytes(), None);
-                let _ = fs.close(&f);
-            }
-        }
-
         let connect_addr = super::net::SocketAddress::Inet(core::net::SocketAddr::V4(
             core::net::SocketAddrV4::new(core::net::Ipv4Addr::LOCALHOST, tcp_port),
         ));
-        let connect_result = task.do_connect(tcp_raw_fd, connect_addr);
-
-        // Write diagnostic AFTER connect.
-        {
-            let diag = alloc::format!(
-                "CONNECT RESULT: sidecar_port={} result={:?} pid={}\n",
-                tcp_port,
-                connect_result,
-                task.process_id.0,
-            );
-            if let Ok(f) = fs.open(
-                "/tmp/unix-port-trace.log",
-                OFlags::CREAT | OFlags::RDWR | OFlags::APPEND,
-                Mode::RWXU,
-            ) {
-                let _ = fs.write(&f, diag.as_bytes(), None);
-                let _ = fs.close(&f);
-            }
-        }
-
-        connect_result?;
+        task.do_connect(tcp_raw_fd, connect_addr)?;
 
         // Get the proxy for the connected TCP socket.
         let proxy = task.files.borrow().with_socket(
@@ -1118,18 +1089,20 @@ impl<FS: ShimFS> UnixStream<FS> {
         )?;
 
         // Wrap the TCP proxy in a unix-socket connected stream.
-        let peer_addr = UnixBoundSocketAddr::Path((
-            sock_path,
-            // We don't have the actual file fd for the remote socket, use a
-            // dummy open so AddrView can report the path.
-            {
-                let f = fs
-                    .open("/dev/null", OFlags::RDONLY, Mode::empty())
-                    .map_err(|_| Errno::ECONNREFUSED)?;
-                f
-            },
-            fs,
-        ));
+        let peer_addr = match addr {
+            UnixSocketAddr::Path(sock_path) => UnixBoundSocketAddr::Path((
+                sock_path.clone(),
+                // We don't have the actual file fd for the remote socket, use a
+                // dummy open so AddrView can report the path.
+                fs.open("/dev/null", OFlags::RDONLY, Mode::empty())
+                    .map_err(|_| Errno::ECONNREFUSED)?,
+                fs,
+            )),
+            UnixSocketAddr::Abstract(data) => {
+                UnixBoundSocketAddr::Abstract((data.clone(), fs.clone()))
+            }
+            UnixSocketAddr::Unnamed => return Err(Errno::ECONNREFUSED),
+        };
 
         self.with_state(|state| match state {
             UnixStreamState::Init(init) => {
@@ -1211,6 +1184,12 @@ impl<FS: ShimFS> UnixStream<FS> {
                         |_| Err(Errno::EINVAL),
                     ) {
                         Ok(accepted_tcp_fd) => {
+                            backlog
+                                .pending_tcp_connections
+                                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |pending| {
+                                    pending.checked_sub(1)
+                                })
+                                .ok();
                             let proxy = task.global.initialize_socket(
                                 &accepted_tcp_fd,
                                 SockType::Stream,
@@ -1265,7 +1244,7 @@ impl<FS: ShimFS> UnixStream<FS> {
                 |observer, mask| {
                     self.with_state_ref(|state| {
                         let conn = state.connected().ok_or(Errno::ENOTCONN)?;
-                        conn.pollee.register_observer(observer, mask);
+                        conn.register_observer(observer, mask);
                         Ok(())
                     })
                 },
@@ -1312,7 +1291,7 @@ impl<FS: ShimFS> UnixStream<FS> {
                 |observer, mask| {
                     self.with_state_ref(|state| {
                         let conn = state.connected().ok_or(Errno::ENOTCONN)?;
-                        conn.pollee.register_observer(observer, mask);
+                        conn.register_observer(observer, mask);
                         Ok(())
                     })
                 },
@@ -1774,7 +1753,7 @@ impl<FS: ShimFS> UnixSocket<FS> {
         }
     }
 
-    pub(super) fn new(sock_type: SockType, flags: SockFlags) -> Option<Self> {
+    pub(crate) fn new(sock_type: SockType, flags: SockFlags) -> Option<Self> {
         let inner = match sock_type {
             // SeqPacket uses stream transport. This does not preserve message
             // boundaries (reads can coalesce/split), but suffices for current
@@ -2291,14 +2270,26 @@ pub(crate) fn bridge_fire_count() -> u32 {
 /// Sidecar file suffix for cross-worker unix socket discovery.
 const SIDECAR_SUFFIX: &str = ".litebox-uds-meta";
 
-/// Build the sidecar metadata path for a unix socket path.
-fn sidecar_path(sock_path: &str) -> String {
-    alloc::format!("{}{}", sock_path, SIDECAR_SUFFIX)
+/// Build the sidecar metadata path for a unix socket address.
+fn sidecar_path(key: &UnixSocketAddrKey) -> String {
+    match key {
+        UnixSocketAddrKey::Path(path) => alloc::format!("{}{}", path, SIDECAR_SUFFIX),
+        UnixSocketAddrKey::Abstract(data) => {
+            const HEX: &[u8; 16] = b"0123456789abcdef";
+            let mut encoded = String::from("/.litebox-abstract-uds-");
+            for byte in data {
+                encoded.push(HEX[(byte >> 4) as usize] as char);
+                encoded.push(HEX[(byte & 0x0f) as usize] as char);
+            }
+            encoded.push_str(SIDECAR_SUFFIX);
+            encoded
+        }
+    }
 }
 
 /// Write the TCP port to a sidecar metadata file.
-fn write_sidecar<FS: ShimFS>(fs: &FS, sock_path: &str, tcp_port: u16) {
-    let path = sidecar_path(sock_path);
+fn write_sidecar<FS: ShimFS>(fs: &FS, key: &UnixSocketAddrKey, tcp_port: u16) {
+    let path = sidecar_path(key);
     let data = alloc::format!("{}", tcp_port);
     if let Ok(fd) = fs.open(
         path.as_str(),
@@ -2311,8 +2302,8 @@ fn write_sidecar<FS: ShimFS>(fs: &FS, sock_path: &str, tcp_port: u16) {
 }
 
 /// Read the TCP port from a sidecar metadata file. Returns None if not found.
-fn read_sidecar<FS: ShimFS>(fs: &FS, sock_path: &str) -> Option<u16> {
-    let path = sidecar_path(sock_path);
+fn read_sidecar<FS: ShimFS>(fs: &FS, key: &UnixSocketAddrKey) -> Option<u16> {
+    let path = sidecar_path(key);
     let fd = fs.open(path.as_str(), OFlags::RDONLY, Mode::empty()).ok()?;
     let mut buf = [0u8; 16];
     let n = fs.read(&fd, &mut buf, Some(0)).ok()?;
@@ -2322,7 +2313,7 @@ fn read_sidecar<FS: ShimFS>(fs: &FS, sock_path: &str) -> Option<u16> {
 }
 
 /// Remove the sidecar metadata file.
-fn remove_sidecar<FS: ShimFS>(fs: &FS, sock_path: &str) {
-    let path = sidecar_path(sock_path);
+fn remove_sidecar<FS: ShimFS>(fs: &FS, key: &UnixSocketAddrKey) {
+    let path = sidecar_path(key);
     let _ = fs.unlink(path.as_str());
 }
