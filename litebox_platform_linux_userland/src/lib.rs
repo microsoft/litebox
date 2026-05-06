@@ -901,6 +901,12 @@ impl LinuxUserland {
         *self.worker_spawn_flags.write().unwrap() = flags;
     }
 
+    pub fn worker_exec_can_load_from_guest_fs(&self) -> bool {
+        self.worker_spawn_flags.read().unwrap().iter().any(|flag| {
+            flag.as_bytes() == b"--nine-p-broker" || flag.as_bytes() == b"--program-from-tar"
+        })
+    }
+
     /// Cancel any pending `read_from_stdin()` call, causing it to return EOF.
     /// Called when the guest process is exiting to unblock threads waiting on stdin.
     pub fn cancel_stdin(&self) {
@@ -1015,9 +1021,59 @@ impl LinuxUserland {
         Ok(written)
     }
 
+    /// Return whether a file is directly visible on the host filesystem.
+    pub fn host_file_exists(&self, path: &str) -> bool {
+        std::fs::metadata(path).is_ok_and(|meta| meta.is_file())
+    }
+
     /// Read a file directly from the host filesystem.
     pub fn read_host_file(&self, path: &str) -> Result<Vec<u8>, ()> {
         std::fs::read(path).map_err(|_| ())
+    }
+
+    /// Map a host file directly into the current process at a fixed guest address.
+    pub fn mmap_host_file(
+        &self,
+        path: &str,
+        address: usize,
+        len: usize,
+        prot: ProtFlags,
+        offset: usize,
+    ) -> Result<usize, ()> {
+        let path_cstr = CString::new(path).map_err(|_| ())?;
+        let fd = unsafe {
+            syscalls::syscall4(
+                syscalls::Sysno::open,
+                path_cstr.as_ptr() as usize,
+                OFlags::RDONLY.bits() as usize,
+                0,
+                syscall_intercept::SYSCALL_ARG_MAGIC,
+            )
+        }
+        .map_err(|_| ())?;
+
+        let result = unsafe {
+            syscalls::syscall6(
+                syscalls::Sysno::mmap,
+                address,
+                len,
+                prot.bits().reinterpret_as_unsigned() as usize,
+                (MapFlags::MAP_PRIVATE | MapFlags::MAP_FIXED)
+                    .bits()
+                    .reinterpret_as_unsigned() as usize
+                    | syscall_intercept::MMAP_FLAG_MAGIC as usize,
+                fd,
+                offset,
+            )
+        };
+        let _ = unsafe {
+            syscalls::syscall2(
+                syscalls::Sysno::close,
+                fd,
+                syscall_intercept::SYSCALL_ARG_MAGIC,
+            )
+        };
+        result.map_err(|_| ())
     }
 
     /// Register a CoW-eligible memory region backed by a file.
@@ -1242,7 +1298,7 @@ impl LinuxUserland {
         guest_euid: u32,
         guest_gid: u32,
         guest_egid: u32,
-        guest_exec_image: &[u8],
+        guest_exec_image: Option<&[u8]>,
         guest_interp_image: Option<(&str, &[u8])>,
         stdio: WorkerExecStdioBindings<FS, LinuxUserland>,
         direct_pipe_io: bool,
@@ -1310,7 +1366,10 @@ impl LinuxUserland {
             }
         }
 
-        let exec_image_fd = create_worker_exec_image_fd(guest_exec_image).map_err(|_| -1_i32)?;
+        let exec_image_fd = guest_exec_image
+            .map(create_worker_exec_image_fd)
+            .transpose()
+            .map_err(|_| -1_i32)?;
         let (result_read_fd, result_write_fd) = create_worker_result_pipe().map_err(|_| -1_i32)?;
         let interp_image_fd = guest_interp_image
             .map(|(_, image)| create_worker_exec_image_fd(image))
@@ -1320,11 +1379,11 @@ impl LinuxUserland {
         // Relocate infrastructure fds to the INFRA range (500+) so that
         // posix_spawn bridge dup2 actions (which target guest fd numbers
         // 3-99) cannot clobber them.
-        let exec_image_fd = relocate_fd_to_infra_range(exec_image_fd)?;
+        let exec_image_fd = exec_image_fd.map(relocate_fd_to_infra_range).transpose()?;
         let result_read_fd = relocate_fd_to_infra_range(result_read_fd)?;
         let result_write_fd = relocate_fd_to_infra_range(result_write_fd)?;
         let interp_image_fd = interp_image_fd
-            .map(|fd| relocate_fd_to_infra_range(fd))
+            .map(relocate_fd_to_infra_range)
             .transpose()?;
         let host_stdio_temp_sources =
             duplicate_host_stdio_sources_for_spawn(&stdio).map_err(|_| -1_i32)?;
@@ -1337,11 +1396,14 @@ impl LinuxUserland {
             CString::new(self_exe.as_os_str().as_bytes()).map_err(|_| -1_i32)?,
             CString::new("-Z").unwrap(),
             CString::new("--worker-exec").unwrap(),
-            CString::new("--worker-exec-fd").unwrap(),
-            CString::new(exec_image_fd.as_raw_fd().to_string()).map_err(|_| -1_i32)?,
-            CString::new("--worker-result-fd").unwrap(),
-            CString::new(result_write_fd.as_raw_fd().to_string()).map_err(|_| -1_i32)?,
         ];
+        if let Some(exec_image_fd) = exec_image_fd.as_ref() {
+            spawn_argv.push(CString::new("--worker-exec-fd").unwrap());
+            spawn_argv
+                .push(CString::new(exec_image_fd.as_raw_fd().to_string()).map_err(|_| -1_i32)?);
+        }
+        spawn_argv.push(CString::new("--worker-result-fd").unwrap());
+        spawn_argv.push(CString::new(result_write_fd.as_raw_fd().to_string()).map_err(|_| -1_i32)?);
         if let (Some((interp_path, _)), Some(interp_image_fd)) =
             (guest_interp_image, interp_image_fd.as_ref())
         {

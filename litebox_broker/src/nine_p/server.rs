@@ -1006,10 +1006,13 @@ impl Server {
                 };
                 let qid = metadata_to_qid(&meta);
 
-                // Try ELF patching for read-only opens
+                // Try ELF patching for read-only opens unless the shim is only
+                // opening the ELF for its own loader metadata path.
                 let is_read_only =
                     !flags.intersects(fcall::LOpenFlags::O_WRONLY | fcall::LOpenFlags::O_RDWR);
-                let patched = self.try_patch_elf(&mut file, &resolved, is_read_only);
+                let skip_elf_patch = flags.contains(fcall::LOpenFlags::LITEBOX_NO_ELF_PATCH);
+                let patched =
+                    self.try_patch_elf(&mut file, &resolved, is_read_only && !skip_elf_patch);
 
                 // Phase 3: Update fid state via inner write lock
                 let mut state = write_lock(&fid_arc, "fid");

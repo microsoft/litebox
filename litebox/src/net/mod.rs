@@ -507,8 +507,8 @@ where
         // poll, the listen sockets may change. We want the pre-poll state.
         let mut tcp_count = 0u16;
         let mut listen_count = 0u16;
-        let mut listen_ports: [u16; 8] = [0; 8];
-        let mut listen_addrs: [u8; 8] = [0; 8]; // 0=None, 1=loopback, 2=10.0.0.2, 3=other
+        let mut listen_ports: [u16; 32] = [0; 32];
+        let mut listen_addrs: [u8; 32] = [0; 32]; // 0=None, 1=loopback, 2=10.0.0.2, 3=other
         for (_handle, socket) in self.socket_set.iter() {
             if let smoltcp::socket::Socket::Tcp(tcp) = socket {
                 tcp_count += 1;
@@ -548,7 +548,19 @@ where
             .interface
             .poll(self.now(), &mut self.device, &mut self.socket_set);
 
-        result
+        // `poll` may receive TCP payload and ACK it without reporting a socket
+        // state change. Drain again so proxy-backed sockets become readable
+        // before the network worker goes back to sleep waiting for more packets.
+        let tcp_rx_ready = self.socket_set.iter().any(
+            |(_, socket)| matches!(socket, smoltcp::socket::Socket::Tcp(tcp) if tcp.can_recv()),
+        );
+        self.drain_all_socket_channel_buffers();
+
+        if tcp_rx_ready {
+            smoltcp::iface::PollResult::SocketStateChanged
+        } else {
+            result
+        }
     }
 
     /// (Internal-only API) Perform the queued interactions.
@@ -1434,13 +1446,14 @@ where
 
         // This prevents users from overloading things too badly; 4096 is the upper limit with
         // similar silent-cap behavior since Linux 5.4 (earlier versions capped even smaller, at
-        // 128, but we use the larger value to be more flexible).
+        // 128).
         //
         // TODO: smoltcp performs a linear search through SocketSet when dispatching an incoming
         // packet to the socket it belongs to, so having a large backlog can cause performance issues
-        // (see https://github.com/smoltcp-rs/smoltcp/issues/973). Restricting the backlog to a smaller
-        // value for now until we have a better solution.
-        let backlog = backlog.min(8);
+        // (see https://github.com/smoltcp-rs/smoltcp/issues/973). Keep a modest cap, but allow more
+        // than 8 pending handshakes so short concurrent bursts do not overflow the listener before
+        // the guest has a chance to accept and refill slots.
+        let backlog = backlog.min(32);
 
         match &mut socket_handle.specific {
             ProtocolSpecific::Tcp(handle) => {

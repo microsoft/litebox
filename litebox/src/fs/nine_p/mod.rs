@@ -1028,6 +1028,9 @@ impl<Platform: sync::RawSyncPrimitivesProvider, W: transport::Write> FileSystem<
         if flags.contains(super::OFlags::NOATIME) {
             lflags |= fcall::LOpenFlags::O_NOATIME;
         }
+        if flags.contains(super::OFlags::LITEBOX_NO_ELF_PATCH) {
+            lflags |= fcall::LOpenFlags::LITEBOX_NO_ELF_PATCH;
+        }
 
         lflags
     }

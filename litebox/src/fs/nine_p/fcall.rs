@@ -152,6 +152,7 @@ bitflags! {
         const O_NOATIME = 0o1000000;
         const O_CLOEXEC = 0o2000000;
         const O_SYNC = 0o4000000;
+        const LITEBOX_NO_ELF_PATCH = 0x8000_0000;
     }
 }
 
