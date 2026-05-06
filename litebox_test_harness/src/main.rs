@@ -268,61 +268,6 @@ fn main() {
                 std::thread::sleep(std::time::Duration::from_millis(50));
             }
         }
-        "tcp-listen-busy" => {
-            // Listen on a TCP port, do CPU-bound work for N seconds, then
-            // accept one connection and echo. Simulates Node.js initialization:
-            // listen() succeeds, module loading delays accept().
-            let port: u16 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(9999);
-            let busy_secs: u64 = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(3);
-            let listener = std::net::TcpListener::bind(format!("0.0.0.0:{port}"))
-                .expect("tcp-listen-busy: bind failed");
-            eprintln!("[tcp-listen-busy] listening on 0.0.0.0:{port}, busy for {busy_secs}s");
-            let start = std::time::Instant::now();
-            let mut counter: u64 = 0;
-            while start.elapsed().as_secs() < busy_secs {
-                counter = counter.wrapping_add(1);
-                std::hint::black_box(counter);
-            }
-            eprintln!("[tcp-listen-busy] busy done, accepting with timeout");
-            // Accept with a timeout so this process doesn't block forever
-            // if nobody connects (e.g., when used as a child of tcp-listen-fork
-            // where the parent connects to a different port).
-            listener.set_nonblocking(false).ok();
-            let timeout = std::time::Duration::from_secs(10);
-            let deadline = std::time::Instant::now() + timeout;
-            // Use a polling loop since std TcpListener doesn't have set_timeout.
-            listener.set_nonblocking(true).ok();
-            loop {
-                match listener.accept() {
-                    Ok((mut stream, addr)) => {
-                        eprintln!("[tcp-listen-busy] accepted from {addr}");
-                        use std::io::{Read, Write};
-                        let mut buf = [0u8; 4096];
-                        match stream.read(&mut buf) {
-                            Ok(n) if n > 0 => {
-                                let _ = stream.write_all(&buf[..n]);
-                                use std::net::Shutdown;
-                                let _ = stream.shutdown(Shutdown::Write);
-                                eprintln!("[tcp-listen-busy] echoed {n} bytes");
-                            }
-                            _ => {}
-                        }
-                        break;
-                    }
-                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                        if std::time::Instant::now() >= deadline {
-                            eprintln!("[tcp-listen-busy] accept timeout, exiting");
-                            break;
-                        }
-                        std::thread::sleep(std::time::Duration::from_millis(50));
-                    }
-                    Err(e) => {
-                        eprintln!("[tcp-listen-busy] accept error: {e}");
-                        break;
-                    }
-                }
-            }
-        }
         "tcp-fork-listen-accept" => {
             // Tests fd inheritance across fork+exec: the VS Code CLI pattern
             // where the parent's listen socket is passed to the child.
