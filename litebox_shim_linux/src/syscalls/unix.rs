@@ -694,12 +694,11 @@ impl<FS: ShimFS> UnixConnectedStream<FS> {
                 use litebox::net::socket_channel::NetworkProxy;
                 match proxy.as_ref() {
                     NetworkProxy::Stream(stream) => match stream.try_write(&msg.data) {
-                        Ok(n) => {
-                            if n > 0 {
-                                litebox_platform_multiplex::platform().wake_network_worker();
-                            }
+                        Ok(n) if n > 0 => {
+                            litebox_platform_multiplex::platform().wake_network_worker();
                             Ok(())
                         }
+                        Ok(_) => Err((msg, Errno::EAGAIN)),
                         Err(_) => Err((msg, Errno::EPIPE)),
                     },
                     _ => Err((msg, Errno::EINVAL)),
@@ -797,6 +796,20 @@ impl<FS: ShimFS> UnixConnectedStream<FS> {
             buf = &mut buf[n..];
         }
         Ok(total_read)
+    }
+
+    fn register_observer(
+        &self,
+        observer: Weak<dyn litebox::event::observer::Observer<Events>>,
+        mask: Events,
+    ) {
+        match &self.transport {
+            UnixTransport::Tcp { proxy } => {
+                use litebox::event::IOPollable;
+                proxy.register_observer(observer, mask);
+            }
+            UnixTransport::Channel { .. } => self.pollee.register_observer(observer, mask),
+        }
     }
 
     fn check_io_events(&self) -> Events {
@@ -1216,6 +1229,12 @@ impl<FS: ShimFS> UnixStream<FS> {
                         |_| Err(Errno::EINVAL),
                     ) {
                         Ok(accepted_tcp_fd) => {
+                            backlog
+                                .pending_tcp_connections
+                                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |pending| {
+                                    pending.checked_sub(1)
+                                })
+                                .ok();
                             let proxy = task.global.initialize_socket(
                                 &accepted_tcp_fd,
                                 SockType::Stream,
@@ -1270,7 +1289,7 @@ impl<FS: ShimFS> UnixStream<FS> {
                 |observer, mask| {
                     self.with_state_ref(|state| {
                         let conn = state.connected().ok_or(Errno::ENOTCONN)?;
-                        conn.pollee.register_observer(observer, mask);
+                        conn.register_observer(observer, mask);
                         Ok(())
                     })
                 },
@@ -1317,7 +1336,7 @@ impl<FS: ShimFS> UnixStream<FS> {
                 |observer, mask| {
                     self.with_state_ref(|state| {
                         let conn = state.connected().ok_or(Errno::ENOTCONN)?;
-                        conn.pollee.register_observer(observer, mask);
+                        conn.register_observer(observer, mask);
                         Ok(())
                     })
                 },
