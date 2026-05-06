@@ -707,7 +707,7 @@ pub fn collect_all_tests() -> Vec<Test> {
     tests.extend(platform_fixes::register_fork_listen_close_tests());
     tests.extend(platform_fixes::register_proc_filesystem_tests());
     tests.extend(platform_fixes::register_subtree_kill_tests());
-    fork_matrix::register_fork_matrix(&mut tests);
+    fork_matrix::register_fork_matrix(&mut registry::Registry::new(&mut tests));
     special_cases::register_unix_socket(&mut tests);
     special_cases::register_cross_worker(&mut tests);
     special_cases::register_pipe_eof(&mut tests);

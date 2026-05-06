@@ -12,6 +12,9 @@
 //! - Non-PIE invocation method
 //! - Contamination pattern (non-PIE then PIE, various depths)
 
+use super::agents::AgentName;
+use super::registry::Registry;
+
 // ═══════════════════════════════════════════════════════════════════
 // SHELL PATTERNS × DEPTH
 // ═══════════════════════════════════════════════════════════════════
@@ -115,7 +118,7 @@ const SHELL_PATTERNS: &[ShellPattern] = &[
     },
 ];
 
-const DEPTH_AGENTS: &[&str] = &["A", "AA", "AAA"];
+const DEPTH_AGENTS: &[AgentName] = &[AgentName::A, AgentName::AA, AgentName::AAA];
 
 // ═══════════════════════════════════════════════════════════════════
 // EXEC BINARY × DEPTH
@@ -253,7 +256,7 @@ impl DfInvocation {
 const DF_TRIGGERS: &[DfTrigger] = &[DfTrigger::Mmap, DfTrigger::Thread];
 const DF_BINARIES: &[DfBinary] = &[DfBinary::Pie, DfBinary::NonPie, DfBinary::Node];
 const DF_INVOCATIONS: &[DfInvocation] = &[DfInvocation::Direct, DfInvocation::ScriptFile];
-const DF_AGENTS: &[&str] = &["A", "AA"];
+const DF_AGENTS: &[AgentName] = &[AgentName::A, AgentName::AA];
 
 // ═══════════════════════════════════════════════════════════════════
 // STRESS EXEC: mode × spawn method
@@ -347,182 +350,170 @@ const CONTAMINATION_CASES: &[ContaminationCase] = &[
 // RUNNER
 // ═══════════════════════════════════════════════════════════════════
 
-pub(crate) fn register_fork_matrix(tests: &mut Vec<super::Test>) {
+pub(crate) fn register_fork_matrix(reg: &mut Registry<'_>) {
     // Shell patterns x depth
     for &agent in DEPTH_AGENTS {
         for pat in SHELL_PATTERNS {
             let id = format!("XB.{}.{agent}", pat.name);
-            let agent_s = agent.to_string();
+            let agent_label = agent.to_string();
             let expected = pat.expected.to_string();
             let cmd_str = pat.cmd.to_string();
-            tests.push(super::Test {
-                suite: "fork",
-                group: "fork_matrix",
-                id,
-                xfail: None,
-                timeout_secs: 60,
-                declared_agents: Vec::new(),
-                run: Box::new(move |r| {
-                    Box::pin(async move {
-                        let cmd = vec!["bash".into(), "-c".into(), cmd_str];
-                        let resp = r.send(&agent_s, super::exec(cmd)).await;
-                        let pass = if expected.is_empty() {
-                            matches!(
-                                &resp,
-                                crate::protocol::Response::ExecResult { exit_code: 0, stdout, .. }
-                                    if !stdout.trim().is_empty()
+
+            reg.test("fork", "fork_matrix", id)
+                .timeout(60)
+                .build(move |cx| {
+                    let handle = cx.require(agent);
+                    Box::new(move |run| {
+                        Box::pin(async move {
+                            let cmd = vec!["bash".into(), "-c".into(), cmd_str];
+                            let resp = run.send(&handle, super::exec(cmd)).await;
+                            let pass = if expected.is_empty() {
+                                matches!(
+                                    &resp,
+                                    crate::protocol::Response::ExecResult { exit_code: 0, stdout, .. }
+                                        if !stdout.trim().is_empty()
+                                )
+                            } else {
+                                matches!(
+                                    &resp,
+                                    crate::protocol::Response::ExecResult { exit_code: 0, stdout, .. }
+                                        if stdout.contains(&*expected)
+                                )
+                            };
+                            let timeout =
+                                matches!(&resp, crate::protocol::Response::ExecTimeout { .. });
+                            super::TestOutcome::new(
+                                &agent_label,
+                                pass,
+                                format!("timeout={timeout} {resp:?}"),
                             )
-                        } else {
-                            matches!(
-                                &resp,
-                                crate::protocol::Response::ExecResult { exit_code: 0, stdout, .. }
-                                    if stdout.contains(&*expected)
-                            )
-                        };
-                        let timeout =
-                            matches!(&resp, crate::protocol::Response::ExecTimeout { .. });
-                        super::TestOutcome::new(
-                            &agent_s,
-                            pass,
-                            format!("timeout={timeout} {resp:?}"),
-                        )
+                        })
                     })
-                }),
-            });
+                });
         }
     }
 
     // Exec binary: Node x depth
     for &agent in DEPTH_AGENTS {
         let id = format!("X.node.{agent}");
-        let agent_s = agent.to_string();
-        tests.push(super::Test {
-            suite: "fork",
-            group: "fork_matrix",
-            id,
-            xfail: None,
-            timeout_secs: 60,
-            declared_agents: Vec::new(),
-            run: Box::new(move |r| {
-                let agent_s2 = agent_s.clone();
+        let agent_label = agent.to_string();
+        reg.test("fork", "fork_matrix", id)
+            .timeout(60)
+            .build(move |cx| {
+                let handle = cx.require(agent);
+                Box::new(move |run| {
+                    Box::pin(async move {
+                        let expected = format!("node_{agent_label}_ok");
+                        let resp = run
+                            .send(
+                                &handle,
+                                super::exec(vec![
+                                    "/usr/local/bin/node".into(),
+                                    "-e".into(),
+                                    format!("console.log('node_{agent_label}_ok')"),
+                                ]),
+                            )
+                            .await;
+                        let pass = matches!(
+                            &resp,
+                            crate::protocol::Response::ExecResult { exit_code: 0, stdout, .. }
+                                if stdout.contains(&expected)
+                        );
+                        super::TestOutcome::new(&agent_label, pass, format!("{resp:?}"))
+                    })
+                })
+            });
+    }
+
+    // Node.js process.stdout.write
+    reg.test("fork", "fork_matrix", "X.node_stdout_write.A")
+        .timeout(60)
+        .build(move |cx| {
+            let handle = cx.require(AgentName::A);
+            Box::new(move |run| {
                 Box::pin(async move {
-                    let expected = format!("node_{agent_s}_ok");
-                    let resp = r
+                    let resp = run
                         .send(
-                            &agent_s,
+                            &handle,
                             super::exec(vec![
                                 "/usr/local/bin/node".into(),
                                 "-e".into(),
-                                format!("console.log('node_{agent_s}_ok')"),
+                                "process.stdout.write('stdout_write_ok\\n')".into(),
                             ]),
                         )
                         .await;
                     let pass = matches!(
                         &resp,
                         crate::protocol::Response::ExecResult { exit_code: 0, stdout, .. }
-                            if stdout.contains(&expected)
+                            if stdout.contains("stdout_write_ok")
                     );
-                    super::TestOutcome::new(&agent_s2, pass, format!("{resp:?}"))
+                    super::TestOutcome::new("A", pass, format!("{resp:?}"))
                 })
-            }),
-        });
-    }
-
-    // Node.js process.stdout.write
-    tests.push(super::Test {
-        suite: "fork",
-        group: "fork_matrix",
-        id: "X.node_stdout_write.A".to_string(),
-        xfail: None,
-        timeout_secs: 60,
-        declared_agents: Vec::new(),
-        run: Box::new(|r| {
-            Box::pin(async move {
-                let resp = r
-                    .send(
-                        "A",
-                        super::exec(vec![
-                            "/usr/local/bin/node".into(),
-                            "-e".into(),
-                            "process.stdout.write('stdout_write_ok\\n')".into(),
-                        ]),
-                    )
-                    .await;
-                let pass = matches!(
-                    &resp,
-                    crate::protocol::Response::ExecResult { exit_code: 0, stdout, .. }
-                        if stdout.contains("stdout_write_ok")
-                );
-                super::TestOutcome::new("A", pass, format!("{resp:?}"))
             })
-        }),
-    });
+        });
 
     // Exec method tests
     for em in EXEC_METHODS {
         let id = format!("XM.{}", em.name);
         let template = em.cmd_template.to_string();
         let expected = em.expected.to_string();
-        tests.push(super::Test {
-            suite: "fork",
-            group: "fork_matrix",
-            id,
-            xfail: None,
-            timeout_secs: 60,
-            declared_agents: Vec::new(),
-            run: Box::new(move |r| {
-                let self_exe = r.self_exe.clone();
+        reg.test("fork", "fork_matrix", id)
+            .timeout(60)
+            .build(move |cx| {
+                let handle = cx.require(AgentName::A);
+                Box::new(move |run| {
+                    Box::pin(async move {
+                        let self_exe = run.self_exe().to_string();
+                        let cmd_str = template.replace("{self_exe}", &self_exe);
+                        let resp = run
+                            .send(
+                                &handle,
+                                super::exec(vec!["bash".into(), "-c".into(), cmd_str]),
+                            )
+                            .await;
+                        let pass = matches!(
+                            &resp,
+                            crate::protocol::Response::ExecResult { exit_code: 0, stdout, .. }
+                                if stdout.contains(&*expected)
+                        );
+                        super::TestOutcome::new("A", pass, format!("{resp:?}"))
+                    })
+                })
+            });
+    }
+
+    // XM.node_networkInterfaces
+    reg.test("fork", "fork_matrix", "XM.node_networkInterfaces")
+        .timeout(60)
+        .build(move |cx| {
+            let handle = cx.require(AgentName::A);
+            Box::new(move |run| {
                 Box::pin(async move {
-                    let cmd_str = template.replace("{self_exe}", &self_exe);
-                    let resp = r
-                        .send("A", super::exec(vec!["bash".into(), "-c".into(), cmd_str]))
+                    let resp = run
+                        .send(
+                            &handle,
+                            super::exec_timeout(
+                                vec![
+                                    "/usr/local/bin/node".into(),
+                                    "-e".into(),
+                                    "try { const r = require('os').networkInterfaces(); \
+                                     console.log('NETIF_OK:' + Object.keys(r).length); } \
+                                     catch(e) { console.log('NETIF_ERR:' + e.code); }"
+                                        .into(),
+                                ],
+                                30,
+                            ),
+                        )
                         .await;
                     let pass = matches!(
                         &resp,
                         crate::protocol::Response::ExecResult { exit_code: 0, stdout, .. }
-                            if stdout.contains(&*expected)
+                            if stdout.contains("NETIF_OK:") || stdout.contains("NETIF_ERR:")
                     );
                     super::TestOutcome::new("A", pass, format!("{resp:?}"))
                 })
-            }),
-        });
-    }
-
-    // XM.node_networkInterfaces
-    tests.push(super::Test {
-        suite: "fork",
-        group: "fork_matrix",
-        id: "XM.node_networkInterfaces".to_string(),
-        xfail: None,
-        timeout_secs: 60,
-        declared_agents: Vec::new(),
-        run: Box::new(|r| {
-            Box::pin(async move {
-                let resp = r
-                    .send(
-                        "A",
-                        super::exec_timeout(
-                            vec![
-                                "/usr/local/bin/node".into(),
-                                "-e".into(),
-                                "try { const r = require('os').networkInterfaces(); \
-                                 console.log('NETIF_OK:' + Object.keys(r).length); } \
-                                 catch(e) { console.log('NETIF_ERR:' + e.code); }"
-                                    .into(),
-                            ],
-                            30,
-                        ),
-                    )
-                    .await;
-                let pass = matches!(
-                    &resp,
-                    crate::protocol::Response::ExecResult { exit_code: 0, stdout, .. }
-                        if stdout.contains("NETIF_OK:") || stdout.contains("NETIF_ERR:")
-                );
-                super::TestOutcome::new("A", pass, format!("{resp:?}"))
             })
-        }),
-    });
+        });
 
     // Delayed fork matrix
     for &trigger in DF_TRIGGERS {
@@ -535,241 +526,153 @@ pub(crate) fn register_fork_matrix(tests: &mut Vec<super::Test>) {
                         binary.suffix(),
                         invocation.suffix()
                     );
-                    let agent_s = agent.to_string();
+                    let agent_label = agent.to_string();
                     let trigger_sub = trigger.subcommand().to_string();
                     let binary_expected = binary.expected().to_string();
 
-                    tests.push(super::Test {
-                        suite: "fork",
-                        group: "fork_matrix",
-                        id,
-                        xfail: None,
-                        timeout_secs: 60,
-                        declared_agents: Vec::new(),
-                        run: Box::new(move |r| {
-                            let self_exe = r.self_exe.clone();
-                            Box::pin(async move {
-                                let (inner_cmd, inner_args): (String, Vec<String>) = match binary {
-                                    DfBinary::Pie => (self_exe.clone(), vec!["echo-test".into()]),
-                                    DfBinary::NonPie => match crate::find_nonpie_binary() {
-                                        Some(p) => (p, vec!["echo-test".into()]),
-                                        None => {
-                                            return super::TestOutcome::new(
-                                                &agent_s,
-                                                false,
-                                                "FAIL: nonpie binary not found",
-                                            );
-                                        }
-                                    },
-                                    DfBinary::Node => (
-                                        "/usr/local/bin/node".into(),
-                                        vec!["-e".into(), "console.log('df_node_ok')".into()],
-                                    ),
-                                };
-
-                                let resp = match invocation {
-                                    DfInvocation::Direct => {
-                                        let mut args =
-                                            vec![self_exe.clone(), trigger_sub.clone(), inner_cmd];
-                                        args.extend(inner_args);
-                                        r.send(&agent_s, super::exec(args)).await
-                                    }
-                                    DfInvocation::ScriptFile => {
-                                        let test_id_safe = format!(
-                                            "XDF_{}_{}_{}_{}",
-                                            trigger.suffix(),
-                                            binary.suffix(),
-                                            invocation.suffix(),
-                                            agent_s
-                                        );
-                                        let script = format!("/tmp/xdf_{test_id_safe}.sh");
-                                        let inner_full = if inner_args.is_empty() {
-                                            inner_cmd.clone()
-                                        } else {
-                                            let escaped: Vec<String> = inner_args
-                                                .iter()
-                                                .map(|a| {
-                                                    if a.contains(|c: char| {
-                                                        !c.is_alphanumeric()
-                                                            && c != '_'
-                                                            && c != '-'
-                                                            && c != '.'
-                                                            && c != '/'
-                                                    }) {
-                                                        format!("\"{}\"", a.replace('"', "\\\""))
-                                                    } else {
-                                                        a.clone()
-                                                    }
-                                                })
-                                                .collect();
-                                            format!("{inner_cmd} {}", escaped.join(" "))
+                    reg.test("fork", "fork_matrix", id)
+                        .timeout(60)
+                        .build(move |cx| {
+                            let handle = cx.require(agent);
+                            Box::new(move |run| {
+                                Box::pin(async move {
+                                    let self_exe = run.self_exe().to_string();
+                                    let (inner_cmd, inner_args): (String, Vec<String>) =
+                                        match binary {
+                                            DfBinary::Pie => {
+                                                (self_exe.clone(), vec!["echo-test".into()])
+                                            }
+                                            DfBinary::NonPie => match crate::find_nonpie_binary() {
+                                                Some(p) => (p, vec!["echo-test".into()]),
+                                                None => {
+                                                    return super::TestOutcome::new(
+                                                        &agent_label,
+                                                        false,
+                                                        "FAIL: nonpie binary not found",
+                                                    );
+                                                }
+                                            },
+                                            DfBinary::Node => (
+                                                "/usr/local/bin/node".into(),
+                                                vec![
+                                                    "-e".into(),
+                                                    "console.log('df_node_ok')".into(),
+                                                ],
+                                            ),
                                         };
-                                        let body = format!(
-                                            "cat > {script} <<'XEOF'\n#!/usr/bin/bash\n\
-                                             {self_exe} {trigger_sub} {inner_full}\n\
-                                             XEOF\nchmod +x {script} && {script}; \
-                                             EXIT=$?; rm -f {script}; exit $EXIT",
-                                        );
-                                        r.send(
-                                            &agent_s,
-                                            super::exec(vec!["bash".into(), "-c".into(), body]),
-                                        )
-                                        .await
-                                    }
-                                };
 
-                                let not_found = matches!(
-                                    &resp,
-                                    crate::protocol::Response::ExecResult { exit_code: 127, .. }
-                                ) || matches!(
-                                    &resp,
-                                    crate::protocol::Response::Error { error }
-                                        if error.contains("not found")
-                                );
-                                if not_found {
-                                    return super::TestOutcome::new(
-                                        &agent_s,
-                                        false,
-                                        "FAIL: binary not in rootfs",
+                                    let resp = match invocation {
+                                        DfInvocation::Direct => {
+                                            let mut args = vec![
+                                                self_exe.clone(),
+                                                trigger_sub.clone(),
+                                                inner_cmd,
+                                            ];
+                                            args.extend(inner_args);
+                                            run.send(&handle, super::exec(args)).await
+                                        }
+                                        DfInvocation::ScriptFile => {
+                                            let test_id_safe = format!(
+                                                "XDF_{}_{}_{}_{}",
+                                                trigger.suffix(),
+                                                binary.suffix(),
+                                                invocation.suffix(),
+                                                agent_label
+                                            );
+                                            let script = format!("/tmp/xdf_{test_id_safe}.sh");
+                                            let inner_full = if inner_args.is_empty() {
+                                                inner_cmd.clone()
+                                            } else {
+                                                let escaped: Vec<String> = inner_args
+                                                    .iter()
+                                                    .map(|a| {
+                                                        if a.contains(|c: char| {
+                                                            !c.is_alphanumeric()
+                                                                && c != '_'
+                                                                && c != '-'
+                                                                && c != '.'
+                                                                && c != '/'
+                                                        }) {
+                                                            format!(
+                                                                "\"{}\"",
+                                                                a.replace('"', "\\\"")
+                                                            )
+                                                        } else {
+                                                            a.clone()
+                                                        }
+                                                    })
+                                                    .collect();
+                                                format!("{inner_cmd} {}", escaped.join(" "))
+                                            };
+                                            let body = format!(
+                                                "cat > {script} <<'XEOF'\n#!/usr/bin/bash\n\
+                                                 {self_exe} {trigger_sub} {inner_full}\n\
+                                                 XEOF\nchmod +x {script} && {script}; \
+                                                 EXIT=$?; rm -f {script}; exit $EXIT",
+                                            );
+                                            run.send(
+                                                &handle,
+                                                super::exec(vec!["bash".into(), "-c".into(), body]),
+                                            )
+                                            .await
+                                        }
+                                    };
+
+                                    let not_found = matches!(
+                                        &resp,
+                                        crate::protocol::Response::ExecResult {
+                                            exit_code: 127,
+                                            ..
+                                        }
+                                    ) || matches!(
+                                        &resp,
+                                        crate::protocol::Response::Error { error }
+                                            if error.contains("not found")
                                     );
-                                }
+                                    if not_found {
+                                        return super::TestOutcome::new(
+                                            &agent_label,
+                                            false,
+                                            "FAIL: binary not in rootfs",
+                                        );
+                                    }
 
-                                let pass = matches!(
-                                    &resp,
-                                    crate::protocol::Response::ExecResult {
-                                        exit_code: 0, stdout, ..
-                                    } if stdout.contains(&*binary_expected)
-                                );
-                                super::TestOutcome::new(&agent_s, pass, format!("{resp:?}"))
+                                    let pass = matches!(
+                                        &resp,
+                                        crate::protocol::Response::ExecResult {
+                                            exit_code: 0, stdout, ..
+                                        } if stdout.contains(&*binary_expected)
+                                    );
+                                    super::TestOutcome::new(&agent_label, pass, format!("{resp:?}"))
+                                })
                             })
-                        }),
-                    });
+                        });
                 }
             }
         }
     }
 
     // XDF.triple_nesting
-    tests.push(super::Test {
-        suite: "fork",
-        group: "fork_matrix",
-        id: "XDF.triple_nesting".to_string(),
-        xfail: None,
-        timeout_secs: 60,
-        declared_agents: Vec::new(),
-        run: Box::new(|r| {
-            let self_exe = r.self_exe.clone();
-            Box::pin(async move {
-                let resp = r
-                    .send(
-                        "A",
-                        super::exec(vec![
-                            self_exe.clone(),
-                            "trigger-delayed-fork".into(),
-                            self_exe.clone(),
-                            "trigger-delayed-fork".into(),
-                            self_exe.clone(),
-                            "echo-test".into(),
-                        ]),
-                    )
-                    .await;
-                let pass = matches!(
-                    &resp,
-                    crate::protocol::Response::ExecResult { exit_code: 0, stdout, .. }
-                        if stdout.contains("ECHO_TEST_OK")
-                );
-                super::TestOutcome::new("A", pass, format!("{resp:?}"))
-            })
-        }),
-    });
-
-    // Stress exec matrix
-    for &mode in STRESS_MODES {
-        for &(spawn_name, spawn_args) in SPAWN_METHODS {
-            let id = format!("XS.{mode}.{spawn_name}");
-            let mode_s = mode.to_string();
-            let extra: Vec<String> = spawn_args.iter().map(|s| s.to_string()).collect();
-            tests.push(super::Test {
-                suite: "fork",
-                group: "fork_matrix",
-                id,
-                xfail: None,
-                timeout_secs: 60,
-                declared_agents: Vec::new(),
-                run: Box::new(move |r| {
-                    let self_exe = r.self_exe.clone();
-                    Box::pin(async move {
-                        let mut args = vec![self_exe, "stress-exec".into(), "10".into(), mode_s];
-                        args.extend(extra);
-                        let resp = r.send("A", super::exec(args)).await;
-                        let pass = matches!(
-                            &resp,
-                            crate::protocol::Response::ExecResult { exit_code: 0, stdout, .. }
-                                if stdout.contains("STRESS_START")
-                                    && stdout.contains("STRESS_END failures=0")
-                        );
-                        super::TestOutcome::new("A", pass, format!("{resp:?}"))
-                    })
-                }),
-            });
-        }
-    }
-
-    // Non-PIE invocation tests
-    for nc in NONPIE_CASES {
-        let id = format!("XNP.{}", nc.name);
-        let bash_cmd = nc.bash_cmd.map(|s| s.to_string());
-        tests.push(super::Test {
-            suite: "fork",
-            group: "fork_matrix",
-            id,
-            xfail: None,
-            timeout_secs: 60,
-            declared_agents: Vec::new(),
-            run: Box::new(move |r| {
+    reg.test("fork", "fork_matrix", "XDF.triple_nesting")
+        .timeout(60)
+        .build(move |cx| {
+            let handle = cx.require(AgentName::A);
+            Box::new(move |run| {
                 Box::pin(async move {
-                    let nonpie_bin = match crate::find_nonpie_binary() {
-                        Some(p) => p,
-                        None => {
-                            return super::TestOutcome::new(
-                                "A",
-                                false,
-                                "FAIL: nonpie binary not found",
-                            );
-                        }
-                    };
-                    let resp = match &bash_cmd {
-                        None => {
-                            r.send(
-                                "A",
-                                super::exec(vec![nonpie_bin.clone(), "echo-test".into()]),
-                            )
-                            .await
-                        }
-                        Some(cmd) => {
-                            let resolved = cmd
-                                .replace("/nonpie-bin", &nonpie_bin)
-                                .replace("/nonpie-cmd", &format!("{nonpie_bin} echo-test"));
-                            r.send("A", super::exec(vec!["bash".into(), "-c".into(), resolved]))
-                                .await
-                        }
-                    };
-                    let not_found = matches!(
-                        &resp,
-                        crate::protocol::Response::ExecResult { exit_code: 127, .. }
-                    ) || matches!(&resp, crate::protocol::Response::Error { .. });
-                    let skipped = matches!(
-                        &resp,
-                        crate::protocol::Response::ExecResult { stdout, .. }
-                            if stdout.contains("SKIP")
-                    );
-                    if not_found || skipped {
-                        return super::TestOutcome::new(
-                            "A",
-                            false,
-                            "FAIL: nonpie binary not found",
-                        );
-                    }
+                    let self_exe = run.self_exe().to_string();
+                    let resp = run
+                        .send(
+                            &handle,
+                            super::exec(vec![
+                                self_exe.clone(),
+                                "trigger-delayed-fork".into(),
+                                self_exe.clone(),
+                                "trigger-delayed-fork".into(),
+                                self_exe,
+                                "echo-test".into(),
+                            ]),
+                        )
+                        .await;
                     let pass = matches!(
                         &resp,
                         crate::protocol::Response::ExecResult { exit_code: 0, stdout, .. }
@@ -777,69 +680,114 @@ pub(crate) fn register_fork_matrix(tests: &mut Vec<super::Test>) {
                     );
                     super::TestOutcome::new("A", pass, format!("{resp:?}"))
                 })
-            }),
+            })
         });
+
+    // Stress exec matrix
+    for &mode in STRESS_MODES {
+        for &(spawn_name, spawn_args) in SPAWN_METHODS {
+            let id = format!("XS.{mode}.{spawn_name}");
+            let mode_s = mode.to_string();
+            let extra: Vec<String> = spawn_args.iter().map(|s| s.to_string()).collect();
+            reg.test("fork", "fork_matrix", id)
+                .timeout(60)
+                .build(move |cx| {
+                    let handle = cx.require(AgentName::A);
+                    Box::new(move |run| {
+                        Box::pin(async move {
+                            let self_exe = run.self_exe().to_string();
+                            let mut args =
+                                vec![self_exe, "stress-exec".into(), "10".into(), mode_s];
+                            args.extend(extra);
+                            let resp = run.send(&handle, super::exec(args)).await;
+                            let pass = matches!(
+                                &resp,
+                                crate::protocol::Response::ExecResult { exit_code: 0, stdout, .. }
+                                    if stdout.contains("STRESS_START")
+                                        && stdout.contains("STRESS_END failures=0")
+                            );
+                            super::TestOutcome::new("A", pass, format!("{resp:?}"))
+                        })
+                    })
+                });
+        }
+    }
+
+    // Non-PIE invocation tests
+    for nc in NONPIE_CASES {
+        let id = format!("XNP.{}", nc.name);
+        let bash_cmd = nc.bash_cmd.map(|s| s.to_string());
+        reg.test("fork", "fork_matrix", id)
+            .timeout(60)
+            .build(move |cx| {
+                let handle = cx.require(AgentName::A);
+                Box::new(move |run| {
+                    Box::pin(async move {
+                        let nonpie_bin = match crate::find_nonpie_binary() {
+                            Some(p) => p,
+                            None => {
+                                return super::TestOutcome::new(
+                                    "A",
+                                    false,
+                                    "FAIL: nonpie binary not found",
+                                );
+                            }
+                        };
+                        let resp = match &bash_cmd {
+                            None => {
+                                run.send(
+                                    &handle,
+                                    super::exec(vec![nonpie_bin.clone(), "echo-test".into()]),
+                                )
+                                .await
+                            }
+                            Some(cmd) => {
+                                let resolved = cmd
+                                    .replace("/nonpie-bin", &nonpie_bin)
+                                    .replace("/nonpie-cmd", &format!("{nonpie_bin} echo-test"));
+                                run.send(
+                                    &handle,
+                                    super::exec(vec!["bash".into(), "-c".into(), resolved]),
+                                )
+                                .await
+                            }
+                        };
+                        let not_found =
+                            matches!(
+                                &resp,
+                                crate::protocol::Response::ExecResult { exit_code: 127, .. }
+                            ) || matches!(&resp, crate::protocol::Response::Error { .. });
+                        let skipped = matches!(
+                            &resp,
+                            crate::protocol::Response::ExecResult { stdout, .. }
+                                if stdout.contains("SKIP")
+                        );
+                        if not_found || skipped {
+                            return super::TestOutcome::new(
+                                "A",
+                                false,
+                                "FAIL: nonpie binary not found",
+                            );
+                        }
+                        let pass = matches!(
+                            &resp,
+                            crate::protocol::Response::ExecResult { exit_code: 0, stdout, .. }
+                                if stdout.contains("ECHO_TEST_OK")
+                        );
+                        super::TestOutcome::new("A", pass, format!("{resp:?}"))
+                    })
+                })
+            });
     }
 
     // XC.init_level
-    tests.push(super::Test {
-        suite: "fork",
-        group: "fork_matrix",
-        id: "XC.init_level".to_string(),
-        xfail: None,
-        timeout_secs: 60,
-        declared_agents: Vec::new(),
-        run: Box::new(|r| {
-            let self_exe = r.self_exe.clone();
-            Box::pin(async move {
-                let nonpie_bin = match crate::find_nonpie_binary() {
-                    Some(p) => p,
-                    None => {
-                        return super::TestOutcome::new(
-                            "A",
-                            false,
-                            "FAIL: nonpie binary not found",
-                        );
-                    }
-                };
-                let resp = r
-                    .send("A", super::exec(vec![nonpie_bin, "echo-test".into()]))
-                    .await;
-                let not_found = matches!(
-                    &resp,
-                    crate::protocol::Response::ExecResult { exit_code: 127, .. }
-                ) || matches!(&resp, crate::protocol::Response::Error { .. });
-                if not_found {
-                    return super::TestOutcome::new("A", false, "FAIL: nonpie binary not found");
-                }
-                let resp2 = r
-                    .send("A", super::exec(vec![self_exe, "echo-test".into()]))
-                    .await;
-                let pass = matches!(
-                    &resp2,
-                    crate::protocol::Response::ExecResult { exit_code: 0, stdout, .. }
-                        if stdout == "ECHO_TEST_OK"
-                );
-                super::TestOutcome::new("A", pass, format!("{resp2:?}"))
-            })
-        }),
-    });
-
-    // Contamination pattern cases
-    for cc in CONTAMINATION_CASES {
-        let id = format!("XC.{}", cc.name);
-        let template = cc.bash_template.unwrap().to_string();
-        let expected = cc.expected.to_string();
-        tests.push(super::Test {
-            suite: "fork",
-            group: "fork_matrix",
-            id,
-            xfail: None,
-            timeout_secs: 60,
-            declared_agents: Vec::new(),
-            run: Box::new(move |r| {
-                let self_exe = r.self_exe.clone();
+    reg.test("fork", "fork_matrix", "XC.init_level")
+        .timeout(60)
+        .build(move |cx| {
+            let handle = cx.require(AgentName::A);
+            Box::new(move |run| {
                 Box::pin(async move {
+                    let self_exe = run.self_exe().to_string();
                     let nonpie_bin = match crate::find_nonpie_binary() {
                         Some(p) => p,
                         None => {
@@ -850,34 +798,86 @@ pub(crate) fn register_fork_matrix(tests: &mut Vec<super::Test>) {
                             );
                         }
                     };
-                    let nonpie_cmd = format!("{nonpie_bin} echo-test");
-                    let cmd_str = template
-                        .replace("{self_exe}", &self_exe)
-                        .replace("/nonpie-bin", &nonpie_bin)
-                        .replace("/nonpie-cmd", &nonpie_cmd);
-                    let resp = r
-                        .send("A", super::exec(vec!["bash".into(), "-c".into(), cmd_str]))
+                    let resp = run
+                        .send(&handle, super::exec(vec![nonpie_bin, "echo-test".into()]))
                         .await;
-                    let skipped = matches!(
+                    let not_found = matches!(
                         &resp,
-                        crate::protocol::Response::ExecResult { stdout, .. }
-                            if stdout.contains("SKIP")
-                    );
-                    if skipped {
+                        crate::protocol::Response::ExecResult { exit_code: 127, .. }
+                    ) || matches!(&resp, crate::protocol::Response::Error { .. });
+                    if not_found {
                         return super::TestOutcome::new(
                             "A",
                             false,
                             "FAIL: nonpie binary not found",
                         );
                     }
+                    let resp2 = run
+                        .send(&handle, super::exec(vec![self_exe, "echo-test".into()]))
+                        .await;
                     let pass = matches!(
-                        &resp,
+                        &resp2,
                         crate::protocol::Response::ExecResult { exit_code: 0, stdout, .. }
-                            if stdout.contains(&*expected)
+                            if stdout == "ECHO_TEST_OK"
                     );
-                    super::TestOutcome::new("A", pass, format!("{resp:?}"))
+                    super::TestOutcome::new("A", pass, format!("{resp2:?}"))
                 })
-            }),
+            })
         });
+
+    // Contamination pattern cases
+    for cc in CONTAMINATION_CASES {
+        let id = format!("XC.{}", cc.name);
+        let template = cc.bash_template.unwrap().to_string();
+        let expected = cc.expected.to_string();
+        reg.test("fork", "fork_matrix", id)
+            .timeout(60)
+            .build(move |cx| {
+                let handle = cx.require(AgentName::A);
+                Box::new(move |run| {
+                    Box::pin(async move {
+                        let self_exe = run.self_exe().to_string();
+                        let nonpie_bin = match crate::find_nonpie_binary() {
+                            Some(p) => p,
+                            None => {
+                                return super::TestOutcome::new(
+                                    "A",
+                                    false,
+                                    "FAIL: nonpie binary not found",
+                                );
+                            }
+                        };
+                        let nonpie_cmd = format!("{nonpie_bin} echo-test");
+                        let cmd_str = template
+                            .replace("{self_exe}", &self_exe)
+                            .replace("/nonpie-bin", &nonpie_bin)
+                            .replace("/nonpie-cmd", &nonpie_cmd);
+                        let resp = run
+                            .send(
+                                &handle,
+                                super::exec(vec!["bash".into(), "-c".into(), cmd_str]),
+                            )
+                            .await;
+                        let skipped = matches!(
+                            &resp,
+                            crate::protocol::Response::ExecResult { stdout, .. }
+                                if stdout.contains("SKIP")
+                        );
+                        if skipped {
+                            return super::TestOutcome::new(
+                                "A",
+                                false,
+                                "FAIL: nonpie binary not found",
+                            );
+                        }
+                        let pass = matches!(
+                            &resp,
+                            crate::protocol::Response::ExecResult { exit_code: 0, stdout, .. }
+                                if stdout.contains(&*expected)
+                        );
+                        super::TestOutcome::new("A", pass, format!("{resp:?}"))
+                    })
+                })
+            });
     }
 }
