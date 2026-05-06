@@ -680,14 +680,18 @@ impl<Host: HostInterface> LinuxKernel<Host> {
         if page_addr.page_offset() != PageOffset::new(0) {
             return Err(DeallocationError::Unaligned);
         }
+        let end = x86_64::VirtAddr::try_new(
+            page_addr
+                .as_u64()
+                .checked_add(length as u64)
+                .ok_or(DeallocationError::Unaligned)?,
+        )
+        .map_err(|_| DeallocationError::Unaligned)?;
         unsafe {
             self.page_table_manager.current_page_table().unmap_pages(
                 PageRange::<PAGE_SIZE>::new(
                     page_addr.as_u64().truncate(),
-                    (page_addr + length as u64)
-                        .align_up(Size4KiB::SIZE)
-                        .as_u64()
-                        .truncate(),
+                    end.align_up(Size4KiB::SIZE).as_u64().truncate(),
                 )
                 .ok_or(DeallocationError::Unaligned)?,
                 false,
@@ -704,9 +708,12 @@ impl<Host: HostInterface> LinuxKernel<Host> {
         size: u64,
         flags: PageTableFlags,
     ) -> Option<Vtl0MappedGuard<'_, Host>> {
-        let (page_addr, page_aligned_length) = self
-            .map_vtl0_phys_range(phys_addr, phys_addr + size, flags)
-            .ok()?;
+        let phys_end = phys_addr
+            .as_u64()
+            .checked_add(size)
+            .and_then(|end| x86_64::PhysAddr::try_new(end).ok())?;
+        let (page_addr, page_aligned_length) =
+            self.map_vtl0_phys_range(phys_addr, phys_end, flags).ok()?;
         let page_offset: usize = (phys_addr - phys_addr.align_down(Size4KiB::SIZE)).truncate();
         Some(Vtl0MappedGuard {
             owner: self,

@@ -87,15 +87,18 @@ pub(crate) fn init(is_bsp: bool) {
 
     if is_bsp {
         if let Ok((start, size)) = get_vtl1_memory_info() {
-            let end = start
-                .checked_add(size)
-                .ok_or(VsmError::IntegerOverflow)
-                .expect("VTL1 memory range overflow while protecting startup memory");
+            let Some(end) = start.checked_add(size) else {
+                panic!("Failed to protect VTL1 memory");
+            };
             debug_serial_println!("VSM: Protect GPAs from {:#x} to {:#x}", start, end);
+            let Ok(end) = PhysAddr::try_new(end) else {
+                panic!("Failed to protect VTL1 memory");
+            };
+            let start = PhysAddr::new(start);
             if protect_physical_memory_range(
                 PhysFrame::range(
-                    PhysFrame::containing_address(PhysAddr::new(start)),
-                    PhysFrame::containing_address(PhysAddr::new(end)),
+                    PhysFrame::containing_address(start),
+                    PhysFrame::containing_address(end),
                 ),
                 MemAttr::empty(),
             )
@@ -121,8 +124,10 @@ pub fn mshv_vsm_enable_aps(_cpu_present_mask_pfn: u64) -> Result<i64, VsmError> 
 /// `cpu_online_mask_pfn` indicates the page containing the VTL0's CPU online mask.
 pub fn mshv_vsm_boot_aps(cpu_online_mask_pfn: u64) -> Result<i64, VsmError> {
     debug_serial_println!("VSM: Boot APs");
-    let cpu_online_mask_page_addr = PhysAddr::try_new(cpu_online_mask_pfn << PAGE_SHIFT)
-        .map_err(|_| VsmError::InvalidPhysicalAddress)?;
+    let cpu_online_mask_page_addr = cpu_online_mask_pfn
+        .checked_shl(PAGE_SHIFT.truncate())
+        .and_then(|pa| PhysAddr::try_new(pa).ok())
+        .ok_or(VsmError::InvalidPhysicalAddress)?;
 
     let Some(cpu_mask) = (unsafe {
         crate::platform_low().copy_from_vtl0_phys::<CpuMask>(cpu_online_mask_page_addr)
@@ -283,8 +288,13 @@ pub fn mshv_vsm_protect_memory(pa: u64, nranges: u64) -> Result<i64, VsmError> {
                 epa - pa
             );
 
+            if pa == epa {
+                continue;
+            }
+
             protect_physical_memory_range(
                 PhysFrame::range(
+                    // `HekiRange::is_valid` already validated both physical addresses.
                     PhysFrame::containing_address(PhysAddr::new(pa)),
                     PhysFrame::containing_address(PhysAddr::new(epa)),
                 ),
@@ -750,7 +760,7 @@ pub fn mshv_vsm_kexec_validate(pa: u64, nranges: u64, crash: u64) -> Result<i64,
             let va = kimage.segment[i].buf;
             let pa = kimage.segment[i].mem;
             if let Some(epa) = pa.checked_add(kimage.segment[i].memsz) {
-                kexec_memory_metadata.insert_memory_range(KexecMemoryRange::new(va, pa, epa));
+                kexec_memory_metadata.insert_memory_range(KexecMemoryRange::new(va, pa, epa)?);
             } else {
                 return Err(VsmError::KexecSegmentRangeInvalid);
             }
@@ -855,6 +865,7 @@ fn copy_heki_patch_from_vtl0(patch_pa_0: u64, patch_pa_1: u64) -> Result<HekiPat
 /// This function apply the given `HekiPatch` patch data to VTL0 text.
 /// It assumes the caller has confirmed the validity of `HekiPatch` by invoking the `is_valid()` member function.
 fn apply_vtl0_text_patch(heki_patch: HekiPatch) -> Result<(), VsmError> {
+    // `HekiPatch::is_valid` already validated both physical addresses.
     let heki_patch_pa_0 = PhysAddr::new(heki_patch.pa[0]);
     let heki_patch_pa_1 = PhysAddr::new(heki_patch.pa[1]);
 
@@ -891,12 +902,14 @@ fn apply_vtl0_text_patch(heki_patch: HekiPatch) -> Result<(), VsmError> {
 fn mshv_vsm_allocate_ringbuffer_memory(phys_addr: u64, size: usize) -> Result<i64, VsmError> {
     let end = phys_addr
         .checked_add(size as u64)
-        .ok_or(VsmError::IntegerOverflow)?;
-    set_ringbuffer(PhysAddr::new(phys_addr), size);
+        .ok_or(VsmError::IntegerOverflow)
+        .and_then(|end| PhysAddr::try_new(end).map_err(|_| VsmError::InvalidPhysicalAddress))?;
+    let phys_addr = PhysAddr::new(phys_addr);
+    set_ringbuffer(phys_addr, size);
     protect_physical_memory_range(
         PhysFrame::range(
-            PhysFrame::containing_address(PhysAddr::new(phys_addr)),
-            PhysFrame::containing_address(PhysAddr::new(end)),
+            PhysFrame::containing_address(phys_addr),
+            PhysFrame::containing_address(end),
         ),
         MemAttr::MEM_ATTR_READ,
     )?;
@@ -1098,16 +1111,15 @@ impl Vtl0KernelInfo {
     // We need this because each step of `mshv_vsm_patch_data`/`text_poke_bp_batch` only
     // provides a part of the patch data and addresses (`patch[0]` or `patch[1..patch_size-1]`).
     pub fn find_precomputed_patch(&self, patch_data: &HekiPatch) -> Option<HekiPatch> {
+        // `HekiPatch::is_valid` already validated both physical addresses.
+        let patch_pa_0 = PhysAddr::new(patch_data.pa[0]);
+        let patch_pa_0_prev = patch_data.pa[0].checked_sub(1).map(PhysAddr::new);
+        let patch_pa_1 = PhysAddr::new(patch_data.pa[1]);
+
         self.precomputed_patches
-            .get(PhysAddr::new(patch_data.pa[0]))
-            .or_else(|| {
-                self.precomputed_patches
-                    .get(PhysAddr::new(patch_data.pa[0].saturating_sub(1)))
-            })
-            .or_else(|| {
-                self.precomputed_patches
-                    .get(PhysAddr::new(patch_data.pa[1]))
-            })
+            .get(patch_pa_0)
+            .or_else(|| patch_pa_0_prev.and_then(|pa| self.precomputed_patches.get(pa)))
+            .or_else(|| self.precomputed_patches.get(patch_pa_1))
             .or(None)
     }
 }
@@ -1133,10 +1145,11 @@ impl ModuleMemoryMetadata {
 
     #[inline]
     pub(crate) fn insert_heki_range(&mut self, heki_range: &HekiRange) {
+        // `HekiRange::is_valid` already validated these addresses.
         let va = heki_range.va;
         let pa = heki_range.pa;
         let epa = heki_range.epa;
-        self.insert_memory_range(ModuleMemoryRange::new(
+        self.insert_memory_range(ModuleMemoryRange::new_checked(
             va,
             pa,
             epa,
@@ -1192,21 +1205,56 @@ pub struct ModuleMemoryRange {
 }
 
 impl ModuleMemoryRange {
-    pub fn new(virt_addr: u64, phys_start: u64, phys_end: u64, mod_mem_type: ModMemType) -> Self {
+    /// Create a memory range from values which are already validated.
+    pub(crate) fn new_checked(
+        virt_addr: u64,
+        phys_start: u64,
+        phys_end: u64,
+        mod_mem_type: ModMemType,
+    ) -> Self {
+        let phys_start = PhysAddr::new(phys_start);
+        let phys_end = PhysAddr::new(phys_end);
         Self {
             virt_addr: VirtAddr::new(virt_addr),
             phys_frame_range: PhysFrame::range(
-                PhysFrame::containing_address(PhysAddr::new(phys_start)),
-                PhysFrame::containing_address(PhysAddr::new(phys_end)),
+                PhysFrame::containing_address(phys_start),
+                PhysFrame::containing_address(phys_end),
             ),
             mod_mem_type,
         }
+    }
+
+    pub fn new(
+        virt_addr: u64,
+        phys_start: u64,
+        phys_end: u64,
+        mod_mem_type: ModMemType,
+    ) -> Result<Self, VsmError> {
+        Ok(Self {
+            virt_addr: VirtAddr::try_new(virt_addr).map_err(|_| VsmError::InvalidVirtualAddress)?,
+            phys_frame_range: PhysFrame::range(
+                PhysFrame::containing_address(
+                    PhysAddr::try_new(phys_start).map_err(|_| VsmError::InvalidPhysicalAddress)?,
+                ),
+                PhysFrame::containing_address(
+                    PhysAddr::try_new(phys_end).map_err(|_| VsmError::InvalidPhysicalAddress)?,
+                ),
+            ),
+            mod_mem_type,
+        })
     }
 }
 
 impl Default for ModuleMemoryRange {
     fn default() -> Self {
-        Self::new(0, 0, 0, ModMemType::Unknown)
+        Self {
+            virt_addr: VirtAddr::zero(),
+            phys_frame_range: PhysFrame::range(
+                PhysFrame::containing_address(PhysAddr::zero()),
+                PhysFrame::containing_address(PhysAddr::zero()),
+            ),
+            mod_mem_type: ModMemType::Unknown,
+        }
     }
 }
 
@@ -1298,7 +1346,7 @@ impl<'a> ModuleMemoryMetadataIters<'a> {
 /// This function copies `HekiPage` structures from VTL0 and returns a vector of them.
 /// `pa` and `nranges` specify the physical address range containing one or more than one `HekiPage` structures.
 fn copy_heki_pages_from_vtl0(pa: u64, nranges: u64) -> Option<Vec<HekiPage>> {
-    let mut next_pa = PhysAddr::new(pa);
+    let mut next_pa = PhysAddr::try_new(pa).ok()?;
     let mut heki_pages = Vec::with_capacity(nranges.truncate());
     let mut range: u64 = 0;
 
@@ -1310,6 +1358,7 @@ fn copy_heki_pages_from_vtl0(pa: u64, nranges: u64) -> Option<Vec<HekiPage>> {
         }
 
         range = range.checked_add(heki_page.nranges)?;
+        // `HekiPage::is_valid` already validated `next_pa`.
         next_pa = PhysAddr::new(heki_page.next_pa);
         heki_pages.push(*heki_page);
     }
@@ -1444,13 +1493,10 @@ impl MemoryContainer {
     }
 
     pub(crate) fn extend_range(&mut self, heki_range: &HekiRange) -> Result<(), VsmError> {
-        let addr = VirtAddr::try_new(heki_range.va).map_err(|_| VsmError::InvalidVirtualAddress)?;
-        let phys_addr =
-            PhysAddr::try_new(heki_range.pa).map_err(|_| VsmError::InvalidPhysicalAddress)?;
-        let len = heki_range
-            .epa
-            .checked_sub(heki_range.pa)
-            .ok_or(VsmError::IntegerOverflow)?;
+        // `HekiRange::is_valid` already validated the addresses and `pa <= epa`.
+        let addr = VirtAddr::new(heki_range.va);
+        let phys_addr = PhysAddr::new(heki_range.pa);
+        let len = heki_range.epa - heki_range.pa;
         if let Some(last_range) = self.range.last()
             && VirtAddr::try_new(
                 last_range
@@ -1600,10 +1646,11 @@ impl KexecMemoryMetadata {
 
     #[inline]
     pub(crate) fn insert_heki_range(&mut self, heki_range: &HekiRange) {
+        // `HekiRange::is_valid` already validated these addresses.
         let va = heki_range.va;
         let pa = heki_range.pa;
         let epa = heki_range.epa;
-        self.insert_memory_range(KexecMemoryRange::new(va, pa, epa));
+        self.insert_memory_range(KexecMemoryRange::new_checked(va, pa, epa));
     }
 
     #[inline]
@@ -1657,20 +1704,43 @@ pub struct KexecMemoryRange {
 }
 
 impl KexecMemoryRange {
-    pub fn new(virt_addr: u64, phys_start: u64, phys_end: u64) -> Self {
+    /// Create a memory range from values which are already validated.
+    pub(crate) fn new_checked(virt_addr: u64, phys_start: u64, phys_end: u64) -> Self {
+        let phys_start = PhysAddr::new(phys_start);
+        let phys_end = PhysAddr::new(phys_end);
         Self {
             virt_addr: VirtAddr::new(virt_addr),
             phys_frame_range: PhysFrame::range(
-                PhysFrame::containing_address(PhysAddr::new(phys_start)),
-                PhysFrame::containing_address(PhysAddr::new(phys_end)),
+                PhysFrame::containing_address(phys_start),
+                PhysFrame::containing_address(phys_end),
             ),
         }
+    }
+
+    pub fn new(virt_addr: u64, phys_start: u64, phys_end: u64) -> Result<Self, VsmError> {
+        Ok(Self {
+            virt_addr: VirtAddr::try_new(virt_addr).map_err(|_| VsmError::InvalidVirtualAddress)?,
+            phys_frame_range: PhysFrame::range(
+                PhysFrame::containing_address(
+                    PhysAddr::try_new(phys_start).map_err(|_| VsmError::InvalidPhysicalAddress)?,
+                ),
+                PhysFrame::containing_address(
+                    PhysAddr::try_new(phys_end).map_err(|_| VsmError::InvalidPhysicalAddress)?,
+                ),
+            ),
+        })
     }
 }
 
 impl Default for KexecMemoryRange {
     fn default() -> Self {
-        Self::new(0, 0, 0)
+        Self {
+            virt_addr: VirtAddr::zero(),
+            phys_frame_range: PhysFrame::range(
+                PhysFrame::containing_address(PhysAddr::zero()),
+                PhysFrame::containing_address(PhysAddr::zero()),
+            ),
+        }
     }
 }
 
@@ -1748,6 +1818,7 @@ impl PatchDataMap {
                 .map(HekiPatch::try_from_bytes)
             {
                 let patch = patch.ok_or(PatchDataMapError::InvalidHekiPatch)?;
+                // `HekiPatch::try_from_bytes` already validated both physical addresses.
                 let patch_target_pa_0 = PhysAddr::new(patch.pa[0]);
                 let patch_target_pa_1 = PhysAddr::new(patch.pa[1]);
 
