@@ -307,11 +307,7 @@ async fn agent_loop(self_exe: &str) {
                                         match stream.read(&mut buf).await {
                                             Ok(0) | Err(_) => break,
                                             Ok(n) => {
-                                                if stream
-                                                    .write_all(&buf[..n])
-                                                    .await
-                                                    .is_err()
-                                                {
+                                                if stream.write_all(&buf[..n]).await.is_err() {
                                                     break;
                                                 }
                                             }
@@ -539,11 +535,7 @@ async fn agent_loop(self_exe: &str) {
                                         match stream.read(&mut buf).await {
                                             Ok(0) | Err(_) => break,
                                             Ok(n) => {
-                                                if stream
-                                                    .write_all(&buf[..n])
-                                                    .await
-                                                    .is_err()
-                                                {
+                                                if stream.write_all(&buf[..n]).await.is_err() {
                                                     break;
                                                 }
                                             }

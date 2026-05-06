@@ -10,8 +10,9 @@
 use crate::protocol::{Command, Response};
 use tokio::time::Duration;
 
-use super::agents::{AgentName, SpawnKind};
+use super::agents::{AgentHandle, AgentName, SpawnKind};
 use super::registry::Registry;
+use super::run_context::RunContext;
 
 const AGENTS: &[AgentName] = &[AgentName::A, AgentName::AA, AgentName::B];
 const DEPTH_AGENTS: &[AgentName] = &[AgentName::A, AgentName::AA];
@@ -583,6 +584,142 @@ pub(crate) fn register_cross_worker_self_connect_tests(reg: &mut Registry<'_>) {
             })
         })
     });
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// TLB: TCP listen remains usable after delayed accept window
+// ═══════════════════════════════════════════════════════════════════
+
+const TLB_DELAY_SECS: u64 = 1;
+
+struct TlbListenBusyDef {
+    name: &'static str,
+    listener: AgentName,
+    connector: AgentName,
+}
+
+async fn run_tlb_listen_busy_case(
+    run: &mut RunContext<'_>,
+    listener: &AgentHandle,
+    connector: &AgentHandle,
+    listener_name: &str,
+    connector_name: &str,
+    data: &str,
+    delay_secs: u64,
+) -> super::TestOutcome {
+    let listen_resp = run.send(listener, Command::NetListen { port: 0 }).await;
+    let port = match &listen_resp {
+        Response::Listening { port } => *port,
+        _ => {
+            return super::TestOutcome::new(
+                connector_name,
+                false,
+                format!("{listener_name} listen failed: {listen_resp:?}"),
+            );
+        }
+    };
+
+    let sleep_resp = run
+        .send(
+            listener,
+            Command::Exec {
+                args: vec!["sleep".into(), delay_secs.to_string()],
+                timeout_secs: Some(delay_secs + 5),
+                stdin: None,
+                background: false,
+            },
+        )
+        .await;
+    if !matches!(&sleep_resp, Response::ExecResult { exit_code: 0, .. }) {
+        let _ = run.send(listener, Command::NetUnlisten { port }).await;
+        return super::TestOutcome::new(
+            connector_name,
+            false,
+            format!("{listener_name} delay failed: {sleep_resp:?}"),
+        );
+    }
+
+    let conn_resp = run
+        .send(
+            connector,
+            Command::NetConnect {
+                addr: format!("127.0.0.1:{port}"),
+                data: data.to_string(),
+            },
+        )
+        .await;
+    let _ = run.send(listener, Command::NetUnlisten { port }).await;
+    let pass = matches!(&conn_resp, Response::Connected { echo } if echo == data);
+    super::TestOutcome::new(
+        connector_name,
+        pass,
+        format!(
+            "listener={listener_name} connector={connector_name} delay={delay_secs}s {conn_resp:?}"
+        ),
+    )
+}
+
+pub(crate) fn register_tcp_listen_busy_tests(reg: &mut Registry<'_>) {
+    let defs = [
+        TlbListenBusyDef {
+            name: "same_agent",
+            listener: AgentName::A,
+            connector: AgentName::A,
+        },
+        TlbListenBusyDef {
+            name: "parent_child",
+            listener: AgentName::A,
+            connector: AgentName::AA,
+        },
+        TlbListenBusyDef {
+            name: "child_parent",
+            listener: AgentName::AA,
+            connector: AgentName::A,
+        },
+        TlbListenBusyDef {
+            name: "sibling",
+            listener: AgentName::AA,
+            connector: AgentName::AB,
+        },
+        TlbListenBusyDef {
+            name: "depth2",
+            listener: AgentName::AAA,
+            connector: AgentName::AAB,
+        },
+    ];
+
+    for def in defs {
+        let listener_name = def.listener.to_string();
+        let connector_name = def.connector.to_string();
+        let data = format!("TLB_{}", def.name);
+        reg.test(
+            "xworker",
+            "tcp_listen_busy",
+            format!("TLB.listen_busy.{}", def.name),
+        )
+        .timeout(60)
+        .build(move |cx| {
+            let listener = cx.require(def.listener);
+            let connector = cx.require(def.connector);
+            Box::new(move |run| {
+                let listener_name = listener_name.clone();
+                let connector_name = connector_name.clone();
+                let data = data.clone();
+                Box::pin(async move {
+                    run_tlb_listen_busy_case(
+                        run,
+                        &listener,
+                        &connector,
+                        &listener_name,
+                        &connector_name,
+                        &data,
+                        TLB_DELAY_SECS,
+                    )
+                    .await
+                })
+            })
+        });
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -2035,17 +2172,6 @@ pub(crate) fn register_loopback_tcp_tests(reg: &mut Registry<'_>) {
                 "kill $PID 2>/dev/null; wait $PID 2>/dev/null\n",
             ),
             check: |s| s.contains("REPLY=LB_ANY"),
-        },
-        Def {
-            name: "busy_after_listen",
-            script_template: concat!(
-                "{exe} tcp-listen-busy 19880 3 > /dev/null 2>&1 &\n",
-                "PID=$!\nsleep 1\n",
-                "REPLY=$(echo LB_BUSY | nc -q5 -w10 127.0.0.1 19880 2>/dev/null)\n",
-                "echo REPLY=$REPLY\n",
-                "kill $PID 2>/dev/null; wait $PID 2>/dev/null\n",
-            ),
-            check: |s| s.contains("REPLY=LB_BUSY"),
         },
         Def {
             name: "fast_close",
