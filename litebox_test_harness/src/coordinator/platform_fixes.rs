@@ -10,7 +10,7 @@
 use crate::protocol::{Command, Response};
 use tokio::time::Duration;
 
-use super::agents::{AgentHandle, AgentName, SpawnKind};
+use super::agents::{AgentHandle, AgentName, EphemeralHandle, SpawnKind};
 use super::registry::Registry;
 use super::run_context::RunContext;
 
@@ -2548,6 +2548,47 @@ pub(crate) fn register_tcp_halfclose_tests(reg: &mut Registry<'_>) {
 // FKLC: fork-listen-close — VS Code CLI pattern
 // ═══════════════════════════════════════════════════════════════════
 
+async fn fklc_connect_from_agent(
+    run: &mut RunContext<'_>,
+    connector: &AgentHandle,
+    port: u16,
+    payload: &str,
+) -> Result<Response, String> {
+    let resp = run
+        .send(
+            connector,
+            Command::NetConnect {
+                addr: format!("127.0.0.1:{port}"),
+                data: payload.to_string(),
+            },
+        )
+        .await;
+    match &resp {
+        Response::Connected { echo } if echo == payload => Ok(resp),
+        _ => Err(format!("connect via agent failed: {resp:?}")),
+    }
+}
+
+async fn fklc_child_accept_ready(
+    run: &mut RunContext<'_>,
+    child: &EphemeralHandle,
+    port: u16,
+) -> Result<Response, String> {
+    let resp = run
+        .forward(
+            child,
+            Command::NetAccept {
+                port,
+                timeout_secs: 5,
+            },
+        )
+        .await;
+    match &resp {
+        Response::Ok { .. } => Ok(resp),
+        _ => Err(format!("child accept start failed: {resp:?}")),
+    }
+}
+
 pub(crate) fn register_fork_listen_close_tests(reg: &mut Registry<'_>) {
     // FKLC.listen_unlisten: A listens then immediately unlistens,
     // B connects — should get RST.
@@ -2586,60 +2627,323 @@ pub(crate) fn register_fork_listen_close_tests(reg: &mut Registry<'_>) {
             })
         })
     });
-    // FKLC.cross_connect: fd inheritance across fork+exec.
-    // A spawns tcp-fork-listen-accept in bg, B connects.
+    // FKLC.inherit.cross_connect: protocol-only fd inheritance across fork+exec.
+    // A listens, forks an inherited-listener child, closes its copy, and B connects.
     reg.test(
         "xworker",
         "fork_listen_close",
-        "FKLC.cross_connect".to_string(),
+        "FKLC.inherit.cross_connect".to_string(),
     )
     .timeout(60)
     .build(move |cx| {
-        let handle_a = cx.require(AgentName::A);
-        let handle_b = cx.require(AgentName::B);
+        let parent = cx.require(AgentName::A);
+        let connector = cx.require(AgentName::B);
+        let child = cx.declare_ephemeral(
+            AgentName::A,
+            "FKLCInheritCross",
+            SpawnKind::Fork {
+                binary: "self",
+                inherit_listen_ports: vec![19921],
+            },
+        );
         Box::new(move |run| {
-            let self_exe = run.self_exe().to_string();
             Box::pin(async move {
                 let port = 19921u16;
-                let bg_resp = run
-                    .send(
-                        &handle_a,
-                        Command::Exec {
-                            args: vec![self_exe, "tcp-fork-listen-accept".into(), port.to_string()],
-                            timeout_secs: None,
-                            stdin: None,
-                            background: true,
-                        },
-                    )
-                    .await;
-                let bg_pid = match &bg_resp {
-                    Response::Background { pid } => Some(*pid),
-                    _ => {
+                let listen_resp = run.send(&parent, Command::NetListen { port }).await;
+                if !matches!(&listen_resp, Response::Listening { port: p } if *p == port) {
+                    return super::TestOutcome::new(
+                        "B",
+                        false,
+                        format!("listen failed: {listen_resp:?}"),
+                    );
+                }
+                let fork_resp = run.spawn_ephemeral(&child).await;
+                if !matches!(&fork_resp, Response::Ok { .. }) {
+                    return super::TestOutcome::new(
+                        "B",
+                        false,
+                        format!("fork failed: {fork_resp:?}"),
+                    );
+                }
+                let _ = run.send(&parent, Command::NetCloseListener { port }).await;
+                if let Err(e) = fklc_child_accept_ready(run, &child, port).await {
+                    let _ = run.forward(&child, Command::Exit).await;
+                    return super::TestOutcome::new("B", false, e);
+                }
+                match fklc_connect_from_agent(run, &connector, port, "fork_listen_close").await {
+                    Ok(conn_resp) => {
+                        let _ = run.forward(&child, Command::Exit).await;
+                        super::TestOutcome::new("B", true, format!("{conn_resp:?}"))
+                    }
+                    Err(e) => {
+                        let _ = run.forward(&child, Command::Exit).await;
+                        super::TestOutcome::new("B", false, e)
+                    }
+                }
+            })
+        })
+    });
+
+    // FKLC.inherit.multi_port: one fork imports two listen sockets at once.
+    reg.test(
+        "xworker",
+        "fork_listen_close",
+        "FKLC.inherit.multi_port".to_string(),
+    )
+    .timeout(60)
+    .build(move |cx| {
+        let parent = cx.require(AgentName::A);
+        let connector = cx.require(AgentName::B);
+        let child = cx.declare_ephemeral(
+            AgentName::A,
+            "FKLCInheritMulti",
+            SpawnKind::Fork {
+                binary: "self",
+                inherit_listen_ports: vec![19922, 19923],
+            },
+        );
+        Box::new(move |run| {
+            Box::pin(async move {
+                for port in [19922u16, 19923] {
+                    let listen_resp = run.send(&parent, Command::NetListen { port }).await;
+                    if !matches!(&listen_resp, Response::Listening { port: p } if *p == port) {
                         return super::TestOutcome::new(
                             "B",
                             false,
-                            format!("bg spawn failed: {bg_resp:?}"),
+                            format!("listen {port} failed: {listen_resp:?}"),
                         );
                     }
+                }
+                let fork_resp = run.spawn_ephemeral(&child).await;
+                if !matches!(&fork_resp, Response::Ok { .. }) {
+                    return super::TestOutcome::new(
+                        "B",
+                        false,
+                        format!("fork failed: {fork_resp:?}"),
+                    );
+                }
+                for port in [19922u16, 19923] {
+                    let _ = run.send(&parent, Command::NetCloseListener { port }).await;
+                }
+                let ready_first = fklc_child_accept_ready(run, &child, 19922).await;
+                let ready_second = fklc_child_accept_ready(run, &child, 19923).await;
+                let first = fklc_connect_from_agent(run, &connector, 19922, "multi_one").await;
+                let second = fklc_connect_from_agent(run, &connector, 19923, "multi_two").await;
+                let _ = run.forward(&child, Command::Exit).await;
+                match (ready_first, ready_second, first, second) {
+                    (Ok(a), Ok(b), Ok(c), Ok(d)) => {
+                        super::TestOutcome::new("B", true, format!("{a:?}; {b:?}; {c:?}; {d:?}"))
+                    }
+                    results => super::TestOutcome::new("B", false, format!("{results:?}")),
+                }
+            })
+        })
+    });
+
+    // FKLC.inherit.close_parent: the child keeps accepting after the parent closes.
+    reg.test(
+        "xworker",
+        "fork_listen_close",
+        "FKLC.inherit.close_parent".to_string(),
+    )
+    .timeout(60)
+    .build(move |cx| {
+        let parent = cx.require(AgentName::A);
+        let connector = cx.require(AgentName::B);
+        let child = cx.declare_ephemeral(
+            AgentName::A,
+            "FKLCInheritCloseParent",
+            SpawnKind::Fork {
+                binary: "self",
+                inherit_listen_ports: vec![19924],
+            },
+        );
+        Box::new(move |run| {
+            Box::pin(async move {
+                let port = 19924u16;
+                let listen_resp = run.send(&parent, Command::NetListen { port }).await;
+                if !matches!(&listen_resp, Response::Listening { port: p } if *p == port) {
+                    return super::TestOutcome::new(
+                        "B",
+                        false,
+                        format!("listen failed: {listen_resp:?}"),
+                    );
+                }
+                let fork_resp = run.spawn_ephemeral(&child).await;
+                let close_resp = run.send(&parent, Command::NetCloseListener { port }).await;
+                if !matches!(
+                    (&fork_resp, &close_resp),
+                    (Response::Ok { .. }, Response::Ok { .. })
+                ) {
+                    return super::TestOutcome::new(
+                        "B",
+                        false,
+                        format!("fork/close failed: {fork_resp:?}; {close_resp:?}"),
+                    );
+                }
+                let ready = fklc_child_accept_ready(run, &child, port).await;
+                let result = if let Err(e) = ready {
+                    Err(e)
+                } else {
+                    fklc_connect_from_agent(run, &connector, port, "close_parent").await
                 };
-                tokio::time::sleep(Duration::from_secs(3)).await;
-                let conn_resp = run
-                    .send(
-                        &handle_b,
-                        Command::NetConnect {
-                            addr: format!("127.0.0.1:{port}"),
-                            data: "fork_listen_close".into(),
+                let _ = run.forward(&child, Command::Exit).await;
+                match result {
+                    Ok(resp) => super::TestOutcome::new("B", true, format!("{resp:?}")),
+                    Err(e) => super::TestOutcome::new("B", false, e),
+                }
+            })
+        })
+    });
+
+    // FKLC.inherit.depth2: an inheriting child can fork the listener onward.
+    reg.test(
+        "xworker",
+        "fork_listen_close",
+        "FKLC.inherit.depth2".to_string(),
+    )
+    .timeout(60)
+    .build(move |cx| {
+        let parent = cx.require(AgentName::A);
+        let connector = cx.require(AgentName::B);
+        let child = cx.declare_ephemeral(
+            AgentName::A,
+            "FKLCInheritDepth1",
+            SpawnKind::Fork {
+                binary: "self",
+                inherit_listen_ports: vec![19925],
+            },
+        );
+        Box::new(move |run| {
+            Box::pin(async move {
+                let port = 19925u16;
+                let listen_resp = run.send(&parent, Command::NetListen { port }).await;
+                if !matches!(&listen_resp, Response::Listening { port: p } if *p == port) {
+                    return super::TestOutcome::new(
+                        "B",
+                        false,
+                        format!("listen failed: {listen_resp:?}"),
+                    );
+                }
+                let fork1_resp = run.spawn_ephemeral(&child).await;
+                let _ = run.send(&parent, Command::NetCloseListener { port }).await;
+                if !matches!(&fork1_resp, Response::Ok { .. }) {
+                    return super::TestOutcome::new(
+                        "B",
+                        false,
+                        format!("fork depth1 failed: {fork1_resp:?}"),
+                    );
+                }
+                let fork2_resp = run
+                    .forward(
+                        &child,
+                        Command::Fork {
+                            name: "FKLCInheritDepth2".into(),
+                            binary: "self".into(),
+                            inherit_listen_ports: vec![port],
                         },
                     )
                     .await;
-                let pass = matches!(
-                    &conn_resp,
-                    Response::Connected { echo } if echo == "fork_listen_close"
-                );
-                if let Some(pid) = bg_pid {
-                    let _ = run.send(&handle_a, Command::Kill { pid }).await;
+                let close1_resp = run
+                    .forward(&child, Command::NetCloseListener { port })
+                    .await;
+                if !matches!(
+                    (&fork2_resp, &close1_resp),
+                    (Response::Ok { .. }, Response::Ok { .. })
+                ) {
+                    let _ = run.forward(&child, Command::Exit).await;
+                    return super::TestOutcome::new(
+                        "B",
+                        false,
+                        format!("fork depth2/close depth1 failed: {fork2_resp:?}; {close1_resp:?}"),
+                    );
                 }
-                super::TestOutcome::new("B", pass, format!("{conn_resp:?}"))
+                let ready = run
+                    .forward(
+                        &child,
+                        Command::Forward {
+                            target: "FKLCInheritDepth2".into(),
+                            inner: Box::new(Command::NetAccept {
+                                port,
+                                timeout_secs: 5,
+                            }),
+                        },
+                    )
+                    .await;
+                let conn = fklc_connect_from_agent(run, &connector, port, "depth2").await;
+                let _ = run
+                    .forward(
+                        &child,
+                        Command::Forward {
+                            target: "FKLCInheritDepth2".into(),
+                            inner: Box::new(Command::Exit),
+                        },
+                    )
+                    .await;
+                let _ = run.forward(&child, Command::Exit).await;
+                match (&ready, conn) {
+                    (Response::Ok { .. }, Ok(conn_resp)) => {
+                        super::TestOutcome::new("B", true, format!("{ready:?}; {conn_resp:?}"))
+                    }
+                    (_, conn_result) => super::TestOutcome::new(
+                        "B",
+                        false,
+                        format!("ready={ready:?}; connect={conn_result:?}"),
+                    ),
+                }
+            })
+        })
+    });
+
+    // FKLC.inherit.sibling_connect: a sibling child, not the parent, connects.
+    reg.test(
+        "xworker",
+        "fork_listen_close",
+        "FKLC.inherit.sibling_connect".to_string(),
+    )
+    .timeout(60)
+    .build(move |cx| {
+        let parent = cx.require(AgentName::A);
+        let connector = cx.require(AgentName::B);
+        let server = cx.declare_ephemeral(
+            AgentName::A,
+            "FKLCInheritSiblingServer",
+            SpawnKind::Fork {
+                binary: "self",
+                inherit_listen_ports: vec![19926],
+            },
+        );
+        Box::new(move |run| {
+            Box::pin(async move {
+                let port = 19926u16;
+                let listen_resp = run.send(&parent, Command::NetListen { port }).await;
+                if !matches!(&listen_resp, Response::Listening { port: p } if *p == port) {
+                    return super::TestOutcome::new(
+                        "A",
+                        false,
+                        format!("listen failed: {listen_resp:?}"),
+                    );
+                }
+                let server_resp = run.spawn_ephemeral(&server).await;
+                let _ = run.send(&parent, Command::NetCloseListener { port }).await;
+                if !matches!(&server_resp, Response::Ok { .. }) {
+                    return super::TestOutcome::new(
+                        "B",
+                        false,
+                        format!("spawn failed: {server_resp:?}"),
+                    );
+                }
+                let ready = fklc_child_accept_ready(run, &server, port).await;
+                let result = if let Err(e) = ready {
+                    Err(e)
+                } else {
+                    fklc_connect_from_agent(run, &connector, port, "sibling_connect").await
+                };
+                let _ = run.forward(&server, Command::Exit).await;
+                match result {
+                    Ok(resp) => super::TestOutcome::new("B", true, format!("{resp:?}")),
+                    Err(e) => super::TestOutcome::new("B", false, e),
+                }
             })
         })
     });

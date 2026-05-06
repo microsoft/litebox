@@ -278,11 +278,9 @@ parent: bind()+listen() → clear CLOEXEC → fork()+exec(child) → close(fd)
 child:  accept() on inherited fd → echo data
 ```
 
-This pattern is tested by the `tcp-fork-listen-accept` subcommand in
-main.rs (used by the FKLC.cross_connect test). It cannot currently be
-expressed via the agent protocol because the child needs to accept on a
-raw fd number rather than re-binding.
-
-The `Fork` protocol command has an `inherit_listen_ports` field designed
-for this but not yet implemented. See the design notes in protocol.rs
-for implementation guidance.
+This pattern is expressed through the agent protocol with
+`Fork { inherit_listen_ports: [...] }`: the parent duplicates requested
+listen sockets into the documented child fd slots and the child imports
+them into its listener registry before serving commands. Add new tests
+against that protocol path rather than reintroducing standalone helper
+subcommands.

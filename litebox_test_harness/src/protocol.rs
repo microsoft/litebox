@@ -35,37 +35,18 @@ pub enum Command {
     ///   - `"nonpie"` → fork+exec the non-PIE binary (= `SpawnRemote`)
     ///
     /// `inherit_listen_ports`: TCP listen ports whose listen socket fds
-    /// should be inherited by the child (CLOEXEC cleared before exec).
-    /// **Not yet implemented** — see design notes below.
-    ///
-    /// # fd inheritance pattern (future work)
-    ///
-    /// The VS Code CLI does this:
-    ///   1. Parent calls `bind()+listen()` on a port
-    ///   2. Parent fork()+exec()s the server process
-    ///   3. Parent closes its listen fd
-    ///   4. Child calls `accept()` on the **inherited** listen fd
-    ///
-    /// To support this in the protocol:
-    ///   1. Fork handler looks up the listen socket fd for each port in
-    ///      `inherit_listen_ports` (the agent tracks port→fd mapping from
-    ///      `NetListen`).
-    ///   2. Clears CLOEXEC on those fds: `fcntl(fd, F_SETFD, 0)`.
-    ///   3. fork()+exec()s the child, passing the fd numbers via a CLI
-    ///      arg or env var (e.g., `--inherited-fds 3,5`).
-    ///   4. Child agent reconstructs `TcpListeners` from the raw fds via
-    ///      `TcpListener::from_raw_fd(fd)` and registers them in its
-    ///      listener map.
-    ///   5. The child's `NetAccept` or echo handler then works on the
-    ///      inherited listener — no re-bind needed.
+    /// should be inherited by the child. The parent duplicates each requested
+    /// listener into deterministic child fd slots 80..99, clearing CLOEXEC only
+    /// on those short-lived duplicates. This range is intentionally below the
+    /// Litebox host bridge/infrastructure bands (100..199, 200..499, 500+) and
+    /// above stdio. The child receives a `port=fd` mapping in
+    /// `LITEBOX_TEST_HARNESS_INHERITED_LISTEN_FDS`, imports each fd into its
+    /// listener registry, and then normal `NetAccept` / `NetConnect` probing
+    /// works without re-binding.
     ///
     /// Pair with `NetCloseListener` on the parent to reproduce the full
     /// VS Code pattern: `NetListen` → Fork(inherit) → `NetCloseListener` →
-    /// child `NetAccept`.
-    ///
-    /// Currently this pattern is tested via the `tcp-fork-listen-accept`
-    /// subcommand (see main.rs), which implements steps 1-4 as a single
-    /// standalone program outside the agent protocol.
+    /// child accepts on the inherited listener.
     #[serde(rename = "fork")]
     Fork {
         name: String,
