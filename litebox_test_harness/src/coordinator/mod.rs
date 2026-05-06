@@ -622,33 +622,30 @@ pub fn run_filtered(self_exe: &str, filter: Option<&str>) -> Vec<TestResult> {
 }
 
 /// Register the contamination canary test.
-fn register_canary(tests: &mut Vec<Test>) {
-    tests.push(Test {
-        suite: "contamination",
-        group: "canary",
-        id: "X_canary.pre_sequence".to_string(),
-        xfail: None,
-        timeout_secs: 60,
-        declared_agents: Vec::new(),
-        run: Box::new(|r| {
-            let self_exe = r.self_exe.clone();
-            Box::pin(async move {
-                let canary_cmd = crate::protocol::Command::Exec {
-                    args: vec![self_exe, "echo-test".into()],
-                    timeout_secs: None,
-                    stdin: None,
-                    background: false,
-                };
-                let resp = r.send("A", canary_cmd).await;
-                let pass = matches!(
-                    &resp,
-                    crate::protocol::Response::ExecResult { exit_code: 0, stdout, .. }
-                        if stdout == "ECHO_TEST_OK"
-                );
-                TestOutcome::new("A", pass, format!("{resp:?}"))
+fn register_canary(reg: &mut registry::Registry<'_>) {
+    reg.test("contamination", "canary", "X_canary.pre_sequence")
+        .timeout(60)
+        .build(|cx| {
+            let a = cx.require(agents::AgentName::A);
+            Box::new(move |run| {
+                let self_exe = run.self_exe().to_string();
+                Box::pin(async move {
+                    let canary_cmd = crate::protocol::Command::Exec {
+                        args: vec![self_exe, "echo-test".into()],
+                        timeout_secs: None,
+                        stdin: None,
+                        background: false,
+                    };
+                    let resp = run.send(&a, canary_cmd).await;
+                    let pass = matches!(
+                        &resp,
+                        crate::protocol::Response::ExecResult { exit_code: 0, stdout, .. }
+                            if stdout == "ECHO_TEST_OK"
+                    );
+                    TestOutcome::new("A", pass, format!("{resp:?}"))
+                })
             })
-        }),
-    });
+        });
 }
 
 /// Check whether a Test matches the --filter argument.
@@ -672,7 +669,7 @@ fn matches_test(filter: Option<&str>, test: &Test) -> bool {
 /// No agents, no docker — just builds the test list.
 pub fn collect_all_tests() -> Vec<Test> {
     let mut tests: Vec<Test> = Vec::new();
-    register_canary(&mut tests);
+    register_canary(&mut registry::Registry::new(&mut tests));
     special_cases::register_netlink(&mut tests);
     concurrent_fork::register_concurrent_fork_pipeline(&mut tests);
     concurrent_fork::register_concurrent_exec(&mut tests);
