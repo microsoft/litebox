@@ -7,8 +7,9 @@
 
 use crate::protocol::{Command, Response};
 use std::collections::HashMap;
+use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
-use tokio::net::TcpListener;
+use tokio::net::{TcpListener, TcpStream};
 use tokio::time::Duration;
 
 struct ChildHandle {
@@ -18,39 +19,7 @@ struct ChildHandle {
     process: tokio::process::Child,
 }
 
-fn net_halfclose_echo_blocking(addr: &str, write_data: &str, half: &str) -> Result<String, String> {
-    use std::io::{Read, Write};
-    use std::net::Shutdown;
-    use std::time::Duration as StdDuration;
-
-    let mut stream = std::net::TcpStream::connect(addr).map_err(|e| format!("connect: {e}"))?;
-    stream
-        .set_read_timeout(Some(StdDuration::from_secs(5)))
-        .map_err(|e| format!("set read timeout: {e}"))?;
-    stream
-        .set_write_timeout(Some(StdDuration::from_secs(5)))
-        .map_err(|e| format!("set write timeout: {e}"))?;
-    stream
-        .write_all(write_data.as_bytes())
-        .map_err(|e| format!("write: {e}"))?;
-    stream.flush().map_err(|e| format!("flush: {e}"))?;
-
-    let shutdown = match half {
-        "wr" => Shutdown::Write,
-        "rd" => Shutdown::Read,
-        "rdwr" => Shutdown::Both,
-        other => return Err(format!("invalid half {other:?}; expected wr, rd, or rdwr")),
-    };
-    stream
-        .shutdown(shutdown)
-        .map_err(|e| format!("shutdown({half}): {e}"))?;
-
-    let mut received = Vec::new();
-    stream
-        .read_to_end(&mut received)
-        .map_err(|e| format!("read_to_eof: {e}"))?;
-    Ok(String::from_utf8_lossy(&received).to_string())
-}
+type TcpConn = Arc<tokio::sync::Mutex<TcpStream>>;
 
 /// Run the agent. Reads commands from stdin, executes, responds on stdout.
 pub fn run(self_exe: &str) {
@@ -68,6 +37,8 @@ async fn agent_loop(self_exe: &str) {
     let mut children: HashMap<String, ChildHandle> = HashMap::new();
     let mut listeners: HashMap<u16, tokio::task::JoinHandle<()>> = HashMap::new();
     let mut unix_listeners: HashMap<String, tokio::task::JoinHandle<()>> = HashMap::new();
+    let mut connections: HashMap<u64, TcpConn> = HashMap::new();
+    let mut next_conn_id = 1u64;
     let mut background_pids: Vec<tokio::process::Child> = Vec::new();
 
     let mut line = String::new();
@@ -410,33 +381,159 @@ async fn agent_loop(self_exe: &str) {
                 }
             }
 
-            Command::NetHalfCloseEcho {
-                addr,
-                write_data,
-                half,
-            } => {
-                let result = tokio::time::timeout(
-                    Duration::from_secs(10),
-                    tokio::task::spawn_blocking(move || {
-                        net_halfclose_echo_blocking(&addr, &write_data, &half)
-                    }),
-                )
-                .await;
-                match result {
-                    Ok(Ok(Ok(echo))) => respond(&Response::HalfClosed { echo }).await,
-                    Ok(Ok(Err(error))) => respond(&Response::HalfCloseFailed { error }).await,
+            Command::NetOpen { addr } => {
+                if next_conn_id == u64::MAX {
+                    respond(&Response::Error {
+                        error: "connection id space exhausted".to_string(),
+                    })
+                    .await;
+                    continue;
+                }
+                match tokio::time::timeout(Duration::from_secs(5), TcpStream::connect(&addr)).await
+                {
+                    Ok(Ok(stream)) => {
+                        let conn = next_conn_id;
+                        next_conn_id += 1;
+                        connections.insert(conn, Arc::new(tokio::sync::Mutex::new(stream)));
+                        respond(&Response::Opened { conn }).await;
+                    }
                     Ok(Err(e)) => {
-                        respond(&Response::HalfCloseFailed {
-                            error: format!("halfclose task join: {e}"),
+                        respond(&Response::ConnectFailed {
+                            error: format!("connect {addr}: {e}"),
                         })
                         .await;
                     }
                     Err(_) => {
-                        respond(&Response::HalfCloseFailed {
-                            error: "halfclose timeout".to_string(),
+                        respond(&Response::ConnectFailed {
+                            error: format!("connect {addr}: timeout"),
                         })
                         .await;
                     }
+                }
+            }
+
+            Command::NetSend { conn, data } => {
+                let Some(stream) = connections.get(&conn).cloned() else {
+                    respond(&Response::Error {
+                        error: format!("unknown conn {conn}"),
+                    })
+                    .await;
+                    continue;
+                };
+                let result = tokio::time::timeout(Duration::from_secs(5), async {
+                    let mut stream = stream.lock().await;
+                    stream
+                        .write_all(data.as_bytes())
+                        .await
+                        .map_err(|e| format!("write conn {conn}: {e}"))?;
+                    stream
+                        .flush()
+                        .await
+                        .map_err(|e| format!("flush conn {conn}: {e}"))
+                })
+                .await;
+                match result {
+                    Ok(Ok(())) => respond(&Response::Sent).await,
+                    Ok(Err(error)) => respond(&Response::Error { error }).await,
+                    Err(_) => {
+                        respond(&Response::Error {
+                            error: format!("send conn {conn}: timeout"),
+                        })
+                        .await;
+                    }
+                }
+            }
+
+            Command::NetRecv { conn, n_bytes } => {
+                let Some(stream) = connections.get(&conn).cloned() else {
+                    respond(&Response::Error {
+                        error: format!("unknown conn {conn}"),
+                    })
+                    .await;
+                    continue;
+                };
+                let result = tokio::time::timeout(Duration::from_secs(10), async {
+                    let mut stream = stream.lock().await;
+                    let mut received = Vec::new();
+                    match n_bytes {
+                        Some(n) => {
+                            received.resize(n as usize, 0);
+                            stream
+                                .read_exact(&mut received)
+                                .await
+                                .map_err(|e| format!("read_exact conn {conn}: {e}"))?;
+                        }
+                        None => {
+                            stream
+                                .read_to_end(&mut received)
+                                .await
+                                .map_err(|e| format!("read_to_eof conn {conn}: {e}"))?;
+                        }
+                    }
+                    Ok::<_, String>(String::from_utf8_lossy(&received).to_string())
+                })
+                .await;
+                match result {
+                    Ok(Ok(data)) => respond(&Response::Received { data }).await,
+                    Ok(Err(error)) => respond(&Response::Error { error }).await,
+                    Err(_) => {
+                        respond(&Response::Error {
+                            error: format!("recv conn {conn}: timeout"),
+                        })
+                        .await;
+                    }
+                }
+            }
+
+            Command::NetShutdown { conn, half } => {
+                let Some(stream) = connections.get(&conn).cloned() else {
+                    respond(&Response::Error {
+                        error: format!("unknown conn {conn}"),
+                    })
+                    .await;
+                    continue;
+                };
+                let how = match half.as_str() {
+                    "wr" => libc::SHUT_WR,
+                    "rd" => libc::SHUT_RD,
+                    "rdwr" => libc::SHUT_RDWR,
+                    _ => {
+                        respond(&Response::Error {
+                            error: format!("invalid half {half:?}; expected wr, rd, or rdwr"),
+                        })
+                        .await;
+                        continue;
+                    }
+                };
+                let shutdown_result = {
+                    let stream = stream.lock().await;
+                    use std::os::fd::AsRawFd;
+                    // SAFETY: the fd comes from a live TcpStream held by the registry,
+                    // and libc::shutdown does not take ownership of it.
+                    let rc = unsafe { libc::shutdown(stream.as_raw_fd(), how) };
+                    if rc == 0 {
+                        Ok(())
+                    } else {
+                        Err(format!(
+                            "shutdown conn {conn}: {}",
+                            std::io::Error::last_os_error()
+                        ))
+                    }
+                };
+                match shutdown_result {
+                    Ok(()) => respond(&Response::ShutdownOk).await,
+                    Err(error) => respond(&Response::Error { error }).await,
+                }
+            }
+
+            Command::NetClose { conn } => {
+                if connections.remove(&conn).is_some() {
+                    respond(&Response::Closed).await;
+                } else {
+                    respond(&Response::Error {
+                        error: format!("unknown conn {conn}"),
+                    })
+                    .await;
                 }
             }
 
@@ -838,9 +935,7 @@ async fn agent_loop(self_exe: &str) {
                         match tokio::time::timeout(Duration::from_secs(5), stream.read(&mut buf))
                             .await
                         {
-                            Ok(Ok(n)) if n > 0 => {
-                                String::from_utf8_lossy(&buf[..n]).contains(&data)
-                            }
+                            Ok(Ok(n)) if n > 0 => String::from_utf8_lossy(&buf[..n]) == data,
                             _ => false,
                         }
                     }));
@@ -945,7 +1040,7 @@ async fn agent_loop(self_exe: &str) {
                             .await
                             .ok()?
                             .ok()?;
-                        if n > 0 && String::from_utf8_lossy(&buf[..n]).contains(&data) {
+                        if n == data.len() && String::from_utf8_lossy(&buf[..n]) == data {
                             Some(())
                         } else {
                             None

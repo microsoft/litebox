@@ -125,19 +125,29 @@ pub enum Command {
     #[serde(rename = "net_unlisten")]
     NetUnlisten { port: u16 },
 
+    /// Connect to addr and register the TCP stream for stateful operations.
+    #[serde(rename = "net_open")]
+    NetOpen { addr: String },
+
+    /// Send bytes on a registered TCP connection.
+    #[serde(rename = "net_send")]
+    NetSend { conn: u64, data: String },
+
+    /// Receive bytes from a registered TCP connection. None means read to EOF.
+    #[serde(rename = "net_recv")]
+    NetRecv { conn: u64, n_bytes: Option<u32> },
+
+    /// Shutdown one half of a registered TCP connection: "wr", "rd", or "rdwr".
+    #[serde(rename = "net_shutdown")]
+    NetShutdown { conn: u64, half: String },
+
+    /// Close and unregister a TCP connection.
+    #[serde(rename = "net_close")]
+    NetClose { conn: u64 },
+
     /// Connect to addr, send data, read echo response.
     #[serde(rename = "net_connect")]
     NetConnect { addr: String, data: String },
-
-    /// Connect to addr, write data, shutdown one half of the TCP connection,
-    /// then read echoed data until EOF. `half` must be `"wr"`, `"rd"`, or
-    /// `"rdwr"`; TCP half-close EOF tests use `"wr"`.
-    #[serde(rename = "net_halfclose_echo")]
-    NetHalfCloseEcho {
-        addr: String,
-        write_data: String,
-        half: String,
-    },
 
     /// Forward a command to a named child and return its response.
     #[serde(rename = "forward")]
@@ -271,13 +281,25 @@ pub enum Response {
     #[serde(rename = "connected")]
     Connected { echo: String },
 
-    /// TCP half-close echo result.
-    #[serde(rename = "halfclosed")]
-    HalfClosed { echo: String },
+    /// Stateful TCP connection opened.
+    #[serde(rename = "opened")]
+    Opened { conn: u64 },
 
-    /// TCP half-close operation failed.
-    #[serde(rename = "halfclose_failed")]
-    HalfCloseFailed { error: String },
+    /// Stateful TCP bytes sent.
+    #[serde(rename = "sent")]
+    Sent,
+
+    /// Stateful TCP bytes received.
+    #[serde(rename = "received")]
+    Received { data: String },
+
+    /// Stateful TCP shutdown completed.
+    #[serde(rename = "shutdown_ok")]
+    ShutdownOk,
+
+    /// Stateful TCP connection closed.
+    #[serde(rename = "closed")]
+    Closed,
 
     /// TCP connection failed.
     #[serde(rename = "connect_failed")]

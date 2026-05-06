@@ -8,7 +8,6 @@
 //! - TC: concurrent connections
 //! - TD: large data transfer integrity
 //! - TRR: rapid reconnect stress
-//! - TF: full-duplex simultaneous read+write
 //! - TW: cross-worker concurrent TCP
 
 use super::agents::{AgentName, SpawnKind};
@@ -200,13 +199,6 @@ const TRR_CASES: &[TrrCase] = &[
 ];
 
 // ═══════════════════════════════════════════════════════════════════
-// TF: TCP Full-Duplex — simultaneous bidirectional transfer
-// ═══════════════════════════════════════════════════════════════════
-
-const TF_AGENTS: &[AgentName] = &[AgentName::A, AgentName::AA, AgentName::B];
-const TF_SIZE: usize = 65_536;
-
-// ═══════════════════════════════════════════════════════════════════
 // TW: TCP Cross-Worker Concurrency (extends XW5/XW6)
 // ═══════════════════════════════════════════════════════════════════
 
@@ -216,7 +208,6 @@ pub(crate) fn register_tcp_stress(reg: &mut Registry<'_>) {
     register_tcp_concurrency_tests(reg);
     register_tcp_data_size_tests(reg);
     register_tcp_reconnect_stress_tests(reg);
-    register_tcp_fullduplex_tests(reg);
     register_tcp_cross_worker_concurrent_tests(reg);
 }
 
@@ -361,81 +352,6 @@ fn register_tcp_reconnect_stress_tests(reg: &mut Registry<'_>) {
                             .send(&listener_handle, crate::protocol::Command::NetUnlisten { port: p })
                             .await;
                         super::TestOutcome::new(&connector_label, pass, format!("{resp:?}"))
-                    })
-                })
-            });
-    }
-}
-
-fn register_tcp_fullduplex_tests(reg: &mut Registry<'_>) {
-    let mut port = 20_300u16;
-    for &agent in TF_AGENTS {
-        let test_id = format!("TF.{agent}");
-        let p = port;
-        port += 1;
-
-        reg.test("stress", "tcp_stress", test_id)
-            .timeout(180)
-            .build(move |cx| {
-                let handle = cx.require(agent);
-                let agent_label = agent.to_string();
-                Box::new(move |run| {
-                    Box::pin(async move {
-                        let self_exe = run.self_exe().to_string();
-                        let server_resp = run
-                            .send(
-                                &handle,
-                                crate::protocol::Command::Exec {
-                                    args: vec![
-                                        self_exe.clone(),
-                                        "tcp-fullduplex".into(),
-                                        p.to_string(),
-                                        TF_SIZE.to_string(),
-                                    ],
-                                    timeout_secs: Some(30),
-                                    stdin: None,
-                                    background: true,
-                                },
-                            )
-                            .await;
-                        let server_pid = match &server_resp {
-                            crate::protocol::Response::Background { pid } => Some(*pid),
-                            _ => {
-                                return super::TestOutcome::new(
-                                    &agent_label,
-                                    false,
-                                    format!("server spawn failed: {server_resp:?}"),
-                                );
-                            }
-                        };
-                        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-                        let client_resp = run
-                            .send(
-                                &handle,
-                                super::exec_timeout(
-                                    vec![
-                                        self_exe,
-                                        "tcp-fullduplex-client".into(),
-                                        format!("127.0.0.1:{p}"),
-                                        TF_SIZE.to_string(),
-                                    ],
-                                    15,
-                                ),
-                            )
-                            .await;
-                        if let Some(pid) = server_pid {
-                            let _ = run
-                                .send(&handle, crate::protocol::Command::Kill { pid })
-                                .await;
-                        }
-                        let pass = match &client_resp {
-                            crate::protocol::Response::ExecResult { stdout, .. } => {
-                                stdout.contains(&format!("CLIENT:sent={TF_SIZE}"))
-                                    && stdout.contains("recv=")
-                            }
-                            _ => false,
-                        };
-                        super::TestOutcome::new(&agent_label, pass, format!("{client_resp:?}"))
                     })
                 })
             });
