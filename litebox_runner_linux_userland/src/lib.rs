@@ -2209,6 +2209,7 @@ fn run_program<FS: litebox_shim_linux::ShimFS>(
 
     if let Some(net_worker) = net_worker {
         shutdown.store(true, core::sync::atomic::Ordering::Relaxed);
+        litebox_platform_multiplex::platform().wake_network_worker();
         net_worker.join().unwrap();
     }
     let wait_status = program.process.wait();
