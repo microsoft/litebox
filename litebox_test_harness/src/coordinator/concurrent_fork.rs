@@ -17,8 +17,11 @@
 //!   - Agent topology: A (depth 1), AA (depth 2), NP (non-PIE worker)
 //!   - Subcommand vs bash: protocol Exec(bash -c ...) and direct fork
 
+use super::agents::AgentName;
+use super::registry::Registry;
+
 /// Agents to run concurrent fork tests on.
-const CF_AGENTS: &[&str] = &["A", "AA", "B"];
+const CF_AGENTS: &[AgentName] = &[AgentName::A, AgentName::AA, AgentName::B];
 
 /// Pipeline patterns with increasing concurrency and library diversity.
 /// Each child in a pipeline loads different shared libraries via 9P,
@@ -71,26 +74,29 @@ const PIPELINE_PATTERNS: &[PipelinePattern] = &[
         expected: "seq_a",
     },
 ];
+
 /// Register concurrent fork pipeline tests.
-pub(crate) fn register_concurrent_fork_pipeline(tests: &mut Vec<super::Test>) {
+pub(crate) fn register_concurrent_fork_pipeline(reg: &mut Registry<'_>) {
     for &agent in CF_AGENTS {
         for pat in PIPELINE_PATTERNS {
             let name = pat.name;
             let cmd = pat.cmd;
             let expected = pat.expected;
-            let agent_s = agent.to_string();
-            tests.push(super::Test {
-                suite: "xworker",
-                group: "concurrent_fork_pipeline",
-                id: format!("CF.{name}.{agent}"),
-                xfail: None,
-                timeout_secs: 90,
-                declared_agents: Vec::new(),
-                run: Box::new(move |r| {
+            let agent_label = agent.to_string();
+
+            reg.test(
+                "xworker",
+                "concurrent_fork_pipeline",
+                format!("CF.{name}.{agent}"),
+            )
+            .timeout(90)
+            .build(move |cx| {
+                let handle = cx.require(agent);
+                Box::new(move |run| {
                     Box::pin(async move {
-                        let resp = r
+                        let resp = run
                             .send(
-                                &agent_s,
+                                &handle,
                                 super::exec_timeout(
                                     vec!["bash".into(), "-c".into(), cmd.into()],
                                     15,
@@ -105,29 +111,29 @@ pub(crate) fn register_concurrent_fork_pipeline(tests: &mut Vec<super::Test>) {
                             } => stdout.trim().contains(expected),
                             _ => false,
                         };
-                        super::TestOutcome::new(&agent_s, pass, format!("{resp:?}"))
+                        super::TestOutcome::new(&agent_label, pass, format!("{resp:?}"))
                     })
-                }),
+                })
             });
         }
     }
 
     // xworker agents
-    for &agent in &["NP", "D4"] {
-        let agent_s = agent.to_string();
-        let agent_s2 = agent_s.clone();
-        tests.push(super::Test {
-            suite: "xworker",
-            group: "concurrent_fork_pipeline",
-            id: format!("CF.pipe4_vscode.{agent}"),
-            xfail: None,
-            timeout_secs: 90,
-            declared_agents: Vec::new(),
-            run: Box::new(move |r| {
+    for &agent in &[AgentName::NP, AgentName::D4] {
+        let agent_label = agent.to_string();
+        reg.test(
+            "xworker",
+            "concurrent_fork_pipeline",
+            format!("CF.pipe4_vscode.{agent}"),
+        )
+        .timeout(90)
+        .build(move |cx| {
+            let handle = cx.require(agent);
+            Box::new(move |run| {
                 Box::pin(async move {
-                    let resp = r
+                    let resp = run
                         .send(
-                            &agent_s,
+                            &handle,
                             super::exec_timeout(
                                 vec![
                                     "bash".into(),
@@ -147,23 +153,25 @@ pub(crate) fn register_concurrent_fork_pipeline(tests: &mut Vec<super::Test>) {
                         } => stdout.trim().contains("pipe4_vscode_ok: pass"),
                         _ => false,
                     };
-                    super::TestOutcome::new(&agent_s, pass, format!("{resp:?}"))
+                    super::TestOutcome::new(&agent_label, pass, format!("{resp:?}"))
                 })
-            }),
+            })
         });
 
-        tests.push(super::Test {
-            suite: "xworker",
-            group: "concurrent_fork_pipeline",
-            id: format!("CF.sequential_control.{agent}"),
-            xfail: None,
-            timeout_secs: 90,
-            declared_agents: Vec::new(),
-            run: Box::new(move |r| {
+        let agent_label = agent.to_string();
+        reg.test(
+            "xworker",
+            "concurrent_fork_pipeline",
+            format!("CF.sequential_control.{agent}"),
+        )
+        .timeout(90)
+        .build(move |cx| {
+            let handle = cx.require(agent);
+            Box::new(move |run| {
                 Box::pin(async move {
-                    let resp = r
+                    let resp = run
                         .send(
-                            &agent_s2,
+                            &handle,
                             super::exec_timeout(
                                 vec![
                                     "bash".into(),
@@ -183,36 +191,37 @@ pub(crate) fn register_concurrent_fork_pipeline(tests: &mut Vec<super::Test>) {
                         } => stdout.trim().contains("seq_a"),
                         _ => false,
                     };
-                    super::TestOutcome::new(&agent_s2, pass, format!("{resp:?}"))
+                    super::TestOutcome::new(&agent_label, pass, format!("{resp:?}"))
                 })
-            }),
+            })
         });
     }
 }
 
 /// Register concurrent exec tests.
-pub(crate) fn register_concurrent_exec(tests: &mut Vec<super::Test>) {
+pub(crate) fn register_concurrent_exec(reg: &mut Registry<'_>) {
     for &count in &[2usize, 3, 4] {
         for &agent in CF_AGENTS {
-            let agent_s = agent.to_string();
-            tests.push(super::Test {
-                suite: "xworker",
-                group: "concurrent_exec",
-                id: format!("CF.concurrent_exec_{count}.{agent}"),
-                xfail: None,
-                timeout_secs: 90,
-                declared_agents: Vec::new(),
-                run: Box::new(move |r| {
-                    let self_exe = r.self_exe.clone();
+            let agent_label = agent.to_string();
+            reg.test(
+                "xworker",
+                "concurrent_exec",
+                format!("CF.concurrent_exec_{count}.{agent}"),
+            )
+            .timeout(90)
+            .build(move |cx| {
+                let handle = cx.require(agent);
+                Box::new(move |run| {
                     Box::pin(async move {
+                        let self_exe = run.self_exe().to_string();
                         let cmd = (0..count)
                             .map(|_| format!("{self_exe} echo-test &"))
                             .collect::<Vec<_>>()
                             .join(" ");
                         let full_cmd = format!("{cmd} wait");
-                        let resp = r
+                        let resp = run
                             .send(
-                                &agent_s,
+                                &handle,
                                 super::exec_timeout(vec!["bash".into(), "-c".into(), full_cmd], 15),
                             )
                             .await;
@@ -233,16 +242,16 @@ pub(crate) fn register_concurrent_exec(tests: &mut Vec<super::Test>) {
                             }
                             _ => format!("{resp:?}"),
                         };
-                        super::TestOutcome::new(&agent_s, pass, detail)
+                        super::TestOutcome::new(&agent_label, pass, detail)
                     })
-                }),
+                })
             });
         }
     }
 }
 
 /// Register VS Code install pipeline tests.
-pub(crate) fn register_vscode_install_pipeline(tests: &mut Vec<super::Test>) {
+pub(crate) fn register_vscode_install_pipeline(reg: &mut Registry<'_>) {
     let vscode_cmds: &[(&str, &str, &str)] = &[
         ("proc_cat_grep", "cat /proc/loadavg | grep -o '[0-9]'", ""),
         (
@@ -264,21 +273,22 @@ pub(crate) fn register_vscode_install_pipeline(tests: &mut Vec<super::Test>) {
 
     for &agent in CF_AGENTS {
         for &(name, cmd, expected) in vscode_cmds {
-            let agent_s = agent.to_string();
+            let agent_label = agent.to_string();
             let cmd_s = cmd.to_string();
             let expected_s = expected.to_string();
-            tests.push(super::Test {
-                suite: "xworker",
-                group: "vscode_install_pipeline",
-                id: format!("CF.vscode.{name}.{agent}"),
-                xfail: None,
-                timeout_secs: 90,
-                declared_agents: Vec::new(),
-                run: Box::new(move |r| {
+            reg.test(
+                "xworker",
+                "vscode_install_pipeline",
+                format!("CF.vscode.{name}.{agent}"),
+            )
+            .timeout(90)
+            .build(move |cx| {
+                let handle = cx.require(agent);
+                Box::new(move |run| {
                     Box::pin(async move {
-                        let resp = r
+                        let resp = run
                             .send(
-                                &agent_s,
+                                &handle,
                                 super::exec_timeout(vec!["bash".into(), "-c".into(), cmd_s], 15),
                             )
                             .await;
@@ -296,32 +306,33 @@ pub(crate) fn register_vscode_install_pipeline(tests: &mut Vec<super::Test>) {
                             }
                             _ => false,
                         };
-                        super::TestOutcome::new(&agent_s, pass, format!("{resp:?}"))
+                        super::TestOutcome::new(&agent_label, pass, format!("{resp:?}"))
                     })
-                }),
+                })
             });
         }
     }
 }
 
 /// Register concurrent FS rwlock tests.
-pub(crate) fn register_concurrent_fs_rwlock(tests: &mut Vec<super::Test>) {
+pub(crate) fn register_concurrent_fs_rwlock(reg: &mut Registry<'_>) {
     for &n in &[2usize, 3, 4] {
         for &agent in CF_AGENTS {
-            let agent_s = agent.to_string();
-            tests.push(super::Test {
-                suite: "xworker",
-                group: "concurrent_fs_rwlock",
-                id: format!("CF.rwlock_{n}.{agent}"),
-                xfail: None,
-                timeout_secs: 90,
-                declared_agents: Vec::new(),
-                run: Box::new(move |r| {
-                    let self_exe = r.self_exe.clone();
+            let agent_label = agent.to_string();
+            reg.test(
+                "xworker",
+                "concurrent_fs_rwlock",
+                format!("CF.rwlock_{n}.{agent}"),
+            )
+            .timeout(90)
+            .build(move |cx| {
+                let handle = cx.require(agent);
+                Box::new(move |run| {
                     Box::pin(async move {
-                        let resp = r
+                        let self_exe = run.self_exe().to_string();
+                        let resp = run
                             .send(
-                                &agent_s,
+                                &handle,
                                 super::exec_timeout(
                                     vec![self_exe, "concurrent-fs".into(), n.to_string()],
                                     20,
@@ -333,29 +344,30 @@ pub(crate) fn register_concurrent_fs_rwlock(tests: &mut Vec<super::Test>) {
                             crate::protocol::Response::ExecResult { exit_code: 0, stdout, .. }
                                 if stdout.contains("CONCURRENT_FS_OK")
                         );
-                        super::TestOutcome::new(&agent_s, pass, format!("{resp:?}"))
+                        super::TestOutcome::new(&agent_label, pass, format!("{resp:?}"))
                     })
-                }),
+                })
             });
         }
     }
 
     for &n in &[3usize, 4, 6] {
         for &agent in CF_AGENTS {
-            let agent_s = agent.to_string();
-            tests.push(super::Test {
-                suite: "xworker",
-                group: "concurrent_fs_rwlock",
-                id: format!("CF.rwlock_multi_{n}.{agent}"),
-                xfail: None,
-                timeout_secs: 90,
-                declared_agents: Vec::new(),
-                run: Box::new(move |r| {
-                    let self_exe = r.self_exe.clone();
+            let agent_label = agent.to_string();
+            reg.test(
+                "xworker",
+                "concurrent_fs_rwlock",
+                format!("CF.rwlock_multi_{n}.{agent}"),
+            )
+            .timeout(90)
+            .build(move |cx| {
+                let handle = cx.require(agent);
+                Box::new(move |run| {
                     Box::pin(async move {
-                        let resp = r
+                        let self_exe = run.self_exe().to_string();
+                        let resp = run
                             .send(
-                                &agent_s,
+                                &handle,
                                 super::exec_timeout(
                                     vec![self_exe, "concurrent-fs-multi".into(), n.to_string()],
                                     20,
@@ -367,9 +379,9 @@ pub(crate) fn register_concurrent_fs_rwlock(tests: &mut Vec<super::Test>) {
                             crate::protocol::Response::ExecResult { exit_code: 0, stdout, .. }
                                 if stdout.contains("CONCURRENT_FS_MULTI_OK")
                         );
-                        super::TestOutcome::new(&agent_s, pass, format!("{resp:?}"))
+                        super::TestOutcome::new(&agent_label, pass, format!("{resp:?}"))
                     })
-                }),
+                })
             });
         }
     }
