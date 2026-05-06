@@ -95,13 +95,10 @@ pub(crate) fn init(is_bsp: bool) {
                 panic!("Failed to protect VTL1 memory");
             };
             let start = PhysAddr::new(start);
-            if protect_physical_memory_range(
-                PhysFrame::range(
-                    PhysFrame::containing_address(start),
-                    PhysFrame::containing_address(end),
-                ),
-                MemAttr::empty(),
-            )
+            if protect_vtl1_physical_memory_range(PhysFrame::range(
+                PhysFrame::containing_address(start),
+                PhysFrame::containing_address(end),
+            ))
             .is_err()
             {
                 panic!("Failed to protect VTL1 memory");
