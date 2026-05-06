@@ -179,6 +179,7 @@ pub struct TestResult {
 
 impl TestResult {
     /// Effective outcome: pass, fail, xfail, or xpass.
+    #[must_use]
     pub fn outcome(&self) -> &'static str {
         match (&self.expected, self.actual_pass) {
             (Expectation::Pass, true) => "pass",
@@ -234,6 +235,7 @@ impl TestRunner {
         expected: Expectation,
         detail: &str,
     ) {
+        use std::io::Write as _;
         let key = format!("{test} {agent}");
         if !self.recorded_ids.insert(key) {
             eprintln!("  WARNING: duplicate test ID: {test} [{agent}] — skipping");
@@ -261,11 +263,11 @@ impl TestRunner {
                 "detail": detail,
             })
         );
-        use std::io::Write as _;
         let _ = std::io::stdout().flush();
         self.results.push(result);
     }
 
+    #[allow(clippy::similar_names)] // `rest` (routing tail) vs `resp` (response).
     async fn send(&mut self, target: &str, cmd: Command) -> Response {
         if target == "init" {
             return self.exec_local(&cmd).await;
@@ -646,6 +648,7 @@ impl TestRunner {
 ///
 /// # Panics
 /// Panics if the tokio current-thread runtime fails to build.
+#[must_use]
 pub fn run_filtered(self_exe: &str, filter: Option<&str>) -> Vec<TestResult> {
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -700,6 +703,7 @@ fn matches_test(filter: Option<&str>, test: &Test) -> bool {
 /// Collect all registered tests without executing any.
 /// Returns the full set of Test structs with their IDs and closures.
 /// No agents, no docker — just builds the test list.
+#[must_use]
 pub fn collect_all_tests() -> Vec<Test> {
     let mut tests: Vec<Test> = Vec::new();
     register_canary(&mut registry::Registry::new(&mut tests));
@@ -885,7 +889,7 @@ fn filter_needs_e(tests: &[Test]) -> bool {
     })
 }
 
-/// Route a target agent name to (direct_child, remaining_path).
+/// Route a target agent name to (`direct_child`, `remaining_path`).
 /// "A" → ("A", None), "AA" → ("A", Some("AA")), "NP" → ("A", Some("NP"))
 fn route(target: &str) -> (&str, Option<&str>) {
     match target {
@@ -1081,7 +1085,7 @@ mod tests {
         bin.to_string_lossy().into_owned()
     }
 
-    /// Helper: create a TestRunner with no children.
+    /// Helper: create a `TestRunner` with no children.
     fn empty_runner() -> TestRunner {
         TestRunner {
             children: std::collections::HashMap::new(),

@@ -36,6 +36,7 @@ macro_rules! typed_test {
 }
 
 /// Register netlink tests. Each test is self-contained: one exec + check.
+#[allow(clippy::too_many_lines)] // exhaustive registration / runner
 pub(super) fn register_netlink(reg: &mut Registry<'_>) {
     let mut self_exe_test =
         |id: &str, subcmd: &str, arg: &str, timeout: u64, check: fn(&str) -> bool| {
@@ -533,6 +534,7 @@ pub(super) fn register_stdin_script(reg: &mut Registry<'_>) {
 }
 
 // Register unix socket tests.
+#[allow(clippy::too_many_lines)] // exhaustive registration / runner
 pub(crate) fn register_unix_socket(reg: &mut Registry<'_>) {
     let simple_tests: &[(&str, &str, &str)] = &[
         (
@@ -737,6 +739,7 @@ pub(crate) fn register_unix_socket(reg: &mut Registry<'_>) {
 }
 
 // Register cross-worker tests.
+#[allow(clippy::too_many_lines)] // exhaustive registration / runner
 pub(crate) fn register_cross_worker(reg: &mut Registry<'_>) {
     typed_test!(
         reg,
@@ -1391,6 +1394,7 @@ pub(crate) fn register_pipe_eof(reg: &mut Registry<'_>) {
 }
 
 // Register contamination sequence tests (X49-X59).
+#[allow(clippy::too_many_lines)] // exhaustive registration / runner
 pub(crate) fn register_contamination_sequence(reg: &mut Registry<'_>) {
     typed_test!(
         reg,

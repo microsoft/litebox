@@ -28,6 +28,7 @@ pub(crate) fn register_file_tcp(reg: &mut Registry<'_>) {
     register_exec_during_tcp_tests(reg);
 }
 
+#[allow(clippy::too_many_lines)] // exhaustive registration / runner
 fn register_listen_file_tests(reg: &mut Registry<'_>) {
     for &agent in &[AgentName::A, AgentName::B] {
         let port = if agent == AgentName::A { 18100 } else { 18101 };
@@ -164,6 +165,7 @@ fn register_listen_file_tests(reg: &mut Registry<'_>) {
     }
 }
 
+#[allow(clippy::too_many_lines)] // exhaustive registration / runner
 fn register_conn_file_tests(reg: &mut Registry<'_>) {
     let port = 18110u16;
 
@@ -446,6 +448,7 @@ fn register_interleave_tests(reg: &mut Registry<'_>) {
     }
 }
 
+#[allow(clippy::too_many_lines)] // exhaustive registration / runner
 fn register_multi_cycle_tests(reg: &mut Registry<'_>) {
     let port = 18130u16;
 

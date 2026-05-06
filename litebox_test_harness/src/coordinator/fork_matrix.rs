@@ -5,8 +5,8 @@
 //!
 //! Dimensions:
 //! - Shell pattern × agent depth
-//! - Exec binary type {SelfExe, Node} × agent depth
-//! - Exec method {ScriptFile, NestedBash, ExecInScript, ...}
+//! - Exec binary type {`SelfExe`, Node} × agent depth
+//! - Exec method {`ScriptFile`, `NestedBash`, `ExecInScript`, ...}
 //! - Delayed fork: trigger × binary × invocation × depth × nesting
 //! - Stress exec: mode × spawn method
 //! - Non-PIE invocation method
@@ -146,7 +146,7 @@ impl ExecBinary {
 
 struct ExecMethodCase {
     name: &'static str,
-    /// Bash -c command. {self_exe} is replaced with the test binary path.
+    /// Bash -c command. {`self_exe`} is replaced with the test binary path.
     cmd_template: &'static str,
     expected: &'static str,
 }
@@ -304,7 +304,7 @@ const NONPIE_CASES: &[NonPieCase] = &[
 
 struct ContaminationCase {
     name: &'static str,
-    /// Bash command template. {self_exe} is replaced. None = special init-level test.
+    /// Bash command template. {`self_exe`} is replaced. None = special init-level test.
     bash_template: Option<&'static str>,
     expected: &'static str,
 }
@@ -351,6 +351,7 @@ const CONTAMINATION_CASES: &[ContaminationCase] = &[
 // RUNNER
 // ═══════════════════════════════════════════════════════════════════
 
+#[allow(clippy::too_many_lines)] // exhaustive registration / runner
 pub(crate) fn register_fork_matrix(reg: &mut Registry<'_>) {
     // Shell patterns x depth
     for &agent in DEPTH_AGENTS {

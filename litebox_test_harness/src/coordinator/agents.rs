@@ -23,6 +23,7 @@ use std::fmt;
 /// the wire-level agent identifier as it appears in test ids and in
 /// the protocol's `Forward { target, .. }` field.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[allow(clippy::upper_case_acronyms)] // NPC, AAA, AAB are wire-protocol names.
 pub enum AgentName {
     /// The coordinator process itself (local `init` target).
     Init,
@@ -38,7 +39,7 @@ pub enum AgentName {
     D4,
     D5,
     /// Subtree-kill ephemeral root. Spawned as a direct child of the
-    /// coordinator (like A, B) and intended to be SIGKILLed by the
+    /// coordinator (like A, B) and intended to be `SIGKILLed` by the
     /// SK.subtree.* tests. Per-Trial docker isolation guarantees no
     /// pollution across tests.
     E,

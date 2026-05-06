@@ -181,6 +181,7 @@ pub(crate) fn register_exit_data_integrity_tests(reg: &mut Registry<'_>) {
 // NPIPE: non-PIE pipe chain integrity (fix febc3e41)
 // ═══════════════════════════════════════════════════════════════════
 
+#[allow(clippy::too_many_lines)] // exhaustive registration / runner
 pub(crate) fn register_nonpie_pipe_chain_tests(reg: &mut Registry<'_>) {
     for &reps in NPIPE_REPS {
         for &agent in DEPTH_AGENTS {
@@ -307,6 +308,7 @@ pub(crate) fn register_nonpie_pipe_chain_tests(reg: &mut Registry<'_>) {
 // XCONN: cross-worker TCP — first connection must succeed
 // ═══════════════════════════════════════════════════════════════════
 
+#[allow(clippy::too_many_lines)] // exhaustive registration / runner
 pub(crate) fn register_cross_worker_first_connect_tests(reg: &mut Registry<'_>) {
     // XCONN.cross_first: A listens, B connects — first attempt must succeed.
     reg.test(
@@ -432,6 +434,7 @@ pub(crate) fn register_cross_worker_first_connect_tests(reg: &mut Registry<'_>) 
 // XCONN.self: same-worker loopback (VS Code pattern)
 // ═══════════════════════════════════════════════════════════════════
 
+#[allow(clippy::too_many_lines)] // exhaustive registration / runner
 pub(crate) fn register_cross_worker_self_connect_tests(reg: &mut Registry<'_>) {
     // XCONN.self_A: A listens, A connects to itself.
     reg.test(
@@ -684,6 +687,7 @@ pub(crate) fn register_bash_fork_exec_tests(reg: &mut Registry<'_>) {
 // FWE: fork+exec from non-PIE worker-exec hosts
 // ═══════════════════════════════════════════════════════════════════
 
+#[allow(clippy::too_many_lines)] // exhaustive registration / runner
 pub(crate) fn register_fork_from_worker_exec_tests(reg: &mut Registry<'_>) {
     // FWE.nonpie_from_init: fork+exec nonpie from init worker (agent A)
     reg.test(
@@ -910,6 +914,7 @@ pub(crate) fn register_stdin_pipe_subst_tests(reg: &mut Registry<'_>) {
 // CWF: Cross-worker file coherence
 // ═══════════════════════════════════════════════════════════════════
 
+#[allow(clippy::too_many_lines)] // exhaustive registration / runner
 pub(crate) fn register_cross_worker_file_tests(reg: &mut Registry<'_>) {
     for &agent in AGENTS {
         let agent_s = agent.to_string();
@@ -1551,6 +1556,7 @@ pub(crate) fn register_touch_redirect_tests(reg: &mut Registry<'_>) {
 // KP: PID and /proc visibility across delayed-fork migration
 // ═══════════════════════════════════════════════════════════════════
 
+#[allow(clippy::too_many_lines)] // exhaustive registration / runner
 pub(crate) fn register_pid_visibility_tests(reg: &mut Registry<'_>) {
     struct Def {
         name: &'static str,
@@ -1989,6 +1995,7 @@ pub(crate) fn register_epoll_socket_tests(reg: &mut Registry<'_>) {
 // LB: Loopback TCP across delayed-fork workers
 // ═══════════════════════════════════════════════════════════════════
 
+#[allow(clippy::too_many_lines)] // exhaustive registration / runner
 pub(crate) fn register_loopback_tcp_tests(reg: &mut Registry<'_>) {
     struct Def {
         name: &'static str,
@@ -2334,7 +2341,7 @@ pub(crate) fn register_proc_filesystem_tests(reg: &mut Registry<'_>) {
 /// jitter under heavy parallelism without masking real hangs.
 const SK_WAIT_BUDGET_SECS: u64 = 5;
 
-/// Per-test outer budget. Must exceed SpawnRemote setup cost
+/// Per-test outer budget. Must exceed `SpawnRemote` setup cost
 /// (the broker rewrites a 124 MB binary on first use, plus the
 /// well-known `spawn_nonpie_subtree` 30-s timeout under litebox).
 const SK_TEST_TIMEOUT_SECS: u64 = 90;

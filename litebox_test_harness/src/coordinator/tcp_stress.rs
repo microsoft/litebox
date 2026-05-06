@@ -133,31 +133,31 @@ const TD_CASES: &[TdCase] = &[
         name: "in_process",
         listener: AgentName::A,
         connector: AgentName::A,
-        size: 65536,
+        size: 65_536,
     },
     TdCase {
         name: "sibling",
         listener: AgentName::B,
         connector: AgentName::A,
-        size: 65536,
+        size: 65_536,
     },
     TdCase {
         name: "cross_subtree",
         listener: AgentName::AAA,
         connector: AgentName::B,
-        size: 65536,
+        size: 65_536,
     },
     TdCase {
         name: "in_process",
         listener: AgentName::A,
         connector: AgentName::A,
-        size: 262144,
+        size: 262_144,
     },
     TdCase {
         name: "sibling",
         listener: AgentName::B,
         connector: AgentName::A,
-        size: 262144,
+        size: 262_144,
     },
 ];
 
@@ -204,7 +204,7 @@ const TRR_CASES: &[TrrCase] = &[
 // ═══════════════════════════════════════════════════════════════════
 
 const TF_AGENTS: &[AgentName] = &[AgentName::A, AgentName::AA, AgentName::B];
-const TF_SIZE: usize = 65536;
+const TF_SIZE: usize = 65_536;
 
 // ═══════════════════════════════════════════════════════════════════
 // TW: TCP Cross-Worker Concurrency (extends XW5/XW6)
@@ -286,9 +286,9 @@ fn register_tcp_concurrency_tests(reg: &mut Registry<'_>) {
 fn register_tcp_data_size_tests(reg: &mut Registry<'_>) {
     let mut port = 20_100u16;
     for tc in TD_CASES {
-        let size_label = if tc.size >= 262144 {
+        let size_label = if tc.size >= 262_144 {
             "256K"
-        } else if tc.size >= 65536 {
+        } else if tc.size >= 65_536 {
             "64K"
         } else {
             "1K"
