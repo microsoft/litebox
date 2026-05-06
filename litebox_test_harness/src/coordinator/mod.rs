@@ -204,10 +204,16 @@ pub struct TestRunner {
     /// to validate that the lazy-matrix decision (which agents to
     /// spawn) was correct: every contacted agent must have been
     /// spawned. See `validate_lazy_matrix`.
-    contacted_agents: std::collections::HashSet<String>,
+    pub(super) contacted_agents: std::collections::HashSet<String>,
     /// Agent names actually spawned by `spawn_tree`. Compared against
     /// `contacted_agents` at end-of-run.
     pub(super) spawned_agents: std::collections::HashSet<String>,
+    /// Union of `declared_agents` across all filtered tests (with
+    /// `cx.require` ancestors already expanded). Used by the
+    /// over-spawn validator to distinguish *test-author-declared*
+    /// agents (which must be used) from *always-on infrastructure*
+    /// agents like the PIE matrix (which are spawned regardless).
+    declared_union: std::collections::HashSet<String>,
 }
 
 impl TestRunner {
@@ -320,179 +326,192 @@ impl TestRunner {
         }
     }
 
-    /// Spawn the full agent tree: A (→AA,AB,AAA,AAB), B,
-    /// and optionally NP,NPC,D3,D4,D5 if non-PIE binary is available.
+    /// Spawn the agents required by the filtered tests.
     ///
-    /// `wants_nonpie` controls whether the expensive non-PIE subtree is
-    /// spawned. Most tests (~97 % of the suite) are PIE-only and don't
-    /// need NP/NPC/D3/D4/D5; skipping the non-PIE path saves ~30 s of
-    /// known `spawn_nonpie_subtree` timeout per harness invocation.
-    /// Set to `true` if any test in the filter references those agent
-    /// names; see `filter_needs_nonpie`.
-    async fn spawn_tree(&mut self, wants_nonpie: bool, wants_e: bool) {
-        // Always-on PIE matrix: A, AA, AB, AAA, AAB, B (cheap, ~3s).
-        for &name in &["A", "AA", "AB", "AAA", "AAB", "B"] {
-            self.spawned_agents.insert(name.to_string());
-        }
-        // Spawn direct children A and B.
-        for id in &["A", "B"] {
-            match spawn_child(&self.self_exe) {
-                Ok(child) => {
-                    self.children.insert(id.to_string(), child);
-                    let sub = match *id {
-                        "A" => vec!["AA".to_string(), "AB".to_string()],
-                        _ => vec![],
-                    };
-                    if !sub.is_empty() {
-                        let r = send_cmd(
-                            self.children.get_mut(*id).unwrap(),
-                            &Command::Spawn { children: sub },
-                        )
-                        .await;
-                        eprintln!("[coord] {id} spawn children: {r:?}");
+    /// `needed` is the union of `declared_agents` across filtered
+    /// tests, with `AgentName::ancestors()` already expanded.
+    /// Coordinator-side overhead is paid only for agents that some
+    /// test actually asked for — minimal-repro shape (single-test
+    /// filters spawn just the path that test uses).
+    async fn spawn_tree(&mut self, needed: &std::collections::BTreeSet<agents::AgentName>) {
+        use agents::AgentName::{A, AA, AAA, AAB, AB, B, D3, D4, D5, E, EE, NP, NPC};
+        // `Init` is the coordinator itself — always available; record
+        // it as "spawned" so the validator doesn't false-flag tests
+        // that route to it via cx.fs_read / Command::FsRead.
+        self.spawned_agents.insert("init".to_string());
+        // Top-level direct children of the coordinator.
+        for top in [A, B, E] {
+            if needed.contains(&top) {
+                self.spawned_agents.insert(top.name().to_string());
+                match spawn_child(&self.self_exe) {
+                    Ok(child) => {
+                        self.children.insert(top.name().to_string(), child);
                     }
+                    Err(e) => eprintln!("[coord] spawn {} failed: {e}", top.name()),
                 }
-                Err(e) => eprintln!("[coord] spawn {id} failed: {e}"),
             }
         }
 
-        // Tell A's child AA to spawn AAA, AAB.
-        let r = self
-            .send(
-                "AA",
-                Command::Spawn {
-                    children: vec!["AAA".to_string(), "AAB".to_string()],
-                },
+        // PIE descendants. Group by parent so we can batch a single
+        // Spawn command per parent.
+        let mut a_pie_kids: Vec<String> = Vec::new();
+        if needed.contains(&AA) {
+            a_pie_kids.push(AA.name().to_string());
+        }
+        if needed.contains(&AB) {
+            a_pie_kids.push(AB.name().to_string());
+        }
+        if !a_pie_kids.is_empty() && needed.contains(&A) {
+            for k in &a_pie_kids {
+                self.spawned_agents.insert(k.clone());
+            }
+            let r = self
+                .send(
+                    "A",
+                    Command::Spawn {
+                        children: a_pie_kids.clone(),
+                    },
+                )
+                .await;
+            eprintln!("[coord] A spawn {a_pie_kids:?}: {r:?}");
+        }
+
+        let mut grandkids: Vec<String> = Vec::new();
+        if needed.contains(&AAA) {
+            grandkids.push(AAA.name().to_string());
+        }
+        if needed.contains(&AAB) {
+            grandkids.push(AAB.name().to_string());
+        }
+        if !grandkids.is_empty() && needed.contains(&AA) {
+            for k in &grandkids {
+                self.spawned_agents.insert(k.clone());
+            }
+            let r = self
+                .send(
+                    "AA",
+                    Command::Spawn {
+                        children: grandkids.clone(),
+                    },
+                )
+                .await;
+            eprintln!("[coord] AA spawn {grandkids:?}: {r:?}");
+        }
+
+        if needed.contains(&EE) && needed.contains(&E) {
+            self.spawned_agents.insert(EE.name().to_string());
+            let r = self
+                .send(
+                    "E",
+                    Command::Spawn {
+                        children: vec![EE.name().to_string()],
+                    },
+                )
+                .await;
+            eprintln!("[coord] E spawn EE: {r:?}");
+        }
+
+        // Non-PIE subtree: NP/NPC under A; D3 (PIE) → D4 (non-PIE) →
+        // D5 (PIE) under AA. Wrapped in a 30s timeout to catch the
+        // known NP→NPC pipe-bridge hang under litebox.
+        let needs_nonpie = [NP, NPC, D3, D4, D5].iter().any(|a| needed.contains(a));
+        if needs_nonpie {
+            // Required dependency: panic now with a clear message
+            // rather than silently failing later with confusing
+            // "no child NP" routing errors.
+            let _ = crate::nonpie_binary();
+            for &n in &[NP, NPC, D3, D4, D5] {
+                if needed.contains(&n) {
+                    self.spawned_agents.insert(n.name().to_string());
+                }
+            }
+            if tokio::time::timeout(
+                Duration::from_secs(30),
+                self.spawn_nonpie_subtree(needed),
             )
-            .await;
-        eprintln!("[coord] AA spawn children: {r:?}");
-
-        // Spawn E (and EE) on demand. SK.subtree.* tests use these as
-        // the SIGKILL target, but they're spawned on the same routing
-        // mesh as A/B so tests can reach them via TestRunner::send.
-        if wants_e {
-            self.spawned_agents.insert("E".to_string());
-            match spawn_child(&self.self_exe) {
-                Ok(child) => {
-                    self.children.insert("E".to_string(), child);
-                    self.spawned_agents.insert("EE".to_string());
-                    let r = self
-                        .send(
-                            "E",
-                            Command::Spawn {
-                                children: vec!["EE".to_string()],
-                            },
-                        )
-                        .await;
-                    eprintln!("[coord] E spawn EE: {r:?}");
-                }
-                Err(e) => eprintln!("[coord] spawn E failed: {e}"),
-            }
-        }
-
-        // Spawn non-PIE subtree only if any filtered test needs it.
-        // ~97% of tests are PIE-only and would just pay the 30s
-        // spawn_nonpie_subtree timeout for nothing. validate_lazy_matrix
-        // surfaces a loud failure if a contacted agent wasn't spawned.
-        if !wants_nonpie {
-            eprintln!(
-                "[coord] skipping non-PIE subtree (no filtered test references NP/NPC/D3/D4/D5)"
-            );
-            return;
-        }
-        for &name in &["NP", "NPC", "D3", "D4", "D5"] {
-            self.spawned_agents.insert(name.to_string());
-        }
-        // Required dependency: panic now with a clear message rather
-        // than silently skipping the subtree spawn and letting tests
-        // fail with confusing "no child NP" routing errors several
-        // seconds later.
-        let _ = crate::nonpie_binary();
-        // Broker caches the rewritten binary, so this is fast after
-        // the first SpawnRemote. Timeout catches the known NP→NPC
-        // pipe bridge hang (vfork Pollee observer bug). Retried on
-        // each rebuild since a fresh tree may succeed.
-        if tokio::time::timeout(Duration::from_secs(30), self.spawn_nonpie_subtree())
             .await
             .is_err()
-        {
-            eprintln!(
-                "[coord] non-PIE subtree setup timed out (30s, likely pipe bridge bug) — continuing without NP/D4"
-            );
+            {
+                eprintln!(
+                    "[coord] non-PIE subtree setup timed out (30s, likely pipe bridge bug)"
+                );
+            }
         }
     }
 
-    /// Spawn non-PIE agents: NP, NPC, D3, D4, D5.
-    async fn spawn_nonpie_subtree(&mut self) {
-        eprintln!("[coord] spawning non-PIE subtree (NP → NPC)");
-        let r = self
-            .send(
-                "A",
-                Command::SpawnRemote {
-                    children: vec!["NP".to_string()],
-                },
-            )
-            .await;
-        eprintln!("[coord] SpawnRemote NP: {r:?}");
-
-        if matches!(&r, Response::Ok { .. }) {
+    /// Spawn the non-PIE descendants requested in `needed`.
+    async fn spawn_nonpie_subtree(
+        &mut self,
+        needed: &std::collections::BTreeSet<agents::AgentName>,
+    ) {
+        use agents::AgentName::{D3, D4, D5, NP, NPC};
+        if needed.contains(&NP) {
+            let r = self
+                .send(
+                    "A",
+                    Command::SpawnRemote {
+                        children: vec![NP.name().to_string()],
+                    },
+                )
+                .await;
+            eprintln!("[coord] SpawnRemote NP: {r:?}");
+        }
+        if needed.contains(&NPC) {
             let r = self
                 .send(
                     "A",
                     Command::Forward {
-                        target: "NP".to_string(),
+                        target: NP.name().to_string(),
                         inner: Box::new(Command::Spawn {
-                            children: vec!["NPC".to_string()],
+                            children: vec![NPC.name().to_string()],
                         }),
                     },
                 )
                 .await;
             eprintln!("[coord] NP spawn NPC: {r:?}");
         }
-
         // Deep mixed chain: AA → D3 (PIE) → D4 (non-PIE) → D5 (PIE)
-        eprintln!("[coord] building deep mixed chain (D3 → D4 → D5)");
-        let r = self
-            .send(
-                "AA",
-                Command::Spawn {
-                    children: vec!["D3".to_string()],
-                },
-            )
-            .await;
-        eprintln!("[coord] AA spawn D3: {r:?}");
-
-        if matches!(&r, Response::Ok { .. }) {
+        if needed.contains(&D3) {
+            let r = self
+                .send(
+                    "AA",
+                    Command::Spawn {
+                        children: vec![D3.name().to_string()],
+                    },
+                )
+                .await;
+            eprintln!("[coord] AA spawn D3: {r:?}");
+        }
+        if needed.contains(&D4) {
             let r = self
                 .send(
                     "AA",
                     Command::Forward {
-                        target: "D3".to_string(),
+                        target: D3.name().to_string(),
                         inner: Box::new(Command::SpawnRemote {
-                            children: vec!["D4".to_string()],
+                            children: vec![D4.name().to_string()],
                         }),
                     },
                 )
                 .await;
             eprintln!("[coord] D3 SpawnRemote D4: {r:?}");
-
-            if matches!(&r, Response::Ok { .. }) {
-                let r = self
-                    .send(
-                        "AA",
-                        Command::Forward {
-                            target: "D3".to_string(),
-                            inner: Box::new(Command::Forward {
-                                target: "D4".to_string(),
-                                inner: Box::new(Command::Spawn {
-                                    children: vec!["D5".to_string()],
-                                }),
+        }
+        if needed.contains(&D5) {
+            let r = self
+                .send(
+                    "AA",
+                    Command::Forward {
+                        target: D3.name().to_string(),
+                        inner: Box::new(Command::Forward {
+                            target: D4.name().to_string(),
+                            inner: Box::new(Command::Spawn {
+                                children: vec![D5.name().to_string()],
                             }),
-                        },
-                    )
-                    .await;
-                eprintln!("[coord] D4 spawn D5: {r:?}");
-            }
+                        }),
+                    },
+                )
+                .await;
+            eprintln!("[coord] D4 spawn D5: {r:?}");
         }
     }
 
@@ -508,38 +527,81 @@ impl TestRunner {
         self.poisoned.clear();
     }
 
-    /// Validate the lazy-matrix decision: every agent contacted via
-    /// `send()` must have been spawned by `spawn_tree`. A mismatch
-    /// means a test contacted an agent it didn't declare via
-    /// `RegistrationContext::require` — should be impossible through
-    /// the typed API, so this is a final-safety belt-and-braces check.
-    /// Recorded as a synthetic `FAIL` so the integration pipeline
-    /// surfaces it loudly.
+    /// Validate the lazy-matrix decision in both directions:
+    ///
+    /// 1. **Under-spawn** (correctness): every agent contacted via
+    ///    `send()` must have been spawned by `spawn_tree`. A mismatch
+    ///    means a test contacted an agent it didn't declare via
+    ///    `RegistrationContext::require` — should be impossible
+    ///    through the typed API; recorded as a synthetic FAIL.
+    ///
+    /// 2. **Over-spawn** (over-declaration): every agent that
+    ///    `spawn_tree` brought up should have been actually used by
+    ///    some test in the filter — either contacted directly or
+    ///    traversed as a routing intermediary. Tests that
+    ///    `cx.require(AgentName::X)` without ever sending to `X`
+    ///    are over-declaring, which clutters minimal-repro process
+    ///    trees and audit logs. Recorded as a synthetic FAIL so
+    ///    over-declarations get fixed at registration.
     fn validate_lazy_matrix(&mut self) {
+        // 1. contacted - spawned (under-spawn / undeclared deps)
         let mut unexpected: Vec<_> = self
             .contacted_agents
             .difference(&self.spawned_agents)
             .cloned()
             .collect();
         unexpected.sort();
-        if unexpected.is_empty() {
-            return;
+        if !unexpected.is_empty() {
+            let detail = format!(
+                "tests contacted agents that were not spawned: {} (spawned={:?}). \
+                 A test sent to an agent it didn't declare via \
+                 RegistrationContext::require — should be unreachable through \
+                 the typed API. Workaround: re-run with \
+                 LITEBOX_FORCE_FULL_MATRIX=1 to confirm.",
+                unexpected.join(","),
+                {
+                    let mut s: Vec<_> = self.spawned_agents.iter().cloned().collect();
+                    s.sort();
+                    s
+                },
+            );
+            eprintln!("[coord] LAZY MATRIX VALIDATION FAILED (under-spawn): {detail}");
+            self.record("__lazy_matrix.under_spawn", "?", false, &detail);
         }
-        let detail = format!(
-            "tests contacted agents that were not spawned: {} (spawned={:?}). \
-             A test sent to an agent it didn't declare via \
-             RegistrationContext::require — should be unreachable through \
-             the typed API. Workaround: re-run with \
-             LITEBOX_FORCE_FULL_MATRIX=1 to confirm.",
-            unexpected.join(","),
-            {
-                let mut s: Vec<_> = self.spawned_agents.iter().cloned().collect();
-                s.sort();
-                s
-            },
-        );
-        eprintln!("[coord] LAZY MATRIX VALIDATION FAILED: {detail}");
-        self.record("__lazy_matrix.validation", "?", false, &detail);
+
+        // 2. declared - (contacted ∪ ancestors-of-contacted) (over-spawn)
+        //    `contacted_agents` only records the original target of
+        //    each `send()`; routing physically traverses ancestors
+        //    too. Expand by `AgentName::ancestors()` before subtracting
+        //    so intermediaries aren't falsely flagged. Compares
+        //    against `declared_union` (the test-author-declared set)
+        //    rather than `spawned_agents`, so any always-on
+        //    coordinator-side spawns wouldn't show up here even if
+        //    they were re-introduced.
+        let mut transitively_contacted = self.contacted_agents.clone();
+        for name in &self.contacted_agents {
+            if let Some(agent) = agents::AgentName::from_wire(name) {
+                for &anc in agent.ancestors() {
+                    transitively_contacted.insert(anc.name().to_string());
+                }
+            }
+        }
+        let mut unused: Vec<_> = self
+            .declared_union
+            .difference(&transitively_contacted)
+            .cloned()
+            .collect();
+        unused.sort();
+        if !unused.is_empty() {
+            let detail = format!(
+                "agents were declared via cx.require but never contacted by any \
+                 filtered test: {}. Drop the unused require() to keep \
+                 minimal-repro process trees lean.",
+                unused.join(","),
+            );
+            eprintln!("[coord] LAZY MATRIX VALIDATION FAILED (over-spawn): {detail}");
+            self.record("__lazy_matrix.over_spawn", "?", false, &detail);
+        }
     }
 
     async fn exec_local(&self, cmd: &Command) -> Response {
@@ -761,6 +823,7 @@ pub fn collect_all_tests() -> Vec<Test> {
     tests
 }
 
+#[allow(clippy::too_many_lines)] // top-level dispatch + setup; refactoring out is invasive.
 async fn run_tests(self_exe: &str, filter: Option<&str>) -> Vec<TestResult> {
     let runtime_env = detect_runtime_environment();
     eprintln!("[coord] runtime: {runtime_env}");
@@ -773,6 +836,7 @@ async fn run_tests(self_exe: &str, filter: Option<&str>) -> Vec<TestResult> {
         recorded_ids: std::collections::HashSet::new(),
         contacted_agents: std::collections::HashSet::new(),
         spawned_agents: std::collections::HashSet::new(),
+        declared_union: std::collections::HashSet::new(),
     };
 
     // --- New-style declarative tests (proof of concept) ---
@@ -793,12 +857,61 @@ async fn run_tests(self_exe: &str, filter: Option<&str>) -> Vec<TestResult> {
 
     if !new_filtered.is_empty() {
         eprintln!("[coord] running {} registered tests", new_filtered.len());
-        // Lazy agent matrix: only spawn the expensive non-PIE subtree
-        // if any filtered test references those agents. Validation at
-        // end-of-run detects mismatches.
-        let wants_nonpie = filter_needs_nonpie(&new_filtered);
-        let wants_e = filter_needs_e(&new_filtered);
-        runner.spawn_tree(wants_nonpie, wants_e).await;
+
+        // Compute the union of declared agents across all filtered
+        // tests (including their routing-chain ancestors via
+        // RegistrationContext::require). This drives spawn_tree —
+        // every agent in the matrix is spawned on demand based on
+        // what tests actually asked for, not a fixed always-on set.
+        let mut declared_union: std::collections::BTreeSet<agents::AgentName> =
+            std::collections::BTreeSet::new();
+        let mut needs_nonpie_binary = false;
+        for test in &new_filtered {
+            for &a in &test.declared_agents {
+                declared_union.insert(a);
+                for &anc in a.ancestors() {
+                    declared_union.insert(anc);
+                }
+            }
+            // Tests that declared a NonPie ephemeral don't need any
+            // additional static agents — the SpawnRemote happens
+            // under the ephemeral's own (already-declared) static
+            // parent. We only need to assert the non-PIE binary
+            // exists so spawn_tree fails loudly if it's missing.
+            if test.needs_nonpie_for_ephemerals {
+                needs_nonpie_binary = true;
+            }
+        }
+        if needs_nonpie_binary {
+            // Required dependency check: panic now with a clear
+            // message rather than letting the test's own SpawnRemote
+            // fail later with a routing-level error.
+            let _ = crate::nonpie_binary();
+        }
+        if std::env::var("LITEBOX_FORCE_FULL_MATRIX").is_ok() {
+            for &a in &[
+                agents::AgentName::A,
+                agents::AgentName::AA,
+                agents::AgentName::AB,
+                agents::AgentName::AAA,
+                agents::AgentName::AAB,
+                agents::AgentName::B,
+                agents::AgentName::E,
+                agents::AgentName::EE,
+                agents::AgentName::NP,
+                agents::AgentName::NPC,
+                agents::AgentName::D3,
+                agents::AgentName::D4,
+                agents::AgentName::D5,
+            ] {
+                declared_union.insert(a);
+            }
+        }
+        runner.declared_union = declared_union
+            .iter()
+            .map(|a| a.name().to_string())
+            .collect();
+        runner.spawn_tree(&declared_union).await;
         for test in new_filtered {
             let timeout_dur = Duration::from_secs(test.timeout_secs);
             if let Ok(outcome) = tokio::time::timeout(timeout_dur, (test.run)(&mut runner)).await {
@@ -851,46 +964,6 @@ async fn run_tests(self_exe: &str, filter: Option<&str>) -> Vec<TestResult> {
     }
 
     runner.results
-}
-
-/// Returns true if any filtered test references a non-PIE agent.
-/// Used to gate the expensive `spawn_nonpie_subtree` (which can take
-/// 30s under litebox due to the known vfork pipe-bridge bug).
-///
-/// The signal is precise: tests declare their agent dependencies via
-/// `RegistrationContext::require`, and the type system prevents a
-/// test from sending to an undeclared agent. `LITEBOX_FORCE_FULL_MATRIX`
-/// is honored as a debug escape hatch.
-fn filter_needs_nonpie(tests: &[Test]) -> bool {
-    use agents::AgentName;
-    const NONPIE: &[AgentName] = &[
-        AgentName::NP,
-        AgentName::NPC,
-        AgentName::D3,
-        AgentName::D4,
-        AgentName::D5,
-    ];
-    if std::env::var("LITEBOX_FORCE_FULL_MATRIX").is_ok() {
-        return true;
-    }
-    tests.iter().any(|t| {
-        t.needs_nonpie_for_ephemerals || t.declared_agents.iter().any(|a| NONPIE.contains(a))
-    })
-}
-
-/// Whether any test in the filter declares the SK.subtree.* ephemeral
-/// root `E` (or its child `EE`). Gates spawning of the E subtree so
-/// the cost is paid only when needed.
-fn filter_needs_e(tests: &[Test]) -> bool {
-    use agents::AgentName;
-    if std::env::var("LITEBOX_FORCE_FULL_MATRIX").is_ok() {
-        return true;
-    }
-    tests.iter().any(|t| {
-        t.declared_agents
-            .iter()
-            .any(|a| matches!(a, AgentName::E | AgentName::EE))
-    })
 }
 
 /// Route a target agent name to (`direct_child`, `remaining_path`).
@@ -1099,6 +1172,7 @@ mod tests {
             recorded_ids: std::collections::HashSet::new(),
             contacted_agents: std::collections::HashSet::new(),
             spawned_agents: std::collections::HashSet::new(),
+            declared_union: std::collections::HashSet::new(),
         }
     }
 
