@@ -17,7 +17,6 @@
 #![cfg_attr(not(feature = "std"), no_std)]
 extern crate alloc;
 
-use alloc::collections::BTreeSet;
 use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::vec;
@@ -160,6 +159,7 @@ pub fn hook_syscalls_in_elf(
         dl_sysinfo_int80,
         text_sections,
         control_transfer_targets,
+        x86_64_syscall_sites,
         trampoline_base_addr,
         fork_to_vfork_patch,
     ) = {
@@ -183,7 +183,8 @@ pub fn hook_syscalls_in_elf(
             return Err(Error::AlreadyHooked);
         }
 
-        let control_transfer_targets = get_control_transfer_targets(arch, &*buf, &text_sections)?;
+        let (control_transfer_targets, x86_64_syscall_sites) =
+            get_control_transfer_targets(arch, &*buf, &text_sections)?;
 
         let trampoline_base_addr = find_addr_for_trampoline_code(&file);
 
@@ -194,6 +195,7 @@ pub fn hook_syscalls_in_elf(
             dl_sysinfo_int80,
             text_sections,
             control_transfer_targets,
+            x86_64_syscall_sites,
             trampoline_base_addr,
             fork_to_vfork_patch,
         )
@@ -212,11 +214,12 @@ pub fn hook_syscalls_in_elf(
 
     // Patch syscalls in-place in buf
     let mut syscall_insns_found = false;
-    for s in &text_sections {
+    for (section_index, s) in text_sections.iter().enumerate() {
         let section_data = section_slice_mut(buf, s)?;
         match hook_syscalls_in_section(
             arch,
             &control_transfer_targets,
+            x86_64_syscall_sites.get(section_index).map(Vec::as_slice),
             s.vaddr,
             section_data,
             trampoline_base_addr,
@@ -446,18 +449,21 @@ pub fn patch_code_segment(
 
     // Build control-transfer targets for this segment.
     let instructions = decode_section_instructions(arch, code, code_vaddr)?;
-    let mut control_transfer_targets = BTreeSet::new();
-    for inst in &instructions {
-        let target = inst.near_branch_target();
-        if target != 0 {
-            control_transfer_targets.insert(target);
-        }
-    }
+    let control_transfer_targets = ControlTransferTargets::new(
+        instructions
+            .iter()
+            .filter_map(|inst| {
+                let target = inst.near_branch_target();
+                (target != 0).then_some(target)
+            })
+            .collect(),
+    );
 
     let mut trampoline_data = Vec::new();
     match hook_syscalls_in_section(
         arch,
         &control_transfer_targets,
+        None,
         code_vaddr,
         code,
         trampoline_write_vaddr,
@@ -558,6 +564,391 @@ enum Arch {
     X86_64,
 }
 
+struct ControlTransferTargets(Vec<u64>);
+
+impl ControlTransferTargets {
+    fn new(mut targets: Vec<u64>) -> Self {
+        targets.sort_unstable();
+        targets.dedup();
+        Self(targets)
+    }
+
+    fn contains(&self, target: u64) -> bool {
+        self.0.binary_search(&target).is_ok()
+    }
+}
+
+#[derive(Clone)]
+struct X86_64SyscallSite {
+    syscall_inst: iced_x86::Instruction,
+    before_insts: Vec<iced_x86::Instruction>,
+    after_insts: Vec<iced_x86::Instruction>,
+}
+
+struct PendingX86_64Syscall {
+    syscall_inst: iced_x86::Instruction,
+    after_insts: Vec<iced_x86::Instruction>,
+}
+
+struct X86_64PatchSite {
+    replace_start: u64,
+    replace_end: u64,
+    target_addr: u64,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn hook_syscalls_in_section_x86_64_sites(
+    control_transfer_targets: &ControlTransferTargets,
+    section_base_addr: u64,
+    section_data: &mut [u8],
+    trampoline_base_addr: u64,
+    syscall_entry_addr: u64,
+    trampoline_data: &mut Vec<u8>,
+    skipped_addrs: &mut Vec<u64>,
+    sites: &[X86_64SyscallSite],
+) -> Result<()> {
+    if sites.is_empty() {
+        return Err(Error::NoSyscallInstructionsFound);
+    }
+
+    let mut patches = Vec::new();
+    for site in sites {
+        let replace_end = site.syscall_inst.next_ip();
+        let mut replace_start = None;
+
+        for prev_inst in site.before_insts.iter().rev() {
+            if replace_end - prev_inst.ip() >= 5 {
+                replace_start = Some(prev_inst.ip());
+                break;
+            } else if control_transfer_targets.contains(prev_inst.ip()) {
+                break;
+            }
+        }
+
+        if let Some(replace_start) = replace_start {
+            let presyscall_insts: Vec<_> = site
+                .before_insts
+                .iter()
+                .copied()
+                .filter(|prev_inst| prev_inst.ip() >= replace_start)
+                .collect();
+            match emit_x86_64_before_patch(
+                section_base_addr,
+                section_data,
+                trampoline_base_addr,
+                syscall_entry_addr,
+                trampoline_data,
+                &mut patches,
+                &site.syscall_inst,
+                replace_start,
+                &presyscall_insts,
+            ) {
+                Ok(()) => continue,
+                Err(Error::InsufficientBytesBeforeOrAfter(_)) => {}
+                Err(e) => return Err(e),
+            }
+        }
+
+        let mut replace_end = None;
+        let mut after_insts = Vec::new();
+        for next_inst in &site.after_insts {
+            let blocked = (next_inst.code() != site.syscall_inst.code()
+                && control_transfer_targets.contains(next_inst.ip()))
+                || (next_inst.code() != site.syscall_inst.code()
+                    && next_inst.flow_control() != iced_x86::FlowControl::Next);
+            if blocked {
+                break;
+            }
+            after_insts.push(*next_inst);
+            if next_inst.next_ip() - site.syscall_inst.ip() >= 5 {
+                replace_end = Some(next_inst.next_ip());
+                break;
+            }
+        }
+
+        if let Some(replace_end) = replace_end
+            && !instruction_slice_has_ip_rel_memory_operand(&after_insts)
+        {
+            emit_x86_64_after_patch(
+                section_base_addr,
+                section_data,
+                trampoline_base_addr,
+                syscall_entry_addr,
+                trampoline_data,
+                &mut patches,
+                &site.syscall_inst,
+                replace_end,
+            );
+        } else {
+            skipped_addrs.push(site.syscall_inst.ip());
+        }
+    }
+
+    for patch in patches {
+        apply_x86_64_patch(section_base_addr, section_data, patch);
+    }
+
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn hook_syscalls_in_section_x86_64(
+    control_transfer_targets: &ControlTransferTargets,
+    section_base_addr: u64,
+    section_data: &mut [u8],
+    trampoline_base_addr: u64,
+    syscall_entry_addr: u64,
+    trampoline_data: &mut Vec<u8>,
+    skipped_addrs: &mut Vec<u64>,
+) -> Result<()> {
+    let mut found_any = false;
+    let mut recent: Vec<iced_x86::Instruction> = Vec::new();
+    let mut pending: Option<PendingX86_64Syscall> = None;
+    let mut patches = Vec::new();
+
+    visit_section_instructions(Arch::X86_64, section_data, section_base_addr, |inst| {
+        if let Some(p) = pending.as_mut() {
+            let blocked = (inst.code() != p.syscall_inst.code()
+                && control_transfer_targets.contains(inst.ip()))
+                || (inst.code() != p.syscall_inst.code()
+                    && inst.flow_control() != iced_x86::FlowControl::Next);
+            if blocked {
+                skipped_addrs.push(p.syscall_inst.ip());
+                pending = None;
+            } else {
+                p.after_insts.push(inst);
+                if inst.next_ip() - p.syscall_inst.ip() >= 5 {
+                    if instruction_slice_has_ip_rel_memory_operand(&p.after_insts) {
+                        skipped_addrs.push(p.syscall_inst.ip());
+                    } else {
+                        emit_x86_64_after_patch(
+                            section_base_addr,
+                            section_data,
+                            trampoline_base_addr,
+                            syscall_entry_addr,
+                            trampoline_data,
+                            &mut patches,
+                            &p.syscall_inst,
+                            inst.next_ip(),
+                        );
+                    }
+                    pending = None;
+                }
+                if pending.is_none() {
+                    return Ok(());
+                }
+            }
+        }
+
+        if inst.code() == iced_x86::Code::Syscall {
+            found_any = true;
+            let replace_end = inst.next_ip();
+            let mut replace_start = None;
+
+            for prev_inst in recent.iter().rev() {
+                if replace_end - prev_inst.ip() >= 5 {
+                    replace_start = Some(prev_inst.ip());
+                    break;
+                } else if control_transfer_targets.contains(prev_inst.ip()) {
+                    break;
+                }
+            }
+
+            if let Some(replace_start) = replace_start {
+                let presyscall_insts: Vec<_> = recent
+                    .iter()
+                    .copied()
+                    .filter(|prev_inst| prev_inst.ip() >= replace_start)
+                    .collect();
+                match emit_x86_64_before_patch(
+                    section_base_addr,
+                    section_data,
+                    trampoline_base_addr,
+                    syscall_entry_addr,
+                    trampoline_data,
+                    &mut patches,
+                    &inst,
+                    replace_start,
+                    &presyscall_insts,
+                ) {
+                    Ok(()) => {}
+                    Err(Error::InsufficientBytesBeforeOrAfter(_)) => {
+                        pending = Some(PendingX86_64Syscall {
+                            syscall_inst: inst,
+                            after_insts: Vec::new(),
+                        });
+                    }
+                    Err(e) => return Err(e),
+                }
+            } else {
+                pending = Some(PendingX86_64Syscall {
+                    syscall_inst: inst,
+                    after_insts: Vec::new(),
+                });
+            }
+        }
+
+        if inst.flow_control() == iced_x86::FlowControl::Next {
+            recent.push(inst);
+            if recent.len() > 8 {
+                recent.remove(0);
+            }
+        } else {
+            recent.clear();
+        }
+
+        Ok(())
+    })?;
+
+    if let Some(p) = pending {
+        skipped_addrs.push(p.syscall_inst.ip());
+    }
+
+    for patch in patches {
+        apply_x86_64_patch(section_base_addr, section_data, patch);
+    }
+
+    if found_any {
+        Ok(())
+    } else {
+        Err(Error::NoSyscallInstructionsFound)
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_x86_64_before_patch(
+    section_base_addr: u64,
+    section_data: &[u8],
+    trampoline_base_addr: u64,
+    syscall_entry_addr: u64,
+    trampoline_data: &mut Vec<u8>,
+    patches: &mut Vec<X86_64PatchSite>,
+    syscall_inst: &iced_x86::Instruction,
+    replace_start: u64,
+    presyscall_insts: &[iced_x86::Instruction],
+) -> Result<()> {
+    let target_addr = trampoline_base_addr + trampoline_data.len() as u64;
+
+    if replace_start < syscall_inst.ip() {
+        if instruction_slice_has_ip_rel_memory_operand(presyscall_insts) {
+            let mut reencoded = Vec::new();
+            let mut encoder = iced_x86::Encoder::new(64);
+            for pre_inst in presyscall_insts {
+                let tramp_ip = target_addr + reencoded.len() as u64;
+                if encoder.encode(pre_inst, tramp_ip).is_err() {
+                    return Err(Error::InsufficientBytesBeforeOrAfter(syscall_inst.ip()));
+                }
+                let bytes = encoder.take_buffer();
+                if bytes.len() != pre_inst.len() {
+                    return Err(Error::InsufficientBytesBeforeOrAfter(syscall_inst.ip()));
+                }
+                reencoded.extend_from_slice(&bytes);
+            }
+            trampoline_data.extend_from_slice(&reencoded);
+        } else {
+            trampoline_data.extend_from_slice(
+                &section_data[usize::try_from(replace_start - section_base_addr).unwrap()
+                    ..usize::try_from(syscall_inst.ip() - section_base_addr).unwrap()],
+            );
+        }
+    }
+
+    let return_addr = syscall_inst.next_ip();
+    trampoline_data.extend_from_slice(&[0x48, 0x8D, 0x64, 0x24, 0x80]);
+
+    let r11_disp = i64::try_from(replace_start).unwrap()
+        - i64::try_from(trampoline_base_addr + trampoline_data.len() as u64 + 7).unwrap();
+    trampoline_data.extend_from_slice(&[0x4C, 0x8D, 0x1D]);
+    trampoline_data.extend_from_slice(&(i32::try_from(r11_disp).unwrap().to_le_bytes()));
+
+    let jmp_back_offset = i64::try_from(return_addr).unwrap()
+        - i64::try_from(trampoline_base_addr + trampoline_data.len() as u64 + 7).unwrap();
+    trampoline_data.extend_from_slice(&[0x48, 0x8D, 0x0D]);
+    trampoline_data.extend_from_slice(&(i32::try_from(jmp_back_offset).unwrap().to_le_bytes()));
+
+    trampoline_data.extend_from_slice(&[0xFF, 0x25]);
+    #[allow(clippy::cast_possible_wrap)]
+    let disp32 = i64::try_from(syscall_entry_addr).unwrap()
+        - i64::try_from(trampoline_base_addr).unwrap()
+        - trampoline_data.len() as i64
+        - 4;
+    trampoline_data.extend_from_slice(&(i32::try_from(disp32).unwrap().to_le_bytes()));
+
+    patches.push(X86_64PatchSite {
+        replace_start,
+        replace_end: return_addr,
+        target_addr,
+    });
+
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_x86_64_after_patch(
+    section_base_addr: u64,
+    section_data: &[u8],
+    trampoline_base_addr: u64,
+    syscall_entry_addr: u64,
+    trampoline_data: &mut Vec<u8>,
+    patches: &mut Vec<X86_64PatchSite>,
+    syscall_inst: &iced_x86::Instruction,
+    replace_end: u64,
+) {
+    let replace_start = syscall_inst.ip();
+    let target_addr = trampoline_base_addr + trampoline_data.len() as u64;
+
+    trampoline_data.extend_from_slice(&[0x48, 0x8D, 0x64, 0x24, 0x80]);
+
+    let r11_disp = i64::try_from(replace_start).unwrap()
+        - i64::try_from(trampoline_base_addr + trampoline_data.len() as u64 + 7).unwrap();
+    trampoline_data.extend_from_slice(&[0x4C, 0x8D, 0x1D]);
+    trampoline_data.extend_from_slice(&(i32::try_from(r11_disp).unwrap().to_le_bytes()));
+
+    trampoline_data.extend_from_slice(&[0x48, 0x8D, 0x0D]);
+    trampoline_data.extend_from_slice(&6u32.to_le_bytes());
+
+    trampoline_data.extend_from_slice(&[0xFF, 0x25]);
+    #[allow(clippy::cast_possible_wrap)]
+    let disp32 = i64::try_from(syscall_entry_addr).unwrap()
+        - i64::try_from(trampoline_base_addr).unwrap()
+        - trampoline_data.len() as i64
+        - 4;
+    trampoline_data.extend_from_slice(&(i32::try_from(disp32).unwrap().to_le_bytes()));
+
+    let syscall_inst_end = syscall_inst.next_ip();
+    if syscall_inst_end < replace_end {
+        trampoline_data.extend_from_slice(
+            &section_data[usize::try_from(syscall_inst_end - section_base_addr).unwrap()
+                ..usize::try_from(replace_end - section_base_addr).unwrap()],
+        );
+    }
+
+    let jmp_back_offset = i64::try_from(replace_end).unwrap()
+        - i64::try_from(trampoline_base_addr + trampoline_data.len() as u64 + 5).unwrap();
+    trampoline_data.push(0xE9);
+    trampoline_data.extend_from_slice(&(i32::try_from(jmp_back_offset).unwrap().to_le_bytes()));
+
+    patches.push(X86_64PatchSite {
+        replace_start,
+        replace_end,
+        target_addr,
+    });
+}
+
+fn apply_x86_64_patch(section_base_addr: u64, section_data: &mut [u8], patch: X86_64PatchSite) {
+    let replace_offset = usize::try_from(patch.replace_start - section_base_addr).unwrap();
+    section_data[replace_offset] = 0xE9;
+    let jump_offset =
+        i64::try_from(patch.target_addr).unwrap() - i64::try_from(patch.replace_start + 5).unwrap();
+    section_data[replace_offset + 1..replace_offset + 5]
+        .copy_from_slice(&(i32::try_from(jump_offset).unwrap().to_le_bytes()));
+
+    let replace_len = usize::try_from(patch.replace_end - patch.replace_start).unwrap();
+    for idx in 5..replace_len {
+        section_data[replace_offset + idx] = 0x90;
+    }
+}
+
 /// (private) Hook all syscalls in `section`, possibly extending `trampoline_data` to do so.
 ///
 /// `trampoline_base_addr` is the virtual address corresponding to `trampoline_data[0]`.
@@ -566,7 +957,8 @@ enum Arch {
 #[allow(clippy::too_many_arguments)]
 fn hook_syscalls_in_section(
     arch: Arch,
-    control_transfer_targets: &BTreeSet<u64>,
+    control_transfer_targets: &ControlTransferTargets,
+    x86_64_syscall_sites: Option<&[X86_64SyscallSite]>,
     section_base_addr: u64,
     section_data: &mut [u8],
     trampoline_base_addr: u64,
@@ -575,6 +967,30 @@ fn hook_syscalls_in_section(
     trampoline_data: &mut Vec<u8>,
     skipped_addrs: &mut Vec<u64>,
 ) -> Result<()> {
+    if arch == Arch::X86_64 {
+        if let Some(sites) = x86_64_syscall_sites {
+            return hook_syscalls_in_section_x86_64_sites(
+                control_transfer_targets,
+                section_base_addr,
+                section_data,
+                trampoline_base_addr,
+                syscall_entry_addr,
+                trampoline_data,
+                skipped_addrs,
+                sites,
+            );
+        }
+        return hook_syscalls_in_section_x86_64(
+            control_transfer_targets,
+            section_base_addr,
+            section_data,
+            trampoline_base_addr,
+            syscall_entry_addr,
+            trampoline_data,
+            skipped_addrs,
+        );
+    }
+
     let instructions = decode_section_instructions(arch, section_data, section_base_addr)?;
     let mut found_any = false;
     for (i, inst) in instructions.iter().enumerate() {
@@ -617,7 +1033,7 @@ fn hook_syscalls_in_section(
             if replace_end - prev_inst.ip() >= 5 {
                 replace_start = Some(prev_inst.ip());
                 break;
-            } else if control_transfer_targets.contains(&prev_inst.ip()) {
+            } else if control_transfer_targets.contains(prev_inst.ip()) {
                 // If the previous instruction is a control transfer target, we don't want to cross it
                 break;
             }
@@ -975,18 +1391,53 @@ fn get_control_transfer_targets(
     arch: Arch,
     input_binary: &[u8],
     text_sections: &[TextSectionInfo],
-) -> Result<BTreeSet<u64>> {
-    let mut control_transfer_targets = BTreeSet::new();
+) -> Result<(ControlTransferTargets, Vec<Vec<X86_64SyscallSite>>)> {
+    let mut control_transfer_targets = Vec::new();
+    let mut x86_64_syscall_sites = Vec::with_capacity(text_sections.len());
     for s in text_sections {
         let section_data = section_slice(input_binary, s)?;
-        let instructions = decode_section_instructions(arch, section_data, s.vaddr)?;
-        control_transfer_targets.extend(instructions.into_iter().filter_map(|inst| {
+        let mut section_sites: Vec<X86_64SyscallSite> = Vec::new();
+        let mut recent: Vec<iced_x86::Instruction> = Vec::new();
+        let mut pending_after: Vec<usize> = Vec::new();
+        visit_section_instructions(arch, section_data, s.vaddr, |inst| {
             let target = inst.near_branch_target();
-            (target != 0).then_some(target)
-        }));
+            if target != 0 {
+                control_transfer_targets.push(target);
+            }
+
+            if arch == Arch::X86_64 {
+                for site_index in &pending_after {
+                    section_sites[*site_index].after_insts.push(inst);
+                }
+                pending_after.retain(|site_index| section_sites[*site_index].after_insts.len() < 8);
+
+                if inst.code() == iced_x86::Code::Syscall {
+                    section_sites.push(X86_64SyscallSite {
+                        syscall_inst: inst,
+                        before_insts: recent.clone(),
+                        after_insts: Vec::new(),
+                    });
+                    pending_after.push(section_sites.len() - 1);
+                }
+
+                if inst.flow_control() == iced_x86::FlowControl::Next {
+                    recent.push(inst);
+                    if recent.len() > 8 {
+                        recent.remove(0);
+                    }
+                } else {
+                    recent.clear();
+                }
+            }
+            Ok(())
+        })?;
+        x86_64_syscall_sites.push(section_sites);
     }
 
-    Ok(control_transfer_targets)
+    Ok((
+        ControlTransferTargets::new(control_transfer_targets),
+        x86_64_syscall_sites,
+    ))
 }
 
 const MAX_X86_INSTRUCTION_LEN: usize = 15;
@@ -1003,17 +1454,17 @@ fn bytes_until_next_4g_boundary(ptr: *const u8) -> usize {
 // has been fixed (see https://github.com/icedland/iced/pull/697) but not
 // released onto crates.io.  We handle it by making sure that we are only ever
 // sending iced-x86 inputs that are fully within the 4GiB scope.
-fn decode_section_instructions(
+fn visit_section_instructions(
     arch: Arch,
     section_data: &[u8],
     section_base_addr: u64,
-) -> Result<Vec<iced_x86::Instruction>> {
+    mut visitor: impl FnMut(iced_x86::Instruction) -> Result<()>,
+) -> Result<()> {
     let bitness = match arch {
         Arch::X86_32 => 32,
         Arch::X86_64 => 64,
     };
 
-    let mut instructions = Vec::new();
     let mut offset = 0usize;
 
     while offset < section_data.len() {
@@ -1047,12 +1498,25 @@ fn decode_section_instructions(
                 break;
             }
 
-            instructions.push(inst);
+            visitor(inst)?;
         }
 
         offset = offset.checked_add(chunk_advance_len).unwrap();
     }
 
+    Ok(())
+}
+
+fn decode_section_instructions(
+    arch: Arch,
+    section_data: &[u8],
+    section_base_addr: u64,
+) -> Result<Vec<iced_x86::Instruction>> {
+    let mut instructions = Vec::new();
+    visit_section_instructions(arch, section_data, section_base_addr, |inst| {
+        instructions.push(inst);
+        Ok(())
+    })?;
     Ok(instructions)
 }
 
@@ -1085,7 +1549,7 @@ fn section_slice_mut<'a>(buf: &'a mut [u8], section: &TextSectionInfo) -> Result
 #[allow(clippy::too_many_arguments)]
 fn hook_syscall_and_after(
     arch: Arch,
-    control_transfer_targets: &BTreeSet<u64>,
+    control_transfer_targets: &ControlTransferTargets,
     section_base_addr: u64,
     section_data: &mut [u8],
     trampoline_base_addr: u64,
@@ -1101,7 +1565,7 @@ fn hook_syscall_and_after(
 
     for next_inst in instructions.iter().skip(inst_index) {
         if next_inst.code() != syscall_inst.code()
-            && control_transfer_targets.contains(&next_inst.ip())
+            && control_transfer_targets.contains(next_inst.ip())
         {
             // If the next instruction is a control transfer target, we don't want to cross it
             break;
@@ -1249,7 +1713,7 @@ fn instruction_slice_has_ip_rel_memory_operand<'a>(
 #[allow(clippy::too_many_arguments)]
 fn hook_syscall_before_and_after(
     arch: Arch,
-    control_transfer_targets: &BTreeSet<u64>,
+    control_transfer_targets: &ControlTransferTargets,
     section_base_addr: u64,
     section_data: &mut [u8],
     trampoline_base_addr: u64,
@@ -1280,8 +1744,8 @@ fn hook_syscall_before_and_after(
     }
 
     // Both the syscall and its following instructions cannot be a control transfer target
-    if control_transfer_targets.contains(&syscall_inst_addr)
-        || control_transfer_targets.contains(&next_inst.ip())
+    if control_transfer_targets.contains(syscall_inst_addr)
+        || control_transfer_targets.contains(next_inst.ip())
     {
         return Err(Error::InsufficientBytesBeforeOrAfter(syscall_inst_addr));
     }
