@@ -694,7 +694,12 @@ impl<FS: ShimFS> UnixConnectedStream<FS> {
                 use litebox::net::socket_channel::NetworkProxy;
                 match proxy.as_ref() {
                     NetworkProxy::Stream(stream) => match stream.try_write(&msg.data) {
-                        Ok(_n) => Ok(()),
+                        Ok(n) => {
+                            if n > 0 {
+                                litebox_platform_multiplex::platform().wake_network_worker();
+                            }
+                            Ok(())
+                        }
                         Err(_) => Err((msg, Errno::EPIPE)),
                     },
                     _ => Err((msg, Errno::EINVAL)),
