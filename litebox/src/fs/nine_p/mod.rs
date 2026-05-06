@@ -512,7 +512,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
             let result =
                 self.client
                     .unlinkat(parent_fid, name, if is_file { 0 } else { AT_REMOVEDIR });
-            let _ = self.client.clunk(parent_fid);
+            self.client.clunk(parent_fid);
             if let Err(Error::Remote(ENOSYS | EOPNOTSUPP)) = &result {
                 self.unlinkat_supported.store(false, Ordering::SeqCst);
                 // fall back to `remove`
@@ -532,7 +532,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
     for FileSystem<Platform, T>
 {
     fn drop(&mut self) {
-        let _ = self.client.clunk(self.root.1);
+        self.client.clunk(self.root.1);
     }
 }
 
@@ -583,7 +583,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
             {
                 Ok(v) => v,
                 Err(err) => {
-                    let _ = self.client.clunk(dfid);
+                    self.client.clunk(dfid);
                     return Err(err.into());
                 }
             }
@@ -606,7 +606,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
     fn close(&self, fd: &FileFd<Platform, T>) -> Result<(), super::errors::CloseError> {
         let entry = self.litebox.descriptor_table_mut().remove(fd);
         if let Some(entry) = entry {
-            let _ = self.client.clunk(entry.entry.fid);
+            self.client.clunk(entry.entry.fid);
         }
         Ok(())
     }
@@ -742,7 +742,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
         };
 
         let result = self.client.setattr(fid, fcall::SetattrMask::MODE, stat);
-        let _ = self.client.clunk(fid);
+        self.client.clunk(fid);
 
         result.map_err(ChmodError::from)
     }
@@ -778,7 +778,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
         };
 
         let result = self.client.setattr(fid, valid, stat);
-        let _ = self.client.clunk(fid);
+        self.client.clunk(fid);
 
         result.map_err(ChownError::from)
     }
@@ -794,7 +794,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
         let (parent_fid, name) = self.walk_to_parent(&path)?;
 
         let result = self.client.mkdir(parent_fid, name, mode.bits(), 0);
-        let _ = self.client.clunk(parent_fid);
+        self.client.clunk(parent_fid);
 
         result.map(|_| ()).map_err(MkdirError::from)
     }
@@ -819,7 +819,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
             return Err(super::errors::ReadDirError::NotADirectory);
         }
 
-        // Perform blocking I/O without holding any locks.
+        // TODO: Perform blocking I/O without holding any locks.
         let entries = self.client.readdir_all(fid)?;
 
         let dir_entries: Vec<super::DirEntry> = entries
@@ -854,7 +854,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
         let fid = self.walk_to(&path)?;
 
         let result = self.client.getattr(fid, fcall::GetattrMask::ALL);
-        let _ = self.client.clunk(fid);
+        self.client.clunk(fid);
 
         result
             .and_then(|attr| Self::rgetattr_to_file_status(&attr))

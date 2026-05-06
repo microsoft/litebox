@@ -156,14 +156,18 @@ impl<Platform: RawSyncPrimitivesProvider, T: Read + Write> Client<Platform, T> {
     fn next_tag(&self) -> u16 {
         loop {
             let current = self.next_tag.load(Ordering::Relaxed);
-            let tag = if current == fcall::NOTAG { 1 } else { current };
-            let next = if tag == fcall::NOTAG - 1 { 1 } else { tag + 1 };
+            debug_assert!(current != fcall::NOTAG);
+            let next = if current == fcall::NOTAG - 1 {
+                1
+            } else {
+                current + 1
+            };
             if self
                 .next_tag
                 .compare_exchange(current, next, Ordering::Relaxed, Ordering::Relaxed)
                 .is_ok()
             {
-                return tag;
+                return current;
             }
         }
     }
@@ -245,24 +249,20 @@ impl<Platform: RawSyncPrimitivesProvider, T: Read + Write> Client<Platform, T> {
                 Ok(v) => v,
                 Err(err) => {
                     if f != fid {
-                        let _ = self.clunk(f);
+                        self.clunk(f);
                     }
                     return Err(err);
                 }
             };
             let new_len = new_wqids.len();
             wqids.append(&mut new_wqids);
-            // Clunk the old fid if it's not the original fid
-            if f != fid
-                && let Err(err) = self.clunk(f)
-            {
-                let _ = self.clunk(new_f);
-                return Err(err);
+            if f != fid {
+                self.clunk(f);
             }
             f = new_f;
             // It means that the walk failed at the nwqid-th element
             if new_len < wnames.len() {
-                self.clunk(f)?;
+                self.clunk(f);
                 return Err(Error::Remote(super::ENOENT));
             }
         }
@@ -348,7 +348,7 @@ impl<Platform: RawSyncPrimitivesProvider, T: Read + Write> Client<Platform, T> {
             }),
             |response| match response {
                 Fcall::Rread(fcall::Rread { data }) => {
-                    if data.len() > count || data.len() > buf.len() {
+                    if data.len() > count {
                         return Err(Error::InvalidResponse);
                     }
                     buf[..data.len()].copy_from_slice(&data);
@@ -566,9 +566,12 @@ impl<Platform: RawSyncPrimitivesProvider, T: Read + Write> Client<Platform, T> {
         )
     }
 
-    /// Clunk (close) a fid
-    pub(super) fn clunk(&self, fid: fcall::Fid) -> Result<(), Error> {
-        let result = self.fcall(
+    /// Clunk (close) a fid.
+    ///
+    /// Always reclaims the local pool slot: per 9P2000.L the server destroys
+    /// the fid even when it replies Rlerror.
+    pub(super) fn clunk(&self, fid: fcall::Fid) {
+        let _ = self.fcall(
             Fcall::Tclunk(fcall::Tclunk { fid }),
             |response| match response {
                 Fcall::Rclunk(_) => Ok(()),
@@ -576,10 +579,7 @@ impl<Platform: RawSyncPrimitivesProvider, T: Read + Write> Client<Platform, T> {
                 _ => Err(Error::InvalidResponse),
             },
         );
-        if result.is_ok() {
-            self.fids.free(fid);
-        }
-        result
+        self.fids.free(fid);
     }
 
     /// Clone a fid (walk with empty path)
