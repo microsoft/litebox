@@ -516,33 +516,11 @@ async fn send_to(
     run.send(handle_for(handles, agent), cmd).await
 }
 
-fn nonpie_missing_test(
-    reg: &mut Registry<'_>,
-    id: impl Into<String>,
-    agent: AgentName,
-    detail: &'static str,
-) {
-    matrix_test(reg, id, vec![agent], move |_run, _handles| {
-        Box::pin(async move { super::TestOutcome::new(agent.name(), false, detail) })
-    });
-}
-
 pub(super) fn register_fs_crud(reg: &mut Registry<'_>) {
-    let has_nonpie = crate::find_nonpie_binary().is_some();
     for &topo in FS_TOPOLOGIES {
         let (source, dest) = topo.agents();
         let ts = topo.suffix();
-        if topo.requires_nonpie() && !has_nonpie {
-            for op in ["absent", "created", "updated", "deleted"] {
-                nonpie_missing_test(
-                    reg,
-                    format!("F.shared.{ts}.{op}"),
-                    dest,
-                    "FAIL: nonpie binary not found — mount at /opt/nonpie",
-                );
-            }
-            continue;
-        }
+
         let required = vec![AgentName::Init, source, dest];
         matrix_test(
             reg,
@@ -683,21 +661,10 @@ pub(super) fn register_fs_crud(reg: &mut Registry<'_>) {
 }
 
 pub(super) fn register_fs_cross_unlink(reg: &mut Registry<'_>) {
-    let has_nonpie = crate::find_nonpie_binary().is_some();
     for &topo in FS_TOPOLOGIES {
         let (source, dest) = topo.agents();
         let ts = topo.suffix();
-        if topo.requires_nonpie() && !has_nonpie {
-            for op in ["delete", "gone"] {
-                nonpie_missing_test(
-                    reg,
-                    format!("F.unlink.{ts}.{op}"),
-                    dest,
-                    "nonpie binary not found",
-                );
-            }
-            continue;
-        }
+
         let required = vec![AgentName::Init, source, dest];
         matrix_test(
             reg,
@@ -776,19 +743,10 @@ pub(super) fn register_fs_cross_unlink(reg: &mut Registry<'_>) {
 }
 
 pub(super) fn register_tmp_isolation(reg: &mut Registry<'_>) {
-    let has_nonpie = crate::find_nonpie_binary().is_some();
     for &topo in FS_TOPOLOGIES {
         let (writer, reader) = topo.agents();
         let ts = topo.suffix();
-        if topo.requires_nonpie() && !has_nonpie {
-            nonpie_missing_test(
-                reg,
-                format!("F.tmp.{ts}.isolation"),
-                reader,
-                "nonpie binary not found",
-            );
-            continue;
-        }
+
         if writer == reader {
             continue;
         }
@@ -856,23 +814,12 @@ pub(super) fn register_host_file(reg: &mut Registry<'_>) {
 }
 
 pub(super) fn register_net_tests(reg: &mut Registry<'_>) {
-    let has_nonpie = crate::find_nonpie_binary().is_some();
     let mut port = 10_001u16;
     for tc in NET_TESTS {
         let p = port;
         port += 1;
         let (name, listener, connector) = (tc.name, tc.listener, tc.connector);
-        if !has_nonpie && (agent_requires_nonpie(listener) || agent_requires_nonpie(connector)) {
-            for suffix in ["listen", "connect", "unlisten"] {
-                nonpie_missing_test(
-                    reg,
-                    format!("N.{name}.{suffix}"),
-                    listener,
-                    "FAIL: nonpie binary not found — mount at /opt/nonpie",
-                );
-            }
-            continue;
-        }
+
         matrix_test(
             reg,
             format!("N.{name}.listen"),
@@ -942,21 +889,12 @@ pub(super) fn register_net_tests(reg: &mut Registry<'_>) {
 }
 
 pub(super) fn register_net_addr_tests(reg: &mut Registry<'_>) {
-    let has_nonpie = crate::find_nonpie_binary().is_some();
     let mut port = 11_001u16;
     for &(agent_a, agent_b) in NET_ADDR_PAIRS {
         for &addr in CONNECT_ADDRS {
             let p = port;
             port += 1;
-            if !has_nonpie && (agent_requires_nonpie(agent_a) || agent_requires_nonpie(agent_b)) {
-                nonpie_missing_test(
-                    reg,
-                    format!("NA.{agent_a}_to_{agent_b}.{addr}"),
-                    agent_b,
-                    "FAIL: nonpie binary not found — mount at /opt/nonpie",
-                );
-                continue;
-            }
+
             let test_data = format!("na_{agent_a}_{agent_b}_{addr}");
             matrix_test(
                 reg,
@@ -994,15 +932,7 @@ pub(super) fn register_net_addr_tests(reg: &mut Registry<'_>) {
         }
         let p = port;
         port += 1;
-        if !has_nonpie && (agent_requires_nonpie(agent_a) || agent_requires_nonpie(agent_b)) {
-            nonpie_missing_test(
-                reg,
-                format!("NA.{agent_a}_to_{agent_b}.self_ip"),
-                agent_b,
-                "FAIL: nonpie binary not found — mount at /opt/nonpie",
-            );
-            continue;
-        }
+
         let test_data = format!("na_{agent_a}_{agent_b}_self_ip");
         matrix_test(
             reg,
@@ -1057,20 +987,11 @@ pub(super) fn register_net_addr_tests(reg: &mut Registry<'_>) {
 }
 
 pub(super) fn register_unix_addr_tests(reg: &mut Registry<'_>) {
-    let has_nonpie = crate::find_nonpie_binary().is_some();
     let mut idx = 0u32;
     for &(agent_a, agent_b) in NET_ADDR_PAIRS {
         let i = idx;
         idx += 1;
-        if !has_nonpie && (agent_requires_nonpie(agent_a) || agent_requires_nonpie(agent_b)) {
-            nonpie_missing_test(
-                reg,
-                format!("UA.{agent_a}_to_{agent_b}"),
-                agent_b,
-                "FAIL: nonpie binary not found — mount at /opt/nonpie",
-            );
-            continue;
-        }
+
         let test_data = format!("ua_{agent_a}_{agent_b}");
         matrix_test(
             reg,
@@ -1121,17 +1042,8 @@ pub(super) fn register_unix_addr_tests(reg: &mut Registry<'_>) {
 }
 
 pub(super) fn register_exec_tests(reg: &mut Registry<'_>) {
-    let has_nonpie = crate::find_nonpie_binary().is_some();
     for &agent in EXEC_AGENTS {
-        if !has_nonpie && agent_requires_nonpie(agent) {
-            nonpie_missing_test(
-                reg,
-                format!("X.echo.{agent}"),
-                agent,
-                "FAIL: nonpie binary not found — mount at /opt/nonpie",
-            );
-            continue;
-        }
+
         matrix_test(
             reg,
             format!("X.echo.{agent}"),
@@ -1176,19 +1088,8 @@ pub(super) fn register_exec_tests(reg: &mut Registry<'_>) {
 }
 
 pub(super) fn register_env_tests(reg: &mut Registry<'_>) {
-    let has_nonpie = crate::find_nonpie_binary().is_some();
     for &agent in EXEC_AGENTS {
-        if !has_nonpie && agent_requires_nonpie(agent) {
-            for var in ["HOME", "PATH", "CWD"] {
-                nonpie_missing_test(
-                    reg,
-                    format!("E.{var}.{agent}"),
-                    agent,
-                    "FAIL: nonpie binary not found — mount at /opt/nonpie",
-                );
-            }
-            continue;
-        }
+
         for var in ["HOME", "PATH"] {
             matrix_test(
                 reg,
@@ -1677,27 +1578,8 @@ pub(super) fn register_symlink_variants(reg: &mut Registry<'_>) {
 }
 
 pub(super) fn register_unix_tests(reg: &mut Registry<'_>) {
-    let has_nonpie = crate::find_nonpie_binary().is_some();
     for tc in unix_test_cases() {
-        if !has_nonpie
-            && (agent_requires_nonpie(tc.agent) || tc.peer.is_some_and(agent_requires_nonpie))
-        {
-            let suffixes: &[&str] = match tc.pattern {
-                UnixPattern::InProcess => &["listen", "connect"],
-                UnixPattern::ServerForkClient => &["listen", "child_connect"],
-                UnixPattern::BackgroundServerConnect => &["server_start", "connect"],
-                UnixPattern::CrossAgent => &["listen", "connect"],
-            };
-            for suffix in suffixes {
-                nonpie_missing_test(
-                    reg,
-                    format!("U.{}.{suffix}", tc.name),
-                    tc.agent,
-                    "FAIL: nonpie binary not found — mount at /opt/nonpie",
-                );
-            }
-            continue;
-        }
+
         let sock = format!("/tmp/um_{}.sock", tc.name.replace('.', "_"));
         let agent = tc.agent;
         let name = tc.name;
@@ -2016,7 +1898,6 @@ pub(super) fn register_unix_tests(reg: &mut Registry<'_>) {
             }
         }
     }
-    if has_nonpie {
         matrix_test(
             reg,
             "U.repro.listen",
@@ -2129,20 +2010,7 @@ pub(super) fn register_unix_tests(reg: &mut Registry<'_>) {
                 })
             },
         );
-    } else {
-        for (id, agent) in [
-            ("U.repro.listen", AgentName::D3),
-            ("U.repro.same_agent", AgentName::D3),
-            ("U.repro.cross_worker", AgentName::D4),
-        ] {
-            nonpie_missing_test(
-                reg,
-                id,
-                agent,
-                "FAIL: nonpie binary not found — mount at /opt/nonpie",
-            );
-        }
-    }
+
 }
 
 pub(super) fn register_matrix(reg: &mut Registry<'_>) {

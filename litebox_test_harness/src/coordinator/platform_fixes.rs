@@ -141,17 +141,7 @@ pub(crate) fn register_exit_data_integrity_tests(reg: &mut Registry<'_>) {
                         Box::pin(async move {
                             let bin_path = match b.as_str() {
                                 "pie" => self_exe,
-                                "nonpie" => match crate::find_nonpie_binary() {
-                                    Some(p) => p,
-                                    None => {
-                                        return super::TestOutcome::new(
-                                            &a,
-                                            false,
-                                            "FAIL: nonpie binary not found — mount at /opt/nonpie"
-                                                .to_string(),
-                                        );
-                                    }
-                                },
+                                "nonpie" => crate::nonpie_binary(),
                                 _ => unreachable!(),
                             };
                             let resp = run
@@ -208,17 +198,7 @@ pub(crate) fn register_nonpie_pipe_chain_tests(reg: &mut Registry<'_>) {
                     let a = agent_s.clone();
                     let _self_exe = run.self_exe().to_string();
                     Box::pin(async move {
-                        let nonpie = match crate::find_nonpie_binary() {
-                            Some(p) => p,
-                            None => {
-                                return super::TestOutcome::new(
-                                    &a,
-                                    false,
-                                    "FAIL: nonpie binary not found — mount at /opt/nonpie"
-                                        .to_string(),
-                                );
-                            }
-                        };
+                        let nonpie = crate::nonpie_binary();
                         let mut all_clean = true;
                         let mut detail = String::new();
                         for i in 0..reps {
@@ -267,17 +247,7 @@ pub(crate) fn register_nonpie_pipe_chain_tests(reg: &mut Registry<'_>) {
                     let a = agent_s2.clone();
                     let self_exe = run.self_exe().to_string();
                     Box::pin(async move {
-                        let nonpie = match crate::find_nonpie_binary() {
-                            Some(p) => p,
-                            None => {
-                                return super::TestOutcome::new(
-                                    &a,
-                                    false,
-                                    "FAIL: nonpie binary not found — mount at /opt/nonpie"
-                                        .to_string(),
-                                );
-                            }
-                        };
+                        let nonpie = crate::nonpie_binary();
                         let mut all_clean = true;
                         let mut detail = String::new();
                         for i in 0..reps {
@@ -727,16 +697,7 @@ pub(crate) fn register_fork_from_worker_exec_tests(reg: &mut Registry<'_>) {
         Box::new(move |run| {
             let self_exe = run.self_exe().to_string();
             Box::pin(async move {
-                let nonpie = match crate::find_nonpie_binary() {
-                    Some(p) => p,
-                    None => {
-                        return super::TestOutcome::new(
-                            "A",
-                            false,
-                            "FAIL: nonpie binary not found — mount at /opt/nonpie".to_string(),
-                        );
-                    }
-                };
+                let nonpie = crate::nonpie_binary();
                 let resp = run
                     .send(
                         &handle_a,
@@ -807,16 +768,7 @@ pub(crate) fn register_fork_from_worker_exec_tests(reg: &mut Registry<'_>) {
         Box::new(move |run| {
             let self_exe = run.self_exe().to_string();
             Box::pin(async move {
-                let nonpie = match crate::find_nonpie_binary() {
-                    Some(p) => p,
-                    None => {
-                        return super::TestOutcome::new(
-                            "NP",
-                            false,
-                            "FAIL: nonpie binary not found — mount at /opt/nonpie".to_string(),
-                        );
-                    }
-                };
+                let nonpie = crate::nonpie_binary();
                 let resp = run
                     .send(
                         &handle_np,
@@ -847,16 +799,7 @@ pub(crate) fn register_fork_from_worker_exec_tests(reg: &mut Registry<'_>) {
         Box::new(move |run| {
             let _self_exe = run.self_exe().to_string();
             Box::pin(async move {
-                let nonpie = match crate::find_nonpie_binary() {
-                    Some(p) => p,
-                    None => {
-                        return super::TestOutcome::new(
-                            "NP",
-                            false,
-                            "FAIL: nonpie binary not found — mount at /opt/nonpie".to_string(),
-                        );
-                    }
-                };
+                let nonpie = crate::nonpie_binary();
                 let resp = run
                     .send(
                         &handle_np,
@@ -2413,13 +2356,7 @@ pub(crate) fn register_subtree_kill_tests(reg: &mut Registry<'_>) {
             let e = e.clone();
             let npx = npx.clone();
             Box::pin(async move {
-                if crate::find_nonpie_binary().is_none() {
-                    return super::TestOutcome::new(
-                        "?",
-                        false,
-                        "FAIL: nonpie binary not found — mount at /opt/nonpie",
-                    );
-                }
+                let _ = crate::nonpie_binary();
                 let r = run.spawn_ephemeral(&npx).await;
                 if !matches!(r, Response::Ok { .. }) {
                     return super::TestOutcome::new(
@@ -2452,13 +2389,7 @@ pub(crate) fn register_subtree_kill_tests(reg: &mut Registry<'_>) {
             let e = e.clone();
             let npx = npx.clone();
             Box::pin(async move {
-                if crate::find_nonpie_binary().is_none() {
-                    return super::TestOutcome::new(
-                        "?",
-                        false,
-                        "FAIL: nonpie binary not found — mount at /opt/nonpie",
-                    );
-                }
+                let _ = crate::nonpie_binary();
                 // EE was already spawned under E by spawn_tree when
                 // the test declared AgentName::EE. Ask EE to spawn
                 // its own non-PIE descendant.
@@ -2495,13 +2426,7 @@ pub(crate) fn register_subtree_kill_tests(reg: &mut Registry<'_>) {
             let e = e.clone();
             let npx = npx.clone();
             Box::pin(async move {
-                if crate::find_nonpie_binary().is_none() {
-                    return super::TestOutcome::new(
-                        "?",
-                        false,
-                        "FAIL: nonpie binary not found — mount at /opt/nonpie",
-                    );
-                }
+                let _ = crate::nonpie_binary();
                 let r = run.spawn_ephemeral(&npx).await;
                 if !matches!(r, Response::Ok { .. }) {
                     return super::TestOutcome::new(

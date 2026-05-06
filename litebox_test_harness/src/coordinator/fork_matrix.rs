@@ -542,16 +542,7 @@ pub(crate) fn register_fork_matrix(reg: &mut Registry<'_>) {
                                             DfBinary::Pie => {
                                                 (self_exe.clone(), vec!["echo-test".into()])
                                             }
-                                            DfBinary::NonPie => match crate::find_nonpie_binary() {
-                                                Some(p) => (p, vec!["echo-test".into()]),
-                                                None => {
-                                                    return super::TestOutcome::new(
-                                                        &agent_label,
-                                                        false,
-                                                        "FAIL: nonpie binary not found",
-                                                    );
-                                                }
-                                            },
+                                            DfBinary::NonPie => (crate::nonpie_binary(), vec!["echo-test".into()]),
                                             DfBinary::Node => (
                                                 "/usr/local/bin/node".into(),
                                                 vec![
@@ -723,16 +714,7 @@ pub(crate) fn register_fork_matrix(reg: &mut Registry<'_>) {
                 let handle = cx.require(AgentName::A);
                 Box::new(move |run| {
                     Box::pin(async move {
-                        let nonpie_bin = match crate::find_nonpie_binary() {
-                            Some(p) => p,
-                            None => {
-                                return super::TestOutcome::new(
-                                    "A",
-                                    false,
-                                    "FAIL: nonpie binary not found",
-                                );
-                            }
-                        };
+                        let nonpie_bin = crate::nonpie_binary();
                         let resp = match &bash_cmd {
                             None => {
                                 run.send(
@@ -788,16 +770,7 @@ pub(crate) fn register_fork_matrix(reg: &mut Registry<'_>) {
             Box::new(move |run| {
                 Box::pin(async move {
                     let self_exe = run.self_exe().to_string();
-                    let nonpie_bin = match crate::find_nonpie_binary() {
-                        Some(p) => p,
-                        None => {
-                            return super::TestOutcome::new(
-                                "A",
-                                false,
-                                "FAIL: nonpie binary not found",
-                            );
-                        }
-                    };
+                    let nonpie_bin = crate::nonpie_binary();
                     let resp = run
                         .send(&handle, super::exec(vec![nonpie_bin, "echo-test".into()]))
                         .await;
@@ -837,16 +810,7 @@ pub(crate) fn register_fork_matrix(reg: &mut Registry<'_>) {
                 Box::new(move |run| {
                     Box::pin(async move {
                         let self_exe = run.self_exe().to_string();
-                        let nonpie_bin = match crate::find_nonpie_binary() {
-                            Some(p) => p,
-                            None => {
-                                return super::TestOutcome::new(
-                                    "A",
-                                    false,
-                                    "FAIL: nonpie binary not found",
-                                );
-                            }
-                        };
+                        let nonpie_bin = crate::nonpie_binary();
                         let nonpie_cmd = format!("{nonpie_bin} echo-test");
                         let cmd_str = template
                             .replace("{self_exe}", &self_exe)

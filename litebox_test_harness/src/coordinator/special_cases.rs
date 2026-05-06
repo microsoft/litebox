@@ -719,16 +719,7 @@ pub(crate) fn register_unix_socket(reg: &mut Registry<'_>) {
             timeout = 60,
             agents[handle = agent_name],
             |run| {
-                let nonpie = match crate::find_nonpie_binary() {
-                    Some(p) => p,
-                    None => {
-                        return super::TestOutcome::new(
-                            &agent_label,
-                            false,
-                            "FAIL: nonpie binary not found",
-                        );
-                    }
-                };
+                let nonpie = crate::nonpie_binary();
                 let resp = run
                     .send(
                         &handle,
@@ -1367,16 +1358,7 @@ pub(crate) fn register_pipe_eof(reg: &mut Registry<'_>) {
             agents[handle = agent_name],
             |run| {
                 let self_exe = run.self_exe().to_string();
-                let nonpie = match crate::find_nonpie_binary() {
-                    Some(p) => p,
-                    None => {
-                        return super::TestOutcome::new(
-                            &agent_label,
-                            false,
-                            "FAIL: nonpie binary not found",
-                        );
-                    }
-                };
+                let nonpie = crate::nonpie_binary();
                 let resp = run
                     .send(
                         &handle,
@@ -1440,12 +1422,7 @@ pub(crate) fn register_contamination_sequence(reg: &mut Registry<'_>) {
         timeout = 60,
         agents[a = AgentName::A],
         |run| {
-            let nonpie = match crate::find_nonpie_binary() {
-                Some(p) => p,
-                None => {
-                    return super::TestOutcome::new("A", false, "FAIL: nonpie binary not found");
-                }
-            };
+            let nonpie = crate::nonpie_binary();
             let resp = run
                 .send(&a, super::exec(vec![nonpie, "echo-test".into()]))
                 .await;
@@ -1479,12 +1456,7 @@ pub(crate) fn register_contamination_sequence(reg: &mut Registry<'_>) {
         timeout = 60,
         agents[b = AgentName::B],
         |run| {
-            let nonpie = match crate::find_nonpie_binary() {
-                Some(p) => p,
-                None => {
-                    return super::TestOutcome::new("B", false, "FAIL: nonpie binary not found");
-                }
-            };
+            let nonpie = crate::nonpie_binary();
             let resp = run
                 .send(&b, super::exec(vec![nonpie, "echo-test".into()]))
                 .await;
@@ -1581,12 +1553,7 @@ pub(crate) fn register_contamination_sequence(reg: &mut Registry<'_>) {
         timeout = 60,
         agents[ab = AgentName::AB],
         |run| {
-            let nonpie = match crate::find_nonpie_binary() {
-                Some(p) => p,
-                None => {
-                    return super::TestOutcome::new("AB", false, "FAIL: nonpie binary not found");
-                }
-            };
+            let nonpie = crate::nonpie_binary();
             let resp = run
                 .send(&ab, super::exec(vec![nonpie, "echo-test".into()]))
                 .await;
@@ -1620,12 +1587,7 @@ pub(crate) fn register_contamination_sequence(reg: &mut Registry<'_>) {
         timeout = 60,
         agents[aab = AgentName::AAB],
         |run| {
-            let nonpie = match crate::find_nonpie_binary() {
-                Some(p) => p,
-                None => {
-                    return super::TestOutcome::new("AAB", false, "FAIL: nonpie binary not found");
-                }
-            };
+            let nonpie = crate::nonpie_binary();
             let resp = run
                 .send(&aab, super::exec(vec![nonpie, "echo-test".into()]))
                 .await;
@@ -1642,12 +1604,7 @@ pub(crate) fn register_contamination_sequence(reg: &mut Registry<'_>) {
         timeout = 60,
         agents[b = AgentName::B],
         |run| {
-            let nonpie = match crate::find_nonpie_binary() {
-                Some(p) => p,
-                None => {
-                    return super::TestOutcome::new("B", false, "FAIL: nonpie binary not found");
-                }
-            };
+            let nonpie = crate::nonpie_binary();
             let resp = run
                 .send(&b, super::exec(vec![nonpie, "echo-test".into()]))
                 .await;
@@ -1664,12 +1621,7 @@ pub(crate) fn register_contamination_sequence(reg: &mut Registry<'_>) {
         timeout = 60,
         agents[b = AgentName::B],
         |run| {
-            let nonpie = match crate::find_nonpie_binary() {
-                Some(p) => p,
-                None => {
-                    return super::TestOutcome::new("B", false, "FAIL: nonpie binary not found");
-                }
-            };
+            let nonpie = crate::nonpie_binary();
             for _ in 0..20 {
                 let _ = run
                     .send(
@@ -1699,12 +1651,7 @@ pub(crate) fn register_contamination_sequence(reg: &mut Registry<'_>) {
         agents[b = AgentName::B],
         |run| {
             let self_exe = run.self_exe().to_string();
-            let nonpie = match crate::find_nonpie_binary() {
-                Some(p) => p,
-                None => {
-                    return super::TestOutcome::new("B", false, "FAIL: nonpie binary not found");
-                }
-            };
+            let nonpie = crate::nonpie_binary();
             let mut results: Vec<(String, bool)> = Vec::new();
             for _ in 0..2 {
                 let resp = run
@@ -1738,12 +1685,7 @@ pub(crate) fn register_contamination_sequence(reg: &mut Registry<'_>) {
         timeout = 60,
         agents[b = AgentName::B],
         |run| {
-            let nonpie = match crate::find_nonpie_binary() {
-                Some(p) => p,
-                None => {
-                    return super::TestOutcome::new("B", false, "FAIL: nonpie binary not found");
-                }
-            };
+            let nonpie = crate::nonpie_binary();
             for i in 0..5 {
                 let resp = run
                     .send(&b, super::exec(vec![nonpie.clone(), "echo-test".into()]))

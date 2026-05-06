@@ -201,16 +201,7 @@ pub(crate) fn register_pipe_bridge(reg: &mut Registry<'_>) {
                         Box::pin(async move {
                             let self_exe = run.self_exe().to_string();
                             let child_bin = if use_nonpie {
-                                match crate::find_nonpie_binary() {
-                                    Some(p) => p,
-                                    None => {
-                                        return super::TestOutcome::new(
-                                            &agent_label,
-                                            false,
-                                            "FAIL: nonpie binary not found",
-                                        );
-                                    }
-                                }
+                                crate::nonpie_binary()
                             } else {
                                 self_exe.clone()
                             };
