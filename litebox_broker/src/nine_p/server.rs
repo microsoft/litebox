@@ -144,11 +144,7 @@ impl Server {
     /// background thread.  This is called at broker startup so that the
     /// first worker connection doesn't pay the ~3s rewriting cost for
     /// shared libraries like libc.
-    pub fn pre_warm_elf_cache(
-        elf_cache: &Arc<Mutex<ElfCache>>,
-        root: &Path,
-        paths: &[&str],
-    ) {
+    pub fn pre_warm_elf_cache(elf_cache: &Arc<Mutex<ElfCache>>, root: &Path, paths: &[&str]) {
         use std::io::{Read, Seek, SeekFrom};
 
         for rel_path in paths {
@@ -210,11 +206,9 @@ impl Server {
             }
 
             let mut skipped_addrs = Vec::new();
-            if let Ok(patched) = litebox_syscall_rewriter::hook_syscalls_in_elf(
-                &content,
-                None,
-                &mut skipped_addrs,
-            ) {
+            if let Ok(patched) =
+                litebox_syscall_rewriter::hook_syscalls_in_elf(&content, None, &mut skipped_addrs)
+            {
                 let arc = Arc::new(patched);
                 let mut cache = mutex_lock(elf_cache, "elf_cache");
                 cache.insert(resolved.clone(), (current_mtime, Arc::clone(&arc)));

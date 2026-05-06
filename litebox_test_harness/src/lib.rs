@@ -38,7 +38,7 @@ pub fn find_nonpie_binary() -> Option<String> {
             if candidate.exists() {
                 let path = candidate.to_string_lossy().to_string();
                 eprintln!("[harness] nonpie binary: {path}");
-                return Some(path.to_string());
+                return Some(path.clone());
             }
         }
     }

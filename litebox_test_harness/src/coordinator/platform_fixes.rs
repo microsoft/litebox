@@ -80,7 +80,7 @@ pub(crate) fn register_bind_getsockname_tests(reg: &mut Registry<'_>) {
                             Response::Ok { data: Some(d) } => d
                                 .strip_prefix("port=")
                                 .and_then(|s| s.parse::<u16>().ok())
-                                .map_or(false, |p| p > 0),
+                                .is_some_and(|p| p > 0),
                             _ => false,
                         };
                         super::TestOutcome::new(&a, pass, format!("{resp:?}"))

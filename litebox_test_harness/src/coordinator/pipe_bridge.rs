@@ -188,7 +188,11 @@ pub(crate) fn register_pipe_bridge(reg: &mut Registry<'_>) {
             let id = format!("PB.{}.{agent}", case.mode);
             let subcmd = case.subcmd.to_string();
             let use_nonpie = case.use_nonpie;
-            let extra: Vec<String> = case.extra_args.iter().map(|s| s.to_string()).collect();
+            let extra: Vec<String> = case
+                .extra_args
+                .iter()
+                .map(std::string::ToString::to_string)
+                .collect();
             let expected = case.expected.to_string();
             let timeout = case.timeout;
             let agent_label = agent.to_string();

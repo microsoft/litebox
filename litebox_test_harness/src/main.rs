@@ -48,7 +48,7 @@ use std::io::Write as _;
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    let cmd = args.get(1).map(String::as_str).unwrap_or("spawn-tree");
+    let cmd = args.get(1).map_or("spawn-tree", String::as_str);
     let self_exe = &args[0];
 
     // Log the resolved binary path so stale rootfs copies are immediately
@@ -86,11 +86,7 @@ fn main() {
             // host child processes whose pipe-relay threads in the runner
             // would otherwise prevent the runner from exiting; the kernel
             // SIGKILLs everything when this process terminates.
-            let exit_code = if fail_count > 0 || xpass_count > 0 {
-                1
-            } else {
-                0
-            };
+            let exit_code = i32::from(fail_count > 0 || xpass_count > 0);
             std::process::exit(exit_code);
         }
         "agent" => {
@@ -112,18 +108,21 @@ fn main() {
             // Also used to test fork from within a worker-exec host.
             //
             // Usage: fork-exec-nonpie <binary> [subcommand]
-            let binary = args.get(2).map(String::as_str).unwrap_or_else(|| {
-                for p in [
-                    "/opt/nonpie/litebox_test_harness",
-                    "/litebox-test-harness-nonpie",
-                ] {
-                    if std::path::Path::new(p).exists() {
-                        return p;
+            let binary = args.get(2).map_or_else(
+                || {
+                    for p in [
+                        "/opt/nonpie/litebox_test_harness",
+                        "/litebox-test-harness-nonpie",
+                    ] {
+                        if std::path::Path::new(p).exists() {
+                            return p;
+                        }
                     }
-                }
-                "/opt/nonpie/litebox_test_harness"
-            });
-            let sub = args.get(3).map(String::as_str).unwrap_or("echo-test");
+                    "/opt/nonpie/litebox_test_harness"
+                },
+                String::as_str,
+            );
+            let sub = args.get(3).map_or("echo-test", String::as_str);
 
             eprintln!(
                 "[fork-exec-nonpie] pid={} forking child to exec {binary} {sub}",
@@ -153,7 +152,7 @@ fn main() {
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
             let mut status = 0i32;
             loop {
-                let ret = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
+                let ret = unsafe { libc::waitpid(pid, &raw mut status, libc::WNOHANG) };
                 if ret > 0 {
                     if libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0 {
                         eprintln!("[fork-exec-nonpie] child exited OK");
@@ -181,15 +180,18 @@ fn main() {
             // worker-exec node forks a PIE child like bash).
             //
             // Usage: fork-exec-pie <binary> [subcommand]
-            let binary = args.get(2).map(String::as_str).unwrap_or_else(|| {
-                for p in ["/opt/litebox/litebox_test_harness"] {
-                    if std::path::Path::new(p).exists() {
-                        return p;
+            let binary = args.get(2).map_or_else(
+                || {
+                    for p in ["/opt/litebox/litebox_test_harness"] {
+                        if std::path::Path::new(p).exists() {
+                            return p;
+                        }
                     }
-                }
-                "/opt/litebox/litebox_test_harness"
-            });
-            let sub = args.get(3).map(String::as_str).unwrap_or("echo-test");
+                    "/opt/litebox/litebox_test_harness"
+                },
+                String::as_str,
+            );
+            let sub = args.get(3).map_or("echo-test", String::as_str);
 
             eprintln!(
                 "[fork-exec-pie] pid={} forking child to exec {binary} {sub}",
@@ -219,7 +221,7 @@ fn main() {
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
             let mut status = 0i32;
             loop {
-                let ret = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
+                let ret = unsafe { libc::waitpid(pid, &raw mut status, libc::WNOHANG) };
                 if ret > 0 {
                     if libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0 {
                         eprintln!("[fork-exec-pie] child exited OK");
@@ -539,7 +541,7 @@ fn main() {
             //   - Write SIZE bytes of 'C' chars
             //   - Read until EOF
             // Reports both totals.
-            let addr = args.get(2).map(String::as_str).unwrap_or("127.0.0.1:9999");
+            let addr = args.get(2).map_or("127.0.0.1:9999", String::as_str);
             let size: usize = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(65536);
             use std::io::{Read, Write};
             match std::net::TcpStream::connect(addr) {
@@ -595,7 +597,7 @@ fn main() {
             // and if no events, parks the thread on a futex. The I/O driver
             // uses an eventfd to wake the parker when new events arrive.
             let port: u16 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(19990);
-            let variant = args.get(3).map(|s| s.as_str()).unwrap_or("direct");
+            let variant = args.get(3).map_or("direct", std::string::String::as_str);
 
             unsafe {
                 // Create server socket
@@ -606,7 +608,7 @@ fn main() {
                     srv,
                     libc::SOL_SOCKET,
                     libc::SO_REUSEADDR,
-                    &one as *const _ as *const libc::c_void,
+                    (&raw const one).cast::<libc::c_void>(),
                     std::mem::size_of::<libc::c_int>() as libc::socklen_t,
                 );
                 let addr = libc::sockaddr_in {
@@ -617,7 +619,7 @@ fn main() {
                 };
                 let ret = libc::bind(
                     srv,
-                    &addr as *const _ as *const libc::sockaddr,
+                    (&raw const addr).cast::<libc::sockaddr>(),
                     std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
                 );
                 assert!(ret == 0, "bind failed: {}", std::io::Error::last_os_error());
@@ -631,7 +633,7 @@ fn main() {
                     events: libc::EPOLLIN as u32,
                     u64: srv as u64,
                 };
-                libc::epoll_ctl(epfd, libc::EPOLL_CTL_ADD, srv, &mut ev);
+                libc::epoll_ctl(epfd, libc::EPOLL_CTL_ADD, srv, &raw mut ev);
 
                 // Spawn client thread
                 let port_copy = port;
@@ -649,7 +651,7 @@ fn main() {
                     };
                     libc::connect(
                         sock,
-                        &addr as *const _ as *const libc::sockaddr,
+                        (&raw const addr).cast::<libc::sockaddr>(),
                         std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
                     );
                     let msg = b"EPOLL_DATA";
@@ -709,7 +711,7 @@ fn main() {
                         events: libc::EPOLLIN as u32,
                         u64: conn as u64,
                     };
-                    libc::epoll_ctl(epfd, libc::EPOLL_CTL_ADD, conn, &mut ev2);
+                    libc::epoll_ctl(epfd, libc::EPOLL_CTL_ADD, conn, &raw mut ev2);
 
                     // Wait for data
                     let n2 = libc::epoll_wait(epfd, events.as_mut_ptr(), 4, 5000);
@@ -937,7 +939,7 @@ fn main() {
         }
         "write-known" => {
             // Write "PIPEDATA:{tag}\n" to stdout. Used for pipe chain integrity.
-            let tag = args.get(2).map(String::as_str).unwrap_or("default");
+            let tag = args.get(2).map_or("default", String::as_str);
             println!("PIPEDATA:{tag}");
         }
         "capture-pipe" => {
@@ -946,8 +948,8 @@ fn main() {
             // parent: read(read_end), verify output.
             // This isolates the delayed-fork capture pipe bridging.
             std::process::exit(capture_pipe_test::run(
-                args.get(2).map(String::as_str).unwrap_or("pipe"),
-                args.get(3).map(String::as_str).unwrap_or("sh"),
+                args.get(2).map_or("pipe", String::as_str),
+                args.get(3).map_or("sh", String::as_str),
             ));
         }
         "stdin-script" => {
@@ -958,7 +960,7 @@ fn main() {
             // Usage: stdin-script <test-name>
             // Each test pipes a specific script to sh and checks stdout.
             std::process::exit(stdin_script_tests::run(
-                args.get(2).map(String::as_str).unwrap_or("all"),
+                args.get(2).map_or("all", String::as_str),
             ));
         }
         "stress-exec" => {
@@ -969,7 +971,7 @@ fn main() {
             // Usage: stress-exec <count> <pie|nonpie|mixed> [sync|tokio]
             // Outputs results to BOTH stdout and stderr.
             let count: usize = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(10);
-            let mode = args.get(3).map(String::as_str).unwrap_or("pie");
+            let mode = args.get(3).map_or("pie", String::as_str);
             let use_tokio = args.get(4).map(String::as_str) == Some("tokio");
             let mut failures = 0;
             let nonpie_bin = find_nonpie_binary().unwrap_or_default();
@@ -1181,29 +1183,29 @@ fn main() {
             print!("{stdout}");
         }
         "getifaddrs-test" => {
-            let sub = args.get(2).map(String::as_str).unwrap_or("full");
+            let sub = args.get(2).map_or("full", String::as_str);
             std::process::exit(netlink_tests::run(sub));
         }
         "unix-socket-test" => {
-            let sub = args.get(2).map(String::as_str).unwrap_or("cross-process");
+            let sub = args.get(2).map_or("cross-process", String::as_str);
             std::process::exit(unix_socket_tests::run(sub));
         }
         "pipe-test" => {
-            let sub = args.get(2).map(String::as_str).unwrap_or("help");
+            let sub = args.get(2).map_or("help", String::as_str);
             std::process::exit(pipe_lifecycle_tests::run(sub, &args));
         }
         "exit-test" => {
-            let sub = args.get(2).map(String::as_str).unwrap_or("single");
+            let sub = args.get(2).map_or("single", String::as_str);
             exit_tests::run(sub);
             eprintln!("EXIT_TEST_BUG: run() returned instead of exiting");
             std::process::exit(99);
         }
         "net-test" => {
-            let sub = args.get(2).map(String::as_str).unwrap_or("ipv6-socket");
+            let sub = args.get(2).map_or("ipv6-socket", String::as_str);
             std::process::exit(net_tests::run(sub));
         }
         "fs-test" => {
-            let sub = args.get(2).map(String::as_str).unwrap_or("help");
+            let sub = args.get(2).map_or("help", String::as_str);
             std::process::exit(fs_tests::run(sub, &args));
         }
         // Check if the pre-warmed code-server is running (reads pid.txt + log.txt)
@@ -1217,10 +1219,10 @@ fn main() {
             // the same worker and works fine.
             //
             // Usage: cross-worker-file [write-and-sleep|write-and-exit]
-            let sub = args.get(2).map(String::as_str).unwrap_or("");
+            let sub = args.get(2).map_or("", String::as_str);
             if sub == "write-and-sleep" || sub == "write-and-exit" || sub == "write-and-hold" {
                 // Child mode: write lines to the file path in arg[3].
-                let path = args.get(3).map(String::as_str).unwrap_or("/tmp/cwf.log");
+                let path = args.get(3).map_or("/tmp/cwf.log", String::as_str);
                 let mut f = std::fs::OpenOptions::new()
                     .write(true)
                     .create(true)
@@ -1315,8 +1317,7 @@ fn main() {
             let n_children: usize = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(3);
             let file_to_open = args
                 .get(3)
-                .map(String::as_str)
-                .unwrap_or("/lib/x86_64-linux-gnu/libc.so.6");
+                .map_or("/lib/x86_64-linux-gnu/libc.so.6", String::as_str);
 
             eprintln!("[concurrent-fs] forking {n_children} children, each opens {file_to_open}");
 
@@ -1362,7 +1363,7 @@ fn main() {
             for (i, &pid) in child_pids.iter().enumerate() {
                 let mut status = 0i32;
                 loop {
-                    let ret = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
+                    let ret = unsafe { libc::waitpid(pid, &raw mut status, libc::WNOHANG) };
                     if ret > 0 {
                         if libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0 {
                             break;
@@ -1388,7 +1389,7 @@ fn main() {
             } else {
                 println!("CONCURRENT_FS_FAIL:{n_children} (concurrent open+close deadlocked)");
             }
-            std::process::exit(if all_ok { 0 } else { 1 });
+            std::process::exit(i32::from(!all_ok));
         }
         "concurrent-fs-multi" => {
             // Targets the open() write-lock-during-9P deadlock (lines 1058-1062
@@ -1469,7 +1470,7 @@ fn main() {
                         }
                     }
                     eprintln!("[concurrent-fs-multi] child {i} done ok={ok}");
-                    std::process::exit(if ok { 0 } else { 1 });
+                    std::process::exit(i32::from(!ok));
                 }
                 child_pids.push(pid);
             }
@@ -1480,7 +1481,7 @@ fn main() {
             for (i, &pid) in child_pids.iter().enumerate() {
                 let mut status = 0i32;
                 loop {
-                    let ret = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
+                    let ret = unsafe { libc::waitpid(pid, &raw mut status, libc::WNOHANG) };
                     if ret > 0 {
                         if libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0 {
                             break;
@@ -1508,7 +1509,7 @@ fn main() {
             } else {
                 println!("CONCURRENT_FS_MULTI_FAIL:{n_children} (open write-lock deadlock)");
             }
-            std::process::exit(if all_ok { 0 } else { 1 });
+            std::process::exit(i32::from(!all_ok));
         }
         other => {
             eprintln!("unknown command: {other}");
@@ -1622,7 +1623,7 @@ mod capture_pipe_test {
         let mut buf = [0u8; 4096];
         let mut output = Vec::new();
         loop {
-            let n = unsafe { libc::read(read_end, buf.as_mut_ptr() as *mut _, buf.len()) };
+            let n = unsafe { libc::read(read_end, buf.as_mut_ptr().cast(), buf.len()) };
             if n <= 0 {
                 break;
             }
@@ -1632,7 +1633,7 @@ mod capture_pipe_test {
 
         // Wait for child
         let mut status = 0i32;
-        unsafe { libc::waitpid(pid, &mut status, 0) };
+        unsafe { libc::waitpid(pid, &raw mut status, 0) };
 
         let stdout = String::from_utf8_lossy(&output).trim().to_string();
         if stdout.contains("CAPTURE_OK") {
@@ -1666,7 +1667,7 @@ mod capture_pipe_test {
             // Child: close read end, write to write end, exit
             unsafe { libc::close(read_end) };
             let msg = b"CAPTURE_OK\n";
-            unsafe { libc::write(write_end, msg.as_ptr() as *const _, msg.len()) };
+            unsafe { libc::write(write_end, msg.as_ptr().cast(), msg.len()) };
             unsafe { libc::close(write_end) };
             unsafe { libc::_exit(0) };
         }
@@ -1677,7 +1678,7 @@ mod capture_pipe_test {
         let mut buf = [0u8; 4096];
         let mut output = Vec::new();
         loop {
-            let n = unsafe { libc::read(read_end, buf.as_mut_ptr() as *mut _, buf.len()) };
+            let n = unsafe { libc::read(read_end, buf.as_mut_ptr().cast(), buf.len()) };
             if n <= 0 {
                 break;
             }
@@ -1686,7 +1687,7 @@ mod capture_pipe_test {
         unsafe { libc::close(read_end) };
 
         let mut status = 0i32;
-        unsafe { libc::waitpid(pid, &mut status, 0) };
+        unsafe { libc::waitpid(pid, &raw mut status, 0) };
 
         let stdout = String::from_utf8_lossy(&output).trim().to_string();
         if stdout.contains("CAPTURE_OK") {
@@ -1741,7 +1742,7 @@ mod capture_pipe_test {
             if gc < 0 {
                 // Fork failed — write error and exit
                 let msg = b"FORK2_FAILED\n";
-                unsafe { libc::write(1, msg.as_ptr() as *const _, msg.len()) };
+                unsafe { libc::write(1, msg.as_ptr().cast(), msg.len()) };
                 unsafe { libc::_exit(1) };
             }
 
@@ -1750,7 +1751,7 @@ mod capture_pipe_test {
                 // Write to inner pipe, exit
                 unsafe { libc::close(inner[0]) };
                 let msg = b"CAPTURE_OK\n";
-                unsafe { libc::write(inner[1], msg.as_ptr() as *const _, msg.len()) };
+                unsafe { libc::write(inner[1], msg.as_ptr().cast(), msg.len()) };
                 unsafe { libc::close(inner[1]) };
                 unsafe { libc::_exit(0) };
             }
@@ -1760,17 +1761,17 @@ mod capture_pipe_test {
             unsafe { libc::close(inner[1]) };
             let mut buf = [0u8; 4096];
             loop {
-                let n = unsafe { libc::read(inner[0], buf.as_mut_ptr() as *mut _, buf.len()) };
+                let n = unsafe { libc::read(inner[0], buf.as_mut_ptr().cast(), buf.len()) };
                 if n <= 0 {
                     break;
                 }
-                unsafe { libc::write(1, buf.as_ptr() as *const _, n as usize) };
+                unsafe { libc::write(1, buf.as_ptr().cast(), n as usize) };
             }
             unsafe { libc::close(inner[0]) };
 
             // Wait for grandchild
             let mut gc_status = 0i32;
-            unsafe { libc::waitpid(gc, &mut gc_status, 0) };
+            unsafe { libc::waitpid(gc, &raw mut gc_status, 0) };
             unsafe { libc::_exit(0) };
         }
 
@@ -1780,7 +1781,7 @@ mod capture_pipe_test {
         let mut buf = [0u8; 4096];
         let mut output = Vec::new();
         loop {
-            let n = unsafe { libc::read(capture[0], buf.as_mut_ptr() as *mut _, buf.len()) };
+            let n = unsafe { libc::read(capture[0], buf.as_mut_ptr().cast(), buf.len()) };
             if n <= 0 {
                 break;
             }
@@ -1789,7 +1790,7 @@ mod capture_pipe_test {
         unsafe { libc::close(capture[0]) };
 
         let mut status = 0i32;
-        unsafe { libc::waitpid(pid, &mut status, 0) };
+        unsafe { libc::waitpid(pid, &raw mut status, 0) };
 
         let stdout = String::from_utf8_lossy(&output).trim().to_string();
         if stdout.contains("CAPTURE_OK") {
@@ -1842,7 +1843,7 @@ mod capture_pipe_test {
             let cat_pid = unsafe { libc::fork() };
             if cat_pid < 0 {
                 let msg = b"FORK2_FAILED\n";
-                unsafe { libc::write(1, msg.as_ptr() as *const _, msg.len()) };
+                unsafe { libc::write(1, msg.as_ptr().cast(), msg.len()) };
                 unsafe { libc::_exit(1) };
             }
 
@@ -1864,12 +1865,12 @@ mod capture_pipe_test {
             // Write data to inner pipe (like echo would), close write end
             unsafe { libc::close(inner[0]) };
             let msg = b"CAPTURE_OK\n";
-            unsafe { libc::write(inner[1], msg.as_ptr() as *const _, msg.len()) };
+            unsafe { libc::write(inner[1], msg.as_ptr().cast(), msg.len()) };
             unsafe { libc::close(inner[1]) };
 
             // Wait for cat
             let mut cat_status = 0i32;
-            unsafe { libc::waitpid(cat_pid, &mut cat_status, 0) };
+            unsafe { libc::waitpid(cat_pid, &raw mut cat_status, 0) };
             unsafe { libc::_exit(0) };
         }
 
@@ -1878,7 +1879,7 @@ mod capture_pipe_test {
         let output = read_all(capture[0]);
         unsafe { libc::close(capture[0]) };
         let mut status = 0i32;
-        unsafe { libc::waitpid(pid, &mut status, 0) };
+        unsafe { libc::waitpid(pid, &raw mut status, 0) };
 
         let stdout = String::from_utf8_lossy(&output).trim().to_string();
         if stdout.contains("CAPTURE_OK") {
@@ -1916,7 +1917,7 @@ mod capture_pipe_test {
             }
             // Write directly (simple — no inner pipeline)
             let msg = b"SUBSHELL_DATA\n";
-            unsafe { libc::write(1, msg.as_ptr() as *const _, msg.len()) };
+            unsafe { libc::write(1, msg.as_ptr().cast(), msg.len()) };
             unsafe { libc::_exit(0) };
         }
 
@@ -1925,7 +1926,7 @@ mod capture_pipe_test {
         let output = read_all(capture[0]);
         unsafe { libc::close(capture[0]) };
         let mut status = 0i32;
-        unsafe { libc::waitpid(pid, &mut status, 0) };
+        unsafe { libc::waitpid(pid, &raw mut status, 0) };
 
         let captured = String::from_utf8_lossy(&output).trim().to_string();
         // Parent does MORE WORK after reading the capture pipe.
@@ -1944,7 +1945,7 @@ mod capture_pipe_test {
         let mut buf = [0u8; 4096];
         let mut output = Vec::new();
         loop {
-            let n = unsafe { libc::read(fd, buf.as_mut_ptr() as *mut _, buf.len()) };
+            let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) };
             if n <= 0 {
                 break;
             }
@@ -2075,7 +2076,7 @@ mod stdin_script_tests {
             return 1;
         }
         eprintln!("stdin-script: {total} tests, {failures} failures");
-        if failures > 0 { 1 } else { 0 }
+        i32::from(failures > 0)
     }
 }
 
@@ -2122,7 +2123,8 @@ mod netlink_tests {
         }
         let mut sa: libc::sockaddr_nl = unsafe { std::mem::zeroed() };
         let mut len = std::mem::size_of::<libc::sockaddr_nl>() as u32;
-        if unsafe { libc::getsockname(fd, &mut sa as *mut _ as *mut libc::sockaddr, &mut len) } < 0
+        if unsafe { libc::getsockname(fd, (&raw mut sa).cast::<libc::sockaddr>(), &raw mut len) }
+            < 0
         {
             println!("NETLINK_GETSOCKNAME_FAIL:{}", errno());
             unsafe { libc::close(fd) };
@@ -2147,15 +2149,15 @@ mod netlink_tests {
         }
         let mut req = [0u8; 32]; // nlmsghdr(16) + ifinfomsg(16)
         req[0..4].copy_from_slice(&32u32.to_ne_bytes());
-        req[4..6].copy_from_slice(&(libc::RTM_GETLINK as u16).to_ne_bytes());
+        req[4..6].copy_from_slice(&libc::RTM_GETLINK.to_ne_bytes());
         req[6..8].copy_from_slice(&((libc::NLM_F_REQUEST | libc::NLM_F_DUMP) as u16).to_ne_bytes());
         req[8..12].copy_from_slice(&1u32.to_ne_bytes());
-        if unsafe { libc::send(fd, req.as_ptr() as *const _, req.len(), 0) } < 0 {
+        if unsafe { libc::send(fd, req.as_ptr().cast(), req.len(), 0) } < 0 {
             println!("NETLINK_SEND_FAIL:{}", errno());
             unsafe { libc::close(fd) };
             return 1;
         }
-        let (found, done) = recv_check(fd, libc::RTM_NEWLINK as u16);
+        let (found, done) = recv_check(fd, libc::RTM_NEWLINK);
         unsafe { libc::close(fd) };
         if found && done {
             println!("NETLINK_GETLINK_OK");
@@ -2174,15 +2176,15 @@ mod netlink_tests {
         }
         let mut req = [0u8; 24]; // nlmsghdr(16) + ifaddrmsg(8)
         req[0..4].copy_from_slice(&24u32.to_ne_bytes());
-        req[4..6].copy_from_slice(&(libc::RTM_GETADDR as u16).to_ne_bytes());
+        req[4..6].copy_from_slice(&libc::RTM_GETADDR.to_ne_bytes());
         req[6..8].copy_from_slice(&((libc::NLM_F_REQUEST | libc::NLM_F_DUMP) as u16).to_ne_bytes());
         req[8..12].copy_from_slice(&2u32.to_ne_bytes());
-        if unsafe { libc::send(fd, req.as_ptr() as *const _, req.len(), 0) } < 0 {
+        if unsafe { libc::send(fd, req.as_ptr().cast(), req.len(), 0) } < 0 {
             println!("NETLINK_SEND_FAIL:{}", errno());
             unsafe { libc::close(fd) };
             return 1;
         }
-        let (found, done) = recv_check(fd, libc::RTM_NEWADDR as u16);
+        let (found, done) = recv_check(fd, libc::RTM_NEWADDR);
         unsafe { libc::close(fd) };
         if found && done {
             println!("NETLINK_GETADDR_OK");
@@ -2198,7 +2200,7 @@ mod netlink_tests {
 
     fn test_full() -> i32 {
         let mut ifaddr: *mut libc::ifaddrs = std::ptr::null_mut();
-        if unsafe { libc::getifaddrs(&mut ifaddr) } != 0 {
+        if unsafe { libc::getifaddrs(&raw mut ifaddr) } != 0 {
             println!("GETIFADDRS_FAIL:{}", errno());
             return 1;
         }
@@ -2229,7 +2231,7 @@ mod netlink_tests {
         unsafe {
             libc::bind(
                 fd,
-                &addr as *const _ as *const libc::sockaddr,
+                (&raw const addr).cast::<libc::sockaddr>(),
                 std::mem::size_of::<libc::sockaddr_nl>() as u32,
             )
         };
@@ -2249,7 +2251,7 @@ mod netlink_tests {
         // Send RTM_GETLINK via sendmsg (glibc pattern)
         let mut req = [0u8; 32]; // nlmsghdr(16) + ifinfomsg(16)
         req[0..4].copy_from_slice(&32u32.to_ne_bytes());
-        req[4..6].copy_from_slice(&(libc::RTM_GETLINK as u16).to_ne_bytes());
+        req[4..6].copy_from_slice(&libc::RTM_GETLINK.to_ne_bytes());
         req[6..8].copy_from_slice(&((libc::NLM_F_REQUEST | libc::NLM_F_DUMP) as u16).to_ne_bytes());
         req[8..12].copy_from_slice(&1u32.to_ne_bytes());
 
@@ -2257,16 +2259,16 @@ mod netlink_tests {
         dst_addr.nl_family = libc::AF_NETLINK as u16;
 
         let mut iov = libc::iovec {
-            iov_base: req.as_mut_ptr() as *mut _,
+            iov_base: req.as_mut_ptr().cast(),
             iov_len: req.len(),
         };
         let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
-        msg.msg_name = &mut dst_addr as *mut _ as *mut _;
+        msg.msg_name = (&raw mut dst_addr).cast();
         msg.msg_namelen = std::mem::size_of::<libc::sockaddr_nl>() as u32;
-        msg.msg_iov = &mut iov;
+        msg.msg_iov = &raw mut iov;
         msg.msg_iovlen = 1;
 
-        let sent = unsafe { libc::sendmsg(fd, &msg, 0) };
+        let sent = unsafe { libc::sendmsg(fd, &raw const msg, 0) };
         if sent < 0 {
             println!("NETLINK_SENDMSG_FAIL:{}", errno());
             unsafe { libc::close(fd) };
@@ -2281,17 +2283,17 @@ mod netlink_tests {
         let mut buf = [0u8; 8192];
         loop {
             let mut iov_recv = libc::iovec {
-                iov_base: buf.as_mut_ptr() as *mut _,
+                iov_base: buf.as_mut_ptr().cast(),
                 iov_len: buf.len(),
             };
             let mut src_addr: libc::sockaddr_nl = unsafe { std::mem::zeroed() };
             let mut rmsg: libc::msghdr = unsafe { std::mem::zeroed() };
-            rmsg.msg_name = &mut src_addr as *mut _ as *mut _;
+            rmsg.msg_name = (&raw mut src_addr).cast();
             rmsg.msg_namelen = std::mem::size_of::<libc::sockaddr_nl>() as u32;
-            rmsg.msg_iov = &mut iov_recv;
+            rmsg.msg_iov = &raw mut iov_recv;
             rmsg.msg_iovlen = 1;
 
-            let n = unsafe { libc::recvmsg(fd, &mut rmsg, 0) };
+            let n = unsafe { libc::recvmsg(fd, &raw mut rmsg, 0) };
             recv_count += 1;
             eprintln!("[recvmsg] call #{recv_count}: returned {n}");
             if n <= 0 {
@@ -2308,7 +2310,7 @@ mod netlink_tests {
                 if len < 16 || off + len > n {
                     break;
                 }
-                if mtype == libc::RTM_NEWLINK as u16 {
+                if mtype == libc::RTM_NEWLINK {
                     found_newlink = true;
                 }
                 if mtype == libc::NLMSG_DONE as u16 {
@@ -2344,7 +2346,7 @@ mod netlink_tests {
         // Request 1: RTM_GETLINK via sendto (glibc pattern)
         let mut req1 = [0u8; 32];
         req1[0..4].copy_from_slice(&32u32.to_ne_bytes());
-        req1[4..6].copy_from_slice(&(libc::RTM_GETLINK as u16).to_ne_bytes());
+        req1[4..6].copy_from_slice(&libc::RTM_GETLINK.to_ne_bytes());
         req1[6..8]
             .copy_from_slice(&((libc::NLM_F_REQUEST | libc::NLM_F_DUMP) as u16).to_ne_bytes());
         req1[8..12].copy_from_slice(&1u32.to_ne_bytes());
@@ -2356,10 +2358,10 @@ mod netlink_tests {
         let sent = unsafe {
             libc::sendto(
                 fd,
-                req1.as_ptr() as *const _,
+                req1.as_ptr().cast(),
                 req1.len(),
                 0,
-                &dst as *const _ as *const libc::sockaddr,
+                (&raw const dst).cast::<libc::sockaddr>(),
                 std::mem::size_of::<libc::sockaddr_nl>() as u32,
             )
         };
@@ -2370,7 +2372,7 @@ mod netlink_tests {
             return 1;
         }
 
-        let (link_ok, link_done) = recv_check(fd, libc::RTM_NEWLINK as u16);
+        let (link_ok, link_done) = recv_check(fd, libc::RTM_NEWLINK);
         eprintln!("[double] getlink: ok={link_ok} done={link_done}");
         if !link_ok || !link_done {
             println!("DOUBLE_GETLINK_FAIL:ok={link_ok},done={link_done}");
@@ -2381,7 +2383,7 @@ mod netlink_tests {
         // Request 2: RTM_GETADDR via sendto
         let mut req2 = [0u8; 24];
         req2[0..4].copy_from_slice(&24u32.to_ne_bytes());
-        req2[4..6].copy_from_slice(&(libc::RTM_GETADDR as u16).to_ne_bytes());
+        req2[4..6].copy_from_slice(&libc::RTM_GETADDR.to_ne_bytes());
         req2[6..8]
             .copy_from_slice(&((libc::NLM_F_REQUEST | libc::NLM_F_DUMP) as u16).to_ne_bytes());
         req2[8..12].copy_from_slice(&2u32.to_ne_bytes());
@@ -2390,10 +2392,10 @@ mod netlink_tests {
         let sent = unsafe {
             libc::sendto(
                 fd,
-                req2.as_ptr() as *const _,
+                req2.as_ptr().cast(),
                 req2.len(),
                 0,
-                &dst as *const _ as *const libc::sockaddr,
+                (&raw const dst).cast::<libc::sockaddr>(),
                 std::mem::size_of::<libc::sockaddr_nl>() as u32,
             )
         };
@@ -2404,7 +2406,7 @@ mod netlink_tests {
             return 1;
         }
 
-        let (addr_ok, addr_done) = recv_check(fd, libc::RTM_NEWADDR as u16);
+        let (addr_ok, addr_done) = recv_check(fd, libc::RTM_NEWADDR);
         eprintln!("[double] getaddr: ok={addr_ok} done={addr_done}");
 
         unsafe { libc::close(fd) };
@@ -2430,10 +2432,10 @@ mod netlink_tests {
         // Send RTM_GETLINK request
         let mut req = [0u8; 32];
         req[0..4].copy_from_slice(&32u32.to_ne_bytes());
-        req[4..6].copy_from_slice(&(libc::RTM_GETLINK as u16).to_ne_bytes());
+        req[4..6].copy_from_slice(&libc::RTM_GETLINK.to_ne_bytes());
         req[6..8].copy_from_slice(&((libc::NLM_F_REQUEST | libc::NLM_F_DUMP) as u16).to_ne_bytes());
         req[8..12].copy_from_slice(&1u32.to_ne_bytes());
-        if unsafe { libc::send(fd, req.as_ptr() as *const _, req.len(), 0) } < 0 {
+        if unsafe { libc::send(fd, req.as_ptr().cast(), req.len(), 0) } < 0 {
             println!("PEEK_SEND_FAIL:{}", errno());
             unsafe { libc::close(fd) };
             return 1;
@@ -2446,12 +2448,13 @@ mod netlink_tests {
         };
         let mut src_addr: libc::sockaddr_nl = unsafe { std::mem::zeroed() };
         let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
-        msg.msg_name = &mut src_addr as *mut _ as *mut _;
+        msg.msg_name = (&raw mut src_addr).cast();
         msg.msg_namelen = std::mem::size_of::<libc::sockaddr_nl>() as u32;
-        msg.msg_iov = &mut iov;
+        msg.msg_iov = &raw mut iov;
         msg.msg_iovlen = 1;
 
-        let peek_size = unsafe { libc::recvmsg(fd, &mut msg, libc::MSG_PEEK | libc::MSG_TRUNC) };
+        let peek_size =
+            unsafe { libc::recvmsg(fd, &raw mut msg, libc::MSG_PEEK | libc::MSG_TRUNC) };
         eprintln!("[peek-trunc] peek returned {peek_size}");
         if peek_size <= 0 {
             println!(
@@ -2465,16 +2468,16 @@ mod netlink_tests {
         // Step 2: recvmsg(0) with properly sized buffer
         let mut buf = vec![0u8; peek_size as usize];
         let mut iov2 = libc::iovec {
-            iov_base: buf.as_mut_ptr() as *mut _,
+            iov_base: buf.as_mut_ptr().cast(),
             iov_len: buf.len(),
         };
         let mut msg2: libc::msghdr = unsafe { std::mem::zeroed() };
-        msg2.msg_name = &mut src_addr as *mut _ as *mut _;
+        msg2.msg_name = (&raw mut src_addr).cast();
         msg2.msg_namelen = std::mem::size_of::<libc::sockaddr_nl>() as u32;
-        msg2.msg_iov = &mut iov2;
+        msg2.msg_iov = &raw mut iov2;
         msg2.msg_iovlen = 1;
 
-        let read_size = unsafe { libc::recvmsg(fd, &mut msg2, 0) };
+        let read_size = unsafe { libc::recvmsg(fd, &raw mut msg2, 0) };
         eprintln!("[peek-trunc] read returned {read_size}");
         if read_size <= 0 {
             println!(
@@ -2520,7 +2523,7 @@ mod netlink_tests {
         let mut found = false;
         let mut done = false;
         loop {
-            let n = unsafe { libc::recv(fd, buf.as_mut_ptr() as *mut _, buf.len(), 0) };
+            let n = unsafe { libc::recv(fd, buf.as_mut_ptr().cast(), buf.len(), 0) };
             if n <= 0 {
                 eprintln!("[recv_check] recv returned {n}");
                 break;
@@ -2676,7 +2679,7 @@ mod unix_socket_tests {
 
         // Wait for server child
         let mut status: i32 = 0;
-        unsafe { libc::waitpid(pid, &mut status, 0) };
+        unsafe { libc::waitpid(pid, &raw mut status, 0) };
         let exit_code = if libc::WIFEXITED(status) {
             libc::WEXITSTATUS(status)
         } else {
@@ -2758,7 +2761,7 @@ mod unix_socket_tests {
         }
 
         let mut status: i32 = 0;
-        unsafe { libc::waitpid(pid, &mut status, 0) };
+        unsafe { libc::waitpid(pid, &raw mut status, 0) };
         let exit_code = if libc::WIFEXITED(status) {
             libc::WEXITSTATUS(status)
         } else {
@@ -2779,7 +2782,7 @@ mod unix_socket_tests {
     /// Uses getifaddrs to check for AF_PACKET/link-layer entries.
     fn test_mac_address() -> i32 {
         let mut ifaddr: *mut libc::ifaddrs = std::ptr::null_mut();
-        if unsafe { libc::getifaddrs(&mut ifaddr) } != 0 {
+        if unsafe { libc::getifaddrs(&raw mut ifaddr) } != 0 {
             println!("NL6_GETIFADDRS_FAIL:{}", errno());
             return 1;
         }
@@ -2808,7 +2811,7 @@ mod unix_socket_tests {
 
         println!("NL6_MAC_CHECK:count={iface_count},has_packet={has_packet},has_inet={has_inet}");
         // has_packet=true means there's a link-layer entry with MAC
-        if has_packet { 0 } else { 1 }
+        i32::from(!has_packet)
     }
 
     /// US2: Fork+exec cross-process unix socket — tests the exec migration path.
@@ -2975,7 +2978,7 @@ mod unix_socket_tests {
         drop(stream);
 
         let mut status: i32 = 0;
-        unsafe { libc::waitpid(pid, &mut status, 0) };
+        unsafe { libc::waitpid(pid, &raw mut status, 0) };
         let exit_code = if libc::WIFEXITED(status) {
             libc::WEXITSTATUS(status)
         } else {
@@ -3050,7 +3053,7 @@ mod unix_socket_tests {
         }
 
         let mut status: i32 = 0;
-        unsafe { libc::waitpid(pid, &mut status, 0) };
+        unsafe { libc::waitpid(pid, &raw mut status, 0) };
         let exit_code = if libc::WIFEXITED(status) {
             libc::WEXITSTATUS(status)
         } else {
@@ -3080,8 +3083,9 @@ mod unix_socket_tests {
 
         let mut addr: libc::sockaddr_un = unsafe { std::mem::zeroed() };
         addr.sun_family = libc::AF_UNIX as u16;
-        addr.sun_path[..abstract_name.len()]
-            .copy_from_slice(unsafe { &*(abstract_name as *const [u8] as *const [i8]) });
+        addr.sun_path[..abstract_name.len()].copy_from_slice(unsafe {
+            &*(std::ptr::from_ref::<[u8]>(abstract_name) as *const [i8])
+        });
         let addr_len =
             (std::mem::size_of::<libc::sa_family_t>() + abstract_name.len()) as libc::socklen_t;
 
@@ -3094,7 +3098,7 @@ mod unix_socket_tests {
 
         if pid == 0 {
             // Child = server: bind + listen + accept
-            if unsafe { libc::bind(fd, &addr as *const _ as *const libc::sockaddr, addr_len) } < 0 {
+            if unsafe { libc::bind(fd, (&raw const addr).cast::<libc::sockaddr>(), addr_len) } < 0 {
                 eprintln!("[US5-server] bind: {}", errno());
                 std::process::exit(1);
             }
@@ -3109,7 +3113,7 @@ mod unix_socket_tests {
                 std::process::exit(3);
             }
             let mut buf = [0u8; 64];
-            let n = unsafe { libc::read(client_fd, buf.as_mut_ptr() as *mut _, buf.len()) };
+            let n = unsafe { libc::read(client_fd, buf.as_mut_ptr().cast(), buf.len()) };
             unsafe {
                 libc::close(client_fd);
                 libc::close(fd);
@@ -3131,7 +3135,7 @@ mod unix_socket_tests {
 
         let mut connected = false;
         for attempt in 0..10 {
-            if unsafe { libc::connect(cfd, &addr as *const _ as *const libc::sockaddr, addr_len) }
+            if unsafe { libc::connect(cfd, (&raw const addr).cast::<libc::sockaddr>(), addr_len) }
                 == 0
             {
                 eprintln!("[US5-client] connected on attempt {attempt}");
@@ -3143,12 +3147,12 @@ mod unix_socket_tests {
         }
 
         if connected {
-            unsafe { libc::write(cfd, b"US5_HELLO".as_ptr() as *const _, 9) };
+            unsafe { libc::write(cfd, b"US5_HELLO".as_ptr().cast(), 9) };
         }
         unsafe { libc::close(cfd) };
 
         let mut status: i32 = 0;
-        unsafe { libc::waitpid(pid, &mut status, 0) };
+        unsafe { libc::waitpid(pid, &raw mut status, 0) };
         let exit_code = if libc::WIFEXITED(status) {
             libc::WEXITSTATUS(status)
         } else {
@@ -3190,7 +3194,7 @@ mod unix_socket_tests {
             unsafe { libc::close(parent_fd) };
             let msg = b"US6_FROM_CHILD";
             let n =
-                unsafe { libc::write(child_fd, msg.as_ptr() as *const libc::c_void, msg.len()) };
+                unsafe { libc::write(child_fd, msg.as_ptr().cast::<libc::c_void>(), msg.len()) };
             if n != msg.len() as isize {
                 eprintln!("[US6a-child] write failed: n={n} errno={}", errno());
                 std::process::exit(1);
@@ -3202,7 +3206,7 @@ mod unix_socket_tests {
 
         unsafe { libc::close(child_fd) };
         let mut status = 0i32;
-        unsafe { libc::waitpid(pid, &mut status, 0) };
+        unsafe { libc::waitpid(pid, &raw mut status, 0) };
         let exit_code = if libc::WIFEXITED(status) {
             libc::WEXITSTATUS(status)
         } else {
@@ -3216,7 +3220,13 @@ mod unix_socket_tests {
         }
 
         let mut buf = [0u8; 64];
-        let n = unsafe { libc::read(parent_fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
+        let n = unsafe {
+            libc::read(
+                parent_fd,
+                buf.as_mut_ptr().cast::<libc::c_void>(),
+                buf.len(),
+            )
+        };
         unsafe { libc::close(parent_fd) };
 
         if n <= 0 {
@@ -3269,13 +3279,13 @@ mod unix_socket_tests {
                     child_fd,
                     libc::SOL_SOCKET,
                     libc::SO_RCVTIMEO,
-                    &tv as *const _ as *const libc::c_void,
+                    (&raw const tv).cast::<libc::c_void>(),
                     core::mem::size_of::<libc::timeval>() as libc::socklen_t,
                 );
             }
             let mut buf = [0u8; 64];
             let n =
-                unsafe { libc::read(child_fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
+                unsafe { libc::read(child_fd, buf.as_mut_ptr().cast::<libc::c_void>(), buf.len()) };
             if n <= 0 {
                 eprintln!("[US6b-child] read failed: n={n} errno={}", errno());
                 std::process::exit(1);
@@ -3288,7 +3298,7 @@ mod unix_socket_tests {
         // Parent: close child end, write to parent end, waitpid.
         unsafe { libc::close(child_fd) };
         let msg = b"US6_FROM_PARENT";
-        let n = unsafe { libc::write(parent_fd, msg.as_ptr() as *const libc::c_void, msg.len()) };
+        let n = unsafe { libc::write(parent_fd, msg.as_ptr().cast::<libc::c_void>(), msg.len()) };
         unsafe { libc::close(parent_fd) };
 
         if n != msg.len() as isize {
@@ -3299,7 +3309,7 @@ mod unix_socket_tests {
         eprintln!("[US6b-parent] wrote {n} bytes");
 
         let mut status = 0i32;
-        unsafe { libc::waitpid(pid, &mut status, 0) };
+        unsafe { libc::waitpid(pid, &raw mut status, 0) };
         let exit_code = if libc::WIFEXITED(status) {
             libc::WEXITSTATUS(status)
         } else {
@@ -3368,7 +3378,7 @@ mod unix_socket_tests {
         unsafe { libc::close(child_fd) };
 
         let msg = b"US6E_FROM_PARENT";
-        let n = unsafe { libc::write(parent_fd, msg.as_ptr() as *const libc::c_void, msg.len()) };
+        let n = unsafe { libc::write(parent_fd, msg.as_ptr().cast::<libc::c_void>(), msg.len()) };
         if n != msg.len() as isize {
             println!("US6E_WRITE_FAIL:n={n},errno={}", errno());
             unsafe { libc::kill(pid, libc::SIGKILL) };
@@ -3386,16 +3396,22 @@ mod unix_socket_tests {
                 parent_fd,
                 libc::SOL_SOCKET,
                 libc::SO_RCVTIMEO,
-                &tv as *const _ as *const libc::c_void,
+                (&raw const tv).cast::<libc::c_void>(),
                 core::mem::size_of::<libc::timeval>() as libc::socklen_t,
             );
         }
         let mut buf = [0u8; 64];
-        let n = unsafe { libc::read(parent_fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
+        let n = unsafe {
+            libc::read(
+                parent_fd,
+                buf.as_mut_ptr().cast::<libc::c_void>(),
+                buf.len(),
+            )
+        };
         unsafe { libc::close(parent_fd) };
 
         let mut status = 0i32;
-        unsafe { libc::waitpid(pid, &mut status, 0) };
+        unsafe { libc::waitpid(pid, &raw mut status, 0) };
         let exit_code = if libc::WIFEXITED(status) {
             libc::WEXITSTATUS(status)
         } else {
@@ -3439,13 +3455,13 @@ mod unix_socket_tests {
                 fd,
                 libc::SOL_SOCKET,
                 libc::SO_RCVTIMEO,
-                &tv as *const _ as *const libc::c_void,
+                (&raw const tv).cast::<libc::c_void>(),
                 core::mem::size_of::<libc::timeval>() as libc::socklen_t,
             );
         }
 
         let mut buf = [0u8; 64];
-        let n = unsafe { libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
+        let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast::<libc::c_void>(), buf.len()) };
         if n <= 0 {
             eprintln!("[US6c-child] read failed: n={n} errno={}", errno());
             return 1;
@@ -3454,7 +3470,7 @@ mod unix_socket_tests {
         eprintln!("[US6c-child] got: {msg}");
 
         let reply = b"US6E_FROM_CHILD";
-        let w = unsafe { libc::write(fd, reply.as_ptr() as *const libc::c_void, reply.len()) };
+        let w = unsafe { libc::write(fd, reply.as_ptr().cast::<libc::c_void>(), reply.len()) };
         unsafe { libc::close(fd) };
 
         if msg == "US6E_FROM_PARENT" && w == reply.len() as isize {
@@ -3540,7 +3556,7 @@ mod pipe_lifecycle_tests {
             unsafe { libc::close(pipe_fds[0]) };
             let msg = b"P1_CHILD_DATA\n";
             let _ =
-                unsafe { libc::write(pipe_fds[1], msg.as_ptr() as *const libc::c_void, msg.len()) };
+                unsafe { libc::write(pipe_fds[1], msg.as_ptr().cast::<libc::c_void>(), msg.len()) };
             unsafe { libc::close(pipe_fds[1]) };
             std::process::exit(0);
         }
@@ -3558,7 +3574,7 @@ mod pipe_lifecycle_tests {
                 pipe_fds[0],
                 libc::SOL_SOCKET,
                 libc::SO_RCVTIMEO,
-                &tv as *const _ as *const libc::c_void,
+                (&raw const tv).cast::<libc::c_void>(),
                 core::mem::size_of::<libc::timeval>() as libc::socklen_t,
             );
         }
@@ -3569,7 +3585,7 @@ mod pipe_lifecycle_tests {
             let n = unsafe {
                 libc::read(
                     pipe_fds[0],
-                    buf.as_mut_ptr() as *mut libc::c_void,
+                    buf.as_mut_ptr().cast::<libc::c_void>(),
                     buf.len(),
                 )
             };
@@ -3585,7 +3601,7 @@ mod pipe_lifecycle_tests {
         unsafe { libc::close(pipe_fds[0]) };
 
         let mut status = 0i32;
-        unsafe { libc::waitpid(pid, &mut status, 0) };
+        unsafe { libc::waitpid(pid, &raw mut status, 0) };
 
         let data = String::from_utf8_lossy(&all_data);
         if data.contains("P1_CHILD_DATA") {
@@ -3669,7 +3685,7 @@ mod pipe_lifecycle_tests {
                 revents: 0,
             };
             let timeout_ms = remaining.as_millis().min(1000) as i32;
-            let poll_ret = unsafe { libc::poll(&mut pfd, 1, timeout_ms) };
+            let poll_ret = unsafe { libc::poll(&raw mut pfd, 1, timeout_ms) };
 
             if poll_ret == 0 {
                 continue; // poll timeout, retry
@@ -3682,7 +3698,7 @@ mod pipe_lifecycle_tests {
             let n = unsafe {
                 libc::read(
                     pipe_fds[0],
-                    buf.as_mut_ptr() as *mut libc::c_void,
+                    buf.as_mut_ptr().cast::<libc::c_void>(),
                     buf.len(),
                 )
             };
@@ -3698,7 +3714,7 @@ mod pipe_lifecycle_tests {
         unsafe { libc::close(pipe_fds[0]) };
 
         let mut status = 0i32;
-        unsafe { libc::waitpid(pid, &mut status, 0) };
+        unsafe { libc::waitpid(pid, &raw mut status, 0) };
         let exit_code = if libc::WIFEXITED(status) {
             libc::WEXITSTATUS(status)
         } else {
@@ -3743,7 +3759,7 @@ mod pipe_lifecycle_tests {
                 revents: 0,
             };
             let timeout_ms = remaining.as_millis().min(1000) as i32;
-            let poll_ret = unsafe { libc::poll(&mut pfd, 1, timeout_ms) };
+            let poll_ret = unsafe { libc::poll(&raw mut pfd, 1, timeout_ms) };
 
             if poll_ret == 0 {
                 continue;
@@ -3753,7 +3769,7 @@ mod pipe_lifecycle_tests {
             }
 
             // Safety: buf is valid, fd is a valid pipe fd from pipe().
-            let n = unsafe { libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
+            let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast::<libc::c_void>(), buf.len()) };
             if n == 0 {
                 got_eof = true;
                 break;
@@ -3770,7 +3786,7 @@ mod pipe_lifecycle_tests {
     fn wait_child(pid: i32) -> i32 {
         let mut status = 0i32;
         // Safety: pid is a valid child pid from fork().
-        unsafe { libc::waitpid(pid, &mut status, 0) };
+        unsafe { libc::waitpid(pid, &raw mut status, 0) };
         if libc::WIFEXITED(status) {
             libc::WEXITSTATUS(status)
         } else {
@@ -3856,8 +3872,7 @@ mod pipe_lifecycle_tests {
             0
         } else if data.is_empty() {
             println!(
-                "PB_C2P_FAIL:no_data (pipe fd likely not bridged to child worker), exit={}",
-                exit_code
+                "PB_C2P_FAIL:no_data (pipe fd likely not bridged to child worker), exit={exit_code}"
             );
             1
         } else {
@@ -3912,7 +3927,7 @@ mod pipe_lifecycle_tests {
         let msg = b"PB_PARENT_WROTE\n";
         // Safety: pipe_fds[1] is a valid fd, msg is valid memory.
         let written =
-            unsafe { libc::write(pipe_fds[1], msg.as_ptr() as *const libc::c_void, msg.len()) };
+            unsafe { libc::write(pipe_fds[1], msg.as_ptr().cast::<libc::c_void>(), msg.len()) };
         // Safety: pipe_fds[1] is a valid fd.
         unsafe { libc::close(pipe_fds[1]) };
 
@@ -4054,7 +4069,7 @@ mod pipe_lifecycle_tests {
         let msg = b"PB_SP_PING";
         // Safety: fds[0] is a valid fd, msg is valid memory.
         let written =
-            unsafe { libc::write(fds[0], msg.as_ptr() as *const libc::c_void, msg.len()) };
+            unsafe { libc::write(fds[0], msg.as_ptr().cast::<libc::c_void>(), msg.len()) };
         if written < 0 {
             println!("PB_SP_WRITE_FAIL:{}", errno());
             return 1;
@@ -4084,7 +4099,7 @@ mod pipe_lifecycle_tests {
     /// Write a known message to one or more fds (comma-separated).
     /// Usage: pipe-test write-on-fd <fd>[,<fd>,...]
     fn helper_write_on_fd(args: &[String]) -> i32 {
-        let fd_arg = args.get(3).map(String::as_str).unwrap_or("3");
+        let fd_arg = args.get(3).map_or("3", String::as_str);
         let fds: Vec<i32> = fd_arg.split(',').filter_map(|s| s.parse().ok()).collect();
 
         if fds.is_empty() {
@@ -4096,7 +4111,7 @@ mod pipe_lifecycle_tests {
         for &fd in &fds {
             let msg = format!("PB_CHILD_WROTE:fd={fd}\n");
             // Safety: fd is a valid fd inherited from the parent.
-            let n = unsafe { libc::write(fd, msg.as_ptr() as *const libc::c_void, msg.len()) };
+            let n = unsafe { libc::write(fd, msg.as_ptr().cast::<libc::c_void>(), msg.len()) };
             if n < 0 {
                 eprintln!(
                     "[write-on-fd] write(fd={fd}) failed: {}",
@@ -4104,13 +4119,13 @@ mod pipe_lifecycle_tests {
                 );
                 ok = false;
             } else {
-                eprintln!("[write-on-fd] wrote {} bytes to fd {fd}", n);
+                eprintln!("[write-on-fd] wrote {n} bytes to fd {fd}");
             }
             // Safety: fd is a valid fd.
             unsafe { libc::close(fd) };
         }
 
-        if ok { 0 } else { 1 }
+        i32::from(!ok)
     }
 
     /// Read from an extra fd, print what was read to stdout.
@@ -4139,7 +4154,7 @@ mod pipe_lifecycle_tests {
 
         let mut buf = [0u8; 4096];
         // Safety: fd is a valid fd inherited from the parent, buf is valid.
-        let n = unsafe { libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
+        let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast::<libc::c_void>(), buf.len()) };
         if n <= 0 {
             eprintln!(
                 "[echo-on-fd] read failed: {}",
@@ -4151,7 +4166,7 @@ mod pipe_lifecycle_tests {
         }
         let n = n as usize;
         // Safety: fd is a valid fd, buf[..n] contains the data we just read.
-        let w = unsafe { libc::write(fd, buf.as_ptr() as *const libc::c_void, n) };
+        let w = unsafe { libc::write(fd, buf.as_ptr().cast::<libc::c_void>(), n) };
         // Safety: fd is a valid fd.
         unsafe { libc::close(fd) };
 
@@ -4170,7 +4185,7 @@ mod pipe_lifecycle_tests {
     /// Delayed write: sleep for N ms, then write to fd(s).
     /// Usage: pipe-test delayed-write-on-fd <fd>[,<fd>,...] [delay_ms]
     fn helper_delayed_write_on_fd(args: &[String]) -> i32 {
-        let fd_arg = args.get(3).map(String::as_str).unwrap_or("3");
+        let fd_arg = args.get(3).map_or("3", String::as_str);
         let delay_ms: u64 = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(500);
         let fds: Vec<i32> = fd_arg.split(',').filter_map(|s| s.parse().ok()).collect();
 
@@ -4181,7 +4196,7 @@ mod pipe_lifecycle_tests {
         for &fd in &fds {
             let msg = format!("PB_DELAYED_WRITE:fd={fd}\n");
             // Safety: fd is a valid fd inherited from the parent.
-            let n = unsafe { libc::write(fd, msg.as_ptr() as *const libc::c_void, msg.len()) };
+            let n = unsafe { libc::write(fd, msg.as_ptr().cast::<libc::c_void>(), msg.len()) };
             if n < 0 {
                 eprintln!(
                     "[delayed-write] write(fd={fd}) failed: {}",
@@ -4189,12 +4204,12 @@ mod pipe_lifecycle_tests {
                 );
                 ok = false;
             } else {
-                eprintln!("[delayed-write] wrote {} bytes to fd {fd}", n);
+                eprintln!("[delayed-write] wrote {n} bytes to fd {fd}");
             }
             // Safety: fd is a valid fd.
             unsafe { libc::close(fd) };
         }
-        if ok { 0 } else { 1 }
+        i32::from(!ok)
     }
 
     /// Epoll wakeup test for pipe bridge across fork+exec.
@@ -4215,7 +4230,7 @@ mod pipe_lifecycle_tests {
                 .unwrap()
                 .to_string()
         });
-        let delay_ms = args.get(4).map(String::as_str).unwrap_or("200");
+        let delay_ms = args.get(4).map_or("200", String::as_str);
 
         let mut pipe_fds = [0i32; 2];
         // Safety: pipe_fds is a valid array.
@@ -4270,7 +4285,7 @@ mod pipe_lifecycle_tests {
             u64: pipe_fds[0] as u64,
         };
         // Safety: epfd and pipe_fds[0] are valid fds, ev is valid.
-        if unsafe { libc::epoll_ctl(epfd, libc::EPOLL_CTL_ADD, pipe_fds[0], &mut ev) } != 0 {
+        if unsafe { libc::epoll_ctl(epfd, libc::EPOLL_CTL_ADD, pipe_fds[0], &raw mut ev) } != 0 {
             println!("EPOLL_BRIDGE_CTL_FAIL:{}", errno());
             return 1;
         }
@@ -4296,7 +4311,7 @@ mod pipe_lifecycle_tests {
             let n = unsafe {
                 libc::read(
                     pipe_fds[0],
-                    buf.as_mut_ptr() as *mut libc::c_void,
+                    buf.as_mut_ptr().cast::<libc::c_void>(),
                     buf.len(),
                 )
             };
@@ -4357,7 +4372,7 @@ mod pipe_lifecycle_tests {
                 .unwrap()
                 .to_string()
         });
-        let delay_ms = args.get(4).map(String::as_str).unwrap_or("500");
+        let delay_ms = args.get(4).map_or("500", String::as_str);
 
         let mut fds = [0i32; 2];
         if unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, fds.as_mut_ptr()) } != 0 {
@@ -4401,7 +4416,7 @@ mod pipe_lifecycle_tests {
             events: libc::EPOLLIN as u32,
             u64: fds[0] as u64,
         };
-        if unsafe { libc::epoll_ctl(epfd, libc::EPOLL_CTL_ADD, fds[0], &mut ev) } != 0 {
+        if unsafe { libc::epoll_ctl(epfd, libc::EPOLL_CTL_ADD, fds[0], &raw mut ev) } != 0 {
             println!("EPOLL_SP_CTL_FAIL:{}", errno());
             return 1;
         }
@@ -4429,8 +4444,9 @@ mod pipe_lifecycle_tests {
                 // Data ready!
                 let elapsed_ms = t0.elapsed().as_millis();
                 let mut buf = [0u8; 256];
-                let n =
-                    unsafe { libc::read(fds[0], buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
+                let n = unsafe {
+                    libc::read(fds[0], buf.as_mut_ptr().cast::<libc::c_void>(), buf.len())
+                };
                 unsafe {
                     libc::close(fds[0]);
                     libc::close(epfd);
@@ -4487,7 +4503,7 @@ mod exit_tests {
 
         match op {
             "tcgets" => {
-                let ret = unsafe { libc::tcgetattr(fd_num, &mut termios) };
+                let ret = unsafe { libc::tcgetattr(fd_num, &raw mut termios) };
                 if ret == 0 {
                     println!("TERM_OK:op={op},fd={fd_num}");
                 } else {
@@ -4497,7 +4513,7 @@ mod exit_tests {
             }
             "tcsets" | "tcsetsw" | "tcsetsf" => {
                 // First get current attrs
-                if unsafe { libc::tcgetattr(fd_num, &mut termios) } != 0 {
+                if unsafe { libc::tcgetattr(fd_num, &raw mut termios) } != 0 {
                     let e = std::io::Error::last_os_error().raw_os_error().unwrap_or(-1);
                     println!("TERM_ERR:op={op},fd={fd_num},errno={e},phase=tcgetattr");
                     std::process::exit(1);
@@ -4508,7 +4524,7 @@ mod exit_tests {
                     "tcsetsf" => libc::TCSAFLUSH,
                     _ => unreachable!(),
                 };
-                let ret = unsafe { libc::tcsetattr(fd_num, when, &termios) };
+                let ret = unsafe { libc::tcsetattr(fd_num, when, &raw const termios) };
                 if ret == 0 {
                     println!("TERM_OK:op={op},fd={fd_num}");
                 } else {
@@ -4583,7 +4599,14 @@ mod net_tests {
         let mut result: *mut libc::addrinfo = std::ptr::null_mut();
         let host = std::ffi::CString::new("::1").unwrap();
         let port = std::ffi::CString::new("0").unwrap();
-        let ret = unsafe { libc::getaddrinfo(host.as_ptr(), port.as_ptr(), &hints, &mut result) };
+        let ret = unsafe {
+            libc::getaddrinfo(
+                host.as_ptr(),
+                port.as_ptr(),
+                &raw const hints,
+                &raw mut result,
+            )
+        };
         if ret != 0 {
             let err = unsafe { std::ffi::CStr::from_ptr(libc::gai_strerror(ret)) };
             println!("NET5_GAI_FAIL:ret={ret},err={}", err.to_string_lossy());
@@ -4616,7 +4639,7 @@ mod net_tests {
                 fd,
                 libc::IPPROTO_IPV6,
                 libc::IPV6_V6ONLY,
-                &v6only as *const _ as *const libc::c_void,
+                (&raw const v6only).cast::<libc::c_void>(),
                 std::mem::size_of::<libc::c_int>() as u32,
             )
         };
@@ -4668,7 +4691,7 @@ mod net_tests {
                 fd,
                 libc::IPPROTO_IPV6,
                 libc::IPV6_V6ONLY,
-                &v6only as *const _ as *const libc::c_void,
+                (&raw const v6only).cast::<libc::c_void>(),
                 std::mem::size_of::<libc::c_int>() as u32,
             )
         };
@@ -4716,7 +4739,7 @@ mod net_tests {
         let ret = unsafe {
             libc::bind(
                 fd,
-                &addr as *const _ as *const libc::sockaddr,
+                (&raw const addr).cast::<libc::sockaddr>(),
                 std::mem::size_of::<libc::sockaddr_in6>() as u32,
             )
         };
@@ -4739,7 +4762,7 @@ mod net_tests {
         let mut bound: libc::sockaddr_in6 = unsafe { std::mem::zeroed() };
         let mut len = std::mem::size_of::<libc::sockaddr_in6>() as u32;
         unsafe {
-            libc::getsockname(fd, &mut bound as *mut _ as *mut libc::sockaddr, &mut len);
+            libc::getsockname(fd, (&raw mut bound).cast::<libc::sockaddr>(), &raw mut len);
         }
         let port = u16::from_be(bound.sin6_port);
         unsafe { libc::close(fd) };
@@ -4764,7 +4787,7 @@ mod net_tests {
         if unsafe {
             libc::bind(
                 fd,
-                &addr as *const _ as *const libc::sockaddr,
+                (&raw const addr).cast::<libc::sockaddr>(),
                 std::mem::size_of::<libc::sockaddr_in>() as u32,
             )
         } < 0
@@ -4785,7 +4808,7 @@ mod net_tests {
         let mut bound: libc::sockaddr_in = unsafe { std::mem::zeroed() };
         let mut len = std::mem::size_of::<libc::sockaddr_in>() as u32;
         unsafe {
-            libc::getsockname(fd, &mut bound as *mut _ as *mut libc::sockaddr, &mut len);
+            libc::getsockname(fd, (&raw mut bound).cast::<libc::sockaddr>(), &raw mut len);
         }
         let port = u16::from_be(bound.sin_port);
         unsafe { libc::close(fd) };
@@ -4800,39 +4823,27 @@ mod fs_tests {
     pub fn run(sub: &str, args: &[String]) -> i32 {
         match sub {
             "io" => {
-                let op = args.get(3).map(String::as_str).unwrap_or("write-read");
-                let path = args
-                    .get(4)
-                    .map(String::as_str)
-                    .unwrap_or("/tmp/fs-test.txt");
+                let op = args.get(3).map_or("write-read", String::as_str);
+                let path = args.get(4).map_or("/tmp/fs-test.txt", String::as_str);
                 test_io(op, path)
             }
             "exec-write" => {
-                let bin_type = args.get(3).map(String::as_str).unwrap_or("pie");
-                let path = args
-                    .get(4)
-                    .map(String::as_str)
-                    .unwrap_or("/tmp/fs-exec.txt");
+                let bin_type = args.get(3).map_or("pie", String::as_str);
+                let path = args.get(4).map_or("/tmp/fs-exec.txt", String::as_str);
                 test_exec_write(bin_type, path)
             }
             // fs-test exec-open-read <binary-type> <path>
             // Fork+exec child that writes AND keeps fd open; parent reads while child alive.
             "exec-open-read" => {
-                let bin_type = args.get(3).map(String::as_str).unwrap_or("pie");
-                let path = args
-                    .get(4)
-                    .map(String::as_str)
-                    .unwrap_or("/tmp/fs-open.txt");
+                let bin_type = args.get(3).map_or("pie", String::as_str);
+                let path = args.get(4).map_or("/tmp/fs-open.txt", String::as_str);
                 test_exec_open_read(bin_type, path)
             }
             // Diagnostic: pinpoint where exec-open-read hangs
             // Helper: write to file then sleep (keeps process alive with file written)
             "do-write-sleep" => {
-                let path = args
-                    .get(3)
-                    .map(String::as_str)
-                    .unwrap_or("/tmp/fs-open.txt");
-                let data = args.get(4).map(String::as_str).unwrap_or("OPEN_WRITE_DATA");
+                let path = args.get(3).map_or("/tmp/fs-open.txt", String::as_str);
+                let data = args.get(4).map_or("OPEN_WRITE_DATA", String::as_str);
                 std::fs::write(path, data.as_bytes()).unwrap_or_else(|e| {
                     eprintln!("do-write-sleep: write failed: {e}");
                     std::process::exit(1);
@@ -4843,13 +4854,10 @@ mod fs_tests {
             }
             // Called by exec-write to actually write the file
             "do-write" => {
-                let path = args
-                    .get(3)
-                    .map(String::as_str)
-                    .unwrap_or("/tmp/fs-exec.txt");
-                let data = args.get(4).map(String::as_str).unwrap_or("EXEC_WRITE_DATA");
+                let path = args.get(3).map_or("/tmp/fs-exec.txt", String::as_str);
+                let data = args.get(4).map_or("EXEC_WRITE_DATA", String::as_str);
                 match std::fs::write(path, data.as_bytes()) {
-                    Ok(_) => 0,
+                    Ok(()) => 0,
                     Err(e) => {
                         eprintln!("do-write: {e}");
                         1
@@ -4875,12 +4883,11 @@ mod fs_tests {
                 .args(["fs-test", "do-write", path, data])
                 .output(),
             "nonpie" => {
-                let bin = match crate::find_nonpie_binary() {
-                    Some(b) => b,
-                    None => {
-                        println!("FS_ERR:op=exec-write,bin=nonpie,err=nonpie binary not found");
-                        return 1;
-                    }
+                let bin = if let Some(b) = crate::find_nonpie_binary() {
+                    b
+                } else {
+                    println!("FS_ERR:op=exec-write,bin=nonpie,err=nonpie binary not found");
+                    return 1;
                 };
                 std::process::Command::new(&bin)
                     .args(["fs-test", "do-write", path, data])
@@ -4940,13 +4947,14 @@ mod fs_tests {
 
         let bin = match bin_type {
             "pie" => self_exe.to_string(),
-            "nonpie" => match crate::find_nonpie_binary() {
-                Some(b) => b,
-                None => {
+            "nonpie" => {
+                if let Some(b) = crate::find_nonpie_binary() {
+                    b
+                } else {
                     println!("FS_ERR:op=exec-open-read,bin=nonpie,err=nonpie binary not found");
                     return 1;
                 }
-            },
+            }
             other => {
                 println!("FS_ERR:op=exec-open-read,unknown_bin_type={other}");
                 return 1;
@@ -4992,7 +5000,7 @@ mod fs_tests {
         // Clean up — kill may hang on wait, so don't block on it
         let _ = child.kill();
         // Don't call child.wait() — it can hang in litebox
-        result.map_or(1, |s| if s == data { 0 } else { 1 })
+        result.map_or(1, |s| i32::from(s != data))
     }
 
     fn test_io(op: &str, path: &str) -> i32 {
@@ -5127,13 +5135,13 @@ mod fs_tests {
                 if pid == 0 {
                     // Child: write to file and exit
                     match std::fs::write(path, b"FORK_DATA") {
-                        Ok(_) => std::process::exit(0),
+                        Ok(()) => std::process::exit(0),
                         Err(_) => std::process::exit(1),
                     }
                 }
                 // Parent: wait for child, then read
                 let mut status: i32 = 0;
-                unsafe { libc::waitpid(pid, &mut status, 0) };
+                unsafe { libc::waitpid(pid, &raw mut status, 0) };
                 match std::fs::read_to_string(path) {
                     Ok(s) if s == "FORK_DATA" => {
                         println!("FS_OK:op={op},path={path}");
@@ -5219,7 +5227,7 @@ mod fs_tests {
                 if pid == 0 {
                     // Child: write to inherited fd, then sleep (keep fd open)
                     let msg = b"CHILD_WROTE_THIS\n";
-                    unsafe { libc::write(fd, msg.as_ptr() as *const _, msg.len()) };
+                    unsafe { libc::write(fd, msg.as_ptr().cast(), msg.len()) };
                     std::thread::sleep(std::time::Duration::from_secs(5));
                     std::process::exit(0);
                 }

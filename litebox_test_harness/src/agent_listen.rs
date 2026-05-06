@@ -36,12 +36,11 @@ pub fn run(self_exe: &str, port: u16) {
     // to the TCP socket so the existing agent_loop (which reads stdin and
     // writes stdout) transparently works over TCP.
     unsafe {
-        if libc::dup2(fd, 0) < 0 {
-            panic!("agent-listen: dup2 to stdin failed");
-        }
-        if libc::dup2(fd, 1) < 0 {
-            panic!("agent-listen: dup2 to stdout failed");
-        }
+        assert!(libc::dup2(fd, 0) >= 0, "agent-listen: dup2 to stdin failed");
+        assert!(
+            libc::dup2(fd, 1) >= 0,
+            "agent-listen: dup2 to stdout failed"
+        );
         // Close the original fd (now duplicated onto 0 and 1).
         if fd > 2 {
             libc::close(fd);

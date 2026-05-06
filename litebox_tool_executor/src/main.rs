@@ -98,29 +98,29 @@ fn main() -> anyhow::Result<()> {
     // When --debug is set, re-exec the entire tool_executor under gdbserver
     // so that both the broker and runner (spawned as children) are debuggable.
     // GDB can then use `set detach-on-fork off` to follow all processes.
-    if let Some(port) = cli.debug {
-        if std::env::var("_LITEBOX_UNDER_GDB").is_err() {
-            let self_exe = std::env::current_exe()?;
-            let args: Vec<String> = std::env::args().collect();
-            eprintln!();
-            eprintln!("=== GDB DEBUG MODE ===");
-            eprintln!("  gdbserver listening on port {port}");
-            eprintln!("  Connect from host with:");
-            eprintln!(
-                "    gdb -ex 'target remote localhost:{port}' {}",
-                self_exe.display()
-            );
-            eprintln!("  Or use: bash dev_tools/gdb-connect.sh --port {port}");
-            eprintln!("======================");
-            eprintln!();
-            let err = std::process::Command::new("gdbserver")
-                .arg(format!(":{port}"))
-                .arg(&self_exe)
-                .args(&args[1..])
-                .env("_LITEBOX_UNDER_GDB", "1")
-                .status()?;
-            std::process::exit(err.code().unwrap_or(1));
-        }
+    if let Some(port) = cli.debug
+        && std::env::var("_LITEBOX_UNDER_GDB").is_err()
+    {
+        let self_exe = std::env::current_exe()?;
+        let args: Vec<String> = std::env::args().collect();
+        eprintln!();
+        eprintln!("=== GDB DEBUG MODE ===");
+        eprintln!("  gdbserver listening on port {port}");
+        eprintln!("  Connect from host with:");
+        eprintln!(
+            "    gdb -ex 'target remote localhost:{port}' {}",
+            self_exe.display()
+        );
+        eprintln!("  Or use: bash dev_tools/gdb-connect.sh --port {port}");
+        eprintln!("======================");
+        eprintln!();
+        let err = std::process::Command::new("gdbserver")
+            .arg(format!(":{port}"))
+            .arg(&self_exe)
+            .args(&args[1..])
+            .env("_LITEBOX_UNDER_GDB", "1")
+            .status()?;
+        std::process::exit(err.code().unwrap_or(1));
     }
 
     if !cli.rootfs.exists() {
@@ -209,7 +209,7 @@ fn civil_from_days(days: i64) -> (i64, u64, u64) {
     let d = doy - (153 * mp + 2) / 5 + 1;
     let m = if mp < 10 { mp + 3 } else { mp - 9 };
     let y = if m <= 2 { y + 1 } else { y };
-    (y, m as u64, d as u64)
+    (y, m, d)
 }
 
 /// Remove old log files (.jsonl, .broker.log) from a directory, keeping only
@@ -250,47 +250,44 @@ fn cleanup_old_logs(dir: &std::path::Path) {
 fn print_build_info(audit_log_file: Option<&std::path::Path>) {
     let mut lines = Vec::new();
 
-    if let Ok(exe) = std::env::current_exe() {
-        if let Ok(meta) = std::fs::metadata(&exe) {
-            if let Ok(modified) = meta.modified() {
-                let age = std::time::SystemTime::now()
-                    .duration_since(modified)
-                    .unwrap_or_default();
-                lines.push(format!(
-                    "Tool executor: {} (built {}s ago)",
-                    exe.display(),
-                    age.as_secs()
-                ));
-            }
-        }
+    if let Ok(exe) = std::env::current_exe()
+        && let Ok(meta) = std::fs::metadata(&exe)
+        && let Ok(modified) = meta.modified()
+    {
+        let age = std::time::SystemTime::now()
+            .duration_since(modified)
+            .unwrap_or_default();
+        lines.push(format!(
+            "Tool executor: {} (built {}s ago)",
+            exe.display(),
+            age.as_secs()
+        ));
     }
-    if let Ok(runner) = find_runner() {
-        if let Ok(meta) = std::fs::metadata(&runner) {
-            if let Ok(modified) = meta.modified() {
-                let age = std::time::SystemTime::now()
-                    .duration_since(modified)
-                    .unwrap_or_default();
-                lines.push(format!(
-                    "Runner: {} (built {}s ago)",
-                    runner.display(),
-                    age.as_secs()
-                ));
-            }
-        }
+    if let Ok(runner) = find_runner()
+        && let Ok(meta) = std::fs::metadata(&runner)
+        && let Ok(modified) = meta.modified()
+    {
+        let age = std::time::SystemTime::now()
+            .duration_since(modified)
+            .unwrap_or_default();
+        lines.push(format!(
+            "Runner: {} (built {}s ago)",
+            runner.display(),
+            age.as_secs()
+        ));
     }
-    if let Ok(broker) = find_broker() {
-        if let Ok(meta) = std::fs::metadata(&broker) {
-            if let Ok(modified) = meta.modified() {
-                let age = std::time::SystemTime::now()
-                    .duration_since(modified)
-                    .unwrap_or_default();
-                lines.push(format!(
-                    "Broker: {} (built {}s ago)",
-                    broker.display(),
-                    age.as_secs()
-                ));
-            }
-        }
+    if let Ok(broker) = find_broker()
+        && let Ok(meta) = std::fs::metadata(&broker)
+        && let Ok(modified) = meta.modified()
+    {
+        let age = std::time::SystemTime::now()
+            .duration_since(modified)
+            .unwrap_or_default();
+        lines.push(format!(
+            "Broker: {} (built {}s ago)",
+            broker.display(),
+            age.as_secs()
+        ));
     }
 
     for line in &lines {
@@ -298,16 +295,15 @@ fn print_build_info(audit_log_file: Option<&std::path::Path>) {
     }
 
     // Also write to the audit log file so the tail script can show them.
-    if let Some(path) = audit_log_file {
-        if let Ok(mut f) = std::fs::OpenOptions::new()
+    if let Some(path) = audit_log_file
+        && let Ok(mut f) = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
             .open(path)
-        {
-            use std::io::Write;
-            for line in &lines {
-                let _ = writeln!(f, "# {line}");
-            }
+    {
+        use std::io::Write;
+        for line in &lines {
+            let _ = writeln!(f, "# {line}");
         }
     }
 }
@@ -761,7 +757,7 @@ fn vscode_server(cli: &Cli, audit_log_file: Option<&std::path::Path>) -> anyhow:
         .output()
         .ok()
         .and_then(|o| String::from_utf8(o.stdout).ok())
-        .map(|s| s.trim().split_whitespace().next().unwrap_or("").to_string())
+        .map(|s| s.split_whitespace().next().unwrap_or("").to_string())
         .unwrap_or_default();
 
     let host_ip = if !wsl_ip.is_empty() && wsl_ip != "127.0.0.1" {

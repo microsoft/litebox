@@ -60,7 +60,8 @@ pub struct Test {
     /// up the non-PIE infrastructure even if no static `NP`/`NPC`/
     /// `D{3..5}` handle was required.
     pub(crate) needs_nonpie_for_ephemerals: bool,
-    pub(crate) run: Box<dyn FnOnce(&'_ mut TestRunner) -> Pin<Box<dyn Future<Output = TestOutcome> + '_>>>,
+    pub(crate) run:
+        Box<dyn FnOnce(&'_ mut TestRunner) -> Pin<Box<dyn Future<Output = TestOutcome> + '_>>>,
 }
 
 /// Detect whether we're running inside litebox or on native Linux.
@@ -107,12 +108,11 @@ fn detect_runtime_environment() -> String {
         )
     } else if pid1_is_litebox && in_docker {
         // Running inside litebox's Docker container but NOT through the runner.
-        format!(
-            "WARNING: litebox Docker container but NOT sandboxed! \
+        "WARNING: litebox Docker container but NOT sandboxed! \
              Tests use native kernel, not litebox shim. \
              To test litebox, run through litebox_tool_executor: \
              litebox_tool_executor --rootfs / --record-baseline -- litebox_test_harness spawn-tree"
-        )
+            .to_string()
     } else if in_docker {
         // Inside a Docker container (e.g., litebox-test) — native gold standard.
         "native Docker (litebox-test container — gold standard, real kernel syscalls)".to_string()
@@ -788,33 +788,30 @@ async fn run_tests(self_exe: &str, filter: Option<&str>) -> Vec<TestResult> {
         runner.spawn_tree(wants_nonpie, wants_e).await;
         for test in new_filtered {
             let timeout_dur = Duration::from_secs(test.timeout_secs);
-            match tokio::time::timeout(timeout_dur, (test.run)(&mut runner)).await {
-                Ok(outcome) => {
-                    if let Some(reason) = &test.xfail {
-                        runner.record_xfail(
-                            &test.id,
-                            &outcome.agent,
-                            outcome.pass,
-                            reason,
-                            &outcome.detail,
-                        );
-                    } else {
-                        runner.record(&test.id, &outcome.agent, outcome.pass, &outcome.detail);
-                    }
-                }
-                Err(_) => {
-                    runner.record(
+            if let Ok(outcome) = tokio::time::timeout(timeout_dur, (test.run)(&mut runner)).await {
+                if let Some(reason) = &test.xfail {
+                    runner.record_xfail(
                         &test.id,
-                        "?",
-                        false,
-                        &format!("test timeout ({}s)", test.timeout_secs),
+                        &outcome.agent,
+                        outcome.pass,
+                        reason,
+                        &outcome.detail,
                     );
-                    // Agent stream is desynchronized — poison all agents
-                    // so subsequent tests fail fast.
-                    let ids: Vec<String> = runner.children.keys().cloned().collect();
-                    for id in ids {
-                        runner.poison_agent(&id).await;
-                    }
+                } else {
+                    runner.record(&test.id, &outcome.agent, outcome.pass, &outcome.detail);
+                }
+            } else {
+                runner.record(
+                    &test.id,
+                    "?",
+                    false,
+                    &format!("test timeout ({}s)", test.timeout_secs),
+                );
+                // Agent stream is desynchronized — poison all agents
+                // so subsequent tests fail fast.
+                let ids: Vec<String> = runner.children.keys().cloned().collect();
+                for id in ids {
+                    runner.poison_agent(&id).await;
                 }
             }
         }
@@ -864,8 +861,7 @@ fn filter_needs_nonpie(tests: &[Test]) -> bool {
         return true;
     }
     tests.iter().any(|t| {
-        t.needs_nonpie_for_ephemerals
-            || t.declared_agents.iter().any(|a| NONPIE.contains(a))
+        t.needs_nonpie_for_ephemerals || t.declared_agents.iter().any(|a| NONPIE.contains(a))
     })
 }
 

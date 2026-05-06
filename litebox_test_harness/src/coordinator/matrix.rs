@@ -105,7 +105,6 @@ impl Topology {
             Self::DeepNonPie => "deep_nonpie",
         }
     }
-
 }
 
 // ── Xfail registry ──
@@ -178,7 +177,6 @@ impl FsScope {
 // ═══════════════════════════════════════════════════════════════════
 // NETWORK
 // ═══════════════════════════════════════════════════════════════════
-
 
 /// Net test descriptor. Listener listens, connector connects.
 struct NetTestCase {
@@ -1029,7 +1027,6 @@ pub(super) fn register_unix_addr_tests(reg: &mut Registry<'_>) {
 
 pub(super) fn register_exec_tests(reg: &mut Registry<'_>) {
     for &agent in EXEC_AGENTS {
-
         matrix_test(
             reg,
             format!("X.echo.{agent}"),
@@ -1075,7 +1072,6 @@ pub(super) fn register_exec_tests(reg: &mut Registry<'_>) {
 
 pub(super) fn register_env_tests(reg: &mut Registry<'_>) {
     for &agent in EXEC_AGENTS {
-
         for var in ["HOME", "PATH"] {
             matrix_test(
                 reg,
@@ -1565,7 +1561,6 @@ pub(super) fn register_symlink_variants(reg: &mut Registry<'_>) {
 
 pub(super) fn register_unix_tests(reg: &mut Registry<'_>) {
     for tc in unix_test_cases() {
-
         let sock = format!("/tmp/um_{}.sock", tc.name.replace('.', "_"));
         let agent = tc.agent;
         let name = tc.name;
@@ -1884,119 +1879,120 @@ pub(super) fn register_unix_tests(reg: &mut Registry<'_>) {
             }
         }
     }
-        matrix_test(
-            reg,
-            "U.repro.listen",
-            vec![AgentName::D3],
-            move |run, handles| {
-                Box::pin(async move {
-                    let sock = "/tmp/um_repro_xworker.sock".to_string();
-                    let resp = send_to(
-                        run,
-                        &handles,
-                        AgentName::D3,
-                        Command::UnixListen { path: sock.clone() },
-                    )
-                    .await;
-                    let pass = matches!(&resp, Response::UnixListening { .. });
-                    let _ = send_to(
-                        run,
-                        &handles,
-                        AgentName::D3,
-                        Command::UnixUnlisten { path: sock },
-                    )
-                    .await;
-                    super::TestOutcome::new(AgentName::D3.name(), pass, format!("{resp:?}"))
-                })
-            },
-        );
-        matrix_test(
-            reg,
-            "U.repro.same_agent",
-            vec![AgentName::D3],
-            move |run, handles| {
-                Box::pin(async move {
-                    let sock = "/tmp/um_repro_xworker.sock".to_string();
-                    let resp = send_to(
-                        run,
-                        &handles,
-                        AgentName::D3,
-                        Command::UnixListen { path: sock.clone() },
-                    )
-                    .await;
-                    if !matches!(&resp, Response::UnixListening { .. }) {
-                        return super::TestOutcome::new(
-                            AgentName::D3.name(),
-                            false,
-                            format!("listen failed: {resp:?}"),
-                        );
-                    }
-                    let resp = send_to(
-                        run,
-                        &handles,
-                        AgentName::D3,
-                        Command::UnixConnect {
-                            path: sock.clone(),
-                            data: "SAME_AGENT".to_string(),
-                        },
-                    )
-                    .await;
-                    let pass = matches!(&resp, Response::Connected { echo } if echo.contains("SAME_AGENT"));
-                    let _ = send_to(
-                        run,
-                        &handles,
-                        AgentName::D3,
-                        Command::UnixUnlisten { path: sock },
-                    )
-                    .await;
-                    super::TestOutcome::new(AgentName::D3.name(), pass, format!("{resp:?}"))
-                })
-            },
-        );
-        matrix_test(
-            reg,
-            "U.repro.cross_worker",
-            vec![AgentName::D3, AgentName::D4],
-            move |run, handles| {
-                Box::pin(async move {
-                    let sock = "/tmp/um_repro_xworker.sock".to_string();
-                    let resp = send_to(
-                        run,
-                        &handles,
-                        AgentName::D3,
-                        Command::UnixListen { path: sock.clone() },
-                    )
-                    .await;
-                    if !matches!(&resp, Response::UnixListening { .. }) {
-                        return super::TestOutcome::new(
-                            AgentName::D4.name(),
-                            false,
-                            format!("listen failed: {resp:?}"),
-                        );
-                    }
-                    let resp = send_to(
-                        run,
-                        &handles,
-                        AgentName::D4,
-                        Command::UnixConnect {
-                            path: sock.clone(),
-                            data: "CROSS_WORKER".to_string(),
-                        },
-                    )
-                    .await;
-                    let pass = matches!(&resp, Response::Connected { echo } if echo.contains("CROSS_WORKER"));
-                    let _ = send_to(
-                        run,
-                        &handles,
-                        AgentName::D3,
-                        Command::UnixUnlisten { path: sock },
-                    )
-                    .await;
-                    super::TestOutcome::new(AgentName::D4.name(), pass, format!("{resp:?}"))
-                })
-            },
-        );
-
+    matrix_test(
+        reg,
+        "U.repro.listen",
+        vec![AgentName::D3],
+        move |run, handles| {
+            Box::pin(async move {
+                let sock = "/tmp/um_repro_xworker.sock".to_string();
+                let resp = send_to(
+                    run,
+                    &handles,
+                    AgentName::D3,
+                    Command::UnixListen { path: sock.clone() },
+                )
+                .await;
+                let pass = matches!(&resp, Response::UnixListening { .. });
+                let _ = send_to(
+                    run,
+                    &handles,
+                    AgentName::D3,
+                    Command::UnixUnlisten { path: sock },
+                )
+                .await;
+                super::TestOutcome::new(AgentName::D3.name(), pass, format!("{resp:?}"))
+            })
+        },
+    );
+    matrix_test(
+        reg,
+        "U.repro.same_agent",
+        vec![AgentName::D3],
+        move |run, handles| {
+            Box::pin(async move {
+                let sock = "/tmp/um_repro_xworker.sock".to_string();
+                let resp = send_to(
+                    run,
+                    &handles,
+                    AgentName::D3,
+                    Command::UnixListen { path: sock.clone() },
+                )
+                .await;
+                if !matches!(&resp, Response::UnixListening { .. }) {
+                    return super::TestOutcome::new(
+                        AgentName::D3.name(),
+                        false,
+                        format!("listen failed: {resp:?}"),
+                    );
+                }
+                let resp = send_to(
+                    run,
+                    &handles,
+                    AgentName::D3,
+                    Command::UnixConnect {
+                        path: sock.clone(),
+                        data: "SAME_AGENT".to_string(),
+                    },
+                )
+                .await;
+                let pass =
+                    matches!(&resp, Response::Connected { echo } if echo.contains("SAME_AGENT"));
+                let _ = send_to(
+                    run,
+                    &handles,
+                    AgentName::D3,
+                    Command::UnixUnlisten { path: sock },
+                )
+                .await;
+                super::TestOutcome::new(AgentName::D3.name(), pass, format!("{resp:?}"))
+            })
+        },
+    );
+    matrix_test(
+        reg,
+        "U.repro.cross_worker",
+        vec![AgentName::D3, AgentName::D4],
+        move |run, handles| {
+            Box::pin(async move {
+                let sock = "/tmp/um_repro_xworker.sock".to_string();
+                let resp = send_to(
+                    run,
+                    &handles,
+                    AgentName::D3,
+                    Command::UnixListen { path: sock.clone() },
+                )
+                .await;
+                if !matches!(&resp, Response::UnixListening { .. }) {
+                    return super::TestOutcome::new(
+                        AgentName::D4.name(),
+                        false,
+                        format!("listen failed: {resp:?}"),
+                    );
+                }
+                let resp = send_to(
+                    run,
+                    &handles,
+                    AgentName::D4,
+                    Command::UnixConnect {
+                        path: sock.clone(),
+                        data: "CROSS_WORKER".to_string(),
+                    },
+                )
+                .await;
+                let pass =
+                    matches!(&resp, Response::Connected { echo } if echo.contains("CROSS_WORKER"));
+                let _ = send_to(
+                    run,
+                    &handles,
+                    AgentName::D3,
+                    Command::UnixUnlisten { path: sock },
+                )
+                .await;
+                super::TestOutcome::new(AgentName::D4.name(), pass, format!("{resp:?}"))
+            })
+        },
+    );
 }
 
 pub(super) fn register_matrix(reg: &mut Registry<'_>) {

@@ -97,7 +97,6 @@ impl<'b, 'a: 'b> TestBuilder<'b, 'a> {
         self
     }
 
-
     /// Build the test. The closure receives a `RegistrationContext`
     /// for declaring agent dependencies and must return a closure
     /// that consumes a `RunContext` to execute the test.

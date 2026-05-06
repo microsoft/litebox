@@ -542,7 +542,9 @@ pub(crate) fn register_fork_matrix(reg: &mut Registry<'_>) {
                                             DfBinary::Pie => {
                                                 (self_exe.clone(), vec!["echo-test".into()])
                                             }
-                                            DfBinary::NonPie => (crate::nonpie_binary(), vec!["echo-test".into()]),
+                                            DfBinary::NonPie => {
+                                                (crate::nonpie_binary(), vec!["echo-test".into()])
+                                            }
                                             DfBinary::Node => (
                                                 "/usr/local/bin/node".into(),
                                                 vec![
@@ -679,7 +681,10 @@ pub(crate) fn register_fork_matrix(reg: &mut Registry<'_>) {
         for &(spawn_name, spawn_args) in SPAWN_METHODS {
             let id = format!("XS.{mode}.{spawn_name}");
             let mode_s = mode.to_string();
-            let extra: Vec<String> = spawn_args.iter().map(|s| s.to_string()).collect();
+            let extra: Vec<String> = spawn_args
+                .iter()
+                .map(std::string::ToString::to_string)
+                .collect();
             reg.test("fork", "fork_matrix", id)
                 .timeout(60)
                 .build(move |cx| {
@@ -707,7 +712,7 @@ pub(crate) fn register_fork_matrix(reg: &mut Registry<'_>) {
     // Non-PIE invocation tests
     for nc in NONPIE_CASES {
         let id = format!("XNP.{}", nc.name);
-        let bash_cmd = nc.bash_cmd.map(|s| s.to_string());
+        let bash_cmd = nc.bash_cmd.map(std::string::ToString::to_string);
         reg.test("fork", "fork_matrix", id)
             .timeout(60)
             .build(move |cx| {

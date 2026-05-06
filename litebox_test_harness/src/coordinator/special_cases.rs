@@ -770,10 +770,13 @@ pub(crate) fn register_cross_worker(reg: &mut Registry<'_>) {
         |run| {
             let _ = run.spawn_ephemeral(&r).await;
             let resp = run
-                .forward(&r, Command::FsWrite {
-                            path: "/tmp/xw1.txt".to_string(),
-                            data: "REMOTE_DATA".to_string(),
-                        })
+                .forward(
+                    &r,
+                    Command::FsWrite {
+                        path: "/tmp/xw1.txt".to_string(),
+                        data: "REMOTE_DATA".to_string(),
+                    },
+                )
                 .await;
             let pass = matches!(&resp, Response::Ok { .. });
             super::TestOutcome::new("A", pass, format!("{resp:?}"))
@@ -791,10 +794,13 @@ pub(crate) fn register_cross_worker(reg: &mut Registry<'_>) {
         |run| {
             let _ = run.spawn_ephemeral(&r).await;
             let setup_resp = run
-                .forward(&r, Command::FsWrite {
-                            path: "/tmp/xw1.txt".to_string(),
-                            data: "REMOTE_DATA".to_string(),
-                        })
+                .forward(
+                    &r,
+                    Command::FsWrite {
+                        path: "/tmp/xw1.txt".to_string(),
+                        data: "REMOTE_DATA".to_string(),
+                    },
+                )
                 .await;
             if !matches!(&setup_resp, Response::Ok { .. }) {
                 return super::TestOutcome::new(
@@ -865,9 +871,12 @@ pub(crate) fn register_cross_worker(reg: &mut Registry<'_>) {
                 );
             }
             let resp = run
-                .forward(&r, Command::FsRead {
-                            path: "/tmp/xw2.txt".to_string(),
-                        })
+                .forward(
+                    &r,
+                    Command::FsRead {
+                        path: "/tmp/xw2.txt".to_string(),
+                    },
+                )
                 .await;
             let pass = matches!(&resp, Response::Ok { data: Some(d), .. } if d == "LOCAL_DATA");
             super::TestOutcome::new("A", pass, format!("{resp:?}"))
@@ -885,9 +894,12 @@ pub(crate) fn register_cross_worker(reg: &mut Registry<'_>) {
         |run| {
             let _ = run.spawn_ephemeral(&r).await;
             let resp = run
-                .forward(&r, Command::UnixListen {
-                            path: "/tmp/xw3.sock".to_string(),
-                        })
+                .forward(
+                    &r,
+                    Command::UnixListen {
+                        path: "/tmp/xw3.sock".to_string(),
+                    },
+                )
                 .await;
             let pass = matches!(&resp, Response::UnixListening { .. });
             super::TestOutcome::new("A", pass, format!("{resp:?}"))
@@ -905,9 +917,12 @@ pub(crate) fn register_cross_worker(reg: &mut Registry<'_>) {
         |run| {
             let _ = run.spawn_ephemeral(&r).await;
             let listen_resp = run
-                .forward(&r, Command::UnixListen {
-                            path: "/tmp/xw3c.sock".to_string(),
-                        })
+                .forward(
+                    &r,
+                    Command::UnixListen {
+                        path: "/tmp/xw3c.sock".to_string(),
+                    },
+                )
                 .await;
             if !matches!(&listen_resp, Response::UnixListening { .. }) {
                 return super::TestOutcome::new(
@@ -977,10 +992,13 @@ pub(crate) fn register_cross_worker(reg: &mut Registry<'_>) {
                 );
             }
             let resp = run
-                .forward(&r, Command::UnixConnect {
-                            path: "/tmp/xw4c.sock".to_string(),
-                            data: "XW_HELLO2".to_string(),
-                        })
+                .forward(
+                    &r,
+                    Command::UnixConnect {
+                        path: "/tmp/xw4c.sock".to_string(),
+                        data: "XW_HELLO2".to_string(),
+                    },
+                )
                 .await;
             let pass = matches!(&resp, Response::Connected { echo } if echo.contains("XW_HELLO2"));
             super::TestOutcome::new("A", pass, format!("{resp:?}"))
@@ -997,9 +1015,7 @@ pub(crate) fn register_cross_worker(reg: &mut Registry<'_>) {
         ephemerals[r = (AgentName::A, "R", SpawnKind::NonPie)],
         |run| {
             let _ = run.spawn_ephemeral(&r).await;
-            let resp = run
-                .forward(&r, Command::NetListen { port: 0 })
-                .await;
+            let resp = run.forward(&r, Command::NetListen { port: 0 }).await;
             let pass = matches!(&resp, Response::Listening { .. });
             super::TestOutcome::new("A", pass, format!("{resp:?}"))
         }
@@ -1015,9 +1031,7 @@ pub(crate) fn register_cross_worker(reg: &mut Registry<'_>) {
         ephemerals[r = (AgentName::A, "R", SpawnKind::NonPie)],
         |run| {
             let _ = run.spawn_ephemeral(&r).await;
-            let listen_resp = run
-                .forward(&r, Command::NetListen { port: 0 })
-                .await;
+            let listen_resp = run.forward(&r, Command::NetListen { port: 0 }).await;
             let port = match &listen_resp {
                 Response::Listening { port } => *port,
                 _ => {
@@ -1039,9 +1053,7 @@ pub(crate) fn register_cross_worker(reg: &mut Registry<'_>) {
                 .await;
             let pass =
                 matches!(&resp, Response::Connected { echo } if echo.contains("XW_TCP_HELLO"));
-            let _ = run
-                .forward(&r, Command::NetUnlisten { port })
-                .await;
+            let _ = run.forward(&r, Command::NetUnlisten { port }).await;
             super::TestOutcome::new("A", pass, format!("{resp:?}"))
         }
     );
@@ -1082,10 +1094,13 @@ pub(crate) fn register_cross_worker(reg: &mut Registry<'_>) {
                 }
             };
             let resp = run
-                .forward(&r, Command::NetConnect {
-                            addr: format!("127.0.0.1:{port}"),
-                            data: "XW_TCP_HELLO2".to_string(),
-                        })
+                .forward(
+                    &r,
+                    Command::NetConnect {
+                        addr: format!("127.0.0.1:{port}"),
+                        data: "XW_TCP_HELLO2".to_string(),
+                    },
+                )
                 .await;
             let pass =
                 matches!(&resp, Response::Connected { echo } if echo.contains("XW_TCP_HELLO2"));

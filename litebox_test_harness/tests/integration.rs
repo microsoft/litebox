@@ -273,18 +273,17 @@ fn run_one_test(pass: &str, test_id: &str) -> Result<serde_json::Value, Failed> 
     for line in BufReader::new(stdout).lines() {
         let Ok(line) = line else { break };
         let _ = writeln!(stdout_log_file, "{line}");
-        if found.is_none() {
-            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) {
-                if v.get("test").and_then(|t| t.as_str()) == Some(test_id) {
-                    found = Some(v);
-                    // Don't break — keep tee'ing later lines into
-                    // the log so post-result harness output (e.g.
-                    // teardown_tree messages) is captured for
-                    // forensics. The drain thread takes over when
-                    // we return and finishes draining the rest.
-                    break;
-                }
-            }
+        if found.is_none()
+            && let Ok(v) = serde_json::from_str::<serde_json::Value>(&line)
+            && v.get("test").and_then(|t| t.as_str()) == Some(test_id)
+        {
+            found = Some(v);
+            // Don't break — keep tee'ing later lines into
+            // the log so post-result harness output (e.g.
+            // teardown_tree messages) is captured for
+            // forensics. The drain thread takes over when
+            // we return and finishes draining the rest.
+            break;
         }
     }
 
@@ -344,7 +343,7 @@ fn main() {
     // (see `spawn_drain`). Concurrent docker runs are bounded by
     // LITEBOX_TEST_JOBS (default 5).
     let test_ids = get_test_ids();
-    for tid in test_ids.iter().cloned() {
+    for tid in test_ids {
         let tid2 = tid.clone();
         trials.push(Trial::test(format!("native::{tid}"), move || {
             run_pass_group("native", &tid2)

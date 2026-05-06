@@ -81,15 +81,14 @@ async fn agent_loop(self_exe: &str) {
 
             Command::SpawnRemote { children: names } => {
                 // Use the non-PIE binary to force remote worker migration.
-                let remote_exe = match crate::find_nonpie_binary() {
-                    Some(p) => p,
-                    None => {
-                        respond(&Response::Error {
-                            error: "nonpie binary not found".to_string(),
-                        })
-                        .await;
-                        continue;
-                    }
+                let remote_exe = if let Some(p) = crate::find_nonpie_binary() {
+                    p
+                } else {
+                    respond(&Response::Error {
+                        error: "nonpie binary not found".to_string(),
+                    })
+                    .await;
+                    continue;
                 };
                 for name in &names {
                     match spawn_child(&remote_exe, name).await {
@@ -121,16 +120,17 @@ async fn agent_loop(self_exe: &str) {
                 inherit_listen_ports,
             } => {
                 let exe = match binary.as_str() {
-                    "nonpie" => match crate::find_nonpie_binary() {
-                        Some(p) => p,
-                        None => {
+                    "nonpie" => {
+                        if let Some(p) = crate::find_nonpie_binary() {
+                            p
+                        } else {
                             respond(&Response::Error {
                                 error: "nonpie binary not found".to_string(),
                             })
                             .await;
                             continue;
                         }
-                    },
+                    }
                     _ => self_exe.to_string(), // "self" or default
                 };
 
@@ -436,12 +436,12 @@ async fn agent_loop(self_exe: &str) {
                     match cmd.spawn() {
                         Ok(mut child) => {
                             // Write stdin content if provided.
-                            if let Some(content) = stdin_content {
-                                if let Some(mut child_stdin) = child.stdin.take() {
-                                    use tokio::io::AsyncWriteExt;
-                                    let _ = child_stdin.write_all(content.as_bytes()).await;
-                                    // drop closes the pipe
-                                }
+                            if let Some(content) = stdin_content
+                                && let Some(mut child_stdin) = child.stdin.take()
+                            {
+                                use tokio::io::AsyncWriteExt;
+                                let _ = child_stdin.write_all(content.as_bytes()).await;
+                                // drop closes the pipe
                             }
                             let pid = child.id().unwrap_or(0);
                             background_pids.push(child);
@@ -470,12 +470,12 @@ async fn agent_loop(self_exe: &str) {
                     };
 
                     // Write stdin content if provided.
-                    if let Some(content) = stdin_content {
-                        if let Some(mut child_stdin) = child.stdin.take() {
-                            use tokio::io::AsyncWriteExt;
-                            let _ = child_stdin.write_all(content.as_bytes()).await;
-                            // drop closes the pipe
-                        }
+                    if let Some(content) = stdin_content
+                        && let Some(mut child_stdin) = child.stdin.take()
+                    {
+                        use tokio::io::AsyncWriteExt;
+                        let _ = child_stdin.write_all(content.as_bytes()).await;
+                        // drop closes the pipe
                     }
 
                     let mut child_stdout = child.stdout.take().unwrap();
@@ -534,8 +534,7 @@ async fn agent_loop(self_exe: &str) {
 
             Command::CwdGet => {
                 let cwd = std::env::current_dir()
-                    .map(|p| p.display().to_string())
-                    .unwrap_or_else(|e| format!("ERROR: {e}"));
+                    .map_or_else(|e| format!("ERROR: {e}"), |p| p.display().to_string());
                 respond(&Response::Ok { data: Some(cwd) }).await;
             }
 
@@ -644,7 +643,7 @@ async fn agent_loop(self_exe: &str) {
                     let (read_fd, write_fd) = (pipe_fds[0], pipe_fds[1]);
                     let data = b"poll_test_data";
                     unsafe {
-                        libc::write(write_fd, data.as_ptr() as *const _, data.len());
+                        libc::write(write_fd, data.as_ptr().cast(), data.len());
                     }
                     let mut fds = [libc::pollfd {
                         fd: read_fd,
@@ -667,7 +666,7 @@ async fn agent_loop(self_exe: &str) {
                         respond(&Response::Ok {
                             data: Some(status.to_string()),
                         })
-                        .await
+                        .await;
                     }
                     Err(e) => respond(&Response::Error { error: e }).await,
                 }
@@ -713,7 +712,7 @@ async fn agent_loop(self_exe: &str) {
                         }
                         // Use inode as proxy for pair_id.
                         let mut stat: libc::stat = unsafe { std::mem::zeroed() };
-                        if unsafe { libc::fstat(pipe_fds[0], &mut stat) } == 0 {
+                        if unsafe { libc::fstat(pipe_fds[0], &raw mut stat) } == 0 {
                             first_batch.insert(stat.st_ino);
                         }
                         fds.push(pipe_fds);
@@ -731,7 +730,7 @@ async fn agent_loop(self_exe: &str) {
                             return Err("pipe() failed".into());
                         }
                         let mut stat: libc::stat = unsafe { std::mem::zeroed() };
-                        if unsafe { libc::fstat(pipe_fds[0], &mut stat) } == 0
+                        if unsafe { libc::fstat(pipe_fds[0], &raw mut stat) } == 0
                             && first_batch.contains(&stat.st_ino)
                         {
                             collisions += 1;
@@ -811,7 +810,7 @@ async fn agent_loop(self_exe: &str) {
                         }
                     }));
                     if delay_ms > 0 {
-                        tokio::time::sleep(Duration::from_millis(delay_ms as u64)).await;
+                        tokio::time::sleep(Duration::from_millis(u64::from(delay_ms))).await;
                     }
                 }
                 let mut success = 0u32;
