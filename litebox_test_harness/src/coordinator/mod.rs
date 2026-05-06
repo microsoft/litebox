@@ -674,10 +674,10 @@ pub fn collect_all_tests() -> Vec<Test> {
     let mut tests: Vec<Test> = Vec::new();
     register_canary(&mut tests);
     special_cases::register_netlink(&mut tests);
-    concurrent_fork::register_concurrent_fork_pipeline(&mut tests);
-    concurrent_fork::register_concurrent_exec(&mut tests);
-    concurrent_fork::register_vscode_install_pipeline(&mut tests);
-    concurrent_fork::register_concurrent_fs_rwlock(&mut tests);
+    concurrent_fork::register_concurrent_fork_pipeline(&mut registry::Registry::new(&mut tests));
+    concurrent_fork::register_concurrent_exec(&mut registry::Registry::new(&mut tests));
+    concurrent_fork::register_vscode_install_pipeline(&mut registry::Registry::new(&mut tests));
+    concurrent_fork::register_concurrent_fs_rwlock(&mut registry::Registry::new(&mut tests));
     special_cases::register_net_ipv6(&mut tests);
     special_cases::register_terminal_ioctl(&mut tests);
     special_cases::register_node_exit(&mut tests);
