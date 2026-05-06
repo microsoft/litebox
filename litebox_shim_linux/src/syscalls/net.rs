@@ -1033,7 +1033,7 @@ impl<FS: ShimFS> GlobalState<FS> {
         };
         let is_nonblock = self.get_status(&fd).contains(OFlags::NONBLOCK);
         let proxy = self.get_proxy(&fd)?;
-        match cx.with_timeout(linger_timeout).wait_on_events(
+        let result = match cx.with_timeout(linger_timeout).wait_on_events(
             is_nonblock,
             Events::HUP,
             |observer, filter| {
@@ -1066,7 +1066,14 @@ impl<FS: ShimFS> GlobalState<FS> {
                     .map_err(Errno::from)
             }
             Err(e) => Err(e.into()),
-        }
+        };
+        // Wake the network worker so the FIN we just queued goes out and any
+        // peer connection (e.g. loopback in the same litebox instance)
+        // observes the CloseWait transition promptly. Without this wake, a
+        // peer process reading from the connection can block indefinitely
+        // because its receive-side never sees EOF.
+        litebox_platform_multiplex::platform().wake_network_worker();
+        result
     }
 }
 
