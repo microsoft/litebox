@@ -196,6 +196,24 @@ const TRR_CASES: &[TrrCase] = &[
         connector: AgentName::A,
         count: 20,
     },
+    TrrCase {
+        name: "parent_child",
+        listener: AgentName::AA,
+        connector: AgentName::A,
+        count: 5,
+    },
+    TrrCase {
+        name: "child_parent",
+        listener: AgentName::A,
+        connector: AgentName::AA,
+        count: 5,
+    },
+    TrrCase {
+        name: "depth2",
+        listener: AgentName::AAA,
+        connector: AgentName::AAB,
+        count: 5,
+    },
 ];
 
 // ═══════════════════════════════════════════════════════════════════
@@ -359,6 +377,26 @@ fn register_tcp_reconnect_stress_tests(reg: &mut Registry<'_>) {
 }
 
 fn register_tcp_cross_worker_concurrent_tests(reg: &mut Registry<'_>) {
+    #[derive(Clone, Copy)]
+    struct StableCase {
+        name: &'static str,
+        listener: AgentName,
+        connector: AgentName,
+    }
+
+    const STABLE_CASES: &[StableCase] = &[
+        StableCase {
+            name: "sibling",
+            listener: AgentName::B,
+            connector: AgentName::A,
+        },
+        StableCase {
+            name: "depth2",
+            listener: AgentName::D4,
+            connector: AgentName::D5,
+        },
+    ];
+
     let mut port = 20_400u16;
     for &count in TW_COUNTS {
         {
@@ -427,6 +465,62 @@ fn register_tcp_cross_worker_concurrent_tests(reg: &mut Registry<'_>) {
                         })
                     })
                 });
+        }
+
+        if count == 1 {
+            for case in STABLE_CASES {
+                let test_id = format!("TW.{}.x{count}", case.name);
+                let p = port;
+                port += 1;
+                let listener = case.listener;
+                let connector = case.connector;
+                let label = format!("{}->{}", connector, listener);
+
+                reg.test("stress", "tcp_stress", test_id)
+                    .timeout(180)
+                    .build(move |cx| {
+                        let listener_handle = cx.require(listener);
+                        let connector_handle = cx.require(connector);
+                        let label = label.clone();
+                        Box::new(move |run| {
+                            let label = label.clone();
+                            Box::pin(async move {
+                                let resp = run
+                                    .send(
+                                        &listener_handle,
+                                        crate::protocol::Command::NetListen { port: p },
+                                    )
+                                    .await;
+                                if !matches!(resp, crate::protocol::Response::Listening { .. }) {
+                                    return super::TestOutcome::new(
+                                        &label,
+                                        false,
+                                        format!("listen failed: {resp:?}"),
+                                    );
+                                }
+                                let resp = run
+                                    .send(
+                                        &connector_handle,
+                                        crate::protocol::Command::NetConnectMany {
+                                            addr: format!("127.0.0.1:{p}"),
+                                            data: format!("TW_{}", case.name),
+                                            count,
+                                            delay_ms: 0,
+                                        },
+                                    )
+                                    .await;
+                                let pass = matches!(&resp, crate::protocol::Response::Ok { data: Some(d) } if d == &format!("success={count}/{count}"));
+                                let _ = run
+                                    .send(
+                                        &listener_handle,
+                                        crate::protocol::Command::NetUnlisten { port: p },
+                                    )
+                                    .await;
+                                super::TestOutcome::new(&label, pass, format!("{resp:?}"))
+                            })
+                        })
+                    });
+            }
         }
     }
 }

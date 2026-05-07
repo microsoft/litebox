@@ -24,6 +24,7 @@ pub(crate) fn register_port_router(reg: &mut Registry<'_>) {
     register_fork_background_tests(reg);
     register_fork_listen_inherit_tests(reg);
     register_child_listen_cross_connect_tests(reg);
+    register_depth_axis_tests(reg);
 }
 
 fn register_fork_port_tests(reg: &mut Registry<'_>) {
@@ -504,6 +505,99 @@ fn register_child_listen_cross_connect_tests(reg: &mut Registry<'_>) {
                         .await;
                     let _ = run.forward(&cl_c, Command::Exit).await;
                     super::TestOutcome::new("B", cross_ok, format!("{conn_resp:?}"))
+                })
+            })
+        });
+}
+
+fn register_depth_axis_tests(reg: &mut Registry<'_>) {
+    reg.test("stress", "port_router", "PR.fork_child_parent")
+        .timeout(180)
+        .build(|cx| {
+            let parent = cx.require(AgentName::A);
+            let child = cx.require(AgentName::AA);
+            Box::new(move |run| {
+                Box::pin(async move {
+                    let port = 18510u16;
+                    let listen_resp = run.send(&parent, Command::NetListen { port }).await;
+                    if !matches!(&listen_resp, Response::Listening { port: p } if *p == port) {
+                        return super::TestOutcome::new(
+                            "AA->A",
+                            false,
+                            format!("listen failed: {listen_resp:?}"),
+                        );
+                    }
+                    let exec_resp = run.send(&parent, super::exec(vec!["true".into()])).await;
+                    if !matches!(&exec_resp, Response::ExecResult { exit_code: 0, .. }) {
+                        let _ = run.send(&parent, Command::NetUnlisten { port }).await;
+                        return super::TestOutcome::new(
+                            "AA->A",
+                            false,
+                            format!("fork failed: {exec_resp:?}"),
+                        );
+                    }
+                    let conn_resp = run
+                        .send(
+                            &child,
+                            Command::NetConnect {
+                                addr: format!("127.0.0.1:{port}"),
+                                data: "child_parent_after_fork".into(),
+                            },
+                        )
+                        .await;
+                    let pass = matches!(&conn_resp, Response::Connected { echo } if echo == "child_parent_after_fork");
+                    let _ = run.send(&parent, Command::NetUnlisten { port }).await;
+                    super::TestOutcome::new("AA->A", pass, format!("{conn_resp:?}"))
+                })
+            })
+        });
+
+    reg.test("stress", "port_router", "PR.child_listen_depth2")
+        .timeout(180)
+        .build(|cx| {
+            let connector = cx.require(AgentName::D5);
+            let child = cx.declare_ephemeral(
+                AgentName::D4,
+                "CL_D4",
+                SpawnKind::Fork {
+                    binary: "self",
+                    inherit_listen_ports: vec![],
+                },
+            );
+            Box::new(move |run| {
+                let child = child.clone();
+                Box::pin(async move {
+                    let port = 18521u16;
+                    let spawn_resp = run.spawn_ephemeral(&child).await;
+                    if !matches!(&spawn_resp, Response::Ok { .. }) {
+                        return super::TestOutcome::new(
+                            "D5->CL_D4",
+                            false,
+                            format!("fork failed: {spawn_resp:?}"),
+                        );
+                    }
+                    let listen_resp = run.forward(&child, Command::NetListen { port }).await;
+                    if !matches!(&listen_resp, Response::Listening { port: p } if *p == port) {
+                        let _ = run.forward(&child, Command::Exit).await;
+                        return super::TestOutcome::new(
+                            "D5->CL_D4",
+                            false,
+                            format!("child listen failed: {listen_resp:?}"),
+                        );
+                    }
+                    let conn_resp = run
+                        .send(
+                            &connector,
+                            Command::NetConnect {
+                                addr: format!("127.0.0.1:{port}"),
+                                data: "child_listen_depth2".into(),
+                            },
+                        )
+                        .await;
+                    let pass = matches!(&conn_resp, Response::Connected { echo } if echo == "child_listen_depth2");
+                    let _ = run.forward(&child, Command::NetUnlisten { port }).await;
+                    let _ = run.forward(&child, Command::Exit).await;
+                    super::TestOutcome::new("D5->CL_D4", pass, format!("{conn_resp:?}"))
                 })
             })
         });

@@ -27,6 +27,13 @@ const EXIT_SIZES: &[usize] = &[256, 4096, 65536];
 const EXIT_BINARIES: &[&str] = &["pie", "nonpie"];
 
 const NPIPE_REPS: &[usize] = &[1, 5, 10];
+const NPIPE_AGENTS: &[AgentName] = &[
+    AgentName::A,
+    AgentName::AA,
+    AgentName::B,
+    AgentName::NP,
+    AgentName::D4,
+];
 
 // ═══════════════════════════════════════════════════════════════════
 // POLL: epoll/ppoll IN events (fix 0fb258e2)
@@ -185,7 +192,7 @@ pub(crate) fn register_exit_data_integrity_tests(reg: &mut Registry<'_>) {
 #[allow(clippy::too_many_lines)] // exhaustive registration / runner
 pub(crate) fn register_nonpie_pipe_chain_tests(reg: &mut Registry<'_>) {
     for &reps in NPIPE_REPS {
-        for &agent in DEPTH_AGENTS {
+        for &agent in NPIPE_AGENTS {
             let agent_s = agent.to_string();
             // Sequential non-PIE pattern.
             reg.test(
@@ -2254,14 +2261,24 @@ pub(crate) fn register_pipe_nonblock_tests(reg: &mut Registry<'_>) {
 
 pub(crate) fn register_epoll_socket_tests(reg: &mut Registry<'_>) {
     for &variant in &["direct", "tokio"] {
-        for &agent in AGENTS {
+        for &agent in &[
+            AgentName::A,
+            AgentName::AA,
+            AgentName::B,
+            AgentName::D4,
+            AgentName::D5,
+        ] {
             let port: u16 = match (variant, agent) {
                 ("direct", AgentName::A) => 19990,
                 ("direct", AgentName::AA) => 19991,
-                ("direct", _) => 19992,
-                ("tokio", AgentName::A) => 19993,
-                ("tokio", AgentName::AA) => 19994,
-                _ => 19995,
+                ("direct", AgentName::B) => 19992,
+                ("direct", AgentName::D4) => 19993,
+                ("direct", _) => 19994,
+                ("tokio", AgentName::A) => 19995,
+                ("tokio", AgentName::AA) => 19996,
+                ("tokio", AgentName::B) => 19997,
+                ("tokio", AgentName::D4) => 19998,
+                _ => 19999,
             };
 
             // EP.{variant}.accept.{agent}
