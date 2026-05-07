@@ -149,70 +149,6 @@ async fn agent_loop(self_exe: &str) {
                 }
             }
 
-            Command::NetAccept { port, timeout_secs } => {
-                // Accept one connection on an already-listening port.
-                // The echo handler is already running from NetListen —
-                // we just wait for one connection to arrive and report.
-                //
-                // Since the echo handler auto-accepts, NetAccept is
-                // currently equivalent to "verify the listener is working"
-                // by connecting to it locally.
-                let timeout = Duration::from_secs(timeout_secs);
-                match tokio::time::timeout(
-                    timeout,
-                    tokio::net::TcpStream::connect(format!("127.0.0.1:{port}")),
-                )
-                .await
-                {
-                    Ok(Ok(mut stream)) => {
-                        let probe = b"__accept_probe__";
-                        let _ = stream.write_all(probe).await;
-                        let _ = stream.flush().await;
-                        let mut buf = [0u8; 64];
-                        match tokio::time::timeout(Duration::from_secs(5), stream.read(&mut buf))
-                            .await
-                        {
-                            Ok(Ok(n)) if n > 0 => {
-                                respond(&Response::Connected {
-                                    echo: String::from_utf8_lossy(&buf[..n]).to_string(),
-                                })
-                                .await;
-                            }
-                            _ => {
-                                respond(&Response::ConnectFailed {
-                                    error: "accept probe: no echo".to_string(),
-                                })
-                                .await;
-                            }
-                        }
-                    }
-                    Ok(Err(e)) => {
-                        respond(&Response::ConnectFailed {
-                            error: format!("accept probe connect: {e}"),
-                        })
-                        .await;
-                    }
-                    Err(_) => {
-                        respond(&Response::ConnectFailed {
-                            error: "accept probe timeout".to_string(),
-                        })
-                        .await;
-                    }
-                }
-            }
-
-            Command::NetCloseListener { port } => {
-                // Close the listen socket but leave the echo handler task.
-                // This reproduces the parent-close-after-fork pattern.
-                if let Some(task) = listeners.remove(&port) {
-                    task.abort();
-                }
-                respond(&Response::Ok {
-                    data: Some(format!("listener on port {port} closed")),
-                })
-                .await;
-            }
-
             Command::GetPid => {
                 let pid = std::process::id();
                 respond(&Response::Ok {
@@ -678,10 +614,6 @@ async fn agent_loop(self_exe: &str) {
                 let cwd = std::env::current_dir()
                     .map_or_else(|e| format!("ERROR: {e}"), |p| p.display().to_string());
                 respond(&Response::Ok { data: Some(cwd) }).await;
-            }
-
-            Command::Go => {
-                respond(&Response::Ok { data: None }).await;
             }
 
             Command::UnixListen { path } => {

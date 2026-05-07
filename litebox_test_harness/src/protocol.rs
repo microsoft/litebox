@@ -9,10 +9,6 @@ fn default_fork_binary() -> String {
     "self".to_string()
 }
 
-fn default_accept_timeout() -> u64 {
-    10
-}
-
 /// Command sent from parent to child via stdin.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "cmd")]
@@ -56,12 +52,11 @@ pub enum Command {
     ///   4. Child agent reconstructs `TcpListeners` from the raw fds via
     ///      `TcpListener::from_raw_fd(fd)` and registers them in its
     ///      listener map.
-    ///   5. The child's `NetAccept` or echo handler then works on the
-    ///      inherited listener — no re-bind needed.
+    ///   5. The child registers the inherited listener so the echo handler
+    ///      works on it — no re-bind needed.
     ///
-    /// Pair with `NetCloseListener` on the parent to reproduce the full
-    /// VS Code pattern: `NetListen` → Fork(inherit) → `NetCloseListener` →
-    /// child `NetAccept`.
+    /// Pair with ordinary `NetUnlisten` on the parent to reproduce the full
+    /// VS Code pattern once inherited listeners are implemented.
     ///
     /// Currently this pattern is tested via the `tcp-fork-listen-accept`
     /// subcommand (see main.rs), which implements steps 1-4 as a single
@@ -74,20 +69,6 @@ pub enum Command {
         #[serde(default)]
         inherit_listen_ports: Vec<u16>,
     },
-
-    /// Accept one connection on an already-listening TCP port.
-    /// Decouples listen from accept so tests can fork/close between them.
-    #[serde(rename = "net_accept")]
-    NetAccept {
-        port: u16,
-        #[serde(default = "default_accept_timeout")]
-        timeout_secs: u64,
-    },
-
-    /// Close the TCP listen socket on a port (without removing the echo
-    /// handler task). Reproduces the parent-close-after-fork pattern.
-    #[serde(rename = "net_close_listener")]
-    NetCloseListener { port: u16 },
 
     /// Report the agent's process ID.
     #[serde(rename = "get_pid")]
@@ -245,10 +226,6 @@ pub enum Command {
     #[serde(rename = "pipe_pair_id_unique")]
     PipePairIdUnique { count: u32 },
 
-    /// Proceed (used after coordination points).
-    #[serde(rename = "go")]
-    Go,
-
     /// Shut down gracefully.
     #[serde(rename = "exit")]
     Exit,
@@ -324,13 +301,4 @@ pub enum Response {
     /// Error.
     #[serde(rename = "error")]
     Error { error: String },
-
-    /// Test result (for structured reporting).
-    #[serde(rename = "test_result")]
-    TestResult {
-        test: String,
-        agent: String,
-        result: String,
-        detail: String,
-    },
 }

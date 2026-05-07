@@ -168,7 +168,7 @@ different worker processes (post-fork-exec).
   two-phase ready/go handshake
 - **Declarative matrix testing**: Topology (in-process, parent→child, sibling,
   grandchild, cross-subtree) × FsScope (`/shared` vs `/tmp`) × operation
-- **Protocol primitives**: `Fork`, `NetAccept`, `NetCloseListener`, `GetPid`,
+- **Protocol primitives**: `Fork`, `GetPid`,
   `NetListen`, unified `Exec` (Exec + ExecBackground merged)
 - **`SpawnRemote`** for cross-worker test execution
 - **`--filter=`** flag on `spawn-tree` to run specific suites

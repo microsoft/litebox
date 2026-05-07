@@ -45,7 +45,7 @@ fn register_fork_port_tests(reg: &mut Registry<'_>) {
                     Box::new(move |run| {
                         Box::pin(async move {
                             let listen_resp = run.send(&handle, Command::NetListen { port }).await;
-                            if !matches!(&listen_resp, Response::Listening { .. }) {
+                            if !super::expect_listening_port(&listen_resp, port).is_ok() {
                                 return super::TestOutcome::new(
                                     &agent_label,
                                     false,
@@ -74,7 +74,7 @@ fn register_fork_port_tests(reg: &mut Registry<'_>) {
                     Box::new(move |run| {
                         Box::pin(async move {
                             let listen_resp = run.send(&handle, Command::NetListen { port }).await;
-                            if !matches!(&listen_resp, Response::Listening { .. }) {
+                            if !super::expect_listening_port(&listen_resp, port).is_ok() {
                                 return super::TestOutcome::new(
                                     &agent_label,
                                     false,
@@ -112,7 +112,7 @@ fn register_fork_multi_tests(reg: &mut Registry<'_>) {
                 Box::pin(async move {
                     let agent = "A";
                     let listen_resp = run.send(&handle_a, Command::NetListen { port }).await;
-                    if !matches!(&listen_resp, Response::Listening { .. }) {
+                    if !super::expect_listening_port(&listen_resp, port).is_ok() {
                         return super::TestOutcome::new(
                             agent,
                             false,
@@ -162,7 +162,7 @@ fn register_fork_cross_tests(reg: &mut Registry<'_>) {
                     let listener = "A";
                     let connector = "B";
                     let listen_resp = run.send(&handle_a, Command::NetListen { port }).await;
-                    if !matches!(&listen_resp, Response::Listening { .. }) {
+                    if !super::expect_listening_port(&listen_resp, port).is_ok() {
                         return super::TestOutcome::new(
                             connector,
                             false,
@@ -203,7 +203,7 @@ fn register_fork_interleave_tests(reg: &mut Registry<'_>) {
                 Box::pin(async move {
                     let agent = "A";
                     let listen_resp = run.send(&handle_a, Command::NetListen { port }).await;
-                    if !matches!(&listen_resp, Response::Listening { .. }) {
+                    if !super::expect_listening_port(&listen_resp, port).is_ok() {
                         return super::TestOutcome::new(
                             agent,
                             false,
@@ -256,7 +256,7 @@ fn register_fork_background_tests(reg: &mut Registry<'_>) {
                 Box::pin(async move {
                     let agent = "A";
                     let listen_resp = run.send(&handle_a, Command::NetListen { port }).await;
-                    if !matches!(&listen_resp, Response::Listening { .. }) {
+                    if !super::expect_listening_port(&listen_resp, port).is_ok() {
                         return super::TestOutcome::new(
                             agent,
                             false,
@@ -329,15 +329,15 @@ fn register_fork_listen_inherit_tests(reg: &mut Registry<'_>) {
                     let port = 18300u16;
                     let child_port = port + 100;
                     let resp = run.send(&handle_a, Command::NetListen { port }).await;
-                    if !matches!(&resp, Response::Listening { .. }) {
+                    if let Err(e) = super::expect_listening_port(&resp, port) {
                         return super::TestOutcome::new(
                             "A",
                             false,
-                            format!("listen failed: {resp:?}"),
+                            format!("listen failed: {e}; resp={resp:?}"),
                         );
                     }
                     let resp = run.spawn_ephemeral(&li_c).await;
-                    if !matches!(&resp, Response::Ok { .. }) {
+                    if !super::ok_spawned_response(&resp) {
                         let _ = run.send(&handle_a, Command::NetUnlisten { port }).await;
                         return super::TestOutcome::new(
                             "A",
@@ -391,15 +391,15 @@ fn register_fork_listen_inherit_tests(reg: &mut Registry<'_>) {
                     let resp = run
                         .send(&handle_a, Command::NetListen { port: port2 })
                         .await;
-                    if !matches!(&resp, Response::Listening { .. }) {
+                    if let Err(e) = super::expect_listening_port(&resp, port2) {
                         return super::TestOutcome::new(
                             "B",
                             false,
-                            format!("listen2 failed: {resp:?}"),
+                            format!("listen2 failed: {e}; resp={resp:?}"),
                         );
                     }
                     let resp = run.spawn_ephemeral(&li_c2).await;
-                    if !matches!(&resp, Response::Ok { .. }) {
+                    if !super::ok_spawned_response(&resp) {
                         let _ = run
                             .send(&handle_a, Command::NetUnlisten { port: port2 })
                             .await;
@@ -468,11 +468,11 @@ fn register_child_listen_cross_connect_tests(reg: &mut Registry<'_>) {
                 let cl_c_pie = cl_c_pie.clone();
                 Box::pin(async move {
                     let resp = run.spawn_ephemeral(&cl_c_nonpie).await;
-                    let cl_c = if matches!(&resp, Response::Ok { .. }) {
+                    let cl_c = if super::ok_spawned_response(&resp) {
                         cl_c_nonpie
                     } else {
                         let resp = run.spawn_ephemeral(&cl_c_pie).await;
-                        if !matches!(&resp, Response::Ok { .. }) {
+                        if !super::ok_spawned_response(&resp) {
                             return super::TestOutcome::new(
                                 "B",
                                 false,
@@ -484,11 +484,11 @@ fn register_child_listen_cross_connect_tests(reg: &mut Registry<'_>) {
                     let resp = run
                         .forward(&cl_c, Command::NetListen { port })
                         .await;
-                    if !matches!(&resp, Response::Listening { .. }) {
+                    if let Err(e) = super::expect_listening_port(&resp, port) {
                         return super::TestOutcome::new(
                             "B",
                             false,
-                            format!("child listen failed: {resp:?}"),
+                            format!("child listen failed: {e}; resp={resp:?}"),
                         );
                     }
                     let conn_resp = run
