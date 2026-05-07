@@ -865,9 +865,10 @@ impl<FS: ShimFS> Task<FS> {
         if !state.trampoline_mapped {
             let tramp_addr = state.trampoline_addr;
 
-            // Try MAP_FIXED first — works when ensure_space_after reserved
-            // PROT_NONE space (shared libraries). Falls back to a hint-based
-            // allocation for the ElfLoader path where no headroom is reserved.
+            // Try MAP_FIXED_NOREPLACE first — works when the preferred
+            // trampoline address is available. If that fails, let the VM
+            // manager choose a free address and validate that it is still
+            // within JMP rel32 range below.
             let actual_addr = self
                 .do_mmap_anonymous(
                     Some(tramp_addr),
@@ -877,7 +878,7 @@ impl<FS: ShimFS> Task<FS> {
                 )
                 .or_else(|_| {
                     self.do_mmap_anonymous(
-                        Some(tramp_addr),
+                        None,
                         PAGE_SIZE,
                         ProtFlags::PROT_READ | ProtFlags::PROT_WRITE,
                         MapFlags::MAP_ANONYMOUS | MapFlags::MAP_PRIVATE,
