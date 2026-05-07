@@ -118,7 +118,11 @@ const SHELL_PATTERNS: &[ShellPattern] = &[
     },
 ];
 
-const DEPTH_AGENTS: &[AgentName] = &[AgentName::A, AgentName::AA, AgentName::AAA];
+const DEPTH_AGENTS: &[AgentName] = &[
+    AgentName::Dpg1,
+    AgentName::Dpg1Dpg1,
+    AgentName::Dpg1Dpg1Dpg1,
+];
 
 // ═══════════════════════════════════════════════════════════════════
 // EXEC BINARY × DEPTH
@@ -255,7 +259,7 @@ const DF_BINARIES: &[DfBinary] = &[
     DfBinary::Node,
 ];
 const DF_INVOCATIONS: &[DfInvocation] = &[DfInvocation::Direct, DfInvocation::ScriptFile];
-const DF_AGENTS: &[AgentName] = &[AgentName::A, AgentName::AA];
+const DF_AGENTS: &[AgentName] = &[AgentName::Dpg1, AgentName::Dpg1Dpg1];
 
 // ═══════════════════════════════════════════════════════════════════
 // STRESS EXEC: mode × spawn method
@@ -431,7 +435,7 @@ pub(crate) fn register_fork_matrix(reg: &mut Registry<'_>) {
     reg.test("fork", "fork_matrix", "X.node_stdout_write.A")
         .timeout(60)
         .build(move |cx| {
-            let handle = cx.require(AgentName::A);
+            let handle = cx.require(AgentName::Dpg1);
             Box::new(move |run| {
                 Box::pin(async move {
                     let resp = run
@@ -474,7 +478,7 @@ pub(crate) fn register_fork_matrix(reg: &mut Registry<'_>) {
             };
             let template = em.cmd_template.to_string();
             let expected = em.expected.to_string();
-            let agent = AgentName::A;
+            let agent = AgentName::Dpg1;
             let agent_label = agent.to_string();
             reg.test("fork", "fork_matrix", id)
                 .timeout(60)
@@ -512,10 +516,10 @@ pub(crate) fn register_fork_matrix(reg: &mut Registry<'_>) {
     // XM.node_networkInterfaces — blockers-added family.
     // Doesn't take a BinaryType axis: the binary is the system node, not self_exe.
     for &(agent, suffix) in &[
-        (AgentName::A, ""),
-        (AgentName::AA, ".AA"),
-        (AgentName::B, ".B"),
-        (AgentName::D4, ".D4"),
+        (AgentName::Dpg1, ""),
+        (AgentName::Dpg1Dpg1, ".AA"),
+        (AgentName::Dpg2, ".B"),
+        (AgentName::Dpg1Dpg1Dpg1Dng, ".D4"),
     ] {
         let id = format!("XM.node_networkInterfaces{suffix}");
         let agent_label = agent.to_string();
@@ -691,7 +695,7 @@ pub(crate) fn register_fork_matrix(reg: &mut Registry<'_>) {
         )
         .timeout(60)
         .build(move |cx| {
-            let handle = cx.require(AgentName::A);
+            let handle = cx.require(AgentName::Dpg1);
             Box::new(move |run| {
                 Box::pin(async move {
                     let self_exe = run.self_exe().to_string();
@@ -734,7 +738,7 @@ pub(crate) fn register_fork_matrix(reg: &mut Registry<'_>) {
                 reg.test("fork", "fork_matrix", id)
                     .timeout(60)
                     .build(move |cx| {
-                        let handle = cx.require(AgentName::A);
+                        let handle = cx.require(AgentName::Dpg1);
                         Box::new(move |run| {
                             let extra = extra.clone();
                             let mode_s = mode_s.clone();
@@ -768,7 +772,7 @@ pub(crate) fn register_fork_matrix(reg: &mut Registry<'_>) {
             reg.test("fork", "fork_matrix", id)
                 .timeout(60)
                 .build(move |cx| {
-                    let handle = cx.require(AgentName::A);
+                    let handle = cx.require(AgentName::Dpg1);
                     Box::new(move |run| {
                         let bash_cmd = bash_cmd.clone();
                         Box::pin(async move {
@@ -828,7 +832,7 @@ pub(crate) fn register_fork_matrix(reg: &mut Registry<'_>) {
         reg.test("fork", "fork_matrix", format!("XC.{bt_label}.init_level"))
             .timeout(60)
             .build(move |cx| {
-                let handle = cx.require(AgentName::A);
+                let handle = cx.require(AgentName::Dpg1);
                 Box::new(move |run| {
                     Box::pin(async move {
                         let self_exe = run.self_exe().to_string();
@@ -887,7 +891,7 @@ pub(crate) fn register_fork_matrix(reg: &mut Registry<'_>) {
             reg.test("fork", "fork_matrix", id)
                 .timeout(60)
                 .build(move |cx| {
-                    let handle = cx.require(AgentName::A);
+                    let handle = cx.require(AgentName::Dpg1);
                     Box::new(move |run| {
                         let template = template.clone();
                         let expected = expected.clone();

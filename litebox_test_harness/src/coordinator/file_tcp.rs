@@ -32,8 +32,12 @@ pub(crate) fn register_file_tcp(reg: &mut Registry<'_>) {
 
 #[allow(clippy::too_many_lines)] // exhaustive registration / runner
 fn register_listen_file_tests(reg: &mut Registry<'_>) {
-    for &agent in &[AgentName::A, AgentName::B] {
-        let port = if agent == AgentName::A { 18100 } else { 18101 };
+    for &agent in &[AgentName::Dpg1, AgentName::Dpg2] {
+        let port = if agent == AgentName::Dpg1 {
+            18100
+        } else {
+            18101
+        };
 
         // FT.listen_write.{agent}
         {
@@ -173,7 +177,7 @@ fn register_conn_file_tests(reg: &mut Registry<'_>) {
     reg.test("stress", "file_tcp", "FT.conn_echo")
         .timeout(180)
         .build(move |cx| {
-            let handle = cx.require(AgentName::A);
+            let handle = cx.require(AgentName::Dpg1);
             Box::new(move |run| {
                 Box::pin(async move {
                     let listen_resp = run
@@ -208,7 +212,7 @@ fn register_conn_file_tests(reg: &mut Registry<'_>) {
     reg.test("stress", "file_tcp", "FT.conn_read_after")
         .timeout(180)
         .build(move |cx| {
-            let handle = cx.require(AgentName::A);
+            let handle = cx.require(AgentName::Dpg1);
             Box::new(move |run| {
                 Box::pin(async move {
                     let listen_resp = run
@@ -251,7 +255,7 @@ fn register_conn_file_tests(reg: &mut Registry<'_>) {
     reg.test("stress", "file_tcp", "FT.conn_write")
         .timeout(180)
         .build(move |cx| {
-            let handle = cx.require(AgentName::A);
+            let handle = cx.require(AgentName::Dpg1);
             Box::new(move |run| {
                 Box::pin(async move {
                     let listen_resp = run
@@ -295,7 +299,7 @@ fn register_conn_file_tests(reg: &mut Registry<'_>) {
     reg.test("stress", "file_tcp", "FT.conn_readback")
         .timeout(180)
         .build(move |cx| {
-            let handle = cx.require(AgentName::A);
+            let handle = cx.require(AgentName::Dpg1);
             Box::new(move |run| {
                 Box::pin(async move {
                     let listen_resp = run
@@ -353,7 +357,7 @@ fn register_interleave_tests(reg: &mut Registry<'_>) {
         reg.test("stress", "file_tcp", id)
             .timeout(180)
             .build(move |cx| {
-                let handle = cx.require(AgentName::A);
+                let handle = cx.require(AgentName::Dpg1);
                 Box::new(move |run| {
                     Box::pin(async move {
                         let port = 18120u16;
@@ -403,8 +407,8 @@ fn register_interleave_tests(reg: &mut Registry<'_>) {
         reg.test("stress", "file_tcp", id)
             .timeout(180)
             .build(move |cx| {
-                let handle_a = cx.require(AgentName::A);
-                let handle_b = cx.require(AgentName::B);
+                let handle_a = cx.require(AgentName::Dpg1);
+                let handle_b = cx.require(AgentName::Dpg2);
                 Box::new(move |run| {
                     Box::pin(async move {
                         let port = 18121u16;
@@ -456,7 +460,7 @@ fn register_multi_cycle_tests(reg: &mut Registry<'_>) {
     reg.test("stress", "file_tcp", "FT.multi_x5")
         .timeout(180)
         .build(move |cx| {
-            let handle = cx.require(AgentName::A);
+            let handle = cx.require(AgentName::Dpg1);
             Box::new(move |run| {
                 Box::pin(async move {
                     let listen_resp = run
@@ -521,7 +525,7 @@ fn register_multi_cycle_tests(reg: &mut Registry<'_>) {
     reg.test("stress", "file_tcp", "FT.multi_interleave_x5")
         .timeout(180)
         .build(move |cx| {
-            let handle = cx.require(AgentName::A);
+            let handle = cx.require(AgentName::Dpg1);
             Box::new(move |run| {
                 Box::pin(async move {
                     let listen_resp = run
@@ -586,7 +590,7 @@ fn register_exec_during_tcp_tests(reg: &mut Registry<'_>) {
     reg.test("stress", "file_tcp", "FT.exec_cat_during_tcp")
         .timeout(180)
         .build(move |cx| {
-            let handle = cx.require(AgentName::A);
+            let handle = cx.require(AgentName::Dpg1);
             Box::new(move |run| {
                 Box::pin(async move {
                     let listen_resp = run
@@ -630,7 +634,7 @@ fn register_exec_during_tcp_tests(reg: &mut Registry<'_>) {
     reg.test("stress", "file_tcp", "FT.echo_after_exec")
         .timeout(180)
         .build(move |cx| {
-            let handle = cx.require(AgentName::A);
+            let handle = cx.require(AgentName::Dpg1);
             Box::new(move |run| {
                 Box::pin(async move {
                     let listen_resp = run
@@ -687,18 +691,18 @@ struct FtAxisCase {
 const FT_AXIS_CASES: &[FtAxisCase] = &[
     FtAxisCase {
         name: "parent_child",
-        server: AgentName::AA,
-        client: AgentName::A,
+        server: AgentName::Dpg1Dpg1,
+        client: AgentName::Dpg1,
     },
     FtAxisCase {
         name: "child_parent",
-        server: AgentName::A,
-        client: AgentName::AA,
+        server: AgentName::Dpg1,
+        client: AgentName::Dpg1Dpg1,
     },
     FtAxisCase {
         name: "depth2",
-        server: AgentName::D4,
-        client: AgentName::D5,
+        server: AgentName::Dpg1Dpg1Dpg1Dng,
+        client: AgentName::Dpg1Dpg1Dpg1DngDpg,
     },
 ];
 
