@@ -1503,6 +1503,42 @@ async fn agent_loop(self_exe: &str) {
                 }
             }
 
+            Command::Getrandom { n, flags } => {
+                let flag_bits = match parse_getrandom_flags(&flags) {
+                    Ok(bits) => bits,
+                    Err(error) => {
+                        respond(&Response::Error { error }).await;
+                        continue;
+                    }
+                };
+                let mut buf = vec![0_u8; n as usize];
+                // SAFETY: `buf` is a valid writable byte buffer of length `n`
+                // for the duration of the getrandom syscall. The kernel writes
+                // at most `n` bytes and does not retain the pointer.
+                let ret = unsafe {
+                    libc::syscall(
+                        libc::SYS_getrandom,
+                        buf.as_mut_ptr(),
+                        n as libc::size_t,
+                        flag_bits,
+                    )
+                };
+                if ret >= 0 {
+                    buf.truncate(ret as usize);
+                    respond(&Response::RandomBytes {
+                        hex: hex_encode(&buf),
+                        errno: None,
+                    })
+                    .await;
+                } else {
+                    respond(&Response::RandomBytes {
+                        hex: String::new(),
+                        errno: Some(errno()),
+                    })
+                    .await;
+                }
+            }
+
             Command::IoUringSetup { entries } => {
                 let mut params = IoUringParams::default();
                 // SAFETY: `params` points to a valid writable C-compatible
@@ -2853,6 +2889,32 @@ fn prepare_inherited_listeners(
         inherited.push((port, dup_fd_to_inherited_slot(entry.fd.as_raw_fd(), slot)?));
     }
     Ok(inherited)
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for &byte in bytes {
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    out
+}
+
+fn parse_getrandom_flags(flags: &str) -> Result<u32, String> {
+    let mut bits = 0;
+    for raw in flags.split('|') {
+        let flag = raw.trim();
+        if flag.is_empty() {
+            continue;
+        }
+        match flag.to_ascii_lowercase().as_str() {
+            "nonblock" | "grnd_nonblock" => bits |= libc::GRND_NONBLOCK,
+            "random" | "grnd_random" => bits |= libc::GRND_RANDOM,
+            other => return Err(format!("unknown getrandom flag {other:?}")),
+        }
+    }
+    Ok(bits)
 }
 
 fn parse_eventfd_flags(flags: &str) -> Result<i32, String> {

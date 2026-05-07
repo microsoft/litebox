@@ -11,6 +11,7 @@ pub(crate) mod epoll_pidfd;
 pub(crate) mod eventfd;
 pub(crate) mod file_tcp;
 pub(crate) mod fork_matrix;
+pub(crate) mod getrandom_tests;
 pub(crate) mod iouring_discovery;
 pub(crate) mod matrix;
 pub(crate) mod pipe_bridge;
@@ -821,6 +822,7 @@ pub fn collect_all_tests() -> Vec<Test> {
     platform_fixes::register_touch_redirect_tests(&mut registry::Registry::new(&mut tests));
     platform_fixes::register_pid_visibility_tests(&mut registry::Registry::new(&mut tests));
     iouring_discovery::register_iouring_discovery_tests(&mut registry::Registry::new(&mut tests));
+    getrandom_tests::register_getrandom_tests(&mut registry::Registry::new(&mut tests));
     platform_fixes::register_cross_pid_visibility_tests(&mut registry::Registry::new(&mut tests));
     platform_fixes::register_file_redirect_tests(&mut registry::Registry::new(&mut tests));
     platform_fixes::register_cli_startup_mimic_tests(&mut registry::Registry::new(&mut tests));
