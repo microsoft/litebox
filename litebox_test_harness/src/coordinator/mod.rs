@@ -766,6 +766,7 @@ pub fn collect_all_tests() -> Vec<Test> {
     platform_fixes::register_file_redirect_tests(&mut registry::Registry::new(&mut tests));
     platform_fixes::register_cli_startup_mimic_tests(&mut registry::Registry::new(&mut tests));
     platform_fixes::register_bg_redirect_poll_tests(&mut registry::Registry::new(&mut tests));
+    platform_fixes::register_bg_redirect_stdin_poll_tests(&mut registry::Registry::new(&mut tests));
     platform_fixes::register_pipe_nonblock_tests(&mut registry::Registry::new(&mut tests));
     platform_fixes::register_epoll_socket_tests(&mut registry::Registry::new(&mut tests));
     platform_fixes::register_loopback_tcp_tests(&mut registry::Registry::new(&mut tests));

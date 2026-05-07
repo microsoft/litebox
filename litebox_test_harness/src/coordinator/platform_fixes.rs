@@ -2475,6 +2475,135 @@ pub(crate) fn register_bg_redirect_poll_tests(reg: &mut Registry<'_>) {
 }
 
 // ═══════════════════════════════════════════════════════════════════
+// BRS: Background Redirect Stdin Poll — stdin pipe + stdout redirect
+// ═══════════════════════════════════════════════════════════════════
+
+#[allow(clippy::too_many_lines)] // exhaustive registration / runner
+pub(crate) fn register_bg_redirect_stdin_poll_tests(reg: &mut Registry<'_>) {
+    #[derive(Clone, Copy)]
+    struct Def {
+        name: &'static str,
+        consumer_template: &'static str,
+        per_binary_type: bool,
+    }
+
+    const SHELLS: &[(&str, &str)] = &[("bash", "bash"), ("sh", "sh")];
+    const DELIVERIES: &[&str] = &["tokio_pipe", "bash_heredoc_pipe"];
+    let defs = [
+        Def {
+            name: "subshell_stdin",
+            consumer_template: "cat",
+            per_binary_type: false,
+        },
+        Def {
+            name: "exe_stdin",
+            consumer_template: "{exe} stdin-echo-test",
+            per_binary_type: true,
+        },
+    ];
+
+    for &agent in AGENTS {
+        for &(shell_name, shell_bin) in SHELLS {
+            for &delivery in DELIVERIES {
+                for def in defs {
+                    let bts: &[Option<crate::BinaryType>] = if def.per_binary_type {
+                        &[
+                            Some(crate::BinaryType::PieGlibc),
+                            Some(crate::BinaryType::NonPieGlibc),
+                            Some(crate::BinaryType::StaticPieGlibc),
+                            Some(crate::BinaryType::StaticPieMusl),
+                            Some(crate::BinaryType::NonPieStaticMusl),
+                        ]
+                    } else {
+                        &[None]
+                    };
+                    for &bt_opt in bts {
+                        let agent_s = agent.to_string();
+                        let test_id = match bt_opt {
+                            None | Some(crate::BinaryType::PieGlibc) => {
+                                format!("BRS.{}.{shell_name}.{delivery}.{agent}", def.name)
+                            }
+                            Some(bt) => format!(
+                                "BRS.{}.{shell_name}.{delivery}.{}.{agent}",
+                                def.name,
+                                bt.label()
+                            ),
+                        };
+                        let path_label = match bt_opt {
+                            None | Some(crate::BinaryType::PieGlibc) => def.name.to_string(),
+                            Some(bt) => format!("{}-{}", def.name, bt.label()),
+                        };
+                        reg.test("shell", "bg_redirect_stdin_poll", test_id)
+                            .timeout(60)
+                            .build(move |cx| {
+                                let handle = cx.require(agent);
+                                Box::new(move |run| {
+                                    let a = agent_s.clone();
+                                    let path_label = path_label.clone();
+                                    let self_exe = run.self_exe().to_string();
+                                    Box::pin(async move {
+                                        let path = format!(
+                                            "/shared/brs-{path_label}-{shell_name}-{delivery}-{a}.txt"
+                                        );
+                                        let marker = format!(
+                                            "BRS_PAYLOAD_{}_{}_{}",
+                                            def.name, shell_name, delivery
+                                        );
+                                        let exe_path = match bt_opt {
+                                            None => self_exe.clone(),
+                                            Some(bt) => crate::binary_path(bt, &self_exe),
+                                        };
+                                        let consumer = def
+                                            .consumer_template
+                                            .replace("{exe}", &exe_path);
+                                        let (producer_script, stdin) = match delivery {
+                                            "tokio_pipe" => (
+                                                format!("cat | {consumer} > {path} &\n"),
+                                                Some(format!("{marker}\n")),
+                                            ),
+                                            "bash_heredoc_pipe" => (
+                                                format!(
+                                                    "cat <<'BRS_EOF' | {consumer} > {path} &\n{marker}\nBRS_EOF\n"
+                                                ),
+                                                None,
+                                            ),
+                                            _ => unreachable!(),
+                                        };
+                                        let script = format!(
+                                            "{producer_script}PID=$!\nfor _ in 1 2 3 4 5 6 7 8 9 10; do\n  if grep -q '{marker}' '{path}'; then\n    wait $PID 2>/dev/null\n    cat '{path}'\n    exit 0\n  fi\n  sleep 0.1\ndone\nkill $PID 2>/dev/null; wait $PID 2>/dev/null\ncat '{path}' 2>/dev/null\nexit 1\n"
+                                        );
+                                        let resp = run
+                                            .send(
+                                                &handle,
+                                                Command::Exec {
+                                                    args: vec![
+                                                        shell_bin.into(),
+                                                        "-c".into(),
+                                                        script,
+                                                    ],
+                                                    timeout_secs: Some(10),
+                                                    stdin,
+                                                    background: false,
+                                                },
+                                            )
+                                            .await;
+                                        let pass = matches!(
+                                            &resp,
+                                            Response::ExecResult { exit_code: 0, stdout, .. }
+                                                if stdout.contains(&marker)
+                                        );
+                                        super::TestOutcome::new(&a, pass, format!("{resp:?}"))
+                                    })
+                                })
+                            });
+                    }
+                }
+            }
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
 // PN: Pipe Non-blocking
 // ═══════════════════════════════════════════════════════════════════
 
