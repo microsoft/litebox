@@ -12,6 +12,7 @@ pub(crate) mod eventfd;
 pub(crate) mod file_tcp;
 pub(crate) mod fork_matrix;
 pub(crate) mod getrandom_tests;
+pub(crate) mod inotify;
 pub(crate) mod iouring_discovery;
 pub(crate) mod matrix;
 pub(crate) mod pipe_bridge;
@@ -832,6 +833,7 @@ pub fn collect_all_tests() -> Vec<Test> {
     platform_fixes::register_pipe_nonblock_tests(&mut registry::Registry::new(&mut tests));
     platform_fixes::register_epoll_socket_tests(&mut registry::Registry::new(&mut tests));
     eventfd::register_eventfd_tests(&mut registry::Registry::new(&mut tests));
+    inotify::register_inotify_tests(&mut registry::Registry::new(&mut tests));
     epoll_pidfd::register_epoll_pidfd_tests(&mut registry::Registry::new(&mut tests));
     clone3_matrix::register_clone3_matrix(&mut registry::Registry::new(&mut tests));
     tcp_state::register_tcp_state_tests(&mut registry::Registry::new(&mut tests));

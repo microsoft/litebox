@@ -158,6 +158,8 @@ fn test_container_suffix(test_id: &str) -> &'static str {
         "-rand"
     } else if test_id.starts_with("CL3.vfork.") {
         "-cl3v"
+    } else if test_id.starts_with("INO.") {
+        "-ino"
     } else {
         ""
     }
