@@ -549,8 +549,8 @@ pub(crate) fn register_fork_matrix(reg: &mut Registry<'_>) {
                         );
                         super::TestOutcome::new(&agent_label, pass, format!("{resp:?}"))
                     })
-                });
-        }
+                })
+            });
     }
 
     // Delayed fork matrix

@@ -64,43 +64,70 @@ pub(crate) fn register_epoll_pidfd_tests(reg: &mut Registry<'_>) {
             if def.in_process_only && agent != AgentName::A {
                 continue;
             }
-            let agent_s = agent.to_string();
-            let scenario = def.kind;
-            reg.test("vscode", "epoll_pidfd", format!("EPI.{}.{agent}", def.name))
-                .timeout(60)
-                .build(move |cx| {
-                    let observer = cx.require(agent);
-                    let peer_agent = peer_for(agent);
-                    let peer = if peer_agent == agent {
-                        observer.clone()
-                    } else {
-                        cx.require(peer_agent)
-                    };
-                    Box::new(move |run| {
-                        let a = agent_s.clone();
-                        Box::pin(async move {
-                            let result = match scenario {
-                                ScenarioKind::PidfdExit => {
-                                    run_pidfd_exit(run, &observer, &peer).await
+            // Only the PidfdExit scenario exec's a binary (it spawns a
+            // background child to monitor for exit-via-pidfd). Iterate
+            // the BinaryType axis there so each leg's execve path is
+            // covered. Other scenarios are pure agent-protocol and
+            // run once.
+            let bts: &[Option<crate::BinaryType>] = if matches!(def.kind, ScenarioKind::PidfdExit) {
+                &[
+                    Some(crate::BinaryType::PieGlibc),
+                    Some(crate::BinaryType::NonPieGlibc),
+                    Some(crate::BinaryType::StaticPieGlibc),
+                    Some(crate::BinaryType::StaticPieMusl),
+                    Some(crate::BinaryType::NonPieStaticMusl),
+                ]
+            } else {
+                &[None]
+            };
+            for &bt_opt in bts {
+                let agent_s = agent.to_string();
+                let scenario = def.kind;
+                let test_id = match bt_opt {
+                    Some(bt) => format!("EPI.{}.{}.{agent}", def.name, bt.label()),
+                    None => format!("EPI.{}.{agent}", def.name),
+                };
+                reg.test("vscode", "epoll_pidfd", test_id)
+                    .timeout(60)
+                    .build(move |cx| {
+                        let observer = cx.require(agent);
+                        let peer_agent = peer_for(agent);
+                        let peer = if peer_agent == agent {
+                            observer.clone()
+                        } else {
+                            cx.require(peer_agent)
+                        };
+                        Box::new(move |run| {
+                            let a = agent_s.clone();
+                            Box::pin(async move {
+                                let result = match scenario {
+                                    ScenarioKind::PidfdExit => {
+                                        let bt =
+                                            bt_opt.expect("PidfdExit always iterates a BinaryType");
+                                        let target = crate::binary_path(bt, run.self_exe());
+                                        run_pidfd_exit(run, &observer, &peer, target).await
+                                    }
+                                    ScenarioKind::MultiSocket => {
+                                        run_multi_socket(run, &observer, &peer).await
+                                    }
+                                    ScenarioKind::EventfdWakeup => {
+                                        run_eventfd_wakeup(run, &observer).await
+                                    }
+                                    ScenarioKind::TimeoutZero => {
+                                        run_timeout_zero(run, &observer).await
+                                    }
+                                    ScenarioKind::EdgeTrigger => {
+                                        run_edge_trigger(run, &observer, &peer).await
+                                    }
+                                };
+                                match result {
+                                    Ok(detail) => TestOutcome::new(&a, true, detail),
+                                    Err(detail) => TestOutcome::new(&a, false, detail),
                                 }
-                                ScenarioKind::MultiSocket => {
-                                    run_multi_socket(run, &observer, &peer).await
-                                }
-                                ScenarioKind::EventfdWakeup => {
-                                    run_eventfd_wakeup(run, &observer).await
-                                }
-                                ScenarioKind::TimeoutZero => run_timeout_zero(run, &observer).await,
-                                ScenarioKind::EdgeTrigger => {
-                                    run_edge_trigger(run, &observer, &peer).await
-                                }
-                            };
-                            match result {
-                                Ok(detail) => TestOutcome::new(&a, true, detail),
-                                Err(detail) => TestOutcome::new(&a, false, detail),
-                            }
+                            })
                         })
-                    })
-                });
+                    });
+            }
         }
     }
 }
@@ -117,16 +144,18 @@ async fn run_pidfd_exit(
     run: &mut RunContext<'_>,
     observer: &super::agents::AgentHandle,
     peer: &super::agents::AgentHandle,
+    target: String,
 ) -> Result<String, String> {
     let epoll = epoll_open(run, observer).await?;
     let bg = run
         .send(
             observer,
             Command::Exec {
-                args: vec![run.self_exe().to_string(), "wait-forever".to_string()],
+                args: vec![target, "wait-forever".to_string()],
                 timeout_secs: None,
                 stdin: None,
                 background: true,
+                env: vec![],
             },
         )
         .await;

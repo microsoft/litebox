@@ -1669,9 +1669,7 @@ pub(super) fn register_unix_tests(reg: &mut Registry<'_>) {
                                     Command::UnixListen { path: sock.clone() },
                                 )
                                 .await;
-                                if let Err(e) =
-                                    super::expect_unix_listening_path(&resp, &sock)
-                                {
+                                if let Err(e) = super::expect_unix_listening_path(&resp, &sock) {
                                     return super::TestOutcome::new(
                                         agent.name(),
                                         false,
@@ -1708,11 +1706,8 @@ pub(super) fn register_unix_tests(reg: &mut Registry<'_>) {
             UnixPattern::BackgroundServerConnect => {
                 for &bt in crate::BinaryType::ALL {
                     let bt_label = bt.label();
-                    let sock_start = format!(
-                        "/tmp/um_{}_{}_start.sock",
-                        name.replace('.', "_"),
-                        bt_label
-                    );
+                    let sock_start =
+                        format!("/tmp/um_{}_{}_start.sock", name.replace('.', "_"), bt_label);
                     matrix_test(
                         reg,
                         format!("U.{name}.{bt_label}.server_start"),
@@ -1745,8 +1740,7 @@ pub(super) fn register_unix_tests(reg: &mut Registry<'_>) {
                                 let pass = pid.is_some();
                                 if let Some(pid) = pid {
                                     let _ =
-                                        send_to(run, &handles, agent, Command::Kill { pid })
-                                            .await;
+                                        send_to(run, &handles, agent, Command::Kill { pid }).await;
                                 }
                                 let _ = send_to(
                                     run,
@@ -1780,11 +1774,7 @@ pub(super) fn register_unix_tests(reg: &mut Registry<'_>) {
                                     &handles,
                                     agent,
                                     Command::ExecReady {
-                                        args: vec![
-                                            target,
-                                            "unix-echo-server".into(),
-                                            sock.clone(),
-                                        ],
+                                        args: vec![target, "unix-echo-server".into(), sock.clone()],
                                         ready_marker: "LISTENING".into(),
                                         timeout_secs: Some(10),
                                         stdin: None,
@@ -1820,8 +1810,7 @@ pub(super) fn register_unix_tests(reg: &mut Registry<'_>) {
                                 );
                                 if let Some(pid) = pid {
                                     let _ =
-                                        send_to(run, &handles, agent, Command::Kill { pid })
-                                            .await;
+                                        send_to(run, &handles, agent, Command::Kill { pid }).await;
                                 }
                                 let _ = send_to(
                                     run,
