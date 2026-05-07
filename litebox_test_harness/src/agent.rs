@@ -5,7 +5,7 @@
 //! writes responses to stdout. Intermediate nodes forward commands to
 //! their children.
 
-use crate::protocol::{Clone3Kind, Command, EpollEvent, Response, WaitPredicate};
+use crate::protocol::{Clone3Kind, Command, EpollEvent, InotifyEvent, Response, WaitPredicate};
 use std::collections::HashMap;
 use std::ffi::CString;
 use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd};
@@ -191,6 +191,8 @@ async fn agent_loop(self_exe: &str) {
     let mut next_pty_id = 1u64;
     let mut epolls: HashMap<u64, EpollEntry> = HashMap::new();
     let mut next_epoll_id = 1u64;
+    let mut inotifies: HashMap<u64, OwnedFd> = HashMap::new();
+    let mut next_inotify_id = 1u64;
     let mut background_pids: HashMap<u32, BackgroundProcess> = HashMap::new();
 
     let mut line = String::new();
@@ -1883,6 +1885,78 @@ async fn agent_loop(self_exe: &str) {
                 }
             }
 
+            Command::InotifyOpen {} => {
+                let id = next_inotify_id;
+                if id == u64::MAX {
+                    respond(&Response::Error {
+                        error: "inotify id space exhausted".to_string(),
+                    })
+                    .await;
+                    continue;
+                }
+                match open_inotify() {
+                    Ok(fd) => {
+                        next_inotify_id += 1;
+                        inotifies.insert(id, fd);
+                        respond(&Response::InotifyHandle { id }).await;
+                    }
+                    Err(error) => respond(&Response::Error { error }).await,
+                }
+            }
+
+            Command::InotifyAddWatch { id, path, mask } => {
+                let Some(fd) = inotifies.get(&id) else {
+                    respond(&Response::Error {
+                        error: format!("unknown inotify {id}"),
+                    })
+                    .await;
+                    continue;
+                };
+                match add_inotify_watch(fd.as_raw_fd(), &path, &mask) {
+                    Ok(wd) => respond(&Response::WatchDescriptor { wd }).await,
+                    Err(error) => respond(&Response::Error { error }).await,
+                }
+            }
+
+            Command::InotifyRmWatch { id, wd } => {
+                let Some(fd) = inotifies.get(&id) else {
+                    respond(&Response::Error {
+                        error: format!("unknown inotify {id}"),
+                    })
+                    .await;
+                    continue;
+                };
+                match remove_inotify_watch(fd.as_raw_fd(), wd) {
+                    Ok(()) => respond(&Response::Closed).await,
+                    Err(error) => respond(&Response::Error { error }).await,
+                }
+            }
+
+            Command::InotifyRead { id, max_events } => {
+                let Some(fd) = inotifies.get(&id) else {
+                    respond(&Response::Error {
+                        error: format!("unknown inotify {id}"),
+                    })
+                    .await;
+                    continue;
+                };
+                match read_inotify_events(fd.as_raw_fd(), max_events) {
+                    Ok(events) => respond(&Response::InotifyEvents { events }).await,
+                    Err(error) => respond(&Response::Error { error }).await,
+                }
+            }
+
+            Command::InotifyClose { id } => {
+                if inotifies.remove(&id).is_some() {
+                    respond(&Response::Closed).await;
+                } else {
+                    respond(&Response::Error {
+                        error: format!("unknown inotify {id}"),
+                    })
+                    .await;
+                }
+            }
+
             Command::EventfdOpen { initval, flags } => {
                 let id = next_eventfd_id;
                 if id == u64::MAX {
@@ -2015,6 +2089,7 @@ async fn agent_loop(self_exe: &str) {
             }
 
             Command::Exit => {
+                inotifies.clear();
                 eventfds.clear();
                 // Abort all TCP echo servers.
                 for (_, entry) in listeners.drain() {
@@ -2037,6 +2112,182 @@ async fn agent_loop(self_exe: &str) {
             }
         }
     }
+}
+
+fn parse_inotify_mask(mask: &str) -> Result<u32, String> {
+    let mut bits = 0u32;
+    for raw in mask.split('|') {
+        let token = raw.trim();
+        if token.is_empty() {
+            continue;
+        }
+        bits |= match token.to_ascii_lowercase().as_str() {
+            "create" | "in_create" => libc::IN_CREATE,
+            "modify" | "in_modify" => libc::IN_MODIFY,
+            "delete" | "in_delete" => libc::IN_DELETE,
+            "moved_from" | "in_moved_from" => libc::IN_MOVED_FROM,
+            "moved_to" | "in_moved_to" => libc::IN_MOVED_TO,
+            "attrib" | "in_attrib" => libc::IN_ATTRIB,
+            "close_write" | "in_close_write" => libc::IN_CLOSE_WRITE,
+            other => return Err(format!("unknown inotify mask token {other:?}")),
+        };
+    }
+    if bits == 0 {
+        return Err("inotify watch mask is empty".to_string());
+    }
+    Ok(bits)
+}
+
+fn format_inotify_mask(mask: u32) -> String {
+    let mut names = Vec::new();
+    for (bit, name) in [
+        (libc::IN_CREATE, "IN_CREATE"),
+        (libc::IN_MODIFY, "IN_MODIFY"),
+        (libc::IN_DELETE, "IN_DELETE"),
+        (libc::IN_MOVED_FROM, "IN_MOVED_FROM"),
+        (libc::IN_MOVED_TO, "IN_MOVED_TO"),
+        (libc::IN_ATTRIB, "IN_ATTRIB"),
+        (libc::IN_CLOSE_WRITE, "IN_CLOSE_WRITE"),
+        (libc::IN_IGNORED, "IN_IGNORED"),
+        (libc::IN_Q_OVERFLOW, "IN_Q_OVERFLOW"),
+        (libc::IN_UNMOUNT, "IN_UNMOUNT"),
+    ] {
+        if (mask & bit) != 0 {
+            names.push(name);
+        }
+    }
+    if names.is_empty() {
+        format!("0x{mask:x}")
+    } else {
+        names.join("|")
+    }
+}
+
+fn open_inotify() -> Result<OwnedFd, String> {
+    // SAFETY: inotify_init1 creates a new file descriptor and does not alias memory.
+    let fd = unsafe { libc::inotify_init1(libc::IN_CLOEXEC | libc::IN_NONBLOCK) };
+    if fd < 0 {
+        return Err(format!(
+            "inotify_init1: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    // SAFETY: `fd` was just returned by inotify_init1 and is uniquely owned here.
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
+fn add_inotify_watch(fd: i32, path: &str, mask: &str) -> Result<i32, String> {
+    let path_c = CString::new(path).map_err(|e| format!("inotify path contains NUL: {e}"))?;
+    let mask_bits = parse_inotify_mask(mask)?;
+    // SAFETY: path_c is a valid C string, fd is a live inotify descriptor, and
+    // inotify_add_watch does not retain Rust-owned memory after returning.
+    let wd = unsafe { libc::inotify_add_watch(fd, path_c.as_ptr(), mask_bits) };
+    if wd < 0 {
+        return Err(format!(
+            "inotify_add_watch({path:?}, {mask:?}): {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    Ok(wd)
+}
+
+fn remove_inotify_watch(fd: i32, wd: i32) -> Result<(), String> {
+    // SAFETY: fd is a live inotify descriptor and wd is an integer watch
+    // descriptor returned by the kernel for that fd.
+    let rc = unsafe { libc::inotify_rm_watch(fd, wd) };
+    if rc != 0 {
+        return Err(format!(
+            "inotify_rm_watch({wd}): {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    Ok(())
+}
+
+fn read_inotify_events(fd: i32, max_events: u32) -> Result<Vec<InotifyEvent>, String> {
+    let max_events = max_events.clamp(1, 1024) as usize;
+    let event_size = std::mem::size_of::<libc::inotify_event>();
+    let mut buf = vec![0u8; max_events * (event_size + libc::NAME_MAX as usize + 1)];
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        // SAFETY: buf is valid writable storage for its full length and fd is a
+        // live nonblocking inotify descriptor. read does not retain the buffer.
+        let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) };
+        if n > 0 {
+            return parse_inotify_events(&buf[..n as usize], max_events);
+        }
+        if n == 0 {
+            return Ok(Vec::new());
+        }
+        let err = std::io::Error::last_os_error();
+        match err.raw_os_error() {
+            Some(libc::EINTR) => continue,
+            Some(libc::EAGAIN) => {
+                if std::time::Instant::now() >= deadline {
+                    return Ok(Vec::new());
+                }
+                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                let timeout_ms = i32::try_from(remaining.as_millis().min(1000)).unwrap_or(1000);
+                let mut pollfd = libc::pollfd {
+                    fd,
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+                // SAFETY: pollfd points to one initialized pollfd entry.
+                let ready = unsafe { libc::poll(&mut pollfd, 1, timeout_ms) };
+                if ready < 0 {
+                    let poll_err = std::io::Error::last_os_error();
+                    if poll_err.raw_os_error() == Some(libc::EINTR) {
+                        continue;
+                    }
+                    return Err(format!("inotify poll: {poll_err}"));
+                }
+                if ready == 0 {
+                    return Ok(Vec::new());
+                }
+            }
+            _ => return Err(format!("inotify read: {err}")),
+        }
+    }
+}
+
+fn parse_inotify_events(bytes: &[u8], max_events: usize) -> Result<Vec<InotifyEvent>, String> {
+    let mut events = Vec::new();
+    let mut offset = 0usize;
+    let event_size = std::mem::size_of::<libc::inotify_event>();
+    while offset + event_size <= bytes.len() && events.len() < max_events {
+        // SAFETY: offset + event_size is within bytes. read_unaligned copies the
+        // kernel-provided record header without requiring alignment.
+        let raw = unsafe {
+            std::ptr::read_unaligned(bytes.as_ptr().add(offset).cast::<libc::inotify_event>())
+        };
+        offset += event_size;
+        let name_len = raw.len as usize;
+        if offset + name_len > bytes.len() {
+            return Err(format!(
+                "short inotify event name: len={name_len} remaining={}",
+                bytes.len().saturating_sub(offset)
+            ));
+        }
+        let name = if name_len == 0 {
+            None
+        } else {
+            let raw_name = &bytes[offset..offset + name_len];
+            let nul = raw_name
+                .iter()
+                .position(|&b| b == 0)
+                .unwrap_or(raw_name.len());
+            Some(String::from_utf8_lossy(&raw_name[..nul]).to_string())
+        };
+        offset += name_len;
+        events.push(InotifyEvent {
+            wd: raw.wd,
+            mask: format_inotify_mask(raw.mask),
+            cookie: raw.cookie,
+            name,
+        });
+    }
+    Ok(events)
 }
 
 fn parse_epoll_events(events: &str) -> Result<u32, String> {

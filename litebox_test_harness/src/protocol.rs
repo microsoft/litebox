@@ -374,6 +374,27 @@ pub enum Command {
     #[serde(rename = "epoll_create")]
     EpollCreate,
 
+    /// Open an inotify instance and register it in this agent's local registry.
+    #[serde(rename = "inotify_open")]
+    InotifyOpen {},
+
+    /// Add an inotify watch. Mask is parsed from strings like
+    /// "create|modify|delete|moved_from|moved_to|attrib|close_write".
+    #[serde(rename = "inotify_add_watch")]
+    InotifyAddWatch { id: u64, path: String, mask: String },
+
+    /// Remove an inotify watch descriptor from a registered inotify instance.
+    #[serde(rename = "inotify_rm_watch")]
+    InotifyRmWatch { id: u64, wd: i32 },
+
+    /// Read up to `max_events` inotify events from a registered instance.
+    #[serde(rename = "inotify_read")]
+    InotifyRead { id: u64, max_events: u32 },
+
+    /// Close and unregister a registered inotify instance.
+    #[serde(rename = "inotify_close")]
+    InotifyClose { id: u64 },
+
     /// Open an eventfd and register it in this agent's local registry.
     /// Flags are parsed from strings like "semaphore|nonblock|cloexec".
     #[serde(rename = "eventfd_open")]
@@ -445,6 +466,14 @@ pub struct EpollEvent {
     pub observed_events: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InotifyEvent {
+    pub wd: i32,
+    pub mask: String,
+    pub cookie: u32,
+    pub name: Option<String>,
+}
+
 /// Response sent from child to parent via stdout.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "status")]
@@ -495,6 +524,18 @@ pub enum Response {
     /// Stateful TCP connection closed.
     #[serde(rename = "closed")]
     Closed,
+
+    /// Inotify registry handle.
+    #[serde(rename = "inotify_handle")]
+    InotifyHandle { id: u64 },
+
+    /// Inotify watch descriptor.
+    #[serde(rename = "watch_descriptor")]
+    WatchDescriptor { wd: i32 },
+
+    /// Events returned by inotify_read.
+    #[serde(rename = "inotify_events")]
+    InotifyEvents { events: Vec<InotifyEvent> },
 
     /// Eventfd registry handle.
     #[serde(rename = "eventfd_handle")]
