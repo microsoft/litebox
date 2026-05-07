@@ -68,6 +68,11 @@ path. The job is to identify and fix **roots**, not to triage cascades
 individually. After a root is fixed, the cascade collapses and a new layer of
 roots becomes visible. Repeat until the delta is empty or stable.
 
+The fix-subagent role — concrete single-test invocation, audit-log capture
+command, gdbserver setup, and a crate ownership map (failure shape → likely
+crate) — is documented separately in
+[`FIX_AGENT_PLAYBOOK.md`](./FIX_AGENT_PLAYBOOK.md).
+
 In the 522→998 arc, the single Bug B fix (shim worker-stdio routing) was
 downstream of 442/446 of the then-remaining failures. Treating those as 442
 independent bugs would have wasted the session. Treating them as one root with
@@ -81,8 +86,9 @@ Each wave has four phases:
    - Capture a fresh full-suite log (`wave-<N>.log`) — this is also the
      regression gate from the previous wave.
    - For each FAIL, capture syscall/errno signature with `litebox_audit_query`
-     (see "playbook" below). Group by `(dominant_syscall, dominant_errno,
-     subsystem)` — most cascades fall out naturally.
+     (see [`FIX_AGENT_PLAYBOOK.md`](./FIX_AGENT_PLAYBOOK.md)). Group by
+     `(dominant_syscall, dominant_errno, subsystem)` — most cascades fall out
+     naturally.
    - Reduce each cluster to one or two **representative tests** that should
      reproduce the root with minimal noise.
    - Write the cluster table: cluster name, representative tests, hypothesized
@@ -175,7 +181,8 @@ Lessons from this side-investigation:
 - **Fixing tests one at a time in series.** Doesn't scale, blocks parallelism,
   and misses cascade structure.
 - **Running the full suite repeatedly during fix-time.** It's a gate, not an
-  iteration tool. Use single-test runs (see playbook) for inner loop.
+  iteration tool. Use single-test runs (see
+  [`FIX_AGENT_PLAYBOOK.md`](./FIX_AGENT_PLAYBOOK.md)) for inner loop.
 - **One subagent owning multiple unrelated clusters.** Defeats the parallelism;
   if it gets stuck on one cluster, the others stall.
 - **Cross-cluster fixes in a single commit.** Hides the fix→test mapping.
