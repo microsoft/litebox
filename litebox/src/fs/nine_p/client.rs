@@ -16,69 +16,38 @@ use super::Error;
 use super::fcall::{self, Fcall, FcallStr, GetattrMask, TaggedFcall};
 use super::transport::{self, Read, Write};
 
-/// Pool of 9P fid values, shared between the [`Client`] and every live
-/// [`Fid`] handle. Recycling a value back to the pool happens only when the
-/// last `Fid` clone for that value is dropped, so an in-flight read or write
-/// keeps the pool slot reserved even after the descriptor that owned it has
-/// been closed. This is what prevents the fid-reuse data-corruption race in
-/// concurrent close-during-read.
+/// Pool of 9P Fid values
 struct FidPool<Platform: RawSyncPrimitivesProvider> {
     inner: Mutex<Platform, IdPool>,
 }
 
 impl<Platform: RawSyncPrimitivesProvider> FidPool<Platform> {
-    /// Create a fresh empty pool with no fids in use.
     fn new() -> Self {
         Self {
             inner: Mutex::new(IdPool::new()),
         }
     }
 
-    /// Allocate a raw fid value. The caller is fully responsible for the
-    /// lifecycle: call [`recycle`](Self::recycle) if the value never reached
-    /// the server (e.g., a Twalk that errored), or [`Client::clunk_raw`]
-    /// (which recycles internally) if it did. Used for short-lived
-    /// intermediates inside [`Client::walk_chunked`] that never escape to
-    /// user code.
-    fn allocate_raw(&self) -> Result<fcall::Fid, Error> {
-        self.inner.lock().allocate().ok_or(Error::Io)
-    }
-
-    /// Wrap a raw fid value into a refcounted handle, transferring ownership
-    /// of the pool slot. The slot is recycled when the last [`Fid`] clone is
-    /// dropped.
-    fn adopt(self: &Arc<Self>, id: fcall::Fid) -> Fid<Platform> {
-        Fid {
+    /// Allocate a new fid wrapped in a refcounted handle. The pool slot is
+    /// recycled when the last [`Fid`] clone is dropped.
+    fn allocate(self: &Arc<Self>) -> Result<Fid<Platform>, Error> {
+        let id = self.inner.lock().allocate().ok_or(Error::Io)?;
+        Ok(Fid {
             inner: Arc::new(FidInner {
                 id,
                 pool: Arc::clone(self),
             }),
-        }
+        })
     }
 
-    /// Allocate directly into a refcounted handle. Equivalent to
-    /// `adopt(allocate_raw()?)` and used for fids that the caller will hand
-    /// out to user code.
-    fn allocate(self: &Arc<Self>) -> Result<Fid<Platform>, Error> {
-        let id = self.allocate_raw()?;
-        Ok(self.adopt(id))
-    }
-
-    /// Return a raw fid value to the pool, making it available for future
-    /// allocations.
+    /// Return a fid value to the pool. Called from [`FidInner::drop`] when
+    /// the last [`Fid`] clone for the value is dropped.
     fn recycle(&self, id: fcall::Fid) {
         self.inner.lock().recycle(id);
     }
 }
 
 /// Refcounted handle to a 9P fid value.
-///
-/// Cheap to clone (one `Arc` bump). The pool slot for the underlying value
-/// is reclaimed when the last clone is dropped. The 9P server-side fid is
-/// destroyed by [`Client::clunk`], which is independent: a stale Tread
-/// issued after a clunk gets `EBADF` from the server, but the *value* will
-/// not be reassigned to a different file while any handle still exists, so
-/// data corruption is not possible.
 pub(super) struct Fid<Platform: RawSyncPrimitivesProvider> {
     inner: Arc<FidInner<Platform>>,
 }
@@ -144,10 +113,6 @@ impl<Platform: RawSyncPrimitivesProvider, T: Read + Write> Client<Platform, T> {
     /// Cap on the number of entries `readdir_all` will accumulate from an
     /// untrusted server before bailing with `InvalidResponse`.
     const MAX_READDIR_ENTRIES: usize = 1_000_000;
-    /// Cap on the aggregate byte size of names accumulated by `readdir_all`.
-    /// Bounds memory in the case where a server returns a huge number of
-    /// entries with maximally long names.
-    const MAX_READDIR_NAME_BYTES: usize = 64 * 1024 * 1024;
 
     /// Create a new 9P client and perform version negotiation
     ///
@@ -193,11 +158,6 @@ impl<Platform: RawSyncPrimitivesProvider, T: Read + Write> Client<Platform, T> {
             } => return Err(Error::from(e)),
             _ => return Err(Error::InvalidResponse),
         };
-        // Reject a negotiated msize so small that subsequent reads/writes
-        // would have effectively zero payload (count = msize - IOHDRSZ).
-        if msize < MIN_MSIZE {
-            return Err(Error::InvalidResponse);
-        }
 
         wbuf.truncate(msize as usize);
         rbuf.truncate(msize as usize);
@@ -224,11 +184,14 @@ impl<Platform: RawSyncPrimitivesProvider, T: Read + Write> Client<Platform, T> {
             .map_err(|_| Error::Io)?;
 
         let mut rbuf = self.rbuf.lock();
-        let response = transport::read_message(transport, &mut rbuf, self.msize as usize)?;
-        if response.tag != tag {
-            return Err(Error::InvalidResponse);
+        // Loop until we get a response with matching tag (in case of stale responses)
+        // TODO: support concurrent requests by allowing out-of-order responses and matching tags accordingly
+        loop {
+            let response = transport::read_message(transport, &mut rbuf, self.msize as usize)?;
+            if response.tag == tag {
+                return f(response.fcall);
+            }
         }
-        f(response.fcall)
     }
 
     fn next_tag(&self) -> u16 {
@@ -255,7 +218,7 @@ impl<Platform: RawSyncPrimitivesProvider, T: Read + Write> Client<Platform, T> {
     ) -> Result<(fcall::Qid, Fid<Platform>), Error> {
         let fid = self.fids.allocate()?;
         let id = fid.id();
-        let res = self.fcall(
+        self.fcall(
             Fcall::Tattach(fcall::Tattach {
                 afid: fcall::NOFID,
                 fid: id,
@@ -268,36 +231,30 @@ impl<Platform: RawSyncPrimitivesProvider, T: Read + Write> Client<Platform, T> {
                 Fcall::Rlerror(e) => Err(Error::from(e)),
                 _ => Err(Error::InvalidResponse),
             },
-        );
-        // On error, `fid` drops here and its FidInner::drop returns the value
-        // to the pool. On success, the caller owns the Fid and is responsible
-        // for clunking when done.
-        res.map(|qid| (qid, fid))
+        )
+        .map(|qid| (qid, fid))
     }
 
-    /// Internal: walks one chunk on raw u32 fids.
+    /// Walks the path from the given fid.
     ///
-    /// Allocates a fresh fid value via [`FidPool::allocate_raw`], sends Twalk,
-    /// and returns the new value on success. On error the fid is recycled
-    /// directly (a failed Twalk does not establish newfid server-side, so no
-    /// Tclunk is needed). Used as the building block for both [`Client::walk_once`]
-    /// (which promotes the result into a [`Fid`]) and [`Client::walk_chunked`] (which
-    /// keeps intermediates as raw u32 to avoid one `Arc` allocation per chunk
-    /// on deep paths).
-    fn walk_once_raw(
+    /// The given wnames should not exceed the maximum number of elements
+    /// (`fcall::MAXWELEM`), which is checked at the beginning of the function.
+    /// Used by [`walk_chunked`](Client::walk_chunked), which handles paths
+    /// longer than `MAXWELEM`.
+    fn walk_once(
         &self,
-        fid: fcall::Fid,
+        fid: &Fid<Platform>,
         wnames: &[FcallStr],
-    ) -> Result<(Vec<fcall::Qid>, fcall::Fid), Error> {
+    ) -> Result<(Vec<fcall::Qid>, Fid<Platform>), Error> {
         if wnames.len() > fcall::MAXWELEM {
             return Err(Error::InvalidPathname);
         }
-        let new_fid = self.fids.allocate_raw()?;
+        let new_fid = self.fids.allocate()?;
         let wnames_len = wnames.len();
-        let ret = self.fcall(
+        let wqids = self.fcall(
             Fcall::Twalk(fcall::Twalk {
-                fid,
-                new_fid,
+                fid: fid.id(),
+                new_fid: new_fid.id(),
                 wnames: wnames.to_vec(),
             }),
             |response| match response {
@@ -312,50 +269,13 @@ impl<Platform: RawSyncPrimitivesProvider, T: Read + Write> Client<Platform, T> {
                 Fcall::Rlerror(err) => Err(Error::from(err)),
                 _ => Err(Error::InvalidResponse),
             },
-        );
-        match ret {
-            Ok(wqids) => Ok((wqids, new_fid)),
-            Err(err) => {
-                self.fids.recycle(new_fid);
-                Err(err)
-            }
-        }
+        )?;
+        Ok((wqids, new_fid))
     }
 
-    /// Internal: clunk a raw u32 fid value. Sends Tclunk and recycles the
-    /// pool slot. Errors from the server are swallowed (the resource is
-    /// being torn down anyway).
-    fn clunk_raw(&self, fid: fcall::Fid) {
-        let _ = self.fcall(
-            Fcall::Tclunk(fcall::Tclunk { fid }),
-            |response| match response {
-                Fcall::Rclunk(_) => Ok(()),
-                Fcall::Rlerror(e) => Err(Error::from(e)),
-                _ => Err(Error::InvalidResponse),
-            },
-        );
-        self.fids.recycle(fid);
-    }
-
-    /// Walks the path from the given fid.
-    ///
-    /// The given wnames should not exceed the maximum number of elements (fcall::MAXWELEM),
-    /// which is checked at the beginning of the function. This is an internal function that
-    /// is used by [`walk_chunked`](Client::walk_chunked), which handles the case where the number of elements exceeds the limit.
-    fn walk_once(
-        &self,
-        fid: &Fid<Platform>,
-        wnames: &[FcallStr],
-    ) -> Result<(Vec<fcall::Qid>, Fid<Platform>), Error> {
-        let (wqids, raw) = self.walk_once_raw(fid.id(), wnames)?;
-        Ok((wqids, self.fids.adopt(raw)))
-    }
-
-    /// Walks the path from the given fid, handling paths longer than fcall::MAXWELEM by walking in chunks.
-    ///
-    /// Returns the qids for each path component and a new fid for the final location on success.
-    /// Intermediate fids between chunks are kept as raw u32 to avoid an `Arc` allocation per
-    /// chunk; only the final result is promoted into a [`Fid`] handle.
+    /// Walks the path from the given fid, handling paths longer than
+    /// `fcall::MAXWELEM` by walking in chunks. Returns the qids for each path
+    /// component and a new fid for the final location on success.
     fn walk_chunked(
         &self,
         fid: &Fid<Platform>,
@@ -365,16 +285,14 @@ impl<Platform: RawSyncPrimitivesProvider, T: Read + Write> Client<Platform, T> {
             return self.walk_once(fid, wnames);
         }
         let mut wqids = Vec::with_capacity(fcall::MAXWELEM);
-        // `None` means we're still walking from the caller's input fid;
-        // `Some` is a raw intermediate that must be clunked before moving on.
-        let mut prev: Option<fcall::Fid> = None;
+        let mut prev: Option<Fid<Platform>> = None;
         for chunk in wnames.chunks(fcall::MAXWELEM) {
-            let from = prev.unwrap_or_else(|| fid.id());
-            let (mut new_wqids, new_f) = match self.walk_once_raw(from, chunk) {
+            let from = prev.as_ref().unwrap_or(fid);
+            let (mut new_wqids, new_f) = match self.walk_once(from, chunk) {
                 Ok(v) => v,
                 Err(err) => {
                     if let Some(p) = prev {
-                        self.clunk_raw(p);
+                        self.clunk(p);
                     }
                     return Err(err);
                 }
@@ -382,27 +300,21 @@ impl<Platform: RawSyncPrimitivesProvider, T: Read + Write> Client<Platform, T> {
             let new_len = new_wqids.len();
             wqids.append(&mut new_wqids);
             if let Some(p) = prev.take() {
-                self.clunk_raw(p);
+                self.clunk(p);
             }
             if new_len < chunk.len() {
-                // Partial Rwalk. The 9P2000.L spec says new_fid is unaffected
-                // when nwqid < nwname, but diod establishes it anyway, so we
-                // send Tclunk for server-side cleanup. `clunk_raw` swallows
-                // Rlerror, so this is also safe against stricter servers
-                // where the clunk would be on an unestablished fid.
-                self.clunk_raw(new_f);
+                // It means that the walk failed at the nwqid-th element
+                self.clunk(new_f);
                 return Err(Error::Remote(super::ENOENT));
             }
             prev = Some(new_f);
         }
-        // `prev` is `Some` because `wnames` was non-empty. Promote the final
-        // raw fid into a refcounted handle for the caller.
-        Ok((wqids, self.fids.adopt(prev.unwrap())))
+        Ok((wqids, prev.unwrap()))
     }
 
-    /// Walk to a path from a given fid
+    /// Walk to a path from a given fid.
     ///
-    /// Returns the qids for each path component and a new fid for the final location
+    /// Returns the qids for each path component and a new fid for the final location.
     pub(super) fn walk<S: AsRef<[u8]>>(
         &self,
         fid: &Fid<Platform>,
@@ -437,10 +349,8 @@ impl<Platform: RawSyncPrimitivesProvider, T: Read + Write> Client<Platform, T> {
     /// Create a file with the given name and flags.
     ///
     /// The input `dfid` initially represents the parent directory of the new
-    /// file; on success the same fid value represents the new file server-side
-    /// and is returned. On error, `dfid` is still bound to the parent dir
-    /// per 9P2000.L semantics, so we clunk it here so the caller doesn't have
-    /// to manage cleanup of a consumed handle.
+    /// file; on success the same fid value represents the new file server-side.
+    /// On error, we clunk it here.
     pub(super) fn create(
         &self,
         dfid: Fid<Platform>,
@@ -614,7 +524,6 @@ impl<Platform: RawSyncPrimitivesProvider, T: Read + Write> Client<Platform, T> {
         fid: &Fid<Platform>,
     ) -> Result<Vec<fcall::DirEntry<'static>>, Error> {
         let mut all_entries = Vec::new();
-        let mut name_bytes: usize = 0;
         let mut offset = 0u64;
         loop {
             let entries = self.readdir(fid, offset)?;
@@ -630,16 +539,6 @@ impl<Platform: RawSyncPrimitivesProvider, T: Read + Write> Client<Platform, T> {
                 .checked_add(entries.len())
                 .is_none_or(|len| len > Self::MAX_READDIR_ENTRIES)
             {
-                return Err(Error::InvalidResponse);
-            }
-            let chunk_bytes = entries
-                .iter()
-                .try_fold(0usize, |acc, e| acc.checked_add(e.name.len()))
-                .ok_or(Error::InvalidResponse)?;
-            name_bytes = name_bytes
-                .checked_add(chunk_bytes)
-                .ok_or(Error::InvalidResponse)?;
-            if name_bytes > Self::MAX_READDIR_NAME_BYTES {
                 return Err(Error::InvalidResponse);
             }
             offset = next_offset;
@@ -671,9 +570,7 @@ impl<Platform: RawSyncPrimitivesProvider, T: Read + Write> Client<Platform, T> {
         )
     }
 
-    /// Remove the file represented by `fid`. The server destroys the fid
-    /// regardless of whether the remove succeeds or fails, so this consumes
-    /// the [`Fid`] handle.
+    /// Remove the file represented by fid and clunk the fid, even if the remove fails.
     pub(super) fn remove(&self, fid: Fid<Platform>) -> Result<(), Error> {
         self.fcall(
             Fcall::Tremove(fcall::Tremove { fid: fid.id() }),
@@ -683,8 +580,7 @@ impl<Platform: RawSyncPrimitivesProvider, T: Read + Write> Client<Platform, T> {
                 _ => Err(Error::InvalidResponse),
             },
         )
-        // `fid` drops here regardless of result; the local pool slot is
-        // returned. Server-side, Tremove destroys the fid even on Rlerror.
+        // `fid` drops here regardless of result
     }
 
     /// Remove (unlink) a file or directory
@@ -748,14 +644,10 @@ impl<Platform: RawSyncPrimitivesProvider, T: Read + Write> Client<Platform, T> {
 
     /// Clunk (close) a fid.
     ///
-    /// Consumes the [`Fid`] handle. Sends Tclunk so the server-side fid is
-    /// destroyed; the local pool slot for the underlying value is reclaimed
+    /// the local pool slot for the underlying value is reclaimed
     /// only when the LAST `Fid` clone is dropped, so concurrent in-flight
     /// operations on a clone keep the value reserved (preventing a different
-    /// file from being assigned the same fid value while a stale Tread is in
-    /// flight). Errors from the server are intentionally swallowed — the
-    /// resource is being torn down and there's nothing useful for callers
-    /// to do with the failure.
+    /// file from being assigned the same fid).
     pub(super) fn clunk(&self, fid: Fid<Platform>) {
         let _ = self.fcall(
             Fcall::Tclunk(fcall::Tclunk { fid: fid.id() }),
@@ -765,8 +657,7 @@ impl<Platform: RawSyncPrimitivesProvider, T: Read + Write> Client<Platform, T> {
                 _ => Err(Error::InvalidResponse),
             },
         );
-        // `fid` drops here. If this was the last clone, FidInner::drop runs
-        // and recycles the pool slot.
+        // Per 9P2000.L semantics, the server-side fid is destroyed even if clunk fails.
     }
 
     /// Clone a fid (walk with empty path)
