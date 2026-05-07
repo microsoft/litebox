@@ -370,76 +370,80 @@ fn register_tcp_reconnect_stress_tests(reg: &mut Registry<'_>) {
 fn register_tcp_fullduplex_tests(reg: &mut Registry<'_>) {
     let mut port = 20_300u16;
     for &agent in TF_AGENTS {
-        let test_id = format!("TF.{agent}");
-        let p = port;
-        port += 1;
+        for &bt in crate::BinaryType::ALL {
+            let bt_label = bt.label();
+            let test_id = format!("TF.{bt_label}.{agent}");
+            let p = port;
+            port += 1;
 
-        reg.test("stress", "tcp_stress", test_id)
-            .timeout(180)
-            .build(move |cx| {
-                let handle = cx.require(agent);
-                let agent_label = agent.to_string();
-                Box::new(move |run| {
-                    Box::pin(async move {
-                        let self_exe = run.self_exe().to_string();
-                        let server_resp = run
-                            .send(
-                                &handle,
-                                crate::protocol::Command::Exec {
-                                    args: vec![
-                                        self_exe.clone(),
-                                        "tcp-fullduplex".into(),
-                                        p.to_string(),
-                                        TF_SIZE.to_string(),
-                                    ],
-                                    timeout_secs: Some(30),
-                                    stdin: None,
-                                    background: true,
-                                    env: vec![],
-                                },
-                            )
-                            .await;
-                        let server_pid = match &server_resp {
-                            crate::protocol::Response::Background { pid } => Some(*pid),
-                            _ => {
-                                return super::TestOutcome::new(
-                                    &agent_label,
-                                    false,
-                                    format!("server spawn failed: {server_resp:?}"),
-                                );
-                            }
-                        };
-                        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-                        let client_resp = run
-                            .send(
-                                &handle,
-                                super::exec_timeout(
-                                    vec![
-                                        self_exe,
-                                        "tcp-fullduplex-client".into(),
-                                        format!("127.0.0.1:{p}"),
-                                        TF_SIZE.to_string(),
-                                    ],
-                                    15,
-                                ),
-                            )
-                            .await;
-                        if let Some(pid) = server_pid {
-                            let _ = run
-                                .send(&handle, crate::protocol::Command::Kill { pid })
+            reg.test("stress", "tcp_stress", test_id)
+                .timeout(180)
+                .build(move |cx| {
+                    let handle = cx.require(agent);
+                    let agent_label = agent.to_string();
+                    Box::new(move |run| {
+                        Box::pin(async move {
+                            let self_exe = run.self_exe().to_string();
+                            let target = crate::binary_path(bt, &self_exe);
+                            let server_resp = run
+                                .send(
+                                    &handle,
+                                    crate::protocol::Command::Exec {
+                                        args: vec![
+                                            target.clone(),
+                                            "tcp-fullduplex".into(),
+                                            p.to_string(),
+                                            TF_SIZE.to_string(),
+                                        ],
+                                        timeout_secs: Some(30),
+                                        stdin: None,
+                                        background: true,
+                                        env: vec![],
+                                    },
+                                )
                                 .await;
-                        }
-                        let pass = match &client_resp {
-                            crate::protocol::Response::ExecResult { stdout, .. } => {
-                                stdout.contains(&format!("CLIENT:sent={TF_SIZE}"))
-                                    && stdout.contains("recv=")
+                            let server_pid = match &server_resp {
+                                crate::protocol::Response::Background { pid } => Some(*pid),
+                                _ => {
+                                    return super::TestOutcome::new(
+                                        &agent_label,
+                                        false,
+                                        format!("server spawn failed: {server_resp:?}"),
+                                    );
+                                }
+                            };
+                            tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+                            let client_resp = run
+                                .send(
+                                    &handle,
+                                    super::exec_timeout(
+                                        vec![
+                                            target,
+                                            "tcp-fullduplex-client".into(),
+                                            format!("127.0.0.1:{p}"),
+                                            TF_SIZE.to_string(),
+                                        ],
+                                        15,
+                                    ),
+                                )
+                                .await;
+                            if let Some(pid) = server_pid {
+                                let _ = run
+                                    .send(&handle, crate::protocol::Command::Kill { pid })
+                                    .await;
                             }
-                            _ => false,
-                        };
-                        super::TestOutcome::new(&agent_label, pass, format!("{client_resp:?}"))
+                            let pass = match &client_resp {
+                                crate::protocol::Response::ExecResult { stdout, .. } => {
+                                    stdout.contains(&format!("CLIENT:sent={TF_SIZE}"))
+                                        && stdout.contains("recv=")
+                                }
+                                _ => false,
+                            };
+                            super::TestOutcome::new(&agent_label, pass, format!("{client_resp:?}"))
+                        })
                     })
-                })
-            });
+                });
+        }
     }
 }
 
