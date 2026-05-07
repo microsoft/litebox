@@ -156,7 +156,7 @@ pub enum Command {
 
     /// Fork+exec in the background, but return only after stdout/stderr
     /// contains the requested readiness marker. Output remains captured for
-    /// WaitBackground, and is drained after readiness so helpers cannot block.
+    /// `WaitBackground`, and is drained after readiness so helpers cannot block.
     #[serde(rename = "exec_ready")]
     ExecReady {
         args: Vec<String>,
@@ -184,7 +184,7 @@ pub enum Command {
 
     /// Wait for a previously backgrounded process to exit and return its
     /// captured output. For plain Exec background commands stdout/stderr are
-    /// empty; ExecReady backgrounds retain captured output.
+    /// empty; `ExecReady` backgrounds retain captured output.
     #[serde(rename = "wait_background")]
     WaitBackground {
         pid: u32,
@@ -250,6 +250,34 @@ pub enum Command {
         count: u32,
         data: String,
     },
+
+    /// Open a pseudo-terminal pair and register the master fd.
+    #[serde(rename = "pty_open")]
+    PtyOpen {},
+
+    /// Fork+exec `args` with stdio attached to a registered pty slave.
+    #[serde(rename = "pty_exec")]
+    PtyExec {
+        master: u64,
+        args: Vec<String>,
+        ctrl_tty: bool,
+    },
+
+    /// Write bytes to a registered pty master.
+    #[serde(rename = "pty_write")]
+    PtyWrite { master: u64, data: String },
+
+    /// Read bytes from a registered pty master. None means read until EOF.
+    #[serde(rename = "pty_read")]
+    PtyRead { master: u64, n_bytes: Option<u32> },
+
+    /// Resize the terminal window for a registered pty master.
+    #[serde(rename = "pty_resize")]
+    PtyResize { master: u64, rows: u16, cols: u16 },
+
+    /// Close and unregister a pty master.
+    #[serde(rename = "pty_close")]
+    PtyClose { master: u64 },
 
     /// Connect to `addr`, send `size` bytes, read file at `path`, then read
     /// echoed TCP data. Reports both file content and TCP integrity. Tests for
@@ -319,6 +347,10 @@ pub enum Response {
     /// Stateful TCP connection opened.
     #[serde(rename = "opened")]
     Opened { conn: u64 },
+
+    /// PTY master handle and slave path.
+    #[serde(rename = "pty_handle")]
+    PtyHandle { master: u64, slave_path: String },
 
     /// Stateful TCP bytes sent.
     #[serde(rename = "sent")]
