@@ -277,10 +277,6 @@ pub enum Command {
     #[serde(rename = "pipe_pair_id_unique")]
     PipePairIdUnique { count: u32 },
 
-    /// Proceed (used after coordination points).
-    #[serde(rename = "go")]
-    Go,
-
     /// Shut down gracefully.
     #[serde(rename = "exit")]
     Exit,
@@ -371,13 +367,4 @@ pub enum Response {
     /// Error.
     #[serde(rename = "error")]
     Error { error: String },
-
-    /// Test result (for structured reporting).
-    #[serde(rename = "test_result")]
-    TestResult {
-        test: String,
-        agent: String,
-        result: String,
-        detail: String,
-    },
 }

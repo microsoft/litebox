@@ -1213,21 +1213,22 @@ pub(crate) fn register_cross_worker_file_tests(reg: &mut Registry<'_>) {
                         let resp = run
                             .send(
                                 &handle,
-                                Command::Exec {
+                                Command::ExecReady {
                                     args: vec![
                                         self_exe,
                                         "cross-worker-file".into(),
                                         "write-and-sleep".into(),
                                         path.clone(),
                                     ],
-                                    timeout_secs: None,
+                                    ready_marker: "[cross-worker-file] READY".into(),
+                                    timeout_secs: Some(15),
                                     stdin: None,
-                                    background: true,
+                                    stream: "stderr".into(),
                                 },
                             )
                             .await;
                         let bg_pid = match &resp {
-                            Response::Background { pid } => Some(*pid),
+                            Response::BackgroundReady { pid } => Some(*pid),
                             _ => {
                                 return super::TestOutcome::new(
                                     &a,
@@ -1236,7 +1237,6 @@ pub(crate) fn register_cross_worker_file_tests(reg: &mut Registry<'_>) {
                                 );
                             }
                         };
-                        tokio::time::sleep(Duration::from_secs(3)).await;
                         let resp = run
                             .send(&handle, Command::FsRead { path: path.clone() })
                             .await;
@@ -1268,21 +1268,22 @@ pub(crate) fn register_cross_worker_file_tests(reg: &mut Registry<'_>) {
                             let resp = run
                                 .send(
                                     &handle,
-                                    Command::Exec {
+                                    Command::ExecReady {
                                         args: vec![
                                             self_exe,
                                             "cross-worker-file".into(),
                                             "write-and-hold".into(),
                                             path.clone(),
                                         ],
-                                        timeout_secs: None,
+                                        ready_marker: "[cross-worker-file] READY".into(),
+                                        timeout_secs: Some(15),
                                         stdin: None,
-                                        background: true,
+                                        stream: "stderr".into(),
                                     },
                                 )
                                 .await;
                             let bg_pid = match &resp {
-                                Response::Background { pid } => Some(*pid),
+                                Response::BackgroundReady { pid } => Some(*pid),
                                 _ => {
                                     return super::TestOutcome::new(
                                         &a,
@@ -1291,7 +1292,6 @@ pub(crate) fn register_cross_worker_file_tests(reg: &mut Registry<'_>) {
                                     );
                                 }
                             };
-                            tokio::time::sleep(Duration::from_secs(3)).await;
                             let resp = run
                                 .send(&handle, Command::FsRead { path: path.clone() })
                                 .await;
@@ -1324,32 +1324,46 @@ pub(crate) fn register_cross_worker_file_tests(reg: &mut Registry<'_>) {
                     let self_exe = run.self_exe().to_string();
                     Box::pin(async move {
                         let path = format!("/shared/cwf-self-{a}.txt");
-                        let script = format!(
-                            concat!(
-                                "rm -f {path}; ",
-                                "{exe} cross-worker-file write-and-hold {path} &\n",
-                                "BGPID=$!\nsleep 3\ncat {path}\n",
-                                "kill $BGPID 2>/dev/null\n",
-                            ),
-                            path = path,
-                            exe = self_exe,
-                        );
+                        let _ = run
+                            .send(&handle, Command::FsDelete { path: path.clone() })
+                            .await;
                         let resp = run
                             .send(
                                 &handle,
-                                Command::Exec {
-                                    args: vec!["bash".into(), "-c".into(), script],
+                                Command::ExecReady {
+                                    args: vec![
+                                        self_exe,
+                                        "cross-worker-file".into(),
+                                        "write-and-hold".into(),
+                                        path.clone(),
+                                    ],
+                                    ready_marker: "[cross-worker-file] READY".into(),
                                     timeout_secs: Some(15),
                                     stdin: None,
-                                    background: false,
+                                    stream: "stderr".into(),
                                 },
                             )
                             .await;
+                        let pid = match &resp {
+                            Response::BackgroundReady { pid } => Some(*pid),
+                            _ => {
+                                return super::TestOutcome::new(
+                                    &a,
+                                    false,
+                                    format!("bg spawn failed: {resp:?}"),
+                                );
+                            }
+                        };
+                        let resp = run
+                            .send(&handle, Command::FsRead { path: path.clone() })
+                            .await;
                         let pass = matches!(
                             &resp,
-                            Response::ExecResult { stdout, .. }
-                                if stdout.starts_with("line0")
+                            Response::Ok { data: Some(d) } if d.starts_with("line0")
                         );
+                        if let Some(pid) = pid {
+                            let _ = run.send(&handle, Command::Kill { pid }).await;
+                        }
                         super::TestOutcome::new(&a, pass, format!("{resp:?}"))
                     })
                 })
@@ -1375,10 +1389,8 @@ pub(crate) fn register_cross_worker_file_tests(reg: &mut Registry<'_>) {
                         let script = format!(
                             concat!(
                                 "rm -f {path}; ",
-                                "{exe} cross-worker-file write-stdout ",
-                                "> {path} 2>&1 &\n",
-                                "BGPID=$!\nsleep 3\ncat {path}\n",
-                                "kill $BGPID 2>/dev/null\n",
+                                "{exe} cross-worker-file write-stdout > {path} &\n",
+                                "wait $!\n",
                             ),
                             path = path,
                             exe = self_exe,
@@ -1386,19 +1398,35 @@ pub(crate) fn register_cross_worker_file_tests(reg: &mut Registry<'_>) {
                         let resp = run
                             .send(
                                 &handle,
-                                Command::Exec {
+                                Command::ExecReady {
                                     args: vec!["bash".into(), "-c".into(), script],
+                                    ready_marker: "[cross-worker-file] READY".into(),
                                     timeout_secs: Some(15),
                                     stdin: None,
-                                    background: false,
+                                    stream: "stderr".into(),
                                 },
                             )
                             .await;
+                        let pid = match &resp {
+                            Response::BackgroundReady { pid } => Some(*pid),
+                            _ => {
+                                return super::TestOutcome::new(
+                                    &a,
+                                    false,
+                                    format!("bg spawn failed: {resp:?}"),
+                                );
+                            }
+                        };
+                        let resp = run
+                            .send(&handle, Command::FsRead { path: path.clone() })
+                            .await;
                         let pass = matches!(
                             &resp,
-                            Response::ExecResult { stdout, .. }
-                                if stdout.contains("line0")
+                            Response::Ok { data: Some(d) } if d.contains("line0")
                         );
+                        if let Some(pid) = pid {
+                            let _ = run.send(&handle, Command::Kill { pid }).await;
+                        }
                         super::TestOutcome::new(&a, pass, format!("{resp:?}"))
                     })
                 })
@@ -1651,17 +1679,19 @@ pub(crate) fn register_concurrent_fork_tests(reg: &mut Registry<'_>) {
                                     &handle,
                                     Command::Exec {
                                         args: vec!["bash".into(), "-c".into(), script],
-                                        timeout_secs: None,
+                                        timeout_secs: Some(10),
                                         stdin: None,
-                                        background: true,
+                                        background: false,
                                     },
                                 )
                                 .await;
-                            let pid = match &resp {
-                                Response::Background { pid } => Some(*pid),
-                                _ => None,
-                            };
-                            tokio::time::sleep(Duration::from_secs(3)).await;
+                            if !matches!(&resp, Response::ExecResult { exit_code: 0, .. }) {
+                                return super::TestOutcome::new(
+                                    &a,
+                                    false,
+                                    format!("writer failed: {resp:?}"),
+                                );
+                            }
                             let resp = run
                                 .send(&handle, Command::FsRead { path: path.clone() })
                                 .await;
@@ -1669,9 +1699,6 @@ pub(crate) fn register_concurrent_fork_tests(reg: &mut Registry<'_>) {
                                 &resp,
                                 Response::Ok { data: Some(d) } if check(d)
                             );
-                            if let Some(pid) = pid {
-                                let _ = run.send(&handle, Command::Kill { pid }).await;
-                            }
                             super::TestOutcome::new(&a, pass, format!("{resp:?}"))
                         })
                     })
@@ -1695,9 +1722,8 @@ pub(crate) fn register_touch_redirect_tests(reg: &mut Registry<'_>) {
             name: "no_touch",
             script_template: concat!(
                 "rm -f {path}; ",
-                "{exe} echo-test > {path} 2>&1 &\n",
-                "BGPID=$!\nsleep 2\ncat {path}\n",
-                "kill $BGPID 2>/dev/null\n",
+                "{exe} echo-test > {path} 2>&1\n",
+                "cat {path}\n",
             ),
             check: |s| s.contains("ECHO_TEST_OK"),
         },
@@ -1705,9 +1731,8 @@ pub(crate) fn register_touch_redirect_tests(reg: &mut Registry<'_>) {
             name: "touch",
             script_template: concat!(
                 "rm -f {path}; touch {path}; ",
-                "{exe} echo-test > {path} 2>&1 &\n",
-                "BGPID=$!\nsleep 2\ncat {path}\n",
-                "kill $BGPID 2>/dev/null\n",
+                "{exe} echo-test > {path} 2>&1\n",
+                "cat {path}\n",
             ),
             check: |s| s.contains("ECHO_TEST_OK"),
         },
@@ -1715,9 +1740,8 @@ pub(crate) fn register_touch_redirect_tests(reg: &mut Registry<'_>) {
             name: "touch_chmod",
             script_template: concat!(
                 "rm -f {path}; touch {path}; chmod 600 {path}; ",
-                "{exe} echo-test > {path} 2>&1 &\n",
-                "BGPID=$!\nsleep 2\ncat {path}\n",
-                "kill $BGPID 2>/dev/null\n",
+                "{exe} echo-test > {path} 2>&1\n",
+                "cat {path}\n",
             ),
             check: |s| s.contains("ECHO_TEST_OK"),
         },
@@ -1725,9 +1749,8 @@ pub(crate) fn register_touch_redirect_tests(reg: &mut Registry<'_>) {
             name: "echo_touch",
             script_template: concat!(
                 "rm -f {path}; echo init > {path}; ",
-                "{exe} echo-test > {path} 2>&1 &\n",
-                "BGPID=$!\nsleep 2\ncat {path}\n",
-                "kill $BGPID 2>/dev/null\n",
+                "{exe} echo-test > {path} 2>&1\n",
+                "cat {path}\n",
             ),
             check: |s| s.contains("ECHO_TEST_OK"),
         },
@@ -1797,7 +1820,7 @@ pub(crate) fn register_pid_visibility_tests(reg: &mut Registry<'_>) {
         Def {
             name: "kill0_bg",
             script_template: concat!(
-                "{exe} slow-echo > /dev/null 2>&1 &\n",
+                "sleep 30 > /dev/null 2>&1 &\n",
                 "PID=$!\n",
                 "kill -0 $PID 2>/dev/null && echo KILL0_OK || echo KILL0_FAIL\n",
                 "kill $PID 2>/dev/null; wait $PID 2>/dev/null\n",
@@ -1811,21 +1834,21 @@ pub(crate) fn register_pid_visibility_tests(reg: &mut Registry<'_>) {
                 "B=$(uname -m)\n",
                 "C=$(ls /tmp | head -1)\n",
                 "D=$(echo x | cat)\n",
-                "{exe} slow-echo > /dev/null 2>&1 &\n",
+                "sleep 2 > /dev/null 2>&1 &\n",
                 "PID=$!\n",
                 "kill -0 $PID 2>/dev/null && echo KILL0_OK || echo KILL0_FAIL\n",
                 "sleep 1\n",
                 "kill -0 $PID 2>/dev/null && echo KILL0_1s_OK || echo KILL0_1s_FAIL\n",
-                "kill $PID 2>/dev/null; wait $PID 2>/dev/null\n",
+                "wait $PID 2>/dev/null\n",
             ),
             check: |s| s.contains("KILL0_OK") && s.contains("KILL0_1s_OK"),
         },
         Def {
             name: "proc_child",
             script_template: concat!(
-                "{exe} slow-echo > /dev/null 2>&1 &\n",
+                "{exe} cross-worker-file write-and-hold /shared/kp-proc-child.txt > /dev/null 2>&1 &\n",
                 "PID=$!\n",
-                "sleep 1\n",
+                "until cat /proc/$PID/cmdline 2>/dev/null | tr '\\0' ' ' | grep -q litebox_test_harness; do :; done\n",
                 "test -d /proc/$PID && echo PROC_DIR_OK || echo PROC_DIR_FAIL\n",
                 "cat /proc/$PID/cmdline 2>/dev/null | tr '\\0' ' ' | ",
                 "grep -q litebox_test_harness && echo CMDLINE_OK || echo CMDLINE_FAIL\n",
