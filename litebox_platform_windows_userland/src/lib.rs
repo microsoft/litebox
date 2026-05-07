@@ -414,8 +414,6 @@ struct TlsState {
     host_bp: Cell<*mut u128>,
     guest_context_top: Cell<*mut litebox_common_linux::PtRegs>,
     scratch: Cell<usize>,
-    scratch2: Cell<usize>,
-    teb_arbitrary_user_pointer: Cell<usize>,
     /// Syscall call-site restart address from the rewriter trampoline,
     /// saved here for future SA_RESTART support. Not stored in pt_regs
     /// (which holds RFLAGS in the r11 slot per the kernel ABI).
@@ -439,8 +437,6 @@ impl TlsState {
             host_bp: Cell::new(core::ptr::null_mut()),
             guest_context_top: core::ptr::null_mut::<litebox_common_linux::PtRegs>().into(),
             scratch: 0.into(),
-            scratch2: 0.into(),
-            teb_arbitrary_user_pointer: 0.into(),
             saved_restart_addr: 0.into(),
             is_in_guest: false.into(),
             interrupt: false.into(),
@@ -489,7 +485,7 @@ fn get_tls_ptr() -> Option<*const TlsState> {
 ///
 /// This saves all non-volatile register state then switches to the guest
 /// context. When the guest makes a syscall, it jumps back into the middle of
-/// this routine, at the syscall callback. This code then updates the guest
+/// this routine, at `syscall_callback`. This code then updates the guest
 /// context structure, switches back to the host stack, and calls the syscall
 /// handler.
 ///
@@ -553,8 +549,6 @@ unsafe extern "C-unwind" fn run_thread_arch(thread_ctx: &mut ThreadContext, tls_
     // Save the host rsp and rbp into the TLS state.
     mov     QWORD PTR [rdx + {HOST_SP}], rsp
     mov     QWORD PTR [rdx + {HOST_BP}], rbp
-    mov     rax, QWORD PTR gs:[0x28]
-    mov     QWORD PTR [rdx + {TEB_ARBITRARY_USER_POINTER}], rax
 
     call {init_handler}
     jmp .Ldone
@@ -566,33 +560,31 @@ unsafe extern "C-unwind" fn run_thread_arch(thread_ctx: &mut ThreadContext, tls_
     //   3. Loaded the return address into RCX
     //
     // All other registers hold guest state.
-    .globl  syscall_callback_redzone
-syscall_callback_redzone:
+    .globl  syscall_callback
+syscall_callback:
     // Save guest R11 (restart address from rewriter trampoline) to
     // TEB.ArbitraryUserPointer (gs:[0x28]) before the TLS index lookup
-    // clobbers R11. This slot is per-thread and the window is very narrow:
-    // only inline asm with no API calls, Rust code, or DLL activity.
+    // clobbers R11. Windows has no direct equivalent of Linux's TLS-relative
+    // store before TLS lookup, so this per-thread TEB slot is used as the
+    // narrow pre-TLS scratch location. No calls, Rust code, or DLL activity
+    // occur before the value is copied into TlsState below.
     mov     gs:[0x28], r11
     // Get the TLS state from the TLS slot and clear the in-guest flag.
     mov     r11d, DWORD PTR [rip + {TLS_INDEX}]
     mov     r11, QWORD PTR gs:[r11 * 8 + TEB_TLS_SLOTS_OFFSET]
     mov     BYTE PTR [r11 + {IS_IN_GUEST}], 0
     // Recover the restart address from the TEB slot and store it in TLS
-    // without touching the guest stack. RAX is saved in a dedicated TLS
-    // scratch slot for this tiny window, then restored before pt_regs capture.
-    mov     QWORD PTR [r11 + {SCRATCH2}], rax
+    // without touching the guest stack. SCRATCH is reused below for the
+    // recovered guest RSP after RAX has been restored.
+    mov     QWORD PTR [r11 + {SCRATCH}], rax
     mov     rax, QWORD PTR gs:[0x28]
     mov     QWORD PTR [r11 + {SAVED_RESTART_ADDR}], rax
-    mov     rax, QWORD PTR [r11 + {TEB_ARBITRARY_USER_POINTER}]
-    mov     QWORD PTR gs:[0x28], rax
-    mov     rax, QWORD PTR [r11 + {SCRATCH2}]
+    mov     rax, QWORD PTR [r11 + {SCRATCH}]
     // Recover the architectural guest stack pointer (undo the 128-byte
     // red zone reservation) and store it in SCRATCH.  LEA is used instead
     // of ADD to avoid clobbering RFLAGS before pushfq.
     lea     rsp, [rsp + 128]
     mov     QWORD PTR [r11 + {SCRATCH}], rsp
-
-.Lsyscall_callback_common:
     mov     rsp, QWORD PTR [r11 + {GUEST_CONTEXT_TOP}]
 
     // TODO: save float and vector registers (xsave or fxsave)
@@ -612,7 +604,7 @@ syscall_callback_redzone:
     push    r8          // pt_regs->r8
     push    r9          // pt_regs->r9
     push    r10         // pt_regs->r10
-    push    [rsp + 88]  // pt_regs->r11 = rflags (matching real syscall ABI)
+    push    [rsp + 88]  // pt_regs->r11 = rflags
     push    rbx         // pt_regs->bx
     push    rbp         // pt_regs->bp
     push    r12
@@ -677,8 +669,6 @@ interrupt_callback:
     HOST_BP = const core::mem::offset_of!(TlsState, host_bp),
     GUEST_CONTEXT_TOP = const core::mem::offset_of!(TlsState, guest_context_top),
     SCRATCH = const core::mem::offset_of!(TlsState, scratch),
-    SCRATCH2 = const core::mem::offset_of!(TlsState, scratch2),
-    TEB_ARBITRARY_USER_POINTER = const core::mem::offset_of!(TlsState, teb_arbitrary_user_pointer),
     SAVED_RESTART_ADDR = const core::mem::offset_of!(TlsState, saved_restart_addr),
     IS_IN_GUEST = const core::mem::offset_of!(TlsState, is_in_guest),
     );
@@ -1972,7 +1962,7 @@ impl litebox::mm::allocator::MemoryProvider for WindowsUserland {
 
 unsafe extern "C" {
     // Defined in asm blocks above
-    fn syscall_callback_redzone() -> isize;
+    fn syscall_callback() -> isize;
     fn exception_callback() -> isize;
     fn interrupt_callback();
     fn switch_to_guest_start();
@@ -2062,7 +2052,7 @@ impl ThreadContext<'_> {
 
 impl litebox::platform::SystemInfoProvider for WindowsUserland {
     fn get_syscall_entry_point(&self) -> usize {
-        syscall_callback_redzone as *const () as usize
+        syscall_callback as *const () as usize
     }
 
     fn get_vdso_address(&self) -> Option<usize> {

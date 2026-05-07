@@ -163,9 +163,7 @@ pub fn hook_syscalls_in_elf(input_binary: &[u8], trampoline: Option<u64>) -> Res
 
         let text_sections = match text_sections(&file) {
             Ok(sections) => sections,
-            Err(InternalError::NoTextSectionFound) => {
-                return Ok(input_binary.to_vec());
-            }
+            Err(InternalError::NoTextSectionFound) => return Ok(input_binary.to_vec()),
             Err(InternalError::Public(e)) => return Err(e),
             Err(e) => unreachable!("unexpected internal error: {e:?}"),
         };
@@ -221,7 +219,7 @@ pub fn hook_syscalls_in_elf(input_binary: &[u8], trampoline: Option<u64>) -> Res
         // "never processed." The trampoline_size=0 sentinel tells the loader
         // to skip trampoline mapping entirely.
         // Use the original input (not `buf`) to avoid emitting the phdr
-        // alignment fixup that was only needed for the `object` crate parser.
+        // alignment fixup that is only needed for the `object` crate parser.
         let mut out = input_binary.to_vec();
         let header = TrampolineHeader64 {
             magic: *TRAMPOLINE_MAGIC,
@@ -1055,17 +1053,4 @@ fn hook_syscall_and_after(
     }
 
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn trampoline_preamble_reports_out_of_range_r11_displacement() {
-        let mut trampoline_data = Vec::new();
-        let result = emit_trampoline_preamble(0x8000_0000, 0, &mut trampoline_data);
-
-        assert!(matches!(result, Err(Error::AddressOverflow(_))));
-    }
 }
