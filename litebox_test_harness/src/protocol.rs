@@ -80,7 +80,17 @@ pub enum Command {
 
     /// Exercise curated `clone3(2)` flag combinations.
     #[serde(rename = "clone3")]
-    Clone3 { kind: Clone3Kind },
+    Clone3 {
+        kind: Clone3Kind,
+        /// Optional path the cloned child should execve into (with
+        /// `echo-test` as argv[1]) instead of the default
+        /// `/bin/sh -c …`. Used by the BinaryType matrix to exercise
+        /// fork+exec with each binary type. `None` preserves the
+        /// legacy `/bin/sh` behavior. Ignored for `Clone3Kind::Thread`
+        /// (threads share the parent's address space and do not exec).
+        #[serde(default)]
+        exec_target: Option<String>,
+    },
 
     /// Read a file and report contents (or `not_found`).
     #[serde(rename = "fs_read")]

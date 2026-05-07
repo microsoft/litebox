@@ -374,8 +374,8 @@ async fn agent_loop(self_exe: &str) {
                 .await;
             }
 
-            Command::Clone3 { kind } => {
-                let result = tokio::task::spawn_blocking(move || run_clone3(kind))
+            Command::Clone3 { kind, exec_target } => {
+                let result = tokio::task::spawn_blocking(move || run_clone3(kind, exec_target))
                     .await
                     .unwrap_or_else(|e| clone_result_error(format!("clone3 task join: {e}")));
                 respond(&Response::CloneResult {
@@ -2513,20 +2513,23 @@ fn wait_for_child(pid: libc::pid_t) -> Result<(), String> {
     }
 }
 
-fn run_clone3(kind: Clone3Kind) -> crate::protocol::CloneResult {
+fn run_clone3(kind: Clone3Kind, exec_target: Option<String>) -> crate::protocol::CloneResult {
     match kind {
         Clone3Kind::Thread => run_clone3_thread(),
-        Clone3Kind::Process => run_clone3_process(false, None, None),
-        Clone3Kind::WithPidfd => run_clone3_process(true, None, None),
-        Clone3Kind::WithSetTid { tid } => run_clone3_process(false, Some(tid), None),
-        Clone3Kind::WithCgroup { cgroup_fd } => run_clone3_with_cgroup(cgroup_fd),
+        Clone3Kind::Process => run_clone3_process(false, None, None, exec_target),
+        Clone3Kind::WithPidfd => run_clone3_process(true, None, None, exec_target),
+        Clone3Kind::WithSetTid { tid } => run_clone3_process(false, Some(tid), None, exec_target),
+        Clone3Kind::WithCgroup { cgroup_fd } => run_clone3_with_cgroup(cgroup_fd, exec_target),
     }
 }
 
-fn run_clone3_with_cgroup(cgroup_fd: u64) -> crate::protocol::CloneResult {
+fn run_clone3_with_cgroup(
+    cgroup_fd: u64,
+    exec_target: Option<String>,
+) -> crate::protocol::CloneResult {
     use std::os::fd::{AsRawFd, FromRawFd};
     if cgroup_fd != 0 {
-        return run_clone3_process(false, None, Some(cgroup_fd as i32));
+        return run_clone3_process(false, None, Some(cgroup_fd as i32), exec_target);
     }
     let path = std::ffi::CString::new("/sys/fs/cgroup").expect("literal has no NUL");
     // SAFETY: `path` is a valid C string. On success, `open` returns a new fd
@@ -2545,7 +2548,7 @@ fn run_clone3_with_cgroup(cgroup_fd: u64) -> crate::protocol::CloneResult {
     }
     // SAFETY: `fd` was just returned by `open` and is uniquely owned here.
     let owned = unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) };
-    run_clone3_process(false, None, Some(owned.as_raw_fd()))
+    run_clone3_process(false, None, Some(owned.as_raw_fd()), exec_target)
 }
 
 fn run_clone3_thread() -> crate::protocol::CloneResult {
@@ -2635,6 +2638,7 @@ fn run_clone3_process(
     with_pidfd: bool,
     set_tid: Option<u64>,
     cgroup_fd: Option<i32>,
+    exec_target: Option<String>,
 ) -> crate::protocol::CloneResult {
     let mut pidfd = -1i32;
     let mut child_tid = 0i32;
@@ -2672,21 +2676,35 @@ fn run_clone3_process(
         )
     };
     if rc == 0 {
-        // SAFETY: These are static NUL-terminated strings; execl either
-        // replaces the process image or returns, after which SYS_exit ends only
+        // SAFETY: NUL-terminated strings; execl/execv either replaces
+        // the process image or returns, after which SYS_exit ends only
         // the child process.
         unsafe {
-            let shell = c"/bin/sh";
-            let arg0 = c"sh";
-            let arg1 = c"-c";
-            let arg2 = c"getpid >/dev/null; exit 0";
-            libc::execl(
-                shell.as_ptr(),
-                arg0.as_ptr(),
-                arg1.as_ptr(),
-                arg2.as_ptr(),
-                std::ptr::null::<libc::c_char>(),
-            );
+            if let Some(target) = exec_target {
+                let target_c = std::ffi::CString::new(target.as_str())
+                    .unwrap_or_else(|_| std::ffi::CString::new("/bin/false").unwrap());
+                let arg0 = std::ffi::CString::new(target.as_str())
+                    .unwrap_or_else(|_| std::ffi::CString::new("/bin/false").unwrap());
+                let arg1 = c"echo-test";
+                libc::execl(
+                    target_c.as_ptr(),
+                    arg0.as_ptr(),
+                    arg1.as_ptr(),
+                    std::ptr::null::<libc::c_char>(),
+                );
+            } else {
+                let shell = c"/bin/sh";
+                let arg0 = c"sh";
+                let arg1 = c"-c";
+                let arg2 = c"getpid >/dev/null; exit 0";
+                libc::execl(
+                    shell.as_ptr(),
+                    arg0.as_ptr(),
+                    arg1.as_ptr(),
+                    arg2.as_ptr(),
+                    std::ptr::null::<libc::c_char>(),
+                );
+            }
             libc::syscall(libc::SYS_exit, 127i32);
         }
         unreachable!();
