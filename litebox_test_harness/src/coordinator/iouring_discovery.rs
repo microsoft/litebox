@@ -17,7 +17,8 @@ use super::registry::Registry;
 const ENOSYS: i32 = libc::ENOSYS;
 const EOPNOTSUPP: i32 = libc::EOPNOTSUPP;
 
-pub(crate) const IOR_AGENTS: &[AgentName] = &[AgentName::A, AgentName::AA, AgentName::B];
+pub(crate) const IOR_AGENTS: &[AgentName] =
+    &[AgentName::Dpg1, AgentName::Dpg1Dpg1, AgentName::Dpg2];
 
 const IOR_SCENARIOS: &[IorScenario] = &[
     IorScenario {

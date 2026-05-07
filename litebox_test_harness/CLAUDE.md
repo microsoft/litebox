@@ -199,6 +199,97 @@ Lessons from this side-investigation:
 - [ ] Out-of-scope FAILs explicitly listed (e.g., disabled suites) so they
       don't get re-triaged each wave.
 
+## Agent Taxonomy
+
+Tests run against an explicit tree of *agents* — the coordinator and
+its descendants — set up by `coordinator/mod.rs::spawn_tree`. Each
+agent is a separate `litebox_test_harness` process; tests address
+them by handle (`AgentHandle`) and route commands through the
+coordinator.
+
+### Naming convention: structural, not type-bearing
+
+Agent names encode **only structural position** (depth + branch +
+isolation context). Binary type (`PieGlibc`, `NonPieGlibc`,
+`StaticPieGlibc`, `StaticPieMusl`, `NonPieStaticMusl`) is a
+**separate, orthogonal axis** set per-spec at spawn time, never part
+of the agent name.
+
+| Position | Names |
+|---|---|
+| Coordinator | `Init` |
+| Depth 1, structural siblings | `A`, `B` |
+| Depth 2, children of `A` | `AA`, `AB` |
+| Depth 2, children of `B` | `BA`, `BB` |
+| Depth 3, children of `AA` | `AAA`, `AAB` |
+| Depth 4, child of `AAA` | `AAAA` |
+| Depth 5, child of `AAAA` | `AAAAA` |
+| Disposable subtree (SK family `SIGKILL`s these) | `K`, `KK` |
+
+### Why no `NP` / `NPC` / `D3` / `D4` / `D5`?
+
+These names predate the `BinaryType` axis. They encoded
+"non-PIE-flavored child of `A`" / "PIE child of non-PIE NP" /
+"depth-3-but-mixed-binary-types" — collapsing structural position
+and binary type into one identifier.
+
+With `BinaryType` modeled separately, the right way to express
+"non-PIE depth-1 child of `Init`" is `A` + `BinaryType::NonPieGlibc`.
+The mixed-binary-type deep chain that used to be `AA → D3 → D4 → D5`
+becomes `AA → AAA → AAAA → AAAAA` with explicit per-leg
+`BinaryType` in each `AgentSpec`.
+
+### Spec-driven `spawn_tree`
+
+Each test family declares its required agents as a list of
+`AgentSpec` records:
+
+```rust
+struct AgentSpec {
+    name: AgentName,                  // structural label only
+    parent: Option<AgentName>,        // None for direct children of Init
+    binary: BinaryType,               // explicit per agent, not implied
+    isolation: IsolationKind,         // Standard | DisposableSubtree
+    inherit_listen_ports: Vec<u16>,   // for fork+inherit-port tests
+}
+```
+
+The coordinator walks the specs in dependency order (parent before
+child) and spawns each via `Command::Spawn` (PIE-glibc, the default),
+`Command::SpawnRemote` (non-PIE-glibc), or the binary-type bridging
+path for static-PIE / musl variants.
+
+### Adding a new test
+
+1. Pick a structural agent that matches your test's process-tree
+   shape. Don't reach for new agent names — extend the existing
+   structural taxonomy if you need more depth.
+2. Pick the `BinaryType` axis: either a single fixed leg, or
+   `BinaryType::ALL` if the test is binary-type-relevant. See the
+   "Binary-Type Axis" section below.
+3. Embed both in your test ID:
+   `<family>.<scenario>.<binary-type>.<agent>` is the canonical
+   ordering. The binary-type segment may be omitted only when the
+   test does not exec a binary at all.
+
+### VS Code-shape canary
+
+For tests that specifically reproduce the VS Code Server's process
+tree, use the named scenario in `coordinator/vscode_shape.rs`:
+
+```
+sshd_pty (depth 1)
+  └── login_bash (depth 2)
+        └── piped_sh (depth 3, stdin = pipe)
+              └── launcher_bash (depth 4, sets up redirect)
+                    └── cli (depth 5, static-PIE-musl)
+                          └── node (depth 6, static-PIE-musl)
+```
+
+Agents in `vscode_shape` use semantic names rather than structural
+ones because the test *is* the VS Code-shape scenario. Tests like
+`BR.cli_startup_mimic.*` belong here.
+
 ## Test Categories
 
 **Self-contained tests** depend only on bash and the test harness binaries.

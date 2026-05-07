@@ -87,6 +87,21 @@ impl BinaryType {
         }
     }
 
+    /// Compact 3-letter suffix used in agent names. Encodes the
+    /// three orthogonal axes: D/S = Dynamic/Static, P/N = Pie/Non-pie,
+    /// G/M = Glibc/Musl. Lowercase so the suffix reads as a tag, not
+    /// an acronym (e.g. `A_dpg`, `AAAA_dng`).
+    #[must_use]
+    pub const fn short_label(self) -> &'static str {
+        match self {
+            Self::PieGlibc => "dpg",
+            Self::NonPieGlibc => "dng",
+            Self::StaticPieGlibc => "spg",
+            Self::StaticPieMusl => "spm",
+            Self::NonPieStaticMusl => "snm",
+        }
+    }
+
     /// The Rust target triple this leg requires, or `None` for the
     /// default host target. The musl legs require
     /// `rustup target add x86_64-unknown-linux-musl`.

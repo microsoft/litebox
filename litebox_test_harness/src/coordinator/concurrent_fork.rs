@@ -21,7 +21,7 @@ use super::agents::AgentName;
 use super::registry::Registry;
 
 /// Agents to run concurrent fork tests on.
-const CF_AGENTS: &[AgentName] = &[AgentName::A, AgentName::AA, AgentName::B];
+const CF_AGENTS: &[AgentName] = &[AgentName::Dpg1, AgentName::Dpg1Dpg1, AgentName::Dpg2];
 
 /// Pipeline patterns with increasing concurrency and library diversity.
 /// Each child in a pipeline loads different shared libraries via 9P,
@@ -120,7 +120,7 @@ pub(crate) fn register_concurrent_fork_pipeline(reg: &mut Registry<'_>) {
     }
 
     // xworker agents
-    for &agent in &[AgentName::NP, AgentName::D4] {
+    for &agent in &[AgentName::Dpg1Dng, AgentName::Dpg1Dpg1Dpg1Dng] {
         let agent_label = agent.to_string();
         reg.test(
             "xworker",
