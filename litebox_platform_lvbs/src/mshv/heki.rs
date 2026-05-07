@@ -214,12 +214,15 @@ impl HekiPage {
     }
 
     pub fn is_valid(&self) -> bool {
-        if PhysAddr::try_new(self.next_pa).is_err() {
+        if PhysAddr::try_new(self.next_pa)
+            .ok()
+            .is_none_or(|next_pa| self.next_pa != 0 && !next_pa.is_aligned(Size4KiB::SIZE))
+        {
             return false;
         }
         let Some(nranges) = usize::try_from(self.nranges)
             .ok()
-            .filter(|&n| n <= HEKI_MAX_RANGES)
+            .filter(|&n| (1..=HEKI_MAX_RANGES).contains(&n))
         else {
             return false;
         };

@@ -18,7 +18,7 @@
 use crate::{NormalWorldConstPtr, NormalWorldMutPtr};
 use alloc::{boxed::Box, vec::Vec};
 use core::mem::size_of;
-use hashbrown::HashMap;
+use hashbrown::{HashMap, HashSet};
 use litebox::{mm::linux::PAGE_SIZE, platform::RawConstPointer, utils::TruncateExt};
 use litebox_common_linux::vmap::PhysPageAddr;
 use litebox_common_optee::{
@@ -250,7 +250,10 @@ pub fn handle_optee_smc_args(
             if page_index >= shm_info.page_addrs.len() {
                 return Err(OpteeSmcReturnCode::EBadAddr);
             }
-            let msg_args_addr = shm_info.page_addrs[page_index].as_usize() + offset_in_page;
+            let msg_args_addr = shm_info.page_addrs[page_index]
+                .as_usize()
+                .checked_add(offset_in_page)
+                .ok_or(OpteeSmcReturnCode::EBadAddr)?;
 
             Ok(OpteeSmcResult::CallWithArg {
                 msg_args,
@@ -324,7 +327,10 @@ pub fn handle_optee_msg_args(msg_args: &OpteeMsgArgs) -> Result<(), OpteeSmcRetu
             // - The physical page address of the first `ShmRefPagesData`
             // - The page offset of the first shared memory page (`pages_list[0]`)
             let shm_ref_pages_data_phys_addr = page_align_down(tmem.buf_ptr);
-            let page_offset = tmem.buf_ptr - shm_ref_pages_data_phys_addr;
+            let page_offset = tmem
+                .buf_ptr
+                .checked_sub(shm_ref_pages_data_phys_addr)
+                .ok_or(OpteeSmcReturnCode::EBadAddr)?;
             let size = page_offset
                 .checked_add(tmem.size)
                 .ok_or(OpteeSmcReturnCode::ENomem)?;
@@ -771,18 +777,18 @@ impl<const ALIGN: usize> ShmRefMap<ALIGN> {
         }
         let num_pages = aligned_size_usize / ALIGN;
         let mut pages = Vec::with_capacity(num_pages);
+        let mut visited_pages_data = HashSet::new();
         let mut cur_addr: usize = shm_ref_pages_data_phys_addr.truncate();
-        let mut num_nodes = 0;
         loop {
-            if num_nodes > num_pages {
+            if visited_pages_data.contains(&cur_addr) {
                 return Err(OpteeSmcReturnCode::EBadAddr);
             }
-            num_nodes += 1;
-            let prev_len = pages.len();
+            visited_pages_data.insert(cur_addr);
             let mut cur_ptr = NormalWorldConstPtr::<ShmRefPagesData, ALIGN>::with_usize(cur_addr)
                 .map_err(|_| OpteeSmcReturnCode::EBadAddr)?;
             let pages_data =
                 unsafe { cur_ptr.read_at_offset(0) }.map_err(|_| OpteeSmcReturnCode::EBadAddr)?;
+            let pages_len_before = pages.len();
             for page in &pages_data.pages_list {
                 if *page == 0 || pages.len() == num_pages {
                     break;
@@ -793,13 +799,16 @@ impl<const ALIGN: usize> ShmRefMap<ALIGN> {
                     );
                 }
             }
-            if pages.len() == prev_len {
+            if pages.len() == num_pages {
+                break;
+            }
+            if pages.len() == pages_len_before || pages_data.next_page_data == 0 {
                 return Err(OpteeSmcReturnCode::EBadAddr);
             }
-            if pages_data.next_page_data == 0 || pages.len() == num_pages {
-                break;
-            } else {
+            if pages_data.next_page_data.is_multiple_of(ALIGN as u64) {
                 cur_addr = pages_data.next_page_data.truncate();
+            } else {
+                return Err(OpteeSmcReturnCode::EBadAddr);
             }
         }
 
@@ -847,7 +856,10 @@ fn get_shm_info_from_optee_msg_param_tmem(
     let mut page_addrs = Vec::with_capacity(num_pages);
     for i in 0..num_pages {
         let page_addr = aligned_addr
-            .checked_add((i * PAGE_SIZE) as u64)
+            .checked_add(
+                i.checked_mul(PAGE_SIZE)
+                    .ok_or(OpteeSmcReturnCode::EBadAddr)? as u64,
+            )
             .ok_or(OpteeSmcReturnCode::EBadAddr)?;
         page_addrs
             .push(PhysPageAddr::new(page_addr.truncate()).ok_or(OpteeSmcReturnCode::EBadAddr)?);
