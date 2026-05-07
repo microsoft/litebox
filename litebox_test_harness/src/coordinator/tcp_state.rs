@@ -25,28 +25,28 @@ struct AxisCase {
 const AXES: &[AxisCase] = &[
     AxisCase {
         name: "in_process",
-        server: AgentName::A,
-        client: AgentName::A,
+        server: AgentName::Dpg1,
+        client: AgentName::Dpg1,
     },
     AxisCase {
         name: "parent_child",
-        server: AgentName::AA,
-        client: AgentName::A,
+        server: AgentName::Dpg1Dpg1,
+        client: AgentName::Dpg1,
     },
     AxisCase {
         name: "child_parent",
-        server: AgentName::A,
-        client: AgentName::AA,
+        server: AgentName::Dpg1,
+        client: AgentName::Dpg1Dpg1,
     },
     AxisCase {
         name: "sibling",
-        server: AgentName::AB,
-        client: AgentName::AA,
+        server: AgentName::Dpg1Dpg2,
+        client: AgentName::Dpg1Dpg1,
     },
     AxisCase {
         name: "depth2",
-        server: AgentName::AAA,
-        client: AgentName::AAB,
+        server: AgentName::Dpg1Dpg1Dpg1,
+        client: AgentName::Dpg1Dpg1Dpg2,
     },
 ];
 
@@ -186,7 +186,7 @@ fn register_conn_id_unique(reg: &mut Registry<'_>) {
     )
     .timeout(60)
     .build(move |cx| {
-        let handle = cx.require(AgentName::A);
+        let handle = cx.require(AgentName::Dpg1);
         Box::new(move |run| Box::pin(async move { run_conn_id_unique_case(run, &handle).await }))
     });
 }

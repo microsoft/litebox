@@ -14,8 +14,8 @@ use super::agents::{AgentHandle, AgentName, EphemeralHandle, SpawnKind};
 use super::registry::Registry;
 use super::run_context::RunContext;
 
-const AGENTS: &[AgentName] = &[AgentName::A, AgentName::AA, AgentName::B];
-const DEPTH_AGENTS: &[AgentName] = &[AgentName::A, AgentName::AA];
+const AGENTS: &[AgentName] = &[AgentName::Dpg1, AgentName::Dpg1Dpg1, AgentName::Dpg2];
+const DEPTH_AGENTS: &[AgentName] = &[AgentName::Dpg1, AgentName::Dpg1Dpg1];
 
 // Constants used by the register_* functions further down. Each test
 // category gets a section divider immediately above its `register_*`
@@ -27,11 +27,11 @@ const EXIT_SIZES: &[usize] = &[256, 4096, 65536];
 
 const NPIPE_REPS: &[usize] = &[1, 5, 10];
 const NPIPE_AGENTS: &[AgentName] = &[
-    AgentName::A,
-    AgentName::AA,
-    AgentName::B,
-    AgentName::NP,
-    AgentName::D4,
+    AgentName::Dpg1,
+    AgentName::Dpg1Dpg1,
+    AgentName::Dpg2,
+    AgentName::Dpg1Dng,
+    AgentName::Dpg1Dpg1Dpg1Dng,
 ];
 
 // ═══════════════════════════════════════════════════════════════════
@@ -470,8 +470,8 @@ pub(crate) fn register_cross_worker_first_connect_tests(reg: &mut Registry<'_>) 
     )
     .timeout(60)
     .build(move |cx| {
-        let handle_a = cx.require(AgentName::A);
-        let handle_b = cx.require(AgentName::B);
+        let handle_a = cx.require(AgentName::Dpg1);
+        let handle_b = cx.require(AgentName::Dpg2);
         Box::new(move |run| {
             Box::pin(async move {
                 let port = 19900u16;
@@ -515,8 +515,8 @@ pub(crate) fn register_cross_worker_first_connect_tests(reg: &mut Registry<'_>) 
     )
     .timeout(60)
     .build(move |cx| {
-        let handle_aa = cx.require(AgentName::AA);
-        let handle_b = cx.require(AgentName::B);
+        let handle_aa = cx.require(AgentName::Dpg1Dpg1);
+        let handle_b = cx.require(AgentName::Dpg2);
         Box::new(move |run| {
             Box::pin(async move {
                 let port = 19901u16;
@@ -555,8 +555,8 @@ pub(crate) fn register_cross_worker_first_connect_tests(reg: &mut Registry<'_>) 
     reg.test("xworker", "cross_worker_first_connect", "XCONN.cross_seq_x3".to_string())
     .timeout(60)
     .build(move |cx| {
-        let handle_a = cx.require(AgentName::A);
-        let handle_b = cx.require(AgentName::B);
+        let handle_a = cx.require(AgentName::Dpg1);
+        let handle_b = cx.require(AgentName::Dpg2);
         Box::new(move |run| {
                 Box::pin(async move {
                     let port = 19902u16;
@@ -612,7 +612,7 @@ pub(crate) fn register_cross_worker_self_connect_tests(reg: &mut Registry<'_>) {
     )
     .timeout(60)
     .build(move |cx| {
-        let handle_a = cx.require(AgentName::A);
+        let handle_a = cx.require(AgentName::Dpg1);
         Box::new(move |run| {
             Box::pin(async move {
                 let port = 19910u16;
@@ -656,8 +656,8 @@ pub(crate) fn register_cross_worker_self_connect_tests(reg: &mut Registry<'_>) {
     )
     .timeout(60)
     .build(move |cx| {
-        let handle_a = cx.require(AgentName::A);
-        let handle_aa = cx.require(AgentName::AA);
+        let handle_a = cx.require(AgentName::Dpg1);
+        let handle_aa = cx.require(AgentName::Dpg1Dpg1);
         Box::new(move |run| {
             Box::pin(async move {
                 let port = 19911u16;
@@ -701,8 +701,8 @@ pub(crate) fn register_cross_worker_self_connect_tests(reg: &mut Registry<'_>) {
     )
     .timeout(60)
     .build(move |cx| {
-        let handle_a = cx.require(AgentName::A);
-        let handle_aa = cx.require(AgentName::AA);
+        let handle_a = cx.require(AgentName::Dpg1);
+        let handle_aa = cx.require(AgentName::Dpg1Dpg1);
         Box::new(move |run| {
             Box::pin(async move {
                 let port = 19912u16;
@@ -746,8 +746,8 @@ pub(crate) fn register_cross_worker_self_connect_tests(reg: &mut Registry<'_>) {
     )
     .timeout(60)
     .build(move |cx| {
-        let handle_a = cx.require(AgentName::A);
-        let handle_ab = cx.require(AgentName::AB);
+        let handle_a = cx.require(AgentName::Dpg1);
+        let handle_ab = cx.require(AgentName::Dpg1Dpg2);
         Box::new(move |run| {
             Box::pin(async move {
                 let port = 19913u16;
@@ -871,28 +871,28 @@ pub(crate) fn register_tcp_listen_busy_tests(reg: &mut Registry<'_>) {
     let defs = [
         TlbListenBusyDef {
             name: "same_agent",
-            listener: AgentName::A,
-            connector: AgentName::A,
+            listener: AgentName::Dpg1,
+            connector: AgentName::Dpg1,
         },
         TlbListenBusyDef {
             name: "parent_child",
-            listener: AgentName::A,
-            connector: AgentName::AA,
+            listener: AgentName::Dpg1,
+            connector: AgentName::Dpg1Dpg1,
         },
         TlbListenBusyDef {
             name: "child_parent",
-            listener: AgentName::AA,
-            connector: AgentName::A,
+            listener: AgentName::Dpg1Dpg1,
+            connector: AgentName::Dpg1,
         },
         TlbListenBusyDef {
             name: "sibling",
-            listener: AgentName::AA,
-            connector: AgentName::AB,
+            listener: AgentName::Dpg1Dpg1,
+            connector: AgentName::Dpg1Dpg2,
         },
         TlbListenBusyDef {
             name: "depth2",
-            listener: AgentName::AAA,
-            connector: AgentName::AAB,
+            listener: AgentName::Dpg1Dpg1Dpg1,
+            connector: AgentName::Dpg1Dpg1Dpg2,
         },
     ];
 
@@ -935,7 +935,7 @@ pub(crate) fn register_tcp_listen_busy_tests(reg: &mut Registry<'_>) {
 // ═══════════════════════════════════════════════════════════════════
 
 pub(crate) fn register_bash_fork_exec_tests(reg: &mut Registry<'_>) {
-    for &agent in &[AgentName::A, AgentName::B] {
+    for &agent in &[AgentName::Dpg1, AgentName::Dpg2] {
         let agent_s = agent.to_string();
 
         // BASH.fork_ls: bash -c running ls
@@ -1045,8 +1045,8 @@ pub(crate) fn register_fork_from_worker_exec_tests(reg: &mut Registry<'_>) {
     //
     for &bt in crate::BinaryType::ALL {
         for (launcher_label, launcher_agent, sub_timeout) in [
-            ("from_init", AgentName::A, 20_u64),
-            ("from_worker_exec", AgentName::NP, 30_u64),
+            ("from_init", AgentName::Dpg1, 20_u64),
+            ("from_worker_exec", AgentName::Dpg1Dng, 30_u64),
         ] {
             let bt_label = bt.label();
             let test_id = format!("FWE.{bt_label}.{launcher_label}");
@@ -1064,8 +1064,8 @@ pub(crate) fn register_fork_from_worker_exec_tests(reg: &mut Registry<'_>) {
                             // we're running on: agent A is PIE, agent NP
                             // is non-PIE.
                             let launcher_bin = match launcher_agent {
-                                AgentName::A => self_exe.clone(),
-                                AgentName::NP => crate::nonpie_binary(),
+                                AgentName::Dpg1 => self_exe.clone(),
+                                AgentName::Dpg1Dng => crate::nonpie_binary(),
                                 _ => unreachable!(),
                             };
                             let resp = run
@@ -1123,11 +1123,11 @@ pub(crate) fn register_fork_from_worker_exec_tests(reg: &mut Registry<'_>) {
 
 pub(crate) fn register_minimal_canary_tests(reg: &mut Registry<'_>) {
     const M_LAUNCHERS: &[AgentName] = &[
-        AgentName::A,
-        AgentName::AA,
-        AgentName::D3,
-        AgentName::D4,
-        AgentName::D5,
+        AgentName::Dpg1,
+        AgentName::Dpg1Dpg1,
+        AgentName::Dpg1Dpg1Dpg1,
+        AgentName::Dpg1Dpg1Dpg1Dng,
+        AgentName::Dpg1Dpg1Dpg1DngDpg,
     ];
     const M_VARIANTS: &[(&str, &str, &str, u64)] = &[
         // (id_prefix, subcommand, expected_stdout_marker, exec_timeout_secs)
@@ -2119,48 +2119,48 @@ struct KpxProcCase {
 const KPX_PROC_CASES: &[KpxProcCase] = &[
     KpxProcCase {
         name: "same_agent",
-        observer: AgentName::A,
-        target: AgentName::A,
+        observer: AgentName::Dpg1,
+        target: AgentName::Dpg1,
     },
     KpxProcCase {
         name: "parent_to_child",
-        observer: AgentName::A,
-        target: AgentName::AA,
+        observer: AgentName::Dpg1,
+        target: AgentName::Dpg1Dpg1,
     },
     KpxProcCase {
         name: "child_to_parent",
-        observer: AgentName::AA,
-        target: AgentName::A,
+        observer: AgentName::Dpg1Dpg1,
+        target: AgentName::Dpg1,
     },
     KpxProcCase {
         name: "root_sibling",
-        observer: AgentName::A,
-        target: AgentName::B,
+        observer: AgentName::Dpg1,
+        target: AgentName::Dpg2,
     },
     KpxProcCase {
         name: "nested_sibling",
-        observer: AgentName::AA,
-        target: AgentName::AB,
+        observer: AgentName::Dpg1Dpg1,
+        target: AgentName::Dpg1Dpg2,
     },
     KpxProcCase {
         name: "depth1_to_depth2",
-        observer: AgentName::AB,
-        target: AgentName::AAA,
+        observer: AgentName::Dpg1Dpg2,
+        target: AgentName::Dpg1Dpg1Dpg1,
     },
     KpxProcCase {
         name: "depth2_to_depth1",
-        observer: AgentName::AAA,
-        target: AgentName::AB,
+        observer: AgentName::Dpg1Dpg1Dpg1,
+        target: AgentName::Dpg1Dpg2,
     },
     KpxProcCase {
         name: "depth2_sibling",
-        observer: AgentName::AAA,
-        target: AgentName::AAB,
+        observer: AgentName::Dpg1Dpg1Dpg1,
+        target: AgentName::Dpg1Dpg1Dpg2,
     },
     KpxProcCase {
         name: "cross_subtree",
-        observer: AgentName::B,
-        target: AgentName::AAA,
+        observer: AgentName::Dpg2,
+        target: AgentName::Dpg1Dpg1Dpg1,
     },
 ];
 
@@ -2757,22 +2757,22 @@ pub(crate) fn register_pipe_nonblock_tests(reg: &mut Registry<'_>) {
 pub(crate) fn register_epoll_socket_tests(reg: &mut Registry<'_>) {
     for &variant in &["direct", "tokio"] {
         for &agent in &[
-            AgentName::A,
-            AgentName::AA,
-            AgentName::B,
-            AgentName::D4,
-            AgentName::D5,
+            AgentName::Dpg1,
+            AgentName::Dpg1Dpg1,
+            AgentName::Dpg2,
+            AgentName::Dpg1Dpg1Dpg1Dng,
+            AgentName::Dpg1Dpg1Dpg1DngDpg,
         ] {
             let port: u16 = match (variant, agent) {
-                ("direct", AgentName::A) => 19990,
-                ("direct", AgentName::AA) => 19991,
-                ("direct", AgentName::B) => 19992,
-                ("direct", AgentName::D4) => 19993,
+                ("direct", AgentName::Dpg1) => 19990,
+                ("direct", AgentName::Dpg1Dpg1) => 19991,
+                ("direct", AgentName::Dpg2) => 19992,
+                ("direct", AgentName::Dpg1Dpg1Dpg1Dng) => 19993,
                 ("direct", _) => 19994,
-                ("tokio", AgentName::A) => 19995,
-                ("tokio", AgentName::AA) => 19996,
-                ("tokio", AgentName::B) => 19997,
-                ("tokio", AgentName::D4) => 19998,
+                ("tokio", AgentName::Dpg1) => 19995,
+                ("tokio", AgentName::Dpg1Dpg1) => 19996,
+                ("tokio", AgentName::Dpg2) => 19997,
+                ("tokio", AgentName::Dpg1Dpg1Dpg1Dng) => 19998,
                 _ => 19999,
             };
 
@@ -2880,26 +2880,26 @@ pub(crate) fn register_tcp_halfclose_tests(reg: &mut Registry<'_>) {
     let cases = [
         Case {
             id: "THC.halfclose.eof.same_agent",
-            server: AgentName::A,
-            client: AgentName::A,
+            server: AgentName::Dpg1,
+            client: AgentName::Dpg1,
             payload: "THC_SAME_AGENT_PAYLOAD",
         },
         Case {
             id: "THC.halfclose.eof.cross_agent",
-            server: AgentName::A,
-            client: AgentName::B,
+            server: AgentName::Dpg1,
+            client: AgentName::Dpg2,
             payload: "THC_CROSS_AGENT_PAYLOAD",
         },
         Case {
             id: "THC.halfclose.eof.sibling",
-            server: AgentName::AA,
-            client: AgentName::AB,
+            server: AgentName::Dpg1Dpg1,
+            client: AgentName::Dpg1Dpg2,
             payload: "THC_SIBLING_PAYLOAD",
         },
         Case {
             id: "THC.halfclose.eof.depth2",
-            server: AgentName::AAA,
-            client: AgentName::AAB,
+            server: AgentName::Dpg1Dpg1Dpg1,
+            client: AgentName::Dpg1Dpg1Dpg2,
             payload: "THC_DEPTH2_PAYLOAD",
         },
     ];
@@ -2987,8 +2987,8 @@ pub(crate) fn register_fork_listen_close_tests(reg: &mut Registry<'_>) {
     )
     .timeout(60)
     .build(move |cx| {
-        let handle_a = cx.require(AgentName::A);
-        let handle_b = cx.require(AgentName::B);
+        let handle_a = cx.require(AgentName::Dpg1);
+        let handle_b = cx.require(AgentName::Dpg2);
         Box::new(move |run| {
             Box::pin(async move {
                 let port = 19920u16;
@@ -3039,10 +3039,10 @@ pub(crate) fn register_fork_listen_close_tests(reg: &mut Registry<'_>) {
     )
     .timeout(60)
     .build(move |cx| {
-        let parent = cx.require(AgentName::A);
-        let connector = cx.require(AgentName::B);
+        let parent = cx.require(AgentName::Dpg1);
+        let connector = cx.require(AgentName::Dpg2);
         let child = cx.declare_ephemeral(
-            AgentName::A,
+            AgentName::Dpg1,
             "FKLCInheritCross",
             SpawnKind::Fork {
                 binary: "self",
@@ -3103,10 +3103,10 @@ pub(crate) fn register_fork_listen_close_tests(reg: &mut Registry<'_>) {
     )
     .timeout(60)
     .build(move |cx| {
-        let parent = cx.require(AgentName::A);
-        let connector = cx.require(AgentName::B);
+        let parent = cx.require(AgentName::Dpg1);
+        let connector = cx.require(AgentName::Dpg2);
         let child = cx.declare_ephemeral(
-            AgentName::A,
+            AgentName::Dpg1,
             "FKLCInheritMulti",
             SpawnKind::Fork {
                 binary: "self",
@@ -3167,10 +3167,10 @@ pub(crate) fn register_fork_listen_close_tests(reg: &mut Registry<'_>) {
     )
     .timeout(60)
     .build(move |cx| {
-        let parent = cx.require(AgentName::A);
-        let connector = cx.require(AgentName::B);
+        let parent = cx.require(AgentName::Dpg1);
+        let connector = cx.require(AgentName::Dpg2);
         let child = cx.declare_ephemeral(
-            AgentName::A,
+            AgentName::Dpg1,
             "FKLCInheritCloseParent",
             SpawnKind::Fork {
                 binary: "self",
@@ -3231,10 +3231,10 @@ pub(crate) fn register_fork_listen_close_tests(reg: &mut Registry<'_>) {
     )
     .timeout(60)
     .build(move |cx| {
-        let parent = cx.require(AgentName::A);
-        let connector = cx.require(AgentName::B);
+        let parent = cx.require(AgentName::Dpg1);
+        let connector = cx.require(AgentName::Dpg2);
         let child = cx.declare_ephemeral(
-            AgentName::A,
+            AgentName::Dpg1,
             "FKLCInheritDepth1",
             SpawnKind::Fork {
                 binary: "self",
@@ -3338,10 +3338,10 @@ pub(crate) fn register_fork_listen_close_tests(reg: &mut Registry<'_>) {
     )
     .timeout(60)
     .build(move |cx| {
-        let parent = cx.require(AgentName::A);
-        let connector = cx.require(AgentName::B);
+        let parent = cx.require(AgentName::Dpg1);
+        let connector = cx.require(AgentName::Dpg2);
         let server = cx.declare_ephemeral(
-            AgentName::A,
+            AgentName::Dpg1,
             "FKLCInheritSiblingServer",
             SpawnKind::Fork {
                 binary: "self",
@@ -3528,71 +3528,63 @@ const SK_WAIT_BUDGET_SECS: u64 = 5;
 const SK_TEST_TIMEOUT_SECS: u64 = 90;
 
 pub(crate) fn register_subtree_kill_tests(reg: &mut Registry<'_>) {
-    // SK.subtree.direct_nonpie — SIGKILL E whose immediate child is a
+    // SK.subtree.direct — SIGKILL E whose immediate child is a
     // non-PIE worker spawned via SpawnRemote. Reproduces the exact
     // shape that hung the PN.B.eof teardown.
-    reg.test(
-        "matrix",
-        "subtree_kill",
-        "SK.subtree.direct_nonpie".to_string(),
-    )
-    .timeout(SK_TEST_TIMEOUT_SECS)
-    .build(move |cx| {
-        let e = cx.require(AgentName::E);
-        let npx = cx.declare_ephemeral(AgentName::E, "NPx", SpawnKind::NonPie);
-        Box::new(move |run| {
-            let e = e.clone();
-            let npx = npx.clone();
-            Box::pin(async move {
-                let _ = crate::nonpie_binary();
-                let r = run.spawn_ephemeral(&npx).await;
-                if !super::ok_spawned_response(&r) {
-                    return super::TestOutcome::new(
-                        "E",
-                        false,
-                        format!("setup: spawn_ephemeral(NPx) failed: {r:?}"),
-                    );
-                }
-                run_subtree_kill(run, &e).await
+    reg.test("matrix", "subtree_kill", "SK.subtree.direct".to_string())
+        .timeout(SK_TEST_TIMEOUT_SECS)
+        .build(move |cx| {
+            let e = cx.require(AgentName::Dpg3);
+            let npx = cx.declare_ephemeral(AgentName::Dpg3, "NPx", SpawnKind::NonPie);
+            Box::new(move |run| {
+                let e = e.clone();
+                let npx = npx.clone();
+                Box::pin(async move {
+                    let _ = crate::nonpie_binary();
+                    let r = run.spawn_ephemeral(&npx).await;
+                    if !super::ok_spawned_response(&r) {
+                        return super::TestOutcome::new(
+                            "E",
+                            false,
+                            format!("setup: spawn_ephemeral(NPx) failed: {r:?}"),
+                        );
+                    }
+                    run_subtree_kill(run, &e).await
+                })
             })
-        })
-    });
+        });
 
-    // SK.subtree.deep_nonpie — SIGKILL E whose subtree is
+    // SK.subtree.deep — SIGKILL E whose subtree is
     // E → EE → NPx (non-PIE leaf). Generalizes the depth axis: tests
     // that the wait4 stub at the *grandchild* level still propagates
     // back when the *root* is SIGKILLed.
-    reg.test(
-        "matrix",
-        "subtree_kill",
-        "SK.subtree.deep_nonpie".to_string(),
-    )
-    .timeout(SK_TEST_TIMEOUT_SECS)
-    .build(move |cx| {
-        let e = cx.require(AgentName::E);
-        let _ee = cx.require(AgentName::EE);
-        // NPx is a non-PIE child of EE, two levels below E.
-        let npx = cx.declare_ephemeral(AgentName::EE, "NPx", SpawnKind::NonPie);
-        Box::new(move |run| {
-            let e = e.clone();
-            let npx = npx.clone();
-            Box::pin(async move {
-                let _ = crate::nonpie_binary();
-                // EE was already spawned under E by spawn_tree when
-                // the test declared AgentName::EE. Ask EE to spawn
-                // its own non-PIE descendant.
-                let r = run.spawn_ephemeral(&npx).await;
-                if !super::ok_spawned_response(&r) {
-                    return super::TestOutcome::new(
-                        "E",
-                        false,
-                        format!("setup: spawn_ephemeral(NPx via EE) failed: {r:?}"),
-                    );
-                }
-                run_subtree_kill(run, &e).await
+    reg.test("matrix", "subtree_kill", "SK.subtree.deep".to_string())
+        .timeout(SK_TEST_TIMEOUT_SECS)
+        .build(move |cx| {
+            let e = cx.require(AgentName::Dpg3);
+            let _ee = cx.require(AgentName::Dpg3Dpg);
+            // NPx is a non-PIE child of EE, two levels below E.
+            let npx = cx.declare_ephemeral(AgentName::Dpg3Dpg, "NPx", SpawnKind::NonPie);
+            Box::new(move |run| {
+                let e = e.clone();
+                let npx = npx.clone();
+                Box::pin(async move {
+                    let _ = crate::nonpie_binary();
+                    // EE was already spawned under E by spawn_tree when
+                    // the test declared AgentName::Dpg3Dpg. Ask EE to spawn
+                    // its own non-PIE descendant.
+                    let r = run.spawn_ephemeral(&npx).await;
+                    if !super::ok_spawned_response(&r) {
+                        return super::TestOutcome::new(
+                            "E",
+                            false,
+                            format!("setup: spawn_ephemeral(NPx via EE) failed: {r:?}"),
+                        );
+                    }
+                    run_subtree_kill(run, &e).await
+                })
             })
-        })
-    });
+        });
 
     // SK.subtree.exit_then_kill — cooperative Exit on the non-PIE
     // descendant first, then SIGKILL the root. Inverts the timing
@@ -3608,8 +3600,8 @@ pub(crate) fn register_subtree_kill_tests(reg: &mut Registry<'_>) {
     )
     .timeout(SK_TEST_TIMEOUT_SECS)
     .build(move |cx| {
-        let e = cx.require(AgentName::E);
-        let npx = cx.declare_ephemeral(AgentName::E, "NPx", SpawnKind::NonPie);
+        let e = cx.require(AgentName::Dpg3);
+        let npx = cx.declare_ephemeral(AgentName::Dpg3, "NPx", SpawnKind::NonPie);
         Box::new(move |run| {
             let e = e.clone();
             let npx = npx.clone();

@@ -28,71 +28,71 @@ struct TcCase {
 const TC_CASES: &[TcCase] = &[
     TcCase {
         name: "in_process",
-        listener: AgentName::A,
-        connector: AgentName::A,
+        listener: AgentName::Dpg1,
+        connector: AgentName::Dpg1,
         count: 2,
         delay_ms: 0,
     },
     TcCase {
         name: "in_process",
-        listener: AgentName::A,
-        connector: AgentName::A,
+        listener: AgentName::Dpg1,
+        connector: AgentName::Dpg1,
         count: 5,
         delay_ms: 0,
     },
     TcCase {
         name: "in_process",
-        listener: AgentName::A,
-        connector: AgentName::A,
+        listener: AgentName::Dpg1,
+        connector: AgentName::Dpg1,
         count: 10,
         delay_ms: 0,
     },
     TcCase {
         name: "sibling",
-        listener: AgentName::B,
-        connector: AgentName::A,
+        listener: AgentName::Dpg2,
+        connector: AgentName::Dpg1,
         count: 2,
         delay_ms: 0,
     },
     TcCase {
         name: "sibling",
-        listener: AgentName::B,
-        connector: AgentName::A,
+        listener: AgentName::Dpg2,
+        connector: AgentName::Dpg1,
         count: 5,
         delay_ms: 0,
     },
     TcCase {
         name: "sibling",
-        listener: AgentName::B,
-        connector: AgentName::A,
+        listener: AgentName::Dpg2,
+        connector: AgentName::Dpg1,
         count: 10,
         delay_ms: 0,
     },
     TcCase {
         name: "depth2",
-        listener: AgentName::AB,
-        connector: AgentName::AA,
+        listener: AgentName::Dpg1Dpg2,
+        connector: AgentName::Dpg1Dpg1,
         count: 2,
         delay_ms: 0,
     },
     TcCase {
         name: "depth2",
-        listener: AgentName::AB,
-        connector: AgentName::AA,
+        listener: AgentName::Dpg1Dpg2,
+        connector: AgentName::Dpg1Dpg1,
         count: 5,
         delay_ms: 0,
     },
     TcCase {
         name: "sibling_delayed",
-        listener: AgentName::B,
-        connector: AgentName::A,
+        listener: AgentName::Dpg2,
+        connector: AgentName::Dpg1,
         count: 5,
         delay_ms: 10,
     },
     TcCase {
         name: "depth2_delayed",
-        listener: AgentName::AB,
-        connector: AgentName::AA,
+        listener: AgentName::Dpg1Dpg2,
+        connector: AgentName::Dpg1Dpg1,
         count: 5,
         delay_ms: 10,
     },
@@ -112,50 +112,50 @@ struct TdCase {
 const TD_CASES: &[TdCase] = &[
     TdCase {
         name: "in_process",
-        listener: AgentName::A,
-        connector: AgentName::A,
+        listener: AgentName::Dpg1,
+        connector: AgentName::Dpg1,
         size: 1024,
     },
     TdCase {
         name: "sibling",
-        listener: AgentName::B,
-        connector: AgentName::A,
+        listener: AgentName::Dpg2,
+        connector: AgentName::Dpg1,
         size: 1024,
     },
     TdCase {
         name: "cross_subtree",
-        listener: AgentName::AAA,
-        connector: AgentName::B,
+        listener: AgentName::Dpg1Dpg1Dpg1,
+        connector: AgentName::Dpg2,
         size: 1024,
     },
     TdCase {
         name: "in_process",
-        listener: AgentName::A,
-        connector: AgentName::A,
+        listener: AgentName::Dpg1,
+        connector: AgentName::Dpg1,
         size: 65_536,
     },
     TdCase {
         name: "sibling",
-        listener: AgentName::B,
-        connector: AgentName::A,
+        listener: AgentName::Dpg2,
+        connector: AgentName::Dpg1,
         size: 65_536,
     },
     TdCase {
         name: "cross_subtree",
-        listener: AgentName::AAA,
-        connector: AgentName::B,
+        listener: AgentName::Dpg1Dpg1Dpg1,
+        connector: AgentName::Dpg2,
         size: 65_536,
     },
     TdCase {
         name: "in_process",
-        listener: AgentName::A,
-        connector: AgentName::A,
+        listener: AgentName::Dpg1,
+        connector: AgentName::Dpg1,
         size: 262_144,
     },
     TdCase {
         name: "sibling",
-        listener: AgentName::B,
-        connector: AgentName::A,
+        listener: AgentName::Dpg2,
+        connector: AgentName::Dpg1,
         size: 262_144,
     },
 ];
@@ -174,44 +174,44 @@ struct TrrCase {
 const TRR_CASES: &[TrrCase] = &[
     TrrCase {
         name: "in_process",
-        listener: AgentName::A,
-        connector: AgentName::A,
+        listener: AgentName::Dpg1,
+        connector: AgentName::Dpg1,
         count: 5,
     },
     TrrCase {
         name: "in_process",
-        listener: AgentName::A,
-        connector: AgentName::A,
+        listener: AgentName::Dpg1,
+        connector: AgentName::Dpg1,
         count: 20,
     },
     TrrCase {
         name: "sibling",
-        listener: AgentName::B,
-        connector: AgentName::A,
+        listener: AgentName::Dpg2,
+        connector: AgentName::Dpg1,
         count: 5,
     },
     TrrCase {
         name: "sibling",
-        listener: AgentName::B,
-        connector: AgentName::A,
+        listener: AgentName::Dpg2,
+        connector: AgentName::Dpg1,
         count: 20,
     },
     TrrCase {
         name: "parent_child",
-        listener: AgentName::AA,
-        connector: AgentName::A,
+        listener: AgentName::Dpg1Dpg1,
+        connector: AgentName::Dpg1,
         count: 5,
     },
     TrrCase {
         name: "child_parent",
-        listener: AgentName::A,
-        connector: AgentName::AA,
+        listener: AgentName::Dpg1,
+        connector: AgentName::Dpg1Dpg1,
         count: 5,
     },
     TrrCase {
         name: "depth2",
-        listener: AgentName::AAA,
-        connector: AgentName::AAB,
+        listener: AgentName::Dpg1Dpg1Dpg1,
+        connector: AgentName::Dpg1Dpg1Dpg2,
         count: 5,
     },
 ];
@@ -390,13 +390,13 @@ fn register_tcp_cross_worker_concurrent_tests(reg: &mut Registry<'_>) {
     const STABLE_CASES: &[StableCase] = &[
         StableCase {
             name: "sibling",
-            listener: AgentName::B,
-            connector: AgentName::A,
+            listener: AgentName::Dpg2,
+            connector: AgentName::Dpg1,
         },
         StableCase {
             name: "depth2",
-            listener: AgentName::D4,
-            connector: AgentName::D5,
+            listener: AgentName::Dpg1Dpg1Dpg1Dng,
+            connector: AgentName::Dpg1Dpg1Dpg1DngDpg,
         },
     ];
 
@@ -410,8 +410,8 @@ fn register_tcp_cross_worker_concurrent_tests(reg: &mut Registry<'_>) {
             reg.test("stress", "tcp_stress", test_id)
                 .timeout(180)
                 .build(move |cx| {
-                    let handle = cx.require(AgentName::A);
-                    let aremote = cx.declare_ephemeral(AgentName::A, "ARemote", SpawnKind::NonPie);
+                    let handle = cx.require(AgentName::Dpg1);
+                    let aremote = cx.declare_ephemeral(AgentName::Dpg1, "ARemote", SpawnKind::NonPie);
                     Box::new(move |run| {
                         let aremote = aremote.clone();
                         Box::pin(async move {
@@ -446,8 +446,8 @@ fn register_tcp_cross_worker_concurrent_tests(reg: &mut Registry<'_>) {
             reg.test("stress", "tcp_stress", test_id)
                 .timeout(180)
                 .build(move |cx| {
-                    let handle = cx.require(AgentName::A);
-                    let aremote = cx.declare_ephemeral(AgentName::A, "ARemote", SpawnKind::NonPie);
+                    let handle = cx.require(AgentName::Dpg1);
+                    let aremote = cx.declare_ephemeral(AgentName::Dpg1, "ARemote", SpawnKind::NonPie);
                     Box::new(move |run| {
                         let aremote = aremote.clone();
                         Box::pin(async move {

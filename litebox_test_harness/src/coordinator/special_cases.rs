@@ -51,7 +51,7 @@ pub(super) fn register_netlink(reg: &mut Registry<'_>) {
                     "netlink",
                     id,
                     timeout = 60,
-                    agents[a = AgentName::A],
+                    agents[a = AgentName::Dpg1],
                     |run| {
                         let self_exe = run.self_exe().to_string();
                         let target = crate::binary_path(bt, &self_exe);
@@ -127,7 +127,7 @@ pub(super) fn register_netlink(reg: &mut Registry<'_>) {
         "netlink",
         "X48.node_networkInterfaces",
         timeout = 60,
-        agents[a = AgentName::A],
+        agents[a = AgentName::Dpg1],
         |run| {
             let resp = run
             .send(
@@ -171,7 +171,7 @@ pub(super) fn register_net_ipv6(reg: &mut Registry<'_>) {
                 "net_ipv6",
                 id,
                 timeout = 60,
-                agents[a = AgentName::A],
+                agents[a = AgentName::Dpg1],
                 |run| {
                     let self_exe = run.self_exe().to_string();
                     let target = crate::binary_path(bt, &self_exe);
@@ -208,7 +208,7 @@ pub(super) fn register_terminal_ioctl(reg: &mut Registry<'_>) {
                     "terminal_ioctl",
                     id,
                     timeout = 60,
-                    agents[a = AgentName::A],
+                    agents[a = AgentName::Dpg1],
                     |run| {
                         let self_exe = run.self_exe().to_string();
                         let target = crate::binary_path(bt, &self_exe);
@@ -242,7 +242,7 @@ pub(super) fn register_node_exit(reg: &mut Registry<'_>) {
         "node_exit",
         "EX6.node_version_exit",
         timeout = 60,
-        agents[a = AgentName::A],
+        agents[a = AgentName::Dpg1],
         |run| {
             let resp = run
                 .send(
@@ -261,7 +261,7 @@ pub(super) fn register_node_exit(reg: &mut Registry<'_>) {
         "node_exit",
         "EX7.node_process_exit",
         timeout = 60,
-        agents[a = AgentName::A],
+        agents[a = AgentName::Dpg1],
         |run| {
             let resp = run
                 .send(
@@ -287,7 +287,7 @@ pub(super) fn register_node_exit(reg: &mut Registry<'_>) {
         "node_exit",
         "EX8.node_exit_code",
         timeout = 60,
-        agents[a = AgentName::A],
+        agents[a = AgentName::Dpg1],
         |run| {
             let resp = run
                 .send(
@@ -313,7 +313,7 @@ pub(super) fn register_node_exit(reg: &mut Registry<'_>) {
         "node_exit",
         "EX9.node_console_exit",
         timeout = 60,
-        agents[a = AgentName::A],
+        agents[a = AgentName::Dpg1],
         |run| {
             let resp = run
                 .send(
@@ -359,7 +359,7 @@ pub(super) fn register_fs_io(reg: &mut Registry<'_>) {
                     "fs_io",
                     id,
                     timeout = 60,
-                    agents[a = AgentName::A],
+                    agents[a = AgentName::Dpg1],
                     |run| {
                         let self_exe = run.self_exe().to_string();
                         let target = crate::binary_path(bt, &self_exe);
@@ -396,7 +396,7 @@ pub(super) fn register_fs_io(reg: &mut Registry<'_>) {
                     "fs_io",
                     id,
                     timeout = 60,
-                    agents[a = AgentName::A],
+                    agents[a = AgentName::Dpg1],
                     |run| {
                         let self_exe = run.self_exe().to_string();
                         let target = crate::binary_path(bt, &self_exe);
@@ -430,7 +430,7 @@ pub(super) fn register_capture_pipe(reg: &mut Registry<'_>) {
         "subshell_continue",
     ];
     const SHELLS: &[&str] = &["sh", "bash"];
-    const CP_AGENTS: &[AgentName] = &[AgentName::A, AgentName::AA];
+    const CP_AGENTS: &[AgentName] = &[AgentName::Dpg1, AgentName::Dpg1Dpg1];
 
     for &agent in CP_AGENTS {
         for &shell in SHELLS {
@@ -515,7 +515,7 @@ pub(super) fn register_stdin_script(reg: &mut Registry<'_>) {
         ),
     ];
     const SHELLS: &[&str] = &["sh", "bash"];
-    const SS_AGENTS: &[AgentName] = &[AgentName::A, AgentName::AA];
+    const SS_AGENTS: &[AgentName] = &[AgentName::Dpg1, AgentName::Dpg1Dpg1];
 
     for &agent in SS_AGENTS {
         for &shell in SHELLS {
@@ -679,10 +679,10 @@ pub(super) fn register_xsi_stdin_script(reg: &mut Registry<'_>) {
         reg.test("shell", "xsi_stdin_script", id)
             .timeout(60)
             .build(move |cx| {
-                let in_process = cx.require(AgentName::A);
-                let depth_two = cx.require(AgentName::AA);
+                let in_process = cx.require(AgentName::Dpg1);
+                let depth_two = cx.require(AgentName::Dpg1Dpg1);
                 let fork_target = cx.declare_ephemeral(
-                    AgentName::A,
+                    AgentName::Dpg1,
                     format!("XSI_{}", script.name),
                     SpawnKind::Fork {
                         binary: "self",
@@ -746,7 +746,7 @@ pub(crate) fn register_unix_socket(reg: &mut Registry<'_>) {
                 "unix_socket",
                 id,
                 timeout = 60,
-                agents[a = AgentName::A],
+                agents[a = AgentName::Dpg1],
                 |run| {
                     let self_exe = run.self_exe().to_string();
                     let target = crate::binary_path(bt, &self_exe);
@@ -763,7 +763,7 @@ pub(crate) fn register_unix_socket(reg: &mut Registry<'_>) {
         }
     }
 
-    for &agent in &[AgentName::A, AgentName::AA, AgentName::B] {
+    for &agent in &[AgentName::Dpg1, AgentName::Dpg1Dpg1, AgentName::Dpg2] {
         for &bt in crate::BinaryType::ALL {
             let id = format!("UF.fork_unix.{}.{agent}", bt.label());
             let agent_name = agent;
@@ -795,12 +795,12 @@ pub(crate) fn register_unix_socket(reg: &mut Registry<'_>) {
     }
 
     for &agent in &[
-        AgentName::A,
-        AgentName::AA,
-        AgentName::B,
-        AgentName::D3,
-        AgentName::D4,
-        AgentName::NP,
+        AgentName::Dpg1,
+        AgentName::Dpg1Dpg1,
+        AgentName::Dpg2,
+        AgentName::Dpg1Dpg1Dpg1,
+        AgentName::Dpg1Dpg1Dpg1Dng,
+        AgentName::Dpg1Dng,
     ] {
         for &bt in crate::BinaryType::ALL {
             let agent_name = agent;
@@ -868,12 +868,12 @@ pub(crate) fn register_unix_socket(reg: &mut Registry<'_>) {
     }
 
     for &agent in &[
-        AgentName::A,
-        AgentName::AA,
-        AgentName::B,
-        AgentName::D3,
-        AgentName::D4,
-        AgentName::NP,
+        AgentName::Dpg1,
+        AgentName::Dpg1Dpg1,
+        AgentName::Dpg2,
+        AgentName::Dpg1Dpg1Dpg1,
+        AgentName::Dpg1Dpg1Dpg1Dng,
+        AgentName::Dpg1Dng,
     ] {
         for &bt in crate::BinaryType::ALL {
             let id = format!("US6.socketpair_exec.{}.{agent}", bt.label());
@@ -915,7 +915,7 @@ pub(crate) fn register_cross_worker(reg: &mut Registry<'_>) {
         "cross_worker",
         "XW.spawn_remote",
         timeout = 60,
-        agents[a = AgentName::A],
+        agents[a = AgentName::Dpg1],
         |run| {
             let resp = run
                 .send(
@@ -936,8 +936,8 @@ pub(crate) fn register_cross_worker(reg: &mut Registry<'_>) {
         "cross_worker",
         "XW1.remote_write",
         timeout = 60,
-        agents[a = AgentName::A],
-        ephemerals[r = (AgentName::A, "R", SpawnKind::NonPie)],
+        agents[a = AgentName::Dpg1],
+        ephemerals[r = (AgentName::Dpg1, "R", SpawnKind::NonPie)],
         |run| {
             let _ = run.spawn_ephemeral(&r).await;
             let resp = run
@@ -960,8 +960,8 @@ pub(crate) fn register_cross_worker(reg: &mut Registry<'_>) {
         "cross_worker",
         "XW1.local_read",
         timeout = 60,
-        agents[a = AgentName::A],
-        ephemerals[r = (AgentName::A, "R", SpawnKind::NonPie)],
+        agents[a = AgentName::Dpg1],
+        ephemerals[r = (AgentName::Dpg1, "R", SpawnKind::NonPie)],
         |run| {
             let _ = run.spawn_ephemeral(&r).await;
             let setup_resp = run
@@ -999,7 +999,7 @@ pub(crate) fn register_cross_worker(reg: &mut Registry<'_>) {
         "cross_worker",
         "XW2.local_write",
         timeout = 60,
-        agents[a = AgentName::A],
+        agents[a = AgentName::Dpg1],
         |run| {
             let resp = run
                 .send(
@@ -1021,8 +1021,8 @@ pub(crate) fn register_cross_worker(reg: &mut Registry<'_>) {
         "cross_worker",
         "XW2.remote_read",
         timeout = 60,
-        agents[a = AgentName::A],
-        ephemerals[r = (AgentName::A, "R", SpawnKind::NonPie)],
+        agents[a = AgentName::Dpg1],
+        ephemerals[r = (AgentName::Dpg1, "R", SpawnKind::NonPie)],
         |run| {
             let _ = run.spawn_ephemeral(&r).await;
             let setup_resp = run
@@ -1060,8 +1060,8 @@ pub(crate) fn register_cross_worker(reg: &mut Registry<'_>) {
         "cross_worker",
         "XW3.remote_listen",
         timeout = 60,
-        agents[a = AgentName::A],
-        ephemerals[r = (AgentName::A, "R", SpawnKind::NonPie)],
+        agents[a = AgentName::Dpg1],
+        ephemerals[r = (AgentName::Dpg1, "R", SpawnKind::NonPie)],
         |run| {
             let _ = run.spawn_ephemeral(&r).await;
             let resp = run
@@ -1083,8 +1083,8 @@ pub(crate) fn register_cross_worker(reg: &mut Registry<'_>) {
         "cross_worker",
         "XW3.local_connect",
         timeout = 60,
-        agents[a = AgentName::A],
-        ephemerals[r = (AgentName::A, "R", SpawnKind::NonPie)],
+        agents[a = AgentName::Dpg1],
+        ephemerals[r = (AgentName::Dpg1, "R", SpawnKind::NonPie)],
         |run| {
             let _ = run.spawn_ephemeral(&r).await;
             let listen_resp = run
@@ -1122,7 +1122,7 @@ pub(crate) fn register_cross_worker(reg: &mut Registry<'_>) {
         "cross_worker",
         "XW4.local_listen",
         timeout = 60,
-        agents[a = AgentName::A],
+        agents[a = AgentName::Dpg1],
         |run| {
             let resp = run
                 .send(
@@ -1143,8 +1143,8 @@ pub(crate) fn register_cross_worker(reg: &mut Registry<'_>) {
         "cross_worker",
         "XW4.remote_connect",
         timeout = 60,
-        agents[a = AgentName::A],
-        ephemerals[r = (AgentName::A, "R", SpawnKind::NonPie)],
+        agents[a = AgentName::Dpg1],
+        ephemerals[r = (AgentName::Dpg1, "R", SpawnKind::NonPie)],
         |run| {
             let _ = run.spawn_ephemeral(&r).await;
             let listen_resp = run
@@ -1182,8 +1182,8 @@ pub(crate) fn register_cross_worker(reg: &mut Registry<'_>) {
         "cross_worker",
         "XW5.remote_tcp_listen",
         timeout = 60,
-        agents[a = AgentName::A],
-        ephemerals[r = (AgentName::A, "R", SpawnKind::NonPie)],
+        agents[a = AgentName::Dpg1],
+        ephemerals[r = (AgentName::Dpg1, "R", SpawnKind::NonPie)],
         |run| {
             let _ = run.spawn_ephemeral(&r).await;
             let resp = run
@@ -1206,8 +1206,8 @@ pub(crate) fn register_cross_worker(reg: &mut Registry<'_>) {
         "cross_worker",
         "XW5.local_tcp_connect",
         timeout = 60,
-        agents[a = AgentName::A],
-        ephemerals[r = (AgentName::A, "R", SpawnKind::NonPie)],
+        agents[a = AgentName::Dpg1],
+        ephemerals[r = (AgentName::Dpg1, "R", SpawnKind::NonPie)],
         |run| {
             let _ = run.spawn_ephemeral(&r).await;
             let listen_resp = run
@@ -1251,7 +1251,7 @@ pub(crate) fn register_cross_worker(reg: &mut Registry<'_>) {
         "cross_worker",
         "XW6.local_tcp_listen",
         timeout = 60,
-        agents[a = AgentName::A],
+        agents[a = AgentName::Dpg1],
         |run| {
             let resp = run
                 .send(
@@ -1273,8 +1273,8 @@ pub(crate) fn register_cross_worker(reg: &mut Registry<'_>) {
         "cross_worker",
         "XW6.remote_tcp_connect",
         timeout = 60,
-        agents[a = AgentName::A],
-        ephemerals[r = (AgentName::A, "R", SpawnKind::NonPie)],
+        agents[a = AgentName::Dpg1],
+        ephemerals[r = (AgentName::Dpg1, "R", SpawnKind::NonPie)],
         |run| {
             let _ = run.spawn_ephemeral(&r).await;
             let listen_resp = run
@@ -1316,9 +1316,9 @@ pub(crate) fn register_cross_worker(reg: &mut Registry<'_>) {
         reg,
         "xworker",
         "cross_worker",
-        "XW7.d4_listen",
+        "XW7.dpg1_dpg1_dpg1_dng_listen",
         timeout = 60,
-        agents[d4 = AgentName::D4],
+        agents[d4 = AgentName::Dpg1Dpg1Dpg1Dng],
         |run| {
             let resp = run
                 .send(
@@ -1329,29 +1329,29 @@ pub(crate) fn register_cross_worker(reg: &mut Registry<'_>) {
                 )
                 .await;
             let pass = super::expect_unix_listening_path(&resp, "/tmp/xw7.sock").is_ok();
-            super::TestOutcome::new("D4", pass, format!("{resp:?}"))
+            super::TestOutcome::new(AgentName::Dpg1Dpg1Dpg1Dng.name(), pass, format!("{resp:?}"))
         }
     );
 
-    typed_test!(reg, "xworker", "cross_worker", "XW7.d3_connect", timeout = 60, agents [d4 = AgentName::D4, d3 = AgentName::D3], |run| {
+    typed_test!(reg, "xworker", "cross_worker", "XW7.dpg1_dpg1_dpg1_connect", timeout = 60, agents [d4 = AgentName::Dpg1Dpg1Dpg1Dng, d3 = AgentName::Dpg1Dpg1Dpg1], |run| {
         let listen_resp = run.send(&d4, Command::UnixListen { path: "/tmp/xw7c.sock".to_string() }).await;
         if super::expect_unix_listening_path(&listen_resp, "/tmp/xw7c.sock").is_err() {
-            return super::TestOutcome::new("D3", false, format!("listen setup failed: {listen_resp:?}"));
+            return super::TestOutcome::new(AgentName::Dpg1Dpg1Dpg1.name(), false, format!("listen setup failed: {listen_resp:?}"));
         }
         let resp = run
             .send(&d3, Command::UnixConnect { path: "/tmp/xw7c.sock".to_string(), data: "XW7_D3_TO_D4".to_string() })
             .await;
         let pass = matches!(&resp, Response::Connected { echo } if echo.contains("XW7_D3_TO_D4"));
-        super::TestOutcome::new("D3", pass, format!("{resp:?}"))
+        super::TestOutcome::new(AgentName::Dpg1Dpg1Dpg1.name(), pass, format!("{resp:?}"))
     });
 
     typed_test!(
         reg,
         "xworker",
         "cross_worker",
-        "XW8.d3_listen",
+        "XW8.dpg1_dpg1_dpg1_listen",
         timeout = 60,
-        agents[d3 = AgentName::D3],
+        agents[d3 = AgentName::Dpg1Dpg1Dpg1],
         |run| {
             let resp = run
                 .send(
@@ -1362,29 +1362,29 @@ pub(crate) fn register_cross_worker(reg: &mut Registry<'_>) {
                 )
                 .await;
             let pass = super::expect_unix_listening_path(&resp, "/tmp/xw8.sock").is_ok();
-            super::TestOutcome::new("D3", pass, format!("{resp:?}"))
+            super::TestOutcome::new(AgentName::Dpg1Dpg1Dpg1.name(), pass, format!("{resp:?}"))
         }
     );
 
-    typed_test!(reg, "xworker", "cross_worker", "XW8.d4_connect", timeout = 60, agents [d3 = AgentName::D3, d4 = AgentName::D4], |run| {
+    typed_test!(reg, "xworker", "cross_worker", "XW8.dpg1_dpg1_dpg1_dng_connect", timeout = 60, agents [d3 = AgentName::Dpg1Dpg1Dpg1, d4 = AgentName::Dpg1Dpg1Dpg1Dng], |run| {
         let listen_resp = run.send(&d3, Command::UnixListen { path: "/tmp/xw8c.sock".to_string() }).await;
         if super::expect_unix_listening_path(&listen_resp, "/tmp/xw8c.sock").is_err() {
-            return super::TestOutcome::new("D4", false, format!("listen setup failed: {listen_resp:?}"));
+            return super::TestOutcome::new(AgentName::Dpg1Dpg1Dpg1Dng.name(), false, format!("listen setup failed: {listen_resp:?}"));
         }
         let resp = run
             .send(&d4, Command::UnixConnect { path: "/tmp/xw8c.sock".to_string(), data: "XW8_D4_TO_D3".to_string() })
             .await;
         let pass = matches!(&resp, Response::Connected { echo } if echo.contains("XW8_D4_TO_D3"));
-        super::TestOutcome::new("D4", pass, format!("{resp:?}"))
+        super::TestOutcome::new(AgentName::Dpg1Dpg1Dpg1Dng.name(), pass, format!("{resp:?}"))
     });
 
     typed_test!(
         reg,
         "xworker",
         "cross_worker",
-        "XW9.d4_listen",
+        "XW9.dpg1_dpg1_dpg1_dng_listen",
         timeout = 60,
-        agents[d4 = AgentName::D4],
+        agents[d4 = AgentName::Dpg1Dpg1Dpg1Dng],
         |run| {
             let resp = run
                 .send(
@@ -1395,29 +1395,29 @@ pub(crate) fn register_cross_worker(reg: &mut Registry<'_>) {
                 )
                 .await;
             let pass = super::expect_unix_listening_path(&resp, "/tmp/xw9.sock").is_ok();
-            super::TestOutcome::new("D4", pass, format!("{resp:?}"))
+            super::TestOutcome::new(AgentName::Dpg1Dpg1Dpg1Dng.name(), pass, format!("{resp:?}"))
         }
     );
 
-    typed_test!(reg, "xworker", "cross_worker", "XW9.aa_connect", timeout = 60, agents [d4 = AgentName::D4, aa = AgentName::AA], |run| {
+    typed_test!(reg, "xworker", "cross_worker", "XW9.dpg1_dpg1_connect", timeout = 60, agents [d4 = AgentName::Dpg1Dpg1Dpg1Dng, aa = AgentName::Dpg1Dpg1], |run| {
         let listen_resp = run.send(&d4, Command::UnixListen { path: "/tmp/xw9c.sock".to_string() }).await;
         if super::expect_unix_listening_path(&listen_resp, "/tmp/xw9c.sock").is_err() {
-            return super::TestOutcome::new("AA", false, format!("listen setup failed: {listen_resp:?}"));
+            return super::TestOutcome::new(AgentName::Dpg1Dpg1.name(), false, format!("listen setup failed: {listen_resp:?}"));
         }
         let resp = run
             .send(&aa, Command::UnixConnect { path: "/tmp/xw9c.sock".to_string(), data: "XW9_AA_TO_D4".to_string() })
             .await;
         let pass = matches!(&resp, Response::Connected { echo } if echo.contains("XW9_AA_TO_D4"));
-        super::TestOutcome::new("AA", pass, format!("{resp:?}"))
+        super::TestOutcome::new(AgentName::Dpg1Dpg1.name(), pass, format!("{resp:?}"))
     });
 
     typed_test!(
         reg,
         "xworker",
         "cross_worker",
-        "XW10.d3_tcp_listen",
+        "XW10.dpg1_dpg1_dpg1_tcp_listen",
         timeout = 60,
-        agents[d3 = AgentName::D3],
+        agents[d3 = AgentName::Dpg1Dpg1Dpg1],
         |run| {
             let resp = run
                 .send(
@@ -1429,11 +1429,11 @@ pub(crate) fn register_cross_worker(reg: &mut Registry<'_>) {
                 )
                 .await;
             let pass = super::expect_listening_port(&resp, 0).is_ok();
-            super::TestOutcome::new("D3", pass, format!("{resp:?}"))
+            super::TestOutcome::new(AgentName::Dpg1Dpg1Dpg1.name(), pass, format!("{resp:?}"))
         }
     );
 
-    typed_test!(reg, "xworker", "cross_worker", "XW10.b_tcp_connect", timeout = 60, agents [d3 = AgentName::D3, b = AgentName::B], |run| {
+    typed_test!(reg, "xworker", "cross_worker", "XW10.dpg2_tcp_connect", timeout = 60, agents [d3 = AgentName::Dpg1Dpg1Dpg1, b = AgentName::Dpg2], |run| {
         let listen_resp = run.send(&d3, Command::NetListen { port: 0, pre_bind_options: vec![] }).await;
         let port = match super::expect_listening_port(&listen_resp, 0) {
             Ok(port) => port,
@@ -1451,9 +1451,9 @@ pub(crate) fn register_cross_worker(reg: &mut Registry<'_>) {
         reg,
         "xworker",
         "cross_worker",
-        "XW11.d3_tcp_listen",
+        "XW11.dpg1_dpg1_dpg1_tcp_listen",
         timeout = 60,
-        agents[d3 = AgentName::D3],
+        agents[d3 = AgentName::Dpg1Dpg1Dpg1],
         |run| {
             let resp = run
                 .send(
@@ -1465,7 +1465,7 @@ pub(crate) fn register_cross_worker(reg: &mut Registry<'_>) {
                 )
                 .await;
             let pass = super::expect_listening_port(&resp, 0).is_ok();
-            super::TestOutcome::new("D3", pass, format!("{resp:?}"))
+            super::TestOutcome::new(AgentName::Dpg1Dpg1Dpg1.name(), pass, format!("{resp:?}"))
         }
     );
 
@@ -1475,8 +1475,8 @@ pub(crate) fn register_cross_worker(reg: &mut Registry<'_>) {
         "cross_worker",
         "XW11.spawn_r2",
         timeout = 60,
-        agents[b = AgentName::B],
-        ephemerals[r2 = (AgentName::B, "R2", SpawnKind::NonPie)],
+        agents[b = AgentName::Dpg2],
+        ephemerals[r2 = (AgentName::Dpg2, "R2", SpawnKind::NonPie)],
         |run| {
             let resp = run.spawn_ephemeral(&r2).await;
             let pass = super::ok_spawned_response(&resp);
@@ -1490,8 +1490,8 @@ pub(crate) fn register_cross_worker(reg: &mut Registry<'_>) {
         "cross_worker",
         "XW11.r2_tcp_connect",
         timeout = 60,
-        agents[d3 = AgentName::D3, b = AgentName::B],
-        ephemerals[r2 = (AgentName::B, "R2", SpawnKind::NonPie)],
+        agents[d3 = AgentName::Dpg1Dpg1Dpg1, b = AgentName::Dpg2],
+        ephemerals[r2 = (AgentName::Dpg2, "R2", SpawnKind::NonPie)],
         |run| {
             let listen_resp = run.send(&d3, Command::NetListen { port: 0, pre_bind_options: vec![] }).await;
             let port = match super::expect_listening_port(&listen_resp, 0) {
@@ -1512,12 +1512,12 @@ pub(crate) fn register_cross_worker(reg: &mut Registry<'_>) {
 // Register pipe EOF tests.
 pub(crate) fn register_pipe_eof(reg: &mut Registry<'_>) {
     for &agent in &[
-        AgentName::A,
-        AgentName::AA,
-        AgentName::B,
-        AgentName::D3,
-        AgentName::D4,
-        AgentName::NP,
+        AgentName::Dpg1,
+        AgentName::Dpg1Dpg1,
+        AgentName::Dpg2,
+        AgentName::Dpg1Dpg1Dpg1,
+        AgentName::Dpg1Dpg1Dpg1Dng,
+        AgentName::Dpg1Dng,
     ] {
         for &bt in crate::BinaryType::ALL {
             let id = format!("P1.pipe_eof_fork.{}.{agent}", bt.label());
@@ -1549,7 +1549,7 @@ pub(crate) fn register_pipe_eof(reg: &mut Registry<'_>) {
         }
     }
 
-    for &agent in &[AgentName::A, AgentName::AA, AgentName::B] {
+    for &agent in &[AgentName::Dpg1, AgentName::Dpg1Dpg1, AgentName::Dpg2] {
         for &bt in crate::BinaryType::ALL {
             let id = format!("P2.pipe_eof_exec.{}.{agent}", bt.label());
             let agent_name = agent;
@@ -1590,7 +1590,7 @@ pub(crate) fn register_contamination_sequence(reg: &mut Registry<'_>) {
         "contamination_sequence",
         "X49a.pie_sequential_1",
         timeout = 60,
-        agents[a = AgentName::A],
+        agents[a = AgentName::Dpg1],
         |run| {
             let self_exe = run.self_exe().to_string();
             let resp = run
@@ -1607,7 +1607,7 @@ pub(crate) fn register_contamination_sequence(reg: &mut Registry<'_>) {
         "contamination_sequence",
         "X49b.pie_sequential_2",
         timeout = 60,
-        agents[a = AgentName::A],
+        agents[a = AgentName::Dpg1],
         |run| {
             let self_exe = run.self_exe().to_string();
             let resp = run
@@ -1627,7 +1627,7 @@ pub(crate) fn register_contamination_sequence(reg: &mut Registry<'_>) {
         "contamination_sequence",
         "X50a.nonpie_then_pie_1",
         timeout = 60,
-        agents[a = AgentName::A],
+        agents[a = AgentName::Dpg1],
         |run| {
             let nonpie = crate::nonpie_binary();
             let resp = run
@@ -1644,7 +1644,7 @@ pub(crate) fn register_contamination_sequence(reg: &mut Registry<'_>) {
         "contamination_sequence",
         "X50b.nonpie_then_pie_2",
         timeout = 60,
-        agents[a = AgentName::A],
+        agents[a = AgentName::Dpg1],
         |run| {
             let self_exe = run.self_exe().to_string();
             let resp = run
@@ -1661,7 +1661,7 @@ pub(crate) fn register_contamination_sequence(reg: &mut Registry<'_>) {
         "contamination_sequence",
         "X51.nonpie_fresh_agent",
         timeout = 60,
-        agents[b = AgentName::B],
+        agents[b = AgentName::Dpg2],
         |run| {
             let nonpie = crate::nonpie_binary();
             let resp = run
@@ -1678,7 +1678,7 @@ pub(crate) fn register_contamination_sequence(reg: &mut Registry<'_>) {
         "contamination_sequence",
         "X52a.B_nonpie_then_pie",
         timeout = 60,
-        agents[b = AgentName::B],
+        agents[b = AgentName::Dpg2],
         |run| {
             let self_exe = run.self_exe().to_string();
             let resp = run
@@ -1695,7 +1695,7 @@ pub(crate) fn register_contamination_sequence(reg: &mut Registry<'_>) {
         "contamination_sequence",
         "X52b.B_pie_after_nonpie",
         timeout = 60,
-        agents[b = AgentName::B],
+        agents[b = AgentName::Dpg2],
         |run| {
             let self_exe = run.self_exe().to_string();
             let resp = run
@@ -1715,7 +1715,7 @@ pub(crate) fn register_contamination_sequence(reg: &mut Registry<'_>) {
         "contamination_sequence",
         "X52c.B_third_exec",
         timeout = 60,
-        agents[b = AgentName::B],
+        agents[b = AgentName::Dpg2],
         |run| {
             let self_exe = run.self_exe().to_string();
             let resp = run
@@ -1732,7 +1732,7 @@ pub(crate) fn register_contamination_sequence(reg: &mut Registry<'_>) {
         "contamination_sequence",
         "X53.stress_pie",
         timeout = 60,
-        agents[ab = AgentName::AB],
+        agents[ab = AgentName::Dpg1Dpg2],
         |run| {
             let self_exe = run.self_exe().to_string();
             for i in 0..30 {
@@ -1758,7 +1758,7 @@ pub(crate) fn register_contamination_sequence(reg: &mut Registry<'_>) {
         "contamination_sequence",
         "X54.nonpie_after_stress",
         timeout = 60,
-        agents[ab = AgentName::AB],
+        agents[ab = AgentName::Dpg1Dpg2],
         |run| {
             let nonpie = crate::nonpie_binary();
             let resp = run
@@ -1775,7 +1775,7 @@ pub(crate) fn register_contamination_sequence(reg: &mut Registry<'_>) {
         "contamination_sequence",
         "X55a.one_pie_first",
         timeout = 60,
-        agents[aab = AgentName::AAB],
+        agents[aab = AgentName::Dpg1Dpg1Dpg2],
         |run| {
             let self_exe = run.self_exe().to_string();
             let resp = run
@@ -1792,7 +1792,7 @@ pub(crate) fn register_contamination_sequence(reg: &mut Registry<'_>) {
         "contamination_sequence",
         "X55b.nonpie_second",
         timeout = 60,
-        agents[aab = AgentName::AAB],
+        agents[aab = AgentName::Dpg1Dpg1Dpg2],
         |run| {
             let nonpie = crate::nonpie_binary();
             let resp = run
@@ -1809,7 +1809,7 @@ pub(crate) fn register_contamination_sequence(reg: &mut Registry<'_>) {
         "contamination_sequence",
         "X56.second_nonpie_on_B",
         timeout = 60,
-        agents[b = AgentName::B],
+        agents[b = AgentName::Dpg2],
         |run| {
             let nonpie = crate::nonpie_binary();
             let resp = run
@@ -1826,7 +1826,7 @@ pub(crate) fn register_contamination_sequence(reg: &mut Registry<'_>) {
         "contamination_sequence",
         "X57.pipe_churn_then_nonpie",
         timeout = 60,
-        agents[b = AgentName::B],
+        agents[b = AgentName::Dpg2],
         |run| {
             let nonpie = crate::nonpie_binary();
             for _ in 0..20 {
@@ -1855,7 +1855,7 @@ pub(crate) fn register_contamination_sequence(reg: &mut Registry<'_>) {
         "contamination_sequence",
         "X58.alternating_pie_nonpie",
         timeout = 60,
-        agents[b = AgentName::B],
+        agents[b = AgentName::Dpg2],
         |run| {
             let self_exe = run.self_exe().to_string();
             let nonpie = crate::nonpie_binary();
@@ -1890,7 +1890,7 @@ pub(crate) fn register_contamination_sequence(reg: &mut Registry<'_>) {
         "contamination_sequence",
         "X59.sequential_nonpie",
         timeout = 60,
-        agents[b = AgentName::B],
+        agents[b = AgentName::Dpg2],
         |run| {
             let nonpie = crate::nonpie_binary();
             for i in 0..5 {

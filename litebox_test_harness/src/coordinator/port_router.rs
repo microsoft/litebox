@@ -28,8 +28,8 @@ pub(crate) fn register_port_router(reg: &mut Registry<'_>) {
 }
 
 fn register_fork_port_tests(reg: &mut Registry<'_>) {
-    for &agent in &[AgentName::A, AgentName::B] {
-        let port = if agent == AgentName::A {
+    for &agent in &[AgentName::Dpg1, AgentName::Dpg2] {
+        let port = if agent == AgentName::Dpg1 {
             18200u16
         } else {
             18201u16
@@ -116,7 +116,7 @@ fn register_fork_multi_tests(reg: &mut Registry<'_>) {
     reg.test("stress", "port_router", "PR.fork_multi_x5")
         .timeout(180)
         .build(move |cx| {
-            let handle_a = cx.require(AgentName::A);
+            let handle_a = cx.require(AgentName::Dpg1);
             Box::new(move |run| {
                 Box::pin(async move {
                     let agent = "A";
@@ -164,8 +164,8 @@ fn register_fork_cross_tests(reg: &mut Registry<'_>) {
     reg.test("stress", "port_router", "PR.fork_cross")
         .timeout(180)
         .build(move |cx| {
-            let handle_a = cx.require(AgentName::A);
-            let handle_b = cx.require(AgentName::B);
+            let handle_a = cx.require(AgentName::Dpg1);
+            let handle_b = cx.require(AgentName::Dpg2);
             Box::new(move |run| {
                 Box::pin(async move {
                     let listener = "A";
@@ -207,7 +207,7 @@ fn register_fork_interleave_tests(reg: &mut Registry<'_>) {
     reg.test("stress", "port_router", "PR.fork_interleave")
         .timeout(180)
         .build(move |cx| {
-            let handle_a = cx.require(AgentName::A);
+            let handle_a = cx.require(AgentName::Dpg1);
             Box::new(move |run| {
                 Box::pin(async move {
                     let agent = "A";
@@ -268,7 +268,7 @@ fn register_fork_background_tests(reg: &mut Registry<'_>) {
     reg.test("stress", "port_router", "PR.fork_bg")
         .timeout(180)
         .build(move |cx| {
-            let handle_a = cx.require(AgentName::A);
+            let handle_a = cx.require(AgentName::Dpg1);
             Box::new(move |run| {
                 Box::pin(async move {
                     let agent = "A";
@@ -332,9 +332,9 @@ fn register_fork_listen_inherit_tests(reg: &mut Registry<'_>) {
     reg.test("stress", "port_router", "PR.listen_inherit_self")
         .timeout(180)
         .build(|cx| {
-            let handle_a = cx.require(AgentName::A);
+            let handle_a = cx.require(AgentName::Dpg1);
             let li_c = cx.declare_ephemeral(
-                AgentName::A,
+                AgentName::Dpg1,
                 "LI_C",
                 SpawnKind::Fork {
                     binary: "self",
@@ -390,10 +390,10 @@ fn register_fork_listen_inherit_tests(reg: &mut Registry<'_>) {
     reg.test("stress", "port_router", "PR.listen_inherit_cross")
         .timeout(180)
         .build(|cx| {
-            let handle_a = cx.require(AgentName::A);
-            let handle_b = cx.require(AgentName::B);
+            let handle_a = cx.require(AgentName::Dpg1);
+            let handle_b = cx.require(AgentName::Dpg2);
             let li_c2 = cx.declare_ephemeral(
-                AgentName::A,
+                AgentName::Dpg1,
                 "LI_C2",
                 SpawnKind::Fork {
                     binary: "self",
@@ -458,13 +458,13 @@ fn register_child_listen_cross_connect_tests(reg: &mut Registry<'_>) {
     reg.test("stress", "port_router", "PR.child_listen_cross")
         .timeout(180)
         .build(move |cx| {
-            let _handle_a = cx.require(AgentName::A);
-            let handle_b = cx.require(AgentName::B);
+            let _handle_a = cx.require(AgentName::Dpg1);
+            let handle_b = cx.require(AgentName::Dpg2);
             // Try CL_C as a non-PIE Fork first; fall back to PIE.
             // Both share the same wire label so forwarding works
             // regardless of which kind succeeded.
             let cl_c_nonpie = cx.declare_ephemeral(
-                AgentName::A,
+                AgentName::Dpg1,
                 "CL_C",
                 SpawnKind::Fork {
                     binary: "nonpie",
@@ -472,7 +472,7 @@ fn register_child_listen_cross_connect_tests(reg: &mut Registry<'_>) {
                 },
             );
             let cl_c_pie = cx.declare_ephemeral(
-                AgentName::A,
+                AgentName::Dpg1,
                 "CL_C",
                 SpawnKind::Fork {
                     binary: "self",
@@ -531,8 +531,8 @@ fn register_depth_axis_tests(reg: &mut Registry<'_>) {
     reg.test("stress", "port_router", "PR.fork_child_parent")
         .timeout(180)
         .build(|cx| {
-            let parent = cx.require(AgentName::A);
-            let child = cx.require(AgentName::AA);
+            let parent = cx.require(AgentName::Dpg1);
+            let child = cx.require(AgentName::Dpg1Dpg1);
             Box::new(move |run| {
                 Box::pin(async move {
                     let port = 18510u16;
@@ -572,10 +572,10 @@ fn register_depth_axis_tests(reg: &mut Registry<'_>) {
     reg.test("stress", "port_router", "PR.child_listen_depth2")
         .timeout(180)
         .build(|cx| {
-            let connector = cx.require(AgentName::D5);
+            let connector = cx.require(AgentName::Dpg1Dpg1Dpg1DngDpg);
             let child = cx.declare_ephemeral(
-                AgentName::D4,
-                "CL_D4",
+                AgentName::Dpg1Dpg1Dpg1Dng,
+                "CL_dpg1_dpg1_dpg1_dng",
                 SpawnKind::Fork {
                     binary: "self",
                     inherit_listen_ports: vec![],
@@ -588,7 +588,7 @@ fn register_depth_axis_tests(reg: &mut Registry<'_>) {
                     let spawn_resp = run.spawn_ephemeral(&child).await;
                     if !matches!(&spawn_resp, Response::Ok { .. }) {
                         return super::TestOutcome::new(
-                            "D5->CL_D4",
+                            "dpg1_dpg1_dpg1_dng_dpg->CL_dpg1_dpg1_dpg1_dng",
                             false,
                             format!("fork failed: {spawn_resp:?}"),
                         );
@@ -597,7 +597,7 @@ fn register_depth_axis_tests(reg: &mut Registry<'_>) {
                     if !matches!(&listen_resp, Response::Listening { port: p } if *p == port) {
                         let _ = run.forward(&child, Command::Exit).await;
                         return super::TestOutcome::new(
-                            "D5->CL_D4",
+                            "dpg1_dpg1_dpg1_dng_dpg->CL_dpg1_dpg1_dpg1_dng",
                             false,
                             format!("child listen failed: {listen_resp:?}"),
                         );
@@ -614,7 +614,7 @@ fn register_depth_axis_tests(reg: &mut Registry<'_>) {
                     let pass = matches!(&conn_resp, Response::Connected { echo } if echo == "child_listen_depth2");
                     let _ = run.forward(&child, Command::NetUnlisten { port }).await;
                     let _ = run.forward(&child, Command::Exit).await;
-                    super::TestOutcome::new("D5->CL_D4", pass, format!("{conn_resp:?}"))
+                    super::TestOutcome::new("dpg1_dpg1_dpg1_dng_dpg->CL_dpg1_dpg1_dpg1_dng", pass, format!("{conn_resp:?}"))
                 })
             })
         });

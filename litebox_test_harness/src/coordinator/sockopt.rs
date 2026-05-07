@@ -10,7 +10,7 @@ use super::agents::{AgentHandle, AgentName};
 use super::registry::Registry;
 use super::run_context::RunContext;
 
-const SOCKOPT_AGENTS: &[AgentName] = &[AgentName::A, AgentName::AA];
+const SOCKOPT_AGENTS: &[AgentName] = &[AgentName::Dpg1, AgentName::Dpg1Dpg1];
 const SOCKOPT_SCENARIOS: &[ScenarioDef] = &[
     ScenarioDef {
         name: "reuseaddr_double_listen",
@@ -59,13 +59,17 @@ fn run_reuseaddr_double_listen<'a>(
             Ok(port) => port,
             Err(e) => return TestOutcome::new(agent_label, false, format!("initial listen: {e}")),
         };
+        let plain_second = listen(run, &handle, port, vec![]).await;
+        if plain_second.is_ok() {
+            let _ = run.send(&handle, Command::NetUnlisten { port }).await;
+            return TestOutcome::new(
+                agent_label,
+                false,
+                format!("second listen on active port {port} succeeded without SO_REUSEADDR"),
+            );
+        }
         let _ = connect_echo(run, &handle, port, "sockopt_reuseaddr_plain").await;
         let _ = run.send(&handle, Command::NetUnlisten { port }).await;
-
-        let plain_relisten = listen(run, &handle, port, vec![]).await;
-        if plain_relisten.is_ok() {
-            let _ = run.send(&handle, Command::NetUnlisten { port }).await;
-        }
 
         let reuse_options = vec![(SockOpt::ReuseAddr, SockOptValue::Bool(true))];
         let reuse_first = listen(run, &handle, 0, reuse_options.clone()).await;
@@ -88,8 +92,8 @@ fn run_reuseaddr_double_listen<'a>(
                     agent_label,
                     true,
                     format!(
-                        "plain_relisten={} reuseaddr_relisten=ok",
-                        plain_relisten.is_ok()
+                        "plain_second={} reuseaddr_relisten=ok",
+                        plain_second.is_ok()
                     ),
                 )
             }

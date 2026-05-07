@@ -44,7 +44,8 @@ impl RegistrationContext {
     /// `agent`. Returns a handle the test can use at runtime to send
     /// commands to it. Routing-chain ancestors (e.g. `D4` requires
     /// `A`, `AA`, `D3`) are recorded too.
-    pub fn require(&mut self, agent: AgentName) -> AgentHandle {
+    pub fn require(&mut self, agent: impl Into<AgentName>) -> AgentHandle {
+        let agent = agent.into();
         for &anc in agent.ancestors() {
             self.declared.insert(anc);
         }
