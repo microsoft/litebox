@@ -994,10 +994,6 @@ async fn agent_loop(self_exe: &str) {
                 respond(&Response::Ok { data: Some(cwd) }).await;
             }
 
-            Command::Go => {
-                respond(&Response::Ok { data: None }).await;
-            }
-
             Command::UnixListen { path } => {
                 let _ = tokio::fs::remove_file(&path).await;
                 match tokio::net::UnixListener::bind(&path) {
