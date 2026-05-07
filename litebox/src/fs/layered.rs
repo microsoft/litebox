@@ -2512,6 +2512,37 @@ impl<
         }
     }
 
+    fn get_pty_winsize(
+        &self,
+        fd: &FileFd<Platform, Upper, Lower>,
+    ) -> Option<crate::platform::WindowSize> {
+        let entry = self
+            .litebox
+            .descriptor_table()
+            .with_entry(fd, |descriptor| Arc::clone(&descriptor.entry.entry))?;
+        match entry.as_ref() {
+            EntryX::Upper { fd } => self.upper.get_pty_winsize(fd),
+            EntryX::Lower { fd } => self.lower.get_pty_winsize(fd),
+            EntryX::Tombstone => None,
+        }
+    }
+
+    fn set_pty_winsize(
+        &self,
+        fd: &FileFd<Platform, Upper, Lower>,
+        winsize: crate::platform::WindowSize,
+    ) -> bool {
+        let entry = self
+            .litebox
+            .descriptor_table()
+            .with_entry(fd, |descriptor| Arc::clone(&descriptor.entry.entry));
+        match entry.as_deref() {
+            Some(EntryX::Upper { fd }) => self.upper.set_pty_winsize(fd, winsize),
+            Some(EntryX::Lower { fd }) => self.lower.set_pty_winsize(fd, winsize),
+            _ => false,
+        }
+    }
+
     fn get_pty_pair_erased(
         &self,
         fd: &FileFd<Platform, Upper, Lower>,

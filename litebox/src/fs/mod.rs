@@ -260,6 +260,18 @@ pub trait FileSystem: private::Sealed + FdEnabledSubsystem {
         false
     }
 
+    /// Get the terminal window size stored for a PTY file descriptor.
+    #[expect(unused_variables, reason = "default body, non-underscored param names")]
+    fn get_pty_winsize(&self, fd: &TypedFd<Self>) -> Option<crate::platform::WindowSize> {
+        None
+    }
+
+    /// Set the terminal window size stored for a PTY file descriptor.
+    #[expect(unused_variables, reason = "default body, non-underscored param names")]
+    fn set_pty_winsize(&self, fd: &TypedFd<Self>, winsize: crate::platform::WindowSize) -> bool {
+        false
+    }
+
     /// Get the PTY pair for a file descriptor as a type-erased Arc.
     ///
     /// Returns `Some((arc, index, is_master))` if the fd refers to a PTY device.

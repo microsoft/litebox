@@ -135,6 +135,8 @@ pub struct PtyPair<Platform: crate::sync::RawSyncPrimitivesProvider + TimeProvid
     /// Foreground process group for this PTY — modified by TIOCSPGRP, read by
     /// TIOCGPGRP.  Stored as a raw pid_t; 0 means "not yet set".
     pub foreground_pgrp: core::sync::atomic::AtomicI32,
+    /// Stored terminal window size — modified by TIOCSWINSZ, read by TIOCGWINSZ.
+    pub winsize: crate::sync::Mutex<Platform, crate::platform::WindowSize>,
 }
 
 /// Wrapper for polling the master side of a PTY pair.
@@ -257,6 +259,12 @@ impl<Platform: crate::sync::RawSyncPrimitivesProvider + TimeProvider> PtyManager
             slave_pollee: Pollee::new(),
             termios: crate::sync::Mutex::new(PtyTermios::new_default()),
             foreground_pgrp: core::sync::atomic::AtomicI32::new(0),
+            winsize: crate::sync::Mutex::new(crate::platform::WindowSize {
+                rows: 40,
+                cols: 120,
+                xpixel: 0,
+                ypixel: 0,
+            }),
         }));
         idx
     }
@@ -1009,6 +1017,20 @@ impl<
         if let Some((pair, _, _)) = self.get_pty_info(fd) {
             pair.foreground_pgrp
                 .store(pgrp, core::sync::atomic::Ordering::Relaxed);
+            true
+        } else {
+            false
+        }
+    }
+
+    fn get_pty_winsize(&self, fd: &FileFd<Platform>) -> Option<crate::platform::WindowSize> {
+        let (pair, _, _) = self.get_pty_info(fd)?;
+        Some(*pair.winsize.lock())
+    }
+
+    fn set_pty_winsize(&self, fd: &FileFd<Platform>, winsize: crate::platform::WindowSize) -> bool {
+        if let Some((pair, _, _)) = self.get_pty_info(fd) {
+            *pair.winsize.lock() = winsize;
             true
         } else {
             false

@@ -2402,6 +2402,7 @@ impl<FS: ShimFS> Task<FS> {
                 vfork_done: vfork_done.clone(),
                 exit_signal: i32::try_from(args.exit_signal).unwrap_or(0),
                 parent_process_id: self.process_id,
+                parent_controlling_pty: *self.process_state.borrow().controlling_pty.lock(),
                 parent_pipe_fds: {
                     let files = self.files.borrow();
                     let rds = files.raw_descriptor_store.read();
@@ -2425,6 +2426,7 @@ impl<FS: ShimFS> Task<FS> {
                     // would cause new pipes to be incorrectly filtered.
                     {
                         let mut mux_ids = self.mux_pipe_pair_ids.borrow_mut();
+                        #[cfg(feature = "trace_syscalls")]
                         let before = mux_ids.len();
                         mux_ids.retain(|id| live_pair_ids.contains(id));
                         #[cfg(feature = "trace_syscalls")]
@@ -2622,6 +2624,9 @@ impl<FS: ShimFS> Task<FS> {
                 pm: litebox::mm::PageManager::new(&self.global.litebox, child_range),
                 address_space_id: child_as_id,
                 thread_count: core::sync::atomic::AtomicI32::new(1),
+                controlling_pty: litebox::sync::Mutex::new(
+                    *self.process_state.borrow().controlling_pty.lock(),
+                ),
                 active_vfork_layers: litebox::sync::Mutex::new(alloc::vec::Vec::new()),
                 elf_patch_cache: litebox::sync::Mutex::new(alloc::collections::BTreeMap::new()),
                 shared_file_mappings: litebox::sync::Mutex::new(alloc::vec::Vec::new()),
@@ -6777,7 +6782,7 @@ impl<FS: ShimFS> Task<FS> {
             // the descriptor's object_id matches the original host stdio.
             // For filesystem fds, also probe terminal metadata markers so we
             // can accept terminal fds through the snapshot gate.
-            let (subsystem_class, object_id, terminal_meta, socket_pair_id) =
+            let (subsystem_class, object_id, terminal_meta, _socket_pair_id) =
                 if let Ok(fd) = rds.fd_from_raw_integer::<FS>(raw_fd) {
                     let oid = Some(fd.object_id());
                     // Probe terminal metadata markers on this filesystem fd.
@@ -8241,7 +8246,10 @@ impl<FS: ShimFS> Task<FS> {
             .process_registry()
             .setsid(self.process_id)
         {
-            Some(Ok(sid)) => Ok(sid.as_u32()),
+            Some(Ok(sid)) => {
+                *self.process_state.borrow().controlling_pty.lock() = None;
+                Ok(sid.as_u32())
+            }
             Some(Err(SetsidError::AlreadyGroupLeader)) => Err(Errno::EPERM),
             None => Err(Errno::ESRCH),
         }
@@ -9213,10 +9221,14 @@ impl<FS: ShimFS> Task<FS> {
                         .address_space_range(fc.address_space_id)
                         .expect("child address space must be valid")
                 };
+                let shared_ps = self.process_state.borrow().clone();
+                let child_controlling_pty = *shared_ps.controlling_pty.lock();
+                *shared_ps.controlling_pty.lock() = fc.parent_controlling_pty;
                 let child_ps = Arc::new(crate::ProcessState {
                     pm: litebox::mm::PageManager::new(&self.global.litebox, child_range),
                     address_space_id: fc.address_space_id,
                     thread_count: core::sync::atomic::AtomicI32::new(1),
+                    controlling_pty: litebox::sync::Mutex::new(child_controlling_pty),
                     active_vfork_layers: litebox::sync::Mutex::new(alloc::vec::Vec::new()),
                     elf_patch_cache: litebox::sync::Mutex::new(alloc::collections::BTreeMap::new()),
                     shared_file_mappings: litebox::sync::Mutex::new(alloc::vec::Vec::new()),
@@ -9295,10 +9307,14 @@ impl<FS: ShimFS> Task<FS> {
                     .address_space_range(fc.address_space_id)
                     .expect("child address space must be valid")
             };
+            let shared_ps = self.process_state.borrow().clone();
+            let child_controlling_pty = *shared_ps.controlling_pty.lock();
+            *shared_ps.controlling_pty.lock() = fc.parent_controlling_pty;
             let child_ps = Arc::new(crate::ProcessState {
                 pm: litebox::mm::PageManager::new(&self.global.litebox, child_range),
                 address_space_id: fc.address_space_id,
                 thread_count: core::sync::atomic::AtomicI32::new(1),
+                controlling_pty: litebox::sync::Mutex::new(child_controlling_pty),
                 active_vfork_layers: litebox::sync::Mutex::new(alloc::vec::Vec::new()),
                 elf_patch_cache: litebox::sync::Mutex::new(alloc::collections::BTreeMap::new()),
                 shared_file_mappings: litebox::sync::Mutex::new(alloc::vec::Vec::new()),
