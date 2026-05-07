@@ -277,6 +277,14 @@ pub enum Command {
     #[serde(rename = "pipe_pair_id_unique")]
     PipePairIdUnique { count: u32 },
 
+    /// Call io_uring_setup(2) once and report the kernel-visible outcome.
+    #[serde(rename = "io_uring_setup")]
+    IoUringSetup { entries: u32 },
+
+    /// Call epoll_create1(2) once and report whether a descriptor was returned.
+    #[serde(rename = "epoll_open")]
+    EpollOpen,
+
     /// Shut down gracefully.
     #[serde(rename = "exit")]
     Exit,
@@ -363,6 +371,14 @@ pub enum Response {
     /// Readiness or wait predicate satisfied.
     #[serde(rename = "ready")]
     Ready,
+
+    /// io_uring_setup(2) result. `errno` is a positive errno on failure.
+    #[serde(rename = "io_uring_result")]
+    IoUringResult { ring_fd: i32, errno: Option<i32> },
+
+    /// epoll_create1(2) result. `errno` is a positive errno on failure.
+    #[serde(rename = "epoll_open_result")]
+    EpollOpenResult { epoll_fd: i32, errno: Option<i32> },
 
     /// Error.
     #[serde(rename = "error")]

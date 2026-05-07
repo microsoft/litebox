@@ -8,6 +8,7 @@ pub(crate) mod agents;
 pub(crate) mod concurrent_fork;
 pub(crate) mod file_tcp;
 pub(crate) mod fork_matrix;
+pub(crate) mod iouring_discovery;
 pub(crate) mod matrix;
 pub(crate) mod pipe_bridge;
 pub(crate) mod platform_fixes;
@@ -802,6 +803,7 @@ pub fn collect_all_tests() -> Vec<Test> {
     platform_fixes::register_concurrent_fork_tests(&mut registry::Registry::new(&mut tests));
     platform_fixes::register_touch_redirect_tests(&mut registry::Registry::new(&mut tests));
     platform_fixes::register_pid_visibility_tests(&mut registry::Registry::new(&mut tests));
+    iouring_discovery::register_iouring_discovery_tests(&mut registry::Registry::new(&mut tests));
     platform_fixes::register_cross_pid_visibility_tests(&mut registry::Registry::new(&mut tests));
     platform_fixes::register_file_redirect_tests(&mut registry::Registry::new(&mut tests));
     platform_fixes::register_pipe_nonblock_tests(&mut registry::Registry::new(&mut tests));
