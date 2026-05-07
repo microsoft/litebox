@@ -759,15 +759,23 @@ async fn agent_loop(self_exe: &str) {
                     let stream = stream.lock().await;
                     stream.as_raw_fd()
                 };
+                let owned_fd = match dup_fd_cloexec(fd) {
+                    Ok(owned_fd) => owned_fd,
+                    Err(error) => {
+                        respond(&Response::Error { error }).await;
+                        continue;
+                    }
+                };
+                let epoll_fd = owned_fd.as_raw_fd();
                 match add_raw_fd_to_epoll(
                     entry,
-                    fd,
+                    epoll_fd,
                     &events,
                     EpollTarget {
                         kind: "socket",
                         id: conn,
                     },
-                    None,
+                    Some(owned_fd),
                 ) {
                     Ok(()) => respond(&Response::Ok { data: None }).await,
                     Err(error) => respond(&Response::Error { error }).await,

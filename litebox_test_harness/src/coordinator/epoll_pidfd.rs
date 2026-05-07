@@ -242,15 +242,21 @@ async fn run_multi_socket(
             .await,
         )?;
     }
-    let events = epoll_wait(run, observer, epoll, 5000, 8).await?;
-    let mut ready: Vec<u64> = events
-        .iter()
-        .filter(|event| event.kind == "socket" && has_in(event))
-        .map(|event| event.id)
-        .collect();
-    ready.sort_unstable();
+    let mut events = epoll_wait(run, observer, epoll, 5000, 8).await?;
     let mut expected = conns.clone();
     expected.sort_unstable();
+    let mut ready = ready_socket_ids(&events);
+    for _ in 0..5 {
+        if ready == expected {
+            break;
+        }
+        let more = epoll_wait(run, observer, epoll, 2000, 8).await?;
+        if more.is_empty() {
+            break;
+        }
+        events.extend(more);
+        ready = ready_socket_ids(&events);
+    }
     if ready == expected {
         Ok(format!(
             "all sockets ready conns={conns:?} events={events:?}"
@@ -451,6 +457,17 @@ fn expect_sent(resp: Response) -> Result<(), String> {
         Response::Sent => Ok(()),
         other => Err(format!("expected Sent, got {other:?}")),
     }
+}
+
+fn ready_socket_ids(events: &[EpollEvent]) -> Vec<u64> {
+    let mut ready: Vec<u64> = events
+        .iter()
+        .filter(|event| event.kind == "socket" && has_in(event))
+        .map(|event| event.id)
+        .collect();
+    ready.sort_unstable();
+    ready.dedup();
+    ready
 }
 
 fn has_in(event: &EpollEvent) -> bool {
