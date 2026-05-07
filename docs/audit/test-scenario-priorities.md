@@ -45,6 +45,11 @@ Priority tiers: **P0** drop-anything-to-fix · **P1** vs-code-blocker
 | `KP.*` | 27 | `/proc/<pid>/cmdline` + `kill -0` (own + bg child) | 🔥 (`/proc` reads heavy; `wait4` 1 110, `kill` reachable via clone3 cleanup) | green | **P2** | regression coverage |
 | `KPX.*` | 9 | cross-worker `/proc` visibility | ⚠️ (cross-worker `pidfd_open` 6) | green (post `/proc/<pid>/cmdline` shim fix) | **P2** | proves cross-axis pid visibility; keep |
 | `FKLC.*` | 6 | `Fork.inherit_listen_ports` end-to-end | 🔥 (VS Code CLI fd-inheritance pattern) | **red** under litebox (pre-existing broker/worker routing bug — `FKLC-inherit-regression-fix` blocked todo) | **P0** | concrete bug, manifests at every Remote-SSH connect via fd-inheritance |
+| `INO.*` ★ NEW | 20 (5 scen × 4 axes) | `inotify_init1` + `inotify_add_watch` + `inotify_read` (workspace file-watcher) | 🔥 (1 343 calls in combined trace) | **red** under litebox (FOLLOWUP-shim-inotify-events-empty: shim returns no events) | **P0** | closes G0 gap from priorities doc |
+| `SCM.*` ★ NEW | 8 (4 scen × cross-agent pairings) | `SCM_RIGHTS` fd-passing over UDS (sendmsg/recvmsg cmsg) | 🔥 (4 calls; `VSCODE_EXTHOST_IPC_SOCKET` extension-host wireup) | green | **P1** | closes G0 gap from priorities doc |
+| `CL3.vfork.*` ★ NEW | 4 axes | `clone3 (CLONE_VFORK)` parent-suspend semantics | ⚠️ (6 calls in combined trace; terminal posix_spawn) | **red** under litebox (FOLLOWUP-shim-clone3-vfork-* per axis: shim treats as plain CLONE_VM) | **P1** | closes G2 gap from priorities doc |
+| `SOCKOPT.*` ★ NEW | 6 (3 scen × 2 axes) | `setsockopt` per-option behavior (SO_REUSEADDR / SO_REUSEPORT / SO_KEEPALIVE) | 🔥 (1 385 calls; option breakdown previously unasserted) | yellow under litebox (FOLLOWUP-shim-sockopt-reuseport-* on 2 axes; REUSEADDR + KEEPALIVE pass) | **P1** | closes G2 gap from priorities doc |
+| `RAND.*` ★ NEW | 6 (3 scen × 2 axes) | `getrandom` semantics (size, novelty, GRND_NONBLOCK) | 🔥 (680 calls) | green | **P2** | closes G2 gap from priorities doc; thin guard on the `CrngProvider` security RNG contract |
 
 ### Tier-2 families (heritage / capability-broad)
 
@@ -131,23 +136,23 @@ warm + missing/weak · **G3** cold + missing · `n/a`.
 | `epoll_pwait` + `epoll_ctl` + `epoll_create1` | 39 514 | `EPI.*` | strong | n/a | n/a | well-covered |
 | `pidfd_open` (bare) | 6 | `EPI.pidfd_exit.*` | strong | n/a | n/a | well-covered |
 | `clone3 (CLONE_THREAD)` | 177 | `CL3.thread.*` | strong | n/a | n/a | well-covered (post shim fix) |
-| `clone3 (CLONE_VFORK)` ★ NEW | 6 | **MISSING** | MISSING | no_test_family | **G2** | add `CL3.with_vfork` scenario (terminal posix_spawn pattern) |
+| `clone3 (CLONE_VFORK)` ★ NEW | 6 | `CL3.vfork.*` (4 axes) | strong (native 4/4) | n/a | n/a | **CLOSED** — added; litebox 0/4 fail (filed FOLLOWUP-shim-clone3-vfork-* per axis: shim treats CLONE_VFORK as plain CLONE_VM, parent doesn't suspend) |
 | `clone3 (with_pidfd)` | 0 | `CL3.with_pidfd.*` | over-coverage relative to trace | n/a | n/a | retain (still possible in deeper scenarios) |
 | `clone3.set_tid` | 0 | `CL3.with_set_tid.*` | over-coverage | n/a | n/a | already deferred; keep test as guard |
 | `eventfd2` | 28 | `EV.*` | strong | n/a | n/a | well-covered |
 | `signalfd` / `signalfd4` | 0 | **MISSING** | MISSING | no_test_family | G3 | defer — cold even under combined workload |
 | `timerfd_*` | 0 | **MISSING** | MISSING | no_test_family | G3 | defer |
-| `inotify_add_watch` | **1 343 ★** | **MISSING** | MISSING | no_test_family | **G0** | **add `INO.*` family** — workspace file watcher; biggest single gap |
-| `inotify_init1` | 2 | (no test) | MISSING | no_test_family | G2 | covered by INO.* once added |
+| `inotify_add_watch` | **1 343 ★** | `INO.*` (5 scen × 4 axes = 20 tests) | strong (native 20/20) | n/a | n/a | **CLOSED** — added; litebox 0/20 fail (filed FOLLOWUP-shim-inotify-events-empty: read returns no events) |
+| `inotify_init1` | 2 | `INO.*` (proxy via InotifyOpen) | strong | n/a | n/a | covered indirectly by INO |
 | `fanotify_*` | 0 | **MISSING** | MISSING | no_test_family | G3 | defer |
-| **`SCM_RIGHTS` fd-passing** ★ | 4 | **MISSING** | MISSING | no_test_family | **G0** | **add `SCM.*` family** — VSCODE_EXTHOST_IPC_SOCKET path; small in count but on critical wireup |
+| **`SCM_RIGHTS` fd-passing** ★ | 4 | `SCM.*` (4 scen × cross-agent pairings = 8 tests) | strong (native 8/8 + litebox 8/8) | n/a | n/a | **CLOSED** — added; both passes green, no FOLLOWUP needed |
 | `pidfd_send_signal` / `pidfd_getfd` | 0 | **MISSING** | MISSING | no_test_family | G3 | defer |
 | `io_uring_setup` + `io_uring_enter` | 372 | `IOR.*` | strong (contract: ENOSYS-fallback) | n/a | n/a | retain — locks in fallback safety |
 | `setsid` | 13 | `PTY.*` (via `PtyExec ctrl_tty=true`) | proxy | n/a | n/a | covered |
 | `prctl(PR_SET_NAME)` | 91 | (no test) | MISSING | no_test_family | G2 | low-risk; defer unless bug surfaces |
 | `arch_prctl(ARCH_SET_FS)` | 579 | proxy via clone3 thread tests | proxy | n/a | n/a | covered indirectly through CL3 |
-| `setsockopt` (mostly SO_REUSEADDR/SO_KEEPALIVE) | 1 385 | `TCS.*`, `TLB.*` | proxy (no per-option assertion) | weak_assertions | G2 | one focused `SOCKOPT.*` family asserting REUSEADDR/KEEPALIVE behavior — small, optional |
-| `getrandom` | 680 | (no test) | MISSING | no_test_family | G2 | the `CrngProvider` stored-memory fact says it's the security RNG contract — worth a thin coverage row |
+| `setsockopt` (mostly SO_REUSEADDR/SO_KEEPALIVE) | 1 385 | `TCS.*`, `TLB.*` (proxy) + `SOCKOPT.*` (focused) | strong (`SOCKOPT.*` 6 tests, native 6/6 + litebox 4/6) | n/a | n/a | **CLOSED** — `SOCKOPT.*` added; 2 SO_REUSEPORT axes fail under litebox (filed FOLLOWUP-shim-sockopt-reuseport-*) |
+| `getrandom` | 680 | `RAND.*` (3 scen × 2 axes = 6 tests) | strong (native 6/6 + litebox 6/6) | n/a | n/a | **CLOSED** — `RAND.*` added; both passes green |
 | `statx` | 23 246 | `FS.*` (proxy) | proxy | n/a | n/a | covered by file ops; explicit `STATX.*` not needed |
 | `mmap (MAP_FIXED \| MAP_SHARED)` | 51 / 5 758 | `XDF.*` (proxy) | proxy | n/a | n/a | covered by exec mmap paths |
 | `getrandom`, `randomness` | 680 | proxy | proxy | n/a | n/a | covered |
@@ -203,17 +208,27 @@ Until that diff is done, **no P4 deletions recommended in this batch.**
 
 ### Testing gaps (G0 + G1) — direct answer to "what are the testing gaps?"
 
-| gap | trace evidence | proposed test family | size | priority |
-|---|---|---|---:|---|
-| **`inotify_add_watch`** workspace file-watcher | **1 343** calls — biggest single new finding | `INO.*` — watch a directory, modify files, assert events come back across the protocol | 4–6 scenarios × 4 axes | **G0** |
-| **`SCM_RIGHTS` fd-passing** over UDS | 4 calls, `VSCODE_EXTHOST_IPC_SOCKET` handoff between server and extension host | `SCM.*` — pass a socket fd via `sendmsg`/`recvmsg`, assert the receiver can read/write through it | 3–4 scenarios × 3 axes | **G0** |
-| `clone3` with `CLONE_VFORK` (terminal `posix_spawn`) | 6 calls (NEW vs connection-only) | extend `CL3.with_vfork` scenario | +1 scenario × 4 axes | **G2** |
-| `setsockopt` per-option behavior | 1 385 calls; option breakdown not yet asserted | `SOCKOPT.*` — narrow tests for SO_REUSEADDR/REUSEPORT/KEEPALIVE that assert kernel state | 3 scenarios × 2 axes | **G2** |
-| `getrandom` semantics | 680 calls; well-defined contract | tiny `RAND.*` family asserting size + monotonic novelty | 2 scenarios × 2 axes | **G2** |
+> **Status (post-gap-closure batch)**: all five gaps below have been
+> **closed** by `wportnoy/session-vscode-gaps` (44 new tests, all
+> native-green). Per-row results are summarized in the table below;
+> any litebox-side failures these tests surfaced are tracked as
+> `FOLLOWUP-shim-*` SQL todos, not test gaps.
 
-These five additions are the **direct testing gaps** vs current
-VS Code Remote-SSH workload. The first two (G0) directly block
-real VS Code paths; the others are regression-risk hardening.
+| gap | trace evidence | proposed test family | size | priority | **status** |
+|---|---|---|---:|---|---|
+| **`inotify_add_watch`** workspace file-watcher | **1 343** calls — biggest single new finding | `INO.*` (5 scen × 4 axes = 20 tests) | 20 tests | **G0** | **CLOSED** — native 20/20 ✓; litebox 0/20 (FOLLOWUP-shim-inotify-events-empty: read returns no events) |
+| **`SCM_RIGHTS` fd-passing** over UDS | 4 calls, `VSCODE_EXTHOST_IPC_SOCKET` handoff between server and extension host | `SCM.*` (4 scen × cross-agent pairings = 8 tests) | 8 tests | **G0** | **CLOSED** — native 8/8 + litebox 8/8 ✓; no shim follow-up |
+| `clone3` with `CLONE_VFORK` (terminal `posix_spawn`) | 6 calls (NEW vs connection-only) | extend `CL3.vfork` scenario | +4 tests | **G2** | **CLOSED** — native 4/4 ✓; litebox 0/4 (FOLLOWUP-shim-clone3-vfork-{dpg1,dpg1_dpg1,dpg2,dpg2_dpg}: shim treats CLONE_VFORK as plain CLONE_VM) |
+| `setsockopt` per-option behavior | 1 385 calls; option breakdown not yet asserted | `SOCKOPT.*` (3 scen × 2 axes = 6 tests) | 6 tests | **G2** | **CLOSED** — native 6/6 ✓; litebox 4/6 (FOLLOWUP-shim-sockopt-reuseport-{dpg1,dpg1-dpg1}: SO_REUSEPORT EINVAL) |
+| `getrandom` semantics | 680 calls; well-defined contract | tiny `RAND.*` family asserting size + monotonic novelty | 6 tests | **G2** | **CLOSED** — native 6/6 + litebox 6/6 ✓; no shim follow-up |
+
+**Summary of post-batch shim follow-ups exposed by these new tests** (filed as SQL `FOLLOWUP-shim-*` todos):
+
+1. `FOLLOWUP-shim-inotify-events-empty` — single shared root cause, blocks all 20 INO.* litebox tests.
+2. `FOLLOWUP-shim-clone3-vfork-*` (4 axes) — predicted CLONE_VFORK semantics gap; vfork's parent-suspend contract not honored.
+3. `FOLLOWUP-shim-sockopt-reuseport-*` (2 axes) — SO_REUSEPORT returning EINVAL.
+
+7 follow-up todos total. SO_REUSEADDR / KeepAlive / inotify_init1 / SCM_RIGHTS / getrandom / clone3-thread (other CL3 kinds) are all working under litebox.
 
 Items moved to **explicit defer** based on combined-trace
 evidence:
