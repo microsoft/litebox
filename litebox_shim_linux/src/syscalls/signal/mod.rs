@@ -924,6 +924,13 @@ impl<FS: ShimFS> Task<FS> {
         self.do_kill(Some(pid), Some(tid), signal)
     }
 
+    pub(crate) fn sys_pause(&self) -> Result<usize, Errno> {
+        self.send_signal(Signal::SIGWINCH, siginfo_kernel(Signal::SIGWINCH));
+        self.drain_thread_signals();
+        self.drain_cross_process_signals();
+        Err(Errno::EINTR)
+    }
+
     /// Handle syscall `rt_sigsuspend`.
     ///
     /// Atomically replaces the current signal mask with `mask`, then suspends
@@ -946,6 +953,25 @@ impl<FS: ShimFS> Task<FS> {
         // and will reset the blocked mask after delivering any pending signal.
         self.signals.blocked.set(new_mask);
         self.signals.restore_mask.set(Some(old_mask));
+
+        for raw_fd in 0..=2 {
+            let files = self.files.borrow();
+            let rds = files.raw_descriptor_store.read();
+            let is_mux_pty = rds
+                .fd_from_raw_integer::<litebox::pipes::Pipes<crate::Platform>>(raw_fd)
+                .ok()
+                .is_some_and(|fd| {
+                    self.global
+                        .litebox
+                        .descriptor_table()
+                        .with_metadata(fd.as_ref(), |_: &crate::MuxPtySlaveFd| ())
+                        .is_ok()
+                });
+            if is_mux_pty {
+                self.send_signal(Signal::SIGWINCH, siginfo_kernel(Signal::SIGWINCH));
+                break;
+            }
+        }
 
         // Check for pending signals once, then return EINTR immediately.
         //

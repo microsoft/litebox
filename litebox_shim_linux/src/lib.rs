@@ -78,6 +78,9 @@ pub trait ShimFS: litebox::fs::FileSystem + Send + Sync + 'static {}
 impl<T: litebox::fs::FileSystem + Send + Sync + 'static> ShimFS for T {}
 
 /// On debug builds, logs that the user attempted to use an unsupported feature.
+#[derive(Clone)]
+pub(crate) struct MuxPtySlaveFd;
+
 fn log_unsupported_fmt(args: core::fmt::Arguments<'_>) {
     #[cfg(debug_assertions)]
     {
@@ -164,6 +167,32 @@ impl<FS: ShimFS> LinuxShimEntrypoints<FS> {
         guest_fd: usize,
         pipe_fd: litebox::fd::TypedFd<litebox::pipes::Pipes<Platform>>,
     ) {
+        self.install_mux_pipe_fd_with_pty_metadata(guest_fd, pipe_fd, false);
+    }
+
+    /// Install a mux pipe endpoint that represents a PTY slave in the parent worker.
+    pub fn install_mux_pty_slave_fd(
+        &self,
+        guest_fd: usize,
+        pipe_fd: litebox::fd::TypedFd<litebox::pipes::Pipes<Platform>>,
+    ) {
+        self.install_mux_pipe_fd_with_pty_metadata(guest_fd, pipe_fd, true);
+    }
+
+    fn install_mux_pipe_fd_with_pty_metadata(
+        &self,
+        guest_fd: usize,
+        pipe_fd: litebox::fd::TypedFd<litebox::pipes::Pipes<Platform>>,
+        is_pty_slave: bool,
+    ) {
+        if is_pty_slave {
+            self.task
+                .global
+                .litebox
+                .descriptor_table_mut()
+                .set_entry_metadata(&pipe_fd, MuxPtySlaveFd);
+        }
+
         let files = self.task.files.borrow();
         let mut rds = files.raw_descriptor_store.write();
 
@@ -1014,8 +1043,9 @@ impl<FS: ShimFS> LinuxShim<FS> {
         );
         child_files.initialize_stdio_in_shared_descriptors_table(&self.global);
 
-        // Restore terminal fds beyond stdio.  Fds 0/1/2 are already
-        // populated by initialize_stdio; skip them to avoid slot collisions.
+        // Restore terminal fds, including stdio.  Fds 0/1/2 are initially
+        // populated by initialize_stdio, but fork-restore must preserve tty
+        // metadata so ioctls such as TIOCGPGRP route to the terminal layer.
         // Terminal filesystem fds (tty/pty metadata) are reconnected via
         // /dev/tty; tty-backed stdio aliases use their original /dev/std* path.
         {
@@ -1023,8 +1053,7 @@ impl<FS: ShimFS> LinuxShim<FS> {
             use syscalls::fork_snapshot::FdClass;
 
             for entry in &fd_table.entries {
-                // Skip stdio slots (already initialized above) and non-FS fds.
-                if entry.fd <= 2 || entry.class != FdClass::FilesystemFd {
+                if !matches!(entry.class, FdClass::FilesystemFd | FdClass::StdioFd) {
                     continue;
                 }
                 let meta = &entry.metadata;
@@ -1055,6 +1084,9 @@ impl<FS: ShimFS> LinuxShim<FS> {
                 // Attach metadata markers matching the snapshot.
                 let mut dt = self.global.litebox.descriptor_table_mut();
                 let mut rds = child_files.raw_descriptor_store.write();
+                if entry.fd <= 2 {
+                    let _ = rds.fd_consume_raw_integer::<FS>(entry.fd);
+                }
                 let status_flags = OFlags::APPEND | flags;
                 dt.set_entry_metadata(&fd_handle, StdioStatusFlags(status_flags));
                 if meta.is_host_tty_alias {
@@ -1209,7 +1241,7 @@ impl<FS: ShimFS> LinuxShim<FS> {
                 process_state: child_process_state.into(),
                 thread: child_thread,
                 wait_state: wait::WaitState::new(self.global.platform),
-                process_id: litebox::process::ProcessId::INIT,
+                process_id: id.process_id,
                 pid: id.pid,
                 ppid: id.ppid,
                 tid: id.tid,
@@ -3433,6 +3465,7 @@ impl<FS: ShimFS> Task<FS> {
             } => self.sys_timer_gettime(timerid, curr_value),
             SyscallRequest::TimerDelete { timerid } => self.sys_timer_delete(timerid),
             SyscallRequest::TimerGetoverrun { timerid } => self.sys_timer_getoverrun(timerid),
+            SyscallRequest::Pause => self.sys_pause(),
             SyscallRequest::RtSigsuspend { mask, sigsetsize } => {
                 self.sys_rt_sigsuspend(mask, sigsetsize, ctx)
             }
