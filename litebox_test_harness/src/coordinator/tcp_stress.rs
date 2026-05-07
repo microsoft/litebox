@@ -237,7 +237,7 @@ fn register_tcp_concurrency_tests(reg: &mut Registry<'_>) {
                                 crate::protocol::Command::NetListen { port: p },
                             )
                             .await;
-                        if !matches!(resp, crate::protocol::Response::Listening { .. }) {
+                        if super::expect_listening_port(&resp, p).is_err() {
                             return super::TestOutcome::new(
                                 &connector_label,
                                 false,
@@ -302,7 +302,7 @@ fn register_tcp_data_size_tests(reg: &mut Registry<'_>) {
                         let resp = run
                             .send(&listener_handle, crate::protocol::Command::NetListen { port: p })
                             .await;
-                        if !matches!(resp, crate::protocol::Response::Listening { .. }) {
+                        if super::expect_listening_port(&resp, p).is_err() {
                             return super::TestOutcome::new(&connector_label, false, format!("listen failed: {resp:?}"));
                         }
                         let resp = run
@@ -341,7 +341,7 @@ fn register_tcp_reconnect_stress_tests(reg: &mut Registry<'_>) {
                         let resp = run
                             .send(&listener_handle, crate::protocol::Command::NetListen { port: p })
                             .await;
-                        if !matches!(resp, crate::protocol::Response::Listening { .. }) {
+                        if super::expect_listening_port(&resp, p).is_err() {
                             return super::TestOutcome::new(&connector_label, false, format!("listen failed: {resp:?}"));
                         }
                         let resp = run
@@ -375,13 +375,13 @@ fn register_tcp_cross_worker_concurrent_tests(reg: &mut Registry<'_>) {
                         let aremote = aremote.clone();
                         Box::pin(async move {
                             let resp = run.spawn_ephemeral(&aremote).await;
-                            if !matches!(&resp, crate::protocol::Response::Ok { .. }) {
+                            if !super::ok_spawned_response(&resp) {
                                 return super::TestOutcome::new("A", false, "FAIL: SpawnRemote unavailable");
                             }
                             let resp = run
                                 .forward(&aremote, crate::protocol::Command::NetListen { port: p })
                                 .await;
-                            if !matches!(resp, crate::protocol::Response::Listening { .. }) {
+                            if super::expect_listening_port(&resp, p).is_err() {
                                 return super::TestOutcome::new("A", false, format!("listen failed: {resp:?}"));
                             }
                             let resp = run
@@ -411,11 +411,11 @@ fn register_tcp_cross_worker_concurrent_tests(reg: &mut Registry<'_>) {
                         let aremote = aremote.clone();
                         Box::pin(async move {
                             let resp = run.spawn_ephemeral(&aremote).await;
-                            if !matches!(&resp, crate::protocol::Response::Ok { .. }) {
+                            if !super::ok_spawned_response(&resp) {
                                 return super::TestOutcome::new("A", false, "FAIL: SpawnRemote unavailable");
                             }
                             let resp = run.send(&handle, crate::protocol::Command::NetListen { port: p }).await;
-                            if !matches!(resp, crate::protocol::Response::Listening { .. }) {
+                            if super::expect_listening_port(&resp, p).is_err() {
                                 return super::TestOutcome::new("A", false, format!("listen failed: {resp:?}"));
                             }
                             let resp = run

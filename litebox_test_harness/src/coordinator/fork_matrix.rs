@@ -382,8 +382,10 @@ pub(crate) fn register_fork_matrix(reg: &mut Registry<'_>) {
                                         if stdout.contains(&*expected)
                                 )
                             };
-                            let timeout =
-                                matches!(&resp, crate::protocol::Response::ExecTimeout { .. });
+                            let timeout = matches!(
+                                &resp,
+                                crate::protocol::Response::ExecTimeout { stderr } if !stderr.is_empty()
+                            );
                             super::TestOutcome::new(
                                 &agent_label,
                                 pass,

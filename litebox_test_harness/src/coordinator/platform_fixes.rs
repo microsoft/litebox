@@ -325,7 +325,7 @@ pub(crate) fn register_cross_worker_first_connect_tests(reg: &mut Registry<'_>) 
             Box::pin(async move {
                 let port = 19900u16;
                 let listen_resp = run.send(&handle_a, Command::NetListen { port }).await;
-                if !matches!(&listen_resp, Response::Listening { .. }) {
+                if !super::expect_listening_port(&listen_resp, port).is_ok() {
                     return super::TestOutcome::new(
                         "B",
                         false,
@@ -362,7 +362,7 @@ pub(crate) fn register_cross_worker_first_connect_tests(reg: &mut Registry<'_>) 
             Box::pin(async move {
                 let port = 19901u16;
                 let listen_resp = run.send(&handle_b, Command::NetListen { port }).await;
-                if !matches!(&listen_resp, Response::Listening { .. }) {
+                if !super::expect_listening_port(&listen_resp, port).is_ok() {
                     return super::TestOutcome::new(
                         "AA",
                         false,
@@ -394,7 +394,7 @@ pub(crate) fn register_cross_worker_first_connect_tests(reg: &mut Registry<'_>) 
                 Box::pin(async move {
                     let port = 19902u16;
                     let listen_resp = run.send(&handle_a, Command::NetListen { port }).await;
-                    if !matches!(&listen_resp, Response::Listening { .. }) {
+                    if !super::expect_listening_port(&listen_resp, port).is_ok() {
                         return super::TestOutcome::new(
                             "B",
                             false,
@@ -450,7 +450,7 @@ pub(crate) fn register_cross_worker_self_connect_tests(reg: &mut Registry<'_>) {
             Box::pin(async move {
                 let port = 19910u16;
                 let listen_resp = run.send(&handle_a, Command::NetListen { port }).await;
-                if !matches!(&listen_resp, Response::Listening { .. }) {
+                if !super::expect_listening_port(&listen_resp, port).is_ok() {
                     return super::TestOutcome::new(
                         "A",
                         false,
@@ -487,7 +487,7 @@ pub(crate) fn register_cross_worker_self_connect_tests(reg: &mut Registry<'_>) {
             Box::pin(async move {
                 let port = 19911u16;
                 let listen_resp = run.send(&handle_a, Command::NetListen { port }).await;
-                if !matches!(&listen_resp, Response::Listening { .. }) {
+                if !super::expect_listening_port(&listen_resp, port).is_ok() {
                     return super::TestOutcome::new(
                         "AA",
                         false,
@@ -524,7 +524,7 @@ pub(crate) fn register_cross_worker_self_connect_tests(reg: &mut Registry<'_>) {
             Box::pin(async move {
                 let port = 19912u16;
                 let listen_resp = run.send(&handle_aa, Command::NetListen { port }).await;
-                if !matches!(&listen_resp, Response::Listening { .. }) {
+                if !super::expect_listening_port(&listen_resp, port).is_ok() {
                     return super::TestOutcome::new(
                         "A",
                         false,
@@ -561,7 +561,7 @@ pub(crate) fn register_cross_worker_self_connect_tests(reg: &mut Registry<'_>) {
             Box::pin(async move {
                 let port = 19913u16;
                 let listen_resp = run.send(&handle_a, Command::NetListen { port }).await;
-                if !matches!(&listen_resp, Response::Listening { .. }) {
+                if !super::expect_listening_port(&listen_resp, port).is_ok() {
                     return super::TestOutcome::new(
                         "AB",
                         false,
@@ -608,13 +608,13 @@ async fn run_tlb_listen_busy_case(
     delay_secs: u64,
 ) -> super::TestOutcome {
     let listen_resp = run.send(listener, Command::NetListen { port: 0 }).await;
-    let port = match &listen_resp {
-        Response::Listening { port } => *port,
-        _ => {
+    let port = match super::expect_listening_port(&listen_resp, 0) {
+        Ok(port) => port,
+        Err(e) => {
             return super::TestOutcome::new(
                 connector_name,
                 false,
-                format!("{listener_name} listen failed: {listen_resp:?}"),
+                format!("{listener_name} listen failed: {e}; resp={listen_resp:?}"),
             );
         }
     };
@@ -2479,11 +2479,11 @@ pub(crate) fn register_fork_listen_close_tests(reg: &mut Registry<'_>) {
             Box::pin(async move {
                 let port = 19920u16;
                 let listen_resp = run.send(&handle_a, Command::NetListen { port }).await;
-                if !matches!(&listen_resp, Response::Listening { .. }) {
+                if let Err(e) = super::expect_listening_port(&listen_resp, port) {
                     return super::TestOutcome::new(
                         "B",
                         false,
-                        format!("listen failed: {listen_resp:?}"),
+                        format!("listen failed: {e}; resp={listen_resp:?}"),
                     );
                 }
                 let _ = run.send(&handle_a, Command::NetUnlisten { port }).await;
@@ -2496,7 +2496,14 @@ pub(crate) fn register_fork_listen_close_tests(reg: &mut Registry<'_>) {
                         },
                     )
                     .await;
-                let got_rst = matches!(&conn_resp, Response::ConnectFailed { .. });
+                let got_rst = matches!(
+                    &conn_resp,
+                    Response::ConnectFailed { error }
+                        if !error.is_empty()
+                            && (error.contains("refused")
+                                || error.contains("reset")
+                                || error.contains("timeout"))
+                );
                 super::TestOutcome::new("B", got_rst, format!("expected RST: {conn_resp:?}"))
             })
         })
@@ -2977,7 +2984,7 @@ pub(crate) fn register_subtree_kill_tests(reg: &mut Registry<'_>) {
             Box::pin(async move {
                 let _ = crate::nonpie_binary();
                 let r = run.spawn_ephemeral(&npx).await;
-                if !matches!(r, Response::Ok { .. }) {
+                if !super::ok_spawned_response(&r) {
                     return super::TestOutcome::new(
                         "E",
                         false,
@@ -3013,7 +3020,7 @@ pub(crate) fn register_subtree_kill_tests(reg: &mut Registry<'_>) {
                 // the test declared AgentName::EE. Ask EE to spawn
                 // its own non-PIE descendant.
                 let r = run.spawn_ephemeral(&npx).await;
-                if !matches!(r, Response::Ok { .. }) {
+                if !super::ok_spawned_response(&r) {
                     return super::TestOutcome::new(
                         "E",
                         false,
@@ -3047,7 +3054,7 @@ pub(crate) fn register_subtree_kill_tests(reg: &mut Registry<'_>) {
             Box::pin(async move {
                 let _ = crate::nonpie_binary();
                 let r = run.spawn_ephemeral(&npx).await;
-                if !matches!(r, Response::Ok { .. }) {
+                if !super::ok_spawned_response(&r) {
                     return super::TestOutcome::new(
                         "E",
                         false,

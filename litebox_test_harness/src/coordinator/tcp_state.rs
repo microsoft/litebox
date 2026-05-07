@@ -405,9 +405,15 @@ async fn run_halfclose_then_reconnect_case(
 ) -> TestOutcome {
     let agent = format!("{server_label}<-{client_label}");
     let listen_resp = run.send(server, Command::NetListen { port: 0 }).await;
-    let port = match listen_resp {
-        Response::Listening { port } => port,
-        other => return TestOutcome::new(&agent, false, format!("listen failed: {other:?}")),
+    let port = match super::expect_listening_port(&listen_resp, 0) {
+        Ok(port) => port,
+        Err(e) => {
+            return TestOutcome::new(
+                &agent,
+                false,
+                format!("listen failed: {e}; resp={listen_resp:?}"),
+            );
+        }
     };
 
     let outcome = async {
@@ -456,9 +462,15 @@ async fn run_halfclose_then_reconnect_case(
 
 async fn run_conn_id_unique_case(run: &mut RunContext<'_>, handle: &AgentHandle) -> TestOutcome {
     let listen_resp = run.send(handle, Command::NetListen { port: 0 }).await;
-    let port = match listen_resp {
-        Response::Listening { port } => port,
-        other => return TestOutcome::new("A", false, format!("listen failed: {other:?}")),
+    let port = match super::expect_listening_port(&listen_resp, 0) {
+        Ok(port) => port,
+        Err(e) => {
+            return TestOutcome::new(
+                "A",
+                false,
+                format!("listen failed: {e}; resp={listen_resp:?}"),
+            );
+        }
     };
 
     let mut seen = HashSet::new();
@@ -509,9 +521,9 @@ async fn listen_open(
     client: &AgentHandle,
 ) -> Result<(u16, u64), String> {
     let listen_resp = run.send(server, Command::NetListen { port: 0 }).await;
-    let port = match listen_resp {
-        Response::Listening { port } => port,
-        other => return Err(format!("listen failed: {other:?}")),
+    let port = match super::expect_listening_port(&listen_resp, 0) {
+        Ok(port) => port,
+        Err(e) => return Err(format!("listen failed: {e}; resp={listen_resp:?}")),
     };
     let open_resp = run
         .send(
