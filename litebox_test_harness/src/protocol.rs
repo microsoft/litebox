@@ -425,6 +425,7 @@ pub enum Clone3Kind {
     WithPidfd,
     WithSetTid { tid: u64 },
     WithCgroup { cgroup_fd: u64 },
+    WithVfork,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
