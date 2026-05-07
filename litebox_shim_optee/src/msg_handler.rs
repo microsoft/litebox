@@ -580,13 +580,19 @@ pub fn update_optee_msg_args(
             TeeParamType::MemrefOutput | TeeParamType::MemrefInout => {
                 if let Ok(Some((addr, len))) = ta_params.get_values(index) {
                     let len = checked_memref_size(len)?;
-                    if len
-                        > ta_req_info.out_shm_info[index]
-                            .as_ref()
-                            .map_or(0, ShmInfo::len)
-                    {
-                        return Err(OpteeSmcReturnCode::EBadAddr);
+                    let Some(out_shm_info) = &ta_req_info.out_shm_info[index] else {
+                        continue;
+                    };
+                    if len > out_shm_info.len() {
+                        if return_code != TeeResult::ShortBuffer {
+                            return Err(OpteeSmcReturnCode::EBadAddr);
+                        }
+                        // For short-buffer returns, report the required size without copying data.
+                        msg_args.set_param_memref_size(index, len as u64)?;
+                        continue;
                     }
+                    // Update the output size in msg_args before attempting any copy-out.
+                    msg_args.set_param_memref_size(index, len as u64)?;
                     // SAFETY
                     // `addr` is expected to be a valid address of a TA and `addr + len` does not
                     // exceed the TA's memory region.
@@ -595,16 +601,10 @@ pub fn update_optee_msg_args(
                         .to_owned_slice(len)
                         .ok_or(OpteeSmcReturnCode::EBadAddr)?;
 
-                    // Update the output size in msg_args
-                    // For rmem/tmem params, size is at the same offset as value.b in the union
-                    msg_args.set_param_memref_size(index, len as u64)?;
-
                     if slice.is_empty() {
                         continue;
                     }
-                    if let Some(out_shm_info) = &ta_req_info.out_shm_info[index] {
-                        write_data_to_shm(out_shm_info, slice.as_ref())?;
-                    }
+                    write_data_to_shm(out_shm_info, slice.as_ref())?;
                 }
             }
             _ => {}
