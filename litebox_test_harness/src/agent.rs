@@ -2654,7 +2654,12 @@ fn run_clone3_process(
         args.set_tid_size = 1;
     }
     if let Some(fd) = cgroup_fd {
-        args.flags |= libc::CLONE_INTO_CGROUP as u64;
+        // CLONE_INTO_CGROUP is glibc-only in the libc crate (as of
+        // libc 0.2.x); musl doesn't expose it. Hard-code the kernel
+        // value (0x200000000) when the symbol is missing — it's an
+        // ABI-stable kernel constant.
+        const CLONE_INTO_CGROUP: u64 = 0x2_0000_0000;
+        args.flags |= CLONE_INTO_CGROUP;
         args.cgroup = fd as u64;
     }
     // SAFETY: `args` is a clone_args-compatible struct. The child immediately
