@@ -29,7 +29,7 @@ impl<Platform: RawSyncPrimitivesProvider> FidPool<Platform> {
     }
 
     /// Allocate a new fid wrapped in a refcounted handle. The pool slot is
-    /// recycled when the last [`Fid`] clone is dropped.
+    /// recycled when the [`Fid`] is dropped.
     fn allocate(self: &Arc<Self>) -> Result<Fid<Platform>, Error> {
         let id = self.inner.lock().allocate().ok_or(Error::Io)?;
         Ok(Fid {
@@ -40,8 +40,7 @@ impl<Platform: RawSyncPrimitivesProvider> FidPool<Platform> {
         })
     }
 
-    /// Return a fid value to the pool. Called from [`FidInner::drop`] when
-    /// the last [`Fid`] clone for the value is dropped.
+    /// Return a fid value to the pool.
     fn recycle(&self, id: fcall::Fid) {
         self.inner.lock().recycle(id);
     }
@@ -237,10 +236,10 @@ impl<Platform: RawSyncPrimitivesProvider, T: Read + Write> Client<Platform, T> {
 
     /// Walks the path from the given fid.
     ///
-    /// The given wnames should not exceed the maximum number of elements
-    /// (`fcall::MAXWELEM`), which is checked at the beginning of the function.
-    /// Used by [`walk_chunked`](Client::walk_chunked), which handles paths
-    /// longer than `MAXWELEM`.
+    /// The given wnames should not exceed the maximum number of elements (fcall::MAXWELEM),
+    /// which is checked at the beginning of the function. This is an internal function that
+    /// is used by [`walk_chunked`](Client::walk_chunked), which handles the case where the
+    /// number of elements exceeds the limit.
     fn walk_once(
         &self,
         fid: &Fid<Platform>,
@@ -273,9 +272,9 @@ impl<Platform: RawSyncPrimitivesProvider, T: Read + Write> Client<Platform, T> {
         Ok((wqids, new_fid))
     }
 
-    /// Walks the path from the given fid, handling paths longer than
-    /// `fcall::MAXWELEM` by walking in chunks. Returns the qids for each path
-    /// component and a new fid for the final location on success.
+    /// Walks the path from the given fid, handling paths longer than fcall::MAXWELEM by walking in chunks.
+    ///
+    /// Returns the qids for each path component and a new fid for the final location on success.
     fn walk_chunked(
         &self,
         fid: &Fid<Platform>,
@@ -302,8 +301,14 @@ impl<Platform: RawSyncPrimitivesProvider, T: Read + Write> Client<Platform, T> {
             if let Some(p) = prev.take() {
                 self.clunk(p);
             }
+            // It means that the walk failed at the nwqid-th element
             if new_len < chunk.len() {
-                // It means that the walk failed at the nwqid-th element
+                if wqids
+                    .last()
+                    .is_some_and(|e| e.typ == fcall::QidType::SYMLINK)
+                {
+                    todo!("symlink");
+                }
                 self.clunk(new_f);
                 return Err(Error::Remote(super::ENOENT));
             }
@@ -643,11 +648,6 @@ impl<Platform: RawSyncPrimitivesProvider, T: Read + Write> Client<Platform, T> {
     }
 
     /// Clunk (close) a fid.
-    ///
-    /// the local pool slot for the underlying value is reclaimed
-    /// only when the LAST `Fid` clone is dropped, so concurrent in-flight
-    /// operations on a clone keep the value reserved (preventing a different
-    /// file from being assigned the same fid).
     pub(super) fn clunk(&self, fid: Fid<Platform>) {
         let _ = self.fcall(
             Fcall::Tclunk(fcall::Tclunk { fid: fid.id() }),
