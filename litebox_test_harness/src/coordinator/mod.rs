@@ -22,6 +22,7 @@ pub(crate) mod run_context;
 pub(crate) mod special_cases;
 pub(crate) mod tcp_state;
 pub(crate) mod tcp_stress;
+pub(crate) mod vscode_shape;
 
 use crate::protocol::{Command, Response};
 use crate::test_registry::matches_filter;
@@ -361,14 +362,13 @@ impl TestRunner {
         // Top-level (parent is None): direct children of the
         // coordinator. Spawned via the local `spawn_child` helper
         // (an OS fork of `self_exe`); no protocol command involved.
-        // PIE is the only supported binary for top-level today;
-        // non-PIE top-level would require additional wiring.
         for spec in specs.iter().filter(|s| s.parent.is_none()) {
             if !needed.contains(&spec.name) {
                 continue;
             }
             self.spawned_agents.insert(spec.name.name().to_string());
-            match spawn_child(&self.self_exe) {
+            let exe = binary_path_for_agent(spec.binary, &self.self_exe);
+            match spawn_child(&exe) {
                 Ok(child) => {
                     self.children.insert(spec.name.name().to_string(), child);
                 }
@@ -376,29 +376,31 @@ impl TestRunner {
             }
         }
 
-        // Non-top-level agents grouped by (parent, binary) so we can
-        // batch a single Spawn / SpawnRemote per parent in the common
-        // case. The non-PIE arm is wrapped in a 30s timeout because
-        // SpawnRemote can hang under litebox if pipe-bridge state
-        // gets out of sync.
-        let needs_nonpie = specs
+        // Companion-binary descendants (non-PIE/static) are spawned through
+        // explicit binary selection and wrapped in a timeout because this path
+        // can be slower under litebox syscall rewriting.
+        let needs_companion = specs
             .iter()
-            .any(|s| needed.contains(&s.name) && s.binary == agents::AgentBinary::NonPie);
-        if needs_nonpie {
-            // Required dependency: panic now with a clear message
-            // rather than silently failing later with confusing
-            // routing errors.
-            let _ = crate::nonpie_binary();
+            .any(|s| needed.contains(&s.name) && s.binary.needs_companion_binary());
+        if needs_companion {
+            // Required dependency: panic now with a clear message rather than
+            // silently failing later with confusing routing errors.
+            for spec in specs
+                .iter()
+                .filter(|s| needed.contains(&s.name) && s.binary.needs_companion_binary())
+            {
+                let _ = binary_path_for_agent(spec.binary, &self.self_exe);
+            }
         }
 
         // PIE descendants first (synchronous, fast).
         self.spawn_pie_descendants(needed, &specs).await;
 
-        // Non-PIE descendants in a timeout (slower, can hang).
-        if needs_nonpie {
+        // Companion-binary descendants in a timeout (slower, can hang).
+        if needs_companion {
             for &n in &specs
                 .iter()
-                .filter(|s| s.binary == agents::AgentBinary::NonPie)
+                .filter(|s| s.binary.needs_companion_binary())
                 .map(|s| s.name)
                 .collect::<Vec<_>>()
             {
@@ -421,7 +423,7 @@ impl TestRunner {
             .await
             .is_err()
             {
-                eprintln!("[coord] non-PIE subtree setup timed out (30s, likely pipe bridge bug)");
+                eprintln!("[coord] companion-binary subtree setup timed out (30s)");
             }
         }
     }
@@ -472,20 +474,12 @@ impl TestRunner {
             if spec.parent.is_none() || !needed.contains(&spec.name) {
                 continue;
             }
-            let nonpie_self = spec.binary == agents::AgentBinary::NonPie;
+            let companion_self = spec.binary.needs_companion_binary();
             let nonpie_chain = depends_on_nonpie(spec.name, specs);
-            if !nonpie_self && !nonpie_chain {
+            if !companion_self && !nonpie_chain {
                 continue;
             }
-            let inner = if nonpie_self {
-                Command::SpawnRemote {
-                    children: vec![spec.name.name().to_string()],
-                }
-            } else {
-                Command::Spawn {
-                    children: vec![spec.name.name().to_string()],
-                }
-            };
+            let inner = spawn_command_for_spec(spec);
             let parent = spec.parent.expect("non-top-level has parent");
             let r = self.send(parent.name(), inner).await;
             eprintln!("[coord] spawn {} (non-PIE chain): {r:?}", spec.name.name());
@@ -682,6 +676,33 @@ impl TestRunner {
     }
 }
 
+fn spawn_command_for_spec(spec: &agents::AgentSpec) -> Command {
+    let name = spec.name.name().to_string();
+    match spec.binary {
+        agents::AgentBinary::Pie => Command::Spawn {
+            children: vec![name],
+        },
+        agents::AgentBinary::NonPie => Command::SpawnRemote {
+            children: vec![name],
+        },
+        other => Command::Fork {
+            name,
+            binary: other.fork_binary_label().to_string(),
+            inherit_listen_ports: vec![],
+        },
+    }
+}
+
+fn binary_path_for_agent(binary: agents::AgentBinary, self_exe: &str) -> String {
+    match binary {
+        agents::AgentBinary::Pie => self_exe.to_string(),
+        agents::AgentBinary::NonPie => crate::nonpie_binary(),
+        agents::AgentBinary::StaticPieGlibc => crate::static_pie_glibc_binary(),
+        agents::AgentBinary::StaticPieMusl => crate::static_pie_musl_binary(),
+        agents::AgentBinary::NonPieStaticMusl => crate::non_pie_static_musl_binary(),
+    }
+}
+
 /// Return true iff `agent`'s ancestor chain (excluding `agent`
 /// itself) contains any non-PIE segment, meaning the spawn must be
 /// routed through the non-PIE timeout-protected path.
@@ -803,6 +824,7 @@ pub fn collect_all_tests() -> Vec<Test> {
     platform_fixes::register_cross_pid_visibility_tests(&mut registry::Registry::new(&mut tests));
     platform_fixes::register_file_redirect_tests(&mut registry::Registry::new(&mut tests));
     platform_fixes::register_cli_startup_mimic_tests(&mut registry::Registry::new(&mut tests));
+    vscode_shape::register_vscode_shape_tests(&mut registry::Registry::new(&mut tests));
     platform_fixes::register_bg_redirect_poll_tests(&mut registry::Registry::new(&mut tests));
     platform_fixes::register_bg_redirect_stdin_poll_tests(&mut registry::Registry::new(&mut tests));
     platform_fixes::register_pipe_nonblock_tests(&mut registry::Registry::new(&mut tests));
@@ -962,8 +984,14 @@ async fn run_tests(self_exe: &str, filter: Option<&str>) -> Vec<TestResult> {
 }
 
 /// Route a target agent name to (`direct_child`, `remaining_path`).
-/// `dpg1` → (`dpg1`, None), `dpg1_dng_dpg` → (`dpg1`, Some(`dpg1_dng_dpg`)).
+/// `dpg1` → (`dpg1`, None), `vscode_node` → (`vscode_sshd_pty`, Some(`vscode_node`)).
 fn route(target: &str) -> (&str, Option<&str>) {
+    if let Some(agent) = agents::AgentName::from_wire(target) {
+        let ancestors = agent.ancestors();
+        let direct = ancestors.first().copied().unwrap_or(agent).name();
+        return (direct, (direct != target).then_some(target));
+    }
+
     match target {
         "dpg1" | "dpg2" | "dpg3" => (target, None),
         "dpg2_dpg" => ("dpg2", Some(target)),
@@ -978,6 +1006,19 @@ fn wrap_forwards(remaining: Option<&str>, cmd: Command) -> Command {
     let Some(target) = remaining else {
         return cmd;
     };
+
+    if let Some(agent) = agents::AgentName::from_wire(target) {
+        let mut chain = agent.ancestors().to_vec();
+        chain.push(agent);
+        return chain
+            .into_iter()
+            .skip(1)
+            .rev()
+            .fold(cmd, |inner, agent| Command::Forward {
+                target: agent.name().to_string(),
+                inner: Box::new(inner),
+            });
+    }
 
     let segments: Vec<&str> = target.split('_').collect();
     if segments.len() <= 1 {
