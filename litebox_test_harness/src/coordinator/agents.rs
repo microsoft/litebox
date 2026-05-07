@@ -4,7 +4,7 @@
 //! Typed agent identifiers and capability handles.
 //!
 //! The integration test harness drives a tree of long-lived agent
-//! processes spawned by the coordinator (A, AA, AB, AAA, AAB, B, NP,
+//! processes spawned by the coordinator (A, AA, AB, AAA, AAB, B, BB, NP,
 //! NPC, D3, D4, D5). To prevent tests from referring to agents they
 //! didn't declare at registration time, the *only* way to talk to an
 //! agent is via an [`AgentHandle`] obtained from

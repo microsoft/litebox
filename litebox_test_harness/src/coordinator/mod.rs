@@ -5,6 +5,7 @@
 //! operations through pipes to child agents.
 
 pub(crate) mod agents;
+pub(crate) mod clone3_matrix;
 pub(crate) mod concurrent_fork;
 pub(crate) mod eventfd;
 pub(crate) mod file_tcp;
@@ -383,17 +384,23 @@ impl TestRunner {
             eprintln!("[coord] A spawn {a_pie_kids:?}: {r:?}");
         }
 
-        if needed.contains(&BB) && needed.contains(&B) {
-            self.spawned_agents.insert(BB.name().to_string());
+        let mut b_pie_kids: Vec<String> = Vec::new();
+        if needed.contains(&BB) {
+            b_pie_kids.push(BB.name().to_string());
+        }
+        if !b_pie_kids.is_empty() && needed.contains(&B) {
+            for k in &b_pie_kids {
+                self.spawned_agents.insert(k.clone());
+            }
             let r = self
                 .send(
                     "B",
                     Command::Spawn {
-                        children: vec![BB.name().to_string()],
+                        children: b_pie_kids.clone(),
                     },
                 )
                 .await;
-            eprintln!("[coord] B spawn BB: {r:?}");
+            eprintln!("[coord] B spawn {b_pie_kids:?}: {r:?}");
         }
 
         let mut grandkids: Vec<String> = Vec::new();
@@ -824,6 +831,7 @@ pub fn collect_all_tests() -> Vec<Test> {
     platform_fixes::register_pipe_nonblock_tests(&mut registry::Registry::new(&mut tests));
     platform_fixes::register_epoll_socket_tests(&mut registry::Registry::new(&mut tests));
     eventfd::register_eventfd_tests(&mut registry::Registry::new(&mut tests));
+    clone3_matrix::register_clone3_matrix(&mut registry::Registry::new(&mut tests));
     tcp_state::register_tcp_state_tests(&mut registry::Registry::new(&mut tests));
     platform_fixes::register_tcp_halfclose_tests(&mut registry::Registry::new(&mut tests));
     platform_fixes::register_fork_listen_close_tests(&mut registry::Registry::new(&mut tests));

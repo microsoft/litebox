@@ -78,6 +78,10 @@ pub enum Command {
     #[serde(rename = "get_pid")]
     GetPid,
 
+    /// Exercise curated `clone3(2)` flag combinations.
+    #[serde(rename = "clone3")]
+    Clone3 { kind: Clone3Kind },
+
     /// Read a file and report contents (or `not_found`).
     #[serde(rename = "fs_read")]
     FsRead { path: String },
@@ -354,6 +358,24 @@ pub enum Command {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
+pub enum Clone3Kind {
+    Thread,
+    Process,
+    WithPidfd,
+    WithSetTid { tid: u64 },
+    WithCgroup { cgroup_fd: u64 },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CloneResult {
+    pub pid: u64,
+    pub pidfd: Option<i32>,
+    pub ok: bool,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
 pub enum WaitPredicate {
     PortListening { port: u16, host: String },
     FileExists { path: String },
@@ -441,6 +463,15 @@ pub enum Response {
     /// Background process reached its readiness marker.
     #[serde(rename = "background_ready")]
     BackgroundReady { pid: u32 },
+
+    /// Result of a curated `clone3(2)` exercise.
+    #[serde(rename = "clone_result")]
+    CloneResult {
+        pid: u64,
+        pidfd: Option<i32>,
+        ok: bool,
+        error: Option<String>,
+    },
 
     /// Readiness or wait predicate satisfied.
     #[serde(rename = "ready")]
