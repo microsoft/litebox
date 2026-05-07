@@ -72,6 +72,31 @@ RUN curl -fsSL "https://nodejs.org/dist/${NODE_VERSION}/node-${NODE_VERSION}-lin
 # Test harness and litebox binaries are bind-mounted at runtime:
 #   /opt/litebox/   — litebox_tool_executor, litebox_broker, litebox_runner, litebox_test_harness
 #   /opt/nonpie/    — litebox_test_harness (non-PIE variant)
+#
+# Design note: we deliberately use bind-mounts for /opt/litebox and
+# /opt/nonpie rather than copying the binaries into the rootfs at
+# container startup. Copying would let the broker's `elf_cache` cover
+# them (the broker only sees files in the rootfs it serves via 9P,
+# not files in separate kernel mount points like bind-mounts), but
+# measurement on CF.rwlock_multi_6.A showed the trade-off goes the
+# wrong direction:
+#
+#   bind-mount (current):       38.5 s/trial  — runner reads binaries
+#                                                directly from host FS,
+#                                                in-process patching is
+#                                                fast (~0.5 s per exec).
+#   copy-then-9P-serve:         60.0 s/trial  — broker rewrites once,
+#                                                but every subsequent
+#                                                exec reads 41 MB through
+#                                                9P, which costs more
+#                                                than the per-exec
+#                                                runner-side patching
+#                                                it would have replaced.
+#
+# In short: 9P serving is more expensive than direct mmap, and ELF
+# patching itself isn't actually a hotspot — so don't try to "fix"
+# the bind-mount choice with a 9P-routed copy unless someone has
+# evidence the broker's per-byte cost has dropped.
 
 # === Stage 2b: VS Code Server rootfs ===
 FROM litebox-base AS litebox-vscode
