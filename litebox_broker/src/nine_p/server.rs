@@ -1859,6 +1859,15 @@ impl Server {
     ///
     /// Only patches read-only opens when syscall rewriting is enabled.
     /// The cache is keyed by path and invalidated when mtime changes.
+    ///
+    /// Coverage limit: this only fires for files served by the broker
+    /// over 9P from the rootfs the broker is responsible for. Files
+    /// reached through separate kernel mount points inside the
+    /// container — e.g. docker bind-mounts like `/opt/litebox/` in
+    /// the test harness setup — are read by the runner directly from
+    /// the host filesystem and never reach this code. See the design
+    /// note in `litebox_tool_executor/rootfs/Dockerfile` (Stage 2a)
+    /// for the rationale.
     fn try_patch_elf(
         &self,
         file: &mut fs::File,
