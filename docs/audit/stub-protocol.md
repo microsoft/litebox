@@ -1,0 +1,52 @@
+# Stub protocol audit
+Method: in disposable worktree `/home/wportnoy/src/litebox-audit-stub`, one non-dead `Command` handler at a time was replaced with `Response::Error { error: "stub" }`, then a scoped native integration subset was run with `LITEBOX_TEST_JOBS=1`. Dead variants from `protocol-coverage.md` were not stubbed. Because full coverage would be too expensive, this run capped dynamic stubs at 15 variants, prioritizing all fragile variants plus weak cleanup/setup variants.
+| variant | classification before stub | stub verdict | notes |
+|---|---|---|---|
+| `Fork` | fragile | caught | single wire construction via RunContext::spawn_ephemeral; PR.listen_inherit_self requires fork spawn to return Ok; filter `native::PR.listen_inherit_self`; elapsed 144.4s; tail: native::PR.listen_inherit_self: fork failed: Error { error: "stub" } (logs: /home/wportnoy/src/litebox-audit-stub/target/test-logs/native-PR-listen-inherit-self.stdout.log /home/wportnoy/src/litebox-audit-stub/target/test-logs/native-PR-listen-inherit-self.stderr.log) / failures: / test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 2004 filtered out; finished in 138.14s / error: test failed, to rerun pass `-p litebox_test_harness --test integration` |
+| `GetPid` | fragile | caught | cross-PID visibility setup parses GetPid response; filter `native::KPX.cross.`; elapsed 34.6s; tail: native::KPX.cross.cross_subtree.B.to.AAA: GetPid failed: Error { error: "stub" }; resp=Error { error: "stub" } (logs: /home/wportnoy/src/litebox-audit-stub/target/test-logs/native-KPX-cross-cross-subtree-B-to-AAA.stdout.log /home/wportnoy/src/litebox-audit-stub/target/test-logs/native-KPX-cross-cross-subtree-B-to-AAA.stderr.log) / failures: / test result: FAILED. 0 passed; 9 failed; 0 ignored; 0 measured; 1996 filtered out; finished in 28.68s / error: test failed, to rerun pass `-p litebox_test_ |
+| `NetHalfCloseEcho` | fragile | caught | TCP half-close test asserts HalfClosed echo payload; filter `native::THC.halfclose`; elapsed 2.1s; rerun avoided unused-code/import warning; elapsed 24.2s; tail: native::THC.halfclose.eof.depth2: Error { error: "stub" } (logs: /home/wportnoy/src/litebox-audit-stub/target/test-logs/native-THC-halfclose-eof-depth2.stdout.log /home/wportnoy/src/litebox-audit-stub/target/test-logs/native-THC-halfclose-eof-depth2.stderr.log) / failures: / test result: FAILED. 0 passed; 4 failed; 0 ignored; 0 measured; 2001 filtered out; finished in 18.61s / error: test failed, to rerun pass `-p litebox_test_harness --test integration` |
+| `CwdGet` | fragile | caught | CWD test only checks Ok(Some(_)), but Error stub should still fail; filter `native::E.CWD`; elapsed 24.8s; tail: native::E.CWD.D5: Error { error: "stub" } (logs: /home/wportnoy/src/litebox-audit-stub/target/test-logs/native-E-CWD-D5.stdout.log /home/wportnoy/src/litebox-audit-stub/target/test-logs/native-E-CWD-D5.stderr.log) / failures: / test result: FAILED. 0 passed; 6 failed; 0 ignored; 0 measured; 1999 filtered out; finished in 20.09s / error: test failed, to rerun pass `-p litebox_test_harness --test integration` |
+| `NetSendRecv` | fragile | caught | TCP data-size tests assert verified= payload; filter `native::TD.`; elapsed 29.9s; tail: native::TD.256K.sibling: Error { error: "stub" } (logs: /home/wportnoy/src/litebox-audit-stub/target/test-logs/native-TD-256K-sibling.stdout.log /home/wportnoy/src/litebox-audit-stub/target/test-logs/native-TD-256K-sibling.stderr.log) / failures: / test result: FAILED. 0 passed; 8 failed; 0 ignored; 0 measured; 1997 filtered out; finished in 24.15s / error: test failed, to rerun pass `-p litebox_test_harness --test integration` |
+| `NetReconnectStress` | fragile | caught | reconnect stress asserts success=count/count; filter `native::TRR.`; elapsed 25.5s; tail: native::TRR.x20.sibling: Error { error: "stub" } (logs: /home/wportnoy/src/litebox-audit-stub/target/test-logs/native-TRR-x20-sibling.stdout.log /home/wportnoy/src/litebox-audit-stub/target/test-logs/native-TRR-x20-sibling.stderr.log) / failures: / test result: FAILED. 0 passed; 4 failed; 0 ignored; 0 measured; 2001 filtered out; finished in 20.12s / error: test failed, to rerun pass `-p litebox_test_harness --test integration` |
+| `PollReady` | fragile | caught | POLL tests assert Ok(POLLIN); filter `native::POLL`; elapsed 23.5s; tail: native::POLL.pipe.B: Error { error: "stub" } (logs: /home/wportnoy/src/litebox-audit-stub/target/test-logs/native-POLL-pipe-B.stdout.log /home/wportnoy/src/litebox-audit-stub/target/test-logs/native-POLL-pipe-B.stderr.log) / failures: / test result: FAILED. 0 passed; 3 failed; 0 ignored; 0 measured; 2002 filtered out; finished in 17.83s / error: test failed, to rerun pass `-p litebox_test_harness --test integration` |
+| `BindGetsockname` | fragile | caught | GSN tests parse port= payload; filter `native::GSN`; elapsed 25.8s; tail: native::GSN.ipv6.AA: Error { error: "stub" } (logs: /home/wportnoy/src/litebox-audit-stub/target/test-logs/native-GSN-ipv6-AA.stdout.log /home/wportnoy/src/litebox-audit-stub/target/test-logs/native-GSN-ipv6-AA.stderr.log) / failures: / test result: FAILED. 0 passed; 4 failed; 0 ignored; 0 measured; 2001 filtered out; finished in 20.15s / error: test failed, to rerun pass `-p litebox_test_harness --test integration` |
+| `PipePairIdUnique` | fragile | caught | pipe pair-id tests assert Ok(unique); filter `native::PID.`; elapsed 23.9s; tail: native::PID.B: Error { error: "stub" } (logs: /home/wportnoy/src/litebox-audit-stub/target/test-logs/native-PID-B.stdout.log /home/wportnoy/src/litebox-audit-stub/target/test-logs/native-PID-B.stderr.log) / failures: / test result: FAILED. 0 passed; 3 failed; 0 ignored; 0 measured; 2002 filtered out; finished in 17.30s / error: test failed, to rerun pass `-p litebox_test_harness --test integration` |
+| `FsDelete` | healthy | caught | unlink tests directly assert FsDelete returns Ok; filter `native::F.unlink.`; elapsed 45.5s; tail: native::F.unlink.nonpie_to_parent.delete: Error { error: "stub" } (logs: /home/wportnoy/src/litebox-audit-stub/target/test-logs/native-F-unlink-nonpie-to-parent-delete.stdout.log /home/wportnoy/src/litebox-audit-stub/target/test-logs/native-F-unlink-nonpie-to-parent-delete.stderr.log) / failures: / test result: FAILED. 6 passed; 14 failed; 0 ignored; 0 measured; 1985 filtered out; finished in 39.78s / error: test failed, to rerun pass `-p litebox_test_harness --test integration` |
+| `NetUnlisten` | healthy | caught | listen_unlisten expects connection failure after unlisten; filter `native::FKLC.listen_unlisten`; elapsed 24.6s; tail: failures: / failures: / test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 2004 filtered out; finished in 16.80s / error: test failed, to rerun pass `-p litebox_test_harness --test integration` |
+| `UnixUnlisten` | healthy | silent-pass | Unix unlisten is generally cleanup; broad U subset checks whether ignored cleanup is detected; filter `native::U.`; elapsed 70.2s; tail: test result: ok. 35 passed; 0 failed; 0 ignored; 0 measured; 1970 filtered out; finished in 64.57s |
+| `Kill` | healthy | silent-pass | Kill is cleanup for background Unix server tests; broad U subset checks whether ignored cleanup is detected; filter `native::U.`; elapsed 69.2s; tail: test result: ok. 35 passed; 0 failed; 0 ignored; 0 measured; 1970 filtered out; finished in 63.45s |
+| `Exit` | healthy | silent-pass | Exit is cooperative child shutdown in PR test; response is ignored; filter `native::PR.listen_inherit_self`; elapsed 21.6s; tail: test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 2004 filtered out; finished in 16.22s |
+| `NetListen` | healthy | caught | TCP stress setup asserts Listening before connecting; filter `native::TC.`; elapsed 2.0s; rerun avoided unused-code/import warning; elapsed 33.6s; tail: native::TC.depth2_delayed.x5.d10: listen failed: Error { error: "stub" } (logs: /home/wportnoy/src/litebox-audit-stub/target/test-logs/native-TC-depth2-delayed-x5-d10.stdout.log /home/wportnoy/src/litebox-audit-stub/target/test-logs/native-TC-depth2-delayed-x5-d10.stderr.log) / failures: / test result: FAILED. 0 passed; 10 failed; 0 ignored; 0 measured; 1995 filtered out; finished in 28.28s / error: test failed, to rerun pass `-p litebox_test_harness --test integration` |
+| `Spawn` | healthy | skipped | skipped: cap reached; high-coverage topology setup, seed says should obviously fail |
+| `SpawnRemote` | healthy | skipped | skipped: cap reached; non-PIE topology setup, seed says should obviously fail |
+| `FsRead` | healthy | skipped | skipped: cap reached; seed says should obviously fail |
+| `FsWrite` | healthy | skipped | skipped: cap reached; seed says should obviously fail |
+| `FsSymlink` | healthy | skipped | skipped: cap reached; seed says should obviously fail |
+| `FsReadlink` | healthy | skipped | skipped: cap reached; payload asserted in FS symlink tests |
+| `FsStat` | healthy | skipped | skipped: cap reached; payload asserted in FS stat tests |
+| `NetConnect` | healthy | skipped | skipped: cap reached; echo payload generally asserted |
+| `Forward` | healthy | skipped | skipped: cap reached; core nested routing should fail many tests |
+| `Exec` | healthy | skipped | skipped: cap reached; ExecResult assertions cover stdout/exit code |
+| `EnvGet` | healthy | skipped | skipped: cap reached; E.HOME/PATH assert non-empty/not NOT_SET |
+| `UnixListen` | healthy | skipped | skipped: cap reached; UnixListening is checked before connect |
+| `UnixConnect` | healthy | skipped | skipped: cap reached; echo payload asserted |
+| `NetConnectMany` | healthy | skipped | skipped: cap reached; TC/TW assert success counts |
+| `NetSendFileRecv` | healthy | skipped | skipped: cap reached; file_tcp tests check tcp_ok substring |
+| `NetAccept` | dead | skipped | skipped: dead/zero callsites by protocol-coverage.md |
+| `NetCloseListener` | dead | skipped | skipped: dead/zero callsites by protocol-coverage.md |
+| `Go` | dead | skipped | skipped: dead/zero callsites by protocol-coverage.md |
+
+## Dynamic-stub counts
+
+- caught: 12
+- silent-pass: 3
+- build-error: 0
+- skipped due to cap/dead variants: 18
+
+## Silently-passing variants
+
+- `UnixUnlisten`
+- `Kill`
+- `Exit`
+
+These are the dynamically confirmed cases where protocol presence is tested-but-not-asserted-on. Compare with `protocol-coverage.md` weak-payload notes: `NetUnlisten`, `UnixUnlisten`, `Kill`, and `Exit` were specifically sampled because their responses are often ignored cleanup/setup paths.
