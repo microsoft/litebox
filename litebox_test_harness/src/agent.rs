@@ -5,7 +5,7 @@
 //! writes responses to stdout. Intermediate nodes forward commands to
 //! their children.
 
-use crate::protocol::{Command, Response, WaitPredicate};
+use crate::protocol::{Command, EpollEvent, Response, WaitPredicate};
 use std::collections::HashMap;
 use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -79,6 +79,24 @@ const INHERITED_LISTEN_FD_LIMIT: i32 = 99;
 
 type TcpConn = Arc<tokio::sync::Mutex<TcpStream>>;
 
+#[derive(Clone, Debug)]
+struct EpollTarget {
+    kind: &'static str,
+    id: u64,
+}
+
+struct EpollRegisteredFd {
+    target: EpollTarget,
+    // pidfd registrations are opened only for this epoll set. Socket and
+    // eventfd registrations are owned by their registries and leave this empty.
+    _owned_fd: Option<OwnedFd>,
+}
+
+struct EpollEntry {
+    fd: OwnedFd,
+    registered: HashMap<i32, EpollRegisteredFd>,
+}
+
 /// Run the agent. Reads commands from stdin, executes, responds on stdout.
 pub fn run(self_exe: &str) {
     tokio::runtime::Builder::new_current_thread()
@@ -103,6 +121,10 @@ async fn agent_loop(self_exe: &str) {
     let mut unix_listeners: HashMap<String, tokio::task::JoinHandle<()>> = HashMap::new();
     let mut connections: HashMap<u64, TcpConn> = HashMap::new();
     let mut next_conn_id = 1u64;
+    let mut eventfds: HashMap<u64, OwnedFd> = HashMap::new();
+    let mut next_eventfd_id = 1u64;
+    let mut epolls: HashMap<u64, EpollEntry> = HashMap::new();
+    let mut next_epoll_id = 1u64;
     let mut background_pids: HashMap<u32, BackgroundProcess> = HashMap::new();
 
     let mut line = String::new();
@@ -572,11 +594,213 @@ async fn agent_loop(self_exe: &str) {
             }
 
             Command::NetClose { conn } => {
+                let fd = if let Some(stream) = connections.get(&conn).cloned() {
+                    let stream = stream.lock().await;
+                    Some(stream.as_raw_fd())
+                } else {
+                    None
+                };
                 if connections.remove(&conn).is_some() {
+                    if let Some(fd) = fd {
+                        remove_epoll_registration(&mut epolls, fd);
+                    }
                     respond(&Response::Closed).await;
                 } else {
                     respond(&Response::Error {
                         error: format!("unknown conn {conn}"),
+                    })
+                    .await;
+                }
+            }
+
+            Command::EventfdOpen { initval, flags } => {
+                if next_eventfd_id == u64::MAX {
+                    respond(&Response::Error {
+                        error: "eventfd id space exhausted".to_string(),
+                    })
+                    .await;
+                    continue;
+                }
+                match open_eventfd(initval, &flags) {
+                    Ok(fd) => {
+                        let id = next_eventfd_id;
+                        next_eventfd_id += 1;
+                        eventfds.insert(id, fd);
+                        respond(&Response::EventfdHandle { id }).await;
+                    }
+                    Err(error) => respond(&Response::Error { error }).await,
+                }
+            }
+
+            Command::EventfdWrite { eventfd_id, value } => {
+                let Some(fd) = eventfds.get(&eventfd_id) else {
+                    respond(&Response::Error {
+                        error: format!("unknown eventfd {eventfd_id}"),
+                    })
+                    .await;
+                    continue;
+                };
+                match write_eventfd(fd.as_raw_fd(), value) {
+                    Ok(()) => respond(&Response::Ok { data: None }).await,
+                    Err(error) => respond(&Response::Error { error }).await,
+                }
+            }
+
+            Command::EventfdClose { eventfd_id } => {
+                let fd = eventfds.get(&eventfd_id).map(AsRawFd::as_raw_fd);
+                if eventfds.remove(&eventfd_id).is_some() {
+                    if let Some(fd) = fd {
+                        remove_epoll_registration(&mut epolls, fd);
+                    }
+                    respond(&Response::Closed).await;
+                } else {
+                    respond(&Response::Error {
+                        error: format!("unknown eventfd {eventfd_id}"),
+                    })
+                    .await;
+                }
+            }
+
+            Command::EpollOpen {} => {
+                if next_epoll_id == u64::MAX {
+                    respond(&Response::Error {
+                        error: "epoll id space exhausted".to_string(),
+                    })
+                    .await;
+                    continue;
+                }
+                // SAFETY: epoll_create1 creates a fresh descriptor on success.
+                let fd = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
+                if fd < 0 {
+                    respond(&Response::Error {
+                        error: format!("epoll_create1: {}", std::io::Error::last_os_error()),
+                    })
+                    .await;
+                    continue;
+                }
+                let id = next_epoll_id;
+                next_epoll_id += 1;
+                epolls.insert(
+                    id,
+                    EpollEntry {
+                        // SAFETY: fd was just returned by epoll_create1 and is owned here.
+                        fd: unsafe { OwnedFd::from_raw_fd(fd) },
+                        registered: HashMap::new(),
+                    },
+                );
+                respond(&Response::EpollHandle { id }).await;
+            }
+
+            Command::EpollAddPidfd { epoll, pid, events } => {
+                let Some(entry) = epolls.get_mut(&epoll) else {
+                    respond(&Response::Error {
+                        error: format!("unknown epoll {epoll}"),
+                    })
+                    .await;
+                    continue;
+                };
+                match add_pidfd_to_epoll(entry, pid, &events) {
+                    Ok(()) => respond(&Response::Ok { data: None }).await,
+                    Err(error) => respond(&Response::Error { error }).await,
+                }
+            }
+
+            Command::EpollAddSocket {
+                epoll,
+                conn,
+                events,
+            } => {
+                let Some(entry) = epolls.get_mut(&epoll) else {
+                    respond(&Response::Error {
+                        error: format!("unknown epoll {epoll}"),
+                    })
+                    .await;
+                    continue;
+                };
+                let Some(stream) = connections.get(&conn).cloned() else {
+                    respond(&Response::Error {
+                        error: format!("unknown conn {conn}"),
+                    })
+                    .await;
+                    continue;
+                };
+                let fd = {
+                    let stream = stream.lock().await;
+                    stream.as_raw_fd()
+                };
+                match add_raw_fd_to_epoll(
+                    entry,
+                    fd,
+                    &events,
+                    EpollTarget {
+                        kind: "socket",
+                        id: conn,
+                    },
+                    None,
+                ) {
+                    Ok(()) => respond(&Response::Ok { data: None }).await,
+                    Err(error) => respond(&Response::Error { error }).await,
+                }
+            }
+
+            Command::EpollAddEventfd {
+                epoll,
+                eventfd_id,
+                events,
+            } => {
+                let Some(entry) = epolls.get_mut(&epoll) else {
+                    respond(&Response::Error {
+                        error: format!("unknown epoll {epoll}"),
+                    })
+                    .await;
+                    continue;
+                };
+                let Some(fd) = eventfds.get(&eventfd_id) else {
+                    respond(&Response::Error {
+                        error: format!("unknown eventfd {eventfd_id}"),
+                    })
+                    .await;
+                    continue;
+                };
+                match add_raw_fd_to_epoll(
+                    entry,
+                    fd.as_raw_fd(),
+                    &events,
+                    EpollTarget {
+                        kind: "eventfd",
+                        id: eventfd_id,
+                    },
+                    None,
+                ) {
+                    Ok(()) => respond(&Response::Ok { data: None }).await,
+                    Err(error) => respond(&Response::Error { error }).await,
+                }
+            }
+
+            Command::EpollWait {
+                epoll,
+                timeout_ms,
+                max_events,
+            } => {
+                let Some(entry) = epolls.get(&epoll) else {
+                    respond(&Response::Error {
+                        error: format!("unknown epoll {epoll}"),
+                    })
+                    .await;
+                    continue;
+                };
+                match wait_epoll(entry, timeout_ms, max_events) {
+                    Ok(events) => respond(&Response::EpollEvents { events }).await,
+                    Err(error) => respond(&Response::Error { error }).await,
+                }
+            }
+
+            Command::EpollClose { epoll } => {
+                if epolls.remove(&epoll).is_some() {
+                    respond(&Response::Closed).await;
+                } else {
+                    respond(&Response::Error {
+                        error: format!("unknown epoll {epoll}"),
                     })
                     .await;
                 }
@@ -1441,6 +1665,8 @@ async fn agent_loop(self_exe: &str) {
                 for (_, task) in unix_listeners.drain() {
                     task.abort();
                 }
+                eventfds.clear();
+                epolls.clear();
                 // Kill background processes.
                 for (_, mut child) in background_pids.drain() {
                     let _ = child.process.start_kill();
@@ -1457,6 +1683,202 @@ async fn agent_loop(self_exe: &str) {
             }
         }
     }
+}
+
+fn parse_epoll_events(events: &str) -> Result<u32, String> {
+    let mut mask = 0u32;
+    for part in events
+        .split('|')
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+    {
+        mask |= match part.to_ascii_lowercase().as_str() {
+            "in" => libc::EPOLLIN as u32,
+            "out" => libc::EPOLLOUT as u32,
+            "err" => libc::EPOLLERR as u32,
+            "hup" => libc::EPOLLHUP as u32,
+            "rdhup" => libc::EPOLLRDHUP as u32,
+            "pri" => libc::EPOLLPRI as u32,
+            "et" => libc::EPOLLET as u32,
+            "oneshot" => libc::EPOLLONESHOT as u32,
+            other => return Err(format!("unknown epoll event token {other:?}")),
+        };
+    }
+    if mask == 0 {
+        return Err("epoll event mask is empty".to_string());
+    }
+    Ok(mask)
+}
+
+fn format_epoll_events(mask: u32) -> String {
+    let mut names = Vec::new();
+    for (bit, name) in [
+        (libc::EPOLLIN as u32, "in"),
+        (libc::EPOLLOUT as u32, "out"),
+        (libc::EPOLLERR as u32, "err"),
+        (libc::EPOLLHUP as u32, "hup"),
+        (libc::EPOLLRDHUP as u32, "rdhup"),
+        (libc::EPOLLPRI as u32, "pri"),
+        (libc::EPOLLET as u32, "et"),
+        (libc::EPOLLONESHOT as u32, "oneshot"),
+    ] {
+        if (mask & bit) != 0 {
+            names.push(name);
+        }
+    }
+    if names.is_empty() {
+        "none".to_string()
+    } else {
+        names.join("|")
+    }
+}
+
+fn parse_eventfd_flags(flags: &str) -> Result<i32, String> {
+    let mut mask = libc::EFD_CLOEXEC;
+    for part in flags
+        .split('|')
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+    {
+        mask |= match part.to_ascii_lowercase().as_str() {
+            "cloexec" => libc::EFD_CLOEXEC,
+            "nonblock" => libc::EFD_NONBLOCK,
+            "semaphore" => libc::EFD_SEMAPHORE,
+            other => return Err(format!("unknown eventfd flag token {other:?}")),
+        };
+    }
+    Ok(mask)
+}
+
+fn open_eventfd(initval: u32, flags: &str) -> Result<OwnedFd, String> {
+    let flags = parse_eventfd_flags(flags)?;
+    // SAFETY: eventfd creates a fresh descriptor on success.
+    let fd = unsafe { libc::eventfd(initval, flags) };
+    if fd < 0 {
+        return Err(format!("eventfd: {}", std::io::Error::last_os_error()));
+    }
+    // SAFETY: fd was just returned by eventfd and is owned here.
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
+fn write_eventfd(fd: i32, value: u64) -> Result<(), String> {
+    let bytes = value.to_ne_bytes();
+    // SAFETY: fd is a live eventfd descriptor and the pointer/length describe
+    // the in-scope u64 value expected by eventfd write semantics.
+    let written = unsafe { libc::write(fd, bytes.as_ptr().cast(), bytes.len()) };
+    if written == bytes.len() as isize {
+        Ok(())
+    } else if written < 0 {
+        Err(format!(
+            "eventfd write: {}",
+            std::io::Error::last_os_error()
+        ))
+    } else {
+        Err(format!("eventfd short write: {written}/{}", bytes.len()))
+    }
+}
+
+fn add_pidfd_to_epoll(entry: &mut EpollEntry, pid: u32, events: &str) -> Result<(), String> {
+    // SAFETY: syscall is invoked with pidfd_open's documented arguments
+    // (pid, flags=0). On success the returned fd is uniquely owned here.
+    let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid as libc::pid_t, 0u32) } as i32;
+    if fd < 0 {
+        return Err(format!(
+            "pidfd_open({pid}): {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    // SAFETY: fd was just returned by pidfd_open and is owned here.
+    let owned = unsafe { OwnedFd::from_raw_fd(fd) };
+    add_raw_fd_to_epoll(
+        entry,
+        owned.as_raw_fd(),
+        events,
+        EpollTarget {
+            kind: "pidfd",
+            id: u64::from(pid),
+        },
+        Some(owned),
+    )
+}
+
+fn add_raw_fd_to_epoll(
+    entry: &mut EpollEntry,
+    fd: i32,
+    events: &str,
+    target: EpollTarget,
+    owned_fd: Option<OwnedFd>,
+) -> Result<(), String> {
+    let mask = parse_epoll_events(events)?;
+    let mut event = libc::epoll_event {
+        events: mask,
+        u64: fd as u64,
+    };
+    // SAFETY: entry.fd is a live epoll descriptor, fd is a live descriptor in
+    // this process, and event points to initialized storage for epoll_ctl.
+    let rc = unsafe {
+        libc::epoll_ctl(
+            entry.fd.as_raw_fd(),
+            libc::EPOLL_CTL_ADD,
+            fd,
+            &raw mut event,
+        )
+    };
+    if rc != 0 {
+        return Err(format!(
+            "epoll_ctl ADD fd {fd}: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    entry.registered.insert(
+        fd,
+        EpollRegisteredFd {
+            target,
+            _owned_fd: owned_fd,
+        },
+    );
+    Ok(())
+}
+
+fn remove_epoll_registration(epolls: &mut HashMap<u64, EpollEntry>, fd: i32) {
+    for entry in epolls.values_mut() {
+        entry.registered.remove(&fd);
+    }
+}
+
+fn wait_epoll(
+    entry: &EpollEntry,
+    timeout_ms: i32,
+    max_events: u32,
+) -> Result<Vec<EpollEvent>, String> {
+    let max_events = max_events.clamp(1, 1024) as usize;
+    let mut raw_events = vec![libc::epoll_event { events: 0, u64: 0 }; max_events];
+    // SAFETY: raw_events is valid writable storage for max_events entries and
+    // entry.fd is a live epoll descriptor owned by this registry entry.
+    let n = unsafe {
+        libc::epoll_wait(
+            entry.fd.as_raw_fd(),
+            raw_events.as_mut_ptr(),
+            max_events as i32,
+            timeout_ms,
+        )
+    };
+    if n < 0 {
+        return Err(format!("epoll_wait: {}", std::io::Error::last_os_error()));
+    }
+    let mut events = Vec::with_capacity(n as usize);
+    for raw in raw_events.into_iter().take(n as usize) {
+        let fd = raw.u64 as i32;
+        let Some(registered) = entry.registered.get(&fd) else {
+            return Err(format!("epoll returned unknown fd token {fd}"));
+        };
+        events.push(EpollEvent {
+            kind: registered.target.kind.to_string(),
+            id: registered.target.id,
+            observed_events: format_epoll_events(raw.events),
+        });
+    }
+    Ok(events)
 }
 
 async fn respond(resp: &Response) {

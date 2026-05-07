@@ -130,6 +130,58 @@ pub enum Command {
     #[serde(rename = "net_close")]
     NetClose { conn: u64 },
 
+    /// Create an eventfd and register it in this agent.
+    #[serde(rename = "eventfd_open")]
+    EventfdOpen { initval: u32, flags: String },
+
+    /// Write a u64 value to a registered eventfd.
+    #[serde(rename = "eventfd_write")]
+    EventfdWrite { eventfd_id: u64, value: u64 },
+
+    /// Close and unregister an eventfd.
+    #[serde(rename = "eventfd_close")]
+    EventfdClose { eventfd_id: u64 },
+
+    /// Create an epoll instance with `EPOLL_CLOEXEC`.
+    #[serde(rename = "epoll_open")]
+    EpollOpen {},
+
+    /// Open `pidfd_open(pid)` and add that pidfd to a registered epoll instance.
+    #[serde(rename = "epoll_add_pidfd")]
+    EpollAddPidfd {
+        epoll: u64,
+        pid: u32,
+        events: String,
+    },
+
+    /// Add a registered TCP connection fd to a registered epoll instance.
+    #[serde(rename = "epoll_add_socket")]
+    EpollAddSocket {
+        epoll: u64,
+        conn: u64,
+        events: String,
+    },
+
+    /// Add a registered eventfd to a registered epoll instance.
+    #[serde(rename = "epoll_add_eventfd")]
+    EpollAddEventfd {
+        epoll: u64,
+        eventfd_id: u64,
+        events: String,
+    },
+
+    /// Wait on a registered epoll instance.
+    #[serde(rename = "epoll_wait")]
+    EpollWait {
+        epoll: u64,
+        timeout_ms: i32,
+        max_events: u32,
+    },
+
+    /// Close and unregister an epoll instance.
+    #[serde(rename = "epoll_close")]
+    EpollClose { epoll: u64 },
+
     /// Connect to addr, send data, read echo response.
     #[serde(rename = "net_connect")]
     NetConnect { addr: String, data: String },
@@ -156,7 +208,7 @@ pub enum Command {
 
     /// Fork+exec in the background, but return only after stdout/stderr
     /// contains the requested readiness marker. Output remains captured for
-    /// WaitBackground, and is drained after readiness so helpers cannot block.
+    /// `WaitBackground`, and is drained after readiness so helpers cannot block.
     #[serde(rename = "exec_ready")]
     ExecReady {
         args: Vec<String>,
@@ -183,8 +235,8 @@ pub enum Command {
     },
 
     /// Wait for a previously backgrounded process to exit and return its
-    /// captured output. For plain Exec background commands stdout/stderr are
-    /// empty; ExecReady backgrounds retain captured output.
+    /// captured output. For plain `Exec` background commands stdout/stderr are
+    /// empty; `ExecReady` backgrounds retain captured output.
     #[serde(rename = "wait_background")]
     WaitBackground {
         pid: u32,
@@ -289,6 +341,13 @@ pub enum WaitPredicate {
     FileExists { path: String },
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EpollEvent {
+    pub kind: String,
+    pub id: u64,
+    pub observed_events: String,
+}
+
 /// Response sent from child to parent via stdout.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "status")]
@@ -319,6 +378,18 @@ pub enum Response {
     /// Stateful TCP connection opened.
     #[serde(rename = "opened")]
     Opened { conn: u64 },
+
+    /// Eventfd opened.
+    #[serde(rename = "eventfd_handle")]
+    EventfdHandle { id: u64 },
+
+    /// Epoll instance opened.
+    #[serde(rename = "epoll_handle")]
+    EpollHandle { id: u64 },
+
+    /// Events returned by `epoll_wait`.
+    #[serde(rename = "epoll_events")]
+    EpollEvents { events: Vec<EpollEvent> },
 
     /// Stateful TCP bytes sent.
     #[serde(rename = "sent")]

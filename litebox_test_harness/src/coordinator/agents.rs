@@ -33,6 +33,7 @@ pub enum AgentName {
     AAA,
     AAB,
     B,
+    BB,
     NP,
     NPC,
     D3,
@@ -59,6 +60,7 @@ impl AgentName {
             AgentName::AAA => "AAA",
             AgentName::AAB => "AAB",
             AgentName::B => "B",
+            AgentName::BB => "BB",
             AgentName::NP => "NP",
             AgentName::NPC => "NPC",
             AgentName::D3 => "D3",
@@ -81,6 +83,7 @@ impl AgentName {
             "AAA" => Some(AgentName::AAA),
             "AAB" => Some(AgentName::AAB),
             "B" => Some(AgentName::B),
+            "BB" => Some(AgentName::BB),
             "NP" => Some(AgentName::NP),
             "NPC" => Some(AgentName::NPC),
             "D3" => Some(AgentName::D3),
@@ -100,6 +103,7 @@ impl AgentName {
     pub const fn ancestors(self) -> &'static [AgentName] {
         match self {
             AgentName::Init | AgentName::A | AgentName::B => &[],
+            AgentName::BB => &[AgentName::B],
             AgentName::AA | AgentName::AB => &[AgentName::A],
             AgentName::AAA | AgentName::AAB => &[AgentName::A, AgentName::AA],
             AgentName::NP => &[AgentName::A],
