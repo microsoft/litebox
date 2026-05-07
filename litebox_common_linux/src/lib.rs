@@ -2265,6 +2265,8 @@ pub enum SyscallRequest<Platform: litebox::platform::RawPointerProvider> {
         ss: Option<Platform::RawConstPointer<signal::SigAltStack>>,
         old_ss: Option<Platform::RawMutPointer<signal::SigAltStack>>,
     },
+    /// pause(2): suspend until a signal is delivered.
+    Pause,
     /// rt_sigsuspend(2): atomically replace signal mask and suspend.
     RtSigsuspend {
         mask: Platform::RawConstPointer<SigSet>,
@@ -3056,6 +3058,7 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
             Sysno::tgkill => sys_req!(Tgkill { tgid, tid, sig }),
             Sysno::sigaltstack => sys_req!(Sigaltstack { ss:*, old_ss:* }),
             // Signal suspension / waiting.
+            Sysno::pause => SyscallRequest::Pause,
             Sysno::rt_sigsuspend => sys_req!(RtSigsuspend { mask:*, sigsetsize }),
             Sysno::rt_sigtimedwait => {
                 sys_req!(RtSigtimedwait { set:*, info:*, timeout:*, sigsetsize })

@@ -1661,9 +1661,15 @@ fn fork_restore_and_ack<FS: litebox_shim_linux::ShimFS>(
 
                     // Dup guest pipe before install (install consumes it).
                     let guest_dup = litebox_ref.descriptor_table_mut().duplicate(&guest_pipe_fd);
-                    program
-                        .entrypoints
-                        .install_mux_pipe_fd(ms.guest_fd, guest_pipe_fd);
+                    if ms.stream_type == b't' {
+                        program
+                            .entrypoints
+                            .install_mux_pty_slave_fd(ms.guest_fd, guest_pipe_fd);
+                    } else {
+                        program
+                            .entrypoints
+                            .install_mux_pipe_fd(ms.guest_fd, guest_pipe_fd);
+                    }
                     if let Some(d) = guest_dup {
                         guest_pipe_dups.insert(ms.stream_id, d);
                     }
@@ -2639,9 +2645,6 @@ fn perform_ipc_handshake(fd: &std::os::fd::OwnedFd) -> Result<()> {
     if mtu != HANDSHAKE_MTU {
         anyhow::bail!("IPC handshake: MTU mismatch (broker sent {mtu}, we expect {HANDSHAKE_MTU})");
     }
-    #[cfg(debug_assertions)]
-    eprintln!("IPC handshake complete: broker MTU={mtu}");
-
     Ok(())
 }
 
