@@ -2366,6 +2366,115 @@ pub(crate) fn register_cli_startup_mimic_tests(reg: &mut Registry<'_>) {
 }
 
 // ═══════════════════════════════════════════════════════════════════
+// BR: Background Redirect Poll — file visibility while backgrounded
+// ═══════════════════════════════════════════════════════════════════
+
+#[allow(clippy::too_many_lines)] // exhaustive registration / runner
+pub(crate) fn register_bg_redirect_poll_tests(reg: &mut Registry<'_>) {
+    #[derive(Clone, Copy)]
+    struct Def {
+        name: &'static str,
+        marker: &'static str,
+        script_template: &'static str,
+        per_binary_type: bool,
+    }
+
+    let defs = [
+        Def {
+            name: "subshell_stdout",
+            marker: "BR_SUBSHELL_STDOUT",
+            script_template: "(echo BR_SUBSHELL_STDOUT; sleep 1) > {path} &\n",
+            per_binary_type: false,
+        },
+        Def {
+            name: "exe_stdout",
+            marker: "ECHO_TEST_OK",
+            script_template: "{exe} echo-test > {path} &\n",
+            per_binary_type: true,
+        },
+        Def {
+            name: "exe_stderr",
+            marker: "STDERR_ONLY_OK",
+            script_template: "{exe} stderr-only-test > {path} 2>&1 &\n",
+            per_binary_type: true,
+        },
+    ];
+
+    for &agent in AGENTS {
+        for def in defs {
+            let bts: &[Option<crate::BinaryType>] = if def.per_binary_type {
+                &[
+                    Some(crate::BinaryType::PieGlibc),
+                    Some(crate::BinaryType::NonPieGlibc),
+                    Some(crate::BinaryType::StaticPieGlibc),
+                    Some(crate::BinaryType::StaticPieMusl),
+                    Some(crate::BinaryType::NonPieStaticMusl),
+                ]
+            } else {
+                &[None]
+            };
+            for &bt_opt in bts {
+                let agent_s = agent.to_string();
+                let test_id = match bt_opt {
+                    None | Some(crate::BinaryType::PieGlibc) => {
+                        format!("BR.{}.{agent}", def.name)
+                    }
+                    Some(bt) => format!("BR.{}.{}.{agent}", def.name, bt.label()),
+                };
+                let path_label = match bt_opt {
+                    None | Some(crate::BinaryType::PieGlibc) => def.name.to_string(),
+                    Some(bt) => format!("{}-{}", def.name, bt.label()),
+                };
+                reg.test("shell", "bg_redirect_poll", test_id)
+                    .timeout(60)
+                    .build(move |cx| {
+                        let handle = cx.require(agent);
+                        Box::new(move |run| {
+                            let a = agent_s.clone();
+                            let path_label = path_label.clone();
+                            let self_exe = run.self_exe().to_string();
+                            Box::pin(async move {
+                                let path = format!("/shared/br-{path_label}-{a}.txt");
+                                let exe_path = match bt_opt {
+                                    None => self_exe.clone(),
+                                    Some(bt) => crate::binary_path(bt, &self_exe),
+                                };
+                                let script = format!(
+                                    "{}PID=$!\nfor _ in 1 2 3 4 5 6 7 8 9 10; do\n  if grep -q '{}' '{}'; then\n    kill $PID 2>/dev/null; wait $PID 2>/dev/null\n    cat '{}'\n    exit 0\n  fi\n  sleep 0.1\ndone\nkill $PID 2>/dev/null; wait $PID 2>/dev/null\ncat '{}' 2>/dev/null\nexit 1\n",
+                                    def.script_template
+                                        .replace("{path}", &path)
+                                        .replace("{exe}", &exe_path),
+                                    def.marker,
+                                    path,
+                                    path,
+                                    path,
+                                );
+                                let resp = run
+                                    .send(
+                                        &handle,
+                                        Command::Exec {
+                                            args: vec!["bash".into(), "-c".into(), script],
+                                            timeout_secs: Some(10),
+                                            stdin: None,
+                                            background: false,
+                                        },
+                                    )
+                                    .await;
+                                let pass = matches!(
+                                    &resp,
+                                    Response::ExecResult { exit_code: 0, stdout, .. }
+                                        if stdout.contains(def.marker)
+                                );
+                                super::TestOutcome::new(&a, pass, format!("{resp:?}"))
+                            })
+                        })
+                    });
+            }
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
 // PN: Pipe Non-blocking
 // ═══════════════════════════════════════════════════════════════════
 
