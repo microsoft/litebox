@@ -149,7 +149,15 @@ fn run_pass_tcp_socket<'a>(
     Box::pin(async move {
         let (send_sock, recv_sock, path) =
             open_scm_channel(run, sender, receiver, scenario).await?;
-        let listen = run.send(sender, Command::NetListen { port: 0 }).await;
+        let listen = run
+            .send(
+                sender,
+                Command::NetListen {
+                    port: 0,
+                    pre_bind_options: vec![],
+                },
+            )
+            .await;
         let port = super::expect_listening_port(&listen, 0)
             .map_err(|e| format!("tcp listen failed: {e}; resp={listen:?}"))?;
         let conn = expect_opened(

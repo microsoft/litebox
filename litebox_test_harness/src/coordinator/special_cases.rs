@@ -1186,7 +1186,15 @@ pub(crate) fn register_cross_worker(reg: &mut Registry<'_>) {
         ephemerals[r = (AgentName::Dpg1, "R", SpawnKind::NonPie)],
         |run| {
             let _ = run.spawn_ephemeral(&r).await;
-            let resp = run.forward(&r, Command::NetListen { port: 0 }).await;
+            let resp = run
+                .forward(
+                    &r,
+                    Command::NetListen {
+                        port: 0,
+                        pre_bind_options: vec![],
+                    },
+                )
+                .await;
             let pass = super::expect_listening_port(&resp, 0).is_ok();
             super::TestOutcome::new("A", pass, format!("{resp:?}"))
         }
@@ -1202,7 +1210,15 @@ pub(crate) fn register_cross_worker(reg: &mut Registry<'_>) {
         ephemerals[r = (AgentName::Dpg1, "R", SpawnKind::NonPie)],
         |run| {
             let _ = run.spawn_ephemeral(&r).await;
-            let listen_resp = run.forward(&r, Command::NetListen { port: 0 }).await;
+            let listen_resp = run
+                .forward(
+                    &r,
+                    Command::NetListen {
+                        port: 0,
+                        pre_bind_options: vec![],
+                    },
+                )
+                .await;
             let port = match super::expect_listening_port(&listen_resp, 0) {
                 Ok(port) => port,
                 Err(e) => {
@@ -1237,7 +1253,15 @@ pub(crate) fn register_cross_worker(reg: &mut Registry<'_>) {
         timeout = 60,
         agents[a = AgentName::Dpg1],
         |run| {
-            let resp = run.send(&a, Command::NetListen { port: 0 }).await;
+            let resp = run
+                .send(
+                    &a,
+                    Command::NetListen {
+                        port: 0,
+                        pre_bind_options: vec![],
+                    },
+                )
+                .await;
             let pass = super::expect_listening_port(&resp, 0).is_ok();
             super::TestOutcome::new("A", pass, format!("{resp:?}"))
         }
@@ -1253,7 +1277,15 @@ pub(crate) fn register_cross_worker(reg: &mut Registry<'_>) {
         ephemerals[r = (AgentName::Dpg1, "R", SpawnKind::NonPie)],
         |run| {
             let _ = run.spawn_ephemeral(&r).await;
-            let listen_resp = run.send(&a, Command::NetListen { port: 0 }).await;
+            let listen_resp = run
+                .send(
+                    &a,
+                    Command::NetListen {
+                        port: 0,
+                        pre_bind_options: vec![],
+                    },
+                )
+                .await;
             let port = match super::expect_listening_port(&listen_resp, 0) {
                 Ok(port) => port,
                 Err(e) => {
@@ -1387,14 +1419,22 @@ pub(crate) fn register_cross_worker(reg: &mut Registry<'_>) {
         timeout = 60,
         agents[d3 = AgentName::Dpg1Dpg1Dpg1],
         |run| {
-            let resp = run.send(&d3, Command::NetListen { port: 0 }).await;
+            let resp = run
+                .send(
+                    &d3,
+                    Command::NetListen {
+                        port: 0,
+                        pre_bind_options: vec![],
+                    },
+                )
+                .await;
             let pass = super::expect_listening_port(&resp, 0).is_ok();
             super::TestOutcome::new(AgentName::Dpg1Dpg1Dpg1.name(), pass, format!("{resp:?}"))
         }
     );
 
     typed_test!(reg, "xworker", "cross_worker", "XW10.dpg2_tcp_connect", timeout = 60, agents [d3 = AgentName::Dpg1Dpg1Dpg1, b = AgentName::Dpg2], |run| {
-        let listen_resp = run.send(&d3, Command::NetListen { port: 0 }).await;
+        let listen_resp = run.send(&d3, Command::NetListen { port: 0, pre_bind_options: vec![] }).await;
         let port = match super::expect_listening_port(&listen_resp, 0) {
             Ok(port) => port,
             Err(e) => return super::TestOutcome::new("B", false, format!("listen setup failed: {e}; resp={listen_resp:?}")),
@@ -1415,7 +1455,15 @@ pub(crate) fn register_cross_worker(reg: &mut Registry<'_>) {
         timeout = 60,
         agents[d3 = AgentName::Dpg1Dpg1Dpg1],
         |run| {
-            let resp = run.send(&d3, Command::NetListen { port: 0 }).await;
+            let resp = run
+                .send(
+                    &d3,
+                    Command::NetListen {
+                        port: 0,
+                        pre_bind_options: vec![],
+                    },
+                )
+                .await;
             let pass = super::expect_listening_port(&resp, 0).is_ok();
             super::TestOutcome::new(AgentName::Dpg1Dpg1Dpg1.name(), pass, format!("{resp:?}"))
         }
@@ -1445,7 +1493,7 @@ pub(crate) fn register_cross_worker(reg: &mut Registry<'_>) {
         agents[d3 = AgentName::Dpg1Dpg1Dpg1, b = AgentName::Dpg2],
         ephemerals[r2 = (AgentName::Dpg2, "R2", SpawnKind::NonPie)],
         |run| {
-            let listen_resp = run.send(&d3, Command::NetListen { port: 0 }).await;
+            let listen_resp = run.send(&d3, Command::NetListen { port: 0, pre_bind_options: vec![] }).await;
             let port = match super::expect_listening_port(&listen_resp, 0) {
                 Ok(port) => port,
                 Err(e) => return super::TestOutcome::new("R2", false, format!("listen setup failed: {e}; resp={listen_resp:?}")),

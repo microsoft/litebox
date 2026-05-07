@@ -22,6 +22,7 @@ pub(crate) mod pty;
 pub(crate) mod registry;
 pub(crate) mod run_context;
 pub(crate) mod scm_rights;
+pub(crate) mod sockopt;
 pub(crate) mod special_cases;
 pub(crate) mod tcp_state;
 pub(crate) mod tcp_stress;
@@ -838,6 +839,7 @@ pub fn collect_all_tests() -> Vec<Test> {
     epoll_pidfd::register_epoll_pidfd_tests(&mut registry::Registry::new(&mut tests));
     clone3_matrix::register_clone3_matrix(&mut registry::Registry::new(&mut tests));
     scm_rights::register_scm_rights_tests(&mut registry::Registry::new(&mut tests));
+    sockopt::register_sockopt_tests(&mut registry::Registry::new(&mut tests));
     tcp_state::register_tcp_state_tests(&mut registry::Registry::new(&mut tests));
     platform_fixes::register_tcp_halfclose_tests(&mut registry::Registry::new(&mut tests));
     platform_fixes::register_fork_listen_close_tests(&mut registry::Registry::new(&mut tests));

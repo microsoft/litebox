@@ -45,7 +45,15 @@ fn register_fork_port_tests(reg: &mut Registry<'_>) {
                     let handle = cx.require(agent);
                     Box::new(move |run| {
                         Box::pin(async move {
-                            let listen_resp = run.send(&handle, Command::NetListen { port }).await;
+                            let listen_resp = run
+                                .send(
+                                    &handle,
+                                    Command::NetListen {
+                                        port,
+                                        pre_bind_options: vec![],
+                                    },
+                                )
+                                .await;
                             if !super::expect_listening_port(&listen_resp, port).is_ok() {
                                 return super::TestOutcome::new(
                                     &agent_label,
@@ -74,7 +82,7 @@ fn register_fork_port_tests(reg: &mut Registry<'_>) {
                     let handle = cx.require(agent);
                     Box::new(move |run| {
                         Box::pin(async move {
-                            let listen_resp = run.send(&handle, Command::NetListen { port }).await;
+                            let listen_resp = run.send(&handle, Command::NetListen { port, pre_bind_options: vec![] }).await;
                             if !super::expect_listening_port(&listen_resp, port).is_ok() {
                                 return super::TestOutcome::new(
                                     &agent_label,
@@ -112,7 +120,7 @@ fn register_fork_multi_tests(reg: &mut Registry<'_>) {
             Box::new(move |run| {
                 Box::pin(async move {
                     let agent = "A";
-                    let listen_resp = run.send(&handle_a, Command::NetListen { port }).await;
+                    let listen_resp = run.send(&handle_a, Command::NetListen { port, pre_bind_options: vec![] }).await;
                     if !super::expect_listening_port(&listen_resp, port).is_ok() {
                         return super::TestOutcome::new(
                             agent,
@@ -162,7 +170,7 @@ fn register_fork_cross_tests(reg: &mut Registry<'_>) {
                 Box::pin(async move {
                     let listener = "A";
                     let connector = "B";
-                    let listen_resp = run.send(&handle_a, Command::NetListen { port }).await;
+                    let listen_resp = run.send(&handle_a, Command::NetListen { port, pre_bind_options: vec![] }).await;
                     if !super::expect_listening_port(&listen_resp, port).is_ok() {
                         return super::TestOutcome::new(
                             connector,
@@ -203,7 +211,15 @@ fn register_fork_interleave_tests(reg: &mut Registry<'_>) {
             Box::new(move |run| {
                 Box::pin(async move {
                     let agent = "A";
-                    let listen_resp = run.send(&handle_a, Command::NetListen { port }).await;
+                    let listen_resp = run
+                        .send(
+                            &handle_a,
+                            Command::NetListen {
+                                port,
+                                pre_bind_options: vec![],
+                            },
+                        )
+                        .await;
                     if !super::expect_listening_port(&listen_resp, port).is_ok() {
                         return super::TestOutcome::new(
                             agent,
@@ -256,7 +272,7 @@ fn register_fork_background_tests(reg: &mut Registry<'_>) {
             Box::new(move |run| {
                 Box::pin(async move {
                     let agent = "A";
-                    let listen_resp = run.send(&handle_a, Command::NetListen { port }).await;
+                    let listen_resp = run.send(&handle_a, Command::NetListen { port, pre_bind_options: vec![] }).await;
                     if !super::expect_listening_port(&listen_resp, port).is_ok() {
                         return super::TestOutcome::new(
                             agent,
@@ -330,7 +346,7 @@ fn register_fork_listen_inherit_tests(reg: &mut Registry<'_>) {
                 Box::pin(async move {
                     let port = 18300u16;
                     let child_port = port + 100;
-                    let resp = run.send(&handle_a, Command::NetListen { port }).await;
+                    let resp = run.send(&handle_a, Command::NetListen { port, pre_bind_options: vec![] }).await;
                     if let Err(e) = super::expect_listening_port(&resp, port) {
                         return super::TestOutcome::new(
                             "A",
@@ -348,7 +364,7 @@ fn register_fork_listen_inherit_tests(reg: &mut Registry<'_>) {
                         );
                     }
                     let _ = run
-                        .forward(&li_c, Command::NetListen { port: child_port })
+                        .forward(&li_c, Command::NetListen { port: child_port, pre_bind_options: vec![] })
                         .await;
                     let _ = run
                         .forward(&li_c, Command::NetUnlisten { port: child_port })
@@ -390,7 +406,7 @@ fn register_fork_listen_inherit_tests(reg: &mut Registry<'_>) {
                     let port2 = 18301u16;
                     let child_port2 = port2 + 100;
                     let resp = run
-                        .send(&handle_a, Command::NetListen { port: port2 })
+                        .send(&handle_a, Command::NetListen { port: port2, pre_bind_options: vec![] })
                         .await;
                     if let Err(e) = super::expect_listening_port(&resp, port2) {
                         return super::TestOutcome::new(
@@ -411,7 +427,7 @@ fn register_fork_listen_inherit_tests(reg: &mut Registry<'_>) {
                         );
                     }
                     let _ = run
-                        .forward(&li_c2, Command::NetListen { port: child_port2 })
+                        .forward(&li_c2, Command::NetListen { port: child_port2, pre_bind_options: vec![] })
                         .await;
                     let _ = run
                         .forward(&li_c2, Command::NetUnlisten { port: child_port2 })
@@ -482,7 +498,7 @@ fn register_child_listen_cross_connect_tests(reg: &mut Registry<'_>) {
                         cl_c_pie
                     };
                     let resp = run
-                        .forward(&cl_c, Command::NetListen { port })
+                        .forward(&cl_c, Command::NetListen { port, pre_bind_options: vec![] })
                         .await;
                     if let Err(e) = super::expect_listening_port(&resp, port) {
                         return super::TestOutcome::new(
@@ -520,7 +536,7 @@ fn register_depth_axis_tests(reg: &mut Registry<'_>) {
             Box::new(move |run| {
                 Box::pin(async move {
                     let port = 18510u16;
-                    let listen_resp = run.send(&parent, Command::NetListen { port }).await;
+                    let listen_resp = run.send(&parent, Command::NetListen { port, pre_bind_options: vec![] }).await;
                     if !matches!(&listen_resp, Response::Listening { port: p } if *p == port) {
                         return super::TestOutcome::new(
                             "AA->A",
@@ -577,7 +593,7 @@ fn register_depth_axis_tests(reg: &mut Registry<'_>) {
                             format!("fork failed: {spawn_resp:?}"),
                         );
                     }
-                    let listen_resp = run.forward(&child, Command::NetListen { port }).await;
+                    let listen_resp = run.forward(&child, Command::NetListen { port, pre_bind_options: vec![] }).await;
                     if !matches!(&listen_resp, Response::Listening { port: p } if *p == port) {
                         let _ = run.forward(&child, Command::Exit).await;
                         return super::TestOutcome::new(

@@ -6,13 +6,14 @@
 //! their children.
 
 use crate::protocol::{
-    Clone3Kind, Command, EpollEvent, FdRef, InotifyEvent, Response, WaitPredicate,
+    Clone3Kind, Command, EpollEvent, FdRef, InotifyEvent, Response, SockOpt, SockOptValue,
+    WaitPredicate,
 };
 use std::collections::HashMap;
 use std::ffi::CString;
 use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd};
 use std::os::unix::net::{UnixListener as StdUnixListener, UnixStream as StdUnixStream};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
@@ -28,6 +29,7 @@ struct ChildHandle {
 struct ListenerEntry {
     fd: OwnedFd,
     task: tokio::task::JoinHandle<()>,
+    accepted: Arc<AtomicUsize>,
 }
 
 struct EventfdEntry {
@@ -326,15 +328,27 @@ async fn agent_loop(self_exe: &str) {
                 // registered listener. Inherited listeners are imported into
                 // the same registry at startup, so the protocol round-trip is
                 // the readiness barrier for a later connector.
-                let Some(entry) = listeners.remove(&port) else {
+                let Some(entries) = listeners.get_mut(&port) else {
                     respond(&Response::ConnectFailed {
                         error: format!("no listener registered for port {port}"),
                     })
                     .await;
                     continue;
                 };
+                let Some(entry) = entries.pop() else {
+                    listeners.remove(&port);
+                    respond(&Response::ConnectFailed {
+                        error: format!("no listener registered for port {port}"),
+                    })
+                    .await;
+                    continue;
+                };
+                if entries.is_empty() {
+                    listeners.remove(&port);
+                }
                 entry.task.abort();
                 let _ = entry.task.await;
+                let accepted = entry.accepted.clone();
                 // SAFETY: removing the registry entry gives this one-shot
                 // accept worker sole ownership of the listener duplicate.
                 let listener =
@@ -343,6 +357,7 @@ async fn agent_loop(self_exe: &str) {
                 let timeout = std::time::Duration::from_secs(timeout_secs);
                 std::thread::spawn(move || {
                     if let Ok((mut stream, _)) = listener.accept() {
+                        accepted.fetch_add(1, Ordering::Relaxed);
                         let _ = stream.set_read_timeout(Some(timeout));
                         let _ = stream.set_write_timeout(Some(timeout));
                         let mut buf = [0u8; 4096];
@@ -367,9 +382,11 @@ async fn agent_loop(self_exe: &str) {
             Command::NetCloseListener { port } => {
                 // Close this agent's listen socket and stop its echo handler.
                 // Inherited child listeners remain alive in their own agents.
-                if let Some(entry) = listeners.remove(&port) {
-                    entry.task.abort();
-                    let _ = entry.task.await;
+                if let Some(entries) = listeners.remove(&port) {
+                    for entry in entries {
+                        entry.task.abort();
+                        let _ = entry.task.await;
+                    }
                 }
                 respond(&Response::Ok {
                     data: Some(format!("listener on port {port} closed")),
@@ -476,9 +493,12 @@ async fn agent_loop(self_exe: &str) {
                 }
             },
 
-            Command::NetListen { port } => match create_listener_entry(port) {
+            Command::NetListen {
+                port,
+                pre_bind_options,
+            } => match create_listener_entry(port, &pre_bind_options) {
                 Ok((actual_port, entry)) => {
-                    listeners.insert(actual_port, entry);
+                    listeners.entry(actual_port).or_default().push(entry);
                     respond(&Response::Listening { port: actual_port }).await;
                 }
                 Err(e) => {
@@ -489,10 +509,27 @@ async fn agent_loop(self_exe: &str) {
                 }
             },
 
+            Command::NetListenerStats { port } => {
+                if let Some(entries) = listeners.get(&port) {
+                    let counts = entries
+                        .iter()
+                        .map(|entry| entry.accepted.load(Ordering::Relaxed) as u64)
+                        .collect();
+                    respond(&Response::ListenerStats { counts }).await;
+                } else {
+                    respond(&Response::Error {
+                        error: format!("no listener registered for port {port}"),
+                    })
+                    .await;
+                }
+            }
+
             Command::NetUnlisten { port } => {
-                if let Some(entry) = listeners.remove(&port) {
-                    entry.task.abort();
-                    let _ = entry.task.await;
+                if let Some(entries) = listeners.remove(&port) {
+                    for entry in entries {
+                        entry.task.abort();
+                        let _ = entry.task.await;
+                    }
                 }
                 respond(&Response::Ok { data: None }).await;
             }
@@ -700,6 +737,46 @@ async fn agent_loop(self_exe: &str) {
                         error: format!("unknown conn {conn}"),
                     })
                     .await;
+                }
+            }
+
+            Command::NetSetSockOpt {
+                conn,
+                option,
+                value,
+            } => {
+                let Some(stream) = connections.get(&conn).cloned() else {
+                    respond(&Response::Error {
+                        error: format!("unknown conn {conn}"),
+                    })
+                    .await;
+                    continue;
+                };
+                let result = {
+                    let stream = stream.lock().await;
+                    set_sockopt_value(stream.as_raw_fd(), option, value)
+                };
+                match result {
+                    Ok(()) => respond(&Response::Ok { data: None }).await,
+                    Err(error) => respond(&Response::Error { error }).await,
+                }
+            }
+
+            Command::NetGetSockOpt { conn, option } => {
+                let Some(stream) = connections.get(&conn).cloned() else {
+                    respond(&Response::Error {
+                        error: format!("unknown conn {conn}"),
+                    })
+                    .await;
+                    continue;
+                };
+                let result = {
+                    let stream = stream.lock().await;
+                    get_sockopt_value(stream.as_raw_fd(), option)
+                };
+                match result {
+                    Ok(value) => respond(&Response::SockOptResult { value }).await,
+                    Err(error) => respond(&Response::Error { error }).await,
                 }
             }
 
@@ -2272,8 +2349,10 @@ async fn agent_loop(self_exe: &str) {
                 inotifies.clear();
                 eventfds.clear();
                 // Abort all TCP echo servers.
-                for (_, entry) in listeners.drain() {
-                    entry.task.abort();
+                for (_, entries) in listeners.drain() {
+                    for entry in entries {
+                        entry.task.abort();
+                    }
                 }
                 // Abort all Unix echo servers.
                 for (_, task) in unix_listeners.drain() {
@@ -3585,27 +3664,95 @@ fn close_fd(fd: i32) {
     }
 }
 
-fn create_listener_entry(port: u16) -> Result<(u16, ListenerEntry), String> {
-    let std_listener =
-        std::net::TcpListener::bind(format!("0.0.0.0:{port}")).map_err(|e| format!("{e}"))?;
+fn create_listener_entry(
+    port: u16,
+    pre_bind_options: &[(SockOpt, SockOptValue)],
+) -> Result<(u16, ListenerEntry), String> {
+    // SAFETY: socket creates a fresh descriptor on success; it is immediately
+    // wrapped in OwnedFd so all later error paths close it exactly once.
+    let raw_fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0) };
+    if raw_fd < 0 {
+        return Err(format!("socket: {}", std::io::Error::last_os_error()));
+    }
+    // SAFETY: raw_fd was just returned by socket and is uniquely owned here.
+    let fd = unsafe { OwnedFd::from_raw_fd(raw_fd) };
+
+    for &(option, value) in pre_bind_options {
+        set_sockopt_value(fd.as_raw_fd(), option, value)?;
+    }
+
+    let addr = libc::sockaddr_in {
+        sin_family: libc::AF_INET as libc::sa_family_t,
+        sin_port: port.to_be(),
+        sin_addr: libc::in_addr {
+            s_addr: libc::INADDR_ANY,
+        },
+        sin_zero: [0; 8],
+    };
+    // SAFETY: addr points to a valid IPv4 sockaddr for the duration of the
+    // call, and fd is a live TCP socket not aliased mutably elsewhere.
+    let bind_rc = unsafe {
+        libc::bind(
+            fd.as_raw_fd(),
+            std::ptr::addr_of!(addr).cast::<libc::sockaddr>(),
+            std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+        )
+    };
+    if bind_rc != 0 {
+        return Err(format!("bind: {}", std::io::Error::last_os_error()));
+    }
+    // SAFETY: fd is a live bound TCP socket; listen does not take ownership.
+    let listen_rc = unsafe { libc::listen(fd.as_raw_fd(), 128) };
+    if listen_rc != 0 {
+        return Err(format!("listen: {}", std::io::Error::last_os_error()));
+    }
+
+    // SAFETY: fd is a live listening socket; zeroed sockaddr_in is an acceptable
+    // output buffer for getsockname, which initializes len bytes on success.
+    let mut actual_addr = unsafe { std::mem::zeroed::<libc::sockaddr_in>() };
+    let mut actual_len = std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
+    // SAFETY: actual_addr and actual_len point to writable storage valid for
+    // the call; fd remains owned by this function.
+    let name_rc = unsafe {
+        libc::getsockname(
+            fd.as_raw_fd(),
+            std::ptr::addr_of_mut!(actual_addr).cast::<libc::sockaddr>(),
+            &mut actual_len,
+        )
+    };
+    let actual_port = if name_rc == 0 {
+        u16::from_be(actual_addr.sin_port)
+    } else {
+        port
+    };
+
+    // SAFETY: into_raw_fd transfers the uniquely owned listening socket to the
+    // standard library TcpListener, which now closes it on drop.
+    let std_listener = unsafe { std::net::TcpListener::from_raw_fd(fd.into_raw_fd()) };
     std_listener
         .set_nonblocking(true)
         .map_err(|e| format!("set_nonblocking: {e}"))?;
-    let actual_port = std_listener
-        .local_addr()
-        .map(|addr| addr.port())
-        .unwrap_or(port);
-    let fd = dup_fd_cloexec(std_listener.as_raw_fd())?;
-    let task = spawn_tcp_echo_task(std_listener)?;
-    Ok((actual_port, ListenerEntry { fd, task }))
+    let registry_fd = dup_fd_cloexec(std_listener.as_raw_fd())?;
+    let accepted = Arc::new(AtomicUsize::new(0));
+    let task = spawn_tcp_echo_task(std_listener, accepted.clone())?;
+    Ok((
+        actual_port,
+        ListenerEntry {
+            fd: registry_fd,
+            task,
+            accepted,
+        },
+    ))
 }
 
 fn spawn_tcp_echo_task(
     std_listener: std::net::TcpListener,
+    accepted: Arc<AtomicUsize>,
 ) -> Result<tokio::task::JoinHandle<()>, String> {
     let listener = TcpListener::from_std(std_listener).map_err(|e| format!("from_std: {e}"))?;
     Ok(tokio::spawn(async move {
         while let Ok((mut stream, _)) = listener.accept().await {
+            accepted.fetch_add(1, Ordering::Relaxed);
             tokio::spawn(async move {
                 let mut buf = [0u8; 4096];
                 loop {
@@ -3623,7 +3770,73 @@ fn spawn_tcp_echo_task(
     }))
 }
 
-fn import_inherited_listeners() -> Result<HashMap<u16, ListenerEntry>, String> {
+fn sockopt_level_name(option: SockOpt) -> (i32, i32, &'static str, bool) {
+    match option {
+        SockOpt::ReuseAddr => (libc::SOL_SOCKET, libc::SO_REUSEADDR, "SO_REUSEADDR", true),
+        SockOpt::ReusePort => (libc::SOL_SOCKET, libc::SO_REUSEPORT, "SO_REUSEPORT", true),
+        SockOpt::KeepAlive => (libc::SOL_SOCKET, libc::SO_KEEPALIVE, "SO_KEEPALIVE", true),
+        SockOpt::RecvBuf => (libc::SOL_SOCKET, libc::SO_RCVBUF, "SO_RCVBUF", false),
+        SockOpt::SendBuf => (libc::SOL_SOCKET, libc::SO_SNDBUF, "SO_SNDBUF", false),
+        SockOpt::NoDelay => (libc::IPPROTO_TCP, libc::TCP_NODELAY, "TCP_NODELAY", true),
+    }
+}
+
+fn set_sockopt_value(fd: i32, option: SockOpt, value: SockOptValue) -> Result<(), String> {
+    let (level, optname, name, _) = sockopt_level_name(option);
+    let raw: libc::c_int = match value {
+        SockOptValue::Bool(enabled) => i32::from(enabled),
+        SockOptValue::U32(value) => value as libc::c_int,
+    };
+    // SAFETY: fd is a live socket descriptor owned by the agent registry; raw
+    // points to a properly aligned c_int value for the duration of the call.
+    let rc = unsafe {
+        libc::setsockopt(
+            fd,
+            level,
+            optname,
+            std::ptr::addr_of!(raw).cast::<libc::c_void>(),
+            std::mem::size_of_val(&raw) as libc::socklen_t,
+        )
+    };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(format!(
+            "setsockopt {name}: {}",
+            std::io::Error::last_os_error()
+        ))
+    }
+}
+
+fn get_sockopt_value(fd: i32, option: SockOpt) -> Result<SockOptValue, String> {
+    let (level, optname, name, is_bool) = sockopt_level_name(option);
+    let mut raw: libc::c_int = 0;
+    let mut len = std::mem::size_of_val(&raw) as libc::socklen_t;
+    // SAFETY: fd is a live socket descriptor owned by the agent registry; raw
+    // and len point to writable storage valid for the duration of the call.
+    let rc = unsafe {
+        libc::getsockopt(
+            fd,
+            level,
+            optname,
+            std::ptr::addr_of_mut!(raw).cast::<libc::c_void>(),
+            &mut len,
+        )
+    };
+    if rc != 0 {
+        return Err(format!(
+            "getsockopt {name}: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    if is_bool {
+        Ok(SockOptValue::Bool(raw != 0))
+    } else {
+        Ok(SockOptValue::U32(raw.max(0) as u32))
+    }
+}
+
+fn import_inherited_listeners() -> Result<HashMap<u16, Vec<ListenerEntry>>, String> {
     let spec = match std::env::var(INHERITED_LISTEN_FDS_ENV) {
         Ok(spec) if !spec.is_empty() => spec,
         _ => return Ok(HashMap::new()),
@@ -3649,19 +3862,20 @@ fn import_inherited_listeners() -> Result<HashMap<u16, ListenerEntry>, String> {
         let registry_fd = dup_fd_cloexec(inherited_listener.as_raw_fd())?;
         drop(inherited_listener);
         let task = tokio::spawn(async {});
-        listeners.insert(
-            port,
-            ListenerEntry {
+        listeners
+            .entry(port)
+            .or_insert_with(Vec::new)
+            .push(ListenerEntry {
                 fd: registry_fd,
                 task,
-            },
-        );
+                accepted: Arc::new(AtomicUsize::new(0)),
+            });
     }
     Ok(listeners)
 }
 
 fn prepare_inherited_listeners(
-    listeners: &HashMap<u16, ListenerEntry>,
+    listeners: &HashMap<u16, Vec<ListenerEntry>>,
     ports: &[u16],
 ) -> Result<Vec<(u16, OwnedFd)>, String> {
     if ports.len() > (INHERITED_LISTEN_FD_LIMIT - INHERITED_LISTEN_FD_BASE + 1) as usize {
@@ -3674,6 +3888,7 @@ fn prepare_inherited_listeners(
     for (index, port) in ports.iter().copied().enumerate() {
         let entry = listeners
             .get(&port)
+            .and_then(|entries| entries.first())
             .ok_or_else(|| format!("no listener registered for port {port}"))?;
         let slot = INHERITED_LISTEN_FD_BASE + index as i32;
         inherited.push((port, dup_fd_to_inherited_slot(entry.fd.as_raw_fd(), slot)?));
