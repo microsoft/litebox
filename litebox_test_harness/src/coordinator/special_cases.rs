@@ -41,32 +41,35 @@ macro_rules! typed_test {
 pub(super) fn register_netlink(reg: &mut Registry<'_>) {
     let mut self_exe_test =
         |id: &str, subcmd: &str, arg: &str, timeout: u64, check: fn(&str) -> bool| {
-            let id = id.to_string();
-            let subcmd = subcmd.to_string();
-            let arg = arg.to_string();
-            typed_test!(
-                reg,
-                "matrix",
-                "netlink",
-                id,
-                timeout = 60,
-                agents[a = AgentName::A],
-                |run| {
-                    let self_exe = run.self_exe().to_string();
-                    let args = vec![self_exe, subcmd, arg];
-                    let cmd = if timeout > 0 {
-                        super::exec_timeout(args, timeout)
-                    } else {
-                        super::exec(args)
-                    };
-                    let resp = run.send(&a, cmd).await;
-                    let pass = matches!(
-                        &resp,
-                        Response::ExecResult { exit_code: 0, stdout, .. } if check(stdout)
-                    );
-                    super::TestOutcome::new("A", pass, format!("{resp:?}"))
-                }
-            );
+            for &bt in crate::BinaryType::ALL {
+                let id = format!("{id}.{}", bt.label());
+                let subcmd = subcmd.to_string();
+                let arg = arg.to_string();
+                typed_test!(
+                    reg,
+                    "matrix",
+                    "netlink",
+                    id,
+                    timeout = 60,
+                    agents[a = AgentName::A],
+                    |run| {
+                        let self_exe = run.self_exe().to_string();
+                        let target = crate::binary_path(bt, &self_exe);
+                        let args = vec![target, subcmd, arg];
+                        let cmd = if timeout > 0 {
+                            super::exec_timeout(args, timeout)
+                        } else {
+                            super::exec(args)
+                        };
+                        let resp = run.send(&a, cmd).await;
+                        let pass = matches!(
+                            &resp,
+                            Response::ExecResult { exit_code: 0, stdout, .. } if check(stdout)
+                        );
+                        super::TestOutcome::new("A", pass, format!("{resp:?}"))
+                    }
+                );
+            }
         };
 
     self_exe_test("NL1.netlink_socket", "getifaddrs-test", "socket", 0, |s| {
@@ -159,28 +162,33 @@ pub(super) fn register_net_ipv6(reg: &mut Registry<'_>) {
         ("NET6.ipv6_v6only", "ipv6-v6only"),
     ];
     for &(name, sub) in cases {
-        let id = name.to_string();
-        let sub = sub.to_string();
-        typed_test!(
-            reg,
-            "matrix",
-            "net_ipv6",
-            id,
-            timeout = 60,
-            agents[a = AgentName::A],
-            |run| {
-                let self_exe = run.self_exe().to_string();
-                let resp = run
-                    .send(
-                        &a,
-                        super::exec_timeout(vec![self_exe, "net-test".into(), sub], 10),
-                    )
-                    .await;
-                let pass =
-                    matches!(&resp, Response::ExecResult { stdout, .. } if stdout.contains("_OK"));
-                super::TestOutcome::new("A", pass, format!("{resp:?}"))
-            }
-        );
+        for &bt in crate::BinaryType::ALL {
+            let id = format!("{name}.{}", bt.label());
+            let sub = sub.to_string();
+            typed_test!(
+                reg,
+                "matrix",
+                "net_ipv6",
+                id,
+                timeout = 60,
+                agents[a = AgentName::A],
+                |run| {
+                    let self_exe = run.self_exe().to_string();
+                    let target = crate::binary_path(bt, &self_exe);
+                    let resp = run
+                        .send(
+                            &a,
+                            super::exec_timeout(vec![target, "net-test".into(), sub], 10),
+                        )
+                        .await;
+                    let pass = matches!(
+                        &resp,
+                        Response::ExecResult { stdout, .. } if stdout.contains("_OK")
+                    );
+                    super::TestOutcome::new("A", pass, format!("{resp:?}"))
+                }
+            );
+        }
     }
 }
 
@@ -190,35 +198,38 @@ pub(super) fn register_terminal_ioctl(reg: &mut Registry<'_>) {
     let fds = [0, 1, 2];
     for op in &ops {
         for fd in &fds {
-            let id = format!("TERM.{op}_fd{fd}");
-            let op = op.to_string();
-            let fd_str = fd.to_string();
-            typed_test!(
-                reg,
-                "matrix",
-                "terminal_ioctl",
-                id,
-                timeout = 60,
-                agents[a = AgentName::A],
-                |run| {
-                    let self_exe = run.self_exe().to_string();
-                    let resp = run
-                        .send(
-                            &a,
-                            super::exec_timeout(
-                                vec![self_exe, "exit-test".into(), "term".into(), op, fd_str],
-                                8,
-                            ),
-                        )
-                        .await;
-                    let pass = matches!(
-                        &resp,
-                        Response::ExecResult { exit_code: 0 | 1, stdout, .. }
-                            if stdout.contains("TERM_OK") || stdout.contains("TERM_ERR")
-                    );
-                    super::TestOutcome::new("A", pass, format!("{resp:?}"))
-                }
-            );
+            for &bt in crate::BinaryType::ALL {
+                let id = format!("TERM.{op}_fd{fd}.{}", bt.label());
+                let op = op.to_string();
+                let fd_str = fd.to_string();
+                typed_test!(
+                    reg,
+                    "matrix",
+                    "terminal_ioctl",
+                    id,
+                    timeout = 60,
+                    agents[a = AgentName::A],
+                    |run| {
+                        let self_exe = run.self_exe().to_string();
+                        let target = crate::binary_path(bt, &self_exe);
+                        let resp = run
+                            .send(
+                                &a,
+                                super::exec_timeout(
+                                    vec![target, "exit-test".into(), "term".into(), op, fd_str],
+                                    8,
+                                ),
+                            )
+                            .await;
+                        let pass = matches!(
+                            &resp,
+                            Response::ExecResult { exit_code: 0 | 1, stdout, .. }
+                                if stdout.contains("TERM_OK") || stdout.contains("TERM_ERR")
+                        );
+                        super::TestOutcome::new("A", pass, format!("{resp:?}"))
+                    }
+                );
+            }
         }
     }
 }
@@ -338,65 +349,71 @@ pub(super) fn register_fs_io(reg: &mut Registry<'_>) {
 
     for &op in ops {
         for &(path, dir) in paths {
-            let id = format!("FS.{op}.{dir}");
-            let op = op.to_string();
-            let path = path.to_string();
-            typed_test!(
-                reg,
-                "matrix",
-                "fs_io",
-                id,
-                timeout = 60,
-                agents[a = AgentName::A],
-                |run| {
-                    let self_exe = run.self_exe().to_string();
-                    let resp = run
-                        .send(
-                            &a,
-                            super::exec_timeout(
-                                vec![self_exe, "fs-test".into(), "io".into(), op, path],
-                                15,
-                            ),
-                        )
-                        .await;
-                    let pass = matches!(&resp, Response::ExecResult { stdout, .. } if stdout.contains("FS_OK"));
-                    super::TestOutcome::new("A", pass, format!("{resp:?}"))
-                }
-            );
+            for &bt in crate::BinaryType::ALL {
+                let id = format!("FS.{op}.{dir}.{}", bt.label());
+                let op = op.to_string();
+                let path = path.to_string();
+                typed_test!(
+                    reg,
+                    "matrix",
+                    "fs_io",
+                    id,
+                    timeout = 60,
+                    agents[a = AgentName::A],
+                    |run| {
+                        let self_exe = run.self_exe().to_string();
+                        let target = crate::binary_path(bt, &self_exe);
+                        let resp = run
+                            .send(
+                                &a,
+                                super::exec_timeout(
+                                    vec![target, "fs-test".into(), "io".into(), op, path],
+                                    15,
+                                ),
+                            )
+                            .await;
+                        let pass = matches!(&resp, Response::ExecResult { stdout, .. } if stdout.contains("FS_OK"));
+                        super::TestOutcome::new("A", pass, format!("{resp:?}"))
+                    }
+                );
+            }
         }
     }
 
     for &mode in &["exec-write", "exec-open-read"] {
         let prefix = if mode == "exec-write" { "exec" } else { "open" };
         for &bin in &["pie", "nonpie"] {
-            let path = "/tmp/fs-exec.txt";
-            let pname = "fs-exec.txt";
-            let id = format!("FS.{prefix}_{bin}_{pname}");
-            let mode = mode.to_string();
-            let bin = bin.to_string();
-            let path = path.to_string();
-            typed_test!(
-                reg,
-                "matrix",
-                "fs_io",
-                id,
-                timeout = 60,
-                agents[a = AgentName::A],
-                |run| {
-                    let self_exe = run.self_exe().to_string();
-                    let resp = run
-                        .send(
-                            &a,
-                            super::exec_timeout(
-                                vec![self_exe, "fs-test".into(), mode, bin, path],
-                                30,
-                            ),
-                        )
-                        .await;
-                    let pass = matches!(&resp, Response::ExecResult { stdout, .. } if stdout.contains("FS_OK"));
-                    super::TestOutcome::new("A", pass, format!("{resp:?}"))
-                }
-            );
+            for &bt in crate::BinaryType::ALL {
+                let path = "/tmp/fs-exec.txt";
+                let pname = "fs-exec.txt";
+                let id = format!("FS.{prefix}_{bin}_{pname}.{}", bt.label());
+                let mode = mode.to_string();
+                let bin = bin.to_string();
+                let path = path.to_string();
+                typed_test!(
+                    reg,
+                    "matrix",
+                    "fs_io",
+                    id,
+                    timeout = 60,
+                    agents[a = AgentName::A],
+                    |run| {
+                        let self_exe = run.self_exe().to_string();
+                        let target = crate::binary_path(bt, &self_exe);
+                        let resp = run
+                            .send(
+                                &a,
+                                super::exec_timeout(
+                                    vec![target, "fs-test".into(), mode, bin, path],
+                                    30,
+                                ),
+                            )
+                            .await;
+                        let pass = matches!(&resp, Response::ExecResult { stdout, .. } if stdout.contains("FS_OK"));
+                        super::TestOutcome::new("A", pass, format!("{resp:?}"))
+                    }
+                );
+            }
         }
     }
 }
@@ -418,33 +435,36 @@ pub(super) fn register_capture_pipe(reg: &mut Registry<'_>) {
     for &agent in CP_AGENTS {
         for &shell in SHELLS {
             for &cmd_type in CMD_TYPES {
-                let id = format!("CP.{cmd_type}.{shell}.{agent}");
-                let agent_name = agent;
-                let agent_label = agent.to_string();
-                let shell = shell.to_string();
-                let cmd_type = cmd_type.to_string();
-                typed_test!(
-                    reg,
-                    "fork",
-                    "capture_pipe",
-                    id,
-                    timeout = 60,
-                    agents[handle = agent_name],
-                    |run| {
-                        let self_exe = run.self_exe().to_string();
-                        let resp = run
-                            .send(
-                                &handle,
-                                super::exec_timeout(
-                                    vec![self_exe, "capture-pipe".into(), cmd_type, shell],
-                                    10,
-                                ),
-                            )
-                            .await;
-                        let pass = matches!(&resp, Response::ExecResult { stdout, .. } if stdout.contains("CP_OK"));
-                        super::TestOutcome::new(&agent_label, pass, format!("{resp:?}"))
-                    }
-                );
+                for &bt in crate::BinaryType::ALL {
+                    let id = format!("CP.{cmd_type}.{shell}.{}.{agent}", bt.label());
+                    let agent_name = agent;
+                    let agent_label = agent.to_string();
+                    let shell = shell.to_string();
+                    let cmd_type = cmd_type.to_string();
+                    typed_test!(
+                        reg,
+                        "fork",
+                        "capture_pipe",
+                        id,
+                        timeout = 60,
+                        agents[handle = agent_name],
+                        |run| {
+                            let self_exe = run.self_exe().to_string();
+                            let target = crate::binary_path(bt, &self_exe);
+                            let resp = run
+                                .send(
+                                    &handle,
+                                    super::exec_timeout(
+                                        vec![target, "capture-pipe".into(), cmd_type, shell],
+                                        10,
+                                    ),
+                                )
+                                .await;
+                            let pass = matches!(&resp, Response::ExecResult { stdout, .. } if stdout.contains("CP_OK"));
+                            super::TestOutcome::new(&agent_label, pass, format!("{resp:?}"))
+                        }
+                    );
+                }
             }
         }
     }
@@ -716,56 +736,62 @@ pub(crate) fn register_unix_socket(reg: &mut Registry<'_>) {
         ("VS1.socket_race", "race", "VS1_RACE_OK"),
     ];
     for &(name, sub, expected) in simple_tests {
-        let id = name.to_string();
-        let sub = sub.to_string();
-        let expected = expected.to_string();
-        typed_test!(
-            reg,
-            "xworker",
-            "unix_socket",
-            id,
-            timeout = 60,
-            agents[a = AgentName::A],
-            |run| {
-                let self_exe = run.self_exe().to_string();
-                let resp = run
-                    .send(
-                        &a,
-                        super::exec_timeout(vec![self_exe, "unix-socket-test".into(), sub], 10),
-                    )
-                    .await;
-                let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout.contains(&*expected));
-                super::TestOutcome::new("A", pass, format!("{resp:?}"))
-            }
-        );
+        for &bt in crate::BinaryType::ALL {
+            let id = format!("{name}.{}", bt.label());
+            let sub = sub.to_string();
+            let expected = expected.to_string();
+            typed_test!(
+                reg,
+                "xworker",
+                "unix_socket",
+                id,
+                timeout = 60,
+                agents[a = AgentName::A],
+                |run| {
+                    let self_exe = run.self_exe().to_string();
+                    let target = crate::binary_path(bt, &self_exe);
+                    let resp = run
+                        .send(
+                            &a,
+                            super::exec_timeout(vec![target, "unix-socket-test".into(), sub], 10),
+                        )
+                        .await;
+                    let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout.contains(&*expected));
+                    super::TestOutcome::new("A", pass, format!("{resp:?}"))
+                }
+            );
+        }
     }
 
     for &agent in &[AgentName::A, AgentName::AA, AgentName::B] {
-        let id = format!("UF.fork_unix.{agent}");
-        let agent_name = agent;
-        let agent_label = agent.to_string();
-        typed_test!(
-            reg,
-            "xworker",
-            "unix_socket",
-            id,
-            timeout = 60,
-            agents[handle = agent_name],
-            |run| {
-                let self_exe = run.self_exe().to_string();
-                let resp = run
-                    .send(
-                        &handle,
-                        super::exec_timeout(
-                            vec![self_exe, "unix-socket-test".into(), "cross-process".into()],
-                            15,
-                        ),
-                    )
-                    .await;
-                let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout.contains("US1_CROSS_PROCESS_OK"));
-                super::TestOutcome::new(&agent_label, pass, format!("{resp:?}"))
-            }
-        );
+        for &bt in crate::BinaryType::ALL {
+            let id = format!("UF.fork_unix.{}.{agent}", bt.label());
+            let agent_name = agent;
+            let agent_label = agent.to_string();
+            typed_test!(
+                reg,
+                "xworker",
+                "unix_socket",
+                id,
+                timeout = 60,
+                agents[handle = agent_name],
+                |run| {
+                    let self_exe = run.self_exe().to_string();
+                    let target = crate::binary_path(bt, &self_exe);
+                    let resp = run
+                        .send(
+                            &handle,
+                            super::exec_timeout(
+                                vec![target, "unix-socket-test".into(), "cross-process".into()],
+                                15,
+                            ),
+                        )
+                        .await;
+                    let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout.contains("US1_CROSS_PROCESS_OK"));
+                    super::TestOutcome::new(&agent_label, pass, format!("{resp:?}"))
+                }
+            );
+        }
     }
 
     for &agent in &[
@@ -776,65 +802,69 @@ pub(crate) fn register_unix_socket(reg: &mut Registry<'_>) {
         AgentName::D4,
         AgentName::NP,
     ] {
-        let agent_name = agent;
-        let agent_label = agent.to_string();
-        let id = format!("US6.socketpair_write.{agent}");
-        typed_test!(
-            reg,
-            "xworker",
-            "unix_socket",
-            id,
-            timeout = 60,
-            agents[handle = agent_name],
-            |run| {
-                let self_exe = run.self_exe().to_string();
-                let resp = run
-                    .send(
-                        &handle,
-                        super::exec_timeout(
-                            vec![
-                                self_exe,
-                                "unix-socket-test".into(),
-                                "socketpair-fork-write".into(),
-                            ],
-                            15,
-                        ),
-                    )
-                    .await;
-                let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout.contains("US6_SOCKETPAIR_FORK_OK"));
-                super::TestOutcome::new(&agent_label, pass, format!("{resp:?}"))
-            }
-        );
+        for &bt in crate::BinaryType::ALL {
+            let agent_name = agent;
+            let agent_label = agent.to_string();
+            let id = format!("US6.socketpair_write.{}.{agent}", bt.label());
+            typed_test!(
+                reg,
+                "xworker",
+                "unix_socket",
+                id,
+                timeout = 60,
+                agents[handle = agent_name],
+                |run| {
+                    let self_exe = run.self_exe().to_string();
+                    let target = crate::binary_path(bt, &self_exe);
+                    let resp = run
+                        .send(
+                            &handle,
+                            super::exec_timeout(
+                                vec![
+                                    target,
+                                    "unix-socket-test".into(),
+                                    "socketpair-fork-write".into(),
+                                ],
+                                15,
+                            ),
+                        )
+                        .await;
+                    let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout.contains("US6_SOCKETPAIR_FORK_OK"));
+                    super::TestOutcome::new(&agent_label, pass, format!("{resp:?}"))
+                }
+            );
 
-        let agent_name = agent;
-        let agent_label = agent.to_string();
-        let id = format!("US6.socketpair_read.{agent}");
-        typed_test!(
-            reg,
-            "xworker",
-            "unix_socket",
-            id,
-            timeout = 60,
-            agents[handle = agent_name],
-            |run| {
-                let self_exe = run.self_exe().to_string();
-                let resp = run
-                    .send(
-                        &handle,
-                        super::exec_timeout(
-                            vec![
-                                self_exe,
-                                "unix-socket-test".into(),
-                                "socketpair-fork-read".into(),
-                            ],
-                            15,
-                        ),
-                    )
-                    .await;
-                let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout.contains("US6R_SOCKETPAIR_FORK_READ_OK"));
-                super::TestOutcome::new(&agent_label, pass, format!("{resp:?}"))
-            }
-        );
+            let agent_name = agent;
+            let agent_label = agent.to_string();
+            let id = format!("US6.socketpair_read.{}.{agent}", bt.label());
+            typed_test!(
+                reg,
+                "xworker",
+                "unix_socket",
+                id,
+                timeout = 60,
+                agents[handle = agent_name],
+                |run| {
+                    let self_exe = run.self_exe().to_string();
+                    let target = crate::binary_path(bt, &self_exe);
+                    let resp = run
+                        .send(
+                            &handle,
+                            super::exec_timeout(
+                                vec![
+                                    target,
+                                    "unix-socket-test".into(),
+                                    "socketpair-fork-read".into(),
+                                ],
+                                15,
+                            ),
+                        )
+                        .await;
+                    let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout.contains("US6R_SOCKETPAIR_FORK_READ_OK"));
+                    super::TestOutcome::new(&agent_label, pass, format!("{resp:?}"))
+                }
+            );
+        }
     }
 
     for &agent in &[
@@ -845,63 +875,34 @@ pub(crate) fn register_unix_socket(reg: &mut Registry<'_>) {
         AgentName::D4,
         AgentName::NP,
     ] {
-        let id = format!("US6.socketpair_exec.{agent}");
-        let agent_name = agent;
-        let agent_label = agent.to_string();
-        typed_test!(
-            reg,
-            "xworker",
-            "unix_socket",
-            id,
-            timeout = 60,
-            agents[handle = agent_name],
-            |run| {
-                let self_exe = run.self_exe().to_string();
-                let resp = run
-                    .send(
-                        &handle,
-                        super::exec_timeout(
-                            vec![
-                                self_exe,
-                                "unix-socket-test".into(),
-                                "socketpair-exec".into(),
-                            ],
-                            20,
-                        ),
-                    )
-                    .await;
-                let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout.contains("US6E_SOCKETPAIR_EXEC_OK"));
-                super::TestOutcome::new(&agent_label, pass, format!("{resp:?}"))
-            }
-        );
-    }
-
-    for &agent in &[AgentName::A, AgentName::AA, AgentName::B] {
-        let id = format!("US6.socketpair_nonpie.{agent}");
-        let agent_name = agent;
-        let agent_label = agent.to_string();
-        typed_test!(
-            reg,
-            "xworker",
-            "unix_socket",
-            id,
-            timeout = 60,
-            agents[handle = agent_name],
-            |run| {
-                let nonpie = crate::nonpie_binary();
-                let resp = run
-                    .send(
-                        &handle,
-                        super::exec_timeout(
-                            vec![nonpie, "unix-socket-test".into(), "socketpair-exec".into()],
-                            30,
-                        ),
-                    )
-                    .await;
-                let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout.contains("US6E_SOCKETPAIR_EXEC_OK"));
-                super::TestOutcome::new(&agent_label, pass, format!("{resp:?}"))
-            }
-        );
+        for &bt in crate::BinaryType::ALL {
+            let id = format!("US6.socketpair_exec.{}.{agent}", bt.label());
+            let agent_name = agent;
+            let agent_label = agent.to_string();
+            typed_test!(
+                reg,
+                "xworker",
+                "unix_socket",
+                id,
+                timeout = 60,
+                agents[handle = agent_name],
+                |run| {
+                    let self_exe = run.self_exe().to_string();
+                    let target = crate::binary_path(bt, &self_exe);
+                    let resp = run
+                        .send(
+                            &handle,
+                            super::exec_timeout(
+                                vec![target, "unix-socket-test".into(), "socketpair-exec".into()],
+                                30,
+                            ),
+                        )
+                        .await;
+                    let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout.contains("US6E_SOCKETPAIR_EXEC_OK"));
+                    super::TestOutcome::new(&agent_label, pass, format!("{resp:?}"))
+                }
+            );
+        }
     }
 }
 
@@ -1470,93 +1471,65 @@ pub(crate) fn register_pipe_eof(reg: &mut Registry<'_>) {
         AgentName::D4,
         AgentName::NP,
     ] {
-        let id = format!("P1.pipe_eof_fork.{agent}");
-        let agent_name = agent;
-        let agent_label = agent.to_string();
-        typed_test!(
-            reg,
-            "xworker",
-            "pipe_eof",
-            id,
-            timeout = 60,
-            agents[handle = agent_name],
-            |run| {
-                let self_exe = run.self_exe().to_string();
-                let resp = run
-                    .send(
-                        &handle,
-                        super::exec_timeout(
-                            vec![self_exe, "pipe-test".into(), "eof-fork".into()],
-                            20,
-                        ),
-                    )
-                    .await;
-                let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout.contains("P1_EOF_OK"));
-                super::TestOutcome::new(&agent_label, pass, format!("{resp:?}"))
-            }
-        );
+        for &bt in crate::BinaryType::ALL {
+            let id = format!("P1.pipe_eof_fork.{}.{agent}", bt.label());
+            let agent_name = agent;
+            let agent_label = agent.to_string();
+            typed_test!(
+                reg,
+                "xworker",
+                "pipe_eof",
+                id,
+                timeout = 60,
+                agents[handle = agent_name],
+                |run| {
+                    let self_exe = run.self_exe().to_string();
+                    let target = crate::binary_path(bt, &self_exe);
+                    let resp = run
+                        .send(
+                            &handle,
+                            super::exec_timeout(
+                                vec![target, "pipe-test".into(), "eof-fork".into()],
+                                20,
+                            ),
+                        )
+                        .await;
+                    let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout.contains("P1_EOF_OK"));
+                    super::TestOutcome::new(&agent_label, pass, format!("{resp:?}"))
+                }
+            );
+        }
     }
 
     for &agent in &[AgentName::A, AgentName::AA, AgentName::B] {
-        let id = format!("P2.pipe_eof_exec_pie.{agent}");
-        let agent_name = agent;
-        let agent_label = agent.to_string();
-        typed_test!(
-            reg,
-            "xworker",
-            "pipe_eof",
-            id,
-            timeout = 60,
-            agents[handle = agent_name],
-            |run| {
-                let self_exe = run.self_exe().to_string();
-                let resp = run
-                    .send(
-                        &handle,
-                        super::exec_timeout(
-                            vec![
-                                self_exe.clone(),
-                                "pipe-test".into(),
-                                "eof-exec".into(),
-                                self_exe,
-                            ],
-                            20,
-                        ),
-                    )
-                    .await;
-                let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout.contains("P2_EOF_OK"));
-                super::TestOutcome::new(&agent_label, pass, format!("{resp:?}"))
-            }
-        );
-    }
-
-    for &agent in &[AgentName::A, AgentName::AA, AgentName::B] {
-        let id = format!("P2.pipe_eof_exec_nonpie.{agent}");
-        let agent_name = agent;
-        let agent_label = agent.to_string();
-        typed_test!(
-            reg,
-            "xworker",
-            "pipe_eof",
-            id,
-            timeout = 60,
-            agents[handle = agent_name],
-            |run| {
-                let self_exe = run.self_exe().to_string();
-                let nonpie = crate::nonpie_binary();
-                let resp = run
-                    .send(
-                        &handle,
-                        super::exec_timeout(
-                            vec![self_exe, "pipe-test".into(), "eof-exec".into(), nonpie],
-                            20,
-                        ),
-                    )
-                    .await;
-                let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout.contains("P2_EOF_OK"));
-                super::TestOutcome::new(&agent_label, pass, format!("{resp:?}"))
-            }
-        );
+        for &bt in crate::BinaryType::ALL {
+            let id = format!("P2.pipe_eof_exec.{}.{agent}", bt.label());
+            let agent_name = agent;
+            let agent_label = agent.to_string();
+            typed_test!(
+                reg,
+                "xworker",
+                "pipe_eof",
+                id,
+                timeout = 60,
+                agents[handle = agent_name],
+                |run| {
+                    let self_exe = run.self_exe().to_string();
+                    let target = crate::binary_path(bt, &self_exe);
+                    let resp = run
+                        .send(
+                            &handle,
+                            super::exec_timeout(
+                                vec![self_exe, "pipe-test".into(), "eof-exec".into(), target],
+                                20,
+                            ),
+                        )
+                        .await;
+                    let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout.contains("P2_EOF_OK"));
+                    super::TestOutcome::new(&agent_label, pass, format!("{resp:?}"))
+                }
+            );
+        }
     }
 }
 
