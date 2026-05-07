@@ -384,6 +384,11 @@ impl ElfParsedFile {
     ///
     /// Callers can use this to reject non-PIE binaries whose fixed addresses
     /// fall outside the target process's VA partition.
+    /// Returns whether this ELF has a mapped Litebox syscall trampoline.
+    pub fn has_trampoline(&self) -> bool {
+        self.trampoline.is_some()
+    }
+
     pub fn fixed_load_range(&self) -> Option<core::ops::Range<usize>> {
         if self.header.e_type != elf::abi::ET_EXEC {
             return None;
