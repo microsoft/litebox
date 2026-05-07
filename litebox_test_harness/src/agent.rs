@@ -2457,6 +2457,7 @@ struct CloneArgs {
 static CLONE3_THREAD_WRITE_FD: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
 static CLONE3_THREAD_TID: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
 static CLONE3_THREAD_SIGNAL: u8 = 1;
+static CLONE3_VFORK_STAGE: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
 
 fn clone_result_error(error: impl Into<String>) -> crate::protocol::CloneResult {
     crate::protocol::CloneResult {
@@ -2523,6 +2524,7 @@ fn run_clone3(kind: Clone3Kind, exec_target: Option<String>) -> crate::protocol:
         Clone3Kind::WithPidfd => run_clone3_process(true, None, None, exec_target),
         Clone3Kind::WithSetTid { tid } => run_clone3_process(false, Some(tid), None, exec_target),
         Clone3Kind::WithCgroup { cgroup_fd } => run_clone3_with_cgroup(cgroup_fd, exec_target),
+        Clone3Kind::WithVfork => run_clone3_vfork(),
     }
 }
 
@@ -2552,6 +2554,70 @@ fn run_clone3_with_cgroup(
     // SAFETY: `fd` was just returned by `open` and is uniquely owned here.
     let owned = unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) };
     run_clone3_process(false, None, Some(owned.as_raw_fd()), exec_target)
+}
+
+fn run_clone3_vfork() -> crate::protocol::CloneResult {
+    CLONE3_VFORK_STAGE.store(0, Ordering::SeqCst);
+    let mut child_tid = 0i32;
+    let mut args = CloneArgs {
+        flags: (libc::CLONE_VM | libc::CLONE_VFORK | libc::CLONE_CHILD_CLEARTID) as u64,
+        child_tid: (&raw mut child_tid).addr() as u64,
+        exit_signal: libc::SIGCHLD as u64,
+        ..CloneArgs::default()
+    };
+    // SAFETY: `args` is a clone_args-compatible struct and lives for the
+    // syscall. The vfork child performs only raw syscalls and atomics, then
+    // terminates with SYS_exit so the parent resumes without Rust unwinding.
+    let rc = unsafe {
+        libc::syscall(
+            libc::SYS_clone3,
+            &raw mut args,
+            std::mem::size_of::<CloneArgs>(),
+        )
+    };
+    if rc == 0 {
+        // SAFETY: In the vfork child, use only raw syscalls and atomic stores
+        // before SYS_exit; SYS_exit releases the suspended parent.
+        unsafe {
+            CLONE3_VFORK_STAGE.store(1, Ordering::SeqCst);
+            for _ in 0..20_000 {
+                let _ = libc::syscall(libc::SYS_sched_yield);
+            }
+            CLONE3_VFORK_STAGE.store(2, Ordering::SeqCst);
+            libc::syscall(libc::SYS_exit, 0i32);
+        }
+        unreachable!();
+    }
+    if rc < 0 {
+        return clone_result_error(last_errno_name());
+    }
+    let pid = rc as libc::pid_t;
+    let stage_after_return = CLONE3_VFORK_STAGE.load(Ordering::SeqCst);
+    if stage_after_return != 2 {
+        let _ = wait_for_child(pid);
+        return crate::protocol::CloneResult {
+            pid: pid as u64,
+            pidfd: None,
+            ok: false,
+            error: Some(format!(
+                "vfork_parent_resumed_before_child_exit:stage={stage_after_return}"
+            )),
+        };
+    }
+    if let Err(error) = wait_for_child(pid) {
+        return crate::protocol::CloneResult {
+            pid: pid as u64,
+            pidfd: None,
+            ok: false,
+            error: Some(format!("wait:{error}")),
+        };
+    }
+    crate::protocol::CloneResult {
+        pid: pid as u64,
+        pidfd: None,
+        ok: true,
+        error: None,
+    }
 }
 
 fn run_clone3_thread() -> crate::protocol::CloneResult {

@@ -20,8 +20,8 @@ struct Clone3Def {
     kind: fn() -> Clone3Kind,
     expect: fn(&Response) -> Result<(), String>,
     /// True if this kind exec's a binary in the cloned child (any
-    /// `Process`-style variant). False for `Thread`, which shares the
-    /// parent address space and never exec's. Per-binary-type
+    /// `Process`-style variant). False for clone3 variants where
+    /// varying the exec target is meaningless. Per-binary-type
     /// variants are only registered for kinds where this is `true`.
     forks_then_execs: bool,
 }
@@ -56,6 +56,12 @@ const CL3_KINDS: &[Clone3Def] = &[
         kind: || Clone3Kind::WithCgroup { cgroup_fd: 0 },
         expect: expect_cgroup_outcome,
         forks_then_execs: true,
+    },
+    Clone3Def {
+        name: "vfork",
+        kind: || Clone3Kind::WithVfork,
+        expect: expect_vfork_success,
+        forks_then_execs: false,
     },
 ];
 
@@ -139,6 +145,25 @@ fn expect_success_without_pidfd(resp: &Response) -> Result<(), String> {
         } if documented_error(error, &["ENOSYS"]) => Ok(()),
         other => Err(format!(
             "expected clone3 success or documented native ENOSYS/seccomp result without pidfd, got {other:?}"
+        )),
+    }
+}
+
+fn expect_vfork_success(resp: &Response) -> Result<(), String> {
+    match resp {
+        Response::CloneResult {
+            pid,
+            pidfd: None,
+            ok: true,
+            error: None,
+        } if *pid > 0 => Ok(()),
+        Response::CloneResult {
+            ok: false,
+            error: Some(error),
+            ..
+        } if documented_error(error, &["ENOSYS"]) => Ok(()),
+        other => Err(format!(
+            "expected clone3(CLONE_VFORK) success or documented native ENOSYS/seccomp result without pidfd, got {other:?}"
         )),
     }
 }
