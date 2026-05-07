@@ -224,4 +224,51 @@ pub(crate) fn register_pipe_bridge(reg: &mut Registry<'_>) {
                 });
         }
     }
+
+    for &(mode, subcmd, expected) in &[
+        ("sibling_dual.c2p.pie", "extra-pipe-c2p", "PB_C2P_OK"),
+        ("sibling_dual.p2c.pie", "extra-pipe-p2c", "PB_P2C_OK"),
+        ("sibling_dual.sp.pie", "extra-socketpair", "PB_SP_OK"),
+    ] {
+        let id = format!("PB.{mode}");
+        reg.test("xworker", "pipe_bridge", id)
+            .timeout(90)
+            .build(move |cx| {
+                let left = cx.require(AgentName::AA);
+                let right = cx.require(AgentName::AB);
+                Box::new(move |run| {
+                    Box::pin(async move {
+                        let self_exe = run.self_exe().to_string();
+                        let args = |subcmd: &str| {
+                            vec![
+                                self_exe.clone(),
+                                "pipe-test".into(),
+                                subcmd.to_string(),
+                                self_exe.clone(),
+                            ]
+                        };
+                        let left_resp =
+                            run.send(&left, super::exec_timeout(args(subcmd), 20)).await;
+                        let right_resp = run
+                            .send(&right, super::exec_timeout(args(subcmd), 20))
+                            .await;
+                        let left_ok = matches!(
+                            &left_resp,
+                            crate::protocol::Response::ExecResult { exit_code: 0, stdout, .. }
+                                if stdout.trim() == expected
+                        );
+                        let right_ok = matches!(
+                            &right_resp,
+                            crate::protocol::Response::ExecResult { exit_code: 0, stdout, .. }
+                                if stdout.trim() == expected
+                        );
+                        super::TestOutcome::new(
+                            "AA+AB",
+                            left_ok && right_ok,
+                            format!("left={left_resp:?} right={right_resp:?}"),
+                        )
+                    })
+                })
+            });
+    }
 }
