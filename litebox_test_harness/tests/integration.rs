@@ -159,18 +159,34 @@ fn build_docker_cmd(
     pass: &str,
     test_id: &str,
     container_name: &str,
-    debug: &Path,
-    nonpie: &Path,
+    bins: &BinaryPaths,
 ) -> Command {
     let filter = format!("--filter={test_id}");
     let mut cmd = Command::new("docker");
     cmd.args(docker_run_base_args())
         .arg("--name")
         .arg(container_name)
+        // Each binary-type leg is mounted at `/opt/<label>/` so the
+        // corresponding `find_*_binary()` helpers in lib.rs find them.
         .arg("-v")
-        .arg(format!("{}:/opt/litebox:ro", debug.display()))
+        .arg(format!("{}:/opt/litebox:ro", bins.pie_glibc.display()))
         .arg("-v")
-        .arg(format!("{}:/opt/nonpie:ro", nonpie.display()))
+        .arg(format!("{}:/opt/nonpie:ro", bins.nonpie_glibc.display()))
+        .arg("-v")
+        .arg(format!(
+            "{}:/opt/static-pie-glibc:ro",
+            bins.static_pie_glibc.display()
+        ))
+        .arg("-v")
+        .arg(format!(
+            "{}:/opt/static-pie-musl:ro",
+            bins.static_pie_musl.display()
+        ))
+        .arg("-v")
+        .arg(format!(
+            "{}:/opt/non-pie-static-musl:ro",
+            bins.non_pie_static_musl.display()
+        ))
         .arg("litebox-test");
     match pass {
         "native" => {
@@ -236,7 +252,7 @@ fn log_path_for(pass: &str, test_id: &str, kind: &str) -> PathBuf {
 fn run_one_test(pass: &str, test_id: &str) -> Result<serde_json::Value, Failed> {
     use std::io::Write as _;
     let permit = active_jobs().acquire();
-    let (_, debug, nonpie) = setup();
+    let (_, bins) = setup();
     let container_name = format!(
         "litebox-{}-{}-{}-{}",
         pass,
@@ -251,7 +267,7 @@ fn run_one_test(pass: &str, test_id: &str) -> Result<serde_json::Value, Failed> 
     let stdout_log = log_path_for(pass, test_id, "stdout");
     let stderr_log = log_path_for(pass, test_id, "stderr");
 
-    let mut cmd = build_docker_cmd(pass, test_id, &container_name, &debug, &nonpie);
+    let mut cmd = build_docker_cmd(pass, test_id, &container_name, &bins);
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::from(
         std::fs::File::create(&stderr_log)
@@ -358,8 +374,8 @@ fn main() {
 
     // Host forwarding trial (not a coordinator suite — uses its own docker run).
     trials.push(Trial::test("host::fwd".to_string(), move || {
-        let (_, debug, nonpie) = setup();
-        run_host_fwd(&debug, &nonpie);
+        let (_, bins) = setup();
+        run_host_fwd(&bins.pie_glibc, &bins.nonpie_glibc);
         Ok(())
     }));
 
@@ -417,6 +433,34 @@ fn nonpie_dir() -> PathBuf {
     target_dir().join("nonpie/debug")
 }
 
+/// Directory containing the static-PIE-glibc debug binary.
+fn static_pie_glibc_dir() -> PathBuf {
+    target_dir().join("static-pie-glibc/x86_64-unknown-linux-gnu/debug")
+}
+
+/// Directory containing the static-PIE-musl debug binary.
+fn static_pie_musl_dir() -> PathBuf {
+    target_dir().join("static-pie-musl/x86_64-unknown-linux-musl/debug")
+}
+
+/// Directory containing the non-PIE-static-musl debug binary.
+fn non_pie_static_musl_dir() -> PathBuf {
+    target_dir().join("non-pie-static-musl/x86_64-unknown-linux-musl/debug")
+}
+
+/// Bundle of all binary-type bind-mount sources discovered during
+/// [`setup`]. Each path corresponds to a leg of
+/// [`litebox_test_harness::BinaryType`] and is bind-mounted into the
+/// Docker container at the conventional `/opt/<label>` path.
+#[derive(Debug, Clone)]
+struct BinaryPaths {
+    pie_glibc: PathBuf,
+    nonpie_glibc: PathBuf,
+    static_pie_glibc: PathBuf,
+    static_pie_musl: PathBuf,
+    non_pie_static_musl: PathBuf,
+}
+
 /// Build the Docker test image if needed.
 fn ensure_docker_image(ws_root: &Path) {
     eprintln!("Building litebox-test Docker image...");
@@ -442,12 +486,18 @@ fn ensure_docker_image(ws_root: &Path) {
     assert!(status.success(), "Docker build failed");
 }
 
-/// Build all required binaries (PIE + non-PIE) to the target directory.
+/// Build all required binaries (5 legs of `BinaryType`) to the
+/// target directory.
+///
+/// Strict-mode invariant: every leg builds unconditionally; failure to
+/// build any one (e.g. missing musl rust target) panics with a clear
+/// pointer to the install command. There is no opt-out env var — if
+/// the test matrix is going to run, all legs must be available.
 fn ensure_binaries_built(ws_root: &Path) {
     let td = target_dir();
     let td_str = td.to_string_lossy();
 
-    eprintln!("Building litebox binaries (PIE) to {td_str}...");
+    eprintln!("Building litebox binaries (PIE-glibc) to {td_str}...");
     let status = Command::new("cargo")
         .current_dir(ws_root)
         .args([
@@ -465,28 +515,107 @@ fn ensure_binaries_built(ws_root: &Path) {
         ])
         .status()
         .expect("cargo build");
-    assert!(status.success(), "cargo build (PIE) failed");
+    assert!(status.success(), "cargo build (PIE-glibc) failed");
 
-    let nonpie_td = td.join("nonpie");
-    let nonpie_td_str = nonpie_td.to_string_lossy();
-    eprintln!("Building litebox_test_harness (non-PIE) to {nonpie_td_str}...");
-    let status = Command::new("cargo")
-        .current_dir(ws_root)
-        .args([
-            "rustc",
-            "-p",
-            "litebox_test_harness",
-            "--bin",
-            "litebox_test_harness",
-            "--target-dir",
-            &nonpie_td_str,
-            "--",
-            "-C",
-            "link-args=-no-pie",
-        ])
+    build_companion_binary(
+        ws_root,
+        "non-PIE-glibc",
+        &td.join("nonpie"),
+        None,
+        None,
+        Some("link-args=-no-pie"),
+    );
+    build_companion_binary(
+        ws_root,
+        "static-PIE-glibc",
+        &td.join("static-pie-glibc"),
+        Some("x86_64-unknown-linux-gnu"),
+        Some("-C target-feature=+crt-static"),
+        None,
+    );
+
+    // The musl legs require the rust target to be installed.
+    ensure_rust_target("x86_64-unknown-linux-musl");
+
+    build_companion_binary(
+        ws_root,
+        "static-PIE-musl",
+        &td.join("static-pie-musl"),
+        Some("x86_64-unknown-linux-musl"),
+        Some("-C target-feature=+crt-static"),
+        None,
+    );
+    build_companion_binary(
+        ws_root,
+        "non-PIE-static-musl",
+        &td.join("non-pie-static-musl"),
+        Some("x86_64-unknown-linux-musl"),
+        Some("-C link-args=-no-pie -C target-feature=+crt-static"),
+        None,
+    );
+}
+
+/// Build a single companion harness binary into `target_dir` with
+/// the given Rust target triple, RUSTFLAGS, and optional rustc
+/// `-C` flag (passed via `--`). Panics on build failure.
+fn build_companion_binary(
+    ws_root: &Path,
+    label: &str,
+    target_dir: &Path,
+    rust_target: Option<&str>,
+    rustflags: Option<&str>,
+    extra_cflag: Option<&str>,
+) {
+    let td_str = target_dir.to_string_lossy();
+    eprintln!("Building litebox_test_harness ({label}) to {td_str}...");
+    let mut cmd = Command::new("cargo");
+    cmd.current_dir(ws_root);
+    if let Some(flags) = rustflags {
+        cmd.env("RUSTFLAGS", flags);
+    }
+    cmd.args([
+        "rustc",
+        "-p",
+        "litebox_test_harness",
+        "--bin",
+        "litebox_test_harness",
+        "--target-dir",
+        &td_str,
+    ]);
+    if let Some(t) = rust_target {
+        cmd.args(["--target", t]);
+    }
+    if let Some(flag) = extra_cflag {
+        cmd.args(["--", "-C", flag]);
+    }
+    let status = cmd
         .status()
-        .expect("cargo rustc nonpie");
-    assert!(status.success(), "cargo build (non-PIE) failed");
+        .unwrap_or_else(|e| panic!("cargo rustc {label}: {e}"));
+    assert!(status.success(), "cargo build ({label}) failed");
+}
+
+/// Verify the requested rust target is installed via rustup. If it
+/// isn't, panic with a clear pointer to `rustup target add`.
+fn ensure_rust_target(target: &str) {
+    let output = match Command::new("rustup")
+        .args(["target", "list", "--installed"])
+        .output()
+    {
+        Ok(o) if o.status.success() => o,
+        Ok(o) => panic!(
+            "rustup target list failed with status {}: {}",
+            o.status,
+            String::from_utf8_lossy(&o.stderr),
+        ),
+        Err(e) => panic!("rustup not available: {e}; required for static-PIE-musl build"),
+    };
+    let installed = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        installed.lines().any(|line| line.trim() == target),
+        "rust target {target} is not installed. Required for the \
+         static-PIE-musl and non-PIE-static-musl legs of the test \
+         matrix. Install with: rustup target add {target}"
+    );
 }
 
 /// Shared setup: build binaries and Docker image once per `cargo test`
@@ -496,29 +625,37 @@ fn ensure_binaries_built(ws_root: &Path) {
 /// once per Trial. Under `cargo nextest` (where each Trial is its
 /// own process) we'd additionally need a `flock`-based file lock;
 /// out of scope for this iteration.
-static SETUP_ONCE: std::sync::OnceLock<(PathBuf, PathBuf, PathBuf)> = std::sync::OnceLock::new();
+static SETUP_ONCE: std::sync::OnceLock<(PathBuf, BinaryPaths)> = std::sync::OnceLock::new();
 
-fn setup() -> (PathBuf, PathBuf, PathBuf) {
+fn setup() -> (PathBuf, BinaryPaths) {
     SETUP_ONCE
         .get_or_init(|| {
             let ws_root = workspace_root();
             ensure_binaries_built(&ws_root);
             ensure_docker_image(&ws_root);
-            let debug = debug_dir();
-            let nonpie = nonpie_dir();
-            let harness = debug.join("litebox_test_harness");
-            assert!(
-                harness.exists(),
-                "litebox_test_harness not found at {}",
-                harness.display()
-            );
-            let nonpie_bin = nonpie.join("litebox_test_harness");
-            assert!(
-                nonpie_bin.exists(),
-                "non-PIE litebox_test_harness not found at {}",
-                nonpie_bin.display()
-            );
-            (ws_root, debug, nonpie)
+            let bins = BinaryPaths {
+                pie_glibc: debug_dir(),
+                nonpie_glibc: nonpie_dir(),
+                static_pie_glibc: static_pie_glibc_dir(),
+                static_pie_musl: static_pie_musl_dir(),
+                non_pie_static_musl: non_pie_static_musl_dir(),
+            };
+            for (label, dir) in [
+                ("PIE-glibc", &bins.pie_glibc),
+                ("non-PIE-glibc", &bins.nonpie_glibc),
+                ("static-PIE-glibc", &bins.static_pie_glibc),
+                ("static-PIE-musl", &bins.static_pie_musl),
+                ("non-PIE-static-musl", &bins.non_pie_static_musl),
+            ] {
+                let bin = dir.join("litebox_test_harness");
+                assert!(
+                    bin.exists(),
+                    "{label} litebox_test_harness not found at {} \
+                     after ensure_binaries_built",
+                    bin.display()
+                );
+            }
+            (ws_root, bins)
         })
         .clone()
 }
