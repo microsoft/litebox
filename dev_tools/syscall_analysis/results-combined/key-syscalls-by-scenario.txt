@@ -1,0 +1,88 @@
+  epoll_create              0
+0
+  epoll_create1             28
+  epoll_ctl                 345
+  epoll_wait                0
+0
+  epoll_pwait               39141
+  epoll_pwait2              0
+0
+  pidfd_open                6
+  pidfd_send_signal         0
+0
+  pidfd_getfd               0
+0
+  eventfd                   0
+0
+  eventfd2                  28
+  signalfd                  0
+0
+  signalfd4                 0
+0
+  timerfd_create            0
+0
+  timerfd_settime           0
+0
+  timerfd_gettime           0
+0
+  inotify_init              0
+0
+  inotify_init1             2
+  inotify_add_watch         1343
+  inotify_rm_watch          0
+0
+  fanotify_init             0
+0
+  fanotify_mark             0
+0
+  io_uring_setup            25
+  io_uring_enter            347
+  io_uring_register         0
+0
+  clone                     695
+  clone3                    92
+  vfork                     0
+0
+  unshare                   0
+0
+  ioctl                     1877
+  prctl                     187
+  arch_prctl                579
+  setsid                    13
+  sendmsg                   2
+  recvmsg                   476
+  socketpair                262
+  shutdown                  214
+  setsockopt                1385
+  getsockopt                117
+  getrandom                 680
+  memfd_create              0
+0
+  copy_file_range           3
+  sendfile                  0
+0
+  splice                    0
+0
+  tee                       0
+0
+  statx                     23246
+  renameat2                 1
+  linkat                    0
+0
+  mount                     0
+0
+  umount2                   0
+0
+  pivot_root                0
+0
+  ptrace                    0
+0
+  readlinkat                0
+0
+  readlink                  709
+  membarrier                0
+0
+  sched_yield               974
+  sched_setaffinity         0
+0
+  mremap                    2
