@@ -14,6 +14,7 @@ pub(crate) mod matrix;
 pub(crate) mod pipe_bridge;
 pub(crate) mod platform_fixes;
 pub(crate) mod port_router;
+pub(crate) mod pty;
 pub(crate) mod registry;
 pub(crate) mod run_context;
 pub(crate) mod special_cases;
@@ -836,6 +837,7 @@ pub fn collect_all_tests() -> Vec<Test> {
     tcp_stress::register_tcp_stress(&mut registry::Registry::new(&mut tests));
     file_tcp::register_file_tcp(&mut registry::Registry::new(&mut tests));
     port_router::register_port_router(&mut registry::Registry::new(&mut tests));
+    pty::register_pty_tests(&mut registry::Registry::new(&mut tests));
     special_cases::register_contamination_sequence(&mut registry::Registry::new(&mut tests));
     tests
 }
