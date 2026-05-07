@@ -179,6 +179,89 @@ When a test fails and the root cause is unclear:
     threads are not cleaned up before those threads finish. Look for
     `detach`/`move to background` patterns that skip `join()`.
 
+## Binary-Type Axis
+
+litebox's syscall shim and worker-migration logic dispatch differently
+based on the *kind* of ELF binary being `execve`'d. The harness models
+this as a five-leg `BinaryType` axis (`litebox_test_harness::BinaryType`):
+
+| Variant | ELF type | Linker | Libc | PIE? | Build flags |
+|---|---|---|---|---|---|
+| `PieGlibc` | `ET_DYN` | dynamic | glibc | yes | (default `cargo build`) |
+| `NonPieGlibc` | `ET_EXEC` | dynamic | glibc | no | `-C link-args=-no-pie` |
+| `StaticPieGlibc` | `ET_DYN` | static-ish (still uses ld.so for nss) | glibc | yes | `RUSTFLAGS="-C target-feature=+crt-static" --target x86_64-unknown-linux-gnu` |
+| `StaticPieMusl` | `ET_DYN` | truly static (no ld.so) | musl | yes | `RUSTFLAGS="-C target-feature=+crt-static" --target x86_64-unknown-linux-musl` |
+| `NonPieStaticMusl` | `ET_EXEC` | truly static, fixed-addr | musl | no | `RUSTFLAGS="-C link-args=-no-pie -C target-feature=+crt-static -C relocation-model=static" --target x86_64-unknown-linux-musl` |
+
+`StaticPieMusl` matches the actual VS Code Server CLI distribution
+(`cli-alpine-x64`).
+
+### Iterating the axis in tests
+
+Use `BinaryType::ALL` to fan out a test over every leg, and resolve
+the actual binary path via `crate::binary_path(bt, &self_exe)`:
+
+```rust
+for &bt in crate::BinaryType::ALL {
+    let label = bt.label();   // "pie-glibc" | "nonpie-glibc" | …
+    let bin = crate::binary_path(bt, &self_exe);
+    // … run the test with `bin` …
+}
+```
+
+`label()` returns a stable kebab-case string suitable for embedding in
+test IDs (e.g. `EXITD.256.static-pie-musl.A`).
+
+### Strict-mode invariant: every leg must be present
+
+`binary_path()` and the per-leg accessors (`nonpie_binary()`,
+`static_pie_glibc_binary()`, `static_pie_musl_binary()`,
+`non_pie_static_musl_binary()`) **panic** when the requested binary
+isn't present at the expected docker mount or as a sibling of the
+current exe. The panic message includes the exact build command
+needed to produce the missing binary.
+
+There is no skip semantics. Tests that require a binary type whose
+build was skipped will fail loudly — by design. The integration test
+runner (`tests/integration.rs::ensure_binaries_built`) builds all five
+binaries unconditionally and asserts each exists at the end of
+`setup()`.
+
+The musl legs require `rustup target add x86_64-unknown-linux-musl`.
+The integration runner's `ensure_rust_target` helper checks for it
+and fails fast with the install command if missing.
+
+### Backwards-compat for existing test IDs
+
+Test families that already had a narrower binary axis (EXITD, FWE, M,
+BS, NPIPE, FR.bg_exe) keep their original IDs as aliases for whichever
+leg the legacy code used. New legs append the kebab-case binary label
+as an additional ID segment. Examples:
+
+- `EXITD.256.pie.A` and `EXITD.256.nonpie.A` (legacy 4-segment) are
+  preserved; new IDs use the BinaryType label
+  (`EXITD.256.static-pie-musl.A`).
+- `FWE.pie_from_init`, `FWE.nonpie_from_init` are preserved; new legs
+  are `FWE.static-pie-musl_from_init` etc.
+- `FR.bg_exe.<agent>` is preserved (= PieGlibc); new legs add a binary
+  segment (`FR.bg_exe.static-pie-musl.<agent>`).
+- `NPIPE.*` IDs are preserved unchanged (= NonPieGlibc); the new
+  `BPIPE.<leg>.*` IDs cover the four other legs.
+
+### Adding the axis to a new family
+
+Pattern:
+
+1. Identify whether the test exercises an external binary path (via
+   `{exe}` substitution, `Command::new()`, `posix_spawn`, etc.). If
+   not, the axis isn't applicable.
+2. Wrap the test loop with `for &bt in crate::BinaryType::ALL`.
+3. Resolve the path with `crate::binary_path(bt, &self_exe)`.
+4. Embed `bt.label()` in the test ID for unique IDs across legs.
+5. If preserving legacy IDs, alias one leg (typically `PieGlibc` or
+   `NonPieGlibc`) to the original 3-segment ID and append `.<label>`
+   for the others.
+
 ## What NOT to Do
 
 - Do NOT introduce any "expected fail" mechanism — no `xfail` /
