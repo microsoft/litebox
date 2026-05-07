@@ -688,9 +688,12 @@ fn emit_trampoline_preamble(
         trampoline_data.len() as u64 + 7,
         "trampoline R11 displacement base",
     )?;
-    let r11_disp = i64::try_from(call_site_addr).unwrap() - i64::try_from(r11_rip).unwrap();
     trampoline_data.extend_from_slice(&[0x4C, 0x8D, 0x1D]);
-    trampoline_data.extend_from_slice(&(i32::try_from(r11_disp).unwrap().to_le_bytes()));
+    trampoline_data.extend_from_slice(&rel32_bytes(
+        call_site_addr,
+        r11_rip,
+        "trampoline R11 restart address",
+    )?);
     Ok(())
 }
 
@@ -1052,4 +1055,17 @@ fn hook_syscall_and_after(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn trampoline_preamble_reports_out_of_range_r11_displacement() {
+        let mut trampoline_data = Vec::new();
+        let result = emit_trampoline_preamble(0x8000_0000, 0, &mut trampoline_data);
+
+        assert!(matches!(result, Err(Error::AddressOverflow(_))));
+    }
 }

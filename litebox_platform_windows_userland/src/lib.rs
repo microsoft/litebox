@@ -414,6 +414,8 @@ struct TlsState {
     host_bp: Cell<*mut u128>,
     guest_context_top: Cell<*mut litebox_common_linux::PtRegs>,
     scratch: Cell<usize>,
+    scratch2: Cell<usize>,
+    teb_arbitrary_user_pointer: Cell<usize>,
     /// Syscall call-site restart address from the rewriter trampoline,
     /// saved here for future SA_RESTART support. Not stored in pt_regs
     /// (which holds RFLAGS in the r11 slot per the kernel ABI).
@@ -437,6 +439,8 @@ impl TlsState {
             host_bp: Cell::new(core::ptr::null_mut()),
             guest_context_top: core::ptr::null_mut::<litebox_common_linux::PtRegs>().into(),
             scratch: 0.into(),
+            scratch2: 0.into(),
+            teb_arbitrary_user_pointer: 0.into(),
             saved_restart_addr: 0.into(),
             is_in_guest: false.into(),
             interrupt: false.into(),
@@ -549,6 +553,8 @@ unsafe extern "C-unwind" fn run_thread_arch(thread_ctx: &mut ThreadContext, tls_
     // Save the host rsp and rbp into the TLS state.
     mov     QWORD PTR [rdx + {HOST_SP}], rsp
     mov     QWORD PTR [rdx + {HOST_BP}], rbp
+    mov     rax, QWORD PTR gs:[0x28]
+    mov     QWORD PTR [rdx + {TEB_ARBITRARY_USER_POINTER}], rax
 
     call {init_handler}
     jmp .Ldone
@@ -564,20 +570,22 @@ unsafe extern "C-unwind" fn run_thread_arch(thread_ctx: &mut ThreadContext, tls_
 syscall_callback_redzone:
     // Save guest R11 (restart address from rewriter trampoline) to
     // TEB.ArbitraryUserPointer (gs:[0x28]) before the TLS index lookup
-    // clobbers R11.  This slot is per-thread and the window is very
-    // narrow: only ~20 instructions of inline asm with no API calls,
-    // no Rust code, and no DLL activity, so the ntdll loader (which
-    // also uses this slot for debugger communication) cannot interfere.
+    // clobbers R11. This slot is per-thread and the window is very narrow:
+    // only inline asm with no API calls, Rust code, or DLL activity.
     mov     gs:[0x28], r11
     // Get the TLS state from the TLS slot and clear the in-guest flag.
     mov     r11d, DWORD PTR [rip + {TLS_INDEX}]
     mov     r11, QWORD PTR gs:[r11 * 8 + TEB_TLS_SLOTS_OFFSET]
     mov     BYTE PTR [r11 + {IS_IN_GUEST}], 0
-    // Recover the restart address from the TEB slot and store it in TLS.
-    // We use SCRATCH as a temporary since all guest GPRs must be preserved
-    // and RSP modifications would break the stack pointer recovery below.
-    push    QWORD PTR gs:[0x28]
-    pop     QWORD PTR [r11 + {SAVED_RESTART_ADDR}]
+    // Recover the restart address from the TEB slot and store it in TLS
+    // without touching the guest stack. RAX is saved in a dedicated TLS
+    // scratch slot for this tiny window, then restored before pt_regs capture.
+    mov     QWORD PTR [r11 + {SCRATCH2}], rax
+    mov     rax, QWORD PTR gs:[0x28]
+    mov     QWORD PTR [r11 + {SAVED_RESTART_ADDR}], rax
+    mov     rax, QWORD PTR [r11 + {TEB_ARBITRARY_USER_POINTER}]
+    mov     QWORD PTR gs:[0x28], rax
+    mov     rax, QWORD PTR [r11 + {SCRATCH2}]
     // Recover the architectural guest stack pointer (undo the 128-byte
     // red zone reservation) and store it in SCRATCH.  LEA is used instead
     // of ADD to avoid clobbering RFLAGS before pushfq.
@@ -669,6 +677,8 @@ interrupt_callback:
     HOST_BP = const core::mem::offset_of!(TlsState, host_bp),
     GUEST_CONTEXT_TOP = const core::mem::offset_of!(TlsState, guest_context_top),
     SCRATCH = const core::mem::offset_of!(TlsState, scratch),
+    SCRATCH2 = const core::mem::offset_of!(TlsState, scratch2),
+    TEB_ARBITRARY_USER_POINTER = const core::mem::offset_of!(TlsState, teb_arbitrary_user_pointer),
     SAVED_RESTART_ADDR = const core::mem::offset_of!(TlsState, saved_restart_addr),
     IS_IN_GUEST = const core::mem::offset_of!(TlsState, is_in_guest),
     );
