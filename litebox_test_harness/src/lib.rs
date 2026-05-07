@@ -248,9 +248,9 @@ pub fn non_pie_static_musl_binary() -> String {
              (Docker) or as a sibling of current exe. Build with \
              `rustup target add x86_64-unknown-linux-musl && \
              RUSTFLAGS=\"-C link-args=-no-pie -C \
-             target-feature=+crt-static\" cargo rustc -p \
-             litebox_test_harness --bin litebox_test_harness \
-             --target-dir target/non-pie-static-musl \
+             target-feature=+crt-static -C relocation-model=static\" \
+             cargo rustc -p litebox_test_harness --bin \
+             litebox_test_harness --target-dir target/non-pie-static-musl \
              --target x86_64-unknown-linux-musl`."
         )
     })

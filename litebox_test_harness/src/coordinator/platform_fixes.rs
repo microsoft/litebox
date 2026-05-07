@@ -24,7 +24,6 @@ const DEPTH_AGENTS: &[AgentName] = &[AgentName::A, AgentName::AA];
 const FAMILIES: &[&str] = &["ipv4", "ipv6"];
 
 const EXIT_SIZES: &[usize] = &[256, 4096, 65536];
-const EXIT_BINARIES: &[&str] = &["pie", "nonpie"];
 
 const NPIPE_REPS: &[usize] = &[1, 5, 10];
 
@@ -123,28 +122,23 @@ pub(crate) fn register_pipe_pair_id_tests(reg: &mut Registry<'_>) {
 
 pub(crate) fn register_exit_data_integrity_tests(reg: &mut Registry<'_>) {
     for &size in EXIT_SIZES {
-        for &binary in EXIT_BINARIES {
+        for &binary in crate::BinaryType::ALL {
             for &agent in DEPTH_AGENTS {
                 let agent_s = agent.to_string();
-                let binary_s = binary.to_string();
+                let binary_label = binary.label();
                 reg.test(
                     "fork",
                     "exit_data_integrity",
-                    format!("EXITD.{size}.{binary}.{agent}"),
+                    format!("EXITD.{size}.{binary_label}.{agent}"),
                 )
                 .timeout(60)
                 .build(move |cx| {
                     let handle = cx.require(agent);
                     Box::new(move |run| {
                         let a = agent_s.clone();
-                        let b = binary_s.clone();
                         let self_exe = run.self_exe().to_string();
                         Box::pin(async move {
-                            let bin_path = match b.as_str() {
-                                "pie" => self_exe,
-                                "nonpie" => crate::nonpie_binary(),
-                                _ => unreachable!(),
-                            };
+                            let bin_path = crate::binary_path(binary, &self_exe);
                             let resp = run
                                 .send(
                                     &handle,

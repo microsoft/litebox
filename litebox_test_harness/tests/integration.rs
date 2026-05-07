@@ -550,7 +550,10 @@ fn ensure_binaries_built(ws_root: &Path) {
         "non-PIE-static-musl",
         &td.join("non-pie-static-musl"),
         Some("x86_64-unknown-linux-musl"),
-        Some("-C link-args=-no-pie -C target-feature=+crt-static"),
+        Some(
+            "-C link-args=-no-pie -C target-feature=+crt-static \
+             -C relocation-model=static",
+        ),
         None,
     );
 }
