@@ -17,6 +17,24 @@ fn default_marker_stream() -> String {
     "either".to_string()
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SockOpt {
+    ReuseAddr,
+    ReusePort,
+    KeepAlive,
+    RecvBuf,
+    SendBuf,
+    NoDelay,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum SockOptValue {
+    Bool(bool),
+    U32(u32),
+}
+
 /// Command sent from parent to child via stdin.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "cmd")]
@@ -118,7 +136,14 @@ pub enum Command {
 
     /// Bind a TCP listener on the given port. Starts an echo handler.
     #[serde(rename = "net_listen")]
-    NetListen { port: u16 },
+    NetListen {
+        port: u16,
+        pre_bind_options: Vec<(SockOpt, SockOptValue)>,
+    },
+
+    /// Return per-listener accept counts for a listening TCP port.
+    #[serde(rename = "net_listener_stats")]
+    NetListenerStats { port: u16 },
 
     /// Stop listening on a port.
     #[serde(rename = "net_unlisten")]
@@ -143,6 +168,18 @@ pub enum Command {
     /// Close and unregister a TCP connection.
     #[serde(rename = "net_close")]
     NetClose { conn: u64 },
+
+    /// Set a socket option on a registered TCP connection.
+    #[serde(rename = "net_set_sockopt")]
+    NetSetSockOpt {
+        conn: u64,
+        option: SockOpt,
+        value: SockOptValue,
+    },
+
+    /// Get a socket option from a registered TCP connection.
+    #[serde(rename = "net_get_sockopt")]
+    NetGetSockOpt { conn: u64, option: SockOpt },
 
     /// Open `pidfd_open(pid)` and add that pidfd to a registered epoll instance.
     #[serde(rename = "epoll_add_pidfd")]
@@ -495,6 +532,14 @@ pub enum Response {
     /// Stateful TCP connection closed.
     #[serde(rename = "closed")]
     Closed,
+
+    /// Socket option value returned by `NetGetSockOpt`.
+    #[serde(rename = "sockopt_result")]
+    SockOptResult { value: SockOptValue },
+
+    /// Per-listener accept counts for a TCP port.
+    #[serde(rename = "listener_stats")]
+    ListenerStats { counts: Vec<u64> },
 
     /// Eventfd registry handle.
     #[serde(rename = "eventfd_handle")]

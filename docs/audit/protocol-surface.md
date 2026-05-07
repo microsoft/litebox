@@ -91,7 +91,7 @@ A backwards-compatible first pass can keep `Response::Ok` for `Fork` and use exi
 
 ```rust
 let port = free_port();
-assert!(matches!(send(A, Command::NetListen { port }).await, Response::Listening { port: p } if p == port));
+assert!(matches!(send(A, Command::NetListen { port, pre_bind_options: vec![] }).await, Response::Listening { port: p } if p == port));
 assert_ok(send(A, Command::Fork {
     name: "A_inherit".into(),
     binary: "self".into(),
@@ -449,7 +449,7 @@ Do **not** put an optional echo into `NetSend`: echo is server behavior and shou
 ### example test sketch
 
 ```rust
-assert_listening(send(A, Command::NetListen { port }).await);
+assert_listening(send(A, Command::NetListen { port, pre_bind_options: vec![] }).await);
 let conn = expect_open(send(B, Command::NetOpen { addr: format!("127.0.0.1:{port}") }).await);
 assert_sent(send(B, Command::NetSend { conn, data: b"one".to_vec() }).await, 3);
 assert_eq!(expect_recv(send(B, Command::NetRecv { conn, n_bytes: Some(3), timeout_ms: Some(5000) }).await).data, b"one");
@@ -558,7 +558,7 @@ No single shape; this is cleanup tied to the additions above. Prefer explicit re
 ### example test sketch
 
 ```rust
-let resp = send(A, Command::NetListen { port: 0 }).await;
+let resp = send(A, Command::NetListen { port: 0, pre_bind_options: vec![] }).await;
 let actual = match resp {
     Response::Listening { port } if port != 0 => port,
     other => panic!("expected assigned listening port, got {other:?}"),
