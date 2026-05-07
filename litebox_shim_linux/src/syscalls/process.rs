@@ -1038,6 +1038,7 @@ impl<FS: ShimFS> Task<FS> {
         // The `Task` will be dropped on the way out of the shim, which will
         // call `self.prepare_for_exit()`.
         self.exit_thread(status.truncate());
+        self.local_task_terminated.set(true);
     }
 
     fn reject_remote_running_process_control(
@@ -1855,7 +1856,11 @@ impl<FS: ShimFS> Task<FS> {
 
         if set_tid != 0 || set_tid_size != 0 {
             log_unsupported!("clone with set_tid");
-            return Err(Errno::EINVAL);
+            return Err(Errno::ENOSYS);
+        }
+        if clone3 && flags.contains(CloneFlags::PIDFD) {
+            log_unsupported!("clone3 with pidfd");
+            return Err(Errno::ENOSYS);
         }
 
         // Note `exit_signal` is ignored for threads; validated for fork.
@@ -2000,6 +2005,10 @@ impl<FS: ShimFS> Task<FS> {
         if (stack == 0 && stack_size != 0) || (stack != 0 && clone3 && stack_size == 0) {
             return Err(Errno::EINVAL);
         }
+        if clone3 && stack == 0 {
+            log_unsupported!("clone3 thread without child stack");
+            return Err(Errno::ENOSYS);
+        }
         let sp = if stack != 0 {
             let stack: usize = stack.truncate();
             Some(stack.wrapping_add(stack_size.truncate()))
@@ -2024,6 +2033,11 @@ impl<FS: ShimFS> Task<FS> {
             set_child_tid,
         });
         thread.clear_child_tid.set(clear_child_tid);
+
+        self.process_state
+            .borrow()
+            .thread_count
+            .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
 
         let r = unsafe {
             self.global.platform.spawn_thread(
@@ -2063,17 +2077,16 @@ impl<FS: ShimFS> Task<FS> {
             )
         };
         if let Err(err) = r {
+            self.process_state
+                .borrow()
+                .thread_count
+                .fetch_sub(1, core::sync::atomic::Ordering::Relaxed);
             litebox::log_println!(self.global.platform, "failed to spawn thread: {}", err);
             // Treat all spawn errors as `ENOMEM`. `EAGAIN` and other errors are
             // for conditions the user can control (such as "in-shim" rlimit
             // violations).
             return Err(Errno::ENOMEM);
         }
-
-        self.process_state
-            .borrow()
-            .thread_count
-            .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
 
         Ok(usize::try_from(child_tid).unwrap())
     }

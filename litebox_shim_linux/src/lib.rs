@@ -2235,6 +2235,7 @@ impl<FS: ShimFS> Task<FS> {
             }
         }
 
+        let is_thread_exit = ctx.orig_rax == ::syscalls::Sysno::exit as usize;
         let return_value = match self.do_syscall(ctx) {
             Ok(v) => {
                 #[cfg(feature = "trace_syscalls")]
@@ -2259,6 +2260,11 @@ impl<FS: ShimFS> Task<FS> {
                 (err.as_neg() as isize).reinterpret_as_unsigned()
             }
         };
+
+        if is_thread_exit {
+            self.local_task_terminated.set(true);
+            return;
+        }
 
         #[cfg(target_arch = "x86")]
         {
