@@ -345,211 +345,150 @@ impl TestRunner {
     /// test actually asked for — minimal-repro shape (single-test
     /// filters spawn just the path that test uses).
     async fn spawn_tree(&mut self, needed: &std::collections::BTreeSet<agents::AgentName>) {
-        use agents::AgentName::{A, AA, AAA, AAB, AB, B, BB, D3, D4, D5, E, EE, NP, NPC};
         // `Init` is the coordinator itself — always available; record
         // it as "spawned" so the validator doesn't false-flag tests
         // that route to it via cx.fs_read / Command::FsRead.
         self.spawned_agents.insert("init".to_string());
-        // Top-level direct children of the coordinator.
-        for top in [A, B, E] {
-            if needed.contains(&top) {
-                self.spawned_agents.insert(top.name().to_string());
-                match spawn_child(&self.self_exe) {
-                    Ok(child) => {
-                        self.children.insert(top.name().to_string(), child);
-                    }
-                    Err(e) => eprintln!("[coord] spawn {} failed: {e}", top.name()),
+
+        // The canonical agent tree is declared as a list of
+        // `AgentSpec`s in `coordinator/agents.rs::default_tree()`.
+        // Walk that list in spec order (which is already topological
+        // — parents precede children) and spawn each agent the test
+        // set asks for. This replaces the previous hardcoded
+        // per-agent match arms.
+        let specs = agents::default_tree();
+
+        // Top-level (parent is None): direct children of the
+        // coordinator. Spawned via the local `spawn_child` helper
+        // (an OS fork of `self_exe`); no protocol command involved.
+        // PIE is the only supported binary for top-level today;
+        // non-PIE top-level would require additional wiring.
+        for spec in specs.iter().filter(|s| s.parent.is_none()) {
+            if !needed.contains(&spec.name) {
+                continue;
+            }
+            self.spawned_agents.insert(spec.name.name().to_string());
+            match spawn_child(&self.self_exe) {
+                Ok(child) => {
+                    self.children.insert(spec.name.name().to_string(), child);
                 }
+                Err(e) => eprintln!("[coord] spawn {} failed: {e}", spec.name.name()),
             }
         }
 
-        // PIE descendants. Group by parent so we can batch a single
-        // Spawn command per parent.
-        let mut a_pie_kids: Vec<String> = Vec::new();
-        if needed.contains(&AA) {
-            a_pie_kids.push(AA.name().to_string());
-        }
-        if needed.contains(&AB) {
-            a_pie_kids.push(AB.name().to_string());
-        }
-        if !a_pie_kids.is_empty() && needed.contains(&A) {
-            for k in &a_pie_kids {
-                self.spawned_agents.insert(k.clone());
-            }
-            let r = self
-                .send(
-                    "A",
-                    Command::Spawn {
-                        children: a_pie_kids.clone(),
-                    },
-                )
-                .await;
-            eprintln!("[coord] A spawn {a_pie_kids:?}: {r:?}");
-        }
-
-        let mut b_pie_kids: Vec<String> = Vec::new();
-        if needed.contains(&BB) {
-            b_pie_kids.push(BB.name().to_string());
-        }
-        if !b_pie_kids.is_empty() && needed.contains(&B) {
-            for k in &b_pie_kids {
-                self.spawned_agents.insert(k.clone());
-            }
-            let r = self
-                .send(
-                    "B",
-                    Command::Spawn {
-                        children: b_pie_kids.clone(),
-                    },
-                )
-                .await;
-            eprintln!("[coord] B spawn {b_pie_kids:?}: {r:?}");
-        }
-
-        let mut grandkids: Vec<String> = Vec::new();
-        if needed.contains(&AAA) {
-            grandkids.push(AAA.name().to_string());
-        }
-        if needed.contains(&AAB) {
-            grandkids.push(AAB.name().to_string());
-        }
-        if !grandkids.is_empty() && needed.contains(&AA) {
-            for k in &grandkids {
-                self.spawned_agents.insert(k.clone());
-            }
-            let r = self
-                .send(
-                    "AA",
-                    Command::Spawn {
-                        children: grandkids.clone(),
-                    },
-                )
-                .await;
-            eprintln!("[coord] AA spawn {grandkids:?}: {r:?}");
-        }
-
-        if needed.contains(&BB) && needed.contains(&B) {
-            self.spawned_agents.insert(BB.name().to_string());
-            let r = self
-                .send(
-                    "B",
-                    Command::Spawn {
-                        children: vec![BB.name().to_string()],
-                    },
-                )
-                .await;
-            eprintln!("[coord] B spawn BB: {r:?}");
-        }
-
-        if needed.contains(&EE) && needed.contains(&E) {
-            self.spawned_agents.insert(EE.name().to_string());
-            let r = self
-                .send(
-                    "E",
-                    Command::Spawn {
-                        children: vec![EE.name().to_string()],
-                    },
-                )
-                .await;
-            eprintln!("[coord] E spawn EE: {r:?}");
-        }
-
-        // Non-PIE subtree: NP/NPC under A; D3 (PIE) → D4 (non-PIE) →
-        // D5 (PIE) under AA. Wrapped in a 30s timeout to catch the
-        // known NP→NPC pipe-bridge hang under litebox.
-        let needs_nonpie = [NP, NPC, D3, D4, D5].iter().any(|a| needed.contains(a));
+        // Non-top-level agents grouped by (parent, binary) so we can
+        // batch a single Spawn / SpawnRemote per parent in the common
+        // case. The non-PIE arm is wrapped in a 30s timeout because
+        // SpawnRemote can hang under litebox if pipe-bridge state
+        // gets out of sync.
+        let needs_nonpie = specs
+            .iter()
+            .any(|s| needed.contains(&s.name) && s.binary == agents::AgentBinary::NonPie);
         if needs_nonpie {
             // Required dependency: panic now with a clear message
             // rather than silently failing later with confusing
-            // "no child NP" routing errors.
+            // routing errors.
             let _ = crate::nonpie_binary();
-            for &n in &[NP, NPC, D3, D4, D5] {
+        }
+
+        // PIE descendants first (synchronous, fast).
+        self.spawn_pie_descendants(needed, &specs).await;
+
+        // Non-PIE descendants in a timeout (slower, can hang).
+        if needs_nonpie {
+            for &n in &specs
+                .iter()
+                .filter(|s| s.binary == agents::AgentBinary::NonPie)
+                .map(|s| s.name)
+                .collect::<Vec<_>>()
+            {
                 if needed.contains(&n) {
                     self.spawned_agents.insert(n.name().to_string());
                 }
             }
-            if tokio::time::timeout(Duration::from_secs(30), self.spawn_nonpie_subtree(needed))
-                .await
-                .is_err()
+            // Also pre-mark any PIE children of non-PIE parents
+            // (they're spawned in `spawn_nonpie_descendants` after
+            // their non-PIE ancestor is up).
+            for spec in &specs {
+                if needed.contains(&spec.name) && depends_on_nonpie(spec.name, &specs) {
+                    self.spawned_agents.insert(spec.name.name().to_string());
+                }
+            }
+            if tokio::time::timeout(
+                Duration::from_secs(30),
+                self.spawn_nonpie_descendants(needed, &specs),
+            )
+            .await
+            .is_err()
             {
                 eprintln!("[coord] non-PIE subtree setup timed out (30s, likely pipe bridge bug)");
             }
         }
     }
 
-    /// Spawn the non-PIE descendants requested in `needed`.
-    async fn spawn_nonpie_subtree(
+    /// Spawn the PIE descendants requested in `needed` whose entire
+    /// ancestor chain is also PIE (i.e. spawnable via plain
+    /// `Command::Spawn` chained through `Forward`s).
+    async fn spawn_pie_descendants(
         &mut self,
         needed: &std::collections::BTreeSet<agents::AgentName>,
+        specs: &[agents::AgentSpec],
     ) {
-        use agents::AgentName::{D3, D4, D5, NP, NPC};
-        if needed.contains(&NP) {
+        for spec in specs {
+            if spec.parent.is_none()
+                || spec.binary != agents::AgentBinary::Pie
+                || depends_on_nonpie(spec.name, specs)
+            {
+                continue;
+            }
+            if !needed.contains(&spec.name) {
+                continue;
+            }
+            self.spawned_agents.insert(spec.name.name().to_string());
+            let parent = spec.parent.expect("non-top-level has parent");
+            // `send` routing wraps the command in `Forward`
+            // envelopes as needed to reach `parent` from the
+            // top-level child.
             let r = self
                 .send(
-                    "A",
-                    Command::SpawnRemote {
-                        children: vec![NP.name().to_string()],
-                    },
-                )
-                .await;
-            eprintln!("[coord] SpawnRemote NP: {r:?}");
-        }
-        if needed.contains(&NPC) {
-            let r = self
-                .send(
-                    "A",
-                    Command::Forward {
-                        target: NP.name().to_string(),
-                        inner: Box::new(Command::Spawn {
-                            children: vec![NPC.name().to_string()],
-                        }),
-                    },
-                )
-                .await;
-            eprintln!("[coord] NP spawn NPC: {r:?}");
-        }
-        // Deep mixed chain: AA → D3 (PIE) → D4 (non-PIE) → D5 (PIE)
-        if needed.contains(&D3) {
-            let r = self
-                .send(
-                    "AA",
+                    parent.name(),
                     Command::Spawn {
-                        children: vec![D3.name().to_string()],
+                        children: vec![spec.name.name().to_string()],
                     },
                 )
                 .await;
-            eprintln!("[coord] AA spawn D3: {r:?}");
+            eprintln!("[coord] spawn {}: {r:?}", spec.name.name());
         }
-        if needed.contains(&D4) {
-            let r = self
-                .send(
-                    "AA",
-                    Command::Forward {
-                        target: D3.name().to_string(),
-                        inner: Box::new(Command::SpawnRemote {
-                            children: vec![D4.name().to_string()],
-                        }),
-                    },
-                )
-                .await;
-            eprintln!("[coord] D3 SpawnRemote D4: {r:?}");
-        }
-        if needed.contains(&D5) {
-            let r = self
-                .send(
-                    "AA",
-                    Command::Forward {
-                        target: D3.name().to_string(),
-                        inner: Box::new(Command::Forward {
-                            target: D4.name().to_string(),
-                            inner: Box::new(Command::Spawn {
-                                children: vec![D5.name().to_string()],
-                            }),
-                        }),
-                    },
-                )
-                .await;
-            eprintln!("[coord] D4 spawn D5: {r:?}");
+    }
+
+    /// Spawn the non-PIE-flavored descendants and any PIE children
+    /// rooted under them. Wrapped in a 30s timeout by the caller.
+    async fn spawn_nonpie_descendants(
+        &mut self,
+        needed: &std::collections::BTreeSet<agents::AgentName>,
+        specs: &[agents::AgentSpec],
+    ) {
+        for spec in specs {
+            if spec.parent.is_none() || !needed.contains(&spec.name) {
+                continue;
+            }
+            let nonpie_self = spec.binary == agents::AgentBinary::NonPie;
+            let nonpie_chain = depends_on_nonpie(spec.name, specs);
+            if !nonpie_self && !nonpie_chain {
+                continue;
+            }
+            let inner = if nonpie_self {
+                Command::SpawnRemote {
+                    children: vec![spec.name.name().to_string()],
+                }
+            } else {
+                Command::Spawn {
+                    children: vec![spec.name.name().to_string()],
+                }
+            };
+            let parent = spec.parent.expect("non-top-level has parent");
+            let r = self.send(parent.name(), inner).await;
+            eprintln!("[coord] spawn {} (non-PIE chain): {r:?}", spec.name.name());
         }
     }
 
@@ -741,6 +680,23 @@ impl TestRunner {
             },
         }
     }
+}
+
+/// Return true iff `agent`'s ancestor chain (excluding `agent`
+/// itself) contains any non-PIE segment, meaning the spawn must be
+/// routed through the non-PIE timeout-protected path.
+fn depends_on_nonpie(agent: agents::AgentName, specs: &[agents::AgentSpec]) -> bool {
+    let mut cursor = agents::agent_spec(agent).and_then(|s| s.parent);
+    while let Some(p) = cursor {
+        let Some(parent_spec) = specs.iter().find(|s| s.name == p) else {
+            return false;
+        };
+        if parent_spec.binary == agents::AgentBinary::NonPie {
+            return true;
+        }
+        cursor = parent_spec.parent;
+    }
+    false
 }
 
 /// Dispatch a single test group to the appropriate async test function.

@@ -115,6 +115,188 @@ impl AgentName {
             AgentName::EE => &[AgentName::E],
         }
     }
+
+    /// Direct parent in the canonical spawn tree, or `None` for
+    /// top-level agents (direct children of the coordinator).
+    #[allow(dead_code)] // Used by tree migration as callers shift
+    // from hard-coded routing to spec-driven.
+    pub const fn parent(self) -> Option<AgentName> {
+        match self {
+            AgentName::Init | AgentName::A | AgentName::B | AgentName::E => None,
+            AgentName::AA | AgentName::AB | AgentName::NP => Some(AgentName::A),
+            AgentName::BB => Some(AgentName::B),
+            AgentName::AAA | AgentName::AAB | AgentName::D3 => Some(AgentName::AA),
+            AgentName::NPC => Some(AgentName::NP),
+            AgentName::D4 => Some(AgentName::D3),
+            AgentName::D5 => Some(AgentName::D4),
+            AgentName::EE => Some(AgentName::E),
+        }
+    }
+}
+
+/// Whether a spawned agent is part of the standard tree (the
+/// coordinator expects it to stay alive for the whole run) or a
+/// disposable subtree (the SK family `SIGKILL`s these and the
+/// coordinator should not flag the disappearance).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum IsolationKind {
+    Standard,
+    DisposableSubtree,
+}
+
+/// Binary-type axis a spawned agent runs as. Mirrors
+/// [`crate::BinaryType`] but kept here to avoid a public module
+/// re-export. The two enums are kept in sync by the From/Into impls
+/// on the coordinator side.
+///
+/// The coordinator translates `Pie` to `Command::Spawn`, `NonPie` to
+/// `Command::SpawnRemote`, and the static-PIE / musl variants to the
+/// appropriate binary-type-bridged spawn path.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[allow(dead_code)] // Static-PIE / musl variants are referenced as the
+// tree migrates per-test-family from hard-coded
+// NP/D3-D5 callers to spec-driven binary types.
+pub enum AgentBinary {
+    Pie,
+    NonPie,
+    StaticPieGlibc,
+    StaticPieMusl,
+    NonPieStaticMusl,
+}
+
+/// Declarative spec for one agent in the canonical spawn tree.
+///
+/// `spawn_tree` walks the list of specs in topological order
+/// (parents before children) and spawns each via the appropriate
+/// `Command::Spawn` / `Command::SpawnRemote` (wrapped in `Forward`s
+/// to reach non-direct ancestors as needed).
+#[derive(Clone, Debug)]
+pub struct AgentSpec {
+    pub name: AgentName,
+    pub parent: Option<AgentName>,
+    pub binary: AgentBinary,
+    /// Whether the SK family considers this agent disposable. Read
+    /// by the validator (added in a follow-up wave); allow-dead in
+    /// the meantime.
+    #[allow(dead_code)]
+    pub isolation: IsolationKind,
+}
+
+/// The default agent tree the coordinator can spawn from. Each entry
+/// records a structural agent name plus its binary type and
+/// isolation flavor. `spawn_tree` filters by which agents the running
+/// test set actually needs.
+///
+/// **Legacy names retained as compatibility shims.** `NP`/`NPC`/`D3`/
+/// `D4`/`D5` are spelled out here with their original
+/// (parent, binary) tuples so callers continue to compile without
+/// change while individual coordinator files migrate to the
+/// pure-structural taxonomy. Once all callers are migrated, these
+/// entries (and the corresponding enum variants) are removed.
+#[must_use]
+pub fn default_tree() -> Vec<AgentSpec> {
+    use AgentBinary::{NonPie, Pie};
+    use IsolationKind::{DisposableSubtree, Standard};
+
+    vec![
+        // ── Standard-tree top level ─────────────────────────────────
+        AgentSpec {
+            name: AgentName::A,
+            parent: None,
+            binary: Pie,
+            isolation: Standard,
+        },
+        AgentSpec {
+            name: AgentName::B,
+            parent: None,
+            binary: Pie,
+            isolation: Standard,
+        },
+        // ── Standard-tree depth-2 ───────────────────────────────────
+        AgentSpec {
+            name: AgentName::AA,
+            parent: Some(AgentName::A),
+            binary: Pie,
+            isolation: Standard,
+        },
+        AgentSpec {
+            name: AgentName::AB,
+            parent: Some(AgentName::A),
+            binary: Pie,
+            isolation: Standard,
+        },
+        AgentSpec {
+            name: AgentName::BB,
+            parent: Some(AgentName::B),
+            binary: Pie,
+            isolation: Standard,
+        },
+        // ── Standard-tree depth-3 ───────────────────────────────────
+        AgentSpec {
+            name: AgentName::AAA,
+            parent: Some(AgentName::AA),
+            binary: Pie,
+            isolation: Standard,
+        },
+        AgentSpec {
+            name: AgentName::AAB,
+            parent: Some(AgentName::AA),
+            binary: Pie,
+            isolation: Standard,
+        },
+        // ── Disposable subtree (SK family SIGKILLs these) ───────────
+        AgentSpec {
+            name: AgentName::E,
+            parent: None,
+            binary: Pie,
+            isolation: DisposableSubtree,
+        },
+        AgentSpec {
+            name: AgentName::EE,
+            parent: Some(AgentName::E),
+            binary: Pie,
+            isolation: DisposableSubtree,
+        },
+        // ── Legacy compat shims (to be migrated) ────────────────────
+        AgentSpec {
+            name: AgentName::NP,
+            parent: Some(AgentName::A),
+            binary: NonPie,
+            isolation: Standard,
+        },
+        AgentSpec {
+            name: AgentName::NPC,
+            parent: Some(AgentName::NP),
+            binary: Pie,
+            isolation: Standard,
+        },
+        AgentSpec {
+            name: AgentName::D3,
+            parent: Some(AgentName::AA),
+            binary: Pie,
+            isolation: Standard,
+        },
+        AgentSpec {
+            name: AgentName::D4,
+            parent: Some(AgentName::D3),
+            binary: NonPie,
+            isolation: Standard,
+        },
+        AgentSpec {
+            name: AgentName::D5,
+            parent: Some(AgentName::D4),
+            binary: Pie,
+            isolation: Standard,
+        },
+    ]
+}
+
+/// Look up an `AgentSpec` by name in the default tree. Returns
+/// `None` for `Init` (which is the coordinator itself, not a spawned
+/// agent).
+#[must_use]
+pub fn agent_spec(name: AgentName) -> Option<AgentSpec> {
+    default_tree().into_iter().find(|s| s.name == name)
 }
 
 impl fmt::Display for AgentName {
