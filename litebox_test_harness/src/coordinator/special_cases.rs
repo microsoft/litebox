@@ -522,6 +522,7 @@ pub(super) fn register_stdin_script(reg: &mut Registry<'_>) {
                                     timeout_secs: Some(10),
                                     stdin: Some(script),
                                     background: false,
+                                    env: vec![],
                                 },
                             )
                             .await;
@@ -629,6 +630,7 @@ fn xsi_exec(script: &'static str) -> Command {
         timeout_secs: Some(10),
         stdin: Some(script.into()),
         background: false,
+        env: vec![],
     }
 }
 

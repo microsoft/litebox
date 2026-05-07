@@ -778,6 +778,7 @@ async fn run_tlb_listen_busy_case(
                 timeout_secs: Some(delay_secs + 5),
                 stdin: None,
                 background: false,
+                env: vec![],
             },
         )
         .await;
@@ -1126,23 +1127,18 @@ pub(crate) fn register_minimal_canary_tests(reg: &mut Registry<'_>) {
                             Box::pin(async move {
                                 let target = crate::binary_path(target_bt, &self_exe);
                                 // Inject the target binary path into
-                                // the M subcommand via the env var
-                                // `LITEBOX_M_TARGET_BINARY`. Wrapping
-                                // with `/usr/bin/env` lets us set the
-                                // variable without extending the
-                                // Exec protocol.
+                                // the M/BS subcommand via the
+                                // `LITEBOX_M_TARGET_BINARY` env var.
                                 let resp = run
                                     .send(
                                         &handle,
-                                        super::exec_timeout(
-                                            vec![
-                                                "/usr/bin/env".into(),
-                                                format!("LITEBOX_M_TARGET_BINARY={target}"),
-                                                self_exe,
-                                                sc,
-                                            ],
-                                            timeout_secs,
-                                        ),
+                                        Command::Exec {
+                                            args: vec![self_exe, sc],
+                                            timeout_secs: Some(timeout_secs),
+                                            stdin: None,
+                                            background: false,
+                                            env: vec![("LITEBOX_M_TARGET_BINARY".into(), target)],
+                                        },
                                     )
                                     .await;
                                 let pass = matches!(
@@ -1224,6 +1220,7 @@ pub(crate) fn register_stdin_pipe_subst_tests(reg: &mut Registry<'_>) {
                                         timeout_secs: Some(15),
                                         stdin: Some(s),
                                         background: false,
+                                        env: vec![],
                                     },
                                 )
                                 .await;
@@ -1323,6 +1320,7 @@ pub(crate) fn register_cross_worker_file_tests(reg: &mut Registry<'_>) {
                                     timeout_secs: None,
                                     stdin: None,
                                     background: true,
+                                    env: vec![],
                                 },
                             )
                             .await;
@@ -1378,6 +1376,7 @@ pub(crate) fn register_cross_worker_file_tests(reg: &mut Registry<'_>) {
                                         timeout_secs: None,
                                         stdin: None,
                                         background: true,
+                                        env: vec![],
                                     },
                                 )
                                 .await;
@@ -1442,6 +1441,7 @@ pub(crate) fn register_cross_worker_file_tests(reg: &mut Registry<'_>) {
                                     timeout_secs: Some(15),
                                     stdin: None,
                                     background: false,
+                                    env: vec![],
                                 },
                             )
                             .await;
@@ -1491,6 +1491,7 @@ pub(crate) fn register_cross_worker_file_tests(reg: &mut Registry<'_>) {
                                     timeout_secs: Some(15),
                                     stdin: None,
                                     background: false,
+                                    env: vec![],
                                 },
                             )
                             .await;
@@ -1539,6 +1540,7 @@ pub(crate) fn register_cross_worker_file_tests(reg: &mut Registry<'_>) {
                                     timeout_secs: Some(15),
                                     stdin: None,
                                     background: false,
+                                    env: vec![],
                                 },
                             )
                             .await;
@@ -1584,6 +1586,7 @@ pub(crate) fn register_cross_worker_file_tests(reg: &mut Registry<'_>) {
                                     timeout_secs: Some(10),
                                     stdin: None,
                                     background: false,
+                                    env: vec![],
                                 },
                             )
                             .await;
@@ -1678,6 +1681,7 @@ pub(crate) fn register_subst_capture_tests(reg: &mut Registry<'_>) {
                                         timeout_secs: Some(10),
                                         stdin: None,
                                         background: false,
+                                        env: vec![],
                                     },
                                 )
                                 .await;
@@ -1754,6 +1758,7 @@ pub(crate) fn register_concurrent_fork_tests(reg: &mut Registry<'_>) {
                                         timeout_secs: None,
                                         stdin: None,
                                         background: true,
+                                        env: vec![],
                                     },
                                 )
                                 .await;
@@ -1866,6 +1871,7 @@ pub(crate) fn register_touch_redirect_tests(reg: &mut Registry<'_>) {
                                         timeout_secs: Some(10),
                                         stdin: None,
                                         background: false,
+                                        env: vec![],
                                     },
                                 )
                                 .await;
@@ -2027,6 +2033,7 @@ pub(crate) fn register_pid_visibility_tests(reg: &mut Registry<'_>) {
                                         timeout_secs: Some(15),
                                         stdin: None,
                                         background: false,
+                                        env: vec![],
                                     },
                                 )
                                 .await;
@@ -2124,6 +2131,7 @@ fn kpx_observe_proc_cmd(pid: u32) -> Command {
         timeout_secs: Some(10),
         stdin: None,
         background: false,
+        env: vec![],
     }
 }
 
@@ -2292,6 +2300,7 @@ pub(crate) fn register_file_redirect_tests(reg: &mut Registry<'_>) {
                                             timeout_secs: Some(10),
                                             stdin: None,
                                             background: false,
+                                            env: vec![],
                                         },
                                     )
                                     .await;
@@ -2341,12 +2350,14 @@ pub(crate) fn register_cli_startup_mimic_tests(reg: &mut Registry<'_>) {
                                         timeout_secs: Some(10),
                                         stdin: None,
                                         background: false,
+                                        env: vec![],
                                     },
                                     "bash_heredoc_pipe" => Command::Exec {
                                         args: vec!["bash".into(), "-s".into()],
                                         timeout_secs: Some(10),
                                         stdin: Some(format!("exec {target} cli-startup-mimic\n")),
                                         background: false,
+                                        env: vec![],
                                     },
                                     _ => unreachable!(),
                                 };
@@ -2457,6 +2468,7 @@ pub(crate) fn register_bg_redirect_poll_tests(reg: &mut Registry<'_>) {
                                             timeout_secs: Some(10),
                                             stdin: None,
                                             background: false,
+                                            env: vec![],
                                         },
                                     )
                                     .await;
@@ -2584,6 +2596,7 @@ pub(crate) fn register_bg_redirect_stdin_poll_tests(reg: &mut Registry<'_>) {
                                                     timeout_secs: Some(10),
                                                     stdin,
                                                     background: false,
+                                                    env: vec![],
                                                 },
                                             )
                                             .await;
@@ -2635,6 +2648,7 @@ pub(crate) fn register_pipe_nonblock_tests(reg: &mut Registry<'_>) {
                                         timeout_secs: Some(10),
                                         stdin: None,
                                         background: false,
+                                        env: vec![],
                                     },
                                 )
                                 .await;
@@ -2680,6 +2694,7 @@ pub(crate) fn register_pipe_nonblock_tests(reg: &mut Registry<'_>) {
                                     timeout_secs: Some(10),
                                     stdin: None,
                                     background: false,
+                                    env: vec![],
                                 },
                             )
                             .await;
@@ -2737,6 +2752,7 @@ pub(crate) fn register_epoll_socket_tests(reg: &mut Registry<'_>) {
                                         timeout_secs: Some(15),
                                         stdin: None,
                                         background: false,
+                                        env: vec![],
                                     },
                                 )
                                 .await;
@@ -2781,6 +2797,7 @@ pub(crate) fn register_epoll_socket_tests(reg: &mut Registry<'_>) {
                                         timeout_secs: Some(15),
                                         stdin: None,
                                         background: false,
+                                        env: vec![],
                                     },
                                 )
                                 .await;
@@ -2890,6 +2907,7 @@ pub(crate) fn register_loopback_tcp_tests(reg: &mut Registry<'_>) {
                                         timeout_secs: Some(15),
                                         stdin: None,
                                         background: false,
+                                        env: vec![],
                                     },
                                 )
                                 .await;
@@ -3057,6 +3075,7 @@ pub(crate) fn register_fork_listen_close_tests(reg: &mut Registry<'_>) {
                             timeout_secs: None,
                             stdin: None,
                             background: true,
+                            env: vec![],
                         },
                     )
                     .await;

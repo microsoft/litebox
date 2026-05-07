@@ -137,6 +137,7 @@ pub(crate) fn exec(args: Vec<String>) -> Command {
         timeout_secs: None,
         stdin: None,
         background: false,
+        env: vec![],
     }
 }
 
@@ -147,6 +148,7 @@ pub(crate) fn exec_timeout(args: Vec<String>, secs: u64) -> Command {
         timeout_secs: Some(secs),
         stdin: None,
         background: false,
+        env: vec![],
     }
 }
 
@@ -691,6 +693,7 @@ fn register_canary(reg: &mut registry::Registry<'_>) {
                         timeout_secs: None,
                         stdin: None,
                         background: false,
+                        env: vec![],
                     };
                     let resp = run.send(&a, canary_cmd).await;
                     let pass = matches!(

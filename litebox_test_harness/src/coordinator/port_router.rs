@@ -271,6 +271,7 @@ fn register_fork_background_tests(reg: &mut Registry<'_>) {
                                 timeout_secs: None,
                                 stdin: None,
                                 background: true,
+                                env: vec![],
                             },
                         )
                         .await;

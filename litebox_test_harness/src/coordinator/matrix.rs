@@ -1706,6 +1706,7 @@ pub(super) fn register_unix_tests(reg: &mut Registry<'_>) {
                                     timeout_secs: None,
                                     stdin: None,
                                     background: true,
+                                    env: vec![],
                                 },
                             )
                             .await;
@@ -1744,6 +1745,7 @@ pub(super) fn register_unix_tests(reg: &mut Registry<'_>) {
                                     timeout_secs: None,
                                     stdin: None,
                                     background: true,
+                                    env: vec![],
                                 },
                             )
                             .await;

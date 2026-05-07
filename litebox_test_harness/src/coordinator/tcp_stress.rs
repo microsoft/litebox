@@ -395,6 +395,7 @@ fn register_tcp_fullduplex_tests(reg: &mut Registry<'_>) {
                                     timeout_secs: Some(30),
                                     stdin: None,
                                     background: true,
+                                    env: vec![],
                                 },
                             )
                             .await;

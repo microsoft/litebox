@@ -157,6 +157,11 @@ pub enum Command {
         /// If true, return Background { pid } immediately instead of waiting.
         #[serde(default)]
         background: bool,
+        /// Extra environment variables to set on the child, on top of
+        /// whatever the agent inherits. List of `(key, value)` pairs.
+        /// Empty means "inherit unchanged".
+        #[serde(default)]
+        env: Vec<(String, String)>,
     },
 
     /// Report an environment variable value.

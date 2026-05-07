@@ -457,6 +457,7 @@ async fn agent_loop(self_exe: &str) {
                 timeout_secs,
                 stdin: stdin_content,
                 background,
+                env,
             } => {
                 if args.is_empty() {
                     respond(&Response::Error {
@@ -469,6 +470,9 @@ async fn agent_loop(self_exe: &str) {
                 let use_piped_stdin = stdin_content.is_some();
                 let mut cmd = tokio::process::Command::new(&args[0]);
                 cmd.args(&args[1..]);
+                for (key, value) in &env {
+                    cmd.env(key, value);
+                }
                 if use_piped_stdin {
                     cmd.stdin(std::process::Stdio::piped());
                 } else {
