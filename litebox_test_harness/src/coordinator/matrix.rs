@@ -66,21 +66,21 @@ pub(crate) enum Topology {
 impl Topology {
     fn agents(self) -> (AgentName, AgentName) {
         match self {
-            Self::InProcess => (AgentName::A, AgentName::A),
-            Self::ParentToChild => (AgentName::Init, AgentName::A),
-            Self::ChildToParent => (AgentName::A, AgentName::Init),
-            Self::Sibling => (AgentName::A, AgentName::B),
-            Self::SiblingReverse => (AgentName::B, AgentName::A),
-            Self::GrandchildUp => (AgentName::AA, AgentName::Init),
-            Self::GreatGrandchildUp => (AgentName::AAA, AgentName::Init),
-            Self::CrossSubtree => (AgentName::B, AgentName::AAA),
-            Self::SiblingDepth2 => (AgentName::AA, AgentName::AB),
-            Self::SiblingDepth3 => (AgentName::AAA, AgentName::AAB),
-            Self::Uncle => (AgentName::AB, AgentName::B),
-            Self::PieToNonPie => (AgentName::A, AgentName::NP),
-            Self::NonPieToParent => (AgentName::NP, AgentName::A),
-            Self::NonPieChildUp => (AgentName::NPC, AgentName::A),
-            Self::DeepNonPie => (AgentName::D5, AgentName::B),
+            Self::InProcess => (AgentName::Dpg1, AgentName::Dpg1),
+            Self::ParentToChild => (AgentName::Init, AgentName::Dpg1),
+            Self::ChildToParent => (AgentName::Dpg1, AgentName::Init),
+            Self::Sibling => (AgentName::Dpg1, AgentName::Dpg2),
+            Self::SiblingReverse => (AgentName::Dpg2, AgentName::Dpg1),
+            Self::GrandchildUp => (AgentName::Dpg1Dpg1, AgentName::Init),
+            Self::GreatGrandchildUp => (AgentName::Dpg1Dpg1Dpg1, AgentName::Init),
+            Self::CrossSubtree => (AgentName::Dpg2, AgentName::Dpg1Dpg1Dpg1),
+            Self::SiblingDepth2 => (AgentName::Dpg1Dpg1, AgentName::Dpg1Dpg2),
+            Self::SiblingDepth3 => (AgentName::Dpg1Dpg1Dpg1, AgentName::Dpg1Dpg1Dpg2),
+            Self::Uncle => (AgentName::Dpg1Dpg2, AgentName::Dpg2),
+            Self::PieToNonPie => (AgentName::Dpg1, AgentName::Dpg1Dng),
+            Self::NonPieToParent => (AgentName::Dpg1Dng, AgentName::Dpg1),
+            Self::NonPieChildUp => (AgentName::Dpg1DngDpg, AgentName::Dpg1),
+            Self::DeepNonPie => (AgentName::Dpg1Dpg1Dpg1DngDpg, AgentName::Dpg2),
         }
     }
 
@@ -173,67 +173,67 @@ struct NetAddrTestCase {
 const NET_TESTS: &[NetTestCase] = &[
     NetTestCase {
         name: "init_to_A",
-        listener: AgentName::A,
+        listener: AgentName::Dpg1,
         connector: AgentName::Init,
     },
     NetTestCase {
         name: "A_to_B",
-        listener: AgentName::B,
-        connector: AgentName::A,
+        listener: AgentName::Dpg2,
+        connector: AgentName::Dpg1,
     },
     NetTestCase {
         name: "B_to_A",
-        listener: AgentName::A,
-        connector: AgentName::B,
+        listener: AgentName::Dpg1,
+        connector: AgentName::Dpg2,
     },
     NetTestCase {
         name: "AAA_to_A",
-        listener: AgentName::A,
-        connector: AgentName::AAA,
+        listener: AgentName::Dpg1,
+        connector: AgentName::Dpg1Dpg1Dpg1,
     },
     NetTestCase {
         name: "B_to_AAA",
-        listener: AgentName::AAA,
-        connector: AgentName::B,
+        listener: AgentName::Dpg1Dpg1Dpg1,
+        connector: AgentName::Dpg2,
     },
     NetTestCase {
         name: "AA_to_AB",
-        listener: AgentName::AB,
-        connector: AgentName::AA,
+        listener: AgentName::Dpg1Dpg2,
+        connector: AgentName::Dpg1Dpg1,
     },
     NetTestCase {
         name: "AAA_to_AAB",
-        listener: AgentName::AAB,
-        connector: AgentName::AAA,
+        listener: AgentName::Dpg1Dpg1Dpg2,
+        connector: AgentName::Dpg1Dpg1Dpg1,
     },
     NetTestCase {
         name: "AB_to_B",
-        listener: AgentName::B,
-        connector: AgentName::AB,
+        listener: AgentName::Dpg2,
+        connector: AgentName::Dpg1Dpg2,
     },
     // Non-PIE tree: NP listens, A connects (cross-type boundary).
     NetTestCase {
-        name: "NP_to_A",
-        listener: AgentName::NP,
-        connector: AgentName::A,
+        name: "dpg1_dng_to_dpg1",
+        listener: AgentName::Dpg1Dng,
+        connector: AgentName::Dpg1,
     },
     // PIE listens, non-PIE child connects.
     NetTestCase {
-        name: "A_to_NPC",
-        listener: AgentName::A,
-        connector: AgentName::NPC,
+        name: "dpg1_to_dpg1_dng_dpg",
+        listener: AgentName::Dpg1,
+        connector: AgentName::Dpg1DngDpg,
     },
     // Non-PIE child listens, PIE from other subtree connects.
     NetTestCase {
-        name: "NPC_to_B",
-        listener: AgentName::NPC,
-        connector: AgentName::B,
+        name: "dpg1_dng_dpg_to_dpg2",
+        listener: AgentName::Dpg1DngDpg,
+        connector: AgentName::Dpg2,
     },
     // Depth 5 (from non-PIE root) to depth 1 — the VS Code server path.
     NetTestCase {
-        name: "D5_to_B",
-        listener: AgentName::D5,
-        connector: AgentName::B,
+        name: "dpg1_dpg1_dpg1_dng_dpg_to_dpg2",
+        listener: AgentName::Dpg1Dpg1Dpg1DngDpg,
+        connector: AgentName::Dpg2,
     },
 ];
 
@@ -259,16 +259,16 @@ const LITEBOX_ADDRS: &[&str] = &["10.0.0.2"];
 /// Cross-worker pairs to test with address variants.
 /// Each pair is tested with all `CONNECT_ADDRS` in both directions.
 const NET_ADDR_PAIRS: &[(AgentName, AgentName)] = &[
-    (AgentName::A, AgentName::A),
-    (AgentName::AA, AgentName::AA),
-    (AgentName::A, AgentName::AA),
-    (AgentName::A, AgentName::B),
-    (AgentName::D3, AgentName::D4),
-    (AgentName::D4, AgentName::D5),
-    (AgentName::D4, AgentName::B),
-    (AgentName::D4, AgentName::A),
-    (AgentName::NP, AgentName::A),
-    (AgentName::A, AgentName::NP),
+    (AgentName::Dpg1, AgentName::Dpg1),
+    (AgentName::Dpg1Dpg1, AgentName::Dpg1Dpg1),
+    (AgentName::Dpg1, AgentName::Dpg1Dpg1),
+    (AgentName::Dpg1, AgentName::Dpg2),
+    (AgentName::Dpg1Dpg1Dpg1, AgentName::Dpg1Dpg1Dpg1Dng),
+    (AgentName::Dpg1Dpg1Dpg1Dng, AgentName::Dpg1Dpg1Dpg1DngDpg),
+    (AgentName::Dpg1Dpg1Dpg1Dng, AgentName::Dpg2),
+    (AgentName::Dpg1Dpg1Dpg1Dng, AgentName::Dpg1),
+    (AgentName::Dpg1Dng, AgentName::Dpg1),
+    (AgentName::Dpg1, AgentName::Dpg1Dng),
 ];
 
 // ═══════════════════════════════════════════════════════════════════
@@ -283,12 +283,12 @@ const NET_ADDR_PAIRS: &[(AgentName, AgentName)] = &[
 // ═══════════════════════════════════════════════════════════════════
 
 const EXEC_AGENTS: &[AgentName] = &[
-    AgentName::A,
-    AgentName::AA,
-    AgentName::AAA,
-    AgentName::NP,
-    AgentName::NPC,
-    AgentName::D5,
+    AgentName::Dpg1,
+    AgentName::Dpg1Dpg1,
+    AgentName::Dpg1Dpg1Dpg1,
+    AgentName::Dpg1Dng,
+    AgentName::Dpg1DngDpg,
+    AgentName::Dpg1Dpg1Dpg1DngDpg,
 ];
 
 // ═══════════════════════════════════════════════════════════════════
@@ -324,37 +324,37 @@ fn unix_test_cases() -> Vec<UnixTestCase> {
         UnixTestCase {
             name: "in_process.A",
             pattern: UnixPattern::InProcess,
-            agent: AgentName::A,
+            agent: AgentName::Dpg1,
             peer: None,
         },
         UnixTestCase {
             name: "in_process.AA",
             pattern: UnixPattern::InProcess,
-            agent: AgentName::AA,
+            agent: AgentName::Dpg1Dpg1,
             peer: None,
         },
         UnixTestCase {
             name: "server_fork.A",
             pattern: UnixPattern::ServerForkClient,
-            agent: AgentName::A,
+            agent: AgentName::Dpg1,
             peer: None,
         },
         UnixTestCase {
             name: "server_fork.AA",
             pattern: UnixPattern::ServerForkClient,
-            agent: AgentName::AA,
+            agent: AgentName::Dpg1Dpg1,
             peer: None,
         },
         UnixTestCase {
             name: "bg_server.A",
             pattern: UnixPattern::BackgroundServerConnect,
-            agent: AgentName::A,
+            agent: AgentName::Dpg1,
             peer: None,
         },
         UnixTestCase {
             name: "bg_server.AA",
             pattern: UnixPattern::BackgroundServerConnect,
-            agent: AgentName::AA,
+            agent: AgentName::Dpg1Dpg1,
             peer: None,
         },
         // Same-worker CrossAgent cases (all connected via Spawn chains,
@@ -362,26 +362,26 @@ fn unix_test_cases() -> Vec<UnixTestCase> {
         UnixTestCase {
             name: "sibling",
             pattern: UnixPattern::CrossAgent,
-            agent: AgentName::A,
-            peer: Some(AgentName::B),
+            agent: AgentName::Dpg1,
+            peer: Some(AgentName::Dpg2),
         },
         UnixTestCase {
             name: "parent_to_grandchild",
             pattern: UnixPattern::CrossAgent,
-            agent: AgentName::A,
-            peer: Some(AgentName::AA),
+            agent: AgentName::Dpg1,
+            peer: Some(AgentName::Dpg1Dpg1),
         },
         UnixTestCase {
             name: "grandchild_to_parent",
             pattern: UnixPattern::CrossAgent,
-            agent: AgentName::AA,
-            peer: Some(AgentName::A),
+            agent: AgentName::Dpg1Dpg1,
+            peer: Some(AgentName::Dpg1),
         },
         UnixTestCase {
             name: "cross_subtree",
             pattern: UnixPattern::CrossAgent,
-            agent: AgentName::B,
-            peer: Some(AgentName::AAA),
+            agent: AgentName::Dpg2,
+            peer: Some(AgentName::Dpg1Dpg1Dpg1),
         },
         // Cross-worker CrossAgent cases — these cross a SpawnRemote boundary
         // (different OS worker processes, separate unix_addr_table).
@@ -389,38 +389,38 @@ fn unix_test_cases() -> Vec<UnixTestCase> {
         UnixTestCase {
             name: "vscode_d3_d4",
             pattern: UnixPattern::CrossAgent,
-            agent: AgentName::D3,
-            peer: Some(AgentName::D4),
+            agent: AgentName::Dpg1Dpg1Dpg1,
+            peer: Some(AgentName::Dpg1Dpg1Dpg1Dng),
         },
         UnixTestCase {
             name: "vscode_d4_d3",
             pattern: UnixPattern::CrossAgent,
-            agent: AgentName::D4,
-            peer: Some(AgentName::D3),
+            agent: AgentName::Dpg1Dpg1Dpg1Dng,
+            peer: Some(AgentName::Dpg1Dpg1Dpg1),
         },
         UnixTestCase {
             name: "d4_to_sibling_b",
             pattern: UnixPattern::CrossAgent,
-            agent: AgentName::D4,
-            peer: Some(AgentName::B),
+            agent: AgentName::Dpg1Dpg1Dpg1Dng,
+            peer: Some(AgentName::Dpg2),
         },
         UnixTestCase {
             name: "d5_to_a",
             pattern: UnixPattern::CrossAgent,
-            agent: AgentName::D5,
-            peer: Some(AgentName::A),
+            agent: AgentName::Dpg1Dpg1Dpg1DngDpg,
+            peer: Some(AgentName::Dpg1),
         },
         UnixTestCase {
             name: "a_to_np",
             pattern: UnixPattern::CrossAgent,
-            agent: AgentName::A,
-            peer: Some(AgentName::NP),
+            agent: AgentName::Dpg1,
+            peer: Some(AgentName::Dpg1Dng),
         },
         UnixTestCase {
             name: "np_to_a",
             pattern: UnixPattern::CrossAgent,
-            agent: AgentName::NP,
-            peer: Some(AgentName::A),
+            agent: AgentName::Dpg1Dng,
+            peer: Some(AgentName::Dpg1),
         },
     ]
 }
@@ -741,7 +741,7 @@ pub(super) fn register_tmp_isolation(reg: &mut Registry<'_>) {
 }
 
 pub(super) fn register_host_file(reg: &mut Registry<'_>) {
-    for agent in [AgentName::Init, AgentName::A, AgentName::AA] {
+    for agent in [AgentName::Init, AgentName::Dpg1, AgentName::Dpg1Dpg1] {
         matrix_test(
             reg,
             format!("F.host.{agent}"),
@@ -1025,7 +1025,7 @@ pub(super) fn register_exec_tests(reg: &mut Registry<'_>) {
             );
         }
     }
-    for &(agent, code) in &[(AgentName::A, 42i32), (AgentName::AAA, 7i32)] {
+    for &(agent, code) in &[(AgentName::Dpg1, 42i32), (AgentName::Dpg1Dpg1Dpg1, 7i32)] {
         for &bt in crate::BinaryType::ALL {
             let bt_label = bt.label();
             matrix_test(
@@ -1292,7 +1292,7 @@ pub(super) fn register_symlink_basic(reg: &mut Registry<'_>) {
 
 #[allow(clippy::too_many_lines)] // exhaustive registration / runner
 pub(super) fn register_symlink_variants(reg: &mut Registry<'_>) {
-    let agent = AgentName::A;
+    let agent = AgentName::Dpg1;
     matrix_test(
         reg,
         "S.dir.read_through",
@@ -1902,14 +1902,14 @@ pub(super) fn register_unix_tests(reg: &mut Registry<'_>) {
     matrix_test(
         reg,
         "U.repro.listen",
-        vec![AgentName::D3],
+        vec![AgentName::Dpg1Dpg1Dpg1],
         move |run, handles| {
             Box::pin(async move {
                 let sock = "/tmp/um_repro_xworker.sock".to_string();
                 let resp = send_to(
                     run,
                     &handles,
-                    AgentName::D3,
+                    AgentName::Dpg1Dpg1Dpg1,
                     Command::UnixListen { path: sock.clone() },
                 )
                 .await;
@@ -1917,31 +1917,31 @@ pub(super) fn register_unix_tests(reg: &mut Registry<'_>) {
                 let _ = send_to(
                     run,
                     &handles,
-                    AgentName::D3,
+                    AgentName::Dpg1Dpg1Dpg1,
                     Command::UnixUnlisten { path: sock },
                 )
                 .await;
-                super::TestOutcome::new(AgentName::D3.name(), pass, format!("{resp:?}"))
+                super::TestOutcome::new(AgentName::Dpg1Dpg1Dpg1.name(), pass, format!("{resp:?}"))
             })
         },
     );
     matrix_test(
         reg,
         "U.repro.same_agent",
-        vec![AgentName::D3],
+        vec![AgentName::Dpg1Dpg1Dpg1],
         move |run, handles| {
             Box::pin(async move {
                 let sock = "/tmp/um_repro_xworker.sock".to_string();
                 let resp = send_to(
                     run,
                     &handles,
-                    AgentName::D3,
+                    AgentName::Dpg1Dpg1Dpg1,
                     Command::UnixListen { path: sock.clone() },
                 )
                 .await;
                 if let Err(e) = super::expect_unix_listening_path(&resp, &sock) {
                     return super::TestOutcome::new(
-                        AgentName::D3.name(),
+                        AgentName::Dpg1Dpg1Dpg1.name(),
                         false,
                         format!("listen failed: {e}; resp={resp:?}"),
                     );
@@ -1949,7 +1949,7 @@ pub(super) fn register_unix_tests(reg: &mut Registry<'_>) {
                 let resp = send_to(
                     run,
                     &handles,
-                    AgentName::D3,
+                    AgentName::Dpg1Dpg1Dpg1,
                     Command::UnixConnect {
                         path: sock.clone(),
                         data: "SAME_AGENT".to_string(),
@@ -1961,31 +1961,31 @@ pub(super) fn register_unix_tests(reg: &mut Registry<'_>) {
                 let _ = send_to(
                     run,
                     &handles,
-                    AgentName::D3,
+                    AgentName::Dpg1Dpg1Dpg1,
                     Command::UnixUnlisten { path: sock },
                 )
                 .await;
-                super::TestOutcome::new(AgentName::D3.name(), pass, format!("{resp:?}"))
+                super::TestOutcome::new(AgentName::Dpg1Dpg1Dpg1.name(), pass, format!("{resp:?}"))
             })
         },
     );
     matrix_test(
         reg,
         "U.repro.cross_worker",
-        vec![AgentName::D3, AgentName::D4],
+        vec![AgentName::Dpg1Dpg1Dpg1, AgentName::Dpg1Dpg1Dpg1Dng],
         move |run, handles| {
             Box::pin(async move {
                 let sock = "/tmp/um_repro_xworker.sock".to_string();
                 let resp = send_to(
                     run,
                     &handles,
-                    AgentName::D3,
+                    AgentName::Dpg1Dpg1Dpg1,
                     Command::UnixListen { path: sock.clone() },
                 )
                 .await;
                 if let Err(e) = super::expect_unix_listening_path(&resp, &sock) {
                     return super::TestOutcome::new(
-                        AgentName::D4.name(),
+                        AgentName::Dpg1Dpg1Dpg1Dng.name(),
                         false,
                         format!("listen failed: {e}; resp={resp:?}"),
                     );
@@ -1993,7 +1993,7 @@ pub(super) fn register_unix_tests(reg: &mut Registry<'_>) {
                 let resp = send_to(
                     run,
                     &handles,
-                    AgentName::D4,
+                    AgentName::Dpg1Dpg1Dpg1Dng,
                     Command::UnixConnect {
                         path: sock.clone(),
                         data: "CROSS_WORKER".to_string(),
@@ -2005,11 +2005,15 @@ pub(super) fn register_unix_tests(reg: &mut Registry<'_>) {
                 let _ = send_to(
                     run,
                     &handles,
-                    AgentName::D3,
+                    AgentName::Dpg1Dpg1Dpg1,
                     Command::UnixUnlisten { path: sock },
                 )
                 .await;
-                super::TestOutcome::new(AgentName::D4.name(), pass, format!("{resp:?}"))
+                super::TestOutcome::new(
+                    AgentName::Dpg1Dpg1Dpg1Dng.name(),
+                    pass,
+                    format!("{resp:?}"),
+                )
             })
         },
     );

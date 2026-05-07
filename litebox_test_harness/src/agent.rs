@@ -278,6 +278,9 @@ async fn agent_loop(self_exe: &str) {
                 let exe = match binary.as_str() {
                     // Required dependency; panic for clarity (see SpawnRemote handler).
                     "nonpie" => litebox_test_harness::nonpie_binary(),
+                    "static-pie-glibc" => litebox_test_harness::static_pie_glibc_binary(),
+                    "static-pie-musl" => litebox_test_harness::static_pie_musl_binary(),
+                    "non-pie-static-musl" => litebox_test_harness::non_pie_static_musl_binary(),
                     _ => self_exe.to_string(), // "self" or default
                 };
 
