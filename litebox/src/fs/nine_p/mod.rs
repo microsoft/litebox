@@ -522,9 +522,6 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
         }
 
         let fid = self.walk_to(&path)?;
-        // `remove` consumes the Fid: the server destroys the fid even on
-        // Rlerror, and the local pool slot is reclaimed when the consumed
-        // handle is dropped.
         self.client.remove(fid)
     }
 }
@@ -533,9 +530,6 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
     for FileSystem<Platform, T>
 {
     fn drop(&mut self) {
-        // `clunk` consumes the Fid by value, but we only have `&mut self`,
-        // so clunk a clone (one Arc bump); the field's own drop reclaims the
-        // pool slot when the last clone — the original — goes away.
         self.client.clunk(self.root.1.clone());
     }
 }
