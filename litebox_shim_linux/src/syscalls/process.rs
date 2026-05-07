@@ -1906,6 +1906,14 @@ impl<FS: ShimFS> Task<FS> {
             && (!flags.contains(CloneFlags::VM) || flags.contains(CloneFlags::VFORK));
 
         if is_fork {
+            // Keep fork-like clone3 on the native fallback path for now.  The
+            // thread-clone subset is supported below, but process creation via
+            // clone3 needs separate fd/stdio semantics from the legacy clone
+            // path and is better reported as unsupported than partially emulated.
+            if clone3 {
+                log_unsupported!("fork-like clone3");
+                return Err(Errno::ENOSYS);
+            }
             return self.do_fork(ctx, args, flags, clone3);
         }
 
