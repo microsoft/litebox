@@ -6,6 +6,7 @@
 
 pub(crate) mod agents;
 pub(crate) mod concurrent_fork;
+pub(crate) mod eventfd;
 pub(crate) mod file_tcp;
 pub(crate) mod fork_matrix;
 pub(crate) mod matrix;
@@ -338,7 +339,7 @@ impl TestRunner {
     /// test actually asked for — minimal-repro shape (single-test
     /// filters spawn just the path that test uses).
     async fn spawn_tree(&mut self, needed: &std::collections::BTreeSet<agents::AgentName>) {
-        use agents::AgentName::{A, AA, AAA, AAB, AB, B, D3, D4, D5, E, EE, NP, NPC};
+        use agents::AgentName::{A, AA, AAA, AAB, AB, B, BB, D3, D4, D5, E, EE, NP, NPC};
         // `Init` is the coordinator itself — always available; record
         // it as "spawned" so the validator doesn't false-flag tests
         // that route to it via cx.fs_read / Command::FsRead.
@@ -378,6 +379,19 @@ impl TestRunner {
                 )
                 .await;
             eprintln!("[coord] A spawn {a_pie_kids:?}: {r:?}");
+        }
+
+        if needed.contains(&BB) && needed.contains(&B) {
+            self.spawned_agents.insert(BB.name().to_string());
+            let r = self
+                .send(
+                    "B",
+                    Command::Spawn {
+                        children: vec![BB.name().to_string()],
+                    },
+                )
+                .await;
+            eprintln!("[coord] B spawn BB: {r:?}");
         }
 
         let mut grandkids: Vec<String> = Vec::new();
@@ -806,6 +820,7 @@ pub fn collect_all_tests() -> Vec<Test> {
     platform_fixes::register_file_redirect_tests(&mut registry::Registry::new(&mut tests));
     platform_fixes::register_pipe_nonblock_tests(&mut registry::Registry::new(&mut tests));
     platform_fixes::register_epoll_socket_tests(&mut registry::Registry::new(&mut tests));
+    eventfd::register_eventfd_tests(&mut registry::Registry::new(&mut tests));
     tcp_state::register_tcp_state_tests(&mut registry::Registry::new(&mut tests));
     platform_fixes::register_tcp_halfclose_tests(&mut registry::Registry::new(&mut tests));
     platform_fixes::register_fork_listen_close_tests(&mut registry::Registry::new(&mut tests));
@@ -896,6 +911,7 @@ async fn run_tests(self_exe: &str, filter: Option<&str>) -> Vec<TestResult> {
                 agents::AgentName::AAA,
                 agents::AgentName::AAB,
                 agents::AgentName::B,
+                agents::AgentName::BB,
                 agents::AgentName::E,
                 agents::AgentName::EE,
                 agents::AgentName::NP,
@@ -961,6 +977,7 @@ async fn run_tests(self_exe: &str, filter: Option<&str>) -> Vec<TestResult> {
 fn route(target: &str) -> (&str, Option<&str>) {
     match target {
         "A" | "B" | "E" => (target, None),
+        "BB" => ("B", Some("BB")),
         // Agents under A: AA*, AB, NP, NPC, D3, D4, D5
         "NP" | "NPC" | "D3" | "D4" | "D5" => ("A", Some(target)),
         "EE" => ("E", Some("EE")),
@@ -975,7 +992,12 @@ fn wrap_forwards(remaining: Option<&str>, cmd: Command) -> Command {
         None => cmd,
         Some(target) => {
             // "AA" or "AB" → forward directly (children of A)
-            if target == "AA" || target == "AB" {
+            if target == "BB" {
+                Command::Forward {
+                    target: "BB".to_string(),
+                    inner: Box::new(cmd),
+                }
+            } else if target == "AA" || target == "AB" {
                 Command::Forward {
                     target: target.to_string(),
                     inner: Box::new(cmd),
