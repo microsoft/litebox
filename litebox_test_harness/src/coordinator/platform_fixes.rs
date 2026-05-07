@@ -942,38 +942,62 @@ pub(crate) fn register_minimal_canary_tests(reg: &mut Registry<'_>) {
 
     for &launcher in M_LAUNCHERS {
         for &(id_prefix, subcommand, marker, timeout_secs) in M_VARIANTS {
-            let launcher_s = launcher.to_string();
-            let subcommand_s: String = subcommand.into();
-            let marker_s: String = marker.into();
-            reg.test(
-                "fork",
-                "minimal_canary",
-                format!("{id_prefix}.{launcher_s}"),
-            )
-            .timeout(timeout_secs + 10)
-            .build(move |cx| {
-                let handle = cx.require(launcher);
-                Box::new(move |run| {
-                    let l = launcher_s.clone();
-                    let sc = subcommand_s.clone();
-                    let m = marker_s.clone();
-                    let self_exe = run.self_exe().to_string();
-                    Box::pin(async move {
-                        let resp = run
-                            .send(
-                                &handle,
-                                super::exec_timeout(vec![self_exe, sc], timeout_secs),
-                            )
-                            .await;
-                        let pass = matches!(
-                            &resp,
-                            Response::ExecResult { exit_code: 0, stdout, .. }
-                                if stdout.contains(m.as_str())
-                        );
-                        super::TestOutcome::new(&l, pass, format!("{resp:?}"))
-                    })
-                })
-            });
+            for &target_bt in crate::BinaryType::ALL {
+                let launcher_s = launcher.to_string();
+                let subcommand_s: String = subcommand.into();
+                let marker_s: String = marker.into();
+                let target_label = target_bt.label();
+                // Backwards-compat: the original M/BS test IDs (no
+                // binary-type segment) keep their semantics by
+                // pinning to the non-PIE-glibc target — which is
+                // exactly what the legacy behavior was. The other
+                // four legs get a `.<binary-type>` suffix.
+                let test_id = if target_bt == crate::BinaryType::NonPieGlibc {
+                    format!("{id_prefix}.{launcher_s}")
+                } else {
+                    format!("{id_prefix}.{launcher_s}.{target_label}")
+                };
+                reg.test("fork", "minimal_canary", test_id)
+                    .timeout(timeout_secs + 10)
+                    .build(move |cx| {
+                        let handle = cx.require(launcher);
+                        Box::new(move |run| {
+                            let l = launcher_s.clone();
+                            let sc = subcommand_s.clone();
+                            let m = marker_s.clone();
+                            let self_exe = run.self_exe().to_string();
+                            Box::pin(async move {
+                                let target = crate::binary_path(target_bt, &self_exe);
+                                // Inject the target binary path into
+                                // the M subcommand via the env var
+                                // `LITEBOX_M_TARGET_BINARY`. Wrapping
+                                // with `/usr/bin/env` lets us set the
+                                // variable without extending the
+                                // Exec protocol.
+                                let resp = run
+                                    .send(
+                                        &handle,
+                                        super::exec_timeout(
+                                            vec![
+                                                "/usr/bin/env".into(),
+                                                format!("LITEBOX_M_TARGET_BINARY={target}"),
+                                                self_exe,
+                                                sc,
+                                            ],
+                                            timeout_secs,
+                                        ),
+                                    )
+                                    .await;
+                                let pass = matches!(
+                                    &resp,
+                                    Response::ExecResult { exit_code: 0, stdout, .. }
+                                        if stdout.contains(m.as_str())
+                                );
+                                super::TestOutcome::new(&l, pass, format!("{resp:?}"))
+                            })
+                        })
+                    });
+            }
         }
     }
 }

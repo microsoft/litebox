@@ -75,6 +75,26 @@ use litebox_test_harness::protocol;
 
 use std::io::Write as _;
 
+/// Resolve the target binary that an M/BS subcommand should spawn.
+///
+/// The M and BS minimal canary subcommands spawn a child binary
+/// internally (originally always the non-PIE harness companion).
+/// Tests exercise per-binary-type behavior by exporting
+/// `LITEBOX_M_TARGET_BINARY=<path>` before invoking the subcommand;
+/// when that env var is set, the subcommand spawns that path
+/// instead. When unset, defaults to
+/// `litebox_test_harness::nonpie_binary()` so existing behavior is
+/// preserved for M tests that don't yet thread a binary type
+/// through.
+fn m_target_binary() -> String {
+    if let Ok(p) = std::env::var("LITEBOX_M_TARGET_BINARY")
+        && !p.is_empty()
+    {
+        return p;
+    }
+    litebox_test_harness::nonpie_binary()
+}
+
 #[allow(clippy::too_many_lines)] // exhaustive runner / dispatch table
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -167,7 +187,7 @@ fn main() {
         "M1-tokio-spawn-nonpie" => {
             // M1: PIE process, current_thread tokio runtime, spawn one
             // non-PIE child, wait, verify parent still alive.
-            let nonpie = litebox_test_harness::nonpie_binary();
+            let nonpie = m_target_binary();
             let parent_pid = std::process::id();
             eprintln!("[M1] pid={parent_pid} spawning nonpie={nonpie}");
 
@@ -209,7 +229,7 @@ fn main() {
             // M2: PIE process, NO tokio. Raw libc fork+execve(nonpie),
             // waitpid, verify parent still alive. Isolates whether
             // tokio is required to trigger the bug.
-            let nonpie = litebox_test_harness::nonpie_binary();
+            let nonpie = m_target_binary();
             let parent_pid = std::process::id();
             eprintln!("[M2] pid={parent_pid} libc fork+execve nonpie={nonpie}");
 
@@ -282,7 +302,7 @@ fn main() {
             // "almost dead" after the spawn (e.g. relay threads gone
             // but main thread still serving), the post-work step
             // catches it.
-            let nonpie = litebox_test_harness::nonpie_binary();
+            let nonpie = m_target_binary();
             let parent_pid = std::process::id();
             eprintln!("[M3] pid={parent_pid} step 1: spawn nonpie");
 
@@ -339,7 +359,7 @@ fn main() {
             // tokio runtime. Counts how many spawns the parent
             // survives before dying.
             let n: usize = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(5);
-            let nonpie = litebox_test_harness::nonpie_binary();
+            let nonpie = m_target_binary();
             let parent_pid = std::process::id();
             eprintln!("[M4] pid={parent_pid} N={n} spawning nonpie={nonpie}");
 
@@ -385,7 +405,7 @@ fn main() {
             // a non-PIE worker has the same Bug-B shape as STDOUT (which
             // M1 covers). If BS1 passes but M1 fails (or vice versa),
             // the bug is direction-specific.
-            let nonpie = litebox_test_harness::nonpie_binary();
+            let nonpie = m_target_binary();
             let parent_pid = std::process::id();
             eprintln!("[BS1] pid={parent_pid} spawning nonpie={nonpie} stderr-only-test");
             let rt = tokio::runtime::Builder::new_current_thread()
@@ -427,7 +447,7 @@ fn main() {
             // stdin; child echoes back to stdout. Parent verifies it
             // reads "BS2_PING\n" from stdout. Tests bidirectional
             // bridging: parent → child stdin AND child → parent stdout.
-            let nonpie = litebox_test_harness::nonpie_binary();
+            let nonpie = m_target_binary();
             let parent_pid = std::process::id();
             eprintln!("[BS2] pid={parent_pid} spawning nonpie={nonpie} stdin-echo-test");
             let rt = tokio::runtime::Builder::new_current_thread()
@@ -481,7 +501,7 @@ fn main() {
             // M1 fails (small) but BS3 passes (large), the bug is
             // small-payload-specific (e.g. lost wakeup before EOF).
             // If both fail, the bug is general.
-            let nonpie = litebox_test_harness::nonpie_binary();
+            let nonpie = m_target_binary();
             let parent_pid = std::process::id();
             eprintln!("[BS3] pid={parent_pid} spawning nonpie={nonpie} large-stdout-test");
             let rt = tokio::runtime::Builder::new_current_thread()
