@@ -202,51 +202,59 @@ pub(crate) fn register_concurrent_fork_pipeline(reg: &mut Registry<'_>) {
 /// Register concurrent exec tests.
 pub(crate) fn register_concurrent_exec(reg: &mut Registry<'_>) {
     for &count in &[2usize, 3, 4] {
-        for &agent in CF_AGENTS {
-            let agent_label = agent.to_string();
-            reg.test(
-                "xworker",
-                "concurrent_exec",
-                format!("CF.concurrent_exec_{count}.{agent}"),
-            )
-            .timeout(90)
-            .build(move |cx| {
-                let handle = cx.require(agent);
-                Box::new(move |run| {
-                    Box::pin(async move {
-                        let self_exe = run.self_exe().to_string();
-                        let cmd = (0..count)
-                            .map(|_| format!("{self_exe} echo-test &"))
-                            .collect::<Vec<_>>()
-                            .join(" ");
-                        let full_cmd = format!("{cmd} wait");
-                        let resp = run
-                            .send(
-                                &handle,
-                                super::exec_timeout(vec!["bash".into(), "-c".into(), full_cmd], 15),
-                            )
-                            .await;
-                        let pass = match &resp {
-                            crate::protocol::Response::ExecResult {
-                                exit_code: 0,
-                                stdout,
-                                ..
-                            } => stdout.matches("ECHO_TEST_OK").count() == count,
-                            _ => false,
-                        };
-                        let detail = match &resp {
-                            crate::protocol::Response::ExecResult { stdout, .. } => {
-                                format!(
-                                    "got {}/{count} ECHO_TEST_OK",
-                                    stdout.matches("ECHO_TEST_OK").count()
+        for &bt in crate::BinaryType::ALL {
+            let bt_label = bt.label();
+            for &agent in CF_AGENTS {
+                let agent_label = agent.to_string();
+                reg.test(
+                    "xworker",
+                    "concurrent_exec",
+                    format!("CF.concurrent_exec_{count}.{bt_label}.{agent}"),
+                )
+                .timeout(90)
+                .build(move |cx| {
+                    let handle = cx.require(agent);
+                    Box::new(move |run| {
+                        let agent_label = agent_label.clone();
+                        Box::pin(async move {
+                            let self_exe = run.self_exe().to_string();
+                            let target = crate::binary_path(bt, &self_exe);
+                            let cmd = (0..count)
+                                .map(|_| format!("{target} echo-test &"))
+                                .collect::<Vec<_>>()
+                                .join(" ");
+                            let full_cmd = format!("{cmd} wait");
+                            let resp = run
+                                .send(
+                                    &handle,
+                                    super::exec_timeout(
+                                        vec!["bash".into(), "-c".into(), full_cmd],
+                                        15,
+                                    ),
                                 )
-                            }
-                            _ => format!("{resp:?}"),
-                        };
-                        super::TestOutcome::new(&agent_label, pass, detail)
+                                .await;
+                            let pass = match &resp {
+                                crate::protocol::Response::ExecResult {
+                                    exit_code: 0,
+                                    stdout,
+                                    ..
+                                } => stdout.matches("ECHO_TEST_OK").count() == count,
+                                _ => false,
+                            };
+                            let detail = match &resp {
+                                crate::protocol::Response::ExecResult { stdout, .. } => {
+                                    format!(
+                                        "got {}/{count} ECHO_TEST_OK",
+                                        stdout.matches("ECHO_TEST_OK").count()
+                                    )
+                                }
+                                _ => format!("{resp:?}"),
+                            };
+                            super::TestOutcome::new(&agent_label, pass, detail)
+                        })
                     })
-                })
-            });
+                });
+            }
         }
     }
 }
@@ -318,72 +326,82 @@ pub(crate) fn register_vscode_install_pipeline(reg: &mut Registry<'_>) {
 /// Register concurrent FS rwlock tests.
 pub(crate) fn register_concurrent_fs_rwlock(reg: &mut Registry<'_>) {
     for &n in &[2usize, 3, 4] {
-        for &agent in CF_AGENTS {
-            let agent_label = agent.to_string();
-            reg.test(
-                "xworker",
-                "concurrent_fs_rwlock",
-                format!("CF.rwlock_{n}.{agent}"),
-            )
-            .timeout(90)
-            .build(move |cx| {
-                let handle = cx.require(agent);
-                Box::new(move |run| {
-                    Box::pin(async move {
-                        let self_exe = run.self_exe().to_string();
-                        let resp = run
-                            .send(
-                                &handle,
-                                super::exec_timeout(
-                                    vec![self_exe, "concurrent-fs".into(), n.to_string()],
-                                    20,
-                                ),
-                            )
-                            .await;
-                        let pass = matches!(
-                            &resp,
-                            crate::protocol::Response::ExecResult { exit_code: 0, stdout, .. }
-                                if stdout.contains("CONCURRENT_FS_OK")
-                        );
-                        super::TestOutcome::new(&agent_label, pass, format!("{resp:?}"))
+        for &bt in crate::BinaryType::ALL {
+            let bt_label = bt.label();
+            for &agent in CF_AGENTS {
+                let agent_label = agent.to_string();
+                reg.test(
+                    "xworker",
+                    "concurrent_fs_rwlock",
+                    format!("CF.rwlock_{n}.{bt_label}.{agent}"),
+                )
+                .timeout(90)
+                .build(move |cx| {
+                    let handle = cx.require(agent);
+                    Box::new(move |run| {
+                        let agent_label = agent_label.clone();
+                        Box::pin(async move {
+                            let self_exe = run.self_exe().to_string();
+                            let target = crate::binary_path(bt, &self_exe);
+                            let resp = run
+                                .send(
+                                    &handle,
+                                    super::exec_timeout(
+                                        vec![target, "concurrent-fs".into(), n.to_string()],
+                                        20,
+                                    ),
+                                )
+                                .await;
+                            let pass = matches!(
+                                &resp,
+                                crate::protocol::Response::ExecResult { exit_code: 0, stdout, .. }
+                                    if stdout.contains("CONCURRENT_FS_OK")
+                            );
+                            super::TestOutcome::new(&agent_label, pass, format!("{resp:?}"))
+                        })
                     })
-                })
-            });
+                });
+            }
         }
     }
 
     for &n in &[3usize, 4, 6] {
-        for &agent in CF_AGENTS {
-            let agent_label = agent.to_string();
-            reg.test(
-                "xworker",
-                "concurrent_fs_rwlock",
-                format!("CF.rwlock_multi_{n}.{agent}"),
-            )
-            .timeout(90)
-            .build(move |cx| {
-                let handle = cx.require(agent);
-                Box::new(move |run| {
-                    Box::pin(async move {
-                        let self_exe = run.self_exe().to_string();
-                        let resp = run
-                            .send(
-                                &handle,
-                                super::exec_timeout(
-                                    vec![self_exe, "concurrent-fs-multi".into(), n.to_string()],
-                                    20,
-                                ),
-                            )
-                            .await;
-                        let pass = matches!(
-                            &resp,
-                            crate::protocol::Response::ExecResult { exit_code: 0, stdout, .. }
-                                if stdout.contains("CONCURRENT_FS_MULTI_OK")
-                        );
-                        super::TestOutcome::new(&agent_label, pass, format!("{resp:?}"))
+        for &bt in crate::BinaryType::ALL {
+            let bt_label = bt.label();
+            for &agent in CF_AGENTS {
+                let agent_label = agent.to_string();
+                reg.test(
+                    "xworker",
+                    "concurrent_fs_rwlock",
+                    format!("CF.rwlock_multi_{n}.{bt_label}.{agent}"),
+                )
+                .timeout(90)
+                .build(move |cx| {
+                    let handle = cx.require(agent);
+                    Box::new(move |run| {
+                        let agent_label = agent_label.clone();
+                        Box::pin(async move {
+                            let self_exe = run.self_exe().to_string();
+                            let target = crate::binary_path(bt, &self_exe);
+                            let resp = run
+                                .send(
+                                    &handle,
+                                    super::exec_timeout(
+                                        vec![target, "concurrent-fs-multi".into(), n.to_string()],
+                                        20,
+                                    ),
+                                )
+                                .await;
+                            let pass = matches!(
+                                &resp,
+                                crate::protocol::Response::ExecResult { exit_code: 0, stdout, .. }
+                                    if stdout.contains("CONCURRENT_FS_MULTI_OK")
+                            );
+                            super::TestOutcome::new(&agent_label, pass, format!("{resp:?}"))
+                        })
                     })
-                })
-            });
+                });
+            }
         }
     }
 }

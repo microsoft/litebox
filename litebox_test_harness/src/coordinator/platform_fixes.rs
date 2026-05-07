@@ -24,7 +24,6 @@ const DEPTH_AGENTS: &[AgentName] = &[AgentName::A, AgentName::AA];
 const FAMILIES: &[&str] = &["ipv4", "ipv6"];
 
 const EXIT_SIZES: &[usize] = &[256, 4096, 65536];
-const EXIT_BINARIES: &[&str] = &["pie", "nonpie"];
 
 const NPIPE_REPS: &[usize] = &[1, 5, 10];
 const NPIPE_AGENTS: &[AgentName] = &[
@@ -130,28 +129,23 @@ pub(crate) fn register_pipe_pair_id_tests(reg: &mut Registry<'_>) {
 
 pub(crate) fn register_exit_data_integrity_tests(reg: &mut Registry<'_>) {
     for &size in EXIT_SIZES {
-        for &binary in EXIT_BINARIES {
+        for &binary in crate::BinaryType::ALL {
             for &agent in DEPTH_AGENTS {
                 let agent_s = agent.to_string();
-                let binary_s = binary.to_string();
+                let binary_label = binary.label();
                 reg.test(
                     "fork",
                     "exit_data_integrity",
-                    format!("EXITD.{size}.{binary}.{agent}"),
+                    format!("EXITD.{size}.{binary_label}.{agent}"),
                 )
                 .timeout(60)
                 .build(move |cx| {
                     let handle = cx.require(agent);
                     Box::new(move |run| {
                         let a = agent_s.clone();
-                        let b = binary_s.clone();
                         let self_exe = run.self_exe().to_string();
                         Box::pin(async move {
-                            let bin_path = match b.as_str() {
-                                "pie" => self_exe,
-                                "nonpie" => crate::nonpie_binary(),
-                                _ => unreachable!(),
-                            };
+                            let bin_path = crate::binary_path(binary, &self_exe);
                             let resp = run
                                 .send(
                                     &handle,
@@ -308,6 +302,156 @@ pub(crate) fn register_nonpie_pipe_chain_tests(reg: &mut Registry<'_>) {
                     })
                 })
             });
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// BPIPE: per-binary-type pipe chain integrity (extends NPIPE)
+//
+// NPIPE above covers the non-PIE-glibc leg as a singleton matrix.
+// BPIPE expands the same patterns (sequential and interleaved
+// fork+execs whose stdout flows through a pipe to the parent) to the
+// other four legs of `BinaryType` so the platform's pipe-chain
+// integrity is exercised across every binary mode the shim might
+// dispatch differently:
+//
+//   BPIPE.{pie-glibc,static-pie-glibc,
+//          static-pie-musl,non-pie-static-musl}
+//        .{seq,interleaved}
+//        .x{reps}
+//        .{A,AA}
+//
+// `interleaved` alternates the under-test leg with the always-PIE-glibc
+// `self_exe` so the test catches pollution between legs.
+// ═══════════════════════════════════════════════════════════════════
+
+#[allow(clippy::too_many_lines)] // exhaustive registration / runner
+pub(crate) fn register_bpipe_tests(reg: &mut Registry<'_>) {
+    // Exercise every binary type with uniform per-leg IDs.
+    for &bt in crate::BinaryType::ALL {
+        let leg_label = bt.label();
+        for &reps in NPIPE_REPS {
+            for &agent in DEPTH_AGENTS {
+                let agent_s = agent.to_string();
+                reg.test(
+                    "fork",
+                    "bpipe",
+                    format!("BPIPE.{leg_label}.seq.x{reps}.{agent}"),
+                )
+                .timeout(60)
+                .build(move |cx| {
+                    let handle = cx.require(agent);
+                    Box::new(move |run| {
+                        let a = agent_s.clone();
+                        let self_exe = run.self_exe().to_string();
+                        Box::pin(async move {
+                            let target = crate::binary_path(bt, &self_exe);
+                            let mut all_clean = true;
+                            let mut detail = String::new();
+                            for i in 0..reps {
+                                let tag = format!("seq_{leg_label}_{a}_{i}");
+                                let resp = run
+                                    .send(
+                                        &handle,
+                                        super::exec(vec![
+                                            target.clone(),
+                                            "write-known".into(),
+                                            tag.clone(),
+                                        ]),
+                                    )
+                                    .await;
+                                let expected = format!("PIPEDATA:{tag}");
+                                let ok = matches!(
+                                    &resp,
+                                    Response::ExecResult { exit_code: 0, stdout, .. }
+                                        if stdout.trim() == expected
+                                );
+                                if !ok {
+                                    all_clean = false;
+                                    detail =
+                                        format!("iter {i}: expected '{expected}', got {resp:?}");
+                                    break;
+                                }
+                            }
+                            if all_clean {
+                                detail = format!("{reps} sequential {leg_label} execs all clean");
+                            }
+                            super::TestOutcome::new(&a, all_clean, detail)
+                        })
+                    })
+                });
+
+                let agent_s2 = agent.to_string();
+                reg.test(
+                    "fork",
+                    "bpipe",
+                    format!("BPIPE.{leg_label}.interleaved.x{reps}.{agent}"),
+                )
+                .timeout(60)
+                .build(move |cx| {
+                    let handle = cx.require(agent);
+                    Box::new(move |run| {
+                        let a = agent_s2.clone();
+                        let self_exe = run.self_exe().to_string();
+                        Box::pin(async move {
+                            let target = crate::binary_path(bt, &self_exe);
+                            let mut all_clean = true;
+                            let mut detail = String::new();
+                            for i in 0..reps {
+                                let tag = format!("itr_{leg_label}_{a}_{i}");
+                                let resp = run
+                                    .send(
+                                        &handle,
+                                        super::exec(vec![
+                                            target.clone(),
+                                            "write-known".into(),
+                                            tag.clone(),
+                                        ]),
+                                    )
+                                    .await;
+                                let expected = format!("PIPEDATA:{tag}");
+                                let ok = matches!(
+                                    &resp,
+                                    Response::ExecResult { exit_code: 0, stdout, .. }
+                                        if stdout.trim() == expected
+                                );
+                                if !ok {
+                                    all_clean = false;
+                                    detail = format!(
+                                        "iter {i} {leg_label}: expected '{expected}', got {resp:?}"
+                                    );
+                                    break;
+                                }
+                                let resp = run
+                                    .send(
+                                        &handle,
+                                        super::exec(vec![self_exe.clone(), "echo-test".into()]),
+                                    )
+                                    .await;
+                                let ok = matches!(
+                                    &resp,
+                                    Response::ExecResult { exit_code: 0, stdout, .. }
+                                        if stdout.trim() == "ECHO_TEST_OK"
+                                );
+                                if !ok {
+                                    all_clean = false;
+                                    detail = format!(
+                                        "iter {i} pie-glibc: expected 'ECHO_TEST_OK', got {resp:?}"
+                                    );
+                                    break;
+                                }
+                            }
+                            if all_clean {
+                                detail = format!(
+                                    "{reps} interleaved {leg_label}+pie-glibc execs all clean"
+                                );
+                            }
+                            super::TestOutcome::new(&a, all_clean, detail)
+                        })
+                    })
+                });
+            }
         }
     }
 }
@@ -634,6 +778,7 @@ async fn run_tlb_listen_busy_case(
                 timeout_secs: Some(delay_secs + 5),
                 stdin: None,
                 background: false,
+                env: vec![],
             },
         )
         .await;
@@ -833,144 +978,65 @@ pub(crate) fn register_bash_fork_exec_tests(reg: &mut Registry<'_>) {
 
 #[allow(clippy::too_many_lines)] // exhaustive registration / runner
 pub(crate) fn register_fork_from_worker_exec_tests(reg: &mut Registry<'_>) {
-    // FWE.nonpie_from_init: fork+exec nonpie from init worker (agent A)
-    reg.test(
-        "fork",
-        "fork_from_worker_exec",
-        "FWE.nonpie_from_init".to_string(),
-    )
-    .timeout(60)
-    .build(move |cx| {
-        let handle_a = cx.require(AgentName::A);
-        Box::new(move |run| {
-            let self_exe = run.self_exe().to_string();
-            Box::pin(async move {
-                let nonpie = crate::nonpie_binary();
-                let resp = run
-                    .send(
-                        &handle_a,
-                        super::exec_timeout(
-                            vec![
-                                self_exe,
-                                "fork-exec-nonpie".into(),
-                                nonpie,
-                                "echo-test".into(),
-                            ],
-                            20,
-                        ),
-                    )
-                    .await;
-                let pass = matches!(
-                    &resp,
-                    Response::ExecResult { exit_code: 0, stdout, .. }
-                        if stdout.contains("FORK_EXEC_NONPIE_OK")
-                );
-                super::TestOutcome::new("A", pass, format!("{resp:?}"))
-            })
-        })
-    });
-    // FWE.pie_from_init: fork+exec PIE from init worker (agent A)
-    reg.test(
-        "fork",
-        "fork_from_worker_exec",
-        "FWE.pie_from_init".to_string(),
-    )
-    .timeout(60)
-    .build(move |cx| {
-        let handle_a = cx.require(AgentName::A);
-        Box::new(move |run| {
-            let self_exe = run.self_exe().to_string();
-            Box::pin(async move {
-                let resp = run
-                    .send(
-                        &handle_a,
-                        super::exec_timeout(
-                            vec![
-                                self_exe.clone(),
-                                "fork-exec-pie".into(),
-                                self_exe,
-                                "echo-test".into(),
-                            ],
-                            20,
-                        ),
-                    )
-                    .await;
-                let pass = matches!(
-                    &resp,
-                    Response::ExecResult { exit_code: 0, stdout, .. }
-                        if stdout.contains("FORK_EXEC_PIE_OK")
-                );
-                super::TestOutcome::new("A", pass, format!("{resp:?}"))
-            })
-        })
-    });
-    // FWE.pie_from_worker_exec: fork+exec PIE from NP (worker-exec host)
-    reg.test(
-        "fork",
-        "fork_from_worker_exec",
-        "FWE.pie_from_worker_exec".to_string(),
-    )
-    .timeout(60)
-    .build(move |cx| {
-        let handle_np = cx.require(AgentName::NP);
-        Box::new(move |run| {
-            let self_exe = run.self_exe().to_string();
-            Box::pin(async move {
-                let nonpie = crate::nonpie_binary();
-                let resp = run
-                    .send(
-                        &handle_np,
-                        super::exec_timeout(
-                            vec![nonpie, "fork-exec-pie".into(), self_exe, "echo-test".into()],
-                            30,
-                        ),
-                    )
-                    .await;
-                let pass = matches!(
-                    &resp,
-                    Response::ExecResult { exit_code: 0, stdout, .. }
-                        if stdout.contains("FORK_EXEC_PIE_OK")
-                );
-                super::TestOutcome::new("NP", pass, format!("{resp:?}"))
-            })
-        })
-    });
-    // FWE.nonpie_from_worker_exec: fork+exec nonpie from NP
-    reg.test(
-        "fork",
-        "fork_from_worker_exec",
-        "FWE.nonpie_from_worker_exec".to_string(),
-    )
-    .timeout(60)
-    .build(move |cx| {
-        let handle_np = cx.require(AgentName::NP);
-        Box::new(move |run| {
-            let _self_exe = run.self_exe().to_string();
-            Box::pin(async move {
-                let nonpie = crate::nonpie_binary();
-                let resp = run
-                    .send(
-                        &handle_np,
-                        super::exec_timeout(
-                            vec![
-                                nonpie.clone(),
-                                "fork-exec-nonpie".into(),
-                                nonpie,
-                                "echo-test".into(),
-                            ],
-                            30,
-                        ),
-                    )
-                    .await;
-                let pass = matches!(
-                    &resp,
-                    Response::ExecResult { exit_code: 0, stdout, .. }
-                        if stdout.contains("FORK_EXEC_NONPIE_OK")
-                );
-                super::TestOutcome::new("NP", pass, format!("{resp:?}"))
-            })
-        })
-    });
+    // FWE matrix:
+    //   - launcher = init   (agent A, PIE) ─► fork+execv each BinaryType
+    //   - launcher = NP     (worker-exec host, non-PIE) ─► same
+    //
+    // Both arms use the `fork-exec-pie` subcommand (which is plain
+    // fork+execv with no PIE-specific logic; the historical name is
+    // kept for backwards compatibility). The binary executed is
+    // resolved per `BinaryType` via `binary_path()`.
+    //
+    for &bt in crate::BinaryType::ALL {
+        for (launcher_label, launcher_agent, sub_timeout) in [
+            ("from_init", AgentName::A, 20_u64),
+            ("from_worker_exec", AgentName::NP, 30_u64),
+        ] {
+            let bt_label = bt.label();
+            let test_id = format!("FWE.{bt_label}.{launcher_label}");
+            let outcome_label = format!("{launcher_agent}");
+            reg.test("fork", "fork_from_worker_exec", test_id.clone())
+                .timeout(60)
+                .build(move |cx| {
+                    let handle = cx.require(launcher_agent);
+                    Box::new(move |run| {
+                        let outcome_label = outcome_label.clone();
+                        let self_exe = run.self_exe().to_string();
+                        Box::pin(async move {
+                            let target = crate::binary_path(bt, &self_exe);
+                            // The launcher binary depends on which agent
+                            // we're running on: agent A is PIE, agent NP
+                            // is non-PIE.
+                            let launcher_bin = match launcher_agent {
+                                AgentName::A => self_exe.clone(),
+                                AgentName::NP => crate::nonpie_binary(),
+                                _ => unreachable!(),
+                            };
+                            let resp = run
+                                .send(
+                                    &handle,
+                                    super::exec_timeout(
+                                        vec![
+                                            launcher_bin,
+                                            "fork-exec-pie".into(),
+                                            target,
+                                            "echo-test".into(),
+                                        ],
+                                        sub_timeout,
+                                    ),
+                                )
+                                .await;
+                            let pass = matches!(
+                                &resp,
+                                Response::ExecResult { exit_code: 0, stdout, .. }
+                                    if stdout.contains("FORK_EXEC_PIE_OK")
+                            );
+                            super::TestOutcome::new(&outcome_label, pass, format!("{resp:?}"))
+                        })
+                    })
+                });
+        }
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -1023,38 +1089,48 @@ pub(crate) fn register_minimal_canary_tests(reg: &mut Registry<'_>) {
 
     for &launcher in M_LAUNCHERS {
         for &(id_prefix, subcommand, marker, timeout_secs) in M_VARIANTS {
-            let launcher_s = launcher.to_string();
-            let subcommand_s: String = subcommand.into();
-            let marker_s: String = marker.into();
-            reg.test(
-                "fork",
-                "minimal_canary",
-                format!("{id_prefix}.{launcher_s}"),
-            )
-            .timeout(timeout_secs + 10)
-            .build(move |cx| {
-                let handle = cx.require(launcher);
-                Box::new(move |run| {
-                    let l = launcher_s.clone();
-                    let sc = subcommand_s.clone();
-                    let m = marker_s.clone();
-                    let self_exe = run.self_exe().to_string();
-                    Box::pin(async move {
-                        let resp = run
-                            .send(
-                                &handle,
-                                super::exec_timeout(vec![self_exe, sc], timeout_secs),
-                            )
-                            .await;
-                        let pass = matches!(
-                            &resp,
-                            Response::ExecResult { exit_code: 0, stdout, .. }
-                                if stdout.contains(m.as_str())
-                        );
-                        super::TestOutcome::new(&l, pass, format!("{resp:?}"))
-                    })
-                })
-            });
+            for &target_bt in crate::BinaryType::ALL {
+                let launcher_s = launcher.to_string();
+                let subcommand_s: String = subcommand.into();
+                let marker_s: String = marker.into();
+                let target_label = target_bt.label();
+                let test_id = format!("{id_prefix}.{launcher_s}.{target_label}");
+                reg.test("fork", "minimal_canary", test_id)
+                    .timeout(timeout_secs + 10)
+                    .build(move |cx| {
+                        let handle = cx.require(launcher);
+                        Box::new(move |run| {
+                            let l = launcher_s.clone();
+                            let sc = subcommand_s.clone();
+                            let m = marker_s.clone();
+                            let self_exe = run.self_exe().to_string();
+                            Box::pin(async move {
+                                let target = crate::binary_path(target_bt, &self_exe);
+                                // Inject the target binary path into
+                                // the M/BS subcommand via the
+                                // `LITEBOX_M_TARGET_BINARY` env var.
+                                let resp = run
+                                    .send(
+                                        &handle,
+                                        Command::Exec {
+                                            args: vec![self_exe, sc],
+                                            timeout_secs: Some(timeout_secs),
+                                            stdin: None,
+                                            background: false,
+                                            env: vec![("LITEBOX_M_TARGET_BINARY".into(), target)],
+                                        },
+                                    )
+                                    .await;
+                                let pass = matches!(
+                                    &resp,
+                                    Response::ExecResult { exit_code: 0, stdout, .. }
+                                        if stdout.contains(m.as_str())
+                                );
+                                super::TestOutcome::new(&l, pass, format!("{resp:?}"))
+                            })
+                        })
+                    });
+            }
         }
     }
 }
@@ -1124,6 +1200,7 @@ pub(crate) fn register_stdin_pipe_subst_tests(reg: &mut Registry<'_>) {
                                         timeout_secs: Some(15),
                                         stdin: Some(s),
                                         background: false,
+                                        env: vec![],
                                     },
                                 )
                                 .await;
@@ -1467,6 +1544,7 @@ pub(crate) fn register_cross_worker_file_tests(reg: &mut Registry<'_>) {
                                     timeout_secs: Some(15),
                                     stdin: None,
                                     background: false,
+                                    env: vec![],
                                 },
                             )
                             .await;
@@ -1512,6 +1590,7 @@ pub(crate) fn register_cross_worker_file_tests(reg: &mut Registry<'_>) {
                                     timeout_secs: Some(10),
                                     stdin: None,
                                     background: false,
+                                    env: vec![],
                                 },
                             )
                             .await;
@@ -1606,6 +1685,7 @@ pub(crate) fn register_subst_capture_tests(reg: &mut Registry<'_>) {
                                         timeout_secs: Some(10),
                                         stdin: None,
                                         background: false,
+                                        env: vec![],
                                     },
                                 )
                                 .await;
@@ -1682,6 +1762,7 @@ pub(crate) fn register_concurrent_fork_tests(reg: &mut Registry<'_>) {
                                         timeout_secs: Some(10),
                                         stdin: None,
                                         background: false,
+                                        env: vec![],
                                     },
                                 )
                                 .await;
@@ -1789,6 +1870,7 @@ pub(crate) fn register_touch_redirect_tests(reg: &mut Registry<'_>) {
                                         timeout_secs: Some(10),
                                         stdin: None,
                                         background: false,
+                                        env: vec![],
                                     },
                                 )
                                 .await;
@@ -1950,6 +2032,7 @@ pub(crate) fn register_pid_visibility_tests(reg: &mut Registry<'_>) {
                                         timeout_secs: Some(15),
                                         stdin: None,
                                         background: false,
+                                        env: vec![],
                                     },
                                 )
                                 .await;
@@ -2047,6 +2130,7 @@ fn kpx_observe_proc_cmd(pid: u32) -> Command {
         timeout_secs: Some(10),
         stdin: None,
         background: false,
+        env: vec![],
     }
 }
 
@@ -2106,32 +2190,41 @@ pub(crate) fn register_cross_pid_visibility_tests(reg: &mut Registry<'_>) {
 // FR: File-Redirect — stdout of background process → file
 // ═══════════════════════════════════════════════════════════════════
 
+#[allow(clippy::too_many_lines)] // exhaustive registration / runner
 pub(crate) fn register_file_redirect_tests(reg: &mut Registry<'_>) {
     struct Def {
         name: &'static str,
         script_template: &'static str,
         check: fn(&str) -> bool,
+        /// If true, the template substitutes `{exe}` and the test
+        /// gains a `BinaryType` axis. Otherwise the test is a pure
+        /// shell-builtin operation with no binary dimension.
+        per_binary_type: bool,
     }
     let defs: &[Def] = &[
         Def {
             name: "fg_redirect",
             script_template: concat!("echo FR_FG > {path}\n", "cat {path}\n"),
             check: |s| s.contains("FR_FG"),
+            per_binary_type: false,
         },
         Def {
             name: "bg_echo",
             script_template: concat!("echo FR_BGECHO > {path} &\n", "wait\n", "cat {path}\n"),
             check: |s| s.contains("FR_BGECHO"),
+            per_binary_type: false,
         },
         Def {
             name: "bg_exe",
             script_template: concat!("{exe} echo-test > {path} &\n", "wait\n", "cat {path}\n"),
             check: |s| s.contains("ECHO_TEST_OK"),
+            per_binary_type: true,
         },
         Def {
             name: "bg_cat_pipe",
             script_template: concat!("echo FR_PIPE | cat > {path} &\n", "wait\n", "cat {path}\n",),
             check: |s| s.contains("FR_PIPE"),
+            per_binary_type: false,
         },
         Def {
             name: "bg_append",
@@ -2142,45 +2235,366 @@ pub(crate) fn register_file_redirect_tests(reg: &mut Registry<'_>) {
                 "cat {path}\n",
             ),
             check: |s| s.contains("LINE1") && s.contains("LINE2"),
+            per_binary_type: false,
         },
     ];
     for &agent in AGENTS {
         for def in defs {
-            let agent_s = agent.to_string();
-            let template: String = def.script_template.into();
-            let check = def.check;
-            let name = def.name;
-            reg.test("shell", "file_redirect", format!("FR.{name}.{agent}"))
-                .timeout(60)
-                .build(move |cx| {
-                    let handle = cx.require(agent);
-                    Box::new(move |run| {
-                        let a = agent_s.clone();
-                        let t = template.clone();
-                        let self_exe = run.self_exe().to_string();
-                        Box::pin(async move {
-                            let path = format!("/shared/fr-{name}-{a}.txt");
-                            let script = t.replace("{path}", &path).replace("{exe}", &self_exe);
-                            let resp = run
-                                .send(
-                                    &handle,
-                                    Command::Exec {
-                                        args: vec!["bash".into(), "-c".into(), script],
+            // For per-binary-type variants, generate a test per leg of
+            // BinaryType::ALL. For shell-builtin variants, generate
+            // exactly one test (the binary type is irrelevant).
+            let bts: &[Option<crate::BinaryType>] = if def.per_binary_type {
+                &[
+                    Some(crate::BinaryType::PieGlibc),
+                    Some(crate::BinaryType::NonPieGlibc),
+                    Some(crate::BinaryType::StaticPieGlibc),
+                    Some(crate::BinaryType::StaticPieMusl),
+                    Some(crate::BinaryType::NonPieStaticMusl),
+                ]
+            } else {
+                &[None]
+            };
+            for &bt_opt in bts {
+                let agent_s = agent.to_string();
+                let template: String = def.script_template.into();
+                let check = def.check;
+                let name = def.name;
+                let test_id = match bt_opt {
+                    None => format!("FR.{name}.{agent}"),
+                    Some(bt) => format!("FR.{name}.{}.{agent}", bt.label()),
+                };
+                let path_label = match bt_opt {
+                    None => name.to_string(),
+                    Some(bt) => format!("{name}-{}", bt.label()),
+                };
+                reg.test("shell", "file_redirect", test_id)
+                    .timeout(60)
+                    .build(move |cx| {
+                        let handle = cx.require(agent);
+                        Box::new(move |run| {
+                            let a = agent_s.clone();
+                            let t = template.clone();
+                            let path_label = path_label.clone();
+                            let self_exe = run.self_exe().to_string();
+                            Box::pin(async move {
+                                let path = format!("/shared/fr-{path_label}-{a}.txt");
+                                let exe_path = match bt_opt {
+                                    None => self_exe.clone(),
+                                    Some(bt) => crate::binary_path(bt, &self_exe),
+                                };
+                                let script = t.replace("{path}", &path).replace("{exe}", &exe_path);
+                                let resp = run
+                                    .send(
+                                        &handle,
+                                        Command::Exec {
+                                            args: vec!["bash".into(), "-c".into(), script],
+                                            timeout_secs: Some(10),
+                                            stdin: None,
+                                            background: false,
+                                            env: vec![],
+                                        },
+                                    )
+                                    .await;
+                                let pass = matches!(
+                                    &resp,
+                                    Response::ExecResult { stdout, .. }
+                                        if check(stdout)
+                                );
+                                super::TestOutcome::new(&a, pass, format!("{resp:?}"))
+                            })
+                        })
+                    });
+            }
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// CSM: CLI Startup Mimic — VS Code CLI link-mode startup shape
+// ═══════════════════════════════════════════════════════════════════
+
+pub(crate) fn register_cli_startup_mimic_tests(reg: &mut Registry<'_>) {
+    const DELIVERIES: &[&str] = &["tokio_pipe", "bash_heredoc_pipe"];
+
+    for &delivery in DELIVERIES {
+        for &bt in crate::BinaryType::ALL {
+            for &agent in AGENTS {
+                let agent_s = agent.to_string();
+                let bt_label = bt.label();
+                let test_id = format!("CSM.{delivery}.{bt_label}.{agent}");
+                reg.test("fork", "cli_startup_mimic", test_id)
+                    .timeout(60)
+                    .build(move |cx| {
+                        let handle = cx.require(agent);
+                        Box::new(move |run| {
+                            let a = agent_s.clone();
+                            let self_exe = run.self_exe().to_string();
+                            Box::pin(async move {
+                                let target = crate::binary_path(bt, &self_exe);
+                                let command = match delivery {
+                                    "tokio_pipe" => Command::Exec {
+                                        args: vec![target, "cli-startup-mimic".into()],
                                         timeout_secs: Some(10),
                                         stdin: None,
                                         background: false,
+                                        env: vec![],
                                     },
-                                )
-                                .await;
-                            let pass = matches!(
-                                &resp,
-                                Response::ExecResult { stdout, .. }
-                                    if check(stdout)
-                            );
-                            super::TestOutcome::new(&a, pass, format!("{resp:?}"))
+                                    "bash_heredoc_pipe" => Command::Exec {
+                                        args: vec!["bash".into(), "-s".into()],
+                                        timeout_secs: Some(10),
+                                        stdin: Some(format!("exec {target} cli-startup-mimic\n")),
+                                        background: false,
+                                        env: vec![],
+                                    },
+                                    _ => unreachable!(),
+                                };
+                                let resp = run.send(&handle, command).await;
+                                let pass = matches!(
+                                    &resp,
+                                    Response::ExecResult { exit_code: 0, stdout, .. }
+                                        if stdout.contains("CLI_STARTUP_MIMIC_OK")
+                                );
+                                super::TestOutcome::new(&a, pass, format!("{resp:?}"))
+                            })
                         })
-                    })
-                });
+                    });
+            }
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// BR: Background Redirect Poll — file visibility while backgrounded
+// ═══════════════════════════════════════════════════════════════════
+
+#[allow(clippy::too_many_lines)] // exhaustive registration / runner
+pub(crate) fn register_bg_redirect_poll_tests(reg: &mut Registry<'_>) {
+    #[derive(Clone, Copy)]
+    struct Def {
+        name: &'static str,
+        marker: &'static str,
+        script_template: &'static str,
+        per_binary_type: bool,
+    }
+
+    let defs = [
+        Def {
+            name: "subshell_stdout",
+            marker: "BR_SUBSHELL_STDOUT",
+            script_template: "(echo BR_SUBSHELL_STDOUT; sleep 1) > {path} &\n",
+            per_binary_type: false,
+        },
+        Def {
+            name: "exe_stdout",
+            marker: "ECHO_TEST_OK",
+            script_template: "{exe} echo-test > {path} &\n",
+            per_binary_type: true,
+        },
+        Def {
+            name: "exe_stderr",
+            marker: "STDERR_ONLY_OK",
+            script_template: "{exe} stderr-only-test > {path} 2>&1 &\n",
+            per_binary_type: true,
+        },
+    ];
+
+    for &agent in AGENTS {
+        for def in defs {
+            let bts: &[Option<crate::BinaryType>] = if def.per_binary_type {
+                &[
+                    Some(crate::BinaryType::PieGlibc),
+                    Some(crate::BinaryType::NonPieGlibc),
+                    Some(crate::BinaryType::StaticPieGlibc),
+                    Some(crate::BinaryType::StaticPieMusl),
+                    Some(crate::BinaryType::NonPieStaticMusl),
+                ]
+            } else {
+                &[None]
+            };
+            for &bt_opt in bts {
+                let agent_s = agent.to_string();
+                let test_id = match bt_opt {
+                    None => format!("BR.{}.{agent}", def.name),
+                    Some(bt) => format!("BR.{}.{}.{agent}", def.name, bt.label()),
+                };
+                let path_label = match bt_opt {
+                    None => def.name.to_string(),
+                    Some(bt) => format!("{}-{}", def.name, bt.label()),
+                };
+                reg.test("shell", "bg_redirect_poll", test_id)
+                    .timeout(60)
+                    .build(move |cx| {
+                        let handle = cx.require(agent);
+                        Box::new(move |run| {
+                            let a = agent_s.clone();
+                            let path_label = path_label.clone();
+                            let self_exe = run.self_exe().to_string();
+                            Box::pin(async move {
+                                let path = format!("/shared/br-{path_label}-{a}.txt");
+                                let exe_path = match bt_opt {
+                                    None => self_exe.clone(),
+                                    Some(bt) => crate::binary_path(bt, &self_exe),
+                                };
+                                let script = format!(
+                                    "{}PID=$!\nfor _ in 1 2 3 4 5 6 7 8 9 10; do\n  if grep -q '{}' '{}'; then\n    kill $PID 2>/dev/null; wait $PID 2>/dev/null\n    cat '{}'\n    exit 0\n  fi\n  sleep 0.1\ndone\nkill $PID 2>/dev/null; wait $PID 2>/dev/null\ncat '{}' 2>/dev/null\nexit 1\n",
+                                    def.script_template
+                                        .replace("{path}", &path)
+                                        .replace("{exe}", &exe_path),
+                                    def.marker,
+                                    path,
+                                    path,
+                                    path,
+                                );
+                                let resp = run
+                                    .send(
+                                        &handle,
+                                        Command::Exec {
+                                            args: vec!["bash".into(), "-c".into(), script],
+                                            timeout_secs: Some(10),
+                                            stdin: None,
+                                            background: false,
+                                            env: vec![],
+                                        },
+                                    )
+                                    .await;
+                                let pass = matches!(
+                                    &resp,
+                                    Response::ExecResult { exit_code: 0, stdout, .. }
+                                        if stdout.contains(def.marker)
+                                );
+                                super::TestOutcome::new(&a, pass, format!("{resp:?}"))
+                            })
+                        })
+                    });
+            }
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// BRS: Background Redirect Stdin Poll — stdin pipe + stdout redirect
+// ═══════════════════════════════════════════════════════════════════
+
+#[allow(clippy::too_many_lines)] // exhaustive registration / runner
+pub(crate) fn register_bg_redirect_stdin_poll_tests(reg: &mut Registry<'_>) {
+    #[derive(Clone, Copy)]
+    struct Def {
+        name: &'static str,
+        consumer_template: &'static str,
+        per_binary_type: bool,
+    }
+
+    const SHELLS: &[(&str, &str)] = &[("bash", "bash"), ("sh", "sh")];
+    const DELIVERIES: &[&str] = &["tokio_pipe", "bash_heredoc_pipe"];
+    let defs = [
+        Def {
+            name: "subshell_stdin",
+            consumer_template: "cat",
+            per_binary_type: false,
+        },
+        Def {
+            name: "exe_stdin",
+            consumer_template: "{exe} stdin-echo-test",
+            per_binary_type: true,
+        },
+    ];
+
+    for &agent in AGENTS {
+        for &(shell_name, shell_bin) in SHELLS {
+            for &delivery in DELIVERIES {
+                for def in defs {
+                    let bts: &[Option<crate::BinaryType>] = if def.per_binary_type {
+                        &[
+                            Some(crate::BinaryType::PieGlibc),
+                            Some(crate::BinaryType::NonPieGlibc),
+                            Some(crate::BinaryType::StaticPieGlibc),
+                            Some(crate::BinaryType::StaticPieMusl),
+                            Some(crate::BinaryType::NonPieStaticMusl),
+                        ]
+                    } else {
+                        &[None]
+                    };
+                    for &bt_opt in bts {
+                        let agent_s = agent.to_string();
+                        let test_id = match bt_opt {
+                            None => format!("BRS.{}.{shell_name}.{delivery}.{agent}", def.name),
+                            Some(bt) => format!(
+                                "BRS.{}.{shell_name}.{delivery}.{}.{agent}",
+                                def.name,
+                                bt.label()
+                            ),
+                        };
+                        let path_label = match bt_opt {
+                            None => def.name.to_string(),
+                            Some(bt) => format!("{}-{}", def.name, bt.label()),
+                        };
+                        reg.test("shell", "bg_redirect_stdin_poll", test_id)
+                            .timeout(60)
+                            .build(move |cx| {
+                                let handle = cx.require(agent);
+                                Box::new(move |run| {
+                                    let a = agent_s.clone();
+                                    let path_label = path_label.clone();
+                                    let self_exe = run.self_exe().to_string();
+                                    Box::pin(async move {
+                                        let path = format!(
+                                            "/shared/brs-{path_label}-{shell_name}-{delivery}-{a}.txt"
+                                        );
+                                        let marker = format!(
+                                            "BRS_PAYLOAD_{}_{}_{}",
+                                            def.name, shell_name, delivery
+                                        );
+                                        let exe_path = match bt_opt {
+                                            None => self_exe.clone(),
+                                            Some(bt) => crate::binary_path(bt, &self_exe),
+                                        };
+                                        let consumer = def
+                                            .consumer_template
+                                            .replace("{exe}", &exe_path);
+                                        let (producer_script, stdin) = match delivery {
+                                            "tokio_pipe" => (
+                                                format!("cat | {consumer} > {path} &\n"),
+                                                Some(format!("{marker}\n")),
+                                            ),
+                                            "bash_heredoc_pipe" => (
+                                                format!(
+                                                    "cat <<'BRS_EOF' | {consumer} > {path} &\n{marker}\nBRS_EOF\n"
+                                                ),
+                                                None,
+                                            ),
+                                            _ => unreachable!(),
+                                        };
+                                        let script = format!(
+                                            "{producer_script}PID=$!\nfor _ in 1 2 3 4 5 6 7 8 9 10; do\n  if grep -q '{marker}' '{path}'; then\n    wait $PID 2>/dev/null\n    cat '{path}'\n    exit 0\n  fi\n  sleep 0.1\ndone\nkill $PID 2>/dev/null; wait $PID 2>/dev/null\ncat '{path}' 2>/dev/null\nexit 1\n"
+                                        );
+                                        let resp = run
+                                            .send(
+                                                &handle,
+                                                Command::Exec {
+                                                    args: vec![
+                                                        shell_bin.into(),
+                                                        "-c".into(),
+                                                        script,
+                                                    ],
+                                                    timeout_secs: Some(10),
+                                                    stdin,
+                                                    background: false,
+                                                    env: vec![],
+                                                },
+                                            )
+                                            .await;
+                                        let pass = matches!(
+                                            &resp,
+                                            Response::ExecResult { exit_code: 0, stdout, .. }
+                                                if stdout.contains(&marker)
+                                        );
+                                        super::TestOutcome::new(&a, pass, format!("{resp:?}"))
+                                    })
+                                })
+                            });
+                    }
+                }
+            }
         }
     }
 }
@@ -2217,6 +2631,7 @@ pub(crate) fn register_pipe_nonblock_tests(reg: &mut Registry<'_>) {
                                         timeout_secs: Some(10),
                                         stdin: None,
                                         background: false,
+                                        env: vec![],
                                     },
                                 )
                                 .await;
@@ -2262,6 +2677,7 @@ pub(crate) fn register_pipe_nonblock_tests(reg: &mut Registry<'_>) {
                                     timeout_secs: Some(10),
                                     stdin: None,
                                     background: false,
+                                    env: vec![],
                                 },
                             )
                             .await;
@@ -2329,6 +2745,7 @@ pub(crate) fn register_epoll_socket_tests(reg: &mut Registry<'_>) {
                                         timeout_secs: Some(15),
                                         stdin: None,
                                         background: false,
+                                        env: vec![],
                                     },
                                 )
                                 .await;
@@ -2373,6 +2790,7 @@ pub(crate) fn register_epoll_socket_tests(reg: &mut Registry<'_>) {
                                         timeout_secs: Some(15),
                                         stdin: None,
                                         background: false,
+                                        env: vec![],
                                     },
                                 )
                                 .await;

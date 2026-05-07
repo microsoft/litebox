@@ -242,6 +242,23 @@ pub trait FileSystem: private::Sealed + FdEnabledSubsystem {
         false
     }
 
+    /// Get the stored window size for a PTY file descriptor.
+    ///
+    /// Returns `Some(size)` if the fd refers to a PTY device, `None` otherwise.
+    #[expect(unused_variables, reason = "default body, non-underscored param names")]
+    fn get_pty_window_size(&self, fd: &TypedFd<Self>) -> Option<crate::platform::WindowSize> {
+        None
+    }
+
+    /// Set the stored window size for a PTY file descriptor.
+    ///
+    /// Returns `true` if the fd refers to a PTY device and the size was updated,
+    /// `false` otherwise.
+    #[expect(unused_variables, reason = "default body, non-underscored param names")]
+    fn set_pty_window_size(&self, fd: &TypedFd<Self>, size: crate::platform::WindowSize) -> bool {
+        false
+    }
+
     /// Get the foreground process group for a PTY file descriptor.
     ///
     /// Returns `Some(pgrp)` if the fd refers to a PTY device, `None` otherwise.
@@ -257,6 +274,18 @@ pub trait FileSystem: private::Sealed + FdEnabledSubsystem {
     /// `false` otherwise.
     #[expect(unused_variables, reason = "default body, non-underscored param names")]
     fn set_pty_foreground_pgrp(&self, fd: &TypedFd<Self>, pgrp: i32) -> bool {
+        false
+    }
+
+    /// Get the terminal window size stored for a PTY file descriptor.
+    #[expect(unused_variables, reason = "default body, non-underscored param names")]
+    fn get_pty_winsize(&self, fd: &TypedFd<Self>) -> Option<crate::platform::WindowSize> {
+        None
+    }
+
+    /// Set the terminal window size stored for a PTY file descriptor.
+    #[expect(unused_variables, reason = "default body, non-underscored param names")]
+    fn set_pty_winsize(&self, fd: &TypedFd<Self>, winsize: crate::platform::WindowSize) -> bool {
         false
     }
 

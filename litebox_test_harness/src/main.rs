@@ -75,6 +75,106 @@ use litebox_test_harness::protocol;
 
 use std::io::Write as _;
 
+/// Resolve the target binary that an M/BS subcommand should spawn.
+///
+/// The M and BS minimal canary subcommands spawn a child binary
+/// internally (originally always the non-PIE harness companion).
+/// Tests exercise per-binary-type behavior by setting
+/// `LITEBOX_M_TARGET_BINARY=<path>` via the Exec command's `env`
+/// field; when that env var is set, the subcommand spawns that path
+/// instead. When unset, defaults to
+/// `litebox_test_harness::nonpie_binary()` so existing behavior is
+/// preserved for M tests that don't yet thread a binary type
+/// through.
+fn m_target_binary() -> String {
+    if let Ok(p) = std::env::var("LITEBOX_M_TARGET_BINARY")
+        && !p.is_empty()
+    {
+        return p;
+    }
+    litebox_test_harness::nonpie_binary()
+}
+
+static PTY_SIGWINCH_SEEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+extern "C" fn pty_sigwinch_handler(_: i32) {
+    PTY_SIGWINCH_SEEN.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+fn pty_tiocgpgrp_probe() {
+    let mut pgrp: libc::pid_t = 0;
+    // SAFETY: TIOCGPGRP writes a pid_t to the provided pointer for fd 0.
+    if unsafe { libc::ioctl(0, libc::TIOCGPGRP, &mut pgrp) } != 0 {
+        eprintln!("TIOCGPGRP failed: {}", std::io::Error::last_os_error());
+        std::process::exit(1);
+    }
+    println!("TIOCGPGRP pgrp={pgrp}");
+}
+
+fn pty_tiocspgrp_probe() {
+    // SAFETY: getpgrp has no preconditions.
+    let pgrp = unsafe { libc::getpgrp() };
+    let mut set = pgrp;
+    // SAFETY: TIOCSPGRP reads a pid_t from the provided pointer for fd 0.
+    if unsafe { libc::ioctl(0, libc::TIOCSPGRP, &mut set) } != 0 {
+        eprintln!("TIOCSPGRP failed: {}", std::io::Error::last_os_error());
+        std::process::exit(1);
+    }
+    let mut got: libc::pid_t = 0;
+    // SAFETY: TIOCGPGRP writes a pid_t to the provided pointer for fd 0.
+    if unsafe { libc::ioctl(0, libc::TIOCGPGRP, &mut got) } != 0 {
+        eprintln!(
+            "TIOCGPGRP after set failed: {}",
+            std::io::Error::last_os_error()
+        );
+        std::process::exit(1);
+    }
+    println!("TIOCSPGRP pgrp={pgrp} got={got}");
+}
+
+fn pty_tiocsctty_probe() {
+    let path = std::ffi::CString::new("/dev/tty").expect("static path");
+    // SAFETY: open reads a valid nul-terminated static path.
+    let fd = unsafe { libc::open(path.as_ptr(), libc::O_WRONLY | libc::O_CLOEXEC) };
+    if fd < 0 {
+        eprintln!("open /dev/tty failed: {}", std::io::Error::last_os_error());
+        std::process::exit(1);
+    }
+    let msg = b"TTY_OK\n";
+    // SAFETY: msg is valid readable memory and fd is a live /dev/tty fd.
+    let rc = unsafe { libc::write(fd, msg.as_ptr().cast(), msg.len()) };
+    // SAFETY: fd is owned by this process and no longer used.
+    let _ = unsafe { libc::close(fd) };
+    if rc != msg.len() as isize {
+        eprintln!("write /dev/tty failed: {}", std::io::Error::last_os_error());
+        std::process::exit(1);
+    }
+}
+
+fn pty_resize_probe() {
+    PTY_SIGWINCH_SEEN.store(false, std::sync::atomic::Ordering::SeqCst);
+    // SAFETY: installing a simple signal handler function for SIGWINCH.
+    unsafe {
+        libc::signal(
+            libc::SIGWINCH,
+            pty_sigwinch_handler as *const () as libc::sighandler_t,
+        );
+    }
+    println!("READY");
+    let _ = std::io::stdout().flush();
+    while !PTY_SIGWINCH_SEEN.load(std::sync::atomic::Ordering::SeqCst) {
+        // SAFETY: pause waits for a signal; EINTR is expected after SIGWINCH.
+        unsafe { libc::pause() };
+    }
+    let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
+    // SAFETY: TIOCGWINSZ writes winsize to the provided pointer for fd 0.
+    if unsafe { libc::ioctl(0, libc::TIOCGWINSZ, &mut ws) } != 0 {
+        eprintln!("TIOCGWINSZ failed: {}", std::io::Error::last_os_error());
+        std::process::exit(1);
+    }
+    println!("RESIZE rows={} cols={}", ws.ws_row, ws.ws_col);
+}
+
 #[allow(clippy::too_many_lines)] // exhaustive runner / dispatch table
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -83,7 +183,9 @@ fn main() {
 
     // Log the resolved binary path so stale rootfs copies are immediately
     // obvious (args[0] may differ from the real on-disk path).
-    if let Ok(real) = std::env::current_exe() {
+    if !cmd.starts_with("pty-")
+        && let Ok(real) = std::env::current_exe()
+    {
         eprintln!("[harness] self_exe={self_exe} resolved={}", real.display());
     }
 
@@ -145,6 +247,19 @@ fn main() {
                 let _ = unsafe { libc::write(1, buf.as_ptr() as *const _, n as usize) };
             }
         }
+        "cli-startup-mimic" => {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("tokio runtime");
+            rt.block_on(async {
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                    .await
+                    .expect("bind cli startup mimic listener");
+                let addr = listener.local_addr().expect("listener addr");
+                println!("CLI_STARTUP_MIMIC_OK {addr}");
+            });
+        }
         "large-stdout-test" => {
             // Child writes a fixed N-byte payload to stdout. Tests
             // whether stdout bridging works for larger payloads (vs
@@ -167,7 +282,7 @@ fn main() {
         "M1-tokio-spawn-nonpie" => {
             // M1: PIE process, current_thread tokio runtime, spawn one
             // non-PIE child, wait, verify parent still alive.
-            let nonpie = litebox_test_harness::nonpie_binary();
+            let nonpie = m_target_binary();
             let parent_pid = std::process::id();
             eprintln!("[M1] pid={parent_pid} spawning nonpie={nonpie}");
 
@@ -209,7 +324,7 @@ fn main() {
             // M2: PIE process, NO tokio. Raw libc fork+execve(nonpie),
             // waitpid, verify parent still alive. Isolates whether
             // tokio is required to trigger the bug.
-            let nonpie = litebox_test_harness::nonpie_binary();
+            let nonpie = m_target_binary();
             let parent_pid = std::process::id();
             eprintln!("[M2] pid={parent_pid} libc fork+execve nonpie={nonpie}");
 
@@ -282,7 +397,7 @@ fn main() {
             // "almost dead" after the spawn (e.g. relay threads gone
             // but main thread still serving), the post-work step
             // catches it.
-            let nonpie = litebox_test_harness::nonpie_binary();
+            let nonpie = m_target_binary();
             let parent_pid = std::process::id();
             eprintln!("[M3] pid={parent_pid} step 1: spawn nonpie");
 
@@ -339,7 +454,7 @@ fn main() {
             // tokio runtime. Counts how many spawns the parent
             // survives before dying.
             let n: usize = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(5);
-            let nonpie = litebox_test_harness::nonpie_binary();
+            let nonpie = m_target_binary();
             let parent_pid = std::process::id();
             eprintln!("[M4] pid={parent_pid} N={n} spawning nonpie={nonpie}");
 
@@ -385,7 +500,7 @@ fn main() {
             // a non-PIE worker has the same Bug-B shape as STDOUT (which
             // M1 covers). If BS1 passes but M1 fails (or vice versa),
             // the bug is direction-specific.
-            let nonpie = litebox_test_harness::nonpie_binary();
+            let nonpie = m_target_binary();
             let parent_pid = std::process::id();
             eprintln!("[BS1] pid={parent_pid} spawning nonpie={nonpie} stderr-only-test");
             let rt = tokio::runtime::Builder::new_current_thread()
@@ -427,7 +542,7 @@ fn main() {
             // stdin; child echoes back to stdout. Parent verifies it
             // reads "BS2_PING\n" from stdout. Tests bidirectional
             // bridging: parent → child stdin AND child → parent stdout.
-            let nonpie = litebox_test_harness::nonpie_binary();
+            let nonpie = m_target_binary();
             let parent_pid = std::process::id();
             eprintln!("[BS2] pid={parent_pid} spawning nonpie={nonpie} stdin-echo-test");
             let rt = tokio::runtime::Builder::new_current_thread()
@@ -481,7 +596,7 @@ fn main() {
             // M1 fails (small) but BS3 passes (large), the bug is
             // small-payload-specific (e.g. lost wakeup before EOF).
             // If both fail, the bug is general.
-            let nonpie = litebox_test_harness::nonpie_binary();
+            let nonpie = m_target_binary();
             let parent_pid = std::process::id();
             eprintln!("[BS3] pid={parent_pid} spawning nonpie={nonpie} large-stdout-test");
             let rt = tokio::runtime::Builder::new_current_thread()
@@ -717,6 +832,9 @@ fn main() {
                 std::thread::sleep(std::time::Duration::from_millis(50));
             }
         }
+        "wait-forever" => loop {
+            std::thread::park();
+        },
         "epoll-socket" => {
             // Minimal reproduction of epoll + TCP socket wakeup.
             //
@@ -1063,6 +1181,18 @@ fn main() {
             }
             // Flush and exit immediately — exercises the bridge-join race.
             let _ = std::io::stdout().flush();
+        }
+        "pty-tiocgpgrp" => {
+            pty_tiocgpgrp_probe();
+        }
+        "pty-tiocspgrp" => {
+            pty_tiocspgrp_probe();
+        }
+        "pty-tiocsctty" => {
+            pty_tiocsctty_probe();
+        }
+        "pty-resize" => {
+            pty_resize_probe();
         }
         "write-known" => {
             // Write "PIPEDATA:{tag}\n" to stdout. Used for pipe chain integrity.

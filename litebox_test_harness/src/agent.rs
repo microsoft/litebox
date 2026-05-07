@@ -5,8 +5,9 @@
 //! writes responses to stdout. Intermediate nodes forward commands to
 //! their children.
 
-use crate::protocol::{Command, Response, WaitPredicate};
+use crate::protocol::{Clone3Kind, Command, EpollEvent, Response, WaitPredicate};
 use std::collections::HashMap;
+use std::ffi::CString;
 use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -26,11 +27,74 @@ struct ListenerEntry {
     task: tokio::task::JoinHandle<()>,
 }
 
-struct BackgroundProcess {
-    process: tokio::process::Child,
-    stdout: Arc<Mutex<Vec<u8>>>,
-    stderr: Arc<Mutex<Vec<u8>>>,
-    drains: Vec<tokio::task::JoinHandle<()>>,
+struct EventfdEntry {
+    fd: OwnedFd,
+    flags: String,
+    authorized_readers: Vec<String>,
+}
+
+enum BackgroundProcess {
+    Tokio {
+        process: tokio::process::Child,
+        stdout: Arc<Mutex<Vec<u8>>>,
+        stderr: Arc<Mutex<Vec<u8>>>,
+        drains: Vec<tokio::task::JoinHandle<()>>,
+    },
+    RawPid {
+        pid: libc::pid_t,
+    },
+}
+
+struct PtyMaster {
+    fd: OwnedFd,
+    slave_path: String,
+}
+
+#[repr(C)]
+#[derive(Default)]
+struct IoSqringOffsets {
+    head: u32,
+    tail: u32,
+    ring_mask: u32,
+    ring_entries: u32,
+    flags: u32,
+    dropped: u32,
+    array: u32,
+    resv1: u32,
+    user_addr: u64,
+}
+
+#[repr(C)]
+#[derive(Default)]
+struct IoCqringOffsets {
+    head: u32,
+    tail: u32,
+    ring_mask: u32,
+    ring_entries: u32,
+    overflow: u32,
+    cqes: u32,
+    flags: u32,
+    resv1: u32,
+    user_addr: u64,
+}
+
+#[repr(C)]
+#[derive(Default)]
+struct IoUringParams {
+    sq_entries: u32,
+    cq_entries: u32,
+    flags: u32,
+    sq_thread_cpu: u32,
+    sq_thread_idle: u32,
+    features: u32,
+    wq_fd: u32,
+    resv: [u32; 3],
+    sq_off: IoSqringOffsets,
+    cq_off: IoCqringOffsets,
+}
+
+fn errno() -> i32 {
+    std::io::Error::last_os_error().raw_os_error().unwrap_or(0)
 }
 
 fn marker_stream_matches(configured: &str, actual: &str) -> bool {
@@ -79,6 +143,24 @@ const INHERITED_LISTEN_FD_LIMIT: i32 = 99;
 
 type TcpConn = Arc<tokio::sync::Mutex<TcpStream>>;
 
+#[derive(Clone, Debug)]
+struct EpollTarget {
+    kind: &'static str,
+    id: u64,
+}
+
+struct EpollRegisteredFd {
+    target: EpollTarget,
+    // pidfd registrations are opened only for this epoll set. Socket and
+    // eventfd registrations are owned by their registries and leave this empty.
+    _owned_fd: Option<OwnedFd>,
+}
+
+struct EpollEntry {
+    fd: OwnedFd,
+    registered: HashMap<i32, EpollRegisteredFd>,
+}
+
 /// Run the agent. Reads commands from stdin, executes, responds on stdout.
 pub fn run(self_exe: &str) {
     tokio::runtime::Builder::new_current_thread()
@@ -103,6 +185,12 @@ async fn agent_loop(self_exe: &str) {
     let mut unix_listeners: HashMap<String, tokio::task::JoinHandle<()>> = HashMap::new();
     let mut connections: HashMap<u64, TcpConn> = HashMap::new();
     let mut next_conn_id = 1u64;
+    let mut eventfds: HashMap<u64, EventfdEntry> = HashMap::new();
+    let mut next_eventfd_id = 1u64;
+    let mut pty_masters: HashMap<u64, PtyMaster> = HashMap::new();
+    let mut next_pty_id = 1u64;
+    let mut epolls: HashMap<u64, EpollEntry> = HashMap::new();
+    let mut next_epoll_id = 1u64;
     let mut background_pids: HashMap<u32, BackgroundProcess> = HashMap::new();
 
     let mut line = String::new();
@@ -282,6 +370,19 @@ async fn agent_loop(self_exe: &str) {
                 let pid = std::process::id();
                 respond(&Response::Ok {
                     data: Some(pid.to_string()),
+                })
+                .await;
+            }
+
+            Command::Clone3 { kind, exec_target } => {
+                let result = tokio::task::spawn_blocking(move || run_clone3(kind, exec_target))
+                    .await
+                    .unwrap_or_else(|e| clone_result_error(format!("clone3 task join: {e}")));
+                respond(&Response::CloneResult {
+                    pid: result.pid,
+                    pidfd: result.pidfd,
+                    ok: result.ok,
+                    error: result.error,
                 })
                 .await;
             }
@@ -572,11 +673,173 @@ async fn agent_loop(self_exe: &str) {
             }
 
             Command::NetClose { conn } => {
+                let fd = if let Some(stream) = connections.get(&conn).cloned() {
+                    let stream = stream.lock().await;
+                    Some(stream.as_raw_fd())
+                } else {
+                    None
+                };
                 if connections.remove(&conn).is_some() {
+                    if let Some(fd) = fd {
+                        remove_epoll_registration(&mut epolls, fd);
+                    }
                     respond(&Response::Closed).await;
                 } else {
                     respond(&Response::Error {
                         error: format!("unknown conn {conn}"),
+                    })
+                    .await;
+                }
+            }
+
+            Command::EpollCreate => {
+                if next_epoll_id == u64::MAX {
+                    respond(&Response::Error {
+                        error: "epoll id space exhausted".to_string(),
+                    })
+                    .await;
+                    continue;
+                }
+                // SAFETY: epoll_create1 creates a fresh descriptor on success.
+                let fd = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
+                if fd < 0 {
+                    respond(&Response::Error {
+                        error: format!("epoll_create1: {}", std::io::Error::last_os_error()),
+                    })
+                    .await;
+                    continue;
+                }
+                let id = next_epoll_id;
+                next_epoll_id += 1;
+                epolls.insert(
+                    id,
+                    EpollEntry {
+                        // SAFETY: fd was just returned by epoll_create1 and is owned here.
+                        fd: unsafe { OwnedFd::from_raw_fd(fd) },
+                        registered: HashMap::new(),
+                    },
+                );
+                respond(&Response::EpollHandle { id }).await;
+            }
+
+            Command::EpollAddPidfd { epoll, pid, events } => {
+                let Some(entry) = epolls.get_mut(&epoll) else {
+                    respond(&Response::Error {
+                        error: format!("unknown epoll {epoll}"),
+                    })
+                    .await;
+                    continue;
+                };
+                match add_pidfd_to_epoll(entry, pid, &events) {
+                    Ok(()) => respond(&Response::Ok { data: None }).await,
+                    Err(error) => respond(&Response::Error { error }).await,
+                }
+            }
+
+            Command::EpollAddSocket {
+                epoll,
+                conn,
+                events,
+            } => {
+                let Some(entry) = epolls.get_mut(&epoll) else {
+                    respond(&Response::Error {
+                        error: format!("unknown epoll {epoll}"),
+                    })
+                    .await;
+                    continue;
+                };
+                let Some(stream) = connections.get(&conn).cloned() else {
+                    respond(&Response::Error {
+                        error: format!("unknown conn {conn}"),
+                    })
+                    .await;
+                    continue;
+                };
+                let fd = {
+                    let stream = stream.lock().await;
+                    stream.as_raw_fd()
+                };
+                let owned_fd = match dup_fd_cloexec(fd) {
+                    Ok(owned_fd) => owned_fd,
+                    Err(error) => {
+                        respond(&Response::Error { error }).await;
+                        continue;
+                    }
+                };
+                let epoll_fd = owned_fd.as_raw_fd();
+                match add_raw_fd_to_epoll(
+                    entry,
+                    epoll_fd,
+                    &events,
+                    EpollTarget {
+                        kind: "socket",
+                        id: conn,
+                    },
+                    Some(owned_fd),
+                ) {
+                    Ok(()) => respond(&Response::Ok { data: None }).await,
+                    Err(error) => respond(&Response::Error { error }).await,
+                }
+            }
+
+            Command::EpollAddEventfd {
+                epoll,
+                eventfd_id,
+                events,
+            } => {
+                let Some(entry) = epolls.get_mut(&epoll) else {
+                    respond(&Response::Error {
+                        error: format!("unknown epoll {epoll}"),
+                    })
+                    .await;
+                    continue;
+                };
+                let Some(fd) = eventfds.get(&eventfd_id) else {
+                    respond(&Response::Error {
+                        error: format!("unknown eventfd {eventfd_id}"),
+                    })
+                    .await;
+                    continue;
+                };
+                match add_raw_fd_to_epoll(
+                    entry,
+                    fd.fd.as_raw_fd(),
+                    &events,
+                    EpollTarget {
+                        kind: "eventfd",
+                        id: eventfd_id,
+                    },
+                    None,
+                ) {
+                    Ok(()) => respond(&Response::Ok { data: None }).await,
+                    Err(error) => respond(&Response::Error { error }).await,
+                }
+            }
+
+            Command::EpollWait {
+                epoll,
+                timeout_ms,
+                max_events,
+            } => {
+                let Some(entry) = epolls.get(&epoll) else {
+                    respond(&Response::Error {
+                        error: format!("unknown epoll {epoll}"),
+                    })
+                    .await;
+                    continue;
+                };
+                match wait_epoll(entry, timeout_ms, max_events) {
+                    Ok(events) => respond(&Response::EpollEvents { events }).await,
+                    Err(error) => respond(&Response::Error { error }).await,
+                }
+            }
+
+            Command::EpollClose { epoll } => {
+                if epolls.remove(&epoll).is_some() {
+                    respond(&Response::Closed).await;
+                } else {
+                    respond(&Response::Error {
+                        error: format!("unknown epoll {epoll}"),
                     })
                     .await;
                 }
@@ -599,6 +862,7 @@ async fn agent_loop(self_exe: &str) {
                 timeout_secs,
                 stdin: stdin_content,
                 background,
+                env,
             } => {
                 if args.is_empty() {
                     respond(&Response::Error {
@@ -611,6 +875,9 @@ async fn agent_loop(self_exe: &str) {
                 let use_piped_stdin = stdin_content.is_some();
                 let mut cmd = tokio::process::Command::new(&args[0]);
                 cmd.args(&args[1..]);
+                for (key, value) in &env {
+                    cmd.env(key, value);
+                }
                 if use_piped_stdin {
                     cmd.stdin(std::process::Stdio::piped());
                 } else {
@@ -633,7 +900,7 @@ async fn agent_loop(self_exe: &str) {
                             let pid = child.id().unwrap_or(0);
                             background_pids.insert(
                                 pid,
-                                BackgroundProcess {
+                                BackgroundProcess::Tokio {
                                     process: child,
                                     stdout: Arc::new(Mutex::new(Vec::new())),
                                     stderr: Arc::new(Mutex::new(Vec::new())),
@@ -838,7 +1105,7 @@ async fn agent_loop(self_exe: &str) {
                         let pid = child.id().unwrap_or(0);
                         background_pids.insert(
                             pid,
-                            BackgroundProcess {
+                            BackgroundProcess::Tokio {
                                 process: child,
                                 stdout: stdout_buf,
                                 stderr: stderr_buf,
@@ -903,7 +1170,7 @@ async fn agent_loop(self_exe: &str) {
             }
 
             Command::WaitBackground { pid, timeout_secs } => {
-                let Some(mut bg) = background_pids.remove(&pid) else {
+                let Some(bg) = background_pids.remove(&pid) else {
                     respond(&Response::Error {
                         error: format!("unknown background pid: {pid}"),
                     })
@@ -911,38 +1178,76 @@ async fn agent_loop(self_exe: &str) {
                     continue;
                 };
                 let timeout = Duration::from_secs(timeout_secs.unwrap_or(30));
-                match tokio::time::timeout(timeout, bg.process.wait()).await {
-                    Ok(Ok(status)) => {
-                        for drain in bg.drains {
-                            let _ = drain.await;
+                match bg {
+                    BackgroundProcess::Tokio {
+                        mut process,
+                        stdout,
+                        stderr,
+                        drains,
+                    } => match tokio::time::timeout(timeout, process.wait()).await {
+                        Ok(Ok(status)) => {
+                            for drain in drains {
+                                let _ = drain.await;
+                            }
+                            let stdout = stdout.lock().expect("stdout buffer mutex").clone();
+                            let stderr = stderr.lock().expect("stderr buffer mutex").clone();
+                            respond(&Response::ExecResult {
+                                exit_code: status.code().unwrap_or(-1),
+                                stdout: String::from_utf8_lossy(&stdout).to_string(),
+                                stderr: String::from_utf8_lossy(&stderr).to_string(),
+                            })
+                            .await;
                         }
-                        let stdout = bg.stdout.lock().expect("stdout buffer mutex").clone();
-                        let stderr = bg.stderr.lock().expect("stderr buffer mutex").clone();
-                        respond(&Response::ExecResult {
-                            exit_code: status.code().unwrap_or(-1),
-                            stdout: String::from_utf8_lossy(&stdout).to_string(),
-                            stderr: String::from_utf8_lossy(&stderr).to_string(),
-                        })
-                        .await;
-                    }
-                    Ok(Err(e)) => {
-                        respond(&Response::Error {
-                            error: format!("wait_background: {e}"),
-                        })
-                        .await;
-                    }
-                    Err(_) => {
-                        let _ = bg.process.start_kill();
-                        for drain in bg.drains {
-                            drain.abort();
+                        Ok(Err(e)) => {
+                            respond(&Response::Error {
+                                error: format!("wait_background: {e}"),
+                            })
+                            .await;
                         }
-                        respond(&Response::ExecTimeout {
-                            stderr: format!(
-                                "background process timed out after {}s",
-                                timeout.as_secs()
-                            ),
-                        })
-                        .await;
+                        Err(_) => {
+                            let _ = process.start_kill();
+                            for drain in drains {
+                                drain.abort();
+                            }
+                            respond(&Response::ExecTimeout {
+                                stderr: format!(
+                                    "background process timed out after {}s",
+                                    timeout.as_secs()
+                                ),
+                            })
+                            .await;
+                        }
+                    },
+                    BackgroundProcess::RawPid { pid: raw_pid } => {
+                        let wait = tokio::task::spawn_blocking(move || wait_raw_child(raw_pid));
+                        match tokio::time::timeout(timeout, wait).await {
+                            Ok(Ok(Ok(status))) => {
+                                respond(&Response::ExecResult {
+                                    exit_code: status,
+                                    stdout: String::new(),
+                                    stderr: String::new(),
+                                })
+                                .await;
+                            }
+                            Ok(Ok(Err(error))) => respond(&Response::Error { error }).await,
+                            Ok(Err(error)) => {
+                                respond(&Response::Error {
+                                    error: format!("wait_background join: {error}"),
+                                })
+                                .await;
+                            }
+                            Err(_) => {
+                                // SAFETY: raw_pid came from fork and still denotes the child we own.
+                                let _ = unsafe { libc::kill(raw_pid, libc::SIGKILL) };
+                                respond(&Response::ExecTimeout {
+                                    stderr: format!(
+                                        "background process timed out after {}s",
+                                        timeout.as_secs()
+                                    ),
+                                })
+                                .await;
+                            }
+                        }
                     }
                 }
             }
@@ -1195,19 +1500,165 @@ async fn agent_loop(self_exe: &str) {
                 }
             }
 
-            Command::Kill { pid } => {
-                if let Some(mut child) = background_pids.remove(&pid) {
-                    let _ = child.process.start_kill();
-                    for drain in child.drains {
-                        drain.abort();
+            Command::IoUringSetup { entries } => {
+                let mut params = IoUringParams::default();
+                // SAFETY: `params` points to a valid writable C-compatible
+                // io_uring_params buffer for the duration of the syscall, and
+                // the kernel does not retain the pointer after returning.
+                let ret =
+                    unsafe { libc::syscall(libc::SYS_io_uring_setup, entries, &raw mut params) };
+                if ret >= 0 {
+                    // The discovery command only needs to know that the kernel
+                    // returned a descriptor. Close it immediately and report a
+                    // stable positive sentinel instead of leaking a ring fd.
+                    // SAFETY: `ret` is a fresh fd returned by io_uring_setup;
+                    // close consumes only that fd and no Rust object owns it.
+                    unsafe {
+                        libc::close(ret as i32);
                     }
+                    respond(&Response::IoUringResult {
+                        ring_fd: 1,
+                        errno: None,
+                    })
+                    .await;
                 } else {
-                    // Try OS-level kill as fallback.
+                    respond(&Response::IoUringResult {
+                        ring_fd: -1,
+                        errno: Some(errno()),
+                    })
+                    .await;
+                }
+            }
+
+            Command::EpollOpen => {
+                // SAFETY: epoll_create1 takes an integer flag word and returns
+                // a new fd or -1; no pointers or aliases are involved.
+                let ret = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
+                if ret >= 0 {
+                    // Close immediately; the test only asserts that epoll can
+                    // still create an fd after io_uring_setup probing.
+                    // SAFETY: `ret` is a fresh fd returned by epoll_create1.
+                    unsafe {
+                        libc::close(ret);
+                    }
+                    respond(&Response::EpollOpenResult {
+                        epoll_fd: 1,
+                        errno: None,
+                    })
+                    .await;
+                } else {
+                    respond(&Response::EpollOpenResult {
+                        epoll_fd: -1,
+                        errno: Some(errno()),
+                    })
+                    .await;
+                }
+            }
+
+            Command::Kill { pid } => {
+                if let Some(child) = background_pids.remove(&pid) {
+                    terminate_background(child);
+                } else {
+                    // SAFETY: fallback for caller-provided PID; errors are ignored.
                     unsafe {
                         libc::kill(pid as i32, libc::SIGKILL);
                     }
                 }
                 respond(&Response::Ok { data: None }).await;
+            }
+
+            Command::PtyOpen {} => {
+                if next_pty_id == u64::MAX {
+                    respond(&Response::Error {
+                        error: "pty id space exhausted".to_string(),
+                    })
+                    .await;
+                    continue;
+                }
+                match open_pty_master() {
+                    Ok(master_entry) => {
+                        let master = next_pty_id;
+                        next_pty_id += 1;
+                        let slave_path = master_entry.slave_path.clone();
+                        pty_masters.insert(master, master_entry);
+                        respond(&Response::PtyHandle { master, slave_path }).await;
+                    }
+                    Err(error) => respond(&Response::Error { error }).await,
+                }
+            }
+
+            Command::PtyExec {
+                master,
+                args,
+                ctrl_tty,
+            } => {
+                let Some(pty) = pty_masters.get(&master) else {
+                    respond(&Response::Error {
+                        error: format!("unknown pty master {master}"),
+                    })
+                    .await;
+                    continue;
+                };
+                match fork_exec_pty(pty, &args, ctrl_tty) {
+                    Ok(pid) => {
+                        background_pids.insert(pid as u32, BackgroundProcess::RawPid { pid });
+                        respond(&Response::Background { pid: pid as u32 }).await;
+                    }
+                    Err(error) => respond(&Response::Error { error }).await,
+                }
+            }
+
+            Command::PtyWrite { master, data } => {
+                let Some(pty) = pty_masters.get(&master) else {
+                    respond(&Response::Error {
+                        error: format!("unknown pty master {master}"),
+                    })
+                    .await;
+                    continue;
+                };
+                match write_all_fd(pty.fd.as_raw_fd(), data.as_bytes()) {
+                    Ok(()) => respond(&Response::Sent).await,
+                    Err(error) => respond(&Response::Error { error }).await,
+                }
+            }
+
+            Command::PtyRead { master, n_bytes } => {
+                let Some(pty) = pty_masters.get(&master) else {
+                    respond(&Response::Error {
+                        error: format!("unknown pty master {master}"),
+                    })
+                    .await;
+                    continue;
+                };
+                match read_pty(pty.fd.as_raw_fd(), n_bytes) {
+                    Ok(data) => respond(&Response::Received { data }).await,
+                    Err(error) => respond(&Response::Error { error }).await,
+                }
+            }
+
+            Command::PtyResize { master, rows, cols } => {
+                let Some(pty) = pty_masters.get(&master) else {
+                    respond(&Response::Error {
+                        error: format!("unknown pty master {master}"),
+                    })
+                    .await;
+                    continue;
+                };
+                match resize_pty(pty.fd.as_raw_fd(), rows, cols) {
+                    Ok(()) => respond(&Response::Ok { data: None }).await,
+                    Err(error) => respond(&Response::Error { error }).await,
+                }
+            }
+
+            Command::PtyClose { master } => {
+                if pty_masters.remove(&master).is_some() {
+                    respond(&Response::Closed).await;
+                } else {
+                    respond(&Response::Error {
+                        error: format!("unknown pty master {master}"),
+                    })
+                    .await;
+                }
             }
 
             Command::NetConnectMany {
@@ -1432,7 +1883,139 @@ async fn agent_loop(self_exe: &str) {
                 }
             }
 
+            Command::EventfdOpen { initval, flags } => {
+                let id = next_eventfd_id;
+                if id == u64::MAX {
+                    respond(&Response::Error {
+                        error: "eventfd id space exhausted".to_string(),
+                    })
+                    .await;
+                    continue;
+                }
+                match open_eventfd(initval, &flags) {
+                    Ok(fd) => {
+                        next_eventfd_id += 1;
+                        eventfds.insert(
+                            id,
+                            EventfdEntry {
+                                fd,
+                                flags,
+                                authorized_readers: Vec::new(),
+                            },
+                        );
+                        respond(&Response::EventfdHandle { id }).await;
+                    }
+                    Err(error) => respond(&Response::Error { error }).await,
+                }
+            }
+
+            Command::EventfdRead { id } => {
+                let Some(entry) = eventfds.get(&id) else {
+                    respond(&Response::Error {
+                        error: format!("unknown eventfd {id}"),
+                    })
+                    .await;
+                    continue;
+                };
+                match read_eventfd_value(entry.fd.as_raw_fd()) {
+                    Ok(value) => respond(&Response::EventfdValue { value }).await,
+                    Err(error) => respond(&Response::Error { error }).await,
+                }
+            }
+
+            Command::EventfdReadShared { id, reader } => {
+                let Some(entry) = eventfds.get(&id) else {
+                    respond(&Response::Error {
+                        error: format!("unknown eventfd {id}"),
+                    })
+                    .await;
+                    continue;
+                };
+                if !entry
+                    .authorized_readers
+                    .iter()
+                    .any(|authorized| authorized == &reader)
+                {
+                    respond(&Response::Error {
+                        error: format!("eventfd {id} reader {reader} is not authorized"),
+                    })
+                    .await;
+                    continue;
+                }
+                match read_eventfd_value(entry.fd.as_raw_fd()) {
+                    Ok(value) => respond(&Response::EventfdValue { value }).await,
+                    Err(error) => respond(&Response::Error { error }).await,
+                }
+            }
+
+            Command::EventfdWrite { id, value } => {
+                let Some(entry) = eventfds.get(&id) else {
+                    respond(&Response::Error {
+                        error: format!("unknown eventfd {id}"),
+                    })
+                    .await;
+                    continue;
+                };
+                match write_eventfd_value(entry.fd.as_raw_fd(), value) {
+                    Ok(()) => respond(&Response::Sent).await,
+                    Err(error) => respond(&Response::Error { error }).await,
+                }
+            }
+
+            Command::EventfdClose { id } => {
+                if eventfds.remove(&id).is_some() {
+                    respond(&Response::Closed).await;
+                } else {
+                    respond(&Response::Error {
+                        error: format!("unknown eventfd {id}"),
+                    })
+                    .await;
+                }
+            }
+
+            Command::EventfdShare { id, target } => {
+                let Some(entry) = eventfds.get_mut(&id) else {
+                    respond(&Response::Error {
+                        error: format!("unknown eventfd {id}"),
+                    })
+                    .await;
+                    continue;
+                };
+                if !entry
+                    .authorized_readers
+                    .iter()
+                    .any(|reader| reader == &target)
+                {
+                    entry.authorized_readers.push(target.clone());
+                }
+                // Layer 1 sharing is creator-registry based: a peer's logical
+                // read is forwarded back through this creator agent. We record
+                // the intended reader here, but do not pass the fd with SCM_RIGHTS.
+                respond(&Response::Ok {
+                    data: Some(format!(
+                        "eventfd {id} shared with {target}; readers={}",
+                        entry.authorized_readers.join(",")
+                    )),
+                })
+                .await;
+            }
+
+            Command::EventfdEpollEt { id } => {
+                let Some(entry) = eventfds.get(&id) else {
+                    respond(&Response::Error {
+                        error: format!("unknown eventfd {id}"),
+                    })
+                    .await;
+                    continue;
+                };
+                match eventfd_epollet_probe(id, entry) {
+                    Ok(detail) => respond(&Response::Ok { data: Some(detail) }).await,
+                    Err(error) => respond(&Response::Error { error }).await,
+                }
+            }
+
             Command::Exit => {
+                eventfds.clear();
                 // Abort all TCP echo servers.
                 for (_, entry) in listeners.drain() {
                     entry.task.abort();
@@ -1441,12 +2024,9 @@ async fn agent_loop(self_exe: &str) {
                 for (_, task) in unix_listeners.drain() {
                     task.abort();
                 }
-                // Kill background processes.
-                for (_, mut child) in background_pids.drain() {
-                    let _ = child.process.start_kill();
-                    for drain in child.drains {
-                        drain.abort();
-                    }
+                // Terminate background processes.
+                for (_, child) in background_pids.drain() {
+                    terminate_background(child);
                 }
                 // Send exit to all children.
                 for (_, mut child) in children.drain() {
@@ -1459,11 +2039,721 @@ async fn agent_loop(self_exe: &str) {
     }
 }
 
+fn parse_epoll_events(events: &str) -> Result<u32, String> {
+    let mut mask = 0u32;
+    for part in events
+        .split('|')
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+    {
+        mask |= match part.to_ascii_lowercase().as_str() {
+            "in" => libc::EPOLLIN as u32,
+            "out" => libc::EPOLLOUT as u32,
+            "err" => libc::EPOLLERR as u32,
+            "hup" => libc::EPOLLHUP as u32,
+            "rdhup" => libc::EPOLLRDHUP as u32,
+            "pri" => libc::EPOLLPRI as u32,
+            "et" => libc::EPOLLET as u32,
+            "oneshot" => libc::EPOLLONESHOT as u32,
+            other => return Err(format!("unknown epoll event token {other:?}")),
+        };
+    }
+    if mask == 0 {
+        return Err("epoll event mask is empty".to_string());
+    }
+    Ok(mask)
+}
+
+fn format_epoll_events(mask: u32) -> String {
+    let mut names = Vec::new();
+    for (bit, name) in [
+        (libc::EPOLLIN as u32, "in"),
+        (libc::EPOLLOUT as u32, "out"),
+        (libc::EPOLLERR as u32, "err"),
+        (libc::EPOLLHUP as u32, "hup"),
+        (libc::EPOLLRDHUP as u32, "rdhup"),
+        (libc::EPOLLPRI as u32, "pri"),
+        (libc::EPOLLET as u32, "et"),
+        (libc::EPOLLONESHOT as u32, "oneshot"),
+    ] {
+        if (mask & bit) != 0 {
+            names.push(name);
+        }
+    }
+    if names.is_empty() {
+        "none".to_string()
+    } else {
+        names.join("|")
+    }
+}
+
+fn add_pidfd_to_epoll(entry: &mut EpollEntry, pid: u32, events: &str) -> Result<(), String> {
+    // SAFETY: syscall is invoked with pidfd_open's documented arguments
+    // (pid, flags=0). On success the returned fd is uniquely owned here.
+    let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid as libc::pid_t, 0u32) } as i32;
+    if fd < 0 {
+        return Err(format!(
+            "pidfd_open({pid}): {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    // SAFETY: fd was just returned by pidfd_open and is owned here.
+    let owned = unsafe { OwnedFd::from_raw_fd(fd) };
+    add_raw_fd_to_epoll(
+        entry,
+        owned.as_raw_fd(),
+        events,
+        EpollTarget {
+            kind: "pidfd",
+            id: u64::from(pid),
+        },
+        Some(owned),
+    )
+}
+
+fn add_raw_fd_to_epoll(
+    entry: &mut EpollEntry,
+    fd: i32,
+    events: &str,
+    target: EpollTarget,
+    owned_fd: Option<OwnedFd>,
+) -> Result<(), String> {
+    let mask = parse_epoll_events(events)?;
+    let mut event = libc::epoll_event {
+        events: mask,
+        u64: fd as u64,
+    };
+    // SAFETY: entry.fd is a live epoll descriptor, fd is a live descriptor in
+    // this process, and event points to initialized storage for epoll_ctl.
+    let rc = unsafe {
+        libc::epoll_ctl(
+            entry.fd.as_raw_fd(),
+            libc::EPOLL_CTL_ADD,
+            fd,
+            &raw mut event,
+        )
+    };
+    if rc != 0 {
+        return Err(format!(
+            "epoll_ctl ADD fd {fd}: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    entry.registered.insert(
+        fd,
+        EpollRegisteredFd {
+            target,
+            _owned_fd: owned_fd,
+        },
+    );
+    Ok(())
+}
+
+fn remove_epoll_registration(epolls: &mut HashMap<u64, EpollEntry>, fd: i32) {
+    for entry in epolls.values_mut() {
+        entry.registered.remove(&fd);
+    }
+}
+
+fn wait_epoll(
+    entry: &EpollEntry,
+    timeout_ms: i32,
+    max_events: u32,
+) -> Result<Vec<EpollEvent>, String> {
+    let max_events = max_events.clamp(1, 1024) as usize;
+    let mut raw_events = vec![libc::epoll_event { events: 0, u64: 0 }; max_events];
+    // SAFETY: raw_events is valid writable storage for max_events entries and
+    // entry.fd is a live epoll descriptor owned by this registry entry.
+    let n = unsafe {
+        libc::epoll_wait(
+            entry.fd.as_raw_fd(),
+            raw_events.as_mut_ptr(),
+            max_events as i32,
+            timeout_ms,
+        )
+    };
+    if n < 0 {
+        return Err(format!("epoll_wait: {}", std::io::Error::last_os_error()));
+    }
+    let mut events = Vec::with_capacity(n as usize);
+    for raw in raw_events.into_iter().take(n as usize) {
+        let fd = raw.u64 as i32;
+        let Some(registered) = entry.registered.get(&fd) else {
+            return Err(format!("epoll returned unknown fd token {fd}"));
+        };
+        events.push(EpollEvent {
+            kind: registered.target.kind.to_string(),
+            id: registered.target.id,
+            observed_events: format_epoll_events(raw.events),
+        });
+    }
+    Ok(events)
+}
+
 async fn respond(resp: &Response) {
     let json = serde_json::to_string(resp).unwrap();
     let mut stdout = tokio::io::stdout();
     let _ = stdout.write_all(format!("{json}\n").as_bytes()).await;
     let _ = stdout.flush().await;
+}
+
+fn open_pty_master() -> Result<PtyMaster, String> {
+    // SAFETY: posix_openpt returns a fresh master fd on success.
+    let fd = unsafe { libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY | libc::O_CLOEXEC) };
+    if fd < 0 {
+        return Err(format!("posix_openpt: {}", std::io::Error::last_os_error()));
+    }
+    // SAFETY: fd is a newly opened descriptor and ownership is transferred.
+    let master = unsafe { OwnedFd::from_raw_fd(fd) };
+    // SAFETY: grantpt operates on the live pty master fd without taking ownership.
+    if unsafe { libc::grantpt(master.as_raw_fd()) } != 0 {
+        return Err(format!("grantpt: {}", std::io::Error::last_os_error()));
+    }
+    // SAFETY: unlockpt operates on the live pty master fd without taking ownership.
+    if unsafe { libc::unlockpt(master.as_raw_fd()) } != 0 {
+        return Err(format!("unlockpt: {}", std::io::Error::last_os_error()));
+    }
+    let mut buf = vec![0i8; 128];
+    // SAFETY: buf is valid writable storage and master is a live pty master fd.
+    let pts_rc = unsafe { libc::ptsname_r(master.as_raw_fd(), buf.as_mut_ptr(), buf.len()) };
+    if pts_rc != 0 {
+        return Err(format!(
+            "ptsname_r: {}",
+            std::io::Error::from_raw_os_error(pts_rc)
+        ));
+    }
+    let nul = buf
+        .iter()
+        .position(|&b| b == 0)
+        .ok_or_else(|| "ptsname_r returned unterminated path".to_string())?;
+    let slave_path = String::from_utf8(
+        buf[..nul]
+            .iter()
+            .map(|&b| u8::try_from(b).unwrap_or_default())
+            .collect(),
+    )
+    .map_err(|e| format!("ptsname utf8: {e}"))?;
+    set_nonblocking(master.as_raw_fd())?;
+    Ok(PtyMaster {
+        fd: master,
+        slave_path,
+    })
+}
+
+fn set_nonblocking(fd: i32) -> Result<(), String> {
+    // SAFETY: fcntl(F_GETFL) reads flags from a live fd.
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags < 0 {
+        return Err(format!(
+            "fcntl getfl fd {fd}: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    // SAFETY: fcntl(F_SETFL) updates flags on the same live fd.
+    if unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } != 0 {
+        return Err(format!(
+            "fcntl nonblock fd {fd}: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    Ok(())
+}
+
+fn fork_exec_pty(pty: &PtyMaster, args: &[String], ctrl_tty: bool) -> Result<libc::pid_t, String> {
+    if args.is_empty() {
+        return Err("pty_exec requires args".to_string());
+    }
+    let slave_path =
+        CString::new(pty.slave_path.as_str()).map_err(|e| format!("slave path: {e}"))?;
+    let c_args: Vec<CString> = args
+        .iter()
+        .map(|arg| CString::new(arg.as_str()).map_err(|e| format!("arg contains nul: {e}")))
+        .collect::<Result<_, _>>()?;
+    let mut argv: Vec<*const libc::c_char> = c_args.iter().map(|arg| arg.as_ptr()).collect();
+    argv.push(std::ptr::null());
+    let master_fd = pty.fd.as_raw_fd();
+    // SAFETY: fork creates a child process. The child only calls libc syscalls
+    // and execvp before _exit, avoiding Rust destructors after fork.
+    let pid = unsafe { libc::fork() };
+    if pid < 0 {
+        return Err(format!("fork: {}", std::io::Error::last_os_error()));
+    }
+    if pid == 0 {
+        // SAFETY: child process setup before exec; failures exit immediately.
+        unsafe {
+            if libc::setsid() < 0 {
+                libc::_exit(126);
+            }
+            let slave_fd = libc::open(slave_path.as_ptr(), libc::O_RDWR | libc::O_NOCTTY);
+            if slave_fd < 0 {
+                libc::_exit(126);
+            }
+            if ctrl_tty && libc::ioctl(slave_fd, libc::TIOCSCTTY, 0) < 0 {
+                libc::_exit(126);
+            }
+            for target in 0..=2 {
+                if slave_fd != target && libc::dup3(slave_fd, target, 0) < 0 {
+                    libc::_exit(126);
+                }
+            }
+            if slave_fd > 2 {
+                libc::close(slave_fd);
+            }
+            libc::close(master_fd);
+            libc::execvp(c_args[0].as_ptr(), argv.as_ptr());
+            libc::_exit(127);
+        }
+    }
+    Ok(pid)
+}
+
+fn write_all_fd(fd: i32, mut data: &[u8]) -> Result<(), String> {
+    while !data.is_empty() {
+        // SAFETY: data points to readable memory and fd is a live pty master.
+        let n = unsafe { libc::write(fd, data.as_ptr().cast(), data.len()) };
+        if n < 0 {
+            let err = std::io::Error::last_os_error();
+            if matches!(err.raw_os_error(), Some(libc::EINTR | libc::EAGAIN)) {
+                continue;
+            }
+            return Err(format!("pty write fd {fd}: {err}"));
+        }
+        data = &data[n as usize..];
+    }
+    Ok(())
+}
+
+fn read_pty(fd: i32, n_bytes: Option<u32>) -> Result<String, String> {
+    let target = n_bytes.map(|n| n as usize);
+    let mut out = Vec::new();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        if target.is_some_and(|want| out.len() >= want) {
+            break;
+        }
+        let now = std::time::Instant::now();
+        if now >= deadline {
+            if target.is_none() && !out.is_empty() {
+                break;
+            }
+            return Err(format!("pty read fd {fd}: timeout"));
+        }
+        let remaining = deadline.saturating_duration_since(now).as_millis();
+        let timeout_ms = i32::try_from(remaining.min(1000)).unwrap_or(1000);
+        let mut pollfd = libc::pollfd {
+            fd,
+            events: libc::POLLIN | libc::POLLHUP | libc::POLLERR,
+            revents: 0,
+        };
+        // SAFETY: pollfd points to one valid pollfd entry for this call.
+        let ready = unsafe { libc::poll(&mut pollfd, 1, timeout_ms) };
+        if ready < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.raw_os_error() == Some(libc::EINTR) {
+                continue;
+            }
+            return Err(format!("pty poll fd {fd}: {err}"));
+        }
+        if ready == 0 {
+            continue;
+        }
+        let mut buf = [0u8; 4096];
+        let want = target.map_or(buf.len(), |n| (n - out.len()).min(buf.len()));
+        // SAFETY: buf is valid writable memory and fd is a live pty master.
+        let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), want) };
+        if n > 0 {
+            out.extend_from_slice(&buf[..n as usize]);
+            continue;
+        }
+        if n == 0 {
+            break;
+        }
+        let err = std::io::Error::last_os_error();
+        match err.raw_os_error() {
+            Some(libc::EINTR | libc::EAGAIN) => continue,
+            Some(libc::EIO) if target.is_none() => break,
+            _ => return Err(format!("pty read fd {fd}: {err}")),
+        }
+    }
+    Ok(String::from_utf8_lossy(&out).to_string())
+}
+
+fn resize_pty(fd: i32, rows: u16, cols: u16) -> Result<(), String> {
+    let ws = libc::winsize {
+        ws_row: rows,
+        ws_col: cols,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    // SAFETY: ioctl TIOCSWINSZ reads the provided winsize for a live pty fd.
+    if unsafe { libc::ioctl(fd, libc::TIOCSWINSZ, &raw const ws) } != 0 {
+        return Err(format!(
+            "TIOCSWINSZ fd {fd}: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    Ok(())
+}
+
+fn wait_raw_child(pid: libc::pid_t) -> Result<i32, String> {
+    let mut status = 0;
+    loop {
+        // SAFETY: waiting for a child pid returned by fork in this process.
+        let rc = unsafe { libc::waitpid(pid, &raw mut status, 0) };
+        if rc == pid {
+            if libc::WIFEXITED(status) {
+                return Ok(libc::WEXITSTATUS(status));
+            }
+            if libc::WIFSIGNALED(status) {
+                return Ok(128 + libc::WTERMSIG(status));
+            }
+            return Ok(-1);
+        }
+        let err = std::io::Error::last_os_error();
+        if err.raw_os_error() != Some(libc::EINTR) {
+            return Err(format!("waitpid {pid}: {err}"));
+        }
+    }
+}
+
+fn terminate_background(child: BackgroundProcess) {
+    match child {
+        BackgroundProcess::Tokio {
+            mut process,
+            drains,
+            ..
+        } => {
+            let _ = process.start_kill();
+            for drain in drains {
+                drain.abort();
+            }
+        }
+        BackgroundProcess::RawPid { pid } => {
+            // SAFETY: pid is a child process previously returned by fork.
+            let _ = unsafe { libc::kill(pid, libc::SIGKILL) };
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Default)]
+struct CloneArgs {
+    flags: u64,
+    pidfd: u64,
+    child_tid: u64,
+    parent_tid: u64,
+    exit_signal: u64,
+    stack: u64,
+    stack_size: u64,
+    tls: u64,
+    set_tid: u64,
+    set_tid_size: u64,
+    cgroup: u64,
+}
+
+static CLONE3_THREAD_WRITE_FD: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
+static CLONE3_THREAD_TID: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+static CLONE3_THREAD_SIGNAL: u8 = 1;
+
+fn clone_result_error(error: impl Into<String>) -> crate::protocol::CloneResult {
+    crate::protocol::CloneResult {
+        pid: 0,
+        pidfd: None,
+        ok: false,
+        error: Some(error.into()),
+    }
+}
+
+fn errno_name(errno: i32) -> String {
+    match errno {
+        libc::EACCES => "EACCES".to_string(),
+        libc::EBADF => "EBADF".to_string(),
+        libc::EINVAL => "EINVAL".to_string(),
+        libc::ENOENT => "ENOENT".to_string(),
+        libc::ENOSYS => "ENOSYS".to_string(),
+        libc::EOPNOTSUPP => "EOPNOTSUPP".to_string(),
+        libc::EPERM => "EPERM".to_string(),
+        libc::EROFS => "EROFS".to_string(),
+        other => format!("errno={other}"),
+    }
+}
+
+fn last_errno_name() -> String {
+    errno_name(std::io::Error::last_os_error().raw_os_error().unwrap_or(0))
+}
+
+fn current_fs_base() -> Result<u64, String> {
+    let mut fs_base = 0u64;
+    // SAFETY: arch_prctl(ARCH_GET_FS) writes one machine word to the valid
+    // `fs_base` pointer and does not retain it after returning.
+    let rc = unsafe { libc::syscall(libc::SYS_arch_prctl, 0x1003_i32, &raw mut fs_base) };
+    if rc == 0 {
+        Ok(fs_base)
+    } else {
+        Err(last_errno_name())
+    }
+}
+
+fn wait_for_child(pid: libc::pid_t) -> Result<(), String> {
+    let mut status = 0;
+    loop {
+        // SAFETY: `status` is a valid output pointer for waitpid, and `pid`
+        // is the process id returned by clone3 in this function.
+        let rc = unsafe { libc::waitpid(pid, &raw mut status, 0) };
+        if rc == pid {
+            if libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0 {
+                return Ok(());
+            }
+            return Err(format!("child status={status}"));
+        }
+        let err = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+        if err != libc::EINTR {
+            return Err(errno_name(err));
+        }
+    }
+}
+
+fn run_clone3(kind: Clone3Kind, exec_target: Option<String>) -> crate::protocol::CloneResult {
+    match kind {
+        Clone3Kind::Thread => run_clone3_thread(),
+        Clone3Kind::Process => run_clone3_process(false, None, None, exec_target),
+        Clone3Kind::WithPidfd => run_clone3_process(true, None, None, exec_target),
+        Clone3Kind::WithSetTid { tid } => run_clone3_process(false, Some(tid), None, exec_target),
+        Clone3Kind::WithCgroup { cgroup_fd } => run_clone3_with_cgroup(cgroup_fd, exec_target),
+    }
+}
+
+fn run_clone3_with_cgroup(
+    cgroup_fd: u64,
+    exec_target: Option<String>,
+) -> crate::protocol::CloneResult {
+    use std::os::fd::{AsRawFd, FromRawFd};
+    if cgroup_fd != 0 {
+        return run_clone3_process(false, None, Some(cgroup_fd as i32), exec_target);
+    }
+    let path = std::ffi::CString::new("/sys/fs/cgroup").expect("literal has no NUL");
+    // SAFETY: `path` is a valid C string. On success, `open` returns a new fd
+    // that is immediately wrapped in `OwnedFd` for automatic close.
+    let fd = unsafe {
+        libc::open(
+            path.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return clone_result_error(format!(
+            "cgroup_fd_unavailable:{}; fallback attempted /sys/fs/cgroup",
+            last_errno_name()
+        ));
+    }
+    // SAFETY: `fd` was just returned by `open` and is uniquely owned here.
+    let owned = unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) };
+    run_clone3_process(false, None, Some(owned.as_raw_fd()), exec_target)
+}
+
+fn run_clone3_thread() -> crate::protocol::CloneResult {
+    let mut pipe_fds = [0i32; 2];
+    // SAFETY: `pipe_fds` points to two writable i32 slots for pipe2 to fill.
+    if unsafe { libc::pipe2(pipe_fds.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
+        return clone_result_error(format!("pipe2:{}", last_errno_name()));
+    }
+    CLONE3_THREAD_WRITE_FD.store(pipe_fds[1], Ordering::SeqCst);
+    CLONE3_THREAD_TID.store(0, Ordering::SeqCst);
+    let mut parent_tid = 0i32;
+    let mut child_tid = 0i32;
+    let tls = match current_fs_base() {
+        Ok(tls) => tls,
+        Err(error) => {
+            close_fd(pipe_fds[0]);
+            close_fd(pipe_fds[1]);
+            return clone_result_error(format!("ARCH_GET_FS:{error}"));
+        }
+    };
+    let mut args = CloneArgs {
+        flags: (libc::CLONE_VM
+            | libc::CLONE_THREAD
+            | libc::CLONE_SIGHAND
+            | libc::CLONE_SYSVSEM
+            | libc::CLONE_SETTLS
+            | libc::CLONE_FS
+            | libc::CLONE_FILES
+            | libc::CLONE_PARENT_SETTID
+            | libc::CLONE_CHILD_CLEARTID) as u64,
+        parent_tid: (&raw mut parent_tid).addr() as u64,
+        child_tid: (&raw mut child_tid).addr() as u64,
+        tls,
+        ..CloneArgs::default()
+    };
+    // SAFETY: `args` points to a clone_args-compatible struct for the duration
+    // of the syscall. The child thread only performs raw syscalls and exits via
+    // SYS_exit, avoiding Rust destructors in the manually-created thread.
+    let rc = unsafe {
+        libc::syscall(
+            libc::SYS_clone3,
+            &raw mut args,
+            std::mem::size_of::<CloneArgs>(),
+        )
+    };
+    if rc == 0 {
+        // SAFETY: In the clone3-created thread, use only raw syscalls and shared
+        // atomics/fds, then terminate this thread with SYS_exit (not exit_group).
+        unsafe {
+            let tid = libc::syscall(libc::SYS_gettid) as i32;
+            CLONE3_THREAD_TID.store(tid, Ordering::SeqCst);
+            let fd = CLONE3_THREAD_WRITE_FD.load(Ordering::SeqCst);
+            let _ = libc::syscall(
+                libc::SYS_write,
+                fd,
+                std::ptr::addr_of!(CLONE3_THREAD_SIGNAL).cast::<libc::c_void>(),
+                1usize,
+            );
+            libc::syscall(libc::SYS_exit, 0i32);
+        }
+        unreachable!();
+    }
+    close_fd(pipe_fds[1]);
+    if rc < 0 {
+        close_fd(pipe_fds[0]);
+        return clone_result_error(last_errno_name());
+    }
+    let mut byte = [0u8; 1];
+    // SAFETY: `byte` is a valid one-byte output buffer and `pipe_fds[0]` is a
+    // live read end created above.
+    let read_rc = unsafe { libc::read(pipe_fds[0], byte.as_mut_ptr().cast(), byte.len()) };
+    close_fd(pipe_fds[0]);
+    let tid = CLONE3_THREAD_TID.load(Ordering::SeqCst);
+    if read_rc == 1 && tid > 0 {
+        crate::protocol::CloneResult {
+            pid: tid as u64,
+            pidfd: None,
+            ok: true,
+            error: None,
+        }
+    } else {
+        clone_result_error(format!("thread_signal_failed:read={read_rc},tid={tid}"))
+    }
+}
+
+fn run_clone3_process(
+    with_pidfd: bool,
+    set_tid: Option<u64>,
+    cgroup_fd: Option<i32>,
+    exec_target: Option<String>,
+) -> crate::protocol::CloneResult {
+    let mut pidfd = -1i32;
+    let mut child_tid = 0i32;
+    let mut requested_tid = set_tid.unwrap_or(0);
+    let mut args = CloneArgs {
+        flags: libc::CLONE_CHILD_CLEARTID as u64,
+        child_tid: (&raw mut child_tid).addr() as u64,
+        exit_signal: libc::SIGCHLD as u64,
+        ..CloneArgs::default()
+    };
+    if with_pidfd {
+        args.flags |= libc::CLONE_PIDFD as u64;
+        args.pidfd = (&raw mut pidfd).addr() as u64;
+    }
+    if set_tid.is_some() {
+        args.set_tid = (&raw mut requested_tid).addr() as u64;
+        args.set_tid_size = 1;
+    }
+    if let Some(fd) = cgroup_fd {
+        // CLONE_INTO_CGROUP is glibc-only in the libc crate (as of
+        // libc 0.2.x); musl doesn't expose it. Hard-code the kernel
+        // value (0x200000000) when the symbol is missing — it's an
+        // ABI-stable kernel constant.
+        const CLONE_INTO_CGROUP: u64 = 0x2_0000_0000;
+        args.flags |= CLONE_INTO_CGROUP;
+        args.cgroup = fd as u64;
+    }
+    // SAFETY: `args` is a clone_args-compatible struct. The child immediately
+    // execs `/bin/sh -c true` or exits via a raw SYS_exit if exec fails.
+    let rc = unsafe {
+        libc::syscall(
+            libc::SYS_clone3,
+            &raw mut args,
+            std::mem::size_of::<CloneArgs>(),
+        )
+    };
+    if rc == 0 {
+        // SAFETY: NUL-terminated strings; execl/execv either replaces
+        // the process image or returns, after which SYS_exit ends only
+        // the child process.
+        unsafe {
+            if let Some(target) = exec_target {
+                let target_c = std::ffi::CString::new(target.as_str())
+                    .unwrap_or_else(|_| std::ffi::CString::new("/bin/false").unwrap());
+                let arg0 = std::ffi::CString::new(target.as_str())
+                    .unwrap_or_else(|_| std::ffi::CString::new("/bin/false").unwrap());
+                let arg1 = c"echo-test";
+                libc::execl(
+                    target_c.as_ptr(),
+                    arg0.as_ptr(),
+                    arg1.as_ptr(),
+                    std::ptr::null::<libc::c_char>(),
+                );
+            } else {
+                let shell = c"/bin/sh";
+                let arg0 = c"sh";
+                let arg1 = c"-c";
+                let arg2 = c"getpid >/dev/null; exit 0";
+                libc::execl(
+                    shell.as_ptr(),
+                    arg0.as_ptr(),
+                    arg1.as_ptr(),
+                    arg2.as_ptr(),
+                    std::ptr::null::<libc::c_char>(),
+                );
+            }
+            libc::syscall(libc::SYS_exit, 127i32);
+        }
+        unreachable!();
+    }
+    if rc < 0 {
+        return crate::protocol::CloneResult {
+            pid: 0,
+            pidfd: None,
+            ok: false,
+            error: Some(last_errno_name()),
+        };
+    }
+    let pid = rc as libc::pid_t;
+    let wait = wait_for_child(pid);
+    if let Err(error) = &wait {
+        if pidfd >= 0 {
+            close_fd(pidfd);
+        }
+        return crate::protocol::CloneResult {
+            pid: pid as u64,
+            pidfd: None,
+            ok: false,
+            error: Some(format!("wait:{error}")),
+        };
+    }
+    if with_pidfd && pidfd < 0 {
+        return crate::protocol::CloneResult {
+            pid: pid as u64,
+            pidfd: None,
+            ok: false,
+            error: Some("missing_pidfd".to_string()),
+        };
+    }
+    crate::protocol::CloneResult {
+        pid: pid as u64,
+        // Keep the pidfd open in this short-lived agent so the reported fd
+        // remains a valid kernel result for the duration of the response.
+        pidfd: with_pidfd.then_some(pidfd),
+        ok: true,
+        error: None,
+    }
+}
+
+fn close_fd(fd: i32) {
+    // SAFETY: Closing an fd is safe; errors are intentionally ignored because
+    // cleanup should not mask the operation being tested.
+    unsafe {
+        libc::close(fd);
+    }
 }
 
 fn create_listener_entry(port: u16) -> Result<(u16, ListenerEntry), String> {
@@ -1560,6 +2850,142 @@ fn prepare_inherited_listeners(
         inherited.push((port, dup_fd_to_inherited_slot(entry.fd.as_raw_fd(), slot)?));
     }
     Ok(inherited)
+}
+
+fn parse_eventfd_flags(flags: &str) -> Result<i32, String> {
+    let mut bits = 0;
+    for raw in flags.split('|') {
+        let flag = raw.trim();
+        if flag.is_empty() {
+            continue;
+        }
+        match flag.to_ascii_lowercase().as_str() {
+            "semaphore" | "efd_semaphore" => bits |= libc::EFD_SEMAPHORE,
+            "nonblock" | "efd_nonblock" => bits |= libc::EFD_NONBLOCK,
+            "cloexec" | "efd_cloexec" => bits |= libc::EFD_CLOEXEC,
+            other => return Err(format!("unknown eventfd flag {other:?}")),
+        }
+    }
+    Ok(bits)
+}
+
+fn open_eventfd(initval: u64, flags: &str) -> Result<OwnedFd, String> {
+    let init = u32::try_from(initval)
+        .map_err(|_| format!("eventfd initval {initval} exceeds u32::MAX"))?;
+    let flag_bits = parse_eventfd_flags(flags)?;
+    // SAFETY: eventfd creates a new file descriptor and does not alias memory.
+    let fd = unsafe { libc::eventfd(init, flag_bits) };
+    if fd < 0 {
+        return Err(format!(
+            "eventfd(initval={initval}, flags={flags:?}): {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    // SAFETY: `fd` is a newly returned descriptor owned by this process.
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
+fn read_eventfd_value(fd: i32) -> Result<u64, String> {
+    let mut value = 0u64;
+    loop {
+        // SAFETY: `value` points to valid writable memory for exactly 8 bytes;
+        // eventfd read does not take ownership of `fd`.
+        let rc = unsafe {
+            libc::read(
+                fd,
+                (&raw mut value).cast::<libc::c_void>(),
+                std::mem::size_of::<u64>(),
+            )
+        };
+        if rc == std::mem::size_of::<u64>() as isize {
+            return Ok(value);
+        }
+        let err = std::io::Error::last_os_error();
+        match err.raw_os_error() {
+            Some(libc::EINTR) => continue,
+            Some(libc::EAGAIN) => return Err("eventfd read: EAGAIN".to_string()),
+            _ => return Err(format!("eventfd read: {err}")),
+        }
+    }
+}
+
+fn write_eventfd_value(fd: i32, value: u64) -> Result<(), String> {
+    loop {
+        // SAFETY: `value` points to valid readable memory for exactly 8 bytes;
+        // eventfd write does not take ownership of `fd`.
+        let rc = unsafe {
+            libc::write(
+                fd,
+                (&raw const value).cast::<libc::c_void>(),
+                std::mem::size_of::<u64>(),
+            )
+        };
+        if rc == std::mem::size_of::<u64>() as isize {
+            return Ok(());
+        }
+        let err = std::io::Error::last_os_error();
+        match err.raw_os_error() {
+            Some(libc::EINTR) => continue,
+            Some(libc::EAGAIN) => return Err("eventfd write: EAGAIN".to_string()),
+            _ => return Err(format!("eventfd write value={value}: {err}")),
+        }
+    }
+}
+
+fn eventfd_epollet_probe(id: u64, entry: &EventfdEntry) -> Result<String, String> {
+    // SAFETY: epoll_create1 returns a fresh descriptor on success.
+    let epfd = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
+    if epfd < 0 {
+        return Err(format!(
+            "epoll_create1: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    // SAFETY: `epfd` is newly returned and owned by this process.
+    let epfd = unsafe { OwnedFd::from_raw_fd(epfd) };
+    let mut ev = libc::epoll_event {
+        events: (libc::EPOLLIN | libc::EPOLLET) as u32,
+        u64: id,
+    };
+    // SAFETY: both descriptors are live, and `ev` points to initialized memory
+    // for the duration of the call.
+    let ctl = unsafe {
+        libc::epoll_ctl(
+            epfd.as_raw_fd(),
+            libc::EPOLL_CTL_ADD,
+            entry.fd.as_raw_fd(),
+            &raw mut ev,
+        )
+    };
+    if ctl != 0 {
+        return Err(format!(
+            "epoll_ctl eventfd {id}: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+
+    let mut events = [libc::epoll_event { events: 0, u64: 0 }; 4];
+    // SAFETY: `events` is valid writable storage for four epoll events.
+    let first = unsafe { libc::epoll_wait(epfd.as_raw_fd(), events.as_mut_ptr(), 4, 1000) };
+    if first < 0 {
+        return Err(format!(
+            "epoll_wait first: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    // SAFETY: same valid storage as above; timeout 0 is nonblocking.
+    let second = unsafe { libc::epoll_wait(epfd.as_raw_fd(), events.as_mut_ptr(), 4, 0) };
+    if second < 0 {
+        return Err(format!(
+            "epoll_wait second: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    let value = read_eventfd_value(entry.fd.as_raw_fd())?;
+    Ok(format!(
+        "first={first},second={second},value={value},flags={}",
+        entry.flags
+    ))
 }
 
 fn dup_fd_cloexec(fd: i32) -> Result<OwnedFd, String> {

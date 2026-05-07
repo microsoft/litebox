@@ -294,6 +294,7 @@ impl<FS: ShimFS> EpollFile<FS> {
 
         let mut events = Vec::new();
         loop {
+            self.drive_network_for_socket_interests(global);
             if self.compute_needs_host_poll(global, fs) {
                 // At least one descriptor requires periodic host polling (e.g.
                 // stdin). Re-scan all interests with a short timeout to detect
@@ -302,12 +303,11 @@ impl<FS: ShimFS> EpollFile<FS> {
                 // next poll tick.
                 const POLL_INTERVAL: core::time::Duration = core::time::Duration::from_millis(50);
                 loop {
-                    // Re-poll every interest — this calls check_io_events()
-                    // which queries the host for poll-only descriptors.
-                    self.rescan_interests(global, fs);
+                    self.refresh_ready_interests(global, fs);
 
                     self.ready.pop_multiple(global, fs, maxevents, &mut events);
                     if !events.is_empty() {
+                        self.collect_additional_socket_events(global, fs, maxevents, &mut events);
                         return Ok(events);
                     }
 
@@ -352,8 +352,10 @@ impl<FS: ShimFS> EpollFile<FS> {
                 }
             } else {
                 match self.ready.pollee.wait(cx, false, Events::IN, || {
+                    self.drive_network_for_socket_interests(global);
                     self.ready.pop_multiple(global, fs, maxevents, &mut events);
                     if !events.is_empty() {
+                        self.collect_additional_socket_events(global, fs, maxevents, &mut events);
                         return Ok(WaitOutcome::Ready);
                     }
                     if self.compute_needs_host_poll(global, fs) {
@@ -367,6 +369,100 @@ impl<FS: ShimFS> EpollFile<FS> {
                     Err(TryOpError::WaitError(e)) => return Err(e),
                     Err(TryOpError::Other(infallible)) => match infallible {},
                 }
+            }
+        }
+    }
+
+    fn refresh_ready_interests(&self, global: &GlobalState<FS>, fs: &FS) {
+        self.drive_network_for_socket_interests(global);
+        self.rescan_interests(global, fs);
+    }
+
+    fn collect_additional_socket_events(
+        &self,
+        global: &GlobalState<FS>,
+        fs: &FS,
+        maxevents: usize,
+        events: &mut Vec<EpollEvent>,
+    ) {
+        const MAX_SOCKET_SETTLE_POLLS: usize = 16;
+        let target = self.socket_interest_count().min(maxevents);
+        if target <= 1 || events.len() >= target {
+            return;
+        }
+        for _ in 0..MAX_SOCKET_SETTLE_POLLS {
+            if events.len() >= target {
+                return;
+            }
+            self.drive_network_for_socket_interests(global);
+            self.append_ready_socket_events(global, fs, maxevents, events);
+        }
+    }
+
+    fn append_ready_socket_events(
+        &self,
+        global: &GlobalState<FS>,
+        fs: &FS,
+        maxevents: usize,
+        events: &mut Vec<EpollEvent>,
+    ) {
+        let entries = {
+            let interests = self.interests.lock();
+            interests.values().cloned().collect::<Vec<_>>()
+        };
+        for entry in entries {
+            if events.len() >= maxevents {
+                return;
+            }
+            if !matches!(&entry.desc, DescriptorRef::Socket(socket) if socket.upgrade().is_some()) {
+                continue;
+            }
+            if let Some((Some(event), _)) = entry.poll(global, fs, false)
+                && !events.iter().any(|existing| existing.data == event.data)
+            {
+                events.push(event);
+            }
+        }
+    }
+
+    fn drive_network_for_socket_interests(&self, global: &GlobalState<FS>) {
+        if self.has_socket_interests() {
+            Self::drive_network_until_idle(global);
+        }
+    }
+
+    fn has_socket_interests(&self) -> bool {
+        self.socket_interest_count() != 0
+    }
+
+    fn socket_interest_count(&self) -> usize {
+        let interests = self.interests.lock();
+        interests
+            .values()
+            .filter(|entry| {
+                matches!(&entry.desc, DescriptorRef::Socket(socket) if socket.upgrade().is_some())
+            })
+            .count()
+    }
+
+    fn drive_network_until_idle(global: &GlobalState<FS>) {
+        const MAX_NETWORK_YIELDS: usize = 4;
+        for _ in 0..MAX_NETWORK_YIELDS {
+            Self::drive_network_poll_loop(global);
+            litebox_platform_multiplex::platform().wake_network_worker();
+            // SAFETY: sched_yield has no memory-safety preconditions and lets peer
+            // worker threads run echo/readiness work before this epoll wait returns.
+            unsafe { ::syscalls::raw::syscall0(::syscalls::Sysno::sched_yield) };
+        }
+        Self::drive_network_poll_loop(global);
+    }
+
+    fn drive_network_poll_loop(global: &GlobalState<FS>) {
+        const MAX_NETWORK_POLLS: usize = 8;
+        for _ in 0..MAX_NETWORK_POLLS {
+            let advice = global.net.lock().perform_platform_interaction();
+            if !advice.call_again_immediately() {
+                break;
             }
         }
     }

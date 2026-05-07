@@ -1001,46 +1001,54 @@ pub(super) fn register_unix_addr_tests(reg: &mut Registry<'_>) {
 
 pub(super) fn register_exec_tests(reg: &mut Registry<'_>) {
     for &agent in EXEC_AGENTS {
-        matrix_test(
-            reg,
-            format!("X.echo.{agent}"),
-            vec![agent],
-            move |run, handles| {
-                Box::pin(async move {
-                    let self_exe = run.self_exe().to_string();
-                    let resp = send_to(
-                        run,
-                        &handles,
-                        agent,
-                        super::exec(vec![self_exe, "echo-test".into()]),
-                    )
-                    .await;
-                    let pass = matches!(&resp, Response::ExecResult { stdout, .. } if stdout.contains("ECHO_TEST_OK"));
-                    super::TestOutcome::new(agent.name(), pass, format!("{resp:?}"))
-                })
-            },
-        );
+        for &bt in crate::BinaryType::ALL {
+            let bt_label = bt.label();
+            matrix_test(
+                reg,
+                format!("X.echo.{bt_label}.{agent}"),
+                vec![agent],
+                move |run, handles| {
+                    Box::pin(async move {
+                        let self_exe = run.self_exe().to_string();
+                        let target = crate::binary_path(bt, &self_exe);
+                        let resp = send_to(
+                            run,
+                            &handles,
+                            agent,
+                            super::exec(vec![target, "echo-test".into()]),
+                        )
+                        .await;
+                        let pass = matches!(&resp, Response::ExecResult { stdout, .. } if stdout.contains("ECHO_TEST_OK"));
+                        super::TestOutcome::new(agent.name(), pass, format!("{resp:?}"))
+                    })
+                },
+            );
+        }
     }
     for &(agent, code) in &[(AgentName::A, 42i32), (AgentName::AAA, 7i32)] {
-        matrix_test(
-            reg,
-            format!("X.exit_code.{agent}.{code}"),
-            vec![agent],
-            move |run, handles| {
-                Box::pin(async move {
-                    let self_exe = run.self_exe().to_string();
-                    let resp = send_to(
-                        run,
-                        &handles,
-                        agent,
-                        super::exec(vec![self_exe, "exit-with".into(), code.to_string()]),
-                    )
-                    .await;
-                    let pass = matches!(&resp, Response::ExecResult { exit_code, .. } if *exit_code == code);
-                    super::TestOutcome::new(agent.name(), pass, format!("{resp:?}"))
-                })
-            },
-        );
+        for &bt in crate::BinaryType::ALL {
+            let bt_label = bt.label();
+            matrix_test(
+                reg,
+                format!("X.exit_code.{bt_label}.{agent}.{code}"),
+                vec![agent],
+                move |run, handles| {
+                    Box::pin(async move {
+                        let self_exe = run.self_exe().to_string();
+                        let target = crate::binary_path(bt, &self_exe);
+                        let resp = send_to(
+                            run,
+                            &handles,
+                            agent,
+                            super::exec(vec![target, "exit-with".into(), code.to_string()]),
+                        )
+                        .await;
+                        let pass = matches!(&resp, Response::ExecResult { exit_code, .. } if *exit_code == code);
+                        super::TestOutcome::new(agent.name(), pass, format!("{resp:?}"))
+                    })
+                },
+            );
+        }
     }
 }
 
@@ -1643,147 +1651,179 @@ pub(super) fn register_unix_tests(reg: &mut Registry<'_>) {
                         })
                     },
                 );
-                matrix_test(
-                    reg,
-                    format!("U.{name}.child_connect"),
-                    vec![agent],
-                    move |run, handles| {
-                        Box::pin(async move {
-                            let self_exe = run.self_exe().to_string();
-                            let resp = send_to(
-                                run,
-                                &handles,
-                                agent,
-                                Command::UnixListen { path: sock.clone() },
-                            )
-                            .await;
-                            if let Err(e) = super::expect_unix_listening_path(&resp, &sock) {
-                                return super::TestOutcome::new(
-                                    agent.name(),
-                                    false,
-                                    format!("listen failed: {e}; resp={resp:?}"),
-                                );
-                            }
-                            let data = format!("unix_{name}");
-                            let resp = send_to(
-                                run,
-                                &handles,
-                                agent,
-                                super::exec(vec![
-                                    self_exe,
-                                    "unix-echo-client".into(),
-                                    sock.clone(),
-                                    data.clone(),
-                                ]),
-                            )
-                            .await;
-                            let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout.contains(&data));
-                            let _ =
-                                send_to(run, &handles, agent, Command::UnixUnlisten { path: sock })
-                                    .await;
-                            super::TestOutcome::new(agent.name(), pass, format!("{resp:?}"))
-                        })
-                    },
-                );
+                for &bt in crate::BinaryType::ALL {
+                    let bt_label = bt.label();
+                    let sock = format!("/tmp/um_{}_{}.sock", name.replace('.', "_"), bt_label);
+                    matrix_test(
+                        reg,
+                        format!("U.{name}.{bt_label}.child_connect"),
+                        vec![agent],
+                        move |run, handles| {
+                            Box::pin(async move {
+                                let self_exe = run.self_exe().to_string();
+                                let target = crate::binary_path(bt, &self_exe);
+                                let resp = send_to(
+                                    run,
+                                    &handles,
+                                    agent,
+                                    Command::UnixListen { path: sock.clone() },
+                                )
+                                .await;
+                                if let Err(e) = super::expect_unix_listening_path(&resp, &sock) {
+                                    return super::TestOutcome::new(
+                                        agent.name(),
+                                        false,
+                                        format!("listen failed: {e}; resp={resp:?}"),
+                                    );
+                                }
+                                let data = format!("unix_{name}");
+                                let resp = send_to(
+                                    run,
+                                    &handles,
+                                    agent,
+                                    super::exec(vec![
+                                        target,
+                                        "unix-echo-client".into(),
+                                        sock.clone(),
+                                        data.clone(),
+                                    ]),
+                                )
+                                .await;
+                                let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout.contains(&data));
+                                let _ = send_to(
+                                    run,
+                                    &handles,
+                                    agent,
+                                    Command::UnixUnlisten { path: sock },
+                                )
+                                .await;
+                                super::TestOutcome::new(agent.name(), pass, format!("{resp:?}"))
+                            })
+                        },
+                    );
+                }
             }
             UnixPattern::BackgroundServerConnect => {
-                let sock_start = sock.clone();
-                matrix_test(
-                    reg,
-                    format!("U.{name}.server_start"),
-                    vec![agent],
-                    move |run, handles| {
-                        Box::pin(async move {
-                            let self_exe = run.self_exe().to_string();
-                            let resp = send_to(
-                                run,
-                                &handles,
-                                agent,
-                                Command::Exec {
-                                    args: vec![
-                                        self_exe,
-                                        "unix-echo-server".into(),
-                                        sock_start.clone(),
-                                    ],
-                                    timeout_secs: None,
-                                    stdin: None,
-                                    background: true,
-                                },
-                            )
-                            .await;
-                            let pid = match &resp {
-                                Response::Background { pid } => Some(*pid),
-                                _ => None,
-                            };
-                            let pass = pid.is_some();
-                            if let Some(pid) = pid {
-                                let _ = send_to(run, &handles, agent, Command::Kill { pid }).await;
-                            }
-                            let _ = send_to(
-                                run,
-                                &handles,
-                                agent,
-                                Command::UnixUnlisten { path: sock_start },
-                            )
-                            .await;
-                            super::TestOutcome::new(agent.name(), pass, format!("{resp:?}"))
-                        })
-                    },
-                );
-                matrix_test(
-                    reg,
-                    format!("U.{name}.connect"),
-                    vec![agent],
-                    move |run, handles| {
-                        Box::pin(async move {
-                            let self_exe = run.self_exe().to_string();
-                            let resp = send_to(
-                                run,
-                                &handles,
-                                agent,
-                                Command::ExecReady {
-                                    args: vec![self_exe, "unix-echo-server".into(), sock.clone()],
-                                    ready_marker: "LISTENING".into(),
-                                    timeout_secs: Some(10),
-                                    stdin: None,
-                                    stream: "stdout".into(),
-                                },
-                            )
-                            .await;
-                            let pid = match &resp {
-                                Response::BackgroundReady { pid } => Some(*pid),
-                                _ => None,
-                            };
-                            if pid.is_none() {
-                                return super::TestOutcome::new(
-                                    agent.name(),
-                                    false,
-                                    format!("server_start failed: {resp:?}"),
+                for &bt in crate::BinaryType::ALL {
+                    let bt_label = bt.label();
+                    let sock_start =
+                        format!("/tmp/um_{}_{}_start.sock", name.replace('.', "_"), bt_label);
+                    matrix_test(
+                        reg,
+                        format!("U.{name}.{bt_label}.server_start"),
+                        vec![agent],
+                        move |run, handles| {
+                            Box::pin(async move {
+                                let self_exe = run.self_exe().to_string();
+                                let target = crate::binary_path(bt, &self_exe);
+                                let resp = send_to(
+                                    run,
+                                    &handles,
+                                    agent,
+                                    Command::Exec {
+                                        args: vec![
+                                            target,
+                                            "unix-echo-server".into(),
+                                            sock_start.clone(),
+                                        ],
+                                        timeout_secs: None,
+                                        stdin: None,
+                                        background: true,
+                                        env: vec![],
+                                    },
+                                )
+                                .await;
+                                let pid = match &resp {
+                                    Response::Background { pid } => Some(*pid),
+                                    _ => None,
+                                };
+                                let pass = pid.is_some();
+                                if let Some(pid) = pid {
+                                    let _ =
+                                        send_to(run, &handles, agent, Command::Kill { pid }).await;
+                                }
+                                let _ = send_to(
+                                    run,
+                                    &handles,
+                                    agent,
+                                    Command::UnixUnlisten { path: sock_start },
+                                )
+                                .await;
+                                super::TestOutcome::new(agent.name(), pass, format!("{resp:?}"))
+                            })
+                        },
+                    );
+                }
+                for &bt in crate::BinaryType::ALL {
+                    let bt_label = bt.label();
+                    let sock = format!(
+                        "/tmp/um_{}_{}_connect.sock",
+                        name.replace('.', "_"),
+                        bt_label
+                    );
+                    matrix_test(
+                        reg,
+                        format!("U.{name}.{bt_label}.connect"),
+                        vec![agent],
+                        move |run, handles| {
+                            Box::pin(async move {
+                                let self_exe = run.self_exe().to_string();
+                                let target = crate::binary_path(bt, &self_exe);
+                                let resp = send_to(
+                                    run,
+                                    &handles,
+                                    agent,
+                                    Command::ExecReady {
+                                        args: vec![target, "unix-echo-server".into(), sock.clone()],
+                                        ready_marker: "LISTENING".into(),
+                                        timeout_secs: Some(10),
+                                        stdin: None,
+                                        stream: "stdout".into(),
+                                    },
+                                )
+                                .await;
+                                let pid = match &resp {
+                                    Response::BackgroundReady { pid } => Some(*pid),
+                                    _ => None,
+                                };
+                                if pid.is_none() {
+                                    return super::TestOutcome::new(
+                                        agent.name(),
+                                        false,
+                                        format!("server_start failed: {resp:?}"),
+                                    );
+                                }
+                                let data = format!("unix_{name}");
+                                let resp = send_to(
+                                    run,
+                                    &handles,
+                                    agent,
+                                    Command::UnixConnect {
+                                        path: sock.clone(),
+                                        data: data.clone(),
+                                    },
+                                )
+                                .await;
+                                let pass = matches!(
+                                    &resp,
+                                    Response::Connected { echo } if *echo == data
                                 );
-                            }
-                            let data = format!("unix_{name}");
-                            let resp = send_to(
-                                run,
-                                &handles,
-                                agent,
-                                Command::UnixConnect {
-                                    path: sock.clone(),
-                                    data: data.clone(),
-                                },
-                            )
-                            .await;
-                            let pass =
-                                matches!(&resp, Response::Connected { echo } if *echo == data);
-                            if let Some(pid) = pid {
-                                let _ = send_to(run, &handles, agent, Command::Kill { pid }).await;
-                            }
-                            let _ =
-                                send_to(run, &handles, agent, Command::UnixUnlisten { path: sock })
-                                    .await;
-                            super::TestOutcome::new(agent.name(), pass, format!("{resp:?}"))
-                        })
-                    },
-                );
+                                if let Some(pid) = pid {
+                                    let _ =
+                                        send_to(run, &handles, agent, Command::Kill { pid }).await;
+                                }
+                                let _ = send_to(
+                                    run,
+                                    &handles,
+                                    agent,
+                                    Command::UnixUnlisten { path: sock },
+                                )
+                                .await;
+                                super::TestOutcome::new(agent.name(), pass, format!("{resp:?}"))
+                            })
+                        },
+                    );
+                }
             }
             UnixPattern::CrossAgent => {
                 let connector = tc.peer.unwrap();

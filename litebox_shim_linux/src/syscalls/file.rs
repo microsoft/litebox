@@ -25,6 +25,7 @@ use litebox_common_linux::{
     AtFlags, ClockId, EfdFlags, EpollCreateFlags, FcntlArg, FileDescriptorFlags, FileStat,
     IoReadVec, IoWriteVec, IoctlArg, ItimerSpec, STATX_BASIC_STATS, StatfsBuf, StatxBuf,
     StatxTimestamp, TMPFS_MAGIC, TimeParam, TimerfdFlags, TimerfdTimerFlags, errno::Errno,
+    signal::Signal,
 };
 use litebox_platform_multiplex::Platform;
 
@@ -865,6 +866,15 @@ impl<FS: ShimFS> Task<FS> {
         if path.to_str().ok() == Some("/sys/kernel/debug/tracing/trace_marker") {
             return Err(Errno::EACCES);
         }
+        let path = if path.to_str().ok() == Some("/dev/tty") {
+            if let Some(pty_idx) = *self.process_state.borrow().controlling_pty.lock() {
+                CString::new(alloc::format!("/dev/pts/{pty_idx}")).map_err(|_| Errno::EINVAL)?
+            } else {
+                path
+            }
+        } else {
+            path
+        };
         let mode = mode & !self.get_umask();
         let file = self
             .files
@@ -4519,13 +4529,45 @@ impl<FS: ShimFS> Task<FS> {
         Ok(())
     }
 
+    fn send_signal_to_process_group(&self, pgrp: i32, signal: Signal) -> Result<(), Errno> {
+        if pgrp <= 0 {
+            return Ok(());
+        }
+        let pgid =
+            litebox::process::ProcessGroupId(u32::try_from(pgrp).map_err(|_| Errno::EINVAL)?);
+        let targets = self
+            .global
+            .litebox
+            .process_registry()
+            .process_ids_in_group(pgid);
+        let mut queue = self.global.cross_process_signals.lock();
+        for target in &targets {
+            queue.push(crate::CrossProcessSignal {
+                target_process_id: target.0,
+                target_tid: None,
+                signal,
+                siginfo: siginfo_kernel(signal),
+            });
+        }
+        drop(queue);
+
+        let handles = self.global.process_thread_handles.read();
+        for target in targets {
+            let key = target.0.cast_signed();
+            if let Some(remote) = handles.get(&key) {
+                remote.interrupt();
+            }
+        }
+        Ok(())
+    }
+
     fn host_stdio_ioctl(
         &self,
         fs: &FS,
         fd: &TypedFd<FS>,
         arg: &IoctlArg<litebox_platform_multiplex::Platform>,
     ) -> Result<u32, Errno> {
-        use litebox::platform::{SetTermiosWhen, StdioIoctlError};
+        use litebox::platform::StdioIoctlError;
 
         /// Map a `StdioIoctlError` to an `Errno`.
         fn ioctl_err_to_errno(e: StdioIoctlError) -> Errno {
@@ -4721,13 +4763,42 @@ impl<FS: ShimFS> Task<FS> {
                 }
                 Ok(0)
             }
-            IoctlArg::TIOCSWINSZ(_) | IoctlArg::TIOCSPTLK(_) | IoctlArg::TIOCNOTTY => Ok(0),
+            IoctlArg::TIOCSWINSZ(ws_ptr) => {
+                let ws: litebox_common_linux::Winsize =
+                    ws_ptr.read_at_offset(0).ok_or(Errno::EFAULT)?;
+                let size = litebox::platform::WindowSize {
+                    rows: ws.row,
+                    cols: ws.col,
+                    xpixel: ws.xpixel,
+                    ypixel: ws.ypixel,
+                };
+                let old_size = fs.get_pty_window_size(fd).ok_or(Errno::ENOTTY)?;
+                if !fs.set_pty_window_size(fd, size) {
+                    return Err(Errno::ENOTTY);
+                }
+                if size != old_size {
+                    let pgrp = fs.get_pty_foreground_pgrp(fd).unwrap_or(0);
+                    self.send_signal_to_process_group(pgrp, Signal::SIGWINCH)?;
+                }
+                Ok(0)
+            }
+            IoctlArg::TIOCSPTLK(_) | IoctlArg::TIOCNOTTY => Ok(0),
             IoctlArg::TIOCSCTTY => {
-                // On real Linux, TIOCSCTTY sets the controlling terminal and
-                // initialises the foreground pgrp to the caller's pgid. Mirror
-                // that here so tcgetpgrp() returns the right value.
+                // On real Linux, TIOCSCTTY installs this slave as /dev/tty for
+                // the session leader and initializes the foreground pgrp to the
+                // caller. Mirror both effects so later /dev/tty opens route to
+                // the sandbox PTY rather than the shim's host stdio alias.
+                let Some((_pair, pty_idx, is_master)) = fs.get_pty_pair_erased(fd) else {
+                    return Err(Errno::ENOTTY);
+                };
+                if is_master {
+                    return Err(Errno::ENOTTY);
+                }
                 let pgid = i32::try_from(self.sys_getpgid(0).unwrap_or(1)).unwrap_or(1);
-                let _ = fs.set_pty_foreground_pgrp(fd, pgid);
+                if !fs.set_pty_foreground_pgrp(fd, pgid) {
+                    return Err(Errno::ENOTTY);
+                }
+                *self.process_state.borrow().controlling_pty.lock() = Some(pty_idx);
                 Ok(0)
             }
             IoctlArg::TIOCSPGRP(pgrp_ptr) => {
@@ -4741,16 +4812,39 @@ impl<FS: ShimFS> Task<FS> {
                 Ok(0)
             }
             IoctlArg::TIOCGWINSZ(ws) => {
+                let size = fs.get_pty_window_size(fd).ok_or(Errno::ENOTTY)?;
                 ws.write_at_offset(
                     0,
                     litebox_common_linux::Winsize {
-                        row: 40,
-                        col: 120,
-                        xpixel: 0,
-                        ypixel: 0,
+                        row: size.rows,
+                        col: size.cols,
+                        xpixel: size.xpixel,
+                        ypixel: size.ypixel,
                     },
                 )
                 .ok_or(Errno::EFAULT)?;
+                Ok(0)
+            }
+            IoctlArg::TIOCSWINSZ(ws_ptr) => {
+                let ws: litebox_common_linux::Winsize =
+                    ws_ptr.read_at_offset(0).ok_or(Errno::EFAULT)?;
+                let size = litebox::platform::WindowSize {
+                    rows: ws.row,
+                    cols: ws.col,
+                    xpixel: ws.xpixel,
+                    ypixel: ws.ypixel,
+                };
+                if !fs.set_pty_winsize(fd, size) {
+                    return Err(Errno::ENOTTY);
+                }
+                if let Some(pgrp) = fs.get_pty_foreground_pgrp(fd)
+                    && pgrp > 0
+                {
+                    let _ = self.sys_kill(
+                        pgrp.saturating_neg(),
+                        litebox_common_linux::signal::Signal::SIGWINCH.as_i32(),
+                    );
+                }
                 Ok(0)
             }
             IoctlArg::TIOCGPTN(ptn) => {
@@ -5370,7 +5464,7 @@ impl<FS: ShimFS> Task<FS> {
             if let Ok(fd_u32) = u32::try_from(fd.fd) {
                 if self.netlink_sockets.borrow().contains_key(&fd_u32) {
                     fd.revents = fd.events; // Mark as ready
-                    fds.write_at_offset(i, fd);
+                    let _ = fds.write_at_offset(i, fd);
                     netlink_ready_count += 1;
                     continue;
                 }
