@@ -37,9 +37,6 @@ use crate::policy::{Action, Decision, Policy};
 /// Maximum number of FIDs per connection to prevent resource exhaustion.
 const MAX_FIDS: usize = 8192;
 
-/// Large executable images are patched by the shim when executable segments are mapped.
-const RUNTIME_PATCH_ELF_SIZE_THRESHOLD: u64 = 32 * 1024 * 1024;
-
 /// Linux `AT_REMOVEDIR` flag for `Tunlinkat`.
 const AT_REMOVEDIR: u32 = 0x200;
 
@@ -1896,10 +1893,6 @@ impl Server {
         // trailer), skip the expensive full-file read + scan. Pre-rewritten
         // binaries on disk are served as-is through 9P.
         let file_len = file.metadata().ok()?.len();
-        if file_len > RUNTIME_PATCH_ELF_SIZE_THRESHOLD {
-            let _ = file.seek(SeekFrom::Start(0));
-            return None;
-        }
         if file_len >= 32 {
             let mut trailer = [0u8; 8];
             if file.seek(SeekFrom::End(-32)).is_ok()
