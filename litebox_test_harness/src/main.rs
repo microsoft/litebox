@@ -79,9 +79,9 @@ use std::io::Write as _;
 ///
 /// The M and BS minimal canary subcommands spawn a child binary
 /// internally (originally always the non-PIE harness companion).
-/// Tests exercise per-binary-type behavior by exporting
-/// `LITEBOX_M_TARGET_BINARY=<path>` before invoking the subcommand;
-/// when that env var is set, the subcommand spawns that path
+/// Tests exercise per-binary-type behavior by setting
+/// `LITEBOX_M_TARGET_BINARY=<path>` via the Exec command's `env`
+/// field; when that env var is set, the subcommand spawns that path
 /// instead. When unset, defaults to
 /// `litebox_test_harness::nonpie_binary()` so existing behavior is
 /// preserved for M tests that don't yet thread a binary type
@@ -95,6 +95,86 @@ fn m_target_binary() -> String {
     litebox_test_harness::nonpie_binary()
 }
 
+static PTY_SIGWINCH_SEEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+extern "C" fn pty_sigwinch_handler(_: i32) {
+    PTY_SIGWINCH_SEEN.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+fn pty_tiocgpgrp_probe() {
+    let mut pgrp: libc::pid_t = 0;
+    // SAFETY: TIOCGPGRP writes a pid_t to the provided pointer for fd 0.
+    if unsafe { libc::ioctl(0, libc::TIOCGPGRP, &mut pgrp) } != 0 {
+        eprintln!("TIOCGPGRP failed: {}", std::io::Error::last_os_error());
+        std::process::exit(1);
+    }
+    println!("TIOCGPGRP pgrp={pgrp}");
+}
+
+fn pty_tiocspgrp_probe() {
+    // SAFETY: getpgrp has no preconditions.
+    let pgrp = unsafe { libc::getpgrp() };
+    let mut set = pgrp;
+    // SAFETY: TIOCSPGRP reads a pid_t from the provided pointer for fd 0.
+    if unsafe { libc::ioctl(0, libc::TIOCSPGRP, &mut set) } != 0 {
+        eprintln!("TIOCSPGRP failed: {}", std::io::Error::last_os_error());
+        std::process::exit(1);
+    }
+    let mut got: libc::pid_t = 0;
+    // SAFETY: TIOCGPGRP writes a pid_t to the provided pointer for fd 0.
+    if unsafe { libc::ioctl(0, libc::TIOCGPGRP, &mut got) } != 0 {
+        eprintln!(
+            "TIOCGPGRP after set failed: {}",
+            std::io::Error::last_os_error()
+        );
+        std::process::exit(1);
+    }
+    println!("TIOCSPGRP pgrp={pgrp} got={got}");
+}
+
+fn pty_tiocsctty_probe() {
+    let path = std::ffi::CString::new("/dev/tty").expect("static path");
+    // SAFETY: open reads a valid nul-terminated static path.
+    let fd = unsafe { libc::open(path.as_ptr(), libc::O_WRONLY | libc::O_CLOEXEC) };
+    if fd < 0 {
+        eprintln!("open /dev/tty failed: {}", std::io::Error::last_os_error());
+        std::process::exit(1);
+    }
+    let msg = b"TTY_OK\n";
+    // SAFETY: msg is valid readable memory and fd is a live /dev/tty fd.
+    let rc = unsafe { libc::write(fd, msg.as_ptr().cast(), msg.len()) };
+    // SAFETY: fd is owned by this process and no longer used.
+    let _ = unsafe { libc::close(fd) };
+    if rc != msg.len() as isize {
+        eprintln!("write /dev/tty failed: {}", std::io::Error::last_os_error());
+        std::process::exit(1);
+    }
+}
+
+fn pty_resize_probe() {
+    PTY_SIGWINCH_SEEN.store(false, std::sync::atomic::Ordering::SeqCst);
+    // SAFETY: installing a simple signal handler function for SIGWINCH.
+    unsafe {
+        libc::signal(
+            libc::SIGWINCH,
+            pty_sigwinch_handler as *const () as libc::sighandler_t,
+        );
+    }
+    println!("READY");
+    let _ = std::io::stdout().flush();
+    while !PTY_SIGWINCH_SEEN.load(std::sync::atomic::Ordering::SeqCst) {
+        // SAFETY: pause waits for a signal; EINTR is expected after SIGWINCH.
+        unsafe { libc::pause() };
+    }
+    let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
+    // SAFETY: TIOCGWINSZ writes winsize to the provided pointer for fd 0.
+    if unsafe { libc::ioctl(0, libc::TIOCGWINSZ, &mut ws) } != 0 {
+        eprintln!("TIOCGWINSZ failed: {}", std::io::Error::last_os_error());
+        std::process::exit(1);
+    }
+    println!("RESIZE rows={} cols={}", ws.ws_row, ws.ws_col);
+}
+
 #[allow(clippy::too_many_lines)] // exhaustive runner / dispatch table
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -103,7 +183,9 @@ fn main() {
 
     // Log the resolved binary path so stale rootfs copies are immediately
     // obvious (args[0] may differ from the real on-disk path).
-    if let Ok(real) = std::env::current_exe() {
+    if !cmd.starts_with("pty-")
+        && let Ok(real) = std::env::current_exe()
+    {
         eprintln!("[harness] self_exe={self_exe} resolved={}", real.display());
     }
 
@@ -750,297 +832,9 @@ fn main() {
                 std::thread::sleep(std::time::Duration::from_millis(50));
             }
         }
-        "tcp-fork-listen-accept" => {
-            // Tests fd inheritance across fork+exec: the VS Code CLI pattern
-            // where the parent's listen socket is passed to the child.
-            //
-            //   1. bind() + listen() on a port
-            //   2. Clear CLOEXEC so the fd survives exec
-            //   3. fork()+exec() child with "tcp-accept-inherited" subcommand
-            //   4. Parent closes the listen fd
-            //   5. Child calls accept() on the INHERITED fd and echoes
-            //
-            // This pattern cannot be expressed via the agent protocol because
-            // the child needs to accept on a raw fd number, not re-bind.
-            let port: u16 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(18400);
-            let listener = std::net::TcpListener::bind(format!("0.0.0.0:{port}"))
-                .expect("tcp-fork-listen-accept: bind failed");
-            eprintln!("[tcp-fork-listen-accept] listening on 0.0.0.0:{port}");
-
-            use std::os::unix::io::AsRawFd;
-            let listen_fd = listener.as_raw_fd();
-            // Clear CLOEXEC so the fd survives exec.
-            unsafe { libc::fcntl(listen_fd, libc::F_SETFD, 0) };
-            eprintln!("[tcp-fork-listen-accept] forking child, listen_fd={listen_fd}");
-
-            let child = std::process::Command::new(self_exe)
-                .args(["tcp-accept-inherited", &listen_fd.to_string()])
-                .stdout(std::process::Stdio::inherit())
-                .stderr(std::process::Stdio::inherit())
-                .spawn();
-
-            // Parent closes its listen fd — the critical step.
-            drop(listener);
-            eprintln!("[tcp-fork-listen-accept] parent closed listen fd");
-
-            match child {
-                Ok(mut c) => {
-                    eprintln!("[tcp-fork-listen-accept] waiting for child pid={}", c.id());
-                    let status = c.wait();
-                    eprintln!("[tcp-fork-listen-accept] child exited: {status:?}");
-                }
-                Err(e) => eprintln!("[tcp-fork-listen-accept] spawn failed: {e}"),
-            }
-        }
-        "tcp-accept-inherited" => {
-            // Accept on an INHERITED listen fd (from parent via fork+exec).
-            // Does NOT re-bind or re-listen — uses the fd as-is.
-            let fd: i32 = args
-                .get(2)
-                .and_then(|s| s.parse().ok())
-                .expect("need fd arg");
-            eprintln!("[tcp-accept-inherited] accepting on inherited fd={fd}");
-            use std::os::unix::io::FromRawFd;
-            let listener = unsafe { std::net::TcpListener::from_raw_fd(fd) };
-            listener.set_nonblocking(false).ok();
-            match listener.accept() {
-                Ok((mut stream, addr)) => {
-                    eprintln!("[tcp-accept-inherited] accepted from {addr}");
-                    use std::io::{Read, Write};
-                    use std::net::Shutdown;
-                    let mut buf = [0u8; 4096];
-                    match stream.read(&mut buf) {
-                        Ok(n) if n > 0 => {
-                            let _ = stream.write_all(&buf[..n]);
-                            let _ = stream.shutdown(Shutdown::Write);
-                            eprintln!("[tcp-accept-inherited] echoed {n} bytes");
-                        }
-                        Ok(_) => eprintln!("[tcp-accept-inherited] read 0"),
-                        Err(e) => eprintln!("[tcp-accept-inherited] read err: {e}"),
-                    }
-                }
-                Err(e) => eprintln!("[tcp-accept-inherited] accept failed: {e}"),
-            }
-        }
-        "tcp-echo" => {
-            // Listen on a TCP port and echo back whatever is received.
-            // Used for cross-worker loopback TCP tests.
-            let port: u16 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(9999);
-            let listener = std::net::TcpListener::bind(format!("0.0.0.0:{port}"))
-                .expect("tcp-echo: bind failed");
-            eprintln!("[tcp-echo] listening on 0.0.0.0:{port}");
-            // Accept one connection, echo data, then exit.
-            if let Ok((mut stream, addr)) = listener.accept() {
-                eprintln!("[tcp-echo] accepted from {addr}");
-                use std::io::Write;
-                use std::os::unix::io::AsRawFd;
-                let mut buf = [0u8; 4096];
-                // Use recv() instead of read() — the litebox shim may handle
-                // them differently for socket FDs.
-                let n = unsafe {
-                    libc::recv(stream.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len(), 0)
-                };
-                match n.cmp(&0) {
-                    std::cmp::Ordering::Greater => {
-                        let n = n as usize;
-                        eprintln!("[tcp-echo] recv {n} bytes, echoing");
-                        match stream.write_all(&buf[..n]) {
-                            Ok(()) => eprintln!("[tcp-echo] write_all OK"),
-                            Err(e) => eprintln!("[tcp-echo] write_all FAILED: {e}"),
-                        }
-                        match stream.flush() {
-                            Ok(()) => eprintln!("[tcp-echo] flush OK"),
-                            Err(e) => eprintln!("[tcp-echo] flush FAILED: {e}"),
-                        }
-                    }
-                    std::cmp::Ordering::Equal => {
-                        eprintln!("[tcp-echo] recv returned 0 (EOF)");
-                    }
-                    std::cmp::Ordering::Less => {
-                        eprintln!("[tcp-echo] recv error: {}", std::io::Error::last_os_error());
-                    }
-                }
-            }
-            eprintln!("[tcp-echo] exiting");
-        }
-        "tcp-echo-multi" => {
-            // Listen on a TCP port and echo back whatever is received.
-            // Handles multiple connections concurrently using threads.
-            // Usage: tcp-echo-multi <port> [max_conns]
-            let port: u16 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(9999);
-            let max_conns: usize = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(100);
-            let listener = std::net::TcpListener::bind(format!("0.0.0.0:{port}"))
-                .expect("tcp-echo-multi: bind failed");
-            eprintln!("[tcp-echo-multi] listening on 0.0.0.0:{port}, max_conns={max_conns}");
-            let mut conn_count = 0usize;
-            let mut handles = Vec::new();
-            while conn_count < max_conns {
-                match listener.accept() {
-                    Ok((mut stream, addr)) => {
-                        conn_count += 1;
-                        let id = conn_count;
-                        eprintln!("[tcp-echo-multi] accepted #{id} from {addr}");
-                        handles.push(std::thread::spawn(move || {
-                            use std::io::{Read, Write};
-                            let mut buf = [0u8; 4096];
-                            match stream.read(&mut buf) {
-                                Ok(n) if n > 0 => {
-                                    eprintln!("[tcp-echo-multi] #{id} read {n} bytes, echoing");
-                                    let _ = stream.write_all(&buf[..n]);
-                                    let _ = stream.flush();
-                                }
-                                Ok(_) => eprintln!("[tcp-echo-multi] #{id} read 0 bytes"),
-                                Err(e) => eprintln!("[tcp-echo-multi] #{id} read error: {e}"),
-                            }
-                        }));
-                    }
-                    Err(e) => {
-                        eprintln!("[tcp-echo-multi] accept error: {e}");
-                        break;
-                    }
-                }
-            }
-            for h in handles {
-                let _ = h.join();
-            }
-            eprintln!("[tcp-echo-multi] exiting");
-        }
-        "tcp-recv-all" => {
-            // Listen on a TCP port, accept one connection, read ALL data
-            // until EOF, then print the total byte count and data to stdout.
-            // Exercises half-close: the server only exits when the client's
-            // FIN is propagated through the TCP bridge as EOF on recv().
-            let port: u16 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(9999);
-            let listener = std::net::TcpListener::bind(format!("0.0.0.0:{port}"))
-                .expect("tcp-recv-all: bind failed");
-            eprintln!("[tcp-recv-all] listening on 0.0.0.0:{port}");
-            if let Ok((stream, addr)) = listener.accept() {
-                eprintln!("[tcp-recv-all] accepted from {addr}");
-                use std::os::unix::io::AsRawFd;
-                let fd = stream.as_raw_fd();
-                let mut data = Vec::new();
-                let mut buf = [0u8; 4096];
-                loop {
-                    let n = unsafe { libc::recv(fd, buf.as_mut_ptr().cast(), buf.len(), 0) };
-                    if n > 0 {
-                        data.extend_from_slice(&buf[..n as usize]);
-                    } else {
-                        if n == 0 {
-                            eprintln!("[tcp-recv-all] recv EOF after {} bytes", data.len());
-                        } else {
-                            eprintln!(
-                                "[tcp-recv-all] recv error: {}",
-                                std::io::Error::last_os_error()
-                            );
-                        }
-                        break;
-                    }
-                }
-                let text = String::from_utf8_lossy(&data);
-                print!("RECV={text}");
-            }
-            eprintln!("[tcp-recv-all] exiting");
-        }
-        "tcp-fullduplex" => {
-            // Listen on a TCP port. Accept one connection. Simultaneously:
-            //   - Writer thread: sends SIZE bytes of 'S' chars
-            //   - Reader thread: reads until SIZE bytes of data received
-            // Reports both totals. Tests for starvation where one direction
-            // blocks the other in the poll loop.
-            let port: u16 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(9999);
-            let size: usize = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(65536);
-            let listener = std::net::TcpListener::bind(format!("0.0.0.0:{port}"))
-                .expect("tcp-fullduplex: bind failed");
-            eprintln!("[tcp-fullduplex] listening on 0.0.0.0:{port}, size={size}");
-            if let Ok((stream, addr)) = listener.accept() {
-                eprintln!("[tcp-fullduplex] accepted from {addr}");
-                use std::io::{Read, Write};
-                let read_stream = stream.try_clone().expect("clone");
-                let write_size = size;
-                // Writer thread: send SIZE bytes of 'S'
-                let writer = std::thread::spawn(move || {
-                    let mut s = stream;
-                    let chunk = vec![b'S'; 4096.min(write_size)];
-                    let mut sent = 0usize;
-                    while sent < write_size {
-                        let n = (write_size - sent).min(chunk.len());
-                        match s.write(&chunk[..n]) {
-                            Ok(w) => sent += w,
-                            Err(_) => break,
-                        }
-                    }
-                    let _ = s.flush();
-                    let _ = s.shutdown(std::net::Shutdown::Write);
-                    sent
-                });
-                // Reader: read until EOF
-                let reader = std::thread::spawn(move || {
-                    let mut s = read_stream;
-                    let mut total = 0usize;
-                    let mut buf = [0u8; 8192];
-                    loop {
-                        match s.read(&mut buf) {
-                            Ok(0) => break,
-                            Ok(n) => total += n,
-                            Err(_) => break,
-                        }
-                    }
-                    total
-                });
-                let sent = writer.join().unwrap_or(0);
-                let recvd = reader.join().unwrap_or(0);
-                println!("FULLDUPLEX:sent={sent},recv={recvd},size={size}");
-            }
-        }
-        "tcp-fullduplex-client" => {
-            // Connect to a tcp-fullduplex server. Simultaneously:
-            //   - Write SIZE bytes of 'C' chars
-            //   - Read until EOF
-            // Reports both totals.
-            let addr = args.get(2).map_or("127.0.0.1:9999", String::as_str);
-            let size: usize = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(65536);
-            use std::io::{Read, Write};
-            match std::net::TcpStream::connect(addr) {
-                Ok(stream) => {
-                    let read_stream = stream.try_clone().expect("clone");
-                    let writer = std::thread::spawn(move || {
-                        let mut s = stream;
-                        let chunk = vec![b'C'; 4096.min(size)];
-                        let mut sent = 0usize;
-                        while sent < size {
-                            let n = (size - sent).min(chunk.len());
-                            match s.write(&chunk[..n]) {
-                                Ok(w) => sent += w,
-                                Err(_) => break,
-                            }
-                        }
-                        let _ = s.flush();
-                        let _ = s.shutdown(std::net::Shutdown::Write);
-                        sent
-                    });
-                    let reader = std::thread::spawn(move || {
-                        let mut s = read_stream;
-                        let mut total = 0usize;
-                        let mut buf = [0u8; 8192];
-                        loop {
-                            match s.read(&mut buf) {
-                                Ok(0) => break,
-                                Ok(n) => total += n,
-                                Err(_) => break,
-                            }
-                        }
-                        total
-                    });
-                    let sent = writer.join().unwrap_or(0);
-                    let recvd = reader.join().unwrap_or(0);
-                    println!("CLIENT:sent={sent},recv={recvd}");
-                }
-                Err(e) => {
-                    eprintln!("[tcp-fullduplex-client] connect failed: {e}");
-                    std::process::exit(1);
-                }
-            }
-        }
+        "wait-forever" => loop {
+            std::thread::park();
+        },
         "epoll-socket" => {
             // Minimal reproduction of epoll + TCP socket wakeup.
             //
@@ -1189,11 +983,6 @@ fn main() {
                 libc::close(srv);
                 libc::close(epfd);
             }
-        }
-        "slow-echo" => {
-            // Sleeps 3 seconds then prints, simulating a slow-starting server.
-            std::thread::sleep(std::time::Duration::from_secs(3));
-            println!("SLOW_ECHO_OK");
         }
         "pipe-nonblock" => {
             // Test pipe F_SETFL O_NONBLOCK behavior.
@@ -1392,6 +1181,18 @@ fn main() {
             }
             // Flush and exit immediately — exercises the bridge-join race.
             let _ = std::io::stdout().flush();
+        }
+        "pty-tiocgpgrp" => {
+            pty_tiocgpgrp_probe();
+        }
+        "pty-tiocspgrp" => {
+            pty_tiocspgrp_probe();
+        }
+        "pty-tiocsctty" => {
+            pty_tiocsctty_probe();
+        }
+        "pty-resize" => {
+            pty_resize_probe();
         }
         "write-known" => {
             // Write "PIPEDATA:{tag}\n" to stdout. Used for pipe chain integrity.
@@ -1695,6 +1496,7 @@ fn main() {
                     writeln!(f, "line{i}").unwrap();
                 }
                 f.flush().unwrap();
+                eprintln!("[cross-worker-file] READY");
                 if sub == "write-and-hold" {
                     // Keep the fd OPEN (like VS Code CLI does with its log).
                     std::thread::sleep(std::time::Duration::from_secs(10));
@@ -1715,6 +1517,7 @@ fn main() {
                     println!("line{i}");
                 }
                 std::io::stdout().flush().unwrap();
+                eprintln!("[cross-worker-file] READY");
                 // Stay alive so parent can read the file concurrently.
                 std::thread::sleep(std::time::Duration::from_secs(10));
                 std::process::exit(0);

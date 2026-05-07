@@ -13,6 +13,10 @@ fn default_accept_timeout() -> u64 {
     10
 }
 
+fn default_marker_stream() -> String {
+    "either".to_string()
+}
+
 /// Command sent from parent to child via stdin.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "cmd")]
@@ -35,37 +39,18 @@ pub enum Command {
     ///   - `"nonpie"` → fork+exec the non-PIE binary (= `SpawnRemote`)
     ///
     /// `inherit_listen_ports`: TCP listen ports whose listen socket fds
-    /// should be inherited by the child (CLOEXEC cleared before exec).
-    /// **Not yet implemented** — see design notes below.
-    ///
-    /// # fd inheritance pattern (future work)
-    ///
-    /// The VS Code CLI does this:
-    ///   1. Parent calls `bind()+listen()` on a port
-    ///   2. Parent fork()+exec()s the server process
-    ///   3. Parent closes its listen fd
-    ///   4. Child calls `accept()` on the **inherited** listen fd
-    ///
-    /// To support this in the protocol:
-    ///   1. Fork handler looks up the listen socket fd for each port in
-    ///      `inherit_listen_ports` (the agent tracks port→fd mapping from
-    ///      `NetListen`).
-    ///   2. Clears CLOEXEC on those fds: `fcntl(fd, F_SETFD, 0)`.
-    ///   3. fork()+exec()s the child, passing the fd numbers via a CLI
-    ///      arg or env var (e.g., `--inherited-fds 3,5`).
-    ///   4. Child agent reconstructs `TcpListeners` from the raw fds via
-    ///      `TcpListener::from_raw_fd(fd)` and registers them in its
-    ///      listener map.
-    ///   5. The child's `NetAccept` or echo handler then works on the
-    ///      inherited listener — no re-bind needed.
+    /// should be inherited by the child. The parent duplicates each requested
+    /// listener into deterministic child fd slots 80..99, clearing CLOEXEC only
+    /// on those short-lived duplicates. This range is intentionally below the
+    /// Litebox host bridge/infrastructure bands (100..199, 200..499, 500+) and
+    /// above stdio. The child receives a `port=fd` mapping in
+    /// `LITEBOX_TEST_HARNESS_INHERITED_LISTEN_FDS`, imports each fd into its
+    /// listener registry, and then normal `NetAccept` / `NetConnect` probing
+    /// works without re-binding.
     ///
     /// Pair with `NetCloseListener` on the parent to reproduce the full
     /// VS Code pattern: `NetListen` → Fork(inherit) → `NetCloseListener` →
-    /// child `NetAccept`.
-    ///
-    /// Currently this pattern is tested via the `tcp-fork-listen-accept`
-    /// subcommand (see main.rs), which implements steps 1-4 as a single
-    /// standalone program outside the agent protocol.
+    /// child accepts on the inherited listener.
     #[serde(rename = "fork")]
     Fork {
         name: String,
@@ -92,6 +77,10 @@ pub enum Command {
     /// Report the agent's process ID.
     #[serde(rename = "get_pid")]
     GetPid,
+
+    /// Exercise curated `clone3(2)` flag combinations.
+    #[serde(rename = "clone3")]
+    Clone3 { kind: Clone3Kind },
 
     /// Read a file and report contents (or `not_found`).
     #[serde(rename = "fs_read")]
@@ -125,19 +114,65 @@ pub enum Command {
     #[serde(rename = "net_unlisten")]
     NetUnlisten { port: u16 },
 
+    /// Connect to addr and register the TCP stream for stateful operations.
+    #[serde(rename = "net_open")]
+    NetOpen { addr: String },
+
+    /// Send bytes on a registered TCP connection.
+    #[serde(rename = "net_send")]
+    NetSend { conn: u64, data: String },
+
+    /// Receive bytes from a registered TCP connection. None means read to EOF.
+    #[serde(rename = "net_recv")]
+    NetRecv { conn: u64, n_bytes: Option<u32> },
+
+    /// Shutdown one half of a registered TCP connection: "wr", "rd", or "rdwr".
+    #[serde(rename = "net_shutdown")]
+    NetShutdown { conn: u64, half: String },
+
+    /// Close and unregister a TCP connection.
+    #[serde(rename = "net_close")]
+    NetClose { conn: u64 },
+
+    /// Open `pidfd_open(pid)` and add that pidfd to a registered epoll instance.
+    #[serde(rename = "epoll_add_pidfd")]
+    EpollAddPidfd {
+        epoll: u64,
+        pid: u32,
+        events: String,
+    },
+
+    /// Add a registered TCP connection fd to a registered epoll instance.
+    #[serde(rename = "epoll_add_socket")]
+    EpollAddSocket {
+        epoll: u64,
+        conn: u64,
+        events: String,
+    },
+
+    /// Add a registered eventfd to a registered epoll instance.
+    #[serde(rename = "epoll_add_eventfd")]
+    EpollAddEventfd {
+        epoll: u64,
+        eventfd_id: u64,
+        events: String,
+    },
+
+    /// Wait on a registered epoll instance.
+    #[serde(rename = "epoll_wait")]
+    EpollWait {
+        epoll: u64,
+        timeout_ms: i32,
+        max_events: u32,
+    },
+
+    /// Close and unregister an epoll instance.
+    #[serde(rename = "epoll_close")]
+    EpollClose { epoll: u64 },
+
     /// Connect to addr, send data, read echo response.
     #[serde(rename = "net_connect")]
     NetConnect { addr: String, data: String },
-
-    /// Connect to addr, write data, shutdown one half of the TCP connection,
-    /// then read echoed data until EOF. `half` must be `"wr"`, `"rd"`, or
-    /// `"rdwr"`; TCP half-close EOF tests use `"wr"`.
-    #[serde(rename = "net_halfclose_echo")]
-    NetHalfCloseEcho {
-        addr: String,
-        write_data: String,
-        half: String,
-    },
 
     /// Forward a command to a named child and return its response.
     #[serde(rename = "forward")]
@@ -162,6 +197,53 @@ pub enum Command {
         /// Empty means "inherit unchanged".
         #[serde(default)]
         env: Vec<(String, String)>,
+    },
+
+    /// Fork+exec in the background, but return only after stdout/stderr
+    /// contains the requested readiness marker. Output remains captured for
+    /// `WaitBackground`, and is drained after readiness so helpers cannot block.
+    #[serde(rename = "exec_ready")]
+    ExecReady {
+        args: Vec<String>,
+        /// Stdout/stderr substring that, once observed, signals readiness.
+        ready_marker: String,
+        /// Hard cap on wait. None = 30 seconds.
+        #[serde(default)]
+        timeout_secs: Option<u64>,
+        #[serde(default)]
+        stdin: Option<String>,
+        /// Where to look for the marker: "stdout" | "stderr" | "either".
+        #[serde(default = "default_marker_stream")]
+        stream: String,
+    },
+
+    /// Wait until this agent or a named child agent has accepted protocol
+    /// commands. A child agent can only answer after its init phase entered
+    /// the command loop, making this a process-ready beacon.
+    #[serde(rename = "wait_ready")]
+    WaitReady {
+        agent: String,
+        #[serde(default)]
+        timeout_secs: Option<u64>,
+    },
+
+    /// Wait for a previously backgrounded process to exit and return its
+    /// captured output. For plain Exec background commands stdout/stderr are
+    /// empty; `ExecReady` backgrounds retain captured output.
+    #[serde(rename = "wait_background")]
+    WaitBackground {
+        pid: u32,
+        #[serde(default)]
+        timeout_secs: Option<u64>,
+    },
+
+    /// Wait for an observed state predicate on this agent. This is a bounded
+    /// protocol-level replacement for coordinator sleeps.
+    #[serde(rename = "wait_for")]
+    WaitFor {
+        predicate: WaitPredicate,
+        #[serde(default)]
+        timeout_secs: Option<u64>,
     },
 
     /// Report an environment variable value.
@@ -214,6 +296,34 @@ pub enum Command {
         data: String,
     },
 
+    /// Open a pseudo-terminal pair and register the master fd.
+    #[serde(rename = "pty_open")]
+    PtyOpen {},
+
+    /// Fork+exec `args` with stdio attached to a registered pty slave.
+    #[serde(rename = "pty_exec")]
+    PtyExec {
+        master: u64,
+        args: Vec<String>,
+        ctrl_tty: bool,
+    },
+
+    /// Write bytes to a registered pty master.
+    #[serde(rename = "pty_write")]
+    PtyWrite { master: u64, data: String },
+
+    /// Read bytes from a registered pty master. None means read until EOF.
+    #[serde(rename = "pty_read")]
+    PtyRead { master: u64, n_bytes: Option<u32> },
+
+    /// Resize the terminal window for a registered pty master.
+    #[serde(rename = "pty_resize")]
+    PtyResize { master: u64, rows: u16, cols: u16 },
+
+    /// Close and unregister a pty master.
+    #[serde(rename = "pty_close")]
+    PtyClose { master: u64 },
+
     /// Connect to `addr`, send `size` bytes, read file at `path`, then read
     /// echoed TCP data. Reports both file content and TCP integrity. Tests for
     /// 9P deadlock when file I/O happens while TCP sockets are active.
@@ -240,13 +350,89 @@ pub enum Command {
     #[serde(rename = "pipe_pair_id_unique")]
     PipePairIdUnique { count: u32 },
 
-    /// Proceed (used after coordination points).
-    #[serde(rename = "go")]
-    Go,
+    /// Call io_uring_setup(2) once and report the kernel-visible outcome.
+    #[serde(rename = "io_uring_setup")]
+    IoUringSetup { entries: u32 },
+
+    /// Call epoll_create1(2) once and report whether a descriptor was returned.
+    #[serde(rename = "epoll_open")]
+    EpollOpen,
+
+    /// Create an epoll instance via the agent's registry, returning a handle
+    /// to be reused with `EpollAdd*` / `EpollWait` / `EpollClose`. (W2
+    /// registry-style; the unit `EpollOpen` is a one-shot probe used by W5.)
+    #[serde(rename = "epoll_create")]
+    EpollCreate,
+
+    /// Open an eventfd and register it in this agent's local registry.
+    /// Flags are parsed from strings like "semaphore|nonblock|cloexec".
+    #[serde(rename = "eventfd_open")]
+    EventfdOpen { initval: u64, flags: String },
+
+    /// Read one u64 from a registered eventfd. Nonblocking empty reads return
+    /// [`Response::Error`] with EAGAIN.
+    #[serde(rename = "eventfd_read")]
+    EventfdRead { id: u64 },
+
+    /// Read one u64 on behalf of a reader authorized via EventfdShare. This
+    /// models the layer-1 forward-via-creator path without passing fds.
+    #[serde(rename = "eventfd_read_shared")]
+    EventfdReadShared { id: u64, reader: String },
+
+    /// Write one u64 to a registered eventfd.
+    #[serde(rename = "eventfd_write")]
+    EventfdWrite { id: u64, value: u64 },
+
+    /// Close and unregister a registered eventfd.
+    #[serde(rename = "eventfd_close")]
+    EventfdClose { id: u64 },
+
+    /// Mark a named agent as an authorized reader of this creator-local
+    /// eventfd. Layer 1 deliberately models sharing as forwarding a command
+    /// through the creator's registry, not as SCM_RIGHTS fd passing.
+    #[serde(rename = "eventfd_share")]
+    EventfdShare { id: u64, target: String },
+
+    /// Minimal eventfd + epoll edge-triggered probe used until W2's structured
+    /// epoll commands are available. The eventfd must already be ready.
+    #[serde(rename = "eventfd_epollet")]
+    EventfdEpollEt { id: u64 },
 
     /// Shut down gracefully.
     #[serde(rename = "exit")]
     Exit,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum Clone3Kind {
+    Thread,
+    Process,
+    WithPidfd,
+    WithSetTid { tid: u64 },
+    WithCgroup { cgroup_fd: u64 },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CloneResult {
+    pub pid: u64,
+    pub pidfd: Option<i32>,
+    pub ok: bool,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum WaitPredicate {
+    PortListening { port: u16, host: String },
+    FileExists { path: String },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EpollEvent {
+    pub kind: String,
+    pub id: u64,
+    pub observed_events: String,
 }
 
 /// Response sent from child to parent via stdout.
@@ -276,13 +462,45 @@ pub enum Response {
     #[serde(rename = "connected")]
     Connected { echo: String },
 
-    /// TCP half-close echo result.
-    #[serde(rename = "halfclosed")]
-    HalfClosed { echo: String },
+    /// Stateful TCP connection opened.
+    #[serde(rename = "opened")]
+    Opened { conn: u64 },
 
-    /// TCP half-close operation failed.
-    #[serde(rename = "halfclose_failed")]
-    HalfCloseFailed { error: String },
+    /// PTY master handle and slave path.
+    #[serde(rename = "pty_handle")]
+    PtyHandle { master: u64, slave_path: String },
+
+    /// Stateful TCP bytes sent.
+    #[serde(rename = "sent")]
+    Sent,
+
+    /// Stateful TCP bytes received.
+    #[serde(rename = "received")]
+    Received { data: String },
+
+    /// Stateful TCP shutdown completed.
+    #[serde(rename = "shutdown_ok")]
+    ShutdownOk,
+
+    /// Stateful TCP connection closed.
+    #[serde(rename = "closed")]
+    Closed,
+
+    /// Eventfd registry handle.
+    #[serde(rename = "eventfd_handle")]
+    EventfdHandle { id: u64 },
+
+    /// Eventfd read value.
+    #[serde(rename = "eventfd_value")]
+    EventfdValue { value: u64 },
+
+    /// Epoll registry handle.
+    #[serde(rename = "epoll_handle")]
+    EpollHandle { id: u64 },
+
+    /// Events returned by `epoll_wait`.
+    #[serde(rename = "epoll_events")]
+    EpollEvents { events: Vec<EpollEvent> },
 
     /// TCP connection failed.
     #[serde(rename = "connect_failed")]
@@ -304,16 +522,32 @@ pub enum Response {
     #[serde(rename = "background")]
     Background { pid: u32 },
 
+    /// Background process reached its readiness marker.
+    #[serde(rename = "background_ready")]
+    BackgroundReady { pid: u32 },
+
+    /// Result of a curated `clone3(2)` exercise.
+    #[serde(rename = "clone_result")]
+    CloneResult {
+        pid: u64,
+        pidfd: Option<i32>,
+        ok: bool,
+        error: Option<String>,
+    },
+
+    /// Readiness or wait predicate satisfied.
+    #[serde(rename = "ready")]
+    Ready,
+
+    /// io_uring_setup(2) result. `errno` is a positive errno on failure.
+    #[serde(rename = "io_uring_result")]
+    IoUringResult { ring_fd: i32, errno: Option<i32> },
+
+    /// epoll_create1(2) result. `errno` is a positive errno on failure.
+    #[serde(rename = "epoll_open_result")]
+    EpollOpenResult { epoll_fd: i32, errno: Option<i32> },
+
     /// Error.
     #[serde(rename = "error")]
     Error { error: String },
-
-    /// Test result (for structured reporting).
-    #[serde(rename = "test_result")]
-    TestResult {
-        test: String,
-        agent: String,
-        result: String,
-        detail: String,
-    },
 }

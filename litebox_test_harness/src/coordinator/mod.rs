@@ -5,16 +5,22 @@
 //! operations through pipes to child agents.
 
 pub(crate) mod agents;
+pub(crate) mod clone3_matrix;
 pub(crate) mod concurrent_fork;
+pub(crate) mod epoll_pidfd;
+pub(crate) mod eventfd;
 pub(crate) mod file_tcp;
 pub(crate) mod fork_matrix;
+pub(crate) mod iouring_discovery;
 pub(crate) mod matrix;
 pub(crate) mod pipe_bridge;
 pub(crate) mod platform_fixes;
 pub(crate) mod port_router;
+pub(crate) mod pty;
 pub(crate) mod registry;
 pub(crate) mod run_context;
 pub(crate) mod special_cases;
+pub(crate) mod tcp_state;
 pub(crate) mod tcp_stress;
 
 use crate::protocol::{Command, Response};
@@ -40,6 +46,46 @@ impl TestOutcome {
             detail: detail.into(),
         }
     }
+}
+
+pub(crate) fn expect_listening_port(resp: &Response, requested_port: u16) -> Result<u16, String> {
+    match resp {
+        Response::Listening { port } if requested_port == 0 && *port != 0 => Ok(*port),
+        Response::Listening { port } if *port == requested_port => Ok(*port),
+        Response::Listening { port } => Err(format!(
+            "listening port mismatch: requested {requested_port}, got {port}"
+        )),
+        other => Err(format!("expected Listening, got {other:?}")),
+    }
+}
+
+pub(crate) fn expect_unix_listening_path(
+    resp: &Response,
+    requested_path: &str,
+) -> Result<(), String> {
+    match resp {
+        Response::UnixListening { path } if path == requested_path => Ok(()),
+        Response::UnixListening { path } => Err(format!(
+            "unix listening path mismatch: requested {requested_path:?}, got {path:?}"
+        )),
+        other => Err(format!("expected UnixListening, got {other:?}")),
+    }
+}
+
+pub(crate) fn ok_without_data(resp: &Response) -> bool {
+    matches!(resp, Response::Ok { data: None })
+}
+
+pub(crate) fn ok_data_contains(resp: &Response, needle: &str) -> bool {
+    matches!(resp, Response::Ok { data: Some(data) } if data.contains(needle))
+}
+
+pub(crate) fn ok_spawned_response(resp: &Response) -> bool {
+    matches!(
+        resp,
+        Response::Ok { data: Some(data) }
+            if data.contains("forked") || data.contains("children spawned")
+    )
 }
 
 /// A registered test: metadata + deferred execution closure.
@@ -299,7 +345,7 @@ impl TestRunner {
     /// test actually asked for — minimal-repro shape (single-test
     /// filters spawn just the path that test uses).
     async fn spawn_tree(&mut self, needed: &std::collections::BTreeSet<agents::AgentName>) {
-        use agents::AgentName::{A, AA, AAA, AAB, AB, B, D3, D4, D5, E, EE, NP, NPC};
+        use agents::AgentName::{A, AA, AAA, AAB, AB, B, BB, D3, D4, D5, E, EE, NP, NPC};
         // `Init` is the coordinator itself — always available; record
         // it as "spawned" so the validator doesn't false-flag tests
         // that route to it via cx.fs_read / Command::FsRead.
@@ -341,6 +387,25 @@ impl TestRunner {
             eprintln!("[coord] A spawn {a_pie_kids:?}: {r:?}");
         }
 
+        let mut b_pie_kids: Vec<String> = Vec::new();
+        if needed.contains(&BB) {
+            b_pie_kids.push(BB.name().to_string());
+        }
+        if !b_pie_kids.is_empty() && needed.contains(&B) {
+            for k in &b_pie_kids {
+                self.spawned_agents.insert(k.clone());
+            }
+            let r = self
+                .send(
+                    "B",
+                    Command::Spawn {
+                        children: b_pie_kids.clone(),
+                    },
+                )
+                .await;
+            eprintln!("[coord] B spawn {b_pie_kids:?}: {r:?}");
+        }
+
         let mut grandkids: Vec<String> = Vec::new();
         if needed.contains(&AAA) {
             grandkids.push(AAA.name().to_string());
@@ -361,6 +426,19 @@ impl TestRunner {
                 )
                 .await;
             eprintln!("[coord] AA spawn {grandkids:?}: {r:?}");
+        }
+
+        if needed.contains(&BB) && needed.contains(&B) {
+            self.spawned_agents.insert(BB.name().to_string());
+            let r = self
+                .send(
+                    "B",
+                    Command::Spawn {
+                        children: vec![BB.name().to_string()],
+                    },
+                )
+                .await;
+            eprintln!("[coord] B spawn BB: {r:?}");
         }
 
         if needed.contains(&EE) && needed.contains(&E) {
@@ -765,6 +843,7 @@ pub fn collect_all_tests() -> Vec<Test> {
     platform_fixes::register_concurrent_fork_tests(&mut registry::Registry::new(&mut tests));
     platform_fixes::register_touch_redirect_tests(&mut registry::Registry::new(&mut tests));
     platform_fixes::register_pid_visibility_tests(&mut registry::Registry::new(&mut tests));
+    iouring_discovery::register_iouring_discovery_tests(&mut registry::Registry::new(&mut tests));
     platform_fixes::register_cross_pid_visibility_tests(&mut registry::Registry::new(&mut tests));
     platform_fixes::register_file_redirect_tests(&mut registry::Registry::new(&mut tests));
     platform_fixes::register_cli_startup_mimic_tests(&mut registry::Registry::new(&mut tests));
@@ -772,7 +851,10 @@ pub fn collect_all_tests() -> Vec<Test> {
     platform_fixes::register_bg_redirect_stdin_poll_tests(&mut registry::Registry::new(&mut tests));
     platform_fixes::register_pipe_nonblock_tests(&mut registry::Registry::new(&mut tests));
     platform_fixes::register_epoll_socket_tests(&mut registry::Registry::new(&mut tests));
-    platform_fixes::register_loopback_tcp_tests(&mut registry::Registry::new(&mut tests));
+    eventfd::register_eventfd_tests(&mut registry::Registry::new(&mut tests));
+    epoll_pidfd::register_epoll_pidfd_tests(&mut registry::Registry::new(&mut tests));
+    clone3_matrix::register_clone3_matrix(&mut registry::Registry::new(&mut tests));
+    tcp_state::register_tcp_state_tests(&mut registry::Registry::new(&mut tests));
     platform_fixes::register_tcp_halfclose_tests(&mut registry::Registry::new(&mut tests));
     platform_fixes::register_fork_listen_close_tests(&mut registry::Registry::new(&mut tests));
     platform_fixes::register_proc_filesystem_tests(&mut registry::Registry::new(&mut tests));
@@ -785,6 +867,7 @@ pub fn collect_all_tests() -> Vec<Test> {
     tcp_stress::register_tcp_stress(&mut registry::Registry::new(&mut tests));
     file_tcp::register_file_tcp(&mut registry::Registry::new(&mut tests));
     port_router::register_port_router(&mut registry::Registry::new(&mut tests));
+    pty::register_pty_tests(&mut registry::Registry::new(&mut tests));
     special_cases::register_contamination_sequence(&mut registry::Registry::new(&mut tests));
     tests
 }
@@ -862,6 +945,7 @@ async fn run_tests(self_exe: &str, filter: Option<&str>) -> Vec<TestResult> {
                 agents::AgentName::AAA,
                 agents::AgentName::AAB,
                 agents::AgentName::B,
+                agents::AgentName::BB,
                 agents::AgentName::E,
                 agents::AgentName::EE,
                 agents::AgentName::NP,
@@ -927,6 +1011,7 @@ async fn run_tests(self_exe: &str, filter: Option<&str>) -> Vec<TestResult> {
 fn route(target: &str) -> (&str, Option<&str>) {
     match target {
         "A" | "B" | "E" => (target, None),
+        "BB" => ("B", Some("BB")),
         // Agents under A: AA*, AB, NP, NPC, D3, D4, D5
         "NP" | "NPC" | "D3" | "D4" | "D5" => ("A", Some(target)),
         "EE" => ("E", Some("EE")),
@@ -941,7 +1026,12 @@ fn wrap_forwards(remaining: Option<&str>, cmd: Command) -> Command {
         None => cmd,
         Some(target) => {
             // "AA" or "AB" → forward directly (children of A)
-            if target == "AA" || target == "AB" {
+            if target == "BB" {
+                Command::Forward {
+                    target: "BB".to_string(),
+                    inner: Box::new(cmd),
+                }
+            } else if target == "AA" || target == "AB" {
                 Command::Forward {
                     target: target.to_string(),
                     inner: Box::new(cmd),
@@ -1012,6 +1102,12 @@ fn wrap_forwards(remaining: Option<&str>, cmd: Command) -> Command {
                     target: "EE".to_string(),
                     inner: Box::new(cmd),
                 }
+            } else if target == "BB" {
+                // BB is a direct child of B.
+                Command::Forward {
+                    target: "BB".to_string(),
+                    inner: Box::new(cmd),
+                }
             } else {
                 Command::Forward {
                     target: target.to_string(),
@@ -1051,6 +1147,22 @@ pub(crate) async fn send_cmd(child: &mut Child, cmd: &Command) -> Response {
             match c {
                 Command::Forward { inner, .. } => c = inner,
                 Command::Exec {
+                    timeout_secs: Some(t),
+                    ..
+                }
+                | Command::ExecReady {
+                    timeout_secs: Some(t),
+                    ..
+                }
+                | Command::WaitReady {
+                    timeout_secs: Some(t),
+                    ..
+                }
+                | Command::WaitBackground {
+                    timeout_secs: Some(t),
+                    ..
+                }
+                | Command::WaitFor {
                     timeout_secs: Some(t),
                     ..
                 } => break Some(*t),

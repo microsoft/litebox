@@ -14,8 +14,9 @@
 //! - FT.interleave: file I/O interleaved between TCP send and recv
 //! - FT.multi: multiple file+TCP round-trips in sequence
 
-use super::agents::AgentName;
+use super::agents::{AgentHandle, AgentName};
 use super::registry::Registry;
+use super::run_context::RunContext;
 
 const TEST_FILE: &str = "/tmp/ft_test.txt";
 const TEST_DATA: &str = "file_tcp_test_data_1234567890";
@@ -26,6 +27,7 @@ pub(crate) fn register_file_tcp(reg: &mut Registry<'_>) {
     register_interleave_tests(reg);
     register_multi_cycle_tests(reg);
     register_exec_during_tcp_tests(reg);
+    register_axis_file_tcp_tests(reg);
 }
 
 #[allow(clippy::too_many_lines)] // exhaustive registration / runner
@@ -46,8 +48,7 @@ fn register_listen_file_tests(reg: &mut Registry<'_>) {
                             let listen_resp = run
                                 .send(&handle, crate::protocol::Command::NetListen { port })
                                 .await;
-                            if !matches!(&listen_resp, crate::protocol::Response::Listening { .. })
-                            {
+                            if !super::expect_listening_port(&listen_resp, port).is_ok() {
                                 return super::TestOutcome::new(
                                     &agent_label,
                                     false,
@@ -63,8 +64,7 @@ fn register_listen_file_tests(reg: &mut Registry<'_>) {
                                     },
                                 )
                                 .await;
-                            let write_ok =
-                                matches!(&write_resp, crate::protocol::Response::Ok { .. });
+                            let write_ok = super::ok_without_data(&write_resp);
                             let _ = run
                                 .send(&handle, crate::protocol::Command::NetUnlisten { port })
                                 .await;
@@ -91,7 +91,7 @@ fn register_listen_file_tests(reg: &mut Registry<'_>) {
                             let listen_resp = run
                                 .send(&handle, crate::protocol::Command::NetListen { port })
                                 .await;
-                            if !matches!(&listen_resp, crate::protocol::Response::Listening { .. }) {
+                            if !super::expect_listening_port(&listen_resp, port).is_ok() {
                                 return super::TestOutcome::new(
                                     &agent_label,
                                     false,
@@ -138,7 +138,7 @@ fn register_listen_file_tests(reg: &mut Registry<'_>) {
                             let listen_resp = run
                                 .send(&handle, crate::protocol::Command::NetListen { port })
                                 .await;
-                            if !matches!(&listen_resp, crate::protocol::Response::Listening { .. }) {
+                            if !super::expect_listening_port(&listen_resp, port).is_ok() {
                                 return super::TestOutcome::new(
                                     &agent_label,
                                     false,
@@ -179,7 +179,7 @@ fn register_conn_file_tests(reg: &mut Registry<'_>) {
                     let listen_resp = run
                         .send(&handle, crate::protocol::Command::NetListen { port })
                         .await;
-                    if !matches!(&listen_resp, crate::protocol::Response::Listening { .. }) {
+                    if !super::expect_listening_port(&listen_resp, port).is_ok() {
                         return super::TestOutcome::new(
                             "A",
                             false,
@@ -214,7 +214,7 @@ fn register_conn_file_tests(reg: &mut Registry<'_>) {
                     let listen_resp = run
                         .send(&handle, crate::protocol::Command::NetListen { port })
                         .await;
-                    if !matches!(&listen_resp, crate::protocol::Response::Listening { .. }) {
+                    if !super::expect_listening_port(&listen_resp, port).is_ok() {
                         return super::TestOutcome::new(
                             "A",
                             false,
@@ -257,7 +257,7 @@ fn register_conn_file_tests(reg: &mut Registry<'_>) {
                     let listen_resp = run
                         .send(&handle, crate::protocol::Command::NetListen { port })
                         .await;
-                    if !matches!(&listen_resp, crate::protocol::Response::Listening { .. }) {
+                    if !super::expect_listening_port(&listen_resp, port).is_ok() {
                         return super::TestOutcome::new(
                             "A",
                             false,
@@ -282,7 +282,7 @@ fn register_conn_file_tests(reg: &mut Registry<'_>) {
                             },
                         )
                         .await;
-                    let write_ok = matches!(&write_resp, crate::protocol::Response::Ok { .. });
+                    let write_ok = super::ok_without_data(&write_resp);
                     let _ = run
                         .send(&handle, crate::protocol::Command::NetUnlisten { port })
                         .await;
@@ -301,7 +301,7 @@ fn register_conn_file_tests(reg: &mut Registry<'_>) {
                     let listen_resp = run
                         .send(&handle, crate::protocol::Command::NetListen { port })
                         .await;
-                    if !matches!(&listen_resp, crate::protocol::Response::Listening { .. }) {
+                    if !super::expect_listening_port(&listen_resp, port).is_ok() {
                         return super::TestOutcome::new(
                             "A",
                             false,
@@ -369,7 +369,7 @@ fn register_interleave_tests(reg: &mut Registry<'_>) {
                         let listen_resp = run
                             .send(&handle, crate::protocol::Command::NetListen { port })
                             .await;
-                        if !matches!(&listen_resp, crate::protocol::Response::Listening { .. }) {
+                        if !super::expect_listening_port(&listen_resp, port).is_ok() {
                             return super::TestOutcome::new(
                                 "A",
                                 false,
@@ -420,7 +420,7 @@ fn register_interleave_tests(reg: &mut Registry<'_>) {
                         let listen_resp = run
                             .send(&handle_b, crate::protocol::Command::NetListen { port })
                             .await;
-                        if !matches!(&listen_resp, crate::protocol::Response::Listening { .. }) {
+                        if !super::expect_listening_port(&listen_resp, port).is_ok() {
                             return super::TestOutcome::new(
                                 "A",
                                 false,
@@ -462,7 +462,7 @@ fn register_multi_cycle_tests(reg: &mut Registry<'_>) {
                     let listen_resp = run
                         .send(&handle, crate::protocol::Command::NetListen { port })
                         .await;
-                    if !matches!(&listen_resp, crate::protocol::Response::Listening { .. }) {
+                    if !super::expect_listening_port(&listen_resp, port).is_ok() {
                         return super::TestOutcome::new(
                             "A",
                             false,
@@ -497,7 +497,7 @@ fn register_multi_cycle_tests(reg: &mut Registry<'_>) {
                                 },
                             )
                             .await;
-                        if !matches!(&write_resp, crate::protocol::Response::Ok { .. }) {
+                        if !super::ok_without_data(&write_resp) {
                             all_ok = false;
                             break;
                         }
@@ -527,7 +527,7 @@ fn register_multi_cycle_tests(reg: &mut Registry<'_>) {
                     let listen_resp = run
                         .send(&handle, crate::protocol::Command::NetListen { port })
                         .await;
-                    if !matches!(&listen_resp, crate::protocol::Response::Listening { .. }) {
+                    if !super::expect_listening_port(&listen_resp, port).is_ok() {
                         return super::TestOutcome::new(
                             "A",
                             false,
@@ -547,7 +547,7 @@ fn register_multi_cycle_tests(reg: &mut Registry<'_>) {
                                 },
                             )
                             .await;
-                        if !matches!(&write_resp, crate::protocol::Response::Ok { .. }) {
+                        if !super::ok_without_data(&write_resp) {
                             interleave_ok = false;
                             break;
                         }
@@ -592,7 +592,7 @@ fn register_exec_during_tcp_tests(reg: &mut Registry<'_>) {
                     let listen_resp = run
                         .send(&handle, crate::protocol::Command::NetListen { port })
                         .await;
-                    if !matches!(&listen_resp, crate::protocol::Response::Listening { .. }) {
+                    if !super::expect_listening_port(&listen_resp, port).is_ok() {
                         return super::TestOutcome::new(
                             "A",
                             false,
@@ -636,7 +636,7 @@ fn register_exec_during_tcp_tests(reg: &mut Registry<'_>) {
                     let listen_resp = run
                         .send(&handle, crate::protocol::Command::NetListen { port })
                         .await;
-                    if !matches!(&listen_resp, crate::protocol::Response::Listening { .. }) {
+                    if !super::expect_listening_port(&listen_resp, port).is_ok() {
                         return super::TestOutcome::new(
                             "A",
                             false,
@@ -675,4 +675,116 @@ fn register_exec_during_tcp_tests(reg: &mut Registry<'_>) {
                 })
             })
         });
+}
+
+#[derive(Clone, Copy)]
+struct FtAxisCase {
+    name: &'static str,
+    server: AgentName,
+    client: AgentName,
+}
+
+const FT_AXIS_CASES: &[FtAxisCase] = &[
+    FtAxisCase {
+        name: "parent_child",
+        server: AgentName::AA,
+        client: AgentName::A,
+    },
+    FtAxisCase {
+        name: "child_parent",
+        server: AgentName::A,
+        client: AgentName::AA,
+    },
+    FtAxisCase {
+        name: "depth2",
+        server: AgentName::D4,
+        client: AgentName::D5,
+    },
+];
+
+fn register_axis_file_tcp_tests(reg: &mut Registry<'_>) {
+    for case in FT_AXIS_CASES {
+        let id = format!("FT.axis.{}", case.name);
+        let server_label = case.server.to_string();
+        let client_label = case.client.to_string();
+        reg.test("stress", "file_tcp", id)
+            .timeout(180)
+            .build(move |cx| {
+                let server = cx.require(case.server);
+                let client = cx.require(case.client);
+                Box::new(move |run| {
+                    let server_label = server_label.clone();
+                    let client_label = client_label.clone();
+                    Box::pin(async move {
+                        run_axis_file_tcp_case(
+                            run,
+                            &server,
+                            &client,
+                            &server_label,
+                            &client_label,
+                            case.name,
+                        )
+                        .await
+                    })
+                })
+            });
+    }
+}
+
+async fn run_axis_file_tcp_case(
+    run: &mut RunContext<'_>,
+    server: &AgentHandle,
+    client: &AgentHandle,
+    server_label: &str,
+    client_label: &str,
+    axis: &str,
+) -> super::TestOutcome {
+    let agent = format!("{server_label}<-{client_label}");
+    let path = format!("/root/litebox_ft_axis_{axis}.txt");
+    let data = format!("ft_axis_payload_{axis}");
+    let write_resp = run
+        .send(
+            server,
+            crate::protocol::Command::FsWrite {
+                path: path.clone(),
+                data: data.clone(),
+            },
+        )
+        .await;
+    if !matches!(&write_resp, crate::protocol::Response::Ok { .. }) {
+        return super::TestOutcome::new(&agent, false, format!("write failed: {write_resp:?}"));
+    }
+
+    let listen_resp = run
+        .send(server, crate::protocol::Command::NetListen { port: 0 })
+        .await;
+    let port = match listen_resp {
+        crate::protocol::Response::Listening { port } if port > 0 => port,
+        other => {
+            let _ = run
+                .send(server, crate::protocol::Command::FsDelete { path })
+                .await;
+            return super::TestOutcome::new(&agent, false, format!("listen failed: {other:?}"));
+        }
+    };
+
+    let resp = run
+        .send(
+            client,
+            crate::protocol::Command::NetSendFileRecv {
+                addr: format!("127.0.0.1:{port}"),
+                size: 128,
+                path: path.clone(),
+            },
+        )
+        .await;
+    let expected = format!("tcp_ok=128,file_len={}", data.len());
+    let pass = matches!(&resp, crate::protocol::Response::Ok { data: Some(d) } if d == &expected);
+    let _ = run
+        .send(server, crate::protocol::Command::NetUnlisten { port })
+        .await;
+    let _ = run
+        .send(server, crate::protocol::Command::FsDelete { path })
+        .await;
+    super::TestOutcome::new(&agent, pass, format!("expected={expected} resp={resp:?}"))
 }

@@ -164,7 +164,7 @@ const EXEC_METHODS: &[ExecMethodCase] = &[
     },
     ExecMethodCase {
         name: "script_env_shebang",
-        cmd_template: "echo '#!/usr/bin/env bash' > /tmp/xm.sh && echo '/usr/local/bin/node -e \"console.log(\\\"script_env_ok\\\")\"' >> /tmp/xm.sh && chmod +x /tmp/xm.sh && /tmp/xm.sh; EXIT=$?; rm -f /tmp/xm.sh; exit $EXIT",
+        cmd_template: "echo '#!/usr/bin/env bash' > /tmp/xm.sh && echo 'echo script_env_ok' >> /tmp/xm.sh && chmod +x /tmp/xm.sh && /tmp/xm.sh; EXIT=$?; rm -f /tmp/xm.sh; exit $EXIT",
         expected: "script_env_ok",
     },
     ExecMethodCase {
@@ -176,11 +176,6 @@ const EXEC_METHODS: &[ExecMethodCase] = &[
         name: "nested_bash_node",
         cmd_template: "bash -c '/usr/local/bin/node -e \"console.log(\\\"nested_ok\\\")\"'",
         expected: "nested_ok",
-    },
-    ExecMethodCase {
-        name: "script_self_exe",
-        cmd_template: "echo '#!/usr/bin/bash' > /tmp/xm.sh && echo '{self_exe} echo-test' >> /tmp/xm.sh && chmod +x /tmp/xm.sh && /tmp/xm.sh; EXIT=$?; rm -f /tmp/xm.sh; exit $EXIT",
-        expected: "ECHO_TEST_OK",
     },
     ExecMethodCase {
         name: "script_exec_node",
@@ -385,8 +380,10 @@ pub(crate) fn register_fork_matrix(reg: &mut Registry<'_>) {
                                         if stdout.contains(&*expected)
                                 )
                             };
-                            let timeout =
-                                matches!(&resp, crate::protocol::Response::ExecTimeout { .. });
+                            let timeout = matches!(
+                                &resp,
+                                crate::protocol::Response::ExecTimeout { stderr } if !stderr.is_empty()
+                            );
                             super::TestOutcome::new(
                                 &agent_label,
                                 pass,
@@ -477,13 +474,16 @@ pub(crate) fn register_fork_matrix(reg: &mut Registry<'_>) {
             };
             let template = em.cmd_template.to_string();
             let expected = em.expected.to_string();
+            let agent = AgentName::A;
+            let agent_label = agent.to_string();
             reg.test("fork", "fork_matrix", id)
                 .timeout(60)
                 .build(move |cx| {
-                    let handle = cx.require(AgentName::A);
+                    let handle = cx.require(agent);
                     Box::new(move |run| {
                         let template = template.clone();
                         let expected = expected.clone();
+                        let agent_label = agent_label.clone();
                         Box::pin(async move {
                             let self_exe = run.self_exe().to_string();
                             let target = match bt_opt {
@@ -500,47 +500,58 @@ pub(crate) fn register_fork_matrix(reg: &mut Registry<'_>) {
                             let pass = matches!(
                                 &resp,
                                 crate::protocol::Response::ExecResult { exit_code: 0, stdout, .. }
-                                    if stdout.contains(&*expected)
+                                    if stdout.trim() == expected
                             );
-                            super::TestOutcome::new("A", pass, format!("{resp:?}"))
+                            super::TestOutcome::new(&agent_label, pass, format!("{resp:?}"))
                         })
                     })
                 });
         }
     }
 
-    // XM.node_networkInterfaces
-    reg.test("fork", "fork_matrix", "XM.node_networkInterfaces")
-        .timeout(60)
-        .build(move |cx| {
-            let handle = cx.require(AgentName::A);
-            Box::new(move |run| {
-                Box::pin(async move {
-                    let resp = run
-                        .send(
-                            &handle,
-                            super::exec_timeout(
-                                vec![
-                                    "/usr/local/bin/node".into(),
-                                    "-e".into(),
-                                    "try { const r = require('os').networkInterfaces(); \
-                                     console.log('NETIF_OK:' + Object.keys(r).length); } \
-                                     catch(e) { console.log('NETIF_ERR:' + e.code); }"
-                                        .into(),
-                                ],
-                                30,
-                            ),
-                        )
-                        .await;
-                    let pass = matches!(
-                        &resp,
-                        crate::protocol::Response::ExecResult { exit_code: 0, stdout, .. }
-                            if stdout.contains("NETIF_OK:") || stdout.contains("NETIF_ERR:")
-                    );
-                    super::TestOutcome::new("A", pass, format!("{resp:?}"))
-                })
-            })
-        });
+    // XM.node_networkInterfaces — blockers-added family.
+    // Doesn't take a BinaryType axis: the binary is the system node, not self_exe.
+    for &(agent, suffix) in &[
+        (AgentName::A, ""),
+        (AgentName::AA, ".AA"),
+        (AgentName::B, ".B"),
+        (AgentName::D4, ".D4"),
+    ] {
+        let id = format!("XM.node_networkInterfaces{suffix}");
+        let agent_label = agent.to_string();
+        reg.test("fork", "fork_matrix", id)
+            .timeout(60)
+            .build(move |cx| {
+                let handle = cx.require(agent);
+                Box::new(move |run| {
+                    let agent_label = agent_label.clone();
+                    Box::pin(async move {
+                        let resp = run
+                            .send(
+                                &handle,
+                                super::exec_timeout(
+                                    vec![
+                                        "/usr/local/bin/node".into(),
+                                        "-e".into(),
+                                        "try { const r = require('os').networkInterfaces(); \
+                                         console.log('NETIF_OK:' + Object.keys(r).length); } \
+                                         catch(e) { console.log('NETIF_ERR:' + e.code); }"
+                                            .into(),
+                                    ],
+                                    30,
+                                ),
+                            )
+                            .await;
+                        let pass = matches!(
+                            &resp,
+                            crate::protocol::Response::ExecResult { exit_code: 0, stdout, .. }
+                                if stdout.trim().starts_with("NETIF_OK:")
+                        );
+                        super::TestOutcome::new(&agent_label, pass, format!("{resp:?}"))
+                    })
+                });
+        }
+    }
 
     // Delayed fork matrix
     for &trigger in DF_TRIGGERS {

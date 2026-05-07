@@ -10,7 +10,7 @@
 use crate::protocol::{Command, Response};
 use tokio::time::Duration;
 
-use super::agents::{AgentHandle, AgentName, SpawnKind};
+use super::agents::{AgentHandle, AgentName, EphemeralHandle, SpawnKind};
 use super::registry::Registry;
 use super::run_context::RunContext;
 
@@ -26,6 +26,13 @@ const FAMILIES: &[&str] = &["ipv4", "ipv6"];
 const EXIT_SIZES: &[usize] = &[256, 4096, 65536];
 
 const NPIPE_REPS: &[usize] = &[1, 5, 10];
+const NPIPE_AGENTS: &[AgentName] = &[
+    AgentName::A,
+    AgentName::AA,
+    AgentName::B,
+    AgentName::NP,
+    AgentName::D4,
+];
 
 // ═══════════════════════════════════════════════════════════════════
 // POLL: epoll/ppoll IN events (fix 0fb258e2)
@@ -179,7 +186,7 @@ pub(crate) fn register_exit_data_integrity_tests(reg: &mut Registry<'_>) {
 #[allow(clippy::too_many_lines)] // exhaustive registration / runner
 pub(crate) fn register_nonpie_pipe_chain_tests(reg: &mut Registry<'_>) {
     for &reps in NPIPE_REPS {
-        for &agent in DEPTH_AGENTS {
+        for &agent in NPIPE_AGENTS {
             let agent_s = agent.to_string();
             // Sequential non-PIE pattern.
             reg.test(
@@ -469,7 +476,7 @@ pub(crate) fn register_cross_worker_first_connect_tests(reg: &mut Registry<'_>) 
             Box::pin(async move {
                 let port = 19900u16;
                 let listen_resp = run.send(&handle_a, Command::NetListen { port }).await;
-                if !matches!(&listen_resp, Response::Listening { .. }) {
+                if !super::expect_listening_port(&listen_resp, port).is_ok() {
                     return super::TestOutcome::new(
                         "B",
                         false,
@@ -506,7 +513,7 @@ pub(crate) fn register_cross_worker_first_connect_tests(reg: &mut Registry<'_>) 
             Box::pin(async move {
                 let port = 19901u16;
                 let listen_resp = run.send(&handle_b, Command::NetListen { port }).await;
-                if !matches!(&listen_resp, Response::Listening { .. }) {
+                if !super::expect_listening_port(&listen_resp, port).is_ok() {
                     return super::TestOutcome::new(
                         "AA",
                         false,
@@ -538,7 +545,7 @@ pub(crate) fn register_cross_worker_first_connect_tests(reg: &mut Registry<'_>) 
                 Box::pin(async move {
                     let port = 19902u16;
                     let listen_resp = run.send(&handle_a, Command::NetListen { port }).await;
-                    if !matches!(&listen_resp, Response::Listening { .. }) {
+                    if !super::expect_listening_port(&listen_resp, port).is_ok() {
                         return super::TestOutcome::new(
                             "B",
                             false,
@@ -594,7 +601,7 @@ pub(crate) fn register_cross_worker_self_connect_tests(reg: &mut Registry<'_>) {
             Box::pin(async move {
                 let port = 19910u16;
                 let listen_resp = run.send(&handle_a, Command::NetListen { port }).await;
-                if !matches!(&listen_resp, Response::Listening { .. }) {
+                if !super::expect_listening_port(&listen_resp, port).is_ok() {
                     return super::TestOutcome::new(
                         "A",
                         false,
@@ -631,7 +638,7 @@ pub(crate) fn register_cross_worker_self_connect_tests(reg: &mut Registry<'_>) {
             Box::pin(async move {
                 let port = 19911u16;
                 let listen_resp = run.send(&handle_a, Command::NetListen { port }).await;
-                if !matches!(&listen_resp, Response::Listening { .. }) {
+                if !super::expect_listening_port(&listen_resp, port).is_ok() {
                     return super::TestOutcome::new(
                         "AA",
                         false,
@@ -668,7 +675,7 @@ pub(crate) fn register_cross_worker_self_connect_tests(reg: &mut Registry<'_>) {
             Box::pin(async move {
                 let port = 19912u16;
                 let listen_resp = run.send(&handle_aa, Command::NetListen { port }).await;
-                if !matches!(&listen_resp, Response::Listening { .. }) {
+                if !super::expect_listening_port(&listen_resp, port).is_ok() {
                     return super::TestOutcome::new(
                         "A",
                         false,
@@ -705,7 +712,7 @@ pub(crate) fn register_cross_worker_self_connect_tests(reg: &mut Registry<'_>) {
             Box::pin(async move {
                 let port = 19913u16;
                 let listen_resp = run.send(&handle_a, Command::NetListen { port }).await;
-                if !matches!(&listen_resp, Response::Listening { .. }) {
+                if !super::expect_listening_port(&listen_resp, port).is_ok() {
                     return super::TestOutcome::new(
                         "AB",
                         false,
@@ -752,13 +759,13 @@ async fn run_tlb_listen_busy_case(
     delay_secs: u64,
 ) -> super::TestOutcome {
     let listen_resp = run.send(listener, Command::NetListen { port: 0 }).await;
-    let port = match &listen_resp {
-        Response::Listening { port } => *port,
-        _ => {
+    let port = match super::expect_listening_port(&listen_resp, 0) {
+        Ok(port) => port,
+        Err(e) => {
             return super::TestOutcome::new(
                 connector_name,
                 false,
-                format!("{listener_name} listen failed: {listen_resp:?}"),
+                format!("{listener_name} listen failed: {e}; resp={listen_resp:?}"),
             );
         }
     };
@@ -1283,22 +1290,22 @@ pub(crate) fn register_cross_worker_file_tests(reg: &mut Registry<'_>) {
                         let resp = run
                             .send(
                                 &handle,
-                                Command::Exec {
+                                Command::ExecReady {
                                     args: vec![
                                         self_exe,
                                         "cross-worker-file".into(),
                                         "write-and-sleep".into(),
                                         path.clone(),
                                     ],
-                                    timeout_secs: None,
+                                    ready_marker: "[cross-worker-file] READY".into(),
+                                    timeout_secs: Some(15),
                                     stdin: None,
-                                    background: true,
-                                    env: vec![],
+                                    stream: "stderr".into(),
                                 },
                             )
                             .await;
                         let bg_pid = match &resp {
-                            Response::Background { pid } => Some(*pid),
+                            Response::BackgroundReady { pid } => Some(*pid),
                             _ => {
                                 return super::TestOutcome::new(
                                     &a,
@@ -1307,7 +1314,6 @@ pub(crate) fn register_cross_worker_file_tests(reg: &mut Registry<'_>) {
                                 );
                             }
                         };
-                        tokio::time::sleep(Duration::from_secs(3)).await;
                         let resp = run
                             .send(&handle, Command::FsRead { path: path.clone() })
                             .await;
@@ -1339,22 +1345,22 @@ pub(crate) fn register_cross_worker_file_tests(reg: &mut Registry<'_>) {
                             let resp = run
                                 .send(
                                     &handle,
-                                    Command::Exec {
+                                    Command::ExecReady {
                                         args: vec![
                                             self_exe,
                                             "cross-worker-file".into(),
                                             "write-and-hold".into(),
                                             path.clone(),
                                         ],
-                                        timeout_secs: None,
+                                        ready_marker: "[cross-worker-file] READY".into(),
+                                        timeout_secs: Some(15),
                                         stdin: None,
-                                        background: true,
-                                        env: vec![],
+                                        stream: "stderr".into(),
                                     },
                                 )
                                 .await;
                             let bg_pid = match &resp {
-                                Response::Background { pid } => Some(*pid),
+                                Response::BackgroundReady { pid } => Some(*pid),
                                 _ => {
                                     return super::TestOutcome::new(
                                         &a,
@@ -1363,7 +1369,6 @@ pub(crate) fn register_cross_worker_file_tests(reg: &mut Registry<'_>) {
                                     );
                                 }
                             };
-                            tokio::time::sleep(Duration::from_secs(3)).await;
                             let resp = run
                                 .send(&handle, Command::FsRead { path: path.clone() })
                                 .await;
@@ -1396,33 +1401,46 @@ pub(crate) fn register_cross_worker_file_tests(reg: &mut Registry<'_>) {
                     let self_exe = run.self_exe().to_string();
                     Box::pin(async move {
                         let path = format!("/shared/cwf-self-{a}.txt");
-                        let script = format!(
-                            concat!(
-                                "rm -f {path}; ",
-                                "{exe} cross-worker-file write-and-hold {path} &\n",
-                                "BGPID=$!\nsleep 3\ncat {path}\n",
-                                "kill $BGPID 2>/dev/null\n",
-                            ),
-                            path = path,
-                            exe = self_exe,
-                        );
+                        let _ = run
+                            .send(&handle, Command::FsDelete { path: path.clone() })
+                            .await;
                         let resp = run
                             .send(
                                 &handle,
-                                Command::Exec {
-                                    args: vec!["bash".into(), "-c".into(), script],
+                                Command::ExecReady {
+                                    args: vec![
+                                        self_exe,
+                                        "cross-worker-file".into(),
+                                        "write-and-hold".into(),
+                                        path.clone(),
+                                    ],
+                                    ready_marker: "[cross-worker-file] READY".into(),
                                     timeout_secs: Some(15),
                                     stdin: None,
-                                    background: false,
-                                    env: vec![],
+                                    stream: "stderr".into(),
                                 },
                             )
                             .await;
+                        let pid = match &resp {
+                            Response::BackgroundReady { pid } => Some(*pid),
+                            _ => {
+                                return super::TestOutcome::new(
+                                    &a,
+                                    false,
+                                    format!("bg spawn failed: {resp:?}"),
+                                );
+                            }
+                        };
+                        let resp = run
+                            .send(&handle, Command::FsRead { path: path.clone() })
+                            .await;
                         let pass = matches!(
                             &resp,
-                            Response::ExecResult { stdout, .. }
-                                if stdout.starts_with("line0")
+                            Response::Ok { data: Some(d) } if d.starts_with("line0")
                         );
+                        if let Some(pid) = pid {
+                            let _ = run.send(&handle, Command::Kill { pid }).await;
+                        }
                         super::TestOutcome::new(&a, pass, format!("{resp:?}"))
                     })
                 })
@@ -1448,10 +1466,8 @@ pub(crate) fn register_cross_worker_file_tests(reg: &mut Registry<'_>) {
                         let script = format!(
                             concat!(
                                 "rm -f {path}; ",
-                                "{exe} cross-worker-file write-stdout ",
-                                "> {path} 2>&1 &\n",
-                                "BGPID=$!\nsleep 3\ncat {path}\n",
-                                "kill $BGPID 2>/dev/null\n",
+                                "{exe} cross-worker-file write-stdout > {path} &\n",
+                                "wait $!\n",
                             ),
                             path = path,
                             exe = self_exe,
@@ -1459,20 +1475,35 @@ pub(crate) fn register_cross_worker_file_tests(reg: &mut Registry<'_>) {
                         let resp = run
                             .send(
                                 &handle,
-                                Command::Exec {
+                                Command::ExecReady {
                                     args: vec!["bash".into(), "-c".into(), script],
+                                    ready_marker: "[cross-worker-file] READY".into(),
                                     timeout_secs: Some(15),
                                     stdin: None,
-                                    background: false,
-                                    env: vec![],
+                                    stream: "stderr".into(),
                                 },
                             )
                             .await;
+                        let pid = match &resp {
+                            Response::BackgroundReady { pid } => Some(*pid),
+                            _ => {
+                                return super::TestOutcome::new(
+                                    &a,
+                                    false,
+                                    format!("bg spawn failed: {resp:?}"),
+                                );
+                            }
+                        };
+                        let resp = run
+                            .send(&handle, Command::FsRead { path: path.clone() })
+                            .await;
                         let pass = matches!(
                             &resp,
-                            Response::ExecResult { stdout, .. }
-                                if stdout.contains("line0")
+                            Response::Ok { data: Some(d) } if d.contains("line0")
                         );
+                        if let Some(pid) = pid {
+                            let _ = run.send(&handle, Command::Kill { pid }).await;
+                        }
                         super::TestOutcome::new(&a, pass, format!("{resp:?}"))
                     })
                 })
@@ -1728,18 +1759,20 @@ pub(crate) fn register_concurrent_fork_tests(reg: &mut Registry<'_>) {
                                     &handle,
                                     Command::Exec {
                                         args: vec!["bash".into(), "-c".into(), script],
-                                        timeout_secs: None,
+                                        timeout_secs: Some(10),
                                         stdin: None,
-                                        background: true,
+                                        background: false,
                                         env: vec![],
                                     },
                                 )
                                 .await;
-                            let pid = match &resp {
-                                Response::Background { pid } => Some(*pid),
-                                _ => None,
-                            };
-                            tokio::time::sleep(Duration::from_secs(3)).await;
+                            if !matches!(&resp, Response::ExecResult { exit_code: 0, .. }) {
+                                return super::TestOutcome::new(
+                                    &a,
+                                    false,
+                                    format!("writer failed: {resp:?}"),
+                                );
+                            }
                             let resp = run
                                 .send(&handle, Command::FsRead { path: path.clone() })
                                 .await;
@@ -1747,9 +1780,6 @@ pub(crate) fn register_concurrent_fork_tests(reg: &mut Registry<'_>) {
                                 &resp,
                                 Response::Ok { data: Some(d) } if check(d)
                             );
-                            if let Some(pid) = pid {
-                                let _ = run.send(&handle, Command::Kill { pid }).await;
-                            }
                             super::TestOutcome::new(&a, pass, format!("{resp:?}"))
                         })
                     })
@@ -1773,9 +1803,8 @@ pub(crate) fn register_touch_redirect_tests(reg: &mut Registry<'_>) {
             name: "no_touch",
             script_template: concat!(
                 "rm -f {path}; ",
-                "{exe} echo-test > {path} 2>&1 &\n",
-                "BGPID=$!\nsleep 2\ncat {path}\n",
-                "kill $BGPID 2>/dev/null\n",
+                "{exe} echo-test > {path} 2>&1\n",
+                "cat {path}\n",
             ),
             check: |s| s.contains("ECHO_TEST_OK"),
         },
@@ -1783,9 +1812,8 @@ pub(crate) fn register_touch_redirect_tests(reg: &mut Registry<'_>) {
             name: "touch",
             script_template: concat!(
                 "rm -f {path}; touch {path}; ",
-                "{exe} echo-test > {path} 2>&1 &\n",
-                "BGPID=$!\nsleep 2\ncat {path}\n",
-                "kill $BGPID 2>/dev/null\n",
+                "{exe} echo-test > {path} 2>&1\n",
+                "cat {path}\n",
             ),
             check: |s| s.contains("ECHO_TEST_OK"),
         },
@@ -1793,9 +1821,8 @@ pub(crate) fn register_touch_redirect_tests(reg: &mut Registry<'_>) {
             name: "touch_chmod",
             script_template: concat!(
                 "rm -f {path}; touch {path}; chmod 600 {path}; ",
-                "{exe} echo-test > {path} 2>&1 &\n",
-                "BGPID=$!\nsleep 2\ncat {path}\n",
-                "kill $BGPID 2>/dev/null\n",
+                "{exe} echo-test > {path} 2>&1\n",
+                "cat {path}\n",
             ),
             check: |s| s.contains("ECHO_TEST_OK"),
         },
@@ -1803,9 +1830,8 @@ pub(crate) fn register_touch_redirect_tests(reg: &mut Registry<'_>) {
             name: "echo_touch",
             script_template: concat!(
                 "rm -f {path}; echo init > {path}; ",
-                "{exe} echo-test > {path} 2>&1 &\n",
-                "BGPID=$!\nsleep 2\ncat {path}\n",
-                "kill $BGPID 2>/dev/null\n",
+                "{exe} echo-test > {path} 2>&1\n",
+                "cat {path}\n",
             ),
             check: |s| s.contains("ECHO_TEST_OK"),
         },
@@ -1876,7 +1902,7 @@ pub(crate) fn register_pid_visibility_tests(reg: &mut Registry<'_>) {
         Def {
             name: "kill0_bg",
             script_template: concat!(
-                "{exe} slow-echo > /dev/null 2>&1 &\n",
+                "sleep 30 > /dev/null 2>&1 &\n",
                 "PID=$!\n",
                 "kill -0 $PID 2>/dev/null && echo KILL0_OK || echo KILL0_FAIL\n",
                 "kill $PID 2>/dev/null; wait $PID 2>/dev/null\n",
@@ -1890,21 +1916,21 @@ pub(crate) fn register_pid_visibility_tests(reg: &mut Registry<'_>) {
                 "B=$(uname -m)\n",
                 "C=$(ls /tmp | head -1)\n",
                 "D=$(echo x | cat)\n",
-                "{exe} slow-echo > /dev/null 2>&1 &\n",
+                "sleep 2 > /dev/null 2>&1 &\n",
                 "PID=$!\n",
                 "kill -0 $PID 2>/dev/null && echo KILL0_OK || echo KILL0_FAIL\n",
                 "sleep 1\n",
                 "kill -0 $PID 2>/dev/null && echo KILL0_1s_OK || echo KILL0_1s_FAIL\n",
-                "kill $PID 2>/dev/null; wait $PID 2>/dev/null\n",
+                "wait $PID 2>/dev/null\n",
             ),
             check: |s| s.contains("KILL0_OK") && s.contains("KILL0_1s_OK"),
         },
         Def {
             name: "proc_child",
             script_template: concat!(
-                "{exe} slow-echo > /dev/null 2>&1 &\n",
+                "{exe} cross-worker-file write-and-hold /shared/kp-proc-child.txt > /dev/null 2>&1 &\n",
                 "PID=$!\n",
-                "sleep 1\n",
+                "until cat /proc/$PID/cmdline 2>/dev/null | tr '\\0' ' ' | grep -q litebox_test_harness; do :; done\n",
                 "test -d /proc/$PID && echo PROC_DIR_OK || echo PROC_DIR_FAIL\n",
                 "cat /proc/$PID/cmdline 2>/dev/null | tr '\\0' ' ' | ",
                 "grep -q litebox_test_harness && echo CMDLINE_OK || echo CMDLINE_FAIL\n",
@@ -2674,14 +2700,24 @@ pub(crate) fn register_pipe_nonblock_tests(reg: &mut Registry<'_>) {
 
 pub(crate) fn register_epoll_socket_tests(reg: &mut Registry<'_>) {
     for &variant in &["direct", "tokio"] {
-        for &agent in AGENTS {
+        for &agent in &[
+            AgentName::A,
+            AgentName::AA,
+            AgentName::B,
+            AgentName::D4,
+            AgentName::D5,
+        ] {
             let port: u16 = match (variant, agent) {
                 ("direct", AgentName::A) => 19990,
                 ("direct", AgentName::AA) => 19991,
-                ("direct", _) => 19992,
-                ("tokio", AgentName::A) => 19993,
-                ("tokio", AgentName::AA) => 19994,
-                _ => 19995,
+                ("direct", AgentName::B) => 19992,
+                ("direct", AgentName::D4) => 19993,
+                ("direct", _) => 19994,
+                ("tokio", AgentName::A) => 19995,
+                ("tokio", AgentName::AA) => 19996,
+                ("tokio", AgentName::B) => 19997,
+                ("tokio", AgentName::D4) => 19998,
+                _ => 19999,
             };
 
             // EP.{variant}.accept.{agent}
@@ -2773,115 +2809,6 @@ pub(crate) fn register_epoll_socket_tests(reg: &mut Registry<'_>) {
 }
 
 // ═══════════════════════════════════════════════════════════════════
-// LB: Loopback TCP across delayed-fork workers
-// ═══════════════════════════════════════════════════════════════════
-
-#[allow(clippy::too_many_lines)] // exhaustive registration / runner
-pub(crate) fn register_loopback_tcp_tests(reg: &mut Registry<'_>) {
-    struct Def {
-        name: &'static str,
-        script_template: &'static str,
-        check: fn(&str) -> bool,
-    }
-    let defs: &[Def] = &[
-        Def {
-            name: "same_worker",
-            script_template: concat!(
-                "{exe} tcp-echo 19876 &\n",
-                "sleep 1\n",
-                "REPLY=$(echo LB_SAME | nc -q1 127.0.0.1 19876 2>/dev/null)\n",
-                "echo REPLY=$REPLY\n",
-                "wait\n",
-            ),
-            check: |s| s.contains("REPLY=LB_SAME"),
-        },
-        Def {
-            name: "localhost",
-            script_template: concat!(
-                "{exe} tcp-echo 19877 > /dev/null 2>&1 &\n",
-                "PID=$!\nsleep 2\n",
-                "REPLY=$(echo LB_LOCAL | nc -q1 127.0.0.1 19877 2>/dev/null)\n",
-                "echo REPLY=$REPLY\n",
-                "kill $PID 2>/dev/null; wait $PID 2>/dev/null\n",
-            ),
-            check: |s| s.contains("REPLY=LB_LOCAL"),
-        },
-        Def {
-            name: "any_to_local",
-            script_template: concat!(
-                "{exe} tcp-echo 19879 > /dev/null 2>&1 &\n",
-                "PID=$!\nsleep 2\n",
-                "REPLY=$(echo LB_ANY | nc -q1 127.0.0.1 19879 2>/dev/null)\n",
-                "echo REPLY=$REPLY\n",
-                "kill $PID 2>/dev/null; wait $PID 2>/dev/null\n",
-            ),
-            check: |s| s.contains("REPLY=LB_ANY"),
-        },
-        Def {
-            name: "fast_close",
-            script_template: concat!(
-                "{exe} tcp-recv-all 19881 &\n",
-                "PID=$!\nsleep 2\n",
-                "echo LB_FAST | nc -q0 127.0.0.1 19881 2>/dev/null\n",
-                "sleep 2\n",
-                "wait $PID 2>/dev/null\n",
-            ),
-            check: |s| s.contains("RECV=LB_FAST"),
-        },
-        Def {
-            name: "halfclose_eof",
-            script_template: concat!(
-                "{exe} tcp-recv-all 19882 &\n",
-                "PID=$!\nsleep 2\n",
-                "echo LB_HALF | nc -w2 127.0.0.1 19882 2>/dev/null\n",
-                "sleep 3\n",
-                "wait $PID 2>/dev/null\n",
-            ),
-            check: |s| s.contains("RECV=LB_HALF"),
-        },
-    ];
-    for &agent in AGENTS {
-        for def in defs {
-            let agent_s = agent.to_string();
-            let template: String = def.script_template.into();
-            let check = def.check;
-            let name = def.name;
-            reg.test("matrix", "loopback_tcp", format!("LB.{name}.{agent}"))
-                .timeout(60)
-                .build(move |cx| {
-                    let handle = cx.require(agent);
-                    Box::new(move |run| {
-                        let a = agent_s.clone();
-                        let t = template.clone();
-                        let self_exe = run.self_exe().to_string();
-                        Box::pin(async move {
-                            let script = t.replace("{exe}", &self_exe);
-                            let resp = run
-                                .send(
-                                    &handle,
-                                    Command::Exec {
-                                        args: vec!["bash".into(), "-c".into(), script],
-                                        timeout_secs: Some(15),
-                                        stdin: None,
-                                        background: false,
-                                        env: vec![],
-                                    },
-                                )
-                                .await;
-                            let pass = matches!(
-                                &resp,
-                                Response::ExecResult { stdout, .. }
-                                    if check(stdout)
-                            );
-                            super::TestOutcome::new(&a, pass, format!("{resp:?}"))
-                        })
-                    })
-                });
-        }
-    }
-}
-
-// ═══════════════════════════════════════════════════════════════════
 // THC: TCP half-close EOF
 // ═══════════════════════════════════════════════════════════════════
 
@@ -2930,37 +2857,19 @@ pub(crate) fn register_tcp_halfclose_tests(reg: &mut Registry<'_>) {
                 let server = cx.require(case.server);
                 let client = cx.require(case.client);
                 Box::new(move |run| {
-                    let agent_label = format!("{server_label}->{client_label}");
+                    let server_label = server_label.clone();
+                    let client_label = client_label.clone();
                     let payload = case.payload.to_string();
                     Box::pin(async move {
-                        let listen_resp = run.send(&server, Command::NetListen { port: 0 }).await;
-                        let port = match &listen_resp {
-                            Response::Listening { port } => *port,
-                            _ => {
-                                return super::TestOutcome::new(
-                                    &agent_label,
-                                    false,
-                                    format!("listen failed: {listen_resp:?}"),
-                                );
-                            }
-                        };
-
-                        let halfclose_resp = run
-                            .send(
-                                &client,
-                                Command::NetHalfCloseEcho {
-                                    addr: format!("127.0.0.1:{port}"),
-                                    write_data: payload.clone(),
-                                    half: "wr".into(),
-                                },
-                            )
-                            .await;
-                        let _ = run.send(&server, Command::NetUnlisten { port }).await;
-                        let pass = matches!(
-                            &halfclose_resp,
-                            Response::HalfClosed { echo } if echo == &payload
-                        );
-                        super::TestOutcome::new(&agent_label, pass, format!("{halfclose_resp:?}"))
+                        crate::coordinator::tcp_state::run_write_shutdown_read_eof_case(
+                            run,
+                            &server,
+                            &client,
+                            &server_label,
+                            &client_label,
+                            &payload,
+                        )
+                        .await
                     })
                 })
             });
@@ -2970,6 +2879,47 @@ pub(crate) fn register_tcp_halfclose_tests(reg: &mut Registry<'_>) {
 // ═══════════════════════════════════════════════════════════════════
 // FKLC: fork-listen-close — VS Code CLI pattern
 // ═══════════════════════════════════════════════════════════════════
+
+async fn fklc_connect_from_agent(
+    run: &mut RunContext<'_>,
+    connector: &AgentHandle,
+    port: u16,
+    payload: &str,
+) -> Result<Response, String> {
+    let resp = run
+        .send(
+            connector,
+            Command::NetConnect {
+                addr: format!("127.0.0.1:{port}"),
+                data: payload.to_string(),
+            },
+        )
+        .await;
+    match &resp {
+        Response::Connected { echo } if echo == payload => Ok(resp),
+        _ => Err(format!("connect via agent failed: {resp:?}")),
+    }
+}
+
+async fn fklc_child_accept_ready(
+    run: &mut RunContext<'_>,
+    child: &EphemeralHandle,
+    port: u16,
+) -> Result<Response, String> {
+    let resp = run
+        .forward(
+            child,
+            Command::NetAccept {
+                port,
+                timeout_secs: 5,
+            },
+        )
+        .await;
+    match &resp {
+        Response::Ok { .. } => Ok(resp),
+        _ => Err(format!("child accept start failed: {resp:?}")),
+    }
+}
 
 pub(crate) fn register_fork_listen_close_tests(reg: &mut Registry<'_>) {
     // FKLC.listen_unlisten: A listens then immediately unlistens,
@@ -2987,11 +2937,11 @@ pub(crate) fn register_fork_listen_close_tests(reg: &mut Registry<'_>) {
             Box::pin(async move {
                 let port = 19920u16;
                 let listen_resp = run.send(&handle_a, Command::NetListen { port }).await;
-                if !matches!(&listen_resp, Response::Listening { .. }) {
+                if let Err(e) = super::expect_listening_port(&listen_resp, port) {
                     return super::TestOutcome::new(
                         "B",
                         false,
-                        format!("listen failed: {listen_resp:?}"),
+                        format!("listen failed: {e}; resp={listen_resp:?}"),
                     );
                 }
                 let _ = run.send(&handle_a, Command::NetUnlisten { port }).await;
@@ -3004,66 +2954,335 @@ pub(crate) fn register_fork_listen_close_tests(reg: &mut Registry<'_>) {
                         },
                     )
                     .await;
-                let got_rst = matches!(&conn_resp, Response::ConnectFailed { .. });
+                let got_rst = matches!(
+                    &conn_resp,
+                    Response::ConnectFailed { error }
+                        if !error.is_empty()
+                            && (error.contains("refused")
+                                || error.contains("reset")
+                                || error.contains("timeout"))
+                );
                 super::TestOutcome::new("B", got_rst, format!("expected RST: {conn_resp:?}"))
             })
         })
     });
-    // FKLC.cross_connect: fd inheritance across fork+exec.
-    // A spawns tcp-fork-listen-accept in bg, B connects.
+    // FKLC.inherit.cross_connect: protocol-only fd inheritance across fork+exec.
+    // A listens, forks an inherited-listener child, closes its copy, and B connects.
     reg.test(
         "xworker",
         "fork_listen_close",
-        "FKLC.cross_connect".to_string(),
+        "FKLC.inherit.cross_connect".to_string(),
     )
     .timeout(60)
     .build(move |cx| {
-        let handle_a = cx.require(AgentName::A);
-        let handle_b = cx.require(AgentName::B);
+        let parent = cx.require(AgentName::A);
+        let connector = cx.require(AgentName::B);
+        let child = cx.declare_ephemeral(
+            AgentName::A,
+            "FKLCInheritCross",
+            SpawnKind::Fork {
+                binary: "self",
+                inherit_listen_ports: vec![19921],
+            },
+        );
         Box::new(move |run| {
-            let self_exe = run.self_exe().to_string();
             Box::pin(async move {
                 let port = 19921u16;
-                let bg_resp = run
-                    .send(
-                        &handle_a,
-                        Command::Exec {
-                            args: vec![self_exe, "tcp-fork-listen-accept".into(), port.to_string()],
-                            timeout_secs: None,
-                            stdin: None,
-                            background: true,
-                            env: vec![],
-                        },
-                    )
-                    .await;
-                let bg_pid = match &bg_resp {
-                    Response::Background { pid } => Some(*pid),
-                    _ => {
+                let listen_resp = run.send(&parent, Command::NetListen { port }).await;
+                if !matches!(&listen_resp, Response::Listening { port: p } if *p == port) {
+                    return super::TestOutcome::new(
+                        "B",
+                        false,
+                        format!("listen failed: {listen_resp:?}"),
+                    );
+                }
+                let fork_resp = run.spawn_ephemeral(&child).await;
+                if !matches!(&fork_resp, Response::Ok { .. }) {
+                    return super::TestOutcome::new(
+                        "B",
+                        false,
+                        format!("fork failed: {fork_resp:?}"),
+                    );
+                }
+                let _ = run.send(&parent, Command::NetCloseListener { port }).await;
+                if let Err(e) = fklc_child_accept_ready(run, &child, port).await {
+                    let _ = run.forward(&child, Command::Exit).await;
+                    return super::TestOutcome::new("B", false, e);
+                }
+                match fklc_connect_from_agent(run, &connector, port, "fork_listen_close").await {
+                    Ok(conn_resp) => {
+                        let _ = run.forward(&child, Command::Exit).await;
+                        super::TestOutcome::new("B", true, format!("{conn_resp:?}"))
+                    }
+                    Err(e) => {
+                        let _ = run.forward(&child, Command::Exit).await;
+                        super::TestOutcome::new("B", false, e)
+                    }
+                }
+            })
+        })
+    });
+
+    // FKLC.inherit.multi_port: one fork imports two listen sockets at once.
+    reg.test(
+        "xworker",
+        "fork_listen_close",
+        "FKLC.inherit.multi_port".to_string(),
+    )
+    .timeout(60)
+    .build(move |cx| {
+        let parent = cx.require(AgentName::A);
+        let connector = cx.require(AgentName::B);
+        let child = cx.declare_ephemeral(
+            AgentName::A,
+            "FKLCInheritMulti",
+            SpawnKind::Fork {
+                binary: "self",
+                inherit_listen_ports: vec![19922, 19923],
+            },
+        );
+        Box::new(move |run| {
+            Box::pin(async move {
+                for port in [19922u16, 19923] {
+                    let listen_resp = run.send(&parent, Command::NetListen { port }).await;
+                    if !matches!(&listen_resp, Response::Listening { port: p } if *p == port) {
                         return super::TestOutcome::new(
                             "B",
                             false,
-                            format!("bg spawn failed: {bg_resp:?}"),
+                            format!("listen {port} failed: {listen_resp:?}"),
                         );
                     }
+                }
+                let fork_resp = run.spawn_ephemeral(&child).await;
+                if !matches!(&fork_resp, Response::Ok { .. }) {
+                    return super::TestOutcome::new(
+                        "B",
+                        false,
+                        format!("fork failed: {fork_resp:?}"),
+                    );
+                }
+                for port in [19922u16, 19923] {
+                    let _ = run.send(&parent, Command::NetCloseListener { port }).await;
+                }
+                let ready_first = fklc_child_accept_ready(run, &child, 19922).await;
+                let ready_second = fklc_child_accept_ready(run, &child, 19923).await;
+                let first = fklc_connect_from_agent(run, &connector, 19922, "multi_one").await;
+                let second = fklc_connect_from_agent(run, &connector, 19923, "multi_two").await;
+                let _ = run.forward(&child, Command::Exit).await;
+                match (ready_first, ready_second, first, second) {
+                    (Ok(a), Ok(b), Ok(c), Ok(d)) => {
+                        super::TestOutcome::new("B", true, format!("{a:?}; {b:?}; {c:?}; {d:?}"))
+                    }
+                    results => super::TestOutcome::new("B", false, format!("{results:?}")),
+                }
+            })
+        })
+    });
+
+    // FKLC.inherit.close_parent: the child keeps accepting after the parent closes.
+    reg.test(
+        "xworker",
+        "fork_listen_close",
+        "FKLC.inherit.close_parent".to_string(),
+    )
+    .timeout(60)
+    .build(move |cx| {
+        let parent = cx.require(AgentName::A);
+        let connector = cx.require(AgentName::B);
+        let child = cx.declare_ephemeral(
+            AgentName::A,
+            "FKLCInheritCloseParent",
+            SpawnKind::Fork {
+                binary: "self",
+                inherit_listen_ports: vec![19924],
+            },
+        );
+        Box::new(move |run| {
+            Box::pin(async move {
+                let port = 19924u16;
+                let listen_resp = run.send(&parent, Command::NetListen { port }).await;
+                if !matches!(&listen_resp, Response::Listening { port: p } if *p == port) {
+                    return super::TestOutcome::new(
+                        "B",
+                        false,
+                        format!("listen failed: {listen_resp:?}"),
+                    );
+                }
+                let fork_resp = run.spawn_ephemeral(&child).await;
+                let close_resp = run.send(&parent, Command::NetCloseListener { port }).await;
+                if !matches!(
+                    (&fork_resp, &close_resp),
+                    (Response::Ok { .. }, Response::Ok { .. })
+                ) {
+                    return super::TestOutcome::new(
+                        "B",
+                        false,
+                        format!("fork/close failed: {fork_resp:?}; {close_resp:?}"),
+                    );
+                }
+                let ready = fklc_child_accept_ready(run, &child, port).await;
+                let result = if let Err(e) = ready {
+                    Err(e)
+                } else {
+                    fklc_connect_from_agent(run, &connector, port, "close_parent").await
                 };
-                tokio::time::sleep(Duration::from_secs(3)).await;
-                let conn_resp = run
-                    .send(
-                        &handle_b,
-                        Command::NetConnect {
-                            addr: format!("127.0.0.1:{port}"),
-                            data: "fork_listen_close".into(),
+                let _ = run.forward(&child, Command::Exit).await;
+                match result {
+                    Ok(resp) => super::TestOutcome::new("B", true, format!("{resp:?}")),
+                    Err(e) => super::TestOutcome::new("B", false, e),
+                }
+            })
+        })
+    });
+
+    // FKLC.inherit.depth2: an inheriting child can fork the listener onward.
+    reg.test(
+        "xworker",
+        "fork_listen_close",
+        "FKLC.inherit.depth2".to_string(),
+    )
+    .timeout(60)
+    .build(move |cx| {
+        let parent = cx.require(AgentName::A);
+        let connector = cx.require(AgentName::B);
+        let child = cx.declare_ephemeral(
+            AgentName::A,
+            "FKLCInheritDepth1",
+            SpawnKind::Fork {
+                binary: "self",
+                inherit_listen_ports: vec![19925],
+            },
+        );
+        Box::new(move |run| {
+            Box::pin(async move {
+                let port = 19925u16;
+                let listen_resp = run.send(&parent, Command::NetListen { port }).await;
+                if !matches!(&listen_resp, Response::Listening { port: p } if *p == port) {
+                    return super::TestOutcome::new(
+                        "B",
+                        false,
+                        format!("listen failed: {listen_resp:?}"),
+                    );
+                }
+                let fork1_resp = run.spawn_ephemeral(&child).await;
+                let _ = run.send(&parent, Command::NetCloseListener { port }).await;
+                if !matches!(&fork1_resp, Response::Ok { .. }) {
+                    return super::TestOutcome::new(
+                        "B",
+                        false,
+                        format!("fork depth1 failed: {fork1_resp:?}"),
+                    );
+                }
+                let fork2_resp = run
+                    .forward(
+                        &child,
+                        Command::Fork {
+                            name: "FKLCInheritDepth2".into(),
+                            binary: "self".into(),
+                            inherit_listen_ports: vec![port],
                         },
                     )
                     .await;
-                let pass = matches!(
-                    &conn_resp,
-                    Response::Connected { echo } if echo == "fork_listen_close"
-                );
-                if let Some(pid) = bg_pid {
-                    let _ = run.send(&handle_a, Command::Kill { pid }).await;
+                let close1_resp = run
+                    .forward(&child, Command::NetCloseListener { port })
+                    .await;
+                if !matches!(
+                    (&fork2_resp, &close1_resp),
+                    (Response::Ok { .. }, Response::Ok { .. })
+                ) {
+                    let _ = run.forward(&child, Command::Exit).await;
+                    return super::TestOutcome::new(
+                        "B",
+                        false,
+                        format!("fork depth2/close depth1 failed: {fork2_resp:?}; {close1_resp:?}"),
+                    );
                 }
-                super::TestOutcome::new("B", pass, format!("{conn_resp:?}"))
+                let ready = run
+                    .forward(
+                        &child,
+                        Command::Forward {
+                            target: "FKLCInheritDepth2".into(),
+                            inner: Box::new(Command::NetAccept {
+                                port,
+                                timeout_secs: 5,
+                            }),
+                        },
+                    )
+                    .await;
+                let conn = fklc_connect_from_agent(run, &connector, port, "depth2").await;
+                let _ = run
+                    .forward(
+                        &child,
+                        Command::Forward {
+                            target: "FKLCInheritDepth2".into(),
+                            inner: Box::new(Command::Exit),
+                        },
+                    )
+                    .await;
+                let _ = run.forward(&child, Command::Exit).await;
+                match (&ready, conn) {
+                    (Response::Ok { .. }, Ok(conn_resp)) => {
+                        super::TestOutcome::new("B", true, format!("{ready:?}; {conn_resp:?}"))
+                    }
+                    (_, conn_result) => super::TestOutcome::new(
+                        "B",
+                        false,
+                        format!("ready={ready:?}; connect={conn_result:?}"),
+                    ),
+                }
+            })
+        })
+    });
+
+    // FKLC.inherit.sibling_connect: a sibling child, not the parent, connects.
+    reg.test(
+        "xworker",
+        "fork_listen_close",
+        "FKLC.inherit.sibling_connect".to_string(),
+    )
+    .timeout(60)
+    .build(move |cx| {
+        let parent = cx.require(AgentName::A);
+        let connector = cx.require(AgentName::B);
+        let server = cx.declare_ephemeral(
+            AgentName::A,
+            "FKLCInheritSiblingServer",
+            SpawnKind::Fork {
+                binary: "self",
+                inherit_listen_ports: vec![19926],
+            },
+        );
+        Box::new(move |run| {
+            Box::pin(async move {
+                let port = 19926u16;
+                let listen_resp = run.send(&parent, Command::NetListen { port }).await;
+                if !matches!(&listen_resp, Response::Listening { port: p } if *p == port) {
+                    return super::TestOutcome::new(
+                        "A",
+                        false,
+                        format!("listen failed: {listen_resp:?}"),
+                    );
+                }
+                let server_resp = run.spawn_ephemeral(&server).await;
+                let _ = run.send(&parent, Command::NetCloseListener { port }).await;
+                if !matches!(&server_resp, Response::Ok { .. }) {
+                    return super::TestOutcome::new(
+                        "B",
+                        false,
+                        format!("spawn failed: {server_resp:?}"),
+                    );
+                }
+                let ready = fklc_child_accept_ready(run, &server, port).await;
+                let result = if let Err(e) = ready {
+                    Err(e)
+                } else {
+                    fklc_connect_from_agent(run, &connector, port, "sibling_connect").await
+                };
+                let _ = run.forward(&server, Command::Exit).await;
+                match result {
+                    Ok(resp) => super::TestOutcome::new("B", true, format!("{resp:?}")),
+                    Err(e) => super::TestOutcome::new("B", false, e),
+                }
             })
         })
     });
@@ -3223,7 +3442,7 @@ pub(crate) fn register_subtree_kill_tests(reg: &mut Registry<'_>) {
             Box::pin(async move {
                 let _ = crate::nonpie_binary();
                 let r = run.spawn_ephemeral(&npx).await;
-                if !matches!(r, Response::Ok { .. }) {
+                if !super::ok_spawned_response(&r) {
                     return super::TestOutcome::new(
                         "E",
                         false,
@@ -3259,7 +3478,7 @@ pub(crate) fn register_subtree_kill_tests(reg: &mut Registry<'_>) {
                 // the test declared AgentName::EE. Ask EE to spawn
                 // its own non-PIE descendant.
                 let r = run.spawn_ephemeral(&npx).await;
-                if !matches!(r, Response::Ok { .. }) {
+                if !super::ok_spawned_response(&r) {
                     return super::TestOutcome::new(
                         "E",
                         false,
@@ -3293,7 +3512,7 @@ pub(crate) fn register_subtree_kill_tests(reg: &mut Registry<'_>) {
             Box::pin(async move {
                 let _ = crate::nonpie_binary();
                 let r = run.spawn_ephemeral(&npx).await;
-                if !matches!(r, Response::Ok { .. }) {
+                if !super::ok_spawned_response(&r) {
                     return super::TestOutcome::new(
                         "E",
                         false,

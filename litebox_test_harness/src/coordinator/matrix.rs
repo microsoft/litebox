@@ -653,7 +653,7 @@ pub(super) fn register_fs_cross_unlink(reg: &mut Registry<'_>) {
                     let resp = send_to(run, &handles, dest, Command::FsDelete { path: file }).await;
                     super::TestOutcome::new(
                         dest.name(),
-                        matches!(&resp, Response::Ok { .. }),
+                        super::ok_without_data(&resp),
                         format!("{resp:?}"),
                     )
                 })
@@ -788,7 +788,7 @@ pub(super) fn register_net_tests(reg: &mut Registry<'_>) {
                 Box::pin(async move {
                     let resp =
                         send_to(run, &handles, listener, Command::NetListen { port: p }).await;
-                    let pass = matches!(resp, Response::Listening { .. });
+                    let pass = super::expect_listening_port(&resp, p).is_ok();
                     let _ =
                         send_to(run, &handles, listener, Command::NetUnlisten { port: p }).await;
                     super::TestOutcome::new(listener.name(), pass, format!("{resp:?}"))
@@ -804,11 +804,11 @@ pub(super) fn register_net_tests(reg: &mut Registry<'_>) {
                 Box::pin(async move {
                     let resp =
                         send_to(run, &handles, listener, Command::NetListen { port: p }).await;
-                    if !matches!(resp, Response::Listening { .. }) {
+                    if let Err(e) = super::expect_listening_port(&resp, p) {
                         return super::TestOutcome::new(
                             connector.name(),
                             false,
-                            format!("listen failed: {resp:?}"),
+                            format!("listen failed: {e}; resp={resp:?}"),
                         );
                     }
                     let resp = send_to(
@@ -839,7 +839,7 @@ pub(super) fn register_net_tests(reg: &mut Registry<'_>) {
                         send_to(run, &handles, listener, Command::NetUnlisten { port: p }).await;
                     super::TestOutcome::new(
                         listener.name(),
-                        matches!(resp, Response::Ok { .. }),
+                        super::ok_without_data(&resp),
                         format!("{resp:?}"),
                     )
                 })
@@ -864,11 +864,11 @@ pub(super) fn register_net_addr_tests(reg: &mut Registry<'_>) {
                     Box::pin(async move {
                         let resp =
                             send_to(run, &handles, agent_a, Command::NetListen { port: p }).await;
-                        if !matches!(resp, Response::Listening { .. }) {
+                        if let Err(e) = super::expect_listening_port(&resp, p) {
                             return super::TestOutcome::new(
                                 agent_b.name(),
                                 false,
-                                format!("listen failed: {resp:?}"),
+                                format!("listen failed: {e}; resp={resp:?}"),
                             );
                         }
                         let resp = send_to(
@@ -920,11 +920,11 @@ pub(super) fn register_net_addr_tests(reg: &mut Registry<'_>) {
                     };
                     let resp =
                         send_to(run, &handles, agent_a, Command::NetListen { port: p }).await;
-                    if !matches!(resp, Response::Listening { .. }) {
+                    if let Err(e) = super::expect_listening_port(&resp, p) {
                         return super::TestOutcome::new(
                             agent_b.name(),
                             false,
-                            format!("listen failed: {resp:?}"),
+                            format!("listen failed: {e}; resp={resp:?}"),
                         );
                     }
                     let resp = send_to(
@@ -967,11 +967,11 @@ pub(super) fn register_unix_addr_tests(reg: &mut Registry<'_>) {
                         },
                     )
                     .await;
-                    if !matches!(&resp, Response::UnixListening { .. }) {
+                    if let Err(e) = super::expect_unix_listening_path(&resp, &sock_path) {
                         return super::TestOutcome::new(
                             agent_b.name(),
                             false,
-                            format!("listen failed: {resp:?}"),
+                            format!("listen failed: {e}; resp={resp:?}"),
                         );
                     }
                     let resp = send_to(
@@ -1079,7 +1079,7 @@ pub(super) fn register_env_tests(reg: &mut Registry<'_>) {
                     let resp = send_to(run, &handles, agent, Command::CwdGet).await;
                     super::TestOutcome::new(
                         agent.name(),
-                        matches!(&resp, Response::Ok { data: Some(_) }),
+                        matches!(&resp, Response::Ok { data: Some(d) } if d == "/"),
                         format!("{resp:?}"),
                     )
                 })
@@ -1135,7 +1135,7 @@ pub(super) fn register_symlink_basic(reg: &mut Registry<'_>) {
                     .await;
                     super::TestOutcome::new(
                         source.name(),
-                        matches!(&resp, Response::Ok { .. }),
+                        super::ok_without_data(&resp),
                         format!("{resp:?}"),
                     )
                 })
@@ -1567,7 +1567,8 @@ pub(super) fn register_unix_tests(reg: &mut Registry<'_>) {
                                 },
                             )
                             .await;
-                            let pass = matches!(&resp, Response::UnixListening { .. });
+                            let pass =
+                                super::expect_unix_listening_path(&resp, &sock_listen).is_ok();
                             let _ = send_to(
                                 run,
                                 &handles,
@@ -1592,11 +1593,11 @@ pub(super) fn register_unix_tests(reg: &mut Registry<'_>) {
                                 Command::UnixListen { path: sock.clone() },
                             )
                             .await;
-                            if !matches!(&resp, Response::UnixListening { .. }) {
+                            if let Err(e) = super::expect_unix_listening_path(&resp, &sock) {
                                 return super::TestOutcome::new(
                                     agent.name(),
                                     false,
-                                    format!("listen failed: {resp:?}"),
+                                    format!("listen failed: {e}; resp={resp:?}"),
                                 );
                             }
                             let data = format!("unix_{name}");
@@ -1637,7 +1638,8 @@ pub(super) fn register_unix_tests(reg: &mut Registry<'_>) {
                                 },
                             )
                             .await;
-                            let pass = matches!(&resp, Response::UnixListening { .. });
+                            let pass =
+                                super::expect_unix_listening_path(&resp, &sock_listen).is_ok();
                             let _ = send_to(
                                 run,
                                 &handles,
@@ -1667,11 +1669,13 @@ pub(super) fn register_unix_tests(reg: &mut Registry<'_>) {
                                     Command::UnixListen { path: sock.clone() },
                                 )
                                 .await;
-                                if !matches!(&resp, Response::UnixListening { .. }) {
+                                if let Err(e) =
+                                    super::expect_unix_listening_path(&resp, &sock)
+                                {
                                     return super::TestOutcome::new(
                                         agent.name(),
                                         false,
-                                        format!("listen failed: {resp:?}"),
+                                        format!("listen failed: {e}; resp={resp:?}"),
                                     );
                                 }
                                 let data = format!("unix_{name}");
@@ -1704,8 +1708,11 @@ pub(super) fn register_unix_tests(reg: &mut Registry<'_>) {
             UnixPattern::BackgroundServerConnect => {
                 for &bt in crate::BinaryType::ALL {
                     let bt_label = bt.label();
-                    let sock_start =
-                        format!("/tmp/um_{}_{}_start.sock", name.replace('.', "_"), bt_label);
+                    let sock_start = format!(
+                        "/tmp/um_{}_{}_start.sock",
+                        name.replace('.', "_"),
+                        bt_label
+                    );
                     matrix_test(
                         reg,
                         format!("U.{name}.{bt_label}.server_start"),
@@ -1738,7 +1745,8 @@ pub(super) fn register_unix_tests(reg: &mut Registry<'_>) {
                                 let pass = pid.is_some();
                                 if let Some(pid) = pid {
                                     let _ =
-                                        send_to(run, &handles, agent, Command::Kill { pid }).await;
+                                        send_to(run, &handles, agent, Command::Kill { pid })
+                                            .await;
                                 }
                                 let _ = send_to(
                                     run,
@@ -1771,17 +1779,21 @@ pub(super) fn register_unix_tests(reg: &mut Registry<'_>) {
                                     run,
                                     &handles,
                                     agent,
-                                    Command::Exec {
-                                        args: vec![target, "unix-echo-server".into(), sock.clone()],
-                                        timeout_secs: None,
+                                    Command::ExecReady {
+                                        args: vec![
+                                            target,
+                                            "unix-echo-server".into(),
+                                            sock.clone(),
+                                        ],
+                                        ready_marker: "LISTENING".into(),
+                                        timeout_secs: Some(10),
                                         stdin: None,
-                                        background: true,
-                                        env: vec![],
+                                        stream: "stdout".into(),
                                     },
                                 )
                                 .await;
                                 let pid = match &resp {
-                                    Response::Background { pid } => Some(*pid),
+                                    Response::BackgroundReady { pid } => Some(*pid),
                                     _ => None,
                                 };
                                 if pid.is_none() {
@@ -1791,7 +1803,6 @@ pub(super) fn register_unix_tests(reg: &mut Registry<'_>) {
                                         format!("server_start failed: {resp:?}"),
                                     );
                                 }
-                                tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
                                 let data = format!("unix_{name}");
                                 let resp = send_to(
                                     run,
@@ -1803,11 +1814,14 @@ pub(super) fn register_unix_tests(reg: &mut Registry<'_>) {
                                     },
                                 )
                                 .await;
-                                let pass =
-                                    matches!(&resp, Response::Connected { echo } if *echo == data);
+                                let pass = matches!(
+                                    &resp,
+                                    Response::Connected { echo } if *echo == data
+                                );
                                 if let Some(pid) = pid {
                                     let _ =
-                                        send_to(run, &handles, agent, Command::Kill { pid }).await;
+                                        send_to(run, &handles, agent, Command::Kill { pid })
+                                            .await;
                                 }
                                 let _ = send_to(
                                     run,
@@ -1840,7 +1854,8 @@ pub(super) fn register_unix_tests(reg: &mut Registry<'_>) {
                                 },
                             )
                             .await;
-                            let pass = matches!(&resp, Response::UnixListening { .. });
+                            let pass =
+                                super::expect_unix_listening_path(&resp, &sock_listen).is_ok();
                             let _ = send_to(
                                 run,
                                 &handles,
@@ -1866,11 +1881,11 @@ pub(super) fn register_unix_tests(reg: &mut Registry<'_>) {
                                 Command::UnixListen { path: sock.clone() },
                             )
                             .await;
-                            if !matches!(&resp, Response::UnixListening { .. }) {
+                            if let Err(e) = super::expect_unix_listening_path(&resp, &sock) {
                                 return super::TestOutcome::new(
                                     connector.name(),
                                     false,
-                                    format!("listen failed: {resp:?}"),
+                                    format!("listen failed: {e}; resp={resp:?}"),
                                 );
                             }
                             let resp = send_to(
@@ -1909,7 +1924,7 @@ pub(super) fn register_unix_tests(reg: &mut Registry<'_>) {
                     Command::UnixListen { path: sock.clone() },
                 )
                 .await;
-                let pass = matches!(&resp, Response::UnixListening { .. });
+                let pass = super::expect_unix_listening_path(&resp, &sock).is_ok();
                 let _ = send_to(
                     run,
                     &handles,
@@ -1935,11 +1950,11 @@ pub(super) fn register_unix_tests(reg: &mut Registry<'_>) {
                     Command::UnixListen { path: sock.clone() },
                 )
                 .await;
-                if !matches!(&resp, Response::UnixListening { .. }) {
+                if let Err(e) = super::expect_unix_listening_path(&resp, &sock) {
                     return super::TestOutcome::new(
                         AgentName::D3.name(),
                         false,
-                        format!("listen failed: {resp:?}"),
+                        format!("listen failed: {e}; resp={resp:?}"),
                     );
                 }
                 let resp = send_to(
@@ -1979,11 +1994,11 @@ pub(super) fn register_unix_tests(reg: &mut Registry<'_>) {
                     Command::UnixListen { path: sock.clone() },
                 )
                 .await;
-                if !matches!(&resp, Response::UnixListening { .. }) {
+                if let Err(e) = super::expect_unix_listening_path(&resp, &sock) {
                     return super::TestOutcome::new(
                         AgentName::D4.name(),
                         false,
-                        format!("listen failed: {resp:?}"),
+                        format!("listen failed: {e}; resp={resp:?}"),
                     );
                 }
                 let resp = send_to(

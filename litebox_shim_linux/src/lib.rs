@@ -353,6 +353,7 @@ impl LinuxShimBuilder {
             pm: PageManager::new(&self.litebox, as_range),
             address_space_id: init_as_id,
             thread_count: core::sync::atomic::AtomicI32::new(1),
+            controlling_pty: litebox::sync::Mutex::new(None),
             active_vfork_layers: litebox::sync::Mutex::new(Vec::new()),
             elf_patch_cache: litebox::sync::Mutex::new(alloc::collections::BTreeMap::new()),
             shared_file_mappings: litebox::sync::Mutex::new(alloc::vec::Vec::new()),
@@ -940,6 +941,7 @@ impl<FS: ShimFS> LinuxShim<FS> {
             pm: child_pm,
             address_space_id: child_as_id,
             thread_count: core::sync::atomic::AtomicI32::new(1),
+            controlling_pty: litebox::sync::Mutex::new(None),
             active_vfork_layers: litebox::sync::Mutex::new(Vec::new()),
             elf_patch_cache: litebox::sync::Mutex::new(elf_patch_cache),
             shared_file_mappings: litebox::sync::Mutex::new(alloc::vec::Vec::new()),
@@ -2235,6 +2237,7 @@ impl<FS: ShimFS> Task<FS> {
             }
         }
 
+        let is_thread_exit = ctx.orig_rax == ::syscalls::Sysno::exit as usize;
         let return_value = match self.do_syscall(ctx) {
             Ok(v) => {
                 #[cfg(feature = "trace_syscalls")]
@@ -2259,6 +2262,11 @@ impl<FS: ShimFS> Task<FS> {
                 (err.as_neg() as isize).reinterpret_as_unsigned()
             }
         };
+
+        if is_thread_exit {
+            self.local_task_terminated.set(true);
+            return;
+        }
 
         #[cfg(target_arch = "x86")]
         {
@@ -3575,6 +3583,8 @@ struct ProcessState {
     /// Number of active threads in this process (including the main thread).
     /// Starts at 1 and is incremented on each `clone(CLONE_THREAD)`.
     thread_count: core::sync::atomic::AtomicI32,
+    /// PTY index installed as this process's controlling terminal by TIOCSCTTY.
+    controlling_pty: litebox::sync::Mutex<Platform, Option<u32>>,
     /// Active shared-vfork CoW layers, with the newest layer at the end.
     /// The forking thread pushes a new layer before spawning the child and
     /// pops it after restoring state once that child execs or exits.
@@ -3828,6 +3838,8 @@ struct ForkContext {
     /// The parent's ProcessId in the process registry.
     /// Needed by `commit_delayed_fork` for the snapshot's parent identity.
     parent_process_id: litebox::process::ProcessId,
+    /// Parent controlling PTY before the vfork child borrowed ProcessState.
+    parent_controlling_pty: Option<u32>,
     /// Snapshot of the parent's pipe FDs at fork time: (guest_fd, direction, pipe_pair_id).
     /// Used by `commit_delayed_fork` to find the parent's counterpart pipe endpoints
     /// so both sides can be replaced with real OS pipes.

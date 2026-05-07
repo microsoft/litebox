@@ -151,6 +151,14 @@ fn sanitize_id(id: &str) -> String {
         .collect()
 }
 
+fn test_container_suffix(test_id: &str) -> &'static str {
+    if test_id.starts_with("IOR.") {
+        "-ior"
+    } else {
+        ""
+    }
+}
+
 /// Build the docker command for a single-test run. We pass `--name`
 /// so the container is identifiable in `docker ps` and so
 /// `LITEBOX_KEEP_CONTAINER` users can find it after the test
@@ -165,10 +173,15 @@ fn build_docker_cmd(
     let mut cmd = Command::new("docker");
     cmd.args(docker_run_base_args())
         .arg("--name")
-        .arg(container_name)
-        // Each binary-type leg is mounted at `/opt/<label>/` so the
-        // corresponding `find_*_binary()` helpers in lib.rs find them.
-        .arg("-v")
+        .arg(container_name);
+    if test_id.starts_with("IOR.") {
+        // Docker's default seccomp profile blocks io_uring_setup with EPERM,
+        // hiding the WSL2/native kernel baseline this family is meant to test.
+        cmd.args(["--security-opt", "seccomp=unconfined"]);
+    }
+    // Each binary-type leg is mounted at `/opt/<label>/` so the
+    // corresponding `find_*_binary()` helpers in lib.rs find them.
+    cmd.arg("-v")
         .arg(format!("{}:/opt/litebox:ro", bins.pie_glibc.display()))
         .arg("-v")
         .arg(format!("{}:/opt/nonpie:ro", bins.nonpie_glibc.display()))
@@ -254,9 +267,10 @@ fn run_one_test(pass: &str, test_id: &str) -> Result<serde_json::Value, Failed> 
     let permit = active_jobs().acquire();
     let (_, bins) = setup();
     let container_name = format!(
-        "litebox-{}-{}-{}-{}",
+        "litebox-{}-{}{}-{}-{}",
         pass,
         sanitize_id(test_id),
+        test_container_suffix(test_id),
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)

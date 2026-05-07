@@ -699,7 +699,7 @@ pub(super) fn register_xsi_stdin_script(reg: &mut Registry<'_>) {
                         details.push(format!("in_process={axis_pass}:{detail}"));
 
                         let spawn_resp = run.spawn_ephemeral(&fork_target).await;
-                        let fork_spawned = matches!(&spawn_resp, Response::Ok { .. });
+                        let fork_spawned = super::ok_spawned_response(&spawn_resp);
                         pass &= fork_spawned;
                         details.push(format!("fork_spawn={fork_spawned}:{spawn_resp:?}"));
                         if fork_spawned {
@@ -925,7 +925,7 @@ pub(crate) fn register_cross_worker(reg: &mut Registry<'_>) {
                     },
                 )
                 .await;
-            let pass = matches!(&resp, Response::Ok { .. });
+            let pass = super::ok_data_contains(&resp, "remote children spawned");
             super::TestOutcome::new("A", pass, format!("{resp:?}"))
         }
     );
@@ -949,7 +949,7 @@ pub(crate) fn register_cross_worker(reg: &mut Registry<'_>) {
                     },
                 )
                 .await;
-            let pass = matches!(&resp, Response::Ok { .. });
+            let pass = super::ok_without_data(&resp);
             super::TestOutcome::new("A", pass, format!("{resp:?}"))
         }
     );
@@ -973,7 +973,7 @@ pub(crate) fn register_cross_worker(reg: &mut Registry<'_>) {
                     },
                 )
                 .await;
-            if !matches!(&setup_resp, Response::Ok { .. }) {
+            if !super::ok_without_data(&setup_resp) {
                 return super::TestOutcome::new(
                     "A",
                     false,
@@ -1010,7 +1010,7 @@ pub(crate) fn register_cross_worker(reg: &mut Registry<'_>) {
                     },
                 )
                 .await;
-            let pass = matches!(&resp, Response::Ok { .. });
+            let pass = super::ok_without_data(&resp);
             super::TestOutcome::new("A", pass, format!("{resp:?}"))
         }
     );
@@ -1034,7 +1034,7 @@ pub(crate) fn register_cross_worker(reg: &mut Registry<'_>) {
                     },
                 )
                 .await;
-            if !matches!(&setup_resp, Response::Ok { .. }) {
+            if !super::ok_without_data(&setup_resp) {
                 return super::TestOutcome::new(
                     "A",
                     false,
@@ -1072,7 +1072,7 @@ pub(crate) fn register_cross_worker(reg: &mut Registry<'_>) {
                     },
                 )
                 .await;
-            let pass = matches!(&resp, Response::UnixListening { .. });
+            let pass = super::expect_unix_listening_path(&resp, "/tmp/xw3.sock").is_ok();
             super::TestOutcome::new("A", pass, format!("{resp:?}"))
         }
     );
@@ -1095,7 +1095,7 @@ pub(crate) fn register_cross_worker(reg: &mut Registry<'_>) {
                     },
                 )
                 .await;
-            if !matches!(&listen_resp, Response::UnixListening { .. }) {
+            if super::expect_unix_listening_path(&listen_resp, "/tmp/xw3c.sock").is_err() {
                 return super::TestOutcome::new(
                     "A",
                     false,
@@ -1132,7 +1132,7 @@ pub(crate) fn register_cross_worker(reg: &mut Registry<'_>) {
                     },
                 )
                 .await;
-            let pass = matches!(&resp, Response::UnixListening { .. });
+            let pass = super::expect_unix_listening_path(&resp, "/tmp/xw4.sock").is_ok();
             super::TestOutcome::new("A", pass, format!("{resp:?}"))
         }
     );
@@ -1155,7 +1155,7 @@ pub(crate) fn register_cross_worker(reg: &mut Registry<'_>) {
                     },
                 )
                 .await;
-            if !matches!(&listen_resp, Response::UnixListening { .. }) {
+            if super::expect_unix_listening_path(&listen_resp, "/tmp/xw4c.sock").is_err() {
                 return super::TestOutcome::new(
                     "A",
                     false,
@@ -1187,7 +1187,7 @@ pub(crate) fn register_cross_worker(reg: &mut Registry<'_>) {
         |run| {
             let _ = run.spawn_ephemeral(&r).await;
             let resp = run.forward(&r, Command::NetListen { port: 0 }).await;
-            let pass = matches!(&resp, Response::Listening { .. });
+            let pass = super::expect_listening_port(&resp, 0).is_ok();
             super::TestOutcome::new("A", pass, format!("{resp:?}"))
         }
     );
@@ -1203,13 +1203,13 @@ pub(crate) fn register_cross_worker(reg: &mut Registry<'_>) {
         |run| {
             let _ = run.spawn_ephemeral(&r).await;
             let listen_resp = run.forward(&r, Command::NetListen { port: 0 }).await;
-            let port = match &listen_resp {
-                Response::Listening { port } => *port,
-                _ => {
+            let port = match super::expect_listening_port(&listen_resp, 0) {
+                Ok(port) => port,
+                Err(e) => {
                     return super::TestOutcome::new(
                         "A",
                         false,
-                        format!("listen setup failed: {listen_resp:?}"),
+                        format!("listen setup failed: {e}; resp={listen_resp:?}"),
                     );
                 }
             };
@@ -1238,7 +1238,7 @@ pub(crate) fn register_cross_worker(reg: &mut Registry<'_>) {
         agents[a = AgentName::A],
         |run| {
             let resp = run.send(&a, Command::NetListen { port: 0 }).await;
-            let pass = matches!(&resp, Response::Listening { .. });
+            let pass = super::expect_listening_port(&resp, 0).is_ok();
             super::TestOutcome::new("A", pass, format!("{resp:?}"))
         }
     );
@@ -1254,13 +1254,13 @@ pub(crate) fn register_cross_worker(reg: &mut Registry<'_>) {
         |run| {
             let _ = run.spawn_ephemeral(&r).await;
             let listen_resp = run.send(&a, Command::NetListen { port: 0 }).await;
-            let port = match &listen_resp {
-                Response::Listening { port } => *port,
-                _ => {
+            let port = match super::expect_listening_port(&listen_resp, 0) {
+                Ok(port) => port,
+                Err(e) => {
                     return super::TestOutcome::new(
                         "A",
                         false,
-                        format!("listen setup failed: {listen_resp:?}"),
+                        format!("listen setup failed: {e}; resp={listen_resp:?}"),
                     );
                 }
             };
@@ -1296,14 +1296,14 @@ pub(crate) fn register_cross_worker(reg: &mut Registry<'_>) {
                     },
                 )
                 .await;
-            let pass = matches!(&resp, Response::UnixListening { .. });
+            let pass = super::expect_unix_listening_path(&resp, "/tmp/xw7.sock").is_ok();
             super::TestOutcome::new("D4", pass, format!("{resp:?}"))
         }
     );
 
     typed_test!(reg, "xworker", "cross_worker", "XW7.d3_connect", timeout = 60, agents [d4 = AgentName::D4, d3 = AgentName::D3], |run| {
         let listen_resp = run.send(&d4, Command::UnixListen { path: "/tmp/xw7c.sock".to_string() }).await;
-        if !matches!(&listen_resp, Response::UnixListening { .. }) {
+        if super::expect_unix_listening_path(&listen_resp, "/tmp/xw7c.sock").is_err() {
             return super::TestOutcome::new("D3", false, format!("listen setup failed: {listen_resp:?}"));
         }
         let resp = run
@@ -1329,14 +1329,14 @@ pub(crate) fn register_cross_worker(reg: &mut Registry<'_>) {
                     },
                 )
                 .await;
-            let pass = matches!(&resp, Response::UnixListening { .. });
+            let pass = super::expect_unix_listening_path(&resp, "/tmp/xw8.sock").is_ok();
             super::TestOutcome::new("D3", pass, format!("{resp:?}"))
         }
     );
 
     typed_test!(reg, "xworker", "cross_worker", "XW8.d4_connect", timeout = 60, agents [d3 = AgentName::D3, d4 = AgentName::D4], |run| {
         let listen_resp = run.send(&d3, Command::UnixListen { path: "/tmp/xw8c.sock".to_string() }).await;
-        if !matches!(&listen_resp, Response::UnixListening { .. }) {
+        if super::expect_unix_listening_path(&listen_resp, "/tmp/xw8c.sock").is_err() {
             return super::TestOutcome::new("D4", false, format!("listen setup failed: {listen_resp:?}"));
         }
         let resp = run
@@ -1362,14 +1362,14 @@ pub(crate) fn register_cross_worker(reg: &mut Registry<'_>) {
                     },
                 )
                 .await;
-            let pass = matches!(&resp, Response::UnixListening { .. });
+            let pass = super::expect_unix_listening_path(&resp, "/tmp/xw9.sock").is_ok();
             super::TestOutcome::new("D4", pass, format!("{resp:?}"))
         }
     );
 
     typed_test!(reg, "xworker", "cross_worker", "XW9.aa_connect", timeout = 60, agents [d4 = AgentName::D4, aa = AgentName::AA], |run| {
         let listen_resp = run.send(&d4, Command::UnixListen { path: "/tmp/xw9c.sock".to_string() }).await;
-        if !matches!(&listen_resp, Response::UnixListening { .. }) {
+        if super::expect_unix_listening_path(&listen_resp, "/tmp/xw9c.sock").is_err() {
             return super::TestOutcome::new("AA", false, format!("listen setup failed: {listen_resp:?}"));
         }
         let resp = run
@@ -1388,16 +1388,16 @@ pub(crate) fn register_cross_worker(reg: &mut Registry<'_>) {
         agents[d3 = AgentName::D3],
         |run| {
             let resp = run.send(&d3, Command::NetListen { port: 0 }).await;
-            let pass = matches!(&resp, Response::Listening { .. });
+            let pass = super::expect_listening_port(&resp, 0).is_ok();
             super::TestOutcome::new("D3", pass, format!("{resp:?}"))
         }
     );
 
     typed_test!(reg, "xworker", "cross_worker", "XW10.b_tcp_connect", timeout = 60, agents [d3 = AgentName::D3, b = AgentName::B], |run| {
         let listen_resp = run.send(&d3, Command::NetListen { port: 0 }).await;
-        let port = match &listen_resp {
-            Response::Listening { port } => *port,
-            _ => return super::TestOutcome::new("B", false, format!("listen setup failed: {listen_resp:?}")),
+        let port = match super::expect_listening_port(&listen_resp, 0) {
+            Ok(port) => port,
+            Err(e) => return super::TestOutcome::new("B", false, format!("listen setup failed: {e}; resp={listen_resp:?}")),
         };
         let resp = run
             .send(&b, Command::NetConnect { addr: format!("127.0.0.1:{port}"), data: "XW10_CROSS_SUBTREE".to_string() })
@@ -1416,7 +1416,7 @@ pub(crate) fn register_cross_worker(reg: &mut Registry<'_>) {
         agents[d3 = AgentName::D3],
         |run| {
             let resp = run.send(&d3, Command::NetListen { port: 0 }).await;
-            let pass = matches!(&resp, Response::Listening { .. });
+            let pass = super::expect_listening_port(&resp, 0).is_ok();
             super::TestOutcome::new("D3", pass, format!("{resp:?}"))
         }
     );
@@ -1431,7 +1431,7 @@ pub(crate) fn register_cross_worker(reg: &mut Registry<'_>) {
         ephemerals[r2 = (AgentName::B, "R2", SpawnKind::NonPie)],
         |run| {
             let resp = run.spawn_ephemeral(&r2).await;
-            let pass = matches!(&resp, Response::Ok { .. });
+            let pass = super::ok_spawned_response(&resp);
             super::TestOutcome::new("B", pass, format!("{resp:?}"))
         }
     );
@@ -1446,9 +1446,9 @@ pub(crate) fn register_cross_worker(reg: &mut Registry<'_>) {
         ephemerals[r2 = (AgentName::B, "R2", SpawnKind::NonPie)],
         |run| {
             let listen_resp = run.send(&d3, Command::NetListen { port: 0 }).await;
-            let port = match &listen_resp {
-                Response::Listening { port } => *port,
-                _ => return super::TestOutcome::new("R2", false, format!("listen setup failed: {listen_resp:?}")),
+            let port = match super::expect_listening_port(&listen_resp, 0) {
+                Ok(port) => port,
+                Err(e) => return super::TestOutcome::new("R2", false, format!("listen setup failed: {e}; resp={listen_resp:?}")),
             };
             let _ = run.spawn_ephemeral(&r2).await;
             let resp = run

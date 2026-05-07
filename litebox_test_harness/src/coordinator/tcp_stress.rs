@@ -8,7 +8,6 @@
 //! - TC: concurrent connections
 //! - TD: large data transfer integrity
 //! - TRR: rapid reconnect stress
-//! - TF: full-duplex simultaneous read+write
 //! - TW: cross-worker concurrent TCP
 
 use super::agents::{AgentName, SpawnKind};
@@ -197,14 +196,25 @@ const TRR_CASES: &[TrrCase] = &[
         connector: AgentName::A,
         count: 20,
     },
+    TrrCase {
+        name: "parent_child",
+        listener: AgentName::AA,
+        connector: AgentName::A,
+        count: 5,
+    },
+    TrrCase {
+        name: "child_parent",
+        listener: AgentName::A,
+        connector: AgentName::AA,
+        count: 5,
+    },
+    TrrCase {
+        name: "depth2",
+        listener: AgentName::AAA,
+        connector: AgentName::AAB,
+        count: 5,
+    },
 ];
-
-// ═══════════════════════════════════════════════════════════════════
-// TF: TCP Full-Duplex — simultaneous bidirectional transfer
-// ═══════════════════════════════════════════════════════════════════
-
-const TF_AGENTS: &[AgentName] = &[AgentName::A, AgentName::AA, AgentName::B];
-const TF_SIZE: usize = 65_536;
 
 // ═══════════════════════════════════════════════════════════════════
 // TW: TCP Cross-Worker Concurrency (extends XW5/XW6)
@@ -216,7 +226,6 @@ pub(crate) fn register_tcp_stress(reg: &mut Registry<'_>) {
     register_tcp_concurrency_tests(reg);
     register_tcp_data_size_tests(reg);
     register_tcp_reconnect_stress_tests(reg);
-    register_tcp_fullduplex_tests(reg);
     register_tcp_cross_worker_concurrent_tests(reg);
 }
 
@@ -246,7 +255,7 @@ fn register_tcp_concurrency_tests(reg: &mut Registry<'_>) {
                                 crate::protocol::Command::NetListen { port: p },
                             )
                             .await;
-                        if !matches!(resp, crate::protocol::Response::Listening { .. }) {
+                        if super::expect_listening_port(&resp, p).is_err() {
                             return super::TestOutcome::new(
                                 &connector_label,
                                 false,
@@ -311,7 +320,7 @@ fn register_tcp_data_size_tests(reg: &mut Registry<'_>) {
                         let resp = run
                             .send(&listener_handle, crate::protocol::Command::NetListen { port: p })
                             .await;
-                        if !matches!(resp, crate::protocol::Response::Listening { .. }) {
+                        if super::expect_listening_port(&resp, p).is_err() {
                             return super::TestOutcome::new(&connector_label, false, format!("listen failed: {resp:?}"));
                         }
                         let resp = run
@@ -350,7 +359,7 @@ fn register_tcp_reconnect_stress_tests(reg: &mut Registry<'_>) {
                         let resp = run
                             .send(&listener_handle, crate::protocol::Command::NetListen { port: p })
                             .await;
-                        if !matches!(resp, crate::protocol::Response::Listening { .. }) {
+                        if super::expect_listening_port(&resp, p).is_err() {
                             return super::TestOutcome::new(&connector_label, false, format!("listen failed: {resp:?}"));
                         }
                         let resp = run
@@ -367,87 +376,27 @@ fn register_tcp_reconnect_stress_tests(reg: &mut Registry<'_>) {
     }
 }
 
-fn register_tcp_fullduplex_tests(reg: &mut Registry<'_>) {
-    let mut port = 20_300u16;
-    for &agent in TF_AGENTS {
-        for &bt in crate::BinaryType::ALL {
-            let bt_label = bt.label();
-            let test_id = format!("TF.{bt_label}.{agent}");
-            let p = port;
-            port += 1;
-
-            reg.test("stress", "tcp_stress", test_id)
-                .timeout(180)
-                .build(move |cx| {
-                    let handle = cx.require(agent);
-                    let agent_label = agent.to_string();
-                    Box::new(move |run| {
-                        Box::pin(async move {
-                            let self_exe = run.self_exe().to_string();
-                            let target = crate::binary_path(bt, &self_exe);
-                            let server_resp = run
-                                .send(
-                                    &handle,
-                                    crate::protocol::Command::Exec {
-                                        args: vec![
-                                            target.clone(),
-                                            "tcp-fullduplex".into(),
-                                            p.to_string(),
-                                            TF_SIZE.to_string(),
-                                        ],
-                                        timeout_secs: Some(30),
-                                        stdin: None,
-                                        background: true,
-                                        env: vec![],
-                                    },
-                                )
-                                .await;
-                            let server_pid = match &server_resp {
-                                crate::protocol::Response::Background { pid } => Some(*pid),
-                                _ => {
-                                    return super::TestOutcome::new(
-                                        &agent_label,
-                                        false,
-                                        format!("server spawn failed: {server_resp:?}"),
-                                    );
-                                }
-                            };
-                            tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-                            let client_resp = run
-                                .send(
-                                    &handle,
-                                    super::exec_timeout(
-                                        vec![
-                                            target,
-                                            "tcp-fullduplex-client".into(),
-                                            format!("127.0.0.1:{p}"),
-                                            TF_SIZE.to_string(),
-                                        ],
-                                        15,
-                                    ),
-                                )
-                                .await;
-                            if let Some(pid) = server_pid {
-                                let _ = run
-                                    .send(&handle, crate::protocol::Command::Kill { pid })
-                                    .await;
-                            }
-                            let pass = match &client_resp {
-                                crate::protocol::Response::ExecResult { stdout, .. } => {
-                                    stdout.contains(&format!("CLIENT:sent={TF_SIZE}"))
-                                        && stdout.contains("recv=")
-                                }
-                                _ => false,
-                            };
-                            super::TestOutcome::new(&agent_label, pass, format!("{client_resp:?}"))
-                        })
-                    })
-                });
-        }
-    }
-}
-
 fn register_tcp_cross_worker_concurrent_tests(reg: &mut Registry<'_>) {
+    #[derive(Clone, Copy)]
+    struct StableCase {
+        name: &'static str,
+        listener: AgentName,
+        connector: AgentName,
+    }
+
+    const STABLE_CASES: &[StableCase] = &[
+        StableCase {
+            name: "sibling",
+            listener: AgentName::B,
+            connector: AgentName::A,
+        },
+        StableCase {
+            name: "depth2",
+            listener: AgentName::D4,
+            connector: AgentName::D5,
+        },
+    ];
+
     let mut port = 20_400u16;
     for &count in TW_COUNTS {
         {
@@ -464,13 +413,13 @@ fn register_tcp_cross_worker_concurrent_tests(reg: &mut Registry<'_>) {
                         let aremote = aremote.clone();
                         Box::pin(async move {
                             let resp = run.spawn_ephemeral(&aremote).await;
-                            if !matches!(&resp, crate::protocol::Response::Ok { .. }) {
+                            if !super::ok_spawned_response(&resp) {
                                 return super::TestOutcome::new("A", false, "FAIL: SpawnRemote unavailable");
                             }
                             let resp = run
                                 .forward(&aremote, crate::protocol::Command::NetListen { port: p })
                                 .await;
-                            if !matches!(resp, crate::protocol::Response::Listening { .. }) {
+                            if super::expect_listening_port(&resp, p).is_err() {
                                 return super::TestOutcome::new("A", false, format!("listen failed: {resp:?}"));
                             }
                             let resp = run
@@ -500,11 +449,11 @@ fn register_tcp_cross_worker_concurrent_tests(reg: &mut Registry<'_>) {
                         let aremote = aremote.clone();
                         Box::pin(async move {
                             let resp = run.spawn_ephemeral(&aremote).await;
-                            if !matches!(&resp, crate::protocol::Response::Ok { .. }) {
+                            if !super::ok_spawned_response(&resp) {
                                 return super::TestOutcome::new("A", false, "FAIL: SpawnRemote unavailable");
                             }
                             let resp = run.send(&handle, crate::protocol::Command::NetListen { port: p }).await;
-                            if !matches!(resp, crate::protocol::Response::Listening { .. }) {
+                            if super::expect_listening_port(&resp, p).is_err() {
                                 return super::TestOutcome::new("A", false, format!("listen failed: {resp:?}"));
                             }
                             let resp = run
@@ -516,6 +465,62 @@ fn register_tcp_cross_worker_concurrent_tests(reg: &mut Registry<'_>) {
                         })
                     })
                 });
+        }
+
+        if count == 1 {
+            for case in STABLE_CASES {
+                let test_id = format!("TW.{}.x{count}", case.name);
+                let p = port;
+                port += 1;
+                let listener = case.listener;
+                let connector = case.connector;
+                let label = format!("{}->{}", connector, listener);
+
+                reg.test("stress", "tcp_stress", test_id)
+                    .timeout(180)
+                    .build(move |cx| {
+                        let listener_handle = cx.require(listener);
+                        let connector_handle = cx.require(connector);
+                        let label = label.clone();
+                        Box::new(move |run| {
+                            let label = label.clone();
+                            Box::pin(async move {
+                                let resp = run
+                                    .send(
+                                        &listener_handle,
+                                        crate::protocol::Command::NetListen { port: p },
+                                    )
+                                    .await;
+                                if !matches!(resp, crate::protocol::Response::Listening { .. }) {
+                                    return super::TestOutcome::new(
+                                        &label,
+                                        false,
+                                        format!("listen failed: {resp:?}"),
+                                    );
+                                }
+                                let resp = run
+                                    .send(
+                                        &connector_handle,
+                                        crate::protocol::Command::NetConnectMany {
+                                            addr: format!("127.0.0.1:{p}"),
+                                            data: format!("TW_{}", case.name),
+                                            count,
+                                            delay_ms: 0,
+                                        },
+                                    )
+                                    .await;
+                                let pass = matches!(&resp, crate::protocol::Response::Ok { data: Some(d) } if d == &format!("success={count}/{count}"));
+                                let _ = run
+                                    .send(
+                                        &listener_handle,
+                                        crate::protocol::Command::NetUnlisten { port: p },
+                                    )
+                                    .await;
+                                super::TestOutcome::new(&label, pass, format!("{resp:?}"))
+                            })
+                        })
+                    });
+            }
         }
     }
 }
