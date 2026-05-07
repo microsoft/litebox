@@ -2310,6 +2310,62 @@ pub(crate) fn register_file_redirect_tests(reg: &mut Registry<'_>) {
 }
 
 // ═══════════════════════════════════════════════════════════════════
+// CSM: CLI Startup Mimic — VS Code CLI link-mode startup shape
+// ═══════════════════════════════════════════════════════════════════
+
+pub(crate) fn register_cli_startup_mimic_tests(reg: &mut Registry<'_>) {
+    const DELIVERIES: &[&str] = &["tokio_pipe", "bash_heredoc_pipe"];
+
+    for &delivery in DELIVERIES {
+        for &bt in crate::BinaryType::ALL {
+            for &agent in AGENTS {
+                let agent_s = agent.to_string();
+                let bt_label = bt.label();
+                let test_id = if bt == crate::BinaryType::PieGlibc {
+                    format!("CSM.{delivery}.{agent}")
+                } else {
+                    format!("CSM.{delivery}.{bt_label}.{agent}")
+                };
+                reg.test("fork", "cli_startup_mimic", test_id)
+                    .timeout(60)
+                    .build(move |cx| {
+                        let handle = cx.require(agent);
+                        Box::new(move |run| {
+                            let a = agent_s.clone();
+                            let self_exe = run.self_exe().to_string();
+                            Box::pin(async move {
+                                let target = crate::binary_path(bt, &self_exe);
+                                let command = match delivery {
+                                    "tokio_pipe" => Command::Exec {
+                                        args: vec![target, "cli-startup-mimic".into()],
+                                        timeout_secs: Some(10),
+                                        stdin: None,
+                                        background: false,
+                                    },
+                                    "bash_heredoc_pipe" => Command::Exec {
+                                        args: vec!["bash".into(), "-s".into()],
+                                        timeout_secs: Some(10),
+                                        stdin: Some(format!("exec {target} cli-startup-mimic\n")),
+                                        background: false,
+                                    },
+                                    _ => unreachable!(),
+                                };
+                                let resp = run.send(&handle, command).await;
+                                let pass = matches!(
+                                    &resp,
+                                    Response::ExecResult { exit_code: 0, stdout, .. }
+                                        if stdout.contains("CLI_STARTUP_MIMIC_OK")
+                                );
+                                super::TestOutcome::new(&a, pass, format!("{resp:?}"))
+                            })
+                        })
+                    });
+            }
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
 // PN: Pipe Non-blocking
 // ═══════════════════════════════════════════════════════════════════
 

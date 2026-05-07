@@ -165,6 +165,19 @@ fn main() {
                 let _ = unsafe { libc::write(1, buf.as_ptr() as *const _, n as usize) };
             }
         }
+        "cli-startup-mimic" => {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("tokio runtime");
+            rt.block_on(async {
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                    .await
+                    .expect("bind cli startup mimic listener");
+                let addr = listener.local_addr().expect("listener addr");
+                println!("CLI_STARTUP_MIMIC_OK {addr}");
+            });
+        }
         "large-stdout-test" => {
             // Child writes a fixed N-byte payload to stdout. Tests
             // whether stdout bridging works for larger payloads (vs
