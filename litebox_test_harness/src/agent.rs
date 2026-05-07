@@ -5,10 +5,13 @@
 //! writes responses to stdout. Intermediate nodes forward commands to
 //! their children.
 
-use crate::protocol::{Clone3Kind, Command, EpollEvent, InotifyEvent, Response, WaitPredicate};
+use crate::protocol::{
+    Clone3Kind, Command, EpollEvent, FdRef, InotifyEvent, Response, WaitPredicate,
+};
 use std::collections::HashMap;
 use std::ffi::CString;
 use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd};
+use std::os::unix::net::{UnixListener as StdUnixListener, UnixStream as StdUnixStream};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader};
@@ -183,6 +186,9 @@ async fn agent_loop(self_exe: &str) {
         }
     };
     let mut unix_listeners: HashMap<String, tokio::task::JoinHandle<()>> = HashMap::new();
+    let mut unix_pair_listeners: HashMap<String, StdUnixListener> = HashMap::new();
+    let mut unix_pairs: HashMap<u64, OwnedFd> = HashMap::new();
+    let mut next_unix_pair_id = 1u64;
     let mut connections: HashMap<u64, TcpConn> = HashMap::new();
     let mut next_conn_id = 1u64;
     let mut eventfds: HashMap<u64, EventfdEntry> = HashMap::new();
@@ -1386,6 +1392,141 @@ async fn agent_loop(self_exe: &str) {
                 }
             }
 
+            Command::UnixPair {} => {
+                if next_unix_pair_id > u64::MAX - 2 {
+                    respond(&Response::Error {
+                        error: "unix pair id space exhausted".to_string(),
+                    })
+                    .await;
+                    continue;
+                }
+                match create_unix_socketpair() {
+                    Ok((left_fd, right_fd)) => {
+                        let left = next_unix_pair_id;
+                        let right = next_unix_pair_id + 1;
+                        next_unix_pair_id += 2;
+                        unix_pairs.insert(left, left_fd);
+                        unix_pairs.insert(right, right_fd);
+                        respond(&Response::UnixPairHandle { left, right }).await;
+                    }
+                    Err(error) => respond(&Response::Error { error }).await,
+                }
+            }
+
+            Command::UnixPairListen { path } => match bind_unix_pair_listener(&path) {
+                Ok(listener) => {
+                    unix_pair_listeners.insert(path.clone(), listener);
+                    respond(&Response::UnixListening { path }).await;
+                }
+                Err(error) => respond(&Response::Error { error }).await,
+            },
+
+            Command::UnixPairConnect { path } => match StdUnixStream::connect(&path) {
+                Ok(stream) => {
+                    match register_unix_stream(stream, &mut unix_pairs, &mut next_unix_pair_id) {
+                        Ok(id) => respond(&Response::UnixPairHandle { left: id, right: 0 }).await,
+                        Err(error) => respond(&Response::Error { error }).await,
+                    }
+                }
+                Err(e) => {
+                    respond(&Response::ConnectFailed {
+                        error: format!("unix connect({path}): {e}"),
+                    })
+                    .await;
+                }
+            },
+
+            Command::UnixPairAccept { path } => {
+                let Some(listener) = unix_pair_listeners.get(&path) else {
+                    respond(&Response::Error {
+                        error: format!("unknown unix pair listener {path}"),
+                    })
+                    .await;
+                    continue;
+                };
+                match listener.accept() {
+                    Ok((stream, _)) => {
+                        match register_unix_stream(stream, &mut unix_pairs, &mut next_unix_pair_id)
+                        {
+                            Ok(id) => {
+                                respond(&Response::UnixPairHandle { left: id, right: 0 }).await
+                            }
+                            Err(error) => respond(&Response::Error { error }).await,
+                        }
+                    }
+                    Err(e) => {
+                        respond(&Response::Error {
+                            error: format!("unix accept({path}): {e}"),
+                        })
+                        .await;
+                    }
+                }
+            }
+
+            Command::UnixSendFd {
+                socket,
+                sources,
+                payload,
+            } => match collect_source_fds(&sources, &eventfds, &connections, &unix_pairs).await {
+                Ok(raw_fds) => {
+                    let Some(sock) = unix_pairs.get(&socket) else {
+                        respond(&Response::Error {
+                            error: format!("unknown unix pair socket {socket}"),
+                        })
+                        .await;
+                        continue;
+                    };
+                    match send_fds(sock.as_raw_fd(), &sources, &raw_fds, payload.as_bytes()) {
+                        Ok(()) => respond(&Response::Sent).await,
+                        Err(error) => respond(&Response::Error { error }).await,
+                    }
+                }
+                Err(error) => respond(&Response::Error { error }).await,
+            },
+
+            Command::UnixRecvFd {
+                socket,
+                max_payload,
+            } => {
+                let Some(sock) = unix_pairs.get(&socket) else {
+                    respond(&Response::Error {
+                        error: format!("unknown unix pair socket {socket}"),
+                    })
+                    .await;
+                    continue;
+                };
+                match recv_fds(sock.as_raw_fd(), max_payload) {
+                    Ok((received, payload)) => {
+                        match register_received_fds(
+                            received,
+                            &mut eventfds,
+                            &mut next_eventfd_id,
+                            &mut connections,
+                            &mut next_conn_id,
+                            &mut unix_pairs,
+                            &mut next_unix_pair_id,
+                        ) {
+                            Ok(received) => {
+                                respond(&Response::ReceivedFd { received, payload }).await
+                            }
+                            Err(error) => respond(&Response::Error { error }).await,
+                        }
+                    }
+                    Err(error) => respond(&Response::Error { error }).await,
+                }
+            }
+
+            Command::UnixPairClose { socket } => {
+                if unix_pairs.remove(&socket).is_some() {
+                    respond(&Response::Closed).await;
+                } else {
+                    respond(&Response::Error {
+                        error: format!("unknown unix pair socket {socket}"),
+                    })
+                    .await;
+                }
+            }
+
             Command::PollReady { timeout_ms } => {
                 // Create a pipe, write data, poll read-end for POLLIN.
                 let result = (|| -> Result<&str, String> {
@@ -2138,6 +2279,8 @@ async fn agent_loop(self_exe: &str) {
                 for (_, task) in unix_listeners.drain() {
                     task.abort();
                 }
+                unix_pair_listeners.clear();
+                unix_pairs.clear();
                 // Terminate background processes.
                 for (_, child) in background_pids.drain() {
                     terminate_background(child);
@@ -2239,6 +2382,336 @@ fn remove_inotify_watch(fd: i32, wd: i32) -> Result<(), String> {
             "inotify_rm_watch({wd}): {}",
             std::io::Error::last_os_error()
         ));
+    }
+    Ok(())
+}
+
+fn create_unix_socketpair() -> Result<(OwnedFd, OwnedFd), String> {
+    let mut sv = [0i32; 2];
+    // SAFETY: `sv` points to two writable fd slots; socketpair initializes both
+    // entries with fresh AF_UNIX SOCK_STREAM descriptors on success.
+    if unsafe {
+        libc::socketpair(
+            libc::AF_UNIX,
+            libc::SOCK_STREAM | libc::SOCK_CLOEXEC,
+            0,
+            sv.as_mut_ptr(),
+        )
+    } != 0
+    {
+        return Err(format!(
+            "socketpair(AF_UNIX): {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    // SAFETY: socketpair returned two fresh descriptors, each transferred to
+    // exactly one OwnedFd for independent registry ownership.
+    let left = unsafe { OwnedFd::from_raw_fd(sv[0]) };
+    // SAFETY: see above; this wraps the second fresh socketpair endpoint.
+    let right = unsafe { OwnedFd::from_raw_fd(sv[1]) };
+    Ok((left, right))
+}
+
+fn bind_unix_pair_listener(path: &str) -> Result<StdUnixListener, String> {
+    let _ = std::fs::remove_file(path);
+    let listener = StdUnixListener::bind(path).map_err(|e| format!("unix bind({path}): {e}"))?;
+    listener
+        .set_nonblocking(false)
+        .map_err(|e| format!("unix listener blocking({path}): {e}"))?;
+    Ok(listener)
+}
+
+fn register_unix_stream(
+    stream: StdUnixStream,
+    unix_pairs: &mut HashMap<u64, OwnedFd>,
+    next_unix_pair_id: &mut u64,
+) -> Result<u64, String> {
+    if *next_unix_pair_id == u64::MAX {
+        return Err("unix pair id space exhausted".to_string());
+    }
+    stream
+        .set_nonblocking(false)
+        .map_err(|e| format!("unix stream blocking: {e}"))?;
+    let id = *next_unix_pair_id;
+    *next_unix_pair_id += 1;
+    unix_pairs.insert(id, stream.into());
+    Ok(id)
+}
+
+async fn collect_source_fds(
+    sources: &[FdRef],
+    eventfds: &HashMap<u64, EventfdEntry>,
+    connections: &HashMap<u64, TcpConn>,
+    unix_pairs: &HashMap<u64, OwnedFd>,
+) -> Result<Vec<i32>, String> {
+    let mut fds = Vec::with_capacity(sources.len());
+    for source in sources {
+        let fd = match source {
+            FdRef::Eventfd(id) => eventfds
+                .get(id)
+                .map(|entry| entry.fd.as_raw_fd())
+                .ok_or_else(|| format!("unknown eventfd {id}"))?,
+            FdRef::TcpConn(id) => {
+                let stream = connections
+                    .get(id)
+                    .cloned()
+                    .ok_or_else(|| format!("unknown conn {id}"))?;
+                let stream = stream.lock().await;
+                stream.as_raw_fd()
+            }
+            FdRef::UnixPair(id) => unix_pairs
+                .get(id)
+                .map(AsRawFd::as_raw_fd)
+                .ok_or_else(|| format!("unknown unix pair socket {id}"))?,
+        };
+        fds.push(fd);
+    }
+    Ok(fds)
+}
+
+fn fd_ref_tag(source: &FdRef) -> u8 {
+    match source {
+        FdRef::Eventfd(_) => b'E',
+        FdRef::TcpConn(_) => b'T',
+        FdRef::UnixPair(_) => b'U',
+    }
+}
+
+fn send_fds(
+    socket_fd: i32,
+    sources: &[FdRef],
+    raw_fds: &[i32],
+    payload: &[u8],
+) -> Result<(), String> {
+    if sources.is_empty() || sources.len() != raw_fds.len() {
+        return Err("unix_send_fd requires at least one source fd".to_string());
+    }
+    let mut tagged_payload = Vec::with_capacity(sources.len() + payload.len());
+    tagged_payload.extend(sources.iter().map(fd_ref_tag));
+    tagged_payload.extend_from_slice(payload);
+    let mut iov = libc::iovec {
+        iov_base: tagged_payload.as_mut_ptr().cast(),
+        iov_len: tagged_payload.len(),
+    };
+    let fd_bytes = std::mem::size_of_val(raw_fds);
+    // SAFETY: CMSG_SPACE only computes the buffer size for `fd_bytes` bytes of
+    // control data; it does not dereference pointers.
+    let mut control = vec![0u8; unsafe { libc::CMSG_SPACE(fd_bytes as u32) as usize }];
+    // SAFETY: zeroed msghdr is a valid starting state; all pointer/length fields
+    // used by sendmsg are initialized below before the syscall.
+    let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+    msg.msg_iov = &raw mut iov;
+    msg.msg_iovlen = 1;
+    msg.msg_control = control.as_mut_ptr().cast();
+    msg.msg_controllen = control
+        .len()
+        .try_into()
+        .map_err(|_| "sendmsg control buffer length overflow".to_string())?;
+    // SAFETY: msg has a valid control buffer large enough for the cmsg header
+    // plus all source fds. CMSG_FIRSTHDR returns a pointer inside that buffer.
+    unsafe {
+        let cmsg = libc::CMSG_FIRSTHDR(&msg);
+        if cmsg.is_null() {
+            return Err("CMSG_FIRSTHDR returned null".to_string());
+        }
+        (*cmsg).cmsg_level = libc::SOL_SOCKET;
+        (*cmsg).cmsg_type = libc::SCM_RIGHTS;
+        (*cmsg).cmsg_len = libc::CMSG_LEN(fd_bytes as u32)
+            .try_into()
+            .map_err(|_| "SCM_RIGHTS cmsg length overflow".to_string())?;
+        std::ptr::copy_nonoverlapping(
+            raw_fds.as_ptr().cast::<u8>(),
+            libc::CMSG_DATA(cmsg).cast::<u8>(),
+            fd_bytes,
+        );
+        msg.msg_controllen = (*cmsg).cmsg_len;
+    }
+    loop {
+        // SAFETY: socket_fd is a live Unix stream socket; msg points to valid
+        // iovec and control buffers for the duration of the call. sendmsg does
+        // not take ownership of the descriptors in SCM_RIGHTS.
+        let rc = unsafe { libc::sendmsg(socket_fd, &raw const msg, 0) };
+        if rc == tagged_payload.len() as isize {
+            return Ok(());
+        }
+        if rc >= 0 {
+            return Err(format!(
+                "sendmsg sent {rc} bytes, expected {}",
+                tagged_payload.len()
+            ));
+        }
+        let err = std::io::Error::last_os_error();
+        if err.raw_os_error() != Some(libc::EINTR) {
+            return Err(format!("sendmsg SCM_RIGHTS: {err}"));
+        }
+    }
+}
+
+fn recv_fds(socket_fd: i32, max_payload: u32) -> Result<(Vec<(u8, OwnedFd)>, String), String> {
+    let mut data = vec![0u8; max_payload.max(1) as usize];
+    let mut iov = libc::iovec {
+        iov_base: data.as_mut_ptr().cast(),
+        iov_len: data.len(),
+    };
+    let max_fds = 8usize;
+    let control_len =
+        unsafe { libc::CMSG_SPACE((max_fds * std::mem::size_of::<i32>()) as u32) as usize };
+    let mut control = vec![0u8; control_len];
+    // SAFETY: zeroed msghdr is a valid starting state; all used fields are set
+    // to live data/control buffers before recvmsg.
+    let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+    msg.msg_iov = &raw mut iov;
+    msg.msg_iovlen = 1;
+    msg.msg_control = control.as_mut_ptr().cast();
+    msg.msg_controllen = control
+        .len()
+        .try_into()
+        .map_err(|_| "recvmsg control buffer length overflow".to_string())?;
+    let n = loop {
+        // SAFETY: socket_fd is a live Unix stream socket; msg points to writable
+        // data and control buffers. MSG_CMSG_CLOEXEC asks the kernel to set
+        // close-on-exec on any received fds before they are installed.
+        let rc = unsafe { libc::recvmsg(socket_fd, &raw mut msg, libc::MSG_CMSG_CLOEXEC) };
+        if rc >= 0 {
+            break rc as usize;
+        }
+        let err = std::io::Error::last_os_error();
+        if err.raw_os_error() != Some(libc::EINTR) {
+            return Err(format!("recvmsg SCM_RIGHTS: {err}"));
+        }
+    };
+    if msg.msg_flags & libc::MSG_CTRUNC != 0 {
+        return Err("recvmsg control data truncated".to_string());
+    }
+    if msg.msg_flags & libc::MSG_TRUNC != 0 {
+        return Err("recvmsg payload truncated".to_string());
+    }
+    // SAFETY: msg's control buffer was filled by recvmsg. CMSG_FIRSTHDR returns
+    // a pointer into that buffer or null when no control message was received.
+    let cmsg = unsafe { libc::CMSG_FIRSTHDR(&msg) };
+    if cmsg.is_null() {
+        return Err("recvmsg did not include SCM_RIGHTS cmsg".to_string());
+    }
+    // SAFETY: cmsg points inside msg's initialized control buffer.
+    let (level, kind, cmsg_len) = unsafe {
+        (
+            (*cmsg).cmsg_level,
+            (*cmsg).cmsg_type,
+            (*cmsg).cmsg_len as usize,
+        )
+    };
+    if level != libc::SOL_SOCKET || kind != libc::SCM_RIGHTS {
+        return Err(format!("unexpected cmsg level={level} type={kind}"));
+    }
+    let header_len = unsafe { libc::CMSG_LEN(0) as usize };
+    if cmsg_len < header_len {
+        return Err(format!("short cmsg length {cmsg_len}"));
+    }
+    let fd_count = (cmsg_len - header_len) / std::mem::size_of::<i32>();
+    if fd_count == 0 {
+        return Err("SCM_RIGHTS cmsg carried no fds".to_string());
+    }
+    if n < fd_count {
+        return Err(format!(
+            "payload too short for {fd_count} fd type tags: {n} bytes"
+        ));
+    }
+    let mut raw_fds = vec![0i32; fd_count];
+    // SAFETY: CMSG_DATA points to at least fd_count i32 values per cmsg_len;
+    // raw_fds is valid writable storage of the same size.
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            libc::CMSG_DATA(cmsg).cast::<i32>(),
+            raw_fds.as_mut_ptr(),
+            fd_count,
+        );
+    }
+    let tags = data[..fd_count].to_vec();
+    let payload = String::from_utf8_lossy(&data[fd_count..n]).to_string();
+    let received = tags
+        .into_iter()
+        .zip(raw_fds)
+        .map(|(tag, fd)| {
+            // SAFETY: each fd was freshly installed by recvmsg and is now owned
+            // by this agent's registry after wrapping in OwnedFd.
+            (tag, unsafe { OwnedFd::from_raw_fd(fd) })
+        })
+        .collect();
+    Ok((received, payload))
+}
+
+fn register_received_fds(
+    received: Vec<(u8, OwnedFd)>,
+    eventfds: &mut HashMap<u64, EventfdEntry>,
+    next_eventfd_id: &mut u64,
+    connections: &mut HashMap<u64, TcpConn>,
+    next_conn_id: &mut u64,
+    unix_pairs: &mut HashMap<u64, OwnedFd>,
+    next_unix_pair_id: &mut u64,
+) -> Result<Vec<FdRef>, String> {
+    let mut refs = Vec::with_capacity(received.len());
+    for (tag, fd) in received {
+        ensure_received_fd_cloexec(&fd)?;
+        match tag {
+            b'E' => {
+                if *next_eventfd_id == u64::MAX {
+                    return Err("eventfd id space exhausted".to_string());
+                }
+                let id = *next_eventfd_id;
+                *next_eventfd_id += 1;
+                eventfds.insert(
+                    id,
+                    EventfdEntry {
+                        fd,
+                        flags: "received_scm_rights".to_string(),
+                        authorized_readers: Vec::new(),
+                    },
+                );
+                refs.push(FdRef::Eventfd(id));
+            }
+            b'T' => {
+                if *next_conn_id == u64::MAX {
+                    return Err("connection id space exhausted".to_string());
+                }
+                let id = *next_conn_id;
+                *next_conn_id += 1;
+                // SAFETY: fd is a received TCP socket tagged by the sender and
+                // uniquely owned here; from_raw_fd transfers ownership to std.
+                let stream = unsafe { std::net::TcpStream::from_raw_fd(fd.into_raw_fd()) };
+                stream
+                    .set_nonblocking(true)
+                    .map_err(|e| format!("received tcp set_nonblocking: {e}"))?;
+                let stream = TcpStream::from_std(stream)
+                    .map_err(|e| format!("received tcp from_std: {e}"))?;
+                connections.insert(id, Arc::new(tokio::sync::Mutex::new(stream)));
+                refs.push(FdRef::TcpConn(id));
+            }
+            b'U' => {
+                if *next_unix_pair_id == u64::MAX {
+                    return Err("unix pair id space exhausted".to_string());
+                }
+                let id = *next_unix_pair_id;
+                *next_unix_pair_id += 1;
+                unix_pairs.insert(id, fd);
+                refs.push(FdRef::UnixPair(id));
+            }
+            other => return Err(format!("unknown SCM_RIGHTS fd tag byte {other}")),
+        }
+    }
+    Ok(refs)
+}
+
+fn ensure_received_fd_cloexec(fd: &OwnedFd) -> Result<(), String> {
+    // SAFETY: F_GETFD reads descriptor flags from a live fd and does not take ownership.
+    let flags = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFD) };
+    if flags < 0 {
+        return Err(format!(
+            "fcntl(F_GETFD) on received fd: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    if flags & libc::FD_CLOEXEC == 0 {
+        return Err("received fd missing FD_CLOEXEC despite MSG_CMSG_CLOEXEC".to_string());
     }
     Ok(())
 }

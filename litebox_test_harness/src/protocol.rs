@@ -276,6 +276,40 @@ pub enum Command {
     #[serde(rename = "unix_connect")]
     UnixConnect { path: String, data: String },
 
+    /// Create a local AF_UNIX SOCK_STREAM socketpair and register both endpoints.
+    #[serde(rename = "unix_pair")]
+    UnixPair {},
+
+    /// Bind a registered Unix stream listener for cross-agent SCM_RIGHTS tests.
+    #[serde(rename = "unix_pair_listen")]
+    UnixPairListen { path: String },
+
+    /// Connect to a registered Unix stream listener and register the endpoint.
+    #[serde(rename = "unix_pair_connect")]
+    UnixPairConnect { path: String },
+
+    /// Accept a Unix stream connection and register the endpoint.
+    #[serde(rename = "unix_pair_accept")]
+    UnixPairAccept { path: String },
+
+    /// Send one or more registered fds as SCM_RIGHTS over a registered Unix endpoint.
+    /// The agent prepends one type-tag byte per fd (E/T/U) to the payload so the
+    /// receiver can register each received fd in the matching registry.
+    #[serde(rename = "unix_send_fd")]
+    UnixSendFd {
+        socket: u64,
+        sources: Vec<FdRef>,
+        payload: String,
+    },
+
+    /// Receive fds sent with SCM_RIGHTS over a registered Unix endpoint.
+    #[serde(rename = "unix_recv_fd")]
+    UnixRecvFd { socket: u64, max_payload: u32 },
+
+    /// Close and unregister a registered Unix endpoint.
+    #[serde(rename = "unix_pair_close")]
+    UnixPairClose { socket: u64 },
+
     /// Kill a background process by PID.
     #[serde(rename = "kill")]
     Kill { pid: u32 },
@@ -450,6 +484,14 @@ pub enum Clone3Kind {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", content = "id", rename_all = "snake_case")]
+pub enum FdRef {
+    Eventfd(u64),
+    TcpConn(u64),
+    UnixPair(u64),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CloneResult {
     pub pid: u64,
     pub pidfd: Option<i32>,
@@ -513,6 +555,17 @@ pub enum Response {
     /// PTY master handle and slave path.
     #[serde(rename = "pty_handle")]
     PtyHandle { master: u64, slave_path: String },
+
+    /// Registered Unix socketpair endpoint handles.
+    #[serde(rename = "unix_pair_handle")]
+    UnixPairHandle { left: u64, right: u64 },
+
+    /// Fds received through SCM_RIGHTS and registered locally.
+    #[serde(rename = "received_fd")]
+    ReceivedFd {
+        received: Vec<FdRef>,
+        payload: String,
+    },
 
     /// Stateful TCP bytes sent.
     #[serde(rename = "sent")]

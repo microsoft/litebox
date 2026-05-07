@@ -160,6 +160,8 @@ fn test_container_suffix(test_id: &str) -> &'static str {
         "-cl3v"
     } else if test_id.starts_with("INO.") {
         "-ino"
+    } else if test_id.starts_with("SCM.") {
+        "-scm"
     } else {
         ""
     }
