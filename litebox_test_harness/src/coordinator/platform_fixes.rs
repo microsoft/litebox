@@ -3424,71 +3424,63 @@ const SK_WAIT_BUDGET_SECS: u64 = 5;
 const SK_TEST_TIMEOUT_SECS: u64 = 90;
 
 pub(crate) fn register_subtree_kill_tests(reg: &mut Registry<'_>) {
-    // SK.subtree.direct_nonpie — SIGKILL E whose immediate child is a
+    // SK.subtree.direct — SIGKILL E whose immediate child is a
     // non-PIE worker spawned via SpawnRemote. Reproduces the exact
     // shape that hung the PN.B.eof teardown.
-    reg.test(
-        "matrix",
-        "subtree_kill",
-        "SK.subtree.direct_nonpie".to_string(),
-    )
-    .timeout(SK_TEST_TIMEOUT_SECS)
-    .build(move |cx| {
-        let e = cx.require(AgentName::Dpg3);
-        let npx = cx.declare_ephemeral(AgentName::Dpg3, "NPx", SpawnKind::NonPie);
-        Box::new(move |run| {
-            let e = e.clone();
-            let npx = npx.clone();
-            Box::pin(async move {
-                let _ = crate::nonpie_binary();
-                let r = run.spawn_ephemeral(&npx).await;
-                if !super::ok_spawned_response(&r) {
-                    return super::TestOutcome::new(
-                        "E",
-                        false,
-                        format!("setup: spawn_ephemeral(NPx) failed: {r:?}"),
-                    );
-                }
-                run_subtree_kill(run, &e).await
+    reg.test("matrix", "subtree_kill", "SK.subtree.direct".to_string())
+        .timeout(SK_TEST_TIMEOUT_SECS)
+        .build(move |cx| {
+            let e = cx.require(AgentName::Dpg3);
+            let npx = cx.declare_ephemeral(AgentName::Dpg3, "NPx", SpawnKind::NonPie);
+            Box::new(move |run| {
+                let e = e.clone();
+                let npx = npx.clone();
+                Box::pin(async move {
+                    let _ = crate::nonpie_binary();
+                    let r = run.spawn_ephemeral(&npx).await;
+                    if !super::ok_spawned_response(&r) {
+                        return super::TestOutcome::new(
+                            "E",
+                            false,
+                            format!("setup: spawn_ephemeral(NPx) failed: {r:?}"),
+                        );
+                    }
+                    run_subtree_kill(run, &e).await
+                })
             })
-        })
-    });
+        });
 
-    // SK.subtree.deep_nonpie — SIGKILL E whose subtree is
+    // SK.subtree.deep — SIGKILL E whose subtree is
     // E → EE → NPx (non-PIE leaf). Generalizes the depth axis: tests
     // that the wait4 stub at the *grandchild* level still propagates
     // back when the *root* is SIGKILLed.
-    reg.test(
-        "matrix",
-        "subtree_kill",
-        "SK.subtree.deep_nonpie".to_string(),
-    )
-    .timeout(SK_TEST_TIMEOUT_SECS)
-    .build(move |cx| {
-        let e = cx.require(AgentName::Dpg3);
-        let _ee = cx.require(AgentName::Dpg3Dpg);
-        // NPx is a non-PIE child of EE, two levels below E.
-        let npx = cx.declare_ephemeral(AgentName::Dpg3Dpg, "NPx", SpawnKind::NonPie);
-        Box::new(move |run| {
-            let e = e.clone();
-            let npx = npx.clone();
-            Box::pin(async move {
-                let _ = crate::nonpie_binary();
-                // EE was already spawned under E by spawn_tree when
-                // the test declared AgentName::Dpg3Dpg. Ask EE to spawn
-                // its own non-PIE descendant.
-                let r = run.spawn_ephemeral(&npx).await;
-                if !super::ok_spawned_response(&r) {
-                    return super::TestOutcome::new(
-                        "E",
-                        false,
-                        format!("setup: spawn_ephemeral(NPx via EE) failed: {r:?}"),
-                    );
-                }
-                run_subtree_kill(run, &e).await
+    reg.test("matrix", "subtree_kill", "SK.subtree.deep".to_string())
+        .timeout(SK_TEST_TIMEOUT_SECS)
+        .build(move |cx| {
+            let e = cx.require(AgentName::Dpg3);
+            let _ee = cx.require(AgentName::Dpg3Dpg);
+            // NPx is a non-PIE child of EE, two levels below E.
+            let npx = cx.declare_ephemeral(AgentName::Dpg3Dpg, "NPx", SpawnKind::NonPie);
+            Box::new(move |run| {
+                let e = e.clone();
+                let npx = npx.clone();
+                Box::pin(async move {
+                    let _ = crate::nonpie_binary();
+                    // EE was already spawned under E by spawn_tree when
+                    // the test declared AgentName::Dpg3Dpg. Ask EE to spawn
+                    // its own non-PIE descendant.
+                    let r = run.spawn_ephemeral(&npx).await;
+                    if !super::ok_spawned_response(&r) {
+                        return super::TestOutcome::new(
+                            "E",
+                            false,
+                            format!("setup: spawn_ephemeral(NPx via EE) failed: {r:?}"),
+                        );
+                    }
+                    run_subtree_kill(run, &e).await
+                })
             })
-        })
-    });
+        });
 
     // SK.subtree.exit_then_kill — cooperative Exit on the non-PIE
     // descendant first, then SIGKILL the root. Inverts the timing

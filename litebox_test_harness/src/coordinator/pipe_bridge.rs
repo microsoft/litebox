@@ -145,9 +145,9 @@ pub(crate) fn register_pipe_bridge(reg: &mut Registry<'_>) {
     }
 
     for &(mode, subcmd, expected) in &[
-        ("sibling_dual.c2p.pie", "extra-pipe-c2p", "PB_C2P_OK"),
-        ("sibling_dual.p2c.pie", "extra-pipe-p2c", "PB_P2C_OK"),
-        ("sibling_dual.sp.pie", "extra-socketpair", "PB_SP_OK"),
+        ("sibling_dual.c2p", "extra-pipe-c2p", "PB_C2P_OK"),
+        ("sibling_dual.p2c", "extra-pipe-p2c", "PB_P2C_OK"),
+        ("sibling_dual.sp", "extra-socketpair", "PB_SP_OK"),
     ] {
         let id = format!("PB.{mode}");
         reg.test("xworker", "pipe_bridge", id)
