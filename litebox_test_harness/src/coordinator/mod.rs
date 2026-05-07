@@ -292,8 +292,8 @@ impl TestRunner {
         // Track for lazy-matrix validation: any agent contacted via
         // send() must be in spawned_agents at end-of-run.
         self.contacted_agents.insert(target.to_string());
-        // Route through the tree: "A" → direct child,
-        // "AA" → forward through A, "AAA" → forward through A → AA.
+        // Route through the tree: "dpg1" → direct child,
+        // "dpg1_dpg1_dpg1" → forward through dpg1 → dpg1_dpg1.
         let (direct, rest) = route(target);
 
         // Fail fast if the direct child is poisoned (desynchronized).
@@ -718,7 +718,7 @@ fn register_canary(reg: &mut registry::Registry<'_>) {
     reg.test("contamination", "canary", "X_canary.pre_sequence")
         .timeout(60)
         .build(|cx| {
-            let a = cx.require(agents::AgentName::A);
+            let a = cx.require(agents::AgentName::Dpg1);
             Box::new(move |run| {
                 let self_exe = run.self_exe().to_string();
                 Box::pin(async move {
@@ -735,7 +735,7 @@ fn register_canary(reg: &mut registry::Registry<'_>) {
                         crate::protocol::Response::ExecResult { exit_code: 0, stdout, .. }
                             if stdout.trim() == "ECHO_TEST_OK"
                     );
-                    TestOutcome::new("A", pass, format!("{resp:?}"))
+                    TestOutcome::new(agents::AgentName::Dpg1.name(), pass, format!("{resp:?}"))
                 })
             })
         });
@@ -895,20 +895,19 @@ async fn run_tests(self_exe: &str, filter: Option<&str>) -> Vec<TestResult> {
         }
         if std::env::var("LITEBOX_FORCE_FULL_MATRIX").is_ok() {
             for &a in &[
-                agents::AgentName::A,
-                agents::AgentName::AA,
-                agents::AgentName::AB,
-                agents::AgentName::AAA,
-                agents::AgentName::AAB,
-                agents::AgentName::B,
-                agents::AgentName::BB,
-                agents::AgentName::E,
-                agents::AgentName::EE,
-                agents::AgentName::NP,
-                agents::AgentName::NPC,
-                agents::AgentName::D3,
-                agents::AgentName::D4,
-                agents::AgentName::D5,
+                agents::AgentName::Dpg1,
+                agents::AgentName::Dpg1Dpg1,
+                agents::AgentName::Dpg1Dpg2,
+                agents::AgentName::Dpg1Dpg1Dpg1,
+                agents::AgentName::Dpg1Dpg1Dpg2,
+                agents::AgentName::Dpg2,
+                agents::AgentName::Dpg2Dpg,
+                agents::AgentName::Dpg3,
+                agents::AgentName::Dpg3Dpg,
+                agents::AgentName::Dpg1Dng,
+                agents::AgentName::Dpg1DngDpg,
+                agents::AgentName::Dpg1Dpg1Dpg1Dng,
+                agents::AgentName::Dpg1Dpg1Dpg1DngDpg,
             ] {
                 declared_union.insert(a);
             }
@@ -963,115 +962,40 @@ async fn run_tests(self_exe: &str, filter: Option<&str>) -> Vec<TestResult> {
 }
 
 /// Route a target agent name to (`direct_child`, `remaining_path`).
-/// "A" → ("A", None), "AA" → ("A", Some("AA")), "NP" → ("A", Some("NP"))
+/// `dpg1` → (`dpg1`, None), `dpg1_dng_dpg` → (`dpg1`, Some(`dpg1_dng_dpg`)).
 fn route(target: &str) -> (&str, Option<&str>) {
     match target {
-        "A" | "B" | "E" => (target, None),
-        "BB" => ("B", Some("BB")),
-        // Agents under A: AA*, AB, NP, NPC, D3, D4, D5
-        "NP" | "NPC" | "D3" | "D4" | "D5" => ("A", Some(target)),
-        "EE" => ("E", Some("EE")),
-        s if s.starts_with('A') => ("A", Some(s)),
+        "dpg1" | "dpg2" | "dpg3" => (target, None),
+        "dpg2_dpg" => ("dpg2", Some(target)),
+        "dpg3_dpg" => ("dpg3", Some(target)),
+        s if s.starts_with("dpg1_") => ("dpg1", Some(s)),
         _ => (target, None),
     }
 }
 
 /// Wrap a command in Forward layers for routing through the tree.
 fn wrap_forwards(remaining: Option<&str>, cmd: Command) -> Command {
-    match remaining {
-        None => cmd,
-        Some(target) => {
-            // "AA" or "AB" → forward directly (children of A)
-            if target == "BB" {
-                Command::Forward {
-                    target: "BB".to_string(),
-                    inner: Box::new(cmd),
-                }
-            } else if target == "AA" || target == "AB" {
-                Command::Forward {
-                    target: target.to_string(),
-                    inner: Box::new(cmd),
-                }
-            } else if target.starts_with("AA") && target != "AA" {
-                // "AAA", "AAB" → forward to AA, then forward to target
-                Command::Forward {
-                    target: "AA".to_string(),
-                    inner: Box::new(Command::Forward {
-                        target: target.to_string(),
-                        inner: Box::new(cmd),
-                    }),
-                }
-            } else if target == "NP" {
-                // NP is a direct child of A (via SpawnRemote)
-                Command::Forward {
-                    target: "NP".to_string(),
-                    inner: Box::new(cmd),
-                }
-            } else if target == "NPC" {
-                // NPC is a child of NP → forward through NP
-                Command::Forward {
-                    target: "NP".to_string(),
-                    inner: Box::new(Command::Forward {
-                        target: "NPC".to_string(),
-                        inner: Box::new(cmd),
-                    }),
-                }
-            } else if target == "D3" {
-                // D3 is a child of AA
-                Command::Forward {
-                    target: "AA".to_string(),
-                    inner: Box::new(Command::Forward {
-                        target: "D3".to_string(),
-                        inner: Box::new(cmd),
-                    }),
-                }
-            } else if target == "D4" {
-                // D4 is a child of D3 (under AA)
-                Command::Forward {
-                    target: "AA".to_string(),
-                    inner: Box::new(Command::Forward {
-                        target: "D3".to_string(),
-                        inner: Box::new(Command::Forward {
-                            target: "D4".to_string(),
-                            inner: Box::new(cmd),
-                        }),
-                    }),
-                }
-            } else if target == "D5" {
-                // D5 is a child of D4 (under D3 under AA)
-                Command::Forward {
-                    target: "AA".to_string(),
-                    inner: Box::new(Command::Forward {
-                        target: "D3".to_string(),
-                        inner: Box::new(Command::Forward {
-                            target: "D4".to_string(),
-                            inner: Box::new(Command::Forward {
-                                target: "D5".to_string(),
-                                inner: Box::new(cmd),
-                            }),
-                        }),
-                    }),
-                }
-            } else if target == "EE" {
-                // EE is a direct child of E
-                Command::Forward {
-                    target: "EE".to_string(),
-                    inner: Box::new(cmd),
-                }
-            } else if target == "BB" {
-                // BB is a direct child of B.
-                Command::Forward {
-                    target: "BB".to_string(),
-                    inner: Box::new(cmd),
-                }
-            } else {
-                Command::Forward {
-                    target: target.to_string(),
-                    inner: Box::new(cmd),
-                }
-            }
-        }
+    let Some(target) = remaining else {
+        return cmd;
+    };
+
+    let segments: Vec<&str> = target.split('_').collect();
+    if segments.len() <= 1 {
+        return Command::Forward {
+            target: target.to_string(),
+            inner: Box::new(cmd),
+        };
     }
+
+    segments
+        .iter()
+        .enumerate()
+        .skip(1)
+        .rev()
+        .fold(cmd, |inner, (idx, _)| Command::Forward {
+            target: segments[..=idx].join("_"),
+            inner: Box::new(inner),
+        })
 }
 
 pub(crate) fn spawn_child(self_exe: &str) -> Result<Child, String> {

@@ -10,8 +10,12 @@ use super::agents::AgentName;
 use super::registry::Registry;
 use super::run_context::RunContext;
 
-pub(crate) const EV_AGENTS: &[AgentName] =
-    &[AgentName::A, AgentName::AA, AgentName::B, AgentName::BB];
+pub(crate) const EV_AGENTS: &[AgentName] = &[
+    AgentName::Dpg1,
+    AgentName::Dpg1Dpg1,
+    AgentName::Dpg2,
+    AgentName::Dpg2Dpg,
+];
 
 struct EventfdScenario {
     name: &'static str,
@@ -70,10 +74,10 @@ pub(crate) fn register_eventfd_tests(reg: &mut Registry<'_>) {
     // the creator agent; it intentionally does not implement SCM_RIGHTS fd
     // passing (layer 2). We register A↔B and AA↔BB only, not same-agent cases.
     for &(creator, reader) in &[
-        (AgentName::A, AgentName::B),
-        (AgentName::B, AgentName::A),
-        (AgentName::AA, AgentName::BB),
-        (AgentName::BB, AgentName::AA),
+        (AgentName::Dpg1, AgentName::Dpg2),
+        (AgentName::Dpg2, AgentName::Dpg1),
+        (AgentName::Dpg1Dpg1, AgentName::Dpg2Dpg),
+        (AgentName::Dpg2Dpg, AgentName::Dpg1Dpg1),
     ] {
         let id = format!("EV.cross_agent_wakeup.{creator}_to_{reader}");
         let label = format!("{creator}->{reader}");

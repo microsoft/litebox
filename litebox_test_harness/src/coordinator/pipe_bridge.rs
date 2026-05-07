@@ -21,7 +21,7 @@ use super::registry::Registry;
 
 /// Agents for pipe bridge tests.  Includes depths 1-2 and the
 /// non-PIE worker agent (NP) to test nested worker-exec.
-const PB_AGENTS: &[AgentName] = &[AgentName::A, AgentName::AA, AgentName::B];
+const PB_AGENTS: &[AgentName] = &[AgentName::Dpg1, AgentName::Dpg1Dpg1, AgentName::Dpg2];
 
 #[allow(clippy::too_many_lines)] // exhaustive registration / runner
 pub(crate) fn register_pipe_bridge(reg: &mut Registry<'_>) {
@@ -34,7 +34,7 @@ pub(crate) fn register_pipe_bridge(reg: &mut Registry<'_>) {
         timeout: u64,
     }
 
-    const XWORKER_AGENTS: &[AgentName] = &[AgentName::NP, AgentName::D4];
+    const XWORKER_AGENTS: &[AgentName] = &[AgentName::Dpg1Dng, AgentName::Dpg1Dpg1Dpg1Dng];
 
     let cases: &[PbCase] = &[
         PbCase {
@@ -153,8 +153,8 @@ pub(crate) fn register_pipe_bridge(reg: &mut Registry<'_>) {
         reg.test("xworker", "pipe_bridge", id)
             .timeout(90)
             .build(move |cx| {
-                let left = cx.require(AgentName::AA);
-                let right = cx.require(AgentName::AB);
+                let left = cx.require(AgentName::Dpg1Dpg1);
+                let right = cx.require(AgentName::Dpg1Dpg2);
                 Box::new(move |run| {
                     Box::pin(async move {
                         let self_exe = run.self_exe().to_string();

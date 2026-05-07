@@ -4,8 +4,10 @@
 //! Typed agent identifiers and capability handles.
 //!
 //! The integration test harness drives a tree of long-lived agent
-//! processes spawned by the coordinator (A, AA, AB, AAA, AAB, B, BB, NP,
-//! NPC, D3, D4, D5). To prevent tests from referring to agents they
+//! processes spawned by the coordinator. Agent names encode the binary
+//! type at every hop (`dpg` = dynamic PIE glibc, `dng` = dynamic
+//! non-PIE glibc) plus an ordinal when there are multiple siblings of
+//! the same binary type. To prevent tests from referring to agents they
 //! didn't declare at registration time, the *only* way to talk to an
 //! agent is via an [`AgentHandle`] obtained from
 //! [`RegistrationContext::require`]. There is no public constructor
@@ -19,34 +21,32 @@
 
 use std::fmt;
 
-/// All agents the coordinator may spawn. The name of each variant is
-/// the wire-level agent identifier as it appears in test ids and in
-/// the protocol's `Forward { target, .. }` field.
+/// All agents the coordinator may spawn. The name of each variant maps
+/// to the wire-level agent identifier used in test ids and in the
+/// protocol's `Forward { target, .. }` field.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
-#[allow(clippy::upper_case_acronyms)] // NPC, AAA, AAB are wire-protocol names.
 pub enum AgentName {
     /// The coordinator process itself (local `init` target).
     Init,
-    A,
-    AA,
-    AB,
-    AAA,
-    AAB,
-    B,
-    BB,
-    NP,
-    NPC,
-    D3,
-    D4,
-    D5,
+    Dpg1,
+    Dpg1Dpg1,
+    Dpg1Dpg2,
+    Dpg1Dpg1Dpg1,
+    Dpg1Dpg1Dpg2,
+    Dpg2,
+    Dpg2Dpg,
+    Dpg1Dng,
+    Dpg1DngDpg,
+    Dpg1Dpg1Dpg1Dng,
+    Dpg1Dpg1Dpg1DngDpg,
     /// Subtree-kill ephemeral root. Spawned as a direct child of the
-    /// coordinator (like A, B) and intended to be `SIGKILLed` by the
-    /// SK.subtree.* tests. Per-Trial docker isolation guarantees no
-    /// pollution across tests.
-    E,
-    /// Direct child of `E`. Used by `SK.subtree.deep_nonpie` to test
-    /// non-PIE descendants two levels deep.
-    EE,
+    /// coordinator (like `Dpg1`, `Dpg2`) and intended to be `SIGKILLed`
+    /// by the SK.subtree.* tests. Per-Trial docker isolation guarantees
+    /// no pollution across tests.
+    Dpg3,
+    /// Direct child of `Dpg3`. Used by `SK.subtree.deep_nonpie` to test
+    /// descendants two levels deep.
+    Dpg3Dpg,
 }
 
 impl AgentName {
@@ -54,20 +54,19 @@ impl AgentName {
     pub const fn name(self) -> &'static str {
         match self {
             AgentName::Init => "init",
-            AgentName::A => "A",
-            AgentName::AA => "AA",
-            AgentName::AB => "AB",
-            AgentName::AAA => "AAA",
-            AgentName::AAB => "AAB",
-            AgentName::B => "B",
-            AgentName::BB => "BB",
-            AgentName::NP => "NP",
-            AgentName::NPC => "NPC",
-            AgentName::D3 => "D3",
-            AgentName::D4 => "D4",
-            AgentName::D5 => "D5",
-            AgentName::E => "E",
-            AgentName::EE => "EE",
+            AgentName::Dpg1 => "dpg1",
+            AgentName::Dpg2 => "dpg2",
+            AgentName::Dpg3 => "dpg3",
+            AgentName::Dpg1Dpg1 => "dpg1_dpg1",
+            AgentName::Dpg1Dpg2 => "dpg1_dpg2",
+            AgentName::Dpg1Dng => "dpg1_dng",
+            AgentName::Dpg1Dpg1Dpg1 => "dpg1_dpg1_dpg1",
+            AgentName::Dpg1Dpg1Dpg2 => "dpg1_dpg1_dpg2",
+            AgentName::Dpg1DngDpg => "dpg1_dng_dpg",
+            AgentName::Dpg1Dpg1Dpg1Dng => "dpg1_dpg1_dpg1_dng",
+            AgentName::Dpg1Dpg1Dpg1DngDpg => "dpg1_dpg1_dpg1_dng_dpg",
+            AgentName::Dpg2Dpg => "dpg2_dpg",
+            AgentName::Dpg3Dpg => "dpg3_dpg",
         }
     }
 
@@ -77,59 +76,66 @@ impl AgentName {
     pub(super) fn from_wire(name: &str) -> Option<Self> {
         match name {
             "init" => Some(AgentName::Init),
-            "A" => Some(AgentName::A),
-            "AA" => Some(AgentName::AA),
-            "AB" => Some(AgentName::AB),
-            "AAA" => Some(AgentName::AAA),
-            "AAB" => Some(AgentName::AAB),
-            "B" => Some(AgentName::B),
-            "BB" => Some(AgentName::BB),
-            "NP" => Some(AgentName::NP),
-            "NPC" => Some(AgentName::NPC),
-            "D3" => Some(AgentName::D3),
-            "D4" => Some(AgentName::D4),
-            "D5" => Some(AgentName::D5),
-            "E" => Some(AgentName::E),
-            "EE" => Some(AgentName::EE),
+            "dpg1" => Some(AgentName::Dpg1),
+            "dpg2" => Some(AgentName::Dpg2),
+            "dpg3" => Some(AgentName::Dpg3),
+            "dpg1_dpg1" => Some(AgentName::Dpg1Dpg1),
+            "dpg1_dpg2" => Some(AgentName::Dpg1Dpg2),
+            "dpg1_dng" => Some(AgentName::Dpg1Dng),
+            "dpg1_dpg1_dpg1" => Some(AgentName::Dpg1Dpg1Dpg1),
+            "dpg1_dpg1_dpg2" => Some(AgentName::Dpg1Dpg1Dpg2),
+            "dpg1_dng_dpg" => Some(AgentName::Dpg1DngDpg),
+            "dpg1_dpg1_dpg1_dng" => Some(AgentName::Dpg1Dpg1Dpg1Dng),
+            "dpg1_dpg1_dpg1_dng_dpg" => Some(AgentName::Dpg1Dpg1Dpg1DngDpg),
+            "dpg2_dpg" => Some(AgentName::Dpg2Dpg),
+            "dpg3_dpg" => Some(AgentName::Dpg3Dpg),
             _ => None,
         }
     }
 
     /// The chain of agents that must already exist for `self` to be
-    /// reachable. For A and B this is empty; for D5 it is
-    /// `[A, AA, D3, D4]`. Used by `spawn_tree` to expand a per-test
-    /// declared set into the full set of agents that must be alive.
-    #[allow(clippy::match_same_arms)] // Each variant is intentionally distinct even if some chains coincide.
+    /// reachable. For `Dpg1` and `Dpg2` this is empty; for
+    /// `Dpg1Dpg1Dpg1DngDpg` it is
+    /// `[Dpg1, Dpg1Dpg1, Dpg1Dpg1Dpg1, Dpg1Dpg1Dpg1Dng]`. Used by
+    /// `spawn_tree` to expand a per-test declared set into the full set
+    /// of agents that must be alive.
     pub const fn ancestors(self) -> &'static [AgentName] {
         match self {
-            AgentName::Init | AgentName::A | AgentName::B => &[],
-            AgentName::AA | AgentName::AB => &[AgentName::A],
-            AgentName::BB => &[AgentName::B],
-            AgentName::AAA | AgentName::AAB => &[AgentName::A, AgentName::AA],
-            AgentName::NP => &[AgentName::A],
-            AgentName::NPC => &[AgentName::A, AgentName::NP],
-            AgentName::D3 => &[AgentName::A, AgentName::AA],
-            AgentName::D4 => &[AgentName::A, AgentName::AA, AgentName::D3],
-            AgentName::D5 => &[AgentName::A, AgentName::AA, AgentName::D3, AgentName::D4],
-            AgentName::E => &[],
-            AgentName::EE => &[AgentName::E],
+            AgentName::Init | AgentName::Dpg1 | AgentName::Dpg2 | AgentName::Dpg3 => &[],
+            AgentName::Dpg1Dpg1 | AgentName::Dpg1Dpg2 | AgentName::Dpg1Dng => &[AgentName::Dpg1],
+            AgentName::Dpg2Dpg => &[AgentName::Dpg2],
+            AgentName::Dpg3Dpg => &[AgentName::Dpg3],
+            AgentName::Dpg1Dpg1Dpg1 | AgentName::Dpg1Dpg1Dpg2 => {
+                &[AgentName::Dpg1, AgentName::Dpg1Dpg1]
+            }
+            AgentName::Dpg1DngDpg => &[AgentName::Dpg1, AgentName::Dpg1Dng],
+            AgentName::Dpg1Dpg1Dpg1Dng => &[
+                AgentName::Dpg1,
+                AgentName::Dpg1Dpg1,
+                AgentName::Dpg1Dpg1Dpg1,
+            ],
+            AgentName::Dpg1Dpg1Dpg1DngDpg => &[
+                AgentName::Dpg1,
+                AgentName::Dpg1Dpg1,
+                AgentName::Dpg1Dpg1Dpg1,
+                AgentName::Dpg1Dpg1Dpg1Dng,
+            ],
         }
     }
 
     /// Direct parent in the canonical spawn tree, or `None` for
     /// top-level agents (direct children of the coordinator).
-    #[allow(dead_code)] // Used by tree migration as callers shift
-    // from hard-coded routing to spec-driven.
+    #[allow(dead_code)] // Used by tree migration as callers shift from hard-coded routing to spec-driven.
     pub const fn parent(self) -> Option<AgentName> {
         match self {
-            AgentName::Init | AgentName::A | AgentName::B | AgentName::E => None,
-            AgentName::AA | AgentName::AB | AgentName::NP => Some(AgentName::A),
-            AgentName::BB => Some(AgentName::B),
-            AgentName::AAA | AgentName::AAB | AgentName::D3 => Some(AgentName::AA),
-            AgentName::NPC => Some(AgentName::NP),
-            AgentName::D4 => Some(AgentName::D3),
-            AgentName::D5 => Some(AgentName::D4),
-            AgentName::EE => Some(AgentName::E),
+            AgentName::Init | AgentName::Dpg1 | AgentName::Dpg2 | AgentName::Dpg3 => None,
+            AgentName::Dpg1Dpg1 | AgentName::Dpg1Dpg2 | AgentName::Dpg1Dng => Some(AgentName::Dpg1),
+            AgentName::Dpg2Dpg => Some(AgentName::Dpg2),
+            AgentName::Dpg3Dpg => Some(AgentName::Dpg3),
+            AgentName::Dpg1Dpg1Dpg1 | AgentName::Dpg1Dpg1Dpg2 => Some(AgentName::Dpg1Dpg1),
+            AgentName::Dpg1DngDpg => Some(AgentName::Dpg1Dng),
+            AgentName::Dpg1Dpg1Dpg1Dng => Some(AgentName::Dpg1Dpg1Dpg1),
+            AgentName::Dpg1Dpg1Dpg1DngDpg => Some(AgentName::Dpg1Dpg1Dpg1Dng),
         }
     }
 }
@@ -183,110 +189,92 @@ pub struct AgentSpec {
 }
 
 /// The default agent tree the coordinator can spawn from. Each entry
-/// records a structural agent name plus its binary type and
-/// isolation flavor. `spawn_tree` filters by which agents the running
-/// test set actually needs.
-///
-/// **Legacy names retained as compatibility shims.** `NP`/`NPC`/`D3`/
-/// `D4`/`D5` are spelled out here with their original
-/// (parent, binary) tuples so callers continue to compile without
-/// change while individual coordinator files migrate to the
-/// pure-structural taxonomy. Once all callers are migrated, these
-/// entries (and the corresponding enum variants) are removed.
+/// records a structural agent name plus its binary type and isolation
+/// flavor. `spawn_tree` filters by which agents the running test set
+/// actually needs.
 #[must_use]
 pub fn default_tree() -> Vec<AgentSpec> {
     use AgentBinary::{NonPie, Pie};
     use IsolationKind::{DisposableSubtree, Standard};
 
     vec![
-        // ── Standard-tree top level ─────────────────────────────────
         AgentSpec {
-            name: AgentName::A,
+            name: AgentName::Dpg1,
             parent: None,
             binary: Pie,
             isolation: Standard,
         },
         AgentSpec {
-            name: AgentName::B,
+            name: AgentName::Dpg2,
             parent: None,
             binary: Pie,
             isolation: Standard,
         },
-        // ── Standard-tree depth-2 ───────────────────────────────────
         AgentSpec {
-            name: AgentName::AA,
-            parent: Some(AgentName::A),
-            binary: Pie,
-            isolation: Standard,
-        },
-        AgentSpec {
-            name: AgentName::AB,
-            parent: Some(AgentName::A),
-            binary: Pie,
-            isolation: Standard,
-        },
-        AgentSpec {
-            name: AgentName::BB,
-            parent: Some(AgentName::B),
-            binary: Pie,
-            isolation: Standard,
-        },
-        // ── Standard-tree depth-3 ───────────────────────────────────
-        AgentSpec {
-            name: AgentName::AAA,
-            parent: Some(AgentName::AA),
-            binary: Pie,
-            isolation: Standard,
-        },
-        AgentSpec {
-            name: AgentName::AAB,
-            parent: Some(AgentName::AA),
-            binary: Pie,
-            isolation: Standard,
-        },
-        // ── Disposable subtree (SK family SIGKILLs these) ───────────
-        AgentSpec {
-            name: AgentName::E,
+            name: AgentName::Dpg3,
             parent: None,
             binary: Pie,
             isolation: DisposableSubtree,
         },
         AgentSpec {
-            name: AgentName::EE,
-            parent: Some(AgentName::E),
+            name: AgentName::Dpg1Dpg1,
+            parent: Some(AgentName::Dpg1),
+            binary: Pie,
+            isolation: Standard,
+        },
+        AgentSpec {
+            name: AgentName::Dpg1Dpg2,
+            parent: Some(AgentName::Dpg1),
+            binary: Pie,
+            isolation: Standard,
+        },
+        AgentSpec {
+            name: AgentName::Dpg1Dng,
+            parent: Some(AgentName::Dpg1),
+            binary: NonPie,
+            isolation: Standard,
+        },
+        AgentSpec {
+            name: AgentName::Dpg1Dpg1Dpg1,
+            parent: Some(AgentName::Dpg1Dpg1),
+            binary: Pie,
+            isolation: Standard,
+        },
+        AgentSpec {
+            name: AgentName::Dpg1Dpg1Dpg2,
+            parent: Some(AgentName::Dpg1Dpg1),
+            binary: Pie,
+            isolation: Standard,
+        },
+        AgentSpec {
+            name: AgentName::Dpg1DngDpg,
+            parent: Some(AgentName::Dpg1Dng),
+            binary: Pie,
+            isolation: Standard,
+        },
+        AgentSpec {
+            name: AgentName::Dpg1Dpg1Dpg1Dng,
+            parent: Some(AgentName::Dpg1Dpg1Dpg1),
+            binary: NonPie,
+            isolation: Standard,
+        },
+        AgentSpec {
+            name: AgentName::Dpg1Dpg1Dpg1DngDpg,
+            parent: Some(AgentName::Dpg1Dpg1Dpg1Dng),
+            binary: Pie,
+            isolation: Standard,
+        },
+        AgentSpec {
+            name: AgentName::Dpg2Dpg,
+            parent: Some(AgentName::Dpg2),
+            binary: Pie,
+            isolation: Standard,
+        },
+        AgentSpec {
+            name: AgentName::Dpg3Dpg,
+            parent: Some(AgentName::Dpg3),
             binary: Pie,
             isolation: DisposableSubtree,
-        },
-        // ── Legacy compat shims (to be migrated) ────────────────────
-        AgentSpec {
-            name: AgentName::NP,
-            parent: Some(AgentName::A),
-            binary: NonPie,
-            isolation: Standard,
-        },
-        AgentSpec {
-            name: AgentName::NPC,
-            parent: Some(AgentName::NP),
-            binary: Pie,
-            isolation: Standard,
-        },
-        AgentSpec {
-            name: AgentName::D3,
-            parent: Some(AgentName::AA),
-            binary: Pie,
-            isolation: Standard,
-        },
-        AgentSpec {
-            name: AgentName::D4,
-            parent: Some(AgentName::D3),
-            binary: NonPie,
-            isolation: Standard,
-        },
-        AgentSpec {
-            name: AgentName::D5,
-            parent: Some(AgentName::D4),
-            binary: Pie,
-            isolation: Standard,
         },
     ]
 }
