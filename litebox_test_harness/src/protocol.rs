@@ -285,6 +285,40 @@ pub enum Command {
     #[serde(rename = "epoll_open")]
     EpollOpen,
 
+    /// Open an eventfd and register it in this agent's local registry.
+    /// Flags are parsed from strings like "semaphore|nonblock|cloexec".
+    #[serde(rename = "eventfd_open")]
+    EventfdOpen { initval: u64, flags: String },
+
+    /// Read one u64 from a registered eventfd. Nonblocking empty reads return
+    /// [`Response::Error`] with EAGAIN.
+    #[serde(rename = "eventfd_read")]
+    EventfdRead { id: u64 },
+
+    /// Read one u64 on behalf of a reader authorized via EventfdShare. This
+    /// models the layer-1 forward-via-creator path without passing fds.
+    #[serde(rename = "eventfd_read_shared")]
+    EventfdReadShared { id: u64, reader: String },
+
+    /// Write one u64 to a registered eventfd.
+    #[serde(rename = "eventfd_write")]
+    EventfdWrite { id: u64, value: u64 },
+
+    /// Close and unregister a registered eventfd.
+    #[serde(rename = "eventfd_close")]
+    EventfdClose { id: u64 },
+
+    /// Mark a named agent as an authorized reader of this creator-local
+    /// eventfd. Layer 1 deliberately models sharing as forwarding a command
+    /// through the creator's registry, not as SCM_RIGHTS fd passing.
+    #[serde(rename = "eventfd_share")]
+    EventfdShare { id: u64, target: String },
+
+    /// Minimal eventfd + epoll edge-triggered probe used until W2's structured
+    /// epoll commands are available. The eventfd must already be ready.
+    #[serde(rename = "eventfd_epollet")]
+    EventfdEpollEt { id: u64 },
+
     /// Shut down gracefully.
     #[serde(rename = "exit")]
     Exit,
@@ -343,6 +377,14 @@ pub enum Response {
     /// Stateful TCP connection closed.
     #[serde(rename = "closed")]
     Closed,
+
+    /// Eventfd registry handle.
+    #[serde(rename = "eventfd_handle")]
+    EventfdHandle { id: u64 },
+
+    /// Eventfd read value.
+    #[serde(rename = "eventfd_value")]
+    EventfdValue { value: u64 },
 
     /// TCP connection failed.
     #[serde(rename = "connect_failed")]

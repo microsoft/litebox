@@ -26,6 +26,12 @@ struct ListenerEntry {
     task: tokio::task::JoinHandle<()>,
 }
 
+struct EventfdEntry {
+    fd: OwnedFd,
+    flags: String,
+    authorized_readers: Vec<String>,
+}
+
 struct BackgroundProcess {
     process: tokio::process::Child,
     stdout: Arc<Mutex<Vec<u8>>>,
@@ -150,6 +156,8 @@ async fn agent_loop(self_exe: &str) {
     let mut unix_listeners: HashMap<String, tokio::task::JoinHandle<()>> = HashMap::new();
     let mut connections: HashMap<u64, TcpConn> = HashMap::new();
     let mut next_conn_id = 1u64;
+    let mut eventfds: HashMap<u64, EventfdEntry> = HashMap::new();
+    let mut next_eventfd_id = 1u64;
     let mut background_pids: HashMap<u32, BackgroundProcess> = HashMap::new();
 
     let mut line = String::new();
@@ -1534,7 +1542,139 @@ async fn agent_loop(self_exe: &str) {
                 }
             }
 
+            Command::EventfdOpen { initval, flags } => {
+                let id = next_eventfd_id;
+                if id == u64::MAX {
+                    respond(&Response::Error {
+                        error: "eventfd id space exhausted".to_string(),
+                    })
+                    .await;
+                    continue;
+                }
+                match open_eventfd(initval, &flags) {
+                    Ok(fd) => {
+                        next_eventfd_id += 1;
+                        eventfds.insert(
+                            id,
+                            EventfdEntry {
+                                fd,
+                                flags,
+                                authorized_readers: Vec::new(),
+                            },
+                        );
+                        respond(&Response::EventfdHandle { id }).await;
+                    }
+                    Err(error) => respond(&Response::Error { error }).await,
+                }
+            }
+
+            Command::EventfdRead { id } => {
+                let Some(entry) = eventfds.get(&id) else {
+                    respond(&Response::Error {
+                        error: format!("unknown eventfd {id}"),
+                    })
+                    .await;
+                    continue;
+                };
+                match read_eventfd_value(entry.fd.as_raw_fd()) {
+                    Ok(value) => respond(&Response::EventfdValue { value }).await,
+                    Err(error) => respond(&Response::Error { error }).await,
+                }
+            }
+
+            Command::EventfdReadShared { id, reader } => {
+                let Some(entry) = eventfds.get(&id) else {
+                    respond(&Response::Error {
+                        error: format!("unknown eventfd {id}"),
+                    })
+                    .await;
+                    continue;
+                };
+                if !entry
+                    .authorized_readers
+                    .iter()
+                    .any(|authorized| authorized == &reader)
+                {
+                    respond(&Response::Error {
+                        error: format!("eventfd {id} reader {reader} is not authorized"),
+                    })
+                    .await;
+                    continue;
+                }
+                match read_eventfd_value(entry.fd.as_raw_fd()) {
+                    Ok(value) => respond(&Response::EventfdValue { value }).await,
+                    Err(error) => respond(&Response::Error { error }).await,
+                }
+            }
+
+            Command::EventfdWrite { id, value } => {
+                let Some(entry) = eventfds.get(&id) else {
+                    respond(&Response::Error {
+                        error: format!("unknown eventfd {id}"),
+                    })
+                    .await;
+                    continue;
+                };
+                match write_eventfd_value(entry.fd.as_raw_fd(), value) {
+                    Ok(()) => respond(&Response::Sent).await,
+                    Err(error) => respond(&Response::Error { error }).await,
+                }
+            }
+
+            Command::EventfdClose { id } => {
+                if eventfds.remove(&id).is_some() {
+                    respond(&Response::Closed).await;
+                } else {
+                    respond(&Response::Error {
+                        error: format!("unknown eventfd {id}"),
+                    })
+                    .await;
+                }
+            }
+
+            Command::EventfdShare { id, target } => {
+                let Some(entry) = eventfds.get_mut(&id) else {
+                    respond(&Response::Error {
+                        error: format!("unknown eventfd {id}"),
+                    })
+                    .await;
+                    continue;
+                };
+                if !entry
+                    .authorized_readers
+                    .iter()
+                    .any(|reader| reader == &target)
+                {
+                    entry.authorized_readers.push(target.clone());
+                }
+                // Layer 1 sharing is creator-registry based: a peer's logical
+                // read is forwarded back through this creator agent. We record
+                // the intended reader here, but do not pass the fd with SCM_RIGHTS.
+                respond(&Response::Ok {
+                    data: Some(format!(
+                        "eventfd {id} shared with {target}; readers={}",
+                        entry.authorized_readers.join(",")
+                    )),
+                })
+                .await;
+            }
+
+            Command::EventfdEpollEt { id } => {
+                let Some(entry) = eventfds.get(&id) else {
+                    respond(&Response::Error {
+                        error: format!("unknown eventfd {id}"),
+                    })
+                    .await;
+                    continue;
+                };
+                match eventfd_epollet_probe(id, entry) {
+                    Ok(detail) => respond(&Response::Ok { data: Some(detail) }).await,
+                    Err(error) => respond(&Response::Error { error }).await,
+                }
+            }
+
             Command::Exit => {
+                eventfds.clear();
                 // Abort all TCP echo servers.
                 for (_, entry) in listeners.drain() {
                     entry.task.abort();
@@ -1662,6 +1802,142 @@ fn prepare_inherited_listeners(
         inherited.push((port, dup_fd_to_inherited_slot(entry.fd.as_raw_fd(), slot)?));
     }
     Ok(inherited)
+}
+
+fn parse_eventfd_flags(flags: &str) -> Result<i32, String> {
+    let mut bits = 0;
+    for raw in flags.split('|') {
+        let flag = raw.trim();
+        if flag.is_empty() {
+            continue;
+        }
+        match flag.to_ascii_lowercase().as_str() {
+            "semaphore" | "efd_semaphore" => bits |= libc::EFD_SEMAPHORE,
+            "nonblock" | "efd_nonblock" => bits |= libc::EFD_NONBLOCK,
+            "cloexec" | "efd_cloexec" => bits |= libc::EFD_CLOEXEC,
+            other => return Err(format!("unknown eventfd flag {other:?}")),
+        }
+    }
+    Ok(bits)
+}
+
+fn open_eventfd(initval: u64, flags: &str) -> Result<OwnedFd, String> {
+    let init = u32::try_from(initval)
+        .map_err(|_| format!("eventfd initval {initval} exceeds u32::MAX"))?;
+    let flag_bits = parse_eventfd_flags(flags)?;
+    // SAFETY: eventfd creates a new file descriptor and does not alias memory.
+    let fd = unsafe { libc::eventfd(init, flag_bits) };
+    if fd < 0 {
+        return Err(format!(
+            "eventfd(initval={initval}, flags={flags:?}): {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    // SAFETY: `fd` is a newly returned descriptor owned by this process.
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
+fn read_eventfd_value(fd: i32) -> Result<u64, String> {
+    let mut value = 0u64;
+    loop {
+        // SAFETY: `value` points to valid writable memory for exactly 8 bytes;
+        // eventfd read does not take ownership of `fd`.
+        let rc = unsafe {
+            libc::read(
+                fd,
+                (&raw mut value).cast::<libc::c_void>(),
+                std::mem::size_of::<u64>(),
+            )
+        };
+        if rc == std::mem::size_of::<u64>() as isize {
+            return Ok(value);
+        }
+        let err = std::io::Error::last_os_error();
+        match err.raw_os_error() {
+            Some(libc::EINTR) => continue,
+            Some(libc::EAGAIN) => return Err("eventfd read: EAGAIN".to_string()),
+            _ => return Err(format!("eventfd read: {err}")),
+        }
+    }
+}
+
+fn write_eventfd_value(fd: i32, value: u64) -> Result<(), String> {
+    loop {
+        // SAFETY: `value` points to valid readable memory for exactly 8 bytes;
+        // eventfd write does not take ownership of `fd`.
+        let rc = unsafe {
+            libc::write(
+                fd,
+                (&raw const value).cast::<libc::c_void>(),
+                std::mem::size_of::<u64>(),
+            )
+        };
+        if rc == std::mem::size_of::<u64>() as isize {
+            return Ok(());
+        }
+        let err = std::io::Error::last_os_error();
+        match err.raw_os_error() {
+            Some(libc::EINTR) => continue,
+            Some(libc::EAGAIN) => return Err("eventfd write: EAGAIN".to_string()),
+            _ => return Err(format!("eventfd write value={value}: {err}")),
+        }
+    }
+}
+
+fn eventfd_epollet_probe(id: u64, entry: &EventfdEntry) -> Result<String, String> {
+    // SAFETY: epoll_create1 returns a fresh descriptor on success.
+    let epfd = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
+    if epfd < 0 {
+        return Err(format!(
+            "epoll_create1: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    // SAFETY: `epfd` is newly returned and owned by this process.
+    let epfd = unsafe { OwnedFd::from_raw_fd(epfd) };
+    let mut ev = libc::epoll_event {
+        events: (libc::EPOLLIN | libc::EPOLLET) as u32,
+        u64: id,
+    };
+    // SAFETY: both descriptors are live, and `ev` points to initialized memory
+    // for the duration of the call.
+    let ctl = unsafe {
+        libc::epoll_ctl(
+            epfd.as_raw_fd(),
+            libc::EPOLL_CTL_ADD,
+            entry.fd.as_raw_fd(),
+            &raw mut ev,
+        )
+    };
+    if ctl != 0 {
+        return Err(format!(
+            "epoll_ctl eventfd {id}: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+
+    let mut events = [libc::epoll_event { events: 0, u64: 0 }; 4];
+    // SAFETY: `events` is valid writable storage for four epoll events.
+    let first = unsafe { libc::epoll_wait(epfd.as_raw_fd(), events.as_mut_ptr(), 4, 1000) };
+    if first < 0 {
+        return Err(format!(
+            "epoll_wait first: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    // SAFETY: same valid storage as above; timeout 0 is nonblocking.
+    let second = unsafe { libc::epoll_wait(epfd.as_raw_fd(), events.as_mut_ptr(), 4, 0) };
+    if second < 0 {
+        return Err(format!(
+            "epoll_wait second: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    let value = read_eventfd_value(entry.fd.as_raw_fd())?;
+    Ok(format!(
+        "first={first},second={second},value={value},flags={}",
+        entry.flags
+    ))
 }
 
 fn dup_fd_cloexec(fd: i32) -> Result<OwnedFd, String> {
