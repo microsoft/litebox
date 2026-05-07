@@ -47,6 +47,12 @@ pub enum AgentName {
     /// Direct child of `Dpg3`. Used by `SK.subtree.deep_nonpie` to test
     /// descendants two levels deep.
     Dpg3Dpg,
+    VsCodeSshdPty,
+    VsCodeLoginBash,
+    VsCodePipedSh,
+    VsCodeLauncherBash,
+    VsCodeCli,
+    VsCodeNode,
 }
 
 impl AgentName {
@@ -67,6 +73,12 @@ impl AgentName {
             AgentName::Dpg1Dpg1Dpg1DngDpg => "dpg1_dpg1_dpg1_dng_dpg",
             AgentName::Dpg2Dpg => "dpg2_dpg",
             AgentName::Dpg3Dpg => "dpg3_dpg",
+            AgentName::VsCodeSshdPty => "vscode_sshd_pty",
+            AgentName::VsCodeLoginBash => "vscode_login_bash",
+            AgentName::VsCodePipedSh => "vscode_piped_sh",
+            AgentName::VsCodeLauncherBash => "vscode_launcher_bash",
+            AgentName::VsCodeCli => "vscode_cli",
+            AgentName::VsCodeNode => "vscode_node",
         }
     }
 
@@ -89,6 +101,12 @@ impl AgentName {
             "dpg1_dpg1_dpg1_dng_dpg" => Some(AgentName::Dpg1Dpg1Dpg1DngDpg),
             "dpg2_dpg" => Some(AgentName::Dpg2Dpg),
             "dpg3_dpg" => Some(AgentName::Dpg3Dpg),
+            "vscode_sshd_pty" => Some(AgentName::VsCodeSshdPty),
+            "vscode_login_bash" => Some(AgentName::VsCodeLoginBash),
+            "vscode_piped_sh" => Some(AgentName::VsCodePipedSh),
+            "vscode_launcher_bash" => Some(AgentName::VsCodeLauncherBash),
+            "vscode_cli" => Some(AgentName::VsCodeCli),
+            "vscode_node" => Some(AgentName::VsCodeNode),
             _ => None,
         }
     }
@@ -101,7 +119,11 @@ impl AgentName {
     /// of agents that must be alive.
     pub const fn ancestors(self) -> &'static [AgentName] {
         match self {
-            AgentName::Init | AgentName::Dpg1 | AgentName::Dpg2 | AgentName::Dpg3 => &[],
+            AgentName::Init
+            | AgentName::Dpg1
+            | AgentName::Dpg2
+            | AgentName::Dpg3
+            | AgentName::VsCodeSshdPty => &[],
             AgentName::Dpg1Dpg1 | AgentName::Dpg1Dpg2 | AgentName::Dpg1Dng => &[AgentName::Dpg1],
             AgentName::Dpg2Dpg => &[AgentName::Dpg2],
             AgentName::Dpg3Dpg => &[AgentName::Dpg3],
@@ -120,6 +142,26 @@ impl AgentName {
                 AgentName::Dpg1Dpg1Dpg1,
                 AgentName::Dpg1Dpg1Dpg1Dng,
             ],
+            AgentName::VsCodeLoginBash => &[AgentName::VsCodeSshdPty],
+            AgentName::VsCodePipedSh => &[AgentName::VsCodeSshdPty, AgentName::VsCodeLoginBash],
+            AgentName::VsCodeLauncherBash => &[
+                AgentName::VsCodeSshdPty,
+                AgentName::VsCodeLoginBash,
+                AgentName::VsCodePipedSh,
+            ],
+            AgentName::VsCodeCli => &[
+                AgentName::VsCodeSshdPty,
+                AgentName::VsCodeLoginBash,
+                AgentName::VsCodePipedSh,
+                AgentName::VsCodeLauncherBash,
+            ],
+            AgentName::VsCodeNode => &[
+                AgentName::VsCodeSshdPty,
+                AgentName::VsCodeLoginBash,
+                AgentName::VsCodePipedSh,
+                AgentName::VsCodeLauncherBash,
+                AgentName::VsCodeCli,
+            ],
         }
     }
 
@@ -128,7 +170,11 @@ impl AgentName {
     #[allow(dead_code)] // Used by tree migration as callers shift from hard-coded routing to spec-driven.
     pub const fn parent(self) -> Option<AgentName> {
         match self {
-            AgentName::Init | AgentName::Dpg1 | AgentName::Dpg2 | AgentName::Dpg3 => None,
+            AgentName::Init
+            | AgentName::Dpg1
+            | AgentName::Dpg2
+            | AgentName::Dpg3
+            | AgentName::VsCodeSshdPty => None,
             AgentName::Dpg1Dpg1 | AgentName::Dpg1Dpg2 | AgentName::Dpg1Dng => Some(AgentName::Dpg1),
             AgentName::Dpg2Dpg => Some(AgentName::Dpg2),
             AgentName::Dpg3Dpg => Some(AgentName::Dpg3),
@@ -136,6 +182,11 @@ impl AgentName {
             AgentName::Dpg1DngDpg => Some(AgentName::Dpg1Dng),
             AgentName::Dpg1Dpg1Dpg1Dng => Some(AgentName::Dpg1Dpg1Dpg1),
             AgentName::Dpg1Dpg1Dpg1DngDpg => Some(AgentName::Dpg1Dpg1Dpg1Dng),
+            AgentName::VsCodeLoginBash => Some(AgentName::VsCodeSshdPty),
+            AgentName::VsCodePipedSh => Some(AgentName::VsCodeLoginBash),
+            AgentName::VsCodeLauncherBash => Some(AgentName::VsCodePipedSh),
+            AgentName::VsCodeCli => Some(AgentName::VsCodeLauncherBash),
+            AgentName::VsCodeNode => Some(AgentName::VsCodeCli),
         }
     }
 }
@@ -170,6 +221,22 @@ pub enum AgentBinary {
     NonPieStaticMusl,
 }
 
+impl AgentBinary {
+    pub(super) const fn needs_companion_binary(self) -> bool {
+        !matches!(self, Self::Pie)
+    }
+
+    pub(super) const fn fork_binary_label(self) -> &'static str {
+        match self {
+            Self::Pie => "self",
+            Self::NonPie => "nonpie",
+            Self::StaticPieGlibc => "static-pie-glibc",
+            Self::StaticPieMusl => "static-pie-musl",
+            Self::NonPieStaticMusl => "non-pie-static-musl",
+        }
+    }
+}
+
 /// Declarative spec for one agent in the canonical spawn tree.
 ///
 /// `spawn_tree` walks the list of specs in topological order
@@ -197,7 +264,7 @@ pub fn default_tree() -> Vec<AgentSpec> {
     use AgentBinary::{NonPie, Pie};
     use IsolationKind::{DisposableSubtree, Standard};
 
-    vec![
+    let mut specs = vec![
         AgentSpec {
             name: AgentName::Dpg1,
             parent: None,
@@ -276,7 +343,9 @@ pub fn default_tree() -> Vec<AgentSpec> {
             binary: Pie,
             isolation: DisposableSubtree,
         },
-    ]
+    ];
+    specs.extend(super::vscode_shape::vscode_tree_specs());
+    specs
 }
 
 /// Look up an `AgentSpec` by name in the default tree. Returns
