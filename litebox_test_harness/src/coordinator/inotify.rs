@@ -10,8 +10,12 @@ use super::agents::{AgentHandle, AgentName};
 use super::registry::Registry;
 use super::run_context::RunContext;
 
-pub(crate) const INO_AGENTS: &[AgentName] =
-    &[AgentName::A, AgentName::AA, AgentName::B, AgentName::BB];
+pub(crate) const INO_AGENTS: &[AgentName] = &[
+    AgentName::Dpg1,
+    AgentName::Dpg1Dpg1,
+    AgentName::Dpg2,
+    AgentName::Dpg2Dpg,
+];
 
 #[derive(Clone, Copy)]
 enum ScenarioKind {
@@ -89,10 +93,10 @@ pub(crate) fn register_inotify_tests(reg: &mut Registry<'_>) {
 }
 
 fn peer_for(agent: AgentName) -> AgentName {
-    if matches!(agent, AgentName::A | AgentName::AA) {
-        AgentName::B
+    if matches!(agent, AgentName::Dpg1 | AgentName::Dpg1Dpg1) {
+        AgentName::Dpg2
     } else {
-        AgentName::A
+        AgentName::Dpg1
     }
 }
 

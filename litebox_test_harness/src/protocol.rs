@@ -379,7 +379,7 @@ pub enum Command {
     InotifyOpen {},
 
     /// Add an inotify watch. Mask is parsed from strings like
-    /// "create|modify|delete|moved_from|moved_to|attrib|close_write".
+    /// `"create|modify|delete|moved_from|moved_to|attrib|close_write"`.
     #[serde(rename = "inotify_add_watch")]
     InotifyAddWatch { id: u64, path: String, mask: String },
 
@@ -533,7 +533,7 @@ pub enum Response {
     #[serde(rename = "watch_descriptor")]
     WatchDescriptor { wd: i32 },
 
-    /// Events returned by inotify_read.
+    /// Events returned by `inotify_read`.
     #[serde(rename = "inotify_events")]
     InotifyEvents { events: Vec<InotifyEvent> },
 
