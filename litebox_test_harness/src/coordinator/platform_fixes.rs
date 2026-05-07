@@ -321,15 +321,8 @@ pub(crate) fn register_nonpie_pipe_chain_tests(reg: &mut Registry<'_>) {
 
 #[allow(clippy::too_many_lines)] // exhaustive registration / runner
 pub(crate) fn register_bpipe_tests(reg: &mut Registry<'_>) {
-    // The four non-NonPieGlibc legs (NonPieGlibc is already covered
-    // by NPIPE above with the legacy IDs).
-    const LEGS: &[crate::BinaryType] = &[
-        crate::BinaryType::PieGlibc,
-        crate::BinaryType::StaticPieGlibc,
-        crate::BinaryType::StaticPieMusl,
-        crate::BinaryType::NonPieStaticMusl,
-    ];
-    for &bt in LEGS {
+    // Exercise every binary type with uniform per-leg IDs.
+    for &bt in crate::BinaryType::ALL {
         let leg_label = bt.label();
         for &reps in NPIPE_REPS {
             for &agent in DEPTH_AGENTS {
@@ -987,24 +980,13 @@ pub(crate) fn register_fork_from_worker_exec_tests(reg: &mut Registry<'_>) {
     // kept for backwards compatibility). The binary executed is
     // resolved per `BinaryType` via `binary_path()`.
     //
-    // Backwards-compat: the original four test IDs (`FWE.pie_from_init`,
-    // `FWE.nonpie_from_init`, `FWE.pie_from_worker_exec`,
-    // `FWE.nonpie_from_worker_exec`) are preserved as aliases for the
-    // PIE-glibc and non-PIE-glibc legs of the new matrix.
     for &bt in crate::BinaryType::ALL {
         for (launcher_label, launcher_agent, sub_timeout) in [
             ("from_init", AgentName::A, 20_u64),
             ("from_worker_exec", AgentName::NP, 30_u64),
         ] {
-            // Preserve the original test IDs for the two pre-existing
-            // legs (pie-glibc / nonpie-glibc) so any external CI filters
-            // continue to work.
-            let bt_label = match bt {
-                crate::BinaryType::PieGlibc => "pie",
-                crate::BinaryType::NonPieGlibc => "nonpie",
-                _ => bt.label(),
-            };
-            let test_id = format!("FWE.{bt_label}_{launcher_label}");
+            let bt_label = bt.label();
+            let test_id = format!("FWE.{bt_label}.{launcher_label}");
             let outcome_label = format!("{launcher_agent}");
             reg.test("fork", "fork_from_worker_exec", test_id.clone())
                 .timeout(60)
@@ -1105,16 +1087,7 @@ pub(crate) fn register_minimal_canary_tests(reg: &mut Registry<'_>) {
                 let subcommand_s: String = subcommand.into();
                 let marker_s: String = marker.into();
                 let target_label = target_bt.label();
-                // Backwards-compat: the original M/BS test IDs (no
-                // binary-type segment) keep their semantics by
-                // pinning to the non-PIE-glibc target — which is
-                // exactly what the legacy behavior was. The other
-                // four legs get a `.<binary-type>` suffix.
-                let test_id = if target_bt == crate::BinaryType::NonPieGlibc {
-                    format!("{id_prefix}.{launcher_s}")
-                } else {
-                    format!("{id_prefix}.{launcher_s}.{target_label}")
-                };
+                let test_id = format!("{id_prefix}.{launcher_s}.{target_label}");
                 reg.test("fork", "minimal_canary", test_id)
                     .timeout(timeout_secs + 10)
                     .build(move |cx| {
@@ -2244,10 +2217,6 @@ pub(crate) fn register_file_redirect_tests(reg: &mut Registry<'_>) {
             // For per-binary-type variants, generate a test per leg of
             // BinaryType::ALL. For shell-builtin variants, generate
             // exactly one test (the binary type is irrelevant).
-            //
-            // Backwards-compat: the legacy `FR.bg_exe.<agent>` ID
-            // aliases to PIE-glibc (the original `self_exe`-based
-            // behavior). Other legs get a `.<binary-type>` segment.
             let bts: &[Option<crate::BinaryType>] = if def.per_binary_type {
                 &[
                     Some(crate::BinaryType::PieGlibc),
@@ -2265,15 +2234,11 @@ pub(crate) fn register_file_redirect_tests(reg: &mut Registry<'_>) {
                 let check = def.check;
                 let name = def.name;
                 let test_id = match bt_opt {
-                    // Both the no-binary and PIE-glibc cases use the
-                    // legacy 3-segment ID for backwards-compat.
-                    None | Some(crate::BinaryType::PieGlibc) => {
-                        format!("FR.{name}.{agent}")
-                    }
+                    None => format!("FR.{name}.{agent}"),
                     Some(bt) => format!("FR.{name}.{}.{agent}", bt.label()),
                 };
                 let path_label = match bt_opt {
-                    None | Some(crate::BinaryType::PieGlibc) => name.to_string(),
+                    None => name.to_string(),
                     Some(bt) => format!("{name}-{}", bt.label()),
                 };
                 reg.test("shell", "file_redirect", test_id)
@@ -2330,11 +2295,7 @@ pub(crate) fn register_cli_startup_mimic_tests(reg: &mut Registry<'_>) {
             for &agent in AGENTS {
                 let agent_s = agent.to_string();
                 let bt_label = bt.label();
-                let test_id = if bt == crate::BinaryType::PieGlibc {
-                    format!("CSM.{delivery}.{agent}")
-                } else {
-                    format!("CSM.{delivery}.{bt_label}.{agent}")
-                };
+                let test_id = format!("CSM.{delivery}.{bt_label}.{agent}");
                 reg.test("fork", "cli_startup_mimic", test_id)
                     .timeout(60)
                     .build(move |cx| {
@@ -2427,13 +2388,11 @@ pub(crate) fn register_bg_redirect_poll_tests(reg: &mut Registry<'_>) {
             for &bt_opt in bts {
                 let agent_s = agent.to_string();
                 let test_id = match bt_opt {
-                    None | Some(crate::BinaryType::PieGlibc) => {
-                        format!("BR.{}.{agent}", def.name)
-                    }
+                    None => format!("BR.{}.{agent}", def.name),
                     Some(bt) => format!("BR.{}.{}.{agent}", def.name, bt.label()),
                 };
                 let path_label = match bt_opt {
-                    None | Some(crate::BinaryType::PieGlibc) => def.name.to_string(),
+                    None => def.name.to_string(),
                     Some(bt) => format!("{}-{}", def.name, bt.label()),
                 };
                 reg.test("shell", "bg_redirect_poll", test_id)
@@ -2532,9 +2491,7 @@ pub(crate) fn register_bg_redirect_stdin_poll_tests(reg: &mut Registry<'_>) {
                     for &bt_opt in bts {
                         let agent_s = agent.to_string();
                         let test_id = match bt_opt {
-                            None | Some(crate::BinaryType::PieGlibc) => {
-                                format!("BRS.{}.{shell_name}.{delivery}.{agent}", def.name)
-                            }
+                            None => format!("BRS.{}.{shell_name}.{delivery}.{agent}", def.name),
                             Some(bt) => format!(
                                 "BRS.{}.{shell_name}.{delivery}.{}.{agent}",
                                 def.name,
@@ -2542,7 +2499,7 @@ pub(crate) fn register_bg_redirect_stdin_poll_tests(reg: &mut Registry<'_>) {
                             ),
                         };
                         let path_label = match bt_opt {
-                            None | Some(crate::BinaryType::PieGlibc) => def.name.to_string(),
+                            None => def.name.to_string(),
                             Some(bt) => format!("{}-{}", def.name, bt.label()),
                         };
                         reg.test("shell", "bg_redirect_stdin_poll", test_id)
