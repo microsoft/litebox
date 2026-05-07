@@ -11,13 +11,13 @@ use super::registry::Registry;
 use super::run_context::RunContext;
 
 const PTY_AGENTS: &[AgentName] = &[
-    AgentName::A,
-    AgentName::AA,
-    AgentName::AAA,
-    AgentName::B,
+    AgentName::Dpg1,
+    AgentName::Dpg1Dpg1,
+    AgentName::Dpg1Dpg1Dpg1,
+    AgentName::Dpg2,
     // AB exercises the reverse child branch under A alongside AA/AAA: the PTY
     // registry lives in the child while routing returns through its parent.
-    AgentName::AB,
+    AgentName::Dpg1Dpg2,
 ];
 
 struct ScenarioDef {

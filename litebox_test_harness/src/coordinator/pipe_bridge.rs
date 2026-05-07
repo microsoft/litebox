@@ -21,7 +21,7 @@ use super::registry::Registry;
 
 /// Agents for pipe bridge tests.  Includes depths 1-2 and the
 /// non-PIE worker agent (NP) to test nested worker-exec.
-const PB_AGENTS: &[AgentName] = &[AgentName::A, AgentName::AA, AgentName::B];
+const PB_AGENTS: &[AgentName] = &[AgentName::Dpg1, AgentName::Dpg1Dpg1, AgentName::Dpg2];
 
 #[allow(clippy::too_many_lines)] // exhaustive registration / runner
 pub(crate) fn register_pipe_bridge(reg: &mut Registry<'_>) {
@@ -34,7 +34,7 @@ pub(crate) fn register_pipe_bridge(reg: &mut Registry<'_>) {
         timeout: u64,
     }
 
-    const XWORKER_AGENTS: &[AgentName] = &[AgentName::NP, AgentName::D4];
+    const XWORKER_AGENTS: &[AgentName] = &[AgentName::Dpg1Dng, AgentName::Dpg1Dpg1Dpg1Dng];
 
     let cases: &[PbCase] = &[
         PbCase {
@@ -145,16 +145,16 @@ pub(crate) fn register_pipe_bridge(reg: &mut Registry<'_>) {
     }
 
     for &(mode, subcmd, expected) in &[
-        ("sibling_dual.c2p.pie", "extra-pipe-c2p", "PB_C2P_OK"),
-        ("sibling_dual.p2c.pie", "extra-pipe-p2c", "PB_P2C_OK"),
-        ("sibling_dual.sp.pie", "extra-socketpair", "PB_SP_OK"),
+        ("sibling_dual.c2p", "extra-pipe-c2p", "PB_C2P_OK"),
+        ("sibling_dual.p2c", "extra-pipe-p2c", "PB_P2C_OK"),
+        ("sibling_dual.sp", "extra-socketpair", "PB_SP_OK"),
     ] {
         let id = format!("PB.{mode}");
         reg.test("xworker", "pipe_bridge", id)
             .timeout(90)
             .build(move |cx| {
-                let left = cx.require(AgentName::AA);
-                let right = cx.require(AgentName::AB);
+                let left = cx.require(AgentName::Dpg1Dpg1);
+                let right = cx.require(AgentName::Dpg1Dpg2);
                 Box::new(move |run| {
                     Box::pin(async move {
                         let self_exe = run.self_exe().to_string();
