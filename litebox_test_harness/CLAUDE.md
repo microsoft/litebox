@@ -49,6 +49,149 @@ containers. When investigating an integration-stack failure, build and
 run from the worktree, not the canonical checkout. See `AGENTS.md`
 "Per-session isolation" for details.
 
+## Multi-wave platform-fix workflow
+
+When the test harness is reporting tens or hundreds of failures (e.g., after a
+large product change, a refactor, or first standing up a new subsystem), use
+this workflow rather than fixing tests one at a time in series. It scales the
+single-failure fix-first workflow to bulk cleanup without sacrificing rigor.
+
+This is the methodology that drove the suite from 522/968 → 998/1002 = 99.6 %
+in one multi-session arc. It is not a substitute for the rules in
+"Investigating a failure" above — it composes them.
+
+### Mental model
+
+A typical large FAIL list is mostly **cascade**: one product bug surfaces as
+dozens or hundreds of distinct test failures because many tests share a code
+path. The job is to identify and fix **roots**, not to triage cascades
+individually. After a root is fixed, the cascade collapses and a new layer of
+roots becomes visible. Repeat until the delta is empty or stable.
+
+In the 522→998 arc, the single Bug B fix (shim worker-stdio routing) was
+downstream of 442/446 of the then-remaining failures. Treating those as 442
+independent bugs would have wasted the session. Treating them as one root with
+a shared symptom found and fixed it once.
+
+### The wave loop
+
+Each wave has four phases:
+
+1. **Triage.** Cluster the current FAIL list by likely shared root.
+   - Capture a fresh full-suite log (`wave-<N>.log`) — this is also the
+     regression gate from the previous wave.
+   - For each FAIL, capture syscall/errno signature with `litebox_audit_query`
+     (see "playbook" below). Group by `(dominant_syscall, dominant_errno,
+     subsystem)` — most cascades fall out naturally.
+   - Reduce each cluster to one or two **representative tests** that should
+     reproduce the root with minimal noise.
+   - Write the cluster table: cluster name, representative tests, hypothesized
+     root, suspect crate (use the ownership map below).
+
+2. **Fan-out.** Dispatch one fix subagent per cluster, in parallel.
+   - Each subagent gets its own git worktree on its own branch (see
+     `AGENTS.md` "Per-session isolation"). This prevents sessions from
+     invalidating each other's incremental builds or stepping on each other's
+     containers.
+   - Each subagent works narrowly: its assigned cluster's representative
+     tests only. **It must not run the full suite** — that's the parent's
+     gate, expensive, and not its job.
+   - Each subagent follows the fix-first workflow rigorously (rule 12 above):
+     reproduce the failing minimal test, fix product code, watch test pass,
+     verify no regressions in the cluster's representative tests.
+   - One fix per commit: `fix: <subsystem> — <one-line summary>`.
+
+3. **Merge.** Rebase or `--no-ff` merge each subagent's branch onto the
+   integration branch. **Never force-push** the integration branch — use the
+   pre-push hook in `.githooks/pre-push` if the repo provides one.
+   `--no-ff` preserves wave structure in history; force-push obliterates it
+   and breaks parallel sessions' working trees.
+
+4. **Re-discover.** Run the full suite again as the next wave's
+   `wave-<N+1>.log`. This serves three purposes simultaneously:
+   - Regression gate for the wave just merged.
+   - Cascade-collapse measurement: did fixing root R in cluster C
+     also pass tests in clusters D, E, F? Often yes — those clusters are
+     dropped from the next wave.
+   - New-root discovery: what becomes visible now that the previous layer is
+     fixed? Triage that as wave N+1.
+
+Stop when the delta from one wave to the next is empty or stable, or when
+remaining FAILs are documented as out-of-scope (e.g., "VS Code integration
+suite — disabled in commit X" or "performance regression, filed as
+follow-up").
+
+### Triage heuristics that work in practice
+
+- **Group by errno before grouping by test name.** `EAGAIN` on `read` from
+  pipes vs `ECONNREFUSED` on `connect` are different roots even if the test
+  IDs look related. Pull `result_err` distributions per cluster.
+- **Group by suspect subsystem second.** `litebox_runner_linux_userland`
+  fork/exec failures look very different from `litebox_broker/network`
+  TCP RST issues even if the test names rhyme.
+- **A "fix" that isn't gated by a failing minimal test is not a fix.** It's a
+  guess. Twice in the 522→998 arc, hypotheses about "the broker rewriting the
+  large ELF" and "the rwlock test stresses node" turned out to be wrong on
+  inspection — both were caught by the parent in review because no minimal
+  failing test had been produced.
+- **Don't trust test docstrings about cause.** A test's comment describing
+  what it's "supposed to" stress can be wrong (the test may have been written
+  before the relevant product code, or the bottleneck may have shifted). When
+  the audit log disagrees with the docstring, the audit log wins. (Worked
+  example below.)
+
+### Worked example: the ~16-test parallelism flake cluster
+
+After the wave loop reached 998/1002, the residual ~16 failures were
+**performance flakes under parallelism=8**, not correctness bugs. Tests like
+`CF.rwlock_multi_6.A` passed in isolation in ~38 s but exceeded the harness's
+20 s per-test exec deadline when 7 sibling containers saturated host CPU.
+
+Initial hypotheses (ELF rewriting, 9P bind-mount routing, open-write-lock
+contention) were all wrong. The actual cost, found via audit log:
+
+```sh
+litebox_audit_query sql --file <log> \
+  "SELECT syscall, COUNT(*), SUM(duration_ns)/1e6 AS ms FROM syscalls
+   GROUP BY syscall ORDER BY ms DESC LIMIT 10"
+```
+
+revealed `clone` taking 1.6 s × 6 calls = 9.6 s of fork-restore overhead per
+trial, vs. ~25 ms of actual child syscall work per fork. The test's own
+docstring (claiming it stressed the 9P open-write-lock path) was factually
+wrong — opens were 1 ms each.
+
+Lessons from this side-investigation:
+
+- Always confirm the bottleneck via audit-log measurement, even when the
+  test code claims to know.
+- "Investigation-only" with no fix is a valid wave outcome when the fix
+  surface is architectural (here: fork-restore in
+  `litebox_platform_linux_userland`) and out of scope. Document it,
+  don't paper over it.
+
+### Anti-patterns
+
+- **Fixing tests one at a time in series.** Doesn't scale, blocks parallelism,
+  and misses cascade structure.
+- **Running the full suite repeatedly during fix-time.** It's a gate, not an
+  iteration tool. Use single-test runs (see playbook) for inner loop.
+- **One subagent owning multiple unrelated clusters.** Defeats the parallelism;
+  if it gets stuck on one cluster, the others stall.
+- **Cross-cluster fixes in a single commit.** Hides the fix→test mapping.
+  One fix per commit, period.
+- **Force-pushing integration branches "to clean up history".** Other
+  sessions are based on those commits. Use `--no-ff` merges.
+
+### Pre-flight before starting a wave loop
+
+- [ ] Per-session worktree set up (see `AGENTS.md`).
+- [ ] Pre-push hook enabled if the repo provides one.
+- [ ] Baseline `wave-0.log` captured: full suite run on the target branch.
+- [ ] FAIL list extracted and bucketed by `(syscall, errno, subsystem)`.
+- [ ] Out-of-scope FAILs explicitly listed (e.g., disabled suites) so they
+      don't get re-triaged each wave.
+
 ## Test Categories
 
 **Self-contained tests** depend only on bash and the test harness binaries.
