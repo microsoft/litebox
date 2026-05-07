@@ -300,6 +300,163 @@ pub(crate) fn register_nonpie_pipe_chain_tests(reg: &mut Registry<'_>) {
 }
 
 // ═══════════════════════════════════════════════════════════════════
+// BPIPE: per-binary-type pipe chain integrity (extends NPIPE)
+//
+// NPIPE above covers the non-PIE-glibc leg as a singleton matrix.
+// BPIPE expands the same patterns (sequential and interleaved
+// fork+execs whose stdout flows through a pipe to the parent) to the
+// other four legs of `BinaryType` so the platform's pipe-chain
+// integrity is exercised across every binary mode the shim might
+// dispatch differently:
+//
+//   BPIPE.{pie-glibc,static-pie-glibc,
+//          static-pie-musl,non-pie-static-musl}
+//        .{seq,interleaved}
+//        .x{reps}
+//        .{A,AA}
+//
+// `interleaved` alternates the under-test leg with the always-PIE-glibc
+// `self_exe` so the test catches pollution between legs.
+// ═══════════════════════════════════════════════════════════════════
+
+#[allow(clippy::too_many_lines)] // exhaustive registration / runner
+pub(crate) fn register_bpipe_tests(reg: &mut Registry<'_>) {
+    // The four non-NonPieGlibc legs (NonPieGlibc is already covered
+    // by NPIPE above with the legacy IDs).
+    const LEGS: &[crate::BinaryType] = &[
+        crate::BinaryType::PieGlibc,
+        crate::BinaryType::StaticPieGlibc,
+        crate::BinaryType::StaticPieMusl,
+        crate::BinaryType::NonPieStaticMusl,
+    ];
+    for &bt in LEGS {
+        let leg_label = bt.label();
+        for &reps in NPIPE_REPS {
+            for &agent in DEPTH_AGENTS {
+                let agent_s = agent.to_string();
+                reg.test(
+                    "fork",
+                    "bpipe",
+                    format!("BPIPE.{leg_label}.seq.x{reps}.{agent}"),
+                )
+                .timeout(60)
+                .build(move |cx| {
+                    let handle = cx.require(agent);
+                    Box::new(move |run| {
+                        let a = agent_s.clone();
+                        let self_exe = run.self_exe().to_string();
+                        Box::pin(async move {
+                            let target = crate::binary_path(bt, &self_exe);
+                            let mut all_clean = true;
+                            let mut detail = String::new();
+                            for i in 0..reps {
+                                let tag = format!("seq_{leg_label}_{a}_{i}");
+                                let resp = run
+                                    .send(
+                                        &handle,
+                                        super::exec(vec![
+                                            target.clone(),
+                                            "write-known".into(),
+                                            tag.clone(),
+                                        ]),
+                                    )
+                                    .await;
+                                let expected = format!("PIPEDATA:{tag}");
+                                let ok = matches!(
+                                    &resp,
+                                    Response::ExecResult { exit_code: 0, stdout, .. }
+                                        if stdout.trim() == expected
+                                );
+                                if !ok {
+                                    all_clean = false;
+                                    detail =
+                                        format!("iter {i}: expected '{expected}', got {resp:?}");
+                                    break;
+                                }
+                            }
+                            if all_clean {
+                                detail = format!("{reps} sequential {leg_label} execs all clean");
+                            }
+                            super::TestOutcome::new(&a, all_clean, detail)
+                        })
+                    })
+                });
+
+                let agent_s2 = agent.to_string();
+                reg.test(
+                    "fork",
+                    "bpipe",
+                    format!("BPIPE.{leg_label}.interleaved.x{reps}.{agent}"),
+                )
+                .timeout(60)
+                .build(move |cx| {
+                    let handle = cx.require(agent);
+                    Box::new(move |run| {
+                        let a = agent_s2.clone();
+                        let self_exe = run.self_exe().to_string();
+                        Box::pin(async move {
+                            let target = crate::binary_path(bt, &self_exe);
+                            let mut all_clean = true;
+                            let mut detail = String::new();
+                            for i in 0..reps {
+                                let tag = format!("itr_{leg_label}_{a}_{i}");
+                                let resp = run
+                                    .send(
+                                        &handle,
+                                        super::exec(vec![
+                                            target.clone(),
+                                            "write-known".into(),
+                                            tag.clone(),
+                                        ]),
+                                    )
+                                    .await;
+                                let expected = format!("PIPEDATA:{tag}");
+                                let ok = matches!(
+                                    &resp,
+                                    Response::ExecResult { exit_code: 0, stdout, .. }
+                                        if stdout.trim() == expected
+                                );
+                                if !ok {
+                                    all_clean = false;
+                                    detail = format!(
+                                        "iter {i} {leg_label}: expected '{expected}', got {resp:?}"
+                                    );
+                                    break;
+                                }
+                                let resp = run
+                                    .send(
+                                        &handle,
+                                        super::exec(vec![self_exe.clone(), "echo-test".into()]),
+                                    )
+                                    .await;
+                                let ok = matches!(
+                                    &resp,
+                                    Response::ExecResult { exit_code: 0, stdout, .. }
+                                        if stdout.trim() == "ECHO_TEST_OK"
+                                );
+                                if !ok {
+                                    all_clean = false;
+                                    detail = format!(
+                                        "iter {i} pie-glibc: expected 'ECHO_TEST_OK', got {resp:?}"
+                                    );
+                                    break;
+                                }
+                            }
+                            if all_clean {
+                                detail = format!(
+                                    "{reps} interleaved {leg_label}+pie-glibc execs all clean"
+                                );
+                            }
+                            super::TestOutcome::new(&a, all_clean, detail)
+                        })
+                    })
+                });
+            }
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
 // XCONN: cross-worker TCP — first connection must succeed
 // ═══════════════════════════════════════════════════════════════════
 
