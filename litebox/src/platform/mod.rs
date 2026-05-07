@@ -806,7 +806,7 @@ impl TerminalAttributes {
 }
 
 /// Platform-agnostic terminal window size.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WindowSize {
     /// Number of rows (height in characters).
     pub rows: u16,
