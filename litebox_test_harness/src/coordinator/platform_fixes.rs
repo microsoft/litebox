@@ -820,144 +820,76 @@ pub(crate) fn register_bash_fork_exec_tests(reg: &mut Registry<'_>) {
 
 #[allow(clippy::too_many_lines)] // exhaustive registration / runner
 pub(crate) fn register_fork_from_worker_exec_tests(reg: &mut Registry<'_>) {
-    // FWE.nonpie_from_init: fork+exec nonpie from init worker (agent A)
-    reg.test(
-        "fork",
-        "fork_from_worker_exec",
-        "FWE.nonpie_from_init".to_string(),
-    )
-    .timeout(60)
-    .build(move |cx| {
-        let handle_a = cx.require(AgentName::A);
-        Box::new(move |run| {
-            let self_exe = run.self_exe().to_string();
-            Box::pin(async move {
-                let nonpie = crate::nonpie_binary();
-                let resp = run
-                    .send(
-                        &handle_a,
-                        super::exec_timeout(
-                            vec![
-                                self_exe,
-                                "fork-exec-nonpie".into(),
-                                nonpie,
-                                "echo-test".into(),
-                            ],
-                            20,
-                        ),
-                    )
-                    .await;
-                let pass = matches!(
-                    &resp,
-                    Response::ExecResult { exit_code: 0, stdout, .. }
-                        if stdout.contains("FORK_EXEC_NONPIE_OK")
-                );
-                super::TestOutcome::new("A", pass, format!("{resp:?}"))
-            })
-        })
-    });
-    // FWE.pie_from_init: fork+exec PIE from init worker (agent A)
-    reg.test(
-        "fork",
-        "fork_from_worker_exec",
-        "FWE.pie_from_init".to_string(),
-    )
-    .timeout(60)
-    .build(move |cx| {
-        let handle_a = cx.require(AgentName::A);
-        Box::new(move |run| {
-            let self_exe = run.self_exe().to_string();
-            Box::pin(async move {
-                let resp = run
-                    .send(
-                        &handle_a,
-                        super::exec_timeout(
-                            vec![
-                                self_exe.clone(),
-                                "fork-exec-pie".into(),
-                                self_exe,
-                                "echo-test".into(),
-                            ],
-                            20,
-                        ),
-                    )
-                    .await;
-                let pass = matches!(
-                    &resp,
-                    Response::ExecResult { exit_code: 0, stdout, .. }
-                        if stdout.contains("FORK_EXEC_PIE_OK")
-                );
-                super::TestOutcome::new("A", pass, format!("{resp:?}"))
-            })
-        })
-    });
-    // FWE.pie_from_worker_exec: fork+exec PIE from NP (worker-exec host)
-    reg.test(
-        "fork",
-        "fork_from_worker_exec",
-        "FWE.pie_from_worker_exec".to_string(),
-    )
-    .timeout(60)
-    .build(move |cx| {
-        let handle_np = cx.require(AgentName::NP);
-        Box::new(move |run| {
-            let self_exe = run.self_exe().to_string();
-            Box::pin(async move {
-                let nonpie = crate::nonpie_binary();
-                let resp = run
-                    .send(
-                        &handle_np,
-                        super::exec_timeout(
-                            vec![nonpie, "fork-exec-pie".into(), self_exe, "echo-test".into()],
-                            30,
-                        ),
-                    )
-                    .await;
-                let pass = matches!(
-                    &resp,
-                    Response::ExecResult { exit_code: 0, stdout, .. }
-                        if stdout.contains("FORK_EXEC_PIE_OK")
-                );
-                super::TestOutcome::new("NP", pass, format!("{resp:?}"))
-            })
-        })
-    });
-    // FWE.nonpie_from_worker_exec: fork+exec nonpie from NP
-    reg.test(
-        "fork",
-        "fork_from_worker_exec",
-        "FWE.nonpie_from_worker_exec".to_string(),
-    )
-    .timeout(60)
-    .build(move |cx| {
-        let handle_np = cx.require(AgentName::NP);
-        Box::new(move |run| {
-            let _self_exe = run.self_exe().to_string();
-            Box::pin(async move {
-                let nonpie = crate::nonpie_binary();
-                let resp = run
-                    .send(
-                        &handle_np,
-                        super::exec_timeout(
-                            vec![
-                                nonpie.clone(),
-                                "fork-exec-nonpie".into(),
-                                nonpie,
-                                "echo-test".into(),
-                            ],
-                            30,
-                        ),
-                    )
-                    .await;
-                let pass = matches!(
-                    &resp,
-                    Response::ExecResult { exit_code: 0, stdout, .. }
-                        if stdout.contains("FORK_EXEC_NONPIE_OK")
-                );
-                super::TestOutcome::new("NP", pass, format!("{resp:?}"))
-            })
-        })
-    });
+    // FWE matrix:
+    //   - launcher = init   (agent A, PIE) ─► fork+execv each BinaryType
+    //   - launcher = NP     (worker-exec host, non-PIE) ─► same
+    //
+    // Both arms use the `fork-exec-pie` subcommand (which is plain
+    // fork+execv with no PIE-specific logic; the historical name is
+    // kept for backwards compatibility). The binary executed is
+    // resolved per `BinaryType` via `binary_path()`.
+    //
+    // Backwards-compat: the original four test IDs (`FWE.pie_from_init`,
+    // `FWE.nonpie_from_init`, `FWE.pie_from_worker_exec`,
+    // `FWE.nonpie_from_worker_exec`) are preserved as aliases for the
+    // PIE-glibc and non-PIE-glibc legs of the new matrix.
+    for &bt in crate::BinaryType::ALL {
+        for (launcher_label, launcher_agent, sub_timeout) in [
+            ("from_init", AgentName::A, 20_u64),
+            ("from_worker_exec", AgentName::NP, 30_u64),
+        ] {
+            // Preserve the original test IDs for the two pre-existing
+            // legs (pie-glibc / nonpie-glibc) so any external CI filters
+            // continue to work.
+            let bt_label = match bt {
+                crate::BinaryType::PieGlibc => "pie",
+                crate::BinaryType::NonPieGlibc => "nonpie",
+                _ => bt.label(),
+            };
+            let test_id = format!("FWE.{bt_label}_{launcher_label}");
+            let outcome_label = format!("{launcher_agent}");
+            reg.test("fork", "fork_from_worker_exec", test_id.clone())
+                .timeout(60)
+                .build(move |cx| {
+                    let handle = cx.require(launcher_agent);
+                    Box::new(move |run| {
+                        let outcome_label = outcome_label.clone();
+                        let self_exe = run.self_exe().to_string();
+                        Box::pin(async move {
+                            let target = crate::binary_path(bt, &self_exe);
+                            // The launcher binary depends on which agent
+                            // we're running on: agent A is PIE, agent NP
+                            // is non-PIE.
+                            let launcher_bin = match launcher_agent {
+                                AgentName::A => self_exe.clone(),
+                                AgentName::NP => crate::nonpie_binary(),
+                                _ => unreachable!(),
+                            };
+                            let resp = run
+                                .send(
+                                    &handle,
+                                    super::exec_timeout(
+                                        vec![
+                                            launcher_bin,
+                                            "fork-exec-pie".into(),
+                                            target,
+                                            "echo-test".into(),
+                                        ],
+                                        sub_timeout,
+                                    ),
+                                )
+                                .await;
+                            let pass = matches!(
+                                &resp,
+                                Response::ExecResult { exit_code: 0, stdout, .. }
+                                    if stdout.contains("FORK_EXEC_PIE_OK")
+                            );
+                            super::TestOutcome::new(&outcome_label, pass, format!("{resp:?}"))
+                        })
+                    })
+                });
+        }
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════
