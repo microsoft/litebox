@@ -1382,10 +1382,7 @@ fn copy_heki_pages_from_vtl0(pa: u64, nranges: u64) -> Option<Vec<HekiPage>> {
         visited_pages.insert(cur_pa.as_u64());
 
         range = range.checked_add(heki_page.nranges)?;
-        if range < nranges
-            && (heki_page.next_pa == 0
-                || heki_page.next_pa == cur_pa.as_u64()
-                || visited_pages.contains(&heki_page.next_pa))
+        if range < nranges && (heki_page.next_pa == 0 || visited_pages.contains(&heki_page.next_pa))
         {
             return None;
         }
