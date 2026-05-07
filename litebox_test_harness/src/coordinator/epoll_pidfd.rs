@@ -10,8 +10,12 @@ use super::registry::Registry;
 use super::run_context::RunContext;
 use super::{TestOutcome, expect_listening_port, ok_without_data};
 
-pub(crate) const EPI_AGENTS: &[AgentName] =
-    &[AgentName::A, AgentName::AA, AgentName::B, AgentName::BB];
+pub(crate) const EPI_AGENTS: &[AgentName] = &[
+    AgentName::Dpg1,
+    AgentName::Dpg1Dpg1,
+    AgentName::Dpg2,
+    AgentName::Dpg2Dpg,
+];
 
 #[derive(Copy, Clone)]
 enum ScenarioKind {
@@ -61,7 +65,7 @@ const EPI_SCENARIOS: &[ScenarioDef] = &[
 pub(crate) fn register_epoll_pidfd_tests(reg: &mut Registry<'_>) {
     for &agent in EPI_AGENTS {
         for def in EPI_SCENARIOS {
-            if def.in_process_only && agent != AgentName::A {
+            if def.in_process_only && agent != AgentName::Dpg1 {
                 continue;
             }
             // Only the PidfdExit scenario exec's a binary (it spawns a
@@ -133,10 +137,10 @@ pub(crate) fn register_epoll_pidfd_tests(reg: &mut Registry<'_>) {
 }
 
 fn peer_for(agent: AgentName) -> AgentName {
-    if matches!(agent, AgentName::A | AgentName::AA) {
-        AgentName::B
+    if matches!(agent, AgentName::Dpg1 | AgentName::Dpg1Dpg1) {
+        AgentName::Dpg2
     } else {
-        AgentName::A
+        AgentName::Dpg1
     }
 }
 

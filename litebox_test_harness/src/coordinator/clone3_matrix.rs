@@ -8,7 +8,12 @@ use crate::protocol::{Clone3Kind, Command, Response};
 use super::agents::AgentName;
 use super::registry::Registry;
 
-const CL3_AGENTS: &[AgentName] = &[AgentName::A, AgentName::AA, AgentName::B, AgentName::BB];
+const CL3_AGENTS: &[AgentName] = &[
+    AgentName::Dpg1,
+    AgentName::Dpg1Dpg1,
+    AgentName::Dpg2,
+    AgentName::Dpg2Dpg,
+];
 
 struct Clone3Def {
     name: &'static str,
