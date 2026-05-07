@@ -15,6 +15,7 @@ pub(crate) mod port_router;
 pub(crate) mod registry;
 pub(crate) mod run_context;
 pub(crate) mod special_cases;
+pub(crate) mod tcp_state;
 pub(crate) mod tcp_stress;
 
 use crate::protocol::{Command, Response};
@@ -40,6 +41,46 @@ impl TestOutcome {
             detail: detail.into(),
         }
     }
+}
+
+pub(crate) fn expect_listening_port(resp: &Response, requested_port: u16) -> Result<u16, String> {
+    match resp {
+        Response::Listening { port } if requested_port == 0 && *port != 0 => Ok(*port),
+        Response::Listening { port } if *port == requested_port => Ok(*port),
+        Response::Listening { port } => Err(format!(
+            "listening port mismatch: requested {requested_port}, got {port}"
+        )),
+        other => Err(format!("expected Listening, got {other:?}")),
+    }
+}
+
+pub(crate) fn expect_unix_listening_path(
+    resp: &Response,
+    requested_path: &str,
+) -> Result<(), String> {
+    match resp {
+        Response::UnixListening { path } if path == requested_path => Ok(()),
+        Response::UnixListening { path } => Err(format!(
+            "unix listening path mismatch: requested {requested_path:?}, got {path:?}"
+        )),
+        other => Err(format!("expected UnixListening, got {other:?}")),
+    }
+}
+
+pub(crate) fn ok_without_data(resp: &Response) -> bool {
+    matches!(resp, Response::Ok { data: None })
+}
+
+pub(crate) fn ok_data_contains(resp: &Response, needle: &str) -> bool {
+    matches!(resp, Response::Ok { data: Some(data) } if data.contains(needle))
+}
+
+pub(crate) fn ok_spawned_response(resp: &Response) -> bool {
+    matches!(
+        resp,
+        Response::Ok { data: Some(data) }
+            if data.contains("forked") || data.contains("children spawned")
+    )
 }
 
 /// A registered test: metadata + deferred execution closure.
@@ -765,7 +806,7 @@ pub fn collect_all_tests() -> Vec<Test> {
     platform_fixes::register_file_redirect_tests(&mut registry::Registry::new(&mut tests));
     platform_fixes::register_pipe_nonblock_tests(&mut registry::Registry::new(&mut tests));
     platform_fixes::register_epoll_socket_tests(&mut registry::Registry::new(&mut tests));
-    platform_fixes::register_loopback_tcp_tests(&mut registry::Registry::new(&mut tests));
+    tcp_state::register_tcp_state_tests(&mut registry::Registry::new(&mut tests));
     platform_fixes::register_tcp_halfclose_tests(&mut registry::Registry::new(&mut tests));
     platform_fixes::register_fork_listen_close_tests(&mut registry::Registry::new(&mut tests));
     platform_fixes::register_proc_filesystem_tests(&mut registry::Registry::new(&mut tests));
@@ -1044,6 +1085,22 @@ pub(crate) async fn send_cmd(child: &mut Child, cmd: &Command) -> Response {
             match c {
                 Command::Forward { inner, .. } => c = inner,
                 Command::Exec {
+                    timeout_secs: Some(t),
+                    ..
+                }
+                | Command::ExecReady {
+                    timeout_secs: Some(t),
+                    ..
+                }
+                | Command::WaitReady {
+                    timeout_secs: Some(t),
+                    ..
+                }
+                | Command::WaitBackground {
+                    timeout_secs: Some(t),
+                    ..
+                }
+                | Command::WaitFor {
                     timeout_secs: Some(t),
                     ..
                 } => break Some(*t),

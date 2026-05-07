@@ -5,10 +5,13 @@
 //! writes responses to stdout. Intermediate nodes forward commands to
 //! their children.
 
-use crate::protocol::{Command, Response};
+use crate::protocol::{Command, Response, WaitPredicate};
 use std::collections::HashMap;
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
-use tokio::net::TcpListener;
+use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::net::{TcpListener, TcpStream};
 use tokio::time::Duration;
 
 struct ChildHandle {
@@ -18,39 +21,63 @@ struct ChildHandle {
     process: tokio::process::Child,
 }
 
-fn net_halfclose_echo_blocking(addr: &str, write_data: &str, half: &str) -> Result<String, String> {
-    use std::io::{Read, Write};
-    use std::net::Shutdown;
-    use std::time::Duration as StdDuration;
-
-    let mut stream = std::net::TcpStream::connect(addr).map_err(|e| format!("connect: {e}"))?;
-    stream
-        .set_read_timeout(Some(StdDuration::from_secs(5)))
-        .map_err(|e| format!("set read timeout: {e}"))?;
-    stream
-        .set_write_timeout(Some(StdDuration::from_secs(5)))
-        .map_err(|e| format!("set write timeout: {e}"))?;
-    stream
-        .write_all(write_data.as_bytes())
-        .map_err(|e| format!("write: {e}"))?;
-    stream.flush().map_err(|e| format!("flush: {e}"))?;
-
-    let shutdown = match half {
-        "wr" => Shutdown::Write,
-        "rd" => Shutdown::Read,
-        "rdwr" => Shutdown::Both,
-        other => return Err(format!("invalid half {other:?}; expected wr, rd, or rdwr")),
-    };
-    stream
-        .shutdown(shutdown)
-        .map_err(|e| format!("shutdown({half}): {e}"))?;
-
-    let mut received = Vec::new();
-    stream
-        .read_to_end(&mut received)
-        .map_err(|e| format!("read_to_eof: {e}"))?;
-    Ok(String::from_utf8_lossy(&received).to_string())
+struct ListenerEntry {
+    fd: OwnedFd,
+    task: tokio::task::JoinHandle<()>,
 }
+
+struct BackgroundProcess {
+    process: tokio::process::Child,
+    stdout: Arc<Mutex<Vec<u8>>>,
+    stderr: Arc<Mutex<Vec<u8>>>,
+    drains: Vec<tokio::task::JoinHandle<()>>,
+}
+
+fn marker_stream_matches(configured: &str, actual: &str) -> bool {
+    matches!(configured, "either") || configured == actual
+}
+
+fn spawn_output_capture<R>(
+    reader: R,
+    actual_stream: &'static str,
+    marker_stream: String,
+    ready_marker: String,
+    ready_seen: Arc<AtomicBool>,
+    buffer: Arc<Mutex<Vec<u8>>>,
+) -> tokio::task::JoinHandle<()>
+where
+    R: AsyncRead + Unpin + Send + 'static,
+{
+    tokio::spawn(async move {
+        let mut reader = BufReader::new(reader);
+        let mut line = Vec::new();
+        loop {
+            line.clear();
+            match reader.read_until(b'\n', &mut line).await {
+                Ok(0) => break,
+                Ok(_) => {
+                    buffer
+                        .lock()
+                        .expect("output buffer mutex")
+                        .extend_from_slice(&line);
+                    if marker_stream_matches(&marker_stream, actual_stream) {
+                        let text = String::from_utf8_lossy(&line);
+                        if text.contains(&ready_marker) {
+                            ready_seen.store(true, Ordering::SeqCst);
+                        }
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    })
+}
+
+const INHERITED_LISTEN_FDS_ENV: &str = "LITEBOX_TEST_HARNESS_INHERITED_LISTEN_FDS";
+const INHERITED_LISTEN_FD_BASE: i32 = 80;
+const INHERITED_LISTEN_FD_LIMIT: i32 = 99;
+
+type TcpConn = Arc<tokio::sync::Mutex<TcpStream>>;
 
 /// Run the agent. Reads commands from stdin, executes, responds on stdout.
 pub fn run(self_exe: &str) {
@@ -66,9 +93,17 @@ async fn agent_loop(self_exe: &str) {
     let stdin = tokio::io::stdin();
     let mut reader = BufReader::new(stdin);
     let mut children: HashMap<String, ChildHandle> = HashMap::new();
-    let mut listeners: HashMap<u16, tokio::task::JoinHandle<()>> = HashMap::new();
+    let mut listeners = match import_inherited_listeners() {
+        Ok(listeners) => listeners,
+        Err(error) => {
+            eprintln!("[agent] failed to import inherited listen fds: {error}");
+            HashMap::new()
+        }
+    };
     let mut unix_listeners: HashMap<String, tokio::task::JoinHandle<()>> = HashMap::new();
-    let mut background_pids: Vec<tokio::process::Child> = Vec::new();
+    let mut connections: HashMap<u64, TcpConn> = HashMap::new();
+    let mut next_conn_id = 1u64;
+    let mut background_pids: HashMap<u32, BackgroundProcess> = HashMap::new();
 
     let mut line = String::new();
     loop {
@@ -158,10 +193,19 @@ async fn agent_loop(self_exe: &str) {
                     _ => self_exe.to_string(), // "self" or default
                 };
 
-                // inherit_listen_ports is tracked for future use.
-                let _ = &inherit_listen_ports;
+                let inherited = match prepare_inherited_listeners(&listeners, &inherit_listen_ports)
+                {
+                    Ok(inherited) => inherited,
+                    Err(error) => {
+                        respond(&Response::Error {
+                            error: format!("fork {name}: {error}"),
+                        })
+                        .await;
+                        continue;
+                    }
+                };
 
-                match spawn_child(&exe, &name) {
+                match spawn_child_with_inherited(&exe, &name, &inherited) {
                     Ok(handle) => {
                         children.insert(name.clone(), handle);
                         respond(&Response::Ok {
@@ -179,62 +223,54 @@ async fn agent_loop(self_exe: &str) {
             }
 
             Command::NetAccept { port, timeout_secs } => {
-                // Accept one connection on an already-listening port.
-                // The echo handler is already running from NetListen —
-                // we just wait for one connection to arrive and report.
-                //
-                // Since the echo handler auto-accepts, NetAccept is
-                // currently equivalent to "verify the listener is working"
-                // by connecting to it locally.
-                let timeout = Duration::from_secs(timeout_secs);
-                match tokio::time::timeout(
-                    timeout,
-                    tokio::net::TcpStream::connect(format!("127.0.0.1:{port}")),
-                )
-                .await
-                {
-                    Ok(Ok(mut stream)) => {
-                        let probe = b"__accept_probe__";
-                        let _ = stream.write_all(probe).await;
-                        let _ = stream.flush().await;
-                        let mut buf = [0u8; 64];
-                        match tokio::time::timeout(Duration::from_secs(5), stream.read(&mut buf))
-                            .await
-                        {
-                            Ok(Ok(n)) if n > 0 => {
-                                respond(&Response::Connected {
-                                    echo: String::from_utf8_lossy(&buf[..n]).to_string(),
-                                })
-                                .await;
-                            }
-                            _ => {
-                                respond(&Response::ConnectFailed {
-                                    error: "accept probe: no echo".to_string(),
-                                })
-                                .await;
+                // Start a one-shot accept+echo worker for this agent's
+                // registered listener. Inherited listeners are imported into
+                // the same registry at startup, so the protocol round-trip is
+                // the readiness barrier for a later connector.
+                let Some(entry) = listeners.remove(&port) else {
+                    respond(&Response::ConnectFailed {
+                        error: format!("no listener registered for port {port}"),
+                    })
+                    .await;
+                    continue;
+                };
+                entry.task.abort();
+                let _ = entry.task.await;
+                // SAFETY: removing the registry entry gives this one-shot
+                // accept worker sole ownership of the listener duplicate.
+                let listener =
+                    unsafe { std::net::TcpListener::from_raw_fd(entry.fd.into_raw_fd()) };
+                let _ = listener.set_nonblocking(false);
+                let timeout = std::time::Duration::from_secs(timeout_secs);
+                std::thread::spawn(move || {
+                    if let Ok((mut stream, _)) = listener.accept() {
+                        let _ = stream.set_read_timeout(Some(timeout));
+                        let _ = stream.set_write_timeout(Some(timeout));
+                        let mut buf = [0u8; 4096];
+                        loop {
+                            match std::io::Read::read(&mut stream, &mut buf) {
+                                Ok(0) | Err(_) => break,
+                                Ok(n) => {
+                                    if std::io::Write::write_all(&mut stream, &buf[..n]).is_err() {
+                                        break;
+                                    }
+                                }
                             }
                         }
                     }
-                    Ok(Err(e)) => {
-                        respond(&Response::ConnectFailed {
-                            error: format!("accept probe connect: {e}"),
-                        })
-                        .await;
-                    }
-                    Err(_) => {
-                        respond(&Response::ConnectFailed {
-                            error: "accept probe timeout".to_string(),
-                        })
-                        .await;
-                    }
-                }
+                });
+                respond(&Response::Ok {
+                    data: Some(format!("accepting on port {port}")),
+                })
+                .await;
             }
 
             Command::NetCloseListener { port } => {
-                // Close the listen socket but leave the echo handler task.
-                // This reproduces the parent-close-after-fork pattern.
-                if let Some(task) = listeners.remove(&port) {
-                    task.abort();
+                // Close this agent's listen socket and stop its echo handler.
+                // Inherited child listeners remain alive in their own agents.
+                if let Some(entry) = listeners.remove(&port) {
+                    entry.task.abort();
+                    let _ = entry.task.await;
                 }
                 respond(&Response::Ok {
                     data: Some(format!("listener on port {port} closed")),
@@ -328,43 +364,23 @@ async fn agent_loop(self_exe: &str) {
                 }
             },
 
-            Command::NetListen { port } => {
-                match TcpListener::bind(format!("0.0.0.0:{port}")).await {
-                    Ok(listener) => {
-                        let actual_port = listener.local_addr().map(|a| a.port()).unwrap_or(port);
-                        // Spawn echo server task.
-                        let task = tokio::spawn(async move {
-                            while let Ok((mut stream, _)) = listener.accept().await {
-                                tokio::spawn(async move {
-                                    let mut buf = [0u8; 4096];
-                                    loop {
-                                        match stream.read(&mut buf).await {
-                                            Ok(0) | Err(_) => break,
-                                            Ok(n) => {
-                                                if stream.write_all(&buf[..n]).await.is_err() {
-                                                    break;
-                                                }
-                                            }
-                                        }
-                                    }
-                                });
-                            }
-                        });
-                        listeners.insert(actual_port, task);
-                        respond(&Response::Listening { port: actual_port }).await;
-                    }
-                    Err(e) => {
-                        respond(&Response::Error {
-                            error: format!("bind {port}: {e}"),
-                        })
-                        .await;
-                    }
+            Command::NetListen { port } => match create_listener_entry(port) {
+                Ok((actual_port, entry)) => {
+                    listeners.insert(actual_port, entry);
+                    respond(&Response::Listening { port: actual_port }).await;
                 }
-            }
+                Err(e) => {
+                    respond(&Response::Error {
+                        error: format!("bind {port}: {e}"),
+                    })
+                    .await;
+                }
+            },
 
             Command::NetUnlisten { port } => {
-                if let Some(task) = listeners.remove(&port) {
-                    task.abort();
+                if let Some(entry) = listeners.remove(&port) {
+                    entry.task.abort();
+                    let _ = entry.task.await;
                 }
                 respond(&Response::Ok { data: None }).await;
             }
@@ -410,33 +426,159 @@ async fn agent_loop(self_exe: &str) {
                 }
             }
 
-            Command::NetHalfCloseEcho {
-                addr,
-                write_data,
-                half,
-            } => {
-                let result = tokio::time::timeout(
-                    Duration::from_secs(10),
-                    tokio::task::spawn_blocking(move || {
-                        net_halfclose_echo_blocking(&addr, &write_data, &half)
-                    }),
-                )
-                .await;
-                match result {
-                    Ok(Ok(Ok(echo))) => respond(&Response::HalfClosed { echo }).await,
-                    Ok(Ok(Err(error))) => respond(&Response::HalfCloseFailed { error }).await,
+            Command::NetOpen { addr } => {
+                if next_conn_id == u64::MAX {
+                    respond(&Response::Error {
+                        error: "connection id space exhausted".to_string(),
+                    })
+                    .await;
+                    continue;
+                }
+                match tokio::time::timeout(Duration::from_secs(5), TcpStream::connect(&addr)).await
+                {
+                    Ok(Ok(stream)) => {
+                        let conn = next_conn_id;
+                        next_conn_id += 1;
+                        connections.insert(conn, Arc::new(tokio::sync::Mutex::new(stream)));
+                        respond(&Response::Opened { conn }).await;
+                    }
                     Ok(Err(e)) => {
-                        respond(&Response::HalfCloseFailed {
-                            error: format!("halfclose task join: {e}"),
+                        respond(&Response::ConnectFailed {
+                            error: format!("connect {addr}: {e}"),
                         })
                         .await;
                     }
                     Err(_) => {
-                        respond(&Response::HalfCloseFailed {
-                            error: "halfclose timeout".to_string(),
+                        respond(&Response::ConnectFailed {
+                            error: format!("connect {addr}: timeout"),
                         })
                         .await;
                     }
+                }
+            }
+
+            Command::NetSend { conn, data } => {
+                let Some(stream) = connections.get(&conn).cloned() else {
+                    respond(&Response::Error {
+                        error: format!("unknown conn {conn}"),
+                    })
+                    .await;
+                    continue;
+                };
+                let result = tokio::time::timeout(Duration::from_secs(5), async {
+                    let mut stream = stream.lock().await;
+                    stream
+                        .write_all(data.as_bytes())
+                        .await
+                        .map_err(|e| format!("write conn {conn}: {e}"))?;
+                    stream
+                        .flush()
+                        .await
+                        .map_err(|e| format!("flush conn {conn}: {e}"))
+                })
+                .await;
+                match result {
+                    Ok(Ok(())) => respond(&Response::Sent).await,
+                    Ok(Err(error)) => respond(&Response::Error { error }).await,
+                    Err(_) => {
+                        respond(&Response::Error {
+                            error: format!("send conn {conn}: timeout"),
+                        })
+                        .await;
+                    }
+                }
+            }
+
+            Command::NetRecv { conn, n_bytes } => {
+                let Some(stream) = connections.get(&conn).cloned() else {
+                    respond(&Response::Error {
+                        error: format!("unknown conn {conn}"),
+                    })
+                    .await;
+                    continue;
+                };
+                let result = tokio::time::timeout(Duration::from_secs(10), async {
+                    let mut stream = stream.lock().await;
+                    let mut received = Vec::new();
+                    match n_bytes {
+                        Some(n) => {
+                            received.resize(n as usize, 0);
+                            stream
+                                .read_exact(&mut received)
+                                .await
+                                .map_err(|e| format!("read_exact conn {conn}: {e}"))?;
+                        }
+                        None => {
+                            stream
+                                .read_to_end(&mut received)
+                                .await
+                                .map_err(|e| format!("read_to_eof conn {conn}: {e}"))?;
+                        }
+                    }
+                    Ok::<_, String>(String::from_utf8_lossy(&received).to_string())
+                })
+                .await;
+                match result {
+                    Ok(Ok(data)) => respond(&Response::Received { data }).await,
+                    Ok(Err(error)) => respond(&Response::Error { error }).await,
+                    Err(_) => {
+                        respond(&Response::Error {
+                            error: format!("recv conn {conn}: timeout"),
+                        })
+                        .await;
+                    }
+                }
+            }
+
+            Command::NetShutdown { conn, half } => {
+                let Some(stream) = connections.get(&conn).cloned() else {
+                    respond(&Response::Error {
+                        error: format!("unknown conn {conn}"),
+                    })
+                    .await;
+                    continue;
+                };
+                let how = match half.as_str() {
+                    "wr" => libc::SHUT_WR,
+                    "rd" => libc::SHUT_RD,
+                    "rdwr" => libc::SHUT_RDWR,
+                    _ => {
+                        respond(&Response::Error {
+                            error: format!("invalid half {half:?}; expected wr, rd, or rdwr"),
+                        })
+                        .await;
+                        continue;
+                    }
+                };
+                let shutdown_result = {
+                    let stream = stream.lock().await;
+                    use std::os::fd::AsRawFd;
+                    // SAFETY: the fd comes from a live TcpStream held by the registry,
+                    // and libc::shutdown does not take ownership of it.
+                    let rc = unsafe { libc::shutdown(stream.as_raw_fd(), how) };
+                    if rc == 0 {
+                        Ok(())
+                    } else {
+                        Err(format!(
+                            "shutdown conn {conn}: {}",
+                            std::io::Error::last_os_error()
+                        ))
+                    }
+                };
+                match shutdown_result {
+                    Ok(()) => respond(&Response::ShutdownOk).await,
+                    Err(error) => respond(&Response::Error { error }).await,
+                }
+            }
+
+            Command::NetClose { conn } => {
+                if connections.remove(&conn).is_some() {
+                    respond(&Response::Closed).await;
+                } else {
+                    respond(&Response::Error {
+                        error: format!("unknown conn {conn}"),
+                    })
+                    .await;
                 }
             }
 
@@ -489,7 +631,15 @@ async fn agent_loop(self_exe: &str) {
                                 // drop closes the pipe
                             }
                             let pid = child.id().unwrap_or(0);
-                            background_pids.push(child);
+                            background_pids.insert(
+                                pid,
+                                BackgroundProcess {
+                                    process: child,
+                                    stdout: Arc::new(Mutex::new(Vec::new())),
+                                    stderr: Arc::new(Mutex::new(Vec::new())),
+                                    drains: Vec::new(),
+                                },
+                            );
                             respond(&Response::Background { pid }).await;
                         }
                         Err(e) => {
@@ -569,6 +719,267 @@ async fn agent_loop(self_exe: &str) {
                             .await;
                         }
                     }
+                }
+            }
+
+            Command::ExecReady {
+                args,
+                ready_marker,
+                timeout_secs,
+                stdin: stdin_content,
+                stream,
+            } => {
+                if args.is_empty() {
+                    respond(&Response::Error {
+                        error: "exec_ready requires args".to_string(),
+                    })
+                    .await;
+                    continue;
+                }
+                if !matches!(stream.as_str(), "stdout" | "stderr" | "either") {
+                    respond(&Response::Error {
+                        error: format!(
+                            "invalid marker stream {stream:?}; expected stdout, stderr, or either"
+                        ),
+                    })
+                    .await;
+                    continue;
+                }
+
+                let mut cmd = tokio::process::Command::new(&args[0]);
+                cmd.args(&args[1..]);
+                if stdin_content.is_some() {
+                    cmd.stdin(std::process::Stdio::piped());
+                } else {
+                    cmd.stdin(std::process::Stdio::null());
+                }
+                cmd.stdout(std::process::Stdio::piped());
+                cmd.stderr(std::process::Stdio::piped());
+
+                let mut child = match cmd.spawn() {
+                    Ok(c) => c,
+                    Err(e) => {
+                        respond(&Response::Error {
+                            error: format!("exec_ready spawn: {e}"),
+                        })
+                        .await;
+                        continue;
+                    }
+                };
+
+                if let Some(content) = stdin_content
+                    && let Some(mut child_stdin) = child.stdin.take()
+                {
+                    let _ = child_stdin.write_all(content.as_bytes()).await;
+                    let _ = child_stdin.flush().await;
+                    drop(child_stdin);
+                }
+
+                let Some(stdout) = child.stdout.take() else {
+                    respond(&Response::Error {
+                        error: "exec_ready: stdout pipe missing".to_string(),
+                    })
+                    .await;
+                    continue;
+                };
+                let Some(stderr) = child.stderr.take() else {
+                    respond(&Response::Error {
+                        error: "exec_ready: stderr pipe missing".to_string(),
+                    })
+                    .await;
+                    continue;
+                };
+
+                let stdout_buf = Arc::new(Mutex::new(Vec::new()));
+                let stderr_buf = Arc::new(Mutex::new(Vec::new()));
+                let ready_seen = Arc::new(AtomicBool::new(false));
+                let stdout_task = spawn_output_capture(
+                    stdout,
+                    "stdout",
+                    stream.clone(),
+                    ready_marker.clone(),
+                    Arc::clone(&ready_seen),
+                    Arc::clone(&stdout_buf),
+                );
+                let stderr_task = spawn_output_capture(
+                    stderr,
+                    "stderr",
+                    stream,
+                    ready_marker,
+                    Arc::clone(&ready_seen),
+                    Arc::clone(&stderr_buf),
+                );
+
+                let timeout = Duration::from_secs(timeout_secs.unwrap_or(30));
+                let ready = tokio::time::timeout(timeout, async {
+                    loop {
+                        if ready_seen.load(Ordering::SeqCst) {
+                            break Ok(());
+                        }
+                        match child.try_wait() {
+                            Ok(Some(status)) => {
+                                if ready_seen.load(Ordering::SeqCst) {
+                                    break Ok(());
+                                }
+                                break Err(format!(
+                                    "process exited before ready_marker (status={status})"
+                                ));
+                            }
+                            Ok(None) => {}
+                            Err(e) => break Err(format!("exec_ready poll: {e}")),
+                        }
+                        tokio::time::sleep(Duration::from_millis(25)).await;
+                    }
+                })
+                .await;
+
+                match ready {
+                    Ok(Ok(())) => {
+                        let pid = child.id().unwrap_or(0);
+                        background_pids.insert(
+                            pid,
+                            BackgroundProcess {
+                                process: child,
+                                stdout: stdout_buf,
+                                stderr: stderr_buf,
+                                drains: vec![stdout_task, stderr_task],
+                            },
+                        );
+                        respond(&Response::BackgroundReady { pid }).await;
+                    }
+                    Ok(Err(error)) => {
+                        let _ = child.start_kill();
+                        stdout_task.abort();
+                        stderr_task.abort();
+                        respond(&Response::Error { error }).await;
+                    }
+                    Err(_) => {
+                        let _ = child.start_kill();
+                        stdout_task.abort();
+                        stderr_task.abort();
+                        respond(&Response::Error {
+                            error: format!(
+                                "ready_marker not observed within {}s",
+                                timeout.as_secs()
+                            ),
+                        })
+                        .await;
+                    }
+                }
+            }
+
+            Command::WaitReady {
+                agent,
+                timeout_secs,
+            } => {
+                if agent.is_empty() || agent == "self" {
+                    respond(&Response::Ready).await;
+                } else if let Some(child) = children.get_mut(&agent) {
+                    let timeout = Duration::from_secs(timeout_secs.unwrap_or(30));
+                    let ready_cmd = Command::WaitReady {
+                        agent: "self".to_string(),
+                        timeout_secs,
+                    };
+                    let wait = send_to_child(child, &ready_cmd);
+                    match tokio::time::timeout(timeout, wait).await {
+                        Ok(Response::Ready) => respond(&Response::Ready).await,
+                        Ok(resp) => respond(&resp).await,
+                        Err(_) => {
+                            respond(&Response::Error {
+                                error: format!(
+                                    "agent {agent} not ready within {}s",
+                                    timeout.as_secs()
+                                ),
+                            })
+                            .await;
+                        }
+                    }
+                } else {
+                    respond(&Response::Error {
+                        error: format!("unknown child: {agent}"),
+                    })
+                    .await;
+                }
+            }
+
+            Command::WaitBackground { pid, timeout_secs } => {
+                let Some(mut bg) = background_pids.remove(&pid) else {
+                    respond(&Response::Error {
+                        error: format!("unknown background pid: {pid}"),
+                    })
+                    .await;
+                    continue;
+                };
+                let timeout = Duration::from_secs(timeout_secs.unwrap_or(30));
+                match tokio::time::timeout(timeout, bg.process.wait()).await {
+                    Ok(Ok(status)) => {
+                        for drain in bg.drains {
+                            let _ = drain.await;
+                        }
+                        let stdout = bg.stdout.lock().expect("stdout buffer mutex").clone();
+                        let stderr = bg.stderr.lock().expect("stderr buffer mutex").clone();
+                        respond(&Response::ExecResult {
+                            exit_code: status.code().unwrap_or(-1),
+                            stdout: String::from_utf8_lossy(&stdout).to_string(),
+                            stderr: String::from_utf8_lossy(&stderr).to_string(),
+                        })
+                        .await;
+                    }
+                    Ok(Err(e)) => {
+                        respond(&Response::Error {
+                            error: format!("wait_background: {e}"),
+                        })
+                        .await;
+                    }
+                    Err(_) => {
+                        let _ = bg.process.start_kill();
+                        for drain in bg.drains {
+                            drain.abort();
+                        }
+                        respond(&Response::ExecTimeout {
+                            stderr: format!(
+                                "background process timed out after {}s",
+                                timeout.as_secs()
+                            ),
+                        })
+                        .await;
+                    }
+                }
+            }
+
+            Command::WaitFor {
+                predicate,
+                timeout_secs,
+            } => {
+                let timeout = Duration::from_secs(timeout_secs.unwrap_or(30));
+                let deadline = tokio::time::Instant::now() + timeout;
+                loop {
+                    let satisfied = match &predicate {
+                        WaitPredicate::PortListening { port, host } => tokio::time::timeout(
+                            Duration::from_millis(200),
+                            tokio::net::TcpStream::connect(format!("{host}:{port}")),
+                        )
+                        .await
+                        .is_ok_and(|r| r.is_ok()),
+                        WaitPredicate::FileExists { path } => {
+                            tokio::fs::metadata(path).await.is_ok()
+                        }
+                    };
+                    if satisfied {
+                        respond(&Response::Ready).await;
+                        break;
+                    }
+                    if tokio::time::Instant::now() >= deadline {
+                        respond(&Response::Error {
+                            error: format!(
+                                "wait_for {predicate:?} not satisfied within {}s",
+                                timeout.as_secs()
+                            ),
+                        })
+                        .await;
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(25)).await;
                 }
             }
 
@@ -789,18 +1200,12 @@ async fn agent_loop(self_exe: &str) {
             }
 
             Command::Kill { pid } => {
-                // Try to kill by pid. Also clean up our background_pids list.
-                let mut killed = false;
-                background_pids.retain_mut(|child| {
-                    if child.id() == Some(pid) {
-                        let _ = child.start_kill();
-                        killed = true;
-                        false // remove from list
-                    } else {
-                        true
+                if let Some(mut child) = background_pids.remove(&pid) {
+                    let _ = child.process.start_kill();
+                    for drain in child.drains {
+                        drain.abort();
                     }
-                });
-                if !killed {
+                } else {
                     // Try OS-level kill as fallback.
                     unsafe {
                         libc::kill(pid as i32, libc::SIGKILL);
@@ -838,9 +1243,7 @@ async fn agent_loop(self_exe: &str) {
                         match tokio::time::timeout(Duration::from_secs(5), stream.read(&mut buf))
                             .await
                         {
-                            Ok(Ok(n)) if n > 0 => {
-                                String::from_utf8_lossy(&buf[..n]).contains(&data)
-                            }
+                            Ok(Ok(n)) if n > 0 => String::from_utf8_lossy(&buf[..n]) == data,
                             _ => false,
                         }
                     }));
@@ -945,7 +1348,7 @@ async fn agent_loop(self_exe: &str) {
                             .await
                             .ok()?
                             .ok()?;
-                        if n > 0 && String::from_utf8_lossy(&buf[..n]).contains(&data) {
+                        if n == data.len() && String::from_utf8_lossy(&buf[..n]) == data {
                             Some(())
                         } else {
                             None
@@ -1035,16 +1438,19 @@ async fn agent_loop(self_exe: &str) {
 
             Command::Exit => {
                 // Abort all TCP echo servers.
-                for (_, task) in listeners.drain() {
-                    task.abort();
+                for (_, entry) in listeners.drain() {
+                    entry.task.abort();
                 }
                 // Abort all Unix echo servers.
                 for (_, task) in unix_listeners.drain() {
                     task.abort();
                 }
                 // Kill background processes.
-                for mut child in background_pids.drain(..) {
-                    let _ = child.kill().await;
+                for (_, mut child) in background_pids.drain() {
+                    let _ = child.process.start_kill();
+                    for drain in child.drains {
+                        drain.abort();
+                    }
                 }
                 // Send exit to all children.
                 for (_, mut child) in children.drain() {
@@ -1064,14 +1470,177 @@ async fn respond(resp: &Response) {
     let _ = stdout.flush().await;
 }
 
-fn spawn_child(self_exe: &str, _id: &str) -> Result<ChildHandle, String> {
-    let mut child = tokio::process::Command::new(self_exe)
+fn create_listener_entry(port: u16) -> Result<(u16, ListenerEntry), String> {
+    let std_listener =
+        std::net::TcpListener::bind(format!("0.0.0.0:{port}")).map_err(|e| format!("{e}"))?;
+    std_listener
+        .set_nonblocking(true)
+        .map_err(|e| format!("set_nonblocking: {e}"))?;
+    let actual_port = std_listener
+        .local_addr()
+        .map(|addr| addr.port())
+        .unwrap_or(port);
+    let fd = dup_fd_cloexec(std_listener.as_raw_fd())?;
+    let task = spawn_tcp_echo_task(std_listener)?;
+    Ok((actual_port, ListenerEntry { fd, task }))
+}
+
+fn spawn_tcp_echo_task(
+    std_listener: std::net::TcpListener,
+) -> Result<tokio::task::JoinHandle<()>, String> {
+    let listener = TcpListener::from_std(std_listener).map_err(|e| format!("from_std: {e}"))?;
+    Ok(tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let mut buf = [0u8; 4096];
+                loop {
+                    match stream.read(&mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => {
+                            if stream.write_all(&buf[..n]).await.is_err() {
+                                break;
+                            }
+                        }
+                    }
+                }
+            });
+        }
+    }))
+}
+
+fn import_inherited_listeners() -> Result<HashMap<u16, ListenerEntry>, String> {
+    let spec = match std::env::var(INHERITED_LISTEN_FDS_ENV) {
+        Ok(spec) if !spec.is_empty() => spec,
+        _ => return Ok(HashMap::new()),
+    };
+    let mut listeners = HashMap::new();
+    for item in spec.split(',') {
+        let (port_s, fd_s) = item
+            .split_once('=')
+            .ok_or_else(|| format!("bad inherited listener item {item:?}"))?;
+        let port = port_s
+            .parse::<u16>()
+            .map_err(|e| format!("bad inherited port {port_s:?}: {e}"))?;
+        let fd = fd_s
+            .parse::<i32>()
+            .map_err(|e| format!("bad inherited fd {fd_s:?}: {e}"))?;
+        // SAFETY: The parent side passes each fd number exactly once via the
+        // inheritance env var after dup'ing it into the reserved child slot.
+        // This child process owns that descriptor after exec.
+        let inherited_listener = unsafe { std::net::TcpListener::from_raw_fd(fd) };
+        inherited_listener
+            .set_nonblocking(true)
+            .map_err(|e| format!("set inherited nonblocking fd {fd}: {e}"))?;
+        let registry_fd = dup_fd_cloexec(inherited_listener.as_raw_fd())?;
+        drop(inherited_listener);
+        let task = tokio::spawn(async {});
+        listeners.insert(
+            port,
+            ListenerEntry {
+                fd: registry_fd,
+                task,
+            },
+        );
+    }
+    Ok(listeners)
+}
+
+fn prepare_inherited_listeners(
+    listeners: &HashMap<u16, ListenerEntry>,
+    ports: &[u16],
+) -> Result<Vec<(u16, OwnedFd)>, String> {
+    if ports.len() > (INHERITED_LISTEN_FD_LIMIT - INHERITED_LISTEN_FD_BASE + 1) as usize {
+        return Err(format!(
+            "too many inherited listen ports: {} (slot range {INHERITED_LISTEN_FD_BASE}-{INHERITED_LISTEN_FD_LIMIT})",
+            ports.len()
+        ));
+    }
+    let mut inherited = Vec::with_capacity(ports.len());
+    for (index, port) in ports.iter().copied().enumerate() {
+        let entry = listeners
+            .get(&port)
+            .ok_or_else(|| format!("no listener registered for port {port}"))?;
+        let slot = INHERITED_LISTEN_FD_BASE + index as i32;
+        inherited.push((port, dup_fd_to_inherited_slot(entry.fd.as_raw_fd(), slot)?));
+    }
+    Ok(inherited)
+}
+
+fn dup_fd_cloexec(fd: i32) -> Result<OwnedFd, String> {
+    // SAFETY: fcntl with F_DUPFD_CLOEXEC duplicates a valid fd owned by this
+    // process and returns a fresh descriptor on success.
+    let dup = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 3) };
+    if dup < 0 {
+        return Err(format!("dup fd {fd}: {}", std::io::Error::last_os_error()));
+    }
+    // SAFETY: `dup` is a newly returned fd and ownership is transferred to
+    // OwnedFd so it will be closed exactly once.
+    Ok(unsafe { OwnedFd::from_raw_fd(dup) })
+}
+
+fn dup_fd_to_inherited_slot(fd: i32, slot: i32) -> Result<OwnedFd, String> {
+    // Inherited listen sockets use fd 80..99 in the child agent. This is above
+    // stdio and normal low-number scratch fds, but below Litebox's documented
+    // bridge/infrastructure bands: 100..199 parent bridge, 200..499 child
+    // bridge host fds, and 500+ infrastructure fds. The mapping is passed as
+    // `port=fd` in LITEBOX_TEST_HARNESS_INHERITED_LISTEN_FDS.
+    // SAFETY: fcntl(F_GETFD) only inspects the candidate slot in this process.
+    let flags = unsafe { libc::fcntl(slot, libc::F_GETFD) };
+    if flags >= 0 {
+        return Err(format!("inherited fd slot {slot} is already occupied"));
+    }
+    let err = std::io::Error::last_os_error();
+    if err.raw_os_error() != Some(libc::EBADF) {
+        return Err(format!("inspect inherited fd slot {slot}: {err}"));
+    }
+    // SAFETY: `fd` is a live listener duplicate from the registry, and `slot`
+    // was just verified unused. F_DUPFD creates an inheritable duplicate at the
+    // lowest free fd >= slot; because `slot` is free, success must return it.
+    let ret = unsafe { libc::fcntl(fd, libc::F_DUPFD, slot) };
+    if ret < 0 {
+        return Err(format!(
+            "dup fd {fd} to inherited slot {slot}: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    if ret != slot {
+        // SAFETY: ret is a fresh duplicate from fcntl and is not used further.
+        let _ = unsafe { libc::close(ret) };
+        return Err(format!(
+            "inherited fd slot {slot} was not allocated (got {ret})"
+        ));
+    }
+    // SAFETY: `slot` is now a freshly duplicated fd owned by this process. The
+    // parent keeps it only until Command::spawn returns; dropping the OwnedFd
+    // closes the parent's duplicate while the exec'd child keeps its copy.
+    Ok(unsafe { OwnedFd::from_raw_fd(slot) })
+}
+
+fn spawn_child(self_exe: &str, id: &str) -> Result<ChildHandle, String> {
+    spawn_child_with_inherited(self_exe, id, &[])
+}
+
+fn spawn_child_with_inherited(
+    self_exe: &str,
+    _id: &str,
+    inherited: &[(u16, OwnedFd)],
+) -> Result<ChildHandle, String> {
+    let inherited_spec = inherited
+        .iter()
+        .map(|(port, fd)| format!("{port}={}", fd.as_raw_fd()))
+        .collect::<Vec<_>>()
+        .join(",");
+    let mut command = tokio::process::Command::new(self_exe);
+    command
         .arg("agent")
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::inherit())
-        .spawn()
-        .map_err(|e| format!("{e}"))?;
+        .env_remove(INHERITED_LISTEN_FDS_ENV);
+    if !inherited_spec.is_empty() {
+        command.env(INHERITED_LISTEN_FDS_ENV, inherited_spec);
+    }
+    let mut child = command.spawn().map_err(|e| format!("{e}"))?;
 
     let stdin = child.stdin.take().ok_or("no stdin")?;
     let stdout = child.stdout.take().ok_or("no stdout")?;

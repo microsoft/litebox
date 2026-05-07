@@ -13,6 +13,10 @@ fn default_accept_timeout() -> u64 {
     10
 }
 
+fn default_marker_stream() -> String {
+    "either".to_string()
+}
+
 /// Command sent from parent to child via stdin.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "cmd")]
@@ -35,37 +39,18 @@ pub enum Command {
     ///   - `"nonpie"` → fork+exec the non-PIE binary (= `SpawnRemote`)
     ///
     /// `inherit_listen_ports`: TCP listen ports whose listen socket fds
-    /// should be inherited by the child (CLOEXEC cleared before exec).
-    /// **Not yet implemented** — see design notes below.
-    ///
-    /// # fd inheritance pattern (future work)
-    ///
-    /// The VS Code CLI does this:
-    ///   1. Parent calls `bind()+listen()` on a port
-    ///   2. Parent fork()+exec()s the server process
-    ///   3. Parent closes its listen fd
-    ///   4. Child calls `accept()` on the **inherited** listen fd
-    ///
-    /// To support this in the protocol:
-    ///   1. Fork handler looks up the listen socket fd for each port in
-    ///      `inherit_listen_ports` (the agent tracks port→fd mapping from
-    ///      `NetListen`).
-    ///   2. Clears CLOEXEC on those fds: `fcntl(fd, F_SETFD, 0)`.
-    ///   3. fork()+exec()s the child, passing the fd numbers via a CLI
-    ///      arg or env var (e.g., `--inherited-fds 3,5`).
-    ///   4. Child agent reconstructs `TcpListeners` from the raw fds via
-    ///      `TcpListener::from_raw_fd(fd)` and registers them in its
-    ///      listener map.
-    ///   5. The child's `NetAccept` or echo handler then works on the
-    ///      inherited listener — no re-bind needed.
+    /// should be inherited by the child. The parent duplicates each requested
+    /// listener into deterministic child fd slots 80..99, clearing CLOEXEC only
+    /// on those short-lived duplicates. This range is intentionally below the
+    /// Litebox host bridge/infrastructure bands (100..199, 200..499, 500+) and
+    /// above stdio. The child receives a `port=fd` mapping in
+    /// `LITEBOX_TEST_HARNESS_INHERITED_LISTEN_FDS`, imports each fd into its
+    /// listener registry, and then normal `NetAccept` / `NetConnect` probing
+    /// works without re-binding.
     ///
     /// Pair with `NetCloseListener` on the parent to reproduce the full
     /// VS Code pattern: `NetListen` → Fork(inherit) → `NetCloseListener` →
-    /// child `NetAccept`.
-    ///
-    /// Currently this pattern is tested via the `tcp-fork-listen-accept`
-    /// subcommand (see main.rs), which implements steps 1-4 as a single
-    /// standalone program outside the agent protocol.
+    /// child accepts on the inherited listener.
     #[serde(rename = "fork")]
     Fork {
         name: String,
@@ -125,19 +110,29 @@ pub enum Command {
     #[serde(rename = "net_unlisten")]
     NetUnlisten { port: u16 },
 
+    /// Connect to addr and register the TCP stream for stateful operations.
+    #[serde(rename = "net_open")]
+    NetOpen { addr: String },
+
+    /// Send bytes on a registered TCP connection.
+    #[serde(rename = "net_send")]
+    NetSend { conn: u64, data: String },
+
+    /// Receive bytes from a registered TCP connection. None means read to EOF.
+    #[serde(rename = "net_recv")]
+    NetRecv { conn: u64, n_bytes: Option<u32> },
+
+    /// Shutdown one half of a registered TCP connection: "wr", "rd", or "rdwr".
+    #[serde(rename = "net_shutdown")]
+    NetShutdown { conn: u64, half: String },
+
+    /// Close and unregister a TCP connection.
+    #[serde(rename = "net_close")]
+    NetClose { conn: u64 },
+
     /// Connect to addr, send data, read echo response.
     #[serde(rename = "net_connect")]
     NetConnect { addr: String, data: String },
-
-    /// Connect to addr, write data, shutdown one half of the TCP connection,
-    /// then read echoed data until EOF. `half` must be `"wr"`, `"rd"`, or
-    /// `"rdwr"`; TCP half-close EOF tests use `"wr"`.
-    #[serde(rename = "net_halfclose_echo")]
-    NetHalfCloseEcho {
-        addr: String,
-        write_data: String,
-        half: String,
-    },
 
     /// Forward a command to a named child and return its response.
     #[serde(rename = "forward")]
@@ -157,6 +152,53 @@ pub enum Command {
         /// If true, return Background { pid } immediately instead of waiting.
         #[serde(default)]
         background: bool,
+    },
+
+    /// Fork+exec in the background, but return only after stdout/stderr
+    /// contains the requested readiness marker. Output remains captured for
+    /// WaitBackground, and is drained after readiness so helpers cannot block.
+    #[serde(rename = "exec_ready")]
+    ExecReady {
+        args: Vec<String>,
+        /// Stdout/stderr substring that, once observed, signals readiness.
+        ready_marker: String,
+        /// Hard cap on wait. None = 30 seconds.
+        #[serde(default)]
+        timeout_secs: Option<u64>,
+        #[serde(default)]
+        stdin: Option<String>,
+        /// Where to look for the marker: "stdout" | "stderr" | "either".
+        #[serde(default = "default_marker_stream")]
+        stream: String,
+    },
+
+    /// Wait until this agent or a named child agent has accepted protocol
+    /// commands. A child agent can only answer after its init phase entered
+    /// the command loop, making this a process-ready beacon.
+    #[serde(rename = "wait_ready")]
+    WaitReady {
+        agent: String,
+        #[serde(default)]
+        timeout_secs: Option<u64>,
+    },
+
+    /// Wait for a previously backgrounded process to exit and return its
+    /// captured output. For plain Exec background commands stdout/stderr are
+    /// empty; ExecReady backgrounds retain captured output.
+    #[serde(rename = "wait_background")]
+    WaitBackground {
+        pid: u32,
+        #[serde(default)]
+        timeout_secs: Option<u64>,
+    },
+
+    /// Wait for an observed state predicate on this agent. This is a bounded
+    /// protocol-level replacement for coordinator sleeps.
+    #[serde(rename = "wait_for")]
+    WaitFor {
+        predicate: WaitPredicate,
+        #[serde(default)]
+        timeout_secs: Option<u64>,
     },
 
     /// Report an environment variable value.
@@ -244,6 +286,13 @@ pub enum Command {
     Exit,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum WaitPredicate {
+    PortListening { port: u16, host: String },
+    FileExists { path: String },
+}
+
 /// Response sent from child to parent via stdout.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "status")]
@@ -271,13 +320,25 @@ pub enum Response {
     #[serde(rename = "connected")]
     Connected { echo: String },
 
-    /// TCP half-close echo result.
-    #[serde(rename = "halfclosed")]
-    HalfClosed { echo: String },
+    /// Stateful TCP connection opened.
+    #[serde(rename = "opened")]
+    Opened { conn: u64 },
 
-    /// TCP half-close operation failed.
-    #[serde(rename = "halfclose_failed")]
-    HalfCloseFailed { error: String },
+    /// Stateful TCP bytes sent.
+    #[serde(rename = "sent")]
+    Sent,
+
+    /// Stateful TCP bytes received.
+    #[serde(rename = "received")]
+    Received { data: String },
+
+    /// Stateful TCP shutdown completed.
+    #[serde(rename = "shutdown_ok")]
+    ShutdownOk,
+
+    /// Stateful TCP connection closed.
+    #[serde(rename = "closed")]
+    Closed,
 
     /// TCP connection failed.
     #[serde(rename = "connect_failed")]
@@ -298,6 +359,14 @@ pub enum Response {
     /// Background process started.
     #[serde(rename = "background")]
     Background { pid: u32 },
+
+    /// Background process reached its readiness marker.
+    #[serde(rename = "background_ready")]
+    BackgroundReady { pid: u32 },
+
+    /// Readiness or wait predicate satisfied.
+    #[serde(rename = "ready")]
+    Ready,
 
     /// Error.
     #[serde(rename = "error")]
