@@ -2026,32 +2026,41 @@ pub(crate) fn register_cross_pid_visibility_tests(reg: &mut Registry<'_>) {
 // FR: File-Redirect — stdout of background process → file
 // ═══════════════════════════════════════════════════════════════════
 
+#[allow(clippy::too_many_lines)] // exhaustive registration / runner
 pub(crate) fn register_file_redirect_tests(reg: &mut Registry<'_>) {
     struct Def {
         name: &'static str,
         script_template: &'static str,
         check: fn(&str) -> bool,
+        /// If true, the template substitutes `{exe}` and the test
+        /// gains a `BinaryType` axis. Otherwise the test is a pure
+        /// shell-builtin operation with no binary dimension.
+        per_binary_type: bool,
     }
     let defs: &[Def] = &[
         Def {
             name: "fg_redirect",
             script_template: concat!("echo FR_FG > {path}\n", "cat {path}\n"),
             check: |s| s.contains("FR_FG"),
+            per_binary_type: false,
         },
         Def {
             name: "bg_echo",
             script_template: concat!("echo FR_BGECHO > {path} &\n", "wait\n", "cat {path}\n"),
             check: |s| s.contains("FR_BGECHO"),
+            per_binary_type: false,
         },
         Def {
             name: "bg_exe",
             script_template: concat!("{exe} echo-test > {path} &\n", "wait\n", "cat {path}\n"),
             check: |s| s.contains("ECHO_TEST_OK"),
+            per_binary_type: true,
         },
         Def {
             name: "bg_cat_pipe",
             script_template: concat!("echo FR_PIPE | cat > {path} &\n", "wait\n", "cat {path}\n",),
             check: |s| s.contains("FR_PIPE"),
+            per_binary_type: false,
         },
         Def {
             name: "bg_append",
@@ -2062,45 +2071,83 @@ pub(crate) fn register_file_redirect_tests(reg: &mut Registry<'_>) {
                 "cat {path}\n",
             ),
             check: |s| s.contains("LINE1") && s.contains("LINE2"),
+            per_binary_type: false,
         },
     ];
     for &agent in AGENTS {
         for def in defs {
-            let agent_s = agent.to_string();
-            let template: String = def.script_template.into();
-            let check = def.check;
-            let name = def.name;
-            reg.test("shell", "file_redirect", format!("FR.{name}.{agent}"))
-                .timeout(60)
-                .build(move |cx| {
-                    let handle = cx.require(agent);
-                    Box::new(move |run| {
-                        let a = agent_s.clone();
-                        let t = template.clone();
-                        let self_exe = run.self_exe().to_string();
-                        Box::pin(async move {
-                            let path = format!("/shared/fr-{name}-{a}.txt");
-                            let script = t.replace("{path}", &path).replace("{exe}", &self_exe);
-                            let resp = run
-                                .send(
-                                    &handle,
-                                    Command::Exec {
-                                        args: vec!["bash".into(), "-c".into(), script],
-                                        timeout_secs: Some(10),
-                                        stdin: None,
-                                        background: false,
-                                    },
-                                )
-                                .await;
-                            let pass = matches!(
-                                &resp,
-                                Response::ExecResult { stdout, .. }
-                                    if check(stdout)
-                            );
-                            super::TestOutcome::new(&a, pass, format!("{resp:?}"))
+            // For per-binary-type variants, generate a test per leg of
+            // BinaryType::ALL. For shell-builtin variants, generate
+            // exactly one test (the binary type is irrelevant).
+            //
+            // Backwards-compat: the legacy `FR.bg_exe.<agent>` ID
+            // aliases to PIE-glibc (the original `self_exe`-based
+            // behavior). Other legs get a `.<binary-type>` segment.
+            let bts: &[Option<crate::BinaryType>] = if def.per_binary_type {
+                &[
+                    Some(crate::BinaryType::PieGlibc),
+                    Some(crate::BinaryType::NonPieGlibc),
+                    Some(crate::BinaryType::StaticPieGlibc),
+                    Some(crate::BinaryType::StaticPieMusl),
+                    Some(crate::BinaryType::NonPieStaticMusl),
+                ]
+            } else {
+                &[None]
+            };
+            for &bt_opt in bts {
+                let agent_s = agent.to_string();
+                let template: String = def.script_template.into();
+                let check = def.check;
+                let name = def.name;
+                let test_id = match bt_opt {
+                    // Both the no-binary and PIE-glibc cases use the
+                    // legacy 3-segment ID for backwards-compat.
+                    None | Some(crate::BinaryType::PieGlibc) => {
+                        format!("FR.{name}.{agent}")
+                    }
+                    Some(bt) => format!("FR.{name}.{}.{agent}", bt.label()),
+                };
+                let path_label = match bt_opt {
+                    None | Some(crate::BinaryType::PieGlibc) => name.to_string(),
+                    Some(bt) => format!("{name}-{}", bt.label()),
+                };
+                reg.test("shell", "file_redirect", test_id)
+                    .timeout(60)
+                    .build(move |cx| {
+                        let handle = cx.require(agent);
+                        Box::new(move |run| {
+                            let a = agent_s.clone();
+                            let t = template.clone();
+                            let path_label = path_label.clone();
+                            let self_exe = run.self_exe().to_string();
+                            Box::pin(async move {
+                                let path = format!("/shared/fr-{path_label}-{a}.txt");
+                                let exe_path = match bt_opt {
+                                    None => self_exe.clone(),
+                                    Some(bt) => crate::binary_path(bt, &self_exe),
+                                };
+                                let script = t.replace("{path}", &path).replace("{exe}", &exe_path);
+                                let resp = run
+                                    .send(
+                                        &handle,
+                                        Command::Exec {
+                                            args: vec!["bash".into(), "-c".into(), script],
+                                            timeout_secs: Some(10),
+                                            stdin: None,
+                                            background: false,
+                                        },
+                                    )
+                                    .await;
+                                let pass = matches!(
+                                    &resp,
+                                    Response::ExecResult { stdout, .. }
+                                        if check(stdout)
+                                );
+                                super::TestOutcome::new(&a, pass, format!("{resp:?}"))
+                            })
                         })
-                    })
-                });
+                    });
+            }
         }
     }
 }
