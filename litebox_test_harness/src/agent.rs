@@ -5,7 +5,7 @@
 //! writes responses to stdout. Intermediate nodes forward commands to
 //! their children.
 
-use crate::protocol::{Command, Response, WaitPredicate};
+use crate::protocol::{Clone3Kind, Command, Response, WaitPredicate};
 use std::collections::HashMap;
 use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -282,6 +282,19 @@ async fn agent_loop(self_exe: &str) {
                 let pid = std::process::id();
                 respond(&Response::Ok {
                     data: Some(pid.to_string()),
+                })
+                .await;
+            }
+
+            Command::Clone3 { kind } => {
+                let result = tokio::task::spawn_blocking(move || run_clone3(kind))
+                    .await
+                    .unwrap_or_else(|e| clone_result_error(format!("clone3 task join: {e}")));
+                respond(&Response::CloneResult {
+                    pid: result.pid,
+                    pidfd: result.pidfd,
+                    ok: result.ok,
+                    error: result.error,
                 })
                 .await;
             }
@@ -1464,6 +1477,304 @@ async fn respond(resp: &Response) {
     let mut stdout = tokio::io::stdout();
     let _ = stdout.write_all(format!("{json}\n").as_bytes()).await;
     let _ = stdout.flush().await;
+}
+
+#[repr(C)]
+#[derive(Default)]
+struct CloneArgs {
+    flags: u64,
+    pidfd: u64,
+    child_tid: u64,
+    parent_tid: u64,
+    exit_signal: u64,
+    stack: u64,
+    stack_size: u64,
+    tls: u64,
+    set_tid: u64,
+    set_tid_size: u64,
+    cgroup: u64,
+}
+
+static CLONE3_THREAD_WRITE_FD: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
+static CLONE3_THREAD_TID: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+static CLONE3_THREAD_SIGNAL: u8 = 1;
+
+fn clone_result_error(error: impl Into<String>) -> crate::protocol::CloneResult {
+    crate::protocol::CloneResult {
+        pid: 0,
+        pidfd: None,
+        ok: false,
+        error: Some(error.into()),
+    }
+}
+
+fn errno_name(errno: i32) -> String {
+    match errno {
+        libc::EACCES => "EACCES".to_string(),
+        libc::EBADF => "EBADF".to_string(),
+        libc::EINVAL => "EINVAL".to_string(),
+        libc::ENOENT => "ENOENT".to_string(),
+        libc::ENOSYS => "ENOSYS".to_string(),
+        libc::EOPNOTSUPP => "EOPNOTSUPP".to_string(),
+        libc::EPERM => "EPERM".to_string(),
+        libc::EROFS => "EROFS".to_string(),
+        other => format!("errno={other}"),
+    }
+}
+
+fn last_errno_name() -> String {
+    errno_name(std::io::Error::last_os_error().raw_os_error().unwrap_or(0))
+}
+
+fn current_fs_base() -> Result<u64, String> {
+    let mut fs_base = 0u64;
+    // SAFETY: arch_prctl(ARCH_GET_FS) writes one machine word to the valid
+    // `fs_base` pointer and does not retain it after returning.
+    let rc = unsafe { libc::syscall(libc::SYS_arch_prctl, 0x1003_i32, &raw mut fs_base) };
+    if rc == 0 {
+        Ok(fs_base)
+    } else {
+        Err(last_errno_name())
+    }
+}
+
+fn wait_for_child(pid: libc::pid_t) -> Result<(), String> {
+    let mut status = 0;
+    loop {
+        // SAFETY: `status` is a valid output pointer for waitpid, and `pid`
+        // is the process id returned by clone3 in this function.
+        let rc = unsafe { libc::waitpid(pid, &raw mut status, 0) };
+        if rc == pid {
+            if libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0 {
+                return Ok(());
+            }
+            return Err(format!("child status={status}"));
+        }
+        let err = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+        if err != libc::EINTR {
+            return Err(errno_name(err));
+        }
+    }
+}
+
+fn run_clone3(kind: Clone3Kind) -> crate::protocol::CloneResult {
+    match kind {
+        Clone3Kind::Thread => run_clone3_thread(),
+        Clone3Kind::Process => run_clone3_process(false, None, None),
+        Clone3Kind::WithPidfd => run_clone3_process(true, None, None),
+        Clone3Kind::WithSetTid { tid } => run_clone3_process(false, Some(tid), None),
+        Clone3Kind::WithCgroup { cgroup_fd } => run_clone3_with_cgroup(cgroup_fd),
+    }
+}
+
+fn run_clone3_with_cgroup(cgroup_fd: u64) -> crate::protocol::CloneResult {
+    use std::os::fd::{AsRawFd, FromRawFd};
+    if cgroup_fd != 0 {
+        return run_clone3_process(false, None, Some(cgroup_fd as i32));
+    }
+    let path = std::ffi::CString::new("/sys/fs/cgroup").expect("literal has no NUL");
+    // SAFETY: `path` is a valid C string. On success, `open` returns a new fd
+    // that is immediately wrapped in `OwnedFd` for automatic close.
+    let fd = unsafe {
+        libc::open(
+            path.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return clone_result_error(format!(
+            "cgroup_fd_unavailable:{}; fallback attempted /sys/fs/cgroup",
+            last_errno_name()
+        ));
+    }
+    // SAFETY: `fd` was just returned by `open` and is uniquely owned here.
+    let owned = unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) };
+    run_clone3_process(false, None, Some(owned.as_raw_fd()))
+}
+
+fn run_clone3_thread() -> crate::protocol::CloneResult {
+    let mut pipe_fds = [0i32; 2];
+    // SAFETY: `pipe_fds` points to two writable i32 slots for pipe2 to fill.
+    if unsafe { libc::pipe2(pipe_fds.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
+        return clone_result_error(format!("pipe2:{}", last_errno_name()));
+    }
+    CLONE3_THREAD_WRITE_FD.store(pipe_fds[1], Ordering::SeqCst);
+    CLONE3_THREAD_TID.store(0, Ordering::SeqCst);
+    let mut parent_tid = 0i32;
+    let mut child_tid = 0i32;
+    let tls = match current_fs_base() {
+        Ok(tls) => tls,
+        Err(error) => {
+            close_fd(pipe_fds[0]);
+            close_fd(pipe_fds[1]);
+            return clone_result_error(format!("ARCH_GET_FS:{error}"));
+        }
+    };
+    let mut args = CloneArgs {
+        flags: (libc::CLONE_VM
+            | libc::CLONE_THREAD
+            | libc::CLONE_SIGHAND
+            | libc::CLONE_SYSVSEM
+            | libc::CLONE_SETTLS
+            | libc::CLONE_FS
+            | libc::CLONE_FILES
+            | libc::CLONE_PARENT_SETTID
+            | libc::CLONE_CHILD_CLEARTID) as u64,
+        parent_tid: (&raw mut parent_tid).addr() as u64,
+        child_tid: (&raw mut child_tid).addr() as u64,
+        tls,
+        ..CloneArgs::default()
+    };
+    // SAFETY: `args` points to a clone_args-compatible struct for the duration
+    // of the syscall. The child thread only performs raw syscalls and exits via
+    // SYS_exit, avoiding Rust destructors in the manually-created thread.
+    let rc = unsafe {
+        libc::syscall(
+            libc::SYS_clone3,
+            &raw mut args,
+            std::mem::size_of::<CloneArgs>(),
+        )
+    };
+    if rc == 0 {
+        // SAFETY: In the clone3-created thread, use only raw syscalls and shared
+        // atomics/fds, then terminate this thread with SYS_exit (not exit_group).
+        unsafe {
+            let tid = libc::syscall(libc::SYS_gettid) as i32;
+            CLONE3_THREAD_TID.store(tid, Ordering::SeqCst);
+            let fd = CLONE3_THREAD_WRITE_FD.load(Ordering::SeqCst);
+            let _ = libc::syscall(
+                libc::SYS_write,
+                fd,
+                std::ptr::addr_of!(CLONE3_THREAD_SIGNAL).cast::<libc::c_void>(),
+                1usize,
+            );
+            libc::syscall(libc::SYS_exit, 0i32);
+        }
+        unreachable!();
+    }
+    close_fd(pipe_fds[1]);
+    if rc < 0 {
+        close_fd(pipe_fds[0]);
+        return clone_result_error(last_errno_name());
+    }
+    let mut byte = [0u8; 1];
+    // SAFETY: `byte` is a valid one-byte output buffer and `pipe_fds[0]` is a
+    // live read end created above.
+    let read_rc = unsafe { libc::read(pipe_fds[0], byte.as_mut_ptr().cast(), byte.len()) };
+    close_fd(pipe_fds[0]);
+    let tid = CLONE3_THREAD_TID.load(Ordering::SeqCst);
+    if read_rc == 1 && tid > 0 {
+        crate::protocol::CloneResult {
+            pid: tid as u64,
+            pidfd: None,
+            ok: true,
+            error: None,
+        }
+    } else {
+        clone_result_error(format!("thread_signal_failed:read={read_rc},tid={tid}"))
+    }
+}
+
+fn run_clone3_process(
+    with_pidfd: bool,
+    set_tid: Option<u64>,
+    cgroup_fd: Option<i32>,
+) -> crate::protocol::CloneResult {
+    let mut pidfd = -1i32;
+    let mut child_tid = 0i32;
+    let mut requested_tid = set_tid.unwrap_or(0);
+    let mut args = CloneArgs {
+        flags: libc::CLONE_CHILD_CLEARTID as u64,
+        child_tid: (&raw mut child_tid).addr() as u64,
+        exit_signal: libc::SIGCHLD as u64,
+        ..CloneArgs::default()
+    };
+    if with_pidfd {
+        args.flags |= libc::CLONE_PIDFD as u64;
+        args.pidfd = (&raw mut pidfd).addr() as u64;
+    }
+    if set_tid.is_some() {
+        args.set_tid = (&raw mut requested_tid).addr() as u64;
+        args.set_tid_size = 1;
+    }
+    if let Some(fd) = cgroup_fd {
+        args.flags |= libc::CLONE_INTO_CGROUP as u64;
+        args.cgroup = fd as u64;
+    }
+    // SAFETY: `args` is a clone_args-compatible struct. The child immediately
+    // execs `/bin/sh -c true` or exits via a raw SYS_exit if exec fails.
+    let rc = unsafe {
+        libc::syscall(
+            libc::SYS_clone3,
+            &raw mut args,
+            std::mem::size_of::<CloneArgs>(),
+        )
+    };
+    if rc == 0 {
+        // SAFETY: These are static NUL-terminated strings; execl either
+        // replaces the process image or returns, after which SYS_exit ends only
+        // the child process.
+        unsafe {
+            let shell = c"/bin/sh";
+            let arg0 = c"sh";
+            let arg1 = c"-c";
+            let arg2 = c"getpid >/dev/null; exit 0";
+            libc::execl(
+                shell.as_ptr(),
+                arg0.as_ptr(),
+                arg1.as_ptr(),
+                arg2.as_ptr(),
+                std::ptr::null::<libc::c_char>(),
+            );
+            libc::syscall(libc::SYS_exit, 127i32);
+        }
+        unreachable!();
+    }
+    if rc < 0 {
+        return crate::protocol::CloneResult {
+            pid: 0,
+            pidfd: None,
+            ok: false,
+            error: Some(last_errno_name()),
+        };
+    }
+    let pid = rc as libc::pid_t;
+    let wait = wait_for_child(pid);
+    if let Err(error) = &wait {
+        if pidfd >= 0 {
+            close_fd(pidfd);
+        }
+        return crate::protocol::CloneResult {
+            pid: pid as u64,
+            pidfd: None,
+            ok: false,
+            error: Some(format!("wait:{error}")),
+        };
+    }
+    if with_pidfd && pidfd < 0 {
+        return crate::protocol::CloneResult {
+            pid: pid as u64,
+            pidfd: None,
+            ok: false,
+            error: Some("missing_pidfd".to_string()),
+        };
+    }
+    crate::protocol::CloneResult {
+        pid: pid as u64,
+        // Keep the pidfd open in this short-lived agent so the reported fd
+        // remains a valid kernel result for the duration of the response.
+        pidfd: with_pidfd.then_some(pidfd),
+        ok: true,
+        error: None,
+    }
+}
+
+fn close_fd(fd: i32) {
+    // SAFETY: Closing an fd is safe; errors are intentionally ignored because
+    // cleanup should not mask the operation being tested.
+    unsafe {
+        libc::close(fd);
+    }
 }
 
 fn create_listener_entry(port: u16) -> Result<(u16, ListenerEntry), String> {

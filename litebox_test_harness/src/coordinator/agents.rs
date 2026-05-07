@@ -4,7 +4,7 @@
 //! Typed agent identifiers and capability handles.
 //!
 //! The integration test harness drives a tree of long-lived agent
-//! processes spawned by the coordinator (A, AA, AB, AAA, AAB, B, NP,
+//! processes spawned by the coordinator (A, AA, AB, AAA, AAB, B, BB, NP,
 //! NPC, D3, D4, D5). To prevent tests from referring to agents they
 //! didn't declare at registration time, the *only* way to talk to an
 //! agent is via an [`AgentHandle`] obtained from
@@ -33,6 +33,7 @@ pub enum AgentName {
     AAA,
     AAB,
     B,
+    BB,
     NP,
     NPC,
     D3,
@@ -59,6 +60,7 @@ impl AgentName {
             AgentName::AAA => "AAA",
             AgentName::AAB => "AAB",
             AgentName::B => "B",
+            AgentName::BB => "BB",
             AgentName::NP => "NP",
             AgentName::NPC => "NPC",
             AgentName::D3 => "D3",
@@ -81,6 +83,7 @@ impl AgentName {
             "AAA" => Some(AgentName::AAA),
             "AAB" => Some(AgentName::AAB),
             "B" => Some(AgentName::B),
+            "BB" => Some(AgentName::BB),
             "NP" => Some(AgentName::NP),
             "NPC" => Some(AgentName::NPC),
             "D3" => Some(AgentName::D3),
@@ -101,6 +104,7 @@ impl AgentName {
         match self {
             AgentName::Init | AgentName::A | AgentName::B => &[],
             AgentName::AA | AgentName::AB => &[AgentName::A],
+            AgentName::BB => &[AgentName::B],
             AgentName::AAA | AgentName::AAB => &[AgentName::A, AgentName::AA],
             AgentName::NP => &[AgentName::A],
             AgentName::NPC => &[AgentName::A, AgentName::NP],

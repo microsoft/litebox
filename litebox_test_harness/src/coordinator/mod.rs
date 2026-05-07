@@ -5,6 +5,7 @@
 //! operations through pipes to child agents.
 
 pub(crate) mod agents;
+pub(crate) mod clone3_matrix;
 pub(crate) mod concurrent_fork;
 pub(crate) mod file_tcp;
 pub(crate) mod fork_matrix;
@@ -338,7 +339,7 @@ impl TestRunner {
     /// test actually asked for — minimal-repro shape (single-test
     /// filters spawn just the path that test uses).
     async fn spawn_tree(&mut self, needed: &std::collections::BTreeSet<agents::AgentName>) {
-        use agents::AgentName::{A, AA, AAA, AAB, AB, B, D3, D4, D5, E, EE, NP, NPC};
+        use agents::AgentName::{A, AA, AAA, AAB, AB, B, BB, D3, D4, D5, E, EE, NP, NPC};
         // `Init` is the coordinator itself — always available; record
         // it as "spawned" so the validator doesn't false-flag tests
         // that route to it via cx.fs_read / Command::FsRead.
@@ -378,6 +379,25 @@ impl TestRunner {
                 )
                 .await;
             eprintln!("[coord] A spawn {a_pie_kids:?}: {r:?}");
+        }
+
+        let mut b_pie_kids: Vec<String> = Vec::new();
+        if needed.contains(&BB) {
+            b_pie_kids.push(BB.name().to_string());
+        }
+        if !b_pie_kids.is_empty() && needed.contains(&B) {
+            for k in &b_pie_kids {
+                self.spawned_agents.insert(k.clone());
+            }
+            let r = self
+                .send(
+                    "B",
+                    Command::Spawn {
+                        children: b_pie_kids.clone(),
+                    },
+                )
+                .await;
+            eprintln!("[coord] B spawn {b_pie_kids:?}: {r:?}");
         }
 
         let mut grandkids: Vec<String> = Vec::new();
@@ -806,6 +826,7 @@ pub fn collect_all_tests() -> Vec<Test> {
     platform_fixes::register_file_redirect_tests(&mut registry::Registry::new(&mut tests));
     platform_fixes::register_pipe_nonblock_tests(&mut registry::Registry::new(&mut tests));
     platform_fixes::register_epoll_socket_tests(&mut registry::Registry::new(&mut tests));
+    clone3_matrix::register_clone3_matrix(&mut registry::Registry::new(&mut tests));
     tcp_state::register_tcp_state_tests(&mut registry::Registry::new(&mut tests));
     platform_fixes::register_tcp_halfclose_tests(&mut registry::Registry::new(&mut tests));
     platform_fixes::register_fork_listen_close_tests(&mut registry::Registry::new(&mut tests));
@@ -961,6 +982,7 @@ async fn run_tests(self_exe: &str, filter: Option<&str>) -> Vec<TestResult> {
 fn route(target: &str) -> (&str, Option<&str>) {
     match target {
         "A" | "B" | "E" => (target, None),
+        "BB" => ("B", Some("BB")),
         // Agents under A: AA*, AB, NP, NPC, D3, D4, D5
         "NP" | "NPC" | "D3" | "D4" | "D5" => ("A", Some(target)),
         "EE" => ("E", Some("EE")),
