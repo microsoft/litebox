@@ -25,6 +25,7 @@ use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{Condvar, Mutex};
+use std::time::Duration;
 
 use libtest_mimic::{Arguments, Failed, Trial};
 
@@ -330,7 +331,7 @@ fn run_one_test(pass: &str, test_id: &str) -> Result<serde_json::Value, Failed> 
     // waits for clean exit so we bound zombies / per-host docker
     // population. Logs are already on disk (stderr via Stdio::from,
     // stdout via the tee above).
-    spawn_drain(child);
+    spawn_drain(child, container_name.clone());
     drop(permit);
 
     found.ok_or_else(|| {
@@ -342,29 +343,79 @@ fn run_one_test(pass: &str, test_id: &str) -> Result<serde_json::Value, Failed> 
     })
 }
 
+/// Wall-clock cap on the post-result drain phase. The drain thread
+/// waits for the docker run process to exit on its own; if the
+/// inner harness wedges *after* emitting the JSON result line,
+/// `child.wait()` would otherwise block until the docker-side
+/// `timeout --signal=KILL 120` (litebox pass) catches it. That's
+/// 120 s of `drain_backlog` permit pinned for nothing — and on
+/// passes without an inner timeout (native), it would be
+/// indefinite. This budget is the defensive bound: after it fires,
+/// the watchdog forcibly tears the container down via
+/// `docker rm -f` plus a SIGTERM to the docker-run client.
+///
+/// 30 s is generous (the harness's own teardown cap is 5 s, plus
+/// container shutdown) but short enough that one wedged test
+/// can't paralyse the orchestrator.
+fn drain_timeout_secs() -> u64 {
+    std::env::var("LITEBOX_DRAIN_TIMEOUT_SECS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(30)
+}
+
 /// Background drain: hold a `drain_backlog` permit until the child
-/// container exits on its own. We deliberately do **not** force-kill
-/// from out here:
+/// docker process exits, with a wall-clock-bounded watchdog.
 ///
-///   * The harness's `teardown_tree` is already wall-clock-bounded
-///     (commit 1c1ae050: 10 s) and main hard-exits via
-///     `std::process::exit`, so the host process tree collapses
-///     promptly.
-///   * The outer `docker run` for the litebox pass wraps its inner
-///     process in `timeout --signal=KILL`, so a genuinely stuck
-///     container will be killed by docker itself.
-///   * `--rm` cleans up the container record once the inner process
-///     exits.
+/// In the normal case the harness's own `teardown_tree` (5 s cap)
+/// + `std::process::exit` causes the inner spawn-tree to exit, the
+/// docker container terminates, `docker run --rm` cleans up, and
+/// `child.wait()` returns within a few seconds. The watchdog
+/// observes the wait completion via a oneshot channel and exits
+/// without taking action.
 ///
-/// The drain thread bounds the backlog: if drain takes longer than
-/// the test loop, callers block on `active_jobs.acquire` (because
-/// new test slots only open after a drain finishes), which is the
-/// right back-pressure signal.
-fn spawn_drain(mut child: std::process::Child) {
+/// In the wedge case (harness reports JSON, then teardown_tree
+/// hangs, or dockerd itself stalls) the watchdog fires after
+/// `LITEBOX_DRAIN_TIMEOUT_SECS` and force-tears-down:
+///   * `docker rm -f <name>` — destroys the container regardless
+///     of internal state.
+///   * `kill(docker_run_pid, SIGTERM)` — unblocks our `wait()` even
+///     if dockerd isn't responsive.
+fn spawn_drain(mut child: std::process::Child, container_name: String) {
     let backlog_permit = drain_backlog().acquire();
     std::thread::spawn(move || {
         let _hold_backlog = backlog_permit;
+        let timeout = Duration::from_secs(drain_timeout_secs());
+        let pid = child.id() as i32;
+        let cname = container_name;
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        let watchdog = std::thread::spawn(move || {
+            if rx.recv_timeout(timeout).is_ok() {
+                // Child exited cleanly — nothing to do.
+                return;
+            }
+            // Defensive force-down. Both calls are best-effort:
+            // if the container/process has already exited they
+            // simply error out (ESRCH / "no such container").
+            eprintln!(
+                "[drain] timeout after {} s; forcing teardown of {cname}",
+                timeout.as_secs()
+            );
+            let _ = Command::new("docker")
+                .args(["rm", "-f", &cname])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+            // SAFETY: PID came from std::process::Child::id() of a child we
+            // own; signal delivery is synchronous and side-effect-free
+            // beyond what we want here.
+            unsafe {
+                libc::kill(pid, libc::SIGTERM);
+            }
+        });
         let _ = child.wait();
+        let _ = tx.send(());
+        let _ = watchdog.join();
     });
 }
 
