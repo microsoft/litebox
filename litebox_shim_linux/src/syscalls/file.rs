@@ -110,26 +110,64 @@ enum TerminalKind {
     NotTerminal,
 }
 
-struct InotifyInstanceState {
+const IN_MODIFY: u32 = 0x0000_0002;
+const IN_MOVED_FROM: u32 = 0x0000_0040;
+const IN_MOVED_TO: u32 = 0x0000_0080;
+const IN_CREATE: u32 = 0x0000_0100;
+const IN_DELETE: u32 = 0x0000_0200;
+
+static INOTIFY_COOKIE_COUNTER: AtomicUsize = AtomicUsize::new(1);
+
+#[derive(Clone)]
+struct InotifyWatch {
+    path: String,
+    mask: u32,
+    entries: BTreeMap<String, (usize, usize, u64)>,
+}
+
+struct InotifyEventRecord {
+    wd: i32,
+    mask: u32,
+    cookie: u32,
+    name: String,
+}
+
+pub(crate) struct InotifyInstanceState {
+    eventfd: litebox::fd::EntryHandle<Platform, super::eventfd::EventfdSubsystem>,
     next_watch_descriptor: i32,
-    watches: BTreeMap<i32, String>,
+    watches: BTreeMap<i32, InotifyWatch>,
+    events: Vec<InotifyEventRecord>,
 }
 
 impl InotifyInstanceState {
-    fn new() -> Self {
+    fn new(eventfd: litebox::fd::EntryHandle<Platform, super::eventfd::EventfdSubsystem>) -> Self {
         Self {
+            eventfd,
             next_watch_descriptor: 1,
             watches: BTreeMap::new(),
+            events: Vec::new(),
         }
     }
 
-    fn add_watch(&mut self, path: String) -> Result<i32, Errno> {
+    fn add_watch(
+        &mut self,
+        path: String,
+        mask: u32,
+        entries: BTreeMap<String, (usize, usize, u64)>,
+    ) -> Result<i32, Errno> {
         let wd = self.next_watch_descriptor;
         self.next_watch_descriptor = self
             .next_watch_descriptor
             .checked_add(1)
             .ok_or(Errno::ENOMEM)?;
-        self.watches.insert(wd, path);
+        self.watches.insert(
+            wd,
+            InotifyWatch {
+                path,
+                mask,
+                entries,
+            },
+        );
         Ok(wd)
     }
 
@@ -138,6 +176,55 @@ impl InotifyInstanceState {
             return Err(Errno::EINVAL);
         }
         self.watches.remove(&wd).map(|_| ()).ok_or(Errno::EINVAL)
+    }
+
+    fn enqueue_matching(&mut self, dir: &str, mask: u32, cookie: u32, name: &str) -> bool {
+        let mut queued = false;
+        for (&wd, watch) in &self.watches {
+            if watch.path == dir && (watch.mask & mask) != 0 {
+                self.events.push(InotifyEventRecord {
+                    wd,
+                    mask,
+                    cookie,
+                    name: name.to_string(),
+                });
+                queued = true;
+            }
+        }
+        queued
+    }
+
+    fn read_events(&mut self, buf: &mut [u8]) -> Result<usize, Errno> {
+        if self.events.is_empty() {
+            return Err(Errno::EAGAIN);
+        }
+
+        let mut written = 0usize;
+        let mut consumed = 0usize;
+        for event in &self.events {
+            let name_len = event.name.len().checked_add(1).ok_or(Errno::EINVAL)?;
+            let record_len = size_of::<i32>() + 3 * size_of::<u32>() + name_len;
+            if written + record_len > buf.len() {
+                if written == 0 {
+                    return Err(Errno::EINVAL);
+                }
+                break;
+            }
+
+            buf[written..written + size_of::<i32>()].copy_from_slice(&event.wd.to_ne_bytes());
+            written += size_of::<i32>();
+            for value in [event.mask, event.cookie, u32::try_from(name_len).unwrap()] {
+                buf[written..written + size_of::<u32>()].copy_from_slice(&value.to_ne_bytes());
+                written += size_of::<u32>();
+            }
+            buf[written..written + event.name.len()].copy_from_slice(event.name.as_bytes());
+            written += event.name.len();
+            buf[written] = 0;
+            written += 1;
+            consumed += 1;
+        }
+        self.events.drain(..consumed);
+        Ok(written)
     }
 }
 
@@ -281,11 +368,12 @@ impl<FS: ShimFS> FilesState<FS> {
         }
     }
 
-    fn register_inotify_fd(&self, raw_fd: usize) {
-        self.inotify_instances.lock().insert(
-            raw_fd,
-            Arc::new(litebox::sync::Mutex::new(InotifyInstanceState::new())),
-        );
+    fn register_inotify_fd(
+        &self,
+        raw_fd: usize,
+        state: Arc<litebox::sync::Mutex<Platform, InotifyInstanceState>>,
+    ) {
+        self.inotify_instances.lock().insert(raw_fd, state);
     }
 
     fn duplicate_inotify_fd(&self, old_fd: usize, new_fd: usize) {
@@ -295,8 +383,11 @@ impl<FS: ShimFS> FilesState<FS> {
         }
     }
 
-    fn remove_inotify_fd(&self, raw_fd: usize) {
-        self.inotify_instances.lock().remove(&raw_fd);
+    fn remove_inotify_fd(
+        &self,
+        raw_fd: usize,
+    ) -> Option<Arc<litebox::sync::Mutex<Platform, InotifyInstanceState>>> {
+        self.inotify_instances.lock().remove(&raw_fd)
     }
 
     /// Returns true if any inotify instances are open.
@@ -425,6 +516,159 @@ impl<FS: ShimFS> Task<FS> {
 
     fn get_umask(&self) -> Mode {
         self.fs.borrow().umask()
+    }
+
+    fn inotify_parent_and_name(path: &str) -> Option<(&str, &str)> {
+        let (parent, name) = path.rsplit_once('/')?;
+        if name.is_empty() {
+            return None;
+        }
+        let parent = if parent.is_empty() { "/" } else { parent };
+        Some((parent, name))
+    }
+
+    fn next_inotify_cookie() -> u32 {
+        let next = INOTIFY_COOKIE_COUNTER.fetch_add(1, Ordering::Relaxed);
+        u32::try_from(next).unwrap_or(u32::MAX).max(1)
+    }
+
+    fn notify_inotify_path(&self, path: &str, mask: u32, cookie: u32) {
+        let Some((dir, name)) = Self::inotify_parent_and_name(path) else {
+            return;
+        };
+        let instances = self.global.inotify_instances.lock().clone();
+        for instance in instances {
+            let eventfd = {
+                let mut state = instance.lock();
+                if state.enqueue_matching(dir, mask, cookie, name) {
+                    Some(state.eventfd.clone())
+                } else {
+                    None
+                }
+            };
+            if let Some(eventfd) = eventfd {
+                let _ = eventfd.with_entry(|file| file.write(&self.wait_cx(), 1));
+            }
+        }
+    }
+
+    fn inotify_dir_snapshot(&self, path: &str) -> BTreeMap<String, (usize, usize, u64)> {
+        let files = self.files.borrow();
+        let Ok(dir) = files
+            .fs
+            .open(path, OFlags::RDONLY | OFlags::DIRECTORY, Mode::empty())
+        else {
+            return BTreeMap::new();
+        };
+        let entries = files.fs.read_dir(&dir).unwrap_or_default();
+        let mut snapshot = BTreeMap::new();
+        for entry in entries {
+            let child_path = if path == "/" {
+                alloc::format!("/{name}", name = entry.name)
+            } else {
+                alloc::format!("{path}/{name}", name = entry.name)
+            };
+            if let Ok(status) = files.fs.file_status(child_path.clone()) {
+                let mut hash = 0u64;
+                if matches!(status.file_type, litebox::fs::FileType::RegularFile)
+                    && let Ok(file) = files.fs.open(&child_path, OFlags::RDONLY, Mode::empty())
+                {
+                    let mut buf = [0u8; 4096];
+                    if let Ok(n) = files.fs.read(&file, &mut buf, Some(0)) {
+                        for &byte in &buf[..n] {
+                            hash = hash.wrapping_mul(16_777_619) ^ u64::from(byte);
+                        }
+                    }
+                    let _ = files.fs.close(&file);
+                }
+                snapshot.insert(entry.name, (status.size, status.node_info.ino, hash));
+            }
+        }
+        let _ = files.fs.close(&dir);
+        snapshot
+    }
+
+    fn rescan_inotify_instance(&self, instance: &mut InotifyInstanceState) {
+        let watch_descriptors: Vec<i32> = instance.watches.keys().copied().collect();
+        for wd in watch_descriptors {
+            let Some(watch) = instance.watches.get_mut(&wd) else {
+                continue;
+            };
+            let current = self.inotify_dir_snapshot(&watch.path);
+            let removed: Vec<String> = watch
+                .entries
+                .keys()
+                .filter(|name| !current.contains_key(*name))
+                .cloned()
+                .collect();
+            let added: Vec<String> = current
+                .keys()
+                .filter(|name| !watch.entries.contains_key(*name))
+                .cloned()
+                .collect();
+            let modified: Vec<String> = current
+                .iter()
+                .filter(|(name, status)| watch.entries.get(*name).is_some_and(|old| old != *status))
+                .map(|(name, _)| name.clone())
+                .collect();
+            let mask = watch.mask;
+            watch.entries = current;
+
+            if !removed.is_empty()
+                && !added.is_empty()
+                && (mask & (IN_MOVED_FROM | IN_MOVED_TO)) != 0
+            {
+                let cookie = Self::next_inotify_cookie();
+                if (mask & IN_MOVED_FROM) != 0 {
+                    instance.events.push(InotifyEventRecord {
+                        wd,
+                        mask: IN_MOVED_FROM,
+                        cookie,
+                        name: removed[0].clone(),
+                    });
+                }
+                if (mask & IN_MOVED_TO) != 0 {
+                    instance.events.push(InotifyEventRecord {
+                        wd,
+                        mask: IN_MOVED_TO,
+                        cookie,
+                        name: added[0].clone(),
+                    });
+                }
+            } else {
+                if (mask & IN_DELETE) != 0 {
+                    for name in removed {
+                        instance.events.push(InotifyEventRecord {
+                            wd,
+                            mask: IN_DELETE,
+                            cookie: 0,
+                            name,
+                        });
+                    }
+                }
+                if (mask & IN_CREATE) != 0 {
+                    for name in added {
+                        instance.events.push(InotifyEventRecord {
+                            wd,
+                            mask: IN_CREATE,
+                            cookie: 0,
+                            name,
+                        });
+                    }
+                }
+            }
+
+            if (mask & IN_MODIFY) != 0 {
+                for name in modified {
+                    instance.events.push(InotifyEventRecord {
+                        wd,
+                        mask: IN_MODIFY,
+                        cookie: 0,
+                        name,
+                    });
+                }
+            }
+        }
     }
 
     fn pty_rdev_for_raw_fd(&self, files: &FilesState<FS>, raw_fd: usize) -> Option<usize> {
@@ -876,12 +1120,23 @@ impl<FS: ShimFS> Task<FS> {
             path
         };
         let mode = mode & !self.get_umask();
+        let existed_before = if flags.contains(OFlags::CREAT) {
+            self.files.borrow().fs.file_status(&*path).is_ok()
+        } else {
+            true
+        };
         let file = self
             .files
             .borrow()
             .fs
             .open(&*path, flags - OFlags::CLOEXEC, mode)
             .map_err(Errno::from)?;
+        if flags.contains(OFlags::CREAT)
+            && !existed_before
+            && let Ok(path_str) = path.to_str()
+        {
+            self.notify_inotify_path(path_str, IN_CREATE, 0);
+        }
         let status = flags & OFlags::STATUS_FLAGS_MASK;
         {
             let mut dt = self.global.litebox.descriptor_table_mut();
@@ -1118,7 +1373,15 @@ impl<FS: ShimFS> Task<FS> {
                 if flags.contains(AtFlags::AT_REMOVEDIR) {
                     self.files.borrow().fs.rmdir(path).map_err(Errno::from)
                 } else {
-                    self.files.borrow().fs.unlink(path).map_err(Errno::from)
+                    self.files
+                        .borrow()
+                        .fs
+                        .unlink(path.clone())
+                        .map_err(Errno::from)?;
+                    if let Ok(path_str) = path.to_str() {
+                        self.notify_inotify_path(path_str, IN_DELETE, 0);
+                    }
+                    Ok(())
                 }
             }
             FsPath::Cwd | FsPath::Fd(_) => Err(Errno::EINVAL),
@@ -1240,8 +1503,16 @@ impl<FS: ShimFS> Task<FS> {
         self.files
             .borrow()
             .fs
-            .rename(old_path, new_path)
-            .map_err(Errno::from)
+            .rename(old_path.clone(), new_path.clone())
+            .map_err(Errno::from)?;
+        let cookie = Self::next_inotify_cookie();
+        if let Ok(old_path) = old_path.to_str() {
+            self.notify_inotify_path(old_path, IN_MOVED_FROM, cookie);
+        }
+        if let Ok(new_path) = new_path.to_str() {
+            self.notify_inotify_path(new_path, IN_MOVED_TO, cookie);
+        }
+        Ok(())
     }
 
     /// Handle syscall `read`
@@ -1262,6 +1533,19 @@ impl<FS: ShimFS> Task<FS> {
         }
 
         let files = self.files.borrow();
+
+        if let Some(instance) = files.inotify_instances.lock().get(&raw_fd).cloned() {
+            let (n, eventfd) = {
+                let mut state = instance.lock();
+                if state.events.is_empty() {
+                    self.rescan_inotify_instance(&mut state);
+                }
+                let n = state.read_events(buf)?;
+                (n, state.eventfd.clone())
+            };
+            let _ = eventfd.with_entry(|file| file.read(&self.wait_cx()));
+            return Ok(n);
+        }
 
         // Fast path: host-pipe FDs bypass the multi-subsystem dispatch.
         if let Some(hp_fd) = files.try_host_pipe_fd(raw_fd) {
@@ -1488,7 +1772,13 @@ impl<FS: ShimFS> Task<FS> {
                     } else {
                         None
                     };
-                    files.fs.write(fd, buf, offset).map_err(Errno::from)
+                    let result = files.fs.write(fd, buf, offset).map_err(Errno::from);
+                    if matches!(result, Ok(n) if n > 0)
+                        && let Some(path) = files.fs.fd_path(fd)
+                    {
+                        self.notify_inotify_path(&path, IN_MODIFY, 0);
+                    }
+                    result
                 },
                 |fd| {
                     self.global.sendto(
@@ -2057,7 +2347,12 @@ impl<FS: ShimFS> Task<FS> {
 
     pub(crate) fn do_close(&self, raw_fd: usize) -> Result<(), Errno> {
         let files = self.files.borrow();
-        files.remove_inotify_fd(raw_fd);
+        if let Some(state) = files.remove_inotify_fd(raw_fd) {
+            self.global
+                .inotify_instances
+                .lock()
+                .retain(|registered| !Arc::ptr_eq(registered, &state));
+        }
         let mut rds = files.raw_descriptor_store.write();
         match rds.fd_consume_raw_integer(raw_fd) {
             Ok(fd) => {
@@ -4332,18 +4627,38 @@ impl<FS: ShimFS> Task<FS> {
             eventfd_flags |= EfdFlags::NONBLOCK;
         }
 
-        let raw_fd = self.sys_eventfd2(0, eventfd_flags)?;
-        self.files
-            .borrow()
-            .register_inotify_fd(usize::try_from(raw_fd).unwrap());
-        Ok(raw_fd)
+        let eventfd = super::eventfd::EventFile::new(0, eventfd_flags);
+        let mut dt = self.global.litebox.descriptor_table_mut();
+        let typed = dt.insert::<super::eventfd::EventfdSubsystem>(eventfd);
+        if flags.contains(OFlags::CLOEXEC) {
+            let old = dt.set_fd_metadata(&typed, FileDescriptorFlags::FD_CLOEXEC);
+            assert!(old.is_none());
+        }
+        let eventfd_handle = dt.entry_handle(&typed).ok_or(Errno::EBADF)?;
+        drop(dt);
+
+        let state = Arc::new(litebox::sync::Mutex::new(InotifyInstanceState::new(
+            eventfd_handle,
+        )));
+        let files = self.files.borrow();
+        let raw_fd = files.insert_raw_fd(typed).map_err(|typed| {
+            self.global
+                .litebox
+                .descriptor_table_mut()
+                .remove(&typed)
+                .unwrap();
+            Errno::EMFILE
+        })?;
+        files.register_inotify_fd(raw_fd, state.clone());
+        self.global.inotify_instances.lock().push(state);
+        Ok(raw_fd.try_into().unwrap())
     }
 
     pub fn sys_inotify_add_watch(
         &self,
         fd: i32,
         pathname: impl path::Arg,
-        _mask: u32,
+        mask: u32,
     ) -> Result<u32, Errno> {
         let raw_fd = u32::try_from(fd)
             .map_err(|_| Errno::EBADF)
@@ -4351,9 +4666,10 @@ impl<FS: ShimFS> Task<FS> {
         let resolved = self.resolve_path(pathname)?;
         self.do_stat(resolved.clone(), true)?;
         let resolved = resolved.into_string().map_err(|_| Errno::EINVAL)?;
+        let entries = self.inotify_dir_snapshot(&resolved);
         self.files.borrow().with_inotify_fd(raw_fd, |state| {
             state
-                .add_watch(resolved.clone())
+                .add_watch(resolved.clone(), mask, entries)
                 .and_then(|wd| u32::try_from(wd).map_err(|_| Errno::EINVAL))
         })
     }
