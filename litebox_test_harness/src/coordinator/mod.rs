@@ -120,24 +120,6 @@ pub struct Test {
 type TestRunFn =
     Box<dyn FnOnce(&'_ mut TestRunner) -> Pin<Box<dyn Future<Output = TestOutcome> + '_>>>;
 
-/// Quick boolean form of `detect_runtime_environment` — used to size
-/// per-pass cleanup budgets without re-running all six probes. Cached
-/// once at first call.
-#[allow(dead_code)] // retained for future use; current cleanup budgets are pass-uniform
-pub(crate) fn is_litebox_runtime() -> bool {
-    static CACHED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *CACHED.get_or_init(|| {
-        let has_trampoline = std::fs::read_to_string("/proc/self/maps")
-            .map(|maps| maps.contains("litebox_rtld_audit") || maps.contains("[trampoline]"))
-            .unwrap_or(false);
-        let has_litebox_env = std::env::var("LITEBOX_RUNNER").is_ok();
-        let proc_stat_litebox = std::fs::read_to_string("/proc/self/stat")
-            .map(|s| s.contains("(litebox_broker)") || s.contains("(litebox_runner"))
-            .unwrap_or(false);
-        has_trampoline || has_litebox_env || proc_stat_litebox
-    })
-}
-
 /// Per-child SIGKILL+wait budget in `teardown_tree`. Each agent in
 /// the matrix gets at most this long to exit after kill before we
 /// abandon the wait. Override via `LITEBOX_TEARDOWN_CHILD_TIMEOUT_MS`.
