@@ -392,8 +392,8 @@ fn register_tcp_cross_worker_concurrent_tests(reg: &mut Registry<'_>) {
         },
         StableCase {
             name: "depth2",
-            listener: AgentName::Dpg1Dpg1Dpg1Dng,
-            connector: AgentName::Dpg1Dpg1Dpg1DngDpg,
+            listener: AgentName::Dpg1Dng,
+            connector: AgentName::Dpg1DngDpg,
         },
     ];
 

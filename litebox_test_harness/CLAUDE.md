@@ -282,13 +282,57 @@ sshd_pty (depth 1)
   └── login_bash (depth 2)
         └── piped_sh (depth 3, stdin = pipe)
               └── launcher_bash (depth 4, sets up redirect)
-                    └── cli (depth 5, static-PIE-musl)
-                          └── node (depth 6, static-PIE-musl)
+                    └── cli (depth 5, StaticPieMusl)
+                          └── node (depth 6, NonPieGlibc)
 ```
+
+**Note on `node`:** the embedded Node.js binary in the VS Code Server
+distribution (`/root/.vscode-server/cli/servers/Stable-<commit>/server/node`)
+is the standard linux-x64 build: `ET_EXEC`, dynamically linked,
+`INTERP=/lib64/ld-linux-x86-64.so.2`. Confirmed via `readelf` plus
+strace evidence (`access("/etc/ld.so.preload")` immediately after
+`execve` returns). Even though Microsoft ships `cli-alpine-x64`
+(static-musl) for the CLI entry point, the bundled Node is glibc.
 
 Agents in `vscode_shape` use semantic names rather than structural
 ones because the test *is* the VS Code-shape scenario. Tests like
 `BR.cli_startup_mimic.*` belong here.
+
+## Worker-Host / Fork-Restore State Transitions (audit, 2026-05-07)
+
+A code-dive audit of `litebox_shim_linux/src/syscalls/process.rs` (and
+related fork-restore / worker-host paths in
+`litebox_platform_linux_userland`) answered the question: **does the
+second consecutive fork in a chain depend on what the first fork did?**
+
+**Verdict: independent. Depth-2 covers all transitions.**
+
+No code path was found that consults grandparent ancestry or prior
+fork-chain history when doing the next fork/exec handoff. Each
+transition snapshots/restores the current task state only. The second
+fork in a chain is driven by the immediate parent's live state, not by
+what the first fork did.
+
+| Lifecycle event | Trigger | State accumulated | Grandparent-dependent? |
+|---|---|---|---|
+| Worker-host spawn | True-fork (`process.rs:6444-6492`) and delayed-fork exec when `needs_remote` (`process.rs:9218-9276`) | New host PID in `fork_child_host_pids`, control-plane ownership, background waiter | **No** |
+| Worker-host teardown | Child host exit (`process.rs:6288-6344`); exec path waits synchronously (`process.rs:8981-9015`) | Removes mappings, unregisters from control plane, reports to process registry | **No** |
+| fd-bridge inheritance | Delayed-fork exec collects child pipes/sockets, builds `parent_*_replacements` (`process.rs:8698-8970`) | `vfork_info.fd_replacements`; direct stdio installed as `HostPipeFd` | **No** |
+| pidfd registration | `pidfd_open` for local targets only (`process.rs:1732-1775`); rejects remote-running | Plain fd in local table | **No** |
+| Signal-mask propagation | True-fork snapshots blocked mask, handlers, altstack (`process.rs:6727-6740`); exec resets via `reset_for_exec()` (`process.rs:9362-9369`) | Snapshot of current task only | **No** |
+| execveat / fork-restore handoff | Routed via `exec_on_remote_host` if `needs_remote` (`process.rs:9142-9165`) | Bridges + `reset_for_exec()` clears thread-local state | **No** |
+| clone3 vfork | Same vfork parking / delayed-fork machinery as clone (`process.rs:1777-1885`) | Same `ForkContext` recording | **No** |
+
+**Implication for the test matrix:** the canonical coverage pattern is
+**depth-2 with `BinaryType::ALL` fan-out**. There is no need for a
+hand-curated Tier-2 of depth-3 chains exercising "interacting"
+transition pairs — none were found.
+
+Depth-3+ chains that exist in the historical agent tree (`AAAA`/`AAAAA`
+in the legacy taxonomy, `Dpg1Dpg1Dpg1Dng` / `Dpg1Dpg1Dpg1DngDpg` in
+the path-encoded taxonomy) do not exercise distinct shim code paths
+beyond the shallower equivalents (`Dpg1Dng` / `Dpg1DngDpg`) and have
+been removed.
 
 ## Test Categories
 

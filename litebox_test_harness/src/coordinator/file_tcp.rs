@@ -701,8 +701,8 @@ const FT_AXIS_CASES: &[FtAxisCase] = &[
     },
     FtAxisCase {
         name: "depth2",
-        server: AgentName::Dpg1Dpg1Dpg1Dng,
-        client: AgentName::Dpg1Dpg1Dpg1DngDpg,
+        server: AgentName::Dpg1Dng,
+        client: AgentName::Dpg1DngDpg,
     },
 ];
 

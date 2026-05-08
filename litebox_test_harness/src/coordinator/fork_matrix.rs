@@ -519,7 +519,7 @@ pub(crate) fn register_fork_matrix(reg: &mut Registry<'_>) {
         (AgentName::Dpg1, ""),
         (AgentName::Dpg1Dpg1, ".AA"),
         (AgentName::Dpg2, ".B"),
-        (AgentName::Dpg1Dpg1Dpg1Dng, ".D4"),
+        (AgentName::Dpg1Dng, ".dpg1_dng"),
     ] {
         let id = format!("XM.node_networkInterfaces{suffix}");
         let agent_label = agent.to_string();

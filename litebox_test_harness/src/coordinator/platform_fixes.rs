@@ -31,7 +31,6 @@ const NPIPE_AGENTS: &[AgentName] = &[
     AgentName::Dpg1Dpg1,
     AgentName::Dpg2,
     AgentName::Dpg1Dng,
-    AgentName::Dpg1Dpg1Dpg1Dng,
 ];
 
 // ═══════════════════════════════════════════════════════════════════
@@ -1070,8 +1069,8 @@ pub(crate) fn register_minimal_canary_tests(reg: &mut Registry<'_>) {
         AgentName::Dpg1,
         AgentName::Dpg1Dpg1,
         AgentName::Dpg1Dpg1Dpg1,
-        AgentName::Dpg1Dpg1Dpg1Dng,
-        AgentName::Dpg1Dpg1Dpg1DngDpg,
+        AgentName::Dpg1Dng,
+        AgentName::Dpg1DngDpg,
     ];
     const M_VARIANTS: &[(&str, &str, &str, u64)] = &[
         // (id_prefix, subcommand, expected_stdout_marker, exec_timeout_secs)
@@ -2704,19 +2703,19 @@ pub(crate) fn register_epoll_socket_tests(reg: &mut Registry<'_>) {
             AgentName::Dpg1,
             AgentName::Dpg1Dpg1,
             AgentName::Dpg2,
-            AgentName::Dpg1Dpg1Dpg1Dng,
-            AgentName::Dpg1Dpg1Dpg1DngDpg,
+            AgentName::Dpg1Dng,
+            AgentName::Dpg1DngDpg,
         ] {
             let port: u16 = match (variant, agent) {
                 ("direct", AgentName::Dpg1) => 19990,
                 ("direct", AgentName::Dpg1Dpg1) => 19991,
                 ("direct", AgentName::Dpg2) => 19992,
-                ("direct", AgentName::Dpg1Dpg1Dpg1Dng) => 19993,
+                ("direct", AgentName::Dpg1Dng) => 19993,
                 ("direct", _) => 19994,
                 ("tokio", AgentName::Dpg1) => 19995,
                 ("tokio", AgentName::Dpg1Dpg1) => 19996,
                 ("tokio", AgentName::Dpg2) => 19997,
-                ("tokio", AgentName::Dpg1Dpg1Dpg1Dng) => 19998,
+                ("tokio", AgentName::Dpg1Dng) => 19998,
                 _ => 19999,
             };
 

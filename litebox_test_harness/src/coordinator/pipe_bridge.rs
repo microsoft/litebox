@@ -34,7 +34,7 @@ pub(crate) fn register_pipe_bridge(reg: &mut Registry<'_>) {
         timeout: u64,
     }
 
-    const XWORKER_AGENTS: &[AgentName] = &[AgentName::Dpg1Dng, AgentName::Dpg1Dpg1Dpg1Dng];
+    const XWORKER_AGENTS: &[AgentName] = &[AgentName::Dpg1Dng];
 
     let cases: &[PbCase] = &[
         PbCase {

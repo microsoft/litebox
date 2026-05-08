@@ -799,7 +799,6 @@ pub(crate) fn register_unix_socket(reg: &mut Registry<'_>) {
         AgentName::Dpg1Dpg1,
         AgentName::Dpg2,
         AgentName::Dpg1Dpg1Dpg1,
-        AgentName::Dpg1Dpg1Dpg1Dng,
         AgentName::Dpg1Dng,
     ] {
         for &bt in crate::BinaryType::ALL {
@@ -872,7 +871,6 @@ pub(crate) fn register_unix_socket(reg: &mut Registry<'_>) {
         AgentName::Dpg1Dpg1,
         AgentName::Dpg2,
         AgentName::Dpg1Dpg1Dpg1,
-        AgentName::Dpg1Dpg1Dpg1Dng,
         AgentName::Dpg1Dng,
     ] {
         for &bt in crate::BinaryType::ALL {
@@ -1284,9 +1282,9 @@ pub(crate) fn register_cross_worker(reg: &mut Registry<'_>) {
         reg,
         "xworker",
         "cross_worker",
-        "XW7.dpg1_dpg1_dpg1_dng_listen",
+        "XW7.dpg1_dng_listen",
         timeout = 60,
-        agents[d4 = AgentName::Dpg1Dpg1Dpg1Dng],
+        agents[d4 = AgentName::Dpg1Dng],
         |run| {
             let resp = run
                 .send(
@@ -1297,11 +1295,11 @@ pub(crate) fn register_cross_worker(reg: &mut Registry<'_>) {
                 )
                 .await;
             let pass = super::expect_unix_listening_path(&resp, "/tmp/xw7.sock").is_ok();
-            super::TestOutcome::new(AgentName::Dpg1Dpg1Dpg1Dng.name(), pass, format!("{resp:?}"))
+            super::TestOutcome::new(AgentName::Dpg1Dng.name(), pass, format!("{resp:?}"))
         }
     );
 
-    typed_test!(reg, "xworker", "cross_worker", "XW7.dpg1_dpg1_dpg1_connect", timeout = 60, agents [d4 = AgentName::Dpg1Dpg1Dpg1Dng, d3 = AgentName::Dpg1Dpg1Dpg1], |run| {
+    typed_test!(reg, "xworker", "cross_worker", "XW7.dpg1_dpg1_dpg1_connect", timeout = 60, agents [d4 = AgentName::Dpg1Dng, d3 = AgentName::Dpg1Dpg1Dpg1], |run| {
         let listen_resp = run.send(&d4, Command::UnixListen { path: "/tmp/xw7c.sock".to_string() }).await;
         if super::expect_unix_listening_path(&listen_resp, "/tmp/xw7c.sock").is_err() {
             return super::TestOutcome::new(AgentName::Dpg1Dpg1Dpg1.name(), false, format!("listen setup failed: {listen_resp:?}"));
@@ -1334,25 +1332,25 @@ pub(crate) fn register_cross_worker(reg: &mut Registry<'_>) {
         }
     );
 
-    typed_test!(reg, "xworker", "cross_worker", "XW8.dpg1_dpg1_dpg1_dng_connect", timeout = 60, agents [d3 = AgentName::Dpg1Dpg1Dpg1, d4 = AgentName::Dpg1Dpg1Dpg1Dng], |run| {
+    typed_test!(reg, "xworker", "cross_worker", "XW8.dpg1_dng_connect", timeout = 60, agents [d3 = AgentName::Dpg1Dpg1Dpg1, d4 = AgentName::Dpg1Dng], |run| {
         let listen_resp = run.send(&d3, Command::UnixListen { path: "/tmp/xw8c.sock".to_string() }).await;
         if super::expect_unix_listening_path(&listen_resp, "/tmp/xw8c.sock").is_err() {
-            return super::TestOutcome::new(AgentName::Dpg1Dpg1Dpg1Dng.name(), false, format!("listen setup failed: {listen_resp:?}"));
+            return super::TestOutcome::new(AgentName::Dpg1Dng.name(), false, format!("listen setup failed: {listen_resp:?}"));
         }
         let resp = run
             .send(&d4, Command::UnixConnect { path: "/tmp/xw8c.sock".to_string(), data: "XW8_D4_TO_D3".to_string() })
             .await;
         let pass = matches!(&resp, Response::Connected { echo } if echo.contains("XW8_D4_TO_D3"));
-        super::TestOutcome::new(AgentName::Dpg1Dpg1Dpg1Dng.name(), pass, format!("{resp:?}"))
+        super::TestOutcome::new(AgentName::Dpg1Dng.name(), pass, format!("{resp:?}"))
     });
 
     typed_test!(
         reg,
         "xworker",
         "cross_worker",
-        "XW9.dpg1_dpg1_dpg1_dng_listen",
+        "XW9.dpg1_dng_listen",
         timeout = 60,
-        agents[d4 = AgentName::Dpg1Dpg1Dpg1Dng],
+        agents[d4 = AgentName::Dpg1Dng],
         |run| {
             let resp = run
                 .send(
@@ -1363,11 +1361,11 @@ pub(crate) fn register_cross_worker(reg: &mut Registry<'_>) {
                 )
                 .await;
             let pass = super::expect_unix_listening_path(&resp, "/tmp/xw9.sock").is_ok();
-            super::TestOutcome::new(AgentName::Dpg1Dpg1Dpg1Dng.name(), pass, format!("{resp:?}"))
+            super::TestOutcome::new(AgentName::Dpg1Dng.name(), pass, format!("{resp:?}"))
         }
     );
 
-    typed_test!(reg, "xworker", "cross_worker", "XW9.dpg1_dpg1_connect", timeout = 60, agents [d4 = AgentName::Dpg1Dpg1Dpg1Dng, aa = AgentName::Dpg1Dpg1], |run| {
+    typed_test!(reg, "xworker", "cross_worker", "XW9.dpg1_dpg1_connect", timeout = 60, agents [d4 = AgentName::Dpg1Dng, aa = AgentName::Dpg1Dpg1], |run| {
         let listen_resp = run.send(&d4, Command::UnixListen { path: "/tmp/xw9c.sock".to_string() }).await;
         if super::expect_unix_listening_path(&listen_resp, "/tmp/xw9c.sock").is_err() {
             return super::TestOutcome::new(AgentName::Dpg1Dpg1.name(), false, format!("listen setup failed: {listen_resp:?}"));
@@ -1468,7 +1466,6 @@ pub(crate) fn register_pipe_eof(reg: &mut Registry<'_>) {
         AgentName::Dpg1Dpg1,
         AgentName::Dpg2,
         AgentName::Dpg1Dpg1Dpg1,
-        AgentName::Dpg1Dpg1Dpg1Dng,
         AgentName::Dpg1Dng,
     ] {
         for &bt in crate::BinaryType::ALL {

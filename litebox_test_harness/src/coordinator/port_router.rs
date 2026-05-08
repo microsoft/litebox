@@ -556,10 +556,10 @@ fn register_depth_axis_tests(reg: &mut Registry<'_>) {
     reg.test("stress", "port_router", "PR.child_listen_depth2")
         .timeout(180)
         .build(|cx| {
-            let connector = cx.require(AgentName::Dpg1Dpg1Dpg1DngDpg);
+            let connector = cx.require(AgentName::Dpg1DngDpg);
             let child = cx.declare_ephemeral(
-                AgentName::Dpg1Dpg1Dpg1Dng,
-                "CL_dpg1_dpg1_dpg1_dng",
+                AgentName::Dpg1Dng,
+                "CL_dpg1_dng",
                 SpawnKind::Fork {
                     binary: "self",
                     inherit_listen_ports: vec![],
@@ -572,7 +572,7 @@ fn register_depth_axis_tests(reg: &mut Registry<'_>) {
                     let spawn_resp = run.spawn_ephemeral(&child).await;
                     if !matches!(&spawn_resp, Response::Ok { .. }) {
                         return super::TestOutcome::new(
-                            "dpg1_dpg1_dpg1_dng_dpg->CL_dpg1_dpg1_dpg1_dng",
+                            "dpg1_dng_dpg->CL_dpg1_dng",
                             false,
                             format!("fork failed: {spawn_resp:?}"),
                         );
@@ -581,7 +581,7 @@ fn register_depth_axis_tests(reg: &mut Registry<'_>) {
                     if !matches!(&listen_resp, Response::Listening { port: p } if *p == port) {
                         let _ = run.forward(&child, Command::Exit).await;
                         return super::TestOutcome::new(
-                            "dpg1_dpg1_dpg1_dng_dpg->CL_dpg1_dpg1_dpg1_dng",
+                            "dpg1_dng_dpg->CL_dpg1_dng",
                             false,
                             format!("child listen failed: {listen_resp:?}"),
                         );
@@ -598,7 +598,7 @@ fn register_depth_axis_tests(reg: &mut Registry<'_>) {
                     let pass = matches!(&conn_resp, Response::Connected { echo } if echo == "child_listen_depth2");
                     let _ = run.forward(&child, Command::NetUnlisten { port }).await;
                     let _ = run.forward(&child, Command::Exit).await;
-                    super::TestOutcome::new("dpg1_dpg1_dpg1_dng_dpg->CL_dpg1_dpg1_dpg1_dng", pass, format!("{conn_resp:?}"))
+                    super::TestOutcome::new("dpg1_dng_dpg->CL_dpg1_dng", pass, format!("{conn_resp:?}"))
                 })
             })
         });

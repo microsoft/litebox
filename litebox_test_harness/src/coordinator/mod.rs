@@ -928,8 +928,8 @@ async fn run_tests(self_exe: &str, filter: Option<&str>) -> Vec<TestResult> {
                 agents::AgentName::Dpg3Dpg,
                 agents::AgentName::Dpg1Dng,
                 agents::AgentName::Dpg1DngDpg,
-                agents::AgentName::Dpg1Dpg1Dpg1Dng,
-                agents::AgentName::Dpg1Dpg1Dpg1DngDpg,
+                agents::AgentName::Dpg1Dng,
+                agents::AgentName::Dpg1DngDpg,
             ] {
                 declared_union.insert(a);
             }

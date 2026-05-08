@@ -37,8 +37,6 @@ pub enum AgentName {
     Dpg2Dpg,
     Dpg1Dng,
     Dpg1DngDpg,
-    Dpg1Dpg1Dpg1Dng,
-    Dpg1Dpg1Dpg1DngDpg,
     /// Subtree-kill ephemeral root. Spawned as a direct child of the
     /// coordinator (like `Dpg1`, `Dpg2`) and intended to be `SIGKILLed`
     /// by the SK.subtree.* tests. Per-Trial docker isolation guarantees
@@ -69,8 +67,6 @@ impl AgentName {
             AgentName::Dpg1Dpg1Dpg1 => "dpg1_dpg1_dpg1",
             AgentName::Dpg1Dpg1Dpg2 => "dpg1_dpg1_dpg2",
             AgentName::Dpg1DngDpg => "dpg1_dng_dpg",
-            AgentName::Dpg1Dpg1Dpg1Dng => "dpg1_dpg1_dpg1_dng",
-            AgentName::Dpg1Dpg1Dpg1DngDpg => "dpg1_dpg1_dpg1_dng_dpg",
             AgentName::Dpg2Dpg => "dpg2_dpg",
             AgentName::Dpg3Dpg => "dpg3_dpg",
             AgentName::VsCodeSshdPty => "vscode_sshd_pty",
@@ -97,8 +93,6 @@ impl AgentName {
             "dpg1_dpg1_dpg1" => Some(AgentName::Dpg1Dpg1Dpg1),
             "dpg1_dpg1_dpg2" => Some(AgentName::Dpg1Dpg1Dpg2),
             "dpg1_dng_dpg" => Some(AgentName::Dpg1DngDpg),
-            "dpg1_dpg1_dpg1_dng" => Some(AgentName::Dpg1Dpg1Dpg1Dng),
-            "dpg1_dpg1_dpg1_dng_dpg" => Some(AgentName::Dpg1Dpg1Dpg1DngDpg),
             "dpg2_dpg" => Some(AgentName::Dpg2Dpg),
             "dpg3_dpg" => Some(AgentName::Dpg3Dpg),
             "vscode_sshd_pty" => Some(AgentName::VsCodeSshdPty),
@@ -114,9 +108,8 @@ impl AgentName {
     /// The chain of agents that must already exist for `self` to be
     /// reachable. For `Dpg1` and `Dpg2` this is empty; for
     /// `Dpg1Dpg1Dpg1DngDpg` it is
-    /// `[Dpg1, Dpg1Dpg1, Dpg1Dpg1Dpg1, Dpg1Dpg1Dpg1Dng]`. Used by
-    /// `spawn_tree` to expand a per-test declared set into the full set
-    /// of agents that must be alive.
+    /// `[Dpg1, Dpg1Dng]`. Used by `spawn_tree` to expand a per-test
+    /// declared set into the full set of agents that must be alive.
     pub const fn ancestors(self) -> &'static [AgentName] {
         match self {
             AgentName::Init
@@ -131,17 +124,6 @@ impl AgentName {
                 &[AgentName::Dpg1, AgentName::Dpg1Dpg1]
             }
             AgentName::Dpg1DngDpg => &[AgentName::Dpg1, AgentName::Dpg1Dng],
-            AgentName::Dpg1Dpg1Dpg1Dng => &[
-                AgentName::Dpg1,
-                AgentName::Dpg1Dpg1,
-                AgentName::Dpg1Dpg1Dpg1,
-            ],
-            AgentName::Dpg1Dpg1Dpg1DngDpg => &[
-                AgentName::Dpg1,
-                AgentName::Dpg1Dpg1,
-                AgentName::Dpg1Dpg1Dpg1,
-                AgentName::Dpg1Dpg1Dpg1Dng,
-            ],
             AgentName::VsCodeLoginBash => &[AgentName::VsCodeSshdPty],
             AgentName::VsCodePipedSh => &[AgentName::VsCodeSshdPty, AgentName::VsCodeLoginBash],
             AgentName::VsCodeLauncherBash => &[
@@ -180,8 +162,6 @@ impl AgentName {
             AgentName::Dpg3Dpg => Some(AgentName::Dpg3),
             AgentName::Dpg1Dpg1Dpg1 | AgentName::Dpg1Dpg1Dpg2 => Some(AgentName::Dpg1Dpg1),
             AgentName::Dpg1DngDpg => Some(AgentName::Dpg1Dng),
-            AgentName::Dpg1Dpg1Dpg1Dng => Some(AgentName::Dpg1Dpg1Dpg1),
-            AgentName::Dpg1Dpg1Dpg1DngDpg => Some(AgentName::Dpg1Dpg1Dpg1Dng),
             AgentName::VsCodeLoginBash => Some(AgentName::VsCodeSshdPty),
             AgentName::VsCodePipedSh => Some(AgentName::VsCodeLoginBash),
             AgentName::VsCodeLauncherBash => Some(AgentName::VsCodePipedSh),
@@ -316,18 +296,6 @@ pub fn default_tree() -> Vec<AgentSpec> {
         AgentSpec {
             name: AgentName::Dpg1DngDpg,
             parent: Some(AgentName::Dpg1Dng),
-            binary: Pie,
-            isolation: Standard,
-        },
-        AgentSpec {
-            name: AgentName::Dpg1Dpg1Dpg1Dng,
-            parent: Some(AgentName::Dpg1Dpg1Dpg1),
-            binary: NonPie,
-            isolation: Standard,
-        },
-        AgentSpec {
-            name: AgentName::Dpg1Dpg1Dpg1DngDpg,
-            parent: Some(AgentName::Dpg1Dpg1Dpg1Dng),
             binary: Pie,
             isolation: Standard,
         },
