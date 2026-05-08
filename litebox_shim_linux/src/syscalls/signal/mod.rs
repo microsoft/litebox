@@ -527,7 +527,9 @@ pub(crate) fn siginfo_kernel(signal: Signal) -> Siginfo {
 
 impl SignalState {
     /// Updates the blocked signal mask.
-    fn set_signal_mask(&self, mask: SigSet) {
+    fn set_signal_mask(&self, mut mask: SigSet) {
+        mask.remove(Signal::SIGKILL);
+        mask.remove(Signal::SIGSTOP);
         self.blocked.set(mask);
     }
 
@@ -1107,10 +1109,10 @@ impl<FS: ShimFS> Task<FS> {
             return Err(Errno::ESRCH);
         }
 
-        // If the target is a fork child running in a remote worker host,
-        // forward the signal to the worker host OS process directly.
-        // This includes signal 0 (existence check) so we test host-level
-        // liveness rather than relying on guest registry state alone.
+        // If the target is running in a remote worker host (fork-restore or
+        // remote exec), forward the signal to the worker host OS process
+        // directly. This includes signal 0 (existence check) so we test
+        // host-level liveness rather than relying on guest registry state alone.
         if let Some(&host_pid) = self.global.fork_child_host_pids.read().get(&target.0) {
             if signal == 0 {
                 let ret = self.global.platform.kill_worker_host(host_pid, 0);
@@ -1154,6 +1156,16 @@ impl<FS: ShimFS> Task<FS> {
             );
             return Err(Errno::EOPNOTSUPP);
         }
+
+        // SIGKILL is not deferrable; publish process exit immediately so pidfd
+        // pollers observe readiness even if the target is asleep in a futex.
+        if is_local && signal == Signal::SIGKILL {
+            let _ = self
+                .global
+                .litebox
+                .process_registry()
+                .exit_process(target, 128 + signal.as_i32());
+        }
         self.global
             .cross_process_signals
             .lock()
@@ -1164,7 +1176,8 @@ impl<FS: ShimFS> Task<FS> {
                 siginfo: siginfo_kill(signal),
             });
 
-        if let Some(remote) = self.global.process_thread_handles.read().get(&pid) {
+        let target_key = target.0.cast_signed();
+        if let Some(remote) = self.global.process_thread_handles.read().get(&target_key) {
             remote.interrupt();
         }
         Ok(0)

@@ -1739,13 +1739,21 @@ impl<FS: ShimFS> Task<FS> {
         if flags & !PIDFD_NONBLOCK != 0 {
             return Err(Errno::EINVAL);
         }
-        self.reject_remote_running_process_control(ProcessId(pid), "pidfd_open")?;
+        let guest_pid = pid.cast_signed();
+        let process_id = self
+            .global
+            .pid_to_process_id
+            .read()
+            .get(&guest_pid)
+            .copied()
+            .unwrap_or(ProcessId(pid));
+        self.reject_remote_running_process_control(process_id, "pidfd_open")?;
 
         let state = self
             .global
             .litebox
             .process_registry()
-            .exit_state(ProcessId(pid))
+            .exit_state(process_id)
             .ok_or(Errno::ESRCH)?;
         let pidfd = crate::syscalls::eventfd::EventFile::new_pidfd(
             state.exited,
@@ -8899,6 +8907,12 @@ impl<FS: ShimFS> Task<FS> {
         // originals).  Do NOT close them again here — that would double-close
         // and trigger IO Safety violations if the fd number was reused.
 
+        let host_pid = spawn_result.host_pid;
+        self.global
+            .fork_child_host_pids
+            .write()
+            .insert(self.process_id.0, host_pid);
+
         // Replace parent's peer unix socket fds with HostPipeFd backed
         // by the OS socketpair parent end. Find the peer by pair_id.
         // Also replace parent's peer pipe fds.
@@ -8991,8 +9005,6 @@ impl<FS: ShimFS> Task<FS> {
         // promptly so parent-side posix_spawn handshakes can observe EOF.
         self.close_on_exec();
 
-        let host_pid = spawn_result.host_pid;
-
         #[cfg(feature = "trace_syscalls")]
         litebox::log_println!(
             self.global.platform,
@@ -9002,6 +9014,10 @@ impl<FS: ShimFS> Task<FS> {
         );
 
         let exit_code = self.global.platform.wait_worker_host(host_pid);
+        self.global
+            .fork_child_host_pids
+            .write()
+            .remove(&self.process_id.0);
 
         #[cfg(feature = "trace_syscalls")]
         litebox::log_println!(
