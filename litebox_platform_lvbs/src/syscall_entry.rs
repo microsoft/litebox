@@ -33,7 +33,7 @@ pub(crate) fn init() {
     let syscall_entry_addr = syscall_entry_wrapper as *const () as u64;
     LStar::write(VirtAddr::new(syscall_entry_addr));
 
-    let rflags = RFlags::INTERRUPT_FLAG;
+    let rflags = RFlags::INTERRUPT_FLAG | RFlags::DIRECTION_FLAG | RFlags::ALIGNMENT_CHECK;
     SFMask::write(rflags);
 
     // configure STAR MSR for CS/SS selectors
