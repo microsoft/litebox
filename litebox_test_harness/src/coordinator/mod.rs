@@ -120,6 +120,39 @@ pub struct Test {
 type TestRunFn =
     Box<dyn FnOnce(&'_ mut TestRunner) -> Pin<Box<dyn Future<Output = TestOutcome> + '_>>>;
 
+/// Per-child SIGKILL+wait budget in `teardown_tree`. Each agent in
+/// the matrix gets at most this long to exit after kill before we
+/// abandon the wait. Override via `LITEBOX_TEARDOWN_CHILD_TIMEOUT_MS`.
+fn child_kill_wait_timeout() -> Duration {
+    if let Ok(s) = std::env::var("LITEBOX_TEARDOWN_CHILD_TIMEOUT_MS")
+        && let Ok(ms) = s.parse::<u64>()
+    {
+        return Duration::from_millis(ms);
+    }
+    Duration::from_millis(2000)
+}
+
+/// Outer wall-clock cap on the entire `teardown_tree` call. The
+/// teardown loop is parallelized, so wall is `max(per_child)` rather
+/// than `sum(per_child)`. Empirical measurement (CF family, 280
+/// native+litebox trials, 2026-05-08) shows per-child kill+wait is
+/// fast on both passes:
+///   native:  mean 4 ms, p99 18 ms, max 31 ms
+///   litebox: mean 8 ms, p99 26 ms, max 39 ms
+/// So even with conservative headroom (10× max, plus matrix size
+/// up to ~8 agents that all run concurrently), 5 s is ample.
+/// The cap exists to protect against pathologies (stuck tokio
+/// reactor, kernel deadlock); it should never fire in normal
+/// operation. Override via `LITEBOX_TEARDOWN_TREE_TIMEOUT_MS`.
+fn teardown_tree_timeout() -> Duration {
+    if let Ok(s) = std::env::var("LITEBOX_TEARDOWN_TREE_TIMEOUT_MS")
+        && let Ok(ms) = s.parse::<u64>()
+    {
+        return Duration::from_millis(ms);
+    }
+    Duration::from_millis(5_000)
+}
+
 /// Detect whether we're running inside litebox or on native Linux.
 ///
 /// Returns a human-readable string like:
@@ -492,12 +525,45 @@ impl TestRunner {
 
     /// Hard-kill the entire agent tree. No cooperative Exit — agents
     /// may be hung in syscalls that never return.
+    ///
+    /// Per-child kill+wait runs in parallel via `tokio::task::JoinSet`
+    /// so the wall-clock cost is `max(per_child)` instead of
+    /// `sum(per_child)`. Each child's budget is bounded independently
+    /// by `child_kill_wait_timeout()`. The outer cap on the whole call
+    /// is set by the caller via `tokio::time::timeout` (see
+    /// `run_with_runner`).
     async fn teardown_tree(&mut self) {
-        for (id, mut child) in self.children.drain() {
-            let _ = child.process.kill().await;
-            // Short wait — don't block forever on zombie reaping.
-            let _ = tokio::time::timeout(Duration::from_secs(2), child.process.wait()).await;
-            eprintln!("[coord] {id} killed");
+        let per_child = child_kill_wait_timeout();
+        let drained: Vec<(String, Child)> = self.children.drain().collect();
+        if drained.is_empty() {
+            self.poisoned.clear();
+            return;
+        }
+        let mut set = tokio::task::JoinSet::new();
+        for (id, mut child) in drained {
+            set.spawn(async move {
+                let t0 = std::time::Instant::now();
+                let _ = child.process.kill().await;
+                let waited = tokio::time::timeout(per_child, child.process.wait()).await;
+                let elapsed = t0.elapsed();
+                let timed_out = waited.is_err();
+                (id, elapsed, timed_out)
+            });
+        }
+        while let Some(res) = set.join_next().await {
+            match res {
+                Ok((id, elapsed, timed_out)) => {
+                    if timed_out {
+                        eprintln!(
+                            "[coord] {id} kill+wait exceeded {} ms — wait abandoned",
+                            per_child.as_millis()
+                        );
+                    } else {
+                        eprintln!("[coord] {id} killed in {} ms", elapsed.as_millis());
+                    }
+                }
+                Err(e) => eprintln!("[coord] teardown task join error: {e}"),
+            }
         }
         self.poisoned.clear();
     }
@@ -966,19 +1032,31 @@ async fn run_tests(self_exe: &str, filter: Option<&str>) -> Vec<TestResult> {
                 }
             }
         }
-        // Bound teardown wall-clock. Under litebox the per-child wait
-        // already has a 2s timeout (see `teardown_tree`), but a stuck
-        // tokio reactor can keep the outer `block_on` parked in
-        // `epoll_pwait(-1)` indefinitely. A top-level cap ensures the
-        // coordinator returns to `main` so we can hard-exit even if
-        // tokio's per-future timer didn't fire as intended.
-        if tokio::time::timeout(Duration::from_secs(10), runner.teardown_tree())
+        // Bound teardown wall-clock. Inner per-child waits are
+        // already bounded (see `teardown_tree`); this cap protects
+        // the coordinator from a stuck tokio reactor or
+        // pathologically large agent matrix. Pass-aware default
+        // (tighter on native, roomier under litebox) — see
+        // `teardown_tree_timeout`.
+        let outer_cap = teardown_tree_timeout();
+        let t_outer = std::time::Instant::now();
+        if tokio::time::timeout(outer_cap, runner.teardown_tree())
             .await
             .is_err()
         {
+            // Forensics: report the total wall, the per-child cap,
+            // and how many children were still in the map. The
+            // parallelized teardown_tree above already logs each
+            // child's elapsed/timeout individually before we get
+            // here; this final line summarizes the timeout event so
+            // it's grep-able.
             eprintln!(
-                "[coord] teardown_tree exceeded 10s — abandoning agent cleanup, hard-exit will reap"
+                "[coord] teardown_tree exceeded {} ms (per-child cap {} ms, still-tracked agents at outer-fire: {}); abandoning agent cleanup, hard-exit will reap",
+                outer_cap.as_millis(),
+                child_kill_wait_timeout().as_millis(),
+                runner.children.len(),
             );
+            let _ = t_outer;
         }
         // Validate the lazy-matrix decision: every contacted agent
         // must have been spawned. A mismatch is a heuristic bug
