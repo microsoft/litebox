@@ -1355,7 +1355,7 @@ impl litebox::platform::RawMutex for RawMutex {
         }
 
         // For windows, the OS kernel does not tell us how many threads were actually woken up,
-        // so we just return zero
+        // so we return zero to indicate that the count is unknown.
         0
     }
 

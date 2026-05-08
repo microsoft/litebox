@@ -298,18 +298,24 @@ pub trait RawMutex: Send + Sync + 'static {
     /// Wake up `n` threads blocked on on this raw mutex.
     ///
     /// Returns the number of waiters that were woken up.
+    /// Some platforms cannot observe this number and may return zero
+    /// even when one or more waiters were woken up, so callers must
+    /// not rely on zero meaning that no waiters were woken up.
     fn wake_many(&self, n: usize) -> usize;
 
     /// Wake up one thread blocked on this raw mutex.
     ///
-    /// Returns true if this actually woke up such a thread, or false if no thread was waiting on this raw mutex.
+    /// Returns true if this actually woke up such a thread. Returns false
+    /// if no thread was waiting on this raw mutex, or if the platform
+    /// cannot observe whether a thread was woken up.
     fn wake_one(&self) -> bool {
         self.wake_many(1) > 0
     }
 
     /// Wake up all threads that are blocked on this raw mutex.
     ///
-    /// Returns the number of waiters that were woken up.
+    /// Returns the number of waiters that were woken up. This may be
+    /// zero on platforms that cannot observe this number.
     fn wake_all(&self) -> usize {
         self.wake_many(i32::MAX as usize)
     }
