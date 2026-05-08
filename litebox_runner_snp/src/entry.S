@@ -76,6 +76,7 @@ ignore_sysret:
 
     .org 0x120
 entry_SYSCALL_64:
+    cld
     swapgs
     mov     gs:0x0, rsp
     mov     rsp, gs:0x8
