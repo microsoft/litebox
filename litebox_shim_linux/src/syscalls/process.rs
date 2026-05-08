@@ -8189,10 +8189,11 @@ impl<FS: ShimFS> Task<FS> {
         if pid < 0 {
             return Err(Errno::EINVAL);
         }
-        if pid == 0 {
-            return Ok(self.pid.cast_unsigned());
-        }
-        let target = ProcessId(pid.cast_unsigned());
+        let target = if pid == 0 {
+            self.process_id
+        } else {
+            ProcessId(pid.cast_unsigned())
+        };
         self.global
             .litebox
             .process_registry()

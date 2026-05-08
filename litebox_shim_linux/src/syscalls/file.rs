@@ -4907,30 +4907,6 @@ impl<FS: ShimFS> Task<FS> {
             return Err(Errno::EBADF);
         };
 
-        if desc <= 2 {
-            match arg {
-                IoctlArg::TIOCGPGRP(pgrp) => {
-                    pgrp.write_at_offset(0, self.pid).ok_or(Errno::EFAULT)?;
-                    return Ok(0);
-                }
-                IoctlArg::TIOCSPGRP(_) | IoctlArg::TIOCSCTTY => return Ok(0),
-                IoctlArg::TIOCGWINSZ(ws) => {
-                    ws.write_at_offset(
-                        0,
-                        litebox_common_linux::Winsize {
-                            row: 41,
-                            col: 132,
-                            xpixel: 0,
-                            ypixel: 0,
-                        },
-                    )
-                    .ok_or(Errno::EFAULT)?;
-                    return Ok(0);
-                }
-                _ => {}
-            }
-        }
-
         let files = self.files.borrow();
         match arg {
             IoctlArg::FIONREAD(out) => {
@@ -5245,38 +5221,10 @@ impl<FS: ShimFS> Task<FS> {
                 |term_fd| match self.classify_terminal(&files.fs, term_fd)? {
                     TerminalKind::HostStdio => self.host_stdio_ioctl(&files.fs, term_fd, &arg),
                     TerminalKind::Pty => self.pty_ioctl(&files.fs, term_fd, &arg),
-                    TerminalKind::NotTerminal if desc <= 2 => match arg {
-                        IoctlArg::TIOCGPGRP(pgrp) => {
-                            let value =
-                                i32::try_from(self.sys_getpgid(0).unwrap_or(1)).unwrap_or(1);
-                            pgrp.write_at_offset(0, value).ok_or(Errno::EFAULT)?;
-                            Ok(0)
-                        }
-                        IoctlArg::TIOCSPGRP(_) | IoctlArg::TIOCSCTTY => Ok(0),
-                        _ => Err(Errno::ENOTTY),
-                    },
                     TerminalKind::NotTerminal => Err(Errno::ENOTTY),
                 },
                 |_fd| Err(Errno::ENOTTY),
-                |pipe_fd| {
-                    let table = self.global.litebox.descriptor_table();
-                    let is_mux_pty = table
-                        .with_metadata(pipe_fd, |_: &crate::MuxPtySlaveFd| ())
-                        .is_ok();
-                    if !is_mux_pty && desc > 2 {
-                        return Err(Errno::ENOTTY);
-                    }
-                    match arg {
-                        IoctlArg::TIOCGPGRP(pgrp) => {
-                            let value =
-                                i32::try_from(self.sys_getpgid(0).unwrap_or(1)).unwrap_or(1);
-                            pgrp.write_at_offset(0, value).ok_or(Errno::EFAULT)?;
-                            Ok(0)
-                        }
-                        IoctlArg::TIOCSPGRP(_) | IoctlArg::TIOCSCTTY => Ok(0),
-                        _ => Err(Errno::ENOTTY),
-                    }
-                },
+                |_fd| Err(Errno::ENOTTY),
                 |_fd| Err(Errno::ENOTTY),
                 |_fd| Err(Errno::ENOTTY),
                 |_fd| Err(Errno::ENOTTY),
