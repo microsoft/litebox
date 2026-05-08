@@ -37,6 +37,28 @@ pub enum AgentName {
     Dpg2Dpg,
     Dpg1Dng,
     Dpg1DngDpg,
+    /// Static-PIE-glibc child of `Dpg1`. Long-lived agent that
+    /// exercises **static-PIE-glibc as a forking parent** in the
+    /// matrix. Static-PIE-glibc binaries still load `ld.so` at
+    /// runtime for nss/dlopen, so the parent-side syscall
+    /// instrumentation differs from both ordinary PIE-glibc (which
+    /// uses ld.so for everything) and from static-PIE-musl (which
+    /// has no ld.so at all). Without this slot, every fan-out test
+    /// would only ever fork from PIE-glibc / non-PIE-glibc parents.
+    Dpg1Spg,
+    /// Static-PIE-musl child of `Dpg1`. Long-lived agent that
+    /// exercises **static-PIE-musl as a forking parent** in the
+    /// matrix. This is the same binary form as VS Code's `cli`
+    /// (`code-alpine-x64`). Truly static, no `PT_INTERP`. Without
+    /// this slot, only `VS.shape.smoke` exercises StaticPieMusl as
+    /// a parent — everything else only execs into it as a child.
+    Dpg1Spm,
+    /// Non-PIE static-musl child of `Dpg1`. Long-lived agent for
+    /// **non-PIE-static-musl as a forking parent**. Combines the
+    /// fixed-load address constraint of non-PIE with the
+    /// no-ld.so / variant-I-TLS regime of musl-static — a
+    /// combination not exercised by any other slot.
+    Dpg1Snm,
     /// Subtree-kill ephemeral root. Spawned as a direct child of the
     /// coordinator (like `Dpg1`, `Dpg2`) and intended to be `SIGKILLed`
     /// by the SK.subtree.* tests. Per-Trial docker isolation guarantees
@@ -67,6 +89,9 @@ impl AgentName {
             AgentName::Dpg1Dpg1Dpg1 => "dpg1_dpg1_dpg1",
             AgentName::Dpg1Dpg1Dpg2 => "dpg1_dpg1_dpg2",
             AgentName::Dpg1DngDpg => "dpg1_dng_dpg",
+            AgentName::Dpg1Spg => "dpg1_spg",
+            AgentName::Dpg1Spm => "dpg1_spm",
+            AgentName::Dpg1Snm => "dpg1_snm",
             AgentName::Dpg2Dpg => "dpg2_dpg",
             AgentName::Dpg3Dpg => "dpg3_dpg",
             AgentName::VsCodeSshdPty => "vscode_sshd_pty",
@@ -93,6 +118,9 @@ impl AgentName {
             "dpg1_dpg1_dpg1" => Some(AgentName::Dpg1Dpg1Dpg1),
             "dpg1_dpg1_dpg2" => Some(AgentName::Dpg1Dpg1Dpg2),
             "dpg1_dng_dpg" => Some(AgentName::Dpg1DngDpg),
+            "dpg1_spg" => Some(AgentName::Dpg1Spg),
+            "dpg1_spm" => Some(AgentName::Dpg1Spm),
+            "dpg1_snm" => Some(AgentName::Dpg1Snm),
             "dpg2_dpg" => Some(AgentName::Dpg2Dpg),
             "dpg3_dpg" => Some(AgentName::Dpg3Dpg),
             "vscode_sshd_pty" => Some(AgentName::VsCodeSshdPty),
@@ -118,6 +146,7 @@ impl AgentName {
             | AgentName::Dpg3
             | AgentName::VsCodeSshdPty => &[],
             AgentName::Dpg1Dpg1 | AgentName::Dpg1Dpg2 | AgentName::Dpg1Dng => &[AgentName::Dpg1],
+            AgentName::Dpg1Spg | AgentName::Dpg1Spm | AgentName::Dpg1Snm => &[AgentName::Dpg1],
             AgentName::Dpg2Dpg => &[AgentName::Dpg2],
             AgentName::Dpg3Dpg => &[AgentName::Dpg3],
             AgentName::Dpg1Dpg1Dpg1 | AgentName::Dpg1Dpg1Dpg2 => {
@@ -158,6 +187,7 @@ impl AgentName {
             | AgentName::Dpg3
             | AgentName::VsCodeSshdPty => None,
             AgentName::Dpg1Dpg1 | AgentName::Dpg1Dpg2 | AgentName::Dpg1Dng => Some(AgentName::Dpg1),
+            AgentName::Dpg1Spg | AgentName::Dpg1Spm | AgentName::Dpg1Snm => Some(AgentName::Dpg1),
             AgentName::Dpg2Dpg => Some(AgentName::Dpg2),
             AgentName::Dpg3Dpg => Some(AgentName::Dpg3),
             AgentName::Dpg1Dpg1Dpg1 | AgentName::Dpg1Dpg1Dpg2 => Some(AgentName::Dpg1Dpg1),
@@ -297,6 +327,44 @@ pub fn default_tree() -> Vec<AgentSpec> {
             name: AgentName::Dpg1DngDpg,
             parent: Some(AgentName::Dpg1Dng),
             binary: Pie,
+            isolation: Standard,
+        },
+        // ── Static-leg parents under Dpg1 ───────────────────────────
+        // These slots give every BinaryType leg a long-lived agent so
+        // matrix tests (EXEC_AGENTS, NPIPE_AGENTS, EP, US6, …)
+        // exercise each binary type as a *forking parent*, not just
+        // as an exec child. The shim's syscall instrumentation,
+        // vDSO state, and fd-bridge tables live in the parent
+        // process, so the parent's binary type matters.
+        //
+        // Coverage scenarios:
+        //   - Dpg1Spg: static-PIE-glibc still loads ld.so for
+        //     nss/dlopen at runtime. Distinct from ordinary PIE-glibc
+        //     (which is fully dynamic) and from static-PIE-musl
+        //     (no ld.so at all).
+        //   - Dpg1Spm: same binary form as VS Code's `cli`
+        //     (cli-alpine-x64). Truly static, no PT_INTERP. Without
+        //     this slot, only VS.shape.smoke exercised StaticPieMusl
+        //     as a fork parent.
+        //   - Dpg1Snm: non-PIE-static-musl. Combines the fixed-load
+        //     address constraint of non-PIE with the no-ld.so /
+        //     variant-I-TLS regime of musl-static.
+        AgentSpec {
+            name: AgentName::Dpg1Spg,
+            parent: Some(AgentName::Dpg1),
+            binary: AgentBinary::StaticPieGlibc,
+            isolation: Standard,
+        },
+        AgentSpec {
+            name: AgentName::Dpg1Spm,
+            parent: Some(AgentName::Dpg1),
+            binary: AgentBinary::StaticPieMusl,
+            isolation: Standard,
+        },
+        AgentSpec {
+            name: AgentName::Dpg1Snm,
+            parent: Some(AgentName::Dpg1),
+            binary: AgentBinary::NonPieStaticMusl,
             isolation: Standard,
         },
         AgentSpec {

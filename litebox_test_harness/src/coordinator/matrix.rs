@@ -278,12 +278,20 @@ const NET_ADDR_PAIRS: &[(AgentName, AgentName)] = &[
 // EXEC & ENV
 // ═══════════════════════════════════════════════════════════════════
 
+// Long-lived agents the EXEC fan-out covers. Each entry is a parent
+// process the test runs on; the test then exec()s the binary leg
+// under test. Including all 5 binary-type parents ensures we
+// exercise the parent-side syscall instrumentation / vDSO / fd-bridge
+// paths for every leg, not just PIE-glibc and non-PIE-glibc.
 const EXEC_AGENTS: &[AgentName] = &[
-    AgentName::Dpg1,
-    AgentName::Dpg1Dpg1,
-    AgentName::Dpg1Dpg1Dpg1,
-    AgentName::Dpg1Dng,
-    AgentName::Dpg1DngDpg,
+    AgentName::Dpg1,         // PIE-glibc
+    AgentName::Dpg1Dpg1,     // PIE-glibc, depth-2
+    AgentName::Dpg1Dpg1Dpg1, // PIE-glibc, depth-3
+    AgentName::Dpg1Dng,      // non-PIE-glibc parent (the "node" form)
+    AgentName::Dpg1DngDpg,   // PIE child of non-PIE — round-trip
+    AgentName::Dpg1Spg,      // static-PIE-glibc parent
+    AgentName::Dpg1Spm,      // static-PIE-musl parent (the "cli" form)
+    AgentName::Dpg1Snm,      // non-PIE-static-musl parent
 ];
 
 // ═══════════════════════════════════════════════════════════════════

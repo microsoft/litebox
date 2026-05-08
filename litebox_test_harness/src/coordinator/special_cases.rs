@@ -794,12 +794,17 @@ pub(crate) fn register_unix_socket(reg: &mut Registry<'_>) {
         }
     }
 
+    // Long-lived agents this fan-out runs in. One slot per
+    // BinaryType leg so each fork-parent code path is exercised.
     for &agent in &[
-        AgentName::Dpg1,
-        AgentName::Dpg1Dpg1,
-        AgentName::Dpg2,
-        AgentName::Dpg1Dpg1Dpg1,
-        AgentName::Dpg1Dng,
+        AgentName::Dpg1,         // PIE-glibc
+        AgentName::Dpg1Dpg1,     // PIE-glibc depth-2
+        AgentName::Dpg2,         // PIE-glibc sibling subtree
+        AgentName::Dpg1Dpg1Dpg1, // PIE-glibc depth-3
+        AgentName::Dpg1Dng,      // non-PIE-glibc (node form)
+        AgentName::Dpg1Spg,      // static-PIE-glibc
+        AgentName::Dpg1Spm,      // static-PIE-musl (cli form)
+        AgentName::Dpg1Snm,      // non-PIE-static-musl
     ] {
         for &bt in crate::BinaryType::ALL {
             let agent_name = agent;
@@ -866,12 +871,17 @@ pub(crate) fn register_unix_socket(reg: &mut Registry<'_>) {
         }
     }
 
+    // Long-lived agents this fan-out runs in. One slot per
+    // BinaryType leg so each fork-parent code path is exercised.
     for &agent in &[
-        AgentName::Dpg1,
-        AgentName::Dpg1Dpg1,
-        AgentName::Dpg2,
-        AgentName::Dpg1Dpg1Dpg1,
-        AgentName::Dpg1Dng,
+        AgentName::Dpg1,         // PIE-glibc
+        AgentName::Dpg1Dpg1,     // PIE-glibc depth-2
+        AgentName::Dpg2,         // PIE-glibc sibling subtree
+        AgentName::Dpg1Dpg1Dpg1, // PIE-glibc depth-3
+        AgentName::Dpg1Dng,      // non-PIE-glibc (node form)
+        AgentName::Dpg1Spg,      // static-PIE-glibc
+        AgentName::Dpg1Spm,      // static-PIE-musl (cli form)
+        AgentName::Dpg1Snm,      // non-PIE-static-musl
     ] {
         for &bt in crate::BinaryType::ALL {
             let id = format!("US6.socketpair_exec.{}.{agent}", bt.label());
@@ -1461,12 +1471,17 @@ pub(crate) fn register_cross_worker(reg: &mut Registry<'_>) {
 
 // Register pipe EOF tests.
 pub(crate) fn register_pipe_eof(reg: &mut Registry<'_>) {
+    // Long-lived agents this fan-out runs in. One slot per
+    // BinaryType leg so each fork-parent code path is exercised.
     for &agent in &[
-        AgentName::Dpg1,
-        AgentName::Dpg1Dpg1,
-        AgentName::Dpg2,
-        AgentName::Dpg1Dpg1Dpg1,
-        AgentName::Dpg1Dng,
+        AgentName::Dpg1,         // PIE-glibc
+        AgentName::Dpg1Dpg1,     // PIE-glibc depth-2
+        AgentName::Dpg2,         // PIE-glibc sibling subtree
+        AgentName::Dpg1Dpg1Dpg1, // PIE-glibc depth-3
+        AgentName::Dpg1Dng,      // non-PIE-glibc (node form)
+        AgentName::Dpg1Spg,      // static-PIE-glibc
+        AgentName::Dpg1Spm,      // static-PIE-musl (cli form)
+        AgentName::Dpg1Snm,      // non-PIE-static-musl
     ] {
         for &bt in crate::BinaryType::ALL {
             let id = format!("P1.pipe_eof_fork.{}.{agent}", bt.label());

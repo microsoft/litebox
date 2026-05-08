@@ -26,11 +26,19 @@ const FAMILIES: &[&str] = &["ipv4", "ipv6"];
 const EXIT_SIZES: &[usize] = &[256, 4096, 65536];
 
 const NPIPE_REPS: &[usize] = &[1, 5, 10];
+// Pipe-bridge churn ("npipe") fan-out parents. Each entry is a
+// long-lived agent the test runs in; the agent's binary type
+// determines which parent-side bridge / pipe-host code path is
+// exercised. Including the static legs covers the cli (StaticPieMusl)
+// and node-class scenarios as forking parents.
 const NPIPE_AGENTS: &[AgentName] = &[
-    AgentName::Dpg1,
-    AgentName::Dpg1Dpg1,
-    AgentName::Dpg2,
-    AgentName::Dpg1Dng,
+    AgentName::Dpg1,     // PIE-glibc
+    AgentName::Dpg1Dpg1, // PIE-glibc, depth-2
+    AgentName::Dpg2,     // PIE-glibc, sibling subtree
+    AgentName::Dpg1Dng,  // non-PIE-glibc (node form)
+    AgentName::Dpg1Spg,  // static-PIE-glibc (still uses ld.so)
+    AgentName::Dpg1Spm,  // static-PIE-musl (no ld.so) — cli form
+    AgentName::Dpg1Snm,  // non-PIE-static-musl
 ];
 
 // ═══════════════════════════════════════════════════════════════════
@@ -2699,24 +2707,38 @@ pub(crate) fn register_pipe_nonblock_tests(reg: &mut Registry<'_>) {
 
 pub(crate) fn register_epoll_socket_tests(reg: &mut Registry<'_>) {
     for &variant in &["direct", "tokio"] {
+        // Long-lived agents the epoll/socket test runs in. Each
+        // entry is a forking parent of a different binary type; the
+        // syscall-rewrite / vDSO / epoll-host code path differs per
+        // parent binary, so we want a slot per leg.
         for &agent in &[
-            AgentName::Dpg1,
-            AgentName::Dpg1Dpg1,
-            AgentName::Dpg2,
-            AgentName::Dpg1Dng,
-            AgentName::Dpg1DngDpg,
+            AgentName::Dpg1,       // PIE-glibc
+            AgentName::Dpg1Dpg1,   // PIE-glibc depth-2
+            AgentName::Dpg2,       // PIE-glibc sibling
+            AgentName::Dpg1Dng,    // non-PIE-glibc (node form)
+            AgentName::Dpg1DngDpg, // PIE child of non-PIE — round-trip
+            AgentName::Dpg1Spg,    // static-PIE-glibc
+            AgentName::Dpg1Spm,    // static-PIE-musl (cli form)
+            AgentName::Dpg1Snm,    // non-PIE-static-musl
         ] {
             let port: u16 = match (variant, agent) {
                 ("direct", AgentName::Dpg1) => 19990,
                 ("direct", AgentName::Dpg1Dpg1) => 19991,
                 ("direct", AgentName::Dpg2) => 19992,
                 ("direct", AgentName::Dpg1Dng) => 19993,
-                ("direct", _) => 19994,
+                ("direct", AgentName::Dpg1DngDpg) => 19994,
+                ("direct", AgentName::Dpg1Spg) => 19980,
+                ("direct", AgentName::Dpg1Spm) => 19981,
+                ("direct", AgentName::Dpg1Snm) => 19982,
                 ("tokio", AgentName::Dpg1) => 19995,
                 ("tokio", AgentName::Dpg1Dpg1) => 19996,
                 ("tokio", AgentName::Dpg2) => 19997,
                 ("tokio", AgentName::Dpg1Dng) => 19998,
-                _ => 19999,
+                ("tokio", AgentName::Dpg1DngDpg) => 19999,
+                ("tokio", AgentName::Dpg1Spg) => 19985,
+                ("tokio", AgentName::Dpg1Spm) => 19986,
+                ("tokio", AgentName::Dpg1Snm) => 19987,
+                _ => 19960,
             };
 
             // EP.{variant}.accept.{agent}
