@@ -152,18 +152,23 @@ fn child_kill_wait_timeout() -> Duration {
 
 /// Outer wall-clock cap on the entire `teardown_tree` call. The
 /// teardown loop is parallelized, so wall is `max(per_child)` rather
-/// than `sum(per_child)`; the cap protects against pathologies
-/// (stuck tokio reactor, kernel deadlock) and is roomy enough for
-/// the litebox case where shim-mediated child exits are slower —
-/// native runs typically complete in well under the budget.
-/// Override via `LITEBOX_TEARDOWN_TREE_TIMEOUT_MS`.
+/// than `sum(per_child)`. Empirical measurement (CF family, 280
+/// native+litebox trials, 2026-05-08) shows per-child kill+wait is
+/// fast on both passes:
+///   native:  mean 4 ms, p99 18 ms, max 31 ms
+///   litebox: mean 8 ms, p99 26 ms, max 39 ms
+/// So even with conservative headroom (10× max, plus matrix size
+/// up to ~8 agents that all run concurrently), 5 s is ample.
+/// The cap exists to protect against pathologies (stuck tokio
+/// reactor, kernel deadlock); it should never fire in normal
+/// operation. Override via `LITEBOX_TEARDOWN_TREE_TIMEOUT_MS`.
 fn teardown_tree_timeout() -> Duration {
     if let Ok(s) = std::env::var("LITEBOX_TEARDOWN_TREE_TIMEOUT_MS")
         && let Ok(ms) = s.parse::<u64>()
     {
         return Duration::from_millis(ms);
     }
-    Duration::from_millis(30_000)
+    Duration::from_millis(5_000)
 }
 
 /// Detect whether we're running inside litebox or on native Linux.
