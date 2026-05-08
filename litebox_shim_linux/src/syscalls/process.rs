@@ -1906,6 +1906,14 @@ impl<FS: ShimFS> Task<FS> {
             && (!flags.contains(CloneFlags::VM) || flags.contains(CloneFlags::VFORK));
 
         if is_fork {
+            // Keep fork-like clone3 on the native fallback path for now.  The
+            // thread-clone subset is supported below, but process creation via
+            // clone3 needs separate fd/stdio semantics from the legacy clone
+            // path and is better reported as unsupported than partially emulated.
+            if clone3 {
+                log_unsupported!("fork-like clone3");
+                return Err(Errno::ENOSYS);
+            }
             return self.do_fork(ctx, args, flags, clone3);
         }
 
@@ -8722,7 +8730,7 @@ impl<FS: ShimFS> Task<FS> {
                 let dt = self.global.litebox.descriptor_table();
                 let mut out = Vec::new();
                 for raw_fd in rds.iter_alive() {
-                    if raw_fd <= 2 {
+                    if raw_fd <= 2 || !worker_exec_fd_survives_exec(raw_fd, &self.global, &files) {
                         continue;
                     }
                     if let Ok(typed) =
@@ -8751,7 +8759,7 @@ impl<FS: ShimFS> Task<FS> {
                 let mux_ids = self.mux_pipe_pair_ids.borrow();
                 let mut out = Vec::new();
                 for raw_fd in rds.iter_alive() {
-                    if raw_fd <= 2 {
+                    if raw_fd <= 2 || !worker_exec_fd_survives_exec(raw_fd, &self.global, &files) {
                         continue;
                     }
                     if let Ok(typed) =
@@ -8977,6 +8985,11 @@ impl<FS: ShimFS> Task<FS> {
                 self.global.platform.close_host_fd(parent_fd);
             }
         }
+
+        // The remote worker has taken over the exec image. The local placeholder
+        // task will never resume guest code, but exec still closes CLOEXEC fds
+        // promptly so parent-side posix_spawn handshakes can observe EOF.
+        self.close_on_exec();
 
         let host_pid = spawn_result.host_pid;
 

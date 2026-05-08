@@ -1092,7 +1092,7 @@ impl<'a, FS: ShimFS> FileAndParsed<'a, FS> {
             file,
             parsed,
             patched_data: None,
-            needs_syscall_patch: missing_trampoline && !host_mmap_large,
+            needs_syscall_patch: missing_trampoline,
             host_mmap_large,
             exec_bias_applied: false,
         })
@@ -1227,16 +1227,16 @@ impl<'a, FS: ShimFS> FileAndParsed<'a, FS> {
         } else {
             self.ensure_syscall_trampoline(platform)?;
         }
-        if self.host_mmap_large {
-            let mut mapper = HostFileMapper {
-                inner: &mut self.file,
-                path: &self.path,
-            };
-            Ok(self.parsed.load(&mut mapper, &mut &*platform)?)
-        } else if let Some(ref data) = self.patched_data {
+        if let Some(ref data) = self.patched_data {
             let mut mapper = PatchedMapper {
                 inner: &mut self.file,
                 data,
+            };
+            Ok(self.parsed.load(&mut mapper, &mut &*platform)?)
+        } else if self.host_mmap_large && !self.parsed.has_trampoline() {
+            let mut mapper = HostFileMapper {
+                inner: &mut self.file,
+                path: &self.path,
             };
             Ok(self.parsed.load(&mut mapper, &mut &*platform)?)
         } else {
