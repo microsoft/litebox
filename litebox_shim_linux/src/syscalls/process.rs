@@ -174,6 +174,11 @@ impl ThreadRemote {
             handle.interrupt();
         }
     }
+
+    pub(crate) fn request_exit(&self) {
+        self.is_exiting.store(true, Ordering::Relaxed);
+        self.interrupt();
+    }
 }
 
 /// A Linux process, which may have multiple threads.
@@ -1739,13 +1744,21 @@ impl<FS: ShimFS> Task<FS> {
         if flags & !PIDFD_NONBLOCK != 0 {
             return Err(Errno::EINVAL);
         }
-        self.reject_remote_running_process_control(ProcessId(pid), "pidfd_open")?;
+        let guest_pid = pid.cast_signed();
+        let process_id = self
+            .global
+            .pid_to_process_id
+            .read()
+            .get(&guest_pid)
+            .copied()
+            .unwrap_or(ProcessId(pid));
+        self.reject_remote_running_process_control(process_id, "pidfd_open")?;
 
         let state = self
             .global
             .litebox
             .process_registry()
-            .exit_state(ProcessId(pid))
+            .exit_state(process_id)
             .ok_or(Errno::ESRCH)?;
         let pidfd = crate::syscalls::eventfd::EventFile::new_pidfd(
             state.exited,
@@ -3589,6 +3602,49 @@ impl<FS: ShimFS> Task<FS> {
                                     }
                                 }
                             });
+                        } else if ms.subsystem == crate::ReplacedSubsystem::Filesystem {
+                            // Filesystem fd stream: the child writes into the
+                            // mux; relay those bytes back into a duplicate of
+                            // the parent's original file descriptor so path
+                            // reads in the parent observe the data.
+                            let fs_fd = {
+                                let rds = files.raw_descriptor_store.read();
+                                let existing = rds.fd_from_raw_integer::<FS>(ms.guest_fd).ok();
+                                drop(rds);
+                                existing.and_then(|fd| {
+                                    self.global.litebox.descriptor_table_mut().duplicate(&fd)
+                                })
+                            };
+
+                            if let Some(fs_fd) = fs_fd {
+                                let fs = files.fs.clone();
+                                let platform = self.global.platform;
+                                let pipes_clone = self.global.pipes.clone();
+                                let relay_fd: alloc::sync::Arc<
+                                    litebox::fd::TypedFd<litebox::pipes::Pipes<crate::Platform>>,
+                                > = parent_pipe_fd.into();
+
+                                self.global.platform.spawn_background_task(move || {
+                                    let wait_state = litebox::event::wait::WaitState::new(platform);
+                                    let cx = wait_state.context();
+                                    let mut buf = alloc::vec![0u8; 65536];
+
+                                    if ms.direction == HostPipeDirection::Read {
+                                        loop {
+                                            match pipes_clone.read(&cx, &relay_fd, &mut buf) {
+                                                Ok(0) | Err(_) => break,
+                                                Ok(n) => {
+                                                    let _ = fs.write(&fs_fd, &buf[..n], None);
+                                                }
+                                            }
+                                        }
+                                    }
+                                    let _ = pipes_clone.close(&relay_fd);
+                                    let _ = fs.close(&fs_fd);
+                                });
+                            } else {
+                                orphan_streams.push((ms.stream_id, Vec::new()));
+                            }
                         } else if let Some(pty_pair) = ms.pty_pair {
                             // PTY-backed stream: spawn a relay thread that
                             // bridges between the PtyPair ring buffers and
@@ -5727,6 +5783,49 @@ impl<FS: ShimFS> Task<FS> {
                 }
             }
 
+            // --- Writable filesystem fd bridging ---
+            // A restored fork child runs in a separate host process.  Non-terminal
+            // filesystem fds cannot be made to share the parent's in-memory upper
+            // layer by reopening the path in the child, so route child writes back
+            // through the parent's original open file description.
+            {
+                use super::fork_snapshot::FdClass;
+                use super::host_pipe::HostPipeDirection;
+
+                for entry in &fd_table.entries {
+                    if entry.class != FdClass::FilesystemFd
+                        || entry.metadata.is_host_tty_alias
+                        || entry.metadata.is_host_pty_device
+                        || entry.metadata.host_stdio_source_fd.is_some()
+                        || child_pipe_bridges.iter().any(|&(fd, _, _)| fd == entry.fd)
+                    {
+                        continue;
+                    }
+
+                    let access_bits = entry.status_flags & 0x3;
+                    let writable = access_bits == 1 || access_bits == 2;
+                    if !writable {
+                        continue;
+                    }
+
+                    let (read_fd, write_fd) = match self.global.platform.create_host_pipe() {
+                        Ok(pair) => pair,
+                        Err(_) => continue,
+                    };
+
+                    child_pipe_bridges.push((entry.fd, write_fd, HostPipeDirection::Write));
+                    bridge_drained.push(Vec::new());
+                    bridge_host_fd.push(-1);
+                    bridge_pty_pair.push(None);
+                    bridge_parent_info.push(alloc::vec![(
+                        entry.fd,
+                        HostPipeDirection::Read,
+                        crate::ReplacedSubsystem::Filesystem,
+                    )]);
+                    self.global.platform.close_host_fd(read_fd);
+                }
+            }
+
             // --- Multiplexer setup ---
             // Replace per-fd OS pipe bridges with a single multiplexed channel.
             // The child worker gets virtual pipe endpoints via --mux-stream,
@@ -5819,6 +5918,7 @@ impl<FS: ShimFS> Task<FS> {
                                 crate::ReplacedSubsystem::Pipe => b'p',
                                 crate::ReplacedSubsystem::UnixSocket => b's',
                                 crate::ReplacedSubsystem::Pty => b't',
+                                crate::ReplacedSubsystem::Filesystem => b'f',
                             },
                         )
                     };
@@ -8899,6 +8999,12 @@ impl<FS: ShimFS> Task<FS> {
         // originals).  Do NOT close them again here — that would double-close
         // and trigger IO Safety violations if the fd number was reused.
 
+        let host_pid = spawn_result.host_pid;
+        self.global
+            .fork_child_host_pids
+            .write()
+            .insert(self.process_id.0, host_pid);
+
         // Replace parent's peer unix socket fds with HostPipeFd backed
         // by the OS socketpair parent end. Find the peer by pair_id.
         // Also replace parent's peer pipe fds.
@@ -8991,8 +9097,6 @@ impl<FS: ShimFS> Task<FS> {
         // promptly so parent-side posix_spawn handshakes can observe EOF.
         self.close_on_exec();
 
-        let host_pid = spawn_result.host_pid;
-
         #[cfg(feature = "trace_syscalls")]
         litebox::log_println!(
             self.global.platform,
@@ -9002,6 +9106,10 @@ impl<FS: ShimFS> Task<FS> {
         );
 
         let exit_code = self.global.platform.wait_worker_host(host_pid);
+        self.global
+            .fork_child_host_pids
+            .write()
+            .remove(&self.process_id.0);
 
         #[cfg(feature = "trace_syscalls")]
         litebox::log_println!(

@@ -18,7 +18,7 @@ fn bidi_tcp_comms(mut network: Network<MockPlatform>, comms: fn(&mut Network<Moc
     let listen_addr = SocketAddr::V4(SocketAddrV4::from_str("10.0.0.2:8080").unwrap());
 
     network
-        .bind(&listener_fd, &listen_addr)
+        .bind(&listener_fd, &listen_addr, false)
         .expect("Failed to bind TCP socket");
     network
         .listen(&listener_fd, 1)
@@ -95,7 +95,7 @@ fn wildcard_bound_udp_comms(
         .expect("Failed to create UDP server socket");
     let server_addr = SocketAddr::V4(SocketAddrV4::from_str("10.0.0.2:8080").unwrap());
     network
-        .bind(&server_fd, &server_addr)
+        .bind(&server_fd, &server_addr, false)
         .expect("Failed to bind UDP server socket");
 
     let client_fd = network
@@ -103,7 +103,7 @@ fn wildcard_bound_udp_comms(
         .expect("Failed to create UDP client socket");
     let wildcard_addr = SocketAddr::V4(SocketAddrV4::from_str("0.0.0.0:0").unwrap());
     network
-        .bind(&client_fd, &wildcard_addr)
+        .bind(&client_fd, &wildcard_addr, false)
         .expect("Failed to bind UDP client socket");
 
     let client_to_server_data = b"Hello from wildcard client!";
@@ -200,7 +200,7 @@ fn test_udp_bound_port_is_released_on_close() {
         .socket(Protocol::Udp)
         .expect("Failed to create UDP socket");
     network
-        .bind(&first_fd, &addr)
+        .bind(&first_fd, &addr, false)
         .expect("Failed to bind first UDP socket");
     network
         .close(&first_fd, CloseBehavior::Immediate)
@@ -210,7 +210,7 @@ fn test_udp_bound_port_is_released_on_close() {
         .socket(Protocol::Udp)
         .expect("Failed to create UDP socket");
     network
-        .bind(&second_fd, &addr)
+        .bind(&second_fd, &addr, false)
         .expect("UDP port should be reusable after close");
     network
         .close(&second_fd, CloseBehavior::Immediate)

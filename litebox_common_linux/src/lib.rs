@@ -863,6 +863,7 @@ pub enum SocketOption {
     /// shall block the process during close() until it can transmit the data
     /// or until the time expires.
     LINGER = 13,
+    REUSEPORT = 15,
     PEERCRED = 17,
     RCVTIMEO = 20,
     SNDTIMEO = 21,
