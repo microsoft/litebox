@@ -3646,6 +3646,7 @@ enum ReplacedSubsystem {
     Pipe,
     UnixSocket,
     Pty,
+    Filesystem,
 }
 
 /// Describes a single fd endpoint that should be replaced with a host OS
