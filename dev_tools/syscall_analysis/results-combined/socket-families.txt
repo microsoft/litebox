@@ -1,0 +1,4 @@
+    145 AF_INET
+    136 AF_UNIX
+     34 AF_NETLINK
+      1 AF_INET6

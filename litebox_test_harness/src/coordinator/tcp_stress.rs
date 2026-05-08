@@ -252,7 +252,10 @@ fn register_tcp_concurrency_tests(reg: &mut Registry<'_>) {
                         let resp = run
                             .send(
                                 &listener_handle,
-                                crate::protocol::Command::NetListen { port: p },
+                                crate::protocol::Command::NetListen {
+                                    port: p,
+                                    pre_bind_options: vec![],
+                                },
                             )
                             .await;
                         if super::expect_listening_port(&resp, p).is_err() {
@@ -318,7 +321,7 @@ fn register_tcp_data_size_tests(reg: &mut Registry<'_>) {
                 Box::new(move |run| {
                     Box::pin(async move {
                         let resp = run
-                            .send(&listener_handle, crate::protocol::Command::NetListen { port: p })
+                            .send(&listener_handle, crate::protocol::Command::NetListen { port: p, pre_bind_options: vec![] })
                             .await;
                         if super::expect_listening_port(&resp, p).is_err() {
                             return super::TestOutcome::new(&connector_label, false, format!("listen failed: {resp:?}"));
@@ -357,7 +360,7 @@ fn register_tcp_reconnect_stress_tests(reg: &mut Registry<'_>) {
                 Box::new(move |run| {
                     Box::pin(async move {
                         let resp = run
-                            .send(&listener_handle, crate::protocol::Command::NetListen { port: p })
+                            .send(&listener_handle, crate::protocol::Command::NetListen { port: p, pre_bind_options: vec![] })
                             .await;
                         if super::expect_listening_port(&resp, p).is_err() {
                             return super::TestOutcome::new(&connector_label, false, format!("listen failed: {resp:?}"));
@@ -392,8 +395,8 @@ fn register_tcp_cross_worker_concurrent_tests(reg: &mut Registry<'_>) {
         },
         StableCase {
             name: "depth2",
-            listener: AgentName::Dpg1Dpg1Dpg1Dng,
-            connector: AgentName::Dpg1Dpg1Dpg1DngDpg,
+            listener: AgentName::Dpg1Dng,
+            connector: AgentName::Dpg1DngDpg,
         },
     ];
 
@@ -417,7 +420,7 @@ fn register_tcp_cross_worker_concurrent_tests(reg: &mut Registry<'_>) {
                                 return super::TestOutcome::new("A", false, "FAIL: SpawnRemote unavailable");
                             }
                             let resp = run
-                                .forward(&aremote, crate::protocol::Command::NetListen { port: p })
+                                .forward(&aremote, crate::protocol::Command::NetListen { port: p, pre_bind_options: vec![] })
                                 .await;
                             if super::expect_listening_port(&resp, p).is_err() {
                                 return super::TestOutcome::new("A", false, format!("listen failed: {resp:?}"));
@@ -452,7 +455,7 @@ fn register_tcp_cross_worker_concurrent_tests(reg: &mut Registry<'_>) {
                             if !super::ok_spawned_response(&resp) {
                                 return super::TestOutcome::new("A", false, "FAIL: SpawnRemote unavailable");
                             }
-                            let resp = run.send(&handle, crate::protocol::Command::NetListen { port: p }).await;
+                            let resp = run.send(&handle, crate::protocol::Command::NetListen { port: p, pre_bind_options: vec![] }).await;
                             if super::expect_listening_port(&resp, p).is_err() {
                                 return super::TestOutcome::new("A", false, format!("listen failed: {resp:?}"));
                             }
@@ -488,7 +491,7 @@ fn register_tcp_cross_worker_concurrent_tests(reg: &mut Registry<'_>) {
                                 let resp = run
                                     .send(
                                         &listener_handle,
-                                        crate::protocol::Command::NetListen { port: p },
+                                        crate::protocol::Command::NetListen { port: p, pre_bind_options: vec![] },
                                     )
                                     .await;
                                 if !matches!(resp, crate::protocol::Response::Listening { .. }) {

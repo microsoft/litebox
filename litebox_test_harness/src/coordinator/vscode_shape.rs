@@ -80,13 +80,23 @@ pub fn vscode_tree_specs() -> Vec<AgentSpec> {
         AgentSpec {
             name: AgentName::VsCodeCli,
             parent: Some(AgentName::VsCodeLauncherBash),
-            binary: Pie,
+            // VS Code's `cli-alpine-x64` distribution: static-PIE
+            // linked against musl, no PT_INTERP. Confirmed via
+            // `readelf` of /root/.vscode-server/code-<commit>.
+            binary: StaticPieMusl,
             isolation: Standard,
         },
         AgentSpec {
             name: AgentName::VsCodeNode,
             parent: Some(AgentName::VsCodeCli),
-            binary: StaticPieMusl,
+            // VS Code Server's bundled Node.js is the standard
+            // linux-x64 distribution: ET_EXEC, dynamically linked,
+            // INTERP=/lib64/ld-linux-x86-64.so.2 (NonPieGlibc).
+            // Confirmed via readelf on
+            // /root/.vscode-server/cli/servers/Stable-<commit>/server/node
+            // and strace evidence (access("/etc/ld.so.preload")
+            // immediately after execve).
+            binary: NonPie,
             isolation: Standard,
         },
     ]

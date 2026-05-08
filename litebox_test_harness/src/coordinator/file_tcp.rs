@@ -50,7 +50,13 @@ fn register_listen_file_tests(reg: &mut Registry<'_>) {
                     Box::new(move |run| {
                         Box::pin(async move {
                             let listen_resp = run
-                                .send(&handle, crate::protocol::Command::NetListen { port })
+                                .send(
+                                    &handle,
+                                    crate::protocol::Command::NetListen {
+                                        port,
+                                        pre_bind_options: vec![],
+                                    },
+                                )
                                 .await;
                             if !super::expect_listening_port(&listen_resp, port).is_ok() {
                                 return super::TestOutcome::new(
@@ -93,7 +99,7 @@ fn register_listen_file_tests(reg: &mut Registry<'_>) {
                     Box::new(move |run| {
                         Box::pin(async move {
                             let listen_resp = run
-                                .send(&handle, crate::protocol::Command::NetListen { port })
+                                .send(&handle, crate::protocol::Command::NetListen { port, pre_bind_options: vec![] })
                                 .await;
                             if !super::expect_listening_port(&listen_resp, port).is_ok() {
                                 return super::TestOutcome::new(
@@ -140,7 +146,7 @@ fn register_listen_file_tests(reg: &mut Registry<'_>) {
                     Box::new(move |run| {
                         Box::pin(async move {
                             let listen_resp = run
-                                .send(&handle, crate::protocol::Command::NetListen { port })
+                                .send(&handle, crate::protocol::Command::NetListen { port, pre_bind_options: vec![] })
                                 .await;
                             if !super::expect_listening_port(&listen_resp, port).is_ok() {
                                 return super::TestOutcome::new(
@@ -181,7 +187,7 @@ fn register_conn_file_tests(reg: &mut Registry<'_>) {
             Box::new(move |run| {
                 Box::pin(async move {
                     let listen_resp = run
-                        .send(&handle, crate::protocol::Command::NetListen { port })
+                        .send(&handle, crate::protocol::Command::NetListen { port, pre_bind_options: vec![] })
                         .await;
                     if !super::expect_listening_port(&listen_resp, port).is_ok() {
                         return super::TestOutcome::new(
@@ -216,7 +222,7 @@ fn register_conn_file_tests(reg: &mut Registry<'_>) {
             Box::new(move |run| {
                 Box::pin(async move {
                     let listen_resp = run
-                        .send(&handle, crate::protocol::Command::NetListen { port })
+                        .send(&handle, crate::protocol::Command::NetListen { port, pre_bind_options: vec![] })
                         .await;
                     if !super::expect_listening_port(&listen_resp, port).is_ok() {
                         return super::TestOutcome::new(
@@ -259,7 +265,13 @@ fn register_conn_file_tests(reg: &mut Registry<'_>) {
             Box::new(move |run| {
                 Box::pin(async move {
                     let listen_resp = run
-                        .send(&handle, crate::protocol::Command::NetListen { port })
+                        .send(
+                            &handle,
+                            crate::protocol::Command::NetListen {
+                                port,
+                                pre_bind_options: vec![],
+                            },
+                        )
                         .await;
                     if !super::expect_listening_port(&listen_resp, port).is_ok() {
                         return super::TestOutcome::new(
@@ -303,7 +315,7 @@ fn register_conn_file_tests(reg: &mut Registry<'_>) {
             Box::new(move |run| {
                 Box::pin(async move {
                     let listen_resp = run
-                        .send(&handle, crate::protocol::Command::NetListen { port })
+                        .send(&handle, crate::protocol::Command::NetListen { port, pre_bind_options: vec![] })
                         .await;
                     if !super::expect_listening_port(&listen_resp, port).is_ok() {
                         return super::TestOutcome::new(
@@ -371,7 +383,7 @@ fn register_interleave_tests(reg: &mut Registry<'_>) {
                             )
                             .await;
                         let listen_resp = run
-                            .send(&handle, crate::protocol::Command::NetListen { port })
+                            .send(&handle, crate::protocol::Command::NetListen { port, pre_bind_options: vec![] })
                             .await;
                         if !super::expect_listening_port(&listen_resp, port).is_ok() {
                             return super::TestOutcome::new(
@@ -422,7 +434,7 @@ fn register_interleave_tests(reg: &mut Registry<'_>) {
                             )
                             .await;
                         let listen_resp = run
-                            .send(&handle_b, crate::protocol::Command::NetListen { port })
+                            .send(&handle_b, crate::protocol::Command::NetListen { port, pre_bind_options: vec![] })
                             .await;
                         if !super::expect_listening_port(&listen_resp, port).is_ok() {
                             return super::TestOutcome::new(
@@ -464,7 +476,7 @@ fn register_multi_cycle_tests(reg: &mut Registry<'_>) {
             Box::new(move |run| {
                 Box::pin(async move {
                     let listen_resp = run
-                        .send(&handle, crate::protocol::Command::NetListen { port })
+                        .send(&handle, crate::protocol::Command::NetListen { port, pre_bind_options: vec![] })
                         .await;
                     if !super::expect_listening_port(&listen_resp, port).is_ok() {
                         return super::TestOutcome::new(
@@ -529,7 +541,7 @@ fn register_multi_cycle_tests(reg: &mut Registry<'_>) {
             Box::new(move |run| {
                 Box::pin(async move {
                     let listen_resp = run
-                        .send(&handle, crate::protocol::Command::NetListen { port })
+                        .send(&handle, crate::protocol::Command::NetListen { port, pre_bind_options: vec![] })
                         .await;
                     if !super::expect_listening_port(&listen_resp, port).is_ok() {
                         return super::TestOutcome::new(
@@ -594,7 +606,7 @@ fn register_exec_during_tcp_tests(reg: &mut Registry<'_>) {
             Box::new(move |run| {
                 Box::pin(async move {
                     let listen_resp = run
-                        .send(&handle, crate::protocol::Command::NetListen { port })
+                        .send(&handle, crate::protocol::Command::NetListen { port, pre_bind_options: vec![] })
                         .await;
                     if !super::expect_listening_port(&listen_resp, port).is_ok() {
                         return super::TestOutcome::new(
@@ -638,7 +650,7 @@ fn register_exec_during_tcp_tests(reg: &mut Registry<'_>) {
             Box::new(move |run| {
                 Box::pin(async move {
                     let listen_resp = run
-                        .send(&handle, crate::protocol::Command::NetListen { port })
+                        .send(&handle, crate::protocol::Command::NetListen { port, pre_bind_options: vec![] })
                         .await;
                     if !super::expect_listening_port(&listen_resp, port).is_ok() {
                         return super::TestOutcome::new(
@@ -701,8 +713,8 @@ const FT_AXIS_CASES: &[FtAxisCase] = &[
     },
     FtAxisCase {
         name: "depth2",
-        server: AgentName::Dpg1Dpg1Dpg1Dng,
-        client: AgentName::Dpg1Dpg1Dpg1DngDpg,
+        server: AgentName::Dpg1Dng,
+        client: AgentName::Dpg1DngDpg,
     },
 ];
 
@@ -760,7 +772,13 @@ async fn run_axis_file_tcp_case(
     }
 
     let listen_resp = run
-        .send(server, crate::protocol::Command::NetListen { port: 0 })
+        .send(
+            server,
+            crate::protocol::Command::NetListen {
+                port: 0,
+                pre_bind_options: vec![],
+            },
+        )
         .await;
     let port = match listen_resp {
         crate::protocol::Response::Listening { port } if port > 0 => port,

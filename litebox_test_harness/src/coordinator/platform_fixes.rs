@@ -26,12 +26,22 @@ const FAMILIES: &[&str] = &["ipv4", "ipv6"];
 const EXIT_SIZES: &[usize] = &[256, 4096, 65536];
 
 const NPIPE_REPS: &[usize] = &[1, 5, 10];
+// Pipe-bridge churn ("npipe") fan-out parents. Each entry is a
+// long-lived agent the test runs in; the agent's binary type
+// determines which parent-side bridge / pipe-host code path is
+// exercised. Including the static legs covers the cli (StaticPieMusl)
+// and node-class scenarios as forking parents.
 const NPIPE_AGENTS: &[AgentName] = &[
-    AgentName::Dpg1,
-    AgentName::Dpg1Dpg1,
-    AgentName::Dpg2,
-    AgentName::Dpg1Dng,
-    AgentName::Dpg1Dpg1Dpg1Dng,
+    AgentName::Dpg1,       // PIE-glibc
+    AgentName::Dpg1Dpg1,   // PIE-glibc, depth-2
+    AgentName::Dpg2,       // PIE-glibc, sibling subtree
+    AgentName::Dpg1Dng,    // non-PIE-glibc (node form)
+    AgentName::Dpg1DngDng, // bash → bash recursion (VS Code hot path)
+    AgentName::Dpg1DngSpm, // bash → cli (VS Code hot path)
+    AgentName::Dpg1Spg,    // static-PIE-glibc (still uses ld.so)
+    AgentName::Dpg1Spm,    // static-PIE-musl (no ld.so) — cli form
+    AgentName::Dpg1SpmDng, // cli → node (VS Code's signature transition)
+    AgentName::Dpg1Snm,    // non-PIE-static-musl
 ];
 
 // ═══════════════════════════════════════════════════════════════════
@@ -475,7 +485,15 @@ pub(crate) fn register_cross_worker_first_connect_tests(reg: &mut Registry<'_>) 
         Box::new(move |run| {
             Box::pin(async move {
                 let port = 19900u16;
-                let listen_resp = run.send(&handle_a, Command::NetListen { port }).await;
+                let listen_resp = run
+                    .send(
+                        &handle_a,
+                        Command::NetListen {
+                            port,
+                            pre_bind_options: vec![],
+                        },
+                    )
+                    .await;
                 if !super::expect_listening_port(&listen_resp, port).is_ok() {
                     return super::TestOutcome::new(
                         "B",
@@ -512,7 +530,15 @@ pub(crate) fn register_cross_worker_first_connect_tests(reg: &mut Registry<'_>) 
         Box::new(move |run| {
             Box::pin(async move {
                 let port = 19901u16;
-                let listen_resp = run.send(&handle_b, Command::NetListen { port }).await;
+                let listen_resp = run
+                    .send(
+                        &handle_b,
+                        Command::NetListen {
+                            port,
+                            pre_bind_options: vec![],
+                        },
+                    )
+                    .await;
                 if !super::expect_listening_port(&listen_resp, port).is_ok() {
                     return super::TestOutcome::new(
                         "AA",
@@ -544,7 +570,7 @@ pub(crate) fn register_cross_worker_first_connect_tests(reg: &mut Registry<'_>) 
         Box::new(move |run| {
                 Box::pin(async move {
                     let port = 19902u16;
-                    let listen_resp = run.send(&handle_a, Command::NetListen { port }).await;
+                    let listen_resp = run.send(&handle_a, Command::NetListen { port, pre_bind_options: vec![] }).await;
                     if !super::expect_listening_port(&listen_resp, port).is_ok() {
                         return super::TestOutcome::new(
                             "B",
@@ -600,7 +626,15 @@ pub(crate) fn register_cross_worker_self_connect_tests(reg: &mut Registry<'_>) {
         Box::new(move |run| {
             Box::pin(async move {
                 let port = 19910u16;
-                let listen_resp = run.send(&handle_a, Command::NetListen { port }).await;
+                let listen_resp = run
+                    .send(
+                        &handle_a,
+                        Command::NetListen {
+                            port,
+                            pre_bind_options: vec![],
+                        },
+                    )
+                    .await;
                 if !super::expect_listening_port(&listen_resp, port).is_ok() {
                     return super::TestOutcome::new(
                         "A",
@@ -637,7 +671,15 @@ pub(crate) fn register_cross_worker_self_connect_tests(reg: &mut Registry<'_>) {
         Box::new(move |run| {
             Box::pin(async move {
                 let port = 19911u16;
-                let listen_resp = run.send(&handle_a, Command::NetListen { port }).await;
+                let listen_resp = run
+                    .send(
+                        &handle_a,
+                        Command::NetListen {
+                            port,
+                            pre_bind_options: vec![],
+                        },
+                    )
+                    .await;
                 if !super::expect_listening_port(&listen_resp, port).is_ok() {
                     return super::TestOutcome::new(
                         "AA",
@@ -674,7 +716,15 @@ pub(crate) fn register_cross_worker_self_connect_tests(reg: &mut Registry<'_>) {
         Box::new(move |run| {
             Box::pin(async move {
                 let port = 19912u16;
-                let listen_resp = run.send(&handle_aa, Command::NetListen { port }).await;
+                let listen_resp = run
+                    .send(
+                        &handle_aa,
+                        Command::NetListen {
+                            port,
+                            pre_bind_options: vec![],
+                        },
+                    )
+                    .await;
                 if !super::expect_listening_port(&listen_resp, port).is_ok() {
                     return super::TestOutcome::new(
                         "A",
@@ -711,7 +761,15 @@ pub(crate) fn register_cross_worker_self_connect_tests(reg: &mut Registry<'_>) {
         Box::new(move |run| {
             Box::pin(async move {
                 let port = 19913u16;
-                let listen_resp = run.send(&handle_a, Command::NetListen { port }).await;
+                let listen_resp = run
+                    .send(
+                        &handle_a,
+                        Command::NetListen {
+                            port,
+                            pre_bind_options: vec![],
+                        },
+                    )
+                    .await;
                 if !super::expect_listening_port(&listen_resp, port).is_ok() {
                     return super::TestOutcome::new(
                         "AB",
@@ -758,7 +816,15 @@ async fn run_tlb_listen_busy_case(
     data: &str,
     delay_secs: u64,
 ) -> super::TestOutcome {
-    let listen_resp = run.send(listener, Command::NetListen { port: 0 }).await;
+    let listen_resp = run
+        .send(
+            listener,
+            Command::NetListen {
+                port: 0,
+                pre_bind_options: vec![],
+            },
+        )
+        .await;
     let port = match super::expect_listening_port(&listen_resp, 0) {
         Ok(port) => port,
         Err(e) => {
@@ -1070,8 +1136,8 @@ pub(crate) fn register_minimal_canary_tests(reg: &mut Registry<'_>) {
         AgentName::Dpg1,
         AgentName::Dpg1Dpg1,
         AgentName::Dpg1Dpg1Dpg1,
-        AgentName::Dpg1Dpg1Dpg1Dng,
-        AgentName::Dpg1Dpg1Dpg1DngDpg,
+        AgentName::Dpg1Dng,
+        AgentName::Dpg1DngDpg,
     ];
     const M_VARIANTS: &[(&str, &str, &str, u64)] = &[
         // (id_prefix, subcommand, expected_stdout_marker, exec_timeout_secs)
@@ -2700,24 +2766,47 @@ pub(crate) fn register_pipe_nonblock_tests(reg: &mut Registry<'_>) {
 
 pub(crate) fn register_epoll_socket_tests(reg: &mut Registry<'_>) {
     for &variant in &["direct", "tokio"] {
+        // Long-lived agents the epoll/socket test runs in. Each
+        // entry is a forking parent of a different binary type; the
+        // syscall-rewrite / vDSO / epoll-host code path differs per
+        // parent binary, so we want a slot per leg.
         for &agent in &[
-            AgentName::Dpg1,
-            AgentName::Dpg1Dpg1,
-            AgentName::Dpg2,
-            AgentName::Dpg1Dpg1Dpg1Dng,
-            AgentName::Dpg1Dpg1Dpg1DngDpg,
+            AgentName::Dpg1,       // PIE-glibc
+            AgentName::Dpg1Dpg1,   // PIE-glibc depth-2
+            AgentName::Dpg2,       // PIE-glibc sibling
+            AgentName::Dpg1Dng,    // non-PIE-glibc (node form)
+            AgentName::Dpg1DngDpg, // PIE child of non-PIE — round-trip
+            AgentName::Dpg1DngDng, // bash → bash (VS Code hot path)
+            AgentName::Dpg1DngSpm, // bash → cli (VS Code hot path)
+            AgentName::Dpg1Spg,    // static-PIE-glibc
+            AgentName::Dpg1Spm,    // static-PIE-musl (cli form)
+            AgentName::Dpg1SpmDng, // cli → node (VS Code signature)
+            AgentName::Dpg1Snm,    // non-PIE-static-musl
         ] {
             let port: u16 = match (variant, agent) {
                 ("direct", AgentName::Dpg1) => 19990,
                 ("direct", AgentName::Dpg1Dpg1) => 19991,
                 ("direct", AgentName::Dpg2) => 19992,
-                ("direct", AgentName::Dpg1Dpg1Dpg1Dng) => 19993,
-                ("direct", _) => 19994,
+                ("direct", AgentName::Dpg1Dng) => 19993,
+                ("direct", AgentName::Dpg1DngDpg) => 19994,
+                ("direct", AgentName::Dpg1Spg) => 19980,
+                ("direct", AgentName::Dpg1Spm) => 19981,
+                ("direct", AgentName::Dpg1Snm) => 19982,
+                ("direct", AgentName::Dpg1DngDng) => 19970,
+                ("direct", AgentName::Dpg1DngSpm) => 19971,
+                ("direct", AgentName::Dpg1SpmDng) => 19972,
                 ("tokio", AgentName::Dpg1) => 19995,
                 ("tokio", AgentName::Dpg1Dpg1) => 19996,
                 ("tokio", AgentName::Dpg2) => 19997,
-                ("tokio", AgentName::Dpg1Dpg1Dpg1Dng) => 19998,
-                _ => 19999,
+                ("tokio", AgentName::Dpg1Dng) => 19998,
+                ("tokio", AgentName::Dpg1DngDpg) => 19999,
+                ("tokio", AgentName::Dpg1Spg) => 19985,
+                ("tokio", AgentName::Dpg1Spm) => 19986,
+                ("tokio", AgentName::Dpg1Snm) => 19987,
+                ("tokio", AgentName::Dpg1DngDng) => 19975,
+                ("tokio", AgentName::Dpg1DngSpm) => 19976,
+                ("tokio", AgentName::Dpg1SpmDng) => 19977,
+                _ => 19960,
             };
 
             // EP.{variant}.accept.{agent}
@@ -2936,7 +3025,15 @@ pub(crate) fn register_fork_listen_close_tests(reg: &mut Registry<'_>) {
         Box::new(move |run| {
             Box::pin(async move {
                 let port = 19920u16;
-                let listen_resp = run.send(&handle_a, Command::NetListen { port }).await;
+                let listen_resp = run
+                    .send(
+                        &handle_a,
+                        Command::NetListen {
+                            port,
+                            pre_bind_options: vec![],
+                        },
+                    )
+                    .await;
                 if let Err(e) = super::expect_listening_port(&listen_resp, port) {
                     return super::TestOutcome::new(
                         "B",
@@ -2988,7 +3085,15 @@ pub(crate) fn register_fork_listen_close_tests(reg: &mut Registry<'_>) {
         Box::new(move |run| {
             Box::pin(async move {
                 let port = 19921u16;
-                let listen_resp = run.send(&parent, Command::NetListen { port }).await;
+                let listen_resp = run
+                    .send(
+                        &parent,
+                        Command::NetListen {
+                            port,
+                            pre_bind_options: vec![],
+                        },
+                    )
+                    .await;
                 if !matches!(&listen_resp, Response::Listening { port: p } if *p == port) {
                     return super::TestOutcome::new(
                         "B",
@@ -3044,7 +3149,15 @@ pub(crate) fn register_fork_listen_close_tests(reg: &mut Registry<'_>) {
         Box::new(move |run| {
             Box::pin(async move {
                 for port in [19922u16, 19923] {
-                    let listen_resp = run.send(&parent, Command::NetListen { port }).await;
+                    let listen_resp = run
+                        .send(
+                            &parent,
+                            Command::NetListen {
+                                port,
+                                pre_bind_options: vec![],
+                            },
+                        )
+                        .await;
                     if !matches!(&listen_resp, Response::Listening { port: p } if *p == port) {
                         return super::TestOutcome::new(
                             "B",
@@ -3100,7 +3213,15 @@ pub(crate) fn register_fork_listen_close_tests(reg: &mut Registry<'_>) {
         Box::new(move |run| {
             Box::pin(async move {
                 let port = 19924u16;
-                let listen_resp = run.send(&parent, Command::NetListen { port }).await;
+                let listen_resp = run
+                    .send(
+                        &parent,
+                        Command::NetListen {
+                            port,
+                            pre_bind_options: vec![],
+                        },
+                    )
+                    .await;
                 if !matches!(&listen_resp, Response::Listening { port: p } if *p == port) {
                     return super::TestOutcome::new(
                         "B",
@@ -3156,7 +3277,15 @@ pub(crate) fn register_fork_listen_close_tests(reg: &mut Registry<'_>) {
         Box::new(move |run| {
             Box::pin(async move {
                 let port = 19925u16;
-                let listen_resp = run.send(&parent, Command::NetListen { port }).await;
+                let listen_resp = run
+                    .send(
+                        &parent,
+                        Command::NetListen {
+                            port,
+                            pre_bind_options: vec![],
+                        },
+                    )
+                    .await;
                 if !matches!(&listen_resp, Response::Listening { port: p } if *p == port) {
                     return super::TestOutcome::new(
                         "B",
@@ -3255,7 +3384,15 @@ pub(crate) fn register_fork_listen_close_tests(reg: &mut Registry<'_>) {
         Box::new(move |run| {
             Box::pin(async move {
                 let port = 19926u16;
-                let listen_resp = run.send(&parent, Command::NetListen { port }).await;
+                let listen_resp = run
+                    .send(
+                        &parent,
+                        Command::NetListen {
+                            port,
+                            pre_bind_options: vec![],
+                        },
+                    )
+                    .await;
                 if !matches!(&listen_resp, Response::Listening { port: p } if *p == port) {
                     return super::TestOutcome::new(
                         "A",

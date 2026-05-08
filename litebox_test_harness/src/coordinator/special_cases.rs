@@ -794,13 +794,21 @@ pub(crate) fn register_unix_socket(reg: &mut Registry<'_>) {
         }
     }
 
+    // Long-lived agents this fan-out runs in. One slot per
+    // BinaryType leg plus the VS-Code-shape transition slots so
+    // each fork-parent code path is exercised.
     for &agent in &[
-        AgentName::Dpg1,
-        AgentName::Dpg1Dpg1,
-        AgentName::Dpg2,
-        AgentName::Dpg1Dpg1Dpg1,
-        AgentName::Dpg1Dpg1Dpg1Dng,
-        AgentName::Dpg1Dng,
+        AgentName::Dpg1,         // PIE-glibc
+        AgentName::Dpg1Dpg1,     // PIE-glibc depth-2
+        AgentName::Dpg2,         // PIE-glibc sibling subtree
+        AgentName::Dpg1Dpg1Dpg1, // PIE-glibc depth-3
+        AgentName::Dpg1Dng,      // non-PIE-glibc (node form)
+        AgentName::Dpg1DngDng,   // bash → bash (VS Code hot path)
+        AgentName::Dpg1DngSpm,   // bash → cli (VS Code hot path)
+        AgentName::Dpg1Spg,      // static-PIE-glibc
+        AgentName::Dpg1Spm,      // static-PIE-musl (cli form)
+        AgentName::Dpg1SpmDng,   // cli → node (VS Code signature)
+        AgentName::Dpg1Snm,      // non-PIE-static-musl
     ] {
         for &bt in crate::BinaryType::ALL {
             let agent_name = agent;
@@ -867,13 +875,21 @@ pub(crate) fn register_unix_socket(reg: &mut Registry<'_>) {
         }
     }
 
+    // Long-lived agents this fan-out runs in. One slot per
+    // BinaryType leg plus the VS-Code-shape transition slots so
+    // each fork-parent code path is exercised.
     for &agent in &[
-        AgentName::Dpg1,
-        AgentName::Dpg1Dpg1,
-        AgentName::Dpg2,
-        AgentName::Dpg1Dpg1Dpg1,
-        AgentName::Dpg1Dpg1Dpg1Dng,
-        AgentName::Dpg1Dng,
+        AgentName::Dpg1,         // PIE-glibc
+        AgentName::Dpg1Dpg1,     // PIE-glibc depth-2
+        AgentName::Dpg2,         // PIE-glibc sibling subtree
+        AgentName::Dpg1Dpg1Dpg1, // PIE-glibc depth-3
+        AgentName::Dpg1Dng,      // non-PIE-glibc (node form)
+        AgentName::Dpg1DngDng,   // bash → bash (VS Code hot path)
+        AgentName::Dpg1DngSpm,   // bash → cli (VS Code hot path)
+        AgentName::Dpg1Spg,      // static-PIE-glibc
+        AgentName::Dpg1Spm,      // static-PIE-musl (cli form)
+        AgentName::Dpg1SpmDng,   // cli → node (VS Code signature)
+        AgentName::Dpg1Snm,      // non-PIE-static-musl
     ] {
         for &bt in crate::BinaryType::ALL {
             let id = format!("US6.socketpair_exec.{}.{agent}", bt.label());
@@ -1186,7 +1202,15 @@ pub(crate) fn register_cross_worker(reg: &mut Registry<'_>) {
         ephemerals[r = (AgentName::Dpg1, "R", SpawnKind::NonPie)],
         |run| {
             let _ = run.spawn_ephemeral(&r).await;
-            let resp = run.forward(&r, Command::NetListen { port: 0 }).await;
+            let resp = run
+                .forward(
+                    &r,
+                    Command::NetListen {
+                        port: 0,
+                        pre_bind_options: vec![],
+                    },
+                )
+                .await;
             let pass = super::expect_listening_port(&resp, 0).is_ok();
             super::TestOutcome::new("A", pass, format!("{resp:?}"))
         }
@@ -1202,7 +1226,15 @@ pub(crate) fn register_cross_worker(reg: &mut Registry<'_>) {
         ephemerals[r = (AgentName::Dpg1, "R", SpawnKind::NonPie)],
         |run| {
             let _ = run.spawn_ephemeral(&r).await;
-            let listen_resp = run.forward(&r, Command::NetListen { port: 0 }).await;
+            let listen_resp = run
+                .forward(
+                    &r,
+                    Command::NetListen {
+                        port: 0,
+                        pre_bind_options: vec![],
+                    },
+                )
+                .await;
             let port = match super::expect_listening_port(&listen_resp, 0) {
                 Ok(port) => port,
                 Err(e) => {
@@ -1237,7 +1269,15 @@ pub(crate) fn register_cross_worker(reg: &mut Registry<'_>) {
         timeout = 60,
         agents[a = AgentName::Dpg1],
         |run| {
-            let resp = run.send(&a, Command::NetListen { port: 0 }).await;
+            let resp = run
+                .send(
+                    &a,
+                    Command::NetListen {
+                        port: 0,
+                        pre_bind_options: vec![],
+                    },
+                )
+                .await;
             let pass = super::expect_listening_port(&resp, 0).is_ok();
             super::TestOutcome::new("A", pass, format!("{resp:?}"))
         }
@@ -1253,7 +1293,15 @@ pub(crate) fn register_cross_worker(reg: &mut Registry<'_>) {
         ephemerals[r = (AgentName::Dpg1, "R", SpawnKind::NonPie)],
         |run| {
             let _ = run.spawn_ephemeral(&r).await;
-            let listen_resp = run.send(&a, Command::NetListen { port: 0 }).await;
+            let listen_resp = run
+                .send(
+                    &a,
+                    Command::NetListen {
+                        port: 0,
+                        pre_bind_options: vec![],
+                    },
+                )
+                .await;
             let port = match super::expect_listening_port(&listen_resp, 0) {
                 Ok(port) => port,
                 Err(e) => {
@@ -1284,9 +1332,9 @@ pub(crate) fn register_cross_worker(reg: &mut Registry<'_>) {
         reg,
         "xworker",
         "cross_worker",
-        "XW7.dpg1_dpg1_dpg1_dng_listen",
+        "XW7.dpg1_dng_listen",
         timeout = 60,
-        agents[d4 = AgentName::Dpg1Dpg1Dpg1Dng],
+        agents[d4 = AgentName::Dpg1Dng],
         |run| {
             let resp = run
                 .send(
@@ -1297,11 +1345,11 @@ pub(crate) fn register_cross_worker(reg: &mut Registry<'_>) {
                 )
                 .await;
             let pass = super::expect_unix_listening_path(&resp, "/tmp/xw7.sock").is_ok();
-            super::TestOutcome::new(AgentName::Dpg1Dpg1Dpg1Dng.name(), pass, format!("{resp:?}"))
+            super::TestOutcome::new(AgentName::Dpg1Dng.name(), pass, format!("{resp:?}"))
         }
     );
 
-    typed_test!(reg, "xworker", "cross_worker", "XW7.dpg1_dpg1_dpg1_connect", timeout = 60, agents [d4 = AgentName::Dpg1Dpg1Dpg1Dng, d3 = AgentName::Dpg1Dpg1Dpg1], |run| {
+    typed_test!(reg, "xworker", "cross_worker", "XW7.dpg1_dpg1_dpg1_connect", timeout = 60, agents [d4 = AgentName::Dpg1Dng, d3 = AgentName::Dpg1Dpg1Dpg1], |run| {
         let listen_resp = run.send(&d4, Command::UnixListen { path: "/tmp/xw7c.sock".to_string() }).await;
         if super::expect_unix_listening_path(&listen_resp, "/tmp/xw7c.sock").is_err() {
             return super::TestOutcome::new(AgentName::Dpg1Dpg1Dpg1.name(), false, format!("listen setup failed: {listen_resp:?}"));
@@ -1334,25 +1382,25 @@ pub(crate) fn register_cross_worker(reg: &mut Registry<'_>) {
         }
     );
 
-    typed_test!(reg, "xworker", "cross_worker", "XW8.dpg1_dpg1_dpg1_dng_connect", timeout = 60, agents [d3 = AgentName::Dpg1Dpg1Dpg1, d4 = AgentName::Dpg1Dpg1Dpg1Dng], |run| {
+    typed_test!(reg, "xworker", "cross_worker", "XW8.dpg1_dng_connect", timeout = 60, agents [d3 = AgentName::Dpg1Dpg1Dpg1, d4 = AgentName::Dpg1Dng], |run| {
         let listen_resp = run.send(&d3, Command::UnixListen { path: "/tmp/xw8c.sock".to_string() }).await;
         if super::expect_unix_listening_path(&listen_resp, "/tmp/xw8c.sock").is_err() {
-            return super::TestOutcome::new(AgentName::Dpg1Dpg1Dpg1Dng.name(), false, format!("listen setup failed: {listen_resp:?}"));
+            return super::TestOutcome::new(AgentName::Dpg1Dng.name(), false, format!("listen setup failed: {listen_resp:?}"));
         }
         let resp = run
             .send(&d4, Command::UnixConnect { path: "/tmp/xw8c.sock".to_string(), data: "XW8_D4_TO_D3".to_string() })
             .await;
         let pass = matches!(&resp, Response::Connected { echo } if echo.contains("XW8_D4_TO_D3"));
-        super::TestOutcome::new(AgentName::Dpg1Dpg1Dpg1Dng.name(), pass, format!("{resp:?}"))
+        super::TestOutcome::new(AgentName::Dpg1Dng.name(), pass, format!("{resp:?}"))
     });
 
     typed_test!(
         reg,
         "xworker",
         "cross_worker",
-        "XW9.dpg1_dpg1_dpg1_dng_listen",
+        "XW9.dpg1_dng_listen",
         timeout = 60,
-        agents[d4 = AgentName::Dpg1Dpg1Dpg1Dng],
+        agents[d4 = AgentName::Dpg1Dng],
         |run| {
             let resp = run
                 .send(
@@ -1363,11 +1411,11 @@ pub(crate) fn register_cross_worker(reg: &mut Registry<'_>) {
                 )
                 .await;
             let pass = super::expect_unix_listening_path(&resp, "/tmp/xw9.sock").is_ok();
-            super::TestOutcome::new(AgentName::Dpg1Dpg1Dpg1Dng.name(), pass, format!("{resp:?}"))
+            super::TestOutcome::new(AgentName::Dpg1Dng.name(), pass, format!("{resp:?}"))
         }
     );
 
-    typed_test!(reg, "xworker", "cross_worker", "XW9.dpg1_dpg1_connect", timeout = 60, agents [d4 = AgentName::Dpg1Dpg1Dpg1Dng, aa = AgentName::Dpg1Dpg1], |run| {
+    typed_test!(reg, "xworker", "cross_worker", "XW9.dpg1_dpg1_connect", timeout = 60, agents [d4 = AgentName::Dpg1Dng, aa = AgentName::Dpg1Dpg1], |run| {
         let listen_resp = run.send(&d4, Command::UnixListen { path: "/tmp/xw9c.sock".to_string() }).await;
         if super::expect_unix_listening_path(&listen_resp, "/tmp/xw9c.sock").is_err() {
             return super::TestOutcome::new(AgentName::Dpg1Dpg1.name(), false, format!("listen setup failed: {listen_resp:?}"));
@@ -1387,14 +1435,22 @@ pub(crate) fn register_cross_worker(reg: &mut Registry<'_>) {
         timeout = 60,
         agents[d3 = AgentName::Dpg1Dpg1Dpg1],
         |run| {
-            let resp = run.send(&d3, Command::NetListen { port: 0 }).await;
+            let resp = run
+                .send(
+                    &d3,
+                    Command::NetListen {
+                        port: 0,
+                        pre_bind_options: vec![],
+                    },
+                )
+                .await;
             let pass = super::expect_listening_port(&resp, 0).is_ok();
             super::TestOutcome::new(AgentName::Dpg1Dpg1Dpg1.name(), pass, format!("{resp:?}"))
         }
     );
 
     typed_test!(reg, "xworker", "cross_worker", "XW10.dpg2_tcp_connect", timeout = 60, agents [d3 = AgentName::Dpg1Dpg1Dpg1, b = AgentName::Dpg2], |run| {
-        let listen_resp = run.send(&d3, Command::NetListen { port: 0 }).await;
+        let listen_resp = run.send(&d3, Command::NetListen { port: 0, pre_bind_options: vec![] }).await;
         let port = match super::expect_listening_port(&listen_resp, 0) {
             Ok(port) => port,
             Err(e) => return super::TestOutcome::new("B", false, format!("listen setup failed: {e}; resp={listen_resp:?}")),
@@ -1415,7 +1471,15 @@ pub(crate) fn register_cross_worker(reg: &mut Registry<'_>) {
         timeout = 60,
         agents[d3 = AgentName::Dpg1Dpg1Dpg1],
         |run| {
-            let resp = run.send(&d3, Command::NetListen { port: 0 }).await;
+            let resp = run
+                .send(
+                    &d3,
+                    Command::NetListen {
+                        port: 0,
+                        pre_bind_options: vec![],
+                    },
+                )
+                .await;
             let pass = super::expect_listening_port(&resp, 0).is_ok();
             super::TestOutcome::new(AgentName::Dpg1Dpg1Dpg1.name(), pass, format!("{resp:?}"))
         }
@@ -1445,7 +1509,7 @@ pub(crate) fn register_cross_worker(reg: &mut Registry<'_>) {
         agents[d3 = AgentName::Dpg1Dpg1Dpg1, b = AgentName::Dpg2],
         ephemerals[r2 = (AgentName::Dpg2, "R2", SpawnKind::NonPie)],
         |run| {
-            let listen_resp = run.send(&d3, Command::NetListen { port: 0 }).await;
+            let listen_resp = run.send(&d3, Command::NetListen { port: 0, pre_bind_options: vec![] }).await;
             let port = match super::expect_listening_port(&listen_resp, 0) {
                 Ok(port) => port,
                 Err(e) => return super::TestOutcome::new("R2", false, format!("listen setup failed: {e}; resp={listen_resp:?}")),
@@ -1463,13 +1527,21 @@ pub(crate) fn register_cross_worker(reg: &mut Registry<'_>) {
 
 // Register pipe EOF tests.
 pub(crate) fn register_pipe_eof(reg: &mut Registry<'_>) {
+    // Long-lived agents this fan-out runs in. One slot per
+    // BinaryType leg plus the VS-Code-shape transition slots so
+    // each fork-parent code path is exercised.
     for &agent in &[
-        AgentName::Dpg1,
-        AgentName::Dpg1Dpg1,
-        AgentName::Dpg2,
-        AgentName::Dpg1Dpg1Dpg1,
-        AgentName::Dpg1Dpg1Dpg1Dng,
-        AgentName::Dpg1Dng,
+        AgentName::Dpg1,         // PIE-glibc
+        AgentName::Dpg1Dpg1,     // PIE-glibc depth-2
+        AgentName::Dpg2,         // PIE-glibc sibling subtree
+        AgentName::Dpg1Dpg1Dpg1, // PIE-glibc depth-3
+        AgentName::Dpg1Dng,      // non-PIE-glibc (node form)
+        AgentName::Dpg1DngDng,   // bash → bash (VS Code hot path)
+        AgentName::Dpg1DngSpm,   // bash → cli (VS Code hot path)
+        AgentName::Dpg1Spg,      // static-PIE-glibc
+        AgentName::Dpg1Spm,      // static-PIE-musl (cli form)
+        AgentName::Dpg1SpmDng,   // cli → node (VS Code signature)
+        AgentName::Dpg1Snm,      // non-PIE-static-musl
     ] {
         for &bt in crate::BinaryType::ALL {
             let id = format!("P1.pipe_eof_fork.{}.{agent}", bt.label());

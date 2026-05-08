@@ -1,5 +1,11 @@
 # VS Code remote server — native syscall trace (connection-only)
 
+> **See also**: `docs/audit/vscode-syscall-trace-combined.md` — a
+> richer follow-up trace under a real workflow (connect → workspace
+> open → terminal → file edit → Copilot-Chat). The combined trace
+> upgrades several capabilities from "cold in connect-only" to "hot",
+> notably `inotify_add_watch` (5 → 1 343 calls).
+
 Captured against the **native** (no-litebox) `litebox-vscode` Docker image
 on `wportnoy/vscode-syscall-trace` worktree. The trace covers a fresh
 VS Code Remote-SSH connect from a Windows VS Code 1.119.0 client into a

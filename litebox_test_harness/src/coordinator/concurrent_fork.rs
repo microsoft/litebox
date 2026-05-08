@@ -120,7 +120,7 @@ pub(crate) fn register_concurrent_fork_pipeline(reg: &mut Registry<'_>) {
     }
 
     // xworker agents
-    for &agent in &[AgentName::Dpg1Dng, AgentName::Dpg1Dpg1Dpg1Dng] {
+    for &agent in &[AgentName::Dpg1Dng] {
         let agent_label = agent.to_string();
         reg.test(
             "xworker",

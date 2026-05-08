@@ -2,6 +2,16 @@
 
 > **TL;DR for VS-Code-in-litebox:** Start with the loopback/process regressions, not generic test cleanup: `TC.in_process.x10.d0` and the deterministic `LB.*` failures show Litebox can still drop or wedge VS-Code-like local TCP helper traffic. The test harness also cannot yet express the top VS Code shapes directly: inherited listen sockets via `Fork.inherit_listen_ports`, real PTY handover, and `SCM_RIGHTS` fd-passing. Before debugging the live VS Code stack, reduce each symptom to a self-contained harness capability test with signal-driven readiness (`ExecReady`/`WaitFor`) so failures localize to a product capability rather than bash, `nc`, or sleeps.
 
+> **Update — see also**:
+> - `docs/audit/vscode-syscall-trace-combined.md` — successor to the
+>   connection-only trace, captured under a real workflow (connect →
+>   workspace open → terminal → file edit → Copilot-Chat). Confirms
+>   `SCM_RIGHTS` is real, surfaces `inotify_add_watch` as a hot
+>   capability (1 343 calls), and adds `clone3 CLONE_VFORK`.
+> - `docs/audit/test-scenario-priorities.md` — per-family priority
+>   table (P0–P4) plus a coverage-by-capability **gaps view**
+>   (G0–G3) — the direct answer to "what are the testing gaps?".
+
 ## Executive summary
 
 ### Numeric snapshot

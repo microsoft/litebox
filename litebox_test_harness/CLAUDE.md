@@ -202,42 +202,110 @@ Lessons from this side-investigation:
 ## Agent Taxonomy
 
 Tests run against an explicit tree of *agents* — the coordinator and
-its descendants — set up by `coordinator/mod.rs::spawn_tree`. Each
-agent is a separate `litebox_test_harness` process; tests address
-them by handle (`AgentHandle`) and route commands through the
-coordinator.
+its descendants — set up by `coordinator/mod.rs::spawn_tree` from the
+declarative spec list in `coordinator/agents.rs::default_tree()`.
+Each agent is a separate `litebox_test_harness` process; tests
+address them by handle (`AgentHandle`) and route commands through
+the coordinator.
 
-### Naming convention: structural, not type-bearing
+### Path-encoded names
 
-Agent names encode **only structural position** (depth + branch +
-isolation context). Binary type (`PieGlibc`, `NonPieGlibc`,
-`StaticPieGlibc`, `StaticPieMusl`, `NonPieStaticMusl`) is a
-**separate, orthogonal axis** set per-spec at spawn time, never part
-of the agent name.
+Agent names embed both structural position and binary type at every
+hop, using a 3-letter binary tag per segment:
 
-| Position | Names |
-|---|---|
-| Coordinator | `Init` |
-| Depth 1, structural siblings | `A`, `B` |
-| Depth 2, children of `A` | `AA`, `AB` |
-| Depth 2, children of `B` | `BA`, `BB` |
-| Depth 3, children of `AA` | `AAA`, `AAB` |
-| Depth 4, child of `AAA` | `AAAA` |
-| Depth 5, child of `AAAA` | `AAAAA` |
-| Disposable subtree (SK family `SIGKILL`s these) | `K`, `KK` |
+```
+{d|s} {p|n} {g|m}
+ │     │     │
+ │     │     └── Glibc / Musl libc
+ │     └──────── Pie / Non-pie ELF
+ └────────────── Dynamically linked / Statically linked
+```
 
-### Why no `NP` / `NPC` / `D3` / `D4` / `D5`?
+Singleton siblings of a given binary type drop the ordinal — so
+`Dpg1Dng` is "the (sole) non-PIE-glibc child of `Dpg1`", whereas
+`Dpg1Dpg1` and `Dpg1Dpg2` are two PIE-glibc children of `Dpg1`.
 
-These names predate the `BinaryType` axis. They encoded
-"non-PIE-flavored child of `A`" / "PIE child of non-PIE NP" /
-"depth-3-but-mixed-binary-types" — collapsing structural position
-and binary type into one identifier.
+Reading a name reconstructs the entire path including binary types
+at each hop. `Dpg1_Dng_Spm` = "PIE-glibc → non-PIE-glibc →
+static-PIE-musl", which is exactly the VS Code "sshd → bash → cli"
+transition.
 
-With `BinaryType` modeled separately, the right way to express
-"non-PIE depth-1 child of `Init`" is `A` + `BinaryType::NonPieGlibc`.
-The mixed-binary-type deep chain that used to be `AA → D3 → D4 → D5`
-becomes `AA → AAA → AAAA → AAAAA` with explicit per-leg
-`BinaryType` in each `AgentSpec`.
+### Canonical tree (15 structural agents + 6 vscode_shape agents)
+
+The default tree is laid out to satisfy three orthogonal coverage
+axes: (1) **fork-parent binary type** — every leg of the
+`BinaryType` axis as a long-lived parent; (2) **VS-Code-shape
+transitions** — the hot fork transitions seen in the real VS Code
+Server strace; (3) **harness-side routing / sibling pairs** —
+multi-hop forwarding and cross-subtree network tests.
+
+| Agent | Position | Binary | What it covers |
+|---|---|---|---|
+| `Init` | Coordinator | — | The harness process itself. |
+| `Dpg1` | Depth-1 root | PieGlibc | Default top-level agent — the canonical PIE-glibc fork parent. Most tests run on or fork from here. |
+| `Dpg2` | Depth-1 sibling | PieGlibc | Sibling subtree for cross-subtree routing/network tests (e.g., `Dpg1` listens, `Dpg2` connects across worker boundaries). |
+| `Dpg3` | Depth-1 disposable | PieGlibc | Subtree-kill (`SK.subtree.*`) target: tests `SIGKILL`s this entire subtree to verify reaping/cleanup. Marked `IsolationKind::DisposableSubtree` so the validator doesn't flag the disappearance. |
+| `Dpg1Dpg1` | Depth-2 / `Dpg1` | PieGlibc | PIE-glibc depth-2. Exercises Forward-chain routing one hop deep and basic depth-2 fork inheritance. |
+| `Dpg1Dpg2` | Depth-2 / `Dpg1` | PieGlibc | PIE-glibc depth-2 sibling — pairs with `Dpg1Dpg1` for sibling-at-depth-2 network/fd-passing tests. |
+| `Dpg1Dpg1Dpg1` | Depth-3 / `Dpg1Dpg1` | PieGlibc | PIE-glibc depth-3. Mostly justified by harness-side routing (Forward chain through 3 hops); shim-side it adds nothing the audit didn't show was redundant. |
+| `Dpg1Dpg1Dpg2` | Depth-3 / `Dpg1Dpg1` | PieGlibc | Sibling-at-depth-3 — pairs with `Dpg1Dpg1Dpg1` for cross-subtree-at-depth-3 routing tests. |
+| `Dpg1Dng` | Depth-2 / `Dpg1` | NonPieGlibc | **Non-PIE-glibc as fork parent.** Spawned via `SpawnRemote`; exercises worker-host setup and the non-PIE syscall instrumentation regime. The agent matrix arrays (EXEC_AGENTS, NPIPE_AGENTS, etc.) all include this slot. |
+| `Dpg1DngDpg` | Depth-3 / `Dpg1Dng` | PieGlibc | **PIE child of NonPie parent** — spawn-time tests the worker-host *teardown* / PIE re-establishment after a non-PIE intermediate. As a forking parent it's just PIE-glibc again, but the spawn pathway to set it up is unique. |
+| `Dpg1DngDng` | Depth-3 / `Dpg1Dng` | NonPieGlibc | **bash → bash recursion** (the most common VS Code transition). Tests whether a second non-PIE fork from a non-PIE parent reuses or respawns the worker host. |
+| `Dpg1DngSpm` | Depth-3 / `Dpg1Dng` | StaticPieMusl | **bash → cli** transition. Exercises `Command::Fork{binary=static-pie-musl}` from a non-PIE-glibc parent — the spawn pathway no other slot covers. |
+| `Dpg1Spg` | Depth-2 / `Dpg1` | StaticPieGlibc | **Static-PIE-glibc as fork parent.** Even though static-PIE-glibc still loads `ld.so` for nss/dlopen, the parent-side syscall instrumentation differs from ordinary PIE-glibc and from static-PIE-musl. |
+| `Dpg1Spm` | Depth-2 / `Dpg1` | StaticPieMusl | **Static-PIE-musl as fork parent** — the same binary form as VS Code's `cli` (`cli-alpine-x64`). Truly static, no `PT_INTERP`. Without this slot, only `VS.shape.smoke` exercised StaticPieMusl as a parent. |
+| `Dpg1SpmDng` | Depth-3 / `Dpg1Spm` | NonPieGlibc | **cli → node** — the VS Code signature transition. Static-PIE-musl parent spawning a standard non-PIE-glibc Node.js child. Every fd Node.js needs (sockets, pipes, pty endpoints) flows through this exact transition in real VS Code Server use. |
+| `Dpg1Snm` | Depth-2 / `Dpg1` | NonPieStaticMusl | **Non-PIE-static-musl as fork parent.** Combines fixed-load address constraint of non-PIE with the no-ld.so / variant-I-TLS regime of musl-static. Not exercised by any other slot. |
+| `Dpg2Dpg` | Depth-2 / `Dpg2` | PieGlibc | Singleton PIE child of `Dpg2`, used by sibling-subtree tests that need a depth-2 endpoint under `Dpg2`. |
+| `Dpg3Dpg` | Depth-2 / `Dpg3` | PieGlibc | Disposable subtree depth-2 — used by `SK.subtree.deep` to test reaping a deeper subtree. Inherits `DisposableSubtree` isolation from `Dpg3`. |
+
+### VS Code-shape canary (`coordinator/vscode_shape.rs`)
+
+Six **semantically named** agents that mirror the actual VS Code
+Server process tree from the docker-vscode-native strace, in their
+real positions and with their real binary types:
+
+```
+sshd_pty (PieGlibc, depth 1)
+  └── login_bash (NonPieGlibc, depth 2)
+        └── piped_sh (NonPieGlibc, depth 3, stdin = pipe)
+              └── launcher_bash (NonPieGlibc, depth 4, sets up redirect)
+                    └── cli (StaticPieMusl, depth 5)
+                          └── node (NonPieGlibc, depth 6)
+```
+
+Used for tests like `BR.cli_startup_mimic.*` and `VS.shape.smoke`
+that *are* the VS Code-shape scenario; everywhere else, prefer the
+structural `Dpg*` taxonomy.
+
+**Note on `node`:** the embedded Node.js binary in the VS Code
+Server distribution
+(`/root/.vscode-server/cli/servers/Stable-<commit>/server/node`) is
+the standard linux-x64 build: `ET_EXEC`, dynamically linked,
+`INTERP=/lib64/ld-linux-x86-64.so.2`. Confirmed via `readelf` plus
+strace evidence (`access("/etc/ld.so.preload")` immediately after
+`execve` returns). Even though Microsoft ships `cli-alpine-x64`
+(static-musl) for the CLI entry point, the bundled Node is glibc.
+Hence `node` is `NonPieGlibc`, not `StaticPieMusl`.
+
+### Why no `NP` / `NPC` / `D3` / `D4` / `D5` / `A` / `B` / `AA`?
+
+Earlier names like `NP`/`NPC`/`D3`/`D4`/`D5` predated the
+`BinaryType` axis and conflated structural position with binary
+type. Earlier still, `A`/`B`/`AA`/`AB` were structural-only but
+needed to be paired with a separate binary-type field that wasn't
+visible in the name. The path-encoded scheme replaces both: the
+binary type is in the name (`Dpg1` = "Dynamic-Pie-Glibc, position
+1") and reading a deep name reconstructs the whole transition
+chain.
+
+The depth-4/5 agents (`Dpg1_Dpg1_Dpg1_Dng` and
+`Dpg1_Dpg1_Dpg1_Dng_Dpg`, formerly `D4`/`D5`) were **dropped**
+after the worker-host audit confirmed grandparent independence in
+the shim — no shim code path depends on what happened more than
+one fork ago. Tests that previously used D4/D5 were migrated to the
+depth-2/3 equivalents (`Dpg1Dng`/`Dpg1DngDpg`).
 
 ### Spec-driven `spawn_tree`
 
@@ -246,24 +314,40 @@ Each test family declares its required agents as a list of
 
 ```rust
 struct AgentSpec {
-    name: AgentName,                  // structural label only
-    parent: Option<AgentName>,        // None for direct children of Init
-    binary: BinaryType,               // explicit per agent, not implied
-    isolation: IsolationKind,         // Standard | DisposableSubtree
-    inherit_listen_ports: Vec<u16>,   // for fork+inherit-port tests
+    name: AgentName,            // path-encoded label
+    parent: Option<AgentName>,  // None for direct children of Init
+    binary: AgentBinary,        // explicit per agent (Pie / NonPie / Static…)
+    isolation: IsolationKind,   // Standard | DisposableSubtree
 }
 ```
 
-The coordinator walks the specs in dependency order (parent before
+The coordinator walks the specs in topological order (parent before
 child) and spawns each via `Command::Spawn` (PIE-glibc, the default),
-`Command::SpawnRemote` (non-PIE-glibc), or the binary-type bridging
-path for static-PIE / musl variants.
+`Command::SpawnRemote` (non-PIE-glibc), or `Command::Fork` with an
+explicit binary label for the static-PIE / musl variants.
+
+### Adding a new agent slot
+
+Resist adding new slots without justification. Every slot fans out
+across every test in `EXEC_AGENTS` / `NPIPE_AGENTS` / EP / US6 / P1
+/ etc., so the cost is significant. Justify a new slot by either:
+- **A real fork transition the tree doesn't already exercise** (was
+  the case for `Dpg1DngDng`, `Dpg1DngSpm`, `Dpg1SpmDng` from the VS
+  Code trace — and `Dpg1Spg`/`Dpg1Spm`/`Dpg1Snm` for static-leg fork
+  parents).
+- **A specific shim code path that branches on parent binary type
+  and isn't covered.** Cite `litebox_shim_linux/src/...` lines.
+
+If the slot is just "a deeper version of something we have", the
+worker-host audit (below) almost certainly says no — re-read it
+first.
 
 ### Adding a new test
 
 1. Pick a structural agent that matches your test's process-tree
-   shape. Don't reach for new agent names — extend the existing
-   structural taxonomy if you need more depth.
+   shape. Don't reach for new agent names — use the existing
+   structural taxonomy unless you have a justification per the
+   prior section.
 2. Pick the `BinaryType` axis: either a single fixed leg, or
    `BinaryType::ALL` if the test is binary-type-relevant. See the
    "Binary-Type Axis" section below.
@@ -272,23 +356,58 @@ path for static-PIE / musl variants.
    ordering. The binary-type segment may be omitted only when the
    test does not exec a binary at all.
 
-### VS Code-shape canary
+### Matrix arrays (where to fan out a new test)
 
-For tests that specifically reproduce the VS Code Server's process
-tree, use the named scenario in `coordinator/vscode_shape.rs`:
+For binary-type-sensitive tests, register against one of these
+arrays so the test automatically fans out across the relevant
+fork-parent slots:
 
-```
-sshd_pty (depth 1)
-  └── login_bash (depth 2)
-        └── piped_sh (depth 3, stdin = pipe)
-              └── launcher_bash (depth 4, sets up redirect)
-                    └── cli (depth 5, static-PIE-musl)
-                          └── node (depth 6, static-PIE-musl)
-```
+| Array | Module | Slots | Use for |
+|---|---|---|---|
+| `EXEC_AGENTS` | `matrix.rs` | 11 | exec-style tests (EXITD, BR.exec_*, FWE, M, BS, …) — fans across PIE-glibc depth-1/2/3, non-PIE-glibc, static-leg parents, and the VS-Code-shape transition slots. |
+| `NPIPE_AGENTS` | `platform_fixes.rs` | 10 | pipe-bridge churn tests (npipe family). |
+| EP agent loop | `platform_fixes.rs::register_epoll_socket_tests` | 11 | epoll/socket tests (EP.direct.*, EP.tokio.*) — has a per-agent port table to keep concurrent runs from colliding. |
+| US6 / P1 fan-out | `special_cases.rs` | 11 | UDS socketpair (US6) and pipe-EOF-fork (P1) families. |
+| `RAND_AGENTS` | `getrandom_tests.rs` | 4 | getrandom contract — covers glibc + musl libc-bootstrap differences. |
+| `INO_AGENTS` | `inotify.rs` | 5 | inotify file-watcher tests. |
+| `SCM_PAIRS` | `scm_rights.rs` | 7 | SCM_RIGHTS fd-passing — including cross-binary pairs (cli→node, bash→bash, bash→cli). |
+| `SOCKOPT_AGENTS` | `sockopt.rs` | 6 | setsockopt/getsockopt tests — one slot per BinaryType leg. |
 
-Agents in `vscode_shape` use semantic names rather than structural
-ones because the test *is* the VS Code-shape scenario. Tests like
-`BR.cli_startup_mimic.*` belong here.
+## Worker-Host / Fork-Restore State Transitions (audit, 2026-05-07)
+
+A code-dive audit of `litebox_shim_linux/src/syscalls/process.rs` (and
+related fork-restore / worker-host paths in
+`litebox_platform_linux_userland`) answered the question: **does the
+second consecutive fork in a chain depend on what the first fork did?**
+
+**Verdict: independent. Depth-2 covers all transitions.**
+
+No code path was found that consults grandparent ancestry or prior
+fork-chain history when doing the next fork/exec handoff. Each
+transition snapshots/restores the current task state only. The second
+fork in a chain is driven by the immediate parent's live state, not by
+what the first fork did.
+
+| Lifecycle event | Trigger | State accumulated | Grandparent-dependent? |
+|---|---|---|---|
+| Worker-host spawn | True-fork (`process.rs:6444-6492`) and delayed-fork exec when `needs_remote` (`process.rs:9218-9276`) | New host PID in `fork_child_host_pids`, control-plane ownership, background waiter | **No** |
+| Worker-host teardown | Child host exit (`process.rs:6288-6344`); exec path waits synchronously (`process.rs:8981-9015`) | Removes mappings, unregisters from control plane, reports to process registry | **No** |
+| fd-bridge inheritance | Delayed-fork exec collects child pipes/sockets, builds `parent_*_replacements` (`process.rs:8698-8970`) | `vfork_info.fd_replacements`; direct stdio installed as `HostPipeFd` | **No** |
+| pidfd registration | `pidfd_open` for local targets only (`process.rs:1732-1775`); rejects remote-running | Plain fd in local table | **No** |
+| Signal-mask propagation | True-fork snapshots blocked mask, handlers, altstack (`process.rs:6727-6740`); exec resets via `reset_for_exec()` (`process.rs:9362-9369`) | Snapshot of current task only | **No** |
+| execveat / fork-restore handoff | Routed via `exec_on_remote_host` if `needs_remote` (`process.rs:9142-9165`) | Bridges + `reset_for_exec()` clears thread-local state | **No** |
+| clone3 vfork | Same vfork parking / delayed-fork machinery as clone (`process.rs:1777-1885`) | Same `ForkContext` recording | **No** |
+
+**Implication for the test matrix:** the canonical coverage pattern is
+**depth-2 with `BinaryType::ALL` fan-out**. There is no need for a
+hand-curated Tier-2 of depth-3 chains exercising "interacting"
+transition pairs — none were found.
+
+Depth-3+ chains that exist in the historical agent tree (`AAAA`/`AAAAA`
+in the legacy taxonomy, `Dpg1Dpg1Dpg1Dng` / `Dpg1Dpg1Dpg1DngDpg` in
+the path-encoded taxonomy) do not exercise distinct shim code paths
+beyond the shallower equivalents (`Dpg1Dng` / `Dpg1DngDpg`) and have
+been removed.
 
 ## Test Categories
 

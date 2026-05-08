@@ -5,11 +5,15 @@
 //! writes responses to stdout. Intermediate nodes forward commands to
 //! their children.
 
-use crate::protocol::{Clone3Kind, Command, EpollEvent, Response, WaitPredicate};
+use crate::protocol::{
+    Clone3Kind, Command, EpollEvent, FdRef, InotifyEvent, Response, SockOpt, SockOptValue,
+    WaitPredicate,
+};
 use std::collections::HashMap;
 use std::ffi::CString;
 use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::os::unix::net::{UnixListener as StdUnixListener, UnixStream as StdUnixStream};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
@@ -25,6 +29,7 @@ struct ChildHandle {
 struct ListenerEntry {
     fd: OwnedFd,
     task: tokio::task::JoinHandle<()>,
+    accepted: Arc<AtomicUsize>,
 }
 
 struct EventfdEntry {
@@ -183,6 +188,9 @@ async fn agent_loop(self_exe: &str) {
         }
     };
     let mut unix_listeners: HashMap<String, tokio::task::JoinHandle<()>> = HashMap::new();
+    let mut unix_pair_listeners: HashMap<String, StdUnixListener> = HashMap::new();
+    let mut unix_pairs: HashMap<u64, OwnedFd> = HashMap::new();
+    let mut next_unix_pair_id = 1u64;
     let mut connections: HashMap<u64, TcpConn> = HashMap::new();
     let mut next_conn_id = 1u64;
     let mut eventfds: HashMap<u64, EventfdEntry> = HashMap::new();
@@ -191,6 +199,8 @@ async fn agent_loop(self_exe: &str) {
     let mut next_pty_id = 1u64;
     let mut epolls: HashMap<u64, EpollEntry> = HashMap::new();
     let mut next_epoll_id = 1u64;
+    let mut inotifies: HashMap<u64, OwnedFd> = HashMap::new();
+    let mut next_inotify_id = 1u64;
     let mut background_pids: HashMap<u32, BackgroundProcess> = HashMap::new();
 
     let mut line = String::new();
@@ -318,15 +328,27 @@ async fn agent_loop(self_exe: &str) {
                 // registered listener. Inherited listeners are imported into
                 // the same registry at startup, so the protocol round-trip is
                 // the readiness barrier for a later connector.
-                let Some(entry) = listeners.remove(&port) else {
+                let Some(entries) = listeners.get_mut(&port) else {
                     respond(&Response::ConnectFailed {
                         error: format!("no listener registered for port {port}"),
                     })
                     .await;
                     continue;
                 };
+                let Some(entry) = entries.pop() else {
+                    listeners.remove(&port);
+                    respond(&Response::ConnectFailed {
+                        error: format!("no listener registered for port {port}"),
+                    })
+                    .await;
+                    continue;
+                };
+                if entries.is_empty() {
+                    listeners.remove(&port);
+                }
                 entry.task.abort();
                 let _ = entry.task.await;
+                let accepted = entry.accepted.clone();
                 // SAFETY: removing the registry entry gives this one-shot
                 // accept worker sole ownership of the listener duplicate.
                 let listener =
@@ -335,6 +357,7 @@ async fn agent_loop(self_exe: &str) {
                 let timeout = std::time::Duration::from_secs(timeout_secs);
                 std::thread::spawn(move || {
                     if let Ok((mut stream, _)) = listener.accept() {
+                        accepted.fetch_add(1, Ordering::Relaxed);
                         let _ = stream.set_read_timeout(Some(timeout));
                         let _ = stream.set_write_timeout(Some(timeout));
                         let mut buf = [0u8; 4096];
@@ -359,9 +382,11 @@ async fn agent_loop(self_exe: &str) {
             Command::NetCloseListener { port } => {
                 // Close this agent's listen socket and stop its echo handler.
                 // Inherited child listeners remain alive in their own agents.
-                if let Some(entry) = listeners.remove(&port) {
-                    entry.task.abort();
-                    let _ = entry.task.await;
+                if let Some(entries) = listeners.remove(&port) {
+                    for entry in entries {
+                        entry.task.abort();
+                        let _ = entry.task.await;
+                    }
                 }
                 respond(&Response::Ok {
                     data: Some(format!("listener on port {port} closed")),
@@ -468,9 +493,12 @@ async fn agent_loop(self_exe: &str) {
                 }
             },
 
-            Command::NetListen { port } => match create_listener_entry(port) {
+            Command::NetListen {
+                port,
+                pre_bind_options,
+            } => match create_listener_entry(port, &pre_bind_options) {
                 Ok((actual_port, entry)) => {
-                    listeners.insert(actual_port, entry);
+                    listeners.entry(actual_port).or_default().push(entry);
                     respond(&Response::Listening { port: actual_port }).await;
                 }
                 Err(e) => {
@@ -481,10 +509,27 @@ async fn agent_loop(self_exe: &str) {
                 }
             },
 
+            Command::NetListenerStats { port } => {
+                if let Some(entries) = listeners.get(&port) {
+                    let counts = entries
+                        .iter()
+                        .map(|entry| entry.accepted.load(Ordering::Relaxed) as u64)
+                        .collect();
+                    respond(&Response::ListenerStats { counts }).await;
+                } else {
+                    respond(&Response::Error {
+                        error: format!("no listener registered for port {port}"),
+                    })
+                    .await;
+                }
+            }
+
             Command::NetUnlisten { port } => {
-                if let Some(entry) = listeners.remove(&port) {
-                    entry.task.abort();
-                    let _ = entry.task.await;
+                if let Some(entries) = listeners.remove(&port) {
+                    for entry in entries {
+                        entry.task.abort();
+                        let _ = entry.task.await;
+                    }
                 }
                 respond(&Response::Ok { data: None }).await;
             }
@@ -692,6 +737,46 @@ async fn agent_loop(self_exe: &str) {
                         error: format!("unknown conn {conn}"),
                     })
                     .await;
+                }
+            }
+
+            Command::NetSetSockOpt {
+                conn,
+                option,
+                value,
+            } => {
+                let Some(stream) = connections.get(&conn).cloned() else {
+                    respond(&Response::Error {
+                        error: format!("unknown conn {conn}"),
+                    })
+                    .await;
+                    continue;
+                };
+                let result = {
+                    let stream = stream.lock().await;
+                    set_sockopt_value(stream.as_raw_fd(), option, value)
+                };
+                match result {
+                    Ok(()) => respond(&Response::Ok { data: None }).await,
+                    Err(error) => respond(&Response::Error { error }).await,
+                }
+            }
+
+            Command::NetGetSockOpt { conn, option } => {
+                let Some(stream) = connections.get(&conn).cloned() else {
+                    respond(&Response::Error {
+                        error: format!("unknown conn {conn}"),
+                    })
+                    .await;
+                    continue;
+                };
+                let result = {
+                    let stream = stream.lock().await;
+                    get_sockopt_value(stream.as_raw_fd(), option)
+                };
+                match result {
+                    Ok(value) => respond(&Response::SockOptResult { value }).await,
+                    Err(error) => respond(&Response::Error { error }).await,
                 }
             }
 
@@ -1384,6 +1469,141 @@ async fn agent_loop(self_exe: &str) {
                 }
             }
 
+            Command::UnixPair {} => {
+                if next_unix_pair_id > u64::MAX - 2 {
+                    respond(&Response::Error {
+                        error: "unix pair id space exhausted".to_string(),
+                    })
+                    .await;
+                    continue;
+                }
+                match create_unix_socketpair() {
+                    Ok((left_fd, right_fd)) => {
+                        let left = next_unix_pair_id;
+                        let right = next_unix_pair_id + 1;
+                        next_unix_pair_id += 2;
+                        unix_pairs.insert(left, left_fd);
+                        unix_pairs.insert(right, right_fd);
+                        respond(&Response::UnixPairHandle { left, right }).await;
+                    }
+                    Err(error) => respond(&Response::Error { error }).await,
+                }
+            }
+
+            Command::UnixPairListen { path } => match bind_unix_pair_listener(&path) {
+                Ok(listener) => {
+                    unix_pair_listeners.insert(path.clone(), listener);
+                    respond(&Response::UnixListening { path }).await;
+                }
+                Err(error) => respond(&Response::Error { error }).await,
+            },
+
+            Command::UnixPairConnect { path } => match StdUnixStream::connect(&path) {
+                Ok(stream) => {
+                    match register_unix_stream(stream, &mut unix_pairs, &mut next_unix_pair_id) {
+                        Ok(id) => respond(&Response::UnixPairHandle { left: id, right: 0 }).await,
+                        Err(error) => respond(&Response::Error { error }).await,
+                    }
+                }
+                Err(e) => {
+                    respond(&Response::ConnectFailed {
+                        error: format!("unix connect({path}): {e}"),
+                    })
+                    .await;
+                }
+            },
+
+            Command::UnixPairAccept { path } => {
+                let Some(listener) = unix_pair_listeners.get(&path) else {
+                    respond(&Response::Error {
+                        error: format!("unknown unix pair listener {path}"),
+                    })
+                    .await;
+                    continue;
+                };
+                match listener.accept() {
+                    Ok((stream, _)) => {
+                        match register_unix_stream(stream, &mut unix_pairs, &mut next_unix_pair_id)
+                        {
+                            Ok(id) => {
+                                respond(&Response::UnixPairHandle { left: id, right: 0 }).await
+                            }
+                            Err(error) => respond(&Response::Error { error }).await,
+                        }
+                    }
+                    Err(e) => {
+                        respond(&Response::Error {
+                            error: format!("unix accept({path}): {e}"),
+                        })
+                        .await;
+                    }
+                }
+            }
+
+            Command::UnixSendFd {
+                socket,
+                sources,
+                payload,
+            } => match collect_source_fds(&sources, &eventfds, &connections, &unix_pairs).await {
+                Ok(raw_fds) => {
+                    let Some(sock) = unix_pairs.get(&socket) else {
+                        respond(&Response::Error {
+                            error: format!("unknown unix pair socket {socket}"),
+                        })
+                        .await;
+                        continue;
+                    };
+                    match send_fds(sock.as_raw_fd(), &sources, &raw_fds, payload.as_bytes()) {
+                        Ok(()) => respond(&Response::Sent).await,
+                        Err(error) => respond(&Response::Error { error }).await,
+                    }
+                }
+                Err(error) => respond(&Response::Error { error }).await,
+            },
+
+            Command::UnixRecvFd {
+                socket,
+                max_payload,
+            } => {
+                let Some(sock) = unix_pairs.get(&socket) else {
+                    respond(&Response::Error {
+                        error: format!("unknown unix pair socket {socket}"),
+                    })
+                    .await;
+                    continue;
+                };
+                match recv_fds(sock.as_raw_fd(), max_payload) {
+                    Ok((received, payload)) => {
+                        match register_received_fds(
+                            received,
+                            &mut eventfds,
+                            &mut next_eventfd_id,
+                            &mut connections,
+                            &mut next_conn_id,
+                            &mut unix_pairs,
+                            &mut next_unix_pair_id,
+                        ) {
+                            Ok(received) => {
+                                respond(&Response::ReceivedFd { received, payload }).await
+                            }
+                            Err(error) => respond(&Response::Error { error }).await,
+                        }
+                    }
+                    Err(error) => respond(&Response::Error { error }).await,
+                }
+            }
+
+            Command::UnixPairClose { socket } => {
+                if unix_pairs.remove(&socket).is_some() {
+                    respond(&Response::Closed).await;
+                } else {
+                    respond(&Response::Error {
+                        error: format!("unknown unix pair socket {socket}"),
+                    })
+                    .await;
+                }
+            }
+
             Command::PollReady { timeout_ms } => {
                 // Create a pipe, write data, poll read-end for POLLIN.
                 let result = (|| -> Result<&str, String> {
@@ -1500,6 +1720,42 @@ async fn agent_loop(self_exe: &str) {
                 match result {
                     Ok(msg) => respond(&Response::Ok { data: Some(msg) }).await,
                     Err(e) => respond(&Response::Error { error: e }).await,
+                }
+            }
+
+            Command::Getrandom { n, flags } => {
+                let flag_bits = match parse_getrandom_flags(&flags) {
+                    Ok(bits) => bits,
+                    Err(error) => {
+                        respond(&Response::Error { error }).await;
+                        continue;
+                    }
+                };
+                let mut buf = vec![0_u8; n as usize];
+                // SAFETY: `buf` is a valid writable byte buffer of length `n`
+                // for the duration of the getrandom syscall. The kernel writes
+                // at most `n` bytes and does not retain the pointer.
+                let ret = unsafe {
+                    libc::syscall(
+                        libc::SYS_getrandom,
+                        buf.as_mut_ptr(),
+                        n as libc::size_t,
+                        flag_bits,
+                    )
+                };
+                if ret >= 0 {
+                    buf.truncate(ret as usize);
+                    respond(&Response::RandomBytes {
+                        hex: hex_encode(&buf),
+                        errno: None,
+                    })
+                    .await;
+                } else {
+                    respond(&Response::RandomBytes {
+                        hex: String::new(),
+                        errno: Some(errno()),
+                    })
+                    .await;
                 }
             }
 
@@ -1886,6 +2142,78 @@ async fn agent_loop(self_exe: &str) {
                 }
             }
 
+            Command::InotifyOpen {} => {
+                let id = next_inotify_id;
+                if id == u64::MAX {
+                    respond(&Response::Error {
+                        error: "inotify id space exhausted".to_string(),
+                    })
+                    .await;
+                    continue;
+                }
+                match open_inotify() {
+                    Ok(fd) => {
+                        next_inotify_id += 1;
+                        inotifies.insert(id, fd);
+                        respond(&Response::InotifyHandle { id }).await;
+                    }
+                    Err(error) => respond(&Response::Error { error }).await,
+                }
+            }
+
+            Command::InotifyAddWatch { id, path, mask } => {
+                let Some(fd) = inotifies.get(&id) else {
+                    respond(&Response::Error {
+                        error: format!("unknown inotify {id}"),
+                    })
+                    .await;
+                    continue;
+                };
+                match add_inotify_watch(fd.as_raw_fd(), &path, &mask) {
+                    Ok(wd) => respond(&Response::WatchDescriptor { wd }).await,
+                    Err(error) => respond(&Response::Error { error }).await,
+                }
+            }
+
+            Command::InotifyRmWatch { id, wd } => {
+                let Some(fd) = inotifies.get(&id) else {
+                    respond(&Response::Error {
+                        error: format!("unknown inotify {id}"),
+                    })
+                    .await;
+                    continue;
+                };
+                match remove_inotify_watch(fd.as_raw_fd(), wd) {
+                    Ok(()) => respond(&Response::Closed).await,
+                    Err(error) => respond(&Response::Error { error }).await,
+                }
+            }
+
+            Command::InotifyRead { id, max_events } => {
+                let Some(fd) = inotifies.get(&id) else {
+                    respond(&Response::Error {
+                        error: format!("unknown inotify {id}"),
+                    })
+                    .await;
+                    continue;
+                };
+                match read_inotify_events(fd.as_raw_fd(), max_events) {
+                    Ok(events) => respond(&Response::InotifyEvents { events }).await,
+                    Err(error) => respond(&Response::Error { error }).await,
+                }
+            }
+
+            Command::InotifyClose { id } => {
+                if inotifies.remove(&id).is_some() {
+                    respond(&Response::Closed).await;
+                } else {
+                    respond(&Response::Error {
+                        error: format!("unknown inotify {id}"),
+                    })
+                    .await;
+                }
+            }
+
             Command::EventfdOpen { initval, flags } => {
                 let id = next_eventfd_id;
                 if id == u64::MAX {
@@ -2018,15 +2346,20 @@ async fn agent_loop(self_exe: &str) {
             }
 
             Command::Exit => {
+                inotifies.clear();
                 eventfds.clear();
                 // Abort all TCP echo servers.
-                for (_, entry) in listeners.drain() {
-                    entry.task.abort();
+                for (_, entries) in listeners.drain() {
+                    for entry in entries {
+                        entry.task.abort();
+                    }
                 }
                 // Abort all Unix echo servers.
                 for (_, task) in unix_listeners.drain() {
                     task.abort();
                 }
+                unix_pair_listeners.clear();
+                unix_pairs.clear();
                 // Terminate background processes.
                 for (_, child) in background_pids.drain() {
                     terminate_background(child);
@@ -2040,6 +2373,512 @@ async fn agent_loop(self_exe: &str) {
             }
         }
     }
+}
+
+fn parse_inotify_mask(mask: &str) -> Result<u32, String> {
+    let mut bits = 0u32;
+    for raw in mask.split('|') {
+        let token = raw.trim();
+        if token.is_empty() {
+            continue;
+        }
+        bits |= match token.to_ascii_lowercase().as_str() {
+            "create" | "in_create" => libc::IN_CREATE,
+            "modify" | "in_modify" => libc::IN_MODIFY,
+            "delete" | "in_delete" => libc::IN_DELETE,
+            "moved_from" | "in_moved_from" => libc::IN_MOVED_FROM,
+            "moved_to" | "in_moved_to" => libc::IN_MOVED_TO,
+            "attrib" | "in_attrib" => libc::IN_ATTRIB,
+            "close_write" | "in_close_write" => libc::IN_CLOSE_WRITE,
+            other => return Err(format!("unknown inotify mask token {other:?}")),
+        };
+    }
+    if bits == 0 {
+        return Err("inotify watch mask is empty".to_string());
+    }
+    Ok(bits)
+}
+
+fn format_inotify_mask(mask: u32) -> String {
+    let mut names = Vec::new();
+    for (bit, name) in [
+        (libc::IN_CREATE, "IN_CREATE"),
+        (libc::IN_MODIFY, "IN_MODIFY"),
+        (libc::IN_DELETE, "IN_DELETE"),
+        (libc::IN_MOVED_FROM, "IN_MOVED_FROM"),
+        (libc::IN_MOVED_TO, "IN_MOVED_TO"),
+        (libc::IN_ATTRIB, "IN_ATTRIB"),
+        (libc::IN_CLOSE_WRITE, "IN_CLOSE_WRITE"),
+        (libc::IN_IGNORED, "IN_IGNORED"),
+        (libc::IN_Q_OVERFLOW, "IN_Q_OVERFLOW"),
+        (libc::IN_UNMOUNT, "IN_UNMOUNT"),
+    ] {
+        if (mask & bit) != 0 {
+            names.push(name);
+        }
+    }
+    if names.is_empty() {
+        format!("0x{mask:x}")
+    } else {
+        names.join("|")
+    }
+}
+
+fn open_inotify() -> Result<OwnedFd, String> {
+    // SAFETY: inotify_init1 creates a new file descriptor and does not alias memory.
+    let fd = unsafe { libc::inotify_init1(libc::IN_CLOEXEC | libc::IN_NONBLOCK) };
+    if fd < 0 {
+        return Err(format!(
+            "inotify_init1: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    // SAFETY: `fd` was just returned by inotify_init1 and is uniquely owned here.
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
+fn add_inotify_watch(fd: i32, path: &str, mask: &str) -> Result<i32, String> {
+    let path_c = CString::new(path).map_err(|e| format!("inotify path contains NUL: {e}"))?;
+    let mask_bits = parse_inotify_mask(mask)?;
+    // SAFETY: path_c is a valid C string, fd is a live inotify descriptor, and
+    // inotify_add_watch does not retain Rust-owned memory after returning.
+    let wd = unsafe { libc::inotify_add_watch(fd, path_c.as_ptr(), mask_bits) };
+    if wd < 0 {
+        return Err(format!(
+            "inotify_add_watch({path:?}, {mask:?}): {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    Ok(wd)
+}
+
+fn remove_inotify_watch(fd: i32, wd: i32) -> Result<(), String> {
+    // SAFETY: fd is a live inotify descriptor and wd is an integer watch
+    // descriptor returned by the kernel for that fd.
+    let rc = unsafe { libc::inotify_rm_watch(fd, wd) };
+    if rc != 0 {
+        return Err(format!(
+            "inotify_rm_watch({wd}): {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    Ok(())
+}
+
+fn create_unix_socketpair() -> Result<(OwnedFd, OwnedFd), String> {
+    let mut sv = [0i32; 2];
+    // SAFETY: `sv` points to two writable fd slots; socketpair initializes both
+    // entries with fresh AF_UNIX SOCK_STREAM descriptors on success.
+    if unsafe {
+        libc::socketpair(
+            libc::AF_UNIX,
+            libc::SOCK_STREAM | libc::SOCK_CLOEXEC,
+            0,
+            sv.as_mut_ptr(),
+        )
+    } != 0
+    {
+        return Err(format!(
+            "socketpair(AF_UNIX): {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    // SAFETY: socketpair returned two fresh descriptors, each transferred to
+    // exactly one OwnedFd for independent registry ownership.
+    let left = unsafe { OwnedFd::from_raw_fd(sv[0]) };
+    // SAFETY: see above; this wraps the second fresh socketpair endpoint.
+    let right = unsafe { OwnedFd::from_raw_fd(sv[1]) };
+    Ok((left, right))
+}
+
+fn bind_unix_pair_listener(path: &str) -> Result<StdUnixListener, String> {
+    let _ = std::fs::remove_file(path);
+    let listener = StdUnixListener::bind(path).map_err(|e| format!("unix bind({path}): {e}"))?;
+    listener
+        .set_nonblocking(false)
+        .map_err(|e| format!("unix listener blocking({path}): {e}"))?;
+    Ok(listener)
+}
+
+fn register_unix_stream(
+    stream: StdUnixStream,
+    unix_pairs: &mut HashMap<u64, OwnedFd>,
+    next_unix_pair_id: &mut u64,
+) -> Result<u64, String> {
+    if *next_unix_pair_id == u64::MAX {
+        return Err("unix pair id space exhausted".to_string());
+    }
+    stream
+        .set_nonblocking(false)
+        .map_err(|e| format!("unix stream blocking: {e}"))?;
+    let id = *next_unix_pair_id;
+    *next_unix_pair_id += 1;
+    unix_pairs.insert(id, stream.into());
+    Ok(id)
+}
+
+async fn collect_source_fds(
+    sources: &[FdRef],
+    eventfds: &HashMap<u64, EventfdEntry>,
+    connections: &HashMap<u64, TcpConn>,
+    unix_pairs: &HashMap<u64, OwnedFd>,
+) -> Result<Vec<i32>, String> {
+    let mut fds = Vec::with_capacity(sources.len());
+    for source in sources {
+        let fd = match source {
+            FdRef::Eventfd(id) => eventfds
+                .get(id)
+                .map(|entry| entry.fd.as_raw_fd())
+                .ok_or_else(|| format!("unknown eventfd {id}"))?,
+            FdRef::TcpConn(id) => {
+                let stream = connections
+                    .get(id)
+                    .cloned()
+                    .ok_or_else(|| format!("unknown conn {id}"))?;
+                let stream = stream.lock().await;
+                stream.as_raw_fd()
+            }
+            FdRef::UnixPair(id) => unix_pairs
+                .get(id)
+                .map(AsRawFd::as_raw_fd)
+                .ok_or_else(|| format!("unknown unix pair socket {id}"))?,
+        };
+        fds.push(fd);
+    }
+    Ok(fds)
+}
+
+fn fd_ref_tag(source: &FdRef) -> u8 {
+    match source {
+        FdRef::Eventfd(_) => b'E',
+        FdRef::TcpConn(_) => b'T',
+        FdRef::UnixPair(_) => b'U',
+    }
+}
+
+fn send_fds(
+    socket_fd: i32,
+    sources: &[FdRef],
+    raw_fds: &[i32],
+    payload: &[u8],
+) -> Result<(), String> {
+    if sources.is_empty() || sources.len() != raw_fds.len() {
+        return Err("unix_send_fd requires at least one source fd".to_string());
+    }
+    let mut tagged_payload = Vec::with_capacity(sources.len() + payload.len());
+    tagged_payload.extend(sources.iter().map(fd_ref_tag));
+    tagged_payload.extend_from_slice(payload);
+    let mut iov = libc::iovec {
+        iov_base: tagged_payload.as_mut_ptr().cast(),
+        iov_len: tagged_payload.len(),
+    };
+    let fd_bytes = std::mem::size_of_val(raw_fds);
+    // SAFETY: CMSG_SPACE only computes the buffer size for `fd_bytes` bytes of
+    // control data; it does not dereference pointers.
+    let mut control = vec![0u8; unsafe { libc::CMSG_SPACE(fd_bytes as u32) as usize }];
+    // SAFETY: zeroed msghdr is a valid starting state; all pointer/length fields
+    // used by sendmsg are initialized below before the syscall.
+    let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+    msg.msg_iov = &raw mut iov;
+    msg.msg_iovlen = 1;
+    msg.msg_control = control.as_mut_ptr().cast();
+    msg.msg_controllen = control
+        .len()
+        .try_into()
+        .map_err(|_| "sendmsg control buffer length overflow".to_string())?;
+    // SAFETY: msg has a valid control buffer large enough for the cmsg header
+    // plus all source fds. CMSG_FIRSTHDR returns a pointer inside that buffer.
+    unsafe {
+        let cmsg = libc::CMSG_FIRSTHDR(&msg);
+        if cmsg.is_null() {
+            return Err("CMSG_FIRSTHDR returned null".to_string());
+        }
+        (*cmsg).cmsg_level = libc::SOL_SOCKET;
+        (*cmsg).cmsg_type = libc::SCM_RIGHTS;
+        (*cmsg).cmsg_len = libc::CMSG_LEN(fd_bytes as u32)
+            .try_into()
+            .map_err(|_| "SCM_RIGHTS cmsg length overflow".to_string())?;
+        std::ptr::copy_nonoverlapping(
+            raw_fds.as_ptr().cast::<u8>(),
+            libc::CMSG_DATA(cmsg).cast::<u8>(),
+            fd_bytes,
+        );
+        msg.msg_controllen = (*cmsg).cmsg_len;
+    }
+    loop {
+        // SAFETY: socket_fd is a live Unix stream socket; msg points to valid
+        // iovec and control buffers for the duration of the call. sendmsg does
+        // not take ownership of the descriptors in SCM_RIGHTS.
+        let rc = unsafe { libc::sendmsg(socket_fd, &raw const msg, 0) };
+        if rc == tagged_payload.len() as isize {
+            return Ok(());
+        }
+        if rc >= 0 {
+            return Err(format!(
+                "sendmsg sent {rc} bytes, expected {}",
+                tagged_payload.len()
+            ));
+        }
+        let err = std::io::Error::last_os_error();
+        if err.raw_os_error() != Some(libc::EINTR) {
+            return Err(format!("sendmsg SCM_RIGHTS: {err}"));
+        }
+    }
+}
+
+fn recv_fds(socket_fd: i32, max_payload: u32) -> Result<(Vec<(u8, OwnedFd)>, String), String> {
+    let mut data = vec![0u8; max_payload.max(1) as usize];
+    let mut iov = libc::iovec {
+        iov_base: data.as_mut_ptr().cast(),
+        iov_len: data.len(),
+    };
+    let max_fds = 8usize;
+    let control_len =
+        unsafe { libc::CMSG_SPACE((max_fds * std::mem::size_of::<i32>()) as u32) as usize };
+    let mut control = vec![0u8; control_len];
+    // SAFETY: zeroed msghdr is a valid starting state; all used fields are set
+    // to live data/control buffers before recvmsg.
+    let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+    msg.msg_iov = &raw mut iov;
+    msg.msg_iovlen = 1;
+    msg.msg_control = control.as_mut_ptr().cast();
+    msg.msg_controllen = control
+        .len()
+        .try_into()
+        .map_err(|_| "recvmsg control buffer length overflow".to_string())?;
+    let n = loop {
+        // SAFETY: socket_fd is a live Unix stream socket; msg points to writable
+        // data and control buffers. MSG_CMSG_CLOEXEC asks the kernel to set
+        // close-on-exec on any received fds before they are installed.
+        let rc = unsafe { libc::recvmsg(socket_fd, &raw mut msg, libc::MSG_CMSG_CLOEXEC) };
+        if rc >= 0 {
+            break rc as usize;
+        }
+        let err = std::io::Error::last_os_error();
+        if err.raw_os_error() != Some(libc::EINTR) {
+            return Err(format!("recvmsg SCM_RIGHTS: {err}"));
+        }
+    };
+    if msg.msg_flags & libc::MSG_CTRUNC != 0 {
+        return Err("recvmsg control data truncated".to_string());
+    }
+    if msg.msg_flags & libc::MSG_TRUNC != 0 {
+        return Err("recvmsg payload truncated".to_string());
+    }
+    // SAFETY: msg's control buffer was filled by recvmsg. CMSG_FIRSTHDR returns
+    // a pointer into that buffer or null when no control message was received.
+    let cmsg = unsafe { libc::CMSG_FIRSTHDR(&msg) };
+    if cmsg.is_null() {
+        return Err("recvmsg did not include SCM_RIGHTS cmsg".to_string());
+    }
+    // SAFETY: cmsg points inside msg's initialized control buffer.
+    let (level, kind, cmsg_len) = unsafe {
+        (
+            (*cmsg).cmsg_level,
+            (*cmsg).cmsg_type,
+            (*cmsg).cmsg_len as usize,
+        )
+    };
+    if level != libc::SOL_SOCKET || kind != libc::SCM_RIGHTS {
+        return Err(format!("unexpected cmsg level={level} type={kind}"));
+    }
+    let header_len = unsafe { libc::CMSG_LEN(0) as usize };
+    if cmsg_len < header_len {
+        return Err(format!("short cmsg length {cmsg_len}"));
+    }
+    let fd_count = (cmsg_len - header_len) / std::mem::size_of::<i32>();
+    if fd_count == 0 {
+        return Err("SCM_RIGHTS cmsg carried no fds".to_string());
+    }
+    if n < fd_count {
+        return Err(format!(
+            "payload too short for {fd_count} fd type tags: {n} bytes"
+        ));
+    }
+    let mut raw_fds = vec![0i32; fd_count];
+    // SAFETY: CMSG_DATA points to at least fd_count i32 values per cmsg_len;
+    // raw_fds is valid writable storage of the same size.
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            libc::CMSG_DATA(cmsg).cast::<i32>(),
+            raw_fds.as_mut_ptr(),
+            fd_count,
+        );
+    }
+    let tags = data[..fd_count].to_vec();
+    let payload = String::from_utf8_lossy(&data[fd_count..n]).to_string();
+    let received = tags
+        .into_iter()
+        .zip(raw_fds)
+        .map(|(tag, fd)| {
+            // SAFETY: each fd was freshly installed by recvmsg and is now owned
+            // by this agent's registry after wrapping in OwnedFd.
+            (tag, unsafe { OwnedFd::from_raw_fd(fd) })
+        })
+        .collect();
+    Ok((received, payload))
+}
+
+fn register_received_fds(
+    received: Vec<(u8, OwnedFd)>,
+    eventfds: &mut HashMap<u64, EventfdEntry>,
+    next_eventfd_id: &mut u64,
+    connections: &mut HashMap<u64, TcpConn>,
+    next_conn_id: &mut u64,
+    unix_pairs: &mut HashMap<u64, OwnedFd>,
+    next_unix_pair_id: &mut u64,
+) -> Result<Vec<FdRef>, String> {
+    let mut refs = Vec::with_capacity(received.len());
+    for (tag, fd) in received {
+        ensure_received_fd_cloexec(&fd)?;
+        match tag {
+            b'E' => {
+                if *next_eventfd_id == u64::MAX {
+                    return Err("eventfd id space exhausted".to_string());
+                }
+                let id = *next_eventfd_id;
+                *next_eventfd_id += 1;
+                eventfds.insert(
+                    id,
+                    EventfdEntry {
+                        fd,
+                        flags: "received_scm_rights".to_string(),
+                        authorized_readers: Vec::new(),
+                    },
+                );
+                refs.push(FdRef::Eventfd(id));
+            }
+            b'T' => {
+                if *next_conn_id == u64::MAX {
+                    return Err("connection id space exhausted".to_string());
+                }
+                let id = *next_conn_id;
+                *next_conn_id += 1;
+                // SAFETY: fd is a received TCP socket tagged by the sender and
+                // uniquely owned here; from_raw_fd transfers ownership to std.
+                let stream = unsafe { std::net::TcpStream::from_raw_fd(fd.into_raw_fd()) };
+                stream
+                    .set_nonblocking(true)
+                    .map_err(|e| format!("received tcp set_nonblocking: {e}"))?;
+                let stream = TcpStream::from_std(stream)
+                    .map_err(|e| format!("received tcp from_std: {e}"))?;
+                connections.insert(id, Arc::new(tokio::sync::Mutex::new(stream)));
+                refs.push(FdRef::TcpConn(id));
+            }
+            b'U' => {
+                if *next_unix_pair_id == u64::MAX {
+                    return Err("unix pair id space exhausted".to_string());
+                }
+                let id = *next_unix_pair_id;
+                *next_unix_pair_id += 1;
+                unix_pairs.insert(id, fd);
+                refs.push(FdRef::UnixPair(id));
+            }
+            other => return Err(format!("unknown SCM_RIGHTS fd tag byte {other}")),
+        }
+    }
+    Ok(refs)
+}
+
+fn ensure_received_fd_cloexec(fd: &OwnedFd) -> Result<(), String> {
+    // SAFETY: F_GETFD reads descriptor flags from a live fd and does not take ownership.
+    let flags = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFD) };
+    if flags < 0 {
+        return Err(format!(
+            "fcntl(F_GETFD) on received fd: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    if flags & libc::FD_CLOEXEC == 0 {
+        return Err("received fd missing FD_CLOEXEC despite MSG_CMSG_CLOEXEC".to_string());
+    }
+    Ok(())
+}
+
+fn read_inotify_events(fd: i32, max_events: u32) -> Result<Vec<InotifyEvent>, String> {
+    let max_events = max_events.clamp(1, 1024) as usize;
+    let event_size = std::mem::size_of::<libc::inotify_event>();
+    let mut buf = vec![0u8; max_events * (event_size + libc::NAME_MAX as usize + 1)];
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        // SAFETY: buf is valid writable storage for its full length and fd is a
+        // live nonblocking inotify descriptor. read does not retain the buffer.
+        let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) };
+        if n > 0 {
+            return parse_inotify_events(&buf[..n as usize], max_events);
+        }
+        if n == 0 {
+            return Ok(Vec::new());
+        }
+        let err = std::io::Error::last_os_error();
+        match err.raw_os_error() {
+            Some(libc::EINTR) => continue,
+            Some(libc::EAGAIN) => {
+                if std::time::Instant::now() >= deadline {
+                    return Ok(Vec::new());
+                }
+                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                let timeout_ms = i32::try_from(remaining.as_millis().min(1000)).unwrap_or(1000);
+                let mut pollfd = libc::pollfd {
+                    fd,
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+                // SAFETY: pollfd points to one initialized pollfd entry.
+                let ready = unsafe { libc::poll(&mut pollfd, 1, timeout_ms) };
+                if ready < 0 {
+                    let poll_err = std::io::Error::last_os_error();
+                    if poll_err.raw_os_error() == Some(libc::EINTR) {
+                        continue;
+                    }
+                    return Err(format!("inotify poll: {poll_err}"));
+                }
+                if ready == 0 {
+                    return Ok(Vec::new());
+                }
+            }
+            _ => return Err(format!("inotify read: {err}")),
+        }
+    }
+}
+
+fn parse_inotify_events(bytes: &[u8], max_events: usize) -> Result<Vec<InotifyEvent>, String> {
+    let mut events = Vec::new();
+    let mut offset = 0usize;
+    let event_size = std::mem::size_of::<libc::inotify_event>();
+    while offset + event_size <= bytes.len() && events.len() < max_events {
+        // SAFETY: offset + event_size is within bytes. read_unaligned copies the
+        // kernel-provided record header without requiring alignment.
+        let raw = unsafe {
+            std::ptr::read_unaligned(bytes.as_ptr().add(offset).cast::<libc::inotify_event>())
+        };
+        offset += event_size;
+        let name_len = raw.len as usize;
+        if offset + name_len > bytes.len() {
+            return Err(format!(
+                "short inotify event name: len={name_len} remaining={}",
+                bytes.len().saturating_sub(offset)
+            ));
+        }
+        let name = if name_len == 0 {
+            None
+        } else {
+            let raw_name = &bytes[offset..offset + name_len];
+            let nul = raw_name
+                .iter()
+                .position(|&b| b == 0)
+                .unwrap_or(raw_name.len());
+            Some(String::from_utf8_lossy(&raw_name[..nul]).to_string())
+        };
+        offset += name_len;
+        events.push(InotifyEvent {
+            wd: raw.wd,
+            mask: format_inotify_mask(raw.mask),
+            cookie: raw.cookie,
+            name,
+        });
+    }
+    Ok(events)
 }
 
 fn parse_epoll_events(events: &str) -> Result<u32, String> {
@@ -2457,6 +3296,7 @@ struct CloneArgs {
 static CLONE3_THREAD_WRITE_FD: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
 static CLONE3_THREAD_TID: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
 static CLONE3_THREAD_SIGNAL: u8 = 1;
+static CLONE3_VFORK_STAGE: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
 
 fn clone_result_error(error: impl Into<String>) -> crate::protocol::CloneResult {
     crate::protocol::CloneResult {
@@ -2523,6 +3363,7 @@ fn run_clone3(kind: Clone3Kind, exec_target: Option<String>) -> crate::protocol:
         Clone3Kind::WithPidfd => run_clone3_process(true, None, None, exec_target),
         Clone3Kind::WithSetTid { tid } => run_clone3_process(false, Some(tid), None, exec_target),
         Clone3Kind::WithCgroup { cgroup_fd } => run_clone3_with_cgroup(cgroup_fd, exec_target),
+        Clone3Kind::WithVfork => run_clone3_vfork(),
     }
 }
 
@@ -2552,6 +3393,70 @@ fn run_clone3_with_cgroup(
     // SAFETY: `fd` was just returned by `open` and is uniquely owned here.
     let owned = unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) };
     run_clone3_process(false, None, Some(owned.as_raw_fd()), exec_target)
+}
+
+fn run_clone3_vfork() -> crate::protocol::CloneResult {
+    CLONE3_VFORK_STAGE.store(0, Ordering::SeqCst);
+    let mut child_tid = 0i32;
+    let mut args = CloneArgs {
+        flags: (libc::CLONE_VM | libc::CLONE_VFORK | libc::CLONE_CHILD_CLEARTID) as u64,
+        child_tid: (&raw mut child_tid).addr() as u64,
+        exit_signal: libc::SIGCHLD as u64,
+        ..CloneArgs::default()
+    };
+    // SAFETY: `args` is a clone_args-compatible struct and lives for the
+    // syscall. The vfork child performs only raw syscalls and atomics, then
+    // terminates with SYS_exit so the parent resumes without Rust unwinding.
+    let rc = unsafe {
+        libc::syscall(
+            libc::SYS_clone3,
+            &raw mut args,
+            std::mem::size_of::<CloneArgs>(),
+        )
+    };
+    if rc == 0 {
+        // SAFETY: In the vfork child, use only raw syscalls and atomic stores
+        // before SYS_exit; SYS_exit releases the suspended parent.
+        unsafe {
+            CLONE3_VFORK_STAGE.store(1, Ordering::SeqCst);
+            for _ in 0..20_000 {
+                let _ = libc::syscall(libc::SYS_sched_yield);
+            }
+            CLONE3_VFORK_STAGE.store(2, Ordering::SeqCst);
+            libc::syscall(libc::SYS_exit, 0i32);
+        }
+        unreachable!();
+    }
+    if rc < 0 {
+        return clone_result_error(last_errno_name());
+    }
+    let pid = rc as libc::pid_t;
+    let stage_after_return = CLONE3_VFORK_STAGE.load(Ordering::SeqCst);
+    if stage_after_return != 2 {
+        let _ = wait_for_child(pid);
+        return crate::protocol::CloneResult {
+            pid: pid as u64,
+            pidfd: None,
+            ok: false,
+            error: Some(format!(
+                "vfork_parent_resumed_before_child_exit:stage={stage_after_return}"
+            )),
+        };
+    }
+    if let Err(error) = wait_for_child(pid) {
+        return crate::protocol::CloneResult {
+            pid: pid as u64,
+            pidfd: None,
+            ok: false,
+            error: Some(format!("wait:{error}")),
+        };
+    }
+    crate::protocol::CloneResult {
+        pid: pid as u64,
+        pidfd: None,
+        ok: true,
+        error: None,
+    }
 }
 
 fn run_clone3_thread() -> crate::protocol::CloneResult {
@@ -2759,27 +3664,95 @@ fn close_fd(fd: i32) {
     }
 }
 
-fn create_listener_entry(port: u16) -> Result<(u16, ListenerEntry), String> {
-    let std_listener =
-        std::net::TcpListener::bind(format!("0.0.0.0:{port}")).map_err(|e| format!("{e}"))?;
+fn create_listener_entry(
+    port: u16,
+    pre_bind_options: &[(SockOpt, SockOptValue)],
+) -> Result<(u16, ListenerEntry), String> {
+    // SAFETY: socket creates a fresh descriptor on success; it is immediately
+    // wrapped in OwnedFd so all later error paths close it exactly once.
+    let raw_fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0) };
+    if raw_fd < 0 {
+        return Err(format!("socket: {}", std::io::Error::last_os_error()));
+    }
+    // SAFETY: raw_fd was just returned by socket and is uniquely owned here.
+    let fd = unsafe { OwnedFd::from_raw_fd(raw_fd) };
+
+    for &(option, value) in pre_bind_options {
+        set_sockopt_value(fd.as_raw_fd(), option, value)?;
+    }
+
+    let addr = libc::sockaddr_in {
+        sin_family: libc::AF_INET as libc::sa_family_t,
+        sin_port: port.to_be(),
+        sin_addr: libc::in_addr {
+            s_addr: libc::INADDR_ANY,
+        },
+        sin_zero: [0; 8],
+    };
+    // SAFETY: addr points to a valid IPv4 sockaddr for the duration of the
+    // call, and fd is a live TCP socket not aliased mutably elsewhere.
+    let bind_rc = unsafe {
+        libc::bind(
+            fd.as_raw_fd(),
+            std::ptr::addr_of!(addr).cast::<libc::sockaddr>(),
+            std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+        )
+    };
+    if bind_rc != 0 {
+        return Err(format!("bind: {}", std::io::Error::last_os_error()));
+    }
+    // SAFETY: fd is a live bound TCP socket; listen does not take ownership.
+    let listen_rc = unsafe { libc::listen(fd.as_raw_fd(), 128) };
+    if listen_rc != 0 {
+        return Err(format!("listen: {}", std::io::Error::last_os_error()));
+    }
+
+    // SAFETY: fd is a live listening socket; zeroed sockaddr_in is an acceptable
+    // output buffer for getsockname, which initializes len bytes on success.
+    let mut actual_addr = unsafe { std::mem::zeroed::<libc::sockaddr_in>() };
+    let mut actual_len = std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
+    // SAFETY: actual_addr and actual_len point to writable storage valid for
+    // the call; fd remains owned by this function.
+    let name_rc = unsafe {
+        libc::getsockname(
+            fd.as_raw_fd(),
+            std::ptr::addr_of_mut!(actual_addr).cast::<libc::sockaddr>(),
+            &mut actual_len,
+        )
+    };
+    let actual_port = if name_rc == 0 {
+        u16::from_be(actual_addr.sin_port)
+    } else {
+        port
+    };
+
+    // SAFETY: into_raw_fd transfers the uniquely owned listening socket to the
+    // standard library TcpListener, which now closes it on drop.
+    let std_listener = unsafe { std::net::TcpListener::from_raw_fd(fd.into_raw_fd()) };
     std_listener
         .set_nonblocking(true)
         .map_err(|e| format!("set_nonblocking: {e}"))?;
-    let actual_port = std_listener
-        .local_addr()
-        .map(|addr| addr.port())
-        .unwrap_or(port);
-    let fd = dup_fd_cloexec(std_listener.as_raw_fd())?;
-    let task = spawn_tcp_echo_task(std_listener)?;
-    Ok((actual_port, ListenerEntry { fd, task }))
+    let registry_fd = dup_fd_cloexec(std_listener.as_raw_fd())?;
+    let accepted = Arc::new(AtomicUsize::new(0));
+    let task = spawn_tcp_echo_task(std_listener, accepted.clone())?;
+    Ok((
+        actual_port,
+        ListenerEntry {
+            fd: registry_fd,
+            task,
+            accepted,
+        },
+    ))
 }
 
 fn spawn_tcp_echo_task(
     std_listener: std::net::TcpListener,
+    accepted: Arc<AtomicUsize>,
 ) -> Result<tokio::task::JoinHandle<()>, String> {
     let listener = TcpListener::from_std(std_listener).map_err(|e| format!("from_std: {e}"))?;
     Ok(tokio::spawn(async move {
         while let Ok((mut stream, _)) = listener.accept().await {
+            accepted.fetch_add(1, Ordering::Relaxed);
             tokio::spawn(async move {
                 let mut buf = [0u8; 4096];
                 loop {
@@ -2797,7 +3770,73 @@ fn spawn_tcp_echo_task(
     }))
 }
 
-fn import_inherited_listeners() -> Result<HashMap<u16, ListenerEntry>, String> {
+fn sockopt_level_name(option: SockOpt) -> (i32, i32, &'static str, bool) {
+    match option {
+        SockOpt::ReuseAddr => (libc::SOL_SOCKET, libc::SO_REUSEADDR, "SO_REUSEADDR", true),
+        SockOpt::ReusePort => (libc::SOL_SOCKET, libc::SO_REUSEPORT, "SO_REUSEPORT", true),
+        SockOpt::KeepAlive => (libc::SOL_SOCKET, libc::SO_KEEPALIVE, "SO_KEEPALIVE", true),
+        SockOpt::RecvBuf => (libc::SOL_SOCKET, libc::SO_RCVBUF, "SO_RCVBUF", false),
+        SockOpt::SendBuf => (libc::SOL_SOCKET, libc::SO_SNDBUF, "SO_SNDBUF", false),
+        SockOpt::NoDelay => (libc::IPPROTO_TCP, libc::TCP_NODELAY, "TCP_NODELAY", true),
+    }
+}
+
+fn set_sockopt_value(fd: i32, option: SockOpt, value: SockOptValue) -> Result<(), String> {
+    let (level, optname, name, _) = sockopt_level_name(option);
+    let raw: libc::c_int = match value {
+        SockOptValue::Bool(enabled) => i32::from(enabled),
+        SockOptValue::U32(value) => value as libc::c_int,
+    };
+    // SAFETY: fd is a live socket descriptor owned by the agent registry; raw
+    // points to a properly aligned c_int value for the duration of the call.
+    let rc = unsafe {
+        libc::setsockopt(
+            fd,
+            level,
+            optname,
+            std::ptr::addr_of!(raw).cast::<libc::c_void>(),
+            std::mem::size_of_val(&raw) as libc::socklen_t,
+        )
+    };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(format!(
+            "setsockopt {name}: {}",
+            std::io::Error::last_os_error()
+        ))
+    }
+}
+
+fn get_sockopt_value(fd: i32, option: SockOpt) -> Result<SockOptValue, String> {
+    let (level, optname, name, is_bool) = sockopt_level_name(option);
+    let mut raw: libc::c_int = 0;
+    let mut len = std::mem::size_of_val(&raw) as libc::socklen_t;
+    // SAFETY: fd is a live socket descriptor owned by the agent registry; raw
+    // and len point to writable storage valid for the duration of the call.
+    let rc = unsafe {
+        libc::getsockopt(
+            fd,
+            level,
+            optname,
+            std::ptr::addr_of_mut!(raw).cast::<libc::c_void>(),
+            &mut len,
+        )
+    };
+    if rc != 0 {
+        return Err(format!(
+            "getsockopt {name}: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    if is_bool {
+        Ok(SockOptValue::Bool(raw != 0))
+    } else {
+        Ok(SockOptValue::U32(raw.max(0) as u32))
+    }
+}
+
+fn import_inherited_listeners() -> Result<HashMap<u16, Vec<ListenerEntry>>, String> {
     let spec = match std::env::var(INHERITED_LISTEN_FDS_ENV) {
         Ok(spec) if !spec.is_empty() => spec,
         _ => return Ok(HashMap::new()),
@@ -2823,19 +3862,20 @@ fn import_inherited_listeners() -> Result<HashMap<u16, ListenerEntry>, String> {
         let registry_fd = dup_fd_cloexec(inherited_listener.as_raw_fd())?;
         drop(inherited_listener);
         let task = tokio::spawn(async {});
-        listeners.insert(
-            port,
-            ListenerEntry {
+        listeners
+            .entry(port)
+            .or_insert_with(Vec::new)
+            .push(ListenerEntry {
                 fd: registry_fd,
                 task,
-            },
-        );
+                accepted: Arc::new(AtomicUsize::new(0)),
+            });
     }
     Ok(listeners)
 }
 
 fn prepare_inherited_listeners(
-    listeners: &HashMap<u16, ListenerEntry>,
+    listeners: &HashMap<u16, Vec<ListenerEntry>>,
     ports: &[u16],
 ) -> Result<Vec<(u16, OwnedFd)>, String> {
     if ports.len() > (INHERITED_LISTEN_FD_LIMIT - INHERITED_LISTEN_FD_BASE + 1) as usize {
@@ -2848,11 +3888,38 @@ fn prepare_inherited_listeners(
     for (index, port) in ports.iter().copied().enumerate() {
         let entry = listeners
             .get(&port)
+            .and_then(|entries| entries.first())
             .ok_or_else(|| format!("no listener registered for port {port}"))?;
         let slot = INHERITED_LISTEN_FD_BASE + index as i32;
         inherited.push((port, dup_fd_to_inherited_slot(entry.fd.as_raw_fd(), slot)?));
     }
     Ok(inherited)
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for &byte in bytes {
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    out
+}
+
+fn parse_getrandom_flags(flags: &str) -> Result<u32, String> {
+    let mut bits = 0;
+    for raw in flags.split('|') {
+        let flag = raw.trim();
+        if flag.is_empty() {
+            continue;
+        }
+        match flag.to_ascii_lowercase().as_str() {
+            "nonblock" | "grnd_nonblock" => bits |= libc::GRND_NONBLOCK,
+            "random" | "grnd_random" => bits |= libc::GRND_RANDOM,
+            other => return Err(format!("unknown getrandom flag {other:?}")),
+        }
+    }
+    Ok(bits)
 }
 
 fn parse_eventfd_flags(flags: &str) -> Result<i32, String> {
