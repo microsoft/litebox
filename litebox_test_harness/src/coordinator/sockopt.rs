@@ -10,7 +10,19 @@ use super::agents::{AgentHandle, AgentName};
 use super::registry::Registry;
 use super::run_context::RunContext;
 
-const SOCKOPT_AGENTS: &[AgentName] = &[AgentName::Dpg1, AgentName::Dpg1Dpg1];
+// Long-lived agents the sockopt tests run in. setsockopt /
+// getsockopt syscall numbers are constant, but the shim's
+// parameter rewriting (and any libc wrappers around them) differ
+// per parent binary type, so we fan out across one slot per
+// BinaryType leg.
+const SOCKOPT_AGENTS: &[AgentName] = &[
+    AgentName::Dpg1,     // PIE-glibc
+    AgentName::Dpg1Dpg1, // PIE-glibc depth-2
+    AgentName::Dpg1Dng,  // non-PIE-glibc
+    AgentName::Dpg1Spg,  // static-PIE-glibc (still uses ld.so for nss)
+    AgentName::Dpg1Spm,  // static-PIE-musl — cli form, no ld.so
+    AgentName::Dpg1Snm,  // non-PIE-static-musl
+];
 const SOCKOPT_SCENARIOS: &[ScenarioDef] = &[
     ScenarioDef {
         name: "reuseaddr_double_listen",

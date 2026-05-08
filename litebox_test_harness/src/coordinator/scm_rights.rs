@@ -18,12 +18,51 @@ struct ScmPair {
 
 const SCM_PAIRS: &[ScmPair] = &[
     ScmPair {
+        // PIE-glibc → PIE-glibc, sibling subtree (baseline).
         sender: AgentName::Dpg1,
         receiver: AgentName::Dpg2,
     },
     ScmPair {
+        // PIE-glibc → PIE-glibc, depth-2 (fd routes through one
+        // hop on each side — exercises the bridge-fd inheritance).
         sender: AgentName::Dpg1Dpg1,
         receiver: AgentName::Dpg2Dpg,
+    },
+    // Cross-binary-type pairs. The shim's fd-bridge / replacement
+    // table is driven by the parent's binary type; passing fds
+    // across processes with different binary types exercises code
+    // paths that same-type pairs do not.
+    ScmPair {
+        // PIE-glibc → non-PIE-glibc: the sshd→bash class fd passing
+        // (every common Unix tool inherits an fd from its launcher).
+        sender: AgentName::Dpg1,
+        receiver: AgentName::Dpg1Dng,
+    },
+    ScmPair {
+        // non-PIE-glibc → PIE-glibc: the reverse direction. Useful
+        // because the receiver-side bridge install path differs
+        // from the sender-side.
+        sender: AgentName::Dpg1Dng,
+        receiver: AgentName::Dpg1,
+    },
+    ScmPair {
+        // non-PIE → non-PIE (the bash→bash recursion in VS Code).
+        sender: AgentName::Dpg1Dng,
+        receiver: AgentName::Dpg1DngDng,
+    },
+    ScmPair {
+        // non-PIE → static-PIE-musl (the bash→cli VS Code entry
+        // transition). Tests fd-passing across the cli boundary.
+        sender: AgentName::Dpg1Dng,
+        receiver: AgentName::Dpg1DngSpm,
+    },
+    ScmPair {
+        // static-PIE-musl → non-PIE-glibc (the cli→node VS Code
+        // signature transition). The most consequential pair for
+        // VS Code Server: every fd Node.js needs (sockets, pipes,
+        // pty endpoints) flows through this exact transition.
+        sender: AgentName::Dpg1Spm,
+        receiver: AgentName::Dpg1SpmDng,
     },
 ];
 

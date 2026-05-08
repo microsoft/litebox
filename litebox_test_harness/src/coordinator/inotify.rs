@@ -11,10 +11,11 @@ use super::registry::Registry;
 use super::run_context::RunContext;
 
 pub(crate) const INO_AGENTS: &[AgentName] = &[
-    AgentName::Dpg1,
-    AgentName::Dpg1Dpg1,
-    AgentName::Dpg2,
-    AgentName::Dpg2Dpg,
+    AgentName::Dpg1,     // PIE-glibc baseline
+    AgentName::Dpg1Dpg1, // PIE-glibc depth-2
+    AgentName::Dpg2,     // PIE-glibc sibling subtree
+    AgentName::Dpg2Dpg,  // PIE-glibc, sibling depth-2
+    AgentName::Dpg1Dng,  // non-PIE-glibc — different fd-bridge / inotify_init1 path
 ];
 
 #[derive(Clone, Copy)]

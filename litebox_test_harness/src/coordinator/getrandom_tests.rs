@@ -15,7 +15,17 @@ use super::run_context::RunContext;
 
 const EAGAIN: i32 = libc::EAGAIN;
 
-pub(crate) const RAND_AGENTS: &[AgentName] = &[AgentName::Dpg1, AgentName::Dpg1Dpg1];
+// Long-lived agents the getrandom contract test runs in. We
+// include both libc regimes (glibc + musl) because the libc-side
+// bootstrap of getrandom (fallback to /dev/urandom on older
+// kernels, vDSO routing) differs across libcs even though the
+// underlying syscall is identical.
+pub(crate) const RAND_AGENTS: &[AgentName] = &[
+    AgentName::Dpg1,     // PIE-glibc
+    AgentName::Dpg1Dpg1, // PIE-glibc depth-2
+    AgentName::Dpg1Dng,  // non-PIE-glibc — different parent-side syscall instr
+    AgentName::Dpg1Spm,  // static-PIE-musl — distinct getrandom code path (no ld.so)
+];
 
 const RAND_SCENARIOS: &[RandScenario] = &[
     RandScenario {
