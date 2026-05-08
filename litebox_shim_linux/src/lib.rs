@@ -393,6 +393,7 @@ impl LinuxShimBuilder {
             fork_child_host_pids: litebox::sync::RwLock::new(alloc::collections::BTreeMap::new()),
             pid_to_process_id: litebox::sync::RwLock::new(alloc::collections::BTreeMap::new()),
             proc_cmdlines: litebox::sync::RwLock::new(alloc::collections::BTreeMap::new()),
+            inotify_instances: litebox::sync::Mutex::new(Vec::new()),
         });
         LinuxShim {
             global,
@@ -3531,6 +3532,11 @@ struct GlobalState<FS: ShimFS> {
     >,
     /// Synthetic `/proc/<pid>/cmdline` contents for locally-known guest PIDs.
     proc_cmdlines: litebox::sync::RwLock<Platform, alloc::collections::BTreeMap<i32, Vec<u8>>>,
+    /// Open inotify instances visible to all tasks on this shim host.
+    inotify_instances: litebox::sync::Mutex<
+        Platform,
+        Vec<alloc::sync::Arc<litebox::sync::Mutex<Platform, syscalls::file::InotifyInstanceState>>>,
+    >,
 }
 
 impl<FS: ShimFS> GlobalState<FS> {
