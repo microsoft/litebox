@@ -996,10 +996,14 @@ pub(crate) fn register_bash_fork_exec_tests(reg: &mut Registry<'_>) {
                                 ]),
                             )
                             .await;
+                        // Substituted hostname must be non-empty (the substitution
+                        // actually ran). `hostname -I` worked above on the same
+                        // container, so /etc/hostname is non-empty.
                         let pass = matches!(
                             &resp,
                             Response::ExecResult { exit_code: 0, stdout, .. }
                                 if stdout.starts_with("HOST=")
+                                    && stdout.trim_end().len() > "HOST=".len()
                         );
                         super::TestOutcome::new(&a, pass, format!("{resp:?}"))
                     })
@@ -1021,7 +1025,14 @@ pub(crate) fn register_bash_fork_exec_tests(reg: &mut Registry<'_>) {
                                 super::exec(vec![
                                     "bash".into(),
                                     "-c".into(),
-                                    "sleep 0.1 & cat /etc/hostname > /dev/null; echo BG_FG_OK"
+                                    // The bg subshell must actually run and emit
+                                    // BG_DONE; the fg leg must run too. Wait for
+                                    // bg before printing FG_DONE so output
+                                    // ordering is deterministic.
+                                    "(sleep 0.05 && echo BG_DONE) & \
+                                     cat /etc/hostname > /dev/null; \
+                                     wait; \
+                                     echo FG_DONE"
                                         .into(),
                                 ]),
                             )
@@ -1029,7 +1040,7 @@ pub(crate) fn register_bash_fork_exec_tests(reg: &mut Registry<'_>) {
                         let pass = matches!(
                             &resp,
                             Response::ExecResult { exit_code: 0, stdout, .. }
-                                if stdout.contains("BG_FG_OK")
+                                if stdout.contains("BG_DONE") && stdout.contains("FG_DONE")
                         );
                         super::TestOutcome::new(&a, pass, format!("{resp:?}"))
                     })

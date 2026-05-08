@@ -145,7 +145,11 @@ pub(super) fn register_netlink(reg: &mut Registry<'_>) {
             let pass = matches!(
                 &resp,
                 Response::ExecResult { exit_code: 0, stdout, .. }
-                    if stdout.contains("NETIF_OK:") || stdout.contains("NETIF_ERR:")
+                    if stdout
+                        .lines()
+                        .find_map(|l| l.strip_prefix("NETIF_OK:"))
+                        .and_then(|s| s.trim().parse::<u32>().ok())
+                        .is_some_and(|n| n > 0)
             );
             super::TestOutcome::new("A", pass, format!("{resp:?}"))
         }
@@ -221,10 +225,18 @@ pub(super) fn register_terminal_ioctl(reg: &mut Registry<'_>) {
                                 ),
                             )
                             .await;
+                        // tcgetattr / tcsetattr / TIOCGWINSZ on a pipe must
+                        // return ENOTTY (errno=25). Exec wires stdio to pipes,
+                        // so every (op, fd) row should produce TERM_ERR with
+                        // errno=25.
+                        // Exit code: tcgets/tiocgwinsz return from main (exit 0);
+                        // tcsets/tcsetsw/tcsetsf hit the phase=tcgetattr fast-fail
+                        // and call process::exit(1).
                         let pass = matches!(
                             &resp,
                             Response::ExecResult { exit_code: 0 | 1, stdout, .. }
-                                if stdout.contains("TERM_OK") || stdout.contains("TERM_ERR")
+                                if stdout.contains("TERM_ERR")
+                                    && stdout.contains("errno=25")
                         );
                         super::TestOutcome::new("A", pass, format!("{resp:?}"))
                     }
@@ -490,8 +502,8 @@ pub(super) fn register_stdin_script(reg: &mut Registry<'_>) {
         ),
         (
             "file_pipe_subst",
-            "A=$(cat /etc/hostname | cat)\necho A=$A\necho DONE\n",
-            "DONE",
+            "A=$(cat /shared/host_wrote.txt | cat)\necho A=$A\necho DONE\n",
+            "A=from_host",
         ),
         (
             "sequential_subst",
@@ -500,13 +512,13 @@ pub(super) fn register_stdin_script(reg: &mut Registry<'_>) {
         ),
         (
             "subst_then_cmds",
-            "A=$(echo val | cat)\necho LINE1\necho LINE2\necho LINE3\n",
-            "LINE3",
+            "A=$(echo val | cat)\necho A=$A\necho LINE1\necho LINE2\necho LINE3\n",
+            "A=val",
         ),
         (
             "vscode_osrelease",
             "ID=$(cat /etc/os-release | grep -E '^ID=' | sed 's/ID=//g' | sed 's/\"//g')\necho ID=$ID\necho DONE\n",
-            "DONE",
+            "ID=ubuntu",
         ),
         (
             "backtick_pipe",
