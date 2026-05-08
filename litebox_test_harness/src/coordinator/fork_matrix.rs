@@ -549,7 +549,11 @@ pub(crate) fn register_fork_matrix(reg: &mut Registry<'_>) {
                         let pass = matches!(
                             &resp,
                             crate::protocol::Response::ExecResult { exit_code: 0, stdout, .. }
-                                if stdout.trim().starts_with("NETIF_OK:")
+                                if stdout
+                                    .lines()
+                                    .find_map(|l| l.strip_prefix("NETIF_OK:"))
+                                    .and_then(|s| s.trim().parse::<u32>().ok())
+                                    .is_some_and(|n| n > 0)
                         );
                         super::TestOutcome::new(&agent_label, pass, format!("{resp:?}"))
                     })

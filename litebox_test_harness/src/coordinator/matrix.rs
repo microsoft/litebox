@@ -763,16 +763,12 @@ pub(super) fn register_host_file(reg: &mut Registry<'_>) {
                         },
                     )
                     .await;
+                    // /shared/host_wrote.txt is provisioned by the rootfs Dockerfile
+                    // (litebox_tool_executor/rootfs/Dockerfile, content "from_host").
+                    // NotFound here is a real failure (broken rootfs / wrong image),
+                    // not a skippable condition.
                     let pass = matches!(&resp, Response::Ok { data: Some(d) } if d == "from_host");
-                    if matches!(&resp, Response::NotFound) {
-                        super::TestOutcome::new(
-                            agent.name(),
-                            true,
-                            "skipped: host_wrote.txt not in rootfs",
-                        )
-                    } else {
-                        super::TestOutcome::new(agent.name(), pass, format!("{resp:?}"))
-                    }
+                    super::TestOutcome::new(agent.name(), pass, format!("{resp:?}"))
                 })
             },
         );
@@ -953,8 +949,9 @@ pub(super) fn register_net_addr_tests(reg: &mut Registry<'_>) {
                     let Some(addr) = self_ip else {
                         return super::TestOutcome::new(
                             agent_b.name(),
-                            true,
-                            "self_ip not discoverable, skipping",
+                            false,
+                            "self_ip not discoverable via `hostname -I`; \
+                             test container is misconfigured (no non-loopback IPv4)",
                         );
                     };
                     let resp = send_to(
@@ -1065,7 +1062,11 @@ pub(super) fn register_exec_tests(reg: &mut Registry<'_>) {
                             super::exec(vec![target, "echo-test".into()]),
                         )
                         .await;
-                        let pass = matches!(&resp, Response::ExecResult { stdout, .. } if stdout.contains("ECHO_TEST_OK"));
+                        let pass = matches!(
+                            &resp,
+                            Response::ExecResult { exit_code: 0, stdout, .. }
+                                if stdout.contains("ECHO_TEST_OK")
+                        );
                         super::TestOutcome::new(agent.name(), pass, format!("{resp:?}"))
                     })
                 },
