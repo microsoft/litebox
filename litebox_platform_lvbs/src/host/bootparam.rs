@@ -1,6 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
+use crate::mshv::vtl1_mem_layout::PAGE_SIZE;
 use litebox_common_linux::errno::Errno;
 use spin::Once;
 
@@ -26,7 +27,11 @@ pub fn get_num_possible_cpus() -> Result<u32, Errno> {
 }
 
 fn save_vtl1_memory_info(start: u64, size: u64) -> Result<(), Errno> {
-    if start > 0 && size > 0 {
+    if start > 0
+        && start.is_multiple_of(PAGE_SIZE as u64)
+        && size > 0
+        && size.is_multiple_of(PAGE_SIZE as u64)
+    {
         VTL1_MEMORY_INFO.call_once(|| (start, size));
         return Ok(());
     }

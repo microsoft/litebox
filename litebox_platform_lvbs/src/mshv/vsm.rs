@@ -96,8 +96,10 @@ pub(crate) fn init(is_bsp: bool) {
             };
             let start = PhysAddr::new(start);
             if protect_vtl1_physical_memory_range(PhysFrame::range(
-                PhysFrame::containing_address(start),
-                PhysFrame::containing_address(end),
+                PhysFrame::from_start_address(start)
+                    .expect("VTL1 memory start address is not page-aligned"),
+                PhysFrame::from_start_address(end)
+                    .expect("VTL1 memory end address is not page-aligned"),
             ))
             .is_err()
             {
@@ -359,7 +361,7 @@ pub fn mshv_vsm_load_kdata(pa: u64, nranges: u64) -> Result<i64, VsmError> {
                     .extend_range(heki_range)
                     .map_err(|_| VsmError::InvalidInputAddress)?,
                 HekiKdataType::KexecTrampoline => {
-                    kexec_trampoline_metadata.insert_heki_range(heki_range);
+                    kexec_trampoline_metadata.insert_heki_range(heki_range)?;
                 }
                 HekiKdataType::PatchInfo => patch_info_mem
                     .extend_range(heki_range)
@@ -718,7 +720,7 @@ pub fn mshv_vsm_kexec_validate(pa: u64, nranges: u64, crash: u64) -> Result<i64,
         for heki_range in heki_page {
             match heki_range.heki_kexec_type() {
                 HekiKexecType::KexecImage => {
-                    kexec_memory_metadata.insert_heki_range(heki_range);
+                    kexec_memory_metadata.insert_heki_range(heki_range)?;
                     kexec_image
                         .extend_range(heki_range)
                         .map_err(|_| VsmError::InvalidInputAddress)?;
@@ -731,7 +733,7 @@ pub fn mshv_vsm_kexec_validate(pa: u64, nranges: u64, crash: u64) -> Result<i64,
                         .map_err(|_| VsmError::InvalidInputAddress)?;
                 }
 
-                HekiKexecType::KexecPages => kexec_memory_metadata.insert_heki_range(heki_range),
+                HekiKexecType::KexecPages => kexec_memory_metadata.insert_heki_range(heki_range)?,
                 HekiKexecType::Unknown => {
                     return Err(VsmError::KexecTypeInvalid);
                 }
@@ -902,14 +904,15 @@ fn mshv_vsm_allocate_ringbuffer_memory(phys_addr: u64, size: usize) -> Result<i6
         .ok_or(VsmError::IntegerOverflow)
         .and_then(|end| PhysAddr::try_new(end).map_err(|_| VsmError::InvalidPhysicalAddress))?;
     let phys_addr = PhysAddr::new(phys_addr);
-    set_ringbuffer(phys_addr, size);
     protect_physical_memory_range(
         PhysFrame::range(
-            PhysFrame::containing_address(phys_addr),
-            PhysFrame::containing_address(end),
+            PhysFrame::from_start_address(phys_addr)
+                .map_err(|_| VsmError::AddressNotPageAligned)?,
+            PhysFrame::from_start_address(end).map_err(|_| VsmError::AddressNotPageAligned)?,
         ),
         MemAttr::MEM_ATTR_READ,
     )?;
+    set_ringbuffer(phys_addr, size);
     debug_serial_println!("VSM: Ring buffer allocated");
     Ok(0)
 }
@@ -1394,7 +1397,7 @@ pub(crate) fn protect_physical_memory_range(
 /// before the kernel platform data structure is initialized. To this end, one might call this function with
 /// a VTL0 physical memory range which only restricts access to the range.
 #[inline]
-pub(crate) fn protect_vtl1_physical_memory_range(
+fn protect_vtl1_physical_memory_range(
     phys_frame_range: PhysFrameRange<Size4KiB>,
 ) -> Result<(), VsmError> {
     let pa = phys_frame_range.start.start_address().as_u64();
@@ -1672,12 +1675,16 @@ impl KexecMemoryMetadata {
     }
 
     #[inline]
-    pub(crate) fn insert_heki_range(&mut self, heki_range: &HekiRange) {
+    pub(crate) fn insert_heki_range(&mut self, heki_range: &HekiRange) -> Result<(), VsmError> {
         // `HekiRange::is_valid` already validated these addresses.
+        if !heki_range.is_aligned(Size4KiB::SIZE) {
+            return Err(VsmError::AddressNotPageAligned);
+        }
         let va = heki_range.va;
         let pa = heki_range.pa;
         let epa = heki_range.epa;
         self.insert_memory_range(KexecMemoryRange::new_checked(va, pa, epa));
+        Ok(())
     }
 
     #[inline]
@@ -1738,22 +1745,25 @@ impl KexecMemoryRange {
         Self {
             virt_addr: VirtAddr::new(virt_addr),
             phys_frame_range: PhysFrame::range(
-                PhysFrame::containing_address(phys_start),
-                PhysFrame::containing_address(phys_end),
+                PhysFrame::from_start_address(phys_start)
+                    .expect("validated kexec memory start address is page-aligned"),
+                PhysFrame::from_start_address(phys_end)
+                    .expect("validated kexec memory end address is page-aligned"),
             ),
         }
     }
 
     pub fn new(virt_addr: u64, phys_start: u64, phys_end: u64) -> Result<Self, VsmError> {
+        let phys_start =
+            PhysAddr::try_new(phys_start).map_err(|_| VsmError::InvalidPhysicalAddress)?;
+        let phys_end = PhysAddr::try_new(phys_end).map_err(|_| VsmError::InvalidPhysicalAddress)?;
         Ok(Self {
             virt_addr: VirtAddr::try_new(virt_addr).map_err(|_| VsmError::InvalidVirtualAddress)?,
             phys_frame_range: PhysFrame::range(
-                PhysFrame::containing_address(
-                    PhysAddr::try_new(phys_start).map_err(|_| VsmError::InvalidPhysicalAddress)?,
-                ),
-                PhysFrame::containing_address(
-                    PhysAddr::try_new(phys_end).map_err(|_| VsmError::InvalidPhysicalAddress)?,
-                ),
+                PhysFrame::from_start_address(phys_start)
+                    .map_err(|_| VsmError::AddressNotPageAligned)?,
+                PhysFrame::from_start_address(phys_end)
+                    .map_err(|_| VsmError::AddressNotPageAligned)?,
             ),
         })
     }
