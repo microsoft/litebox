@@ -163,6 +163,7 @@ impl SocketAddress {
 #[derive(Default, Clone)]
 pub(super) struct SocketOptions {
     pub(super) reuse_address: bool,
+    pub(super) reuse_port: bool,
     pub(super) keep_alive: bool,
     pub(super) broadcast: bool,
     /// Receiving timeout, None (default value) means no timeout
@@ -305,7 +306,10 @@ impl<FS: ShimFS> GlobalState<FS> {
                     };
                     set_option(sopt, SocketOptionValue::Timeout(timeout))
                 }
-                SocketOption::REUSEADDR | SocketOption::BROADCAST | SocketOption::KEEPALIVE => {
+                SocketOption::REUSEADDR
+                | SocketOption::REUSEPORT
+                | SocketOption::BROADCAST
+                | SocketOption::KEEPALIVE => {
                     let val: u32 = super::read_from_user(optval, optlen)?;
                     set_option(sopt, SocketOptionValue::U32(val))
                 }
@@ -340,6 +344,9 @@ impl<FS: ShimFS> GlobalState<FS> {
                     }
                     (SocketOption::REUSEADDR, SocketOptionValue::U32(val)) => {
                         opt.reuse_address = val != 0;
+                    }
+                    (SocketOption::REUSEPORT, SocketOptionValue::U32(val)) => {
+                        opt.reuse_port = val != 0;
                     }
                     (SocketOption::BROADCAST, SocketOptionValue::U32(val)) => {
                         opt.broadcast = val != 0;
@@ -400,6 +407,7 @@ impl<FS: ShimFS> GlobalState<FS> {
                 | SocketOption::SNDTIMEO
                 | SocketOption::LINGER
                 | SocketOption::REUSEADDR
+                | SocketOption::REUSEPORT
                 | SocketOption::BROADCAST
                 | SocketOption::KEEPALIVE => unreachable!(),
                 // We use fixed buffer size for now
@@ -535,7 +543,10 @@ impl<FS: ShimFS> GlobalState<FS> {
                     );
                     super::write_to_user(tv, optval, len)
                 }
-                SocketOption::REUSEADDR | SocketOption::KEEPALIVE | SocketOption::BROADCAST => {
+                SocketOption::REUSEADDR
+                | SocketOption::REUSEPORT
+                | SocketOption::KEEPALIVE
+                | SocketOption::BROADCAST => {
                     let SocketOptionValue::U32(val) = get_option(sopt) else {
                         unreachable!()
                     };
@@ -559,6 +570,7 @@ impl<FS: ShimFS> GlobalState<FS> {
                 SocketOption::SNDTIMEO => SocketOptionValue::Timeout(options.send_timeout),
                 SocketOption::LINGER => SocketOptionValue::Timeout(options.linger_timeout),
                 SocketOption::REUSEADDR => SocketOptionValue::U32(u32::from(options.reuse_address)),
+                SocketOption::REUSEPORT => SocketOptionValue::U32(u32::from(options.reuse_port)),
                 SocketOption::KEEPALIVE => SocketOptionValue::U32(u32::from(options.keep_alive)),
                 SocketOption::BROADCAST => SocketOptionValue::U32(u32::from(options.broadcast)),
                 _ => unreachable!(),
@@ -581,6 +593,7 @@ impl<FS: ShimFS> GlobalState<FS> {
                 | SocketOption::SNDTIMEO
                 | SocketOption::LINGER
                 | SocketOption::REUSEADDR
+                | SocketOption::REUSEPORT
                 | SocketOption::KEEPALIVE
                 | SocketOption::BROADCAST => {
                     unreachable!()
@@ -721,7 +734,11 @@ impl<FS: ShimFS> GlobalState<FS> {
     }
 
     fn bind(&self, fd: &SocketFd, sockaddr: SocketAddr) -> Result<(), Errno> {
-        self.net.lock().bind(fd, &sockaddr).map_err(Errno::from)
+        let reuse_port = self.with_socket_options(fd, |options| options.reuse_port);
+        self.net
+            .lock()
+            .bind(fd, &sockaddr, reuse_port)
+            .map_err(Errno::from)
     }
 
     /// Non-blocking TCP accept by raw guest fd number. Looks up the SocketFd
@@ -865,6 +882,7 @@ impl<FS: ShimFS> GlobalState<FS> {
                     core::net::Ipv4Addr::UNSPECIFIED,
                     0,
                 )),
+                false,
             ) {
                 match err {
                     litebox::net::errors::BindError::AlreadyBound => {

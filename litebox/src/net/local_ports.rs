@@ -82,6 +82,20 @@ impl LocalPortAllocator {
         self.specific_port(port)
     }
 
+    /// Increment the ref-count for an already allocated local port.
+    pub(crate) fn allocate_existing_local_port(
+        &mut self,
+        port: u16,
+    ) -> Result<LocalPort, LocalPortAllocationError> {
+        let port = NonZeroU16::new(port).ok_or(LocalPortAllocationError::AlreadyInUse(port))?;
+        let refcount = self
+            .refcount
+            .get_mut(&port)
+            .ok_or(LocalPortAllocationError::AlreadyInUse(port.get()))?;
+        *refcount = refcount.checked_add(1).unwrap();
+        Ok(LocalPort { port })
+    }
+
     /// Increments the ref-count for a local port, producing a new [`LocalPort`] token to be used
     #[must_use]
     pub(crate) fn allocate_same_local_port(&mut self, port: &LocalPort) -> LocalPort {

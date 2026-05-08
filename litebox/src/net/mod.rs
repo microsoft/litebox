@@ -238,6 +238,8 @@ pub(crate) enum ProtocolSpecific {
 pub(crate) struct TcpSpecific {
     /// A local port associated with this socket, if any
     local_port: Option<LocalPort>,
+    /// Whether this socket was bound with SO_REUSEPORT enabled.
+    reuse_port: bool,
     /// Server socket specific data
     server_socket: Option<TcpServerSpecific>,
     /// Whether to immediately close the socket when closed (i.e., no graceful FIN handshake)
@@ -892,6 +894,7 @@ where
             specific: match protocol {
                 Protocol::Tcp => ProtocolSpecific::Tcp(TcpSpecific {
                     local_port: None,
+                    reuse_port: false,
                     server_socket: None,
                     immediate_close: AtomicBool::new(false),
                     local_shutdown: AtomicBool::new(false),
@@ -1358,12 +1361,37 @@ where
         &mut self,
         fd: &SocketFd<Platform>,
         socket_addr: &SocketAddr,
+        reuse_port: bool,
     ) -> Result<(), BindError> {
         let SocketAddr::V4(addr) = socket_addr else {
             return Err(BindError::UnsupportedAddress(*socket_addr));
         };
 
         let descriptor_table = self.litebox.descriptor_table();
+        let reuse_existing_port = if reuse_port && addr.port() != 0 {
+            let mut found_reusable = false;
+            for (_, entry) in descriptor_table.iter::<Network<Platform>>() {
+                let ProtocolSpecific::Tcp(tcp) = &entry.entry.specific else {
+                    continue;
+                };
+                if tcp.server_socket.is_none() {
+                    continue;
+                }
+                let Some(local_port) = &tcp.local_port else {
+                    continue;
+                };
+                if local_port.port() == addr.port() {
+                    if !tcp.reuse_port {
+                        return Err(BindError::PortAlreadyInUse(addr.port()));
+                    }
+                    found_reusable = true;
+                }
+            }
+            found_reusable
+        } else {
+            false
+        };
+
         let mut table_entry = descriptor_table
             .get_entry_mut(fd)
             .ok_or(BindError::InvalidFd)?;
@@ -1373,12 +1401,19 @@ where
                 if socket_handle.tcp().server_socket.is_some() {
                     return Err(BindError::AlreadyBound);
                 }
-                let lp = self
-                    .local_port_allocator
-                    .allocate_local_port(addr.port())
-                    .map_err(|_| BindError::PortAlreadyInUse(addr.port()))?;
+                let lp = if reuse_existing_port {
+                    self.local_port_allocator
+                        .allocate_existing_local_port(addr.port())
+                        .map_err(|_| BindError::PortAlreadyInUse(addr.port()))?
+                } else {
+                    self.local_port_allocator
+                        .allocate_local_port(addr.port())
+                        .map_err(|_| BindError::PortAlreadyInUse(addr.port()))?
+                };
                 let new_port = lp.port();
-                let old_lp = socket_handle.tcp_mut().local_port.replace(lp);
+                let tcp = socket_handle.tcp_mut();
+                let old_lp = tcp.local_port.replace(lp);
+                tcp.reuse_port = reuse_port;
                 if let Some(old) = old_lp {
                     self.local_port_allocator.deallocate(old);
                     // Currently unsure if the dealloc is sufficient and if we need to do
@@ -1387,7 +1422,7 @@ where
                     // unimplemented for now to trigger a panic.
                     unimplemented!()
                 }
-                socket_handle.tcp_mut().server_socket = Some(TcpServerSpecific {
+                tcp.server_socket = Some(TcpServerSpecific {
                     ip_listen_endpoint: Self::ip_listen_endpoint_v4(*addr, new_port),
                     backlog: None,
                     socket_set_handles: vec![],
@@ -1457,6 +1492,7 @@ where
 
         match &mut socket_handle.specific {
             ProtocolSpecific::Tcp(handle) => {
+                let backlog = if handle.reuse_port { 1 } else { backlog };
                 if handle.server_socket.is_none() {
                     let local_port =
                         self.local_port_allocator
@@ -1636,6 +1672,7 @@ where
                     handle: ready_handle,
                     specific: ProtocolSpecific::Tcp(TcpSpecific {
                         local_port,
+                        reuse_port: false,
                         server_socket: None,
                         immediate_close: AtomicBool::new(false),
                         local_shutdown: AtomicBool::new(false),
