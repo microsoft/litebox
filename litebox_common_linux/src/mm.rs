@@ -14,12 +14,6 @@ use crate::{MRemapFlags, MapFlags, ProtFlags, errno::Errno};
 
 const PAGE_MASK: usize = !(PAGE_SIZE - 1);
 
-#[inline]
-fn align_up(addr: usize, align: usize) -> usize {
-    debug_assert!(align.is_power_of_two());
-    (addr + align - 1) & !(align - 1)
-}
-
 pub fn do_mmap<
     Platform: litebox::platform::RawPointerProvider
         + litebox::sync::RawSyncPrimitivesProvider
@@ -97,7 +91,9 @@ pub fn sys_munmap<
     if len == 0 {
         return Err(Errno::EINVAL);
     }
-    let aligned_len = align_up(len, PAGE_SIZE);
+    let aligned_len = len
+        .checked_next_multiple_of(PAGE_SIZE)
+        .ok_or(Errno::EINVAL)?;
     if addr.as_usize().checked_add(aligned_len).is_none() {
         return Err(Errno::EINVAL);
     }
@@ -178,8 +174,12 @@ pub fn sys_mremap<
         return Err(Errno::EINVAL);
     }
 
-    let old_size = align_up(old_size, PAGE_SIZE);
-    let new_size = align_up(new_size, PAGE_SIZE);
+    let old_size = old_size
+        .checked_next_multiple_of(PAGE_SIZE)
+        .ok_or(Errno::EINVAL)?;
+    let new_size = new_size
+        .checked_next_multiple_of(PAGE_SIZE)
+        .ok_or(Errno::EINVAL)?;
     if new_size == 0 {
         return Err(Errno::EINVAL);
     }
