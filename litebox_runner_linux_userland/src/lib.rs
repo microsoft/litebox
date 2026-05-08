@@ -2639,9 +2639,6 @@ fn perform_ipc_handshake(fd: &std::os::fd::OwnedFd) -> Result<()> {
     if mtu != HANDSHAKE_MTU {
         anyhow::bail!("IPC handshake: MTU mismatch (broker sent {mtu}, we expect {HANDSHAKE_MTU})");
     }
-    #[cfg(debug_assertions)]
-    eprintln!("IPC handshake complete: broker MTU={mtu}");
-
     Ok(())
 }
 
