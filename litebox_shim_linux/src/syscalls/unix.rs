@@ -2076,6 +2076,9 @@ impl<FS: ShimFS> UnixSocket<FS> {
                 (SocketOption::REUSEADDR, SocketOptionValue::U32(val)) => {
                     self.options.lock().reuse_address = val != 0;
                 }
+                (SocketOption::REUSEPORT, SocketOptionValue::U32(val)) => {
+                    self.options.lock().reuse_port = val != 0;
+                }
                 (SocketOption::KEEPALIVE, SocketOptionValue::U32(val)) => {
                     self.options.lock().keep_alive = val != 0;
                 }
@@ -2102,6 +2105,7 @@ impl<FS: ShimFS> UnixSocket<FS> {
                 | SocketOption::SNDTIMEO
                 | SocketOption::LINGER
                 | SocketOption::REUSEADDR
+                | SocketOption::REUSEPORT
                 | SocketOption::KEEPALIVE
                 | SocketOption::BROADCAST => {
                     unreachable!()
@@ -2130,6 +2134,9 @@ impl<FS: ShimFS> UnixSocket<FS> {
             SocketOption::REUSEADDR => {
                 SocketOptionValue::U32(u32::from(self.options.lock().reuse_address))
             }
+            SocketOption::REUSEPORT => {
+                SocketOptionValue::U32(u32::from(self.options.lock().reuse_port))
+            }
             SocketOption::KEEPALIVE => {
                 SocketOptionValue::U32(u32::from(self.options.lock().keep_alive))
             }
@@ -2154,6 +2161,7 @@ impl<FS: ShimFS> UnixSocket<FS> {
                 | SocketOption::SNDTIMEO
                 | SocketOption::LINGER
                 | SocketOption::REUSEADDR
+                | SocketOption::REUSEPORT
                 | SocketOption::KEEPALIVE
                 | SocketOption::BROADCAST => {
                     unreachable!()

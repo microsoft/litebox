@@ -654,7 +654,7 @@ fn ws2_bind(shared: &NtSharedState, ctx: &mut ExecutionContext, teb_va: usize) -
         return wsa_fail(ctx, teb_va, WSAENOTSOCK);
     };
     let mut net = net_arc.lock();
-    match net.bind(socket_fd, &addr) {
+    match net.bind(socket_fd, &addr, false) {
         Ok(()) => wsa_ok(ctx, teb_va, 0),
         Err(litebox::net::errors::BindError::PortAlreadyInUse(_)) => {
             wsa_fail(ctx, teb_va, WSAEADDRINUSE)
