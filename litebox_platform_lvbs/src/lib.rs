@@ -1343,7 +1343,9 @@ impl<Host: HostInterface> StdioProvider for LinuxKernel<Host> {
 
 impl<Host: HostInterface> litebox::platform::SystemInfoProvider for LinuxKernel<Host> {
     fn get_syscall_entry_point(&self) -> usize {
-        syscall_callback as *const () as usize
+        // Currently this is only used in ELF loader to fix trampoline code.
+        // When running in kernel mode, we don't need a syscall trampoline.
+        0
     }
 
     fn get_vdso_address(&self) -> Option<usize> {
@@ -2039,11 +2041,6 @@ unsafe extern "C" fn run_thread_arch(
         exception_handler = sym exception_handler,
         kernel_exception_handler_no_ctx = sym kernel_exception_handler_no_ctx,
     );
-}
-
-unsafe extern "C" {
-    // Defined in asm blocks above
-    fn syscall_callback() -> isize;
 }
 
 unsafe extern "C" fn init_handler(thread_ctx: &mut ThreadContext) {
