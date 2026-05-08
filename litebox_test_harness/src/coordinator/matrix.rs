@@ -289,8 +289,11 @@ const EXEC_AGENTS: &[AgentName] = &[
     AgentName::Dpg1Dpg1Dpg1, // PIE-glibc, depth-3
     AgentName::Dpg1Dng,      // non-PIE-glibc parent (the "node" form)
     AgentName::Dpg1DngDpg,   // PIE child of non-PIE — round-trip
+    AgentName::Dpg1DngDng,   // non-PIE → non-PIE (bash recursion in VS Code)
+    AgentName::Dpg1DngSpm,   // non-PIE → static-PIE-musl (bash → cli in VS Code)
     AgentName::Dpg1Spg,      // static-PIE-glibc parent
     AgentName::Dpg1Spm,      // static-PIE-musl parent (the "cli" form)
+    AgentName::Dpg1SpmDng,   // static-PIE-musl → non-PIE (cli → node, VS Code's signature)
     AgentName::Dpg1Snm,      // non-PIE-static-musl parent
 ];
 

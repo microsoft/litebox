@@ -795,15 +795,19 @@ pub(crate) fn register_unix_socket(reg: &mut Registry<'_>) {
     }
 
     // Long-lived agents this fan-out runs in. One slot per
-    // BinaryType leg so each fork-parent code path is exercised.
+    // BinaryType leg plus the VS-Code-shape transition slots so
+    // each fork-parent code path is exercised.
     for &agent in &[
         AgentName::Dpg1,         // PIE-glibc
         AgentName::Dpg1Dpg1,     // PIE-glibc depth-2
         AgentName::Dpg2,         // PIE-glibc sibling subtree
         AgentName::Dpg1Dpg1Dpg1, // PIE-glibc depth-3
         AgentName::Dpg1Dng,      // non-PIE-glibc (node form)
+        AgentName::Dpg1DngDng,   // bash → bash (VS Code hot path)
+        AgentName::Dpg1DngSpm,   // bash → cli (VS Code hot path)
         AgentName::Dpg1Spg,      // static-PIE-glibc
         AgentName::Dpg1Spm,      // static-PIE-musl (cli form)
+        AgentName::Dpg1SpmDng,   // cli → node (VS Code signature)
         AgentName::Dpg1Snm,      // non-PIE-static-musl
     ] {
         for &bt in crate::BinaryType::ALL {
@@ -872,15 +876,19 @@ pub(crate) fn register_unix_socket(reg: &mut Registry<'_>) {
     }
 
     // Long-lived agents this fan-out runs in. One slot per
-    // BinaryType leg so each fork-parent code path is exercised.
+    // BinaryType leg plus the VS-Code-shape transition slots so
+    // each fork-parent code path is exercised.
     for &agent in &[
         AgentName::Dpg1,         // PIE-glibc
         AgentName::Dpg1Dpg1,     // PIE-glibc depth-2
         AgentName::Dpg2,         // PIE-glibc sibling subtree
         AgentName::Dpg1Dpg1Dpg1, // PIE-glibc depth-3
         AgentName::Dpg1Dng,      // non-PIE-glibc (node form)
+        AgentName::Dpg1DngDng,   // bash → bash (VS Code hot path)
+        AgentName::Dpg1DngSpm,   // bash → cli (VS Code hot path)
         AgentName::Dpg1Spg,      // static-PIE-glibc
         AgentName::Dpg1Spm,      // static-PIE-musl (cli form)
+        AgentName::Dpg1SpmDng,   // cli → node (VS Code signature)
         AgentName::Dpg1Snm,      // non-PIE-static-musl
     ] {
         for &bt in crate::BinaryType::ALL {
@@ -1472,15 +1480,19 @@ pub(crate) fn register_cross_worker(reg: &mut Registry<'_>) {
 // Register pipe EOF tests.
 pub(crate) fn register_pipe_eof(reg: &mut Registry<'_>) {
     // Long-lived agents this fan-out runs in. One slot per
-    // BinaryType leg so each fork-parent code path is exercised.
+    // BinaryType leg plus the VS-Code-shape transition slots so
+    // each fork-parent code path is exercised.
     for &agent in &[
         AgentName::Dpg1,         // PIE-glibc
         AgentName::Dpg1Dpg1,     // PIE-glibc depth-2
         AgentName::Dpg2,         // PIE-glibc sibling subtree
         AgentName::Dpg1Dpg1Dpg1, // PIE-glibc depth-3
         AgentName::Dpg1Dng,      // non-PIE-glibc (node form)
+        AgentName::Dpg1DngDng,   // bash → bash (VS Code hot path)
+        AgentName::Dpg1DngSpm,   // bash → cli (VS Code hot path)
         AgentName::Dpg1Spg,      // static-PIE-glibc
         AgentName::Dpg1Spm,      // static-PIE-musl (cli form)
+        AgentName::Dpg1SpmDng,   // cli → node (VS Code signature)
         AgentName::Dpg1Snm,      // non-PIE-static-musl
     ] {
         for &bt in crate::BinaryType::ALL {

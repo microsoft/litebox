@@ -32,13 +32,16 @@ const NPIPE_REPS: &[usize] = &[1, 5, 10];
 // exercised. Including the static legs covers the cli (StaticPieMusl)
 // and node-class scenarios as forking parents.
 const NPIPE_AGENTS: &[AgentName] = &[
-    AgentName::Dpg1,     // PIE-glibc
-    AgentName::Dpg1Dpg1, // PIE-glibc, depth-2
-    AgentName::Dpg2,     // PIE-glibc, sibling subtree
-    AgentName::Dpg1Dng,  // non-PIE-glibc (node form)
-    AgentName::Dpg1Spg,  // static-PIE-glibc (still uses ld.so)
-    AgentName::Dpg1Spm,  // static-PIE-musl (no ld.so) — cli form
-    AgentName::Dpg1Snm,  // non-PIE-static-musl
+    AgentName::Dpg1,       // PIE-glibc
+    AgentName::Dpg1Dpg1,   // PIE-glibc, depth-2
+    AgentName::Dpg2,       // PIE-glibc, sibling subtree
+    AgentName::Dpg1Dng,    // non-PIE-glibc (node form)
+    AgentName::Dpg1DngDng, // bash → bash recursion (VS Code hot path)
+    AgentName::Dpg1DngSpm, // bash → cli (VS Code hot path)
+    AgentName::Dpg1Spg,    // static-PIE-glibc (still uses ld.so)
+    AgentName::Dpg1Spm,    // static-PIE-musl (no ld.so) — cli form
+    AgentName::Dpg1SpmDng, // cli → node (VS Code's signature transition)
+    AgentName::Dpg1Snm,    // non-PIE-static-musl
 ];
 
 // ═══════════════════════════════════════════════════════════════════
@@ -2717,8 +2720,11 @@ pub(crate) fn register_epoll_socket_tests(reg: &mut Registry<'_>) {
             AgentName::Dpg2,       // PIE-glibc sibling
             AgentName::Dpg1Dng,    // non-PIE-glibc (node form)
             AgentName::Dpg1DngDpg, // PIE child of non-PIE — round-trip
+            AgentName::Dpg1DngDng, // bash → bash (VS Code hot path)
+            AgentName::Dpg1DngSpm, // bash → cli (VS Code hot path)
             AgentName::Dpg1Spg,    // static-PIE-glibc
             AgentName::Dpg1Spm,    // static-PIE-musl (cli form)
+            AgentName::Dpg1SpmDng, // cli → node (VS Code signature)
             AgentName::Dpg1Snm,    // non-PIE-static-musl
         ] {
             let port: u16 = match (variant, agent) {
@@ -2730,6 +2736,9 @@ pub(crate) fn register_epoll_socket_tests(reg: &mut Registry<'_>) {
                 ("direct", AgentName::Dpg1Spg) => 19980,
                 ("direct", AgentName::Dpg1Spm) => 19981,
                 ("direct", AgentName::Dpg1Snm) => 19982,
+                ("direct", AgentName::Dpg1DngDng) => 19970,
+                ("direct", AgentName::Dpg1DngSpm) => 19971,
+                ("direct", AgentName::Dpg1SpmDng) => 19972,
                 ("tokio", AgentName::Dpg1) => 19995,
                 ("tokio", AgentName::Dpg1Dpg1) => 19996,
                 ("tokio", AgentName::Dpg2) => 19997,
@@ -2738,6 +2747,9 @@ pub(crate) fn register_epoll_socket_tests(reg: &mut Registry<'_>) {
                 ("tokio", AgentName::Dpg1Spg) => 19985,
                 ("tokio", AgentName::Dpg1Spm) => 19986,
                 ("tokio", AgentName::Dpg1Snm) => 19987,
+                ("tokio", AgentName::Dpg1DngDng) => 19975,
+                ("tokio", AgentName::Dpg1DngSpm) => 19976,
+                ("tokio", AgentName::Dpg1SpmDng) => 19977,
                 _ => 19960,
             };
 
