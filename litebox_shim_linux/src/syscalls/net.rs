@@ -32,7 +32,7 @@ use litebox_common_linux::{
 };
 use zerocopy::{FromBytes, Immutable, IntoBytes};
 
-use crate::{ConstPtr, MutPtr, syscalls::signal::siginfo_kill};
+use crate::{ConstPtr, MutPtr, syscalls::signal};
 use crate::{GlobalState, ShimFS, Task};
 use crate::{
     Platform,
@@ -1358,7 +1358,7 @@ impl<FS: ShimFS> Task<FS> {
         if let Err(Errno::EPIPE) = res
             && !flags.contains(SendFlags::NOSIGNAL)
         {
-            self.send_signal(Signal::SIGPIPE, siginfo_kill(Signal::SIGPIPE));
+            self.send_signal(Signal::SIGPIPE, signal::siginfo_kill(Signal::SIGPIPE));
         }
         res
     }
@@ -1447,7 +1447,7 @@ impl<FS: ShimFS> Task<FS> {
         if let Err(Errno::EPIPE) = res
             && !flags.contains(SendFlags::NOSIGNAL)
         {
-            self.send_signal(Signal::SIGPIPE, siginfo_kill(Signal::SIGPIPE));
+            self.send_signal(Signal::SIGPIPE, signal::siginfo_kill(Signal::SIGPIPE));
         }
         res
     }

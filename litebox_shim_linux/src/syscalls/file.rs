@@ -22,7 +22,7 @@ use litebox_common_linux::{
 };
 use litebox_platform_multiplex::Platform;
 
-use crate::{ConstPtr, GlobalState, MutPtr, ShimFS, Task, syscalls::signal::siginfo_kill};
+use crate::{ConstPtr, GlobalState, MutPtr, ShimFS, Task, syscalls::signal};
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 /// Task state shared by `CLONE_FS`.
@@ -504,7 +504,7 @@ impl<FS: ShimFS> Task<FS> {
             )
             .flatten();
         if let Err(Errno::EPIPE) = res {
-            self.send_signal(Signal::SIGPIPE, siginfo_kill(Signal::SIGPIPE));
+            self.send_signal(Signal::SIGPIPE, signal::siginfo_kill(Signal::SIGPIPE));
         }
         res
     }
@@ -788,7 +788,7 @@ impl<FS: ShimFS> Task<FS> {
             )
             .flatten();
         if let Err(Errno::EPIPE) = res {
-            self.send_signal(Signal::SIGPIPE, siginfo_kill(Signal::SIGPIPE));
+            self.send_signal(Signal::SIGPIPE, signal::siginfo_kill(Signal::SIGPIPE));
         }
         res
     }
