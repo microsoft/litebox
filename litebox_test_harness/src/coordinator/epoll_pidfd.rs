@@ -427,7 +427,15 @@ async fn open_registered_socket(
     observer: &super::agents::AgentHandle,
     peer: &super::agents::AgentHandle,
 ) -> Result<u64, String> {
-    let listen = run.send(peer, Command::NetListen { port: 0 }).await;
+    let listen = run
+        .send(
+            peer,
+            Command::NetListen {
+                port: 0,
+                pre_bind_options: vec![],
+            },
+        )
+        .await;
     let port = expect_listening_port(&listen, 0)?;
     match run
         .send(

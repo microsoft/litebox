@@ -17,6 +17,24 @@ fn default_marker_stream() -> String {
     "either".to_string()
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SockOpt {
+    ReuseAddr,
+    ReusePort,
+    KeepAlive,
+    RecvBuf,
+    SendBuf,
+    NoDelay,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum SockOptValue {
+    Bool(bool),
+    U32(u32),
+}
+
 /// Command sent from parent to child via stdin.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "cmd")]
@@ -118,7 +136,14 @@ pub enum Command {
 
     /// Bind a TCP listener on the given port. Starts an echo handler.
     #[serde(rename = "net_listen")]
-    NetListen { port: u16 },
+    NetListen {
+        port: u16,
+        pre_bind_options: Vec<(SockOpt, SockOptValue)>,
+    },
+
+    /// Return per-listener accept counts for a listening TCP port.
+    #[serde(rename = "net_listener_stats")]
+    NetListenerStats { port: u16 },
 
     /// Stop listening on a port.
     #[serde(rename = "net_unlisten")]
@@ -143,6 +168,18 @@ pub enum Command {
     /// Close and unregister a TCP connection.
     #[serde(rename = "net_close")]
     NetClose { conn: u64 },
+
+    /// Set a socket option on a registered TCP connection.
+    #[serde(rename = "net_set_sockopt")]
+    NetSetSockOpt {
+        conn: u64,
+        option: SockOpt,
+        value: SockOptValue,
+    },
+
+    /// Get a socket option from a registered TCP connection.
+    #[serde(rename = "net_get_sockopt")]
+    NetGetSockOpt { conn: u64, option: SockOpt },
 
     /// Open `pidfd_open(pid)` and add that pidfd to a registered epoll instance.
     #[serde(rename = "epoll_add_pidfd")]
@@ -276,6 +313,40 @@ pub enum Command {
     #[serde(rename = "unix_connect")]
     UnixConnect { path: String, data: String },
 
+    /// Create a local AF_UNIX SOCK_STREAM socketpair and register both endpoints.
+    #[serde(rename = "unix_pair")]
+    UnixPair {},
+
+    /// Bind a registered Unix stream listener for cross-agent SCM_RIGHTS tests.
+    #[serde(rename = "unix_pair_listen")]
+    UnixPairListen { path: String },
+
+    /// Connect to a registered Unix stream listener and register the endpoint.
+    #[serde(rename = "unix_pair_connect")]
+    UnixPairConnect { path: String },
+
+    /// Accept a Unix stream connection and register the endpoint.
+    #[serde(rename = "unix_pair_accept")]
+    UnixPairAccept { path: String },
+
+    /// Send one or more registered fds as SCM_RIGHTS over a registered Unix endpoint.
+    /// The agent prepends one type-tag byte per fd (E/T/U) to the payload so the
+    /// receiver can register each received fd in the matching registry.
+    #[serde(rename = "unix_send_fd")]
+    UnixSendFd {
+        socket: u64,
+        sources: Vec<FdRef>,
+        payload: String,
+    },
+
+    /// Receive fds sent with SCM_RIGHTS over a registered Unix endpoint.
+    #[serde(rename = "unix_recv_fd")]
+    UnixRecvFd { socket: u64, max_payload: u32 },
+
+    /// Close and unregister a registered Unix endpoint.
+    #[serde(rename = "unix_pair_close")]
+    UnixPairClose { socket: u64 },
+
     /// Kill a background process by PID.
     #[serde(rename = "kill")]
     Kill { pid: u32 },
@@ -360,6 +431,10 @@ pub enum Command {
     #[serde(rename = "pipe_pair_id_unique")]
     PipePairIdUnique { count: u32 },
 
+    /// Call `getrandom(2)` once and report either bytes or positive errno.
+    #[serde(rename = "getrandom")]
+    Getrandom { n: u32, flags: String },
+
     /// Call io_uring_setup(2) once and report the kernel-visible outcome.
     #[serde(rename = "io_uring_setup")]
     IoUringSetup { entries: u32 },
@@ -373,6 +448,27 @@ pub enum Command {
     /// registry-style; the unit `EpollOpen` is a one-shot probe used by W5.)
     #[serde(rename = "epoll_create")]
     EpollCreate,
+
+    /// Open an inotify instance and register it in this agent's local registry.
+    #[serde(rename = "inotify_open")]
+    InotifyOpen {},
+
+    /// Add an inotify watch. Mask is parsed from strings like
+    /// `"create|modify|delete|moved_from|moved_to|attrib|close_write"`.
+    #[serde(rename = "inotify_add_watch")]
+    InotifyAddWatch { id: u64, path: String, mask: String },
+
+    /// Remove an inotify watch descriptor from a registered inotify instance.
+    #[serde(rename = "inotify_rm_watch")]
+    InotifyRmWatch { id: u64, wd: i32 },
+
+    /// Read up to `max_events` inotify events from a registered instance.
+    #[serde(rename = "inotify_read")]
+    InotifyRead { id: u64, max_events: u32 },
+
+    /// Close and unregister a registered inotify instance.
+    #[serde(rename = "inotify_close")]
+    InotifyClose { id: u64 },
 
     /// Open an eventfd and register it in this agent's local registry.
     /// Flags are parsed from strings like "semaphore|nonblock|cloexec".
@@ -421,6 +517,15 @@ pub enum Clone3Kind {
     WithPidfd,
     WithSetTid { tid: u64 },
     WithCgroup { cgroup_fd: u64 },
+    WithVfork,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", content = "id", rename_all = "snake_case")]
+pub enum FdRef {
+    Eventfd(u64),
+    TcpConn(u64),
+    UnixPair(u64),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -443,6 +548,14 @@ pub struct EpollEvent {
     pub kind: String,
     pub id: u64,
     pub observed_events: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InotifyEvent {
+    pub wd: i32,
+    pub mask: String,
+    pub cookie: u32,
+    pub name: Option<String>,
 }
 
 /// Response sent from child to parent via stdout.
@@ -480,6 +593,17 @@ pub enum Response {
     #[serde(rename = "pty_handle")]
     PtyHandle { master: u64, slave_path: String },
 
+    /// Registered Unix socketpair endpoint handles.
+    #[serde(rename = "unix_pair_handle")]
+    UnixPairHandle { left: u64, right: u64 },
+
+    /// Fds received through SCM_RIGHTS and registered locally.
+    #[serde(rename = "received_fd")]
+    ReceivedFd {
+        received: Vec<FdRef>,
+        payload: String,
+    },
+
     /// Stateful TCP bytes sent.
     #[serde(rename = "sent")]
     Sent,
@@ -495,6 +619,26 @@ pub enum Response {
     /// Stateful TCP connection closed.
     #[serde(rename = "closed")]
     Closed,
+
+    /// Inotify registry handle.
+    #[serde(rename = "inotify_handle")]
+    InotifyHandle { id: u64 },
+
+    /// Inotify watch descriptor.
+    #[serde(rename = "watch_descriptor")]
+    WatchDescriptor { wd: i32 },
+
+    /// Events returned by `inotify_read`.
+    #[serde(rename = "inotify_events")]
+    InotifyEvents { events: Vec<InotifyEvent> },
+
+    /// Socket option value returned by `NetGetSockOpt`.
+    #[serde(rename = "sockopt_result")]
+    SockOptResult { value: SockOptValue },
+
+    /// Per-listener accept counts for a TCP port.
+    #[serde(rename = "listener_stats")]
+    ListenerStats { counts: Vec<u64> },
 
     /// Eventfd registry handle.
     #[serde(rename = "eventfd_handle")]
@@ -548,6 +692,10 @@ pub enum Response {
     /// Readiness or wait predicate satisfied.
     #[serde(rename = "ready")]
     Ready,
+
+    /// `getrandom(2)` result. `errno` is a positive errno on failure.
+    #[serde(rename = "random_bytes")]
+    RandomBytes { hex: String, errno: Option<i32> },
 
     /// io_uring_setup(2) result. `errno` is a positive errno on failure.
     #[serde(rename = "io_uring_result")]

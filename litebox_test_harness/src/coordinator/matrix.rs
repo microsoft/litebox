@@ -792,8 +792,16 @@ pub(super) fn register_net_tests(reg: &mut Registry<'_>) {
             vec![listener],
             move |run, handles| {
                 Box::pin(async move {
-                    let resp =
-                        send_to(run, &handles, listener, Command::NetListen { port: p }).await;
+                    let resp = send_to(
+                        run,
+                        &handles,
+                        listener,
+                        Command::NetListen {
+                            port: p,
+                            pre_bind_options: vec![],
+                        },
+                    )
+                    .await;
                     let pass = super::expect_listening_port(&resp, p).is_ok();
                     let _ =
                         send_to(run, &handles, listener, Command::NetUnlisten { port: p }).await;
@@ -808,8 +816,16 @@ pub(super) fn register_net_tests(reg: &mut Registry<'_>) {
             vec![listener, connector],
             move |run, handles| {
                 Box::pin(async move {
-                    let resp =
-                        send_to(run, &handles, listener, Command::NetListen { port: p }).await;
+                    let resp = send_to(
+                        run,
+                        &handles,
+                        listener,
+                        Command::NetListen {
+                            port: p,
+                            pre_bind_options: vec![],
+                        },
+                    )
+                    .await;
                     if let Err(e) = super::expect_listening_port(&resp, p) {
                         return super::TestOutcome::new(
                             connector.name(),
@@ -840,7 +856,16 @@ pub(super) fn register_net_tests(reg: &mut Registry<'_>) {
             vec![listener],
             move |run, handles| {
                 Box::pin(async move {
-                    let _ = send_to(run, &handles, listener, Command::NetListen { port: p }).await;
+                    let _ = send_to(
+                        run,
+                        &handles,
+                        listener,
+                        Command::NetListen {
+                            port: p,
+                            pre_bind_options: vec![],
+                        },
+                    )
+                    .await;
                     let resp =
                         send_to(run, &handles, listener, Command::NetUnlisten { port: p }).await;
                     super::TestOutcome::new(
@@ -868,8 +893,16 @@ pub(super) fn register_net_addr_tests(reg: &mut Registry<'_>) {
                 vec![agent_a, agent_b],
                 move |run, handles| {
                     Box::pin(async move {
-                        let resp =
-                            send_to(run, &handles, agent_a, Command::NetListen { port: p }).await;
+                        let resp = send_to(
+                            run,
+                            &handles,
+                            agent_a,
+                            Command::NetListen {
+                                port: p,
+                                pre_bind_options: vec![],
+                            },
+                        )
+                        .await;
                         if let Err(e) = super::expect_listening_port(&resp, p) {
                             return super::TestOutcome::new(
                                 agent_b.name(),
@@ -924,8 +957,16 @@ pub(super) fn register_net_addr_tests(reg: &mut Registry<'_>) {
                             "self_ip not discoverable, skipping",
                         );
                     };
-                    let resp =
-                        send_to(run, &handles, agent_a, Command::NetListen { port: p }).await;
+                    let resp = send_to(
+                        run,
+                        &handles,
+                        agent_a,
+                        Command::NetListen {
+                            port: p,
+                            pre_bind_options: vec![],
+                        },
+                    )
+                    .await;
                     if let Err(e) = super::expect_listening_port(&resp, p) {
                         return super::TestOutcome::new(
                             agent_b.name(),

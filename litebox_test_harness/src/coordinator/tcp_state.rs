@@ -404,7 +404,15 @@ async fn run_halfclose_then_reconnect_case(
     second: &str,
 ) -> TestOutcome {
     let agent = format!("{server_label}<-{client_label}");
-    let listen_resp = run.send(server, Command::NetListen { port: 0 }).await;
+    let listen_resp = run
+        .send(
+            server,
+            Command::NetListen {
+                port: 0,
+                pre_bind_options: vec![],
+            },
+        )
+        .await;
     let port = match super::expect_listening_port(&listen_resp, 0) {
         Ok(port) => port,
         Err(e) => {
@@ -461,7 +469,15 @@ async fn run_halfclose_then_reconnect_case(
 }
 
 async fn run_conn_id_unique_case(run: &mut RunContext<'_>, handle: &AgentHandle) -> TestOutcome {
-    let listen_resp = run.send(handle, Command::NetListen { port: 0 }).await;
+    let listen_resp = run
+        .send(
+            handle,
+            Command::NetListen {
+                port: 0,
+                pre_bind_options: vec![],
+            },
+        )
+        .await;
     let port = match super::expect_listening_port(&listen_resp, 0) {
         Ok(port) => port,
         Err(e) => {
@@ -520,7 +536,15 @@ async fn listen_open(
     server: &AgentHandle,
     client: &AgentHandle,
 ) -> Result<(u16, u64), String> {
-    let listen_resp = run.send(server, Command::NetListen { port: 0 }).await;
+    let listen_resp = run
+        .send(
+            server,
+            Command::NetListen {
+                port: 0,
+                pre_bind_options: vec![],
+            },
+        )
+        .await;
     let port = match super::expect_listening_port(&listen_resp, 0) {
         Ok(port) => port,
         Err(e) => return Err(format!("listen failed: {e}; resp={listen_resp:?}")),

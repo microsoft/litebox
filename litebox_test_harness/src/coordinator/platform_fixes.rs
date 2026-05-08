@@ -485,7 +485,15 @@ pub(crate) fn register_cross_worker_first_connect_tests(reg: &mut Registry<'_>) 
         Box::new(move |run| {
             Box::pin(async move {
                 let port = 19900u16;
-                let listen_resp = run.send(&handle_a, Command::NetListen { port }).await;
+                let listen_resp = run
+                    .send(
+                        &handle_a,
+                        Command::NetListen {
+                            port,
+                            pre_bind_options: vec![],
+                        },
+                    )
+                    .await;
                 if !super::expect_listening_port(&listen_resp, port).is_ok() {
                     return super::TestOutcome::new(
                         "B",
@@ -522,7 +530,15 @@ pub(crate) fn register_cross_worker_first_connect_tests(reg: &mut Registry<'_>) 
         Box::new(move |run| {
             Box::pin(async move {
                 let port = 19901u16;
-                let listen_resp = run.send(&handle_b, Command::NetListen { port }).await;
+                let listen_resp = run
+                    .send(
+                        &handle_b,
+                        Command::NetListen {
+                            port,
+                            pre_bind_options: vec![],
+                        },
+                    )
+                    .await;
                 if !super::expect_listening_port(&listen_resp, port).is_ok() {
                     return super::TestOutcome::new(
                         "AA",
@@ -554,7 +570,7 @@ pub(crate) fn register_cross_worker_first_connect_tests(reg: &mut Registry<'_>) 
         Box::new(move |run| {
                 Box::pin(async move {
                     let port = 19902u16;
-                    let listen_resp = run.send(&handle_a, Command::NetListen { port }).await;
+                    let listen_resp = run.send(&handle_a, Command::NetListen { port, pre_bind_options: vec![] }).await;
                     if !super::expect_listening_port(&listen_resp, port).is_ok() {
                         return super::TestOutcome::new(
                             "B",
@@ -610,7 +626,15 @@ pub(crate) fn register_cross_worker_self_connect_tests(reg: &mut Registry<'_>) {
         Box::new(move |run| {
             Box::pin(async move {
                 let port = 19910u16;
-                let listen_resp = run.send(&handle_a, Command::NetListen { port }).await;
+                let listen_resp = run
+                    .send(
+                        &handle_a,
+                        Command::NetListen {
+                            port,
+                            pre_bind_options: vec![],
+                        },
+                    )
+                    .await;
                 if !super::expect_listening_port(&listen_resp, port).is_ok() {
                     return super::TestOutcome::new(
                         "A",
@@ -647,7 +671,15 @@ pub(crate) fn register_cross_worker_self_connect_tests(reg: &mut Registry<'_>) {
         Box::new(move |run| {
             Box::pin(async move {
                 let port = 19911u16;
-                let listen_resp = run.send(&handle_a, Command::NetListen { port }).await;
+                let listen_resp = run
+                    .send(
+                        &handle_a,
+                        Command::NetListen {
+                            port,
+                            pre_bind_options: vec![],
+                        },
+                    )
+                    .await;
                 if !super::expect_listening_port(&listen_resp, port).is_ok() {
                     return super::TestOutcome::new(
                         "AA",
@@ -684,7 +716,15 @@ pub(crate) fn register_cross_worker_self_connect_tests(reg: &mut Registry<'_>) {
         Box::new(move |run| {
             Box::pin(async move {
                 let port = 19912u16;
-                let listen_resp = run.send(&handle_aa, Command::NetListen { port }).await;
+                let listen_resp = run
+                    .send(
+                        &handle_aa,
+                        Command::NetListen {
+                            port,
+                            pre_bind_options: vec![],
+                        },
+                    )
+                    .await;
                 if !super::expect_listening_port(&listen_resp, port).is_ok() {
                     return super::TestOutcome::new(
                         "A",
@@ -721,7 +761,15 @@ pub(crate) fn register_cross_worker_self_connect_tests(reg: &mut Registry<'_>) {
         Box::new(move |run| {
             Box::pin(async move {
                 let port = 19913u16;
-                let listen_resp = run.send(&handle_a, Command::NetListen { port }).await;
+                let listen_resp = run
+                    .send(
+                        &handle_a,
+                        Command::NetListen {
+                            port,
+                            pre_bind_options: vec![],
+                        },
+                    )
+                    .await;
                 if !super::expect_listening_port(&listen_resp, port).is_ok() {
                     return super::TestOutcome::new(
                         "AB",
@@ -768,7 +816,15 @@ async fn run_tlb_listen_busy_case(
     data: &str,
     delay_secs: u64,
 ) -> super::TestOutcome {
-    let listen_resp = run.send(listener, Command::NetListen { port: 0 }).await;
+    let listen_resp = run
+        .send(
+            listener,
+            Command::NetListen {
+                port: 0,
+                pre_bind_options: vec![],
+            },
+        )
+        .await;
     let port = match super::expect_listening_port(&listen_resp, 0) {
         Ok(port) => port,
         Err(e) => {
@@ -2969,7 +3025,15 @@ pub(crate) fn register_fork_listen_close_tests(reg: &mut Registry<'_>) {
         Box::new(move |run| {
             Box::pin(async move {
                 let port = 19920u16;
-                let listen_resp = run.send(&handle_a, Command::NetListen { port }).await;
+                let listen_resp = run
+                    .send(
+                        &handle_a,
+                        Command::NetListen {
+                            port,
+                            pre_bind_options: vec![],
+                        },
+                    )
+                    .await;
                 if let Err(e) = super::expect_listening_port(&listen_resp, port) {
                     return super::TestOutcome::new(
                         "B",
@@ -3021,7 +3085,15 @@ pub(crate) fn register_fork_listen_close_tests(reg: &mut Registry<'_>) {
         Box::new(move |run| {
             Box::pin(async move {
                 let port = 19921u16;
-                let listen_resp = run.send(&parent, Command::NetListen { port }).await;
+                let listen_resp = run
+                    .send(
+                        &parent,
+                        Command::NetListen {
+                            port,
+                            pre_bind_options: vec![],
+                        },
+                    )
+                    .await;
                 if !matches!(&listen_resp, Response::Listening { port: p } if *p == port) {
                     return super::TestOutcome::new(
                         "B",
@@ -3077,7 +3149,15 @@ pub(crate) fn register_fork_listen_close_tests(reg: &mut Registry<'_>) {
         Box::new(move |run| {
             Box::pin(async move {
                 for port in [19922u16, 19923] {
-                    let listen_resp = run.send(&parent, Command::NetListen { port }).await;
+                    let listen_resp = run
+                        .send(
+                            &parent,
+                            Command::NetListen {
+                                port,
+                                pre_bind_options: vec![],
+                            },
+                        )
+                        .await;
                     if !matches!(&listen_resp, Response::Listening { port: p } if *p == port) {
                         return super::TestOutcome::new(
                             "B",
@@ -3133,7 +3213,15 @@ pub(crate) fn register_fork_listen_close_tests(reg: &mut Registry<'_>) {
         Box::new(move |run| {
             Box::pin(async move {
                 let port = 19924u16;
-                let listen_resp = run.send(&parent, Command::NetListen { port }).await;
+                let listen_resp = run
+                    .send(
+                        &parent,
+                        Command::NetListen {
+                            port,
+                            pre_bind_options: vec![],
+                        },
+                    )
+                    .await;
                 if !matches!(&listen_resp, Response::Listening { port: p } if *p == port) {
                     return super::TestOutcome::new(
                         "B",
@@ -3189,7 +3277,15 @@ pub(crate) fn register_fork_listen_close_tests(reg: &mut Registry<'_>) {
         Box::new(move |run| {
             Box::pin(async move {
                 let port = 19925u16;
-                let listen_resp = run.send(&parent, Command::NetListen { port }).await;
+                let listen_resp = run
+                    .send(
+                        &parent,
+                        Command::NetListen {
+                            port,
+                            pre_bind_options: vec![],
+                        },
+                    )
+                    .await;
                 if !matches!(&listen_resp, Response::Listening { port: p } if *p == port) {
                     return super::TestOutcome::new(
                         "B",
@@ -3288,7 +3384,15 @@ pub(crate) fn register_fork_listen_close_tests(reg: &mut Registry<'_>) {
         Box::new(move |run| {
             Box::pin(async move {
                 let port = 19926u16;
-                let listen_resp = run.send(&parent, Command::NetListen { port }).await;
+                let listen_resp = run
+                    .send(
+                        &parent,
+                        Command::NetListen {
+                            port,
+                            pre_bind_options: vec![],
+                        },
+                    )
+                    .await;
                 if !matches!(&listen_resp, Response::Listening { port: p } if *p == port) {
                     return super::TestOutcome::new(
                         "A",
