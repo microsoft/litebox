@@ -1165,6 +1165,14 @@ impl<FS: ShimFS> Task<FS> {
                 .litebox
                 .process_registry()
                 .exit_process(target, 128 + signal.as_i32());
+            self.global
+                .litebox
+                .process_registry()
+                .notify_waiters(target);
+            let target_key = target.0.cast_signed();
+            if let Some(remote) = self.global.process_thread_handles.read().get(&target_key) {
+                remote.request_exit();
+            }
         }
         self.global
             .cross_process_signals

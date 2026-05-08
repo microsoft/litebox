@@ -174,6 +174,11 @@ impl ThreadRemote {
             handle.interrupt();
         }
     }
+
+    pub(crate) fn request_exit(&self) {
+        self.is_exiting.store(true, Ordering::Relaxed);
+        self.interrupt();
+    }
 }
 
 /// A Linux process, which may have multiple threads.
