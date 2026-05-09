@@ -5237,20 +5237,6 @@ impl<FS: ShimFS> Task<FS> {
                     return Ok(0);
                 }
                 IoctlArg::TIOCSCTTY => return Ok(0),
-                IoctlArg::TIOCGWINSZ(ws) => {
-                    ws.write_at_offset(
-                        0,
-                        litebox_common_linux::Winsize {
-                            row: 41,
-                            col: 132,
-                            xpixel: 0,
-                            ypixel: 0,
-                        },
-                    )
-                    .ok_or(Errno::EFAULT)?;
-                    return Ok(0);
-                }
-                IoctlArg::TIOCSWINSZ(_) => return Ok(0),
                 _ => {}
             }
         }
@@ -5579,7 +5565,7 @@ impl<FS: ShimFS> Task<FS> {
                         .descriptor_table()
                         .with_metadata(pipe_fd, |_: &crate::MuxPtySlaveFd| ())
                         .is_ok();
-                    if !is_mux_pty && desc > 2 {
+                    if !is_mux_pty {
                         return Err(Errno::ENOTTY);
                     }
 
