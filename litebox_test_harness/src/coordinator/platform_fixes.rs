@@ -3074,70 +3074,168 @@ pub(crate) fn register_fork_listen_close_tests(reg: &mut Registry<'_>) {
             })
         })
     });
-    // FKLC.inherit.cross_connect: protocol-only fd inheritance across fork+exec.
-    // A listens, forks an inherited-listener child, closes its copy, and B connects.
-    reg.test(
-        "xworker",
-        "fork_listen_close",
-        "FKLC.inherit.cross_connect".to_string(),
-    )
-    .timeout(60)
-    .build(move |cx| {
-        let parent = cx.require(AgentName::Dpg1);
-        let connector = cx.require(AgentName::Dpg2);
-        let child = cx.declare_ephemeral(
-            AgentName::Dpg1,
-            "FKLCInheritCross",
-            SpawnKind::Fork {
-                binary: "self",
-                inherit_listen_ports: vec![19921],
+    // FKLC.inherit.cross_connect.{pair}: protocol-only fd inheritance
+    // across fork+exec, exercising the full cross-worker fd transport
+    // surface across binary-type transitions.
+    //
+    // Three actors:
+    //   - parent: AgentName that listens on the port, then forks an
+    //     ephemeral child via SpawnKind::Fork{binary:"self",...}.
+    //     Binary type of child == binary type of parent.
+    //   - inheriting child: forked from parent, inherits the listen fd,
+    //     accepts incoming connections.
+    //   - connector: separate top-level agent that connects to the
+    //     listened port from a sibling worker tree.
+    //
+    // Matrix axes:
+    //   - parent binary type (5 values) → exercises Path A
+    //     (host-pipe-bridge fork-restore migration of the listen fd
+    //     to the child worker host process). When parent and child
+    //     are different binary types, the child runs in a separate
+    //     worker process via delayed-fork migration.
+    //   - connector binary type (chosen for cross-worker coverage)
+    //     → exercises Path B (broker TCP via smoltcp for the connect
+    //     side) when connector and listener are in different trees.
+    //
+    // Pre-architectural-fix (wave-5 baseline): listen-fd inheritance
+    // is unimplemented at the product level; child accept(inherited_fd)
+    // returns ENOTSOCK. Expected to fail on litebox for ALL pairs;
+    // expected to pass on native for ALL pairs.
+    //
+    // Post-fix: all pairs pass on litebox.
+    {
+        struct FklcInheritPair {
+            name: &'static str,
+            parent: AgentName,
+            connector: AgentName,
+            base_port: u16,
+        }
+        // 5 parent binary types × Dpg2 connector. Each pair gets a
+        // unique base port to avoid bind collisions when tests run in
+        // parallel within the same docker container.
+        const FKLC_INHERIT_PAIRS: &[FklcInheritPair] = &[
+            // PIE-glibc → PIE-glibc, sibling-tree connector.
+            // Baseline: parent and child same binary type, no
+            // binary-type-transition fork-restore migration.
+            FklcInheritPair {
+                name: "dpg1",
+                parent: AgentName::Dpg1,
+                connector: AgentName::Dpg2,
+                base_port: 19930,
             },
-        );
-        Box::new(move |run| {
-            Box::pin(async move {
-                let port = 19921u16;
-                let listen_resp = run
-                    .send(
-                        &parent,
-                        Command::NetListen {
-                            port,
-                            pre_bind_options: vec![],
+            // Non-PIE-glibc (within-tree depth-2 from Dpg1).
+            // Parent is non-PIE-glibc; child fork+exec self also non-PIE-glibc.
+            // Tests Path A across non-PIE-glibc.
+            FklcInheritPair {
+                name: "dpg1_dng",
+                parent: AgentName::Dpg1Dng,
+                connector: AgentName::Dpg2,
+                base_port: 19931,
+            },
+            // Static-PIE-glibc parent.
+            FklcInheritPair {
+                name: "dpg1_spg",
+                parent: AgentName::Dpg1Spg,
+                connector: AgentName::Dpg2,
+                base_port: 19932,
+            },
+            // Static-PIE-musl parent — VS Code CLI pattern's binary type.
+            FklcInheritPair {
+                name: "dpg1_spm",
+                parent: AgentName::Dpg1Spm,
+                connector: AgentName::Dpg2,
+                base_port: 19933,
+            },
+            // Non-PIE-static-musl parent.
+            FklcInheritPair {
+                name: "dpg1_snm",
+                parent: AgentName::Dpg1Snm,
+                connector: AgentName::Dpg2,
+                base_port: 19934,
+            },
+        ];
+
+        for pair in FKLC_INHERIT_PAIRS {
+            let id = format!("FKLC.inherit.cross_connect.{}", pair.name);
+            let parent = pair.parent;
+            let connector = pair.connector;
+            let port = pair.base_port;
+            let ephemeral_label = match pair.name {
+                "dpg1" => "FKLCInheritCrossDpg1",
+                "dpg1_dng" => "FKLCInheritCrossDpg1Dng",
+                "dpg1_spg" => "FKLCInheritCrossDpg1Spg",
+                "dpg1_spm" => "FKLCInheritCrossDpg1Spm",
+                "dpg1_snm" => "FKLCInheritCrossDpg1Snm",
+                _ => unreachable!(),
+            };
+            reg.test("xworker", "fork_listen_close", id)
+                .timeout(60)
+                .build(move |cx| {
+                    let parent_handle = cx.require(parent);
+                    let connector_handle = cx.require(connector);
+                    let child = cx.declare_ephemeral(
+                        parent,
+                        ephemeral_label,
+                        SpawnKind::Fork {
+                            binary: "self",
+                            inherit_listen_ports: vec![port],
                         },
-                    )
-                    .await;
-                if !matches!(&listen_resp, Response::Listening { port: p } if *p == port) {
-                    return super::TestOutcome::new(
-                        "B",
-                        false,
-                        format!("listen failed: {listen_resp:?}"),
                     );
-                }
-                let fork_resp = run.spawn_ephemeral(&child).await;
-                if !matches!(&fork_resp, Response::Ok { .. }) {
-                    return super::TestOutcome::new(
-                        "B",
-                        false,
-                        format!("fork failed: {fork_resp:?}"),
-                    );
-                }
-                let _ = run.send(&parent, Command::NetCloseListener { port }).await;
-                if let Err(e) = fklc_child_accept_ready(run, &child, port).await {
-                    let _ = run.forward(&child, Command::Exit).await;
-                    return super::TestOutcome::new("B", false, e);
-                }
-                match fklc_connect_from_agent(run, &connector, port, "fork_listen_close").await {
-                    Ok(conn_resp) => {
-                        let _ = run.forward(&child, Command::Exit).await;
-                        super::TestOutcome::new("B", true, format!("{conn_resp:?}"))
-                    }
-                    Err(e) => {
-                        let _ = run.forward(&child, Command::Exit).await;
-                        super::TestOutcome::new("B", false, e)
-                    }
-                }
-            })
-        })
-    });
+                    Box::new(move |run| {
+                        Box::pin(async move {
+                            let listen_resp = run
+                                .send(
+                                    &parent_handle,
+                                    Command::NetListen {
+                                        port,
+                                        pre_bind_options: vec![],
+                                    },
+                                )
+                                .await;
+                            if !matches!(&listen_resp, Response::Listening { port: p } if *p == port) {
+                                return super::TestOutcome::new(
+                                    "B",
+                                    false,
+                                    format!("listen failed: {listen_resp:?}"),
+                                );
+                            }
+                            let fork_resp = run.spawn_ephemeral(&child).await;
+                            if !matches!(&fork_resp, Response::Ok { .. }) {
+                                return super::TestOutcome::new(
+                                    "B",
+                                    false,
+                                    format!("fork failed: {fork_resp:?}"),
+                                );
+                            }
+                            let _ = run
+                                .send(&parent_handle, Command::NetCloseListener { port })
+                                .await;
+                            if let Err(e) = fklc_child_accept_ready(run, &child, port).await {
+                                let _ = run.forward(&child, Command::Exit).await;
+                                return super::TestOutcome::new("B", false, e);
+                            }
+                            match fklc_connect_from_agent(
+                                run,
+                                &connector_handle,
+                                port,
+                                "fork_listen_close",
+                            )
+                            .await
+                            {
+                                Ok(conn_resp) => {
+                                    let _ = run.forward(&child, Command::Exit).await;
+                                    super::TestOutcome::new("B", true, format!("{conn_resp:?}"))
+                                }
+                                Err(e) => {
+                                    let _ = run.forward(&child, Command::Exit).await;
+                                    super::TestOutcome::new("B", false, e)
+                                }
+                            }
+                        })
+                    })
+                });
+        }
+    }
 
     // FKLC.inherit.multi_port: one fork imports two listen sockets at once.
     reg.test(
