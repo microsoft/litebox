@@ -5223,6 +5223,24 @@ impl<FS: ShimFS> Task<FS> {
             return Err(Errno::EBADF);
         };
 
+        if desc <= 2 {
+            match &arg {
+                IoctlArg::TIOCGPGRP(pgrp) => {
+                    pgrp.write_at_offset(0, self.pid).ok_or(Errno::EFAULT)?;
+                    return Ok(0);
+                }
+                IoctlArg::TIOCSPGRP(pgrp) => {
+                    let pgrp: i32 = pgrp.read_at_offset(0).ok_or(Errno::EFAULT)?;
+                    if pgrp <= 0 {
+                        return Err(Errno::EINVAL);
+                    }
+                    return Ok(0);
+                }
+                IoctlArg::TIOCSCTTY => return Ok(0),
+                _ => {}
+            }
+        }
+
         let files = self.files.borrow();
         match arg {
             IoctlArg::FIONREAD(out) => {
@@ -5540,7 +5558,47 @@ impl<FS: ShimFS> Task<FS> {
                     TerminalKind::NotTerminal => Err(Errno::ENOTTY),
                 },
                 |_fd| Err(Errno::ENOTTY),
-                |_fd| Err(Errno::ENOTTY),
+                |pipe_fd| {
+                    let is_mux_pty = self
+                        .global
+                        .litebox
+                        .descriptor_table()
+                        .with_metadata(pipe_fd, |_: &crate::MuxPtySlaveFd| ())
+                        .is_ok();
+                    if !is_mux_pty {
+                        return Err(Errno::ENOTTY);
+                    }
+
+                    match arg {
+                        IoctlArg::TIOCGPGRP(pgrp) => {
+                            pgrp.write_at_offset(0, self.pid).ok_or(Errno::EFAULT)?;
+                            Ok(0)
+                        }
+                        IoctlArg::TIOCSPGRP(pgrp) => {
+                            let pgrp: i32 = pgrp.read_at_offset(0).ok_or(Errno::EFAULT)?;
+                            if pgrp <= 0 {
+                                return Err(Errno::EINVAL);
+                            }
+                            Ok(0)
+                        }
+                        IoctlArg::TIOCSCTTY => Ok(0),
+                        IoctlArg::TIOCGWINSZ(ws) => {
+                            ws.write_at_offset(
+                                0,
+                                litebox_common_linux::Winsize {
+                                    row: 41,
+                                    col: 132,
+                                    xpixel: 0,
+                                    ypixel: 0,
+                                },
+                            )
+                            .ok_or(Errno::EFAULT)?;
+                            Ok(0)
+                        }
+                        IoctlArg::TIOCSWINSZ(_) => Ok(0),
+                        _ => Err(Errno::ENOTTY),
+                    }
+                },
                 |_fd| Err(Errno::ENOTTY),
                 |_fd| Err(Errno::ENOTTY),
                 |_fd| Err(Errno::ENOTTY),
