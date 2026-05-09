@@ -1565,7 +1565,7 @@ impl<FS: ShimFS> Task<FS> {
         if msg_controllen != 0 {
             log_unsupported!("ancillary data is not supported");
         }
-        if msg_iovlen == 0 || msg_iovlen > 1024 {
+        if msg_iovlen > 1024 {
             return Err(Errno::EINVAL);
         }
 
@@ -1577,10 +1577,6 @@ impl<FS: ShimFS> Task<FS> {
             .map(|iov| iov.iov_len)
             .fold(0usize, usize::saturating_add)
             .min(MAX_LEN);
-
-        if total_iov_capacity == 0 {
-            return Ok(0);
-        }
 
         // Perform a single recv into a contiguous buffer.
         let want_source = msg_name.as_usize() != 0;
