@@ -117,7 +117,9 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         envp
     };
 
-    let program = shim.load_program(initial_file_system, program_path, argv, envp);
+    let program = shim
+        .load_program(initial_file_system, program_path, argv, envp)
+        .map_err(|e| anyhow!("failed to load Windows PE program: {e}"))?;
     unsafe {
         litebox_platform_windows_userland::run_thread(
             program.entrypoints,

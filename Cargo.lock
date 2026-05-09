@@ -1492,6 +1492,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "litebox_common_windows"
+version = "0.1.0"
+dependencies = [
+ "object",
+ "thiserror",
+]
+
+[[package]]
 name = "litebox_packager"
 version = "0.1.0"
 dependencies = [
@@ -1755,7 +1763,10 @@ version = "0.1.0"
 dependencies = [
  "litebox",
  "litebox_common_linux",
+ "litebox_common_windows",
  "litebox_platform_multiplex",
+ "litebox_util_log",
+ "thiserror",
 ]
 
 [[package]]
