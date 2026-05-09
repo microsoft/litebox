@@ -202,7 +202,7 @@ pub struct CliArgs {
     /// Internal: stream mapping for the multiplexer.
     /// Format: `stream_id:guest_fd:direction:type` where direction is
     /// 'r' (read/ParentToWorker) or 'w' (write/WorkerToParent), and type
-    /// is 'p' (pipe) or 's' (socket).
+    /// is 'p' (pipe), 's' (socket), or 't' (PTY slave).
     #[arg(long = "mux-stream", hide = true, requires = "fork_restore")]
     pub mux_stream: Vec<String>,
 
@@ -1329,7 +1329,7 @@ struct MuxStreamSpec {
     guest_fd: usize,
     /// 'r' = ParentToWorker (worker reads), 'w' = WorkerToParent (worker writes).
     direction: u8,
-    /// 'p' = pipe, 's' = socket.
+    /// 'p' = pipe, 's' = socket, 't' = PTY slave.
     stream_type: u8,
     /// If true, the parent's pipe is already EOF at setup time.
     /// The worker pre-closes the relay sender so the child sees
@@ -1628,7 +1628,13 @@ fn fork_restore_and_ack<FS: litebox_shim_linux::ShimFS>(
                         if let Some(duped) =
                             litebox_ref.descriptor_table_mut().duplicate(primary_dup)
                         {
-                            program.entrypoints.install_mux_pipe_fd(ms.guest_fd, duped);
+                            if ms.stream_type == b't' {
+                                program
+                                    .entrypoints
+                                    .install_mux_pty_slave_fd(ms.guest_fd, duped);
+                            } else {
+                                program.entrypoints.install_mux_pipe_fd(ms.guest_fd, duped);
+                            }
                         }
                         continue;
                     }
@@ -1661,9 +1667,15 @@ fn fork_restore_and_ack<FS: litebox_shim_linux::ShimFS>(
 
                     // Dup guest pipe before install (install consumes it).
                     let guest_dup = litebox_ref.descriptor_table_mut().duplicate(&guest_pipe_fd);
-                    program
-                        .entrypoints
-                        .install_mux_pipe_fd(ms.guest_fd, guest_pipe_fd);
+                    if ms.stream_type == b't' {
+                        program
+                            .entrypoints
+                            .install_mux_pty_slave_fd(ms.guest_fd, guest_pipe_fd);
+                    } else {
+                        program
+                            .entrypoints
+                            .install_mux_pipe_fd(ms.guest_fd, guest_pipe_fd);
+                    }
                     if let Some(d) = guest_dup {
                         guest_pipe_dups.insert(ms.stream_id, d);
                     }

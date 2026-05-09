@@ -77,6 +77,9 @@ pub(crate) type FileFd<FS> = litebox::fd::TypedFd<FS>;
 pub trait ShimFS: litebox::fs::FileSystem + Send + Sync + 'static {}
 impl<T: litebox::fs::FileSystem + Send + Sync + 'static> ShimFS for T {}
 
+#[derive(Clone)]
+pub(crate) struct MuxPtySlaveFd;
+
 /// On debug builds, logs that the user attempted to use an unsupported feature.
 fn log_unsupported_fmt(args: core::fmt::Arguments<'_>) {
     #[cfg(debug_assertions)]
@@ -164,6 +167,32 @@ impl<FS: ShimFS> LinuxShimEntrypoints<FS> {
         guest_fd: usize,
         pipe_fd: litebox::fd::TypedFd<litebox::pipes::Pipes<Platform>>,
     ) {
+        self.install_mux_pipe_fd_with_pty_metadata(guest_fd, pipe_fd, false);
+    }
+
+    /// Install a virtual pipe endpoint that represents a fork-restored PTY slave.
+    pub fn install_mux_pty_slave_fd(
+        &self,
+        guest_fd: usize,
+        pipe_fd: litebox::fd::TypedFd<litebox::pipes::Pipes<Platform>>,
+    ) {
+        self.install_mux_pipe_fd_with_pty_metadata(guest_fd, pipe_fd, true);
+    }
+
+    fn install_mux_pipe_fd_with_pty_metadata(
+        &self,
+        guest_fd: usize,
+        pipe_fd: litebox::fd::TypedFd<litebox::pipes::Pipes<Platform>>,
+        is_pty_slave: bool,
+    ) {
+        if is_pty_slave {
+            self.task
+                .global
+                .litebox
+                .descriptor_table_mut()
+                .set_entry_metadata(&pipe_fd, MuxPtySlaveFd);
+        }
+
         let files = self.task.files.borrow();
         let mut rds = files.raw_descriptor_store.write();
 
