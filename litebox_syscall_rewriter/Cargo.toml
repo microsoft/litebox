@@ -11,7 +11,7 @@ clap = ["dep:clap"]
 
 [dependencies]
 iced-x86 = { version = "1.21", default-features = false, features = ["no_std", "decoder", "encoder", "instr_info"] }
-object = { version = "0.36.7", default-features = false, features = ["elf", "read_core"] }
+object = { version = "0.36.7", default-features = false, features = ["elf", "pe", "read_core"] }
 thiserror = { version = "2.0.6", default-features = false }
 zerocopy = { version = "0.8", default-features = false, features = ["derive"] }
 

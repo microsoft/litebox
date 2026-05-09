@@ -15,7 +15,10 @@ fn loads_minimal_pe_without_imports() {
     let test_dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("no_import");
     std::fs::create_dir_all(&test_dir).unwrap();
     let pe_path = build_no_import_pe(&test_dir);
-    println!("Built no-import PE fixture at `{}`", pe_path.display());
+    println!(
+        "Built rewritten no-import PE fixture at `{}`",
+        pe_path.display()
+    );
 
     let tar_path = test_dir.join("no_import.tar");
     create_tar_with_exe(&test_dir, &tar_path, "no_import.exe");
@@ -43,6 +46,7 @@ fn loads_minimal_pe_without_imports() {
 
 fn build_no_import_pe(test_dir: &std::path::Path) -> std::path::PathBuf {
     let source_path = test_dir.join("no_import.rs");
+    let raw_exe_path = test_dir.join("no_import.raw.exe");
     let exe_path = test_dir.join("no_import.exe");
     let syscall_number = nt_terminate_process_syscall_number();
     println!("Using NtTerminateProcess syscall number `{syscall_number:#x}`");
@@ -66,7 +70,7 @@ fn build_no_import_pe(test_dir: &std::path::Path) -> std::path::PathBuf {
             "-C",
             "link-arg=/NODEFAULTLIB",
             "-o",
-            exe_path.to_str().unwrap(),
+            raw_exe_path.to_str().unwrap(),
         ])
         .output()
         .expect("failed to run rustc for the no-import Windows PE fixture");
@@ -77,6 +81,11 @@ fn build_no_import_pe(test_dir: &std::path::Path) -> std::path::PathBuf {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
+
+    let rewritten =
+        litebox_syscall_rewriter::rewrite_binary(&std::fs::read(raw_exe_path).unwrap(), None)
+            .expect("failed to rewrite no-import Windows PE fixture");
+    std::fs::write(&exe_path, rewritten).unwrap();
     exe_path
 }
 

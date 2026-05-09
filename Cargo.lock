@@ -1497,6 +1497,7 @@ version = "0.1.0"
 dependencies = [
  "object",
  "thiserror",
+ "zerocopy",
 ]
 
 [[package]]
@@ -1708,6 +1709,7 @@ dependencies = [
  "litebox_platform_multiplex",
  "litebox_platform_windows_userland",
  "litebox_shim_windows",
+ "litebox_syscall_rewriter",
  "litebox_util_log",
  "tracing-subscriber",
 ]

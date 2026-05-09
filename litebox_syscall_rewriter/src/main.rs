@@ -10,10 +10,10 @@ use std::io::Write as _;
 use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 use std::path::PathBuf;
 
-/// Rewrite ELF files to hook syscalls
+/// Rewrite ELF files to hook syscalls, or PE files to hook syscalls and change GS TEB accesses to FS.
 #[derive(Parser, Debug)]
 struct CliArgs {
-    /// Path to input ELF binary
+    /// Path to input binary
     input_binary: PathBuf,
     /// Path to output the generated binary (default = <INPUT_BINARY>.hooked)
     #[arg(short = 'o', long = "output")]
@@ -47,10 +47,8 @@ fn main() -> anyhow::Result<()> {
     let mut input_binary = std::fs::File::open(&cli_args.input_binary)?;
     let mut input_binary_bytes = vec![];
     input_binary.read_to_end(&mut input_binary_bytes)?;
-    let output_binary = litebox_syscall_rewriter::hook_syscalls_in_elf(
-        &input_binary_bytes,
-        cli_args.trampoline_addr,
-    )?;
+    let output_binary =
+        litebox_syscall_rewriter::rewrite_binary(&input_binary_bytes, cli_args.trampoline_addr)?;
     let output_path = cli_args.output_binary.unwrap_or_else(|| {
         cli_args.input_binary.with_file_name(
             cli_args
