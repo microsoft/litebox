@@ -22,14 +22,33 @@
 //!
 //! - the original `data` payload (verbatim bytes),
 //! - the count of passed fds,
-//! - a token id (u64) per passed fd — opaque to this layer; the broker's
-//!   `BrokerFdTokenRegistry` is the authority for what each id refers to.
+//! - a [`PassedToken`] per passed fd — a tagged broker-allocated id.
+//!   Each token is encoded on the wire as a `u64`: the low 8 bits carry
+//!   a [`SubsystemTag`] discriminator (so the receiver knows what kind
+//!   of subsystem entry to construct around the materialised host fd),
+//!   and the high 56 bits carry the broker-registry id. 56 bits at
+//!   nanosecond allocation is over 2 years — comfortably above any
+//!   plausible worker lifetime.
 //!
 //! A single `UnixTransport::Tcp` carries a sequence of these frames.
 //! Stream sockets concatenate frames; seqpacket sockets emit one frame
 //! per message. Either way the framing tells the receiver where one
 //! `Message` ends and the next begins, which is exactly what the
 //! in-memory `Channel` variant gets for free.
+//!
+//! # Subsystem tag
+//!
+//! [`SubsystemTag`] is open-ended on purpose. The codec accepts tags it
+//! doesn't recognise (surfacing them as [`SubsystemTag::Unknown(u8)`]):
+//! this is the constraint required to extend the supported subsystem
+//! set later without a wire-version bump. The shim integration treats
+//! an unknown tag as a per-fd protocol error (drop that fd, deliver
+//! the rest of the message), not a fatal stream error.
+//!
+//! Initial Phase 3c-ii scope ("Option B"): `Eventfd` and `TcpSocket`.
+//! Additional tags (`Pipe`, `File`, `Signalfd`, `Timerfd`, `UnixSocket`)
+//! land incrementally as their per-subsystem `host_raw_fd_for_passing` /
+//! `from_host_fd` accessors are added.
 //!
 //! # Wire format (little-endian)
 //!
@@ -41,7 +60,7 @@
 //!   6      2    flags = 0                           // u16 (reserved)
 //!   8      4    data_len    (≤ DATA_MAX)            // u32
 //!  12      4    fd_count    (≤ FD_COUNT_MAX)        // u32
-//!  16      8    token[0]                            // u64
+//!  16      8    token[0]                            // u64 (tag:8 | id:56)
 //!  24      8    token[1]                            // u64
 //!   …      …    …                                   //
 //!  16+8K    L   data[0..L]                          // raw bytes
@@ -65,6 +84,115 @@
 //! frames (this module) → wire → frames → tokens → host fds.
 
 use alloc::vec::Vec;
+
+/// Discriminator byte that tells the receiver what kind of subsystem
+/// entry to build around a materialised host fd.
+///
+/// # Extensibility
+///
+/// This enum is **open-ended on purpose**. New subsystems get a new
+/// `u8` tag value and a new named variant; the decoder accepts unknown
+/// tags by surfacing them as [`SubsystemTag::Unknown(u8)`]. The shim
+/// integration treats unknown tags as per-fd protocol errors (drop that
+/// fd, deliver the rest of the message) — not a fatal stream error —
+/// which lets us roll out new subsystems without coordinated upgrades.
+///
+/// Reserved range: `0` is "Unspecified" (decoder treats it like
+/// `Unknown(0)`) so a freshly zero-initialised wire buffer never looks
+/// like a valid token. Values `1..=127` are reserved for named
+/// subsystems; `128..=255` are reserved for future use (potentially
+/// vendor-specific tags).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SubsystemTag {
+    /// Linux `eventfd2(2)`-created fd. Wire value `1`.
+    Eventfd,
+    /// Connected TCP socket. Wire value `2`. (Phase 3c-ii: includes
+    /// `SOCK_STREAM` AF_INET / AF_INET6 sockets. Listening sockets are
+    /// distinguished only after materialisation via `SO_ACCEPTCONN`.)
+    TcpSocket,
+    /// Tag that this receiver doesn't recognise. Carries the raw u8
+    /// value so the receiver can log diagnostics; callers should reject
+    /// the specific fd while continuing to deliver the rest of the
+    /// message.
+    Unknown(u8),
+}
+
+impl SubsystemTag {
+    /// Wire byte for this tag.
+    pub fn as_u8(self) -> u8 {
+        match self {
+            SubsystemTag::Eventfd => 1,
+            SubsystemTag::TcpSocket => 2,
+            SubsystemTag::Unknown(v) => v,
+        }
+    }
+
+    /// Decodes a wire byte. Never fails: unknown values surface as
+    /// `Unknown(raw)` rather than an error, so a single unrecognised
+    /// fd doesn't sink the surrounding message.
+    pub fn from_u8(raw: u8) -> Self {
+        match raw {
+            1 => SubsystemTag::Eventfd,
+            2 => SubsystemTag::TcpSocket,
+            other => SubsystemTag::Unknown(other),
+        }
+    }
+
+    /// True iff this tag is a named (known) subsystem this build
+    /// understands. Callers use this to decide whether to attempt
+    /// `from_host_fd` construction or to fail-soft on the receive path.
+    pub fn is_known(self) -> bool {
+        !matches!(self, SubsystemTag::Unknown(_))
+    }
+}
+
+/// A broker-allocated fd token tagged with the receiving subsystem.
+///
+/// Encoded on the wire as a single `u64`: the low 8 bits carry the
+/// [`SubsystemTag`] and the high 56 bits carry the broker registry id.
+/// 56-bit id space at nanosecond allocation rate covers > 2 years —
+/// effectively unlimited at any plausible worker lifetime.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct PassedToken(u64);
+
+/// Maximum broker token id encodable in [`PassedToken`]: `2^56 - 1`.
+pub const PASSED_TOKEN_MAX_ID: u64 = (1u64 << 56) - 1;
+
+impl PassedToken {
+    /// Constructs a token from a tag and a broker id. Returns
+    /// [`FrameError::EncodeIdTooLarge`] if `id` exceeds
+    /// [`PASSED_TOKEN_MAX_ID`]; broker token-id allocation is monotonic
+    /// from 1, so callers can safely treat overflow as a long-term
+    /// invariant violation rather than a hot-path concern.
+    pub fn new(tag: SubsystemTag, id: u64) -> Result<Self, FrameError> {
+        if id > PASSED_TOKEN_MAX_ID {
+            return Err(FrameError::EncodeIdTooLarge { id });
+        }
+        Ok(Self((id << 8) | u64::from(tag.as_u8())))
+    }
+
+    /// Reconstructs a token from its raw u64 wire encoding. No validation —
+    /// any u64 maps to *some* token, with `tag` possibly `Unknown(_)`.
+    pub fn from_raw(raw: u64) -> Self {
+        Self(raw)
+    }
+
+    /// Raw u64 wire encoding (low byte = tag, high 56 bits = id).
+    pub fn raw(self) -> u64 {
+        self.0
+    }
+
+    /// Subsystem tag.
+    pub fn tag(self) -> SubsystemTag {
+        #[allow(clippy::cast_possible_truncation)]
+        SubsystemTag::from_u8((self.0 & 0xff) as u8)
+    }
+
+    /// Broker registry id (56 bits).
+    pub fn id(self) -> u64 {
+        self.0 >> 8
+    }
+}
 
 /// A buffer-accumulating reader for [`FdTransferFrame`]s arriving on a
 /// byte stream in arbitrary-sized chunks.
@@ -95,7 +223,7 @@ pub struct FdTransferReader {
 /// `push` / `take_frame`; returning slices would tie the caller's hands.
 #[derive(Debug, PartialEq, Eq)]
 pub struct OwnedFrame {
-    pub tokens: Vec<u64>,
+    pub tokens: Vec<PassedToken>,
     pub data: Vec<u8>,
 }
 
@@ -158,7 +286,11 @@ mod reader_tests {
     use super::*;
     use alloc::vec;
 
-    fn encoded_frame(tokens: &[u64], data: &[u8]) -> Vec<u8> {
+    fn pt(id: u64) -> PassedToken {
+        PassedToken::new(SubsystemTag::Eventfd, id).expect("test id fits")
+    }
+
+    fn encoded_frame(tokens: &[PassedToken], data: &[u8]) -> Vec<u8> {
         let mut buf = Vec::new();
         FdTransferFrame { tokens, data }.encode(&mut buf).unwrap();
         buf
@@ -173,9 +305,9 @@ mod reader_tests {
     #[test]
     fn push_then_take_one_frame() {
         let mut r = FdTransferReader::new();
-        r.push(&encoded_frame(&[1, 2], b"hello"));
+        r.push(&encoded_frame(&[pt(1), pt(2)], b"hello"));
         let frame = r.take_frame().unwrap().expect("frame ready");
-        assert_eq!(frame.tokens, vec![1u64, 2]);
+        assert_eq!(frame.tokens, vec![pt(1), pt(2)]);
         assert_eq!(frame.data, b"hello");
         assert_eq!(r.buffered_bytes(), 0);
         assert!(r.take_frame().unwrap().is_none());
@@ -186,19 +318,19 @@ mod reader_tests {
         // The reader must tolerate single-byte chunks (worst case under
         // congested non-blocking TCP).
         let mut r = FdTransferReader::new();
-        let bytes = encoded_frame(&[42], b"trickle");
+        let bytes = encoded_frame(&[pt(42)], b"trickle");
         for &b in &bytes {
             r.push(&[b]);
         }
         let frame = r.take_frame().unwrap().expect("frame ready");
-        assert_eq!(frame.tokens, vec![42u64]);
+        assert_eq!(frame.tokens, vec![pt(42)]);
         assert_eq!(frame.data, b"trickle");
     }
 
     #[test]
     fn body_truncated_returns_none_until_complete() {
         let mut r = FdTransferReader::new();
-        let bytes = encoded_frame(&[7], b"halfsies");
+        let bytes = encoded_frame(&[pt(7)], b"halfsies");
 
         // Push everything except the last byte: header complete, body short.
         r.push(&bytes[..bytes.len() - 1]);
@@ -207,7 +339,7 @@ mod reader_tests {
         // Now the last byte arrives: frame becomes available.
         r.push(&bytes[bytes.len() - 1..]);
         let frame = r.take_frame().unwrap().expect("now ready");
-        assert_eq!(frame.tokens, vec![7u64]);
+        assert_eq!(frame.tokens, vec![pt(7)]);
         assert_eq!(frame.data, b"halfsies");
     }
 
@@ -233,17 +365,17 @@ mod reader_tests {
     #[test]
     fn back_to_back_frames_in_one_push() {
         let mut r = FdTransferReader::new();
-        let mut bytes = encoded_frame(&[1], b"a");
-        bytes.extend_from_slice(&encoded_frame(&[2, 3], b"bcd"));
+        let mut bytes = encoded_frame(&[pt(1)], b"a");
+        bytes.extend_from_slice(&encoded_frame(&[pt(2), pt(3)], b"bcd"));
         bytes.extend_from_slice(&encoded_frame(&[], b""));
         r.push(&bytes);
 
         let f1 = r.take_frame().unwrap().expect("f1");
-        assert_eq!(f1.tokens, vec![1u64]);
+        assert_eq!(f1.tokens, vec![pt(1)]);
         assert_eq!(f1.data, b"a");
 
         let f2 = r.take_frame().unwrap().expect("f2");
-        assert_eq!(f2.tokens, vec![2u64, 3]);
+        assert_eq!(f2.tokens, vec![pt(2), pt(3)]);
         assert_eq!(f2.data, b"bcd");
 
         let f3 = r.take_frame().unwrap().expect("f3");
@@ -259,14 +391,14 @@ mod reader_tests {
         // The classic non-aligned-chunks case: header bytes arrive in
         // one chunk, body in a different chunk.
         let mut r = FdTransferReader::new();
-        let bytes = encoded_frame(&[100, 200, 300], b"reassembly_check");
+        let bytes = encoded_frame(&[pt(100), pt(200), pt(300)], b"reassembly_check");
         let split = bytes.len() / 2;
         r.push(&bytes[..split]);
         assert!(r.take_frame().unwrap().is_none());
 
         r.push(&bytes[split..]);
         let frame = r.take_frame().unwrap().expect("frame ready");
-        assert_eq!(frame.tokens, vec![100u64, 200, 300]);
+        assert_eq!(frame.tokens, vec![pt(100), pt(200), pt(300)]);
         assert_eq!(frame.data, b"reassembly_check");
     }
 
@@ -275,14 +407,14 @@ mod reader_tests {
         // Frame A complete + Frame B partial in one push.
         // After taking A, the buffer should hold only B's partial bytes.
         let mut r = FdTransferReader::new();
-        let a = encoded_frame(&[1], b"first");
-        let b = encoded_frame(&[2, 3], b"second");
+        let a = encoded_frame(&[pt(1)], b"first");
+        let b = encoded_frame(&[pt(2), pt(3)], b"second");
         let mut chunk = a.clone();
         chunk.extend_from_slice(&b[..5]); // first 5 bytes of frame B
         r.push(&chunk);
 
         let f_a = r.take_frame().unwrap().expect("frame A");
-        assert_eq!(f_a.tokens, vec![1u64]);
+        assert_eq!(f_a.tokens, vec![pt(1)]);
         assert_eq!(f_a.data, b"first");
 
         // Frame B is incomplete.
@@ -292,7 +424,7 @@ mod reader_tests {
         // Push the remainder of B.
         r.push(&b[5..]);
         let f_b = r.take_frame().unwrap().expect("frame B");
-        assert_eq!(f_b.tokens, vec![2u64, 3]);
+        assert_eq!(f_b.tokens, vec![pt(2), pt(3)]);
         assert_eq!(f_b.data, b"second");
         assert_eq!(r.buffered_bytes(), 0);
     }
@@ -325,10 +457,12 @@ mod reader_tests {
         // bytes through the reader in a fixed pseudo-random chunk pattern.
         // Verifies the reader's state machine handles arbitrary chunk
         // alignment over many frames.
-        let frames: Vec<(Vec<u64>, Vec<u8>)> = (0..20)
+        let frames: Vec<(Vec<PassedToken>, Vec<u8>)> = (0..20)
             .map(|i: usize| {
                 let n_tokens = i % 5;
-                let tokens: Vec<u64> = (0..n_tokens as u64).map(|t| (i as u64) * 100 + t).collect();
+                let tokens: Vec<PassedToken> = (0..n_tokens as u64)
+                    .map(|t| pt((i as u64) * 100 + t))
+                    .collect();
                 #[allow(clippy::cast_possible_truncation)]
                 let data = vec![i as u8; (i * 7) % 90];
                 (tokens, data)
@@ -414,6 +548,11 @@ pub enum FrameError {
     EncodeDataTooLarge { data_len: usize, max: u32 },
     /// Same as [`FrameError::FdCountTooLarge`] but at encode time.
     EncodeFdCountTooLarge { fd_count: usize, max: u32 },
+    /// A [`PassedToken`] was constructed with an id that does not fit
+    /// in the 56-bit on-wire id field. The broker allocates token ids
+    /// monotonically from 1, so seeing this in practice indicates a
+    /// long-lived broker or a bug.
+    EncodeIdTooLarge { id: u64 },
 }
 
 impl core::fmt::Display for FrameError {
@@ -449,6 +588,9 @@ impl core::fmt::Display for FrameError {
             FrameError::EncodeFdCountTooLarge { fd_count, max } => {
                 write!(f, "encode fd_count {fd_count} exceeds max {max}")
             }
+            FrameError::EncodeIdTooLarge { id } => {
+                write!(f, "encode token id {id} exceeds 56-bit wire field")
+            }
         }
     }
 }
@@ -461,7 +603,7 @@ impl std::error::Error for FrameError {}
 /// data slice borrows from the input to avoid copying the bulk payload.
 #[derive(Debug, PartialEq, Eq)]
 pub struct DecodedFrame<'a> {
-    pub tokens: Vec<u64>,
+    pub tokens: Vec<PassedToken>,
     pub data: &'a [u8],
     /// Total bytes consumed from the input (header + tokens + data). The
     /// caller advances its read cursor by this many bytes.
@@ -471,7 +613,7 @@ pub struct DecodedFrame<'a> {
 /// An encodable frame. The `tokens` and `data` references describe a
 /// single message's worth of payload + fd-token list.
 pub struct FdTransferFrame<'a> {
-    pub tokens: &'a [u64],
+    pub tokens: &'a [PassedToken],
     pub data: &'a [u8],
 }
 
@@ -514,7 +656,7 @@ impl FdTransferFrame<'_> {
         out.extend_from_slice(&(self.tokens.len() as u32).to_le_bytes());
 
         for &t in self.tokens {
-            out.extend_from_slice(&t.to_le_bytes());
+            out.extend_from_slice(&t.raw().to_le_bytes());
         }
 
         out.extend_from_slice(self.data);
@@ -590,7 +732,7 @@ pub fn decode_frame(buf: &[u8]) -> Result<DecodedFrame<'_>, FrameError> {
     let mut tokens = Vec::with_capacity(fd_count as usize);
     for i in 0..fd_count as usize {
         let off = tokens_start + 8 * i;
-        let id = u64::from_le_bytes([
+        let raw = u64::from_le_bytes([
             buf[off],
             buf[off + 1],
             buf[off + 2],
@@ -600,7 +742,7 @@ pub fn decode_frame(buf: &[u8]) -> Result<DecodedFrame<'_>, FrameError> {
             buf[off + 6],
             buf[off + 7],
         ]);
-        tokens.push(id);
+        tokens.push(PassedToken::from_raw(raw));
     }
 
     Ok(DecodedFrame {
@@ -614,6 +756,86 @@ pub fn decode_frame(buf: &[u8]) -> Result<DecodedFrame<'_>, FrameError> {
 mod tests {
     use super::*;
     use alloc::vec;
+
+    /// Test helper: wrap a u64 id in a [`PassedToken`] with the
+    /// `Eventfd` subsystem tag. Tests in this module care about
+    /// id-level round-trip behaviour, not subsystem tagging.
+    fn pt(id: u64) -> PassedToken {
+        PassedToken::new(SubsystemTag::Eventfd, id).expect("test id fits in 56 bits")
+    }
+
+    #[test]
+    fn passed_token_tag_and_id_round_trip() {
+        for &tag in &[SubsystemTag::Eventfd, SubsystemTag::TcpSocket] {
+            for &id in &[0u64, 1, 42, 0xff, 0x100, PASSED_TOKEN_MAX_ID] {
+                let t = PassedToken::new(tag, id).unwrap();
+                assert_eq!(t.tag(), tag);
+                assert_eq!(t.id(), id);
+                // Round trip through raw u64.
+                let again = PassedToken::from_raw(t.raw());
+                assert_eq!(again, t);
+            }
+        }
+    }
+
+    #[test]
+    fn passed_token_rejects_oversized_id() {
+        let too_big = PASSED_TOKEN_MAX_ID + 1;
+        match PassedToken::new(SubsystemTag::Eventfd, too_big) {
+            Err(FrameError::EncodeIdTooLarge { id }) => assert_eq!(id, too_big),
+            other => panic!("expected EncodeIdTooLarge, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn subsystem_tag_unknown_round_trips_through_u8() {
+        for raw in [0u8, 3, 0x55, 0x7f, 0x80, 0xff] {
+            let tag = SubsystemTag::from_u8(raw);
+            assert_eq!(tag.as_u8(), raw);
+            assert!(!tag.is_known(), "raw {raw:#x} should be Unknown");
+            match tag {
+                SubsystemTag::Unknown(v) => assert_eq!(v, raw),
+                other => panic!("expected Unknown({raw:#x}), got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn subsystem_tag_known_values() {
+        assert_eq!(SubsystemTag::Eventfd.as_u8(), 1);
+        assert_eq!(SubsystemTag::TcpSocket.as_u8(), 2);
+        assert!(SubsystemTag::Eventfd.is_known());
+        assert!(SubsystemTag::TcpSocket.is_known());
+        assert_eq!(SubsystemTag::from_u8(1), SubsystemTag::Eventfd);
+        assert_eq!(SubsystemTag::from_u8(2), SubsystemTag::TcpSocket);
+    }
+
+    #[test]
+    fn decoder_preserves_unknown_subsystem_tags() {
+        // Manually construct a frame with a token whose tag byte = 99
+        // (Unknown). The decoder must surface that as Unknown(99) — not
+        // an error. This is the constraint that lets us roll out new
+        // subsystems incrementally without bumping the wire version.
+        let unknown_tag_raw = 99u8;
+        let id = 1234u64;
+        let token_raw = (id << 8) | u64::from(unknown_tag_raw);
+        let token = PassedToken::from_raw(token_raw);
+
+        let frame = FdTransferFrame {
+            tokens: &[token],
+            data: b"payload",
+        };
+        let mut buf = Vec::new();
+        frame.encode(&mut buf).expect("encode");
+
+        let decoded = decode_frame(&buf).expect("decode must accept unknown tag");
+        assert_eq!(decoded.tokens.len(), 1);
+        assert_eq!(
+            decoded.tokens[0].tag(),
+            SubsystemTag::Unknown(unknown_tag_raw)
+        );
+        assert_eq!(decoded.tokens[0].id(), id);
+    }
 
     #[test]
     fn round_trip_empty_data_no_fds() {
@@ -650,7 +872,7 @@ mod tests {
 
     #[test]
     fn round_trip_tokens_only() {
-        let tokens = [1u64, 42, 0xdead_beef_cafe_babe];
+        let tokens = [pt(1), pt(42), pt(0x00de_adbe_efca_feba)];
         let frame = FdTransferFrame {
             tokens: &tokens,
             data: &[],
@@ -659,14 +881,14 @@ mod tests {
         frame.encode(&mut buf).expect("encode");
 
         let decoded = decode_frame(&buf).expect("decode");
-        assert_eq!(decoded.tokens, tokens);
+        assert_eq!(&decoded.tokens[..], &tokens[..]);
         assert!(decoded.data.is_empty());
         assert_eq!(decoded.consumed, FRAME_HEADER_LEN + 8 * tokens.len());
     }
 
     #[test]
     fn round_trip_full_frame() {
-        let tokens = [7u64, 8, 9];
+        let tokens = [pt(7), pt(8), pt(9)];
         let payload = b"some bytes plus three fd tokens";
         let frame = FdTransferFrame {
             tokens: &tokens,
@@ -677,7 +899,7 @@ mod tests {
         assert_eq!(n, FRAME_HEADER_LEN + 24 + payload.len());
 
         let decoded = decode_frame(&buf).expect("decode");
-        assert_eq!(decoded.tokens, tokens);
+        assert_eq!(&decoded.tokens[..], &tokens[..]);
         assert_eq!(decoded.data, payload);
         assert_eq!(decoded.consumed, n);
     }
@@ -690,24 +912,24 @@ mod tests {
         let mut buf = Vec::new();
 
         FdTransferFrame {
-            tokens: &[1, 2],
+            tokens: &[pt(1), pt(2)],
             data: p1,
         }
         .encode(&mut buf)
         .expect("encode 1");
         FdTransferFrame {
-            tokens: &[3],
+            tokens: &[pt(3)],
             data: p2,
         }
         .encode(&mut buf)
         .expect("encode 2");
 
         let f1 = decode_frame(&buf).expect("decode 1");
-        assert_eq!(f1.tokens, [1u64, 2]);
+        assert_eq!(f1.tokens, [pt(1), pt(2)]);
         assert_eq!(f1.data, p1);
 
         let f2 = decode_frame(&buf[f1.consumed..]).expect("decode 2");
-        assert_eq!(f2.tokens, [3u64]);
+        assert_eq!(f2.tokens, [pt(3)]);
         assert_eq!(f2.data, p2);
 
         assert_eq!(f1.consumed + f2.consumed, buf.len());
@@ -853,7 +1075,9 @@ mod tests {
 
     #[test]
     fn encode_rejects_oversized_fd_count() {
-        let many = vec![0u64; FD_COUNT_MAX as usize + 1];
+        let many: Vec<PassedToken> = (0..=(FD_COUNT_MAX as usize))
+            .map(|i| pt(i as u64))
+            .collect();
         let frame = FdTransferFrame {
             tokens: &many,
             data: &[],
@@ -873,20 +1097,20 @@ mod tests {
     fn boundary_max_data_len_round_trips() {
         let payload = vec![0xa5u8; DATA_MAX as usize];
         let frame = FdTransferFrame {
-            tokens: &[1, 2, 3],
+            tokens: &[pt(1), pt(2), pt(3)],
             data: &payload,
         };
         let mut buf = Vec::new();
         frame.encode(&mut buf).expect("encode at max");
         let decoded = decode_frame(&buf).expect("decode at max");
-        assert_eq!(decoded.tokens, [1u64, 2, 3]);
+        assert_eq!(decoded.tokens, [pt(1), pt(2), pt(3)]);
         assert_eq!(decoded.data.len(), DATA_MAX as usize);
         assert!(decoded.data.iter().all(|&b| b == 0xa5));
     }
 
     #[test]
     fn boundary_max_fd_count_round_trips() {
-        let tokens: Vec<u64> = (0..u64::from(FD_COUNT_MAX)).collect();
+        let tokens: Vec<PassedToken> = (0..u64::from(FD_COUNT_MAX)).map(pt).collect();
         let frame = FdTransferFrame {
             tokens: &tokens,
             data: b"x",
