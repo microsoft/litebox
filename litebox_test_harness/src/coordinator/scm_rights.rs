@@ -64,6 +64,30 @@ const SCM_PAIRS: &[ScmPair] = &[
         sender: AgentName::Dpg1Spm,
         receiver: AgentName::Dpg1SpmDng,
     },
+    // Static-PIE-glibc and non-PIE-static-musl coverage. Added so
+    // every binary type appears as both sender and receiver at
+    // least once. Without these pairs the shim's fd-table install
+    // path for static-PIE-glibc and non-PIE-static-musl receivers
+    // is never exercised by SCM tests.
+    ScmPair {
+        // static-PIE-glibc as sender (cross-tree): exercises the
+        // sender-side passed_fds path on a static-PIE-glibc binary.
+        sender: AgentName::Dpg1Spg,
+        receiver: AgentName::Dpg2,
+    },
+    ScmPair {
+        // non-PIE-static-musl as sender (cross-tree): exercises the
+        // sender-side passed_fds path on a fully static musl binary.
+        sender: AgentName::Dpg1Snm,
+        receiver: AgentName::Dpg2,
+    },
+    ScmPair {
+        // PIE-glibc → static-PIE-glibc within-tree: the receiver-side
+        // fd-table install path on static-PIE-glibc (which still loads
+        // ld.so for nss/dlopen but has fixed-load semantics).
+        sender: AgentName::Dpg1,
+        receiver: AgentName::Dpg1Spg,
+    },
 ];
 
 struct ScmScenario {
