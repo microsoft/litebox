@@ -597,4 +597,92 @@ mod tests {
         }
         assert_eq!(registry.live_token_count(), 0);
     }
+
+    // ---- Integration: real FdTokenClient against the listener ------------
+    //
+    // These tests use the production worker-side client
+    // (litebox_common_linux::fd_token_client::FdTokenClient) talking to
+    // our spawn_control_listener. They prove the two halves of the
+    // protocol speak the same wire format.
+
+    #[test]
+    fn client_register_materialize_release_round_trip() {
+        use litebox_common_linux::fd_token_client::FdTokenClient;
+        use std::io::{Read, Write};
+
+        let (_dir, path, registry) = spawn_test_listener();
+        let client = FdTokenClient::connect(&path).expect("client connect");
+
+        let (r, w) = pipe_pair();
+        let token_id = client.register(r).expect("register");
+        assert!(token_id > 0);
+        assert_eq!(registry.live_token_count(), 1);
+
+        let mat_fd = client.materialize(token_id).expect("materialize");
+
+        let mut writer = std::fs::File::from(w);
+        writer.write_all(b"client-roundtrip").unwrap();
+        drop(writer);
+
+        let mut reader = std::fs::File::from(mat_fd);
+        let mut buf = Vec::new();
+        reader.read_to_end(&mut buf).unwrap();
+        assert_eq!(&buf, b"client-roundtrip");
+
+        client.release(token_id).expect("release");
+        assert_eq!(registry.live_token_count(), 0);
+    }
+
+    #[test]
+    fn client_unknown_token_errors_are_typed() {
+        use litebox_common_linux::fd_token_client::{ClientError, FdTokenClient};
+
+        let (_dir, path, _registry) = spawn_test_listener();
+        let client = FdTokenClient::connect(&path).expect("client connect");
+
+        match client.materialize(999_999) {
+            Err(ClientError::UnknownToken { token_id }) => {
+                assert_eq!(token_id, 999_999);
+            }
+            other => panic!("expected UnknownToken, got {other:?}"),
+        }
+
+        match client.release(999_999) {
+            Err(ClientError::UnknownToken { token_id }) => {
+                assert_eq!(token_id, 999_999);
+            }
+            other => panic!("expected UnknownToken, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn client_concurrent_calls_serialize_via_mutex() {
+        // Two threads sharing one client and registering 50 fds each.
+        // Mutex serialization must keep request/response framing intact.
+        use litebox_common_linux::fd_token_client::FdTokenClient;
+        use std::sync::Arc;
+
+        let (_dir, path, registry) = spawn_test_listener();
+        let client = Arc::new(FdTokenClient::connect(&path).expect("client connect"));
+
+        let mut handles = Vec::new();
+        for _ in 0..2 {
+            let client = Arc::clone(&client);
+            handles.push(thread::spawn(move || {
+                let mut tokens = Vec::new();
+                for _ in 0..50 {
+                    let (r, _w) = pipe_pair();
+                    let id = client.register(r).expect("register");
+                    tokens.push(id);
+                }
+                for id in tokens {
+                    client.release(id).expect("release");
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+        assert_eq!(registry.live_token_count(), 0);
+    }
 }

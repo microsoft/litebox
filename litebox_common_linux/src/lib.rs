@@ -30,6 +30,8 @@ pub mod vmap;
 extern crate std;
 
 #[cfg(all(feature = "std", unix))]
+pub mod fd_token_client;
+#[cfg(all(feature = "std", unix))]
 pub mod shmem_ring;
 
 extern crate alloc;
