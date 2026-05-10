@@ -19,6 +19,7 @@ use zerocopy::{FromBytes, IntoBytes};
 use crate::signal::SigSet;
 
 pub mod errno;
+pub mod fd_transfer_frame;
 pub mod loader;
 pub mod mm;
 pub mod signal;
