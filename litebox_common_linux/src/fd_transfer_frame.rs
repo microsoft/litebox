@@ -66,6 +66,307 @@
 
 use alloc::vec::Vec;
 
+/// A buffer-accumulating reader for [`FdTransferFrame`]s arriving on a
+/// byte stream in arbitrary-sized chunks.
+///
+/// The receive side of `UnixTransport::Tcp` reads bytes from a smoltcp
+/// TCP stream. Those bytes carry an unbroken sequence of LBFD frames,
+/// but `try_read` may surface them in chunks that don't align to frame
+/// boundaries. `FdTransferReader` hides that: callers
+///
+/// 1. invoke [`push`](Self::push) for each freshly-received chunk;
+/// 2. invoke [`take_frame`](Self::take_frame) until it returns `None`,
+///    yielding one decoded frame's worth of `(tokens, data)` per call.
+///
+/// State is kept across calls in an internal `Vec<u8>`. Once a complete
+/// frame's worth of bytes has been consumed, the buffer compacts the
+/// remaining tail in place so memory does not grow without bound.
+///
+/// Phase 3c-i.2: pure state, no I/O. Phase 3c-ii will instantiate one
+/// `FdTransferReader` per `UnixTransport::Tcp` and feed it the bytes
+/// returned by `proxy.try_read`.
+pub struct FdTransferReader {
+    buf: Vec<u8>,
+}
+
+/// One frame's worth of payload extracted by
+/// [`FdTransferReader::take_frame`]. Both `tokens` and `data` are owned
+/// because the underlying buffer slot may be compacted on the next
+/// `push` / `take_frame`; returning slices would tie the caller's hands.
+#[derive(Debug, PartialEq, Eq)]
+pub struct OwnedFrame {
+    pub tokens: Vec<u64>,
+    pub data: Vec<u8>,
+}
+
+impl Default for FdTransferReader {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl FdTransferReader {
+    /// Creates an empty reader.
+    pub fn new() -> Self {
+        Self { buf: Vec::new() }
+    }
+
+    /// Returns the number of buffered bytes not yet consumed by
+    /// [`take_frame`]. Intended for telemetry / tests; not part of the
+    /// production wire protocol.
+    pub fn buffered_bytes(&self) -> usize {
+        self.buf.len()
+    }
+
+    /// Appends `chunk` to the internal buffer. Cheap (`extend_from_slice`).
+    pub fn push(&mut self, chunk: &[u8]) {
+        self.buf.extend_from_slice(chunk);
+    }
+
+    /// Tries to extract one complete frame from the front of the
+    /// buffer.
+    ///
+    /// Returns:
+    /// - `Ok(Some(OwnedFrame))` when a full frame is available; the
+    ///   bytes for that frame are removed from the buffer.
+    /// - `Ok(None)` when not enough bytes are buffered yet for either
+    ///   a complete header or a complete body. The caller should
+    ///   `push` more bytes and try again.
+    /// - `Err(FrameError)` when the frame is structurally malformed
+    ///   (bad magic, unsupported version, oversized fields). The
+    ///   buffer state on a malformed frame is undefined and the caller
+    ///   SHOULD treat the stream as unrecoverable (close the
+    ///   underlying transport).
+    pub fn take_frame(&mut self) -> Result<Option<OwnedFrame>, FrameError> {
+        match decode_frame(&self.buf) {
+            Ok(decoded) => {
+                let consumed = decoded.consumed;
+                let tokens = decoded.tokens;
+                let data = decoded.data.to_vec();
+                // Compact the buffer in place: drop the consumed prefix.
+                self.buf.drain(..consumed);
+                Ok(Some(OwnedFrame { tokens, data }))
+            }
+            Err(FrameError::HeaderTruncated { .. } | FrameError::BodyTruncated { .. }) => Ok(None),
+            Err(other) => Err(other),
+        }
+    }
+}
+
+#[cfg(test)]
+mod reader_tests {
+    use super::*;
+    use alloc::vec;
+
+    fn encoded_frame(tokens: &[u64], data: &[u8]) -> Vec<u8> {
+        let mut buf = Vec::new();
+        FdTransferFrame { tokens, data }.encode(&mut buf).unwrap();
+        buf
+    }
+
+    #[test]
+    fn empty_reader_returns_none() {
+        let mut r = FdTransferReader::new();
+        assert!(r.take_frame().unwrap().is_none());
+    }
+
+    #[test]
+    fn push_then_take_one_frame() {
+        let mut r = FdTransferReader::new();
+        r.push(&encoded_frame(&[1, 2], b"hello"));
+        let frame = r.take_frame().unwrap().expect("frame ready");
+        assert_eq!(frame.tokens, vec![1u64, 2]);
+        assert_eq!(frame.data, b"hello");
+        assert_eq!(r.buffered_bytes(), 0);
+        assert!(r.take_frame().unwrap().is_none());
+    }
+
+    #[test]
+    fn push_byte_at_a_time_eventually_yields_frame() {
+        // The reader must tolerate single-byte chunks (worst case under
+        // congested non-blocking TCP).
+        let mut r = FdTransferReader::new();
+        let bytes = encoded_frame(&[42], b"trickle");
+        for &b in &bytes {
+            r.push(&[b]);
+        }
+        let frame = r.take_frame().unwrap().expect("frame ready");
+        assert_eq!(frame.tokens, vec![42u64]);
+        assert_eq!(frame.data, b"trickle");
+    }
+
+    #[test]
+    fn body_truncated_returns_none_until_complete() {
+        let mut r = FdTransferReader::new();
+        let bytes = encoded_frame(&[7], b"halfsies");
+
+        // Push everything except the last byte: header complete, body short.
+        r.push(&bytes[..bytes.len() - 1]);
+        assert!(r.take_frame().unwrap().is_none());
+
+        // Now the last byte arrives: frame becomes available.
+        r.push(&bytes[bytes.len() - 1..]);
+        let frame = r.take_frame().unwrap().expect("now ready");
+        assert_eq!(frame.tokens, vec![7u64]);
+        assert_eq!(frame.data, b"halfsies");
+    }
+
+    #[test]
+    fn header_truncated_returns_none_until_complete() {
+        let mut r = FdTransferReader::new();
+        // First, push fewer than HEADER_LEN bytes.
+        r.push(&[0xa5; 4]);
+        assert!(r.take_frame().unwrap().is_none());
+
+        // Now push a complete frame; the bogus prefix bytes will form a
+        // bad-magic header. We expect a hard error.
+        let mut bytes = encoded_frame(&[], b"xx");
+        bytes.splice(0..0, [0u8; 0]); // no-op, just to keep ordering clear
+        r.push(&bytes);
+
+        match r.take_frame() {
+            Err(FrameError::BadMagic { .. }) => {}
+            other => panic!("expected BadMagic from desync, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn back_to_back_frames_in_one_push() {
+        let mut r = FdTransferReader::new();
+        let mut bytes = encoded_frame(&[1], b"a");
+        bytes.extend_from_slice(&encoded_frame(&[2, 3], b"bcd"));
+        bytes.extend_from_slice(&encoded_frame(&[], b""));
+        r.push(&bytes);
+
+        let f1 = r.take_frame().unwrap().expect("f1");
+        assert_eq!(f1.tokens, vec![1u64]);
+        assert_eq!(f1.data, b"a");
+
+        let f2 = r.take_frame().unwrap().expect("f2");
+        assert_eq!(f2.tokens, vec![2u64, 3]);
+        assert_eq!(f2.data, b"bcd");
+
+        let f3 = r.take_frame().unwrap().expect("f3");
+        assert!(f3.tokens.is_empty());
+        assert!(f3.data.is_empty());
+
+        assert!(r.take_frame().unwrap().is_none());
+        assert_eq!(r.buffered_bytes(), 0);
+    }
+
+    #[test]
+    fn frame_split_across_pushes_reassembles() {
+        // The classic non-aligned-chunks case: header bytes arrive in
+        // one chunk, body in a different chunk.
+        let mut r = FdTransferReader::new();
+        let bytes = encoded_frame(&[100, 200, 300], b"reassembly_check");
+        let split = bytes.len() / 2;
+        r.push(&bytes[..split]);
+        assert!(r.take_frame().unwrap().is_none());
+
+        r.push(&bytes[split..]);
+        let frame = r.take_frame().unwrap().expect("frame ready");
+        assert_eq!(frame.tokens, vec![100u64, 200, 300]);
+        assert_eq!(frame.data, b"reassembly_check");
+    }
+
+    #[test]
+    fn partial_frame_then_extra_partial_frame_compacts_buffer() {
+        // Frame A complete + Frame B partial in one push.
+        // After taking A, the buffer should hold only B's partial bytes.
+        let mut r = FdTransferReader::new();
+        let a = encoded_frame(&[1], b"first");
+        let b = encoded_frame(&[2, 3], b"second");
+        let mut chunk = a.clone();
+        chunk.extend_from_slice(&b[..5]); // first 5 bytes of frame B
+        r.push(&chunk);
+
+        let f_a = r.take_frame().unwrap().expect("frame A");
+        assert_eq!(f_a.tokens, vec![1u64]);
+        assert_eq!(f_a.data, b"first");
+
+        // Frame B is incomplete.
+        assert!(r.take_frame().unwrap().is_none());
+        assert_eq!(r.buffered_bytes(), 5);
+
+        // Push the remainder of B.
+        r.push(&b[5..]);
+        let f_b = r.take_frame().unwrap().expect("frame B");
+        assert_eq!(f_b.tokens, vec![2u64, 3]);
+        assert_eq!(f_b.data, b"second");
+        assert_eq!(r.buffered_bytes(), 0);
+    }
+
+    #[test]
+    fn bad_magic_in_header_surfaces_as_error() {
+        let mut r = FdTransferReader::new();
+        r.push(&[0u8; FRAME_HEADER_LEN]); // all zeros = bad magic
+        match r.take_frame() {
+            Err(FrameError::BadMagic { .. }) => {}
+            other => panic!("expected BadMagic, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unsupported_version_surfaces_as_error() {
+        let mut r = FdTransferReader::new();
+        let mut bytes = encoded_frame(&[], b"x");
+        bytes[4..6].copy_from_slice(&99u16.to_le_bytes());
+        r.push(&bytes);
+        match r.take_frame() {
+            Err(FrameError::UnsupportedVersion { version: 99 }) => {}
+            other => panic!("expected UnsupportedVersion, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn many_random_chunk_sizes_round_trip() {
+        // Encode a sequence of 20 frames with varied sizes, then push the
+        // bytes through the reader in a fixed pseudo-random chunk pattern.
+        // Verifies the reader's state machine handles arbitrary chunk
+        // alignment over many frames.
+        let frames: Vec<(Vec<u64>, Vec<u8>)> = (0..20)
+            .map(|i: usize| {
+                let n_tokens = i % 5;
+                let tokens: Vec<u64> = (0..n_tokens as u64).map(|t| (i as u64) * 100 + t).collect();
+                #[allow(clippy::cast_possible_truncation)]
+                let data = vec![i as u8; (i * 7) % 90];
+                (tokens, data)
+            })
+            .collect();
+
+        let mut all_bytes = Vec::new();
+        for (tokens, data) in &frames {
+            all_bytes.extend_from_slice(&encoded_frame(tokens, data));
+        }
+
+        let mut r = FdTransferReader::new();
+        let chunk_sizes = [1, 2, 3, 5, 7, 11, 13, 17, 23];
+        let mut idx = 0;
+        let mut decoded = Vec::new();
+        let mut cs_i = 0;
+
+        while idx < all_bytes.len() || decoded.len() < frames.len() {
+            if idx < all_bytes.len() {
+                let cs = chunk_sizes[cs_i % chunk_sizes.len()].min(all_bytes.len() - idx);
+                cs_i += 1;
+                r.push(&all_bytes[idx..idx + cs]);
+                idx += cs;
+            }
+            while let Some(f) = r.take_frame().unwrap() {
+                decoded.push(f);
+            }
+        }
+
+        assert_eq!(decoded.len(), frames.len());
+        for (i, (expected, got)) in frames.iter().zip(decoded.iter()).enumerate() {
+            assert_eq!(got.tokens, expected.0, "tokens mismatch at frame {i}");
+            assert_eq!(got.data, expected.1, "data mismatch at frame {i}");
+        }
+        assert_eq!(r.buffered_bytes(), 0);
+    }
+}
+
 /// Wire-format magic number ("LBFD" — LiteBox Fd Frame).
 pub const FRAME_MAGIC: u32 = 0x4C42_4644;
 
