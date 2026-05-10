@@ -19,9 +19,15 @@ fn loads_minimal_pe_without_imports() {
         "Built rewritten no-import PE fixture at `{}`",
         pe_path.display()
     );
-
-    let tar_path = test_dir.join("no_import.tar");
-    create_tar_with_exe(&test_dir, &tar_path, "no_import.exe");
+    for dll_name in ["ntdll.dll", "kernel32.dll", "kernelbase.dll"] {
+        let dll_path = build_rewritten_system_dll(&test_dir, dll_name);
+        println!(
+            "Built rewritten {dll_name} fixture at `{}`",
+            dll_path.display()
+        );
+    }
+    let tar_path = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("no_import.tar");
+    create_tar_with_dir(&test_dir, &tar_path);
 
     let mut command =
         std::process::Command::new(env!("CARGO_BIN_EXE_litebox_runner_windows_userland"));
@@ -154,22 +160,85 @@ fn nt_terminate_process_syscall_number() -> u32 {
     )
 }
 
-fn create_tar_with_exe(test_dir: &std::path::Path, tar_path: &std::path::Path, exe_name: &str) {
-    let output = std::process::Command::new("tar.exe")
-        .args([
-            "-cf",
-            tar_path.to_str().unwrap(),
-            "-C",
-            test_dir.to_str().unwrap(),
-            exe_name,
-        ])
-        .output()
-        .expect("failed to run tar.exe for the no-import Windows PE fixture");
+fn build_rewritten_system_dll(test_dir: &std::path::Path, dll_name: &str) -> std::path::PathBuf {
+    let system32_dir = test_dir.join("Windows").join("System32");
+    std::fs::create_dir_all(&system32_dir).unwrap();
+    let dll_path = system32_dir.join(dll_name);
+    let host_dll = std::fs::read(host_system32_dll_path(dll_name))
+        .unwrap_or_else(|error| panic!("failed to read host {dll_name}: {error}"));
+    let rewritten = match litebox_syscall_rewriter::rewrite_binary(&host_dll, None) {
+        Ok(rewritten) => rewritten,
+        Err(litebox_syscall_rewriter::Error::UnpatchableSyscalls(_)) => panic!(
+            "failed to rewrite host {dll_name}; required support: patch dense ntdll syscall stubs or provide a pre-rewritten guest DLL"
+        ),
+        Err(error) => panic!("failed to rewrite host {dll_name}: {error}"),
+    };
+    std::fs::write(&dll_path, rewritten).unwrap();
+    dll_path
+}
 
-    assert!(
-        output.status.success(),
-        "failed to create tar for no-import Windows PE fixture\nstdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
+fn host_system32_dll_path(dll_name: &str) -> std::path::PathBuf {
+    std::env::var_os("SystemRoot")
+        .map_or_else(
+            || std::path::PathBuf::from(r"C:\Windows"),
+            std::path::PathBuf::from,
+        )
+        .join("System32")
+        .join(dll_name)
+}
+
+fn create_tar_with_dir(test_dir: &std::path::Path, tar_path: &std::path::Path) {
+    let output_file = std::fs::File::create(tar_path)
+        .expect("failed to create tar for the no-import Windows PE fixture");
+    let mut builder = tar::Builder::new(output_file);
+    append_regular_files_to_ustar(&mut builder, test_dir, test_dir);
+    builder
+        .finish()
+        .expect("failed to finalize tar for the no-import Windows PE fixture");
+}
+
+fn append_regular_files_to_ustar(
+    builder: &mut tar::Builder<std::fs::File>,
+    root: &std::path::Path,
+    dir: &std::path::Path,
+) {
+    for entry in std::fs::read_dir(dir).unwrap() {
+        let entry = entry.unwrap();
+        let path = entry.path();
+        if path.is_dir() {
+            append_regular_files_to_ustar(builder, root, &path);
+            continue;
+        }
+
+        // Avoid nesting tar files from previous runs into the fixture archive.
+        if path
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("tar"))
+        {
+            continue;
+        }
+
+        let data = std::fs::read(&path).unwrap_or_else(|error| {
+            panic!("failed to read fixture file {}: {error}", path.display())
+        });
+        let mut header = tar::Header::new_ustar();
+        header.set_size(data.len() as u64);
+        header.set_mode(0o644);
+        header.set_uid(1000);
+        header.set_gid(1000);
+        header.set_mtime(0);
+        header.set_entry_type(tar::EntryType::Regular);
+        header.set_cksum();
+
+        let relative = path.strip_prefix(root).unwrap();
+        let relative = relative.to_string_lossy().replace('\\', "/");
+        builder
+            .append_data(&mut header, relative, data.as_slice())
+            .unwrap_or_else(|error| {
+                panic!(
+                    "failed to append fixture file {} to tar: {error}",
+                    path.display()
+                )
+            });
+    }
 }
