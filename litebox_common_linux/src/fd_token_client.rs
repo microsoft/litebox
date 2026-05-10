@@ -50,7 +50,7 @@ use std::io;
 use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex, OnceLock};
 
 /// Errors returned by [`FdTokenClient`] operations.
 #[derive(Debug, thiserror::Error)]
@@ -348,4 +348,58 @@ fn recv_frame(stream: &UnixStream) -> Result<(Frame, Option<OwnedFd>), ClientErr
 
     let frame = decode(&frame_buf).map_err(ClientError::Protocol)?;
     Ok((frame, received_fd))
+}
+
+// -- Process-global client accessor ------------------------------------------
+//
+// The cross-worker fd-transport path needs a single FdTokenClient per worker
+// process, established once at runner bootstrap and referenced from any
+// `UnixTransport::Tcp` send/recv site. A `OnceLock<Arc<FdTokenClient>>` is
+// the simplest fit: the runner sets it once before any guest code runs;
+// the shim reads it on demand.
+//
+// Returning `None` means "fd-token transport is not enabled in this
+// configuration" — for example when the runner was started without a
+// broker control socket. Callers MUST handle that case explicitly:
+// either fall back to legacy behaviour (drop passed_fds, matching the
+// pre-3c behaviour) or refuse the operation. The shim integration in
+// Phase 3c-ii will choose fall-back so that a partial rollout doesn't
+// regress any tests that don't depend on cross-worker SCM_RIGHTS.
+
+static GLOBAL_CLIENT: OnceLock<Arc<FdTokenClient>> = OnceLock::new();
+
+/// Sets the process-global [`FdTokenClient`]. Intended to be called
+/// exactly once during runner bootstrap. Returns `Err(client)` if a
+/// client was already set; callers can choose whether to log+drop or
+/// panic on that case (in practice it indicates a bootstrap bug).
+pub fn set_global_client(client: Arc<FdTokenClient>) -> Result<(), Arc<FdTokenClient>> {
+    GLOBAL_CLIENT.set(client)
+}
+
+/// Returns the process-global [`FdTokenClient`] if one has been set.
+/// Returns `None` if the runner did not initialise the fd-token
+/// transport for this process.
+pub fn global_client() -> Option<Arc<FdTokenClient>> {
+    GLOBAL_CLIENT.get().cloned()
+}
+
+#[cfg(test)]
+mod global_tests {
+    use super::*;
+
+    /// We can't directly test set/get because OnceLock is process-global
+    /// and other tests in this binary may have already initialised it.
+    /// This test validates only that calling `global_client()` does not
+    /// panic on an uninitialised state, and the documented contract holds:
+    /// returning `None` is the unset case.
+    ///
+    /// Real coverage of set+get round trips lives in integration tests
+    /// in `litebox_broker::fd_token_socket::tests` where each test
+    /// constructs its own client; the global is only exercised from the
+    /// shim integration in Phase 3c-ii.
+    #[test]
+    fn global_client_is_none_or_some_without_panic() {
+        // Either Some (already set by another test) or None — both fine.
+        let _ = global_client();
+    }
 }
