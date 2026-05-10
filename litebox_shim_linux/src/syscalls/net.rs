@@ -394,7 +394,13 @@ impl<FS: ShimFS> GlobalState<FS> {
 
         match optname {
             SocketOptionName::IP(ip) => match ip {
-                litebox_common_linux::IpOption::TOS => return Err(Errno::EOPNOTSUPP),
+                // Silently accept IP_TOS (traffic class hint). Node's
+                // Socket.setTypeOfService treats ENOTSUP as an uncaught
+                // exception and tears down the connection. We don't
+                // propagate the TOS bit anywhere, but accepting the
+                // setsockopt is harmless and matches what most Linux
+                // configurations do for unprivileged sockets.
+                litebox_common_linux::IpOption::TOS => return Ok(()),
                 // Silently accept IP_RECVERR, IP_MTU_DISCOVER, IP_PKTINFO
                 // (used by glibc's DNS resolver; not yet tracked).
                 litebox_common_linux::IpOption::RECVERR
