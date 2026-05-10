@@ -10,6 +10,7 @@
 
 pub mod audit;
 pub mod fd_token_service;
+pub mod fd_token_socket;
 pub mod fd_tokens;
 pub mod net_proxy;
 pub mod nine_p;

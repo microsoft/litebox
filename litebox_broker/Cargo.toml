@@ -19,3 +19,6 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [target.'cfg(windows)'.dependencies]
 litebox_common_windows = { version = "0.1.0", path = "../litebox_common_windows", features = ["std"] }
+
+[dev-dependencies]
+tempfile = "3"
