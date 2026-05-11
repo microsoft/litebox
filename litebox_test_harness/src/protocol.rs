@@ -451,10 +451,6 @@ pub enum Command {
     #[serde(rename = "pipe_pair_id_unique")]
     PipePairIdUnique { count: u32 },
 
-    /// Call `getrandom(2)` once and report either bytes or positive errno.
-    #[serde(rename = "getrandom")]
-    Getrandom { n: u32, flags: String },
-
     /// Call io_uring_setup(2) once and report the kernel-visible outcome.
     #[serde(rename = "io_uring_setup")]
     IoUringSetup { entries: u32 },
@@ -685,10 +681,6 @@ pub enum Response {
     /// Readiness or wait predicate satisfied.
     #[serde(rename = "ready")]
     Ready,
-
-    /// `getrandom(2)` result. `errno` is a positive errno on failure.
-    #[serde(rename = "random_bytes")]
-    RandomBytes { hex: String, errno: Option<i32> },
 
     /// io_uring_setup(2) result. `errno` is a positive errno on failure.
     #[serde(rename = "io_uring_result")]

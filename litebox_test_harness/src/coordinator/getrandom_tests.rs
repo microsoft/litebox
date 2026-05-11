@@ -2,16 +2,18 @@
 // Licensed under the MIT license.
 
 //! getrandom(2) contract tests for VS Code startup coverage.
+//!
+//! Migrated to the typed-handler protocol. Each scenario declares one
+//! `HandlerToken<(), Out>` and performs its getrandom syscall sequence
+//! inline in the agent.
 
-use std::future::Future;
-use std::pin::Pin;
+use serde::{Deserialize, Serialize};
 
-use crate::protocol::{Command, Response};
+use crate::handlers::{HandlerCtx, HandlerError, HandlerToken};
+use crate::register_handler;
 
-use super::TestOutcome;
-use super::agents::{AgentHandle, AgentName};
+use super::agents::AgentName;
 use super::registry::Registry;
-use super::run_context::RunContext;
 
 const EAGAIN: i32 = libc::EAGAIN;
 
@@ -27,123 +29,170 @@ pub(crate) const RAND_AGENTS: &[AgentName] = &[
     AgentName::Dpg1Spm,  // static-PIE-musl — distinct getrandom code path (no ld.so)
 ];
 
-const RAND_SCENARIOS: &[RandScenario] = &[
-    RandScenario {
-        name: "size_exact",
-        run: run_size_exact,
-    },
-    RandScenario {
-        name: "novelty",
-        run: run_novelty,
-    },
-    RandScenario {
-        name: "nonblock_when_short",
-        run: run_nonblock_when_short,
-    },
-];
+// ─── Outputs ────────────────────────────────────────────────────────
 
-struct RandScenario {
-    name: &'static str,
-    run: for<'a, 'r> fn(&'a mut RunContext<'r>, &'a AgentHandle) -> RandFuture<'a>,
+#[derive(Serialize, Deserialize, Debug)]
+struct SizeExactOut {
+    hex_len: usize,
 }
 
-type RandFuture<'a> = Pin<Box<dyn Future<Output = Result<String, String>> + 'a>>;
+#[derive(Serialize, Deserialize, Debug)]
+struct NoveltyOut {
+    first_hex_len: usize,
+    second_hex_len: usize,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+struct NonblockWhenShortOut {
+    hex_len: usize,
+    errno: Option<i32>,
+}
+
+// ─── Tokens ─────────────────────────────────────────────────────────
+
+const SIZE_EXACT: HandlerToken<(), SizeExactOut> = HandlerToken::new("getrandom.size_exact");
+const NOVELTY: HandlerToken<(), NoveltyOut> = HandlerToken::new("getrandom.novelty");
+const NONBLOCK_WHEN_SHORT: HandlerToken<(), NonblockWhenShortOut> =
+    HandlerToken::new("getrandom.nonblock_when_short");
+
+// ─── Handlers ───────────────────────────────────────────────────────
+
+async fn handle_size_exact(
+    _args: (),
+    _ctx: &mut HandlerCtx<'_>,
+) -> Result<SizeExactOut, HandlerError> {
+    let sample = getrandom_bytes(32, 0);
+    match sample {
+        RandomBytes { bytes, errno: None } if bytes.len() == 32 => Ok(SizeExactOut {
+            hex_len: bytes.len() * 2,
+        }),
+        other => Err(HandlerError(format!(
+            "expected 32-byte success as 64 hex chars, got {other:?}"
+        ))),
+    }
+}
+
+async fn handle_novelty(_args: (), _ctx: &mut HandlerCtx<'_>) -> Result<NoveltyOut, HandlerError> {
+    let first = getrandom_bytes(32, 0);
+    let second = getrandom_bytes(32, 0);
+    match (first, second) {
+        (
+            RandomBytes {
+                bytes: first_bytes,
+                errno: None,
+            },
+            RandomBytes {
+                bytes: second_bytes,
+                errno: None,
+            },
+        ) if first_bytes.len() == 32 && second_bytes.len() == 32 && first_bytes != second_bytes => {
+            Ok(NoveltyOut {
+                first_hex_len: first_bytes.len() * 2,
+                second_hex_len: second_bytes.len() * 2,
+            })
+        }
+        (first, second) => Err(HandlerError(format!(
+            "expected two distinct 32-byte successes, got first={first:?}; second={second:?}"
+        ))),
+    }
+}
+
+async fn handle_nonblock_when_short(
+    _args: (),
+    _ctx: &mut HandlerCtx<'_>,
+) -> Result<NonblockWhenShortOut, HandlerError> {
+    let sample = getrandom_bytes(4096, libc::GRND_NONBLOCK);
+    match sample {
+        RandomBytes { bytes, errno: None } if bytes.len() == 4096 => Ok(NonblockWhenShortOut {
+            hex_len: bytes.len() * 2,
+            errno: None,
+        }),
+        RandomBytes {
+            bytes,
+            errno: Some(EAGAIN),
+        } if bytes.is_empty() => Ok(NonblockWhenShortOut {
+            hex_len: 0,
+            errno: Some(EAGAIN),
+        }),
+        other => Err(HandlerError(format!(
+            "expected full 4096-byte success or EAGAIN with no bytes, got {other:?}"
+        ))),
+    }
+}
+
+// ─── Registration ──────────────────────────────────────────────────
 
 pub(crate) fn register_getrandom_tests(reg: &mut Registry<'_>) {
+    register_handler!(SIZE_EXACT, handle_size_exact);
+    register_handler!(NOVELTY, handle_novelty);
+    register_handler!(NONBLOCK_WHEN_SHORT, handle_nonblock_when_short);
+
     for &agent in RAND_AGENTS {
-        for def in RAND_SCENARIOS {
-            let agent_s = agent.to_string();
-            let name = def.name;
-            let run_scenario = def.run;
-            reg.test("vscode", "getrandom", format!("RAND.{name}.{agent}"))
-                .timeout(30)
-                .build(move |cx| {
-                    let handle = cx.require(agent);
-                    Box::new(move |run| {
-                        let a = agent_s.clone();
-                        Box::pin(async move { outcome(&a, run_scenario(run, &handle).await) })
-                    })
-                });
+        reg.single_agent_handler_test(
+            "vscode",
+            "getrandom",
+            format!("RAND.size_exact.{agent}"),
+            agent,
+            &SIZE_EXACT,
+            |out| Ok(format!("hex_len={}", out.hex_len)),
+        );
+        reg.single_agent_handler_test(
+            "vscode",
+            "getrandom",
+            format!("RAND.novelty.{agent}"),
+            agent,
+            &NOVELTY,
+            |_out| Ok("two 32-byte samples differed".to_string()),
+        );
+        reg.single_agent_handler_test(
+            "vscode",
+            "getrandom",
+            format!("RAND.nonblock_when_short.{agent}"),
+            agent,
+            &NONBLOCK_WHEN_SHORT,
+            |out| match out.errno {
+                None => Ok(format!("nonblock_success_hex_len={}", out.hex_len)),
+                Some(EAGAIN) => Ok("nonblock_eagain".to_string()),
+                Some(errno) => Err(format!("unexpected errno {errno}")),
+            },
+        );
+    }
+}
+
+#[derive(Debug)]
+struct RandomBytes {
+    bytes: Vec<u8>,
+    errno: Option<i32>,
+}
+
+fn getrandom_bytes(n: usize, flags: u32) -> RandomBytes {
+    let mut buf = vec![0_u8; n];
+    // SAFETY: `buf` is a valid writable byte buffer of length `n` for the
+    // duration of the getrandom syscall. The kernel writes at most `n` bytes
+    // and does not retain the pointer.
+    let ret = unsafe {
+        libc::syscall(
+            libc::SYS_getrandom,
+            buf.as_mut_ptr(),
+            n as libc::size_t,
+            flags,
+        )
+    };
+    if ret >= 0 {
+        let bytes_read = usize::try_from(ret).expect("nonnegative getrandom byte count fits usize");
+        buf.truncate(bytes_read);
+        RandomBytes {
+            bytes: buf,
+            errno: None,
+        }
+    } else {
+        RandomBytes {
+            bytes: Vec::new(),
+            errno: Some(errno()),
         }
     }
 }
 
-fn outcome(agent: &str, result: Result<String, String>) -> TestOutcome {
-    match result {
-        Ok(detail) => TestOutcome::new(agent, true, detail),
-        Err(detail) => TestOutcome::new(agent, false, detail),
-    }
-}
-
-fn run_size_exact<'a>(run: &'a mut RunContext<'_>, agent: &'a AgentHandle) -> RandFuture<'a> {
-    Box::pin(async move {
-        let resp = getrandom(run, agent, 32, "").await;
-        match resp {
-            Response::RandomBytes { hex, errno: None } if hex.len() == 64 => {
-                Ok(format!("hex_len={}", hex.len()))
-            }
-            other => Err(format!(
-                "expected 32-byte success as 64 hex chars, got {other:?}"
-            )),
-        }
-    })
-}
-
-fn run_novelty<'a>(run: &'a mut RunContext<'_>, agent: &'a AgentHandle) -> RandFuture<'a> {
-    Box::pin(async move {
-        let first = getrandom(run, agent, 32, "").await;
-        let second = getrandom(run, agent, 32, "").await;
-        match (first, second) {
-            (
-                Response::RandomBytes {
-                    hex: first_hex,
-                    errno: None,
-                },
-                Response::RandomBytes {
-                    hex: second_hex,
-                    errno: None,
-                },
-            ) if first_hex.len() == 64 && second_hex.len() == 64 && first_hex != second_hex => {
-                Ok("two 32-byte samples differed".to_string())
-            }
-            (first, second) => Err(format!(
-                "expected two distinct 32-byte successes, got first={first:?}; second={second:?}"
-            )),
-        }
-    })
-}
-
-fn run_nonblock_when_short<'a>(
-    run: &'a mut RunContext<'_>,
-    agent: &'a AgentHandle,
-) -> RandFuture<'a> {
-    Box::pin(async move {
-        let resp = getrandom(run, agent, 4096, "nonblock").await;
-        // With GRND_NONBLOCK, Linux may either return the full request
-        // when entropy is available or fail with EAGAIN without bytes.
-        // Both outcomes are legitimate; a short success is not.
-        match resp {
-            Response::RandomBytes { hex, errno: None } if hex.len() == 8192 => {
-                Ok(format!("nonblock_success_hex_len={}", hex.len()))
-            }
-            Response::RandomBytes {
-                hex,
-                errno: Some(EAGAIN),
-            } if hex.is_empty() => Ok("nonblock_eagain".to_string()),
-            other => Err(format!(
-                "expected full 4096-byte success or EAGAIN with no bytes, got {other:?}"
-            )),
-        }
-    })
-}
-
-async fn getrandom(run: &mut RunContext<'_>, agent: &AgentHandle, n: u32, flags: &str) -> Response {
-    run.send(
-        agent,
-        Command::Getrandom {
-            n,
-            flags: flags.to_string(),
-        },
-    )
-    .await
+fn errno() -> i32 {
+    std::io::Error::last_os_error().raw_os_error().unwrap_or(0)
 }
