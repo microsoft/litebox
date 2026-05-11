@@ -7,7 +7,6 @@
 
 use crate::protocol::{Command, EpollEvent, FdRef, Response, SockOpt, SockOptValue, WaitPredicate};
 use std::collections::HashMap;
-use std::ffi::CString;
 use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd};
 use std::os::unix::net::{UnixListener as StdUnixListener, UnixStream as StdUnixStream};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -43,14 +42,6 @@ enum BackgroundProcess {
         stderr: Arc<Mutex<Vec<u8>>>,
         drains: Vec<tokio::task::JoinHandle<()>>,
     },
-    RawPid {
-        pid: libc::pid_t,
-    },
-}
-
-struct PtyMaster {
-    fd: OwnedFd,
-    slave_path: String,
 }
 
 fn errno() -> i32 {
@@ -143,8 +134,6 @@ pub(crate) struct AgentState {
     next_conn_id: u64,
     eventfds: HashMap<u64, EventfdEntry>,
     next_eventfd_id: u64,
-    pty_masters: HashMap<u64, PtyMaster>,
-    next_pty_id: u64,
     epolls: HashMap<u64, EpollEntry>,
     next_epoll_id: u64,
     background_pids: HashMap<u32, BackgroundProcess>,
@@ -163,8 +152,6 @@ impl AgentState {
             next_conn_id: 1,
             eventfds: HashMap::new(),
             next_eventfd_id: 1,
-            pty_masters: HashMap::new(),
-            next_pty_id: 1,
             epolls: HashMap::new(),
             next_epoll_id: 1,
             background_pids: HashMap::new(),
@@ -209,8 +196,6 @@ async fn agent_loop(self_exe: &str) {
         next_conn_id,
         eventfds,
         next_eventfd_id,
-        pty_masters,
-        next_pty_id,
         epolls,
         next_epoll_id,
         background_pids,
@@ -1324,37 +1309,6 @@ async fn agent_loop(self_exe: &str) {
                             .await;
                         }
                     },
-                    BackgroundProcess::RawPid { pid: raw_pid } => {
-                        let wait = tokio::task::spawn_blocking(move || wait_raw_child(raw_pid));
-                        match tokio::time::timeout(timeout, wait).await {
-                            Ok(Ok(Ok(status))) => {
-                                respond(&Response::ExecResult {
-                                    exit_code: status,
-                                    stdout: String::new(),
-                                    stderr: String::new(),
-                                })
-                                .await;
-                            }
-                            Ok(Ok(Err(error))) => respond(&Response::Error { error }).await,
-                            Ok(Err(error)) => {
-                                respond(&Response::Error {
-                                    error: format!("wait_background join: {error}"),
-                                })
-                                .await;
-                            }
-                            Err(_) => {
-                                // SAFETY: raw_pid came from fork and still denotes the child we own.
-                                let _ = unsafe { libc::kill(raw_pid, libc::SIGKILL) };
-                                respond(&Response::ExecTimeout {
-                                    stderr: format!(
-                                        "background process timed out after {}s",
-                                        timeout.as_secs()
-                                    ),
-                                })
-                                .await;
-                            }
-                        }
-                    }
                 }
             }
 
@@ -1773,100 +1727,6 @@ async fn agent_loop(self_exe: &str) {
                     }
                 }
                 respond(&Response::Ok { data: None }).await;
-            }
-
-            Command::PtyOpen {} => {
-                if *next_pty_id == u64::MAX {
-                    respond(&Response::Error {
-                        error: "pty id space exhausted".to_string(),
-                    })
-                    .await;
-                    continue;
-                }
-                match open_pty_master() {
-                    Ok(master_entry) => {
-                        let master = *next_pty_id;
-                        *next_pty_id += 1;
-                        let slave_path = master_entry.slave_path.clone();
-                        pty_masters.insert(master, master_entry);
-                        respond(&Response::PtyHandle { master, slave_path }).await;
-                    }
-                    Err(error) => respond(&Response::Error { error }).await,
-                }
-            }
-
-            Command::PtyExec {
-                master,
-                args,
-                ctrl_tty,
-            } => {
-                let Some(pty) = pty_masters.get(&master) else {
-                    respond(&Response::Error {
-                        error: format!("unknown pty master {master}"),
-                    })
-                    .await;
-                    continue;
-                };
-                match fork_exec_pty(pty, &args, ctrl_tty) {
-                    Ok(pid) => {
-                        background_pids.insert(pid as u32, BackgroundProcess::RawPid { pid });
-                        respond(&Response::Background { pid: pid as u32 }).await;
-                    }
-                    Err(error) => respond(&Response::Error { error }).await,
-                }
-            }
-
-            Command::PtyWrite { master, data } => {
-                let Some(pty) = pty_masters.get(&master) else {
-                    respond(&Response::Error {
-                        error: format!("unknown pty master {master}"),
-                    })
-                    .await;
-                    continue;
-                };
-                match write_all_fd(pty.fd.as_raw_fd(), data.as_bytes()) {
-                    Ok(()) => respond(&Response::Sent).await,
-                    Err(error) => respond(&Response::Error { error }).await,
-                }
-            }
-
-            Command::PtyRead { master, n_bytes } => {
-                let Some(pty) = pty_masters.get(&master) else {
-                    respond(&Response::Error {
-                        error: format!("unknown pty master {master}"),
-                    })
-                    .await;
-                    continue;
-                };
-                match read_pty(pty.fd.as_raw_fd(), n_bytes) {
-                    Ok(data) => respond(&Response::Received { data }).await,
-                    Err(error) => respond(&Response::Error { error }).await,
-                }
-            }
-
-            Command::PtyResize { master, rows, cols } => {
-                let Some(pty) = pty_masters.get(&master) else {
-                    respond(&Response::Error {
-                        error: format!("unknown pty master {master}"),
-                    })
-                    .await;
-                    continue;
-                };
-                match resize_pty(pty.fd.as_raw_fd(), rows, cols) {
-                    Ok(()) => respond(&Response::Ok { data: None }).await,
-                    Err(error) => respond(&Response::Error { error }).await,
-                }
-            }
-
-            Command::PtyClose { master } => {
-                if pty_masters.remove(&master).is_some() {
-                    respond(&Response::Closed).await;
-                } else {
-                    respond(&Response::Error {
-                        error: format!("unknown pty master {master}"),
-                    })
-                    .await;
-                }
             }
 
             Command::NetConnectMany {
@@ -2725,225 +2585,6 @@ async fn respond(resp: &Response) {
     let _ = stdout.flush().await;
 }
 
-fn open_pty_master() -> Result<PtyMaster, String> {
-    // SAFETY: posix_openpt returns a fresh master fd on success.
-    let fd = unsafe { libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY | libc::O_CLOEXEC) };
-    if fd < 0 {
-        return Err(format!("posix_openpt: {}", std::io::Error::last_os_error()));
-    }
-    // SAFETY: fd is a newly opened descriptor and ownership is transferred.
-    let master = unsafe { OwnedFd::from_raw_fd(fd) };
-    // SAFETY: grantpt operates on the live pty master fd without taking ownership.
-    if unsafe { libc::grantpt(master.as_raw_fd()) } != 0 {
-        return Err(format!("grantpt: {}", std::io::Error::last_os_error()));
-    }
-    // SAFETY: unlockpt operates on the live pty master fd without taking ownership.
-    if unsafe { libc::unlockpt(master.as_raw_fd()) } != 0 {
-        return Err(format!("unlockpt: {}", std::io::Error::last_os_error()));
-    }
-    let mut buf = vec![0i8; 128];
-    // SAFETY: buf is valid writable storage and master is a live pty master fd.
-    let pts_rc = unsafe { libc::ptsname_r(master.as_raw_fd(), buf.as_mut_ptr(), buf.len()) };
-    if pts_rc != 0 {
-        return Err(format!(
-            "ptsname_r: {}",
-            std::io::Error::from_raw_os_error(pts_rc)
-        ));
-    }
-    let nul = buf
-        .iter()
-        .position(|&b| b == 0)
-        .ok_or_else(|| "ptsname_r returned unterminated path".to_string())?;
-    let slave_path = String::from_utf8(
-        buf[..nul]
-            .iter()
-            .map(|&b| u8::try_from(b).unwrap_or_default())
-            .collect(),
-    )
-    .map_err(|e| format!("ptsname utf8: {e}"))?;
-    set_nonblocking(master.as_raw_fd())?;
-    Ok(PtyMaster {
-        fd: master,
-        slave_path,
-    })
-}
-
-fn set_nonblocking(fd: i32) -> Result<(), String> {
-    // SAFETY: fcntl(F_GETFL) reads flags from a live fd.
-    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
-    if flags < 0 {
-        return Err(format!(
-            "fcntl getfl fd {fd}: {}",
-            std::io::Error::last_os_error()
-        ));
-    }
-    // SAFETY: fcntl(F_SETFL) updates flags on the same live fd.
-    if unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } != 0 {
-        return Err(format!(
-            "fcntl nonblock fd {fd}: {}",
-            std::io::Error::last_os_error()
-        ));
-    }
-    Ok(())
-}
-
-fn fork_exec_pty(pty: &PtyMaster, args: &[String], ctrl_tty: bool) -> Result<libc::pid_t, String> {
-    if args.is_empty() {
-        return Err("pty_exec requires args".to_string());
-    }
-    let slave_path =
-        CString::new(pty.slave_path.as_str()).map_err(|e| format!("slave path: {e}"))?;
-    let c_args: Vec<CString> = args
-        .iter()
-        .map(|arg| CString::new(arg.as_str()).map_err(|e| format!("arg contains nul: {e}")))
-        .collect::<Result<_, _>>()?;
-    let mut argv: Vec<*const libc::c_char> = c_args.iter().map(|arg| arg.as_ptr()).collect();
-    argv.push(std::ptr::null());
-    let master_fd = pty.fd.as_raw_fd();
-    // SAFETY: fork creates a child process. The child only calls libc syscalls
-    // and execvp before _exit, avoiding Rust destructors after fork.
-    let pid = unsafe { libc::fork() };
-    if pid < 0 {
-        return Err(format!("fork: {}", std::io::Error::last_os_error()));
-    }
-    if pid == 0 {
-        // SAFETY: child process setup before exec; failures exit immediately.
-        unsafe {
-            if libc::setsid() < 0 {
-                libc::_exit(126);
-            }
-            let slave_fd = libc::open(slave_path.as_ptr(), libc::O_RDWR | libc::O_NOCTTY);
-            if slave_fd < 0 {
-                libc::_exit(126);
-            }
-            if ctrl_tty && libc::ioctl(slave_fd, libc::TIOCSCTTY, 0) < 0 {
-                libc::_exit(126);
-            }
-            for target in 0..=2 {
-                if slave_fd != target && libc::dup3(slave_fd, target, 0) < 0 {
-                    libc::_exit(126);
-                }
-            }
-            if slave_fd > 2 {
-                libc::close(slave_fd);
-            }
-            libc::close(master_fd);
-            libc::execvp(c_args[0].as_ptr(), argv.as_ptr());
-            libc::_exit(127);
-        }
-    }
-    Ok(pid)
-}
-
-fn write_all_fd(fd: i32, mut data: &[u8]) -> Result<(), String> {
-    while !data.is_empty() {
-        // SAFETY: data points to readable memory and fd is a live pty master.
-        let n = unsafe { libc::write(fd, data.as_ptr().cast(), data.len()) };
-        if n < 0 {
-            let err = std::io::Error::last_os_error();
-            if matches!(err.raw_os_error(), Some(libc::EINTR | libc::EAGAIN)) {
-                continue;
-            }
-            return Err(format!("pty write fd {fd}: {err}"));
-        }
-        data = &data[n as usize..];
-    }
-    Ok(())
-}
-
-fn read_pty(fd: i32, n_bytes: Option<u32>) -> Result<String, String> {
-    let target = n_bytes.map(|n| n as usize);
-    let mut out = Vec::new();
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-    loop {
-        if target.is_some_and(|want| out.len() >= want) {
-            break;
-        }
-        let now = std::time::Instant::now();
-        if now >= deadline {
-            if target.is_none() && !out.is_empty() {
-                break;
-            }
-            return Err(format!("pty read fd {fd}: timeout"));
-        }
-        let remaining = deadline.saturating_duration_since(now).as_millis();
-        let timeout_ms = i32::try_from(remaining.min(1000)).unwrap_or(1000);
-        let mut pollfd = libc::pollfd {
-            fd,
-            events: libc::POLLIN | libc::POLLHUP | libc::POLLERR,
-            revents: 0,
-        };
-        // SAFETY: pollfd points to one valid pollfd entry for this call.
-        let ready = unsafe { libc::poll(&mut pollfd, 1, timeout_ms) };
-        if ready < 0 {
-            let err = std::io::Error::last_os_error();
-            if err.raw_os_error() == Some(libc::EINTR) {
-                continue;
-            }
-            return Err(format!("pty poll fd {fd}: {err}"));
-        }
-        if ready == 0 {
-            continue;
-        }
-        let mut buf = [0u8; 4096];
-        let want = target.map_or(buf.len(), |n| (n - out.len()).min(buf.len()));
-        // SAFETY: buf is valid writable memory and fd is a live pty master.
-        let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), want) };
-        if n > 0 {
-            out.extend_from_slice(&buf[..n as usize]);
-            continue;
-        }
-        if n == 0 {
-            break;
-        }
-        let err = std::io::Error::last_os_error();
-        match err.raw_os_error() {
-            Some(libc::EINTR | libc::EAGAIN) => continue,
-            Some(libc::EIO) if target.is_none() => break,
-            _ => return Err(format!("pty read fd {fd}: {err}")),
-        }
-    }
-    Ok(String::from_utf8_lossy(&out).to_string())
-}
-
-fn resize_pty(fd: i32, rows: u16, cols: u16) -> Result<(), String> {
-    let ws = libc::winsize {
-        ws_row: rows,
-        ws_col: cols,
-        ws_xpixel: 0,
-        ws_ypixel: 0,
-    };
-    // SAFETY: ioctl TIOCSWINSZ reads the provided winsize for a live pty fd.
-    if unsafe { libc::ioctl(fd, libc::TIOCSWINSZ, &raw const ws) } != 0 {
-        return Err(format!(
-            "TIOCSWINSZ fd {fd}: {}",
-            std::io::Error::last_os_error()
-        ));
-    }
-    Ok(())
-}
-
-fn wait_raw_child(pid: libc::pid_t) -> Result<i32, String> {
-    let mut status = 0;
-    loop {
-        // SAFETY: waiting for a child pid returned by fork in this process.
-        let rc = unsafe { libc::waitpid(pid, &raw mut status, 0) };
-        if rc == pid {
-            if libc::WIFEXITED(status) {
-                return Ok(libc::WEXITSTATUS(status));
-            }
-            if libc::WIFSIGNALED(status) {
-                return Ok(128 + libc::WTERMSIG(status));
-            }
-            return Ok(-1);
-        }
-        let err = std::io::Error::last_os_error();
-        if err.raw_os_error() != Some(libc::EINTR) {
-            return Err(format!("waitpid {pid}: {err}"));
-        }
-    }
-}
-
 fn terminate_background(child: BackgroundProcess) {
     match child {
         BackgroundProcess::Tokio {
@@ -2955,10 +2596,6 @@ fn terminate_background(child: BackgroundProcess) {
             for drain in drains {
                 drain.abort();
             }
-        }
-        BackgroundProcess::RawPid { pid } => {
-            // SAFETY: pid is a child process previously returned by fork.
-            let _ = unsafe { libc::kill(pid, libc::SIGKILL) };
         }
     }
 }

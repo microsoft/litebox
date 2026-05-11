@@ -319,11 +319,11 @@ pub enum Command {
     #[serde(rename = "unix_connect")]
     UnixConnect { path: String, data: String },
 
-    /// Create a local AF_UNIX SOCK_STREAM socketpair and register both endpoints.
+    /// Create a local `AF_UNIX` `SOCK_STREAM` socketpair and register both endpoints.
     #[serde(rename = "unix_pair")]
     UnixPair {},
 
-    /// Bind a registered Unix stream listener for cross-agent SCM_RIGHTS tests.
+    /// Bind a registered Unix stream listener for cross-agent `SCM_RIGHTS` tests.
     #[serde(rename = "unix_pair_listen")]
     UnixPairListen { path: String },
 
@@ -335,7 +335,7 @@ pub enum Command {
     #[serde(rename = "unix_pair_accept")]
     UnixPairAccept { path: String },
 
-    /// Send one or more registered fds as SCM_RIGHTS over a registered Unix endpoint.
+    /// Send one or more registered fds as `SCM_RIGHTS` over a registered Unix endpoint.
     /// The agent prepends one type-tag byte per fd (E/T/U) to the payload so the
     /// receiver can register each received fd in the matching registry.
     #[serde(rename = "unix_send_fd")]
@@ -345,7 +345,7 @@ pub enum Command {
         payload: String,
     },
 
-    /// Receive fds sent with SCM_RIGHTS over a registered Unix endpoint.
+    /// Receive fds sent with `SCM_RIGHTS` over a registered Unix endpoint.
     #[serde(rename = "unix_recv_fd")]
     UnixRecvFd { socket: u64, max_payload: u32 },
 
@@ -383,34 +383,6 @@ pub enum Command {
         data: String,
     },
 
-    /// Open a pseudo-terminal pair and register the master fd.
-    #[serde(rename = "pty_open")]
-    PtyOpen {},
-
-    /// Fork+exec `args` with stdio attached to a registered pty slave.
-    #[serde(rename = "pty_exec")]
-    PtyExec {
-        master: u64,
-        args: Vec<String>,
-        ctrl_tty: bool,
-    },
-
-    /// Write bytes to a registered pty master.
-    #[serde(rename = "pty_write")]
-    PtyWrite { master: u64, data: String },
-
-    /// Read bytes from a registered pty master. None means read until EOF.
-    #[serde(rename = "pty_read")]
-    PtyRead { master: u64, n_bytes: Option<u32> },
-
-    /// Resize the terminal window for a registered pty master.
-    #[serde(rename = "pty_resize")]
-    PtyResize { master: u64, rows: u16, cols: u16 },
-
-    /// Close and unregister a pty master.
-    #[serde(rename = "pty_close")]
-    PtyClose { master: u64 },
-
     /// Connect to `addr`, send `size` bytes, read file at `path`, then read
     /// echoed TCP data. Reports both file content and TCP integrity. Tests for
     /// 9P deadlock when file I/O happens while TCP sockets are active.
@@ -438,7 +410,7 @@ pub enum Command {
     PipePairIdUnique { count: u32 },
 
 
-    /// Call epoll_create1(2) once and report whether a descriptor was returned.
+    /// Call `epoll_create1(2)` once and report whether a descriptor was returned.
     #[serde(rename = "epoll_open")]
     EpollOpen,
 
@@ -458,7 +430,7 @@ pub enum Command {
     #[serde(rename = "eventfd_read")]
     EventfdRead { id: u64 },
 
-    /// Read one u64 on behalf of a reader authorized via EventfdShare. This
+    /// Read one u64 on behalf of a reader authorized via `EventfdShare`. This
     /// models the layer-1 forward-via-creator path without passing fds.
     #[serde(rename = "eventfd_read_shared")]
     EventfdReadShared { id: u64, reader: String },
@@ -473,7 +445,7 @@ pub enum Command {
 
     /// Mark a named agent as an authorized reader of this creator-local
     /// eventfd. Layer 1 deliberately models sharing as forwarding a command
-    /// through the creator's registry, not as SCM_RIGHTS fd passing.
+    /// through the creator's registry, not as `SCM_RIGHTS` fd passing.
     #[serde(rename = "eventfd_share")]
     EventfdShare { id: u64, target: String },
 
@@ -554,15 +526,11 @@ pub enum Response {
     #[serde(rename = "opened")]
     Opened { conn: u64 },
 
-    /// PTY master handle and slave path.
-    #[serde(rename = "pty_handle")]
-    PtyHandle { master: u64, slave_path: String },
-
     /// Registered Unix socketpair endpoint handles.
     #[serde(rename = "unix_pair_handle")]
     UnixPairHandle { left: u64, right: u64 },
 
-    /// Fds received through SCM_RIGHTS and registered locally.
+    /// Fds received through `SCM_RIGHTS` and registered locally.
     #[serde(rename = "received_fd")]
     ReceivedFd {
         received: Vec<FdRef>,
@@ -638,7 +606,7 @@ pub enum Response {
     Ready,
 
 
-    /// epoll_create1(2) result. `errno` is a positive errno on failure.
+    /// `epoll_create1(2)` result. `errno` is a positive errno on failure.
     #[serde(rename = "epoll_open_result")]
     EpollOpenResult { epoll_fd: i32, errno: Option<i32> },
 
