@@ -348,6 +348,11 @@ pub fn build_audit_event(
         }
     }
 
+    // Canonical syscall name is determined exhaustively up-front so that even
+    // variants we don't unpack arguments for still get the right name (instead
+    // of falling through to a generic "other" bucket).
+    let name = syscall_canonical_name(request);
+
     match request {
         // --- File operations ---
         SyscallRequest::Openat {
@@ -356,7 +361,7 @@ pub fn build_audit_event(
             flags,
             mode,
         } => {
-            let mut ev = AuditEvent::new("openat");
+            let mut ev = AuditEvent::new(name);
             ev.fd(*dirfd);
             record_path(&mut ev, *pathname);
             ev.int(u64::from(flags.bits()));
@@ -364,20 +369,45 @@ pub fn build_audit_event(
             ev
         }
         SyscallRequest::Read { fd, count, .. } => {
-            let mut ev = AuditEvent::new("read");
+            let mut ev = AuditEvent::new(name);
             ev.fd(*fd);
             ev.int(*count as u64);
             ev
         }
         SyscallRequest::Write { fd, count, .. } => {
-            let mut ev = AuditEvent::new("write");
+            let mut ev = AuditEvent::new(name);
             ev.fd(*fd);
             ev.int(*count as u64);
             ev
         }
         SyscallRequest::Close { fd } => {
-            let mut ev = AuditEvent::new("close");
+            let mut ev = AuditEvent::new(name);
             ev.fd(*fd);
+            ev
+        }
+        SyscallRequest::Lseek { fd, offset, whence } => {
+            let mut ev = AuditEvent::new(name);
+            ev.fd(*fd);
+            ev.int(*offset as u64);
+            ev.int(*whence as u64);
+            ev
+        }
+        SyscallRequest::Pread64 {
+            fd, count, offset, ..
+        }
+        | SyscallRequest::Pwrite64 {
+            fd, count, offset, ..
+        } => {
+            let mut ev = AuditEvent::new(name);
+            ev.fd(*fd);
+            ev.int(*count as u64);
+            ev.int(*offset as u64);
+            ev
+        }
+        SyscallRequest::Readv { fd, iovcnt, .. } | SyscallRequest::Writev { fd, iovcnt, .. } => {
+            let mut ev = AuditEvent::new(name);
+            ev.fd(*fd);
+            ev.int(*iovcnt as u64);
             ev
         }
         SyscallRequest::Unlinkat {
@@ -385,37 +415,370 @@ pub fn build_audit_event(
             pathname,
             flags,
         } => {
-            let mut ev = AuditEvent::new("unlinkat");
+            let mut ev = AuditEvent::new(name);
             ev.fd(*dirfd);
             record_path(&mut ev, *pathname);
             ev.int(flags.bits() as u64);
             ev
         }
         SyscallRequest::Mkdir { pathname, mode } => {
-            let mut ev = AuditEvent::new("mkdir");
+            let mut ev = AuditEvent::new(name);
             record_path(&mut ev, *pathname);
             ev.int(u64::from(*mode));
             ev
         }
-
-        // --- Process operations ---
-        SyscallRequest::Execve { pathname, .. } => {
-            let mut ev = AuditEvent::new("execve");
+        SyscallRequest::Mkdirat {
+            dirfd,
+            pathname,
+            mode,
+        } => {
+            let mut ev = AuditEvent::new(name);
+            ev.fd(*dirfd);
+            record_path(&mut ev, *pathname);
+            ev.int(u64::from(*mode));
+            ev
+        }
+        SyscallRequest::Chdir { pathname } => {
+            let mut ev = AuditEvent::new(name);
             record_path(&mut ev, *pathname);
             ev
         }
-        SyscallRequest::Exit { status } => {
-            let mut ev = AuditEvent::new("exit");
+        SyscallRequest::Fchdir { fd } => {
+            let mut ev = AuditEvent::new(name);
+            ev.fd(*fd);
+            ev
+        }
+        SyscallRequest::Renameat2 {
+            olddirfd,
+            oldpath,
+            newdirfd,
+            newpath,
+            flags,
+        } => {
+            let mut ev = AuditEvent::new(name);
+            ev.fd(*olddirfd);
+            record_path(&mut ev, *oldpath);
+            ev.fd(*newdirfd);
+            record_path(&mut ev, *newpath);
+            ev.int(u64::from(*flags));
+            ev
+        }
+        SyscallRequest::Symlinkat {
+            target,
+            newdirfd,
+            linkpath,
+        } => {
+            let mut ev = AuditEvent::new(name);
+            record_path(&mut ev, *target);
+            ev.fd(*newdirfd);
+            record_path(&mut ev, *linkpath);
+            ev
+        }
+        SyscallRequest::Linkat {
+            olddirfd,
+            oldpath,
+            newdirfd,
+            newpath,
+            flags,
+        } => {
+            let mut ev = AuditEvent::new(name);
+            ev.fd(*olddirfd);
+            record_path(&mut ev, *oldpath);
+            ev.fd(*newdirfd);
+            record_path(&mut ev, *newpath);
+            ev.int(flags.bits() as u64);
+            ev
+        }
+        SyscallRequest::Fchmod { fd, mode } => {
+            let mut ev = AuditEvent::new(name);
+            ev.fd(*fd);
+            ev.int(u64::from(*mode));
+            ev
+        }
+        SyscallRequest::Fchmodat {
+            dirfd,
+            pathname,
+            mode,
+        } => {
+            let mut ev = AuditEvent::new(name);
+            ev.fd(*dirfd);
+            record_path(&mut ev, *pathname);
+            ev.int(u64::from(*mode));
+            ev
+        }
+        SyscallRequest::Ftruncate { fd, length } => {
+            let mut ev = AuditEvent::new(name);
+            ev.fd(*fd);
+            ev.int(*length as u64);
+            ev
+        }
+        SyscallRequest::Fsync { fd } | SyscallRequest::Fdatasync { fd } => {
+            let mut ev = AuditEvent::new(name);
+            ev.fd(*fd);
+            ev
+        }
+        SyscallRequest::Readlink { pathname, .. } => {
+            let mut ev = AuditEvent::new(name);
+            record_path(&mut ev, *pathname);
+            ev
+        }
+        SyscallRequest::Readlinkat {
+            dirfd, pathname, ..
+        } => {
+            let mut ev = AuditEvent::new(name);
+            ev.fd(*dirfd);
+            record_path(&mut ev, *pathname);
+            ev
+        }
+        SyscallRequest::Access { pathname, mode } => {
+            let mut ev = AuditEvent::new(name);
+            record_path(&mut ev, *pathname);
+            ev.int(mode.bits() as u64);
+            ev
+        }
+        SyscallRequest::Faccessat {
+            dirfd,
+            pathname,
+            mode,
+        } => {
+            let mut ev = AuditEvent::new(name);
+            ev.fd(*dirfd);
+            record_path(&mut ev, *pathname);
+            ev.int(mode.bits() as u64);
+            ev
+        }
+        SyscallRequest::Faccessat2 {
+            dirfd,
+            pathname,
+            mode,
+            flags,
+        } => {
+            let mut ev = AuditEvent::new(name);
+            ev.fd(*dirfd);
+            record_path(&mut ev, *pathname);
+            ev.int(mode.bits() as u64);
+            ev.int(flags.bits() as u64);
+            ev
+        }
+        SyscallRequest::Stat { pathname, .. } | SyscallRequest::Lstat { pathname, .. } => {
+            let mut ev = AuditEvent::new(name);
+            record_path(&mut ev, *pathname);
+            ev
+        }
+        SyscallRequest::Statx {
+            dirfd,
+            pathname,
+            flags,
+            mask,
+            ..
+        } => {
+            let mut ev = AuditEvent::new(name);
+            ev.fd(*dirfd);
+            record_path(&mut ev, *pathname);
+            ev.int(flags.bits() as u64);
+            ev.int(u64::from(*mask));
+            ev
+        }
+        SyscallRequest::Statfs { pathname, .. } => {
+            let mut ev = AuditEvent::new(name);
+            record_path(&mut ev, *pathname);
+            ev
+        }
+        SyscallRequest::Fstatfs { fd, .. } => {
+            let mut ev = AuditEvent::new(name);
+            ev.fd(*fd);
+            ev
+        }
+        SyscallRequest::Fadvise64 {
+            fd,
+            offset,
+            len,
+            advice,
+        } => {
+            let mut ev = AuditEvent::new(name);
+            ev.fd(*fd);
+            ev.int(*offset as u64);
+            ev.int(*len as u64);
+            ev.int(*advice as u64);
+            ev
+        }
+        SyscallRequest::CopyFileRange {
+            fd_in,
+            fd_out,
+            len,
+            flags,
+            ..
+        } => {
+            let mut ev = AuditEvent::new(name);
+            ev.fd(*fd_in);
+            ev.fd(*fd_out);
+            ev.int(*len as u64);
+            ev.int(u64::from(*flags));
+            ev
+        }
+        SyscallRequest::GetDirent64 { fd, count, .. } => {
+            let mut ev = AuditEvent::new(name);
+            ev.fd(*fd);
+            ev.int(*count as u64);
+            ev
+        }
+        SyscallRequest::Flock { fd, operation } => {
+            let mut ev = AuditEvent::new(name);
+            ev.fd(*fd);
+            ev.int(*operation as u64);
+            ev
+        }
+        SyscallRequest::Fallocate {
+            fd,
+            mode,
+            offset,
+            len,
+        } => {
+            let mut ev = AuditEvent::new(name);
+            ev.fd(*fd);
+            ev.int(*mode as u64);
+            ev.int(*offset as u64);
+            ev.int(*len as u64);
+            ev
+        }
+
+        // --- Xattr operations ---
+        SyscallRequest::XattrGetPath {
+            pathname,
+            name: xname,
+            ..
+        }
+        | SyscallRequest::XattrSetPath {
+            pathname,
+            name: xname,
+            ..
+        } => {
+            let mut ev = AuditEvent::new(name);
+            record_path(&mut ev, *pathname);
+            record_path(&mut ev, *xname);
+            ev
+        }
+        SyscallRequest::XattrListPath { pathname, .. } => {
+            let mut ev = AuditEvent::new(name);
+            record_path(&mut ev, *pathname);
+            ev
+        }
+        SyscallRequest::XattrGetFd {
+            fd, name: xname, ..
+        }
+        | SyscallRequest::XattrSetFd {
+            fd, name: xname, ..
+        } => {
+            let mut ev = AuditEvent::new(name);
+            ev.fd(*fd);
+            record_path(&mut ev, *xname);
+            ev
+        }
+        SyscallRequest::XattrListFd { fd } => {
+            let mut ev = AuditEvent::new(name);
+            ev.fd(*fd);
+            ev
+        }
+
+        // --- Process / signal operations ---
+        SyscallRequest::Execve { pathname, .. } => {
+            let mut ev = AuditEvent::new(name);
+            record_path(&mut ev, *pathname);
+            ev
+        }
+        SyscallRequest::Execveat {
+            dirfd,
+            pathname,
+            flags,
+            ..
+        } => {
+            let mut ev = AuditEvent::new(name);
+            ev.fd(*dirfd);
+            record_path(&mut ev, *pathname);
+            ev.int(*flags as u64);
+            ev
+        }
+        SyscallRequest::Exit { status } | SyscallRequest::ExitGroup { status } => {
+            let mut ev = AuditEvent::new(name);
             ev.int(*status as u64);
             ev
         }
-        SyscallRequest::ExitGroup { status } => {
-            let mut ev = AuditEvent::new("exit_group");
-            ev.int(*status as u64);
+        SyscallRequest::Clone { .. } | SyscallRequest::Clone3 { .. } => AuditEvent::new(name),
+        SyscallRequest::Kill { pid, sig } => {
+            let mut ev = AuditEvent::new(name);
+            ev.int(*pid as u64);
+            ev.int(*sig as u64);
             ev
         }
-        SyscallRequest::Clone { .. } => AuditEvent::new("clone"),
-        SyscallRequest::Clone3 { .. } => AuditEvent::new("clone3"),
+        SyscallRequest::Tkill { tid, sig } => {
+            let mut ev = AuditEvent::new(name);
+            ev.int(*tid as u64);
+            ev.int(*sig as u64);
+            ev
+        }
+        SyscallRequest::Tgkill { tgid, tid, sig } => {
+            let mut ev = AuditEvent::new(name);
+            ev.int(*tgid as u64);
+            ev.int(*tid as u64);
+            ev.int(*sig as u64);
+            ev
+        }
+        SyscallRequest::RtSigaction { signum, .. } => {
+            let mut ev = AuditEvent::new(name);
+            let debug_str = alloc::format!("{signum:?}");
+            let name_end = debug_str.find([' ', '(']).unwrap_or(debug_str.len());
+            ev.flags(&debug_str[..name_end]);
+            ev
+        }
+        SyscallRequest::RtSigprocmask { how, .. } => {
+            let mut ev = AuditEvent::new(name);
+            let debug_str = alloc::format!("{how:?}");
+            let name_end = debug_str.find([' ', '(']).unwrap_or(debug_str.len());
+            ev.flags(&debug_str[..name_end]);
+            ev
+        }
+        SyscallRequest::Wait4 { pid, options, .. } => {
+            let mut ev = AuditEvent::new(name);
+            ev.int(*pid as u64);
+            ev.int(*options as u64);
+            ev
+        }
+        SyscallRequest::Waitid {
+            idtype,
+            id,
+            options,
+            ..
+        } => {
+            let mut ev = AuditEvent::new(name);
+            ev.int(u64::from(*idtype));
+            ev.int(u64::from(*id));
+            ev.int(*options as u64);
+            ev
+        }
+        SyscallRequest::PidfdOpen { pid, flags } => {
+            let mut ev = AuditEvent::new(name);
+            ev.int(*pid as u64);
+            ev.int(u64::from(*flags));
+            ev
+        }
+        SyscallRequest::Setpgid { pid, pgid } => {
+            let mut ev = AuditEvent::new(name);
+            ev.int(*pid as u64);
+            ev.int(*pgid as u64);
+            ev
+        }
+        SyscallRequest::Getpgid { pid } | SyscallRequest::Getsid { pid } => {
+            let mut ev = AuditEvent::new(name);
+            ev.int(*pid as u64);
+            ev
+        }
+        SyscallRequest::Futex { args } => {
+            let mut ev = AuditEvent::new(name);
+            let debug_str = alloc::format!("{args:?}");
+            let name_end = debug_str.find([' ', '{', '(']).unwrap_or(debug_str.len());
+            ev.flags(&debug_str[..name_end]);
+            ev
+        }
 
         // --- Memory operations ---
         SyscallRequest::Mmap {
@@ -426,7 +789,7 @@ pub fn build_audit_event(
             fd,
             ..
         } => {
-            let mut ev = AuditEvent::new("mmap");
+            let mut ev = AuditEvent::new(name);
             ev.int(*addr as u64);
             ev.int(*length as u64);
             ev.int(prot.bits() as u64);
@@ -435,21 +798,34 @@ pub fn build_audit_event(
             ev
         }
         SyscallRequest::Mprotect { addr, length, prot } => {
-            let mut ev = AuditEvent::new("mprotect");
+            let mut ev = AuditEvent::new(name);
             ev.int(addr.as_usize() as u64);
             ev.int(*length as u64);
             ev.int(prot.bits() as u64);
             ev
         }
         SyscallRequest::Munmap { addr, length } => {
-            let mut ev = AuditEvent::new("munmap");
+            let mut ev = AuditEvent::new(name);
             ev.int(addr.as_usize() as u64);
             ev.int(*length as u64);
             ev
         }
         SyscallRequest::Brk { addr } => {
-            let mut ev = AuditEvent::new("brk");
+            let mut ev = AuditEvent::new(name);
             ev.int(addr.as_usize() as u64);
+            ev
+        }
+        SyscallRequest::Madvise {
+            addr,
+            length,
+            behavior,
+        } => {
+            let mut ev = AuditEvent::new(name);
+            ev.int(addr.as_usize() as u64);
+            ev.int(*length as u64);
+            let debug_str = alloc::format!("{behavior:?}");
+            let name_end = debug_str.find([' ', '(']).unwrap_or(debug_str.len());
+            ev.flags(&debug_str[..name_end]);
             ev
         }
 
@@ -459,7 +835,19 @@ pub fn build_audit_event(
             type_and_flags,
             protocol,
         } => {
-            let mut ev = AuditEvent::new("socket");
+            let mut ev = AuditEvent::new(name);
+            ev.int(u64::from(*domain));
+            ev.int(u64::from(*type_and_flags));
+            ev.int(u64::from(*protocol));
+            ev
+        }
+        SyscallRequest::Socketpair {
+            domain,
+            type_and_flags,
+            protocol,
+            ..
+        } => {
+            let mut ev = AuditEvent::new(name);
             ev.int(u64::from(*domain));
             ev.int(u64::from(*type_and_flags));
             ev.int(u64::from(*protocol));
@@ -470,7 +858,7 @@ pub fn build_audit_event(
             sockaddr,
             addrlen,
         } => {
-            let mut ev = AuditEvent::new("connect");
+            let mut ev = AuditEvent::new(name);
             ev.fd(*sockfd);
             // Try to parse sockaddr_in for AF_INET to emit dst_ip and dst_port.
             if *addrlen >= 8 {
@@ -509,28 +897,89 @@ pub fn build_audit_event(
         SyscallRequest::Bind {
             sockfd, addrlen, ..
         } => {
-            let mut ev = AuditEvent::new("bind");
+            let mut ev = AuditEvent::new(name);
             ev.fd(*sockfd);
             ev.int(*addrlen as u64);
             ev
         }
         SyscallRequest::Listen { sockfd, backlog } => {
-            let mut ev = AuditEvent::new("listen");
+            let mut ev = AuditEvent::new(name);
             ev.fd(*sockfd);
             ev.int(u64::from(*backlog));
             ev
         }
         SyscallRequest::Accept { sockfd, flags, .. } => {
-            let mut ev = AuditEvent::new("accept");
+            let mut ev = AuditEvent::new(name);
             ev.fd(*sockfd);
             ev.int(u64::from(flags.bits()));
             ev
         }
+        SyscallRequest::Sendto {
+            sockfd, len, flags, ..
+        } => {
+            let mut ev = AuditEvent::new(name);
+            ev.fd(*sockfd);
+            ev.int(*len as u64);
+            ev.int(u64::from(flags.bits()));
+            ev
+        }
+        SyscallRequest::Recvfrom {
+            sockfd, len, flags, ..
+        } => {
+            let mut ev = AuditEvent::new(name);
+            ev.fd(*sockfd);
+            ev.int(*len as u64);
+            ev.int(u64::from(flags.bits()));
+            ev
+        }
+        SyscallRequest::Sendmsg { sockfd, flags, .. } => {
+            let mut ev = AuditEvent::new(name);
+            ev.fd(*sockfd);
+            ev.int(u64::from(flags.bits()));
+            ev
+        }
+        SyscallRequest::Recvmsg { sockfd, flags, .. } => {
+            let mut ev = AuditEvent::new(name);
+            ev.fd(*sockfd);
+            ev.int(u64::from(flags.bits()));
+            ev
+        }
+        SyscallRequest::Sendmmsg {
+            sockfd,
+            vlen,
+            flags,
+            ..
+        } => {
+            let mut ev = AuditEvent::new(name);
+            ev.fd(*sockfd);
+            ev.int(u64::from(*vlen));
+            ev.int(u64::from(flags.bits()));
+            ev
+        }
+        SyscallRequest::Shutdown { sockfd, how } => {
+            let mut ev = AuditEvent::new(name);
+            ev.fd(*sockfd);
+            ev.int(*how as u64);
+            ev
+        }
+        SyscallRequest::Setsockopt {
+            sockfd,
+            level,
+            optname,
+            optlen,
+            ..
+        } => {
+            let mut ev = AuditEvent::new(name);
+            ev.fd(*sockfd);
+            ev.int(u64::from(*level));
+            ev.int(u64::from(*optname));
+            ev.int(*optlen as u64);
+            ev
+        }
 
-        // --- All other syscalls: log the name from Debug repr ---
         // Special case: Ioctl — record fd and command type.
         SyscallRequest::Ioctl { fd, arg } => {
-            let mut ev = AuditEvent::new("ioctl");
+            let mut ev = AuditEvent::new(name);
             ev.fd(*fd);
             let debug_str = alloc::format!("{arg:?}");
             let name_end = debug_str.find([' ', '(']).unwrap_or(debug_str.len());
@@ -540,22 +989,20 @@ pub fn build_audit_event(
 
         // --- fd-bearing syscalls that need explicit logging ---
         SyscallRequest::Fstat { fd, .. } => {
-            let mut ev = AuditEvent::new("fstat");
+            let mut ev = AuditEvent::new(name);
             ev.fd(*fd);
             ev
         }
         SyscallRequest::Newfstatat {
             dirfd, pathname, ..
         } => {
-            let mut ev = AuditEvent::new("newfstatat");
+            let mut ev = AuditEvent::new(name);
             ev.fd(*dirfd);
-            if let Some(p) = pathname.to_cstring() {
-                ev.path(p.to_str().unwrap_or("?"));
-            }
+            record_path(&mut ev, *pathname);
             ev
         }
         SyscallRequest::Fcntl { fd, arg } => {
-            let mut ev = AuditEvent::new("fcntl");
+            let mut ev = AuditEvent::new(name);
             ev.fd(*fd);
             let debug_str = alloc::format!("{arg:?}");
             let name_end = debug_str.find([' ', '(']).unwrap_or(debug_str.len());
@@ -563,7 +1010,7 @@ pub fn build_audit_event(
             ev
         }
         SyscallRequest::EpollCtl { epfd, op, fd, .. } => {
-            let mut ev = AuditEvent::new("epoll_ctl");
+            let mut ev = AuditEvent::new(name);
             ev.fd(*epfd);
             ev.int(*fd as u64);
             let debug_str = alloc::format!("{op:?}");
@@ -572,14 +1019,28 @@ pub fn build_audit_event(
             ev
         }
         SyscallRequest::EpollCreate { flags, .. } => {
-            let mut ev = AuditEvent::new("epoll_create");
+            let mut ev = AuditEvent::new(name);
             ev.int(u64::from(flags.bits()));
             ev
         }
         SyscallRequest::EpollPwait { epfd, timeout, .. } => {
-            let mut ev = AuditEvent::new("epoll_pwait");
+            let mut ev = AuditEvent::new(name);
             ev.fd(*epfd);
             // timeout is a TimeParam which isn't directly castable
+            let debug_str = alloc::format!("{timeout:?}");
+            ev.flags(&debug_str);
+            ev
+        }
+        SyscallRequest::Ppoll { nfds, timeout, .. } => {
+            let mut ev = AuditEvent::new(name);
+            ev.int(*nfds as u64);
+            let debug_str = alloc::format!("{timeout:?}");
+            ev.flags(&debug_str);
+            ev
+        }
+        SyscallRequest::Pselect { nfds, timeout, .. } => {
+            let mut ev = AuditEvent::new(name);
+            ev.int(u64::from(*nfds));
             let debug_str = alloc::format!("{timeout:?}");
             ev.flags(&debug_str);
             ev
@@ -590,44 +1051,347 @@ pub fn build_audit_event(
             optname,
             ..
         } => {
-            let mut ev = AuditEvent::new("getsockopt");
+            let mut ev = AuditEvent::new(name);
             ev.fd(*sockfd);
             ev.int(u64::from(*level));
             ev.int(u64::from(*optname));
             ev
         }
         SyscallRequest::Getsockname { sockfd, .. } => {
-            let mut ev = AuditEvent::new("getsockname");
+            let mut ev = AuditEvent::new(name);
             ev.fd(*sockfd);
             ev
         }
         SyscallRequest::Getpeername { sockfd, .. } => {
-            let mut ev = AuditEvent::new("getpeername");
+            let mut ev = AuditEvent::new(name);
             ev.fd(*sockfd);
             ev
         }
         SyscallRequest::Dup { oldfd, .. } => {
-            let mut ev = AuditEvent::new("dup");
+            let mut ev = AuditEvent::new(name);
             ev.fd(*oldfd);
             ev
         }
         SyscallRequest::Pipe2 { flags, .. } => {
-            let mut ev = AuditEvent::new("pipe2");
+            let mut ev = AuditEvent::new(name);
             ev.int(flags.bits() as u64);
             ev
         }
-        other => {
-            // Extract the variant name from the Debug representation.
-            // `SyscallRequest::Gettid` debugs as "Gettid", `SyscallRequest::Fcntl { fd, arg }`
-            // as "Fcntl { ... }". We take the first word as the syscall name.
-            let debug_str = alloc::format!("{other:?}");
-            let name_end = debug_str.find([' ', '{', '(']).unwrap_or(debug_str.len());
-            let name = &debug_str[..name_end];
-            let mut ev = AuditEvent::new("other");
-            // Store the variant name as a flags argument for visibility.
-            ev.flags(name);
+
+        // --- Eventfd / memfd / timerfd / inotify / signalfd-style fds ---
+        SyscallRequest::Eventfd2 { initval, flags } => {
+            let mut ev = AuditEvent::new(name);
+            ev.int(u64::from(*initval));
+            ev.int(u64::from(flags.bits()));
             ev
         }
+        SyscallRequest::MemfdCreate { name: mname, flags } => {
+            let mut ev = AuditEvent::new(name);
+            record_path(&mut ev, *mname);
+            ev.int(u64::from(flags.bits()));
+            ev
+        }
+        SyscallRequest::InotifyInit1 { flags } => {
+            let mut ev = AuditEvent::new(name);
+            ev.int(u64::from(flags.bits()));
+            ev
+        }
+        SyscallRequest::InotifyAddWatch { fd, pathname, mask } => {
+            let mut ev = AuditEvent::new(name);
+            ev.fd(*fd);
+            record_path(&mut ev, *pathname);
+            ev.int(u64::from(*mask));
+            ev
+        }
+        SyscallRequest::InotifyRmWatch { fd, wd } => {
+            let mut ev = AuditEvent::new(name);
+            ev.fd(*fd);
+            ev.int(*wd as u64);
+            ev
+        }
+        SyscallRequest::TimerfdCreate { clockid, flags } => {
+            let mut ev = AuditEvent::new(name);
+            ev.int(*clockid as u64);
+            ev.int(u64::from(flags.bits()));
+            ev
+        }
+        SyscallRequest::TimerfdSettime { fd, flags, .. } => {
+            let mut ev = AuditEvent::new(name);
+            ev.fd(*fd);
+            ev.int(u64::from(flags.bits()));
+            ev
+        }
+        SyscallRequest::TimerfdGettime { fd, .. } => {
+            let mut ev = AuditEvent::new(name);
+            ev.fd(*fd);
+            ev
+        }
+
+        // --- Clocks / time ---
+        SyscallRequest::ClockGettime { clockid, .. }
+        | SyscallRequest::ClockGetres { clockid, .. } => {
+            let mut ev = AuditEvent::new(name);
+            ev.int(*clockid as u64);
+            ev
+        }
+        SyscallRequest::ClockNanosleep { clockid, flags, .. } => {
+            let mut ev = AuditEvent::new(name);
+            ev.int(*clockid as u64);
+            ev.int(flags.bits() as u64);
+            ev
+        }
+
+        // --- POSIX timers ---
+        SyscallRequest::TimerCreate { clockid, .. } => {
+            let mut ev = AuditEvent::new(name);
+            ev.int(*clockid as u64);
+            ev
+        }
+        SyscallRequest::TimerSettime { timerid, flags, .. } => {
+            let mut ev = AuditEvent::new(name);
+            ev.int(*timerid as u64);
+            ev.int(*flags as u64);
+            ev
+        }
+        SyscallRequest::TimerGettime { timerid, .. }
+        | SyscallRequest::TimerDelete { timerid }
+        | SyscallRequest::TimerGetoverrun { timerid } => {
+            let mut ev = AuditEvent::new(name);
+            ev.int(*timerid as u64);
+            ev
+        }
+
+        // --- Misc with useful args ---
+        SyscallRequest::Prctl { args } => {
+            let mut ev = AuditEvent::new(name);
+            let debug_str = alloc::format!("{args:?}");
+            let name_end = debug_str.find([' ', '{', '(']).unwrap_or(debug_str.len());
+            ev.flags(&debug_str[..name_end]);
+            ev
+        }
+        SyscallRequest::Prlimit { pid, resource, .. } => {
+            let mut ev = AuditEvent::new(name);
+            ev.int(*pid as u64);
+            let debug_str = alloc::format!("{resource:?}");
+            let name_end = debug_str.find([' ', '(']).unwrap_or(debug_str.len());
+            ev.flags(&debug_str[..name_end]);
+            ev
+        }
+        SyscallRequest::Getrlimit { resource, .. } | SyscallRequest::Setrlimit { resource, .. } => {
+            let mut ev = AuditEvent::new(name);
+            let debug_str = alloc::format!("{resource:?}");
+            let name_end = debug_str.find([' ', '(']).unwrap_or(debug_str.len());
+            ev.flags(&debug_str[..name_end]);
+            ev
+        }
+        SyscallRequest::Umask { mask } => {
+            let mut ev = AuditEvent::new(name);
+            ev.int(u64::from(*mask));
+            ev
+        }
+        SyscallRequest::Alarm { seconds } => {
+            let mut ev = AuditEvent::new(name);
+            ev.int(u64::from(*seconds));
+            ev
+        }
+        SyscallRequest::GetRandom { count, flags, .. } => {
+            let mut ev = AuditEvent::new(name);
+            ev.int(*count as u64);
+            ev.int(flags.bits() as u64);
+            ev
+        }
+
+        // All remaining variants get the canonical name with no args.
+        // (The catch-all is reached only for variants that don't carry
+        // particularly useful arguments for audit-log analysis; they still
+        // get correctly named instead of bucketed under "other".)
+        _ => AuditEvent::new(name),
+    }
+}
+
+/// Map a [`SyscallRequest`] variant to its canonical snake_case Linux syscall
+/// name. This is the single source of truth for the `"syscall"` field in audit
+/// log entries — every variant must have a name, and the match is exhaustive
+/// (no `_` wildcard) so the compiler enforces that newly added
+/// `SyscallRequest` variants pick a canonical name before they can be merged.
+///
+/// Names follow the Linux man-page convention (snake_case, e.g. `eventfd2`,
+/// `memfd_create`, `rt_sigprocmask`, `pidfd_open`). Variants that share a
+/// canonical name (e.g. `Stat` and `Lstat` both backing `stat` family calls)
+/// keep distinct names so they stay distinguishable in the log.
+pub fn syscall_canonical_name(
+    request: &litebox_common_linux::SyscallRequest<litebox_platform_multiplex::Platform>,
+) -> &'static str {
+    use litebox_common_linux::SyscallRequest as S;
+    match request {
+        S::Exit { .. } => "exit",
+        S::ExitGroup { .. } => "exit_group",
+        S::Read { .. } => "read",
+        S::Write { .. } => "write",
+        S::Lseek { .. } => "lseek",
+        S::Close { .. } => "close",
+        S::Stat { .. } => "stat",
+        S::Fstat { .. } => "fstat",
+        S::Lstat { .. } => "lstat",
+        S::Mkdir { .. } => "mkdir",
+        S::Mkdirat { .. } => "mkdirat",
+        S::Chdir { .. } => "chdir",
+        S::Fchdir { .. } => "fchdir",
+        S::Mmap { .. } => "mmap",
+        S::Mprotect { .. } => "mprotect",
+        S::Msync { .. } => "msync",
+        S::Munmap { .. } => "munmap",
+        S::Mremap { .. } => "mremap",
+        S::Brk { .. } => "brk",
+        S::RtSigprocmask { .. } => "rt_sigprocmask",
+        S::RtSigaction { .. } => "rt_sigaction",
+        S::RtSigreturn => "rt_sigreturn",
+        #[cfg(target_arch = "x86")]
+        S::Sigreturn => "sigreturn",
+        S::Kill { .. } => "kill",
+        S::Tkill { .. } => "tkill",
+        S::Tgkill { .. } => "tgkill",
+        S::Sigaltstack { .. } => "sigaltstack",
+        S::RtSigsuspend { .. } => "rt_sigsuspend",
+        S::RtSigtimedwait { .. } => "rt_sigtimedwait",
+        S::Sigpending { .. } => "rt_sigpending",
+        S::Ioctl { .. } => "ioctl",
+        S::Pread64 { .. } => "pread64",
+        S::Pwrite64 { .. } => "pwrite64",
+        S::Readv { .. } => "readv",
+        S::Writev { .. } => "writev",
+        S::Access { .. } => "access",
+        S::Faccessat { .. } => "faccessat",
+        S::Faccessat2 { .. } => "faccessat2",
+        S::Madvise { .. } => "madvise",
+        S::Dup { .. } => "dup",
+        S::Socket { .. } => "socket",
+        #[cfg(target_arch = "x86")]
+        S::Socketcall { .. } => "socketcall",
+        S::Socketpair { .. } => "socketpair",
+        S::Connect { .. } => "connect",
+        S::Accept { .. } => "accept",
+        S::Sendto { .. } => "sendto",
+        S::Sendmsg { .. } => "sendmsg",
+        S::Sendmmsg { .. } => "sendmmsg",
+        S::Recvfrom { .. } => "recvfrom",
+        S::Recvmsg { .. } => "recvmsg",
+        S::Bind { .. } => "bind",
+        S::Listen { .. } => "listen",
+        S::Shutdown { .. } => "shutdown",
+        S::Setsockopt { .. } => "setsockopt",
+        S::Getsockopt { .. } => "getsockopt",
+        S::Getsockname { .. } => "getsockname",
+        S::Getpeername { .. } => "getpeername",
+        S::Uname { .. } => "uname",
+        S::Fcntl { .. } => "fcntl",
+        S::Getcwd { .. } => "getcwd",
+        S::EpollCtl { .. } => "epoll_ctl",
+        S::EpollPwait { .. } => "epoll_pwait",
+        S::EpollCreate { .. } => "epoll_create1",
+        S::Ppoll { .. } => "ppoll",
+        S::Pselect { .. } => "pselect6",
+        S::ArchPrctl { .. } => "arch_prctl",
+        S::Readlink { .. } => "readlink",
+        S::Readlinkat { .. } => "readlinkat",
+        S::Openat { .. } => "openat",
+        S::Ftruncate { .. } => "ftruncate",
+        S::Unlinkat { .. } => "unlinkat",
+        S::Renameat2 { .. } => "renameat2",
+        S::Symlinkat { .. } => "symlinkat",
+        S::Linkat { .. } => "linkat",
+        S::Fchmod { .. } => "fchmod",
+        S::Fchown => "fchown",
+        S::Fchownat => "fchownat",
+        S::Fsync { .. } => "fsync",
+        S::Fdatasync { .. } => "fdatasync",
+        S::Utimensat => "utimensat",
+        S::Seccomp => "seccomp",
+        S::Fchmodat { .. } => "fchmodat",
+        #[cfg(target_arch = "x86_64")]
+        S::Newfstatat { .. } => "newfstatat",
+        #[cfg(target_arch = "x86")]
+        S::Fstatat64 { .. } => "fstatat64",
+        S::Statx { .. } => "statx",
+        S::Statfs { .. } => "statfs",
+        S::Fstatfs { .. } => "fstatfs",
+        S::Fadvise64 { .. } => "fadvise64",
+        S::CopyFileRange { .. } => "copy_file_range",
+        S::Eventfd2 { .. } => "eventfd2",
+        S::MemfdCreate { .. } => "memfd_create",
+        S::InotifyInit1 { .. } => "inotify_init1",
+        S::InotifyAddWatch { .. } => "inotify_add_watch",
+        S::InotifyRmWatch { .. } => "inotify_rm_watch",
+        S::TimerfdCreate { .. } => "timerfd_create",
+        S::TimerfdSettime { .. } => "timerfd_settime",
+        S::TimerfdGettime { .. } => "timerfd_gettime",
+        S::Flock { .. } => "flock",
+        S::Fallocate { .. } => "fallocate",
+        S::XattrGetPath { .. } => "getxattr",
+        S::XattrSetPath { .. } => "setxattr",
+        S::XattrListPath { .. } => "listxattr",
+        S::XattrGetFd { .. } => "fgetxattr",
+        S::XattrSetFd { .. } => "fsetxattr",
+        S::XattrListFd { .. } => "flistxattr",
+        S::Pipe2 { .. } => "pipe2",
+        S::Clone { .. } => "clone",
+        S::Clone3 { .. } => "clone3",
+        S::SetThreadArea { .. } => "set_thread_area",
+        S::ClockGettime { .. } => "clock_gettime",
+        S::ClockGetres { .. } => "clock_getres",
+        S::ClockNanosleep { .. } => "clock_nanosleep",
+        S::Gettimeofday { .. } => "gettimeofday",
+        S::Time { .. } => "time",
+        S::Getrusage { .. } => "getrusage",
+        S::Getrlimit { .. } => "getrlimit",
+        S::Setrlimit { .. } => "setrlimit",
+        S::Prlimit { .. } => "prlimit64",
+        S::SetTidAddress { .. } => "set_tid_address",
+        S::Gettid => "gettid",
+        S::SetRobustList { .. } => "set_robust_list",
+        S::GetRobustList { .. } => "get_robust_list",
+        S::Rseq { .. } => "rseq",
+        S::GetRandom { .. } => "getrandom",
+        S::Getpid => "getpid",
+        S::Getppid => "getppid",
+        S::Getpgid { .. } => "getpgid",
+        S::Setpgid { .. } => "setpgid",
+        S::Getsid { .. } => "getsid",
+        S::Setsid => "setsid",
+        S::Getuid => "getuid",
+        S::Geteuid => "geteuid",
+        S::Getgid => "getgid",
+        S::Getegid => "getegid",
+        S::Getgroups { .. } => "getgroups",
+        S::Sysinfo { .. } => "sysinfo",
+        S::CapGet { .. } => "capget",
+        S::GetDirent64 { .. } => "getdents64",
+        S::SchedGetAffinity { .. } => "sched_getaffinity",
+        S::SchedYield => "sched_yield",
+        S::SchedGetparam { .. } => "sched_getparam",
+        S::SchedGetscheduler { .. } => "sched_getscheduler",
+        S::SchedSetscheduler { .. } => "sched_setscheduler",
+        S::Futex { .. } => "futex",
+        S::Execve { .. } => "execve",
+        S::Execveat { .. } => "execveat",
+        S::Umask { .. } => "umask",
+        S::Prctl { .. } => "prctl",
+        S::Alarm { .. } => "alarm",
+        S::SetITimer { .. } => "setitimer",
+        S::TimerCreate { .. } => "timer_create",
+        S::TimerSettime { .. } => "timer_settime",
+        S::TimerGettime { .. } => "timer_gettime",
+        S::TimerDelete { .. } => "timer_delete",
+        S::TimerGetoverrun { .. } => "timer_getoverrun",
+        S::Wait4 { .. } => "wait4",
+        S::Waitid { .. } => "waitid",
+        S::ProcessVmReadv { .. } => "process_vm_readv",
+        S::PidfdOpen { .. } => "pidfd_open",
+        // `SyscallRequest` is `#[non_exhaustive]`, so the compiler requires a
+        // wildcard. Any newly added variant should add an explicit arm above
+        // before the variant is wired through the dispatcher; until then it
+        // shows up as `"unknown"` rather than silently being mis-named.
+        _ => "unknown",
     }
 }
 
@@ -670,5 +1434,111 @@ mod tests {
 
         let json = format!("{event}");
         assert!(json.contains("\\\"quotes"));
+    }
+
+    #[test]
+    fn canonical_name_uses_snake_case_for_variants_that_used_to_be_other() {
+        use litebox_common_linux::EfdFlags;
+        use litebox_common_linux::SyscallRequest as S;
+        type P = litebox_platform_multiplex::Platform;
+
+        // Spot-check a handful of variants that previously fell through to
+        // the `"other"` catch-all. Each must report its canonical snake_case
+        // Linux name — not `"other"`, not CamelCase.
+        let req: S<P> = S::Eventfd2 {
+            initval: 1,
+            flags: EfdFlags::empty(),
+        };
+        assert_eq!(syscall_canonical_name(&req), "eventfd2");
+
+        let req: S<P> = S::PidfdOpen { pid: 1, flags: 0 };
+        assert_eq!(syscall_canonical_name(&req), "pidfd_open");
+
+        let req: S<P> = S::Kill { pid: 1, sig: 9 };
+        assert_eq!(syscall_canonical_name(&req), "kill");
+
+        let req: S<P> = S::Tgkill {
+            tgid: 1,
+            tid: 2,
+            sig: 9,
+        };
+        assert_eq!(syscall_canonical_name(&req), "tgkill");
+
+        let req: S<P> = S::Gettid;
+        assert_eq!(syscall_canonical_name(&req), "gettid");
+
+        let req: S<P> = S::Exit { status: 0 };
+        assert_eq!(syscall_canonical_name(&req), "exit");
+
+        let req: S<P> = S::Setsid;
+        assert_eq!(syscall_canonical_name(&req), "setsid");
+    }
+
+    #[test]
+    fn build_audit_event_names_eventfd2_correctly_and_records_args() {
+        use litebox_common_linux::EfdFlags;
+        use litebox_common_linux::SyscallRequest as S;
+        type P = litebox_platform_multiplex::Platform;
+
+        let req: S<P> = S::Eventfd2 {
+            initval: 7,
+            flags: EfdFlags::empty(),
+        };
+        let ev = build_audit_event(&req);
+        let json = format!("{ev}");
+        assert!(
+            json.contains("\"syscall\":\"eventfd2\""),
+            "expected canonical name, got: {json}"
+        );
+        assert!(
+            !json.contains("\"syscall\":\"other\""),
+            "must not fall through to `other`: {json}"
+        );
+        // initval was 7
+        assert!(json.contains("\"int\":7"), "json was: {json}");
+    }
+
+    #[test]
+    fn build_audit_event_records_kill_pid_and_sig() {
+        use litebox_common_linux::SyscallRequest as S;
+        type P = litebox_platform_multiplex::Platform;
+
+        let req: S<P> = S::Kill { pid: 42, sig: 15 };
+        let ev = build_audit_event(&req);
+        let json = format!("{ev}");
+        assert!(json.contains("\"syscall\":\"kill\""), "{json}");
+        assert!(json.contains("\"int\":42"), "{json}");
+        assert!(json.contains("\"int\":15"), "{json}");
+    }
+
+    #[test]
+    fn build_audit_event_never_emits_other_for_no_arg_variants() {
+        use litebox_common_linux::SyscallRequest as S;
+        type P = litebox_platform_multiplex::Platform;
+
+        // These variants don't have explicit arg handlers in `build_audit_event`
+        // and previously would have been bucketed as `"syscall":"other"`.
+        // The canonical-name path means they must now be named correctly.
+        let cases: &[(S<P>, &str)] = &[
+            (S::Gettid, "gettid"),
+            (S::Getpid, "getpid"),
+            (S::Getppid, "getppid"),
+            (S::Getuid, "getuid"),
+            (S::Getegid, "getegid"),
+            (S::Setsid, "setsid"),
+            (S::SchedYield, "sched_yield"),
+        ];
+        for (req, expected) in cases {
+            let ev = build_audit_event(req);
+            let json = format!("{ev}");
+            assert!(
+                json.contains(&format!("\"syscall\":\"{expected}\"")),
+                "expected `{expected}`, got: {json}"
+            );
+            assert!(
+                !json.contains("\"syscall\":\"other\""),
+                "must not fall through to `other`: {json}"
+            );
+        }
     }
 }
