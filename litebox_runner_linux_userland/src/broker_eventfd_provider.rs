@@ -111,6 +111,12 @@ impl BrokerEventfdProvider for RunnerBrokerEventfdProvider {
             tracing::warn!(handle, subscription_id, error = %e, "unsubscribe_eventfd failed");
         }
     }
+
+    fn dup_handle(&self, handle: u64) -> Result<(), BrokerOpError> {
+        self.client
+            .dup_handle(handle)
+            .map_err(client_err_to_broker_err)
+    }
 }
 
 /// Adapter so the dispatcher (no_std-friendly NotificationCallback)
@@ -140,7 +146,7 @@ mod tests {
     use litebox_broker::fd_token_socket::spawn_control_listener;
     use litebox_broker::fd_tokens::BrokerFdTokenRegistry;
     use litebox_broker::state_registry::BrokerStateRegistry;
-    use litebox_common_linux::broker_eventfd::{NotificationCallback, NotificationDispatcher};
+    use litebox_common_linux::broker_eventfd::NotificationDispatcher;
     use litebox_common_linux::notification_frame::{NOTIFY_EVENT_IN, NOTIFY_EVENT_OUT};
     use litebox_common_linux::notification_ring::NotificationReceiver;
     use litebox_common_linux::shmem_ring::ShmemRingPair;
@@ -271,5 +277,30 @@ mod tests {
 
         provider.unsubscribe_eventfd(handle, sub_id);
         provider.release_eventfd(handle);
+    }
+
+    #[test]
+    fn dup_handle_increments_refcount() {
+        let (provider, state_registry, _dir) = spawn_provider();
+
+        let handle = provider.create_eventfd(0, false).expect("create");
+        assert_eq!(state_registry.live_handle_count(), 1);
+
+        provider.dup_handle(handle).expect("dup");
+
+        provider.release_eventfd(handle);
+        assert_eq!(state_registry.live_handle_count(), 1);
+
+        provider.release_eventfd(handle);
+        assert_eq!(state_registry.live_handle_count(), 0);
+    }
+
+    #[test]
+    fn dup_unknown_handle_errors() {
+        let (provider, _state, _dir) = spawn_provider();
+        match provider.dup_handle(999_999) {
+            Err(BrokerOpError::UnknownHandle) => {}
+            other => panic!("expected UnknownHandle, got {other:?}"),
+        }
     }
 }

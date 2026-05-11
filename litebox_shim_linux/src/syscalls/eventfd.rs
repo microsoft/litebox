@@ -51,6 +51,7 @@ static BROKER_EVENTFD_PROVIDER: once_cell::race::OnceBox<Arc<dyn BrokerEventfdPr
 /// Returns `Err(provider)` if a provider was already set; callers
 /// can decide whether to log + drop or panic on that case (in
 /// practice it indicates a bootstrap bug).
+#[allow(dead_code)] // wired in by the runner bootstrap, not the shim itself
 pub fn set_broker_eventfd_provider(
     provider: Arc<dyn BrokerEventfdProvider>,
 ) -> Result<(), alloc::boxed::Box<Arc<dyn BrokerEventfdProvider>>> {
@@ -75,6 +76,11 @@ enum EventFileInner<Platform: RawSyncPrimitivesProvider + TimeProvider> {
     /// Broker-hosted eventfd (Phase B-Step7b). State lives in the
     /// broker; this worker holds only the handle id and a provider
     /// reference to make RPC calls.
+    ///
+    /// `semaphore` is recorded for diagnostics / future use even
+    /// though the broker is the source of truth for that flag — the
+    /// shim doesn't need to act on it locally.
+    #[allow(dead_code)]
     BrokerBacked {
         provider: Arc<dyn BrokerEventfdProvider>,
         handle: u64,
@@ -377,6 +383,22 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> EventFile<Platform> {
     }
 
     super::common_functions_for_file_status!();
+}
+
+impl<Platform: RawSyncPrimitivesProvider + TimeProvider> Drop for EventFile<Platform> {
+    fn drop(&mut self) {
+        // Phase B-Step8: when a broker-backed EventFile drops, tell
+        // the broker to decrement its refcount on the canonical
+        // handle. The broker frees the underlying state when refcount
+        // reaches 0. Non-broker variants have no broker-side state
+        // to release; the local Mutex<EventFileInner> drops normally.
+        if let EventFileInner::BrokerBacked {
+            provider, handle, ..
+        } = &*self.inner.lock()
+        {
+            provider.release_eventfd(*handle);
+        }
+    }
 }
 
 impl<Platform: RawSyncPrimitivesProvider + TimeProvider> IOPollable for EventFile<Platform> {
@@ -752,6 +774,9 @@ mod tests {
                 Ok(1)
             }
             fn unsubscribe_eventfd(&self, _handle: u64, _subscription_id: u64) {}
+            fn dup_handle(&self, _handle: u64) -> Result<(), BrokerOpError> {
+                Ok(())
+            }
         }
 
         let _task = crate::syscalls::tests::init_platform(None);
@@ -794,5 +819,71 @@ mod tests {
             Err(Errno::EINVAL) => {}
             other => panic!("expected EINVAL on u64::MAX write, got {other:?}"),
         }
+    }
+
+    /// Phase B-Step8: verifies that dropping a BrokerBacked EventFile
+    /// calls provider.release_eventfd, balancing the broker-side
+    /// refcount that sys_eventfd2 set up at create.
+    #[test]
+    fn test_broker_backed_eventfd_drop_releases_handle() {
+        use alloc::sync::Arc;
+        use core::sync::atomic::{AtomicU32, Ordering};
+        use litebox_common_linux::broker_eventfd_provider::{
+            BrokerEventCallback, BrokerEventfdProvider, BrokerOpError,
+        };
+
+        struct ReleaseCountingProvider {
+            releases: AtomicU32,
+        }
+
+        impl BrokerEventfdProvider for ReleaseCountingProvider {
+            fn create_eventfd(
+                &self,
+                _initial: u64,
+                _semaphore: bool,
+            ) -> Result<u64, BrokerOpError> {
+                Ok(99)
+            }
+            fn read_eventfd(&self, _handle: u64) -> Result<u64, BrokerOpError> {
+                Err(BrokerOpError::WouldBlock)
+            }
+            fn write_eventfd(&self, _handle: u64, _value: u64) -> Result<(), BrokerOpError> {
+                Ok(())
+            }
+            fn release_eventfd(&self, _handle: u64) {
+                self.releases.fetch_add(1, Ordering::SeqCst);
+            }
+            fn subscribe_eventfd(
+                &self,
+                _handle: u64,
+                _events_mask: u32,
+                _cb: Arc<dyn BrokerEventCallback>,
+            ) -> Result<u64, BrokerOpError> {
+                Ok(1)
+            }
+            fn unsubscribe_eventfd(&self, _handle: u64, _subscription_id: u64) {}
+            fn dup_handle(&self, _handle: u64) -> Result<(), BrokerOpError> {
+                Ok(())
+            }
+        }
+
+        let _task = crate::syscalls::tests::init_platform(None);
+
+        let provider = Arc::new(ReleaseCountingProvider {
+            releases: AtomicU32::new(0),
+        });
+        let provider_dyn: Arc<dyn BrokerEventfdProvider> = provider.clone();
+
+        // Construct then drop.
+        {
+            let _ef: super::EventFile<litebox_platform_multiplex::Platform> =
+                super::EventFile::new_broker_backed(provider_dyn, 99, EfdFlags::empty());
+        }
+
+        assert_eq!(
+            provider.releases.load(Ordering::SeqCst),
+            1,
+            "EventFile::drop must call release_eventfd exactly once for the BrokerBacked variant",
+        );
     }
 }

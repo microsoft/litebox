@@ -96,6 +96,7 @@ pub enum Opcode {
     WriteEventfd = 0x12,
     SubscribeEventfd = 0x13,
     Unsubscribe = 0x14,
+    DupHandle = 0x15,
 
     RegisterResponse = 0x81,
     MaterializeResponse = 0x82,
@@ -106,6 +107,7 @@ pub enum Opcode {
     WriteEventfdResponse = 0x92,
     SubscribeEventfdResponse = 0x93,
     UnsubscribeResponse = 0x94,
+    DupHandleResponse = 0x95,
 }
 
 impl Opcode {
@@ -122,6 +124,7 @@ impl Opcode {
             Opcode::WriteEventfd => Some(Opcode::WriteEventfdResponse),
             Opcode::SubscribeEventfd => Some(Opcode::SubscribeEventfdResponse),
             Opcode::Unsubscribe => Some(Opcode::UnsubscribeResponse),
+            Opcode::DupHandle => Some(Opcode::DupHandleResponse),
             _ => None,
         }
     }
@@ -139,6 +142,7 @@ impl Opcode {
                 | Opcode::WriteEventfd
                 | Opcode::SubscribeEventfd
                 | Opcode::Unsubscribe
+                | Opcode::DupHandle
         )
     }
 
@@ -171,6 +175,7 @@ impl TryFrom<u8> for Opcode {
             0x12 => Ok(Opcode::WriteEventfd),
             0x13 => Ok(Opcode::SubscribeEventfd),
             0x14 => Ok(Opcode::Unsubscribe),
+            0x15 => Ok(Opcode::DupHandle),
             0x81 => Ok(Opcode::RegisterResponse),
             0x82 => Ok(Opcode::MaterializeResponse),
             0x83 => Ok(Opcode::ReleaseResponse),
@@ -180,6 +185,7 @@ impl TryFrom<u8> for Opcode {
             0x92 => Ok(Opcode::WriteEventfdResponse),
             0x93 => Ok(Opcode::SubscribeEventfdResponse),
             0x94 => Ok(Opcode::UnsubscribeResponse),
+            0x95 => Ok(Opcode::DupHandleResponse),
             other => Err(ProtocolError::UnknownOpcode { opcode: other }),
         }
     }
@@ -677,6 +683,29 @@ pub fn parse_unsubscribe_body(body: &[u8]) -> Result<(u64, u64), ProtocolError> 
 pub fn build_unsubscribe_response_ok() -> OwnedFrame {
     OwnedFrame {
         opcode: Opcode::UnsubscribeResponse,
+        status: StatusCode::Ok,
+        body: Vec::new(),
+    }
+}
+
+/// Body for [`Opcode::DupHandle`]: existing handle id.
+/// Semantics: broker increments the refcount of `handle_id` so a
+/// receiver worker can adopt it. Sender invokes this BEFORE shipping
+/// the handle over the data plane; receiver constructs an
+/// `EventFile::new_broker_backed` referencing the same handle, and
+/// when the receiver's EventFile drops it calls `release` to balance.
+pub fn build_dup_handle_request(handle_id: u64) -> OwnedFrame {
+    OwnedFrame {
+        opcode: Opcode::DupHandle,
+        status: StatusCode::Ok,
+        body: handle_id.to_le_bytes().to_vec(),
+    }
+}
+
+/// Body for [`Opcode::DupHandleResponse`]: empty.
+pub fn build_dup_handle_response_ok() -> OwnedFrame {
+    OwnedFrame {
+        opcode: Opcode::DupHandleResponse,
         status: StatusCode::Ok,
         body: Vec::new(),
     }

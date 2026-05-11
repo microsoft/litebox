@@ -314,6 +314,28 @@ impl FdTokenClient {
         }
     }
 
+    /// Asks the broker to increment the refcount of an existing
+    /// handle (typically before shipping it to a peer worker via
+    /// SCM_RIGHTS). Returns Ok when the broker confirms the dup;
+    /// the caller must arrange a matching release on the peer side
+    /// when the peer's handle reference drops.
+    pub fn dup_handle(&self, handle_id: u64) -> Result<(), ClientError> {
+        let stream = self.lock();
+        send_frame(
+            &stream,
+            &crate::fd_token_protocol::build_dup_handle_request(handle_id),
+            None,
+        )?;
+        let (resp_bytes, _) = recv_frame(&stream)?;
+        let resp = decode(&resp_bytes).map_err(ClientError::Protocol)?;
+        check_opcode(&resp, Opcode::DupHandleResponse)?;
+        match resp.status {
+            StatusCode::Ok => Ok(()),
+            StatusCode::UnknownHandle => Err(ClientError::UnknownHandle { handle_id }),
+            s => Err(map_status_with_handle(resp.opcode, s, handle_id)),
+        }
+    }
+
     fn lock(&self) -> std::sync::MutexGuard<'_, UnixStream> {
         self.stream.lock().expect("FdTokenClient mutex poisoned")
     }

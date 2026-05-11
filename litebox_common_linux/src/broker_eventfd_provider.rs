@@ -76,4 +76,10 @@ pub trait BrokerEventfdProvider: Send + Sync {
 
     /// Removes a subscription.
     fn unsubscribe_eventfd(&self, handle: u64, subscription_id: u64);
+
+    /// Asks the broker to increment the refcount of an existing
+    /// handle. Used when the worker is about to ship the handle to a
+    /// peer (e.g. cross-worker SCM_RIGHTS) — the peer's eventual
+    /// release balances this dup.
+    fn dup_handle(&self, handle: u64) -> Result<(), BrokerOpError>;
 }

@@ -324,7 +324,8 @@ pub fn handle_control_connection(
                     | Opcode::ReadEventfd
                     | Opcode::WriteEventfd
                     | Opcode::SubscribeEventfd
-                    | Opcode::Unsubscribe => {
+                    | Opcode::Unsubscribe
+                    | Opcode::DupHandle => {
                         // State-object opcodes: route to state_service.
                         let state_result =
                             state_handle_request(&state_registry, &mut conn_state, &frame, in_fds);

@@ -74,6 +74,7 @@ pub fn handle_request(
         Opcode::SubscribeEventfd => handle_subscribe_eventfd(registry, conn, request, in_fds),
         Opcode::Unsubscribe => handle_unsubscribe(registry, request, in_fds),
         Opcode::Release => handle_release_state(registry, request, in_fds),
+        Opcode::DupHandle => handle_dup_handle(registry, request, in_fds),
         other => HandlerResult {
             frame: build_error_response(
                 other.response_for().unwrap_or(Opcode::ReleaseResponse),
@@ -335,6 +336,30 @@ fn handle_release_state(
             status_err(Opcode::ReleaseResponse, StatusCode::UnknownHandle)
         }
         Err(_) => status_err(Opcode::ReleaseResponse, StatusCode::Internal),
+    }
+}
+
+fn handle_dup_handle(
+    registry: &BrokerStateRegistry,
+    request: &Frame<'_>,
+    in_fds: Vec<OwnedFd>,
+) -> HandlerResult {
+    if !in_fds.is_empty() {
+        return protocol_err(Opcode::DupHandleResponse);
+    }
+    let handle_id = match parse_handle_body(request.body, request.opcode) {
+        Ok(id) => id,
+        Err(_) => return protocol_err(Opcode::DupHandleResponse),
+    };
+    match registry.dup(StateHandle::from_id(handle_id)) {
+        Ok(_) => HandlerResult {
+            frame: litebox_common_linux::fd_token_protocol::build_dup_handle_response_ok(),
+            out_fd: None,
+        },
+        Err(StateRegistryError::UnknownHandle(_)) => {
+            status_err(Opcode::DupHandleResponse, StatusCode::UnknownHandle)
+        }
+        Err(_) => status_err(Opcode::DupHandleResponse, StatusCode::Internal),
     }
 }
 
