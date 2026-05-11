@@ -36,6 +36,32 @@ impl FdEnabledSubsystem for EventfdSubsystem {
 }
 impl FdEnabledSubsystemEntry for EventFile<Platform> {}
 
+/// Process-global broker eventfd provider. Set once at runner
+/// bootstrap (in litebox_runner_linux_userland). `sys_eventfd2`
+/// consults this; if `Some`, new eventfds are broker-backed.
+/// If `None`, falls back to the local `EventFile::new` path —
+/// preserves all existing behaviour when fd-token transport is
+/// not configured.
+static BROKER_EVENTFD_PROVIDER: once_cell::race::OnceBox<Arc<dyn BrokerEventfdProvider>> =
+    once_cell::race::OnceBox::new();
+
+/// Sets the process-global broker eventfd provider. Called by the
+/// runner exactly once during bootstrap.
+///
+/// Returns `Err(provider)` if a provider was already set; callers
+/// can decide whether to log + drop or panic on that case (in
+/// practice it indicates a bootstrap bug).
+pub fn set_broker_eventfd_provider(
+    provider: Arc<dyn BrokerEventfdProvider>,
+) -> Result<(), alloc::boxed::Box<Arc<dyn BrokerEventfdProvider>>> {
+    BROKER_EVENTFD_PROVIDER.set(alloc::boxed::Box::new(provider))
+}
+
+/// Returns the broker eventfd provider if one has been set.
+pub fn broker_eventfd_provider() -> Option<Arc<dyn BrokerEventfdProvider>> {
+    BROKER_EVENTFD_PROVIDER.get().cloned()
+}
+
 enum EventFileInner<Platform: RawSyncPrimitivesProvider + TimeProvider> {
     Eventfd {
         counter: u64,
