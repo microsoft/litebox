@@ -23,6 +23,7 @@ pub mod fd_token_protocol;
 pub mod fd_transfer_frame;
 pub mod loader;
 pub mod mm;
+pub mod notification_frame;
 pub mod signal;
 pub mod vmap;
 
