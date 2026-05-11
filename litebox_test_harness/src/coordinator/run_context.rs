@@ -173,17 +173,102 @@ impl<'a> RunContext<'a> {
         }
     }
 
-    /// Start a multi-agent scenario invocation. Each `.assign(...)`
-    /// adds one agent's handler call; `.phase(tag)` declares a
-    /// rendezvous tag (members default to all assigned agents);
-    /// `.run()` drives the test to completion.
+    /// Write `Command::Run { handler, args }` to `handle`'s pipe
+    /// without waiting for a response. The command is routed through
+    /// `route` + `wrap_forwards` to reach descendants via their
+    /// parent's pipe.
     ///
-    /// Internally lifts the participating agents' pipes out of
-    /// `runner.children` for the duration of the run, spawns one
-    /// driver task per agent that streams Checkpoint events to a
-    /// central coordinator, routes Resume commands back when peers
-    /// quorum, collects per-agent `Result`s, and restores the pipes.
-    pub fn run_multi<'r>(&'r mut self) -> super::multi_run::Invocation<'r, 'a> {
-        super::multi_run::Invocation::new(self.runner)
+    /// Pair with `run_read` to receive the response stream. Use this
+    /// when you need to interleave writes across multiple agents
+    /// (e.g. for a Class 1 rendezvous where two agents arrive at the
+    /// same checkpoint before either resumes).
+    ///
+    /// # Errors
+    /// Returns Err on a routing or pipe-write failure.
+    pub async fn run_write(
+        &mut self,
+        handle: &AgentHandle,
+        handler: &str,
+        args: serde_json::Value,
+    ) -> Result<(), String> {
+        let cmd = Command::Run {
+            handler: handler.to_string(),
+            args,
+        };
+        self.write_routed(handle, cmd).await
+    }
+
+    /// Write `Command::Resume { tag }` to `handle`'s pipe without
+    /// waiting for a response. Used after the coord observes a
+    /// `Response::Checkpoint` and decides to release the handler.
+    ///
+    /// # Errors
+    /// Returns Err on routing or pipe-write failure.
+    pub async fn run_resume(&mut self, handle: &AgentHandle, tag: &str) -> Result<(), String> {
+        let cmd = Command::Resume {
+            tag: tag.to_string(),
+        };
+        self.write_routed(handle, cmd).await
+    }
+
+    /// Read one `Response` from `handle`'s pipe. Pair with
+    /// `run_write` / `run_resume`. The response may be
+    /// `Response::Checkpoint` (handler is paused) or
+    /// `Response::Result` (handler is done) or an error.
+    pub async fn run_read(&mut self, handle: &AgentHandle) -> Response {
+        use tokio::io::AsyncBufReadExt;
+        let wire = handle.name().name();
+        self.runner.contacted_agents.insert(wire.to_string());
+        let (direct, _rest) = super::route(wire);
+        let Some(child) = self.runner.children.get_mut(direct) else {
+            return Response::Error {
+                error: format!("no child {direct}"),
+            };
+        };
+        let mut line = String::new();
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(15),
+            child.stdout.read_line(&mut line),
+        )
+        .await
+        {
+            Ok(Ok(0)) => Response::Error {
+                error: "EOF on agent stdout".into(),
+            },
+            Ok(Ok(_)) => match serde_json::from_str(line.trim()) {
+                Ok(r) => r,
+                Err(e) => Response::Error {
+                    error: format!("response parse: {e}; line={}", line.trim()),
+                },
+            },
+            Ok(Err(e)) => Response::Error {
+                error: format!("read: {e}"),
+            },
+            Err(_) => Response::Error {
+                error: "timeout reading from agent".into(),
+            },
+        }
+    }
+
+    /// Common helper: route `cmd` to `handle` (Forward-wrapping for
+    /// descendants), write to the appropriate direct-child pipe,
+    /// flush, return without reading any response.
+    async fn write_routed(&mut self, handle: &AgentHandle, cmd: Command) -> Result<(), String> {
+        use tokio::io::AsyncWriteExt;
+        let wire = handle.name().name();
+        self.runner.contacted_agents.insert(wire.to_string());
+        let (direct, rest) = super::route(wire);
+        let actual_cmd = super::wrap_forwards(rest, cmd);
+        let Some(child) = self.runner.children.get_mut(direct) else {
+            return Err(format!("no child {direct}"));
+        };
+        let json = serde_json::to_string(&actual_cmd).map_err(|e| e.to_string())?;
+        child
+            .stdin
+            .write_all(format!("{json}\n").as_bytes())
+            .await
+            .map_err(|e| e.to_string())?;
+        child.stdin.flush().await.map_err(|e| e.to_string())?;
+        Ok(())
     }
 }

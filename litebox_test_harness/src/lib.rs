@@ -8,6 +8,7 @@
 
 pub mod coordinator;
 pub mod handlers;
+pub mod os;
 pub mod protocol;
 pub mod test_registry;
 

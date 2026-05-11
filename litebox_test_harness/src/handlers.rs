@@ -137,18 +137,30 @@ where
     }
 }
 
-/// Lift an `async fn(serde_json::Value, &mut HandlerCtx<'_>) ->
-/// Result<serde_json::Value, HandlerError>` into the closure shape
-/// the dispatcher expects. Usage:
+/// Lift an `async fn(A: DeserializeOwned, &mut HandlerCtx<'_>) ->
+/// Result<O: Serialize, HandlerError>` into the untyped closure shape
+/// the dispatcher expects. The macro generates the deserialize-args
+/// / call-fn / serialize-out adapter.
 ///
 /// ```ignore
-/// register_handler("inotify.create_file.watcher",
-///                  handler_fn!(handle_watch_for_create));
+/// async fn handle_foo(args: FooArgs, ctx: &mut HandlerCtx<'_>)
+///     -> Result<FooOut, HandlerError> { ... }
+///
+/// register_handler!("foo", handle_foo);
 /// ```
 #[macro_export]
 macro_rules! handler_fn {
     ($f:path) => {
-        |args, ctx| ::std::boxed::Box::pin($f(args, ctx))
+        |args, ctx| {
+            ::std::boxed::Box::pin(async move {
+                let typed_args = ::serde_json::from_value(args).map_err(|e| {
+                    $crate::handlers::HandlerError(format!("args deserialize: {e}"))
+                })?;
+                let typed_out = $f(typed_args, ctx).await?;
+                ::serde_json::to_value(&typed_out)
+                    .map_err(|e| $crate::handlers::HandlerError(format!("out serialize: {e}")))
+            })
+        }
     };
 }
 

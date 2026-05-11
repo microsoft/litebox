@@ -15,7 +15,6 @@ pub(crate) mod getrandom_tests;
 pub(crate) mod inotify;
 pub(crate) mod iouring_discovery;
 pub(crate) mod matrix;
-pub(crate) mod multi_run;
 pub(crate) mod pipe_bridge;
 pub(crate) mod platform_fixes;
 pub(crate) mod port_router;
@@ -911,26 +910,50 @@ fn register_handler_canary(reg: &mut registry::Registry<'_>) {
             let b = cx.require(agents::AgentName::Dpg2);
             Box::new(move |run| {
                 Box::pin(async move {
-                    let results = run
-                        .run_multi()
-                        .assign(&a, "canary.rendezvous_a", serde_json::Value::Null)
-                        .assign(&b, "canary.rendezvous_b", serde_json::Value::Null)
-                        .phase("rendezvous")
-                        .run()
-                        .await;
-                    let ra = results.raw(&a);
-                    let rb = results.raw(&b);
-                    let pass = results.top_level_error().is_none()
-                        && matches!(&ra, Some(r) if r.ok && r.data["role"] == "a")
-                        && matches!(&rb, Some(r) if r.ok && r.data["role"] == "b");
-                    TestOutcome::new(
-                        agents::AgentName::Dpg1.name(),
-                        pass,
-                        format!("ra={ra:?} rb={rb:?} top={:?}", results.top_level_error()),
-                    )
+                    let detail = match drive_rendezvous(run, &a, &b).await {
+                        Ok(d) => return TestOutcome::new(agents::AgentName::Dpg1.name(), true, d),
+                        Err(d) => d,
+                    };
+                    TestOutcome::new(agents::AgentName::Dpg1.name(), false, detail)
                 })
             })
         });
+}
+
+async fn drive_rendezvous(
+    run: &mut run_context::RunContext<'_>,
+    a: &agents::AgentHandle,
+    b: &agents::AgentHandle,
+) -> Result<String, String> {
+    use crate::protocol::Response;
+    run.run_write(a, "canary.rendezvous_a", serde_json::Value::Null)
+        .await?;
+    match run.run_read(a).await {
+        Response::Checkpoint { tag } if tag == "rendezvous" => {}
+        other => return Err(format!("a: expected Checkpoint(rendezvous), got {other:?}")),
+    }
+    run.run_write(b, "canary.rendezvous_b", serde_json::Value::Null)
+        .await?;
+    match run.run_read(b).await {
+        Response::Checkpoint { tag } if tag == "rendezvous" => {}
+        other => return Err(format!("b: expected Checkpoint(rendezvous), got {other:?}")),
+    }
+    run.run_resume(a, "rendezvous").await?;
+    run.run_resume(b, "rendezvous").await?;
+    let ra = run.run_read(a).await;
+    let rb = run.run_read(b).await;
+    let pass = matches!(
+        &ra,
+        Response::Result { ok: true, data, .. } if data["role"] == "a"
+    ) && matches!(
+        &rb,
+        Response::Result { ok: true, data, .. } if data["role"] == "b"
+    );
+    if pass {
+        Ok(format!("ra={ra:?} rb={rb:?}"))
+    } else {
+        Err(format!("unexpected results: ra={ra:?} rb={rb:?}"))
+    }
 }
 
 /// Check whether a Test matches the --filter argument.
@@ -1173,7 +1196,7 @@ async fn run_tests(self_exe: &str, filter: Option<&str>) -> Vec<TestResult> {
 
 /// Route a target agent name to (`direct_child`, `remaining_path`).
 /// `dpg1` → (`dpg1`, None), `vscode_node` → (`vscode_sshd_pty`, Some(`vscode_node`)).
-fn route(target: &str) -> (&str, Option<&str>) {
+pub(crate) fn route(target: &str) -> (&str, Option<&str>) {
     if let Some(agent) = agents::AgentName::from_wire(target) {
         let ancestors = agent.ancestors();
         let direct = ancestors.first().copied().unwrap_or(agent).name();
@@ -1190,7 +1213,7 @@ fn route(target: &str) -> (&str, Option<&str>) {
 }
 
 /// Wrap a command in Forward layers for routing through the tree.
-fn wrap_forwards(remaining: Option<&str>, cmd: Command) -> Command {
+pub(crate) fn wrap_forwards(remaining: Option<&str>, cmd: Command) -> Command {
     let Some(target) = remaining else {
         return cmd;
     };
