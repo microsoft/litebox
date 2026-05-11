@@ -170,17 +170,25 @@ impl FdTokenClient {
 
     // ---- Notification-ring setup (Phase B) -------------------------------
 
-    /// Hands the worker's broker→worker notification ring writer to
+    /// Hands the worker's broker→worker notification ring memfds to
     /// the broker. Call once after `connect`. The broker stores the
-    /// writer and uses it for `subscribe`-triggered notifications.
-    pub fn register_notification_ring(&self, ring_writer_fd: OwnedFd) -> Result<(), ClientError> {
+    /// writer half and uses it for `subscribe`-triggered notifications;
+    /// the other memfd is unused (kept for ShmemRingPair::open API
+    /// symmetry — see module-level docs in notification_ring).
+    #[allow(clippy::similar_names)] // the pair is inherently named tx/rx
+    pub fn register_notification_ring(
+        &self,
+        notification_ring_tx_fd: OwnedFd,
+        notification_ring_rx_fd: OwnedFd,
+    ) -> Result<(), ClientError> {
         let stream = self.lock();
-        send_frame(
+        send_frame_with_fds(
             &stream,
             &build_register_notification_ring_request(),
-            Some(&ring_writer_fd),
+            &[&notification_ring_tx_fd, &notification_ring_rx_fd],
         )?;
-        drop(ring_writer_fd);
+        drop(notification_ring_tx_fd);
+        drop(notification_ring_rx_fd);
         let (resp_bytes, attached) = recv_frame(&stream)?;
         let resp = decode(&resp_bytes).map_err(ClientError::Protocol)?;
         check_opcode(&resp, Opcode::RegisterNotificationRingResponse)?;
@@ -349,13 +357,32 @@ fn send_frame(
     frame: &proto::OwnedFrame,
     fd: Option<&OwnedFd>,
 ) -> Result<(), ClientError> {
+    if let Some(f) = fd {
+        send_frame_with_fds(stream, frame, &[f])
+    } else {
+        send_frame_with_fds(stream, frame, &[])
+    }
+}
+
+fn send_frame_with_fds(
+    stream: &UnixStream,
+    frame: &proto::OwnedFrame,
+    fds: &[&OwnedFd],
+) -> Result<(), ClientError> {
+    // CMSG_SPACE for up to 2 fds (matches broker's read_request cap).
     #[allow(clippy::cast_possible_truncation)]
-    const CMSG_SPACE: usize = unsafe { libc::CMSG_SPACE(size_of::<i32>() as u32) as usize };
+    const CMSG_SPACE: usize = unsafe { libc::CMSG_SPACE((2 * size_of::<i32>()) as u32) as usize };
     #[repr(C)]
     union CmsgBuf {
         _align: libc::cmsghdr,
         buf: [u8; CMSG_SPACE],
     }
+
+    assert!(
+        fds.len() <= 2,
+        "send_frame_with_fds: at most 2 fds supported, got {}",
+        fds.len()
+    );
 
     let bytes = frame.encode().map_err(ClientError::Protocol)?;
 
@@ -370,11 +397,15 @@ fn send_frame(
     msg.msg_iov = &raw mut iov;
     msg.msg_iovlen = 1;
 
-    if let Some(f) = fd {
+    if !fds.is_empty() {
         msg.msg_control = unsafe { cmsg_buf.buf.as_mut_ptr().cast() };
+        // fds.len() ≤ 2 (the leading assert), so the multiplication
+        // fits trivially in a u32; explicit truncation is sound.
+        #[allow(clippy::cast_possible_truncation)]
+        let cmsg_data_len = (fds.len() * size_of::<i32>()) as u32;
         #[allow(clippy::cast_possible_truncation)]
         {
-            msg.msg_controllen = CMSG_SPACE as _;
+            msg.msg_controllen = unsafe { libc::CMSG_SPACE(cmsg_data_len) as _ };
         }
         let cmsg = unsafe { libc::CMSG_FIRSTHDR(&raw const msg) };
         debug_assert!(!cmsg.is_null());
@@ -383,11 +414,13 @@ fn send_frame(
             (*cmsg).cmsg_type = libc::SCM_RIGHTS;
             #[allow(clippy::cast_possible_truncation)]
             {
-                (*cmsg).cmsg_len = libc::CMSG_LEN(size_of::<i32>() as u32) as _;
+                (*cmsg).cmsg_len = libc::CMSG_LEN(cmsg_data_len) as _;
             }
             #[allow(clippy::cast_ptr_alignment)]
             let data_ptr = libc::CMSG_DATA(cmsg).cast::<i32>();
-            std::ptr::write_unaligned(data_ptr, f.as_raw_fd());
+            for (i, fd) in fds.iter().enumerate() {
+                std::ptr::write_unaligned(data_ptr.add(i), fd.as_raw_fd());
+            }
         }
     }
 

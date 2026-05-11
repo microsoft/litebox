@@ -8,8 +8,10 @@
 //! [`crate::fd_token_service`] (host-fd ops) and — once Phase B-Step6
 //! lands — `crate::state_service` (eventfd and other state-object ops).
 
-use crate::fd_token_service::{HandlerFatal, handle_request};
+use crate::fd_token_service::{HandlerFatal, handle_request as host_fd_handle_request};
 use crate::fd_tokens::BrokerFdTokenRegistry;
+use crate::state_registry::BrokerStateRegistry;
+use crate::state_service::{ConnState, handle_request as state_handle_request};
 use litebox_common_linux::fd_token_protocol::{
     BODY_MAX, CTRL_HEADER_LEN, Opcode, OwnedFrame, ProtocolError, decode,
 };
@@ -52,11 +54,16 @@ enum ConnError {
     HandlerFatal(#[from] HandlerFatal),
 }
 
-/// Reads one complete frame plus zero or one `SCM_RIGHTS` fd.
-/// Returns `(encoded_bytes, optional_fd)`. Bytes can then be `decode`d.
-fn read_request(stream: &UnixStream) -> Result<(Vec<u8>, Option<OwnedFd>), ConnError> {
+/// Reads one complete frame plus zero, one, or two `SCM_RIGHTS` fds.
+/// Returns `(encoded_bytes, attached_fds)`. Bytes can then be `decode`d.
+///
+/// The cap of 2 attached fds matches the maximum any current opcode
+/// expects (`RegisterNotificationRing` carries the two memfds of a
+/// `ShmemRingPair`).
+fn read_request(stream: &UnixStream) -> Result<(Vec<u8>, Vec<OwnedFd>), ConnError> {
+    // CMSG_SPACE for up to 2 fds.
     #[allow(clippy::cast_possible_truncation)]
-    const CMSG_SPACE: usize = unsafe { libc::CMSG_SPACE(size_of::<i32>() as u32) as usize };
+    const CMSG_SPACE: usize = unsafe { libc::CMSG_SPACE((2 * size_of::<i32>()) as u32) as usize };
     #[repr(C)]
     union CmsgBuf {
         _align: libc::cmsghdr,
@@ -97,8 +104,8 @@ fn read_request(stream: &UnixStream) -> Result<(Vec<u8>, Option<OwnedFd>), ConnE
         return Err(ConnError::CmsgTruncated);
     }
 
-    // Extract SCM_RIGHTS fd if any (at most 1).
-    let mut received_fd: Option<OwnedFd> = None;
+    // Extract SCM_RIGHTS fds. Up to 2 supported.
+    let mut received_fds: Vec<OwnedFd> = Vec::new();
     let mut cmsg = unsafe { libc::CMSG_FIRSTHDR(&raw const msg) };
     while !cmsg.is_null() {
         let hdr = unsafe { &*cmsg };
@@ -109,19 +116,20 @@ fn read_request(stream: &UnixStream) -> Result<(Vec<u8>, Option<OwnedFd>), ConnE
                 return Err(ConnError::MalformedCmsg);
             }
             let fd_count = ((hdr.cmsg_len as usize) - header_len) / size_of::<i32>();
-            if fd_count > 1 {
-                // Reject; close all received fds.
+            if received_fds.len() + fd_count > 2 {
                 for i in 0..fd_count {
                     #[allow(clippy::cast_ptr_alignment)]
                     let raw = unsafe { std::ptr::read_unaligned(data_ptr.cast::<i32>().add(i)) };
                     drop(unsafe { OwnedFd::from_raw_fd(raw) });
                 }
-                return Err(ConnError::TooManyFds { count: fd_count });
+                return Err(ConnError::TooManyFds {
+                    count: received_fds.len() + fd_count,
+                });
             }
-            if fd_count == 1 {
+            for i in 0..fd_count {
                 #[allow(clippy::cast_ptr_alignment)]
-                let raw = unsafe { std::ptr::read_unaligned(data_ptr.cast::<i32>()) };
-                received_fd = Some(unsafe { OwnedFd::from_raw_fd(raw) });
+                let raw = unsafe { std::ptr::read_unaligned(data_ptr.cast::<i32>().add(i)) };
+                received_fds.push(unsafe { OwnedFd::from_raw_fd(raw) });
             }
         }
         cmsg = unsafe { libc::CMSG_NXTHDR(&raw const msg, cmsg) };
@@ -167,7 +175,7 @@ fn read_request(stream: &UnixStream) -> Result<(Vec<u8>, Option<OwnedFd>), ConnE
         full.extend_from_slice(&body_buf);
     }
 
-    Ok((full, received_fd))
+    Ok((full, received_fds))
 }
 
 /// Sends an [`OwnedFrame`] plus an optional fd via `sendmsg`.
@@ -236,10 +244,15 @@ fn write_response(
 
 /// Runs the per-connection request/response loop until the peer
 /// closes or an error is observed.
-pub fn handle_control_connection(stream: UnixStream, registry: Arc<BrokerFdTokenRegistry>) {
+pub fn handle_control_connection(
+    stream: UnixStream,
+    fd_registry: Arc<BrokerFdTokenRegistry>,
+    state_registry: Arc<BrokerStateRegistry>,
+) {
+    let mut conn_state = ConnState::new();
     loop {
         match read_request(&stream) {
-            Ok((bytes, in_fd)) => {
+            Ok((bytes, in_fds)) => {
                 let frame = match decode(&bytes) {
                     Ok(f) => f,
                     Err(e) => {
@@ -247,25 +260,81 @@ pub fn handle_control_connection(stream: UnixStream, registry: Arc<BrokerFdToken
                         return;
                     }
                 };
-                // For Phase B-Step5 only the host-fd opcodes are wired
-                // through this dispatcher. Non-host-fd opcodes panic
-                // in the service; in Step 6 we'll add the state_service
-                // dispatch alongside.
-                let is_host_fd_opcode = matches!(
-                    frame.opcode,
-                    Opcode::Register | Opcode::Materialize | Opcode::Release
-                );
-                if !is_host_fd_opcode {
-                    warn!(
-                        opcode = ?frame.opcode,
-                        "fd-token control: non-host-fd opcode not yet handled; closing"
-                    );
-                    return;
-                }
-                let result = match handle_request(&registry, &frame, in_fd) {
-                    Ok(r) => r,
-                    Err(e) => {
-                        warn!(error = %e, "fd-token control: fatal handler error");
+                let result = match frame.opcode {
+                    Opcode::Register | Opcode::Materialize => {
+                        // Host-fd opcodes: route to fd_token_service.
+                        // It expects Option<OwnedFd>; collapse Vec → Option.
+                        let mut fds: Vec<OwnedFd> = in_fds;
+                        if fds.len() > 1 {
+                            warn!("fd-token control: host-fd opcode with >1 fds; closing");
+                            return;
+                        }
+                        let in_fd = fds.pop();
+                        let host_result = match host_fd_handle_request(&fd_registry, &frame, in_fd)
+                        {
+                            Ok(r) => r,
+                            Err(e) => {
+                                warn!(error = %e, "fd-token control: fatal handler error");
+                                return;
+                            }
+                        };
+                        SocketHandlerResult {
+                            frame: host_result.frame,
+                            out_fd: host_result.out_fd,
+                        }
+                    }
+                    Opcode::Release => {
+                        // Release: try host-fd registry first; if unknown there, try state registry.
+                        // Both registries use independent monotonic id spaces, so an id will
+                        // never be in both. Easy disambiguation.
+                        let fds: Vec<OwnedFd> = in_fds;
+                        if !fds.is_empty() {
+                            warn!("fd-token control: Release with attached fds; closing");
+                            return;
+                        }
+                        let host_result = match host_fd_handle_request(&fd_registry, &frame, None) {
+                            Ok(r) => r,
+                            Err(e) => {
+                                warn!(error = %e, "fd-token control: fatal handler error");
+                                return;
+                            }
+                        };
+                        if host_result.frame.status
+                            == litebox_common_linux::fd_token_protocol::StatusCode::UnknownHandle
+                        {
+                            let state_result = state_handle_request(
+                                &state_registry,
+                                &mut conn_state,
+                                &frame,
+                                Vec::new(),
+                            );
+                            SocketHandlerResult {
+                                frame: state_result.frame,
+                                out_fd: state_result.out_fd,
+                            }
+                        } else {
+                            SocketHandlerResult {
+                                frame: host_result.frame,
+                                out_fd: host_result.out_fd,
+                            }
+                        }
+                    }
+                    Opcode::RegisterNotificationRing
+                    | Opcode::CreateEventfd
+                    | Opcode::ReadEventfd
+                    | Opcode::WriteEventfd
+                    | Opcode::SubscribeEventfd
+                    | Opcode::Unsubscribe => {
+                        // State-object opcodes: route to state_service.
+                        let state_result =
+                            state_handle_request(&state_registry, &mut conn_state, &frame, in_fds);
+                        SocketHandlerResult {
+                            frame: state_result.frame,
+                            out_fd: state_result.out_fd,
+                        }
+                    }
+                    other => {
+                        warn!(opcode = ?other, "fd-token control: response opcode received as request; closing");
                         return;
                     }
                 };
@@ -286,11 +355,17 @@ pub fn handle_control_connection(stream: UnixStream, registry: Arc<BrokerFdToken
     }
 }
 
+struct SocketHandlerResult {
+    frame: OwnedFrame,
+    out_fd: Option<OwnedFd>,
+}
+
 /// Spawns a thread that listens on `path` and handles each accepted
-/// connection on its own thread.
+/// connection on its own thread, with both registries available.
 pub fn spawn_control_listener(
     path: &Path,
-    registry: Arc<BrokerFdTokenRegistry>,
+    fd_registry: Arc<BrokerFdTokenRegistry>,
+    state_registry: Arc<BrokerStateRegistry>,
 ) -> std::io::Result<JoinHandle<()>> {
     let _ = std::fs::remove_file(path);
     let listener = UnixListener::bind(path)?;
@@ -302,10 +377,14 @@ pub fn spawn_control_listener(
             for incoming in listener.incoming() {
                 match incoming {
                     Ok(stream) => {
-                        let registry = Arc::clone(&registry);
-                        if let Err(e) = thread::Builder::new()
-                            .name("fd-token-conn".into())
-                            .spawn(move || handle_control_connection(stream, registry))
+                        let fd_registry = Arc::clone(&fd_registry);
+                        let state_registry = Arc::clone(&state_registry);
+                        if let Err(e) =
+                            thread::Builder::new()
+                                .name("fd-token-conn".into())
+                                .spawn(move || {
+                                    handle_control_connection(stream, fd_registry, state_registry)
+                                })
                         {
                             warn!(error = %e, "failed to spawn fd-token connection thread");
                         }
@@ -339,23 +418,27 @@ mod tests {
         tempfile::TempDir,
         std::path::PathBuf,
         Arc<BrokerFdTokenRegistry>,
+        Arc<BrokerStateRegistry>,
     ) {
         let dir = tempdir().expect("tempdir");
         let path = dir.path().join("fd-token.sock");
-        let registry = Arc::new(BrokerFdTokenRegistry::new());
-        let _ = spawn_control_listener(&path, Arc::clone(&registry)).expect("spawn");
+        let fd_registry = Arc::new(BrokerFdTokenRegistry::new());
+        let state_registry = Arc::new(BrokerStateRegistry::new());
+        let _ =
+            spawn_control_listener(&path, Arc::clone(&fd_registry), Arc::clone(&state_registry))
+                .expect("spawn");
         for _ in 0..100 {
             if path.exists() {
                 break;
             }
             thread::sleep(std::time::Duration::from_millis(10));
         }
-        (dir, path, registry)
+        (dir, path, fd_registry, state_registry)
     }
 
     #[test]
     fn end_to_end_host_fd_lifecycle() {
-        let (_dir, path, registry) = spawn_test_listener();
+        let (_dir, path, registry, _state) = spawn_test_listener();
         let client = FdTokenClient::connect(&path).expect("connect");
 
         let (r, w) = pipe_pair();
@@ -378,7 +461,7 @@ mod tests {
 
     #[test]
     fn unknown_handle_returns_typed_error() {
-        let (_dir, path, _registry) = spawn_test_listener();
+        let (_dir, path, _registry, _state) = spawn_test_listener();
         let client = FdTokenClient::connect(&path).expect("connect");
 
         match client.materialize(99_999) {
@@ -394,7 +477,7 @@ mod tests {
 
     #[test]
     fn many_requests_over_one_connection() {
-        let (_dir, path, registry) = spawn_test_listener();
+        let (_dir, path, registry, _state) = spawn_test_listener();
         let client = FdTokenClient::connect(&path).expect("connect");
         for _ in 0..50 {
             let (r, _w) = pipe_pair();
@@ -402,5 +485,62 @@ mod tests {
             client.release(id).expect("release");
         }
         assert_eq!(registry.live_token_count(), 0);
+    }
+
+    #[test]
+    fn end_to_end_eventfd_via_client() {
+        use litebox_common_linux::notification_frame::{NOTIFY_EVENT_IN, NOTIFY_EVENT_OUT};
+        use litebox_common_linux::notification_ring::NotificationReceiver;
+        use litebox_common_linux::shmem_ring::ShmemRingPair;
+
+        let (_dir, path, _fd_registry, state_registry) = spawn_test_listener();
+        let client = FdTokenClient::connect(&path).expect("connect");
+
+        // Set up the notification ring. Worker creates the pair; broker
+        // takes the writer half via SCM_RIGHTS.
+        let (pair, tx_fd, rx_fd) = ShmemRingPair::create().expect("ring create");
+        let (_worker_writer_unused, worker_reader) = pair.into_parts();
+        client
+            .register_notification_ring(tx_fd, rx_fd)
+            .expect("register_notification_ring");
+        let mut receiver = NotificationReceiver::new(worker_reader);
+
+        // Create an eventfd.
+        let handle = client.create_eventfd(0, false).expect("create_eventfd");
+        assert!(handle > 0);
+        assert_eq!(state_registry.live_handle_count(), 1);
+
+        // Subscribe with IN+OUT, expect priming notification for OUT.
+        client
+            .subscribe_eventfd(handle, 42, NOTIFY_EVENT_IN | NOTIFY_EVENT_OUT)
+            .expect("subscribe");
+        let priming = receiver.recv().expect("recv priming");
+        assert_eq!(priming.subscription_id, 42);
+        assert_eq!(priming.events, NOTIFY_EVENT_OUT);
+
+        // Write a value; expect notification for IN+OUT.
+        client.write_eventfd(handle, 7).expect("write");
+        let notif = receiver.recv().expect("recv after write");
+        assert_eq!(notif.subscription_id, 42);
+        assert_eq!(notif.events, NOTIFY_EVENT_IN | NOTIFY_EVENT_OUT);
+
+        // Read; expect 7 + notification for OUT only.
+        let value = client.read_eventfd(handle).expect("read");
+        assert_eq!(value, 7);
+        let notif = receiver.recv().expect("recv after read");
+        assert_eq!(notif.events, NOTIFY_EVENT_OUT);
+
+        // Read on empty: WouldBlock.
+        match client.read_eventfd(handle) {
+            Err(litebox_common_linux::fd_token_client::ClientError::WouldBlock) => {}
+            other => panic!("expected WouldBlock, got {other:?}"),
+        }
+
+        // Unsubscribe.
+        client.unsubscribe(handle, 42).expect("unsubscribe");
+
+        // Release the eventfd handle.
+        client.release(handle).expect("release");
+        assert_eq!(state_registry.live_handle_count(), 0);
     }
 }

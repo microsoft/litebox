@@ -147,7 +147,11 @@ impl Opcode {
     /// response side for `MaterializeResponse`).
     pub fn expected_fd_count(self) -> usize {
         match self {
-            Opcode::Register | Opcode::RegisterNotificationRing | Opcode::MaterializeResponse => 1,
+            // RegisterNotificationRing sends both memfds of a
+            // ShmemRingPair (we use only the writer side; the unused
+            // direction is inert).
+            Opcode::RegisterNotificationRing => 2,
+            Opcode::Register | Opcode::MaterializeResponse => 1,
             _ => 0,
         }
     }
@@ -754,7 +758,7 @@ mod tests {
     #[test]
     fn expected_fd_count() {
         assert_eq!(Opcode::Register.expected_fd_count(), 1);
-        assert_eq!(Opcode::RegisterNotificationRing.expected_fd_count(), 1);
+        assert_eq!(Opcode::RegisterNotificationRing.expected_fd_count(), 2);
         assert_eq!(Opcode::MaterializeResponse.expected_fd_count(), 1);
         for op in [
             Opcode::Materialize,

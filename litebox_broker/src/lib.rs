@@ -19,4 +19,5 @@ pub mod policy;
 pub mod sandbox_policy;
 pub mod sock_compat;
 pub mod state_registry;
+pub mod state_service;
 pub mod subscription_list;
