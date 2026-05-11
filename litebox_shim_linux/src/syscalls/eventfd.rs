@@ -914,17 +914,17 @@ mod tests {
     /// write → read → counter-zero cycle, when the provider is a REAL
     /// `FdTokenClient` against a REAL in-process broker?
     ///
-    /// This isolates the "BrokerBacked + real broker RPC" code path
-    /// from the test harness's own use of eventfd for coordination
-    /// (which masks the underlying behaviour). The test uses
-    /// `std::sync::mpsc` for any test-side coordination, NOT eventfd.
-    ///
-    /// If this test fails, the bug is in BrokerBacked's interaction
-    /// with the real broker (most likely a downstream-of-sys_eventfd2
-    /// issue we haven't yet isolated).
-    /// If this test passes, the in-worker regression observed in
-    /// the docker integration suite is something specific to the
-    /// harness's eventfd usage pattern, not BrokerBacked itself.
+    /// **Coverage limitation**: this test exercises a SINGLE eventfd
+    /// in a SINGLE task in a SINGLE thread. It does NOT exercise
+    /// fork (delayed/snapshot/restore), cross-process eventfd
+    /// inheritance, SCM_RIGHTS transfer of eventfds, multi-thread
+    /// blocking-read wake-up, or concurrent operations across many
+    /// eventfds. The docker integration regression triggers under
+    /// fork-based test patterns the harness uses, so this test
+    /// passing does NOT prove broker-backed eventfds work for that
+    /// path. It DOES prove they work for the basic non-fork case —
+    /// useful as a regression pin, and as evidence that the bug
+    /// is fork-path-specific.
     #[test]
     fn sys_eventfd2_via_real_broker_basic_write_read() {
         use crate::syscalls::eventfd::set_broker_eventfd_provider;
