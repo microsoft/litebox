@@ -3080,4 +3080,84 @@ mod tests {
         assert!(host_signal_should_raise(segv));
         assert!(!host_signal_should_raise(stop));
     }
+
+    /// Phase B-Step9 followup pin test.
+    ///
+    /// Documents (and locks in) the current contract of
+    /// [`setup_broker_eventfd_provider`]: it MUST NOT spawn a
+    /// background reader thread nor call
+    /// [`litebox_shim_linux::syscalls::set_broker_eventfd_provider`].
+    ///
+    /// Why: the runner's fork-snapshot/restore mechanism does not yet
+    /// handle threads that exist in the parent at fork-snapshot time.
+    /// An extra background thread reliably hangs cross-worker SCM
+    /// tests (`SCM.pass_two_fds_one_msg.dpg1_to_dpg2` and friends).
+    /// See the comment on `setup_broker_eventfd_provider` for the
+    /// follow-up plan.
+    ///
+    /// If a future change re-introduces the dispatcher thread without
+    /// first making it fork-safe, this test will catch the regression
+    /// at unit-test time instead of waiting for the 30+ minute
+    /// integration cycle.
+    #[test]
+    fn setup_broker_eventfd_provider_does_not_install_provider() {
+        use litebox_broker::fd_token_socket::spawn_control_listener;
+        use litebox_broker::fd_tokens::BrokerFdTokenRegistry;
+        use litebox_broker::state_registry::BrokerStateRegistry;
+        use std::sync::Arc;
+        use tempfile::tempdir;
+
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("fd-token.sock");
+        let fd_registry = Arc::new(BrokerFdTokenRegistry::new());
+        let state_registry = Arc::new(BrokerStateRegistry::new());
+        let _listener =
+            spawn_control_listener(&path, Arc::clone(&fd_registry), Arc::clone(&state_registry))
+                .expect("spawn listener");
+
+        for _ in 0..100 {
+            if path.exists() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(path.exists(), "broker control socket never appeared");
+
+        // Snapshot live thread count before setup. We can't use
+        // a precise check (tracing-subscriber's worker threads, libtest
+        // background threads etc. all show up), so we count delta.
+        let before = thread_count_after_settling();
+        let result = setup_broker_eventfd_provider(path.to_str().expect("path utf8"));
+        assert!(result.is_ok(), "setup must succeed: {result:?}");
+        let after = thread_count_after_settling();
+
+        // GUARANTEE: setup_broker_eventfd_provider must NOT increase
+        // the thread count. The notification dispatcher thread is
+        // currently the only thread this function would ever spawn,
+        // and it must stay deferred.
+        assert!(
+            after <= before,
+            "setup_broker_eventfd_provider must not spawn background threads \
+             (before={before}, after={after}); see fork-restore safety comment",
+        );
+
+        // Also assert the global provider was NOT installed. A subsequent
+        // sys_eventfd2 call (in real usage) will therefore fall back to
+        // local EventFile::new — which is what we want until the
+        // dispatcher integration is fork-safe.
+        assert!(
+            litebox_shim_linux::syscalls::broker_eventfd_provider().is_none(),
+            "broker eventfd provider must not be installed; see fork-restore \
+             safety comment on setup_broker_eventfd_provider",
+        );
+    }
+
+    fn thread_count_after_settling() -> usize {
+        // Sleep briefly to let any short-lived helper threads finish.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        // /proc/self/task has one entry per kernel-visible thread.
+        std::fs::read_dir("/proc/self/task")
+            .map(|it| it.filter_map(Result::ok).count())
+            .unwrap_or(0)
+    }
 }

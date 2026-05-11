@@ -10,6 +10,7 @@ pub(crate) mod eventfd;
 /// calls this at bootstrap if a broker fd-token control socket is
 /// available; the shim consults the registered provider from
 /// `sys_eventfd2`.
+pub use eventfd::broker_eventfd_provider;
 pub use eventfd::set_broker_eventfd_provider;
 
 pub mod file;
