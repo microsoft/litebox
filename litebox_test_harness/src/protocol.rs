@@ -321,32 +321,6 @@ pub enum Command {
     #[serde(rename = "kill")]
     Kill { pid: u32 },
 
-    /// Open `count` concurrent TCP connections to `addr`, send `data` on each,
-    /// read echoed response, report success count. Tests for data corruption
-    /// and connection races under concurrency.
-    #[serde(rename = "net_connect_many")]
-    NetConnectMany {
-        addr: String,
-        data: String,
-        count: u32,
-        delay_ms: u32,
-    },
-
-    /// Send `size` bytes of a known repeating pattern to `addr`, read `size`
-    /// bytes back, verify byte-by-byte integrity. Tests backpressure and
-    /// large-transfer correctness.
-    #[serde(rename = "net_send_recv")]
-    NetSendRecv { addr: String, size: u32 },
-
-    /// Open `count` sequential TCP connections to `addr`, send `data` on each,
-    /// read echo, close. Tests `TIME_WAIT` handling and rapid port reuse.
-    #[serde(rename = "net_reconnect_stress")]
-    NetReconnectStress {
-        addr: String,
-        count: u32,
-        data: String,
-    },
-
     /// Connect to `addr`, send `size` bytes, read file at `path`, then read
     /// echoed TCP data. Reports both file content and TCP integrity. Tests for
     /// 9P deadlock when file I/O happens while TCP sockets are active.
@@ -372,7 +346,6 @@ pub enum Command {
     /// Tests monotonic `pair_id` generation (vs. Arc pointer reuse).
     #[serde(rename = "pipe_pair_id_unique")]
     PipePairIdUnique { count: u32 },
-
 
     /// Open an eventfd and register it in this agent's local registry.
     /// Flags are parsed from strings like "semaphore|nonblock|cloexec".
@@ -550,7 +523,6 @@ pub enum Response {
     /// Readiness or wait predicate satisfied.
     #[serde(rename = "ready")]
     Ready,
-
 
     /// Error.
     #[serde(rename = "error")]
