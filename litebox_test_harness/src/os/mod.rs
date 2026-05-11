@@ -7,3 +7,4 @@ pub mod epoll;
 pub mod eventfd;
 pub mod inotify;
 pub mod pty;
+pub mod socket;
