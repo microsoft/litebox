@@ -193,8 +193,7 @@ async fn handle_keepalive_roundtrip(
             libc::SOL_SOCKET,
             libc::SO_KEEPALIVE,
             std::ptr::from_ref(&on).cast::<libc::c_void>(),
-            u32::try_from(std::mem::size_of::<libc::c_int>())
-                .expect("c_int size fits in u32"),
+            u32::try_from(std::mem::size_of::<libc::c_int>()).expect("c_int size fits in u32"),
         )
     };
     let set_ok = set_rc == 0;
@@ -207,8 +206,8 @@ async fn handle_keepalive_roundtrip(
 
     // getsockopt(SO_KEEPALIVE).
     let mut value: libc::c_int = 0;
-    let mut len: libc::socklen_t = u32::try_from(std::mem::size_of::<libc::c_int>())
-        .expect("c_int size fits in u32");
+    let mut len: libc::socklen_t =
+        u32::try_from(std::mem::size_of::<libc::c_int>()).expect("c_int size fits in u32");
     // SAFETY: raw_fd is live; value + len are valid writable storage.
     let get_rc = unsafe {
         libc::getsockopt(

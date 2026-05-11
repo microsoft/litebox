@@ -17,6 +17,11 @@
 //!   - Agent topology: A (depth 1), AA (depth 2), NP (non-PIE worker)
 //!   - Subcommand vs bash: protocol Exec(bash -c ...) and direct fork
 
+use serde::{Deserialize, Serialize};
+
+use crate::handlers::{HandlerCtx, HandlerError, HandlerToken};
+use crate::register_handler;
+
 use super::agents::AgentName;
 use super::registry::Registry;
 
@@ -75,9 +80,38 @@ const PIPELINE_PATTERNS: &[PipelinePattern] = &[
     },
 ];
 
+// ─── Handler shared across pipeline + xworker bash tests ────────────
+
+#[derive(Serialize, Deserialize)]
+struct BashArgs {
+    cmd: String,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+struct BashOut {
+    stdout: String,
+    exit_code: i32,
+}
+
+const BASH: HandlerToken<BashArgs, BashOut> = HandlerToken::new("concurrent_fork.bash");
+
+async fn handle_bash(args: BashArgs, _ctx: &mut HandlerCtx<'_>) -> Result<BashOut, HandlerError> {
+    let out = tokio::process::Command::new("bash")
+        .arg("-c")
+        .arg(&args.cmd)
+        .output()
+        .await?;
+    Ok(BashOut {
+        stdout: String::from_utf8_lossy(&out.stdout).to_string(),
+        exit_code: out.status.code().unwrap_or(-1),
+    })
+}
+
 /// Register concurrent fork pipeline tests.
 #[allow(clippy::too_many_lines)] // exhaustive registration / runner
 pub(crate) fn register_concurrent_fork_pipeline(reg: &mut Registry<'_>) {
+    register_handler!(BASH, handle_bash);
+
     for &agent in CF_AGENTS {
         for pat in PIPELINE_PATTERNS {
             let name = pat.name;
@@ -95,31 +129,22 @@ pub(crate) fn register_concurrent_fork_pipeline(reg: &mut Registry<'_>) {
                 let handle = cx.require(agent);
                 Box::new(move |run| {
                     Box::pin(async move {
-                        let resp = run
-                            .send(
-                                &handle,
-                                super::exec_timeout(
-                                    vec!["bash".into(), "-c".into(), cmd.into()],
-                                    15,
-                                ),
-                            )
+                        let result = run
+                            .send_named_typed(&handle, &BASH, BashArgs { cmd: cmd.into() })
                             .await;
-                        let pass = match &resp {
-                            crate::protocol::Response::ExecResult {
-                                exit_code: 0,
-                                stdout,
-                                ..
-                            } => stdout.trim().contains(expected),
-                            _ => false,
-                        };
-                        super::TestOutcome::new(&agent_label, pass, format!("{resp:?}"))
+                        let pass = matches!(
+                            &result,
+                            Ok(out) if out.exit_code == 0 && out.stdout.trim().contains(expected)
+                        );
+                        super::TestOutcome::new(&agent_label, pass, format!("{result:?}"))
                     })
                 })
             });
         }
     }
 
-    // xworker agents
+    // xworker agents — single pipeline + sequential control on Dpg1Dng.
+    #[allow(clippy::single_element_loop)] // loop preserved for parity with legacy + future expansion
     for &agent in &[AgentName::Dpg1Dng] {
         let agent_label = agent.to_string();
         reg.test(
@@ -132,29 +157,23 @@ pub(crate) fn register_concurrent_fork_pipeline(reg: &mut Registry<'_>) {
             let handle = cx.require(agent);
             Box::new(move |run| {
                 Box::pin(async move {
-                    let resp = run
-                        .send(
+                    let result = run
+                        .send_named_typed(
                             &handle,
-                            super::exec_timeout(
-                                vec![
-                                    "bash".into(),
-                                    "-c".into(),
-                                    "echo 'pipe4_vscode_ok: test' | cat | grep pipe4 | sed 's/test/pass/'"
-                                        .into(),
-                                ],
-                                15,
-                            ),
+                            &BASH,
+                            BashArgs {
+                                cmd: "echo 'pipe4_vscode_ok: test' | cat | grep pipe4 \
+                                      | sed 's/test/pass/'"
+                                    .into(),
+                            },
                         )
                         .await;
-                    let pass = match &resp {
-                        crate::protocol::Response::ExecResult {
-                            exit_code: 0,
-                            stdout,
-                            ..
-                        } => stdout.trim().contains("pipe4_vscode_ok: pass"),
-                        _ => false,
-                    };
-                    super::TestOutcome::new(&agent_label, pass, format!("{resp:?}"))
+                    let pass = matches!(
+                        &result,
+                        Ok(out) if out.exit_code == 0
+                            && out.stdout.trim().contains("pipe4_vscode_ok: pass")
+                    );
+                    super::TestOutcome::new(&agent_label, pass, format!("{result:?}"))
                 })
             })
         });
@@ -170,29 +189,22 @@ pub(crate) fn register_concurrent_fork_pipeline(reg: &mut Registry<'_>) {
             let handle = cx.require(agent);
             Box::new(move |run| {
                 Box::pin(async move {
-                    let resp = run
-                        .send(
+                    let result = run
+                        .send_named_typed(
                             &handle,
-                            super::exec_timeout(
-                                vec![
-                                    "bash".into(),
-                                    "-c".into(),
-                                    "echo seq_a > /tmp/cf_test && cat /tmp/cf_test && rm /tmp/cf_test"
-                                        .into(),
-                                ],
-                                15,
-                            ),
+                            &BASH,
+                            BashArgs {
+                                cmd: "echo seq_a > /tmp/cf_test && cat /tmp/cf_test \
+                                      && rm /tmp/cf_test"
+                                    .into(),
+                            },
                         )
                         .await;
-                    let pass = match &resp {
-                        crate::protocol::Response::ExecResult {
-                            exit_code: 0,
-                            stdout,
-                            ..
-                        } => stdout.trim().contains("seq_a"),
-                        _ => false,
-                    };
-                    super::TestOutcome::new(&agent_label, pass, format!("{resp:?}"))
+                    let pass = matches!(
+                        &result,
+                        Ok(out) if out.exit_code == 0 && out.stdout.trim().contains("seq_a")
+                    );
+                    super::TestOutcome::new(&agent_label, pass, format!("{result:?}"))
                 })
             })
         });
