@@ -9,6 +9,7 @@
 //! Also provides a network proxy that bridges guest networking over IPC.
 
 pub mod audit;
+pub mod eventfd_state;
 pub mod fd_token_service;
 pub mod fd_token_socket;
 pub mod fd_tokens;
