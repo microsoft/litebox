@@ -5,3 +5,4 @@
 
 pub mod eventfd;
 pub mod inotify;
+pub mod pty;
