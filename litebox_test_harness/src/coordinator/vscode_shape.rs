@@ -3,10 +3,13 @@
 
 //! Semantic coordinator topology for VS Code Server shape canaries.
 
+use serde::{Deserialize, Serialize};
+
 use super::TestOutcome;
 use super::agents::{AgentBinary, AgentName, AgentSpec, IsolationKind};
 use super::registry::Registry;
-use crate::protocol::{Command, Response};
+use crate::handlers::{HandlerCtx, HandlerError, HandlerToken};
+use crate::register_handler;
 
 /// Semantic agents in the VS Code Server process-tree shape.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -102,7 +105,22 @@ pub fn vscode_tree_specs() -> Vec<AgentSpec> {
     ]
 }
 
+#[derive(Serialize, Deserialize)]
+struct PidOut {
+    pid: u32,
+}
+
+const GET_PID: HandlerToken<(), PidOut> = HandlerToken::new("vscode_shape.get_pid");
+
+async fn handle_get_pid(_args: (), _ctx: &mut HandlerCtx<'_>) -> Result<PidOut, HandlerError> {
+    Ok(PidOut {
+        pid: std::process::id(),
+    })
+}
+
 pub(super) fn register_vscode_shape_tests(reg: &mut Registry<'_>) {
+    register_handler!(GET_PID, handle_get_pid);
+
     reg.test("vscode", "shape", "VS.shape.smoke")
         .timeout(60)
         .build(|cx| {
@@ -124,9 +142,18 @@ pub(super) fn register_vscode_shape_tests(reg: &mut Registry<'_>) {
                     ];
 
                     for (agent, handle) in &agents {
-                        let resp = run.send(handle, Command::GetPid).await;
-                        if !matches!(resp, Response::Ok { data: Some(_) }) {
-                            return TestOutcome::new(agent.name(), false, format!("{resp:?}"));
+                        match run.send_named_typed(handle, &GET_PID, ()).await {
+                            Ok(out) if out.pid > 0 => {}
+                            Ok(out) => {
+                                return TestOutcome::new(
+                                    agent.name(),
+                                    false,
+                                    format!("non-positive pid {}", out.pid),
+                                );
+                            }
+                            Err(e) => {
+                                return TestOutcome::new(agent.name(), false, format!("{e:?}"));
+                            }
                         }
                     }
 
