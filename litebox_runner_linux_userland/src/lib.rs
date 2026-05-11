@@ -2824,31 +2824,43 @@ fn register_worker_spawn_flags(platform: &Platform, cli_args: &CliArgs) {
 ///
 /// Called from `run()` when `--fd-token-broker <path>` is supplied.
 fn setup_broker_eventfd_provider(broker_path: &str) -> anyhow::Result<()> {
-    use litebox_common_linux::broker_eventfd::NotificationDispatcher;
     use litebox_common_linux::fd_token_client::FdTokenClient;
-    use litebox_common_linux::notification_ring::NotificationReceiver;
     use litebox_common_linux::shmem_ring::ShmemRingPair;
     use std::sync::Arc;
 
+    // Phase B-Step8c (Step9-amended): connect, create the ring, register
+    // it with the broker. The full setup that spawns the
+    // `NotificationDispatcher` reader thread is intentionally NOT done
+    // here — that thread breaks fork-restore: the runner's snapshot/
+    // restore mechanism does not yet handle extra threads in the parent
+    // process at fork-snapshot time, and tests that fork the runner
+    // (DifferentProcess agents under Tcp transport) reliably hang
+    // with the dispatcher thread alive.
+    //
+    // Without the dispatcher, broker-backed eventfds will not receive
+    // broker→worker notifications, so `sys_eventfd2` falls back to a
+    // local `EventFile::new` (set_broker_eventfd_provider is NOT called
+    // here). The cross-worker SCM_RIGHTS path for broker-backed
+    // eventfds therefore remains gated on a follow-up that integrates
+    // the dispatcher with the runner's existing event loop (or makes
+    // the thread fork-safe).
     let path = std::path::Path::new(broker_path);
     let client = Arc::new(
         FdTokenClient::connect(path)
             .map_err(|e| anyhow!("connect to fd-token broker at {broker_path}: {e}"))?,
     );
 
-    let (pair, tx_fd, rx_fd) =
+    let (_pair, tx_fd, rx_fd) =
         ShmemRingPair::create().map_err(|e| anyhow!("create notification ring pair: {e:?}"))?;
-    let (_worker_writer_unused, worker_reader) = pair.into_parts();
     client
         .register_notification_ring(tx_fd, rx_fd)
         .map_err(|e| anyhow!("register notification ring with broker: {e}"))?;
 
-    let dispatcher = NotificationDispatcher::start(NotificationReceiver::new(worker_reader));
-    let provider = Arc::new(
-        crate::broker_eventfd_provider::RunnerBrokerEventfdProvider::new(client, dispatcher),
-    );
-    litebox_shim_linux::syscalls::set_broker_eventfd_provider(provider)
-        .map_err(|_| anyhow!("broker eventfd provider already set"))?;
+    // NOTE: deliberately not starting the dispatcher / installing the
+    // provider here. See the comment above. The infrastructure is in
+    // place; a later commit will turn this on once fork-restore can
+    // cope with the reader thread.
+    let _ = client;
     Ok(())
 }
 
