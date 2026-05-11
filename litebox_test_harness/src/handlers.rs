@@ -16,6 +16,7 @@
 
 use std::collections::HashMap;
 use std::future::Future;
+use std::marker::PhantomData;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -23,6 +24,44 @@ use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 use crate::protocol::{Command, Response};
+
+/// Typed wire-name for a registered handler. Pair with
+/// [`register_handler!`] at registration time and
+/// [`crate::coordinator::run_context::RunContext::send_named_typed`]
+/// at the call site for end-to-end Args/Out type checking.
+///
+/// ```ignore
+/// pub const COUNTER: HandlerToken<(), CounterOut> =
+///     HandlerToken::new("eventfd.counter");
+/// register_handler!(COUNTER, handle_counter);
+/// let out: CounterOut = run.send_named_typed(&h, &COUNTER, ()).await?;
+/// ```
+pub struct HandlerToken<A, O> {
+    name: &'static str,
+    _phantom: PhantomData<fn(A) -> O>,
+}
+
+impl<A, O> HandlerToken<A, O> {
+    #[must_use]
+    pub const fn new(name: &'static str) -> Self {
+        Self {
+            name,
+            _phantom: PhantomData,
+        }
+    }
+
+    #[must_use]
+    pub const fn name(&self) -> &'static str {
+        self.name
+    }
+}
+
+impl<A, O> Clone for HandlerToken<A, O> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+impl<A, O> Copy for HandlerToken<A, O> {}
 
 /// Error returned by a handler. String-typed for simplicity.
 #[derive(Debug, Clone)]
@@ -211,8 +250,30 @@ pub fn lookup(name: &str) -> Option<Arc<dyn HandlerDispatch>> {
 /// ```ignore
 /// register_handler!("inotify.create_file.watcher", handle_watch_for_create);
 /// ```
+/// Register a handler against a typed [`HandlerToken`] declared as
+/// a `const`. The token's `A` / `O` types are checked by the Rust
+/// compiler against `fn`'s signature via `handler_fn!`.
+///
+/// ```ignore
+/// const COUNTER: HandlerToken<(), CounterOut> =
+///     HandlerToken::new("eventfd.counter");
+///
+/// async fn handle_counter(_args: (), _ctx: &mut HandlerCtx<'_>)
+///     -> Result<CounterOut, HandlerError> { /* ... */ }
+///
+/// register_handler!(COUNTER, handle_counter);
+/// // ... later, in a test body:
+/// let out = run.send_named_typed(&h, &COUNTER, ()).await?;
+/// ```
+///
+/// The second form accepts a string name + fn for cases where you
+/// don't want a separate token (e.g. one-off testing of the
+/// registry). Prefer the typed-token form for test families.
 #[macro_export]
 macro_rules! register_handler {
+    ($token:ident, $f:path) => {
+        $crate::handlers::register($token.name(), $crate::handler_fn!($f))
+    };
     ($name:expr, $f:path) => {
         $crate::handlers::register($name, $crate::handler_fn!($f))
     };

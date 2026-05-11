@@ -3,27 +3,22 @@
 
 //! Eventfd semantics tests for VS Code/Node platform compatibility.
 //!
-//! Single-agent scenarios (`counter`, `semaphore`, `epollet`) are
-//! migrated to the handler-refactor protocol — each is one
-//! `Command::Run` round-trip against a registered handler that
-//! drives the eventfd syscalls inline.
+//! Migrated to the typed-handler protocol. Each scenario declares a
+//! `HandlerToken<Args, Out>` const next to its handler; tests use
+//! `send_named_typed` for type-checked, zero-JSON-drilling call
+//! sites.
 //!
 //! The `cross_agent_wakeup` scenario stays on the legacy protocol
-//! (`Command::EventfdOpen` / `EventfdShare` / `EventfdReadShared` /
-//! `EventfdClose`) because it exercises the agent-internal share-
-//! registry abstraction (layer 1 only — no actual `SCM_RIGHTS` fd
-//! passing). Collapsing it into a single-agent handler would
-//! eliminate the authorization check the test currently exercises.
-//! Reframing as a true cross-process fd-pass test (layer 2) is a
-//! separate effort.
+//! because it exercises the agent-internal layer-1 share-registry
+//! abstraction (not real cross-process kernel behavior). Reframing
+//! as a true `SCM_RIGHTS` layer-2 test is future work.
 
-use crate::handlers::{HandlerCtx, HandlerError};
+use crate::handlers::{HandlerCtx, HandlerError, HandlerToken};
 use crate::os::eventfd::EventFd;
 use crate::protocol::{Command, Response};
 use crate::register_handler;
 
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
 
 use super::TestOutcome;
 use super::agents::AgentName;
@@ -37,23 +32,32 @@ pub(crate) const EV_AGENTS: &[AgentName] = &[
     AgentName::Dpg2Dpg,
 ];
 
-// ─── Handler args ───────────────────────────────────────────────────
+// ─── Outputs ────────────────────────────────────────────────────────
 
-#[derive(Serialize, Deserialize)]
-struct CounterArgs;
+#[derive(Serialize, Deserialize, Debug)]
+struct CounterOut {
+    value: u64,
+}
 
-#[derive(Serialize, Deserialize)]
-struct SemaphoreArgs;
+#[derive(Serialize, Deserialize, Debug)]
+struct SemaphoreOut {
+    reads: u32,
+}
 
-#[derive(Serialize, Deserialize)]
-struct EpolletArgs;
+#[derive(Serialize, Deserialize, Debug)]
+struct EpolletOut {
+    detail: String,
+}
+
+// ─── Typed handler tokens ──────────────────────────────────────────
+
+const COUNTER: HandlerToken<(), CounterOut> = HandlerToken::new("eventfd.counter");
+const SEMAPHORE: HandlerToken<(), SemaphoreOut> = HandlerToken::new("eventfd.semaphore");
+const EPOLLET: HandlerToken<(), EpolletOut> = HandlerToken::new("eventfd.epollet");
 
 // ─── Handlers ───────────────────────────────────────────────────────
 
-async fn handle_counter(
-    _args: CounterArgs,
-    _ctx: &mut HandlerCtx<'_>,
-) -> Result<Value, HandlerError> {
+async fn handle_counter(_args: (), _ctx: &mut HandlerCtx<'_>) -> Result<CounterOut, HandlerError> {
     let ev = EventFd::open(0, "nonblock")?;
     ev.write(3)?;
     ev.write(5)?;
@@ -63,19 +67,18 @@ async fn handle_counter(
             "expected accumulated=8 got {accumulated}"
         )));
     }
-    // Second read with no data: must EAGAIN.
     match ev.read() {
         Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
         Err(e) => return Err(HandlerError(format!("expected EAGAIN, got {e}"))),
         Ok(v) => return Err(HandlerError(format!("expected EAGAIN, got value {v}"))),
     }
-    Ok(json!({ "value": accumulated }))
+    Ok(CounterOut { value: accumulated })
 }
 
 async fn handle_semaphore(
-    _args: SemaphoreArgs,
+    _args: (),
     _ctx: &mut HandlerCtx<'_>,
-) -> Result<Value, HandlerError> {
+) -> Result<SemaphoreOut, HandlerError> {
     let ev = EventFd::open(5, "semaphore|nonblock")?;
     for i in 0..5 {
         let v = ev.read()?;
@@ -90,13 +93,10 @@ async fn handle_semaphore(
         Err(e) => return Err(HandlerError(format!("expected EAGAIN, got {e}"))),
         Ok(v) => return Err(HandlerError(format!("expected EAGAIN, got value {v}"))),
     }
-    Ok(json!({ "reads": 5 }))
+    Ok(SemaphoreOut { reads: 5 })
 }
 
-async fn handle_epollet(
-    _args: EpolletArgs,
-    _ctx: &mut HandlerCtx<'_>,
-) -> Result<Value, HandlerError> {
+async fn handle_epollet(_args: (), _ctx: &mut HandlerCtx<'_>) -> Result<EpolletOut, HandlerError> {
     let ev = EventFd::open(0, "nonblock|cloexec")?;
     ev.write(3)?;
     ev.write(5)?;
@@ -104,42 +104,27 @@ async fn handle_epollet(
     if !detail.contains("first=1") || !detail.contains("second=0") || !detail.contains("value=8") {
         return Err(HandlerError(format!("epollet detail mismatch: {detail}")));
     }
-    Ok(json!({ "detail": detail }))
+    Ok(EpolletOut { detail })
 }
 
 // ─── Registration ──────────────────────────────────────────────────
 
 pub(crate) fn register_eventfd_tests(reg: &mut Registry<'_>) {
-    register_handler!("eventfd.counter", handle_counter);
-    register_handler!("eventfd.semaphore", handle_semaphore);
-    register_handler!("eventfd.epollet", handle_epollet);
+    register_handler!(COUNTER, handle_counter);
+    register_handler!(SEMAPHORE, handle_semaphore);
+    register_handler!(EPOLLET, handle_epollet);
 
     for &agent in EV_AGENTS {
-        let agent_label = agent.to_string();
-        for (name, handler) in &[
-            ("counter", "eventfd.counter"),
-            ("semaphore", "eventfd.semaphore"),
-            ("epollet", "eventfd.epollet"),
-        ] {
-            let label = agent_label.clone();
-            let scenario_name = *name;
-            let handler_name = *handler;
-            reg.test("vscode", "eventfd", format!("EV.{scenario_name}.{agent}"))
-                .timeout(60)
-                .build(move |cx| {
-                    let h = cx.require(agent);
-                    let label = label.clone();
-                    Box::new(move |run| {
-                        Box::pin(async move {
-                            let result = run.send_named(&h, handler_name, Value::Null).await;
-                            match result {
-                                Ok(data) => TestOutcome::new(&label, true, format!("{data}")),
-                                Err(e) => TestOutcome::new(&label, false, e),
-                            }
-                        })
-                    })
-                });
-        }
+        let label = agent.to_string();
+        register_single_agent_test(reg, "EV.counter", agent, &label, &COUNTER, |out| {
+            Ok(format!("counter value={}", out.value))
+        });
+        register_single_agent_test(reg, "EV.semaphore", agent, &label, &SEMAPHORE, |out| {
+            Ok(format!("semaphore reads={}", out.reads))
+        });
+        register_single_agent_test(reg, "EV.epollet", agent, &label, &EPOLLET, |out| {
+            Ok(format!("epollet {}", out.detail))
+        });
     }
 
     // Cross-agent share-registry tests stay on the legacy protocol.
@@ -170,6 +155,40 @@ pub(crate) fn register_eventfd_tests(reg: &mut Registry<'_>) {
                 })
             });
     }
+}
+
+/// Register a single-agent test that invokes one handler with `()` args
+/// and applies `check` to the typed result. Common helper for Class 2
+/// migrations — collapses the per-test boilerplate to one call.
+fn register_single_agent_test<O: serde::de::DeserializeOwned + Send + 'static>(
+    reg: &mut Registry<'_>,
+    test_id_prefix: &str,
+    agent: AgentName,
+    label: &str,
+    token: &'static HandlerToken<(), O>,
+    check: fn(&O) -> Result<String, String>,
+) {
+    let id = format!("{test_id_prefix}.{agent}");
+    let label = label.to_string();
+    reg.test("vscode", "eventfd", id)
+        .timeout(60)
+        .build(move |cx| {
+            let h = cx.require(agent);
+            let label = label.clone();
+            Box::new(move |run| {
+                Box::pin(async move {
+                    let result = run.send_named_typed(&h, token, ()).await;
+                    let (pass, detail) = match result {
+                        Ok(out) => match check(&out) {
+                            Ok(d) => (true, d),
+                            Err(d) => (false, d),
+                        },
+                        Err(e) => (false, e),
+                    };
+                    TestOutcome::new(&label, pass, detail)
+                })
+            })
+        });
 }
 
 // ─── Legacy cross-agent driver (kept) ──────────────────────────────

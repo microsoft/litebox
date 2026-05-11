@@ -184,6 +184,29 @@ impl<'a> RunContext<'a> {
         }
     }
 
+    /// Token-typed variant of [`Self::send_named`]. The token's
+    /// `A` / `O` types let the framework serialize `args` and
+    /// deserialize the result, so the test author never sees
+    /// `serde_json::Value` at the boundary.
+    ///
+    /// # Errors
+    /// Returns Err on agent-side failure, serialization failure, or
+    /// any non-`Result` response.
+    pub async fn send_named_typed<A, O>(
+        &mut self,
+        handle: &AgentHandle,
+        token: &crate::handlers::HandlerToken<A, O>,
+        args: A,
+    ) -> Result<O, String>
+    where
+        A: serde::Serialize,
+        O: serde::de::DeserializeOwned,
+    {
+        let args_value = serde_json::to_value(&args).map_err(|e| format!("args serialize: {e}"))?;
+        let data = self.send_named(handle, token.name(), args_value).await?;
+        serde_json::from_value(data).map_err(|e| format!("typed deserialize: {e}"))
+    }
+
     /// Write `Command::Run { handler, args }` to `handle`'s pipe
     /// without waiting for a response. The command is routed through
     /// `route` + `wrap_forwards` to reach descendants via their
@@ -223,6 +246,24 @@ impl<'a> RunContext<'a> {
         self.write_routed(handle, cmd).await?;
         self.in_flight_directs.insert(direct.to_string());
         Ok(())
+    }
+
+    /// Token-typed variant of [`Self::run_write`]. Same routing and
+    /// in-flight rules; framework serializes `args` from `A`.
+    ///
+    /// # Errors
+    /// Same as [`Self::run_write`], plus serialization errors.
+    pub async fn run_write_typed<A, O>(
+        &mut self,
+        handle: &AgentHandle,
+        token: &crate::handlers::HandlerToken<A, O>,
+        args: A,
+    ) -> Result<(), String>
+    where
+        A: serde::Serialize,
+    {
+        let args_value = serde_json::to_value(&args).map_err(|e| format!("args serialize: {e}"))?;
+        self.run_write(handle, token.name(), args_value).await
     }
 
     /// Write `Command::Resume { tag }` to `handle`'s pipe without
@@ -290,6 +331,57 @@ impl<'a> RunContext<'a> {
             self.in_flight_directs.remove(direct);
         }
         resp
+    }
+
+    /// Read one response from `handle`'s pipe and expect it to be
+    /// `Response::Checkpoint` with `expected_tag`. Convenience for
+    /// the rendezvous pattern.
+    ///
+    /// # Errors
+    /// Returns Err if the response is not a Checkpoint or if the tag
+    /// doesn't match.
+    pub async fn run_read_checkpoint(
+        &mut self,
+        handle: &AgentHandle,
+        expected_tag: &str,
+    ) -> Result<(), String> {
+        match self.run_read(handle).await {
+            Response::Checkpoint { tag } if tag == expected_tag => Ok(()),
+            Response::Checkpoint { tag } => Err(format!(
+                "expected Checkpoint({expected_tag}), got Checkpoint({tag})"
+            )),
+            other => Err(format!("expected Checkpoint, got {other:?}")),
+        }
+    }
+
+    /// Read one response from `handle`'s pipe and decode the
+    /// terminal `Response::Result` as `O`. Convenience after
+    /// `run_resume` when the handler is expected to finish.
+    ///
+    /// # Errors
+    /// Returns Err on any non-Result response, on `ok: false`, or on
+    /// deserialization failure.
+    pub async fn run_read_result<A, O>(
+        &mut self,
+        handle: &AgentHandle,
+        _token: &crate::handlers::HandlerToken<A, O>,
+    ) -> Result<O, String>
+    where
+        O: serde::de::DeserializeOwned,
+    {
+        match self.run_read(handle).await {
+            Response::Result {
+                ok: true,
+                data,
+                error: _,
+            } => serde_json::from_value(data).map_err(|e| format!("typed deserialize: {e}")),
+            Response::Result {
+                ok: false,
+                data: _,
+                error,
+            } => Err(error.unwrap_or_else(|| "handler failed".into())),
+            other => Err(format!("expected Result, got {other:?}")),
+        }
     }
 
     /// Common helper: route `cmd` to `handle` (Forward-wrapping for

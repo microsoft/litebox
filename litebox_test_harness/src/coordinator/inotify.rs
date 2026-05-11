@@ -17,9 +17,8 @@
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
 
-use crate::handlers::{HandlerCtx, HandlerError};
+use crate::handlers::{HandlerCtx, HandlerError, HandlerToken};
 use crate::os::inotify::{Event, Inotify};
 use crate::register_handler;
 
@@ -101,9 +100,18 @@ struct ActorMove {
     new_path: String,
 }
 
+// ─── Typed handler tokens ──────────────────────────────────────────
+
+const WATCH: HandlerToken<WatchArgs, WatchOut> = HandlerToken::new("inotify.watch");
+const ACTOR_CREATE: HandlerToken<ActorCreate, ()> = HandlerToken::new("inotify.actor.create");
+const ACTOR_MODIFY: HandlerToken<ActorModify, ()> = HandlerToken::new("inotify.actor.modify");
+const ACTOR_DELETE: HandlerToken<ActorDelete, ()> = HandlerToken::new("inotify.actor.delete");
+const ACTOR_MOVE: HandlerToken<ActorMove, ()> = HandlerToken::new("inotify.actor.move");
+const MULTI_WATCH: HandlerToken<MultiArgs, MultiOut> = HandlerToken::new("inotify.multi_watch");
+
 // ─── Watcher handlers ───────────────────────────────────────────────
 
-async fn handle_watch(args: WatchArgs, ctx: &mut HandlerCtx<'_>) -> Result<Value, HandlerError> {
+async fn handle_watch(args: WatchArgs, ctx: &mut HandlerCtx<'_>) -> Result<WatchOut, HandlerError> {
     tokio::fs::create_dir_all(&args.dir).await?;
     if !args.preflight_contents.is_empty() {
         tokio::fs::write(&args.target_path, args.preflight_contents.as_bytes()).await?;
@@ -112,7 +120,7 @@ async fn handle_watch(args: WatchArgs, ctx: &mut HandlerCtx<'_>) -> Result<Value
     let wd = ino.add_watch(&args.dir, args.mask_bits)?;
     ctx.checkpoint("armed").await?;
     let events = ino.drain(Duration::from_secs(2))?;
-    Ok(serde_json::to_value(WatchOut { wd, events })?)
+    Ok(WatchOut { wd, events })
 }
 
 // ─── Actor handlers ─────────────────────────────────────────────────
@@ -120,38 +128,35 @@ async fn handle_watch(args: WatchArgs, ctx: &mut HandlerCtx<'_>) -> Result<Value
 async fn handle_actor_create(
     args: ActorCreate,
     ctx: &mut HandlerCtx<'_>,
-) -> Result<Value, HandlerError> {
+) -> Result<(), HandlerError> {
     tokio::fs::create_dir_all(&args.dir).await?;
     ctx.checkpoint("armed").await?;
     tokio::fs::write(&args.path, args.contents.as_bytes()).await?;
-    Ok(Value::Null)
+    Ok(())
 }
 
 async fn handle_actor_modify(
     args: ActorModify,
     ctx: &mut HandlerCtx<'_>,
-) -> Result<Value, HandlerError> {
+) -> Result<(), HandlerError> {
     ctx.checkpoint("armed").await?;
     tokio::fs::write(&args.path, args.new_contents.as_bytes()).await?;
-    Ok(Value::Null)
+    Ok(())
 }
 
 async fn handle_actor_delete(
     args: ActorDelete,
     ctx: &mut HandlerCtx<'_>,
-) -> Result<Value, HandlerError> {
+) -> Result<(), HandlerError> {
     ctx.checkpoint("armed").await?;
     tokio::fs::remove_file(&args.path).await?;
-    Ok(Value::Null)
+    Ok(())
 }
 
-async fn handle_actor_move(
-    args: ActorMove,
-    ctx: &mut HandlerCtx<'_>,
-) -> Result<Value, HandlerError> {
+async fn handle_actor_move(args: ActorMove, ctx: &mut HandlerCtx<'_>) -> Result<(), HandlerError> {
     ctx.checkpoint("armed").await?;
     tokio::fs::rename(&args.old_path, &args.new_path).await?;
-    Ok(Value::Null)
+    Ok(())
 }
 
 // ─── Single-agent multi_watch handler ───────────────────────────────
@@ -171,7 +176,7 @@ struct MultiOut {
 async fn handle_multi_watch(
     args: MultiArgs,
     _ctx: &mut HandlerCtx<'_>,
-) -> Result<Value, HandlerError> {
+) -> Result<MultiOut, HandlerError> {
     let left = format!("{}/left", args.root);
     let right = format!("{}/right", args.root);
     tokio::fs::create_dir_all(&left).await?;
@@ -186,24 +191,22 @@ async fn handle_multi_watch(
     tokio::fs::write(&left_file, "after-left").await?;
     tokio::fs::write(&right_file, "after-right").await?;
     let events = ino.drain(Duration::from_secs(2))?;
-    Ok(serde_json::to_value(MultiOut {
+    Ok(MultiOut {
         left_wd,
         right_wd,
         events,
-    })?)
+    })
 }
 
 // ─── Registration ───────────────────────────────────────────────────
 
 pub(crate) fn register_inotify_tests(reg: &mut Registry<'_>) {
-    // Register handlers once at startup (idempotent if called
-    // multiple times since lookup is string-keyed).
-    register_handler!("inotify.watch", handle_watch);
-    register_handler!("inotify.actor.create", handle_actor_create);
-    register_handler!("inotify.actor.modify", handle_actor_modify);
-    register_handler!("inotify.actor.delete", handle_actor_delete);
-    register_handler!("inotify.actor.move", handle_actor_move);
-    register_handler!("inotify.multi_watch", handle_multi_watch);
+    register_handler!(WATCH, handle_watch);
+    register_handler!(ACTOR_CREATE, handle_actor_create);
+    register_handler!(ACTOR_MODIFY, handle_actor_modify);
+    register_handler!(ACTOR_DELETE, handle_actor_delete);
+    register_handler!(ACTOR_MOVE, handle_actor_move);
+    register_handler!(MULTI_WATCH, handle_multi_watch);
 
     for &agent in INO_AGENTS {
         for &(name, kind) in SCENARIOS {
@@ -270,61 +273,39 @@ async fn drive_scenario(
     }
 }
 
-/// Common rendezvous machinery for inotify cross-agent tests.
-/// Both watcher and actor run their handlers and rendezvous on
-/// `"armed"`; this helper returns the watcher's `WatchOut`.
-async fn run_watch_actor(
+/// Common rendezvous machinery for inotify cross-agent tests. The
+/// watcher always runs `WATCH`; the actor's handler is generic so
+/// each scenario passes its own `ActorXxx` args. Returns the
+/// watcher's `WatchOut`.
+async fn run_watch_actor<AA>(
     run: &mut super::run_context::RunContext<'_>,
     watcher: &super::agents::AgentHandle,
     actor: &super::agents::AgentHandle,
-    actor_handler: &str,
-    watch_args: Value,
-    actor_args: Value,
-) -> Result<WatchOut, String> {
-    use crate::protocol::Response;
-
+    actor_token: &HandlerToken<AA, ()>,
+    watch_args: WatchArgs,
+    actor_args: AA,
+) -> Result<WatchOut, String>
+where
+    AA: Serialize,
+{
     // Kick off both handlers; each will arrive at the "armed"
     // checkpoint and emit Response::Checkpoint.
-    run.run_write(watcher, "inotify.watch", watch_args).await?;
-    match run.run_read(watcher).await {
-        Response::Checkpoint { tag } if tag == "armed" => {}
-        other => {
-            return Err(format!(
-                "watcher: expected Checkpoint(armed), got {other:?}"
-            ));
-        }
-    }
-    run.run_write(actor, actor_handler, actor_args).await?;
-    match run.run_read(actor).await {
-        Response::Checkpoint { tag } if tag == "armed" => {}
-        other => return Err(format!("actor: expected Checkpoint(armed), got {other:?}")),
-    }
+    run.run_write_typed(watcher, &WATCH, watch_args).await?;
+    run.run_read_checkpoint(watcher, "armed").await?;
+    run.run_write_typed(actor, actor_token, actor_args).await?;
+    run.run_read_checkpoint(actor, "armed").await?;
 
     // Both arrived. Release both — the writes don't block; the actor
     // will do its filesystem operation, the watcher will drain events.
     run.run_resume(watcher, "armed").await?;
     run.run_resume(actor, "armed").await?;
 
-    // Read both results. Order matters for the inotify case: the
-    // actor's Result comes back quickly (just writes a file); the
-    // watcher's takes up to 2s for the drain. Read watcher first so
-    // the timeout-based drain has time to see the actor's event.
-    let watcher_resp = run.run_read(watcher).await;
-    let actor_resp = run.run_read(actor).await;
-
-    let actor_ok = matches!(&actor_resp, Response::Result { ok: true, .. });
-    if !actor_ok {
-        return Err(format!("actor failed: {actor_resp:?}"));
-    }
-    match watcher_resp {
-        Response::Result { ok: true, data, .. } => {
-            serde_json::from_value::<WatchOut>(data).map_err(|e| format!("watcher decode: {e}"))
-        }
-        Response::Result {
-            ok: false, error, ..
-        } => Err(error.unwrap_or_else(|| "watcher failed".into())),
-        other => Err(format!("watcher: expected Result, got {other:?}")),
-    }
+    // Read both results. Order matters: the watcher's drain takes up
+    // to 2s; reading watcher first lets the timeout window cover the
+    // actor's act in real time.
+    let out = run.run_read_result(watcher, &WATCH).await?;
+    let () = run.run_read_result(actor, actor_token).await?;
+    Ok(out)
 }
 
 async fn drive_create(
@@ -335,22 +316,22 @@ async fn drive_create(
 ) -> Result<String, String> {
     let dir = test_dir("create", label);
     let path = format!("{dir}/newfile.txt");
-    let mask = libc::IN_CREATE | libc::IN_MODIFY | libc::IN_DELETE;
-    let watch_args = json!({
-        "dir": &dir,
-        "target_path": &path,
-        "preflight_contents": "",
-        "mask_bits": mask,
-    });
-    let actor_args = json!({ "dir": &dir, "path": &path, "contents": "created" });
-
     let out = run_watch_actor(
         run,
         watcher,
         actor,
-        "inotify.actor.create",
-        watch_args,
-        actor_args,
+        &ACTOR_CREATE,
+        WatchArgs {
+            dir: dir.clone(),
+            target_path: path.clone(),
+            preflight_contents: String::new(),
+            mask_bits: libc::IN_CREATE | libc::IN_MODIFY | libc::IN_DELETE,
+        },
+        ActorCreate {
+            dir,
+            path,
+            contents: "created".into(),
+        },
     )
     .await?;
     if out.events.iter().any(|e| {
@@ -373,21 +354,21 @@ async fn drive_modify(
 ) -> Result<String, String> {
     let dir = test_dir("modify", label);
     let path = format!("{dir}/existing.txt");
-    let watch_args = json!({
-        "dir": &dir,
-        "target_path": &path,
-        "preflight_contents": "before",
-        "mask_bits": libc::IN_MODIFY,
-    });
-    let actor_args = json!({ "path": &path, "new_contents": "after" });
-
     let out = run_watch_actor(
         run,
         watcher,
         actor,
-        "inotify.actor.modify",
-        watch_args,
-        actor_args,
+        &ACTOR_MODIFY,
+        WatchArgs {
+            dir: dir.clone(),
+            target_path: path.clone(),
+            preflight_contents: "before".into(),
+            mask_bits: libc::IN_MODIFY,
+        },
+        ActorModify {
+            path,
+            new_contents: "after".into(),
+        },
     )
     .await?;
     if out
@@ -412,21 +393,18 @@ async fn drive_delete(
 ) -> Result<String, String> {
     let dir = test_dir("delete", label);
     let path = format!("{dir}/remove-me.txt");
-    let watch_args = json!({
-        "dir": &dir,
-        "target_path": &path,
-        "preflight_contents": "delete me",
-        "mask_bits": libc::IN_DELETE,
-    });
-    let actor_args = json!({ "path": &path });
-
     let out = run_watch_actor(
         run,
         watcher,
         actor,
-        "inotify.actor.delete",
-        watch_args,
-        actor_args,
+        &ACTOR_DELETE,
+        WatchArgs {
+            dir: dir.clone(),
+            target_path: path.clone(),
+            preflight_contents: "delete me".into(),
+            mask_bits: libc::IN_DELETE,
+        },
+        ActorDelete { path },
     )
     .await?;
     if out.events.iter().any(|e| {
@@ -450,21 +428,21 @@ async fn drive_move(
     let dir = test_dir("move", label);
     let old = format!("{dir}/old-name.txt");
     let new = format!("{dir}/new-name.txt");
-    let watch_args = json!({
-        "dir": &dir,
-        "target_path": &old,
-        "preflight_contents": "move me",
-        "mask_bits": libc::IN_MOVED_FROM | libc::IN_MOVED_TO,
-    });
-    let actor_args = json!({ "old_path": &old, "new_path": &new });
-
     let out = run_watch_actor(
         run,
         watcher,
         actor,
-        "inotify.actor.move",
-        watch_args,
-        actor_args,
+        &ACTOR_MOVE,
+        WatchArgs {
+            dir: dir.clone(),
+            target_path: old.clone(),
+            preflight_contents: "move me".into(),
+            mask_bits: libc::IN_MOVED_FROM | libc::IN_MOVED_TO,
+        },
+        ActorMove {
+            old_path: old,
+            new_path: new,
+        },
     )
     .await?;
     let from = out.events.iter().find(|e| {
@@ -497,12 +475,10 @@ async fn drive_multi(
     label: &str,
 ) -> Result<String, String> {
     let root = test_dir("multi", label);
-    let args = json!({ "root": &root });
-    let data = run
-        .send_named(watcher, "inotify.multi_watch", args)
+    let out = run
+        .send_named_typed(watcher, &MULTI_WATCH, MultiArgs { root })
         .await
         .map_err(|e| format!("send_named: {e}"))?;
-    let out: MultiOut = serde_json::from_value(data).map_err(|e| format!("decode: {e}"))?;
     let saw_left = out
         .events
         .iter()
