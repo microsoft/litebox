@@ -371,6 +371,7 @@ fn find_broker() -> anyhow::Result<std::path::PathBuf> {
 struct BrokerProcess {
     child: std::process::Child,
     socket_path: std::path::PathBuf,
+    fd_token_socket_path: std::path::PathBuf,
 }
 
 impl BrokerProcess {
@@ -394,8 +395,18 @@ impl BrokerProcess {
         // Clean up any stale socket from a previous run.
         let _ = std::fs::remove_file(&socket_path);
 
+        // Phase B-Step9: a second socket for the fd-token /
+        // state-object control plane. Runners connect via
+        // `--fd-token-broker` to register broker-backed eventfds and
+        // exchange cross-worker SCM_RIGHTS tokens.
+        let fd_token_socket_path =
+            std::env::temp_dir().join(format!("litebox-fdtoken-{}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&fd_token_socket_path);
+
         let mut cmd = std::process::Command::new(&broker);
         cmd.arg("--network-proxy-listen").arg(&socket_path);
+        cmd.arg("--fd-token-broker-listen")
+            .arg(&fd_token_socket_path);
 
         // Expose the rootfs directory for 9P access. The tar rootfs itself is
         // extracted by the runner, so we expose the rootfs's parent directory
@@ -452,17 +463,31 @@ impl BrokerProcess {
         // Give the broker a moment to create the socket.
         for _ in 0..50 {
             if socket_path.exists() {
-                return Ok(Self { child, socket_path });
+                return Ok(Self {
+                    child,
+                    socket_path,
+                    fd_token_socket_path,
+                });
             }
             std::thread::sleep(std::time::Duration::from_millis(100));
         }
 
-        Ok(Self { child, socket_path })
+        Ok(Self {
+            child,
+            socket_path,
+            fd_token_socket_path,
+        })
     }
 
     /// Get the IPC socket path for the runner's `--network-broker` flag.
     fn socket_path(&self) -> &std::path::Path {
         &self.socket_path
+    }
+
+    /// Get the fd-token control-plane socket path for the runner's
+    /// `--fd-token-broker` flag.
+    fn fd_token_socket_path(&self) -> &std::path::Path {
+        &self.fd_token_socket_path
     }
 }
 
@@ -471,6 +496,7 @@ impl Drop for BrokerProcess {
         let _ = self.child.kill();
         let _ = self.child.wait();
         let _ = std::fs::remove_file(&self.socket_path);
+        let _ = std::fs::remove_file(&self.fd_token_socket_path);
     }
 }
 
@@ -534,6 +560,13 @@ fn runner_command(
         cmd.arg("--network-broker").arg(socket);
         if rootfs_is_dir {
             cmd.arg("--nine-p-broker").arg(socket);
+        }
+        // Phase B-Step9: hook the runner into the broker's
+        // fd-token / state-object control plane so broker-backed
+        // shim objects (eventfds today) work cross-worker.
+        let fd_token_socket = b.fd_token_socket_path().to_str().unwrap_or("");
+        if !fd_token_socket.is_empty() {
+            cmd.arg("--fd-token-broker").arg(fd_token_socket);
         }
     }
     if let Some(audit_path) = audit_log_file {

@@ -716,7 +716,31 @@ impl<FS: ShimFS> UnixConnectedStream<FS> {
     fn try_sendto(&self, msg: Message) -> Result<(), (Message, Errno)> {
         match &self.transport {
             UnixTransport::Channel { send, .. } => {
-                // TODO: write partial data?
+                // Phase B-Step10 refcount audit: `parse_sendmsg_cmsg`
+                // eagerly called `provider.dup_handle` on every
+                // broker-backed entry (it had to, because by this
+                // point we no longer have task context to look up the
+                // provider). On the in-worker Channel path the
+                // `PassedFd` aliases the SAME global-dt EventFile
+                // entry the sender already holds, so the duplicate
+                // broker refcount is redundant — when the receiver's
+                // installed fd is dropped, only ONE `release_eventfd`
+                // fires (from `EventFile::Drop` once the last alias
+                // goes). Undo the eager dup here.
+                if let Some(provider) = super::eventfd::broker_eventfd_provider() {
+                    for token in &msg.passed_tokens {
+                        if matches!(
+                            token.tag(),
+                            litebox_common_linux::fd_transfer_frame::SubsystemTag::Eventfd
+                        ) {
+                            provider.release_eventfd(token.id());
+                        }
+                    }
+                }
+                // Strip tokens — they're a cross-worker concept; the
+                // in-worker path doesn't carry them across.
+                let mut msg = msg;
+                msg.passed_tokens.clear();
                 send.try_write_one(msg)
             }
             UnixTransport::Tcp { proxy, .. } => {
