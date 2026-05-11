@@ -66,35 +66,56 @@ impl NotificationDispatcher {
     ///
     /// Panics if the OS refuses to spawn the reader thread.
     pub fn start(mut receiver: NotificationReceiver) -> Arc<Self> {
-        let callbacks: Arc<Mutex<HashMap<u64, Arc<dyn NotificationCallback>>>> =
-            Arc::new(Mutex::new(HashMap::new()));
-        let dispatcher = Arc::new(Self {
-            callbacks: Arc::clone(&callbacks),
-            next_id: AtomicU64::new(1),
-            thread_handle: Mutex::new(None),
-        });
+        let dispatcher = Self::new();
+        let callbacks = Arc::clone(&dispatcher.callbacks);
         let handle = thread::Builder::new()
             .name("broker-notification-reader".into())
-            .spawn(move || {
-                loop {
-                    let Ok(frame) = receiver.recv() else {
-                        // EOF (broker closed) or hard error — exit.
-                        return;
-                    };
-                    let cb = {
-                        let map = callbacks.lock().expect("callbacks mutex poisoned");
-                        map.get(&frame.subscription_id).cloned()
-                    };
-                    if let Some(cb) = cb {
-                        cb.on_events(frame.events);
-                    }
-                    // Otherwise: no callback (subscription removed
-                    // concurrent with broker pushing the frame); drop.
-                }
-            })
+            .spawn(move || Self::run_reader_loop(&mut receiver, &callbacks))
             .expect("spawn notification reader");
         *dispatcher.thread_handle.lock().unwrap() = Some(handle);
         dispatcher
+    }
+
+    /// Creates a dispatcher WITHOUT spawning the reader thread.
+    /// The caller is responsible for driving the reader loop via
+    /// [`Self::run_reader_loop`] on a thread of its choosing — e.g.
+    /// via the runner's `spawn_host_thread` so the reader thread
+    /// blocks guest signals like every other host helper thread.
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self {
+            callbacks: Arc::new(Mutex::new(HashMap::new())),
+            next_id: AtomicU64::new(1),
+            thread_handle: Mutex::new(None),
+        })
+    }
+
+    /// The reader loop body — accepts ownership of the receiver and a
+    /// shared callbacks map; runs until the receiver returns Err
+    /// (EOF / hard error). Public so a caller can launch it on a
+    /// custom thread (see [`Self::new`]).
+    pub fn run_reader_loop(
+        receiver: &mut NotificationReceiver,
+        callbacks: &Arc<Mutex<HashMap<u64, Arc<dyn NotificationCallback>>>>,
+    ) {
+        loop {
+            let Ok(frame) = receiver.recv() else {
+                return;
+            };
+            let cb = {
+                let map = callbacks.lock().expect("callbacks mutex poisoned");
+                map.get(&frame.subscription_id).cloned()
+            };
+            if let Some(cb) = cb {
+                cb.on_events(frame.events);
+            }
+        }
+    }
+
+    /// Returns an Arc clone of the callbacks map so a caller-spawned
+    /// thread can drive [`Self::run_reader_loop`] without going
+    /// through `start`.
+    pub fn callbacks_arc(&self) -> Arc<Mutex<HashMap<u64, Arc<dyn NotificationCallback>>>> {
+        Arc::clone(&self.callbacks)
     }
 
     /// Creates a dispatcher with NO reader thread. Subscriptions can

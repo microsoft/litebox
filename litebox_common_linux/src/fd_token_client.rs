@@ -107,6 +107,16 @@ impl FdTokenClient {
         })
     }
 
+    /// Builds a client from an already-connected stream. Useful when
+    /// the caller wants to relocate the underlying fd before
+    /// constructing the client (e.g., to INFRA_FD_MIN to avoid
+    /// posix_spawn dup2 collisions).
+    pub fn from_unix_stream(stream: UnixStream) -> Self {
+        Self {
+            stream: Mutex::new(stream),
+        }
+    }
+
     // ---- Host-fd lifecycle (Phase 3 surface) -----------------------------
 
     /// Registers a host fd with the broker; returns its handle id.
