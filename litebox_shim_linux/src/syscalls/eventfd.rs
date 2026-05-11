@@ -80,11 +80,23 @@ enum EventFileInner<Platform: RawSyncPrimitivesProvider + TimeProvider> {
     /// `semaphore` is recorded for diagnostics / future use even
     /// though the broker is the source of truth for that flag — the
     /// shim doesn't need to act on it locally.
+    ///
+    /// `local_readable` is a cached approximation of "has data
+    /// available to read" used by `check_io_events`. The broker is
+    /// the source of truth for the counter, but `check_io_events`
+    /// runs synchronously in the polling path and can't afford an
+    /// RPC per poll. Instead, write_eventfd sets it to `true` and
+    /// read_eventfd clears it (on a read that drained the counter
+    /// to zero). This is needed because epoll re-calls
+    /// `check_io_events` after an observer fires; if it returned
+    /// Events::empty() the epoll would go back to waiting forever
+    /// even though notify_observers had fired.
     #[allow(dead_code)]
     BrokerBacked {
         provider: Arc<dyn BrokerEventfdProvider>,
         handle: u64,
         semaphore: bool,
+        local_readable: bool,
     },
 }
 
@@ -140,6 +152,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> EventFile<Platform> {
                 provider,
                 handle,
                 semaphore: flags.contains(EfdFlags::SEMAPHORE),
+                local_readable: false,
             }),
             status: AtomicU32::new(status.bits()),
             pollee: Pollee::new(),
@@ -236,17 +249,42 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> EventFile<Platform> {
                 Ok(res)
             }
             EventFileInner::BrokerBacked {
-                provider, handle, ..
+                provider,
+                handle,
+                semaphore,
+                ..
             } => {
                 let provider = Arc::clone(provider);
                 let handle = *handle;
+                let semaphore = *semaphore;
                 drop(inner);
                 match provider.read_eventfd(handle) {
                     Ok(v) => {
+                        // Update local readability cache: if we read
+                        // in semaphore mode we just took 1; broker
+                        // counter may still be > 0. If non-semaphore,
+                        // we drained the entire counter to 0.
+                        // Without a separate "peek" RPC, the safe
+                        // assumption for semaphore is that more data
+                        // MAY exist (set readable=true). For
+                        // non-semaphore, we drained → not readable.
+                        // The next epoll wake from a broker write
+                        // will re-set it to true via try_write_eventfd.
+                        let mut inner = self.inner.lock();
+                        if let EventFileInner::BrokerBacked { local_readable, .. } = &mut *inner {
+                            *local_readable = semaphore;
+                        }
+                        drop(inner);
                         self.pollee.notify_observers(Events::OUT);
                         Ok(v)
                     }
-                    Err(BrokerOpError::WouldBlock) => Err(TryOpError::TryAgain),
+                    Err(BrokerOpError::WouldBlock) => {
+                        let mut inner = self.inner.lock();
+                        if let EventFileInner::BrokerBacked { local_readable, .. } = &mut *inner {
+                            *local_readable = false;
+                        }
+                        Err(TryOpError::TryAgain)
+                    }
                     Err(BrokerOpError::UnknownHandle) => Err(TryOpError::Other(Errno::EBADF)),
                     Err(BrokerOpError::InvalidValue) => Err(TryOpError::Other(Errno::EINVAL)),
                     Err(BrokerOpError::Io) => Err(TryOpError::Other(Errno::EIO)),
@@ -347,6 +385,15 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> EventFile<Platform> {
                 drop(inner);
                 match provider.write_eventfd(handle, value) {
                     Ok(()) => {
+                        // Mark locally readable so check_io_events
+                        // reports Events::IN. This is what unblocks
+                        // an in-process epoll observer that was woken
+                        // by notify_observers below.
+                        let mut inner = self.inner.lock();
+                        if let EventFileInner::BrokerBacked { local_readable, .. } = &mut *inner {
+                            *local_readable = true;
+                        }
+                        drop(inner);
                         self.pollee.notify_observers(Events::IN);
                         Ok(8)
                     }
@@ -448,15 +495,25 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> IOPollable for EventFil
                     events |= Events::IN | Events::HUP;
                 }
             }
-            EventFileInner::BrokerBacked { .. } => {
-                // For broker-backed eventfds, poll readiness is driven
-                // by broker-pushed notification frames waking the
-                // Pollee. `check_io_events` is called by the polling
-                // path when there's no observer; in that path we
-                // conservatively return empty (the caller will
-                // register and then wait). The Pollee's notify_observers
-                // calls in try_read/try_write keep the observer
-                // wakeup path correct.
+            EventFileInner::BrokerBacked { local_readable, .. } => {
+                // Phase B-Step12 readiness fix: track local readiness
+                // based on the most recent write/read RPC outcome. The
+                // broker is the source of truth for the counter, but
+                // we can't afford an RPC in every check_io_events
+                // call (and crucially, we need check_io_events to
+                // report IN after a write so that epoll observers,
+                // once woken by notify_observers, see the fd as
+                // ready). The cache is updated by try_read_eventfd
+                // (clears on drain-to-zero, keeps for semaphore mode)
+                // and try_write_eventfd (sets to true on every write
+                // success).
+                if *local_readable {
+                    events |= Events::IN;
+                }
+                // Broker-backed eventfds are always writable in
+                // practice (the broker accepts any non-MAX value);
+                // the broker side will reject MAX-1 saturated writes.
+                events |= Events::OUT;
             }
         }
 

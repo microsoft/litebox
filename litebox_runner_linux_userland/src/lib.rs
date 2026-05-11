@@ -2824,52 +2824,29 @@ fn register_worker_spawn_flags(platform: &Platform, cli_args: &CliArgs) {
 ///
 /// Called from `run()` when `--fd-token-broker <path>` is supplied.
 fn setup_broker_eventfd_provider(broker_path: &str) -> anyhow::Result<()> {
+    use litebox_common_linux::broker_eventfd::NotificationDispatcher;
     use litebox_common_linux::fd_token_client::FdTokenClient;
+    use litebox_common_linux::notification_ring::NotificationReceiver;
     use litebox_common_linux::shmem_ring::ShmemRingPair;
     use std::sync::Arc;
-
-    // Phase B-Step9 + followup:
-    //
-    // We connect to the broker, create the notification ring, and
-    // register it — these are all synchronous setup steps that validate
-    // the broker is reachable and that the runner-side wiring is sound.
-    //
-    // We deliberately do NOT install the global broker eventfd
-    // provider (and therefore do not spawn the dispatcher reader
-    // thread). Installing the provider would keep the FdTokenClient
-    // UnixStream alive past this function, and any long-lived
-    // runner-side broker state (open socket fd to the broker, the
-    // dispatcher reader thread, or the ShmemRingPair memfds) breaks
-    // the runner's fork-snapshot/restore mechanism: tests that fork
-    // the runner (DifferentProcess agents under the UnixTransport::Tcp
-    // cross-worker arm) reliably hang.
-    //
-    // Concretely, two distinct issues block durable broker state in
-    // the parent runner:
-    //
-    //   1. An open broker-side UnixStream is inherited by every
-    //      worker fork; the child runner has no idea what to do with
-    //      it and the broker doesn't either.
-    //   2. The NotificationDispatcher reader thread, if spawned,
-    //      becomes a parent-side thread at fork-snapshot time, which
-    //      the snapshot/restore mechanism does not yet handle.
-    //
-    // Without an installed provider, `sys_eventfd2` falls back to
-    // local `EventFile::new`, so cross-worker broker-backed eventfd
-    // SCM_RIGHTS transfer remains gated. See todo
-    // `b-step12-dispatcher-forksafe` for the unblock plan.
     let path = std::path::Path::new(broker_path);
-    let client = FdTokenClient::connect(path)
-        .map_err(|e| anyhow!("connect to fd-token broker at {broker_path}: {e}"))?;
-    let (_pair, tx_fd, rx_fd) =
-        ShmemRingPair::create().map_err(|e| anyhow!("create notification ring pair: {e:?}"))?;
+    let client = Arc::new(FdTokenClient::connect(path).map_err(|e| anyhow!("connect: {e}"))?);
+    let (pair, tx_fd, rx_fd) = ShmemRingPair::create().map_err(|e| anyhow!("ring: {e:?}"))?;
+    let (_unused, worker_reader) = pair.into_parts();
     client
         .register_notification_ring(tx_fd, rx_fd)
-        .map_err(|e| anyhow!("register notification ring with broker: {e}"))?;
-
-    // Drop everything here: client closes (closing the broker
-    // UnixStream), pair drops (closing memfds), no thread spawn.
-    let _ = Arc::new(client); // keep the use-of-Arc shape for upgrade later
+        .map_err(|e| anyhow!("register: {e}"))?;
+    let mut receiver = NotificationReceiver::new(worker_reader);
+    let dispatcher = NotificationDispatcher::new();
+    let callbacks = dispatcher.callbacks_arc();
+    let _join = litebox_platform_linux_userland::spawn_host_thread(move || {
+        NotificationDispatcher::run_reader_loop(&mut receiver, &callbacks);
+    });
+    let provider = Arc::new(
+        crate::broker_eventfd_provider::RunnerBrokerEventfdProvider::new(client, dispatcher),
+    );
+    litebox_shim_linux::syscalls::set_broker_eventfd_provider(provider)
+        .map_err(|_| anyhow!("provider already set"))?;
     Ok(())
 }
 
