@@ -18,6 +18,7 @@ use zerocopy::{FromBytes, IntoBytes};
 
 use crate::signal::SigSet;
 
+pub mod broker_eventfd_provider;
 pub mod errno;
 pub mod fd_token_protocol;
 pub mod fd_transfer_frame;

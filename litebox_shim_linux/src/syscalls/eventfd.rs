@@ -24,7 +24,9 @@ use litebox::{
     sync::RawSyncPrimitivesProvider,
 };
 use litebox_common_linux::{
-    ClockId, EfdFlags, ItimerSpec, TimerfdFlags, TimerfdTimerFlags, errno::Errno,
+    ClockId, EfdFlags, ItimerSpec, TimerfdFlags, TimerfdTimerFlags,
+    broker_eventfd_provider::{BrokerEventfdProvider, BrokerOpError},
+    errno::Errno,
 };
 use litebox_platform_multiplex::Platform;
 
@@ -44,6 +46,14 @@ enum EventFileInner<Platform: RawSyncPrimitivesProvider + TimeProvider> {
         subject: Arc<Subject<Events, Events, Platform>>,
     },
     Timerfd(TimerFileState<Platform>),
+    /// Broker-hosted eventfd (Phase B-Step7b). State lives in the
+    /// broker; this worker holds only the handle id and a provider
+    /// reference to make RPC calls.
+    BrokerBacked {
+        provider: Arc<dyn BrokerEventfdProvider>,
+        handle: u64,
+        semaphore: bool,
+    },
 }
 
 struct TimerFileState<Platform: RawSyncPrimitivesProvider + TimeProvider> {
@@ -70,6 +80,33 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> EventFile<Platform> {
         Self {
             inner: litebox::sync::Mutex::new(EventFileInner::Eventfd {
                 counter: count,
+                semaphore: flags.contains(EfdFlags::SEMAPHORE),
+            }),
+            status: AtomicU32::new(status.bits()),
+            pollee: Pollee::new(),
+        }
+    }
+
+    /// Creates a broker-backed eventfd. The caller (`sys_eventfd2`) has
+    /// already obtained `handle` from `provider.create_eventfd(...)`.
+    /// All subsequent read/write ops route through the provider.
+    ///
+    /// Phase B-Step7b: broker-backed variant. Polling is still wired
+    /// to the local `Pollee`; the runner is responsible for arranging
+    /// a subscription on the broker side that wakes this Pollee via a
+    /// `BrokerEventCallback` impl (typically supplied by the runner's
+    /// platform layer).
+    pub(crate) fn new_broker_backed(
+        provider: Arc<dyn BrokerEventfdProvider>,
+        handle: u64,
+        flags: EfdFlags,
+    ) -> Self {
+        let mut status = OFlags::RDWR;
+        status.set(OFlags::NONBLOCK, flags.contains(EfdFlags::NONBLOCK));
+        Self {
+            inner: litebox::sync::Mutex::new(EventFileInner::BrokerBacked {
+                provider,
+                handle,
                 semaphore: flags.contains(EfdFlags::SEMAPHORE),
             }),
             status: AtomicU32::new(status.bits()),
@@ -124,6 +161,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> EventFile<Platform> {
             EventFileInner::Eventfd { .. } => "eventfd",
             EventFileInner::Pidfd { .. } => "pidfd",
             EventFileInner::Timerfd(_) => "timerfd",
+            EventFileInner::BrokerBacked { .. } => "broker_eventfd",
         }
     }
 
@@ -133,19 +171,36 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> EventFile<Platform> {
 
     fn try_read_eventfd(&self) -> Result<u64, TryOpError<Errno>> {
         let mut inner = self.inner.lock();
-        let EventFileInner::Eventfd { counter, semaphore } = &mut *inner else {
-            return Err(TryOpError::Other(Errno::EINVAL));
-        };
-        if *counter == 0 {
-            return Err(TryOpError::TryAgain);
+        match &mut *inner {
+            EventFileInner::Eventfd { counter, semaphore } => {
+                if *counter == 0 {
+                    return Err(TryOpError::TryAgain);
+                }
+                let res = if *semaphore { 1 } else { *counter };
+                *counter -= res;
+                drop(inner);
+                self.pollee.notify_observers(Events::OUT);
+                Ok(res)
+            }
+            EventFileInner::BrokerBacked {
+                provider, handle, ..
+            } => {
+                let provider = Arc::clone(provider);
+                let handle = *handle;
+                drop(inner);
+                match provider.read_eventfd(handle) {
+                    Ok(v) => {
+                        self.pollee.notify_observers(Events::OUT);
+                        Ok(v)
+                    }
+                    Err(BrokerOpError::WouldBlock) => Err(TryOpError::TryAgain),
+                    Err(BrokerOpError::UnknownHandle) => Err(TryOpError::Other(Errno::EBADF)),
+                    Err(BrokerOpError::InvalidValue) => Err(TryOpError::Other(Errno::EINVAL)),
+                    Err(BrokerOpError::Io) => Err(TryOpError::Other(Errno::EIO)),
+                }
+            }
+            _ => Err(TryOpError::Other(Errno::EINVAL)),
         }
-
-        let res = if *semaphore { 1 } else { *counter };
-        *counter -= res;
-
-        drop(inner);
-        self.pollee.notify_observers(Events::OUT);
-        Ok(res)
     }
 
     fn try_read_timerfd(&self) -> Result<u64, Errno> {
@@ -163,7 +218,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> EventFile<Platform> {
     fn try_read(&self) -> Result<u64, TryOpError<Errno>> {
         let inner = self.inner.lock();
         match &*inner {
-            EventFileInner::Eventfd { .. } => {
+            EventFileInner::Eventfd { .. } | EventFileInner::BrokerBacked { .. } => {
                 drop(inner);
                 self.try_read_eventfd()
             }
@@ -217,26 +272,47 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> EventFile<Platform> {
 
     fn try_write_eventfd(&self, value: u64) -> Result<usize, TryOpError<Errno>> {
         let mut inner = self.inner.lock();
-        let EventFileInner::Eventfd { counter, .. } = &mut *inner else {
-            return Err(TryOpError::Other(Errno::EINVAL));
-        };
-        if let Some(new_value) = (*counter).checked_add(value)
-            // The maximum value that may be stored in the counter is the largest unsigned
-            // 64-bit value minus 1 (i.e., 0xfffffffffffffffe)
-            && new_value != u64::MAX
-        {
-            *counter = new_value;
-            drop(inner);
-            self.pollee.notify_observers(Events::IN);
-            return Ok(8);
+        match &mut *inner {
+            EventFileInner::Eventfd { counter, .. } => {
+                if let Some(new_value) = (*counter).checked_add(value)
+                    // The maximum value that may be stored in the counter is the largest unsigned
+                    // 64-bit value minus 1 (i.e., 0xfffffffffffffffe)
+                    && new_value != u64::MAX
+                {
+                    *counter = new_value;
+                    drop(inner);
+                    self.pollee.notify_observers(Events::IN);
+                    return Ok(8);
+                }
+                Err(TryOpError::TryAgain)
+            }
+            EventFileInner::BrokerBacked {
+                provider, handle, ..
+            } => {
+                let provider = Arc::clone(provider);
+                let handle = *handle;
+                drop(inner);
+                match provider.write_eventfd(handle, value) {
+                    Ok(()) => {
+                        self.pollee.notify_observers(Events::IN);
+                        Ok(8)
+                    }
+                    Err(BrokerOpError::WouldBlock) => Err(TryOpError::TryAgain),
+                    Err(BrokerOpError::UnknownHandle) => Err(TryOpError::Other(Errno::EBADF)),
+                    Err(BrokerOpError::InvalidValue) => Err(TryOpError::Other(Errno::EINVAL)),
+                    Err(BrokerOpError::Io) => Err(TryOpError::Other(Errno::EIO)),
+                }
+            }
+            _ => Err(TryOpError::Other(Errno::EINVAL)),
         }
-
-        Err(TryOpError::TryAgain)
     }
 
     pub(crate) fn write(&self, cx: &WaitContext<'_, Platform>, value: u64) -> Result<usize, Errno> {
-        let is_eventfd = matches!(*self.inner.lock(), EventFileInner::Eventfd { .. });
-        if !is_eventfd {
+        let writable = matches!(
+            *self.inner.lock(),
+            EventFileInner::Eventfd { .. } | EventFileInner::BrokerBacked { .. }
+        );
+        if !writable {
             let _ = (cx, value);
             return Err(Errno::EINVAL);
         }
@@ -303,6 +379,16 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> IOPollable for EventFil
                     events |= Events::IN | Events::HUP;
                 }
             }
+            EventFileInner::BrokerBacked { .. } => {
+                // For broker-backed eventfds, poll readiness is driven
+                // by broker-pushed notification frames waking the
+                // Pollee. `check_io_events` is called by the polling
+                // path when there's no observer; in that path we
+                // conservatively return empty (the caller will
+                // register and then wait). The Pollee's notify_observers
+                // calls in try_read/try_write keep the observer
+                // wakeup path correct.
+            }
         }
 
         events
@@ -314,7 +400,9 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> IOPollable for EventFil
             EventFileInner::Pidfd { subject, .. } => {
                 subject.register_observer(observer, mask | Events::ALWAYS_POLLED);
             }
-            EventFileInner::Eventfd { .. } | EventFileInner::Timerfd(_) => {
+            EventFileInner::Eventfd { .. }
+            | EventFileInner::Timerfd(_)
+            | EventFileInner::BrokerBacked { .. } => {
                 drop(inner);
                 self.pollee.register_observer(observer, mask);
             }
@@ -581,5 +669,104 @@ mod tests {
             Duration::try_from(timerfd.get_timer().unwrap().value).unwrap(),
             Duration::ZERO
         );
+    }
+
+    /// Phase B-Step7b: verifies an `EventFile::new_broker_backed`
+    /// instance routes read/write through a mock provider.
+    /// Functional surface: the same `read`/`write` calls that work
+    /// against a local `EventFile::new` work against a broker-backed
+    /// one without the caller knowing the difference.
+    #[test]
+    fn test_broker_backed_eventfd_routes_read_write() {
+        use alloc::sync::Arc;
+        use core::sync::atomic::{AtomicU64, Ordering};
+        use litebox_common_linux::broker_eventfd_provider::{
+            BrokerEventCallback, BrokerEventfdProvider, BrokerOpError,
+        };
+
+        /// Mock provider: in-process counter modelling the broker.
+        struct MockProvider {
+            counter: AtomicU64,
+            reads: AtomicU64,
+            writes: AtomicU64,
+        }
+
+        impl BrokerEventfdProvider for MockProvider {
+            fn create_eventfd(
+                &self,
+                _initial: u64,
+                _semaphore: bool,
+            ) -> Result<u64, BrokerOpError> {
+                Ok(7) // arbitrary fixed handle id
+            }
+            fn read_eventfd(&self, _handle: u64) -> Result<u64, BrokerOpError> {
+                self.reads.fetch_add(1, Ordering::SeqCst);
+                let v = self.counter.swap(0, Ordering::SeqCst);
+                if v == 0 {
+                    Err(BrokerOpError::WouldBlock)
+                } else {
+                    Ok(v)
+                }
+            }
+            fn write_eventfd(&self, _handle: u64, value: u64) -> Result<(), BrokerOpError> {
+                if value == u64::MAX {
+                    return Err(BrokerOpError::InvalidValue);
+                }
+                self.writes.fetch_add(1, Ordering::SeqCst);
+                self.counter.fetch_add(value, Ordering::SeqCst);
+                Ok(())
+            }
+            fn release_eventfd(&self, _handle: u64) {}
+            fn subscribe_eventfd(
+                &self,
+                _handle: u64,
+                _events_mask: u32,
+                _cb: Arc<dyn BrokerEventCallback>,
+            ) -> Result<u64, BrokerOpError> {
+                Ok(1)
+            }
+            fn unsubscribe_eventfd(&self, _handle: u64, _subscription_id: u64) {}
+        }
+
+        let _task = crate::syscalls::tests::init_platform(None);
+
+        let provider = Arc::new(MockProvider {
+            counter: AtomicU64::new(0),
+            reads: AtomicU64::new(0),
+            writes: AtomicU64::new(0),
+        });
+        let provider_dyn: Arc<dyn BrokerEventfdProvider> = provider.clone();
+
+        let eventfd = alloc::sync::Arc::new(super::EventFile::new_broker_backed(
+            provider_dyn,
+            7,
+            EfdFlags::NONBLOCK,
+        ));
+
+        // Write 5 → provider.counter goes to 5.
+        let n = eventfd
+            .write(&WaitState::new(platform()).context(), 5)
+            .unwrap();
+        assert_eq!(n, 8);
+        assert_eq!(provider.counter.load(Ordering::SeqCst), 5);
+        assert_eq!(provider.writes.load(Ordering::SeqCst), 1);
+
+        // Read → returns 5, provider.counter back to 0.
+        let v = eventfd.read(&WaitState::new(platform()).context()).unwrap();
+        assert_eq!(v, 5);
+        assert_eq!(provider.counter.load(Ordering::SeqCst), 0);
+        assert_eq!(provider.reads.load(Ordering::SeqCst), 1);
+
+        // Second read → WouldBlock, surfaces as EAGAIN because NONBLOCK is set.
+        match eventfd.read(&WaitState::new(platform()).context()) {
+            Err(Errno::EAGAIN) => {}
+            other => panic!("expected EAGAIN, got {other:?}"),
+        }
+
+        // Write u64::MAX → InvalidValue → EINVAL.
+        match eventfd.write(&WaitState::new(platform()).context(), u64::MAX) {
+            Err(Errno::EINVAL) => {}
+            other => panic!("expected EINVAL on u64::MAX write, got {other:?}"),
+        }
     }
 }
