@@ -18,9 +18,777 @@
 use super::agents::{AgentHandle, AgentName};
 use super::registry::Registry;
 use super::run_context::RunContext;
-use crate::protocol::{Command, Response};
+use crate::handlers::{HandlerCtx, HandlerToken};
+use crate::protocol::Response;
+use crate::register_handler;
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
+
+use std::process::Stdio;
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+#[derive(Clone, Serialize, Deserialize)]
+struct FsPathArgs {
+    path: String,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct FsWriteArgs {
+    path: String,
+    data: String,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct FsSymlinkArgs {
+    target: String,
+    link: String,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct NetListenArgs {
+    port: u16,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct NetConnectArgs {
+    addr: String,
+    data: String,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct UnixConnectArgs {
+    path: String,
+    data: String,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct ExecArgs {
+    args: Vec<String>,
+    timeout_secs: Option<u64>,
+    stdin: Option<String>,
+    background: bool,
+    env: Vec<(String, String)>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct ExecReadyArgs {
+    args: Vec<String>,
+    ready_marker: String,
+    timeout_secs: Option<u64>,
+    stdin: Option<String>,
+    stream: String,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct KillArgs {
+    pid: u32,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct EnvGetArgs {
+    var: String,
+}
+
+const FS_READ: HandlerToken<FsPathArgs, Response> = HandlerToken::new("matrix.fs_read");
+const FS_WRITE: HandlerToken<FsWriteArgs, Response> = HandlerToken::new("matrix.fs_write");
+const FS_DELETE: HandlerToken<FsPathArgs, Response> = HandlerToken::new("matrix.fs_delete");
+const FS_SYMLINK: HandlerToken<FsSymlinkArgs, Response> = HandlerToken::new("matrix.fs_symlink");
+const FS_READLINK: HandlerToken<FsPathArgs, Response> = HandlerToken::new("matrix.fs_readlink");
+const FS_STAT: HandlerToken<FsPathArgs, Response> = HandlerToken::new("matrix.fs_stat");
+const NET_LISTEN: HandlerToken<NetListenArgs, Response> = HandlerToken::new("matrix.net_listen");
+const NET_UNLISTEN: HandlerToken<NetListenArgs, Response> =
+    HandlerToken::new("matrix.net_unlisten");
+const NET_CONNECT: HandlerToken<NetConnectArgs, Response> = HandlerToken::new("matrix.net_connect");
+const UNIX_LISTEN: HandlerToken<FsPathArgs, Response> = HandlerToken::new("matrix.unix_listen");
+const UNIX_UNLISTEN: HandlerToken<FsPathArgs, Response> = HandlerToken::new("matrix.unix_unlisten");
+const UNIX_CONNECT: HandlerToken<UnixConnectArgs, Response> =
+    HandlerToken::new("matrix.unix_connect");
+const EXEC: HandlerToken<ExecArgs, Response> = HandlerToken::new("matrix.exec");
+const EXEC_READY: HandlerToken<ExecReadyArgs, Response> = HandlerToken::new("matrix.exec_ready");
+const KILL: HandlerToken<KillArgs, Response> = HandlerToken::new("matrix.kill");
+const ENV_GET: HandlerToken<EnvGetArgs, Response> = HandlerToken::new("matrix.env_get");
+const CWD_GET: HandlerToken<(), Response> = HandlerToken::new("matrix.cwd_get");
+
+static TCP_LISTENERS: OnceLock<Mutex<HashMap<u16, tokio::task::JoinHandle<()>>>> = OnceLock::new();
+static UNIX_LISTENERS: OnceLock<Mutex<HashMap<String, tokio::task::JoinHandle<()>>>> =
+    OnceLock::new();
+
+fn tcp_listeners() -> &'static Mutex<HashMap<u16, tokio::task::JoinHandle<()>>> {
+    TCP_LISTENERS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn unix_listeners() -> &'static Mutex<HashMap<String, tokio::task::JoinHandle<()>>> {
+    UNIX_LISTENERS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+async fn local_fs_read(args: FsPathArgs) -> Response {
+    match tokio::fs::read_to_string(&args.path).await {
+        Ok(data) => Response::Ok { data: Some(data) },
+        Err(_) => Response::NotFound,
+    }
+}
+
+async fn local_fs_write(args: FsWriteArgs) -> Response {
+    if let Some(parent) = std::path::Path::new(&args.path).parent() {
+        let _ = tokio::fs::create_dir_all(parent).await;
+    }
+    match tokio::fs::write(&args.path, &args.data).await {
+        Ok(()) => Response::Ok { data: None },
+        Err(e) => Response::Error {
+            error: format!("write: {e}"),
+        },
+    }
+}
+
+async fn local_fs_delete(args: FsPathArgs) -> Response {
+    match tokio::fs::remove_file(&args.path).await {
+        Ok(()) => Response::Ok { data: None },
+        Err(e) => Response::Error {
+            error: format!("delete: {e}"),
+        },
+    }
+}
+
+async fn local_fs_symlink(args: FsSymlinkArgs) -> Response {
+    match tokio::fs::symlink(&args.target, &args.link).await {
+        Ok(()) => Response::Ok { data: None },
+        Err(e) => Response::Error {
+            error: format!("symlink: {e}"),
+        },
+    }
+}
+
+async fn local_fs_readlink(args: FsPathArgs) -> Response {
+    match tokio::fs::read_link(&args.path).await {
+        Ok(target) => Response::Ok {
+            data: Some(target.to_string_lossy().into_owned()),
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Response::NotFound,
+        Err(e) => Response::Error {
+            error: format!("readlink: {e}"),
+        },
+    }
+}
+
+async fn local_fs_stat(args: FsPathArgs) -> Response {
+    match tokio::fs::symlink_metadata(&args.path).await {
+        Ok(meta) => {
+            let kind = if meta.is_symlink() {
+                "symlink"
+            } else if meta.is_dir() {
+                "dir"
+            } else {
+                "file"
+            };
+            Response::Ok {
+                data: Some(kind.to_string()),
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Response::NotFound,
+        Err(e) => Response::Error {
+            error: format!("stat: {e}"),
+        },
+    }
+}
+
+async fn local_net_listen(args: NetListenArgs) -> Response {
+    match tokio::net::TcpListener::bind((std::net::Ipv4Addr::UNSPECIFIED, args.port)).await {
+        Ok(listener) => {
+            let port = match listener.local_addr() {
+                Ok(addr) => addr.port(),
+                Err(e) => {
+                    return Response::Error {
+                        error: format!("local_addr: {e}"),
+                    };
+                }
+            };
+            let task = tokio::spawn(async move {
+                while let Ok((mut stream, _)) = listener.accept().await {
+                    tokio::spawn(async move {
+                        let mut buf = [0_u8; 4096];
+                        loop {
+                            match stream.read(&mut buf).await {
+                                Ok(0) | Err(_) => break,
+                                Ok(n) => {
+                                    if stream.write_all(&buf[..n]).await.is_err() {
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    });
+                }
+            });
+            if let Some(old) = tcp_listeners()
+                .lock()
+                .expect("tcp listener registry poisoned")
+                .insert(port, task)
+            {
+                old.abort();
+            }
+            Response::Listening { port }
+        }
+        Err(e) => Response::Error {
+            error: format!("bind {}: {e}", args.port),
+        },
+    }
+}
+
+async fn local_net_unlisten(args: NetListenArgs) -> Response {
+    if let Some(task) = tcp_listeners()
+        .lock()
+        .expect("tcp listener registry poisoned")
+        .remove(&args.port)
+    {
+        task.abort();
+    }
+    Response::Ok { data: None }
+}
+
+async fn local_net_connect(args: NetConnectArgs) -> Response {
+    match tokio::time::timeout(
+        Duration::from_secs(5),
+        tokio::net::TcpStream::connect(&args.addr),
+    )
+    .await
+    {
+        Ok(Ok(mut stream)) => {
+            let _ = stream.write_all(args.data.as_bytes()).await;
+            let _ = stream.flush().await;
+            let mut buf = [0_u8; 4096];
+            match tokio::time::timeout(Duration::from_secs(5), stream.read(&mut buf)).await {
+                Ok(Ok(n)) if n > 0 => Response::Connected {
+                    echo: String::from_utf8_lossy(&buf[..n]).to_string(),
+                },
+                _ => Response::ConnectFailed {
+                    error: "no echo response".to_string(),
+                },
+            }
+        }
+        Ok(Err(e)) => Response::ConnectFailed {
+            error: format!("{e}"),
+        },
+        Err(_) => Response::ConnectFailed {
+            error: "connect timeout".to_string(),
+        },
+    }
+}
+
+async fn local_unix_listen(args: FsPathArgs) -> Response {
+    let _ = tokio::fs::remove_file(&args.path).await;
+    match tokio::net::UnixListener::bind(&args.path) {
+        Ok(listener) => {
+            let path = args.path;
+            let task = tokio::spawn(async move {
+                while let Ok((mut stream, _)) = listener.accept().await {
+                    tokio::spawn(async move {
+                        let mut buf = [0_u8; 4096];
+                        loop {
+                            match stream.read(&mut buf).await {
+                                Ok(0) | Err(_) => break,
+                                Ok(n) => {
+                                    if stream.write_all(&buf[..n]).await.is_err() {
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    });
+                }
+            });
+            if let Some(old) = unix_listeners()
+                .lock()
+                .expect("unix listener registry poisoned")
+                .insert(path.clone(), task)
+            {
+                old.abort();
+            }
+            Response::UnixListening { path }
+        }
+        Err(e) => Response::Error {
+            error: format!("unix bind({}): {e}", args.path),
+        },
+    }
+}
+
+async fn local_unix_unlisten(args: FsPathArgs) -> Response {
+    if let Some(task) = unix_listeners()
+        .lock()
+        .expect("unix listener registry poisoned")
+        .remove(&args.path)
+    {
+        task.abort();
+    }
+    let _ = tokio::fs::remove_file(&args.path).await;
+    Response::Ok { data: None }
+}
+
+async fn local_unix_connect(args: UnixConnectArgs) -> Response {
+    match tokio::time::timeout(
+        Duration::from_secs(5),
+        tokio::net::UnixStream::connect(&args.path),
+    )
+    .await
+    {
+        Ok(Ok(mut stream)) => {
+            let _ = stream.write_all(args.data.as_bytes()).await;
+            let _ = stream.flush().await;
+            let mut buf = [0_u8; 4096];
+            match tokio::time::timeout(Duration::from_secs(5), stream.read(&mut buf)).await {
+                Ok(Ok(n)) if n > 0 => Response::Connected {
+                    echo: String::from_utf8_lossy(&buf[..n]).to_string(),
+                },
+                _ => Response::ConnectFailed {
+                    error: "no echo response".to_string(),
+                },
+            }
+        }
+        Ok(Err(e)) => Response::ConnectFailed {
+            error: format!("{e}"),
+        },
+        Err(_) => Response::ConnectFailed {
+            error: "connect timeout".to_string(),
+        },
+    }
+}
+
+async fn local_exec(args: ExecArgs) -> Response {
+    if args.args.is_empty() {
+        return Response::Error {
+            error: "exec requires args".to_string(),
+        };
+    }
+    let mut cmd = tokio::process::Command::new(&args.args[0]);
+    cmd.args(&args.args[1..]);
+    for (key, value) in &args.env {
+        cmd.env(key, value);
+    }
+    if args.stdin.is_some() {
+        cmd.stdin(Stdio::piped());
+    } else {
+        cmd.stdin(Stdio::null());
+    }
+    if args.background {
+        cmd.stdout(Stdio::null()).stderr(Stdio::null());
+        match cmd.spawn() {
+            Ok(mut child) => {
+                if let Some(content) = args.stdin
+                    && let Some(mut stdin) = child.stdin.take()
+                {
+                    let _ = stdin.write_all(content.as_bytes()).await;
+                }
+                Response::Background {
+                    pid: child.id().unwrap_or(0),
+                }
+            }
+            Err(e) => Response::Error {
+                error: format!("exec spawn: {e}"),
+            },
+        }
+    } else {
+        cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+        let mut child = match cmd.spawn() {
+            Ok(child) => child,
+            Err(e) => {
+                return Response::Error {
+                    error: format!("exec spawn: {e}"),
+                };
+            }
+        };
+        if let Some(content) = args.stdin
+            && let Some(mut stdin) = child.stdin.take()
+        {
+            let _ = stdin.write_all(content.as_bytes()).await;
+        }
+        let timeout = Duration::from_secs(args.timeout_secs.unwrap_or(10));
+        match tokio::time::timeout(timeout, child.wait_with_output()).await {
+            Ok(Ok(output)) => Response::ExecResult {
+                exit_code: output.status.code().unwrap_or(-1),
+                stdout: String::from_utf8_lossy(&output.stdout).to_string(),
+                stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+            },
+            Ok(Err(e)) => Response::Error {
+                error: format!("exec wait: {e}"),
+            },
+            Err(_) => Response::ExecTimeout {
+                stderr: format!(
+                    "process timed out after {}s (likely deadlocked)",
+                    timeout.as_secs()
+                ),
+            },
+        }
+    }
+}
+
+#[allow(clippy::too_many_lines)]
+async fn local_exec_ready(args: ExecReadyArgs) -> Response {
+    if args.args.is_empty() {
+        return Response::Error {
+            error: "exec_ready requires args".to_string(),
+        };
+    }
+    if !matches!(args.stream.as_str(), "stdout" | "stderr" | "either") {
+        return Response::Error {
+            error: format!(
+                "invalid marker stream {:?}; expected stdout, stderr, or either",
+                args.stream
+            ),
+        };
+    }
+    let mut cmd = std::process::Command::new(&args.args[0]);
+    cmd.args(&args.args[1..]);
+    if args.stdin.is_some() {
+        cmd.stdin(Stdio::piped());
+    } else {
+        cmd.stdin(Stdio::null());
+    }
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = match cmd.spawn() {
+        Ok(child) => child,
+        Err(e) => {
+            return Response::Error {
+                error: format!("exec_ready spawn: {e}"),
+            };
+        }
+    };
+    if let Some(content) = args.stdin
+        && let Some(mut stdin) = child.stdin.take()
+    {
+        let _ = std::io::Write::write_all(&mut stdin, content.as_bytes());
+    }
+    let Some(stdout) = child.stdout.take() else {
+        return Response::Error {
+            error: "exec_ready: stdout pipe missing".to_string(),
+        };
+    };
+    let Some(stderr) = child.stderr.take() else {
+        return Response::Error {
+            error: "exec_ready: stderr pipe missing".to_string(),
+        };
+    };
+    let (tx, rx) = std::sync::mpsc::channel::<String>();
+    let marker = args.ready_marker.clone();
+    let stream = args.stream.clone();
+    if matches!(stream.as_str(), "stdout" | "either") {
+        let tx = tx.clone();
+        let marker = marker.clone();
+        std::thread::spawn(move || {
+            let mut reader = std::io::BufReader::new(stdout);
+            let mut seen = Vec::new();
+            let mut byte = [0_u8; 1];
+            while let Ok(1) = std::io::Read::read(&mut reader, &mut byte) {
+                seen.push(byte[0]);
+                if String::from_utf8_lossy(&seen).contains(&marker) {
+                    let _ = tx.send("ready".to_string());
+                    break;
+                }
+            }
+        });
+    }
+    if matches!(stream.as_str(), "stderr" | "either") {
+        let tx = tx.clone();
+        let marker = marker.clone();
+        std::thread::spawn(move || {
+            let mut reader = std::io::BufReader::new(stderr);
+            let mut seen = Vec::new();
+            let mut byte = [0_u8; 1];
+            while let Ok(1) = std::io::Read::read(&mut reader, &mut byte) {
+                seen.push(byte[0]);
+                if String::from_utf8_lossy(&seen).contains(&marker) {
+                    let _ = tx.send("ready".to_string());
+                    break;
+                }
+            }
+        });
+    }
+    let timeout = Duration::from_secs(args.timeout_secs.unwrap_or(30));
+    let start = Instant::now();
+    loop {
+        if rx.try_recv().is_ok() {
+            let pid = child.id();
+            std::mem::forget(child);
+            return Response::BackgroundReady { pid };
+        }
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                return Response::Error {
+                    error: format!("process exited before ready_marker (status={status})"),
+                };
+            }
+            Ok(None) => {}
+            Err(e) => {
+                return Response::Error {
+                    error: format!("exec_ready poll: {e}"),
+                };
+            }
+        }
+        if start.elapsed() >= timeout {
+            let _ = child.kill();
+            return Response::Error {
+                error: format!("ready_marker not observed within {}s", timeout.as_secs()),
+            };
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
+async fn local_kill(args: KillArgs) -> Response {
+    let Ok(pid) = libc::pid_t::try_from(args.pid) else {
+        return Response::Error {
+            error: format!("kill {}: pid out of range", args.pid),
+        };
+    };
+    // SAFETY: libc::kill is called with a PID returned by a previous background spawn and a constant signal.
+    let rc = unsafe { libc::kill(pid, libc::SIGKILL) };
+    if rc == 0 {
+        Response::Ok { data: None }
+    } else {
+        Response::Error {
+            error: format!("kill {}: {}", args.pid, std::io::Error::last_os_error()),
+        }
+    }
+}
+
+async fn local_env_get(args: EnvGetArgs) -> Response {
+    Response::Ok {
+        data: Some(std::env::var(&args.var).unwrap_or_else(|_| "NOT_SET".to_string())),
+    }
+}
+
+#[allow(clippy::unused_async)]
+async fn local_cwd_get((): ()) -> Response {
+    Response::Ok {
+        data: Some(
+            std::env::current_dir()
+                .map_or_else(|e| format!("ERROR: {e}"), |p| p.display().to_string()),
+        ),
+    }
+}
+
+async fn handle_fs_read(
+    args: FsPathArgs,
+    _ctx: &mut HandlerCtx<'_>,
+) -> Result<Response, crate::handlers::HandlerError> {
+    Ok(local_fs_read(args).await)
+}
+async fn handle_fs_write(
+    args: FsWriteArgs,
+    _ctx: &mut HandlerCtx<'_>,
+) -> Result<Response, crate::handlers::HandlerError> {
+    Ok(local_fs_write(args).await)
+}
+async fn handle_fs_delete(
+    args: FsPathArgs,
+    _ctx: &mut HandlerCtx<'_>,
+) -> Result<Response, crate::handlers::HandlerError> {
+    Ok(local_fs_delete(args).await)
+}
+async fn handle_fs_symlink(
+    args: FsSymlinkArgs,
+    _ctx: &mut HandlerCtx<'_>,
+) -> Result<Response, crate::handlers::HandlerError> {
+    Ok(local_fs_symlink(args).await)
+}
+async fn handle_fs_readlink(
+    args: FsPathArgs,
+    _ctx: &mut HandlerCtx<'_>,
+) -> Result<Response, crate::handlers::HandlerError> {
+    Ok(local_fs_readlink(args).await)
+}
+async fn handle_fs_stat(
+    args: FsPathArgs,
+    _ctx: &mut HandlerCtx<'_>,
+) -> Result<Response, crate::handlers::HandlerError> {
+    Ok(local_fs_stat(args).await)
+}
+async fn handle_net_listen(
+    args: NetListenArgs,
+    _ctx: &mut HandlerCtx<'_>,
+) -> Result<Response, crate::handlers::HandlerError> {
+    Ok(local_net_listen(args).await)
+}
+async fn handle_net_unlisten(
+    args: NetListenArgs,
+    _ctx: &mut HandlerCtx<'_>,
+) -> Result<Response, crate::handlers::HandlerError> {
+    Ok(local_net_unlisten(args).await)
+}
+async fn handle_net_connect(
+    args: NetConnectArgs,
+    _ctx: &mut HandlerCtx<'_>,
+) -> Result<Response, crate::handlers::HandlerError> {
+    Ok(local_net_connect(args).await)
+}
+async fn handle_unix_listen(
+    args: FsPathArgs,
+    _ctx: &mut HandlerCtx<'_>,
+) -> Result<Response, crate::handlers::HandlerError> {
+    Ok(local_unix_listen(args).await)
+}
+async fn handle_unix_unlisten(
+    args: FsPathArgs,
+    _ctx: &mut HandlerCtx<'_>,
+) -> Result<Response, crate::handlers::HandlerError> {
+    Ok(local_unix_unlisten(args).await)
+}
+async fn handle_unix_connect(
+    args: UnixConnectArgs,
+    _ctx: &mut HandlerCtx<'_>,
+) -> Result<Response, crate::handlers::HandlerError> {
+    Ok(local_unix_connect(args).await)
+}
+async fn handle_exec(
+    args: ExecArgs,
+    _ctx: &mut HandlerCtx<'_>,
+) -> Result<Response, crate::handlers::HandlerError> {
+    Ok(local_exec(args).await)
+}
+async fn handle_exec_ready(
+    args: ExecReadyArgs,
+    _ctx: &mut HandlerCtx<'_>,
+) -> Result<Response, crate::handlers::HandlerError> {
+    Ok(local_exec_ready(args).await)
+}
+async fn handle_kill(
+    args: KillArgs,
+    _ctx: &mut HandlerCtx<'_>,
+) -> Result<Response, crate::handlers::HandlerError> {
+    Ok(local_kill(args).await)
+}
+async fn handle_env_get(
+    args: EnvGetArgs,
+    _ctx: &mut HandlerCtx<'_>,
+) -> Result<Response, crate::handlers::HandlerError> {
+    Ok(local_env_get(args).await)
+}
+async fn handle_cwd_get(
+    args: (),
+    _ctx: &mut HandlerCtx<'_>,
+) -> Result<Response, crate::handlers::HandlerError> {
+    Ok(local_cwd_get(args).await)
+}
+
+fn register_matrix_handlers() {
+    register_handler!(FS_READ, handle_fs_read);
+    register_handler!(FS_WRITE, handle_fs_write);
+    register_handler!(FS_DELETE, handle_fs_delete);
+    register_handler!(FS_SYMLINK, handle_fs_symlink);
+    register_handler!(FS_READLINK, handle_fs_readlink);
+    register_handler!(FS_STAT, handle_fs_stat);
+    register_handler!(NET_LISTEN, handle_net_listen);
+    register_handler!(NET_UNLISTEN, handle_net_unlisten);
+    register_handler!(NET_CONNECT, handle_net_connect);
+    register_handler!(UNIX_LISTEN, handle_unix_listen);
+    register_handler!(UNIX_UNLISTEN, handle_unix_unlisten);
+    register_handler!(UNIX_CONNECT, handle_unix_connect);
+    register_handler!(EXEC, handle_exec);
+    register_handler!(EXEC_READY, handle_exec_ready);
+    register_handler!(KILL, handle_kill);
+    register_handler!(ENV_GET, handle_env_get);
+    register_handler!(CWD_GET, handle_cwd_get);
+}
+
+async fn send_response<A, F, Fut>(
+    run: &mut RunContext<'_>,
+    handles: &MatrixHandles,
+    agent: AgentName,
+    token: &HandlerToken<A, Response>,
+    args: A,
+    local: F,
+) -> Response
+where
+    A: Clone + Serialize,
+    F: FnOnce(A) -> Fut,
+    Fut: Future<Output = Response>,
+{
+    if agent == AgentName::Init {
+        local(args).await
+    } else {
+        run.send_named_typed(handle_for(handles, agent), token, args)
+            .await
+            .unwrap_or_else(|error| Response::Error { error })
+    }
+}
+
+#[allow(clippy::large_enum_variant, dead_code)]
+enum MatrixOp {
+    FsRead {
+        path: String,
+    },
+    FsWrite {
+        path: String,
+        data: String,
+    },
+    FsDelete {
+        path: String,
+    },
+    FsSymlink {
+        target: String,
+        link: String,
+    },
+    FsReadlink {
+        path: String,
+    },
+    FsStat {
+        path: String,
+    },
+    NetListen {
+        port: u16,
+        pre_bind_options: Vec<()>,
+    },
+    NetUnlisten {
+        port: u16,
+    },
+    NetConnect {
+        addr: String,
+        data: String,
+    },
+    UnixListen {
+        path: String,
+    },
+    UnixUnlisten {
+        path: String,
+    },
+    UnixConnect {
+        path: String,
+        data: String,
+    },
+    Exec {
+        args: Vec<String>,
+        timeout_secs: Option<u64>,
+        stdin: Option<String>,
+        background: bool,
+        env: Vec<(String, String)>,
+    },
+    ExecReady {
+        args: Vec<String>,
+        ready_marker: String,
+        timeout_secs: Option<u64>,
+        stdin: Option<String>,
+        stream: String,
+    },
+    Kill {
+        pid: u32,
+    },
+    EnvGet {
+        var: String,
+    },
+    CwdGet,
+}
+
+fn exec(args: Vec<String>) -> MatrixOp {
+    MatrixOp::Exec {
+        args,
+        timeout_secs: None,
+        stdin: None,
+        background: false,
+        env: vec![],
+    }
+}
 
 // ── Topology axis ──
 
@@ -472,13 +1240,219 @@ fn handle_for(handles: &MatrixHandles, agent: AgentName) -> &AgentHandle {
         .expect("agent was not declared for matrix test")
 }
 
+#[allow(clippy::too_many_lines)]
 async fn send_to(
     run: &mut RunContext<'_>,
     handles: &MatrixHandles,
     agent: AgentName,
-    cmd: Command,
+    cmd: MatrixOp,
 ) -> Response {
-    run.send(handle_for(handles, agent), cmd).await
+    match cmd {
+        MatrixOp::FsRead { path } => {
+            send_response(
+                run,
+                handles,
+                agent,
+                &FS_READ,
+                FsPathArgs { path },
+                local_fs_read,
+            )
+            .await
+        }
+        MatrixOp::FsWrite { path, data } => {
+            send_response(
+                run,
+                handles,
+                agent,
+                &FS_WRITE,
+                FsWriteArgs { path, data },
+                local_fs_write,
+            )
+            .await
+        }
+        MatrixOp::FsDelete { path } => {
+            send_response(
+                run,
+                handles,
+                agent,
+                &FS_DELETE,
+                FsPathArgs { path },
+                local_fs_delete,
+            )
+            .await
+        }
+        MatrixOp::FsSymlink { target, link } => {
+            send_response(
+                run,
+                handles,
+                agent,
+                &FS_SYMLINK,
+                FsSymlinkArgs { target, link },
+                local_fs_symlink,
+            )
+            .await
+        }
+        MatrixOp::FsReadlink { path } => {
+            send_response(
+                run,
+                handles,
+                agent,
+                &FS_READLINK,
+                FsPathArgs { path },
+                local_fs_readlink,
+            )
+            .await
+        }
+        MatrixOp::FsStat { path } => {
+            send_response(
+                run,
+                handles,
+                agent,
+                &FS_STAT,
+                FsPathArgs { path },
+                local_fs_stat,
+            )
+            .await
+        }
+        MatrixOp::NetListen {
+            port,
+            pre_bind_options: _,
+        } => {
+            send_response(
+                run,
+                handles,
+                agent,
+                &NET_LISTEN,
+                NetListenArgs { port },
+                local_net_listen,
+            )
+            .await
+        }
+        MatrixOp::NetUnlisten { port } => {
+            send_response(
+                run,
+                handles,
+                agent,
+                &NET_UNLISTEN,
+                NetListenArgs { port },
+                local_net_unlisten,
+            )
+            .await
+        }
+        MatrixOp::NetConnect { addr, data } => {
+            send_response(
+                run,
+                handles,
+                agent,
+                &NET_CONNECT,
+                NetConnectArgs { addr, data },
+                local_net_connect,
+            )
+            .await
+        }
+        MatrixOp::UnixListen { path } => {
+            send_response(
+                run,
+                handles,
+                agent,
+                &UNIX_LISTEN,
+                FsPathArgs { path },
+                local_unix_listen,
+            )
+            .await
+        }
+        MatrixOp::UnixUnlisten { path } => {
+            send_response(
+                run,
+                handles,
+                agent,
+                &UNIX_UNLISTEN,
+                FsPathArgs { path },
+                local_unix_unlisten,
+            )
+            .await
+        }
+        MatrixOp::UnixConnect { path, data } => {
+            send_response(
+                run,
+                handles,
+                agent,
+                &UNIX_CONNECT,
+                UnixConnectArgs { path, data },
+                local_unix_connect,
+            )
+            .await
+        }
+        MatrixOp::Exec {
+            args,
+            timeout_secs,
+            stdin,
+            background,
+            env,
+        } => {
+            send_response(
+                run,
+                handles,
+                agent,
+                &EXEC,
+                ExecArgs {
+                    args,
+                    timeout_secs,
+                    stdin,
+                    background,
+                    env,
+                },
+                local_exec,
+            )
+            .await
+        }
+        MatrixOp::ExecReady {
+            args,
+            ready_marker,
+            timeout_secs,
+            stdin,
+            stream,
+        } => {
+            send_response(
+                run,
+                handles,
+                agent,
+                &EXEC_READY,
+                ExecReadyArgs {
+                    args,
+                    ready_marker,
+                    timeout_secs,
+                    stdin,
+                    stream,
+                },
+                local_exec_ready,
+            )
+            .await
+        }
+        MatrixOp::Kill { pid } => {
+            send_response(run, handles, agent, &KILL, KillArgs { pid }, local_kill).await
+        }
+        MatrixOp::EnvGet { var } => {
+            send_response(
+                run,
+                handles,
+                agent,
+                &ENV_GET,
+                EnvGetArgs { var },
+                local_env_get,
+            )
+            .await
+        }
+        MatrixOp::CwdGet => {
+            if agent == AgentName::Init {
+                local_cwd_get(()).await
+            } else {
+                run.send_named_typed(handle_for(handles, agent), &CWD_GET, ())
+                    .await
+                    .unwrap_or_else(|error| Response::Error { error })
+            }
+        }
+    }
 }
 
 #[allow(clippy::too_many_lines)] // exhaustive registration / runner
@@ -499,10 +1473,10 @@ pub(super) fn register_fs_crud(reg: &mut Registry<'_>) {
                         run,
                         &handles,
                         AgentName::Init,
-                        Command::FsDelete { path: file.clone() },
+                        MatrixOp::FsDelete { path: file.clone() },
                     )
                     .await;
-                    let resp = send_to(run, &handles, dest, Command::FsRead { path: file }).await;
+                    let resp = send_to(run, &handles, dest, MatrixOp::FsRead { path: file }).await;
                     super::TestOutcome::new(
                         dest.name(),
                         matches!(resp, Response::NotFound),
@@ -523,20 +1497,20 @@ pub(super) fn register_fs_crud(reg: &mut Registry<'_>) {
                         run,
                         &handles,
                         AgentName::Init,
-                        Command::FsDelete { path: file.clone() },
+                        MatrixOp::FsDelete { path: file.clone() },
                     )
                     .await;
                     let _ = send_to(
                         run,
                         &handles,
                         source,
-                        Command::FsWrite {
+                        MatrixOp::FsWrite {
                             path: file.clone(),
                             data: data.clone(),
                         },
                     )
                     .await;
-                    let resp = send_to(run, &handles, dest, Command::FsRead { path: file }).await;
+                    let resp = send_to(run, &handles, dest, MatrixOp::FsRead { path: file }).await;
                     let pass = matches!(&resp, Response::Ok { data: Some(d) } if *d == data);
                     super::TestOutcome::new(dest.name(), pass, format!("{resp:?}"))
                 })
@@ -554,14 +1528,14 @@ pub(super) fn register_fs_crud(reg: &mut Registry<'_>) {
                         run,
                         &handles,
                         AgentName::Init,
-                        Command::FsDelete { path: file.clone() },
+                        MatrixOp::FsDelete { path: file.clone() },
                     )
                     .await;
                     let _ = send_to(
                         run,
                         &handles,
                         source,
-                        Command::FsWrite {
+                        MatrixOp::FsWrite {
                             path: file.clone(),
                             data: format!("data_{ts}"),
                         },
@@ -571,13 +1545,13 @@ pub(super) fn register_fs_crud(reg: &mut Registry<'_>) {
                         run,
                         &handles,
                         source,
-                        Command::FsWrite {
+                        MatrixOp::FsWrite {
                             path: file.clone(),
                             data: updated.clone(),
                         },
                     )
                     .await;
-                    let resp = send_to(run, &handles, dest, Command::FsRead { path: file }).await;
+                    let resp = send_to(run, &handles, dest, MatrixOp::FsRead { path: file }).await;
                     let pass = matches!(&resp, Response::Ok { data: Some(d) } if *d == updated);
                     super::TestOutcome::new(dest.name(), pass, format!("{resp:?}"))
                 })
@@ -594,14 +1568,14 @@ pub(super) fn register_fs_crud(reg: &mut Registry<'_>) {
                         run,
                         &handles,
                         AgentName::Init,
-                        Command::FsDelete { path: file.clone() },
+                        MatrixOp::FsDelete { path: file.clone() },
                     )
                     .await;
                     let _ = send_to(
                         run,
                         &handles,
                         source,
-                        Command::FsWrite {
+                        MatrixOp::FsWrite {
                             path: file.clone(),
                             data: format!("data_{ts}"),
                         },
@@ -611,10 +1585,10 @@ pub(super) fn register_fs_crud(reg: &mut Registry<'_>) {
                         run,
                         &handles,
                         source,
-                        Command::FsDelete { path: file.clone() },
+                        MatrixOp::FsDelete { path: file.clone() },
                     )
                     .await;
-                    let resp = send_to(run, &handles, dest, Command::FsRead { path: file }).await;
+                    let resp = send_to(run, &handles, dest, MatrixOp::FsRead { path: file }).await;
                     super::TestOutcome::new(
                         dest.name(),
                         matches!(resp, Response::NotFound),
@@ -643,20 +1617,21 @@ pub(super) fn register_fs_cross_unlink(reg: &mut Registry<'_>) {
                         run,
                         &handles,
                         AgentName::Init,
-                        Command::FsDelete { path: file.clone() },
+                        MatrixOp::FsDelete { path: file.clone() },
                     )
                     .await;
                     let _ = send_to(
                         run,
                         &handles,
                         source,
-                        Command::FsWrite {
+                        MatrixOp::FsWrite {
                             path: file.clone(),
                             data: "unlink_me".into(),
                         },
                     )
                     .await;
-                    let resp = send_to(run, &handles, dest, Command::FsDelete { path: file }).await;
+                    let resp =
+                        send_to(run, &handles, dest, MatrixOp::FsDelete { path: file }).await;
                     super::TestOutcome::new(
                         dest.name(),
                         super::ok_without_data(&resp),
@@ -676,14 +1651,14 @@ pub(super) fn register_fs_cross_unlink(reg: &mut Registry<'_>) {
                         run,
                         &handles,
                         AgentName::Init,
-                        Command::FsDelete { path: file.clone() },
+                        MatrixOp::FsDelete { path: file.clone() },
                     )
                     .await;
                     let _ = send_to(
                         run,
                         &handles,
                         source,
-                        Command::FsWrite {
+                        MatrixOp::FsWrite {
                             path: file.clone(),
                             data: "unlink_me".into(),
                         },
@@ -693,10 +1668,11 @@ pub(super) fn register_fs_cross_unlink(reg: &mut Registry<'_>) {
                         run,
                         &handles,
                         dest,
-                        Command::FsDelete { path: file.clone() },
+                        MatrixOp::FsDelete { path: file.clone() },
                     )
                     .await;
-                    let resp = send_to(run, &handles, source, Command::FsRead { path: file }).await;
+                    let resp =
+                        send_to(run, &handles, source, MatrixOp::FsRead { path: file }).await;
                     super::TestOutcome::new(
                         source.name(),
                         matches!(resp, Response::NotFound),
@@ -727,13 +1703,14 @@ pub(super) fn register_tmp_isolation(reg: &mut Registry<'_>) {
                         run,
                         &handles,
                         writer,
-                        Command::FsWrite {
+                        MatrixOp::FsWrite {
                             path: file.clone(),
                             data: "tmp_test".into(),
                         },
                     )
                     .await;
-                    let resp = send_to(run, &handles, reader, Command::FsRead { path: file }).await;
+                    let resp =
+                        send_to(run, &handles, reader, MatrixOp::FsRead { path: file }).await;
                     let is_isolated = matches!(resp, Response::NotFound);
                     super::TestOutcome::new(
                         reader.name(),
@@ -758,7 +1735,7 @@ pub(super) fn register_host_file(reg: &mut Registry<'_>) {
                         run,
                         &handles,
                         agent,
-                        Command::FsRead {
+                        MatrixOp::FsRead {
                             path: "/shared/host_wrote.txt".into(),
                         },
                     )
@@ -775,6 +1752,7 @@ pub(super) fn register_host_file(reg: &mut Registry<'_>) {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 pub(super) fn register_net_tests(reg: &mut Registry<'_>) {
     let mut port = 10_001u16;
     for tc in NET_TESTS {
@@ -792,7 +1770,7 @@ pub(super) fn register_net_tests(reg: &mut Registry<'_>) {
                         run,
                         &handles,
                         listener,
-                        Command::NetListen {
+                        MatrixOp::NetListen {
                             port: p,
                             pre_bind_options: vec![],
                         },
@@ -800,7 +1778,7 @@ pub(super) fn register_net_tests(reg: &mut Registry<'_>) {
                     .await;
                     let pass = super::expect_listening_port(&resp, p).is_ok();
                     let _ =
-                        send_to(run, &handles, listener, Command::NetUnlisten { port: p }).await;
+                        send_to(run, &handles, listener, MatrixOp::NetUnlisten { port: p }).await;
                     super::TestOutcome::new(listener.name(), pass, format!("{resp:?}"))
                 })
             },
@@ -816,7 +1794,7 @@ pub(super) fn register_net_tests(reg: &mut Registry<'_>) {
                         run,
                         &handles,
                         listener,
-                        Command::NetListen {
+                        MatrixOp::NetListen {
                             port: p,
                             pre_bind_options: vec![],
                         },
@@ -833,7 +1811,7 @@ pub(super) fn register_net_tests(reg: &mut Registry<'_>) {
                         run,
                         &handles,
                         connector,
-                        Command::NetConnect {
+                        MatrixOp::NetConnect {
                             addr: format!("127.0.0.1:{p}"),
                             data: test_data.clone(),
                         },
@@ -841,7 +1819,7 @@ pub(super) fn register_net_tests(reg: &mut Registry<'_>) {
                     .await;
                     let pass = matches!(&resp, Response::Connected { echo } if *echo == test_data);
                     let _ =
-                        send_to(run, &handles, listener, Command::NetUnlisten { port: p }).await;
+                        send_to(run, &handles, listener, MatrixOp::NetUnlisten { port: p }).await;
                     super::TestOutcome::new(connector.name(), pass, format!("{resp:?}"))
                 })
             },
@@ -856,14 +1834,14 @@ pub(super) fn register_net_tests(reg: &mut Registry<'_>) {
                         run,
                         &handles,
                         listener,
-                        Command::NetListen {
+                        MatrixOp::NetListen {
                             port: p,
                             pre_bind_options: vec![],
                         },
                     )
                     .await;
                     let resp =
-                        send_to(run, &handles, listener, Command::NetUnlisten { port: p }).await;
+                        send_to(run, &handles, listener, MatrixOp::NetUnlisten { port: p }).await;
                     super::TestOutcome::new(
                         listener.name(),
                         super::ok_without_data(&resp),
@@ -875,6 +1853,7 @@ pub(super) fn register_net_tests(reg: &mut Registry<'_>) {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 pub(super) fn register_net_addr_tests(reg: &mut Registry<'_>) {
     let mut port = 11_001u16;
     for &(agent_a, agent_b) in NET_ADDR_PAIRS {
@@ -893,7 +1872,7 @@ pub(super) fn register_net_addr_tests(reg: &mut Registry<'_>) {
                             run,
                             &handles,
                             agent_a,
-                            Command::NetListen {
+                            MatrixOp::NetListen {
                                 port: p,
                                 pre_bind_options: vec![],
                             },
@@ -910,7 +1889,7 @@ pub(super) fn register_net_addr_tests(reg: &mut Registry<'_>) {
                             run,
                             &handles,
                             agent_b,
-                            Command::NetConnect {
+                            MatrixOp::NetConnect {
                                 addr: format!("{addr}:{p}"),
                                 data: test_data.clone(),
                             },
@@ -918,8 +1897,8 @@ pub(super) fn register_net_addr_tests(reg: &mut Registry<'_>) {
                         .await;
                         let pass =
                             matches!(&resp, Response::Connected { echo } if *echo == test_data);
-                        let _ =
-                            send_to(run, &handles, agent_a, Command::NetUnlisten { port: p }).await;
+                        let _ = send_to(run, &handles, agent_a, MatrixOp::NetUnlisten { port: p })
+                            .await;
                         super::TestOutcome::new(agent_b.name(), pass, format!("{resp:?}"))
                     })
                 },
@@ -958,7 +1937,7 @@ pub(super) fn register_net_addr_tests(reg: &mut Registry<'_>) {
                         run,
                         &handles,
                         agent_a,
-                        Command::NetListen {
+                        MatrixOp::NetListen {
                             port: p,
                             pre_bind_options: vec![],
                         },
@@ -975,14 +1954,15 @@ pub(super) fn register_net_addr_tests(reg: &mut Registry<'_>) {
                         run,
                         &handles,
                         agent_b,
-                        Command::NetConnect {
+                        MatrixOp::NetConnect {
                             addr: format!("{addr}:{p}"),
                             data: test_data.clone(),
                         },
                     )
                     .await;
                     let pass = matches!(&resp, Response::Connected { echo } if *echo == test_data);
-                    let _ = send_to(run, &handles, agent_a, Command::NetUnlisten { port: p }).await;
+                    let _ =
+                        send_to(run, &handles, agent_a, MatrixOp::NetUnlisten { port: p }).await;
                     super::TestOutcome::new(agent_b.name(), pass, format!("{resp:?}"))
                 })
             },
@@ -1006,7 +1986,7 @@ pub(super) fn register_unix_addr_tests(reg: &mut Registry<'_>) {
                         run,
                         &handles,
                         agent_a,
-                        Command::UnixListen {
+                        MatrixOp::UnixListen {
                             path: sock_path.clone(),
                         },
                     )
@@ -1022,7 +2002,7 @@ pub(super) fn register_unix_addr_tests(reg: &mut Registry<'_>) {
                         run,
                         &handles,
                         agent_b,
-                        Command::UnixConnect {
+                        MatrixOp::UnixConnect {
                             path: sock_path.clone(),
                             data: test_data.clone(),
                         },
@@ -1033,7 +2013,7 @@ pub(super) fn register_unix_addr_tests(reg: &mut Registry<'_>) {
                         run,
                         &handles,
                         agent_a,
-                        Command::UnixUnlisten { path: sock_path },
+                        MatrixOp::UnixUnlisten { path: sock_path },
                     )
                     .await;
                     super::TestOutcome::new(agent_b.name(), pass, format!("{resp:?}"))
@@ -1055,13 +2035,9 @@ pub(super) fn register_exec_tests(reg: &mut Registry<'_>) {
                     Box::pin(async move {
                         let self_exe = run.self_exe().to_string();
                         let target = crate::binary_path(bt, &self_exe);
-                        let resp = send_to(
-                            run,
-                            &handles,
-                            agent,
-                            super::exec(vec![target, "echo-test".into()]),
-                        )
-                        .await;
+                        let resp =
+                            send_to(run, &handles, agent, exec(vec![target, "echo-test".into()]))
+                                .await;
                         let pass = matches!(
                             &resp,
                             Response::ExecResult { exit_code: 0, stdout, .. }
@@ -1088,7 +2064,7 @@ pub(super) fn register_exec_tests(reg: &mut Registry<'_>) {
                             run,
                             &handles,
                             agent,
-                            super::exec(vec![target, "exit-with".into(), code.to_string()]),
+                            exec(vec![target, "exit-with".into(), code.to_string()]),
                         )
                         .await;
                         let pass = matches!(&resp, Response::ExecResult { exit_code, .. } if *exit_code == code);
@@ -1110,7 +2086,7 @@ pub(super) fn register_env_tests(reg: &mut Registry<'_>) {
                 move |run, handles| {
                     Box::pin(async move {
                         let resp =
-                            send_to(run, &handles, agent, Command::EnvGet { var: var.into() })
+                            send_to(run, &handles, agent, MatrixOp::EnvGet { var: var.into() })
                                 .await;
                         let pass = matches!(&resp, Response::Ok { data: Some(d) } if !d.is_empty() && d != "NOT_SET");
                         super::TestOutcome::new(agent.name(), pass, format!("{resp:?}"))
@@ -1124,7 +2100,7 @@ pub(super) fn register_env_tests(reg: &mut Registry<'_>) {
             vec![agent],
             move |run, handles| {
                 Box::pin(async move {
-                    let resp = send_to(run, &handles, agent, Command::CwdGet).await;
+                    let resp = send_to(run, &handles, agent, MatrixOp::CwdGet).await;
                     super::TestOutcome::new(
                         agent.name(),
                         matches!(&resp, Response::Ok { data: Some(d) } if d == "/"),
@@ -1154,21 +2130,21 @@ pub(super) fn register_symlink_basic(reg: &mut Registry<'_>) {
                         run,
                         &handles,
                         AgentName::Init,
-                        Command::FsDelete { path: link.clone() },
+                        MatrixOp::FsDelete { path: link.clone() },
                     )
                     .await;
                     let _ = send_to(
                         run,
                         &handles,
                         AgentName::Init,
-                        Command::FsDelete { path: file.clone() },
+                        MatrixOp::FsDelete { path: file.clone() },
                     )
                     .await;
                     let _ = send_to(
                         run,
                         &handles,
                         source,
-                        Command::FsWrite {
+                        MatrixOp::FsWrite {
                             path: file.clone(),
                             data: format!("symdata_{ts}"),
                         },
@@ -1178,7 +2154,7 @@ pub(super) fn register_symlink_basic(reg: &mut Registry<'_>) {
                         run,
                         &handles,
                         source,
-                        Command::FsSymlink { target: file, link },
+                        MatrixOp::FsSymlink { target: file, link },
                     )
                     .await;
                     super::TestOutcome::new(
@@ -1201,21 +2177,21 @@ pub(super) fn register_symlink_basic(reg: &mut Registry<'_>) {
                         run,
                         &handles,
                         AgentName::Init,
-                        Command::FsDelete { path: link.clone() },
+                        MatrixOp::FsDelete { path: link.clone() },
                     )
                     .await;
                     let _ = send_to(
                         run,
                         &handles,
                         AgentName::Init,
-                        Command::FsDelete { path: file.clone() },
+                        MatrixOp::FsDelete { path: file.clone() },
                     )
                     .await;
                     let _ = send_to(
                         run,
                         &handles,
                         source,
-                        Command::FsWrite {
+                        MatrixOp::FsWrite {
                             path: file.clone(),
                             data: format!("symdata_{ts}"),
                         },
@@ -1225,14 +2201,14 @@ pub(super) fn register_symlink_basic(reg: &mut Registry<'_>) {
                         run,
                         &handles,
                         source,
-                        Command::FsSymlink {
+                        MatrixOp::FsSymlink {
                             target: file.clone(),
                             link: link.clone(),
                         },
                     )
                     .await;
                     let resp =
-                        send_to(run, &handles, source, Command::FsReadlink { path: link }).await;
+                        send_to(run, &handles, source, MatrixOp::FsReadlink { path: link }).await;
                     let pass = matches!(&resp, Response::Ok { data: Some(d) } if *d == file);
                     super::TestOutcome::new(source.name(), pass, format!("{resp:?}"))
                 })
@@ -1251,21 +2227,21 @@ pub(super) fn register_symlink_basic(reg: &mut Registry<'_>) {
                         run,
                         &handles,
                         AgentName::Init,
-                        Command::FsDelete { path: link.clone() },
+                        MatrixOp::FsDelete { path: link.clone() },
                     )
                     .await;
                     let _ = send_to(
                         run,
                         &handles,
                         AgentName::Init,
-                        Command::FsDelete { path: file.clone() },
+                        MatrixOp::FsDelete { path: file.clone() },
                     )
                     .await;
                     let _ = send_to(
                         run,
                         &handles,
                         source,
-                        Command::FsWrite {
+                        MatrixOp::FsWrite {
                             path: file.clone(),
                             data: data.clone(),
                         },
@@ -1275,13 +2251,13 @@ pub(super) fn register_symlink_basic(reg: &mut Registry<'_>) {
                         run,
                         &handles,
                         source,
-                        Command::FsSymlink {
+                        MatrixOp::FsSymlink {
                             target: file,
                             link: link.clone(),
                         },
                     )
                     .await;
-                    let resp = send_to(run, &handles, dest, Command::FsRead { path: link }).await;
+                    let resp = send_to(run, &handles, dest, MatrixOp::FsRead { path: link }).await;
                     let pass = matches!(&resp, Response::Ok { data: Some(d) } if *d == data);
                     super::TestOutcome::new(dest.name(), pass, format!("{resp:?}"))
                 })
@@ -1299,21 +2275,21 @@ pub(super) fn register_symlink_basic(reg: &mut Registry<'_>) {
                         run,
                         &handles,
                         AgentName::Init,
-                        Command::FsDelete { path: link.clone() },
+                        MatrixOp::FsDelete { path: link.clone() },
                     )
                     .await;
                     let _ = send_to(
                         run,
                         &handles,
                         AgentName::Init,
-                        Command::FsDelete { path: file.clone() },
+                        MatrixOp::FsDelete { path: file.clone() },
                     )
                     .await;
                     let _ = send_to(
                         run,
                         &handles,
                         source,
-                        Command::FsWrite {
+                        MatrixOp::FsWrite {
                             path: file.clone(),
                             data: format!("symdata_{ts}"),
                         },
@@ -1323,13 +2299,13 @@ pub(super) fn register_symlink_basic(reg: &mut Registry<'_>) {
                         run,
                         &handles,
                         source,
-                        Command::FsSymlink {
+                        MatrixOp::FsSymlink {
                             target: file,
                             link: link.clone(),
                         },
                     )
                     .await;
-                    let resp = send_to(run, &handles, dest, Command::FsStat { path: link }).await;
+                    let resp = send_to(run, &handles, dest, MatrixOp::FsStat { path: link }).await;
                     let pass = matches!(&resp, Response::Ok { data: Some(d) } if d == "symlink");
                     super::TestOutcome::new(dest.name(), pass, format!("{resp:?}"))
                 })
@@ -1351,7 +2327,7 @@ pub(super) fn register_symlink_variants(reg: &mut Registry<'_>) {
                     run,
                     &handles,
                     agent,
-                    super::exec(vec![
+                    exec(vec![
                         "rm".into(),
                         "-rf".into(),
                         "/shared/sv_dir".into(),
@@ -1363,7 +2339,7 @@ pub(super) fn register_symlink_variants(reg: &mut Registry<'_>) {
                     run,
                     &handles,
                     agent,
-                    super::exec(vec![
+                    exec(vec![
                         "bash".into(),
                         "-c".into(),
                         "mkdir -p /shared/sv_dir && echo DIR_CONTENT > /shared/sv_dir/inside.txt"
@@ -1375,7 +2351,7 @@ pub(super) fn register_symlink_variants(reg: &mut Registry<'_>) {
                     run,
                     &handles,
                     agent,
-                    Command::FsSymlink {
+                    MatrixOp::FsSymlink {
                         target: "/shared/sv_dir".into(),
                         link: "/shared/sv_dirlink".into(),
                     },
@@ -1385,7 +2361,7 @@ pub(super) fn register_symlink_variants(reg: &mut Registry<'_>) {
                     run,
                     &handles,
                     agent,
-                    Command::FsRead {
+                    MatrixOp::FsRead {
                         path: "/shared/sv_dirlink/inside.txt".into(),
                     },
                 )
@@ -1406,7 +2382,7 @@ pub(super) fn register_symlink_variants(reg: &mut Registry<'_>) {
                     run,
                     &handles,
                     AgentName::Init,
-                    Command::FsDelete {
+                    MatrixOp::FsDelete {
                         path: "/shared/sv_dangling".into(),
                     },
                 )
@@ -1415,7 +2391,7 @@ pub(super) fn register_symlink_variants(reg: &mut Registry<'_>) {
                     run,
                     &handles,
                     agent,
-                    Command::FsSymlink {
+                    MatrixOp::FsSymlink {
                         target: "/shared/nonexistent_target".into(),
                         link: "/shared/sv_dangling".into(),
                     },
@@ -1425,7 +2401,7 @@ pub(super) fn register_symlink_variants(reg: &mut Registry<'_>) {
                     run,
                     &handles,
                     agent,
-                    Command::FsReadlink {
+                    MatrixOp::FsReadlink {
                         path: "/shared/sv_dangling".into(),
                     },
                 )
@@ -1445,7 +2421,7 @@ pub(super) fn register_symlink_variants(reg: &mut Registry<'_>) {
                     run,
                     &handles,
                     AgentName::Init,
-                    Command::FsDelete {
+                    MatrixOp::FsDelete {
                         path: "/shared/sv_dangling".into(),
                     },
                 )
@@ -1454,7 +2430,7 @@ pub(super) fn register_symlink_variants(reg: &mut Registry<'_>) {
                     run,
                     &handles,
                     agent,
-                    Command::FsSymlink {
+                    MatrixOp::FsSymlink {
                         target: "/shared/nonexistent_target".into(),
                         link: "/shared/sv_dangling".into(),
                     },
@@ -1464,7 +2440,7 @@ pub(super) fn register_symlink_variants(reg: &mut Registry<'_>) {
                     run,
                     &handles,
                     agent,
-                    Command::FsRead {
+                    MatrixOp::FsRead {
                         path: "/shared/sv_dangling".into(),
                     },
                 )
@@ -1488,7 +2464,7 @@ pub(super) fn register_symlink_variants(reg: &mut Registry<'_>) {
                         run,
                         &handles,
                         AgentName::Init,
-                        Command::FsDelete {
+                        MatrixOp::FsDelete {
                             path: format!("/shared/{name}"),
                         },
                     )
@@ -1498,7 +2474,7 @@ pub(super) fn register_symlink_variants(reg: &mut Registry<'_>) {
                     run,
                     &handles,
                     agent,
-                    Command::FsWrite {
+                    MatrixOp::FsWrite {
                         path: "/shared/sv_nested_file".into(),
                         data: "NESTED_DATA".into(),
                     },
@@ -1508,7 +2484,7 @@ pub(super) fn register_symlink_variants(reg: &mut Registry<'_>) {
                     run,
                     &handles,
                     agent,
-                    Command::FsSymlink {
+                    MatrixOp::FsSymlink {
                         target: "/shared/sv_nested_file".into(),
                         link: "/shared/sv_nested_link2".into(),
                     },
@@ -1518,7 +2494,7 @@ pub(super) fn register_symlink_variants(reg: &mut Registry<'_>) {
                     run,
                     &handles,
                     agent,
-                    Command::FsSymlink {
+                    MatrixOp::FsSymlink {
                         target: "/shared/sv_nested_link2".into(),
                         link: "/shared/sv_nested_link1".into(),
                     },
@@ -1528,7 +2504,7 @@ pub(super) fn register_symlink_variants(reg: &mut Registry<'_>) {
                     run,
                     &handles,
                     agent,
-                    Command::FsRead {
+                    MatrixOp::FsRead {
                         path: "/shared/sv_nested_link1".into(),
                     },
                 )
@@ -1549,7 +2525,7 @@ pub(super) fn register_symlink_variants(reg: &mut Registry<'_>) {
                         run,
                         &handles,
                         AgentName::Init,
-                        Command::FsDelete {
+                        MatrixOp::FsDelete {
                             path: format!("/shared/{name}"),
                         },
                     )
@@ -1559,7 +2535,7 @@ pub(super) fn register_symlink_variants(reg: &mut Registry<'_>) {
                     run,
                     &handles,
                     agent,
-                    Command::FsWrite {
+                    MatrixOp::FsWrite {
                         path: "/shared/sv_rel_file".into(),
                         data: "REL_DATA".into(),
                     },
@@ -1569,7 +2545,7 @@ pub(super) fn register_symlink_variants(reg: &mut Registry<'_>) {
                     run,
                     &handles,
                     agent,
-                    Command::FsSymlink {
+                    MatrixOp::FsSymlink {
                         target: "sv_rel_file".into(),
                         link: "/shared/sv_rel_link".into(),
                     },
@@ -1579,7 +2555,7 @@ pub(super) fn register_symlink_variants(reg: &mut Registry<'_>) {
                     run,
                     &handles,
                     agent,
-                    Command::FsRead {
+                    MatrixOp::FsRead {
                         path: "/shared/sv_rel_link".into(),
                     },
                 )
@@ -1610,7 +2586,7 @@ pub(super) fn register_unix_tests(reg: &mut Registry<'_>) {
                                 run,
                                 &handles,
                                 agent,
-                                Command::UnixListen {
+                                MatrixOp::UnixListen {
                                     path: sock_listen.clone(),
                                 },
                             )
@@ -1621,7 +2597,7 @@ pub(super) fn register_unix_tests(reg: &mut Registry<'_>) {
                                 run,
                                 &handles,
                                 agent,
-                                Command::UnixUnlisten { path: sock_listen },
+                                MatrixOp::UnixUnlisten { path: sock_listen },
                             )
                             .await;
                             super::TestOutcome::new(agent.name(), pass, format!("{resp:?}"))
@@ -1638,7 +2614,7 @@ pub(super) fn register_unix_tests(reg: &mut Registry<'_>) {
                                 run,
                                 &handles,
                                 agent,
-                                Command::UnixListen { path: sock.clone() },
+                                MatrixOp::UnixListen { path: sock.clone() },
                             )
                             .await;
                             if let Err(e) = super::expect_unix_listening_path(&resp, &sock) {
@@ -1653,7 +2629,7 @@ pub(super) fn register_unix_tests(reg: &mut Registry<'_>) {
                                 run,
                                 &handles,
                                 agent,
-                                Command::UnixConnect {
+                                MatrixOp::UnixConnect {
                                     path: sock.clone(),
                                     data: data.clone(),
                                 },
@@ -1661,9 +2637,13 @@ pub(super) fn register_unix_tests(reg: &mut Registry<'_>) {
                             .await;
                             let pass =
                                 matches!(&resp, Response::Connected { echo } if *echo == data);
-                            let _ =
-                                send_to(run, &handles, agent, Command::UnixUnlisten { path: sock })
-                                    .await;
+                            let _ = send_to(
+                                run,
+                                &handles,
+                                agent,
+                                MatrixOp::UnixUnlisten { path: sock },
+                            )
+                            .await;
                             super::TestOutcome::new(agent.name(), pass, format!("{resp:?}"))
                         })
                     },
@@ -1681,7 +2661,7 @@ pub(super) fn register_unix_tests(reg: &mut Registry<'_>) {
                                 run,
                                 &handles,
                                 agent,
-                                Command::UnixListen {
+                                MatrixOp::UnixListen {
                                     path: sock_listen.clone(),
                                 },
                             )
@@ -1692,7 +2672,7 @@ pub(super) fn register_unix_tests(reg: &mut Registry<'_>) {
                                 run,
                                 &handles,
                                 agent,
-                                Command::UnixUnlisten { path: sock_listen },
+                                MatrixOp::UnixUnlisten { path: sock_listen },
                             )
                             .await;
                             super::TestOutcome::new(agent.name(), pass, format!("{resp:?}"))
@@ -1714,7 +2694,7 @@ pub(super) fn register_unix_tests(reg: &mut Registry<'_>) {
                                     run,
                                     &handles,
                                     agent,
-                                    Command::UnixListen { path: sock.clone() },
+                                    MatrixOp::UnixListen { path: sock.clone() },
                                 )
                                 .await;
                                 if let Err(e) = super::expect_unix_listening_path(&resp, &sock) {
@@ -1729,7 +2709,7 @@ pub(super) fn register_unix_tests(reg: &mut Registry<'_>) {
                                     run,
                                     &handles,
                                     agent,
-                                    super::exec(vec![
+                                    exec(vec![
                                         target,
                                         "unix-echo-client".into(),
                                         sock.clone(),
@@ -1742,7 +2722,7 @@ pub(super) fn register_unix_tests(reg: &mut Registry<'_>) {
                                     run,
                                     &handles,
                                     agent,
-                                    Command::UnixUnlisten { path: sock },
+                                    MatrixOp::UnixUnlisten { path: sock },
                                 )
                                 .await;
                                 super::TestOutcome::new(agent.name(), pass, format!("{resp:?}"))
@@ -1768,7 +2748,7 @@ pub(super) fn register_unix_tests(reg: &mut Registry<'_>) {
                                     run,
                                     &handles,
                                     agent,
-                                    Command::Exec {
+                                    MatrixOp::Exec {
                                         args: vec![
                                             target,
                                             "unix-echo-server".into(),
@@ -1788,13 +2768,13 @@ pub(super) fn register_unix_tests(reg: &mut Registry<'_>) {
                                 let pass = pid.is_some();
                                 if let Some(pid) = pid {
                                     let _ =
-                                        send_to(run, &handles, agent, Command::Kill { pid }).await;
+                                        send_to(run, &handles, agent, MatrixOp::Kill { pid }).await;
                                 }
                                 let _ = send_to(
                                     run,
                                     &handles,
                                     agent,
-                                    Command::UnixUnlisten { path: sock_start },
+                                    MatrixOp::UnixUnlisten { path: sock_start },
                                 )
                                 .await;
                                 super::TestOutcome::new(agent.name(), pass, format!("{resp:?}"))
@@ -1821,7 +2801,7 @@ pub(super) fn register_unix_tests(reg: &mut Registry<'_>) {
                                     run,
                                     &handles,
                                     agent,
-                                    Command::ExecReady {
+                                    MatrixOp::ExecReady {
                                         args: vec![target, "unix-echo-server".into(), sock.clone()],
                                         ready_marker: "LISTENING".into(),
                                         timeout_secs: Some(10),
@@ -1846,7 +2826,7 @@ pub(super) fn register_unix_tests(reg: &mut Registry<'_>) {
                                     run,
                                     &handles,
                                     agent,
-                                    Command::UnixConnect {
+                                    MatrixOp::UnixConnect {
                                         path: sock.clone(),
                                         data: data.clone(),
                                     },
@@ -1858,13 +2838,13 @@ pub(super) fn register_unix_tests(reg: &mut Registry<'_>) {
                                 );
                                 if let Some(pid) = pid {
                                     let _ =
-                                        send_to(run, &handles, agent, Command::Kill { pid }).await;
+                                        send_to(run, &handles, agent, MatrixOp::Kill { pid }).await;
                                 }
                                 let _ = send_to(
                                     run,
                                     &handles,
                                     agent,
-                                    Command::UnixUnlisten { path: sock },
+                                    MatrixOp::UnixUnlisten { path: sock },
                                 )
                                 .await;
                                 super::TestOutcome::new(agent.name(), pass, format!("{resp:?}"))
@@ -1886,7 +2866,7 @@ pub(super) fn register_unix_tests(reg: &mut Registry<'_>) {
                                 run,
                                 &handles,
                                 agent,
-                                Command::UnixListen {
+                                MatrixOp::UnixListen {
                                     path: sock_listen.clone(),
                                 },
                             )
@@ -1897,7 +2877,7 @@ pub(super) fn register_unix_tests(reg: &mut Registry<'_>) {
                                 run,
                                 &handles,
                                 agent,
-                                Command::UnixUnlisten { path: sock_listen },
+                                MatrixOp::UnixUnlisten { path: sock_listen },
                             )
                             .await;
                             super::TestOutcome::new(agent.name(), pass, format!("{resp:?}"))
@@ -1915,7 +2895,7 @@ pub(super) fn register_unix_tests(reg: &mut Registry<'_>) {
                                 run,
                                 &handles,
                                 agent,
-                                Command::UnixListen { path: sock.clone() },
+                                MatrixOp::UnixListen { path: sock.clone() },
                             )
                             .await;
                             if let Err(e) = super::expect_unix_listening_path(&resp, &sock) {
@@ -1929,7 +2909,7 @@ pub(super) fn register_unix_tests(reg: &mut Registry<'_>) {
                                 run,
                                 &handles,
                                 connector,
-                                Command::UnixConnect {
+                                MatrixOp::UnixConnect {
                                     path: sock.clone(),
                                     data: data.clone(),
                                 },
@@ -1937,9 +2917,13 @@ pub(super) fn register_unix_tests(reg: &mut Registry<'_>) {
                             .await;
                             let pass =
                                 matches!(&resp, Response::Connected { echo } if *echo == data);
-                            let _ =
-                                send_to(run, &handles, agent, Command::UnixUnlisten { path: sock })
-                                    .await;
+                            let _ = send_to(
+                                run,
+                                &handles,
+                                agent,
+                                MatrixOp::UnixUnlisten { path: sock },
+                            )
+                            .await;
                             super::TestOutcome::new(connector.name(), pass, format!("{resp:?}"))
                         })
                     },
@@ -1958,7 +2942,7 @@ pub(super) fn register_unix_tests(reg: &mut Registry<'_>) {
                     run,
                     &handles,
                     AgentName::Dpg1Dpg1Dpg1,
-                    Command::UnixListen { path: sock.clone() },
+                    MatrixOp::UnixListen { path: sock.clone() },
                 )
                 .await;
                 let pass = super::expect_unix_listening_path(&resp, &sock).is_ok();
@@ -1966,7 +2950,7 @@ pub(super) fn register_unix_tests(reg: &mut Registry<'_>) {
                     run,
                     &handles,
                     AgentName::Dpg1Dpg1Dpg1,
-                    Command::UnixUnlisten { path: sock },
+                    MatrixOp::UnixUnlisten { path: sock },
                 )
                 .await;
                 super::TestOutcome::new(AgentName::Dpg1Dpg1Dpg1.name(), pass, format!("{resp:?}"))
@@ -1984,7 +2968,7 @@ pub(super) fn register_unix_tests(reg: &mut Registry<'_>) {
                     run,
                     &handles,
                     AgentName::Dpg1Dpg1Dpg1,
-                    Command::UnixListen { path: sock.clone() },
+                    MatrixOp::UnixListen { path: sock.clone() },
                 )
                 .await;
                 if let Err(e) = super::expect_unix_listening_path(&resp, &sock) {
@@ -1998,7 +2982,7 @@ pub(super) fn register_unix_tests(reg: &mut Registry<'_>) {
                     run,
                     &handles,
                     AgentName::Dpg1Dpg1Dpg1,
-                    Command::UnixConnect {
+                    MatrixOp::UnixConnect {
                         path: sock.clone(),
                         data: "SAME_AGENT".to_string(),
                     },
@@ -2010,7 +2994,7 @@ pub(super) fn register_unix_tests(reg: &mut Registry<'_>) {
                     run,
                     &handles,
                     AgentName::Dpg1Dpg1Dpg1,
-                    Command::UnixUnlisten { path: sock },
+                    MatrixOp::UnixUnlisten { path: sock },
                 )
                 .await;
                 super::TestOutcome::new(AgentName::Dpg1Dpg1Dpg1.name(), pass, format!("{resp:?}"))
@@ -2028,7 +3012,7 @@ pub(super) fn register_unix_tests(reg: &mut Registry<'_>) {
                     run,
                     &handles,
                     AgentName::Dpg1Dpg1Dpg1,
-                    Command::UnixListen { path: sock.clone() },
+                    MatrixOp::UnixListen { path: sock.clone() },
                 )
                 .await;
                 if let Err(e) = super::expect_unix_listening_path(&resp, &sock) {
@@ -2042,7 +3026,7 @@ pub(super) fn register_unix_tests(reg: &mut Registry<'_>) {
                     run,
                     &handles,
                     AgentName::Dpg1Dng,
-                    Command::UnixConnect {
+                    MatrixOp::UnixConnect {
                         path: sock.clone(),
                         data: "CROSS_WORKER".to_string(),
                     },
@@ -2054,7 +3038,7 @@ pub(super) fn register_unix_tests(reg: &mut Registry<'_>) {
                     run,
                     &handles,
                     AgentName::Dpg1Dpg1Dpg1,
-                    Command::UnixUnlisten { path: sock },
+                    MatrixOp::UnixUnlisten { path: sock },
                 )
                 .await;
                 super::TestOutcome::new(AgentName::Dpg1Dng.name(), pass, format!("{resp:?}"))
@@ -2064,6 +3048,7 @@ pub(super) fn register_unix_tests(reg: &mut Registry<'_>) {
 }
 
 pub(super) fn register_matrix(reg: &mut Registry<'_>) {
+    register_matrix_handlers();
     register_fs_crud(reg);
     register_fs_cross_unlink(reg);
     register_tmp_isolation(reg);
