@@ -293,77 +293,6 @@ async fn agent_loop(self_exe: &str) {
                 }
             }
 
-            Command::NetAccept { port, timeout_secs } => {
-                // Start a one-shot accept+echo worker for this agent's
-                // registered listener. Inherited listeners are imported into
-                // the same registry at startup, so the protocol round-trip is
-                // the readiness barrier for a later connector.
-                let Some(entries) = listeners.get_mut(&port) else {
-                    respond(&Response::ConnectFailed {
-                        error: format!("no listener registered for port {port}"),
-                    })
-                    .await;
-                    continue;
-                };
-                let Some(entry) = entries.pop() else {
-                    listeners.remove(&port);
-                    respond(&Response::ConnectFailed {
-                        error: format!("no listener registered for port {port}"),
-                    })
-                    .await;
-                    continue;
-                };
-                if entries.is_empty() {
-                    listeners.remove(&port);
-                }
-                entry.task.abort();
-                let _ = entry.task.await;
-                let accepted = entry.accepted.clone();
-                // SAFETY: removing the registry entry gives this one-shot
-                // accept worker sole ownership of the listener duplicate.
-                let listener =
-                    unsafe { std::net::TcpListener::from_raw_fd(entry.fd.into_raw_fd()) };
-                let _ = listener.set_nonblocking(false);
-                let timeout = std::time::Duration::from_secs(timeout_secs);
-                std::thread::spawn(move || {
-                    if let Ok((mut stream, _)) = listener.accept() {
-                        accepted.fetch_add(1, Ordering::Relaxed);
-                        let _ = stream.set_read_timeout(Some(timeout));
-                        let _ = stream.set_write_timeout(Some(timeout));
-                        let mut buf = [0u8; 4096];
-                        loop {
-                            match std::io::Read::read(&mut stream, &mut buf) {
-                                Ok(0) | Err(_) => break,
-                                Ok(n) => {
-                                    if std::io::Write::write_all(&mut stream, &buf[..n]).is_err() {
-                                        break;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                });
-                respond(&Response::Ok {
-                    data: Some(format!("accepting on port {port}")),
-                })
-                .await;
-            }
-
-            Command::NetCloseListener { port } => {
-                // Close this agent's listen socket and stop its echo handler.
-                // Inherited child listeners remain alive in their own agents.
-                if let Some(entries) = listeners.remove(&port) {
-                    for entry in entries {
-                        entry.task.abort();
-                        let _ = entry.task.await;
-                    }
-                }
-                respond(&Response::Ok {
-                    data: Some(format!("listener on port {port} closed")),
-                })
-                .await;
-            }
-
             Command::GetPid => {
                 let pid = std::process::id();
                 respond(&Response::Ok {
@@ -1383,125 +1312,6 @@ async fn agent_loop(self_exe: &str) {
                 }
             }
 
-            Command::PollReady { timeout_ms } => {
-                // Create a pipe, write data, poll read-end for POLLIN.
-                let result = (|| -> Result<&str, String> {
-                    let mut pipe_fds = [0i32; 2];
-                    if unsafe { libc::pipe(pipe_fds.as_mut_ptr()) } != 0 {
-                        return Err("pipe() failed".into());
-                    }
-                    let (read_fd, write_fd) = (pipe_fds[0], pipe_fds[1]);
-                    let data = b"poll_test_data";
-                    unsafe {
-                        libc::write(write_fd, data.as_ptr().cast(), data.len());
-                    }
-                    let mut fds = [libc::pollfd {
-                        fd: read_fd,
-                        events: libc::POLLIN,
-                        revents: 0,
-                    }];
-                    let n = unsafe { libc::poll(fds.as_mut_ptr(), 1, timeout_ms as i32) };
-                    unsafe {
-                        libc::close(write_fd);
-                        libc::close(read_fd);
-                    }
-                    if n > 0 && (fds[0].revents & libc::POLLIN) != 0 {
-                        Ok("POLLIN")
-                    } else {
-                        Ok("TIMEOUT")
-                    }
-                })();
-                match result {
-                    Ok(status) => {
-                        respond(&Response::Ok {
-                            data: Some(status.to_string()),
-                        })
-                        .await;
-                    }
-                    Err(e) => respond(&Response::Error { error: e }).await,
-                }
-            }
-
-            Command::BindGetsockname { family } => {
-                let result = match family.as_str() {
-                    "ipv4" => {
-                        let sock = std::net::TcpListener::bind("0.0.0.0:0");
-                        sock.map(|s| s.local_addr().map(|a| a.port()).unwrap_or(0))
-                            .map_err(|e| format!("{e}"))
-                    }
-                    "ipv6" => {
-                        let sock = std::net::TcpListener::bind("[::]:0");
-                        sock.map(|s| s.local_addr().map(|a| a.port()).unwrap_or(0))
-                            .map_err(|e| format!("{e}"))
-                    }
-                    other => Err(format!("unknown family: {other}")),
-                };
-                match result {
-                    Ok(port) => {
-                        respond(&Response::Ok {
-                            data: Some(format!("port={port}")),
-                        })
-                        .await;
-                    }
-                    Err(e) => respond(&Response::Error { error: e }).await,
-                }
-            }
-
-            Command::PipePairIdUnique { count } => {
-                // Create+drop pipes, then create more and check for inode reuse.
-                // On native Linux inodes are unique so this always passes.
-                // On litebox, Arc::as_ptr() pair_ids could collide after free.
-                use std::collections::HashSet;
-                let result = (|| -> Result<String, String> {
-                    let mut first_batch = HashSet::new();
-                    let mut fds = Vec::new();
-                    for _ in 0..count {
-                        let mut pipe_fds = [0i32; 2];
-                        if unsafe { libc::pipe(pipe_fds.as_mut_ptr()) } != 0 {
-                            return Err("pipe() failed".into());
-                        }
-                        // Use inode as proxy for pair_id.
-                        let mut stat: libc::stat = unsafe { std::mem::zeroed() };
-                        if unsafe { libc::fstat(pipe_fds[0], &raw mut stat) } == 0 {
-                            first_batch.insert(stat.st_ino);
-                        }
-                        fds.push(pipe_fds);
-                    }
-                    for pipe_fds in fds.drain(..) {
-                        unsafe {
-                            libc::close(pipe_fds[0]);
-                            libc::close(pipe_fds[1]);
-                        }
-                    }
-                    let mut collisions = 0u32;
-                    for _ in 0..count {
-                        let mut pipe_fds = [0i32; 2];
-                        if unsafe { libc::pipe(pipe_fds.as_mut_ptr()) } != 0 {
-                            return Err("pipe() failed".into());
-                        }
-                        let mut stat: libc::stat = unsafe { std::mem::zeroed() };
-                        if unsafe { libc::fstat(pipe_fds[0], &raw mut stat) } == 0
-                            && first_batch.contains(&stat.st_ino)
-                        {
-                            collisions += 1;
-                        }
-                        unsafe {
-                            libc::close(pipe_fds[0]);
-                            libc::close(pipe_fds[1]);
-                        }
-                    }
-                    if collisions > 0 {
-                        Err(format!("collision: {collisions}/{count} ids reused"))
-                    } else {
-                        Ok("unique".to_string())
-                    }
-                })();
-                match result {
-                    Ok(msg) => respond(&Response::Ok { data: Some(msg) }).await,
-                    Err(e) => respond(&Response::Error { error: e }).await,
-                }
-            }
-
             Command::Kill { pid } => {
                 if let Some(child) = background_pids.remove(&pid) {
                     terminate_background(child);
@@ -2190,6 +2000,7 @@ fn import_inherited_listeners() -> Result<HashMap<u16, Vec<ListenerEntry>>, Stri
         _ => return Ok(HashMap::new()),
     };
     let mut listeners = HashMap::new();
+    let mut handler_env = Vec::new();
     for item in spec.split(',') {
         let (port_s, fd_s) = item
             .split_once('=')
@@ -2208,6 +2019,8 @@ fn import_inherited_listeners() -> Result<HashMap<u16, Vec<ListenerEntry>>, Stri
             .set_nonblocking(true)
             .map_err(|e| format!("set inherited nonblocking fd {fd}: {e}"))?;
         let registry_fd = dup_fd_cloexec(inherited_listener.as_raw_fd())?;
+        let handler_fd = dup_fd_cloexec(inherited_listener.as_raw_fd())?;
+        handler_env.push(format!("{port}={}", handler_fd.into_raw_fd()));
         drop(inherited_listener);
         let task = tokio::spawn(async {});
         listeners
@@ -2218,6 +2031,13 @@ fn import_inherited_listeners() -> Result<HashMap<u16, Vec<ListenerEntry>>, Stri
                 task,
                 accepted: Arc::new(AtomicUsize::new(0)),
             });
+    }
+    if !handler_env.is_empty() {
+        // SAFETY: agent startup is single-threaded here; no other Rust threads are
+        // concurrently reading or mutating the process environment.
+        unsafe {
+            std::env::set_var(INHERITED_LISTEN_FDS_ENV, handler_env.join(","));
+        }
     }
     Ok(listeners)
 }

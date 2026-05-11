@@ -9,10 +9,6 @@ fn default_fork_binary() -> String {
     "self".to_string()
 }
 
-fn default_accept_timeout() -> u64 {
-    10
-}
-
 fn default_marker_stream() -> String {
     "either".to_string()
 }
@@ -62,13 +58,8 @@ pub enum Command {
     /// on those short-lived duplicates. This range is intentionally below the
     /// Litebox host bridge/infrastructure bands (100..199, 200..499, 500+) and
     /// above stdio. The child receives a `port=fd` mapping in
-    /// `LITEBOX_TEST_HARNESS_INHERITED_LISTEN_FDS`, imports each fd into its
-    /// listener registry, and then normal `NetAccept` / `NetConnect` probing
-    /// works without re-binding.
-    ///
-    /// Pair with `NetCloseListener` on the parent to reproduce the full
-    /// VS Code pattern: `NetListen` → Fork(inherit) → `NetCloseListener` →
-    /// child accepts on the inherited listener.
+    /// `LITEBOX_TEST_HARNESS_INHERITED_LISTEN_FDS`; handler-dispatched probes
+    /// accept on the inherited listener after the parent unlistens.
     #[serde(rename = "fork")]
     Fork {
         name: String,
@@ -77,20 +68,6 @@ pub enum Command {
         #[serde(default)]
         inherit_listen_ports: Vec<u16>,
     },
-
-    /// Accept one connection on an already-listening TCP port.
-    /// Decouples listen from accept so tests can fork/close between them.
-    #[serde(rename = "net_accept")]
-    NetAccept {
-        port: u16,
-        #[serde(default = "default_accept_timeout")]
-        timeout_secs: u64,
-    },
-
-    /// Close the TCP listen socket on a port (without removing the echo
-    /// handler task). Reproduces the parent-close-after-fork pattern.
-    #[serde(rename = "net_close_listener")]
-    NetCloseListener { port: u16 },
 
     /// Report the agent's process ID.
     #[serde(rename = "get_pid")]
@@ -320,22 +297,6 @@ pub enum Command {
     /// Kill a background process by PID.
     #[serde(rename = "kill")]
     Kill { pid: u32 },
-
-    /// Create a pipe, write data, poll read-end for POLLIN readiness.
-    /// Tests that file descriptors correctly report IN events in poll/epoll.
-    #[serde(rename = "poll_ready")]
-    PollReady { timeout_ms: u32 },
-
-    /// Bind a TCP socket to ANY:0, call getsockname, report the assigned port.
-    /// Tests that getsockname returns a nonzero port for bound sockets.
-    #[serde(rename = "bind_getsockname")]
-    BindGetsockname { family: String },
-
-    /// Create+drop `count` pipe pairs, then create `count` more and check
-    /// that no `pair_id` from the second batch collides with the first.
-    /// Tests monotonic `pair_id` generation (vs. Arc pointer reuse).
-    #[serde(rename = "pipe_pair_id_unique")]
-    PipePairIdUnique { count: u32 },
 
     /// Open an eventfd and register it in this agent's local registry.
     /// Flags are parsed from strings like "semaphore|nonblock|cloexec".
