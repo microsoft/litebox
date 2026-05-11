@@ -17,3 +17,4 @@ pub mod nine_p;
 pub mod policy;
 pub mod sandbox_policy;
 pub mod sock_compat;
+pub mod state_registry;
