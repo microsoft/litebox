@@ -1009,6 +1009,24 @@ async fn agent_loop(self_exe: &str) {
                 }
             }
 
+            Command::Run { handler, args } => {
+                let resp = litebox_test_harness::handlers::dispatch_run(
+                    &handler,
+                    args,
+                    self_exe,
+                    &mut reader,
+                )
+                .await;
+                respond(&resp).await;
+            }
+
+            Command::Resume { tag } => {
+                respond(&Response::Error {
+                    error: format!("Resume {{ tag: {tag} }} received outside handler context"),
+                })
+                .await;
+            }
+
             Command::Exec {
                 args,
                 timeout_secs,

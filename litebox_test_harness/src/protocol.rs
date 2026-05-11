@@ -225,6 +225,26 @@ pub enum Command {
     #[serde(rename = "forward")]
     Forward { target: String, inner: Box<Command> },
 
+    /// Invoke a registered handler on the agent. The agent looks up
+    /// `handler` in its global registry (populated at startup via
+    /// `collect_all_tests`), invokes it with `args`, and returns a
+    /// `Response::Result` on completion. While running, a handler
+    /// may emit `Response::Checkpoint { tag }` and block reading
+    /// stdin for `Command::Resume { tag }`. This is the generic
+    /// dispatch path; new test behavior should be expressed as a
+    /// registered handler rather than as a new `Command::*` variant.
+    #[serde(rename = "run")]
+    Run {
+        handler: String,
+        args: serde_json::Value,
+    },
+
+    /// Sent to an agent that is currently blocked at a handler's
+    /// `ctx.checkpoint(tag)` call to release it. Must match the tag
+    /// the handler is waiting on.
+    #[serde(rename = "resume")]
+    Resume { tag: String },
+
     /// Fork+exec with args. Captures stdout/stderr and waits, or runs
     /// in background and returns PID. Optionally pipes content to stdin.
     #[serde(rename = "exec")]
@@ -572,6 +592,25 @@ pub enum Response {
     /// File not found.
     #[serde(rename = "not_found")]
     NotFound,
+
+    /// Terminal event for a `Command::Run`. The handler's typed
+    /// `Out` is encoded as a `serde_json` `Value` in `data`. On
+    /// failure, `ok` is false and `error` carries the message.
+    #[serde(rename = "result")]
+    Result {
+        ok: bool,
+        #[serde(default)]
+        data: serde_json::Value,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+    },
+
+    /// Mid-handler rendezvous arrival event. Emitted by an agent
+    /// running a handler when it hits a `ctx.checkpoint(tag)` call;
+    /// the agent then blocks reading stdin until the coord sends
+    /// `Command::Resume` with the matching tag.
+    #[serde(rename = "checkpoint")]
+    Checkpoint { tag: String },
 
     /// TCP listener is ready.
     #[serde(rename = "listening")]

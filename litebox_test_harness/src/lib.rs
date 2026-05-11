@@ -7,6 +7,7 @@
 //! integration test (`tests/integration.rs`).
 
 pub mod coordinator;
+pub mod handlers;
 pub mod protocol;
 pub mod test_registry;
 

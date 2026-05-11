@@ -219,6 +219,10 @@ fn main() {
             std::process::exit(exit_code);
         }
         "agent" => {
+            // Populate the handler registry as a side-effect; every
+            // process needs the same handlers registered under the
+            // same names. Discard the returned Test list.
+            let _tests = coordinator::collect_all_tests();
             agent::run(self_exe);
         }
         "agent-listen" => {
@@ -226,6 +230,7 @@ fn main() {
             // one connection, and runs the same agent protocol over that
             // connection (by dup2-ing the socket onto stdin/stdout).
             let port: u16 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(9090);
+            let _tests = coordinator::collect_all_tests();
             agent_listen::run(self_exe, port);
         }
         "echo-test" => {

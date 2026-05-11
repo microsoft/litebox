@@ -15,6 +15,7 @@ pub(crate) mod getrandom_tests;
 pub(crate) mod inotify;
 pub(crate) mod iouring_discovery;
 pub(crate) mod matrix;
+pub(crate) mod multi_run;
 pub(crate) mod pipe_bridge;
 pub(crate) mod platform_fixes;
 pub(crate) mod port_router;
@@ -832,6 +833,106 @@ fn register_canary(reg: &mut registry::Registry<'_>) {
         });
 }
 
+fn register_handler_canary(reg: &mut registry::Registry<'_>) {
+    use crate::handlers::{HandlerCtx, HandlerError};
+    use crate::register_handler;
+    use serde_json::{Value, json};
+
+    // Single-agent handler: echo input msg with a sequence number.
+    // Registered once at startup; every call increments a per-process
+    // static counter. This proves `send_named` works.
+    async fn handle_echo(args: Value, _ctx: &mut HandlerCtx<'_>) -> Result<Value, HandlerError> {
+        static COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let msg = args
+            .get("msg")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Ok(json!({ "msg": msg, "n": n }))
+    }
+
+    // Multi-agent handlers: a "phase rendezvous" canary. Two agents
+    // both reach checkpoint "rendezvous", coord routes Resume to both,
+    // each emits its own pid in the result so we can verify both ran.
+    async fn handle_rendezvous_a(
+        _args: Value,
+        ctx: &mut HandlerCtx<'_>,
+    ) -> Result<Value, HandlerError> {
+        ctx.checkpoint("rendezvous").await?;
+        Ok(json!({ "role": "a", "pid": std::process::id() }))
+    }
+    async fn handle_rendezvous_b(
+        _args: Value,
+        ctx: &mut HandlerCtx<'_>,
+    ) -> Result<Value, HandlerError> {
+        ctx.checkpoint("rendezvous").await?;
+        Ok(json!({ "role": "b", "pid": std::process::id() }))
+    }
+
+    register_handler!("canary.echo", handle_echo);
+    register_handler!("canary.rendezvous_a", handle_rendezvous_a);
+    register_handler!("canary.rendezvous_b", handle_rendezvous_b);
+
+    // Single-agent test: invoke handle_echo twice; verify state is
+    // per-process (counter ticks up across calls).
+    reg.test("contamination", "handler_canary", "H_canary.send_named")
+        .timeout(30)
+        .build(|cx| {
+            let a = cx.require(agents::AgentName::Dpg1);
+            Box::new(move |run| {
+                Box::pin(async move {
+                    let r1 = run
+                        .send_named(&a, "canary.echo", serde_json::json!({"msg": "hello"}))
+                        .await;
+                    let r2 = run
+                        .send_named(&a, "canary.echo", serde_json::json!({"msg": "world"}))
+                        .await;
+                    let pass = matches!(
+                        (&r1, &r2),
+                        (Ok(v1), Ok(v2))
+                            if v1["msg"] == "hello" && v2["msg"] == "world"
+                            && v2["n"].as_u64().unwrap_or(0) > v1["n"].as_u64().unwrap_or(0)
+                    );
+                    TestOutcome::new(
+                        agents::AgentName::Dpg1.name(),
+                        pass,
+                        format!("r1={r1:?} r2={r2:?}"),
+                    )
+                })
+            })
+        });
+
+    // Multi-agent test: two agents rendezvous on "rendezvous" tag.
+    reg.test("contamination", "handler_canary", "H_canary.rendezvous")
+        .timeout(30)
+        .build(|cx| {
+            let a = cx.require(agents::AgentName::Dpg1);
+            let b = cx.require(agents::AgentName::Dpg2);
+            Box::new(move |run| {
+                Box::pin(async move {
+                    let results = run
+                        .run_multi()
+                        .assign(&a, "canary.rendezvous_a", serde_json::Value::Null)
+                        .assign(&b, "canary.rendezvous_b", serde_json::Value::Null)
+                        .phase("rendezvous")
+                        .run()
+                        .await;
+                    let ra = results.raw(&a);
+                    let rb = results.raw(&b);
+                    let pass = results.top_level_error().is_none()
+                        && matches!(&ra, Some(r) if r.ok && r.data["role"] == "a")
+                        && matches!(&rb, Some(r) if r.ok && r.data["role"] == "b");
+                    TestOutcome::new(
+                        agents::AgentName::Dpg1.name(),
+                        pass,
+                        format!("ra={ra:?} rb={rb:?} top={:?}", results.top_level_error()),
+                    )
+                })
+            })
+        });
+}
+
 /// Check whether a Test matches the --filter argument.
 /// Matches by suite, suite.group, or test ID prefix. The filter may be
 /// a comma-separated list of parts; the test matches if **any** part
@@ -855,6 +956,7 @@ fn matches_test(filter: Option<&str>, test: &Test) -> bool {
 pub fn collect_all_tests() -> Vec<Test> {
     let mut tests: Vec<Test> = Vec::new();
     register_canary(&mut registry::Registry::new(&mut tests));
+    register_handler_canary(&mut registry::Registry::new(&mut tests));
     special_cases::register_netlink(&mut registry::Registry::new(&mut tests));
     concurrent_fork::register_concurrent_fork_pipeline(&mut registry::Registry::new(&mut tests));
     concurrent_fork::register_concurrent_exec(&mut registry::Registry::new(&mut tests));

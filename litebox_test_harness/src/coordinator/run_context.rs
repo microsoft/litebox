@@ -139,4 +139,51 @@ impl<'a> RunContext<'a> {
             Err(_) => Err(start.elapsed()),
         }
     }
+
+    /// Invoke a registered handler on the agent and return its
+    /// `Result` data (untyped). Single round-trip — no checkpoint
+    /// routing. Use [`Self::run_multi`] for multi-agent tests that
+    /// need cross-agent rendezvous via `ctx.checkpoint(tag)`.
+    ///
+    /// # Errors
+    /// Returns Err if the agent returns a non-`Result` response or a
+    /// `Result { ok: false }`.
+    pub async fn send_named(
+        &mut self,
+        handle: &AgentHandle,
+        handler: &str,
+        args: serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
+        let cmd = Command::Run {
+            handler: handler.to_string(),
+            args,
+        };
+        match self.send(handle, cmd).await {
+            Response::Result {
+                ok: true,
+                data,
+                error: _,
+            } => Ok(data),
+            Response::Result {
+                ok: false,
+                data: _,
+                error,
+            } => Err(error.unwrap_or_else(|| "handler failed".into())),
+            other => Err(format!("expected Result, got {other:?}")),
+        }
+    }
+
+    /// Start a multi-agent scenario invocation. Each `.assign(...)`
+    /// adds one agent's handler call; `.phase(tag)` declares a
+    /// rendezvous tag (members default to all assigned agents);
+    /// `.run()` drives the test to completion.
+    ///
+    /// Internally lifts the participating agents' pipes out of
+    /// `runner.children` for the duration of the run, spawns one
+    /// driver task per agent that streams Checkpoint events to a
+    /// central coordinator, routes Resume commands back when peers
+    /// quorum, collects per-agent `Result`s, and restores the pipes.
+    pub fn run_multi<'r>(&'r mut self) -> super::multi_run::Invocation<'r, 'a> {
+        super::multi_run::Invocation::new(self.runner)
+    }
 }
