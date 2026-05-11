@@ -7,7 +7,14 @@
 //! Each test category targets a commit in the wportnoy/vscode-server-in-litebox
 //! branch and must pass on both native WSL2 (gold standard) and litebox.
 
-use crate::protocol::{Command, Response};
+use std::os::fd::FromRawFd;
+use std::time::Duration as StdDuration;
+
+use serde::{Deserialize, Serialize};
+
+use crate::handlers::{HandlerCtx, HandlerError, HandlerToken};
+use crate::protocol::{Command as InfraCommand, Response};
+use crate::register_handler;
 use tokio::time::Duration;
 
 use super::agents::{AgentHandle, AgentName, EphemeralHandle, SpawnKind};
@@ -16,6 +23,208 @@ use super::run_context::RunContext;
 
 const AGENTS: &[AgentName] = &[AgentName::Dpg1, AgentName::Dpg1Dpg1, AgentName::Dpg2];
 const DEPTH_AGENTS: &[AgentName] = &[AgentName::Dpg1, AgentName::Dpg1Dpg1];
+
+#[derive(Serialize, Deserialize, Debug)]
+struct DetailOut {
+    detail: String,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+struct PollReadyArgs {
+    timeout_ms: u32,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+struct BindGetsocknameArgs {
+    family: String,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+struct PipePairIdArgs {
+    count: u32,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+struct AcceptInheritedArgs {
+    port: u16,
+    timeout_secs: u64,
+}
+
+const POLL_READY: HandlerToken<PollReadyArgs, DetailOut> =
+    HandlerToken::new("platform_fixes.poll_ready");
+const BIND_GETSOCKNAME: HandlerToken<BindGetsocknameArgs, DetailOut> =
+    HandlerToken::new("platform_fixes.bind_getsockname");
+const PIPE_PAIR_ID: HandlerToken<PipePairIdArgs, DetailOut> =
+    HandlerToken::new("platform_fixes.pipe_pair_id");
+const ACCEPT_INHERITED: HandlerToken<AcceptInheritedArgs, DetailOut> =
+    HandlerToken::new("platform_fixes.accept_inherited");
+
+async fn handle_poll_ready(
+    args: PollReadyArgs,
+    _ctx: &mut HandlerCtx<'_>,
+) -> Result<DetailOut, HandlerError> {
+    let detail = (|| -> Result<String, String> {
+        let mut pipe_fds = [0i32; 2];
+        // SAFETY: pipe writes two fresh fds into pipe_fds on success.
+        if unsafe { libc::pipe(pipe_fds.as_mut_ptr()) } != 0 {
+            return Err(format!("pipe: {}", std::io::Error::last_os_error()));
+        }
+        let (read_fd, write_fd) = (pipe_fds[0], pipe_fds[1]);
+        let data = b"poll_test_data";
+        // SAFETY: write_fd is a live pipe fd and data points to readable bytes.
+        let _ = unsafe { libc::write(write_fd, data.as_ptr().cast(), data.len()) };
+        let mut fds = [libc::pollfd {
+            fd: read_fd,
+            events: libc::POLLIN,
+            revents: 0,
+        }];
+        // SAFETY: fds points to one valid pollfd.
+        let n = unsafe { libc::poll(fds.as_mut_ptr(), 1, args.timeout_ms as i32) };
+        // SAFETY: both fds are owned by this handler.
+        unsafe {
+            libc::close(write_fd);
+            libc::close(read_fd);
+        }
+        if n > 0 && (fds[0].revents & libc::POLLIN) != 0 {
+            Ok("POLLIN".to_string())
+        } else {
+            Ok("TIMEOUT".to_string())
+        }
+    })()?;
+    Ok(DetailOut { detail })
+}
+
+async fn handle_bind_getsockname(
+    args: BindGetsocknameArgs,
+    _ctx: &mut HandlerCtx<'_>,
+) -> Result<DetailOut, HandlerError> {
+    let port = match args.family.as_str() {
+        "ipv4" => std::net::TcpListener::bind("0.0.0.0:0")?
+            .local_addr()?
+            .port(),
+        "ipv6" => std::net::TcpListener::bind("[::]:0")?.local_addr()?.port(),
+        other => return Err(HandlerError(format!("unknown family: {other}"))),
+    };
+    Ok(DetailOut {
+        detail: format!("port={port}"),
+    })
+}
+
+async fn handle_pipe_pair_id(
+    args: PipePairIdArgs,
+    _ctx: &mut HandlerCtx<'_>,
+) -> Result<DetailOut, HandlerError> {
+    use std::collections::HashSet;
+    let mut first_batch = HashSet::new();
+    let mut fds = Vec::new();
+    for _ in 0..args.count {
+        let mut pipe_fds = [0i32; 2];
+        // SAFETY: pipe writes two fresh fds into pipe_fds on success.
+        if unsafe { libc::pipe(pipe_fds.as_mut_ptr()) } != 0 {
+            return Err(HandlerError(format!(
+                "pipe: {}",
+                std::io::Error::last_os_error()
+            )));
+        }
+        // SAFETY: zeroed stat is a valid output buffer for fstat.
+        let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+        // SAFETY: pipe_fds[0] is a live fd and stat is writable.
+        if unsafe { libc::fstat(pipe_fds[0], &raw mut stat) } == 0 {
+            first_batch.insert(stat.st_ino);
+        }
+        fds.push(pipe_fds);
+    }
+    for pipe_fds in fds.drain(..) {
+        // SAFETY: fds were created by this handler and are still owned here.
+        unsafe {
+            libc::close(pipe_fds[0]);
+            libc::close(pipe_fds[1]);
+        }
+    }
+    let mut collisions = 0u32;
+    for _ in 0..args.count {
+        let mut pipe_fds = [0i32; 2];
+        // SAFETY: pipe writes two fresh fds into pipe_fds on success.
+        if unsafe { libc::pipe(pipe_fds.as_mut_ptr()) } != 0 {
+            return Err(HandlerError(format!(
+                "pipe: {}",
+                std::io::Error::last_os_error()
+            )));
+        }
+        // SAFETY: zeroed stat is a valid output buffer for fstat.
+        let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+        // SAFETY: pipe_fds[0] is a live fd and stat is writable.
+        if unsafe { libc::fstat(pipe_fds[0], &raw mut stat) } == 0
+            && first_batch.contains(&stat.st_ino)
+        {
+            collisions += 1;
+        }
+        // SAFETY: fds were created by this handler and are still owned here.
+        unsafe {
+            libc::close(pipe_fds[0]);
+            libc::close(pipe_fds[1]);
+        }
+    }
+    if collisions == 0 {
+        Ok(DetailOut {
+            detail: "unique".to_string(),
+        })
+    } else {
+        Err(HandlerError(format!(
+            "collision: {collisions}/{} ids reused",
+            args.count
+        )))
+    }
+}
+
+async fn handle_accept_inherited(
+    args: AcceptInheritedArgs,
+    _ctx: &mut HandlerCtx<'_>,
+) -> Result<DetailOut, HandlerError> {
+    let spec = std::env::var("LITEBOX_TEST_HARNESS_INHERITED_LISTEN_FDS")
+        .map_err(|e| HandlerError(format!("missing inherited listener env: {e}")))?;
+    let fd = spec
+        .split(',')
+        .find_map(|item| {
+            let (port_s, fd_s) = item.split_once('=')?;
+            if port_s.parse::<u16>().ok()? == args.port {
+                fd_s.parse::<i32>().ok()
+            } else {
+                None
+            }
+        })
+        .ok_or_else(|| {
+            HandlerError(format!(
+                "no inherited fd for port {} in {spec:?}",
+                args.port
+            ))
+        })?;
+    let timeout = StdDuration::from_secs(args.timeout_secs);
+    std::thread::spawn(move || {
+        // SAFETY: agent import publishes a handler-owned duplicate fd in the
+        // inheritance env mapping. This thread takes ownership of that fd.
+        let listener = unsafe { std::net::TcpListener::from_raw_fd(fd) };
+        let _ = listener.set_nonblocking(false);
+        if let Ok((mut stream, _)) = listener.accept() {
+            let _ = stream.set_read_timeout(Some(timeout));
+            let _ = stream.set_write_timeout(Some(timeout));
+            let mut buf = [0u8; 4096];
+            loop {
+                match std::io::Read::read(&mut stream, &mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        if std::io::Write::write_all(&mut stream, &buf[..n]).is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    });
+    Ok(DetailOut {
+        detail: format!("accepting on port {}", args.port),
+    })
+}
 
 // Constants used by the register_* functions further down. Each test
 // category gets a section divider immediately above its `register_*`
@@ -49,6 +258,7 @@ const NPIPE_AGENTS: &[AgentName] = &[
 // ═══════════════════════════════════════════════════════════════════
 
 pub(crate) fn register_poll_ready_tests(reg: &mut Registry<'_>) {
+    register_handler!(POLL_READY, handle_poll_ready);
     for &agent in AGENTS {
         let agent_s = agent.to_string();
         reg.test("matrix", "poll_ready", format!("POLL.pipe.{agent}"))
@@ -58,11 +268,15 @@ pub(crate) fn register_poll_ready_tests(reg: &mut Registry<'_>) {
                 Box::new(move |run| {
                     let a = agent_s.clone();
                     Box::pin(async move {
-                        let resp = run
-                            .send(&handle, Command::PollReady { timeout_ms: 2000 })
+                        let result = run
+                            .send_named_typed(
+                                &handle,
+                                &POLL_READY,
+                                PollReadyArgs { timeout_ms: 2000 },
+                            )
                             .await;
-                        let pass = matches!(&resp, Response::Ok { data: Some(d) } if d == "POLLIN");
-                        super::TestOutcome::new(&a, pass, format!("{resp:?}"))
+                        let pass = matches!(&result, Ok(out) if out.detail == "POLLIN");
+                        super::TestOutcome::new(&a, pass, format!("{result:?}"))
                     })
                 })
             });
@@ -74,6 +288,7 @@ pub(crate) fn register_poll_ready_tests(reg: &mut Registry<'_>) {
 // ═══════════════════════════════════════════════════════════════════
 
 pub(crate) fn register_bind_getsockname_tests(reg: &mut Registry<'_>) {
+    register_handler!(BIND_GETSOCKNAME, handle_bind_getsockname);
     for &family in FAMILIES {
         for &agent in DEPTH_AGENTS {
             let agent_s = agent.to_string();
@@ -90,17 +305,22 @@ pub(crate) fn register_bind_getsockname_tests(reg: &mut Registry<'_>) {
                     let a = agent_s.clone();
                     let f = family_s.clone();
                     Box::pin(async move {
-                        let resp = run
-                            .send(&handle, Command::BindGetsockname { family: f })
+                        let result = run
+                            .send_named_typed(
+                                &handle,
+                                &BIND_GETSOCKNAME,
+                                BindGetsocknameArgs { family: f },
+                            )
                             .await;
-                        let pass = match &resp {
-                            Response::Ok { data: Some(d) } => d
+                        let pass = match &result {
+                            Ok(out) => out
+                                .detail
                                 .strip_prefix("port=")
                                 .and_then(|s| s.parse::<u16>().ok())
                                 .is_some_and(|p| p > 0),
-                            _ => false,
+                            Err(_) => false,
                         };
-                        super::TestOutcome::new(&a, pass, format!("{resp:?}"))
+                        super::TestOutcome::new(&a, pass, format!("{result:?}"))
                     })
                 })
             });
@@ -113,6 +333,7 @@ pub(crate) fn register_bind_getsockname_tests(reg: &mut Registry<'_>) {
 // ═══════════════════════════════════════════════════════════════════
 
 pub(crate) fn register_pipe_pair_id_tests(reg: &mut Registry<'_>) {
+    register_handler!(PIPE_PAIR_ID, handle_pipe_pair_id);
     for &agent in AGENTS {
         let agent_s = agent.to_string();
         reg.test("matrix", "pipe_pair_id", format!("PID.{agent}"))
@@ -122,11 +343,11 @@ pub(crate) fn register_pipe_pair_id_tests(reg: &mut Registry<'_>) {
                 Box::new(move |run| {
                     let a = agent_s.clone();
                     Box::pin(async move {
-                        let resp = run
-                            .send(&handle, Command::PipePairIdUnique { count: 100 })
+                        let result = run
+                            .send_named_typed(&handle, &PIPE_PAIR_ID, PipePairIdArgs { count: 100 })
                             .await;
-                        let pass = matches!(&resp, Response::Ok { data: Some(d) } if d == "unique");
-                        super::TestOutcome::new(&a, pass, format!("{resp:?}"))
+                        let pass = matches!(&result, Ok(out) if out.detail == "unique");
+                        super::TestOutcome::new(&a, pass, format!("{result:?}"))
                     })
                 })
             });
@@ -488,7 +709,7 @@ pub(crate) fn register_cross_worker_first_connect_tests(reg: &mut Registry<'_>) 
                 let listen_resp = run
                     .send(
                         &handle_a,
-                        Command::NetListen {
+                        InfraCommand::NetListen {
                             port,
                             pre_bind_options: vec![],
                         },
@@ -504,7 +725,7 @@ pub(crate) fn register_cross_worker_first_connect_tests(reg: &mut Registry<'_>) 
                 let conn_resp = run
                     .send(
                         &handle_b,
-                        Command::NetConnect {
+                        InfraCommand::NetConnect {
                             addr: format!("127.0.0.1:{port}"),
                             data: "first_connect".into(),
                         },
@@ -512,7 +733,9 @@ pub(crate) fn register_cross_worker_first_connect_tests(reg: &mut Registry<'_>) 
                     .await;
                 let ok =
                     matches!(&conn_resp, Response::Connected { echo } if echo == "first_connect");
-                let _ = run.send(&handle_a, Command::NetUnlisten { port }).await;
+                let _ = run
+                    .send(&handle_a, InfraCommand::NetUnlisten { port })
+                    .await;
                 super::TestOutcome::new("B", ok, format!("{conn_resp:?}"))
             })
         })
@@ -533,7 +756,7 @@ pub(crate) fn register_cross_worker_first_connect_tests(reg: &mut Registry<'_>) 
                 let listen_resp = run
                     .send(
                         &handle_b,
-                        Command::NetListen {
+                        InfraCommand::NetListen {
                             port,
                             pre_bind_options: vec![],
                         },
@@ -549,14 +772,16 @@ pub(crate) fn register_cross_worker_first_connect_tests(reg: &mut Registry<'_>) 
                 let conn_resp = run
                     .send(
                         &handle_aa,
-                        Command::NetConnect {
+                        InfraCommand::NetConnect {
                             addr: format!("127.0.0.1:{port}"),
                             data: "deep_cross".into(),
                         },
                     )
                     .await;
                 let ok = matches!(&conn_resp, Response::Connected { echo } if echo == "deep_cross");
-                let _ = run.send(&handle_b, Command::NetUnlisten { port }).await;
+                let _ = run
+                    .send(&handle_b, InfraCommand::NetUnlisten { port })
+                    .await;
                 super::TestOutcome::new("AA", ok, format!("{conn_resp:?}"))
             })
         })
@@ -570,7 +795,7 @@ pub(crate) fn register_cross_worker_first_connect_tests(reg: &mut Registry<'_>) 
         Box::new(move |run| {
                 Box::pin(async move {
                     let port = 19902u16;
-                    let listen_resp = run.send(&handle_a, Command::NetListen { port, pre_bind_options: vec![] }).await;
+                    let listen_resp = run.send(&handle_a, InfraCommand::NetListen { port, pre_bind_options: vec![] }).await;
                     if !super::expect_listening_port(&listen_resp, port).is_ok() {
                         return super::TestOutcome::new(
                             "B",
@@ -583,7 +808,7 @@ pub(crate) fn register_cross_worker_first_connect_tests(reg: &mut Registry<'_>) 
                     for i in 0..3 {
                         let conn_resp = run
                             .send(&handle_b,
-                                Command::NetConnect {
+                                InfraCommand::NetConnect {
                                     addr: format!("127.0.0.1:{port}"),
                                     data: format!("seq_{i}"),
                                 },
@@ -596,7 +821,7 @@ pub(crate) fn register_cross_worker_first_connect_tests(reg: &mut Registry<'_>) 
                             break;
                         }
                     }
-                    let _ = run.send(&handle_a, Command::NetUnlisten { port }).await;
+                    let _ = run.send(&handle_a, InfraCommand::NetUnlisten { port }).await;
                     let detail = if all_ok {
                         "3/3 sequential OK".into()
                     } else {
@@ -629,7 +854,7 @@ pub(crate) fn register_cross_worker_self_connect_tests(reg: &mut Registry<'_>) {
                 let listen_resp = run
                     .send(
                         &handle_a,
-                        Command::NetListen {
+                        InfraCommand::NetListen {
                             port,
                             pre_bind_options: vec![],
                         },
@@ -645,7 +870,7 @@ pub(crate) fn register_cross_worker_self_connect_tests(reg: &mut Registry<'_>) {
                 let conn_resp = run
                     .send(
                         &handle_a,
-                        Command::NetConnect {
+                        InfraCommand::NetConnect {
                             addr: format!("127.0.0.1:{port}"),
                             data: "self_loopback".into(),
                         },
@@ -653,7 +878,9 @@ pub(crate) fn register_cross_worker_self_connect_tests(reg: &mut Registry<'_>) {
                     .await;
                 let ok =
                     matches!(&conn_resp, Response::Connected { echo } if echo == "self_loopback");
-                let _ = run.send(&handle_a, Command::NetUnlisten { port }).await;
+                let _ = run
+                    .send(&handle_a, InfraCommand::NetUnlisten { port })
+                    .await;
                 super::TestOutcome::new("A", ok, format!("{conn_resp:?}"))
             })
         })
@@ -674,7 +901,7 @@ pub(crate) fn register_cross_worker_self_connect_tests(reg: &mut Registry<'_>) {
                 let listen_resp = run
                     .send(
                         &handle_a,
-                        Command::NetListen {
+                        InfraCommand::NetListen {
                             port,
                             pre_bind_options: vec![],
                         },
@@ -690,7 +917,7 @@ pub(crate) fn register_cross_worker_self_connect_tests(reg: &mut Registry<'_>) {
                 let conn_resp = run
                     .send(
                         &handle_aa,
-                        Command::NetConnect {
+                        InfraCommand::NetConnect {
                             addr: format!("127.0.0.1:{port}"),
                             data: "parent_child".into(),
                         },
@@ -698,7 +925,9 @@ pub(crate) fn register_cross_worker_self_connect_tests(reg: &mut Registry<'_>) {
                     .await;
                 let ok =
                     matches!(&conn_resp, Response::Connected { echo } if echo == "parent_child");
-                let _ = run.send(&handle_a, Command::NetUnlisten { port }).await;
+                let _ = run
+                    .send(&handle_a, InfraCommand::NetUnlisten { port })
+                    .await;
                 super::TestOutcome::new("AA", ok, format!("{conn_resp:?}"))
             })
         })
@@ -719,7 +948,7 @@ pub(crate) fn register_cross_worker_self_connect_tests(reg: &mut Registry<'_>) {
                 let listen_resp = run
                     .send(
                         &handle_aa,
-                        Command::NetListen {
+                        InfraCommand::NetListen {
                             port,
                             pre_bind_options: vec![],
                         },
@@ -735,7 +964,7 @@ pub(crate) fn register_cross_worker_self_connect_tests(reg: &mut Registry<'_>) {
                 let conn_resp = run
                     .send(
                         &handle_a,
-                        Command::NetConnect {
+                        InfraCommand::NetConnect {
                             addr: format!("127.0.0.1:{port}"),
                             data: "child_parent".into(),
                         },
@@ -743,7 +972,9 @@ pub(crate) fn register_cross_worker_self_connect_tests(reg: &mut Registry<'_>) {
                     .await;
                 let ok =
                     matches!(&conn_resp, Response::Connected { echo } if echo == "child_parent");
-                let _ = run.send(&handle_aa, Command::NetUnlisten { port }).await;
+                let _ = run
+                    .send(&handle_aa, InfraCommand::NetUnlisten { port })
+                    .await;
                 super::TestOutcome::new("A", ok, format!("{conn_resp:?}"))
             })
         })
@@ -764,7 +995,7 @@ pub(crate) fn register_cross_worker_self_connect_tests(reg: &mut Registry<'_>) {
                 let listen_resp = run
                     .send(
                         &handle_a,
-                        Command::NetListen {
+                        InfraCommand::NetListen {
                             port,
                             pre_bind_options: vec![],
                         },
@@ -780,7 +1011,7 @@ pub(crate) fn register_cross_worker_self_connect_tests(reg: &mut Registry<'_>) {
                 let conn_resp = run
                     .send(
                         &handle_ab,
-                        Command::NetConnect {
+                        InfraCommand::NetConnect {
                             addr: format!("127.0.0.1:{port}"),
                             data: "sibling_connect".into(),
                         },
@@ -788,7 +1019,9 @@ pub(crate) fn register_cross_worker_self_connect_tests(reg: &mut Registry<'_>) {
                     .await;
                 let ok =
                     matches!(&conn_resp, Response::Connected { echo } if echo == "sibling_connect");
-                let _ = run.send(&handle_a, Command::NetUnlisten { port }).await;
+                let _ = run
+                    .send(&handle_a, InfraCommand::NetUnlisten { port })
+                    .await;
                 super::TestOutcome::new("AB", ok, format!("{conn_resp:?}"))
             })
         })
@@ -819,7 +1052,7 @@ async fn run_tlb_listen_busy_case(
     let listen_resp = run
         .send(
             listener,
-            Command::NetListen {
+            InfraCommand::NetListen {
                 port: 0,
                 pre_bind_options: vec![],
             },
@@ -839,7 +1072,7 @@ async fn run_tlb_listen_busy_case(
     let sleep_resp = run
         .send(
             listener,
-            Command::Exec {
+            InfraCommand::Exec {
                 args: vec!["sleep".into(), delay_secs.to_string()],
                 timeout_secs: Some(delay_secs + 5),
                 stdin: None,
@@ -849,7 +1082,7 @@ async fn run_tlb_listen_busy_case(
         )
         .await;
     if !matches!(&sleep_resp, Response::ExecResult { exit_code: 0, .. }) {
-        let _ = run.send(listener, Command::NetUnlisten { port }).await;
+        let _ = run.send(listener, InfraCommand::NetUnlisten { port }).await;
         return super::TestOutcome::new(
             connector_name,
             false,
@@ -860,13 +1093,13 @@ async fn run_tlb_listen_busy_case(
     let conn_resp = run
         .send(
             connector,
-            Command::NetConnect {
+            InfraCommand::NetConnect {
                 addr: format!("127.0.0.1:{port}"),
                 data: data.to_string(),
             },
         )
         .await;
-    let _ = run.send(listener, Command::NetUnlisten { port }).await;
+    let _ = run.send(listener, InfraCommand::NetUnlisten { port }).await;
     let pass = matches!(&conn_resp, Response::Connected { echo } if echo == data);
     super::TestOutcome::new(
         connector_name,
@@ -1189,7 +1422,7 @@ pub(crate) fn register_minimal_canary_tests(reg: &mut Registry<'_>) {
                                 let resp = run
                                     .send(
                                         &handle,
-                                        Command::Exec {
+                                        InfraCommand::Exec {
                                             args: vec![self_exe, sc],
                                             timeout_secs: Some(timeout_secs),
                                             stdin: None,
@@ -1272,7 +1505,7 @@ pub(crate) fn register_stdin_pipe_subst_tests(reg: &mut Registry<'_>) {
                             let resp = run
                                 .send(
                                     &handle,
-                                    Command::Exec {
+                                    InfraCommand::Exec {
                                         args: vec!["/bin/sh".into()],
                                         timeout_secs: Some(15),
                                         stdin: Some(s),
@@ -1336,7 +1569,7 @@ pub(crate) fn register_cross_worker_file_tests(reg: &mut Registry<'_>) {
                                 );
                             }
                             let resp = run
-                                .send(&handle, Command::FsRead { path: path.clone() })
+                                .send(&handle, InfraCommand::FsRead { path: path.clone() })
                                 .await;
                             let pass = matches!(
                                 &resp,
@@ -1367,7 +1600,7 @@ pub(crate) fn register_cross_worker_file_tests(reg: &mut Registry<'_>) {
                         let resp = run
                             .send(
                                 &handle,
-                                Command::ExecReady {
+                                InfraCommand::ExecReady {
                                     args: vec![
                                         self_exe,
                                         "cross-worker-file".into(),
@@ -1392,14 +1625,14 @@ pub(crate) fn register_cross_worker_file_tests(reg: &mut Registry<'_>) {
                             }
                         };
                         let resp = run
-                            .send(&handle, Command::FsRead { path: path.clone() })
+                            .send(&handle, InfraCommand::FsRead { path: path.clone() })
                             .await;
                         let pass = matches!(
                             &resp,
                             Response::Ok { data: Some(d) } if d.starts_with("line0")
                         );
                         if let Some(pid) = bg_pid {
-                            let _ = run.send(&handle, Command::Kill { pid }).await;
+                            let _ = run.send(&handle, InfraCommand::Kill { pid }).await;
                         }
                         super::TestOutcome::new(&a, pass, format!("{resp:?}"))
                     })
@@ -1422,7 +1655,7 @@ pub(crate) fn register_cross_worker_file_tests(reg: &mut Registry<'_>) {
                             let resp = run
                                 .send(
                                     &handle,
-                                    Command::ExecReady {
+                                    InfraCommand::ExecReady {
                                         args: vec![
                                             self_exe,
                                             "cross-worker-file".into(),
@@ -1447,14 +1680,14 @@ pub(crate) fn register_cross_worker_file_tests(reg: &mut Registry<'_>) {
                                 }
                             };
                             let resp = run
-                                .send(&handle, Command::FsRead { path: path.clone() })
+                                .send(&handle, InfraCommand::FsRead { path: path.clone() })
                                 .await;
                             let pass = matches!(
                                 &resp,
                                 Response::Ok { data: Some(d) } if d.starts_with("line0")
                             );
                             if let Some(pid) = bg_pid {
-                                let _ = run.send(&handle, Command::Kill { pid }).await;
+                                let _ = run.send(&handle, InfraCommand::Kill { pid }).await;
                             }
                             super::TestOutcome::new(&a, pass, format!("{resp:?}"))
                         })
@@ -1479,12 +1712,12 @@ pub(crate) fn register_cross_worker_file_tests(reg: &mut Registry<'_>) {
                     Box::pin(async move {
                         let path = format!("/shared/cwf-self-{a}.txt");
                         let _ = run
-                            .send(&handle, Command::FsDelete { path: path.clone() })
+                            .send(&handle, InfraCommand::FsDelete { path: path.clone() })
                             .await;
                         let resp = run
                             .send(
                                 &handle,
-                                Command::ExecReady {
+                                InfraCommand::ExecReady {
                                     args: vec![
                                         self_exe,
                                         "cross-worker-file".into(),
@@ -1509,14 +1742,14 @@ pub(crate) fn register_cross_worker_file_tests(reg: &mut Registry<'_>) {
                             }
                         };
                         let resp = run
-                            .send(&handle, Command::FsRead { path: path.clone() })
+                            .send(&handle, InfraCommand::FsRead { path: path.clone() })
                             .await;
                         let pass = matches!(
                             &resp,
                             Response::Ok { data: Some(d) } if d.starts_with("line0")
                         );
                         if let Some(pid) = pid {
-                            let _ = run.send(&handle, Command::Kill { pid }).await;
+                            let _ = run.send(&handle, InfraCommand::Kill { pid }).await;
                         }
                         super::TestOutcome::new(&a, pass, format!("{resp:?}"))
                     })
@@ -1552,7 +1785,7 @@ pub(crate) fn register_cross_worker_file_tests(reg: &mut Registry<'_>) {
                         let resp = run
                             .send(
                                 &handle,
-                                Command::ExecReady {
+                                InfraCommand::ExecReady {
                                     args: vec!["bash".into(), "-c".into(), script],
                                     ready_marker: "[cross-worker-file] READY".into(),
                                     timeout_secs: Some(15),
@@ -1572,14 +1805,14 @@ pub(crate) fn register_cross_worker_file_tests(reg: &mut Registry<'_>) {
                             }
                         };
                         let resp = run
-                            .send(&handle, Command::FsRead { path: path.clone() })
+                            .send(&handle, InfraCommand::FsRead { path: path.clone() })
                             .await;
                         let pass = matches!(
                             &resp,
                             Response::Ok { data: Some(d) } if d.contains("line0")
                         );
                         if let Some(pid) = pid {
-                            let _ = run.send(&handle, Command::Kill { pid }).await;
+                            let _ = run.send(&handle, InfraCommand::Kill { pid }).await;
                         }
                         super::TestOutcome::new(&a, pass, format!("{resp:?}"))
                     })
@@ -1616,7 +1849,7 @@ pub(crate) fn register_cross_worker_file_tests(reg: &mut Registry<'_>) {
                         let resp = run
                             .send(
                                 &handle,
-                                Command::Exec {
+                                InfraCommand::Exec {
                                     args: vec!["bash".into(), "-c".into(), script],
                                     timeout_secs: Some(15),
                                     stdin: None,
@@ -1662,7 +1895,7 @@ pub(crate) fn register_cross_worker_file_tests(reg: &mut Registry<'_>) {
                         let resp = run
                             .send(
                                 &handle,
-                                Command::Exec {
+                                InfraCommand::Exec {
                                     args: vec!["bash".into(), "-c".into(), script],
                                     timeout_secs: Some(10),
                                     stdin: None,
@@ -1757,7 +1990,7 @@ pub(crate) fn register_subst_capture_tests(reg: &mut Registry<'_>) {
                             let resp = run
                                 .send(
                                     &handle,
-                                    Command::Exec {
+                                    InfraCommand::Exec {
                                         args: vec!["bash".into(), "-c".into(), s],
                                         timeout_secs: Some(10),
                                         stdin: None,
@@ -1834,7 +2067,7 @@ pub(crate) fn register_concurrent_fork_tests(reg: &mut Registry<'_>) {
                             let resp = run
                                 .send(
                                     &handle,
-                                    Command::Exec {
+                                    InfraCommand::Exec {
                                         args: vec!["bash".into(), "-c".into(), script],
                                         timeout_secs: Some(10),
                                         stdin: None,
@@ -1851,7 +2084,7 @@ pub(crate) fn register_concurrent_fork_tests(reg: &mut Registry<'_>) {
                                 );
                             }
                             let resp = run
-                                .send(&handle, Command::FsRead { path: path.clone() })
+                                .send(&handle, InfraCommand::FsRead { path: path.clone() })
                                 .await;
                             let pass = matches!(
                                 &resp,
@@ -1942,7 +2175,7 @@ pub(crate) fn register_touch_redirect_tests(reg: &mut Registry<'_>) {
                             let resp = run
                                 .send(
                                     &handle,
-                                    Command::Exec {
+                                    InfraCommand::Exec {
                                         args: vec!["bash".into(), "-c".into(), script],
                                         timeout_secs: Some(10),
                                         stdin: None,
@@ -2104,7 +2337,7 @@ pub(crate) fn register_pid_visibility_tests(reg: &mut Registry<'_>) {
                             let resp = run
                                 .send(
                                     &handle,
-                                    Command::Exec {
+                                    InfraCommand::Exec {
                                         args: vec!["bash".into(), "-c".into(), script],
                                         timeout_secs: Some(15),
                                         stdin: None,
@@ -2194,7 +2427,7 @@ fn kpx_pid(resp: &Response) -> Result<u32, String> {
     }
 }
 
-fn kpx_observe_proc_cmd(pid: u32) -> Command {
+fn kpx_observe_proc_cmd(pid: u32) -> InfraCommand {
     let script = format!(
         "pid={pid}\n\
          if test -d \"/proc/$pid\"; then echo PROC_DIR_OK; else echo PROC_DIR_FAIL; fi\n\
@@ -2202,7 +2435,7 @@ fn kpx_observe_proc_cmd(pid: u32) -> Command {
          printf '\\n'\n\
          if kill -0 \"$pid\" 2>/dev/null; then echo KILL0_OK; else echo KILL0_FAIL; fi\n"
     );
-    Command::Exec {
+    InfraCommand::Exec {
         args: vec!["/bin/sh".into(), "-c".into(), script],
         timeout_secs: Some(10),
         stdin: None,
@@ -2237,7 +2470,7 @@ pub(crate) fn register_cross_pid_visibility_tests(reg: &mut Registry<'_>) {
                 let target_handle = cx.require(target);
                 Box::new(move |run| {
                     Box::pin(async move {
-                        let pid_resp = run.send(&target_handle, Command::GetPid).await;
+                        let pid_resp = run.send(&target_handle, InfraCommand::GetPid).await;
                         let pid = match kpx_pid(&pid_resp) {
                             Ok(pid) => pid,
                             Err(e) => {
@@ -2363,7 +2596,7 @@ pub(crate) fn register_file_redirect_tests(reg: &mut Registry<'_>) {
                                 let resp = run
                                     .send(
                                         &handle,
-                                        Command::Exec {
+                                        InfraCommand::Exec {
                                             args: vec!["bash".into(), "-c".into(), script],
                                             timeout_secs: Some(10),
                                             stdin: None,
@@ -2409,14 +2642,14 @@ pub(crate) fn register_cli_startup_mimic_tests(reg: &mut Registry<'_>) {
                             Box::pin(async move {
                                 let target = crate::binary_path(bt, &self_exe);
                                 let command = match delivery {
-                                    "tokio_pipe" => Command::Exec {
+                                    "tokio_pipe" => InfraCommand::Exec {
                                         args: vec![target, "cli-startup-mimic".into()],
                                         timeout_secs: Some(10),
                                         stdin: None,
                                         background: false,
                                         env: vec![],
                                     },
-                                    "bash_heredoc_pipe" => Command::Exec {
+                                    "bash_heredoc_pipe" => InfraCommand::Exec {
                                         args: vec!["bash".into(), "-s".into()],
                                         timeout_secs: Some(10),
                                         stdin: Some(format!("exec {target} cli-startup-mimic\n")),
@@ -2525,7 +2758,7 @@ pub(crate) fn register_bg_redirect_poll_tests(reg: &mut Registry<'_>) {
                                 let resp = run
                                     .send(
                                         &handle,
-                                        Command::Exec {
+                                        InfraCommand::Exec {
                                             args: vec!["bash".into(), "-c".into(), script],
                                             timeout_secs: Some(10),
                                             stdin: None,
@@ -2647,7 +2880,7 @@ pub(crate) fn register_bg_redirect_stdin_poll_tests(reg: &mut Registry<'_>) {
                                         let resp = run
                                             .send(
                                                 &handle,
-                                                Command::Exec {
+                                                InfraCommand::Exec {
                                                     args: vec![
                                                         shell_bin.into(),
                                                         "-c".into(),
@@ -2703,7 +2936,7 @@ pub(crate) fn register_pipe_nonblock_tests(reg: &mut Registry<'_>) {
                             let resp = run
                                 .send(
                                     &handle,
-                                    Command::Exec {
+                                    InfraCommand::Exec {
                                         args: vec![self_exe, "pipe-nonblock".into()],
                                         timeout_secs: Some(10),
                                         stdin: None,
@@ -2749,7 +2982,7 @@ pub(crate) fn register_pipe_nonblock_tests(reg: &mut Registry<'_>) {
                         let resp = run
                             .send(
                                 &handle,
-                                Command::Exec {
+                                InfraCommand::Exec {
                                     args: vec![self_exe, "pipe-child-nonblock".into()],
                                     timeout_secs: Some(10),
                                     stdin: None,
@@ -2835,7 +3068,7 @@ pub(crate) fn register_epoll_socket_tests(reg: &mut Registry<'_>) {
                         Box::pin(async move {
                             let resp = run
                                 .send(&handle,
-                                    Command::Exec {
+                                    InfraCommand::Exec {
                                         args: vec![
                                             self_exe,
                                             "epoll-socket".into(),
@@ -2880,7 +3113,7 @@ pub(crate) fn register_epoll_socket_tests(reg: &mut Registry<'_>) {
                             let resp = run
                                 .send(
                                     &handle,
-                                    Command::Exec {
+                                    InfraCommand::Exec {
                                         args: vec![
                                             self_exe,
                                             "epoll-socket".into(),
@@ -2989,7 +3222,7 @@ async fn fklc_connect_from_agent(
     let resp = run
         .send(
             connector,
-            Command::NetConnect {
+            InfraCommand::NetConnect {
                 addr: format!("127.0.0.1:{port}"),
                 data: payload.to_string(),
             },
@@ -3006,22 +3239,28 @@ async fn fklc_child_accept_ready(
     child: &EphemeralHandle,
     port: u16,
 ) -> Result<Response, String> {
+    let args = serde_json::to_value(AcceptInheritedArgs {
+        port,
+        timeout_secs: 5,
+    })
+    .map_err(|e| format!("accept args serialize: {e}"))?;
     let resp = run
         .forward(
             child,
-            Command::NetAccept {
-                port,
-                timeout_secs: 5,
+            InfraCommand::Run {
+                handler: ACCEPT_INHERITED.name().to_string(),
+                args,
             },
         )
         .await;
     match &resp {
-        Response::Ok { .. } => Ok(resp),
+        Response::Result { ok: true, .. } => Ok(resp),
         _ => Err(format!("child accept start failed: {resp:?}")),
     }
 }
 
 pub(crate) fn register_fork_listen_close_tests(reg: &mut Registry<'_>) {
+    register_handler!(ACCEPT_INHERITED, handle_accept_inherited);
     // FKLC.listen_unlisten: A listens then immediately unlistens,
     // B connects — should get RST.
     reg.test(
@@ -3039,7 +3278,7 @@ pub(crate) fn register_fork_listen_close_tests(reg: &mut Registry<'_>) {
                 let listen_resp = run
                     .send(
                         &handle_a,
-                        Command::NetListen {
+                        InfraCommand::NetListen {
                             port,
                             pre_bind_options: vec![],
                         },
@@ -3052,11 +3291,13 @@ pub(crate) fn register_fork_listen_close_tests(reg: &mut Registry<'_>) {
                         format!("listen failed: {e}; resp={listen_resp:?}"),
                     );
                 }
-                let _ = run.send(&handle_a, Command::NetUnlisten { port }).await;
+                let _ = run
+                    .send(&handle_a, InfraCommand::NetUnlisten { port })
+                    .await;
                 let conn_resp = run
                     .send(
                         &handle_b,
-                        Command::NetConnect {
+                        InfraCommand::NetConnect {
                             addr: format!("127.0.0.1:{port}"),
                             data: "listen_unlisten".into(),
                         },
@@ -3186,7 +3427,7 @@ pub(crate) fn register_fork_listen_close_tests(reg: &mut Registry<'_>) {
                             let listen_resp = run
                                 .send(
                                     &parent_handle,
-                                    Command::NetListen {
+                                    InfraCommand::NetListen {
                                         port,
                                         pre_bind_options: vec![],
                                     },
@@ -3208,10 +3449,10 @@ pub(crate) fn register_fork_listen_close_tests(reg: &mut Registry<'_>) {
                                 );
                             }
                             let _ = run
-                                .send(&parent_handle, Command::NetCloseListener { port })
+                                .send(&parent_handle, InfraCommand::NetUnlisten { port })
                                 .await;
                             if let Err(e) = fklc_child_accept_ready(run, &child, port).await {
-                                let _ = run.forward(&child, Command::Exit).await;
+                                let _ = run.forward(&child, InfraCommand::Exit).await;
                                 return super::TestOutcome::new("B", false, e);
                             }
                             match fklc_connect_from_agent(
@@ -3223,11 +3464,11 @@ pub(crate) fn register_fork_listen_close_tests(reg: &mut Registry<'_>) {
                             .await
                             {
                                 Ok(conn_resp) => {
-                                    let _ = run.forward(&child, Command::Exit).await;
+                                    let _ = run.forward(&child, InfraCommand::Exit).await;
                                     super::TestOutcome::new("B", true, format!("{conn_resp:?}"))
                                 }
                                 Err(e) => {
-                                    let _ = run.forward(&child, Command::Exit).await;
+                                    let _ = run.forward(&child, InfraCommand::Exit).await;
                                     super::TestOutcome::new("B", false, e)
                                 }
                             }
@@ -3261,7 +3502,7 @@ pub(crate) fn register_fork_listen_close_tests(reg: &mut Registry<'_>) {
                     let listen_resp = run
                         .send(
                             &parent,
-                            Command::NetListen {
+                            InfraCommand::NetListen {
                                 port,
                                 pre_bind_options: vec![],
                             },
@@ -3284,13 +3525,13 @@ pub(crate) fn register_fork_listen_close_tests(reg: &mut Registry<'_>) {
                     );
                 }
                 for port in [19922u16, 19923] {
-                    let _ = run.send(&parent, Command::NetCloseListener { port }).await;
+                    let _ = run.send(&parent, InfraCommand::NetUnlisten { port }).await;
                 }
                 let ready_first = fklc_child_accept_ready(run, &child, 19922).await;
                 let ready_second = fklc_child_accept_ready(run, &child, 19923).await;
                 let first = fklc_connect_from_agent(run, &connector, 19922, "multi_one").await;
                 let second = fklc_connect_from_agent(run, &connector, 19923, "multi_two").await;
-                let _ = run.forward(&child, Command::Exit).await;
+                let _ = run.forward(&child, InfraCommand::Exit).await;
                 match (ready_first, ready_second, first, second) {
                     (Ok(a), Ok(b), Ok(c), Ok(d)) => {
                         super::TestOutcome::new("B", true, format!("{a:?}; {b:?}; {c:?}; {d:?}"))
@@ -3325,7 +3566,7 @@ pub(crate) fn register_fork_listen_close_tests(reg: &mut Registry<'_>) {
                 let listen_resp = run
                     .send(
                         &parent,
-                        Command::NetListen {
+                        InfraCommand::NetListen {
                             port,
                             pre_bind_options: vec![],
                         },
@@ -3339,7 +3580,7 @@ pub(crate) fn register_fork_listen_close_tests(reg: &mut Registry<'_>) {
                     );
                 }
                 let fork_resp = run.spawn_ephemeral(&child).await;
-                let close_resp = run.send(&parent, Command::NetCloseListener { port }).await;
+                let close_resp = run.send(&parent, InfraCommand::NetUnlisten { port }).await;
                 if !matches!(
                     (&fork_resp, &close_resp),
                     (Response::Ok { .. }, Response::Ok { .. })
@@ -3356,7 +3597,7 @@ pub(crate) fn register_fork_listen_close_tests(reg: &mut Registry<'_>) {
                 } else {
                     fklc_connect_from_agent(run, &connector, port, "close_parent").await
                 };
-                let _ = run.forward(&child, Command::Exit).await;
+                let _ = run.forward(&child, InfraCommand::Exit).await;
                 match result {
                     Ok(resp) => super::TestOutcome::new("B", true, format!("{resp:?}")),
                     Err(e) => super::TestOutcome::new("B", false, e),
@@ -3389,7 +3630,7 @@ pub(crate) fn register_fork_listen_close_tests(reg: &mut Registry<'_>) {
                 let listen_resp = run
                     .send(
                         &parent,
-                        Command::NetListen {
+                        InfraCommand::NetListen {
                             port,
                             pre_bind_options: vec![],
                         },
@@ -3403,7 +3644,7 @@ pub(crate) fn register_fork_listen_close_tests(reg: &mut Registry<'_>) {
                     );
                 }
                 let fork1_resp = run.spawn_ephemeral(&child).await;
-                let _ = run.send(&parent, Command::NetCloseListener { port }).await;
+                let _ = run.send(&parent, InfraCommand::NetUnlisten { port }).await;
                 if !matches!(&fork1_resp, Response::Ok { .. }) {
                     return super::TestOutcome::new(
                         "B",
@@ -3414,7 +3655,7 @@ pub(crate) fn register_fork_listen_close_tests(reg: &mut Registry<'_>) {
                 let fork2_resp = run
                     .forward(
                         &child,
-                        Command::Fork {
+                        InfraCommand::Fork {
                             name: "FKLCInheritDepth2".into(),
                             binary: "self".into(),
                             inherit_listen_ports: vec![port],
@@ -3422,27 +3663,32 @@ pub(crate) fn register_fork_listen_close_tests(reg: &mut Registry<'_>) {
                     )
                     .await;
                 let close1_resp = run
-                    .forward(&child, Command::NetCloseListener { port })
+                    .forward(&child, InfraCommand::NetUnlisten { port })
                     .await;
                 if !matches!(
                     (&fork2_resp, &close1_resp),
                     (Response::Ok { .. }, Response::Ok { .. })
                 ) {
-                    let _ = run.forward(&child, Command::Exit).await;
+                    let _ = run.forward(&child, InfraCommand::Exit).await;
                     return super::TestOutcome::new(
                         "B",
                         false,
                         format!("fork depth2/close depth1 failed: {fork2_resp:?}; {close1_resp:?}"),
                     );
                 }
+                let ready_args = serde_json::to_value(AcceptInheritedArgs {
+                    port,
+                    timeout_secs: 5,
+                })
+                .expect("accept args serialize");
                 let ready = run
                     .forward(
                         &child,
-                        Command::Forward {
+                        InfraCommand::Forward {
                             target: "FKLCInheritDepth2".into(),
-                            inner: Box::new(Command::NetAccept {
-                                port,
-                                timeout_secs: 5,
+                            inner: Box::new(InfraCommand::Run {
+                                handler: ACCEPT_INHERITED.name().to_string(),
+                                args: ready_args,
                             }),
                         },
                     )
@@ -3451,15 +3697,15 @@ pub(crate) fn register_fork_listen_close_tests(reg: &mut Registry<'_>) {
                 let _ = run
                     .forward(
                         &child,
-                        Command::Forward {
+                        InfraCommand::Forward {
                             target: "FKLCInheritDepth2".into(),
-                            inner: Box::new(Command::Exit),
+                            inner: Box::new(InfraCommand::Exit),
                         },
                     )
                     .await;
-                let _ = run.forward(&child, Command::Exit).await;
+                let _ = run.forward(&child, InfraCommand::Exit).await;
                 match (&ready, conn) {
-                    (Response::Ok { .. }, Ok(conn_resp)) => {
+                    (Response::Result { ok: true, .. }, Ok(conn_resp)) => {
                         super::TestOutcome::new("B", true, format!("{ready:?}; {conn_resp:?}"))
                     }
                     (_, conn_result) => super::TestOutcome::new(
@@ -3496,7 +3742,7 @@ pub(crate) fn register_fork_listen_close_tests(reg: &mut Registry<'_>) {
                 let listen_resp = run
                     .send(
                         &parent,
-                        Command::NetListen {
+                        InfraCommand::NetListen {
                             port,
                             pre_bind_options: vec![],
                         },
@@ -3510,7 +3756,7 @@ pub(crate) fn register_fork_listen_close_tests(reg: &mut Registry<'_>) {
                     );
                 }
                 let server_resp = run.spawn_ephemeral(&server).await;
-                let _ = run.send(&parent, Command::NetCloseListener { port }).await;
+                let _ = run.send(&parent, InfraCommand::NetUnlisten { port }).await;
                 if !matches!(&server_resp, Response::Ok { .. }) {
                     return super::TestOutcome::new(
                         "B",
@@ -3524,7 +3770,7 @@ pub(crate) fn register_fork_listen_close_tests(reg: &mut Registry<'_>) {
                 } else {
                     fklc_connect_from_agent(run, &connector, port, "sibling_connect").await
                 };
-                let _ = run.forward(&server, Command::Exit).await;
+                let _ = run.forward(&server, InfraCommand::Exit).await;
                 match result {
                     Ok(resp) => super::TestOutcome::new("B", true, format!("{resp:?}")),
                     Err(e) => super::TestOutcome::new("B", false, e),
@@ -3559,7 +3805,7 @@ pub(crate) fn register_proc_filesystem_tests(reg: &mut Registry<'_>) {
                         let resp = run
                             .send(
                                 &handle,
-                                Command::FsRead {
+                                InfraCommand::FsRead {
                                     path: "/proc/self/stat".into(),
                                 },
                             )
@@ -3621,7 +3867,7 @@ pub(crate) fn register_proc_filesystem_tests(reg: &mut Registry<'_>) {
                             let resp = run
                                 .send(
                                     &handle,
-                                    Command::FsRead {
+                                    InfraCommand::FsRead {
                                         path: "/proc/uptime".into(),
                                     },
                                 )
@@ -3761,7 +4007,7 @@ pub(crate) fn register_subtree_kill_tests(reg: &mut Registry<'_>) {
                 // before we kill the root. Forward(Exit) reaches NPx
                 // via E. If the response stream desyncs we ignore —
                 // the goal is just to make NPx exit.
-                let _ = run.forward(&npx, Command::Exit).await;
+                let _ = run.forward(&npx, InfraCommand::Exit).await;
                 run_subtree_kill(run, &e).await
             })
         })
