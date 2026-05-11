@@ -3,12 +3,16 @@
 
 //! Stateful TCP protocol tests.
 //!
-//! TCS exercises multi-step connection state through the agent's TCP
-//! connection registry, replacing one-shot helper subcommands.
+//! TCS exercises multi-step connection state through handler-dispatched
+//! raw socket operations instead of the legacy `Net*` wire commands.
 
 use std::collections::HashSet;
 
-use crate::protocol::{Command, Response};
+use serde::{Deserialize, Serialize};
+
+use crate::handlers::{HandlerCtx, HandlerError, HandlerToken};
+use crate::os::socket::TcpSocket;
+use crate::register_handler;
 
 use super::TestOutcome;
 use super::agents::{AgentHandle, AgentName};
@@ -50,7 +54,64 @@ const AXES: &[AxisCase] = &[
     },
 ];
 
+#[derive(Serialize, Deserialize, Clone, Debug)]
+struct ServerArgs {
+    connections: u32,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+struct InProcessArgs {
+    client: ClientScenario,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+struct ClientArgs {
+    port: u16,
+    scenario: ClientScenario,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+enum ClientScenario {
+    WriteShutdownReadEof { payload: String },
+    SendRecvSend { first: String, second: String },
+    PartialRecv { payload: String, first_len: usize },
+    HalfcloseThenReconnect { first: String, second: String },
+}
+
+impl ClientScenario {
+    fn connections(&self) -> u32 {
+        match self {
+            Self::HalfcloseThenReconnect { .. } => 2,
+            Self::WriteShutdownReadEof { .. }
+            | Self::SendRecvSend { .. }
+            | Self::PartialRecv { .. } => 1,
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+struct DetailOut {
+    detail: String,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+struct ServerOut {
+    port: u16,
+    detail: String,
+}
+
+const SERVER: HandlerToken<ServerArgs, ServerOut> = HandlerToken::new("tcp_state.server");
+const CLIENT: HandlerToken<ClientArgs, DetailOut> = HandlerToken::new("tcp_state.client");
+const IN_PROCESS: HandlerToken<InProcessArgs, DetailOut> =
+    HandlerToken::new("tcp_state.in_process");
+const CONN_ID_UNIQUE: HandlerToken<(), DetailOut> = HandlerToken::new("tcp_state.conn_id_unique");
+
 pub(crate) fn register_tcp_state_tests(reg: &mut Registry<'_>) {
+    register_handler!(SERVER, handle_server);
+    register_handler!(CLIENT, handle_client);
+    register_handler!(IN_PROCESS, handle_in_process);
+    register_handler!(CONN_ID_UNIQUE, handle_conn_id_unique);
+
     register_write_shutdown_read_eof(reg);
     register_send_recv_send(reg);
     register_partial_recv(reg);
@@ -60,118 +121,90 @@ pub(crate) fn register_tcp_state_tests(reg: &mut Registry<'_>) {
 
 fn register_write_shutdown_read_eof(reg: &mut Registry<'_>) {
     for axis in AXES {
-        let id = format!("TCS.write_shutdown_read_eof.{}", axis.name);
-        let server_label = axis.server.to_string();
-        let client_label = axis.client.to_string();
-        reg.test("matrix", "tcp_state", id)
-            .timeout(60)
-            .build(move |cx| {
-                let server = cx.require(axis.server);
-                let client = cx.require(axis.client);
-                Box::new(move |run| {
-                    let server_label = server_label.clone();
-                    let client_label = client_label.clone();
-                    Box::pin(async move {
-                        run_write_shutdown_read_eof_case(
-                            run,
-                            &server,
-                            &client,
-                            &server_label,
-                            &client_label,
-                            &format!("TCS_EOF_{}", axis.name),
-                        )
-                        .await
-                    })
-                })
-            });
+        let scenario = ClientScenario::WriteShutdownReadEof {
+            payload: format!("TCS_EOF_{}", axis.name),
+        };
+        register_axis_case(reg, axis, "TCS.write_shutdown_read_eof", scenario);
     }
 }
 
 fn register_send_recv_send(reg: &mut Registry<'_>) {
     for axis in AXES {
-        let id = format!("TCS.send_recv_send.{}", axis.name);
-        let server_label = axis.server.to_string();
-        let client_label = axis.client.to_string();
-        reg.test("matrix", "tcp_state", id)
-            .timeout(60)
-            .build(move |cx| {
-                let server = cx.require(axis.server);
-                let client = cx.require(axis.client);
-                Box::new(move |run| {
-                    let server_label = server_label.clone();
-                    let client_label = client_label.clone();
-                    Box::pin(async move {
-                        run_send_recv_send_case(
-                            run,
-                            &server,
-                            &client,
-                            &server_label,
-                            &client_label,
-                            &format!("TCS_X_{}", axis.name),
-                            &format!("TCS_Y_{}", axis.name),
-                        )
-                        .await
-                    })
-                })
-            });
+        let scenario = ClientScenario::SendRecvSend {
+            first: format!("TCS_X_{}", axis.name),
+            second: format!("TCS_Y_{}", axis.name),
+        };
+        register_axis_case(reg, axis, "TCS.send_recv_send", scenario);
     }
 }
 
 fn register_partial_recv(reg: &mut Registry<'_>) {
     for axis in AXES {
-        let id = format!("TCS.partial_recv.{}", axis.name);
-        let server_label = axis.server.to_string();
-        let client_label = axis.client.to_string();
-        reg.test("matrix", "tcp_state", id)
-            .timeout(60)
-            .build(move |cx| {
-                let server = cx.require(axis.server);
-                let client = cx.require(axis.client);
-                Box::new(move |run| {
-                    let server_label = server_label.clone();
-                    let client_label = client_label.clone();
-                    Box::pin(async move {
-                        let payload = format!("TCS_PARTIAL_{}_ABCDEFGHIJK", axis.name);
-                        run_partial_recv_case(
-                            run,
-                            &server,
-                            &client,
-                            &server_label,
-                            &client_label,
-                            &payload,
-                            11,
-                        )
-                        .await
-                    })
-                })
-            });
+        let scenario = ClientScenario::PartialRecv {
+            payload: format!("TCS_PARTIAL_{}_ABCDEFGHIJK", axis.name),
+            first_len: 11,
+        };
+        register_axis_case(reg, axis, "TCS.partial_recv", scenario);
     }
 }
 
 fn register_halfclose_then_reconnect(reg: &mut Registry<'_>) {
     for axis in AXES {
-        let id = format!("TCS.halfclose_then_reconnect.{}", axis.name);
-        let server_label = axis.server.to_string();
-        let client_label = axis.client.to_string();
+        let scenario = ClientScenario::HalfcloseThenReconnect {
+            first: format!("TCS_FIRST_{}", axis.name),
+            second: format!("TCS_SECOND_{}", axis.name),
+        };
+        register_axis_case(reg, axis, "TCS.halfclose_then_reconnect", scenario);
+    }
+}
+
+fn register_axis_case(
+    reg: &mut Registry<'_>,
+    axis: &AxisCase,
+    id_prefix: &'static str,
+    scenario: ClientScenario,
+) {
+    let id = format!("{id_prefix}.{}", axis.name);
+    let server_label = axis.server.to_string();
+    let client_label = axis.client.to_string();
+    let agent_label = format!("{server_label}<-{client_label}");
+    if axis.server == axis.client {
+        reg.test("matrix", "tcp_state", id)
+            .timeout(60)
+            .build(move |cx| {
+                let handle = cx.require(axis.server);
+                let scenario = scenario.clone();
+                let agent_label = agent_label.clone();
+                Box::new(move |run| {
+                    Box::pin(async move {
+                        match run
+                            .send_named_typed(
+                                &handle,
+                                &IN_PROCESS,
+                                InProcessArgs { client: scenario },
+                            )
+                            .await
+                        {
+                            Ok(out) => TestOutcome::new(&agent_label, true, out.detail),
+                            Err(e) => TestOutcome::new(&agent_label, false, e),
+                        }
+                    })
+                })
+            });
+    } else {
         reg.test("matrix", "tcp_state", id)
             .timeout(60)
             .build(move |cx| {
                 let server = cx.require(axis.server);
                 let client = cx.require(axis.client);
+                let scenario = scenario.clone();
+                let agent_label = agent_label.clone();
                 Box::new(move |run| {
-                    let server_label = server_label.clone();
-                    let client_label = client_label.clone();
                     Box::pin(async move {
-                        run_halfclose_then_reconnect_case(
-                            run,
-                            &server,
-                            &client,
-                            &server_label,
-                            &client_label,
-                            &format!("TCS_FIRST_{}", axis.name),
-                            &format!("TCS_SECOND_{}", axis.name),
-                        )
-                        .await
+                        match run_cross_agent_case(run, &server, &client, scenario).await {
+                            Ok(detail) => TestOutcome::new(&agent_label, true, detail),
+                            Err(e) => TestOutcome::new(&agent_label, false, e),
+                        }
                     })
                 })
             });
@@ -179,16 +212,14 @@ fn register_halfclose_then_reconnect(reg: &mut Registry<'_>) {
 }
 
 fn register_conn_id_unique(reg: &mut Registry<'_>) {
-    reg.test(
+    reg.single_agent_handler_test(
         "matrix",
         "tcp_state",
-        "TCS.conn_id_unique.rapid_open_close".to_string(),
-    )
-    .timeout(60)
-    .build(move |cx| {
-        let handle = cx.require(AgentName::Dpg1);
-        Box::new(move |run| Box::pin(async move { run_conn_id_unique_case(run, &handle).await }))
-    });
+        "TCS.conn_id_unique.rapid_open_close",
+        AgentName::Dpg1,
+        &CONN_ID_UNIQUE,
+        detail_out,
+    );
 }
 
 pub(crate) async fn run_write_shutdown_read_eof_case(
@@ -200,447 +231,206 @@ pub(crate) async fn run_write_shutdown_read_eof_case(
     payload: &str,
 ) -> TestOutcome {
     let agent = format!("{server_label}<-{client_label}");
-    let (port, conn) = match listen_open(run, server, client).await {
-        Ok(pair) => pair,
-        Err(e) => return TestOutcome::new(&agent, false, format!("setup failed: {e}")),
+    let scenario = ClientScenario::WriteShutdownReadEof {
+        payload: payload.to_string(),
     };
-
-    let outcome = async {
-        expect_sent(
-            run.send(
-                client,
-                Command::NetSend {
-                    conn,
-                    data: payload.into(),
-                },
-            )
-            .await,
-        )?;
-        expect_shutdown(
-            run.send(
-                client,
-                Command::NetShutdown {
-                    conn,
-                    half: "wr".into(),
-                },
-            )
-            .await,
-        )?;
-        let data = expect_received(
-            run.send(
-                client,
-                Command::NetRecv {
-                    conn,
-                    n_bytes: None,
-                },
-            )
-            .await,
-        )?;
-        if data != payload {
-            return Err(format!("expected exact EOF echo {payload:?}, got {data:?}"));
-        }
-        Ok::<_, String>(format!("conn={conn} payload={payload:?}"))
-    }
-    .await;
-
-    let _ = run.send(client, Command::NetClose { conn }).await;
-    let _ = run.send(server, Command::NetUnlisten { port }).await;
-    match outcome {
+    match run_cross_agent_case(run, server, client, scenario).await {
         Ok(detail) => TestOutcome::new(&agent, true, detail),
-        Err(detail) => TestOutcome::new(&agent, false, detail),
+        Err(e) => TestOutcome::new(&agent, false, e),
     }
 }
 
-async fn run_send_recv_send_case(
-    run: &mut RunContext<'_>,
-    server: &AgentHandle,
-    client: &AgentHandle,
-    server_label: &str,
-    client_label: &str,
-    first: &str,
-    second: &str,
-) -> TestOutcome {
-    let agent = format!("{server_label}<-{client_label}");
-    let (port, conn) = match listen_open(run, server, client).await {
-        Ok(pair) => pair,
-        Err(e) => return TestOutcome::new(&agent, false, format!("setup failed: {e}")),
-    };
-
-    let outcome = async {
-        expect_sent(
-            run.send(
-                client,
-                Command::NetSend {
-                    conn,
-                    data: first.into(),
-                },
-            )
-            .await,
-        )?;
-        let first_echo = expect_received(
-            run.send(
-                client,
-                Command::NetRecv {
-                    conn,
-                    n_bytes: Some(first.len() as u32),
-                },
-            )
-            .await,
-        )?;
-        if first_echo != first {
-            return Err(format!(
-                "first echo mismatch: expected {first:?}, got {first_echo:?}"
-            ));
+async fn handle_server(
+    args: ServerArgs,
+    _ctx: &mut HandlerCtx<'_>,
+) -> Result<ServerOut, HandlerError> {
+    let listener = TcpSocket::new_tcp_listen(0)?;
+    let port = listener.local_port()?;
+    std::thread::spawn(move || {
+        for _ in 0..args.connections {
+            let Ok(conn) = listener.accept() else {
+                return;
+            };
+            if conn.echo_to_eof().is_err() {
+                return;
+            }
         }
-
-        expect_sent(
-            run.send(
-                client,
-                Command::NetSend {
-                    conn,
-                    data: second.into(),
-                },
-            )
-            .await,
-        )?;
-        let second_echo = expect_received(
-            run.send(
-                client,
-                Command::NetRecv {
-                    conn,
-                    n_bytes: Some(second.len() as u32),
-                },
-            )
-            .await,
-        )?;
-        if second_echo != second {
-            return Err(format!(
-                "second echo mismatch: expected {second:?}, got {second_echo:?}"
-            ));
-        }
-        Ok::<_, String>(format!("conn={conn} echoes exact"))
-    }
-    .await;
-
-    let _ = run.send(client, Command::NetClose { conn }).await;
-    let _ = run.send(server, Command::NetUnlisten { port }).await;
-    match outcome {
-        Ok(detail) => TestOutcome::new(&agent, true, detail),
-        Err(detail) => TestOutcome::new(&agent, false, detail),
-    }
+    });
+    Ok(ServerOut {
+        port,
+        detail: format!("port={port} expected_connections={}", args.connections),
+    })
 }
 
-async fn run_partial_recv_case(
-    run: &mut RunContext<'_>,
-    server: &AgentHandle,
-    client: &AgentHandle,
-    server_label: &str,
-    client_label: &str,
-    payload: &str,
-    first_len: usize,
-) -> TestOutcome {
-    let agent = format!("{server_label}<-{client_label}");
-    let (port, conn) = match listen_open(run, server, client).await {
-        Ok(pair) => pair,
-        Err(e) => return TestOutcome::new(&agent, false, format!("setup failed: {e}")),
-    };
-
-    let outcome = async {
-        expect_sent(
-            run.send(
-                client,
-                Command::NetSend {
-                    conn,
-                    data: payload.into(),
-                },
-            )
-            .await,
-        )?;
-        let first = expect_received(
-            run.send(
-                client,
-                Command::NetRecv {
-                    conn,
-                    n_bytes: Some(first_len as u32),
-                },
-            )
-            .await,
-        )?;
-        let rest = expect_received(
-            run.send(
-                client,
-                Command::NetRecv {
-                    conn,
-                    n_bytes: Some((payload.len() - first_len) as u32),
-                },
-            )
-            .await,
-        )?;
-        let combined = format!("{first}{rest}");
-        if combined != payload {
-            return Err(format!(
-                "partial continuity mismatch: expected {payload:?}, got {combined:?}"
-            ));
-        }
-        Ok::<_, String>(format!("conn={conn} split={first_len}+{}", rest.len()))
-    }
-    .await;
-
-    let _ = run.send(client, Command::NetClose { conn }).await;
-    let _ = run.send(server, Command::NetUnlisten { port }).await;
-    match outcome {
-        Ok(detail) => TestOutcome::new(&agent, true, detail),
-        Err(detail) => TestOutcome::new(&agent, false, detail),
-    }
+async fn handle_client(
+    args: ClientArgs,
+    _ctx: &mut HandlerCtx<'_>,
+) -> Result<DetailOut, HandlerError> {
+    let first = TcpSocket::connect_loopback(args.port)?;
+    run_client_scenario(args.scenario, first, args.port)
 }
 
-async fn run_halfclose_then_reconnect_case(
-    run: &mut RunContext<'_>,
-    server: &AgentHandle,
-    client: &AgentHandle,
-    server_label: &str,
-    client_label: &str,
-    first: &str,
-    second: &str,
-) -> TestOutcome {
-    let agent = format!("{server_label}<-{client_label}");
-    let listen_resp = run
-        .send(
-            server,
-            Command::NetListen {
-                port: 0,
-                pre_bind_options: vec![],
-            },
-        )
-        .await;
-    let port = match super::expect_listening_port(&listen_resp, 0) {
-        Ok(port) => port,
-        Err(e) => {
-            return TestOutcome::new(
-                &agent,
-                false,
-                format!("listen failed: {e}; resp={listen_resp:?}"),
-            );
-        }
-    };
-
-    let outcome = async {
-        let first_conn = expect_opened(
-            run.send(
-                client,
-                Command::NetOpen {
-                    addr: format!("127.0.0.1:{port}"),
-                },
-            )
-            .await,
-        )?;
-        round_trip_to_eof(run, client, first_conn, first).await?;
-        expect_closed(
-            run.send(client, Command::NetClose { conn: first_conn })
-                .await,
-        )?;
-
-        let second_conn = expect_opened(
-            run.send(
-                client,
-                Command::NetOpen {
-                    addr: format!("127.0.0.1:{port}"),
-                },
-            )
-            .await,
-        )?;
-        if second_conn == first_conn {
-            return Err(format!("connection id reused: {second_conn}"));
-        }
-        round_trip_to_eof(run, client, second_conn, second).await?;
-        expect_closed(
-            run.send(client, Command::NetClose { conn: second_conn })
-                .await,
-        )?;
-        Ok::<_, String>(format!("first_conn={first_conn} second_conn={second_conn}"))
-    }
-    .await;
-
-    let _ = run.send(server, Command::NetUnlisten { port }).await;
-    match outcome {
-        Ok(detail) => TestOutcome::new(&agent, true, detail),
-        Err(detail) => TestOutcome::new(&agent, false, detail),
-    }
+async fn handle_in_process(
+    args: InProcessArgs,
+    _ctx: &mut HandlerCtx<'_>,
+) -> Result<DetailOut, HandlerError> {
+    run_in_process(args.client)
 }
 
-async fn run_conn_id_unique_case(run: &mut RunContext<'_>, handle: &AgentHandle) -> TestOutcome {
-    let listen_resp = run
-        .send(
-            handle,
-            Command::NetListen {
-                port: 0,
-                pre_bind_options: vec![],
-            },
-        )
-        .await;
-    let port = match super::expect_listening_port(&listen_resp, 0) {
-        Ok(port) => port,
-        Err(e) => {
-            return TestOutcome::new(
-                "A",
-                false,
-                format!("listen failed: {e}; resp={listen_resp:?}"),
-            );
+async fn handle_conn_id_unique(
+    _args: (),
+    _ctx: &mut HandlerCtx<'_>,
+) -> Result<DetailOut, HandlerError> {
+    let iterations = 25;
+    let listener = TcpSocket::new_tcp_listen(0)?;
+    let port = listener.local_port()?;
+    let server = std::thread::spawn(move || -> Result<u32, std::io::Error> {
+        let mut accepted = 0;
+        for _ in 0..iterations {
+            let conn = listener.accept()?;
+            accepted += 1;
+            let _ = conn.recv_to_end_string()?;
         }
-    };
+        Ok(accepted)
+    });
 
     let mut seen = HashSet::new();
-    let mut detail = String::new();
-    let mut pass = true;
-    for i in 0..25 {
-        let conn = match expect_opened(
-            run.send(
-                handle,
-                Command::NetOpen {
-                    addr: format!("127.0.0.1:{port}"),
-                },
-            )
-            .await,
-        ) {
-            Ok(conn) => conn,
-            Err(e) => {
-                pass = false;
-                detail = format!("open {i} failed: {e}");
-                break;
-            }
-        };
+    for conn in 1..=iterations {
+        let sock = TcpSocket::connect_loopback(port)?;
         if !seen.insert(conn) {
-            pass = false;
-            detail = format!("conn id {conn} reused at iteration {i}");
-            let _ = run.send(handle, Command::NetClose { conn }).await;
-            break;
+            return Err(HandlerError(format!(
+                "conn id {conn} reused at iteration {}",
+                conn - 1
+            )));
         }
-        match expect_closed(run.send(handle, Command::NetClose { conn }).await) {
-            Ok(()) => {}
-            Err(e) => {
-                pass = false;
-                detail = format!("close {conn} failed: {e}");
-                break;
-            }
-        }
+        drop(sock);
     }
-    let _ = run.send(handle, Command::NetUnlisten { port }).await;
-    if pass {
-        detail = format!("{} unique ids", seen.len());
-    }
-    TestOutcome::new("A", pass, detail)
+    let accepted = join_server(server)?;
+    Ok(DetailOut {
+        detail: format!("{} unique ids; accepted={accepted}", seen.len()),
+    })
 }
 
-async fn listen_open(
+async fn run_cross_agent_case(
     run: &mut RunContext<'_>,
     server: &AgentHandle,
     client: &AgentHandle,
-) -> Result<(u16, u64), String> {
-    let listen_resp = run
-        .send(
-            server,
-            Command::NetListen {
-                port: 0,
-                pre_bind_options: vec![],
-            },
-        )
-        .await;
-    let port = match super::expect_listening_port(&listen_resp, 0) {
-        Ok(port) => port,
-        Err(e) => return Err(format!("listen failed: {e}; resp={listen_resp:?}")),
-    };
-    let open_resp = run
-        .send(
+    scenario: ClientScenario,
+) -> Result<String, String> {
+    let connections = scenario.connections();
+    let server_out: ServerOut = run
+        .send_named_typed(server, &SERVER, ServerArgs { connections })
+        .await?;
+    let client_out: DetailOut = run
+        .send_named_typed(
             client,
-            Command::NetOpen {
-                addr: format!("127.0.0.1:{port}"),
+            &CLIENT,
+            ClientArgs {
+                port: server_out.port,
+                scenario,
             },
         )
-        .await;
-    let conn = match expect_opened(open_resp) {
-        Ok(conn) => conn,
-        Err(e) => {
-            let _ = run.send(server, Command::NetUnlisten { port }).await;
-            return Err(e);
-        }
-    };
-    Ok((port, conn))
+        .await?;
+    Ok(format!("{}; {}", client_out.detail, server_out.detail))
 }
 
-async fn round_trip_to_eof(
-    run: &mut RunContext<'_>,
-    client: &AgentHandle,
-    conn: u64,
-    payload: &str,
-) -> Result<(), String> {
-    expect_sent(
-        run.send(
-            client,
-            Command::NetSend {
-                conn,
-                data: payload.into(),
-            },
-        )
-        .await,
-    )?;
-    expect_shutdown(
-        run.send(
-            client,
-            Command::NetShutdown {
-                conn,
-                half: "wr".into(),
-            },
-        )
-        .await,
-    )?;
-    let echo = expect_received(
-        run.send(
-            client,
-            Command::NetRecv {
-                conn,
-                n_bytes: None,
-            },
-        )
-        .await,
-    )?;
+fn run_in_process(scenario: ClientScenario) -> Result<DetailOut, HandlerError> {
+    let connections = scenario.connections();
+    let listener = TcpSocket::new_tcp_listen(0)?;
+    let port = listener.local_port()?;
+    let server = std::thread::spawn(move || -> Result<u32, std::io::Error> {
+        let mut accepted = 0;
+        for _ in 0..connections {
+            let conn = listener.accept()?;
+            accepted += 1;
+            conn.echo_to_eof()?;
+        }
+        Ok(accepted)
+    });
+    let first = TcpSocket::connect_loopback(port)?;
+    let out = run_client_scenario(scenario, first, port)?;
+    let accepted = join_server(server)?;
+    Ok(DetailOut {
+        detail: format!("{}; accepted={accepted}", out.detail),
+    })
+}
+
+fn run_client_scenario(
+    scenario: ClientScenario,
+    first: TcpSocket,
+    port: u16,
+) -> Result<DetailOut, HandlerError> {
+    let detail = match scenario {
+        ClientScenario::WriteShutdownReadEof { payload } => {
+            round_trip_to_eof(&first, &payload)?;
+            format!("conn=1 payload={payload:?}")
+        }
+        ClientScenario::SendRecvSend { first: a, second } => {
+            first.send_all(a.as_bytes())?;
+            let first_echo = first.recv_exact_string(a.len())?;
+            if first_echo != a {
+                return Err(HandlerError(format!(
+                    "first echo mismatch: expected {a:?}, got {first_echo:?}"
+                )));
+            }
+            first.send_all(second.as_bytes())?;
+            let second_echo = first.recv_exact_string(second.len())?;
+            if second_echo != second {
+                return Err(HandlerError(format!(
+                    "second echo mismatch: expected {second:?}, got {second_echo:?}"
+                )));
+            }
+            "conn=1 echoes exact".to_string()
+        }
+        ClientScenario::PartialRecv { payload, first_len } => {
+            first.send_all(payload.as_bytes())?;
+            let head = first.recv_exact_string(first_len)?;
+            let rest = first.recv_exact_string(payload.len() - first_len)?;
+            let combined = format!("{head}{rest}");
+            if combined != payload {
+                return Err(HandlerError(format!(
+                    "partial continuity mismatch: expected {payload:?}, got {combined:?}"
+                )));
+            }
+            format!("conn=1 split={first_len}+{}", rest.len())
+        }
+        ClientScenario::HalfcloseThenReconnect { first: a, second } => {
+            round_trip_to_eof(&first, &a)?;
+            drop(first);
+            let second_conn = TcpSocket::connect_loopback(port)?;
+            round_trip_to_eof(&second_conn, &second)?;
+            "first_conn=1 second_conn=2".to_string()
+        }
+    };
+    Ok(DetailOut { detail })
+}
+
+fn round_trip_to_eof(conn: &TcpSocket, payload: &str) -> Result<(), HandlerError> {
+    conn.send_all(payload.as_bytes())?;
+    conn.shutdown_write()?;
+    let echo = conn.recv_to_end_string()?;
     if echo == payload {
         Ok(())
     } else {
-        Err(format!("expected exact echo {payload:?}, got {echo:?}"))
+        Err(HandlerError(format!(
+            "expected exact echo {payload:?}, got {echo:?}"
+        )))
     }
 }
 
-fn expect_opened(resp: Response) -> Result<u64, String> {
-    match resp {
-        Response::Opened { conn } => Ok(conn),
-        other => Err(format!("expected Opened, got {other:?}")),
-    }
+fn join_server(
+    server: std::thread::JoinHandle<Result<u32, std::io::Error>>,
+) -> Result<u32, HandlerError> {
+    server
+        .join()
+        .map_err(|_| HandlerError("server thread panicked".to_string()))?
+        .map_err(HandlerError::from)
 }
 
-fn expect_sent(resp: Response) -> Result<(), String> {
-    match resp {
-        Response::Sent => Ok(()),
-        other => Err(format!("expected Sent, got {other:?}")),
-    }
-}
-
-fn expect_received(resp: Response) -> Result<String, String> {
-    match resp {
-        Response::Received { data } => Ok(data),
-        other => Err(format!("expected Received, got {other:?}")),
-    }
-}
-
-fn expect_shutdown(resp: Response) -> Result<(), String> {
-    match resp {
-        Response::ShutdownOk => Ok(()),
-        other => Err(format!("expected ShutdownOk, got {other:?}")),
-    }
-}
-
-fn expect_closed(resp: Response) -> Result<(), String> {
-    match resp {
-        Response::Closed => Ok(()),
-        other => Err(format!("expected Closed, got {other:?}")),
+fn detail_out(out: &DetailOut) -> Result<String, String> {
+    if out.detail.is_empty() {
+        Err("handler returned empty detail".to_string())
+    } else {
+        Ok(out.detail.clone())
     }
 }
