@@ -638,7 +638,9 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
 
         if offset.is_none() {
             self.litebox.descriptor_table().with_entry(fd, |desc| {
-                desc.entry.offset.fetch_add(bytes_read, Ordering::SeqCst);
+                desc.entry
+                    .offset
+                    .store(read_offset.saturating_add(bytes_read), Ordering::SeqCst);
             });
         }
 
@@ -671,7 +673,9 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
 
         if offset.is_none() {
             self.litebox.descriptor_table().with_entry(fd, |desc| {
-                desc.entry.offset.fetch_add(bytes_written, Ordering::SeqCst);
+                desc.entry
+                    .offset
+                    .store(write_offset.saturating_add(bytes_written), Ordering::SeqCst);
             });
         }
 
