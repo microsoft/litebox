@@ -768,25 +768,19 @@ impl<FS: ShimFS> UnixConnectedStream<FS> {
         buf: &mut [u8],
         seqpacket: bool,
         received_fds: &mut Vec<PassedFd>,
+        received_tokens: &mut Vec<litebox_common_linux::fd_transfer_frame::PassedToken>,
     ) -> Result<usize, TryOpError<Errno>> {
         match &self.transport {
             UnixTransport::Tcp { proxy, recv_reader } => {
                 use litebox::net::socket_channel::NetworkProxy;
-                // Phase B-Step8b: read smoltcp bytes into the
-                // per-stream FdTransferReader, peel any complete
-                // LBFD frames, copy decoded data bytes into the
-                // user buffer. Tokens are currently discarded; Phase
-                // 8e will materialize them into PassedFds.
                 let mut reader = recv_reader.lock();
 
-                // First, try to satisfy from any already-buffered
-                // complete frame.
-                if let Some(n) = Self::try_emit_from_reader(&mut reader, buf, received_fds)? {
+                if let Some(n) =
+                    Self::try_emit_from_reader(&mut reader, buf, received_fds, received_tokens)?
+                {
                     return Ok(n);
                 }
 
-                // Otherwise, pull more bytes from smoltcp. Heap-allocate
-                // the staging buffer to avoid a large stack frame.
                 let mut staging = alloc::vec![0u8; UNIX_BUF_SIZE];
                 let read_n = match proxy.as_ref() {
                     NetworkProxy::Stream(stream) => match stream.try_read(
@@ -809,22 +803,17 @@ impl<FS: ShimFS> UnixConnectedStream<FS> {
                     reader.push(&staging[..read_n]);
                 }
 
-                match Self::try_emit_from_reader(&mut reader, buf, received_fds)? {
+                match Self::try_emit_from_reader(&mut reader, buf, received_fds, received_tokens)? {
                     Some(n) => Ok(n),
-                    None if read_n == 0 => Ok(0), // EOF and no buffered frame
+                    None if read_n == 0 => Ok(0),
                     None => {
-                        // We got bytes but not a complete frame; for
-                        // SOCK_SEQPACKET callers expect "no data
-                        // yet". For SOCK_STREAM we could in principle
-                        // surface what we have, but the LBFD frame
-                        // is the message boundary — surface TryAgain
-                        // so the caller waits for the rest.
                         let _ = seqpacket;
                         Err(TryOpError::TryAgain)
                     }
                 }
             }
             UnixTransport::Channel { recv, .. } => {
+                let _ = received_tokens;
                 self.try_recvfrom_channel(recv, buf, seqpacket, received_fds)
             }
         }
@@ -834,8 +823,8 @@ impl<FS: ShimFS> UnixConnectedStream<FS> {
     /// the per-stream reader into the user buffer. Returns:
     ///
     /// - `Ok(Some(n))` — exactly `n` bytes copied into `buf`; the frame
-    ///   is fully consumed (any tokens are added to `_received_fds` once
-    ///   Step 8e wires that in).
+    ///   is fully consumed. Tokens from the frame are appended to
+    ///   `received_tokens` for the syscall handler to materialise.
     /// - `Ok(None)` — no complete frame buffered yet; the caller should
     ///   try to read more bytes from the underlying transport.
     /// - `Err(TryOpError::Other(EPROTO))` — the wire stream is corrupt /
@@ -844,25 +833,16 @@ impl<FS: ShimFS> UnixConnectedStream<FS> {
         reader: &mut FdTransferReader,
         buf: &mut [u8],
         _received_fds: &mut Vec<PassedFd>,
+        received_tokens: &mut Vec<litebox_common_linux::fd_transfer_frame::PassedToken>,
     ) -> Result<Option<usize>, TryOpError<Errno>> {
         match reader.take_frame() {
             Ok(Some(frame)) => {
-                // Phase 8b: ignore tokens for now. Phase 8e will translate
-                // them into PassedFd entries.
-                if !frame.tokens.is_empty() {
-                    // Until Step 8e: log-via-no-op and drop tokens. This
-                    // keeps cross-worker unix-socket data flow correct
-                    // for the no-fd case (most uses) while we land the
-                    // wire format.
-                }
+                // Phase B-Step8e/recv: hand tokens to the syscall
+                // handler which has task context to materialise them
+                // into EventFile entries.
+                received_tokens.extend(frame.tokens);
                 let copy_len = buf.len().min(frame.data.len());
                 buf[..copy_len].copy_from_slice(&frame.data[..copy_len]);
-                // Note: if frame.data.len() > buf.len(), the tail is
-                // dropped here. This matches Linux SOCK_SEQPACKET-without-
-                // MSG_TRUNC behaviour. For SOCK_STREAM with a small buf,
-                // this loses bytes — Phase 8e will add an internal "frame
-                // tail" buffer in FdTransferReader to handle partial
-                // delivery.
                 Ok(Some(copy_len))
             }
             Ok(None) => Ok(None),
@@ -1418,6 +1398,7 @@ impl<FS: ShimFS> UnixStream<FS> {
         mut source_addr: Option<&mut Option<UnixSocketAddr>>,
         seqpacket: bool,
         received_fds: &mut Vec<PassedFd>,
+        received_tokens: &mut Vec<litebox_common_linux::fd_transfer_frame::PassedToken>,
     ) -> Result<usize, Errno> {
         cx.with_timeout(timeout)
             .wait_on_events(
@@ -1435,7 +1416,7 @@ impl<FS: ShimFS> UnixStream<FS> {
                         let conn = state
                             .connected()
                             .ok_or(TryOpError::Other(Errno::ENOTCONN))?;
-                        let n = conn.try_recvfrom(buf, seqpacket, received_fds)?;
+                        let n = conn.try_recvfrom(buf, seqpacket, received_fds, received_tokens)?;
                         // For connected stream sockets, no need to return the source address
                         if let Some(source_addr) = source_addr.as_deref_mut() {
                             *source_addr = None;
@@ -2094,6 +2075,7 @@ impl<FS: ShimFS> UnixSocket<FS> {
         flags: ReceiveFlags,
         source_addr: Option<&mut Option<UnixSocketAddr>>,
         received_fds: &mut Vec<PassedFd>,
+        received_tokens: &mut Vec<litebox_common_linux::fd_transfer_frame::PassedToken>,
     ) -> Result<usize, Errno> {
         let supported_flags =
             ReceiveFlags::DONTWAIT | ReceiveFlags::NOSIGNAL | ReceiveFlags::CMSG_CLOEXEC;
@@ -2114,8 +2096,10 @@ impl<FS: ShimFS> UnixSocket<FS> {
                 source_addr,
                 seqpacket,
                 received_fds,
+                received_tokens,
             ),
             UnixSocketInner::Datagram(datagram) => {
+                let _ = received_tokens;
                 datagram.recvfrom(cx, timeout, buf, is_nonblocking, source_addr, received_fds)
             }
         };
@@ -2493,10 +2477,13 @@ mod lbfd_framing_tests {
         buf: &mut [u8],
     ) -> Result<Option<usize>, TryOpError<Errno>> {
         let mut received_fds: Vec<PassedFd> = Vec::new();
+        let mut received_tokens: Vec<litebox_common_linux::fd_transfer_frame::PassedToken> =
+            Vec::new();
         UnixConnectedStream::<crate::DefaultFS>::try_emit_from_reader(
             reader,
             buf,
             &mut received_fds,
+            &mut received_tokens,
         )
     }
 

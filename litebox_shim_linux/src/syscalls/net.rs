@@ -2553,6 +2553,8 @@ impl<FS: ShimFS> Task<FS> {
         let want_source = msg_name.as_usize() != 0;
         let mut source_addr = None;
         let mut received_fds = Vec::new();
+        let mut received_tokens: Vec<litebox_common_linux::fd_transfer_frame::PassedToken> =
+            Vec::new();
         let size = self.do_recvfrom_with_fds(
             sockfd,
             &mut recv_buf,
@@ -2563,6 +2565,7 @@ impl<FS: ShimFS> Task<FS> {
                 None
             },
             &mut received_fds,
+            &mut received_tokens,
         )?;
 
         let copied_len = size.min(recv_buf.len());
@@ -2597,16 +2600,64 @@ impl<FS: ShimFS> Task<FS> {
         }
 
         // Install received fds and format SCM_RIGHTS control message.
-        if received_fds.is_empty() {
+        // Phase B-Step8e/recv: tokens (cross-worker broker-backed
+        // handles, e.g. eventfds passed via LBFD) are materialised
+        // alongside received_fds. Materialised tokens contribute fresh
+        // raw fds into `installed_fds` and are surfaced through the
+        // same SCM_RIGHTS control message as ordinary received fds —
+        // the user-space recipient cannot distinguish a broker-backed
+        // eventfd from a local one.
+        if received_fds.is_empty() && received_tokens.is_empty() {
             hdr.msg_controllen = 0;
         } else {
-            let mut installed_fds = Vec::with_capacity(received_fds.len());
+            let mut installed_fds = Vec::with_capacity(received_fds.len() + received_tokens.len());
             {
                 let files = self.files.borrow();
                 let mut rds = files.raw_descriptor_store.write();
                 for passed_fd in received_fds {
                     let raw_fd = rds.insert_passed_fd(passed_fd);
                     installed_fds.push(i32::try_from(raw_fd).unwrap_or(i32::MAX));
+                }
+            }
+
+            // Materialise broker tokens into descriptor table entries.
+            for token in received_tokens {
+                use litebox_common_linux::fd_transfer_frame::SubsystemTag;
+                match token.tag() {
+                    SubsystemTag::Eventfd => {
+                        let Some(provider) = super::eventfd::broker_eventfd_provider() else {
+                            // No provider on this worker — drop the
+                            // token; broker will eventually release
+                            // when sender closes its own ref. Without
+                            // a provider we cannot materialise.
+                            continue;
+                        };
+                        let handle_id = token.id();
+                        let eventfd = super::eventfd::EventFile::new_broker_backed(
+                            provider,
+                            handle_id,
+                            litebox_common_linux::EfdFlags::empty(),
+                        );
+                        let mut dt = self.global.litebox.descriptor_table_mut();
+                        let typed = dt.insert::<super::eventfd::EventfdSubsystem>(eventfd);
+                        drop(dt);
+                        let files = self.files.borrow();
+                        match files.insert_raw_fd(typed) {
+                            Ok(raw_fd) => {
+                                installed_fds.push(i32::try_from(raw_fd).unwrap_or(i32::MAX));
+                            }
+                            Err(typed) => {
+                                self.global
+                                    .litebox
+                                    .descriptor_table_mut()
+                                    .remove(&typed)
+                                    .unwrap();
+                            }
+                        }
+                    }
+                    SubsystemTag::TcpSocket | SubsystemTag::Unknown(_) => {
+                        // Unsupported token kind on this worker; drop.
+                    }
                 }
             }
 
@@ -2647,7 +2698,14 @@ impl<FS: ShimFS> Task<FS> {
             let n = if is_peek { nl.peek(buf) } else { nl.recv(buf) };
             return Ok(if is_trunc { data_len } else { n });
         }
-        self.do_recvfrom_with_fds(sockfd, buf, flags, source_addr, &mut Vec::new())
+        self.do_recvfrom_with_fds(
+            sockfd,
+            buf,
+            flags,
+            source_addr,
+            &mut Vec::new(),
+            &mut Vec::new(),
+        )
     }
 
     fn do_recvfrom_with_fds(
@@ -2657,13 +2715,12 @@ impl<FS: ShimFS> Task<FS> {
         flags: ReceiveFlags,
         source_addr: Option<&mut Option<SocketAddress>>,
         received_fds: &mut Vec<super::unix::PassedFd>,
+        received_tokens: &mut Vec<litebox_common_linux::fd_transfer_frame::PassedToken>,
     ) -> Result<usize, Errno> {
         let want_source = source_addr.is_some();
         let files = self.files.borrow();
         let raw_fd = usize::try_from(sockfd).or(Err(Errno::EBADF))?;
         let (size, addr) = {
-            // We need to do this cell dance because otherwise Rust can't recognize that the two
-            // closures are mutually exclusive.
             let buf: core::cell::RefCell<&mut [u8]> = core::cell::RefCell::new(buf);
             files.with_socket(
                 &self.global,
@@ -2688,6 +2745,7 @@ impl<FS: ShimFS> Task<FS> {
                         flags,
                         if want_source { Some(&mut addr) } else { None },
                         received_fds,
+                        received_tokens,
                     )?;
                     let src_addr = addr.map(SocketAddress::Unix);
                     Ok((size, src_addr))

@@ -10113,6 +10113,7 @@ impl<FS: ShimFS> litebox::process::WorkerExecStreamReader for UnixSocketStreamRe
                     litebox_common_linux::ReceiveFlags::empty(),
                     None,
                     &mut Vec::new(),
+                    &mut Vec::new(),
                 )
             })
             .map_err(|_| ())
