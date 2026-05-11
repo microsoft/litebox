@@ -9,9 +9,10 @@
 //! compatibility with POSIX semantics.
 
 use alloc::string::String;
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::num::NonZeroUsize;
-use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, Ordering};
 
 use thiserror::Error;
 
@@ -591,7 +592,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
 
         let descriptor = Descriptor {
             fid: new_fid,
-            offset: AtomicUsize::new(0),
+            offset: Arc::new(sync::Mutex::new(0)),
             qid: new_qid,
         };
 
@@ -613,37 +614,27 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
         buf: &mut [u8],
         offset: Option<usize>,
     ) -> Result<usize, super::errors::ReadError> {
-        // Clone the Fid Arc out of the descriptor and release the table lock
-        // before issuing the (potentially blocking) 9P call. The Arc keeps the
-        // pool slot reserved for as long as the read is in flight, so `close`
-        // on another thread cannot cause the fid value to be reassigned to a
-        // different file.
-        let (fid, current_offset) = self
+        // Clone the fid and offset lock out of the descriptor and release the
+        // table lock before issuing the potentially blocking 9P call. The fid
+        // keeps the pool slot reserved while the offset lock serializes
+        // implicit-offset I/O on this descriptor.
+        let (fid, descriptor_offset) = self
             .litebox
             .descriptor_table()
             .with_entry(fd, |desc| {
-                (
-                    desc.entry.fid.clone(),
-                    desc.entry.offset.load(Ordering::SeqCst),
-                )
+                (desc.entry.fid.clone(), Arc::clone(&desc.entry.offset))
             })
             .ok_or(super::errors::ReadError::ClosedFd)?;
 
-        let read_offset = match offset {
-            Some(o) => o,
-            None => current_offset,
-        };
-
-        let bytes_read = self.client.read(&fid, read_offset as u64, buf)?;
-
-        if offset.is_none() {
-            self.litebox.descriptor_table().with_entry(fd, |desc| {
-                desc.entry
-                    .offset
-                    .store(read_offset.saturating_add(bytes_read), Ordering::SeqCst);
-            });
+        if let Some(read_offset) = offset {
+            return Ok(self.client.read(&fid, read_offset as u64, buf)?);
         }
 
+        let mut current_offset = descriptor_offset.lock();
+        let bytes_read = self.client.read(&fid, *current_offset as u64, buf)?;
+        *current_offset = current_offset
+            .checked_add(bytes_read)
+            .ok_or(super::errors::ReadError::Io)?;
         Ok(bytes_read)
     }
 
@@ -653,32 +644,23 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
         buf: &[u8],
         offset: Option<usize>,
     ) -> Result<usize, super::errors::WriteError> {
-        let (fid, current_offset) = self
+        let (fid, descriptor_offset) = self
             .litebox
             .descriptor_table()
             .with_entry(fd, |desc| {
-                (
-                    desc.entry.fid.clone(),
-                    desc.entry.offset.load(Ordering::SeqCst),
-                )
+                (desc.entry.fid.clone(), Arc::clone(&desc.entry.offset))
             })
             .ok_or(super::errors::WriteError::ClosedFd)?;
 
-        let write_offset = match offset {
-            Some(o) => o,
-            None => current_offset,
-        };
-
-        let bytes_written = self.client.write(&fid, write_offset as u64, buf)?;
-
-        if offset.is_none() {
-            self.litebox.descriptor_table().with_entry(fd, |desc| {
-                desc.entry
-                    .offset
-                    .store(write_offset.saturating_add(bytes_written), Ordering::SeqCst);
-            });
+        if let Some(write_offset) = offset {
+            return Ok(self.client.write(&fid, write_offset as u64, buf)?);
         }
 
+        let mut current_offset = descriptor_offset.lock();
+        let bytes_written = self.client.write(&fid, *current_offset as u64, buf)?;
+        *current_offset = current_offset
+            .checked_add(bytes_written)
+            .ok_or(super::errors::WriteError::Io)?;
         Ok(bytes_written)
     }
 
@@ -688,32 +670,33 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
         offset: isize,
         whence: super::SeekWhence,
     ) -> Result<usize, SeekError> {
-        let (fid, current_offset) = self
+        let (fid, descriptor_offset) = self
             .litebox
             .descriptor_table()
             .with_entry(fd, |desc| {
-                (
-                    desc.entry.fid.clone(),
-                    desc.entry.offset.load(Ordering::SeqCst),
-                )
+                (desc.entry.fid.clone(), Arc::clone(&desc.entry.offset))
             })
             .ok_or(SeekError::ClosedFd)?;
 
-        let base = match whence {
+        let new_offset = match whence {
             super::SeekWhence::RelativeToBeginning => 0,
-            super::SeekWhence::RelativeToCurrentOffset => current_offset,
+            super::SeekWhence::RelativeToCurrentOffset => {
+                let mut current_offset = descriptor_offset.lock();
+                let new_offset = current_offset
+                    .checked_add_signed(offset)
+                    .ok_or(SeekError::InvalidOffset)?;
+                *current_offset = new_offset;
+                return Ok(new_offset);
+            }
             super::SeekWhence::RelativeToEnd => {
                 let attr = self.client.getattr(&fid, fcall::GetattrMask::SIZE)?;
                 usize::try_from(attr.stat.size).map_err(|_| Error::InvalidResponse)?
             }
-        };
-        let new_offset = base
-            .checked_add_signed(offset)
-            .ok_or(SeekError::InvalidOffset)?;
+        }
+        .checked_add_signed(offset)
+        .ok_or(SeekError::InvalidOffset)?;
 
-        self.litebox.descriptor_table().with_entry(fd, |desc| {
-            desc.entry.offset.store(new_offset, Ordering::SeqCst);
-        });
+        *descriptor_offset.lock() = new_offset;
         Ok(new_offset)
     }
 
@@ -723,10 +706,16 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
         length: usize,
         reset_offset: bool,
     ) -> Result<(), super::errors::TruncateError> {
-        let (fid, qid) = self
+        let (fid, qid, descriptor_offset) = self
             .litebox
             .descriptor_table()
-            .with_entry(fd, |desc| (desc.entry.fid.clone(), desc.entry.qid))
+            .with_entry(fd, |desc| {
+                (
+                    desc.entry.fid.clone(),
+                    desc.entry.qid,
+                    Arc::clone(&desc.entry.offset),
+                )
+            })
             .ok_or(super::errors::TruncateError::ClosedFd)?;
 
         if qid.typ.contains(fcall::QidType::DIR) {
@@ -744,9 +733,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
         self.client.setattr(&fid, fcall::SetattrMask::SIZE, stat)?;
 
         if reset_offset {
-            self.litebox.descriptor_table().with_entry(fd, |desc| {
-                desc.entry.offset.store(0, Ordering::SeqCst);
-            });
+            *descriptor_offset.lock() = 0;
         }
 
         Ok(())
@@ -905,7 +892,7 @@ struct Descriptor<Platform: sync::RawSyncPrimitivesProvider> {
     /// operations keep the pool slot reserved across `close`.
     fid: client::Fid<Platform>,
     /// Current file offset (9P doesn't track this server-side)
-    offset: AtomicUsize,
+    offset: Arc<sync::Mutex<Platform, usize>>,
     /// The qid of the file (contains type and unique ID)
     qid: fcall::Qid,
 }
