@@ -543,4 +543,80 @@ mod tests {
         client.release(handle).expect("release");
         assert_eq!(state_registry.live_handle_count(), 0);
     }
+
+    #[test]
+    fn end_to_end_broker_eventfd_facade() {
+        // Uses BrokerEventfd + NotificationDispatcher — the full
+        // worker-side experience workers will eventually use through
+        // the shim once Step 7b lands the Platform-trait indirection.
+        use litebox_common_linux::broker_eventfd::{
+            BrokerEventfd, NotificationCallback, NotificationDispatcher,
+        };
+        use litebox_common_linux::notification_frame::{NOTIFY_EVENT_IN, NOTIFY_EVENT_OUT};
+        use litebox_common_linux::notification_ring::NotificationReceiver;
+        use litebox_common_linux::shmem_ring::ShmemRingPair;
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        struct AccumCallback(AtomicU32);
+        impl NotificationCallback for AccumCallback {
+            fn on_events(&self, events: u32) {
+                self.0.fetch_or(events, Ordering::SeqCst);
+            }
+        }
+
+        let (_dir, path, _fd_registry, state_registry) = spawn_test_listener();
+        let client = Arc::new(FdTokenClient::connect(&path).expect("connect"));
+
+        // Set up the notification ring.
+        let (pair, tx_fd, rx_fd) = ShmemRingPair::create().expect("ring create");
+        let (_worker_writer_unused, worker_reader) = pair.into_parts();
+        client
+            .register_notification_ring(tx_fd, rx_fd)
+            .expect("register_notification_ring");
+        let dispatcher = NotificationDispatcher::start(NotificationReceiver::new(worker_reader));
+
+        // Create eventfd via BrokerEventfd facade.
+        let efd = BrokerEventfd::create(Arc::clone(&client), 0, false).expect("create");
+
+        // Subscribe with a callback that ORs together all observed events.
+        let cb = Arc::new(AccumCallback(AtomicU32::new(0)));
+        let sub_id = efd
+            .subscribe(
+                &dispatcher,
+                NOTIFY_EVENT_IN | NOTIFY_EVENT_OUT,
+                Arc::clone(&cb) as Arc<dyn NotificationCallback>,
+            )
+            .expect("subscribe");
+
+        // Write 1 → expect IN+OUT events (after counter changes).
+        efd.write(1).expect("write");
+
+        // Wait for the IN bit to appear in the callback (initially OUT
+        // arrives via priming, then IN+OUT arrives after write).
+        for _ in 0..50 {
+            let e = cb.0.load(Ordering::SeqCst);
+            if e & NOTIFY_EVENT_IN != 0 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let observed = cb.0.load(Ordering::SeqCst);
+        assert!(
+            observed & NOTIFY_EVENT_IN != 0,
+            "expected IN bit in observed events, got 0x{observed:x}"
+        );
+        assert!(
+            observed & NOTIFY_EVENT_OUT != 0,
+            "expected OUT bit (from priming) in observed events, got 0x{observed:x}"
+        );
+
+        // Read returns 1.
+        let value = efd.read().expect("read");
+        assert_eq!(value, 1);
+
+        // Unsubscribe + close.
+        efd.unsubscribe(&dispatcher, sub_id).expect("unsubscribe");
+        efd.close().expect("close");
+        assert_eq!(state_registry.live_handle_count(), 0);
+    }
 }
