@@ -44,10 +44,6 @@ enum BackgroundProcess {
     },
 }
 
-fn errno() -> i32 {
-    std::io::Error::last_os_error().raw_os_error().unwrap_or(0)
-}
-
 fn marker_stream_matches(configured: &str, actual: &str) -> bool {
     matches!(configured, "either") || configured == actual
 }
@@ -1503,31 +1499,6 @@ async fn agent_loop(self_exe: &str) {
                 match result {
                     Ok(msg) => respond(&Response::Ok { data: Some(msg) }).await,
                     Err(e) => respond(&Response::Error { error: e }).await,
-                }
-            }
-
-            Command::EpollOpen => {
-                // SAFETY: epoll_create1 takes an integer flag word and returns
-                // a new fd or -1; no pointers or aliases are involved.
-                let ret = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
-                if ret >= 0 {
-                    // Close immediately; the test only asserts that epoll can
-                    // still create an fd after io_uring_setup probing.
-                    // SAFETY: `ret` is a fresh fd returned by epoll_create1.
-                    unsafe {
-                        libc::close(ret);
-                    }
-                    respond(&Response::EpollOpenResult {
-                        epoll_fd: 1,
-                        errno: None,
-                    })
-                    .await;
-                } else {
-                    respond(&Response::EpollOpenResult {
-                        epoll_fd: -1,
-                        errno: Some(errno()),
-                    })
-                    .await;
                 }
             }
 

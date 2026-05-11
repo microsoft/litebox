@@ -374,10 +374,6 @@ pub enum Command {
     PipePairIdUnique { count: u32 },
 
 
-    /// Call `epoll_create1(2)` once and report whether a descriptor was returned.
-    #[serde(rename = "epoll_open")]
-    EpollOpen,
-
     /// Open an eventfd and register it in this agent's local registry.
     /// Flags are parsed from strings like "semaphore|nonblock|cloexec".
     #[serde(rename = "eventfd_open")]
@@ -555,10 +551,6 @@ pub enum Response {
     #[serde(rename = "ready")]
     Ready,
 
-
-    /// `epoll_create1(2)` result. `errno` is a positive errno on failure.
-    #[serde(rename = "epoll_open_result")]
-    EpollOpenResult { epoll_fd: i32, errno: Option<i32> },
 
     /// Error.
     #[serde(rename = "error")]
