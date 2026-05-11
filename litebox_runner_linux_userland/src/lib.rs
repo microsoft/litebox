@@ -2795,6 +2795,14 @@ fn register_worker_spawn_flags(platform: &Platform, cli_args: &CliArgs) {
         flags.push(std::ffi::CString::new("--nine-p-broker").unwrap());
         flags.push(std::ffi::CString::new(broker.as_bytes()).unwrap());
     }
+    // Phase B-Step12: propagate fd-token broker path so each
+    // worker (worker_exec / fork_restore) connects independently
+    // and installs its own broker eventfd provider. Mirrors the
+    // --network-broker / --nine-p-broker per-worker pattern.
+    if let Some(ref broker) = cli_args.fd_token_broker {
+        flags.push(std::ffi::CString::new("--fd-token-broker").unwrap());
+        flags.push(std::ffi::CString::new(broker.as_bytes()).unwrap());
+    }
     if let Some(ref initial_files) = cli_args.initial_files {
         flags.push(std::ffi::CString::new("--initial-files").unwrap());
         flags
