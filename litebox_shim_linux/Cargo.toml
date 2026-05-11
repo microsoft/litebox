@@ -29,6 +29,7 @@ audit_log = []
 [dev-dependencies]
 spin = { version = "0.9.8", default-features = false, features = ["spin_mutex"] }
 tempfile = "3"
+litebox_broker = { path = "../litebox_broker" }
 
 [target.'cfg(target_os = "linux")'.dev-dependencies]
 libc = "0.2.177"

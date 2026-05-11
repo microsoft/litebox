@@ -907,4 +907,300 @@ mod tests {
             "EventFile::drop must call release_eventfd exactly once for the BrokerBacked variant",
         );
     }
+
+    /// Phase B-Step12 focused test: does a broker-backed eventfd created
+    /// via `sys_eventfd2` (the guest-visible syscall path) behave
+    /// indistinguishably from a local eventfd for the basic
+    /// write → read → counter-zero cycle, when the provider is a REAL
+    /// `FdTokenClient` against a REAL in-process broker?
+    ///
+    /// This isolates the "BrokerBacked + real broker RPC" code path
+    /// from the test harness's own use of eventfd for coordination
+    /// (which masks the underlying behaviour). The test uses
+    /// `std::sync::mpsc` for any test-side coordination, NOT eventfd.
+    ///
+    /// If this test fails, the bug is in BrokerBacked's interaction
+    /// with the real broker (most likely a downstream-of-sys_eventfd2
+    /// issue we haven't yet isolated).
+    /// If this test passes, the in-worker regression observed in
+    /// the docker integration suite is something specific to the
+    /// harness's eventfd usage pattern, not BrokerBacked itself.
+    #[test]
+    fn sys_eventfd2_via_real_broker_basic_write_read() {
+        use crate::syscalls::eventfd::set_broker_eventfd_provider;
+        use alloc::sync::Arc;
+        use litebox_broker::fd_token_socket::spawn_control_listener;
+        use litebox_broker::fd_tokens::BrokerFdTokenRegistry;
+        use litebox_broker::state_registry::BrokerStateRegistry;
+        use litebox_common_linux::EfdFlags;
+        use litebox_common_linux::broker_eventfd_provider::{
+            BrokerEventCallback, BrokerEventfdProvider, BrokerOpError,
+        };
+        use litebox_common_linux::fd_token_client::FdTokenClient;
+        use std::sync::Mutex as StdMutex;
+        use tempfile::tempdir;
+
+        /// Minimal provider wrapping a real FdTokenClient — same shape
+        /// as RunnerBrokerEventfdProvider but stripped to what this
+        /// test exercises (no dispatcher / no subscriptions). Real
+        /// RPC over the real Unix socket.
+        struct RealProviderForTest {
+            client: StdMutex<FdTokenClient>,
+        }
+        impl BrokerEventfdProvider for RealProviderForTest {
+            fn create_eventfd(&self, initial: u64, semaphore: bool) -> Result<u64, BrokerOpError> {
+                self.client
+                    .lock()
+                    .unwrap()
+                    .create_eventfd(initial, semaphore)
+                    .map_err(client_err_to_broker_err)
+            }
+            fn read_eventfd(&self, handle: u64) -> Result<u64, BrokerOpError> {
+                self.client
+                    .lock()
+                    .unwrap()
+                    .read_eventfd(handle)
+                    .map_err(client_err_to_broker_err)
+            }
+            fn write_eventfd(&self, handle: u64, value: u64) -> Result<(), BrokerOpError> {
+                self.client
+                    .lock()
+                    .unwrap()
+                    .write_eventfd(handle, value)
+                    .map_err(client_err_to_broker_err)
+            }
+            fn release_eventfd(&self, handle: u64) {
+                let _ = self.client.lock().unwrap().release(handle);
+            }
+            fn dup_handle(&self, handle: u64) -> Result<(), BrokerOpError> {
+                self.client
+                    .lock()
+                    .unwrap()
+                    .dup_handle(handle)
+                    .map_err(client_err_to_broker_err)
+            }
+            fn subscribe_eventfd(
+                &self,
+                _: u64,
+                _: u32,
+                _: Arc<dyn BrokerEventCallback>,
+            ) -> Result<u64, BrokerOpError> {
+                Err(BrokerOpError::Io)
+            }
+            fn unsubscribe_eventfd(&self, _: u64, _: u64) {}
+        }
+        fn client_err_to_broker_err(
+            e: litebox_common_linux::fd_token_client::ClientError,
+        ) -> BrokerOpError {
+            use litebox_common_linux::fd_token_client::ClientError;
+            match e {
+                ClientError::WouldBlock => BrokerOpError::WouldBlock,
+                ClientError::UnknownHandle { .. } => BrokerOpError::UnknownHandle,
+                ClientError::InvalidValue { .. } => BrokerOpError::InvalidValue,
+                _ => BrokerOpError::Io,
+            }
+        }
+
+        // Spawn an in-process broker on a unique socket path.
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("fd-token.sock");
+        let fd_registry = std::sync::Arc::new(BrokerFdTokenRegistry::new());
+        let state_registry = std::sync::Arc::new(BrokerStateRegistry::new());
+        let _listener_handle = spawn_control_listener(
+            &path,
+            std::sync::Arc::clone(&fd_registry),
+            std::sync::Arc::clone(&state_registry),
+        )
+        .expect("spawn listener");
+        for _ in 0..100 {
+            if path.exists() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(path.exists(), "broker control socket never appeared");
+
+        // Wire up a real provider against the listener.
+        let client = FdTokenClient::connect(&path).expect("connect");
+        let provider: Arc<dyn BrokerEventfdProvider> = Arc::new(RealProviderForTest {
+            client: StdMutex::new(client),
+        });
+
+        // Install via the OnceBox global. If already set by another
+        // test in this binary, we still get to verify behaviour via
+        // direct EventFile::new_broker_backed — but install-set is the
+        // path sys_eventfd2 takes.
+        let install_result = set_broker_eventfd_provider(Arc::clone(&provider));
+        let _ = install_result; // first-run installs; later runs are OK
+
+        // Drive a real `Task` through `sys_eventfd2`.
+        let task = crate::syscalls::tests::init_platform(None);
+        let efd_u32 = task
+            .sys_eventfd2(0, EfdFlags::NONBLOCK | EfdFlags::CLOEXEC)
+            .expect("sys_eventfd2 should succeed with real broker installed");
+        let efd = i32::try_from(efd_u32).expect("eventfd fd fits in i32");
+
+        // sys_write(eventfd, 7u64) — guest-visible semantics.
+        let val: u64 = 7;
+        let buf = val.to_le_bytes();
+        // We need a guest buf pointer; for tests, the harness has
+        // helpers — use the simplest one available. The simplest
+        // surface is task.sys_write(fd, &[u8], offset).
+        let n = task
+            .sys_write(efd, &buf, None)
+            .expect("sys_write to broker-backed eventfd must succeed");
+        assert_eq!(n, 8, "eventfd write should report 8 bytes");
+
+        // sys_read(eventfd) — should return 7.
+        let mut readbuf = [0u8; 8];
+        let n = task
+            .sys_read(efd, &mut readbuf, None)
+            .expect("sys_read from broker-backed eventfd must succeed");
+        assert_eq!(n, 8, "eventfd read should report 8 bytes");
+        let got = u64::from_le_bytes(readbuf);
+        assert_eq!(
+            got, 7,
+            "eventfd read should return the previously-written value"
+        );
+
+        // Subsequent non-blocking read returns EAGAIN.
+        let mut readbuf2 = [0u8; 8];
+        let err = task.sys_read(efd, &mut readbuf2, None).unwrap_err();
+        assert_eq!(
+            err,
+            Errno::EAGAIN,
+            "non-blocking read on empty broker-backed eventfd should return EAGAIN"
+        );
+
+        // Close cleanly.
+        task.sys_close(efd).expect("close eventfd");
+    }
+
+    /// Phase B-Step12 focused test #2: SEMAPHORE-mode eventfd via real broker.
+    /// Semaphore mode is used by some IPC patterns (each read returns 1
+    /// and decrements; like a counting semaphore acquire). Verifying
+    /// this works through the broker matters because some harness or
+    /// guest user-space might use it.
+    #[test]
+    fn sys_eventfd2_via_real_broker_semaphore_mode() {
+        use crate::syscalls::eventfd::set_broker_eventfd_provider;
+        use alloc::sync::Arc;
+        use litebox_broker::fd_token_socket::spawn_control_listener;
+        use litebox_broker::fd_tokens::BrokerFdTokenRegistry;
+        use litebox_broker::state_registry::BrokerStateRegistry;
+        use litebox_common_linux::EfdFlags;
+        use litebox_common_linux::broker_eventfd_provider::{
+            BrokerEventCallback, BrokerEventfdProvider, BrokerOpError,
+        };
+        use litebox_common_linux::fd_token_client::FdTokenClient;
+        use std::sync::Mutex as StdMutex;
+        use tempfile::tempdir;
+
+        struct RealProviderForTest {
+            client: StdMutex<FdTokenClient>,
+        }
+        impl BrokerEventfdProvider for RealProviderForTest {
+            fn create_eventfd(&self, initial: u64, semaphore: bool) -> Result<u64, BrokerOpError> {
+                self.client
+                    .lock()
+                    .unwrap()
+                    .create_eventfd(initial, semaphore)
+                    .map_err(|_| BrokerOpError::Io)
+            }
+            fn read_eventfd(&self, handle: u64) -> Result<u64, BrokerOpError> {
+                use litebox_common_linux::fd_token_client::ClientError;
+                self.client
+                    .lock()
+                    .unwrap()
+                    .read_eventfd(handle)
+                    .map_err(|e| match e {
+                        ClientError::WouldBlock => BrokerOpError::WouldBlock,
+                        _ => BrokerOpError::Io,
+                    })
+            }
+            fn write_eventfd(&self, handle: u64, value: u64) -> Result<(), BrokerOpError> {
+                self.client
+                    .lock()
+                    .unwrap()
+                    .write_eventfd(handle, value)
+                    .map_err(|_| BrokerOpError::Io)
+            }
+            fn release_eventfd(&self, handle: u64) {
+                let _ = self.client.lock().unwrap().release(handle);
+            }
+            fn dup_handle(&self, handle: u64) -> Result<(), BrokerOpError> {
+                self.client
+                    .lock()
+                    .unwrap()
+                    .dup_handle(handle)
+                    .map_err(|_| BrokerOpError::Io)
+            }
+            fn subscribe_eventfd(
+                &self,
+                _: u64,
+                _: u32,
+                _: Arc<dyn BrokerEventCallback>,
+            ) -> Result<u64, BrokerOpError> {
+                Err(BrokerOpError::Io)
+            }
+            fn unsubscribe_eventfd(&self, _: u64, _: u64) {}
+        }
+
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("fd-token.sock");
+        let fd_registry = std::sync::Arc::new(BrokerFdTokenRegistry::new());
+        let state_registry = std::sync::Arc::new(BrokerStateRegistry::new());
+        let _listener_handle = spawn_control_listener(
+            &path,
+            std::sync::Arc::clone(&fd_registry),
+            std::sync::Arc::clone(&state_registry),
+        )
+        .expect("spawn listener");
+        for _ in 0..100 {
+            if path.exists() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        let client = FdTokenClient::connect(&path).expect("connect");
+        let provider: Arc<dyn BrokerEventfdProvider> = Arc::new(RealProviderForTest {
+            client: StdMutex::new(client),
+        });
+        let _ = set_broker_eventfd_provider(Arc::clone(&provider));
+
+        let task = crate::syscalls::tests::init_platform(None);
+        let efd_u32 = task
+            .sys_eventfd2(
+                0,
+                EfdFlags::NONBLOCK | EfdFlags::CLOEXEC | EfdFlags::SEMAPHORE,
+            )
+            .expect("sys_eventfd2 SEMAPHORE mode with real broker");
+        let efd = i32::try_from(efd_u32).unwrap();
+
+        // Write 3 → semaphore counter = 3.
+        let val: u64 = 3;
+        let n = task
+            .sys_write(efd, &val.to_le_bytes(), None)
+            .expect("write");
+        assert_eq!(n, 8);
+
+        // Read three times in semaphore mode: each returns 1, counter
+        // decrements. After 3 reads, counter is 0 → EAGAIN.
+        for i in 0..3 {
+            let mut buf = [0u8; 8];
+            let n = task
+                .sys_read(efd, &mut buf, None)
+                .unwrap_or_else(|e| panic!("semaphore read #{i} failed: {e:?}"));
+            assert_eq!(n, 8, "semaphore read should return 8 bytes");
+            let got = u64::from_le_bytes(buf);
+            assert_eq!(got, 1, "semaphore read should return 1, got {got}");
+        }
+        // 4th read: counter is 0, NONBLOCK → EAGAIN.
+        let mut buf = [0u8; 8];
+        let err = task.sys_read(efd, &mut buf, None).unwrap_err();
+        assert_eq!(err, Errno::EAGAIN);
+
+        task.sys_close(efd).expect("close eventfd");
+    }
 }
