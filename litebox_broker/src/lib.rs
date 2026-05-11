@@ -18,3 +18,4 @@ pub mod policy;
 pub mod sandbox_policy;
 pub mod sock_compat;
 pub mod state_registry;
+pub mod subscription_list;
