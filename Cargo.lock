@@ -1794,6 +1794,7 @@ dependencies = [
  "glob",
  "libc",
  "litebox",
+ "litebox_broker",
  "litebox_common_linux",
  "litebox_platform_linux_userland",
  "litebox_platform_multiplex",
@@ -1803,6 +1804,8 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "tempfile",
+ "tracing",
  "walkdir",
 ]
 

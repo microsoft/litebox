@@ -11,6 +11,8 @@ use std::path::{Path, PathBuf};
 
 extern crate alloc;
 
+pub mod broker_eventfd_provider;
+
 /// Run Linux programs with LiteBox on unmodified Linux
 #[derive(Parser, Debug)]
 #[allow(clippy::struct_excessive_bools)]
