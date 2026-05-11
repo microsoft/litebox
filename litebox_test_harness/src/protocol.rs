@@ -167,42 +167,6 @@ pub enum Command {
     #[serde(rename = "net_get_sockopt")]
     NetGetSockOpt { conn: u64, option: SockOpt },
 
-    /// Open `pidfd_open(pid)` and add that pidfd to a registered epoll instance.
-    #[serde(rename = "epoll_add_pidfd")]
-    EpollAddPidfd {
-        epoll: u64,
-        pid: u32,
-        events: String,
-    },
-
-    /// Add a registered TCP connection fd to a registered epoll instance.
-    #[serde(rename = "epoll_add_socket")]
-    EpollAddSocket {
-        epoll: u64,
-        conn: u64,
-        events: String,
-    },
-
-    /// Add a registered eventfd to a registered epoll instance.
-    #[serde(rename = "epoll_add_eventfd")]
-    EpollAddEventfd {
-        epoll: u64,
-        eventfd_id: u64,
-        events: String,
-    },
-
-    /// Wait on a registered epoll instance.
-    #[serde(rename = "epoll_wait")]
-    EpollWait {
-        epoll: u64,
-        timeout_ms: i32,
-        max_events: u32,
-    },
-
-    /// Close and unregister an epoll instance.
-    #[serde(rename = "epoll_close")]
-    EpollClose { epoll: u64 },
-
     /// Connect to addr, send data, read echo response.
     #[serde(rename = "net_connect")]
     NetConnect { addr: String, data: String },
@@ -414,12 +378,6 @@ pub enum Command {
     #[serde(rename = "epoll_open")]
     EpollOpen,
 
-    /// Create an epoll instance via the agent's registry, returning a handle
-    /// to be reused with `EpollAdd*` / `EpollWait` / `EpollClose`. (W2
-    /// registry-style; the unit `EpollOpen` is a one-shot probe used by W5.)
-    #[serde(rename = "epoll_create")]
-    EpollCreate,
-
     /// Open an eventfd and register it in this agent's local registry.
     /// Flags are parsed from strings like "semaphore|nonblock|cloexec".
     #[serde(rename = "eventfd_open")]
@@ -568,14 +526,6 @@ pub enum Response {
     /// Eventfd read value.
     #[serde(rename = "eventfd_value")]
     EventfdValue { value: u64 },
-
-    /// Epoll registry handle.
-    #[serde(rename = "epoll_handle")]
-    EpollHandle { id: u64 },
-
-    /// Events returned by `epoll_wait`.
-    #[serde(rename = "epoll_events")]
-    EpollEvents { events: Vec<EpollEvent> },
 
     /// TCP connection failed.
     #[serde(rename = "connect_failed")]

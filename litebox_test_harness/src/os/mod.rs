@@ -3,6 +3,7 @@
 
 //! Scenario-friendly wrappers over Linux OS primitives.
 
+pub mod epoll;
 pub mod eventfd;
 pub mod inotify;
 pub mod pty;
