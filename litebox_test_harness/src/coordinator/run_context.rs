@@ -405,4 +405,46 @@ impl<'a> RunContext<'a> {
         child.stdin.flush().await.map_err(|e| e.to_string())?;
         Ok(())
     }
+
+    /// Common pattern for Class A multi-agent rendezvous tests: a
+    /// watcher and an actor each run a handler, both arrive at `tag`,
+    /// the coord releases both, and the watcher's typed `Out` is
+    /// returned. The actor's handler must return `()`.
+    ///
+    /// Replaces the per-family `run_watch_actor`-style boilerplate
+    /// in test files like `coordinator/inotify.rs`.
+    ///
+    /// # Errors
+    /// Returns Err on any wire failure, checkpoint mismatch, handler
+    /// failure, or deserialization failure.
+    #[allow(clippy::too_many_arguments)] // 3 typed (watcher,token,args) + 3 typed (actor,token,args) + tag = inherent to the pattern
+    pub async fn rendezvous_pair<WA, WO, AA>(
+        &mut self,
+        watcher: &AgentHandle,
+        watcher_token: &crate::handlers::HandlerToken<WA, WO>,
+        watcher_args: WA,
+        actor: &AgentHandle,
+        actor_token: &crate::handlers::HandlerToken<AA, ()>,
+        actor_args: AA,
+        tag: &str,
+    ) -> Result<WO, String>
+    where
+        WA: serde::Serialize,
+        WO: serde::de::DeserializeOwned,
+        AA: serde::Serialize,
+    {
+        self.run_write_typed(watcher, watcher_token, watcher_args)
+            .await?;
+        self.run_read_checkpoint(watcher, tag).await?;
+        self.run_write_typed(actor, actor_token, actor_args).await?;
+        self.run_read_checkpoint(actor, tag).await?;
+        self.run_resume(watcher, tag).await?;
+        self.run_resume(actor, tag).await?;
+        // Read watcher first: its result tends to involve a drain
+        // timeout, which lets the actor's quick work complete in
+        // parallel. The actor's Result is read second.
+        let out = self.run_read_result(watcher, watcher_token).await?;
+        let () = self.run_read_result(actor, actor_token).await?;
+        Ok(out)
+    }
 }

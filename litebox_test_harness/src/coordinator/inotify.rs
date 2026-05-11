@@ -273,40 +273,9 @@ async fn drive_scenario(
     }
 }
 
-/// Common rendezvous machinery for inotify cross-agent tests. The
-/// watcher always runs `WATCH`; the actor's handler is generic so
-/// each scenario passes its own `ActorXxx` args. Returns the
-/// watcher's `WatchOut`.
-async fn run_watch_actor<AA>(
-    run: &mut super::run_context::RunContext<'_>,
-    watcher: &super::agents::AgentHandle,
-    actor: &super::agents::AgentHandle,
-    actor_token: &HandlerToken<AA, ()>,
-    watch_args: WatchArgs,
-    actor_args: AA,
-) -> Result<WatchOut, String>
-where
-    AA: Serialize,
-{
-    // Kick off both handlers; each will arrive at the "armed"
-    // checkpoint and emit Response::Checkpoint.
-    run.run_write_typed(watcher, &WATCH, watch_args).await?;
-    run.run_read_checkpoint(watcher, "armed").await?;
-    run.run_write_typed(actor, actor_token, actor_args).await?;
-    run.run_read_checkpoint(actor, "armed").await?;
-
-    // Both arrived. Release both — the writes don't block; the actor
-    // will do its filesystem operation, the watcher will drain events.
-    run.run_resume(watcher, "armed").await?;
-    run.run_resume(actor, "armed").await?;
-
-    // Read both results. Order matters: the watcher's drain takes up
-    // to 2s; reading watcher first lets the timeout window cover the
-    // actor's act in real time.
-    let out = run.run_read_result(watcher, &WATCH).await?;
-    let () = run.run_read_result(actor, actor_token).await?;
-    Ok(out)
-}
+// Common rendezvous machinery for inotify cross-agent tests is now
+// `RunContext::rendezvous_pair` in the framework; each `drive_*`
+// below calls it directly with the per-scenario actor token + args.
 
 async fn drive_create(
     run: &mut super::run_context::RunContext<'_>,
@@ -316,24 +285,26 @@ async fn drive_create(
 ) -> Result<String, String> {
     let dir = test_dir("create", label);
     let path = format!("{dir}/newfile.txt");
-    let out = run_watch_actor(
-        run,
-        watcher,
-        actor,
-        &ACTOR_CREATE,
-        WatchArgs {
-            dir: dir.clone(),
-            target_path: path.clone(),
-            preflight_contents: String::new(),
-            mask_bits: libc::IN_CREATE | libc::IN_MODIFY | libc::IN_DELETE,
-        },
-        ActorCreate {
-            dir,
-            path,
-            contents: "created".into(),
-        },
-    )
-    .await?;
+    let out = run
+        .rendezvous_pair(
+            watcher,
+            &WATCH,
+            WatchArgs {
+                dir: dir.clone(),
+                target_path: path.clone(),
+                preflight_contents: String::new(),
+                mask_bits: libc::IN_CREATE | libc::IN_MODIFY | libc::IN_DELETE,
+            },
+            actor,
+            &ACTOR_CREATE,
+            ActorCreate {
+                dir,
+                path,
+                contents: "created".into(),
+            },
+            "armed",
+        )
+        .await?;
     if out.events.iter().any(|e| {
         e.has(libc::IN_CREATE) && e.name.as_deref() == Some("newfile.txt") && e.wd == out.wd
     }) {
@@ -354,23 +325,25 @@ async fn drive_modify(
 ) -> Result<String, String> {
     let dir = test_dir("modify", label);
     let path = format!("{dir}/existing.txt");
-    let out = run_watch_actor(
-        run,
-        watcher,
-        actor,
-        &ACTOR_MODIFY,
-        WatchArgs {
-            dir: dir.clone(),
-            target_path: path.clone(),
-            preflight_contents: "before".into(),
-            mask_bits: libc::IN_MODIFY,
-        },
-        ActorModify {
-            path,
-            new_contents: "after".into(),
-        },
-    )
-    .await?;
+    let out = run
+        .rendezvous_pair(
+            watcher,
+            &WATCH,
+            WatchArgs {
+                dir: dir.clone(),
+                target_path: path.clone(),
+                preflight_contents: "before".into(),
+                mask_bits: libc::IN_MODIFY,
+            },
+            actor,
+            &ACTOR_MODIFY,
+            ActorModify {
+                path,
+                new_contents: "after".into(),
+            },
+            "armed",
+        )
+        .await?;
     if out
         .events
         .iter()
@@ -393,20 +366,22 @@ async fn drive_delete(
 ) -> Result<String, String> {
     let dir = test_dir("delete", label);
     let path = format!("{dir}/remove-me.txt");
-    let out = run_watch_actor(
-        run,
-        watcher,
-        actor,
-        &ACTOR_DELETE,
-        WatchArgs {
-            dir: dir.clone(),
-            target_path: path.clone(),
-            preflight_contents: "delete me".into(),
-            mask_bits: libc::IN_DELETE,
-        },
-        ActorDelete { path },
-    )
-    .await?;
+    let out = run
+        .rendezvous_pair(
+            watcher,
+            &WATCH,
+            WatchArgs {
+                dir: dir.clone(),
+                target_path: path.clone(),
+                preflight_contents: "delete me".into(),
+                mask_bits: libc::IN_DELETE,
+            },
+            actor,
+            &ACTOR_DELETE,
+            ActorDelete { path },
+            "armed",
+        )
+        .await?;
     if out.events.iter().any(|e| {
         e.has(libc::IN_DELETE) && e.name.as_deref() == Some("remove-me.txt") && e.wd == out.wd
     }) {
@@ -428,23 +403,25 @@ async fn drive_move(
     let dir = test_dir("move", label);
     let old = format!("{dir}/old-name.txt");
     let new = format!("{dir}/new-name.txt");
-    let out = run_watch_actor(
-        run,
-        watcher,
-        actor,
-        &ACTOR_MOVE,
-        WatchArgs {
-            dir: dir.clone(),
-            target_path: old.clone(),
-            preflight_contents: "move me".into(),
-            mask_bits: libc::IN_MOVED_FROM | libc::IN_MOVED_TO,
-        },
-        ActorMove {
-            old_path: old,
-            new_path: new,
-        },
-    )
-    .await?;
+    let out = run
+        .rendezvous_pair(
+            watcher,
+            &WATCH,
+            WatchArgs {
+                dir: dir.clone(),
+                target_path: old.clone(),
+                preflight_contents: "move me".into(),
+                mask_bits: libc::IN_MOVED_FROM | libc::IN_MOVED_TO,
+            },
+            actor,
+            &ACTOR_MOVE,
+            ActorMove {
+                old_path: old,
+                new_path: new,
+            },
+            "armed",
+        )
+        .await?;
     let from = out.events.iter().find(|e| {
         e.has(libc::IN_MOVED_FROM)
             && e.cookie != 0

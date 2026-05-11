@@ -115,16 +115,30 @@ pub(crate) fn register_eventfd_tests(reg: &mut Registry<'_>) {
     register_handler!(EPOLLET, handle_epollet);
 
     for &agent in EV_AGENTS {
-        let label = agent.to_string();
-        register_single_agent_test(reg, "EV.counter", agent, &label, &COUNTER, |out| {
-            Ok(format!("counter value={}", out.value))
-        });
-        register_single_agent_test(reg, "EV.semaphore", agent, &label, &SEMAPHORE, |out| {
-            Ok(format!("semaphore reads={}", out.reads))
-        });
-        register_single_agent_test(reg, "EV.epollet", agent, &label, &EPOLLET, |out| {
-            Ok(format!("epollet {}", out.detail))
-        });
+        reg.single_agent_handler_test(
+            "vscode",
+            "eventfd",
+            format!("EV.counter.{agent}"),
+            agent,
+            &COUNTER,
+            |out| Ok(format!("counter value={}", out.value)),
+        );
+        reg.single_agent_handler_test(
+            "vscode",
+            "eventfd",
+            format!("EV.semaphore.{agent}"),
+            agent,
+            &SEMAPHORE,
+            |out| Ok(format!("semaphore reads={}", out.reads)),
+        );
+        reg.single_agent_handler_test(
+            "vscode",
+            "eventfd",
+            format!("EV.epollet.{agent}"),
+            agent,
+            &EPOLLET,
+            |out| Ok(format!("epollet {}", out.detail)),
+        );
     }
 
     // Cross-agent share-registry tests stay on the legacy protocol.
@@ -155,40 +169,6 @@ pub(crate) fn register_eventfd_tests(reg: &mut Registry<'_>) {
                 })
             });
     }
-}
-
-/// Register a single-agent test that invokes one handler with `()` args
-/// and applies `check` to the typed result. Common helper for Class 2
-/// migrations — collapses the per-test boilerplate to one call.
-fn register_single_agent_test<O: serde::de::DeserializeOwned + Send + 'static>(
-    reg: &mut Registry<'_>,
-    test_id_prefix: &str,
-    agent: AgentName,
-    label: &str,
-    token: &'static HandlerToken<(), O>,
-    check: fn(&O) -> Result<String, String>,
-) {
-    let id = format!("{test_id_prefix}.{agent}");
-    let label = label.to_string();
-    reg.test("vscode", "eventfd", id)
-        .timeout(60)
-        .build(move |cx| {
-            let h = cx.require(agent);
-            let label = label.clone();
-            Box::new(move |run| {
-                Box::pin(async move {
-                    let result = run.send_named_typed(&h, token, ()).await;
-                    let (pass, detail) = match result {
-                        Ok(out) => match check(&out) {
-                            Ok(d) => (true, d),
-                            Err(d) => (false, d),
-                        },
-                        Err(e) => (false, e),
-                    };
-                    TestOutcome::new(&label, pass, detail)
-                })
-            })
-        });
 }
 
 // ─── Legacy cross-agent driver (kept) ──────────────────────────────

@@ -21,7 +21,6 @@ use tokio::net::{TcpListener, TcpSocket, TcpStream};
 use crate::handlers::{HandlerCtx, HandlerError, HandlerToken};
 use crate::register_handler;
 
-use super::TestOutcome;
 use super::agents::AgentName;
 use super::registry::Registry;
 
@@ -240,12 +239,11 @@ pub(crate) fn register_sockopt_tests(reg: &mut Registry<'_>) {
     register_handler!(KEEPALIVE, handle_keepalive_roundtrip);
 
     for &agent in SOCKOPT_AGENTS {
-        let label = agent.to_string();
-        register_sockopt_test(
-            reg,
-            "SOCKOPT.reuseaddr_double_listen",
+        reg.single_agent_handler_test(
+            "vscode_gap",
+            "sockopt",
+            format!("SOCKOPT.reuseaddr_double_listen.{agent}"),
             agent,
-            &label,
             &REUSEADDR,
             |out| {
                 Ok(format!(
@@ -254,11 +252,11 @@ pub(crate) fn register_sockopt_tests(reg: &mut Registry<'_>) {
                 ))
             },
         );
-        register_sockopt_test(
-            reg,
-            "SOCKOPT.reuseport_two_listeners",
+        reg.single_agent_handler_test(
+            "vscode_gap",
+            "sockopt",
+            format!("SOCKOPT.reuseport_two_listeners.{agent}"),
             agent,
-            &label,
             &REUSEPORT,
             |out| {
                 Ok(format!(
@@ -267,11 +265,11 @@ pub(crate) fn register_sockopt_tests(reg: &mut Registry<'_>) {
                 ))
             },
         );
-        register_sockopt_test(
-            reg,
-            "SOCKOPT.keepalive_roundtrip",
+        reg.single_agent_handler_test(
+            "vscode_gap",
+            "sockopt",
+            format!("SOCKOPT.keepalive_roundtrip.{agent}"),
             agent,
-            &label,
             &KEEPALIVE,
             |out| {
                 if out.set_ok && out.get_value {
@@ -282,35 +280,4 @@ pub(crate) fn register_sockopt_tests(reg: &mut Registry<'_>) {
             },
         );
     }
-}
-
-fn register_sockopt_test<O: serde::de::DeserializeOwned + Send + 'static>(
-    reg: &mut Registry<'_>,
-    test_id_prefix: &str,
-    agent: AgentName,
-    label: &str,
-    token: &'static HandlerToken<(), O>,
-    check: fn(&O) -> Result<String, String>,
-) {
-    let id = format!("{test_id_prefix}.{agent}");
-    let label = label.to_string();
-    reg.test("vscode_gap", "sockopt", id)
-        .timeout(60)
-        .build(move |cx| {
-            let h = cx.require(agent);
-            let label = label.clone();
-            Box::new(move |run| {
-                Box::pin(async move {
-                    let result = run.send_named_typed(&h, token, ()).await;
-                    let (pass, detail) = match result {
-                        Ok(out) => match check(&out) {
-                            Ok(d) => (true, d),
-                            Err(d) => (false, d),
-                        },
-                        Err(e) => (false, e),
-                    };
-                    TestOutcome::new(&label, pass, detail)
-                })
-            })
-        });
 }

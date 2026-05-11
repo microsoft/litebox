@@ -144,7 +144,8 @@ pub(crate) fn register_concurrent_fork_pipeline(reg: &mut Registry<'_>) {
     }
 
     // xworker agents — single pipeline + sequential control on Dpg1Dng.
-    #[allow(clippy::single_element_loop)] // loop preserved for parity with legacy + future expansion
+    #[allow(clippy::single_element_loop)]
+    // loop preserved for parity with legacy + future expansion
     for &agent in &[AgentName::Dpg1Dng] {
         let agent_label = agent.to_string();
         reg.test(
