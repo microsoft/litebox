@@ -55,49 +55,6 @@ struct PtyMaster {
     slave_path: String,
 }
 
-#[repr(C)]
-#[derive(Default)]
-struct IoSqringOffsets {
-    head: u32,
-    tail: u32,
-    ring_mask: u32,
-    ring_entries: u32,
-    flags: u32,
-    dropped: u32,
-    array: u32,
-    resv1: u32,
-    user_addr: u64,
-}
-
-#[repr(C)]
-#[derive(Default)]
-struct IoCqringOffsets {
-    head: u32,
-    tail: u32,
-    ring_mask: u32,
-    ring_entries: u32,
-    overflow: u32,
-    cqes: u32,
-    flags: u32,
-    resv1: u32,
-    user_addr: u64,
-}
-
-#[repr(C)]
-#[derive(Default)]
-struct IoUringParams {
-    sq_entries: u32,
-    cq_entries: u32,
-    flags: u32,
-    sq_thread_cpu: u32,
-    sq_thread_idle: u32,
-    features: u32,
-    wq_fd: u32,
-    resv: [u32; 3],
-    sq_off: IoSqringOffsets,
-    cq_off: IoCqringOffsets,
-}
-
 fn errno() -> i32 {
     std::io::Error::last_os_error().raw_os_error().unwrap_or(0)
 }
@@ -1826,36 +1783,6 @@ async fn agent_loop(self_exe: &str) {
                 } else {
                     respond(&Response::RandomBytes {
                         hex: String::new(),
-                        errno: Some(errno()),
-                    })
-                    .await;
-                }
-            }
-
-            Command::IoUringSetup { entries } => {
-                let mut params = IoUringParams::default();
-                // SAFETY: `params` points to a valid writable C-compatible
-                // io_uring_params buffer for the duration of the syscall, and
-                // the kernel does not retain the pointer after returning.
-                let ret =
-                    unsafe { libc::syscall(libc::SYS_io_uring_setup, entries, &raw mut params) };
-                if ret >= 0 {
-                    // The discovery command only needs to know that the kernel
-                    // returned a descriptor. Close it immediately and report a
-                    // stable positive sentinel instead of leaking a ring fd.
-                    // SAFETY: `ret` is a fresh fd returned by io_uring_setup;
-                    // close consumes only that fd and no Rust object owns it.
-                    unsafe {
-                        libc::close(ret as i32);
-                    }
-                    respond(&Response::IoUringResult {
-                        ring_fd: 1,
-                        errno: None,
-                    })
-                    .await;
-                } else {
-                    respond(&Response::IoUringResult {
-                        ring_fd: -1,
                         errno: Some(errno()),
                     })
                     .await;
