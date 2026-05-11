@@ -498,11 +498,6 @@ pub enum Command {
     #[serde(rename = "eventfd_share")]
     EventfdShare { id: u64, target: String },
 
-    /// Minimal eventfd + epoll edge-triggered probe used until W2's structured
-    /// epoll commands are available. The eventfd must already be ready.
-    #[serde(rename = "eventfd_epollet")]
-    EventfdEpollEt { id: u64 },
-
     /// Shut down gracefully.
     #[serde(rename = "exit")]
     Exit,

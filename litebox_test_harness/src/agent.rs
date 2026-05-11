@@ -33,6 +33,7 @@ struct ListenerEntry {
 
 struct EventfdEntry {
     fd: OwnedFd,
+    #[allow(dead_code)] // Was read by eventfd_epollet_probe (now migrated).
     flags: String,
     authorized_readers: Vec<String>,
 }
@@ -2331,20 +2332,6 @@ async fn agent_loop(self_exe: &str) {
                 .await;
             }
 
-            Command::EventfdEpollEt { id } => {
-                let Some(entry) = eventfds.get(&id) else {
-                    respond(&Response::Error {
-                        error: format!("unknown eventfd {id}"),
-                    })
-                    .await;
-                    continue;
-                };
-                match eventfd_epollet_probe(id, entry) {
-                    Ok(detail) => respond(&Response::Ok { data: Some(detail) }).await,
-                    Err(error) => respond(&Response::Error { error }).await,
-                }
-            }
-
             Command::Exit => {
                 eventfds.clear();
                 // Abort all TCP echo servers.
@@ -3823,62 +3810,6 @@ fn write_eventfd_value(fd: i32, value: u64) -> Result<(), String> {
             _ => return Err(format!("eventfd write value={value}: {err}")),
         }
     }
-}
-
-fn eventfd_epollet_probe(id: u64, entry: &EventfdEntry) -> Result<String, String> {
-    // SAFETY: epoll_create1 returns a fresh descriptor on success.
-    let epfd = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
-    if epfd < 0 {
-        return Err(format!(
-            "epoll_create1: {}",
-            std::io::Error::last_os_error()
-        ));
-    }
-    // SAFETY: `epfd` is newly returned and owned by this process.
-    let epfd = unsafe { OwnedFd::from_raw_fd(epfd) };
-    let mut ev = libc::epoll_event {
-        events: (libc::EPOLLIN | libc::EPOLLET) as u32,
-        u64: id,
-    };
-    // SAFETY: both descriptors are live, and `ev` points to initialized memory
-    // for the duration of the call.
-    let ctl = unsafe {
-        libc::epoll_ctl(
-            epfd.as_raw_fd(),
-            libc::EPOLL_CTL_ADD,
-            entry.fd.as_raw_fd(),
-            &raw mut ev,
-        )
-    };
-    if ctl != 0 {
-        return Err(format!(
-            "epoll_ctl eventfd {id}: {}",
-            std::io::Error::last_os_error()
-        ));
-    }
-
-    let mut events = [libc::epoll_event { events: 0, u64: 0 }; 4];
-    // SAFETY: `events` is valid writable storage for four epoll events.
-    let first = unsafe { libc::epoll_wait(epfd.as_raw_fd(), events.as_mut_ptr(), 4, 1000) };
-    if first < 0 {
-        return Err(format!(
-            "epoll_wait first: {}",
-            std::io::Error::last_os_error()
-        ));
-    }
-    // SAFETY: same valid storage as above; timeout 0 is nonblocking.
-    let second = unsafe { libc::epoll_wait(epfd.as_raw_fd(), events.as_mut_ptr(), 4, 0) };
-    if second < 0 {
-        return Err(format!(
-            "epoll_wait second: {}",
-            std::io::Error::last_os_error()
-        ));
-    }
-    let value = read_eventfd_value(entry.fd.as_raw_fd())?;
-    Ok(format!(
-        "first={first},second={second},value={value},flags={}",
-        entry.flags
-    ))
 }
 
 fn dup_fd_cloexec(fd: i32) -> Result<OwnedFd, String> {

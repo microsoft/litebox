@@ -3,4 +3,5 @@
 
 //! Scenario-friendly wrappers over Linux OS primitives.
 
+pub mod eventfd;
 pub mod inotify;

@@ -2,8 +2,28 @@
 // Licensed under the MIT license.
 
 //! Eventfd semantics tests for VS Code/Node platform compatibility.
+//!
+//! Single-agent scenarios (`counter`, `semaphore`, `epollet`) are
+//! migrated to the handler-refactor protocol — each is one
+//! `Command::Run` round-trip against a registered handler that
+//! drives the eventfd syscalls inline.
+//!
+//! The `cross_agent_wakeup` scenario stays on the legacy protocol
+//! (`Command::EventfdOpen` / `EventfdShare` / `EventfdReadShared` /
+//! `EventfdClose`) because it exercises the agent-internal share-
+//! registry abstraction (layer 1 only — no actual `SCM_RIGHTS` fd
+//! passing). Collapsing it into a single-agent handler would
+//! eliminate the authorization check the test currently exercises.
+//! Reframing as a true cross-process fd-pass test (layer 2) is a
+//! separate effort.
 
+use crate::handlers::{HandlerCtx, HandlerError};
+use crate::os::eventfd::EventFd;
 use crate::protocol::{Command, Response};
+use crate::register_handler;
+
+use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
 
 use super::TestOutcome;
 use super::agents::AgentName;
@@ -17,62 +37,112 @@ pub(crate) const EV_AGENTS: &[AgentName] = &[
     AgentName::Dpg2Dpg,
 ];
 
-struct EventfdScenario {
-    name: &'static str,
-    run: Option<
-        for<'a, 'r> fn(&'a mut RunContext<'r>, &'a super::agents::AgentHandle) -> EventfdFuture<'a>,
-    >,
+// ─── Handler args ───────────────────────────────────────────────────
+
+#[derive(Serialize, Deserialize)]
+struct CounterArgs;
+
+#[derive(Serialize, Deserialize)]
+struct SemaphoreArgs;
+
+#[derive(Serialize, Deserialize)]
+struct EpolletArgs;
+
+// ─── Handlers ───────────────────────────────────────────────────────
+
+async fn handle_counter(
+    _args: CounterArgs,
+    _ctx: &mut HandlerCtx<'_>,
+) -> Result<Value, HandlerError> {
+    let ev = EventFd::open(0, "nonblock")?;
+    ev.write(3)?;
+    ev.write(5)?;
+    let accumulated = ev.read()?;
+    if accumulated != 8 {
+        return Err(HandlerError(format!(
+            "expected accumulated=8 got {accumulated}"
+        )));
+    }
+    // Second read with no data: must EAGAIN.
+    match ev.read() {
+        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+        Err(e) => return Err(HandlerError(format!("expected EAGAIN, got {e}"))),
+        Ok(v) => return Err(HandlerError(format!("expected EAGAIN, got value {v}"))),
+    }
+    Ok(json!({ "value": accumulated }))
 }
 
-type EventfdFuture<'a> =
-    std::pin::Pin<Box<dyn std::future::Future<Output = Result<String, String>> + 'a>>;
+async fn handle_semaphore(
+    _args: SemaphoreArgs,
+    _ctx: &mut HandlerCtx<'_>,
+) -> Result<Value, HandlerError> {
+    let ev = EventFd::open(5, "semaphore|nonblock")?;
+    for i in 0..5 {
+        let v = ev.read()?;
+        if v != 1 {
+            return Err(HandlerError(format!(
+                "semaphore read {i}: expected 1 got {v}"
+            )));
+        }
+    }
+    match ev.read() {
+        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+        Err(e) => return Err(HandlerError(format!("expected EAGAIN, got {e}"))),
+        Ok(v) => return Err(HandlerError(format!("expected EAGAIN, got value {v}"))),
+    }
+    Ok(json!({ "reads": 5 }))
+}
 
-const EV_SCENARIOS: &[EventfdScenario] = &[
-    EventfdScenario {
-        name: "counter",
-        run: Some(run_counter),
-    },
-    EventfdScenario {
-        name: "semaphore",
-        run: Some(run_semaphore),
-    },
-    EventfdScenario {
-        name: "cross_agent_wakeup",
-        run: None,
-    },
-    EventfdScenario {
-        name: "epollet",
-        run: Some(run_epollet),
-    },
-];
+async fn handle_epollet(
+    _args: EpolletArgs,
+    _ctx: &mut HandlerCtx<'_>,
+) -> Result<Value, HandlerError> {
+    let ev = EventFd::open(0, "nonblock|cloexec")?;
+    ev.write(3)?;
+    ev.write(5)?;
+    let detail = ev.epollet_probe()?;
+    if !detail.contains("first=1") || !detail.contains("second=0") || !detail.contains("value=8") {
+        return Err(HandlerError(format!("epollet detail mismatch: {detail}")));
+    }
+    Ok(json!({ "detail": detail }))
+}
+
+// ─── Registration ──────────────────────────────────────────────────
 
 pub(crate) fn register_eventfd_tests(reg: &mut Registry<'_>) {
+    register_handler!("eventfd.counter", handle_counter);
+    register_handler!("eventfd.semaphore", handle_semaphore);
+    register_handler!("eventfd.epollet", handle_epollet);
+
     for &agent in EV_AGENTS {
-        for def in EV_SCENARIOS {
-            let Some(run_scenario) = def.run else {
-                continue;
-            };
-            let agent_s = agent.to_string();
-            let name = def.name;
-            reg.test("vscode", "eventfd", format!("EV.{name}.{agent}"))
+        let agent_label = agent.to_string();
+        for (name, handler) in &[
+            ("counter", "eventfd.counter"),
+            ("semaphore", "eventfd.semaphore"),
+            ("epollet", "eventfd.epollet"),
+        ] {
+            let label = agent_label.clone();
+            let scenario_name = *name;
+            let handler_name = *handler;
+            reg.test("vscode", "eventfd", format!("EV.{scenario_name}.{agent}"))
                 .timeout(60)
                 .build(move |cx| {
-                    let handle = cx.require(agent);
+                    let h = cx.require(agent);
+                    let label = label.clone();
                     Box::new(move |run| {
-                        let a = agent_s.clone();
                         Box::pin(async move {
-                            let result = run_scenario(run, &handle).await;
-                            outcome(&a, result)
+                            let result = run.send_named(&h, handler_name, Value::Null).await;
+                            match result {
+                                Ok(data) => TestOutcome::new(&label, true, format!("{data}")),
+                                Err(e) => TestOutcome::new(&label, false, e),
+                            }
                         })
                     })
                 });
         }
     }
 
-    // Cross-agent sharing is restricted to paired subtrees. Layer 1 models
-    // sharing as a registry authorization plus a logical read forwarded through
-    // the creator agent; it intentionally does not implement SCM_RIGHTS fd
-    // passing (layer 2). We register A↔B and AA↔BB only, not same-agent cases.
+    // Cross-agent share-registry tests stay on the legacy protocol.
     for &(creator, reader) in &[
         (AgentName::Dpg1, AgentName::Dpg2),
         (AgentName::Dpg2, AgentName::Dpg1),
@@ -90,105 +160,21 @@ pub(crate) fn register_eventfd_tests(reg: &mut Registry<'_>) {
                     let label = label.clone();
                     Box::pin(async move {
                         let result =
-                            run_cross_agent(run, &creator_handle, &reader_handle, reader).await;
-                        outcome(&label, result)
+                            run_cross_agent_legacy(run, &creator_handle, &reader_handle, reader)
+                                .await;
+                        match result {
+                            Ok(d) => TestOutcome::new(&label, true, d),
+                            Err(d) => TestOutcome::new(&label, false, d),
+                        }
                     })
                 })
             });
     }
 }
 
-fn outcome(agent: &str, result: Result<String, String>) -> TestOutcome {
-    match result {
-        Ok(detail) => TestOutcome::new(agent, true, detail),
-        Err(detail) => TestOutcome::new(agent, false, detail),
-    }
-}
+// ─── Legacy cross-agent driver (kept) ──────────────────────────────
 
-fn run_counter<'a>(
-    run: &'a mut RunContext<'_>,
-    agent: &'a super::agents::AgentHandle,
-) -> EventfdFuture<'a> {
-    Box::pin(async move {
-        let id = eventfd_open(run, agent, 0, "nonblock").await?;
-        expect_sent(
-            run.send(agent, Command::EventfdWrite { id, value: 3 })
-                .await,
-            "write 3",
-        )?;
-        expect_sent(
-            run.send(agent, Command::EventfdWrite { id, value: 5 })
-                .await,
-            "write 5",
-        )?;
-        expect_eventfd_value(
-            run.send(agent, Command::EventfdRead { id }).await,
-            8,
-            "read accumulated counter",
-        )?;
-        expect_eagain(
-            run.send(agent, Command::EventfdRead { id }).await,
-            "read empty nonblock",
-        )?;
-        expect_closed(run.send(agent, Command::EventfdClose { id }).await, "close")?;
-        Ok(format!("counter id={id} value=8 eagain=ok"))
-    })
-}
-
-fn run_semaphore<'a>(
-    run: &'a mut RunContext<'_>,
-    agent: &'a super::agents::AgentHandle,
-) -> EventfdFuture<'a> {
-    Box::pin(async move {
-        let id = eventfd_open(run, agent, 5, "semaphore|nonblock").await?;
-        for index in 0..5 {
-            expect_eventfd_value(
-                run.send(agent, Command::EventfdRead { id }).await,
-                1,
-                &format!("semaphore read {index}"),
-            )?;
-        }
-        expect_eagain(
-            run.send(agent, Command::EventfdRead { id }).await,
-            "semaphore empty",
-        )?;
-        expect_closed(run.send(agent, Command::EventfdClose { id }).await, "close")?;
-        Ok(format!("semaphore id={id} five_reads=1 eagain=ok"))
-    })
-}
-
-fn run_epollet<'a>(
-    run: &'a mut RunContext<'_>,
-    agent: &'a super::agents::AgentHandle,
-) -> EventfdFuture<'a> {
-    Box::pin(async move {
-        let id = eventfd_open(run, agent, 0, "nonblock|cloexec").await?;
-        expect_sent(
-            run.send(agent, Command::EventfdWrite { id, value: 3 })
-                .await,
-            "write 3",
-        )?;
-        expect_sent(
-            run.send(agent, Command::EventfdWrite { id, value: 5 })
-                .await,
-            "write 5",
-        )?;
-        let detail = expect_ok_data(
-            run.send(agent, Command::EventfdEpollEt { id }).await,
-            "epollet",
-        )?;
-        if !detail.contains("first=1")
-            || !detail.contains("second=0")
-            || !detail.contains("value=8")
-        {
-            return Err(format!("epollet detail mismatch: {detail}"));
-        }
-        expect_closed(run.send(agent, Command::EventfdClose { id }).await, "close")?;
-        Ok(format!("epollet id={id} {detail}"))
-    })
-}
-
-async fn run_cross_agent(
+async fn run_cross_agent_legacy(
     run: &mut RunContext<'_>,
     creator: &super::agents::AgentHandle,
     reader: &super::agents::AgentHandle,
@@ -198,7 +184,7 @@ async fn run_cross_agent(
     if !matches!(reader_pid, Response::Ok { data: Some(_) }) {
         return Err(format!("reader readiness failed: {reader_pid:?}"));
     }
-    let id = eventfd_open(run, creator, 7, "nonblock").await?;
+    let id = eventfd_open_legacy(run, creator, 7, "nonblock").await?;
     let share = run
         .send(
             creator,
@@ -231,7 +217,7 @@ async fn run_cross_agent(
     ))
 }
 
-async fn eventfd_open(
+async fn eventfd_open_legacy(
     run: &mut RunContext<'_>,
     agent: &super::agents::AgentHandle,
     initval: u64,
@@ -249,13 +235,6 @@ async fn eventfd_open(
     {
         Response::EventfdHandle { id } => Ok(id),
         other => Err(format!("eventfd_open({initval}, {flags:?}) got {other:?}")),
-    }
-}
-
-fn expect_sent(resp: Response, label: &str) -> Result<(), String> {
-    match resp {
-        Response::Sent => Ok(()),
-        other => Err(format!("{label}: expected Sent, got {other:?}")),
     }
 }
 
@@ -280,12 +259,5 @@ fn expect_eventfd_value(resp: Response, expected: u64, label: &str) -> Result<()
             "{label}: expected EventfdValue {expected}, got {value}"
         )),
         other => Err(format!("{label}: expected EventfdValue, got {other:?}")),
-    }
-}
-
-fn expect_eagain(resp: Response, label: &str) -> Result<(), String> {
-    match resp {
-        Response::Error { error } if error.contains("EAGAIN") => Ok(()),
-        other => Err(format!("{label}: expected Error/EAGAIN, got {other:?}")),
     }
 }
