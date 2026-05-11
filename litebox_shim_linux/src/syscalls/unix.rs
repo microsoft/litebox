@@ -2451,3 +2451,150 @@ fn remove_sidecar<FS: ShimFS>(fs: &FS, key: &UnixSocketAddrKey) {
     let path = sidecar_path(key);
     let _ = fs.unlink(path.as_str());
 }
+
+#[cfg(test)]
+mod lbfd_framing_tests {
+    use super::*;
+    use litebox_common_linux::fd_transfer_frame::{FdTransferFrame, FdTransferReader};
+
+    /// Build encoded LBFD bytes for a frame with given data + no tokens.
+    fn encoded(data: &[u8]) -> alloc::vec::Vec<u8> {
+        let mut buf = alloc::vec::Vec::new();
+        FdTransferFrame { tokens: &[], data }
+            .encode(&mut buf)
+            .expect("encode");
+        buf
+    }
+
+    /// Static-method call helper: cast through DefaultFS so we can
+    /// invoke the impl block's static method without an instance.
+    fn try_emit(
+        reader: &mut FdTransferReader,
+        buf: &mut [u8],
+    ) -> Result<Option<usize>, TryOpError<Errno>> {
+        let mut received_fds: Vec<PassedFd> = Vec::new();
+        UnixConnectedStream::<crate::DefaultFS>::try_emit_from_reader(
+            reader,
+            buf,
+            &mut received_fds,
+        )
+    }
+
+    #[test]
+    fn complete_frame_in_one_push() {
+        let mut reader = FdTransferReader::new();
+        reader.push(&encoded(b"hello"));
+        let mut out = [0u8; 32];
+        let n = try_emit(&mut reader, &mut out)
+            .unwrap()
+            .expect("frame ready");
+        assert_eq!(n, 5);
+        assert_eq!(&out[..5], b"hello");
+        assert!(try_emit(&mut reader, &mut out).unwrap().is_none());
+    }
+
+    #[test]
+    fn partial_frame_returns_none_until_complete() {
+        let mut reader = FdTransferReader::new();
+        let bytes = encoded(b"partial-arrival");
+        // Feed header-minus-one-byte first.
+        let split = 15; // less than full header+body
+        reader.push(&bytes[..split]);
+        let mut out = [0u8; 32];
+        assert!(
+            try_emit(&mut reader, &mut out).unwrap().is_none(),
+            "incomplete frame must return Ok(None)"
+        );
+
+        // Now feed the rest.
+        reader.push(&bytes[split..]);
+        let n = try_emit(&mut reader, &mut out).unwrap().expect("now ready");
+        assert_eq!(n, 15);
+        assert_eq!(&out[..15], b"partial-arrival");
+    }
+
+    #[test]
+    fn byte_at_a_time_eventually_yields() {
+        // Worst-case fragmentation: feed every byte separately and
+        // call try_emit between each push.
+        let mut reader = FdTransferReader::new();
+        let bytes = encoded(b"trickle");
+        let mut out = [0u8; 32];
+        let mut emitted = None;
+        for &b in &bytes[..bytes.len() - 1] {
+            reader.push(&[b]);
+            assert!(try_emit(&mut reader, &mut out).unwrap().is_none());
+        }
+        // Last byte completes the frame.
+        reader.push(&bytes[bytes.len() - 1..]);
+        emitted = try_emit(&mut reader, &mut out).unwrap();
+        let n = emitted.expect("complete after last byte");
+        assert_eq!(n, 7);
+        assert_eq!(&out[..7], b"trickle");
+    }
+
+    #[test]
+    fn back_to_back_frames_emit_in_order() {
+        let mut reader = FdTransferReader::new();
+        let mut bytes = encoded(b"first");
+        bytes.extend_from_slice(&encoded(b"second-frame"));
+        bytes.extend_from_slice(&encoded(b"third"));
+        reader.push(&bytes);
+
+        let mut out = [0u8; 64];
+        let n1 = try_emit(&mut reader, &mut out).unwrap().unwrap();
+        assert_eq!(&out[..n1], b"first");
+        let n2 = try_emit(&mut reader, &mut out).unwrap().unwrap();
+        assert_eq!(&out[..n2], b"second-frame");
+        let n3 = try_emit(&mut reader, &mut out).unwrap().unwrap();
+        assert_eq!(&out[..n3], b"third");
+        assert!(try_emit(&mut reader, &mut out).unwrap().is_none());
+    }
+
+    #[test]
+    fn user_buffer_smaller_than_frame_truncates() {
+        // SOCK_SEQPACKET-without-MSG_TRUNC behaviour: tail is dropped.
+        let mut reader = FdTransferReader::new();
+        reader.push(&encoded(b"abcdefghij"));
+        let mut small = [0u8; 4];
+        let n = try_emit(&mut reader, &mut small).unwrap().unwrap();
+        assert_eq!(n, 4);
+        assert_eq!(&small, b"abcd");
+        // Reader is now empty (frame fully consumed despite truncated copy).
+        let mut out = [0u8; 32];
+        assert!(try_emit(&mut reader, &mut out).unwrap().is_none());
+    }
+
+    #[test]
+    fn empty_data_frame() {
+        // A frame carrying an empty data payload — used for zero-byte
+        // sendto on a stream socket.
+        let mut reader = FdTransferReader::new();
+        reader.push(&encoded(b""));
+        let mut out = [0u8; 32];
+        let n = try_emit(&mut reader, &mut out).unwrap().unwrap();
+        assert_eq!(n, 0);
+    }
+
+    #[test]
+    fn bad_magic_returns_eproto() {
+        let mut reader = FdTransferReader::new();
+        reader.push(&[0u8; 16]); // all-zero header = bad magic
+        let mut out = [0u8; 32];
+        match try_emit(&mut reader, &mut out) {
+            Err(TryOpError::Other(Errno::EPROTO)) => {}
+            other => panic!("expected EPROTO, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn boundary_max_buf_holds_frame_exactly() {
+        // User buf is exactly the frame's data length.
+        let mut reader = FdTransferReader::new();
+        reader.push(&encoded(b"x"));
+        let mut out = [0u8; 1];
+        let n = try_emit(&mut reader, &mut out).unwrap().unwrap();
+        assert_eq!(n, 1);
+        assert_eq!(&out, b"x");
+    }
+}

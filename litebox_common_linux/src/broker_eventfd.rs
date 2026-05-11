@@ -365,4 +365,103 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(50));
         assert_eq!(cb.count.load(Ordering::SeqCst), 0);
     }
+
+    /// Test C: stress the dispatcher with many subscriptions and a
+    /// stream of notifications. Verifies the HashMap-based lookup
+    /// holds up under load and every frame is delivered to the right
+    /// callback.
+    #[test]
+    fn stress_many_subscriptions_many_frames() {
+        use std::vec::Vec;
+
+        const N_SUBS: u64 = 100;
+        const N_FRAMES_PER_SUB: u32 = 50;
+
+        let (mut sender, receiver) = make_ring_for_test();
+        let dispatcher = NotificationDispatcher::start(receiver);
+
+        // Allocate ids 1..=N_SUBS and register a counting callback
+        // for each.
+        let mut callbacks: Vec<Arc<CountingCallback>> = Vec::with_capacity(N_SUBS as usize);
+        for id in 1..=N_SUBS {
+            let cb = CountingCallback::new();
+            dispatcher.register_callback(id, Arc::clone(&cb) as Arc<dyn NotificationCallback>);
+            callbacks.push(cb);
+        }
+
+        // Round-robin fire N_FRAMES_PER_SUB frames per subscription.
+        for round in 0..N_FRAMES_PER_SUB {
+            for id in 1..=N_SUBS {
+                let events = if round % 2 == 0 {
+                    NOTIFY_EVENT_IN
+                } else {
+                    NOTIFY_EVENT_OUT
+                };
+                sender
+                    .send(NotificationFrame {
+                        subscription_id: id,
+                        events,
+                    })
+                    .unwrap();
+            }
+        }
+
+        // Wait for each callback to see its full count, then verify.
+        for (i, cb) in callbacks.iter().enumerate() {
+            cb.wait_for_count(N_FRAMES_PER_SUB, 5000);
+            assert_eq!(
+                cb.count.load(Ordering::SeqCst),
+                N_FRAMES_PER_SUB,
+                "subscription {} received wrong frame count",
+                i + 1,
+            );
+            // Both event bits should have been observed (round-robin alternates).
+            let e = cb.events.load(Ordering::SeqCst);
+            assert!(
+                e & NOTIFY_EVENT_IN != 0 && e & NOTIFY_EVENT_OUT != 0,
+                "subscription {} missed an event bit, got 0x{:x}",
+                i + 1,
+                e,
+            );
+        }
+    }
+
+    /// Concurrent register + unregister + frame-receive. Verifies the
+    /// dispatcher's locking doesn't deadlock or drop frames under
+    /// reasonable contention.
+    #[test]
+    fn concurrent_register_unregister_smoke() {
+        use std::thread;
+
+        let (mut sender, receiver) = make_ring_for_test();
+        let dispatcher = NotificationDispatcher::start(receiver);
+
+        // Background thread: register+unregister callbacks in a loop.
+        let dispatcher_for_thread = Arc::clone(&dispatcher);
+        let bg = thread::spawn(move || {
+            for round in 0..200 {
+                let id = 10_000 + round;
+                let cb = CountingCallback::new();
+                dispatcher_for_thread
+                    .register_callback(id, Arc::clone(&cb) as Arc<dyn NotificationCallback>);
+                dispatcher_for_thread.unregister_callback(id);
+            }
+        });
+
+        // Main thread: register one stable callback and fire frames at it.
+        let cb = CountingCallback::new();
+        dispatcher.register_callback(7, Arc::clone(&cb) as Arc<dyn NotificationCallback>);
+        for _ in 0..100 {
+            sender
+                .send(NotificationFrame {
+                    subscription_id: 7,
+                    events: NOTIFY_EVENT_IN,
+                })
+                .unwrap();
+        }
+
+        bg.join().unwrap();
+        cb.wait_for_count(100, 5000);
+        assert_eq!(cb.count.load(Ordering::SeqCst), 100);
+    }
 }
