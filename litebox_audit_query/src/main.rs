@@ -522,7 +522,10 @@ Column reference:
   worker      - Host OS PID of the runner process                      NOT NULL
   pid         - Guest virtual PID                                      NOT NULL
   tid         - Guest virtual TID (important for Node.js worker threads) NOT NULL
-  syscall     - Syscall name: "openat", "read", "connect", "other"    NOT NULL
+  syscall     - Canonical snake_case Linux syscall name (e.g. "openat",      NOT NULL
+                "read", "connect", "eventfd2", "pidfd_open", "rt_sigprocmask").
+                "unknown" is used only if a new SyscallRequest variant is
+                added in the shim without updating syscall_canonical_name.
   args        - JSON array of arguments from the entry event           NOT NULL
   enter_ts    - Monotonic nanoseconds at syscall entry                  NOT NULL
   exit_ts     - Monotonic nanoseconds at syscall exit (NULL if never returned)
