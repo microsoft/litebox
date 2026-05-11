@@ -96,20 +96,6 @@ pub enum Command {
     #[serde(rename = "get_pid")]
     GetPid,
 
-    /// Exercise curated `clone3(2)` flag combinations.
-    #[serde(rename = "clone3")]
-    Clone3 {
-        kind: Clone3Kind,
-        /// Optional path the cloned child should execve into (with
-        /// `echo-test` as argv[1]) instead of the default
-        /// `/bin/sh -c …`. Used by the BinaryType matrix to exercise
-        /// fork+exec with each binary type. `None` preserves the
-        /// legacy `/bin/sh` behavior. Ignored for `Clone3Kind::Thread`
-        /// (threads share the parent's address space and do not exec).
-        #[serde(default)]
-        exec_target: Option<String>,
-    },
-
     /// Read a file and report contents (or `not_found`).
     #[serde(rename = "fs_read")]
     FsRead { path: String },
@@ -504,30 +490,11 @@ pub enum Command {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum Clone3Kind {
-    Thread,
-    Process,
-    WithPidfd,
-    WithSetTid { tid: u64 },
-    WithCgroup { cgroup_fd: u64 },
-    WithVfork,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", content = "id", rename_all = "snake_case")]
 pub enum FdRef {
     Eventfd(u64),
     TcpConn(u64),
     UnixPair(u64),
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CloneResult {
-    pub pid: u64,
-    pub pidfd: Option<i32>,
-    pub ok: bool,
-    pub error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -672,15 +639,6 @@ pub enum Response {
     /// Background process reached its readiness marker.
     #[serde(rename = "background_ready")]
     BackgroundReady { pid: u32 },
-
-    /// Result of a curated `clone3(2)` exercise.
-    #[serde(rename = "clone_result")]
-    CloneResult {
-        pid: u64,
-        pidfd: Option<i32>,
-        ok: bool,
-        error: Option<String>,
-    },
 
     /// Readiness or wait predicate satisfied.
     #[serde(rename = "ready")]
