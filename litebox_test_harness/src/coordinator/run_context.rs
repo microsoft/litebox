@@ -31,11 +31,22 @@ use super::agents::{AgentHandle, EphemeralHandle, SpawnKind};
 /// this by passing a string because no string-typed `send` is exposed.
 pub struct RunContext<'a> {
     runner: &'a mut TestRunner,
+    /// Direct top-level pipes that currently have a `Command::Run`
+    /// in flight (handler running on the agent or one of its
+    /// descendants, awaiting a terminal `Response::Result`). Used
+    /// by `run_write` to refuse a second concurrent Run on the same
+    /// direct pipe — that would corrupt the wire because Forward and
+    /// the agent's main loop can't multiplex two in-flight handlers
+    /// on one stdin/stdout pair.
+    in_flight_directs: std::collections::HashSet<String>,
 }
 
 impl<'a> RunContext<'a> {
     pub(super) fn new(runner: &'a mut TestRunner) -> Self {
-        Self { runner }
+        Self {
+            runner,
+            in_flight_directs: std::collections::HashSet::new(),
+        }
     }
 
     /// Path to the self-executable that test code can pass to its
@@ -184,18 +195,34 @@ impl<'a> RunContext<'a> {
     /// same checkpoint before either resumes).
     ///
     /// # Errors
-    /// Returns Err on a routing or pipe-write failure.
+    /// - Returns Err if another `Run` is already in flight on the
+    ///   same direct top-level pipe. Two concurrent Runs sharing a
+    ///   pipe would deadlock (the agent's stdin/stdout can carry only
+    ///   one active conversation at a time, and Forward arms can't
+    ///   multiplex).
+    /// - Returns Err on a routing or pipe-write failure.
     pub async fn run_write(
         &mut self,
         handle: &AgentHandle,
         handler: &str,
         args: serde_json::Value,
     ) -> Result<(), String> {
+        let wire = handle.name().name();
+        let (direct, _rest) = super::route(wire);
+        if self.in_flight_directs.contains(direct) {
+            return Err(format!(
+                "another Run is already in flight on direct pipe '{direct}'; \
+                 cannot start a second Run on {wire} until the in-flight one \
+                 returns Result (or pick a target whose route() direct differs)"
+            ));
+        }
         let cmd = Command::Run {
             handler: handler.to_string(),
             args,
         };
-        self.write_routed(handle, cmd).await
+        self.write_routed(handle, cmd).await?;
+        self.in_flight_directs.insert(direct.to_string());
+        Ok(())
     }
 
     /// Write `Command::Resume { tag }` to `handle`'s pipe without
@@ -215,39 +242,54 @@ impl<'a> RunContext<'a> {
     /// `run_write` / `run_resume`. The response may be
     /// `Response::Checkpoint` (handler is paused) or
     /// `Response::Result` (handler is done) or an error.
+    ///
+    /// When `Response::Result` is returned (or an `Error` that
+    /// indicates the conversation ended), the direct pipe is cleared
+    /// from the in-flight set so a subsequent `run_write` to a
+    /// target with the same direct pipe is allowed.
     pub async fn run_read(&mut self, handle: &AgentHandle) -> Response {
         use tokio::io::AsyncBufReadExt;
         let wire = handle.name().name();
         self.runner.contacted_agents.insert(wire.to_string());
         let (direct, _rest) = super::route(wire);
-        let Some(child) = self.runner.children.get_mut(direct) else {
-            return Response::Error {
-                error: format!("no child {direct}"),
+        let resp = {
+            let Some(child) = self.runner.children.get_mut(direct) else {
+                return Response::Error {
+                    error: format!("no child {direct}"),
+                };
             };
-        };
-        let mut line = String::new();
-        match tokio::time::timeout(
-            std::time::Duration::from_secs(15),
-            child.stdout.read_line(&mut line),
-        )
-        .await
-        {
-            Ok(Ok(0)) => Response::Error {
-                error: "EOF on agent stdout".into(),
-            },
-            Ok(Ok(_)) => match serde_json::from_str(line.trim()) {
-                Ok(r) => r,
-                Err(e) => Response::Error {
-                    error: format!("response parse: {e}; line={}", line.trim()),
+            let mut line = String::new();
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(15),
+                child.stdout.read_line(&mut line),
+            )
+            .await
+            {
+                Ok(Ok(0)) => Response::Error {
+                    error: "EOF on agent stdout".into(),
                 },
-            },
-            Ok(Err(e)) => Response::Error {
-                error: format!("read: {e}"),
-            },
-            Err(_) => Response::Error {
-                error: "timeout reading from agent".into(),
-            },
+                Ok(Ok(_)) => match serde_json::from_str(line.trim()) {
+                    Ok(r) => r,
+                    Err(e) => Response::Error {
+                        error: format!("response parse: {e}; line={}", line.trim()),
+                    },
+                },
+                Ok(Err(e)) => Response::Error {
+                    error: format!("read: {e}"),
+                },
+                Err(_) => Response::Error {
+                    error: "timeout reading from agent".into(),
+                },
+            }
+        };
+        // Any non-Checkpoint response terminates the in-flight Run on
+        // this direct pipe — Result is the happy path; Error means the
+        // conversation is broken and we shouldn't keep blocking new
+        // Runs that target the same direct pipe.
+        if !matches!(&resp, Response::Checkpoint { .. }) {
+            self.in_flight_directs.remove(direct);
         }
+        resp
     }
 
     /// Common helper: route `cmd` to `handle` (Forward-wrapping for

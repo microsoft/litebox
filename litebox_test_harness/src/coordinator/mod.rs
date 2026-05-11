@@ -832,6 +832,7 @@ fn register_canary(reg: &mut registry::Registry<'_>) {
         });
 }
 
+#[allow(clippy::too_many_lines)]
 fn register_handler_canary(reg: &mut registry::Registry<'_>) {
     use crate::handlers::{HandlerCtx, HandlerError};
     use crate::register_handler;
@@ -918,6 +919,54 @@ fn register_handler_canary(reg: &mut registry::Registry<'_>) {
                 })
             })
         });
+
+    // Negative test: pipe-share guard. Two run_writes targeting
+    // agents that share a direct top-level pipe (Dpg1 + Dpg1Dpg1
+    // both route through dpg1's pipe) — the second write must
+    // error out before any wire I/O happens.
+    reg.test(
+        "contamination",
+        "handler_canary",
+        "H_canary.pipe_share_guard",
+    )
+    .timeout(30)
+    .build(|cx| {
+        let a = cx.require(agents::AgentName::Dpg1);
+        let deep = cx.require(agents::AgentName::Dpg1Dpg1);
+        Box::new(move |run| {
+            Box::pin(async move {
+                // First write succeeds (no in-flight runs).
+                let first = run
+                    .run_write(&a, "canary.rendezvous_a", serde_json::Value::Null)
+                    .await;
+                if first.is_err() {
+                    return TestOutcome::new(
+                        agents::AgentName::Dpg1.name(),
+                        false,
+                        format!("first run_write failed: {first:?}"),
+                    );
+                }
+                // Second write targets a deep agent whose direct
+                // pipe is dpg1 — the same pipe the first Run is
+                // using. Must error.
+                let second = run
+                    .run_write(&deep, "canary.rendezvous_a", serde_json::Value::Null)
+                    .await;
+                let pass = matches!(&second, Err(msg) if msg.contains("in flight"));
+                // Clean up: read the first Run's Checkpoint, then
+                // resume + read Result so the agent isn't left
+                // mid-handler and the in-flight slot is cleared.
+                let _ = run.run_read(&a).await;
+                let _ = run.run_resume(&a, "rendezvous").await;
+                let _ = run.run_read(&a).await;
+                TestOutcome::new(
+                    agents::AgentName::Dpg1.name(),
+                    pass,
+                    format!("first={first:?} second={second:?}"),
+                )
+            })
+        })
+    });
 }
 
 async fn drive_rendezvous(
