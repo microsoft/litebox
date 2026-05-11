@@ -10,6 +10,12 @@ pub struct TcpSocket {
     fd: OwnedFd,
 }
 
+impl AsRawFd for TcpSocket {
+    fn as_raw_fd(&self) -> std::os::fd::RawFd {
+        self.fd.as_raw_fd()
+    }
+}
+
 impl TcpSocket {
     /// Create a loopback TCP listener bound to `port` (`0` for ephemeral).
     ///
