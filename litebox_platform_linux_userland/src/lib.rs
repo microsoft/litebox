@@ -508,8 +508,6 @@ core::arch::global_asm!(
     "
     .section .tbss
     .align 8
-saved_restart_addr:
-    .quad 0
 scratch:
     .quad 0
 host_sp:
@@ -620,18 +618,9 @@ unsafe extern "C-unwind" fn run_thread_arch(
     // contain rflags if the syscall instruction had actually been issued).
     .globl syscall_callback
 syscall_callback:
-    // the trampoline has already reserved 128 bytes below RSP to protect the
-    // SysV red zone.
     // Clear in_guest flag. This must be the first instruction to match the
     // expectations of `interrupt_signal_handler`.
     mov      BYTE PTR gs:in_guest@tpoff, 0
-
-    // Save guest R11 (syscall call-site restart address from the rewriter
-    // trampoline) to TLS before it is clobbered by the fsbase/gsbase save
-    // sequence below. This value is not placed in pt_regs (which holds
-    // RFLAGS in the r11 slot per the kernel ABI); instead it is kept in
-    // TLS for future SA_RESTART support.
-    mov      gs:saved_restart_addr@tpoff, r11
 
     // Restore host fs base.
     rdfsbase r11
@@ -639,12 +628,9 @@ syscall_callback:
     rdgsbase r11
     wrfsbase r11
 
-    // The trampoline lowered RSP by 128 bytes with LEA, so recover the
-    // architectural guest stack pointer before saving pt_regs.
-    lea     r11, [rsp + 128]
+    // Switch to the top of the guest context.
+    mov     r11, rsp
     mov     rsp, fs:guest_context_top@tpoff
-
-.Lsyscall_save_regs:
 
     // TODO: save float and vector registers (xsave or fxsave)
     // Save caller-saved registers
@@ -663,7 +649,7 @@ syscall_callback:
     push    r8          // pt_regs->r8
     push    r9          // pt_regs->r9
     push    r10         // pt_regs->r10
-    push    [rsp + 88]  // pt_regs->r11 = rflags (matching real syscall ABI)
+    push    [rsp + 88]  // pt_regs->r11 = rflags
     push    rbx         // pt_regs->bx
     push    rbp         // pt_regs->bp
     push    r12         // pt_regs->r12

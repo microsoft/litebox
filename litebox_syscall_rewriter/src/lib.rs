@@ -455,20 +455,13 @@ fn hook_syscalls_in_section(
         trampoline_data.extend_from_slice(&presyscall_bytes);
 
         let return_addr = inst.next_ip();
-        emit_trampoline_preamble(trampoline_base_addr, replace_start, trampoline_data)?;
 
-        // Put jump back location into rcx.
-        let jmp_back_base = checked_add_u64(
-            trampoline_base_addr,
-            trampoline_data.len() as u64 + 7,
-            "x86_64 trampoline jump-back base",
-        )?;
-        trampoline_data.extend_from_slice(&[0x48, 0x8D, 0x0D]); // LEA RCX, [RIP + disp32]
-        trampoline_data.extend_from_slice(&rel32_bytes(
-            return_addr,
-            jmp_back_base,
-            "x86_64 trampoline jump-back",
-        )?);
+        // LEA RCX, [RIP + 6] — load RCX with the address of the in-trampoline
+        // `post_jmp` (the instruction immediately after the indirect JMP into
+        // the callback). The SA_RESTART handler relies on the invariant that
+        // pt_regs.rcx - 6 points at the indirect JMP itself, so it can rewind
+        // ctx.rip and re-enter the callback.
+        trampoline_data.extend_from_slice(&[0x48, 0x8D, 0x0D, 0x06, 0x00, 0x00, 0x00]);
 
         // Add jmp [rip + offset_to_entry_point]
         trampoline_data.extend_from_slice(&[0xFF, 0x25]);
@@ -483,6 +476,20 @@ fn hook_syscalls_in_section(
             syscall_entry_addr,
             entry_base,
             "x86_64 trampoline entry",
+        )?);
+
+        // post_jmp: JMP rel32 back to the guest instruction following the
+        // original syscall. The callback returns via `jmp rcx` and lands here.
+        let jmp_back_base = checked_add_u64(
+            trampoline_base_addr,
+            trampoline_data.len() as u64 + 5,
+            "x86_64 trampoline jump-back base",
+        )?;
+        trampoline_data.push(0xE9);
+        trampoline_data.extend_from_slice(&rel32_bytes(
+            return_addr,
+            jmp_back_base,
+            "x86_64 trampoline jump-back",
         )?);
 
         // Replace original instructions with jump to trampoline
@@ -654,45 +661,6 @@ fn replace_with_trap(
 fn checked_add_u64(base: u64, addend: u64, context: &'static str) -> Result<u64> {
     base.checked_add(addend)
         .ok_or_else(|| Error::AddressOverflow(format!("{context} address overflow")))
-}
-
-/// Emit the trampoline preamble: reserve the SysV red zone and load R11 with
-/// the call-site restart address.
-///
-/// The red zone reservation (`LEA RSP, [RSP - 0x80]`) prevents async guest
-/// signal delivery / interrupt handling from clobbering stack locals parked
-/// below the architectural RSP.
-///
-/// R11 is loaded with `call_site_addr` (the address of the original JMP that
-/// entered the trampoline) so that SA_RESTART can rewind `ctx.rip` to re-enter
-/// the trampoline. The real `syscall` instruction clobbers R11 with RFLAGS, so
-/// this register is free from the guest's perspective.
-///
-/// CONTRACT: R11 carries the call-site restart address from this point until
-/// the platform callback saves it to a dedicated TLS variable
-/// (`saved_restart_addr`). The platform MUST preserve R11 before any clobbering
-/// instructions (fsbase swap, TLS lookup).
-fn emit_trampoline_preamble(
-    trampoline_base_addr: u64,
-    call_site_addr: u64,
-    trampoline_data: &mut Vec<u8>,
-) -> Result<()> {
-    // LEA RSP, [RSP - 0x80]
-    trampoline_data.extend_from_slice(&[0x48, 0x8D, 0x64, 0x24, 0x80]);
-
-    // LEA R11, [RIP + disp32] — disp32 targets call_site_addr
-    let r11_rip = checked_add_u64(
-        trampoline_base_addr,
-        trampoline_data.len() as u64 + 7,
-        "trampoline R11 displacement base",
-    )?;
-    trampoline_data.extend_from_slice(&[0x4C, 0x8D, 0x1D]);
-    trampoline_data.extend_from_slice(&rel32_bytes(
-        call_site_addr,
-        r11_rip,
-        "trampoline R11 restart address",
-    )?);
-    Ok(())
 }
 
 fn rel32_bytes(target: u64, base: u64, context: &'static str) -> Result<[u8; 4]> {
@@ -979,12 +947,8 @@ fn hook_syscall_and_after(
 
     // Compute preamble size so we can determine where post-syscall
     // instructions will land and encode them before committing anything.
-    // x86_64 preamble:
-    //   LEA RSP,[RSP-0x80]      (5)
-    //   LEA R11,[RIP+disp32]    (7)
-    //   LEA RCX,[RIP+disp32]    (7)
-    //   JMP [RIP+disp32]        (6)
-    let preamble_len: u64 = 25;
+    // x86_64: LEA RCX,[RIP+disp32] (7) + JMP [RIP+disp32] (6) = 13
+    let preamble_len: u64 = 13;
 
     // Encode the post-syscall instructions for the trampoline, re-encoding
     // any RIP-relative memory operands for the new location.
@@ -1001,11 +965,12 @@ fn hook_syscall_and_after(
     } else {
         Vec::new()
     };
-    emit_trampoline_preamble(trampoline_base_addr, replace_start, trampoline_data)?;
 
-    // Put jump back location into rcx, via lea rcx, [next instruction]
-    trampoline_data.extend_from_slice(&[0x48, 0x8D, 0x0D]); // LEA RCX, [RIP + disp32]
-    trampoline_data.extend_from_slice(&6u32.to_le_bytes());
+    // LEA RCX, [RIP + 6] — make RCX point at the instruction immediately
+    // following the indirect JMP: the start of postsyscall_bytes (or, when
+    // none, the unconditional JMP back to guest). The SA_RESTART handler
+    // relies on pt_regs.rcx - 6 pointing at the indirect JMP itself.
+    trampoline_data.extend_from_slice(&[0x48, 0x8D, 0x0D, 0x06, 0x00, 0x00, 0x00]);
     // Add jmp [rip + offset_to_entry_point]
     trampoline_data.extend_from_slice(&[0xFF, 0x25]);
     // RIP after this instruction = trampoline_base_addr + trampoline_data.len() + 4

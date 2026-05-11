@@ -414,10 +414,6 @@ struct TlsState {
     host_bp: Cell<*mut u128>,
     guest_context_top: Cell<*mut litebox_common_linux::PtRegs>,
     scratch: Cell<usize>,
-    /// Syscall call-site restart address from the rewriter trampoline,
-    /// saved here for future SA_RESTART support. Not stored in pt_regs
-    /// (which holds RFLAGS in the r11 slot per the kernel ABI).
-    saved_restart_addr: Cell<usize>,
     is_in_guest: Cell<bool>,
     interrupt: Cell<bool>,
     continue_context:
@@ -437,7 +433,6 @@ impl TlsState {
             host_bp: Cell::new(core::ptr::null_mut()),
             guest_context_top: core::ptr::null_mut::<litebox_common_linux::PtRegs>().into(),
             scratch: 0.into(),
-            saved_restart_addr: 0.into(),
             is_in_guest: false.into(),
             interrupt: false.into(),
             continue_context: Box::default(),
@@ -554,36 +549,18 @@ unsafe extern "C-unwind" fn run_thread_arch(thread_ctx: &mut ThreadContext, tls_
     jmp .Ldone
 
     // This entry point is called from the guest when it issues a syscall
-    // instruction.  The rewriter trampoline has already:
-    //   1. Reserved 128 bytes below RSP to protect the SysV red zone
-    //   2. Loaded the call-site restart address into R11 (for SA_RESTART)
-    //   3. Loaded the return address into RCX
+    // instruction.
     //
-    // All other registers hold guest state.
+    // At entry, the register context is the guest context with the
+    // return address in rcx. r11 is an available scratch register (it would
+    // contain rflags if the syscall instruction had actually been issued).
     .globl  syscall_callback
 syscall_callback:
-    // Save guest R11 (restart address from rewriter trampoline) to
-    // TEB.ArbitraryUserPointer (gs:[0x28]) before the TLS index lookup
-    // clobbers R11. Windows has no direct equivalent of Linux's TLS-relative
-    // store before TLS lookup, so this per-thread TEB slot is used as the
-    // narrow pre-TLS scratch location. No calls, Rust code, or DLL activity
-    // occur before the value is copied into TlsState below.
-    mov     gs:[0x28], r11
     // Get the TLS state from the TLS slot and clear the in-guest flag.
     mov     r11d, DWORD PTR [rip + {TLS_INDEX}]
     mov     r11, QWORD PTR gs:[r11 * 8 + TEB_TLS_SLOTS_OFFSET]
     mov     BYTE PTR [r11 + {IS_IN_GUEST}], 0
-    // Recover the restart address from the TEB slot and store it in TLS
-    // without touching the guest stack. SCRATCH is reused below for the
-    // recovered guest RSP after RAX has been restored.
-    mov     QWORD PTR [r11 + {SCRATCH}], rax
-    mov     rax, QWORD PTR gs:[0x28]
-    mov     QWORD PTR [r11 + {SAVED_RESTART_ADDR}], rax
-    mov     rax, QWORD PTR [r11 + {SCRATCH}]
-    // Recover the architectural guest stack pointer (undo the 128-byte
-    // red zone reservation) and store it in SCRATCH.  LEA is used instead
-    // of ADD to avoid clobbering RFLAGS before pushfq.
-    lea     rsp, [rsp + 128]
+    // Set rsp to the top of the guest context.
     mov     QWORD PTR [r11 + {SCRATCH}], rsp
     mov     rsp, QWORD PTR [r11 + {GUEST_CONTEXT_TOP}]
 
@@ -669,7 +646,6 @@ interrupt_callback:
     HOST_BP = const core::mem::offset_of!(TlsState, host_bp),
     GUEST_CONTEXT_TOP = const core::mem::offset_of!(TlsState, guest_context_top),
     SCRATCH = const core::mem::offset_of!(TlsState, scratch),
-    SAVED_RESTART_ADDR = const core::mem::offset_of!(TlsState, saved_restart_addr),
     IS_IN_GUEST = const core::mem::offset_of!(TlsState, is_in_guest),
     );
 }
