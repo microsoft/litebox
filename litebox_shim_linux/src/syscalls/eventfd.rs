@@ -187,6 +187,27 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> EventFile<Platform> {
         matches!(*self.inner.lock(), EventFileInner::Timerfd(_))
     }
 
+    /// Returns the broker handle id if this is a broker-backed
+    /// eventfd, else `None`. Used by the cross-worker SCM_RIGHTS
+    /// path to extract the handle for transport in an LBFD frame
+    /// (Phase B-Step8e).
+    pub(crate) fn broker_backed_handle(&self) -> Option<u64> {
+        match &*self.inner.lock() {
+            EventFileInner::BrokerBacked { handle, .. } => Some(*handle),
+            _ => None,
+        }
+    }
+
+    /// Returns the broker provider if this is a broker-backed
+    /// eventfd. Used by the cross-worker SCM_RIGHTS sender to call
+    /// `dup_handle` on the same provider that owns this eventfd.
+    pub(crate) fn broker_backed_provider(&self) -> Option<Arc<dyn BrokerEventfdProvider>> {
+        match &*self.inner.lock() {
+            EventFileInner::BrokerBacked { provider, .. } => Some(Arc::clone(provider)),
+            _ => None,
+        }
+    }
+
     #[cfg(feature = "trace_syscalls")]
     pub(crate) fn kind_name(&self) -> &'static str {
         match &*self.inner.lock() {

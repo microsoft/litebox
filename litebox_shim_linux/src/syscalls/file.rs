@@ -1826,6 +1826,7 @@ impl<FS: ShimFS> Task<FS> {
                             litebox_common_linux::SendFlags::empty(),
                             None,
                             Vec::new(),
+                            Vec::new(),
                         )
                     })
                 },
@@ -3070,6 +3071,7 @@ impl<FS: ShimFS> Task<FS> {
                                 buf,
                                 litebox_common_linux::SendFlags::empty(),
                                 None,
+                                Vec::new(),
                                 Vec::new(),
                             )
                         })

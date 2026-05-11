@@ -586,7 +586,19 @@ pub(super) use litebox::fd::PassedFd;
 pub(crate) struct Message {
     pub(crate) data: Vec<u8>,
     /// File descriptors passed via `SCM_RIGHTS` ancillary data.
+    /// Used by the same-worker `UnixTransport::Channel` arm; the
+    /// cross-worker `UnixTransport::Tcp` arm uses `passed_tokens`
+    /// instead.
     pub(crate) passed_fds: Vec<PassedFd>,
+    /// Broker handle tokens for cross-worker fd transfer (Phase
+    /// B-Step8e). Populated by `parse_sendmsg_cmsg` for any
+    /// `passed_fds` entry whose underlying subsystem entry carries a
+    /// broker handle (currently only `EventFile::BrokerBacked`).
+    /// The `UnixTransport::Tcp` send path encodes these into the LBFD
+    /// frame; the recv path decodes them into `received_tokens` for
+    /// the syscall handler to materialise into receiver-side
+    /// `PassedFd` entries.
+    pub(crate) passed_tokens: Vec<litebox_common_linux::fd_transfer_frame::PassedToken>,
 }
 
 /// Represents a connected Unix stream socket.
@@ -709,23 +721,18 @@ impl<FS: ShimFS> UnixConnectedStream<FS> {
             }
             UnixTransport::Tcp { proxy, .. } => {
                 use litebox::net::socket_channel::NetworkProxy;
-                // Phase B-Step8b: always-frame on the cross-worker
-                // TCP transport. Sender encodes one LBFD frame per
-                // Message; tokens are empty until the broker-handle
-                // extraction work (Step 8e) lands. Receiver mirrors
-                // this via FdTransferReader and copies data into the
-                // user buffer.
+                // Phase B-Step8e: always-LBFD-frame on the cross-worker
+                // TCP transport. Sender encodes the data plus any
+                // pre-extracted broker handle tokens (built by
+                // parse_sendmsg_cmsg). Receiver mirrors this via
+                // FdTransferReader and the recv-side materialisation.
                 //
-                // Note: cross-worker passed_fds are still dropped
-                // here. Phase 8e will: (a) look up each PassedFd's
-                // underlying subsystem entry, (b) if BrokerBacked,
-                // call provider.dup_handle, (c) encode a PassedToken.
-                if !msg.passed_fds.is_empty() {
-                    // Cross-worker passed_fds still dropped here;
-                    // Phase 8e wires the broker-handle extraction.
-                }
+                // passed_fds is for the in-worker `Channel` arm and is
+                // discarded here — the sender's task context already
+                // converted broker-backed entries into `passed_tokens`
+                // before reaching this point.
                 let frame = FdTransferFrame {
-                    tokens: &[],
+                    tokens: &msg.passed_tokens,
                     data: &msg.data,
                 };
                 let bytes = {
@@ -1358,10 +1365,12 @@ impl<FS: ShimFS> UnixStream<FS> {
         addr: Option<UnixSocketAddr>,
         preserve_empty_record: bool,
         passed_fds: Vec<PassedFd>,
+        passed_tokens: Vec<litebox_common_linux::fd_transfer_frame::PassedToken>,
     ) -> Result<usize, Errno> {
         let mut msg = Some(Message {
             data: buf.to_vec(),
             passed_fds,
+            passed_tokens,
         });
         cx.with_timeout(timeout)
             .wait_on_events(
@@ -1939,6 +1948,7 @@ impl<FS: ShimFS> UnixSocket<FS> {
                                 Message {
                                     data: core::mem::take(&mut msg.data),
                                     passed_fds: core::mem::take(&mut msg.passed_fds),
+                                    passed_tokens: core::mem::take(&mut msg.passed_tokens),
                                 },
                             ))
                         })
@@ -1957,6 +1967,7 @@ impl<FS: ShimFS> UnixSocket<FS> {
                                     Some(Message {
                                         data: buf,
                                         passed_fds: Vec::new(),
+                                        passed_tokens: Vec::new(),
                                     })
                                 }
                                 Err(_) => None,
@@ -2026,6 +2037,7 @@ impl<FS: ShimFS> UnixSocket<FS> {
         flags: SendFlags,
         addr: Option<UnixSocketAddr>,
         passed_fds: Vec<PassedFd>,
+        passed_tokens: Vec<litebox_common_linux::fd_transfer_frame::PassedToken>,
     ) -> Result<usize, Errno> {
         let supported_flags = SendFlags::DONTWAIT | SendFlags::NOSIGNAL;
         if flags.intersects(supported_flags.complement()) {
@@ -2044,6 +2056,7 @@ impl<FS: ShimFS> UnixSocket<FS> {
                 addr,
                 self.sock_type == SockType::SeqPacket,
                 passed_fds,
+                passed_tokens,
             ),
             UnixSocketInner::Datagram(datagram) => {
                 datagram.sendto(task, timeout, buf, is_nonblocking, addr, passed_fds)
@@ -2060,9 +2073,16 @@ impl<FS: ShimFS> UnixSocket<FS> {
         let is_nonblocking = self.get_status().contains(OFlags::NONBLOCK);
         let timeout = self.options.lock().send_timeout;
         match &self.inner {
-            UnixSocketInner::Stream(stream) => {
-                stream.sendto(cx, timeout, buf, is_nonblocking, None, false, Vec::new())
-            }
+            UnixSocketInner::Stream(stream) => stream.sendto(
+                cx,
+                timeout,
+                buf,
+                is_nonblocking,
+                None,
+                false,
+                Vec::new(),
+                Vec::new(),
+            ),
             UnixSocketInner::Datagram(_) => Err(Errno::ENOTSUP),
         }
     }
