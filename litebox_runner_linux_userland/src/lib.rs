@@ -2828,39 +2828,48 @@ fn setup_broker_eventfd_provider(broker_path: &str) -> anyhow::Result<()> {
     use litebox_common_linux::shmem_ring::ShmemRingPair;
     use std::sync::Arc;
 
-    // Phase B-Step8c (Step9-amended): connect, create the ring, register
-    // it with the broker. The full setup that spawns the
-    // `NotificationDispatcher` reader thread is intentionally NOT done
-    // here — that thread breaks fork-restore: the runner's snapshot/
-    // restore mechanism does not yet handle extra threads in the parent
-    // process at fork-snapshot time, and tests that fork the runner
-    // (DifferentProcess agents under Tcp transport) reliably hang
-    // with the dispatcher thread alive.
+    // Phase B-Step9 + followup:
     //
-    // Without the dispatcher, broker-backed eventfds will not receive
-    // broker→worker notifications, so `sys_eventfd2` falls back to a
-    // local `EventFile::new` (set_broker_eventfd_provider is NOT called
-    // here). The cross-worker SCM_RIGHTS path for broker-backed
-    // eventfds therefore remains gated on a follow-up that integrates
-    // the dispatcher with the runner's existing event loop (or makes
-    // the thread fork-safe).
+    // We connect to the broker, create the notification ring, and
+    // register it — these are all synchronous setup steps that validate
+    // the broker is reachable and that the runner-side wiring is sound.
+    //
+    // We deliberately do NOT install the global broker eventfd
+    // provider (and therefore do not spawn the dispatcher reader
+    // thread). Installing the provider would keep the FdTokenClient
+    // UnixStream alive past this function, and any long-lived
+    // runner-side broker state (open socket fd to the broker, the
+    // dispatcher reader thread, or the ShmemRingPair memfds) breaks
+    // the runner's fork-snapshot/restore mechanism: tests that fork
+    // the runner (DifferentProcess agents under the UnixTransport::Tcp
+    // cross-worker arm) reliably hang.
+    //
+    // Concretely, two distinct issues block durable broker state in
+    // the parent runner:
+    //
+    //   1. An open broker-side UnixStream is inherited by every
+    //      worker fork; the child runner has no idea what to do with
+    //      it and the broker doesn't either.
+    //   2. The NotificationDispatcher reader thread, if spawned,
+    //      becomes a parent-side thread at fork-snapshot time, which
+    //      the snapshot/restore mechanism does not yet handle.
+    //
+    // Without an installed provider, `sys_eventfd2` falls back to
+    // local `EventFile::new`, so cross-worker broker-backed eventfd
+    // SCM_RIGHTS transfer remains gated. See todo
+    // `b-step12-dispatcher-forksafe` for the unblock plan.
     let path = std::path::Path::new(broker_path);
-    let client = Arc::new(
-        FdTokenClient::connect(path)
-            .map_err(|e| anyhow!("connect to fd-token broker at {broker_path}: {e}"))?,
-    );
-
+    let client = FdTokenClient::connect(path)
+        .map_err(|e| anyhow!("connect to fd-token broker at {broker_path}: {e}"))?;
     let (_pair, tx_fd, rx_fd) =
         ShmemRingPair::create().map_err(|e| anyhow!("create notification ring pair: {e:?}"))?;
     client
         .register_notification_ring(tx_fd, rx_fd)
         .map_err(|e| anyhow!("register notification ring with broker: {e}"))?;
 
-    // NOTE: deliberately not starting the dispatcher / installing the
-    // provider here. See the comment above. The infrastructure is in
-    // place; a later commit will turn this on once fork-restore can
-    // cope with the reader thread.
-    let _ = client;
+    // Drop everything here: client closes (closing the broker
+    // UnixStream), pair drops (closing memfds), no thread spawn.
+    let _ = Arc::new(client); // keep the use-of-Arc shape for upgrade later
     Ok(())
 }
 
@@ -3084,26 +3093,33 @@ mod tests {
     /// Phase B-Step9 followup pin test.
     ///
     /// Documents (and locks in) the current contract of
-    /// [`setup_broker_eventfd_provider`]: it MUST NOT spawn a
-    /// background reader thread nor call
-    /// [`litebox_shim_linux::syscalls::set_broker_eventfd_provider`].
+    /// [`setup_broker_eventfd_provider`]: it MUST NOT leave any
+    /// long-lived runner-side broker state alive past return.
     ///
-    /// Why: the runner's fork-snapshot/restore mechanism does not yet
-    /// handle threads that exist in the parent at fork-snapshot time.
-    /// An extra background thread reliably hangs cross-worker SCM
-    /// tests (`SCM.pass_two_fds_one_msg.dpg1_to_dpg2` and friends).
-    /// See the comment on `setup_broker_eventfd_provider` for the
-    /// follow-up plan.
+    /// Two specific things would break the runner's fork-snapshot/
+    /// restore mechanism if left alive: a `NotificationDispatcher`
+    /// reader thread, and the `FdTokenClient`'s open broker
+    /// UnixStream. Both are dropped before this function returns.
     ///
-    /// If a future change re-introduces the dispatcher thread without
-    /// first making it fork-safe, this test will catch the regression
-    /// at unit-test time instead of waiting for the 30+ minute
-    /// integration cycle.
+    /// Why: with either of these alive, cross-worker SCM tests
+    /// (`SCM.pass_two_fds_one_msg.dpg1_to_dpg2` and friends) reliably
+    /// hang in worker startup. Verified empirically by 30-min docker
+    /// integration cycles + parent-thread bisect.
+    ///
+    /// This test catches a future regression at unit-test time by
+    /// asserting (a) thread count didn't grow, and (b) the global
+    /// broker eventfd provider remains uninstalled, so `sys_eventfd2`
+    /// continues to take the local-fallback path. The full
+    /// cross-worker eventfd SCM_RIGHTS path is gated on a future
+    /// step (`b-step12-dispatcher-forksafe`) that makes broker state
+    /// fork-safe.
     #[test]
-    fn setup_broker_eventfd_provider_does_not_install_provider() {
+    fn setup_broker_eventfd_provider_leaves_no_long_lived_state() {
         use litebox_broker::fd_token_socket::spawn_control_listener;
         use litebox_broker::fd_tokens::BrokerFdTokenRegistry;
         use litebox_broker::state_registry::BrokerStateRegistry;
+        use litebox_common_linux::fd_token_client::FdTokenClient;
+        use litebox_common_linux::shmem_ring::ShmemRingPair;
         use std::sync::Arc;
         use tempfile::tempdir;
 
@@ -3123,32 +3139,35 @@ mod tests {
         }
         assert!(path.exists(), "broker control socket never appeared");
 
-        // Snapshot live thread count before setup. We can't use
-        // a precise check (tracing-subscriber's worker threads, libtest
-        // background threads etc. all show up), so we count delta.
-        let before = thread_count_after_settling();
+        // Establish a baseline equal to what setup_broker_eventfd_provider
+        // does internally — connect + create-ring + register-ring —
+        // then drop everything. This captures the broker-side
+        // per-connection handler thread that arises from any client
+        // connect; we want to verify setup doesn't add MORE than that.
+        let client_baseline = FdTokenClient::connect(&path).expect("connect baseline");
+        let (_pair_baseline, tx_fd, rx_fd) = ShmemRingPair::create().expect("create ring baseline");
+        client_baseline
+            .register_notification_ring(tx_fd, rx_fd)
+            .expect("register baseline");
+        drop(client_baseline);
+        let baseline = thread_count_after_settling();
+
         let result = setup_broker_eventfd_provider(path.to_str().expect("path utf8"));
         assert!(result.is_ok(), "setup must succeed: {result:?}");
         let after = thread_count_after_settling();
 
-        // GUARANTEE: setup_broker_eventfd_provider must NOT increase
-        // the thread count. The notification dispatcher thread is
-        // currently the only thread this function would ever spawn,
-        // and it must stay deferred.
         assert!(
-            after <= before,
-            "setup_broker_eventfd_provider must not spawn background threads \
-             (before={before}, after={after}); see fork-restore safety comment",
+            after <= baseline,
+            "setup_broker_eventfd_provider must not spawn a runner-side reader thread \
+             (baseline={baseline}, after={after}); see fork-restore safety comment",
         );
 
-        // Also assert the global provider was NOT installed. A subsequent
-        // sys_eventfd2 call (in real usage) will therefore fall back to
-        // local EventFile::new — which is what we want until the
-        // dispatcher integration is fork-safe.
+        // Provider must NOT be installed; sys_eventfd2 must fall back
+        // to local EventFile::new.
         assert!(
             litebox_shim_linux::syscalls::broker_eventfd_provider().is_none(),
-            "broker eventfd provider must not be installed; see fork-restore \
-             safety comment on setup_broker_eventfd_provider",
+            "broker eventfd provider must not be installed; cross-worker broker-backed \
+             eventfd transfer is gated on Step 12 (fork-safe broker state)",
         );
     }
 

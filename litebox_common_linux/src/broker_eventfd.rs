@@ -97,6 +97,26 @@ impl NotificationDispatcher {
         dispatcher
     }
 
+    /// Creates a dispatcher with NO reader thread. Subscriptions can
+    /// still be registered but broker→worker notifications will never
+    /// be delivered (poll/epoll on a broker-backed eventfd will not
+    /// wake from a cross-worker write). Synchronous RPC operations
+    /// (create/read/write/release/dup) on the corresponding
+    /// `FdTokenClient` are unaffected.
+    ///
+    /// Phase B-Step9 followup: the runner uses this constructor
+    /// because spawning a background thread in the parent process
+    /// breaks fork-snapshot/restore. A future Step 12 will either
+    /// integrate the loop into the runner's event loop or make the
+    /// thread fork-safe.
+    pub fn start_without_reader_thread() -> Arc<Self> {
+        Arc::new(Self {
+            callbacks: Arc::new(Mutex::new(HashMap::new())),
+            next_id: AtomicU64::new(1),
+            thread_handle: Mutex::new(None),
+        })
+    }
+
     /// Allocates a fresh `subscription_id` unique to this dispatcher.
     pub fn alloc_subscription_id(&self) -> u64 {
         self.next_id.fetch_add(1, Ordering::Relaxed)
