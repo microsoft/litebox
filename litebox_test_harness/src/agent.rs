@@ -166,6 +166,61 @@ struct EpollEntry {
     registered: HashMap<i32, EpollRegisteredFd>,
 }
 
+/// All per-agent mutable state, lifted from `agent_loop`'s locals.
+///
+/// Phase 0 of the handler refactor: this struct exists so subsequent
+/// phases can move per-family match arms into family files that take
+/// `&mut AgentState`. As families migrate to straight-line handlers,
+/// the per-family handle tables (e.g. `inotifies`, `next_inotify_id`)
+/// will be deleted from this struct — handlers will hold those
+/// resources in their own stack frames.
+///
+/// Terminal shape after Phase 2 is just `{ self_exe, children }`;
+/// during migration the struct shrinks one field-pair per family.
+pub(crate) struct AgentState {
+    children: HashMap<String, ChildHandle>,
+    listeners: HashMap<u16, Vec<ListenerEntry>>,
+    unix_listeners: HashMap<String, tokio::task::JoinHandle<()>>,
+    unix_pair_listeners: HashMap<String, StdUnixListener>,
+    unix_pairs: HashMap<u64, OwnedFd>,
+    next_unix_pair_id: u64,
+    connections: HashMap<u64, TcpConn>,
+    next_conn_id: u64,
+    eventfds: HashMap<u64, EventfdEntry>,
+    next_eventfd_id: u64,
+    pty_masters: HashMap<u64, PtyMaster>,
+    next_pty_id: u64,
+    epolls: HashMap<u64, EpollEntry>,
+    next_epoll_id: u64,
+    inotifies: HashMap<u64, OwnedFd>,
+    next_inotify_id: u64,
+    background_pids: HashMap<u32, BackgroundProcess>,
+}
+
+impl AgentState {
+    fn new(listeners: HashMap<u16, Vec<ListenerEntry>>) -> Self {
+        Self {
+            children: HashMap::new(),
+            listeners,
+            unix_listeners: HashMap::new(),
+            unix_pair_listeners: HashMap::new(),
+            unix_pairs: HashMap::new(),
+            next_unix_pair_id: 1,
+            connections: HashMap::new(),
+            next_conn_id: 1,
+            eventfds: HashMap::new(),
+            next_eventfd_id: 1,
+            pty_masters: HashMap::new(),
+            next_pty_id: 1,
+            epolls: HashMap::new(),
+            next_epoll_id: 1,
+            inotifies: HashMap::new(),
+            next_inotify_id: 1,
+            background_pids: HashMap::new(),
+        }
+    }
+}
+
 /// Run the agent. Reads commands from stdin, executes, responds on stdout.
 pub fn run(self_exe: &str) {
     tokio::runtime::Builder::new_current_thread()
@@ -179,29 +234,38 @@ pub fn run(self_exe: &str) {
 async fn agent_loop(self_exe: &str) {
     let stdin = tokio::io::stdin();
     let mut reader = BufReader::new(stdin);
-    let mut children: HashMap<String, ChildHandle> = HashMap::new();
-    let mut listeners = match import_inherited_listeners() {
+    let imported_listeners = match import_inherited_listeners() {
         Ok(listeners) => listeners,
         Err(error) => {
             eprintln!("[agent] failed to import inherited listen fds: {error}");
             HashMap::new()
         }
     };
-    let mut unix_listeners: HashMap<String, tokio::task::JoinHandle<()>> = HashMap::new();
-    let mut unix_pair_listeners: HashMap<String, StdUnixListener> = HashMap::new();
-    let mut unix_pairs: HashMap<u64, OwnedFd> = HashMap::new();
-    let mut next_unix_pair_id = 1u64;
-    let mut connections: HashMap<u64, TcpConn> = HashMap::new();
-    let mut next_conn_id = 1u64;
-    let mut eventfds: HashMap<u64, EventfdEntry> = HashMap::new();
-    let mut next_eventfd_id = 1u64;
-    let mut pty_masters: HashMap<u64, PtyMaster> = HashMap::new();
-    let mut next_pty_id = 1u64;
-    let mut epolls: HashMap<u64, EpollEntry> = HashMap::new();
-    let mut next_epoll_id = 1u64;
-    let mut inotifies: HashMap<u64, OwnedFd> = HashMap::new();
-    let mut next_inotify_id = 1u64;
-    let mut background_pids: HashMap<u32, BackgroundProcess> = HashMap::new();
+    let mut state = AgentState::new(imported_listeners);
+    // Destructure-bind every field as a local `&mut` reference so the
+    // existing match arms can keep their syntax (`inotifies.insert(...)`
+    // rather than `state.inotifies.insert(...)`). Phase 2 family
+    // migrations will replace these bindings with `&mut AgentState`
+    // passed to family-local dispatch functions.
+    let AgentState {
+        children,
+        listeners,
+        unix_listeners,
+        unix_pair_listeners,
+        unix_pairs,
+        next_unix_pair_id,
+        connections,
+        next_conn_id,
+        eventfds,
+        next_eventfd_id,
+        pty_masters,
+        next_pty_id,
+        epolls,
+        next_epoll_id,
+        inotifies,
+        next_inotify_id,
+        background_pids,
+    } = &mut state;
 
     let mut line = String::new();
     loop {
@@ -576,7 +640,7 @@ async fn agent_loop(self_exe: &str) {
             }
 
             Command::NetOpen { addr } => {
-                if next_conn_id == u64::MAX {
+                if *next_conn_id == u64::MAX {
                     respond(&Response::Error {
                         error: "connection id space exhausted".to_string(),
                     })
@@ -586,8 +650,8 @@ async fn agent_loop(self_exe: &str) {
                 match tokio::time::timeout(Duration::from_secs(5), TcpStream::connect(&addr)).await
                 {
                     Ok(Ok(stream)) => {
-                        let conn = next_conn_id;
-                        next_conn_id += 1;
+                        let conn = *next_conn_id;
+                        *next_conn_id += 1;
                         connections.insert(conn, Arc::new(tokio::sync::Mutex::new(stream)));
                         respond(&Response::Opened { conn }).await;
                     }
@@ -729,7 +793,7 @@ async fn agent_loop(self_exe: &str) {
                 };
                 if connections.remove(&conn).is_some() {
                     if let Some(fd) = fd {
-                        remove_epoll_registration(&mut epolls, fd);
+                        remove_epoll_registration(epolls, fd);
                     }
                     respond(&Response::Closed).await;
                 } else {
@@ -781,7 +845,7 @@ async fn agent_loop(self_exe: &str) {
             }
 
             Command::EpollCreate => {
-                if next_epoll_id == u64::MAX {
+                if *next_epoll_id == u64::MAX {
                     respond(&Response::Error {
                         error: "epoll id space exhausted".to_string(),
                     })
@@ -797,8 +861,8 @@ async fn agent_loop(self_exe: &str) {
                     .await;
                     continue;
                 }
-                let id = next_epoll_id;
-                next_epoll_id += 1;
+                let id = *next_epoll_id;
+                *next_epoll_id += 1;
                 epolls.insert(
                     id,
                     EpollEntry {
@@ -1470,7 +1534,7 @@ async fn agent_loop(self_exe: &str) {
             }
 
             Command::UnixPair {} => {
-                if next_unix_pair_id > u64::MAX - 2 {
+                if *next_unix_pair_id > u64::MAX - 2 {
                     respond(&Response::Error {
                         error: "unix pair id space exhausted".to_string(),
                     })
@@ -1479,9 +1543,9 @@ async fn agent_loop(self_exe: &str) {
                 }
                 match create_unix_socketpair() {
                     Ok((left_fd, right_fd)) => {
-                        let left = next_unix_pair_id;
-                        let right = next_unix_pair_id + 1;
-                        next_unix_pair_id += 2;
+                        let left = *next_unix_pair_id;
+                        let right = *next_unix_pair_id + 1;
+                        *next_unix_pair_id += 2;
                         unix_pairs.insert(left, left_fd);
                         unix_pairs.insert(right, right_fd);
                         respond(&Response::UnixPairHandle { left, right }).await;
@@ -1499,12 +1563,10 @@ async fn agent_loop(self_exe: &str) {
             },
 
             Command::UnixPairConnect { path } => match StdUnixStream::connect(&path) {
-                Ok(stream) => {
-                    match register_unix_stream(stream, &mut unix_pairs, &mut next_unix_pair_id) {
-                        Ok(id) => respond(&Response::UnixPairHandle { left: id, right: 0 }).await,
-                        Err(error) => respond(&Response::Error { error }).await,
-                    }
-                }
+                Ok(stream) => match register_unix_stream(stream, unix_pairs, next_unix_pair_id) {
+                    Ok(id) => respond(&Response::UnixPairHandle { left: id, right: 0 }).await,
+                    Err(error) => respond(&Response::Error { error }).await,
+                },
                 Err(e) => {
                     respond(&Response::ConnectFailed {
                         error: format!("unix connect({path}): {e}"),
@@ -1523,8 +1585,7 @@ async fn agent_loop(self_exe: &str) {
                 };
                 match listener.accept() {
                     Ok((stream, _)) => {
-                        match register_unix_stream(stream, &mut unix_pairs, &mut next_unix_pair_id)
-                        {
+                        match register_unix_stream(stream, unix_pairs, next_unix_pair_id) {
                             Ok(id) => {
                                 respond(&Response::UnixPairHandle { left: id, right: 0 }).await
                             }
@@ -1576,12 +1637,12 @@ async fn agent_loop(self_exe: &str) {
                     Ok((received, payload)) => {
                         match register_received_fds(
                             received,
-                            &mut eventfds,
-                            &mut next_eventfd_id,
-                            &mut connections,
-                            &mut next_conn_id,
-                            &mut unix_pairs,
-                            &mut next_unix_pair_id,
+                            eventfds,
+                            next_eventfd_id,
+                            connections,
+                            next_conn_id,
+                            unix_pairs,
+                            next_unix_pair_id,
                         ) {
                             Ok(received) => {
                                 respond(&Response::ReceivedFd { received, payload }).await
@@ -1827,7 +1888,7 @@ async fn agent_loop(self_exe: &str) {
             }
 
             Command::PtyOpen {} => {
-                if next_pty_id == u64::MAX {
+                if *next_pty_id == u64::MAX {
                     respond(&Response::Error {
                         error: "pty id space exhausted".to_string(),
                     })
@@ -1836,8 +1897,8 @@ async fn agent_loop(self_exe: &str) {
                 }
                 match open_pty_master() {
                     Ok(master_entry) => {
-                        let master = next_pty_id;
-                        next_pty_id += 1;
+                        let master = *next_pty_id;
+                        *next_pty_id += 1;
                         let slave_path = master_entry.slave_path.clone();
                         pty_masters.insert(master, master_entry);
                         respond(&Response::PtyHandle { master, slave_path }).await;
@@ -2143,7 +2204,7 @@ async fn agent_loop(self_exe: &str) {
             }
 
             Command::InotifyOpen {} => {
-                let id = next_inotify_id;
+                let id = *next_inotify_id;
                 if id == u64::MAX {
                     respond(&Response::Error {
                         error: "inotify id space exhausted".to_string(),
@@ -2153,7 +2214,7 @@ async fn agent_loop(self_exe: &str) {
                 }
                 match open_inotify() {
                     Ok(fd) => {
-                        next_inotify_id += 1;
+                        *next_inotify_id += 1;
                         inotifies.insert(id, fd);
                         respond(&Response::InotifyHandle { id }).await;
                     }
@@ -2215,7 +2276,7 @@ async fn agent_loop(self_exe: &str) {
             }
 
             Command::EventfdOpen { initval, flags } => {
-                let id = next_eventfd_id;
+                let id = *next_eventfd_id;
                 if id == u64::MAX {
                     respond(&Response::Error {
                         error: "eventfd id space exhausted".to_string(),
@@ -2225,7 +2286,7 @@ async fn agent_loop(self_exe: &str) {
                 }
                 match open_eventfd(initval, &flags) {
                     Ok(fd) => {
-                        next_eventfd_id += 1;
+                        *next_eventfd_id += 1;
                         eventfds.insert(
                             id,
                             EventfdEntry {
