@@ -3,7 +3,15 @@
 
 //! SCM_RIGHTS fd-passing tests over Unix domain sockets.
 
-use crate::protocol::{Command, FdRef, Response};
+use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
+use std::time::{Duration, Instant};
+
+use serde::{Deserialize, Serialize};
+
+use crate::handlers::{HandlerCtx, HandlerError, HandlerToken};
+use crate::os::eventfd::EventFd;
+use crate::os::unix_socket::{UnixListener, UnixStream};
+use crate::register_handler;
 
 use super::TestOutcome;
 use super::agents::{AgentHandle, AgentName};
@@ -90,45 +98,137 @@ const SCM_PAIRS: &[ScmPair] = &[
     },
 ];
 
+#[derive(Clone, Copy)]
 struct ScmScenario {
     name: &'static str,
-    run: for<'a, 'r> fn(
-        &'a mut RunContext<'r>,
-        &'a AgentHandle,
-        &'a AgentHandle,
-        &'static str,
-    ) -> ScmFuture<'a>,
+    kind: ScmKind,
 }
 
-type ScmFuture<'a> =
-    std::pin::Pin<Box<dyn std::future::Future<Output = Result<String, String>> + 'a>>;
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ScmKind {
+    PassEventfd,
+    PassTcpSocket,
+    PassThenCloseSender,
+    PassTwoFdsOneMsg,
+}
 
 const SCM_SCENARIOS: &[ScmScenario] = &[
     ScmScenario {
         name: "pass_eventfd",
-        run: run_pass_eventfd,
+        kind: ScmKind::PassEventfd,
     },
     ScmScenario {
         name: "pass_tcp_socket",
-        run: run_pass_tcp_socket,
+        kind: ScmKind::PassTcpSocket,
     },
     ScmScenario {
         name: "pass_then_close_sender",
-        run: run_pass_then_close_sender,
+        kind: ScmKind::PassThenCloseSender,
     },
     ScmScenario {
         name: "pass_two_fds_one_msg",
-        run: run_pass_two_fds_one_msg,
+        kind: ScmKind::PassTwoFdsOneMsg,
     },
 ];
 
+#[derive(Serialize, Deserialize)]
+struct ScmArgs {
+    kind: ScmKind,
+    socket_path: String,
+}
+
+#[derive(Serialize, Deserialize)]
+struct ReceiverStartArgs {
+    kind: ScmKind,
+    socket_path: String,
+    result_path: String,
+}
+
+#[derive(Serialize, Deserialize)]
+struct ReceiverFinishArgs {
+    result_path: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct ScmOut {
+    detail: String,
+}
+
+const SCM_RECEIVER: HandlerToken<ScmArgs, ScmOut> = HandlerToken::new("scm_rights.receiver");
+const SCM_SENDER: HandlerToken<ScmArgs, ()> = HandlerToken::new("scm_rights.sender");
+const SCM_RECEIVER_START: HandlerToken<ReceiverStartArgs, ()> =
+    HandlerToken::new("scm_rights.receiver_start");
+const SCM_RECEIVER_FINISH: HandlerToken<ReceiverFinishArgs, ScmOut> =
+    HandlerToken::new("scm_rights.receiver_finish");
+const SCM_SENDER_STAGED: HandlerToken<ScmArgs, ()> = HandlerToken::new("scm_rights.sender_staged");
+
+async fn handle_receiver(args: ScmArgs, ctx: &mut HandlerCtx<'_>) -> Result<ScmOut, HandlerError> {
+    let listener = UnixListener::bind(&args.socket_path)?;
+    ctx.checkpoint("scm_ready").await?;
+    accept_and_validate(args.kind, listener).map_err(HandlerError)
+}
+
+async fn handle_sender(args: ScmArgs, ctx: &mut HandlerCtx<'_>) -> Result<(), HandlerError> {
+    ctx.checkpoint("scm_ready").await?;
+    send_for_scenario(args.kind, &args.socket_path).map_err(HandlerError)
+}
+
+async fn handle_receiver_start(
+    args: ReceiverStartArgs,
+    _ctx: &mut HandlerCtx<'_>,
+) -> Result<(), HandlerError> {
+    let listener = UnixListener::bind(&args.socket_path)?;
+    std::thread::spawn(move || {
+        let result = accept_and_validate(args.kind, listener);
+        let encoded = serde_json::to_string(&result)
+            .unwrap_or_else(|e| format!("{{\"Err\":\"result serialize: {e}\"}}"));
+        let _ = std::fs::write(args.result_path, encoded);
+    });
+    Ok(())
+}
+
+async fn handle_sender_staged(
+    args: ScmArgs,
+    _ctx: &mut HandlerCtx<'_>,
+) -> Result<(), HandlerError> {
+    send_for_scenario(args.kind, &args.socket_path).map_err(HandlerError)
+}
+
+async fn handle_receiver_finish(
+    args: ReceiverFinishArgs,
+    _ctx: &mut HandlerCtx<'_>,
+) -> Result<ScmOut, HandlerError> {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        match std::fs::read_to_string(&args.result_path) {
+            Ok(contents) => {
+                let _ = std::fs::remove_file(&args.result_path);
+                let decoded: Result<ScmOut, String> = serde_json::from_str(&contents)
+                    .map_err(|e| HandlerError(format!("result deserialize: {e}: {contents}")))?;
+                return decoded.map_err(HandlerError);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound && Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Err(e) => return Err(HandlerError(format!("read receiver result: {e}"))),
+        }
+    }
+}
+
 pub(crate) fn register_scm_rights_tests(reg: &mut Registry<'_>) {
-    for pair in SCM_PAIRS {
+    register_handler!(SCM_RECEIVER, handle_receiver);
+    register_handler!(SCM_SENDER, handle_sender);
+    register_handler!(SCM_RECEIVER_START, handle_receiver_start);
+    register_handler!(SCM_RECEIVER_FINISH, handle_receiver_finish);
+    register_handler!(SCM_SENDER_STAGED, handle_sender_staged);
+
+    for &pair in SCM_PAIRS {
         for scenario in SCM_SCENARIOS {
             let id = format!("SCM.{}.{}_to_{}", scenario.name, pair.sender, pair.receiver);
             let label = format!("{}->{}", pair.sender, pair.receiver);
+            let kind = scenario.kind;
             let scenario_name = scenario.name;
-            let run_scenario = scenario.run;
             reg.test("vscode", "scm_rights", id)
                 .timeout(60)
                 .build(move |cx| {
@@ -137,7 +237,9 @@ pub(crate) fn register_scm_rights_tests(reg: &mut Registry<'_>) {
                     Box::new(move |run| {
                         let label = label.clone();
                         Box::pin(async move {
-                            let result = run_scenario(run, &sender, &receiver, scenario_name).await;
+                            let result =
+                                run_scenario(run, &sender, &receiver, pair, scenario_name, kind)
+                                    .await;
                             match result {
                                 Ok(detail) => TestOutcome::new(&label, true, detail),
                                 Err(detail) => TestOutcome::new(&label, false, detail),
@@ -149,290 +251,84 @@ pub(crate) fn register_scm_rights_tests(reg: &mut Registry<'_>) {
     }
 }
 
-fn run_pass_eventfd<'a>(
-    run: &'a mut RunContext<'_>,
-    sender: &'a AgentHandle,
-    receiver: &'a AgentHandle,
-    scenario: &'static str,
-) -> ScmFuture<'a> {
-    Box::pin(async move {
-        let (send_sock, recv_sock, path) =
-            open_scm_channel(run, sender, receiver, scenario).await?;
-        let source = eventfd_open(run, sender, 0, "nonblock|cloexec").await?;
-        send_fds(
-            run,
-            sender,
-            send_sock,
-            vec![FdRef::Eventfd(source)],
-            "eventfd",
-        )
-        .await?;
-        let received = recv_fds(run, receiver, recv_sock, 64, "eventfd").await?;
-        let received_id = expect_one_eventfd(received)?;
-        expect_closed(
-            run.send(receiver, Command::UnixPairClose { socket: recv_sock })
-                .await,
-            "receiver socket close",
-        )?;
-        expect_closed(
-            run.send(sender, Command::UnixPairClose { socket: send_sock })
-                .await,
-            "sender socket close",
-        )?;
-        expect_sent(
-            run.send(
-                sender,
-                Command::EventfdWrite {
-                    id: source,
-                    value: 7,
-                },
-            )
-            .await,
-            "write original eventfd",
-        )?;
-        expect_eventfd_value(
-            run.send(receiver, Command::EventfdRead { id: received_id })
-                .await,
-            7,
-            "read received eventfd",
-        )?;
-        cleanup_path(&path);
-        Ok(format!(
-            "source_eventfd={source} received_eventfd={received_id} value=7"
-        ))
-    })
-}
-
-fn run_pass_tcp_socket<'a>(
-    run: &'a mut RunContext<'_>,
-    sender: &'a AgentHandle,
-    receiver: &'a AgentHandle,
-    scenario: &'static str,
-) -> ScmFuture<'a> {
-    Box::pin(async move {
-        let (send_sock, recv_sock, path) =
-            open_scm_channel(run, sender, receiver, scenario).await?;
-        let listen = run
-            .send(
-                sender,
-                Command::NetListen {
-                    port: 0,
-                    pre_bind_options: vec![],
-                },
-            )
-            .await;
-        let port = super::expect_listening_port(&listen, 0)
-            .map_err(|e| format!("tcp listen failed: {e}; resp={listen:?}"))?;
-        let conn = expect_opened(
-            run.send(
-                sender,
-                Command::NetOpen {
-                    addr: format!("127.0.0.1:{port}"),
-                },
-            )
-            .await,
-            "open tcp conn",
-        )?;
-        send_fds(run, sender, send_sock, vec![FdRef::TcpConn(conn)], "tcp").await?;
-        let received = recv_fds(run, receiver, recv_sock, 64, "tcp").await?;
-        let received_conn = expect_one_tcp(received)?;
-        expect_sent(
-            run.send(
-                receiver,
-                Command::NetSend {
-                    conn: received_conn,
-                    data: "SCM_TCP_PAYLOAD".into(),
-                },
-            )
-            .await,
-            "send on received tcp",
-        )?;
-        let echo = expect_received(
-            run.send(
-                receiver,
-                Command::NetRecv {
-                    conn: received_conn,
-                    n_bytes: Some("SCM_TCP_PAYLOAD".len() as u32),
-                },
-            )
-            .await,
-            "recv tcp echo",
-        )?;
-        if echo != "SCM_TCP_PAYLOAD" {
-            return Err(format!("tcp echo mismatch: {echo:?}"));
-        }
-        let _ = run
-            .send(
-                receiver,
-                Command::NetClose {
-                    conn: received_conn,
-                },
-            )
-            .await;
-        let _ = run.send(sender, Command::NetClose { conn }).await;
-        let _ = run.send(sender, Command::NetUnlisten { port }).await;
-        let _ = run
-            .send(receiver, Command::UnixPairClose { socket: recv_sock })
-            .await;
-        let _ = run
-            .send(sender, Command::UnixPairClose { socket: send_sock })
-            .await;
-        cleanup_path(&path);
-        Ok(format!(
-            "source_conn={conn} received_conn={received_conn} echo=ok"
-        ))
-    })
-}
-
-fn run_pass_then_close_sender<'a>(
-    run: &'a mut RunContext<'_>,
-    sender: &'a AgentHandle,
-    receiver: &'a AgentHandle,
-    scenario: &'static str,
-) -> ScmFuture<'a> {
-    Box::pin(async move {
-        let (send_sock, recv_sock, path) =
-            open_scm_channel(run, sender, receiver, scenario).await?;
-        let source = eventfd_open(run, sender, 0, "nonblock|cloexec").await?;
-        send_fds(
-            run,
-            sender,
-            send_sock,
-            vec![FdRef::Eventfd(source)],
-            "close_sender",
-        )
-        .await?;
-        let received = recv_fds(run, receiver, recv_sock, 64, "close_sender").await?;
-        let received_id = expect_one_eventfd(received)?;
-        expect_closed(
-            run.send(sender, Command::EventfdClose { id: source }).await,
-            "close sender eventfd",
-        )?;
-        expect_sent(
-            run.send(
-                receiver,
-                Command::EventfdWrite {
-                    id: received_id,
-                    value: 5,
-                },
-            )
-            .await,
-            "write received eventfd after sender close",
-        )?;
-        expect_eventfd_value(
-            run.send(receiver, Command::EventfdRead { id: received_id })
-                .await,
-            5,
-            "read received eventfd after sender close",
-        )?;
-        let _ = run
-            .send(receiver, Command::UnixPairClose { socket: recv_sock })
-            .await;
-        let _ = run
-            .send(sender, Command::UnixPairClose { socket: send_sock })
-            .await;
-        cleanup_path(&path);
-        Ok(format!(
-            "closed_source={source} received_eventfd={received_id} still_works"
-        ))
-    })
-}
-
-fn run_pass_two_fds_one_msg<'a>(
-    run: &'a mut RunContext<'_>,
-    sender: &'a AgentHandle,
-    receiver: &'a AgentHandle,
-    scenario: &'static str,
-) -> ScmFuture<'a> {
-    Box::pin(async move {
-        let (send_sock, recv_sock, path) =
-            open_scm_channel(run, sender, receiver, scenario).await?;
-        let first = eventfd_open(run, sender, 0, "nonblock|cloexec").await?;
-        let second = eventfd_open(run, sender, 0, "nonblock|cloexec").await?;
-        send_fds(
-            run,
-            sender,
-            send_sock,
-            vec![FdRef::Eventfd(first), FdRef::Eventfd(second)],
-            "two_eventfds",
-        )
-        .await?;
-        let received = recv_fds(run, receiver, recv_sock, 64, "two_eventfds").await?;
-        let ids = expect_eventfds(received, 2)?;
-        expect_sent(
-            run.send(
-                sender,
-                Command::EventfdWrite {
-                    id: first,
-                    value: 11,
-                },
-            )
-            .await,
-            "write first original eventfd",
-        )?;
-        expect_sent(
-            run.send(
-                sender,
-                Command::EventfdWrite {
-                    id: second,
-                    value: 13,
-                },
-            )
-            .await,
-            "write second original eventfd",
-        )?;
-        expect_eventfd_value(
-            run.send(receiver, Command::EventfdRead { id: ids[0] })
-                .await,
-            11,
-            "read first received eventfd",
-        )?;
-        expect_eventfd_value(
-            run.send(receiver, Command::EventfdRead { id: ids[1] })
-                .await,
-            13,
-            "read second received eventfd",
-        )?;
-        let _ = run
-            .send(receiver, Command::UnixPairClose { socket: recv_sock })
-            .await;
-        let _ = run
-            .send(sender, Command::UnixPairClose { socket: send_sock })
-            .await;
-        cleanup_path(&path);
-        Ok(format!("received_eventfds={ids:?} values=11,13"))
-    })
-}
-
-async fn open_scm_channel(
+async fn run_scenario(
     run: &mut RunContext<'_>,
     sender: &AgentHandle,
     receiver: &AgentHandle,
+    pair: ScmPair,
     scenario: &str,
-) -> Result<(u64, u64, String), String> {
-    let path = format!(
-        "/run/litebox-scm-{}-{scenario}-{}.sock",
-        std::process::id(),
-        monotonic_suffix()
-    );
-    match run
-        .send(receiver, Command::UnixPairListen { path: path.clone() })
-        .await
-    {
-        Response::UnixListening { path: observed } if observed == path => {}
-        other => return Err(format!("unix pair listen failed: {other:?}")),
+    kind: ScmKind,
+) -> Result<String, String> {
+    let socket_path = unique_path(scenario, "sock");
+    if same_direct_pipe(pair.sender, pair.receiver) {
+        run_staged(run, sender, receiver, kind, socket_path).await
+    } else {
+        let out = run
+            .rendezvous_pair(
+                receiver,
+                &SCM_RECEIVER,
+                ScmArgs {
+                    kind,
+                    socket_path: socket_path.clone(),
+                },
+                sender,
+                &SCM_SENDER,
+                ScmArgs { kind, socket_path },
+                "scm_ready",
+            )
+            .await?;
+        Ok(out.detail)
     }
-    let send_sock = expect_unix_endpoint(
-        run.send(sender, Command::UnixPairConnect { path: path.clone() })
-            .await,
-        "unix pair connect",
-    )?;
-    let recv_sock = expect_unix_endpoint(
-        run.send(receiver, Command::UnixPairAccept { path: path.clone() })
-            .await,
-        "unix pair accept",
-    )?;
-    Ok((send_sock, recv_sock, path))
+}
+
+async fn run_staged(
+    run: &mut RunContext<'_>,
+    sender: &AgentHandle,
+    receiver: &AgentHandle,
+    kind: ScmKind,
+    socket_path: String,
+) -> Result<String, String> {
+    let result_path = unique_path("result", "json");
+    run.send_named_typed(
+        receiver,
+        &SCM_RECEIVER_START,
+        ReceiverStartArgs {
+            kind,
+            socket_path: socket_path.clone(),
+            result_path: result_path.clone(),
+        },
+    )
+    .await
+    .map_err(|e| format!("receiver_start: {e}"))?;
+    run.send_named_typed(sender, &SCM_SENDER_STAGED, ScmArgs { kind, socket_path })
+        .await
+        .map_err(|e| format!("sender_staged: {e}"))?;
+    let out = run
+        .send_named_typed(
+            receiver,
+            &SCM_RECEIVER_FINISH,
+            ReceiverFinishArgs { result_path },
+        )
+        .await
+        .map_err(|e| format!("receiver_finish: {e}"))?;
+    Ok(out.detail)
+}
+
+fn same_direct_pipe(left: AgentName, right: AgentName) -> bool {
+    direct_pipe(left) == direct_pipe(right)
+}
+
+fn direct_pipe(agent: AgentName) -> AgentName {
+    agent.ancestors().first().copied().unwrap_or(agent)
+}
+
+fn unique_path(scenario: &str, ext: &str) -> String {
+    format!(
+        "/run/litebox-scm-{}-{scenario}-{}.{}",
+        std::process::id(),
+        monotonic_suffix(),
+        ext
+    )
 }
 
 fn monotonic_suffix() -> u64 {
@@ -440,146 +336,307 @@ fn monotonic_suffix() -> u64 {
     NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
-fn cleanup_path(path: &str) {
-    let _ = std::fs::remove_file(path);
-}
-
-async fn eventfd_open(
-    run: &mut RunContext<'_>,
-    agent: &AgentHandle,
-    initval: u64,
-    flags: &str,
-) -> Result<u64, String> {
-    match run
-        .send(
-            agent,
-            Command::EventfdOpen {
-                initval,
-                flags: flags.to_string(),
-            },
-        )
-        .await
-    {
-        Response::EventfdHandle { id } => Ok(id),
-        other => Err(format!("eventfd_open({initval}, {flags:?}) got {other:?}")),
+fn accept_and_validate(kind: ScmKind, listener: UnixListener) -> Result<ScmOut, String> {
+    let stream = listener.accept()?;
+    match kind {
+        ScmKind::PassEventfd => receive_eventfd(stream, 7, false, "eventfd"),
+        ScmKind::PassTcpSocket => receive_tcp(stream),
+        ScmKind::PassThenCloseSender => receive_eventfd(stream, 5, true, "close_sender"),
+        ScmKind::PassTwoFdsOneMsg => receive_two_eventfds(stream),
     }
 }
 
-async fn send_fds(
-    run: &mut RunContext<'_>,
-    agent: &AgentHandle,
-    socket: u64,
-    sources: Vec<FdRef>,
-    payload: &str,
-) -> Result<(), String> {
-    expect_sent(
-        run.send(
-            agent,
-            Command::UnixSendFd {
-                socket,
-                sources,
-                payload: payload.to_string(),
-            },
-        )
-        .await,
-        "unix_send_fd",
-    )
+fn send_for_scenario(kind: ScmKind, socket_path: &str) -> Result<(), String> {
+    match kind {
+        ScmKind::PassEventfd => {
+            let ev = EventFd::open(0, "nonblock|cloexec").map_err(|e| e.to_string())?;
+            let stream = UnixStream::connect(socket_path)?;
+            stream.send_fd(ev.as_fd(), b"eventfd")?;
+            ev.write(7).map_err(|e| e.to_string())?;
+            Ok(())
+        }
+        ScmKind::PassTcpSocket => send_tcp(socket_path),
+        ScmKind::PassThenCloseSender => {
+            let ev = EventFd::open(0, "nonblock|cloexec").map_err(|e| e.to_string())?;
+            let source_fd = ev.as_raw_fd();
+            let stream = UnixStream::connect(socket_path)?;
+            stream.send_fd(ev.as_fd(), b"close_sender")?;
+            drop(ev);
+            if fd_is_open(source_fd) {
+                return Err(format!("source eventfd {source_fd} still open after drop"));
+            }
+            Ok(())
+        }
+        ScmKind::PassTwoFdsOneMsg => {
+            let first = EventFd::open(0, "nonblock|cloexec").map_err(|e| e.to_string())?;
+            let second = EventFd::open(0, "nonblock|cloexec").map_err(|e| e.to_string())?;
+            let stream = UnixStream::connect(socket_path)?;
+            stream.send_fds(&[first.as_fd(), second.as_fd()], b"two_eventfds")?;
+            first.write(11).map_err(|e| e.to_string())?;
+            second.write(13).map_err(|e| e.to_string())?;
+            Ok(())
+        }
+    }
 }
 
-async fn recv_fds(
-    run: &mut RunContext<'_>,
-    agent: &AgentHandle,
-    socket: u64,
-    max_payload: u32,
+fn receive_eventfd(
+    stream: UnixStream,
+    expected: u64,
+    write_received: bool,
     expected_payload: &str,
-) -> Result<Vec<FdRef>, String> {
-    match run
-        .send(
-            agent,
-            Command::UnixRecvFd {
-                socket,
-                max_payload,
-            },
+) -> Result<ScmOut, String> {
+    let (fd, payload) = stream.recv_fd(64)?;
+    expect_payload(&payload, expected_payload)?;
+    let ev = eventfd_from_received(fd);
+    if write_received {
+        ev.write(expected).map_err(|e| e.to_string())?;
+    }
+    let value = ev.read().map_err(|e| e.to_string())?;
+    if value != expected {
+        return Err(format!("expected eventfd value {expected}, got {value}"));
+    }
+    Ok(ScmOut {
+        detail: format!("received_eventfd_fd={} value={value}", ev.as_raw_fd()),
+    })
+}
+
+fn receive_two_eventfds(stream: UnixStream) -> Result<ScmOut, String> {
+    let (fds, payload) = stream.recv_fds(64, 2)?;
+    expect_payload(&payload, "two_eventfds")?;
+    if fds.len() != 2 {
+        return Err(format!("expected 2 eventfds, got {}", fds.len()));
+    }
+    let mut iter = fds.into_iter();
+    let first = eventfd_from_received(iter.next().expect("len checked"));
+    let second = eventfd_from_received(iter.next().expect("len checked"));
+    let first_value = first.read().map_err(|e| e.to_string())?;
+    let second_value = second.read().map_err(|e| e.to_string())?;
+    if first_value != 11 || second_value != 13 {
+        return Err(format!(
+            "expected eventfd values 11,13 got {first_value},{second_value}"
+        ));
+    }
+    Ok(ScmOut {
+        detail: format!(
+            "received_eventfds=[{},{}] values=11,13",
+            first.as_raw_fd(),
+            second.as_raw_fd()
+        ),
+    })
+}
+
+fn send_tcp(socket_path: &str) -> Result<(), String> {
+    let listener = tcp_listener()?;
+    let port = listener_port(listener.as_raw_fd())?;
+    std::thread::spawn(move || {
+        let _ = tcp_echo_once(listener);
+    });
+    let conn = tcp_connect(port)?;
+    let stream = UnixStream::connect(socket_path)?;
+    stream.send_fd(conn.as_fd(), b"tcp")?;
+    Ok(())
+}
+
+fn receive_tcp(stream: UnixStream) -> Result<ScmOut, String> {
+    let (fd, payload) = stream.recv_fd(64)?;
+    expect_payload(&payload, "tcp")?;
+    let raw = fd.as_raw_fd();
+    let payload = b"SCM_TCP_PAYLOAD";
+    write_all(raw, payload)?;
+    let echoed = read_exact(raw, payload.len())?;
+    if echoed != payload {
+        return Err(format!(
+            "tcp echo mismatch: {:?}",
+            String::from_utf8_lossy(&echoed)
+        ));
+    }
+    Ok(ScmOut {
+        detail: format!("received_tcp_fd={raw} echo=ok"),
+    })
+}
+
+fn tcp_listener() -> Result<OwnedFd, String> {
+    // SAFETY: socket creates a fresh fd on success.
+    let raw = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0) };
+    if raw < 0 {
+        return Err(format!("tcp socket: {}", std::io::Error::last_os_error()));
+    }
+    // SAFETY: raw was just returned by socket and is uniquely owned here.
+    let fd = unsafe { OwnedFd::from_raw_fd(raw) };
+    let one: libc::c_int = 1;
+    // SAFETY: setsockopt reads `one` and does not take ownership of fd.
+    let _ = unsafe {
+        libc::setsockopt(
+            fd.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_REUSEADDR,
+            std::ptr::addr_of!(one).cast(),
+            std::mem::size_of_val(&one) as libc::socklen_t,
         )
-        .await
+    };
+    let addr = libc::sockaddr_in {
+        sin_family: libc::AF_INET as libc::sa_family_t,
+        sin_port: 0,
+        sin_addr: libc::in_addr {
+            s_addr: libc::INADDR_LOOPBACK.to_be(),
+        },
+        sin_zero: [0; 8],
+    };
+    // SAFETY: addr points to a valid IPv4 sockaddr and fd is a live TCP socket.
+    let rc = unsafe {
+        libc::bind(
+            fd.as_raw_fd(),
+            std::ptr::addr_of!(addr).cast::<libc::sockaddr>(),
+            std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+        )
+    };
+    if rc != 0 {
+        return Err(format!("tcp bind: {}", std::io::Error::last_os_error()));
+    }
+    // SAFETY: fd is a live bound TCP socket.
+    if unsafe { libc::listen(fd.as_raw_fd(), 1) } != 0 {
+        return Err(format!("tcp listen: {}", std::io::Error::last_os_error()));
+    }
+    Ok(fd)
+}
+
+fn listener_port(fd: i32) -> Result<u16, String> {
+    // SAFETY: zeroed sockaddr_in is an output buffer for getsockname.
+    let mut addr: libc::sockaddr_in = unsafe { std::mem::zeroed() };
+    let mut len = std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
+    // SAFETY: addr/len are writable and fd is a live socket.
+    if unsafe {
+        libc::getsockname(
+            fd,
+            std::ptr::addr_of_mut!(addr).cast::<libc::sockaddr>(),
+            &mut len,
+        )
+    } != 0
     {
-        Response::ReceivedFd { received, payload } if payload == expected_payload => Ok(received),
-        Response::ReceivedFd { received, payload } => Err(format!(
-            "received payload mismatch: expected {expected_payload:?}, got {payload:?}; fds={received:?}"
-        )),
-        other => Err(format!("expected ReceivedFd, got {other:?}")),
+        return Err(format!("getsockname: {}", std::io::Error::last_os_error()));
+    }
+    Ok(u16::from_be(addr.sin_port))
+}
+
+fn tcp_connect(port: u16) -> Result<OwnedFd, String> {
+    // SAFETY: socket creates a fresh fd on success.
+    let raw = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0) };
+    if raw < 0 {
+        return Err(format!("tcp socket: {}", std::io::Error::last_os_error()));
+    }
+    // SAFETY: raw was just returned by socket and is uniquely owned here.
+    let fd = unsafe { OwnedFd::from_raw_fd(raw) };
+    let addr = libc::sockaddr_in {
+        sin_family: libc::AF_INET as libc::sa_family_t,
+        sin_port: port.to_be(),
+        sin_addr: libc::in_addr {
+            s_addr: libc::INADDR_LOOPBACK.to_be(),
+        },
+        sin_zero: [0; 8],
+    };
+    // SAFETY: addr points to a valid IPv4 sockaddr and fd is a live TCP socket.
+    let rc = unsafe {
+        libc::connect(
+            fd.as_raw_fd(),
+            std::ptr::addr_of!(addr).cast::<libc::sockaddr>(),
+            std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+        )
+    };
+    if rc != 0 {
+        return Err(format!("tcp connect: {}", std::io::Error::last_os_error()));
+    }
+    Ok(fd)
+}
+
+fn tcp_echo_once(listener: OwnedFd) -> Result<(), String> {
+    let accepted = loop {
+        // SAFETY: accept4 operates on the live listener fd and returns a fresh fd on success.
+        let raw = unsafe {
+            libc::accept4(
+                listener.as_raw_fd(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                libc::SOCK_CLOEXEC,
+            )
+        };
+        if raw >= 0 {
+            // SAFETY: raw was just returned by accept4 and is uniquely owned here.
+            break unsafe { OwnedFd::from_raw_fd(raw) };
+        }
+        let err = std::io::Error::last_os_error();
+        if err.raw_os_error() != Some(libc::EINTR) {
+            return Err(format!("tcp accept: {err}"));
+        }
+    };
+    let mut buf = [0u8; 4096];
+    loop {
+        let n = read_some(accepted.as_raw_fd(), &mut buf)?;
+        if n == 0 {
+            return Ok(());
+        }
+        write_all(accepted.as_raw_fd(), &buf[..n])?;
     }
 }
 
-fn expect_unix_endpoint(resp: Response, label: &str) -> Result<u64, String> {
-    match resp {
-        Response::UnixPairHandle { left, .. } if left != 0 => Ok(left),
-        other => Err(format!("{label}: expected UnixPairHandle, got {other:?}")),
+fn read_some(fd: i32, buf: &mut [u8]) -> Result<usize, String> {
+    loop {
+        // SAFETY: buf is writable and fd is a live descriptor.
+        let rc = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) };
+        if rc >= 0 {
+            return Ok(rc as usize);
+        }
+        let err = std::io::Error::last_os_error();
+        if err.raw_os_error() != Some(libc::EINTR) {
+            return Err(format!("read fd {fd}: {err}"));
+        }
     }
 }
 
-fn expect_one_eventfd(received: Vec<FdRef>) -> Result<u64, String> {
-    let ids = expect_eventfds(received, 1)?;
-    Ok(ids[0])
+fn read_exact(fd: i32, len: usize) -> Result<Vec<u8>, String> {
+    let mut out = vec![0u8; len];
+    let mut offset = 0;
+    while offset < len {
+        let n = read_some(fd, &mut out[offset..])?;
+        if n == 0 {
+            return Err(format!("read fd {fd}: EOF after {offset}/{len} bytes"));
+        }
+        offset += n;
+    }
+    Ok(out)
 }
 
-fn expect_eventfds(received: Vec<FdRef>, count: usize) -> Result<Vec<u64>, String> {
-    if received.len() != count {
-        return Err(format!("expected {count} received fds, got {received:?}"));
+fn write_all(fd: i32, mut data: &[u8]) -> Result<(), String> {
+    while !data.is_empty() {
+        // SAFETY: data is readable and fd is a live descriptor.
+        let rc = unsafe { libc::write(fd, data.as_ptr().cast(), data.len()) };
+        if rc > 0 {
+            data = &data[rc as usize..];
+            continue;
+        }
+        let err = std::io::Error::last_os_error();
+        if err.raw_os_error() != Some(libc::EINTR) {
+            return Err(format!("write fd {fd}: {err}"));
+        }
     }
-    received
-        .into_iter()
-        .map(|fd| match fd {
-            FdRef::Eventfd(id) => Ok(id),
-            other => Err(format!("expected received eventfd, got {other:?}")),
-        })
-        .collect()
+    Ok(())
 }
 
-fn expect_one_tcp(received: Vec<FdRef>) -> Result<u64, String> {
-    if received.len() != 1 {
-        return Err(format!("expected one received tcp fd, got {received:?}"));
-    }
-    match received[0] {
-        FdRef::TcpConn(id) => Ok(id),
-        ref other => Err(format!("expected received tcp conn, got {other:?}")),
-    }
+fn fd_is_open(fd: i32) -> bool {
+    // SAFETY: F_GETFD inspects descriptor state and does not take ownership.
+    (unsafe { libc::fcntl(fd, libc::F_GETFD) }) >= 0
 }
 
-fn expect_opened(resp: Response, label: &str) -> Result<u64, String> {
-    match resp {
-        Response::Opened { conn } => Ok(conn),
-        other => Err(format!("{label}: expected Opened, got {other:?}")),
-    }
-}
-
-fn expect_sent(resp: Response, label: &str) -> Result<(), String> {
-    match resp {
-        Response::Sent | Response::Ok { data: None } => Ok(()),
-        other => Err(format!("{label}: expected Sent, got {other:?}")),
-    }
-}
-
-fn expect_closed(resp: Response, label: &str) -> Result<(), String> {
-    match resp {
-        Response::Closed => Ok(()),
-        other => Err(format!("{label}: expected Closed, got {other:?}")),
+fn expect_payload(actual: &[u8], expected: &str) -> Result<(), String> {
+    if actual == expected.as_bytes() {
+        Ok(())
+    } else {
+        Err(format!(
+            "payload mismatch: expected {expected:?}, got {:?}",
+            String::from_utf8_lossy(actual)
+        ))
     }
 }
 
-fn expect_received(resp: Response, label: &str) -> Result<String, String> {
-    match resp {
-        Response::Received { data } => Ok(data),
-        other => Err(format!("{label}: expected Received, got {other:?}")),
-    }
-}
-
-fn expect_eventfd_value(resp: Response, expected: u64, label: &str) -> Result<(), String> {
-    match resp {
-        Response::EventfdValue { value } if value == expected => Ok(()),
-        Response::EventfdValue { value } => Err(format!(
-            "{label}: expected eventfd value {expected}, got {value}"
-        )),
-        other => Err(format!("{label}: expected EventfdValue, got {other:?}")),
-    }
+fn eventfd_from_received(fd: OwnedFd) -> EventFd {
+    EventFd::from_owned_fd(fd, 0)
 }

@@ -3,7 +3,7 @@
 
 //! Thin idiomatic wrapper over `eventfd(2)` for handler bodies.
 
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
 
 /// Owned eventfd file descriptor.
 pub struct EventFd {
@@ -36,6 +36,12 @@ pub fn parse_flags(flags: &str) -> Result<u32, String> {
 }
 
 impl EventFd {
+    /// Wrap an owned eventfd received from another process.
+    #[must_use]
+    pub fn from_owned_fd(fd: OwnedFd, flags: u32) -> Self {
+        Self { fd, flags }
+    }
+
     /// `eventfd(initval, flags)`. `flags` is parsed via
     /// [`parse_flags`].
     ///
@@ -71,6 +77,11 @@ impl EventFd {
     #[must_use]
     pub fn as_raw_fd(&self) -> i32 {
         self.fd.as_raw_fd()
+    }
+
+    #[must_use]
+    pub fn as_fd(&self) -> BorrowedFd<'_> {
+        self.fd.as_fd()
     }
 
     /// Read the eventfd counter. Returns `Err` with "EAGAIN" if no

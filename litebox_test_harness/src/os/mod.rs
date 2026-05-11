@@ -8,3 +8,4 @@ pub mod eventfd;
 pub mod inotify;
 pub mod pty;
 pub mod socket;
+pub mod unix_socket;
