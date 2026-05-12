@@ -20,6 +20,7 @@
 
 pub mod broker_eventfd_provider;
 pub mod fd_token_protocol;
+pub mod fd_transfer_frame;
 pub mod notification_frame;
 
 #[cfg(all(feature = "std", unix))]

@@ -10,7 +10,6 @@
 
 pub mod audit;
 pub mod cwfd;
-pub mod fd_tokens;
 pub mod net_proxy;
 pub mod nine_p;
 pub mod policy;
@@ -21,6 +20,6 @@ pub mod sock_compat;
 // modules now living under [`cwfd`]. Keeps existing
 // `litebox_broker::eventfd_state::*` etc. import paths working.
 pub use cwfd::{
-    eventfd_state, fd_token_service, fd_token_socket, state_registry, state_service,
+    eventfd_state, fd_token_service, fd_token_socket, fd_tokens, state_registry, state_service,
     subscription_list,
 };

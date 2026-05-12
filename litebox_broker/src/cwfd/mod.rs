@@ -20,6 +20,7 @@
 pub mod eventfd_state;
 pub mod fd_token_service;
 pub mod fd_token_socket;
+pub mod fd_tokens;
 pub mod state_registry;
 pub mod state_service;
 pub mod subscription_list;

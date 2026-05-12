@@ -20,7 +20,6 @@ use crate::signal::SigSet;
 
 pub mod cwfd;
 pub mod errno;
-pub mod fd_transfer_frame;
 pub mod loader;
 pub mod mm;
 pub mod signal;
@@ -30,7 +29,7 @@ pub mod vmap;
 // modules now living under [`cwfd`]. Keeps existing
 // `litebox_common_linux::broker_eventfd_provider::*` etc. import
 // paths working.
-pub use cwfd::{broker_eventfd_provider, fd_token_protocol, notification_frame};
+pub use cwfd::{broker_eventfd_provider, fd_token_protocol, fd_transfer_frame, notification_frame};
 
 #[cfg(feature = "std")]
 extern crate std;
