@@ -1,0 +1,259 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
+//! exit/terminal special-case argv leaves.
+
+use super::*;
+
+use crate::handlers::{HandlerCtx, HandlerError, HandlerToken};
+use serde::{Deserialize, Serialize};
+use std::process::{Command as StdCommand, Stdio};
+
+#[derive(Serialize, Deserialize)]
+pub(super) struct LeafArgs {
+    pub sub: String,
+    pub extra: Vec<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub(super) struct LeafOut {
+    pub exit_code: i32,
+    pub stdout: String,
+    pub stderr: String,
+}
+
+/// Simple single-threaded exit. Also used as the target for exec-exit tests.
+fn test_single_exit() {
+    println!("EX1_BEFORE_EXIT");
+    std::process::exit(0);
+}
+
+/// Terminal ioctl tests — run as: exit-test term <op> <fd>
+/// ops: tcgets, tcsets, tcsetsw, tcsetsf, tiocgwinsz
+/// fds: 0, 1, 2
+fn test_terminal_ioctl(op: &str, fd_num: i32) {
+    let mut termios: libc::termios = unsafe { std::mem::zeroed() };
+
+    match op {
+        "tcgets" => {
+            let ret = unsafe { libc::tcgetattr(fd_num, &raw mut termios) };
+            if ret == 0 {
+                println!("TERM_OK:op={op},fd={fd_num}");
+            } else {
+                let e = std::io::Error::last_os_error().raw_os_error().unwrap_or(-1);
+                println!("TERM_ERR:op={op},fd={fd_num},errno={e}");
+            }
+        }
+        "tcsets" | "tcsetsw" | "tcsetsf" => {
+            // First get current attrs
+            if unsafe { libc::tcgetattr(fd_num, &raw mut termios) } != 0 {
+                let e = std::io::Error::last_os_error().raw_os_error().unwrap_or(-1);
+                println!("TERM_ERR:op={op},fd={fd_num},errno={e},phase=tcgetattr");
+                std::process::exit(1);
+            }
+            let when = match op {
+                "tcsets" => libc::TCSANOW,
+                "tcsetsw" => libc::TCSADRAIN,
+                "tcsetsf" => libc::TCSAFLUSH,
+                _ => unreachable!(),
+            };
+            let ret = unsafe { libc::tcsetattr(fd_num, when, &raw const termios) };
+            if ret == 0 {
+                println!("TERM_OK:op={op},fd={fd_num}");
+            } else {
+                let e = std::io::Error::last_os_error().raw_os_error().unwrap_or(-1);
+                println!("TERM_ERR:op={op},fd={fd_num},errno={e}");
+            }
+        }
+        "tiocgwinsz" => {
+            let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
+            let ret = unsafe { libc::ioctl(fd_num, libc::TIOCGWINSZ, &mut ws) };
+            if ret == 0 {
+                println!(
+                    "TERM_OK:op={op},fd={fd_num},rows={},cols={}",
+                    ws.ws_row, ws.ws_col
+                );
+            } else {
+                let e = std::io::Error::last_os_error().raw_os_error().unwrap_or(-1);
+                println!("TERM_ERR:op={op},fd={fd_num},errno={e}");
+            }
+        }
+        _ => {
+            println!("TERM_ERR:unknown_op={op}");
+            std::process::exit(1);
+        }
+    }
+    std::process::exit(0);
+}
+
+pub fn run(sub: &str) {
+    match sub {
+        "single" => test_single_exit(),
+        // Matrix-style: exit-test term <op> <fd>
+        "term" => {
+            let op = std::env::args().nth(3).unwrap_or_default();
+            let fd: i32 = std::env::args()
+                .nth(4)
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0);
+            test_terminal_ioctl(&op, fd);
+        }
+        other => {
+            eprintln!("unknown exit test: {other}");
+            std::process::exit(1);
+        }
+    }
+}
+
+#[allow(dead_code)]
+pub(super) const RUN: HandlerToken<LeafArgs, LeafOut> = HandlerToken::new("special_cases.exit.run");
+
+#[allow(dead_code)]
+pub(super) async fn handle_run(
+    args: LeafArgs,
+    _ctx: &mut HandlerCtx<'_>,
+) -> Result<LeafOut, HandlerError> {
+    let output = StdCommand::new(std::env::current_exe()?)
+        .arg("exit-test")
+        .arg(args.sub)
+        .args(args.extra)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()?;
+    Ok(LeafOut {
+        exit_code: output.status.code().unwrap_or(-1),
+        stdout: String::from_utf8_lossy(&output.stdout).to_string(),
+        stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+    })
+}
+
+/// Register argv leaves used by exec-driven exit and terminal ioctl tests.
+pub(super) fn register() {
+    crate::register_handler!(RUN, handle_run);
+    crate::register_leaf_subcommand!("exit-test", subcmd_exit_test);
+}
+
+fn subcmd_exit_test(args: &[String]) -> i32 {
+    let sub = args.get(2).map_or("single", String::as_str);
+    run(sub);
+    eprintln!("EXIT_TEST_BUG: run() returned instead of exiting");
+    99
+}
+
+/// Register Node.js exit tests.
+pub(super) fn register_node_exit(reg: &mut Registry<'_>) {
+    register();
+    typed_test!(
+        reg,
+        "fork",
+        "node_exit",
+        "EX6.node_version_exit",
+        timeout = 60,
+        agents[a = AgentName::Dpg1],
+        |run| {
+            let resp = run
+                .send_named_typed(
+                    &a,
+                    &EXEC_BIN,
+                    ExecBinArgs {
+                        argv: vec!["/usr/local/bin/node".into(), "--version".into()],
+                        timeout_ms: Some(10 * 1000),
+                        stdin: None,
+                        env: vec![],
+                    },
+                )
+                .await;
+            let pass =
+                matches!(&resp, Ok(out) if out.exit_code == 0 && out.stdout.starts_with('v'));
+            crate::coordinator::TestOutcome::new("A", pass, format!("{resp:?}"))
+        }
+    );
+
+    typed_test!(
+        reg,
+        "fork",
+        "node_exit",
+        "EX7.node_process_exit",
+        timeout = 60,
+        agents[a = AgentName::Dpg1],
+        |run| {
+            let resp = run
+                .send_named_typed(
+                    &a,
+                    &EXEC_BIN,
+                    ExecBinArgs {
+                        argv: vec![
+                            "/usr/local/bin/node".into(),
+                            "-e".into(),
+                            "process.exit(0)".into(),
+                        ],
+                        timeout_ms: Some(10 * 1000),
+                        stdin: None,
+                        env: vec![],
+                    },
+                )
+                .await;
+            let pass = matches!(&resp, Ok(out) if out.exit_code == 0);
+            crate::coordinator::TestOutcome::new("A", pass, format!("{resp:?}"))
+        }
+    );
+
+    typed_test!(
+        reg,
+        "fork",
+        "node_exit",
+        "EX8.node_exit_code",
+        timeout = 60,
+        agents[a = AgentName::Dpg1],
+        |run| {
+            let resp = run
+                .send_named_typed(
+                    &a,
+                    &EXEC_BIN,
+                    ExecBinArgs {
+                        argv: vec![
+                            "/usr/local/bin/node".into(),
+                            "-e".into(),
+                            "process.exit(42)".into(),
+                        ],
+                        timeout_ms: Some(10 * 1000),
+                        stdin: None,
+                        env: vec![],
+                    },
+                )
+                .await;
+            let pass = matches!(&resp, Ok(out) if out.exit_code == 42);
+            crate::coordinator::TestOutcome::new("A", pass, format!("{resp:?}"))
+        }
+    );
+
+    typed_test!(
+        reg,
+        "fork",
+        "node_exit",
+        "EX9.node_console_exit",
+        timeout = 60,
+        agents[a = AgentName::Dpg1],
+        |run| {
+            let resp = run
+                .send_named_typed(
+                    &a,
+                    &EXEC_BIN,
+                    ExecBinArgs {
+                        argv: vec![
+                            "/usr/local/bin/node".into(),
+                            "-e".into(),
+                            "console.log(\"NODE_EXIT_OK\")".into(),
+                        ],
+                        timeout_ms: Some(10 * 1000),
+                        stdin: None,
+                        env: vec![],
+                    },
+                )
+                .await;
+            let pass = matches!(&resp, Ok(out) if out.exit_code == 0 && out.stdout.contains("NODE_EXIT_OK"));
+            crate::coordinator::TestOutcome::new("A", pass, format!("{resp:?}"))
+        }
+    );
+}
