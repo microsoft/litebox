@@ -52,16 +52,19 @@ find_symbols_dir() {
         return
     fi
 
-    local candidates=(
-        "$HOME/litebox-out/debug"
-    )
-
     local script_dir
     script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
     local workspace_root
     workspace_root="$(cd "$script_dir/.." && pwd)"
     local target_dir="${CARGO_TARGET_DIR:-$workspace_root/target}/debug"
-    candidates+=("$target_dir")
+
+    # Prefer the workspace target directory (ext4 default per AGENTS.md).
+    # Fall back to ~/litebox-out/debug for legacy NTFS-resident workspaces
+    # that built with --target-dir ~/litebox-out for Docker mmap compatibility.
+    local candidates=(
+        "$target_dir"
+        "$HOME/litebox-out/debug"
+    )
 
     for c in "${candidates[@]}"; do
         if [[ -f "$c/litebox_tool_executor" ]]; then
@@ -75,8 +78,9 @@ find_symbols_dir() {
     for c in "${candidates[@]}"; do
         echo "    $c" >&2
     done
-    echo "  Set LITEBOX_SYMBOLS_DIR or build with:" >&2
-    echo "    cargo build --target-dir ~/litebox-out -p litebox_tool_executor -p litebox_runner_linux_userland -p litebox_broker" >&2
+    echo "  Set LITEBOX_SYMBOLS_DIR, or from an ext4 workspace run:" >&2
+    echo "    cargo build -p litebox_tool_executor -p litebox_runner_linux_userland -p litebox_broker" >&2
+    echo "  (NTFS workspaces additionally need --target-dir ~/litebox-out for Docker mmap.)" >&2
     exit 1
 }
 

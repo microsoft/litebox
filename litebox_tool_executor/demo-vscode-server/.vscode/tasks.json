@@ -1,13 +1,18 @@
 {
     "version": "2.0.0",
     // ────────────────────────────────────────────────────────────────
-    // IMPORTANT: ELF binaries MUST live on a Linux-native filesystem.
-    // Docker Desktop on Windows cannot mmap ELF files from NTFS bind
-    // mounts (causes "unsupported version 3 of Verneed record").
+    // IMPORTANT: this demo workspace lives on NTFS
+    // (C:\src\litebox-vscode-server / /mnt/c/src/litebox-vscode-server).
+    // Docker Desktop on Windows cannot mmap ELF binaries from NTFS bind
+    // mounts (causes "unsupported version 3 of Verneed record"). So the
+    // build task builds to ~/litebox-out/ (WSL2 ext4) and the Docker
+    // run tasks mount from there. Do NOT change the mount source to
+    // C:\... or /mnt/c/... — it will segfault.
     //
-    // The build task outputs to ~/litebox-out/ (WSL2 ext4), and the
-    // Docker run tasks mount from that path.  Do NOT change the mount
-    // source to C:\... or /mnt/c/... — it will segfault.
+    // The canonical ext4 workspace at ~/src/litebox does NOT need
+    // --target-dir ~/litebox-out; it uses the default target/ per
+    // AGENTS.md. This file only needs the override because the demo
+    // workspace itself is on NTFS.
     // ────────────────────────────────────────────────────────────────
     "tasks": [
         {
