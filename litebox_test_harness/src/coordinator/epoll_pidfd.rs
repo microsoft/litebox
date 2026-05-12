@@ -9,6 +9,7 @@
 use std::io::Write;
 use std::os::fd::AsRawFd;
 use std::process::Stdio;
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
@@ -16,13 +17,14 @@ use serde::{Deserialize, Serialize};
 use crate::handlers::{HandlerCtx, HandlerError, HandlerToken};
 use crate::os::epoll::{Epoll, EpollTarget};
 use crate::os::eventfd::EventFd;
-use crate::protocol::{Command, EpollEvent};
+use crate::os::socket::TcpSocket;
+use crate::protocol::EpollEvent;
 use crate::register_handler;
 
+use super::TestOutcome;
 use super::agents::AgentName;
 use super::registry::Registry;
 use super::run_context::RunContext;
-use super::{TestOutcome, expect_listening_port};
 
 pub(crate) const EPI_AGENTS: &[AgentName] = &[
     AgentName::Dpg1,
@@ -92,6 +94,16 @@ struct DetailOut {
     detail: String,
 }
 
+#[derive(Serialize, Deserialize)]
+struct SetupTcpListenArgs {
+    port: u16,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+struct SetupTcpListenOut {
+    port: u16,
+}
+
 const PIDFD_EXIT: HandlerToken<PidfdExitArgs, DetailOut> =
     HandlerToken::new("epoll_pidfd.pidfd_exit");
 const MULTI_SOCKET: HandlerToken<PeerAddrArgs, DetailOut> =
@@ -100,6 +112,8 @@ const EVENTFD_WAKEUP: HandlerToken<(), DetailOut> = HandlerToken::new("epoll_pid
 const TIMEOUT_ZERO: HandlerToken<(), DetailOut> = HandlerToken::new("epoll_pidfd.timeout_zero");
 const EDGE_TRIGGER: HandlerToken<PeerAddrArgs, DetailOut> =
     HandlerToken::new("epoll_pidfd.edge_trigger");
+const SETUP_TCP_LISTEN: HandlerToken<SetupTcpListenArgs, SetupTcpListenOut> =
+    HandlerToken::new("epoll_pidfd.setup_tcp_listen");
 
 async fn handle_pidfd_exit(
     args: PidfdExitArgs,
@@ -297,12 +311,62 @@ async fn handle_edge_trigger(
     }
 }
 
+async fn handle_setup_tcp_listen(
+    args: SetupTcpListenArgs,
+    _ctx: &mut HandlerCtx<'_>,
+) -> Result<SetupTcpListenOut, HandlerError> {
+    let listener = TcpSocket::new_tcp_listen(args.port)?;
+    let port = listener.local_port()?;
+    let std_listener = listener.into_std_listener();
+    std_listener.set_nonblocking(true)?;
+    let task = spawn_tcp_echo_task(std_listener)?;
+
+    // Process-scope state: these setup listeners intentionally outlive the
+    // handler so the peer address remains connectable for the following test.
+    setup_listeners().lock().unwrap().push(task);
+    Ok(SetupTcpListenOut { port })
+}
+
+static SETUP_LISTENERS: OnceLock<Mutex<Vec<tokio::task::JoinHandle<()>>>> = OnceLock::new();
+
+fn setup_listeners() -> &'static Mutex<Vec<tokio::task::JoinHandle<()>>> {
+    SETUP_LISTENERS.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+fn spawn_tcp_echo_task(
+    std_listener: std::net::TcpListener,
+) -> Result<tokio::task::JoinHandle<()>, HandlerError> {
+    let listener = tokio::net::TcpListener::from_std(std_listener)
+        .map_err(|e| HandlerError(format!("from_std: {e}")))?;
+    Ok(tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let mut buf = [0_u8; 4096];
+                loop {
+                    match tokio::io::AsyncReadExt::read(&mut stream, &mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => {
+                            if tokio::io::AsyncWriteExt::write_all(&mut stream, &buf[..n])
+                                .await
+                                .is_err()
+                            {
+                                break;
+                            }
+                        }
+                    }
+                }
+            });
+        }
+    }))
+}
+
 pub(crate) fn register_epoll_pidfd_tests(reg: &mut Registry<'_>) {
     register_handler!(PIDFD_EXIT, handle_pidfd_exit);
     register_handler!(MULTI_SOCKET, handle_multi_socket);
     register_handler!(EVENTFD_WAKEUP, handle_eventfd_wakeup);
     register_handler!(TIMEOUT_ZERO, handle_timeout_zero);
     register_handler!(EDGE_TRIGGER, handle_edge_trigger);
+    register_handler!(SETUP_TCP_LISTEN, handle_setup_tcp_listen);
 
     for &agent in EPI_AGENTS {
         for def in EPI_SCENARIOS {
@@ -436,17 +500,11 @@ async fn open_peer_addr(
     run: &mut RunContext<'_>,
     peer: &super::agents::AgentHandle,
 ) -> Result<String, String> {
-    let listen = run
-        .send(
-            peer,
-            Command::NetListen {
-                port: 0,
-                pre_bind_options: vec![],
-            },
-        )
-        .await;
-    let port = expect_listening_port(&listen, 0)?;
-    Ok(format!("127.0.0.1:{port}"))
+    let out = run
+        .send_named_typed(peer, &SETUP_TCP_LISTEN, SetupTcpListenArgs { port: 0 })
+        .await
+        .map_err(|e| format!("setup_tcp_listen: {e}"))?;
+    Ok(format!("127.0.0.1:{}", out.port))
 }
 
 fn connect_peer(addr: &str) -> Result<std::net::TcpStream, std::io::Error> {

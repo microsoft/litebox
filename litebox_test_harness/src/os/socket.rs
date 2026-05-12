@@ -3,7 +3,7 @@
 
 //! Thin idiomatic wrappers over TCP sockets for handler bodies.
 
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd};
 
 /// Owned TCP socket descriptor.
 pub struct TcpSocket {
@@ -58,6 +58,13 @@ impl TcpSocket {
             return Err(std::io::Error::last_os_error());
         }
         Ok(Self { fd })
+    }
+
+    /// Convert this listening socket into a standard-library listener.
+    #[must_use]
+    pub fn into_std_listener(self) -> std::net::TcpListener {
+        // SAFETY: into_raw_fd transfers the uniquely owned socket to TcpListener.
+        unsafe { std::net::TcpListener::from_raw_fd(self.fd.into_raw_fd()) }
     }
 
     /// Connect to `127.0.0.1:port`.
