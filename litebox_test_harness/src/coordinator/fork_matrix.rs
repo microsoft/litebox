@@ -730,6 +730,85 @@ pub(crate) fn register_fork_matrix(reg: &mut Registry<'_>) {
             });
     }
 
+    // SXF.<bt> — socketpair-fork-cross. Validates p1-socketpair-fork:
+    // parent socketpair → fork+execv into <bt> child → PING/PONG over
+    // the inherited endpoint. When <bt> differs from the parent's
+    // binary type (Dpg1), commit_delayed_fork must bridge both
+    // endpoints across host workers. Today the bridge replaces the
+    // unix socket with a host pipe; the basic byte round-trip survives
+    // but AF_UNIX semantics (SCM_RIGHTS, SO_PEERCRED, abstract names)
+    // are lost — the BSF.<bt> test pins the SCM-loss subset.
+    for &bt in crate::BinaryType::ALL {
+        let bt_label = bt.label();
+        reg.test("fork", "fork_matrix", format!("SXF.{bt_label}"))
+            .timeout(60)
+            .build(move |cx| {
+                let handle = cx.require(AgentName::Dpg1);
+                Box::new(move |run| {
+                    Box::pin(async move {
+                        let self_exe = run.self_exe().to_string();
+                        let child_target = crate::binary_path(bt, &self_exe);
+                        let resp = run
+                            .send(
+                                &handle,
+                                super::exec(vec![
+                                    self_exe,
+                                    "unix-socket-test".into(),
+                                    "socketpair-fork-cross".into(),
+                                    child_target,
+                                ]),
+                            )
+                            .await;
+                        let pass = matches!(
+                            &resp,
+                            crate::protocol::Response::ExecResult { exit_code: 0, stdout, .. }
+                                if stdout.contains("SXF_OK")
+                        );
+                        super::TestOutcome::new("A", pass, format!("{resp:?}"))
+                    })
+                })
+            });
+    }
+
+    // PIF.<bt> — pidfd-inherit-fork. Validates p1-pidfd-inherit:
+    // parent spawns a grandchild, pidfd_open's it, fork+execvs into
+    // <bt> child that poll+waitid's on the inherited pidfd. When <bt>
+    // differs from the parent's binary type, commit_delayed_fork must
+    // migrate the pidfd to the child's worker — there is currently no
+    // broker-side pidfd state, so the migration may drop the pidfd or
+    // fail outright.
+    for &bt in crate::BinaryType::ALL {
+        let bt_label = bt.label();
+        reg.test("fork", "fork_matrix", format!("PIF.{bt_label}"))
+            .timeout(60)
+            .build(move |cx| {
+                let handle = cx.require(AgentName::Dpg1);
+                Box::new(move |run| {
+                    Box::pin(async move {
+                        let self_exe = run.self_exe().to_string();
+                        let child_target = crate::binary_path(bt, &self_exe);
+                        let resp = run
+                            .send(
+                                &handle,
+                                super::exec(vec![
+                                    self_exe,
+                                    "unix-socket-test".into(),
+                                    "pidfd-inherit-fork".into(),
+                                    child_target,
+                                ]),
+                            )
+                            .await;
+                        let pass = matches!(
+                            &resp,
+                            crate::protocol::Response::ExecResult { exit_code: 0, stdout, .. }
+                                if stdout.contains("PIF_OK")
+                        );
+                        super::TestOutcome::new("A", pass, format!("{resp:?}"))
+                    })
+                })
+            });
+    }
+
     // XDF.triple_nesting
     for &bt in crate::BinaryType::ALL {
         let bt_label = bt.label();
