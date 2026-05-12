@@ -189,6 +189,19 @@ fn main() {
         eprintln!("[harness] self_exe={self_exe} resolved={}", real.display());
     }
 
+    // Dispatch through the leaf-subcommand registry first. Family
+    // files register their argv-only leaves via
+    // `register_leaf_subcommand!`; collect_all_tests() populates the
+    // registry as a side-effect. If a registration matches `cmd`,
+    // run it and exit. Otherwise fall through to the legacy `match`
+    // arms below (which are being migrated family-by-family).
+    if !matches!(cmd, "spawn-tree" | "agent" | "agent-listen") {
+        let _ = coordinator::collect_all_tests();
+        if let Some(code) = coordinator::leaf_subcommand::dispatch(&args) {
+            std::process::exit(code);
+        }
+    }
+
     match cmd {
         "spawn-tree" => {
             // Optional: --filter=matrix to run only matrix tests.

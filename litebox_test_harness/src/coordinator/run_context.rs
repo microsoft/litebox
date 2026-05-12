@@ -210,6 +210,86 @@ impl<'a> RunContext<'a> {
         serde_json::from_value(data).map_err(|e| format!("typed deserialize: {e}"))
     }
 
+    /// Spawn an ephemeral leaf agent (per `leaf.kind()`), invoke one
+    /// typed handler on it via `Command::Run`, then send `Command::Exit`
+    /// to terminate it. Returns the handler's typed `Out`.
+    ///
+    /// This is the **default way to run leaf programs** in the new
+    /// model: instead of `EXEC_BIN { argv: [bt_binary, "name", …] }`
+    /// (which fork+execs into a fresh argv-dispatched main()), the
+    /// test does `cx.declare_ephemeral(parent, "Leaf…",
+    /// SpawnKind::Fork{binary=bt, …})` and `run_leaf(&leaf, &TOKEN,
+    /// args).await`. The fork+exec round-trip across binary types
+    /// is preserved (`Command::Fork{binary}` is the same kernel
+    /// mechanism), but the leaf body lives as a registered handler
+    /// in the family's `coordinator/<family>.rs`, co-located with
+    /// the tests that drive it.
+    ///
+    /// Use [`Self::spawn_ephemeral`] + [`Self::forward`] directly only
+    /// when you need finer control (e.g., multiple handler calls on
+    /// one leaf, or rendezvous between two leaves). For the common
+    /// one-shot leaf-handler pattern, prefer this helper.
+    ///
+    /// On error (spawn failure, handler error, deserialization failure),
+    /// still attempts a best-effort `Command::Exit` so a half-spawned
+    /// leaf doesn't linger across the rest of the test run.
+    ///
+    /// # Errors
+    /// Returns Err on spawn failure, handler-side failure, serialization
+    /// failure, or any non-`Result` response from the leaf.
+    #[allow(dead_code)] // called by family register_* fns as B-phases land
+    pub async fn run_leaf<A, O>(
+        &mut self,
+        leaf: &EphemeralHandle,
+        token: &crate::handlers::HandlerToken<A, O>,
+        args: A,
+    ) -> Result<O, String>
+    where
+        A: serde::Serialize,
+        O: serde::de::DeserializeOwned,
+    {
+        // Step 1: fork+exec the leaf agent under its declared parent.
+        let spawn_resp = self.spawn_ephemeral(leaf).await;
+        if !matches!(&spawn_resp, Response::Ok { .. }) {
+            return Err(format!("spawn_ephemeral: {spawn_resp:?}"));
+        }
+
+        // Step 2: invoke the handler via Forward routing through the
+        // parent. (Direct send_named_typed would require an
+        // AgentHandle, which EphemeralHandle isn't. Forward+Run is the
+        // canonical leaf-dispatch path.)
+        let args_value = serde_json::to_value(&args).map_err(|e| format!("args serialize: {e}"))?;
+        let run_resp = self
+            .forward(
+                leaf,
+                Command::Run {
+                    handler: token.name().to_string(),
+                    args: args_value,
+                },
+            )
+            .await;
+
+        // Step 3: parse the response, capture any error.
+        let result: Result<O, String> = match run_resp {
+            Response::Result {
+                ok: true,
+                data,
+                error: _,
+            } => serde_json::from_value(data).map_err(|e| format!("typed deserialize: {e}")),
+            Response::Result {
+                ok: false,
+                data: _,
+                error,
+            } => Err(error.unwrap_or_else(|| "handler failed".into())),
+            other => Err(format!("expected Result, got {other:?}")),
+        };
+
+        // Step 4: best-effort Exit, regardless of handler outcome.
+        let _ = self.forward(leaf, Command::Exit).await;
+
+        result
+    }
+
     /// Write `Command::Run { handler, args }` to `handle`'s pipe
     /// without waiting for a response. The command is routed through
     /// `route` + `wrap_forwards` to reach descendants via their

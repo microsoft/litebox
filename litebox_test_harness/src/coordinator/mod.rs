@@ -15,6 +15,7 @@ pub(crate) mod fork_matrix;
 pub(crate) mod getrandom_tests;
 pub(crate) mod inotify;
 pub(crate) mod iouring_discovery;
+pub mod leaf_subcommand;
 pub(crate) mod matrix;
 pub(crate) mod pipe_bridge;
 pub(crate) mod platform_fixes;
