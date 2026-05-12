@@ -26,6 +26,7 @@ use litebox::{
 use litebox_common_linux::{
     ClockId, EfdFlags, ItimerSpec, TimerfdFlags, TimerfdTimerFlags,
     broker_eventfd_provider::{BrokerEventfdProvider, BrokerOpError},
+    broker_pidfd_provider::BrokerPidfdProvider,
     errno::Errno,
 };
 use litebox_platform_multiplex::Platform;
@@ -44,6 +45,8 @@ impl FdEnabledSubsystemEntry for EventFile<Platform> {}
 /// not configured.
 static BROKER_EVENTFD_PROVIDER: once_cell::race::OnceBox<Arc<dyn BrokerEventfdProvider>> =
     once_cell::race::OnceBox::new();
+static BROKER_PIDFD_PROVIDER: once_cell::race::OnceBox<Arc<dyn BrokerPidfdProvider>> =
+    once_cell::race::OnceBox::new();
 
 /// Sets the process-global broker eventfd provider. Called by the
 /// runner exactly once during bootstrap.
@@ -61,6 +64,19 @@ pub fn set_broker_eventfd_provider(
 /// Returns the broker eventfd provider if one has been set.
 pub fn broker_eventfd_provider() -> Option<Arc<dyn BrokerEventfdProvider>> {
     BROKER_EVENTFD_PROVIDER.get().cloned()
+}
+
+/// Sets the process-global broker pidfd provider.
+#[allow(dead_code)]
+pub fn set_broker_pidfd_provider(
+    provider: Arc<dyn BrokerPidfdProvider>,
+) -> Result<(), alloc::boxed::Box<Arc<dyn BrokerPidfdProvider>>> {
+    BROKER_PIDFD_PROVIDER.set(alloc::boxed::Box::new(provider))
+}
+
+/// Returns the broker pidfd provider if one has been set.
+pub fn broker_pidfd_provider() -> Option<Arc<dyn BrokerPidfdProvider>> {
+    BROKER_PIDFD_PROVIDER.get().cloned()
 }
 
 enum EventFileInner<Platform: RawSyncPrimitivesProvider + TimeProvider> {
@@ -87,6 +103,10 @@ enum EventFileInner<Platform: RawSyncPrimitivesProvider + TimeProvider> {
         provider: Arc<dyn BrokerEventfdProvider>,
         common: super::broker_backed::BrokerBackedCommon<Platform>,
         semaphore: bool,
+    },
+    PidfdBrokerBacked {
+        provider: Arc<dyn BrokerPidfdProvider>,
+        common: super::broker_backed::BrokerBackedCommon<Platform>,
     },
 }
 
@@ -171,6 +191,32 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> EventFile<Platform> {
         }
     }
 
+    pub(crate) fn new_pidfd_broker_backed(
+        provider: Arc<dyn BrokerPidfdProvider>,
+        handle: u64,
+        nonblock: bool,
+    ) -> Self {
+        use litebox_common_linux::cwfd::notification_frame::{NOTIFY_EVENT_HUP, NOTIFY_EVENT_IN};
+        let mut status = OFlags::RDWR;
+        status.set(OFlags::NONBLOCK, nonblock);
+        let subscribable: Arc<
+            dyn litebox_common_linux::cwfd::broker_subscribable::BrokerSubscribable,
+        > = Arc::clone(&provider) as _;
+        let common = super::broker_backed::BrokerBackedCommon::new(
+            subscribable,
+            handle,
+            NOTIFY_EVENT_IN | NOTIFY_EVENT_HUP,
+        );
+        Self {
+            inner: litebox::sync::Mutex::new(EventFileInner::PidfdBrokerBacked {
+                provider,
+                common,
+            }),
+            status: AtomicU32::new(status.bits()),
+            pollee: Arc::new(Pollee::new()),
+        }
+    }
+
     pub(crate) fn new_timer(
         platform: &'static Platform,
         boot_time: Platform::Instant,
@@ -218,7 +264,8 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> EventFile<Platform> {
     /// (Phase B-Step8e).
     pub(crate) fn broker_backed_handle(&self) -> Option<u64> {
         match &*self.inner.lock() {
-            EventFileInner::BrokerBacked { common, .. } => Some(common.handle()),
+            EventFileInner::BrokerBacked { common, .. }
+            | EventFileInner::PidfdBrokerBacked { common, .. } => Some(common.handle()),
             _ => None,
         }
     }
@@ -240,6 +287,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> EventFile<Platform> {
             EventFileInner::Pidfd { .. } => "pidfd",
             EventFileInner::Timerfd(_) => "timerfd",
             EventFileInner::BrokerBacked { .. } => "broker_eventfd",
+            EventFileInner::PidfdBrokerBacked { .. } => "broker_pidfd",
         }
     }
 
@@ -318,9 +366,9 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> EventFile<Platform> {
                 drop(inner);
                 self.try_read_eventfd()
             }
-            EventFileInner::Pidfd { .. } | EventFileInner::Timerfd(_) => {
-                Err(TryOpError::Other(Errno::EINVAL))
-            }
+            EventFileInner::Pidfd { .. }
+            | EventFileInner::PidfdBrokerBacked { .. }
+            | EventFileInner::Timerfd(_) => Err(TryOpError::Other(Errno::EINVAL)),
         }
     }
 
@@ -496,6 +544,16 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider + Send + Sync + 'static>
                 //     wake-ups from a peer worker's write.
                 events |= common.check_io_events();
             }
+            EventFileInner::PidfdBrokerBacked { provider, common } => {
+                if common.is_readable()
+                    || provider
+                        .pidfd_exited(common.handle())
+                        .inspect(|exited| common.set_readable(*exited))
+                        .unwrap_or(false)
+                {
+                    events |= Events::IN | Events::HUP;
+                }
+            }
         }
 
         events
@@ -516,6 +574,11 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider + Send + Sync + 'static>
                 // cross-worker writes get pushed to our pollee via the
                 // notification dispatcher. Idempotent on the inner
                 // mutex inside BrokerBackedCommon.
+                common.ensure_subscribed(&self.pollee);
+                drop(inner);
+                self.pollee.register_observer(observer, mask);
+            }
+            EventFileInner::PidfdBrokerBacked { common, .. } => {
                 common.ensure_subscribed(&self.pollee);
                 drop(inner);
                 self.pollee.register_observer(observer, mask);

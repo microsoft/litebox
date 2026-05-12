@@ -12,7 +12,9 @@ pub(crate) mod eventfd;
 /// available; the shim consults the registered provider from
 /// `sys_eventfd2`.
 pub use eventfd::broker_eventfd_provider;
+pub use eventfd::broker_pidfd_provider;
 pub use eventfd::set_broker_eventfd_provider;
+pub use eventfd::set_broker_pidfd_provider;
 
 pub mod file;
 pub mod fork_snapshot;
