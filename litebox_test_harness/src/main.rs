@@ -723,9 +723,6 @@ fn main() {
                 std::thread::sleep(std::time::Duration::from_millis(50));
             }
         }
-        "wait-forever" => loop {
-            std::thread::park();
-        },
         "epoll-socket" => {
             // Minimal reproduction of epoll + TCP socket wakeup.
             //
