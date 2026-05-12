@@ -292,7 +292,10 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> EventFile<Platform> {
     }
 
     pub(crate) fn needs_host_poll(&self) -> bool {
-        self.is_timerfd()
+        matches!(
+            *self.inner.lock(),
+            EventFileInner::Timerfd(_) | EventFileInner::PidfdBrokerBacked { .. }
+        )
     }
 
     fn try_read_eventfd(&self) -> Result<u64, TryOpError<Errno>> {
@@ -560,8 +563,8 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider + Send + Sync + 'static>
     }
 
     fn register_observer(&self, observer: alloc::sync::Weak<dyn Observer<Events>>, mask: Events) {
-        let inner = self.inner.lock();
-        match &*inner {
+        let mut inner = self.inner.lock();
+        match &mut *inner {
             EventFileInner::Pidfd { subject, .. } => {
                 subject.register_observer(observer, mask | Events::ALWAYS_POLLED);
             }
@@ -578,7 +581,24 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider + Send + Sync + 'static>
                 drop(inner);
                 self.pollee.register_observer(observer, mask);
             }
-            EventFileInner::PidfdBrokerBacked { common, .. } => {
+            EventFileInner::PidfdBrokerBacked { provider, common } => {
+                if let Some(local_provider) = broker_pidfd_provider()
+                    && !Arc::ptr_eq(provider, &local_provider)
+                {
+                    let handle = common.handle();
+                    if local_provider.dup_handle(handle).is_ok() {
+                        let subscribable: Arc<
+                            dyn litebox_common_linux::cwfd::broker_subscribable::BrokerSubscribable,
+                        > = Arc::clone(&local_provider) as _;
+                        *provider = local_provider;
+                        *common = super::broker_backed::BrokerBackedCommon::new(
+                            subscribable,
+                            handle,
+                            litebox_common_linux::cwfd::notification_frame::NOTIFY_EVENT_IN
+                                | litebox_common_linux::cwfd::notification_frame::NOTIFY_EVENT_HUP,
+                        );
+                    }
+                }
                 common.ensure_subscribed(&self.pollee);
                 drop(inner);
                 self.pollee.register_observer(observer, mask);

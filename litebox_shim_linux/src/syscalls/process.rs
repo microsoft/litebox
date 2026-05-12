@@ -1752,37 +1752,45 @@ impl<FS: ShimFS> Task<FS> {
             .get(&guest_pid)
             .copied()
             .unwrap_or(ProcessId(pid));
-        if let Err(err) = self.reject_remote_running_process_control(process_id, "pidfd_open") {
-            if let Some(provider) = crate::syscalls::eventfd::broker_pidfd_provider()
-                && let Some(host_pid) = self
-                    .global
-                    .fork_child_host_pids
-                    .read()
-                    .get(&process_id.0)
-                    .copied()
-            {
-                let host_pid = u32::try_from(host_pid).map_err(|_| Errno::ESRCH)?;
-                let handle = provider
-                    .create_pidfd(host_pid)
-                    .map_err(super::broker_backed::broker_err_to_errno)?;
-                let pidfd = crate::syscalls::eventfd::EventFile::new_pidfd_broker_backed(
-                    provider,
-                    handle,
-                    flags & PIDFD_NONBLOCK != 0,
-                );
-                let mut dt = self.global.litebox.descriptor_table_mut();
-                let typed = dt.insert::<crate::syscalls::eventfd::EventfdSubsystem>(pidfd);
-                let old = dt.set_fd_metadata(&typed, FileDescriptorFlags::FD_CLOEXEC);
-                assert!(old.is_none());
-                drop(dt);
+        let remote_err = self
+            .reject_remote_running_process_control(process_id, "pidfd_open")
+            .err();
+        if let Some(provider) = crate::syscalls::eventfd::broker_pidfd_provider()
+            && let Some(host_pid) = self
+                .global
+                .fork_child_host_pids
+                .read()
+                .get(&process_id.0)
+                .copied()
+        {
+            let host_pid = u32::try_from(host_pid).map_err(|_| Errno::ESRCH)?;
+            match provider.create_pidfd(host_pid) {
+                Ok(handle) => {
+                    let pidfd = crate::syscalls::eventfd::EventFile::new_pidfd_broker_backed(
+                        provider,
+                        handle,
+                        flags & PIDFD_NONBLOCK != 0,
+                    );
+                    let mut dt = self.global.litebox.descriptor_table_mut();
+                    let typed = dt.insert::<crate::syscalls::eventfd::EventfdSubsystem>(pidfd);
+                    let old = dt.set_fd_metadata(&typed, FileDescriptorFlags::FD_CLOEXEC);
+                    assert!(old.is_none());
+                    drop(dt);
 
-                let raw_fd = self
-                    .files
-                    .borrow()
-                    .insert_raw_fd(typed)
-                    .map_err(|_| Errno::EMFILE)?;
-                return Ok(raw_fd);
+                    let raw_fd = self
+                        .files
+                        .borrow()
+                        .insert_raw_fd(typed)
+                        .map_err(|_| Errno::EMFILE)?;
+                    return Ok(raw_fd);
+                }
+                Err(e) if remote_err.is_some() => {
+                    return Err(super::broker_backed::broker_err_to_errno(e));
+                }
+                Err(_) => {}
             }
+        }
+        if let Some(err) = remote_err {
             return Err(err);
         }
 
