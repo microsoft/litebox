@@ -112,45 +112,9 @@ pub enum Command {
         pre_bind_options: Vec<(SockOpt, SockOptValue)>,
     },
 
-    /// Return per-listener accept counts for a listening TCP port.
-    #[serde(rename = "net_listener_stats")]
-    NetListenerStats { port: u16 },
-
     /// Stop listening on a port.
     #[serde(rename = "net_unlisten")]
     NetUnlisten { port: u16 },
-
-    /// Connect to addr and register the TCP stream for stateful operations.
-    #[serde(rename = "net_open")]
-    NetOpen { addr: String },
-
-    /// Send bytes on a registered TCP connection.
-    #[serde(rename = "net_send")]
-    NetSend { conn: u64, data: String },
-
-    /// Receive bytes from a registered TCP connection. None means read to EOF.
-    #[serde(rename = "net_recv")]
-    NetRecv { conn: u64, n_bytes: Option<u32> },
-
-    /// Shutdown one half of a registered TCP connection: "wr", "rd", or "rdwr".
-    #[serde(rename = "net_shutdown")]
-    NetShutdown { conn: u64, half: String },
-
-    /// Close and unregister a TCP connection.
-    #[serde(rename = "net_close")]
-    NetClose { conn: u64 },
-
-    /// Set a socket option on a registered TCP connection.
-    #[serde(rename = "net_set_sockopt")]
-    NetSetSockOpt {
-        conn: u64,
-        option: SockOpt,
-        value: SockOptValue,
-    },
-
-    /// Get a socket option from a registered TCP connection.
-    #[serde(rename = "net_get_sockopt")]
-    NetGetSockOpt { conn: u64, option: SockOpt },
 
     /// Connect to addr, send data, read echo response.
     #[serde(rename = "net_connect")]
@@ -252,60 +216,6 @@ pub enum Command {
     #[serde(rename = "env_get")]
     EnvGet { var: String },
 
-    /// Report current working directory.
-    #[serde(rename = "cwd_get")]
-    CwdGet,
-
-    /// Bind a Unix domain socket listener. Starts an echo handler task.
-    #[serde(rename = "unix_listen")]
-    UnixListen { path: String },
-
-    /// Stop listening on a Unix socket path.
-    #[serde(rename = "unix_unlisten")]
-    UnixUnlisten { path: String },
-
-    /// Connect to a Unix domain socket, send data, read echo response.
-    #[serde(rename = "unix_connect")]
-    UnixConnect { path: String, data: String },
-
-    /// Create a local `AF_UNIX` `SOCK_STREAM` socketpair and register both endpoints.
-    #[serde(rename = "unix_pair")]
-    UnixPair {},
-
-    /// Bind a registered Unix stream listener for cross-agent `SCM_RIGHTS` tests.
-    #[serde(rename = "unix_pair_listen")]
-    UnixPairListen { path: String },
-
-    /// Connect to a registered Unix stream listener and register the endpoint.
-    #[serde(rename = "unix_pair_connect")]
-    UnixPairConnect { path: String },
-
-    /// Accept a Unix stream connection and register the endpoint.
-    #[serde(rename = "unix_pair_accept")]
-    UnixPairAccept { path: String },
-
-    /// Send one or more registered fds as `SCM_RIGHTS` over a registered Unix endpoint.
-    /// The agent prepends one type-tag byte per fd (E/T/U) to the payload so the
-    /// receiver can register each received fd in the matching registry.
-    #[serde(rename = "unix_send_fd")]
-    UnixSendFd {
-        socket: u64,
-        sources: Vec<FdRef>,
-        payload: String,
-    },
-
-    /// Receive fds sent with `SCM_RIGHTS` over a registered Unix endpoint.
-    #[serde(rename = "unix_recv_fd")]
-    UnixRecvFd { socket: u64, max_payload: u32 },
-
-    /// Close and unregister a registered Unix endpoint.
-    #[serde(rename = "unix_pair_close")]
-    UnixPairClose { socket: u64 },
-
-    /// Kill a background process by PID.
-    #[serde(rename = "kill")]
-    Kill { pid: u32 },
-
     /// Open an eventfd and register it in this agent's local registry.
     /// Flags are parsed from strings like "semaphore|nonblock|cloexec".
     #[serde(rename = "eventfd_open")]
@@ -320,10 +230,6 @@ pub enum Command {
     /// models the layer-1 forward-via-creator path without passing fds.
     #[serde(rename = "eventfd_read_shared")]
     EventfdReadShared { id: u64, reader: String },
-
-    /// Write one u64 to a registered eventfd.
-    #[serde(rename = "eventfd_write")]
-    EventfdWrite { id: u64, value: u64 },
 
     /// Close and unregister a registered eventfd.
     #[serde(rename = "eventfd_close")]
