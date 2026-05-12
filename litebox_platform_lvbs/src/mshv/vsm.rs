@@ -838,7 +838,7 @@ fn copy_heki_patch_from_vtl0(patch_pa_0: u64, patch_pa_1: u64) -> Result<HekiPat
     {
         unsafe { crate::platform_low().copy_from_vtl0_phys::<HekiPatch>(patch_pa_0) }
             .map(|boxed| *boxed)
-            .ok_or(VsmError::Vtl0CopyFailed)?
+            .ok_or(VsmError::Vtl0CopyFailed)
     } else {
         let mut heki_patch = HekiPatch::new_zeroed();
         let heki_patch_bytes = heki_patch.as_mut_bytes();
@@ -853,8 +853,8 @@ fn copy_heki_patch_from_vtl0(patch_pa_0: u64, patch_pa_1: u64) -> Result<HekiPat
                 return Err(VsmError::Vtl0CopyFailed);
             }
         }
-        heki_patch
-    };
+        Ok(heki_patch)
+    }?;
 
     if heki_patch.is_valid() {
         Ok(heki_patch)
@@ -1122,12 +1122,10 @@ impl Vtl0KernelInfo {
         // `HekiPatch::is_valid` already validated both physical addresses.
         let patch_pa_0 = PhysAddr::new(patch_data.pa[0]);
         let patch_pa_0_prev = patch_data.pa[0].checked_sub(1).map(PhysAddr::new);
-        let patch_pa_1 = PhysAddr::new(patch_data.pa[1]);
 
         self.precomputed_patches
             .get(patch_pa_0)
             .or_else(|| patch_pa_0_prev.and_then(|pa| self.precomputed_patches.get(pa)))
-            .or_else(|| self.precomputed_patches.get(patch_pa_1))
             .or(None)
     }
 }

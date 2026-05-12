@@ -635,17 +635,23 @@ pub fn validate_text_poke_bp_batch(patch_data: &HekiPatch, precomputed_patch: &H
 
     let offset: usize = if patch_data.size == 1 && patch_data.pa[0] == precomputed_patch.pa[0] {
         0 // step 3
-    } else if patch_data.size == precomputed_patch.size - 1
-        && (patch_data.pa[0] == precomputed_patch.pa[0] + 1
-            || (patch_data.pa[0] == precomputed_patch.pa[1]
-                && (precomputed_patch.pa[0] + 1).is_multiple_of(Size4KiB::SIZE)))
-    {
-        // step 2. pa[1] is dereferenced by `apply_vtl0_text_patch` only when
-        // `precomputed_patch.pa[0] + 1` is not page-aligned. In that case, it must
-        // equal `precomputed_patch.pa[1]`.
-        if !(precomputed_patch.pa[0] + 1).is_multiple_of(Size4KiB::SIZE)
-            && patch_data.pa[1] != precomputed_patch.pa[1]
+    } else if patch_data.size == precomputed_patch.size - 1 {
+        let Some(precomputed_pa_0_plus_1) = precomputed_patch.pa[0].checked_add(1) else {
+            return false;
+        };
+        let precomputed_pa_0_plus_1_aligned =
+            precomputed_pa_0_plus_1.is_multiple_of(Size4KiB::SIZE);
+
+        if patch_data.pa[0] != precomputed_pa_0_plus_1
+            && !(patch_data.pa[0] == precomputed_patch.pa[1] && precomputed_pa_0_plus_1_aligned)
         {
+            return false;
+        }
+
+        // step 2. `apply_vtl0_text_patch` uses `patch_data.pa[1]` only when
+        // `patch_data.pa[0]` leaves the remainder of the patch on the next page.
+        // For a legitimate step 2, that next page is the precomputed patch's pa[1].
+        if !precomputed_pa_0_plus_1_aligned && patch_data.pa[1] != precomputed_patch.pa[1] {
             return false;
         }
         1
@@ -675,6 +681,35 @@ pub fn validate_text_poke_bp_batch(patch_data: &HekiPatch, precomputed_patch: &H
 pub fn validate_text_patch(patch_data: &HekiPatch, precomputed_patch: &HekiPatch) -> bool {
     validate_text_poke_bp_batch(patch_data, precomputed_patch)
     // TODO: support other patching methods
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn patch(pa: [u64; 2], code: &[u8]) -> HekiPatch {
+        let mut patch = HekiPatch::default();
+        patch.pa = pa;
+        patch.size = code.len() as u8;
+        patch.code[..code.len()].copy_from_slice(code);
+        patch
+    }
+
+    #[test]
+    fn validate_text_poke_bp_batch_accepts_step_2_starting_on_second_page() {
+        let precomputed = patch([0x1fff, 0x2000], &[0xe9, 0x01, 0x02, 0x03, 0x04]);
+        let patch_data = patch([precomputed.pa[1], 0], &[0x01, 0x02, 0x03, 0x04]);
+
+        assert!(validate_text_poke_bp_batch(&patch_data, &precomputed));
+    }
+
+    #[test]
+    fn validate_text_poke_bp_batch_rejects_straddling_step_2_wrong_pa_1() {
+        let precomputed = patch([0x1ffe, 0x2000], &[0xe9, 0x01, 0x02]);
+        let patch_data = patch([precomputed.pa[0] + 1, 0x3000], &[0x01, 0x02]);
+
+        assert!(!validate_text_poke_bp_batch(&patch_data, &precomputed));
+    }
 }
 
 /// Errors for kernel ELF validation and relocation.
