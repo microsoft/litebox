@@ -6,6 +6,7 @@
 
 pub(crate) mod agents;
 pub(crate) mod clone3_matrix;
+pub(crate) mod common;
 pub(crate) mod concurrent_fork;
 pub(crate) mod epoll_pidfd;
 pub(crate) mod eventfd;
@@ -1027,6 +1028,7 @@ fn matches_test(filter: Option<&str>, test: &Test) -> bool {
 #[must_use]
 pub fn collect_all_tests() -> Vec<Test> {
     let mut tests: Vec<Test> = Vec::new();
+    common::register_common_handlers(&mut registry::Registry::new(&mut tests));
     register_canary(&mut registry::Registry::new(&mut tests));
     register_handler_canary(&mut registry::Registry::new(&mut tests));
     special_cases::register_netlink(&mut registry::Registry::new(&mut tests));
