@@ -109,6 +109,10 @@ const SCM_SCENARIOS: &[ScmScenario] = &[
         run: run_pass_eventfd,
     },
     ScmScenario {
+        name: "pass_eventfd_poll_wake",
+        run: run_pass_eventfd_poll_wake,
+    },
+    ScmScenario {
         name: "pass_tcp_socket",
         run: run_pass_tcp_socket,
     },
@@ -199,6 +203,144 @@ fn run_pass_eventfd<'a>(
         cleanup_path(&path);
         Ok(format!(
             "source_eventfd={source} received_eventfd={received_id} value=7"
+        ))
+    })
+}
+
+/// Phase B-Step `b-next-poll-cross-worker`: validate that a write to a
+/// broker-backed eventfd in the sender wakes a `poll`/`epoll_wait` on
+/// the receiver side. This is the cross-worker poll wake-up path:
+///
+///   1. sender creates an eventfd (broker-backed if provider is set);
+///   2. sender passes it to receiver via SCM_RIGHTS (recv-side
+///      materialises a new BrokerBacked EventFile referring to the
+///      same broker handle);
+///   3. receiver registers the received eventfd with an epoll instance,
+///      asking for `IN` readiness;
+///   4. receiver does a fast `epoll_wait(timeout=0)` and expects no
+///      events (broker counter is 0);
+///   5. sender writes to its eventfd (broker counter → 7);
+///   6. receiver does an `epoll_wait(timeout=2000ms)` and expects to
+///      observe `IN` on the received eventfd quickly (well under the
+///      timeout, ideally as soon as the broker pushes a notification).
+///
+/// If step 6 times out without an `IN` event, the receiver is missing
+/// broker→worker notification delivery for cross-worker writes — the
+/// next gap to fix (subscribe_eventfd RPC at epoll_ctl + dispatcher
+/// thread firing the local Pollee observer).
+fn run_pass_eventfd_poll_wake<'a>(
+    run: &'a mut RunContext<'_>,
+    sender: &'a AgentHandle,
+    receiver: &'a AgentHandle,
+    scenario: &'static str,
+) -> ScmFuture<'a> {
+    Box::pin(async move {
+        let (send_sock, recv_sock, path) =
+            open_scm_channel(run, sender, receiver, scenario).await?;
+        let source = eventfd_open(run, sender, 0, "nonblock|cloexec").await?;
+        send_fds(
+            run,
+            sender,
+            send_sock,
+            vec![FdRef::Eventfd(source)],
+            "eventfd_poll",
+        )
+        .await?;
+        let received = recv_fds(run, receiver, recv_sock, 64, "eventfd_poll").await?;
+        let received_id = expect_one_eventfd(received)?;
+        // Receiver: create an epoll instance and register the
+        // received eventfd asking for IN readiness.
+        let epoll = match run.send(receiver, Command::EpollCreate).await {
+            Response::EpollHandle { id } => id,
+            other => return Err(format!("EpollCreate on receiver got {other:?}")),
+        };
+        match run
+            .send(
+                receiver,
+                Command::EpollAddEventfd {
+                    epoll,
+                    eventfd_id: received_id,
+                    events: "in".to_string(),
+                },
+            )
+            .await
+        {
+            Response::Ok { .. } => {}
+            other => return Err(format!("EpollAddEventfd got {other:?}")),
+        }
+        // Sanity: immediately, no events should be reported.
+        match run
+            .send(
+                receiver,
+                Command::EpollWait {
+                    epoll,
+                    timeout_ms: 0,
+                    max_events: 4,
+                },
+            )
+            .await
+        {
+            Response::EpollEvents { events } => {
+                if !events.is_empty() {
+                    return Err(format!(
+                        "expected empty epoll events before write, got {events:?}"
+                    ));
+                }
+            }
+            other => return Err(format!("expected EpollEvents, got {other:?}")),
+        }
+        // Sender writes to the eventfd. Broker counter → 7.
+        expect_sent(
+            run.send(
+                sender,
+                Command::EventfdWrite {
+                    id: source,
+                    value: 7,
+                },
+            )
+            .await,
+            "write source eventfd",
+        )?;
+        // Receiver: epoll_wait with a generous timeout. Should fire
+        // promptly via broker→worker notification.
+        let events = match run
+            .send(
+                receiver,
+                Command::EpollWait {
+                    epoll,
+                    timeout_ms: 2000,
+                    max_events: 4,
+                },
+            )
+            .await
+        {
+            Response::EpollEvents { events } => events,
+            other => return Err(format!("expected EpollEvents (post-write), got {other:?}")),
+        };
+        if events.is_empty() {
+            return Err(format!(
+                "epoll_wait timed out without firing for received eventfd \
+                 (cross-worker broker→worker notification path missing)"
+            ));
+        }
+        // Verify the actual read returns 7 (sanity: same handle, same
+        // counter).
+        expect_eventfd_value(
+            run.send(receiver, Command::EventfdRead { id: received_id })
+                .await,
+            7,
+            "read received eventfd after poll wake",
+        )?;
+        let _ = run
+            .send(receiver, Command::UnixPairClose { socket: recv_sock })
+            .await;
+        let _ = run
+            .send(sender, Command::UnixPairClose { socket: send_sock })
+            .await;
+        let _ = run.send(receiver, Command::EpollClose { epoll }).await;
+        cleanup_path(&path);
+        Ok(format!(
+            "poll_woken on received_eventfd={received_id}; events={events:?}"
         ))
     })
 }
