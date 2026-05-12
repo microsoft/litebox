@@ -18,13 +18,13 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use tokio::io::AsyncReadExt;
 
-use super::agents::{AgentHandle, AgentName};
-use super::common;
+use super::agents::{AgentHandle, AgentName, SpawnKind};
 use super::registry::Registry;
 use super::run_context::RunContext;
 use crate::handlers::{HandlerCtx, HandlerError, HandlerToken};
 use crate::protocol::Response;
 use crate::register_handler;
+use crate::register_leaf_subcommand;
 
 #[derive(Clone, Serialize, Deserialize)]
 struct BashArgs {
@@ -133,6 +133,597 @@ async fn run_exec_argv(argv: Vec<String>, timeout_secs: Option<u64>) -> Response
                 ),
             }
         }
+    }
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct BufferedScmForkArgs {
+    child_target: String,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+struct BufferedScmForkOut {
+    detail: String,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct SocketpairForkCrossArgs {
+    child_target: String,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+struct SocketpairForkCrossOut {
+    detail: String,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct PidfdInheritForkArgs {
+    child_target: String,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+struct PidfdInheritForkOut {
+    detail: String,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct StressExecArgs {
+    count: usize,
+    mode: String,
+    use_tokio: bool,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+struct StressExecOut {
+    detail: String,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct TriggerDelayedForkArgs {
+    cmd: String,
+    args: Vec<String>,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+struct TriggerDelayedForkOut {
+    detail: String,
+}
+
+const BUFFERED_SCM_FORK: HandlerToken<BufferedScmForkArgs, BufferedScmForkOut> =
+    HandlerToken::new("fork_matrix.buffered_scm_fork");
+const SOCKETPAIR_FORK_CROSS: HandlerToken<SocketpairForkCrossArgs, SocketpairForkCrossOut> =
+    HandlerToken::new("fork_matrix.socketpair_fork_cross");
+const PIDFD_INHERIT_FORK: HandlerToken<PidfdInheritForkArgs, PidfdInheritForkOut> =
+    HandlerToken::new("fork_matrix.pidfd_inherit_fork");
+const STRESS_EXEC: HandlerToken<StressExecArgs, StressExecOut> =
+    HandlerToken::new("fork_matrix.stress_exec");
+const TRIGGER_DELAYED_FORK: HandlerToken<TriggerDelayedForkArgs, TriggerDelayedForkOut> =
+    HandlerToken::new("fork_matrix.trigger_delayed_fork");
+const TRIGGER_DELAYED_FORK_THREAD: HandlerToken<TriggerDelayedForkArgs, TriggerDelayedForkOut> =
+    HandlerToken::new("fork_matrix.trigger_delayed_fork_thread");
+
+fn errno() -> i32 {
+    std::io::Error::last_os_error().raw_os_error().unwrap_or(-1)
+}
+
+const fn fork_binary_label(bt: crate::BinaryType) -> &'static str {
+    match bt {
+        crate::BinaryType::PieGlibc => "self",
+        crate::BinaryType::NonPieGlibc => "nonpie",
+        crate::BinaryType::StaticPieGlibc => "static-pie-glibc",
+        crate::BinaryType::StaticPieMusl => "static-pie-musl",
+        crate::BinaryType::NonPieStaticMusl => "non-pie-static-musl",
+    }
+}
+
+fn wait_exit_code(pid: libc::pid_t) -> i32 {
+    let mut status = 0i32;
+    unsafe { libc::waitpid(pid, &raw mut status, 0) };
+    if libc::WIFEXITED(status) {
+        libc::WEXITSTATUS(status)
+    } else {
+        99
+    }
+}
+
+async fn handle_buffered_scm_fork(
+    args: BufferedScmForkArgs,
+    _ctx: &mut HandlerCtx<'_>,
+) -> Result<BufferedScmForkOut, HandlerError> {
+    Ok(BufferedScmForkOut {
+        detail: buffered_scm_fork(&args.child_target),
+    })
+}
+
+async fn handle_socketpair_fork_cross(
+    args: SocketpairForkCrossArgs,
+    _ctx: &mut HandlerCtx<'_>,
+) -> Result<SocketpairForkCrossOut, HandlerError> {
+    Ok(SocketpairForkCrossOut {
+        detail: socketpair_fork_cross(&args.child_target),
+    })
+}
+
+async fn handle_pidfd_inherit_fork(
+    args: PidfdInheritForkArgs,
+    _ctx: &mut HandlerCtx<'_>,
+) -> Result<PidfdInheritForkOut, HandlerError> {
+    Ok(PidfdInheritForkOut {
+        detail: pidfd_inherit_fork(&args.child_target),
+    })
+}
+
+async fn handle_stress_exec(
+    args: StressExecArgs,
+    _ctx: &mut HandlerCtx<'_>,
+) -> Result<StressExecOut, HandlerError> {
+    let self_exe =
+        std::env::current_exe().map_err(|e| HandlerError::from(format!("current_exe: {e}")))?;
+    let self_exe = self_exe.to_string_lossy().to_string();
+    let mode = args.mode.as_str();
+    let nonpie_bin: String = if matches!(mode, "nonpie" | "mixed") {
+        crate::nonpie_binary()
+    } else {
+        String::new()
+    };
+    let mut failures = 0;
+    let mut detail = format!(
+        "STRESS_START mode={} count={} tokio={}\n",
+        args.mode, args.count, args.use_tokio
+    );
+
+    if args.use_tokio {
+        for i in 0..args.count {
+            let (cmd, cmd_args, expected): (&str, &[&str], &str) = match mode {
+                "nonpie" => (&nonpie_bin, &["echo-test"], "ECHO_TEST_OK"),
+                "mixed" if i % 2 == 0 => (&self_exe, &["echo-test"], "ECHO_TEST_OK"),
+                "mixed" => (&nonpie_bin, &["echo-test"], "ECHO_TEST_OK"),
+                _ => (&self_exe, &["echo-test"], "ECHO_TEST_OK"),
+            };
+            let result = tokio::process::Command::new(cmd)
+                .args(cmd_args)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .output()
+                .await;
+            match result {
+                Ok(out) => {
+                    let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                    if stdout == expected {
+                        detail.push_str(&format!("i={i} ok={stdout}\n"));
+                    } else {
+                        detail.push_str(&format!(
+                            "i={i} FAIL: expected={expected:?} got={stdout:?} exit={}\n",
+                            out.status
+                        ));
+                        failures += 1;
+                    }
+                }
+                Err(e) => {
+                    detail.push_str(&format!("i={i} FAIL: spawn error: {e}\n"));
+                    failures += 1;
+                }
+            }
+        }
+    } else {
+        for i in 0..args.count {
+            let (cmd, cmd_args, expected): (&str, &[&str], &str) = match mode {
+                "nonpie" => (&nonpie_bin, &["echo-test"], "ECHO_TEST_OK"),
+                "mixed" if i % 2 == 0 => (&self_exe, &["echo-test"], "ECHO_TEST_OK"),
+                "mixed" => (&nonpie_bin, &["echo-test"], "ECHO_TEST_OK"),
+                _ => (&self_exe, &["echo-test"], "ECHO_TEST_OK"),
+            };
+            let result = std::process::Command::new(cmd)
+                .args(cmd_args)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .output();
+            match result {
+                Ok(out) => {
+                    let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                    if stdout == expected {
+                        detail.push_str(&format!("i={i} ok={stdout}\n"));
+                    } else {
+                        detail.push_str(&format!(
+                            "i={i} FAIL: expected={expected:?} got={stdout:?} exit={}\n",
+                            out.status
+                        ));
+                        failures += 1;
+                    }
+                }
+                Err(e) => {
+                    detail.push_str(&format!("i={i} FAIL: spawn error: {e}\n"));
+                    failures += 1;
+                }
+            }
+        }
+    }
+
+    detail.push_str(&format!("STRESS_END failures={failures}"));
+    Ok(StressExecOut { detail })
+}
+
+async fn handle_trigger_delayed_fork(
+    args: TriggerDelayedForkArgs,
+    _ctx: &mut HandlerCtx<'_>,
+) -> Result<TriggerDelayedForkOut, HandlerError> {
+    let trigger: Vec<u8> = vec![0u8; 64 * 1024];
+    assert_eq!(trigger[0], 0);
+    run_trigger_command(args).await
+}
+
+async fn handle_trigger_delayed_fork_thread(
+    args: TriggerDelayedForkArgs,
+    _ctx: &mut HandlerCtx<'_>,
+) -> Result<TriggerDelayedForkOut, HandlerError> {
+    let handle = std::thread::spawn(|| {});
+    handle
+        .join()
+        .map_err(|_| HandlerError::from("thread join failed"))?;
+    run_trigger_command(args).await
+}
+
+async fn run_trigger_command(
+    args: TriggerDelayedForkArgs,
+) -> Result<TriggerDelayedForkOut, HandlerError> {
+    let output = tokio::process::Command::new(&args.cmd)
+        .args(&args.args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .await
+        .map_err(|e| HandlerError::from(format!("nested fork+exec failed: {e}")))?;
+    if !output.status.success() {
+        return Err(HandlerError::from(format!(
+            "nested fork+exec exit={} stderr={}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        )));
+    }
+    Ok(TriggerDelayedForkOut {
+        detail: String::from_utf8_lossy(&output.stdout).to_string(),
+    })
+}
+
+fn buffered_scm_fork(child_exe: &str) -> String {
+    if child_exe.is_empty() {
+        return "BSF_USAGE: buffered-scm-fork <child_exe>".into();
+    }
+    let mut fds = [0i32; 2];
+    let rc = unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, fds.as_mut_ptr()) };
+    if rc != 0 {
+        return format!("BSF_SOCKETPAIR_FAIL:{}", errno());
+    }
+    let s_send = fds[0];
+    let s_recv = fds[1];
+
+    let ev = unsafe { libc::eventfd(0, 0) };
+    if ev < 0 {
+        return format!("BSF_EVENTFD_FAIL:{}", errno());
+    }
+
+    let payload = b"BSF";
+    let mut iov = libc::iovec {
+        iov_base: payload.as_ptr() as *mut libc::c_void,
+        iov_len: payload.len(),
+    };
+    let mut cmsg_buf = [0u8; 32];
+    let mut msg: libc::msghdr = unsafe { core::mem::zeroed() };
+    msg.msg_iov = &raw mut iov;
+    msg.msg_iovlen = 1;
+    msg.msg_control = cmsg_buf.as_mut_ptr().cast::<libc::c_void>();
+    msg.msg_controllen = cmsg_buf.len() as _;
+    unsafe {
+        let cmsg = libc::CMSG_FIRSTHDR(&raw const msg);
+        (*cmsg).cmsg_level = libc::SOL_SOCKET;
+        (*cmsg).cmsg_type = libc::SCM_RIGHTS;
+        (*cmsg).cmsg_len = libc::CMSG_LEN(core::mem::size_of::<i32>() as u32) as _;
+        let data = libc::CMSG_DATA(cmsg).cast::<i32>();
+        data.write_unaligned(ev);
+        msg.msg_controllen = libc::CMSG_SPACE(core::mem::size_of::<i32>() as u32) as _;
+    }
+    let n = unsafe { libc::sendmsg(s_send, &raw const msg, 0) };
+    if n < 0 {
+        return format!("BSF_SENDMSG_FAIL:{}", errno());
+    }
+
+    unsafe {
+        libc::close(s_send);
+        libc::close(ev);
+        libc::fcntl(s_recv, libc::F_SETFD, 0);
+    }
+
+    let pid = unsafe { libc::fork() };
+    if pid < 0 {
+        return format!("BSF_FORK_FAIL:{}", errno());
+    }
+
+    if pid == 0 {
+        let fd_str = s_recv.to_string();
+        let c_exe = std::ffi::CString::new(child_exe).unwrap();
+        let c_a1 = std::ffi::CString::new("buffered-scm-fork-child").unwrap();
+        let c_a2 = std::ffi::CString::new(fd_str.as_str()).unwrap();
+        let argv = [
+            c_exe.as_ptr(),
+            c_a1.as_ptr(),
+            c_a2.as_ptr(),
+            core::ptr::null(),
+        ];
+        unsafe { libc::execv(c_exe.as_ptr(), argv.as_ptr()) };
+        eprintln!("[BSF-child] execv failed: {}", errno());
+        std::process::exit(127);
+    }
+
+    unsafe { libc::close(s_recv) };
+    let exit_code = wait_exit_code(pid);
+    if exit_code == 0 {
+        "BSF_OK".into()
+    } else {
+        format!("BSF_FAIL:exit={exit_code}")
+    }
+}
+
+fn socketpair_fork_cross(child_exe: &str) -> String {
+    if child_exe.is_empty() {
+        return "SXF_USAGE: socketpair-fork-cross <child_exe>".into();
+    }
+    let mut fds = [0i32; 2];
+    let rc = unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, fds.as_mut_ptr()) };
+    if rc != 0 {
+        return format!("SXF_SOCKETPAIR_FAIL:{}", errno());
+    }
+    let parent_fd = fds[0];
+    let child_fd = fds[1];
+    unsafe { libc::fcntl(child_fd, libc::F_SETFD, 0) };
+
+    let pid = unsafe { libc::fork() };
+    if pid < 0 {
+        return format!("SXF_FORK_FAIL:{}", errno());
+    }
+    if pid == 0 {
+        unsafe { libc::close(parent_fd) };
+        let fd_str = child_fd.to_string();
+        let c_exe = std::ffi::CString::new(child_exe).unwrap();
+        let c_a1 = std::ffi::CString::new("socketpair-fork-cross-child").unwrap();
+        let c_a2 = std::ffi::CString::new(fd_str.as_str()).unwrap();
+        let argv = [
+            c_exe.as_ptr(),
+            c_a1.as_ptr(),
+            c_a2.as_ptr(),
+            core::ptr::null(),
+        ];
+        unsafe { libc::execv(c_exe.as_ptr(), argv.as_ptr()) };
+        eprintln!("[SXF-child] execv failed: {}", errno());
+        std::process::exit(127);
+    }
+    unsafe { libc::close(child_fd) };
+
+    let tv = libc::timeval {
+        tv_sec: 10,
+        tv_usec: 0,
+    };
+    unsafe {
+        libc::setsockopt(
+            parent_fd,
+            libc::SOL_SOCKET,
+            libc::SO_RCVTIMEO,
+            (&raw const tv).cast::<libc::c_void>(),
+            core::mem::size_of::<libc::timeval>() as libc::socklen_t,
+        );
+    }
+
+    let ping = b"SXF_PING";
+    let w = unsafe { libc::write(parent_fd, ping.as_ptr().cast::<libc::c_void>(), ping.len()) };
+    if w != ping.len() as isize {
+        unsafe { libc::kill(pid, libc::SIGKILL) };
+        return format!("SXF_WRITE_FAIL:n={w} errno={}", errno());
+    }
+    let mut buf = [0u8; 32];
+    let n = unsafe {
+        libc::read(
+            parent_fd,
+            buf.as_mut_ptr().cast::<libc::c_void>(),
+            buf.len(),
+        )
+    };
+    unsafe { libc::close(parent_fd) };
+    let exit_code = wait_exit_code(pid);
+    if n <= 0 {
+        return format!("SXF_READ_FAIL:n={n},errno={},exit={exit_code}", errno());
+    }
+    let reply = core::str::from_utf8(&buf[..n as usize]).unwrap_or("?");
+    if reply == "SXF_PONG" && exit_code == 0 {
+        "SXF_OK".into()
+    } else {
+        format!("SXF_FAIL:reply={reply},exit={exit_code}")
+    }
+}
+
+fn pidfd_inherit_fork(child_exe: &str) -> String {
+    if child_exe.is_empty() {
+        return "PIF_USAGE: pidfd-inherit-fork <child_exe>".into();
+    }
+    let gpid = unsafe { libc::fork() };
+    if gpid < 0 {
+        return format!("PIF_GRANDCHILD_FORK_FAIL:{}", errno());
+    }
+    if gpid == 0 {
+        unsafe { libc::sleep(2) };
+        std::process::exit(0);
+    }
+
+    let pidfd = unsafe { libc::syscall(libc::SYS_pidfd_open, gpid, 0) } as i32;
+    if pidfd < 0 {
+        unsafe { libc::kill(gpid, libc::SIGKILL) };
+        return format!("PIF_PIDFD_OPEN_FAIL:{}", errno());
+    }
+    unsafe { libc::fcntl(pidfd, libc::F_SETFD, 0) };
+
+    let pid = unsafe { libc::fork() };
+    if pid < 0 {
+        unsafe { libc::kill(gpid, libc::SIGKILL) };
+        return format!("PIF_FORK_FAIL:{}", errno());
+    }
+    if pid == 0 {
+        let fd_str = pidfd.to_string();
+        let gpid_str = gpid.to_string();
+        let c_exe = std::ffi::CString::new(child_exe).unwrap();
+        let c_a1 = std::ffi::CString::new("pidfd-inherit-child").unwrap();
+        let c_a2 = std::ffi::CString::new(fd_str.as_str()).unwrap();
+        let c_a3 = std::ffi::CString::new(gpid_str.as_str()).unwrap();
+        let argv = [
+            c_exe.as_ptr(),
+            c_a1.as_ptr(),
+            c_a2.as_ptr(),
+            c_a3.as_ptr(),
+            core::ptr::null(),
+        ];
+        unsafe { libc::execv(c_exe.as_ptr(), argv.as_ptr()) };
+        eprintln!("[PIF-child] execv failed: {}", errno());
+        std::process::exit(127);
+    }
+    unsafe { libc::close(pidfd) };
+
+    let mut status = 0i32;
+    unsafe { libc::waitpid(pid, &raw mut status, 0) };
+    let child_exit = if libc::WIFEXITED(status) {
+        libc::WEXITSTATUS(status)
+    } else {
+        99
+    };
+    unsafe { libc::waitpid(gpid, &raw mut status, libc::WNOHANG) };
+
+    if child_exit == 0 {
+        "PIF_OK".into()
+    } else {
+        format!("PIF_FAIL:exit={child_exit}")
+    }
+}
+
+mod leaf_subcmd {
+    pub(super) fn subcmd_buffered_scm_fork_child(args: &[String]) -> i32 {
+        let fd: i32 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(-1);
+        if fd < 0 {
+            eprintln!("[BSF-child] bad fd arg");
+            return 1;
+        }
+        let mut buf = [0u8; 32];
+        let mut iov = libc::iovec {
+            iov_base: buf.as_mut_ptr().cast::<libc::c_void>(),
+            iov_len: buf.len(),
+        };
+        let mut cmsg_buf = [0u8; 64];
+        let mut msg: libc::msghdr = unsafe { core::mem::zeroed() };
+        msg.msg_iov = &raw mut iov;
+        msg.msg_iovlen = 1;
+        msg.msg_control = cmsg_buf.as_mut_ptr().cast::<libc::c_void>();
+        msg.msg_controllen = cmsg_buf.len() as _;
+        let n = unsafe { libc::recvmsg(fd, &raw mut msg, 0) };
+        if n < 0 {
+            eprintln!("[BSF-child] recvmsg failed: {}", super::errno());
+            return 2;
+        }
+        let mut got_ev: i32 = -1;
+        unsafe {
+            let mut cmsg = libc::CMSG_FIRSTHDR(&raw const msg);
+            while !cmsg.is_null() {
+                if (*cmsg).cmsg_level == libc::SOL_SOCKET && (*cmsg).cmsg_type == libc::SCM_RIGHTS {
+                    let data = libc::CMSG_DATA(cmsg).cast::<i32>();
+                    got_ev = data.read_unaligned();
+                    break;
+                }
+                cmsg = libc::CMSG_NXTHDR(&raw const msg, cmsg);
+            }
+        }
+        if got_ev < 0 {
+            eprintln!("[BSF-child] no SCM_RIGHTS in recvmsg result");
+            return 3;
+        }
+        let v: u64 = 0x4243_5f4f_4b21;
+        let w = unsafe { libc::write(got_ev, (&raw const v).cast::<libc::c_void>(), 8) };
+        if w != 8 {
+            eprintln!(
+                "[BSF-child] write to ev failed: w={w} errno={}",
+                super::errno()
+            );
+            return 4;
+        }
+        let mut r: u64 = 0;
+        let rn = unsafe { libc::read(got_ev, (&raw mut r).cast::<libc::c_void>(), 8) };
+        unsafe {
+            libc::close(got_ev);
+            libc::close(fd);
+        }
+        if rn != 8 || r != v {
+            eprintln!("[BSF-child] read mismatch: rn={rn} r={r:#x} expected={v:#x}");
+            return 5;
+        }
+        0
+    }
+
+    pub(super) fn subcmd_socketpair_fork_cross_child(args: &[String]) -> i32 {
+        let fd: i32 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(-1);
+        if fd < 0 {
+            eprintln!("[SXF-child] bad fd arg");
+            return 1;
+        }
+        let tv = libc::timeval {
+            tv_sec: 5,
+            tv_usec: 0,
+        };
+        unsafe {
+            libc::setsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                libc::SO_RCVTIMEO,
+                (&raw const tv).cast::<libc::c_void>(),
+                core::mem::size_of::<libc::timeval>() as libc::socklen_t,
+            );
+        }
+        let mut buf = [0u8; 32];
+        let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast::<libc::c_void>(), buf.len()) };
+        if n <= 0 {
+            eprintln!("[SXF-child] read failed: n={n} errno={}", super::errno());
+            return 2;
+        }
+        let msg = core::str::from_utf8(&buf[..n as usize]).unwrap_or("?");
+        if msg != "SXF_PING" {
+            eprintln!("[SXF-child] unexpected msg: {msg}");
+            return 3;
+        }
+        let pong = b"SXF_PONG";
+        let w = unsafe { libc::write(fd, pong.as_ptr().cast::<libc::c_void>(), pong.len()) };
+        unsafe { libc::close(fd) };
+        if w == pong.len() as isize { 0 } else { 4 }
+    }
+
+    pub(super) fn subcmd_pidfd_inherit_child(args: &[String]) -> i32 {
+        let pidfd: i32 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(-1);
+        let gpid: i32 = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(-1);
+        if pidfd < 0 || gpid < 0 {
+            eprintln!("[PIF-child] bad args");
+            return 1;
+        }
+        let mut pfd = libc::pollfd {
+            fd: pidfd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let rc = unsafe { libc::poll(&raw mut pfd, 1, 10_000) };
+        unsafe { libc::close(pidfd) };
+        if rc <= 0 {
+            eprintln!("[PIF-child] poll failed: rc={rc} errno={}", super::errno());
+            return 2;
+        }
+        if pfd.revents & libc::POLLIN == 0 {
+            eprintln!("[PIF-child] no POLLIN: revents={}", pfd.revents);
+            return 3;
+        }
+        let _ = gpid;
+        0
     }
 }
 
@@ -320,12 +911,6 @@ enum DfTrigger {
 }
 
 impl DfTrigger {
-    fn subcommand(self) -> &'static str {
-        match self {
-            Self::Mmap => "trigger-delayed-fork",
-            Self::Thread => "trigger-delayed-fork-thread",
-        }
-    }
     fn suffix(self) -> &'static str {
         match self {
             Self::Mmap => "mmap",
@@ -478,6 +1063,27 @@ const CONTAMINATION_CASES: &[ContaminationCase] = &[
 pub(crate) fn register_fork_matrix(reg: &mut Registry<'_>) {
     register_handler!(BASH, handle_bash);
     register_handler!(EXEC_BIN, handle_exec_bin);
+    register_handler!(BUFFERED_SCM_FORK, handle_buffered_scm_fork);
+    register_handler!(SOCKETPAIR_FORK_CROSS, handle_socketpair_fork_cross);
+    register_handler!(PIDFD_INHERIT_FORK, handle_pidfd_inherit_fork);
+    register_handler!(STRESS_EXEC, handle_stress_exec);
+    register_handler!(TRIGGER_DELAYED_FORK, handle_trigger_delayed_fork);
+    register_handler!(
+        TRIGGER_DELAYED_FORK_THREAD,
+        handle_trigger_delayed_fork_thread
+    );
+    register_leaf_subcommand!(
+        "buffered-scm-fork-child",
+        leaf_subcmd::subcmd_buffered_scm_fork_child
+    );
+    register_leaf_subcommand!(
+        "socketpair-fork-cross-child",
+        leaf_subcmd::subcmd_socketpair_fork_cross_child
+    );
+    register_leaf_subcommand!(
+        "pidfd-inherit-child",
+        leaf_subcmd::subcmd_pidfd_inherit_child
+    );
 
     // Shell patterns x depth
     for &agent in DEPTH_AGENTS {
@@ -691,107 +1297,55 @@ pub(crate) fn register_fork_matrix(reg: &mut Registry<'_>) {
                         invocation.suffix()
                     );
                     let agent_label = agent.to_string();
-                    let trigger_sub = trigger.subcommand().to_string();
                     let binary_expected = binary.expected().to_string();
 
                     reg.test("fork", "fork_matrix", id)
                         .timeout(60)
                         .build(move |cx| {
-                            let handle = cx.require(agent);
+                            let leaf = cx.declare_ephemeral(
+                                agent,
+                                format!(
+                                    "XDF_{}_{}_{}_{agent}",
+                                    binary.suffix(),
+                                    trigger.suffix(),
+                                    invocation.suffix()
+                                ),
+                                SpawnKind::Fork {
+                                    binary: "self",
+                                    inherit_listen_ports: vec![],
+                                },
+                            );
                             Box::new(move |run| {
+                                let leaf = leaf.clone();
+                                let agent_label = agent_label.clone();
+                                let binary_expected = binary_expected.clone();
                                 Box::pin(async move {
                                     let self_exe = run.self_exe().to_string();
-                                    let (inner_cmd, inner_args): (String, Vec<String>) =
-                                        match binary {
-                                            DfBinary::Harness(bt) => (
-                                                crate::binary_path(bt, &self_exe),
-                                                vec!["echo-test".into()],
-                                            ),
-                                            DfBinary::Node => (
-                                                "/usr/local/bin/node".into(),
-                                                vec![
-                                                    "-e".into(),
-                                                    "console.log('df_node_ok')".into(),
-                                                ],
-                                            ),
-                                        };
-
-                                    let resp = match invocation {
-                                        DfInvocation::Direct => {
-                                            let mut args = vec![
-                                                self_exe.clone(),
-                                                trigger_sub.clone(),
-                                                inner_cmd,
-                                            ];
-                                            args.extend(inner_args);
-                                            dispatch_exec_bin(run, &handle, args, None).await
+                                    let (inner_cmd, inner_args): (String, Vec<String>) = match binary {
+                                        DfBinary::Harness(bt) => {
+                                            (crate::binary_path(bt, &self_exe), vec!["echo-test".into()])
                                         }
-                                        DfInvocation::ScriptFile => {
-                                            let test_id_safe = format!(
-                                                "XDF_{}_{}_{}_{}",
-                                                trigger.suffix(),
-                                                binary.suffix(),
-                                                invocation.suffix(),
-                                                agent_label
-                                            );
-                                            let script = format!("/tmp/xdf_{test_id_safe}.sh");
-                                            let inner_full = if inner_args.is_empty() {
-                                                inner_cmd.clone()
-                                            } else {
-                                                let escaped: Vec<String> = inner_args
-                                                    .iter()
-                                                    .map(|a| {
-                                                        if a.contains(|c: char| {
-                                                            !c.is_alphanumeric()
-                                                                && c != '_'
-                                                                && c != '-'
-                                                                && c != '.'
-                                                                && c != '/'
-                                                        }) {
-                                                            format!(
-                                                                "\"{}\"",
-                                                                a.replace('"', "\\\"")
-                                                            )
-                                                        } else {
-                                                            a.clone()
-                                                        }
-                                                    })
-                                                    .collect();
-                                                format!("{inner_cmd} {}", escaped.join(" "))
-                                            };
-                                            let body = format!(
-                                                "cat > {script} <<'XEOF'\n#!/usr/bin/bash\n\
-                                                 {self_exe} {trigger_sub} {inner_full}\n\
-                                                 XEOF\nchmod +x {script} && {script}; \
-                                                 EXIT=$?; rm -f {script}; exit $EXIT",
-                                            );
-                                            dispatch_bash(run, &handle, body, None).await
-                                        }
+                                        DfBinary::Node => (
+                                            "/usr/local/bin/node".into(),
+                                            vec!["-e".into(), "console.log('df_node_ok')".into()],
+                                        ),
                                     };
-
-                                    let not_found = matches!(
-                                        &resp,
-                                        Response::ExecResult { exit_code: 127, .. }
-                                    ) || matches!(
-                                        &resp,
-                                        Response::Error { error }
-                                            if error.contains("not found")
-                                    );
-                                    if not_found {
-                                        return super::TestOutcome::new(
-                                            &agent_label,
-                                            false,
-                                            "FAIL: binary not in rootfs",
-                                        );
-                                    }
-
-                                    let pass = matches!(
-                                        &resp,
-                                        Response::ExecResult {
-                                            exit_code: 0, stdout, ..
-                                        } if stdout.contains(&*binary_expected)
-                                    );
-                                    super::TestOutcome::new(&agent_label, pass, format!("{resp:?}"))
+                                    let token = match trigger {
+                                        DfTrigger::Mmap => &TRIGGER_DELAYED_FORK,
+                                        DfTrigger::Thread => &TRIGGER_DELAYED_FORK_THREAD,
+                                    };
+                                    let result = run
+                                        .run_leaf(
+                                            &leaf,
+                                            token,
+                                            TriggerDelayedForkArgs {
+                                                cmd: inner_cmd,
+                                                args: inner_args,
+                                            },
+                                        )
+                                        .await;
+                                    let pass = matches!(&result, Ok(out) if out.detail.contains(&*binary_expected));
+                                    super::TestOutcome::new(&agent_label, pass, format!("{result:?}"))
                                 })
                             })
                         });
@@ -814,32 +1368,27 @@ pub(crate) fn register_fork_matrix(reg: &mut Registry<'_>) {
         reg.test("fork", "fork_matrix", format!("BSF.{bt_label}"))
             .timeout(60)
             .build(move |cx| {
-                let handle = cx.require(AgentName::Dpg1);
+                let leaf = cx.declare_ephemeral(
+                    AgentName::Dpg1,
+                    format!("BSF_{bt_label}"),
+                    SpawnKind::Fork {
+                        binary: "self",
+                        inherit_listen_ports: vec![],
+                    },
+                );
                 Box::new(move |run| {
+                    let leaf = leaf.clone();
                     Box::pin(async move {
                         let self_exe = run.self_exe().to_string();
                         let child_target = crate::binary_path(bt, &self_exe);
                         let result = run
-                            .send_named_typed(
-                                &handle,
-                                &common::EXEC_BIN,
-                                common::ExecBinArgs {
-                                    argv: vec![
-                                        self_exe,
-                                        "unix-socket-test".into(),
-                                        "buffered-scm-fork".into(),
-                                        child_target,
-                                    ],
-                                    timeout_ms: Some(50_000),
-                                    stdin: None,
-                                    env: vec![],
-                                },
+                            .run_leaf(
+                                &leaf,
+                                &BUFFERED_SCM_FORK,
+                                BufferedScmForkArgs { child_target },
                             )
                             .await;
-                        let pass = matches!(
-                            &result,
-                            Ok(out) if out.exit_code == 0 && out.stdout.contains("BSF_OK")
-                        );
+                        let pass = matches!(&result, Ok(out) if out.detail.contains("BSF_OK"));
                         super::TestOutcome::new("A", pass, format!("{result:?}"))
                     })
                 })
@@ -859,32 +1408,27 @@ pub(crate) fn register_fork_matrix(reg: &mut Registry<'_>) {
         reg.test("fork", "fork_matrix", format!("SXF.{bt_label}"))
             .timeout(60)
             .build(move |cx| {
-                let handle = cx.require(AgentName::Dpg1);
+                let leaf = cx.declare_ephemeral(
+                    AgentName::Dpg1,
+                    format!("SXF_{bt_label}"),
+                    SpawnKind::Fork {
+                        binary: "self",
+                        inherit_listen_ports: vec![],
+                    },
+                );
                 Box::new(move |run| {
+                    let leaf = leaf.clone();
                     Box::pin(async move {
                         let self_exe = run.self_exe().to_string();
                         let child_target = crate::binary_path(bt, &self_exe);
                         let result = run
-                            .send_named_typed(
-                                &handle,
-                                &common::EXEC_BIN,
-                                common::ExecBinArgs {
-                                    argv: vec![
-                                        self_exe,
-                                        "unix-socket-test".into(),
-                                        "socketpair-fork-cross".into(),
-                                        child_target,
-                                    ],
-                                    timeout_ms: Some(50_000),
-                                    stdin: None,
-                                    env: vec![],
-                                },
+                            .run_leaf(
+                                &leaf,
+                                &SOCKETPAIR_FORK_CROSS,
+                                SocketpairForkCrossArgs { child_target },
                             )
                             .await;
-                        let pass = matches!(
-                            &result,
-                            Ok(out) if out.exit_code == 0 && out.stdout.contains("SXF_OK")
-                        );
+                        let pass = matches!(&result, Ok(out) if out.detail.contains("SXF_OK"));
                         super::TestOutcome::new("A", pass, format!("{result:?}"))
                     })
                 })
@@ -903,32 +1447,27 @@ pub(crate) fn register_fork_matrix(reg: &mut Registry<'_>) {
         reg.test("fork", "fork_matrix", format!("PIF.{bt_label}"))
             .timeout(60)
             .build(move |cx| {
-                let handle = cx.require(AgentName::Dpg1);
+                let leaf = cx.declare_ephemeral(
+                    AgentName::Dpg1,
+                    format!("PIF_{bt_label}"),
+                    SpawnKind::Fork {
+                        binary: "self",
+                        inherit_listen_ports: vec![],
+                    },
+                );
                 Box::new(move |run| {
+                    let leaf = leaf.clone();
                     Box::pin(async move {
                         let self_exe = run.self_exe().to_string();
                         let child_target = crate::binary_path(bt, &self_exe);
                         let result = run
-                            .send_named_typed(
-                                &handle,
-                                &common::EXEC_BIN,
-                                common::ExecBinArgs {
-                                    argv: vec![
-                                        self_exe,
-                                        "unix-socket-test".into(),
-                                        "pidfd-inherit-fork".into(),
-                                        child_target,
-                                    ],
-                                    timeout_ms: Some(50_000),
-                                    stdin: None,
-                                    env: vec![],
-                                },
+                            .run_leaf(
+                                &leaf,
+                                &PIDFD_INHERIT_FORK,
+                                PidfdInheritForkArgs { child_target },
                             )
                             .await;
-                        let pass = matches!(
-                            &result,
-                            Ok(out) if out.exit_code == 0 && out.stdout.contains("PIF_OK")
-                        );
+                        let pass = matches!(&result, Ok(out) if out.detail.contains("PIF_OK"));
                         super::TestOutcome::new("A", pass, format!("{result:?}"))
                     })
                 })
@@ -945,31 +1484,31 @@ pub(crate) fn register_fork_matrix(reg: &mut Registry<'_>) {
         )
         .timeout(60)
         .build(move |cx| {
-            let handle = cx.require(AgentName::Dpg1);
+            let leaf = cx.declare_ephemeral(
+                AgentName::Dpg1,
+                format!("XDF_triple_{bt_label}"),
+                SpawnKind::Fork {
+                    binary: fork_binary_label(bt),
+                    inherit_listen_ports: vec![],
+                },
+            );
             Box::new(move |run| {
+                let leaf = leaf.clone();
                 Box::pin(async move {
                     let self_exe = run.self_exe().to_string();
                     let target = crate::binary_path(bt, &self_exe);
-                    let resp = dispatch_exec_bin(
-                        run,
-                        &handle,
-                        vec![
-                            target.clone(),
-                            "trigger-delayed-fork".into(),
-                            target.clone(),
-                            "trigger-delayed-fork".into(),
-                            target,
-                            "echo-test".into(),
-                        ],
-                        None,
-                    )
-                    .await;
-                    let pass = matches!(
-                        &resp,
-                        Response::ExecResult { exit_code: 0, stdout, .. }
-                            if stdout.contains("ECHO_TEST_OK")
-                    );
-                    super::TestOutcome::new("A", pass, format!("{resp:?}"))
+                    let result = run
+                        .run_leaf(
+                            &leaf,
+                            &TRIGGER_DELAYED_FORK,
+                            TriggerDelayedForkArgs {
+                                cmd: target,
+                                args: vec!["echo-test".into()],
+                            },
+                        )
+                        .await;
+                    let pass = matches!(&result, Ok(out) if out.detail.contains("ECHO_TEST_OK"));
+                    super::TestOutcome::new("A", pass, format!("{result:?}"))
                 })
             })
         });
@@ -982,31 +1521,39 @@ pub(crate) fn register_fork_matrix(reg: &mut Registry<'_>) {
                 let bt_label = bt.label();
                 let id = format!("XS.{bt_label}.{mode}.{spawn_name}");
                 let mode_s = mode.to_string();
-                let extra: Vec<String> = spawn_args
-                    .iter()
-                    .map(std::string::ToString::to_string)
-                    .collect();
+                let use_tokio = spawn_args.contains(&"tokio");
                 reg.test("fork", "fork_matrix", id)
                     .timeout(60)
                     .build(move |cx| {
-                        let handle = cx.require(AgentName::Dpg1);
+                        let leaf = cx.declare_ephemeral(
+                            AgentName::Dpg1,
+                            format!("XS_{bt_label}_{mode}_{spawn_name}"),
+                            SpawnKind::Fork {
+                                binary: fork_binary_label(bt),
+                                inherit_listen_ports: vec![],
+                            },
+                        );
                         Box::new(move |run| {
-                            let extra = extra.clone();
+                            let leaf = leaf.clone();
                             let mode_s = mode_s.clone();
                             Box::pin(async move {
-                                let self_exe = run.self_exe().to_string();
-                                let target = crate::binary_path(bt, &self_exe);
-                                let mut args =
-                                    vec![target, "stress-exec".into(), "10".into(), mode_s];
-                                args.extend(extra);
-                                let resp = dispatch_exec_bin(run, &handle, args, None).await;
+                                let result = run
+                                    .run_leaf(
+                                        &leaf,
+                                        &STRESS_EXEC,
+                                        StressExecArgs {
+                                            count: 10,
+                                            mode: mode_s,
+                                            use_tokio,
+                                        },
+                                    )
+                                    .await;
                                 let pass = matches!(
-                                    &resp,
-                                    Response::ExecResult { exit_code: 0, stdout, .. }
-                                        if stdout.contains("STRESS_START")
-                                            && stdout.contains("STRESS_END failures=0")
+                                    &result,
+                                    Ok(out) if out.detail.contains("STRESS_START")
+                                        && out.detail.contains("STRESS_END failures=0")
                                 );
-                                super::TestOutcome::new("A", pass, format!("{resp:?}"))
+                                super::TestOutcome::new("A", pass, format!("{result:?}"))
                             })
                         })
                     });
