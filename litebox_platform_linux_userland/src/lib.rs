@@ -2554,7 +2554,7 @@ fn move_fd_away_from_stdio(fd: std::os::fd::OwnedFd) -> std::io::Result<std::os:
 /// Relocate an fd to the infrastructure range ([`INFRA_FD_MIN`]+) so it
 /// cannot be clobbered by posix_spawn dup2 actions for bridge fds.
 /// Preserves the CLOEXEC flag from the original fd.
-fn relocate_fd_to_infra_range(fd: std::os::fd::OwnedFd) -> Result<std::os::fd::OwnedFd, i32> {
+pub fn relocate_fd_to_infra_range(fd: std::os::fd::OwnedFd) -> Result<std::os::fd::OwnedFd, i32> {
     if fd.as_raw_fd() >= INFRA_FD_MIN {
         return Ok(fd); // already in the safe range
     }

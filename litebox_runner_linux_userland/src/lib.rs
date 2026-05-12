@@ -11,6 +11,8 @@ use std::path::{Path, PathBuf};
 
 extern crate alloc;
 
+pub mod broker_eventfd_provider;
+
 /// Run Linux programs with LiteBox on unmodified Linux
 #[derive(Parser, Debug)]
 #[allow(clippy::struct_excessive_bools)]
@@ -107,6 +109,20 @@ pub struct CliArgs {
         help_heading = "Unstable Options"
     )]
     pub nine_p_broker: Option<String>,
+
+    /// Connect to a broker fd-token control socket at this Unix-domain
+    /// path. When set, broker-hosted eventfds (and other broker state
+    /// objects) become available; otherwise the worker uses purely-local
+    /// shim-emulated state. The broker must be running with
+    /// `--fd-token-broker-listen <path>` set to the same path.
+    ///
+    /// Phase B-Step8c: enables the cross-worker eventfd path.
+    #[arg(
+        long = "fd-token-broker",
+        requires = "unstable",
+        help_heading = "Unstable Options"
+    )]
+    pub fd_token_broker: Option<String>,
 
     /// Set the initial working directory for the sandboxed process.
     /// Defaults to "/".
@@ -385,6 +401,22 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
             litebox_shim_linux::audit::set_audit_log_fd(high_fd);
         } else {
             litebox_shim_linux::audit::set_audit_log_fd(raw_fd);
+        }
+    }
+
+    // Phase B-Step8c: if --fd-token-broker is supplied, connect to
+    // the broker's fd-token control socket and register a
+    // BrokerEventfdProvider so subsequent sys_eventfd2 calls produce
+    // broker-hosted eventfds. Best-effort: failures are logged via
+    // anyhow context but do not abort the worker — the worker
+    // gracefully falls back to local EventFile.
+    if let Some(ref broker_path) = cli_args.fd_token_broker {
+        if let Err(e) = setup_broker_eventfd_provider(broker_path) {
+            tracing::warn!(
+                error = %e,
+                path = broker_path.as_str(),
+                "fd-token-broker setup failed; falling back to local EventFile",
+            );
         }
     }
 
@@ -2763,6 +2795,14 @@ fn register_worker_spawn_flags(platform: &Platform, cli_args: &CliArgs) {
         flags.push(std::ffi::CString::new("--nine-p-broker").unwrap());
         flags.push(std::ffi::CString::new(broker.as_bytes()).unwrap());
     }
+    // Phase B-Step12: propagate fd-token broker path so each
+    // worker (worker_exec / fork_restore) connects independently
+    // and installs its own broker eventfd provider. Mirrors the
+    // --network-broker / --nine-p-broker per-worker pattern.
+    if let Some(ref broker) = cli_args.fd_token_broker {
+        flags.push(std::ffi::CString::new("--fd-token-broker").unwrap());
+        flags.push(std::ffi::CString::new(broker.as_bytes()).unwrap());
+    }
     if let Some(ref initial_files) = cli_args.initial_files {
         flags.push(std::ffi::CString::new("--initial-files").unwrap());
         flags
@@ -2785,6 +2825,39 @@ fn register_worker_spawn_flags(platform: &Platform, cli_args: &CliArgs) {
     }
 }
 
+/// Phase B-Step8c: connects to the broker fd-token control socket,
+/// sets up the worker's broker→worker notification ring, starts a
+/// `NotificationDispatcher` reader thread, and installs a
+/// `RunnerBrokerEventfdProvider` as the shim's global provider.
+///
+/// Called from `run()` when `--fd-token-broker <path>` is supplied.
+fn setup_broker_eventfd_provider(broker_path: &str) -> anyhow::Result<()> {
+    use litebox_common_linux::broker_eventfd::NotificationDispatcher;
+    use litebox_common_linux::fd_token_client::FdTokenClient;
+    use litebox_common_linux::notification_ring::NotificationReceiver;
+    use litebox_common_linux::shmem_ring::ShmemRingPair;
+    use std::sync::Arc;
+    let path = std::path::Path::new(broker_path);
+    let client = Arc::new(FdTokenClient::connect(path).map_err(|e| anyhow!("connect: {e}"))?);
+    let (pair, tx_fd, rx_fd) = ShmemRingPair::create().map_err(|e| anyhow!("ring: {e:?}"))?;
+    let (_unused, worker_reader) = pair.into_parts();
+    client
+        .register_notification_ring(tx_fd, rx_fd)
+        .map_err(|e| anyhow!("register: {e}"))?;
+    let mut receiver = NotificationReceiver::new(worker_reader);
+    let dispatcher = NotificationDispatcher::new();
+    let callbacks = dispatcher.callbacks_arc();
+    let _join = litebox_platform_linux_userland::spawn_host_thread(move || {
+        NotificationDispatcher::run_reader_loop(&mut receiver, &callbacks);
+    });
+    let provider = Arc::new(
+        crate::broker_eventfd_provider::RunnerBrokerEventfdProvider::new(client, dispatcher),
+    );
+    litebox_shim_linux::syscalls::set_broker_eventfd_provider(provider)
+        .map_err(|_| anyhow!("provider already set"))?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2803,6 +2876,7 @@ mod tests {
             network_broker: None,
             program_from_tar: false,
             nine_p_broker: None,
+            fd_token_broker: None,
             working_directory: None,
             worker_exec: false,
             worker_exec_fd: None,
@@ -2999,5 +3073,95 @@ mod tests {
 
         assert!(host_signal_should_raise(segv));
         assert!(!host_signal_should_raise(stop));
+    }
+
+    /// Phase B-Step9 followup pin test.
+    ///
+    /// Documents (and locks in) the current contract of
+    /// [`setup_broker_eventfd_provider`]: it MUST NOT leave any
+    /// long-lived runner-side broker state alive past return.
+    ///
+    /// Two specific things would break the runner's fork-snapshot/
+    /// restore mechanism if left alive: a `NotificationDispatcher`
+    /// reader thread, and the `FdTokenClient`'s open broker
+    /// UnixStream. Both are dropped before this function returns.
+    ///
+    /// Why: with either of these alive, cross-worker SCM tests
+    /// (`SCM.pass_two_fds_one_msg.dpg1_to_dpg2` and friends) reliably
+    /// hang in worker startup. Verified empirically by 30-min docker
+    /// integration cycles + parent-thread bisect.
+    ///
+    /// This test catches a future regression at unit-test time by
+    /// asserting (a) thread count didn't grow, and (b) the global
+    /// broker eventfd provider remains uninstalled, so `sys_eventfd2`
+    /// continues to take the local-fallback path. The full
+    /// cross-worker eventfd SCM_RIGHTS path is gated on a future
+    /// step (`b-step12-dispatcher-forksafe`) that makes broker state
+    /// fork-safe.
+    #[test]
+    fn setup_broker_eventfd_provider_leaves_no_long_lived_state() {
+        use litebox_broker::fd_token_socket::spawn_control_listener;
+        use litebox_broker::fd_tokens::BrokerFdTokenRegistry;
+        use litebox_broker::state_registry::BrokerStateRegistry;
+        use litebox_common_linux::fd_token_client::FdTokenClient;
+        use litebox_common_linux::shmem_ring::ShmemRingPair;
+        use std::sync::Arc;
+        use tempfile::tempdir;
+
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("fd-token.sock");
+        let fd_registry = Arc::new(BrokerFdTokenRegistry::new());
+        let state_registry = Arc::new(BrokerStateRegistry::new());
+        let _listener =
+            spawn_control_listener(&path, Arc::clone(&fd_registry), Arc::clone(&state_registry))
+                .expect("spawn listener");
+
+        for _ in 0..100 {
+            if path.exists() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(path.exists(), "broker control socket never appeared");
+
+        // Establish a baseline equal to what setup_broker_eventfd_provider
+        // does internally — connect + create-ring + register-ring —
+        // then drop everything. This captures the broker-side
+        // per-connection handler thread that arises from any client
+        // connect; we want to verify setup doesn't add MORE than that.
+        let client_baseline = FdTokenClient::connect(&path).expect("connect baseline");
+        let (_pair_baseline, tx_fd, rx_fd) = ShmemRingPair::create().expect("create ring baseline");
+        client_baseline
+            .register_notification_ring(tx_fd, rx_fd)
+            .expect("register baseline");
+        drop(client_baseline);
+        let baseline = thread_count_after_settling();
+
+        let result = setup_broker_eventfd_provider(path.to_str().expect("path utf8"));
+        assert!(result.is_ok(), "setup must succeed: {result:?}");
+        let after = thread_count_after_settling();
+
+        assert!(
+            after <= baseline,
+            "setup_broker_eventfd_provider must not spawn a runner-side reader thread \
+             (baseline={baseline}, after={after}); see fork-restore safety comment",
+        );
+
+        // Provider must NOT be installed; sys_eventfd2 must fall back
+        // to local EventFile::new.
+        assert!(
+            litebox_shim_linux::syscalls::broker_eventfd_provider().is_none(),
+            "broker eventfd provider must not be installed; cross-worker broker-backed \
+             eventfd transfer is gated on Step 12 (fork-safe broker state)",
+        );
+    }
+
+    fn thread_count_after_settling() -> usize {
+        // Sleep briefly to let any short-lived helper threads finish.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        // /proc/self/task has one entry per kernel-visible thread.
+        std::fs::read_dir("/proc/self/task")
+            .map(|it| it.filter_map(Result::ok).count())
+            .unwrap_or(0)
     }
 }

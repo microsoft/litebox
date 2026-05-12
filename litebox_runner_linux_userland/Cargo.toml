@@ -8,6 +8,7 @@ anyhow = "1.0.97"
 clap = { version = "4.5.33", features = ["derive"] }
 libc = { version = "0.2.169", default-features = false }
 litebox = { version = "0.1.0", path = "../litebox" }
+litebox_broker = { version = "0.1.0", path = "../litebox_broker" }
 litebox_common_linux = { version = "0.1.0", path = "../litebox_common_linux", features = ["std"] }
 litebox_platform_linux_userland = { version = "0.1.0", path = "../litebox_platform_linux_userland" }
 litebox_platform_multiplex = { version = "0.1.0", path = "../litebox_platform_multiplex", default-features = false, features = ["platform_linux_userland", "systrap_backend"] }
@@ -16,11 +17,13 @@ litebox_syscall_rewriter = { version = "0.1.0", path = "../litebox_syscall_rewri
 memmap2 = "0.9.8"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+tracing = "0.1"
 
 [dev-dependencies]
 sha2 = "0.10"
 walkdir = "2.0"
 glob = "0.3"
+tempfile = "3"
 
 [features]
 default = ["audit_log"]

@@ -1702,6 +1702,7 @@ impl<FS: ShimFS> Task<FS> {
                             litebox_common_linux::ReceiveFlags::empty(),
                             None,
                             &mut Vec::new(),
+                            &mut Vec::new(),
                         )
                     })
                 },
@@ -1825,6 +1826,7 @@ impl<FS: ShimFS> Task<FS> {
                             buf,
                             litebox_common_linux::SendFlags::empty(),
                             None,
+                            Vec::new(),
                             Vec::new(),
                         )
                     })
@@ -2740,6 +2742,7 @@ impl<FS: ShimFS> Task<FS> {
                                     litebox_common_linux::ReceiveFlags::empty(),
                                     None,
                                     &mut Vec::new(),
+                                    &mut Vec::new(),
                                 )
                             },
                         )
@@ -3070,6 +3073,7 @@ impl<FS: ShimFS> Task<FS> {
                                 buf,
                                 litebox_common_linux::SendFlags::empty(),
                                 None,
+                                Vec::new(),
                                 Vec::new(),
                             )
                         })
@@ -4524,7 +4528,27 @@ impl<FS: ShimFS> Task<FS> {
             return Err(Errno::EINVAL);
         }
 
-        let eventfd = super::eventfd::EventFile::new(u64::from(initval), flags);
+        // Phase B-Step7c: if a broker eventfd provider has been
+        // registered (set at runner bootstrap), route this eventfd
+        // through it so its state lives in the broker and is visible
+        // across worker processes via SCM_RIGHTS / fork. Otherwise
+        // fall back to the local-only EventFile::new path, preserving
+        // pre-Phase-B behaviour for configurations without a broker.
+        let eventfd = if let Some(provider) = super::eventfd::broker_eventfd_provider() {
+            match provider.create_eventfd(u64::from(initval), flags.contains(EfdFlags::SEMAPHORE)) {
+                Ok(handle) => super::eventfd::EventFile::new_broker_backed(provider, handle, flags),
+                Err(_) => {
+                    // Broker creation failed; we don't transparently
+                    // fall back to local because that would break the
+                    // cross-worker contract (a sibling worker can't
+                    // reach a local-only eventfd). Surface ENODEV so
+                    // the worker observes a clear error.
+                    return Err(Errno::ENODEV);
+                }
+            }
+        } else {
+            super::eventfd::EventFile::new(u64::from(initval), flags)
+        };
         let mut dt = self.global.litebox.descriptor_table_mut();
         let typed = dt.insert::<super::eventfd::EventfdSubsystem>(eventfd);
         if flags.contains(EfdFlags::CLOEXEC) {

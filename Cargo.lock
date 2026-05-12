@@ -1619,6 +1619,7 @@ dependencies = [
  "serde_json",
  "simple-dns",
  "smoltcp",
+ "tempfile",
  "thiserror",
  "tracing",
  "tracing-subscriber",
@@ -1793,6 +1794,7 @@ dependencies = [
  "glob",
  "libc",
  "litebox",
+ "litebox_broker",
  "litebox_common_linux",
  "litebox_platform_linux_userland",
  "litebox_platform_multiplex",
@@ -1802,6 +1804,8 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "tempfile",
+ "tracing",
  "walkdir",
 ]
 
@@ -1875,6 +1879,7 @@ dependencies = [
  "bitvec",
  "libc",
  "litebox",
+ "litebox_broker",
  "litebox_common_linux",
  "litebox_platform_multiplex",
  "litebox_syscall_rewriter",

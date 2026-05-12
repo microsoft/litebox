@@ -24,7 +24,9 @@ use litebox::{
     sync::RawSyncPrimitivesProvider,
 };
 use litebox_common_linux::{
-    ClockId, EfdFlags, ItimerSpec, TimerfdFlags, TimerfdTimerFlags, errno::Errno,
+    ClockId, EfdFlags, ItimerSpec, TimerfdFlags, TimerfdTimerFlags,
+    broker_eventfd_provider::{BrokerEventfdProvider, BrokerOpError},
+    errno::Errno,
 };
 use litebox_platform_multiplex::Platform;
 
@@ -33,6 +35,33 @@ impl FdEnabledSubsystem for EventfdSubsystem {
     type Entry = EventFile<Platform>;
 }
 impl FdEnabledSubsystemEntry for EventFile<Platform> {}
+
+/// Process-global broker eventfd provider. Set once at runner
+/// bootstrap (in litebox_runner_linux_userland). `sys_eventfd2`
+/// consults this; if `Some`, new eventfds are broker-backed.
+/// If `None`, falls back to the local `EventFile::new` path —
+/// preserves all existing behaviour when fd-token transport is
+/// not configured.
+static BROKER_EVENTFD_PROVIDER: once_cell::race::OnceBox<Arc<dyn BrokerEventfdProvider>> =
+    once_cell::race::OnceBox::new();
+
+/// Sets the process-global broker eventfd provider. Called by the
+/// runner exactly once during bootstrap.
+///
+/// Returns `Err(provider)` if a provider was already set; callers
+/// can decide whether to log + drop or panic on that case (in
+/// practice it indicates a bootstrap bug).
+#[allow(dead_code)] // wired in by the runner bootstrap, not the shim itself
+pub fn set_broker_eventfd_provider(
+    provider: Arc<dyn BrokerEventfdProvider>,
+) -> Result<(), alloc::boxed::Box<Arc<dyn BrokerEventfdProvider>>> {
+    BROKER_EVENTFD_PROVIDER.set(alloc::boxed::Box::new(provider))
+}
+
+/// Returns the broker eventfd provider if one has been set.
+pub fn broker_eventfd_provider() -> Option<Arc<dyn BrokerEventfdProvider>> {
+    BROKER_EVENTFD_PROVIDER.get().cloned()
+}
 
 enum EventFileInner<Platform: RawSyncPrimitivesProvider + TimeProvider> {
     Eventfd {
@@ -44,6 +73,24 @@ enum EventFileInner<Platform: RawSyncPrimitivesProvider + TimeProvider> {
         subject: Arc<Subject<Events, Events, Platform>>,
     },
     Timerfd(TimerFileState<Platform>),
+    /// Broker-hosted eventfd (Phase B-Step7b). State lives in the
+    /// broker; this worker holds only the handle id and a provider
+    /// reference to make RPC calls.
+    ///
+    /// `semaphore` is recorded for diagnostics / future use even
+    /// though the broker is the source of truth for that flag — the
+    /// shim doesn't need to act on it locally.
+    ///
+    /// Local readability is tracked in `EventFile::broker_local_readable`
+    /// (an Arc<AtomicBool>) so that the broker→worker notification
+    /// callback can update it from the dispatcher thread without
+    /// needing the inner Mutex.
+    #[allow(dead_code)]
+    BrokerBacked {
+        provider: Arc<dyn BrokerEventfdProvider>,
+        handle: u64,
+        semaphore: bool,
+    },
 }
 
 struct TimerFileState<Platform: RawSyncPrimitivesProvider + TimeProvider> {
@@ -59,7 +106,64 @@ pub(crate) struct EventFile<Platform: RawSyncPrimitivesProvider + TimeProvider> 
     inner: litebox::sync::Mutex<Platform, EventFileInner<Platform>>,
     /// File status flags (see [`OFlags::STATUS_FLAGS_MASK`])
     status: AtomicU32,
-    pollee: Pollee<Platform>,
+    /// Local pollee, wrapped in Arc so the cross-worker
+    /// `BrokerSubscriptionWaker` (running on the runner's notification-
+    /// dispatcher thread) can hold a Weak reference and fire local
+    /// observer wake-ups when a broker→worker notification arrives.
+    pollee: Arc<Pollee<Platform>>,
+    /// Cached "broker-backed eventfd has data to read" flag.
+    /// Updated by:
+    ///   - try_write_eventfd (local write success → true)
+    ///   - try_read_eventfd (drain-to-zero → false)
+    ///   - BrokerSubscriptionWaker::on_events (broker NotificationFrame
+    ///     with NOTIFY_EVENT_IN → true)
+    /// Read by `check_io_events` to report `Events::IN` for BrokerBacked.
+    /// Only meaningful for BrokerBacked entries; ignored otherwise.
+    broker_local_readable: Arc<AtomicBool>,
+    /// Subscription state when register_observer subscribes with the
+    /// broker (Some after first subscription, None otherwise).
+    broker_sub: litebox::sync::Mutex<Platform, Option<BrokerSubscription>>,
+}
+
+struct BrokerSubscription {
+    provider: Arc<dyn BrokerEventfdProvider>,
+    handle: u64,
+    subscription_id: u64,
+}
+
+/// Callback the runner's NotificationDispatcher invokes when a broker
+/// NotificationFrame arrives for this subscription. Translates broker
+/// event bits to shim `Events`, sets the `broker_local_readable` cache,
+/// and fires local Pollee observers — waking any `epoll_wait` waiter
+/// even though the writer was in a different worker.
+struct BrokerSubscriptionWaker<Platform: RawSyncPrimitivesProvider + TimeProvider> {
+    pollee: alloc::sync::Weak<Pollee<Platform>>,
+    local_readable: alloc::sync::Weak<AtomicBool>,
+}
+
+impl<Platform: RawSyncPrimitivesProvider + TimeProvider + Send + Sync + 'static>
+    litebox_common_linux::broker_eventfd_provider::BrokerEventCallback
+    for BrokerSubscriptionWaker<Platform>
+{
+    fn on_events(&self, events: u32) {
+        use litebox_common_linux::notification_frame::{NOTIFY_EVENT_IN, NOTIFY_EVENT_OUT};
+        let Some(pollee) = self.pollee.upgrade() else {
+            return;
+        };
+        let mut shim_events = Events::empty();
+        if events & NOTIFY_EVENT_IN != 0 {
+            shim_events |= Events::IN;
+            if let Some(flag) = self.local_readable.upgrade() {
+                flag.store(true, Ordering::SeqCst);
+            }
+        }
+        if events & NOTIFY_EVENT_OUT != 0 {
+            shim_events |= Events::OUT;
+        }
+        if !shim_events.is_empty() {
+            pollee.notify_observers(shim_events);
+        }
+    }
 }
 
 impl<Platform: RawSyncPrimitivesProvider + TimeProvider> EventFile<Platform> {
@@ -73,7 +177,38 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> EventFile<Platform> {
                 semaphore: flags.contains(EfdFlags::SEMAPHORE),
             }),
             status: AtomicU32::new(status.bits()),
-            pollee: Pollee::new(),
+            pollee: Arc::new(Pollee::new()),
+            broker_local_readable: Arc::new(AtomicBool::new(false)),
+            broker_sub: litebox::sync::Mutex::new(None),
+        }
+    }
+
+    /// Creates a broker-backed eventfd. The caller (`sys_eventfd2`) has
+    /// already obtained `handle` from `provider.create_eventfd(...)`.
+    /// All subsequent read/write ops route through the provider.
+    ///
+    /// Phase B-Step7b: broker-backed variant. Polling is still wired
+    /// to the local `Pollee`; the runner is responsible for arranging
+    /// a subscription on the broker side that wakes this Pollee via a
+    /// `BrokerEventCallback` impl (typically supplied by the runner's
+    /// platform layer).
+    pub(crate) fn new_broker_backed(
+        provider: Arc<dyn BrokerEventfdProvider>,
+        handle: u64,
+        flags: EfdFlags,
+    ) -> Self {
+        let mut status = OFlags::RDWR;
+        status.set(OFlags::NONBLOCK, flags.contains(EfdFlags::NONBLOCK));
+        Self {
+            inner: litebox::sync::Mutex::new(EventFileInner::BrokerBacked {
+                provider,
+                handle,
+                semaphore: flags.contains(EfdFlags::SEMAPHORE),
+            }),
+            status: AtomicU32::new(status.bits()),
+            pollee: Arc::new(Pollee::new()),
+            broker_local_readable: Arc::new(AtomicBool::new(false)),
+            broker_sub: litebox::sync::Mutex::new(None),
         }
     }
 
@@ -96,7 +231,9 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> EventFile<Platform> {
                 pending_expirations: 0,
             })),
             status: AtomicU32::new(status.bits()),
-            pollee: Pollee::new(),
+            pollee: Arc::new(Pollee::new()),
+            broker_local_readable: Arc::new(AtomicBool::new(false)),
+            broker_sub: litebox::sync::Mutex::new(None),
         }
     }
 
@@ -110,12 +247,35 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> EventFile<Platform> {
         Self {
             inner: litebox::sync::Mutex::new(EventFileInner::Pidfd { exited, subject }),
             status: AtomicU32::new(status.bits()),
-            pollee: Pollee::new(),
+            pollee: Arc::new(Pollee::new()),
+            broker_local_readable: Arc::new(AtomicBool::new(false)),
+            broker_sub: litebox::sync::Mutex::new(None),
         }
     }
 
     pub(crate) fn is_timerfd(&self) -> bool {
         matches!(*self.inner.lock(), EventFileInner::Timerfd(_))
+    }
+
+    /// Returns the broker handle id if this is a broker-backed
+    /// eventfd, else `None`. Used by the cross-worker SCM_RIGHTS
+    /// path to extract the handle for transport in an LBFD frame
+    /// (Phase B-Step8e).
+    pub(crate) fn broker_backed_handle(&self) -> Option<u64> {
+        match &*self.inner.lock() {
+            EventFileInner::BrokerBacked { handle, .. } => Some(*handle),
+            _ => None,
+        }
+    }
+
+    /// Returns the broker provider if this is a broker-backed
+    /// eventfd. Used by the cross-worker SCM_RIGHTS sender to call
+    /// `dup_handle` on the same provider that owns this eventfd.
+    pub(crate) fn broker_backed_provider(&self) -> Option<Arc<dyn BrokerEventfdProvider>> {
+        match &*self.inner.lock() {
+            EventFileInner::BrokerBacked { provider, .. } => Some(Arc::clone(provider)),
+            _ => None,
+        }
     }
 
     #[cfg(feature = "trace_syscalls")]
@@ -124,6 +284,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> EventFile<Platform> {
             EventFileInner::Eventfd { .. } => "eventfd",
             EventFileInner::Pidfd { .. } => "pidfd",
             EventFileInner::Timerfd(_) => "timerfd",
+            EventFileInner::BrokerBacked { .. } => "broker_eventfd",
         }
     }
 
@@ -133,19 +294,55 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> EventFile<Platform> {
 
     fn try_read_eventfd(&self) -> Result<u64, TryOpError<Errno>> {
         let mut inner = self.inner.lock();
-        let EventFileInner::Eventfd { counter, semaphore } = &mut *inner else {
-            return Err(TryOpError::Other(Errno::EINVAL));
-        };
-        if *counter == 0 {
-            return Err(TryOpError::TryAgain);
+        match &mut *inner {
+            EventFileInner::Eventfd { counter, semaphore } => {
+                if *counter == 0 {
+                    return Err(TryOpError::TryAgain);
+                }
+                let res = if *semaphore { 1 } else { *counter };
+                *counter -= res;
+                drop(inner);
+                self.pollee.notify_observers(Events::OUT);
+                Ok(res)
+            }
+            EventFileInner::BrokerBacked {
+                provider,
+                handle,
+                semaphore,
+                ..
+            } => {
+                let provider = Arc::clone(provider);
+                let handle = *handle;
+                let semaphore = *semaphore;
+                drop(inner);
+                match provider.read_eventfd(handle) {
+                    Ok(v) => {
+                        // Update local readability cache: if we read
+                        // in semaphore mode we just took 1; broker
+                        // counter may still be > 0. If non-semaphore,
+                        // we drained the entire counter to 0.
+                        // Without a separate "peek" RPC, the safe
+                        // assumption for semaphore is that more data
+                        // MAY exist (set readable=true). For
+                        // non-semaphore, we drained → not readable.
+                        // The next epoll wake from a broker write
+                        // will re-set it to true via try_write_eventfd.
+                        self.broker_local_readable
+                            .store(semaphore, Ordering::SeqCst);
+                        self.pollee.notify_observers(Events::OUT);
+                        Ok(v)
+                    }
+                    Err(BrokerOpError::WouldBlock) => {
+                        self.broker_local_readable.store(false, Ordering::SeqCst);
+                        Err(TryOpError::TryAgain)
+                    }
+                    Err(BrokerOpError::UnknownHandle) => Err(TryOpError::Other(Errno::EBADF)),
+                    Err(BrokerOpError::InvalidValue) => Err(TryOpError::Other(Errno::EINVAL)),
+                    Err(BrokerOpError::Io) => Err(TryOpError::Other(Errno::EIO)),
+                }
+            }
+            _ => Err(TryOpError::Other(Errno::EINVAL)),
         }
-
-        let res = if *semaphore { 1 } else { *counter };
-        *counter -= res;
-
-        drop(inner);
-        self.pollee.notify_observers(Events::OUT);
-        Ok(res)
     }
 
     fn try_read_timerfd(&self) -> Result<u64, Errno> {
@@ -163,7 +360,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> EventFile<Platform> {
     fn try_read(&self) -> Result<u64, TryOpError<Errno>> {
         let inner = self.inner.lock();
         match &*inner {
-            EventFileInner::Eventfd { .. } => {
+            EventFileInner::Eventfd { .. } | EventFileInner::BrokerBacked { .. } => {
                 drop(inner);
                 self.try_read_eventfd()
             }
@@ -217,26 +414,52 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> EventFile<Platform> {
 
     fn try_write_eventfd(&self, value: u64) -> Result<usize, TryOpError<Errno>> {
         let mut inner = self.inner.lock();
-        let EventFileInner::Eventfd { counter, .. } = &mut *inner else {
-            return Err(TryOpError::Other(Errno::EINVAL));
-        };
-        if let Some(new_value) = (*counter).checked_add(value)
-            // The maximum value that may be stored in the counter is the largest unsigned
-            // 64-bit value minus 1 (i.e., 0xfffffffffffffffe)
-            && new_value != u64::MAX
-        {
-            *counter = new_value;
-            drop(inner);
-            self.pollee.notify_observers(Events::IN);
-            return Ok(8);
+        match &mut *inner {
+            EventFileInner::Eventfd { counter, .. } => {
+                if let Some(new_value) = (*counter).checked_add(value)
+                    // The maximum value that may be stored in the counter is the largest unsigned
+                    // 64-bit value minus 1 (i.e., 0xfffffffffffffffe)
+                    && new_value != u64::MAX
+                {
+                    *counter = new_value;
+                    drop(inner);
+                    self.pollee.notify_observers(Events::IN);
+                    return Ok(8);
+                }
+                Err(TryOpError::TryAgain)
+            }
+            EventFileInner::BrokerBacked {
+                provider, handle, ..
+            } => {
+                let provider = Arc::clone(provider);
+                let handle = *handle;
+                drop(inner);
+                match provider.write_eventfd(handle, value) {
+                    Ok(()) => {
+                        // Mark locally readable so check_io_events
+                        // reports Events::IN. This is what unblocks
+                        // an in-process epoll observer that was woken
+                        // by notify_observers below.
+                        self.broker_local_readable.store(true, Ordering::SeqCst);
+                        self.pollee.notify_observers(Events::IN);
+                        Ok(8)
+                    }
+                    Err(BrokerOpError::WouldBlock) => Err(TryOpError::TryAgain),
+                    Err(BrokerOpError::UnknownHandle) => Err(TryOpError::Other(Errno::EBADF)),
+                    Err(BrokerOpError::InvalidValue) => Err(TryOpError::Other(Errno::EINVAL)),
+                    Err(BrokerOpError::Io) => Err(TryOpError::Other(Errno::EIO)),
+                }
+            }
+            _ => Err(TryOpError::Other(Errno::EINVAL)),
         }
-
-        Err(TryOpError::TryAgain)
     }
 
     pub(crate) fn write(&self, cx: &WaitContext<'_, Platform>, value: u64) -> Result<usize, Errno> {
-        let is_eventfd = matches!(*self.inner.lock(), EventFileInner::Eventfd { .. });
-        if !is_eventfd {
+        let writable = matches!(
+            *self.inner.lock(),
+            EventFileInner::Eventfd { .. } | EventFileInner::BrokerBacked { .. }
+        );
+        if !writable {
             let _ = (cx, value);
             return Err(Errno::EINVAL);
         }
@@ -277,7 +500,32 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> EventFile<Platform> {
     super::common_functions_for_file_status!();
 }
 
-impl<Platform: RawSyncPrimitivesProvider + TimeProvider> IOPollable for EventFile<Platform> {
+impl<Platform: RawSyncPrimitivesProvider + TimeProvider> Drop for EventFile<Platform> {
+    fn drop(&mut self) {
+        // Unsubscribe any active broker subscription first so the
+        // dispatcher stops dispatching to a callback whose Weak refs
+        // are about to be invalidated.
+        if let Some(sub) = self.broker_sub.lock().take() {
+            sub.provider
+                .unsubscribe_eventfd(sub.handle, sub.subscription_id);
+        }
+        // Phase B-Step8: when a broker-backed EventFile drops, tell
+        // the broker to decrement its refcount on the canonical
+        // handle. The broker frees the underlying state when refcount
+        // reaches 0. Non-broker variants have no broker-side state
+        // to release; the local Mutex<EventFileInner> drops normally.
+        if let EventFileInner::BrokerBacked {
+            provider, handle, ..
+        } = &*self.inner.lock()
+        {
+            provider.release_eventfd(*handle);
+        }
+    }
+}
+
+impl<Platform: RawSyncPrimitivesProvider + TimeProvider + Send + Sync + 'static> IOPollable
+    for EventFile<Platform>
+{
     fn check_io_events(&self) -> Events {
         let mut inner = self.inner.lock();
         let mut events = Events::empty();
@@ -303,6 +551,26 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> IOPollable for EventFil
                     events |= Events::IN | Events::HUP;
                 }
             }
+            EventFileInner::BrokerBacked { .. } => {
+                // Phase B-Step12 readiness fix: track local readiness
+                // based on the most recent write/read RPC outcome AND
+                // broker→worker notification frames. The broker is the
+                // source of truth for the counter, but check_io_events
+                // runs synchronously in the polling path and can't
+                // afford an RPC per poll. Cache is updated by:
+                //   - try_write_eventfd (local write success → true)
+                //   - try_read_eventfd (drain-to-zero → false)
+                //   - BrokerSubscriptionWaker::on_events (broker push
+                //     with NOTIFY_EVENT_IN → true) — for cross-worker
+                //     wake-ups from a peer worker's write.
+                if self.broker_local_readable.load(Ordering::SeqCst) {
+                    events |= Events::IN;
+                }
+                // Broker-backed eventfds are always writable in
+                // practice (the broker accepts any non-MAX value);
+                // the broker side will reject MAX-1 saturated writes.
+                events |= Events::OUT;
+            }
         }
 
         events
@@ -316,6 +584,53 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> IOPollable for EventFil
             }
             EventFileInner::Eventfd { .. } | EventFileInner::Timerfd(_) => {
                 drop(inner);
+                self.pollee.register_observer(observer, mask);
+            }
+            EventFileInner::BrokerBacked {
+                provider, handle, ..
+            } => {
+                let provider = Arc::clone(provider);
+                let handle = *handle;
+                drop(inner);
+                // Ensure we have an active broker subscription so that
+                // cross-worker writes get pushed to our pollee via the
+                // notification dispatcher. Idempotent: only subscribes
+                // on the first register_observer call.
+                let mut sub_guard = self.broker_sub.lock();
+                if sub_guard.is_none() {
+                    use litebox_common_linux::notification_frame::{
+                        NOTIFY_EVENT_IN, NOTIFY_EVENT_OUT,
+                    };
+                    let waker = Arc::new(BrokerSubscriptionWaker::<Platform> {
+                        pollee: Arc::downgrade(&self.pollee),
+                        local_readable: Arc::downgrade(&self.broker_local_readable),
+                    });
+                    match provider.subscribe_eventfd(
+                        handle,
+                        NOTIFY_EVENT_IN | NOTIFY_EVENT_OUT,
+                        waker
+                            as Arc<
+                                dyn litebox_common_linux::broker_eventfd_provider::BrokerEventCallback,
+                            >,
+                    ) {
+                        Ok(subscription_id) => {
+                            *sub_guard = Some(BrokerSubscription {
+                                provider: Arc::clone(&provider),
+                                handle,
+                                subscription_id,
+                            });
+                        }
+                        Err(_) => {
+                            // Subscription failed; we still register the
+                            // local observer. In-worker write→read still
+                            // wakes via try_write_eventfd. Cross-worker
+                            // wake-up will be missed but that's a soft
+                            // degradation, not a correctness issue for
+                            // the local case.
+                        }
+                    }
+                }
+                drop(sub_guard);
                 self.pollee.register_observer(observer, mask);
             }
         }
@@ -581,5 +896,469 @@ mod tests {
             Duration::try_from(timerfd.get_timer().unwrap().value).unwrap(),
             Duration::ZERO
         );
+    }
+
+    /// Phase B-Step7b: verifies an `EventFile::new_broker_backed`
+    /// instance routes read/write through a mock provider.
+    /// Functional surface: the same `read`/`write` calls that work
+    /// against a local `EventFile::new` work against a broker-backed
+    /// one without the caller knowing the difference.
+    #[test]
+    fn test_broker_backed_eventfd_routes_read_write() {
+        use alloc::sync::Arc;
+        use core::sync::atomic::{AtomicU64, Ordering};
+        use litebox_common_linux::broker_eventfd_provider::{
+            BrokerEventCallback, BrokerEventfdProvider, BrokerOpError,
+        };
+
+        /// Mock provider: in-process counter modelling the broker.
+        struct MockProvider {
+            counter: AtomicU64,
+            reads: AtomicU64,
+            writes: AtomicU64,
+        }
+
+        impl BrokerEventfdProvider for MockProvider {
+            fn create_eventfd(
+                &self,
+                _initial: u64,
+                _semaphore: bool,
+            ) -> Result<u64, BrokerOpError> {
+                Ok(7) // arbitrary fixed handle id
+            }
+            fn read_eventfd(&self, _handle: u64) -> Result<u64, BrokerOpError> {
+                self.reads.fetch_add(1, Ordering::SeqCst);
+                let v = self.counter.swap(0, Ordering::SeqCst);
+                if v == 0 {
+                    Err(BrokerOpError::WouldBlock)
+                } else {
+                    Ok(v)
+                }
+            }
+            fn write_eventfd(&self, _handle: u64, value: u64) -> Result<(), BrokerOpError> {
+                if value == u64::MAX {
+                    return Err(BrokerOpError::InvalidValue);
+                }
+                self.writes.fetch_add(1, Ordering::SeqCst);
+                self.counter.fetch_add(value, Ordering::SeqCst);
+                Ok(())
+            }
+            fn release_eventfd(&self, _handle: u64) {}
+            fn subscribe_eventfd(
+                &self,
+                _handle: u64,
+                _events_mask: u32,
+                _cb: Arc<dyn BrokerEventCallback>,
+            ) -> Result<u64, BrokerOpError> {
+                Ok(1)
+            }
+            fn unsubscribe_eventfd(&self, _handle: u64, _subscription_id: u64) {}
+            fn dup_handle(&self, _handle: u64) -> Result<(), BrokerOpError> {
+                Ok(())
+            }
+        }
+
+        let _task = crate::syscalls::tests::init_platform(None);
+
+        let provider = Arc::new(MockProvider {
+            counter: AtomicU64::new(0),
+            reads: AtomicU64::new(0),
+            writes: AtomicU64::new(0),
+        });
+        let provider_dyn: Arc<dyn BrokerEventfdProvider> = provider.clone();
+
+        let eventfd = alloc::sync::Arc::new(super::EventFile::new_broker_backed(
+            provider_dyn,
+            7,
+            EfdFlags::NONBLOCK,
+        ));
+
+        // Write 5 → provider.counter goes to 5.
+        let n = eventfd
+            .write(&WaitState::new(platform()).context(), 5)
+            .unwrap();
+        assert_eq!(n, 8);
+        assert_eq!(provider.counter.load(Ordering::SeqCst), 5);
+        assert_eq!(provider.writes.load(Ordering::SeqCst), 1);
+
+        // Read → returns 5, provider.counter back to 0.
+        let v = eventfd.read(&WaitState::new(platform()).context()).unwrap();
+        assert_eq!(v, 5);
+        assert_eq!(provider.counter.load(Ordering::SeqCst), 0);
+        assert_eq!(provider.reads.load(Ordering::SeqCst), 1);
+
+        // Second read → WouldBlock, surfaces as EAGAIN because NONBLOCK is set.
+        match eventfd.read(&WaitState::new(platform()).context()) {
+            Err(Errno::EAGAIN) => {}
+            other => panic!("expected EAGAIN, got {other:?}"),
+        }
+
+        // Write u64::MAX → InvalidValue → EINVAL.
+        match eventfd.write(&WaitState::new(platform()).context(), u64::MAX) {
+            Err(Errno::EINVAL) => {}
+            other => panic!("expected EINVAL on u64::MAX write, got {other:?}"),
+        }
+    }
+
+    /// Phase B-Step8: verifies that dropping a BrokerBacked EventFile
+    /// calls provider.release_eventfd, balancing the broker-side
+    /// refcount that sys_eventfd2 set up at create.
+    #[test]
+    fn test_broker_backed_eventfd_drop_releases_handle() {
+        use alloc::sync::Arc;
+        use core::sync::atomic::{AtomicU32, Ordering};
+        use litebox_common_linux::broker_eventfd_provider::{
+            BrokerEventCallback, BrokerEventfdProvider, BrokerOpError,
+        };
+
+        struct ReleaseCountingProvider {
+            releases: AtomicU32,
+        }
+
+        impl BrokerEventfdProvider for ReleaseCountingProvider {
+            fn create_eventfd(
+                &self,
+                _initial: u64,
+                _semaphore: bool,
+            ) -> Result<u64, BrokerOpError> {
+                Ok(99)
+            }
+            fn read_eventfd(&self, _handle: u64) -> Result<u64, BrokerOpError> {
+                Err(BrokerOpError::WouldBlock)
+            }
+            fn write_eventfd(&self, _handle: u64, _value: u64) -> Result<(), BrokerOpError> {
+                Ok(())
+            }
+            fn release_eventfd(&self, _handle: u64) {
+                self.releases.fetch_add(1, Ordering::SeqCst);
+            }
+            fn subscribe_eventfd(
+                &self,
+                _handle: u64,
+                _events_mask: u32,
+                _cb: Arc<dyn BrokerEventCallback>,
+            ) -> Result<u64, BrokerOpError> {
+                Ok(1)
+            }
+            fn unsubscribe_eventfd(&self, _handle: u64, _subscription_id: u64) {}
+            fn dup_handle(&self, _handle: u64) -> Result<(), BrokerOpError> {
+                Ok(())
+            }
+        }
+
+        let _task = crate::syscalls::tests::init_platform(None);
+
+        let provider = Arc::new(ReleaseCountingProvider {
+            releases: AtomicU32::new(0),
+        });
+        let provider_dyn: Arc<dyn BrokerEventfdProvider> = provider.clone();
+
+        // Construct then drop.
+        {
+            let _ef: super::EventFile<litebox_platform_multiplex::Platform> =
+                super::EventFile::new_broker_backed(provider_dyn, 99, EfdFlags::empty());
+        }
+
+        assert_eq!(
+            provider.releases.load(Ordering::SeqCst),
+            1,
+            "EventFile::drop must call release_eventfd exactly once for the BrokerBacked variant",
+        );
+    }
+
+    /// Phase B-Step12 focused test: does a broker-backed eventfd created
+    /// via `sys_eventfd2` (the guest-visible syscall path) behave
+    /// indistinguishably from a local eventfd for the basic
+    /// write → read → counter-zero cycle, when the provider is a REAL
+    /// `FdTokenClient` against a REAL in-process broker?
+    ///
+    /// **Coverage limitation**: this test exercises a SINGLE eventfd
+    /// in a SINGLE task in a SINGLE thread. It does NOT exercise
+    /// fork (delayed/snapshot/restore), cross-process eventfd
+    /// inheritance, SCM_RIGHTS transfer of eventfds, multi-thread
+    /// blocking-read wake-up, or concurrent operations across many
+    /// eventfds. The docker integration regression triggers under
+    /// fork-based test patterns the harness uses, so this test
+    /// passing does NOT prove broker-backed eventfds work for that
+    /// path. It DOES prove they work for the basic non-fork case —
+    /// useful as a regression pin, and as evidence that the bug
+    /// is fork-path-specific.
+    #[test]
+    fn sys_eventfd2_via_real_broker_basic_write_read() {
+        use crate::syscalls::eventfd::set_broker_eventfd_provider;
+        use alloc::sync::Arc;
+        use litebox_broker::fd_token_socket::spawn_control_listener;
+        use litebox_broker::fd_tokens::BrokerFdTokenRegistry;
+        use litebox_broker::state_registry::BrokerStateRegistry;
+        use litebox_common_linux::EfdFlags;
+        use litebox_common_linux::broker_eventfd_provider::{
+            BrokerEventCallback, BrokerEventfdProvider, BrokerOpError,
+        };
+        use litebox_common_linux::fd_token_client::FdTokenClient;
+        use std::sync::Mutex as StdMutex;
+        use tempfile::tempdir;
+
+        /// Minimal provider wrapping a real FdTokenClient — same shape
+        /// as RunnerBrokerEventfdProvider but stripped to what this
+        /// test exercises (no dispatcher / no subscriptions). Real
+        /// RPC over the real Unix socket.
+        struct RealProviderForTest {
+            client: StdMutex<FdTokenClient>,
+        }
+        impl BrokerEventfdProvider for RealProviderForTest {
+            fn create_eventfd(&self, initial: u64, semaphore: bool) -> Result<u64, BrokerOpError> {
+                self.client
+                    .lock()
+                    .unwrap()
+                    .create_eventfd(initial, semaphore)
+                    .map_err(client_err_to_broker_err)
+            }
+            fn read_eventfd(&self, handle: u64) -> Result<u64, BrokerOpError> {
+                self.client
+                    .lock()
+                    .unwrap()
+                    .read_eventfd(handle)
+                    .map_err(client_err_to_broker_err)
+            }
+            fn write_eventfd(&self, handle: u64, value: u64) -> Result<(), BrokerOpError> {
+                self.client
+                    .lock()
+                    .unwrap()
+                    .write_eventfd(handle, value)
+                    .map_err(client_err_to_broker_err)
+            }
+            fn release_eventfd(&self, handle: u64) {
+                let _ = self.client.lock().unwrap().release(handle);
+            }
+            fn dup_handle(&self, handle: u64) -> Result<(), BrokerOpError> {
+                self.client
+                    .lock()
+                    .unwrap()
+                    .dup_handle(handle)
+                    .map_err(client_err_to_broker_err)
+            }
+            fn subscribe_eventfd(
+                &self,
+                _: u64,
+                _: u32,
+                _: Arc<dyn BrokerEventCallback>,
+            ) -> Result<u64, BrokerOpError> {
+                Err(BrokerOpError::Io)
+            }
+            fn unsubscribe_eventfd(&self, _: u64, _: u64) {}
+        }
+        fn client_err_to_broker_err(
+            e: litebox_common_linux::fd_token_client::ClientError,
+        ) -> BrokerOpError {
+            use litebox_common_linux::fd_token_client::ClientError;
+            match e {
+                ClientError::WouldBlock => BrokerOpError::WouldBlock,
+                ClientError::UnknownHandle { .. } => BrokerOpError::UnknownHandle,
+                ClientError::InvalidValue { .. } => BrokerOpError::InvalidValue,
+                _ => BrokerOpError::Io,
+            }
+        }
+
+        // Spawn an in-process broker on a unique socket path.
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("fd-token.sock");
+        let fd_registry = std::sync::Arc::new(BrokerFdTokenRegistry::new());
+        let state_registry = std::sync::Arc::new(BrokerStateRegistry::new());
+        let _listener_handle = spawn_control_listener(
+            &path,
+            std::sync::Arc::clone(&fd_registry),
+            std::sync::Arc::clone(&state_registry),
+        )
+        .expect("spawn listener");
+        for _ in 0..100 {
+            if path.exists() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(path.exists(), "broker control socket never appeared");
+
+        // Wire up a real provider against the listener.
+        let client = FdTokenClient::connect(&path).expect("connect");
+        let provider: Arc<dyn BrokerEventfdProvider> = Arc::new(RealProviderForTest {
+            client: StdMutex::new(client),
+        });
+
+        // Install via the OnceBox global. If already set by another
+        // test in this binary, we still get to verify behaviour via
+        // direct EventFile::new_broker_backed — but install-set is the
+        // path sys_eventfd2 takes.
+        let install_result = set_broker_eventfd_provider(Arc::clone(&provider));
+        let _ = install_result; // first-run installs; later runs are OK
+
+        // Drive a real `Task` through `sys_eventfd2`.
+        let task = crate::syscalls::tests::init_platform(None);
+        let efd_u32 = task
+            .sys_eventfd2(0, EfdFlags::NONBLOCK | EfdFlags::CLOEXEC)
+            .expect("sys_eventfd2 should succeed with real broker installed");
+        let efd = i32::try_from(efd_u32).expect("eventfd fd fits in i32");
+
+        // sys_write(eventfd, 7u64) — guest-visible semantics.
+        let val: u64 = 7;
+        let buf = val.to_le_bytes();
+        // We need a guest buf pointer; for tests, the harness has
+        // helpers — use the simplest one available. The simplest
+        // surface is task.sys_write(fd, &[u8], offset).
+        let n = task
+            .sys_write(efd, &buf, None)
+            .expect("sys_write to broker-backed eventfd must succeed");
+        assert_eq!(n, 8, "eventfd write should report 8 bytes");
+
+        // sys_read(eventfd) — should return 7.
+        let mut readbuf = [0u8; 8];
+        let n = task
+            .sys_read(efd, &mut readbuf, None)
+            .expect("sys_read from broker-backed eventfd must succeed");
+        assert_eq!(n, 8, "eventfd read should report 8 bytes");
+        let got = u64::from_le_bytes(readbuf);
+        assert_eq!(
+            got, 7,
+            "eventfd read should return the previously-written value"
+        );
+
+        // Subsequent non-blocking read returns EAGAIN.
+        let mut readbuf2 = [0u8; 8];
+        let err = task.sys_read(efd, &mut readbuf2, None).unwrap_err();
+        assert_eq!(
+            err,
+            Errno::EAGAIN,
+            "non-blocking read on empty broker-backed eventfd should return EAGAIN"
+        );
+
+        // Close cleanly.
+        task.sys_close(efd).expect("close eventfd");
+    }
+
+    /// Phase B-Step12 focused test #2: SEMAPHORE-mode eventfd via real broker.
+    /// Semaphore mode is used by some IPC patterns (each read returns 1
+    /// and decrements; like a counting semaphore acquire). Verifying
+    /// this works through the broker matters because some harness or
+    /// guest user-space might use it.
+    #[test]
+    fn sys_eventfd2_via_real_broker_semaphore_mode() {
+        use crate::syscalls::eventfd::set_broker_eventfd_provider;
+        use alloc::sync::Arc;
+        use litebox_broker::fd_token_socket::spawn_control_listener;
+        use litebox_broker::fd_tokens::BrokerFdTokenRegistry;
+        use litebox_broker::state_registry::BrokerStateRegistry;
+        use litebox_common_linux::EfdFlags;
+        use litebox_common_linux::broker_eventfd_provider::{
+            BrokerEventCallback, BrokerEventfdProvider, BrokerOpError,
+        };
+        use litebox_common_linux::fd_token_client::FdTokenClient;
+        use std::sync::Mutex as StdMutex;
+        use tempfile::tempdir;
+
+        struct RealProviderForTest {
+            client: StdMutex<FdTokenClient>,
+        }
+        impl BrokerEventfdProvider for RealProviderForTest {
+            fn create_eventfd(&self, initial: u64, semaphore: bool) -> Result<u64, BrokerOpError> {
+                self.client
+                    .lock()
+                    .unwrap()
+                    .create_eventfd(initial, semaphore)
+                    .map_err(|_| BrokerOpError::Io)
+            }
+            fn read_eventfd(&self, handle: u64) -> Result<u64, BrokerOpError> {
+                use litebox_common_linux::fd_token_client::ClientError;
+                self.client
+                    .lock()
+                    .unwrap()
+                    .read_eventfd(handle)
+                    .map_err(|e| match e {
+                        ClientError::WouldBlock => BrokerOpError::WouldBlock,
+                        _ => BrokerOpError::Io,
+                    })
+            }
+            fn write_eventfd(&self, handle: u64, value: u64) -> Result<(), BrokerOpError> {
+                self.client
+                    .lock()
+                    .unwrap()
+                    .write_eventfd(handle, value)
+                    .map_err(|_| BrokerOpError::Io)
+            }
+            fn release_eventfd(&self, handle: u64) {
+                let _ = self.client.lock().unwrap().release(handle);
+            }
+            fn dup_handle(&self, handle: u64) -> Result<(), BrokerOpError> {
+                self.client
+                    .lock()
+                    .unwrap()
+                    .dup_handle(handle)
+                    .map_err(|_| BrokerOpError::Io)
+            }
+            fn subscribe_eventfd(
+                &self,
+                _: u64,
+                _: u32,
+                _: Arc<dyn BrokerEventCallback>,
+            ) -> Result<u64, BrokerOpError> {
+                Err(BrokerOpError::Io)
+            }
+            fn unsubscribe_eventfd(&self, _: u64, _: u64) {}
+        }
+
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("fd-token.sock");
+        let fd_registry = std::sync::Arc::new(BrokerFdTokenRegistry::new());
+        let state_registry = std::sync::Arc::new(BrokerStateRegistry::new());
+        let _listener_handle = spawn_control_listener(
+            &path,
+            std::sync::Arc::clone(&fd_registry),
+            std::sync::Arc::clone(&state_registry),
+        )
+        .expect("spawn listener");
+        for _ in 0..100 {
+            if path.exists() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        let client = FdTokenClient::connect(&path).expect("connect");
+        let provider: Arc<dyn BrokerEventfdProvider> = Arc::new(RealProviderForTest {
+            client: StdMutex::new(client),
+        });
+        let _ = set_broker_eventfd_provider(Arc::clone(&provider));
+
+        let task = crate::syscalls::tests::init_platform(None);
+        let efd_u32 = task
+            .sys_eventfd2(
+                0,
+                EfdFlags::NONBLOCK | EfdFlags::CLOEXEC | EfdFlags::SEMAPHORE,
+            )
+            .expect("sys_eventfd2 SEMAPHORE mode with real broker");
+        let efd = i32::try_from(efd_u32).unwrap();
+
+        // Write 3 → semaphore counter = 3.
+        let val: u64 = 3;
+        let n = task
+            .sys_write(efd, &val.to_le_bytes(), None)
+            .expect("write");
+        assert_eq!(n, 8);
+
+        // Read three times in semaphore mode: each returns 1, counter
+        // decrements. After 3 reads, counter is 0 → EAGAIN.
+        for i in 0..3 {
+            let mut buf = [0u8; 8];
+            let n = task
+                .sys_read(efd, &mut buf, None)
+                .unwrap_or_else(|e| panic!("semaphore read #{i} failed: {e:?}"));
+            assert_eq!(n, 8, "semaphore read should return 8 bytes");
+            let got = u64::from_le_bytes(buf);
+            assert_eq!(got, 1, "semaphore read should return 1, got {got}");
+        }
+        // 4th read: counter is 0, NONBLOCK → EAGAIN.
+        let mut buf = [0u8; 8];
+        let err = task.sys_read(efd, &mut buf, None).unwrap_err();
+        assert_eq!(err, Errno::EAGAIN);
+
+        task.sys_close(efd).expect("close eventfd");
     }
 }

@@ -226,7 +226,8 @@ mod tests {
 
         let info = task.sys_sysinfo();
         assert_eq!(info.loads, [0; 3]);
-        assert_eq!(info.procs, task.process().nr_threads().truncate());
+        let nr_threads_u16: u16 = task.process().nr_threads().truncate();
+        assert_eq!(info.procs, nr_threads_u16);
         assert_eq!(info.mem_unit, 1);
         #[cfg(target_arch = "x86_64")]
         assert_eq!(info.totalram, 4 * 1024 * 1024 * 1024);

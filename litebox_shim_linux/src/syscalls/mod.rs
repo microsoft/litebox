@@ -5,6 +5,14 @@
 
 pub(crate) mod epoll;
 pub(crate) mod eventfd;
+
+/// Public re-export of the broker-eventfd-provider setter. The runner
+/// calls this at bootstrap if a broker fd-token control socket is
+/// available; the shim consults the registered provider from
+/// `sys_eventfd2`.
+pub use eventfd::broker_eventfd_provider;
+pub use eventfd::set_broker_eventfd_provider;
+
 pub mod file;
 pub mod fork_snapshot;
 pub mod host_pipe;
