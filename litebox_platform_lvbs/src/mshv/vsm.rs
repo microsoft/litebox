@@ -833,12 +833,12 @@ fn copy_heki_patch_from_vtl0(patch_pa_0: u64, patch_pa_1: u64) -> Result<HekiPat
         return Err(VsmError::InvalidInputAddress);
     }
 
-    if patch_pa_1.is_null()
+    let heki_patch = if patch_pa_1.is_null()
         || (patch_pa_0.align_up(Size4KiB::SIZE) == patch_pa_1.align_down(Size4KiB::SIZE))
     {
         unsafe { crate::platform_low().copy_from_vtl0_phys::<HekiPatch>(patch_pa_0) }
             .map(|boxed| *boxed)
-            .ok_or(VsmError::Vtl0CopyFailed)
+            .ok_or(VsmError::Vtl0CopyFailed)?
     } else {
         let mut heki_patch = HekiPatch::new_zeroed();
         let heki_patch_bytes = heki_patch.as_mut_bytes();
@@ -853,11 +853,13 @@ fn copy_heki_patch_from_vtl0(patch_pa_0: u64, patch_pa_1: u64) -> Result<HekiPat
                 return Err(VsmError::Vtl0CopyFailed);
             }
         }
-        if heki_patch.is_valid() {
-            Ok(heki_patch)
-        } else {
-            Err(VsmError::InvalidInputAddress)
-        }
+        heki_patch
+    };
+
+    if heki_patch.is_valid() {
+        Ok(heki_patch)
+    } else {
+        Err(VsmError::InvalidInputAddress)
     }
 }
 
