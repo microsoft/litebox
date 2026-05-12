@@ -245,24 +245,19 @@ fn handle_subscribe_eventfd(
         );
     };
     let handle = StateHandle::from_id(handle_id);
-    let state = match registry.resolve(handle, SubsystemTag::Eventfd) {
+    // P2.0.5 generalization: dispatch via the StateObject trait so
+    // the same SubscribeEventfd opcode services every broker-managed
+    // fd kind. We resolve untyped (no SubsystemTag check) because
+    // the kind is recorded inside the state object — and Subscribe
+    // is genuinely kind-agnostic at the wire level.
+    let state = match registry.resolve_untyped(handle) {
         Ok(s) => s,
         Err(StateRegistryError::UnknownHandle(_)) => {
             return status_err(Opcode::SubscribeEventfdResponse, StatusCode::UnknownHandle);
         }
-        Err(StateRegistryError::TagMismatch { .. }) => {
-            return status_err(
-                Opcode::SubscribeEventfdResponse,
-                StatusCode::SubsystemMismatch,
-            );
-        }
         Err(_) => return status_err(Opcode::SubscribeEventfdResponse, StatusCode::Internal),
     };
-    let eventfd = state
-        .as_any()
-        .downcast_ref::<EventfdState>()
-        .expect("subsystem_tag check guarantees EventfdState");
-    match eventfd.subscribe(subscription_id, events_mask, sender) {
+    match state.subscribe(subscription_id, events_mask, sender) {
         Ok(()) => HandlerResult {
             frame: build_subscribe_eventfd_response_ok(),
             out_fd: None,
@@ -290,21 +285,15 @@ fn handle_unsubscribe(
         Err(_) => return protocol_err(Opcode::UnsubscribeResponse),
     };
     let handle = StateHandle::from_id(handle_id);
-    let state = match registry.resolve(handle, SubsystemTag::Eventfd) {
+    // P2.0.5 generalization: kind-agnostic via the StateObject trait.
+    let state = match registry.resolve_untyped(handle) {
         Ok(s) => s,
         Err(StateRegistryError::UnknownHandle(_)) => {
             return status_err(Opcode::UnsubscribeResponse, StatusCode::UnknownHandle);
         }
-        Err(StateRegistryError::TagMismatch { .. }) => {
-            return status_err(Opcode::UnsubscribeResponse, StatusCode::SubsystemMismatch);
-        }
         Err(_) => return status_err(Opcode::UnsubscribeResponse, StatusCode::Internal),
     };
-    let eventfd = state
-        .as_any()
-        .downcast_ref::<EventfdState>()
-        .expect("subsystem_tag check guarantees EventfdState");
-    match eventfd.unsubscribe(subscription_id) {
+    match state.unsubscribe(subscription_id) {
         Ok(()) => HandlerResult {
             frame: build_unsubscribe_response_ok(),
             out_fd: None,

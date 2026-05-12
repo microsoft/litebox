@@ -84,6 +84,28 @@ pub const BODY_MAX: u32 = 4096;
 /// Naming convention: request opcodes have arbitrary values; response
 /// opcodes are `request | 0x80`. The handler dispatcher can derive
 /// the response opcode from the request without a lookup table.
+///
+/// # Opcode range allocation
+///
+/// To let the broker-managed-fd kinds grow independently, each kind
+/// owns a 16-byte opcode range. New kinds append within their range;
+/// the response opcode is the request opcode with bit 7 set.
+///
+/// | Range            | Owner                       |
+/// |------------------|-----------------------------|
+/// | `0x00`–`0x0F`    | Token registry + transport  |
+/// | `0x10`–`0x1F`    | Eventfd state (P2.0)        |
+/// | `0x20`–`0x2F`    | Pidfd state (P2.B)          |
+/// | `0x30`–`0x3F`    | UnixSocket state (P2.A)     |
+/// | `0x40`–`0x4F`    | Signalfd state (P2.C)       |
+/// | `0x50`–`0x5F`    | Timerfd state (future)      |
+/// | `0x60`–`0x6F`    | Inotify state (future)      |
+/// | `0x70`–`0x7F`    | reserved for future kinds   |
+///
+/// Within a kind's range, follow the eventfd template:
+/// `0xN0` = create, `0xN1` = read-like primary op, `0xN2` = write-like
+/// primary op, `0xN3` = subscribe, etc. Unsubscribe / DupHandle live
+/// in the shared `0x14` / `0x15` slots — they're kind-agnostic.
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Opcode {
@@ -108,6 +130,25 @@ pub enum Opcode {
     SubscribeEventfdResponse = 0x93,
     UnsubscribeResponse = 0x94,
     DupHandleResponse = 0x95,
+}
+
+/// Reserved opcode ranges per kind. P2.B/A/C subagents append their
+/// opcodes within these ranges, then add `from_u8` arms + a
+/// `response_for` mapping. The reservation here documents the
+/// allocation contract; the actual `Opcode::CreateXxx` variants
+/// land in their respective subphase commits.
+pub mod opcode_ranges {
+    /// Pidfd state (P2.B): create / exit-query / subscribe.
+    pub const PIDFD_BASE: u8 = 0x20;
+    pub const PIDFD_RESPONSE_BASE: u8 = 0xA0;
+
+    /// UnixSocket state (P2.A): create / sendmsg / recvmsg / shutdown / subscribe.
+    pub const UNIX_SOCKET_BASE: u8 = 0x30;
+    pub const UNIX_SOCKET_RESPONSE_BASE: u8 = 0xB0;
+
+    /// Signalfd state (P2.C): create / read-siginfo / subscribe.
+    pub const SIGNALFD_BASE: u8 = 0x40;
+    pub const SIGNALFD_RESPONSE_BASE: u8 = 0xC0;
 }
 
 impl Opcode {

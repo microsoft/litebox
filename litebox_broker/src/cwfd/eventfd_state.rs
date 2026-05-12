@@ -239,6 +239,19 @@ impl StateObject for EventfdState {
     fn as_any(&self) -> &dyn Any {
         self
     }
+
+    fn subscribe(
+        &self,
+        subscription_id: u64,
+        events_mask: u32,
+        sender: Arc<Mutex<NotificationSender>>,
+    ) -> Result<(), SubscribeError> {
+        EventfdState::subscribe(self, subscription_id, events_mask, sender)
+    }
+
+    fn unsubscribe(&self, subscription_id: u64) -> Result<(), UnsubscribeError> {
+        EventfdState::unsubscribe(self, subscription_id)
+    }
 }
 
 #[cfg(test)]

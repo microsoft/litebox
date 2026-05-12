@@ -64,7 +64,10 @@ use core::any::Any;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use litebox_common_linux::fd_transfer_frame::SubsystemTag;
+use litebox_common_linux::cwfd::fd_transfer_frame::SubsystemTag;
+use litebox_common_linux::cwfd::notification_ring::NotificationSender;
+
+use crate::cwfd::subscription_list::{SubscribeError, UnsubscribeError};
 
 /// An opaque, broker-global handle to a [`StateObject`] held by the
 /// broker on behalf of one or more workers.
@@ -116,6 +119,27 @@ pub trait StateObject: Any + Send + Sync + core::fmt::Debug {
     /// state type. Concrete subsystem services use this to recover
     /// type-specific operation APIs.
     fn as_any(&self) -> &dyn Any;
+
+    /// Kind-agnostic subscribe. Adds `subscription_id` to this
+    /// state-object's notification fan-out for the given
+    /// `events_mask`, using `sender` as the worker-side ring.
+    /// Implementations typically delegate to an internal
+    /// [`crate::cwfd::subscription_list::SubscriptionList`].
+    ///
+    /// Implementations SHOULD prime the new subscription with any
+    /// currently-ready events so workers that subscribe after the
+    /// event don't miss the wake-up — this matches Linux
+    /// level-triggered poll semantics.
+    fn subscribe(
+        &self,
+        subscription_id: u64,
+        events_mask: u32,
+        sender: Arc<Mutex<NotificationSender>>,
+    ) -> Result<(), SubscribeError>;
+
+    /// Kind-agnostic unsubscribe. Removes the subscription previously
+    /// installed via [`Self::subscribe`].
+    fn unsubscribe(&self, subscription_id: u64) -> Result<(), UnsubscribeError>;
 }
 
 /// Errors returned by [`BrokerStateRegistry`] operations.
@@ -320,6 +344,18 @@ mod tests {
         fn as_any(&self) -> &dyn Any {
             self
         }
+        fn subscribe(
+            &self,
+            _subscription_id: u64,
+            _events_mask: u32,
+            _sender: Arc<Mutex<NotificationSender>>,
+        ) -> Result<(), SubscribeError> {
+            // Test stubs ignore subscriptions.
+            Ok(())
+        }
+        fn unsubscribe(&self, _subscription_id: u64) -> Result<(), UnsubscribeError> {
+            Ok(())
+        }
     }
 
     /// A second test state for tag-mismatch checks.
@@ -331,6 +367,17 @@ mod tests {
         }
         fn as_any(&self) -> &dyn Any {
             self
+        }
+        fn subscribe(
+            &self,
+            _subscription_id: u64,
+            _events_mask: u32,
+            _sender: Arc<Mutex<NotificationSender>>,
+        ) -> Result<(), SubscribeError> {
+            Ok(())
+        }
+        fn unsubscribe(&self, _subscription_id: u64) -> Result<(), UnsubscribeError> {
+            Ok(())
         }
     }
 

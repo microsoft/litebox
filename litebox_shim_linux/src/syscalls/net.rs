@@ -2677,6 +2677,18 @@ impl<FS: ShimFS> Task<FS> {
                     SubsystemTag::TcpSocket | SubsystemTag::Unknown(_) => {
                         // Unsupported token kind on this worker; drop.
                     }
+                    SubsystemTag::Pidfd
+                    | SubsystemTag::UnixSocket
+                    | SubsystemTag::Signalfd
+                    | SubsystemTag::Timerfd
+                    | SubsystemTag::Inotify => {
+                        // Reserved for P2.A/B/C and later phases.
+                        // Until those subphases land, the receive
+                        // path drops the fd cleanly rather than
+                        // panicking. Each subphase replaces the
+                        // matching arm here with proper
+                        // materialisation logic.
+                    }
                 }
             }
 
