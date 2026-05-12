@@ -119,6 +119,46 @@ const PF_NET_UNLISTEN: HandlerToken<PfNetListenArgs, Response> =
 const PF_NET_CONNECT: HandlerToken<PfNetConnectArgs, Response> =
     HandlerToken::new("platform_fixes.net_connect");
 
+#[derive(Serialize, Deserialize, Debug)]
+struct CliStartupMimicArgs {}
+
+#[derive(Serialize, Deserialize, Debug)]
+struct ForkExecPieArgs {
+    binary: String,
+    subcommand: String,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+struct PipeNonblockArgs {}
+
+#[derive(Serialize, Deserialize, Debug)]
+struct PipeChildNonblockArgs {}
+
+#[derive(Serialize, Deserialize, Debug)]
+struct EpollSocketArgs {
+    port: u16,
+    variant: String,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+struct CrossWorkerFileArgs {
+    mode: String,
+    path: String,
+}
+
+const CLI_STARTUP_MIMIC: HandlerToken<CliStartupMimicArgs, DetailOut> =
+    HandlerToken::new("platform_fixes.cli_startup_mimic");
+const FORK_EXEC_PIE: HandlerToken<ForkExecPieArgs, DetailOut> =
+    HandlerToken::new("platform_fixes.fork_exec_pie");
+const PIPE_NONBLOCK: HandlerToken<PipeNonblockArgs, DetailOut> =
+    HandlerToken::new("platform_fixes.pipe_nonblock");
+const PIPE_CHILD_NONBLOCK: HandlerToken<PipeChildNonblockArgs, DetailOut> =
+    HandlerToken::new("platform_fixes.pipe_child_nonblock");
+const EPOLL_SOCKET: HandlerToken<EpollSocketArgs, DetailOut> =
+    HandlerToken::new("platform_fixes.epoll_socket");
+const CROSS_WORKER_FILE: HandlerToken<CrossWorkerFileArgs, DetailOut> =
+    HandlerToken::new("platform_fixes.cross_worker_file");
+
 static PF_TCP_LISTENERS: OnceLock<Mutex<HashMap<u16, tokio::task::JoinHandle<()>>>> =
     OnceLock::new();
 
@@ -159,21 +199,6 @@ where
 
 async fn pf_exec(run: &mut RunContext<'_>, handle: &AgentHandle, args: Vec<String>) -> Response {
     pf_send_response(run, handle, &PF_EXEC, pf_exec_args(args)).await
-}
-
-async fn pf_exec_timeout(
-    run: &mut RunContext<'_>,
-    handle: &AgentHandle,
-    args: Vec<String>,
-    timeout_secs: u64,
-) -> Response {
-    pf_send_response(
-        run,
-        handle,
-        &PF_EXEC,
-        pf_exec_timeout_args(args, timeout_secs),
-    )
-    .await
 }
 
 async fn pf_exec_full(
@@ -640,6 +665,484 @@ fn register_platform_fix_handlers() {
     register_handler!(PF_NET_LISTEN, handle_pf_net_listen);
     register_handler!(PF_NET_UNLISTEN, handle_pf_net_unlisten);
     register_handler!(PF_NET_CONNECT, handle_pf_net_connect);
+    register_handler!(CLI_STARTUP_MIMIC, handle_cli_startup_mimic);
+    register_handler!(FORK_EXEC_PIE, handle_fork_exec_pie);
+    register_handler!(PIPE_NONBLOCK, handle_pipe_nonblock);
+    register_handler!(PIPE_CHILD_NONBLOCK, handle_pipe_child_nonblock);
+    register_handler!(EPOLL_SOCKET, handle_epoll_socket);
+    register_handler!(CROSS_WORKER_FILE, handle_cross_worker_file);
+
+    crate::register_leaf_subcommand!("cross-worker-file", leaf_subcmd::subcmd_cross_worker_file);
+    crate::register_leaf_subcommand!("proc-probe", leaf_subcmd::subcmd_proc_probe);
+    crate::register_leaf_subcommand!("check-ppid", leaf_subcmd::subcmd_check_ppid);
+}
+
+async fn handle_cli_startup_mimic(
+    _args: CliStartupMimicArgs,
+    _ctx: &mut HandlerCtx<'_>,
+) -> Result<DetailOut, HandlerError> {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .map_err(|e| HandlerError::from(format!("bind cli startup mimic listener: {e}")))?;
+    let addr = listener
+        .local_addr()
+        .map_err(|e| HandlerError::from(format!("listener addr: {e}")))?;
+    Ok(DetailOut {
+        detail: format!("CLI_STARTUP_MIMIC_OK {addr}"),
+    })
+}
+
+async fn handle_fork_exec_pie(
+    args: ForkExecPieArgs,
+    _ctx: &mut HandlerCtx<'_>,
+) -> Result<DetailOut, HandlerError> {
+    let detail = (|| -> Result<String, String> {
+        let pid = unsafe { libc::fork() };
+        if pid < 0 {
+            return Err(format!("fork: {}", std::io::Error::last_os_error()));
+        }
+        if pid == 0 {
+            let bin = std::ffi::CString::new(args.binary.as_str()).expect("binary has no NUL");
+            let sub =
+                std::ffi::CString::new(args.subcommand.as_str()).expect("subcommand has no NUL");
+            let exec_argv = [bin.as_ptr(), sub.as_ptr(), core::ptr::null()];
+            // SAFETY: child process passes valid NUL-terminated argv to execv; on failure it exits.
+            unsafe { libc::execv(bin.as_ptr(), exec_argv.as_ptr()) };
+            std::process::exit(127);
+        }
+
+        let deadline = Instant::now() + StdDuration::from_secs(15);
+        let mut status = 0i32;
+        loop {
+            // SAFETY: pid is a live child pid from fork and status points to valid storage.
+            let ret = unsafe { libc::waitpid(pid, &raw mut status, libc::WNOHANG) };
+            if ret > 0 {
+                if libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0 {
+                    return Ok("FORK_EXEC_PIE_OK".into());
+                }
+                return Ok(format!("FORK_EXEC_PIE_FAIL:exit={status}"));
+            }
+            if Instant::now() >= deadline {
+                // SAFETY: pid is the child process being timed out.
+                unsafe { libc::kill(pid, libc::SIGKILL) };
+                // SAFETY: reap the child after SIGKILL; null status is allowed.
+                unsafe { libc::waitpid(pid, std::ptr::null_mut(), 0) };
+                return Ok("FORK_EXEC_PIE_FAIL:timeout".into());
+            }
+            std::thread::sleep(StdDuration::from_millis(50));
+        }
+    })()?;
+    Ok(DetailOut { detail })
+}
+
+async fn handle_pipe_nonblock(
+    _args: PipeNonblockArgs,
+    _ctx: &mut HandlerCtx<'_>,
+) -> Result<DetailOut, HandlerError> {
+    let detail = (|| -> Result<String, String> {
+        let mut out = Vec::new();
+        let mut fds = [0i32; 2];
+        // SAFETY: pipe initializes two fds on success.
+        if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
+            return Err(format!("pipe: {}", std::io::Error::last_os_error()));
+        }
+        let read_fd = fds[0];
+        let write_fd = fds[1];
+        // SAFETY: read_fd is a valid pipe fd.
+        let flags = unsafe { libc::fcntl(read_fd, libc::F_GETFL) };
+        // SAFETY: read_fd is valid and flags are from F_GETFL.
+        let ret = unsafe { libc::fcntl(read_fd, libc::F_SETFL, flags | libc::O_NONBLOCK) };
+        out.push(format!(
+            "PIPE_NB_SETFL={}",
+            if ret == 0 { "OK" } else { "FAIL" }
+        ));
+        let mut buf = [0u8; 64];
+        // SAFETY: read_fd is valid and buf is writable.
+        let n = unsafe { libc::read(read_fd, buf.as_mut_ptr().cast(), buf.len()) };
+        // SAFETY: errno is thread-local and read just failed or returned.
+        let errno = unsafe { *libc::__errno_location() };
+        if n == -1 && (errno == libc::EAGAIN || errno == libc::EWOULDBLOCK) {
+            out.push("PIPE_NB_EMPTY=EAGAIN".into());
+        } else {
+            out.push(format!("PIPE_NB_EMPTY=UNEXPECTED n={n} errno={errno}"));
+        }
+        let msg = b"HELLO";
+        // SAFETY: write_fd is valid and msg points to readable bytes.
+        unsafe { libc::write(write_fd, msg.as_ptr().cast(), msg.len()) };
+        // SAFETY: read_fd is valid and buf is writable.
+        let n = unsafe { libc::read(read_fd, buf.as_mut_ptr().cast(), buf.len()) };
+        out.push(if n == 5 {
+            "PIPE_NB_DATA=OK".into()
+        } else {
+            format!("PIPE_NB_DATA=UNEXPECTED n={n}")
+        });
+        // SAFETY: write_fd is a valid fd and is no longer used after close.
+        unsafe { libc::close(write_fd) };
+        // SAFETY: read_fd is valid and buf is writable.
+        let n = unsafe { libc::read(read_fd, buf.as_mut_ptr().cast(), buf.len()) };
+        if n == 0 {
+            out.push("PIPE_NB_EOF=OK".into());
+        } else {
+            // SAFETY: errno is thread-local and read just returned unexpectedly.
+            let errno = unsafe { *libc::__errno_location() };
+            out.push(format!("PIPE_NB_EOF=UNEXPECTED n={n} errno={errno}"));
+        }
+        // SAFETY: read_fd is a valid fd and is no longer used after close.
+        unsafe { libc::close(read_fd) };
+        Ok(out.join("\n"))
+    })()?;
+    Ok(DetailOut { detail })
+}
+
+async fn handle_pipe_child_nonblock(
+    _args: PipeChildNonblockArgs,
+    _ctx: &mut HandlerCtx<'_>,
+) -> Result<DetailOut, HandlerError> {
+    let detail = (|| -> Result<String, String> {
+        let mut out = Vec::new();
+        let mut fds = [0i32; 2];
+        // SAFETY: pipe initializes two fds on success.
+        if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
+            return Err(format!("pipe: {}", std::io::Error::last_os_error()));
+        }
+        let read_fd = fds[0];
+        let write_fd = fds[1];
+        // SAFETY: fork duplicates the current process; child exits below.
+        let pid = unsafe { libc::fork() };
+        if pid == 0 {
+            // SAFETY: child owns these fds after fork.
+            unsafe { libc::close(read_fd) };
+            std::thread::sleep(StdDuration::from_millis(500));
+            let msg = b"X";
+            // SAFETY: write_fd is valid and msg is readable.
+            unsafe { libc::write(write_fd, msg.as_ptr().cast(), 1) };
+            // SAFETY: child is done with write_fd.
+            unsafe { libc::close(write_fd) };
+            std::process::exit(0);
+        }
+        if pid < 0 {
+            return Err(format!("fork: {}", std::io::Error::last_os_error()));
+        }
+        // SAFETY: parent is done with write_fd.
+        unsafe { libc::close(write_fd) };
+        // SAFETY: read_fd is a valid pipe fd.
+        let flags = unsafe { libc::fcntl(read_fd, libc::F_GETFL) };
+        // SAFETY: read_fd is valid and flags are from F_GETFL.
+        unsafe { libc::fcntl(read_fd, libc::F_SETFL, flags | libc::O_NONBLOCK) };
+        let mut buf = [0u8; 1];
+        // SAFETY: read_fd is valid and buf is writable.
+        let n = unsafe { libc::read(read_fd, buf.as_mut_ptr().cast(), 1) };
+        // SAFETY: errno is thread-local and read just returned.
+        let errno = unsafe { *libc::__errno_location() };
+        if n == -1 && (errno == libc::EAGAIN || errno == libc::EWOULDBLOCK) {
+            out.push("PCHILD_INITIAL=EAGAIN".into());
+        } else {
+            out.push(format!("PCHILD_INITIAL=UNEXPECTED n={n} errno={errno}"));
+        }
+        std::thread::sleep(StdDuration::from_secs(1));
+        // SAFETY: read_fd is valid and buf is writable.
+        let n = unsafe { libc::read(read_fd, buf.as_mut_ptr().cast(), 1) };
+        if n == 1 {
+            out.push("PCHILD_DATA=OK".into());
+        } else {
+            // SAFETY: errno is thread-local and read just returned unexpectedly.
+            let errno = unsafe { *libc::__errno_location() };
+            out.push(format!("PCHILD_DATA=UNEXPECTED n={n} errno={errno}"));
+        }
+        // SAFETY: read_fd is valid and buf is writable.
+        let n = unsafe { libc::read(read_fd, buf.as_mut_ptr().cast(), 1) };
+        if n == 0 {
+            out.push("PCHILD_EOF=OK".into());
+        } else {
+            // SAFETY: errno is thread-local and read just returned unexpectedly.
+            let errno = unsafe { *libc::__errno_location() };
+            out.push(format!("PCHILD_EOF=UNEXPECTED n={n} errno={errno}"));
+        }
+        // SAFETY: cleanup live fd and reap the child pid.
+        unsafe { libc::close(read_fd) };
+        // SAFETY: pid is a child process from fork.
+        unsafe { libc::waitpid(pid, std::ptr::null_mut(), 0) };
+        Ok(out.join("\n"))
+    })()?;
+    Ok(DetailOut { detail })
+}
+
+async fn handle_epoll_socket(
+    args: EpollSocketArgs,
+    _ctx: &mut HandlerCtx<'_>,
+) -> Result<DetailOut, HandlerError> {
+    let detail = epoll_socket_detail(args.port, &args.variant)?;
+    Ok(DetailOut { detail })
+}
+
+async fn handle_cross_worker_file(
+    args: CrossWorkerFileArgs,
+    ctx: &mut HandlerCtx<'_>,
+) -> Result<DetailOut, HandlerError> {
+    use std::io::Write;
+    let keep_open = args.mode == "write-and-hold";
+    let checkpoint = keep_open || args.mode == "write-and-sleep";
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&args.path)
+        .map_err(|e| HandlerError::from(format!("open {}: {e}", args.path)))?;
+    for i in 0..5 {
+        writeln!(f, "line{i}").map_err(|e| HandlerError::from(format!("write: {e}")))?;
+    }
+    f.flush()
+        .map_err(|e| HandlerError::from(format!("flush: {e}")))?;
+    if !keep_open {
+        drop(f);
+    }
+    if checkpoint {
+        ctx.checkpoint("cross-worker-file-ready").await?;
+    }
+    Ok(DetailOut {
+        detail: "[cross-worker-file] READY".into(),
+    })
+}
+
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::too_many_lines
+)]
+fn epoll_socket_detail(port: u16, variant: &str) -> Result<String, HandlerError> {
+    let mut out = Vec::new();
+    // SAFETY: all raw sockets/fds created here are checked for errors and closed before return.
+    unsafe {
+        let srv = libc::socket(libc::AF_INET, libc::SOCK_STREAM | libc::SOCK_NONBLOCK, 0);
+        if srv < 0 {
+            return Err(HandlerError::from(format!(
+                "socket: {}",
+                std::io::Error::last_os_error()
+            )));
+        }
+        let one: libc::c_int = 1;
+        libc::setsockopt(
+            srv,
+            libc::SOL_SOCKET,
+            libc::SO_REUSEADDR,
+            (&raw const one).cast::<libc::c_void>(),
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        );
+        let addr = libc::sockaddr_in {
+            sin_family: libc::AF_INET as u16,
+            sin_port: port.to_be(),
+            sin_addr: libc::in_addr { s_addr: 0 },
+            sin_zero: [0; 8],
+        };
+        if libc::bind(
+            srv,
+            (&raw const addr).cast::<libc::sockaddr>(),
+            std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+        ) != 0
+        {
+            let e = std::io::Error::last_os_error();
+            libc::close(srv);
+            return Err(HandlerError::from(format!("bind: {e}")));
+        }
+        libc::listen(srv, 5);
+        let epfd = libc::epoll_create1(0);
+        if epfd < 0 {
+            let e = std::io::Error::last_os_error();
+            libc::close(srv);
+            return Err(HandlerError::from(format!("epoll_create1: {e}")));
+        }
+        let mut ev = libc::epoll_event {
+            events: libc::EPOLLIN as u32,
+            u64: srv as u64,
+        };
+        libc::epoll_ctl(epfd, libc::EPOLL_CTL_ADD, srv, &raw mut ev);
+        let client = std::thread::spawn(move || {
+            std::thread::sleep(StdDuration::from_millis(500));
+            let sock = libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0);
+            let addr = libc::sockaddr_in {
+                sin_family: libc::AF_INET as u16,
+                sin_port: port.to_be(),
+                sin_addr: libc::in_addr {
+                    s_addr: u32::from_be_bytes([127, 0, 0, 1]).to_be(),
+                },
+                sin_zero: [0; 8],
+            };
+            libc::connect(
+                sock,
+                (&raw const addr).cast::<libc::sockaddr>(),
+                std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+            );
+            let msg = b"EPOLL_DATA";
+            libc::send(sock, msg.as_ptr().cast(), msg.len(), 0);
+            libc::close(sock);
+        });
+        let mut events = [libc::epoll_event { events: 0, u64: 0 }; 4];
+        if variant == "tokio" {
+            let n = libc::epoll_wait(epfd, events.as_mut_ptr(), 4, 0);
+            if n > 0 {
+                out.push("EPOLL_ACCEPT=IMMEDIATE".into());
+            } else {
+                let n = libc::epoll_wait(epfd, events.as_mut_ptr(), 4, 5000);
+                if n <= 0 {
+                    out.push("EPOLL_ACCEPT=TIMEOUT".into());
+                    let _ = client.join();
+                    libc::close(srv);
+                    libc::close(epfd);
+                    return Ok(out.join("\n"));
+                }
+                out.push("EPOLL_ACCEPT=WOKE".into());
+            }
+        } else {
+            let n = libc::epoll_wait(epfd, events.as_mut_ptr(), 4, 5000);
+            if n <= 0 {
+                out.push("EPOLL_ACCEPT=TIMEOUT".into());
+                let _ = client.join();
+                libc::close(srv);
+                libc::close(epfd);
+                return Ok(out.join("\n"));
+            }
+            out.push("EPOLL_ACCEPT=READY".into());
+        }
+        let conn = libc::accept4(
+            srv,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            libc::SOCK_NONBLOCK,
+        );
+        if conn < 0 {
+            out.push("EPOLL_ACCEPT=FAIL".into());
+        } else {
+            let mut ev2 = libc::epoll_event {
+                events: libc::EPOLLIN as u32,
+                u64: conn as u64,
+            };
+            libc::epoll_ctl(epfd, libc::EPOLL_CTL_ADD, conn, &raw mut ev2);
+            let n2 = libc::epoll_wait(epfd, events.as_mut_ptr(), 4, 5000);
+            if n2 <= 0 {
+                out.push("EPOLL_READ=TIMEOUT".into());
+            } else {
+                let mut buf = [0u8; 64];
+                let nr = libc::recv(conn, buf.as_mut_ptr().cast(), buf.len(), 0);
+                if nr > 0 {
+                    let data = std::str::from_utf8(&buf[..nr.cast_unsigned()]).unwrap_or("?");
+                    out.push(format!("EPOLL_READ=OK data={data}"));
+                } else {
+                    out.push(format!("EPOLL_READ=NO_DATA nr={nr}"));
+                }
+            }
+            libc::close(conn);
+        }
+        let _ = client.join();
+        libc::close(srv);
+        libc::close(epfd);
+    }
+    Ok(out.join("\n"))
+}
+
+fn fork_binary_label(bt: crate::BinaryType) -> &'static str {
+    match bt {
+        crate::BinaryType::PieGlibc => "self",
+        crate::BinaryType::NonPieGlibc => "nonpie",
+        crate::BinaryType::StaticPieGlibc => "static-pie-glibc",
+        crate::BinaryType::StaticPieMusl => "static-pie-musl",
+        crate::BinaryType::NonPieStaticMusl => "non-pie-static-musl",
+    }
+}
+
+mod leaf_subcmd {
+    use std::io::Write;
+
+    pub(super) fn subcmd_cross_worker_file(args: &[String]) -> i32 {
+        let sub = args.get(2).map_or("", String::as_str);
+        if sub == "write-and-sleep" || sub == "write-and-exit" || sub == "write-and-hold" {
+            let path = args.get(3).map_or("/tmp/cwf.log", String::as_str);
+            let mut f = std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(path)
+                .unwrap();
+            for i in 0..5 {
+                writeln!(f, "line{i}").unwrap();
+            }
+            f.flush().unwrap();
+            eprintln!("[cross-worker-file] READY");
+            if sub == "write-and-hold" {
+                std::thread::sleep(std::time::Duration::from_secs(10));
+                drop(f);
+            } else {
+                drop(f);
+                if sub == "write-and-sleep" {
+                    std::thread::sleep(std::time::Duration::from_secs(10));
+                }
+            }
+            return 0;
+        }
+        if sub == "write-stdout" {
+            for i in 0..5 {
+                println!("line{i}");
+            }
+            std::io::stdout().flush().unwrap();
+            eprintln!("[cross-worker-file] READY");
+            std::thread::sleep(std::time::Duration::from_secs(10));
+            return 0;
+        }
+        1
+    }
+
+    pub(super) fn subcmd_check_ppid(_args: &[String]) -> i32 {
+        let ppid = unsafe { libc::getppid() };
+        let proc_exists = std::path::Path::new(&format!("/proc/{ppid}")).exists();
+        let kill_ret = unsafe { libc::kill(ppid, 0) };
+        let kill_errno = if kill_ret != 0 {
+            std::io::Error::last_os_error().raw_os_error().unwrap_or(-1)
+        } else {
+            0
+        };
+        let kill_ok = kill_ret == 0;
+        println!("ppid={ppid} proc={proc_exists} kill0={kill_ok} errno={kill_errno}");
+        0
+    }
+
+    pub(super) fn subcmd_proc_probe(args: &[String]) -> i32 {
+        let pid = unsafe { libc::getpid() };
+        let parent_pid = unsafe { libc::getppid() };
+        let self_exists = std::path::Path::new("/proc/self").exists();
+        let self_cmdline = std::fs::read_to_string("/proc/self/cmdline")
+            .map(|s| !s.is_empty())
+            .unwrap_or(false);
+        let self_stat = std::fs::read_to_string("/proc/self/stat")
+            .map(|s| !s.is_empty())
+            .unwrap_or(false);
+        let own_proc = std::path::Path::new(&format!("/proc/{pid}")).exists();
+        let own_cmdline = std::fs::read_to_string(format!("/proc/{pid}/cmdline"))
+            .map(|s| !s.is_empty())
+            .unwrap_or(false);
+        let ppid_proc = std::path::Path::new(&format!("/proc/{parent_pid}")).exists();
+        let ppid_cmdline = std::fs::read_to_string(format!("/proc/{parent_pid}/cmdline"))
+            .map(|s| !s.is_empty())
+            .unwrap_or(false);
+        let ppid_kill0_ret = unsafe { libc::kill(parent_pid, 0) };
+        let ppid_kill0_errno = if ppid_kill0_ret != 0 {
+            std::io::Error::last_os_error().raw_os_error().unwrap_or(-1)
+        } else {
+            0
+        };
+        let ppid_kill0 = ppid_kill0_ret == 0;
+        print!("pid={pid} ppid={parent_pid}");
+        print!(" self={self_exists} self_cmdline={self_cmdline} self_stat={self_stat}");
+        print!(" own_proc={own_proc} own_cmdline={own_cmdline}");
+        print!(
+            " ppid_proc={ppid_proc} ppid_cmdline={ppid_cmdline} ppid_kill0={ppid_kill0} ppid_kill0_errno={ppid_kill0_errno}"
+        );
+        if let Some(target) = args.get(2).and_then(|s| s.parse::<i32>().ok()) {
+            let t_proc = std::path::Path::new(&format!("/proc/{target}")).exists();
+            let t_kill0 = unsafe { libc::kill(target, 0) } == 0;
+            print!(" target={target} target_proc={t_proc} target_kill0={t_kill0}");
+        }
+        println!();
+        0
+    }
 }
 
 async fn handle_poll_ready(
@@ -999,31 +1502,28 @@ pub(crate) fn register_exit_data_integrity_tests(reg: &mut Registry<'_>) {
                 )
                 .timeout(60)
                 .build(move |cx| {
-                    let handle = cx.require(agent);
+                    let leaf = cx.declare_ephemeral(
+                        agent,
+                        format!("ExitData_{size}_{binary_label}_{agent}"),
+                        SpawnKind::Fork {
+                            binary: fork_binary_label(binary),
+                            inherit_listen_ports: vec![],
+                        },
+                    );
                     Box::new(move |run| {
                         let a = agent_s.clone();
-                        let self_exe = run.self_exe().to_string();
                         Box::pin(async move {
-                            let bin_path = crate::binary_path(binary, &self_exe);
-                            let resp = pf_exec(
-                                run,
-                                &handle,
-                                vec![bin_path, "write-then-exit".into(), size.to_string()],
-                            )
-                            .await;
-                            let pass = match &resp {
-                                Response::ExecResult {
-                                    exit_code: 0,
-                                    stdout,
-                                    ..
-                                } => stdout.len() == size,
-                                _ => false,
-                            };
-                            let detail = match &resp {
-                                Response::ExecResult { stdout, .. } => {
-                                    format!("got {} bytes, expected {size}", stdout.len())
-                                }
-                                _ => format!("{resp:?}"),
+                            let result = run
+                                .run_leaf(
+                                    &leaf,
+                                    &super::common::WRITE_THEN_EXIT,
+                                    super::common::WriteThenExitArgs { size },
+                                )
+                                .await;
+                            let pass = matches!(&result, Ok(out) if out.data.len() == size);
+                            let detail = match &result {
+                                Ok(out) => format!("got {} bytes, expected {size}", out.data.len()),
+                                Err(e) => e.clone(),
                             };
                             super::TestOutcome::new(&a, pass, detail)
                         })
@@ -1812,15 +2312,15 @@ pub(crate) fn register_fork_from_worker_exec_tests(reg: &mut Registry<'_>) {
     //   - launcher = init   (agent A, PIE) ─► fork+execv each BinaryType
     //   - launcher = NP     (worker-exec host, non-PIE) ─► same
     //
-    // Both arms use the `fork-exec-pie` subcommand (which is plain
+    // Both arms use the fork-exec-pie handler (which is plain
     // fork+execv with no PIE-specific logic; the historical name is
     // kept for backwards compatibility). The binary executed is
     // resolved per `BinaryType` via `binary_path()`.
     //
     for &bt in crate::BinaryType::ALL {
-        for (launcher_label, launcher_agent, sub_timeout) in [
-            ("from_init", AgentName::Dpg1, 20_u64),
-            ("from_worker_exec", AgentName::Dpg1Dng, 30_u64),
+        for (launcher_label, launcher_agent) in [
+            ("from_init", AgentName::Dpg1),
+            ("from_worker_exec", AgentName::Dpg1Dng),
         ] {
             let bt_label = bt.label();
             let test_id = format!("FWE.{bt_label}.{launcher_label}");
@@ -1828,38 +2328,36 @@ pub(crate) fn register_fork_from_worker_exec_tests(reg: &mut Registry<'_>) {
             reg.test("fork", "fork_from_worker_exec", test_id.clone())
                 .timeout(60)
                 .build(move |cx| {
-                    let handle = cx.require(launcher_agent);
+                    let launcher_binary = match launcher_agent {
+                        AgentName::Dpg1 => "self",
+                        AgentName::Dpg1Dng => "nonpie",
+                        _ => unreachable!(),
+                    };
+                    let leaf = cx.declare_ephemeral(
+                        launcher_agent,
+                        format!("ForkExecPie_{bt_label}_{launcher_label}"),
+                        SpawnKind::Fork {
+                            binary: launcher_binary,
+                            inherit_listen_ports: vec![],
+                        },
+                    );
                     Box::new(move |run| {
                         let outcome_label = outcome_label.clone();
                         let self_exe = run.self_exe().to_string();
                         Box::pin(async move {
                             let target = crate::binary_path(bt, &self_exe);
-                            // The launcher binary depends on which agent
-                            // we're running on: agent A is PIE, agent NP
-                            // is non-PIE.
-                            let launcher_bin = match launcher_agent {
-                                AgentName::Dpg1 => self_exe.clone(),
-                                AgentName::Dpg1Dng => crate::nonpie_binary(),
-                                _ => unreachable!(),
-                            };
-                            let resp = pf_exec_timeout(
-                                run,
-                                &handle,
-                                vec![
-                                    launcher_bin,
-                                    "fork-exec-pie".into(),
-                                    target,
-                                    "echo-test".into(),
-                                ],
-                                sub_timeout,
-                            )
-                            .await;
-                            let pass = matches!(
-                                &resp,
-                                Response::ExecResult { exit_code: 0, stdout, .. }
-                                    if stdout.contains("FORK_EXEC_PIE_OK")
-                            );
-                            super::TestOutcome::new(&outcome_label, pass, format!("{resp:?}"))
+                            let result = run
+                                .run_leaf(
+                                    &leaf,
+                                    &FORK_EXEC_PIE,
+                                    ForkExecPieArgs {
+                                        binary: target,
+                                        subcommand: "echo-test".into(),
+                                    },
+                                )
+                                .await;
+                            let pass = matches!(&result, Ok(out) if out.detail.contains("FORK_EXEC_PIE_OK"));
+                            super::TestOutcome::new(&outcome_label, pass, format!("{result:?}"))
                         })
                     })
                 });
@@ -2058,30 +2556,30 @@ pub(crate) fn register_cross_worker_file_tests(reg: &mut Registry<'_>) {
                 .timeout(60)
                 .build(move |cx| {
                     let handle = cx.require(agent);
+                    let leaf = cx.declare_ephemeral(
+                        agent,
+                        format!("CrossWorkerFileSeq_{agent}"),
+                        SpawnKind::Fork {
+                            binary: "self",
+                            inherit_listen_ports: vec![],
+                        },
+                    );
                     Box::new(move |run| {
                         let a = a.clone();
-                        let self_exe = run.self_exe().to_string();
                         Box::pin(async move {
                             let path = format!("/shared/cwf-seq-{a}.txt");
-                            let resp = pf_exec(
-                                run,
-                                &handle,
-                                vec![
-                                    "bash".into(),
-                                    "-c".into(),
-                                    format!(
-                                        "{} cross-worker-file write-and-exit {}",
-                                        self_exe, path
-                                    ),
-                                ],
-                            )
-                            .await;
-                            if !matches!(&resp, Response::ExecResult { exit_code: 0, .. }) {
-                                return super::TestOutcome::new(
-                                    &a,
-                                    false,
-                                    format!("write failed: {resp:?}"),
-                                );
+                            let result = run
+                                .run_leaf(
+                                    &leaf,
+                                    &CROSS_WORKER_FILE,
+                                    CrossWorkerFileArgs {
+                                        mode: "write-and-exit".into(),
+                                        path: path.clone(),
+                                    },
+                                )
+                                .await;
+                            if let Err(e) = result {
+                                return super::TestOutcome::new(&a, false, e);
                             }
                             let resp = pf_fs_read(run, &handle, path.clone()).await;
                             let pass = matches!(
@@ -2105,44 +2603,45 @@ pub(crate) fn register_cross_worker_file_tests(reg: &mut Registry<'_>) {
             .timeout(60)
             .build(move |cx| {
                 let handle = cx.require(agent);
+                let leaf = cx.declare_ephemeral(
+                    agent,
+                    format!("CrossWorkerFileConcurrent_{agent}"),
+                    SpawnKind::Fork {
+                        binary: "self",
+                        inherit_listen_ports: vec![],
+                    },
+                );
                 Box::new(move |run| {
                     let a = a.clone();
-                    let self_exe = run.self_exe().to_string();
                     Box::pin(async move {
                         let path = format!("/shared/cwf-conc-{a}.txt");
-                        let resp = pf_exec_ready(
-                            run,
-                            &handle,
-                            vec![
-                                self_exe,
-                                "cross-worker-file".into(),
-                                "write-and-sleep".into(),
-                                path.clone(),
-                            ],
-                            "[cross-worker-file] READY".into(),
-                            Some(15),
-                            None,
-                            "stderr".into(),
-                        )
-                        .await;
-                        let bg_pid = match &resp {
-                            Response::BackgroundReady { pid } => Some(*pid),
-                            _ => {
-                                return super::TestOutcome::new(
-                                    &a,
-                                    false,
-                                    format!("bg spawn failed: {resp:?}"),
-                                );
-                            }
-                        };
+                        if let Err(e) = run
+                            .run_leaf_write(
+                                &leaf,
+                                &CROSS_WORKER_FILE,
+                                CrossWorkerFileArgs {
+                                    mode: "write-and-sleep".into(),
+                                    path: path.clone(),
+                                },
+                            )
+                            .await
+                        {
+                            return super::TestOutcome::new(&a, false, e);
+                        }
+                        if let Err(e) = run
+                            .run_leaf_read_checkpoint(&leaf, "cross-worker-file-ready")
+                            .await
+                        {
+                            return super::TestOutcome::new(&a, false, e);
+                        }
                         let resp = pf_fs_read(run, &handle, path.clone()).await;
                         let pass = matches!(
                             &resp,
                             Response::Ok { data: Some(d) } if d.starts_with("line0")
                         );
-                        if let Some(pid) = bg_pid {
-                            let _ = pf_kill(run, &handle, pid).await;
-                        }
+                        let _ = run.run_leaf_resume(&leaf, "cross-worker-file-ready").await;
+                        let _ = run.run_leaf_read_result(&leaf, &CROSS_WORKER_FILE).await;
+                        let _ = run.run_leaf_exit(&leaf).await;
                         super::TestOutcome::new(&a, pass, format!("{resp:?}"))
                     })
                 })
@@ -2156,44 +2655,45 @@ pub(crate) fn register_cross_worker_file_tests(reg: &mut Registry<'_>) {
                 .timeout(60)
                 .build(move |cx| {
                     let handle = cx.require(agent);
+                    let leaf = cx.declare_ephemeral(
+                        agent,
+                        format!("CrossWorkerFileHold_{agent}"),
+                        SpawnKind::Fork {
+                            binary: "self",
+                            inherit_listen_ports: vec![],
+                        },
+                    );
                     Box::new(move |run| {
                         let a = a.clone();
-                        let self_exe = run.self_exe().to_string();
                         Box::pin(async move {
                             let path = format!("/shared/cwf-hold-{a}.txt");
-                            let resp = pf_exec_ready(
-                                run,
-                                &handle,
-                                vec![
-                                    self_exe,
-                                    "cross-worker-file".into(),
-                                    "write-and-hold".into(),
-                                    path.clone(),
-                                ],
-                                "[cross-worker-file] READY".into(),
-                                Some(15),
-                                None,
-                                "stderr".into(),
-                            )
-                            .await;
-                            let bg_pid = match &resp {
-                                Response::BackgroundReady { pid } => Some(*pid),
-                                _ => {
-                                    return super::TestOutcome::new(
-                                        &a,
-                                        false,
-                                        format!("bg spawn failed: {resp:?}"),
-                                    );
-                                }
-                            };
+                            let started = run
+                                .run_leaf_write(
+                                    &leaf,
+                                    &CROSS_WORKER_FILE,
+                                    CrossWorkerFileArgs {
+                                        mode: "write-and-hold".into(),
+                                        path: path.clone(),
+                                    },
+                                )
+                                .await;
+                            if let Err(e) = started {
+                                return super::TestOutcome::new(&a, false, e);
+                            }
+                            if let Err(e) = run
+                                .run_leaf_read_checkpoint(&leaf, "cross-worker-file-ready")
+                                .await
+                            {
+                                return super::TestOutcome::new(&a, false, e);
+                            }
                             let resp = pf_fs_read(run, &handle, path.clone()).await;
                             let pass = matches!(
                                 &resp,
                                 Response::Ok { data: Some(d) } if d.starts_with("line0")
                             );
-                            if let Some(pid) = bg_pid {
-                                let _ = pf_kill(run, &handle, pid).await;
-                            }
+                            let _ = run.run_leaf_resume(&leaf, "cross-worker-file-ready").await;
+                            let _ = run.run_leaf_read_result(&leaf, &CROSS_WORKER_FILE).await;
+                            let _ = run.run_leaf_exit(&leaf).await;
                             super::TestOutcome::new(&a, pass, format!("{resp:?}"))
                         })
                     })
@@ -2211,45 +2711,46 @@ pub(crate) fn register_cross_worker_file_tests(reg: &mut Registry<'_>) {
             .timeout(60)
             .build(move |cx| {
                 let handle = cx.require(agent);
+                let leaf = cx.declare_ephemeral(
+                    agent,
+                    format!("CrossWorkerFileSelfOpen_{agent}"),
+                    SpawnKind::Fork {
+                        binary: "self",
+                        inherit_listen_ports: vec![],
+                    },
+                );
                 Box::new(move |run| {
                     let a = a.clone();
-                    let self_exe = run.self_exe().to_string();
                     Box::pin(async move {
                         let path = format!("/shared/cwf-self-{a}.txt");
                         let _ = pf_fs_delete(run, &handle, path.clone()).await;
-                        let resp = pf_exec_ready(
-                            run,
-                            &handle,
-                            vec![
-                                self_exe,
-                                "cross-worker-file".into(),
-                                "write-and-hold".into(),
-                                path.clone(),
-                            ],
-                            "[cross-worker-file] READY".into(),
-                            Some(15),
-                            None,
-                            "stderr".into(),
-                        )
-                        .await;
-                        let pid = match &resp {
-                            Response::BackgroundReady { pid } => Some(*pid),
-                            _ => {
-                                return super::TestOutcome::new(
-                                    &a,
-                                    false,
-                                    format!("bg spawn failed: {resp:?}"),
-                                );
-                            }
-                        };
+                        if let Err(e) = run
+                            .run_leaf_write(
+                                &leaf,
+                                &CROSS_WORKER_FILE,
+                                CrossWorkerFileArgs {
+                                    mode: "write-and-hold".into(),
+                                    path: path.clone(),
+                                },
+                            )
+                            .await
+                        {
+                            return super::TestOutcome::new(&a, false, e);
+                        }
+                        if let Err(e) = run
+                            .run_leaf_read_checkpoint(&leaf, "cross-worker-file-ready")
+                            .await
+                        {
+                            return super::TestOutcome::new(&a, false, e);
+                        }
                         let resp = pf_fs_read(run, &handle, path.clone()).await;
                         let pass = matches!(
                             &resp,
                             Response::Ok { data: Some(d) } if d.starts_with("line0")
                         );
-                        if let Some(pid) = pid {
-                            let _ = pf_kill(run, &handle, pid).await;
-                        }
+                        let _ = run.run_leaf_resume(&leaf, "cross-worker-file-ready").await;
+                        let _ = run.run_leaf_read_result(&leaf, &CROSS_WORKER_FILE).await;
+                        let _ = run.run_leaf_exit(&leaf).await;
                         super::TestOutcome::new(&a, pass, format!("{resp:?}"))
                     })
                 })
@@ -3114,30 +3615,22 @@ pub(crate) fn register_cli_startup_mimic_tests(reg: &mut Registry<'_>) {
                 reg.test("fork", "cli_startup_mimic", test_id)
                     .timeout(60)
                     .build(move |cx| {
-                        let handle = cx.require(agent);
+                        let leaf = cx.declare_ephemeral(
+                            agent,
+                            format!("CliStartupMimic_{delivery}_{bt_label}_{agent}"),
+                            SpawnKind::Fork {
+                                binary: fork_binary_label(bt),
+                                inherit_listen_ports: vec![],
+                            },
+                        );
                         Box::new(move |run| {
                             let a = agent_s.clone();
-                            let self_exe = run.self_exe().to_string();
                             Box::pin(async move {
-                                let target = crate::binary_path(bt, &self_exe);
-                                let (args, stdin) = match delivery {
-                                    "tokio_pipe" => {
-                                        (vec![target, "cli-startup-mimic".into()], None)
-                                    }
-                                    "bash_heredoc_pipe" => (
-                                        vec!["bash".into(), "-s".into()],
-                                        Some(format!("exec {target} cli-startup-mimic\n")),
-                                    ),
-                                    _ => unreachable!(),
-                                };
-                                let resp =
-                                    pf_exec_full(run, &handle, args, Some(10), stdin, vec![]).await;
-                                let pass = matches!(
-                                    &resp,
-                                    Response::ExecResult { exit_code: 0, stdout, .. }
-                                        if stdout.contains("CLI_STARTUP_MIMIC_OK")
-                                );
-                                super::TestOutcome::new(&a, pass, format!("{resp:?}"))
+                                let result = run
+                                    .run_leaf(&leaf, &CLI_STARTUP_MIMIC, CliStartupMimicArgs {})
+                                    .await;
+                                let pass = matches!(&result, Ok(out) if out.detail.contains("CLI_STARTUP_MIMIC_OK"));
+                                super::TestOutcome::new(&a, pass, format!("{result:?}"))
                             })
                         })
                     });
@@ -3385,27 +3878,23 @@ pub(crate) fn register_pipe_nonblock_tests(reg: &mut Registry<'_>) {
             reg.test("matrix", "pipe_nonblock", format!("PN.{agent}.{suffix}"))
                 .timeout(60)
                 .build(move |cx| {
-                    let handle = cx.require(agent);
+                    let leaf = cx.declare_ephemeral(
+                        agent,
+                        format!("PipeNonblock_{agent}_{suffix}"),
+                        SpawnKind::Fork {
+                            binary: "self",
+                            inherit_listen_ports: vec![],
+                        },
+                    );
                     Box::new(move |run| {
                         let a = agent_s.clone();
                         let m = marker_s.clone();
-                        let self_exe = run.self_exe().to_string();
                         Box::pin(async move {
-                            let resp = pf_exec_full(
-                                run,
-                                &handle,
-                                vec![self_exe, "pipe-nonblock".into()],
-                                Some(10),
-                                None,
-                                vec![],
-                            )
-                            .await;
-                            let pass = matches!(
-                                &resp,
-                                Response::ExecResult { stdout, .. }
-                                    if stdout.contains(&*m)
-                            );
-                            super::TestOutcome::new(&a, pass, format!("{resp:?}"))
+                            let result = run
+                                .run_leaf(&leaf, &PIPE_NONBLOCK, PipeNonblockArgs {})
+                                .await;
+                            let pass = matches!(&result, Ok(out) if out.detail.contains(&*m));
+                            super::TestOutcome::new(&a, pass, format!("{result:?}"))
                         })
                     })
                 });
@@ -3428,27 +3917,23 @@ pub(crate) fn register_pipe_nonblock_tests(reg: &mut Registry<'_>) {
             )
             .timeout(60)
             .build(move |cx| {
-                let handle = cx.require(agent);
+                let leaf = cx.declare_ephemeral(
+                    agent,
+                    format!("PipeChildNonblock_{agent}_{suffix}"),
+                    SpawnKind::Fork {
+                        binary: "self",
+                        inherit_listen_ports: vec![],
+                    },
+                );
                 Box::new(move |run| {
                     let a = agent_s.clone();
                     let m = marker_s.clone();
-                    let self_exe = run.self_exe().to_string();
                     Box::pin(async move {
-                        let resp = pf_exec_full(
-                            run,
-                            &handle,
-                            vec![self_exe, "pipe-child-nonblock".into()],
-                            Some(10),
-                            None,
-                            vec![],
-                        )
-                        .await;
-                        let pass = matches!(
-                            &resp,
-                            Response::ExecResult { stdout, .. }
-                                if stdout.contains(&*m)
-                        );
-                        super::TestOutcome::new(&a, pass, format!("{resp:?}"))
+                        let result = run
+                            .run_leaf(&leaf, &PIPE_CHILD_NONBLOCK, PipeChildNonblockArgs {})
+                            .await;
+                        let pass = matches!(&result, Ok(out) if out.detail.contains(&*m));
+                        super::TestOutcome::new(&a, pass, format!("{result:?}"))
                     })
                 })
             });
@@ -3512,29 +3997,32 @@ pub(crate) fn register_epoll_socket_tests(reg: &mut Registry<'_>) {
                 let agent_s = agent.to_string();
                 let variant_s: String = variant.into();
                 reg.test("matrix", "epoll_socket", format!("EP.{variant}.accept.{agent}"))
-    .timeout(60)
-    .build(move |cx| {
-        let handle = cx.require(agent);
-        Box::new(move |run| {
-                        let a = agent_s.clone();
-                        let v = variant_s.clone();
-                        let self_exe = run.self_exe().to_string();
-                        Box::pin(async move {
-                            let resp = pf_exec_full(run, &handle, vec![
-                                            self_exe,
-                                            "epoll-socket".into(),
-                                            port.to_string(),
-                                            v,
-                                        ], Some(15), None, vec![]).await;
-                            let pass = matches!(
-                                &resp,
-                                Response::ExecResult { stdout, .. }
-                                    if stdout.contains("EPOLL_ACCEPT=") && !stdout.contains("TIMEOUT")
-                            );
-                            super::TestOutcome::new(&a, pass, format!("{resp:?}"))
+                    .timeout(60)
+                    .build(move |cx| {
+                        let leaf = cx.declare_ephemeral(
+                            agent,
+                            format!("EpollSocketAccept_{variant}_{agent}"),
+                            SpawnKind::Fork {
+                                binary: "self",
+                                inherit_listen_ports: vec![],
+                            },
+                        );
+                        Box::new(move |run| {
+                            let a = agent_s.clone();
+                            let v = variant_s.clone();
+                            Box::pin(async move {
+                                let result = run
+                                    .run_leaf(
+                                        &leaf,
+                                        &EPOLL_SOCKET,
+                                        EpollSocketArgs { port, variant: v },
+                                    )
+                                    .await;
+                                let pass = matches!(&result, Ok(out) if out.detail.contains("EPOLL_ACCEPT=") && !out.detail.contains("TIMEOUT"));
+                                super::TestOutcome::new(&a, pass, format!("{result:?}"))
+                            })
                         })
-        })
-    });
+                    });
             }
 
             // EP.{variant}.read.{agent}
@@ -3548,27 +4036,28 @@ pub(crate) fn register_epoll_socket_tests(reg: &mut Registry<'_>) {
                 )
                 .timeout(60)
                 .build(move |cx| {
-                    let handle = cx.require(agent);
+                    let leaf = cx.declare_ephemeral(
+                        agent,
+                        format!("EpollSocketRead_{variant}_{agent}"),
+                        SpawnKind::Fork {
+                            binary: "self",
+                            inherit_listen_ports: vec![],
+                        },
+                    );
                     Box::new(move |run| {
                         let a = agent_s.clone();
                         let v = variant_s.clone();
-                        let self_exe = run.self_exe().to_string();
                         Box::pin(async move {
-                            let resp = pf_exec_full(
-                                run,
-                                &handle,
-                                vec![self_exe, "epoll-socket".into(), port.to_string(), v],
-                                Some(15),
-                                None,
-                                vec![],
-                            )
-                            .await;
-                            let pass = matches!(
-                                &resp,
-                                Response::ExecResult { stdout, .. }
-                                    if stdout.contains("EPOLL_READ=OK")
-                            );
-                            super::TestOutcome::new(&a, pass, format!("{resp:?}"))
+                            let result = run
+                                .run_leaf(
+                                    &leaf,
+                                    &EPOLL_SOCKET,
+                                    EpollSocketArgs { port, variant: v },
+                                )
+                                .await;
+                            let pass =
+                                matches!(&result, Ok(out) if out.detail.contains("EPOLL_READ=OK"));
+                            super::TestOutcome::new(&a, pass, format!("{result:?}"))
                         })
                     })
                 });
