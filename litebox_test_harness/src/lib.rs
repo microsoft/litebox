@@ -7,8 +7,26 @@
 //! integration test (`tests/integration.rs`).
 
 pub mod coordinator;
+pub mod handlers;
+pub mod os;
 pub mod protocol;
 pub mod test_registry;
+
+use std::collections::HashMap;
+use std::os::fd::OwnedFd;
+use std::sync::{Mutex, OnceLock};
+
+/// Bridge between handler-side listener-bind code in the test harness
+/// and `Command::Fork { inherit_listen_ports }` processing in the
+/// agent. Handlers that bind a TCP listener and want it to be
+/// inheritable across `Fork` must dup the listener fd into this map
+/// keyed by port; the agent's `prepare_inherited_listeners` then dups
+/// the fd into the well-known inherited-fd slots (80..99) for the
+/// forked child.
+pub fn inherit_bridge() -> &'static Mutex<HashMap<u16, OwnedFd>> {
+    static BRIDGE: OnceLock<Mutex<HashMap<u16, OwnedFd>>> = OnceLock::new();
+    BRIDGE.get_or_init(|| Mutex::new(HashMap::new()))
+}
 
 // ─────────────────────────────────────────────────────────────────────
 // Binary-type axis

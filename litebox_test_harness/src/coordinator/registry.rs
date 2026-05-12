@@ -168,4 +168,44 @@ impl<'a> Registry<'a> {
             timeout_secs: 60,
         }
     }
+
+    /// Register a single-agent test that invokes one registered
+    /// handler with `()` args and applies `check` to the typed
+    /// result. Collapses the per-test closure boilerplate for the
+    /// common Class 2 pattern.
+    ///
+    /// `check` returns `Ok(detail)` to pass the test or
+    /// `Err(detail)` to fail it; the returned string is recorded in
+    /// the test outcome's detail.
+    pub fn single_agent_handler_test<O>(
+        &mut self,
+        suite: &'static str,
+        group: &'static str,
+        id: impl Into<String>,
+        agent: AgentName,
+        token: &'static crate::handlers::HandlerToken<(), O>,
+        check: fn(&O) -> Result<String, String>,
+    ) where
+        O: serde::de::DeserializeOwned + Send + 'static,
+    {
+        let id = id.into();
+        let label = agent.to_string();
+        self.test(suite, group, id).timeout(60).build(move |cx| {
+            let h = cx.require(agent);
+            let label = label.clone();
+            Box::new(move |run| {
+                Box::pin(async move {
+                    let result = run.send_named_typed(&h, token, ()).await;
+                    let (pass, detail) = match result {
+                        Ok(out) => match check(&out) {
+                            Ok(d) => (true, d),
+                            Err(d) => (false, d),
+                        },
+                        Err(e) => (false, e),
+                    };
+                    super::TestOutcome::new(&label, pass, detail)
+                })
+            })
+        });
+    }
 }

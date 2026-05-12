@@ -9,9 +9,16 @@
 //! non-PIE, then run PIE — does the PIE see clean output?").
 
 use super::agents::{AgentHandle, AgentName, EphemeralHandle, SpawnKind};
+use super::common::{BASH, BashArgs, EXEC_BIN, ExecBinArgs};
 use super::registry::Registry;
 use super::run_context::RunContext;
+use crate::handlers::{HandlerCtx, HandlerError, HandlerToken};
 use crate::protocol::{Command, Response};
+use crate::register_handler;
+use serde::{Deserialize, Serialize};
+use std::io::{Read, Write};
+use std::process::{Command as StdCommand, Stdio};
+use std::time::Duration;
 
 macro_rules! typed_test {
     ($reg:ident, $suite:expr, $group:expr, $id:expr, timeout = $timeout:expr, agents [$($handle:ident = $agent:expr),+ $(,)?], |$run:ident| $body:block) => {{
@@ -36,6 +43,453 @@ macro_rules! typed_test {
     }};
 }
 
+#[derive(Serialize, Deserialize)]
+struct ExecScriptArgs {
+    shell: String,
+    script: String,
+    timeout_secs: u64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct ExecScriptOut {
+    exit_code: i32,
+    stdout: String,
+    stderr: String,
+}
+
+#[derive(Serialize, Deserialize)]
+struct FsWriteArgs {
+    path: String,
+    data: String,
+}
+
+#[derive(Serialize, Deserialize)]
+struct FsReadArgs {
+    path: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct FsReadOut {
+    data: String,
+}
+
+#[derive(Serialize, Deserialize)]
+struct PathArgs {
+    path: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct UnixListenOut {
+    path: String,
+}
+
+#[derive(Serialize, Deserialize)]
+struct UnixConnectArgs {
+    path: String,
+    data: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct ConnectOut {
+    echo: String,
+}
+
+#[derive(Serialize, Deserialize)]
+struct TcpListenArgs {
+    port: u16,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct TcpListenOut {
+    port: u16,
+}
+
+#[derive(Serialize, Deserialize)]
+struct TcpConnectArgs {
+    addr: String,
+    data: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct SpawnRemoteOut {
+    detail: String,
+}
+
+const EXEC_SCRIPT: HandlerToken<ExecScriptArgs, ExecScriptOut> =
+    HandlerToken::new("special_cases.exec_script");
+const FS_WRITE: HandlerToken<FsWriteArgs, ()> = HandlerToken::new("special_cases.fs_write");
+const FS_READ: HandlerToken<FsReadArgs, FsReadOut> = HandlerToken::new("special_cases.fs_read");
+const UNIX_LISTEN: HandlerToken<PathArgs, UnixListenOut> =
+    HandlerToken::new("special_cases.unix_listen");
+const UNIX_CONNECT: HandlerToken<UnixConnectArgs, ConnectOut> =
+    HandlerToken::new("special_cases.unix_connect");
+const TCP_LISTEN: HandlerToken<TcpListenArgs, TcpListenOut> =
+    HandlerToken::new("special_cases.tcp_listen");
+const TCP_CONNECT: HandlerToken<TcpConnectArgs, ConnectOut> =
+    HandlerToken::new("special_cases.tcp_connect");
+const SPAWN_REMOTE: HandlerToken<(), SpawnRemoteOut> =
+    HandlerToken::new("special_cases.spawn_remote");
+
+async fn handle_exec_script(
+    args: ExecScriptArgs,
+    _ctx: &mut HandlerCtx<'_>,
+) -> Result<ExecScriptOut, HandlerError> {
+    let mut child = StdCommand::new(&args.shell)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin.write_all(args.script.as_bytes())?;
+    }
+    let output = wait_with_timeout(child, Duration::from_secs(args.timeout_secs))?;
+    Ok(ExecScriptOut {
+        exit_code: output.status.code().unwrap_or(-1),
+        stdout: String::from_utf8_lossy(&output.stdout).to_string(),
+        stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+    })
+}
+
+async fn handle_fs_write(args: FsWriteArgs, _ctx: &mut HandlerCtx<'_>) -> Result<(), HandlerError> {
+    if let Some(parent) = std::path::Path::new(&args.path).parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(&args.path, args.data)?;
+    Ok(())
+}
+
+async fn handle_fs_read(
+    args: FsReadArgs,
+    _ctx: &mut HandlerCtx<'_>,
+) -> Result<FsReadOut, HandlerError> {
+    Ok(FsReadOut {
+        data: std::fs::read_to_string(args.path)?,
+    })
+}
+
+async fn handle_unix_listen(
+    args: PathArgs,
+    _ctx: &mut HandlerCtx<'_>,
+) -> Result<UnixListenOut, HandlerError> {
+    let _ = std::fs::remove_file(&args.path);
+    let listener = std::os::unix::net::UnixListener::bind(&args.path)?;
+    let path = args.path.clone();
+    std::thread::spawn(move || {
+        if let Ok((mut stream, _)) = listener.accept() {
+            let mut buf = [0_u8; 4096];
+            if let Ok(n) = stream.read(&mut buf)
+                && n > 0
+            {
+                let _ = stream.write_all(&buf[..n]);
+            }
+        }
+    });
+    Ok(UnixListenOut { path })
+}
+
+async fn handle_unix_connect(
+    args: UnixConnectArgs,
+    _ctx: &mut HandlerCtx<'_>,
+) -> Result<ConnectOut, HandlerError> {
+    let mut stream = std::os::unix::net::UnixStream::connect(args.path)?;
+    stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+    stream.write_all(args.data.as_bytes())?;
+    stream.flush()?;
+    let mut buf = [0_u8; 4096];
+    let n = stream.read(&mut buf)?;
+    Ok(ConnectOut {
+        echo: String::from_utf8_lossy(&buf[..n]).to_string(),
+    })
+}
+
+async fn handle_tcp_listen(
+    args: TcpListenArgs,
+    _ctx: &mut HandlerCtx<'_>,
+) -> Result<TcpListenOut, HandlerError> {
+    let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, args.port))?;
+    let port = listener.local_addr()?.port();
+    std::thread::spawn(move || {
+        if let Ok((mut stream, _)) = listener.accept() {
+            let mut buf = [0_u8; 4096];
+            if let Ok(n) = stream.read(&mut buf)
+                && n > 0
+            {
+                let _ = stream.write_all(&buf[..n]);
+            }
+        }
+    });
+    Ok(TcpListenOut { port })
+}
+
+async fn handle_tcp_connect(
+    args: TcpConnectArgs,
+    _ctx: &mut HandlerCtx<'_>,
+) -> Result<ConnectOut, HandlerError> {
+    let mut stream = std::net::TcpStream::connect(&args.addr)?;
+    stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+    stream.write_all(args.data.as_bytes())?;
+    stream.flush()?;
+    let mut buf = vec![0_u8; args.data.len()];
+    stream.read_exact(&mut buf)?;
+    Ok(ConnectOut {
+        echo: String::from_utf8_lossy(&buf).to_string(),
+    })
+}
+
+async fn handle_spawn_remote(
+    _args: (),
+    _ctx: &mut HandlerCtx<'_>,
+) -> Result<SpawnRemoteOut, HandlerError> {
+    let remote_exe = crate::nonpie_binary();
+    let mut child = StdCommand::new(remote_exe)
+        .arg("agent")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn()?;
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin.write_all(b"{\"cmd\":\"exit\"}\n")?;
+    }
+    let status = child.wait()?;
+    if !status.success() {
+        return Err(HandlerError(format!("remote child exited with {status}")));
+    }
+    Ok(SpawnRemoteOut {
+        detail: "1 remote children spawned".to_string(),
+    })
+}
+
+fn wait_with_timeout(
+    mut child: std::process::Child,
+    timeout: Duration,
+) -> Result<std::process::Output, HandlerError> {
+    let start = std::time::Instant::now();
+    loop {
+        if child.try_wait()?.is_some() {
+            return child.wait_with_output().map_err(HandlerError::from);
+        }
+        if start.elapsed() >= timeout {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(HandlerError(format!(
+                "process timed out after {}s (likely deadlocked)",
+                timeout.as_secs()
+            )));
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+async fn forward_named_typed<A, O>(
+    run: &mut RunContext<'_>,
+    handle: &EphemeralHandle,
+    token: &HandlerToken<A, O>,
+    args: A,
+) -> Result<O, String>
+where
+    A: Serialize,
+    O: serde::de::DeserializeOwned,
+{
+    let args = serde_json::to_value(args).map_err(|e| format!("args serialize: {e}"))?;
+    let resp = run
+        .forward(
+            handle,
+            Command::Run {
+                handler: token.name().to_string(),
+                args,
+            },
+        )
+        .await;
+    match resp {
+        Response::Result {
+            ok: true,
+            data,
+            error: _,
+        } => serde_json::from_value(data).map_err(|e| format!("typed deserialize: {e}")),
+        Response::Result {
+            ok: false,
+            data: _,
+            error,
+        } => Err(error.unwrap_or_else(|| "handler failed".into())),
+        other => Err(format!("expected Result, got {other:?}")),
+    }
+}
+
+fn register_special_case_handlers() {
+    register_handler!(EXEC_SCRIPT, handle_exec_script);
+    register_handler!(FS_WRITE, handle_fs_write);
+    register_handler!(FS_READ, handle_fs_read);
+    register_handler!(UNIX_LISTEN, handle_unix_listen);
+    register_handler!(UNIX_CONNECT, handle_unix_connect);
+    register_handler!(TCP_LISTEN, handle_tcp_listen);
+    register_handler!(TCP_CONNECT, handle_tcp_connect);
+    register_handler!(SPAWN_REMOTE, handle_spawn_remote);
+}
+
+fn result_to_response<T>(result: Result<T, String>, ok: impl FnOnce(T) -> Response) -> Response {
+    match result {
+        Ok(out) => ok(out),
+        Err(error) => Response::Error { error },
+    }
+}
+
+async fn send_spawn_remote_response(run: &mut RunContext<'_>, handle: &AgentHandle) -> Response {
+    result_to_response(
+        run.send_named_typed(handle, &SPAWN_REMOTE, ()).await,
+        |out: SpawnRemoteOut| Response::Ok {
+            data: Some(out.detail),
+        },
+    )
+}
+
+async fn send_fs_write_response(
+    run: &mut RunContext<'_>,
+    handle: &AgentHandle,
+    path: String,
+    data: String,
+) -> Response {
+    result_to_response(
+        run.send_named_typed(handle, &FS_WRITE, FsWriteArgs { path, data })
+            .await,
+        |()| Response::Ok { data: None },
+    )
+}
+
+async fn forward_fs_write_response(
+    run: &mut RunContext<'_>,
+    handle: &EphemeralHandle,
+    path: String,
+    data: String,
+) -> Response {
+    result_to_response(
+        forward_named_typed(run, handle, &FS_WRITE, FsWriteArgs { path, data }).await,
+        |()| Response::Ok { data: None },
+    )
+}
+
+async fn send_fs_read_response(
+    run: &mut RunContext<'_>,
+    handle: &AgentHandle,
+    path: String,
+) -> Response {
+    result_to_response(
+        run.send_named_typed(handle, &FS_READ, FsReadArgs { path })
+            .await,
+        |out: FsReadOut| Response::Ok {
+            data: Some(out.data),
+        },
+    )
+}
+
+async fn forward_fs_read_response(
+    run: &mut RunContext<'_>,
+    handle: &EphemeralHandle,
+    path: String,
+) -> Response {
+    result_to_response(
+        forward_named_typed(run, handle, &FS_READ, FsReadArgs { path }).await,
+        |out: FsReadOut| Response::Ok {
+            data: Some(out.data),
+        },
+    )
+}
+
+async fn send_unix_listen_response(
+    run: &mut RunContext<'_>,
+    handle: &AgentHandle,
+    path: String,
+) -> Response {
+    result_to_response(
+        run.send_named_typed(handle, &UNIX_LISTEN, PathArgs { path })
+            .await,
+        |out: UnixListenOut| Response::UnixListening { path: out.path },
+    )
+}
+
+async fn forward_unix_listen_response(
+    run: &mut RunContext<'_>,
+    handle: &EphemeralHandle,
+    path: String,
+) -> Response {
+    result_to_response(
+        forward_named_typed(run, handle, &UNIX_LISTEN, PathArgs { path }).await,
+        |out: UnixListenOut| Response::UnixListening { path: out.path },
+    )
+}
+
+async fn send_unix_connect_response(
+    run: &mut RunContext<'_>,
+    handle: &AgentHandle,
+    path: String,
+    data: String,
+) -> Response {
+    result_to_response(
+        run.send_named_typed(handle, &UNIX_CONNECT, UnixConnectArgs { path, data })
+            .await,
+        |out: ConnectOut| Response::Connected { echo: out.echo },
+    )
+}
+
+async fn forward_unix_connect_response(
+    run: &mut RunContext<'_>,
+    handle: &EphemeralHandle,
+    path: String,
+    data: String,
+) -> Response {
+    result_to_response(
+        forward_named_typed(run, handle, &UNIX_CONNECT, UnixConnectArgs { path, data }).await,
+        |out: ConnectOut| Response::Connected { echo: out.echo },
+    )
+}
+
+async fn send_tcp_listen_response(
+    run: &mut RunContext<'_>,
+    handle: &AgentHandle,
+    port: u16,
+) -> Response {
+    result_to_response(
+        run.send_named_typed(handle, &TCP_LISTEN, TcpListenArgs { port })
+            .await,
+        |out: TcpListenOut| Response::Listening { port: out.port },
+    )
+}
+
+async fn forward_tcp_listen_response(
+    run: &mut RunContext<'_>,
+    handle: &EphemeralHandle,
+    port: u16,
+) -> Response {
+    result_to_response(
+        forward_named_typed(run, handle, &TCP_LISTEN, TcpListenArgs { port }).await,
+        |out: TcpListenOut| Response::Listening { port: out.port },
+    )
+}
+
+async fn send_tcp_connect_response(
+    run: &mut RunContext<'_>,
+    handle: &AgentHandle,
+    addr: String,
+    data: String,
+) -> Response {
+    result_to_response(
+        run.send_named_typed(handle, &TCP_CONNECT, TcpConnectArgs { addr, data })
+            .await,
+        |out: ConnectOut| Response::Connected { echo: out.echo },
+    )
+}
+
+async fn forward_tcp_connect_response(
+    run: &mut RunContext<'_>,
+    handle: &EphemeralHandle,
+    addr: String,
+    data: String,
+) -> Response {
+    result_to_response(
+        forward_named_typed(run, handle, &TCP_CONNECT, TcpConnectArgs { addr, data }).await,
+        |out: ConnectOut| Response::Connected { echo: out.echo },
+    )
+}
+
 /// Register netlink tests. Each test is self-contained: one exec + check.
 #[allow(clippy::too_many_lines)] // exhaustive registration / runner
 pub(super) fn register_netlink(reg: &mut Registry<'_>) {
@@ -55,16 +509,16 @@ pub(super) fn register_netlink(reg: &mut Registry<'_>) {
                     |run| {
                         let self_exe = run.self_exe().to_string();
                         let target = crate::binary_path(bt, &self_exe);
-                        let args = vec![target, subcmd, arg];
-                        let cmd = if timeout > 0 {
-                            super::exec_timeout(args, timeout)
-                        } else {
-                            super::exec(args)
+                        let args = ExecBinArgs {
+                            argv: vec![target, subcmd, arg],
+                            timeout_ms: (timeout > 0).then_some(timeout * 1000),
+                            stdin: None,
+                            env: vec![],
                         };
-                        let resp = run.send(&a, cmd).await;
+                        let resp = run.send_named_typed(&a, &EXEC_BIN, args).await;
                         let pass = matches!(
                             &resp,
-                            Response::ExecResult { exit_code: 0, stdout, .. } if check(stdout)
+                            Ok(out) if out.exit_code == 0 && check(out.stdout.as_str())
                         );
                         super::TestOutcome::new("A", pass, format!("{resp:?}"))
                     }
@@ -130,22 +584,25 @@ pub(super) fn register_netlink(reg: &mut Registry<'_>) {
         agents[a = AgentName::Dpg1],
         |run| {
             let resp = run
-            .send(
-                &a,
-                super::exec_timeout(
-                    vec![
-                        "/usr/local/bin/node".into(),
-                        "-e".into(),
-                        "try { const r = require('os').networkInterfaces(); console.log('NETIF_OK:' + Object.keys(r).length); } catch(e) { console.log('NETIF_ERR:' + e.code); }".into(),
-                    ],
-                    30,
-                ),
-            )
-            .await;
+                .send_named_typed(
+                    &a,
+                    &EXEC_BIN,
+                    ExecBinArgs {
+                        argv: vec![
+                            "/usr/local/bin/node".into(),
+                            "-e".into(),
+                            "try { const r = require('os').networkInterfaces(); console.log('NETIF_OK:' + Object.keys(r).length); } catch(e) { console.log('NETIF_ERR:' + e.code); }".into(),
+                        ],
+                        timeout_ms: Some(30 * 1000),
+                        stdin: None,
+                        env: vec![],
+                    },
+                )
+                .await;
             let pass = matches!(
                 &resp,
-                Response::ExecResult { exit_code: 0, stdout, .. }
-                    if stdout
+                Ok(out) if out.exit_code == 0
+                    && out.stdout
                         .lines()
                         .find_map(|l| l.strip_prefix("NETIF_OK:"))
                         .and_then(|s| s.trim().parse::<u32>().ok())
@@ -180,14 +637,20 @@ pub(super) fn register_net_ipv6(reg: &mut Registry<'_>) {
                     let self_exe = run.self_exe().to_string();
                     let target = crate::binary_path(bt, &self_exe);
                     let resp = run
-                        .send(
+                        .send_named_typed(
                             &a,
-                            super::exec_timeout(vec![target, "net-test".into(), sub], 10),
+                            &EXEC_BIN,
+                            ExecBinArgs {
+                                argv: vec![target, "net-test".into(), sub],
+                                timeout_ms: Some(10 * 1000),
+                                stdin: None,
+                                env: vec![],
+                            },
                         )
                         .await;
                     let pass = matches!(
                         &resp,
-                        Response::ExecResult { stdout, .. } if stdout.contains("_OK")
+                        Ok(out) if out.stdout.contains("_OK")
                     );
                     super::TestOutcome::new("A", pass, format!("{resp:?}"))
                 }
@@ -217,12 +680,21 @@ pub(super) fn register_terminal_ioctl(reg: &mut Registry<'_>) {
                         let self_exe = run.self_exe().to_string();
                         let target = crate::binary_path(bt, &self_exe);
                         let resp = run
-                            .send(
+                            .send_named_typed(
                                 &a,
-                                super::exec_timeout(
-                                    vec![target, "exit-test".into(), "term".into(), op, fd_str],
-                                    8,
-                                ),
+                                &EXEC_BIN,
+                                ExecBinArgs {
+                                    argv: vec![
+                                        target,
+                                        "exit-test".into(),
+                                        "term".into(),
+                                        op,
+                                        fd_str,
+                                    ],
+                                    timeout_ms: Some(8 * 1000),
+                                    stdin: None,
+                                    env: vec![],
+                                },
                             )
                             .await;
                         // tcgetattr / tcsetattr / TIOCGWINSZ on a pipe must
@@ -234,9 +706,9 @@ pub(super) fn register_terminal_ioctl(reg: &mut Registry<'_>) {
                         // and call process::exit(1).
                         let pass = matches!(
                             &resp,
-                            Response::ExecResult { exit_code: 0 | 1, stdout, .. }
-                                if stdout.contains("TERM_ERR")
-                                    && stdout.contains("errno=25")
+                            Ok(out) if matches!(out.exit_code, 0 | 1)
+                                && out.stdout.contains("TERM_ERR")
+                                && out.stdout.contains("errno=25")
                         );
                         super::TestOutcome::new("A", pass, format!("{resp:?}"))
                     }
@@ -257,12 +729,19 @@ pub(super) fn register_node_exit(reg: &mut Registry<'_>) {
         agents[a = AgentName::Dpg1],
         |run| {
             let resp = run
-                .send(
+                .send_named_typed(
                     &a,
-                    super::exec_timeout(vec!["/usr/local/bin/node".into(), "--version".into()], 10),
+                    &EXEC_BIN,
+                    ExecBinArgs {
+                        argv: vec!["/usr/local/bin/node".into(), "--version".into()],
+                        timeout_ms: Some(10 * 1000),
+                        stdin: None,
+                        env: vec![],
+                    },
                 )
                 .await;
-            let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout.starts_with('v'));
+            let pass =
+                matches!(&resp, Ok(out) if out.exit_code == 0 && out.stdout.starts_with('v'));
             super::TestOutcome::new("A", pass, format!("{resp:?}"))
         }
     );
@@ -276,19 +755,22 @@ pub(super) fn register_node_exit(reg: &mut Registry<'_>) {
         agents[a = AgentName::Dpg1],
         |run| {
             let resp = run
-                .send(
+                .send_named_typed(
                     &a,
-                    super::exec_timeout(
-                        vec![
+                    &EXEC_BIN,
+                    ExecBinArgs {
+                        argv: vec![
                             "/usr/local/bin/node".into(),
                             "-e".into(),
                             "process.exit(0)".into(),
                         ],
-                        10,
-                    ),
+                        timeout_ms: Some(10 * 1000),
+                        stdin: None,
+                        env: vec![],
+                    },
                 )
                 .await;
-            let pass = matches!(&resp, Response::ExecResult { exit_code: 0, .. });
+            let pass = matches!(&resp, Ok(out) if out.exit_code == 0);
             super::TestOutcome::new("A", pass, format!("{resp:?}"))
         }
     );
@@ -302,19 +784,22 @@ pub(super) fn register_node_exit(reg: &mut Registry<'_>) {
         agents[a = AgentName::Dpg1],
         |run| {
             let resp = run
-                .send(
+                .send_named_typed(
                     &a,
-                    super::exec_timeout(
-                        vec![
+                    &EXEC_BIN,
+                    ExecBinArgs {
+                        argv: vec![
                             "/usr/local/bin/node".into(),
                             "-e".into(),
                             "process.exit(42)".into(),
                         ],
-                        10,
-                    ),
+                        timeout_ms: Some(10 * 1000),
+                        stdin: None,
+                        env: vec![],
+                    },
                 )
                 .await;
-            let pass = matches!(&resp, Response::ExecResult { exit_code: 42, .. });
+            let pass = matches!(&resp, Ok(out) if out.exit_code == 42);
             super::TestOutcome::new("A", pass, format!("{resp:?}"))
         }
     );
@@ -328,19 +813,22 @@ pub(super) fn register_node_exit(reg: &mut Registry<'_>) {
         agents[a = AgentName::Dpg1],
         |run| {
             let resp = run
-                .send(
+                .send_named_typed(
                     &a,
-                    super::exec_timeout(
-                        vec![
+                    &EXEC_BIN,
+                    ExecBinArgs {
+                        argv: vec![
                             "/usr/local/bin/node".into(),
                             "-e".into(),
                             "console.log(\"NODE_EXIT_OK\")".into(),
                         ],
-                        10,
-                    ),
+                        timeout_ms: Some(10 * 1000),
+                        stdin: None,
+                        env: vec![],
+                    },
                 )
                 .await;
-            let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout.contains("NODE_EXIT_OK"));
+            let pass = matches!(&resp, Ok(out) if out.exit_code == 0 && out.stdout.contains("NODE_EXIT_OK"));
             super::TestOutcome::new("A", pass, format!("{resp:?}"))
         }
     );
@@ -376,15 +864,18 @@ pub(super) fn register_fs_io(reg: &mut Registry<'_>) {
                         let self_exe = run.self_exe().to_string();
                         let target = crate::binary_path(bt, &self_exe);
                         let resp = run
-                            .send(
+                            .send_named_typed(
                                 &a,
-                                super::exec_timeout(
-                                    vec![target, "fs-test".into(), "io".into(), op, path],
-                                    15,
-                                ),
+                                &EXEC_BIN,
+                                ExecBinArgs {
+                                    argv: vec![target, "fs-test".into(), "io".into(), op, path],
+                                    timeout_ms: Some(15 * 1000),
+                                    stdin: None,
+                                    env: vec![],
+                                },
                             )
                             .await;
-                        let pass = matches!(&resp, Response::ExecResult { stdout, .. } if stdout.contains("FS_OK"));
+                        let pass = matches!(&resp, Ok(out) if out.stdout.contains("FS_OK"));
                         super::TestOutcome::new("A", pass, format!("{resp:?}"))
                     }
                 );
@@ -413,15 +904,18 @@ pub(super) fn register_fs_io(reg: &mut Registry<'_>) {
                         let self_exe = run.self_exe().to_string();
                         let target = crate::binary_path(bt, &self_exe);
                         let resp = run
-                            .send(
+                            .send_named_typed(
                                 &a,
-                                super::exec_timeout(
-                                    vec![target, "fs-test".into(), mode, bin, path],
-                                    30,
-                                ),
+                                &EXEC_BIN,
+                                ExecBinArgs {
+                                    argv: vec![target, "fs-test".into(), mode, bin, path],
+                                    timeout_ms: Some(30 * 1000),
+                                    stdin: None,
+                                    env: vec![],
+                                },
                             )
                             .await;
-                        let pass = matches!(&resp, Response::ExecResult { stdout, .. } if stdout.contains("FS_OK"));
+                        let pass = matches!(&resp, Ok(out) if out.stdout.contains("FS_OK"));
                         super::TestOutcome::new("A", pass, format!("{resp:?}"))
                     }
                 );
@@ -464,15 +958,18 @@ pub(super) fn register_capture_pipe(reg: &mut Registry<'_>) {
                             let self_exe = run.self_exe().to_string();
                             let target = crate::binary_path(bt, &self_exe);
                             let resp = run
-                                .send(
+                                .send_named_typed(
                                     &handle,
-                                    super::exec_timeout(
-                                        vec![target, "capture-pipe".into(), cmd_type, shell],
-                                        10,
-                                    ),
+                                    &EXEC_BIN,
+                                    ExecBinArgs {
+                                        argv: vec![target, "capture-pipe".into(), cmd_type, shell],
+                                        timeout_ms: Some(10 * 1000),
+                                        stdin: None,
+                                        env: vec![],
+                                    },
                                 )
                                 .await;
-                            let pass = matches!(&resp, Response::ExecResult { stdout, .. } if stdout.contains("CP_OK"));
+                            let pass = matches!(&resp, Ok(out) if out.stdout.contains("CP_OK"));
                             super::TestOutcome::new(&agent_label, pass, format!("{resp:?}"))
                         }
                     );
@@ -484,6 +981,7 @@ pub(super) fn register_capture_pipe(reg: &mut Registry<'_>) {
 
 /// Register stdin-piped script tests.
 pub(super) fn register_stdin_script(reg: &mut Registry<'_>) {
+    register_special_case_handlers();
     const SCRIPTS: &[(&str, &str, &str)] = &[
         (
             "cmd_subst",
@@ -546,20 +1044,19 @@ pub(super) fn register_stdin_script(reg: &mut Registry<'_>) {
                     timeout = 60,
                     agents[handle = agent_name],
                     |run| {
-                        let resp = run
-                            .send(
+                        let result = run
+                            .send_named_typed(
                                 &handle,
-                                Command::Exec {
-                                    args: vec![shell],
-                                    timeout_secs: Some(10),
-                                    stdin: Some(script),
-                                    background: false,
-                                    env: vec![],
+                                &EXEC_SCRIPT,
+                                ExecScriptArgs {
+                                    shell,
+                                    script,
+                                    timeout_secs: 10,
                                 },
                             )
                             .await;
-                        let pass = matches!(&resp, Response::ExecResult { stdout, .. } if stdout.contains(&*expected));
-                        super::TestOutcome::new(&agent_label, pass, format!("{resp:?}"))
+                        let pass = matches!(&result, Ok(out) if out.stdout.contains(&*expected));
+                        super::TestOutcome::new(&agent_label, pass, format!("{result:?}"))
                     }
                 );
             }
@@ -583,37 +1080,17 @@ enum XsiExpectation {
 }
 
 impl XsiExpectation {
-    fn matches(self, resp: &Response) -> bool {
-        match (self, resp) {
-            (
-                Self::Exact { exit_code, stdout },
-                Response::ExecResult {
-                    exit_code: actual,
-                    stdout: actual_stdout,
-                    stderr,
-                },
-            ) => *actual == exit_code && actual_stdout == stdout && stderr.is_empty(),
-            (
-                Self::NonZero { stdout },
-                Response::ExecResult {
-                    exit_code,
-                    stdout: actual_stdout,
-                    ..
-                },
-            ) => *exit_code != 0 && actual_stdout == stdout,
-            (
-                Self::Contains { exit_code, parts },
-                Response::ExecResult {
-                    exit_code: actual,
-                    stdout,
-                    stderr,
-                },
-            ) => {
-                *actual == exit_code
-                    && stderr.is_empty()
-                    && parts.iter().all(|part| stdout.contains(part))
+    fn matches_exec(self, out: &ExecScriptOut) -> bool {
+        match self {
+            Self::Exact { exit_code, stdout } => {
+                out.exit_code == exit_code && out.stdout == stdout && out.stderr.is_empty()
             }
-            _ => false,
+            Self::NonZero { stdout } => out.exit_code != 0 && out.stdout == stdout,
+            Self::Contains { exit_code, parts } => {
+                out.exit_code == exit_code
+                    && out.stderr.is_empty()
+                    && parts.iter().all(|part| out.stdout.contains(part))
+            }
         }
     }
 }
@@ -656,23 +1133,24 @@ const XSI_SCRIPTS: &[XsiScript] = &[
     },
 ];
 
-fn xsi_exec(script: &'static str) -> Command {
-    Command::Exec {
-        args: vec!["/bin/sh".into()],
-        timeout_secs: Some(10),
-        stdin: Some(script.into()),
-        background: false,
-        env: vec![],
-    }
-}
-
 async fn run_xsi_on_agent(
     run: &mut RunContext<'_>,
     handle: &AgentHandle,
     script: &'static XsiScript,
 ) -> (bool, String) {
-    let resp = run.send(handle, xsi_exec(script.script)).await;
-    (script.expectation.matches(&resp), format!("{resp:?}"))
+    let result = run
+        .send_named_typed(
+            handle,
+            &EXEC_SCRIPT,
+            ExecScriptArgs {
+                shell: "/bin/sh".into(),
+                script: script.script.into(),
+                timeout_secs: 10,
+            },
+        )
+        .await;
+    let pass = matches!(&result, Ok(out) if script.expectation.matches_exec(out));
+    (pass, format!("{result:?}"))
 }
 
 async fn run_xsi_on_ephemeral(
@@ -680,12 +1158,24 @@ async fn run_xsi_on_ephemeral(
     handle: &EphemeralHandle,
     script: &'static XsiScript,
 ) -> (bool, String) {
-    let resp = run.forward(handle, xsi_exec(script.script)).await;
-    (script.expectation.matches(&resp), format!("{resp:?}"))
+    let result = forward_named_typed(
+        run,
+        handle,
+        &EXEC_SCRIPT,
+        ExecScriptArgs {
+            shell: "/bin/sh".into(),
+            script: script.script.into(),
+            timeout_secs: 10,
+        },
+    )
+    .await;
+    let pass = matches!(&result, Ok(out) if script.expectation.matches_exec(out));
+    (pass, format!("{result:?}"))
 }
 
 /// Register protocol-level stdin script tests for `sh < script` workflows.
 pub(super) fn register_xsi_stdin_script(reg: &mut Registry<'_>) {
+    register_special_case_handlers();
     for script in XSI_SCRIPTS {
         let id = format!("XSI.stdin_script.{}", script.name);
         reg.test("shell", "xsi_stdin_script", id)
@@ -763,12 +1253,18 @@ pub(crate) fn register_unix_socket(reg: &mut Registry<'_>) {
                     let self_exe = run.self_exe().to_string();
                     let target = crate::binary_path(bt, &self_exe);
                     let resp = run
-                        .send(
+                        .send_named_typed(
                             &a,
-                            super::exec_timeout(vec![target, "unix-socket-test".into(), sub], 10),
+                            &EXEC_BIN,
+                            ExecBinArgs {
+                                argv: vec![target, "unix-socket-test".into(), sub],
+                                timeout_ms: Some(10 * 1000),
+                                stdin: None,
+                                env: vec![],
+                            },
                         )
                         .await;
-                    let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout.contains(&*expected));
+                    let pass = matches!(&resp, Ok(out) if out.exit_code == 0 && out.stdout.contains(&*expected));
                     super::TestOutcome::new("A", pass, format!("{resp:?}"))
                 }
             );
@@ -791,15 +1287,22 @@ pub(crate) fn register_unix_socket(reg: &mut Registry<'_>) {
                     let self_exe = run.self_exe().to_string();
                     let target = crate::binary_path(bt, &self_exe);
                     let resp = run
-                        .send(
+                        .send_named_typed(
                             &handle,
-                            super::exec_timeout(
-                                vec![target, "unix-socket-test".into(), "cross-process".into()],
-                                15,
-                            ),
+                            &EXEC_BIN,
+                            ExecBinArgs {
+                                argv: vec![
+                                    target,
+                                    "unix-socket-test".into(),
+                                    "cross-process".into(),
+                                ],
+                                timeout_ms: Some(15 * 1000),
+                                stdin: None,
+                                env: vec![],
+                            },
                         )
                         .await;
-                    let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout.contains("US1_CROSS_PROCESS_OK"));
+                    let pass = matches!(&resp, Ok(out) if out.exit_code == 0 && out.stdout.contains("US1_CROSS_PROCESS_OK"));
                     super::TestOutcome::new(&agent_label, pass, format!("{resp:?}"))
                 }
             );
@@ -837,19 +1340,22 @@ pub(crate) fn register_unix_socket(reg: &mut Registry<'_>) {
                     let self_exe = run.self_exe().to_string();
                     let target = crate::binary_path(bt, &self_exe);
                     let resp = run
-                        .send(
+                        .send_named_typed(
                             &handle,
-                            super::exec_timeout(
-                                vec![
+                            &EXEC_BIN,
+                            ExecBinArgs {
+                                argv: vec![
                                     target,
                                     "unix-socket-test".into(),
                                     "socketpair-fork-write".into(),
                                 ],
-                                15,
-                            ),
+                                timeout_ms: Some(15 * 1000),
+                                stdin: None,
+                                env: vec![],
+                            },
                         )
                         .await;
-                    let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout.contains("US6_SOCKETPAIR_FORK_OK"));
+                    let pass = matches!(&resp, Ok(out) if out.exit_code == 0 && out.stdout.contains("US6_SOCKETPAIR_FORK_OK"));
                     super::TestOutcome::new(&agent_label, pass, format!("{resp:?}"))
                 }
             );
@@ -868,19 +1374,22 @@ pub(crate) fn register_unix_socket(reg: &mut Registry<'_>) {
                     let self_exe = run.self_exe().to_string();
                     let target = crate::binary_path(bt, &self_exe);
                     let resp = run
-                        .send(
+                        .send_named_typed(
                             &handle,
-                            super::exec_timeout(
-                                vec![
+                            &EXEC_BIN,
+                            ExecBinArgs {
+                                argv: vec![
                                     target,
                                     "unix-socket-test".into(),
                                     "socketpair-fork-read".into(),
                                 ],
-                                15,
-                            ),
+                                timeout_ms: Some(15 * 1000),
+                                stdin: None,
+                                env: vec![],
+                            },
                         )
                         .await;
-                    let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout.contains("US6R_SOCKETPAIR_FORK_READ_OK"));
+                    let pass = matches!(&resp, Ok(out) if out.exit_code == 0 && out.stdout.contains("US6R_SOCKETPAIR_FORK_READ_OK"));
                     super::TestOutcome::new(&agent_label, pass, format!("{resp:?}"))
                 }
             );
@@ -918,15 +1427,22 @@ pub(crate) fn register_unix_socket(reg: &mut Registry<'_>) {
                     let self_exe = run.self_exe().to_string();
                     let target = crate::binary_path(bt, &self_exe);
                     let resp = run
-                        .send(
+                        .send_named_typed(
                             &handle,
-                            super::exec_timeout(
-                                vec![target, "unix-socket-test".into(), "socketpair-exec".into()],
-                                30,
-                            ),
+                            &EXEC_BIN,
+                            ExecBinArgs {
+                                argv: vec![
+                                    target,
+                                    "unix-socket-test".into(),
+                                    "socketpair-exec".into(),
+                                ],
+                                timeout_ms: Some(30 * 1000),
+                                stdin: None,
+                                env: vec![],
+                            },
                         )
                         .await;
-                    let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout.contains("US6E_SOCKETPAIR_EXEC_OK"));
+                    let pass = matches!(&resp, Ok(out) if out.exit_code == 0 && out.stdout.contains("US6E_SOCKETPAIR_EXEC_OK"));
                     super::TestOutcome::new(&agent_label, pass, format!("{resp:?}"))
                 }
             );
@@ -937,6 +1453,7 @@ pub(crate) fn register_unix_socket(reg: &mut Registry<'_>) {
 // Register cross-worker tests.
 #[allow(clippy::too_many_lines)] // exhaustive registration / runner
 pub(crate) fn register_cross_worker(reg: &mut Registry<'_>) {
+    register_special_case_handlers();
     typed_test!(
         reg,
         "xworker",
@@ -945,14 +1462,7 @@ pub(crate) fn register_cross_worker(reg: &mut Registry<'_>) {
         timeout = 60,
         agents[a = AgentName::Dpg1],
         |run| {
-            let resp = run
-                .send(
-                    &a,
-                    Command::SpawnRemote {
-                        children: vec!["R".to_string()],
-                    },
-                )
-                .await;
+            let resp = send_spawn_remote_response(run, &a).await;
             let pass = super::ok_data_contains(&resp, "remote children spawned");
             super::TestOutcome::new("A", pass, format!("{resp:?}"))
         }
@@ -968,15 +1478,13 @@ pub(crate) fn register_cross_worker(reg: &mut Registry<'_>) {
         ephemerals[r = (AgentName::Dpg1, "R", SpawnKind::NonPie)],
         |run| {
             let _ = run.spawn_ephemeral(&r).await;
-            let resp = run
-                .forward(
-                    &r,
-                    Command::FsWrite {
-                        path: "/tmp/xw1.txt".to_string(),
-                        data: "REMOTE_DATA".to_string(),
-                    },
-                )
-                .await;
+            let resp = forward_fs_write_response(
+                run,
+                &r,
+                "/tmp/xw1.txt".to_string(),
+                "REMOTE_DATA".to_string(),
+            )
+            .await;
             let pass = super::ok_without_data(&resp);
             super::TestOutcome::new("A", pass, format!("{resp:?}"))
         }
@@ -992,15 +1500,13 @@ pub(crate) fn register_cross_worker(reg: &mut Registry<'_>) {
         ephemerals[r = (AgentName::Dpg1, "R", SpawnKind::NonPie)],
         |run| {
             let _ = run.spawn_ephemeral(&r).await;
-            let setup_resp = run
-                .forward(
-                    &r,
-                    Command::FsWrite {
-                        path: "/tmp/xw1.txt".to_string(),
-                        data: "REMOTE_DATA".to_string(),
-                    },
-                )
-                .await;
+            let setup_resp = forward_fs_write_response(
+                run,
+                &r,
+                "/tmp/xw1.txt".to_string(),
+                "REMOTE_DATA".to_string(),
+            )
+            .await;
             if !super::ok_without_data(&setup_resp) {
                 return super::TestOutcome::new(
                     "A",
@@ -1008,14 +1514,7 @@ pub(crate) fn register_cross_worker(reg: &mut Registry<'_>) {
                     format!("write setup failed: {setup_resp:?}"),
                 );
             }
-            let resp = run
-                .send(
-                    &a,
-                    Command::FsRead {
-                        path: "/tmp/xw1.txt".to_string(),
-                    },
-                )
-                .await;
+            let resp = send_fs_read_response(run, &a, "/tmp/xw1.txt".to_string()).await;
             let pass = matches!(&resp, Response::Ok { data: Some(d), .. } if d == "REMOTE_DATA");
             super::TestOutcome::new("A", pass, format!("{resp:?}"))
         }
@@ -1029,15 +1528,13 @@ pub(crate) fn register_cross_worker(reg: &mut Registry<'_>) {
         timeout = 60,
         agents[a = AgentName::Dpg1],
         |run| {
-            let resp = run
-                .send(
-                    &a,
-                    Command::FsWrite {
-                        path: "/tmp/xw2.txt".to_string(),
-                        data: "LOCAL_DATA".to_string(),
-                    },
-                )
-                .await;
+            let resp = send_fs_write_response(
+                run,
+                &a,
+                "/tmp/xw2.txt".to_string(),
+                "LOCAL_DATA".to_string(),
+            )
+            .await;
             let pass = super::ok_without_data(&resp);
             super::TestOutcome::new("A", pass, format!("{resp:?}"))
         }
@@ -1053,15 +1550,13 @@ pub(crate) fn register_cross_worker(reg: &mut Registry<'_>) {
         ephemerals[r = (AgentName::Dpg1, "R", SpawnKind::NonPie)],
         |run| {
             let _ = run.spawn_ephemeral(&r).await;
-            let setup_resp = run
-                .send(
-                    &a,
-                    Command::FsWrite {
-                        path: "/tmp/xw2.txt".to_string(),
-                        data: "LOCAL_DATA".to_string(),
-                    },
-                )
-                .await;
+            let setup_resp = send_fs_write_response(
+                run,
+                &a,
+                "/tmp/xw2.txt".to_string(),
+                "LOCAL_DATA".to_string(),
+            )
+            .await;
             if !super::ok_without_data(&setup_resp) {
                 return super::TestOutcome::new(
                     "A",
@@ -1069,14 +1564,7 @@ pub(crate) fn register_cross_worker(reg: &mut Registry<'_>) {
                     format!("write setup failed: {setup_resp:?}"),
                 );
             }
-            let resp = run
-                .forward(
-                    &r,
-                    Command::FsRead {
-                        path: "/tmp/xw2.txt".to_string(),
-                    },
-                )
-                .await;
+            let resp = forward_fs_read_response(run, &r, "/tmp/xw2.txt".to_string()).await;
             let pass = matches!(&resp, Response::Ok { data: Some(d), .. } if d == "LOCAL_DATA");
             super::TestOutcome::new("A", pass, format!("{resp:?}"))
         }
@@ -1092,14 +1580,7 @@ pub(crate) fn register_cross_worker(reg: &mut Registry<'_>) {
         ephemerals[r = (AgentName::Dpg1, "R", SpawnKind::NonPie)],
         |run| {
             let _ = run.spawn_ephemeral(&r).await;
-            let resp = run
-                .forward(
-                    &r,
-                    Command::UnixListen {
-                        path: "/tmp/xw3.sock".to_string(),
-                    },
-                )
-                .await;
+            let resp = forward_unix_listen_response(run, &r, "/tmp/xw3.sock".to_string()).await;
             let pass = super::expect_unix_listening_path(&resp, "/tmp/xw3.sock").is_ok();
             super::TestOutcome::new("A", pass, format!("{resp:?}"))
         }
@@ -1115,14 +1596,8 @@ pub(crate) fn register_cross_worker(reg: &mut Registry<'_>) {
         ephemerals[r = (AgentName::Dpg1, "R", SpawnKind::NonPie)],
         |run| {
             let _ = run.spawn_ephemeral(&r).await;
-            let listen_resp = run
-                .forward(
-                    &r,
-                    Command::UnixListen {
-                        path: "/tmp/xw3c.sock".to_string(),
-                    },
-                )
-                .await;
+            let listen_resp =
+                forward_unix_listen_response(run, &r, "/tmp/xw3c.sock".to_string()).await;
             if super::expect_unix_listening_path(&listen_resp, "/tmp/xw3c.sock").is_err() {
                 return super::TestOutcome::new(
                     "A",
@@ -1130,15 +1605,13 @@ pub(crate) fn register_cross_worker(reg: &mut Registry<'_>) {
                     format!("listen setup failed: {listen_resp:?}"),
                 );
             }
-            let resp = run
-                .send(
-                    &a,
-                    Command::UnixConnect {
-                        path: "/tmp/xw3c.sock".to_string(),
-                        data: "XW_HELLO".to_string(),
-                    },
-                )
-                .await;
+            let resp = send_unix_connect_response(
+                run,
+                &a,
+                "/tmp/xw3c.sock".to_string(),
+                "XW_HELLO".to_string(),
+            )
+            .await;
             let pass = matches!(&resp, Response::Connected { echo } if echo.contains("XW_HELLO"));
             super::TestOutcome::new("A", pass, format!("{resp:?}"))
         }
@@ -1152,14 +1625,7 @@ pub(crate) fn register_cross_worker(reg: &mut Registry<'_>) {
         timeout = 60,
         agents[a = AgentName::Dpg1],
         |run| {
-            let resp = run
-                .send(
-                    &a,
-                    Command::UnixListen {
-                        path: "/tmp/xw4.sock".to_string(),
-                    },
-                )
-                .await;
+            let resp = send_unix_listen_response(run, &a, "/tmp/xw4.sock".to_string()).await;
             let pass = super::expect_unix_listening_path(&resp, "/tmp/xw4.sock").is_ok();
             super::TestOutcome::new("A", pass, format!("{resp:?}"))
         }
@@ -1175,14 +1641,8 @@ pub(crate) fn register_cross_worker(reg: &mut Registry<'_>) {
         ephemerals[r = (AgentName::Dpg1, "R", SpawnKind::NonPie)],
         |run| {
             let _ = run.spawn_ephemeral(&r).await;
-            let listen_resp = run
-                .send(
-                    &a,
-                    Command::UnixListen {
-                        path: "/tmp/xw4c.sock".to_string(),
-                    },
-                )
-                .await;
+            let listen_resp =
+                send_unix_listen_response(run, &a, "/tmp/xw4c.sock".to_string()).await;
             if super::expect_unix_listening_path(&listen_resp, "/tmp/xw4c.sock").is_err() {
                 return super::TestOutcome::new(
                     "A",
@@ -1190,15 +1650,13 @@ pub(crate) fn register_cross_worker(reg: &mut Registry<'_>) {
                     format!("listen setup failed: {listen_resp:?}"),
                 );
             }
-            let resp = run
-                .forward(
-                    &r,
-                    Command::UnixConnect {
-                        path: "/tmp/xw4c.sock".to_string(),
-                        data: "XW_HELLO2".to_string(),
-                    },
-                )
-                .await;
+            let resp = forward_unix_connect_response(
+                run,
+                &r,
+                "/tmp/xw4c.sock".to_string(),
+                "XW_HELLO2".to_string(),
+            )
+            .await;
             let pass = matches!(&resp, Response::Connected { echo } if echo.contains("XW_HELLO2"));
             super::TestOutcome::new("A", pass, format!("{resp:?}"))
         }
@@ -1214,15 +1672,7 @@ pub(crate) fn register_cross_worker(reg: &mut Registry<'_>) {
         ephemerals[r = (AgentName::Dpg1, "R", SpawnKind::NonPie)],
         |run| {
             let _ = run.spawn_ephemeral(&r).await;
-            let resp = run
-                .forward(
-                    &r,
-                    Command::NetListen {
-                        port: 0,
-                        pre_bind_options: vec![],
-                    },
-                )
-                .await;
+            let resp = forward_tcp_listen_response(run, &r, 0).await;
             let pass = super::expect_listening_port(&resp, 0).is_ok();
             super::TestOutcome::new("A", pass, format!("{resp:?}"))
         }
@@ -1238,15 +1688,7 @@ pub(crate) fn register_cross_worker(reg: &mut Registry<'_>) {
         ephemerals[r = (AgentName::Dpg1, "R", SpawnKind::NonPie)],
         |run| {
             let _ = run.spawn_ephemeral(&r).await;
-            let listen_resp = run
-                .forward(
-                    &r,
-                    Command::NetListen {
-                        port: 0,
-                        pre_bind_options: vec![],
-                    },
-                )
-                .await;
+            let listen_resp = forward_tcp_listen_response(run, &r, 0).await;
             let port = match super::expect_listening_port(&listen_resp, 0) {
                 Ok(port) => port,
                 Err(e) => {
@@ -1257,18 +1699,15 @@ pub(crate) fn register_cross_worker(reg: &mut Registry<'_>) {
                     );
                 }
             };
-            let resp = run
-                .send(
-                    &a,
-                    Command::NetConnect {
-                        addr: format!("127.0.0.1:{port}"),
-                        data: "XW_TCP_HELLO".to_string(),
-                    },
-                )
-                .await;
+            let resp = send_tcp_connect_response(
+                run,
+                &a,
+                format!("127.0.0.1:{port}"),
+                "XW_TCP_HELLO".to_string(),
+            )
+            .await;
             let pass =
                 matches!(&resp, Response::Connected { echo } if echo.contains("XW_TCP_HELLO"));
-            let _ = run.forward(&r, Command::NetUnlisten { port }).await;
             super::TestOutcome::new("A", pass, format!("{resp:?}"))
         }
     );
@@ -1281,15 +1720,7 @@ pub(crate) fn register_cross_worker(reg: &mut Registry<'_>) {
         timeout = 60,
         agents[a = AgentName::Dpg1],
         |run| {
-            let resp = run
-                .send(
-                    &a,
-                    Command::NetListen {
-                        port: 0,
-                        pre_bind_options: vec![],
-                    },
-                )
-                .await;
+            let resp = send_tcp_listen_response(run, &a, 0).await;
             let pass = super::expect_listening_port(&resp, 0).is_ok();
             super::TestOutcome::new("A", pass, format!("{resp:?}"))
         }
@@ -1305,15 +1736,7 @@ pub(crate) fn register_cross_worker(reg: &mut Registry<'_>) {
         ephemerals[r = (AgentName::Dpg1, "R", SpawnKind::NonPie)],
         |run| {
             let _ = run.spawn_ephemeral(&r).await;
-            let listen_resp = run
-                .send(
-                    &a,
-                    Command::NetListen {
-                        port: 0,
-                        pre_bind_options: vec![],
-                    },
-                )
-                .await;
+            let listen_resp = send_tcp_listen_response(run, &a, 0).await;
             let port = match super::expect_listening_port(&listen_resp, 0) {
                 Ok(port) => port,
                 Err(e) => {
@@ -1324,18 +1747,15 @@ pub(crate) fn register_cross_worker(reg: &mut Registry<'_>) {
                     );
                 }
             };
-            let resp = run
-                .forward(
-                    &r,
-                    Command::NetConnect {
-                        addr: format!("127.0.0.1:{port}"),
-                        data: "XW_TCP_HELLO2".to_string(),
-                    },
-                )
-                .await;
+            let resp = forward_tcp_connect_response(
+                run,
+                &r,
+                format!("127.0.0.1:{port}"),
+                "XW_TCP_HELLO2".to_string(),
+            )
+            .await;
             let pass =
                 matches!(&resp, Response::Connected { echo } if echo.contains("XW_TCP_HELLO2"));
-            let _ = run.send(&a, Command::NetUnlisten { port }).await;
             super::TestOutcome::new("A", pass, format!("{resp:?}"))
         }
     );
@@ -1348,27 +1768,24 @@ pub(crate) fn register_cross_worker(reg: &mut Registry<'_>) {
         timeout = 60,
         agents[d4 = AgentName::Dpg1Dng],
         |run| {
-            let resp = run
-                .send(
-                    &d4,
-                    Command::UnixListen {
-                        path: "/tmp/xw7.sock".to_string(),
-                    },
-                )
-                .await;
+            let resp = send_unix_listen_response(run, &d4, "/tmp/xw7.sock".to_string()).await;
             let pass = super::expect_unix_listening_path(&resp, "/tmp/xw7.sock").is_ok();
             super::TestOutcome::new(AgentName::Dpg1Dng.name(), pass, format!("{resp:?}"))
         }
     );
 
     typed_test!(reg, "xworker", "cross_worker", "XW7.dpg1_dpg1_dpg1_connect", timeout = 60, agents [d4 = AgentName::Dpg1Dng, d3 = AgentName::Dpg1Dpg1Dpg1], |run| {
-        let listen_resp = run.send(&d4, Command::UnixListen { path: "/tmp/xw7c.sock".to_string() }).await;
+        let listen_resp = send_unix_listen_response(run, &d4, "/tmp/xw7c.sock".to_string()).await;
         if super::expect_unix_listening_path(&listen_resp, "/tmp/xw7c.sock").is_err() {
             return super::TestOutcome::new(AgentName::Dpg1Dpg1Dpg1.name(), false, format!("listen setup failed: {listen_resp:?}"));
         }
-        let resp = run
-            .send(&d3, Command::UnixConnect { path: "/tmp/xw7c.sock".to_string(), data: "XW7_D3_TO_D4".to_string() })
-            .await;
+        let resp = send_unix_connect_response(
+            run,
+            &d3,
+            "/tmp/xw7c.sock".to_string(),
+            "XW7_D3_TO_D4".to_string(),
+        )
+        .await;
         let pass = matches!(&resp, Response::Connected { echo } if echo.contains("XW7_D3_TO_D4"));
         super::TestOutcome::new(AgentName::Dpg1Dpg1Dpg1.name(), pass, format!("{resp:?}"))
     });
@@ -1381,27 +1798,24 @@ pub(crate) fn register_cross_worker(reg: &mut Registry<'_>) {
         timeout = 60,
         agents[d3 = AgentName::Dpg1Dpg1Dpg1],
         |run| {
-            let resp = run
-                .send(
-                    &d3,
-                    Command::UnixListen {
-                        path: "/tmp/xw8.sock".to_string(),
-                    },
-                )
-                .await;
+            let resp = send_unix_listen_response(run, &d3, "/tmp/xw8.sock".to_string()).await;
             let pass = super::expect_unix_listening_path(&resp, "/tmp/xw8.sock").is_ok();
             super::TestOutcome::new(AgentName::Dpg1Dpg1Dpg1.name(), pass, format!("{resp:?}"))
         }
     );
 
     typed_test!(reg, "xworker", "cross_worker", "XW8.dpg1_dng_connect", timeout = 60, agents [d3 = AgentName::Dpg1Dpg1Dpg1, d4 = AgentName::Dpg1Dng], |run| {
-        let listen_resp = run.send(&d3, Command::UnixListen { path: "/tmp/xw8c.sock".to_string() }).await;
+        let listen_resp = send_unix_listen_response(run, &d3, "/tmp/xw8c.sock".to_string()).await;
         if super::expect_unix_listening_path(&listen_resp, "/tmp/xw8c.sock").is_err() {
             return super::TestOutcome::new(AgentName::Dpg1Dng.name(), false, format!("listen setup failed: {listen_resp:?}"));
         }
-        let resp = run
-            .send(&d4, Command::UnixConnect { path: "/tmp/xw8c.sock".to_string(), data: "XW8_D4_TO_D3".to_string() })
-            .await;
+        let resp = send_unix_connect_response(
+            run,
+            &d4,
+            "/tmp/xw8c.sock".to_string(),
+            "XW8_D4_TO_D3".to_string(),
+        )
+        .await;
         let pass = matches!(&resp, Response::Connected { echo } if echo.contains("XW8_D4_TO_D3"));
         super::TestOutcome::new(AgentName::Dpg1Dng.name(), pass, format!("{resp:?}"))
     });
@@ -1414,27 +1828,24 @@ pub(crate) fn register_cross_worker(reg: &mut Registry<'_>) {
         timeout = 60,
         agents[d4 = AgentName::Dpg1Dng],
         |run| {
-            let resp = run
-                .send(
-                    &d4,
-                    Command::UnixListen {
-                        path: "/tmp/xw9.sock".to_string(),
-                    },
-                )
-                .await;
+            let resp = send_unix_listen_response(run, &d4, "/tmp/xw9.sock".to_string()).await;
             let pass = super::expect_unix_listening_path(&resp, "/tmp/xw9.sock").is_ok();
             super::TestOutcome::new(AgentName::Dpg1Dng.name(), pass, format!("{resp:?}"))
         }
     );
 
     typed_test!(reg, "xworker", "cross_worker", "XW9.dpg1_dpg1_connect", timeout = 60, agents [d4 = AgentName::Dpg1Dng, aa = AgentName::Dpg1Dpg1], |run| {
-        let listen_resp = run.send(&d4, Command::UnixListen { path: "/tmp/xw9c.sock".to_string() }).await;
+        let listen_resp = send_unix_listen_response(run, &d4, "/tmp/xw9c.sock".to_string()).await;
         if super::expect_unix_listening_path(&listen_resp, "/tmp/xw9c.sock").is_err() {
             return super::TestOutcome::new(AgentName::Dpg1Dpg1.name(), false, format!("listen setup failed: {listen_resp:?}"));
         }
-        let resp = run
-            .send(&aa, Command::UnixConnect { path: "/tmp/xw9c.sock".to_string(), data: "XW9_AA_TO_D4".to_string() })
-            .await;
+        let resp = send_unix_connect_response(
+            run,
+            &aa,
+            "/tmp/xw9c.sock".to_string(),
+            "XW9_AA_TO_D4".to_string(),
+        )
+        .await;
         let pass = matches!(&resp, Response::Connected { echo } if echo.contains("XW9_AA_TO_D4"));
         super::TestOutcome::new(AgentName::Dpg1Dpg1.name(), pass, format!("{resp:?}"))
     });
@@ -1447,31 +1858,26 @@ pub(crate) fn register_cross_worker(reg: &mut Registry<'_>) {
         timeout = 60,
         agents[d3 = AgentName::Dpg1Dpg1Dpg1],
         |run| {
-            let resp = run
-                .send(
-                    &d3,
-                    Command::NetListen {
-                        port: 0,
-                        pre_bind_options: vec![],
-                    },
-                )
-                .await;
+            let resp = send_tcp_listen_response(run, &d3, 0).await;
             let pass = super::expect_listening_port(&resp, 0).is_ok();
             super::TestOutcome::new(AgentName::Dpg1Dpg1Dpg1.name(), pass, format!("{resp:?}"))
         }
     );
 
     typed_test!(reg, "xworker", "cross_worker", "XW10.dpg2_tcp_connect", timeout = 60, agents [d3 = AgentName::Dpg1Dpg1Dpg1, b = AgentName::Dpg2], |run| {
-        let listen_resp = run.send(&d3, Command::NetListen { port: 0, pre_bind_options: vec![] }).await;
+        let listen_resp = send_tcp_listen_response(run, &d3, 0).await;
         let port = match super::expect_listening_port(&listen_resp, 0) {
             Ok(port) => port,
             Err(e) => return super::TestOutcome::new("B", false, format!("listen setup failed: {e}; resp={listen_resp:?}")),
         };
-        let resp = run
-            .send(&b, Command::NetConnect { addr: format!("127.0.0.1:{port}"), data: "XW10_CROSS_SUBTREE".to_string() })
-            .await;
+        let resp = send_tcp_connect_response(
+            run,
+            &b,
+            format!("127.0.0.1:{port}"),
+            "XW10_CROSS_SUBTREE".to_string(),
+        )
+        .await;
         let pass = matches!(&resp, Response::Connected { echo } if echo.contains("XW10_CROSS_SUBTREE"));
-        let _ = run.send(&d3, Command::NetUnlisten { port }).await;
         super::TestOutcome::new("B", pass, format!("{resp:?}"))
     });
 
@@ -1483,15 +1889,7 @@ pub(crate) fn register_cross_worker(reg: &mut Registry<'_>) {
         timeout = 60,
         agents[d3 = AgentName::Dpg1Dpg1Dpg1],
         |run| {
-            let resp = run
-                .send(
-                    &d3,
-                    Command::NetListen {
-                        port: 0,
-                        pre_bind_options: vec![],
-                    },
-                )
-                .await;
+            let resp = send_tcp_listen_response(run, &d3, 0).await;
             let pass = super::expect_listening_port(&resp, 0).is_ok();
             super::TestOutcome::new(AgentName::Dpg1Dpg1Dpg1.name(), pass, format!("{resp:?}"))
         }
@@ -1521,17 +1919,20 @@ pub(crate) fn register_cross_worker(reg: &mut Registry<'_>) {
         agents[d3 = AgentName::Dpg1Dpg1Dpg1, b = AgentName::Dpg2],
         ephemerals[r2 = (AgentName::Dpg2, "R2", SpawnKind::NonPie)],
         |run| {
-            let listen_resp = run.send(&d3, Command::NetListen { port: 0, pre_bind_options: vec![] }).await;
+            let listen_resp = send_tcp_listen_response(run, &d3, 0).await;
             let port = match super::expect_listening_port(&listen_resp, 0) {
                 Ok(port) => port,
                 Err(e) => return super::TestOutcome::new("R2", false, format!("listen setup failed: {e}; resp={listen_resp:?}")),
             };
             let _ = run.spawn_ephemeral(&r2).await;
-            let resp = run
-                .forward(&r2, Command::NetConnect { addr: format!("127.0.0.1:{port}"), data: "XW11_LATE_SPAWN".to_string() })
-                .await;
+            let resp = forward_tcp_connect_response(
+                run,
+                &r2,
+                format!("127.0.0.1:{port}"),
+                "XW11_LATE_SPAWN".to_string(),
+            )
+            .await;
             let pass = matches!(&resp, Response::Connected { echo } if echo.contains("XW11_LATE_SPAWN"));
-            let _ = run.send(&d3, Command::NetUnlisten { port }).await;
             super::TestOutcome::new("R2", pass, format!("{resp:?}"))
         }
     );
@@ -1570,15 +1971,18 @@ pub(crate) fn register_pipe_eof(reg: &mut Registry<'_>) {
                     let self_exe = run.self_exe().to_string();
                     let target = crate::binary_path(bt, &self_exe);
                     let resp = run
-                        .send(
+                        .send_named_typed(
                             &handle,
-                            super::exec_timeout(
-                                vec![target, "pipe-test".into(), "eof-fork".into()],
-                                20,
-                            ),
+                            &EXEC_BIN,
+                            ExecBinArgs {
+                                argv: vec![target, "pipe-test".into(), "eof-fork".into()],
+                                timeout_ms: Some(20 * 1000),
+                                stdin: None,
+                                env: vec![],
+                            },
                         )
                         .await;
-                    let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout.contains("P1_EOF_OK"));
+                    let pass = matches!(&resp, Ok(out) if out.exit_code == 0 && out.stdout.contains("P1_EOF_OK"));
                     super::TestOutcome::new(&agent_label, pass, format!("{resp:?}"))
                 }
             );
@@ -1601,15 +2005,18 @@ pub(crate) fn register_pipe_eof(reg: &mut Registry<'_>) {
                     let self_exe = run.self_exe().to_string();
                     let target = crate::binary_path(bt, &self_exe);
                     let resp = run
-                        .send(
+                        .send_named_typed(
                             &handle,
-                            super::exec_timeout(
-                                vec![self_exe, "pipe-test".into(), "eof-exec".into(), target],
-                                20,
-                            ),
+                            &EXEC_BIN,
+                            ExecBinArgs {
+                                argv: vec![self_exe, "pipe-test".into(), "eof-exec".into(), target],
+                                timeout_ms: Some(20 * 1000),
+                                stdin: None,
+                                env: vec![],
+                            },
                         )
                         .await;
-                    let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout.contains("P2_EOF_OK"));
+                    let pass = matches!(&resp, Ok(out) if out.exit_code == 0 && out.stdout.contains("P2_EOF_OK"));
                     super::TestOutcome::new(&agent_label, pass, format!("{resp:?}"))
                 }
             );
@@ -1630,9 +2037,18 @@ pub(crate) fn register_contamination_sequence(reg: &mut Registry<'_>) {
         |run| {
             let self_exe = run.self_exe().to_string();
             let resp = run
-                .send(&a, super::exec(vec![self_exe, "echo-test".into()]))
+                .send_named_typed(
+                    &a,
+                    &EXEC_BIN,
+                    ExecBinArgs {
+                        argv: vec![self_exe, "echo-test".into()],
+                        timeout_ms: None,
+                        stdin: None,
+                        env: vec![],
+                    },
+                )
                 .await;
-            let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout.trim() == "ECHO_TEST_OK");
+            let pass = matches!(&resp, Ok(out) if out.exit_code == 0 && out.stdout.trim() == "ECHO_TEST_OK");
             super::TestOutcome::new("A", pass, format!("{resp:?}"))
         }
     );
@@ -1647,12 +2063,18 @@ pub(crate) fn register_contamination_sequence(reg: &mut Registry<'_>) {
         |run| {
             let self_exe = run.self_exe().to_string();
             let resp = run
-                .send(
+                .send_named_typed(
                     &a,
-                    super::exec(vec![self_exe, "exit-with".into(), "0".into()]),
+                    &EXEC_BIN,
+                    ExecBinArgs {
+                        argv: vec![self_exe, "exit-with".into(), "0".into()],
+                        timeout_ms: None,
+                        stdin: None,
+                        env: vec![],
+                    },
                 )
                 .await;
-            let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout.is_empty());
+            let pass = matches!(&resp, Ok(out) if out.exit_code == 0 && out.stdout.is_empty());
             super::TestOutcome::new("A", pass, format!("{resp:?}"))
         }
     );
@@ -1667,9 +2089,18 @@ pub(crate) fn register_contamination_sequence(reg: &mut Registry<'_>) {
         |run| {
             let nonpie = crate::nonpie_binary();
             let resp = run
-                .send(&a, super::exec(vec![nonpie, "echo-test".into()]))
+                .send_named_typed(
+                    &a,
+                    &EXEC_BIN,
+                    ExecBinArgs {
+                        argv: vec![nonpie, "echo-test".into()],
+                        timeout_ms: None,
+                        stdin: None,
+                        env: vec![],
+                    },
+                )
                 .await;
-            let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout.contains("ECHO_TEST_OK"));
+            let pass = matches!(&resp, Ok(out) if out.exit_code == 0 && out.stdout.contains("ECHO_TEST_OK"));
             super::TestOutcome::new("A", pass, format!("{resp:?}"))
         }
     );
@@ -1684,9 +2115,18 @@ pub(crate) fn register_contamination_sequence(reg: &mut Registry<'_>) {
         |run| {
             let self_exe = run.self_exe().to_string();
             let resp = run
-                .send(&a, super::exec(vec![self_exe, "echo-test".into()]))
+                .send_named_typed(
+                    &a,
+                    &EXEC_BIN,
+                    ExecBinArgs {
+                        argv: vec![self_exe, "echo-test".into()],
+                        timeout_ms: None,
+                        stdin: None,
+                        env: vec![],
+                    },
+                )
                 .await;
-            let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout.trim() == "ECHO_TEST_OK");
+            let pass = matches!(&resp, Ok(out) if out.exit_code == 0 && out.stdout.trim() == "ECHO_TEST_OK");
             super::TestOutcome::new("A", pass, format!("{resp:?}"))
         }
     );
@@ -1701,9 +2141,18 @@ pub(crate) fn register_contamination_sequence(reg: &mut Registry<'_>) {
         |run| {
             let nonpie = crate::nonpie_binary();
             let resp = run
-                .send(&b, super::exec(vec![nonpie, "echo-test".into()]))
+                .send_named_typed(
+                    &b,
+                    &EXEC_BIN,
+                    ExecBinArgs {
+                        argv: vec![nonpie, "echo-test".into()],
+                        timeout_ms: None,
+                        stdin: None,
+                        env: vec![],
+                    },
+                )
                 .await;
-            let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout.contains("ECHO_TEST_OK"));
+            let pass = matches!(&resp, Ok(out) if out.exit_code == 0 && out.stdout.contains("ECHO_TEST_OK"));
             super::TestOutcome::new("B", pass, format!("{resp:?}"))
         }
     );
@@ -1718,9 +2167,18 @@ pub(crate) fn register_contamination_sequence(reg: &mut Registry<'_>) {
         |run| {
             let self_exe = run.self_exe().to_string();
             let resp = run
-                .send(&b, super::exec(vec![self_exe, "echo-test".into()]))
+                .send_named_typed(
+                    &b,
+                    &EXEC_BIN,
+                    ExecBinArgs {
+                        argv: vec![self_exe, "echo-test".into()],
+                        timeout_ms: None,
+                        stdin: None,
+                        env: vec![],
+                    },
+                )
                 .await;
-            let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout.trim() == "ECHO_TEST_OK");
+            let pass = matches!(&resp, Ok(out) if out.exit_code == 0 && out.stdout.trim() == "ECHO_TEST_OK");
             super::TestOutcome::new("B", pass, format!("{resp:?}"))
         }
     );
@@ -1735,12 +2193,18 @@ pub(crate) fn register_contamination_sequence(reg: &mut Registry<'_>) {
         |run| {
             let self_exe = run.self_exe().to_string();
             let resp = run
-                .send(
+                .send_named_typed(
                     &b,
-                    super::exec(vec![self_exe, "exit-with".into(), "0".into()]),
+                    &EXEC_BIN,
+                    ExecBinArgs {
+                        argv: vec![self_exe, "exit-with".into(), "0".into()],
+                        timeout_ms: None,
+                        stdin: None,
+                        env: vec![],
+                    },
                 )
                 .await;
-            let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout.is_empty());
+            let pass = matches!(&resp, Ok(out) if out.exit_code == 0 && out.stdout.is_empty());
             super::TestOutcome::new("B", pass, format!("{resp:?}"))
         }
     );
@@ -1755,9 +2219,18 @@ pub(crate) fn register_contamination_sequence(reg: &mut Registry<'_>) {
         |run| {
             let self_exe = run.self_exe().to_string();
             let resp = run
-                .send(&b, super::exec(vec![self_exe, "echo-test".into()]))
+                .send_named_typed(
+                    &b,
+                    &EXEC_BIN,
+                    ExecBinArgs {
+                        argv: vec![self_exe, "echo-test".into()],
+                        timeout_ms: None,
+                        stdin: None,
+                        env: vec![],
+                    },
+                )
                 .await;
-            let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout.trim() == "ECHO_TEST_OK");
+            let pass = matches!(&resp, Ok(out) if out.exit_code == 0 && out.stdout.trim() == "ECHO_TEST_OK");
             super::TestOutcome::new("B", pass, format!("{resp:?}"))
         }
     );
@@ -1773,9 +2246,18 @@ pub(crate) fn register_contamination_sequence(reg: &mut Registry<'_>) {
             let self_exe = run.self_exe().to_string();
             for i in 0..30 {
                 let resp = run
-                    .send(&ab, super::exec(vec![self_exe.clone(), "echo-test".into()]))
+                    .send_named_typed(
+                        &ab,
+                        &EXEC_BIN,
+                        ExecBinArgs {
+                            argv: vec![self_exe.clone(), "echo-test".into()],
+                            timeout_ms: None,
+                            stdin: None,
+                            env: vec![],
+                        },
+                    )
                     .await;
-                let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout.trim() == "ECHO_TEST_OK");
+                let pass = matches!(&resp, Ok(out) if out.exit_code == 0 && out.stdout.trim() == "ECHO_TEST_OK");
                 if !pass {
                     return super::TestOutcome::new(
                         "AB",
@@ -1798,9 +2280,18 @@ pub(crate) fn register_contamination_sequence(reg: &mut Registry<'_>) {
         |run| {
             let nonpie = crate::nonpie_binary();
             let resp = run
-                .send(&ab, super::exec(vec![nonpie, "echo-test".into()]))
+                .send_named_typed(
+                    &ab,
+                    &EXEC_BIN,
+                    ExecBinArgs {
+                        argv: vec![nonpie, "echo-test".into()],
+                        timeout_ms: None,
+                        stdin: None,
+                        env: vec![],
+                    },
+                )
                 .await;
-            let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout.contains("ECHO_TEST_OK"));
+            let pass = matches!(&resp, Ok(out) if out.exit_code == 0 && out.stdout.contains("ECHO_TEST_OK"));
             super::TestOutcome::new("AB", pass, format!("{resp:?}"))
         }
     );
@@ -1815,9 +2306,18 @@ pub(crate) fn register_contamination_sequence(reg: &mut Registry<'_>) {
         |run| {
             let self_exe = run.self_exe().to_string();
             let resp = run
-                .send(&aab, super::exec(vec![self_exe, "echo-test".into()]))
+                .send_named_typed(
+                    &aab,
+                    &EXEC_BIN,
+                    ExecBinArgs {
+                        argv: vec![self_exe, "echo-test".into()],
+                        timeout_ms: None,
+                        stdin: None,
+                        env: vec![],
+                    },
+                )
                 .await;
-            let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout.trim() == "ECHO_TEST_OK");
+            let pass = matches!(&resp, Ok(out) if out.exit_code == 0 && out.stdout.trim() == "ECHO_TEST_OK");
             super::TestOutcome::new("AAB", pass, format!("{resp:?}"))
         }
     );
@@ -1832,9 +2332,18 @@ pub(crate) fn register_contamination_sequence(reg: &mut Registry<'_>) {
         |run| {
             let nonpie = crate::nonpie_binary();
             let resp = run
-                .send(&aab, super::exec(vec![nonpie, "echo-test".into()]))
+                .send_named_typed(
+                    &aab,
+                    &EXEC_BIN,
+                    ExecBinArgs {
+                        argv: vec![nonpie, "echo-test".into()],
+                        timeout_ms: None,
+                        stdin: None,
+                        env: vec![],
+                    },
+                )
                 .await;
-            let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout.contains("ECHO_TEST_OK"));
+            let pass = matches!(&resp, Ok(out) if out.exit_code == 0 && out.stdout.contains("ECHO_TEST_OK"));
             super::TestOutcome::new("AAB", pass, format!("{resp:?}"))
         }
     );
@@ -1849,9 +2358,18 @@ pub(crate) fn register_contamination_sequence(reg: &mut Registry<'_>) {
         |run| {
             let nonpie = crate::nonpie_binary();
             let resp = run
-                .send(&b, super::exec(vec![nonpie, "echo-test".into()]))
+                .send_named_typed(
+                    &b,
+                    &EXEC_BIN,
+                    ExecBinArgs {
+                        argv: vec![nonpie, "echo-test".into()],
+                        timeout_ms: None,
+                        stdin: None,
+                        env: vec![],
+                    },
+                )
                 .await;
-            let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout.contains("ECHO_TEST_OK"));
+            let pass = matches!(&resp, Ok(out) if out.exit_code == 0 && out.stdout.contains("ECHO_TEST_OK"));
             super::TestOutcome::new("B", pass, format!("{resp:?}"))
         }
     );
@@ -1867,20 +2385,29 @@ pub(crate) fn register_contamination_sequence(reg: &mut Registry<'_>) {
             let nonpie = crate::nonpie_binary();
             for _ in 0..20 {
                 let _ = run
-                    .send(
+                    .send_named_typed(
                         &b,
-                        super::exec(vec![
-                            "bash".into(),
-                            "-c".into(),
-                            "echo churn >/dev/null".into(),
-                        ]),
+                        &BASH,
+                        BashArgs {
+                            cmd: "echo churn >/dev/null".into(),
+                            timeout_ms: None,
+                        },
                     )
                     .await;
             }
             let resp = run
-                .send(&b, super::exec(vec![nonpie, "echo-test".into()]))
+                .send_named_typed(
+                    &b,
+                    &EXEC_BIN,
+                    ExecBinArgs {
+                        argv: vec![nonpie, "echo-test".into()],
+                        timeout_ms: None,
+                        stdin: None,
+                        env: vec![],
+                    },
+                )
                 .await;
-            let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout.contains("ECHO_TEST_OK"));
+            let pass = matches!(&resp, Ok(out) if out.exit_code == 0 && out.stdout.contains("ECHO_TEST_OK"));
             super::TestOutcome::new("B", pass, format!("{resp:?}"))
         }
     );
@@ -1898,15 +2425,33 @@ pub(crate) fn register_contamination_sequence(reg: &mut Registry<'_>) {
             let mut results: Vec<(String, bool)> = Vec::new();
             for _ in 0..2 {
                 let resp = run
-                    .send(&b, super::exec(vec![self_exe.clone(), "echo-test".into()]))
+                    .send_named_typed(
+                        &b,
+                        &EXEC_BIN,
+                        ExecBinArgs {
+                            argv: vec![self_exe.clone(), "echo-test".into()],
+                            timeout_ms: None,
+                            stdin: None,
+                            env: vec![],
+                        },
+                    )
                     .await;
-                let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout.trim() == "ECHO_TEST_OK");
+                let pass = matches!(&resp, Ok(out) if out.exit_code == 0 && out.stdout.trim() == "ECHO_TEST_OK");
                 results.push((format!("{resp:?}"), pass));
 
                 let resp = run
-                    .send(&b, super::exec(vec![nonpie.clone(), "echo-test".into()]))
+                    .send_named_typed(
+                        &b,
+                        &EXEC_BIN,
+                        ExecBinArgs {
+                            argv: vec![nonpie.clone(), "echo-test".into()],
+                            timeout_ms: None,
+                            stdin: None,
+                            env: vec![],
+                        },
+                    )
                     .await;
-                let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout.contains("ECHO_TEST_OK"));
+                let pass = matches!(&resp, Ok(out) if out.exit_code == 0 && out.stdout.contains("ECHO_TEST_OK"));
                 results.push((format!("{resp:?}"), pass));
             }
             let all_pass = results.iter().all(|(_, p)| *p);
@@ -1931,9 +2476,18 @@ pub(crate) fn register_contamination_sequence(reg: &mut Registry<'_>) {
             let nonpie = crate::nonpie_binary();
             for i in 0..5 {
                 let resp = run
-                    .send(&b, super::exec(vec![nonpie.clone(), "echo-test".into()]))
+                    .send_named_typed(
+                        &b,
+                        &EXEC_BIN,
+                        ExecBinArgs {
+                            argv: vec![nonpie.clone(), "echo-test".into()],
+                            timeout_ms: None,
+                            stdin: None,
+                            env: vec![],
+                        },
+                    )
                     .await;
-                let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout.contains("ECHO_TEST_OK"));
+                let pass = matches!(&resp, Ok(out) if out.exit_code == 0 && out.stdout.contains("ECHO_TEST_OK"));
                 if !pass {
                     return super::TestOutcome::new(
                         "B",

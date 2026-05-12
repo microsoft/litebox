@@ -18,6 +18,7 @@
 //!   - Subcommand vs bash: protocol Exec(bash -c ...) and direct fork
 
 use super::agents::AgentName;
+use super::common;
 use super::registry::Registry;
 
 /// Agents to run concurrent fork tests on.
@@ -95,31 +96,30 @@ pub(crate) fn register_concurrent_fork_pipeline(reg: &mut Registry<'_>) {
                 let handle = cx.require(agent);
                 Box::new(move |run| {
                     Box::pin(async move {
-                        let resp = run
-                            .send(
+                        let result = run
+                            .send_named_typed(
                                 &handle,
-                                super::exec_timeout(
-                                    vec!["bash".into(), "-c".into(), cmd.into()],
-                                    15,
-                                ),
+                                &common::BASH,
+                                common::BashArgs {
+                                    cmd: cmd.into(),
+                                    timeout_ms: Some(15_000),
+                                },
                             )
                             .await;
-                        let pass = match &resp {
-                            crate::protocol::Response::ExecResult {
-                                exit_code: 0,
-                                stdout,
-                                ..
-                            } => stdout.trim().contains(expected),
-                            _ => false,
-                        };
-                        super::TestOutcome::new(&agent_label, pass, format!("{resp:?}"))
+                        let pass = matches!(
+                            &result,
+                            Ok(out) if out.exit_code == 0 && out.stdout.trim().contains(expected)
+                        );
+                        super::TestOutcome::new(&agent_label, pass, format!("{result:?}"))
                     })
                 })
             });
         }
     }
 
-    // xworker agents
+    // xworker agents — single pipeline + sequential control on Dpg1Dng.
+    #[allow(clippy::single_element_loop)]
+    // loop preserved for parity with legacy + future expansion
     for &agent in &[AgentName::Dpg1Dng] {
         let agent_label = agent.to_string();
         reg.test(
@@ -132,29 +132,24 @@ pub(crate) fn register_concurrent_fork_pipeline(reg: &mut Registry<'_>) {
             let handle = cx.require(agent);
             Box::new(move |run| {
                 Box::pin(async move {
-                    let resp = run
-                        .send(
+                    let result = run
+                        .send_named_typed(
                             &handle,
-                            super::exec_timeout(
-                                vec![
-                                    "bash".into(),
-                                    "-c".into(),
-                                    "echo 'pipe4_vscode_ok: test' | cat | grep pipe4 | sed 's/test/pass/'"
-                                        .into(),
-                                ],
-                                15,
-                            ),
+                            &common::BASH,
+                            common::BashArgs {
+                                cmd: "echo 'pipe4_vscode_ok: test' | cat | grep pipe4 \
+                                      | sed 's/test/pass/'"
+                                    .into(),
+                                timeout_ms: Some(15_000),
+                            },
                         )
                         .await;
-                    let pass = match &resp {
-                        crate::protocol::Response::ExecResult {
-                            exit_code: 0,
-                            stdout,
-                            ..
-                        } => stdout.trim().contains("pipe4_vscode_ok: pass"),
-                        _ => false,
-                    };
-                    super::TestOutcome::new(&agent_label, pass, format!("{resp:?}"))
+                    let pass = matches!(
+                        &result,
+                        Ok(out) if out.exit_code == 0
+                            && out.stdout.trim().contains("pipe4_vscode_ok: pass")
+                    );
+                    super::TestOutcome::new(&agent_label, pass, format!("{result:?}"))
                 })
             })
         });
@@ -170,29 +165,23 @@ pub(crate) fn register_concurrent_fork_pipeline(reg: &mut Registry<'_>) {
             let handle = cx.require(agent);
             Box::new(move |run| {
                 Box::pin(async move {
-                    let resp = run
-                        .send(
+                    let result = run
+                        .send_named_typed(
                             &handle,
-                            super::exec_timeout(
-                                vec![
-                                    "bash".into(),
-                                    "-c".into(),
-                                    "echo seq_a > /tmp/cf_test && cat /tmp/cf_test && rm /tmp/cf_test"
-                                        .into(),
-                                ],
-                                15,
-                            ),
+                            &common::BASH,
+                            common::BashArgs {
+                                cmd: "echo seq_a > /tmp/cf_test && cat /tmp/cf_test \
+                                      && rm /tmp/cf_test"
+                                    .into(),
+                                timeout_ms: Some(15_000),
+                            },
                         )
                         .await;
-                    let pass = match &resp {
-                        crate::protocol::Response::ExecResult {
-                            exit_code: 0,
-                            stdout,
-                            ..
-                        } => stdout.trim().contains("seq_a"),
-                        _ => false,
-                    };
-                    super::TestOutcome::new(&agent_label, pass, format!("{resp:?}"))
+                    let pass = matches!(
+                        &result,
+                        Ok(out) if out.exit_code == 0 && out.stdout.trim().contains("seq_a")
+                    );
+                    super::TestOutcome::new(&agent_label, pass, format!("{result:?}"))
                 })
             })
         });
@@ -225,30 +214,26 @@ pub(crate) fn register_concurrent_exec(reg: &mut Registry<'_>) {
                                 .join(" ");
                             let full_cmd = format!("{cmd} wait");
                             let resp = run
-                                .send(
+                                .send_named_typed(
                                     &handle,
-                                    super::exec_timeout(
-                                        vec!["bash".into(), "-c".into(), full_cmd],
-                                        15,
-                                    ),
+                                    &common::BASH,
+                                    common::BashArgs {
+                                        cmd: full_cmd,
+                                        timeout_ms: Some(15_000),
+                                    },
                                 )
                                 .await;
-                            let pass = match &resp {
-                                crate::protocol::Response::ExecResult {
-                                    exit_code: 0,
-                                    stdout,
-                                    ..
-                                } => stdout.matches("ECHO_TEST_OK").count() == count,
-                                _ => false,
-                            };
+                            let pass = matches!(
+                                &resp,
+                                Ok(out) if out.exit_code == 0
+                                    && out.stdout.matches("ECHO_TEST_OK").count() == count
+                            );
                             let detail = match &resp {
-                                crate::protocol::Response::ExecResult { stdout, .. } => {
-                                    format!(
-                                        "got {}/{count} ECHO_TEST_OK",
-                                        stdout.matches("ECHO_TEST_OK").count()
-                                    )
-                                }
-                                _ => format!("{resp:?}"),
+                                Ok(out) => format!(
+                                    "got {}/{count} ECHO_TEST_OK",
+                                    out.stdout.matches("ECHO_TEST_OK").count()
+                                ),
+                                Err(_) => format!("{resp:?}"),
                             };
                             super::TestOutcome::new(&agent_label, pass, detail)
                         })
@@ -296,21 +281,21 @@ pub(crate) fn register_vscode_install_pipeline(reg: &mut Registry<'_>) {
                 Box::new(move |run| {
                     Box::pin(async move {
                         let resp = run
-                            .send(
+                            .send_named_typed(
                                 &handle,
-                                super::exec_timeout(vec!["bash".into(), "-c".into(), cmd_s], 15),
+                                &common::BASH,
+                                common::BashArgs {
+                                    cmd: cmd_s,
+                                    timeout_ms: Some(15_000),
+                                },
                             )
                             .await;
                         let pass = match &resp {
-                            crate::protocol::Response::ExecResult {
-                                exit_code: 0,
-                                stdout,
-                                ..
-                            } => {
+                            Ok(out) if out.exit_code == 0 => {
                                 if expected_s.is_empty() {
-                                    !stdout.trim().is_empty()
+                                    !out.stdout.trim().is_empty()
                                 } else {
-                                    stdout.contains(&*expected_s)
+                                    out.stdout.contains(&*expected_s)
                                 }
                             }
                             _ => false,
@@ -344,18 +329,19 @@ pub(crate) fn register_concurrent_fs_rwlock(reg: &mut Registry<'_>) {
                             let self_exe = run.self_exe().to_string();
                             let target = crate::binary_path(bt, &self_exe);
                             let resp = run
-                                .send(
+                                .send_named_typed(
                                     &handle,
-                                    super::exec_timeout(
-                                        vec![target, "concurrent-fs".into(), n.to_string()],
-                                        20,
-                                    ),
+                                    &common::BASH,
+                                    common::BashArgs {
+                                        cmd: format!("{target} concurrent-fs {n}"),
+                                        timeout_ms: Some(15_000),
+                                    },
                                 )
                                 .await;
                             let pass = matches!(
                                 &resp,
-                                crate::protocol::Response::ExecResult { exit_code: 0, stdout, .. }
-                                    if stdout.contains("CONCURRENT_FS_OK")
+                                Ok(out) if out.exit_code == 0
+                                    && out.stdout.contains("CONCURRENT_FS_OK")
                             );
                             super::TestOutcome::new(&agent_label, pass, format!("{resp:?}"))
                         })
@@ -384,18 +370,19 @@ pub(crate) fn register_concurrent_fs_rwlock(reg: &mut Registry<'_>) {
                             let self_exe = run.self_exe().to_string();
                             let target = crate::binary_path(bt, &self_exe);
                             let resp = run
-                                .send(
+                                .send_named_typed(
                                     &handle,
-                                    super::exec_timeout(
-                                        vec![target, "concurrent-fs-multi".into(), n.to_string()],
-                                        20,
-                                    ),
+                                    &common::BASH,
+                                    common::BashArgs {
+                                        cmd: format!("{target} concurrent-fs-multi {n}"),
+                                        timeout_ms: Some(15_000),
+                                    },
                                 )
                                 .await;
                             let pass = matches!(
                                 &resp,
-                                crate::protocol::Response::ExecResult { exit_code: 0, stdout, .. }
-                                    if stdout.contains("CONCURRENT_FS_MULTI_OK")
+                                Ok(out) if out.exit_code == 0
+                                    && out.stdout.contains("CONCURRENT_FS_MULTI_OK")
                             );
                             super::TestOutcome::new(&agent_label, pass, format!("{resp:?}"))
                         })

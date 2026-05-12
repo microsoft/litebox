@@ -6,6 +6,7 @@
 
 pub(crate) mod agents;
 pub(crate) mod clone3_matrix;
+pub(crate) mod common;
 pub(crate) mod concurrent_fork;
 pub(crate) mod epoll_pidfd;
 pub(crate) mod eventfd;
@@ -214,28 +215,6 @@ fn detect_runtime_environment() -> String {
     }
 }
 
-/// Create an Exec command with default 10s timeout.
-pub(crate) fn exec(args: Vec<String>) -> Command {
-    Command::Exec {
-        args,
-        timeout_secs: None,
-        stdin: None,
-        background: false,
-        env: vec![],
-    }
-}
-
-/// Create an Exec command with a custom timeout.
-pub(crate) fn exec_timeout(args: Vec<String>, secs: u64) -> Command {
-    Command::Exec {
-        args,
-        timeout_secs: Some(secs),
-        stdin: None,
-        background: false,
-        env: vec![],
-    }
-}
-
 pub(crate) struct Child {
     pub(crate) stdin: tokio::process::ChildStdin,
     pub(crate) stdout: BufReader<tokio::process::ChildStdout>,
@@ -324,9 +303,6 @@ impl TestRunner {
 
     #[allow(clippy::similar_names)] // `rest` (routing tail) vs `resp` (response).
     async fn send(&mut self, target: &str, cmd: Command) -> Response {
-        if target == "init" {
-            return self.exec_local(&cmd).await;
-        }
         // Track for lazy-matrix validation: any agent contacted via
         // send() must be in spawned_agents at end-of-run.
         self.contacted_agents.insert(target.to_string());
@@ -644,106 +620,6 @@ impl TestRunner {
             self.record("__lazy_matrix.over_spawn", "?", false, &detail);
         }
     }
-
-    async fn exec_local(&self, cmd: &Command) -> Response {
-        match cmd {
-            Command::FsRead { path } => match tokio::fs::read_to_string(path).await {
-                Ok(data) => Response::Ok { data: Some(data) },
-                Err(_) => Response::NotFound,
-            },
-            Command::FsWrite { path, data } => {
-                if let Some(parent) = std::path::Path::new(path).parent() {
-                    let _ = tokio::fs::create_dir_all(parent).await;
-                }
-                match tokio::fs::write(path, data).await {
-                    Ok(()) => Response::Ok { data: None },
-                    Err(e) => Response::Error {
-                        error: format!("{e}"),
-                    },
-                }
-            }
-            Command::FsDelete { path } => match tokio::fs::remove_file(path).await {
-                Ok(()) => Response::Ok { data: None },
-                Err(e) => Response::Error {
-                    error: format!("{e}"),
-                },
-            },
-            Command::FsSymlink { target, link } => {
-                #[cfg(unix)]
-                match tokio::fs::symlink(target, link).await {
-                    Ok(()) => Response::Ok { data: None },
-                    Err(e) => Response::Error {
-                        error: format!("symlink: {e}"),
-                    },
-                }
-                #[cfg(not(unix))]
-                Response::Error {
-                    error: "symlink not supported on this platform".to_string(),
-                }
-            }
-            Command::FsReadlink { path } => match tokio::fs::read_link(path).await {
-                Ok(target) => Response::Ok {
-                    data: Some(target.to_string_lossy().into_owned()),
-                },
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Response::NotFound,
-                Err(e) => Response::Error {
-                    error: format!("readlink: {e}"),
-                },
-            },
-            Command::FsStat { path } => match tokio::fs::symlink_metadata(path).await {
-                Ok(meta) => {
-                    let kind = if meta.is_symlink() {
-                        "symlink"
-                    } else if meta.is_dir() {
-                        "dir"
-                    } else {
-                        "file"
-                    };
-                    Response::Ok {
-                        data: Some(kind.to_string()),
-                    }
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Response::NotFound,
-                Err(e) => Response::Error {
-                    error: format!("stat: {e}"),
-                },
-            },
-            Command::NetConnect { addr, data } => {
-                use tokio::io::{AsyncReadExt, AsyncWriteExt};
-                match tokio::time::timeout(
-                    Duration::from_secs(5),
-                    tokio::net::TcpStream::connect(addr),
-                )
-                .await
-                {
-                    Ok(Ok(mut stream)) => {
-                        let _ = stream.write_all(data.as_bytes()).await;
-                        let _ = stream.flush().await;
-                        let mut buf = [0u8; 4096];
-                        match tokio::time::timeout(Duration::from_secs(5), stream.read(&mut buf))
-                            .await
-                        {
-                            Ok(Ok(n)) if n > 0 => Response::Connected {
-                                echo: String::from_utf8_lossy(&buf[..n]).to_string(),
-                            },
-                            _ => Response::ConnectFailed {
-                                error: "no echo".to_string(),
-                            },
-                        }
-                    }
-                    Ok(Err(e)) => Response::ConnectFailed {
-                        error: format!("{e}"),
-                    },
-                    Err(_) => Response::ConnectFailed {
-                        error: "timeout".to_string(),
-                    },
-                }
-            }
-            _ => Response::Error {
-                error: "not implemented locally".to_string(),
-            },
-        }
-    }
 }
 
 fn spawn_command_for_spec(spec: &agents::AgentSpec) -> Command {
@@ -813,23 +689,199 @@ fn register_canary(reg: &mut registry::Registry<'_>) {
             Box::new(move |run| {
                 let self_exe = run.self_exe().to_string();
                 Box::pin(async move {
-                    let canary_cmd = crate::protocol::Command::Exec {
-                        args: vec![self_exe, "echo-test".into()],
-                        timeout_secs: None,
-                        stdin: None,
-                        background: false,
-                        env: vec![],
-                    };
-                    let resp = run.send(&a, canary_cmd).await;
+                    let result = run
+                        .send_named_typed(
+                            &a,
+                            &common::EXEC_BIN,
+                            common::ExecBinArgs {
+                                argv: vec![self_exe, "echo-test".into()],
+                                timeout_ms: None,
+                                stdin: None,
+                                env: vec![],
+                            },
+                        )
+                        .await;
                     let pass = matches!(
-                        &resp,
-                        crate::protocol::Response::ExecResult { exit_code: 0, stdout, .. }
-                            if stdout.trim() == "ECHO_TEST_OK"
+                        &result,
+                        Ok(out) if out.exit_code == 0 && out.stdout.trim() == "ECHO_TEST_OK"
                     );
-                    TestOutcome::new(agents::AgentName::Dpg1.name(), pass, format!("{resp:?}"))
+                    TestOutcome::new(agents::AgentName::Dpg1.name(), pass, format!("{result:?}"))
                 })
             })
         });
+}
+
+#[allow(clippy::too_many_lines)]
+fn register_handler_canary(reg: &mut registry::Registry<'_>) {
+    use crate::handlers::{HandlerCtx, HandlerError};
+    use crate::register_handler;
+    use serde_json::{Value, json};
+
+    // Single-agent handler: echo input msg with a sequence number.
+    // Registered once at startup; every call increments a per-process
+    // static counter. This proves `send_named` works.
+    async fn handle_echo(args: Value, _ctx: &mut HandlerCtx<'_>) -> Result<Value, HandlerError> {
+        static COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let msg = args
+            .get("msg")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Ok(json!({ "msg": msg, "n": n }))
+    }
+
+    // Multi-agent handlers: a "phase rendezvous" canary. Two agents
+    // both reach checkpoint "rendezvous", coord routes Resume to both,
+    // each emits its own pid in the result so we can verify both ran.
+    async fn handle_rendezvous_a(
+        _args: Value,
+        ctx: &mut HandlerCtx<'_>,
+    ) -> Result<Value, HandlerError> {
+        ctx.checkpoint("rendezvous").await?;
+        Ok(json!({ "role": "a", "pid": std::process::id() }))
+    }
+    async fn handle_rendezvous_b(
+        _args: Value,
+        ctx: &mut HandlerCtx<'_>,
+    ) -> Result<Value, HandlerError> {
+        ctx.checkpoint("rendezvous").await?;
+        Ok(json!({ "role": "b", "pid": std::process::id() }))
+    }
+
+    register_handler!("canary.echo", handle_echo);
+    register_handler!("canary.rendezvous_a", handle_rendezvous_a);
+    register_handler!("canary.rendezvous_b", handle_rendezvous_b);
+
+    // Single-agent test: invoke handle_echo twice; verify state is
+    // per-process (counter ticks up across calls).
+    reg.test("contamination", "handler_canary", "H_canary.send_named")
+        .timeout(30)
+        .build(|cx| {
+            let a = cx.require(agents::AgentName::Dpg1);
+            Box::new(move |run| {
+                Box::pin(async move {
+                    let r1 = run
+                        .send_named(&a, "canary.echo", serde_json::json!({"msg": "hello"}))
+                        .await;
+                    let r2 = run
+                        .send_named(&a, "canary.echo", serde_json::json!({"msg": "world"}))
+                        .await;
+                    let pass = matches!(
+                        (&r1, &r2),
+                        (Ok(v1), Ok(v2))
+                            if v1["msg"] == "hello" && v2["msg"] == "world"
+                            && v2["n"].as_u64().unwrap_or(0) > v1["n"].as_u64().unwrap_or(0)
+                    );
+                    TestOutcome::new(
+                        agents::AgentName::Dpg1.name(),
+                        pass,
+                        format!("r1={r1:?} r2={r2:?}"),
+                    )
+                })
+            })
+        });
+
+    // Multi-agent test: two agents rendezvous on "rendezvous" tag.
+    reg.test("contamination", "handler_canary", "H_canary.rendezvous")
+        .timeout(30)
+        .build(|cx| {
+            let a = cx.require(agents::AgentName::Dpg1);
+            let b = cx.require(agents::AgentName::Dpg2);
+            Box::new(move |run| {
+                Box::pin(async move {
+                    let detail = match drive_rendezvous(run, &a, &b).await {
+                        Ok(d) => return TestOutcome::new(agents::AgentName::Dpg1.name(), true, d),
+                        Err(d) => d,
+                    };
+                    TestOutcome::new(agents::AgentName::Dpg1.name(), false, detail)
+                })
+            })
+        });
+
+    // Negative test: pipe-share guard. Two run_writes targeting
+    // agents that share a direct top-level pipe (Dpg1 + Dpg1Dpg1
+    // both route through dpg1's pipe) — the second write must
+    // error out before any wire I/O happens.
+    reg.test(
+        "contamination",
+        "handler_canary",
+        "H_canary.pipe_share_guard",
+    )
+    .timeout(30)
+    .build(|cx| {
+        let a = cx.require(agents::AgentName::Dpg1);
+        let deep = cx.require(agents::AgentName::Dpg1Dpg1);
+        Box::new(move |run| {
+            Box::pin(async move {
+                // First write succeeds (no in-flight runs).
+                let first = run
+                    .run_write(&a, "canary.rendezvous_a", serde_json::Value::Null)
+                    .await;
+                if first.is_err() {
+                    return TestOutcome::new(
+                        agents::AgentName::Dpg1.name(),
+                        false,
+                        format!("first run_write failed: {first:?}"),
+                    );
+                }
+                // Second write targets a deep agent whose direct
+                // pipe is dpg1 — the same pipe the first Run is
+                // using. Must error.
+                let second = run
+                    .run_write(&deep, "canary.rendezvous_a", serde_json::Value::Null)
+                    .await;
+                let pass = matches!(&second, Err(msg) if msg.contains("in flight"));
+                // Clean up: read the first Run's Checkpoint, then
+                // resume + read Result so the agent isn't left
+                // mid-handler and the in-flight slot is cleared.
+                let _ = run.run_read(&a).await;
+                let _ = run.run_resume(&a, "rendezvous").await;
+                let _ = run.run_read(&a).await;
+                TestOutcome::new(
+                    agents::AgentName::Dpg1.name(),
+                    pass,
+                    format!("first={first:?} second={second:?}"),
+                )
+            })
+        })
+    });
+}
+
+async fn drive_rendezvous(
+    run: &mut run_context::RunContext<'_>,
+    a: &agents::AgentHandle,
+    b: &agents::AgentHandle,
+) -> Result<String, String> {
+    use crate::protocol::Response;
+    run.run_write(a, "canary.rendezvous_a", serde_json::Value::Null)
+        .await?;
+    match run.run_read(a).await {
+        Response::Checkpoint { tag } if tag == "rendezvous" => {}
+        other => return Err(format!("a: expected Checkpoint(rendezvous), got {other:?}")),
+    }
+    run.run_write(b, "canary.rendezvous_b", serde_json::Value::Null)
+        .await?;
+    match run.run_read(b).await {
+        Response::Checkpoint { tag } if tag == "rendezvous" => {}
+        other => return Err(format!("b: expected Checkpoint(rendezvous), got {other:?}")),
+    }
+    run.run_resume(a, "rendezvous").await?;
+    run.run_resume(b, "rendezvous").await?;
+    let ra = run.run_read(a).await;
+    let rb = run.run_read(b).await;
+    let pass = matches!(
+        &ra,
+        Response::Result { ok: true, data, .. } if data["role"] == "a"
+    ) && matches!(
+        &rb,
+        Response::Result { ok: true, data, .. } if data["role"] == "b"
+    );
+    if pass {
+        Ok(format!("ra={ra:?} rb={rb:?}"))
+    } else {
+        Err(format!("unexpected results: ra={ra:?} rb={rb:?}"))
+    }
 }
 
 /// Check whether a Test matches the --filter argument.
@@ -854,7 +906,9 @@ fn matches_test(filter: Option<&str>, test: &Test) -> bool {
 #[must_use]
 pub fn collect_all_tests() -> Vec<Test> {
     let mut tests: Vec<Test> = Vec::new();
+    common::register_common_handlers(&mut registry::Registry::new(&mut tests));
     register_canary(&mut registry::Registry::new(&mut tests));
+    register_handler_canary(&mut registry::Registry::new(&mut tests));
     special_cases::register_netlink(&mut registry::Registry::new(&mut tests));
     concurrent_fork::register_concurrent_fork_pipeline(&mut registry::Registry::new(&mut tests));
     concurrent_fork::register_concurrent_exec(&mut registry::Registry::new(&mut tests));
@@ -1071,7 +1125,7 @@ async fn run_tests(self_exe: &str, filter: Option<&str>) -> Vec<TestResult> {
 
 /// Route a target agent name to (`direct_child`, `remaining_path`).
 /// `dpg1` → (`dpg1`, None), `vscode_node` → (`vscode_sshd_pty`, Some(`vscode_node`)).
-fn route(target: &str) -> (&str, Option<&str>) {
+pub(crate) fn route(target: &str) -> (&str, Option<&str>) {
     if let Some(agent) = agents::AgentName::from_wire(target) {
         let ancestors = agent.ancestors();
         let direct = ancestors.first().copied().unwrap_or(agent).name();
@@ -1088,7 +1142,7 @@ fn route(target: &str) -> (&str, Option<&str>) {
 }
 
 /// Wrap a command in Forward layers for routing through the tree.
-fn wrap_forwards(remaining: Option<&str>, cmd: Command) -> Command {
+pub(crate) fn wrap_forwards(remaining: Option<&str>, cmd: Command) -> Command {
     let Some(target) = remaining else {
         return cmd;
     };
@@ -1158,18 +1212,6 @@ pub(crate) async fn send_cmd(child: &mut Child, cmd: &Command) -> Response {
                     ..
                 }
                 | Command::ExecReady {
-                    timeout_secs: Some(t),
-                    ..
-                }
-                | Command::WaitReady {
-                    timeout_secs: Some(t),
-                    ..
-                }
-                | Command::WaitBackground {
-                    timeout_secs: Some(t),
-                    ..
-                }
-                | Command::WaitFor {
                     timeout_secs: Some(t),
                     ..
                 } => break Some(*t),
@@ -1259,12 +1301,11 @@ mod tests {
         let child = spawn_child(&runner.self_exe).unwrap();
         runner.children.insert("T".to_string(), child);
 
-        // Verify it works before poisoning.
+        // Verify it works before poisoning. Use Spawn with an empty
+        // children list as a no-op probe (returns Ok with a count).
         let resp = send_cmd(
             runner.children.get_mut("T").unwrap(),
-            &Command::EnvGet {
-                var: "HOME".to_string(),
-            },
+            &Command::Spawn { children: vec![] },
         )
         .await;
         assert!(
@@ -1278,14 +1319,7 @@ mod tests {
         assert!(!runner.children.contains_key("T"));
 
         // Sends to poisoned agent should return immediate error.
-        let resp = runner
-            .send(
-                "T",
-                Command::EnvGet {
-                    var: "HOME".to_string(),
-                },
-            )
-            .await;
+        let resp = runner.send("T", Command::Spawn { children: vec![] }).await;
         match &resp {
             Response::Error { error } => {
                 assert!(
