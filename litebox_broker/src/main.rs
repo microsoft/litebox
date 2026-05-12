@@ -75,6 +75,17 @@ struct Cli {
     /// The broker listens on HOST_PORT and relays connections to the guest.
     #[arg(long = "forward-port", value_name = "HOST:GUEST_IP:GUEST_PORT")]
     forward_port: Vec<String>,
+
+    /// Path to a Unix socket on which to host the broker fd-token /
+    /// state-object control plane. Runners connect to this socket via
+    /// `--fd-token-broker <path>` to register and materialise broker-
+    /// backed shim objects (eventfds today; timerfds, signalfds and
+    /// cross-worker SCM_RIGHTS handoff in the future). When omitted,
+    /// the control plane is disabled and runners fall back to
+    /// purely-local shim emulation.
+    #[arg(long = "fd-token-broker-listen", value_name = "PATH",
+          value_hint = clap::ValueHint::FilePath)]
+    fd_token_broker_listen: Option<PathBuf>,
 }
 
 fn parse_forward_specs(specs: &[String]) -> Vec<(u16, std::net::Ipv4Addr, u16)> {
@@ -213,6 +224,40 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let cli = Cli::parse();
     let sandbox_policy = load_sandbox_policy(&cli);
+
+    // Phase B-Step8d: optionally host the fd-token / state-object
+    // control listener. Runners connect via `--fd-token-broker <path>`
+    // to register broker-backed eventfds (etc.) and to dup/materialise
+    // handles for cross-worker SCM_RIGHTS transfer. The two registries
+    // are constructed here and shared with the listener thread; their
+    // Arc clones survive for the lifetime of the broker process.
+    let _fd_token_listener: Option<std::thread::JoinHandle<()>> =
+        if let Some(path) = cli.fd_token_broker_listen.as_ref() {
+            let fd_registry =
+                std::sync::Arc::new(litebox_broker::fd_tokens::BrokerFdTokenRegistry::new());
+            let state_registry =
+                std::sync::Arc::new(litebox_broker::state_registry::BrokerStateRegistry::new());
+            match litebox_broker::fd_token_socket::spawn_control_listener(
+                path,
+                fd_registry,
+                state_registry,
+            ) {
+                Ok(handle) => {
+                    info!(path = %path.display(), "fd-token broker listener started");
+                    Some(handle)
+                }
+                Err(e) => {
+                    tracing::error!(
+                        path = %path.display(),
+                        error = %e,
+                        "failed to start fd-token broker listener",
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
 
     // Open the audit log file for structured broker events.
     let audit_log =

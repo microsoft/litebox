@@ -7041,6 +7041,14 @@ impl<FS: ShimFS> Task<FS> {
                 // connected/socketpair fds are recreated first, then replaced
                 // by fork-bridge host fds when needed.
                 FdClass::UnixSocket => {}
+                // Phase B-Step12 candidate fix: accept EventFds across
+                // fork-snapshot. For local eventfds the restore path
+                // creates a fresh one (state not preserved — matches
+                // Linux fork semantics: child has independent counter);
+                // for BrokerBacked the restore path reattaches to the
+                // same broker handle (state IS preserved because the
+                // broker owns it).
+                FdClass::EventFd => {}
                 _ => {
                     reject.push(ForkRejectReason::UnsupportedFdClass { fd: raw_fd, class });
                 }
@@ -10112,6 +10120,7 @@ impl<FS: ShimFS> litebox::process::WorkerExecStreamReader for UnixSocketStreamRe
                     buf,
                     litebox_common_linux::ReceiveFlags::empty(),
                     None,
+                    &mut Vec::new(),
                     &mut Vec::new(),
                 )
             })

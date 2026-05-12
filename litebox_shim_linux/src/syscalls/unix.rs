@@ -28,6 +28,7 @@ use litebox::{
 use litebox_common_linux::{
     IpOption, ReceiveFlags, SendFlags, SockFlags, SockType, SocketOption, SocketOptionName, Ucred,
     errno::Errno,
+    fd_transfer_frame::{FdTransferFrame, FdTransferReader},
 };
 
 use crate::{
@@ -585,7 +586,19 @@ pub(super) use litebox::fd::PassedFd;
 pub(crate) struct Message {
     pub(crate) data: Vec<u8>,
     /// File descriptors passed via `SCM_RIGHTS` ancillary data.
+    /// Used by the same-worker `UnixTransport::Channel` arm; the
+    /// cross-worker `UnixTransport::Tcp` arm uses `passed_tokens`
+    /// instead.
     pub(crate) passed_fds: Vec<PassedFd>,
+    /// Broker handle tokens for cross-worker fd transfer (Phase
+    /// B-Step8e). Populated by `parse_sendmsg_cmsg` for any
+    /// `passed_fds` entry whose underlying subsystem entry carries a
+    /// broker handle (currently only `EventFile::BrokerBacked`).
+    /// The `UnixTransport::Tcp` send path encodes these into the LBFD
+    /// frame; the recv path decodes them into `received_tokens` for
+    /// the syscall handler to materialise into receiver-side
+    /// `PassedFd` entries.
+    pub(crate) passed_tokens: Vec<litebox_common_linux::fd_transfer_frame::PassedToken>,
 }
 
 /// Represents a connected Unix stream socket.
@@ -608,8 +621,13 @@ enum UnixTransport {
         send: crate::channel::WriteEnd<Message>,
     },
     /// Cross-worker: TCP-backed stream through broker/smoltcp.
+    ///
+    /// `recv_reader` holds the partial LBFD frame state across
+    /// `try_recvfrom` calls — the smoltcp stream surfaces bytes in
+    /// arbitrary chunks, but the wire protocol is framed.
     Tcp {
         proxy: Arc<litebox::net::socket_channel::NetworkProxy<crate::Platform>>,
+        recv_reader: Arc<litebox::sync::Mutex<crate::Platform, FdTransferReader>>,
     },
 }
 
@@ -635,7 +653,7 @@ impl<FS: ShimFS> UnixConnectedStream<FS> {
                 let send_peer_ptr = send.peer_ptr() as usize;
                 core::cmp::min(recv_ptr, send_peer_ptr)
             }
-            UnixTransport::Tcp { proxy } => Arc::as_ptr(proxy) as usize,
+            UnixTransport::Tcp { proxy, .. } => Arc::as_ptr(proxy) as usize,
         }
     }
 
@@ -698,17 +716,68 @@ impl<FS: ShimFS> UnixConnectedStream<FS> {
     fn try_sendto(&self, msg: Message) -> Result<(), (Message, Errno)> {
         match &self.transport {
             UnixTransport::Channel { send, .. } => {
-                // TODO: write partial data?
+                // Phase B-Step10 refcount audit: `parse_sendmsg_cmsg`
+                // eagerly called `provider.dup_handle` on every
+                // broker-backed entry (it had to, because by this
+                // point we no longer have task context to look up the
+                // provider). On the in-worker Channel path the
+                // `PassedFd` aliases the SAME global-dt EventFile
+                // entry the sender already holds, so the duplicate
+                // broker refcount is redundant — when the receiver's
+                // installed fd is dropped, only ONE `release_eventfd`
+                // fires (from `EventFile::Drop` once the last alias
+                // goes). Undo the eager dup here.
+                if let Some(provider) = super::eventfd::broker_eventfd_provider() {
+                    for token in &msg.passed_tokens {
+                        if matches!(
+                            token.tag(),
+                            litebox_common_linux::fd_transfer_frame::SubsystemTag::Eventfd
+                        ) {
+                            provider.release_eventfd(token.id());
+                        }
+                    }
+                }
+                // Strip tokens — they're a cross-worker concept; the
+                // in-worker path doesn't carry them across.
+                let mut msg = msg;
+                msg.passed_tokens.clear();
                 send.try_write_one(msg)
             }
-            UnixTransport::Tcp { proxy } => {
+            UnixTransport::Tcp { proxy, .. } => {
                 use litebox::net::socket_channel::NetworkProxy;
+                // Phase B-Step8e: always-LBFD-frame on the cross-worker
+                // TCP transport. Sender encodes the data plus any
+                // pre-extracted broker handle tokens (built by
+                // parse_sendmsg_cmsg). Receiver mirrors this via
+                // FdTransferReader and the recv-side materialisation.
+                //
+                // passed_fds is for the in-worker `Channel` arm and is
+                // discarded here — the sender's task context already
+                // converted broker-backed entries into `passed_tokens`
+                // before reaching this point.
+                let frame = FdTransferFrame {
+                    tokens: &msg.passed_tokens,
+                    data: &msg.data,
+                };
+                let bytes = {
+                    let mut buf = alloc::vec::Vec::new();
+                    match frame.encode(&mut buf) {
+                        Ok(_) => buf,
+                        Err(_) => return Err((msg, Errno::EMSGSIZE)),
+                    }
+                };
                 match proxy.as_ref() {
-                    NetworkProxy::Stream(stream) => match stream.try_write(&msg.data) {
-                        Ok(n) if n > 0 => {
+                    NetworkProxy::Stream(stream) => match stream.try_write(&bytes) {
+                        Ok(n) if n == bytes.len() => {
                             litebox_platform_multiplex::platform().wake_network_worker();
                             Ok(())
                         }
+                        // Partial write on TCP: not handled in this
+                        // path today (the previous code only handled
+                        // n>0 vs n==0). Surface EAGAIN; the caller
+                        // will retry the whole Message. Smoltcp TCP
+                        // generally accepts the entire chunk so this
+                        // is rare in practice.
                         Ok(_) => Err((msg, Errno::EAGAIN)),
                         Err(_) => Err((msg, Errno::EPIPE)),
                     },
@@ -720,30 +789,90 @@ impl<FS: ShimFS> UnixConnectedStream<FS> {
 
     fn try_recvfrom(
         &self,
-        mut buf: &mut [u8],
+        buf: &mut [u8],
         seqpacket: bool,
         received_fds: &mut Vec<PassedFd>,
+        received_tokens: &mut Vec<litebox_common_linux::fd_transfer_frame::PassedToken>,
     ) -> Result<usize, TryOpError<Errno>> {
         match &self.transport {
-            UnixTransport::Tcp { proxy } => {
+            UnixTransport::Tcp { proxy, recv_reader } => {
                 use litebox::net::socket_channel::NetworkProxy;
-                match proxy.as_ref() {
-                    NetworkProxy::Stream(stream) => {
-                        match stream.try_read(buf, litebox::net::ReceiveFlags::empty(), None) {
-                            Ok(0) => Err(TryOpError::TryAgain),
-                            Ok(n) => Ok(n),
-                            Err(litebox::net::errors::ReceiveError::SocketInInvalidState) => {
-                                Err(TryOpError::TryAgain)
-                            }
-                            Err(litebox::net::errors::ReceiveError::Eof) => Ok(0),
-                            Err(_) => Err(TryOpError::Other(Errno::ECONNRESET)),
+                let mut reader = recv_reader.lock();
+
+                if let Some(n) =
+                    Self::try_emit_from_reader(&mut reader, buf, received_fds, received_tokens)?
+                {
+                    return Ok(n);
+                }
+
+                let mut staging = alloc::vec![0u8; UNIX_BUF_SIZE];
+                let read_n = match proxy.as_ref() {
+                    NetworkProxy::Stream(stream) => match stream.try_read(
+                        &mut staging,
+                        litebox::net::ReceiveFlags::empty(),
+                        None,
+                    ) {
+                        Ok(0) => return Err(TryOpError::TryAgain),
+                        Ok(n) => n,
+                        Err(litebox::net::errors::ReceiveError::SocketInInvalidState) => {
+                            return Err(TryOpError::TryAgain);
                         }
+                        Err(litebox::net::errors::ReceiveError::Eof) => 0,
+                        Err(_) => return Err(TryOpError::Other(Errno::ECONNRESET)),
+                    },
+                    _ => return Err(TryOpError::Other(Errno::EINVAL)),
+                };
+
+                if read_n > 0 {
+                    reader.push(&staging[..read_n]);
+                }
+
+                match Self::try_emit_from_reader(&mut reader, buf, received_fds, received_tokens)? {
+                    Some(n) => Ok(n),
+                    None if read_n == 0 => Ok(0),
+                    None => {
+                        let _ = seqpacket;
+                        Err(TryOpError::TryAgain)
                     }
-                    _ => Err(TryOpError::Other(Errno::EINVAL)),
                 }
             }
             UnixTransport::Channel { recv, .. } => {
+                let _ = received_tokens;
                 self.try_recvfrom_channel(recv, buf, seqpacket, received_fds)
+            }
+        }
+    }
+
+    /// Phase B-Step8b helper: try to drain one complete LBFD frame from
+    /// the per-stream reader into the user buffer. Returns:
+    ///
+    /// - `Ok(Some(n))` — exactly `n` bytes copied into `buf`; the frame
+    ///   is fully consumed. Tokens from the frame are appended to
+    ///   `received_tokens` for the syscall handler to materialise.
+    /// - `Ok(None)` — no complete frame buffered yet; the caller should
+    ///   try to read more bytes from the underlying transport.
+    /// - `Err(TryOpError::Other(EPROTO))` — the wire stream is corrupt /
+    ///   wrong version / etc.; caller should tear down the connection.
+    fn try_emit_from_reader(
+        reader: &mut FdTransferReader,
+        buf: &mut [u8],
+        _received_fds: &mut Vec<PassedFd>,
+        received_tokens: &mut Vec<litebox_common_linux::fd_transfer_frame::PassedToken>,
+    ) -> Result<Option<usize>, TryOpError<Errno>> {
+        match reader.take_frame() {
+            Ok(Some(frame)) => {
+                // Phase B-Step8e/recv: hand tokens to the syscall
+                // handler which has task context to materialise them
+                // into EventFile entries.
+                received_tokens.extend(frame.tokens);
+                let copy_len = buf.len().min(frame.data.len());
+                buf[..copy_len].copy_from_slice(&frame.data[..copy_len]);
+                Ok(Some(copy_len))
+            }
+            Ok(None) => Ok(None),
+            Err(_) => {
+                // LBFD decode error: stream is unrecoverable.
+                Err(TryOpError::Other(Errno::EPROTO))
             }
         }
     }
@@ -817,7 +946,7 @@ impl<FS: ShimFS> UnixConnectedStream<FS> {
         mask: Events,
     ) {
         match &self.transport {
-            UnixTransport::Tcp { proxy } => {
+            UnixTransport::Tcp { proxy, .. } => {
                 use litebox::event::IOPollable;
                 proxy.register_observer(observer, mask);
             }
@@ -827,7 +956,7 @@ impl<FS: ShimFS> UnixConnectedStream<FS> {
 
     fn check_io_events(&self) -> Events {
         match &self.transport {
-            UnixTransport::Tcp { proxy } => proxy.check_io_events(),
+            UnixTransport::Tcp { proxy, .. } => proxy.check_io_events(),
             UnixTransport::Channel { recv, send } => {
                 let mut events = Events::empty();
                 let is_read_shutdown = recv.is_shutdown();
@@ -1111,7 +1240,10 @@ impl<FS: ShimFS> UnixStream<FS> {
                         addr: init.addr.map(Arc::new),
                         peer: Some(Arc::new(peer_addr)),
                     },
-                    transport: UnixTransport::Tcp { proxy },
+                    transport: UnixTransport::Tcp {
+                        proxy,
+                        recv_reader: Arc::new(litebox::sync::Mutex::new(FdTransferReader::new())),
+                    },
                     peer_cred: task.current_ucred(),
                     pollee: Arc::new(Pollee::new()),
                 };
@@ -1201,7 +1333,12 @@ impl<FS: ShimFS> UnixStream<FS> {
                                     addr: Some(listen_addr.clone()),
                                     peer: None,
                                 },
-                                transport: UnixTransport::Tcp { proxy },
+                                transport: UnixTransport::Tcp {
+                                    proxy,
+                                    recv_reader: Arc::new(litebox::sync::Mutex::new(
+                                        FdTransferReader::new(),
+                                    )),
+                                },
                                 peer_cred: listener_cred,
                                 pollee: Arc::new(Pollee::new()),
                             };
@@ -1232,10 +1369,12 @@ impl<FS: ShimFS> UnixStream<FS> {
         addr: Option<UnixSocketAddr>,
         preserve_empty_record: bool,
         passed_fds: Vec<PassedFd>,
+        passed_tokens: Vec<litebox_common_linux::fd_transfer_frame::PassedToken>,
     ) -> Result<usize, Errno> {
         let mut msg = Some(Message {
             data: buf.to_vec(),
             passed_fds,
+            passed_tokens,
         });
         cx.with_timeout(timeout)
             .wait_on_events(
@@ -1283,6 +1422,7 @@ impl<FS: ShimFS> UnixStream<FS> {
         mut source_addr: Option<&mut Option<UnixSocketAddr>>,
         seqpacket: bool,
         received_fds: &mut Vec<PassedFd>,
+        received_tokens: &mut Vec<litebox_common_linux::fd_transfer_frame::PassedToken>,
     ) -> Result<usize, Errno> {
         cx.with_timeout(timeout)
             .wait_on_events(
@@ -1300,7 +1440,7 @@ impl<FS: ShimFS> UnixStream<FS> {
                         let conn = state
                             .connected()
                             .ok_or(TryOpError::Other(Errno::ENOTCONN))?;
-                        let n = conn.try_recvfrom(buf, seqpacket, received_fds)?;
+                        let n = conn.try_recvfrom(buf, seqpacket, received_fds, received_tokens)?;
                         // For connected stream sockets, no need to return the source address
                         if let Some(source_addr) = source_addr.as_deref_mut() {
                             *source_addr = None;
@@ -1339,7 +1479,7 @@ impl<FS: ShimFS> UnixStream<FS> {
             UnixStreamState::Listen(listen) => listen.register_observer(observer, mask),
             UnixStreamState::Connected(connect) => {
                 match &connect.transport {
-                    UnixTransport::Tcp { proxy } => {
+                    UnixTransport::Tcp { proxy, .. } => {
                         // For TCP-backed connections, register on the TCP proxy's
                         // pollee so we get woken when data arrives from smoltcp.
                         use litebox::event::IOPollable;
@@ -1813,11 +1953,12 @@ impl<FS: ShimFS> UnixSocket<FS> {
                                 Message {
                                     data: core::mem::take(&mut msg.data),
                                     passed_fds: core::mem::take(&mut msg.passed_fds),
+                                    passed_tokens: core::mem::take(&mut msg.passed_tokens),
                                 },
                             ))
                         })
                         .ok(),
-                    UnixTransport::Tcp { proxy } => {
+                    UnixTransport::Tcp { proxy, .. } => {
                         use litebox::net::socket_channel::NetworkProxy;
                         if let NetworkProxy::Stream(stream) = proxy.as_ref() {
                             let mut buf = alloc::vec![0u8; UNIX_BUF_SIZE];
@@ -1831,6 +1972,7 @@ impl<FS: ShimFS> UnixSocket<FS> {
                                     Some(Message {
                                         data: buf,
                                         passed_fds: Vec::new(),
+                                        passed_tokens: Vec::new(),
                                     })
                                 }
                                 Err(_) => None,
@@ -1900,6 +2042,7 @@ impl<FS: ShimFS> UnixSocket<FS> {
         flags: SendFlags,
         addr: Option<UnixSocketAddr>,
         passed_fds: Vec<PassedFd>,
+        passed_tokens: Vec<litebox_common_linux::fd_transfer_frame::PassedToken>,
     ) -> Result<usize, Errno> {
         let supported_flags = SendFlags::DONTWAIT | SendFlags::NOSIGNAL;
         if flags.intersects(supported_flags.complement()) {
@@ -1918,6 +2061,7 @@ impl<FS: ShimFS> UnixSocket<FS> {
                 addr,
                 self.sock_type == SockType::SeqPacket,
                 passed_fds,
+                passed_tokens,
             ),
             UnixSocketInner::Datagram(datagram) => {
                 datagram.sendto(task, timeout, buf, is_nonblocking, addr, passed_fds)
@@ -1934,9 +2078,16 @@ impl<FS: ShimFS> UnixSocket<FS> {
         let is_nonblocking = self.get_status().contains(OFlags::NONBLOCK);
         let timeout = self.options.lock().send_timeout;
         match &self.inner {
-            UnixSocketInner::Stream(stream) => {
-                stream.sendto(cx, timeout, buf, is_nonblocking, None, false, Vec::new())
-            }
+            UnixSocketInner::Stream(stream) => stream.sendto(
+                cx,
+                timeout,
+                buf,
+                is_nonblocking,
+                None,
+                false,
+                Vec::new(),
+                Vec::new(),
+            ),
             UnixSocketInner::Datagram(_) => Err(Errno::ENOTSUP),
         }
     }
@@ -1948,6 +2099,7 @@ impl<FS: ShimFS> UnixSocket<FS> {
         flags: ReceiveFlags,
         source_addr: Option<&mut Option<UnixSocketAddr>>,
         received_fds: &mut Vec<PassedFd>,
+        received_tokens: &mut Vec<litebox_common_linux::fd_transfer_frame::PassedToken>,
     ) -> Result<usize, Errno> {
         let supported_flags =
             ReceiveFlags::DONTWAIT | ReceiveFlags::NOSIGNAL | ReceiveFlags::CMSG_CLOEXEC;
@@ -1968,8 +2120,10 @@ impl<FS: ShimFS> UnixSocket<FS> {
                 source_addr,
                 seqpacket,
                 received_fds,
+                received_tokens,
             ),
             UnixSocketInner::Datagram(datagram) => {
+                let _ = received_tokens;
                 datagram.recvfrom(cx, timeout, buf, is_nonblocking, source_addr, received_fds)
             }
         };
@@ -2000,7 +2154,7 @@ impl<FS: ShimFS> UnixSocket<FS> {
                             send.shutdown();
                         }
                     }
-                    UnixTransport::Tcp { proxy } => {
+                    UnixTransport::Tcp { proxy, .. } => {
                         use litebox::net::socket_channel::NetworkProxy;
                         if let NetworkProxy::Stream(stream) = proxy.as_ref() {
                             if read {
@@ -2324,4 +2478,154 @@ fn read_sidecar<FS: ShimFS>(fs: &FS, key: &UnixSocketAddrKey) -> Option<u16> {
 fn remove_sidecar<FS: ShimFS>(fs: &FS, key: &UnixSocketAddrKey) {
     let path = sidecar_path(key);
     let _ = fs.unlink(path.as_str());
+}
+
+#[cfg(test)]
+mod lbfd_framing_tests {
+    use super::*;
+    use litebox_common_linux::fd_transfer_frame::{FdTransferFrame, FdTransferReader};
+
+    /// Build encoded LBFD bytes for a frame with given data + no tokens.
+    fn encoded(data: &[u8]) -> alloc::vec::Vec<u8> {
+        let mut buf = alloc::vec::Vec::new();
+        FdTransferFrame { tokens: &[], data }
+            .encode(&mut buf)
+            .expect("encode");
+        buf
+    }
+
+    /// Static-method call helper: cast through DefaultFS so we can
+    /// invoke the impl block's static method without an instance.
+    fn try_emit(
+        reader: &mut FdTransferReader,
+        buf: &mut [u8],
+    ) -> Result<Option<usize>, TryOpError<Errno>> {
+        let mut received_fds: Vec<PassedFd> = Vec::new();
+        let mut received_tokens: Vec<litebox_common_linux::fd_transfer_frame::PassedToken> =
+            Vec::new();
+        UnixConnectedStream::<crate::DefaultFS>::try_emit_from_reader(
+            reader,
+            buf,
+            &mut received_fds,
+            &mut received_tokens,
+        )
+    }
+
+    #[test]
+    fn complete_frame_in_one_push() {
+        let mut reader = FdTransferReader::new();
+        reader.push(&encoded(b"hello"));
+        let mut out = [0u8; 32];
+        let n = try_emit(&mut reader, &mut out)
+            .unwrap()
+            .expect("frame ready");
+        assert_eq!(n, 5);
+        assert_eq!(&out[..5], b"hello");
+        assert!(try_emit(&mut reader, &mut out).unwrap().is_none());
+    }
+
+    #[test]
+    fn partial_frame_returns_none_until_complete() {
+        let mut reader = FdTransferReader::new();
+        let bytes = encoded(b"partial-arrival");
+        // Feed header-minus-one-byte first.
+        let split = 15; // less than full header+body
+        reader.push(&bytes[..split]);
+        let mut out = [0u8; 32];
+        assert!(
+            try_emit(&mut reader, &mut out).unwrap().is_none(),
+            "incomplete frame must return Ok(None)"
+        );
+
+        // Now feed the rest.
+        reader.push(&bytes[split..]);
+        let n = try_emit(&mut reader, &mut out).unwrap().expect("now ready");
+        assert_eq!(n, 15);
+        assert_eq!(&out[..15], b"partial-arrival");
+    }
+
+    #[test]
+    fn byte_at_a_time_eventually_yields() {
+        // Worst-case fragmentation: feed every byte separately and
+        // call try_emit between each push.
+        let mut reader = FdTransferReader::new();
+        let bytes = encoded(b"trickle");
+        let mut out = [0u8; 32];
+        let mut emitted = None;
+        for &b in &bytes[..bytes.len() - 1] {
+            reader.push(&[b]);
+            assert!(try_emit(&mut reader, &mut out).unwrap().is_none());
+        }
+        // Last byte completes the frame.
+        reader.push(&bytes[bytes.len() - 1..]);
+        emitted = try_emit(&mut reader, &mut out).unwrap();
+        let n = emitted.expect("complete after last byte");
+        assert_eq!(n, 7);
+        assert_eq!(&out[..7], b"trickle");
+    }
+
+    #[test]
+    fn back_to_back_frames_emit_in_order() {
+        let mut reader = FdTransferReader::new();
+        let mut bytes = encoded(b"first");
+        bytes.extend_from_slice(&encoded(b"second-frame"));
+        bytes.extend_from_slice(&encoded(b"third"));
+        reader.push(&bytes);
+
+        let mut out = [0u8; 64];
+        let n1 = try_emit(&mut reader, &mut out).unwrap().unwrap();
+        assert_eq!(&out[..n1], b"first");
+        let n2 = try_emit(&mut reader, &mut out).unwrap().unwrap();
+        assert_eq!(&out[..n2], b"second-frame");
+        let n3 = try_emit(&mut reader, &mut out).unwrap().unwrap();
+        assert_eq!(&out[..n3], b"third");
+        assert!(try_emit(&mut reader, &mut out).unwrap().is_none());
+    }
+
+    #[test]
+    fn user_buffer_smaller_than_frame_truncates() {
+        // SOCK_SEQPACKET-without-MSG_TRUNC behaviour: tail is dropped.
+        let mut reader = FdTransferReader::new();
+        reader.push(&encoded(b"abcdefghij"));
+        let mut small = [0u8; 4];
+        let n = try_emit(&mut reader, &mut small).unwrap().unwrap();
+        assert_eq!(n, 4);
+        assert_eq!(&small, b"abcd");
+        // Reader is now empty (frame fully consumed despite truncated copy).
+        let mut out = [0u8; 32];
+        assert!(try_emit(&mut reader, &mut out).unwrap().is_none());
+    }
+
+    #[test]
+    fn empty_data_frame() {
+        // A frame carrying an empty data payload — used for zero-byte
+        // sendto on a stream socket.
+        let mut reader = FdTransferReader::new();
+        reader.push(&encoded(b""));
+        let mut out = [0u8; 32];
+        let n = try_emit(&mut reader, &mut out).unwrap().unwrap();
+        assert_eq!(n, 0);
+    }
+
+    #[test]
+    fn bad_magic_returns_eproto() {
+        let mut reader = FdTransferReader::new();
+        reader.push(&[0u8; 16]); // all-zero header = bad magic
+        let mut out = [0u8; 32];
+        match try_emit(&mut reader, &mut out) {
+            Err(TryOpError::Other(Errno::EPROTO)) => {}
+            other => panic!("expected EPROTO, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn boundary_max_buf_holds_frame_exactly() {
+        // User buf is exactly the frame's data length.
+        let mut reader = FdTransferReader::new();
+        reader.push(&encoded(b"x"));
+        let mut out = [0u8; 1];
+        let n = try_emit(&mut reader, &mut out).unwrap().unwrap();
+        assert_eq!(n, 1);
+        assert_eq!(&out, b"x");
+    }
 }

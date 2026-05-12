@@ -2567,6 +2567,27 @@ mod unix_socket_tests {
             // Nested: exec a child that itself does socketpair+fork+exec
             // Called by the test harness binary after fork+exec for US2
             "us2-server" => us2_server(),
+            // BSF: buffered-SCM-fork — parent buffers an eventfd in a
+            // unix socket's recv queue via sendmsg(SCM_RIGHTS), then
+            // fork+execs a (possibly cross-binary-type) child that
+            // recvmsg's the buffered fd and round-trips on it. Exercises
+            // the commit_delayed_fork buffered-SCM path that currently
+            // returns ENOSYS in litebox when the child must migrate.
+            "buffered-scm-fork" => test_buffered_scm_fork(),
+            "buffered-scm-fork-child" => buffered_scm_fork_child(),
+            // SXF: socketpair-fork-cross — socketpair() then fork+execv
+            // into a (possibly cross-binary-type) child. Parent and
+            // child exchange a PING/PONG to verify both endpoints
+            // survive the commit_delayed_fork bridge. Companion to
+            // p1-socketpair-fork TODO.
+            "socketpair-fork-cross" => test_socketpair_fork_cross(),
+            "socketpair-fork-cross-child" => socketpair_fork_cross_child(),
+            // PIF: pidfd-inherit-fork — parent spawns a short-lived
+            // grandchild, pidfd_open's it, fork+execvs (possibly
+            // cross-binary-type) child that waitid's on the inherited
+            // pidfd. Companion to p1-pidfd-inherit TODO.
+            "pidfd-inherit-fork" => test_pidfd_inherit_fork(),
+            "pidfd-inherit-child" => pidfd_inherit_child(),
             other => {
                 eprintln!("unknown: {other}");
                 1
@@ -3460,6 +3481,432 @@ mod unix_socket_tests {
         } else {
             2
         }
+    }
+
+    /// BSF parent — buffered-SCM-fork:
+    /// 1. socketpair(AF_UNIX, SOCK_STREAM) → (s_send, s_recv)
+    /// 2. eventfd(initval=0)
+    /// 3. sendmsg(s_send, SCM_RIGHTS=[ev], data="BSF") — message lands
+    ///    in s_recv's recv queue, not yet drained.
+    /// 4. close(s_send) to ensure the child does not race writers.
+    /// 5. fork+execv(child_exe, "unix-socket-test",
+    ///    "buffered-scm-fork-child", "<s_recv_fd>"). The fork(+exec) is
+    ///    the trigger for `commit_delayed_fork` to bridge s_recv across
+    ///    host workers when child_exe is a different binary type —
+    ///    that bridge is the gate currently returning ENOSYS.
+    /// 6. waitpid; emit BSF_OK iff child exit==0.
+    fn test_buffered_scm_fork() -> i32 {
+        let child_exe: String = std::env::args().nth(3).unwrap_or_default();
+        if child_exe.is_empty() {
+            println!("BSF_USAGE: unix-socket-test buffered-scm-fork <child_exe>");
+            return 1;
+        }
+        let mut fds = [0i32; 2];
+        let rc = unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, fds.as_mut_ptr()) };
+        if rc != 0 {
+            println!("BSF_SOCKETPAIR_FAIL:{}", errno());
+            return 1;
+        }
+        let s_send = fds[0];
+        let s_recv = fds[1];
+
+        let ev = unsafe { libc::eventfd(0, 0) };
+        if ev < 0 {
+            println!("BSF_EVENTFD_FAIL:{}", errno());
+            return 1;
+        }
+
+        let payload = b"BSF";
+        let mut iov = libc::iovec {
+            iov_base: payload.as_ptr() as *mut libc::c_void,
+            iov_len: payload.len(),
+        };
+        let mut cmsg_buf = [0u8; 32];
+        let mut msg: libc::msghdr = unsafe { core::mem::zeroed() };
+        msg.msg_iov = &raw mut iov;
+        msg.msg_iovlen = 1;
+        msg.msg_control = cmsg_buf.as_mut_ptr().cast::<libc::c_void>();
+        msg.msg_controllen = cmsg_buf.len() as _;
+        unsafe {
+            let cmsg = libc::CMSG_FIRSTHDR(&raw const msg);
+            (*cmsg).cmsg_level = libc::SOL_SOCKET;
+            (*cmsg).cmsg_type = libc::SCM_RIGHTS;
+            (*cmsg).cmsg_len = libc::CMSG_LEN(core::mem::size_of::<i32>() as u32) as _;
+            let data = libc::CMSG_DATA(cmsg).cast::<i32>();
+            data.write_unaligned(ev);
+            msg.msg_controllen = libc::CMSG_SPACE(core::mem::size_of::<i32>() as u32) as _;
+        }
+        let n = unsafe { libc::sendmsg(s_send, &raw const msg, 0) };
+        if n < 0 {
+            println!("BSF_SENDMSG_FAIL:{}", errno());
+            return 1;
+        }
+
+        unsafe {
+            libc::close(s_send);
+            libc::close(ev);
+        }
+        unsafe { libc::fcntl(s_recv, libc::F_SETFD, 0) };
+
+        let pid = unsafe { libc::fork() };
+        if pid < 0 {
+            println!("BSF_FORK_FAIL:{}", errno());
+            return 1;
+        }
+
+        if pid == 0 {
+            let fd_str = s_recv.to_string();
+            let c_exe = std::ffi::CString::new(child_exe.as_str()).unwrap();
+            let c_a1 = std::ffi::CString::new("unix-socket-test").unwrap();
+            let c_a2 = std::ffi::CString::new("buffered-scm-fork-child").unwrap();
+            let c_a3 = std::ffi::CString::new(fd_str.as_str()).unwrap();
+            let argv = [
+                c_exe.as_ptr(),
+                c_a1.as_ptr(),
+                c_a2.as_ptr(),
+                c_a3.as_ptr(),
+                core::ptr::null(),
+            ];
+            unsafe { libc::execv(c_exe.as_ptr(), argv.as_ptr()) };
+            eprintln!("[BSF-child] execv failed: {}", errno());
+            std::process::exit(127);
+        }
+
+        unsafe { libc::close(s_recv) };
+        let mut status = 0i32;
+        unsafe { libc::waitpid(pid, &raw mut status, 0) };
+        let exit_code = if libc::WIFEXITED(status) {
+            libc::WEXITSTATUS(status)
+        } else {
+            99
+        };
+        if exit_code == 0 {
+            println!("BSF_OK");
+            0
+        } else {
+            println!("BSF_FAIL:exit={exit_code}");
+            1
+        }
+    }
+
+    /// BSF child — recvmsg the buffered SCM_RIGHTS message, then
+    /// eventfd_write/read on the recovered fd to verify it's wired
+    /// up to a real broker handle (or kernel eventfd, on native).
+    fn buffered_scm_fork_child() -> i32 {
+        let fd: i32 = std::env::args()
+            .nth(3)
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(-1);
+        if fd < 0 {
+            eprintln!("[BSF-child] bad fd arg");
+            return 1;
+        }
+        let mut buf = [0u8; 32];
+        let mut iov = libc::iovec {
+            iov_base: buf.as_mut_ptr().cast::<libc::c_void>(),
+            iov_len: buf.len(),
+        };
+        let mut cmsg_buf = [0u8; 64];
+        let mut msg: libc::msghdr = unsafe { core::mem::zeroed() };
+        msg.msg_iov = &raw mut iov;
+        msg.msg_iovlen = 1;
+        msg.msg_control = cmsg_buf.as_mut_ptr().cast::<libc::c_void>();
+        msg.msg_controllen = cmsg_buf.len() as _;
+        let n = unsafe { libc::recvmsg(fd, &raw mut msg, 0) };
+        if n < 0 {
+            eprintln!("[BSF-child] recvmsg failed: {}", errno());
+            return 2;
+        }
+        let mut got_ev: i32 = -1;
+        unsafe {
+            let mut cmsg = libc::CMSG_FIRSTHDR(&raw const msg);
+            while !cmsg.is_null() {
+                if (*cmsg).cmsg_level == libc::SOL_SOCKET && (*cmsg).cmsg_type == libc::SCM_RIGHTS {
+                    let data = libc::CMSG_DATA(cmsg).cast::<i32>();
+                    got_ev = data.read_unaligned();
+                    break;
+                }
+                cmsg = libc::CMSG_NXTHDR(&raw const msg, cmsg);
+            }
+        }
+        if got_ev < 0 {
+            eprintln!("[BSF-child] no SCM_RIGHTS in recvmsg result");
+            return 3;
+        }
+        let v: u64 = 0x4243_5f4f_4b21;
+        let w = unsafe { libc::write(got_ev, (&raw const v).cast::<libc::c_void>(), 8) };
+        if w != 8 {
+            eprintln!("[BSF-child] write to ev failed: w={w} errno={}", errno());
+            return 4;
+        }
+        let mut r: u64 = 0;
+        let rn = unsafe { libc::read(got_ev, (&raw mut r).cast::<libc::c_void>(), 8) };
+        unsafe {
+            libc::close(got_ev);
+            libc::close(fd);
+        }
+        if rn != 8 || r != v {
+            eprintln!("[BSF-child] read mismatch: rn={rn} r={r:#x} expected={v:#x}");
+            return 5;
+        }
+        0
+    }
+
+    /// SXF parent — socketpair-fork-cross:
+    /// socketpair → clear CLOEXEC on child end → fork+execv child_exe.
+    /// Parent writes PING on its end; child writes PONG back. Verifies
+    /// both endpoints of a socketpair survive the cross-host-runner
+    /// bridge in `commit_delayed_fork` when child_exe is a different
+    /// binary type.
+    fn test_socketpair_fork_cross() -> i32 {
+        let child_exe: String = std::env::args().nth(3).unwrap_or_default();
+        if child_exe.is_empty() {
+            println!("SXF_USAGE: unix-socket-test socketpair-fork-cross <child_exe>");
+            return 1;
+        }
+        let mut fds = [0i32; 2];
+        let rc = unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, fds.as_mut_ptr()) };
+        if rc != 0 {
+            println!("SXF_SOCKETPAIR_FAIL:{}", errno());
+            return 1;
+        }
+        let parent_fd = fds[0];
+        let child_fd = fds[1];
+        unsafe { libc::fcntl(child_fd, libc::F_SETFD, 0) };
+
+        let pid = unsafe { libc::fork() };
+        if pid < 0 {
+            println!("SXF_FORK_FAIL:{}", errno());
+            return 1;
+        }
+        if pid == 0 {
+            unsafe { libc::close(parent_fd) };
+            let fd_str = child_fd.to_string();
+            let c_exe = std::ffi::CString::new(child_exe.as_str()).unwrap();
+            let c_a1 = std::ffi::CString::new("unix-socket-test").unwrap();
+            let c_a2 = std::ffi::CString::new("socketpair-fork-cross-child").unwrap();
+            let c_a3 = std::ffi::CString::new(fd_str.as_str()).unwrap();
+            let argv = [
+                c_exe.as_ptr(),
+                c_a1.as_ptr(),
+                c_a2.as_ptr(),
+                c_a3.as_ptr(),
+                core::ptr::null(),
+            ];
+            unsafe { libc::execv(c_exe.as_ptr(), argv.as_ptr()) };
+            eprintln!("[SXF-child] execv failed: {}", errno());
+            std::process::exit(127);
+        }
+        unsafe { libc::close(child_fd) };
+
+        let tv = libc::timeval {
+            tv_sec: 10,
+            tv_usec: 0,
+        };
+        unsafe {
+            libc::setsockopt(
+                parent_fd,
+                libc::SOL_SOCKET,
+                libc::SO_RCVTIMEO,
+                (&raw const tv).cast::<libc::c_void>(),
+                core::mem::size_of::<libc::timeval>() as libc::socklen_t,
+            );
+        }
+
+        let ping = b"SXF_PING";
+        let w = unsafe { libc::write(parent_fd, ping.as_ptr().cast::<libc::c_void>(), ping.len()) };
+        if w != ping.len() as isize {
+            println!("SXF_WRITE_FAIL:n={w} errno={}", errno());
+            unsafe { libc::kill(pid, libc::SIGKILL) };
+            return 1;
+        }
+        let mut buf = [0u8; 32];
+        let n = unsafe {
+            libc::read(
+                parent_fd,
+                buf.as_mut_ptr().cast::<libc::c_void>(),
+                buf.len(),
+            )
+        };
+        unsafe { libc::close(parent_fd) };
+        let mut status = 0i32;
+        unsafe { libc::waitpid(pid, &raw mut status, 0) };
+        let exit_code = if libc::WIFEXITED(status) {
+            libc::WEXITSTATUS(status)
+        } else {
+            99
+        };
+        if n <= 0 {
+            println!("SXF_READ_FAIL:n={n},errno={},exit={exit_code}", errno());
+            return 1;
+        }
+        let reply = core::str::from_utf8(&buf[..n as usize]).unwrap_or("?");
+        if reply == "SXF_PONG" && exit_code == 0 {
+            println!("SXF_OK");
+            0
+        } else {
+            println!("SXF_FAIL:reply={reply},exit={exit_code}");
+            1
+        }
+    }
+
+    fn socketpair_fork_cross_child() -> i32 {
+        let fd: i32 = std::env::args()
+            .nth(3)
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(-1);
+        if fd < 0 {
+            eprintln!("[SXF-child] bad fd arg");
+            return 1;
+        }
+        let tv = libc::timeval {
+            tv_sec: 5,
+            tv_usec: 0,
+        };
+        unsafe {
+            libc::setsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                libc::SO_RCVTIMEO,
+                (&raw const tv).cast::<libc::c_void>(),
+                core::mem::size_of::<libc::timeval>() as libc::socklen_t,
+            );
+        }
+        let mut buf = [0u8; 32];
+        let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast::<libc::c_void>(), buf.len()) };
+        if n <= 0 {
+            eprintln!("[SXF-child] read failed: n={n} errno={}", errno());
+            return 2;
+        }
+        let msg = core::str::from_utf8(&buf[..n as usize]).unwrap_or("?");
+        if msg != "SXF_PING" {
+            eprintln!("[SXF-child] unexpected msg: {msg}");
+            return 3;
+        }
+        let pong = b"SXF_PONG";
+        let w = unsafe { libc::write(fd, pong.as_ptr().cast::<libc::c_void>(), pong.len()) };
+        unsafe { libc::close(fd) };
+        if w == pong.len() as isize { 0 } else { 4 }
+    }
+
+    /// PIF parent — pidfd-inherit-fork:
+    /// 1. fork() a short-lived grandchild that sleeps then exits.
+    /// 2. pidfd_open(grandchild_pid).
+    /// 3. Clear CLOEXEC on the pidfd.
+    /// 4. fork+execv(child_exe, ..., pidfd, grandchild_pid).
+    /// Child poll()s + waitid()s on the inherited pidfd; reports PIF_OK
+    /// iff the wait observes the grandchild's exit. Validates that pidfd
+    /// inheritance survives a cross-host-runner exec.
+    fn test_pidfd_inherit_fork() -> i32 {
+        let child_exe: String = std::env::args().nth(3).unwrap_or_default();
+        if child_exe.is_empty() {
+            println!("PIF_USAGE: unix-socket-test pidfd-inherit-fork <child_exe>");
+            return 1;
+        }
+        // Spawn a grandchild that sleeps 2s then exits cleanly.
+        let gpid = unsafe { libc::fork() };
+        if gpid < 0 {
+            println!("PIF_GRANDCHILD_FORK_FAIL:{}", errno());
+            return 1;
+        }
+        if gpid == 0 {
+            unsafe { libc::sleep(2) };
+            std::process::exit(0);
+        }
+
+        // pidfd_open(SYS_pidfd_open=434 on x86_64).
+        let pidfd = unsafe { libc::syscall(libc::SYS_pidfd_open, gpid, 0) } as i32;
+        if pidfd < 0 {
+            println!("PIF_PIDFD_OPEN_FAIL:{}", errno());
+            unsafe { libc::kill(gpid, libc::SIGKILL) };
+            return 1;
+        }
+        unsafe { libc::fcntl(pidfd, libc::F_SETFD, 0) };
+
+        let pid = unsafe { libc::fork() };
+        if pid < 0 {
+            println!("PIF_FORK_FAIL:{}", errno());
+            unsafe { libc::kill(gpid, libc::SIGKILL) };
+            return 1;
+        }
+        if pid == 0 {
+            let fd_str = pidfd.to_string();
+            let gpid_str = gpid.to_string();
+            let c_exe = std::ffi::CString::new(child_exe.as_str()).unwrap();
+            let c_a1 = std::ffi::CString::new("unix-socket-test").unwrap();
+            let c_a2 = std::ffi::CString::new("pidfd-inherit-child").unwrap();
+            let c_a3 = std::ffi::CString::new(fd_str.as_str()).unwrap();
+            let c_a4 = std::ffi::CString::new(gpid_str.as_str()).unwrap();
+            let argv = [
+                c_exe.as_ptr(),
+                c_a1.as_ptr(),
+                c_a2.as_ptr(),
+                c_a3.as_ptr(),
+                c_a4.as_ptr(),
+                core::ptr::null(),
+            ];
+            unsafe { libc::execv(c_exe.as_ptr(), argv.as_ptr()) };
+            eprintln!("[PIF-child] execv failed: {}", errno());
+            std::process::exit(127);
+        }
+        unsafe { libc::close(pidfd) };
+
+        let mut status = 0i32;
+        unsafe { libc::waitpid(pid, &raw mut status, 0) };
+        let child_exit = if libc::WIFEXITED(status) {
+            libc::WEXITSTATUS(status)
+        } else {
+            99
+        };
+        // Reap the grandchild if the child didn't (defensive — the
+        // child's waitid on the pidfd does not reap on some kernels).
+        unsafe { libc::waitpid(gpid, &raw mut status, libc::WNOHANG) };
+
+        if child_exit == 0 {
+            println!("PIF_OK");
+            0
+        } else {
+            println!("PIF_FAIL:exit={child_exit}");
+            1
+        }
+    }
+
+    fn pidfd_inherit_child() -> i32 {
+        let pidfd: i32 = std::env::args()
+            .nth(3)
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(-1);
+        let gpid: i32 = std::env::args()
+            .nth(4)
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(-1);
+        if pidfd < 0 || gpid < 0 {
+            eprintln!("[PIF-child] bad args");
+            return 1;
+        }
+        // poll(pidfd, POLLIN, 10s) — fires when the (sibling, not
+        // child) grandchild exits. We can't use waitid(P_PIDFD)
+        // here: waitid requires the target to be a child of the
+        // calling process, but the grandchild was forked by our
+        // parent. POLLIN on pidfd works cross-process.
+        let mut pfd = libc::pollfd {
+            fd: pidfd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let rc = unsafe { libc::poll(&raw mut pfd, 1, 10_000) };
+        unsafe { libc::close(pidfd) };
+        if rc <= 0 {
+            eprintln!("[PIF-child] poll failed: rc={rc} errno={}", errno());
+            return 2;
+        }
+        if pfd.revents & libc::POLLIN == 0 {
+            eprintln!("[PIF-child] no POLLIN: revents={}", pfd.revents);
+            return 3;
+        }
+        // Sanity: also verify the grandchild process is gone.
+        let _ = gpid;
+        0
     }
 
     fn errno() -> i32 {

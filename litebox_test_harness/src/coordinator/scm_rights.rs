@@ -108,6 +108,7 @@ struct ScmScenario {
 #[serde(rename_all = "snake_case")]
 enum ScmKind {
     PassEventfd,
+    PassEventfdPollWake,
     PassTcpSocket,
     PassThenCloseSender,
     PassTwoFdsOneMsg,
@@ -117,6 +118,10 @@ const SCM_SCENARIOS: &[ScmScenario] = &[
     ScmScenario {
         name: "pass_eventfd",
         kind: ScmKind::PassEventfd,
+    },
+    ScmScenario {
+        name: "pass_eventfd_poll_wake",
+        kind: ScmKind::PassEventfdPollWake,
     },
     ScmScenario {
         name: "pass_tcp_socket",
@@ -340,6 +345,7 @@ fn accept_and_validate(kind: ScmKind, listener: UnixListener) -> Result<ScmOut, 
     let stream = listener.accept()?;
     match kind {
         ScmKind::PassEventfd => receive_eventfd(stream, 7, false, "eventfd"),
+        ScmKind::PassEventfdPollWake => receive_eventfd_poll_wake(stream),
         ScmKind::PassTcpSocket => receive_tcp(stream),
         ScmKind::PassThenCloseSender => receive_eventfd(stream, 5, true, "close_sender"),
         ScmKind::PassTwoFdsOneMsg => receive_two_eventfds(stream),
@@ -352,6 +358,25 @@ fn send_for_scenario(kind: ScmKind, socket_path: &str) -> Result<(), String> {
             let ev = EventFd::open(0, "nonblock|cloexec").map_err(|e| e.to_string())?;
             let stream = UnixStream::connect(socket_path)?;
             stream.send_fd(ev.as_fd(), b"eventfd")?;
+            ev.write(7).map_err(|e| e.to_string())?;
+            Ok(())
+        }
+        ScmKind::PassEventfdPollWake => {
+            let ev = EventFd::open(0, "nonblock|cloexec").map_err(|e| e.to_string())?;
+            let stream = UnixStream::connect(socket_path)?;
+            stream.send_fd(ev.as_fd(), b"eventfd_poll_wake")?;
+            // Wait for receiver to confirm fast epoll_wait(0) returned no
+            // events (READY sentinel = single 'R' byte).
+            let mut sentinel = [0u8; 1];
+            stream.read_exact(&mut sentinel)?;
+            if sentinel[0] != b'R' {
+                return Err(format!(
+                    "poll_wake: bad READY sentinel {:?}",
+                    sentinel[0] as char
+                ));
+            }
+            // Now write to the eventfd; the receiver's epoll_wait(2000ms)
+            // should observe IN promptly.
             ev.write(7).map_err(|e| e.to_string())?;
             Ok(())
         }
@@ -397,6 +422,48 @@ fn receive_eventfd(
     }
     Ok(ScmOut {
         detail: format!("received_eventfd_fd={} value={value}", ev.as_raw_fd()),
+    })
+}
+
+fn receive_eventfd_poll_wake(stream: UnixStream) -> Result<ScmOut, String> {
+    let (fd, payload) = stream.recv_fd(64)?;
+    expect_payload(&payload, "eventfd_poll_wake")?;
+    let ev = eventfd_from_received(fd);
+    let mut epoll = crate::os::epoll::Epoll::new().map_err(|e| format!("epoll_create1: {e}"))?;
+    epoll
+        .add_fd(
+            ev.as_raw_fd(),
+            "in",
+            crate::os::epoll::EpollTarget {
+                kind: "eventfd",
+                id: ev.as_raw_fd() as u64,
+            },
+        )
+        .map_err(|e| format!("epoll_ctl add eventfd: {e}"))?;
+    // Step 4: fast poll (timeout=0) should report no events.
+    let pre = epoll
+        .wait(0, 4)
+        .map_err(|e| format!("pre epoll_wait: {e}"))?;
+    if !pre.is_empty() {
+        return Err(format!("pre epoll_wait(0) expected no events, got {pre:?}"));
+    }
+    // Tell sender to write.
+    stream.write_all(b"R")?;
+    // Step 6: wait up to 2s for the sender's write to wake us.
+    let started = std::time::Instant::now();
+    let post = epoll
+        .wait(2000, 4)
+        .map_err(|e| format!("post epoll_wait: {e}"))?;
+    let elapsed_ms = started.elapsed().as_millis();
+    if post.is_empty() {
+        return Err(format!(
+            "post epoll_wait(2000) timed out without IN ({elapsed_ms}ms elapsed)"
+        ));
+    }
+    // Drain the eventfd so the post-test state is clean.
+    let value = ev.read().map_err(|e| e.to_string())?;
+    Ok(ScmOut {
+        detail: format!("poll_wake_received={value} events={post:?} wake_ms={elapsed_ms}"),
     })
 }
 

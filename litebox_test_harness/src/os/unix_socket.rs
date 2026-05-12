@@ -128,6 +128,67 @@ impl UnixStream {
         Ok(Self { fd })
     }
 
+    /// Write all bytes on the socket. Used for tiny in-band signaling
+    /// (e.g., a "READY" sentinel) alongside `SCM_RIGHTS` exchanges.
+    ///
+    /// # Errors
+    /// Returns an error string if `write(2)` returns a short or failing result.
+    pub fn write_all(&self, buf: &[u8]) -> Result<(), String> {
+        let mut written = 0;
+        while written < buf.len() {
+            // SAFETY: self.fd is a live socket; buf is a valid slice.
+            let rc = unsafe {
+                libc::write(
+                    self.fd.as_raw_fd(),
+                    buf[written..].as_ptr().cast(),
+                    buf.len() - written,
+                )
+            };
+            if rc > 0 {
+                written += rc as usize;
+                continue;
+            }
+            let err = std::io::Error::last_os_error();
+            if err.raw_os_error() == Some(libc::EINTR) {
+                continue;
+            }
+            return Err(format!("write_all: {err}"));
+        }
+        Ok(())
+    }
+
+    /// Read exactly `buf.len()` bytes, looping over short reads.
+    ///
+    /// # Errors
+    /// Returns an error string if the peer closes before `buf.len()` bytes
+    /// arrive or if `read(2)` fails.
+    pub fn read_exact(&self, buf: &mut [u8]) -> Result<(), String> {
+        let mut read = 0;
+        while read < buf.len() {
+            // SAFETY: self.fd is a live socket; buf is a valid slice.
+            let rc = unsafe {
+                libc::read(
+                    self.fd.as_raw_fd(),
+                    buf[read..].as_mut_ptr().cast(),
+                    buf.len() - read,
+                )
+            };
+            if rc > 0 {
+                read += rc as usize;
+                continue;
+            }
+            if rc == 0 {
+                return Err(format!("read_exact: EOF after {read} bytes"));
+            }
+            let err = std::io::Error::last_os_error();
+            if err.raw_os_error() == Some(libc::EINTR) {
+                continue;
+            }
+            return Err(format!("read_exact: {err}"));
+        }
+        Ok(())
+    }
+
     /// Send one fd with `SCM_RIGHTS`.
     ///
     /// # Errors
