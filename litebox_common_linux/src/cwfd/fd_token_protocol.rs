@@ -119,6 +119,8 @@ pub enum Opcode {
     SubscribeEventfd = 0x13,
     Unsubscribe = 0x14,
     DupHandle = 0x15,
+    CreatePidfd = 0x20,
+    PidfdExited = 0x21,
 
     RegisterResponse = 0x81,
     MaterializeResponse = 0x82,
@@ -130,6 +132,8 @@ pub enum Opcode {
     SubscribeEventfdResponse = 0x93,
     UnsubscribeResponse = 0x94,
     DupHandleResponse = 0x95,
+    CreatePidfdResponse = 0xA0,
+    PidfdExitedResponse = 0xA1,
 }
 
 /// Reserved opcode ranges per kind. P2.B/A/C subagents append their
@@ -166,6 +170,8 @@ impl Opcode {
             Opcode::SubscribeEventfd => Some(Opcode::SubscribeEventfdResponse),
             Opcode::Unsubscribe => Some(Opcode::UnsubscribeResponse),
             Opcode::DupHandle => Some(Opcode::DupHandleResponse),
+            Opcode::CreatePidfd => Some(Opcode::CreatePidfdResponse),
+            Opcode::PidfdExited => Some(Opcode::PidfdExitedResponse),
             _ => None,
         }
     }
@@ -184,6 +190,8 @@ impl Opcode {
                 | Opcode::SubscribeEventfd
                 | Opcode::Unsubscribe
                 | Opcode::DupHandle
+                | Opcode::CreatePidfd
+                | Opcode::PidfdExited
         )
     }
 
@@ -217,6 +225,8 @@ impl TryFrom<u8> for Opcode {
             0x13 => Ok(Opcode::SubscribeEventfd),
             0x14 => Ok(Opcode::Unsubscribe),
             0x15 => Ok(Opcode::DupHandle),
+            0x20 => Ok(Opcode::CreatePidfd),
+            0x21 => Ok(Opcode::PidfdExited),
             0x81 => Ok(Opcode::RegisterResponse),
             0x82 => Ok(Opcode::MaterializeResponse),
             0x83 => Ok(Opcode::ReleaseResponse),
@@ -227,6 +237,8 @@ impl TryFrom<u8> for Opcode {
             0x93 => Ok(Opcode::SubscribeEventfdResponse),
             0x94 => Ok(Opcode::UnsubscribeResponse),
             0x95 => Ok(Opcode::DupHandleResponse),
+            0xA0 => Ok(Opcode::CreatePidfdResponse),
+            0xA1 => Ok(Opcode::PidfdExitedResponse),
             other => Err(ProtocolError::UnknownOpcode { opcode: other }),
         }
     }
@@ -584,6 +596,78 @@ pub fn build_create_eventfd_response_ok(handle_id: u64) -> OwnedFrame {
     }
 }
 
+/// Body for [`Opcode::CreatePidfd`]: target host pid (u32 LE).
+pub fn build_create_pidfd_request(target_host_pid: u32) -> OwnedFrame {
+    OwnedFrame {
+        opcode: Opcode::CreatePidfd,
+        status: StatusCode::Ok,
+        body: target_host_pid.to_le_bytes().to_vec(),
+    }
+}
+
+/// Decodes the body of a CreatePidfd request frame.
+pub fn parse_create_pidfd_body(body: &[u8]) -> Result<u32, ProtocolError> {
+    if body.len() != 4 {
+        return Err(ProtocolError::WrongBodyLen {
+            opcode: Opcode::CreatePidfd,
+            got: body.len(),
+            want: 4,
+        });
+    }
+    Ok(u32::from_le_bytes([body[0], body[1], body[2], body[3]]))
+}
+
+/// Body for [`Opcode::CreatePidfdResponse`]: handle id.
+pub fn build_create_pidfd_response_ok(handle_id: u64) -> OwnedFrame {
+    OwnedFrame {
+        opcode: Opcode::CreatePidfdResponse,
+        status: StatusCode::Ok,
+        body: handle_id.to_le_bytes().to_vec(),
+    }
+}
+
+/// Decodes the body of a CreatePidfdResponse success frame.
+pub fn parse_create_pidfd_response_ok(body: &[u8]) -> Result<u64, ProtocolError> {
+    parse_handle_body(body, Opcode::CreatePidfdResponse)
+}
+
+/// Body for [`Opcode::PidfdExited`]: handle id.
+pub fn build_pidfd_exited_request(handle_id: u64) -> OwnedFrame {
+    OwnedFrame {
+        opcode: Opcode::PidfdExited,
+        status: StatusCode::Ok,
+        body: handle_id.to_le_bytes().to_vec(),
+    }
+}
+
+/// Decodes the body of a PidfdExited request frame.
+pub fn parse_pidfd_exited_request(body: &[u8]) -> Result<u64, ProtocolError> {
+    parse_handle_body(body, Opcode::PidfdExited)
+}
+
+/// Body for [`Opcode::PidfdExitedResponse`]: exited flag (u8).
+pub fn build_pidfd_exited_response_ok(exited: bool) -> OwnedFrame {
+    let mut body = Vec::with_capacity(1);
+    body.push(u8::from(exited));
+    OwnedFrame {
+        opcode: Opcode::PidfdExitedResponse,
+        status: StatusCode::Ok,
+        body,
+    }
+}
+
+/// Decodes the body of a PidfdExitedResponse success frame.
+pub fn parse_pidfd_exited_response_ok(body: &[u8]) -> Result<bool, ProtocolError> {
+    if body.len() != 1 {
+        return Err(ProtocolError::WrongBodyLen {
+            opcode: Opcode::PidfdExitedResponse,
+            got: body.len(),
+            want: 1,
+        });
+    }
+    Ok(body[0] != 0)
+}
+
 /// Body for [`Opcode::ReadEventfd`]: handle id.
 pub fn build_read_eventfd_request(handle_id: u64) -> OwnedFrame {
     OwnedFrame {
@@ -794,6 +878,8 @@ mod tests {
             Opcode::WriteEventfd,
             Opcode::SubscribeEventfd,
             Opcode::Unsubscribe,
+            Opcode::CreatePidfd,
+            Opcode::PidfdExited,
             Opcode::RegisterResponse,
             Opcode::MaterializeResponse,
             Opcode::ReleaseResponse,
@@ -803,6 +889,8 @@ mod tests {
             Opcode::WriteEventfdResponse,
             Opcode::SubscribeEventfdResponse,
             Opcode::UnsubscribeResponse,
+            Opcode::CreatePidfdResponse,
+            Opcode::PidfdExitedResponse,
         ] {
             assert_eq!(Opcode::try_from(op as u8).unwrap(), op);
         }
@@ -822,6 +910,14 @@ mod tests {
             Opcode::Unsubscribe.response_for(),
             Some(Opcode::UnsubscribeResponse)
         );
+        assert_eq!(
+            Opcode::CreatePidfd.response_for(),
+            Some(Opcode::CreatePidfdResponse)
+        );
+        assert_eq!(
+            Opcode::PidfdExited.response_for(),
+            Some(Opcode::PidfdExitedResponse)
+        );
         assert_eq!(Opcode::ReadEventfdResponse.response_for(), None);
     }
 
@@ -838,9 +934,13 @@ mod tests {
             Opcode::WriteEventfd,
             Opcode::SubscribeEventfd,
             Opcode::Unsubscribe,
+            Opcode::CreatePidfd,
+            Opcode::PidfdExited,
             Opcode::RegisterResponse,
             Opcode::CreateEventfdResponse,
             Opcode::ReadEventfdResponse,
+            Opcode::CreatePidfdResponse,
+            Opcode::PidfdExitedResponse,
         ] {
             assert_eq!(op.expected_fd_count(), 0, "{op:?}");
         }
@@ -887,6 +987,33 @@ mod tests {
         let g = decode(&bytes).unwrap();
         assert_eq!(g.opcode, Opcode::CreateEventfdResponse);
         assert_eq!(parse_handle_body(g.body, g.opcode).unwrap(), 7);
+    }
+
+    #[test]
+    fn round_trip_pidfd_messages() {
+        let create = build_create_pidfd_request(1234);
+        let bytes = create.encode().unwrap();
+        let decoded = decode(&bytes).unwrap();
+        assert_eq!(decoded.opcode, Opcode::CreatePidfd);
+        assert_eq!(parse_create_pidfd_body(decoded.body).unwrap(), 1234);
+
+        let create_resp = build_create_pidfd_response_ok(0xabc);
+        let bytes = create_resp.encode().unwrap();
+        let decoded = decode(&bytes).unwrap();
+        assert_eq!(decoded.opcode, Opcode::CreatePidfdResponse);
+        assert_eq!(parse_create_pidfd_response_ok(decoded.body).unwrap(), 0xabc);
+
+        let exited = build_pidfd_exited_request(0xdef);
+        let bytes = exited.encode().unwrap();
+        let decoded = decode(&bytes).unwrap();
+        assert_eq!(decoded.opcode, Opcode::PidfdExited);
+        assert_eq!(parse_pidfd_exited_request(decoded.body).unwrap(), 0xdef);
+
+        let exited_resp = build_pidfd_exited_response_ok(true);
+        let bytes = exited_resp.encode().unwrap();
+        let decoded = decode(&bytes).unwrap();
+        assert_eq!(decoded.opcode, Opcode::PidfdExitedResponse);
+        assert!(parse_pidfd_exited_response_ok(decoded.body).unwrap());
     }
 
     #[test]
