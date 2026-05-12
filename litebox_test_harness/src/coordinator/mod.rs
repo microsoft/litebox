@@ -16,6 +16,7 @@ pub(crate) mod getrandom_tests;
 pub(crate) mod inotify;
 pub(crate) mod iouring_discovery;
 pub(crate) mod matrix;
+pub(crate) mod pidfd_inherit;
 pub(crate) mod pipe_bridge;
 pub(crate) mod platform_fixes;
 pub(crate) mod port_router;
@@ -957,6 +958,7 @@ pub fn collect_all_tests() -> Vec<Test> {
     eventfd::register_eventfd_tests(&mut registry::Registry::new(&mut tests));
     inotify::register_inotify_tests(&mut registry::Registry::new(&mut tests));
     epoll_pidfd::register_epoll_pidfd_tests(&mut registry::Registry::new(&mut tests));
+    pidfd_inherit::register_pidfd_inherit_tests(&mut registry::Registry::new(&mut tests));
     clone3_matrix::register_clone3_matrix(&mut registry::Registry::new(&mut tests));
     scm_rights::register_scm_rights_tests(&mut registry::Registry::new(&mut tests));
     sockopt::register_sockopt_tests(&mut registry::Registry::new(&mut tests));
