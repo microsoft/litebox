@@ -215,29 +215,6 @@ fn detect_runtime_environment() -> String {
     }
 }
 
-/// Create an Exec command with default 10s timeout.
-#[allow(dead_code)]
-pub(crate) fn exec(args: Vec<String>) -> Command {
-    Command::Exec {
-        args,
-        timeout_secs: None,
-        stdin: None,
-        background: false,
-        env: vec![],
-    }
-}
-
-/// Create an Exec command with a custom timeout.
-pub(crate) fn exec_timeout(args: Vec<String>, secs: u64) -> Command {
-    Command::Exec {
-        args,
-        timeout_secs: Some(secs),
-        stdin: None,
-        background: false,
-        env: vec![],
-    }
-}
-
 pub(crate) struct Child {
     pub(crate) stdin: tokio::process::ChildStdin,
     pub(crate) stdout: BufReader<tokio::process::ChildStdout>,
