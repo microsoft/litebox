@@ -17,12 +17,196 @@
 //!   - Agent topology: A (depth 1), AA (depth 2), NP (non-PIE worker)
 //!   - Subcommand vs bash: protocol Exec(bash -c ...) and direct fork
 
-use super::agents::AgentName;
+use serde::{Deserialize, Serialize};
+
+use super::agents::{AgentName, SpawnKind};
 use super::common;
 use super::registry::Registry;
+use crate::handlers::{HandlerCtx, HandlerError, HandlerToken};
+use crate::register_handler;
 
 /// Agents to run concurrent fork tests on.
 const CF_AGENTS: &[AgentName] = &[AgentName::Dpg1, AgentName::Dpg1Dpg1, AgentName::Dpg2];
+
+#[derive(Serialize, Deserialize)]
+struct ConcurrentFsArgs {
+    n: u32,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+struct ConcurrentFsOut {
+    detail: String,
+}
+
+const CONCURRENT_FS: HandlerToken<ConcurrentFsArgs, ConcurrentFsOut> =
+    HandlerToken::new("concurrent_fork.concurrent_fs");
+const CONCURRENT_FS_MULTI: HandlerToken<ConcurrentFsArgs, ConcurrentFsOut> =
+    HandlerToken::new("concurrent_fork.concurrent_fs_multi");
+
+fn fork_binary_label(bt: crate::BinaryType) -> &'static str {
+    match bt {
+        crate::BinaryType::PieGlibc => "self",
+        crate::BinaryType::NonPieGlibc => "nonpie",
+        crate::BinaryType::StaticPieGlibc => "static-pie-glibc",
+        crate::BinaryType::StaticPieMusl => "static-pie-musl",
+        crate::BinaryType::NonPieStaticMusl => "non-pie-static-musl",
+    }
+}
+
+async fn handle_concurrent_fs(
+    args: ConcurrentFsArgs,
+    _ctx: &mut HandlerCtx<'_>,
+) -> Result<ConcurrentFsOut, HandlerError> {
+    let n_children = args.n as usize;
+    let file_to_open = "/lib/x86_64-linux-gnu/libc.so.6";
+
+    eprintln!("[concurrent-fs] forking {n_children} children, each opens {file_to_open}");
+
+    let mut child_pids = Vec::new();
+    for i in 0..n_children {
+        let pre_fd = std::fs::File::open(file_to_open);
+
+        // SAFETY: fork is called in a leaf test process. The child does only
+        // simple file I/O and exits immediately; the parent records the pid.
+        let pid = unsafe { libc::fork() };
+        if pid < 0 {
+            eprintln!("[concurrent-fs] fork {i} failed");
+            continue;
+        }
+        if pid == 0 {
+            drop(pre_fd);
+            match std::fs::File::open(file_to_open) {
+                Ok(mut f) => {
+                    use std::io::Read;
+                    let mut buf = [0u8; 16];
+                    let _ = f.read(&mut buf);
+                    drop(f);
+                    eprintln!("[concurrent-fs] child {i} OK");
+                    std::process::exit(0);
+                }
+                Err(e) => {
+                    eprintln!("[concurrent-fs] child {i} open failed: {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
+        child_pids.push(pid);
+    }
+
+    let all_ok = wait_for_children(&child_pids, "concurrent-fs", "RwLock deadlock?");
+    let detail = if all_ok {
+        format!("CONCURRENT_FS_OK:{n_children}")
+    } else {
+        format!("CONCURRENT_FS_FAIL:{n_children} (concurrent open+close deadlocked)")
+    };
+    Ok(ConcurrentFsOut { detail })
+}
+
+async fn handle_concurrent_fs_multi(
+    args: ConcurrentFsArgs,
+    _ctx: &mut HandlerCtx<'_>,
+) -> Result<ConcurrentFsOut, HandlerError> {
+    let libs: &[&str] = &[
+        "/lib/x86_64-linux-gnu/libc.so.6",
+        "/lib/x86_64-linux-gnu/libm.so.6",
+        "/lib/x86_64-linux-gnu/libdl.so.2",
+        "/lib/x86_64-linux-gnu/libpthread.so.0",
+        "/lib/x86_64-linux-gnu/librt.so.1",
+        "/lib/x86_64-linux-gnu/libresolv.so.2",
+        "/lib/x86_64-linux-gnu/libnss_files.so.2",
+        "/lib/x86_64-linux-gnu/libnss_dns.so.2",
+    ];
+
+    let n_children = args.n as usize;
+    eprintln!(
+        "[concurrent-fs-multi] forking {n_children} children, each opens {} libs",
+        libs.len()
+    );
+
+    let mut child_pids = Vec::new();
+    for i in 0..n_children {
+        let pre_fds: Vec<_> = libs
+            .iter()
+            .filter_map(|p| std::fs::File::open(p).ok())
+            .collect();
+
+        // SAFETY: fork is called in a leaf test process. The child does only
+        // simple file I/O and exits immediately; the parent records the pid.
+        let pid = unsafe { libc::fork() };
+        if pid < 0 {
+            eprintln!("[concurrent-fs-multi] fork {i} failed");
+            continue;
+        }
+        if pid == 0 {
+            drop(pre_fds);
+
+            let mut ok = true;
+            for &lib in libs {
+                match std::fs::File::open(lib) {
+                    Ok(mut f) => {
+                        use std::io::Read;
+                        let mut buf = [0u8; 16];
+                        let _ = f.read(&mut buf);
+                        drop(f);
+                    }
+                    Err(e) => {
+                        eprintln!("[concurrent-fs-multi] child {i} open {lib}: {e}");
+                        ok = false;
+                    }
+                }
+            }
+            eprintln!("[concurrent-fs-multi] child {i} done ok={ok}");
+            std::process::exit(i32::from(!ok));
+        }
+        child_pids.push(pid);
+    }
+
+    let all_ok = wait_for_children(
+        &child_pids,
+        "concurrent-fs-multi",
+        "open() write-lock deadlock?",
+    );
+    let detail = if all_ok {
+        format!("CONCURRENT_FS_MULTI_OK:{n_children}")
+    } else {
+        format!("CONCURRENT_FS_MULTI_FAIL:{n_children} (open write-lock deadlock)")
+    };
+    Ok(ConcurrentFsOut { detail })
+}
+
+fn wait_for_children(child_pids: &[libc::pid_t], label: &str, timeout_reason: &str) -> bool {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    let mut all_ok = true;
+    for (i, &pid) in child_pids.iter().enumerate() {
+        let mut status = 0i32;
+        loop {
+            // SAFETY: pid was returned by fork in this process. status points
+            // to valid writable storage and WNOHANG avoids blocking forever.
+            let ret = unsafe { libc::waitpid(pid, &raw mut status, libc::WNOHANG) };
+            if ret > 0 {
+                if libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0 {
+                    break;
+                }
+                eprintln!("[{label}] child {i} bad exit: {status}");
+                all_ok = false;
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                eprintln!("[{label}] child {i} TIMEOUT ({timeout_reason})");
+                // SAFETY: pid is a child process id returned by fork. Sending
+                // SIGKILL is the timeout cleanup path for a stuck child.
+                unsafe { libc::kill(pid, libc::SIGKILL) };
+                // SAFETY: pid is the same child; null status is allowed when
+                // the exit status is intentionally discarded after cleanup.
+                unsafe { libc::waitpid(pid, std::ptr::null_mut(), 0) };
+                all_ok = false;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    }
+    all_ok
+}
 
 /// Pipeline patterns with increasing concurrency and library diversity.
 /// Each child in a pipeline loads different shared libraries via 9P,
@@ -79,6 +263,9 @@ const PIPELINE_PATTERNS: &[PipelinePattern] = &[
 /// Register concurrent fork pipeline tests.
 #[allow(clippy::too_many_lines)] // exhaustive registration / runner
 pub(crate) fn register_concurrent_fork_pipeline(reg: &mut Registry<'_>) {
+    register_handler!(CONCURRENT_FS, handle_concurrent_fs);
+    register_handler!(CONCURRENT_FS_MULTI, handle_concurrent_fs_multi);
+
     for &agent in CF_AGENTS {
         for pat in PIPELINE_PATTERNS {
             let name = pat.name;
@@ -322,26 +509,23 @@ pub(crate) fn register_concurrent_fs_rwlock(reg: &mut Registry<'_>) {
                 )
                 .timeout(90)
                 .build(move |cx| {
-                    let handle = cx.require(agent);
+                    let leaf = cx.declare_ephemeral(
+                        agent,
+                        format!("ConcurrentFsLeaf{n}{}{}", bt.short_label(), agent),
+                        SpawnKind::Fork {
+                            binary: fork_binary_label(bt),
+                            inherit_listen_ports: vec![],
+                        },
+                    );
                     Box::new(move |run| {
                         let agent_label = agent_label.clone();
                         Box::pin(async move {
-                            let self_exe = run.self_exe().to_string();
-                            let target = crate::binary_path(bt, &self_exe);
                             let resp = run
-                                .send_named_typed(
-                                    &handle,
-                                    &common::BASH,
-                                    common::BashArgs {
-                                        cmd: format!("{target} concurrent-fs {n}"),
-                                        timeout_ms: Some(15_000),
-                                    },
-                                )
+                                .run_leaf(&leaf, &CONCURRENT_FS, ConcurrentFsArgs { n: n as u32 })
                                 .await;
                             let pass = matches!(
                                 &resp,
-                                Ok(out) if out.exit_code == 0
-                                    && out.stdout.contains("CONCURRENT_FS_OK")
+                                Ok(out) if out.detail.contains("CONCURRENT_FS_OK")
                             );
                             super::TestOutcome::new(&agent_label, pass, format!("{resp:?}"))
                         })
@@ -363,26 +547,27 @@ pub(crate) fn register_concurrent_fs_rwlock(reg: &mut Registry<'_>) {
                 )
                 .timeout(90)
                 .build(move |cx| {
-                    let handle = cx.require(agent);
+                    let leaf = cx.declare_ephemeral(
+                        agent,
+                        format!("ConcurrentFsMultiLeaf{n}{}{}", bt.short_label(), agent),
+                        SpawnKind::Fork {
+                            binary: fork_binary_label(bt),
+                            inherit_listen_ports: vec![],
+                        },
+                    );
                     Box::new(move |run| {
                         let agent_label = agent_label.clone();
                         Box::pin(async move {
-                            let self_exe = run.self_exe().to_string();
-                            let target = crate::binary_path(bt, &self_exe);
                             let resp = run
-                                .send_named_typed(
-                                    &handle,
-                                    &common::BASH,
-                                    common::BashArgs {
-                                        cmd: format!("{target} concurrent-fs-multi {n}"),
-                                        timeout_ms: Some(15_000),
-                                    },
+                                .run_leaf(
+                                    &leaf,
+                                    &CONCURRENT_FS_MULTI,
+                                    ConcurrentFsArgs { n: n as u32 },
                                 )
                                 .await;
                             let pass = matches!(
                                 &resp,
-                                Ok(out) if out.exit_code == 0
-                                    && out.stdout.contains("CONCURRENT_FS_MULTI_OK")
+                                Ok(out) if out.detail.contains("CONCURRENT_FS_MULTI_OK")
                             );
                             super::TestOutcome::new(&agent_label, pass, format!("{resp:?}"))
                         })
