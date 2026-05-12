@@ -2616,6 +2616,7 @@ impl<FS: ShimFS> Task<FS> {
         if received_fds.is_empty() && received_tokens.is_empty() {
             hdr.msg_controllen = 0;
         } else {
+            let cloexec = flags.contains(ReceiveFlags::CMSG_CLOEXEC);
             let mut installed_fds = Vec::with_capacity(received_fds.len() + received_tokens.len());
             {
                 let files = self.files.borrow();
@@ -2639,13 +2640,25 @@ impl<FS: ShimFS> Task<FS> {
                             continue;
                         };
                         let handle_id = token.id();
+                        // Apply MSG_CMSG_CLOEXEC right at construction
+                        // (matches Linux recvmsg semantics where the
+                        // received fd is created with CLOEXEC atomically).
+                        let efd_flags = if cloexec {
+                            litebox_common_linux::EfdFlags::CLOEXEC
+                        } else {
+                            litebox_common_linux::EfdFlags::empty()
+                        };
                         let eventfd = super::eventfd::EventFile::new_broker_backed(
-                            provider,
-                            handle_id,
-                            litebox_common_linux::EfdFlags::empty(),
+                            provider, handle_id, efd_flags,
                         );
                         let mut dt = self.global.litebox.descriptor_table_mut();
                         let typed = dt.insert::<super::eventfd::EventfdSubsystem>(eventfd);
+                        if cloexec {
+                            let _ = dt.set_fd_metadata(
+                                &typed,
+                                litebox_common_linux::FileDescriptorFlags::FD_CLOEXEC,
+                            );
+                        }
                         drop(dt);
                         let files = self.files.borrow();
                         match files.insert_raw_fd(typed) {
