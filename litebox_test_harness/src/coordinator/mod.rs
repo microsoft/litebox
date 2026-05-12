@@ -792,20 +792,23 @@ fn register_canary(reg: &mut registry::Registry<'_>) {
             Box::new(move |run| {
                 let self_exe = run.self_exe().to_string();
                 Box::pin(async move {
-                    let canary_cmd = crate::protocol::Command::Exec {
-                        args: vec![self_exe, "echo-test".into()],
-                        timeout_secs: None,
-                        stdin: None,
-                        background: false,
-                        env: vec![],
-                    };
-                    let resp = run.send(&a, canary_cmd).await;
+                    let result = run
+                        .send_named_typed(
+                            &a,
+                            &common::EXEC_BIN,
+                            common::ExecBinArgs {
+                                argv: vec![self_exe, "echo-test".into()],
+                                timeout_ms: None,
+                                stdin: None,
+                                env: vec![],
+                            },
+                        )
+                        .await;
                     let pass = matches!(
-                        &resp,
-                        crate::protocol::Response::ExecResult { exit_code: 0, stdout, .. }
-                            if stdout.trim() == "ECHO_TEST_OK"
+                        &result,
+                        Ok(out) if out.exit_code == 0 && out.stdout.trim() == "ECHO_TEST_OK"
                     );
-                    TestOutcome::new(agents::AgentName::Dpg1.name(), pass, format!("{resp:?}"))
+                    TestOutcome::new(agents::AgentName::Dpg1.name(), pass, format!("{result:?}"))
                 })
             })
         });
