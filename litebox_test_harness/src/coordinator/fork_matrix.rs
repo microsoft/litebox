@@ -689,6 +689,47 @@ pub(crate) fn register_fork_matrix(reg: &mut Registry<'_>) {
         }
     }
 
+    // BSF.<bt> — buffered-SCM-fork. Validates p4-fork-restore-tokens:
+    // parent buffers an eventfd in a socketpair's recv queue via
+    // sendmsg(SCM_RIGHTS), then fork+execs into `bt`. When `bt` is a
+    // different binary type from the parent (Dpg1), the cross-host
+    // bridge in `commit_delayed_fork` must serialize the buffered
+    // SCM_RIGHTS fd via a `BrokerFdToken` for the child to recvmsg
+    // a working fd. Native: all binaries pass (real kernel keeps the
+    // buffered fd live across fork). Litebox today: returns ENOSYS
+    // when buffered_fds is non-empty for a cross-worker bridge.
+    for &bt in crate::BinaryType::ALL {
+        let bt_label = bt.label();
+        reg.test("fork", "fork_matrix", format!("BSF.{bt_label}"))
+            .timeout(60)
+            .build(move |cx| {
+                let handle = cx.require(AgentName::Dpg1);
+                Box::new(move |run| {
+                    Box::pin(async move {
+                        let self_exe = run.self_exe().to_string();
+                        let child_target = crate::binary_path(bt, &self_exe);
+                        let resp = run
+                            .send(
+                                &handle,
+                                super::exec(vec![
+                                    self_exe,
+                                    "unix-socket-test".into(),
+                                    "buffered-scm-fork".into(),
+                                    child_target,
+                                ]),
+                            )
+                            .await;
+                        let pass = matches!(
+                            &resp,
+                            crate::protocol::Response::ExecResult { exit_code: 0, stdout, .. }
+                                if stdout.contains("BSF_OK")
+                        );
+                        super::TestOutcome::new("A", pass, format!("{resp:?}"))
+                    })
+                })
+            });
+    }
+
     // XDF.triple_nesting
     for &bt in crate::BinaryType::ALL {
         let bt_label = bt.label();
