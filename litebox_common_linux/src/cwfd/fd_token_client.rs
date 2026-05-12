@@ -24,11 +24,12 @@
 
 use crate::fd_token_protocol::{
     self as proto, BODY_MAX, CTRL_HEADER_LEN, Frame, Opcode, ProtocolError, StatusCode,
-    build_create_eventfd_request, build_create_pidfd_request, build_materialize_request,
-    build_pidfd_exited_request, build_read_eventfd_request,
-    build_register_notification_ring_request, build_register_request, build_release_request,
-    build_subscribe_eventfd_request, build_unsubscribe_request, build_write_eventfd_request,
-    decode, parse_create_pidfd_response_ok, parse_handle_body, parse_pidfd_exited_response_ok,
+    build_create_eventfd_request, build_create_pidfd_request, build_create_signalfd_request,
+    build_materialize_request, build_pidfd_exited_request, build_read_eventfd_request,
+    build_read_siginfo_request, build_register_notification_ring_request, build_register_request,
+    build_release_request, build_subscribe_eventfd_request, build_unsubscribe_request,
+    build_write_eventfd_request, decode, parse_create_pidfd_response_ok, parse_handle_body,
+    parse_pidfd_exited_response_ok, parse_read_siginfo_response_body,
 };
 use std::format;
 use std::io;
@@ -309,6 +310,52 @@ impl FdTokenClient {
             StatusCode::Ok => {
                 parse_pidfd_exited_response_ok(resp.body).map_err(ClientError::Protocol)
             }
+            StatusCode::UnknownHandle => Err(ClientError::UnknownHandle { handle_id }),
+            s => Err(map_status_with_handle(resp.opcode, s, handle_id)),
+        }
+    }
+
+    /// Asks the broker to create a signalfd state with the given mask.
+    pub fn create_signalfd(&self, sigmask_lo: u64, sigmask_hi: u64) -> Result<u64, ClientError> {
+        let stream = self.lock();
+        send_frame(
+            &stream,
+            &build_create_signalfd_request(sigmask_lo, sigmask_hi),
+            None,
+        )?;
+        let (resp_bytes, attached) = recv_frame(&stream)?;
+        let resp = decode(&resp_bytes).map_err(ClientError::Protocol)?;
+        check_opcode(&resp, Opcode::CreateSignalfdResponse)?;
+        if attached.is_some() {
+            return Err(ClientError::UnexpectedFdAttachment {
+                opcode: resp.opcode,
+            });
+        }
+        match resp.status {
+            StatusCode::Ok => {
+                parse_handle_body(resp.body, resp.opcode).map_err(ClientError::Protocol)
+            }
+            s => Err(map_status_no_handle(resp.opcode, s)),
+        }
+    }
+
+    /// Reads one `signalfd_siginfo` payload from a broker-hosted signalfd.
+    pub fn read_siginfo(&self, handle_id: u64) -> Result<Option<Vec<u8>>, ClientError> {
+        let stream = self.lock();
+        send_frame(&stream, &build_read_siginfo_request(handle_id), None)?;
+        let (resp_bytes, attached) = recv_frame(&stream)?;
+        let resp = decode(&resp_bytes).map_err(ClientError::Protocol)?;
+        check_opcode(&resp, Opcode::ReadSiginfoResponse)?;
+        if attached.is_some() {
+            return Err(ClientError::UnexpectedFdAttachment {
+                opcode: resp.opcode,
+            });
+        }
+        match resp.status {
+            StatusCode::Ok => parse_read_siginfo_response_body(resp.body)
+                .map(Some)
+                .map_err(ClientError::Protocol),
+            StatusCode::WouldBlock => Ok(None),
             StatusCode::UnknownHandle => Err(ClientError::UnknownHandle { handle_id }),
             s => Err(map_status_with_handle(resp.opcode, s, handle_id)),
         }

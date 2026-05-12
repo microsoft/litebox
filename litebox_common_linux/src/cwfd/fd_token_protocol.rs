@@ -117,6 +117,8 @@ pub enum Opcode {
     ReadEventfd = 0x11,
     WriteEventfd = 0x12,
     SubscribeEventfd = 0x13,
+    CreateSignalfd = 0x40,
+    ReadSiginfo = 0x41,
     Unsubscribe = 0x14,
     DupHandle = 0x15,
     CreatePidfd = 0x20,
@@ -130,6 +132,8 @@ pub enum Opcode {
     ReadEventfdResponse = 0x91,
     WriteEventfdResponse = 0x92,
     SubscribeEventfdResponse = 0x93,
+    CreateSignalfdResponse = 0xC0,
+    ReadSiginfoResponse = 0xC1,
     UnsubscribeResponse = 0x94,
     DupHandleResponse = 0x95,
     CreatePidfdResponse = 0xA0,
@@ -168,6 +172,8 @@ impl Opcode {
             Opcode::ReadEventfd => Some(Opcode::ReadEventfdResponse),
             Opcode::WriteEventfd => Some(Opcode::WriteEventfdResponse),
             Opcode::SubscribeEventfd => Some(Opcode::SubscribeEventfdResponse),
+            Opcode::CreateSignalfd => Some(Opcode::CreateSignalfdResponse),
+            Opcode::ReadSiginfo => Some(Opcode::ReadSiginfoResponse),
             Opcode::Unsubscribe => Some(Opcode::UnsubscribeResponse),
             Opcode::DupHandle => Some(Opcode::DupHandleResponse),
             Opcode::CreatePidfd => Some(Opcode::CreatePidfdResponse),
@@ -188,6 +194,8 @@ impl Opcode {
                 | Opcode::ReadEventfd
                 | Opcode::WriteEventfd
                 | Opcode::SubscribeEventfd
+                | Opcode::CreateSignalfd
+                | Opcode::ReadSiginfo
                 | Opcode::Unsubscribe
                 | Opcode::DupHandle
                 | Opcode::CreatePidfd
@@ -223,6 +231,8 @@ impl TryFrom<u8> for Opcode {
             0x11 => Ok(Opcode::ReadEventfd),
             0x12 => Ok(Opcode::WriteEventfd),
             0x13 => Ok(Opcode::SubscribeEventfd),
+            0x40 => Ok(Opcode::CreateSignalfd),
+            0x41 => Ok(Opcode::ReadSiginfo),
             0x14 => Ok(Opcode::Unsubscribe),
             0x15 => Ok(Opcode::DupHandle),
             0x20 => Ok(Opcode::CreatePidfd),
@@ -235,6 +245,8 @@ impl TryFrom<u8> for Opcode {
             0x91 => Ok(Opcode::ReadEventfdResponse),
             0x92 => Ok(Opcode::WriteEventfdResponse),
             0x93 => Ok(Opcode::SubscribeEventfdResponse),
+            0xC0 => Ok(Opcode::CreateSignalfdResponse),
+            0xC1 => Ok(Opcode::ReadSiginfoResponse),
             0x94 => Ok(Opcode::UnsubscribeResponse),
             0x95 => Ok(Opcode::DupHandleResponse),
             0xA0 => Ok(Opcode::CreatePidfdResponse),
@@ -772,6 +784,92 @@ pub fn build_subscribe_eventfd_response_ok() -> OwnedFrame {
         status: StatusCode::Ok,
         body: Vec::new(),
     }
+}
+
+/// Body for [`Opcode::CreateSignalfd`]: (sigmask_lo: u64, sigmask_hi: u64).
+pub fn build_create_signalfd_request(sigmask_lo: u64, sigmask_hi: u64) -> OwnedFrame {
+    let mut body = Vec::with_capacity(16);
+    body.extend_from_slice(&sigmask_lo.to_le_bytes());
+    body.extend_from_slice(&sigmask_hi.to_le_bytes());
+    OwnedFrame {
+        opcode: Opcode::CreateSignalfd,
+        status: StatusCode::Ok,
+        body,
+    }
+}
+
+/// Decodes the body of a CreateSignalfd request.
+pub fn parse_create_signalfd_body(body: &[u8]) -> Result<(u64, u64), ProtocolError> {
+    if body.len() != 16 {
+        return Err(ProtocolError::WrongBodyLen {
+            opcode: Opcode::CreateSignalfd,
+            got: body.len(),
+            want: 16,
+        });
+    }
+    let lo = u64::from_le_bytes([
+        body[0], body[1], body[2], body[3], body[4], body[5], body[6], body[7],
+    ]);
+    let hi = u64::from_le_bytes([
+        body[8], body[9], body[10], body[11], body[12], body[13], body[14], body[15],
+    ]);
+    Ok((lo, hi))
+}
+
+/// Body for [`Opcode::CreateSignalfdResponse`]: handle id.
+pub fn build_create_signalfd_response_ok(handle_id: u64) -> OwnedFrame {
+    OwnedFrame {
+        opcode: Opcode::CreateSignalfdResponse,
+        status: StatusCode::Ok,
+        body: handle_id.to_le_bytes().to_vec(),
+    }
+}
+
+/// Body for [`Opcode::ReadSiginfo`]: handle id.
+pub fn build_read_siginfo_request(handle_id: u64) -> OwnedFrame {
+    OwnedFrame {
+        opcode: Opcode::ReadSiginfo,
+        status: StatusCode::Ok,
+        body: handle_id.to_le_bytes().to_vec(),
+    }
+}
+
+/// Body for [`Opcode::ReadSiginfoResponse`]: (payload_len: u32, pad: u32, payload bytes).
+pub fn build_read_siginfo_response_ok(payload: &[u8]) -> OwnedFrame {
+    let mut body = Vec::with_capacity(8 + payload.len());
+    #[allow(clippy::cast_possible_truncation)]
+    body.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+    body.extend_from_slice(&0u32.to_le_bytes());
+    body.extend_from_slice(payload);
+    OwnedFrame {
+        opcode: Opcode::ReadSiginfoResponse,
+        status: StatusCode::Ok,
+        body,
+    }
+}
+
+/// Decodes a ReadSiginfo response body.
+pub fn parse_read_siginfo_response_body(body: &[u8]) -> Result<Vec<u8>, ProtocolError> {
+    if body.len() < 8 {
+        return Err(ProtocolError::WrongBodyLen {
+            opcode: Opcode::ReadSiginfoResponse,
+            got: body.len(),
+            want: 8,
+        });
+    }
+    let len = u32::from_le_bytes([body[0], body[1], body[2], body[3]]) as usize;
+    let reserved = u32::from_le_bytes([body[4], body[5], body[6], body[7]]);
+    if reserved != 0 {
+        return Err(ProtocolError::NonZeroReserved { reserved });
+    }
+    if body.len() != 8 + len {
+        return Err(ProtocolError::WrongBodyLen {
+            opcode: Opcode::ReadSiginfoResponse,
+            got: body.len(),
+            want: 8 + len,
+        });
+    }
+    Ok(body[8..].to_vec())
 }
 
 /// Body for [`Opcode::Unsubscribe`]: (handle: u64, sub_id: u64).

@@ -3268,6 +3268,14 @@ impl<FS: ShimFS> Task<FS> {
             SyscallRequest::Eventfd2 { initval, flags } => {
                 syscall!(sys_eventfd2(initval, flags))
             }
+            SyscallRequest::Signalfd4 {
+                fd,
+                mask,
+                sizemask,
+                flags,
+            } => {
+                syscall!(sys_signalfd4(fd, mask, sizemask, flags))
+            }
             SyscallRequest::MemfdCreate { name, flags } => {
                 name.to_cstring().map_or(Err(Errno::EFAULT), |name| {
                     syscall!(sys_memfd_create(name, flags))
