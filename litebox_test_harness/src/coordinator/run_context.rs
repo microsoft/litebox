@@ -56,7 +56,16 @@ impl<'a> RunContext<'a> {
     }
 
     /// Send a protocol command to the agent identified by `handle`,
-    /// returning its response.
+    /// returning its raw `Response`. **FRAMEWORK-ONLY**: test code in
+    /// `coordinator/<family>.rs` should *not* call this. Use
+    /// [`Self::send_named_typed`] (handler dispatch) or
+    /// [`Self::rendezvous_pair`] (multi-agent rendezvous) instead.
+    ///
+    /// This entry point exists so the framework can issue the small
+    /// set of process-lifecycle primitives (`Spawn`, `SpawnRemote`,
+    /// `Fork`, `Forward`, `Run`, `Resume`, `Exec`, `ExecReady`,
+    /// `Exit`) directly. See `litebox_test_harness/CLAUDE.md`
+    /// "Handler Model" for the invariant.
     pub async fn send(&mut self, handle: &AgentHandle, cmd: Command) -> Response {
         let wire = handle.name().name();
         self.runner.contacted_agents.insert(wire.to_string());

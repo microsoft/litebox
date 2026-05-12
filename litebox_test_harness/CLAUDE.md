@@ -413,21 +413,41 @@ been removed.
 
 The harness uses a **registered-handler dispatch model**. The wire
 protocol (`litebox_test_harness/src/protocol.rs`) is intentionally
-small and generic:
+tiny — at HEAD it carries only:
 
-- Process lifecycle: `Spawn`, `SpawnRemote`, `Fork`, `Exec`,
-  `ExecReady`, `Wait*`, `Exit`, `GetPid`, `Forward`.
-- Fs / Net / Unix / Eventfd primitives: `FsRead`, `FsWrite`,
-  `NetListen`, `NetConnect`, `NetUnlisten`, `UnixListen` /
-  `UnixConnect` / `UnixSendFd` / `UnixRecvFd`, `EventfdOpen` /
-  `EventfdRead` / `EventfdWrite` / `EventfdShare`, …
+- **Process lifecycle (framework-only)**: `Spawn`, `SpawnRemote`,
+  `Fork`, `Forward`, `Exec`, `ExecReady`, `Exit`.
 - **The dispatch envelope**: `Command::Run { handler, args }` +
-  `Response::Result { data }` (and `Response::Checkpoint { tag }` /
-  `Command::Resume { tag }` for multi-agent rendezvous).
+  `Response::Result { ok, data, error }` (and
+  `Response::Checkpoint { tag }` / `Command::Resume { tag }` for
+  multi-agent rendezvous).
 
-**Test-specific behavior is implemented as handlers**, not as new wire
-variants. The `Command` enum and the `agent_loop` match in `agent.rs`
-are **closed** to test additions:
+Everything else — fs I/O, sockets, eventfds, pty, signals, getrandom,
+clone3, io_uring, … — is a handler. There is **no** `Command::FsRead`,
+no `Command::NetListen`, no `Command::EventfdOpen`. If you find one
+referenced anywhere, it's a bug (the variant was retired).
+
+### Test code uses handlers — full stop
+
+**The only agent-dispatch primitives that test code (every file in
+`coordinator/` except `mod.rs`, `run_context.rs`, `registry.rs`,
+`agents.rs`) may use are:**
+
+- `RunContext::send_named_typed(&handle, &TOKEN, args)` — typed
+  one-round-trip handler call.
+- `RunContext::rendezvous_pair(...)` — multi-agent rendezvous with
+  per-side handlers and `ctx.checkpoint(tag)`.
+- `Registry::single_agent_handler_test(...)` — convenience wrapper
+  for the single-agent multi-step pattern.
+
+`RunContext::send` and `Runner::send` (the untyped raw wire-dispatch
+methods) are marked **framework-only** in their doc comments. Calling
+them from a coordinator/<family>.rs file other than the four
+framework files listed above is a layering violation and a sign the
+test should be a handler.
+
+The `Command` enum and the `agent_loop` match in `agent.rs` are
+**closed** to test additions:
 
 > When you would otherwise be tempted to add a `Command::PtyTiocgpgrp`,
 > a `Command::Clone3 { kind: ... }`, a `Command::IoUringSetup`, or a
@@ -500,17 +520,36 @@ prefer reusing or extending `crate::os::*`:
 | `os::unix_socket` | Unix domain sockets incl. `sendmsg`/`recvmsg` + SCM_RIGHTS. |
 | `os::inotify`, `os::eventfd`, `os::epoll`, `os::pty` | The obvious primitives. |
 
+### Shared bash / exec handlers
+
+For tests that just need to "run a child process on this agent and
+check stdout/exit_code", reuse the shared tokens in
+`coordinator/common.rs`:
+
+- `common::BASH` — `bash -c "<cmd>"`, returns `{stdout, stderr,
+  exit_code, timed_out}`. Use when the test is a bash one-liner.
+- `common::EXEC_BIN` — arbitrary `argv[0..]` with optional
+  `timeout_ms` / `stdin` / `env`, same output struct. Use for
+  invoking specific binaries (test self-exe with subcommand, node,
+  etc.).
+
+Both run via `tokio::process::Command` inside the handler. **Prefer
+these** over inventing per-family bash-runner handlers.
+
 ### When you genuinely need a new wire primitive
 
 The Command enum is "closed to test variants", not "closed forever".
-New primitives are acceptable when:
+New primitives are acceptable only when:
 
-1. Many handlers across families need it (i.e., it is genuinely a
-   primitive, not a test).
+1. They are genuinely a process-lifecycle / agent-tree primitive
+   (think `Spawn`, `Fork`, `Forward`) — i.e., the framework itself
+   needs it, not one test family.
 2. It cannot be expressed by composing existing primitives + a
    handler.
 3. You add the corresponding agent-side execution in `agent_loop`
-   and an idiomatic `crate::os::*` wrapper where appropriate.
+   and an idiomatic `crate::os::*` wrapper where appropriate, plus
+   doc-comments on `RunContext::send` / `Runner::send` if it widens
+   the framework-only surface.
 
 If a handler would suffice, write the handler.
 
