@@ -95,86 +95,6 @@ fn m_target_binary() -> String {
     litebox_test_harness::nonpie_binary()
 }
 
-static PTY_SIGWINCH_SEEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
-extern "C" fn pty_sigwinch_handler(_: i32) {
-    PTY_SIGWINCH_SEEN.store(true, std::sync::atomic::Ordering::SeqCst);
-}
-
-fn pty_tiocgpgrp_probe() {
-    let mut pgrp: libc::pid_t = 0;
-    // SAFETY: TIOCGPGRP writes a pid_t to the provided pointer for fd 0.
-    if unsafe { libc::ioctl(0, libc::TIOCGPGRP, &mut pgrp) } != 0 {
-        eprintln!("TIOCGPGRP failed: {}", std::io::Error::last_os_error());
-        std::process::exit(1);
-    }
-    println!("TIOCGPGRP pgrp={pgrp}");
-}
-
-fn pty_tiocspgrp_probe() {
-    // SAFETY: getpgrp has no preconditions.
-    let pgrp = unsafe { libc::getpgrp() };
-    let mut set = pgrp;
-    // SAFETY: TIOCSPGRP reads a pid_t from the provided pointer for fd 0.
-    if unsafe { libc::ioctl(0, libc::TIOCSPGRP, &mut set) } != 0 {
-        eprintln!("TIOCSPGRP failed: {}", std::io::Error::last_os_error());
-        std::process::exit(1);
-    }
-    let mut got: libc::pid_t = 0;
-    // SAFETY: TIOCGPGRP writes a pid_t to the provided pointer for fd 0.
-    if unsafe { libc::ioctl(0, libc::TIOCGPGRP, &mut got) } != 0 {
-        eprintln!(
-            "TIOCGPGRP after set failed: {}",
-            std::io::Error::last_os_error()
-        );
-        std::process::exit(1);
-    }
-    println!("TIOCSPGRP pgrp={pgrp} got={got}");
-}
-
-fn pty_tiocsctty_probe() {
-    let path = std::ffi::CString::new("/dev/tty").expect("static path");
-    // SAFETY: open reads a valid nul-terminated static path.
-    let fd = unsafe { libc::open(path.as_ptr(), libc::O_WRONLY | libc::O_CLOEXEC) };
-    if fd < 0 {
-        eprintln!("open /dev/tty failed: {}", std::io::Error::last_os_error());
-        std::process::exit(1);
-    }
-    let msg = b"TTY_OK\n";
-    // SAFETY: msg is valid readable memory and fd is a live /dev/tty fd.
-    let rc = unsafe { libc::write(fd, msg.as_ptr().cast(), msg.len()) };
-    // SAFETY: fd is owned by this process and no longer used.
-    let _ = unsafe { libc::close(fd) };
-    if rc != msg.len() as isize {
-        eprintln!("write /dev/tty failed: {}", std::io::Error::last_os_error());
-        std::process::exit(1);
-    }
-}
-
-fn pty_resize_probe() {
-    PTY_SIGWINCH_SEEN.store(false, std::sync::atomic::Ordering::SeqCst);
-    // SAFETY: installing a simple signal handler function for SIGWINCH.
-    unsafe {
-        libc::signal(
-            libc::SIGWINCH,
-            pty_sigwinch_handler as *const () as libc::sighandler_t,
-        );
-    }
-    println!("READY");
-    let _ = std::io::stdout().flush();
-    while !PTY_SIGWINCH_SEEN.load(std::sync::atomic::Ordering::SeqCst) {
-        // SAFETY: pause waits for a signal; EINTR is expected after SIGWINCH.
-        unsafe { libc::pause() };
-    }
-    let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
-    // SAFETY: TIOCGWINSZ writes winsize to the provided pointer for fd 0.
-    if unsafe { libc::ioctl(0, libc::TIOCGWINSZ, &mut ws) } != 0 {
-        eprintln!("TIOCGWINSZ failed: {}", std::io::Error::last_os_error());
-        std::process::exit(1);
-    }
-    println!("RESIZE rows={} cols={}", ws.ws_row, ws.ws_col);
-}
-
 #[allow(clippy::too_many_lines)] // exhaustive runner / dispatch table
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -1069,18 +989,6 @@ fn main() {
             }
             // Flush and exit immediately — exercises the bridge-join race.
             let _ = std::io::stdout().flush();
-        }
-        "pty-tiocgpgrp" => {
-            pty_tiocgpgrp_probe();
-        }
-        "pty-tiocspgrp" => {
-            pty_tiocspgrp_probe();
-        }
-        "pty-tiocsctty" => {
-            pty_tiocsctty_probe();
-        }
-        "pty-resize" => {
-            pty_resize_probe();
         }
         "write-known" => {
             // Write "PIPEDATA:{tag}\n" to stdout. Used for pipe chain integrity.
