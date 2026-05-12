@@ -10,6 +10,7 @@
 
 use super::agents::{AgentHandle, AgentName, EphemeralHandle, SpawnKind};
 use super::common::{BASH, BashArgs, EXEC_BIN, ExecBinArgs};
+use super::pipe_bridge;
 use super::registry::Registry;
 use super::run_context::RunContext;
 use crate::handlers::{HandlerCtx, HandlerError, HandlerToken};
@@ -1242,32 +1243,55 @@ pub(crate) fn register_unix_socket(reg: &mut Registry<'_>) {
             let id = format!("{name}.{}", bt.label());
             let sub = sub.to_string();
             let expected = expected.to_string();
-            typed_test!(
-                reg,
-                "xworker",
-                "unix_socket",
-                id,
-                timeout = 60,
-                agents[a = AgentName::Dpg1],
-                |run| {
-                    let self_exe = run.self_exe().to_string();
-                    let target = crate::binary_path(bt, &self_exe);
-                    let resp = run
-                        .send_named_typed(
-                            &a,
-                            &EXEC_BIN,
-                            ExecBinArgs {
-                                argv: vec![target, "unix-socket-test".into(), sub],
-                                timeout_ms: Some(10 * 1000),
-                                stdin: None,
-                                env: vec![],
+            reg.test("xworker", "unix_socket", id)
+                .timeout(60)
+                .build(move |cx| {
+                    let a = (sub != "bidirectional").then(|| cx.require(AgentName::Dpg1));
+                    let leaf = (sub == "bidirectional").then(|| {
+                        cx.declare_ephemeral(
+                            AgentName::Dpg1,
+                            format!("Us3_{}", bt.short_label()),
+                            SpawnKind::Fork {
+                                binary: pipe_bridge::fork_binary_label(bt),
+                                inherit_listen_ports: vec![],
                             },
                         )
-                        .await;
-                    let pass = matches!(&resp, Ok(out) if out.exit_code == 0 && out.stdout.contains(&*expected));
-                    super::TestOutcome::new("A", pass, format!("{resp:?}"))
-                }
-            );
+                    });
+                    Box::new(move |run| {
+                        let a = a.clone();
+                        let leaf = leaf.clone();
+                        Box::pin(async move {
+                            if sub == "bidirectional" {
+                                let resp = run
+                                    .run_leaf(
+                                        leaf.as_ref().expect("bidirectional leaf"),
+                                        &pipe_bridge::BIDIRECTIONAL,
+                                        (),
+                                    )
+                                    .await;
+                                let pass = matches!(&resp, Ok(out) if out.detail.contains(&*expected));
+                                return super::TestOutcome::new("A", pass, format!("{resp:?}"));
+                            }
+
+                            let self_exe = run.self_exe().to_string();
+                            let target = crate::binary_path(bt, &self_exe);
+                            let resp = run
+                                .send_named_typed(
+                                    a.as_ref().expect("unix socket argv handle"),
+                                    &EXEC_BIN,
+                                    ExecBinArgs {
+                                        argv: vec![target, "unix-socket-test".into(), sub],
+                                        timeout_ms: Some(10 * 1000),
+                                        stdin: None,
+                                        env: vec![],
+                                    },
+                                )
+                                .await;
+                            let pass = matches!(&resp, Ok(out) if out.exit_code == 0 && out.stdout.contains(&*expected));
+                            super::TestOutcome::new("A", pass, format!("{resp:?}"))
+                        })
+                    })
+                });
         }
     }
 
