@@ -81,22 +81,15 @@ enum EventFileInner<Platform: RawSyncPrimitivesProvider + TimeProvider> {
     /// though the broker is the source of truth for that flag — the
     /// shim doesn't need to act on it locally.
     ///
-    /// `local_readable` is a cached approximation of "has data
-    /// available to read" used by `check_io_events`. The broker is
-    /// the source of truth for the counter, but `check_io_events`
-    /// runs synchronously in the polling path and can't afford an
-    /// RPC per poll. Instead, write_eventfd sets it to `true` and
-    /// read_eventfd clears it (on a read that drained the counter
-    /// to zero). This is needed because epoll re-calls
-    /// `check_io_events` after an observer fires; if it returned
-    /// Events::empty() the epoll would go back to waiting forever
-    /// even though notify_observers had fired.
+    /// Local readability is tracked in `EventFile::broker_local_readable`
+    /// (an Arc<AtomicBool>) so that the broker→worker notification
+    /// callback can update it from the dispatcher thread without
+    /// needing the inner Mutex.
     #[allow(dead_code)]
     BrokerBacked {
         provider: Arc<dyn BrokerEventfdProvider>,
         handle: u64,
         semaphore: bool,
-        local_readable: bool,
     },
 }
 
@@ -113,7 +106,64 @@ pub(crate) struct EventFile<Platform: RawSyncPrimitivesProvider + TimeProvider> 
     inner: litebox::sync::Mutex<Platform, EventFileInner<Platform>>,
     /// File status flags (see [`OFlags::STATUS_FLAGS_MASK`])
     status: AtomicU32,
-    pollee: Pollee<Platform>,
+    /// Local pollee, wrapped in Arc so the cross-worker
+    /// `BrokerSubscriptionWaker` (running on the runner's notification-
+    /// dispatcher thread) can hold a Weak reference and fire local
+    /// observer wake-ups when a broker→worker notification arrives.
+    pollee: Arc<Pollee<Platform>>,
+    /// Cached "broker-backed eventfd has data to read" flag.
+    /// Updated by:
+    ///   - try_write_eventfd (local write success → true)
+    ///   - try_read_eventfd (drain-to-zero → false)
+    ///   - BrokerSubscriptionWaker::on_events (broker NotificationFrame
+    ///     with NOTIFY_EVENT_IN → true)
+    /// Read by `check_io_events` to report `Events::IN` for BrokerBacked.
+    /// Only meaningful for BrokerBacked entries; ignored otherwise.
+    broker_local_readable: Arc<AtomicBool>,
+    /// Subscription state when register_observer subscribes with the
+    /// broker (Some after first subscription, None otherwise).
+    broker_sub: litebox::sync::Mutex<Platform, Option<BrokerSubscription>>,
+}
+
+struct BrokerSubscription {
+    provider: Arc<dyn BrokerEventfdProvider>,
+    handle: u64,
+    subscription_id: u64,
+}
+
+/// Callback the runner's NotificationDispatcher invokes when a broker
+/// NotificationFrame arrives for this subscription. Translates broker
+/// event bits to shim `Events`, sets the `broker_local_readable` cache,
+/// and fires local Pollee observers — waking any `epoll_wait` waiter
+/// even though the writer was in a different worker.
+struct BrokerSubscriptionWaker<Platform: RawSyncPrimitivesProvider + TimeProvider> {
+    pollee: alloc::sync::Weak<Pollee<Platform>>,
+    local_readable: alloc::sync::Weak<AtomicBool>,
+}
+
+impl<Platform: RawSyncPrimitivesProvider + TimeProvider + Send + Sync + 'static>
+    litebox_common_linux::broker_eventfd_provider::BrokerEventCallback
+    for BrokerSubscriptionWaker<Platform>
+{
+    fn on_events(&self, events: u32) {
+        use litebox_common_linux::notification_frame::{NOTIFY_EVENT_IN, NOTIFY_EVENT_OUT};
+        let Some(pollee) = self.pollee.upgrade() else {
+            return;
+        };
+        let mut shim_events = Events::empty();
+        if events & NOTIFY_EVENT_IN != 0 {
+            shim_events |= Events::IN;
+            if let Some(flag) = self.local_readable.upgrade() {
+                flag.store(true, Ordering::SeqCst);
+            }
+        }
+        if events & NOTIFY_EVENT_OUT != 0 {
+            shim_events |= Events::OUT;
+        }
+        if !shim_events.is_empty() {
+            pollee.notify_observers(shim_events);
+        }
+    }
 }
 
 impl<Platform: RawSyncPrimitivesProvider + TimeProvider> EventFile<Platform> {
@@ -127,7 +177,9 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> EventFile<Platform> {
                 semaphore: flags.contains(EfdFlags::SEMAPHORE),
             }),
             status: AtomicU32::new(status.bits()),
-            pollee: Pollee::new(),
+            pollee: Arc::new(Pollee::new()),
+            broker_local_readable: Arc::new(AtomicBool::new(false)),
+            broker_sub: litebox::sync::Mutex::new(None),
         }
     }
 
@@ -152,10 +204,11 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> EventFile<Platform> {
                 provider,
                 handle,
                 semaphore: flags.contains(EfdFlags::SEMAPHORE),
-                local_readable: false,
             }),
             status: AtomicU32::new(status.bits()),
-            pollee: Pollee::new(),
+            pollee: Arc::new(Pollee::new()),
+            broker_local_readable: Arc::new(AtomicBool::new(false)),
+            broker_sub: litebox::sync::Mutex::new(None),
         }
     }
 
@@ -178,7 +231,9 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> EventFile<Platform> {
                 pending_expirations: 0,
             })),
             status: AtomicU32::new(status.bits()),
-            pollee: Pollee::new(),
+            pollee: Arc::new(Pollee::new()),
+            broker_local_readable: Arc::new(AtomicBool::new(false)),
+            broker_sub: litebox::sync::Mutex::new(None),
         }
     }
 
@@ -192,7 +247,9 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> EventFile<Platform> {
         Self {
             inner: litebox::sync::Mutex::new(EventFileInner::Pidfd { exited, subject }),
             status: AtomicU32::new(status.bits()),
-            pollee: Pollee::new(),
+            pollee: Arc::new(Pollee::new()),
+            broker_local_readable: Arc::new(AtomicBool::new(false)),
+            broker_sub: litebox::sync::Mutex::new(None),
         }
     }
 
@@ -270,19 +327,13 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> EventFile<Platform> {
                         // non-semaphore, we drained → not readable.
                         // The next epoll wake from a broker write
                         // will re-set it to true via try_write_eventfd.
-                        let mut inner = self.inner.lock();
-                        if let EventFileInner::BrokerBacked { local_readable, .. } = &mut *inner {
-                            *local_readable = semaphore;
-                        }
-                        drop(inner);
+                        self.broker_local_readable
+                            .store(semaphore, Ordering::SeqCst);
                         self.pollee.notify_observers(Events::OUT);
                         Ok(v)
                     }
                     Err(BrokerOpError::WouldBlock) => {
-                        let mut inner = self.inner.lock();
-                        if let EventFileInner::BrokerBacked { local_readable, .. } = &mut *inner {
-                            *local_readable = false;
-                        }
+                        self.broker_local_readable.store(false, Ordering::SeqCst);
                         Err(TryOpError::TryAgain)
                     }
                     Err(BrokerOpError::UnknownHandle) => Err(TryOpError::Other(Errno::EBADF)),
@@ -389,11 +440,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> EventFile<Platform> {
                         // reports Events::IN. This is what unblocks
                         // an in-process epoll observer that was woken
                         // by notify_observers below.
-                        let mut inner = self.inner.lock();
-                        if let EventFileInner::BrokerBacked { local_readable, .. } = &mut *inner {
-                            *local_readable = true;
-                        }
-                        drop(inner);
+                        self.broker_local_readable.store(true, Ordering::SeqCst);
                         self.pollee.notify_observers(Events::IN);
                         Ok(8)
                     }
@@ -455,6 +502,13 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> EventFile<Platform> {
 
 impl<Platform: RawSyncPrimitivesProvider + TimeProvider> Drop for EventFile<Platform> {
     fn drop(&mut self) {
+        // Unsubscribe any active broker subscription first so the
+        // dispatcher stops dispatching to a callback whose Weak refs
+        // are about to be invalidated.
+        if let Some(sub) = self.broker_sub.lock().take() {
+            sub.provider
+                .unsubscribe_eventfd(sub.handle, sub.subscription_id);
+        }
         // Phase B-Step8: when a broker-backed EventFile drops, tell
         // the broker to decrement its refcount on the canonical
         // handle. The broker frees the underlying state when refcount
@@ -469,7 +523,9 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> Drop for EventFile<Plat
     }
 }
 
-impl<Platform: RawSyncPrimitivesProvider + TimeProvider> IOPollable for EventFile<Platform> {
+impl<Platform: RawSyncPrimitivesProvider + TimeProvider + Send + Sync + 'static> IOPollable
+    for EventFile<Platform>
+{
     fn check_io_events(&self) -> Events {
         let mut inner = self.inner.lock();
         let mut events = Events::empty();
@@ -495,19 +551,19 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> IOPollable for EventFil
                     events |= Events::IN | Events::HUP;
                 }
             }
-            EventFileInner::BrokerBacked { local_readable, .. } => {
+            EventFileInner::BrokerBacked { .. } => {
                 // Phase B-Step12 readiness fix: track local readiness
-                // based on the most recent write/read RPC outcome. The
-                // broker is the source of truth for the counter, but
-                // we can't afford an RPC in every check_io_events
-                // call (and crucially, we need check_io_events to
-                // report IN after a write so that epoll observers,
-                // once woken by notify_observers, see the fd as
-                // ready). The cache is updated by try_read_eventfd
-                // (clears on drain-to-zero, keeps for semaphore mode)
-                // and try_write_eventfd (sets to true on every write
-                // success).
-                if *local_readable {
+                // based on the most recent write/read RPC outcome AND
+                // broker→worker notification frames. The broker is the
+                // source of truth for the counter, but check_io_events
+                // runs synchronously in the polling path and can't
+                // afford an RPC per poll. Cache is updated by:
+                //   - try_write_eventfd (local write success → true)
+                //   - try_read_eventfd (drain-to-zero → false)
+                //   - BrokerSubscriptionWaker::on_events (broker push
+                //     with NOTIFY_EVENT_IN → true) — for cross-worker
+                //     wake-ups from a peer worker's write.
+                if self.broker_local_readable.load(Ordering::SeqCst) {
                     events |= Events::IN;
                 }
                 // Broker-backed eventfds are always writable in
@@ -526,10 +582,55 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> IOPollable for EventFil
             EventFileInner::Pidfd { subject, .. } => {
                 subject.register_observer(observer, mask | Events::ALWAYS_POLLED);
             }
-            EventFileInner::Eventfd { .. }
-            | EventFileInner::Timerfd(_)
-            | EventFileInner::BrokerBacked { .. } => {
+            EventFileInner::Eventfd { .. } | EventFileInner::Timerfd(_) => {
                 drop(inner);
+                self.pollee.register_observer(observer, mask);
+            }
+            EventFileInner::BrokerBacked {
+                provider, handle, ..
+            } => {
+                let provider = Arc::clone(provider);
+                let handle = *handle;
+                drop(inner);
+                // Ensure we have an active broker subscription so that
+                // cross-worker writes get pushed to our pollee via the
+                // notification dispatcher. Idempotent: only subscribes
+                // on the first register_observer call.
+                let mut sub_guard = self.broker_sub.lock();
+                if sub_guard.is_none() {
+                    use litebox_common_linux::notification_frame::{
+                        NOTIFY_EVENT_IN, NOTIFY_EVENT_OUT,
+                    };
+                    let waker = Arc::new(BrokerSubscriptionWaker::<Platform> {
+                        pollee: Arc::downgrade(&self.pollee),
+                        local_readable: Arc::downgrade(&self.broker_local_readable),
+                    });
+                    match provider.subscribe_eventfd(
+                        handle,
+                        NOTIFY_EVENT_IN | NOTIFY_EVENT_OUT,
+                        waker
+                            as Arc<
+                                dyn litebox_common_linux::broker_eventfd_provider::BrokerEventCallback,
+                            >,
+                    ) {
+                        Ok(subscription_id) => {
+                            *sub_guard = Some(BrokerSubscription {
+                                provider: Arc::clone(&provider),
+                                handle,
+                                subscription_id,
+                            });
+                        }
+                        Err(_) => {
+                            // Subscription failed; we still register the
+                            // local observer. In-worker write→read still
+                            // wakes via try_write_eventfd. Cross-worker
+                            // wake-up will be missed but that's a soft
+                            // degradation, not a correctness issue for
+                            // the local case.
+                        }
+                    }
+                }
+                drop(sub_guard);
                 self.pollee.register_observer(observer, mask);
             }
         }
