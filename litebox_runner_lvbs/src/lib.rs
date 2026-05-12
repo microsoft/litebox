@@ -520,10 +520,7 @@ fn handle_open_session(
                     // Evict the zombie. Analog of OP-TEE's `maybe_release_ta_ctx`
                     // removing the dead ctx from `tee_ctxes`.
                     session_manager().remove_single_instance_if_same(&ta_uuid, &existing);
-                    msg_args.ret = TeeResult::TargetDead;
-                    msg_args.ret_origin = TeeOrigin::Tee;
-                    write_non_ta_msg_args_to_normal_world(msg_args, msg_args_phys_addr)?;
-                    Ok(())
+                    Err(OpteeSmcReturnCode::EThreadLimit)
                 }
             }
         }
