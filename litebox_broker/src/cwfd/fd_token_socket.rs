@@ -323,6 +323,8 @@ pub fn handle_control_connection(
                     | Opcode::CreateEventfd
                     | Opcode::ReadEventfd
                     | Opcode::WriteEventfd
+                    | Opcode::CreateSignalfd
+                    | Opcode::ReadSiginfo
                     | Opcode::SubscribeEventfd
                     | Opcode::Unsubscribe
                     | Opcode::DupHandle => {

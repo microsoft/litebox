@@ -20,14 +20,17 @@
 //! `SubscribeEventfd` calls use that sender.
 
 use crate::eventfd_state::{EventfdError, EventfdState};
+use crate::signalfd_state::SignalfdState;
 use crate::state_registry::{BrokerStateRegistry, StateHandle, StateRegistryError};
 use crate::subscription_list::{SubscribeError, UnsubscribeError};
 use litebox_common_linux::fd_token_protocol::{
-    Frame, Opcode, OwnedFrame, StatusCode, build_create_eventfd_response_ok, build_error_response,
-    build_read_eventfd_response_ok, build_register_notification_ring_response_ok,
+    Frame, Opcode, OwnedFrame, StatusCode, build_create_eventfd_response_ok,
+    build_create_signalfd_response_ok, build_error_response, build_read_eventfd_response_ok,
+    build_read_siginfo_response_ok, build_register_notification_ring_response_ok,
     build_release_response_ok, build_subscribe_eventfd_response_ok, build_unsubscribe_response_ok,
-    build_write_eventfd_response_ok, parse_create_eventfd_body, parse_handle_body,
-    parse_subscribe_eventfd_body, parse_unsubscribe_body, parse_write_eventfd_body,
+    build_write_eventfd_response_ok, parse_create_eventfd_body, parse_create_signalfd_body,
+    parse_handle_body, parse_subscribe_eventfd_body, parse_unsubscribe_body,
+    parse_write_eventfd_body,
 };
 use litebox_common_linux::fd_transfer_frame::SubsystemTag;
 use litebox_common_linux::notification_ring::NotificationSender;
@@ -71,6 +74,8 @@ pub fn handle_request(
         Opcode::CreateEventfd => handle_create_eventfd(registry, request, in_fds),
         Opcode::ReadEventfd => handle_read_eventfd(registry, request, in_fds),
         Opcode::WriteEventfd => handle_write_eventfd(registry, request, in_fds),
+        Opcode::CreateSignalfd => handle_create_signalfd(registry, request, in_fds),
+        Opcode::ReadSiginfo => handle_read_siginfo(registry, request, in_fds),
         Opcode::SubscribeEventfd => handle_subscribe_eventfd(registry, conn, request, in_fds),
         Opcode::Unsubscribe => handle_unsubscribe(registry, request, in_fds),
         Opcode::Release => handle_release_state(registry, request, in_fds),
@@ -220,6 +225,71 @@ fn handle_write_eventfd(
         }
         Err(EventfdError::InvalidWriteValue(_)) => {
             status_err(Opcode::WriteEventfdResponse, StatusCode::InvalidValue)
+        }
+    }
+}
+
+fn handle_create_signalfd(
+    registry: &BrokerStateRegistry,
+    request: &Frame<'_>,
+    in_fds: Vec<OwnedFd>,
+) -> HandlerResult {
+    if !in_fds.is_empty() {
+        return protocol_err(Opcode::CreateSignalfdResponse);
+    }
+    let (lo, hi) = match parse_create_signalfd_body(request.body) {
+        Ok(t) => t,
+        Err(_) => return protocol_err(Opcode::CreateSignalfdResponse),
+    };
+    let state = match SignalfdState::new(lo, hi) {
+        Ok(s) => s,
+        Err(err) => {
+            tracing::warn!(error = %err, "CreateSignalfd failed");
+            return status_err(Opcode::CreateSignalfdResponse, StatusCode::Internal);
+        }
+    };
+    let handle = registry.register(state);
+    HandlerResult {
+        frame: build_create_signalfd_response_ok(handle.id()),
+        out_fd: None,
+    }
+}
+
+fn handle_read_siginfo(
+    registry: &BrokerStateRegistry,
+    request: &Frame<'_>,
+    in_fds: Vec<OwnedFd>,
+) -> HandlerResult {
+    if !in_fds.is_empty() {
+        return protocol_err(Opcode::ReadSiginfoResponse);
+    }
+    let handle_id = match parse_handle_body(request.body, request.opcode) {
+        Ok(id) => id,
+        Err(_) => return protocol_err(Opcode::ReadSiginfoResponse),
+    };
+    let state = match registry.resolve(StateHandle::from_id(handle_id), SubsystemTag::Signalfd) {
+        Ok(s) => s,
+        Err(StateRegistryError::UnknownHandle(_)) => {
+            return status_err(Opcode::ReadSiginfoResponse, StatusCode::UnknownHandle);
+        }
+        Err(StateRegistryError::TagMismatch { .. }) => {
+            return status_err(Opcode::ReadSiginfoResponse, StatusCode::SubsystemMismatch);
+        }
+        Err(_) => return status_err(Opcode::ReadSiginfoResponse, StatusCode::Internal),
+    };
+    let signalfd = state
+        .as_any()
+        .downcast_ref::<SignalfdState>()
+        .expect("subsystem_tag check guarantees SignalfdState");
+    match signalfd.read_siginfo() {
+        Ok(Some(payload)) => HandlerResult {
+            frame: build_read_siginfo_response_ok(&payload),
+            out_fd: None,
+        },
+        Ok(None) => status_err(Opcode::ReadSiginfoResponse, StatusCode::WouldBlock),
+        Err(err) => {
+            tracing::warn!(error = %err, "ReadSiginfo failed");
+            status_err(Opcode::ReadSiginfoResponse, StatusCode::Internal)
         }
     }
 }

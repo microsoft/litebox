@@ -33,6 +33,7 @@
 //! `EventfdState`.
 
 use std::sync::{Arc, Mutex};
+use std::vec::Vec;
 
 use litebox_common_linux::notification_frame::{NOTIFY_EVENT_MASK_ALL, NotificationFrame};
 use litebox_common_linux::notification_ring::NotificationSender;
@@ -168,6 +169,26 @@ impl SubscriptionList {
                     subscription_id = sub.id,
                     error = %err,
                     "notification send failed; leaving subscription in list",
+                );
+            }
+        }
+    }
+
+    /// Notifies subscribers with an opaque payload frame.
+    pub fn notify_payload(&self, events: u32, payload: Vec<u8>) {
+        let entries = self.entries.lock().expect("SubscriptionList poisoned");
+        for sub in entries.iter() {
+            let matched = events & sub.events_mask;
+            if matched == 0 {
+                continue;
+            }
+            let frame = NotificationFrame::payload(sub.id, matched, payload.clone());
+            let mut sender = sub.sender.lock().expect("NotificationSender poisoned");
+            if let Err(err) = sender.send(&frame) {
+                tracing::warn!(
+                    subscription_id = sub.id,
+                    error = %err,
+                    "payload notification send failed; leaving subscription in list",
                 );
             }
         }

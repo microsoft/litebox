@@ -13,6 +13,8 @@ pub(crate) mod eventfd;
 /// `sys_eventfd2`.
 pub use eventfd::broker_eventfd_provider;
 pub use eventfd::set_broker_eventfd_provider;
+pub use signalfd::broker_signalfd_provider;
+pub use signalfd::set_broker_signalfd_provider;
 
 pub mod file;
 pub mod fork_snapshot;
@@ -22,6 +24,7 @@ pub(crate) mod mm;
 pub(crate) mod net;
 pub(crate) mod netlink;
 pub mod process;
+pub(crate) mod signalfd;
 pub(crate) mod unix;
 
 pub(crate) mod signal;
