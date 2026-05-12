@@ -210,6 +210,95 @@ impl<'a> RunContext<'a> {
         serde_json::from_value(data).map_err(|e| format!("typed deserialize: {e}"))
     }
 
+    /// Spawn an ephemeral leaf and start a typed handler on it without
+    /// waiting for the response. Pair with `run_leaf_read_checkpoint`,
+    /// `run_leaf_resume`, and `run_leaf_read_result` for leaf handlers
+    /// that need coordinator-driven rendezvous.
+    pub async fn run_leaf_write<A, O>(
+        &mut self,
+        leaf: &EphemeralHandle,
+        token: &crate::handlers::HandlerToken<A, O>,
+        args: A,
+    ) -> Result<(), String>
+    where
+        A: serde::Serialize,
+    {
+        let spawn_resp = self.spawn_ephemeral(leaf).await;
+        if !matches!(&spawn_resp, Response::Ok { .. }) {
+            return Err(format!("spawn_ephemeral: {spawn_resp:?}"));
+        }
+        let args_value = serde_json::to_value(&args).map_err(|e| format!("args serialize: {e}"))?;
+        self.write_ephemeral(
+            leaf,
+            Command::Run {
+                handler: token.name().to_string(),
+                args: args_value,
+            },
+            true,
+        )
+        .await
+    }
+
+    /// Resume a checkpointed typed handler running on an ephemeral leaf.
+    pub async fn run_leaf_resume(
+        &mut self,
+        leaf: &EphemeralHandle,
+        tag: &str,
+    ) -> Result<(), String> {
+        self.write_ephemeral(
+            leaf,
+            Command::Resume {
+                tag: tag.to_string(),
+            },
+            false,
+        )
+        .await
+    }
+
+    /// Send `Exit` to an ephemeral leaf.
+    pub async fn run_leaf_exit(&mut self, leaf: &EphemeralHandle) -> Result<(), String> {
+        self.write_ephemeral(leaf, Command::Exit, false).await
+    }
+
+    /// Read and validate a checkpoint from an ephemeral leaf handler.
+    pub async fn run_leaf_read_checkpoint(
+        &mut self,
+        leaf: &EphemeralHandle,
+        expected_tag: &str,
+    ) -> Result<(), String> {
+        match self.read_ephemeral(leaf).await {
+            Response::Checkpoint { tag } if tag == expected_tag => Ok(()),
+            Response::Checkpoint { tag } => Err(format!(
+                "expected Checkpoint({expected_tag}), got Checkpoint({tag})"
+            )),
+            other => Err(format!("expected Checkpoint, got {other:?}")),
+        }
+    }
+
+    /// Read and decode the terminal `Result` from an ephemeral leaf handler.
+    pub async fn run_leaf_read_result<A, O>(
+        &mut self,
+        leaf: &EphemeralHandle,
+        _token: &crate::handlers::HandlerToken<A, O>,
+    ) -> Result<O, String>
+    where
+        O: serde::de::DeserializeOwned,
+    {
+        match self.read_ephemeral(leaf).await {
+            Response::Result {
+                ok: true,
+                data,
+                error: _,
+            } => serde_json::from_value(data).map_err(|e| format!("typed deserialize: {e}")),
+            Response::Result {
+                ok: false,
+                data: _,
+                error,
+            } => Err(error.unwrap_or_else(|| "handler failed".into())),
+            other => Err(format!("expected Result, got {other:?}")),
+        }
+    }
+
     /// Spawn an ephemeral leaf agent (per `leaf.kind()`), invoke one
     /// typed handler on it via `Command::Run`, then send `Command::Exit`
     /// to terminate it. Returns the handler's typed `Out`.
@@ -465,6 +554,91 @@ impl<'a> RunContext<'a> {
             } => Err(error.unwrap_or_else(|| "handler failed".into())),
             other => Err(format!("expected Result, got {other:?}")),
         }
+    }
+
+    async fn write_ephemeral(
+        &mut self,
+        leaf: &EphemeralHandle,
+        inner: Command,
+        track_in_flight: bool,
+    ) -> Result<(), String> {
+        use tokio::io::AsyncWriteExt;
+        let parent = leaf.parent().name();
+        self.runner.contacted_agents.insert(parent.to_string());
+        let (direct, rest) = super::route(parent);
+        if track_in_flight {
+            if self.in_flight_directs.contains(direct) {
+                return Err(format!(
+                    "another Run is already in flight on direct pipe '{direct}'; \
+                     cannot start a second Run on ephemeral leaf {} until the in-flight one \
+                     returns Result",
+                    leaf.label()
+                ));
+            }
+            self.in_flight_directs.insert(direct.to_string());
+        }
+        let Some(child) = self.runner.children.get_mut(direct) else {
+            if track_in_flight {
+                self.in_flight_directs.remove(direct);
+            }
+            return Err(format!("no child {direct}"));
+        };
+        let actual_cmd = super::wrap_forwards(
+            rest,
+            Command::Forward {
+                target: leaf.label().to_string(),
+                inner: Box::new(inner),
+            },
+        );
+        let json = serde_json::to_string(&actual_cmd).map_err(|e| e.to_string())?;
+        child
+            .stdin
+            .write_all(format!("{json}\n").as_bytes())
+            .await
+            .map_err(|e| e.to_string())?;
+        child.stdin.flush().await.map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    async fn read_ephemeral(&mut self, leaf: &EphemeralHandle) -> Response {
+        use tokio::io::AsyncBufReadExt;
+        let parent = leaf.parent().name();
+        self.runner.contacted_agents.insert(parent.to_string());
+        let (direct, _rest) = super::route(parent);
+        let resp = {
+            let Some(child) = self.runner.children.get_mut(direct) else {
+                return Response::Error {
+                    error: format!("no child {direct}"),
+                };
+            };
+            let mut line = String::new();
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(15),
+                child.stdout.read_line(&mut line),
+            )
+            .await
+            {
+                Ok(Ok(0)) => Response::Error {
+                    error: "EOF on agent stdout".into(),
+                },
+                Ok(Ok(_)) => match serde_json::from_str(line.trim()) {
+                    Ok(r) => r,
+                    Err(e) => Response::Error {
+                        error: format!("response parse: {e}; line={}", line.trim()),
+                    },
+                },
+                Ok(Err(e)) => Response::Error {
+                    error: format!("read: {e}"),
+                },
+                Err(_) => Response::Error {
+                    error: "timeout reading from agent".into(),
+                },
+            }
+        };
+        if !matches!(&resp, Response::Checkpoint { .. }) {
+            self.in_flight_directs.remove(direct);
+        }
+        resp
     }
 
     /// Common helper: route `cmd` to `handle` (Forward-wrapping for

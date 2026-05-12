@@ -15,10 +15,10 @@
 // FS tests (it handles FsRead/FsWrite/FsDelete/FsSymlink/FsReadlink/FsStat/
 // NetConnect locally). It cannot listen on TCP or Unix sockets.
 
-use super::agents::{AgentHandle, AgentName};
+use super::agents::{AgentHandle, AgentName, EphemeralHandle, SpawnKind};
 use super::registry::Registry;
 use super::run_context::RunContext;
-use crate::handlers::{HandlerCtx, HandlerToken};
+use crate::handlers::{HandlerCtx, HandlerError, HandlerToken};
 use crate::protocol::Response;
 use crate::register_handler;
 use serde::{Deserialize, Serialize};
@@ -66,6 +66,29 @@ struct UnixConnectArgs {
 }
 
 #[derive(Clone, Serialize, Deserialize)]
+struct UnixEchoServerArgs {
+    socket_path: String,
+}
+
+#[derive(Clone, Serialize, Deserialize, Debug)]
+struct UnixEchoServerOut {
+    bytes_received: usize,
+    echo: String,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct UnixEchoClientArgs {
+    socket_path: String,
+    data: String,
+}
+
+#[derive(Clone, Serialize, Deserialize, Debug)]
+struct UnixEchoClientOut {
+    bytes_sent: usize,
+    echo: String,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
 struct ExecArgs {
     args: Vec<String>,
     timeout_secs: Option<u64>,
@@ -107,6 +130,10 @@ const UNIX_LISTEN: HandlerToken<FsPathArgs, Response> = HandlerToken::new("matri
 const UNIX_UNLISTEN: HandlerToken<FsPathArgs, Response> = HandlerToken::new("matrix.unix_unlisten");
 const UNIX_CONNECT: HandlerToken<UnixConnectArgs, Response> =
     HandlerToken::new("matrix.unix_connect");
+const UNIX_ECHO_SERVER: HandlerToken<UnixEchoServerArgs, UnixEchoServerOut> =
+    HandlerToken::new("matrix.unix_echo_server");
+const UNIX_ECHO_CLIENT: HandlerToken<UnixEchoClientArgs, UnixEchoClientOut> =
+    HandlerToken::new("matrix.unix_echo_client");
 const EXEC: HandlerToken<ExecArgs, Response> = HandlerToken::new("matrix.exec");
 const EXEC_READY: HandlerToken<ExecReadyArgs, Response> = HandlerToken::new("matrix.exec_ready");
 const KILL: HandlerToken<KillArgs, Response> = HandlerToken::new("matrix.kill");
@@ -641,6 +668,69 @@ async fn handle_unix_connect(
 ) -> Result<Response, crate::handlers::HandlerError> {
     Ok(local_unix_connect(args).await)
 }
+async fn handle_unix_echo_server(
+    args: UnixEchoServerArgs,
+    ctx: &mut HandlerCtx<'_>,
+) -> Result<UnixEchoServerOut, HandlerError> {
+    let _ = tokio::fs::remove_file(&args.socket_path).await;
+    let listener = tokio::net::UnixListener::bind(&args.socket_path)
+        .map_err(|e| HandlerError(format!("bind {}: {e}", args.socket_path)))?;
+    ctx.checkpoint("listening").await?;
+
+    let (mut stream, _) = tokio::time::timeout(Duration::from_secs(10), listener.accept())
+        .await
+        .map_err(|_| HandlerError("accept timeout".to_string()))?
+        .map_err(|e| HandlerError(format!("accept: {e}")))?;
+    let mut buf = [0_u8; 4096];
+    let n = tokio::time::timeout(Duration::from_secs(5), stream.read(&mut buf))
+        .await
+        .map_err(|_| HandlerError("read timeout".to_string()))?
+        .map_err(|e| HandlerError(format!("read: {e}")))?;
+    if n > 0 {
+        stream
+            .write_all(&buf[..n])
+            .await
+            .map_err(|e| HandlerError(format!("write: {e}")))?;
+        stream
+            .flush()
+            .await
+            .map_err(|e| HandlerError(format!("flush: {e}")))?;
+    }
+    let _ = tokio::fs::remove_file(&args.socket_path).await;
+    Ok(UnixEchoServerOut {
+        bytes_received: n,
+        echo: String::from_utf8_lossy(&buf[..n]).to_string(),
+    })
+}
+async fn handle_unix_echo_client(
+    args: UnixEchoClientArgs,
+    _ctx: &mut HandlerCtx<'_>,
+) -> Result<UnixEchoClientOut, HandlerError> {
+    let mut stream = tokio::time::timeout(
+        Duration::from_secs(5),
+        tokio::net::UnixStream::connect(&args.socket_path),
+    )
+    .await
+    .map_err(|_| HandlerError("connect timeout".to_string()))?
+    .map_err(|e| HandlerError(format!("connect: {e}")))?;
+    stream
+        .write_all(args.data.as_bytes())
+        .await
+        .map_err(|e| HandlerError(format!("write: {e}")))?;
+    stream
+        .flush()
+        .await
+        .map_err(|e| HandlerError(format!("flush: {e}")))?;
+    let mut buf = [0_u8; 4096];
+    let n = tokio::time::timeout(Duration::from_secs(5), stream.read(&mut buf))
+        .await
+        .map_err(|_| HandlerError("read timeout".to_string()))?
+        .map_err(|e| HandlerError(format!("read: {e}")))?;
+    Ok(UnixEchoClientOut {
+        bytes_sent: args.data.len(),
+        echo: String::from_utf8_lossy(&buf[..n]).to_string(),
+    })
+}
 async fn handle_exec(
     args: ExecArgs,
     _ctx: &mut HandlerCtx<'_>,
@@ -685,6 +775,8 @@ fn register_matrix_handlers() {
     register_handler!(UNIX_LISTEN, handle_unix_listen);
     register_handler!(UNIX_UNLISTEN, handle_unix_unlisten);
     register_handler!(UNIX_CONNECT, handle_unix_connect);
+    register_handler!(UNIX_ECHO_SERVER, handle_unix_echo_server);
+    register_handler!(UNIX_ECHO_CLIENT, handle_unix_echo_client);
     register_handler!(EXEC, handle_exec);
     register_handler!(EXEC_READY, handle_exec_ready);
     register_handler!(KILL, handle_kill);
@@ -1238,6 +1330,68 @@ fn handle_for(handles: &MatrixHandles, agent: AgentName) -> &AgentHandle {
         .iter()
         .find_map(|(name, handle)| (*name == agent).then_some(handle))
         .expect("agent was not declared for matrix test")
+}
+
+fn fork_binary_label(bt: crate::BinaryType) -> &'static str {
+    match bt {
+        crate::BinaryType::PieGlibc => "self",
+        crate::BinaryType::NonPieGlibc => "nonpie",
+        crate::BinaryType::StaticPieGlibc => "static-pie-glibc",
+        crate::BinaryType::StaticPieMusl => "static-pie-musl",
+        crate::BinaryType::NonPieStaticMusl => "non-pie-static-musl",
+    }
+}
+
+async fn unix_echo_round_trip(
+    run: &mut RunContext<'_>,
+    server_leaf: &EphemeralHandle,
+    client_leaf: &EphemeralHandle,
+    sock: String,
+    data: String,
+) -> Result<String, String> {
+    run.run_leaf_write(
+        server_leaf,
+        &UNIX_ECHO_SERVER,
+        UnixEchoServerArgs {
+            socket_path: sock.clone(),
+        },
+    )
+    .await?;
+    run.run_leaf_read_checkpoint(server_leaf, "listening")
+        .await?;
+    run.run_leaf_resume(server_leaf, "listening").await?;
+    let client_out = run
+        .run_leaf(
+            client_leaf,
+            &UNIX_ECHO_CLIENT,
+            UnixEchoClientArgs {
+                socket_path: sock,
+                data: data.clone(),
+            },
+        )
+        .await?;
+    let server_out: UnixEchoServerOut = run
+        .run_leaf_read_result(server_leaf, &UNIX_ECHO_SERVER)
+        .await?;
+    let _ = run.run_leaf_exit(server_leaf).await;
+    if client_out.echo != data {
+        return Err(format!(
+            "client echo mismatch: expected={data:?} out={client_out:?}"
+        ));
+    }
+    if client_out.bytes_sent != data.len() {
+        return Err(format!(
+            "client byte count mismatch: expected={} out={client_out:?}",
+            data.len()
+        ));
+    }
+    if server_out.echo != data || server_out.bytes_received != data.len() {
+        return Err(format!(
+            "server mismatch: expected={data:?}/{} out={server_out:?}",
+            data.len()
+        ));
+    }
+    Ok(format!("client={client_out:?} server={server_out:?}"))
 }
 
 #[allow(clippy::too_many_lines)]
@@ -2682,21 +2836,33 @@ pub(super) fn register_unix_tests(reg: &mut Registry<'_>) {
                 for &bt in crate::BinaryType::ALL {
                     let bt_label = bt.label();
                     let sock = format!("/tmp/um_{}_{}.sock", name.replace('.', "_"), bt_label);
-                    matrix_test(
-                        reg,
+                    reg.test(
+                        "matrix",
+                        "run_matrix",
                         format!("U.{name}.{bt_label}.child_connect"),
-                        vec![agent],
-                        move |run, handles| {
+                    )
+                    .timeout(60)
+                    .build(move |cx| {
+                        let parent = cx.require(agent);
+                        let client_leaf = cx.declare_ephemeral(
+                            agent,
+                            format!("UnixEchoClient_{}_{}", name.replace('.', "_"), bt.short_label()),
+                            SpawnKind::Fork {
+                                binary: fork_binary_label(bt),
+                                inherit_listen_ports: vec![],
+                            },
+                        );
+                        Box::new(move |run| {
+                            let client_leaf = client_leaf.clone();
                             Box::pin(async move {
-                                let self_exe = run.self_exe().to_string();
-                                let target = crate::binary_path(bt, &self_exe);
-                                let resp = send_to(
-                                    run,
-                                    &handles,
-                                    agent,
-                                    MatrixOp::UnixListen { path: sock.clone() },
-                                )
-                                .await;
+                                let resp = run
+                                    .send_named_typed(
+                                        &parent,
+                                        &UNIX_LISTEN,
+                                        FsPathArgs { path: sock.clone() },
+                                    )
+                                    .await
+                                    .unwrap_or_else(|error| Response::Error { error });
                                 if let Err(e) = super::expect_unix_listening_path(&resp, &sock) {
                                     return super::TestOutcome::new(
                                         agent.name(),
@@ -2705,30 +2871,28 @@ pub(super) fn register_unix_tests(reg: &mut Registry<'_>) {
                                     );
                                 }
                                 let data = format!("unix_{name}");
-                                let resp = send_to(
-                                    run,
-                                    &handles,
-                                    agent,
-                                    exec(vec![
-                                        target,
-                                        "unix-echo-client".into(),
-                                        sock.clone(),
-                                        data.clone(),
-                                    ]),
-                                )
-                                .await;
-                                let pass = matches!(&resp, Response::ExecResult { exit_code: 0, stdout, .. } if stdout.contains(&data));
-                                let _ = send_to(
-                                    run,
-                                    &handles,
-                                    agent,
-                                    MatrixOp::UnixUnlisten { path: sock },
-                                )
-                                .await;
-                                super::TestOutcome::new(agent.name(), pass, format!("{resp:?}"))
+                                let out = run
+                                    .run_leaf(
+                                        &client_leaf,
+                                        &UNIX_ECHO_CLIENT,
+                                        UnixEchoClientArgs {
+                                            socket_path: sock.clone(),
+                                            data: data.clone(),
+                                        },
+                                    )
+                                    .await;
+                                let _ = run
+                                    .send_named_typed(
+                                        &parent,
+                                        &UNIX_UNLISTEN,
+                                        FsPathArgs { path: sock },
+                                    )
+                                    .await;
+                                let pass = matches!(&out, Ok(client_out) if client_out.echo == data && client_out.bytes_sent == data.len());
+                                super::TestOutcome::new(agent.name(), pass, format!("{out:?}"))
                             })
-                        },
-                    );
+                        })
+                    });
                 }
             }
             UnixPattern::BackgroundServerConnect => {
@@ -2736,51 +2900,56 @@ pub(super) fn register_unix_tests(reg: &mut Registry<'_>) {
                     let bt_label = bt.label();
                     let sock_start =
                         format!("/tmp/um_{}_{}_start.sock", name.replace('.', "_"), bt_label);
-                    matrix_test(
-                        reg,
+                    reg.test(
+                        "matrix",
+                        "run_matrix",
                         format!("U.{name}.{bt_label}.server_start"),
-                        vec![agent],
-                        move |run, handles| {
+                    )
+                    .timeout(60)
+                    .build(move |cx| {
+                        let _parent = cx.require(agent);
+                        let client_parent = AgentName::Dpg2;
+                        let _client_parent = cx.require(client_parent);
+                        let label =
+                            format!("{}_{}_start", name.replace('.', "_"), bt.short_label());
+                        let server_leaf = cx.declare_ephemeral(
+                            agent,
+                            format!("UnixEchoServer_{label}"),
+                            SpawnKind::Fork {
+                                binary: fork_binary_label(bt),
+                                inherit_listen_ports: vec![],
+                            },
+                        );
+                        let client_leaf = cx.declare_ephemeral(
+                            client_parent,
+                            format!("UnixEchoClient_{label}"),
+                            SpawnKind::Fork {
+                                binary: fork_binary_label(bt),
+                                inherit_listen_ports: vec![],
+                            },
+                        );
+                        Box::new(move |run| {
+                            let server_leaf = server_leaf.clone();
+                            let client_leaf = client_leaf.clone();
                             Box::pin(async move {
-                                let self_exe = run.self_exe().to_string();
-                                let target = crate::binary_path(bt, &self_exe);
-                                let resp = send_to(
+                                let data = format!("unix_{name}");
+                                match unix_echo_round_trip(
                                     run,
-                                    &handles,
-                                    agent,
-                                    MatrixOp::Exec {
-                                        args: vec![
-                                            target,
-                                            "unix-echo-server".into(),
-                                            sock_start.clone(),
-                                        ],
-                                        timeout_secs: None,
-                                        stdin: None,
-                                        background: true,
-                                        env: vec![],
-                                    },
+                                    &server_leaf,
+                                    &client_leaf,
+                                    sock_start,
+                                    data,
                                 )
-                                .await;
-                                let pid = match &resp {
-                                    Response::Background { pid } => Some(*pid),
-                                    _ => None,
-                                };
-                                let pass = pid.is_some();
-                                if let Some(pid) = pid {
-                                    let _ =
-                                        send_to(run, &handles, agent, MatrixOp::Kill { pid }).await;
+                                .await
+                                {
+                                    Ok(detail) => {
+                                        super::TestOutcome::new(agent.name(), true, detail)
+                                    }
+                                    Err(e) => super::TestOutcome::new(agent.name(), false, e),
                                 }
-                                let _ = send_to(
-                                    run,
-                                    &handles,
-                                    agent,
-                                    MatrixOp::UnixUnlisten { path: sock_start },
-                                )
-                                .await;
-                                super::TestOutcome::new(agent.name(), pass, format!("{resp:?}"))
                             })
-                        },
-                    );
+                        })
+                    });
                 }
                 for &bt in crate::BinaryType::ALL {
                     let bt_label = bt.label();
@@ -2789,68 +2958,56 @@ pub(super) fn register_unix_tests(reg: &mut Registry<'_>) {
                         name.replace('.', "_"),
                         bt_label
                     );
-                    matrix_test(
-                        reg,
+                    reg.test(
+                        "matrix",
+                        "run_matrix",
                         format!("U.{name}.{bt_label}.connect"),
-                        vec![agent],
-                        move |run, handles| {
+                    )
+                    .timeout(60)
+                    .build(move |cx| {
+                        let _parent = cx.require(agent);
+                        let client_parent = AgentName::Dpg2;
+                        let _client_parent = cx.require(client_parent);
+                        let label =
+                            format!("{}_{}_connect", name.replace('.', "_"), bt.short_label());
+                        let server_leaf = cx.declare_ephemeral(
+                            agent,
+                            format!("UnixEchoServer_{label}"),
+                            SpawnKind::Fork {
+                                binary: fork_binary_label(bt),
+                                inherit_listen_ports: vec![],
+                            },
+                        );
+                        let client_leaf = cx.declare_ephemeral(
+                            client_parent,
+                            format!("UnixEchoClient_{label}"),
+                            SpawnKind::Fork {
+                                binary: fork_binary_label(bt),
+                                inherit_listen_ports: vec![],
+                            },
+                        );
+                        Box::new(move |run| {
+                            let server_leaf = server_leaf.clone();
+                            let client_leaf = client_leaf.clone();
                             Box::pin(async move {
-                                let self_exe = run.self_exe().to_string();
-                                let target = crate::binary_path(bt, &self_exe);
-                                let resp = send_to(
-                                    run,
-                                    &handles,
-                                    agent,
-                                    MatrixOp::ExecReady {
-                                        args: vec![target, "unix-echo-server".into(), sock.clone()],
-                                        ready_marker: "LISTENING".into(),
-                                        timeout_secs: Some(10),
-                                        stdin: None,
-                                        stream: "stdout".into(),
-                                    },
-                                )
-                                .await;
-                                let pid = match &resp {
-                                    Response::BackgroundReady { pid } => Some(*pid),
-                                    _ => None,
-                                };
-                                if pid.is_none() {
-                                    return super::TestOutcome::new(
-                                        agent.name(),
-                                        false,
-                                        format!("server_start failed: {resp:?}"),
-                                    );
-                                }
                                 let data = format!("unix_{name}");
-                                let resp = send_to(
+                                match unix_echo_round_trip(
                                     run,
-                                    &handles,
-                                    agent,
-                                    MatrixOp::UnixConnect {
-                                        path: sock.clone(),
-                                        data: data.clone(),
-                                    },
+                                    &server_leaf,
+                                    &client_leaf,
+                                    sock,
+                                    data,
                                 )
-                                .await;
-                                let pass = matches!(
-                                    &resp,
-                                    Response::Connected { echo } if *echo == data
-                                );
-                                if let Some(pid) = pid {
-                                    let _ =
-                                        send_to(run, &handles, agent, MatrixOp::Kill { pid }).await;
+                                .await
+                                {
+                                    Ok(detail) => {
+                                        super::TestOutcome::new(agent.name(), true, detail)
+                                    }
+                                    Err(e) => super::TestOutcome::new(agent.name(), false, e),
                                 }
-                                let _ = send_to(
-                                    run,
-                                    &handles,
-                                    agent,
-                                    MatrixOp::UnixUnlisten { path: sock },
-                                )
-                                .await;
-                                super::TestOutcome::new(agent.name(), pass, format!("{resp:?}"))
                             })
-                        },
-                    );
+                        })
+                    });
                 }
             }
             UnixPattern::CrossAgent => {
