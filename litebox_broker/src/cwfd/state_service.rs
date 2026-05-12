@@ -19,15 +19,18 @@
 //! its ring once via `RegisterNotificationRing`; subsequent
 //! `SubscribeEventfd` calls use that sender.
 
+use crate::cwfd::pidfd_state::{PidfdError, PidfdState};
 use crate::eventfd_state::{EventfdError, EventfdState};
 use crate::state_registry::{BrokerStateRegistry, StateHandle, StateRegistryError};
 use crate::subscription_list::{SubscribeError, UnsubscribeError};
 use litebox_common_linux::fd_token_protocol::{
-    Frame, Opcode, OwnedFrame, StatusCode, build_create_eventfd_response_ok, build_error_response,
+    Frame, Opcode, OwnedFrame, StatusCode, build_create_eventfd_response_ok,
+    build_create_pidfd_response_ok, build_error_response, build_pidfd_exited_response_ok,
     build_read_eventfd_response_ok, build_register_notification_ring_response_ok,
     build_release_response_ok, build_subscribe_eventfd_response_ok, build_unsubscribe_response_ok,
-    build_write_eventfd_response_ok, parse_create_eventfd_body, parse_handle_body,
-    parse_subscribe_eventfd_body, parse_unsubscribe_body, parse_write_eventfd_body,
+    build_write_eventfd_response_ok, parse_create_eventfd_body, parse_create_pidfd_body,
+    parse_handle_body, parse_pidfd_exited_request, parse_subscribe_eventfd_body,
+    parse_unsubscribe_body, parse_write_eventfd_body,
 };
 use litebox_common_linux::fd_transfer_frame::SubsystemTag;
 use litebox_common_linux::notification_ring::NotificationSender;
@@ -69,6 +72,8 @@ pub fn handle_request(
             handle_register_notification_ring(conn, request, in_fds)
         }
         Opcode::CreateEventfd => handle_create_eventfd(registry, request, in_fds),
+        Opcode::CreatePidfd => handle_create_pidfd(registry, request, in_fds),
+        Opcode::PidfdExited => handle_pidfd_exited(registry, request, in_fds),
         Opcode::ReadEventfd => handle_read_eventfd(registry, request, in_fds),
         Opcode::WriteEventfd => handle_write_eventfd(registry, request, in_fds),
         Opcode::SubscribeEventfd => handle_subscribe_eventfd(registry, conn, request, in_fds),
@@ -137,6 +142,60 @@ fn handle_create_eventfd(
     let handle = registry.register(state);
     HandlerResult {
         frame: build_create_eventfd_response_ok(handle.id()),
+        out_fd: None,
+    }
+}
+
+fn handle_create_pidfd(
+    registry: &BrokerStateRegistry,
+    request: &Frame<'_>,
+    in_fds: Vec<OwnedFd>,
+) -> HandlerResult {
+    if !in_fds.is_empty() {
+        return protocol_err(Opcode::CreatePidfdResponse);
+    }
+    let target_host_pid = match parse_create_pidfd_body(request.body) {
+        Ok(pid) => pid,
+        Err(_) => return protocol_err(Opcode::CreatePidfdResponse),
+    };
+    let state = match PidfdState::new(target_host_pid) {
+        Ok(state) => state,
+        Err(PidfdError::Open { .. }) => {
+            return status_err(Opcode::CreatePidfdResponse, StatusCode::Internal);
+        }
+    };
+    let handle = registry.register(state);
+    HandlerResult {
+        frame: build_create_pidfd_response_ok(handle.id()),
+        out_fd: None,
+    }
+}
+
+fn handle_pidfd_exited(
+    registry: &BrokerStateRegistry,
+    request: &Frame<'_>,
+    in_fds: Vec<OwnedFd>,
+) -> HandlerResult {
+    if !in_fds.is_empty() {
+        return protocol_err(Opcode::PidfdExitedResponse);
+    }
+    let handle_id = match parse_pidfd_exited_request(request.body) {
+        Ok(id) => id,
+        Err(_) => return protocol_err(Opcode::PidfdExitedResponse),
+    };
+    let handle = StateHandle::from_id(handle_id);
+    let state = match registry.resolve_untyped(handle) {
+        Ok(s) => s,
+        Err(StateRegistryError::UnknownHandle(_)) => {
+            return status_err(Opcode::PidfdExitedResponse, StatusCode::UnknownHandle);
+        }
+        Err(_) => return status_err(Opcode::PidfdExitedResponse, StatusCode::Internal),
+    };
+    let Some(pidfd) = state.as_any().downcast_ref::<PidfdState>() else {
+        return status_err(Opcode::PidfdExitedResponse, StatusCode::SubsystemMismatch);
+    };
+    HandlerResult {
+        frame: build_pidfd_exited_response_ok(pidfd.exited()),
         out_fd: None,
     }
 }
