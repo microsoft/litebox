@@ -3,6 +3,7 @@
 
 //! Syscalls Handlers
 
+pub(crate) mod broker_backed;
 pub(crate) mod epoll;
 pub(crate) mod eventfd;
 

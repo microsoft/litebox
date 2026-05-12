@@ -81,6 +81,74 @@ impl BrokerFdToken {
     }
 }
 
+/// Kind tag carried alongside each registered token.
+///
+/// Receiver-side SCM_RIGHTS materialization must construct the right
+/// shim variant for the kind of kernel object the token refers to —
+/// an eventfd token materializes into `EventFile::BrokerBacked`, a
+/// pidfd token into `PidfdState::BrokerBacked`, etc. The kind is
+/// recorded at register time (the registering worker knows the
+/// kind), travels alongside the token over IPC, and is queried at
+/// materialize time.
+///
+/// `FdKind::Eventfd` is the default for legacy callers that
+/// registered tokens before this tag existed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum FdKind {
+    /// Plain host fd (no broker-managed state object). Used by the
+    /// original Phase 2/3 SCM_RIGHTS path that just shipped a raw fd
+    /// alias through the registry.
+    Raw,
+    /// Eventfd state hosted by the broker (`EventfdState`).
+    Eventfd,
+    /// AF_UNIX socket state hosted by the broker
+    /// (`UnixSocketState`, P2.A).
+    UnixSocket,
+    /// pidfd state hosted by the broker (`PidfdState`, P2.B).
+    Pidfd,
+    /// signalfd state hosted by the broker (`SignalfdState`, P2.C).
+    Signalfd,
+    /// timerfd state hosted by the broker (future).
+    Timerfd,
+    /// inotify state hosted by the broker (future).
+    Inotify,
+}
+
+impl FdKind {
+    /// Wire encoding of an `FdKind` as a single byte for transport
+    /// over the fd-transfer / SCM bridge protocols.
+    #[must_use]
+    pub fn as_u8(self) -> u8 {
+        match self {
+            Self::Raw => 0,
+            Self::Eventfd => 1,
+            Self::UnixSocket => 2,
+            Self::Pidfd => 3,
+            Self::Signalfd => 4,
+            Self::Timerfd => 5,
+            Self::Inotify => 6,
+        }
+    }
+
+    /// Inverse of [`as_u8`]. Returns `None` for unrecognised tags so
+    /// receiver code can reject forged frames cleanly.
+    ///
+    /// [`as_u8`]: FdKind::as_u8
+    #[must_use]
+    pub fn from_u8(value: u8) -> Option<Self> {
+        Some(match value {
+            0 => Self::Raw,
+            1 => Self::Eventfd,
+            2 => Self::UnixSocket,
+            3 => Self::Pidfd,
+            4 => Self::Signalfd,
+            5 => Self::Timerfd,
+            6 => Self::Inotify,
+            _ => return None,
+        })
+    }
+}
+
 /// Errors returned by [`BrokerFdTokenRegistry`] operations.
 #[derive(Debug, thiserror::Error)]
 pub enum BrokerFdTokenError {
@@ -110,6 +178,7 @@ pub enum BrokerFdTokenError {
 struct Entry {
     fd: OwnedFd,
     refcount: u32,
+    kind: FdKind,
 }
 
 struct State {
@@ -146,7 +215,19 @@ impl BrokerFdTokenRegistry {
     /// with refcount 1. The caller must arrange for [`Self::release`] to be
     /// invoked exactly once per outstanding reference (the initial register
     /// counts as one reference).
+    ///
+    /// Equivalent to [`Self::register_with_kind`] with [`FdKind::Raw`]; use
+    /// the latter when the token refers to a broker-managed kernel-object
+    /// state (eventfd / pidfd / unix-socket / signalfd / …) so receiver
+    /// workers can materialize the correct shim variant.
     pub fn register(&self, fd: OwnedFd) -> BrokerFdToken {
+        self.register_with_kind(fd, FdKind::Raw)
+    }
+
+    /// Variant of [`Self::register`] that also records the kind of
+    /// kernel object the fd refers to. The kind travels with the
+    /// token through every subsequent dup / materialize call.
+    pub fn register_with_kind(&self, fd: OwnedFd, kind: FdKind) -> BrokerFdToken {
         let mut state = self.state.lock().expect("BrokerFdTokenRegistry poisoned");
         let id = state.next_id;
         // Token allocation is a u64 monotonic counter. At one allocation per
@@ -156,8 +237,22 @@ impl BrokerFdTokenRegistry {
             .next_id
             .checked_add(1)
             .expect("BrokerFdTokenRegistry id space exhausted");
-        state.table.insert(id, Entry { fd, refcount: 1 });
+        state.table.insert(
+            id,
+            Entry {
+                fd,
+                refcount: 1,
+                kind,
+            },
+        );
         BrokerFdToken(id)
+    }
+
+    /// Returns the [`FdKind`] recorded at register time for the token.
+    /// `None` if the token is unknown (e.g. already fully released).
+    pub fn kind_of(&self, token: BrokerFdToken) -> Option<FdKind> {
+        let state = self.state.lock().expect("BrokerFdTokenRegistry poisoned");
+        state.table.get(&token.0).map(|e| e.kind)
     }
 
     /// Increments the refcount of an existing token, returning the same

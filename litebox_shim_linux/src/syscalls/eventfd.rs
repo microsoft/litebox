@@ -73,22 +73,19 @@ enum EventFileInner<Platform: RawSyncPrimitivesProvider + TimeProvider> {
         subject: Arc<Subject<Events, Events, Platform>>,
     },
     Timerfd(TimerFileState<Platform>),
-    /// Broker-hosted eventfd (Phase B-Step7b). State lives in the
-    /// broker; this worker holds only the handle id and a provider
-    /// reference to make RPC calls.
+    /// Broker-hosted eventfd (Phase B-Step7b + P2.0 refactor). State
+    /// lives in the broker; this worker holds only the canonical
+    /// handle id + provider for kind-specific RPCs, alongside a
+    /// [`BrokerBackedCommon`] scaffold that owns the cross-worker
+    /// poll wake-up plumbing (cached readable flag, lazy subscribe,
+    /// Drop-time unsubscribe + release).
     ///
-    /// `semaphore` is recorded for diagnostics / future use even
-    /// though the broker is the source of truth for that flag — the
-    /// shim doesn't need to act on it locally.
-    ///
-    /// Local readability is tracked in `EventFile::broker_local_readable`
-    /// (an Arc<AtomicBool>) so that the broker→worker notification
-    /// callback can update it from the dispatcher thread without
-    /// needing the inner Mutex.
+    /// `semaphore` is recorded for diagnostics / future use; the
+    /// broker is the source of truth for that flag.
     #[allow(dead_code)]
     BrokerBacked {
         provider: Arc<dyn BrokerEventfdProvider>,
-        handle: u64,
+        common: super::broker_backed::BrokerBackedCommon<Platform>,
         semaphore: bool,
     },
 }
@@ -107,63 +104,16 @@ pub(crate) struct EventFile<Platform: RawSyncPrimitivesProvider + TimeProvider> 
     /// File status flags (see [`OFlags::STATUS_FLAGS_MASK`])
     status: AtomicU32,
     /// Local pollee, wrapped in Arc so the cross-worker
-    /// `BrokerSubscriptionWaker` (running on the runner's notification-
-    /// dispatcher thread) can hold a Weak reference and fire local
-    /// observer wake-ups when a broker→worker notification arrives.
+    /// `BrokerSubscriptionWaker` (running on the runner's
+    /// notification-dispatcher thread) can hold a Weak reference
+    /// and fire local observer wake-ups when a broker→worker
+    /// notification arrives.
+    ///
+    /// Shared by all variants: Eventfd / Timerfd use it directly
+    /// for in-worker observer registration; BrokerBacked uses it
+    /// AND passes it to `BrokerBackedCommon::ensure_subscribed` so
+    /// the broker subscription's callback wakes the same pollee.
     pollee: Arc<Pollee<Platform>>,
-    /// Cached "broker-backed eventfd has data to read" flag.
-    /// Updated by:
-    ///   - try_write_eventfd (local write success → true)
-    ///   - try_read_eventfd (drain-to-zero → false)
-    ///   - BrokerSubscriptionWaker::on_events (broker NotificationFrame
-    ///     with NOTIFY_EVENT_IN → true)
-    /// Read by `check_io_events` to report `Events::IN` for BrokerBacked.
-    /// Only meaningful for BrokerBacked entries; ignored otherwise.
-    broker_local_readable: Arc<AtomicBool>,
-    /// Subscription state when register_observer subscribes with the
-    /// broker (Some after first subscription, None otherwise).
-    broker_sub: litebox::sync::Mutex<Platform, Option<BrokerSubscription>>,
-}
-
-struct BrokerSubscription {
-    provider: Arc<dyn BrokerEventfdProvider>,
-    handle: u64,
-    subscription_id: u64,
-}
-
-/// Callback the runner's NotificationDispatcher invokes when a broker
-/// NotificationFrame arrives for this subscription. Translates broker
-/// event bits to shim `Events`, sets the `broker_local_readable` cache,
-/// and fires local Pollee observers — waking any `epoll_wait` waiter
-/// even though the writer was in a different worker.
-struct BrokerSubscriptionWaker<Platform: RawSyncPrimitivesProvider + TimeProvider> {
-    pollee: alloc::sync::Weak<Pollee<Platform>>,
-    local_readable: alloc::sync::Weak<AtomicBool>,
-}
-
-impl<Platform: RawSyncPrimitivesProvider + TimeProvider + Send + Sync + 'static>
-    litebox_common_linux::broker_eventfd_provider::BrokerEventCallback
-    for BrokerSubscriptionWaker<Platform>
-{
-    fn on_events(&self, events: u32) {
-        use litebox_common_linux::notification_frame::{NOTIFY_EVENT_IN, NOTIFY_EVENT_OUT};
-        let Some(pollee) = self.pollee.upgrade() else {
-            return;
-        };
-        let mut shim_events = Events::empty();
-        if events & NOTIFY_EVENT_IN != 0 {
-            shim_events |= Events::IN;
-            if let Some(flag) = self.local_readable.upgrade() {
-                flag.store(true, Ordering::SeqCst);
-            }
-        }
-        if events & NOTIFY_EVENT_OUT != 0 {
-            shim_events |= Events::OUT;
-        }
-        if !shim_events.is_empty() {
-            pollee.notify_observers(shim_events);
-        }
-    }
 }
 
 impl<Platform: RawSyncPrimitivesProvider + TimeProvider> EventFile<Platform> {
@@ -178,8 +128,6 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> EventFile<Platform> {
             }),
             status: AtomicU32::new(status.bits()),
             pollee: Arc::new(Pollee::new()),
-            broker_local_readable: Arc::new(AtomicBool::new(false)),
-            broker_sub: litebox::sync::Mutex::new(None),
         }
     }
 
@@ -187,28 +135,39 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> EventFile<Platform> {
     /// already obtained `handle` from `provider.create_eventfd(...)`.
     /// All subsequent read/write ops route through the provider.
     ///
-    /// Phase B-Step7b: broker-backed variant. Polling is still wired
-    /// to the local `Pollee`; the runner is responsible for arranging
-    /// a subscription on the broker side that wakes this Pollee via a
-    /// `BrokerEventCallback` impl (typically supplied by the runner's
-    /// platform layer).
+    /// Phase B-Step7b + P2.0 refactor: broker-backed variant. The
+    /// cross-worker poll wake-up scaffolding is delegated to
+    /// [`BrokerBackedCommon`] which is stashed inside the
+    /// `BrokerBacked` enum arm.
     pub(crate) fn new_broker_backed(
         provider: Arc<dyn BrokerEventfdProvider>,
         handle: u64,
         flags: EfdFlags,
     ) -> Self {
+        use litebox_common_linux::cwfd::notification_frame::{NOTIFY_EVENT_IN, NOTIFY_EVENT_OUT};
         let mut status = OFlags::RDWR;
         status.set(OFlags::NONBLOCK, flags.contains(EfdFlags::NONBLOCK));
+        // Coerce the kind-specific provider trait object to the base
+        // `BrokerSubscribable` for the shared scaffold. The same
+        // `Arc` is held in two trait-object forms (kind-specific for
+        // RPCs in this file, base for subscribe/unsubscribe/release
+        // inside `BrokerBackedCommon`).
+        let subscribable: Arc<
+            dyn litebox_common_linux::cwfd::broker_subscribable::BrokerSubscribable,
+        > = Arc::clone(&provider) as _;
+        let common = super::broker_backed::BrokerBackedCommon::new(
+            subscribable,
+            handle,
+            NOTIFY_EVENT_IN | NOTIFY_EVENT_OUT,
+        );
         Self {
             inner: litebox::sync::Mutex::new(EventFileInner::BrokerBacked {
                 provider,
-                handle,
+                common,
                 semaphore: flags.contains(EfdFlags::SEMAPHORE),
             }),
             status: AtomicU32::new(status.bits()),
             pollee: Arc::new(Pollee::new()),
-            broker_local_readable: Arc::new(AtomicBool::new(false)),
-            broker_sub: litebox::sync::Mutex::new(None),
         }
     }
 
@@ -232,8 +191,6 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> EventFile<Platform> {
             })),
             status: AtomicU32::new(status.bits()),
             pollee: Arc::new(Pollee::new()),
-            broker_local_readable: Arc::new(AtomicBool::new(false)),
-            broker_sub: litebox::sync::Mutex::new(None),
         }
     }
 
@@ -248,8 +205,6 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> EventFile<Platform> {
             inner: litebox::sync::Mutex::new(EventFileInner::Pidfd { exited, subject }),
             status: AtomicU32::new(status.bits()),
             pollee: Arc::new(Pollee::new()),
-            broker_local_readable: Arc::new(AtomicBool::new(false)),
-            broker_sub: litebox::sync::Mutex::new(None),
         }
     }
 
@@ -263,7 +218,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> EventFile<Platform> {
     /// (Phase B-Step8e).
     pub(crate) fn broker_backed_handle(&self) -> Option<u64> {
         match &*self.inner.lock() {
-            EventFileInner::BrokerBacked { handle, .. } => Some(*handle),
+            EventFileInner::BrokerBacked { common, .. } => Some(common.handle()),
             _ => None,
         }
     }
@@ -307,13 +262,13 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> EventFile<Platform> {
             }
             EventFileInner::BrokerBacked {
                 provider,
-                handle,
+                common,
                 semaphore,
-                ..
             } => {
                 let provider = Arc::clone(provider);
-                let handle = *handle;
+                let handle = common.handle();
                 let semaphore = *semaphore;
+                let readable = common.readable_flag();
                 drop(inner);
                 match provider.read_eventfd(handle) {
                     Ok(v) => {
@@ -327,13 +282,12 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> EventFile<Platform> {
                         // non-semaphore, we drained → not readable.
                         // The next epoll wake from a broker write
                         // will re-set it to true via try_write_eventfd.
-                        self.broker_local_readable
-                            .store(semaphore, Ordering::SeqCst);
+                        readable.store(semaphore, Ordering::SeqCst);
                         self.pollee.notify_observers(Events::OUT);
                         Ok(v)
                     }
                     Err(BrokerOpError::WouldBlock) => {
-                        self.broker_local_readable.store(false, Ordering::SeqCst);
+                        readable.store(false, Ordering::SeqCst);
                         Err(TryOpError::TryAgain)
                     }
                     Err(BrokerOpError::UnknownHandle) => Err(TryOpError::Other(Errno::EBADF)),
@@ -429,10 +383,11 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> EventFile<Platform> {
                 Err(TryOpError::TryAgain)
             }
             EventFileInner::BrokerBacked {
-                provider, handle, ..
+                provider, common, ..
             } => {
                 let provider = Arc::clone(provider);
-                let handle = *handle;
+                let handle = common.handle();
+                let readable = common.readable_flag();
                 drop(inner);
                 match provider.write_eventfd(handle, value) {
                     Ok(()) => {
@@ -440,7 +395,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> EventFile<Platform> {
                         // reports Events::IN. This is what unblocks
                         // an in-process epoll observer that was woken
                         // by notify_observers below.
-                        self.broker_local_readable.store(true, Ordering::SeqCst);
+                        readable.store(true, Ordering::SeqCst);
                         self.pollee.notify_observers(Events::IN);
                         Ok(8)
                     }
@@ -500,28 +455,9 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> EventFile<Platform> {
     super::common_functions_for_file_status!();
 }
 
-impl<Platform: RawSyncPrimitivesProvider + TimeProvider> Drop for EventFile<Platform> {
-    fn drop(&mut self) {
-        // Unsubscribe any active broker subscription first so the
-        // dispatcher stops dispatching to a callback whose Weak refs
-        // are about to be invalidated.
-        if let Some(sub) = self.broker_sub.lock().take() {
-            sub.provider
-                .unsubscribe_eventfd(sub.handle, sub.subscription_id);
-        }
-        // Phase B-Step8: when a broker-backed EventFile drops, tell
-        // the broker to decrement its refcount on the canonical
-        // handle. The broker frees the underlying state when refcount
-        // reaches 0. Non-broker variants have no broker-side state
-        // to release; the local Mutex<EventFileInner> drops normally.
-        if let EventFileInner::BrokerBacked {
-            provider, handle, ..
-        } = &*self.inner.lock()
-        {
-            provider.release_eventfd(*handle);
-        }
-    }
-}
+// EventFile no longer needs an explicit Drop impl for broker-backed
+// state: the BrokerBackedCommon stashed inside the BrokerBacked
+// variant performs both unsubscribe and release in its own Drop.
 
 impl<Platform: RawSyncPrimitivesProvider + TimeProvider + Send + Sync + 'static> IOPollable
     for EventFile<Platform>
@@ -551,25 +487,14 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider + Send + Sync + 'static>
                     events |= Events::IN | Events::HUP;
                 }
             }
-            EventFileInner::BrokerBacked { .. } => {
-                // Phase B-Step12 readiness fix: track local readiness
-                // based on the most recent write/read RPC outcome AND
-                // broker→worker notification frames. The broker is the
-                // source of truth for the counter, but check_io_events
-                // runs synchronously in the polling path and can't
-                // afford an RPC per poll. Cache is updated by:
+            EventFileInner::BrokerBacked { common, .. } => {
+                // Cached local readiness — updated by:
                 //   - try_write_eventfd (local write success → true)
                 //   - try_read_eventfd (drain-to-zero → false)
                 //   - BrokerSubscriptionWaker::on_events (broker push
                 //     with NOTIFY_EVENT_IN → true) — for cross-worker
                 //     wake-ups from a peer worker's write.
-                if self.broker_local_readable.load(Ordering::SeqCst) {
-                    events |= Events::IN;
-                }
-                // Broker-backed eventfds are always writable in
-                // practice (the broker accepts any non-MAX value);
-                // the broker side will reject MAX-1 saturated writes.
-                events |= Events::OUT;
+                events |= common.check_io_events();
             }
         }
 
@@ -586,51 +511,13 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider + Send + Sync + 'static>
                 drop(inner);
                 self.pollee.register_observer(observer, mask);
             }
-            EventFileInner::BrokerBacked {
-                provider, handle, ..
-            } => {
-                let provider = Arc::clone(provider);
-                let handle = *handle;
-                drop(inner);
+            EventFileInner::BrokerBacked { common, .. } => {
                 // Ensure we have an active broker subscription so that
                 // cross-worker writes get pushed to our pollee via the
-                // notification dispatcher. Idempotent: only subscribes
-                // on the first register_observer call.
-                let mut sub_guard = self.broker_sub.lock();
-                if sub_guard.is_none() {
-                    use litebox_common_linux::notification_frame::{
-                        NOTIFY_EVENT_IN, NOTIFY_EVENT_OUT,
-                    };
-                    let waker = Arc::new(BrokerSubscriptionWaker::<Platform> {
-                        pollee: Arc::downgrade(&self.pollee),
-                        local_readable: Arc::downgrade(&self.broker_local_readable),
-                    });
-                    match provider.subscribe_eventfd(
-                        handle,
-                        NOTIFY_EVENT_IN | NOTIFY_EVENT_OUT,
-                        waker
-                            as Arc<
-                                dyn litebox_common_linux::broker_eventfd_provider::BrokerEventCallback,
-                            >,
-                    ) {
-                        Ok(subscription_id) => {
-                            *sub_guard = Some(BrokerSubscription {
-                                provider: Arc::clone(&provider),
-                                handle,
-                                subscription_id,
-                            });
-                        }
-                        Err(_) => {
-                            // Subscription failed; we still register the
-                            // local observer. In-worker write→read still
-                            // wakes via try_write_eventfd. Cross-worker
-                            // wake-up will be missed but that's a soft
-                            // degradation, not a correctness issue for
-                            // the local case.
-                        }
-                    }
-                }
-                drop(sub_guard);
+                // notification dispatcher. Idempotent on the inner
+                // mutex inside BrokerBackedCommon.
+                common.ensure_subscribed(&self.pollee);
+                drop(inner);
                 self.pollee.register_observer(observer, mask);
             }
         }
@@ -918,6 +805,22 @@ mod tests {
             writes: AtomicU64,
         }
 
+        impl litebox_common_linux::cwfd::broker_subscribable::BrokerSubscribable for MockProvider {
+            fn subscribe(
+                &self,
+                _handle: u64,
+                _events_mask: u32,
+                _cb: Arc<dyn BrokerEventCallback>,
+            ) -> Result<u64, BrokerOpError> {
+                Ok(1)
+            }
+            fn unsubscribe(&self, _handle: u64, _subscription_id: u64) {}
+            fn release(&self, _handle: u64) {}
+            fn dup_handle(&self, _handle: u64) -> Result<(), BrokerOpError> {
+                Ok(())
+            }
+        }
+
         impl BrokerEventfdProvider for MockProvider {
             fn create_eventfd(
                 &self,
@@ -941,19 +844,6 @@ mod tests {
                 }
                 self.writes.fetch_add(1, Ordering::SeqCst);
                 self.counter.fetch_add(value, Ordering::SeqCst);
-                Ok(())
-            }
-            fn release_eventfd(&self, _handle: u64) {}
-            fn subscribe_eventfd(
-                &self,
-                _handle: u64,
-                _events_mask: u32,
-                _cb: Arc<dyn BrokerEventCallback>,
-            ) -> Result<u64, BrokerOpError> {
-                Ok(1)
-            }
-            fn unsubscribe_eventfd(&self, _handle: u64, _subscription_id: u64) {}
-            fn dup_handle(&self, _handle: u64) -> Result<(), BrokerOpError> {
                 Ok(())
             }
         }
@@ -1015,6 +905,26 @@ mod tests {
             releases: AtomicU32,
         }
 
+        impl litebox_common_linux::cwfd::broker_subscribable::BrokerSubscribable
+            for ReleaseCountingProvider
+        {
+            fn subscribe(
+                &self,
+                _handle: u64,
+                _events_mask: u32,
+                _cb: Arc<dyn BrokerEventCallback>,
+            ) -> Result<u64, BrokerOpError> {
+                Ok(1)
+            }
+            fn unsubscribe(&self, _handle: u64, _subscription_id: u64) {}
+            fn release(&self, _handle: u64) {
+                self.releases.fetch_add(1, Ordering::SeqCst);
+            }
+            fn dup_handle(&self, _handle: u64) -> Result<(), BrokerOpError> {
+                Ok(())
+            }
+        }
+
         impl BrokerEventfdProvider for ReleaseCountingProvider {
             fn create_eventfd(
                 &self,
@@ -1027,21 +937,6 @@ mod tests {
                 Err(BrokerOpError::WouldBlock)
             }
             fn write_eventfd(&self, _handle: u64, _value: u64) -> Result<(), BrokerOpError> {
-                Ok(())
-            }
-            fn release_eventfd(&self, _handle: u64) {
-                self.releases.fetch_add(1, Ordering::SeqCst);
-            }
-            fn subscribe_eventfd(
-                &self,
-                _handle: u64,
-                _events_mask: u32,
-                _cb: Arc<dyn BrokerEventCallback>,
-            ) -> Result<u64, BrokerOpError> {
-                Ok(1)
-            }
-            fn unsubscribe_eventfd(&self, _handle: u64, _subscription_id: u64) {}
-            fn dup_handle(&self, _handle: u64) -> Result<(), BrokerOpError> {
                 Ok(())
             }
         }
@@ -1105,6 +1000,28 @@ mod tests {
         struct RealProviderForTest {
             client: StdMutex<FdTokenClient>,
         }
+        impl litebox_common_linux::cwfd::broker_subscribable::BrokerSubscribable for RealProviderForTest {
+            fn subscribe(
+                &self,
+                _: u64,
+                _: u32,
+                _: Arc<dyn BrokerEventCallback>,
+            ) -> Result<u64, BrokerOpError> {
+                Err(BrokerOpError::Io)
+            }
+            fn unsubscribe(&self, _: u64, _: u64) {}
+            fn release(&self, handle: u64) {
+                let _ = self.client.lock().unwrap().release(handle);
+            }
+            fn dup_handle(&self, handle: u64) -> Result<(), BrokerOpError> {
+                self.client
+                    .lock()
+                    .unwrap()
+                    .dup_handle(handle)
+                    .map_err(client_err_to_broker_err)
+            }
+        }
+
         impl BrokerEventfdProvider for RealProviderForTest {
             fn create_eventfd(&self, initial: u64, semaphore: bool) -> Result<u64, BrokerOpError> {
                 self.client
@@ -1127,25 +1044,6 @@ mod tests {
                     .write_eventfd(handle, value)
                     .map_err(client_err_to_broker_err)
             }
-            fn release_eventfd(&self, handle: u64) {
-                let _ = self.client.lock().unwrap().release(handle);
-            }
-            fn dup_handle(&self, handle: u64) -> Result<(), BrokerOpError> {
-                self.client
-                    .lock()
-                    .unwrap()
-                    .dup_handle(handle)
-                    .map_err(client_err_to_broker_err)
-            }
-            fn subscribe_eventfd(
-                &self,
-                _: u64,
-                _: u32,
-                _: Arc<dyn BrokerEventCallback>,
-            ) -> Result<u64, BrokerOpError> {
-                Err(BrokerOpError::Io)
-            }
-            fn unsubscribe_eventfd(&self, _: u64, _: u64) {}
         }
         fn client_err_to_broker_err(
             e: litebox_common_linux::fd_token_client::ClientError,
@@ -1257,6 +1155,27 @@ mod tests {
         struct RealProviderForTest {
             client: StdMutex<FdTokenClient>,
         }
+        impl litebox_common_linux::cwfd::broker_subscribable::BrokerSubscribable for RealProviderForTest {
+            fn subscribe(
+                &self,
+                _: u64,
+                _: u32,
+                _: Arc<dyn BrokerEventCallback>,
+            ) -> Result<u64, BrokerOpError> {
+                Err(BrokerOpError::Io)
+            }
+            fn unsubscribe(&self, _: u64, _: u64) {}
+            fn release(&self, handle: u64) {
+                let _ = self.client.lock().unwrap().release(handle);
+            }
+            fn dup_handle(&self, handle: u64) -> Result<(), BrokerOpError> {
+                self.client
+                    .lock()
+                    .unwrap()
+                    .dup_handle(handle)
+                    .map_err(|_| BrokerOpError::Io)
+            }
+        }
         impl BrokerEventfdProvider for RealProviderForTest {
             fn create_eventfd(&self, initial: u64, semaphore: bool) -> Result<u64, BrokerOpError> {
                 self.client
@@ -1283,25 +1202,6 @@ mod tests {
                     .write_eventfd(handle, value)
                     .map_err(|_| BrokerOpError::Io)
             }
-            fn release_eventfd(&self, handle: u64) {
-                let _ = self.client.lock().unwrap().release(handle);
-            }
-            fn dup_handle(&self, handle: u64) -> Result<(), BrokerOpError> {
-                self.client
-                    .lock()
-                    .unwrap()
-                    .dup_handle(handle)
-                    .map_err(|_| BrokerOpError::Io)
-            }
-            fn subscribe_eventfd(
-                &self,
-                _: u64,
-                _: u32,
-                _: Arc<dyn BrokerEventCallback>,
-            ) -> Result<u64, BrokerOpError> {
-                Err(BrokerOpError::Io)
-            }
-            fn unsubscribe_eventfd(&self, _: u64, _: u64) {}
         }
 
         let dir = tempdir().expect("tempdir");
