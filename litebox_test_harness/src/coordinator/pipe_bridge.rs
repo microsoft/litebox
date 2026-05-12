@@ -16,8 +16,71 @@
 //!   - Count: single pipe, multiple pipes
 //!   - Agent topology: various depths (A, AA, B, NP, D4)
 
+use std::time::Duration;
+
+use serde::{Deserialize, Serialize};
+
 use super::agents::AgentName;
 use super::registry::Registry;
+use crate::handlers::{HandlerCtx, HandlerError, HandlerToken};
+use crate::register_handler;
+
+#[derive(Serialize, Deserialize, Debug)]
+struct BashArgs {
+    cmd: String,
+    timeout_ms: u32,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+struct BashOut {
+    stdout: String,
+    stderr: String,
+    exit_code: i32,
+}
+
+const BASH: HandlerToken<BashArgs, BashOut> = HandlerToken::new("pipe_bridge.bash");
+
+async fn handle_bash(args: BashArgs, _ctx: &mut HandlerCtx<'_>) -> Result<BashOut, HandlerError> {
+    let output = tokio::time::timeout(
+        Duration::from_millis(u64::from(args.timeout_ms)),
+        tokio::process::Command::new("bash")
+            .arg("-c")
+            .arg(&args.cmd)
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    .map_err(|_| HandlerError(format!("bash timed out after {} ms", args.timeout_ms)))??;
+
+    Ok(BashOut {
+        stdout: String::from_utf8_lossy(&output.stdout).to_string(),
+        stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+        exit_code: output.status.code().unwrap_or(-1),
+    })
+}
+
+fn bash_cmd(args: &[String]) -> String {
+    args.iter()
+        .map(|arg| shell_quote(arg))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn shell_quote(arg: &str) -> String {
+    if !arg.is_empty()
+        && arg
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'/' | b'.' | b'_' | b'-' | b'='))
+    {
+        return arg.to_string();
+    }
+
+    format!("'{}'", arg.replace('\'', "'\\''"))
+}
+
+fn timeout_ms(seconds: u64) -> u32 {
+    seconds.saturating_mul(1000).min(u64::from(u32::MAX)) as u32
+}
 
 /// Agents for pipe bridge tests.  Includes depths 1-2 and the
 /// non-PIE worker agent (NP) to test nested worker-exec.
@@ -25,6 +88,8 @@ const PB_AGENTS: &[AgentName] = &[AgentName::Dpg1, AgentName::Dpg1Dpg1, AgentNam
 
 #[allow(clippy::too_many_lines)] // exhaustive registration / runner
 pub(crate) fn register_pipe_bridge(reg: &mut Registry<'_>) {
+    register_handler!(BASH, handle_bash);
+
     struct PbCase {
         mode: &'static str,
         subcmd: &'static str,
@@ -128,14 +193,23 @@ pub(crate) fn register_pipe_bridge(reg: &mut Registry<'_>) {
                             Box::pin(async move {
                                 let self_exe = run.self_exe().to_string();
                                 let child_bin = crate::binary_path(bt, &self_exe);
-                                let mut args = vec![self_exe, "pipe-test".into(), subcmd, child_bin];
+                                let mut args =
+                                    vec![self_exe, "pipe-test".into(), subcmd, child_bin];
                                 args.extend(extra);
-                                let resp = run.send(&handle, super::exec_timeout(args, timeout)).await;
-                            let pass = matches!(
-                                &resp,
-                                crate::protocol::Response::ExecResult { exit_code: 0, stdout, .. }
-                                    if stdout.contains(&*expected)
-                            );
+                                let resp = run
+                                    .send_named_typed(
+                                        &handle,
+                                        &BASH,
+                                        BashArgs {
+                                            cmd: bash_cmd(&args),
+                                            timeout_ms: timeout_ms(timeout),
+                                        },
+                                    )
+                                    .await;
+                                let pass = matches!(
+                                    &resp,
+                                    Ok(out) if out.exit_code == 0 && out.stdout.contains(&*expected)
+                                );
                                 super::TestOutcome::new(&agent_label, pass, format!("{resp:?}"))
                             })
                         })
@@ -166,20 +240,35 @@ pub(crate) fn register_pipe_bridge(reg: &mut Registry<'_>) {
                                 self_exe.clone(),
                             ]
                         };
-                        let left_resp =
-                            run.send(&left, super::exec_timeout(args(subcmd), 20)).await;
+                        let left_args = args(subcmd);
+                        let left_resp = run
+                            .send_named_typed(
+                                &left,
+                                &BASH,
+                                BashArgs {
+                                    cmd: bash_cmd(&left_args),
+                                    timeout_ms: timeout_ms(20),
+                                },
+                            )
+                            .await;
+                        let right_args = args(subcmd);
                         let right_resp = run
-                            .send(&right, super::exec_timeout(args(subcmd), 20))
+                            .send_named_typed(
+                                &right,
+                                &BASH,
+                                BashArgs {
+                                    cmd: bash_cmd(&right_args),
+                                    timeout_ms: timeout_ms(20),
+                                },
+                            )
                             .await;
                         let left_ok = matches!(
                             &left_resp,
-                            crate::protocol::Response::ExecResult { exit_code: 0, stdout, .. }
-                                if stdout.trim() == expected
+                            Ok(out) if out.exit_code == 0 && out.stdout.trim() == expected
                         );
                         let right_ok = matches!(
                             &right_resp,
-                            crate::protocol::Response::ExecResult { exit_code: 0, stdout, .. }
-                                if stdout.trim() == expected
+                            Ok(out) if out.exit_code == 0 && out.stdout.trim() == expected
                         );
                         super::TestOutcome::new(
                             "AA+AB",
